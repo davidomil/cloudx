@@ -40,4 +40,38 @@ describe("PluginRegistry", () => {
       })
     ).toThrow(/does not accept input/);
   });
+
+  it("sanitizes broad structured voice inputs down to the selected action schema", () => {
+    const registry = new PluginRegistry();
+    registry.register(new CodexTerminalPlugin(new FakeFactory()));
+
+    expect(
+      registry.sanitizeVoiceInput("codex-terminal", "enter_text", {
+        text: "ls",
+        submit: true,
+        relativePath: "",
+        title: null
+      })
+    ).toEqual({ text: "ls", submit: true });
+  });
+
+  it("still rejects extra inputs for direct plugin actions", () => {
+    const registry = new PluginRegistry();
+    registry.register(new CodexTerminalPlugin(new FakeFactory()));
+
+    expect(() =>
+      registry.validateInput("codex-terminal", "enter_text", {
+        text: "hello",
+        relativePath: ""
+      })
+    ).toThrow(/does not accept input/);
+  });
+
+  it("exposes the terminal default voice action", () => {
+    const registry = new PluginRegistry();
+    registry.register(new CodexTerminalPlugin(new FakeFactory()));
+
+    expect(registry.getDefaultVoiceAction("codex-terminal")?.name).toBe("enter_text");
+    expect(registry.list()[0]?.actions[0]?.defaultForVoice).toBe(true);
+  });
 });

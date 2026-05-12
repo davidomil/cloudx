@@ -9,7 +9,8 @@
   ],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
-    "dev": "npm run dev -w @cloudx/server",
+    "cert:create": "node scripts/create-local-cert.mjs",
+    "dev": "npm run cert:create && npm run dev -w @cloudx/server",
     "dev:web": "npm run dev -w @cloudx/web",
     "test": "vitest run",
     "typecheck": "tsc -b"

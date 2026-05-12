@@ -1,23 +1,55 @@
-import type { CreateTabRequest, CreateTabResponse, PluginDescriptor, VoiceExecutionResult, WorkspaceTab } from "@cloudx/shared";
+import type { CreateTabRequest, CreateTabResponse, PathOptionsResponse, PathOption, PluginDescriptor, VoiceExecutionResult, WorkspaceTab } from "@cloudx/shared";
+
+export interface HealthResponse {
+  status: string;
+  host: string;
+  port: number;
+  plugins: string[];
+}
 
 export async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     ...init,
-    headers: {
-      "content-type": "application/json",
-      ...init?.headers
-    }
+    headers: init?.body === undefined ? init?.headers : { "content-type": "application/json", ...init?.headers }
   });
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(text || `Request failed with ${response.status}`);
+    throw new Error(errorMessageFromResponse(text, response.status));
   }
   return (await response.json()) as T;
+}
+
+function errorMessageFromResponse(text: string, status: number): string {
+  if (!text) {
+    return `Request failed with ${status}`;
+  }
+  try {
+    const body = JSON.parse(text) as { message?: unknown; error?: unknown };
+    if (typeof body.message === "string" && body.message.trim()) {
+      return body.message;
+    }
+    if (typeof body.error === "string" && body.error.trim()) {
+      return body.error;
+    }
+  } catch {
+    return text;
+  }
+  return text;
 }
 
 export async function getPlugins(): Promise<PluginDescriptor[]> {
   const body = await fetchJson<{ plugins: PluginDescriptor[] }>("/api/plugins");
   return body.plugins;
+}
+
+export async function getHealth(): Promise<HealthResponse> {
+  return fetchJson("/api/health");
+}
+
+export async function getPathOptions(query: string): Promise<PathOption[]> {
+  const params = new URLSearchParams({ query });
+  const body = await fetchJson<PathOptionsResponse>(`/api/paths/options?${params.toString()}`);
+  return body.options;
 }
 
 export async function getTabs(): Promise<{ tabs: WorkspaceTab[]; activeTabId?: string }> {

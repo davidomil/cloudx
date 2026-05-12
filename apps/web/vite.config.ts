@@ -8,9 +8,15 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     proxy: {
-      "/api": "http://127.0.0.1:3001",
+      "/api": {
+        target: "https://127.0.0.1:3001",
+        changeOrigin: true,
+        secure: false
+      },
       "/ws": {
-        target: "ws://127.0.0.1:3001",
+        target: "wss://127.0.0.1:3001",
+        changeOrigin: true,
+        secure: false,
         ws: true
       }
     }

@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -25,8 +26,18 @@ export function buildVoicePrompt(transcript: string, context: Record<string, unk
     "You are the Cloudx voice controller.",
     "Return only JSON matching this shape:",
     "{\"transcript\":\"string\",\"summary\":\"string\",\"actions\":[{\"targetTabId\":\"string optional\",\"pluginId\":\"string optional\",\"action\":\"string\",\"input\":{},\"reason\":\"string optional\"}]}",
+    "For unused optional structured fields, use null or omit them when the schema allows omission.",
     "You may only select actions that are listed as voiceExposed in the provided plugin descriptors.",
-    "Prefer entering text into the active tab when the command sounds like dictation.",
+    "Workspace context includes per-session standardized plugin voiceContext, visibleText, openFile, currentPath, and voiceActions. Use that state before choosing actions.",
+    "Every transcript has already been routed through you. Do not blindly paste the transcript into the active tab.",
+    "Actions marked defaultForVoice are safe default tools after you have interpreted the user's intent.",
+    "For standard-terminal enter_text, translate natural-language shell requests into concise shell commands and submit them. Example: transcript 'list directory' becomes input.text 'ls' with input.submit true.",
+    "For codex-terminal enter_text, send the instruction that should be given to the interactive Codex CLI. Usually keep coding/editing requests as natural-language instructions for Codex, not shell commands.",
+    "For file-browser actions, use list_directory and open_file to inspect files. Use replace_in_file when you can identify an exact oldText/newText edit from context, and write_file only when the full intended content is known.",
+    "If the active file-browser session already has an openFile, treat that as the current file unless the transcript names a different file.",
+    "When targeting a tab, targetTabId must be an exact tab id from workspace context. For the active tab, you may omit targetTabId and let Cloudx use activeTabId.",
+    "Only type the user's words exactly when they clearly ask to dictate, type, or enter exact text.",
+    "Use workspace-control.switch_tab for explicit requests to switch, activate, select, or focus another tab.",
     "For multi-step requests, return actions in execution order.",
     "Never invent shell access. Never ask to run commands directly.",
     "",
@@ -39,9 +50,11 @@ export function buildVoicePrompt(transcript: string, context: Record<string, unk
 
 function runCodexExec(model: string, prompt: string): Promise<string> {
   return new Promise((resolve, reject) => {
+    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-voice-plan-"));
+    const outputPath = path.join(outputDir, "last-message.json");
     const child = spawn(
       "codex",
-      ["exec", "--model", model, "--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral", "--output-schema", resolveVoiceSchemaPath(), "-"],
+      buildCodexExecArgs(model, resolveVoiceSchemaPath(), outputPath),
       {
         stdio: ["pipe", "pipe", "pipe"]
       }
@@ -59,13 +72,41 @@ function runCodexExec(model: string, prompt: string): Promise<string> {
     child.on("error", reject);
     child.on("close", (code) => {
       if (code === 0) {
-        resolve(stdout.trim());
+        try {
+          resolve(fs.readFileSync(outputPath, "utf8").trim());
+        } catch {
+          resolve(extractLastJsonObject(stdout));
+        } finally {
+          fs.rmSync(outputDir, { recursive: true, force: true });
+        }
       } else {
-        reject(new Error(`codex exec voice planner failed with code ${code}: ${stderr.trim()}`));
+        fs.rmSync(outputDir, { recursive: true, force: true });
+        reject(new Error(`codex exec voice planner failed with code ${code}: ${summarizeCodexError(stderr || stdout)}`));
       }
     });
     child.stdin.end(prompt);
   });
+}
+
+export function buildCodexExecArgs(model: string, schemaPath: string, outputPath: string): string[] {
+  return [
+    "exec",
+    "-c",
+    "streamable_shell=false",
+    "-c",
+    'model_reasoning_effort="medium"',
+    "--model",
+    model,
+    "--sandbox",
+    "read-only",
+    "--skip-git-repo-check",
+    "--ephemeral",
+    "--output-schema",
+    schemaPath,
+    "--output-last-message",
+    outputPath,
+    "-"
+  ];
 }
 
 function resolveVoiceSchemaPath(): string {
@@ -76,4 +117,34 @@ function resolveVoiceSchemaPath(): string {
     throw new Error("Missing voice-plan.schema.json for Codex voice planner.");
   }
   return found;
+}
+
+function extractLastJsonObject(output: string): string {
+  const trimmed = output.trim();
+  const start = trimmed.lastIndexOf("\n{");
+  if (start !== -1) {
+    return trimmed.slice(start + 1);
+  }
+  return trimmed;
+}
+
+function summarizeCodexError(output: string): string {
+  const matches = Array.from(output.matchAll(/ERROR:\s*(\{[\s\S]*?\n\})/g));
+  const last = matches.at(-1)?.[1];
+  if (last) {
+    try {
+      const parsed = JSON.parse(last) as { error?: { message?: string; code?: string }; status?: number };
+      const message = parsed.error?.message;
+      if (message) {
+        return parsed.error?.code ? `${parsed.error.code}: ${message}` : message;
+      }
+    } catch {
+      return last;
+    }
+  }
+  const lines = output
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return lines.slice(-12).join("\n");
 }

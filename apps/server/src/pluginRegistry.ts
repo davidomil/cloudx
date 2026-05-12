@@ -32,6 +32,10 @@ export class PluginRegistry {
     return action;
   }
 
+  getDefaultVoiceAction(pluginId: PluginId): PluginActionDefinition | undefined {
+    return this.get(pluginId).actions.find((action) => action.voiceExposed && action.defaultForVoice);
+  }
+
   getAction(pluginId: PluginId, actionName: string): PluginActionDefinition {
     const action = this.get(pluginId).actions.find((candidate) => candidate.name === actionName);
     if (!action) {
@@ -43,6 +47,12 @@ export class PluginRegistry {
   validateVoiceInput(pluginId: PluginId, actionName: string, input: Record<string, unknown>): void {
     const action = this.getVoiceAction(pluginId, actionName);
     validateObjectSchema(action.inputSchema, input, `${pluginId}.${actionName}`);
+  }
+
+  sanitizeVoiceInput(pluginId: PluginId, actionName: string, input: Record<string, unknown>): Record<string, unknown> {
+    const action = this.getVoiceAction(pluginId, actionName);
+    const allowed = new Set(Object.keys(action.inputSchema.properties ?? {}));
+    return Object.fromEntries(Object.entries(input).filter(([key, value]) => allowed.has(key) && value !== null && value !== undefined));
   }
 
   validateInput(pluginId: PluginId, actionName: string, input: Record<string, unknown>): void {

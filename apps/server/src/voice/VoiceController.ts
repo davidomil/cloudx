@@ -1,4 +1,4 @@
-import type { VoiceExecutionResult } from "@cloudx/shared";
+import type { VoiceActionPlan, VoiceExecutionResult } from "@cloudx/shared";
 
 import type { SessionStore } from "../sessionStore.js";
 import type { VoicePlanner } from "./VoicePlanner.js";
@@ -12,11 +12,17 @@ export class VoiceController {
   ) {}
 
   async handleTranscript(transcript: string, activeTabId?: string): Promise<VoiceExecutionResult> {
-    if (!transcript.trim()) {
+    const trimmedTranscript = transcript.trim();
+    if (!trimmedTranscript) {
       throw new Error("Transcript is empty.");
     }
+
     const context = this.contextProvider ? await this.contextProvider.context(activeTabId) : await this.sessions.buildVoiceContext(activeTabId);
-    const plan = await this.planner.plan({ transcript, context });
+    const plan = await this.planner.plan({ transcript: trimmedTranscript, context });
+    return this.executePlan(plan, activeTabId);
+  }
+
+  private async executePlan(plan: VoiceActionPlan, activeTabId?: string): Promise<VoiceExecutionResult> {
     const results: VoiceExecutionResult["results"] = [];
 
     for (const action of plan.actions) {

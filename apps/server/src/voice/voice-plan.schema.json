@@ -16,17 +16,30 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["action", "input"],
+        "required": ["id", "targetTabId", "pluginId", "action", "input", "reason"],
         "properties": {
-          "id": { "type": "string" },
-          "targetTabId": { "type": "string" },
-          "pluginId": { "type": "string" },
+          "id": { "type": ["string", "null"] },
+          "targetTabId": { "type": ["string", "null"] },
+          "pluginId": { "type": ["string", "null"] },
           "action": { "type": "string", "minLength": 1 },
           "input": {
             "type": "object",
-            "additionalProperties": true
+            "additionalProperties": false,
+            "required": ["text", "submit", "key", "tabId", "title", "relativePath", "content", "oldText", "newText", "create"],
+            "properties": {
+              "text": { "type": ["string", "null"] },
+              "submit": { "type": ["boolean", "null"] },
+              "key": { "type": ["string", "null"], "enum": ["enter", "escape", "tab", "ctrl-c", null] },
+              "tabId": { "type": ["string", "null"] },
+              "title": { "type": ["string", "null"] },
+              "relativePath": { "type": ["string", "null"] },
+              "content": { "type": ["string", "null"] },
+              "oldText": { "type": ["string", "null"] },
+              "newText": { "type": ["string", "null"] },
+              "create": { "type": ["boolean", "null"] }
+            }
           },
-          "reason": { "type": "string" }
+          "reason": { "type": ["string", "null"] }
         }
       }
     }

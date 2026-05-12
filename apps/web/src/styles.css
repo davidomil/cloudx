@@ -14,22 +14,27 @@ body,
 #root {
   height: 100%;
   margin: 0;
+  overflow: hidden;
 }
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
 .app-shell {
-  min-height: 100%;
+  height: 100dvh;
+  min-height: 0;
   display: grid;
-  grid-template-rows: auto auto auto 1fr auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   background: #0d1117;
+  overflow: hidden;
 }
 
 .topbar {
+  grid-row: 1;
   height: 52px;
   display: flex;
   align-items: center;
@@ -41,7 +46,6 @@ select {
 }
 
 .brand,
-.status-strip span,
 .topbar-actions,
 .primary-button,
 .tab-button,
@@ -54,6 +58,40 @@ select {
   gap: 8px;
   font-weight: 700;
   letter-spacing: 0;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.brand > span:first-of-type {
+  flex: none;
+}
+
+.brand-active-tab,
+.connection-status,
+.voice-status {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #9ca9ba;
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.brand-active-tab {
+  max-width: min(240px, 32vw);
+  overflow: hidden;
+  color: #cbd5e1;
+  text-overflow: ellipsis;
+}
+
+.voice-status.recording {
+  color: #ffd166;
+}
+
+.voice-status.processing {
+  color: #b7a9ff;
 }
 
 .topbar-actions {
@@ -79,6 +117,12 @@ select {
 .new-tab-inline:hover,
 .primary-button:hover {
   border-color: #7cc7ff;
+}
+
+.add-tab-button {
+  color: #06111e;
+  background: #8bd3ff;
+  border-color: #8bd3ff;
 }
 
 .primary-button {
@@ -108,24 +152,24 @@ select {
   color: #110e24;
 }
 
-.status-strip {
-  min-height: 34px;
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 0 14px;
-  border-bottom: 1px solid #242b36;
-  background: #0f141d;
-  color: #9ca9ba;
-  font-size: 13px;
+.mic-button.unavailable {
+  color: #8e9bad;
 }
 
-.status-strip span {
-  gap: 6px;
-  white-space: nowrap;
+.connection-status.connected {
+  color: #9ee6b8;
+}
+
+.connection-status.checking {
+  color: #ffd166;
+}
+
+.connection-status.disconnected {
+  color: #ff9aa8;
 }
 
 .error-banner {
+  grid-row: 2;
   padding: 9px 14px;
   background: #4d1c21;
   border-bottom: 1px solid #8d313b;
@@ -133,25 +177,45 @@ select {
   font-size: 13px;
 }
 
-.pane-grid {
+.pane-root {
+  grid-row: 3;
   min-height: 0;
   display: flex;
-  gap: 8px;
   padding: 8px;
+  overflow: hidden;
 }
 
-.pane-grid.row {
+.pane-split {
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex: 1 1 0;
+  overflow: hidden;
+}
+
+.pane-split.row {
   flex-direction: row;
 }
 
-.pane-grid.column {
+.pane-split.column {
   flex-direction: column;
 }
 
-.workspace-pane {
-  position: relative;
+.pane-split-child {
   min-width: 0;
-  min-height: 260px;
+  min-height: 0;
+  display: flex;
+  flex: 1 1 0;
+  padding: 0;
+}
+
+.workspace-pane {
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
   display: grid;
   grid-template-rows: auto 1fr;
   flex: 1 1 0;
@@ -175,6 +239,10 @@ select {
   overflow-x: auto;
 }
 
+.pane-close-button {
+  margin-left: auto;
+}
+
 .tab-button {
   max-width: 190px;
   min-width: 118px;
@@ -195,17 +263,62 @@ select {
   border-color: #8bd3ff;
 }
 
-.tab-button span {
+.tab-button .tab-title {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.tab-button small {
+.tab-indicator {
   flex: none;
-  font-size: 10px;
-  opacity: 0.74;
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.22);
+}
+
+.tab-indicator.green {
+  background: #3ddc84;
+}
+
+.tab-indicator.yellow {
+  background: #ffd166;
+}
+
+.tab-indicator.red {
+  background: #ff5d6c;
+}
+
+.tab-indicator.attention {
+  animation: tab-attention-pulse 0.9s ease-in-out infinite;
+}
+
+@keyframes tab-attention-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(0.86);
+    box-shadow: 0 0 0 1px rgb(255 255 255 / 0.22);
+  }
+
+  50% {
+    opacity: 1;
+    transform: scale(1.35);
+    box-shadow:
+      0 0 0 1px rgb(255 255 255 / 0.32),
+      0 0 0 5px rgb(139 211 255 / 0.22);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tab-indicator.attention {
+    animation: none;
+    box-shadow:
+      0 0 0 1px rgb(255 255 255 / 0.32),
+      0 0 0 5px rgb(139 211 255 / 0.22);
+  }
 }
 
 .tab-close {
@@ -225,41 +338,50 @@ select {
 .terminal-panel {
   width: 100%;
   height: 100%;
-  min-height: 240px;
+  min-height: 0;
   padding: 8px;
   background: #101318;
 }
 
+.terminal-panel .xterm {
+  height: 100%;
+}
+
 .empty-pane {
   height: 100%;
-  min-height: 240px;
+  min-height: 0;
   display: grid;
   place-items: center;
   align-content: center;
   gap: 10px;
+  padding: 12px;
+  overflow: hidden;
   color: #8190a3;
+  font-size: 13px;
   text-align: center;
 }
 
+.empty-pane span {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .resize-handle {
-  position: absolute;
+  position: relative;
+  flex: none;
   z-index: 5;
   background: transparent;
 }
 
 .resize-handle.row {
-  top: 0;
-  right: -6px;
-  bottom: 0;
-  width: 12px;
+  width: 8px;
   cursor: col-resize;
 }
 
 .resize-handle.column {
-  right: 0;
-  bottom: -6px;
-  left: 0;
-  height: 12px;
+  height: 8px;
   cursor: row-resize;
 }
 
@@ -273,12 +395,12 @@ select {
 .resize-handle.row::after {
   top: 42%;
   bottom: 42%;
-  left: 5px;
+  left: 3px;
   width: 2px;
 }
 
 .resize-handle.column::after {
-  top: 5px;
+  top: 3px;
   right: 42%;
   left: 42%;
   height: 2px;
@@ -376,23 +498,26 @@ select {
 }
 
 .voice-console {
+  grid-row: 4;
   gap: 8px;
   padding: 8px;
   border-top: 1px solid #242b36;
   background: #111722;
 }
 
-.voice-console input {
+.voice-console textarea {
   width: 100%;
-  height: 38px;
-  padding: 0 11px;
+  min-height: 44px;
+  max-height: 120px;
+  resize: vertical;
+  padding: 9px 11px;
   color: #e6edf3;
   background: #0d1117;
   border: 1px solid #2b3443;
   border-radius: 8px;
+  line-height: 1.35;
 }
 
-.voice-console button,
 .dialog-actions button {
   height: 36px;
   padding: 0 12px;
@@ -435,6 +560,13 @@ select {
   font-size: 13px;
 }
 
+.dialog .field-group {
+  display: grid;
+  gap: 6px;
+  color: #aab6c7;
+  font-size: 13px;
+}
+
 .dialog input,
 .dialog select {
   width: 100%;
@@ -444,6 +576,68 @@ select {
   background: #0d1117;
   border: 1px solid #2b3443;
   border-radius: 8px;
+}
+
+.path-autocomplete {
+  position: relative;
+}
+
+.path-options {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 6px);
+  right: 0;
+  left: 0;
+  max-height: 220px;
+  display: grid;
+  gap: 4px;
+  padding: 6px;
+  overflow: auto;
+  border: 1px solid #344153;
+  border-radius: 8px;
+  background: #0d1117;
+  box-shadow: 0 16px 42px rgb(0 0 0 / 0.42);
+}
+
+.path-option {
+  min-height: 34px;
+  display: grid;
+  gap: 2px;
+  padding: 6px 8px;
+  color: #d7dde8;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.path-option.active,
+.path-option:hover {
+  border-color: #477da8;
+  background: #152335;
+}
+
+.path-option span,
+.path-option small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.path-option span {
+  color: #e6edf3;
+}
+
+.path-option small,
+.path-options-empty {
+  color: #8e9bad;
+  font-size: 12px;
+}
+
+.path-options-empty {
+  padding: 8px;
 }
 
 .checkbox-row {
@@ -464,7 +658,7 @@ select {
 
 @media (max-width: 760px) {
   .app-shell {
-    grid-template-rows: auto auto auto 1fr auto;
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
   }
 
   .topbar {
@@ -479,21 +673,12 @@ select {
     justify-content: space-between;
   }
 
-  .status-strip {
-    overflow-x: auto;
+  .brand {
+    width: 100%;
   }
 
-  .pane-grid.row,
-  .pane-grid.column {
-    flex-direction: column;
-  }
-
-  .workspace-pane {
-    min-height: 360px;
-  }
-
-  .workspace-pane:not(.active) {
-    min-height: 132px;
+  .brand-active-tab {
+    max-width: 48vw;
   }
 
   .voice-console {

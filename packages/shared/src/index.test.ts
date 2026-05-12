@@ -13,6 +13,28 @@ describe("parseVoiceActionPlan", () => {
     expect(plan.actions[0]?.action).toBe("enter_text");
   });
 
+  it("strips null optional input fields emitted by strict structured output schemas", () => {
+    const plan = parseVoiceActionPlan({
+      transcript: "list folder",
+      summary: "List files.",
+      actions: [
+        {
+          id: null,
+          targetTabId: null,
+          pluginId: null,
+          action: "enter_text",
+          input: { text: "ls", submit: true, key: null, tabId: null, title: null, relativePath: null },
+          reason: null
+        }
+      ]
+    });
+
+    expect(plan.actions[0]).toEqual({
+      action: "enter_text",
+      input: { text: "ls", submit: true }
+    });
+  });
+
   it("rejects malformed actions", () => {
     expect(() =>
       parseVoiceActionPlan({

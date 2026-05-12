@@ -6,12 +6,28 @@ export type PluginPanelKind = "terminal" | "file-browser" | "placeholder";
 
 export type TabStatus = "idle" | "starting" | "running" | "waiting_approval" | "failed" | "completed" | "stopped";
 
+export type TabIndicatorColor = "green" | "yellow" | "red";
+
+export interface TabIndicator {
+  color: TabIndicatorColor;
+  label: string;
+  message?: string;
+  updatedAt: string;
+}
+
+export interface TabIndicatorUpdate {
+  color: TabIndicatorColor;
+  label: string;
+  message?: string;
+}
+
 export interface WorkspaceTab {
   id: string;
   pluginId: PluginId;
   title: string;
   cwd: string;
   status: TabStatus;
+  indicator: TabIndicator;
   createdAt: string;
   updatedAt: string;
   contextPath?: string;
@@ -22,6 +38,7 @@ export interface PluginActionDescriptor {
   name: string;
   description: string;
   voiceExposed: boolean;
+  defaultForVoice?: boolean;
   inputSchema: Record<string, unknown>;
 }
 
@@ -43,6 +60,17 @@ export interface CreateTabRequest {
 
 export interface CreateTabResponse {
   tab: WorkspaceTab;
+}
+
+export interface PathOption {
+  value: string;
+  label: string;
+  detail?: string;
+  kind: "root" | "directory";
+}
+
+export interface PathOptionsResponse {
+  options: PathOption[];
 }
 
 export interface VoiceAction {
@@ -77,14 +105,35 @@ export interface WorkspaceSnapshot {
   plugins: PluginDescriptor[];
 }
 
+export interface WorkspaceTabsUpdate {
+  type: "tabs";
+  activeTabId?: string;
+  tabs: WorkspaceTab[];
+}
+
+export type TabLayoutDirection = "row" | "column";
+
+export interface TabPaneState {
+  id: string;
+  tabIds: string[];
+  activeTabId?: string;
+}
+
+export type TabLayoutNode =
+  | {
+      type: "pane";
+      pane: TabPaneState;
+    }
+  | {
+      type: "split";
+      id: string;
+      direction: TabLayoutDirection;
+      sizes: [number, number];
+      children: [TabLayoutNode, TabLayoutNode];
+    };
+
 export interface TabLayoutState {
-  panes: Array<{
-    id: string;
-    tabIds: string[];
-    activeTabId?: string;
-    size: number;
-  }>;
-  direction: "row" | "column";
+  root: TabLayoutNode;
   activePaneId: string;
 }
 
@@ -134,7 +183,11 @@ export function parseVoiceAction(value: unknown, index = 0): VoiceAction {
     targetTabId: typeof value.targetTabId === "string" ? value.targetTabId : undefined,
     pluginId: typeof value.pluginId === "string" ? value.pluginId : undefined,
     action: value.action,
-    input: value.input,
+    input: stripNullishValues(value.input),
     reason: typeof value.reason === "string" ? value.reason : undefined
   };
+}
+
+function stripNullishValues(input: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== null && value !== undefined));
 }

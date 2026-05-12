@@ -1,107 +1,170 @@
-import { useEffect, useMemo, useState } from "react";
-import { Columns2, GitBranch, Mic, MicOff, PanelTopOpen, Plus, RefreshCw, Rows3, Wifi, X } from "lucide-react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement } from "react";
+import { Columns2, GitBranch, Mic, MicOff, PanelTopOpen, RefreshCw, Rows3, SquarePlus, Wifi, WifiOff, X } from "lucide-react";
 
-import type { PluginDescriptor, PluginId, TabLayoutState, WorkspaceTab } from "@cloudx/shared";
+import type { PathOption, PluginDescriptor, PluginId, TabLayoutState, WorkspaceTab, WorkspaceTabsUpdate } from "@cloudx/shared";
 
-import { closeTab, createTab, getPlugins, getTabs, setActiveTab, submitAudio, submitTranscript } from "../api.js";
+import { closeTab, createTab, getHealth, getPathOptions, getPlugins, getTabs, setActiveTab, submitAudio, submitTranscript } from "../api.js";
 import { FileBrowserPanel } from "./FileBrowserPanel.js";
-import { TerminalPanel } from "./TerminalPanel.js";
+import {
+  activatePane,
+  activatePaneTab,
+  addTabToPane,
+  defaultLayout,
+  findPane,
+  isStoredLayout,
+  listPanes,
+  placeTabInPane,
+  reconcileLayout,
+  removePane,
+  removeTabFromPanes,
+  resizeSplit,
+  splitPane,
+  type LayoutDirection,
+  type LayoutNode,
+  type Pane
+} from "./layout.js";
+import { shouldSubmitVoiceConsoleKey } from "./keyboard.js";
+import { clearFocusedAttention, isTabFocused, updateAttentionTabs } from "./tabAttention.js";
+import { disposeTerminalView, disposeTerminalViewsExcept, TerminalPanel } from "./TerminalPanel.js";
 
-type Pane = TabLayoutState["panes"][number];
-type LayoutDirection = TabLayoutState["direction"];
+type ConnectionStatus = "checking" | "connected" | "disconnected";
 
-const LAYOUT_KEY = "cloudx-layout-v1";
+const LAYOUT_KEY = "cloudx-layout-v2";
 
 export function App() {
+  const initialLayout = useMemo(() => loadLayout(), []);
   const [plugins, setPlugins] = useState<PluginDescriptor[]>([]);
   const [tabs, setTabs] = useState<WorkspaceTab[]>([]);
-  const [panes, setPanes] = useState<Pane[]>(loadLayout().panes);
-  const [layoutDirection, setLayoutDirection] = useState<LayoutDirection>(loadLayout().direction);
-  const [activePaneId, setActivePaneId] = useState(loadLayout().activePaneId);
+  const [layout, setLayout] = useState<TabLayoutState>(initialLayout);
   const [activeTabId, setActiveTabId] = useState<string | undefined>();
   const [createOpen, setCreateOpen] = useState(false);
   const [error, setError] = useState<string | undefined>();
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("checking");
   const [voiceState, setVoiceState] = useState<"idle" | "recording" | "processing">("idle");
   const [manualTranscript, setManualTranscript] = useState("");
+  const [attentionTabIds, setAttentionTabIds] = useState<Set<string>>(() => new Set());
+  const tabsRef = useRef<WorkspaceTab[]>([]);
+  const layoutRef = useRef<TabLayoutState>(initialLayout);
 
   useEffect(() => {
     void refresh();
+    const closeWorkspaceSocket = subscribeWorkspaceUpdates(
+      (update) => {
+        applyWorkspaceTabs(update.tabs, update.activeTabId);
+        setConnectionStatus("connected");
+      },
+      () => setConnectionStatus("disconnected")
+    );
+    const interval = window.setInterval(() => void checkConnection(), 5000);
+    return () => {
+      closeWorkspaceSocket();
+      window.clearInterval(interval);
+    };
   }, []);
 
   useEffect(() => {
-    persistLayout({ panes, direction: layoutDirection, activePaneId });
-  }, [activePaneId, layoutDirection, panes]);
+    persistLayout(layout);
+    layoutRef.current = layout;
+  }, [layout]);
+
+  useEffect(() => {
+    tabsRef.current = tabs;
+  }, [tabs]);
+
+  useEffect(() => {
+    if (!findPane(layout.root, layout.activePaneId)) {
+      setLayout((current) => activatePane(current, listPanes(current.root)[0]?.id ?? defaultLayout().activePaneId));
+    }
+  }, [layout]);
+
+  useEffect(() => {
+    disposeTerminalViewsExcept(new Set(tabs.map((tab) => tab.id)));
+  }, [tabs]);
+
+  useEffect(() => {
+    setAttentionTabIds((current) => clearFocusedAttention(current, layout));
+  }, [layout]);
 
   const tabById = useMemo(() => new Map(tabs.map((tab) => [tab.id, tab])), [tabs]);
   const pluginById = useMemo(() => new Map(plugins.map((plugin) => [plugin.id, plugin])), [plugins]);
+  const panes = useMemo(() => listPanes(layout.root), [layout.root]);
+  const activePaneId = layout.activePaneId;
+  const serverLabel = window.location.host || "server";
+  const activeTab = activeTabId ? tabById.get(activeTabId) : undefined;
+  const microphoneUnavailableReason = getMicrophoneUnavailableReason();
 
   async function refresh() {
-    const [pluginList, tabState] = await Promise.all([getPlugins(), getTabs()]);
-    setPlugins(pluginList);
-    setTabs(tabState.tabs);
-    setActiveTabId(tabState.activeTabId);
-    setPanes((current) => reconcilePanes(current, tabState.tabs, tabState.activeTabId));
+    setConnectionStatus("checking");
+    try {
+      const [pluginList, tabState] = await Promise.all([getPlugins(), getTabs()]);
+      setPlugins(pluginList);
+      applyWorkspaceTabs(tabState.tabs, tabState.activeTabId);
+      setConnectionStatus("connected");
+      setError(undefined);
+    } catch (err) {
+      setConnectionStatus("disconnected");
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  function applyWorkspaceTabs(nextTabs: WorkspaceTab[], nextActiveTabId?: string) {
+    const previousTabs = new Map(tabsRef.current.map((tab) => [tab.id, tab]));
+    const nextLayout = reconcileLayout(layoutRef.current, nextTabs, nextActiveTabId);
+    tabsRef.current = nextTabs;
+    layoutRef.current = nextLayout;
+    setTabs(nextTabs);
+    setActiveTabId(nextActiveTabId);
+    setLayout(nextLayout);
+    setAttentionTabIds((current) => updateAttentionTabs(current, previousTabs, nextTabs, nextLayout));
+  }
+
+  async function checkConnection() {
+    try {
+      await getHealth();
+      setConnectionStatus("connected");
+    } catch {
+      setConnectionStatus("disconnected");
+    }
   }
 
   async function activateTab(tabId: string, paneId = activePaneId) {
     setActiveTabId(tabId);
-    setActivePaneId(paneId);
-    setPanes((current) => current.map((pane) => (pane.id === paneId ? { ...pane, activeTabId: tabId } : pane)));
+    setLayout((current) => activatePaneTab(current, paneId, tabId));
     await setActiveTab(tabId);
   }
 
   function split(direction: LayoutDirection) {
-    setLayoutDirection(direction);
-    setPanes((current) => {
-      if (current.length >= 4) return current;
-      const next = [...current, { id: `pane-${crypto.randomUUID()}`, tabIds: [], activeTabId: undefined, size: 100 }];
-      return normalizeSizes(next);
-    });
+    setLayout((current) => splitPane(current, direction, () => `pane-${crypto.randomUUID()}`, () => `split-${crypto.randomUUID()}`));
   }
 
-  function resizePane(index: number, deltaPixels: number, containerPixels: number) {
-    if (containerPixels <= 0) return;
-    const delta = (deltaPixels / containerPixels) * 100;
-    setPanes((current) => {
-      const next = current.map((pane) => ({ ...pane }));
-      const left = next[index];
-      const right = next[index + 1];
-      if (!left || !right) return current;
-      left.size = Math.max(12, left.size + delta);
-      right.size = Math.max(12, right.size - delta);
-      return normalizeSizes(next);
-    });
+  function resizePane(splitId: string, deltaPixels: number, containerPixels: number) {
+    setLayout((current) => resizeSplit(current, splitId, deltaPixels, containerPixels));
   }
 
   function handleDropTab(targetPaneId: string, tabId: string, beforeTabId?: string) {
     if (!tabId) return;
-    setPanes((current) => {
-      const withoutTab = current.map((pane) => ({ ...pane, tabIds: pane.tabIds.filter((id) => id !== tabId) }));
-      return withoutTab.map((pane) => {
-        if (pane.id !== targetPaneId) return pane;
-        const tabIds = beforeTabId ? insertBefore(pane.tabIds, tabId, beforeTabId) : [...pane.tabIds, tabId];
-        return { ...pane, tabIds, activeTabId: tabId };
-      });
-    });
+    setLayout((current) => placeTabInPane(current, targetPaneId, tabId, beforeTabId));
     void activateTab(tabId, targetPaneId);
+  }
+
+  function handlePaneFocus(pane: Pane) {
+    if (pane.activeTabId) {
+      void activateTab(pane.activeTabId, pane.id);
+      return;
+    }
+    setLayout((current) => activatePane(current, pane.id));
+  }
+
+  function handleClosePane(paneId: string) {
+    setLayout((current) => removePane(current, paneId));
   }
 
   async function handleCreate(input: { pluginId: PluginId; cwd: string; title: string; createDirectory: boolean }) {
     setError(undefined);
     try {
       const tab = await createTab(input);
-      setTabs((current) => [...current, tab]);
-      setPanes((current) =>
-        current.map((pane) =>
-          pane.id === activePaneId
-            ? {
-                ...pane,
-                tabIds: [...pane.tabIds, tab.id],
-                activeTabId: tab.id
-              }
-            : pane
-        )
-      );
+      setTabs((current) => upsertTab(current, tab));
+      setLayout((current) => addTabToPane(current, activePaneId, tab.id));
       setActiveTabId(tab.id);
       setCreateOpen(false);
     } catch (err) {
@@ -114,16 +177,20 @@ export function App() {
     try {
       const result = await closeTab(tabId);
       setTabs((current) => current.filter((tab) => tab.id !== tabId));
-      setPanes((current) =>
-        current.map((pane) => {
-          const tabIds = pane.tabIds.filter((id) => id !== tabId);
-          return { ...pane, tabIds, activeTabId: pane.activeTabId === tabId ? tabIds[0] : pane.activeTabId };
-        })
-      );
+      setLayout((current) => removeTabFromPanes(current, tabId));
       setActiveTabId(result.activeTabId);
+      disposeTerminalView(tabId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
+  }
+
+  function handleTranscriptKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (!shouldSubmitVoiceConsoleKey({ key: event.key, shiftKey: event.shiftKey, isComposing: event.nativeEvent.isComposing })) {
+      return;
+    }
+    event.preventDefault();
+    void handleManualTranscript();
   }
 
   async function handleManualTranscript() {
@@ -133,6 +200,7 @@ export function App() {
     try {
       await submitTranscript(manualTranscript, activeTabId);
       setManualTranscript("");
+      await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -143,8 +211,8 @@ export function App() {
   async function handleMic() {
     setError(undefined);
     if (voiceState !== "idle") return;
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setError("This browser does not expose microphone capture.");
+    if (microphoneUnavailableReason) {
+      setError(microphoneUnavailableReason);
       return;
     }
     setVoiceState("recording");
@@ -164,6 +232,7 @@ export function App() {
       const audio = await stopped;
       setVoiceState("processing");
       await submitAudio(audio, activeTabId);
+      await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -177,9 +246,14 @@ export function App() {
         <div className="brand">
           <GitBranch size={18} />
           <span>Cloudx</span>
+          <span className={`connection-status ${connectionStatus}`} title={`Server ${connectionStatus}: ${serverLabel}`}>
+            {connectionStatus === "connected" ? <Wifi size={14} /> : <WifiOff size={14} />} {serverLabel}
+          </span>
+          {activeTab ? <span className="brand-active-tab" title={`Active tab: ${activeTab.title}`}>{activeTab.title}</span> : null}
+          {voiceState !== "idle" ? <span className={`voice-status ${voiceState}`}>{voiceState}</span> : null}
         </div>
         <div className="topbar-actions">
-          <button className="icon-button" onClick={() => void refresh()} title="Refresh">
+          <button className="icon-button" onClick={() => window.location.reload()} title="Reload app">
             <RefreshCw size={17} />
           </button>
           <button className="icon-button" onClick={() => split("row")} title="Split columns">
@@ -188,96 +262,140 @@ export function App() {
           <button className="icon-button" onClick={() => split("column")} title="Split rows">
             <Rows3 size={17} />
           </button>
-          <button className="primary-button" onClick={() => setCreateOpen(true)}>
-            <Plus size={17} />
-            New
-          </button>
-          <button className={`mic-button ${voiceState}`} onClick={() => void handleMic()} title="Record voice command">
+          <button className={`mic-button ${voiceState} ${microphoneUnavailableReason ? "unavailable" : ""}`} onClick={() => void handleMic()} title={microphoneUnavailableReason ?? "Record voice command"}>
             {voiceState === "recording" ? <MicOff size={17} /> : <Mic size={17} />}
           </button>
         </div>
       </header>
 
-      <section className="status-strip">
-        <span>
-          <Wifi size={14} /> 0.0.0.0:3001
-        </span>
-        <span>{activeTabId ? `Active ${tabById.get(activeTabId)?.title ?? activeTabId}` : "No active tab"}</span>
-        <span>{voiceState}</span>
-      </section>
-
       {error ? <div className="error-banner">{error}</div> : null}
 
-      <section className={`pane-grid ${layoutDirection}`}>
-        {panes.map((pane, index) => (
-          <div
-            className={`workspace-pane ${pane.id === activePaneId ? "active" : ""}`}
-            key={pane.id}
-            style={{ flexBasis: `${pane.size}%` }}
-            onClick={() => setActivePaneId(pane.id)}
-            onDragOver={(event) => event.preventDefault()}
-            onDrop={(event) => handleDropTab(pane.id, event.dataTransfer.getData("text/tab-id"))}
-          >
-            <div className="tab-strip">
-              {pane.tabIds.map((tabId) => {
-                const tab = tabById.get(tabId);
-                if (!tab) return null;
-                const selected = (pane.activeTabId ?? activeTabId) === tabId;
-                return (
-                  <button
-                    key={tabId}
-                    draggable
-                    className={`tab-button ${selected ? "selected" : ""}`}
-                    onDragOver={(event) => event.preventDefault()}
-                    onDrop={(event) => {
-                      event.stopPropagation();
-                      handleDropTab(pane.id, event.dataTransfer.getData("text/tab-id"), tabId);
-                    }}
-                    onDragStart={(event) => event.dataTransfer.setData("text/tab-id", tabId)}
-                    onClick={() => void activateTab(tabId, pane.id)}
-                  >
-                    <span>{tab.title}</span>
-                    <small>{tab.status}</small>
-                    <X
-                      size={13}
-                      className="tab-close"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void handleClose(tabId);
-                      }}
-                    />
-                  </button>
-                );
-              })}
-              <button className="new-tab-inline" onClick={() => setCreateOpen(true)} title="New tab">
-                <PanelTopOpen size={16} />
-              </button>
-            </div>
-            <div className="pane-body">
-              {pane.activeTabId && tabById.has(pane.activeTabId) ? (
-                <PluginPanel tab={tabById.get(pane.activeTabId)!} plugin={pluginById.get(tabById.get(pane.activeTabId)!.pluginId)} active={activeTabId === pane.activeTabId} />
-              ) : (
-                <div className="empty-pane">
-                  <PanelTopOpen size={28} />
-                  <span>Drop a tab here or create a plugin tab.</span>
-                </div>
-              )}
-            </div>
-            {index < panes.length - 1 ? <ResizeHandle direction={layoutDirection} onResize={(delta, total) => resizePane(index, delta, total)} /> : null}
-          </div>
-        ))}
+      <section className="pane-root">
+        {renderLayoutNode(layout.root)}
       </section>
 
       <footer className="voice-console">
-        <input value={manualTranscript} onChange={(event) => setManualTranscript(event.target.value)} placeholder="Type a voice transcript fallback, e.g. 'tell the active Codex tab to run tests'" />
-        <button onClick={() => void handleManualTranscript()} disabled={voiceState !== "idle"}>
-          Send
-        </button>
+        <textarea
+          aria-label="Voice transcript"
+          value={manualTranscript}
+          onChange={(event) => setManualTranscript(event.target.value)}
+          onKeyDown={handleTranscriptKeyDown}
+          placeholder="Type what you would say. Enter sends, Shift+Enter inserts a new line."
+          rows={2}
+          disabled={voiceState !== "idle"}
+        />
       </footer>
 
       {createOpen ? <CreateTabDialog plugins={plugins} onCancel={() => setCreateOpen(false)} onCreate={handleCreate} /> : null}
     </main>
   );
+
+  function renderLayoutNode(node: LayoutNode): ReactElement {
+    if (node.type === "pane") {
+      return renderPane(node.pane);
+    }
+    return (
+      <div className={`pane-split ${node.direction}`} data-split-id={node.id}>
+        <div className="pane-split-child" style={{ flexBasis: `${node.sizes[0]}%` }}>
+          {renderLayoutNode(node.children[0])}
+        </div>
+        <ResizeHandle direction={node.direction} onResize={(delta, total) => resizePane(node.id, delta, total)} />
+        <div className="pane-split-child" style={{ flexBasis: `${node.sizes[1]}%` }}>
+          {renderLayoutNode(node.children[1])}
+        </div>
+      </div>
+    );
+  }
+
+  function renderPane(pane: Pane): ReactElement {
+    const paneActive = pane.id === activePaneId;
+    return (
+      <div
+        className={`workspace-pane ${paneActive ? "active" : ""}`}
+        key={pane.id}
+        data-pane-id={pane.id}
+        onClick={() => handlePaneFocus(pane)}
+        onDragOver={(event) => event.preventDefault()}
+        onDrop={(event) => handleDropTab(pane.id, event.dataTransfer.getData("text/tab-id"))}
+      >
+        <div className="tab-strip">
+          {pane.tabIds.map((tabId) => {
+            const tab = tabById.get(tabId);
+            if (!tab) return null;
+            const selected = pane.activeTabId === tabId;
+            const focused = isTabFocused(layout, tabId);
+            const shouldBlink = attentionTabIds.has(tabId) && !focused;
+            return (
+              <button
+                key={tabId}
+                draggable
+                className={`tab-button ${selected ? "selected" : ""}`}
+                onDragOver={(event) => event.preventDefault()}
+                onDrop={(event) => {
+                  event.stopPropagation();
+                  handleDropTab(pane.id, event.dataTransfer.getData("text/tab-id"), tabId);
+                }}
+                onDragStart={(event) => event.dataTransfer.setData("text/tab-id", tabId)}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void activateTab(tabId, pane.id);
+                }}
+              >
+                <span className="tab-title">{tab.title}</span>
+                <TabIndicatorDot tab={tab} attention={shouldBlink} />
+                <X
+                  size={13}
+                  className="tab-close"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void handleClose(tabId);
+                  }}
+                />
+              </button>
+            );
+          })}
+          <button
+            className="new-tab-inline add-tab-button"
+            onClick={(event) => {
+              event.stopPropagation();
+              setLayout((current) => activatePane(current, pane.id));
+              setCreateOpen(true);
+            }}
+            title="Add tab to this pane"
+          >
+            <SquarePlus size={18} />
+          </button>
+          {panes.length > 1 ? (
+            <button
+              className="new-tab-inline pane-close-button"
+              onClick={(event) => {
+                event.stopPropagation();
+                handleClosePane(pane.id);
+              }}
+              title="Close pane"
+            >
+              <X size={16} />
+            </button>
+          ) : null}
+        </div>
+        <div className="pane-body">
+          {pane.activeTabId && tabById.has(pane.activeTabId) ? (
+            <PluginPanel tab={tabById.get(pane.activeTabId)!} plugin={pluginById.get(tabById.get(pane.activeTabId)!.pluginId)} active={paneActive} />
+          ) : (
+            <div className="empty-pane">
+              <PanelTopOpen size={28} />
+              <span>Drop a tab here or create a plugin tab.</span>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+}
+
+function TabIndicatorDot({ tab, attention }: { tab: WorkspaceTab; attention?: boolean }) {
+  const title = tab.indicator.message ? `${tab.indicator.label}: ${tab.indicator.message}` : tab.indicator.label;
+  return <span className={`tab-indicator ${tab.indicator.color} ${attention ? "attention" : ""}`} title={title} aria-label={title} />;
 }
 
 function PluginPanel({ tab, plugin, active }: { tab: WorkspaceTab; plugin: PluginDescriptor | undefined; active: boolean }) {
@@ -313,49 +431,13 @@ function ResizeHandle({ direction, onResize }: { direction: LayoutDirection; onR
   );
 }
 
-function reconcilePanes(current: Pane[], tabs: WorkspaceTab[], activeTabId?: string): Pane[] {
-  const known = new Set(tabs.map((tab) => tab.id));
-  const assigned = new Set<string>();
-  const panes = current.map((pane) => {
-    const tabIds = pane.tabIds.filter((tabId) => known.has(tabId));
-    tabIds.forEach((tabId) => assigned.add(tabId));
-    return {
-      ...pane,
-      tabIds,
-      activeTabId: pane.activeTabId && known.has(pane.activeTabId) ? pane.activeTabId : tabIds[0]
-    };
-  });
-  const unassigned = tabs.map((tab) => tab.id).filter((tabId) => !assigned.has(tabId));
-  const first = panes[0] ?? { id: "pane-1", tabIds: [], size: 100 };
-  return normalizeSizes([
-    {
-      ...first,
-      tabIds: [...first.tabIds, ...unassigned],
-      activeTabId: activeTabId ?? first.activeTabId ?? unassigned[0]
-    },
-    ...panes.slice(1)
-  ]);
-}
-
-function normalizeSizes(panes: Pane[]): Pane[] {
-  const total = panes.reduce((sum, pane) => sum + (pane.size || 100), 0) || 100;
-  return panes.map((pane) => ({ ...pane, size: (pane.size || 100) * (100 / total) }));
-}
-
-function insertBefore(items: string[], item: string, before: string): string[] {
-  const filtered = items.filter((candidate) => candidate !== item);
-  const index = filtered.indexOf(before);
-  if (index === -1) return [...filtered, item];
-  return [...filtered.slice(0, index), item, ...filtered.slice(index)];
-}
-
 function loadLayout(): TabLayoutState {
   if (typeof window === "undefined") {
     return defaultLayout();
   }
   try {
-    const parsed = JSON.parse(window.localStorage.getItem(LAYOUT_KEY) ?? "") as TabLayoutState;
-    if (Array.isArray(parsed.panes) && parsed.panes.length > 0 && (parsed.direction === "row" || parsed.direction === "column")) {
+    const parsed = JSON.parse(window.localStorage.getItem(LAYOUT_KEY) ?? "") as unknown;
+    if (isStoredLayout(parsed)) {
       return parsed;
     }
   } catch {
@@ -368,11 +450,47 @@ function persistLayout(layout: TabLayoutState) {
   window.localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout));
 }
 
-function defaultLayout(): TabLayoutState {
-  return {
-    panes: [{ id: "pane-1", tabIds: [], activeTabId: undefined, size: 100 }],
-    direction: "row",
-    activePaneId: "pane-1"
+function upsertTab(tabs: WorkspaceTab[], tab: WorkspaceTab): WorkspaceTab[] {
+  const existingIndex = tabs.findIndex((candidate) => candidate.id === tab.id);
+  if (existingIndex === -1) {
+    return [...tabs, tab];
+  }
+  return [...tabs.slice(0, existingIndex), tab, ...tabs.slice(existingIndex + 1)];
+}
+
+function getMicrophoneUnavailableReason(): string | undefined {
+  if (typeof window !== "undefined" && !window.isSecureContext) {
+    return "Microphone capture requires HTTPS or localhost. Run Cloudx over https://<host>:3001 and trust the local Cloudx certificate on this device.";
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    return "This browser does not expose microphone capture.";
+  }
+  if (typeof MediaRecorder === "undefined") {
+    return "This browser does not support MediaRecorder microphone upload.";
+  }
+  return undefined;
+}
+
+function subscribeWorkspaceUpdates(onUpdate: (update: WorkspaceTabsUpdate) => void, onDisconnect: () => void): () => void {
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  const socket = new WebSocket(`${protocol}://${window.location.host}/ws/workspace`);
+  let closedByClient = false;
+
+  socket.addEventListener("message", (event) => {
+    const message = JSON.parse(event.data as string) as WorkspaceTabsUpdate;
+    if (message.type === "tabs") {
+      onUpdate(message);
+    }
+  });
+  socket.addEventListener("close", () => {
+    if (!closedByClient) {
+      onDisconnect();
+    }
+  });
+
+  return () => {
+    closedByClient = true;
+    socket.close();
   };
 }
 
@@ -387,10 +505,41 @@ function CreateTabDialog({
 }) {
   const creatablePlugins = plugins.filter((plugin) => plugin.creatable);
   const [pluginId, setPluginId] = useState<PluginId>("codex-terminal");
-  const [cwd, setCwd] = useState("");
+  const [cwd, setCwd] = useState("~");
   const [title, setTitle] = useState("");
   const [createDirectory, setCreateDirectory] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [pathOptions, setPathOptions] = useState<PathOption[]>([]);
+  const [pathOptionsOpen, setPathOptionsOpen] = useState(false);
+  const [highlightedPathOption, setHighlightedPathOption] = useState(0);
+  const [pathOptionsError, setPathOptionsError] = useState<string | undefined>();
+
+  useEffect(() => {
+    if (!pathOptionsOpen) return;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void loadPathOptions();
+    }, 120);
+
+    async function loadPathOptions() {
+      try {
+        const options = await getPathOptions(cwd);
+        if (cancelled) return;
+        setPathOptions(options);
+        setHighlightedPathOption(0);
+        setPathOptionsError(undefined);
+      } catch (err) {
+        if (cancelled) return;
+        setPathOptions([]);
+        setPathOptionsError(err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [cwd, pathOptionsOpen]);
 
   async function submit() {
     setBusy(true);
@@ -398,6 +547,31 @@ function CreateTabDialog({
       await onCreate({ pluginId, cwd, title, createDirectory });
     } finally {
       setBusy(false);
+    }
+  }
+
+  function choosePathOption(option: PathOption) {
+    setCwd(option.value);
+    setPathOptionsOpen(false);
+    setHighlightedPathOption(0);
+  }
+
+  function handlePathKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+    if (!pathOptionsOpen || pathOptions.length === 0) return;
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setHighlightedPathOption((current) => (current + 1) % pathOptions.length);
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setHighlightedPathOption((current) => (current - 1 + pathOptions.length) % pathOptions.length);
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      const option = pathOptions[highlightedPathOption];
+      if (option) {
+        choosePathOption(option);
+      }
+    } else if (event.key === "Escape") {
+      setPathOptionsOpen(false);
     }
   }
 
@@ -415,10 +589,50 @@ function CreateTabDialog({
             ))}
           </select>
         </label>
-        <label>
-          Directory
-          <input value={cwd} onChange={(event) => setCwd(event.target.value)} placeholder="/workspace/project" />
-        </label>
+        <div className="field-group">
+          <label htmlFor="new-tab-directory">Directory</label>
+          <div className="path-autocomplete">
+            <input
+              id="new-tab-directory"
+              value={cwd}
+              onChange={(event) => {
+                setCwd(event.target.value);
+                setPathOptionsOpen(true);
+              }}
+              onFocus={() => setPathOptionsOpen(true)}
+              onBlur={() => window.setTimeout(() => setPathOptionsOpen(false), 100)}
+              onKeyDown={handlePathKeyDown}
+              placeholder="~, ~/project, or relative/path"
+              autoComplete="off"
+              aria-autocomplete="list"
+              aria-controls="new-tab-path-options"
+              aria-expanded={pathOptionsOpen}
+            />
+            {pathOptionsOpen ? (
+              <div id="new-tab-path-options" className="path-options" role="listbox">
+                {pathOptions.length > 0 ? (
+                  pathOptions.map((option, index) => (
+                    <button
+                      key={`${option.kind}:${option.value}`}
+                      type="button"
+                      className={`path-option ${index === highlightedPathOption ? "active" : ""}`}
+                      role="option"
+                      aria-selected={index === highlightedPathOption}
+                      onMouseDown={(event) => event.preventDefault()}
+                      onMouseEnter={() => setHighlightedPathOption(index)}
+                      onClick={() => choosePathOption(option)}
+                    >
+                      <span>{option.label}</span>
+                      {option.detail ? <small>{option.detail}</small> : null}
+                    </button>
+                  ))
+                ) : (
+                  <div className="path-options-empty">{pathOptionsError ?? "No matching directories."}</div>
+                )}
+              </div>
+            ) : null}
+          </div>
+        </div>
         <label>
           Title
           <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Optional tab title" />

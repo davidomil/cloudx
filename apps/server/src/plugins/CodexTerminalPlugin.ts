@@ -1,15 +1,24 @@
-import type { CreatePluginSessionInput, PluginActionDefinition, PluginSession, PluginSessionSnapshot, WorkspacePlugin } from "@cloudx/plugin-api";
+import type {
+  CreatePluginSessionInput,
+  PluginActionDefinition,
+  PluginSession,
+  PluginSessionSnapshot,
+  PluginTabControls,
+  PluginVoiceContext,
+  WorkspacePlugin
+} from "@cloudx/plugin-api";
 import type { WorkspaceTab } from "@cloudx/shared";
 
 import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
 
-const MAX_RECENT_OUTPUT = 8000;
+export const DEFAULT_TERMINAL_REPLAY_BYTES = 1_048_576;
 
 export const TERMINAL_ACTIONS: PluginActionDefinition[] = [
   {
     name: "enter_text",
     description: "Type text into the terminal.",
     voiceExposed: true,
+    defaultForVoice: true,
     inputSchema: {
       type: "object",
       properties: {
@@ -64,7 +73,10 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
 
   readonly actions = TERMINAL_ACTIONS;
 
-  constructor(private readonly factory: TerminalProcessFactory) {}
+  constructor(
+    private readonly factory: TerminalProcessFactory,
+    private readonly replayBytes = DEFAULT_TERMINAL_REPLAY_BYTES
+  ) {}
 
   descriptor() {
     return {
@@ -84,7 +96,59 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       cols: 100,
       rows: 30
     });
-    return new CodexTerminalSession(input.tab, terminalProcess);
+    return new CodexTerminalSession(input.tab, terminalProcess, input.controls, {
+      closeOnExit: true,
+      replayBytes: this.replayBytes,
+      voiceKind: "codex-terminal",
+      voiceSummary: "Interactive Codex CLI terminal. Send natural-language coding instructions here."
+    });
+  }
+}
+
+interface TerminalSessionOptions {
+  closeOnExit: boolean;
+  replayBytes?: number;
+  voiceKind?: "codex-terminal" | "standard-terminal" | "terminal";
+  voiceSummary?: string;
+}
+
+export interface TerminalCommandFinishEvent {
+  exitCode?: number;
+  sequence: 133 | 633;
+}
+
+export class TerminalShellIntegrationParser {
+  private buffer = "";
+
+  push(data: string): TerminalCommandFinishEvent[] {
+    this.buffer += data;
+    const events: TerminalCommandFinishEvent[] = [];
+
+    while (true) {
+      const oscStart = this.buffer.indexOf("\u001b]");
+      if (oscStart === -1) {
+        this.buffer = this.buffer.slice(-1);
+        return events;
+      }
+      if (oscStart > 0) {
+        this.buffer = this.buffer.slice(oscStart);
+      }
+
+      const belEnd = this.buffer.indexOf("\u0007", 2);
+      const stEnd = this.buffer.indexOf("\u001b\\", 2);
+      const terminator = firstTerminator(belEnd, stEnd);
+      if (!terminator) {
+        this.buffer = this.buffer.slice(0, 4096);
+        return events;
+      }
+
+      const payload = this.buffer.slice(2, terminator.index);
+      this.buffer = this.buffer.slice(terminator.index + terminator.length);
+      const event = parseShellIntegrationPayload(payload);
+      if (event) {
+        events.push(event);
+      }
+    }
   }
 }
 
@@ -92,17 +156,30 @@ export class CodexTerminalSession implements PluginSession {
   private recentOutput = "";
   private stopped = false;
   private status: WorkspaceTab["status"];
+  private readonly replayBytes: number;
+  private readonly shellIntegrationParser = new TerminalShellIntegrationParser();
   private readonly statusListeners = new Set<(status: WorkspaceTab["status"], message?: string) => void>();
 
   constructor(
     public readonly tab: WorkspaceTab,
-    private readonly terminalProcess: TerminalProcess
+    private readonly terminalProcess: TerminalProcess,
+    private readonly controls: PluginTabControls = noopControls,
+    private readonly options: TerminalSessionOptions = { closeOnExit: false }
   ) {
     this.status = tab.status;
+    this.replayBytes = options.replayBytes ?? DEFAULT_TERMINAL_REPLAY_BYTES;
     this.terminalProcess.onData((data) => {
-      this.recentOutput = `${this.recentOutput}${data}`.slice(-MAX_RECENT_OUTPUT);
+      this.recentOutput = trimRecentOutput(`${this.recentOutput}${data}`, this.replayBytes);
+      for (const event of this.shellIntegrationParser.push(data)) {
+        this.recordCommandFinish(event.exitCode);
+      }
     });
     this.terminalProcess.onExit((event) => {
+      if (this.options.closeOnExit) {
+        const message = event.exitCode === 0 ? "Codex exited cleanly." : `Codex exited with code ${event.exitCode}.`;
+        this.controls.closeTab(message);
+        return;
+      }
       if (this.stopped) {
         this.setStatus("stopped", "Terminal was stopped.");
         return;
@@ -149,11 +226,19 @@ export class CodexTerminalSession implements PluginSession {
     };
   }
 
-  voiceContext(): Record<string, unknown> {
+  voiceContext(): PluginVoiceContext {
+    const recentOutput = this.recentOutput.slice(-4000);
     return {
-      recentOutput: this.recentOutput.slice(-2500),
+      kind: this.options.voiceKind ?? "terminal",
       cwd: this.tab.cwd,
-      status: this.status
+      status: this.status,
+      summary: this.options.voiceSummary ?? "Interactive shell terminal. Translate natural-language shell requests into commands before typing.",
+      visibleText: recentOutput,
+      recentOutput,
+      metadata: {
+        outputBytes: Buffer.byteLength(this.recentOutput, "utf8"),
+        replayBytes: this.replayBytes
+      }
     };
   }
 
@@ -188,7 +273,62 @@ export class CodexTerminalSession implements PluginSession {
       listener(status, message);
     }
   }
+
+  private recordCommandFinish(exitCode: number | undefined): void {
+    if (typeof exitCode === "number" && exitCode !== 0) {
+      this.controls.setTabIndicator({
+        color: "red",
+        label: "Command failed",
+        message: `Command failed with exit code ${exitCode}.`
+      });
+      return;
+    }
+    this.controls.setTabIndicator({
+      color: "green",
+      label: "Command completed",
+      message: typeof exitCode === "number" ? "Command finished successfully." : "Command finished."
+    });
+  }
 }
+
+function trimRecentOutput(output: string, maxBytes: number): string {
+  if (Buffer.byteLength(output, "utf8") <= maxBytes) {
+    return output;
+  }
+  return Buffer.from(output, "utf8").subarray(-maxBytes).toString("utf8");
+}
+
+function firstTerminator(belEnd: number, stEnd: number): { index: number; length: number } | undefined {
+  if (belEnd === -1 && stEnd === -1) {
+    return undefined;
+  }
+  if (belEnd !== -1 && (stEnd === -1 || belEnd < stEnd)) {
+    return { index: belEnd, length: 1 };
+  }
+  return { index: stEnd, length: 2 };
+}
+
+function parseShellIntegrationPayload(payload: string): TerminalCommandFinishEvent | undefined {
+  const [identifier, marker, exitCodeText] = payload.split(";");
+  if ((identifier !== "133" && identifier !== "633") || marker !== "D") {
+    return undefined;
+  }
+  if (exitCodeText === undefined || exitCodeText === "") {
+    return { sequence: identifier === "133" ? 133 : 633 };
+  }
+  if (!/^-?\d+$/.test(exitCodeText)) {
+    return undefined;
+  }
+  return {
+    sequence: identifier === "133" ? 133 : 633,
+    exitCode: Number(exitCodeText)
+  };
+}
+
+const noopControls: PluginTabControls = {
+  setTabIndicator: () => undefined,
+  closeTab: () => undefined
+};
 
 function requireString(value: unknown, name: string): string {
   if (typeof value !== "string") {

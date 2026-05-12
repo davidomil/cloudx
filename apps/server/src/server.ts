@@ -14,6 +14,7 @@ import { PluginRegistry } from "./pluginRegistry.js";
 import { CodexTerminalPlugin } from "./plugins/CodexTerminalPlugin.js";
 import { FileBrowserPlugin } from "./plugins/FileBrowserPlugin.js";
 import { StandardTerminalPlugin } from "./plugins/StandardTerminalPlugin.js";
+import { WorkspaceControlPlugin } from "./plugins/WorkspaceControlPlugin.js";
 import { SessionStore } from "./sessionStore.js";
 import { NodePtyTerminalProcessFactory } from "./terminal/NodePtyTerminalProcess.js";
 import { VoiceController } from "./voice/VoiceController.js";
@@ -25,12 +26,22 @@ import { AppServerContextProvider } from "./appServer/AppServerContextProvider.j
 export interface AppServices {
   plugins: PluginRegistry;
   sessions: SessionStore;
+  pathPolicy: PathPolicy;
   voice: VoiceController;
   asr: AsrClient;
 }
 
 export async function buildServer(config: AppConfig, services = buildServices(config)): Promise<FastifyInstance> {
-  const app = Fastify({ logger: true, requestTimeout: 120_000 });
+  const app = Fastify({
+    logger: true,
+    requestTimeout: 120_000,
+    https: config.https
+      ? {
+          key: fs.readFileSync(config.https.keyPath),
+          cert: fs.readFileSync(config.https.certPath)
+        }
+      : null
+  });
   await app.register(cors, { origin: true });
   await app.register(websocket);
 
@@ -46,6 +57,10 @@ export async function buildServer(config: AppConfig, services = buildServices(co
   }));
 
   app.get("/api/plugins", async () => ({ plugins: services.plugins.list() }));
+
+  app.get<{ Querystring: { query?: string } }>("/api/paths/options", async (request) => ({
+    options: await services.pathPolicy.suggestDirectories(request.query.query ?? "")
+  }));
 
   app.get("/api/tabs", async () => ({ tabs: services.sessions.listTabs(), activeTabId: services.sessions.getActiveTabId() }));
 
@@ -78,6 +93,18 @@ export async function buildServer(config: AppConfig, services = buildServices(co
     const context = JSON.stringify(await services.sessions.buildVoiceContext(request.query.activeTabId));
     const transcript = await services.asr.transcribe(request.body, request.query.filename ?? "voice.webm", context);
     return services.voice.handleTranscript(transcript.text, request.query.activeTabId);
+  });
+
+  app.get("/ws/workspace", { websocket: true }, (socket) => {
+    const ws = socket as WebSocket;
+    const send = (payload: unknown) => {
+      if (ws.readyState === 1) {
+        ws.send(JSON.stringify(payload));
+      }
+    };
+    send({ type: "tabs", tabs: services.sessions.listTabs(), activeTabId: services.sessions.getActiveTabId() });
+    const dispose = services.sessions.onTabsChange(send);
+    ws.on("close", () => dispose());
   });
 
   app.get("/ws/terminal/:tabId", { websocket: true }, (socket, request) => {
@@ -126,9 +153,10 @@ export function buildServices(config: AppConfig): AppServices {
   const plugins = new PluginRegistry();
   const pathPolicy = new PathPolicy(config.allowedRoots);
   const terminalFactory = new NodePtyTerminalProcessFactory();
-  plugins.register(new CodexTerminalPlugin(terminalFactory));
-  plugins.register(new StandardTerminalPlugin(terminalFactory));
+  plugins.register(new CodexTerminalPlugin(terminalFactory, config.terminalReplayBytes));
+  plugins.register(new StandardTerminalPlugin(terminalFactory, config.terminalReplayBytes));
   plugins.register(new FileBrowserPlugin(pathPolicy));
+  plugins.register(new WorkspaceControlPlugin());
   const sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir));
   const asr = new AsrClient(config.asrUrl);
   const voice = new VoiceController(
@@ -136,5 +164,5 @@ export function buildServices(config: AppConfig): AppServices {
     new CodexExecVoicePlanner(config.voiceModel),
     new AppServerContextProvider(sessions, config.appServerEnabled ? () => new AppServerClient() : undefined)
   );
-  return { plugins, sessions, voice, asr };
+  return { plugins, sessions, pathPolicy, voice, asr };
 }
