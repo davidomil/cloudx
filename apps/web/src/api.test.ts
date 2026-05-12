@@ -68,8 +68,9 @@ describe("api client", () => {
       }
     }
     class TestMediaRecorder extends FakeMediaRecorder {
-      constructor(input: MediaStream) {
-        super(input);
+      static supportedMimeTypes = new Set(["audio/webm;codecs=opus"]);
+      constructor(input: MediaStream, options?: MediaRecorderOptions) {
+        super(input, options);
         recorders.push(this);
       }
     }
@@ -84,6 +85,8 @@ describe("api client", () => {
     const session = await startAudioStream(stream, "tab-1", { activePaneId: "pane-2" }, (status) => statuses.push(status.status));
 
     expect(recorders[0]?.timeslice).toBe(750);
+    expect(recorders[0]?.mimeType).toBe("audio/webm;codecs=opus");
+    expect(new URL(String(sockets[0]!.url)).searchParams.get("filename")).toBe("voice.webm");
     expect(JSON.parse(sockets[0]!.sent[0] as string)).toEqual({ type: "start", clientContext: { activePaneId: "pane-2" } });
     expect(sockets[0]!.sent).toHaveLength(1);
 
@@ -97,6 +100,39 @@ describe("api client", () => {
     expect(stoppedTrack).toHaveBeenCalled();
     expect(statuses).toContain("recording");
     expect(statuses).toContain("transcribing");
+  });
+
+  it("uses the actual recorder MIME type when naming streamed audio", async () => {
+    const stream = { getTracks: () => [{ stop: vi.fn() }] } as unknown as MediaStream;
+    const sockets: FakeWebSocket[] = [];
+    const recorders: FakeMediaRecorder[] = [];
+
+    class TestWebSocket extends FakeWebSocket {
+      constructor(url: string | URL) {
+        super(url);
+        sockets.push(this);
+      }
+    }
+    class TestMediaRecorder extends FakeMediaRecorder {
+      static supportedMimeTypes = new Set(["audio/mp4"]);
+      constructor(input: MediaStream, options?: MediaRecorderOptions) {
+        super(input, options);
+        recorders.push(this);
+      }
+    }
+
+    vi.stubGlobal("window", {
+      location: { origin: "http://localhost:3001", protocol: "http:" },
+      setTimeout
+    });
+    vi.stubGlobal("WebSocket", TestWebSocket);
+    vi.stubGlobal("MediaRecorder", TestMediaRecorder);
+
+    const session = await startAudioStream(stream);
+
+    expect(recorders[0]?.mimeType).toBe("audio/mp4");
+    expect(new URL(String(sockets[0]!.url)).searchParams.get("filename")).toBe("voice.mp4");
+    session.cancel();
   });
 });
 
@@ -141,9 +177,15 @@ class FakeWebSocket extends EventTarget {
 class FakeMediaRecorder extends EventTarget {
   timeslice?: number;
   state: RecordingState = "inactive";
+  readonly mimeType: string;
 
-  constructor(readonly stream: MediaStream) {
+  static isTypeSupported(this: { supportedMimeTypes?: Set<string> }, mimeType: string) {
+    return this.supportedMimeTypes?.has(mimeType) ?? false;
+  }
+
+  constructor(readonly stream: MediaStream, options?: MediaRecorderOptions) {
     super();
+    this.mimeType = options?.mimeType ?? "";
   }
 
   start(timeslice?: number) {

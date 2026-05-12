@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import logging
 import tempfile
 from functools import lru_cache
 from pathlib import Path
@@ -17,6 +18,7 @@ class TranscriptionResponse(BaseModel):
 
 
 app = FastAPI(title="Cloudx ASR", version="0.1.0")
+logger = logging.getLogger("cloudx_asr")
 
 
 @app.get("/health")
@@ -58,6 +60,7 @@ async def transcribe_ws(websocket: WebSocket) -> None:
     filename = "voice.webm"
     temp_path: Path | None = None
     temp_file = None
+    total_bytes = 0
 
     try:
         while True:
@@ -82,8 +85,10 @@ async def transcribe_ws(websocket: WebSocket) -> None:
                 if temp_file is None:
                     temp_file, temp_path = open_temp_audio_file(filename)
                 temp_file.write(bytes_message)
+                total_bytes += len(bytes_message)
 
         if temp_file is None or temp_path is None:
+            logger.warning("ASR websocket ended without audio chunks")
             await websocket.send_json({"type": "error", "message": "No audio chunks were received."})
             return
 
@@ -92,6 +97,13 @@ async def transcribe_ws(websocket: WebSocket) -> None:
         temp_file = None
         await websocket.send_json({"type": "status", "status": "transcribing"})
         result = transcribe_file(temp_path, context)
+        logger.info(
+            "ASR websocket transcription completed filename=%s bytes=%s text_chars=%s language=%s",
+            filename,
+            total_bytes,
+            len(result.text),
+            result.language,
+        )
         await websocket.send_json({"type": "transcript", **result.model_dump()})
     except WebSocketDisconnect:
         return

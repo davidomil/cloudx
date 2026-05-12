@@ -27,7 +27,7 @@ export class AsrClient {
     }
 
     const body = (await response.json()) as TranscriptionResult;
-    if (!body.text || typeof body.text !== "string") {
+    if (typeof body.text !== "string") {
       throw new Error("ASR response did not include transcript text.");
     }
     return body;
@@ -49,7 +49,7 @@ export class AsrClient {
         const message = JSON.parse(raw.toString()) as { type?: string; message?: string; text?: string; language?: string; language_probability?: number };
         if (message.type === "transcript") {
           ws.close();
-          if (!message.text) {
+          if (typeof message.text !== "string") {
             reject(new Error("ASR response did not include transcript text."));
             return;
           }

@@ -13,6 +13,12 @@ class FakeModel:
         return [SimpleNamespace(text=" hello")], SimpleNamespace(language="en", language_probability=0.99)
 
 
+class EmptyModel:
+    def transcribe(self, path, beam_size, vad_filter, initial_prompt):
+        assert path
+        return [], SimpleNamespace(language="en", language_probability=0.99)
+
+
 def test_health():
     client = TestClient(main.app)
 
@@ -51,3 +57,19 @@ def test_transcribe_websocket_with_fake_model(monkeypatch):
 
     assert transcript["type"] == "transcript"
     assert transcript["text"] == "hello"
+
+
+def test_transcribe_websocket_can_return_empty_text(monkeypatch):
+    monkeypatch.setattr(main, "get_model", lambda: EmptyModel())
+    client = TestClient(main.app)
+
+    with client.websocket_connect("/transcribe/ws") as websocket:
+        websocket.send_json({"type": "start", "filename": "voice.webm", "context": "Cloudx"})
+        assert websocket.receive_json() == {"type": "status", "status": "receiving"}
+        websocket.send_bytes(b"fake-audio")
+        websocket.send_json({"type": "end"})
+        assert websocket.receive_json() == {"type": "status", "status": "transcribing"}
+        transcript = websocket.receive_json()
+
+    assert transcript["type"] == "transcript"
+    assert transcript["text"] == ""

@@ -93,6 +93,7 @@ export async function buildServer(config: AppConfig, services = buildServices(co
   app.post<{ Querystring: { activeTabId?: string; filename?: string }; Body: Buffer }>("/api/voice/audio", async (request) => {
     const context = JSON.stringify(await services.sessions.buildVoiceContext(request.query.activeTabId));
     const transcript = await services.asr.transcribe(request.body, request.query.filename ?? "voice.webm", context);
+    assertSpeechDetected(transcript.text);
     return services.voice.handleTranscript(transcript.text, request.query.activeTabId);
   });
 
@@ -120,6 +121,7 @@ export async function buildServer(config: AppConfig, services = buildServices(co
         send({ type: "status", status: "receiving", message: "Streaming microphone audio to Faster Whisper. Press the mic again to stop." });
         const context = JSON.stringify(attachClientVoiceContext(await services.sessions.buildVoiceContext(request.query.activeTabId), clientContext));
         const transcript = await services.asr.transcribeStream(chunks, filename, context);
+        assertSpeechDetected(transcript.text);
         send({ type: "status", status: "thinking", message: "AI is thinking and controlling Cloudx." });
         const result = await services.voice.handleTranscript(transcript.text, request.query.activeTabId, clientContext);
         finished = true;
@@ -248,4 +250,10 @@ export function buildServices(config: AppConfig): AppServices {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function assertSpeechDetected(text: string): void {
+  if (!text.trim()) {
+    throw new Error("No speech was detected in the microphone recording. Check that the browser is using the expected microphone, speak clearly, then try again.");
+  }
 }

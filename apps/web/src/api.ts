@@ -124,16 +124,22 @@ export async function startAudioStream(
   clientContext?: VoiceClientContext,
   onStatus?: (status: VoiceAudioStatus) => void
 ): Promise<VoiceAudioStreamSession> {
+  let recorder: MediaRecorder;
+  try {
+    recorder = createAudioRecorder(stream);
+  } catch (error) {
+    stream.getTracks().forEach((track) => track.stop());
+    throw error;
+  }
   const url = new URL("/ws/voice/audio", window.location.origin);
   url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   if (activeTabId) {
     url.searchParams.set("activeTabId", activeTabId);
   }
-  url.searchParams.set("filename", "voice.webm");
+  url.searchParams.set("filename", audioFilenameForMimeType(recorder.mimeType));
 
   return new Promise((resolveSession, rejectSession) => {
     const socket = new WebSocket(url);
-    let recorder: MediaRecorder | undefined;
     const pendingSends = new Set<Promise<void>>();
     let settled = false;
     let stopping = false;
@@ -186,7 +192,6 @@ export async function startAudioStream(
             socket.send(JSON.stringify({ type: "start", clientContext }));
           }
           onStatus?.({ status: "recording", message: "Listening and streaming microphone audio. Press the mic again to stop." });
-          recorder = new MediaRecorder(stream);
           recorder.addEventListener("dataavailable", (event) => sendBlob(event.data));
           recorder.addEventListener("stop", () => sendEnd());
           recorder.addEventListener("error", () => finish(new Error("Microphone recorder failed.")));
@@ -196,7 +201,7 @@ export async function startAudioStream(
               if (!stopping) {
                 stopping = true;
                 onStatus?.({ status: "transcribing", message: "Stopping recording and transcribing with local Faster Whisper." });
-                if (recorder?.state === "recording") {
+                if (recorder.state === "recording") {
                   recorder.stop();
                 } else {
                   sendEnd();
@@ -239,4 +244,31 @@ export async function startAudioStream(
       rejectSession(new Error("Voice audio socket failed."));
     });
   });
+}
+
+function createAudioRecorder(stream: MediaStream): MediaRecorder {
+  const mimeType = preferredAudioMimeType();
+  return mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+}
+
+function preferredAudioMimeType(): string | undefined {
+  const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus", "audio/ogg"];
+  if (typeof MediaRecorder.isTypeSupported !== "function") {
+    return undefined;
+  }
+  return candidates.find((candidate) => MediaRecorder.isTypeSupported(candidate));
+}
+
+function audioFilenameForMimeType(mimeType: string): string {
+  const normalized = mimeType.toLowerCase();
+  if (normalized.includes("webm")) {
+    return "voice.webm";
+  }
+  if (normalized.includes("mp4") || normalized.includes("aac")) {
+    return "voice.mp4";
+  }
+  if (normalized.includes("ogg") || normalized.includes("opus")) {
+    return "voice.ogg";
+  }
+  return "voice.webm";
 }
