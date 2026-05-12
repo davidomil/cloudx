@@ -183,6 +183,7 @@ Useful environment variables:
 - `CLOUDX_ASR_MODEL_PATH`: local Faster Whisper model directory.
 - `CLOUDX_ASR_DEVICE`: `cuda` or `cpu`, default `cpu`.
 - `CLOUDX_ASR_COMPUTE_TYPE`: for example `float16` on GPU or `int8` on CPU.
+- `CLOUDX_ASR_VAD_FILTER`: set to `true` to enable Faster Whisper VAD. It defaults to `false` because Cloudx voice commands are already manually bounded by the mic button, and VAD can filter valid short commands on some microphones.
 - `CLOUDX_TERMINAL_REPLAY_BYTES`: terminal replay buffer retained server-side for reconnects and voice context.
 
 ## Verify

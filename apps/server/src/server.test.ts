@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 
 import type { AppConfig } from "./config.js";
 import { PathPolicy } from "./pathPolicy.js";
-import { buildServer, type AppServices } from "./server.js";
+import { buildAsrInitialPrompt, buildServer, type AppServices } from "./server.js";
 
 describe("buildServer", () => {
   it("serves built frontend index.html when configured", async () => {
@@ -139,12 +139,16 @@ describe("buildServer", () => {
       appServerEnabled: false,
       terminalReplayBytes: 1024
     };
+    let asrContext: string | undefined;
     const services = {
       plugins: { list: () => [] },
       sessions: {
         listTabs: () => [],
         getActiveTabId: () => undefined,
-        buildVoiceContext: async () => ({})
+        buildVoiceContext: async () => ({
+          tabs: [{ title: "Repo Shell", cwd: "/workspace/cloudx", pluginId: "standard-terminal" }],
+          sessions: [{ voiceContext: { currentPath: "/workspace/cloudx/apps/server/src/server.ts" } }]
+        })
       },
       pathPolicy: new PathPolicy([root]),
       voice: {
@@ -153,7 +157,8 @@ describe("buildServer", () => {
         }
       },
       asr: {
-        async transcribe() {
+        async transcribe(_audio: Buffer, _filename: string, context?: string) {
+          asrContext = context;
           return { text: "" };
         }
       }
@@ -170,5 +175,20 @@ describe("buildServer", () => {
 
     expect(response.statusCode).toBe(500);
     expect(response.json().message).toContain("No speech was detected");
+    expect(asrContext).toContain("Repo Shell");
+    expect(asrContext).toContain("server.ts");
+    expect(asrContext).not.toContain("{");
+  });
+
+  it("builds a compact ASR prompt instead of raw workspace JSON", () => {
+    const prompt = buildAsrInitialPrompt({
+      tabs: [{ title: "Cloudx Dev", cwd: "/workspace/cloudx", pluginId: "codex-terminal" }],
+      client: { panes: [{ activeTab: { title: "Files", cwd: "/workspace/cloudx/apps/web" } }] }
+    });
+
+    expect(prompt).toContain("Cloudx Dev");
+    expect(prompt).toContain("codex-terminal");
+    expect(prompt).toContain("web");
+    expect(prompt).not.toContain("{");
   });
 });

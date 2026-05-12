@@ -37,6 +37,10 @@ def get_model():
     return WhisperModel(model_path or model_name, device=device, compute_type=compute_type)
 
 
+def use_vad_filter() -> bool:
+    return os.getenv("CLOUDX_ASR_VAD_FILTER", "false").lower() in {"1", "true", "yes", "on"}
+
+
 @app.post("/transcribe", response_model=TranscriptionResponse)
 async def transcribe(
     audio: UploadFile = File(...),
@@ -97,13 +101,20 @@ async def transcribe_ws(websocket: WebSocket) -> None:
         temp_file = None
         await websocket.send_json({"type": "status", "status": "transcribing"})
         result = transcribe_file(temp_path, context)
-        logger.info(
-            "ASR websocket transcription completed filename=%s bytes=%s text_chars=%s language=%s",
-            filename,
-            total_bytes,
-            len(result.text),
-            result.language,
+        log_message = (
+            "ASR websocket transcription completed "
+            f"filename={filename} bytes={total_bytes} text_chars={len(result.text)} language={result.language}"
         )
+        if result.text.strip():
+            print(log_message, flush=True)
+        else:
+            logger.warning(
+                "ASR websocket produced empty transcript filename=%s bytes=%s language=%s",
+                filename,
+                total_bytes,
+                result.language,
+            )
+            print(log_message, flush=True)
         await websocket.send_json({"type": "transcript", **result.model_dump()})
     except WebSocketDisconnect:
         return
@@ -127,7 +138,7 @@ def transcribe_file(path: Path, context: str | None) -> TranscriptionResponse:
     segments, info = get_model().transcribe(
         str(path),
         beam_size=5,
-        vad_filter=True,
+        vad_filter=use_vad_filter(),
         initial_prompt=initial_prompt,
     )
     text = "".join(segment.text for segment in segments).strip()
