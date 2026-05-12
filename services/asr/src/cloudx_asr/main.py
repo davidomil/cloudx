@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import json
 import logging
 import tempfile
+import time
 from functools import lru_cache
 from pathlib import Path
 
@@ -41,6 +43,18 @@ def use_vad_filter() -> bool:
     return os.getenv("CLOUDX_ASR_VAD_FILTER", "false").lower() in {"1", "true", "yes", "on"}
 
 
+def partial_interval_seconds() -> float:
+    return read_float_env("CLOUDX_ASR_PARTIAL_INTERVAL_SECONDS", 2.0)
+
+
+def partial_min_bytes() -> int:
+    return read_int_env("CLOUDX_ASR_PARTIAL_MIN_BYTES", 16_000)
+
+
+def partial_beam_size() -> int:
+    return read_int_env("CLOUDX_ASR_PARTIAL_BEAM_SIZE", 1)
+
+
 @app.post("/transcribe", response_model=TranscriptionResponse)
 async def transcribe(
     audio: UploadFile = File(...),
@@ -65,6 +79,40 @@ async def transcribe_ws(websocket: WebSocket) -> None:
     temp_path: Path | None = None
     temp_file = None
     total_bytes = 0
+    last_partial_at = 0.0
+    last_partial_text = ""
+    partial_task: asyncio.Task | None = None
+    send_lock = asyncio.Lock()
+
+    async def send_json(payload: dict) -> None:
+        async with send_lock:
+            await websocket.send_json(payload)
+
+    async def send_partial_snapshot(path: Path) -> None:
+        nonlocal last_partial_text
+        try:
+            result = await asyncio.to_thread(transcribe_file, path, context, partial_beam_size())
+        except Exception as error:
+            logger.debug("ASR partial transcription skipped: %s", error)
+            return
+        text = result.text.strip()
+        if text and text != last_partial_text:
+            last_partial_text = text
+            await send_json({"type": "partial", "text": text})
+
+    def maybe_start_partial_snapshot() -> None:
+        nonlocal last_partial_at, partial_task
+        interval = partial_interval_seconds()
+        if interval < 0 or total_bytes < partial_min_bytes() or temp_file is None or temp_path is None:
+            return
+        if partial_task is not None and not partial_task.done():
+            return
+        now = time.monotonic()
+        if now - last_partial_at < interval:
+            return
+        temp_file.flush()
+        last_partial_at = now
+        partial_task = asyncio.create_task(send_partial_snapshot(temp_path))
 
     try:
         while True:
@@ -79,7 +127,7 @@ async def transcribe_ws(websocket: WebSocket) -> None:
                     context = payload.get("context") if isinstance(payload.get("context"), str) else None
                     filename = payload.get("filename") if isinstance(payload.get("filename"), str) else filename
                     temp_file, temp_path = open_temp_audio_file(filename)
-                    await websocket.send_json({"type": "status", "status": "receiving"})
+                    await send_json({"type": "status", "status": "receiving"})
                     continue
                 if payload.get("type") == "end":
                     break
@@ -90,16 +138,19 @@ async def transcribe_ws(websocket: WebSocket) -> None:
                     temp_file, temp_path = open_temp_audio_file(filename)
                 temp_file.write(bytes_message)
                 total_bytes += len(bytes_message)
+                maybe_start_partial_snapshot()
 
         if temp_file is None or temp_path is None:
             logger.warning("ASR websocket ended without audio chunks")
-            await websocket.send_json({"type": "error", "message": "No audio chunks were received."})
+            await send_json({"type": "error", "message": "No audio chunks were received."})
             return
 
         temp_file.flush()
         temp_file.close()
         temp_file = None
-        await websocket.send_json({"type": "status", "status": "transcribing"})
+        await send_json({"type": "status", "status": "transcribing"})
+        if partial_task is not None and not partial_task.done():
+            await partial_task
         result = transcribe_file(temp_path, context)
         log_message = (
             "ASR websocket transcription completed "
@@ -115,11 +166,11 @@ async def transcribe_ws(websocket: WebSocket) -> None:
                 result.language,
             )
             print(log_message, flush=True)
-        await websocket.send_json({"type": "transcript", **result.model_dump()})
+        await send_json({"type": "transcript", **result.model_dump()})
     except WebSocketDisconnect:
         return
     except Exception as error:
-        await websocket.send_json({"type": "error", "message": str(error)})
+        await send_json({"type": "error", "message": str(error)})
     finally:
         if temp_file is not None:
             temp_file.close()
@@ -133,11 +184,11 @@ def open_temp_audio_file(filename: str):
     return temp_file, Path(temp_file.name)
 
 
-def transcribe_file(path: Path, context: str | None) -> TranscriptionResponse:
+def transcribe_file(path: Path, context: str | None, beam_size: int = 5) -> TranscriptionResponse:
     initial_prompt = context if context and context.strip() else None
     segments, info = get_model().transcribe(
         str(path),
-        beam_size=5,
+        beam_size=beam_size,
         vad_filter=use_vad_filter(),
         initial_prompt=initial_prompt,
     )
@@ -147,3 +198,23 @@ def transcribe_file(path: Path, context: str | None) -> TranscriptionResponse:
         language=getattr(info, "language", None),
         language_probability=getattr(info, "language_probability", None),
     )
+
+
+def read_float_env(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def read_int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default

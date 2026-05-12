@@ -43,6 +43,7 @@ export function App() {
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("checking");
   const [voiceState, setVoiceState] = useState<"idle" | "recording" | "processing">("idle");
   const [voiceMessage, setVoiceMessage] = useState<string | undefined>();
+  const [liveTranscript, setLiveTranscript] = useState<string | undefined>();
   const [manualTranscript, setManualTranscript] = useState("");
   const [attentionTabIds, setAttentionTabIds] = useState<Set<string>>(() => new Set());
   const tabsRef = useRef<WorkspaceTab[]>([]);
@@ -101,7 +102,7 @@ export function App() {
   const serverLabel = window.location.host || "server";
   const activeTab = activeTabId ? tabById.get(activeTabId) : undefined;
   const microphoneUnavailableReason = getMicrophoneUnavailableReason();
-  const voiceConsoleText = voiceConsoleValue(voiceState, manualTranscript, voiceMessage);
+  const voiceConsoleText = voiceConsoleValue(voiceState, manualTranscript, voiceMessage, liveTranscript);
 
   async function refresh() {
     setConnectionStatus("checking");
@@ -215,6 +216,7 @@ export function App() {
     if (!manualTranscript.trim()) return;
     setVoiceState("processing");
     setVoiceMessage("AI is thinking and controlling Cloudx...");
+    setLiveTranscript(undefined);
     setError(undefined);
     try {
       const result = await submitTranscript(manualTranscript, activeTabId, currentVoiceClientContext());
@@ -245,6 +247,7 @@ export function App() {
         audioSessionRef.current = undefined;
         setVoiceState("idle");
         setVoiceMessage(undefined);
+        setLiveTranscript(undefined);
       }
       return;
     }
@@ -255,16 +258,29 @@ export function App() {
     }
     setVoiceState("recording");
     setVoiceMessage("Listening and streaming microphone audio...");
+    setLiveTranscript(undefined);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      audioSessionRef.current = await startAudioStream(stream, activeTabId, currentVoiceClientContext(), (status) => {
-        setVoiceState(status.status === "recording" || status.status === "receiving" ? "recording" : "processing");
-        setVoiceMessage(status.message);
-      });
+      audioSessionRef.current = await startAudioStream(
+        stream,
+        activeTabId,
+        currentVoiceClientContext(),
+        (status) => {
+          setVoiceState(status.status === "recording" || status.status === "receiving" ? "recording" : "processing");
+          setVoiceMessage(status.message);
+        },
+        (transcript) => {
+          setLiveTranscript(transcript.text);
+          if (transcript.final) {
+            setVoiceMessage("AI is thinking and controlling Cloudx...");
+          }
+        }
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setVoiceState("idle");
       setVoiceMessage(undefined);
+      setLiveTranscript(undefined);
     }
   }
 

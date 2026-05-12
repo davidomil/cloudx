@@ -57,6 +57,7 @@ describe("api client", () => {
   it("streams microphone chunks until the returned audio session is stopped", async () => {
     const stoppedTrack = vi.fn();
     const statuses: string[] = [];
+    const transcripts: string[] = [];
     const stream = { getTracks: () => [{ stop: stoppedTrack }] } as unknown as MediaStream;
     const sockets: FakeWebSocket[] = [];
     const recorders: FakeMediaRecorder[] = [];
@@ -82,7 +83,13 @@ describe("api client", () => {
     vi.stubGlobal("WebSocket", TestWebSocket);
     vi.stubGlobal("MediaRecorder", TestMediaRecorder);
 
-    const session = await startAudioStream(stream, "tab-1", { activePaneId: "pane-2" }, (status) => statuses.push(status.status));
+    const session = await startAudioStream(
+      stream,
+      "tab-1",
+      { activePaneId: "pane-2" },
+      (status) => statuses.push(status.status),
+      (transcript) => transcripts.push(transcript.text)
+    );
 
     expect(recorders[0]?.timeslice).toBe(750);
     expect(recorders[0]?.mimeType).toBe("audio/webm;codecs=opus");
@@ -95,11 +102,13 @@ describe("api client", () => {
 
     expect(sockets[0]!.sent.some((message) => message instanceof ArrayBuffer)).toBe(true);
     expect(sockets[0]!.sent.map((message) => (typeof message === "string" ? message : undefined)).filter(Boolean)).toContain(JSON.stringify({ type: "end" }));
+    sockets[0]!.serverMessage({ type: "partial_transcript", transcript: "list directory" });
     sockets[0]!.serverMessage({ type: "result", result: { accepted: true, plan: { transcript: "hi", summary: "", actions: [] }, results: [] } });
     await expect(resultPromise).resolves.toMatchObject({ accepted: true });
     expect(stoppedTrack).toHaveBeenCalled();
     expect(statuses).toContain("recording");
     expect(statuses).toContain("transcribing");
+    expect(transcripts).toEqual(["list directory"]);
   });
 
   it("uses the actual recorder MIME type when naming streamed audio", async () => {

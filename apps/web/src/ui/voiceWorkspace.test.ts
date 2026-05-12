@@ -11,6 +11,8 @@ describe("voice workspace helpers", () => {
     expect(voiceConsoleValue("recording", "")).toBe("Listening and streaming microphone audio...");
     expect(voiceConsoleValue("processing", "", "Transcribing with local Faster Whisper.")).toBe("Transcribing with local Faster Whisper.");
     expect(voiceConsoleValue("processing", "")).toBe("AI is thinking and controlling Cloudx...");
+    expect(voiceConsoleValue("recording", "", "Listening...", "list directory")).toBe("list directory");
+    expect(voiceConsoleValue("processing", "", "AI is thinking...", "open files")).toBe("open files");
   });
 
   it("places voice-created tabs into a newly split pane", () => {

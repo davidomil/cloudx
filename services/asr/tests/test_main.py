@@ -19,6 +19,14 @@ class EmptyModel:
         return [], SimpleNamespace(language="en", language_probability=0.99)
 
 
+class PartialModel:
+    def transcribe(self, path, beam_size, vad_filter, initial_prompt):
+        assert path
+        if beam_size == 1:
+            return [SimpleNamespace(text=" partial text")], SimpleNamespace(language="en", language_probability=0.99)
+        return [SimpleNamespace(text=" final text")], SimpleNamespace(language="en", language_probability=0.99)
+
+
 def test_health():
     client = TestClient(main.app)
 
@@ -76,6 +84,27 @@ def test_transcribe_websocket_can_return_empty_text(monkeypatch):
 
     assert transcript["type"] == "transcript"
     assert transcript["text"] == ""
+
+
+def test_transcribe_websocket_sends_partial_transcripts(monkeypatch):
+    monkeypatch.delenv("CLOUDX_ASR_VAD_FILTER", raising=False)
+    monkeypatch.setenv("CLOUDX_ASR_PARTIAL_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("CLOUDX_ASR_PARTIAL_MIN_BYTES", "1")
+    monkeypatch.setattr(main, "get_model", lambda: PartialModel())
+    client = TestClient(main.app)
+
+    with client.websocket_connect("/transcribe/ws") as websocket:
+        websocket.send_json({"type": "start", "filename": "voice.webm", "context": "Cloudx"})
+        assert websocket.receive_json() == {"type": "status", "status": "receiving"}
+        websocket.send_bytes(b"fake-audio")
+        partial = websocket.receive_json()
+        websocket.send_json({"type": "end"})
+        assert websocket.receive_json() == {"type": "status", "status": "transcribing"}
+        transcript = websocket.receive_json()
+
+    assert partial == {"type": "partial", "text": "partial text"}
+    assert transcript["type"] == "transcript"
+    assert transcript["text"] == "final text"
 
 
 def test_vad_filter_can_be_enabled(monkeypatch):

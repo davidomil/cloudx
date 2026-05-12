@@ -29,15 +29,15 @@ interface PaneBounds {
   height: number;
 }
 
-export function voiceConsoleValue(voiceState: VoiceState, manualTranscript: string, voiceMessage?: string): string {
-  if (voiceState !== "idle" && voiceMessage) {
-    return voiceMessage;
+export function voiceConsoleValue(voiceState: VoiceState, manualTranscript: string, voiceMessage?: string, liveTranscript?: string): string {
+  if (voiceState !== "idle" && liveTranscript?.trim()) {
+    return liveTranscript;
   }
   if (voiceState === "recording") {
-    return "Listening and streaming microphone audio...";
+    return voiceMessage ?? "Listening and streaming microphone audio...";
   }
   if (voiceState === "processing") {
-    return "AI is thinking and controlling Cloudx...";
+    return voiceMessage ?? "AI is thinking and controlling Cloudx...";
   }
   return manualTranscript;
 }

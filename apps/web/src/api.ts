@@ -113,6 +113,11 @@ export interface VoiceAudioStatus {
   message: string;
 }
 
+export interface VoiceAudioTranscript {
+  text: string;
+  final?: boolean;
+}
+
 export interface VoiceAudioStreamSession {
   stop(): Promise<VoiceExecutionResult>;
   cancel(): void;
@@ -122,7 +127,8 @@ export async function startAudioStream(
   stream: MediaStream,
   activeTabId?: string,
   clientContext?: VoiceClientContext,
-  onStatus?: (status: VoiceAudioStatus) => void
+  onStatus?: (status: VoiceAudioStatus) => void,
+  onTranscript?: (transcript: VoiceAudioTranscript) => void
 ): Promise<VoiceAudioStreamSession> {
   let recorder: MediaRecorder;
   try {
@@ -218,9 +224,19 @@ export async function startAudioStream(
       });
 
       socket.addEventListener("message", (event) => {
-        const message = JSON.parse(event.data as string) as { type?: string; status?: VoiceAudioStatus["status"]; message?: string; result?: VoiceExecutionResult };
+        const message = JSON.parse(event.data as string) as {
+          type?: string;
+          status?: VoiceAudioStatus["status"];
+          message?: string;
+          result?: VoiceExecutionResult;
+          transcript?: string;
+          final?: boolean;
+        };
         if (message.type === "status" && message.status && message.message) {
           onStatus?.({ status: message.status, message: message.message });
+        }
+        if (message.type === "partial_transcript" && typeof message.transcript === "string") {
+          onTranscript?.({ text: message.transcript, final: message.final });
         }
         if (message.type === "result" && message.result) {
           finish(undefined, message.result);

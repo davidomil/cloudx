@@ -6,6 +6,10 @@ export interface TranscriptionResult {
   language_probability?: number;
 }
 
+export interface PartialTranscriptionResult {
+  text: string;
+}
+
 export class AsrClient {
   constructor(private readonly baseUrl: string) {}
 
@@ -33,20 +37,22 @@ export class AsrClient {
     return body;
   }
 
-  async transcribeStream(chunks: AsyncIterable<Buffer>, filename: string, context?: string): Promise<TranscriptionResult> {
+  async transcribeStream(
+    chunks: AsyncIterable<Buffer>,
+    filename: string,
+    context?: string,
+    onPartial?: (partial: PartialTranscriptionResult) => void
+  ): Promise<TranscriptionResult> {
     const ws = new WebSocket(this.websocketUrl("/transcribe/ws"));
     await waitForOpen(ws);
-    ws.send(JSON.stringify({ type: "start", filename, context }));
-    for await (const chunk of chunks) {
-      if (chunk.byteLength > 0) {
-        ws.send(chunk);
-      }
-    }
-    ws.send(JSON.stringify({ type: "end" }));
 
-    return new Promise((resolve, reject) => {
+    const result = new Promise<TranscriptionResult>((resolve, reject) => {
       ws.on("message", (raw) => {
         const message = JSON.parse(raw.toString()) as { type?: string; message?: string; text?: string; language?: string; language_probability?: number };
+        if (message.type === "partial" && typeof message.text === "string") {
+          onPartial?.({ text: message.text });
+          return;
+        }
         if (message.type === "transcript") {
           ws.close();
           if (typeof message.text !== "string") {
@@ -71,6 +77,16 @@ export class AsrClient {
         }
       });
     });
+
+    ws.send(JSON.stringify({ type: "start", filename, context }));
+    for await (const chunk of chunks) {
+      if (chunk.byteLength > 0) {
+        ws.send(chunk);
+      }
+    }
+    ws.send(JSON.stringify({ type: "end" }));
+
+    return result;
   }
 
   private websocketUrl(pathname: string): string {

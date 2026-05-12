@@ -120,8 +120,11 @@ export async function buildServer(config: AppConfig, services = buildServices(co
         await started;
         send({ type: "status", status: "receiving", message: "Streaming microphone audio to Faster Whisper. Press the mic again to stop." });
         const context = attachClientVoiceContext(await services.sessions.buildVoiceContext(request.query.activeTabId), clientContext);
-        const transcript = await services.asr.transcribeStream(chunks, filename, buildAsrInitialPrompt(context));
+        const transcript = await services.asr.transcribeStream(chunks, filename, buildAsrInitialPrompt(context), (partial) => {
+          send({ type: "partial_transcript", transcript: partial.text });
+        });
         assertSpeechDetected(transcript.text);
+        send({ type: "partial_transcript", transcript: transcript.text, final: true });
         send({ type: "status", status: "thinking", message: "AI is thinking and controlling Cloudx." });
         const result = await services.voice.handleTranscript(transcript.text, request.query.activeTabId, clientContext);
         finished = true;

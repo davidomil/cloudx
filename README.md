@@ -184,6 +184,9 @@ Useful environment variables:
 - `CLOUDX_ASR_DEVICE`: `cuda` or `cpu`, default `cpu`.
 - `CLOUDX_ASR_COMPUTE_TYPE`: for example `float16` on GPU or `int8` on CPU.
 - `CLOUDX_ASR_VAD_FILTER`: set to `true` to enable Faster Whisper VAD. It defaults to `false` because Cloudx voice commands are already manually bounded by the mic button, and VAD can filter valid short commands on some microphones.
+- `CLOUDX_ASR_PARTIAL_INTERVAL_SECONDS`: seconds between live partial transcription attempts while the mic is still recording, default `2.0`. Set a negative value to disable partials.
+- `CLOUDX_ASR_PARTIAL_MIN_BYTES`: minimum streamed audio bytes before attempting a partial transcript, default `16000`.
+- `CLOUDX_ASR_PARTIAL_BEAM_SIZE`: Faster Whisper beam size for partial transcripts, default `1` for lower latency.
 - `CLOUDX_TERMINAL_REPLAY_BYTES`: terminal replay buffer retained server-side for reconnects and voice context.
 
 ## Verify
