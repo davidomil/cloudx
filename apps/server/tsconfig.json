@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    "composite": true,
+    "types": ["node"]
+  },
+  "references": [
+    { "path": "../../packages/shared" },
+    { "path": "../../packages/plugin-api" }
+  ],
+  "include": ["src/**/*.ts"]
+}
