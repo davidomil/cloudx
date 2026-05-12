@@ -34,3 +34,20 @@ def test_transcribe_with_fake_model(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["text"] == "hello"
+
+
+def test_transcribe_websocket_with_fake_model(monkeypatch):
+    monkeypatch.setattr(main, "get_model", lambda: FakeModel())
+    client = TestClient(main.app)
+
+    with client.websocket_connect("/transcribe/ws") as websocket:
+        websocket.send_json({"type": "start", "filename": "voice.webm", "context": "Cloudx"})
+        assert websocket.receive_json() == {"type": "status", "status": "receiving"}
+        websocket.send_bytes(b"fake-")
+        websocket.send_bytes(b"audio")
+        websocket.send_json({"type": "end"})
+        assert websocket.receive_json() == {"type": "status", "status": "transcribing"}
+        transcript = websocket.receive_json()
+
+    assert transcript["type"] == "transcript"
+    assert transcript["text"] == "hello"

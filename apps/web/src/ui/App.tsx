@@ -3,7 +3,7 @@ import { Columns2, GitBranch, Mic, MicOff, PanelTopOpen, RefreshCw, Rows3, Squar
 
 import type { PathOption, PluginDescriptor, PluginId, TabLayoutState, WorkspaceTab, WorkspaceTabsUpdate } from "@cloudx/shared";
 
-import { closeTab, createTab, getHealth, getPathOptions, getPlugins, getTabs, setActiveTab, submitAudio, submitTranscript } from "../api.js";
+import { closeTab, createTab, getHealth, getPathOptions, getPlugins, getTabs, setActiveTab, submitAudioStream, submitTranscript } from "../api.js";
 import { FileBrowserPanel } from "./FileBrowserPanel.js";
 import {
   activatePane,
@@ -42,6 +42,7 @@ export function App() {
   const [error, setError] = useState<string | undefined>();
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("checking");
   const [voiceState, setVoiceState] = useState<"idle" | "recording" | "processing">("idle");
+  const [voiceMessage, setVoiceMessage] = useState<string | undefined>();
   const [manualTranscript, setManualTranscript] = useState("");
   const [attentionTabIds, setAttentionTabIds] = useState<Set<string>>(() => new Set());
   const tabsRef = useRef<WorkspaceTab[]>([]);
@@ -98,7 +99,7 @@ export function App() {
   const serverLabel = window.location.host || "server";
   const activeTab = activeTabId ? tabById.get(activeTabId) : undefined;
   const microphoneUnavailableReason = getMicrophoneUnavailableReason();
-  const voiceConsoleText = voiceConsoleValue(voiceState, manualTranscript);
+  const voiceConsoleText = voiceConsoleValue(voiceState, manualTranscript, voiceMessage);
 
   async function refresh() {
     setConnectionStatus("checking");
@@ -211,6 +212,7 @@ export function App() {
   async function handleManualTranscript() {
     if (!manualTranscript.trim()) return;
     setVoiceState("processing");
+    setVoiceMessage("AI is thinking and controlling Cloudx...");
     setError(undefined);
     try {
       const result = await submitTranscript(manualTranscript, activeTabId);
@@ -221,6 +223,7 @@ export function App() {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setVoiceState("idle");
+      setVoiceMessage(undefined);
     }
   }
 
@@ -232,28 +235,20 @@ export function App() {
       return;
     }
     setVoiceState("recording");
+    setVoiceMessage("Listening and streaming microphone audio...");
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream);
-      const chunks: Blob[] = [];
-      recorder.ondataavailable = (event) => chunks.push(event.data);
-      const stopped = new Promise<Blob>((resolve) => {
-        recorder.onstop = () => {
-          stream.getTracks().forEach((track) => track.stop());
-          resolve(new Blob(chunks, { type: recorder.mimeType || "audio/webm" }));
-        };
+      const result = await submitAudioStream(stream, activeTabId, (status) => {
+        setVoiceState(status.status === "recording" ? "recording" : "processing");
+        setVoiceMessage(status.message);
       });
-      recorder.start();
-      window.setTimeout(() => recorder.state === "recording" && recorder.stop(), 5000);
-      const audio = await stopped;
-      setVoiceState("processing");
-      const result = await submitAudio(audio, activeTabId);
       await refresh();
       applyVoiceResult(result);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setVoiceState("idle");
+      setVoiceMessage(undefined);
     }
   }
 

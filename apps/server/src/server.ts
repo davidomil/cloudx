@@ -3,7 +3,7 @@ import websocket from "@fastify/websocket";
 import cors from "@fastify/cors";
 import staticPlugin from "@fastify/static";
 import fs from "node:fs";
-import type { WebSocket } from "ws";
+import type { RawData, WebSocket } from "ws";
 
 import type { CreateTabRequest } from "@cloudx/shared";
 
@@ -19,6 +19,7 @@ import { SessionStore } from "./sessionStore.js";
 import { NodePtyTerminalProcessFactory } from "./terminal/NodePtyTerminalProcess.js";
 import { VoiceController } from "./voice/VoiceController.js";
 import { CodexExecVoicePlanner } from "./voice/VoicePlanner.js";
+import { AudioChunkQueue } from "./voice/AudioChunkQueue.js";
 import { TabContextService } from "./context/TabContextService.js";
 import { AppServerClient } from "./appServer/AppServerClient.js";
 import { AppServerContextProvider } from "./appServer/AppServerContextProvider.js";
@@ -93,6 +94,61 @@ export async function buildServer(config: AppConfig, services = buildServices(co
     const context = JSON.stringify(await services.sessions.buildVoiceContext(request.query.activeTabId));
     const transcript = await services.asr.transcribe(request.body, request.query.filename ?? "voice.webm", context);
     return services.voice.handleTranscript(transcript.text, request.query.activeTabId);
+  });
+
+  app.get<{ Querystring: { activeTabId?: string; filename?: string } }>("/ws/voice/audio", { websocket: true }, (socket, request) => {
+    const ws = socket as WebSocket;
+    const chunks = new AudioChunkQueue();
+    const filename = request.query.filename ?? "voice.webm";
+    let finished = false;
+
+    const send = (payload: unknown) => {
+      if (ws.readyState === 1) {
+        ws.send(JSON.stringify(payload));
+      }
+    };
+
+    void (async () => {
+      try {
+        send({ type: "status", status: "receiving", message: "Streaming microphone audio to Cloudx." });
+        const context = JSON.stringify(await services.sessions.buildVoiceContext(request.query.activeTabId));
+        const transcript = await services.asr.transcribeStream(chunks, filename, context);
+        send({ type: "status", status: "thinking", message: "AI is thinking and controlling Cloudx." });
+        const result = await services.voice.handleTranscript(transcript.text, request.query.activeTabId);
+        finished = true;
+        send({ type: "result", result });
+        ws.close();
+      } catch (error) {
+        finished = true;
+        send({ type: "error", message: error instanceof Error ? error.message : String(error) });
+        ws.close();
+      }
+    })();
+
+    ws.on("message", (raw) => {
+      if (typeof raw === "string") {
+        const message = JSON.parse(raw) as { type?: string };
+        if (message.type === "end") {
+          send({ type: "status", status: "transcribing", message: "Transcribing with local Faster Whisper." });
+          chunks.end();
+        }
+        return;
+      }
+      if (Buffer.isBuffer(raw)) {
+        chunks.push(raw);
+        return;
+      }
+      if (Array.isArray(raw)) {
+        chunks.push(Buffer.concat(raw));
+        return;
+      }
+      chunks.push(Buffer.from(raw as ArrayBuffer));
+    });
+    ws.on("close", () => {
+      if (!finished) {
+        chunks.end();
+      }
+    });
   });
 
   app.get("/ws/workspace", { websocket: true }, (socket) => {

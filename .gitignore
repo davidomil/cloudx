@@ -31,3 +31,5 @@ apps/web/dist-ts/
 .codex/
 .cloudx/
 auth.json
+
+*.egg-info/

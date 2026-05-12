@@ -8,7 +8,8 @@ import { applyVoiceWorkspaceResults, voiceConsoleValue } from "./voiceWorkspace.
 describe("voice workspace helpers", () => {
   it("shows clear voice console status while recording and thinking", () => {
     expect(voiceConsoleValue("idle", "open a new codex pane")).toBe("open a new codex pane");
-    expect(voiceConsoleValue("recording", "")).toBe("Listening...");
+    expect(voiceConsoleValue("recording", "")).toBe("Listening and streaming microphone audio...");
+    expect(voiceConsoleValue("processing", "", "Transcribing with local Faster Whisper.")).toBe("Transcribing with local Faster Whisper.");
     expect(voiceConsoleValue("processing", "")).toBe("AI is thinking and controlling Cloudx...");
   });
 

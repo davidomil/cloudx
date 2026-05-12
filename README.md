@@ -31,6 +31,8 @@ Plugins export:
 
 The voice path is deliberately tool-based. Browser audio is posted to the local ASR service, the transcript and workspace context are sent to a local `codex exec` planner running `gpt-5.3-codex-spark` with medium reasoning, and the planner may only return plugin actions that are marked `voiceExposed`. For example, "list directory" in a shell tab becomes `standard-terminal.enter_text` with `ls`, while file edits can be routed to `file-browser.replace_in_file` or `file-browser.write_file`.
 
+The microphone path uses a WebSocket from the browser to Cloudx. Cloudx forwards the audio chunks to the private Faster Whisper service over a loopback WebSocket, then runs the resulting transcript through the voice planner. Faster Whisper still performs final transcription after the short recording window ends; the WebSocket path keeps audio streaming and gives the UI precise `receiving`, `transcribing`, and `thinking` states.
+
 ## Requirements
 
 - Node.js 22 or newer.
@@ -80,6 +82,43 @@ services/asr/.venv/bin/uvicorn cloudx_asr.main:app --app-dir services/asr/src --
 ```
 
 For a smaller first test, omit `CLOUDX_ASR_MODEL_PATH` and set `CLOUDX_ASR_MODEL=small`. The service defaults to `small`, `cpu`, and `int8`.
+
+## Systemd User Service
+
+To set up the Python ASR venv, download the Faster Whisper large-v3 model, build Cloudx, write user-level systemd units, and start both services:
+
+```bash
+npm run service:install
+```
+
+Useful variants:
+
+```bash
+npm run service:install -- --cpu
+npm run service:install -- --gpu
+npm run service:install -- --skip-model
+npm run service:install -- --no-start
+```
+
+The setup script writes:
+
+- `~/.config/cloudx/cloudx.env`
+- `~/.config/systemd/user/cloudx-asr.service`
+- `~/.config/systemd/user/cloudx.service`
+
+Service commands:
+
+```bash
+systemctl --user status cloudx.service cloudx-asr.service
+systemctl --user restart cloudx-asr.service cloudx.service
+journalctl --user -u cloudx.service -u cloudx-asr.service -f
+```
+
+For service startup before login, enable lingering separately:
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
 
 ## Run Locally
 
@@ -152,7 +191,7 @@ Useful environment variables:
 npm run typecheck
 npm test
 npm run build
-python3 -m py_compile services/asr/src/cloudx_asr/main.py services/asr/tests/test_main.py
+services/asr/.venv/bin/python -m pytest services/asr/tests
 ```
 
 For browser screenshots on Linux, install Playwright browser dependencies when the host lacks Chromium system libraries:

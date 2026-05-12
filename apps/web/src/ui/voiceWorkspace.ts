@@ -21,9 +21,12 @@ interface LayoutInstruction {
   splitDirection?: TabLayoutDirection;
 }
 
-export function voiceConsoleValue(voiceState: VoiceState, manualTranscript: string): string {
+export function voiceConsoleValue(voiceState: VoiceState, manualTranscript: string, voiceMessage?: string): string {
+  if (voiceState !== "idle" && voiceMessage) {
+    return voiceMessage;
+  }
   if (voiceState === "recording") {
-    return "Listening...";
+    return "Listening and streaming microphone audio...";
   }
   if (voiceState === "processing") {
     return "AI is thinking and controlling Cloudx...";
