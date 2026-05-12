@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { TabLayoutState, VoiceExecutionResult, WorkspaceTab } from "@cloudx/shared";
 
 import { listPanes } from "./layout.js";
-import { applyVoiceWorkspaceResults, voiceConsoleValue } from "./voiceWorkspace.js";
+import { applyVoiceWorkspaceResults, buildClientVoiceContext, voiceConsoleValue } from "./voiceWorkspace.js";
 
 describe("voice workspace helpers", () => {
   it("shows clear voice console status while recording and thinking", () => {
@@ -42,6 +42,87 @@ describe("voice workspace helpers", () => {
       { id: "pane-2", tabIds: ["tab-2"], activeTabId: "tab-2" }
     ]);
   });
+
+  it("moves a voice-created tab out of the first pane after server refresh reconciliation", () => {
+    const result: VoiceExecutionResult = {
+      accepted: true,
+      plan: { transcript: "open a new terminal pane", summary: "Open terminal.", actions: [] },
+      results: [
+        {
+          action: "create_tab",
+          ok: true,
+          result: {
+            tab: tab("tab-2", "standard-terminal"),
+            layoutInstruction: { type: "open_tab_in_new_pane", tabId: "tab-2", splitDirection: "row" }
+          }
+        }
+      ]
+    };
+
+    const applied = applyVoiceWorkspaceResults(
+      { layout: layoutWithTabs([tab("tab-1"), tab("tab-2", "standard-terminal")]), tabs: [tab("tab-1"), tab("tab-2", "standard-terminal")], activeTabId: "tab-2" },
+      result,
+      { createPaneId: () => "pane-2", createSplitId: () => "split-1" }
+    );
+
+    expect(listPanes(applied.layout.root)).toMatchObject([
+      { id: "pane-1", tabIds: ["tab-1"] },
+      { id: "pane-2", tabIds: ["tab-2"], activeTabId: "tab-2" }
+    ]);
+  });
+
+  it("applies multi-step pane control before opening a tab in the new active pane", () => {
+    const result: VoiceExecutionResult = {
+      accepted: true,
+      plan: { transcript: "select right pane, split it horizontally, and open files there", summary: "Open files.", actions: [] },
+      results: [
+        {
+          action: "select_pane",
+          ok: true,
+          result: { layoutInstruction: { type: "select_pane", paneId: "pane-2" } }
+        },
+        {
+          action: "split_pane",
+          ok: true,
+          result: { layoutInstruction: { type: "split_pane", paneId: "pane-2", splitDirection: "column" } }
+        },
+        {
+          action: "create_tab",
+          ok: true,
+          result: {
+            tab: tab("tab-3", "file-browser"),
+            layoutInstruction: { type: "add_tab_to_active_pane", tabId: "tab-3" }
+          }
+        }
+      ]
+    };
+
+    const applied = applyVoiceWorkspaceResults(
+      { layout: splitLayout(), tabs: [tab("tab-1"), tab("tab-2")], activeTabId: "tab-2" },
+      result,
+      { createPaneId: () => "pane-3", createSplitId: () => "split-2" }
+    );
+
+    expect(applied.activeTabId).toBe("tab-3");
+    expect(applied.layout.activePaneId).toBe("pane-3");
+    expect(listPanes(applied.layout.root)).toMatchObject([
+      { id: "pane-1", tabIds: ["tab-1"] },
+      { id: "pane-2", tabIds: ["tab-2"] },
+      { id: "pane-3", tabIds: ["tab-3"], activeTabId: "tab-3" }
+    ]);
+  });
+
+  it("describes client pane positions for voice planning", () => {
+    const context = buildClientVoiceContext(splitLayout(), [tab("tab-1"), tab("tab-2")]);
+
+    expect(context).toMatchObject({
+      activePaneId: "pane-2",
+      panes: [
+        { id: "pane-1", position: { horizontal: "left", labels: ["left"] } },
+        { id: "pane-2", position: { horizontal: "right", labels: ["right"] } }
+      ]
+    });
+  });
 });
 
 function layoutWithTabs(tabs: WorkspaceTab[]): TabLayoutState {
@@ -51,10 +132,26 @@ function layoutWithTabs(tabs: WorkspaceTab[]): TabLayoutState {
   };
 }
 
-function tab(id: string): WorkspaceTab {
+function splitLayout(): TabLayoutState {
+  return {
+    root: {
+      type: "split",
+      id: "split-1",
+      direction: "row",
+      sizes: [50, 50],
+      children: [
+        { type: "pane", pane: { id: "pane-1", tabIds: ["tab-1"], activeTabId: "tab-1" } },
+        { type: "pane", pane: { id: "pane-2", tabIds: ["tab-2"], activeTabId: "tab-2" } }
+      ]
+    },
+    activePaneId: "pane-2"
+  };
+}
+
+function tab(id: string, pluginId = "codex-terminal"): WorkspaceTab {
   return {
     id,
-    pluginId: "codex-terminal",
+    pluginId,
     title: id,
     cwd: "/workspace",
     status: "running",

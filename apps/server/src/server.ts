@@ -17,7 +17,7 @@ import { StandardTerminalPlugin } from "./plugins/StandardTerminalPlugin.js";
 import { WorkspaceControlPlugin } from "./plugins/WorkspaceControlPlugin.js";
 import { SessionStore } from "./sessionStore.js";
 import { NodePtyTerminalProcessFactory } from "./terminal/NodePtyTerminalProcess.js";
-import { VoiceController } from "./voice/VoiceController.js";
+import { attachClientVoiceContext, VoiceController } from "./voice/VoiceController.js";
 import { CodexExecVoicePlanner } from "./voice/VoicePlanner.js";
 import { AudioChunkQueue } from "./voice/AudioChunkQueue.js";
 import { TabContextService } from "./context/TabContextService.js";
@@ -86,8 +86,8 @@ export async function buildServer(config: AppConfig, services = buildServices(co
     return { ok: true, activeTabId: services.sessions.getActiveTabId() };
   });
 
-  app.post<{ Body: { transcript: string; activeTabId?: string } }>("/api/voice/transcript", async (request) => {
-    return services.voice.handleTranscript(request.body.transcript, request.body.activeTabId);
+  app.post<{ Body: { transcript: string; activeTabId?: string; clientContext?: Record<string, unknown> } }>("/api/voice/transcript", async (request) => {
+    return services.voice.handleTranscript(request.body.transcript, request.body.activeTabId, request.body.clientContext);
   });
 
   app.post<{ Querystring: { activeTabId?: string; filename?: string }; Body: Buffer }>("/api/voice/audio", async (request) => {
@@ -101,6 +101,12 @@ export async function buildServer(config: AppConfig, services = buildServices(co
     const chunks = new AudioChunkQueue();
     const filename = request.query.filename ?? "voice.webm";
     let finished = false;
+    let clientContext: Record<string, unknown> | undefined;
+    let startResolved = false;
+    let resolveStart: () => void = () => undefined;
+    const started = new Promise<void>((resolve) => {
+      resolveStart = resolve;
+    });
 
     const send = (payload: unknown) => {
       if (ws.readyState === 1) {
@@ -110,11 +116,12 @@ export async function buildServer(config: AppConfig, services = buildServices(co
 
     void (async () => {
       try {
-        send({ type: "status", status: "receiving", message: "Streaming microphone audio to Cloudx." });
-        const context = JSON.stringify(await services.sessions.buildVoiceContext(request.query.activeTabId));
+        await started;
+        send({ type: "status", status: "receiving", message: "Streaming microphone audio to Faster Whisper. Press the mic again to stop." });
+        const context = JSON.stringify(attachClientVoiceContext(await services.sessions.buildVoiceContext(request.query.activeTabId), clientContext));
         const transcript = await services.asr.transcribeStream(chunks, filename, context);
         send({ type: "status", status: "thinking", message: "AI is thinking and controlling Cloudx." });
-        const result = await services.voice.handleTranscript(transcript.text, request.query.activeTabId);
+        const result = await services.voice.handleTranscript(transcript.text, request.query.activeTabId, clientContext);
         finished = true;
         send({ type: "result", result });
         ws.close();
@@ -125,10 +132,22 @@ export async function buildServer(config: AppConfig, services = buildServices(co
       }
     })();
 
-    ws.on("message", (raw) => {
-      if (typeof raw === "string") {
-        const message = JSON.parse(raw) as { type?: string };
+    ws.on("message", (raw, isBinary) => {
+      if (!isBinary) {
+        const message = JSON.parse(raw.toString()) as { type?: string; clientContext?: unknown };
+        if (message.type === "start") {
+          clientContext = isRecord(message.clientContext) ? message.clientContext : undefined;
+          if (!startResolved) {
+            startResolved = true;
+            resolveStart();
+          }
+          return;
+        }
         if (message.type === "end") {
+          if (!startResolved) {
+            startResolved = true;
+            resolveStart();
+          }
           send({ type: "status", status: "transcribing", message: "Transcribing with local Faster Whisper." });
           chunks.end();
         }
@@ -146,6 +165,10 @@ export async function buildServer(config: AppConfig, services = buildServices(co
     });
     ws.on("close", () => {
       if (!finished) {
+        if (!startResolved) {
+          startResolved = true;
+          resolveStart();
+        }
         chunks.end();
       }
     });
@@ -221,4 +244,8 @@ export function buildServices(config: AppConfig): AppServices {
     new AppServerContextProvider(sessions, config.appServerEnabled ? () => new AppServerClient() : undefined)
   );
   return { plugins, sessions, pathPolicy, voice, asr };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

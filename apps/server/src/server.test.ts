@@ -83,4 +83,46 @@ describe("buildServer", () => {
       ]
     });
   });
+
+  it("passes manual transcript client context to the voice controller", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-voice-route-"));
+    const config: AppConfig = {
+      host: "0.0.0.0",
+      port: 3001,
+      allowedRoots: [root],
+      asrUrl: "http://127.0.0.1:7810",
+      voiceModel: "gpt-5.3-codex-spark",
+      dataDir: path.join(os.tmpdir(), "cloudx-data"),
+      webDistDir: path.join(root, "missing-web-dist"),
+      appServerEnabled: false,
+      terminalReplayBytes: 1024
+    };
+    const calls: unknown[] = [];
+    const services = {
+      plugins: { list: () => [] },
+      sessions: {
+        listTabs: () => [],
+        getActiveTabId: () => undefined
+      },
+      pathPolicy: new PathPolicy([root]),
+      voice: {
+        async handleTranscript(transcript: string, activeTabId?: string, clientContext?: Record<string, unknown>) {
+          calls.push({ transcript, activeTabId, clientContext });
+          return { accepted: true, plan: { transcript, summary: "", actions: [] }, results: [] };
+        }
+      },
+      asr: {}
+    } as unknown as AppServices;
+
+    const app = await buildServer(config, services);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/voice/transcript",
+      payload: { transcript: "open files", activeTabId: "tab-1", clientContext: { activePaneId: "pane-2" } }
+    });
+    await app.close();
+
+    expect(response.statusCode).toBe(200);
+    expect(calls).toEqual([{ transcript: "open files", activeTabId: "tab-1", clientContext: { activePaneId: "pane-2" } }]);
+  });
 });

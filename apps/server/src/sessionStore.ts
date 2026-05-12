@@ -276,6 +276,7 @@ export class SessionStore {
       const targetPluginId = requireString(input.targetPluginId, "targetPluginId");
       const cwd = normalizeVoiceCwd(requireString(input.cwd, "cwd"));
       const title = typeof input.title === "string" && input.title.trim() ? input.title.trim() : undefined;
+      const paneId = typeof input.paneId === "string" && input.paneId.trim() ? input.paneId.trim() : undefined;
       const createDirectory = typeof input.createDirectory === "boolean" ? input.createDirectory : false;
       const newPane = typeof input.newPane === "boolean" ? input.newPane : false;
       const splitDirection = input.splitDirection === "column" ? "column" : "row";
@@ -286,7 +287,25 @@ export class SessionStore {
         layoutInstruction: {
           type: newPane ? "open_tab_in_new_pane" : "add_tab_to_active_pane",
           tabId: tab.id,
+          paneId,
           splitDirection
+        }
+      };
+    }
+    if (action === "select_pane") {
+      return {
+        layoutInstruction: {
+          type: "select_pane",
+          paneId: requireString(input.paneId, "paneId")
+        }
+      };
+    }
+    if (action === "split_pane") {
+      return {
+        layoutInstruction: {
+          type: "split_pane",
+          paneId: typeof input.paneId === "string" && input.paneId.trim() ? input.paneId.trim() : undefined,
+          splitDirection: input.splitDirection === "column" ? "column" : "row"
         }
       };
     }

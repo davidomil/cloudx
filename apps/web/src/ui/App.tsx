@@ -3,7 +3,7 @@ import { Columns2, GitBranch, Mic, MicOff, PanelTopOpen, RefreshCw, Rows3, Squar
 
 import type { PathOption, PluginDescriptor, PluginId, TabLayoutState, WorkspaceTab, WorkspaceTabsUpdate } from "@cloudx/shared";
 
-import { closeTab, createTab, getHealth, getPathOptions, getPlugins, getTabs, setActiveTab, submitAudioStream, submitTranscript } from "../api.js";
+import { closeTab, createTab, getHealth, getPathOptions, getPlugins, getTabs, setActiveTab, startAudioStream, submitTranscript, type VoiceAudioStreamSession } from "../api.js";
 import { FileBrowserPanel } from "./FileBrowserPanel.js";
 import {
   activatePane,
@@ -26,7 +26,7 @@ import {
 import { shouldSubmitVoiceConsoleKey } from "./keyboard.js";
 import { clearFocusedAttention, isTabFocused, updateAttentionTabs } from "./tabAttention.js";
 import { disposeTerminalView, disposeTerminalViewsExcept, TerminalPanel } from "./TerminalPanel.js";
-import { applyVoiceWorkspaceResults, voiceConsoleValue } from "./voiceWorkspace.js";
+import { applyVoiceWorkspaceResults, buildClientVoiceContext, voiceConsoleValue } from "./voiceWorkspace.js";
 
 type ConnectionStatus = "checking" | "connected" | "disconnected";
 
@@ -48,6 +48,7 @@ export function App() {
   const tabsRef = useRef<WorkspaceTab[]>([]);
   const layoutRef = useRef<TabLayoutState>(initialLayout);
   const activeTabIdRef = useRef<string | undefined>(undefined);
+  const audioSessionRef = useRef<VoiceAudioStreamSession | undefined>(undefined);
 
   useEffect(() => {
     void refresh();
@@ -60,6 +61,7 @@ export function App() {
     );
     const interval = window.setInterval(() => void checkConnection(), 5000);
     return () => {
+      audioSessionRef.current?.cancel();
       closeWorkspaceSocket();
       window.clearInterval(interval);
     };
@@ -215,7 +217,7 @@ export function App() {
     setVoiceMessage("AI is thinking and controlling Cloudx...");
     setError(undefined);
     try {
-      const result = await submitTranscript(manualTranscript, activeTabId);
+      const result = await submitTranscript(manualTranscript, activeTabId, currentVoiceClientContext());
       setManualTranscript("");
       await refresh();
       applyVoiceResult(result);
@@ -229,6 +231,23 @@ export function App() {
 
   async function handleMic() {
     setError(undefined);
+    if (voiceState === "recording" && audioSessionRef.current) {
+      setVoiceState("processing");
+      setVoiceMessage("Stopping recording and transcribing with local Faster Whisper.");
+      try {
+        const result = await audioSessionRef.current.stop();
+        audioSessionRef.current = undefined;
+        await refresh();
+        applyVoiceResult(result);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        audioSessionRef.current = undefined;
+        setVoiceState("idle");
+        setVoiceMessage(undefined);
+      }
+      return;
+    }
     if (voiceState !== "idle") return;
     if (microphoneUnavailableReason) {
       setError(microphoneUnavailableReason);
@@ -238,15 +257,12 @@ export function App() {
     setVoiceMessage("Listening and streaming microphone audio...");
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const result = await submitAudioStream(stream, activeTabId, (status) => {
-        setVoiceState(status.status === "recording" ? "recording" : "processing");
+      audioSessionRef.current = await startAudioStream(stream, activeTabId, currentVoiceClientContext(), (status) => {
+        setVoiceState(status.status === "recording" || status.status === "receiving" ? "recording" : "processing");
         setVoiceMessage(status.message);
       });
-      await refresh();
-      applyVoiceResult(result);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
-    } finally {
       setVoiceState("idle");
       setVoiceMessage(undefined);
     }
@@ -267,6 +283,10 @@ export function App() {
     setTabs(next.tabs);
     setLayout(next.layout);
     setActiveTabId(next.activeTabId);
+  }
+
+  function currentVoiceClientContext() {
+    return buildClientVoiceContext(layoutRef.current, tabsRef.current);
   }
 
   return (
@@ -291,7 +311,7 @@ export function App() {
           <button className="icon-button" onClick={() => split("column")} title="Split rows">
             <Rows3 size={17} />
           </button>
-          <button className={`mic-button ${voiceState} ${microphoneUnavailableReason ? "unavailable" : ""}`} onClick={() => void handleMic()} title={microphoneUnavailableReason ?? "Record voice command"}>
+          <button className={`mic-button ${voiceState} ${microphoneUnavailableReason ? "unavailable" : ""}`} onClick={() => void handleMic()} title={microphoneUnavailableReason ?? (voiceState === "recording" ? "Stop voice command" : "Record voice command")}>
             {voiceState === "recording" ? <MicOff size={17} /> : <Mic size={17} />}
           </button>
         </div>

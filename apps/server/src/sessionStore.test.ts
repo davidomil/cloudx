@@ -182,6 +182,7 @@ describe("SessionStore voice actions", () => {
         targetPluginId: "fake-default",
         cwd: root,
         title: "Voice Codex",
+        paneId: "pane-2",
         newPane: true,
         splitDirection: "row",
         createDirectory: false
@@ -190,10 +191,30 @@ describe("SessionStore voice actions", () => {
 
     expect(result).toMatchObject({
       tab: { pluginId: "fake-default", title: "Voice Codex", cwd: root },
-      layoutInstruction: { type: "open_tab_in_new_pane", splitDirection: "row" }
+      layoutInstruction: { type: "open_tab_in_new_pane", paneId: "pane-2", splitDirection: "row" }
     });
     expect(store.listTabs()).toHaveLength(1);
     expect(store.getActiveTabId()).toBe((result.tab as WorkspaceTab).id);
+  });
+
+  it("returns client pane instructions through workspace-control", async () => {
+    const { store } = await createStore();
+
+    await expect(
+      store.executeVoiceAction({
+        pluginId: WORKSPACE_CONTROL_PLUGIN_ID,
+        action: "select_pane",
+        input: { paneId: "pane-right" }
+      })
+    ).resolves.toEqual({ layoutInstruction: { type: "select_pane", paneId: "pane-right" } });
+
+    await expect(
+      store.executeVoiceAction({
+        pluginId: WORKSPACE_CONTROL_PLUGIN_ID,
+        action: "split_pane",
+        input: { paneId: "pane-right", splitDirection: "column" }
+      })
+    ).resolves.toEqual({ layoutInstruction: { type: "split_pane", paneId: "pane-right", splitDirection: "column" } });
   });
 
   it("treats a plugin id in voice targetTabId as the active tab for that plugin", async () => {

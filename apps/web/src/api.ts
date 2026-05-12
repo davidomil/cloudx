@@ -80,10 +80,12 @@ export async function runTabAction<T>(tabId: string, action: string, input: Reco
   return body.result;
 }
 
-export async function submitTranscript(transcript: string, activeTabId?: string): Promise<VoiceExecutionResult> {
+export type VoiceClientContext = Record<string, unknown>;
+
+export async function submitTranscript(transcript: string, activeTabId?: string, clientContext?: VoiceClientContext): Promise<VoiceExecutionResult> {
   return fetchJson("/api/voice/transcript", {
     method: "POST",
-    body: JSON.stringify({ transcript, activeTabId })
+    body: JSON.stringify({ transcript, activeTabId, clientContext })
   });
 }
 
@@ -111,11 +113,17 @@ export interface VoiceAudioStatus {
   message: string;
 }
 
-export async function submitAudioStream(
+export interface VoiceAudioStreamSession {
+  stop(): Promise<VoiceExecutionResult>;
+  cancel(): void;
+}
+
+export async function startAudioStream(
   stream: MediaStream,
   activeTabId?: string,
+  clientContext?: VoiceClientContext,
   onStatus?: (status: VoiceAudioStatus) => void
-): Promise<VoiceExecutionResult> {
+): Promise<VoiceAudioStreamSession> {
   const url = new URL("/ws/voice/audio", window.location.origin);
   url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   if (activeTabId) {
@@ -123,76 +131,112 @@ export async function submitAudioStream(
   }
   url.searchParams.set("filename", "voice.webm");
 
-  return new Promise((resolve, reject) => {
+  return new Promise((resolveSession, rejectSession) => {
     const socket = new WebSocket(url);
     let recorder: MediaRecorder | undefined;
+    const pendingSends = new Set<Promise<void>>();
     let settled = false;
+    let stopping = false;
 
-    function stopStream() {
-      stream.getTracks().forEach((track) => track.stop());
-    }
+    const resultPromise = new Promise<VoiceExecutionResult>((resolveResult, rejectResult) => {
+      function stopStream() {
+        stream.getTracks().forEach((track) => track.stop());
+      }
 
-    function finish(error?: Error, result?: VoiceExecutionResult) {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      stopStream();
-      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
-        socket.close();
-      }
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve(result!);
-    }
-
-    socket.addEventListener("open", () => {
-      onStatus?.({ status: "recording", message: "Listening and streaming microphone audio..." });
-      recorder = new MediaRecorder(stream);
-      recorder.addEventListener("dataavailable", (event) => {
-        if (event.data.size === 0 || socket.readyState !== WebSocket.OPEN) {
+      function finish(error?: Error, result?: VoiceExecutionResult) {
+        if (settled) {
           return;
         }
-        void event.data.arrayBuffer().then((buffer) => {
+        settled = true;
+        stopStream();
+        if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+          socket.close();
+        }
+        if (error) {
+          rejectResult(error);
+          return;
+        }
+        resolveResult(result!);
+      }
+
+      function sendBlob(blob: Blob) {
+        if (blob.size === 0 || socket.readyState !== WebSocket.OPEN) {
+          return;
+        }
+        const sendPromise = blob.arrayBuffer().then((buffer) => {
           if (socket.readyState === WebSocket.OPEN) {
             socket.send(buffer);
           }
         });
-      });
-      recorder.addEventListener("stop", () => {
-        if (socket.readyState === WebSocket.OPEN) {
-          socket.send(JSON.stringify({ type: "end" }));
+        pendingSends.add(sendPromise);
+        void sendPromise.finally(() => pendingSends.delete(sendPromise));
+      }
+
+      function sendEnd() {
+        void Promise.allSettled(Array.from(pendingSends)).then(() => {
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ type: "end" }));
+          }
+        });
+      }
+
+      socket.addEventListener("open", () => {
+        try {
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ type: "start", clientContext }));
+          }
+          onStatus?.({ status: "recording", message: "Listening and streaming microphone audio. Press the mic again to stop." });
+          recorder = new MediaRecorder(stream);
+          recorder.addEventListener("dataavailable", (event) => sendBlob(event.data));
+          recorder.addEventListener("stop", () => sendEnd());
+          recorder.addEventListener("error", () => finish(new Error("Microphone recorder failed.")));
+          recorder.start(750);
+          resolveSession({
+            stop: () => {
+              if (!stopping) {
+                stopping = true;
+                onStatus?.({ status: "transcribing", message: "Stopping recording and transcribing with local Faster Whisper." });
+                if (recorder?.state === "recording") {
+                  recorder.stop();
+                } else {
+                  sendEnd();
+                }
+              }
+              return resultPromise;
+            },
+            cancel: () => finish(new Error("Voice audio recording was cancelled."))
+          });
+        } catch (error) {
+          finish(error instanceof Error ? error : new Error(String(error)));
+          rejectSession(error instanceof Error ? error : new Error(String(error)));
         }
       });
-      recorder.addEventListener("error", () => finish(new Error("Microphone recorder failed.")));
-      recorder.start(750);
-      window.setTimeout(() => {
-        if (recorder?.state === "recording") {
-          recorder.stop();
+
+      socket.addEventListener("message", (event) => {
+        const message = JSON.parse(event.data as string) as { type?: string; status?: VoiceAudioStatus["status"]; message?: string; result?: VoiceExecutionResult };
+        if (message.type === "status" && message.status && message.message) {
+          onStatus?.({ status: message.status, message: message.message });
         }
-      }, 5000);
-    });
+        if (message.type === "result" && message.result) {
+          finish(undefined, message.result);
+        }
+        if (message.type === "error") {
+          finish(new Error(message.message ?? "Voice audio stream failed."));
+        }
+      });
 
-    socket.addEventListener("message", (event) => {
-      const message = JSON.parse(event.data as string) as { type?: string; status?: VoiceAudioStatus["status"]; message?: string; result?: VoiceExecutionResult };
-      if (message.type === "status" && message.status && message.message) {
-        onStatus?.({ status: message.status, message: message.message });
-      }
-      if (message.type === "result" && message.result) {
-        finish(undefined, message.result);
-      }
-      if (message.type === "error") {
-        finish(new Error(message.message ?? "Voice audio stream failed."));
-      }
+      socket.addEventListener("error", () => finish(new Error("Voice audio socket failed.")));
+      socket.addEventListener("close", () => {
+        if (!settled) {
+          finish(new Error("Voice audio socket closed before a result was received."));
+        }
+      });
     });
+    void resultPromise.catch(() => undefined);
 
-    socket.addEventListener("error", () => finish(new Error("Voice audio socket failed.")));
-    socket.addEventListener("close", () => {
-      if (!settled) {
-        finish(new Error("Voice audio socket closed before a result was received."));
-      }
+    socket.addEventListener("error", () => {
+      stream.getTracks().forEach((track) => track.stop());
+      rejectSession(new Error("Voice audio socket failed."));
     });
   });
 }

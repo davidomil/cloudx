@@ -38,6 +38,7 @@
               "create",
               "targetPluginId",
               "cwd",
+              "paneId",
               "createDirectory",
               "newPane",
               "splitDirection"
@@ -55,6 +56,7 @@
               "create": { "type": ["boolean", "null"] },
               "targetPluginId": { "type": ["string", "null"] },
               "cwd": { "type": ["string", "null"] },
+              "paneId": { "type": ["string", "null"] },
               "createDirectory": { "type": ["boolean", "null"] },
               "newPane": { "type": ["boolean", "null"] },
               "splitDirection": { "type": ["string", "null"], "enum": ["row", "column", null] }

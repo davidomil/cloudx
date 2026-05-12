@@ -20,6 +20,9 @@ describe("buildVoicePrompt", () => {
     expect(prompt).toContain("standardized plugin voiceContext");
     expect(prompt).toContain("replace_in_file");
     expect(prompt).toContain("workspace-control.create_tab");
+    expect(prompt).toContain("workspace-control.select_pane");
+    expect(prompt).toContain("workspace-control.split_pane");
+    expect(prompt).toContain("exact pane ids");
     expect(prompt).toContain("Map 'home' to input.cwd '~'");
     expect(prompt).not.toContain("set input.text to the full transcript");
   });

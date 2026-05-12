@@ -67,10 +67,11 @@ describe("VoiceController", () => {
     };
 
     const controller = new VoiceController(sessions as never, planner);
-    const result = await controller.handleTranscript("list directory", "tab-1");
+    const result = await controller.handleTranscript("list directory", "tab-1", { activePaneId: "pane-2" });
 
     expect(result.accepted).toBe(true);
     expect(plannerInput?.transcript).toBe("list directory");
+    expect(plannerInput?.context).toMatchObject({ client: { activePaneId: "pane-2" } });
     expect(result.plan.actions).toEqual([{ action: "enter_text", targetTabId: "tab-1", input: { text: "ls", submit: true } }]);
     expect(executed).toEqual(result.plan.actions);
   });

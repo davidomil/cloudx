@@ -11,13 +11,14 @@ export class VoiceController {
     private readonly contextProvider?: VoiceContextProvider
   ) {}
 
-  async handleTranscript(transcript: string, activeTabId?: string): Promise<VoiceExecutionResult> {
+  async handleTranscript(transcript: string, activeTabId?: string, clientContext?: Record<string, unknown>): Promise<VoiceExecutionResult> {
     const trimmedTranscript = transcript.trim();
     if (!trimmedTranscript) {
       throw new Error("Transcript is empty.");
     }
 
-    const context = this.contextProvider ? await this.contextProvider.context(activeTabId) : await this.sessions.buildVoiceContext(activeTabId);
+    const baseContext = this.contextProvider ? await this.contextProvider.context(activeTabId) : await this.sessions.buildVoiceContext(activeTabId);
+    const context = attachClientVoiceContext(baseContext, clientContext);
     const plan = await this.planner.plan({ transcript: trimmedTranscript, context });
     return this.executePlan(plan, activeTabId);
   }
@@ -45,4 +46,18 @@ export class VoiceController {
       results
     };
   }
+}
+
+export function attachClientVoiceContext(context: Record<string, unknown>, clientContext?: Record<string, unknown>): Record<string, unknown> {
+  if (!clientContext) {
+    return context;
+  }
+  return {
+    ...context,
+    client: clientContext,
+    workspace:
+      typeof context.workspace === "object" && context.workspace !== null && !Array.isArray(context.workspace)
+        ? { ...context.workspace, client: clientContext }
+        : context.workspace
+  };
 }
