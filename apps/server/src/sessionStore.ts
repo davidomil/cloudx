@@ -154,6 +154,7 @@ export class SessionStore {
       activeTabId: targetActiveTabId,
       tabs: this.listTabs(),
       plugins: this.plugins.list(),
+      paths: this.pathPolicy.voiceContext(),
       sessions: sessionContexts
     };
   }
@@ -162,7 +163,7 @@ export class SessionStore {
     if (action.pluginId === WORKSPACE_CONTROL_PLUGIN_ID) {
       const input = this.plugins.sanitizeVoiceInput(WORKSPACE_CONTROL_PLUGIN_ID, action.action, action.input);
       this.plugins.validateVoiceInput(WORKSPACE_CONTROL_PLUGIN_ID, action.action, input);
-      const result = this.executeWorkspaceControlAction(action.action, input);
+      const result = await this.executeWorkspaceControlAction(action.action, input);
       if (this.activeTabId) {
         await this.contextService.record(this.getTab(this.activeTabId), "voice-action", JSON.stringify({ action: { ...action, input }, result }, null, 2));
       }
@@ -265,13 +266,31 @@ export class SessionStore {
     }
   }
 
-  private executeWorkspaceControlAction(action: string, input: Record<string, unknown>): Record<string, unknown> {
-    if (action !== "switch_tab") {
-      throw new Error(`Unsupported workspace control action: ${action}`);
+  private async executeWorkspaceControlAction(action: string, input: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (action === "switch_tab") {
+      const tab = this.findTabForSwitch(input);
+      this.setActiveTab(tab.id);
+      return { activeTabId: tab.id, title: tab.title };
     }
-    const tab = this.findTabForSwitch(input);
-    this.setActiveTab(tab.id);
-    return { activeTabId: tab.id, title: tab.title };
+    if (action === "create_tab") {
+      const targetPluginId = requireString(input.targetPluginId, "targetPluginId");
+      const cwd = normalizeVoiceCwd(requireString(input.cwd, "cwd"));
+      const title = typeof input.title === "string" && input.title.trim() ? input.title.trim() : undefined;
+      const createDirectory = typeof input.createDirectory === "boolean" ? input.createDirectory : false;
+      const newPane = typeof input.newPane === "boolean" ? input.newPane : false;
+      const splitDirection = input.splitDirection === "column" ? "column" : "row";
+      const tab = await this.createTab({ pluginId: targetPluginId, cwd, title, createDirectory });
+      return {
+        tab,
+        activeTabId: tab.id,
+        layoutInstruction: {
+          type: newPane ? "open_tab_in_new_pane" : "add_tab_to_active_pane",
+          tabId: tab.id,
+          splitDirection
+        }
+      };
+    }
+    throw new Error(`Unsupported workspace control action: ${action}`);
   }
 
   private findTabForSwitch(input: Record<string, unknown>): WorkspaceTab {
@@ -334,6 +353,24 @@ function defaultVoiceInput(action: PluginActionDefinition, transcript: string): 
     }
   }
   return input;
+}
+
+function requireString(value: unknown, name: string): string {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error(`${name} must be a non-empty string.`);
+  }
+  return value.trim();
+}
+
+function normalizeVoiceCwd(cwd: string): string {
+  const normalized = cwd.trim().toLowerCase();
+  if (normalized === "home" || normalized === "my home" || normalized === "$home") {
+    return "~";
+  }
+  if (normalized === "current" || normalized === "current directory" || normalized === "active directory") {
+    return ".";
+  }
+  return cwd;
 }
 
 function createTabIndicator(update: TabIndicatorUpdate, updatedAt = new Date().toISOString()): TabIndicator {

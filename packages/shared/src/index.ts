@@ -96,6 +96,7 @@ export interface VoiceExecutionResult {
     targetTabId?: string;
     ok: boolean;
     message?: string;
+    result?: unknown;
   }>;
 }
 

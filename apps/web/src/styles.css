@@ -518,6 +518,16 @@ textarea {
   line-height: 1.35;
 }
 
+.voice-console textarea[aria-busy="true"] {
+  color: #d7ccff;
+  border-color: #6d5dfc;
+  background: #16142a;
+}
+
+.voice-console textarea[aria-disabled="true"] {
+  cursor: progress;
+}
+
 .dialog-actions button {
   height: 36px;
   padding: 0 12px;

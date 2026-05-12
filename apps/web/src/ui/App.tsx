@@ -26,6 +26,7 @@ import {
 import { shouldSubmitVoiceConsoleKey } from "./keyboard.js";
 import { clearFocusedAttention, isTabFocused, updateAttentionTabs } from "./tabAttention.js";
 import { disposeTerminalView, disposeTerminalViewsExcept, TerminalPanel } from "./TerminalPanel.js";
+import { applyVoiceWorkspaceResults, voiceConsoleValue } from "./voiceWorkspace.js";
 
 type ConnectionStatus = "checking" | "connected" | "disconnected";
 
@@ -45,6 +46,7 @@ export function App() {
   const [attentionTabIds, setAttentionTabIds] = useState<Set<string>>(() => new Set());
   const tabsRef = useRef<WorkspaceTab[]>([]);
   const layoutRef = useRef<TabLayoutState>(initialLayout);
+  const activeTabIdRef = useRef<string | undefined>(undefined);
 
   useEffect(() => {
     void refresh();
@@ -72,6 +74,10 @@ export function App() {
   }, [tabs]);
 
   useEffect(() => {
+    activeTabIdRef.current = activeTabId;
+  }, [activeTabId]);
+
+  useEffect(() => {
     if (!findPane(layout.root, layout.activePaneId)) {
       setLayout((current) => activatePane(current, listPanes(current.root)[0]?.id ?? defaultLayout().activePaneId));
     }
@@ -92,6 +98,7 @@ export function App() {
   const serverLabel = window.location.host || "server";
   const activeTab = activeTabId ? tabById.get(activeTabId) : undefined;
   const microphoneUnavailableReason = getMicrophoneUnavailableReason();
+  const voiceConsoleText = voiceConsoleValue(voiceState, manualTranscript);
 
   async function refresh() {
     setConnectionStatus("checking");
@@ -112,6 +119,7 @@ export function App() {
     const nextLayout = reconcileLayout(layoutRef.current, nextTabs, nextActiveTabId);
     tabsRef.current = nextTabs;
     layoutRef.current = nextLayout;
+    activeTabIdRef.current = nextActiveTabId;
     setTabs(nextTabs);
     setActiveTabId(nextActiveTabId);
     setLayout(nextLayout);
@@ -128,6 +136,7 @@ export function App() {
   }
 
   async function activateTab(tabId: string, paneId = activePaneId) {
+    activeTabIdRef.current = tabId;
     setActiveTabId(tabId);
     setLayout((current) => activatePaneTab(current, paneId, tabId));
     await setActiveTab(tabId);
@@ -165,6 +174,7 @@ export function App() {
       const tab = await createTab(input);
       setTabs((current) => upsertTab(current, tab));
       setLayout((current) => addTabToPane(current, activePaneId, tab.id));
+      activeTabIdRef.current = tab.id;
       setActiveTabId(tab.id);
       setCreateOpen(false);
     } catch (err) {
@@ -178,6 +188,7 @@ export function App() {
       const result = await closeTab(tabId);
       setTabs((current) => current.filter((tab) => tab.id !== tabId));
       setLayout((current) => removeTabFromPanes(current, tabId));
+      activeTabIdRef.current = result.activeTabId;
       setActiveTabId(result.activeTabId);
       disposeTerminalView(tabId);
     } catch (err) {
@@ -186,6 +197,10 @@ export function App() {
   }
 
   function handleTranscriptKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (voiceState !== "idle") {
+      event.preventDefault();
+      return;
+    }
     if (!shouldSubmitVoiceConsoleKey({ key: event.key, shiftKey: event.shiftKey, isComposing: event.nativeEvent.isComposing })) {
       return;
     }
@@ -198,9 +213,10 @@ export function App() {
     setVoiceState("processing");
     setError(undefined);
     try {
-      await submitTranscript(manualTranscript, activeTabId);
+      const result = await submitTranscript(manualTranscript, activeTabId);
       setManualTranscript("");
       await refresh();
+      applyVoiceResult(result);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -231,13 +247,31 @@ export function App() {
       window.setTimeout(() => recorder.state === "recording" && recorder.stop(), 5000);
       const audio = await stopped;
       setVoiceState("processing");
-      await submitAudio(audio, activeTabId);
+      const result = await submitAudio(audio, activeTabId);
       await refresh();
+      applyVoiceResult(result);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setVoiceState("idle");
     }
+  }
+
+  function applyVoiceResult(result: Awaited<ReturnType<typeof submitTranscript>>) {
+    const next = applyVoiceWorkspaceResults(
+      { layout: layoutRef.current, tabs: tabsRef.current, activeTabId: activeTabIdRef.current },
+      result,
+      {
+        createPaneId: () => `pane-${crypto.randomUUID()}`,
+        createSplitId: () => `split-${crypto.randomUUID()}`
+      }
+    );
+    tabsRef.current = next.tabs;
+    layoutRef.current = next.layout;
+    activeTabIdRef.current = next.activeTabId;
+    setTabs(next.tabs);
+    setLayout(next.layout);
+    setActiveTabId(next.activeTabId);
   }
 
   return (
@@ -277,12 +311,18 @@ export function App() {
       <footer className="voice-console">
         <textarea
           aria-label="Voice transcript"
-          value={manualTranscript}
-          onChange={(event) => setManualTranscript(event.target.value)}
+          value={voiceConsoleText}
+          onChange={(event) => {
+            if (voiceState === "idle") {
+              setManualTranscript(event.target.value);
+            }
+          }}
           onKeyDown={handleTranscriptKeyDown}
-          placeholder="Type what you would say. Enter sends, Shift+Enter inserts a new line."
+          placeholder={voiceState === "idle" ? "Type what you would say. Enter sends, Shift+Enter inserts a new line." : "AI is thinking..."}
           rows={2}
-          disabled={voiceState !== "idle"}
+          readOnly={voiceState !== "idle"}
+          aria-busy={voiceState === "processing"}
+          aria-disabled={voiceState !== "idle"}
         />
       </footer>
 

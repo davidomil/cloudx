@@ -27,8 +27,8 @@ export class VoiceController {
 
     for (const action of plan.actions) {
       try {
-        await this.sessions.executeVoiceAction(action, activeTabId);
-        results.push({ action: action.action, targetTabId: action.targetTabId ?? activeTabId, ok: true });
+        const result = await this.sessions.executeVoiceAction(action, activeTabId);
+        results.push({ action: action.action, targetTabId: action.targetTabId ?? activeTabId, ok: true, result });
       } catch (error) {
         results.push({
           action: action.action,

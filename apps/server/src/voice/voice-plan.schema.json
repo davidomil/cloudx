@@ -25,7 +25,23 @@
           "input": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["text", "submit", "key", "tabId", "title", "relativePath", "content", "oldText", "newText", "create"],
+            "required": [
+              "text",
+              "submit",
+              "key",
+              "tabId",
+              "title",
+              "relativePath",
+              "content",
+              "oldText",
+              "newText",
+              "create",
+              "targetPluginId",
+              "cwd",
+              "createDirectory",
+              "newPane",
+              "splitDirection"
+            ],
             "properties": {
               "text": { "type": ["string", "null"] },
               "submit": { "type": ["boolean", "null"] },
@@ -36,7 +52,12 @@
               "content": { "type": ["string", "null"] },
               "oldText": { "type": ["string", "null"] },
               "newText": { "type": ["string", "null"] },
-              "create": { "type": ["boolean", "null"] }
+              "create": { "type": ["boolean", "null"] },
+              "targetPluginId": { "type": ["string", "null"] },
+              "cwd": { "type": ["string", "null"] },
+              "createDirectory": { "type": ["boolean", "null"] },
+              "newPane": { "type": ["boolean", "null"] },
+              "splitDirection": { "type": ["string", "null"], "enum": ["row", "column", null] }
             }
           },
           "reason": { "type": ["string", "null"] }

@@ -27,7 +27,7 @@ describe("VoiceController", () => {
       },
       async executeVoiceAction(action: { action: string }) {
         executed.push(action.action);
-        return {};
+        return { typed: 5 };
       }
     };
 
@@ -36,6 +36,7 @@ describe("VoiceController", () => {
 
     expect(result.accepted).toBe(true);
     expect(executed).toEqual(["enter_text"]);
+    expect(result.results[0]?.result).toEqual({ typed: 5 });
   });
 
   it("routes default-looking transcripts through the planner before executing plugin defaults", async () => {

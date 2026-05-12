@@ -103,6 +103,21 @@ export class PathPolicy {
     return uniquePathOptions([current, ...directories, ...this.rootOptions(query, limit)]).slice(0, limit);
   }
 
+  voiceContext(): Record<string, unknown> {
+    return {
+      home: this.homeDir,
+      relativeBase: this.relativeBaseDir,
+      aliases: [
+        { label: "home", cwd: "~", resolvesTo: this.homeDir },
+        { label: "current", cwd: ".", resolvesTo: this.relativeBaseDir }
+      ],
+      allowedRoots: this.rootEntries.map((root) => ({
+        expression: root.expression,
+        resolved: root.resolved
+      }))
+    };
+  }
+
   private resolveUserPath(candidate: string): string {
     const trimmed = candidate.trim();
     if (!trimmed) {

@@ -19,6 +19,8 @@ describe("buildVoicePrompt", () => {
     expect(prompt).toContain("transcript 'list directory' becomes input.text 'ls'");
     expect(prompt).toContain("standardized plugin voiceContext");
     expect(prompt).toContain("replace_in_file");
+    expect(prompt).toContain("workspace-control.create_tab");
+    expect(prompt).toContain("Map 'home' to input.cwd '~'");
     expect(prompt).not.toContain("set input.text to the full transcript");
   });
 });

@@ -148,6 +148,7 @@ describe("SessionStore voice actions", () => {
 
     expect(context).toMatchObject({
       activeTabId: tab.id,
+      paths: { aliases: expect.arrayContaining([{ label: "home", cwd: "~", resolvesTo: expect.any(String) }]) },
       sessions: [
         {
           tabId: tab.id,
@@ -169,6 +170,30 @@ describe("SessionStore voice actions", () => {
     expect(result).toMatchObject({ title: "Alpha" });
     expect(store.getActiveTabId()).toBe(alpha.id);
     expect(store.getActiveTabId()).not.toBe(beta.id);
+  });
+
+  it("creates tabs through workspace-control with client pane instructions", async () => {
+    const { store, root } = await createStore();
+
+    const result = await store.executeVoiceAction({
+      pluginId: WORKSPACE_CONTROL_PLUGIN_ID,
+      action: "create_tab",
+      input: {
+        targetPluginId: "fake-default",
+        cwd: root,
+        title: "Voice Codex",
+        newPane: true,
+        splitDirection: "row",
+        createDirectory: false
+      }
+    });
+
+    expect(result).toMatchObject({
+      tab: { pluginId: "fake-default", title: "Voice Codex", cwd: root },
+      layoutInstruction: { type: "open_tab_in_new_pane", splitDirection: "row" }
+    });
+    expect(store.listTabs()).toHaveLength(1);
+    expect(store.getActiveTabId()).toBe((result.tab as WorkspaceTab).id);
   });
 
   it("treats a plugin id in voice targetTabId as the active tab for that plugin", async () => {

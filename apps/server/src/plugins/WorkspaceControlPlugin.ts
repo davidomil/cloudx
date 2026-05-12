@@ -21,6 +21,24 @@ export class WorkspaceControlPlugin implements WorkspacePlugin {
         },
         additionalProperties: false
       }
+    },
+    {
+      name: "create_tab",
+      description: "Create a new plugin tab, optionally requesting that the client opens it in a new pane.",
+      voiceExposed: true,
+      inputSchema: {
+        type: "object",
+        properties: {
+          targetPluginId: { type: "string", description: "Plugin to open, such as codex-terminal, standard-terminal, or file-browser." },
+          cwd: { type: "string", description: "Directory to open. Use ~ for home, an existing tab cwd, or a path from workspace path context." },
+          title: { type: "string", description: "Optional visible tab title." },
+          createDirectory: { type: "boolean", description: "Whether Cloudx may create the directory if it does not exist." },
+          newPane: { type: "boolean", description: "Whether the client should place the new tab in a newly split pane." },
+          splitDirection: { type: "string", enum: ["row", "column"], description: "row creates side-by-side panes; column creates stacked panes." }
+        },
+        required: ["targetPluginId", "cwd"],
+        additionalProperties: false
+      }
     }
   ];
 
