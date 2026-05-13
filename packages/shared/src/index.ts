@@ -77,6 +77,55 @@ export interface PathOptionsResponse {
   options: PathOption[];
 }
 
+export type GitFileStatus = "modified" | "added" | "deleted" | "renamed" | "copied" | "untracked" | "type_changed";
+
+export interface GitSetupState {
+  canInitialize: boolean;
+  canClone: boolean;
+  canSetOrigin: boolean;
+}
+
+export interface GitRepositoryState {
+  isRepository: boolean;
+  cwd: string;
+  rootPath?: string;
+  folderEmpty: boolean;
+  currentBranch?: string;
+  headRef?: string;
+  upstream?: string;
+  originUrl?: string;
+  defaultCompareRef?: string;
+  compareRefs: string[];
+  setup: GitSetupState;
+}
+
+export interface GitDiffFileSummary {
+  path: string;
+  oldPath?: string;
+  status: GitFileStatus;
+  statusCode: string;
+  additions?: number;
+  deletions?: number;
+  binary?: boolean;
+}
+
+export interface GitDiffSummary {
+  compareRef?: string;
+  files: GitDiffFileSummary[];
+  truncated: boolean;
+}
+
+export interface GitDiffFile {
+  path: string;
+  oldPath?: string;
+  status: GitFileStatus;
+  statusCode: string;
+  patch?: string;
+  binary?: boolean;
+  tooLarge?: boolean;
+  message?: string;
+}
+
 export interface VoiceAction {
   id?: string;
   targetTabId?: string;

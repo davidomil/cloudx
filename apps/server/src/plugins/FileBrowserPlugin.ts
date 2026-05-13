@@ -2,8 +2,9 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import type { CreatePluginSessionInput, PluginActionDefinition, PluginSession, PluginSessionSnapshot, PluginVoiceContext, WorkspacePlugin } from "@cloudx/plugin-api";
-import type { WorkspaceTab } from "@cloudx/shared";
+import type { GitDiffFile, GitDiffSummary, GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
 
+import { GitService } from "../git/GitService.js";
 import type { PathPolicy } from "../pathPolicy.js";
 
 const MAX_FILE_BYTES = 96_000;
@@ -27,6 +28,12 @@ interface OpenFileVoiceState {
   truncated: boolean;
   sizeBytes: number;
   updatedAt: string;
+}
+
+interface GitVoiceState {
+  state?: GitRepositoryState;
+  diff?: GitDiffSummary;
+  openDiffFile?: GitDiffFile;
 }
 
 export class FileBrowserPlugin implements WorkspacePlugin {
@@ -94,10 +101,88 @@ export class FileBrowserPlugin implements WorkspacePlugin {
         required: ["relativePath", "content"],
         additionalProperties: false
       }
+    },
+    {
+      name: "get_git_state",
+      description: "Inspect whether the file browser working directory is inside a Git repository and return available setup or diff controls.",
+      voiceExposed: true,
+      inputSchema: {
+        type: "object",
+        properties: {},
+        required: [],
+        additionalProperties: false
+      }
+    },
+    {
+      name: "initialize_repository",
+      description: "Initialize a Git repository in the file browser working directory.",
+      voiceExposed: false,
+      inputSchema: {
+        type: "object",
+        properties: {},
+        required: [],
+        additionalProperties: false
+      }
+    },
+    {
+      name: "clone_repository",
+      description: "Clone a Git repository URL into the empty file browser working directory.",
+      voiceExposed: false,
+      inputSchema: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "Git repository URL to clone." }
+        },
+        required: ["url"],
+        additionalProperties: false
+      }
+    },
+    {
+      name: "set_origin",
+      description: "Set the Git origin remote URL, initializing the working directory first when needed.",
+      voiceExposed: false,
+      inputSchema: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "Git repository URL for the origin remote." }
+        },
+        required: ["url"],
+        additionalProperties: false
+      }
+    },
+    {
+      name: "list_git_diff",
+      description: "List changed files under the file browser working directory against a comparison branch or ref.",
+      voiceExposed: true,
+      inputSchema: {
+        type: "object",
+        properties: {
+          compareRef: { type: "string", description: "Optional comparison branch or ref. Empty uses the repository default." }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    },
+    {
+      name: "open_git_diff_file",
+      description: "Open the rendered diff patch for one changed file under the file browser working directory.",
+      voiceExposed: true,
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Repository-relative path of the changed file." },
+          compareRef: { type: "string", description: "Optional comparison branch or ref. Empty uses the repository default." }
+        },
+        required: ["path"],
+        additionalProperties: false
+      }
     }
   ];
 
-  constructor(private readonly pathPolicy: PathPolicy) {}
+  constructor(
+    private readonly pathPolicy: PathPolicy,
+    private readonly gitService = new GitService()
+  ) {}
 
   descriptor() {
     return {
@@ -113,17 +198,19 @@ export class FileBrowserPlugin implements WorkspacePlugin {
   }
 
   createSession(input: CreatePluginSessionInput): PluginSession {
-    return new FileBrowserSession(input.tab, this.pathPolicy);
+    return new FileBrowserSession(input.tab, this.pathPolicy, this.gitService);
   }
 }
 
 class FileBrowserSession implements PluginSession {
   private currentDirectory: DirectoryVoiceState | undefined;
   private openFile: OpenFileVoiceState | undefined;
+  private git: GitVoiceState = {};
 
   constructor(
     public readonly tab: WorkspaceTab,
-    private readonly pathPolicy: PathPolicy
+    private readonly pathPolicy: PathPolicy,
+    private readonly gitService: GitService
   ) {}
 
   snapshot(): PluginSessionSnapshot {
@@ -140,18 +227,21 @@ class FileBrowserSession implements PluginSession {
   voiceContext(): PluginVoiceContext {
     const directoryText = this.currentDirectoryText();
     const openFileText = this.openFile ? `Open file ${this.openFile.relativePath}:\n${this.openFile.contentPreview}` : undefined;
-    const visibleText = [directoryText, openFileText].filter(Boolean).join("\n\n");
+    const gitText = this.gitContextText();
+    const visibleText = [directoryText, openFileText, gitText].filter(Boolean).join("\n\n");
     return {
       kind: "file-browser",
       cwd: this.tab.cwd,
       status: this.tab.status,
-      summary: "File browser session. Use list_directory and open_file to inspect files, and replace_in_file or write_file to edit them.",
+      summary: "File browser session. Use list_directory and open_file to inspect files, Git diff actions to review repository changes, and replace_in_file or write_file to edit files.",
       visibleText: visibleText || undefined,
       currentPath: this.currentDirectory?.path,
       currentRelativePath: this.currentDirectory?.relativePath,
       openFile: this.openFile,
       metadata: {
-        listedEntryCount: this.currentDirectory?.entries.length ?? 0
+        listedEntryCount: this.currentDirectory?.entries.length ?? 0,
+        gitRepository: this.git.state?.isRepository,
+        gitChangedFileCount: this.git.diff?.files.length
       }
     };
   }
@@ -220,6 +310,36 @@ class FileBrowserSession implements PluginSession {
         written: true,
         bytes: Buffer.byteLength(content, "utf8")
       };
+    }
+    if (action === "get_git_state") {
+      const state = await this.gitService.getState(this.tab.cwd);
+      this.git.state = state;
+      return state as unknown as Record<string, unknown>;
+    }
+    if (action === "initialize_repository") {
+      const state = await this.gitService.initializeRepository(this.tab.cwd);
+      this.git.state = state;
+      return state as unknown as Record<string, unknown>;
+    }
+    if (action === "clone_repository") {
+      const state = await this.gitService.cloneRepository(this.tab.cwd, requireString(input.url, "url"));
+      this.git.state = state;
+      return state as unknown as Record<string, unknown>;
+    }
+    if (action === "set_origin") {
+      const state = await this.gitService.setOrigin(this.tab.cwd, requireString(input.url, "url"));
+      this.git.state = state;
+      return state as unknown as Record<string, unknown>;
+    }
+    if (action === "list_git_diff") {
+      const diff = await this.gitService.listDiff(this.tab.cwd, optionalString(input.compareRef, "compareRef"));
+      this.git.diff = diff;
+      return diff as unknown as Record<string, unknown>;
+    }
+    if (action === "open_git_diff_file") {
+      const diffFile = await this.gitService.openDiffFile(this.tab.cwd, requireString(input.path, "path"), optionalString(input.compareRef, "compareRef"));
+      this.git.openDiffFile = diffFile;
+      return diffFile as unknown as Record<string, unknown>;
     }
     throw new Error(`Unsupported file browser action: ${action}`);
   }
@@ -293,6 +413,25 @@ class FileBrowserSession implements PluginSession {
     const entries = this.currentDirectory.entries.map((entry) => `${entry.type}\t${entry.name}`).join("\n");
     return `Directory ${this.currentDirectory.relativePath}:\n${entries}`;
   }
+
+  private gitContextText(): string | undefined {
+    if (!this.git.state) {
+      return undefined;
+    }
+    if (!this.git.state.isRepository) {
+      const controls = [
+        this.git.state.setup.canInitialize ? "initialize_repository" : undefined,
+        this.git.state.setup.canClone ? "clone_repository" : undefined,
+        this.git.state.setup.canSetOrigin ? "set_origin" : undefined
+      ]
+        .filter(Boolean)
+        .join(", ");
+      return `Git: not a repository. Available controls: ${controls || "none"}.`;
+    }
+    const files = this.git.diff?.files.map((file) => `${file.statusCode}\t${file.path}`).join("\n");
+    const open = this.git.openDiffFile ? `Open diff ${this.git.openDiffFile.path}${this.git.openDiffFile.message ? `: ${this.git.openDiffFile.message}` : ""}` : undefined;
+    return [`Git repository ${this.git.state.currentBranch ?? this.git.state.headRef ?? ""}`.trim(), files ? `Changed files:\n${files}` : undefined, open].filter(Boolean).join("\n");
+  }
 }
 
 function requireString(value: unknown, name: string): string {
@@ -300,6 +439,13 @@ function requireString(value: unknown, name: string): string {
     throw new Error(`${name} must be a string.`);
   }
   return value;
+}
+
+function optionalString(value: unknown, name: string): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  return requireString(value, name);
 }
 
 function countOccurrences(content: string, needle: string): number {

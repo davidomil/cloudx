@@ -816,7 +816,7 @@ a:hover svg {
   height: 100%;
   min-height: 0;
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto minmax(0, 1fr);
   overflow: hidden;
 }
 
@@ -880,6 +880,9 @@ a:hover svg {
 
 .file-browser-toolbar button,
 .file-list button,
+.git-bar button,
+.git-bar input,
+.git-bar select,
 .web-viewer-toolbar button,
 .web-viewer-popout,
 .dialog-actions button,
@@ -893,7 +896,8 @@ a:hover svg {
 
 .web-viewer-toolbar button,
 .web-viewer-popout,
-.file-browser-toolbar button {
+.file-browser-toolbar button,
+.git-bar button {
   min-width: 40px;
   height: 38px;
   display: grid;
@@ -910,6 +914,8 @@ a:hover svg {
 
 .file-browser-toolbar button:hover:not(:disabled),
 .file-list button:hover,
+.git-bar button:hover:not(:disabled),
+.git-view-toggle button.active,
 .web-viewer-toolbar button:hover:not(:disabled),
 .web-viewer-popout:hover,
 .dialog-actions button:hover,
@@ -930,6 +936,92 @@ a:hover svg {
   text-overflow: ellipsis;
   text-transform: uppercase;
   white-space: nowrap;
+}
+
+.git-bar {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px;
+  border-bottom: 1px solid rgb(0 212 255 / 0.2);
+  background: rgb(12 18 22 / 0.9);
+  overflow-x: auto;
+}
+
+.git-bar.loading,
+.git-bar.setup {
+  color: var(--color-muted-foreground);
+}
+
+.git-bar-summary,
+.git-compare-control,
+.git-inline-form,
+.git-view-toggle {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: none;
+}
+
+.git-bar-summary span,
+.git-change-count,
+.git-open-file,
+.git-compare-control {
+  min-width: 0;
+  color: var(--color-muted-foreground);
+  font-family: var(--font-label);
+  font-size: 12px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.git-bar-summary small {
+  color: var(--color-accent-tertiary);
+  font-family: var(--font-label);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.git-inline-form {
+  flex: 1 1 240px;
+}
+
+.git-inline-form.compact {
+  flex: 0 1 320px;
+}
+
+.git-bar input,
+.git-bar select {
+  height: 38px;
+  min-width: 0;
+  color: var(--color-accent);
+  background: var(--color-input);
+  padding: 0 9px;
+}
+
+.git-bar input {
+  flex: 1 1 180px;
+}
+
+.git-bar select {
+  max-width: 220px;
+}
+
+.git-view-toggle {
+  gap: 0;
+}
+
+.git-view-toggle button {
+  min-width: 64px;
+  border-color: rgb(0 212 255 / 0.28);
+}
+
+.git-open-file {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .inline-error {
@@ -981,7 +1073,8 @@ a:hover svg {
 
 .file-list button {
   min-height: 34px;
-  display: flex;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
   padding: 0 9px;
@@ -997,6 +1090,39 @@ a:hover svg {
   white-space: nowrap;
 }
 
+.file-list button.has-git-change {
+  border-color: rgb(0 212 255 / 0.46);
+}
+
+.tree-change-badge {
+  min-width: 24px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  padding: 0 5px;
+  color: var(--color-background);
+  background: var(--color-accent-tertiary);
+  clip-path: var(--chamfer-xs);
+  font-family: var(--font-label);
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.tree-change-badge.added,
+.tree-change-badge.untracked {
+  background: var(--color-accent);
+}
+
+.tree-change-badge.deleted {
+  background: var(--color-destructive);
+}
+
+.tree-change-badge.renamed,
+.tree-change-badge.copied {
+  background: var(--color-accent-secondary);
+}
+
 .file-preview {
   min-width: 0;
   min-height: 0;
@@ -1008,6 +1134,135 @@ a:hover svg {
   border-left: 1px solid rgb(0 255 136 / 0.08);
   font: 12px/1.5 var(--font-body);
   white-space: pre-wrap;
+}
+
+.file-preview pre {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.git-diff-workspace {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  display: grid;
+  grid-template-columns: minmax(190px, 28%) minmax(0, 1fr);
+}
+
+.git-diff-files {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border-right: 1px solid rgb(42 42 58 / 0.92);
+  background: rgb(8 12 15 / 0.94);
+  overflow: auto;
+}
+
+.git-diff-files button {
+  min-height: 36px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 0 9px;
+  color: var(--color-accent-tertiary);
+  background: transparent;
+  border: 1px solid var(--color-border);
+  clip-path: var(--chamfer-sm);
+  cursor: pointer;
+  text-align: left;
+}
+
+.git-diff-files button:hover:not(:disabled),
+.git-diff-files button.selected {
+  color: var(--color-background);
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+  box-shadow: var(--shadow-neon);
+}
+
+.git-diff-files span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-diff-files small {
+  font-family: var(--font-label);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.git-status-badge {
+  min-width: 24px;
+  color: var(--color-accent);
+  font-family: var(--font-label);
+  font-size: 11px;
+  text-align: center;
+}
+
+.git-status-badge.deleted {
+  color: #ff6b8a;
+}
+
+.git-status-badge.renamed,
+.git-status-badge.copied {
+  color: var(--color-accent-tertiary);
+}
+
+.git-diff-empty,
+.git-diff-preview.empty {
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  gap: 8px;
+  padding: 16px;
+  color: var(--color-muted-foreground);
+  text-align: center;
+}
+
+.git-diff-preview {
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  overflow: auto;
+  background: var(--color-background);
+}
+
+.git-diff-preview .diff {
+  min-width: 100%;
+  color: var(--color-foreground);
+  background: transparent;
+  font: 12px/1.45 var(--font-body);
+}
+
+.git-diff-preview .diff-gutter {
+  color: var(--color-muted-foreground);
+  background: rgb(18 18 26 / 0.92);
+  user-select: none;
+}
+
+.git-diff-preview .diff-code {
+  color: var(--color-foreground);
+}
+
+.git-diff-preview .diff-code-insert,
+.git-diff-preview .diff-gutter-insert {
+  background: rgb(0 255 136 / 0.13);
+}
+
+.git-diff-preview .diff-code-delete,
+.git-diff-preview .diff-gutter-delete {
+  background: rgb(255 51 102 / 0.14);
+}
+
+.git-diff-preview .diff-code-normal,
+.git-diff-preview .diff-gutter-normal {
+  background: rgb(10 10 15 / 0.72);
 }
 
 .voice-console {
@@ -1229,6 +1484,21 @@ a:hover svg {
   }
 
   .file-list {
+    border-right: 0;
+    border-bottom: 1px solid rgb(42 42 58 / 0.92);
+  }
+
+  .git-bar {
+    align-items: stretch;
+    flex-wrap: wrap;
+  }
+
+  .git-diff-workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .git-diff-files {
+    max-height: 28vh;
     border-right: 0;
     border-bottom: 1px solid rgb(42 42 58 / 0.92);
   }
