@@ -20,9 +20,7 @@ tailnet only.
 These screenshots use a throwaway demo workspace and avoid local paths, host
 names, and dashboard tokens. Regenerate them with `npm run docs:screenshots`.
 
-![Cloudx split pane workspace showing file browser and local dashboard plugins](docs/screenshots/cloudx-split-panes.png)
-
-![Cloudx new tab dialog opened inside a multi-pane workspace](docs/screenshots/cloudx-new-tab-dialog.png)
+![Cloudx split pane workspace showing a Codex terminal, file browser, and local dashboard](docs/screenshots/cloudx-split-panes.png)
 
 ## Features
 

@@ -17,8 +17,9 @@ const screenshotDir = path.join(repoRoot, "docs", "screenshots");
 
 async function main() {
   const demoRoot = await createDemoWorkspace();
+  const codexFixtureBin = await createCodexFixtureBin(demoRoot);
   const demoSite = await startDemoSite();
-  const cloudx = await startCloudxServer(demoRoot);
+  const cloudx = await startCloudxServer(demoRoot, codexFixtureBin);
 
   try {
     const tabs = await createDemoTabs(cloudx.baseUrl, demoRoot, demoSite.url);
@@ -59,6 +60,29 @@ async function createDemoWorkspace() {
   await fs.writeFile(path.join(root, "docs", "notes.md"), "# Notes\n\nPublic screenshot fixture.\n");
   await fs.writeFile(path.join(root, "src", "example.ts"), "export const status = 'ready';\n");
   return root;
+}
+
+async function createCodexFixtureBin(demoRoot) {
+  const binDir = path.join(demoRoot, ".bin");
+  const codexPath = path.join(binDir, "codex");
+  await fs.mkdir(binDir, { recursive: true });
+  await fs.writeFile(
+    codexPath,
+    [
+      "#!/bin/sh",
+      "printf '\\033[32mCloudx Codex demo\\033[0m\\r\\n'",
+      "printf 'model: gpt-5.3-codex-spark\\r\\n'",
+      "printf 'workdir: demo workspace\\r\\n\\r\\n'",
+      "printf '> inspect the split pane workspace and summarize next steps\\r\\n\\r\\n'",
+      "printf '%s\\r\\n' '- Reading file browser context'",
+      "printf '%s\\r\\n' '- Watching local dashboard pane'",
+      "printf '%s\\r\\n' '- Ready for voice-driven follow-up'",
+      "while true; do sleep 60; done",
+      ""
+    ].join("\n")
+  );
+  await fs.chmod(codexPath, 0o755);
+  return binDir;
 }
 
 function startDemoSite() {
@@ -108,7 +132,7 @@ function startDemoSite() {
   });
 }
 
-async function startCloudxServer(demoRoot) {
+async function startCloudxServer(demoRoot, codexFixtureBin) {
   const port = await freePort();
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-readme-data-"));
   const child = spawn(process.execPath, ["apps/server/dist/index.js"], {
@@ -116,11 +140,12 @@ async function startCloudxServer(demoRoot) {
     env: {
       ...process.env,
       CLOUDX_APP_SERVER_ENABLED: "false",
-      CLOUDX_ALLOWED_ROOTS: demoRoot,
+      CLOUDX_ALLOWED_ROOTS: [demoRoot, "/"].join(path.delimiter),
       CLOUDX_ASR_URL: "http://127.0.0.1:9",
       CLOUDX_DATA_DIR: dataDir,
       CLOUDX_HOST: "127.0.0.1",
-      CLOUDX_PORT: String(port)
+      CLOUDX_PORT: String(port),
+      PATH: `${codexFixtureBin}${path.delimiter}${process.env.PATH ?? ""}`
     },
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -153,6 +178,11 @@ async function startCloudxServer(demoRoot) {
 }
 
 async function createDemoTabs(baseUrl, demoRoot, demoSiteUrl) {
+  const codexTab = await postJson(`${baseUrl}/api/tabs`, {
+    pluginId: "codex-terminal",
+    cwd: "/",
+    title: "CDX - demo"
+  });
   const filesTab = await postJson(`${baseUrl}/api/tabs`, {
     pluginId: "file-browser",
     cwd: demoRoot,
@@ -163,15 +193,11 @@ async function createDemoTabs(baseUrl, demoRoot, demoSiteUrl) {
     title: "WEB - dashboard",
     initialInput: { url: demoSiteUrl }
   });
-  const notesTab = await postJson(`${baseUrl}/api/tabs`, {
-    pluginId: "file-browser",
-    cwd: path.join(demoRoot, "docs"),
-    title: "FB - docs"
-  });
+  await postJson(`${baseUrl}/api/tabs/${codexTab.tab.id}/active`, {});
   return {
+    codexTab: codexTab.tab,
     filesTab: filesTab.tab,
-    webTab: webTab.tab,
-    notesTab: notesTab.tab
+    webTab: webTab.tab
   };
 }
 
@@ -191,22 +217,15 @@ async function captureScreenshots(baseUrl, tabs, forbiddenText) {
     const page = await context.newPage();
     await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
     await page.locator(".workspace-pane").first().waitFor({ timeout: 10_000 });
+    await page.locator('[data-pane-id="pane-codex"]').getByText("Cloudx Codex demo").waitFor({ timeout: 10_000 });
     await page.locator('[data-pane-id="pane-files"]').getByRole("button", { name: /README\.md/ }).click();
-    await page.locator('[data-pane-id="pane-notes"]').getByRole("button", { name: /plan\.md/ }).click();
     await page.frameLocator(".web-viewer-frame").locator(".demo-dashboard").waitFor({ timeout: 10_000 });
+    await page.locator('[data-pane-id="pane-codex"]').click();
     await normalizeVolatileUi(page);
     await assertPublicSafe(page, forbiddenText);
 
     await page.screenshot({
       path: path.join(screenshotDir, "cloudx-split-panes.png"),
-      fullPage: false
-    });
-
-    await page.locator('[data-pane-id="pane-web"] .add-tab-button').click();
-    await page.locator(".dialog").waitFor({ timeout: 5_000 });
-    await assertPublicSafe(page, forbiddenText);
-    await page.screenshot({
-      path: path.join(screenshotDir, "cloudx-new-tab-dialog.png"),
       fullPage: false
     });
   } finally {
@@ -222,30 +241,31 @@ function demoLayout(tabs) {
       direction: "row",
       sizes: [52, 48],
       children: [
-        { type: "pane", pane: { id: "pane-files", tabIds: [tabs.filesTab.id], activeTabId: tabs.filesTab.id } },
+        { type: "pane", pane: { id: "pane-codex", tabIds: [tabs.codexTab.id], activeTabId: tabs.codexTab.id } },
         {
           type: "split",
           id: "split-right",
           direction: "column",
           sizes: [54, 46],
           children: [
-            { type: "pane", pane: { id: "pane-web", tabIds: [tabs.webTab.id], activeTabId: tabs.webTab.id } },
-            { type: "pane", pane: { id: "pane-notes", tabIds: [tabs.notesTab.id], activeTabId: tabs.notesTab.id } }
+            { type: "pane", pane: { id: "pane-files", tabIds: [tabs.filesTab.id], activeTabId: tabs.filesTab.id } },
+            { type: "pane", pane: { id: "pane-web", tabIds: [tabs.webTab.id], activeTabId: tabs.webTab.id } }
           ]
         }
       ]
     },
-    activePaneId: "pane-files"
+    activePaneId: "pane-codex"
   };
 }
 
 async function normalizeVolatileUi(page) {
   await page.locator(".connection-status").evaluate((element) => {
-    element.childNodes.forEach((node) => {
-      if (node.nodeType === Node.TEXT_NODE) {
-        node.textContent = " 127.0.0.1:3001";
-      }
-    });
+    const icon = element.querySelector("svg");
+    element.replaceChildren();
+    if (icon) {
+      element.appendChild(icon);
+    }
+    element.append(" 127.0.0.1:3001");
     element.setAttribute("title", "Server connected: 127.0.0.1:3001");
   });
   await page.locator(".web-viewer-toolbar input").evaluate((element) => {
