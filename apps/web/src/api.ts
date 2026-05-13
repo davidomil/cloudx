@@ -277,14 +277,18 @@ function createAudioRecorder(stream: MediaStream): MediaRecorder {
   return new MediaRecorder(stream, options);
 }
 
-export function voiceAudioConstraints(): MediaTrackConstraints {
-  return {
+export function voiceAudioConstraints(deviceId?: string): MediaTrackConstraints {
+  const constraints: MediaTrackConstraints = {
     echoCancellation: true,
     noiseSuppression: true,
     autoGainControl: true,
     channelCount: { ideal: 1 },
     sampleRate: { ideal: 48_000 }
   };
+  if (deviceId) {
+    constraints.deviceId = { exact: deviceId };
+  }
+  return constraints;
 }
 
 function attachAudioCaptureContext(clientContext: VoiceClientContext | undefined, stream: MediaStream, recorder: MediaRecorder): VoiceClientContext {

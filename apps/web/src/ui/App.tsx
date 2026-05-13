@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement } from "react";
-import { Columns2, GitBranch, Mic, MicOff, PanelTopOpen, RefreshCw, Rows3, SquarePlus, Wifi, WifiOff, X } from "lucide-react";
+import { AudioLines, ChevronDown, Columns2, GitBranch, Mic, MicOff, PanelTopOpen, RefreshCw, Rows3, SquarePlus, Wifi, WifiOff, X } from "lucide-react";
 
 import type { CreateTabRequest, PathOption, PluginDescriptor, PluginId, TabLayoutState, WorkspaceTab, WorkspaceTabsUpdate } from "@cloudx/shared";
 
@@ -33,6 +33,7 @@ import { WebViewerPanel } from "./WebViewerPanel.js";
 type ConnectionStatus = "checking" | "connected" | "disconnected";
 
 const LAYOUT_KEY = "cloudx-layout-v2";
+const AUDIO_INPUT_KEY = "cloudx-audio-input-v1";
 
 export function App() {
   const initialLayout = useMemo(() => loadLayout(), []);
@@ -49,6 +50,10 @@ export function App() {
   const [liveTranscript, setLiveTranscript] = useState<string | undefined>();
   const [manualTranscript, setManualTranscript] = useState("");
   const [attentionTabIds, setAttentionTabIds] = useState<Set<string>>(() => new Set());
+  const [selectedAudioInputId, setSelectedAudioInputId] = useState<string | undefined>(() => loadAudioInputId());
+  const [audioInputs, setAudioInputs] = useState<MediaDeviceInfo[]>([]);
+  const [audioInputMenuOpen, setAudioInputMenuOpen] = useState(false);
+  const [audioInputError, setAudioInputError] = useState<string | undefined>();
   const tabsRef = useRef<WorkspaceTab[]>([]);
   const layoutRef = useRef<TabLayoutState>(initialLayout);
   const activeTabIdRef = useRef<string | undefined>(undefined);
@@ -70,6 +75,20 @@ export function App() {
       closeWorkspaceSocket();
       window.clearInterval(interval);
     };
+  }, []);
+
+  useEffect(() => {
+    void refreshAudioInputs();
+    if (typeof navigator === "undefined") {
+      return;
+    }
+    const mediaDevices = navigator.mediaDevices;
+    if (!mediaDevices?.addEventListener) {
+      return;
+    }
+    const handleDeviceChange = () => void refreshAudioInputs();
+    mediaDevices.addEventListener("devicechange", handleDeviceChange);
+    return () => mediaDevices.removeEventListener("devicechange", handleDeviceChange);
   }, []);
 
   useEffect(() => {
@@ -266,6 +285,7 @@ export function App() {
 
   async function handleMic() {
     setError(undefined);
+    setAudioInputMenuOpen(false);
     if (voiceState === "recording" && audioSessionRef.current) {
       setVoiceState("processing");
       setVoiceMessage("Stopping recording and transcribing with local Faster Whisper.");
@@ -293,7 +313,8 @@ export function App() {
     setVoiceMessage("Listening and streaming microphone audio...");
     setLiveTranscript(undefined);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: voiceAudioConstraints() });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: voiceAudioConstraints(selectedAudioInputId) });
+      void refreshAudioInputs();
       audioSessionRef.current = await startAudioStream(
         stream,
         activeTabId,
@@ -315,6 +336,44 @@ export function App() {
       setVoiceMessage(undefined);
       setLiveTranscript(undefined);
     }
+  }
+
+  async function refreshAudioInputs() {
+    if (typeof navigator === "undefined") {
+      return;
+    }
+    if (!navigator.mediaDevices?.enumerateDevices) {
+      setAudioInputs([]);
+      return;
+    }
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      setAudioInputs(devices.filter((device) => device.kind === "audioinput"));
+      setAudioInputError(undefined);
+    } catch (err) {
+      setAudioInputError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function toggleAudioInputMenu() {
+    if (voiceState !== "idle") {
+      return;
+    }
+    if (microphoneUnavailableReason) {
+      setError(microphoneUnavailableReason);
+      return;
+    }
+    const nextOpen = !audioInputMenuOpen;
+    setAudioInputMenuOpen(nextOpen);
+    if (nextOpen) {
+      await refreshAudioInputs();
+    }
+  }
+
+  function chooseAudioInput(deviceId?: string) {
+    setSelectedAudioInputId(deviceId);
+    persistAudioInputId(deviceId);
+    setAudioInputMenuOpen(false);
   }
 
   function applyVoiceResult(result: Awaited<ReturnType<typeof submitTranscript>>) {
@@ -362,9 +421,45 @@ export function App() {
           <button className="icon-button" onClick={() => split("column")} title="Split rows">
             <Rows3 size={17} />
           </button>
-          <button className={`mic-button ${voiceState} ${microphoneUnavailableReason ? "unavailable" : ""}`} onClick={() => void handleMic()} title={microphoneUnavailableReason ?? (voiceState === "recording" ? "Stop voice command" : "Record voice command")}>
-            {voiceState === "recording" ? <MicOff size={17} /> : <Mic size={17} />}
-          </button>
+          <div className="mic-control">
+            <button className={`mic-button ${voiceState} ${microphoneUnavailableReason ? "unavailable" : ""}`} onClick={() => void handleMic()} title={microphoneUnavailableReason ?? (voiceState === "recording" ? "Stop voice command" : "Record voice command")}>
+              {voiceState === "recording" ? <MicOff size={17} /> : <Mic size={17} />}
+            </button>
+            <button
+              className={`mic-source-button ${audioInputMenuOpen ? "open" : ""}`}
+              onClick={() => void toggleAudioInputMenu()}
+              disabled={voiceState !== "idle" || Boolean(microphoneUnavailableReason)}
+              title="Select microphone"
+              aria-label="Select microphone"
+              aria-expanded={audioInputMenuOpen}
+              aria-haspopup="menu"
+            >
+              <AudioLines size={15} />
+              <ChevronDown size={12} />
+            </button>
+            {audioInputMenuOpen ? (
+              <div className="mic-source-menu" role="menu" aria-label="Microphone devices">
+                <button type="button" className={!selectedAudioInputId ? "selected" : ""} onClick={() => chooseAudioInput(undefined)} role="menuitem">
+                  <span>Browser default</span>
+                  {!selectedAudioInputId ? <small>Selected</small> : null}
+                </button>
+                {audioInputs.map((device, index) => (
+                  <button
+                    type="button"
+                    className={selectedAudioInputId === device.deviceId ? "selected" : ""}
+                    onClick={() => chooseAudioInput(device.deviceId)}
+                    role="menuitem"
+                    key={device.deviceId || `audioinput-${index}`}
+                  >
+                    <span>{audioInputLabel(device, index)}</span>
+                    {selectedAudioInputId === device.deviceId ? <small>Selected</small> : null}
+                  </button>
+                ))}
+                {audioInputs.length === 0 ? <div className="mic-source-empty">No microphones found.</div> : null}
+                {audioInputError ? <div className="mic-source-error">{audioInputError}</div> : null}
+              </div>
+            ) : null}
+          </div>
         </div>
       </header>
 
@@ -563,6 +658,25 @@ function persistLayout(layout: TabLayoutState) {
   window.localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout));
 }
 
+function loadAudioInputId(): string | undefined {
+  if (typeof window === "undefined") {
+    return undefined;
+  }
+  return window.localStorage.getItem(AUDIO_INPUT_KEY) || undefined;
+}
+
+function persistAudioInputId(deviceId: string | undefined) {
+  if (deviceId) {
+    window.localStorage.setItem(AUDIO_INPUT_KEY, deviceId);
+    return;
+  }
+  window.localStorage.removeItem(AUDIO_INPUT_KEY);
+}
+
+function audioInputLabel(device: MediaDeviceInfo, index: number): string {
+  return device.label || `Microphone ${index + 1}`;
+}
+
 function upsertTab(tabs: WorkspaceTab[], tab: WorkspaceTab): WorkspaceTab[] {
   const existingIndex = tabs.findIndex((candidate) => candidate.id === tab.id);
   if (existingIndex === -1) {
@@ -574,6 +688,9 @@ function upsertTab(tabs: WorkspaceTab[], tab: WorkspaceTab): WorkspaceTab[] {
 function getMicrophoneUnavailableReason(): string | undefined {
   if (typeof window !== "undefined" && !window.isSecureContext) {
     return "Microphone capture requires HTTPS or localhost. Run Cloudx over https://<host>:3001 and trust the local Cloudx certificate on this device.";
+  }
+  if (typeof navigator === "undefined") {
+    return "This browser does not expose microphone capture.";
   }
   if (!navigator.mediaDevices?.getUserMedia) {
     return "This browser does not expose microphone capture.";

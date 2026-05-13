@@ -367,6 +367,7 @@ a:hover svg {
 
 .icon-button,
 .mic-button,
+.mic-source-button,
 .new-tab-inline {
   width: 38px;
   height: 36px;
@@ -381,12 +382,106 @@ a:hover svg {
 
 .icon-button:hover:not(:disabled),
 .mic-button:hover:not(:disabled),
+.mic-source-button:hover:not(:disabled),
 .new-tab-inline:hover:not(:disabled) {
   color: var(--color-background);
   background: var(--color-accent-tertiary);
   border-color: var(--color-accent-tertiary);
   box-shadow: var(--shadow-neon-tertiary);
   transform: translateY(-1px);
+}
+
+.mic-control {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.mic-source-button {
+  width: 34px;
+  grid-template-columns: 1fr auto;
+  gap: 1px;
+  padding: 0 6px;
+  color: var(--color-accent);
+  border-color: rgb(0 255 136 / 0.34);
+}
+
+.mic-source-button.open {
+  color: var(--color-background);
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+  box-shadow: var(--shadow-neon-sm);
+}
+
+.mic-source-button:disabled {
+  color: var(--color-muted-foreground);
+  border-color: var(--color-border);
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.mic-source-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 20;
+  width: min(320px, calc(100vw - 24px));
+  max-height: 340px;
+  padding: 6px;
+  overflow-y: auto;
+  background: rgb(10 10 15 / 0.98);
+  border: 1px solid rgb(0 255 136 / 0.34);
+  box-shadow: var(--shadow-neon-sm), 0 12px 30px rgb(0 0 0 / 0.42);
+  clip-path: var(--chamfer-sm);
+}
+
+.mic-source-menu button {
+  width: 100%;
+  min-height: 38px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  color: var(--color-foreground);
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  clip-path: var(--chamfer-xs);
+  cursor: pointer;
+}
+
+.mic-source-menu button:hover,
+.mic-source-menu button.selected {
+  color: var(--color-accent);
+  background: rgb(0 255 136 / 0.08);
+  border-color: rgb(0 255 136 / 0.36);
+}
+
+.mic-source-menu span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mic-source-menu small,
+.mic-source-empty,
+.mic-source-error {
+  color: var(--color-muted-foreground);
+  font-family: var(--font-label);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.mic-source-empty,
+.mic-source-error {
+  padding: 9px;
+}
+
+.mic-source-error {
+  color: var(--color-destructive);
 }
 
 .add-tab-button {
@@ -1095,9 +1190,15 @@ a:hover svg {
 
   .icon-button,
   .mic-button,
+  .mic-source-button,
   .new-tab-inline {
     width: 44px;
     height: 44px;
+  }
+
+  .mic-source-button,
+  .mic-source-menu {
+    display: none;
   }
 
   .brand {

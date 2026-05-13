@@ -169,6 +169,17 @@ describe("api client", () => {
       sampleRate: { ideal: 48_000 }
     });
   });
+
+  it("can request a specific microphone device", () => {
+    expect(voiceAudioConstraints("mic-1")).toEqual({
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      channelCount: { ideal: 1 },
+      sampleRate: { ideal: 48_000 },
+      deviceId: { exact: "mic-1" }
+    });
+  });
 });
 
 function jsonResponse(value: unknown): Response {
