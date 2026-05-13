@@ -108,6 +108,42 @@ describe("VoiceController", () => {
     expect(result.plan.actions[0]?.pluginId).toBe("workspace-control");
   });
 
+  it("uses a newly created tab as the fallback target for following voice actions", async () => {
+    const plan: VoiceActionPlan = {
+      transcript: "open a terminal and ping google",
+      summary: "Create a terminal then run ping.",
+      actions: [
+        { pluginId: "workspace-control", action: "create_tab", input: { targetPluginId: "standard-terminal" } },
+        { pluginId: "standard-terminal", action: "enter_text", input: { text: "ping google.com", submit: true } }
+      ]
+    };
+    const planner: VoicePlanner = {
+      async plan() {
+        return plan;
+      }
+    };
+    const fallbacks: Array<string | undefined> = [];
+    const sessions = {
+      async buildVoiceContext() {
+        return { activeTabId: undefined };
+      },
+      async executeVoiceAction(action: { action: string }, fallbackTabId?: string) {
+        fallbacks.push(fallbackTabId);
+        if (action.action === "create_tab") {
+          return { activeTabId: "new-terminal", tab: { id: "new-terminal" } };
+        }
+        return { typed: "ping google.com" };
+      }
+    };
+
+    const controller = new VoiceController(sessions as never, planner);
+    const result = await controller.handleTranscript("open a terminal and ping google");
+
+    expect(result.accepted).toBe(true);
+    expect(fallbacks).toEqual([undefined, "new-terminal"]);
+    expect(result.results[1]).toMatchObject({ action: "enter_text", targetTabId: "new-terminal", ok: true });
+  });
+
   it("logs transcript, planner, and action events with request correlation", async () => {
     const plan: VoiceActionPlan = {
       transcript: "list directory",

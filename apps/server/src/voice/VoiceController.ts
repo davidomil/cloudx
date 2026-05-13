@@ -92,6 +92,7 @@ export class VoiceController {
 
   private async executePlan(plan: VoiceActionPlan, activeTabId?: string, trace: VoiceTrace = {}): Promise<VoiceExecutionResult> {
     const results: VoiceExecutionResult["results"] = [];
+    let fallbackTabId = activeTabId;
 
     for (const [index, action] of plan.actions.entries()) {
       const startedAt = Date.now();
@@ -100,14 +101,16 @@ export class VoiceController {
           event: "voice_action_started",
           voiceRequestId: trace.voiceRequestId,
           source: trace.source,
-          fallbackTabId: activeTabId,
+          fallbackTabId,
           ...actionLogFields(action, this.logOptions.includeText, index)
         },
         "voice action started"
       );
       try {
-        const result = await this.sessions.executeVoiceAction(action, activeTabId);
-        results.push({ action: action.action, targetTabId: action.targetTabId ?? activeTabId, ok: true, result });
+        const result = await this.sessions.executeVoiceAction(action, fallbackTabId);
+        const resultTargetTabId = action.targetTabId ?? fallbackTabId;
+        results.push({ action: action.action, targetTabId: resultTargetTabId, ok: true, result });
+        fallbackTabId = nextFallbackTabId(result, fallbackTabId);
         this.logger?.info(
           {
             event: "voice_action_completed",
@@ -116,7 +119,8 @@ export class VoiceController {
             durationMs: Date.now() - startedAt,
             actionIndex: index,
             action: action.action,
-            targetTabId: action.targetTabId ?? activeTabId,
+            targetTabId: resultTargetTabId,
+            nextFallbackTabId: fallbackTabId,
             ok: true,
             result: summarizeRecordForLog(result, this.logOptions.includeText)
           },
@@ -125,7 +129,7 @@ export class VoiceController {
       } catch (error) {
         results.push({
           action: action.action,
-          targetTabId: action.targetTabId ?? activeTabId,
+          targetTabId: action.targetTabId ?? fallbackTabId,
           ok: false,
           message: error instanceof Error ? error.message : String(error)
         });
@@ -137,7 +141,7 @@ export class VoiceController {
             durationMs: Date.now() - startedAt,
             actionIndex: index,
             action: action.action,
-            targetTabId: action.targetTabId ?? activeTabId,
+            targetTabId: action.targetTabId ?? fallbackTabId,
             ok: false,
             err: serializeError(error)
           },
@@ -179,4 +183,18 @@ export function attachClientVoiceContext(context: Record<string, unknown>, clien
         ? { ...context.workspace, client: clientContext }
         : context.workspace
   };
+}
+
+function nextFallbackTabId(result: Record<string, unknown>, currentFallbackTabId: string | undefined): string | undefined {
+  if (typeof result.activeTabId === "string" && result.activeTabId.trim()) {
+    return result.activeTabId;
+  }
+  if (isRecord(result.tab) && typeof result.tab.id === "string" && result.tab.id.trim()) {
+    return result.tab.id;
+  }
+  return currentFallbackTabId;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

@@ -291,7 +291,13 @@ export class SessionStore {
     }
     if (action === "create_tab") {
       const targetPluginId = requireString(input.targetPluginId, "targetPluginId");
-      const cwd = typeof input.cwd === "string" && input.cwd.trim() ? normalizeVoiceCwd(input.cwd) : undefined;
+      const targetPlugin = this.plugins.get(targetPluginId);
+      const cwd =
+        typeof input.cwd === "string" && input.cwd.trim()
+          ? normalizeVoiceCwd(input.cwd)
+          : targetPlugin.requiresDirectory
+            ? this.defaultVoiceCreateTabCwdExpression()
+            : undefined;
       const title = typeof input.title === "string" && input.title.trim() ? input.title.trim() : undefined;
       const paneId = typeof input.paneId === "string" && input.paneId.trim() ? input.paneId.trim() : undefined;
       const createDirectory = typeof input.createDirectory === "boolean" ? input.createDirectory : false;
@@ -328,6 +334,16 @@ export class SessionStore {
       };
     }
     throw new Error(`Unsupported workspace control action: ${action}`);
+  }
+
+  private defaultVoiceCreateTabCwdExpression(): string {
+    if (this.activeTabId) {
+      const activeTab = this.tabs.get(this.activeTabId);
+      if (activeTab?.cwd) {
+        return activeTab.cwd;
+      }
+    }
+    return this.pathPolicy.defaultDirectoryExpression();
   }
 
   private findTabForSwitch(input: Record<string, unknown>): WorkspaceTab {

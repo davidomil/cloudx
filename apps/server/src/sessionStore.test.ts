@@ -268,6 +268,23 @@ describe("SessionStore voice actions", () => {
     expect(store.getActiveTabId()).toBe((result.tab as WorkspaceTab).id);
   });
 
+  it("uses the default directory when voice creates a directory-backed tab without cwd", async () => {
+    const { store, root } = await createStore();
+
+    const result = await store.executeVoiceAction({
+      pluginId: WORKSPACE_CONTROL_PLUGIN_ID,
+      action: "create_tab",
+      input: {
+        targetPluginId: "fake-default",
+        title: "Voice Shell"
+      }
+    });
+
+    expect(result).toMatchObject({
+      tab: { pluginId: "fake-default", title: "Voice Shell", cwd: root }
+    });
+  });
+
   it("passes plugin-specific initial input from workspace-control tab creation", async () => {
     const { store, root, plugin } = await createStore();
 
