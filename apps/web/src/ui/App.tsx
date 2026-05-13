@@ -59,6 +59,7 @@ export function App() {
   const activeTabIdRef = useRef<string | undefined>(undefined);
   const createTargetPaneIdRef = useRef<string | undefined>(undefined);
   const audioSessionRef = useRef<VoiceAudioStreamSession | undefined>(undefined);
+  const micControlRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     void refresh();
@@ -103,6 +104,20 @@ export function App() {
   useEffect(() => {
     activeTabIdRef.current = activeTabId;
   }, [activeTabId]);
+
+  useEffect(() => {
+    if (!audioInputMenuOpen) {
+      return;
+    }
+    function closeAudioInputMenuOnOutsidePointer(event: PointerEvent) {
+      if (micControlRef.current?.contains(event.target as Node)) {
+        return;
+      }
+      setAudioInputMenuOpen(false);
+    }
+    document.addEventListener("pointerdown", closeAudioInputMenuOnOutsidePointer);
+    return () => document.removeEventListener("pointerdown", closeAudioInputMenuOnOutsidePointer);
+  }, [audioInputMenuOpen]);
 
   useEffect(() => {
     if (!findPane(layout.root, layout.activePaneId)) {
@@ -366,6 +381,12 @@ export function App() {
     const nextOpen = !audioInputMenuOpen;
     setAudioInputMenuOpen(nextOpen);
     if (nextOpen) {
+      setAudioInputError(undefined);
+      try {
+        await requestAudioInputEnumerationAccess();
+      } catch (err) {
+        setAudioInputError(err instanceof Error ? err.message : String(err));
+      }
       await refreshAudioInputs();
     }
   }
@@ -421,7 +442,7 @@ export function App() {
           <button className="icon-button" onClick={() => split("column")} title="Split rows">
             <Rows3 size={17} />
           </button>
-          <div className="mic-control">
+          <div className="mic-control" ref={micControlRef}>
             <button className={`mic-button ${voiceState} ${microphoneUnavailableReason ? "unavailable" : ""}`} onClick={() => void handleMic()} title={microphoneUnavailableReason ?? (voiceState === "recording" ? "Stop voice command" : "Record voice command")}>
               {voiceState === "recording" ? <MicOff size={17} /> : <Mic size={17} />}
             </button>
@@ -674,6 +695,14 @@ function persistAudioInputId(deviceId: string | undefined) {
 
 function audioInputLabel(device: MediaDeviceInfo, index: number): string {
   return device.label || `Microphone ${index + 1}`;
+}
+
+export async function requestAudioInputEnumerationAccess(): Promise<void> {
+  if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+    throw new Error("This browser does not expose microphone capture.");
+  }
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  stream.getTracks().forEach((track) => track.stop());
 }
 
 function upsertTab(tabs: WorkspaceTab[], tab: WorkspaceTab): WorkspaceTab[] {
