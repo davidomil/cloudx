@@ -74,13 +74,21 @@ export class AsrClient {
       });
     });
 
-    ws.send(JSON.stringify({ type: "start", filename }));
-    for await (const chunk of chunks) {
-      if (chunk.byteLength > 0) {
-        ws.send(chunk);
+    try {
+      ws.send(JSON.stringify({ type: "start", filename }));
+      for await (const chunk of chunks) {
+        if (chunk.byteLength > 0) {
+          ws.send(chunk);
+        }
       }
+      ws.send(JSON.stringify({ type: "end" }));
+    } catch (error) {
+      void result.catch(() => undefined);
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close();
+      }
+      throw error;
     }
-    ws.send(JSON.stringify({ type: "end" }));
 
     return result;
   }

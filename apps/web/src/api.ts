@@ -184,8 +184,14 @@ export async function startAudioStream(
         void sendPromise.finally(() => pendingSends.delete(sendPromise));
       }
 
+      async function waitForPendingSendsToDrain(): Promise<void> {
+        while (pendingSends.size > 0) {
+          await Promise.allSettled(Array.from(pendingSends));
+        }
+      }
+
       function sendEnd() {
-        void Promise.allSettled(Array.from(pendingSends)).then(() => {
+        void waitForPendingSendsToDrain().then(() => {
           if (socket.readyState === WebSocket.OPEN) {
             socket.send(JSON.stringify({ type: "end" }));
           }

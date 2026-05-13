@@ -4,6 +4,8 @@ from fastapi.testclient import TestClient
 
 from cloudx_asr import main
 
+VALID_FAKE_AUDIO = b"fake-audio" * 20
+
 
 class FakeModel:
     def __init__(self):
@@ -48,7 +50,7 @@ def test_transcribe_with_fake_model(monkeypatch):
 
     response = client.post(
         "/transcribe",
-        files={"audio": ("voice.webm", b"fake-audio", "audio/webm")},
+        files={"audio": ("voice.webm", VALID_FAKE_AUDIO, "audio/webm")},
     )
 
     assert response.status_code == 200
@@ -71,8 +73,8 @@ def test_transcribe_websocket_with_fake_model(monkeypatch):
     with client.websocket_connect("/transcribe/ws") as websocket:
         websocket.send_json({"type": "start", "filename": "voice.webm"})
         assert websocket.receive_json() == {"type": "status", "status": "receiving"}
-        websocket.send_bytes(b"fake-")
-        websocket.send_bytes(b"audio")
+        websocket.send_bytes(VALID_FAKE_AUDIO[:80])
+        websocket.send_bytes(VALID_FAKE_AUDIO[80:])
         websocket.send_json({"type": "end"})
         assert websocket.receive_json() == {"type": "status", "status": "transcribing"}
         transcript = websocket.receive_json()
@@ -89,7 +91,7 @@ def test_transcribe_websocket_redacts_transcript_text_from_logs_by_default(monke
     with client.websocket_connect("/transcribe/ws") as websocket:
         websocket.send_json({"type": "start", "filename": "voice.webm"})
         websocket.receive_json()
-        websocket.send_bytes(b"fake-audio")
+        websocket.send_bytes(VALID_FAKE_AUDIO)
         websocket.send_json({"type": "end"})
         websocket.receive_json()
         websocket.receive_json()
@@ -109,7 +111,7 @@ def test_transcribe_websocket_logs_transcript_text_when_debug_enabled(monkeypatc
     with client.websocket_connect("/transcribe/ws") as websocket:
         websocket.send_json({"type": "start", "filename": "voice.webm"})
         websocket.receive_json()
-        websocket.send_bytes(b"fake-audio")
+        websocket.send_bytes(VALID_FAKE_AUDIO)
         websocket.send_json({"type": "end"})
         websocket.receive_json()
         websocket.receive_json()
@@ -125,13 +127,34 @@ def test_transcribe_websocket_can_return_empty_text(monkeypatch):
     with client.websocket_connect("/transcribe/ws") as websocket:
         websocket.send_json({"type": "start", "filename": "voice.webm"})
         assert websocket.receive_json() == {"type": "status", "status": "receiving"}
-        websocket.send_bytes(b"fake-audio")
+        websocket.send_bytes(VALID_FAKE_AUDIO)
         websocket.send_json({"type": "end"})
         assert websocket.receive_json() == {"type": "status", "status": "transcribing"}
         transcript = websocket.receive_json()
 
     assert transcript["type"] == "transcript"
     assert transcript["text"] == ""
+
+
+def test_transcribe_websocket_rejects_tiny_audio_before_decode(monkeypatch, capsys):
+    reset_asr_env(monkeypatch)
+    monkeypatch.setattr(main, "get_model", lambda: FakeModel())
+    client = TestClient(main.app)
+
+    with client.websocket_connect("/transcribe/ws") as websocket:
+        websocket.send_json({"type": "start", "filename": "voice.webm"})
+        assert websocket.receive_json() == {"type": "status", "status": "receiving"}
+        websocket.send_bytes(b"audio")
+        websocket.send_json({"type": "end"})
+        assert websocket.receive_json() == {"type": "status", "status": "transcribing"}
+        error = websocket.receive_json()
+
+    assert error["type"] == "error"
+    assert "too small to decode" in error["message"]
+    output = capsys.readouterr().out
+    assert '"event": "asr_websocket_invalid_audio"' in output
+    assert '"audio_bytes": 5' in output
+    assert '"first_bytes_hex": "617564696f"' in output
 
 
 def test_transcribe_websocket_sends_partial_transcripts(monkeypatch):
@@ -144,7 +167,7 @@ def test_transcribe_websocket_sends_partial_transcripts(monkeypatch):
     with client.websocket_connect("/transcribe/ws") as websocket:
         websocket.send_json({"type": "start", "filename": "voice.webm"})
         assert websocket.receive_json() == {"type": "status", "status": "receiving"}
-        websocket.send_bytes(b"fake-audio")
+        websocket.send_bytes(VALID_FAKE_AUDIO)
         partial = websocket.receive_json()
         websocket.send_json({"type": "end"})
         assert websocket.receive_json() == {"type": "status", "status": "transcribing"}

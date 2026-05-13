@@ -101,10 +101,27 @@ export function summarizeClientContext(clientContext?: Record<string, unknown>):
   if (!clientContext) {
     return undefined;
   }
+  const audioCapture = isRecord(clientContext.audioCapture) ? clientContext.audioCapture : undefined;
+  const trackSettings = audioCapture && isRecord(audioCapture.trackSettings) ? audioCapture.trackSettings : undefined;
   return stripUndefined({
     activePaneId: stringValue(clientContext.activePaneId),
     paneCount: Array.isArray(clientContext.panes) ? clientContext.panes.length : undefined,
-    activeTabId: stringValue(clientContext.activeTabId)
+    activeTabId: stringValue(clientContext.activeTabId),
+    audioCapture: audioCapture
+      ? stripUndefined({
+          recorderMimeType: stringValue(audioCapture.recorderMimeType),
+          audioBitsPerSecond: numberValue(audioCapture.audioBitsPerSecond),
+          trackSettings: trackSettings
+            ? stripUndefined({
+                channelCount: numberValue(trackSettings.channelCount),
+                echoCancellation: booleanValue(trackSettings.echoCancellation),
+                noiseSuppression: booleanValue(trackSettings.noiseSuppression),
+                sampleRate: numberValue(trackSettings.sampleRate),
+                sampleSize: numberValue(trackSettings.sampleSize)
+              })
+            : undefined
+        })
+      : undefined
   });
 }
 
@@ -138,6 +155,14 @@ function hashText(text: string): string {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" ? value : undefined;
+}
+
+function booleanValue(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 
@@ -24,6 +24,11 @@ class TranscriptionResponse(BaseModel):
 
 app = FastAPI(title="Cloudx ASR", version="0.1.0")
 logger = logging.getLogger("cloudx_asr")
+MIN_DECODABLE_AUDIO_BYTES = 128
+
+
+class InvalidAudioInput(ValueError):
+    pass
 
 
 @dataclass
@@ -175,6 +180,18 @@ async def transcribe(
         temp_file.write(audio_bytes)
 
     try:
+        try:
+            validate_audio_size(len(audio_bytes))
+        except InvalidAudioInput as error:
+            emit_asr_log(
+                "asr_http_invalid_audio",
+                filename=audio.filename or "audio.webm",
+                audio_bytes=len(audio_bytes),
+                duration_ms=elapsed_ms(started_at),
+                error=str(error),
+                first_bytes_hex=audio_bytes[:16].hex() if audio_bytes else None,
+            )
+            raise HTTPException(status_code=400, detail=str(error)) from error
         result = transcribe_file(temp_path)
         emit_asr_log(
             "asr_http_transcription_completed",
@@ -285,6 +302,19 @@ async def transcribe_ws(websocket: WebSocket) -> None:
         await send_json({"type": "status", "status": "transcribing"})
         if partial_task is not None and not partial_task.done():
             await partial_task
+        try:
+            validate_audio_size(total_bytes)
+        except InvalidAudioInput as error:
+            emit_asr_log(
+                "asr_websocket_invalid_audio",
+                filename=filename,
+                audio_bytes=total_bytes,
+                duration_ms=elapsed_ms(started_at),
+                error=str(error),
+                first_bytes_hex=first_bytes_hex(partial_audio),
+            )
+            await send_json({"type": "error", "message": str(error)})
+            return
         result = transcribe_file(temp_path)
         log_fields = {
             "filename": filename,
@@ -308,7 +338,14 @@ async def transcribe_ws(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         return
     except Exception as error:
-        emit_asr_log("asr_websocket_failed", filename=filename, duration_ms=elapsed_ms(started_at), error=str(error))
+        emit_asr_log(
+            "asr_websocket_failed",
+            filename=filename,
+            audio_bytes=total_bytes,
+            duration_ms=elapsed_ms(started_at),
+            error=str(error),
+            first_bytes_hex=first_bytes_hex(partial_audio),
+        )
         await send_json({"type": "error", "message": str(error)})
     finally:
         if temp_file is not None:
@@ -321,6 +358,19 @@ def open_temp_audio_file(filename: str):
     suffix = Path(filename or "audio.webm").suffix or ".webm"
     temp_file = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
     return temp_file, Path(temp_file.name)
+
+
+def validate_audio_size(audio_bytes: int) -> None:
+    if audio_bytes < MIN_DECODABLE_AUDIO_BYTES:
+        raise InvalidAudioInput(
+            f"ASR received only {audio_bytes} bytes of microphone audio, which is too small to decode. Check the selected microphone and try again."
+        )
+
+
+def first_bytes_hex(partial_audio: PartialAudioWindow) -> str | None:
+    if partial_audio.first_chunk is None:
+        return None
+    return partial_audio.first_chunk[:16].hex()
 
 
 def write_partial_audio_file(filename: str, chunks: list[bytes]) -> Path:

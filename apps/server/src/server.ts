@@ -35,6 +35,8 @@ export interface AppServices {
   asr: AsrClient;
 }
 
+const MIN_STREAMED_AUDIO_BYTES = 128;
+
 export async function buildServer(config: AppConfig, services?: AppServices): Promise<FastifyInstance> {
   const app = Fastify({
     logger: true,
@@ -302,6 +304,21 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
             startResolved = true;
             resolveStart();
           }
+          if (audioBytes < MIN_STREAMED_AUDIO_BYTES) {
+            const error = new Error(insufficientAudioMessage(audioBytes));
+            request.log.warn(
+              {
+                event: "voice_audio_ws_invalid_audio",
+                voiceRequestId,
+                audioBytes,
+                audioChunks,
+                err: serializeError(error)
+              },
+              "voice audio websocket invalid audio"
+            );
+            chunks.fail(error);
+            return;
+          }
           send({ type: "status", status: "transcribing", message: "Transcribing with local Faster Whisper." });
           chunks.end();
         }
@@ -341,7 +358,11 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
           startResolved = true;
           resolveStart();
         }
-        chunks.end();
+        if (audioBytes > 0 && audioBytes < MIN_STREAMED_AUDIO_BYTES) {
+          chunks.fail(new Error(insufficientAudioMessage(audioBytes)));
+        } else {
+          chunks.end();
+        }
       }
     });
   });
@@ -438,4 +459,8 @@ function assertSpeechDetected(text: string): void {
   if (!text.trim()) {
     throw new Error("No speech was detected in the microphone recording. Check that the browser is using the expected microphone, speak clearly, then try again.");
   }
+}
+
+function insufficientAudioMessage(audioBytes: number): string {
+  return `The browser sent only ${audioBytes} bytes of microphone audio, which is too small to decode. Check the selected microphone and try again.`;
 }

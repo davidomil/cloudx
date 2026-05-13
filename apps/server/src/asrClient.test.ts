@@ -44,6 +44,20 @@ describe("AsrClient", () => {
     expect(startMessages).toEqual([{ type: "start", filename: "voice.webm" }]);
   });
 
+  it("rejects when the audio stream fails before the end marker", async () => {
+    const textMessages: string[] = [];
+    const { url } = await startAsrWebSocketServer((message, _socket, isBinary) => {
+      if (!isBinary) {
+        textMessages.push(message.toString());
+      }
+    });
+    const client = new AsrClient(url);
+
+    await expect(client.transcribeStream(failingAudioChunks(), "voice.webm")).rejects.toThrow("too small to decode");
+
+    expect(textMessages).not.toContain(JSON.stringify({ type: "end" }));
+  });
+
   async function startAsrWebSocketServer(
     onMessage: (message: Buffer, socket: WebSocket, isBinary: boolean) => void
   ): Promise<{ url: string }> {
@@ -64,4 +78,9 @@ describe("AsrClient", () => {
 
 async function* audioChunks(): AsyncIterable<Buffer> {
   yield Buffer.from("audio");
+}
+
+async function* failingAudioChunks(): AsyncIterable<Buffer> {
+  yield Buffer.from("audio");
+  throw new Error("too small to decode");
 }
