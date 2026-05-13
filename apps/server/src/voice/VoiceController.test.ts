@@ -108,6 +108,91 @@ describe("VoiceController", () => {
     expect(result.plan.actions[0]?.pluginId).toBe("workspace-control");
   });
 
+  it("forwards unresolved general speech to the active Codex tab default action", async () => {
+    const plan: VoiceActionPlan = {
+      transcript: "make the tests pass",
+      summary: "No explicit workspace action found.",
+      actions: []
+    };
+    const planner: VoicePlanner = {
+      async plan() {
+        return plan;
+      }
+    };
+    const executed: unknown[] = [];
+    const sessions = {
+      async buildVoiceContext() {
+        return { activeTabId: "codex-tab" };
+      },
+      createDefaultVoiceAction(transcript: string, activeTabId?: string) {
+        return {
+          targetTabId: activeTabId,
+          pluginId: "codex-terminal",
+          action: "enter_text",
+          input: { text: transcript, submit: true }
+        };
+      },
+      async executeVoiceAction(action: unknown) {
+        executed.push(action);
+        return { typed: 19, submitted: true };
+      }
+    };
+
+    const controller = new VoiceController(sessions as never, planner);
+    const result = await controller.handleTranscript("make the tests pass", "codex-tab");
+
+    expect(result.accepted).toBe(true);
+    expect(result.plan.actions).toEqual([
+      {
+        targetTabId: "codex-tab",
+        pluginId: "codex-terminal",
+        action: "enter_text",
+        input: { text: "make the tests pass", submit: true },
+        reason: "Planner returned no actions; forwarding the transcript to the active Codex tab."
+      }
+    ]);
+    expect(executed).toEqual(result.plan.actions);
+  });
+
+  it("does not default unresolved speech into a non-Codex tab", async () => {
+    const plan: VoiceActionPlan = {
+      transcript: "make the tests pass",
+      summary: "No explicit workspace action found.",
+      actions: []
+    };
+    const planner: VoicePlanner = {
+      async plan() {
+        return plan;
+      }
+    };
+    const executed: unknown[] = [];
+    const sessions = {
+      async buildVoiceContext() {
+        return { activeTabId: "shell-tab" };
+      },
+      createDefaultVoiceAction(transcript: string, activeTabId?: string) {
+        return {
+          targetTabId: activeTabId,
+          pluginId: "standard-terminal",
+          action: "enter_text",
+          input: { text: transcript, submit: true }
+        };
+      },
+      async executeVoiceAction(action: unknown) {
+        executed.push(action);
+        return {};
+      }
+    };
+
+    const controller = new VoiceController(sessions as never, planner);
+    const result = await controller.handleTranscript("make the tests pass", "shell-tab");
+
+    expect(result.accepted).toBe(true);
+    expect(result.plan.actions).toEqual([]);
+    expect(result.results).toEqual([]);
+    expect(executed).toEqual([]);
+  });
+
   it("uses a newly created tab as the fallback target for following voice actions", async () => {
     const plan: VoiceActionPlan = {
       transcript: "open a terminal and ping google",

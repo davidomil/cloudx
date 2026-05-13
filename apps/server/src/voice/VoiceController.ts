@@ -87,7 +87,40 @@ export class VoiceController {
       },
       "voice plan received"
     );
-    return this.executePlan(plan, activeTabId, trace);
+    const executablePlan = this.planWithActiveCodexDefault(plan, trimmedTranscript, activeTabId, trace);
+    return this.executePlan(executablePlan, activeTabId, trace);
+  }
+
+  private planWithActiveCodexDefault(plan: VoiceActionPlan, transcript: string, activeTabId?: string, trace: VoiceTrace = {}): VoiceActionPlan {
+    if (plan.actions.length > 0) {
+      return plan;
+    }
+
+    const defaultAction = this.sessions.createDefaultVoiceAction(transcript, activeTabId);
+    if (defaultAction?.pluginId !== "codex-terminal" || defaultAction.action !== "enter_text") {
+      return plan;
+    }
+
+    const fallbackAction = {
+      ...defaultAction,
+      reason: defaultAction.reason ?? "Planner returned no actions; forwarding the transcript to the active Codex tab."
+    };
+    const fallbackPlan: VoiceActionPlan = {
+      ...plan,
+      summary: "Planner returned no actions; forwarded the transcript to the active Codex tab.",
+      actions: [fallbackAction]
+    };
+
+    this.logger?.info(
+      {
+        event: "voice_codex_default_action_selected",
+        voiceRequestId: trace.voiceRequestId,
+        source: trace.source,
+        ...actionLogFields(fallbackAction, this.logOptions.includeText, 0)
+      },
+      "voice codex default action selected"
+    );
+    return fallbackPlan;
   }
 
   private async executePlan(plan: VoiceActionPlan, activeTabId?: string, trace: VoiceTrace = {}): Promise<VoiceExecutionResult> {
