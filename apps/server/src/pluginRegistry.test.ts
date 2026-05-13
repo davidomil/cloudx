@@ -74,4 +74,15 @@ describe("PluginRegistry", () => {
     expect(registry.getDefaultVoiceAction("codex-terminal")?.name).toBe("enter_text");
     expect(registry.list()[0]?.actions[0]?.defaultForVoice).toBe(true);
   });
+
+  it("exposes plugin creation metadata in descriptors", () => {
+    const registry = new PluginRegistry();
+    registry.register(new CodexTerminalPlugin(new FakeFactory()));
+
+    expect(registry.list()[0]).toMatchObject({
+      id: "codex-terminal",
+      acronym: "CDX",
+      requiresDirectory: true
+    });
+  });
 });

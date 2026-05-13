@@ -12,6 +12,7 @@ import type { WorkspaceTab } from "@cloudx/shared";
 import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
 
 export const DEFAULT_TERMINAL_REPLAY_BYTES = 1_048_576;
+export const CODEX_SUBMIT_DELAY_MS = 25;
 
 export const TERMINAL_ACTIONS: PluginActionDefinition[] = [
   {
@@ -66,10 +67,12 @@ export const TERMINAL_ACTIONS: PluginActionDefinition[] = [
 
 export class CodexTerminalPlugin implements WorkspacePlugin {
   readonly id = "codex-terminal";
+  readonly acronym = "CDX";
   readonly displayName = "Codex Terminal";
   readonly description = "Runs an interactive Codex CLI session in a PTY-backed web terminal.";
   readonly panelKind = "terminal" as const;
   readonly creatable = true;
+  readonly requiresDirectory = true;
 
   readonly actions = TERMINAL_ACTIONS;
 
@@ -81,10 +84,12 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
   descriptor() {
     return {
       id: this.id,
+      acronym: this.acronym,
       displayName: this.displayName,
       description: this.description,
       panelKind: this.panelKind,
       creatable: this.creatable,
+      requiresDirectory: this.requiresDirectory,
       actions: this.actions
     };
   }
@@ -99,6 +104,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     return new CodexTerminalSession(input.tab, terminalProcess, input.controls, {
       closeOnExit: true,
       replayBytes: this.replayBytes,
+      submitDelayMs: CODEX_SUBMIT_DELAY_MS,
       voiceKind: "codex-terminal",
       voiceSummary: "Interactive Codex CLI terminal. Send natural-language coding instructions here."
     });
@@ -108,6 +114,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
 interface TerminalSessionOptions {
   closeOnExit: boolean;
   replayBytes?: number;
+  submitDelayMs?: number;
   voiceKind?: "codex-terminal" | "standard-terminal" | "terminal";
   voiceSummary?: string;
 }
@@ -246,8 +253,12 @@ export class CodexTerminalSession implements PluginSession {
     if (action === "enter_text") {
       const text = requireString(input.text, "text");
       const submit = typeof input.submit === "boolean" ? input.submit : false;
-      this.write(submit ? `${text}\r` : text);
-      return { typed: text.length, submitted: submit };
+      const textToWrite = submit ? stripTrailingLineTerminators(text) : text;
+      this.write(textToWrite);
+      if (submit) {
+        this.submit();
+      }
+      return { typed: textToWrite.length, submitted: submit };
     }
     if (action === "send_key") {
       const key = requireString(input.key, "key");
@@ -274,6 +285,15 @@ export class CodexTerminalSession implements PluginSession {
     }
   }
 
+  private submit(): void {
+    const delayMs = this.options.submitDelayMs ?? 0;
+    if (delayMs > 0) {
+      setTimeout(() => this.write("\r"), delayMs);
+      return;
+    }
+    this.write("\r");
+  }
+
   private recordCommandFinish(exitCode: number | undefined): void {
     if (typeof exitCode === "number" && exitCode !== 0) {
       this.controls.setTabIndicator({
@@ -296,6 +316,10 @@ function trimRecentOutput(output: string, maxBytes: number): string {
     return output;
   }
   return Buffer.from(output, "utf8").subarray(-maxBytes).toString("utf8");
+}
+
+function stripTrailingLineTerminators(text: string): string {
+  return text.replace(/[\r\n]+$/u, "");
 }
 
 function firstTerminator(belEnd: number, stEnd: number): { index: number; length: number } | undefined {

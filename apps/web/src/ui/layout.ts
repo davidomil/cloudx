@@ -151,14 +151,24 @@ export function placeTabInPane(current: WorkspaceLayout, targetPaneId: string, t
 
 export function addTabToPane(current: WorkspaceLayout, targetPaneId: string, tabId: string): WorkspaceLayout {
   const existingPane = findPaneContainingTab(current.root, tabId);
-  if (existingPane) {
+  if (existingPane?.id === targetPaneId) {
     return activatePaneTab(current, existingPane.id, tabId);
   }
   const target = findPane(current.root, targetPaneId) ? targetPaneId : firstPaneId(current.root);
+  if (existingPane) {
+    return placeTabInPane(current, target, tabId);
+  }
   return {
     root: updatePane(current.root, target, (pane) => ({ ...pane, tabIds: [...pane.tabIds, tabId], activeTabId: tabId })),
     activePaneId: target
   };
+}
+
+export function resolveTabCreationPaneId(current: WorkspaceLayout, requestedPaneId?: string): string {
+  if (requestedPaneId && findPane(current.root, requestedPaneId)) {
+    return requestedPaneId;
+  }
+  return current.activePaneId;
 }
 
 export function removeTabFromPanes(current: WorkspaceLayout, tabId: string): WorkspaceLayout {

@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import path from "node:path";
 
-import type { PluginActionDefinition, PluginSession, PluginTabControls } from "@cloudx/plugin-api";
+import type { PluginActionDefinition, PluginSession, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
 import type { CreateTabRequest, TabIndicator, TabIndicatorUpdate, VoiceAction, WorkspaceSnapshot, WorkspaceTab, WorkspaceTabsUpdate } from "@cloudx/shared";
 
 import { PathPolicy } from "./pathPolicy.js";
@@ -23,13 +23,14 @@ export class SessionStore {
 
   async createTab(request: CreateTabRequest): Promise<WorkspaceTab> {
     const plugin = this.plugins.get(request.pluginId);
-    const cwd = await this.pathPolicy.ensureDirectory(request.cwd, request.createDirectory ?? false);
+    const cwdExpression = this.createTabCwdExpression(plugin, request);
+    const cwd = await this.pathPolicy.ensureDirectory(cwdExpression, plugin.requiresDirectory ? (request.createDirectory ?? false) : false);
     const now = new Date().toISOString();
     const id = crypto.randomUUID();
     const tab: WorkspaceTab = {
       id,
       pluginId: plugin.id,
-      title: request.title?.trim() || path.basename(cwd) || plugin.displayName,
+      title: request.title?.trim() || defaultTabTitle(plugin, cwd, request.initialInput),
       cwd,
       status: "starting",
       indicator: createTabIndicator({ color: "green", label: "OK", message: "Starting tab." }, now),
@@ -41,7 +42,7 @@ export class SessionStore {
     this.tabs.set(id, tab);
 
     try {
-      const session = await plugin.createSession({ tab, cwd, controls: this.createControls(id) });
+      const session = await plugin.createSession({ tab, cwd, controls: this.createControls(id), initialInput: request.initialInput });
       this.sessions.set(id, session);
       session.onStatusChange?.((status, statusMessage) => {
         if (this.tabs.has(id)) {
@@ -75,6 +76,17 @@ export class SessionStore {
     this.activeTabId = id;
     this.emitTabsChange();
     return this.getTab(id);
+  }
+
+  private createTabCwdExpression(plugin: WorkspacePlugin, request: CreateTabRequest): string {
+    const requestedCwd = request.cwd?.trim();
+    if (requestedCwd) {
+      return requestedCwd;
+    }
+    if (plugin.requiresDirectory) {
+      throw new Error(`Directory is required for ${plugin.displayName}.`);
+    }
+    return this.pathPolicy.defaultDirectoryExpression();
   }
 
   listTabs(): WorkspaceTab[] {
@@ -127,6 +139,7 @@ export class SessionStore {
         const tab = this.getTab(tabId);
         const plugin = this.plugins.get(tab.pluginId);
         const voiceContext = await session.voiceContext();
+        const historyText = await this.contextService.read(tab);
         return {
           tabId,
           pluginId: tab.pluginId,
@@ -145,7 +158,11 @@ export class SessionStore {
               defaultForVoice: action.defaultForVoice,
               inputSchema: action.inputSchema
             })),
-          contextFile: await this.contextService.read(tab)
+          history: {
+            source: tab.contextPath,
+            description: "Recent Cloudx tab context. Includes terminal output, plugin actions, and prior voice actions for this tab.",
+            text: historyText
+          }
         };
       })
     );
@@ -274,13 +291,14 @@ export class SessionStore {
     }
     if (action === "create_tab") {
       const targetPluginId = requireString(input.targetPluginId, "targetPluginId");
-      const cwd = normalizeVoiceCwd(requireString(input.cwd, "cwd"));
+      const cwd = typeof input.cwd === "string" && input.cwd.trim() ? normalizeVoiceCwd(input.cwd) : undefined;
       const title = typeof input.title === "string" && input.title.trim() ? input.title.trim() : undefined;
       const paneId = typeof input.paneId === "string" && input.paneId.trim() ? input.paneId.trim() : undefined;
       const createDirectory = typeof input.createDirectory === "boolean" ? input.createDirectory : false;
       const newPane = typeof input.newPane === "boolean" ? input.newPane : false;
       const splitDirection = input.splitDirection === "column" ? "column" : "row";
-      const tab = await this.createTab({ pluginId: targetPluginId, cwd, title, createDirectory });
+      const initialInput = typeof input.url === "string" && input.url.trim() ? { url: input.url.trim() } : undefined;
+      const tab = await this.createTab({ pluginId: targetPluginId, cwd, title, createDirectory, initialInput });
       return {
         tab,
         activeTabId: tab.id,
@@ -394,6 +412,11 @@ function normalizeVoiceCwd(cwd: string): string {
 
 function createTabIndicator(update: TabIndicatorUpdate, updatedAt = new Date().toISOString()): TabIndicator {
   return { ...update, updatedAt };
+}
+
+function defaultTabTitle(plugin: WorkspacePlugin, cwd: string, initialInput?: Record<string, unknown>): string {
+  const context = plugin.defaultTitleContext?.({ cwd, initialInput })?.trim() || path.basename(cwd) || plugin.displayName;
+  return `${plugin.acronym} - ${context}`;
 }
 
 function indicatorForStatus(status: WorkspaceTab["status"], message?: string): TabIndicator {

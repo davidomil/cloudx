@@ -16,6 +16,7 @@ export interface AppConfig {
   webDistDir: string;
   appServerEnabled: boolean;
   terminalReplayBytes: number;
+  voiceDebugTranscripts?: boolean;
   https?: {
     keyPath: string;
     certPath: string;
@@ -55,8 +56,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     webDistDir: path.resolve(env.CLOUDX_WEB_DIST_DIR ?? path.join(repoRoot, "apps/web/dist")),
     appServerEnabled: env.CLOUDX_APP_SERVER_ENABLED !== "false",
     terminalReplayBytes,
+    voiceDebugTranscripts: isTruthy(env.CLOUDX_VOICE_DEBUG_TRANSCRIPTS),
     https
   };
+}
+
+function isTruthy(value: string | undefined): boolean {
+  return value?.toLowerCase() === "1" || value?.toLowerCase() === "true" || value?.toLowerCase() === "yes" || value?.toLowerCase() === "on";
 }
 
 function resolveHttpsConfig(env: NodeJS.ProcessEnv, dataDir: string): AppConfig["https"] {

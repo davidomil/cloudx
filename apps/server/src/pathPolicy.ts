@@ -61,6 +61,14 @@ export class PathPolicy {
     return resolved;
   }
 
+  defaultDirectoryExpression(): string {
+    const firstRoot = this.rootEntries[0]?.expression;
+    if (!firstRoot) {
+      throw new Error("No Cloudx roots are configured.");
+    }
+    return firstRoot;
+  }
+
   isAllowed(resolvedPath: string): boolean {
     const normalized = path.resolve(resolvedPath);
     return this.roots.some((root) => normalized === root || normalized.startsWith(`${root}${path.sep}`));

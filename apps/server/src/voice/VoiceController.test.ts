@@ -107,4 +107,54 @@ describe("VoiceController", () => {
     expect(plannerCalled).toBe(true);
     expect(result.plan.actions[0]?.pluginId).toBe("workspace-control");
   });
+
+  it("logs transcript, planner, and action events with request correlation", async () => {
+    const plan: VoiceActionPlan = {
+      transcript: "list directory",
+      summary: "List files.",
+      actions: [{ pluginId: "standard-terminal", action: "enter_text", targetTabId: "tab-1", input: { text: "ls", submit: true } }]
+    };
+    const entries: Array<{ fields: Record<string, unknown>; message?: string }> = [];
+    const planner: VoicePlanner = {
+      async plan() {
+        return plan;
+      }
+    };
+    const sessions = {
+      async buildVoiceContext() {
+        return { activeTabId: "tab-1", tabs: [{ id: "tab-1", title: "Shell", pluginId: "standard-terminal" }] };
+      },
+      async executeVoiceAction() {
+        return { typed: 2, echoed: "ls" };
+      }
+    };
+    const logger = {
+      info(fields: Record<string, unknown>, message?: string) {
+        entries.push({ fields, message });
+      },
+      warn(fields: Record<string, unknown>, message?: string) {
+        entries.push({ fields, message });
+      },
+      error(fields: Record<string, unknown>, message?: string) {
+        entries.push({ fields, message });
+      }
+    };
+
+    const controller = new VoiceController(sessions as never, planner, undefined, logger, { includeText: true });
+    const result = await controller.handleTranscript("list directory", "tab-1", undefined, { voiceRequestId: "voice-1", source: "test" });
+
+    expect(result.accepted).toBe(true);
+    expect(entries.map((entry) => entry.fields.event)).toEqual([
+      "voice_transcript_received",
+      "voice_context_built",
+      "voice_plan_received",
+      "voice_action_started",
+      "voice_action_completed",
+      "voice_execution_completed"
+    ]);
+    expect(entries.every((entry) => entry.fields.voiceRequestId === "voice-1")).toBe(true);
+    expect(entries[0]?.fields).toMatchObject({ transcript: "list directory" });
+    expect(entries[3]?.fields).toMatchObject({ input: { text: "ls", submit: true } });
+    expect(entries[4]?.fields).toMatchObject({ result: { typed: 2, echoed: "ls" } });
+  });
 });

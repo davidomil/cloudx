@@ -86,10 +86,10 @@ function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement): Terminal
     fontSize: 13,
     lineHeight: 1.25,
     theme: {
-      background: "#101318",
-      foreground: "#d7dde8",
-      cursor: "#8bd3ff",
-      selectionBackground: "#26415f"
+      background: "#0a0a0f",
+      foreground: "#e0e0e0",
+      cursor: "#00ff88",
+      selectionBackground: "#173d33"
     }
   });
   const fit = new FitAddon();

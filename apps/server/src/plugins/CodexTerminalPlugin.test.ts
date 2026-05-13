@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { TabIndicatorUpdate, WorkspaceTab } from "@cloudx/shared";
 
@@ -66,6 +66,32 @@ describe("CodexTerminalSession", () => {
     session.handleAction("enter_text", { text: "run tests", submit: true });
 
     expect(process.written).toBe("run tests\r");
+  });
+
+  it("keeps the submit key separate for Codex TUI input", async () => {
+    vi.useFakeTimers();
+    try {
+      const process = new FakeTerminalProcess();
+      const session = new CodexTerminalSession(tab, process, undefined, { closeOnExit: false, submitDelayMs: 25 });
+
+      session.handleAction("enter_text", { text: "run tests", submit: true });
+
+      expect(process.written).toBe("run tests");
+      await vi.advanceTimersByTimeAsync(25);
+      expect(process.written).toBe("run tests\r");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("removes trailing line breaks before adding the submit key", () => {
+    const process = new FakeTerminalProcess();
+    const session = new CodexTerminalSession(tab, process);
+
+    const result = session.handleAction("enter_text", { text: "run tests\n\n", submit: true });
+
+    expect(process.written).toBe("run tests\r");
+    expect(result).toEqual({ typed: 9, submitted: true });
   });
 
   it("maps supported keys to terminal sequences", () => {

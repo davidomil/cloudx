@@ -60,6 +60,13 @@ describe("PathPolicy", () => {
     ]);
   });
 
+  it("exposes the first configured root as the default directory expression", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-default-root-"));
+    const policy = new PathPolicy([root]);
+
+    expect(policy.defaultDirectoryExpression()).toBe(root);
+  });
+
   it("suggests matching child directories using user-facing home paths", async () => {
     const home = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-home-options-"));
     await fs.mkdir(path.join(home, "project-alpha"));

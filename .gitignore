@@ -30,6 +30,7 @@ apps/web/dist-ts/
 
 .codex/
 .cloudx/
+.understand-anything/
 auth.json
 
 *.egg-info/

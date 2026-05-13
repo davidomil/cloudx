@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { WorkspaceTab } from "@cloudx/shared";
 
-import { addTabToPane, defaultLayout, listPanes, placeTabInPane, reconcileLayout, removePane, resizeSplit, splitPane } from "./layout.js";
+import { activatePane, addTabToPane, defaultLayout, listPanes, placeTabInPane, reconcileLayout, removePane, resolveTabCreationPaneId, resizeSplit, splitPane } from "./layout.js";
 
 describe("layout helpers", () => {
   it("splits only the active pane and preserves nested split directions", () => {
@@ -45,6 +45,43 @@ describe("layout helpers", () => {
     const layout = addTabToPane(defaultLayout(), "pane-1", "tab-1");
 
     expect(addTabToPane(layout, "pane-1", "tab-1")).toEqual(layout);
+  });
+
+  it("moves a newly-created tab to the requested pane if reconciliation placed it elsewhere first", () => {
+    const split = splitPane(layoutWithTabs(["existing-tab"]), "row", sequence("pane-2"), sequence("split-1"));
+    const reconciledFirst = reconcileLayout(split, [tab("existing-tab"), tab("tab-1")], "tab-1");
+    const corrected = addTabToPane(reconciledFirst, "pane-2", "tab-1");
+
+    expect(listPanes(corrected.root)).toMatchObject([
+      { id: "pane-1", tabIds: ["existing-tab"], activeTabId: "existing-tab" },
+      { id: "pane-2", tabIds: ["tab-1"], activeTabId: "tab-1" }
+    ]);
+    expect(corrected.activePaneId).toBe("pane-2");
+  });
+
+  it("resolves tab creation to the pane that opened the dialog even when another pane is active", () => {
+    const layout = splitPane(layoutWithTabs(["tab-1"]), "row", sequence("pane-2"), sequence("split-1"));
+    const firstPaneActive = { ...layout, activePaneId: "pane-1" };
+
+    expect(resolveTabCreationPaneId(firstPaneActive, "pane-2")).toBe("pane-2");
+    expect(resolveTabCreationPaneId(firstPaneActive, "missing-pane")).toBe("pane-1");
+    expect(addTabToPane(firstPaneActive, resolveTabCreationPaneId(firstPaneActive, "pane-2"), "tab-2")).toMatchObject({
+      activePaneId: "pane-2"
+    });
+  });
+
+  it("keeps an inactive pane plus-button target through selection and websocket reconciliation", () => {
+    const split = splitPane(layoutWithTabs(["existing-tab"]), "row", sequence("pane-2"), sequence("split-1"));
+    const leftPaneActive = { ...split, activePaneId: "pane-1" };
+    const selectedForCreate = activatePane(leftPaneActive, "pane-2");
+    const reconciled = reconcileLayout(selectedForCreate, [tab("existing-tab"), tab("created-tab")], "created-tab");
+    const corrected = addTabToPane(reconciled, resolveTabCreationPaneId(reconciled, "pane-2"), "created-tab");
+
+    expect(listPanes(corrected.root)).toMatchObject([
+      { id: "pane-1", tabIds: ["existing-tab"], activeTabId: "existing-tab" },
+      { id: "pane-2", tabIds: ["created-tab"], activeTabId: "created-tab" }
+    ]);
+    expect(corrected.activePaneId).toBe("pane-2");
   });
 
   it("moves a tab between panes instead of copying it", () => {

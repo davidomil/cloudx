@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement } from "react";
 import { Columns2, GitBranch, Mic, MicOff, PanelTopOpen, RefreshCw, Rows3, SquarePlus, Wifi, WifiOff, X } from "lucide-react";
 
-import type { PathOption, PluginDescriptor, PluginId, TabLayoutState, WorkspaceTab, WorkspaceTabsUpdate } from "@cloudx/shared";
+import type { CreateTabRequest, PathOption, PluginDescriptor, PluginId, TabLayoutState, WorkspaceTab, WorkspaceTabsUpdate } from "@cloudx/shared";
 
-import { closeTab, createTab, getHealth, getPathOptions, getPlugins, getTabs, setActiveTab, startAudioStream, submitTranscript, type VoiceAudioStreamSession } from "../api.js";
+import { closeTab, createTab, getHealth, getPathOptions, getPlugins, getTabs, setActiveTab, startAudioStream, submitTranscript, voiceAudioConstraints, type VoiceAudioStreamSession } from "../api.js";
 import { FileBrowserPanel } from "./FileBrowserPanel.js";
 import {
   activatePane,
@@ -17,6 +17,7 @@ import {
   reconcileLayout,
   removePane,
   removeTabFromPanes,
+  resolveTabCreationPaneId,
   resizeSplit,
   splitPane,
   type LayoutDirection,
@@ -27,6 +28,7 @@ import { shouldSubmitVoiceConsoleKey } from "./keyboard.js";
 import { clearFocusedAttention, isTabFocused, updateAttentionTabs } from "./tabAttention.js";
 import { disposeTerminalView, disposeTerminalViewsExcept, TerminalPanel } from "./TerminalPanel.js";
 import { applyVoiceWorkspaceResults, buildClientVoiceContext, voiceConsoleValue } from "./voiceWorkspace.js";
+import { WebViewerPanel } from "./WebViewerPanel.js";
 
 type ConnectionStatus = "checking" | "connected" | "disconnected";
 
@@ -39,6 +41,7 @@ export function App() {
   const [layout, setLayout] = useState<TabLayoutState>(initialLayout);
   const [activeTabId, setActiveTabId] = useState<string | undefined>();
   const [createOpen, setCreateOpen] = useState(false);
+  const [createTargetPaneId, setCreateTargetPaneId] = useState<string | undefined>();
   const [error, setError] = useState<string | undefined>();
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("checking");
   const [voiceState, setVoiceState] = useState<"idle" | "recording" | "processing">("idle");
@@ -49,6 +52,7 @@ export function App() {
   const tabsRef = useRef<WorkspaceTab[]>([]);
   const layoutRef = useRef<TabLayoutState>(initialLayout);
   const activeTabIdRef = useRef<string | undefined>(undefined);
+  const createTargetPaneIdRef = useRef<string | undefined>(undefined);
   const audioSessionRef = useRef<VoiceAudioStreamSession | undefined>(undefined);
 
   useEffect(() => {
@@ -120,7 +124,10 @@ export function App() {
 
   function applyWorkspaceTabs(nextTabs: WorkspaceTab[], nextActiveTabId?: string) {
     const previousTabs = new Map(tabsRef.current.map((tab) => [tab.id, tab]));
-    const nextLayout = reconcileLayout(layoutRef.current, nextTabs, nextActiveTabId);
+    let nextLayout = reconcileLayout(layoutRef.current, nextTabs, nextActiveTabId);
+    if (createTargetPaneIdRef.current && nextActiveTabId && !previousTabs.has(nextActiveTabId)) {
+      nextLayout = addTabToPane(nextLayout, resolveTabCreationPaneId(nextLayout, createTargetPaneIdRef.current), nextActiveTabId);
+    }
     tabsRef.current = nextTabs;
     layoutRef.current = nextLayout;
     activeTabIdRef.current = nextActiveTabId;
@@ -154,6 +161,19 @@ export function App() {
     setLayout((current) => resizeSplit(current, splitId, deltaPixels, containerPixels));
   }
 
+  function selectPaneForCreation(paneId: string) {
+    createTargetPaneIdRef.current = paneId;
+    setCreateTargetPaneId(paneId);
+    const nextLayout = activatePane(layoutRef.current, paneId);
+    layoutRef.current = nextLayout;
+    setLayout(nextLayout);
+  }
+
+  function openCreateDialogForPane(paneId: string) {
+    selectPaneForCreation(paneId);
+    setCreateOpen(true);
+  }
+
   function handleDropTab(targetPaneId: string, tabId: string, beforeTabId?: string) {
     if (!tabId) return;
     setLayout((current) => placeTabInPane(current, targetPaneId, tabId, beforeTabId));
@@ -170,20 +190,33 @@ export function App() {
 
   function handleClosePane(paneId: string) {
     setLayout((current) => removePane(current, paneId));
+    if (createTargetPaneIdRef.current === paneId) {
+      createTargetPaneIdRef.current = undefined;
+    }
+    setCreateTargetPaneId((current) => (current === paneId ? undefined : current));
   }
 
-  async function handleCreate(input: { pluginId: PluginId; cwd: string; title: string; createDirectory: boolean }) {
+  async function handleCreate(input: CreateTabRequest) {
     setError(undefined);
     try {
       const tab = await createTab(input);
       setTabs((current) => upsertTab(current, tab));
-      setLayout((current) => addTabToPane(current, activePaneId, tab.id));
+      const targetPaneId = createTargetPaneIdRef.current ?? createTargetPaneId;
+      setLayout((current) => addTabToPane(current, resolveTabCreationPaneId(current, targetPaneId), tab.id));
       activeTabIdRef.current = tab.id;
       setActiveTabId(tab.id);
       setCreateOpen(false);
+      createTargetPaneIdRef.current = undefined;
+      setCreateTargetPaneId(undefined);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
+  }
+
+  function closeCreateDialog() {
+    setCreateOpen(false);
+    createTargetPaneIdRef.current = undefined;
+    setCreateTargetPaneId(undefined);
   }
 
   async function handleClose(tabId: string) {
@@ -260,7 +293,7 @@ export function App() {
     setVoiceMessage("Listening and streaming microphone audio...");
     setLiveTranscript(undefined);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: voiceAudioConstraints() });
       audioSessionRef.current = await startAudioStream(
         stream,
         activeTabId,
@@ -310,7 +343,9 @@ export function App() {
       <header className="topbar">
         <div className="brand">
           <GitBranch size={18} />
-          <span>Cloudx</span>
+          <span className="brand-mark cyber-glitch" data-text="Cloudx">
+            Cloudx
+          </span>
           <span className={`connection-status ${connectionStatus}`} title={`Server ${connectionStatus}: ${serverLabel}`}>
             {connectionStatus === "connected" ? <Wifi size={14} /> : <WifiOff size={14} />} {serverLabel}
           </span>
@@ -349,7 +384,7 @@ export function App() {
             }
           }}
           onKeyDown={handleTranscriptKeyDown}
-          placeholder={voiceState === "idle" ? "Type what you would say. Enter sends, Shift+Enter inserts a new line." : "AI is thinking..."}
+          placeholder={voiceState === "idle" ? "Type voice command. Enter sends, Shift+Enter newline." : "AI is thinking..."}
           rows={2}
           readOnly={voiceState !== "idle"}
           aria-busy={voiceState === "processing"}
@@ -357,7 +392,7 @@ export function App() {
         />
       </footer>
 
-      {createOpen ? <CreateTabDialog plugins={plugins} onCancel={() => setCreateOpen(false)} onCreate={handleCreate} /> : null}
+      {createOpen ? <CreateTabDialog plugins={plugins} onCancel={closeCreateDialog} onCreate={handleCreate} /> : null}
     </main>
   );
 
@@ -426,11 +461,15 @@ export function App() {
             );
           })}
           <button
+            type="button"
             className="new-tab-inline add-tab-button"
+            onPointerDown={(event) => {
+              event.stopPropagation();
+              selectPaneForCreation(pane.id);
+            }}
             onClick={(event) => {
               event.stopPropagation();
-              setLayout((current) => activatePane(current, pane.id));
-              setCreateOpen(true);
+              openCreateDialogForPane(pane.id);
             }}
             title="Add tab to this pane"
           >
@@ -472,6 +511,9 @@ function TabIndicatorDot({ tab, attention }: { tab: WorkspaceTab; attention?: bo
 function PluginPanel({ tab, plugin, active }: { tab: WorkspaceTab; plugin: PluginDescriptor | undefined; active: boolean }) {
   if (plugin?.panelKind === "file-browser") {
     return <FileBrowserPanel tab={tab} />;
+  }
+  if (plugin?.panelKind === "web-viewer") {
+    return <WebViewerPanel tab={tab} />;
   }
   if (plugin?.panelKind === "terminal" || !plugin) {
     return <TerminalPanel tab={tab} active={active} />;
@@ -572,20 +614,30 @@ function CreateTabDialog({
 }: {
   plugins: PluginDescriptor[];
   onCancel: () => void;
-  onCreate: (input: { pluginId: PluginId; cwd: string; title: string; createDirectory: boolean }) => Promise<void>;
+  onCreate: (input: CreateTabRequest) => Promise<void>;
 }) {
   const creatablePlugins = plugins.filter((plugin) => plugin.creatable);
   const [pluginId, setPluginId] = useState<PluginId>("codex-terminal");
   const [cwd, setCwd] = useState("~");
   const [title, setTitle] = useState("");
+  const [localWebUrl, setLocalWebUrl] = useState("");
   const [createDirectory, setCreateDirectory] = useState(false);
   const [busy, setBusy] = useState(false);
   const [pathOptions, setPathOptions] = useState<PathOption[]>([]);
   const [pathOptionsOpen, setPathOptionsOpen] = useState(false);
   const [highlightedPathOption, setHighlightedPathOption] = useState(0);
   const [pathOptionsError, setPathOptionsError] = useState<string | undefined>();
+  const selectedPlugin = creatablePlugins.find((plugin) => plugin.id === pluginId);
+  const isLocalWeb = selectedPlugin?.panelKind === "web-viewer";
+  const requiresDirectory = selectedPlugin?.requiresDirectory ?? true;
+  const titlePlaceholder = defaultTabTitlePlaceholder(selectedPlugin, cwd, localWebUrl);
 
   useEffect(() => {
+    if (!requiresDirectory) {
+      setPathOptionsOpen(false);
+      setCreateDirectory(false);
+      return;
+    }
     if (!pathOptionsOpen) return;
     let cancelled = false;
     const timer = window.setTimeout(() => {
@@ -610,12 +662,19 @@ function CreateTabDialog({
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [cwd, pathOptionsOpen]);
+  }, [cwd, pathOptionsOpen, requiresDirectory]);
 
   async function submit() {
     setBusy(true);
     try {
-      await onCreate({ pluginId, cwd, title, createDirectory });
+      const initialInput = isLocalWeb && localWebUrl.trim() ? { url: localWebUrl.trim() } : undefined;
+      await onCreate({
+        pluginId,
+        cwd: requiresDirectory ? cwd : undefined,
+        title,
+        createDirectory: requiresDirectory ? createDirectory : false,
+        initialInput
+      });
     } finally {
       setBusy(false);
     }
@@ -660,65 +719,114 @@ function CreateTabDialog({
             ))}
           </select>
         </label>
-        <div className="field-group">
-          <label htmlFor="new-tab-directory">Directory</label>
-          <div className="path-autocomplete">
-            <input
-              id="new-tab-directory"
-              value={cwd}
-              onChange={(event) => {
-                setCwd(event.target.value);
-                setPathOptionsOpen(true);
-              }}
-              onFocus={() => setPathOptionsOpen(true)}
-              onBlur={() => window.setTimeout(() => setPathOptionsOpen(false), 100)}
-              onKeyDown={handlePathKeyDown}
-              placeholder="~, ~/project, or relative/path"
-              autoComplete="off"
-              aria-autocomplete="list"
-              aria-controls="new-tab-path-options"
-              aria-expanded={pathOptionsOpen}
-            />
-            {pathOptionsOpen ? (
-              <div id="new-tab-path-options" className="path-options" role="listbox">
-                {pathOptions.length > 0 ? (
-                  pathOptions.map((option, index) => (
-                    <button
-                      key={`${option.kind}:${option.value}`}
-                      type="button"
-                      className={`path-option ${index === highlightedPathOption ? "active" : ""}`}
-                      role="option"
-                      aria-selected={index === highlightedPathOption}
-                      onMouseDown={(event) => event.preventDefault()}
-                      onMouseEnter={() => setHighlightedPathOption(index)}
-                      onClick={() => choosePathOption(option)}
-                    >
-                      <span>{option.label}</span>
-                      {option.detail ? <small>{option.detail}</small> : null}
-                    </button>
-                  ))
-                ) : (
-                  <div className="path-options-empty">{pathOptionsError ?? "No matching directories."}</div>
-                )}
-              </div>
-            ) : null}
+        {requiresDirectory ? (
+          <div className="field-group">
+            <label htmlFor="new-tab-directory">Directory</label>
+            <div className="path-autocomplete">
+              <input
+                id="new-tab-directory"
+                value={cwd}
+                onChange={(event) => {
+                  setCwd(event.target.value);
+                  setPathOptionsOpen(true);
+                }}
+                onFocus={() => setPathOptionsOpen(true)}
+                onBlur={() => window.setTimeout(() => setPathOptionsOpen(false), 100)}
+                onKeyDown={handlePathKeyDown}
+                placeholder="~, ~/project, or relative/path"
+                autoComplete="off"
+                aria-autocomplete="list"
+                aria-controls="new-tab-path-options"
+                aria-expanded={pathOptionsOpen}
+              />
+              {pathOptionsOpen ? (
+                <div id="new-tab-path-options" className="path-options" role="listbox">
+                  {pathOptions.length > 0 ? (
+                    pathOptions.map((option, index) => (
+                      <button
+                        key={`${option.kind}:${option.value}`}
+                        type="button"
+                        className={`path-option ${index === highlightedPathOption ? "active" : ""}`}
+                        role="option"
+                        aria-selected={index === highlightedPathOption}
+                        onMouseDown={(event) => event.preventDefault()}
+                        onMouseEnter={() => setHighlightedPathOption(index)}
+                        onClick={() => choosePathOption(option)}
+                      >
+                        <span>{option.label}</span>
+                        {option.detail ? <small>{option.detail}</small> : null}
+                      </button>
+                    ))
+                  ) : (
+                    <div className="path-options-empty">{pathOptionsError ?? "No matching directories."}</div>
+                  )}
+                </div>
+              ) : null}
+            </div>
           </div>
-        </div>
+        ) : null}
+        {isLocalWeb ? (
+          <label>
+            URL
+            <input
+              value={localWebUrl}
+              onChange={(event) => setLocalWebUrl(event.target.value)}
+              placeholder="http://127.0.0.1:5173?token=..."
+              inputMode="url"
+              autoComplete="url"
+            />
+          </label>
+        ) : null}
         <label>
           Title
-          <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Optional tab title" />
+          <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder={titlePlaceholder} />
         </label>
-        <label className="checkbox-row">
-          <input type="checkbox" checked={createDirectory} onChange={(event) => setCreateDirectory(event.target.checked)} />
-          Create directory if needed
-        </label>
+        {requiresDirectory ? (
+          <label className="checkbox-row">
+            <input type="checkbox" checked={createDirectory} onChange={(event) => setCreateDirectory(event.target.checked)} />
+            Create directory if needed
+          </label>
+        ) : null}
         <div className="dialog-actions">
           <button onClick={onCancel}>Cancel</button>
-          <button className="primary-button" onClick={() => void submit()} disabled={!cwd || busy}>
+          <button className="primary-button" onClick={() => void submit()} disabled={(requiresDirectory && !cwd.trim()) || busy}>
             Create
           </button>
         </div>
       </div>
     </div>
   );
+}
+
+function defaultTabTitlePlaceholder(plugin: PluginDescriptor | undefined, cwd: string, localWebUrl: string): string {
+  const acronym = plugin?.acronym ?? "TAB";
+  const context = plugin?.requiresDirectory === false ? localWebTitleContext(localWebUrl) : folderNameFromPathInput(cwd);
+  return `${acronym} - ${context}`;
+}
+
+function folderNameFromPathInput(input: string): string {
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return "folder";
+  }
+  const normalized = trimmed.replace(/[\\/]+$/, "");
+  if (normalized === "~") {
+    return "home";
+  }
+  if (normalized === ".") {
+    return "current";
+  }
+  return normalized.split(/[\\/]/).filter(Boolean).pop() ?? "folder";
+}
+
+function localWebTitleContext(input: string): string {
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return "local";
+  }
+  try {
+    return new URL(trimmed).host || "local";
+  } catch {
+    return "local";
+  }
 }

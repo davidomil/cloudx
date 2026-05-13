@@ -21,6 +21,7 @@ export interface PluginSessionSnapshot {
   cwd: string;
   status: WorkspaceTab["status"];
   recentOutput?: string;
+  state?: Record<string, unknown>;
 }
 
 export interface PluginVoiceOpenFileContext {
@@ -61,6 +62,7 @@ export interface CreatePluginSessionInput {
   tab: WorkspaceTab;
   cwd: string;
   controls: PluginTabControls;
+  initialInput?: Record<string, unknown>;
 }
 
 export interface PluginTabControls {
@@ -70,11 +72,14 @@ export interface PluginTabControls {
 
 export interface WorkspacePlugin {
   id: PluginId;
+  acronym: string;
   displayName: string;
   description: string;
   panelKind: PluginPanelKind;
   creatable: boolean;
+  requiresDirectory: boolean;
   actions: PluginActionDefinition[];
+  defaultTitleContext?(input: { cwd: string; initialInput?: Record<string, unknown> }): string | undefined;
   createSession(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;
   descriptor(): PluginDescriptor;
 }
@@ -82,10 +87,12 @@ export interface WorkspacePlugin {
 export function descriptorFromPlugin(plugin: WorkspacePlugin): PluginDescriptor {
   return {
     id: plugin.id,
+    acronym: plugin.acronym,
     displayName: plugin.displayName,
     description: plugin.description,
     panelKind: plugin.panelKind,
     creatable: plugin.creatable,
+    requiresDirectory: plugin.requiresDirectory,
     actions: plugin.actions.map((action) => ({
       name: action.name,
       description: action.description,

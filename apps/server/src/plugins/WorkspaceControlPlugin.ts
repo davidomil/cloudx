@@ -4,10 +4,12 @@ export const WORKSPACE_CONTROL_PLUGIN_ID = "workspace-control";
 
 export class WorkspaceControlPlugin implements WorkspacePlugin {
   readonly id = WORKSPACE_CONTROL_PLUGIN_ID;
+  readonly acronym = "CTRL";
   readonly displayName = "Workspace Controls";
   readonly description = "Voice-only controls for Cloudx workspace navigation.";
   readonly panelKind = "placeholder" as const;
   readonly creatable = false;
+  readonly requiresDirectory = false;
   readonly actions: PluginActionDefinition[] = [
     {
       name: "switch_tab",
@@ -29,15 +31,16 @@ export class WorkspaceControlPlugin implements WorkspacePlugin {
       inputSchema: {
         type: "object",
         properties: {
-          targetPluginId: { type: "string", description: "Plugin to open, such as codex-terminal, standard-terminal, or file-browser." },
-          cwd: { type: "string", description: "Directory to open. Use ~ for home, an existing tab cwd, or a path from workspace path context." },
+          targetPluginId: { type: "string", description: "Plugin to open, such as codex-terminal, standard-terminal, file-browser, or local-web." },
+          cwd: { type: "string", description: "Directory to open. Use ~ for home, an existing tab cwd, or a path from workspace path context. Omit this for local-web unless the user explicitly names a directory." },
           title: { type: "string", description: "Optional visible tab title." },
+          url: { type: "string", description: "Optional local website URL when opening targetPluginId local-web." },
           paneId: { type: "string", description: "Optional exact client pane id where the new tab should be placed." },
           createDirectory: { type: "boolean", description: "Whether Cloudx may create the directory if it does not exist." },
           newPane: { type: "boolean", description: "Whether the client should place the new tab in a newly split pane." },
           splitDirection: { type: "string", enum: ["row", "column"], description: "row creates side-by-side panes; column creates stacked panes." }
         },
-        required: ["targetPluginId", "cwd"],
+        required: ["targetPluginId"],
         additionalProperties: false
       }
     },
@@ -72,10 +75,12 @@ export class WorkspaceControlPlugin implements WorkspacePlugin {
   descriptor() {
     return {
       id: this.id,
+      acronym: this.acronym,
       displayName: this.displayName,
       description: this.description,
       panelKind: this.panelKind,
       creatable: this.creatable,
+      requiresDirectory: this.requiresDirectory,
       actions: this.actions
     };
   }

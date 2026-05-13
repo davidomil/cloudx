@@ -13,13 +13,10 @@ export interface PartialTranscriptionResult {
 export class AsrClient {
   constructor(private readonly baseUrl: string) {}
 
-  async transcribe(audio: Buffer, filename: string, context?: string): Promise<TranscriptionResult> {
+  async transcribe(audio: Buffer, filename: string): Promise<TranscriptionResult> {
     const form = new FormData();
     const audioBytes = audio.buffer.slice(audio.byteOffset, audio.byteOffset + audio.byteLength) as ArrayBuffer;
     form.set("audio", new Blob([audioBytes]), filename);
-    if (context) {
-      form.set("context", context);
-    }
 
     const response = await fetch(`${this.baseUrl}/transcribe`, {
       method: "POST",
@@ -40,7 +37,6 @@ export class AsrClient {
   async transcribeStream(
     chunks: AsyncIterable<Buffer>,
     filename: string,
-    context?: string,
     onPartial?: (partial: PartialTranscriptionResult) => void
   ): Promise<TranscriptionResult> {
     const ws = new WebSocket(this.websocketUrl("/transcribe/ws"));
@@ -78,7 +74,7 @@ export class AsrClient {
       });
     });
 
-    ws.send(JSON.stringify({ type: "start", filename, context }));
+    ws.send(JSON.stringify({ type: "start", filename }));
     for await (const chunk of chunks) {
       if (chunk.byteLength > 0) {
         ws.send(chunk);

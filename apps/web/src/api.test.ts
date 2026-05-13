@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { closeTab, fetchJson, setActiveTab, startAudioStream, submitTranscript } from "./api.js";
+import { closeTab, fetchJson, setActiveTab, startAudioStream, submitTranscript, voiceAudioConstraints } from "./api.js";
 
 describe("api client", () => {
   afterEach(() => {
@@ -58,7 +58,12 @@ describe("api client", () => {
     const stoppedTrack = vi.fn();
     const statuses: string[] = [];
     const transcripts: string[] = [];
-    const stream = { getTracks: () => [{ stop: stoppedTrack }] } as unknown as MediaStream;
+    const audioTrack = {
+      kind: "audio",
+      stop: stoppedTrack,
+      getSettings: () => ({ channelCount: 1, echoCancellation: true, noiseSuppression: true, sampleRate: 48000 })
+    };
+    const stream = { getTracks: () => [audioTrack], getAudioTracks: () => [audioTrack] } as unknown as MediaStream;
     const sockets: FakeWebSocket[] = [];
     const recorders: FakeMediaRecorder[] = [];
 
@@ -93,8 +98,19 @@ describe("api client", () => {
 
     expect(recorders[0]?.timeslice).toBe(750);
     expect(recorders[0]?.mimeType).toBe("audio/webm;codecs=opus");
+    expect(recorders[0]?.audioBitsPerSecond).toBe(96_000);
     expect(new URL(String(sockets[0]!.url)).searchParams.get("filename")).toBe("voice.webm");
-    expect(JSON.parse(sockets[0]!.sent[0] as string)).toEqual({ type: "start", clientContext: { activePaneId: "pane-2" } });
+    expect(JSON.parse(sockets[0]!.sent[0] as string)).toEqual({
+      type: "start",
+      clientContext: {
+        activePaneId: "pane-2",
+        audioCapture: {
+          recorderMimeType: "audio/webm;codecs=opus",
+          audioBitsPerSecond: 96_000,
+          trackSettings: { channelCount: 1, echoCancellation: true, noiseSuppression: true, sampleRate: 48000 }
+        }
+      }
+    });
     expect(sockets[0]!.sent).toHaveLength(1);
 
     const resultPromise = session.stop();
@@ -143,6 +159,16 @@ describe("api client", () => {
     expect(new URL(String(sockets[0]!.url)).searchParams.get("filename")).toBe("voice.mp4");
     session.cancel();
   });
+
+  it("requests speech-oriented microphone constraints", () => {
+    expect(voiceAudioConstraints()).toEqual({
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      channelCount: { ideal: 1 },
+      sampleRate: { ideal: 48_000 }
+    });
+  });
 });
 
 function jsonResponse(value: unknown): Response {
@@ -187,6 +213,7 @@ class FakeMediaRecorder extends EventTarget {
   timeslice?: number;
   state: RecordingState = "inactive";
   readonly mimeType: string;
+  readonly audioBitsPerSecond: number;
 
   static isTypeSupported(this: { supportedMimeTypes?: Set<string> }, mimeType: string) {
     return this.supportedMimeTypes?.has(mimeType) ?? false;
@@ -195,6 +222,7 @@ class FakeMediaRecorder extends EventTarget {
   constructor(readonly stream: MediaStream, options?: MediaRecorderOptions) {
     super();
     this.mimeType = options?.mimeType ?? "";
+    this.audioBitsPerSecond = options?.audioBitsPerSecond ?? 0;
   }
 
   start(timeslice?: number) {

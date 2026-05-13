@@ -10,6 +10,7 @@ import { TabContextService } from "./context/TabContextService.js";
 import { PathPolicy } from "./pathPolicy.js";
 import { PluginRegistry } from "./pluginRegistry.js";
 import { SessionStore } from "./sessionStore.js";
+import { LocalWebPlugin } from "./plugins/LocalWebPlugin.js";
 import { WorkspaceControlPlugin, WORKSPACE_CONTROL_PLUGIN_ID } from "./plugins/WorkspaceControlPlugin.js";
 
 class FakeSession implements PluginSession {
@@ -54,10 +55,12 @@ class FakeSession implements PluginSession {
 
 class FakeDefaultPlugin implements WorkspacePlugin {
   readonly id = "fake-default";
+  readonly acronym = "FAKE";
   readonly displayName = "Fake Default";
   readonly description = "Fake plugin with a default voice action.";
   readonly panelKind = "terminal" as const;
   readonly creatable = true;
+  readonly requiresDirectory = true;
   readonly actions = [
     {
       name: "enter_text",
@@ -77,8 +80,10 @@ class FakeDefaultPlugin implements WorkspacePlugin {
   ];
   lastSession: FakeSession | undefined;
   lastControls: PluginTabControls | undefined;
+  lastInput: CreatePluginSessionInput | undefined;
 
   createSession(input: CreatePluginSessionInput) {
+    this.lastInput = input;
     this.lastControls = input.controls;
     this.lastSession = new FakeSession(input.tab);
     return this.lastSession;
@@ -87,10 +92,12 @@ class FakeDefaultPlugin implements WorkspacePlugin {
   descriptor() {
     return {
       id: this.id,
+      acronym: this.acronym,
       displayName: this.displayName,
       description: this.description,
       panelKind: this.panelKind,
       creatable: this.creatable,
+      requiresDirectory: this.requiresDirectory,
       actions: this.actions
     };
   }
@@ -103,6 +110,65 @@ describe("SessionStore voice actions", () => {
     const tab = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Healthy" });
 
     expect(tab.indicator).toMatchObject({ color: "green", label: "OK" });
+  });
+
+  it("uses the plugin acronym and directory folder for generated tab titles", async () => {
+    const { store, root } = await createStore();
+    const project = path.join(root, "project-alpha");
+    await fs.mkdir(project);
+
+    const tab = await store.createTab({ pluginId: "fake-default", cwd: project });
+
+    expect(tab.title).toBe("FAKE - project-alpha");
+  });
+
+  it("requires a directory for plugins that declare directory creation", async () => {
+    const { store } = await createStore();
+
+    await expect(store.createTab({ pluginId: "fake-default" })).rejects.toThrow(/Directory is required for Fake Default/);
+  });
+
+  it("creates local web tabs without a requested directory", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-local-web-no-cwd-"));
+    const registry = new PluginRegistry();
+    registry.register(new LocalWebPlugin());
+    const store = new SessionStore(registry, new PathPolicy([root]), new TabContextService(path.join(root, ".cloudx")));
+
+    const tab = await store.createTab({
+      pluginId: "local-web",
+      initialInput: { url: "http://127.0.0.1:5173?token=test" }
+    });
+
+    expect(tab).toMatchObject({
+      pluginId: "local-web",
+      title: "WEB - 127.0.0.1:5173",
+      cwd: root
+    });
+  });
+
+  it("creates local web tabs through workspace-control without cwd", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-local-web-voice-no-cwd-"));
+    const registry = new PluginRegistry();
+    registry.register(new LocalWebPlugin());
+    registry.register(new WorkspaceControlPlugin());
+    const store = new SessionStore(registry, new PathPolicy([root]), new TabContextService(path.join(root, ".cloudx")));
+
+    const result = await store.executeVoiceAction({
+      pluginId: WORKSPACE_CONTROL_PLUGIN_ID,
+      action: "create_tab",
+      input: {
+        targetPluginId: "local-web",
+        url: "http://127.0.0.1:5173?token=test"
+      }
+    });
+
+    expect(result).toMatchObject({
+      tab: {
+        pluginId: "local-web",
+        title: "WEB - 127.0.0.1:5173",
+        cwd: root
+      }
+    });
   });
 
   it("lets plugin sessions update tab indicators", async () => {
@@ -154,7 +220,12 @@ describe("SessionStore voice actions", () => {
           tabId: tab.id,
           active: true,
           voiceContext: { kind: "fake", cwd: root, summary: "Fake session." },
-          voiceActions: [{ name: "enter_text", defaultForVoice: true }]
+          voiceActions: [{ name: "enter_text", defaultForVoice: true }],
+          history: {
+            source: expect.stringContaining(`${tab.id}.md`),
+            description: expect.stringContaining("Recent Cloudx tab context"),
+            text: expect.stringContaining("Cloudx Tab Context")
+          }
         }
       ]
     });
@@ -195,6 +266,24 @@ describe("SessionStore voice actions", () => {
     });
     expect(store.listTabs()).toHaveLength(1);
     expect(store.getActiveTabId()).toBe((result.tab as WorkspaceTab).id);
+  });
+
+  it("passes plugin-specific initial input from workspace-control tab creation", async () => {
+    const { store, root, plugin } = await createStore();
+
+    const result = await store.executeVoiceAction({
+      pluginId: WORKSPACE_CONTROL_PLUGIN_ID,
+      action: "create_tab",
+      input: {
+        targetPluginId: "fake-default",
+        cwd: root,
+        title: "Dashboard",
+        url: "http://127.0.0.1:5173?token=test"
+      }
+    });
+
+    expect(result).toMatchObject({ tab: { title: "Dashboard" } });
+    expect(plugin.lastInput?.initialInput).toEqual({ url: "http://127.0.0.1:5173?token=test" });
   });
 
   it("returns client pane instructions through workspace-control", async () => {

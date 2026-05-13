@@ -20,12 +20,16 @@ describe("AsrClient", () => {
   });
 
   it("relays partial transcript messages before the final transcript", async () => {
+    const startMessages: unknown[] = [];
     const { url } = await startAsrWebSocketServer((message, socket, isBinary) => {
       if (isBinary) {
         socket.send(JSON.stringify({ type: "partial", text: "list directory" }));
         return;
       }
       const payload = JSON.parse(message.toString()) as { type?: string };
+      if (payload.type === "start") {
+        startMessages.push(payload);
+      }
       if (payload.type === "end") {
         socket.send(JSON.stringify({ type: "transcript", text: "list directory", language: "en" }));
       }
@@ -33,10 +37,11 @@ describe("AsrClient", () => {
     const partials: string[] = [];
     const client = new AsrClient(url);
 
-    const result = await client.transcribeStream(audioChunks(), "voice.webm", "Cloudx", (partial) => partials.push(partial.text));
+    const result = await client.transcribeStream(audioChunks(), "voice.webm", (partial) => partials.push(partial.text));
 
     expect(partials).toEqual(["list directory"]);
     expect(result).toMatchObject({ text: "list directory", language: "en" });
+    expect(startMessages).toEqual([{ type: "start", filename: "voice.webm" }]);
   });
 
   async function startAsrWebSocketServer(

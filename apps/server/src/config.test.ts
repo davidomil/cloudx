@@ -27,6 +27,11 @@ describe("loadConfig", () => {
     expect(config.terminalReplayBytes).toBe(2_097_152);
   });
 
+  it("keeps raw voice transcript logging opt-in", () => {
+    expect(loadConfig({} as NodeJS.ProcessEnv).voiceDebugTranscripts).toBe(false);
+    expect(loadConfig({ CLOUDX_VOICE_DEBUG_TRANSCRIPTS: "true" } as NodeJS.ProcessEnv).voiceDebugTranscripts).toBe(true);
+  });
+
   it("rejects invalid terminal replay buffer size", () => {
     expect(() => loadConfig({ CLOUDX_TERMINAL_REPLAY_BYTES: "0" } as NodeJS.ProcessEnv)).toThrow(/CLOUDX_TERMINAL_REPLAY_BYTES/);
   });

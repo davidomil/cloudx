@@ -3,6 +3,7 @@ name = "cloudx-asr"
 version = "0.1.0"
 description = "Local Faster Whisper service for Cloudx voice control"
 requires-python = ">=3.9"
+license = "MIT"
 dependencies = [
   "fastapi>=0.115",
   "uvicorn[standard]>=0.30",

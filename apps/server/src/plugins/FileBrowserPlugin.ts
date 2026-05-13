@@ -31,10 +31,12 @@ interface OpenFileVoiceState {
 
 export class FileBrowserPlugin implements WorkspacePlugin {
   readonly id = "file-browser";
+  readonly acronym = "FB";
   readonly displayName = "Files";
   readonly description = "Browses and opens files under the tab working directory.";
   readonly panelKind = "file-browser" as const;
   readonly creatable = true;
+  readonly requiresDirectory = true;
 
   readonly actions: PluginActionDefinition[] = [
     {
@@ -100,10 +102,12 @@ export class FileBrowserPlugin implements WorkspacePlugin {
   descriptor() {
     return {
       id: this.id,
+      acronym: this.acronym,
       displayName: this.displayName,
       description: this.description,
       panelKind: this.panelKind,
       creatable: this.creatable,
+      requiresDirectory: this.requiresDirectory,
       actions: this.actions
     };
   }

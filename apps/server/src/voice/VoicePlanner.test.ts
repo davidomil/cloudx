@@ -16,10 +16,16 @@ describe("buildVoicePrompt", () => {
     });
 
     expect(prompt).toContain("Do not blindly paste the transcript");
+    expect(prompt).toContain("transcript is ASR output and is often wrong");
+    expect(prompt).toContain("read that session's voiceContext and history.text");
+    expect(prompt).toContain("if the transcript says 'run pink' in a terminal context, infer 'run ping'");
     expect(prompt).toContain("transcript 'list directory' becomes input.text 'ls'");
     expect(prompt).toContain("standardized plugin voiceContext");
     expect(prompt).toContain("replace_in_file");
     expect(prompt).toContain("workspace-control.create_tab");
+    expect(prompt).toContain("targetPluginId 'local-web'");
+    expect(prompt).toContain("including any token query string");
+    expect(prompt).toContain("Do not include input.cwd for local-web");
     expect(prompt).toContain("workspace-control.select_pane");
     expect(prompt).toContain("workspace-control.split_pane");
     expect(prompt).toContain("exact pane ids");

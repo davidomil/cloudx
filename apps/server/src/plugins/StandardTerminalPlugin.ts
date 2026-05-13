@@ -5,10 +5,12 @@ import type { TerminalProcessFactory } from "../terminal/TerminalProcess.js";
 
 export class StandardTerminalPlugin implements WorkspacePlugin {
   readonly id = "standard-terminal";
+  readonly acronym = "TTY";
   readonly displayName = "Terminal";
   readonly description = "Runs the user's shell in a PTY-backed web terminal.";
   readonly panelKind = "terminal" as const;
   readonly creatable = true;
+  readonly requiresDirectory = true;
   readonly actions = TERMINAL_ACTIONS;
 
   constructor(
@@ -19,10 +21,12 @@ export class StandardTerminalPlugin implements WorkspacePlugin {
   descriptor() {
     return {
       id: this.id,
+      acronym: this.acronym,
       displayName: this.displayName,
       description: this.description,
       panelKind: this.panelKind,
       creatable: this.creatable,
+      requiresDirectory: this.requiresDirectory,
       actions: this.actions
     };
   }

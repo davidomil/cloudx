@@ -195,7 +195,7 @@ export async function startAudioStream(
       socket.addEventListener("open", () => {
         try {
           if (socket.readyState === WebSocket.OPEN) {
-            socket.send(JSON.stringify({ type: "start", clientContext }));
+            socket.send(JSON.stringify({ type: "start", clientContext: attachAudioCaptureContext(clientContext, stream, recorder) }));
           }
           onStatus?.({ status: "recording", message: "Listening and streaming microphone audio. Press the mic again to stop." });
           recorder.addEventListener("dataavailable", (event) => sendBlob(event.data));
@@ -264,7 +264,49 @@ export async function startAudioStream(
 
 function createAudioRecorder(stream: MediaStream): MediaRecorder {
   const mimeType = preferredAudioMimeType();
-  return mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+  const options: MediaRecorderOptions = { audioBitsPerSecond: 96_000 };
+  if (mimeType) {
+    options.mimeType = mimeType;
+  }
+  return new MediaRecorder(stream, options);
+}
+
+export function voiceAudioConstraints(): MediaTrackConstraints {
+  return {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+    channelCount: { ideal: 1 },
+    sampleRate: { ideal: 48_000 }
+  };
+}
+
+function attachAudioCaptureContext(clientContext: VoiceClientContext | undefined, stream: MediaStream, recorder: MediaRecorder): VoiceClientContext {
+  const audioTrack = stream.getAudioTracks?.()[0] ?? stream.getTracks().find((track) => track.kind === "audio");
+  const trackSettings = sanitizeAudioTrackSettings(audioTrack?.getSettings?.());
+  return {
+    ...(clientContext ?? {}),
+    audioCapture: {
+      recorderMimeType: recorder.mimeType,
+      audioBitsPerSecond: recorder.audioBitsPerSecond,
+      trackSettings
+    }
+  };
+}
+
+function sanitizeAudioTrackSettings(settings: MediaTrackSettings | undefined): Record<string, unknown> | undefined {
+  if (!settings) {
+    return undefined;
+  }
+  const keys: Array<keyof MediaTrackSettings> = ["autoGainControl", "channelCount", "deviceId", "echoCancellation", "noiseSuppression", "sampleRate", "sampleSize"];
+  const result: Record<string, unknown> = {};
+  for (const key of keys) {
+    const value = settings[key];
+    if (value !== undefined) {
+      result[key] = value;
+    }
+  }
+  return result;
 }
 
 function preferredAudioMimeType(): string | undefined {

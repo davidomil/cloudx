@@ -26,6 +26,7 @@ const nodePath = findCommand("node");
 const python = findCommand("python3");
 const device = resolveDevice();
 const computeType = device === "cuda" ? "float16" : "int8";
+const defaultCpuThreads = Math.max(1, Math.floor((typeof os.availableParallelism === "function" ? os.availableParallelism() : os.cpus().length || 4) / 2));
 
 run(python, ["-m", "venv", "--upgrade-deps", venvDir]);
 run(pipPath, ["install", "-e", `${asrDir}[dev]`, "huggingface_hub[cli]"]);
@@ -54,6 +55,10 @@ fs.writeFileSync(
     `CLOUDX_ASR_MODEL_PATH=${modelDir}`,
     `CLOUDX_ASR_DEVICE=${device}`,
     `CLOUDX_ASR_COMPUTE_TYPE=${computeType}`,
+    `CLOUDX_ASR_LANGUAGE=en`,
+    `CLOUDX_ASR_CPU_THREADS=${defaultCpuThreads}`,
+    `CLOUDX_ASR_NUM_WORKERS=1`,
+    `CLOUDX_VOICE_DEBUG_TRANSCRIPTS=false`,
     ""
   ].join("\n")
 );

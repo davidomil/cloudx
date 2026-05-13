@@ -6,18 +6,78 @@ import { fileURLToPath } from "node:url";
 
 import type { VoiceActionPlan } from "@cloudx/shared";
 import { parseVoiceActionPlan } from "@cloudx/shared";
+import {
+  planLogFields,
+  serializeError,
+  summarizeVoiceContext,
+  transcriptLogFields,
+  type StructuredVoiceLogger,
+  type VoiceDebugLogOptions,
+  type VoiceTrace
+} from "./VoiceDebugLog.js";
+
+export interface VoicePlannerInput extends VoiceTrace {
+  transcript: string;
+  context: Record<string, unknown>;
+}
 
 export interface VoicePlanner {
-  plan(input: { transcript: string; context: Record<string, unknown> }): Promise<VoiceActionPlan>;
+  plan(input: VoicePlannerInput): Promise<VoiceActionPlan>;
 }
 
 export class CodexExecVoicePlanner implements VoicePlanner {
-  constructor(private readonly model: string) {}
+  constructor(
+    private readonly model: string,
+    private readonly logger?: StructuredVoiceLogger,
+    private readonly logOptions: VoiceDebugLogOptions = {}
+  ) {}
 
-  async plan(input: { transcript: string; context: Record<string, unknown> }): Promise<VoiceActionPlan> {
+  async plan(input: VoicePlannerInput): Promise<VoiceActionPlan> {
     const prompt = buildVoicePrompt(input.transcript, input.context);
-    const output = await runCodexExec(this.model, prompt);
-    return parseVoiceActionPlan(JSON.parse(output));
+    const startedAt = Date.now();
+    this.logger?.info(
+      {
+        event: "voice_planner_codex_exec_started",
+        voiceRequestId: input.voiceRequestId,
+        source: input.source,
+        model: this.model,
+        promptChars: prompt.length,
+        ...transcriptLogFields(input.transcript, this.logOptions.includeText),
+        context: summarizeVoiceContext(input.context)
+      },
+      "voice planner codex exec started"
+    );
+
+    try {
+      const output = await runCodexExec(this.model, prompt);
+      const plan = parseVoiceActionPlan(JSON.parse(output));
+      this.logger?.info(
+        {
+          event: "voice_planner_codex_exec_completed",
+          voiceRequestId: input.voiceRequestId,
+          source: input.source,
+          model: this.model,
+          durationMs: Date.now() - startedAt,
+          outputChars: output.length,
+          ...planLogFields(plan, this.logOptions.includeText)
+        },
+        "voice planner codex exec completed"
+      );
+      return plan;
+    } catch (error) {
+      this.logger?.error(
+        {
+          event: "voice_planner_codex_exec_failed",
+          voiceRequestId: input.voiceRequestId,
+          source: input.source,
+          model: this.model,
+          durationMs: Date.now() - startedAt,
+          err: serializeError(error)
+        },
+        "voice planner codex exec failed"
+      );
+      throw error;
+    }
   }
 }
 
@@ -28,7 +88,10 @@ export function buildVoicePrompt(transcript: string, context: Record<string, unk
     "{\"transcript\":\"string\",\"summary\":\"string\",\"actions\":[{\"targetTabId\":\"string optional\",\"pluginId\":\"string optional\",\"action\":\"string\",\"input\":{},\"reason\":\"string optional\"}]}",
     "For unused optional structured fields, use null or omit them when the schema allows omission.",
     "You may only select actions that are listed as voiceExposed in the provided plugin descriptors.",
-    "Workspace context includes per-session standardized plugin voiceContext, visibleText, openFile, currentPath, and voiceActions. It also includes client.panes with exact pane ids, active pane, tab ids, active tab, and approximate visual positions. Use that state before choosing actions.",
+    "Workspace context includes per-session standardized plugin voiceContext, visibleText, openFile, currentPath, voiceActions, and history.text. history.text is the tab context file and contains recent terminal output, plugin actions, and prior voice actions. It also includes client.panes with exact pane ids, active pane, tab ids, active tab, and approximate visual positions. Use that state before choosing actions.",
+    "The transcript is ASR output and is often wrong. Treat it as a noisy hint, not ground truth. Infer the user's likely command from the transcript plus workspace state, active pane, active tab, visible text, open file, current path, terminal history, and prior voice actions.",
+    "Before choosing actions, internally do these steps: identify the target pane/tab if one exists; read that session's voiceContext and history.text; if no target exists, read the active session history; compare the noisy transcript against what the user is likely doing in that context; then choose plugin actions.",
+    "When ASR gives a plausible but wrong word, prefer the command that fits the local context and common developer vocabulary. Example: if the transcript says 'run pink' in a terminal context, infer 'run ping' and send input.text 'ping' with input.submit true.",
     "Every transcript has already been routed through you. Do not blindly paste the transcript into the active tab.",
     "Actions marked defaultForVoice are safe default tools after you have interpreted the user's intent.",
     "For standard-terminal enter_text, translate natural-language shell requests into concise shell commands and submit them. Example: transcript 'list directory' becomes input.text 'ls' with input.submit true.",
@@ -37,7 +100,8 @@ export function buildVoicePrompt(transcript: string, context: Record<string, unk
     "If the active file-browser session already has an openFile, treat that as the current file unless the transcript names a different file.",
     "Use workspace-control.select_pane for explicit requests to focus an existing pane by position. Use exact input.paneId from client.panes.",
     "Use workspace-control.split_pane for pane split requests. Set input.paneId when the user names a pane by position; the newly created pane becomes active for following actions.",
-    "Use workspace-control.create_tab for requests to open a new Codex, terminal, or file tab. For 'new Codex pane', set input.targetPluginId 'codex-terminal' and input.newPane true. To open into an existing pane, set input.paneId to the exact pane id.",
+    "Use workspace-control.create_tab for requests to open a new Codex, terminal, file, or local web tab. For 'new Codex pane', set input.targetPluginId 'codex-terminal' and input.newPane true. For local web dashboards, set input.targetPluginId 'local-web' and put the absolute local URL, including any token query string, in input.url. Do not include input.cwd for local-web unless the user explicitly names a directory. To open into an existing pane, set input.paneId to the exact pane id.",
+    "For local-web open_url, use absolute local URLs. Prefer http://127.0.0.1 or http://localhost only for loopback dashboards; prefer HTTPS for LAN or tailnet hosts.",
     "For workspace-control.create_tab paths, use workspace paths context. Map 'home' to input.cwd '~'. Prefer an existing tab cwd when the user refers to that tab or folder.",
     "For pane placement, splitDirection 'row' means side-by-side columns with a vertical divider. splitDirection 'column' means stacked rows with a horizontal divider. When the user says split horizontally, prefer 'column'; when they say split vertically, prefer 'row'.",
     "When targeting a tab, targetTabId must be an exact tab id from workspace context. For the active tab, you may omit targetTabId and let Cloudx use activeTabId.",

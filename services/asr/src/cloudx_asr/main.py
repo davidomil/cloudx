@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import json
 import logging
 import tempfile
 import time
+from collections import deque
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 
@@ -21,6 +24,38 @@ class TranscriptionResponse(BaseModel):
 
 app = FastAPI(title="Cloudx ASR", version="0.1.0")
 logger = logging.getLogger("cloudx_asr")
+
+
+@dataclass
+class PartialAudioWindow:
+    max_recent_bytes: int
+    first_chunk: bytes | None = None
+    recent_chunks: deque[bytes] | None = None
+    recent_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        if self.recent_chunks is None:
+            self.recent_chunks = deque()
+
+    def push(self, chunk: bytes) -> None:
+        if self.first_chunk is None:
+            self.first_chunk = bytes(chunk)
+            return
+        self.recent_chunks.append(bytes(chunk))
+        self.recent_bytes += len(chunk)
+        self.prune()
+
+    def chunks(self) -> list[bytes]:
+        if self.first_chunk is None:
+            return []
+        return [self.first_chunk, *list(self.recent_chunks)]
+
+    def prune(self) -> None:
+        if self.max_recent_bytes < 0 or self.recent_chunks is None:
+            return
+        while self.recent_bytes > self.max_recent_bytes and len(self.recent_chunks) > 1:
+            removed = self.recent_chunks.popleft()
+            self.recent_bytes -= len(removed)
 
 
 @app.get("/health")
@@ -36,7 +71,13 @@ def get_model():
     device = os.getenv("CLOUDX_ASR_DEVICE", "cpu")
     compute_type = os.getenv("CLOUDX_ASR_COMPUTE_TYPE", "int8")
     model_path = os.getenv("CLOUDX_ASR_MODEL_PATH")
-    return WhisperModel(model_path or model_name, device=device, compute_type=compute_type)
+    return WhisperModel(
+        model_path or model_name,
+        device=device,
+        compute_type=compute_type,
+        cpu_threads=asr_cpu_threads(),
+        num_workers=asr_num_workers(),
+    )
 
 
 def use_vad_filter() -> bool:
@@ -55,18 +96,96 @@ def partial_beam_size() -> int:
     return read_int_env("CLOUDX_ASR_PARTIAL_BEAM_SIZE", 1)
 
 
+def final_beam_size() -> int:
+    return read_int_env("CLOUDX_ASR_BEAM_SIZE", 5)
+
+
+def partial_window_bytes() -> int:
+    return read_int_env("CLOUDX_ASR_PARTIAL_WINDOW_BYTES", 192_000)
+
+
+def asr_cpu_threads() -> int:
+    return max(0, read_int_env("CLOUDX_ASR_CPU_THREADS", default_cpu_threads()))
+
+
+def default_cpu_threads() -> int:
+    return max(1, (os.cpu_count() or 4) // 2)
+
+
+def asr_num_workers() -> int:
+    return max(1, read_int_env("CLOUDX_ASR_NUM_WORKERS", 1))
+
+
+def transcription_language() -> str | None:
+    language = os.getenv("CLOUDX_ASR_LANGUAGE", "en").strip().lower()
+    if language in {"", "auto", "detect"}:
+        return None
+    return language
+
+
+def transcription_temperature() -> float:
+    return read_float_env("CLOUDX_ASR_TEMPERATURE", 0.0)
+
+
+def condition_on_previous_text() -> bool:
+    return os.getenv("CLOUDX_ASR_CONDITION_ON_PREVIOUS_TEXT", "false").lower() in {"1", "true", "yes", "on"}
+
+
+def max_new_tokens() -> int | None:
+    value = read_int_env("CLOUDX_ASR_MAX_NEW_TOKENS", 96)
+    return value if value > 0 else None
+
+
+def debug_transcripts_enabled() -> bool:
+    return os.getenv("CLOUDX_VOICE_DEBUG_TRANSCRIPTS", "false").lower() in {"1", "true", "yes", "on"}
+
+
+def transcript_log_fields(text: str) -> dict:
+    fields = {
+        "text_chars": len(text),
+        "text_sha256": hash_text(text),
+    }
+    if debug_transcripts_enabled():
+        fields["text"] = text
+    return fields
+
+
+def emit_asr_log(event: str, **fields) -> None:
+    payload = {"event": event, **{key: value for key, value in fields.items() if value is not None}}
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def elapsed_ms(started_at: float) -> int:
+    return int((time.monotonic() - started_at) * 1000)
+
+
 @app.post("/transcribe", response_model=TranscriptionResponse)
 async def transcribe(
     audio: UploadFile = File(...),
-    context: str | None = Form(default=None),
 ) -> TranscriptionResponse:
+    started_at = time.monotonic()
     suffix = Path(audio.filename or "audio.webm").suffix or ".webm"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
         temp_path = Path(temp_file.name)
-        temp_file.write(await audio.read())
+        audio_bytes = await audio.read()
+        temp_file.write(audio_bytes)
 
     try:
-        return transcribe_file(temp_path, context)
+        result = transcribe_file(temp_path)
+        emit_asr_log(
+            "asr_http_transcription_completed",
+            filename=audio.filename or "audio.webm",
+            audio_bytes=len(audio_bytes),
+            duration_ms=elapsed_ms(started_at),
+            language=result.language,
+            language_probability=result.language_probability,
+            **transcript_log_fields(result.text),
+        )
+        return result
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -74,7 +193,7 @@ async def transcribe(
 @app.websocket("/transcribe/ws")
 async def transcribe_ws(websocket: WebSocket) -> None:
     await websocket.accept()
-    context: str | None = None
+    started_at = time.monotonic()
     filename = "voice.webm"
     temp_path: Path | None = None
     temp_file = None
@@ -83,21 +202,35 @@ async def transcribe_ws(websocket: WebSocket) -> None:
     last_partial_text = ""
     partial_task: asyncio.Task | None = None
     send_lock = asyncio.Lock()
+    partial_audio = PartialAudioWindow(partial_window_bytes())
 
     async def send_json(payload: dict) -> None:
         async with send_lock:
             await websocket.send_json(payload)
 
-    async def send_partial_snapshot(path: Path) -> None:
+    async def send_partial_snapshot(chunks: list[bytes]) -> None:
         nonlocal last_partial_text
+        if not chunks:
+            return
+        partial_path = write_partial_audio_file(filename, chunks)
         try:
-            result = await asyncio.to_thread(transcribe_file, path, context, partial_beam_size())
+            result = await asyncio.to_thread(transcribe_file, partial_path, partial_beam_size())
         except Exception as error:
             logger.debug("ASR partial transcription skipped: %s", error)
             return
+        finally:
+            partial_path.unlink(missing_ok=True)
         text = result.text.strip()
         if text and text != last_partial_text:
             last_partial_text = text
+            emit_asr_log(
+                "asr_websocket_partial_transcript",
+                filename=filename,
+                audio_bytes=total_bytes,
+                language=result.language,
+                language_probability=result.language_probability,
+                **transcript_log_fields(text),
+            )
             await send_json({"type": "partial", "text": text})
 
     def maybe_start_partial_snapshot() -> None:
@@ -110,9 +243,8 @@ async def transcribe_ws(websocket: WebSocket) -> None:
         now = time.monotonic()
         if now - last_partial_at < interval:
             return
-        temp_file.flush()
         last_partial_at = now
-        partial_task = asyncio.create_task(send_partial_snapshot(temp_path))
+        partial_task = asyncio.create_task(send_partial_snapshot(partial_audio.chunks()))
 
     try:
         while True:
@@ -124,9 +256,9 @@ async def transcribe_ws(websocket: WebSocket) -> None:
             if text_message is not None:
                 payload = json.loads(text_message)
                 if payload.get("type") == "start":
-                    context = payload.get("context") if isinstance(payload.get("context"), str) else None
                     filename = payload.get("filename") if isinstance(payload.get("filename"), str) else filename
                     temp_file, temp_path = open_temp_audio_file(filename)
+                    emit_asr_log("asr_websocket_started", filename=filename)
                     await send_json({"type": "status", "status": "receiving"})
                     continue
                 if payload.get("type") == "end":
@@ -138,9 +270,11 @@ async def transcribe_ws(websocket: WebSocket) -> None:
                     temp_file, temp_path = open_temp_audio_file(filename)
                 temp_file.write(bytes_message)
                 total_bytes += len(bytes_message)
+                partial_audio.push(bytes_message)
                 maybe_start_partial_snapshot()
 
         if temp_file is None or temp_path is None:
+            emit_asr_log("asr_websocket_no_audio", filename=filename, duration_ms=elapsed_ms(started_at))
             logger.warning("ASR websocket ended without audio chunks")
             await send_json({"type": "error", "message": "No audio chunks were received."})
             return
@@ -151,25 +285,30 @@ async def transcribe_ws(websocket: WebSocket) -> None:
         await send_json({"type": "status", "status": "transcribing"})
         if partial_task is not None and not partial_task.done():
             await partial_task
-        result = transcribe_file(temp_path, context)
-        log_message = (
-            "ASR websocket transcription completed "
-            f"filename={filename} bytes={total_bytes} text_chars={len(result.text)} language={result.language}"
-        )
+        result = transcribe_file(temp_path)
+        log_fields = {
+            "filename": filename,
+            "audio_bytes": total_bytes,
+            "duration_ms": elapsed_ms(started_at),
+            "language": result.language,
+            "language_probability": result.language_probability,
+            **transcript_log_fields(result.text),
+        }
         if result.text.strip():
-            print(log_message, flush=True)
+            emit_asr_log("asr_websocket_transcription_completed", **log_fields)
         else:
+            emit_asr_log("asr_websocket_empty_transcript", **log_fields)
             logger.warning(
                 "ASR websocket produced empty transcript filename=%s bytes=%s language=%s",
                 filename,
                 total_bytes,
                 result.language,
             )
-            print(log_message, flush=True)
         await send_json({"type": "transcript", **result.model_dump()})
     except WebSocketDisconnect:
         return
     except Exception as error:
+        emit_asr_log("asr_websocket_failed", filename=filename, duration_ms=elapsed_ms(started_at), error=str(error))
         await send_json({"type": "error", "message": str(error)})
     finally:
         if temp_file is not None:
@@ -184,13 +323,28 @@ def open_temp_audio_file(filename: str):
     return temp_file, Path(temp_file.name)
 
 
-def transcribe_file(path: Path, context: str | None, beam_size: int = 5) -> TranscriptionResponse:
-    initial_prompt = context if context and context.strip() else None
+def write_partial_audio_file(filename: str, chunks: list[bytes]) -> Path:
+    suffix = Path(filename or "audio.webm").suffix or ".webm"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
+        for chunk in chunks:
+            temp_file.write(chunk)
+        return Path(temp_file.name)
+
+
+def transcribe_file(path: Path, beam_size: int | None = None) -> TranscriptionResponse:
+    actual_beam_size = beam_size if beam_size is not None else final_beam_size()
     segments, info = get_model().transcribe(
         str(path),
-        beam_size=beam_size,
+        language=transcription_language(),
+        task="transcribe",
+        beam_size=actual_beam_size,
+        best_of=max(1, actual_beam_size),
+        temperature=transcription_temperature(),
         vad_filter=use_vad_filter(),
-        initial_prompt=initial_prompt,
+        initial_prompt=None,
+        hotwords=None,
+        condition_on_previous_text=condition_on_previous_text(),
+        max_new_tokens=max_new_tokens(),
     )
     text = "".join(segment.text for segment in segments).strip()
     return TranscriptionResponse(
@@ -198,7 +352,6 @@ def transcribe_file(path: Path, context: str | None, beam_size: int = 5) -> Tran
         language=getattr(info, "language", None),
         language_probability=getattr(info, "language_probability", None),
     )
-
 
 def read_float_env(name: str, default: float) -> float:
     value = os.getenv(name)

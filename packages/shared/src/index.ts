@@ -1,8 +1,8 @@
 export const DEFAULT_VOICE_MODEL = "gpt-5.3-codex-spark";
 
-export type PluginId = "codex-terminal" | "standard-terminal" | "file-browser" | string;
+export type PluginId = "codex-terminal" | "standard-terminal" | "file-browser" | "local-web" | string;
 
-export type PluginPanelKind = "terminal" | "file-browser" | "placeholder";
+export type PluginPanelKind = "terminal" | "file-browser" | "web-viewer" | "placeholder";
 
 export type TabStatus = "idle" | "starting" | "running" | "waiting_approval" | "failed" | "completed" | "stopped";
 
@@ -44,18 +44,21 @@ export interface PluginActionDescriptor {
 
 export interface PluginDescriptor {
   id: PluginId;
+  acronym: string;
   displayName: string;
   description: string;
   panelKind: PluginPanelKind;
   creatable: boolean;
+  requiresDirectory: boolean;
   actions: PluginActionDescriptor[];
 }
 
 export interface CreateTabRequest {
   pluginId: PluginId;
-  cwd: string;
+  cwd?: string;
   title?: string;
   createDirectory?: boolean;
+  initialInput?: Record<string, unknown>;
 }
 
 export interface CreateTabResponse {

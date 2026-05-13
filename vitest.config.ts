@@ -1,4 +1,8 @@
 import { defineConfig } from "vitest/config";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const repoRoot = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
   test: {
@@ -11,8 +15,8 @@ export default defineConfig({
   },
   resolve: {
     alias: {
-      "@cloudx/shared": "/workspace/cloudx/packages/shared/src/index.ts",
-      "@cloudx/plugin-api": "/workspace/cloudx/packages/plugin-api/src/index.ts"
+      "@cloudx/shared": path.join(repoRoot, "packages/shared/src/index.ts"),
+      "@cloudx/plugin-api": path.join(repoRoot, "packages/plugin-api/src/index.ts")
     }
   }
 });

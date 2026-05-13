@@ -23,7 +23,7 @@ describe("parseVoiceActionPlan", () => {
           targetTabId: null,
           pluginId: null,
           action: "enter_text",
-          input: { text: "ls", submit: true, key: null, tabId: null, title: null, relativePath: null },
+          input: { text: "ls", submit: true, key: null, tabId: null, title: null, relativePath: null, url: null },
           reason: null
         }
       ]

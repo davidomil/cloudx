@@ -79,6 +79,9 @@ V1 plugins:
 - `file-browser`
   - lists directories and opens bounded text previews
   - exposes `list_directory` and `open_file`
+- `local-web`
+  - embeds custom local HTTP(S) dashboard URLs, including token query strings
+  - exposes `open_url`, `get_state`, and `clear_url`
 
 Planned plugins:
 

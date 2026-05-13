@@ -1,14 +1,179 @@
 import fs from "node:fs/promises";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 
 import { describe, expect, it } from "vitest";
+import WebSocket, { WebSocketServer } from "ws";
 
 import type { AppConfig } from "./config.js";
+import { TabContextService } from "./context/TabContextService.js";
+import { PluginRegistry } from "./pluginRegistry.js";
+import { LocalWebPlugin } from "./plugins/LocalWebPlugin.js";
 import { PathPolicy } from "./pathPolicy.js";
-import { buildAsrInitialPrompt, buildServer, type AppServices } from "./server.js";
+import { buildServer, type AppServices } from "./server.js";
+import { SessionStore } from "./sessionStore.js";
 
 describe("buildServer", () => {
+  it("proxies local web tabs through the Cloudx server and rewrites root asset URLs", async () => {
+    const localServer = http.createServer((request, response) => {
+      if (request.url?.startsWith("/@vite/client")) {
+        response.writeHead(200, { "content-type": "text/javascript" });
+        response.end('const socketHost = `${null || importMetaUrl.hostname}:${hmrPort || importMetaUrl.port}${"/"}`; const base = "/" || "/"; const base$1 = "/" || "/"; import "/@fs/tmp/cloudx-project/node_modules/vite/dist/client/env.mjs"; import "/@id/react";');
+        return;
+      }
+      if (request.url?.startsWith("/src/main.tsx")) {
+        response.writeHead(200, { "content-type": "text/javascript" });
+        response.end('import "/@fs/tmp/cloudx-project/packages/core/dist/schema.js"; const path = `/${fileName}`; fetch("/knowledge-graph.json?token=abc"); fetch(`/file-content.json?${params.toString()}`);');
+        return;
+      }
+      if (request.url?.startsWith("/assets/app.js")) {
+        response.writeHead(200, { "content-type": "text/javascript" });
+        response.end("fetch('/knowledge-graph.json?token=abc');");
+        return;
+      }
+      response.writeHead(200, { "content-type": "text/html", "x-frame-options": "DENY", "content-security-policy": "default-src 'none'" });
+      response.end(`<!doctype html><html><head>
+        <script type="module">import { injectIntoGlobalHook } from "/@react-refresh"; injectIntoGlobalHook(window);</script>
+        <script type="module" src="/@vite/client"></script>
+        <script type="module" src="/assets/app.js"></script>
+        <script type="module" src="/src/main.tsx"></script>
+        </head><body>Dashboard</body></html>`);
+    });
+    await new Promise<void>((resolve) => localServer.listen(0, "127.0.0.1", resolve));
+    const localPort = (localServer.address() as { port: number }).port;
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-local-web-proxy-"));
+    const registry = new PluginRegistry();
+    registry.register(new LocalWebPlugin());
+    const services = {
+      plugins: registry,
+      sessions: new SessionStore(registry, new PathPolicy([root]), new TabContextService(path.join(root, ".cloudx"))),
+      pathPolicy: new PathPolicy([root]),
+      voice: {},
+      asr: {}
+    } as unknown as AppServices;
+    const config: AppConfig = {
+      host: "0.0.0.0",
+      port: 3001,
+      allowedRoots: [root],
+      asrUrl: "http://127.0.0.1:7810",
+      voiceModel: "gpt-5.3-codex-spark",
+      dataDir: path.join(root, ".cloudx"),
+      webDistDir: path.join(root, "missing-web-dist"),
+      appServerEnabled: false,
+      terminalReplayBytes: 1024
+    };
+
+    const app = await buildServer(config, services);
+    try {
+      const created = await app.inject({
+        method: "POST",
+        url: "/api/tabs",
+        payload: {
+          pluginId: "local-web",
+          cwd: root,
+          initialInput: { url: `http://127.0.0.1:${localPort}/?token=abc` }
+        }
+      });
+      const tabId = created.json().tab.id as string;
+      const html = await app.inject({ method: "GET", url: `/api/local-web/${tabId}/proxy/?token=abc` });
+      const viteClient = await app.inject({ method: "GET", url: `/api/local-web/${tabId}/proxy/@vite/client` });
+      const main = await app.inject({ method: "GET", url: `/api/local-web/${tabId}/proxy/src/main.tsx` });
+      const script = await app.inject({ method: "GET", url: `/api/local-web/${tabId}/proxy/assets/app.js` });
+
+      expect(html.statusCode).toBe(200);
+      expect(html.headers["x-frame-options"]).toBeUndefined();
+      expect(html.headers["content-security-policy"]).toBeUndefined();
+      expect(html.body).toContain(`<base href="/api/local-web/${tabId}/proxy/">`);
+      expect(html.body).toContain(`from "/api/local-web/${tabId}/proxy/@react-refresh"`);
+      expect(html.body).toContain(`src="/api/local-web/${tabId}/proxy/@vite/client"`);
+      expect(html.body).toContain(`src="/api/local-web/${tabId}/proxy/assets/app.js"`);
+      expect(html.body).toContain(`src="/api/local-web/${tabId}/proxy/src/main.tsx"`);
+      expect(viteClient.statusCode).toBe(200);
+      expect(viteClient.body).toContain(`/api/local-web/${tabId}/proxy/@fs/tmp/cloudx-project/node_modules/vite/dist/client/env.mjs`);
+      expect(viteClient.body).toContain(`/api/local-web/${tabId}/proxy/@id/react`);
+      expect(viteClient.body).toContain(`"/api/local-web/${tabId}/proxy-ws/"`);
+      expect(viteClient.body).toContain(`"/api/local-web/${tabId}/proxy/" || "/"`);
+      expect(main.statusCode).toBe(200);
+      expect(main.body).toContain(`/api/local-web/${tabId}/proxy/@fs/tmp/cloudx-project/packages/core/dist/schema.js`);
+      expect(main.body).toContain(`/api/local-web/${tabId}/proxy/knowledge-graph.json?token=abc`);
+      expect(main.body).toContain("const path = `/api/local-web/");
+      expect(main.body).toContain(`${tabId}/proxy/\${fileName}\`;`);
+      expect(main.body).toContain(`/api/local-web/${tabId}/proxy/file-content.json?`);
+      expect(script.statusCode).toBe(200);
+      expect(script.body).toContain(`/api/local-web/${tabId}/proxy/knowledge-graph.json?token=abc`);
+    } finally {
+      await app.close();
+      await new Promise<void>((resolve) => localServer.close(() => resolve()));
+    }
+  });
+
+  it("proxies local web websocket connections through the Cloudx server", async () => {
+    const localServer = http.createServer();
+    const wsServer = new WebSocketServer({ server: localServer });
+    wsServer.on("connection", (socket) => {
+      socket.on("message", (message, isBinary) => {
+        socket.send(message, { binary: isBinary });
+      });
+    });
+    await new Promise<void>((resolve) => localServer.listen(0, "127.0.0.1", resolve));
+    const localPort = (localServer.address() as { port: number }).port;
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-local-web-ws-"));
+    const registry = new PluginRegistry();
+    registry.register(new LocalWebPlugin());
+    const services = {
+      plugins: registry,
+      sessions: new SessionStore(registry, new PathPolicy([root]), new TabContextService(path.join(root, ".cloudx"))),
+      pathPolicy: new PathPolicy([root]),
+      voice: {},
+      asr: {}
+    } as unknown as AppServices;
+    const config: AppConfig = {
+      host: "127.0.0.1",
+      port: 0,
+      allowedRoots: [root],
+      asrUrl: "http://127.0.0.1:7810",
+      voiceModel: "gpt-5.3-codex-spark",
+      dataDir: path.join(root, ".cloudx"),
+      webDistDir: path.join(root, "missing-web-dist"),
+      appServerEnabled: false,
+      terminalReplayBytes: 1024
+    };
+
+    const app = await buildServer(config, services);
+    let client: WebSocket | undefined;
+    try {
+      const created = await app.inject({
+        method: "POST",
+        url: "/api/tabs",
+        payload: {
+          pluginId: "local-web",
+          cwd: root,
+          initialInput: { url: `http://127.0.0.1:${localPort}/?token=abc` }
+        }
+      });
+      const tabId = created.json().tab.id as string;
+      await app.listen({ host: "127.0.0.1", port: 0 });
+      const address = app.server.address() as { port: number };
+      client = new WebSocket(`ws://127.0.0.1:${address.port}/api/local-web/${tabId}/proxy-ws/`, "vite-hmr");
+      await new Promise<void>((resolve, reject) => {
+        client?.once("open", resolve);
+        client?.once("error", reject);
+      });
+      const received = new Promise<string>((resolve) => {
+        client?.once("message", (message) => resolve(message.toString()));
+      });
+      client.send("ping");
+
+      await expect(received).resolves.toBe("ping");
+    } finally {
+      client?.close();
+      await app.close();
+      wsServer.close();
+      await new Promise<void>((resolve) => localServer.close(() => resolve()));
+    }
+  });
+
   it("serves built frontend index.html when configured", async () => {
     const webDistDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-web-"));
     await fs.writeFile(path.join(webDistDir, "index.html"), "<!doctype html><title>Cloudx Test</title>");
@@ -126,7 +291,7 @@ describe("buildServer", () => {
     expect(calls).toEqual([{ transcript: "open files", activeTabId: "tab-1", clientContext: { activePaneId: "pane-2" } }]);
   });
 
-  it("reports empty ASR output as no detected speech", async () => {
+  it("reports empty ASR output as no detected speech without passing ASR context", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-empty-asr-"));
     const config: AppConfig = {
       host: "0.0.0.0",
@@ -139,16 +304,12 @@ describe("buildServer", () => {
       appServerEnabled: false,
       terminalReplayBytes: 1024
     };
-    let asrContext: string | undefined;
+    const asrCalls: unknown[][] = [];
     const services = {
       plugins: { list: () => [] },
       sessions: {
         listTabs: () => [],
-        getActiveTabId: () => undefined,
-        buildVoiceContext: async () => ({
-          tabs: [{ title: "Repo Shell", cwd: "/workspace/cloudx", pluginId: "standard-terminal" }],
-          sessions: [{ voiceContext: { currentPath: "/workspace/cloudx/apps/server/src/server.ts" } }]
-        })
+        getActiveTabId: () => undefined
       },
       pathPolicy: new PathPolicy([root]),
       voice: {
@@ -157,8 +318,8 @@ describe("buildServer", () => {
         }
       },
       asr: {
-        async transcribe(_audio: Buffer, _filename: string, context?: string) {
-          asrContext = context;
+        async transcribe(...args: unknown[]) {
+          asrCalls.push(args);
           return { text: "" };
         }
       }
@@ -175,20 +336,108 @@ describe("buildServer", () => {
 
     expect(response.statusCode).toBe(500);
     expect(response.json().message).toContain("No speech was detected");
-    expect(asrContext).toContain("Repo Shell");
-    expect(asrContext).toContain("server.ts");
-    expect(asrContext).not.toContain("{");
+    expect(asrCalls).toHaveLength(1);
+    expect(asrCalls[0]).toHaveLength(2);
   });
 
-  it("builds a compact ASR prompt instead of raw workspace JSON", () => {
-    const prompt = buildAsrInitialPrompt({
-      tabs: [{ title: "Cloudx Dev", cwd: "/workspace/cloudx", pluginId: "codex-terminal" }],
-      client: { panes: [{ activeTab: { title: "Files", cwd: "/workspace/cloudx/apps/web" } }] }
-    });
+  it("passes raw ASR transcript to the voice controller", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-raw-asr-"));
+    const config: AppConfig = {
+      host: "0.0.0.0",
+      port: 3001,
+      allowedRoots: [root],
+      asrUrl: "http://127.0.0.1:7810",
+      voiceModel: "gpt-5.3-codex-spark",
+      dataDir: path.join(os.tmpdir(), "cloudx-data"),
+      webDistDir: path.join(root, "missing-web-dist"),
+      appServerEnabled: false,
+      terminalReplayBytes: 1024
+    };
+    let handledTranscript = "";
+    const services = {
+      plugins: { list: () => [] },
+      sessions: {
+        listTabs: () => [],
+        getActiveTabId: () => undefined,
+        buildVoiceContext: async () => ({ tabs: [] })
+      },
+      pathPolicy: new PathPolicy([root]),
+      voice: {
+        async handleTranscript(transcript: string) {
+          handledTranscript = transcript;
+          return { accepted: true, plan: { transcript, summary: "", actions: [] }, results: [] };
+        }
+      },
+      asr: {
+        async transcribe() {
+          return { text: "open a terminal pane and run pink" };
+        }
+      }
+    } as unknown as AppServices;
 
-    expect(prompt).toContain("Cloudx Dev");
-    expect(prompt).toContain("codex-terminal");
-    expect(prompt).toContain("web");
-    expect(prompt).not.toContain("{");
+    const app = await buildServer(config, services);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/voice/audio?filename=voice.webm",
+      headers: { "content-type": "audio/webm" },
+      payload: Buffer.from("audio")
+    });
+    await app.close();
+
+    expect(response.statusCode).toBe(200);
+    expect(handledTranscript).toBe("open a terminal pane and run pink");
+  });
+
+  it("does not build or pass workspace hints to ASR", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-no-asr-context-"));
+    const config: AppConfig = {
+      host: "0.0.0.0",
+      port: 3001,
+      allowedRoots: [root],
+      asrUrl: "http://127.0.0.1:7810",
+      voiceModel: "gpt-5.3-codex-spark",
+      dataDir: path.join(os.tmpdir(), "cloudx-data"),
+      webDistDir: path.join(root, "missing-web-dist"),
+      appServerEnabled: false,
+      terminalReplayBytes: 1024
+    };
+    let buildVoiceContextCalled = false;
+    const asrCalls: unknown[][] = [];
+    const services = {
+      plugins: { list: () => [] },
+      sessions: {
+        listTabs: () => [],
+        getActiveTabId: () => undefined,
+        buildVoiceContext: async () => {
+          buildVoiceContextCalled = true;
+          return { tabs: [{ title: "Should Not Reach ASR" }] };
+        }
+      },
+      pathPolicy: new PathPolicy([root]),
+      voice: {
+        async handleTranscript() {
+          return { accepted: true, plan: { transcript: "ok", summary: "", actions: [] }, results: [] };
+        }
+      },
+      asr: {
+        async transcribe(...args: unknown[]) {
+          asrCalls.push(args);
+          return { text: "ok" };
+        }
+      }
+    } as unknown as AppServices;
+
+    const app = await buildServer(config, services);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/voice/audio?filename=voice.webm",
+      headers: { "content-type": "audio/webm" },
+      payload: Buffer.from("audio")
+    });
+    await app.close();
+
+    expect(response.statusCode).toBe(200);
+    expect(buildVoiceContextCalled).toBe(false);
+    expect(asrCalls[0]).toHaveLength(2);
   });
 });
