@@ -16,6 +16,7 @@ import { CodexTerminalPlugin } from "./plugins/CodexTerminalPlugin.js";
 import { FileBrowserPlugin } from "./plugins/FileBrowserPlugin.js";
 import { LocalWebPlugin } from "./plugins/LocalWebPlugin.js";
 import { StandardTerminalPlugin } from "./plugins/StandardTerminalPlugin.js";
+import { WorktreeManagerPlugin } from "./plugins/WorktreeManagerPlugin.js";
 import { WorkspaceControlPlugin } from "./plugins/WorkspaceControlPlugin.js";
 import { SessionStore } from "./sessionStore.js";
 import { NodePtyTerminalProcessFactory } from "./terminal/NodePtyTerminalProcess.js";
@@ -429,6 +430,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   plugins.register(new StandardTerminalPlugin(terminalFactory, config.terminalReplayBytes));
   plugins.register(new FileBrowserPlugin(pathPolicy));
   plugins.register(new LocalWebPlugin());
+  plugins.register(new WorktreeManagerPlugin());
   plugins.register(new WorkspaceControlPlugin());
   const sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir));
   const asr = new AsrClient(config.asrUrl);

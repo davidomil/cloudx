@@ -29,6 +29,7 @@ import { clearFocusedAttention, isTabFocused, updateAttentionTabs } from "./tabA
 import { disposeTerminalView, disposeTerminalViewsExcept, TerminalPanel } from "./TerminalPanel.js";
 import { applyVoiceWorkspaceResults, buildClientVoiceContext, voiceConsoleValue } from "./voiceWorkspace.js";
 import { WebViewerPanel } from "./WebViewerPanel.js";
+import { WorktreeManagerPanel } from "./WorktreeManagerPanel.js";
 
 type ConnectionStatus = "checking" | "connected" | "disconnected";
 
@@ -629,6 +630,9 @@ function PluginPanel({ tab, plugin, active }: { tab: WorkspaceTab; plugin: Plugi
   }
   if (plugin?.panelKind === "web-viewer") {
     return <WebViewerPanel tab={tab} />;
+  }
+  if (plugin?.panelKind === "worktree-manager") {
+    return <WorktreeManagerPanel tab={tab} />;
   }
   if (plugin?.panelKind === "terminal" || !plugin) {
     return <TerminalPanel tab={tab} active={active} />;

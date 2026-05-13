@@ -27,12 +27,12 @@ export class WorkspaceControlPlugin implements WorkspacePlugin {
     {
       name: "create_tab",
       description:
-        "Create a new plugin tab. Use this for requests to open a Codex, terminal, file, or local web tab. To open a local web dashboard, set targetPluginId local-web and include the full local URL, including token query strings, in url. To open a new pane, set newPane true; to open into an existing pane, set paneId from client.panes.",
+        "Create a new plugin tab. Use this for requests to open a Codex, terminal, file, local web, or worktree manager tab. To open a local web dashboard, set targetPluginId local-web and include the full local URL, including token query strings, in url. To open a new pane, set newPane true; to open into an existing pane, set paneId from client.panes.",
       voiceExposed: true,
       inputSchema: {
         type: "object",
         properties: {
-          targetPluginId: { type: "string", description: "Plugin to open, such as codex-terminal, standard-terminal, file-browser, or local-web." },
+          targetPluginId: { type: "string", description: "Plugin to open, such as codex-terminal, standard-terminal, file-browser, local-web, or worktree-manager." },
           cwd: {
             type: "string",
             description:

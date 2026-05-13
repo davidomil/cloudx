@@ -2,7 +2,7 @@ export const DEFAULT_VOICE_MODEL = "gpt-5.3-codex-spark";
 
 export type PluginId = "codex-terminal" | "standard-terminal" | "file-browser" | "local-web" | string;
 
-export type PluginPanelKind = "terminal" | "file-browser" | "web-viewer" | "placeholder";
+export type PluginPanelKind = "terminal" | "file-browser" | "web-viewer" | "worktree-manager" | "placeholder";
 
 export type TabStatus = "idle" | "starting" | "running" | "waiting_approval" | "failed" | "completed" | "stopped";
 
@@ -123,6 +123,54 @@ export interface GitDiffFile {
   patch?: string;
   binary?: boolean;
   tooLarge?: boolean;
+  message?: string;
+}
+
+export type WorktreeProjectStatus = "empty" | "blocked" | "ready";
+
+export type WorktreeRefKind = "local" | "remote" | "tag";
+
+export type WorktreeCreateMode = "new_branch" | "existing_branch" | "remote_branch";
+
+export interface WorktreeProjectSetupState {
+  canInitialize: boolean;
+  canClone: boolean;
+  blockedReason?: string;
+}
+
+export interface WorktreeRef {
+  name: string;
+  fullName: string;
+  kind: WorktreeRefKind;
+  commit: string;
+  upstream?: string;
+}
+
+export interface WorktreeDirtyStatus {
+  dirty: boolean;
+  staged: number;
+  unstaged: number;
+  untracked: number;
+}
+
+export interface WorktreeSummary {
+  folderName: string;
+  path: string;
+  branch?: string;
+  head?: string;
+  detached: boolean;
+  dirty: WorktreeDirtyStatus;
+}
+
+export interface WorktreeProjectState {
+  cwd: string;
+  barePath: string;
+  status: WorktreeProjectStatus;
+  folderEmpty: boolean;
+  originUrl?: string;
+  refs: WorktreeRef[];
+  worktrees: WorktreeSummary[];
+  setup: WorktreeProjectSetupState;
   message?: string;
 }
 
