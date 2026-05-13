@@ -15,8 +15,9 @@ interface DirectoryResult {
   entries: DirectoryEntry[];
 }
 
-interface OpenFileResult {
+export interface OpenFileResult {
   path: string;
+  relativePath?: string;
   truncated: boolean;
   content: string;
 }
@@ -73,10 +74,18 @@ export function FileBrowserPanel({ tab }: { tab: WorkspaceTab }) {
             </button>
           ))}
         </div>
-        <pre className="file-preview">{opened ? `${opened.path}${opened.truncated ? "\n[truncated]\n" : "\n\n"}${opened.content}` : "Select a file to preview it."}</pre>
+        <pre className="file-preview">{filePreviewText(opened)}</pre>
       </div>
     </div>
   );
+}
+
+export function filePreviewText(opened: OpenFileResult | undefined): string {
+  if (!opened) {
+    return "Select a file to preview it.";
+  }
+  const displayPath = opened.relativePath ?? opened.path;
+  return `${displayPath}${opened.truncated ? "\n[truncated]\n" : "\n\n"}${opened.content}`;
 }
 
 function parentPath(relativePath: string): string {

@@ -15,6 +15,15 @@ to shells and Codex, read and edit files under configured roots, and embed local
 dashboards with token-bearing URLs. Use localhost, a trusted LAN, or a private
 tailnet only.
 
+## Screenshots
+
+These screenshots use a throwaway demo workspace and avoid local paths, host
+names, and dashboard tokens. Regenerate them with `npm run docs:screenshots`.
+
+![Cloudx split pane workspace showing file browser and local dashboard plugins](docs/screenshots/cloudx-split-panes.png)
+
+![Cloudx new tab dialog opened inside a multi-pane workspace](docs/screenshots/cloudx-new-tab-dialog.png)
+
 ## Features
 
 - Responsive desktop and phone UI.
