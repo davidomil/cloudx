@@ -98,6 +98,7 @@ export function descriptorFromPlugin(plugin: WorkspacePlugin): PluginDescriptor 
       description: action.description,
       voiceExposed: action.voiceExposed,
       defaultForVoice: action.defaultForVoice,
+      handlesUnhandledVoice: action.handlesUnhandledVoice,
       inputSchema: action.inputSchema
     }))
   };

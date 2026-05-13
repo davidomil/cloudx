@@ -87,38 +87,38 @@ export class VoiceController {
       },
       "voice plan received"
     );
-    const executablePlan = this.planWithActiveCodexDefault(plan, trimmedTranscript, activeTabId, trace);
+    const executablePlan = this.planWithUnhandledVoiceFallback(plan, trimmedTranscript, activeTabId, trace);
     return this.executePlan(executablePlan, activeTabId, trace);
   }
 
-  private planWithActiveCodexDefault(plan: VoiceActionPlan, transcript: string, activeTabId?: string, trace: VoiceTrace = {}): VoiceActionPlan {
+  private planWithUnhandledVoiceFallback(plan: VoiceActionPlan, transcript: string, activeTabId?: string, trace: VoiceTrace = {}): VoiceActionPlan {
     if (plan.actions.length > 0) {
       return plan;
     }
 
-    const defaultAction = this.sessions.createDefaultVoiceAction(transcript, activeTabId);
-    if (defaultAction?.pluginId !== "codex-terminal" || defaultAction.action !== "enter_text") {
+    const fallbackAction = this.sessions.createUnhandledVoiceAction(transcript, activeTabId);
+    if (!fallbackAction) {
       return plan;
     }
 
-    const fallbackAction = {
-      ...defaultAction,
-      reason: defaultAction.reason ?? "Planner returned no actions; forwarding the transcript to the active Codex tab."
+    const action = {
+      ...fallbackAction,
+      reason: fallbackAction.reason ?? "Planner returned no actions; forwarding the transcript to the active plugin fallback."
     };
     const fallbackPlan: VoiceActionPlan = {
       ...plan,
-      summary: "Planner returned no actions; forwarded the transcript to the active Codex tab.",
-      actions: [fallbackAction]
+      summary: "Planner returned no actions; forwarded the transcript to the active plugin fallback.",
+      actions: [action]
     };
 
     this.logger?.info(
       {
-        event: "voice_codex_default_action_selected",
+        event: "voice_unhandled_fallback_action_selected",
         voiceRequestId: trace.voiceRequestId,
         source: trace.source,
-        ...actionLogFields(fallbackAction, this.logOptions.includeText, 0)
+        ...actionLogFields(action, this.logOptions.includeText, 0)
       },
-      "voice codex default action selected"
+      "voice unhandled fallback action selected"
     );
     return fallbackPlan;
   }

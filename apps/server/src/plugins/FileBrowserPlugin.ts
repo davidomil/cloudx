@@ -41,7 +41,7 @@ export class FileBrowserPlugin implements WorkspacePlugin {
   readonly actions: PluginActionDefinition[] = [
     {
       name: "list_directory",
-      description: "List entries in a directory below the tab working directory.",
+      description: "List entries in a directory below the tab working directory. Use this to inspect folders before opening or editing files.",
       voiceExposed: true,
       inputSchema: {
         type: "object",
@@ -54,7 +54,7 @@ export class FileBrowserPlugin implements WorkspacePlugin {
     },
     {
       name: "open_file",
-      description: "Open a text file below the tab working directory.",
+      description: "Open a text file below the tab working directory and expose a preview in voiceContext.openFile.",
       voiceExposed: true,
       inputSchema: {
         type: "object",
@@ -67,7 +67,7 @@ export class FileBrowserPlugin implements WorkspacePlugin {
     },
     {
       name: "replace_in_file",
-      description: "Replace one exact text span in a file below the tab working directory.",
+      description: "Replace one exact text span in a file below the tab working directory. Use the active openFile when the transcript refers to the current file.",
       voiceExposed: true,
       inputSchema: {
         type: "object",
@@ -82,7 +82,7 @@ export class FileBrowserPlugin implements WorkspacePlugin {
     },
     {
       name: "write_file",
-      description: "Write full text content to a file below the tab working directory.",
+      description: "Write full text content to a file below the tab working directory. Use only when the intended complete file content is known.",
       voiceExposed: true,
       inputSchema: {
         type: "object",

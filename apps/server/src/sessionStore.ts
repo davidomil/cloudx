@@ -156,6 +156,7 @@ export class SessionStore {
               name: action.name,
               description: action.description,
               defaultForVoice: action.defaultForVoice,
+              handlesUnhandledVoice: action.handlesUnhandledVoice,
               inputSchema: action.inputSchema
             })),
           history: {
@@ -224,6 +225,29 @@ export class SessionStore {
       action: defaultAction.name,
       input,
       reason: `Default voice action for ${session.tab.pluginId}.`
+    };
+  }
+
+  createUnhandledVoiceAction(transcript: string, activeTabId?: string): VoiceAction | undefined {
+    const targetTabId = activeTabId ?? this.activeTabId;
+    if (!targetTabId) {
+      return undefined;
+    }
+    const session = this.getSession(targetTabId);
+    const fallbackAction = this.plugins.getUnhandledVoiceAction(session.tab.pluginId);
+    if (!fallbackAction) {
+      return undefined;
+    }
+    const input = defaultVoiceInput(fallbackAction, transcript);
+    if (!input) {
+      return undefined;
+    }
+    return {
+      targetTabId,
+      pluginId: session.tab.pluginId,
+      action: fallbackAction.name,
+      input,
+      reason: `Unhandled voice fallback for ${session.tab.pluginId}.`
     };
   }
 

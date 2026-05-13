@@ -61,26 +61,31 @@ class FakeDefaultPlugin implements WorkspacePlugin {
   readonly panelKind = "terminal" as const;
   readonly creatable = true;
   readonly requiresDirectory = true;
-  readonly actions = [
-    {
-      name: "enter_text",
-      description: "Enter text.",
-      voiceExposed: true,
-      defaultForVoice: true,
-      inputSchema: {
-        type: "object",
-        properties: {
-          text: { type: "string" },
-          submit: { type: "boolean" }
-        },
-        required: ["text"],
-        additionalProperties: false
-      }
-    }
-  ];
+  readonly actions;
   lastSession: FakeSession | undefined;
   lastControls: PluginTabControls | undefined;
   lastInput: CreatePluginSessionInput | undefined;
+
+  constructor(input: { handlesUnhandledVoice?: boolean } = {}) {
+    this.actions = [
+      {
+        name: "enter_text",
+        description: "Enter text.",
+        voiceExposed: true,
+        defaultForVoice: true,
+        handlesUnhandledVoice: input.handlesUnhandledVoice,
+        inputSchema: {
+          type: "object",
+          properties: {
+            text: { type: "string" },
+            submit: { type: "boolean" }
+          },
+          required: ["text"],
+          additionalProperties: false
+        }
+      }
+    ];
+  }
 
   createSession(input: CreatePluginSessionInput) {
     this.lastInput = input;
@@ -199,6 +204,19 @@ describe("SessionStore voice actions", () => {
     const tab = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Codex" });
 
     expect(store.createDefaultVoiceAction("edit file x", tab.id)).toMatchObject({
+      targetTabId: tab.id,
+      pluginId: "fake-default",
+      action: "enter_text",
+      input: { text: "edit file x", submit: true }
+    });
+    expect(store.createUnhandledVoiceAction("edit file x", tab.id)).toBeUndefined();
+  });
+
+  it("builds unhandled voice actions only when the active plugin opts in", async () => {
+    const { store, root } = await createStore({ handlesUnhandledVoice: true });
+    const tab = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Codex-like" });
+
+    expect(store.createUnhandledVoiceAction("edit file x", tab.id)).toMatchObject({
       targetTabId: tab.id,
       pluginId: "fake-default",
       action: "enter_text",
@@ -382,9 +400,9 @@ describe("SessionStore voice actions", () => {
   });
 });
 
-async function createStore() {
+async function createStore(pluginOptions: { handlesUnhandledVoice?: boolean } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-session-store-"));
-  const plugin = new FakeDefaultPlugin();
+  const plugin = new FakeDefaultPlugin(pluginOptions);
   const registry = new PluginRegistry();
   registry.register(plugin);
   registry.register(new WorkspaceControlPlugin());

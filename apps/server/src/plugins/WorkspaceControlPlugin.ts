@@ -13,7 +13,7 @@ export class WorkspaceControlPlugin implements WorkspacePlugin {
   readonly actions: PluginActionDefinition[] = [
     {
       name: "switch_tab",
-      description: "Switch the active workspace tab by tab id or visible title.",
+      description: "Switch, activate, select, or focus an existing workspace tab by exact tab id or visible title.",
       voiceExposed: true,
       inputSchema: {
         type: "object",
@@ -26,19 +26,28 @@ export class WorkspaceControlPlugin implements WorkspacePlugin {
     },
     {
       name: "create_tab",
-      description: "Create a new plugin tab, optionally requesting that the client opens it in a specific pane or newly split pane.",
+      description:
+        "Create a new plugin tab. Use this for requests to open a Codex, terminal, file, or local web tab. To open a local web dashboard, set targetPluginId local-web and include the full local URL, including token query strings, in url. To open a new pane, set newPane true; to open into an existing pane, set paneId from client.panes.",
       voiceExposed: true,
       inputSchema: {
         type: "object",
         properties: {
           targetPluginId: { type: "string", description: "Plugin to open, such as codex-terminal, standard-terminal, file-browser, or local-web." },
-          cwd: { type: "string", description: "Directory to open. Use ~ for home, an existing tab cwd, or a path from workspace path context. Omit this for local-web unless the user explicitly names a directory." },
+          cwd: {
+            type: "string",
+            description:
+              "Directory to open. Use ~ for home, an existing tab cwd, or a path from workspace paths context. Omit this for plugins that do not require directories unless the user explicitly names a directory."
+          },
           title: { type: "string", description: "Optional visible tab title." },
           url: { type: "string", description: "Optional local website URL when opening targetPluginId local-web." },
           paneId: { type: "string", description: "Optional exact client pane id where the new tab should be placed." },
           createDirectory: { type: "boolean", description: "Whether Cloudx may create the directory if it does not exist." },
           newPane: { type: "boolean", description: "Whether the client should place the new tab in a newly split pane." },
-          splitDirection: { type: "string", enum: ["row", "column"], description: "row creates side-by-side panes; column creates stacked panes." }
+          splitDirection: {
+            type: "string",
+            enum: ["row", "column"],
+            description: "row creates side-by-side columns with a vertical divider; column creates stacked rows with a horizontal divider."
+          }
         },
         required: ["targetPluginId"],
         additionalProperties: false
@@ -46,7 +55,7 @@ export class WorkspaceControlPlugin implements WorkspacePlugin {
     },
     {
       name: "select_pane",
-      description: "Select an existing client pane by exact pane id from client.panes context.",
+      description: "Select or focus an existing client pane by exact pane id from client.panes context.",
       voiceExposed: true,
       inputSchema: {
         type: "object",
@@ -59,13 +68,17 @@ export class WorkspaceControlPlugin implements WorkspacePlugin {
     },
     {
       name: "split_pane",
-      description: "Split an existing client pane and select the newly created pane.",
+      description: "Split an existing client pane and select the newly created pane. Use row for side-by-side columns and column for stacked rows.",
       voiceExposed: true,
       inputSchema: {
         type: "object",
         properties: {
           paneId: { type: "string", description: "Exact client pane id to split. Omit only when the active pane should be split." },
-          splitDirection: { type: "string", enum: ["row", "column"], description: "row creates side-by-side panes; column creates stacked panes." }
+          splitDirection: {
+            type: "string",
+            enum: ["row", "column"],
+            description: "row creates side-by-side columns with a vertical divider; column creates stacked rows with a horizontal divider."
+          }
         },
         additionalProperties: false
       }

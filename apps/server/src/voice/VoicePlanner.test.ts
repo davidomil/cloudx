@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { buildCodexExecArgs, buildVoicePrompt } from "./VoicePlanner.js";
 
 describe("buildVoicePrompt", () => {
-  it("tells the voice planner to translate shell intents instead of pasting transcripts", () => {
+  it("keeps plugin-specific behavior in descriptors instead of planner rules", () => {
     const prompt = buildVoicePrompt("list directory", {
       activeTabId: "tab-1",
       tabs: [{ id: "tab-1", pluginId: "standard-terminal", title: "Shell" }],
@@ -18,18 +18,15 @@ describe("buildVoicePrompt", () => {
     expect(prompt).toContain("Do not blindly paste the transcript");
     expect(prompt).toContain("transcript is ASR output and is often wrong");
     expect(prompt).toContain("read that session's voiceContext and history.text");
+    expect(prompt).toContain("handlesUnhandledVoice");
     expect(prompt).toContain("if the transcript says 'run pink' in a terminal context, infer 'run ping'");
-    expect(prompt).toContain("transcript 'list directory' becomes input.text 'ls'");
+    expect(prompt).toContain("Plugin descriptions, action descriptions, input schemas, voiceContext, and history are authoritative");
     expect(prompt).toContain("standardized plugin voiceContext");
-    expect(prompt).toContain("replace_in_file");
-    expect(prompt).toContain("workspace-control.create_tab");
-    expect(prompt).toContain("targetPluginId 'local-web'");
-    expect(prompt).toContain("including any token query string");
-    expect(prompt).toContain("Do not include input.cwd for local-web");
-    expect(prompt).toContain("workspace-control.select_pane");
-    expect(prompt).toContain("workspace-control.split_pane");
+    expect(prompt).toContain("do not invent plugin capabilities");
     expect(prompt).toContain("exact pane ids");
-    expect(prompt).toContain("Map 'home' to input.cwd '~'");
+    expect(prompt).not.toContain("For standard-terminal enter_text");
+    expect(prompt).not.toContain("For codex-terminal enter_text");
+    expect(prompt).not.toContain("Use workspace-control");
     expect(prompt).not.toContain("set input.text to the full transcript");
   });
 });

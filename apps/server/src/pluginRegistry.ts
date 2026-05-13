@@ -36,6 +36,10 @@ export class PluginRegistry {
     return this.get(pluginId).actions.find((action) => action.voiceExposed && action.defaultForVoice);
   }
 
+  getUnhandledVoiceAction(pluginId: PluginId): PluginActionDefinition | undefined {
+    return this.get(pluginId).actions.find((action) => action.voiceExposed && action.handlesUnhandledVoice);
+  }
+
   getAction(pluginId: PluginId, actionName: string): PluginActionDefinition {
     const action = this.get(pluginId).actions.find((candidate) => candidate.name === actionName);
     if (!action) {

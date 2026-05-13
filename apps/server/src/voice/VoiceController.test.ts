@@ -108,7 +108,7 @@ describe("VoiceController", () => {
     expect(result.plan.actions[0]?.pluginId).toBe("workspace-control");
   });
 
-  it("forwards unresolved general speech to the active Codex tab default action", async () => {
+  it("forwards unresolved general speech through the active plugin fallback action", async () => {
     const plan: VoiceActionPlan = {
       transcript: "make the tests pass",
       summary: "No explicit workspace action found.",
@@ -122,13 +122,13 @@ describe("VoiceController", () => {
     const executed: unknown[] = [];
     const sessions = {
       async buildVoiceContext() {
-        return { activeTabId: "codex-tab" };
+        return { activeTabId: "plugin-tab" };
       },
-      createDefaultVoiceAction(transcript: string, activeTabId?: string) {
+      createUnhandledVoiceAction(transcript: string, activeTabId?: string) {
         return {
           targetTabId: activeTabId,
-          pluginId: "codex-terminal",
-          action: "enter_text",
+          pluginId: "assistant-plugin",
+          action: "accept_voice_text",
           input: { text: transcript, submit: true }
         };
       },
@@ -139,22 +139,22 @@ describe("VoiceController", () => {
     };
 
     const controller = new VoiceController(sessions as never, planner);
-    const result = await controller.handleTranscript("make the tests pass", "codex-tab");
+    const result = await controller.handleTranscript("make the tests pass", "plugin-tab");
 
     expect(result.accepted).toBe(true);
     expect(result.plan.actions).toEqual([
       {
-        targetTabId: "codex-tab",
-        pluginId: "codex-terminal",
-        action: "enter_text",
+        targetTabId: "plugin-tab",
+        pluginId: "assistant-plugin",
+        action: "accept_voice_text",
         input: { text: "make the tests pass", submit: true },
-        reason: "Planner returned no actions; forwarding the transcript to the active Codex tab."
+        reason: "Planner returned no actions; forwarding the transcript to the active plugin fallback."
       }
     ]);
     expect(executed).toEqual(result.plan.actions);
   });
 
-  it("does not default unresolved speech into a non-Codex tab", async () => {
+  it("does not forward unresolved speech when the active plugin has no fallback action", async () => {
     const plan: VoiceActionPlan = {
       transcript: "make the tests pass",
       summary: "No explicit workspace action found.",
@@ -170,13 +170,8 @@ describe("VoiceController", () => {
       async buildVoiceContext() {
         return { activeTabId: "shell-tab" };
       },
-      createDefaultVoiceAction(transcript: string, activeTabId?: string) {
-        return {
-          targetTabId: activeTabId,
-          pluginId: "standard-terminal",
-          action: "enter_text",
-          input: { text: transcript, submit: true }
-        };
+      createUnhandledVoiceAction() {
+        return undefined;
       },
       async executeVoiceAction(action: unknown) {
         executed.push(action);

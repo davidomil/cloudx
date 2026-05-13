@@ -39,6 +39,7 @@ export interface PluginActionDescriptor {
   description: string;
   voiceExposed: boolean;
   defaultForVoice?: boolean;
+  handlesUnhandledVoice?: boolean;
   inputSchema: Record<string, unknown>;
 }
 

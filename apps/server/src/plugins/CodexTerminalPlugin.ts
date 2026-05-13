@@ -14,56 +14,15 @@ import type { TerminalProcess, TerminalProcessFactory } from "../terminal/Termin
 export const DEFAULT_TERMINAL_REPLAY_BYTES = 1_048_576;
 export const CODEX_SUBMIT_DELAY_MS = 25;
 
-export const TERMINAL_ACTIONS: PluginActionDefinition[] = [
-  {
-    name: "enter_text",
-    description: "Type text into the terminal.",
-    voiceExposed: true,
-    defaultForVoice: true,
-    inputSchema: {
-      type: "object",
-      properties: {
-        text: { type: "string", description: "Text to type into the terminal." },
-        submit: { type: "boolean", description: "Whether to press Enter after typing." }
-      },
-      required: ["text"],
-      additionalProperties: false
-    }
-  },
-  {
-    name: "send_key",
-    description: "Send a supported control key to the terminal.",
-    voiceExposed: true,
-    inputSchema: {
-      type: "object",
-      properties: {
-        key: { type: "string", enum: ["enter", "escape", "tab", "ctrl-c"] }
-      },
-      required: ["key"],
-      additionalProperties: false
-    }
-  },
-  {
-    name: "resize",
-    description: "Resize the terminal PTY.",
-    voiceExposed: false,
-    inputSchema: {
-      type: "object",
-      properties: {
-        cols: { type: "number" },
-        rows: { type: "number" }
-      },
-      required: ["cols", "rows"],
-      additionalProperties: false
-    }
-  },
-  {
-    name: "stop",
-    description: "Stop the running terminal process.",
-    voiceExposed: true,
-    inputSchema: { type: "object", properties: {}, additionalProperties: false }
-  }
-];
+export const TERMINAL_ACTIONS: PluginActionDefinition[] = terminalActions({
+  enterTextDescription:
+    "Type into a standard shell terminal. For voice, translate natural-language shell requests into concise shell commands before submitting."
+});
+export const CODEX_TERMINAL_ACTIONS: PluginActionDefinition[] = terminalActions({
+  enterTextDescription:
+    "Type into an interactive Codex CLI terminal. For voice, send the coding instruction Codex should receive, usually as natural language rather than a shell command.",
+  enterTextHandlesUnhandledVoice: true
+});
 
 export class CodexTerminalPlugin implements WorkspacePlugin {
   readonly id = "codex-terminal";
@@ -74,7 +33,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
   readonly creatable = true;
   readonly requiresDirectory = true;
 
-  readonly actions = TERMINAL_ACTIONS;
+  readonly actions = CODEX_TERMINAL_ACTIONS;
 
   constructor(
     private readonly factory: TerminalProcessFactory,
@@ -109,6 +68,60 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       voiceSummary: "Interactive Codex CLI terminal. Send natural-language coding instructions here."
     });
   }
+}
+
+function terminalActions(options: { enterTextDescription: string; enterTextHandlesUnhandledVoice?: boolean }): PluginActionDefinition[] {
+  return [
+    {
+      name: "enter_text",
+      description: options.enterTextDescription,
+      voiceExposed: true,
+      defaultForVoice: true,
+      handlesUnhandledVoice: options.enterTextHandlesUnhandledVoice,
+      inputSchema: {
+        type: "object",
+        properties: {
+          text: { type: "string", description: "Text to type into the terminal." },
+          submit: { type: "boolean", description: "Whether to press Enter after typing." }
+        },
+        required: ["text"],
+        additionalProperties: false
+      }
+    },
+    {
+      name: "send_key",
+      description: "Send a supported control key to the terminal.",
+      voiceExposed: true,
+      inputSchema: {
+        type: "object",
+        properties: {
+          key: { type: "string", enum: ["enter", "escape", "tab", "ctrl-c"] }
+        },
+        required: ["key"],
+        additionalProperties: false
+      }
+    },
+    {
+      name: "resize",
+      description: "Resize the terminal PTY.",
+      voiceExposed: false,
+      inputSchema: {
+        type: "object",
+        properties: {
+          cols: { type: "number" },
+          rows: { type: "number" }
+        },
+        required: ["cols", "rows"],
+        additionalProperties: false
+      }
+    },
+    {
+      name: "stop",
+      description: "Stop the running terminal process.",
+      voiceExposed: true,
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    }
+  ];
 }
 
 interface TerminalSessionOptions {

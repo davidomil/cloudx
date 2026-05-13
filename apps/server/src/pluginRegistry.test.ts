@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { CodexTerminalPlugin } from "./plugins/CodexTerminalPlugin.js";
+import { StandardTerminalPlugin } from "./plugins/StandardTerminalPlugin.js";
 import { PluginRegistry } from "./pluginRegistry.js";
 import type { TerminalProcess, TerminalProcessFactory } from "./terminal/TerminalProcess.js";
 
@@ -73,6 +74,16 @@ describe("PluginRegistry", () => {
 
     expect(registry.getDefaultVoiceAction("codex-terminal")?.name).toBe("enter_text");
     expect(registry.list()[0]?.actions[0]?.defaultForVoice).toBe(true);
+  });
+
+  it("lets plugins opt in to unresolved voice fallback", () => {
+    const registry = new PluginRegistry();
+    registry.register(new CodexTerminalPlugin(new FakeFactory()));
+    registry.register(new StandardTerminalPlugin(new FakeFactory()));
+
+    expect(registry.getUnhandledVoiceAction("codex-terminal")?.name).toBe("enter_text");
+    expect(registry.getUnhandledVoiceAction("standard-terminal")).toBeUndefined();
+    expect(registry.list().find((plugin) => plugin.id === "codex-terminal")?.actions[0]?.handlesUnhandledVoice).toBe(true);
   });
 
   it("exposes plugin creation metadata in descriptors", () => {
