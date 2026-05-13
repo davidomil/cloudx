@@ -228,6 +228,7 @@ a:hover svg {
 
 .topbar {
   grid-row: 1;
+  z-index: 30;
   min-height: 56px;
   display: flex;
   align-items: center;
@@ -395,16 +396,21 @@ a:hover svg {
   position: relative;
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 0;
 }
 
 .mic-source-button {
-  width: 34px;
-  grid-template-columns: 1fr auto;
-  gap: 1px;
-  padding: 0 6px;
+  width: 17px;
+  margin-left: -1px;
+  padding: 0;
   color: var(--color-accent);
   border-color: rgb(0 255 136 / 0.34);
+  border-left-color: rgb(0 255 136 / 0.18);
+  clip-path: polygon(0 0, calc(100% - 7px) 0, 100% 7px, 100% calc(100% - 7px), calc(100% - 7px) 100%, 0 100%);
+}
+
+.mic-control .mic-button {
+  clip-path: polygon(0 8px, 8px 0, 100% 0, 100% 100%, 8px 100%, 0 calc(100% - 8px));
 }
 
 .mic-source-button.open {
@@ -425,7 +431,7 @@ a:hover svg {
   position: absolute;
   top: calc(100% + 8px);
   right: 0;
-  z-index: 20;
+  z-index: 200;
   width: min(320px, calc(100vw - 24px));
   max-height: 340px;
   padding: 6px;

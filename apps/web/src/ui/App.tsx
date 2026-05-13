@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement } from "react";
-import { AudioLines, ChevronDown, Columns2, GitBranch, Mic, MicOff, PanelTopOpen, RefreshCw, Rows3, SquarePlus, Wifi, WifiOff, X } from "lucide-react";
+import { ChevronDown, Columns2, GitBranch, Mic, MicOff, PanelTopOpen, RefreshCw, Rows3, SquarePlus, Wifi, WifiOff, X } from "lucide-react";
 
 import type { CreateTabRequest, PathOption, PluginDescriptor, PluginId, TabLayoutState, WorkspaceTab, WorkspaceTabsUpdate } from "@cloudx/shared";
 
@@ -434,8 +434,7 @@ export function App() {
               aria-expanded={audioInputMenuOpen}
               aria-haspopup="menu"
             >
-              <AudioLines size={15} />
-              <ChevronDown size={12} />
+              <ChevronDown size={13} />
             </button>
             {audioInputMenuOpen ? (
               <div className="mic-source-menu" role="menu" aria-label="Microphone devices">
