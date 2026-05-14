@@ -15,13 +15,13 @@ describe("ConfigService", () => {
 
     expect(service.getResponse()).toMatchObject({
       values: {
-        global: { aiControlEnabled: true, microphoneEnabled: true },
+        global: { aiControlEnabled: true, microphoneEnabled: true, themeId: "cloudx-neon" },
         plugins: { "file-browser": { showGitDiff: true } }
       }
     });
 
     await service.update({
-      global: { aiControlEnabled: false },
+      global: { aiControlEnabled: false, themeId: "graphite" },
       plugins: { "file-browser": { showGitDiff: false } }
     });
 
@@ -30,7 +30,7 @@ describe("ConfigService", () => {
     const reloaded = new ConfigService(dataDir, () => [fileBrowserDescriptor()]);
     expect(reloaded.getResponse()).toMatchObject({
       values: {
-        global: { aiControlEnabled: false, microphoneEnabled: true },
+        global: { aiControlEnabled: false, microphoneEnabled: true, themeId: "graphite" },
         plugins: { "file-browser": { showGitDiff: false } }
       }
     });
@@ -41,6 +41,7 @@ describe("ConfigService", () => {
     const service = new ConfigService(dataDir, () => [fileBrowserDescriptor()]);
 
     await expect(service.update({ global: { nope: true } })).rejects.toThrow("Unknown config key");
+    await expect(service.update({ global: { themeId: "missing" } })).rejects.toThrow("must be one of the configured options");
     await expect(service.update({ plugins: { "file-browser": { showGitDiff: "no" } } })).rejects.toThrow("must be a boolean");
   });
 });

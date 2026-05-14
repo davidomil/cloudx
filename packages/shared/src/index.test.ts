@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseVoiceActionPlan } from "./index.js";
+import { CLOUDX_THEME_OPTIONS, isCloudxThemeId, parseVoiceActionPlan } from "./index.js";
 
 describe("parseVoiceActionPlan", () => {
   it("accepts a valid structured plan", () => {
@@ -43,5 +43,13 @@ describe("parseVoiceActionPlan", () => {
         actions: [{ input: {} }]
       })
     ).toThrow(/action name/);
+  });
+});
+
+describe("CloudX themes", () => {
+  it("exposes config-safe theme options", () => {
+    expect(CLOUDX_THEME_OPTIONS.map((option) => option.value)).toEqual(["cloudx-neon", "graphite"]);
+    expect(isCloudxThemeId("graphite")).toBe(true);
+    expect(isCloudxThemeId("missing")).toBe(false);
   });
 });

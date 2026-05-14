@@ -4,6 +4,7 @@ import { AlertTriangle, Download, GitBranch, GitFork, Plus, RefreshCw, Trash2 } 
 import type { WorktreeCreateMode, WorktreeProjectState, WorktreeRef, WorktreeSummary, WorkspaceTab } from "@cloudx/shared";
 
 import { runTabAction } from "../api.js";
+import { ControlButton } from "./Control.js";
 
 type BusyAction = "state" | "initialize" | "clone" | "fetch" | "create" | "delete";
 
@@ -105,9 +106,9 @@ export function WorktreeManagerPanel({ tab }: { tab: WorkspaceTab }) {
           <GitFork size={16} />
           <span title={tab.cwd}>{tab.cwd}</span>
         </div>
-        <button type="button" onClick={() => void loadState()} disabled={Boolean(busyAction)} title="Refresh worktree project">
+        <ControlButton type="button" iconOnly onClick={() => void loadState()} disabled={Boolean(busyAction)} title="Refresh worktree project">
           <RefreshCw size={15} />
-        </button>
+        </ControlButton>
       </div>
       {error ? <div className="inline-error">{error}</div> : null}
       {!state ? <LoadingState /> : state.status === "ready" ? <ManagerView state={state} busy={Boolean(busyAction)} localRefs={localRefs} remoteRefs={remoteRefs} tagRefs={tagRefs} mode={mode} folderName={folderName} branchName={branchName} baseRef={baseRef} deleteTarget={deleteTarget} deleteConfirmation={deleteConfirmation} forceDelete={forceDelete} onModeChange={setMode} onFolderNameChange={setFolderName} onBranchNameChange={setBranchName} onBaseRefChange={setBaseRef} onFetch={() => void fetchRefs()} onCreate={() => void createWorktree()} onOpenDelete={openDelete} onCancelDelete={() => setDeleteTarget(undefined)} onDeleteConfirmationChange={setDeleteConfirmation} onForceDeleteChange={setForceDelete} onDelete={() => void deleteWorktree()} /> : state.status === "empty" ? <SetupView cloneUrl={cloneUrl} busy={Boolean(busyAction)} onCloneUrlChange={setCloneUrl} onInitialize={() => void initializeBareRepository()} onClone={() => void cloneBareRepository()} /> : <BlockedView state={state} />}
@@ -132,10 +133,10 @@ function SetupView({ cloneUrl, busy, onCloneUrlChange, onInitialize, onClone }: 
         <span>Initialize an empty worktree project or clone one from a Git URL.</span>
       </div>
       <div className="worktree-setup-actions">
-        <button type="button" onClick={onInitialize} disabled={busy}>
+        <ControlButton type="button" onClick={onInitialize} disabled={busy}>
           <Plus size={15} />
           Initialize bare repository
-        </button>
+        </ControlButton>
         <form
           className="worktree-inline-form"
           onSubmit={(event) => {
@@ -144,10 +145,10 @@ function SetupView({ cloneUrl, busy, onCloneUrlChange, onInitialize, onClone }: 
           }}
         >
           <input value={cloneUrl} onChange={(event) => onCloneUrlChange(event.target.value)} placeholder="Git repository URL" aria-label="Git repository URL" />
-          <button type="submit" disabled={busy || !cloneUrl.trim()}>
+          <ControlButton type="submit" disabled={busy || !cloneUrl.trim()}>
             <Download size={15} />
             Clone bare repository
-          </button>
+          </ControlButton>
         </form>
       </div>
     </div>
@@ -220,10 +221,10 @@ function ManagerView({
         {state.originUrl ? <small title={state.originUrl}>origin</small> : null}
         <small>{state.worktrees.length} worktrees</small>
         <small>{state.refs.length} refs</small>
-        <button type="button" onClick={onFetch} disabled={busy || !state.originUrl} title="Fetch origin refs and tags">
+        <ControlButton type="button" onClick={onFetch} disabled={busy || !state.originUrl} title="Fetch origin refs and tags">
           <Download size={15} />
           Fetch
-        </button>
+        </ControlButton>
       </div>
 
       <form
@@ -284,10 +285,10 @@ function ManagerView({
             </select>
           </label>
         )}
-        <button type="submit" disabled={createDisabled}>
+        <ControlButton type="submit" disabled={createDisabled}>
           <Plus size={15} />
           Create
-        </button>
+        </ControlButton>
       </form>
 
       <div className="worktree-content-grid">
@@ -300,9 +301,9 @@ function ManagerView({
                   <span>{worktree.branch ?? worktree.head ?? "detached"}</span>
                 </div>
                 <DirtyBadge worktree={worktree} />
-                <button type="button" onClick={() => onOpenDelete(worktree)} disabled={busy} title={`Delete ${worktree.folderName}`}>
+                <ControlButton type="button" tone="danger" iconOnly onClick={() => onOpenDelete(worktree)} disabled={busy} title={`Delete ${worktree.folderName}`}>
                   <Trash2 size={15} />
-                </button>
+                </ControlButton>
               </article>
             ))
           ) : (
@@ -366,12 +367,12 @@ function DeletePanel({ target, confirmation, force, busy, onCancel, onConfirmati
         </label>
       ) : null}
       <div className="worktree-delete-actions">
-        <button type="button" onClick={onCancel}>
+        <ControlButton type="button" onClick={onCancel}>
           Cancel
-        </button>
-        <button type="button" className="danger-button" onClick={onDelete} disabled={busy || !canDelete}>
+        </ControlButton>
+        <ControlButton type="button" className="danger-button" tone="danger" onClick={onDelete} disabled={busy || !canDelete}>
           Delete
-        </button>
+        </ControlButton>
       </div>
     </div>
   );

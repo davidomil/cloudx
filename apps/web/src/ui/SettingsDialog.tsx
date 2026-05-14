@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 
 import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, ConfigValue } from "@cloudx/shared";
 
+import { ControlButton } from "./Control.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
 
 export function SettingsDialog({ config, onCancel, onSave }: { config: CloudxConfigResponse; onCancel: () => void; onSave: (values: CloudxConfigValues) => Promise<void> }) {
@@ -63,8 +64,8 @@ export function SettingsDialog({ config, onCancel, onSave }: { config: CloudxCon
           )}
         </section>
         <div className="dialog-actions">
-          <button onClick={onCancel} disabled={busy}>Cancel</button>
-          <button className="primary-button" onClick={() => void save()} disabled={busy}>Save</button>
+          <ControlButton onClick={onCancel} disabled={busy}>Cancel</ControlButton>
+          <ControlButton className="primary-button" tone="primary" onClick={() => void save()} disabled={busy}>Save</ControlButton>
         </div>
       </div>
     </div>

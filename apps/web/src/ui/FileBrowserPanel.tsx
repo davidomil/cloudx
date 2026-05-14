@@ -6,6 +6,7 @@ import { FileDiff, FileText, Folder, GitBranch, GitFork, GitPullRequest, Refresh
 import type { ConfigValue, FileSearchFileResult, FileSearchMode, FileSearchResult, GitDiffFile, GitDiffFileSummary, GitDiffSummary, GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
 
 import { runTabAction } from "../api.js";
+import { ControlButton, SegmentedControl } from "./Control.js";
 
 interface DirectoryEntry {
   name: string;
@@ -299,21 +300,21 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   return (
     <div className="file-browser-panel">
       <div className="file-browser-toolbar">
-        <button onClick={() => void loadDirectory(parentPath(relativePath))}>..</button>
+        <ControlButton onClick={() => void loadDirectory(parentPath(relativePath))}>..</ControlButton>
         <span>{relativePath || "."}</span>
-        <button onClick={() => void loadDirectory(relativePath)} title="Refresh">
+        <ControlButton iconOnly onClick={() => void loadDirectory(relativePath)} title="Refresh">
           <RefreshCw size={15} />
-        </button>
-        <button type="button" aria-pressed={treeVisible} aria-label={treeVisible ? "Hide tree view" : "Show tree view"} title={treeVisible ? "Hide tree view" : "Show tree view"} onClick={() => setTreeVisible(!treeVisible)}>
+        </ControlButton>
+        <ControlButton type="button" iconOnly pressed={treeVisible} aria-label={treeVisible ? "Hide tree view" : "Show tree view"} title={treeVisible ? "Hide tree view" : "Show tree view"} onClick={() => setTreeVisible(!treeVisible)}>
           <Folder size={15} />
-        </button>
-        <button type="button" aria-pressed={searchVisible} aria-label={searchVisible ? "Hide search bar" : "Show search bar"} title={searchVisible ? "Hide search bar" : "Show search bar"} onClick={toggleSearchVisible}>
+        </ControlButton>
+        <ControlButton type="button" iconOnly pressed={searchVisible} aria-label={searchVisible ? "Hide search bar" : "Show search bar"} title={searchVisible ? "Hide search bar" : "Show search bar"} onClick={toggleSearchVisible}>
           <Search size={15} />
-        </button>
+        </ControlButton>
         {showGitDiff ? (
-          <button type="button" aria-pressed={gitBarVisible} aria-label={gitBarVisible ? "Hide Git bar" : "Show Git bar"} title={gitBarVisible ? "Hide Git bar" : "Show Git bar"} onClick={() => setGitBarVisible(!gitBarVisible)}>
+          <ControlButton type="button" iconOnly pressed={gitBarVisible} aria-label={gitBarVisible ? "Hide Git bar" : "Show Git bar"} title={gitBarVisible ? "Hide Git bar" : "Show Git bar"} onClick={() => setGitBarVisible(!gitBarVisible)}>
             <GitBranch size={15} />
-          </button>
+          </ControlButton>
         ) : null}
       </div>
       {searchVisible ? <SearchBar
@@ -357,12 +358,12 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
           {activeSearchQuery && searchBusyAction ? <div className="file-list-empty">Searching...</div> : null}
           {activeSearchQuery && !searchBusyAction && activeSearchResult && visibleEntries.length === 0 ? <div className="file-list-empty">No matches.</div> : null}
           {visibleEntries.map((entry) => (
-            <button key={`${entry.type}:${entry.name}:${entry.virtual ? "virtual" : "real"}`} className={entry.gitChange ? "has-git-change" : ""} onClick={() => void handleFileListEntry(entry)}>
+            <ControlButton key={`${entry.type}:${entry.name}:${entry.virtual ? "virtual" : "real"}`} className={entry.gitChange ? "has-git-change" : ""} onClick={() => void handleFileListEntry(entry)}>
               {entry.type === "directory" ? <Folder size={15} /> : <FileText size={15} />}
               <span>{entry.name}</span>
               {entry.searchMatch ? <SearchMatchBadge entry={entry} /> : null}
               {entry.gitChange ? <TreeChangeBadge change={entry.gitChange} /> : null}
-            </button>
+            </ControlButton>
           ))}
         </div> : null}
         <div className="file-preview">
@@ -444,28 +445,28 @@ function SearchBar({
         onSearch();
       }}
     >
-      <button type="button" className="file-search-toggle" aria-expanded={expanded} aria-controls={controlsId} onClick={() => onExpandedChange(!expanded)}>
+      <ControlButton type="button" className="file-search-toggle" selected={Boolean(trimmedQuery)} aria-expanded={expanded} aria-controls={controlsId} onClick={() => onExpandedChange(!expanded)}>
         <span className="file-search-status" title={statusLabel} aria-label={statusLabel} aria-busy={busy}>
           <Search size={15} className={busy ? "spinning" : ""} />
         </span>
         <span>{trimmedQuery || "Search files"}</span>
-      </button>
+      </ControlButton>
       <div id={controlsId} className="file-search-controls">
         <span className="file-search-status" title={busy ? "Searching files" : "Search is live"} aria-label={busy ? "Searching files" : "Search is live"} aria-busy={busy}>
           <Search size={15} className={busy ? "spinning" : ""} />
         </span>
         <input value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder={mode === "filename" ? "Find filenames" : mode === "content" ? "Search contents" : "Search files"} aria-label="Search files" />
-        <div className="file-search-mode" role="group" aria-label="File search mode">
-          <button type="button" className={mode === "all" ? "active" : ""} onClick={() => onModeChange("all")}>
+        <SegmentedControl className="file-search-mode" label="File search mode">
+          <ControlButton type="button" className={mode === "all" ? "active" : ""} selected={mode === "all"} onClick={() => onModeChange("all")}>
             All
-          </button>
-          <button type="button" className={mode === "content" ? "active" : ""} onClick={() => onModeChange("content")}>
+          </ControlButton>
+          <ControlButton type="button" className={mode === "content" ? "active" : ""} selected={mode === "content"} onClick={() => onModeChange("content")}>
             Contents
-          </button>
-          <button type="button" className={mode === "filename" ? "active" : ""} onClick={() => onModeChange("filename")}>
+          </ControlButton>
+          <ControlButton type="button" className={mode === "filename" ? "active" : ""} selected={mode === "filename"} onClick={() => onModeChange("filename")}>
             Names
-          </button>
-        </div>
+          </ControlButton>
+        </SegmentedControl>
         <input className="file-search-glob" value={glob} onChange={(event) => onGlobChange(event.target.value)} placeholder="Glob" aria-label="Search glob" />
       </div>
     </form>
@@ -566,9 +567,9 @@ function GitRepositoryBar({
         <div className="git-bar-summary">
           <GitFork size={15} />
           <span>Not a Git repository</span>
-          <button type="button" onClick={onInitialize} disabled={Boolean(busyAction)} title="Initialize repository">
+          <ControlButton type="button" onClick={onInitialize} disabled={Boolean(busyAction)} title="Initialize repository">
             Init
-          </button>
+          </ControlButton>
         </div>
         {state.setup.canClone ? (
           <form
@@ -579,9 +580,9 @@ function GitRepositoryBar({
             }}
           >
             <input value={cloneUrl} onChange={(event) => onSetCloneUrl(event.target.value)} placeholder="Repository URL" aria-label="Repository URL to clone" />
-            <button type="submit" disabled={Boolean(busyAction) || !cloneUrl.trim()} title="Clone repository into this empty folder">
+            <ControlButton type="submit" disabled={Boolean(busyAction) || !cloneUrl.trim()} title="Clone repository into this empty folder">
               Clone
-            </button>
+            </ControlButton>
           </form>
         ) : null}
         {state.setup.canSetOrigin ? (
@@ -597,9 +598,9 @@ function GitRepositoryBar({
         <GitPullRequest size={15} />
         <span title={state.rootPath}>{state.currentBranch ?? "detached"}</span>
         {state.originUrl ? <small title={state.originUrl}>origin</small> : null}
-        <button type="button" onClick={onRefresh} disabled={Boolean(busyAction)} title="Refresh Git state">
+        <ControlButton type="button" iconOnly onClick={onRefresh} disabled={Boolean(busyAction)} title="Refresh Git state">
           <RefreshCw size={14} />
-        </button>
+        </ControlButton>
       </div>
       <label className="git-compare-control">
         Compare
@@ -615,20 +616,20 @@ function GitRepositoryBar({
           {!state.defaultCompareRef && state.compareRefs.length === 0 ? <option value="">working tree</option> : null}
         </select>
       </label>
-      <div className="git-view-toggle" role="group" aria-label="Diff view mode">
-        <button type="button" className={diffViewMode === "split" ? "active" : ""} onClick={() => onDiffViewModeChange("split")}>
+      <SegmentedControl className="git-view-toggle" label="Diff view mode">
+        <ControlButton type="button" className={diffViewMode === "split" ? "active" : ""} selected={diffViewMode === "split"} onClick={() => onDiffViewModeChange("split")}>
           Split
-        </button>
-        <button type="button" className={diffViewMode === "unified" ? "active" : ""} onClick={() => onDiffViewModeChange("unified")}>
+        </ControlButton>
+        <ControlButton type="button" className={diffViewMode === "unified" ? "active" : ""} selected={diffViewMode === "unified"} onClick={() => onDiffViewModeChange("unified")}>
           Unified
-        </button>
-      </div>
+        </ControlButton>
+      </SegmentedControl>
       <span className="git-change-count">{diffSummary ? `${diffSummary.files.length}${diffSummary.truncated ? "+" : ""} changed` : "No diff loaded"}</span>
       {state.setup.canSetOrigin ? <OriginForm originUrl={originUrl} busy={Boolean(busyAction)} onSetOrigin={onSetOrigin} onSetOriginUrl={onSetOriginUrl} compact /> : null}
       {openedDiff ? <span className="git-open-file" title={openedDiff.path}>{openedDiff.path}</span> : null}
-      <button type="button" className="git-bar-end-toggle" aria-pressed={diffFilesVisible} aria-label={diffFilesVisible ? "Hide changed files" : "Show changed files"} title={diffFilesVisible ? "Hide changed files" : "Show changed files"} onClick={() => onDiffFilesVisibleChange(!diffFilesVisible)}>
+      <ControlButton type="button" className="git-bar-end-toggle" iconOnly pressed={diffFilesVisible} aria-label={diffFilesVisible ? "Hide changed files" : "Show changed files"} title={diffFilesVisible ? "Hide changed files" : "Show changed files"} onClick={() => onDiffFilesVisibleChange(!diffFilesVisible)}>
         <FileDiff size={14} />
-      </button>
+      </ControlButton>
     </div>
   );
 }
@@ -643,9 +644,9 @@ function OriginForm({ originUrl, busy, compact, onSetOrigin, onSetOriginUrl }: {
       }}
     >
       <input value={originUrl} onChange={(event) => onSetOriginUrl(event.target.value)} placeholder="Origin URL" aria-label="Origin remote URL" />
-      <button type="submit" disabled={busy || !originUrl.trim()} title="Set origin remote">
+      <ControlButton type="submit" disabled={busy || !originUrl.trim()} title="Set origin remote">
         Set origin
-      </button>
+      </ControlButton>
     </form>
   );
 }
@@ -674,18 +675,18 @@ function SearchResults({ result, busy, onOpenFile }: { result: FileSearchResult;
 function SearchResultFile({ file, busy, onOpenFile }: { file: FileSearchFileResult; busy: boolean; onOpenFile: (filePath: string) => void }) {
   return (
     <div className="file-search-result-file">
-      <button type="button" onClick={() => onOpenFile(file.path)} disabled={busy}>
+      <ControlButton type="button" onClick={() => onOpenFile(file.path)} disabled={busy}>
         <FileText size={15} />
         <span>{file.path}</span>
         {file.truncated ? <small>truncated</small> : null}
-      </button>
+      </ControlButton>
       {file.matches.length ? (
         <div className="file-search-matches">
           {file.matches.map((match, index) => (
-            <button key={`${file.path}:${match.lineNumber ?? 0}:${index}`} type="button" onClick={() => onOpenFile(file.path)} disabled={busy}>
+            <ControlButton key={`${file.path}:${match.lineNumber ?? 0}:${index}`} type="button" onClick={() => onOpenFile(file.path)} disabled={busy}>
               {match.lineNumber ? <small>{match.lineNumber}:{match.column ?? 1}</small> : null}
               <span>{match.text.trim() || file.path}</span>
-            </button>
+            </ControlButton>
           ))}
         </div>
       ) : null}
@@ -706,11 +707,11 @@ function GitDiffWorkspace({ diffSummary, openedDiff, viewMode, filesVisible, bus
       {filesVisible ? <div className="git-diff-files" aria-label="Changed files">
         {diffSummary?.files.length ? (
           diffSummary.files.map((file) => (
-            <button key={`${file.statusCode}:${file.path}`} type="button" className={openedDiff?.path === file.path ? "selected" : ""} onClick={() => onOpenFile(file)} disabled={busy}>
+            <ControlButton key={`${file.statusCode}:${file.path}`} type="button" className={openedDiff?.path === file.path ? "selected" : ""} selected={openedDiff?.path === file.path} onClick={() => onOpenFile(file)} disabled={busy}>
               <StatusBadge file={file} />
               <span>{file.path}</span>
               {file.additions !== undefined || file.deletions !== undefined ? <small>{formatStat(file)}</small> : null}
-            </button>
+            </ControlButton>
           ))
         ) : (
           <div className="git-diff-empty">

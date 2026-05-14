@@ -26,6 +26,7 @@ import {
   voiceAudioConstraints,
   type VoiceAudioStreamSession
 } from "../api.js";
+import { ControlButton } from "./Control.js";
 import { FileBrowserPanel } from "./FileBrowserPanel.js";
 import { PathEntry } from "./PathEntry.js";
 import {
@@ -49,7 +50,8 @@ import {
 import { shouldSubmitVoiceConsoleKey } from "./keyboard.js";
 import { SettingsDialog } from "./SettingsDialog.js";
 import { clearFocusedAttention, isTabFocused, updateAttentionTabs } from "./tabAttention.js";
-import { disposeTerminalView, disposeTerminalViewsExcept, TerminalPanel } from "./TerminalPanel.js";
+import { applyTerminalColorTheme, disposeTerminalView, disposeTerminalViewsExcept, TerminalPanel } from "./TerminalPanel.js";
+import { applyCloudxTheme, readTerminalColorTheme } from "./theme.js";
 import { attemptPortraitOrientationLock } from "./orientationLock.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
 import { applyVoiceWorkspaceResults, buildClientVoiceContext, voiceConsoleValue } from "./voiceWorkspace.js";
@@ -269,6 +271,14 @@ export function App() {
 
   usePortraitOrientationLock();
   useMobileZoomSuppression();
+
+  useEffect(() => {
+    if (!config) {
+      return;
+    }
+    applyCloudxTheme(config.values.global.themeId);
+    applyTerminalColorTheme(readTerminalColorTheme());
+  }, [config?.values.global.themeId]);
 
   async function refresh() {
     setConnectionStatus("checking");
@@ -666,11 +676,13 @@ export function App() {
     }
     return (
       <div className={`mic-control ${className}`} ref={ref}>
-        <button className={`mic-button ${voiceState} ${microphoneUnavailableReason ? "unavailable" : ""}`} onClick={() => void handleMic()} title={microphoneUnavailableReason ?? (voiceState === "recording" ? "Stop voice command" : "Record voice command")}>
+        <ControlButton className={`mic-button ${voiceState} ${microphoneUnavailableReason ? "unavailable" : ""}`} iconOnly onClick={() => void handleMic()} title={microphoneUnavailableReason ?? (voiceState === "recording" ? "Stop voice command" : "Record voice command")}>
           {voiceState === "recording" ? <MicOff size={iconSize} /> : <Mic size={iconSize} />}
-        </button>
-        <button
+        </ControlButton>
+        <ControlButton
           className={`mic-source-button ${audioInputMenuOpen ? "open" : ""}`}
+          iconOnly
+          pressed={audioInputMenuOpen}
           onClick={() => void toggleAudioInputMenu()}
           disabled={voiceState !== "idle" || Boolean(microphoneUnavailableReason)}
           title="Select microphone"
@@ -679,24 +691,25 @@ export function App() {
           aria-haspopup="menu"
         >
           <ChevronDown size={13} />
-        </button>
+        </ControlButton>
         {audioInputMenuOpen ? (
           <div className="mic-source-menu" role="menu" aria-label="Microphone devices">
-            <button type="button" className={!selectedAudioInputId ? "selected" : ""} onClick={() => chooseAudioInput(undefined)} role="menuitem">
+            <ControlButton type="button" className={!selectedAudioInputId ? "selected" : ""} selected={!selectedAudioInputId} onClick={() => chooseAudioInput(undefined)} role="menuitem">
               <span>Browser default</span>
               {!selectedAudioInputId ? <small>Selected</small> : null}
-            </button>
+            </ControlButton>
             {audioInputs.map((device, index) => (
-              <button
+              <ControlButton
                 type="button"
                 className={selectedAudioInputId === device.deviceId ? "selected" : ""}
+                selected={selectedAudioInputId === device.deviceId}
                 onClick={() => chooseAudioInput(device.deviceId)}
                 role="menuitem"
                 key={device.deviceId || `audioinput-${index}`}
               >
                 <span>{audioInputLabel(device, index)}</span>
                 {selectedAudioInputId === device.deviceId ? <small>Selected</small> : null}
-              </button>
+              </ControlButton>
             ))}
             {audioInputs.length === 0 ? <div className="mic-source-empty">No microphones found.</div> : null}
             {audioInputError ? <div className="mic-source-error">{audioInputError}</div> : null}
@@ -734,20 +747,20 @@ export function App() {
             onContextSearch={handleContextSearch}
           />
           <div className="mobile-action-menu" ref={mobileActionsRef}>
-            <button className="icon-button" onClick={() => setMobileActionsOpen((open) => !open)} title="Workspace actions" aria-label="Workspace actions" aria-expanded={mobileActionsOpen} aria-haspopup="menu">
+            <ControlButton className="icon-button" iconOnly pressed={mobileActionsOpen} onClick={() => setMobileActionsOpen((open) => !open)} title="Workspace actions" aria-label="Workspace actions" aria-expanded={mobileActionsOpen} aria-haspopup="menu">
               <MoreHorizontal size={19} />
-            </button>
+            </ControlButton>
             {mobileActionsOpen ? (
               <div className={`mobile-action-menu-popover ${templateMenuOpen ? "template-open" : ""}`} role="menu" aria-label="Workspace actions">
-                <button className="icon-button" onClick={() => window.location.reload()} title="Reload app" aria-label="Reload app" role="menuitem">
+                <ControlButton className="icon-button" iconOnly onClick={() => window.location.reload()} title="Reload app" aria-label="Reload app" role="menuitem">
                   <RefreshCw size={17} />
-                </button>
-                <button className="icon-button" onClick={() => { setSettingsOpen(true); setMobileActionsOpen(false); }} title="Settings" aria-label="Settings" role="menuitem">
+                </ControlButton>
+                <ControlButton className="icon-button" iconOnly onClick={() => { setSettingsOpen(true); setMobileActionsOpen(false); }} title="Settings" aria-label="Settings" role="menuitem">
                   <Settings size={17} />
-                </button>
-                <button className="icon-button" onClick={() => { split("column"); setMobileActionsOpen(false); }} title="Split vertically" aria-label="Split vertically" role="menuitem">
+                </ControlButton>
+                <ControlButton className="icon-button" iconOnly onClick={() => { split("column"); setMobileActionsOpen(false); }} title="Split vertically" aria-label="Split vertically" role="menuitem">
                   <Rows3 size={17} />
-                </button>
+                </ControlButton>
                 {mobileActionsEnabled ? (
                   <TemplateMenu
                     open={templateMenuOpen}
@@ -764,18 +777,18 @@ export function App() {
             ) : null}
           </div>
           <div className="topbar-action-cluster">
-            <button className="icon-button" onClick={() => window.location.reload()} title="Reload app">
+            <ControlButton className="icon-button" iconOnly onClick={() => window.location.reload()} title="Reload app">
               <RefreshCw size={17} />
-            </button>
-            <button className="icon-button" onClick={() => setSettingsOpen(true)} title="Settings">
+            </ControlButton>
+            <ControlButton className="icon-button" iconOnly onClick={() => setSettingsOpen(true)} title="Settings">
               <Settings size={17} />
-            </button>
-            <button className="icon-button" onClick={() => split("row")} title="Split columns">
+            </ControlButton>
+            <ControlButton className="icon-button" iconOnly onClick={() => split("row")} title="Split columns">
               <Columns2 size={17} />
-            </button>
-            <button className="icon-button" onClick={() => split("column")} title="Split rows">
+            </ControlButton>
+            <ControlButton className="icon-button" iconOnly onClick={() => split("column")} title="Split rows">
               <Rows3 size={17} />
-            </button>
+            </ControlButton>
             {!mobileActionsEnabled ? (
               <TemplateMenu
                 open={templateMenuOpen}
@@ -887,9 +900,11 @@ export function App() {
               </button>
             );
           })}
-          <button
+          <ControlButton
             type="button"
             className="new-tab-inline add-tab-button"
+            tone="primary"
+            iconOnly
             onPointerDown={(event) => {
               event.stopPropagation();
               selectPaneForCreation(pane.id);
@@ -901,10 +916,11 @@ export function App() {
             title="Add tab to this pane"
           >
             <SquarePlus size={18} />
-          </button>
+          </ControlButton>
           {panes.length > 1 ? (
-            <button
+            <ControlButton
               className="new-tab-inline pane-close-button"
+              iconOnly
               onClick={(event) => {
                 event.stopPropagation();
                 handleClosePane(pane.id);
@@ -912,7 +928,7 @@ export function App() {
               title="Close pane"
             >
               <X size={16} />
-            </button>
+            </ControlButton>
           ) : null}
         </div>
         <div className="pane-body">
@@ -1065,16 +1081,16 @@ function WindowSwitcher({
 
   return (
     <div className="window-switcher" ref={rootRef}>
-      <button className="window-switcher-button" onClick={() => onOpenChange(!open)} title="Workspace windows">
+      <ControlButton className="window-switcher-button" pressed={open} onClick={() => onOpenChange(!open)} title="Workspace windows">
         <PanelTopOpen size={15} />
         <span>{activeWindow?.name ?? "Window"}</span>
-      </button>
+      </ControlButton>
       {open ? (
         <div className="window-menu">
           <div className="window-search-row">
-            <button type="button" className={contextMode ? "active" : ""} onClick={() => setContextMode((current) => !current)} title={contextMode ? "Context search" : "Name search"}>
+            <ControlButton type="button" className={contextMode ? "active" : ""} iconOnly pressed={contextMode} onClick={() => setContextMode((current) => !current)} title={contextMode ? "Context search" : "Name search"}>
               {contextMode ? <Bot size={15} className={contextBusy ? "spinning" : ""} /> : <Search size={15} />}
-            </button>
+            </ControlButton>
             <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={contextMode ? "Search by context" : "Search windows"} />
           </div>
           <div className="window-list">
@@ -1086,21 +1102,21 @@ function WindowSwitcher({
                     <span>{window.name}</span>
                     <small>{tabCount} tabs · {window.defaultCwd}</small>
                   </button>
-                  <button type="button" className="compact-icon-button" onClick={() => openEditDialog(window)} title={`Edit ${window.name}`} aria-label={`Edit ${window.name}`}>
+                  <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => openEditDialog(window)} title={`Edit ${window.name}`} aria-label={`Edit ${window.name}`}>
                     <Wrench size={14} />
-                  </button>
-                  <button type="button" className="compact-icon-button danger" onClick={() => openDeleteWarning(window)} title={`Delete ${window.name}`} aria-label={`Delete ${window.name}`}>
+                  </ControlButton>
+                  <ControlButton type="button" className="compact-icon-button danger" tone="danger" size="compact" iconOnly onClick={() => openDeleteWarning(window)} title={`Delete ${window.name}`} aria-label={`Delete ${window.name}`}>
                     <Trash2 size={14} />
-                  </button>
+                  </ControlButton>
                 </div>
               );
             })}
             {visibleWindows.length === 0 ? <div className="window-menu-empty">No windows match.</div> : null}
           </div>
           <div className="menu-footer-actions">
-            <button type="button" className="compact-icon-button" onClick={openCreateDialog} title="Create window" aria-label="Create window">
+            <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={openCreateDialog} title="Create window" aria-label="Create window">
               <Plus size={15} />
-            </button>
+            </ControlButton>
           </div>
           {dialogMode ? (
             <div className="menu-form-panel">
@@ -1108,12 +1124,12 @@ function WindowSwitcher({
               <input value={draftName} onChange={(event) => setDraftName(event.target.value)} placeholder="Window name" />
               <PathEntry inputId="window-default-directory" value={draftCwd} onChange={setDraftCwd} placeholder="Default directory" ariaLabel="Window default directory" />
               <div className="menu-form-actions">
-                <button type="button" className="compact-icon-button" onClick={() => void submitWindowDialog()} disabled={!draftName.trim() || !draftCwd.trim()} title={dialogMode === "edit" ? "Save window" : "Create window"} aria-label={dialogMode === "edit" ? "Save window" : "Create window"}>
+                <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void submitWindowDialog()} disabled={!draftName.trim() || !draftCwd.trim()} title={dialogMode === "edit" ? "Save window" : "Create window"} aria-label={dialogMode === "edit" ? "Save window" : "Create window"}>
                   {dialogMode === "edit" ? <Save size={15} /> : <Plus size={15} />}
-                </button>
-                <button type="button" className="compact-icon-button" onClick={() => setDialogMode(undefined)} title="Cancel" aria-label="Cancel">
+                </ControlButton>
+                <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => setDialogMode(undefined)} title="Cancel" aria-label="Cancel">
                   <X size={15} />
-                </button>
+                </ControlButton>
               </div>
             </div>
           ) : null}
@@ -1149,12 +1165,12 @@ function WindowDeleteWarning({ window, tabCount, onCancel, onConfirm }: { window
         {tabCount > 0 ? `${window.name} has ${tabCount} open tab${tabCount === 1 ? "" : "s"}. Closing it will close those tabs.` : `${window.name} will be removed from the workspace.`}
       </p>
       <div className="menu-form-actions">
-        <button type="button" className="compact-icon-button danger" onClick={onConfirm} title="Close window" aria-label="Close window">
+        <ControlButton type="button" className="compact-icon-button danger" tone="danger" size="compact" iconOnly onClick={onConfirm} title="Close window" aria-label="Close window">
           <Trash2 size={15} />
-        </button>
-        <button type="button" className="compact-icon-button" onClick={onCancel} title="Cancel" aria-label="Cancel">
+        </ControlButton>
+        <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={onCancel} title="Cancel" aria-label="Cancel">
           <X size={15} />
-        </button>
+        </ControlButton>
       </div>
     </div>
   );
@@ -1245,9 +1261,9 @@ function TemplateMenu({
 
   return (
     <div className="template-menu-root" ref={rootRef}>
-      <button className="icon-button" onClick={() => onOpenChange(!open)} title="Layout templates">
+      <ControlButton className="icon-button" iconOnly pressed={open} onClick={() => onOpenChange(!open)} title="Layout templates">
         <LayoutTemplate size={17} />
-      </button>
+      </ControlButton>
       {open ? (
         <div className="template-menu">
           <div className="template-list">
@@ -1257,23 +1273,23 @@ function TemplateMenu({
                   <span>{template.name}</span>
                   <small>{template.tabs.length} tabs · {template.basePath}</small>
                 </button>
-                <button type="button" className="compact-icon-button" onClick={() => openLoadDialog(template)} title={`Load ${template.name}`} aria-label={`Load ${template.name}`}>
+                <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => openLoadDialog(template)} title={`Load ${template.name}`} aria-label={`Load ${template.name}`}>
                   <Play size={14} />
-                </button>
-                <button type="button" className="compact-icon-button" onClick={() => openRenameDialog(template)} title={`Rename ${template.name}`} aria-label={`Rename ${template.name}`}>
+                </ControlButton>
+                <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => openRenameDialog(template)} title={`Rename ${template.name}`} aria-label={`Rename ${template.name}`}>
                   <Pencil size={14} />
-                </button>
-                <button type="button" className="compact-icon-button danger" onClick={() => void onDelete(template.id)} title={`Delete ${template.name}`} aria-label={`Delete ${template.name}`}>
+                </ControlButton>
+                <ControlButton type="button" className="compact-icon-button danger" tone="danger" size="compact" iconOnly onClick={() => void onDelete(template.id)} title={`Delete ${template.name}`} aria-label={`Delete ${template.name}`}>
                   <Trash2 size={14} />
-                </button>
+                </ControlButton>
               </div>
             ))}
             {templates.length === 0 ? <div className="window-menu-empty">No templates saved.</div> : null}
           </div>
           <div className="menu-footer-actions">
-            <button type="button" className="compact-icon-button" onClick={openSaveDialog} title="Save current layout as template" aria-label="Save current layout as template">
+            <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={openSaveDialog} title="Save current layout as template" aria-label="Save current layout as template">
               <Save size={15} />
-            </button>
+            </ControlButton>
           </div>
           {dialog ? (
             <div className="menu-form-panel">
@@ -1288,23 +1304,23 @@ function TemplateMenu({
               )}
               <div className="menu-form-actions">
                 {dialog.kind === "save" ? (
-                  <button type="button" className="compact-icon-button" onClick={() => void submitSave()} disabled={!name.trim()} title="Save template" aria-label="Save template">
+                  <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void submitSave()} disabled={!name.trim()} title="Save template" aria-label="Save template">
                     <Save size={15} />
-                  </button>
+                  </ControlButton>
                 ) : null}
                 {dialog.kind === "rename" ? (
-                  <button type="button" className="compact-icon-button" onClick={() => void submitRename(dialog.template)} disabled={!name.trim()} title="Rename template" aria-label="Rename template">
+                  <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void submitRename(dialog.template)} disabled={!name.trim()} title="Rename template" aria-label="Rename template">
                     <Save size={15} />
-                  </button>
+                  </ControlButton>
                 ) : null}
                 {dialog.kind === "load" ? (
-                  <button type="button" className="compact-icon-button" onClick={() => void submitApply(dialog.template)} disabled={!projectPath.trim()} title="Load template" aria-label="Load template">
+                  <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void submitApply(dialog.template)} disabled={!projectPath.trim()} title="Load template" aria-label="Load template">
                     <Play size={15} />
-                  </button>
+                  </ControlButton>
                 ) : null}
-                <button type="button" className="compact-icon-button" onClick={() => setDialog(undefined)} title="Cancel" aria-label="Cancel">
+                <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => setDialog(undefined)} title="Cancel" aria-label="Cancel">
                   <X size={15} />
-                </button>
+                </ControlButton>
               </div>
             </div>
           ) : null}
@@ -1531,10 +1547,10 @@ function CreateTabDialog({
           </label>
         ) : null}
         <div className="dialog-actions">
-          <button onClick={onCancel}>Cancel</button>
-          <button className="primary-button" onClick={() => void submit()} disabled={(requiresDirectory && !cwd.trim()) || busy}>
+          <ControlButton onClick={onCancel}>Cancel</ControlButton>
+          <ControlButton className="primary-button" tone="primary" onClick={() => void submit()} disabled={(requiresDirectory && !cwd.trim()) || busy}>
             Create
-          </button>
+          </ControlButton>
         </div>
       </div>
     </div>

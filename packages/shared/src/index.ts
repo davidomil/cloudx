@@ -90,6 +90,21 @@ export interface CloudxConfigResponse {
   values: CloudxConfigValues;
 }
 
+export const CLOUDX_THEME_IDS = ["cloudx-neon", "graphite"] as const;
+
+export type CloudxThemeId = (typeof CLOUDX_THEME_IDS)[number];
+
+export const DEFAULT_CLOUDX_THEME_ID: CloudxThemeId = "cloudx-neon";
+
+export const CLOUDX_THEME_OPTIONS: ConfigFieldOption[] = [
+  { label: "CloudX Neon", value: "cloudx-neon" },
+  { label: "Graphite", value: "graphite" }
+];
+
+export function isCloudxThemeId(value: ConfigValue | undefined): value is CloudxThemeId {
+  return typeof value === "string" && CLOUDX_THEME_IDS.includes(value as CloudxThemeId);
+}
+
 export interface CreateTabRequest {
   pluginId: PluginId;
   cwd?: string;

@@ -22,6 +22,20 @@
   --shadow-neon-secondary: 0 0 5px #ff00ff, 0 0 20px #ff00ff60;
   --shadow-neon-tertiary: 0 0 5px #00d4ff, 0 0 20px #00d4ff60;
   --shadow-danger: 0 0 5px #ff3366, 0 0 18px #ff336650;
+  --terminal-selection-background: #173d33;
+  --control-foreground: var(--color-accent-tertiary);
+  --control-background: transparent;
+  --control-border: var(--color-border);
+  --control-hover-foreground: var(--color-background);
+  --control-hover-background: var(--color-accent-tertiary);
+  --control-hover-border: var(--color-accent-tertiary);
+  --control-hover-shadow: var(--shadow-neon-tertiary);
+  --control-selected-foreground: var(--color-background);
+  --control-selected-background: var(--color-accent);
+  --control-selected-border: var(--color-accent);
+  --control-selected-shadow: var(--shadow-neon-sm);
+  --control-danger-foreground: var(--color-destructive);
+  --control-danger-border: rgb(255 51 102 / 0.45);
   --chamfer-xs: polygon(0 4px, 4px 0, calc(100% - 4px) 0, 100% 4px, 100% calc(100% - 4px), calc(100% - 4px) 100%, 4px 100%, 0 calc(100% - 4px));
   --chamfer-sm: polygon(0 7px, 7px 0, calc(100% - 7px) 0, 100% 7px, 100% calc(100% - 7px), calc(100% - 7px) 100%, 7px 100%, 0 calc(100% - 7px));
   --chamfer: polygon(0 11px, 11px 0, calc(100% - 11px) 0, 100% 11px, 100% calc(100% - 11px), calc(100% - 11px) 100%, 11px 100%, 0 calc(100% - 11px));
@@ -611,6 +625,56 @@ a:hover svg {
   }
 }
 
+.cx-button {
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  color: var(--control-foreground);
+  background: var(--control-background);
+  border: 1px solid var(--control-border);
+  clip-path: var(--chamfer-sm);
+  cursor: pointer;
+}
+
+.cx-button-icon,
+.cx-button-compact {
+  width: 36px;
+  min-width: 36px;
+  padding: 0;
+}
+
+.cx-button-primary,
+.cx-button.is-selected,
+.cx-button.is-pressed,
+.cx-button[aria-pressed="true"] {
+  color: var(--control-selected-foreground);
+  background: var(--control-selected-background);
+  border-color: var(--control-selected-border);
+  box-shadow: var(--control-selected-shadow);
+}
+
+.cx-button-danger {
+  color: var(--control-danger-foreground);
+  border-color: var(--control-danger-border);
+}
+
+.cx-button:hover:not(:disabled) {
+  color: var(--control-hover-foreground);
+  background: var(--control-hover-background);
+  border-color: var(--control-hover-border);
+  box-shadow: var(--control-hover-shadow);
+  transform: translateY(-1px);
+}
+
+.cx-toolbar,
+.cx-segmented-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .icon-button,
 .mic-button,
 .mic-source-button,
@@ -650,6 +714,7 @@ a:hover svg {
 
 .mic-source-button {
   width: 17px;
+  min-width: 17px;
   margin-left: -1px;
   padding: 0;
   color: var(--color-accent);
@@ -1106,14 +1171,14 @@ a:hover svg {
 }
 
 .file-browser-panel {
-  --file-browser-button-hover-background: var(--color-accent-tertiary);
-  --file-browser-button-hover-border: var(--color-accent-tertiary);
-  --file-browser-button-hover-color: var(--color-background);
-  --file-browser-button-hover-shadow: var(--shadow-neon-tertiary);
-  --file-browser-button-selected-background: var(--color-accent);
-  --file-browser-button-selected-border: var(--color-accent);
-  --file-browser-button-selected-color: var(--color-background);
-  --file-browser-button-selected-shadow: var(--shadow-neon);
+  --file-browser-button-hover-background: var(--control-hover-background);
+  --file-browser-button-hover-border: var(--control-hover-border);
+  --file-browser-button-hover-color: var(--control-hover-foreground);
+  --file-browser-button-hover-shadow: var(--control-hover-shadow);
+  --file-browser-button-selected-background: var(--control-selected-background);
+  --file-browser-button-selected-border: var(--control-selected-border);
+  --file-browser-button-selected-color: var(--control-selected-foreground);
+  --file-browser-button-selected-shadow: var(--control-selected-shadow);
 
   height: 100%;
   min-height: 0;

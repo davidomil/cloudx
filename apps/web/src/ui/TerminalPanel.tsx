@@ -5,6 +5,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import type { WorkspaceTab } from "@cloudx/shared";
 import { installTerminalMobileScroller } from "./terminalMobileScroll.js";
 import { rowsFittingTerminalViewport } from "./terminalSizing.js";
+import { readTerminalColorTheme, type TerminalColorTheme } from "./theme.js";
 
 interface TerminalView {
   terminal: Terminal;
@@ -89,12 +90,7 @@ function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement): Terminal
     fontFamily: "JetBrains Mono, SFMono-Regular, Consolas, monospace",
     fontSize: 13,
     lineHeight: 1.25,
-    theme: {
-      background: "#0a0a0f",
-      foreground: "#e0e0e0",
-      cursor: "#00ff88",
-      selectionBackground: "#173d33"
-    }
+    theme: readTerminalColorTheme()
   });
   const fit = new FitAddon();
   terminal.loadAddon(fit);
@@ -122,6 +118,12 @@ function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement): Terminal
   });
 
   return view;
+}
+
+export function applyTerminalColorTheme(theme: TerminalColorTheme): void {
+  for (const view of terminalViews.values()) {
+    view.terminal.options.theme = theme;
+  }
 }
 
 function attachTerminalView(view: TerminalView, container: HTMLDivElement): void {

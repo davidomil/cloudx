@@ -4,6 +4,7 @@ import { ExternalLink, RefreshCw, X } from "lucide-react";
 import type { WorkspaceTab } from "@cloudx/shared";
 
 import { runTabAction } from "../api.js";
+import { ControlButton, ControlLink } from "./Control.js";
 
 interface LocalWebState {
   url?: string;
@@ -80,19 +81,19 @@ export function WebViewerPanel({ tab }: { tab: WorkspaceTab }) {
     <div className="web-viewer-panel">
       <form className="web-viewer-toolbar" onSubmit={(event) => void openUrl(event)}>
         <input value={draftUrl} onChange={(event) => setDraftUrl(event.target.value)} placeholder="http://127.0.0.1:5173?token=..." inputMode="url" autoComplete="url" aria-label="Local website URL" />
-        <button type="submit" disabled={!draftUrl.trim() || busy} title="Open URL">
+        <ControlButton type="submit" disabled={!draftUrl.trim() || busy} title="Open URL">
           Open
-        </button>
-        <button type="button" onClick={() => setReloadKey((current) => current + 1)} disabled={!url} title="Reload viewer">
+        </ControlButton>
+        <ControlButton type="button" iconOnly onClick={() => setReloadKey((current) => current + 1)} disabled={!url} title="Reload viewer">
           <RefreshCw size={15} />
-        </button>
-        <button type="button" onClick={() => void clearUrl()} disabled={!url || busy} title="Clear URL">
+        </ControlButton>
+        <ControlButton type="button" iconOnly onClick={() => void clearUrl()} disabled={!url || busy} title="Clear URL">
           <X size={15} />
-        </button>
+        </ControlButton>
         {url ? (
-          <a className="web-viewer-popout" href={frameSrc} target="_blank" rel="noreferrer" title="Open proxied view in a new browser tab">
+          <ControlLink className="web-viewer-popout" iconOnly href={frameSrc} target="_blank" rel="noreferrer" title="Open proxied view in a new browser tab">
             <ExternalLink size={15} />
-          </a>
+          </ControlLink>
         ) : null}
       </form>
       {error ? <div className="inline-error">{error}</div> : null}

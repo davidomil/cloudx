@@ -2,6 +2,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 
+import { CLOUDX_THEME_OPTIONS, DEFAULT_CLOUDX_THEME_ID } from "@cloudx/shared";
 import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, ConfigValue, PluginDescriptor, PluginId } from "@cloudx/shared";
 
 export const GLOBAL_CONFIG_FIELDS: ConfigFieldDescriptor[] = [
@@ -18,6 +19,14 @@ export const GLOBAL_CONFIG_FIELDS: ConfigFieldDescriptor[] = [
     type: "boolean",
     description: "Enable microphone capture for AI control.",
     defaultValue: true
+  },
+  {
+    key: "themeId",
+    label: "Theme",
+    type: "select",
+    description: "Choose the active CloudX visual theme.",
+    defaultValue: DEFAULT_CLOUDX_THEME_ID,
+    options: CLOUDX_THEME_OPTIONS
   }
 ];
 
