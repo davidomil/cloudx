@@ -230,25 +230,40 @@ async function captureScreenshots(baseUrl, tabs, demoRoot, forbiddenText) {
 
   const browser = await chromium.launch({ headless: true });
   try {
-    const context = await browser.newContext({ viewport: { width: 1440, height: 960 } });
-    const page = await context.newPage();
-    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
-    await page.locator(".workspace-pane").first().waitFor({ timeout: 10_000 });
-    await page.locator('[data-pane-id="pane-codex"]').getByText("Cloudx Codex demo").waitFor({ timeout: 10_000 });
-    await page.locator('[data-pane-id="pane-files"]').getByRole("button", { name: /README\.md/ }).click();
-    await page.frameLocator(".web-viewer-frame").locator(".demo-dashboard").waitFor({ timeout: 10_000 });
-    await page.getByRole("button", { name: /Codex Work/ }).click();
-    await page.locator('[data-pane-id="pane-codex"]').click();
-    await normalizeVolatileUi(page, [{ from: demoRoot, to: "/workspace" }]);
-    await assertPublicSafe(page, forbiddenText);
-
-    await page.screenshot({
+    const desktopPage = await prepareScreenshotPage(browser, baseUrl, demoRoot, forbiddenText, {
+      viewport: { width: 1440, height: 960 }
+    });
+    await desktopPage.screenshot({
       path: path.join(screenshotDir, "cloudx-split-panes.png"),
+      fullPage: false
+    });
+
+    const mobilePage = await prepareScreenshotPage(browser, baseUrl, demoRoot, forbiddenText, {
+      viewport: { width: 390, height: 844 },
+      isMobile: true,
+      hasTouch: true
+    });
+    await mobilePage.screenshot({
+      path: path.join(screenshotDir, "cloudx-mobile-portrait.png"),
       fullPage: false
     });
   } finally {
     await browser.close();
   }
+}
+
+async function prepareScreenshotPage(browser, baseUrl, demoRoot, forbiddenText, contextOptions) {
+  const context = await browser.newContext(contextOptions);
+  const page = await context.newPage();
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await page.locator(".workspace-pane").first().waitFor({ timeout: 10_000 });
+  await page.locator('[data-pane-id="pane-codex"]').getByText("Cloudx Codex demo").waitFor({ timeout: 10_000 });
+  await page.locator('[data-pane-id="pane-files"] .file-list').getByRole("button", { name: /README\.md/ }).click();
+  await page.frameLocator(".web-viewer-frame").locator(".demo-dashboard").waitFor({ timeout: 10_000 });
+  await page.locator('[data-pane-id="pane-codex"]').click();
+  await normalizeVolatileUi(page, [{ from: demoRoot, to: "/workspace" }]);
+  await assertPublicSafe(page, forbiddenText);
+  return page;
 }
 
 function demoLayout(tabs) {
@@ -283,8 +298,8 @@ async function normalizeVolatileUi(page, replacements) {
     if (icon) {
       element.appendChild(icon);
     }
-    element.append(" 127.0.0.1:3001");
-    element.setAttribute("title", "Server connected: 127.0.0.1:3001");
+    element.setAttribute("title", "connected: 127.0.0.1:3001");
+    element.setAttribute("aria-label", "connected: 127.0.0.1:3001");
   });
   await page.locator(".web-viewer-toolbar input").evaluate((element) => {
     if (element instanceof HTMLInputElement) {
@@ -310,6 +325,53 @@ async function normalizeVolatileUi(page, replacements) {
       }
     }
   }, { replacements });
+  await page.locator('[data-pane-id="pane-codex"] .xterm-rows > div, [data-pane-id="pane-codex"] .xterm-accessibility-tree > div').evaluateAll((rows, { replacements }) => {
+    for (const row of rows) {
+      let value = row.textContent ?? "";
+      for (const replacement of replacements) {
+        value = value.split(replacement.from).join(replacement.to);
+      }
+      if (value !== row.textContent) {
+        row.textContent = value;
+      }
+    }
+  }, { replacements });
+  await page.locator('[data-pane-id="pane-codex"]').evaluate((pane, { replacements }) => {
+    for (const element of pane.querySelectorAll("*")) {
+      let value = element.textContent ?? "";
+      const original = value;
+      for (const replacement of replacements) {
+        value = value.split(replacement.from).join(replacement.to);
+      }
+      if (value !== original && original.trim().startsWith("cwd:")) {
+        element.textContent = value;
+      }
+    }
+  }, { replacements });
+  await page.locator('[data-pane-id="pane-codex"] .terminal-panel').evaluate((panel) => {
+    const screen = panel.querySelector(".xterm-screen");
+    if (!(panel instanceof HTMLElement) || !(screen instanceof HTMLElement)) {
+      return;
+    }
+    const panelRect = panel.getBoundingClientRect();
+    const screenRect = screen.getBoundingClientRect();
+    const rowCount = Math.max(1, panel.querySelectorAll(".xterm-rows > div").length || 24);
+    const rowHeight = screenRect.height / rowCount;
+    const overlay = document.createElement("div");
+    overlay.textContent = "cwd: /workspace";
+    overlay.style.position = "absolute";
+    overlay.style.left = `${screenRect.left - panelRect.left}px`;
+    overlay.style.top = `${screenRect.top - panelRect.top + rowHeight}px`;
+    overlay.style.width = `${screenRect.width}px`;
+    overlay.style.height = `${rowHeight}px`;
+    overlay.style.zIndex = "3";
+    overlay.style.overflow = "hidden";
+    overlay.style.background = "#05050a";
+    overlay.style.color = "#e6edf3";
+    overlay.style.font = "13px / 1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+    overlay.style.letterSpacing = "0";
+    panel.appendChild(overlay);
+  });
 }
 
 async function assertPublicSafe(page, extraForbiddenText) {
@@ -317,7 +379,8 @@ async function assertPublicSafe(page, extraForbiddenText) {
   const forbidden = [os.homedir(), process.env.USER, process.env.HOSTNAME, "/home/", "token=", ...extraForbiddenText].filter(Boolean);
   for (const value of forbidden) {
     if (bodyText.includes(value)) {
-      throw new Error(`Screenshot page contains private text: ${value}`);
+      const excerpt = bodyText.split("\n").find((line) => line.includes(value)) ?? "";
+      throw new Error(`Screenshot page contains private text: ${value}\n${excerpt}`);
     }
   }
 }

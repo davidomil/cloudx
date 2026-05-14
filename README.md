@@ -23,6 +23,8 @@ names, and dashboard tokens. Regenerate them with `npm run docs:screenshots`.
 
 ![Cloudx workspace window showing a Codex terminal, file browser, and local dashboard](docs/screenshots/cloudx-split-panes.png)
 
+![Cloudx mobile portrait workspace showing stacked panes and the bottom voice command bar](docs/screenshots/cloudx-mobile-portrait.png)
+
 ## Features
 
 - Responsive desktop and phone UI tuned for quick mobile sessions.
