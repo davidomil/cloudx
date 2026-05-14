@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import fs from "node:fs/promises";
@@ -8,24 +8,26 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(path.join(repoRoot, "package.json"));
 const { chromium } = require("@playwright/test");
+const execFileAsync = promisify(execFile);
 
 const screenshotDir = path.join(repoRoot, "docs", "screenshots");
 
 async function main() {
   const demoRoot = await createDemoWorkspace();
-  const codexFixtureBin = await createCodexFixtureBin(demoRoot);
+  const codexFixtureBin = await createCodexFixtureBin();
   const demoSite = await startDemoSite();
   const cloudx = await startCloudxServer(demoRoot, codexFixtureBin);
 
   try {
     const tabs = await createDemoTabs(cloudx.baseUrl, demoRoot, demoSite.url);
-    await captureScreenshots(cloudx.baseUrl, tabs, [demoRoot]);
+    await captureScreenshots(cloudx.baseUrl, tabs, demoRoot, [demoRoot]);
   } finally {
-    await Promise.allSettled([cloudx.stop(), closeServer(demoSite.server), fs.rm(demoRoot, { recursive: true, force: true })]);
+    await Promise.allSettled([cloudx.stop(), closeServer(demoSite.server), fs.rm(codexFixtureBin, { recursive: true, force: true }), fs.rm(demoRoot, { recursive: true, force: true })]);
   }
 }
 
@@ -41,7 +43,9 @@ async function createDemoWorkspace() {
       "This file is opened through the Cloudx file browser.",
       "",
       "- Inspect files without leaving the pane layout.",
+      "- Review changed files with Git diff badges.",
       "- Keep a local dashboard open beside the workspace.",
+      "- Save and reopen workspace windows as layout templates.",
       "- Route voice commands through the plugin control layer.",
       ""
     ].join("\n")
@@ -59,13 +63,22 @@ async function createDemoWorkspace() {
   );
   await fs.writeFile(path.join(root, "docs", "notes.md"), "# Notes\n\nPublic screenshot fixture.\n");
   await fs.writeFile(path.join(root, "src", "example.ts"), "export const status = 'ready';\n");
+  await initializeDemoGitRepository(root);
+  await fs.appendFile(path.join(root, "README.md"), "\nStatus: README changed for the screenshot.\n");
   return root;
 }
 
-async function createCodexFixtureBin(demoRoot) {
-  const binDir = path.join(demoRoot, ".bin");
+async function initializeDemoGitRepository(root) {
+  await execFileAsync("git", ["init"], { cwd: root });
+  await execFileAsync("git", ["config", "user.email", "demo@example.invalid"], { cwd: root });
+  await execFileAsync("git", ["config", "user.name", "Cloudx Demo"], { cwd: root });
+  await execFileAsync("git", ["add", "."], { cwd: root });
+  await execFileAsync("git", ["commit", "-m", "Initial demo workspace"], { cwd: root });
+}
+
+async function createCodexFixtureBin() {
+  const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-readme-bin-"));
   const codexPath = path.join(binDir, "codex");
-  await fs.mkdir(binDir, { recursive: true });
   await fs.writeFile(
     codexPath,
     [
@@ -140,7 +153,7 @@ async function startCloudxServer(demoRoot, codexFixtureBin) {
     env: {
       ...process.env,
       CLOUDX_APP_SERVER_ENABLED: "false",
-      CLOUDX_ALLOWED_ROOTS: [demoRoot, "/"].join(path.delimiter),
+      CLOUDX_ALLOWED_ROOTS: demoRoot,
       CLOUDX_ASR_URL: "http://127.0.0.1:9",
       CLOUDX_DATA_DIR: dataDir,
       CLOUDX_HOST: "127.0.0.1",
@@ -180,19 +193,30 @@ async function startCloudxServer(demoRoot, codexFixtureBin) {
 async function createDemoTabs(baseUrl, demoRoot, demoSiteUrl) {
   const codexTab = await postJson(`${baseUrl}/api/tabs`, {
     pluginId: "codex-terminal",
-    cwd: "/",
-    title: "CDX - demo"
+    cwd: demoRoot,
+    title: "Codex - workspace"
   });
   const filesTab = await postJson(`${baseUrl}/api/tabs`, {
     pluginId: "file-browser",
     cwd: demoRoot,
-    title: "FB - demo"
+    title: "Files - git diff"
   });
   const webTab = await postJson(`${baseUrl}/api/tabs`, {
     pluginId: "local-web",
-    title: "WEB - dashboard",
+    title: "Dashboard",
     initialInput: { url: demoSiteUrl }
   });
+  const workspace = await getJson(`${baseUrl}/api/workspace`);
+  await patchJson(`${baseUrl}/api/windows/${workspace.activeWindowId}`, {
+    name: "Codex Work",
+    defaultCwd: demoRoot,
+    layout: demoLayout({ codexTab: codexTab.tab, filesTab: filesTab.tab, webTab: webTab.tab })
+  });
+  await postJson(`${baseUrl}/api/windows`, {
+    name: "Docs Review",
+    defaultCwd: demoRoot
+  });
+  await postJson(`${baseUrl}/api/windows/${workspace.activeWindowId}/active`, {});
   await postJson(`${baseUrl}/api/tabs/${codexTab.tab.id}/active`, {});
   return {
     codexTab: codexTab.tab,
@@ -201,27 +225,21 @@ async function createDemoTabs(baseUrl, demoRoot, demoSiteUrl) {
   };
 }
 
-async function captureScreenshots(baseUrl, tabs, forbiddenText) {
+async function captureScreenshots(baseUrl, tabs, demoRoot, forbiddenText) {
   await fs.mkdir(screenshotDir, { recursive: true });
 
   const browser = await chromium.launch({ headless: true });
   try {
     const context = await browser.newContext({ viewport: { width: 1440, height: 960 } });
-    await context.addInitScript(
-      ({ layout }) => {
-        window.localStorage.setItem("cloudx-layout-v2", JSON.stringify(layout));
-      },
-      { layout: demoLayout(tabs) }
-    );
-
     const page = await context.newPage();
     await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
     await page.locator(".workspace-pane").first().waitFor({ timeout: 10_000 });
     await page.locator('[data-pane-id="pane-codex"]').getByText("Cloudx Codex demo").waitFor({ timeout: 10_000 });
     await page.locator('[data-pane-id="pane-files"]').getByRole("button", { name: /README\.md/ }).click();
     await page.frameLocator(".web-viewer-frame").locator(".demo-dashboard").waitFor({ timeout: 10_000 });
+    await page.getByRole("button", { name: /Codex Work/ }).click();
     await page.locator('[data-pane-id="pane-codex"]').click();
-    await normalizeVolatileUi(page);
+    await normalizeVolatileUi(page, [{ from: demoRoot, to: "/workspace" }]);
     await assertPublicSafe(page, forbiddenText);
 
     await page.screenshot({
@@ -258,7 +276,7 @@ function demoLayout(tabs) {
   };
 }
 
-async function normalizeVolatileUi(page) {
+async function normalizeVolatileUi(page, replacements) {
   await page.locator(".connection-status").evaluate((element) => {
     const icon = element.querySelector("svg");
     element.replaceChildren();
@@ -273,6 +291,25 @@ async function normalizeVolatileUi(page) {
       element.value = "http://127.0.0.1:5173/";
     }
   });
+  await page.evaluate(({ replacements }) => {
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let node = walker.nextNode();
+    while (node) {
+      let value = node.nodeValue ?? "";
+      for (const replacement of replacements) {
+        value = value.split(replacement.from).join(replacement.to);
+      }
+      node.nodeValue = value;
+      node = walker.nextNode();
+    }
+    for (const element of document.querySelectorAll("input, textarea")) {
+      if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+        for (const replacement of replacements) {
+          element.value = element.value.split(replacement.from).join(replacement.to);
+        }
+      }
+    }
+  }, { replacements });
 }
 
 async function assertPublicSafe(page, extraForbiddenText) {
@@ -291,6 +328,26 @@ async function postJson(url, body) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body)
   });
+  if (!response.ok) {
+    throw new Error(`${url} failed with ${response.status}: ${await response.text()}`);
+  }
+  return response.json();
+}
+
+async function patchJson(url, body) {
+  const response = await fetch(url, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!response.ok) {
+    throw new Error(`${url} failed with ${response.status}: ${await response.text()}`);
+  }
+  return response.json();
+}
+
+async function getJson(url) {
+  const response = await fetch(url);
   if (!response.ok) {
     throw new Error(`${url} failed with ${response.status}: ${await response.text()}`);
   }

@@ -20,15 +20,26 @@ tailnet only.
 These screenshots use a throwaway demo workspace and avoid local paths, host
 names, and dashboard tokens. Regenerate them with `npm run docs:screenshots`.
 
-![Cloudx split pane workspace showing a Codex terminal, file browser, and local dashboard](docs/screenshots/cloudx-split-panes.png)
+![Cloudx workspace window showing a Codex terminal, file browser, and local dashboard](docs/screenshots/cloudx-split-panes.png)
 
 ## Features
 
 - Responsive desktop and phone UI.
+- Server-backed workspace windows with independent pane layouts, default work
+  directories, quick name search, and AI-assisted context search.
 - tmux-like panes with movable plugin tabs.
+- Layout templates that save the current pane/tab arrangement and reopen it on a
+  different project path.
 - Codex terminal and standard shell terminal plugins.
-- File browser plugin with voice-exposed read/write actions.
+- File browser plugin with voice-exposed read/write actions, active file search,
+  optional Git setup controls, changed-file badges in the tree, and rendered
+  per-file diffs.
+- Worktree manager plugin for creating or cloning a bare repository and managing
+  project worktree folders.
 - Local web plugin for dashboards such as Understand Anything.
+- Dynamic settings for global AI/microphone controls and plugin-owned options
+  such as file-browser Git diff visibility.
+- Shared path autocomplete for tab, window, and template directory fields.
 - Voice control using browser audio, local Faster Whisper, and
   `gpt-5.3-codex-spark`.
 - HTTPS on port `3001` with a local self-signed certificate for microphone
