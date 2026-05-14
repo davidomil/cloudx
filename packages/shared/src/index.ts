@@ -90,7 +90,7 @@ export interface CloudxConfigResponse {
   values: CloudxConfigValues;
 }
 
-export const CLOUDX_THEME_IDS = ["cloudx-neon", "graphite"] as const;
+export const CLOUDX_THEME_IDS = ["cloudx-neon", "minimalist-dark"] as const;
 
 export type CloudxThemeId = (typeof CLOUDX_THEME_IDS)[number];
 
@@ -98,7 +98,7 @@ export const DEFAULT_CLOUDX_THEME_ID: CloudxThemeId = "cloudx-neon";
 
 export const CLOUDX_THEME_OPTIONS: ConfigFieldOption[] = [
   { label: "CloudX Neon", value: "cloudx-neon" },
-  { label: "Graphite", value: "graphite" }
+  { label: "Minimalist Dark", value: "minimalist-dark" }
 ];
 
 export function isCloudxThemeId(value: ConfigValue | undefined): value is CloudxThemeId {

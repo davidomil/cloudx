@@ -21,7 +21,7 @@ describe("ConfigService", () => {
     });
 
     await service.update({
-      global: { aiControlEnabled: false, themeId: "graphite" },
+      global: { aiControlEnabled: false, themeId: "minimalist-dark" },
       plugins: { "file-browser": { showGitDiff: false } }
     });
 
@@ -30,7 +30,7 @@ describe("ConfigService", () => {
     const reloaded = new ConfigService(dataDir, () => [fileBrowserDescriptor()]);
     expect(reloaded.getResponse()).toMatchObject({
       values: {
-        global: { aiControlEnabled: false, microphoneEnabled: true, themeId: "graphite" },
+        global: { aiControlEnabled: false, microphoneEnabled: true, themeId: "minimalist-dark" },
         plugins: { "file-browser": { showGitDiff: false } }
       }
     });

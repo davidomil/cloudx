@@ -48,8 +48,9 @@ describe("parseVoiceActionPlan", () => {
 
 describe("CloudX themes", () => {
   it("exposes config-safe theme options", () => {
-    expect(CLOUDX_THEME_OPTIONS.map((option) => option.value)).toEqual(["cloudx-neon", "graphite"]);
-    expect(isCloudxThemeId("graphite")).toBe(true);
+    expect(CLOUDX_THEME_OPTIONS.map((option) => option.value)).toEqual(["cloudx-neon", "minimalist-dark"]);
+    expect(isCloudxThemeId("minimalist-dark")).toBe(true);
+    expect(isCloudxThemeId("graphite")).toBe(false);
     expect(isCloudxThemeId("missing")).toBe(false);
   });
 });

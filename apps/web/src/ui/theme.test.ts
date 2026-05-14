@@ -16,10 +16,12 @@ describe("theme", () => {
   it("applies theme tokens to the root element", () => {
     const root = document.createElement("div");
 
-    expect(applyCloudxTheme("graphite", root)).toBe("graphite");
+    expect(applyCloudxTheme("minimalist-dark", root)).toBe("minimalist-dark");
 
-    expect(root.dataset.theme).toBe("graphite");
-    expect(root.style.getPropertyValue("--color-background")).toBe("#0c0f12");
+    expect(root.dataset.theme).toBe("minimalist-dark");
+    expect(root.style.getPropertyValue("--color-background")).toBe("#0A0A0F");
+    expect(root.style.getPropertyValue("--color-accent")).toBe("#F59E0B");
+    expect(root.style.getPropertyValue("--chamfer")).toBe("inset(0 round 12px)");
   });
 
   it("reads terminal colors from CSS variables", () => {

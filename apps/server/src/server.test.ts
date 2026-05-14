@@ -74,14 +74,14 @@ describe("buildServer", () => {
         method: "PATCH",
         url: "/api/config",
         payload: {
-          global: { aiControlEnabled: false, themeId: "graphite" },
+          global: { aiControlEnabled: false, themeId: "minimalist-dark" },
           plugins: { "file-browser": { showGitDiff: false } }
         }
       });
 
       expect(updated.statusCode).toBe(200);
       expect(updated.json().values.global.aiControlEnabled).toBe(false);
-      expect(updated.json().values.global.themeId).toBe("graphite");
+      expect(updated.json().values.global.themeId).toBe("minimalist-dark");
       expect(updated.json().values.plugins["file-browser"].showGitDiff).toBe(false);
       await expect(fs.readFile(path.join(config.dataDir, "config.json"), "utf8")).resolves.toContain("showGitDiff");
     } finally {
