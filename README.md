@@ -19,7 +19,7 @@ tailnet only.
 ## Screenshots
 
 These screenshots use a throwaway demo workspace and avoid local paths, host
-names, and dashboard tokens. Regenerate them with `npm run docs:screenshots`.
+names, and dashboard tokens.
 
 ### Desktop Workspace
 
