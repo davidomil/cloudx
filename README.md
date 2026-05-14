@@ -1,9 +1,10 @@
 # Cloudx
 
 Cloudx is a local-first web workbench for running Codex CLI sessions from a
-laptop or phone. It gives you split panes, plugin tabs, terminal sessions, file
-tools, local dashboard viewing, and voice control through local Faster Whisper
-plus a restricted Codex planner.
+laptop or phone, with a mobile-optimized interface for work on the go. It gives
+you split panes, plugin tabs, terminal sessions, file tools, local dashboard
+viewing, and voice control through local Faster Whisper plus a restricted Codex
+planner.
 
 ## Status And Disclosure
 
@@ -24,7 +25,7 @@ names, and dashboard tokens. Regenerate them with `npm run docs:screenshots`.
 
 ## Features
 
-- Responsive desktop and phone UI.
+- Responsive desktop and phone UI tuned for quick mobile sessions.
 - Server-backed workspace windows with independent pane layouts, default work
   directories, quick name search, and AI-assisted context search.
 - tmux-like panes with movable plugin tabs.

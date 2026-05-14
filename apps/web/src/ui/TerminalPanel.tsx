@@ -3,6 +3,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 
 import type { WorkspaceTab } from "@cloudx/shared";
+import { rowsFittingTerminalViewport } from "./terminalSizing.js";
 
 interface TerminalView {
   terminal: Terminal;
@@ -150,11 +151,24 @@ function fitAndResize(view: TerminalView, focus = false): void {
     view.terminal.options.fontSize = fontSize;
   }
   view.fit.fit();
+  trimTerminalRowsToViewport(view.terminal);
   if (focus) {
     view.terminal.focus();
   }
   if (view.socket.readyState === WebSocket.OPEN) {
     view.socket.send(JSON.stringify({ type: "resize", cols: view.terminal.cols, rows: view.terminal.rows }));
+  }
+}
+
+function trimTerminalRowsToViewport(terminal: Terminal): void {
+  const viewport = terminal.element?.querySelector(".xterm-viewport");
+  const screen = terminal.element?.querySelector(".xterm-screen");
+  if (!(viewport instanceof HTMLElement) || !(screen instanceof HTMLElement)) {
+    return;
+  }
+  const nextRows = rowsFittingTerminalViewport(terminal.rows, viewport.getBoundingClientRect().height, screen.getBoundingClientRect().height);
+  if (nextRows < terminal.rows) {
+    terminal.resize(terminal.cols, nextRows);
   }
 }
 

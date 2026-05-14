@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import { Diff, Hunk, parseDiff, type DiffType, type FileData, type HunkData, type ViewType } from "react-diff-view";
 import "react-diff-view/style/index.css";
 import { FileDiff, FileText, Folder, GitBranch, GitFork, GitPullRequest, RefreshCw, Search } from "lucide-react";
@@ -59,6 +59,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   const [searchMode, setSearchMode] = useState<FileSearchMode>("all");
   const [searchGlob, setSearchGlob] = useState("");
   const [searchResult, setSearchResult] = useState<FileSearchResult | undefined>();
+  const [searchExpanded, setSearchExpanded] = useState(false);
   const [error, setError] = useState<string | undefined>();
   const showGitDiff = config.showGitDiff !== false;
   const activeSearchQuery = searchQuery.trim();
@@ -295,9 +296,11 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
         mode={searchMode}
         glob={searchGlob}
         busy={Boolean(searchBusyAction)}
+        expanded={searchExpanded}
         onQueryChange={setSearchQuery}
         onModeChange={setSearchMode}
         onGlobChange={setSearchGlob}
+        onExpandedChange={setSearchExpanded}
         onSearch={() => void runSearch()}
       />
       {showGitDiff ? <GitRepositoryBar
@@ -384,44 +387,60 @@ function SearchBar({
   mode,
   glob,
   busy,
+  expanded,
   onQueryChange,
   onModeChange,
   onGlobChange,
+  onExpandedChange,
   onSearch
 }: {
   query: string;
   mode: FileSearchMode;
   glob: string;
   busy: boolean;
+  expanded: boolean;
   onQueryChange: (value: string) => void;
   onModeChange: (value: FileSearchMode) => void;
   onGlobChange: (value: string) => void;
+  onExpandedChange: (value: boolean) => void;
   onSearch: () => void;
 }) {
+  const controlsId = useId();
+  const trimmedQuery = query.trim();
+  const statusLabel = busy ? "Searching files" : trimmedQuery ? `Search active: ${trimmedQuery}` : "Search files";
+
   return (
     <form
-      className="file-search-bar"
+      className={`file-search-bar ${expanded ? "expanded" : "collapsed"} ${trimmedQuery ? "has-query" : ""}`}
       onSubmit={(event) => {
         event.preventDefault();
         onSearch();
       }}
     >
-      <span className="file-search-status" title={busy ? "Searching files" : "Search is live"} aria-label={busy ? "Searching files" : "Search is live"} aria-busy={busy}>
-        <Search size={15} className={busy ? "spinning" : ""} />
-      </span>
-      <input value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder={mode === "filename" ? "Find filenames" : mode === "content" ? "Search contents" : "Search files"} aria-label="Search files" />
-      <div className="file-search-mode" role="group" aria-label="File search mode">
-        <button type="button" className={mode === "all" ? "active" : ""} onClick={() => onModeChange("all")}>
-          All
-        </button>
-        <button type="button" className={mode === "content" ? "active" : ""} onClick={() => onModeChange("content")}>
-          Contents
-        </button>
-        <button type="button" className={mode === "filename" ? "active" : ""} onClick={() => onModeChange("filename")}>
-          Names
-        </button>
+      <button type="button" className="file-search-toggle" aria-expanded={expanded} aria-controls={controlsId} onClick={() => onExpandedChange(!expanded)}>
+        <span className="file-search-status" title={statusLabel} aria-label={statusLabel} aria-busy={busy}>
+          <Search size={15} className={busy ? "spinning" : ""} />
+        </span>
+        <span>{trimmedQuery || "Search files"}</span>
+      </button>
+      <div id={controlsId} className="file-search-controls">
+        <span className="file-search-status" title={busy ? "Searching files" : "Search is live"} aria-label={busy ? "Searching files" : "Search is live"} aria-busy={busy}>
+          <Search size={15} className={busy ? "spinning" : ""} />
+        </span>
+        <input value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder={mode === "filename" ? "Find filenames" : mode === "content" ? "Search contents" : "Search files"} aria-label="Search files" />
+        <div className="file-search-mode" role="group" aria-label="File search mode">
+          <button type="button" className={mode === "all" ? "active" : ""} onClick={() => onModeChange("all")}>
+            All
+          </button>
+          <button type="button" className={mode === "content" ? "active" : ""} onClick={() => onModeChange("content")}>
+            Contents
+          </button>
+          <button type="button" className={mode === "filename" ? "active" : ""} onClick={() => onModeChange("filename")}>
+            Names
+          </button>
+        </div>
+        <input className="file-search-glob" value={glob} onChange={(event) => onGlobChange(event.target.value)} placeholder="Glob" aria-label="Search glob" />
       </div>
-      <input className="file-search-glob" value={glob} onChange={(event) => onGlobChange(event.target.value)} placeholder="Glob" aria-label="Search glob" />
     </form>
   );
 }

@@ -1,0 +1,9 @@
+{
+  "name": "Cloudx",
+  "short_name": "Cloudx",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "theme_color": "#0a0a0f",
+  "background_color": "#0a0a0f"
+}

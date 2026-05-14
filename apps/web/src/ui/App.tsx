@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement } from "react";
-import { AlertTriangle, Bot, ChevronDown, Columns2, GitBranch, LayoutTemplate, Mic, MicOff, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement, type RefObject } from "react";
+import { AlertTriangle, Bot, ChevronDown, Columns2, GitBranch, LayoutTemplate, Mic, MicOff, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
 
 import type { CloudxConfigResponse, CloudxConfigValues, ConfigValue, CreateTabRequest, PluginDescriptor, PluginId, TabLayoutState, WorkspaceLayoutTemplate, WorkspaceStateResponse, WorkspaceTab, WorkspaceTabsUpdate, WorkspaceWindow } from "@cloudx/shared";
 
@@ -50,6 +50,7 @@ import { shouldSubmitVoiceConsoleKey } from "./keyboard.js";
 import { SettingsDialog } from "./SettingsDialog.js";
 import { clearFocusedAttention, isTabFocused, updateAttentionTabs } from "./tabAttention.js";
 import { disposeTerminalView, disposeTerminalViewsExcept, TerminalPanel } from "./TerminalPanel.js";
+import { attemptPortraitOrientationLock } from "./orientationLock.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
 import { applyVoiceWorkspaceResults, buildClientVoiceContext, voiceConsoleValue } from "./voiceWorkspace.js";
 import { WebViewerPanel } from "./WebViewerPanel.js";
@@ -58,6 +59,66 @@ import { WorktreeManagerPanel } from "./WorktreeManagerPanel.js";
 type ConnectionStatus = "checking" | "connected" | "disconnected";
 
 const AUDIO_INPUT_KEY = "cloudx-audio-input-v1";
+const MOBILE_ACTIONS_QUERY = "(max-width: 760px), all and (hover: none) and (pointer: coarse) and (max-width: 960px) and (max-height: 520px)";
+
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() => (typeof window === "undefined" ? false : window.matchMedia(query).matches));
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const mediaQuery = window.matchMedia(query);
+    const updateMatches = () => setMatches(mediaQuery.matches);
+    updateMatches();
+    mediaQuery.addEventListener("change", updateMatches);
+    return () => mediaQuery.removeEventListener("change", updateMatches);
+  }, [query]);
+  return matches;
+}
+
+function usePortraitOrientationLock() {
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const requestLock = () => {
+      void attemptPortraitOrientationLock(window, document);
+    };
+    requestLock();
+    document.addEventListener("pointerdown", requestLock, { passive: true });
+    document.addEventListener("visibilitychange", requestLock);
+    window.screen.orientation?.addEventListener("change", requestLock);
+    return () => {
+      document.removeEventListener("pointerdown", requestLock);
+      document.removeEventListener("visibilitychange", requestLock);
+      window.screen.orientation?.removeEventListener("change", requestLock);
+    };
+  }, []);
+}
+
+function useMobileZoomSuppression() {
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia("(hover: none) and (pointer: coarse)").matches) {
+      return;
+    }
+    const preventGestureZoom = (event: Event) => event.preventDefault();
+    const preventMultiTouchZoom = (event: TouchEvent) => {
+      if (event.touches.length > 1) {
+        event.preventDefault();
+      }
+    };
+    document.addEventListener("gesturestart", preventGestureZoom, { passive: false } as AddEventListenerOptions);
+    document.addEventListener("gesturechange", preventGestureZoom, { passive: false } as AddEventListenerOptions);
+    document.addEventListener("gestureend", preventGestureZoom, { passive: false } as AddEventListenerOptions);
+    document.addEventListener("touchmove", preventMultiTouchZoom, { passive: false });
+    return () => {
+      document.removeEventListener("gesturestart", preventGestureZoom);
+      document.removeEventListener("gesturechange", preventGestureZoom);
+      document.removeEventListener("gestureend", preventGestureZoom);
+      document.removeEventListener("touchmove", preventMultiTouchZoom);
+    };
+  }, []);
+}
 
 export function App() {
   const initialLayout = useMemo(() => defaultLayout(), []);
@@ -72,6 +133,7 @@ export function App() {
   const [createOpen, setCreateOpen] = useState(false);
   const [windowMenuOpen, setWindowMenuOpen] = useState(false);
   const [templateMenuOpen, setTemplateMenuOpen] = useState(false);
+  const [mobileActionsOpen, setMobileActionsOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [createTargetPaneId, setCreateTargetPaneId] = useState<string | undefined>();
   const [error, setError] = useState<string | undefined>();
@@ -93,7 +155,9 @@ export function App() {
   const createTargetPaneIdRef = useRef<string | undefined>(undefined);
   const persistLayoutTimerRef = useRef<number | undefined>(undefined);
   const audioSessionRef = useRef<VoiceAudioStreamSession | undefined>(undefined);
-  const micControlRef = useRef<HTMLDivElement | null>(null);
+  const topbarMicControlRef = useRef<HTMLDivElement | null>(null);
+  const footerMicControlRef = useRef<HTMLDivElement | null>(null);
+  const mobileActionsRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     void refresh();
@@ -164,7 +228,8 @@ export function App() {
       return;
     }
     function closeAudioInputMenuOnOutsidePointer(event: PointerEvent) {
-      if (micControlRef.current?.contains(event.target as Node)) {
+      const target = event.target as Node;
+      if (topbarMicControlRef.current?.contains(target) || footerMicControlRef.current?.contains(target)) {
         return;
       }
       setAudioInputMenuOpen(false);
@@ -172,6 +237,8 @@ export function App() {
     document.addEventListener("pointerdown", closeAudioInputMenuOnOutsidePointer);
     return () => document.removeEventListener("pointerdown", closeAudioInputMenuOnOutsidePointer);
   }, [audioInputMenuOpen]);
+
+  useOutsidePointerDismiss(mobileActionsOpen, mobileActionsRef, () => setMobileActionsOpen(false));
 
   useEffect(() => {
     if (!findPane(layout.root, layout.activePaneId)) {
@@ -191,13 +258,17 @@ export function App() {
   const pluginById = useMemo(() => new Map(plugins.map((plugin) => [plugin.id, plugin])), [plugins]);
   const panes = useMemo(() => listPanes(layout.root), [layout.root]);
   const activePaneId = layout.activePaneId;
-  const serverLabel = window.location.host || "server";
+  const serverLabel = window.location.host || "Cloudx";
   const activeTab = activeTabId ? tabById.get(activeTabId) : undefined;
   const activeWindow = activeWindowId ? windows.find((window) => window.id === activeWindowId) : windows[0];
   const microphoneUnavailableReason = getMicrophoneUnavailableReason();
   const aiControlEnabled = config?.values.global.aiControlEnabled !== false;
   const microphoneEnabled = aiControlEnabled && config?.values.global.microphoneEnabled !== false;
   const voiceConsoleText = voiceConsoleValue(voiceState, manualTranscript, voiceMessage, liveTranscript);
+  const mobileActionsEnabled = useMediaQuery(MOBILE_ACTIONS_QUERY);
+
+  usePortraitOrientationLock();
+  useMobileZoomSuppression();
 
   async function refresh() {
     setConnectionStatus("checking");
@@ -284,11 +355,12 @@ export function App() {
   }
 
   function split(direction: LayoutDirection) {
-    updateLayout((current) => splitPane(current, direction, () => `pane-${crypto.randomUUID()}`, () => `split-${crypto.randomUUID()}`));
+    const effectiveDirection = mobileActionsEnabled ? "column" : direction;
+    updateLayout((current) => splitPane(current, effectiveDirection, () => `pane-${crypto.randomUUID()}`, () => `split-${crypto.randomUUID()}`));
   }
 
-  function resizePane(splitId: string, deltaPixels: number, containerPixels: number) {
-    updateLayout((current) => resizeSplit(current, splitId, deltaPixels, containerPixels));
+  function resizePane(splitId: string, deltaPixels: number, containerPixels: number, startSizes: [number, number]) {
+    updateLayout((current) => resizeSplit(current, splitId, deltaPixels, containerPixels, startSizes));
   }
 
   function selectPaneForCreation(paneId: string) {
@@ -588,6 +660,52 @@ export function App() {
     setTemplateMenuOpen(false);
   }
 
+  function renderMicControl(className: string, ref: RefObject<HTMLDivElement | null>, iconSize: number) {
+    if (!microphoneEnabled) {
+      return null;
+    }
+    return (
+      <div className={`mic-control ${className}`} ref={ref}>
+        <button className={`mic-button ${voiceState} ${microphoneUnavailableReason ? "unavailable" : ""}`} onClick={() => void handleMic()} title={microphoneUnavailableReason ?? (voiceState === "recording" ? "Stop voice command" : "Record voice command")}>
+          {voiceState === "recording" ? <MicOff size={iconSize} /> : <Mic size={iconSize} />}
+        </button>
+        <button
+          className={`mic-source-button ${audioInputMenuOpen ? "open" : ""}`}
+          onClick={() => void toggleAudioInputMenu()}
+          disabled={voiceState !== "idle" || Boolean(microphoneUnavailableReason)}
+          title="Select microphone"
+          aria-label="Select microphone"
+          aria-expanded={audioInputMenuOpen}
+          aria-haspopup="menu"
+        >
+          <ChevronDown size={13} />
+        </button>
+        {audioInputMenuOpen ? (
+          <div className="mic-source-menu" role="menu" aria-label="Microphone devices">
+            <button type="button" className={!selectedAudioInputId ? "selected" : ""} onClick={() => chooseAudioInput(undefined)} role="menuitem">
+              <span>Browser default</span>
+              {!selectedAudioInputId ? <small>Selected</small> : null}
+            </button>
+            {audioInputs.map((device, index) => (
+              <button
+                type="button"
+                className={selectedAudioInputId === device.deviceId ? "selected" : ""}
+                onClick={() => chooseAudioInput(device.deviceId)}
+                role="menuitem"
+                key={device.deviceId || `audioinput-${index}`}
+              >
+                <span>{audioInputLabel(device, index)}</span>
+                {selectedAudioInputId === device.deviceId ? <small>Selected</small> : null}
+              </button>
+            ))}
+            {audioInputs.length === 0 ? <div className="mic-source-empty">No microphones found.</div> : null}
+            {audioInputError ? <div className="mic-source-error">{audioInputError}</div> : null}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -596,8 +714,8 @@ export function App() {
           <span className="brand-mark cyber-glitch" data-text="Cloudx">
             Cloudx
           </span>
-          <span className={`connection-status ${connectionStatus}`} title={`Server ${connectionStatus}: ${serverLabel}`}>
-            {connectionStatus === "connected" ? <Wifi size={14} /> : <WifiOff size={14} />} {serverLabel}
+          <span className={`connection-status ${connectionStatus}`} title={`${connectionStatus}: ${serverLabel}`} aria-label={`${connectionStatus}: ${serverLabel}`}>
+            {connectionStatus === "connected" ? <Wifi size={14} /> : <WifiOff size={14} />}
           </span>
           {activeTab ? <span className="brand-active-tab" title={`Active tab: ${activeTab.title}`}>{activeTab.title}</span> : null}
           {voiceState !== "idle" ? <span className={`voice-status ${voiceState}`}>{voiceState}</span> : null}
@@ -615,66 +733,63 @@ export function App() {
             onDelete={handleDeleteWindow}
             onContextSearch={handleContextSearch}
           />
-          <button className="icon-button" onClick={() => window.location.reload()} title="Reload app">
-            <RefreshCw size={17} />
-          </button>
-          <button className="icon-button" onClick={() => setSettingsOpen(true)} title="Settings">
-            <Settings size={17} />
-          </button>
-          <button className="icon-button" onClick={() => split("row")} title="Split columns">
-            <Columns2 size={17} />
-          </button>
-          <button className="icon-button" onClick={() => split("column")} title="Split rows">
-            <Rows3 size={17} />
-          </button>
-          <TemplateMenu
-            open={templateMenuOpen}
-            templates={templates}
-            activeWindow={activeWindow}
-            onOpenChange={setTemplateMenuOpen}
-            onSave={handleSaveTemplate}
-            onRename={handleRenameTemplate}
-            onDelete={handleDeleteTemplate}
-            onApply={handleApplyTemplate}
-          />
-          {microphoneEnabled ? <div className="mic-control" ref={micControlRef}>
-            <button className={`mic-button ${voiceState} ${microphoneUnavailableReason ? "unavailable" : ""}`} onClick={() => void handleMic()} title={microphoneUnavailableReason ?? (voiceState === "recording" ? "Stop voice command" : "Record voice command")}>
-              {voiceState === "recording" ? <MicOff size={17} /> : <Mic size={17} />}
+          <div className="mobile-action-menu" ref={mobileActionsRef}>
+            <button className="icon-button" onClick={() => setMobileActionsOpen((open) => !open)} title="Workspace actions" aria-label="Workspace actions" aria-expanded={mobileActionsOpen} aria-haspopup="menu">
+              <MoreHorizontal size={19} />
             </button>
-            <button
-              className={`mic-source-button ${audioInputMenuOpen ? "open" : ""}`}
-              onClick={() => void toggleAudioInputMenu()}
-              disabled={voiceState !== "idle" || Boolean(microphoneUnavailableReason)}
-              title="Select microphone"
-              aria-label="Select microphone"
-              aria-expanded={audioInputMenuOpen}
-              aria-haspopup="menu"
-            >
-              <ChevronDown size={13} />
-            </button>
-            {audioInputMenuOpen ? (
-              <div className="mic-source-menu" role="menu" aria-label="Microphone devices">
-                <button type="button" className={!selectedAudioInputId ? "selected" : ""} onClick={() => chooseAudioInput(undefined)} role="menuitem">
-                  <span>Browser default</span>
-                  {!selectedAudioInputId ? <small>Selected</small> : null}
+            {mobileActionsOpen ? (
+              <div className={`mobile-action-menu-popover ${templateMenuOpen ? "template-open" : ""}`} role="menu" aria-label="Workspace actions">
+                <button className="icon-button" onClick={() => window.location.reload()} title="Reload app" aria-label="Reload app" role="menuitem">
+                  <RefreshCw size={17} />
                 </button>
-                {audioInputs.map((device, index) => (
-                  <button
-                    type="button"
-                    className={selectedAudioInputId === device.deviceId ? "selected" : ""}
-                    onClick={() => chooseAudioInput(device.deviceId)}
-                    role="menuitem"
-                    key={device.deviceId || `audioinput-${index}`}
-                  >
-                    <span>{audioInputLabel(device, index)}</span>
-                    {selectedAudioInputId === device.deviceId ? <small>Selected</small> : null}
-                  </button>
-                ))}
-                {audioInputs.length === 0 ? <div className="mic-source-empty">No microphones found.</div> : null}
-                {audioInputError ? <div className="mic-source-error">{audioInputError}</div> : null}
+                <button className="icon-button" onClick={() => { setSettingsOpen(true); setMobileActionsOpen(false); }} title="Settings" aria-label="Settings" role="menuitem">
+                  <Settings size={17} />
+                </button>
+                <button className="icon-button" onClick={() => { split("column"); setMobileActionsOpen(false); }} title="Split vertically" aria-label="Split vertically" role="menuitem">
+                  <Rows3 size={17} />
+                </button>
+                {mobileActionsEnabled ? (
+                  <TemplateMenu
+                    open={templateMenuOpen}
+                    templates={templates}
+                    activeWindow={activeWindow}
+                    onOpenChange={setTemplateMenuOpen}
+                    onSave={handleSaveTemplate}
+                    onRename={handleRenameTemplate}
+                    onDelete={handleDeleteTemplate}
+                    onApply={handleApplyTemplate}
+                  />
+                ) : null}
               </div>
             ) : null}
-          </div> : null}
+          </div>
+          <div className="topbar-action-cluster">
+            <button className="icon-button" onClick={() => window.location.reload()} title="Reload app">
+              <RefreshCw size={17} />
+            </button>
+            <button className="icon-button" onClick={() => setSettingsOpen(true)} title="Settings">
+              <Settings size={17} />
+            </button>
+            <button className="icon-button" onClick={() => split("row")} title="Split columns">
+              <Columns2 size={17} />
+            </button>
+            <button className="icon-button" onClick={() => split("column")} title="Split rows">
+              <Rows3 size={17} />
+            </button>
+            {!mobileActionsEnabled ? (
+              <TemplateMenu
+                open={templateMenuOpen}
+                templates={templates}
+                activeWindow={activeWindow}
+                onOpenChange={setTemplateMenuOpen}
+                onSave={handleSaveTemplate}
+                onRename={handleRenameTemplate}
+                onDelete={handleDeleteTemplate}
+                onApply={handleApplyTemplate}
+              />
+            ) : null}
+            {renderMicControl("topbar-mic-control", topbarMicControlRef, 17)}
+          </div>
         </div>
       </header>
 
@@ -700,6 +815,7 @@ export function App() {
           aria-busy={voiceState === "processing"}
           aria-disabled={voiceState !== "idle"}
         />
+        {renderMicControl("voice-console-mic-control", footerMicControlRef, 25)}
       </footer> : null}
 
       {createOpen ? <CreateTabDialog plugins={plugins} defaultCwd={activeWindow?.defaultCwd ?? "~"} onCancel={closeCreateDialog} onCreate={handleCreate} /> : null}
@@ -716,7 +832,7 @@ export function App() {
         <div className="pane-split-child" style={{ flexBasis: `${node.sizes[0]}%` }}>
           {renderLayoutNode(node.children[0])}
         </div>
-        <ResizeHandle direction={node.direction} onResize={(delta, total) => resizePane(node.id, delta, total)} />
+        <ResizeHandle direction={node.direction} sizes={[node.sizes[0], node.sizes[1]]} onResize={(delta, total, startSizes) => resizePane(node.id, delta, total, startSizes)} />
         <div className="pane-split-child" style={{ flexBasis: `${node.sizes[1]}%` }}>
           {renderLayoutNode(node.children[1])}
         </div>
@@ -1220,24 +1336,34 @@ function PluginPanel({ tab, plugin, active, config }: { tab: WorkspaceTab; plugi
   return <div className="empty-pane">No panel registered for {plugin.displayName}</div>;
 }
 
-function ResizeHandle({ direction, onResize }: { direction: LayoutDirection; onResize: (deltaPixels: number, containerPixels: number) => void }) {
+function ResizeHandle({ direction, sizes, onResize }: { direction: LayoutDirection; sizes: [number, number]; onResize: (deltaPixels: number, containerPixels: number, startSizes: [number, number]) => void }) {
   return (
     <div
       className={`resize-handle ${direction}`}
       onPointerDown={(event) => {
+        event.preventDefault();
         const start = direction === "row" ? event.clientX : event.clientY;
-        const container = event.currentTarget.parentElement?.parentElement;
-        const total = direction === "row" ? container?.clientWidth ?? 1 : container?.clientHeight ?? 1;
+        const handle = event.currentTarget;
+        const container = handle.parentElement;
+        const bounds = container?.getBoundingClientRect();
+        const total = direction === "row" ? bounds?.width ?? 1 : bounds?.height ?? 1;
+        const startSizes: [number, number] = [sizes[0], sizes[1]];
+        handle.setPointerCapture(event.pointerId);
         const onMove = (moveEvent: PointerEvent) => {
           const current = direction === "row" ? moveEvent.clientX : moveEvent.clientY;
-          onResize(current - start, total);
+          onResize(current - start, total, startSizes);
         };
         const onUp = () => {
+          if (handle.hasPointerCapture(event.pointerId)) {
+            handle.releasePointerCapture(event.pointerId);
+          }
           window.removeEventListener("pointermove", onMove);
           window.removeEventListener("pointerup", onUp);
+          window.removeEventListener("pointercancel", onUp);
         };
         window.addEventListener("pointermove", onMove);
         window.addEventListener("pointerup", onUp);
+        window.addEventListener("pointercancel", onUp);
       }}
     />
   );

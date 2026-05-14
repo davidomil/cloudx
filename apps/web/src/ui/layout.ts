@@ -197,7 +197,7 @@ export function removePane(current: WorkspaceLayout, paneId: string): WorkspaceL
   };
 }
 
-export function resizeSplit(current: WorkspaceLayout, splitId: string, deltaPixels: number, containerPixels: number): WorkspaceLayout {
+export function resizeSplit(current: WorkspaceLayout, splitId: string, deltaPixels: number, containerPixels: number, startSizes?: [number, number]): WorkspaceLayout {
   if (containerPixels <= 0) {
     return current;
   }
@@ -208,7 +208,8 @@ export function resizeSplit(current: WorkspaceLayout, splitId: string, deltaPixe
       if (split.id !== splitId) {
         return split;
       }
-      const first = clamp(split.sizes[0] + delta, MIN_SPLIT_SIZE, 100 - MIN_SPLIT_SIZE);
+      const baseSizes = startSizes ?? split.sizes;
+      const first = clamp(baseSizes[0] + delta, MIN_SPLIT_SIZE, 100 - MIN_SPLIT_SIZE);
       return { ...split, sizes: [first, 100 - first] };
     })
   };

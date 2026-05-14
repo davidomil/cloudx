@@ -129,6 +129,14 @@ describe("layout helpers", () => {
 
     expect(resized.root).toMatchObject({ type: "split", sizes: [70, 30] });
   });
+
+  it("resizes from captured drag-start sizes instead of compounding pointer movement", () => {
+    const layout = splitPane(layoutWithTabs(["tab-1"]), "row", sequence("pane-2"), sequence("split-1"));
+    const firstMove = resizeSplit(layout, "split-1", 100, 1000, [50, 50]);
+    const secondMove = resizeSplit(firstMove, "split-1", 200, 1000, [50, 50]);
+
+    expect(secondMove.root).toMatchObject({ type: "split", sizes: [70, 30] });
+  });
 });
 
 function layoutWithTabs(tabIds: string[]) {
