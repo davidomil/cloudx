@@ -21,9 +21,15 @@ tailnet only.
 These screenshots use a throwaway demo workspace and avoid local paths, host
 names, and dashboard tokens. Regenerate them with `npm run docs:screenshots`.
 
+### Desktop Workspace
+
 ![Cloudx workspace window showing a Codex terminal, file browser, and local dashboard](docs/screenshots/cloudx-split-panes.png)
 
-![Cloudx mobile portrait workspace showing stacked panes and the bottom voice command bar](docs/screenshots/cloudx-mobile-portrait.png)
+### Mobile Portrait
+
+<p align="center">
+  <img src="docs/screenshots/cloudx-mobile-portrait.png" width="390" alt="Cloudx mobile portrait workspace showing stacked panes and the bottom voice command bar">
+</p>
 
 ## Features
 
