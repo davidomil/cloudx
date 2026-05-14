@@ -1,4 +1,4 @@
-import type { PluginActionDescriptor, PluginDescriptor, PluginId, PluginPanelKind, TabIndicatorUpdate, WorkspaceTab } from "@cloudx/shared";
+import type { ConfigFieldDescriptor, ConfigValue, PluginActionDescriptor, PluginDescriptor, PluginId, PluginPanelKind, TabIndicatorUpdate, WorkspaceTab } from "@cloudx/shared";
 
 export interface JsonSchemaLike {
   [key: string]: unknown;
@@ -63,6 +63,8 @@ export interface CreatePluginSessionInput {
   cwd: string;
   controls: PluginTabControls;
   initialInput?: Record<string, unknown>;
+  config?: Record<string, ConfigValue>;
+  getConfig?: () => Record<string, ConfigValue>;
 }
 
 export interface PluginTabControls {
@@ -79,6 +81,7 @@ export interface WorkspacePlugin {
   creatable: boolean;
   requiresDirectory: boolean;
   actions: PluginActionDefinition[];
+  configFields?: ConfigFieldDescriptor[];
   defaultTitleContext?(input: { cwd: string; initialInput?: Record<string, unknown> }): string | undefined;
   createSession(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;
   descriptor(): PluginDescriptor;
@@ -93,6 +96,7 @@ export function descriptorFromPlugin(plugin: WorkspacePlugin): PluginDescriptor 
     panelKind: plugin.panelKind,
     creatable: plugin.creatable,
     requiresDirectory: plugin.requiresDirectory,
+    configFields: plugin.configFields ?? [],
     actions: plugin.actions.map((action) => ({
       name: action.name,
       description: action.description,

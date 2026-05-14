@@ -1,4 +1,4 @@
-import type { CreateTabRequest, CreateTabResponse, PathOptionsResponse, PathOption, PluginDescriptor, VoiceExecutionResult, WorkspaceTab } from "@cloudx/shared";
+import type { CloudxConfigResponse, CloudxConfigValues, CreateTabRequest, CreateTabResponse, PathOptionsResponse, PathOption, PluginDescriptor, VoiceExecutionResult, WorkspaceTab } from "@cloudx/shared";
 
 export interface HealthResponse {
   status: string;
@@ -40,6 +40,17 @@ function errorMessageFromResponse(text: string, status: number): string {
 export async function getPlugins(): Promise<PluginDescriptor[]> {
   const body = await fetchJson<{ plugins: PluginDescriptor[] }>("/api/plugins");
   return body.plugins;
+}
+
+export async function getConfig(): Promise<CloudxConfigResponse> {
+  return fetchJson("/api/config");
+}
+
+export async function updateConfig(patch: Partial<CloudxConfigValues>): Promise<CloudxConfigResponse> {
+  return fetchJson("/api/config", {
+    method: "PATCH",
+    body: JSON.stringify(patch)
+  });
 }
 
 export async function getHealth(): Promise<HealthResponse> {

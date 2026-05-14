@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { closeTab, fetchJson, setActiveTab, startAudioStream, submitTranscript, voiceAudioConstraints } from "./api.js";
+import { closeTab, fetchJson, getConfig, setActiveTab, startAudioStream, submitTranscript, updateConfig, voiceAudioConstraints } from "./api.js";
 
 describe("api client", () => {
   afterEach(() => {
@@ -50,6 +50,28 @@ describe("api client", () => {
     expect(fetchMock).toHaveBeenCalledWith("/api/voice/transcript", {
       method: "POST",
       body: JSON.stringify({ transcript: "open terminal", activeTabId: "tab-1", clientContext: { activePaneId: "pane-2" } }),
+      headers: { "content-type": "application/json" }
+    });
+  });
+
+  it("loads and updates dynamic config", async () => {
+    const response = {
+      globalFields: [],
+      plugins: [],
+      values: { global: { aiControlEnabled: true }, plugins: { "file-browser": { showGitDiff: false } } }
+    };
+    const fetchMock = vi.fn(async () => jsonResponse(response));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getConfig()).resolves.toEqual(response);
+    await updateConfig({ plugins: { "file-browser": { showGitDiff: false } } });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/config", {
+      headers: undefined
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/config", {
+      method: "PATCH",
+      body: JSON.stringify({ plugins: { "file-browser": { showGitDiff: false } } }),
       headers: { "content-type": "application/json" }
     });
   });

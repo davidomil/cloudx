@@ -15,6 +15,54 @@ import { buildServer, type AppServices } from "./server.js";
 import { SessionStore } from "./sessionStore.js";
 
 describe("buildServer", () => {
+  it("exposes and persists dynamic configuration", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-config-route-"));
+    const config = testConfig(root);
+    const app = await buildServer(config);
+    try {
+      const initial = await app.inject({ method: "GET", url: "/api/config" });
+      expect(initial.statusCode).toBe(200);
+      expect(initial.json().values.global).toMatchObject({ aiControlEnabled: true, microphoneEnabled: true });
+      expect(initial.json().values.plugins["file-browser"]).toMatchObject({ showGitDiff: true });
+
+      const updated = await app.inject({
+        method: "PATCH",
+        url: "/api/config",
+        payload: {
+          global: { aiControlEnabled: false },
+          plugins: { "file-browser": { showGitDiff: false } }
+        }
+      });
+
+      expect(updated.statusCode).toBe(200);
+      expect(updated.json().values.global.aiControlEnabled).toBe(false);
+      expect(updated.json().values.plugins["file-browser"].showGitDiff).toBe(false);
+      await expect(fs.readFile(path.join(config.dataDir, "config.json"), "utf8")).resolves.toContain("showGitDiff");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("rejects voice control routes when AI control is disabled", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-config-voice-"));
+    const config = testConfig(root);
+    await fs.mkdir(config.dataDir, { recursive: true });
+    await fs.writeFile(path.join(config.dataDir, "config.json"), JSON.stringify({ global: { aiControlEnabled: false } }), "utf8");
+    const app = await buildServer(config);
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/voice/transcript",
+        payload: { transcript: "open terminal" }
+      });
+
+      expect(response.statusCode).toBe(403);
+      expect(response.body).toContain("AI control is disabled");
+    } finally {
+      await app.close();
+    }
+  });
+
   it("proxies local web tabs through the Cloudx server and rewrites root asset URLs", async () => {
     const localServer = http.createServer((request, response) => {
       if (request.url?.startsWith("/@vite/client")) {
@@ -441,3 +489,17 @@ describe("buildServer", () => {
     expect(asrCalls[0]).toHaveLength(2);
   });
 });
+
+function testConfig(root: string): AppConfig {
+  return {
+    host: "0.0.0.0",
+    port: 3001,
+    allowedRoots: [root],
+    asrUrl: "http://127.0.0.1:7810",
+    voiceModel: "gpt-5.3-codex-spark",
+    dataDir: path.join(root, ".cloudx"),
+    webDistDir: path.join(root, "missing-web-dist"),
+    appServerEnabled: false,
+    terminalReplayBytes: 1024
+  };
+}

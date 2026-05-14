@@ -3,7 +3,7 @@ import { Diff, Hunk, parseDiff, type DiffType, type FileData, type HunkData, typ
 import "react-diff-view/style/index.css";
 import { FileDiff, FileText, Folder, GitBranch, GitFork, GitPullRequest, RefreshCw } from "lucide-react";
 
-import type { GitDiffFile, GitDiffFileSummary, GitDiffSummary, GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
+import type { ConfigValue, GitDiffFile, GitDiffFileSummary, GitDiffSummary, GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
 
 import { runTabAction } from "../api.js";
 
@@ -39,7 +39,7 @@ interface GitTreeChange {
   file?: GitDiffFileSummary;
 }
 
-export function FileBrowserPanel({ tab }: { tab: WorkspaceTab }) {
+export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; config?: Record<string, ConfigValue> }) {
   const [relativePath, setRelativePath] = useState("");
   const [entries, setEntries] = useState<DirectoryEntry[]>([]);
   const [opened, setOpened] = useState<OpenFileResult | undefined>();
@@ -52,12 +52,20 @@ export function FileBrowserPanel({ tab }: { tab: WorkspaceTab }) {
   const [originUrl, setOriginUrl] = useState("");
   const [busyAction, setBusyAction] = useState<GitBusyAction | undefined>();
   const [error, setError] = useState<string | undefined>();
-  const visibleEntries = useMemo(() => mergeGitChangesIntoEntries(entries, relativePath, diffSummary), [entries, relativePath, diffSummary]);
+  const showGitDiff = config.showGitDiff !== false;
+  const visibleEntries = useMemo(() => mergeGitChangesIntoEntries(entries, relativePath, showGitDiff ? diffSummary : undefined), [entries, relativePath, diffSummary, showGitDiff]);
 
   useEffect(() => {
     void loadDirectory("");
-    void loadGitState();
-  }, [tab.id]);
+    if (showGitDiff) {
+      void loadGitState();
+    } else {
+      setGitState(undefined);
+      setDiffSummary(undefined);
+      setOpenedDiff(undefined);
+      setCompareRef("");
+    }
+  }, [tab.id, showGitDiff]);
 
   useEffect(() => {
     function updateViewMode() {
@@ -80,6 +88,9 @@ export function FileBrowserPanel({ tab }: { tab: WorkspaceTab }) {
   }
 
   async function loadGitState() {
+    if (!showGitDiff) {
+      return;
+    }
     setBusyAction("state");
     setError(undefined);
     try {
@@ -103,6 +114,7 @@ export function FileBrowserPanel({ tab }: { tab: WorkspaceTab }) {
   }
 
   async function initializeRepository() {
+    if (!showGitDiff) return;
     setBusyAction("initialize");
     setError(undefined);
     try {
@@ -119,6 +131,7 @@ export function FileBrowserPanel({ tab }: { tab: WorkspaceTab }) {
   }
 
   async function cloneRepository() {
+    if (!showGitDiff) return;
     setBusyAction("clone");
     setError(undefined);
     try {
@@ -136,6 +149,7 @@ export function FileBrowserPanel({ tab }: { tab: WorkspaceTab }) {
   }
 
   async function setOrigin() {
+    if (!showGitDiff) return;
     setBusyAction("origin");
     setError(undefined);
     try {
@@ -152,6 +166,9 @@ export function FileBrowserPanel({ tab }: { tab: WorkspaceTab }) {
   }
 
   async function loadDiff(ref = compareRef) {
+    if (!showGitDiff) {
+      return;
+    }
     setBusyAction("diff");
     setError(undefined);
     try {
@@ -167,6 +184,7 @@ export function FileBrowserPanel({ tab }: { tab: WorkspaceTab }) {
   }
 
   async function openDiffFile(file: GitDiffFileSummary) {
+    if (!showGitDiff) return;
     setBusyAction("file");
     setError(undefined);
     try {
@@ -201,7 +219,7 @@ export function FileBrowserPanel({ tab }: { tab: WorkspaceTab }) {
           <RefreshCw size={15} />
         </button>
       </div>
-      <GitRepositoryBar
+      {showGitDiff ? <GitRepositoryBar
         state={gitState}
         compareRef={compareRef}
         diffSummary={diffSummary}
@@ -221,7 +239,7 @@ export function FileBrowserPanel({ tab }: { tab: WorkspaceTab }) {
           void loadDiff(value);
         }}
         onDiffViewModeChange={setDiffViewMode}
-      />
+      /> : null}
       {error ? <div className="inline-error">{error}</div> : null}
       <div className="file-browser-body">
         <div className="file-list">
@@ -236,7 +254,7 @@ export function FileBrowserPanel({ tab }: { tab: WorkspaceTab }) {
         <div className="file-preview">
           {opened ? (
             <pre>{filePreviewText(opened)}</pre>
-          ) : gitState?.isRepository ? (
+          ) : showGitDiff && gitState?.isRepository ? (
             <GitDiffWorkspace diffSummary={diffSummary} openedDiff={openedDiff} viewMode={diffViewMode} busy={busyAction === "file"} onOpenFile={(file) => void openDiffFile(file)} />
           ) : (
             <pre>{filePreviewText(opened)}</pre>

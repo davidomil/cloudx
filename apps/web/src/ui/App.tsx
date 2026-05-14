@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement } from "react";
-import { ChevronDown, Columns2, GitBranch, Mic, MicOff, PanelTopOpen, RefreshCw, Rows3, SquarePlus, Wifi, WifiOff, X } from "lucide-react";
+import { ChevronDown, Columns2, GitBranch, Mic, MicOff, PanelTopOpen, RefreshCw, Rows3, Settings, SquarePlus, Wifi, WifiOff, X } from "lucide-react";
 
-import type { CreateTabRequest, PathOption, PluginDescriptor, PluginId, TabLayoutState, WorkspaceTab, WorkspaceTabsUpdate } from "@cloudx/shared";
+import type { CloudxConfigResponse, CloudxConfigValues, ConfigValue, CreateTabRequest, PathOption, PluginDescriptor, PluginId, TabLayoutState, WorkspaceTab, WorkspaceTabsUpdate } from "@cloudx/shared";
 
-import { closeTab, createTab, getHealth, getPathOptions, getPlugins, getTabs, setActiveTab, startAudioStream, submitTranscript, voiceAudioConstraints, type VoiceAudioStreamSession } from "../api.js";
+import { closeTab, createTab, getConfig, getHealth, getPathOptions, getPlugins, getTabs, setActiveTab, startAudioStream, submitTranscript, updateConfig, voiceAudioConstraints, type VoiceAudioStreamSession } from "../api.js";
 import { FileBrowserPanel } from "./FileBrowserPanel.js";
 import {
   activatePane,
@@ -25,6 +25,7 @@ import {
   type Pane
 } from "./layout.js";
 import { shouldSubmitVoiceConsoleKey } from "./keyboard.js";
+import { SettingsDialog } from "./SettingsDialog.js";
 import { clearFocusedAttention, isTabFocused, updateAttentionTabs } from "./tabAttention.js";
 import { disposeTerminalView, disposeTerminalViewsExcept, TerminalPanel } from "./TerminalPanel.js";
 import { applyVoiceWorkspaceResults, buildClientVoiceContext, voiceConsoleValue } from "./voiceWorkspace.js";
@@ -39,10 +40,12 @@ const AUDIO_INPUT_KEY = "cloudx-audio-input-v1";
 export function App() {
   const initialLayout = useMemo(() => loadLayout(), []);
   const [plugins, setPlugins] = useState<PluginDescriptor[]>([]);
+  const [config, setConfig] = useState<CloudxConfigResponse | undefined>();
   const [tabs, setTabs] = useState<WorkspaceTab[]>([]);
   const [layout, setLayout] = useState<TabLayoutState>(initialLayout);
   const [activeTabId, setActiveTabId] = useState<string | undefined>();
   const [createOpen, setCreateOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [createTargetPaneId, setCreateTargetPaneId] = useState<string | undefined>();
   const [error, setError] = useState<string | undefined>();
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("checking");
@@ -141,13 +144,16 @@ export function App() {
   const serverLabel = window.location.host || "server";
   const activeTab = activeTabId ? tabById.get(activeTabId) : undefined;
   const microphoneUnavailableReason = getMicrophoneUnavailableReason();
+  const aiControlEnabled = config?.values.global.aiControlEnabled !== false;
+  const microphoneEnabled = aiControlEnabled && config?.values.global.microphoneEnabled !== false;
   const voiceConsoleText = voiceConsoleValue(voiceState, manualTranscript, voiceMessage, liveTranscript);
 
   async function refresh() {
     setConnectionStatus("checking");
     try {
-      const [pluginList, tabState] = await Promise.all([getPlugins(), getTabs()]);
+      const [pluginList, tabState, configState] = await Promise.all([getPlugins(), getTabs(), getConfig()]);
       setPlugins(pluginList);
+      setConfig(configState);
       applyWorkspaceTabs(tabState.tabs, tabState.activeTabId);
       setConnectionStatus("connected");
       setError(undefined);
@@ -282,6 +288,10 @@ export function App() {
 
   async function handleManualTranscript() {
     if (!manualTranscript.trim()) return;
+    if (!aiControlEnabled) {
+      setError("AI control is disabled in Cloudx settings.");
+      return;
+    }
     setVoiceState("processing");
     setVoiceMessage("AI is thinking and controlling Cloudx...");
     setLiveTranscript(undefined);
@@ -302,6 +312,10 @@ export function App() {
   async function handleMic() {
     setError(undefined);
     setAudioInputMenuOpen(false);
+    if (!microphoneEnabled) {
+      setError("Microphone capture is disabled in Cloudx settings.");
+      return;
+    }
     if (voiceState === "recording" && audioSessionRef.current) {
       setVoiceState("processing");
       setVoiceMessage("Stopping recording and transcribing with local Faster Whisper.");
@@ -375,6 +389,9 @@ export function App() {
     if (voiceState !== "idle") {
       return;
     }
+    if (!microphoneEnabled) {
+      return;
+    }
     if (microphoneUnavailableReason) {
       setError(microphoneUnavailableReason);
       return;
@@ -419,6 +436,19 @@ export function App() {
     return buildClientVoiceContext(layoutRef.current, tabsRef.current);
   }
 
+  async function handleSaveConfig(values: CloudxConfigValues) {
+    const nextConfig = await updateConfig(values);
+    setConfig(nextConfig);
+    setSettingsOpen(false);
+    if (nextConfig.values.global.aiControlEnabled === false || nextConfig.values.global.microphoneEnabled === false) {
+      setAudioInputMenuOpen(false);
+    }
+  }
+
+  function pluginConfig(pluginId: PluginId): Record<string, ConfigValue> {
+    return config?.values.plugins[pluginId] ?? {};
+  }
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -437,13 +467,16 @@ export function App() {
           <button className="icon-button" onClick={() => window.location.reload()} title="Reload app">
             <RefreshCw size={17} />
           </button>
+          <button className="icon-button" onClick={() => setSettingsOpen(true)} title="Settings">
+            <Settings size={17} />
+          </button>
           <button className="icon-button" onClick={() => split("row")} title="Split columns">
             <Columns2 size={17} />
           </button>
           <button className="icon-button" onClick={() => split("column")} title="Split rows">
             <Rows3 size={17} />
           </button>
-          <div className="mic-control" ref={micControlRef}>
+          {microphoneEnabled ? <div className="mic-control" ref={micControlRef}>
             <button className={`mic-button ${voiceState} ${microphoneUnavailableReason ? "unavailable" : ""}`} onClick={() => void handleMic()} title={microphoneUnavailableReason ?? (voiceState === "recording" ? "Stop voice command" : "Record voice command")}>
               {voiceState === "recording" ? <MicOff size={17} /> : <Mic size={17} />}
             </button>
@@ -480,7 +513,7 @@ export function App() {
                 {audioInputError ? <div className="mic-source-error">{audioInputError}</div> : null}
               </div>
             ) : null}
-          </div>
+          </div> : null}
         </div>
       </header>
 
@@ -490,7 +523,7 @@ export function App() {
         {renderLayoutNode(layout.root)}
       </section>
 
-      <footer className="voice-console">
+      {aiControlEnabled ? <footer className="voice-console">
         <textarea
           aria-label="Voice transcript"
           value={voiceConsoleText}
@@ -506,9 +539,10 @@ export function App() {
           aria-busy={voiceState === "processing"}
           aria-disabled={voiceState !== "idle"}
         />
-      </footer>
+      </footer> : null}
 
       {createOpen ? <CreateTabDialog plugins={plugins} onCancel={closeCreateDialog} onCreate={handleCreate} /> : null}
+      {settingsOpen && config ? <SettingsDialog config={config} onCancel={() => setSettingsOpen(false)} onSave={handleSaveConfig} /> : null}
     </main>
   );
 
@@ -606,7 +640,7 @@ export function App() {
         </div>
         <div className="pane-body">
           {pane.activeTabId && tabById.has(pane.activeTabId) ? (
-            <PluginPanel tab={tabById.get(pane.activeTabId)!} plugin={pluginById.get(tabById.get(pane.activeTabId)!.pluginId)} active={paneActive} />
+            <PluginPanel tab={tabById.get(pane.activeTabId)!} plugin={pluginById.get(tabById.get(pane.activeTabId)!.pluginId)} active={paneActive} config={pluginConfig(tabById.get(pane.activeTabId)!.pluginId)} />
           ) : (
             <div className="empty-pane">
               <PanelTopOpen size={28} />
@@ -624,9 +658,9 @@ function TabIndicatorDot({ tab, attention }: { tab: WorkspaceTab; attention?: bo
   return <span className={`tab-indicator ${tab.indicator.color} ${attention ? "attention" : ""}`} title={title} aria-label={title} />;
 }
 
-function PluginPanel({ tab, plugin, active }: { tab: WorkspaceTab; plugin: PluginDescriptor | undefined; active: boolean }) {
+function PluginPanel({ tab, plugin, active, config }: { tab: WorkspaceTab; plugin: PluginDescriptor | undefined; active: boolean; config: Record<string, ConfigValue> }) {
   if (plugin?.panelKind === "file-browser") {
-    return <FileBrowserPanel tab={tab} />;
+    return <FileBrowserPanel tab={tab} config={config} />;
   }
   if (plugin?.panelKind === "web-viewer") {
     return <WebViewerPanel tab={tab} />;

@@ -74,4 +74,25 @@ describe("FileBrowserPlugin", () => {
       contentPreview: "ship it\n"
     });
   });
+
+  it("rejects Git diff actions when the plugin config disables them", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-files-"));
+    const session = new FileBrowserPlugin(new PathPolicy([root])).createSession({
+      tab: {
+        id: "tab-1",
+        pluginId: "file-browser",
+        title: "Files",
+        cwd: root,
+        status: "running",
+        indicator: { color: "green", label: "OK", updatedAt: new Date(0).toISOString() },
+        createdAt: new Date(0).toISOString(),
+        updatedAt: new Date(0).toISOString()
+      },
+      cwd: root,
+      controls: { setTabIndicator: () => undefined, closeTab: () => undefined },
+      getConfig: () => ({ showGitDiff: false })
+    });
+
+    await expect(session.handleAction("get_git_state", {})).rejects.toThrow("Git diff is disabled");
+  });
 });

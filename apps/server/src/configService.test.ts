@@ -1,0 +1,67 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+import { describe, expect, it } from "vitest";
+
+import type { PluginDescriptor } from "@cloudx/shared";
+
+import { ConfigService } from "./configService.js";
+
+describe("ConfigService", () => {
+  it("resolves defaults and persists updated global and plugin values", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-config-"));
+    const service = new ConfigService(dataDir, () => [fileBrowserDescriptor()]);
+
+    expect(service.getResponse()).toMatchObject({
+      values: {
+        global: { aiControlEnabled: true, microphoneEnabled: true },
+        plugins: { "file-browser": { showGitDiff: true } }
+      }
+    });
+
+    await service.update({
+      global: { aiControlEnabled: false },
+      plugins: { "file-browser": { showGitDiff: false } }
+    });
+
+    const configPath = path.join(dataDir, "config.json");
+    await expect(fs.readFile(configPath, "utf8")).resolves.toContain("showGitDiff");
+    const reloaded = new ConfigService(dataDir, () => [fileBrowserDescriptor()]);
+    expect(reloaded.getResponse()).toMatchObject({
+      values: {
+        global: { aiControlEnabled: false, microphoneEnabled: true },
+        plugins: { "file-browser": { showGitDiff: false } }
+      }
+    });
+  });
+
+  it("rejects unknown or wrongly typed values", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-config-"));
+    const service = new ConfigService(dataDir, () => [fileBrowserDescriptor()]);
+
+    await expect(service.update({ global: { nope: true } })).rejects.toThrow("Unknown config key");
+    await expect(service.update({ plugins: { "file-browser": { showGitDiff: "no" } } })).rejects.toThrow("must be a boolean");
+  });
+});
+
+function fileBrowserDescriptor(): PluginDescriptor {
+  return {
+    id: "file-browser",
+    acronym: "FB",
+    displayName: "Files",
+    description: "Files",
+    panelKind: "file-browser",
+    creatable: true,
+    requiresDirectory: true,
+    actions: [],
+    configFields: [
+      {
+        key: "showGitDiff",
+        label: "Show Git diff",
+        type: "boolean",
+        defaultValue: true
+      }
+    ]
+  };
+}

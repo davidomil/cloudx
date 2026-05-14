@@ -5,9 +5,10 @@ import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { RawData, WebSocket } from "ws";
 
-import type { CreateTabRequest } from "@cloudx/shared";
+import type { CloudxConfigValues, CreateTabRequest } from "@cloudx/shared";
 
 import type { AppConfig } from "./config.js";
+import { ConfigService } from "./configService.js";
 import { AsrClient } from "./asrClient.js";
 import { PathPolicy } from "./pathPolicy.js";
 import { PluginRegistry } from "./pluginRegistry.js";
@@ -34,6 +35,7 @@ export interface AppServices {
   pathPolicy: PathPolicy;
   voice: VoiceController;
   asr: AsrClient;
+  config?: ConfigService;
 }
 
 const MIN_STREAMED_AUDIO_BYTES = 128;
@@ -50,6 +52,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       : null
   });
   services ??= buildServices(config, app.log);
+  services.config ??= new ConfigService(config.dataDir, () => services!.plugins.list());
   const localWebProxy = new LocalWebProxy(services.sessions);
   await app.register(websocket);
 
@@ -65,6 +68,10 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   }));
 
   app.get("/api/plugins", async () => ({ plugins: services.plugins.list() }));
+
+  app.get("/api/config", async () => services.config!.getResponse());
+
+  app.patch<{ Body: Partial<CloudxConfigValues> }>("/api/config", async (request) => services.config!.update(request.body));
 
   app.get<{ Querystring: { query?: string } }>("/api/paths/options", async (request) => ({
     options: await services.pathPolicy.suggestDirectories(request.query.query ?? "")
@@ -106,6 +113,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   });
 
   app.post<{ Body: { transcript: string; activeTabId?: string; clientContext?: Record<string, unknown> } }>("/api/voice/transcript", async (request) => {
+    assertAiControlEnabled(services.config!);
     const voiceRequestId = randomUUID();
     request.log.info(
       {
@@ -135,6 +143,8 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   });
 
   app.post<{ Querystring: { activeTabId?: string; filename?: string }; Body: Buffer }>("/api/voice/audio", async (request) => {
+    assertAiControlEnabled(services.config!);
+    assertMicrophoneEnabled(services.config!);
     const voiceRequestId = randomUUID();
     request.log.info(
       {
@@ -188,6 +198,8 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
 
     void (async () => {
       try {
+        assertAiControlEnabled(services.config!);
+        assertMicrophoneEnabled(services.config!);
         await started;
         request.log.info(
           {
@@ -432,7 +444,8 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   plugins.register(new LocalWebPlugin());
   plugins.register(new WorktreeManagerPlugin());
   plugins.register(new WorkspaceControlPlugin());
-  const sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir));
+  const configService = new ConfigService(config.dataDir, () => plugins.list());
+  const sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir), configService);
   const asr = new AsrClient(config.asrUrl);
   const voice = new VoiceController(
     sessions,
@@ -441,7 +454,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     logger,
     { includeText: config.voiceDebugTranscripts ?? false }
   );
-  return { plugins, sessions, pathPolicy, voice, asr };
+  return { plugins, sessions, pathPolicy, voice, asr, config: configService };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -461,6 +474,24 @@ function assertSpeechDetected(text: string): void {
   if (!text.trim()) {
     throw new Error("No speech was detected in the microphone recording. Check that the browser is using the expected microphone, speak clearly, then try again.");
   }
+}
+
+function assertAiControlEnabled(config: ConfigService): void {
+  if (!config.isAiControlEnabled()) {
+    throwForbidden("AI control is disabled in Cloudx settings.");
+  }
+}
+
+function assertMicrophoneEnabled(config: ConfigService): void {
+  if (!config.isMicrophoneEnabled()) {
+    throwForbidden("Microphone capture is disabled in Cloudx settings.");
+  }
+}
+
+function throwForbidden(message: string): never {
+  const error = new Error(message) as Error & { statusCode: number };
+  error.statusCode = 403;
+  throw error;
 }
 
 function insufficientAudioMessage(audioBytes: number): string {

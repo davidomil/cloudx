@@ -1701,6 +1701,59 @@ a:hover svg {
   border-color: var(--color-accent);
 }
 
+.settings-dialog {
+  max-height: min(760px, calc(100dvh - 32px));
+  overflow: auto;
+}
+
+.settings-section,
+.settings-plugin-section {
+  display: grid;
+  gap: 10px;
+}
+
+.settings-section h3,
+.settings-plugin-section h4 {
+  margin: 0;
+  color: var(--color-accent-tertiary);
+  font-family: var(--font-label);
+  font-size: 13px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.settings-plugin-section {
+  padding: 10px;
+  border: 1px solid rgb(0 212 255 / 0.2);
+  background: rgb(8 12 15 / 0.58);
+  clip-path: var(--chamfer-sm);
+}
+
+.settings-toggle {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+}
+
+.settings-toggle input {
+  width: 17px;
+  height: 17px;
+  accent-color: var(--color-accent);
+  clip-path: none;
+}
+
+.settings-toggle span {
+  display: grid;
+  gap: 3px;
+}
+
+.settings-dialog small {
+  color: var(--color-muted-foreground);
+  font-family: var(--font-body);
+  font-size: 12px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
 @media (max-width: 760px) {
   .app-shell {
     grid-template-rows: auto auto minmax(0, 1fr) auto;

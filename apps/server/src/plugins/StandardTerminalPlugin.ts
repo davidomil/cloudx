@@ -27,6 +27,7 @@ export class StandardTerminalPlugin implements WorkspacePlugin {
       panelKind: this.panelKind,
       creatable: this.creatable,
       requiresDirectory: this.requiresDirectory,
+      configFields: [],
       actions: this.actions
     };
   }

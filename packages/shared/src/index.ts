@@ -43,6 +43,24 @@ export interface PluginActionDescriptor {
   inputSchema: Record<string, unknown>;
 }
 
+export type ConfigValue = boolean | string | number;
+
+export type ConfigFieldType = "boolean" | "string" | "number" | "select";
+
+export interface ConfigFieldOption {
+  label: string;
+  value: ConfigValue;
+}
+
+export interface ConfigFieldDescriptor {
+  key: string;
+  label: string;
+  type: ConfigFieldType;
+  description?: string;
+  defaultValue: ConfigValue;
+  options?: ConfigFieldOption[];
+}
+
 export interface PluginDescriptor {
   id: PluginId;
   acronym: string;
@@ -52,6 +70,24 @@ export interface PluginDescriptor {
   creatable: boolean;
   requiresDirectory: boolean;
   actions: PluginActionDescriptor[];
+  configFields: ConfigFieldDescriptor[];
+}
+
+export interface PluginConfigSection {
+  pluginId: PluginId;
+  displayName: string;
+  fields: ConfigFieldDescriptor[];
+}
+
+export interface CloudxConfigValues {
+  global: Record<string, ConfigValue>;
+  plugins: Record<string, Record<string, ConfigValue>>;
+}
+
+export interface CloudxConfigResponse {
+  globalFields: ConfigFieldDescriptor[];
+  plugins: PluginConfigSection[];
+  values: CloudxConfigValues;
 }
 
 export interface CreateTabRequest {

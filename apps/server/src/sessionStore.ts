@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import path from "node:path";
 
 import type { PluginActionDefinition, PluginSession, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
+import type { ConfigValue } from "@cloudx/shared";
 import type { CreateTabRequest, TabIndicator, TabIndicatorUpdate, VoiceAction, WorkspaceSnapshot, WorkspaceTab, WorkspaceTabsUpdate } from "@cloudx/shared";
 
 import { PathPolicy } from "./pathPolicy.js";
@@ -18,7 +19,8 @@ export class SessionStore {
   constructor(
     private readonly plugins: PluginRegistry,
     private readonly pathPolicy: PathPolicy,
-    private readonly contextService: TabContextService
+    private readonly contextService: TabContextService,
+    private readonly configProvider: { getPluginConfig(pluginId: string): Record<string, ConfigValue> } = { getPluginConfig: () => ({}) }
   ) {}
 
   async createTab(request: CreateTabRequest): Promise<WorkspaceTab> {
@@ -42,7 +44,14 @@ export class SessionStore {
     this.tabs.set(id, tab);
 
     try {
-      const session = await plugin.createSession({ tab, cwd, controls: this.createControls(id), initialInput: request.initialInput });
+      const session = await plugin.createSession({
+        tab,
+        cwd,
+        controls: this.createControls(id),
+        initialInput: request.initialInput,
+        config: this.configProvider.getPluginConfig(plugin.id),
+        getConfig: () => this.configProvider.getPluginConfig(plugin.id)
+      });
       this.sessions.set(id, session);
       session.onStatusChange?.((status, statusMessage) => {
         if (this.tabs.has(id)) {

@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import type { CreatePluginSessionInput, PluginActionDefinition, PluginSession, PluginSessionSnapshot, PluginVoiceContext, WorkspacePlugin } from "@cloudx/plugin-api";
-import type { GitDiffFile, GitDiffSummary, GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
+import type { ConfigFieldDescriptor, ConfigValue, GitDiffFile, GitDiffSummary, GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
 
 import { GitService } from "../git/GitService.js";
 import type { PathPolicy } from "../pathPolicy.js";
@@ -44,6 +44,15 @@ export class FileBrowserPlugin implements WorkspacePlugin {
   readonly panelKind = "file-browser" as const;
   readonly creatable = true;
   readonly requiresDirectory = true;
+  readonly configFields: ConfigFieldDescriptor[] = [
+    {
+      key: "showGitDiff",
+      label: "Show Git diff",
+      type: "boolean",
+      description: "Show Git repository setup controls, tree change badges, and rendered diffs in the file browser.",
+      defaultValue: true
+    }
+  ];
 
   readonly actions: PluginActionDefinition[] = [
     {
@@ -193,12 +202,13 @@ export class FileBrowserPlugin implements WorkspacePlugin {
       panelKind: this.panelKind,
       creatable: this.creatable,
       requiresDirectory: this.requiresDirectory,
+      configFields: this.configFields,
       actions: this.actions
     };
   }
 
   createSession(input: CreatePluginSessionInput): PluginSession {
-    return new FileBrowserSession(input.tab, this.pathPolicy, this.gitService);
+    return new FileBrowserSession(input.tab, this.pathPolicy, this.gitService, input.getConfig ?? (() => input.config ?? {}));
   }
 }
 
@@ -210,7 +220,8 @@ class FileBrowserSession implements PluginSession {
   constructor(
     public readonly tab: WorkspaceTab,
     private readonly pathPolicy: PathPolicy,
-    private readonly gitService: GitService
+    private readonly gitService: GitService,
+    private readonly getConfig: () => Record<string, ConfigValue>
   ) {}
 
   snapshot(): PluginSessionSnapshot {
@@ -227,7 +238,7 @@ class FileBrowserSession implements PluginSession {
   voiceContext(): PluginVoiceContext {
     const directoryText = this.currentDirectoryText();
     const openFileText = this.openFile ? `Open file ${this.openFile.relativePath}:\n${this.openFile.contentPreview}` : undefined;
-    const gitText = this.gitContextText();
+    const gitText = this.gitDiffEnabled() ? this.gitContextText() : undefined;
     const visibleText = [directoryText, openFileText, gitText].filter(Boolean).join("\n\n");
     return {
       kind: "file-browser",
@@ -312,31 +323,37 @@ class FileBrowserSession implements PluginSession {
       };
     }
     if (action === "get_git_state") {
+      this.requireGitDiffEnabled();
       const state = await this.gitService.getState(this.tab.cwd);
       this.git.state = state;
       return state as unknown as Record<string, unknown>;
     }
     if (action === "initialize_repository") {
+      this.requireGitDiffEnabled();
       const state = await this.gitService.initializeRepository(this.tab.cwd);
       this.git.state = state;
       return state as unknown as Record<string, unknown>;
     }
     if (action === "clone_repository") {
+      this.requireGitDiffEnabled();
       const state = await this.gitService.cloneRepository(this.tab.cwd, requireString(input.url, "url"));
       this.git.state = state;
       return state as unknown as Record<string, unknown>;
     }
     if (action === "set_origin") {
+      this.requireGitDiffEnabled();
       const state = await this.gitService.setOrigin(this.tab.cwd, requireString(input.url, "url"));
       this.git.state = state;
       return state as unknown as Record<string, unknown>;
     }
     if (action === "list_git_diff") {
+      this.requireGitDiffEnabled();
       const diff = await this.gitService.listDiff(this.tab.cwd, optionalString(input.compareRef, "compareRef"));
       this.git.diff = diff;
       return diff as unknown as Record<string, unknown>;
     }
     if (action === "open_git_diff_file") {
+      this.requireGitDiffEnabled();
       const diffFile = await this.gitService.openDiffFile(this.tab.cwd, requireString(input.path, "path"), optionalString(input.compareRef, "compareRef"));
       this.git.openDiffFile = diffFile;
       return diffFile as unknown as Record<string, unknown>;
@@ -431,6 +448,16 @@ class FileBrowserSession implements PluginSession {
     const files = this.git.diff?.files.map((file) => `${file.statusCode}\t${file.path}`).join("\n");
     const open = this.git.openDiffFile ? `Open diff ${this.git.openDiffFile.path}${this.git.openDiffFile.message ? `: ${this.git.openDiffFile.message}` : ""}` : undefined;
     return [`Git repository ${this.git.state.currentBranch ?? this.git.state.headRef ?? ""}`.trim(), files ? `Changed files:\n${files}` : undefined, open].filter(Boolean).join("\n");
+  }
+
+  private gitDiffEnabled(): boolean {
+    return this.getConfig().showGitDiff !== false;
+  }
+
+  private requireGitDiffEnabled(): void {
+    if (!this.gitDiffEnabled()) {
+      throw new Error("Git diff is disabled for the file browser plugin.");
+    }
   }
 }
 
