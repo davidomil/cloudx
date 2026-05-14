@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildSearchInput, filePreviewText, mergeGitChangesIntoEntries, parsePatch, searchEntriesFromResult, searchResultSummary, type OpenFileResult } from "./FileBrowserPanel.js";
+import { buildSearchInput, fileBrowserBodyClassName, filePreviewText, gitDiffWorkspaceClassName, mergeGitChangesIntoEntries, parsePatch, searchEntriesFromResult, searchResultSummary, type OpenFileResult } from "./FileBrowserPanel.js";
 
 describe("filePreviewText", () => {
   it("uses relative paths when the server returns them", () => {
@@ -50,6 +50,15 @@ describe("buildSearchInput", () => {
 
   it("returns undefined for empty search text", () => {
     expect(buildSearchInput("   ", "filename", "")).toBeUndefined();
+  });
+});
+
+describe("file browser visibility class names", () => {
+  it("adds layout modifiers when the tree or diff files are hidden", () => {
+    expect(fileBrowserBodyClassName(true)).toBe("file-browser-body");
+    expect(fileBrowserBodyClassName(false)).toBe("file-browser-body tree-hidden");
+    expect(gitDiffWorkspaceClassName(true)).toBe("git-diff-workspace");
+    expect(gitDiffWorkspaceClassName(false)).toBe("git-diff-workspace files-hidden");
   });
 });
 

@@ -60,6 +60,10 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   const [searchGlob, setSearchGlob] = useState("");
   const [searchResult, setSearchResult] = useState<FileSearchResult | undefined>();
   const [searchExpanded, setSearchExpanded] = useState(false);
+  const [treeVisible, setTreeVisible] = useState(true);
+  const [searchVisible, setSearchVisible] = useState(false);
+  const [gitBarVisible, setGitBarVisible] = useState(true);
+  const [gitDiffFilesVisible, setGitDiffFilesVisible] = useState(true);
   const [error, setError] = useState<string | undefined>();
   const showGitDiff = config.showGitDiff !== false;
   const activeSearchQuery = searchQuery.trim();
@@ -282,6 +286,16 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     }
   }
 
+  function toggleSearchVisible() {
+    if (searchVisible) {
+      setSearchQuery("");
+      setSearchResult(undefined);
+      setSearchBusyAction(undefined);
+      setSearchExpanded(false);
+    }
+    setSearchVisible(!searchVisible);
+  }
+
   return (
     <div className="file-browser-panel">
       <div className="file-browser-toolbar">
@@ -290,8 +304,19 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
         <button onClick={() => void loadDirectory(relativePath)} title="Refresh">
           <RefreshCw size={15} />
         </button>
+        <button type="button" aria-pressed={treeVisible} aria-label={treeVisible ? "Hide tree view" : "Show tree view"} title={treeVisible ? "Hide tree view" : "Show tree view"} onClick={() => setTreeVisible(!treeVisible)}>
+          <Folder size={15} />
+        </button>
+        <button type="button" aria-pressed={searchVisible} aria-label={searchVisible ? "Hide search bar" : "Show search bar"} title={searchVisible ? "Hide search bar" : "Show search bar"} onClick={toggleSearchVisible}>
+          <Search size={15} />
+        </button>
+        {showGitDiff ? (
+          <button type="button" aria-pressed={gitBarVisible} aria-label={gitBarVisible ? "Hide Git bar" : "Show Git bar"} title={gitBarVisible ? "Hide Git bar" : "Show Git bar"} onClick={() => setGitBarVisible(!gitBarVisible)}>
+            <GitBranch size={15} />
+          </button>
+        ) : null}
       </div>
-      <SearchBar
+      {searchVisible ? <SearchBar
         query={searchQuery}
         mode={searchMode}
         glob={searchGlob}
@@ -302,8 +327,8 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
         onGlobChange={setSearchGlob}
         onExpandedChange={setSearchExpanded}
         onSearch={() => void runSearch()}
-      />
-      {showGitDiff ? <GitRepositoryBar
+      /> : null}
+      {showGitDiff && gitBarVisible ? <GitRepositoryBar
         state={gitState}
         compareRef={compareRef}
         diffSummary={diffSummary}
@@ -312,6 +337,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
         originUrl={originUrl}
         busyAction={busyAction}
         diffViewMode={diffViewMode}
+        diffFilesVisible={gitDiffFilesVisible}
         onRefresh={() => void loadGitState()}
         onInitialize={() => void initializeRepository()}
         onClone={() => void cloneRepository()}
@@ -323,10 +349,11 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
           void loadDiff(value);
         }}
         onDiffViewModeChange={setDiffViewMode}
+        onDiffFilesVisibleChange={setGitDiffFilesVisible}
       /> : null}
       {error ? <div className="inline-error">{error}</div> : null}
-      <div className="file-browser-body">
-        <div className="file-list">
+      <div className={fileBrowserBodyClassName(treeVisible)}>
+        {treeVisible ? <div className="file-list">
           {activeSearchQuery && searchBusyAction ? <div className="file-list-empty">Searching...</div> : null}
           {activeSearchQuery && !searchBusyAction && activeSearchResult && visibleEntries.length === 0 ? <div className="file-list-empty">No matches.</div> : null}
           {visibleEntries.map((entry) => (
@@ -337,14 +364,14 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
               {entry.gitChange ? <TreeChangeBadge change={entry.gitChange} /> : null}
             </button>
           ))}
-        </div>
+        </div> : null}
         <div className="file-preview">
           {opened ? (
             <pre>{filePreviewText(opened)}</pre>
           ) : searchResult ? (
             <SearchResults result={searchResult} busy={Boolean(searchBusyAction)} onOpenFile={(filePath) => void openFilePath(filePath)} />
           ) : showGitDiff && gitState?.isRepository ? (
-            <GitDiffWorkspace diffSummary={diffSummary} openedDiff={openedDiff} viewMode={diffViewMode} busy={busyAction === "file"} onOpenFile={(file) => void openDiffFile(file)} />
+            <GitDiffWorkspace diffSummary={diffSummary} openedDiff={openedDiff} viewMode={diffViewMode} filesVisible={gitDiffFilesVisible} busy={busyAction === "file"} onOpenFile={(file) => void openDiffFile(file)} />
           ) : (
             <pre>{filePreviewText(opened)}</pre>
           )}
@@ -494,6 +521,7 @@ function GitRepositoryBar({
   originUrl,
   busyAction,
   diffViewMode,
+  diffFilesVisible,
   onRefresh,
   onInitialize,
   onClone,
@@ -501,7 +529,8 @@ function GitRepositoryBar({
   onSetOrigin,
   onSetOriginUrl,
   onCompareRefChange,
-  onDiffViewModeChange
+  onDiffViewModeChange,
+  onDiffFilesVisibleChange
 }: {
   state: GitRepositoryState | undefined;
   compareRef: string;
@@ -511,6 +540,7 @@ function GitRepositoryBar({
   originUrl: string;
   busyAction: GitBusyAction | undefined;
   diffViewMode: DiffViewMode;
+  diffFilesVisible: boolean;
   onRefresh: () => void;
   onInitialize: () => void;
   onClone: () => void;
@@ -519,6 +549,7 @@ function GitRepositoryBar({
   onSetOriginUrl: (value: string) => void;
   onCompareRefChange: (value: string) => void;
   onDiffViewModeChange: (value: DiffViewMode) => void;
+  onDiffFilesVisibleChange: (value: boolean) => void;
 }) {
   if (!state) {
     return (
@@ -595,6 +626,9 @@ function GitRepositoryBar({
       <span className="git-change-count">{diffSummary ? `${diffSummary.files.length}${diffSummary.truncated ? "+" : ""} changed` : "No diff loaded"}</span>
       {state.setup.canSetOrigin ? <OriginForm originUrl={originUrl} busy={Boolean(busyAction)} onSetOrigin={onSetOrigin} onSetOriginUrl={onSetOriginUrl} compact /> : null}
       {openedDiff ? <span className="git-open-file" title={openedDiff.path}>{openedDiff.path}</span> : null}
+      <button type="button" className="git-bar-end-toggle" aria-pressed={diffFilesVisible} aria-label={diffFilesVisible ? "Hide changed files" : "Show changed files"} title={diffFilesVisible ? "Hide changed files" : "Show changed files"} onClick={() => onDiffFilesVisibleChange(!diffFilesVisible)}>
+        <FileDiff size={14} />
+      </button>
     </div>
   );
 }
@@ -666,10 +700,10 @@ export function searchResultSummary(result: FileSearchResult): string {
   return `${count} ${noun} matched ${result.mode} search "${result.query}" in ${scope}`;
 }
 
-function GitDiffWorkspace({ diffSummary, openedDiff, viewMode, busy, onOpenFile }: { diffSummary: GitDiffSummary | undefined; openedDiff: GitDiffFile | undefined; viewMode: DiffViewMode; busy: boolean; onOpenFile: (file: GitDiffFileSummary) => void }) {
+function GitDiffWorkspace({ diffSummary, openedDiff, viewMode, filesVisible, busy, onOpenFile }: { diffSummary: GitDiffSummary | undefined; openedDiff: GitDiffFile | undefined; viewMode: DiffViewMode; filesVisible: boolean; busy: boolean; onOpenFile: (file: GitDiffFileSummary) => void }) {
   return (
-    <div className="git-diff-workspace">
-      <div className="git-diff-files" aria-label="Changed files">
+    <div className={gitDiffWorkspaceClassName(filesVisible)}>
+      {filesVisible ? <div className="git-diff-files" aria-label="Changed files">
         {diffSummary?.files.length ? (
           diffSummary.files.map((file) => (
             <button key={`${file.statusCode}:${file.path}`} type="button" className={openedDiff?.path === file.path ? "selected" : ""} onClick={() => onOpenFile(file)} disabled={busy}>
@@ -684,10 +718,18 @@ function GitDiffWorkspace({ diffSummary, openedDiff, viewMode, busy, onOpenFile 
             <span>{diffSummary ? "No working-tree changes under this folder." : "Load a Git diff to inspect changes."}</span>
           </div>
         )}
-      </div>
+      </div> : null}
       <GitDiffPreview diffFile={openedDiff} viewMode={viewMode} />
     </div>
   );
+}
+
+export function fileBrowserBodyClassName(treeVisible: boolean): string {
+  return `file-browser-body${treeVisible ? "" : " tree-hidden"}`;
+}
+
+export function gitDiffWorkspaceClassName(filesVisible: boolean): string {
+  return `git-diff-workspace${filesVisible ? "" : " files-hidden"}`;
 }
 
 function StatusBadge({ file }: { file: GitDiffFileSummary }) {

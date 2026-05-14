@@ -1106,10 +1106,19 @@ a:hover svg {
 }
 
 .file-browser-panel {
+  --file-browser-button-hover-background: var(--color-accent-tertiary);
+  --file-browser-button-hover-border: var(--color-accent-tertiary);
+  --file-browser-button-hover-color: var(--color-background);
+  --file-browser-button-hover-shadow: var(--shadow-neon-tertiary);
+  --file-browser-button-selected-background: var(--color-accent);
+  --file-browser-button-selected-border: var(--color-accent);
+  --file-browser-button-selected-color: var(--color-background);
+  --file-browser-button-selected-shadow: var(--shadow-neon);
+
   height: 100%;
   min-height: 0;
   display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto auto minmax(0, 1fr);
   overflow: hidden;
 }
 
@@ -1234,12 +1243,6 @@ a:hover svg {
   display: none;
 }
 
-.file-browser-toolbar button:hover:not(:disabled),
-.file-search-bar button:hover:not(:disabled),
-.file-search-mode button.active,
-.file-list button:hover,
-.git-bar button:hover:not(:disabled),
-.git-view-toggle button.active,
 .worktree-manager-panel button:hover:not(:disabled),
 .web-viewer-toolbar button:hover:not(:disabled),
 .web-viewer-popout:hover,
@@ -1250,6 +1253,32 @@ a:hover svg {
   background: var(--color-accent);
   border-color: var(--color-accent);
   box-shadow: var(--shadow-neon);
+}
+
+.file-browser-panel .file-browser-toolbar button[aria-pressed="true"],
+.file-browser-panel .file-search-mode button.active,
+.file-browser-panel .git-bar button[aria-pressed="true"],
+.file-browser-panel .git-view-toggle button.active,
+.file-browser-panel .git-diff-files button.selected,
+.file-browser-panel .file-search-bar.has-query.collapsed .file-search-toggle {
+  color: var(--file-browser-button-selected-color);
+  background: var(--file-browser-button-selected-background);
+  border-color: var(--file-browser-button-selected-border);
+  box-shadow: var(--file-browser-button-selected-shadow);
+}
+
+.file-browser-panel .file-browser-toolbar button:hover:not(:disabled),
+.file-browser-panel .file-search-bar button:hover:not(:disabled),
+.file-browser-panel .file-list button:hover,
+.file-browser-panel .git-bar button:hover:not(:disabled),
+.file-browser-panel .git-diff-files button:hover:not(:disabled),
+.file-browser-panel .file-search-result-file > button:hover:not(:disabled),
+.file-browser-panel .file-search-matches button:hover:not(:disabled),
+.file-browser-panel .file-search-toggle:hover {
+  color: var(--file-browser-button-hover-color);
+  background: var(--file-browser-button-hover-background);
+  border-color: var(--file-browser-button-hover-border);
+  box-shadow: var(--file-browser-button-hover-shadow);
 }
 
 .file-browser-toolbar span,
@@ -1350,6 +1379,11 @@ a:hover svg {
   text-overflow: ellipsis;
 }
 
+.git-bar-end-toggle {
+  flex: none;
+  margin-left: auto;
+}
+
 .file-search-bar {
   min-width: 0;
   display: grid;
@@ -1434,9 +1468,14 @@ a:hover svg {
 }
 
 .file-browser-body {
+  grid-row: -2 / -1;
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(190px, 30%) minmax(0, 1fr);
+}
+
+.file-browser-body.tree-hidden {
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .file-list {
@@ -1540,6 +1579,10 @@ a:hover svg {
   white-space: pre-wrap;
 }
 
+.file-browser-body.tree-hidden .file-preview {
+  border-left: 0;
+}
+
 .file-preview pre {
   margin: 0;
   white-space: pre-wrap;
@@ -1551,6 +1594,10 @@ a:hover svg {
   height: 100%;
   display: grid;
   grid-template-columns: minmax(190px, 28%) minmax(0, 1fr);
+}
+
+.git-diff-workspace.files-hidden {
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .git-diff-files {
@@ -1580,12 +1627,18 @@ a:hover svg {
   text-align: left;
 }
 
-.git-diff-files button:hover:not(:disabled),
 .git-diff-files button.selected {
-  color: var(--color-background);
-  background: var(--color-accent);
-  border-color: var(--color-accent);
-  box-shadow: var(--shadow-neon);
+  color: var(--file-browser-button-selected-color);
+  background: var(--file-browser-button-selected-background);
+  border-color: var(--file-browser-button-selected-border);
+  box-shadow: var(--file-browser-button-selected-shadow);
+}
+
+.git-diff-files button:hover:not(:disabled) {
+  color: var(--file-browser-button-hover-color);
+  background: var(--file-browser-button-hover-background);
+  border-color: var(--file-browser-button-hover-border);
+  box-shadow: var(--file-browser-button-hover-shadow);
 }
 
 .git-diff-files span {
@@ -1678,10 +1731,10 @@ a:hover svg {
 
 .file-search-result-file > button:hover:not(:disabled),
 .file-search-matches button:hover:not(:disabled) {
-  color: var(--color-background);
-  background: var(--color-accent);
-  border-color: var(--color-accent);
-  box-shadow: var(--shadow-neon);
+  color: var(--file-browser-button-hover-color);
+  background: var(--file-browser-button-hover-background);
+  border-color: var(--file-browser-button-hover-border);
+  box-shadow: var(--file-browser-button-hover-shadow);
 }
 
 .file-search-result-file span,
@@ -2464,6 +2517,10 @@ a:hover svg {
     grid-template-rows: minmax(150px, 36%) minmax(0, 1fr);
   }
 
+  .file-browser-body.tree-hidden {
+    grid-template-rows: minmax(0, 1fr);
+  }
+
   .file-list {
     border-right: 0;
     border-bottom: 1px solid rgb(42 42 58 / 0.92);
@@ -2512,12 +2569,18 @@ a:hover svg {
     white-space: nowrap;
   }
 
-  .file-search-bar.has-query.collapsed .file-search-toggle,
+  .file-search-bar.has-query.collapsed .file-search-toggle {
+    color: var(--file-browser-button-selected-color);
+    background: var(--file-browser-button-selected-background);
+    border-color: var(--file-browser-button-selected-border);
+    box-shadow: var(--file-browser-button-selected-shadow);
+  }
+
   .file-search-toggle:hover {
-    color: var(--color-background);
-    background: var(--color-accent);
-    border-color: var(--color-accent);
-    box-shadow: var(--shadow-neon);
+    color: var(--file-browser-button-hover-color);
+    background: var(--file-browser-button-hover-background);
+    border-color: var(--file-browser-button-hover-border);
+    box-shadow: var(--file-browser-button-hover-shadow);
   }
 
   .file-search-controls {
@@ -2552,6 +2615,10 @@ a:hover svg {
   .git-diff-workspace {
     grid-template-columns: 1fr;
     grid-template-rows: minmax(128px, 34%) minmax(0, 1fr);
+  }
+
+  .git-diff-workspace.files-hidden {
+    grid-template-rows: minmax(0, 1fr);
   }
 
   .git-diff-files {
