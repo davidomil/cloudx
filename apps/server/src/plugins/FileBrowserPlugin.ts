@@ -2,10 +2,11 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import type { CreatePluginSessionInput, PluginActionDefinition, PluginSession, PluginSessionSnapshot, PluginVoiceContext, WorkspacePlugin } from "@cloudx/plugin-api";
-import type { ConfigFieldDescriptor, ConfigValue, GitDiffFile, GitDiffSummary, GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
+import type { ConfigFieldDescriptor, ConfigValue, FileSearchMode, FileSearchResult, GitDiffFile, GitDiffSummary, GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
 
 import { GitService } from "../git/GitService.js";
 import type { PathPolicy } from "../pathPolicy.js";
+import { FileSearchService } from "../search/FileSearchService.js";
 
 const MAX_FILE_BYTES = 96_000;
 const VOICE_PREVIEW_BYTES = 8_000;
@@ -34,6 +35,10 @@ interface GitVoiceState {
   state?: GitRepositoryState;
   diff?: GitDiffSummary;
   openDiffFile?: GitDiffFile;
+}
+
+interface SearchVoiceState {
+  result?: FileSearchResult;
 }
 
 export class FileBrowserPlugin implements WorkspacePlugin {
@@ -78,6 +83,24 @@ export class FileBrowserPlugin implements WorkspacePlugin {
           relativePath: { type: "string", description: "Relative file path to open." }
         },
         required: ["relativePath"],
+        additionalProperties: false
+      }
+    },
+    {
+      name: "search_files",
+      description: "Search files below the tab working directory by filename or by grep-style file contents.",
+      voiceExposed: true,
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Filename substring or ripgrep-compatible content regular expression." },
+          mode: { type: "string", enum: ["all", "filename", "content"], description: "Search mode. Use all for path/name and content search, filename for path/name search, and content for grep-style text search." },
+          relativePath: { type: "string", description: "Optional relative directory scope. Empty string means tab cwd." },
+          caseSensitive: { type: "boolean", description: "Whether matching should be case-sensitive. Default is false." },
+          glob: { type: "string", description: "Optional ripgrep glob such as *.ts or !*.test.ts." },
+          maxResults: { type: "number", description: "Maximum number of matching files to return, capped by the server." }
+        },
+        required: ["query"],
         additionalProperties: false
       }
     },
@@ -190,7 +213,8 @@ export class FileBrowserPlugin implements WorkspacePlugin {
 
   constructor(
     private readonly pathPolicy: PathPolicy,
-    private readonly gitService = new GitService()
+    private readonly gitService = new GitService(),
+    private readonly fileSearchService = new FileSearchService()
   ) {}
 
   descriptor() {
@@ -208,7 +232,7 @@ export class FileBrowserPlugin implements WorkspacePlugin {
   }
 
   createSession(input: CreatePluginSessionInput): PluginSession {
-    return new FileBrowserSession(input.tab, this.pathPolicy, this.gitService, input.getConfig ?? (() => input.config ?? {}));
+    return new FileBrowserSession(input.tab, this.pathPolicy, this.gitService, this.fileSearchService, input.getConfig ?? (() => input.config ?? {}));
   }
 }
 
@@ -216,11 +240,13 @@ class FileBrowserSession implements PluginSession {
   private currentDirectory: DirectoryVoiceState | undefined;
   private openFile: OpenFileVoiceState | undefined;
   private git: GitVoiceState = {};
+  private search: SearchVoiceState = {};
 
   constructor(
     public readonly tab: WorkspaceTab,
     private readonly pathPolicy: PathPolicy,
     private readonly gitService: GitService,
+    private readonly fileSearchService: FileSearchService,
     private readonly getConfig: () => Record<string, ConfigValue>
   ) {}
 
@@ -238,19 +264,21 @@ class FileBrowserSession implements PluginSession {
   voiceContext(): PluginVoiceContext {
     const directoryText = this.currentDirectoryText();
     const openFileText = this.openFile ? `Open file ${this.openFile.relativePath}:\n${this.openFile.contentPreview}` : undefined;
+    const searchText = this.searchContextText();
     const gitText = this.gitDiffEnabled() ? this.gitContextText() : undefined;
-    const visibleText = [directoryText, openFileText, gitText].filter(Boolean).join("\n\n");
+    const visibleText = [directoryText, openFileText, searchText, gitText].filter(Boolean).join("\n\n");
     return {
       kind: "file-browser",
       cwd: this.tab.cwd,
       status: this.tab.status,
-      summary: "File browser session. Use list_directory and open_file to inspect files, Git diff actions to review repository changes, and replace_in_file or write_file to edit files.",
+      summary: "File browser session. Use list_directory, search_files, and open_file to inspect files, Git diff actions to review repository changes, and replace_in_file or write_file to edit files.",
       visibleText: visibleText || undefined,
       currentPath: this.currentDirectory?.path,
       currentRelativePath: this.currentDirectory?.relativePath,
       openFile: this.openFile,
       metadata: {
         listedEntryCount: this.currentDirectory?.entries.length ?? 0,
+        searchResultCount: this.search.result?.files.length ?? 0,
         gitRepository: this.git.state?.isRepository,
         gitChangedFileCount: this.git.diff?.files.length
       }
@@ -279,6 +307,18 @@ class FileBrowserSession implements PluginSession {
     if (action === "open_file") {
       const result = await this.openTextFile(requireString(input.relativePath, "relativePath"));
       return result;
+    }
+    if (action === "search_files") {
+      const result = await this.fileSearchService.search(this.tab.cwd, {
+        query: requireString(input.query, "query"),
+        mode: optionalSearchMode(input.mode),
+        relativePath: await this.searchRelativePath(optionalString(input.relativePath, "relativePath")),
+        caseSensitive: optionalBoolean(input.caseSensitive, "caseSensitive"),
+        glob: optionalString(input.glob, "glob"),
+        maxResults: optionalNumber(input.maxResults, "maxResults")
+      });
+      this.search.result = result;
+      return result as unknown as Record<string, unknown>;
     }
     if (action === "replace_in_file") {
       const relativePath = requireString(input.relativePath, "relativePath");
@@ -368,6 +408,19 @@ class FileBrowserSession implements PluginSession {
     return this.pathPolicy.resolve(path.resolve(this.tab.cwd, relativePath || "."));
   }
 
+  private async searchRelativePath(relativePath: string | undefined): Promise<string> {
+    const directory = this.resolveUnderCwd(relativePath ?? ".");
+    const relative = path.relative(this.tab.cwd, directory);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      throw new Error("Search path is outside the tab working directory.");
+    }
+    const stat = await fs.stat(directory);
+    if (!stat.isDirectory()) {
+      throw new Error(`Search path is not a directory: ${directory}`);
+    }
+    return relative ? relative.split(path.sep).join("/") : ".";
+  }
+
   private async openTextFile(relativePath: string): Promise<Record<string, unknown>> {
     const filePath = this.resolveUnderCwd(relativePath);
     const stat = await this.requireFile(filePath);
@@ -450,6 +503,20 @@ class FileBrowserSession implements PluginSession {
     return [`Git repository ${this.git.state.currentBranch ?? this.git.state.headRef ?? ""}`.trim(), files ? `Changed files:\n${files}` : undefined, open].filter(Boolean).join("\n");
   }
 
+  private searchContextText(): string | undefined {
+    const result = this.search.result;
+    if (!result) {
+      return undefined;
+    }
+    const files = result.files.map((file) => {
+      const firstMatch = file.matches[0];
+      const location = firstMatch?.lineNumber ? `:${firstMatch.lineNumber}` : "";
+      const text = firstMatch?.text ? `\t${firstMatch.text.trim()}` : "";
+      return `${file.path}${location}${text}`;
+    });
+    return [`Search ${result.mode} "${result.query}" in ${result.relativePath}:`, files.length ? files.join("\n") : "No matches."].join("\n");
+  }
+
   private gitDiffEnabled(): boolean {
     return this.getConfig().showGitDiff !== false;
   }
@@ -473,6 +540,37 @@ function optionalString(value: unknown, name: string): string | undefined {
     return undefined;
   }
   return requireString(value, name);
+}
+
+function optionalBoolean(value: unknown, name: string): boolean | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "boolean") {
+    throw new Error(`${name} must be a boolean.`);
+  }
+  return value;
+}
+
+function optionalNumber(value: unknown, name: string): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`${name} must be a number.`);
+  }
+  return value;
+}
+
+function optionalSearchMode(value: unknown): FileSearchMode | undefined {
+  const mode = optionalString(value, "mode");
+  if (mode === undefined) {
+    return undefined;
+  }
+  if (mode !== "all" && mode !== "filename" && mode !== "content") {
+    throw new Error("mode must be all, filename, or content.");
+  }
+  return mode;
 }
 
 function countOccurrences(content: string, needle: string): number {

@@ -4,7 +4,7 @@ import path from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import type { WorkspaceTab } from "@cloudx/shared";
+import type { FileSearchResult, WorkspaceTab } from "@cloudx/shared";
 
 import { PathPolicy } from "../pathPolicy.js";
 import { FileBrowserPlugin } from "./FileBrowserPlugin.js";
@@ -73,6 +73,113 @@ describe("FileBrowserPlugin", () => {
       relativePath: "notes/todo.md",
       contentPreview: "ship it\n"
     });
+  });
+
+  it("searches files by filename and content and exposes search results to voice context", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-files-"));
+    await fs.mkdir(path.join(root, "src"));
+    await fs.writeFile(path.join(root, "README.md"), "hello Cloudx\n");
+    await fs.writeFile(path.join(root, "src", "App.tsx"), "export const title = 'Cloudx Search';\n");
+    await fs.writeFile(path.join(root, "src", "App.test.tsx"), "Cloudx Search test\n");
+    await fs.writeFile(path.join(root, ".hidden.md"), "Cloudx hidden\n");
+    const tab: WorkspaceTab = {
+      id: "tab-1",
+      pluginId: "file-browser",
+      title: "Files",
+      cwd: root,
+      status: "running",
+      indicator: { color: "green", label: "OK", updatedAt: new Date(0).toISOString() },
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString()
+    };
+    const session = new FileBrowserPlugin(new PathPolicy([root])).createSession({
+      tab,
+      cwd: root,
+      controls: { setTabIndicator: () => undefined, closeTab: () => undefined }
+    });
+
+    const filenameResult = (await session.handleAction("search_files", {
+      query: "read",
+      mode: "filename"
+    })) as unknown as FileSearchResult;
+    const contentResult = (await session.handleAction("search_files", {
+      query: "cloudx search",
+      mode: "content",
+      relativePath: "src",
+      glob: "!*.test.tsx"
+    })) as unknown as FileSearchResult;
+    const context = await session.voiceContext();
+
+    expect(filenameResult.files.map((file) => file.path)).toEqual(["README.md"]);
+    expect(contentResult).toMatchObject({
+      mode: "content",
+      relativePath: "src",
+      files: [
+        {
+          path: "src/App.tsx",
+          matches: [expect.objectContaining({ lineNumber: 1, text: "export const title = 'Cloudx Search';\n" })]
+        }
+      ]
+    });
+    expect(contentResult.files.some((file) => file.path === "src/App.test.tsx")).toBe(false);
+    expect(contentResult.files.some((file) => file.path === ".hidden.md")).toBe(false);
+    expect(context.visibleText).toContain('Search content "cloudx search" in src');
+    expect(context.metadata?.searchResultCount).toBe(1);
+  });
+
+  it("searches filenames and contents together by default", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-files-"));
+    await fs.mkdir(path.join(root, "docs"));
+    await fs.writeFile(path.join(root, "docs", "TODO.md"), "# Roadmap\n");
+    await fs.writeFile(path.join(root, "notes.md"), "TODO in content\n");
+    const tab: WorkspaceTab = {
+      id: "tab-1",
+      pluginId: "file-browser",
+      title: "Files",
+      cwd: root,
+      status: "running",
+      indicator: { color: "green", label: "OK", updatedAt: new Date(0).toISOString() },
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString()
+    };
+    const session = new FileBrowserPlugin(new PathPolicy([root])).createSession({
+      tab,
+      cwd: root,
+      controls: { setTabIndicator: () => undefined, closeTab: () => undefined }
+    });
+
+    const result = (await session.handleAction("search_files", { query: "TODO" })) as unknown as FileSearchResult;
+
+    expect(result.mode).toBe("all");
+    expect(result.files.map((file) => file.path)).toEqual(["docs/TODO.md", "notes.md"]);
+  });
+
+  it("includes matching folders in filename search", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-files-"));
+    await fs.mkdir(path.join(root, "docs"));
+    await fs.writeFile(path.join(root, "docs", "TODO.md"), "# Roadmap\n");
+    const tab: WorkspaceTab = {
+      id: "tab-1",
+      pluginId: "file-browser",
+      title: "Files",
+      cwd: root,
+      status: "running",
+      indicator: { color: "green", label: "OK", updatedAt: new Date(0).toISOString() },
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString()
+    };
+    const session = new FileBrowserPlugin(new PathPolicy([root])).createSession({
+      tab,
+      cwd: root,
+      controls: { setTabIndicator: () => undefined, closeTab: () => undefined }
+    });
+
+    const result = (await session.handleAction("search_files", { query: "docs", mode: "filename" })) as unknown as FileSearchResult;
+
+    expect(result.files).toEqual([
+      expect.objectContaining({ path: "docs", entryType: "directory" }),
+      expect.objectContaining({ path: "docs/TODO.md", entryType: "file" })
+    ]);
   });
 
   it("rejects Git diff actions when the plugin config disables them", async () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { filePreviewText, mergeGitChangesIntoEntries, parsePatch, type OpenFileResult } from "./FileBrowserPanel.js";
+import { buildSearchInput, filePreviewText, mergeGitChangesIntoEntries, parsePatch, searchEntriesFromResult, searchResultSummary, type OpenFileResult } from "./FileBrowserPanel.js";
 
 describe("filePreviewText", () => {
   it("uses relative paths when the server returns them", () => {
@@ -16,6 +16,85 @@ describe("filePreviewText", () => {
 
   it("falls back to path for older open file results", () => {
     expect(filePreviewText({ path: "/workspace/README.md", truncated: true, content: "partial" })).toBe("/workspace/README.md\n[truncated]\npartial");
+  });
+});
+
+describe("searchResultSummary", () => {
+  it("summarizes scoped and truncated search results", () => {
+    expect(
+      searchResultSummary({
+        query: "Cloudx",
+        mode: "content",
+        relativePath: "src",
+        files: [
+          { path: "src/App.tsx", type: "content", matches: [{ lineNumber: 1, column: 14, text: "Cloudx" }], truncated: false },
+          { path: "src/main.tsx", type: "content", matches: [{ lineNumber: 2, column: 1, text: "Cloudx" }], truncated: false }
+        ],
+        truncated: true,
+        searchedAt: new Date(0).toISOString()
+      })
+    ).toBe('2+ files matched content search "Cloudx" in src');
+  });
+});
+
+describe("buildSearchInput", () => {
+  it("searches from the tab root by default and trims query and glob text", () => {
+    expect(buildSearchInput("  Cloudx  ", "all", "  *.ts  ")).toEqual({
+      query: "Cloudx",
+      mode: "all",
+      relativePath: "",
+      caseSensitive: false,
+      glob: "*.ts"
+    });
+  });
+
+  it("returns undefined for empty search text", () => {
+    expect(buildSearchInput("   ", "filename", "")).toBeUndefined();
+  });
+});
+
+describe("searchEntriesFromResult", () => {
+  it("builds active tree entries only for direct search results", () => {
+    const entries = searchEntriesFromResult({
+      query: "TODO",
+      mode: "all",
+      relativePath: ".",
+      files: [
+        {
+          path: "docs/TODO.md",
+          type: "all",
+          entryType: "file",
+          matches: [{ text: "docs/TODO.md", matchText: "TODO" }],
+          truncated: false
+        }
+      ],
+      truncated: false,
+      searchedAt: new Date(0).toISOString()
+    });
+
+    expect(entries).toEqual([expect.objectContaining({ name: "docs/TODO.md", type: "file", searchPath: "docs/TODO.md" })]);
+    expect(entries).not.toContainEqual(expect.objectContaining({ name: "docs", type: "directory", searchPath: "docs" }));
+  });
+
+  it("keeps directory entries when the backend reports the directory itself as a match", () => {
+    const entries = searchEntriesFromResult({
+      query: "docs",
+      mode: "filename",
+      relativePath: ".",
+      files: [
+        {
+          path: "docs",
+          type: "filename",
+          entryType: "directory",
+          matches: [{ text: "docs", matchText: "docs" }],
+          truncated: false
+        }
+      ],
+      truncated: false,
+      searchedAt: new Date(0).toISOString()
+    });
+
+    expect(entries).toEqual([expect.objectContaining({ name: "docs", type: "directory", searchPath: "docs" })]);
   });
 });
 

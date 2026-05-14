@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { Diff, Hunk, parseDiff, type DiffType, type FileData, type HunkData, type ViewType } from "react-diff-view";
 import "react-diff-view/style/index.css";
-import { FileDiff, FileText, Folder, GitBranch, GitFork, GitPullRequest, RefreshCw } from "lucide-react";
+import { FileDiff, FileText, Folder, GitBranch, GitFork, GitPullRequest, RefreshCw, Search } from "lucide-react";
 
-import type { ConfigValue, GitDiffFile, GitDiffFileSummary, GitDiffSummary, GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
+import type { ConfigValue, FileSearchFileResult, FileSearchMode, FileSearchResult, GitDiffFile, GitDiffFileSummary, GitDiffSummary, GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
 
 import { runTabAction } from "../api.js";
 
@@ -15,6 +15,8 @@ interface DirectoryEntry {
 interface DisplayDirectoryEntry extends DirectoryEntry {
   gitChange?: GitTreeChange;
   virtual?: boolean;
+  searchPath?: string;
+  searchMatch?: FileSearchFileResult;
 }
 
 interface DirectoryResult {
@@ -30,6 +32,7 @@ export interface OpenFileResult {
 }
 
 type GitBusyAction = "state" | "diff" | "file" | "initialize" | "clone" | "origin";
+type SearchBusyAction = "search";
 type DiffViewMode = Extract<ViewType, "split" | "unified">;
 
 interface GitTreeChange {
@@ -51,9 +54,19 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   const [cloneUrl, setCloneUrl] = useState("");
   const [originUrl, setOriginUrl] = useState("");
   const [busyAction, setBusyAction] = useState<GitBusyAction | undefined>();
+  const [searchBusyAction, setSearchBusyAction] = useState<SearchBusyAction | undefined>();
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchMode, setSearchMode] = useState<FileSearchMode>("all");
+  const [searchGlob, setSearchGlob] = useState("");
+  const [searchResult, setSearchResult] = useState<FileSearchResult | undefined>();
   const [error, setError] = useState<string | undefined>();
   const showGitDiff = config.showGitDiff !== false;
-  const visibleEntries = useMemo(() => mergeGitChangesIntoEntries(entries, relativePath, showGitDiff ? diffSummary : undefined), [entries, relativePath, diffSummary, showGitDiff]);
+  const activeSearchQuery = searchQuery.trim();
+  const activeSearchResult = searchResult?.query === activeSearchQuery && searchResult.mode === searchMode ? searchResult : undefined;
+  const visibleEntries = useMemo(
+    () => (activeSearchQuery ? searchEntriesFromResult(activeSearchResult) : mergeGitChangesIntoEntries(entries, relativePath, showGitDiff ? diffSummary : undefined)),
+    [activeSearchQuery, activeSearchResult, entries, relativePath, diffSummary, showGitDiff]
+  );
 
   useEffect(() => {
     void loadDirectory("");
@@ -74,6 +87,42 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     window.addEventListener("resize", updateViewMode);
     return () => window.removeEventListener("resize", updateViewMode);
   }, []);
+
+  useEffect(() => {
+    const input = buildSearchInput(searchQuery, searchMode, searchGlob);
+    if (!input) {
+      setSearchResult(undefined);
+      setSearchBusyAction(undefined);
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      setSearchBusyAction("search");
+      setError(undefined);
+      void runTabAction<FileSearchResult>(tab.id, "search_files", input)
+        .then((result) => {
+          if (!cancelled) {
+            setSearchResult(result);
+            setOpened(undefined);
+            setOpenedDiff(undefined);
+          }
+        })
+        .catch((err) => {
+          if (!cancelled) {
+            setError(err instanceof Error ? err.message : String(err));
+          }
+        })
+        .finally(() => {
+          if (!cancelled) {
+            setSearchBusyAction(undefined);
+          }
+        });
+    }, 250);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [tab.id, searchQuery, searchMode, searchGlob]);
 
   async function loadDirectory(path: string) {
     setError(undefined);
@@ -199,14 +248,36 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   }
 
   async function openFile(name: string) {
+    await openFilePath(relativePath ? `${relativePath}/${name}` : name);
+  }
+
+  async function openFilePath(filePath: string) {
     setError(undefined);
     try {
-      const filePath = relativePath ? `${relativePath}/${name}` : name;
       const result = await runTabAction<OpenFileResult>(tab.id, "open_file", { relativePath: filePath });
       setOpened(result);
       setOpenedDiff(undefined);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function runSearch() {
+    const input = buildSearchInput(searchQuery, searchMode, searchGlob);
+    if (!input) {
+      return;
+    }
+    setSearchBusyAction("search");
+    setError(undefined);
+    try {
+      const result = await runTabAction<FileSearchResult>(tab.id, "search_files", input);
+      setSearchResult(result);
+      setOpened(undefined);
+      setOpenedDiff(undefined);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSearchBusyAction(undefined);
     }
   }
 
@@ -219,6 +290,16 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
           <RefreshCw size={15} />
         </button>
       </div>
+      <SearchBar
+        query={searchQuery}
+        mode={searchMode}
+        glob={searchGlob}
+        busy={Boolean(searchBusyAction)}
+        onQueryChange={setSearchQuery}
+        onModeChange={setSearchMode}
+        onGlobChange={setSearchGlob}
+        onSearch={() => void runSearch()}
+      />
       {showGitDiff ? <GitRepositoryBar
         state={gitState}
         compareRef={compareRef}
@@ -243,10 +324,13 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
       {error ? <div className="inline-error">{error}</div> : null}
       <div className="file-browser-body">
         <div className="file-list">
+          {activeSearchQuery && searchBusyAction ? <div className="file-list-empty">Searching...</div> : null}
+          {activeSearchQuery && !searchBusyAction && activeSearchResult && visibleEntries.length === 0 ? <div className="file-list-empty">No matches.</div> : null}
           {visibleEntries.map((entry) => (
             <button key={`${entry.type}:${entry.name}:${entry.virtual ? "virtual" : "real"}`} className={entry.gitChange ? "has-git-change" : ""} onClick={() => void handleFileListEntry(entry)}>
               {entry.type === "directory" ? <Folder size={15} /> : <FileText size={15} />}
               <span>{entry.name}</span>
+              {entry.searchMatch ? <SearchMatchBadge entry={entry} /> : null}
               {entry.gitChange ? <TreeChangeBadge change={entry.gitChange} /> : null}
             </button>
           ))}
@@ -254,6 +338,8 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
         <div className="file-preview">
           {opened ? (
             <pre>{filePreviewText(opened)}</pre>
+          ) : searchResult ? (
+            <SearchResults result={searchResult} busy={Boolean(searchBusyAction)} onOpenFile={(filePath) => void openFilePath(filePath)} />
           ) : showGitDiff && gitState?.isRepository ? (
             <GitDiffWorkspace diffSummary={diffSummary} openedDiff={openedDiff} viewMode={diffViewMode} busy={busyAction === "file"} onOpenFile={(file) => void openDiffFile(file)} />
           ) : (
@@ -265,6 +351,15 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   );
 
   async function handleFileListEntry(entry: DisplayDirectoryEntry) {
+    if (entry.searchPath) {
+      if (entry.type === "directory") {
+        setSearchQuery("");
+        await loadDirectory(entry.searchPath);
+        return;
+      }
+      await openFilePath(entry.searchPath);
+      return;
+    }
     if (entry.type === "directory") {
       await loadDirectory(relativePath ? `${relativePath}/${entry.name}` : entry.name);
       return;
@@ -275,6 +370,91 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     }
     await openFile(entry.name);
   }
+}
+
+function SearchMatchBadge({ entry }: { entry: DisplayDirectoryEntry }) {
+  if (!entry.searchMatch) {
+    return null;
+  }
+  return <span className="tree-search-badge">{entry.type === "directory" ? "dir" : entry.searchMatch.matches.length}</span>;
+}
+
+function SearchBar({
+  query,
+  mode,
+  glob,
+  busy,
+  onQueryChange,
+  onModeChange,
+  onGlobChange,
+  onSearch
+}: {
+  query: string;
+  mode: FileSearchMode;
+  glob: string;
+  busy: boolean;
+  onQueryChange: (value: string) => void;
+  onModeChange: (value: FileSearchMode) => void;
+  onGlobChange: (value: string) => void;
+  onSearch: () => void;
+}) {
+  return (
+    <form
+      className="file-search-bar"
+      onSubmit={(event) => {
+        event.preventDefault();
+        onSearch();
+      }}
+    >
+      <span className="file-search-status" title={busy ? "Searching files" : "Search is live"} aria-label={busy ? "Searching files" : "Search is live"} aria-busy={busy}>
+        <Search size={15} className={busy ? "spinning" : ""} />
+      </span>
+      <input value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder={mode === "filename" ? "Find filenames" : mode === "content" ? "Search contents" : "Search files"} aria-label="Search files" />
+      <div className="file-search-mode" role="group" aria-label="File search mode">
+        <button type="button" className={mode === "all" ? "active" : ""} onClick={() => onModeChange("all")}>
+          All
+        </button>
+        <button type="button" className={mode === "content" ? "active" : ""} onClick={() => onModeChange("content")}>
+          Contents
+        </button>
+        <button type="button" className={mode === "filename" ? "active" : ""} onClick={() => onModeChange("filename")}>
+          Names
+        </button>
+      </div>
+      <input className="file-search-glob" value={glob} onChange={(event) => onGlobChange(event.target.value)} placeholder="Glob" aria-label="Search glob" />
+    </form>
+  );
+}
+
+export function buildSearchInput(query: string, mode: FileSearchMode, glob: string): Record<string, unknown> | undefined {
+  const trimmedQuery = query.trim();
+  if (!trimmedQuery) {
+    return undefined;
+  }
+  const trimmedGlob = glob.trim();
+  return {
+    query: trimmedQuery,
+    mode,
+    relativePath: "",
+    caseSensitive: false,
+    ...(trimmedGlob ? { glob: trimmedGlob } : {})
+  };
+}
+
+export function searchEntriesFromResult(result: FileSearchResult | undefined): DisplayDirectoryEntry[] {
+  if (!result) {
+    return [];
+  }
+  const entries = new Map<string, DisplayDirectoryEntry>();
+  for (const file of result.files) {
+    entries.set(`${file.entryType ?? "file"}:${file.path}`, {
+      name: file.path,
+      type: file.entryType ?? "file",
+      searchPath: file.path,
+      searchMatch: file
+    });
+  }
+  return Array.from(entries.values()).sort((left, right) => `${left.type}:${left.name}`.localeCompare(`${right.type}:${right.name}`));
 }
 
 function TreeChangeBadge({ change }: { change: GitTreeChange }) {
@@ -415,6 +595,56 @@ function OriginForm({ originUrl, busy, compact, onSetOrigin, onSetOriginUrl }: {
       </button>
     </form>
   );
+}
+
+function SearchResults({ result, busy, onOpenFile }: { result: FileSearchResult; busy: boolean; onOpenFile: (filePath: string) => void }) {
+  if (!result.files.length) {
+    return (
+      <div className="file-search-results empty">
+        <Search size={22} />
+        <span>No matches for {result.query}.</span>
+      </div>
+    );
+  }
+  return (
+    <div className="file-search-results">
+      <div className="file-search-summary">{searchResultSummary(result)}</div>
+      <div className="file-search-result-list">
+        {result.files.map((file) => (
+          <SearchResultFile key={`${file.type}:${file.path}`} file={file} busy={busy} onOpenFile={onOpenFile} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SearchResultFile({ file, busy, onOpenFile }: { file: FileSearchFileResult; busy: boolean; onOpenFile: (filePath: string) => void }) {
+  return (
+    <div className="file-search-result-file">
+      <button type="button" onClick={() => onOpenFile(file.path)} disabled={busy}>
+        <FileText size={15} />
+        <span>{file.path}</span>
+        {file.truncated ? <small>truncated</small> : null}
+      </button>
+      {file.matches.length ? (
+        <div className="file-search-matches">
+          {file.matches.map((match, index) => (
+            <button key={`${file.path}:${match.lineNumber ?? 0}:${index}`} type="button" onClick={() => onOpenFile(file.path)} disabled={busy}>
+              {match.lineNumber ? <small>{match.lineNumber}:{match.column ?? 1}</small> : null}
+              <span>{match.text.trim() || file.path}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+export function searchResultSummary(result: FileSearchResult): string {
+  const scope = result.relativePath === "." ? "." : result.relativePath;
+  const count = `${result.files.length}${result.truncated ? "+" : ""}`;
+  const noun = result.files.length === 1 && !result.truncated ? "file" : "files";
+  return `${count} ${noun} matched ${result.mode} search "${result.query}" in ${scope}`;
 }
 
 function GitDiffWorkspace({ diffSummary, openedDiff, viewMode, busy, onOpenFile }: { diffSummary: GitDiffSummary | undefined; openedDiff: GitDiffFile | undefined; viewMode: DiffViewMode; busy: boolean; onOpenFile: (file: GitDiffFileSummary) => void }) {

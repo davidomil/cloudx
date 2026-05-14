@@ -162,6 +162,33 @@ export interface GitDiffFile {
   message?: string;
 }
 
+export type FileSearchMode = "all" | "filename" | "content";
+
+export interface FileSearchMatch {
+  lineNumber?: number;
+  column?: number;
+  text: string;
+  matchText?: string;
+}
+
+export interface FileSearchFileResult {
+  path: string;
+  type: FileSearchMode;
+  entryType?: "file" | "directory";
+  matches: FileSearchMatch[];
+  truncated: boolean;
+}
+
+export interface FileSearchResult {
+  query: string;
+  mode: FileSearchMode;
+  relativePath: string;
+  glob?: string;
+  files: FileSearchFileResult[];
+  truncated: boolean;
+  searchedAt: string;
+}
+
 export type WorktreeProjectStatus = "empty" | "blocked" | "ready";
 
 export type WorktreeRefKind = "local" | "remote" | "tag";

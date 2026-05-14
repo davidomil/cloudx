@@ -8,6 +8,7 @@ to run Cloudx with voice control.
 - Node.js 22 or newer.
 - OpenSSL 3.x or newer.
 - Python 3.9 or newer; Python 3.12 is tested locally.
+- ripgrep (`rg`) for file-browser search.
 - Codex CLI installed and authenticated on the backend host.
 - A trusted LAN or private tailnet for remote laptop/phone access.
 
@@ -18,6 +19,7 @@ clearly at runtime if it is unavailable.
 
 ```bash
 npm install
+sudo apt install ripgrep
 python3 -m venv services/asr/.venv
 services/asr/.venv/bin/pip install -e services/asr
 ```
@@ -61,8 +63,9 @@ For a small first test, omit `CLOUDX_ASR_MODEL_PATH` and set
 
 ## Systemd User Services
 
-This command creates the Python venv if needed, downloads the large-v3 model,
-builds Cloudx, writes user-level units, and starts both services:
+This command installs ripgrep on Debian/Ubuntu when missing, creates the Python
+venv if needed, downloads the large-v3 model, builds Cloudx, writes user-level
+units, and starts both services:
 
 ```bash
 npm run service:install

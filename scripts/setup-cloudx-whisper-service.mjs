@@ -28,6 +28,7 @@ const device = resolveDevice();
 const computeType = device === "cuda" ? "float16" : "int8";
 const defaultCpuThreads = Math.max(1, Math.floor((typeof os.availableParallelism === "function" ? os.availableParallelism() : os.cpus().length || 4) / 2));
 
+ensureRipgrep();
 run(python, ["-m", "venv", "--upgrade-deps", venvDir]);
 run(pipPath, ["install", "-e", `${asrDir}[dev]`, "huggingface_hub[cli]"]);
 
@@ -138,6 +139,20 @@ function findCommand(name) {
     throw new Error(`Missing required command: ${name}`);
   }
   return result.stdout.trim();
+}
+
+function ensureRipgrep() {
+  const existing = spawnSync("sh", ["-lc", "command -v rg"], { encoding: "utf8" });
+  if (existing.status === 0) {
+    console.log(`ripgrep already available: ${existing.stdout.trim()}`);
+    return;
+  }
+  if (spawnSync("sh", ["-lc", "command -v apt-get"], { stdio: "ignore" }).status === 0) {
+    run("sudo", ["apt-get", "update"]);
+    run("sudo", ["apt-get", "install", "-y", "ripgrep"]);
+    return;
+  }
+  throw new Error("Missing required command: rg. Install ripgrep with your system package manager, for example `sudo apt install ripgrep` on Debian/Ubuntu.");
 }
 
 function run(command, args) {

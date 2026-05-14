@@ -858,6 +858,7 @@ a:hover svg {
 }
 
 .web-viewer-toolbar input,
+.file-search-bar input,
 .worktree-manager-panel input,
 .worktree-manager-panel select,
 .dialog input,
@@ -870,6 +871,7 @@ a:hover svg {
 }
 
 .web-viewer-toolbar input,
+.file-search-bar input,
 .worktree-manager-panel input,
 .worktree-manager-panel select,
 .dialog input,
@@ -881,6 +883,7 @@ a:hover svg {
 }
 
 .web-viewer-toolbar input::placeholder,
+.file-search-bar input::placeholder,
 .worktree-manager-panel input::placeholder,
 .dialog input::placeholder,
 .voice-console textarea::placeholder {
@@ -888,6 +891,7 @@ a:hover svg {
 }
 
 .web-viewer-toolbar input:focus,
+.file-search-bar input:focus,
 .worktree-manager-panel input:focus,
 .worktree-manager-panel select:focus,
 .dialog input:focus,
@@ -897,6 +901,7 @@ a:hover svg {
 }
 
 .file-browser-toolbar button,
+.file-search-bar button,
 .file-list button,
 .git-bar button,
 .git-bar input,
@@ -916,6 +921,7 @@ a:hover svg {
 .web-viewer-toolbar button,
 .web-viewer-popout,
 .file-browser-toolbar button,
+.file-search-bar button,
 .worktree-toolbar button,
 .git-bar button {
   min-width: 40px;
@@ -933,6 +939,8 @@ a:hover svg {
 }
 
 .file-browser-toolbar button:hover:not(:disabled),
+.file-search-bar button:hover:not(:disabled),
+.file-search-mode button.active,
 .file-list button:hover,
 .git-bar button:hover:not(:disabled),
 .git-view-toggle button.active,
@@ -1046,6 +1054,51 @@ a:hover svg {
   text-overflow: ellipsis;
 }
 
+.file-search-bar {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(160px, 1fr) auto minmax(90px, 140px);
+  align-items: center;
+  gap: 8px;
+  padding: 7px;
+  color: var(--color-muted-foreground);
+  background: rgb(13 13 20 / 0.9);
+  border-bottom: 1px solid rgb(42 42 58 / 0.72);
+}
+
+.file-search-status {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  color: var(--color-accent-tertiary);
+}
+
+.file-search-status .spinning {
+  animation: file-search-spin 0.8s linear infinite;
+}
+
+@keyframes file-search-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.file-search-mode {
+  display: flex;
+  align-items: center;
+  gap: 0;
+}
+
+.file-search-mode button {
+  min-width: 76px;
+  border-color: rgb(0 212 255 / 0.28);
+}
+
+.file-search-glob {
+  max-width: 140px;
+}
+
 .inline-error {
   padding: 9px 11px;
   color: #ffe4ea;
@@ -1096,7 +1149,7 @@ a:hover svg {
 .file-list button {
   min-height: 34px;
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 8px;
   padding: 0 9px;
@@ -1129,6 +1182,31 @@ a:hover svg {
   font-size: 11px;
   line-height: 1;
   white-space: nowrap;
+}
+
+.tree-search-badge {
+  min-width: 24px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  padding: 0 5px;
+  color: var(--color-background);
+  background: var(--color-accent-secondary);
+  clip-path: var(--chamfer-xs);
+  font-family: var(--font-label);
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.file-list-empty {
+  min-height: 34px;
+  display: grid;
+  place-items: center;
+  color: var(--color-muted-foreground);
+  font-family: var(--font-label);
+  font-size: 12px;
+  text-transform: uppercase;
 }
 
 .tree-change-badge.added,
@@ -1237,7 +1315,8 @@ a:hover svg {
 }
 
 .git-diff-empty,
-.git-diff-preview.empty {
+.git-diff-preview.empty,
+.file-search-results.empty {
   min-height: 0;
   display: grid;
   place-items: center;
@@ -1245,6 +1324,90 @@ a:hover svg {
   padding: 16px;
   color: var(--color-muted-foreground);
   text-align: center;
+}
+
+.file-search-results {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
+}
+
+.file-search-summary {
+  color: var(--color-muted-foreground);
+  font-family: var(--font-label);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.file-search-result-list {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: auto;
+}
+
+.file-search-result-file {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.file-search-result-file > button,
+.file-search-matches button {
+  min-width: 0;
+  min-height: 34px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 0 9px;
+  color: var(--color-accent-tertiary);
+  background: transparent;
+  border: 1px solid var(--color-border);
+  clip-path: var(--chamfer-sm);
+  cursor: pointer;
+  text-align: left;
+}
+
+.file-search-result-file > button:hover:not(:disabled),
+.file-search-matches button:hover:not(:disabled) {
+  color: var(--color-background);
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+  box-shadow: var(--shadow-neon);
+}
+
+.file-search-result-file span,
+.file-search-matches span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-search-result-file small,
+.file-search-matches small {
+  color: var(--color-muted-foreground);
+  font-family: var(--font-label);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.file-search-matches {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+  padding-left: 18px;
+}
+
+.file-search-matches button {
+  grid-template-columns: auto minmax(0, 1fr);
+  min-height: 30px;
+  color: var(--color-foreground);
+  background: rgb(18 18 26 / 0.72);
 }
 
 .git-diff-preview {
@@ -1812,6 +1975,19 @@ a:hover svg {
   .git-bar {
     align-items: stretch;
     flex-wrap: wrap;
+  }
+
+  .file-search-bar {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+
+  .file-search-mode,
+  .file-search-glob {
+    grid-column: 2 / -1;
+  }
+
+  .file-search-glob {
+    max-width: none;
   }
 
   .git-diff-workspace {
