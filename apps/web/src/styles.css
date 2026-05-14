@@ -1,5 +1,6 @@
 :root {
   color-scheme: dark;
+  --ui-scale: 1;
   --color-background: #0a0a0f;
   --color-foreground: #e0e0e0;
   --color-card: #12121a;
@@ -51,6 +52,7 @@
   --chamfer-sm: polygon(0 7px, 7px 0, calc(100% - 7px) 0, 100% 7px, 100% calc(100% - 7px), calc(100% - 7px) 100%, 7px 100%, 0 calc(100% - 7px));
   --chamfer: polygon(0 11px, 11px 0, calc(100% - 11px) 0, 100% 11px, 100% calc(100% - 11px), calc(100% - 11px) 100%, 11px 100%, 0 calc(100% - 11px));
   --transition-digital: 120ms steps(4);
+  font-size: calc(16px * var(--ui-scale));
   font-family: var(--font-body);
   background: var(--color-background);
   color: var(--color-foreground);
@@ -637,12 +639,13 @@ a:hover svg {
 }
 
 .cx-button {
-  min-height: 36px;
+  min-height: calc(36px * var(--ui-scale));
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 7px;
+  gap: calc(7px * var(--ui-scale));
   color: var(--control-foreground);
+  font-size: calc(12px * var(--ui-scale));
   background: var(--control-background);
   border: 1px solid var(--control-border);
   clip-path: var(--chamfer-sm);
@@ -651,8 +654,8 @@ a:hover svg {
 
 .cx-button-icon,
 .cx-button-compact {
-  width: 36px;
-  min-width: 36px;
+  width: calc(36px * var(--ui-scale));
+  min-width: calc(36px * var(--ui-scale));
   padding: 0;
 }
 
@@ -690,8 +693,8 @@ a:hover svg {
 .mic-button,
 .mic-source-button,
 .new-tab-inline {
-  width: 38px;
-  height: 36px;
+  width: calc(38px * var(--ui-scale));
+  height: calc(36px * var(--ui-scale));
   display: grid;
   place-items: center;
   color: var(--color-accent-tertiary);
@@ -1392,8 +1395,14 @@ a:hover svg {
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 4px;
   flex: none;
+}
+
+.git-bar-summary,
+.git-compare-control,
+.git-inline-form {
+  gap: 7px;
 }
 
 .git-bar-summary span,
@@ -1445,7 +1454,9 @@ a:hover svg {
 }
 
 .git-view-toggle button {
-  min-width: 64px;
+  width: 40px;
+  min-width: 40px;
+  padding: 0;
   border-color: rgb(0 212 255 / 0.28);
 }
 
@@ -1547,7 +1558,11 @@ a:hover svg {
   grid-row: -2 / -1;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(190px, 30%) minmax(0, 1fr);
+  grid-template-columns: minmax(160px, var(--file-tree-size, 280px)) 7px minmax(0, 1fr);
+}
+
+.file-browser-body.resizing {
+  user-select: none;
 }
 
 .file-browser-body.tree-hidden {
@@ -1563,6 +1578,25 @@ a:hover svg {
   border-right: 1px solid rgb(42 42 58 / 0.92);
   background: rgb(10 10 15 / 0.94);
   overflow: auto;
+}
+
+.file-tree-resize-handle {
+  min-width: 0;
+  min-height: 0;
+  cursor: col-resize;
+  touch-action: none;
+  background:
+    linear-gradient(180deg, transparent, rgb(0 212 255 / 0.24), transparent),
+    rgb(18 18 26 / 0.56);
+  border-right: 1px solid rgb(0 212 255 / 0.18);
+}
+
+.file-tree-resize-handle:hover,
+.file-tree-resize-handle:focus-visible,
+.file-browser-body.resizing .file-tree-resize-handle {
+  background:
+    linear-gradient(180deg, transparent, var(--color-accent-tertiary), transparent),
+    rgb(18 18 26 / 0.86);
 }
 
 .file-list button {
@@ -1650,7 +1684,6 @@ a:hover svg {
   overflow: auto;
   color: var(--color-foreground);
   background: var(--color-background);
-  border-left: 1px solid rgb(0 255 136 / 0.08);
   font: 12px/1.5 var(--font-body);
   white-space: pre-wrap;
 }
@@ -2590,7 +2623,7 @@ a:hover svg {
 
   .file-browser-body {
     grid-template-columns: 1fr;
-    grid-template-rows: minmax(150px, 36%) minmax(0, 1fr);
+    grid-template-rows: minmax(150px, var(--file-tree-size, 280px)) 9px minmax(0, 1fr);
   }
 
   .file-browser-body.tree-hidden {
@@ -2600,6 +2633,15 @@ a:hover svg {
   .file-list {
     border-right: 0;
     border-bottom: 1px solid rgb(42 42 58 / 0.92);
+  }
+
+  .file-tree-resize-handle {
+    cursor: row-resize;
+    background:
+      linear-gradient(90deg, transparent, rgb(0 212 255 / 0.24), transparent),
+      rgb(18 18 26 / 0.56);
+    border-right: 0;
+    border-bottom: 1px solid rgb(0 212 255 / 0.18);
   }
 
   .git-bar {

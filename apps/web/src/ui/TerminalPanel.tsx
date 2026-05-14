@@ -6,6 +6,7 @@ import type { WorkspaceTab } from "@cloudx/shared";
 import { installTerminalMobileScroller } from "./terminalMobileScroll.js";
 import { rowsFittingTerminalViewport } from "./terminalSizing.js";
 import { readTerminalColorTheme, type TerminalColorTheme } from "./theme.js";
+import { DEFAULT_UI_SCALE, scaledTerminalFontSize } from "./uiScale.js";
 
 interface TerminalView {
   terminal: Terminal;
@@ -14,11 +15,12 @@ interface TerminalView {
   container?: HTMLDivElement;
   fitFrame?: number;
   releaseMobileScroll?: () => void;
+  uiScale: number;
 }
 
 const terminalViews = new Map<string, TerminalView>();
 
-export function TerminalPanel({ tab, active }: { tab: WorkspaceTab; active: boolean }) {
+export function TerminalPanel({ tab, active, uiScale }: { tab: WorkspaceTab; active: boolean; uiScale: number }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<TerminalView | null>(null);
   const activeRef = useRef(active);
@@ -30,7 +32,7 @@ export function TerminalPanel({ tab, active }: { tab: WorkspaceTab; active: bool
   useEffect(() => {
     if (!containerRef.current) return;
 
-    const view = getTerminalView(tab, containerRef.current);
+    const view = getTerminalView(tab, containerRef.current, uiScale);
     viewRef.current = view;
 
     const resizeObserver = new ResizeObserver(() => scheduleFitAndResize(view, activeRef.current));
@@ -46,7 +48,7 @@ export function TerminalPanel({ tab, active }: { tab: WorkspaceTab; active: bool
       window.visualViewport?.removeEventListener("resize", onViewportResize);
       viewRef.current = null;
     };
-  }, [tab.id, tab.cwd, tab.title]);
+  }, [tab.id, tab.cwd, tab.title, uiScale]);
 
   useEffect(() => {
     const view = viewRef.current;
@@ -78,9 +80,10 @@ export function disposeTerminalViewsExcept(activeTabIds: Set<string>): void {
   }
 }
 
-function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement): TerminalView {
+function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement, uiScale: number): TerminalView {
   const existing = terminalViews.get(tab.id);
   if (existing) {
+    existing.uiScale = uiScale;
     attachTerminalView(existing, container);
     return existing;
   }
@@ -88,7 +91,7 @@ function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement): Terminal
   const terminal = new Terminal({
     cursorBlink: true,
     fontFamily: "JetBrains Mono, SFMono-Regular, Consolas, monospace",
-    fontSize: 13,
+    fontSize: responsiveTerminalFontSize(container, uiScale),
     lineHeight: 1.25,
     theme: readTerminalColorTheme()
   });
@@ -97,7 +100,7 @@ function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement): Terminal
 
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
   const socket = new WebSocket(`${protocol}://${window.location.host}/ws/terminal/${tab.id}`);
-  const view = { terminal, fit, socket };
+  const view = { terminal, fit, socket, uiScale };
   terminalViews.set(tab.id, view);
   attachTerminalView(view, container);
   terminal.writeln(`Cloudx tab ${tab.title}`);
@@ -110,7 +113,7 @@ function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement): Terminal
       terminal.write(message.data);
     }
   });
-  socket.addEventListener("open", () => fitAndResize({ terminal, fit, socket }));
+  socket.addEventListener("open", () => fitAndResize(view));
   terminal.onData((data) => {
     if (socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: "input", data }));
@@ -123,6 +126,13 @@ function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement): Terminal
 export function applyTerminalColorTheme(theme: TerminalColorTheme): void {
   for (const view of terminalViews.values()) {
     view.terminal.options.theme = theme;
+  }
+}
+
+export function applyTerminalUiScale(uiScale: number): void {
+  for (const view of terminalViews.values()) {
+    view.uiScale = uiScale;
+    scheduleFitAndResize(view);
   }
 }
 
@@ -162,7 +172,7 @@ function fitAndResize(view: TerminalView, focus = false): void {
   if (!view.terminal.element) {
     return;
   }
-  const fontSize = responsiveTerminalFontSize(view.container);
+  const fontSize = responsiveTerminalFontSize(view.container, view.uiScale);
   if (view.terminal.options.fontSize !== fontSize) {
     view.terminal.options.fontSize = fontSize;
   }
@@ -198,13 +208,13 @@ function scheduleFitAndResize(view: TerminalView, focus = false): void {
   });
 }
 
-function responsiveTerminalFontSize(container: HTMLDivElement | undefined): number {
+export function responsiveTerminalFontSize(container: HTMLDivElement | undefined, uiScale = DEFAULT_UI_SCALE): number {
   const width = container?.clientWidth ?? window.innerWidth;
+  let baseFontSize = 13;
   if (width < 520) {
-    return 12;
+    baseFontSize = 12;
+  } else if (width > 1400) {
+    baseFontSize = 14;
   }
-  if (width > 1400) {
-    return 14;
-  }
-  return 13;
+  return scaledTerminalFontSize(baseFontSize, uiScale);
 }

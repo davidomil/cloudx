@@ -15,13 +15,13 @@ describe("ConfigService", () => {
 
     expect(service.getResponse()).toMatchObject({
       values: {
-        global: { aiControlEnabled: true, microphoneEnabled: true, themeId: "cloudx-neon" },
+        global: { aiControlEnabled: true, microphoneEnabled: true, themeId: "cloudx-neon", uiScale: 100 },
         plugins: { "file-browser": { showGitDiff: true, gitAutoRefresh: true, gitAutoRefreshSeconds: 15 } }
       }
     });
 
     await service.update({
-      global: { aiControlEnabled: false, themeId: "minimalist-dark" },
+      global: { aiControlEnabled: false, themeId: "minimalist-dark", uiScale: 115 },
       plugins: { "file-browser": { showGitDiff: false, gitAutoRefresh: false, gitAutoRefreshSeconds: 30 } }
     });
 
@@ -30,7 +30,7 @@ describe("ConfigService", () => {
     const reloaded = new ConfigService(dataDir, () => [fileBrowserDescriptor()]);
     expect(reloaded.getResponse()).toMatchObject({
       values: {
-        global: { aiControlEnabled: false, microphoneEnabled: true, themeId: "minimalist-dark" },
+        global: { aiControlEnabled: false, microphoneEnabled: true, themeId: "minimalist-dark", uiScale: 115 },
         plugins: { "file-browser": { showGitDiff: false, gitAutoRefresh: false, gitAutoRefreshSeconds: 30 } }
       }
     });
@@ -42,6 +42,8 @@ describe("ConfigService", () => {
 
     await expect(service.update({ global: { nope: true } })).rejects.toThrow("Unknown config key");
     await expect(service.update({ global: { themeId: "missing" } })).rejects.toThrow("must be one of the configured options");
+    await expect(service.update({ global: { uiScale: 50 } })).rejects.toThrow("must be greater than or equal to 75");
+    await expect(service.update({ global: { uiScale: 175 } })).rejects.toThrow("must be less than or equal to 150");
     await expect(service.update({ plugins: { "file-browser": { showGitDiff: "no" } } })).rejects.toThrow("must be a boolean");
     await expect(service.update({ plugins: { "file-browser": { gitAutoRefreshSeconds: 0 } } })).rejects.toThrow("must be greater than or equal to 1");
   });

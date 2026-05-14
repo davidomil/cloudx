@@ -1,7 +1,7 @@
-import { useEffect, useId, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { Diff, Hunk, parseDiff, type DiffType, type FileData, type HunkData, type ViewType } from "react-diff-view";
 import "react-diff-view/style/index.css";
-import { FileDiff, FileText, Folder, GitBranch, GitFork, GitPullRequest, RefreshCw, Search } from "lucide-react";
+import { AlignJustify, FileDiff, FileText, Folder, GitBranch, GitCompareArrows, GitFork, GitPullRequest, RefreshCw, Search } from "lucide-react";
 
 import type { ConfigValue, FileSearchFileResult, FileSearchMode, FileSearchResult, GitDiffFile, GitDiffFileSummary, GitDiffSummary, GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
 
@@ -36,6 +36,9 @@ type GitBusyAction = "state" | "diff" | "file" | "initialize" | "clone" | "origi
 type SearchBusyAction = "search";
 type DiffViewMode = Extract<ViewType, "split" | "unified">;
 const DEFAULT_GIT_AUTO_REFRESH_SECONDS = 15;
+const DEFAULT_FILE_TREE_SIZE = 280;
+const MIN_FILE_TREE_SIZE = 160;
+const FILE_TREE_RESIZE_STEP = 24;
 
 interface GitTreeChange {
   status: GitDiffFileSummary["status"];
@@ -66,7 +69,10 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   const [searchVisible, setSearchVisible] = useState(false);
   const [gitBarVisible, setGitBarVisible] = useState(true);
   const [gitDiffFilesVisible, setGitDiffFilesVisible] = useState(true);
+  const [fileTreeSize, setFileTreeSize] = useState(DEFAULT_FILE_TREE_SIZE);
+  const [fileTreeResizing, setFileTreeResizing] = useState(false);
   const [error, setError] = useState<string | undefined>();
+  const bodyRef = useRef<HTMLDivElement | null>(null);
   const showGitDiff = config.showGitDiff !== false;
   const gitAutoRefresh = config.gitAutoRefresh !== false;
   const gitAutoRefreshIntervalMs = gitAutoRefreshIntervalMilliseconds(config);
@@ -376,7 +382,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
         onDiffFilesVisibleChange={setGitDiffFilesVisible}
       /> : null}
       {error ? <div className="inline-error">{error}</div> : null}
-      <div className={fileBrowserBodyClassName(treeVisible)}>
+      <div ref={bodyRef} className={fileBrowserBodyClassName(treeVisible, fileTreeResizing)} style={fileBrowserBodyStyle(fileTreeSize)}>
         {treeVisible ? <div className="file-list">
           {activeSearchQuery && searchBusyAction ? <div className="file-list-empty">Searching...</div> : null}
           {activeSearchQuery && !searchBusyAction && activeSearchResult && visibleEntries.length === 0 ? <div className="file-list-empty">No matches.</div> : null}
@@ -389,6 +395,18 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
             </ControlButton>
           ))}
         </div> : null}
+        {treeVisible ? (
+          <div
+            className="file-tree-resize-handle"
+            role="separator"
+            aria-label="Resize file tree"
+            aria-orientation="vertical"
+            tabIndex={0}
+            title="Resize file tree"
+            onPointerDown={startFileTreeResize}
+            onKeyDown={handleFileTreeResizeKeyDown}
+          />
+        ) : null}
         <div className="file-preview">
           {opened ? (
             <pre>{filePreviewText(opened)}</pre>
@@ -403,6 +421,44 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
       </div>
     </div>
   );
+
+  function handleFileTreeResizeKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    const delta = event.key === "ArrowRight" || event.key === "ArrowDown" ? FILE_TREE_RESIZE_STEP : event.key === "ArrowLeft" || event.key === "ArrowUp" ? -FILE_TREE_RESIZE_STEP : 0;
+    if (delta === 0) {
+      return;
+    }
+    event.preventDefault();
+    setFileTreeSize((current) => clampFileBrowserTreeSize(current + delta, fileTreeResizeContainerSize(bodyRef.current)));
+  }
+
+  function startFileTreeResize(event: ReactPointerEvent<HTMLDivElement>) {
+    event.preventDefault();
+    const container = bodyRef.current;
+    if (!container) {
+      return;
+    }
+    const axis = fileTreeResizeAxis();
+    const rect = container.getBoundingClientRect();
+    const containerSize = axis === "x" ? rect.width : rect.height;
+    setFileTreeResizing(true);
+
+    function resize(pointerEvent: PointerEvent) {
+      const rawSize = axis === "x" ? pointerEvent.clientX - rect.left : pointerEvent.clientY - rect.top;
+      setFileTreeSize(clampFileBrowserTreeSize(rawSize, containerSize));
+    }
+
+    function stopResize() {
+      setFileTreeResizing(false);
+      window.removeEventListener("pointermove", resize);
+      window.removeEventListener("pointerup", stopResize);
+      window.removeEventListener("pointercancel", stopResize);
+    }
+
+    window.addEventListener("pointermove", resize);
+    window.addEventListener("pointerup", stopResize);
+    window.addEventListener("pointercancel", stopResize);
+    resize(event.nativeEvent);
+  }
 
   async function handleFileListEntry(entry: DisplayDirectoryEntry) {
     if (entry.searchPath) {
@@ -664,11 +720,11 @@ function GitRepositoryBar({
         </select>
       </label>
       <SegmentedControl className="git-view-toggle" label="Diff view mode">
-        <ControlButton type="button" className={diffViewMode === "split" ? "active" : ""} selected={diffViewMode === "split"} onClick={() => onDiffViewModeChange("split")}>
-          Split
+        <ControlButton type="button" className={diffViewMode === "unified" ? "active" : ""} iconOnly selected={diffViewMode === "unified"} aria-label="Unified diff view" title="Unified diff view" onClick={() => onDiffViewModeChange("unified")}>
+          <AlignJustify size={14} />
         </ControlButton>
-        <ControlButton type="button" className={diffViewMode === "unified" ? "active" : ""} selected={diffViewMode === "unified"} onClick={() => onDiffViewModeChange("unified")}>
-          Unified
+        <ControlButton type="button" className={diffViewMode === "split" ? "active" : ""} iconOnly selected={diffViewMode === "split"} aria-label="Split diff view" title="Split diff view" onClick={() => onDiffViewModeChange("split")}>
+          <GitCompareArrows size={14} />
         </ControlButton>
       </SegmentedControl>
       <span className="git-change-count">{diffSummary ? `${diffSummary.files.length}${diffSummary.truncated ? "+" : ""} changed` : "No diff loaded"}</span>
@@ -772,8 +828,20 @@ function GitDiffWorkspace({ diffSummary, openedDiff, viewMode, filesVisible, bus
   );
 }
 
-export function fileBrowserBodyClassName(treeVisible: boolean): string {
-  return `file-browser-body${treeVisible ? "" : " tree-hidden"}`;
+export function fileBrowserBodyClassName(treeVisible: boolean, resizing = false): string {
+  return `file-browser-body${treeVisible ? "" : " tree-hidden"}${resizing ? " resizing" : ""}`;
+}
+
+export function fileBrowserBodyStyle(treeSize: number): CSSProperties {
+  return { "--file-tree-size": `${treeSize}px` } as CSSProperties;
+}
+
+export function clampFileBrowserTreeSize(size: number, containerSize: number): number {
+  if (!Number.isFinite(size)) {
+    return DEFAULT_FILE_TREE_SIZE;
+  }
+  const maxSize = Math.max(MIN_FILE_TREE_SIZE, Math.min(640, containerSize - MIN_FILE_TREE_SIZE));
+  return Math.round(Math.min(maxSize, Math.max(MIN_FILE_TREE_SIZE, size)));
 }
 
 export function gitDiffWorkspaceClassName(filesVisible: boolean): string {
@@ -934,6 +1002,18 @@ function parentPath(relativePath: string): string {
   return parts.join("/");
 }
 
-function defaultDiffViewMode(): DiffViewMode {
-  return typeof window !== "undefined" && window.innerWidth < 760 ? "unified" : "split";
+export function defaultDiffViewMode(): DiffViewMode {
+  return "unified";
+}
+
+function fileTreeResizeAxis(): "x" | "y" {
+  return window.matchMedia("(max-width: 760px)").matches ? "y" : "x";
+}
+
+function fileTreeResizeContainerSize(container: HTMLElement | null): number {
+  if (!container) {
+    return window.innerWidth;
+  }
+  const rect = container.getBoundingClientRect();
+  return fileTreeResizeAxis() === "x" ? rect.width : rect.height;
 }

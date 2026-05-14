@@ -27,6 +27,16 @@ export const GLOBAL_CONFIG_FIELDS: ConfigFieldDescriptor[] = [
     description: "Choose the active CloudX visual theme.",
     defaultValue: DEFAULT_CLOUDX_THEME_ID,
     options: CLOUDX_THEME_OPTIONS
+  },
+  {
+    key: "uiScale",
+    label: "UI scale",
+    type: "number",
+    description: "Scale CloudX controls, text, and terminal typography as a percentage.",
+    defaultValue: 100,
+    min: 75,
+    max: 150,
+    step: 5
   }
 ];
 

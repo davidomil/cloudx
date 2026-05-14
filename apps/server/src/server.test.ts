@@ -67,14 +67,14 @@ describe("buildServer", () => {
     try {
       const initial = await app.inject({ method: "GET", url: "/api/config" });
       expect(initial.statusCode).toBe(200);
-      expect(initial.json().values.global).toMatchObject({ aiControlEnabled: true, microphoneEnabled: true, themeId: "cloudx-neon" });
+      expect(initial.json().values.global).toMatchObject({ aiControlEnabled: true, microphoneEnabled: true, themeId: "cloudx-neon", uiScale: 100 });
       expect(initial.json().values.plugins["file-browser"]).toMatchObject({ showGitDiff: true, gitAutoRefresh: true, gitAutoRefreshSeconds: 15 });
 
       const updated = await app.inject({
         method: "PATCH",
         url: "/api/config",
         payload: {
-          global: { aiControlEnabled: false, themeId: "minimalist-dark" },
+          global: { aiControlEnabled: false, themeId: "minimalist-dark", uiScale: 115 },
           plugins: { "file-browser": { showGitDiff: false, gitAutoRefresh: false, gitAutoRefreshSeconds: 30 } }
         }
       });
@@ -82,6 +82,7 @@ describe("buildServer", () => {
       expect(updated.statusCode).toBe(200);
       expect(updated.json().values.global.aiControlEnabled).toBe(false);
       expect(updated.json().values.global.themeId).toBe("minimalist-dark");
+      expect(updated.json().values.global.uiScale).toBe(115);
       expect(updated.json().values.plugins["file-browser"].showGitDiff).toBe(false);
       expect(updated.json().values.plugins["file-browser"].gitAutoRefresh).toBe(false);
       expect(updated.json().values.plugins["file-browser"].gitAutoRefreshSeconds).toBe(30);

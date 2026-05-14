@@ -50,8 +50,9 @@ import {
 import { shouldSubmitVoiceConsoleKey } from "./keyboard.js";
 import { SettingsDialog } from "./SettingsDialog.js";
 import { clearFocusedAttention, isTabFocused, updateAttentionTabs } from "./tabAttention.js";
-import { applyTerminalColorTheme, disposeTerminalView, disposeTerminalViewsExcept, TerminalPanel } from "./TerminalPanel.js";
+import { applyTerminalColorTheme, applyTerminalUiScale, disposeTerminalView, disposeTerminalViewsExcept, TerminalPanel } from "./TerminalPanel.js";
 import { applyCloudxTheme, readTerminalColorTheme } from "./theme.js";
+import { normalizeUiScale, uiScaleFactor } from "./uiScale.js";
 import { attemptPortraitOrientationLock } from "./orientationLock.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
 import { applyVoiceWorkspaceResults, buildClientVoiceContext, voiceConsoleValue } from "./voiceWorkspace.js";
@@ -268,6 +269,7 @@ export function App() {
   const microphoneUnavailableReason = getMicrophoneUnavailableReason();
   const aiControlEnabled = config?.values.global.aiControlEnabled !== false;
   const microphoneEnabled = aiControlEnabled && config?.values.global.microphoneEnabled !== false;
+  const uiScale = normalizeUiScale(config?.values.global.uiScale);
   const voiceConsoleText = voiceConsoleValue(voiceState, manualTranscript, voiceMessage, liveTranscript);
   const mobileActionsEnabled = useMediaQuery(MOBILE_ACTIONS_QUERY);
 
@@ -281,6 +283,11 @@ export function App() {
     applyCloudxTheme(config.values.global.themeId);
     applyTerminalColorTheme(readTerminalColorTheme());
   }, [config?.values.global.themeId]);
+
+  useEffect(() => {
+    document.documentElement.style.setProperty("--ui-scale", uiScaleFactor(uiScale));
+    applyTerminalUiScale(uiScale);
+  }, [uiScale]);
 
   async function refresh() {
     setConnectionStatus("checking");
@@ -946,7 +953,7 @@ export function App() {
         </div>
         <div className="pane-body">
           {pane.activeTabId && tabById.has(pane.activeTabId) ? (
-            <PluginPanel tab={tabById.get(pane.activeTabId)!} plugin={pluginById.get(tabById.get(pane.activeTabId)!.pluginId)} active={paneActive} config={pluginConfig(tabById.get(pane.activeTabId)!.pluginId)} />
+            <PluginPanel tab={tabById.get(pane.activeTabId)!} plugin={pluginById.get(tabById.get(pane.activeTabId)!.pluginId)} active={paneActive} config={pluginConfig(tabById.get(pane.activeTabId)!.pluginId)} uiScale={uiScale} />
           ) : (
             <div className="empty-pane">
               <PanelTopOpen size={28} />
@@ -1349,7 +1356,7 @@ function TabIndicatorDot({ tab, attention }: { tab: WorkspaceTab; attention?: bo
   return <span className={`tab-indicator ${tab.indicator.color} ${attention ? "attention" : ""}`} title={title} aria-label={title} />;
 }
 
-function PluginPanel({ tab, plugin, active, config }: { tab: WorkspaceTab; plugin: PluginDescriptor | undefined; active: boolean; config: Record<string, ConfigValue> }) {
+function PluginPanel({ tab, plugin, active, config, uiScale }: { tab: WorkspaceTab; plugin: PluginDescriptor | undefined; active: boolean; config: Record<string, ConfigValue>; uiScale: number }) {
   if (plugin?.panelKind === "file-browser") {
     return <FileBrowserPanel tab={tab} config={config} />;
   }
@@ -1360,7 +1367,7 @@ function PluginPanel({ tab, plugin, active, config }: { tab: WorkspaceTab; plugi
     return <WorktreeManagerPanel tab={tab} />;
   }
   if (plugin?.panelKind === "terminal" || !plugin) {
-    return <TerminalPanel tab={tab} active={active} />;
+    return <TerminalPanel tab={tab} active={active} uiScale={uiScale} />;
   }
   return <div className="empty-pane">No panel registered for {plugin.displayName}</div>;
 }

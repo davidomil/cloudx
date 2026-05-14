@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { GitRepositoryState } from "@cloudx/shared";
 
-import { buildSearchInput, fileBrowserBodyClassName, filePreviewText, gitAutoRefreshIntervalMilliseconds, gitDiffWorkspaceClassName, mergeGitChangesIntoEntries, parsePatch, resolveNextCompareRef, searchEntriesFromResult, searchResultSummary, type OpenFileResult } from "./FileBrowserPanel.js";
+import { buildSearchInput, clampFileBrowserTreeSize, defaultDiffViewMode, fileBrowserBodyClassName, fileBrowserBodyStyle, filePreviewText, gitAutoRefreshIntervalMilliseconds, gitDiffWorkspaceClassName, mergeGitChangesIntoEntries, parsePatch, resolveNextCompareRef, searchEntriesFromResult, searchResultSummary, type OpenFileResult } from "./FileBrowserPanel.js";
 
 describe("filePreviewText", () => {
   it("uses relative paths when the server returns them", () => {
@@ -56,6 +56,10 @@ describe("buildSearchInput", () => {
 });
 
 describe("git auto-refresh helpers", () => {
+  it("defaults rendered Git diffs to unified view", () => {
+    expect(defaultDiffViewMode()).toBe("unified");
+  });
+
   it("uses a 15 second interval by default and configured seconds when provided", () => {
     expect(gitAutoRefreshIntervalMilliseconds({})).toBe(15_000);
     expect(gitAutoRefreshIntervalMilliseconds({ gitAutoRefreshSeconds: 30 })).toBe(30_000);
@@ -86,8 +90,16 @@ describe("file browser visibility class names", () => {
   it("adds layout modifiers when the tree or diff files are hidden", () => {
     expect(fileBrowserBodyClassName(true)).toBe("file-browser-body");
     expect(fileBrowserBodyClassName(false)).toBe("file-browser-body tree-hidden");
+    expect(fileBrowserBodyClassName(true, true)).toBe("file-browser-body resizing");
     expect(gitDiffWorkspaceClassName(true)).toBe("git-diff-workspace");
     expect(gitDiffWorkspaceClassName(false)).toBe("git-diff-workspace files-hidden");
+  });
+
+  it("clamps and exposes the resizable tree size", () => {
+    expect(clampFileBrowserTreeSize(120, 800)).toBe(160);
+    expect(clampFileBrowserTreeSize(320, 800)).toBe(320);
+    expect(clampFileBrowserTreeSize(900, 800)).toBe(640);
+    expect(fileBrowserBodyStyle(320)).toEqual({ "--file-tree-size": "320px" });
   });
 });
 
