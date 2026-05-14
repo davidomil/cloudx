@@ -156,6 +156,8 @@ export function App() {
   const activeTabIdRef = useRef<string | undefined>(undefined);
   const createTargetPaneIdRef = useRef<string | undefined>(undefined);
   const persistLayoutTimerRef = useRef<number | undefined>(undefined);
+  const pendingLayoutPersistWindowIdRef = useRef<string | undefined>(undefined);
+  const pendingLayoutPersistRef = useRef<TabLayoutState | undefined>(undefined);
   const audioSessionRef = useRef<VoiceAudioStreamSession | undefined>(undefined);
   const topbarMicControlRef = useRef<HTMLDivElement | null>(null);
   const footerMicControlRef = useRef<HTMLDivElement | null>(null);
@@ -172,7 +174,7 @@ export function App() {
             windows: update.windows,
             activeWindowId: update.activeWindowId,
             templates: update.templates
-          });
+          }, { preservePendingLayout: true });
         } else {
           applyWorkspaceTabs(update.tabs, update.activeTabId);
         }
@@ -295,18 +297,19 @@ export function App() {
     }
   }
 
-  function applyWorkspaceState(state: WorkspaceStateResponse) {
-    const nextLayout = state.windows.find((window) => window.id === state.activeWindowId)?.layout ?? state.windows[0]?.layout ?? defaultLayout();
-    tabsRef.current = state.tabs;
-    windowsRef.current = state.windows;
-    activeWindowIdRef.current = state.activeWindowId;
+  function applyWorkspaceState(state: WorkspaceStateResponse, options: { preservePendingLayout?: boolean } = {}) {
+    const effectiveState = options.preservePendingLayout ? workspaceStateWithPreservedLayout(state, layoutRef.current, pendingLayoutPersistWindowIdRef.current) : state;
+    const nextLayout = effectiveState.windows.find((window) => window.id === effectiveState.activeWindowId)?.layout ?? effectiveState.windows[0]?.layout ?? defaultLayout();
+    tabsRef.current = effectiveState.tabs;
+    windowsRef.current = effectiveState.windows;
+    activeWindowIdRef.current = effectiveState.activeWindowId;
     layoutRef.current = nextLayout;
-    activeTabIdRef.current = state.activeTabId;
-    setTabs(state.tabs);
-    setWindows(state.windows);
-    setActiveWindowId(state.activeWindowId);
-    setTemplates(state.templates);
-    setActiveTabId(state.activeTabId);
+    activeTabIdRef.current = effectiveState.activeTabId;
+    setTabs(effectiveState.tabs);
+    setWindows(effectiveState.windows);
+    setActiveWindowId(effectiveState.activeWindowId);
+    setTemplates(effectiveState.templates);
+    setActiveTabId(effectiveState.activeTabId);
     commitLayout(nextLayout, { persist: false });
   }
 
@@ -345,11 +348,21 @@ export function App() {
     if (options.persist === false || !windowId) {
       return;
     }
+    pendingLayoutPersistWindowIdRef.current = windowId;
+    pendingLayoutPersistRef.current = nextLayout;
     if (persistLayoutTimerRef.current !== undefined) {
       window.clearTimeout(persistLayoutTimerRef.current);
     }
+    const layoutForPersistence = nextLayout;
     persistLayoutTimerRef.current = window.setTimeout(() => {
-      void updateWindow(windowId, { layout: nextLayout }).catch((err) => setError(err instanceof Error ? err.message : String(err)));
+      void updateWindow(windowId, { layout: layoutForPersistence })
+        .then(() => {
+          if (pendingLayoutPersistWindowIdRef.current === windowId && pendingLayoutPersistRef.current === layoutForPersistence) {
+            pendingLayoutPersistWindowIdRef.current = undefined;
+            pendingLayoutPersistRef.current = undefined;
+          }
+        })
+        .catch((err) => setError(err instanceof Error ? err.message : String(err)));
     }, 200);
   }
 
@@ -1418,6 +1431,16 @@ function upsertTab(tabs: WorkspaceTab[], tab: WorkspaceTab): WorkspaceTab[] {
     return [...tabs, tab];
   }
   return [...tabs.slice(0, existingIndex), tab, ...tabs.slice(existingIndex + 1)];
+}
+
+export function workspaceStateWithPreservedLayout(state: WorkspaceStateResponse, localLayout: TabLayoutState, pendingWindowId: string | undefined): WorkspaceStateResponse {
+  if (!pendingWindowId || state.activeWindowId !== pendingWindowId) {
+    return state;
+  }
+  return {
+    ...state,
+    windows: state.windows.map((window) => (window.id === pendingWindowId ? { ...window, layout: localLayout } : window))
+  };
 }
 
 function getMicrophoneUnavailableReason(): string | undefined {
