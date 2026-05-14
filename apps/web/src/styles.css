@@ -991,10 +991,53 @@ a:hover svg {
 
 .terminal-panel .xterm {
   height: 100%;
+  touch-action: none;
 }
 
 .terminal-panel .xterm-viewport {
   background-color: transparent !important;
+  overscroll-behavior: contain;
+  touch-action: none;
+}
+
+.terminal-panel .xterm-screen {
+  touch-action: none;
+}
+
+.terminal-mobile-scroll-rail {
+  display: none;
+  position: absolute;
+  z-index: 6;
+  top: 15px;
+  right: 2px;
+  bottom: 6px;
+  width: 30px;
+  border-radius: 8px;
+  opacity: 0;
+  touch-action: none;
+  transition: opacity 140ms ease;
+}
+
+.terminal-mobile-scroll-thumb {
+  position: absolute;
+  top: 0;
+  right: 8px;
+  width: 8px;
+  min-height: 38px;
+  border-radius: 999px;
+  background: rgb(0 212 255 / 0.46);
+  box-shadow: 0 0 12px rgb(0 212 255 / 0.25);
+}
+
+.terminal-panel:focus-within .terminal-mobile-scroll-rail,
+.terminal-panel:hover .terminal-mobile-scroll-rail,
+.terminal-mobile-scroll-rail:active {
+  opacity: 1;
+}
+
+.terminal-mobile-scroll-rail.is-hidden {
+  opacity: 0;
+  pointer-events: none;
 }
 
 .empty-pane {
@@ -2375,6 +2418,12 @@ a:hover svg {
     -webkit-overflow-scrolling: touch;
   }
 
+  .pane-root.terminal-touch-scroll-lock {
+    overflow: hidden;
+    overscroll-behavior: contain;
+    touch-action: none;
+  }
+
   .pane-split,
   .pane-split.row,
   .pane-split.column,
@@ -2398,11 +2447,16 @@ a:hover svg {
   }
 
   .terminal-panel {
-    padding: 15px 6px 6px;
+    padding: 15px 20px 6px 6px;
   }
 
   .terminal-panel .xterm {
     font-size: 13px;
+  }
+
+  .terminal-mobile-scroll-rail {
+    display: block;
+    opacity: 0.7;
   }
 
   .file-browser-body {

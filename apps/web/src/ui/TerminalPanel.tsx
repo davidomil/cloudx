@@ -3,6 +3,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 
 import type { WorkspaceTab } from "@cloudx/shared";
+import { installTerminalMobileScroller } from "./terminalMobileScroll.js";
 import { rowsFittingTerminalViewport } from "./terminalSizing.js";
 
 interface TerminalView {
@@ -11,6 +12,7 @@ interface TerminalView {
   socket: WebSocket;
   container?: HTMLDivElement;
   fitFrame?: number;
+  releaseMobileScroll?: () => void;
 }
 
 const terminalViews = new Map<string, TerminalView>();
@@ -62,6 +64,7 @@ export function disposeTerminalView(tabId: string): void {
     window.cancelAnimationFrame(view.fitFrame);
   }
   view.socket.close();
+  view.releaseMobileScroll?.();
   view.terminal.dispose();
   terminalViews.delete(tabId);
 }
@@ -128,10 +131,12 @@ function attachTerminalView(view: TerminalView, container: HTMLDivElement): void
     if (view.terminal.element.parentElement !== container) {
       container.appendChild(view.terminal.element);
     }
+    installMobileScrollForView(view, container);
     return;
   }
   view.terminal.open(container);
   removeInactiveTerminalElements(container, view.terminal.element);
+  installMobileScrollForView(view, container);
 }
 
 function removeInactiveTerminalElements(container: HTMLDivElement, activeElement: HTMLElement | undefined): void {
@@ -140,6 +145,15 @@ function removeInactiveTerminalElements(container: HTMLDivElement, activeElement
       child.remove();
     }
   }
+}
+
+function installMobileScrollForView(view: TerminalView, container: HTMLDivElement): void {
+  view.releaseMobileScroll?.();
+  if (!view.terminal.element) {
+    view.releaseMobileScroll = undefined;
+    return;
+  }
+  view.releaseMobileScroll = installTerminalMobileScroller(view.terminal, container, container.closest(".pane-root"));
 }
 
 function fitAndResize(view: TerminalView, focus = false): void {
