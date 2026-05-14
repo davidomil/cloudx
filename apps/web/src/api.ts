@@ -1,4 +1,22 @@
-import type { CloudxConfigResponse, CloudxConfigValues, CreateTabRequest, CreateTabResponse, PathOptionsResponse, PathOption, PluginDescriptor, VoiceExecutionResult, WorkspaceTab } from "@cloudx/shared";
+import type {
+  ApplyWorkspaceLayoutTemplateRequest,
+  CloudxConfigResponse,
+  CloudxConfigValues,
+  CreateTabRequest,
+  CreateTabResponse,
+  CreateWorkspaceLayoutTemplateRequest,
+  CreateWorkspaceWindowRequest,
+  PathOptionsResponse,
+  PathOption,
+  PluginDescriptor,
+  SearchWorkspaceWindowsResponse,
+  UpdateWorkspaceLayoutTemplateRequest,
+  UpdateWorkspaceWindowRequest,
+  VoiceExecutionResult,
+  WorkspaceLayoutTemplate,
+  WorkspaceStateResponse,
+  WorkspaceTab
+} from "@cloudx/shared";
 
 export interface HealthResponse {
   status: string;
@@ -65,6 +83,64 @@ export async function getPathOptions(query: string): Promise<PathOption[]> {
 
 export async function getTabs(): Promise<{ tabs: WorkspaceTab[]; activeTabId?: string }> {
   return fetchJson("/api/tabs");
+}
+
+export async function getWorkspace(): Promise<WorkspaceStateResponse> {
+  return fetchJson("/api/workspace");
+}
+
+export async function createWindow(input: CreateWorkspaceWindowRequest): Promise<WorkspaceStateResponse> {
+  return fetchJson("/api/windows", {
+    method: "POST",
+    body: JSON.stringify(input)
+  });
+}
+
+export async function updateWindow(windowId: string, input: UpdateWorkspaceWindowRequest): Promise<WorkspaceStateResponse> {
+  return fetchJson(`/api/windows/${windowId}`, {
+    method: "PATCH",
+    body: JSON.stringify(input)
+  });
+}
+
+export async function selectWindow(windowId: string): Promise<WorkspaceStateResponse> {
+  return fetchJson(`/api/windows/${windowId}/active`, { method: "POST", body: "{}" });
+}
+
+export async function deleteWindow(windowId: string): Promise<WorkspaceStateResponse> {
+  return fetchJson(`/api/windows/${windowId}`, { method: "DELETE" });
+}
+
+export async function searchWorkspaceWindows(query: string): Promise<SearchWorkspaceWindowsResponse> {
+  return fetchJson("/api/windows/search-context", {
+    method: "POST",
+    body: JSON.stringify({ query })
+  });
+}
+
+export async function saveLayoutTemplate(input: CreateWorkspaceLayoutTemplateRequest): Promise<{ template: WorkspaceLayoutTemplate; workspace: WorkspaceStateResponse }> {
+  return fetchJson("/api/layout-templates", {
+    method: "POST",
+    body: JSON.stringify(input)
+  });
+}
+
+export async function applyLayoutTemplate(templateId: string, input: ApplyWorkspaceLayoutTemplateRequest): Promise<{ workspace: WorkspaceStateResponse }> {
+  return fetchJson(`/api/layout-templates/${templateId}/apply`, {
+    method: "POST",
+    body: JSON.stringify(input)
+  });
+}
+
+export async function updateLayoutTemplate(templateId: string, input: UpdateWorkspaceLayoutTemplateRequest): Promise<{ template: WorkspaceLayoutTemplate; workspace: WorkspaceStateResponse }> {
+  return fetchJson(`/api/layout-templates/${templateId}`, {
+    method: "PATCH",
+    body: JSON.stringify(input)
+  });
+}
+
+export async function deleteLayoutTemplate(templateId: string): Promise<{ template: WorkspaceLayoutTemplate; workspace: WorkspaceStateResponse }> {
+  return fetchJson(`/api/layout-templates/${templateId}`, { method: "DELETE" });
 }
 
 export async function createTab(input: CreateTabRequest): Promise<WorkspaceTab> {

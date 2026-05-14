@@ -115,15 +115,35 @@ describe("voice workspace helpers", () => {
   });
 
   it("describes client pane positions for voice planning", () => {
-    const context = buildClientVoiceContext(splitLayout(), [tab("tab-1"), tab("tab-2")]);
+    const context = buildClientVoiceContext(splitLayout(), [tab("tab-1"), tab("tab-2")], [window("window-1", "Main", splitLayout())], "window-1");
 
     expect(context).toMatchObject({
+      activeWindowId: "window-1",
+      windows: [{ id: "window-1", name: "Main", active: true, paneCount: 2 }],
       activePaneId: "pane-2",
       panes: [
         { id: "pane-1", position: { horizontal: "left", labels: ["left"] } },
         { id: "pane-2", position: { horizontal: "right", labels: ["right"] } }
       ]
     });
+  });
+
+  it("ignores select-window instructions because server workspace state owns active windows", () => {
+    const result: VoiceExecutionResult = {
+      accepted: true,
+      plan: { transcript: "switch window", summary: "Switch.", actions: [] },
+      results: [
+        {
+          action: "switch_window",
+          ok: true,
+          result: { layoutInstruction: { type: "select_window", windowId: "window-2" } }
+        }
+      ]
+    };
+
+    const current = { layout: splitLayout(), tabs: [tab("tab-1"), tab("tab-2")], activeTabId: "tab-2" };
+
+    expect(applyVoiceWorkspaceResults(current, result, { createPaneId: () => "pane-3", createSplitId: () => "split-2" })).toEqual(current);
   });
 });
 
@@ -147,6 +167,17 @@ function splitLayout(): TabLayoutState {
       ]
     },
     activePaneId: "pane-2"
+  };
+}
+
+function window(id: string, name: string, layout: TabLayoutState) {
+  return {
+    id,
+    name,
+    defaultCwd: "/workspace",
+    layout,
+    createdAt: new Date(0).toISOString(),
+    updatedAt: new Date(0).toISOString()
   };
 }
 

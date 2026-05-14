@@ -12,6 +12,7 @@ import { PluginRegistry } from "./pluginRegistry.js";
 import { SessionStore } from "./sessionStore.js";
 import { LocalWebPlugin } from "./plugins/LocalWebPlugin.js";
 import { WorkspaceControlPlugin, WORKSPACE_CONTROL_PLUGIN_ID } from "./plugins/WorkspaceControlPlugin.js";
+import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
 
 class FakeSession implements PluginSession {
   private readonly dataListeners = new Set<(data: string) => void>();
@@ -342,6 +343,20 @@ describe("SessionStore voice actions", () => {
     ).resolves.toEqual({ layoutInstruction: { type: "split_pane", paneId: "pane-right", splitDirection: "column" } });
   });
 
+  it("switches windows through workspace-control", async () => {
+    const { store, root, workspace } = await createStore({ withWorkspace: true });
+    const target = await workspace!.createWindow({ name: "Backend", defaultCwd: root });
+
+    const result = await store.executeVoiceAction({
+      pluginId: WORKSPACE_CONTROL_PLUGIN_ID,
+      action: "switch_window",
+      input: { title: "Backend" }
+    });
+
+    expect(result).toMatchObject({ activeWindowId: target.id, layoutInstruction: { type: "select_window", windowId: target.id } });
+    await expect(workspace!.state([], undefined)).resolves.toMatchObject({ activeWindowId: target.id });
+  });
+
   it("treats a plugin id in voice targetTabId as the active tab for that plugin", async () => {
     const { store, root } = await createStore();
     const tab = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Shell" });
@@ -401,15 +416,18 @@ describe("SessionStore voice actions", () => {
   });
 });
 
-async function createStore(pluginOptions: { handlesUnhandledVoice?: boolean } = {}) {
+async function createStore(pluginOptions: { handlesUnhandledVoice?: boolean; withWorkspace?: boolean } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-session-store-"));
   const plugin = new FakeDefaultPlugin(pluginOptions);
   const registry = new PluginRegistry();
   registry.register(plugin);
   registry.register(new WorkspaceControlPlugin());
+  const pathPolicy = new PathPolicy([root]);
+  const workspace = pluginOptions.withWorkspace ? new WorkspaceLayoutStore(path.join(root, ".cloudx"), pathPolicy) : undefined;
   return {
     plugin,
     root,
-    store: new SessionStore(registry, new PathPolicy([root]), new TabContextService(path.join(root, ".cloudx")))
+    workspace,
+    store: new SessionStore(registry, pathPolicy, new TabContextService(path.join(root, ".cloudx")), { getPluginConfig: () => ({}) }, workspace)
   };
 }

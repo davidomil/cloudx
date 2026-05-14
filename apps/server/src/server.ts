@@ -5,7 +5,16 @@ import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { RawData, WebSocket } from "ws";
 
-import type { CloudxConfigValues, CreateTabRequest } from "@cloudx/shared";
+import type {
+  ApplyWorkspaceLayoutTemplateRequest,
+  CloudxConfigValues,
+  CreateTabRequest,
+  CreateWorkspaceLayoutTemplateRequest,
+  CreateWorkspaceWindowRequest,
+  SearchWorkspaceWindowsRequest,
+  UpdateWorkspaceLayoutTemplateRequest,
+  UpdateWorkspaceWindowRequest
+} from "@cloudx/shared";
 
 import type { AppConfig } from "./config.js";
 import { ConfigService } from "./configService.js";
@@ -20,6 +29,7 @@ import { StandardTerminalPlugin } from "./plugins/StandardTerminalPlugin.js";
 import { WorktreeManagerPlugin } from "./plugins/WorktreeManagerPlugin.js";
 import { WorkspaceControlPlugin } from "./plugins/WorkspaceControlPlugin.js";
 import { SessionStore } from "./sessionStore.js";
+import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
 import { NodePtyTerminalProcessFactory } from "./terminal/NodePtyTerminalProcess.js";
 import { VoiceController } from "./voice/VoiceController.js";
 import { CodexExecVoicePlanner } from "./voice/VoicePlanner.js";
@@ -36,6 +46,7 @@ export interface AppServices {
   voice: VoiceController;
   asr: AsrClient;
   config?: ConfigService;
+  workspace?: WorkspaceLayoutStore;
 }
 
 const MIN_STREAMED_AUDIO_BYTES = 128;
@@ -53,6 +64,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   });
   services ??= buildServices(config, app.log);
   services.config ??= new ConfigService(config.dataDir, () => services!.plugins.list());
+  services.workspace ??= new WorkspaceLayoutStore(config.dataDir, services.pathPolicy);
   const localWebProxy = new LocalWebProxy(services.sessions);
   await app.register(websocket);
 
@@ -78,6 +90,86 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   }));
 
   app.get("/api/tabs", async () => ({ tabs: services.sessions.listTabs(), activeTabId: services.sessions.getActiveTabId() }));
+
+  app.get("/api/workspace", async () => services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId()));
+
+  app.post<{ Body: CreateWorkspaceWindowRequest }>("/api/windows", async (request, reply) => {
+    const window = await services.workspace!.createWindow(request.body);
+    reply.code(201);
+    return await services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId());
+  });
+
+  app.patch<{ Params: { windowId: string }; Body: UpdateWorkspaceWindowRequest }>("/api/windows/:windowId", async (request) => {
+    await services.workspace!.updateWindow(request.params.windowId, request.body);
+    return await services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId());
+  });
+
+  app.post<{ Params: { windowId: string } }>("/api/windows/:windowId/active", async (request) => {
+    await services.workspace!.selectWindow(request.params.windowId);
+    return await services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId());
+  });
+
+  app.delete<{ Params: { windowId: string } }>("/api/windows/:windowId", async (request) => {
+    const tabIds = services.workspace!.tabIdsForWindow(request.params.windowId);
+    for (const tabId of tabIds) {
+      services.sessions.closeTab(tabId);
+    }
+    await services.workspace!.deleteWindow(request.params.windowId);
+    return await services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId());
+  });
+
+  app.post<{ Body: SearchWorkspaceWindowsRequest }>("/api/windows/search-context", async (request) =>
+    services.workspace!.search(request.body.query ?? "", services.sessions.listTabs(), await services.sessions.sessionTextByTabId())
+  );
+
+  app.post<{ Body: CreateWorkspaceLayoutTemplateRequest }>("/api/layout-templates", async (request, reply) => {
+    const tabsById = new Map(services.sessions.listTabs().map((tab) => [tab.id, tab]));
+    const window = services.workspace!.getWindow(request.body.windowId ?? services.workspace!.getActiveWindow().id);
+    const sources = [];
+    for (const tabId of services.workspace!.tabIdsForWindow(window.id)) {
+      const tab = tabsById.get(tabId);
+      if (!tab) continue;
+      const snapshot = services.sessions.getSession(tab.id).snapshot();
+      sources.push({ tab, initialInput: templateInitialInput(snapshot.state) });
+    }
+    const template = await services.workspace!.createTemplate(request.body, sources);
+    reply.code(201);
+    return { template, workspace: await services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId()) };
+  });
+
+  app.post<{ Params: { templateId: string }; Body: ApplyWorkspaceLayoutTemplateRequest }>("/api/layout-templates/:templateId/apply", async (request, reply) => {
+    const prepared = await services.workspace!.prepareTemplateWindow(request.params.templateId, request.body);
+    const tabIdMap = new Map<string, string>();
+    const createdTabIds: string[] = [];
+    try {
+      for (const templateTab of prepared.template.tabs) {
+        const tabInput = services.workspace!.tabInputForTemplate(templateTab, prepared.projectPath);
+        const tab = await services.sessions.createTab({ pluginId: tabInput.pluginId, cwd: tabInput.cwd, title: tabInput.title, initialInput: tabInput.initialInput });
+        tabIdMap.set(templateTab.id, tab.id);
+        createdTabIds.push(tab.id);
+      }
+      const layout = services.workspace!.remapTemplateLayout(prepared.template, tabIdMap);
+      const window = await services.workspace!.finishTemplateWindow(prepared.window.id, layout);
+      reply.code(201);
+      return { window, workspace: await services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId()) };
+    } catch (error) {
+      for (const tabId of createdTabIds) {
+        services.sessions.closeTab(tabId);
+      }
+      await services.workspace!.deleteWindow(prepared.window.id);
+      throw error;
+    }
+  });
+
+  app.patch<{ Params: { templateId: string }; Body: UpdateWorkspaceLayoutTemplateRequest }>("/api/layout-templates/:templateId", async (request) => {
+    const template = await services.workspace!.updateTemplate(request.params.templateId, request.body);
+    return { template, workspace: await services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId()) };
+  });
+
+  app.delete<{ Params: { templateId: string } }>("/api/layout-templates/:templateId", async (request) => {
+    const template = await services.workspace!.deleteTemplate(request.params.templateId);
+    return { template, workspace: await services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId()) };
+  });
 
   app.post<{ Body: CreateTabRequest }>("/api/tabs", async (request, reply) => {
     const tab = await services.sessions.createTab(request.body);
@@ -388,8 +480,16 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       }
     };
     send({ type: "tabs", tabs: services.sessions.listTabs(), activeTabId: services.sessions.getActiveTabId() });
-    const dispose = services.sessions.onTabsChange(send);
-    ws.on("close", () => dispose());
+    const sendWorkspace = () => {
+      void services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId()).then((state) => send({ type: "workspace", ...state }));
+    };
+    sendWorkspace();
+    const disposeTabs = services.sessions.onTabsChange(sendWorkspace);
+    const disposeWorkspace = services.workspace!.onChange(sendWorkspace);
+    ws.on("close", () => {
+      disposeTabs();
+      disposeWorkspace();
+    });
   });
 
   app.get("/ws/terminal/:tabId", { websocket: true }, (socket, request) => {
@@ -437,6 +537,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
 export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger): AppServices {
   const plugins = new PluginRegistry();
   const pathPolicy = new PathPolicy(config.allowedRoots);
+  const workspace = new WorkspaceLayoutStore(config.dataDir, pathPolicy);
   const terminalFactory = new NodePtyTerminalProcessFactory();
   plugins.register(new CodexTerminalPlugin(terminalFactory, config.terminalReplayBytes));
   plugins.register(new StandardTerminalPlugin(terminalFactory, config.terminalReplayBytes));
@@ -445,7 +546,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   plugins.register(new WorktreeManagerPlugin());
   plugins.register(new WorkspaceControlPlugin());
   const configService = new ConfigService(config.dataDir, () => plugins.list());
-  const sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir), configService);
+  const sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir), configService, workspace);
   const asr = new AsrClient(config.asrUrl);
   const voice = new VoiceController(
     sessions,
@@ -454,7 +555,14 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     logger,
     { includeText: config.voiceDebugTranscripts ?? false }
   );
-  return { plugins, sessions, pathPolicy, voice, asr, config: configService };
+  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace };
+}
+
+function templateInitialInput(state: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (typeof state?.url === "string" && state.url.trim()) {
+    return { url: state.url.trim() };
+  }
+  return undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

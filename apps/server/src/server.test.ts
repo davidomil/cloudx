@@ -15,6 +15,51 @@ import { buildServer, type AppServices } from "./server.js";
 import { SessionStore } from "./sessionStore.js";
 
 describe("buildServer", () => {
+  it("exposes server-backed workspace windows", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-workspace-route-"));
+    const config = testConfig(root);
+    const app = await buildServer(config);
+    try {
+      const initial = await app.inject({ method: "GET", url: "/api/workspace" });
+      expect(initial.statusCode).toBe(200);
+      expect(initial.json().windows).toHaveLength(1);
+
+      const created = await app.inject({
+        method: "POST",
+        url: "/api/windows",
+        payload: { name: "Feature", defaultCwd: root }
+      });
+      expect(created.statusCode).toBe(201);
+      const windowId = created.json().activeWindowId as string;
+      expect(created.json().windows.find((window: { id: string }) => window.id === windowId)).toMatchObject({ name: "Feature", defaultCwd: root });
+
+      const renamed = await app.inject({
+        method: "PATCH",
+        url: `/api/windows/${windowId}`,
+        payload: { name: "Feature A" }
+      });
+      expect(renamed.statusCode).toBe(200);
+      expect(renamed.json().windows.find((window: { id: string }) => window.id === windowId)).toMatchObject({ name: "Feature A" });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("searches workspace windows by local context", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-workspace-search-route-"));
+    const config = testConfig(root);
+    const app = await buildServer(config);
+    try {
+      await app.inject({ method: "POST", url: "/api/windows", payload: { name: "Server Routes", defaultCwd: root } });
+      const result = await app.inject({ method: "POST", url: "/api/windows/search-context", payload: { query: "routes" } });
+
+      expect(result.statusCode).toBe(200);
+      expect(result.json().matches[0].window.name).toBe("Server Routes");
+    } finally {
+      await app.close();
+    }
+  });
+
   it("exposes and persists dynamic configuration", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-config-route-"));
     const config = testConfig(root);

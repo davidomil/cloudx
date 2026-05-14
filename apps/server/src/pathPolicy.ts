@@ -81,34 +81,18 @@ export class PathPolicy {
     }
 
     const target = this.parseSuggestionTarget(query);
+    const current = await this.currentDirectoryOption(query);
+    const nestedDirectories = current && !endsWithPathSeparator(query) && shouldSuggestNestedDirectories(target.fragment)
+      ? await this.childDirectoryOptions(current.detail ?? this.resolveUserPath(query), query, "")
+      : [];
     const parent = target.parentExpression ? this.resolveUserPath(target.parentExpression) : this.relativeBaseDir;
     if (!this.isAllowed(parent)) {
-      return this.rootOptions(query, limit);
+      return uniquePathOptions([current, ...nestedDirectories, ...this.rootOptions(query, limit)]).slice(0, limit);
     }
 
-    const current = await this.currentDirectoryOption(query);
-    const entries = await fs.readdir(parent, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
-      if (error.code === "ENOENT" || error.code === "ENOTDIR" || error.code === "EACCES") {
-        return [];
-      }
-      throw error;
-    });
-    const fragment = target.fragment.toLowerCase();
-    const directories = entries
-      .filter((entry) => entry.isDirectory() && entry.name.toLowerCase().startsWith(fragment))
-      .sort((left, right) => compareDirectoryNames(left.name, right.name, fragment))
-      .map((entry) => {
-        const value = this.joinDisplayPath(target.parentExpression, entry.name);
-        const resolved = path.join(parent, entry.name);
-        return {
-          value,
-          label: value,
-          detail: resolved,
-          kind: "directory" as const
-        };
-      });
+    const directories = await this.childDirectoryOptions(parent, target.parentExpression, target.fragment);
 
-    return uniquePathOptions([current, ...directories, ...this.rootOptions(query, limit)]).slice(0, limit);
+    return uniquePathOptions([current, ...nestedDirectories, ...directories, ...this.rootOptions(query, limit)]).slice(0, limit);
   }
 
   voiceContext(): Record<string, unknown> {
@@ -196,6 +180,29 @@ export class PathPolicy {
     };
   }
 
+  private async childDirectoryOptions(parent: string, parentExpression: string, fragment: string): Promise<PathOption[]> {
+    const entries = await fs.readdir(parent, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT" || error.code === "ENOTDIR" || error.code === "EACCES") {
+        return [];
+      }
+      throw error;
+    });
+    const normalizedFragment = fragment.toLowerCase();
+    return entries
+      .filter((entry) => entry.isDirectory() && entry.name.toLowerCase().startsWith(normalizedFragment))
+      .sort((left, right) => compareDirectoryNames(left.name, right.name, normalizedFragment))
+      .map((entry) => {
+        const value = this.joinDisplayPath(parentExpression, entry.name);
+        const resolved = path.join(parent, entry.name);
+        return {
+          value,
+          label: value,
+          detail: resolved,
+          kind: "directory" as const
+        };
+      });
+  }
+
   private rootOptions(query: string, limit: number): PathOption[] {
     const normalized = query.toLowerCase();
     const resolvedQuery = normalized ? this.resolveUserPath(query).toLowerCase() : "";
@@ -262,4 +269,12 @@ function uniquePathOptions(options: Array<PathOption | undefined>): PathOption[]
     unique.push(option);
   }
   return unique;
+}
+
+function endsWithPathSeparator(value: string): boolean {
+  return value.endsWith("/") || value.endsWith("\\");
+}
+
+function shouldSuggestNestedDirectories(fragment: string): boolean {
+  return fragment !== "." && fragment !== "..";
 }

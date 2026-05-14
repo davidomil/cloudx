@@ -82,6 +82,20 @@ export class WorkspaceControlPlugin implements WorkspacePlugin {
         },
         additionalProperties: false
       }
+    },
+    {
+      name: "switch_window",
+      description: "Switch, activate, select, or focus an existing workspace window by exact window id, visible name, or contextual description.",
+      voiceExposed: true,
+      inputSchema: {
+        type: "object",
+        properties: {
+          windowId: { type: "string", description: "Exact workspace window id to activate." },
+          title: { type: "string", description: "Visible window name. Exact match preferred; partial match is allowed when unique." },
+          context: { type: "string", description: "Natural-language context to match against window names, default directories, tab titles, cwd, plugins, and recent tab context." }
+        },
+        additionalProperties: false
+      }
     }
   ];
 

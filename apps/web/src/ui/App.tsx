@@ -1,17 +1,39 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement } from "react";
-import { ChevronDown, Columns2, GitBranch, Mic, MicOff, PanelTopOpen, RefreshCw, Rows3, Settings, SquarePlus, Wifi, WifiOff, X } from "lucide-react";
+import { AlertTriangle, Bot, ChevronDown, Columns2, GitBranch, LayoutTemplate, Mic, MicOff, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
 
-import type { CloudxConfigResponse, CloudxConfigValues, ConfigValue, CreateTabRequest, PathOption, PluginDescriptor, PluginId, TabLayoutState, WorkspaceTab, WorkspaceTabsUpdate } from "@cloudx/shared";
+import type { CloudxConfigResponse, CloudxConfigValues, ConfigValue, CreateTabRequest, PluginDescriptor, PluginId, TabLayoutState, WorkspaceLayoutTemplate, WorkspaceStateResponse, WorkspaceTab, WorkspaceTabsUpdate, WorkspaceWindow } from "@cloudx/shared";
 
-import { closeTab, createTab, getConfig, getHealth, getPathOptions, getPlugins, getTabs, setActiveTab, startAudioStream, submitTranscript, updateConfig, voiceAudioConstraints, type VoiceAudioStreamSession } from "../api.js";
+import {
+  applyLayoutTemplate,
+  closeTab,
+  createTab,
+  createWindow,
+  deleteLayoutTemplate,
+  deleteWindow,
+  getConfig,
+  getHealth,
+  getPlugins,
+  getWorkspace,
+  saveLayoutTemplate,
+  searchWorkspaceWindows,
+  selectWindow,
+  setActiveTab,
+  startAudioStream,
+  submitTranscript,
+  updateConfig,
+  updateLayoutTemplate,
+  updateWindow,
+  voiceAudioConstraints,
+  type VoiceAudioStreamSession
+} from "../api.js";
 import { FileBrowserPanel } from "./FileBrowserPanel.js";
+import { PathEntry } from "./PathEntry.js";
 import {
   activatePane,
   activatePaneTab,
   addTabToPane,
   defaultLayout,
   findPane,
-  isStoredLayout,
   listPanes,
   placeTabInPane,
   reconcileLayout,
@@ -28,23 +50,28 @@ import { shouldSubmitVoiceConsoleKey } from "./keyboard.js";
 import { SettingsDialog } from "./SettingsDialog.js";
 import { clearFocusedAttention, isTabFocused, updateAttentionTabs } from "./tabAttention.js";
 import { disposeTerminalView, disposeTerminalViewsExcept, TerminalPanel } from "./TerminalPanel.js";
+import { useOutsidePointerDismiss } from "./outsidePointer.js";
 import { applyVoiceWorkspaceResults, buildClientVoiceContext, voiceConsoleValue } from "./voiceWorkspace.js";
 import { WebViewerPanel } from "./WebViewerPanel.js";
 import { WorktreeManagerPanel } from "./WorktreeManagerPanel.js";
 
 type ConnectionStatus = "checking" | "connected" | "disconnected";
 
-const LAYOUT_KEY = "cloudx-layout-v2";
 const AUDIO_INPUT_KEY = "cloudx-audio-input-v1";
 
 export function App() {
-  const initialLayout = useMemo(() => loadLayout(), []);
+  const initialLayout = useMemo(() => defaultLayout(), []);
   const [plugins, setPlugins] = useState<PluginDescriptor[]>([]);
   const [config, setConfig] = useState<CloudxConfigResponse | undefined>();
   const [tabs, setTabs] = useState<WorkspaceTab[]>([]);
+  const [windows, setWindows] = useState<WorkspaceWindow[]>([]);
+  const [activeWindowId, setActiveWindowId] = useState<string | undefined>();
+  const [templates, setTemplates] = useState<WorkspaceLayoutTemplate[]>([]);
   const [layout, setLayout] = useState<TabLayoutState>(initialLayout);
   const [activeTabId, setActiveTabId] = useState<string | undefined>();
   const [createOpen, setCreateOpen] = useState(false);
+  const [windowMenuOpen, setWindowMenuOpen] = useState(false);
+  const [templateMenuOpen, setTemplateMenuOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [createTargetPaneId, setCreateTargetPaneId] = useState<string | undefined>();
   const [error, setError] = useState<string | undefined>();
@@ -59,9 +86,12 @@ export function App() {
   const [audioInputMenuOpen, setAudioInputMenuOpen] = useState(false);
   const [audioInputError, setAudioInputError] = useState<string | undefined>();
   const tabsRef = useRef<WorkspaceTab[]>([]);
+  const windowsRef = useRef<WorkspaceWindow[]>([]);
+  const activeWindowIdRef = useRef<string | undefined>(undefined);
   const layoutRef = useRef<TabLayoutState>(initialLayout);
   const activeTabIdRef = useRef<string | undefined>(undefined);
   const createTargetPaneIdRef = useRef<string | undefined>(undefined);
+  const persistLayoutTimerRef = useRef<number | undefined>(undefined);
   const audioSessionRef = useRef<VoiceAudioStreamSession | undefined>(undefined);
   const micControlRef = useRef<HTMLDivElement | null>(null);
 
@@ -69,7 +99,17 @@ export function App() {
     void refresh();
     const closeWorkspaceSocket = subscribeWorkspaceUpdates(
       (update) => {
-        applyWorkspaceTabs(update.tabs, update.activeTabId);
+        if (update.windows && update.templates && update.activeWindowId) {
+          applyWorkspaceState({
+            tabs: update.tabs,
+            activeTabId: update.activeTabId,
+            windows: update.windows,
+            activeWindowId: update.activeWindowId,
+            templates: update.templates
+          });
+        } else {
+          applyWorkspaceTabs(update.tabs, update.activeTabId);
+        }
         setConnectionStatus("connected");
       },
       () => setConnectionStatus("disconnected")
@@ -78,6 +118,9 @@ export function App() {
     return () => {
       audioSessionRef.current?.cancel();
       closeWorkspaceSocket();
+      if (persistLayoutTimerRef.current !== undefined) {
+        window.clearTimeout(persistLayoutTimerRef.current);
+      }
       window.clearInterval(interval);
     };
   }, []);
@@ -97,13 +140,20 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    persistLayout(layout);
     layoutRef.current = layout;
   }, [layout]);
 
   useEffect(() => {
     tabsRef.current = tabs;
   }, [tabs]);
+
+  useEffect(() => {
+    windowsRef.current = windows;
+  }, [windows]);
+
+  useEffect(() => {
+    activeWindowIdRef.current = activeWindowId;
+  }, [activeWindowId]);
 
   useEffect(() => {
     activeTabIdRef.current = activeTabId;
@@ -125,7 +175,7 @@ export function App() {
 
   useEffect(() => {
     if (!findPane(layout.root, layout.activePaneId)) {
-      setLayout((current) => activatePane(current, listPanes(current.root)[0]?.id ?? defaultLayout().activePaneId));
+      updateLayout((current) => activatePane(current, listPanes(current.root)[0]?.id ?? defaultLayout().activePaneId));
     }
   }, [layout]);
 
@@ -143,6 +193,7 @@ export function App() {
   const activePaneId = layout.activePaneId;
   const serverLabel = window.location.host || "server";
   const activeTab = activeTabId ? tabById.get(activeTabId) : undefined;
+  const activeWindow = activeWindowId ? windows.find((window) => window.id === activeWindowId) : windows[0];
   const microphoneUnavailableReason = getMicrophoneUnavailableReason();
   const aiControlEnabled = config?.values.global.aiControlEnabled !== false;
   const microphoneEnabled = aiControlEnabled && config?.values.global.microphoneEnabled !== false;
@@ -151,16 +202,31 @@ export function App() {
   async function refresh() {
     setConnectionStatus("checking");
     try {
-      const [pluginList, tabState, configState] = await Promise.all([getPlugins(), getTabs(), getConfig()]);
+      const [pluginList, workspaceState, configState] = await Promise.all([getPlugins(), getWorkspace(), getConfig()]);
       setPlugins(pluginList);
       setConfig(configState);
-      applyWorkspaceTabs(tabState.tabs, tabState.activeTabId);
+      applyWorkspaceState(workspaceState);
       setConnectionStatus("connected");
       setError(undefined);
     } catch (err) {
       setConnectionStatus("disconnected");
       setError(err instanceof Error ? err.message : String(err));
     }
+  }
+
+  function applyWorkspaceState(state: WorkspaceStateResponse) {
+    const nextLayout = state.windows.find((window) => window.id === state.activeWindowId)?.layout ?? state.windows[0]?.layout ?? defaultLayout();
+    tabsRef.current = state.tabs;
+    windowsRef.current = state.windows;
+    activeWindowIdRef.current = state.activeWindowId;
+    layoutRef.current = nextLayout;
+    activeTabIdRef.current = state.activeTabId;
+    setTabs(state.tabs);
+    setWindows(state.windows);
+    setActiveWindowId(state.activeWindowId);
+    setTemplates(state.templates);
+    setActiveTabId(state.activeTabId);
+    commitLayout(nextLayout, { persist: false });
   }
 
   function applyWorkspaceTabs(nextTabs: WorkspaceTab[], nextActiveTabId?: string) {
@@ -174,7 +240,7 @@ export function App() {
     activeTabIdRef.current = nextActiveTabId;
     setTabs(nextTabs);
     setActiveTabId(nextActiveTabId);
-    setLayout(nextLayout);
+    commitLayout(nextLayout);
     setAttentionTabIds((current) => updateAttentionTabs(current, previousTabs, nextTabs, nextLayout));
   }
 
@@ -187,19 +253,42 @@ export function App() {
     }
   }
 
+  function commitLayout(nextLayout: TabLayoutState, options: { persist?: boolean } = {}) {
+    const windowId = activeWindowIdRef.current;
+    layoutRef.current = nextLayout;
+    setLayout(nextLayout);
+    if (windowId) {
+      setWindows((current) => current.map((window) => (window.id === windowId ? { ...window, layout: nextLayout, updatedAt: new Date().toISOString() } : window)));
+      windowsRef.current = windowsRef.current.map((window) => (window.id === windowId ? { ...window, layout: nextLayout, updatedAt: new Date().toISOString() } : window));
+    }
+    if (options.persist === false || !windowId) {
+      return;
+    }
+    if (persistLayoutTimerRef.current !== undefined) {
+      window.clearTimeout(persistLayoutTimerRef.current);
+    }
+    persistLayoutTimerRef.current = window.setTimeout(() => {
+      void updateWindow(windowId, { layout: nextLayout }).catch((err) => setError(err instanceof Error ? err.message : String(err)));
+    }, 200);
+  }
+
+  function updateLayout(updater: (current: TabLayoutState) => TabLayoutState) {
+    commitLayout(updater(layoutRef.current));
+  }
+
   async function activateTab(tabId: string, paneId = activePaneId) {
     activeTabIdRef.current = tabId;
     setActiveTabId(tabId);
-    setLayout((current) => activatePaneTab(current, paneId, tabId));
+    updateLayout((current) => activatePaneTab(current, paneId, tabId));
     await setActiveTab(tabId);
   }
 
   function split(direction: LayoutDirection) {
-    setLayout((current) => splitPane(current, direction, () => `pane-${crypto.randomUUID()}`, () => `split-${crypto.randomUUID()}`));
+    updateLayout((current) => splitPane(current, direction, () => `pane-${crypto.randomUUID()}`, () => `split-${crypto.randomUUID()}`));
   }
 
   function resizePane(splitId: string, deltaPixels: number, containerPixels: number) {
-    setLayout((current) => resizeSplit(current, splitId, deltaPixels, containerPixels));
+    updateLayout((current) => resizeSplit(current, splitId, deltaPixels, containerPixels));
   }
 
   function selectPaneForCreation(paneId: string) {
@@ -207,7 +296,7 @@ export function App() {
     setCreateTargetPaneId(paneId);
     const nextLayout = activatePane(layoutRef.current, paneId);
     layoutRef.current = nextLayout;
-    setLayout(nextLayout);
+    commitLayout(nextLayout);
   }
 
   function openCreateDialogForPane(paneId: string) {
@@ -217,7 +306,7 @@ export function App() {
 
   function handleDropTab(targetPaneId: string, tabId: string, beforeTabId?: string) {
     if (!tabId) return;
-    setLayout((current) => placeTabInPane(current, targetPaneId, tabId, beforeTabId));
+    updateLayout((current) => placeTabInPane(current, targetPaneId, tabId, beforeTabId));
     void activateTab(tabId, targetPaneId);
   }
 
@@ -226,11 +315,11 @@ export function App() {
       void activateTab(pane.activeTabId, pane.id);
       return;
     }
-    setLayout((current) => activatePane(current, pane.id));
+    updateLayout((current) => activatePane(current, pane.id));
   }
 
   function handleClosePane(paneId: string) {
-    setLayout((current) => removePane(current, paneId));
+    updateLayout((current) => removePane(current, paneId));
     if (createTargetPaneIdRef.current === paneId) {
       createTargetPaneIdRef.current = undefined;
     }
@@ -243,7 +332,7 @@ export function App() {
       const tab = await createTab(input);
       setTabs((current) => upsertTab(current, tab));
       const targetPaneId = createTargetPaneIdRef.current ?? createTargetPaneId;
-      setLayout((current) => addTabToPane(current, resolveTabCreationPaneId(current, targetPaneId), tab.id));
+      updateLayout((current) => addTabToPane(current, resolveTabCreationPaneId(current, targetPaneId), tab.id));
       activeTabIdRef.current = tab.id;
       setActiveTabId(tab.id);
       setCreateOpen(false);
@@ -265,7 +354,7 @@ export function App() {
     try {
       const result = await closeTab(tabId);
       setTabs((current) => current.filter((tab) => tab.id !== tabId));
-      setLayout((current) => removeTabFromPanes(current, tabId));
+      updateLayout((current) => removeTabFromPanes(current, tabId));
       activeTabIdRef.current = result.activeTabId;
       setActiveTabId(result.activeTabId);
       disposeTerminalView(tabId);
@@ -428,12 +517,12 @@ export function App() {
     layoutRef.current = next.layout;
     activeTabIdRef.current = next.activeTabId;
     setTabs(next.tabs);
-    setLayout(next.layout);
+    commitLayout(next.layout);
     setActiveTabId(next.activeTabId);
   }
 
   function currentVoiceClientContext() {
-    return buildClientVoiceContext(layoutRef.current, tabsRef.current);
+    return buildClientVoiceContext(layoutRef.current, tabsRef.current, windowsRef.current, activeWindowIdRef.current);
   }
 
   async function handleSaveConfig(values: CloudxConfigValues) {
@@ -447,6 +536,56 @@ export function App() {
 
   function pluginConfig(pluginId: PluginId): Record<string, ConfigValue> {
     return config?.values.plugins[pluginId] ?? {};
+  }
+
+  async function handleCreateWindow(name: string, defaultCwd: string) {
+    applyWorkspaceState(await createWindow({ name, defaultCwd }));
+  }
+
+  async function handleSelectWindow(windowId: string) {
+    applyWorkspaceState(await selectWindow(windowId));
+    setWindowMenuOpen(false);
+  }
+
+  async function handleRenameWindow(windowId: string, name: string, defaultCwd: string) {
+    applyWorkspaceState(await updateWindow(windowId, { name, defaultCwd }));
+  }
+
+  async function handleDeleteWindow(windowId: string) {
+    const target = windows.find((window) => window.id === windowId);
+    if (!target) return;
+    applyWorkspaceState(await deleteWindow(windowId));
+    setWindowMenuOpen(false);
+  }
+
+  async function handleContextSearch(query: string) {
+    return searchWorkspaceWindows(query);
+  }
+
+  async function handleSaveTemplate(name: string, basePath: string) {
+    const result = await saveLayoutTemplate({ name, basePath, windowId: activeWindowId });
+    applyWorkspaceState(result.workspace);
+  }
+
+  async function handleRenameTemplate(templateId: string, name: string) {
+    const result = await updateLayoutTemplate(templateId, { name });
+    applyWorkspaceState(result.workspace);
+  }
+
+  async function handleDeleteTemplate(templateId: string) {
+    const target = templates.find((template) => template.id === templateId);
+    if (!target) return;
+    if (!window.confirm(`Delete layout template ${target.name}?`)) {
+      return;
+    }
+    const result = await deleteLayoutTemplate(templateId);
+    applyWorkspaceState(result.workspace);
+  }
+
+  async function handleApplyTemplate(templateId: string, projectPath: string, name?: string) {
+    const result = await applyLayoutTemplate(templateId, { projectPath, name });
+    applyWorkspaceState(result.workspace);
+    setTemplateMenuOpen(false);
   }
 
   return (
@@ -464,6 +603,18 @@ export function App() {
           {voiceState !== "idle" ? <span className={`voice-status ${voiceState}`}>{voiceState}</span> : null}
         </div>
         <div className="topbar-actions">
+          <WindowSwitcher
+            windows={windows}
+            tabs={tabs}
+            activeWindow={activeWindow}
+            open={windowMenuOpen}
+            onOpenChange={setWindowMenuOpen}
+            onSelect={handleSelectWindow}
+            onCreate={handleCreateWindow}
+            onUpdate={handleRenameWindow}
+            onDelete={handleDeleteWindow}
+            onContextSearch={handleContextSearch}
+          />
           <button className="icon-button" onClick={() => window.location.reload()} title="Reload app">
             <RefreshCw size={17} />
           </button>
@@ -476,6 +627,16 @@ export function App() {
           <button className="icon-button" onClick={() => split("column")} title="Split rows">
             <Rows3 size={17} />
           </button>
+          <TemplateMenu
+            open={templateMenuOpen}
+            templates={templates}
+            activeWindow={activeWindow}
+            onOpenChange={setTemplateMenuOpen}
+            onSave={handleSaveTemplate}
+            onRename={handleRenameTemplate}
+            onDelete={handleDeleteTemplate}
+            onApply={handleApplyTemplate}
+          />
           {microphoneEnabled ? <div className="mic-control" ref={micControlRef}>
             <button className={`mic-button ${voiceState} ${microphoneUnavailableReason ? "unavailable" : ""}`} onClick={() => void handleMic()} title={microphoneUnavailableReason ?? (voiceState === "recording" ? "Stop voice command" : "Record voice command")}>
               {voiceState === "recording" ? <MicOff size={17} /> : <Mic size={17} />}
@@ -541,7 +702,7 @@ export function App() {
         />
       </footer> : null}
 
-      {createOpen ? <CreateTabDialog plugins={plugins} onCancel={closeCreateDialog} onCreate={handleCreate} /> : null}
+      {createOpen ? <CreateTabDialog plugins={plugins} defaultCwd={activeWindow?.defaultCwd ?? "~"} onCancel={closeCreateDialog} onCreate={handleCreate} /> : null}
       {settingsOpen && config ? <SettingsDialog config={config} onCancel={() => setSettingsOpen(false)} onSave={handleSaveConfig} /> : null}
     </main>
   );
@@ -653,6 +814,391 @@ export function App() {
   }
 }
 
+function WindowSwitcher({
+  windows,
+  tabs,
+  activeWindow,
+  open,
+  onOpenChange,
+  onSelect,
+  onCreate,
+  onUpdate,
+  onDelete,
+  onContextSearch
+}: {
+  windows: WorkspaceWindow[];
+  tabs: WorkspaceTab[];
+  activeWindow?: WorkspaceWindow;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onSelect: (windowId: string) => Promise<void>;
+  onCreate: (name: string, defaultCwd: string) => Promise<void>;
+  onUpdate: (windowId: string, name: string, defaultCwd: string) => Promise<void>;
+  onDelete: (windowId: string) => Promise<void>;
+  onContextSearch: (query: string) => Promise<{ matches: Array<{ window: WorkspaceWindow; score: number; reasons: string[] }> }>;
+}) {
+  const [query, setQuery] = useState("");
+  const [contextMode, setContextMode] = useState(false);
+  const [contextBusy, setContextBusy] = useState(false);
+  const [contextMatches, setContextMatches] = useState<Array<{ window: WorkspaceWindow; score: number; reasons: string[] }>>([]);
+  const [draftName, setDraftName] = useState(activeWindow?.name ?? "");
+  const [draftCwd, setDraftCwd] = useState(activeWindow?.defaultCwd ?? "~");
+  const [dialogMode, setDialogMode] = useState<"create" | "edit" | undefined>();
+  const [editingWindow, setEditingWindow] = useState<WorkspaceWindow | undefined>();
+  const [deleteCandidate, setDeleteCandidate] = useState<WorkspaceWindow | undefined>();
+  const [error, setError] = useState<string | undefined>();
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const tabsById = useMemo(() => new Map(tabs.map((tab) => [tab.id, tab])), [tabs]);
+
+  useOutsidePointerDismiss(open, rootRef, () => onOpenChange(false));
+
+  useEffect(() => {
+    setDraftName(activeWindow?.name ?? "");
+    setDraftCwd(activeWindow?.defaultCwd ?? "~");
+  }, [activeWindow?.id, activeWindow?.name, activeWindow?.defaultCwd]);
+
+  useEffect(() => {
+    if (!open || !contextMode || !query.trim()) {
+      setContextMatches([]);
+      setContextBusy(false);
+      return;
+    }
+    let cancelled = false;
+    setContextBusy(true);
+    const timer = window.setTimeout(() => {
+      void onContextSearch(query)
+        .then((result) => {
+          if (!cancelled) {
+            setContextMatches(result.matches);
+            setError(undefined);
+          }
+        })
+        .catch((err) => {
+          if (!cancelled) {
+            setError(err instanceof Error ? err.message : String(err));
+          }
+        })
+        .finally(() => {
+          if (!cancelled) {
+            setContextBusy(false);
+          }
+        });
+    }, 180);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [contextMode, onContextSearch, open, query]);
+
+  const visibleWindows = contextMode && query.trim()
+    ? contextMatches.map((match) => match.window)
+    : windows.filter((window) => !query.trim() || window.name.toLowerCase().includes(query.trim().toLowerCase()));
+
+  function openCreateDialog() {
+    setDialogMode("create");
+    setEditingWindow(undefined);
+    setDeleteCandidate(undefined);
+    setDraftName("");
+    setDraftCwd(activeWindow?.defaultCwd ?? "~");
+    setError(undefined);
+  }
+
+  function openEditDialog(window: WorkspaceWindow) {
+    setDialogMode("edit");
+    setEditingWindow(window);
+    setDeleteCandidate(undefined);
+    setDraftName(window.name);
+    setDraftCwd(window.defaultCwd);
+    setError(undefined);
+  }
+
+  function openDeleteWarning(window: WorkspaceWindow) {
+    setDialogMode(undefined);
+    setEditingWindow(undefined);
+    setDeleteCandidate(window);
+    setError(undefined);
+  }
+
+  async function submitWindowDialog() {
+    try {
+      if (dialogMode === "edit" && editingWindow) {
+        await onUpdate(editingWindow.id, draftName, draftCwd);
+      } else {
+        await onCreate(draftName, draftCwd);
+      }
+      setDialogMode(undefined);
+      setEditingWindow(undefined);
+      setError(undefined);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function confirmDeleteWindow() {
+    if (!deleteCandidate) {
+      return;
+    }
+    try {
+      await onDelete(deleteCandidate.id);
+      setDeleteCandidate(undefined);
+      setError(undefined);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  return (
+    <div className="window-switcher" ref={rootRef}>
+      <button className="window-switcher-button" onClick={() => onOpenChange(!open)} title="Workspace windows">
+        <PanelTopOpen size={15} />
+        <span>{activeWindow?.name ?? "Window"}</span>
+      </button>
+      {open ? (
+        <div className="window-menu">
+          <div className="window-search-row">
+            <button type="button" className={contextMode ? "active" : ""} onClick={() => setContextMode((current) => !current)} title={contextMode ? "Context search" : "Name search"}>
+              {contextMode ? <Bot size={15} className={contextBusy ? "spinning" : ""} /> : <Search size={15} />}
+            </button>
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={contextMode ? "Search by context" : "Search windows"} />
+          </div>
+          <div className="window-list">
+            {visibleWindows.map((window) => {
+              const tabCount = tabCountForWindow(window, tabsById);
+              return (
+                <div key={window.id} className={`window-menu-row ${window.id === activeWindow?.id ? "selected" : ""}`}>
+                  <button type="button" className="window-row-main" onClick={() => void onSelect(window.id)}>
+                    <span>{window.name}</span>
+                    <small>{tabCount} tabs · {window.defaultCwd}</small>
+                  </button>
+                  <button type="button" className="compact-icon-button" onClick={() => openEditDialog(window)} title={`Edit ${window.name}`} aria-label={`Edit ${window.name}`}>
+                    <Wrench size={14} />
+                  </button>
+                  <button type="button" className="compact-icon-button danger" onClick={() => openDeleteWarning(window)} title={`Delete ${window.name}`} aria-label={`Delete ${window.name}`}>
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              );
+            })}
+            {visibleWindows.length === 0 ? <div className="window-menu-empty">No windows match.</div> : null}
+          </div>
+          <div className="menu-footer-actions">
+            <button type="button" className="compact-icon-button" onClick={openCreateDialog} title="Create window" aria-label="Create window">
+              <Plus size={15} />
+            </button>
+          </div>
+          {dialogMode ? (
+            <div className="menu-form-panel">
+              <strong>{dialogMode === "edit" ? "Edit window" : "Create window"}</strong>
+              <input value={draftName} onChange={(event) => setDraftName(event.target.value)} placeholder="Window name" />
+              <PathEntry inputId="window-default-directory" value={draftCwd} onChange={setDraftCwd} placeholder="Default directory" ariaLabel="Window default directory" />
+              <div className="menu-form-actions">
+                <button type="button" className="compact-icon-button" onClick={() => void submitWindowDialog()} disabled={!draftName.trim() || !draftCwd.trim()} title={dialogMode === "edit" ? "Save window" : "Create window"} aria-label={dialogMode === "edit" ? "Save window" : "Create window"}>
+                  {dialogMode === "edit" ? <Save size={15} /> : <Plus size={15} />}
+                </button>
+                <button type="button" className="compact-icon-button" onClick={() => setDialogMode(undefined)} title="Cancel" aria-label="Cancel">
+                  <X size={15} />
+                </button>
+              </div>
+            </div>
+          ) : null}
+          {deleteCandidate ? (
+            <WindowDeleteWarning
+              window={deleteCandidate}
+              tabCount={tabCountForWindow(deleteCandidate, tabsById)}
+              onCancel={() => setDeleteCandidate(undefined)}
+              onConfirm={() => void confirmDeleteWindow()}
+            />
+          ) : null}
+          {error ? <div className="window-menu-error">{error}</div> : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function tabCountForWindow(window: WorkspaceWindow, tabsById: Map<string, WorkspaceTab>): number {
+  return listPanes(window.layout.root).reduce((count, pane) => count + pane.tabIds.filter((tabId) => tabsById.has(tabId)).length, 0);
+}
+
+function WindowDeleteWarning({ window, tabCount, onCancel, onConfirm }: { window: WorkspaceWindow; tabCount: number; onCancel: () => void; onConfirm: () => void }) {
+  const titleId = `delete-window-${window.id}-title`;
+  const descriptionId = `delete-window-${window.id}-description`;
+  return (
+    <div className="menu-warning-panel" role="alertdialog" aria-labelledby={titleId} aria-describedby={descriptionId}>
+      <div className="menu-warning-heading">
+        <AlertTriangle size={17} />
+        <strong id={titleId}>Close window</strong>
+      </div>
+      <p id={descriptionId}>
+        {tabCount > 0 ? `${window.name} has ${tabCount} open tab${tabCount === 1 ? "" : "s"}. Closing it will close those tabs.` : `${window.name} will be removed from the workspace.`}
+      </p>
+      <div className="menu-form-actions">
+        <button type="button" className="compact-icon-button danger" onClick={onConfirm} title="Close window" aria-label="Close window">
+          <Trash2 size={15} />
+        </button>
+        <button type="button" className="compact-icon-button" onClick={onCancel} title="Cancel" aria-label="Cancel">
+          <X size={15} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function TemplateMenu({
+  open,
+  templates,
+  activeWindow,
+  onOpenChange,
+  onSave,
+  onRename,
+  onDelete,
+  onApply
+}: {
+  open: boolean;
+  templates: WorkspaceLayoutTemplate[];
+  activeWindow?: WorkspaceWindow;
+  onOpenChange: (open: boolean) => void;
+  onSave: (name: string, basePath: string) => Promise<void>;
+  onRename: (templateId: string, name: string) => Promise<void>;
+  onDelete: (templateId: string) => Promise<void>;
+  onApply: (templateId: string, projectPath: string, name?: string) => Promise<void>;
+}) {
+  const [name, setName] = useState("");
+  const [projectPath, setProjectPath] = useState(activeWindow?.defaultCwd ?? "~");
+  const [windowName, setWindowName] = useState("");
+  const [dialog, setDialog] = useState<{ kind: "save" } | { kind: "load" | "rename"; template: WorkspaceLayoutTemplate } | undefined>();
+  const [error, setError] = useState<string | undefined>();
+  const rootRef = useRef<HTMLDivElement | null>(null);
+
+  useOutsidePointerDismiss(open, rootRef, () => onOpenChange(false));
+
+  useEffect(() => {
+    setProjectPath(activeWindow?.defaultCwd ?? "~");
+  }, [activeWindow?.id, activeWindow?.defaultCwd]);
+
+  async function submitSave() {
+    try {
+      await onSave(name, activeWindow?.defaultCwd ?? "~");
+      setName("");
+      setDialog(undefined);
+      setError(undefined);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function submitApply(template: WorkspaceLayoutTemplate) {
+    try {
+      await onApply(template.id, projectPath, windowName || undefined);
+      setDialog(undefined);
+      setError(undefined);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function submitRename(template: WorkspaceLayoutTemplate) {
+    try {
+      await onRename(template.id, name);
+      setDialog(undefined);
+      setName("");
+      setError(undefined);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  function openLoadDialog(template: WorkspaceLayoutTemplate) {
+    setDialog({ kind: "load", template });
+    setProjectPath(activeWindow?.defaultCwd ?? template.basePath);
+    setWindowName("");
+    setError(undefined);
+  }
+
+  function openRenameDialog(template: WorkspaceLayoutTemplate) {
+    setDialog({ kind: "rename", template });
+    setName(template.name);
+    setError(undefined);
+  }
+
+  function openSaveDialog() {
+    setDialog({ kind: "save" });
+    setName(activeWindow?.name ? `${activeWindow.name} template` : "");
+    setError(undefined);
+  }
+
+  return (
+    <div className="template-menu-root" ref={rootRef}>
+      <button className="icon-button" onClick={() => onOpenChange(!open)} title="Layout templates">
+        <LayoutTemplate size={17} />
+      </button>
+      {open ? (
+        <div className="template-menu">
+          <div className="template-list">
+            {templates.map((template) => (
+              <div key={template.id} className="template-menu-row">
+                <button type="button" className="template-row-main" onClick={() => openLoadDialog(template)}>
+                  <span>{template.name}</span>
+                  <small>{template.tabs.length} tabs · {template.basePath}</small>
+                </button>
+                <button type="button" className="compact-icon-button" onClick={() => openLoadDialog(template)} title={`Load ${template.name}`} aria-label={`Load ${template.name}`}>
+                  <Play size={14} />
+                </button>
+                <button type="button" className="compact-icon-button" onClick={() => openRenameDialog(template)} title={`Rename ${template.name}`} aria-label={`Rename ${template.name}`}>
+                  <Pencil size={14} />
+                </button>
+                <button type="button" className="compact-icon-button danger" onClick={() => void onDelete(template.id)} title={`Delete ${template.name}`} aria-label={`Delete ${template.name}`}>
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            ))}
+            {templates.length === 0 ? <div className="window-menu-empty">No templates saved.</div> : null}
+          </div>
+          <div className="menu-footer-actions">
+            <button type="button" className="compact-icon-button" onClick={openSaveDialog} title="Save current layout as template" aria-label="Save current layout as template">
+              <Save size={15} />
+            </button>
+          </div>
+          {dialog ? (
+            <div className="menu-form-panel">
+              <strong>{dialog.kind === "save" ? "Save current layout" : dialog.kind === "rename" ? "Rename template" : "Load template"}</strong>
+              {dialog.kind === "load" ? (
+                <>
+                  <PathEntry inputId="template-project-path" value={projectPath} onChange={setProjectPath} placeholder="Project path" ariaLabel="Template project path" />
+                  <input value={windowName} onChange={(event) => setWindowName(event.target.value)} placeholder="New window name" />
+                </>
+              ) : (
+                <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Template name" />
+              )}
+              <div className="menu-form-actions">
+                {dialog.kind === "save" ? (
+                  <button type="button" className="compact-icon-button" onClick={() => void submitSave()} disabled={!name.trim()} title="Save template" aria-label="Save template">
+                    <Save size={15} />
+                  </button>
+                ) : null}
+                {dialog.kind === "rename" ? (
+                  <button type="button" className="compact-icon-button" onClick={() => void submitRename(dialog.template)} disabled={!name.trim()} title="Rename template" aria-label="Rename template">
+                    <Save size={15} />
+                  </button>
+                ) : null}
+                {dialog.kind === "load" ? (
+                  <button type="button" className="compact-icon-button" onClick={() => void submitApply(dialog.template)} disabled={!projectPath.trim()} title="Load template" aria-label="Load template">
+                    <Play size={15} />
+                  </button>
+                ) : null}
+                <button type="button" className="compact-icon-button" onClick={() => setDialog(undefined)} title="Cancel" aria-label="Cancel">
+                  <X size={15} />
+                </button>
+              </div>
+            </div>
+          ) : null}
+          {error ? <div className="window-menu-error">{error}</div> : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function TabIndicatorDot({ tab, attention }: { tab: WorkspaceTab; attention?: boolean }) {
   const title = tab.indicator.message ? `${tab.indicator.label}: ${tab.indicator.message}` : tab.indicator.label;
   return <span className={`tab-indicator ${tab.indicator.color} ${attention ? "attention" : ""}`} title={title} aria-label={title} />;
@@ -695,25 +1241,6 @@ function ResizeHandle({ direction, onResize }: { direction: LayoutDirection; onR
       }}
     />
   );
-}
-
-function loadLayout(): TabLayoutState {
-  if (typeof window === "undefined") {
-    return defaultLayout();
-  }
-  try {
-    const parsed = JSON.parse(window.localStorage.getItem(LAYOUT_KEY) ?? "") as unknown;
-    if (isStoredLayout(parsed)) {
-      return parsed;
-    }
-  } catch {
-    return defaultLayout();
-  }
-  return defaultLayout();
-}
-
-function persistLayout(layout: TabLayoutState) {
-  window.localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout));
 }
 
 function loadAudioInputId(): string | undefined {
@@ -774,7 +1301,7 @@ function subscribeWorkspaceUpdates(onUpdate: (update: WorkspaceTabsUpdate) => vo
 
   socket.addEventListener("message", (event) => {
     const message = JSON.parse(event.data as string) as WorkspaceTabsUpdate;
-    if (message.type === "tabs") {
+    if (message.type === "tabs" || message.type === "workspace") {
       onUpdate(message);
     }
   });
@@ -792,24 +1319,22 @@ function subscribeWorkspaceUpdates(onUpdate: (update: WorkspaceTabsUpdate) => vo
 
 function CreateTabDialog({
   plugins,
+  defaultCwd,
   onCancel,
   onCreate
 }: {
   plugins: PluginDescriptor[];
+  defaultCwd: string;
   onCancel: () => void;
   onCreate: (input: CreateTabRequest) => Promise<void>;
 }) {
   const creatablePlugins = plugins.filter((plugin) => plugin.creatable);
   const [pluginId, setPluginId] = useState<PluginId>("codex-terminal");
-  const [cwd, setCwd] = useState("~");
+  const [cwd, setCwd] = useState(defaultCwd);
   const [title, setTitle] = useState("");
   const [localWebUrl, setLocalWebUrl] = useState("");
   const [createDirectory, setCreateDirectory] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [pathOptions, setPathOptions] = useState<PathOption[]>([]);
-  const [pathOptionsOpen, setPathOptionsOpen] = useState(false);
-  const [highlightedPathOption, setHighlightedPathOption] = useState(0);
-  const [pathOptionsError, setPathOptionsError] = useState<string | undefined>();
   const selectedPlugin = creatablePlugins.find((plugin) => plugin.id === pluginId);
   const isLocalWeb = selectedPlugin?.panelKind === "web-viewer";
   const requiresDirectory = selectedPlugin?.requiresDirectory ?? true;
@@ -817,35 +1342,9 @@ function CreateTabDialog({
 
   useEffect(() => {
     if (!requiresDirectory) {
-      setPathOptionsOpen(false);
       setCreateDirectory(false);
-      return;
     }
-    if (!pathOptionsOpen) return;
-    let cancelled = false;
-    const timer = window.setTimeout(() => {
-      void loadPathOptions();
-    }, 120);
-
-    async function loadPathOptions() {
-      try {
-        const options = await getPathOptions(cwd);
-        if (cancelled) return;
-        setPathOptions(options);
-        setHighlightedPathOption(0);
-        setPathOptionsError(undefined);
-      } catch (err) {
-        if (cancelled) return;
-        setPathOptions([]);
-        setPathOptionsError(err instanceof Error ? err.message : String(err));
-      }
-    }
-
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [cwd, pathOptionsOpen, requiresDirectory]);
+  }, [requiresDirectory]);
 
   async function submit() {
     setBusy(true);
@@ -860,31 +1359,6 @@ function CreateTabDialog({
       });
     } finally {
       setBusy(false);
-    }
-  }
-
-  function choosePathOption(option: PathOption) {
-    setCwd(option.value);
-    setPathOptionsOpen(false);
-    setHighlightedPathOption(0);
-  }
-
-  function handlePathKeyDown(event: KeyboardEvent<HTMLInputElement>) {
-    if (!pathOptionsOpen || pathOptions.length === 0) return;
-    if (event.key === "ArrowDown") {
-      event.preventDefault();
-      setHighlightedPathOption((current) => (current + 1) % pathOptions.length);
-    } else if (event.key === "ArrowUp") {
-      event.preventDefault();
-      setHighlightedPathOption((current) => (current - 1 + pathOptions.length) % pathOptions.length);
-    } else if (event.key === "Enter") {
-      event.preventDefault();
-      const option = pathOptions[highlightedPathOption];
-      if (option) {
-        choosePathOption(option);
-      }
-    } else if (event.key === "Escape") {
-      setPathOptionsOpen(false);
     }
   }
 
@@ -905,47 +1379,7 @@ function CreateTabDialog({
         {requiresDirectory ? (
           <div className="field-group">
             <label htmlFor="new-tab-directory">Directory</label>
-            <div className="path-autocomplete">
-              <input
-                id="new-tab-directory"
-                value={cwd}
-                onChange={(event) => {
-                  setCwd(event.target.value);
-                  setPathOptionsOpen(true);
-                }}
-                onFocus={() => setPathOptionsOpen(true)}
-                onBlur={() => window.setTimeout(() => setPathOptionsOpen(false), 100)}
-                onKeyDown={handlePathKeyDown}
-                placeholder="~, ~/project, or relative/path"
-                autoComplete="off"
-                aria-autocomplete="list"
-                aria-controls="new-tab-path-options"
-                aria-expanded={pathOptionsOpen}
-              />
-              {pathOptionsOpen ? (
-                <div id="new-tab-path-options" className="path-options" role="listbox">
-                  {pathOptions.length > 0 ? (
-                    pathOptions.map((option, index) => (
-                      <button
-                        key={`${option.kind}:${option.value}`}
-                        type="button"
-                        className={`path-option ${index === highlightedPathOption ? "active" : ""}`}
-                        role="option"
-                        aria-selected={index === highlightedPathOption}
-                        onMouseDown={(event) => event.preventDefault()}
-                        onMouseEnter={() => setHighlightedPathOption(index)}
-                        onClick={() => choosePathOption(option)}
-                      >
-                        <span>{option.label}</span>
-                        {option.detail ? <small>{option.detail}</small> : null}
-                      </button>
-                    ))
-                  ) : (
-                    <div className="path-options-empty">{pathOptionsError ?? "No matching directories."}</div>
-                  )}
-                </div>
-              ) : null}
-            </div>
+            <PathEntry inputId="new-tab-directory" value={cwd} onChange={setCwd} ariaLabel="New tab directory" />
           </div>
         ) : null}
         {isLocalWeb ? (

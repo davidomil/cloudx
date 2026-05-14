@@ -268,12 +268,18 @@ export interface WorkspaceSnapshot {
   activeTabId?: string;
   tabs: WorkspaceTab[];
   plugins: PluginDescriptor[];
+  activeWindowId?: string;
+  windows?: WorkspaceWindow[];
+  templates?: WorkspaceLayoutTemplate[];
 }
 
 export interface WorkspaceTabsUpdate {
-  type: "tabs";
+  type: "tabs" | "workspace";
   activeTabId?: string;
   tabs: WorkspaceTab[];
+  activeWindowId?: string;
+  windows?: WorkspaceWindow[];
+  templates?: WorkspaceLayoutTemplate[];
 }
 
 export type TabLayoutDirection = "row" | "column";
@@ -300,6 +306,83 @@ export type TabLayoutNode =
 export interface TabLayoutState {
   root: TabLayoutNode;
   activePaneId: string;
+}
+
+export interface WorkspaceWindow {
+  id: string;
+  name: string;
+  defaultCwd: string;
+  layout: TabLayoutState;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateWorkspaceWindowRequest {
+  name?: string;
+  defaultCwd?: string;
+}
+
+export interface UpdateWorkspaceWindowRequest {
+  name?: string;
+  defaultCwd?: string;
+  layout?: TabLayoutState;
+}
+
+export interface WorkspaceLayoutTemplateTab {
+  id: string;
+  pluginId: PluginId;
+  title?: string;
+  cwd?: string;
+  relativeCwd?: string;
+  initialInput?: Record<string, unknown>;
+}
+
+export interface WorkspaceLayoutTemplate {
+  id: string;
+  name: string;
+  basePath: string;
+  layout: TabLayoutState;
+  tabs: WorkspaceLayoutTemplateTab[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateWorkspaceLayoutTemplateRequest {
+  name: string;
+  basePath: string;
+  windowId?: string;
+}
+
+export interface UpdateWorkspaceLayoutTemplateRequest {
+  name?: string;
+}
+
+export interface ApplyWorkspaceLayoutTemplateRequest {
+  projectPath: string;
+  name?: string;
+}
+
+export interface WorkspaceWindowSearchMatch {
+  window: WorkspaceWindow;
+  score: number;
+  reasons: string[];
+}
+
+export interface SearchWorkspaceWindowsRequest {
+  query: string;
+}
+
+export interface SearchWorkspaceWindowsResponse {
+  query: string;
+  matches: WorkspaceWindowSearchMatch[];
+}
+
+export interface WorkspaceStateResponse {
+  activeTabId?: string;
+  tabs: WorkspaceTab[];
+  activeWindowId: string;
+  windows: WorkspaceWindow[];
+  templates: WorkspaceLayoutTemplate[];
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {

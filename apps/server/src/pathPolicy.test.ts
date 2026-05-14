@@ -86,6 +86,27 @@ describe("PathPolicy", () => {
     ]);
   });
 
+  it("suggests nested child directories when the query is an exact directory without a trailing slash", async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-home-nested-options-"));
+    await fs.mkdir(path.join(home, "project", "apps"), { recursive: true });
+    await fs.mkdir(path.join(home, "project", "docs"), { recursive: true });
+    const policy = new PathPolicy(["~"], { homeDir: home });
+
+    const options = await policy.suggestDirectories("~/project");
+
+    expect(options.map((option) => option.value).slice(0, 3)).toEqual(["~/project", "~/project/apps", "~/project/docs"]);
+  });
+
+  it("suggests nested child directories for an exact allowed root even when its parent is outside the allowed roots", async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-home-root-options-"));
+    await fs.mkdir(path.join(home, "project"));
+    const policy = new PathPolicy(["~"], { homeDir: home });
+
+    const options = await policy.suggestDirectories(home);
+
+    expect(options.map((option) => option.value).slice(0, 2)).toEqual([home, `${home}/project`]);
+  });
+
   it("lists normal directories before hidden directories for empty fragments", async () => {
     const home = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-home-hidden-options-"));
     await fs.mkdir(path.join(home, ".config"));

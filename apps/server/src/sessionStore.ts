@@ -9,6 +9,7 @@ import { PathPolicy } from "./pathPolicy.js";
 import { PluginRegistry } from "./pluginRegistry.js";
 import { TabContextService } from "./context/TabContextService.js";
 import { WORKSPACE_CONTROL_PLUGIN_ID } from "./plugins/WorkspaceControlPlugin.js";
+import type { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
 
 export class SessionStore {
   private readonly tabs = new Map<string, WorkspaceTab>();
@@ -20,7 +21,8 @@ export class SessionStore {
     private readonly plugins: PluginRegistry,
     private readonly pathPolicy: PathPolicy,
     private readonly contextService: TabContextService,
-    private readonly configProvider: { getPluginConfig(pluginId: string): Record<string, ConfigValue> } = { getPluginConfig: () => ({}) }
+    private readonly configProvider: { getPluginConfig(pluginId: string): Record<string, ConfigValue> } = { getPluginConfig: () => ({}) },
+    private readonly workspace?: WorkspaceLayoutStore
   ) {}
 
   async createTab(request: CreateTabRequest): Promise<WorkspaceTab> {
@@ -133,11 +135,15 @@ export class SessionStore {
     return this.activeTabId;
   }
 
-  snapshot(): WorkspaceSnapshot {
+  async snapshot(): Promise<WorkspaceSnapshot> {
+    const workspace = this.workspace ? await this.workspace.state(this.listTabs(), this.activeTabId) : undefined;
     return {
       activeTabId: this.activeTabId,
       tabs: this.listTabs(),
-      plugins: this.plugins.list()
+      plugins: this.plugins.list(),
+      activeWindowId: workspace?.activeWindowId,
+      windows: workspace?.windows,
+      templates: workspace?.templates
     };
   }
 
@@ -177,9 +183,14 @@ export class SessionStore {
       })
     );
 
+    const workspace = this.workspace ? await this.workspace.state(this.listTabs(), targetActiveTabId) : undefined;
+
     return {
       activeTabId: targetActiveTabId,
       tabs: this.listTabs(),
+      activeWindowId: workspace?.activeWindowId,
+      windows: workspace?.windows,
+      templates: workspace?.templates,
       plugins: this.plugins.list(),
       paths: this.pathPolicy.voiceContext(),
       sessions: sessionContexts
@@ -366,7 +377,75 @@ export class SessionStore {
         }
       };
     }
+    if (action === "switch_window") {
+      if (!this.workspace) {
+        throw new Error("Workspace windows are not available.");
+      }
+      const window = await this.findWindowForSwitch(input);
+      await this.workspace.selectWindow(window.id);
+      return {
+        activeWindowId: window.id,
+        window,
+        layoutInstruction: {
+          type: "select_window",
+          windowId: window.id
+        }
+      };
+    }
     throw new Error(`Unsupported workspace control action: ${action}`);
+  }
+
+  private async findWindowForSwitch(input: Record<string, unknown>) {
+    if (!this.workspace) {
+      throw new Error("Workspace windows are not available.");
+    }
+    const workspace = await this.workspace.state(this.listTabs(), this.activeTabId);
+    const windowId = typeof input.windowId === "string" && input.windowId.trim() ? input.windowId.trim() : undefined;
+    if (windowId) {
+      const window = workspace.windows.find((candidate) => candidate.id === windowId);
+      if (!window) {
+        throw new Error(`Unknown workspace window: ${windowId}`);
+      }
+      return window;
+    }
+    const title = typeof input.title === "string" && input.title.trim() ? input.title.trim().toLowerCase() : undefined;
+    if (title) {
+      const exact = workspace.windows.find((window) => window.name.toLowerCase() === title);
+      if (exact) {
+        return exact;
+      }
+      const partial = workspace.windows.filter((window) => window.name.toLowerCase().includes(title));
+      if (partial.length === 1) {
+        return partial[0]!;
+      }
+      if (partial.length > 1) {
+        throw new Error(`Multiple windows match: ${title}`);
+      }
+    }
+    const context = typeof input.context === "string" && input.context.trim() ? input.context.trim() : undefined;
+    if (context) {
+      const search = await this.workspace.search(context, this.listTabs(), await this.sessionTextByTabId());
+      const match = search.matches[0];
+      if (match) {
+        return match.window;
+      }
+    }
+    throw new Error("Window switch requires windowId, title, or context.");
+  }
+
+  async sessionTextByTabId(): Promise<Map<string, string>> {
+    const entries = await Promise.all(
+      Array.from(this.sessions.entries()).map(async ([tabId, session]) => {
+        const voiceContext = await session.voiceContext();
+        const tab = this.getTab(tabId);
+        const history = await this.contextService.read(tab);
+        return [
+          tabId,
+          [voiceContext.summary, voiceContext.visibleText, voiceContext.currentPath, voiceContext.recentOutput, history].filter(Boolean).join("\n")
+        ] as const;
+      })
+    );
+    return new Map(entries);
   }
 
   private defaultVoiceCreateTabCwdExpression(): string {

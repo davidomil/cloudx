@@ -1,4 +1,4 @@
-import type { TabLayoutDirection, TabLayoutNode, TabLayoutState, TabPaneState, VoiceExecutionResult, WorkspaceTab } from "@cloudx/shared";
+import type { TabLayoutDirection, TabLayoutNode, TabLayoutState, TabPaneState, VoiceExecutionResult, WorkspaceTab, WorkspaceWindow } from "@cloudx/shared";
 
 import { activatePane, placeTabInPane, splitPane } from "./layout.js";
 
@@ -16,9 +16,10 @@ interface VoiceWorkspaceIdFactories {
 }
 
 interface LayoutInstruction {
-  type: "open_tab_in_new_pane" | "add_tab_to_active_pane" | "select_pane" | "split_pane";
+  type: "open_tab_in_new_pane" | "add_tab_to_active_pane" | "select_pane" | "split_pane" | "select_window";
   tabId?: string;
   paneId?: string;
+  windowId?: string;
   splitDirection?: TabLayoutDirection;
 }
 
@@ -64,6 +65,9 @@ export function applyVoiceWorkspaceResults(
     if (!instruction) {
       continue;
     }
+    if (instruction.type === "select_window") {
+      continue;
+    }
     if (instruction.type === "select_pane" && instruction.paneId) {
       layout = activatePane(layout, instruction.paneId);
       continue;
@@ -92,7 +96,7 @@ export function applyVoiceWorkspaceResults(
   return { layout, tabs, activeTabId };
 }
 
-export function buildClientVoiceContext(layout: TabLayoutState, tabs: WorkspaceTab[]): Record<string, unknown> {
+export function buildClientVoiceContext(layout: TabLayoutState, tabs: WorkspaceTab[], windows: WorkspaceWindow[] = [], activeWindowId?: string): Record<string, unknown> {
   const tabsById = new Map(tabs.map((tab) => [tab.id, tab]));
   const panes = describePanes(layout.root).map(({ pane, bounds }) => ({
     id: pane.id,
@@ -105,6 +109,15 @@ export function buildClientVoiceContext(layout: TabLayoutState, tabs: WorkspaceT
   }));
 
   return {
+    activeWindowId,
+    windows: windows.map((window) => ({
+      id: window.id,
+      name: window.name,
+      active: window.id === activeWindowId,
+      defaultCwd: window.defaultCwd,
+      tabIds: describePanes(window.layout.root).flatMap(({ pane }) => pane.tabIds),
+      paneCount: describePanes(window.layout.root).length
+    })),
     activePaneId: layout.activePaneId,
     root: layout.root,
     panes
@@ -122,7 +135,7 @@ function readLayoutInstruction(value: unknown): LayoutInstruction | undefined {
   if (!isRecord(value) || typeof value.type !== "string") {
     return undefined;
   }
-  if (value.type !== "open_tab_in_new_pane" && value.type !== "add_tab_to_active_pane" && value.type !== "select_pane" && value.type !== "split_pane") {
+  if (value.type !== "open_tab_in_new_pane" && value.type !== "add_tab_to_active_pane" && value.type !== "select_pane" && value.type !== "split_pane" && value.type !== "select_window") {
     return undefined;
   }
   const splitDirection = value.splitDirection === "column" ? "column" : "row";
@@ -130,6 +143,7 @@ function readLayoutInstruction(value: unknown): LayoutInstruction | undefined {
     type: value.type,
     tabId: typeof value.tabId === "string" ? value.tabId : undefined,
     paneId: typeof value.paneId === "string" ? value.paneId : undefined,
+    windowId: typeof value.windowId === "string" ? value.windowId : undefined,
     splitDirection
   };
 }

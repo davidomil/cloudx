@@ -1,10 +1,15 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, ConfigValue } from "@cloudx/shared";
+
+import { useOutsidePointerDismiss } from "./outsidePointer.js";
 
 export function SettingsDialog({ config, onCancel, onSave }: { config: CloudxConfigResponse; onCancel: () => void; onSave: (values: CloudxConfigValues) => Promise<void> }) {
   const [values, setValues] = useState<CloudxConfigValues>(() => structuredClone(config.values));
   const [busy, setBusy] = useState(false);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+
+  useOutsidePointerDismiss(true, dialogRef, onCancel);
 
   async function save() {
     setBusy(true);
@@ -34,7 +39,7 @@ export function SettingsDialog({ config, onCancel, onSave }: { config: CloudxCon
 
   return (
     <div className="dialog-backdrop">
-      <div className="dialog settings-dialog">
+      <div className="dialog settings-dialog" ref={dialogRef}>
         <h2>Settings</h2>
         <section className="settings-section">
           <h3>Global</h3>
