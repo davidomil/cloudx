@@ -104,7 +104,14 @@ function ConfigField({ field, value, onChange }: { field: ConfigFieldDescriptor;
   return (
     <label>
       {field.label}
-      <input type={field.type === "number" ? "number" : "text"} value={String(value)} onChange={(event) => onChange(field.type === "number" ? Number(event.target.value) : event.target.value)} />
+      <input
+        type={field.type === "number" ? "number" : "text"}
+        value={String(value)}
+        min={field.type === "number" ? field.min : undefined}
+        max={field.type === "number" ? field.max : undefined}
+        step={field.type === "number" ? field.step : undefined}
+        onChange={(event) => onChange(field.type === "number" ? Number(event.target.value) : event.target.value)}
+      />
       {field.description ? <small>{field.description}</small> : null}
     </label>
   );

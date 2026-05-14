@@ -35,6 +35,7 @@ export interface OpenFileResult {
 type GitBusyAction = "state" | "diff" | "file" | "initialize" | "clone" | "origin";
 type SearchBusyAction = "search";
 type DiffViewMode = Extract<ViewType, "split" | "unified">;
+const DEFAULT_GIT_AUTO_REFRESH_SECONDS = 15;
 
 interface GitTreeChange {
   status: GitDiffFileSummary["status"];
@@ -67,6 +68,8 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   const [gitDiffFilesVisible, setGitDiffFilesVisible] = useState(true);
   const [error, setError] = useState<string | undefined>();
   const showGitDiff = config.showGitDiff !== false;
+  const gitAutoRefresh = config.gitAutoRefresh !== false;
+  const gitAutoRefreshIntervalMs = gitAutoRefreshIntervalMilliseconds(config);
   const activeSearchQuery = searchQuery.trim();
   const activeSearchResult = searchResult?.query === activeSearchQuery && searchResult.mode === searchMode ? searchResult : undefined;
   const visibleEntries = useMemo(
@@ -85,6 +88,16 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
       setCompareRef("");
     }
   }, [tab.id, showGitDiff]);
+
+  useEffect(() => {
+    if (!showGitDiff || !gitAutoRefresh || gitAutoRefreshIntervalMs === undefined) {
+      return;
+    }
+    const intervalId = window.setInterval(() => {
+      void loadGitState({ preserveCompareRef: true, silent: true });
+    }, gitAutoRefreshIntervalMs);
+    return () => window.clearInterval(intervalId);
+  }, [tab.id, showGitDiff, gitAutoRefresh, gitAutoRefreshIntervalMs, compareRef]);
 
   useEffect(() => {
     function updateViewMode() {
@@ -142,20 +155,22 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     }
   }
 
-  async function loadGitState() {
+  async function loadGitState(options: { preserveCompareRef?: boolean; silent?: boolean } = {}) {
     if (!showGitDiff) {
       return;
     }
-    setBusyAction("state");
+    if (!options.silent) {
+      setBusyAction("state");
+    }
     setError(undefined);
     try {
       const state = await runTabAction<GitRepositoryState>(tab.id, "get_git_state", {});
       setGitState(state);
       setOriginUrl(state.originUrl ?? "");
       if (state.isRepository) {
-        const nextCompareRef = state.defaultCompareRef ?? "";
+        const nextCompareRef = resolveNextCompareRef(state, options.preserveCompareRef ? compareRef : undefined);
         setCompareRef(nextCompareRef);
-        await loadDiff(nextCompareRef);
+        await loadDiff(nextCompareRef, { silent: options.silent, preserveOpenedDiff: options.silent });
       } else {
         setCompareRef("");
         setDiffSummary(undefined);
@@ -164,7 +179,9 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setBusyAction(undefined);
+      if (!options.silent) {
+        setBusyAction(undefined);
+      }
     }
   }
 
@@ -220,21 +237,27 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     }
   }
 
-  async function loadDiff(ref = compareRef) {
+  async function loadDiff(ref = compareRef, options: { silent?: boolean; preserveOpenedDiff?: boolean } = {}) {
     if (!showGitDiff) {
       return;
     }
-    setBusyAction("diff");
+    if (!options.silent) {
+      setBusyAction("diff");
+    }
     setError(undefined);
     try {
       const diff = await runTabAction<GitDiffSummary>(tab.id, "list_git_diff", ref ? { compareRef: ref } : {});
       setDiffSummary(diff);
-      setOpenedDiff(undefined);
+      if (!options.preserveOpenedDiff) {
+        setOpenedDiff(undefined);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setDiffSummary(undefined);
     } finally {
-      setBusyAction(undefined);
+      if (!options.silent) {
+        setBusyAction(undefined);
+      }
     }
   }
 
@@ -486,6 +509,30 @@ export function buildSearchInput(query: string, mode: FileSearchMode, glob: stri
     caseSensitive: false,
     ...(trimmedGlob ? { glob: trimmedGlob } : {})
   };
+}
+
+export function gitAutoRefreshIntervalMilliseconds(config: Record<string, ConfigValue>): number | undefined {
+  const configuredSeconds = config.gitAutoRefreshSeconds;
+  const seconds = typeof configuredSeconds === "number" ? configuredSeconds : DEFAULT_GIT_AUTO_REFRESH_SECONDS;
+  if (!Number.isFinite(seconds) || seconds < 1) {
+    return undefined;
+  }
+  return seconds * 1000;
+}
+
+export function resolveNextCompareRef(state: GitRepositoryState, preferredCompareRef: string | undefined): string {
+  const fallback = state.defaultCompareRef ?? "";
+  if (preferredCompareRef === undefined) {
+    return fallback;
+  }
+  if (!preferredCompareRef) {
+    return "";
+  }
+  const refs = new Set(state.compareRefs);
+  if (state.defaultCompareRef) {
+    refs.add(state.defaultCompareRef);
+  }
+  return refs.has(preferredCompareRef) ? preferredCompareRef : fallback;
 }
 
 export function searchEntriesFromResult(result: FileSearchResult | undefined): DisplayDirectoryEntry[] {

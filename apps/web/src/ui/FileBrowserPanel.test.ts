@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import { buildSearchInput, fileBrowserBodyClassName, filePreviewText, gitDiffWorkspaceClassName, mergeGitChangesIntoEntries, parsePatch, searchEntriesFromResult, searchResultSummary, type OpenFileResult } from "./FileBrowserPanel.js";
+import type { GitRepositoryState } from "@cloudx/shared";
+
+import { buildSearchInput, fileBrowserBodyClassName, filePreviewText, gitAutoRefreshIntervalMilliseconds, gitDiffWorkspaceClassName, mergeGitChangesIntoEntries, parsePatch, resolveNextCompareRef, searchEntriesFromResult, searchResultSummary, type OpenFileResult } from "./FileBrowserPanel.js";
 
 describe("filePreviewText", () => {
   it("uses relative paths when the server returns them", () => {
@@ -50,6 +52,33 @@ describe("buildSearchInput", () => {
 
   it("returns undefined for empty search text", () => {
     expect(buildSearchInput("   ", "filename", "")).toBeUndefined();
+  });
+});
+
+describe("git auto-refresh helpers", () => {
+  it("uses a 15 second interval by default and configured seconds when provided", () => {
+    expect(gitAutoRefreshIntervalMilliseconds({})).toBe(15_000);
+    expect(gitAutoRefreshIntervalMilliseconds({ gitAutoRefreshSeconds: 30 })).toBe(30_000);
+  });
+
+  it("does not produce an interval for invalid frequencies", () => {
+    expect(gitAutoRefreshIntervalMilliseconds({ gitAutoRefreshSeconds: 0 })).toBeUndefined();
+    expect(gitAutoRefreshIntervalMilliseconds({ gitAutoRefreshSeconds: -1 })).toBeUndefined();
+  });
+
+  it("preserves a valid selected compare ref while falling back when that ref disappears", () => {
+    const state = {
+      isRepository: true,
+      cwd: "/repo",
+      folderEmpty: false,
+      defaultCompareRef: "origin/main",
+      compareRefs: ["origin/main", "origin/dev"],
+      setup: { canInitialize: false, canClone: false, canSetOrigin: true }
+    } satisfies GitRepositoryState;
+
+    expect(resolveNextCompareRef(state, "origin/dev")).toBe("origin/dev");
+    expect(resolveNextCompareRef(state, "deleted/ref")).toBe("origin/main");
+    expect(resolveNextCompareRef(state, undefined)).toBe("origin/main");
   });
 });
 

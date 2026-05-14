@@ -56,6 +56,22 @@ export class FileBrowserPlugin implements WorkspacePlugin {
       type: "boolean",
       description: "Show Git repository setup controls, tree change badges, and rendered diffs in the file browser.",
       defaultValue: true
+    },
+    {
+      key: "gitAutoRefresh",
+      label: "Git auto-refresh",
+      type: "boolean",
+      description: "Automatically refresh Git repository state and changed-file badges in the file browser.",
+      defaultValue: true
+    },
+    {
+      key: "gitAutoRefreshSeconds",
+      label: "Git refresh frequency",
+      type: "number",
+      description: "Seconds between automatic Git status refreshes.",
+      defaultValue: 15,
+      min: 1,
+      step: 1
     }
   ];
 

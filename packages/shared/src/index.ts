@@ -59,6 +59,9 @@ export interface ConfigFieldDescriptor {
   description?: string;
   defaultValue: ConfigValue;
   options?: ConfigFieldOption[];
+  min?: number;
+  max?: number;
+  step?: number;
 }
 
 export interface PluginDescriptor {

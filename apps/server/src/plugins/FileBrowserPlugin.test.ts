@@ -10,6 +10,17 @@ import { PathPolicy } from "../pathPolicy.js";
 import { FileBrowserPlugin } from "./FileBrowserPlugin.js";
 
 describe("FileBrowserPlugin", () => {
+  it("exposes Git auto-refresh settings", () => {
+    const plugin = new FileBrowserPlugin(new PathPolicy([process.cwd()]));
+
+    expect(plugin.descriptor().configFields).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ key: "gitAutoRefresh", type: "boolean", defaultValue: true }),
+        expect.objectContaining({ key: "gitAutoRefreshSeconds", type: "number", defaultValue: 15, min: 1, step: 1 })
+      ])
+    );
+  });
+
   it("lists directories, opens text files, and exposes standardized voice context", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-files-"));
     await fs.writeFile(path.join(root, "README.md"), "hello");

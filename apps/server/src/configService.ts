@@ -149,6 +149,12 @@ function validateFieldValue(value: ConfigValue, field: ConfigFieldDescriptor, la
   if (field.type === "number" && (typeof value !== "number" || !Number.isFinite(value))) {
     throw new Error(`${label} must be a finite number.`);
   }
+  if (field.type === "number" && typeof value === "number" && field.min !== undefined && value < field.min) {
+    throw new Error(`${label} must be greater than or equal to ${field.min}.`);
+  }
+  if (field.type === "number" && typeof value === "number" && field.max !== undefined && value > field.max) {
+    throw new Error(`${label} must be less than or equal to ${field.max}.`);
+  }
   if (field.type === "select" && !field.options?.some((option) => option.value === value)) {
     throw new Error(`${label} must be one of the configured options.`);
   }
