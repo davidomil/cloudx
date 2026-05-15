@@ -13,6 +13,8 @@ import type {
   TabPaneState,
   UpdateWorkspaceLayoutTemplateRequest,
   UpdateWorkspaceWindowRequest,
+  PluginMetadataMap,
+  PluginMetadataPatch,
   WorkspaceLayoutTemplate,
   WorkspaceLayoutTemplateTab,
   WorkspaceStateResponse,
@@ -91,6 +93,7 @@ export class WorkspaceLayoutStore {
       name: cleanName(input.name) || defaultWindowName(this.windows.length),
       defaultCwd,
       layout: defaultLayout(),
+      pluginMetadata: readPluginMetadata(input.pluginMetadata),
       createdAt: now,
       updatedAt: now
     };
@@ -114,6 +117,9 @@ export class WorkspaceLayoutStore {
         throw new Error("Invalid workspace window layout.");
       }
       patch.layout = input.layout;
+    }
+    if (input.pluginMetadata !== undefined) {
+      patch.pluginMetadata = mergePluginMetadata(current.pluginMetadata, input.pluginMetadata);
     }
     const updated = { ...current, ...patch, updatedAt: new Date().toISOString() };
     this.windows = this.windows.map((candidate) => (candidate.id === windowId ? updated : candidate));
@@ -143,6 +149,10 @@ export class WorkspaceLayoutStore {
 
   tabIdsForWindow(windowId: string): string[] {
     return uniqueStrings(listPanes(this.getWindow(windowId).layout.root).flatMap((pane) => pane.tabIds));
+  }
+
+  findWindowForTab(tabId: string): WorkspaceWindow | undefined {
+    return this.windows.find((window) => this.tabIdsForWindow(window.id).includes(tabId));
   }
 
   async createTemplate(input: CreateWorkspaceLayoutTemplateRequest, sources: TemplateTabSource[]): Promise<WorkspaceLayoutTemplate> {
@@ -268,6 +278,7 @@ export class WorkspaceLayoutStore {
       name: "Main",
       defaultCwd: this.pathPolicy.defaultDirectoryExpression(),
       layout: defaultLayout(),
+      pluginMetadata: {},
       createdAt: now,
       updatedAt: now
     };
@@ -280,6 +291,7 @@ export class WorkspaceLayoutStore {
       name: "Main",
       defaultCwd: await this.resolveWindowCwd(undefined),
       layout: defaultLayout(),
+      pluginMetadata: {},
       createdAt: now,
       updatedAt: now
     };
@@ -436,9 +448,40 @@ function readWindow(value: unknown): WorkspaceWindow | undefined {
     name: value.name,
     defaultCwd: value.defaultCwd,
     layout: value.layout,
+    pluginMetadata: readPluginMetadata(value.pluginMetadata),
     createdAt: typeof value.createdAt === "string" ? value.createdAt : new Date(0).toISOString(),
     updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : new Date(0).toISOString()
   };
+}
+
+function mergePluginMetadata(current: PluginMetadataMap | undefined, patch: PluginMetadataPatch): PluginMetadataMap {
+  const next: PluginMetadataMap = { ...(current ?? {}) };
+  for (const [pluginId, value] of Object.entries(patch)) {
+    if (value === null) {
+      delete next[pluginId];
+      continue;
+    }
+    const metadata = readPluginMetadataValue(value);
+    if (metadata) {
+      next[pluginId] = metadata;
+    }
+  }
+  return next;
+}
+
+function readPluginMetadata(value: unknown): PluginMetadataMap {
+  if (!isRecord(value)) {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(value)
+      .map(([pluginId, metadata]) => [pluginId, readPluginMetadataValue(metadata)] as const)
+      .filter((entry): entry is readonly [string, Record<string, unknown>] => Boolean(entry[1]))
+  );
+}
+
+function readPluginMetadataValue(value: unknown): Record<string, unknown> | undefined {
+  return isRecord(value) ? { ...value } : undefined;
 }
 
 function readTemplate(value: unknown): WorkspaceLayoutTemplate | undefined {

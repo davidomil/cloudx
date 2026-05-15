@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement, type RefObject } from "react";
 import { AlertTriangle, Bot, ChevronDown, Columns2, GitBranch, LayoutTemplate, Mic, MicOff, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
 
-import type { CloudxConfigResponse, CloudxConfigValues, ConfigValue, CreateTabRequest, PluginDescriptor, PluginId, TabLayoutState, WorkspaceLayoutTemplate, WorkspaceStateResponse, WorkspaceTab, WorkspaceTabsUpdate, WorkspaceWindow } from "@cloudx/shared";
+import { RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, type CloudxConfigResponse, type CloudxConfigValues, type CloudxRule, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsStore, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceWindow } from "@cloudx/shared";
 
 import {
   applyLayoutTemplate,
+  callHook,
   closeTab,
   createTab,
   createWindow,
@@ -55,6 +56,18 @@ import { applyCloudxTheme, readTerminalColorTheme } from "./theme.js";
 import { normalizeUiScale, uiScaleFactor } from "./uiScale.js";
 import { attemptPortraitOrientationLock } from "./orientationLock.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
+import { RulesSkillsPanel, TemplateSelect, pluginMetadataForTemplate, selectedTemplateId } from "./RulesSkillsPanel.js";
+import {
+  PLUGIN_WEBVIEW_RENDERER,
+  PluginWebviewPanel,
+  UiContributionRegistry,
+  buildUiContributionHookInput,
+  collectUiContributions,
+  selectPluginPanelContribution,
+  selectTabIndicatorContribution,
+  selectTabSettingsContributions,
+  type UiContributionRenderContext
+} from "./uiContributions.js";
 import { applyVoiceWorkspaceResults, buildClientVoiceContext, voiceConsoleValue } from "./voiceWorkspace.js";
 import { WebViewerPanel } from "./WebViewerPanel.js";
 import { WorktreeManagerPanel } from "./WorktreeManagerPanel.js";
@@ -127,6 +140,7 @@ export function App() {
   const initialLayout = useMemo(() => defaultLayout(), []);
   const [plugins, setPlugins] = useState<PluginDescriptor[]>([]);
   const [config, setConfig] = useState<CloudxConfigResponse | undefined>();
+  const [rulesSkillsStore, setRulesSkillsStore] = useState<RulesSkillsStore | undefined>();
   const [tabs, setTabs] = useState<WorkspaceTab[]>([]);
   const [windows, setWindows] = useState<WorkspaceWindow[]>([]);
   const [activeWindowId, setActiveWindowId] = useState<string | undefined>();
@@ -138,6 +152,7 @@ export function App() {
   const [templateMenuOpen, setTemplateMenuOpen] = useState(false);
   const [mobileActionsOpen, setMobileActionsOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [tabSettings, setTabSettings] = useState<{ tabId: string; sectionId?: string } | undefined>();
   const [createTargetPaneId, setCreateTargetPaneId] = useState<string | undefined>();
   const [error, setError] = useState<string | undefined>();
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("checking");
@@ -271,6 +286,7 @@ export function App() {
   const microphoneEnabled = aiControlEnabled && config?.values.global.microphoneEnabled !== false;
   const uiScale = normalizeUiScale(config?.values.global.uiScale);
   const voiceConsoleText = voiceConsoleValue(voiceState, manualTranscript, voiceMessage, liveTranscript);
+  const uiContributions = useMemo(() => collectUiContributions(plugins), [plugins]);
   const mobileActionsEnabled = useMediaQuery(MOBILE_ACTIONS_QUERY);
 
   usePortraitOrientationLock();
@@ -292,15 +308,25 @@ export function App() {
   async function refresh() {
     setConnectionStatus("checking");
     try {
-      const [pluginList, workspaceState, configState] = await Promise.all([getPlugins(), getWorkspace(), getConfig()]);
+      const [pluginList, workspaceState, configState, rulesSkills] = await Promise.all([getPlugins(), getWorkspace(), getConfig(), loadRulesSkillsStore()]);
       setPlugins(pluginList);
       setConfig(configState);
+      setRulesSkillsStore(rulesSkills);
       applyWorkspaceState(workspaceState);
       setConnectionStatus("connected");
       setError(undefined);
     } catch (err) {
       setConnectionStatus("disconnected");
       setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function loadRulesSkillsStore(): Promise<RulesSkillsStore | undefined> {
+    try {
+      const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.catalog.list");
+      return result.store;
+    } catch {
+      return undefined;
     }
   }
 
@@ -431,7 +457,7 @@ export function App() {
   async function handleCreate(input: CreateTabRequest) {
     setError(undefined);
     try {
-      const tab = await createTab(input);
+      const tab = await createTab({ ...input, windowId: input.windowId ?? activeWindowIdRef.current });
       setTabs((current) => upsertTab(current, tab));
       const targetPaneId = createTargetPaneIdRef.current ?? createTargetPaneId;
       updateLayout((current) => addTabToPane(current, resolveTabCreationPaneId(current, targetPaneId), tab.id));
@@ -607,9 +633,29 @@ export function App() {
   }
 
   function applyVoiceResult(result: Awaited<ReturnType<typeof submitTranscript>>) {
+    applyWorkspaceExecutionResults(result.results);
+  }
+
+  function applyHookResult(result: Record<string, unknown>) {
+    applyHookUiInstruction(result.uiInstruction);
+    applyWorkspaceExecutionResults([{ action: "ui-hook", ok: true, result }]);
+  }
+
+  function applyHookUiInstruction(instruction: unknown) {
+    if (!isRecord(instruction) || instruction.type !== "open_tab_settings" || typeof instruction.tabId !== "string") {
+      return;
+    }
+    setTabSettings({ tabId: instruction.tabId, sectionId: typeof instruction.sectionId === "string" ? instruction.sectionId : undefined });
+  }
+
+  function applyWorkspaceExecutionResults(results: VoiceExecutionResult["results"]) {
     const next = applyVoiceWorkspaceResults(
       { layout: layoutRef.current, tabs: tabsRef.current, activeTabId: activeTabIdRef.current },
-      result,
+      {
+        accepted: true,
+        plan: { transcript: "", summary: "", actions: [] },
+        results
+      },
       {
         createPaneId: () => `pane-${crypto.randomUUID()}`,
         createSplitId: () => `split-${crypto.randomUUID()}`
@@ -621,6 +667,24 @@ export function App() {
     setTabs(next.tabs);
     commitLayout(next.layout);
     setActiveTabId(next.activeTabId);
+  }
+
+  async function handleUiContributionHook(contribution: UiContributionDescriptor, context: UiContributionRenderContext = {}) {
+    if (!contribution.hookId) {
+      return;
+    }
+    try {
+      await callUiHook(contribution.hookId, buildUiContributionHookInput(contribution, context), context.tab?.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function callUiHook<T extends Record<string, unknown> = Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}, targetTabId?: string): Promise<T> {
+    const result = await callHook<T>(hookId, input, targetTabId);
+    applyHookResult(result);
+    setError(undefined);
+    return result;
   }
 
   function currentVoiceClientContext() {
@@ -640,8 +704,8 @@ export function App() {
     return config?.values.plugins[pluginId] ?? {};
   }
 
-  async function handleCreateWindow(name: string, defaultCwd: string) {
-    applyWorkspaceState(await createWindow({ name, defaultCwd }));
+  async function handleCreateWindow(name: string, defaultCwd: string, templateId?: string) {
+    applyWorkspaceState(await createWindow({ name, defaultCwd, pluginMetadata: pluginMetadataForTemplate(templateId) }));
   }
 
   async function handleSelectWindow(windowId: string) {
@@ -649,8 +713,8 @@ export function App() {
     setWindowMenuOpen(false);
   }
 
-  async function handleRenameWindow(windowId: string, name: string, defaultCwd: string) {
-    applyWorkspaceState(await updateWindow(windowId, { name, defaultCwd }));
+  async function handleRenameWindow(windowId: string, name: string, defaultCwd: string, templateId?: string) {
+    applyWorkspaceState(await updateWindow(windowId, { name, defaultCwd, pluginMetadata: { [RULES_SKILLS_PLUGIN_ID]: templateId ? { selectedTemplateId: templateId } : null } }));
   }
 
   async function handleDeleteWindow(windowId: string) {
@@ -688,6 +752,31 @@ export function App() {
     const result = await applyLayoutTemplate(templateId, { projectPath, name });
     applyWorkspaceState(result.workspace);
     setTemplateMenuOpen(false);
+  }
+
+  async function handleSavePersonalityTemplate(template: PersonalityTemplate) {
+    const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.templates.save", { template });
+    setRulesSkillsStore(result.store);
+  }
+
+  async function handleDeletePersonalityTemplate(templateId: string) {
+    const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.templates.delete", { templateId });
+    setRulesSkillsStore(result.store);
+  }
+
+  async function handleSetDefaultTemplate(templateId: string | undefined) {
+    const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.templates.setDefault", templateId ? { templateId } : {});
+    setRulesSkillsStore(result.store);
+  }
+
+  async function handleSaveRule(rule: CloudxRule) {
+    const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.rules.save", { rule });
+    setRulesSkillsStore(result.store);
+  }
+
+  async function handleDeleteRule(ruleId: string) {
+    const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.rules.delete", { ruleId });
+    setRulesSkillsStore(result.store);
   }
 
   function renderMicControl(className: string, ref: RefObject<HTMLDivElement | null>, iconSize: number) {
@@ -739,6 +828,87 @@ export function App() {
     );
   }
 
+  const uiContributionRegistry = new UiContributionRegistry({
+    [UI_RENDERER_ICON_BUTTON]: (contribution, context) => {
+      if (!contribution.hookId) {
+        return null;
+      }
+      return (
+        <ControlButton
+          type="button"
+          className="compact-icon-button"
+          size="compact"
+          iconOnly
+          onClick={(event) => {
+            event.stopPropagation();
+            void handleUiContributionHook(contribution, context);
+          }}
+          title={contribution.title}
+          aria-label={contribution.title}
+        >
+          {uiContributionIcon(contribution.icon)}
+        </ControlButton>
+      );
+    },
+    [PLUGIN_WEBVIEW_RENDERER]: (contribution, context) => <PluginWebviewPanel contribution={contribution} context={context} />,
+    [UI_RENDERER_STATUS_DOT]: (_contribution, context) => (context.tab ? <TabIndicatorDot tab={context.tab} attention={context.attention} /> : null),
+    "audio-ai.voice-control": () => renderMicControl("topbar-mic-control", topbarMicControlRef, 17),
+    "audio-ai.voice-console": () => {
+      if (!aiControlEnabled) {
+        return null;
+      }
+      return (
+        <footer className="voice-console">
+          <textarea
+            aria-label="Voice transcript"
+            value={voiceConsoleText}
+            onChange={(event) => {
+              if (voiceState === "idle") {
+                setManualTranscript(event.target.value);
+              }
+            }}
+            onKeyDown={handleTranscriptKeyDown}
+            placeholder={voiceState === "idle" ? "Type voice command. Enter sends, Shift+Enter newline." : "AI is thinking..."}
+            rows={2}
+            readOnly={voiceState !== "idle"}
+            aria-busy={voiceState === "processing"}
+            aria-disabled={voiceState !== "idle"}
+          />
+          {renderMicControl("voice-console-mic-control", footerMicControlRef, 25)}
+        </footer>
+      );
+    },
+    "rules-skills.templates-panel": (_contribution, context) => (
+      <RulesSkillsPanel
+        store={rulesSkillsStore}
+        onSaveTemplate={handleSavePersonalityTemplate}
+        onDeleteTemplate={handleDeletePersonalityTemplate}
+        onSetDefault={handleSetDefaultTemplate}
+        onSaveRule={handleSaveRule}
+        onDeleteRule={handleDeleteRule}
+      />
+    ),
+  });
+
+  function renderUiContributions(slot: UiContributionSlot, context: { tab?: WorkspaceTab; attention?: boolean } = {}): Array<ReactElement | null> {
+    return uiContributions.filter((contribution) => contribution.slot === slot).map((contribution) => renderUiContribution(contribution, context));
+  }
+
+  function renderUiContribution(contribution: UiContributionDescriptor, context: { tab?: WorkspaceTab; attention?: boolean } = {}): ReactElement | null {
+    return uiContributionRegistry.render(contribution, {
+      plugins,
+      config: config?.values.global,
+      uiScale,
+      callHook: callUiHook,
+      ...context
+    });
+  }
+
+  function renderTabIndicator(tab: WorkspaceTab, attention: boolean): ReactElement | null {
+    const contribution = selectTabIndicatorContribution(plugins, tab);
+    return contribution ? renderUiContribution(contribution, { tab, attention }) : null;
+  }
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -757,6 +927,7 @@ export function App() {
           <WindowSwitcher
             windows={windows}
             tabs={tabs}
+            rulesSkillsStore={rulesSkillsStore}
             activeWindow={activeWindow}
             open={windowMenuOpen}
             onOpenChange={setWindowMenuOpen}
@@ -821,7 +992,7 @@ export function App() {
                 onApply={handleApplyTemplate}
               />
             ) : null}
-            {renderMicControl("topbar-mic-control", topbarMicControlRef, 17)}
+            {renderUiContributions("app.topbar.actions")}
           </div>
         </div>
       </header>
@@ -832,27 +1003,31 @@ export function App() {
         {renderLayoutNode(layout.root)}
       </section>
 
-      {aiControlEnabled ? <footer className="voice-console">
-        <textarea
-          aria-label="Voice transcript"
-          value={voiceConsoleText}
-          onChange={(event) => {
-            if (voiceState === "idle") {
-              setManualTranscript(event.target.value);
-            }
-          }}
-          onKeyDown={handleTranscriptKeyDown}
-          placeholder={voiceState === "idle" ? "Type voice command. Enter sends, Shift+Enter newline." : "AI is thinking..."}
-          rows={2}
-          readOnly={voiceState !== "idle"}
-          aria-busy={voiceState === "processing"}
-          aria-disabled={voiceState !== "idle"}
-        />
-        {renderMicControl("voice-console-mic-control", footerMicControlRef, 25)}
-      </footer> : null}
+      {renderUiContributions("app.footer.actions")}
 
-      {createOpen ? <CreateTabDialog plugins={plugins} defaultCwd={activeWindow?.defaultCwd ?? "~"} onCancel={closeCreateDialog} onCreate={handleCreate} /> : null}
-      {settingsOpen && config ? <SettingsDialog config={config} onCancel={() => setSettingsOpen(false)} onSave={handleSaveConfig} /> : null}
+      {createOpen ? <CreateTabDialog plugins={plugins} templates={rulesSkillsStore?.templates ?? []} defaultCwd={activeWindow?.defaultCwd ?? "~"} onCancel={closeCreateDialog} onCreate={handleCreate} /> : null}
+      {settingsOpen && config ? (
+        <SettingsDialog
+          config={config}
+          rulesSkillsStore={rulesSkillsStore}
+          onCancel={() => setSettingsOpen(false)}
+          onSave={handleSaveConfig}
+          onSaveDefaultTemplate={handleSetDefaultTemplate}
+        />
+      ) : null}
+      {tabSettings && tabById.has(tabSettings.tabId) ? (
+        <TabSettingsDialog
+          tab={tabById.get(tabSettings.tabId)!}
+          plugin={pluginById.get(tabById.get(tabSettings.tabId)!.pluginId)}
+          plugins={plugins}
+          sectionId={tabSettings.sectionId}
+          config={pluginConfig(tabById.get(tabSettings.tabId)!.pluginId)}
+          uiScale={uiScale}
+          uiContributionRegistry={uiContributionRegistry}
+          callHook={callUiHook}
+          onClose={() => setTabSettings(undefined)}
+        />
+      ) : null}
     </main>
   );
 
@@ -892,7 +1067,7 @@ export function App() {
             const focused = isTabFocused(layout, tabId);
             const shouldBlink = attentionTabIds.has(tabId) && !focused;
             return (
-              <button
+              <div
                 key={tabId}
                 draggable
                 className={`tab-button ${selected ? "selected" : ""}`}
@@ -904,20 +1079,35 @@ export function App() {
                 onDragStart={(event) => event.dataTransfer.setData("text/tab-id", tabId)}
                 onClick={(event) => {
                   event.stopPropagation();
-                  void activateTab(tabId, pane.id);
                 }}
               >
-                <span className="tab-title">{tab.title}</span>
-                <TabIndicatorDot tab={tab} attention={shouldBlink} />
-                <X
-                  size={13}
-                  className="tab-close"
+                <button
+                  type="button"
+                  className="tab-activation"
                   onClick={(event) => {
                     event.stopPropagation();
-                    void handleClose(tabId);
+                    void activateTab(tabId, pane.id);
                   }}
-                />
-              </button>
+                >
+                  <span className="tab-title">{tab.title}</span>
+                  {renderTabIndicator(tab, shouldBlink)}
+                </button>
+                <div className="tab-actions">
+                  {renderUiContributions("tab.actions.trailing", { tab })}
+                  <button
+                    type="button"
+                    className="tab-close"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void handleClose(tabId);
+                    }}
+                    aria-label={`Close ${tab.title}`}
+                    title={`Close ${tab.title}`}
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
+              </div>
             );
           })}
           <ControlButton
@@ -953,7 +1143,16 @@ export function App() {
         </div>
         <div className="pane-body">
           {pane.activeTabId && tabById.has(pane.activeTabId) ? (
-            <PluginPanel tab={tabById.get(pane.activeTabId)!} plugin={pluginById.get(tabById.get(pane.activeTabId)!.pluginId)} active={paneActive} config={pluginConfig(tabById.get(pane.activeTabId)!.pluginId)} uiScale={uiScale} />
+            <PluginPanel
+              tab={tabById.get(pane.activeTabId)!}
+              plugin={pluginById.get(tabById.get(pane.activeTabId)!.pluginId)}
+              plugins={plugins}
+              active={paneActive}
+              config={pluginConfig(tabById.get(pane.activeTabId)!.pluginId)}
+              uiScale={uiScale}
+              uiContributionRegistry={uiContributionRegistry}
+              callHook={callUiHook}
+            />
           ) : (
             <div className="empty-pane">
               <PanelTopOpen size={28} />
@@ -969,6 +1168,7 @@ export function App() {
 function WindowSwitcher({
   windows,
   tabs,
+  rulesSkillsStore,
   activeWindow,
   open,
   onOpenChange,
@@ -980,12 +1180,13 @@ function WindowSwitcher({
 }: {
   windows: WorkspaceWindow[];
   tabs: WorkspaceTab[];
+  rulesSkillsStore?: RulesSkillsStore;
   activeWindow?: WorkspaceWindow;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSelect: (windowId: string) => Promise<void>;
-  onCreate: (name: string, defaultCwd: string) => Promise<void>;
-  onUpdate: (windowId: string, name: string, defaultCwd: string) => Promise<void>;
+  onCreate: (name: string, defaultCwd: string, templateId?: string) => Promise<void>;
+  onUpdate: (windowId: string, name: string, defaultCwd: string, templateId?: string) => Promise<void>;
   onDelete: (windowId: string) => Promise<void>;
   onContextSearch: (query: string) => Promise<{ matches: Array<{ window: WorkspaceWindow; score: number; reasons: string[] }> }>;
 }) {
@@ -995,6 +1196,7 @@ function WindowSwitcher({
   const [contextMatches, setContextMatches] = useState<Array<{ window: WorkspaceWindow; score: number; reasons: string[] }>>([]);
   const [draftName, setDraftName] = useState(activeWindow?.name ?? "");
   const [draftCwd, setDraftCwd] = useState(activeWindow?.defaultCwd ?? "~");
+  const [draftTemplateId, setDraftTemplateId] = useState(selectedTemplateId(activeWindow));
   const [dialogMode, setDialogMode] = useState<"create" | "edit" | undefined>();
   const [editingWindow, setEditingWindow] = useState<WorkspaceWindow | undefined>();
   const [deleteCandidate, setDeleteCandidate] = useState<WorkspaceWindow | undefined>();
@@ -1007,7 +1209,8 @@ function WindowSwitcher({
   useEffect(() => {
     setDraftName(activeWindow?.name ?? "");
     setDraftCwd(activeWindow?.defaultCwd ?? "~");
-  }, [activeWindow?.id, activeWindow?.name, activeWindow?.defaultCwd]);
+    setDraftTemplateId(selectedTemplateId(activeWindow));
+  }, [activeWindow?.id, activeWindow?.name, activeWindow?.defaultCwd, activeWindow?.pluginMetadata]);
 
   useEffect(() => {
     if (!open || !contextMode || !query.trim()) {
@@ -1052,6 +1255,7 @@ function WindowSwitcher({
     setDeleteCandidate(undefined);
     setDraftName("");
     setDraftCwd(activeWindow?.defaultCwd ?? "~");
+    setDraftTemplateId("");
     setError(undefined);
   }
 
@@ -1061,6 +1265,7 @@ function WindowSwitcher({
     setDeleteCandidate(undefined);
     setDraftName(window.name);
     setDraftCwd(window.defaultCwd);
+    setDraftTemplateId(selectedTemplateId(window));
     setError(undefined);
   }
 
@@ -1074,9 +1279,9 @@ function WindowSwitcher({
   async function submitWindowDialog() {
     try {
       if (dialogMode === "edit" && editingWindow) {
-        await onUpdate(editingWindow.id, draftName, draftCwd);
+        await onUpdate(editingWindow.id, draftName, draftCwd, draftTemplateId || undefined);
       } else {
-        await onCreate(draftName, draftCwd);
+        await onCreate(draftName, draftCwd, draftTemplateId || undefined);
       }
       setDialogMode(undefined);
       setEditingWindow(undefined);
@@ -1143,6 +1348,17 @@ function WindowSwitcher({
               <strong>{dialogMode === "edit" ? "Edit window" : "Create window"}</strong>
               <input value={draftName} onChange={(event) => setDraftName(event.target.value)} placeholder="Window name" />
               <PathEntry inputId="window-default-directory" value={draftCwd} onChange={setDraftCwd} placeholder="Default directory" ariaLabel="Window default directory" />
+              {rulesSkillsStore ? (
+                <TemplateSelect
+                  value={draftTemplateId}
+                  templates={rulesSkillsStore.templates}
+                  defaultTemplateId={rulesSkillsStore.defaultTemplateId}
+                  onChange={setDraftTemplateId}
+                  label="Template"
+                  includeInherited
+                  inheritedLabel="Use default"
+                />
+              ) : null}
               <div className="menu-form-actions">
                 <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void submitWindowDialog()} disabled={!draftName.trim() || !draftCwd.trim()} title={dialogMode === "edit" ? "Save window" : "Create window"} aria-label={dialogMode === "edit" ? "Save window" : "Create window"}>
                   {dialogMode === "edit" ? <Save size={15} /> : <Plus size={15} />}
@@ -1356,7 +1572,75 @@ function TabIndicatorDot({ tab, attention }: { tab: WorkspaceTab; attention?: bo
   return <span className={`tab-indicator ${tab.indicator.color} ${attention ? "attention" : ""}`} title={title} aria-label={title} />;
 }
 
-function PluginPanel({ tab, plugin, active, config, uiScale }: { tab: WorkspaceTab; plugin: PluginDescriptor | undefined; active: boolean; config: Record<string, ConfigValue>; uiScale: number }) {
+function uiContributionIcon(icon?: string): ReactElement {
+  switch (icon) {
+    case "alert":
+      return <AlertTriangle size={15} />;
+    case "bot":
+      return <Bot size={15} />;
+    case "columns":
+      return <Columns2 size={15} />;
+    case "layout":
+      return <LayoutTemplate size={15} />;
+    case "mic":
+      return <Mic size={15} />;
+    case "panel":
+      return <PanelTopOpen size={15} />;
+    case "pencil":
+      return <Pencil size={15} />;
+    case "play":
+      return <Play size={15} />;
+    case "plus":
+      return <Plus size={15} />;
+    case "refresh":
+      return <RefreshCw size={15} />;
+    case "rows":
+      return <Rows3 size={15} />;
+    case "save":
+      return <Save size={15} />;
+    case "search":
+      return <Search size={15} />;
+    case "settings":
+      return <Settings size={15} />;
+    case "square-plus":
+      return <SquarePlus size={15} />;
+    case "trash":
+      return <Trash2 size={15} />;
+    case "wrench":
+      return <Wrench size={15} />;
+    case "x":
+      return <X size={15} />;
+    default:
+      return <MoreHorizontal size={15} />;
+  }
+}
+
+function PluginPanel({
+  tab,
+  plugin,
+  plugins,
+  active,
+  config,
+  uiScale,
+  uiContributionRegistry,
+  callHook
+}: {
+  tab: WorkspaceTab;
+  plugin: PluginDescriptor | undefined;
+  plugins: PluginDescriptor[];
+  active: boolean;
+  config: Record<string, ConfigValue>;
+  uiScale: number;
+  uiContributionRegistry: UiContributionRegistry;
+  callHook: UiContributionRenderContext["callHook"];
+}) {
+  const panelContribution = selectPluginPanelContribution(plugins, plugin);
+  if (panelContribution) {
+    const panel = uiContributionRegistry.render(panelContribution, { tab, plugin, plugins, active, config, uiScale, callHook });
+    if (panel) {
+      return panel;
+    }
+  }
   if (plugin?.panelKind === "file-browser") {
     return <FileBrowserPanel tab={tab} config={config} />;
   }
@@ -1370,6 +1654,55 @@ function PluginPanel({ tab, plugin, active, config, uiScale }: { tab: WorkspaceT
     return <TerminalPanel tab={tab} active={active} uiScale={uiScale} />;
   }
   return <div className="empty-pane">No panel registered for {plugin.displayName}</div>;
+}
+
+function TabSettingsDialog({
+  tab,
+  plugin,
+  plugins,
+  sectionId,
+  config,
+  uiScale,
+  uiContributionRegistry,
+  callHook,
+  onClose
+}: {
+  tab: WorkspaceTab;
+  plugin: PluginDescriptor | undefined;
+  plugins: PluginDescriptor[];
+  sectionId?: string;
+  config: Record<string, ConfigValue>;
+  uiScale: number;
+  uiContributionRegistry: UiContributionRegistry;
+  callHook: UiContributionRenderContext["callHook"];
+  onClose: () => void;
+}) {
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  useOutsidePointerDismiss(true, dialogRef, onClose);
+  const sections = selectTabSettingsContributions(plugins, tab);
+  const requestedSection = sectionId ? sections.find((section) => section.id === sectionId) : undefined;
+  const orderedSections = requestedSection ? [requestedSection, ...sections.filter((section) => section.id !== requestedSection.id)] : sections;
+
+  return (
+    <div className="dialog-backdrop">
+      <div className="dialog tab-settings-dialog" ref={dialogRef}>
+        <h2>{tab.title}</h2>
+        <p>{plugin?.displayName ?? tab.pluginId}</p>
+        {orderedSections.length ? (
+          orderedSections.map((contribution) => (
+            <div key={contribution.id} className="tab-settings-contribution">
+              {uiContributionRegistry.render(contribution, { tab, plugin, plugins, config, uiScale, callHook })}
+            </div>
+          ))
+        ) : (
+          <div className="empty-pane">No tab settings are registered for this plugin.</div>
+        )}
+        <div className="dialog-actions">
+          <ControlButton onClick={onClose}>Close</ControlButton>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function ResizeHandle({ direction, sizes, onResize }: { direction: LayoutDirection; sizes: [number, number]; onResize: (deltaPixels: number, containerPixels: number, startSizes: [number, number]) => void }) {
@@ -1410,6 +1743,10 @@ function loadAudioInputId(): string | undefined {
     return undefined;
   }
   return window.localStorage.getItem(AUDIO_INPUT_KEY) || undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function persistAudioInputId(deviceId: string | undefined) {
@@ -1491,11 +1828,13 @@ function subscribeWorkspaceUpdates(onUpdate: (update: WorkspaceTabsUpdate) => vo
 
 function CreateTabDialog({
   plugins,
+  templates,
   defaultCwd,
   onCancel,
   onCreate
 }: {
   plugins: PluginDescriptor[];
+  templates: PersonalityTemplate[];
   defaultCwd: string;
   onCancel: () => void;
   onCreate: (input: CreateTabRequest) => Promise<void>;
@@ -1505,10 +1844,12 @@ function CreateTabDialog({
   const [cwd, setCwd] = useState(defaultCwd);
   const [title, setTitle] = useState("");
   const [localWebUrl, setLocalWebUrl] = useState("");
+  const [templateId, setTemplateId] = useState("");
   const [createDirectory, setCreateDirectory] = useState(false);
   const [busy, setBusy] = useState(false);
   const selectedPlugin = creatablePlugins.find((plugin) => plugin.id === pluginId);
   const isLocalWeb = selectedPlugin?.panelKind === "web-viewer";
+  const isCodex = selectedPlugin?.id === "codex-terminal";
   const requiresDirectory = selectedPlugin?.requiresDirectory ?? true;
   const titlePlaceholder = defaultTabTitlePlaceholder(selectedPlugin, cwd, localWebUrl);
 
@@ -1517,6 +1858,12 @@ function CreateTabDialog({
       setCreateDirectory(false);
     }
   }, [requiresDirectory]);
+
+  useEffect(() => {
+    if (!isCodex) {
+      setTemplateId("");
+    }
+  }, [isCodex]);
 
   async function submit() {
     setBusy(true);
@@ -1527,7 +1874,8 @@ function CreateTabDialog({
         cwd: requiresDirectory ? cwd : undefined,
         title,
         createDirectory: requiresDirectory ? createDirectory : false,
-        initialInput
+        initialInput,
+        pluginMetadata: isCodex ? pluginMetadataForTemplate(templateId || undefined) : undefined
       });
     } finally {
       setBusy(false);
@@ -1565,6 +1913,9 @@ function CreateTabDialog({
               autoComplete="url"
             />
           </label>
+        ) : null}
+        {isCodex && templates.length > 0 ? (
+          <TemplateSelect value={templateId} templates={templates} onChange={setTemplateId} label="Template" includeInherited />
         ) : null}
         <label>
           Title

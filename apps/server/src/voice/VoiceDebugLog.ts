@@ -46,6 +46,7 @@ export function actionLogFields(action: VoiceAction, includeText = false, index?
     actionId: action.id,
     targetTabId: action.targetTabId,
     pluginId: action.pluginId,
+    hookId: action.hookId,
     action: action.action,
     reason: includeText ? action.reason : undefined,
     reasonChars: action.reason?.length,

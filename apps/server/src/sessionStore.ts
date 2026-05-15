@@ -1,29 +1,43 @@
 import crypto from "node:crypto";
 import path from "node:path";
 
-import type { PluginActionDefinition, PluginSession, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
+import { pluginActionHookId } from "@cloudx/plugin-api";
+import type { CloudxAppContext, HookCaller, PluginActionDefinition, PluginSession, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
 import type { ConfigValue } from "@cloudx/shared";
-import type { CreateTabRequest, TabIndicator, TabIndicatorUpdate, VoiceAction, WorkspaceSnapshot, WorkspaceTab, WorkspaceTabsUpdate } from "@cloudx/shared";
+import type { CreateTabRequest, HookId, PluginMetadata, PluginMetadataMap, TabIndicator, TabIndicatorUpdate, VoiceAction, WorkspaceRuntimeContext, WorkspaceSnapshot, WorkspaceTab, WorkspaceTabsUpdate, WorkspaceWindow } from "@cloudx/shared";
 
 import { PathPolicy } from "./pathPolicy.js";
 import { PluginRegistry } from "./pluginRegistry.js";
 import { TabContextService } from "./context/TabContextService.js";
 import { WORKSPACE_CONTROL_PLUGIN_ID } from "./plugins/WorkspaceControlPlugin.js";
 import type { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
+import type { HookRegistry } from "./hooks/HookRegistry.js";
+
+export interface SessionRuntimeContextResolver {
+  runtimeContextFor(tab: WorkspaceTab, window?: WorkspaceWindow): Promise<WorkspaceRuntimeContext> | WorkspaceRuntimeContext;
+  tabIndicatorFor(tab: WorkspaceTab, window?: WorkspaceWindow): Promise<TabIndicatorUpdate | undefined> | TabIndicatorUpdate | undefined;
+}
 
 export class SessionStore {
   private readonly tabs = new Map<string, WorkspaceTab>();
   private readonly sessions = new Map<string, PluginSession>();
+  private readonly sessionDisposers = new Map<string, Array<() => void>>();
   private readonly tabsListeners = new Set<(update: WorkspaceTabsUpdate) => void>();
   private activeTabId: string | undefined;
+  private hooks: HookRegistry | undefined;
 
   constructor(
     private readonly plugins: PluginRegistry,
     private readonly pathPolicy: PathPolicy,
     private readonly contextService: TabContextService,
     private readonly configProvider: { getPluginConfig(pluginId: string): Record<string, ConfigValue> } = { getPluginConfig: () => ({}) },
-    private readonly workspace?: WorkspaceLayoutStore
+    private readonly workspace?: WorkspaceLayoutStore,
+    private readonly runtimeContextResolver?: SessionRuntimeContextResolver
   ) {}
+
+  setHookRegistry(hooks: HookRegistry): void {
+    this.hooks = hooks;
+  }
 
   async createTab(request: CreateTabRequest): Promise<WorkspaceTab> {
     const plugin = this.plugins.get(request.pluginId);
@@ -31,6 +45,7 @@ export class SessionStore {
     const cwd = await this.pathPolicy.ensureDirectory(cwdExpression, plugin.requiresDirectory ? (request.createDirectory ?? false) : false);
     const now = new Date().toISOString();
     const id = crypto.randomUUID();
+    const window = this.resolveRequestWindow(request);
     const tab: WorkspaceTab = {
       id,
       pluginId: plugin.id,
@@ -38,10 +53,16 @@ export class SessionStore {
       cwd,
       status: "starting",
       indicator: createTabIndicator({ color: "green", label: "OK", message: "Starting tab." }, now),
+      pluginMetadata: readPluginMetadata(request.pluginMetadata),
       createdAt: now,
       updatedAt: now,
       contextPath: ""
     };
+    const runtimeContext = await this.runtimeContextResolver?.runtimeContextFor(tab, window);
+    const templateIndicator = await this.runtimeContextResolver?.tabIndicatorFor(tab, window);
+    if (templateIndicator) {
+      tab.indicator = createTabIndicator(templateIndicator, now);
+    }
     tab.contextPath = await this.contextService.create(tab);
     this.tabs.set(id, tab);
 
@@ -49,28 +70,15 @@ export class SessionStore {
       const session = await plugin.createSession({
         tab,
         cwd,
+        runtimeContext,
+        app: this.createAppContext(plugin.id, id),
         controls: this.createControls(id),
         initialInput: request.initialInput,
         config: this.configProvider.getPluginConfig(plugin.id),
         getConfig: () => this.configProvider.getPluginConfig(plugin.id)
       });
-      this.sessions.set(id, session);
-      session.onStatusChange?.((status, statusMessage) => {
-        if (this.tabs.has(id)) {
-          this.updateTab(id, {
-            status,
-            statusMessage,
-            indicator: indicatorForStatus(status, statusMessage)
-          });
-        }
-      });
-      session.onData?.((data) => {
-        const current = this.tabs.get(id);
-        if (current) {
-          void this.contextService.record(current, "terminal-output", data);
-        }
-      });
-      this.updateTab(id, { status: "running", indicator: createTabIndicator({ color: "green", label: "OK", message: "Running." }) });
+      this.bindSession(id, session);
+      this.updateTab(id, { status: "running", indicator: templateIndicator ? createTabIndicator(templateIndicator) : createTabIndicator({ color: "green", label: "OK", message: "Running." }) });
     } catch (error) {
       this.updateTab(id, {
         status: "failed",
@@ -149,6 +157,7 @@ export class SessionStore {
 
   async buildVoiceContext(activeTabId?: string): Promise<Record<string, unknown>> {
     const targetActiveTabId = activeTabId ?? this.activeTabId;
+    const voiceHooks = this.hooks?.list().filter((hook) => hook.exposures.includes("voice")) ?? [];
     const sessionContexts = await Promise.all(
       Array.from(this.sessions.entries()).map(async ([tabId, session]) => {
         const tab = this.getTab(tabId);
@@ -174,9 +183,10 @@ export class SessionStore {
               handlesUnhandledVoice: action.handlesUnhandledVoice,
               inputSchema: action.inputSchema
             })),
+          voiceHooks: voiceHooks.filter((hook) => hook.owner.kind === "plugin" && hook.owner.pluginId === tab.pluginId),
           history: {
             source: tab.contextPath,
-            description: "Recent Cloudx tab context. Includes terminal output, plugin actions, and prior voice actions for this tab.",
+            description: "Recent Cloudx tab context. Includes terminal output, plugin actions, plugin hooks, and prior voice actions for this tab.",
             text: historyText
           }
         };
@@ -192,12 +202,17 @@ export class SessionStore {
       windows: workspace?.windows,
       templates: workspace?.templates,
       plugins: this.plugins.list(),
+      hooks: voiceHooks,
       paths: this.pathPolicy.voiceContext(),
       sessions: sessionContexts
     };
   }
 
   async executeVoiceAction(action: VoiceAction, fallbackTabId?: string): Promise<Record<string, unknown>> {
+    if (action.hookId) {
+      return this.executeVoiceHook(action, fallbackTabId);
+    }
+
     if (action.pluginId === WORKSPACE_CONTROL_PLUGIN_ID) {
       const input = this.plugins.sanitizeVoiceInput(WORKSPACE_CONTROL_PLUGIN_ID, action.action, action.input);
       this.plugins.validateVoiceInput(WORKSPACE_CONTROL_PLUGIN_ID, action.action, input);
@@ -242,6 +257,7 @@ export class SessionStore {
     return {
       targetTabId,
       pluginId: session.tab.pluginId,
+      hookId: pluginActionHookId(session.tab.pluginId, defaultAction.name),
       action: defaultAction.name,
       input,
       reason: `Default voice action for ${session.tab.pluginId}.`
@@ -265,6 +281,7 @@ export class SessionStore {
     return {
       targetTabId,
       pluginId: session.tab.pluginId,
+      hookId: pluginActionHookId(session.tab.pluginId, fallbackAction.name),
       action: fallbackAction.name,
       input,
       reason: `Unhandled voice fallback for ${session.tab.pluginId}.`
@@ -279,8 +296,49 @@ export class SessionStore {
     return result;
   }
 
+  async executePluginHook(pluginId: string, hookId: HookId, action: string, targetTabId: string | undefined, input: Record<string, unknown>, caller: HookCaller): Promise<Record<string, unknown>> {
+    const tabId = this.resolvePluginHookTargetTabId(pluginId, targetTabId, caller.tabId ?? this.activeTabId);
+    if (!tabId) {
+      throw new Error(`Hook ${hookId} requires a target tab for plugin ${pluginId}.`);
+    }
+    const session = this.getSession(tabId);
+    if (session.tab.pluginId !== pluginId) {
+      throw new Error(`Hook ${hookId} targets plugin ${pluginId}, but tab ${tabId} uses ${session.tab.pluginId}.`);
+    }
+    const actionInput = caller.kind === "voice" ? this.plugins.sanitizeVoiceInput(pluginId, action, input) : input;
+    if (caller.kind === "voice") {
+      this.plugins.validateVoiceInput(pluginId, action, actionInput);
+    } else {
+      this.plugins.validateInput(pluginId, action, actionInput);
+    }
+    const result = await session.handleAction(action, actionInput);
+    await this.contextService.record(this.getTab(tabId), "plugin-hook", JSON.stringify({ hookId, action, input: actionInput, caller, result }, null, 2));
+    return result;
+  }
+
+  private async executeVoiceHook(action: VoiceAction, fallbackTabId?: string): Promise<Record<string, unknown>> {
+    if (!this.hooks) {
+      throw new Error("Hook registry is not available.");
+    }
+    const activeTabId = fallbackTabId ?? this.activeTabId;
+    const targetTabId = action.targetTabId ?? activeTabId;
+    const targetTab = targetTabId && this.tabs.has(targetTabId) ? this.getTab(targetTabId) : undefined;
+    const result = await this.hooks.call(action.hookId!, action.input, {
+      caller: { kind: "voice" },
+      targetTabId,
+      targetTab,
+      activeTabId
+    });
+    const contextTabId = targetTab?.id ?? (activeTabId && this.tabs.has(activeTabId) ? activeTabId : undefined);
+    if (contextTabId) {
+      await this.contextService.record(this.getTab(contextTabId), "voice-action", JSON.stringify({ action, result }, null, 2));
+    }
+    return result;
+  }
+
   closeTab(tabId: string, options: { stopSession?: boolean } = {}): void {
     const session = this.sessions.get(tabId);
+    this.disposeSessionListeners(tabId);
     if (options.stopSession ?? true) {
       session?.stop?.();
     }
@@ -292,22 +350,174 @@ export class SessionStore {
     this.emitTabsChange();
   }
 
+  async restartTab(tabId: string, reason = "Restarting tab."): Promise<WorkspaceTab> {
+    const current = this.getTab(tabId);
+    const plugin = this.plugins.get(current.pluginId);
+    const oldSession = this.sessions.get(tabId);
+    this.disposeSessionListeners(tabId);
+    this.sessions.delete(tabId);
+    oldSession?.stop?.();
+
+    const window = this.workspace?.findWindowForTab(tabId) ?? this.workspace?.getActiveWindow();
+    const runtimeContext = await this.runtimeContextResolver?.runtimeContextFor(current, window);
+    const templateIndicator = await this.runtimeContextResolver?.tabIndicatorFor(current, window);
+    this.updateTab(tabId, {
+      status: "starting",
+      statusMessage: reason,
+      indicator: templateIndicator ? createTabIndicator(templateIndicator) : createTabIndicator({ color: "yellow", label: "Restarting", message: reason })
+    });
+
+    try {
+      const tab = this.getTab(tabId);
+      const session = await plugin.createSession({
+        tab,
+        cwd: tab.cwd,
+        runtimeContext,
+        app: this.createAppContext(plugin.id, tabId),
+        controls: this.createControls(tabId),
+        config: this.configProvider.getPluginConfig(plugin.id),
+        getConfig: () => this.configProvider.getPluginConfig(plugin.id)
+      });
+      this.bindSession(tabId, session);
+      this.updateTab(tabId, {
+        status: "running",
+        statusMessage: undefined,
+        indicator: templateIndicator ? createTabIndicator(templateIndicator) : createTabIndicator({ color: "green", label: "OK", message: "Running." })
+      });
+    } catch (error) {
+      this.updateTab(tabId, {
+        status: "failed",
+        statusMessage: error instanceof Error ? error.message : String(error),
+        indicator: createTabIndicator({
+          color: "red",
+          label: "Failed",
+          message: error instanceof Error ? error.message : String(error)
+        })
+      });
+      throw error;
+    }
+
+    return this.getTab(tabId);
+  }
+
+  async restartTabs(predicate: (tab: WorkspaceTab) => boolean, reason = "Restarting tab."): Promise<WorkspaceTab[]> {
+    const tabs = this.listTabs().filter((tab) => this.sessions.has(tab.id) && predicate(tab));
+    const restarted: WorkspaceTab[] = [];
+    for (const tab of tabs) {
+      restarted.push(await this.restartTab(tab.id, reason));
+    }
+    return restarted;
+  }
+
+  async applyRuntimeContext(tabId: string, reason = "Applying runtime context."): Promise<WorkspaceTab> {
+    const tab = this.getTab(tabId);
+    const session = this.sessions.get(tabId);
+    if (!session?.applyRuntimeContext || !this.runtimeContextResolver) {
+      return tab;
+    }
+    const window = this.workspace?.findWindowForTab(tabId) ?? this.workspace?.getActiveWindow();
+    const runtimeContext = await this.runtimeContextResolver.runtimeContextFor(tab, window);
+    const templateIndicator = await this.runtimeContextResolver.tabIndicatorFor(tab, window);
+    const result = await session.applyRuntimeContext(runtimeContext);
+    await this.contextService.record(tab, "runtime-context", JSON.stringify({ reason, result }, null, 2));
+    if (templateIndicator) {
+      this.updateTab(tabId, { indicator: createTabIndicator(templateIndicator) });
+    }
+    return this.getTab(tabId);
+  }
+
+  async applyRuntimeContexts(predicate: (tab: WorkspaceTab) => boolean, reason = "Applying runtime context."): Promise<WorkspaceTab[]> {
+    const tabs = this.listTabs().filter((tab) => this.sessions.has(tab.id) && predicate(tab));
+    const applied: WorkspaceTab[] = [];
+    for (const tab of tabs) {
+      applied.push(await this.applyRuntimeContext(tab.id, reason));
+    }
+    return applied;
+  }
+
   private updateTab(tabId: string, patch: Partial<WorkspaceTab>): void {
     const current = this.getTab(tabId);
     this.tabs.set(tabId, { ...current, ...patch, updatedAt: new Date().toISOString() });
     this.emitTabsChange();
   }
 
-  private setTabIndicator(tabId: string, indicator: TabIndicatorUpdate): void {
+  updateTabIndicator(tabId: string, indicator: TabIndicatorUpdate): WorkspaceTab {
     if (!this.tabs.has(tabId)) {
-      return;
+      throw new Error(`Unknown tab: ${tabId}`);
     }
     this.updateTab(tabId, { indicator: createTabIndicator(indicator) });
+    return this.getTab(tabId);
+  }
+
+  async updateTabPluginMetadata(tabId: string, pluginId: string, metadata: PluginMetadata | null): Promise<WorkspaceTab> {
+    const current = this.getTab(tabId);
+    const pluginMetadata = mergePluginMetadata(current.pluginMetadata, pluginId, metadata);
+    const nextTab = { ...current, pluginMetadata };
+    const window = this.workspace?.findWindowForTab(tabId) ?? this.workspace?.getActiveWindow();
+    const templateIndicator = await this.runtimeContextResolver?.tabIndicatorFor(nextTab, window);
+    this.updateTab(tabId, {
+      pluginMetadata,
+      ...(templateIndicator ? { indicator: createTabIndicator(templateIndicator) } : {})
+    });
+    await this.applyRuntimeContext(tabId, `Applying ${pluginId} metadata changes.`);
+    return this.getTab(tabId);
+  }
+
+  async refreshRuntimeIndicators(windowId?: string): Promise<void> {
+    if (!this.runtimeContextResolver) {
+      return;
+    }
+    const tabIds = windowId && this.workspace ? this.workspace.tabIdsForWindow(windowId) : this.listTabs().map((tab) => tab.id);
+    for (const tabId of tabIds) {
+      if (!this.tabs.has(tabId)) {
+        continue;
+      }
+      const tab = this.getTab(tabId);
+      const window = this.workspace?.findWindowForTab(tabId) ?? this.workspace?.getActiveWindow();
+      const templateIndicator = await this.runtimeContextResolver.tabIndicatorFor(tab, window);
+      if (templateIndicator) {
+        this.updateTab(tabId, { indicator: createTabIndicator(templateIndicator) });
+      }
+    }
+  }
+
+  private bindSession(tabId: string, session: PluginSession): void {
+    this.sessions.set(tabId, session);
+    const disposers: Array<() => void> = [];
+    const statusDisposer = session.onStatusChange?.((status, statusMessage) => {
+      if (this.tabs.has(tabId)) {
+        this.updateTab(tabId, {
+          status,
+          statusMessage,
+          indicator: indicatorForStatus(status, statusMessage)
+        });
+      }
+    });
+    if (statusDisposer) {
+      disposers.push(statusDisposer);
+    }
+    const dataDisposer = session.onData?.((data) => {
+      const current = this.tabs.get(tabId);
+      if (current) {
+        void this.contextService.record(current, "terminal-output", data);
+      }
+    });
+    if (dataDisposer) {
+      disposers.push(dataDisposer);
+    }
+    this.sessionDisposers.set(tabId, disposers);
+  }
+
+  private disposeSessionListeners(tabId: string): void {
+    for (const dispose of this.sessionDisposers.get(tabId) ?? []) {
+      dispose();
+    }
+    this.sessionDisposers.delete(tabId);
   }
 
   private createControls(tabId: string): PluginTabControls {
     return {
-      setTabIndicator: (indicator) => this.setTabIndicator(tabId, indicator),
+      setTabIndicator: (indicator) => this.updateTabIndicator(tabId, indicator),
       closeTab: () => {
         if (this.tabs.has(tabId)) {
           this.closeTab(tabId, { stopSession: false });
@@ -325,6 +535,13 @@ export class SessionStore {
     for (const listener of this.tabsListeners) {
       listener(update);
     }
+  }
+
+  private resolveRequestWindow(request: CreateTabRequest): WorkspaceWindow | undefined {
+    if (!this.workspace) {
+      return undefined;
+    }
+    return request.windowId ? this.workspace.getWindow(request.windowId) : this.workspace.getActiveWindow();
   }
 
   private async executeWorkspaceControlAction(action: string, input: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -448,6 +665,53 @@ export class SessionStore {
     return new Map(entries);
   }
 
+  private resolvePluginHookTargetTabId(pluginId: string, targetTabId?: string, fallbackTabId?: string): string | undefined {
+    if (targetTabId && this.sessions.has(targetTabId)) {
+      return targetTabId;
+    }
+    if (fallbackTabId) {
+      const fallbackSession = this.sessions.get(fallbackTabId);
+      if (fallbackSession?.tab.pluginId === pluginId) {
+        return fallbackTabId;
+      }
+    }
+    const matchingTabs = this.listTabs().filter((tab) => tab.pluginId === pluginId);
+    if (matchingTabs.length === 1) {
+      return matchingTabs[0]!.id;
+    }
+    if (targetTabId) {
+      throw new Error(`Unknown tab for hook target: ${targetTabId}`);
+    }
+    return undefined;
+  }
+
+  private createAppContext(pluginId: string, tabId: string): CloudxAppContext {
+    return {
+      callHook: async <T extends Record<string, unknown> = Record<string, unknown>>(hookId: HookId, input = {}) => {
+        if (!this.hooks) {
+          throw new Error("Hook registry is not available.");
+        }
+        return this.hooks.call(hookId, input, {
+          caller: { kind: "plugin", pluginId, tabId },
+          activeTabId: this.activeTabId
+        }) as Promise<T>;
+      },
+      callTabHook: async <T extends Record<string, unknown> = Record<string, unknown>>(targetTabId: string, hookId: HookId, input = {}) => {
+        if (!this.hooks) {
+          throw new Error("Hook registry is not available.");
+        }
+        return this.hooks.call(hookId, input, {
+          caller: { kind: "plugin", pluginId, tabId },
+          targetTabId,
+          targetTab: this.tabs.get(targetTabId),
+          activeTabId: this.activeTabId
+        }) as Promise<T>;
+      },
+      getConfig: () => this.configProvider.getPluginConfig(pluginId),
+      getTab: () => this.getTab(tabId)
+    };
+  }
+
   private defaultVoiceCreateTabCwdExpression(): string {
     if (this.activeTabId) {
       const activeTab = this.tabs.get(this.activeTabId);
@@ -561,4 +825,29 @@ function indicatorForStatus(status: WorkspaceTab["status"], message?: string): T
     return createTabIndicator({ color: "yellow", label: "Stopped", message });
   }
   return createTabIndicator({ color: "green", label: "OK", message });
+}
+
+function readPluginMetadata(value: unknown): PluginMetadataMap {
+  if (!isPlainObject(value)) {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(value)
+      .map(([pluginId, metadata]) => [pluginId, isPlainObject(metadata) ? { ...metadata } : undefined] as const)
+      .filter((entry): entry is readonly [string, PluginMetadata] => Boolean(entry[1]))
+  );
+}
+
+function mergePluginMetadata(current: PluginMetadataMap | undefined, pluginId: string, metadata: PluginMetadata | null): PluginMetadataMap {
+  const next: PluginMetadataMap = { ...(current ?? {}) };
+  if (metadata === null) {
+    delete next[pluginId];
+    return next;
+  }
+  next[pluginId] = { ...metadata };
+  return next;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

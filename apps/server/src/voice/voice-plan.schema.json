@@ -16,11 +16,12 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "targetTabId", "pluginId", "action", "input", "reason"],
+        "required": ["id", "targetTabId", "pluginId", "hookId", "action", "input", "reason"],
         "properties": {
           "id": { "type": ["string", "null"] },
           "targetTabId": { "type": ["string", "null"] },
           "pluginId": { "type": ["string", "null"] },
+          "hookId": { "type": ["string", "null"] },
           "action": { "type": "string", "minLength": 1 },
           "input": {
             "type": "object",
@@ -42,7 +43,16 @@
               "paneId",
               "createDirectory",
               "newPane",
-              "splitDirection"
+              "splitDirection",
+              "pluginId",
+              "initialInput",
+              "indicator",
+              "windowId",
+              "context",
+              "defaultCwd",
+              "sectionId",
+              "reason",
+              "stopSession"
             ],
             "properties": {
               "text": { "type": ["string", "null"] },
@@ -61,7 +71,28 @@
               "paneId": { "type": ["string", "null"] },
               "createDirectory": { "type": ["boolean", "null"] },
               "newPane": { "type": ["boolean", "null"] },
-              "splitDirection": { "type": ["string", "null"], "enum": ["row", "column", null] }
+              "splitDirection": { "type": ["string", "null"], "enum": ["row", "column", null] },
+              "pluginId": { "type": ["string", "null"] },
+              "initialInput": {
+                "type": ["object", "null"],
+                "additionalProperties": true
+              },
+              "indicator": {
+                "type": ["object", "null"],
+                "additionalProperties": false,
+                "required": ["color", "label", "message"],
+                "properties": {
+                  "color": { "type": ["string", "null"], "enum": ["green", "yellow", "red", null] },
+                  "label": { "type": ["string", "null"] },
+                  "message": { "type": ["string", "null"] }
+                }
+              },
+              "windowId": { "type": ["string", "null"] },
+              "context": { "type": ["string", "null"] },
+              "defaultCwd": { "type": ["string", "null"] },
+              "sectionId": { "type": ["string", "null"] },
+              "reason": { "type": ["string", "null"] },
+              "stopSession": { "type": ["boolean", "null"] }
             }
           },
           "reason": { "type": ["string", "null"] }

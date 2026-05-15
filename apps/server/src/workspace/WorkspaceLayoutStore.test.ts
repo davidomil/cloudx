@@ -72,6 +72,25 @@ describe("WorkspaceLayoutStore", () => {
     expect(result.matches[0]?.window.id).toBe(api.id);
     expect(result.matches[0]?.score).toBeGreaterThan(0);
   });
+
+  it("persists and clears plugin metadata on windows", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-window-metadata-"));
+    const store = new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root]));
+    const created = await store.createWindow({
+      name: "Templated",
+      defaultCwd: root,
+      pluginMetadata: { "rules-skills": { selectedTemplateId: "focused" } }
+    });
+
+    expect(created.pluginMetadata?.["rules-skills"]).toEqual({ selectedTemplateId: "focused" });
+
+    const cleared = await store.updateWindow(created.id, { pluginMetadata: { "rules-skills": null } });
+    expect(cleared.pluginMetadata?.["rules-skills"]).toBeUndefined();
+
+    const reloaded = new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root]));
+    const state = await reloaded.state([], undefined);
+    expect(state.windows.find((window) => window.id === created.id)?.pluginMetadata?.["rules-skills"]).toBeUndefined();
+  });
 });
 
 function layoutWithTab(tabId: string) {

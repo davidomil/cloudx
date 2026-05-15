@@ -11,6 +11,7 @@ import type {
   CreateTabRequest,
   CreateWorkspaceLayoutTemplateRequest,
   CreateWorkspaceWindowRequest,
+  HookCallRequest,
   SearchWorkspaceWindowsRequest,
   UpdateWorkspaceLayoutTemplateRequest,
   UpdateWorkspaceWindowRequest
@@ -28,8 +29,12 @@ import { LocalWebPlugin } from "./plugins/LocalWebPlugin.js";
 import { StandardTerminalPlugin } from "./plugins/StandardTerminalPlugin.js";
 import { WorktreeManagerPlugin } from "./plugins/WorktreeManagerPlugin.js";
 import { WorkspaceControlPlugin } from "./plugins/WorkspaceControlPlugin.js";
+import { AudioAiPlugin } from "./plugins/AudioAiPlugin.js";
+import { PluginDataStore } from "./plugins/PluginDataStore.js";
+import { RulesSkillsPlugin } from "./plugins/RulesSkillsPlugin.js";
 import { SessionStore } from "./sessionStore.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
+import { RulesSkillsCatalogService } from "./rulesSkills/RulesSkillsCatalogService.js";
 import { NodePtyTerminalProcessFactory } from "./terminal/NodePtyTerminalProcess.js";
 import { VoiceController } from "./voice/VoiceController.js";
 import { CodexExecVoicePlanner } from "./voice/VoicePlanner.js";
@@ -38,6 +43,9 @@ import { TabContextService } from "./context/TabContextService.js";
 import { AppServerClient } from "./appServer/AppServerClient.js";
 import { AppServerContextProvider } from "./appServer/AppServerContextProvider.js";
 import { serializeError, summarizeClientContext, transcriptLogFields, type StructuredVoiceLogger } from "./voice/VoiceDebugLog.js";
+import { HookRegistry } from "./hooks/HookRegistry.js";
+import { registerCoreHooks } from "./hooks/coreHooks.js";
+import { registerPluginActionHooks } from "./hooks/pluginActionHooks.js";
 
 export interface AppServices {
   plugins: PluginRegistry;
@@ -47,6 +55,9 @@ export interface AppServices {
   asr: AsrClient;
   config?: ConfigService;
   workspace?: WorkspaceLayoutStore;
+  hooks?: HookRegistry;
+  pluginData?: PluginDataStore;
+  rulesSkills?: RulesSkillsCatalogService;
 }
 
 const MIN_STREAMED_AUDIO_BYTES = 128;
@@ -65,6 +76,10 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   services ??= buildServices(config, app.log);
   services.config ??= new ConfigService(config.dataDir, () => services!.plugins.list());
   services.workspace ??= new WorkspaceLayoutStore(config.dataDir, services.pathPolicy);
+  services.pluginData ??= new PluginDataStore(config.dataDir);
+  services.rulesSkills ??= new RulesSkillsCatalogService(config.dataDir);
+  services.hooks ??= buildHookRegistry(services);
+  services.sessions.setHookRegistry?.(services.hooks);
   const localWebProxy = new LocalWebProxy(services.sessions);
   await app.register(websocket);
 
@@ -80,6 +95,8 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   }));
 
   app.get("/api/plugins", async () => ({ plugins: services.plugins.list() }));
+
+  app.get("/api/hooks", async () => ({ hooks: services.hooks!.list() }));
 
   app.get("/api/config", async () => services.config!.getResponse());
 
@@ -101,6 +118,14 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
 
   app.patch<{ Params: { windowId: string }; Body: UpdateWorkspaceWindowRequest }>("/api/windows/:windowId", async (request) => {
     await services.workspace!.updateWindow(request.params.windowId, request.body);
+    if (request.body.pluginMetadata !== undefined) {
+      await services.sessions.refreshRuntimeIndicators(request.params.windowId);
+      const windowTabIds = new Set(services.workspace!.tabIdsForWindow(request.params.windowId));
+      await services.sessions.applyRuntimeContexts(
+        (tab) => tab.pluginId === "codex-terminal" && windowTabIds.has(tab.id),
+        "Applying window rules/skills template changes."
+      );
+    }
     return await services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId());
   });
 
@@ -184,6 +209,17 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
 
   app.post<{ Params: { tabId: string }; Body: { action: string; input: Record<string, unknown> } }>("/api/tabs/:tabId/actions", async (request) => {
     const result = await services.sessions.executePluginAction(request.params.tabId, request.body.action, request.body.input);
+    return { result };
+  });
+
+  app.post<{ Params: { hookId: string }; Body: HookCallRequest }>("/api/hooks/:hookId", async (request) => {
+    const targetTab = request.body.targetTabId ? services.sessions.getTab(request.body.targetTabId) : undefined;
+    const result = await services.hooks!.call(request.params.hookId, request.body.input ?? {}, {
+      caller: { kind: "http" },
+      targetTab,
+      targetTabId: request.body.targetTabId,
+      activeTabId: services.sessions.getActiveTabId()
+    });
     return { result };
   });
 
@@ -539,23 +575,61 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   const pathPolicy = new PathPolicy(config.allowedRoots);
   const workspace = new WorkspaceLayoutStore(config.dataDir, pathPolicy);
   const terminalFactory = new NodePtyTerminalProcessFactory();
-  plugins.register(new CodexTerminalPlugin(terminalFactory, config.terminalReplayBytes));
+  const pluginData = new PluginDataStore(config.dataDir);
+  const rulesSkills = new RulesSkillsCatalogService(config.dataDir);
+  plugins.register(new CodexTerminalPlugin(terminalFactory, config.terminalReplayBytes, config.dataDir));
   plugins.register(new StandardTerminalPlugin(terminalFactory, config.terminalReplayBytes));
   plugins.register(new FileBrowserPlugin(pathPolicy));
   plugins.register(new LocalWebPlugin());
   plugins.register(new WorktreeManagerPlugin());
   plugins.register(new WorkspaceControlPlugin());
+  plugins.register(new RulesSkillsPlugin(rulesSkills));
   const configService = new ConfigService(config.dataDir, () => plugins.list());
-  const sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir), configService, workspace);
+  const sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir), configService, workspace, rulesSkills);
+  rulesSkills.onChange(() => {
+    void (async () => {
+      await sessions.refreshRuntimeIndicators();
+      await sessions.applyRuntimeContexts((tab) => tab.pluginId === "codex-terminal", "Applying rules/skills template changes.");
+    })();
+  });
   const asr = new AsrClient(config.asrUrl);
-  const voice = new VoiceController(
+  let voice: VoiceController | undefined;
+  plugins.register(new AudioAiPlugin(() => {
+    if (!voice) {
+      throw new Error("Voice controller is not available.");
+    }
+    return voice;
+  }));
+  voice = new VoiceController(
     sessions,
     new CodexExecVoicePlanner(config.voiceModel, logger, { includeText: config.voiceDebugTranscripts ?? false }),
     new AppServerContextProvider(sessions, config.appServerEnabled ? () => new AppServerClient() : undefined),
     logger,
     { includeText: config.voiceDebugTranscripts ?? false }
   );
-  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace };
+  const hooks = buildHookRegistry({ plugins, sessions, pathPolicy, voice, asr, config: configService, workspace });
+  sessions.setHookRegistry(hooks);
+  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, pluginData, rulesSkills };
+}
+
+function buildHookRegistry(services: AppServices): HookRegistry {
+  const hooks = new HookRegistry();
+  registerCoreHooks(hooks, {
+    sessions: services.sessions,
+    plugins: services.plugins,
+    pathPolicy: services.pathPolicy,
+    workspace: services.workspace!
+  });
+  const pluginValues = typeof services.plugins.values === "function" ? services.plugins.values() : [];
+  for (const plugin of pluginValues) {
+    for (const hook of plugin.hooks ?? []) {
+      hooks.register(hook);
+    }
+  }
+  if (typeof services.plugins.values === "function") {
+    registerPluginActionHooks(hooks, services.plugins, services.sessions);
+  }
+  return hooks;
 }
 
 function templateInitialInput(state: Record<string, unknown> | undefined): Record<string, unknown> | undefined {

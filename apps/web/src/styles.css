@@ -507,7 +507,8 @@ a:hover svg {
 }
 
 .window-search-row input,
-.menu-form-panel input {
+.menu-form-panel input,
+.menu-form-panel select {
   width: 100%;
   min-width: 0;
   height: 36px;
@@ -626,6 +627,23 @@ a:hover svg {
 
 .window-menu-error {
   color: var(--color-destructive);
+}
+
+.template-select-row {
+  display: grid;
+  gap: 5px;
+  color: var(--color-muted-foreground);
+  font-family: var(--font-label);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.template-select-row select {
+  min-width: 0;
+  color: var(--color-accent);
+  background: var(--color-input);
+  border: 1px solid var(--color-border);
+  clip-path: var(--chamfer-sm);
 }
 
 .spinning {
@@ -973,6 +991,26 @@ a:hover svg {
   cursor: grab;
 }
 
+.tab-activation,
+.tab-close {
+  appearance: none;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  font: inherit;
+}
+
+.tab-activation {
+  min-width: 0;
+  height: 100%;
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
+  cursor: pointer;
+}
+
 .tab-button:hover {
   color: var(--color-accent-tertiary);
   border-color: rgb(0 212 255 / 0.48);
@@ -1026,11 +1064,26 @@ a:hover svg {
 
 .tab-close {
   flex: none;
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  cursor: pointer;
   opacity: 0.72;
 }
 
-.tab-close:hover {
+.tab-close:hover,
+.tab-close:focus-visible {
+  outline: none;
   opacity: 1;
+}
+
+.tab-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 5px;
 }
 
 .pane-body {
@@ -1041,7 +1094,8 @@ a:hover svg {
 .terminal-panel,
 .file-browser-panel,
 .worktree-manager-panel,
-.web-viewer-panel {
+.web-viewer-panel,
+.plugin-webview-panel {
   background:
     linear-gradient(180deg, rgb(0 255 136 / 0.035), transparent 38%),
     var(--color-background);
@@ -1220,6 +1274,15 @@ a:hover svg {
   overflow: hidden;
 }
 
+.plugin-webview-panel {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  overflow: hidden;
+}
+
 .file-browser-toolbar,
 .worktree-toolbar,
 .web-viewer-toolbar {
@@ -1237,12 +1300,163 @@ a:hover svg {
   grid-template-columns: minmax(0, 1fr) auto auto auto auto;
 }
 
+.rules-skills-panel {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(160px, 220px) minmax(0, 1fr);
+  gap: 10px;
+  padding: 10px;
+  overflow: hidden;
+  background: rgb(8 8 14 / 0.9);
+}
+
+.rules-skills-sidebar,
+.rules-skills-editor {
+  min-height: 0;
+  overflow: auto;
+}
+
+.rules-skills-sidebar {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+}
+
+.rules-skills-sidebar button {
+  min-width: 0;
+  min-height: 38px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 0 9px;
+  color: var(--color-accent-tertiary);
+  background: transparent;
+  border: 1px solid var(--color-border);
+  clip-path: var(--chamfer-sm);
+  cursor: pointer;
+}
+
+.rules-skills-sidebar button.selected,
+.rules-skills-sidebar button:hover {
+  color: var(--color-background);
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+}
+
+.rules-skills-sidebar button span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.template-color {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+}
+
+.template-color.green {
+  background: var(--color-accent);
+}
+
+.template-color.yellow {
+  background: var(--color-warning);
+}
+
+.template-color.red {
+  background: var(--color-destructive);
+}
+
+.rules-skills-editor {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+}
+
+.rules-skills-editor label {
+  display: grid;
+  gap: 5px;
+  color: var(--color-muted-foreground);
+  font-family: var(--font-label);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.rules-skills-panel textarea {
+  width: 100%;
+  min-width: 0;
+  resize: vertical;
+  padding: 10px 11px;
+  font: inherit;
+}
+
+.rules-skills-picker {
+  display: grid;
+  gap: 8px;
+}
+
+.rules-skills-picker h3 {
+  margin: 6px 0 0;
+  color: var(--color-accent-tertiary);
+  font-family: var(--font-label);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.rules-skills-inline-create {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.rules-skills-panel .rule-option,
+.rules-skills-panel .skill-option {
+  min-height: 36px;
+  align-items: start;
+  padding: 7px;
+  color: var(--color-accent-tertiary);
+  background: rgb(255 255 255 / 0.025);
+  border: 1px solid var(--color-border);
+  clip-path: var(--chamfer-sm);
+  font-family: inherit;
+  font-size: 12px;
+  text-transform: none;
+}
+
+.rules-skills-panel .rule-option {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+}
+
+.rules-skills-panel .skill-option {
+  grid-template-columns: auto minmax(0, 1fr);
+}
+
+.rules-skills-panel .skill-option small {
+  grid-column: 2;
+  color: var(--color-muted-foreground);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.rules-skills-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
 .web-viewer-toolbar input,
 .file-search-bar input,
 .worktree-manager-panel input,
 .worktree-manager-panel select,
 .dialog input,
 .dialog select,
+.rules-skills-panel input,
+.rules-skills-panel select,
+.rules-skills-panel textarea,
 .voice-console textarea {
   color: var(--color-accent);
   background: var(--color-input);
@@ -1255,7 +1469,9 @@ a:hover svg {
 .worktree-manager-panel input,
 .worktree-manager-panel select,
 .dialog input,
-.dialog select {
+.dialog select,
+.rules-skills-panel input,
+.rules-skills-panel select {
   width: 100%;
   min-width: 0;
   height: 40px;
@@ -1266,6 +1482,8 @@ a:hover svg {
 .file-search-bar input::placeholder,
 .worktree-manager-panel input::placeholder,
 .dialog input::placeholder,
+.rules-skills-panel input::placeholder,
+.rules-skills-panel textarea::placeholder,
 .voice-console textarea::placeholder {
   color: var(--color-muted-foreground);
 }
@@ -1276,6 +1494,9 @@ a:hover svg {
 .worktree-manager-panel select:focus,
 .dialog input:focus,
 .dialog select:focus,
+.rules-skills-panel input:focus,
+.rules-skills-panel select:focus,
+.rules-skills-panel textarea:focus,
 .voice-console textarea:focus {
   border-color: var(--color-accent);
 }
@@ -1545,6 +1766,16 @@ a:hover svg {
 }
 
 .web-viewer-frame {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: block;
+  border: 0;
+  background: var(--color-background);
+}
+
+.plugin-webview-frame {
   width: 100%;
   height: 100%;
   min-width: 0;
@@ -2350,6 +2581,36 @@ a:hover svg {
 .settings-dialog {
   max-height: min(760px, calc(100dvh - 32px));
   overflow: auto;
+}
+
+.tab-settings-dialog {
+  width: min(520px, calc(100vw - 24px));
+  max-height: min(620px, calc(100dvh - 32px));
+  overflow: auto;
+}
+
+.tab-settings-dialog > p {
+  margin: -4px 0 8px;
+  color: var(--color-muted-foreground);
+  font-family: var(--font-label);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.tab-settings-contribution,
+.tab-settings-section {
+  display: grid;
+  gap: 10px;
+}
+
+.tab-settings-section h3 {
+  margin: 0;
+  color: var(--color-accent-tertiary);
+  font-family: var(--font-label);
+  font-size: 13px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
 }
 
 .settings-section,

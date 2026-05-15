@@ -1,20 +1,43 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
-import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, ConfigValue } from "@cloudx/shared";
+import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, ConfigValue, RulesSkillsStore } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
+import { TemplateSelect } from "./RulesSkillsPanel.js";
 
-export function SettingsDialog({ config, onCancel, onSave }: { config: CloudxConfigResponse; onCancel: () => void; onSave: (values: CloudxConfigValues) => Promise<void> }) {
+export function SettingsDialog({
+  config,
+  rulesSkillsStore,
+  onCancel,
+  onSave,
+  onSaveDefaultTemplate,
+  children
+}: {
+  config: CloudxConfigResponse;
+  rulesSkillsStore?: RulesSkillsStore;
+  onCancel: () => void;
+  onSave: (values: CloudxConfigValues) => Promise<void>;
+  onSaveDefaultTemplate?: (templateId: string | undefined) => Promise<void>;
+  children?: ReactNode;
+}) {
   const [values, setValues] = useState<CloudxConfigValues>(() => structuredClone(config.values));
+  const [defaultTemplateId, setDefaultTemplateId] = useState(rulesSkillsStore?.defaultTemplateId ?? "");
   const [busy, setBusy] = useState(false);
   const dialogRef = useRef<HTMLDivElement | null>(null);
 
   useOutsidePointerDismiss(true, dialogRef, onCancel);
 
+  useEffect(() => {
+    setDefaultTemplateId(rulesSkillsStore?.defaultTemplateId ?? "");
+  }, [rulesSkillsStore?.defaultTemplateId]);
+
   async function save() {
     setBusy(true);
     try {
+      if (rulesSkillsStore && onSaveDefaultTemplate && defaultTemplateId !== (rulesSkillsStore.defaultTemplateId ?? "")) {
+        await onSaveDefaultTemplate(defaultTemplateId || undefined);
+      }
       await onSave(values);
     } finally {
       setBusy(false);
@@ -47,7 +70,17 @@ export function SettingsDialog({ config, onCancel, onSave }: { config: CloudxCon
           {config.globalFields.map((field) => (
             <ConfigField key={field.key} field={field} value={values.global[field.key] ?? field.defaultValue} onChange={(value) => setGlobalValue(field.key, value)} />
           ))}
+          {rulesSkillsStore ? (
+            <TemplateSelect
+              value={defaultTemplateId}
+              templates={rulesSkillsStore.templates}
+              defaultTemplateId={defaultTemplateId}
+              onChange={setDefaultTemplateId}
+              label="Default template"
+            />
+          ) : null}
         </section>
+        {children}
         <section className="settings-section">
           <h3>Plugins</h3>
           {config.plugins.length ? (
