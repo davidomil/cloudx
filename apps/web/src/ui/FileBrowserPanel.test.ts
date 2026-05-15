@@ -1,8 +1,15 @@
-import { describe, expect, it } from "vitest";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { afterEach, describe, expect, it } from "vitest";
 
-import type { GitRepositoryState } from "@cloudx/shared";
+import type { GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
 
-import { buildSearchInput, clampFileBrowserTreeSize, defaultDiffViewMode, fileBrowserBodyClassName, fileBrowserBodyStyle, filePreviewText, gitAutoRefreshIntervalMilliseconds, gitDiffWorkspaceClassName, mergeGitChangesIntoEntries, parsePatch, resolveNextCompareRef, searchEntriesFromResult, searchResultSummary, type OpenFileResult } from "./FileBrowserPanel.js";
+import { buildSearchInput, clampFileBrowserTreeSize, defaultDiffViewMode, disposeFileBrowserPanelStatesExcept, FileBrowserPanel, fileBrowserBodyClassName, fileBrowserBodyStyle, filePreviewText, gitAutoRefreshIntervalMilliseconds, gitDiffWorkspaceClassName, mergeGitChangesIntoEntries, parsePatch, readFileBrowserPanelState, rememberFileBrowserPanelState, resolveNextCompareRef, searchEntriesFromResult, searchResultSummary, type FileBrowserPanelState, type OpenFileResult } from "./FileBrowserPanel.js";
+import { PathEntry } from "./PathEntry.js";
+
+afterEach(() => {
+  disposeFileBrowserPanelStatesExcept(new Set());
+});
 
 describe("filePreviewText", () => {
   it("uses relative paths when the server returns them", () => {
@@ -52,6 +59,55 @@ describe("buildSearchInput", () => {
 
   it("returns undefined for empty search text", () => {
     expect(buildSearchInput("   ", "filename", "")).toBeUndefined();
+  });
+});
+
+describe("file browser panel state cache", () => {
+  it("restores cached directory and open-file state for the same tab cwd", () => {
+    const tab = workspaceTab("tab-files", "/repo");
+    rememberFileBrowserPanelState(tab, fileBrowserState({
+      relativePath: "src",
+      entries: [{ name: "App.tsx", type: "file" }],
+      opened: { path: "/repo/src/App.tsx", relativePath: "src/App.tsx", truncated: false, content: "export const app = true;\n" },
+      searchVisible: true
+    }));
+
+    const html = renderToStaticMarkup(createElement(FileBrowserPanel, { tab, config: { showGitDiff: false } }));
+    const normalizedHtml = html.toLowerCase();
+
+    expect(html).toContain(">src<");
+    expect(html).toContain("App.tsx");
+    expect(html).toContain("src/App.tsx");
+    expect(html).toContain("export const app = true;");
+    expect(normalizedHtml).toContain('autocomplete="off"');
+    expect(normalizedHtml).toContain('autocorrect="off"');
+    expect(normalizedHtml).toContain('autocapitalize="none"');
+    expect(normalizedHtml).toContain('spellcheck="false"');
+  });
+
+  it("ignores cached state after cwd changes and disposes closed tabs", () => {
+    const tab = workspaceTab("tab-files", "/repo");
+    rememberFileBrowserPanelState(tab, fileBrowserState());
+
+    expect(readFileBrowserPanelState(tab)?.relativePath).toBe("src");
+    expect(readFileBrowserPanelState({ ...tab, cwd: "/other" })).toBeUndefined();
+
+    disposeFileBrowserPanelStatesExcept(new Set(["tab-other"]));
+
+    expect(readFileBrowserPanelState(tab)).toBeUndefined();
+  });
+});
+
+describe("path entry text assistance attributes", () => {
+  it("disables browser and OS corrections while keeping the custom suggestions list", () => {
+    const html = renderToStaticMarkup(createElement(PathEntry, { inputId: "directory", value: "/home/david", onChange: () => undefined }));
+    const normalizedHtml = html.toLowerCase();
+
+    expect(normalizedHtml).toContain('autocomplete="off"');
+    expect(normalizedHtml).toContain('autocorrect="off"');
+    expect(normalizedHtml).toContain('autocapitalize="none"');
+    expect(normalizedHtml).toContain('spellcheck="false"');
+    expect(html).toContain('aria-autocomplete="list"');
   });
 });
 
@@ -215,3 +271,41 @@ describe("mergeGitChangesIntoEntries", () => {
     expect(merged.some((entry) => entry.name === "elsewhere.ts")).toBe(false);
   });
 });
+
+function workspaceTab(id: string, cwd: string): WorkspaceTab {
+  return {
+    id,
+    pluginId: "file-browser",
+    title: "Files",
+    cwd,
+    status: "running",
+    indicator: {
+      color: "green",
+      label: "OK",
+      updatedAt: new Date(0).toISOString()
+    },
+    createdAt: new Date(0).toISOString(),
+    updatedAt: new Date(0).toISOString()
+  };
+}
+
+function fileBrowserState(overrides: Partial<FileBrowserPanelState> = {}): FileBrowserPanelState {
+  return {
+    relativePath: "src",
+    entries: [],
+    compareRef: "",
+    diffViewMode: "unified",
+    cloneUrl: "",
+    originUrl: "",
+    searchQuery: "",
+    searchMode: "all",
+    searchGlob: "",
+    searchExpanded: false,
+    treeVisible: true,
+    searchVisible: false,
+    gitBarVisible: true,
+    gitDiffFilesVisible: true,
+    fileTreeSize: 280,
+    ...overrides
+  };
+}

@@ -237,6 +237,9 @@ export class GitService {
   private async untrackedPatch(rootPath: string, summary: GitDiffFileSummary): Promise<GitDiffFile> {
     const absolutePath = path.join(rootPath, summary.path);
     const stat = await fs.stat(absolutePath);
+    if (!stat.isFile()) {
+      return { ...summary, message: "Only regular files can be rendered as a text diff." };
+    }
     if (stat.size > MAX_PATCH_BYTES) {
       return { ...summary, tooLarge: true, message: `Diff is too large to preview (${stat.size} bytes).` };
     }
@@ -344,6 +347,9 @@ function ensurePathUnderCwd(rootPath: string, cwd: string, repositoryRelativePat
 
 async function countFileLines(filePath: string): Promise<number | undefined> {
   const stat = await fs.stat(filePath);
+  if (!stat.isFile()) {
+    return undefined;
+  }
   if (stat.size > MAX_PATCH_BYTES) {
     return undefined;
   }

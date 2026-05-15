@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Palette, Plus, Save, Trash2 } from "lucide-react";
+import { Palette, Plus, RefreshCw, Save, Trash2 } from "lucide-react";
 
 import {
   RULES_SKILLS_PLUGIN_ID,
@@ -52,7 +52,8 @@ export function RulesSkillsPanel({
   onDeleteTemplate,
   onSetDefault,
   onSaveRule,
-  onDeleteRule
+  onDeleteRule,
+  onRefreshStore
 }: {
   store?: RulesSkillsStore;
   onSaveTemplate: (template: PersonalityTemplate) => Promise<void>;
@@ -60,6 +61,7 @@ export function RulesSkillsPanel({
   onSetDefault: (templateId: string | undefined) => Promise<void>;
   onSaveRule: (rule: CloudxRule) => Promise<void>;
   onDeleteRule: (ruleId: string) => Promise<void>;
+  onRefreshStore?: () => Promise<void>;
 }) {
   const templates = store?.templates ?? [];
   const [selectedId, setSelectedId] = useState(templates[0]?.id ?? "");
@@ -69,6 +71,21 @@ export function RulesSkillsPanel({
   const [newRuleText, setNewRuleText] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | undefined>();
+
+  useEffect(() => {
+    if (!onRefreshStore) {
+      return;
+    }
+    let active = true;
+    onRefreshStore().catch((err) => {
+      if (active) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [onRefreshStore]);
 
   useEffect(() => {
     if (draftMode === "new") {
@@ -84,11 +101,11 @@ export function RulesSkillsPanel({
   }
 
   function toggleRule(ruleId: string, enabled: boolean) {
-    updateDraft({ ruleIds: enabled ? [...draft.ruleIds, ruleId] : draft.ruleIds.filter((id) => id !== ruleId) });
+    updateDraft({ ruleIds: enabled ? [...new Set([...draft.ruleIds, ruleId])] : draft.ruleIds.filter((id) => id !== ruleId) });
   }
 
   function toggleSkill(skillId: string, enabled: boolean) {
-    updateDraft({ skillIds: enabled ? [...draft.skillIds, skillId] : draft.skillIds.filter((id) => id !== skillId) });
+    updateDraft({ skillIds: enabled ? [...new Set([...draft.skillIds, skillId])] : draft.skillIds.filter((id) => id !== skillId) });
   }
 
   function createTemplate() {
@@ -141,15 +158,34 @@ export function RulesSkillsPanel({
   }
 
   async function addRule() {
-    const text = newRuleText.trim();
-    if (!text) {
+    const rule = cloudxRuleFromText(newRuleText);
+    if (!rule) {
+      return;
+    }
+    const nextDraft = draftWithRuleEnabled(draft, rule.id);
+    setBusy(true);
+    setError(undefined);
+    try {
+      await onSaveRule(rule);
+      await onSaveTemplate(templateFromDraft(nextDraft));
+      setDraft(nextDraft);
+      setDraftMode("existing");
+      setNewRuleText("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refreshStore() {
+    if (!onRefreshStore) {
       return;
     }
     setBusy(true);
     setError(undefined);
     try {
-      await onSaveRule({ id: slugFromText(text), description: text, text });
-      setNewRuleText("");
+      await onRefreshStore();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -232,6 +268,9 @@ export function RulesSkillsPanel({
         </section>
 
         <div className="rules-skills-actions">
+          <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void refreshStore()} disabled={busy || !onRefreshStore} title="Refresh rules and skills" aria-label="Refresh rules and skills">
+            <RefreshCw size={15} />
+          </ControlButton>
           <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void submit()} disabled={busy || !draft.id.trim() || !draft.name.trim()} title="Save template" aria-label="Save template">
             <Save size={15} />
           </ControlButton>
@@ -257,7 +296,7 @@ export function selectedTemplateId(source: WorkspaceWindow | WorkspaceTab | unde
   return isRecord(metadata) && typeof metadata.selectedTemplateId === "string" ? metadata.selectedTemplateId : "";
 }
 
-interface TemplateDraft {
+export interface TemplateDraft {
   id: string;
   name: string;
   color: PersonalityTemplate["color"];
@@ -265,7 +304,7 @@ interface TemplateDraft {
   skillIds: string[];
 }
 
-function templateDraft(template: PersonalityTemplate | undefined): TemplateDraft {
+export function templateDraft(template: PersonalityTemplate | undefined): TemplateDraft {
   return {
     id: template?.id ?? "",
     name: template?.name ?? "",
@@ -275,7 +314,7 @@ function templateDraft(template: PersonalityTemplate | undefined): TemplateDraft
   };
 }
 
-function templateFromDraft(draft: TemplateDraft): PersonalityTemplate {
+export function templateFromDraft(draft: TemplateDraft): PersonalityTemplate {
   return {
     id: draft.id.trim(),
     name: draft.name.trim(),
@@ -283,6 +322,15 @@ function templateFromDraft(draft: TemplateDraft): PersonalityTemplate {
     ruleIds: [...new Set(draft.ruleIds)],
     skillIds: [...new Set(draft.skillIds)]
   };
+}
+
+export function draftWithRuleEnabled(draft: TemplateDraft, ruleId: string): TemplateDraft {
+  return { ...draft, ruleIds: [...new Set([...draft.ruleIds, ruleId])] };
+}
+
+export function cloudxRuleFromText(value: string): CloudxRule | undefined {
+  const text = value.trim();
+  return text ? { id: slugFromText(text), description: text, text } : undefined;
 }
 
 function slugFromText(text: string): string {

@@ -82,6 +82,32 @@ describe("GitService", () => {
     });
   });
 
+  it("reports untracked repository directories without reading them as files", async () => {
+    const service = new GitService();
+    const root = await createCommittedRepo("cloudx-git-untracked-dir-");
+    const nestedRepo = path.join(root, "vendor", "nested");
+    await fs.mkdir(nestedRepo, { recursive: true });
+    await git(nestedRepo, "init");
+    await fs.writeFile(path.join(nestedRepo, "README.md"), "nested\n");
+
+    const diff = await service.listDiff(root);
+
+    expect(diff.files).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: "vendor/nested/",
+          status: "untracked",
+          additions: undefined
+        })
+      ])
+    );
+    await expect(service.openDiffFile(root, "vendor/nested/")).resolves.toMatchObject({
+      path: "vendor/nested/",
+      status: "untracked",
+      message: "Only regular files can be rendered as a text diff."
+    });
+  });
+
   it("rejects opening repository changes outside the tab working directory", async () => {
     const service = new GitService();
     const root = await createCommittedRepo("cloudx-git-subdir-");

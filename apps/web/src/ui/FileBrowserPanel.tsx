@@ -7,8 +7,9 @@ import type { ConfigValue, FileSearchFileResult, FileSearchMode, FileSearchResul
 
 import { runTabAction } from "../api.js";
 import { ControlButton, SegmentedControl } from "./Control.js";
+import { noSystemTextAssistProps } from "./inputAssist.js";
 
-interface DirectoryEntry {
+export interface DirectoryEntry {
   name: string;
   type: "directory" | "file";
 }
@@ -34,11 +35,61 @@ export interface OpenFileResult {
 
 type GitBusyAction = "state" | "diff" | "file" | "initialize" | "clone" | "origin";
 type SearchBusyAction = "search";
-type DiffViewMode = Extract<ViewType, "split" | "unified">;
+export type DiffViewMode = Extract<ViewType, "split" | "unified">;
 const DEFAULT_GIT_AUTO_REFRESH_SECONDS = 15;
 const DEFAULT_FILE_TREE_SIZE = 280;
 const MIN_FILE_TREE_SIZE = 160;
 const FILE_TREE_RESIZE_STEP = 24;
+
+export interface FileBrowserPanelState {
+  relativePath: string;
+  entries: DirectoryEntry[];
+  opened?: OpenFileResult;
+  gitState?: GitRepositoryState;
+  compareRef: string;
+  diffSummary?: GitDiffSummary;
+  openedDiff?: GitDiffFile;
+  diffViewMode: DiffViewMode;
+  cloneUrl: string;
+  originUrl: string;
+  searchQuery: string;
+  searchMode: FileSearchMode;
+  searchGlob: string;
+  searchResult?: FileSearchResult;
+  searchExpanded: boolean;
+  treeVisible: boolean;
+  searchVisible: boolean;
+  gitBarVisible: boolean;
+  gitDiffFilesVisible: boolean;
+  fileTreeSize: number;
+}
+
+interface CachedFileBrowserPanelState extends FileBrowserPanelState {
+  cwd: string;
+}
+
+const fileBrowserPanelStates = new Map<string, CachedFileBrowserPanelState>();
+
+export function readFileBrowserPanelState(tab: WorkspaceTab): FileBrowserPanelState | undefined {
+  const cached = fileBrowserPanelStates.get(tab.id);
+  if (!cached || cached.cwd !== tab.cwd) {
+    return undefined;
+  }
+  const { cwd: _cwd, ...state } = cached;
+  return state;
+}
+
+export function rememberFileBrowserPanelState(tab: WorkspaceTab, state: FileBrowserPanelState): void {
+  fileBrowserPanelStates.set(tab.id, { cwd: tab.cwd, ...state });
+}
+
+export function disposeFileBrowserPanelStatesExcept(activeTabIds: Set<string>): void {
+  for (const tabId of fileBrowserPanelStates.keys()) {
+    if (!activeTabIds.has(tabId)) {
+      fileBrowserPanelStates.delete(tabId);
+    }
+  }
+}
 
 interface GitTreeChange {
   status: GitDiffFileSummary["status"];
@@ -48,28 +99,29 @@ interface GitTreeChange {
 }
 
 export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; config?: Record<string, ConfigValue> }) {
-  const [relativePath, setRelativePath] = useState("");
-  const [entries, setEntries] = useState<DirectoryEntry[]>([]);
-  const [opened, setOpened] = useState<OpenFileResult | undefined>();
-  const [gitState, setGitState] = useState<GitRepositoryState | undefined>();
-  const [compareRef, setCompareRef] = useState("");
-  const [diffSummary, setDiffSummary] = useState<GitDiffSummary | undefined>();
-  const [openedDiff, setOpenedDiff] = useState<GitDiffFile | undefined>();
-  const [diffViewMode, setDiffViewMode] = useState<DiffViewMode>(() => defaultDiffViewMode());
-  const [cloneUrl, setCloneUrl] = useState("");
-  const [originUrl, setOriginUrl] = useState("");
+  const [initialState] = useState(() => readFileBrowserPanelState(tab));
+  const [relativePath, setRelativePath] = useState(() => initialState?.relativePath ?? "");
+  const [entries, setEntries] = useState<DirectoryEntry[]>(() => initialState?.entries ?? []);
+  const [opened, setOpened] = useState<OpenFileResult | undefined>(() => initialState?.opened);
+  const [gitState, setGitState] = useState<GitRepositoryState | undefined>(() => initialState?.gitState);
+  const [compareRef, setCompareRef] = useState(() => initialState?.compareRef ?? "");
+  const [diffSummary, setDiffSummary] = useState<GitDiffSummary | undefined>(() => initialState?.diffSummary);
+  const [openedDiff, setOpenedDiff] = useState<GitDiffFile | undefined>(() => initialState?.openedDiff);
+  const [diffViewMode, setDiffViewMode] = useState<DiffViewMode>(() => initialState?.diffViewMode ?? defaultDiffViewMode());
+  const [cloneUrl, setCloneUrl] = useState(() => initialState?.cloneUrl ?? "");
+  const [originUrl, setOriginUrl] = useState(() => initialState?.originUrl ?? "");
   const [busyAction, setBusyAction] = useState<GitBusyAction | undefined>();
   const [searchBusyAction, setSearchBusyAction] = useState<SearchBusyAction | undefined>();
-  const [searchQuery, setSearchQuery] = useState("");
-  const [searchMode, setSearchMode] = useState<FileSearchMode>("all");
-  const [searchGlob, setSearchGlob] = useState("");
-  const [searchResult, setSearchResult] = useState<FileSearchResult | undefined>();
-  const [searchExpanded, setSearchExpanded] = useState(false);
-  const [treeVisible, setTreeVisible] = useState(true);
-  const [searchVisible, setSearchVisible] = useState(false);
-  const [gitBarVisible, setGitBarVisible] = useState(true);
-  const [gitDiffFilesVisible, setGitDiffFilesVisible] = useState(true);
-  const [fileTreeSize, setFileTreeSize] = useState(DEFAULT_FILE_TREE_SIZE);
+  const [searchQuery, setSearchQuery] = useState(() => initialState?.searchQuery ?? "");
+  const [searchMode, setSearchMode] = useState<FileSearchMode>(() => initialState?.searchMode ?? "all");
+  const [searchGlob, setSearchGlob] = useState(() => initialState?.searchGlob ?? "");
+  const [searchResult, setSearchResult] = useState<FileSearchResult | undefined>(() => initialState?.searchResult);
+  const [searchExpanded, setSearchExpanded] = useState(() => initialState?.searchExpanded ?? false);
+  const [treeVisible, setTreeVisible] = useState(() => initialState?.treeVisible ?? true);
+  const [searchVisible, setSearchVisible] = useState(() => initialState?.searchVisible ?? false);
+  const [gitBarVisible, setGitBarVisible] = useState(() => initialState?.gitBarVisible ?? true);
+  const [gitDiffFilesVisible, setGitDiffFilesVisible] = useState(() => initialState?.gitDiffFilesVisible ?? true);
+  const [fileTreeSize, setFileTreeSize] = useState(() => initialState?.fileTreeSize ?? DEFAULT_FILE_TREE_SIZE);
   const [fileTreeResizing, setFileTreeResizing] = useState(false);
   const [error, setError] = useState<string | undefined>();
   const bodyRef = useRef<HTMLDivElement | null>(null);
@@ -84,16 +136,41 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   );
 
   useEffect(() => {
-    void loadDirectory("");
+    void loadDirectory(relativePath, { preserveOpened: Boolean(initialState) });
     if (showGitDiff) {
-      void loadGitState();
+      void loadGitState({ preserveCompareRef: Boolean(initialState), silent: Boolean(initialState) });
     } else {
       setGitState(undefined);
       setDiffSummary(undefined);
       setOpenedDiff(undefined);
       setCompareRef("");
     }
-  }, [tab.id, showGitDiff]);
+  }, [tab.id, tab.cwd, showGitDiff]);
+
+  useEffect(() => {
+    rememberFileBrowserPanelState(tab, {
+      relativePath,
+      entries,
+      opened,
+      gitState,
+      compareRef,
+      diffSummary,
+      openedDiff,
+      diffViewMode,
+      cloneUrl,
+      originUrl,
+      searchQuery,
+      searchMode,
+      searchGlob,
+      searchResult,
+      searchExpanded,
+      treeVisible,
+      searchVisible,
+      gitBarVisible,
+      gitDiffFilesVisible,
+      fileTreeSize
+    });
+  }, [tab.id, tab.cwd, relativePath, entries, opened, gitState, compareRef, diffSummary, openedDiff, diffViewMode, cloneUrl, originUrl, searchQuery, searchMode, searchGlob, searchResult, searchExpanded, treeVisible, searchVisible, gitBarVisible, gitDiffFilesVisible, fileTreeSize]);
 
   useEffect(() => {
     if (!showGitDiff || !gitAutoRefresh || gitAutoRefreshIntervalMs === undefined) {
@@ -149,13 +226,15 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     };
   }, [tab.id, searchQuery, searchMode, searchGlob]);
 
-  async function loadDirectory(path: string) {
+  async function loadDirectory(path: string, options: { preserveOpened?: boolean } = {}) {
     setError(undefined);
     try {
       const result = await runTabAction<DirectoryResult>(tab.id, "list_directory", { relativePath: path });
       setRelativePath(path);
       setEntries(result.entries);
-      setOpened(undefined);
+      if (!options.preserveOpened) {
+        setOpened(undefined);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -534,7 +613,7 @@ function SearchBar({
         <span className="file-search-status" title={busy ? "Searching files" : "Search is live"} aria-label={busy ? "Searching files" : "Search is live"} aria-busy={busy}>
           <Search size={15} className={busy ? "spinning" : ""} />
         </span>
-        <input value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder={mode === "filename" ? "Find filenames" : mode === "content" ? "Search contents" : "Search files"} aria-label="Search files" />
+        <input value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder={mode === "filename" ? "Find filenames" : mode === "content" ? "Search contents" : "Search files"} aria-label="Search files" {...noSystemTextAssistProps} />
         <SegmentedControl className="file-search-mode" label="File search mode">
           <ControlButton type="button" className={mode === "all" ? "active" : ""} selected={mode === "all"} onClick={() => onModeChange("all")}>
             All
@@ -546,7 +625,7 @@ function SearchBar({
             Names
           </ControlButton>
         </SegmentedControl>
-        <input className="file-search-glob" value={glob} onChange={(event) => onGlobChange(event.target.value)} placeholder="Glob" aria-label="Search glob" />
+        <input className="file-search-glob" value={glob} onChange={(event) => onGlobChange(event.target.value)} placeholder="Glob" aria-label="Search glob" {...noSystemTextAssistProps} />
       </div>
     </form>
   );
@@ -682,7 +761,7 @@ function GitRepositoryBar({
               onClone();
             }}
           >
-            <input value={cloneUrl} onChange={(event) => onSetCloneUrl(event.target.value)} placeholder="Repository URL" aria-label="Repository URL to clone" />
+            <input value={cloneUrl} onChange={(event) => onSetCloneUrl(event.target.value)} placeholder="Repository URL" aria-label="Repository URL to clone" {...noSystemTextAssistProps} />
             <ControlButton type="submit" disabled={Boolean(busyAction) || !cloneUrl.trim()} title="Clone repository into this empty folder">
               Clone
             </ControlButton>
@@ -746,7 +825,7 @@ function OriginForm({ originUrl, busy, compact, onSetOrigin, onSetOriginUrl }: {
         onSetOrigin();
       }}
     >
-      <input value={originUrl} onChange={(event) => onSetOriginUrl(event.target.value)} placeholder="Origin URL" aria-label="Origin remote URL" />
+      <input value={originUrl} onChange={(event) => onSetOriginUrl(event.target.value)} placeholder="Origin URL" aria-label="Origin remote URL" {...noSystemTextAssistProps} />
       <ControlButton type="submit" disabled={busy || !originUrl.trim()} title="Set origin remote">
         Set origin
       </ControlButton>

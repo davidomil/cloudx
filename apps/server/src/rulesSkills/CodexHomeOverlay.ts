@@ -46,6 +46,7 @@ export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptio
 
   await linkOrCopyIfExists(path.join(sourceCodexHome, "auth.json"), path.join(codexHome, "auth.json"));
   await linkOrCopyIfExists(path.join(sourceCodexHome, "rules"), path.join(codexHome, "rules"));
+  await linkOrCopyIfExists(path.join(sourceCodexHome, "sessions"), path.join(codexHome, "sessions"));
 
   const skillPaths = await materializeSelectedSkills(codexHome, rulesSkillsRoot, options.resolved);
   const configPath = path.join(codexHome, "config.toml");

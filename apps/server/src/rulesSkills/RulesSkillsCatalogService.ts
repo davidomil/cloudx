@@ -131,7 +131,8 @@ export class RulesSkillsCatalogService {
     await fsp.rm(this.templatePath(id), { force: true });
     const store = await this.readStore();
     if (store.templates.length === 0) {
-      await writeJson(this.templatePath(DEFAULT_TEMPLATE.id), DEFAULT_TEMPLATE);
+      const defaultRuleExists = fs.existsSync(this.rulePath(DEFAULT_RULE.id));
+      await writeJson(this.templatePath(DEFAULT_TEMPLATE.id), defaultRuleExists ? DEFAULT_TEMPLATE : { ...DEFAULT_TEMPLATE, ruleIds: [] });
       await this.ensureSettings(DEFAULT_TEMPLATE.id);
     } else if (store.defaultTemplateId === id) {
       await writeJson(this.settingsPath(), { defaultTemplateId: store.templates[0]?.id });
@@ -276,14 +277,15 @@ export class RulesSkillsCatalogService {
     await fsp.mkdir(this.skillsPath(), { recursive: true });
     await fsp.mkdir(this.templatesPath(), { recursive: true });
     await ensureCloudxSystemSkills(this.rootPath);
-    if (!fs.existsSync(this.settingsPath())) {
-      await writeJson(this.settingsPath(), { defaultTemplateId: DEFAULT_TEMPLATE.id });
-    }
-    if (!fs.existsSync(this.rulePath(DEFAULT_RULE.id))) {
+    const templateFiles = (await readDirectoryEntries(this.templatesPath())).filter((entry) => entry.isFile() && entry.name.endsWith(".json")).sort((a, b) => a.name.localeCompare(b.name));
+    const hasTemplates = templateFiles.length > 0;
+    if (!hasTemplates) {
       await fsp.writeFile(this.rulePath(DEFAULT_RULE.id), formatRule(DEFAULT_RULE), "utf8");
-    }
-    if (!fs.existsSync(this.templatePath(DEFAULT_TEMPLATE.id))) {
       await writeJson(this.templatePath(DEFAULT_TEMPLATE.id), DEFAULT_TEMPLATE);
+    }
+    if (!fs.existsSync(this.settingsPath())) {
+      const defaultTemplateId = hasTemplates ? path.basename(templateFiles[0]?.name ?? "", ".json") : DEFAULT_TEMPLATE.id;
+      await writeJson(this.settingsPath(), { defaultTemplateId });
     }
   }
 
@@ -421,7 +423,7 @@ async function readSkill(skillPath: string): Promise<CloudxSkill> {
   }
   return normalizeSkill({
     id,
-    name: parsed.frontmatter.cloudx_name || titleFromId(id),
+    name: parsed.frontmatter.cloudx_name || parsed.frontmatter.name || titleFromId(id),
     description: parsed.frontmatter.description,
     instructions
   });

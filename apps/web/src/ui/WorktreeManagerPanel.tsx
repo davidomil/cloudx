@@ -5,6 +5,7 @@ import type { ConfigValue, WorktreeCreateMode, WorktreeProjectState, WorktreeRef
 
 import { runTabAction } from "../api.js";
 import { ControlButton } from "./Control.js";
+import { noSystemTextAssistProps } from "./inputAssist.js";
 
 type BusyAction = "state" | "initialize" | "clone" | "fetch" | "create" | "delete";
 
@@ -400,6 +401,7 @@ function RefCombobox({ value, refs, onChange, placeholder, ariaLabel }: { value:
         onKeyDown={onKeyDown}
         placeholder={placeholder}
         aria-label={ariaLabel}
+        {...noSystemTextAssistProps}
         role="combobox"
         aria-expanded={open}
       />

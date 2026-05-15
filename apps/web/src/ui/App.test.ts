@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RULES_SKILLS_PLUGIN_ID, type PluginDescriptor, type WorkspaceStateResponse } from "@cloudx/shared";
 
-import { requestAudioInputEnumerationAccess, workspaceStateWithPreservedLayout } from "./App.js";
+import { codexTabInitialInput, requestAudioInputEnumerationAccess, workspaceStateWithPreservedLayout } from "./App.js";
 import { pluginMetadataForTemplate, selectedTemplateId } from "./RulesSkillsPanel.js";
 import { collectUiContributions, selectTabIndicatorContribution } from "./uiContributions.js";
 
@@ -109,6 +109,21 @@ describe("template metadata helpers", () => {
     expect(metadata).toEqual({ [RULES_SKILLS_PLUGIN_ID]: { selectedTemplateId: "focused" } });
     expect(selectedTemplateId({ ...workspaceTab("tab-codex", "codex-terminal"), pluginMetadata: metadata })).toBe("focused");
     expect(pluginMetadataForTemplate(undefined)).toBeUndefined();
+  });
+});
+
+describe("codexTabInitialInput", () => {
+  it("omits resume input for fresh Codex tabs", () => {
+    expect(codexTabInitialInput("new", "", false, false)).toBeUndefined();
+  });
+
+  it("builds resume input for last and exact Codex sessions", () => {
+    expect(codexTabInitialInput("last", "", true, true)).toEqual({
+      resume: { mode: "last", all: true, includeNonInteractive: true }
+    });
+    expect(codexTabInitialInput("session", " 019e2c73-53ab-79f1-9b0c-4d63bfcfbdcd ", false, false)).toEqual({
+      resume: { mode: "session", sessionId: "019e2c73-53ab-79f1-9b0c-4d63bfcfbdcd" }
+    });
   });
 });
 

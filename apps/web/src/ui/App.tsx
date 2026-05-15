@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement, type RefObject } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement, type RefObject } from "react";
 import { AlertTriangle, Bot, ChevronDown, Columns2, GitBranch, LayoutTemplate, Mic, MicOff, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
 
-import { RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, type CloudxConfigResponse, type CloudxConfigValues, type CloudxRule, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsStore, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceWindow } from "@cloudx/shared";
+import { RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, type CloudxConfigResponse, type CloudxConfigValues, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsStore, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceWindow } from "@cloudx/shared";
 
 import {
   applyLayoutTemplate,
@@ -28,7 +28,7 @@ import {
   type VoiceAudioStreamSession
 } from "../api.js";
 import { ControlButton } from "./Control.js";
-import { FileBrowserPanel } from "./FileBrowserPanel.js";
+import { disposeFileBrowserPanelStatesExcept, FileBrowserPanel } from "./FileBrowserPanel.js";
 import { PathEntry } from "./PathEntry.js";
 import {
   activatePane,
@@ -54,6 +54,7 @@ import { clearFocusedAttention, isTabFocused, updateAttentionTabs } from "./tabA
 import { applyTerminalColorTheme, applyTerminalUiScale, disposeTerminalView, disposeTerminalViewsExcept, TerminalPanel } from "./TerminalPanel.js";
 import { applyCloudxTheme, readTerminalColorTheme } from "./theme.js";
 import { normalizeUiScale, uiScaleFactor } from "./uiScale.js";
+import { noSystemTextAssistProps } from "./inputAssist.js";
 import { attemptPortraitOrientationLock } from "./orientationLock.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
 import { RulesSkillsPanel, TemplateSelect, pluginMetadataForTemplate, selectedTemplateId } from "./RulesSkillsPanel.js";
@@ -267,7 +268,9 @@ export function App() {
   }, [layout]);
 
   useEffect(() => {
-    disposeTerminalViewsExcept(new Set(tabs.map((tab) => tab.id)));
+    const tabIds = new Set(tabs.map((tab) => tab.id));
+    disposeTerminalViewsExcept(tabIds);
+    disposeFileBrowserPanelStatesExcept(tabIds);
   }, [tabs]);
 
   useEffect(() => {
@@ -321,14 +324,18 @@ export function App() {
     }
   }
 
-  async function loadRulesSkillsStore(): Promise<RulesSkillsStore | undefined> {
+  const loadRulesSkillsStore = useCallback(async (): Promise<RulesSkillsStore | undefined> => {
     try {
       const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.catalog.list");
       return result.store;
     } catch {
       return undefined;
     }
-  }
+  }, []);
+
+  const handleRefreshRulesSkillsStore = useCallback(async () => {
+    setRulesSkillsStore(await loadRulesSkillsStore());
+  }, [loadRulesSkillsStore]);
 
   function applyWorkspaceState(state: WorkspaceStateResponse, options: { preservePendingLayout?: boolean } = {}) {
     const effectiveState = options.preservePendingLayout ? workspaceStateWithPreservedLayout(state, layoutRef.current, pendingLayoutPersistWindowIdRef.current) : state;
@@ -886,6 +893,7 @@ export function App() {
         onSetDefault={handleSetDefaultTemplate}
         onSaveRule={handleSaveRule}
         onDeleteRule={handleDeleteRule}
+        onRefreshStore={handleRefreshRulesSkillsStore}
       />
     ),
   });
@@ -1642,7 +1650,7 @@ function PluginPanel({
     }
   }
   if (plugin?.panelKind === "file-browser") {
-    return <FileBrowserPanel tab={tab} config={config} />;
+    return <FileBrowserPanel key={`${tab.id}:${tab.cwd}`} tab={tab} config={config} />;
   }
   if (plugin?.panelKind === "web-viewer") {
     return <WebViewerPanel tab={tab} />;
@@ -1845,6 +1853,10 @@ function CreateTabDialog({
   const [title, setTitle] = useState("");
   const [localWebUrl, setLocalWebUrl] = useState("");
   const [templateId, setTemplateId] = useState("");
+  const [codexResumeMode, setCodexResumeMode] = useState<CodexSessionResumeMode>("new");
+  const [codexResumeSessionId, setCodexResumeSessionId] = useState("");
+  const [codexResumeAll, setCodexResumeAll] = useState(false);
+  const [codexResumeIncludeNonInteractive, setCodexResumeIncludeNonInteractive] = useState(false);
   const [createDirectory, setCreateDirectory] = useState(false);
   const [busy, setBusy] = useState(false);
   const selectedPlugin = creatablePlugins.find((plugin) => plugin.id === pluginId);
@@ -1862,13 +1874,21 @@ function CreateTabDialog({
   useEffect(() => {
     if (!isCodex) {
       setTemplateId("");
+      setCodexResumeMode("new");
+      setCodexResumeSessionId("");
+      setCodexResumeAll(false);
+      setCodexResumeIncludeNonInteractive(false);
     }
   }, [isCodex]);
 
   async function submit() {
     setBusy(true);
     try {
-      const initialInput = isLocalWeb && localWebUrl.trim() ? { url: localWebUrl.trim() } : undefined;
+      const initialInput = isLocalWeb && localWebUrl.trim()
+        ? { url: localWebUrl.trim() }
+        : isCodex
+          ? codexTabInitialInput(codexResumeMode, codexResumeSessionId, codexResumeAll, codexResumeIncludeNonInteractive)
+          : undefined;
       await onCreate({
         pluginId,
         cwd: requiresDirectory ? cwd : undefined,
@@ -1917,6 +1937,35 @@ function CreateTabDialog({
         {isCodex && templates.length > 0 ? (
           <TemplateSelect value={templateId} templates={templates} onChange={setTemplateId} label="Template" includeInherited />
         ) : null}
+        {isCodex ? (
+          <label>
+            Session
+            <select value={codexResumeMode} onChange={(event) => setCodexResumeMode(event.target.value as CodexSessionResumeMode)}>
+              <option value="new">New session</option>
+              <option value="picker">Resume picker</option>
+              <option value="last">Resume last</option>
+              <option value="session">Resume ID</option>
+            </select>
+          </label>
+        ) : null}
+        {isCodex && codexResumeMode === "session" ? (
+          <label>
+            Session ID
+            <input value={codexResumeSessionId} onChange={(event) => setCodexResumeSessionId(event.target.value)} placeholder="UUID or thread name" {...noSystemTextAssistProps} />
+          </label>
+        ) : null}
+        {isCodex && codexResumeMode !== "new" && codexResumeMode !== "session" ? (
+          <>
+            <label className="checkbox-row">
+              <input type="checkbox" checked={codexResumeAll} onChange={(event) => setCodexResumeAll(event.target.checked)} />
+              All directories
+            </label>
+            <label className="checkbox-row">
+              <input type="checkbox" checked={codexResumeIncludeNonInteractive} onChange={(event) => setCodexResumeIncludeNonInteractive(event.target.checked)} />
+              Include exec sessions
+            </label>
+          </>
+        ) : null}
         <label>
           Title
           <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder={titlePlaceholder} />
@@ -1929,13 +1978,35 @@ function CreateTabDialog({
         ) : null}
         <div className="dialog-actions">
           <ControlButton onClick={onCancel}>Cancel</ControlButton>
-          <ControlButton className="primary-button" tone="primary" onClick={() => void submit()} disabled={(requiresDirectory && !cwd.trim()) || busy}>
+          <ControlButton className="primary-button" tone="primary" onClick={() => void submit()} disabled={(requiresDirectory && !cwd.trim()) || (isCodex && codexResumeMode === "session" && !codexResumeSessionId.trim()) || busy}>
             Create
           </ControlButton>
         </div>
       </div>
     </div>
   );
+}
+
+export function codexTabInitialInput(
+  resumeMode: CodexSessionResumeMode,
+  sessionId: string,
+  all: boolean,
+  includeNonInteractive: boolean
+): CreateTabRequest["initialInput"] {
+  if (resumeMode === "new") {
+    return undefined;
+  }
+  if (resumeMode === "session") {
+    const trimmedSessionId = sessionId.trim();
+    return trimmedSessionId ? { resume: { mode: "session", sessionId: trimmedSessionId } } : undefined;
+  }
+  return {
+    resume: {
+      mode: resumeMode,
+      all,
+      includeNonInteractive
+    }
+  };
 }
 
 function defaultTabTitlePlaceholder(plugin: PluginDescriptor | undefined, cwd: string, localWebUrl: string): string {

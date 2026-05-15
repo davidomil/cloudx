@@ -243,6 +243,17 @@ export interface CreateTabRequest {
   pluginMetadata?: PluginMetadataMap;
 }
 
+export type CodexSessionResumeMode = "new" | "picker" | "last" | "session";
+
+export interface CodexTerminalInitialInput {
+  resume?: {
+    mode: Exclude<CodexSessionResumeMode, "new">;
+    sessionId?: string;
+    all?: boolean;
+    includeNonInteractive?: boolean;
+  };
+}
+
 export interface CreateTabResponse {
   tab: WorkspaceTab;
 }

@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { TabIndicatorUpdate, WorkspaceTab } from "@cloudx/shared";
 
-import { CodexTerminalPlugin, CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES, TerminalShellIntegrationParser, materializeCodexTemplate } from "./CodexTerminalPlugin.js";
+import { CodexTerminalPlugin, CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES, TerminalShellIntegrationParser, buildCodexLaunchArgs, codexResumeInput, materializeCodexTemplate } from "./CodexTerminalPlugin.js";
 import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
 
 class FakeTerminalProcess implements TerminalProcess {
@@ -94,6 +94,38 @@ describe("CodexTerminalPlugin", () => {
     expect(factory.args).toEqual(["-lc", "exec /usr/bin/codex"]);
   });
 
+  it("launches Codex resume for requested sessions", async () => {
+    vi.stubEnv("SHELL", "/bin/bash");
+    vi.stubEnv("CLOUDX_ASSISTANT_BIN", "/usr/bin/codex");
+    const factory = new CapturingFactory();
+    const plugin = new CodexTerminalPlugin(factory);
+
+    await plugin.createSession({
+      tab,
+      cwd: "/tmp",
+      controls: { setTabIndicator: () => undefined, closeTab: () => undefined },
+      initialInput: { resume: { mode: "last", all: true, includeNonInteractive: true } }
+    });
+
+    expect(factory.args).toEqual(["-lc", "exec /usr/bin/codex resume --last --all --include-non-interactive"]);
+  });
+
+  it("quotes Codex resume session names through the login shell", async () => {
+    vi.stubEnv("SHELL", "/bin/bash");
+    vi.stubEnv("CLOUDX_ASSISTANT_BIN", "/usr/bin/codex");
+    const factory = new CapturingFactory();
+    const plugin = new CodexTerminalPlugin(factory);
+
+    await plugin.createSession({
+      tab,
+      cwd: "/tmp",
+      controls: { setTabIndicator: () => undefined, closeTab: () => undefined },
+      initialInput: { resume: { mode: "session", sessionId: "release fix thread" } }
+    });
+
+    expect(factory.args).toEqual(["-lc", "exec /usr/bin/codex resume 'release fix thread'"]);
+  });
+
   it("launches resolved template rules and skills through a Codex home overlay", async () => {
     vi.stubEnv("SHELL", "/bin/bash");
     vi.stubEnv("CLOUDX_ASSISTANT_BIN", "/usr/bin/codex");
@@ -101,6 +133,8 @@ describe("CodexTerminalPlugin", () => {
     const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-base-codex-home-"));
     vi.stubEnv("CODEX_HOME", codexHome);
     await fs.writeFile(path.join(codexHome, "AGENTS.md"), "Prefer direct answers.\n", "utf8");
+    await fs.mkdir(path.join(codexHome, "sessions", "2026", "05", "15"), { recursive: true });
+    await fs.writeFile(path.join(codexHome, "sessions", "2026", "05", "15", "rollout-session.jsonl"), "session\n", "utf8");
     await seedSkill(dataDir, "code-review", "Code Review", "Review code.", "Code review skill instructions.");
     const factory = new CapturingFactory();
     const plugin = new CodexTerminalPlugin(factory, DEFAULT_TERMINAL_REPLAY_BYTES, dataDir);
@@ -151,6 +185,7 @@ describe("CodexTerminalPlugin", () => {
     const overlayInstructions = await fs.readFile(path.join(factory.env!.CODEX_HOME!, "AGENTS.override.md"), "utf8");
     expect(overlayInstructions).toContain("Prefer direct answers.");
     expect(overlayInstructions).toContain("Review carefully.");
+    await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "sessions", "2026", "05", "15", "rollout-session.jsonl"), "utf8")).resolves.toBe("session\n");
   });
 
   it("materializes resolved template fields into a Codex home overlay", async () => {
@@ -241,6 +276,16 @@ describe("CodexTerminalPlugin", () => {
     expect(launch.args).toEqual([]);
     expect(launch.overlay).toBeUndefined();
     expect(launch.env.CLOUDX_PERSONALITY_TEMPLATE_ID).toBeUndefined();
+  });
+
+  it("builds Codex resume args from tab initial input", () => {
+    expect(buildCodexLaunchArgs(["--add-dir", "/tmp/rules"], { resume: { mode: "picker", all: true } })).toEqual(["--add-dir", "/tmp/rules", "resume", "--all"]);
+    expect(buildCodexLaunchArgs([], { resume: { mode: "session", sessionId: "019e2c73-53ab-79f1-9b0c-4d63bfcfbdcd" } })).toEqual([
+      "resume",
+      "019e2c73-53ab-79f1-9b0c-4d63bfcfbdcd"
+    ]);
+    expect(codexResumeInput({ resume: { mode: "new" } })).toBeUndefined();
+    expect(() => codexResumeInput({ resume: { mode: "session", sessionId: " " } })).toThrow("Codex resume session id is required.");
   });
 
   it("injects updated rules and skills into a running Codex terminal without stopping it", async () => {

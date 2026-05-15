@@ -86,6 +86,27 @@ describe("FileBrowserPlugin", () => {
     });
   });
 
+  it("rejects opening directories as files before reading content", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-files-"));
+    await fs.mkdir(path.join(root, "src"));
+    const session = new FileBrowserPlugin(new PathPolicy([root])).createSession({
+      tab: {
+        id: "tab-1",
+        pluginId: "file-browser",
+        title: "Files",
+        cwd: root,
+        status: "running",
+        indicator: { color: "green", label: "OK", updatedAt: new Date(0).toISOString() },
+        createdAt: new Date(0).toISOString(),
+        updatedAt: new Date(0).toISOString()
+      },
+      cwd: root,
+      controls: { setTabIndicator: () => undefined, closeTab: () => undefined }
+    });
+
+    await expect(session.handleAction("open_file", { relativePath: "src" })).rejects.toThrow("Not a file:");
+  });
+
   it("searches files by filename and content and exposes search results to voice context", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-files-"));
     await fs.mkdir(path.join(root, "src"));

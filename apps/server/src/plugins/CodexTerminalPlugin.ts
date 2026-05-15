@@ -7,7 +7,7 @@ import type {
   PluginVoiceContext,
   WorkspacePlugin
 } from "@cloudx/plugin-api";
-import { RULES_SKILLS_PLUGIN_ID, isRecord, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
+import { RULES_SKILLS_PLUGIN_ID, isRecord, type CodexTerminalInitialInput, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
 
 import { materializeCodexHomeOverlay, type CodexHomeOverlay } from "../rulesSkills/CodexHomeOverlay.js";
 import { CLOUDX_SYSTEM_SKILLS, cloudxSkillFilePath, cloudxSystemSkillFilePath, type ResolvedPersonalityTemplate } from "../rulesSkills/RulesSkillsCatalogService.js";
@@ -59,6 +59,20 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     };
   }
 
+  defaultTitleContext(input: { initialInput?: Record<string, unknown> }): string | undefined {
+    const resume = codexResumeInput(input.initialInput);
+    if (!resume) {
+      return undefined;
+    }
+    if (resume.mode === "last") {
+      return "Resume last";
+    }
+    if (resume.mode === "session") {
+      return `Resume ${shortSessionLabel(resume.sessionId)}`;
+    }
+    return "Resume";
+  }
+
   async createSession(input: CreatePluginSessionInput): Promise<PluginSession> {
     const template = templateFromRuntimeContext(input.runtimeContext);
     const launchTemplate = await materializeCodexTemplate(template, process.env, {
@@ -66,7 +80,8 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       tabId: input.tab.id
     });
     const command = launchTemplate.command;
-    const launch = buildLoginShellCommandLaunch(command, launchTemplate.args, launchTemplate.env);
+    const launchArgs = buildCodexLaunchArgs(launchTemplate.args, input.initialInput);
+    const launch = buildLoginShellCommandLaunch(command, launchArgs, launchTemplate.env);
     const terminalProcess = await this.factory.spawn(launch.command, launch.args, {
       cwd: input.cwd,
       env: launchTemplate.env,
@@ -97,6 +112,55 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       }
     });
   }
+}
+
+export function buildCodexLaunchArgs(baseArgs: string[], initialInput?: Record<string, unknown>): string[] {
+  const resume = codexResumeInput(initialInput);
+  if (!resume) {
+    return baseArgs;
+  }
+  const args = [...baseArgs, "resume"];
+  if (resume.mode === "last") {
+    args.push("--last");
+  }
+  if (resume.mode !== "session" && resume.all) {
+    args.push("--all");
+  }
+  if (resume.mode !== "session" && resume.includeNonInteractive) {
+    args.push("--include-non-interactive");
+  }
+  if (resume.mode === "session") {
+    args.push(resume.sessionId!);
+  }
+  return args;
+}
+
+export function codexResumeInput(initialInput: Record<string, unknown> | undefined): Required<CodexTerminalInitialInput>["resume"] | undefined {
+  if (!isRecord(initialInput) || !isRecord(initialInput.resume)) {
+    return undefined;
+  }
+  const mode = initialInput.resume.mode;
+  if (mode !== "picker" && mode !== "last" && mode !== "session") {
+    return undefined;
+  }
+  const sessionId = typeof initialInput.resume.sessionId === "string" ? initialInput.resume.sessionId.trim() : "";
+  if (mode === "session" && !sessionId) {
+    throw new Error("Codex resume session id is required.");
+  }
+  return {
+    mode,
+    sessionId: mode === "session" ? sessionId : undefined,
+    all: initialInput.resume.all === true,
+    includeNonInteractive: initialInput.resume.includeNonInteractive === true
+  };
+}
+
+function shortSessionLabel(sessionId: string | undefined): string {
+  const value = sessionId?.trim();
+  if (!value) {
+    return "session";
+  }
+  return value.length > 12 ? `${value.slice(0, 8)}...` : value;
 }
 
 function templateFromRuntimeContext(runtimeContext: WorkspaceRuntimeContext | undefined): ResolvedPersonalityTemplate | undefined {

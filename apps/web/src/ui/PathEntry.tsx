@@ -4,6 +4,7 @@ import { createPortal } from "react-dom";
 import type { PathOption } from "@cloudx/shared";
 
 import { getPathOptions } from "../api.js";
+import { noSystemTextAssistProps } from "./inputAssist.js";
 import { OUTSIDE_POINTER_INSIDE_ATTRIBUTE } from "./outsidePointer.js";
 
 export function PathEntry({
@@ -125,7 +126,7 @@ export function PathEntry({
         onBlur={() => window.setTimeout(() => setOpen(false), 100)}
         onKeyDown={handleKeyDown}
         placeholder={placeholder}
-        autoComplete="off"
+        {...noSystemTextAssistProps}
         role="combobox"
         aria-label={ariaLabel}
         aria-autocomplete="list"

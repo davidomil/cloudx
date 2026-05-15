@@ -34,6 +34,63 @@ describe("RulesSkillsCatalogService", () => {
     expect(systemSkillFile).toContain("CLOUDX_RULES_SKILLS_DIR");
   });
 
+  it("does not recreate a deleted default rule during catalog refresh", async () => {
+    const service = await createService();
+    await expect(service.list()).resolves.toMatchObject({
+      defaultTemplateId: "default-codex"
+    });
+
+    const store = await service.deleteRule("keep-changes-focused");
+
+    expect(store.rules.map((rule) => rule.id)).not.toContain("keep-changes-focused");
+    expect(store.templates.find((template) => template.id === "default-codex")?.ruleIds).not.toContain("keep-changes-focused");
+    await expect(service.list()).resolves.toMatchObject({
+      rules: expect.not.arrayContaining([expect.objectContaining({ id: "keep-changes-focused" })])
+    });
+  });
+
+  it("does not reattach a deleted default rule when recreating the last template", async () => {
+    const service = await createService();
+    await service.deleteRule("keep-changes-focused");
+
+    const store = await service.deleteTemplate("default-codex");
+
+    expect(store.rules.map((rule) => rule.id)).not.toContain("keep-changes-focused");
+    expect(store.templates).toContainEqual(expect.objectContaining({
+      id: "default-codex",
+      ruleIds: []
+    }));
+  });
+
+  it("loads skills written directly into the folder-backed catalog", async () => {
+    const service = await createService();
+    const skillDir = path.join(service.catalogRoot(), "skills", "view-logs");
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(
+      path.join(skillDir, "SKILL.md"),
+      [
+        "---",
+        "name: View Logs",
+        "description: View logs for the CloudX 3002 service.",
+        "---",
+        "",
+        "# View Logs",
+        "",
+        "Use journalctl to inspect the 3002 service.",
+        ""
+      ].join("\n"),
+      "utf8"
+    );
+
+    const store = await service.list();
+
+    expect(store.skills).toContainEqual(expect.objectContaining({
+      id: "view-logs",
+      name: "View Logs",
+      description: "View logs for the CloudX 3002 service."
+    }));
+  });
+
   it("resolves default, window, and tab template precedence", async () => {
     const service = await createService();
     await service.saveTemplate({ id: "window-template", name: "Window Template", color: "yellow", ruleIds: [], skillIds: [] });
