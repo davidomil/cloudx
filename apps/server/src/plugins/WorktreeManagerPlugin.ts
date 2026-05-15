@@ -50,7 +50,7 @@ export class WorktreeManagerPlugin implements WorkspacePlugin {
     },
     {
       name: "fetch_refs",
-      description: "Fetch remote branches and tags from origin.",
+      description: "Fetch and prune remote branches from origin without rewriting local tags.",
       voiceExposed: true,
       inputSchema: {
         type: "object",

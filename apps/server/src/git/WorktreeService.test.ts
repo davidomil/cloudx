@@ -38,7 +38,7 @@ describe("WorktreeService", () => {
 
     const cloned = await service.cloneBareRepository(project, remote);
     expect(cloned).toMatchObject({ status: "ready", originUrl: remote });
-    expect(cloned.refs).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "remote", name: expect.stringMatching(/^origin\/(main|master)$/) }), expect.objectContaining({ kind: "remote", name: "origin/feature" }), expect.objectContaining({ kind: "tag", name: "v1" })]));
+    expect(cloned.refs).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "remote", name: expect.stringMatching(/^origin\/(main|master)$/) }), expect.objectContaining({ kind: "remote", name: "origin/feature" })]));
 
     const baseRef = cloned.refs.find((ref) => ref.kind === "remote" && ref.name.match(/^origin\/(main|master)$/))?.name;
     expect(baseRef).toBeTruthy();
@@ -84,6 +84,25 @@ describe("WorktreeService", () => {
         baseRef: "origin/feature"
       })
     ).rejects.toThrow("folderName");
+  });
+
+  it("fetches remote branches without failing on divergent local tags", async () => {
+    const service = new WorktreeService();
+    const remote = await createRemoteRepo();
+    const project = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-wt-tags-"));
+    const cloned = await service.cloneBareRepository(project, remote);
+    expect(cloned.refs).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "remote", name: "origin/feature" })]));
+
+    await git(project, "--git-dir", path.join(project, ".bare"), "tag", "moved-tag", cloned.refs.find((ref) => ref.kind === "remote" && ref.name === "origin/feature")?.commit ?? "HEAD");
+    await fs.writeFile(path.join(remote, "REMOTE.md"), "updated\n");
+    await git(remote, "add", ".");
+    await git(remote, "commit", "-m", "move remote tag");
+    await git(remote, "tag", "moved-tag");
+
+    await expect(service.fetchRefs(project)).resolves.toMatchObject({
+      status: "ready",
+      refs: expect.arrayContaining([expect.objectContaining({ kind: "remote", name: "origin/feature" })])
+    });
   });
 
   it("detects a single non-.bare repository child and the bare directory itself", async () => {

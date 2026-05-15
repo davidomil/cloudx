@@ -127,7 +127,7 @@ export class WorktreeService {
 
   async fetchRefs(projectDir: string): Promise<WorktreeProjectState> {
     const context = await this.requireReadyProject(projectDir);
-    await this.runBareGit(context.barePath, ["fetch", "--prune", "--tags", "origin"]);
+    await this.runBareGit(context.barePath, ["fetch", "--prune", "--no-tags", "origin"]);
     return this.getState(projectDir);
   }
 
