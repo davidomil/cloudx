@@ -5,8 +5,10 @@
   "license": "MIT",
   "type": "module",
   "workspaces": [
-    "apps/*",
-    "packages/*"
+    "packages/shared",
+    "packages/plugin-api",
+    "apps/server",
+    "apps/web"
   ],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
