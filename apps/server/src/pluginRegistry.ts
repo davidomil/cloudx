@@ -1,6 +1,7 @@
 import type { PluginActionDefinition, WorkspacePlugin } from "@cloudx/plugin-api";
 import { descriptorFromPlugin } from "@cloudx/plugin-api";
 import type { PluginDescriptor, PluginId } from "@cloudx/shared";
+import { validateObjectSchema } from "./hooks/schema.js";
 
 export class PluginRegistry {
   private readonly plugins = new Map<PluginId, WorkspacePlugin>();
@@ -22,6 +23,10 @@ export class PluginRegistry {
 
   list(): PluginDescriptor[] {
     return Array.from(this.plugins.values()).map((plugin) => descriptorFromPlugin(plugin));
+  }
+
+  values(): WorkspacePlugin[] {
+    return Array.from(this.plugins.values());
   }
 
   getVoiceAction(pluginId: PluginId, actionName: string): PluginActionDefinition {
@@ -62,45 +67,5 @@ export class PluginRegistry {
   validateInput(pluginId: PluginId, actionName: string, input: Record<string, unknown>): void {
     const action = this.getAction(pluginId, actionName);
     validateObjectSchema(action.inputSchema, input, `${pluginId}.${actionName}`);
-  }
-}
-
-function validateObjectSchema(schema: PluginActionDefinition["inputSchema"], input: Record<string, unknown>, label: string): void {
-  if (schema.type !== "object") {
-    throw new Error(`Action schema ${label} must be an object schema.`);
-  }
-  const required = new Set(schema.required ?? []);
-  for (const key of required) {
-    if (!(key in input)) {
-      throw new Error(`Action ${label} missing required input: ${key}`);
-    }
-  }
-
-  if (schema.additionalProperties === false) {
-    const allowed = new Set(Object.keys(schema.properties ?? {}));
-    for (const key of Object.keys(input)) {
-      if (!allowed.has(key)) {
-        throw new Error(`Action ${label} does not accept input: ${key}`);
-      }
-    }
-  }
-
-  for (const [key, value] of Object.entries(input)) {
-    const property = schema.properties?.[key];
-    if (!property) {
-      continue;
-    }
-    if (property.enum && typeof value === "string" && !property.enum.includes(value)) {
-      throw new Error(`Action ${label} input ${key} must be one of: ${property.enum.join(", ")}`);
-    }
-    if (property.type === "string" && typeof value !== "string") {
-      throw new Error(`Action ${label} input ${key} must be a string.`);
-    }
-    if (property.type === "number" && (typeof value !== "number" || !Number.isFinite(value))) {
-      throw new Error(`Action ${label} input ${key} must be a number.`);
-    }
-    if (property.type === "boolean" && typeof value !== "boolean") {
-      throw new Error(`Action ${label} input ${key} must be a boolean.`);
-    }
   }
 }

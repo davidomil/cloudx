@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CLOUDX_THEME_OPTIONS, isCloudxThemeId, parseVoiceActionPlan } from "./index.js";
+import { CLOUDX_THEME_OPTIONS, UI_RENDERER_ICON_BUTTON, UI_RENDERER_PLUGIN_WEBVIEW, UI_RENDERER_STATUS_DOT, isCloudxThemeId, parseVoiceActionPlan } from "./index.js";
 
 describe("parseVoiceActionPlan", () => {
   it("accepts a valid structured plan", () => {
@@ -22,6 +22,7 @@ describe("parseVoiceActionPlan", () => {
           id: null,
           targetTabId: null,
           pluginId: null,
+          hookId: null,
           action: "enter_text",
           input: { text: "ls", submit: true, key: null, tabId: null, title: null, relativePath: null, url: null },
           reason: null
@@ -33,6 +34,22 @@ describe("parseVoiceActionPlan", () => {
       action: "enter_text",
       input: { text: "ls", submit: true }
     });
+  });
+
+  it("preserves hook ids for hook-backed voice actions", () => {
+    const plan = parseVoiceActionPlan({
+      transcript: "open a web tab",
+      summary: "Create a web tab.",
+      actions: [
+        {
+          hookId: "workspace.tabs.create",
+          action: "workspace.tabs.create",
+          input: { pluginId: "local-web", url: "http://127.0.0.1:5173" }
+        }
+      ]
+    });
+
+    expect(plan.actions[0]).toMatchObject({ hookId: "workspace.tabs.create", action: "workspace.tabs.create" });
   });
 
   it("rejects malformed actions", () => {
@@ -52,5 +69,11 @@ describe("CloudX themes", () => {
     expect(isCloudxThemeId("minimalist-dark")).toBe(true);
     expect(isCloudxThemeId("graphite")).toBe(false);
     expect(isCloudxThemeId("missing")).toBe(false);
+  });
+});
+
+describe("UI contribution renderer ids", () => {
+  it("exports stable renderer ids for plugin-authored contributions", () => {
+    expect([UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, UI_RENDERER_PLUGIN_WEBVIEW]).toEqual(["icon-button", "status-dot", "plugin.webview"]);
   });
 });

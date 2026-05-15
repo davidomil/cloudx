@@ -8,6 +8,39 @@ export type TabStatus = "idle" | "starting" | "running" | "waiting_approval" | "
 
 export type TabIndicatorColor = "green" | "yellow" | "red";
 
+export type PluginMetadata = Record<string, unknown>;
+
+export type PluginMetadataMap = Record<PluginId, PluginMetadata>;
+
+export type PluginMetadataPatch = Record<PluginId, PluginMetadata | null>;
+
+export const RULES_SKILLS_PLUGIN_ID = "rules-skills";
+
+export interface PersonalityProfile {
+  id: string;
+  name: string;
+  color: TabIndicatorColor;
+  assistantCommand?: string;
+  rulesText?: string;
+  enabledSkillIds: string[];
+  enabledPluginIds: PluginId[];
+  env?: Record<string, string>;
+}
+
+export interface PersonalityProfileStore {
+  defaultProfileId?: string;
+  profiles: PersonalityProfile[];
+}
+
+export type PluginRuntimeContextMap = Record<PluginId, Record<string, unknown>>;
+
+export interface WorkspaceRuntimeContext {
+  activeWindowId?: string;
+  windowPluginMetadata?: PluginMetadataMap;
+  tabPluginMetadata?: PluginMetadataMap;
+  pluginRuntime?: PluginRuntimeContextMap;
+}
+
 export interface TabIndicator {
   color: TabIndicatorColor;
   label: string;
@@ -28,6 +61,7 @@ export interface WorkspaceTab {
   cwd: string;
   status: TabStatus;
   indicator: TabIndicator;
+  pluginMetadata?: PluginMetadataMap;
   createdAt: string;
   updatedAt: string;
   contextPath?: string;
@@ -41,6 +75,78 @@ export interface PluginActionDescriptor {
   defaultForVoice?: boolean;
   handlesUnhandledVoice?: boolean;
   inputSchema: Record<string, unknown>;
+}
+
+export type HookId = string;
+
+export type HookOwnerKind = "app" | "plugin";
+
+export type HookExposure = "app" | "plugin" | "voice" | "ui" | "http";
+
+export interface HookOwner {
+  kind: HookOwnerKind;
+  pluginId?: PluginId;
+}
+
+export interface HookDescriptor {
+  id: HookId;
+  owner: HookOwner;
+  title: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
+  exposures: HookExposure[];
+  defaultForVoice?: boolean;
+  handlesUnhandledVoice?: boolean;
+}
+
+export interface HookCallRequest {
+  input?: Record<string, unknown>;
+  targetTabId?: string;
+}
+
+export interface HookCallResponse {
+  result: Record<string, unknown>;
+}
+
+export type UiContributionSlot =
+  | "app.topbar.actions"
+  | "app.footer.actions"
+  | "tab.indicator"
+  | "tab.actions.trailing"
+  | "window.settings.sections"
+  | "tab.settings.sections"
+  | "plugin.panel";
+
+export type UiContributionRenderer = string;
+
+export const UI_RENDERER_ICON_BUTTON = "icon-button";
+export const UI_RENDERER_STATUS_DOT = "status-dot";
+export const UI_RENDERER_PLUGIN_WEBVIEW = "plugin.webview";
+
+export interface UiWebviewContributionState {
+  html?: string;
+  url?: string;
+  title?: string;
+  sandbox?: string;
+  allow?: string;
+}
+
+export interface UiContributionDescriptor {
+  id: string;
+  owner: HookOwner;
+  slot: UiContributionSlot;
+  renderer: UiContributionRenderer;
+  title: string;
+  icon?: string;
+  order?: number;
+  targetPluginId?: PluginId;
+  targetTabId?: string;
+  visibleWhen?: Record<string, unknown>;
+  enabledWhen?: Record<string, unknown>;
+  hookId?: HookId;
+  input?: Record<string, unknown>;
+  state?: Record<string, unknown>;
 }
 
 export type ConfigValue = boolean | string | number;
@@ -73,6 +179,8 @@ export interface PluginDescriptor {
   creatable: boolean;
   requiresDirectory: boolean;
   actions: PluginActionDescriptor[];
+  hooks?: HookDescriptor[];
+  uiContributions?: UiContributionDescriptor[];
   configFields: ConfigFieldDescriptor[];
 }
 
@@ -114,6 +222,8 @@ export interface CreateTabRequest {
   title?: string;
   createDirectory?: boolean;
   initialInput?: Record<string, unknown>;
+  windowId?: string;
+  pluginMetadata?: PluginMetadataMap;
 }
 
 export interface CreateTabResponse {
@@ -268,6 +378,7 @@ export interface VoiceAction {
   id?: string;
   targetTabId?: string;
   pluginId?: PluginId;
+  hookId?: HookId;
   action: string;
   input: Record<string, unknown>;
   reason?: string;
@@ -340,6 +451,7 @@ export interface WorkspaceWindow {
   name: string;
   defaultCwd: string;
   layout: TabLayoutState;
+  pluginMetadata?: PluginMetadataMap;
   createdAt: string;
   updatedAt: string;
 }
@@ -347,12 +459,14 @@ export interface WorkspaceWindow {
 export interface CreateWorkspaceWindowRequest {
   name?: string;
   defaultCwd?: string;
+  pluginMetadata?: PluginMetadataMap;
 }
 
 export interface UpdateWorkspaceWindowRequest {
   name?: string;
   defaultCwd?: string;
   layout?: TabLayoutState;
+  pluginMetadata?: PluginMetadataPatch;
 }
 
 export interface WorkspaceLayoutTemplateTab {
@@ -457,6 +571,7 @@ export function parseVoiceAction(value: unknown, index = 0): VoiceAction {
     id: typeof value.id === "string" ? value.id : undefined,
     targetTabId: typeof value.targetTabId === "string" ? value.targetTabId : undefined,
     pluginId: typeof value.pluginId === "string" ? value.pluginId : undefined,
+    hookId: typeof value.hookId === "string" ? value.hookId : undefined,
     action: value.action,
     input: stripNullishValues(value.input),
     reason: typeof value.reason === "string" ? value.reason : undefined
@@ -464,5 +579,9 @@ export function parseVoiceAction(value: unknown, index = 0): VoiceAction {
 }
 
 function stripNullishValues(input: Record<string, unknown>): Record<string, unknown> {
-  return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== null && value !== undefined));
+  return Object.fromEntries(
+    Object.entries(input)
+      .filter(([, value]) => value !== null && value !== undefined)
+      .map(([key, value]) => [key, isRecord(value) ? stripNullishValues(value) : value])
+  );
 }

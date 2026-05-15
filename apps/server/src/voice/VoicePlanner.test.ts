@@ -19,8 +19,9 @@ describe("buildVoicePrompt", () => {
     expect(prompt).toContain("transcript is ASR output and is often wrong");
     expect(prompt).toContain("read that session's voiceContext and history.text");
     expect(prompt).toContain("handlesUnhandledVoice");
+    expect(prompt).toContain("hookId");
     expect(prompt).toContain("if the transcript says 'run pink' in a terminal context, infer 'run ping'");
-    expect(prompt).toContain("Plugin descriptions, action descriptions, input schemas, voiceContext, and history are authoritative");
+    expect(prompt).toContain("Plugin descriptions, hook descriptions, action descriptions, input schemas, voiceContext, and history are authoritative");
     expect(prompt).toContain("standardized plugin voiceContext");
     expect(prompt).toContain("do not invent plugin capabilities");
     expect(prompt).toContain("exact pane ids");

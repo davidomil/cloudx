@@ -1,3 +1,5 @@
+import path from "node:path";
+
 import type {
   CreatePluginSessionInput,
   PluginActionDefinition,
@@ -7,8 +9,9 @@ import type {
   PluginVoiceContext,
   WorkspacePlugin
 } from "@cloudx/plugin-api";
-import type { WorkspaceTab } from "@cloudx/shared";
+import { RULES_SKILLS_PLUGIN_ID, isRecord, type PersonalityProfile, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
 
+import { buildCodexProfileInjection } from "./CodexProfileInjection.js";
 import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
 import { buildLoginShellCommandLaunch, buildToolEnv, resolveAssistantCommand } from "../terminal/ShellLaunch.js";
 
@@ -57,11 +60,13 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
   }
 
   async createSession(input: CreatePluginSessionInput): Promise<PluginSession> {
-    const env = buildToolEnv(process.env);
-    const launch = buildLoginShellCommandLaunch(resolveAssistantCommand(env, "codex"), [], env);
+    const profile = profileFromRuntimeContext(input.runtimeContext);
+    const launchProfile = materializeCodexProfile(profile, process.env);
+    const command = launchProfile.command;
+    const launch = buildLoginShellCommandLaunch(command, launchProfile.args, launchProfile.env);
     const terminalProcess = await this.factory.spawn(launch.command, launch.args, {
       cwd: input.cwd,
-      env,
+      env: launchProfile.env,
       cols: 100,
       rows: 30
     });
@@ -71,9 +76,74 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       replayBytes: this.replayBytes,
       submitDelayMs: CODEX_SUBMIT_DELAY_MS,
       voiceKind: "codex-terminal",
-      voiceSummary: "Interactive Codex CLI terminal. Send natural-language coding instructions here."
+      voiceSummary: launchProfile.voiceSummary,
+      profileName: launchProfile.profileName
     });
   }
+}
+
+function profileFromRuntimeContext(runtimeContext: WorkspaceRuntimeContext | undefined): PersonalityProfile | undefined {
+  const rulesSkillsRuntime = runtimeContext?.pluginRuntime?.[RULES_SKILLS_PLUGIN_ID];
+  const personalityProfile = rulesSkillsRuntime?.personalityProfile;
+  if (!isRecord(personalityProfile)) {
+    return undefined;
+  }
+  const profile = personalityProfile.profile;
+  return isPersonalityProfile(profile) ? profile : undefined;
+}
+
+function isPersonalityProfile(value: unknown): value is PersonalityProfile {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.name === "string" &&
+    (value.color === "green" || value.color === "yellow" || value.color === "red") &&
+    (value.assistantCommand === undefined || typeof value.assistantCommand === "string") &&
+    (value.rulesText === undefined || typeof value.rulesText === "string") &&
+    Array.isArray(value.enabledSkillIds) &&
+    value.enabledSkillIds.every((skillId) => typeof skillId === "string") &&
+    Array.isArray(value.enabledPluginIds) &&
+    value.enabledPluginIds.every((pluginId) => typeof pluginId === "string") &&
+    (value.env === undefined || (isRecord(value.env) && Object.values(value.env).every((envValue) => typeof envValue === "string")))
+  );
+}
+
+export interface MaterializedCodexProfile {
+  command: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+  injectionPrompt?: string;
+  voiceSummary: string;
+  profileName?: string;
+}
+
+export function materializeCodexProfile(profile: PersonalityProfile | undefined, baseEnv: NodeJS.ProcessEnv): MaterializedCodexProfile {
+  const env = {
+    ...buildToolEnv(baseEnv),
+    ...(profile?.env ?? {})
+  };
+  const injection = buildCodexProfileInjection(profile, env);
+  if (profile) {
+    env.CLOUDX_PERSONALITY_PROFILE_ID = profile.id;
+    env.CLOUDX_PERSONALITY_PROFILE_NAME = profile.name;
+    env.CLOUDX_ENABLED_SKILL_IDS = profile.enabledSkillIds.join(",");
+    env.CLOUDX_ENABLED_PLUGIN_IDS = profile.enabledPluginIds.join(",");
+    if (injection.prompt) {
+      env.CLOUDX_PERSONALITY_INJECTION = "prompt-argument";
+      env.CLOUDX_PERSONALITY_SKILL_PATHS = injection.skillDocuments.map((skill) => skill.filePath).join(path.delimiter);
+    }
+    if (profile.rulesText?.trim()) {
+      env.CLOUDX_PERSONALITY_RULES = profile.rulesText.trim();
+    }
+  }
+  return {
+    command: profile?.assistantCommand?.trim() || resolveAssistantCommand(env, "codex"),
+    args: injection.prompt ? [injection.prompt] : [],
+    env,
+    injectionPrompt: injection.prompt,
+    voiceSummary: profile?.name ? `Interactive Codex CLI terminal using the ${profile.name} profile.` : "Interactive Codex CLI terminal. Send natural-language coding instructions here.",
+    profileName: profile?.name
+  };
 }
 
 function terminalActions(options: { enterTextDescription: string; enterTextHandlesUnhandledVoice?: boolean }): PluginActionDefinition[] {
@@ -137,6 +207,7 @@ interface TerminalSessionOptions {
   submitDelayMs?: number;
   voiceKind?: "codex-terminal" | "standard-terminal" | "terminal";
   voiceSummary?: string;
+  profileName?: string;
 }
 
 export interface TerminalCommandFinishEvent {
@@ -270,7 +341,8 @@ export class CodexTerminalSession implements PluginSession {
       recentOutput,
       metadata: {
         outputBytes: Buffer.byteLength(this.recentOutput, "utf8"),
-        replayBytes: this.replayBytes
+        replayBytes: this.replayBytes,
+        profileName: this.options.profileName
       }
     };
   }

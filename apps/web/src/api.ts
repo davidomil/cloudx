@@ -6,6 +6,8 @@ import type {
   CreateTabResponse,
   CreateWorkspaceLayoutTemplateRequest,
   CreateWorkspaceWindowRequest,
+  HookCallResponse,
+  HookDescriptor,
   PathOptionsResponse,
   PathOption,
   PluginDescriptor,
@@ -58,6 +60,11 @@ function errorMessageFromResponse(text: string, status: number): string {
 export async function getPlugins(): Promise<PluginDescriptor[]> {
   const body = await fetchJson<{ plugins: PluginDescriptor[] }>("/api/plugins");
   return body.plugins;
+}
+
+export async function getHooks(): Promise<HookDescriptor[]> {
+  const body = await fetchJson<{ hooks: HookDescriptor[] }>("/api/hooks");
+  return body.hooks;
 }
 
 export async function getConfig(): Promise<CloudxConfigResponse> {
@@ -165,6 +172,14 @@ export async function runTabAction<T>(tabId: string, action: string, input: Reco
     body: JSON.stringify({ action, input })
   });
   return body.result;
+}
+
+export async function callHook<T extends Record<string, unknown> = Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}, targetTabId?: string): Promise<T> {
+  const body = await fetchJson<HookCallResponse>(`/api/hooks/${encodeURIComponent(hookId)}`, {
+    method: "POST",
+    body: JSON.stringify({ input, targetTabId })
+  });
+  return body.result as T;
 }
 
 export type VoiceClientContext = Record<string, unknown>;

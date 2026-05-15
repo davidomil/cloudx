@@ -324,6 +324,7 @@ export class InstallerRunner {
 export async function runInstaller(options = {}) {
   const root = options.repoRoot ?? repoRoot;
   const home = options.home ?? os.homedir();
+  const env = options.env ?? process.env;
   const answers = options.answers ?? {};
   const yes = options.yes ?? false;
   const dryRun = options.dryRun ?? false;
@@ -333,20 +334,20 @@ export async function runInstaller(options = {}) {
   assertSupportedPlatform(osRelease);
   const networkInterfaces = options.networkInterfaces ?? os.networkInterfaces();
 
-  const paths = installerPaths({ repoRoot: root, home });
+  const paths = installerPaths({ repoRoot: root, home, env });
   const commands = commandMap(runner);
   if (options.uninstall) {
     return await runUninstaller({ paths, commands, runner, prompt, dryRun });
   }
   section(options.update ? "1/9 Install and verify Ubuntu prerequisites" : "1/8 Install and verify Ubuntu prerequisites");
-  if (process.env.CLOUDX_INSTALL_BOOTSTRAPPED === "1") {
+  if (env.CLOUDX_INSTALL_BOOTSTRAPPED === "1") {
     console.log("Shell bootstrap already installed Ubuntu packages. Verifying Node.js and npm.");
     verifyNodeAndNpm(commands);
   } else {
     installUbuntuPrerequisites(commands);
   }
   if (options.update) {
-    return await runUpdater({ paths, commands, runner, prompt, noStart: options.noStart, networkInterfaces });
+    return await runUpdater({ paths, commands, runner, prompt, noStart: options.noStart, networkInterfaces, env });
   }
   const gpuDetected = options.gpuDetected ?? commands.exists("nvidia-smi");
   const cudaRuntimeReady = options.cudaRuntimeReady ?? detectCudaRuntime(commands);
@@ -366,7 +367,7 @@ export async function runInstaller(options = {}) {
   section("2/8 Verify Codex CLI");
   await ensureCodex(commands, prompt);
   const assistantBin = commands.which("codex");
-  const toolPath = toolPathFor(assistantBin, commands.capture("npm", ["prefix", "-g"]), process.env.PATH);
+  const toolPath = toolPathFor(assistantBin, commands.capture("npm", ["prefix", "-g"]), env.PATH);
 
   section("3/8 Collect install choices");
   explainQuestion(
@@ -536,7 +537,7 @@ async function runUninstaller({ paths, commands, runner, prompt }) {
   return { runner, paths, removed: { removeServices, removeConfig, removeVenv, removeRuntimeData, removeModel, removeNodeModules, disableLinger } };
 }
 
-async function runUpdater({ paths, commands, runner, prompt, noStart, networkInterfaces }) {
+async function runUpdater({ paths, commands, runner, prompt, noStart, networkInterfaces, env }) {
   section("Cloudx update wizard");
   console.log("This updates an existing Cloudx checkout and local install. It keeps your saved Cloudx environment config.");
   console.log(`Repository: ${paths.repoRoot}`);
@@ -548,7 +549,7 @@ async function runUpdater({ paths, commands, runner, prompt, noStart, networkInt
   const servicesInstalled = SERVICE_NAMES.every((serviceName) => fs.existsSync(path.join(paths.systemdDir, serviceName)));
 
   section("2/9 Pull latest Cloudx checkout");
-  if (process.env.CLOUDX_INSTALL_ALREADY_PULLED === "1") {
+  if (env.CLOUDX_INSTALL_ALREADY_PULLED === "1") {
     console.log("Checkout was already pulled by install.sh.");
   } else {
     commands.run("git", ["pull", "--ff-only"]);
@@ -561,7 +562,7 @@ async function runUpdater({ paths, commands, runner, prompt, noStart, networkInt
     paths.envPath,
     updateEnvFileContent(readText(paths.envPath, ""), {
       CLOUDX_ASSISTANT_BIN: assistantBin,
-      CLOUDX_TOOL_PATH: toolPathFor(assistantBin, commands.capture("npm", ["prefix", "-g"]), process.env.PATH)
+      CLOUDX_TOOL_PATH: toolPathFor(assistantBin, commands.capture("npm", ["prefix", "-g"]), env.PATH)
     })
   );
 
@@ -789,7 +790,7 @@ async function updateCodex(commands, prompt) {
   }
 }
 
-function installerPaths({ repoRoot: root, home }) {
+function installerPaths({ repoRoot: root, home, env = process.env }) {
   const asrDir = path.join(root, "services/asr");
   const venvDir = path.join(asrDir, ".venv");
   const configDir = path.join(home, ".config/cloudx");
@@ -800,7 +801,7 @@ function installerPaths({ repoRoot: root, home }) {
     pipPath: path.join(venvDir, "bin/pip"),
     hfPath: path.join(venvDir, "bin/hf"),
     uvicornPath: path.join(venvDir, "bin/uvicorn"),
-    modelDir: process.env.CLOUDX_ASR_MODEL_PATH ?? path.join(home, ".cache/cloudx/models/faster-whisper-large-v3"),
+    modelDir: env.CLOUDX_ASR_MODEL_PATH ?? path.join(home, ".cache/cloudx/models/faster-whisper-large-v3"),
     dataDir: path.join(root, ".cloudx"),
     configDir,
     envPath: path.join(configDir, "cloudx.env"),

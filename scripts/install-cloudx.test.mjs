@@ -23,6 +23,8 @@ import {
   validateCpuThreads
 } from "./install-cloudx.mjs";
 
+const TEST_ENV = { PATH: "/usr/bin" };
+
 describe("install-cloudx helpers", () => {
   it("parses Ubuntu os-release files", () => {
     expect(parseOsRelease('ID=ubuntu\nVERSION_ID="24.04"\nPRETTY_NAME="Ubuntu 24.04.4 LTS"\n')).toMatchObject({
@@ -156,6 +158,7 @@ describe("runInstaller dry-run", () => {
     const result = await runInstaller({
       repoRoot: "/repo",
       home: "/home/me",
+      env: TEST_ENV,
       dryRun: true,
       yes: true,
       runner,
@@ -193,6 +196,7 @@ describe("runInstaller dry-run", () => {
     await runInstaller({
       repoRoot: "/repo",
       home: "/home/me",
+      env: TEST_ENV,
       dryRun: true,
       yes: true,
       runner,
@@ -239,6 +243,7 @@ describe("runInstaller dry-run", () => {
     const result = await runInstaller({
       repoRoot: "/repo",
       home: "/home/me",
+      env: TEST_ENV,
       dryRun: true,
       yes: true,
       uninstall: true,
@@ -276,6 +281,7 @@ describe("runInstaller dry-run", () => {
     await runInstaller({
       repoRoot: "/repo",
       home: "/home/me",
+      env: TEST_ENV,
       dryRun: true,
       yes: true,
       uninstall: true,
@@ -313,6 +319,7 @@ describe("runInstaller dry-run", () => {
     const result = await runInstaller({
       repoRoot: root,
       home,
+      env: TEST_ENV,
       dryRun: true,
       yes: true,
       update: true,

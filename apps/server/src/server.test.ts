@@ -3,16 +3,20 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import WebSocket, { WebSocketServer } from "ws";
+
+import { RULES_SKILLS_PLUGIN_ID } from "@cloudx/shared";
 
 import type { AppConfig } from "./config.js";
 import { TabContextService } from "./context/TabContextService.js";
+import { HookRegistry } from "./hooks/HookRegistry.js";
 import { PluginRegistry } from "./pluginRegistry.js";
 import { LocalWebPlugin } from "./plugins/LocalWebPlugin.js";
 import { PathPolicy } from "./pathPolicy.js";
 import { buildServer, type AppServices } from "./server.js";
 import { SessionStore } from "./sessionStore.js";
+import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
 
 describe("buildServer", () => {
   it("exposes server-backed workspace windows", async () => {
@@ -55,6 +59,85 @@ describe("buildServer", () => {
 
       expect(result.statusCode).toBe(200);
       expect(result.json().matches[0].window.name).toBe("Server Routes");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("refreshes runtime indicators when window plugin metadata changes", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-window-profile-route-"));
+    const config = testConfig(root);
+    const registry = new PluginRegistry();
+    const pathPolicy = new PathPolicy([root]);
+    const workspace = new WorkspaceLayoutStore(config.dataDir, pathPolicy);
+    const sessions = new SessionStore(registry, pathPolicy, new TabContextService(config.dataDir), { getPluginConfig: () => ({}) }, workspace);
+    const refreshRuntimeIndicators = vi.spyOn(sessions, "refreshRuntimeIndicators").mockResolvedValue();
+    const app = await buildServer(config, {
+      plugins: registry,
+      sessions,
+      pathPolicy,
+      voice: {},
+      asr: {},
+      workspace,
+      hooks: new HookRegistry()
+    } as AppServices);
+    try {
+      const window = await workspace.createWindow({ name: "Profiled", defaultCwd: root });
+      const response = await app.inject({
+        method: "PATCH",
+        url: `/api/windows/${window.id}`,
+        payload: { pluginMetadata: { [RULES_SKILLS_PLUGIN_ID]: { selectedProfileId: "focused" } } }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(refreshRuntimeIndicators).toHaveBeenCalledWith(window.id);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("exposes app and plugin hooks through the hook API", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-hooks-route-"));
+    const config = testConfig(root);
+    const app = await buildServer(config);
+    try {
+      const hooks = await app.inject({ method: "GET", url: "/api/hooks" });
+      expect(hooks.statusCode).toBe(200);
+      expect(hooks.json().hooks.map((hook: { id: string }) => hook.id)).toEqual(
+        expect.arrayContaining(["workspace.tabs.create", "local-web.openUrl", "audio-ai.submitTranscript"])
+      );
+
+      const plugins = await app.inject({ method: "GET", url: "/api/plugins" });
+      expect(plugins.json().plugins.find((plugin: { id: string }) => plugin.id === "audio-ai").uiContributions).toEqual(
+        expect.arrayContaining([expect.objectContaining({ slot: "app.footer.actions", renderer: "audio-ai.voice-console" })])
+      );
+      expect(plugins.json().plugins.find((plugin: { id: string }) => plugin.id === "local-web").uiContributions).toEqual(
+        expect.arrayContaining([expect.objectContaining({ id: "local-web.tabIndicator", slot: "tab.indicator", renderer: "status-dot", targetPluginId: "local-web" })])
+      );
+
+      const created = await app.inject({
+        method: "POST",
+        url: "/api/hooks/workspace.tabs.create",
+        payload: {
+          input: {
+            pluginId: "local-web",
+            initialInput: { url: "http://127.0.0.1:5173/?token=abc" }
+          }
+        }
+      });
+      expect(created.statusCode).toBe(200);
+      const tabId = created.json().result.tab.id as string;
+
+      const opened = await app.inject({
+        method: "POST",
+        url: "/api/hooks/local-web.openUrl",
+        payload: {
+          targetTabId: tabId,
+          input: { url: "http://127.0.0.1:5174/dashboard" }
+        }
+      });
+      expect(opened.statusCode).toBe(200);
+      expect(opened.json().result.url).toBe("http://127.0.0.1:5174/dashboard");
     } finally {
       await app.close();
     }

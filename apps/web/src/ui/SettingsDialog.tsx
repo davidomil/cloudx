@@ -1,20 +1,43 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
-import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, ConfigValue } from "@cloudx/shared";
+import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, ConfigValue, PersonalityProfileStore } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
+import { ProfileSelect } from "./RulesSkillsPanel.js";
 
-export function SettingsDialog({ config, onCancel, onSave }: { config: CloudxConfigResponse; onCancel: () => void; onSave: (values: CloudxConfigValues) => Promise<void> }) {
+export function SettingsDialog({
+  config,
+  profileStore,
+  onCancel,
+  onSave,
+  onSaveDefaultProfile,
+  children
+}: {
+  config: CloudxConfigResponse;
+  profileStore?: PersonalityProfileStore;
+  onCancel: () => void;
+  onSave: (values: CloudxConfigValues) => Promise<void>;
+  onSaveDefaultProfile?: (profileId: string | undefined) => Promise<void>;
+  children?: ReactNode;
+}) {
   const [values, setValues] = useState<CloudxConfigValues>(() => structuredClone(config.values));
+  const [defaultProfileId, setDefaultProfileId] = useState(profileStore?.defaultProfileId ?? "");
   const [busy, setBusy] = useState(false);
   const dialogRef = useRef<HTMLDivElement | null>(null);
 
   useOutsidePointerDismiss(true, dialogRef, onCancel);
 
+  useEffect(() => {
+    setDefaultProfileId(profileStore?.defaultProfileId ?? "");
+  }, [profileStore?.defaultProfileId]);
+
   async function save() {
     setBusy(true);
     try {
+      if (profileStore && onSaveDefaultProfile && defaultProfileId !== (profileStore.defaultProfileId ?? "")) {
+        await onSaveDefaultProfile(defaultProfileId || undefined);
+      }
       await onSave(values);
     } finally {
       setBusy(false);
@@ -47,7 +70,17 @@ export function SettingsDialog({ config, onCancel, onSave }: { config: CloudxCon
           {config.globalFields.map((field) => (
             <ConfigField key={field.key} field={field} value={values.global[field.key] ?? field.defaultValue} onChange={(value) => setGlobalValue(field.key, value)} />
           ))}
+          {profileStore ? (
+            <ProfileSelect
+              value={defaultProfileId}
+              profiles={profileStore.profiles}
+              defaultProfileId={defaultProfileId}
+              onChange={setDefaultProfileId}
+              label="Default personality"
+            />
+          ) : null}
         </section>
+        {children}
         <section className="settings-section">
           <h3>Plugins</h3>
           {config.plugins.length ? (

@@ -3,13 +3,17 @@ import os from "node:os";
 import path from "node:path";
 
 import type { CreatePluginSessionInput, PluginSession, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
-import type { WorkspaceTab } from "@cloudx/shared";
+import { pluginActionHookId } from "@cloudx/plugin-api";
+import { RULES_SKILLS_PLUGIN_ID, type WorkspaceTab } from "@cloudx/shared";
 import { describe, expect, it } from "vitest";
 
 import { TabContextService } from "./context/TabContextService.js";
 import { PathPolicy } from "./pathPolicy.js";
 import { PluginRegistry } from "./pluginRegistry.js";
-import { SessionStore } from "./sessionStore.js";
+import { SessionStore, type SessionRuntimeContextResolver } from "./sessionStore.js";
+import { HookRegistry } from "./hooks/HookRegistry.js";
+import { registerCoreHooks } from "./hooks/coreHooks.js";
+import { registerPluginActionHooks } from "./hooks/pluginActionHooks.js";
 import { LocalWebPlugin } from "./plugins/LocalWebPlugin.js";
 import { WorkspaceControlPlugin, WORKSPACE_CONTROL_PLUGIN_ID } from "./plugins/WorkspaceControlPlugin.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
@@ -251,6 +255,69 @@ describe("SessionStore voice actions", () => {
     });
   });
 
+  it("includes voice-exposed hooks in voice context", async () => {
+    const { store, root, registry } = await createStore();
+    const hooks = new HookRegistry();
+    registerPluginActionHooks(hooks, registry, store);
+    store.setHookRegistry(hooks);
+    const tab = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Codex" });
+
+    const context = await store.buildVoiceContext(tab.id);
+
+    expect(context.hooks).toEqual(expect.arrayContaining([expect.objectContaining({ id: "fake-default.enterText", exposures: expect.arrayContaining(["voice"]) })]));
+    expect(context.sessions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          tabId: tab.id,
+          voiceHooks: expect.arrayContaining([expect.objectContaining({ id: "fake-default.enterText" })])
+        })
+      ])
+    );
+  });
+
+  it("executes plugin actions through voice hook ids", async () => {
+    const { store, root, registry } = await createStore();
+    const hooks = new HookRegistry();
+    registerPluginActionHooks(hooks, registry, store);
+    store.setHookRegistry(hooks);
+    const tab = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Shell" });
+
+    const result = await store.executeVoiceAction({
+      hookId: pluginActionHookId("fake-default", "enter_text"),
+      targetTabId: tab.id,
+      pluginId: "fake-default",
+      action: "enter_text",
+      input: { text: "ls", submit: true }
+    });
+
+    expect(result).toEqual({ action: "enter_text", input: { text: "ls", submit: true } });
+  });
+
+  it("executes workspace controls through voice hook ids", async () => {
+    const { store, root, registry, pathPolicy, workspace } = await createStore({ withWorkspace: true });
+    const hooks = new HookRegistry();
+    registerCoreHooks(hooks, { sessions: store, plugins: registry, pathPolicy, workspace: workspace! });
+    store.setHookRegistry(hooks);
+
+    const result = await store.executeVoiceAction({
+      hookId: "workspace.tabs.create",
+      action: "workspace.tabs.create",
+      input: {
+        pluginId: "fake-default",
+        cwd: root,
+        title: "Voice Hook",
+        paneId: "pane-2",
+        newPane: true,
+        splitDirection: "row"
+      }
+    });
+
+    expect(result).toMatchObject({
+      tab: { pluginId: "fake-default", title: "Voice Hook", cwd: root },
+      layoutInstruction: { type: "open_tab_in_new_pane", paneId: "pane-2", splitDirection: "row" }
+    });
+  });
+
   it("executes workspace-control tab switching by title", async () => {
     const { store, root } = await createStore();
     const alpha = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Alpha" });
@@ -414,6 +481,78 @@ describe("SessionStore voice actions", () => {
 
     expect(() => plugin.lastSession?.emitData("late output")).not.toThrow();
   });
+
+  it("passes resolved runtime context and updates tab profile metadata", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-session-profile-"));
+    const plugin = new FakeDefaultPlugin();
+    const registry = new PluginRegistry();
+    registry.register(plugin);
+    const pathPolicy = new PathPolicy([root]);
+    const workspace = new WorkspaceLayoutStore(path.join(root, ".cloudx"), pathPolicy);
+    const resolver: SessionRuntimeContextResolver = {
+      runtimeContextFor: (tab, window) => ({
+        activeWindowId: window?.id,
+        tabPluginMetadata: tab.pluginMetadata,
+        pluginRuntime: {
+          [RULES_SKILLS_PLUGIN_ID]: {
+            personalityProfile: { source: "tab", profile: { id: "focused", name: "Focused", color: "yellow", enabledSkillIds: [], enabledPluginIds: [] } }
+          }
+        }
+      }),
+      tabIndicatorFor: (tab) => {
+        const metadata = tab.pluginMetadata?.[RULES_SKILLS_PLUGIN_ID];
+        return metadata ? { color: "yellow", label: "Focused" } : undefined;
+      }
+    };
+    const store = new SessionStore(registry, pathPolicy, new TabContextService(path.join(root, ".cloudx")), { getPluginConfig: () => ({}) }, workspace, resolver);
+
+    const tab = await store.createTab({
+      pluginId: "fake-default",
+      cwd: root,
+      pluginMetadata: { [RULES_SKILLS_PLUGIN_ID]: { selectedProfileId: "focused" } }
+    });
+
+    expect(plugin.lastInput?.runtimeContext).toMatchObject({
+      activeWindowId: expect.stringMatching(/^window-/),
+      pluginRuntime: { [RULES_SKILLS_PLUGIN_ID]: { personalityProfile: { profile: { id: "focused" } } } }
+    });
+    expect(tab.indicator).toMatchObject({ color: "yellow", label: "Focused" });
+
+    const cleared = await store.updateTabPluginMetadata(tab.id, RULES_SKILLS_PLUGIN_ID, null);
+    expect(cleared.pluginMetadata?.[RULES_SKILLS_PLUGIN_ID]).toBeUndefined();
+  });
+
+  it("refreshes tab indicators from updated window runtime metadata", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-session-window-profile-"));
+    const plugin = new FakeDefaultPlugin();
+    const registry = new PluginRegistry();
+    registry.register(plugin);
+    const pathPolicy = new PathPolicy([root]);
+    const workspace = new WorkspaceLayoutStore(path.join(root, ".cloudx"), pathPolicy);
+    const window = workspace.getActiveWindow();
+    const resolver: SessionRuntimeContextResolver = {
+      runtimeContextFor: (tab, activeWindow) => ({
+        activeWindowId: activeWindow?.id,
+        windowPluginMetadata: activeWindow?.pluginMetadata,
+        tabPluginMetadata: tab.pluginMetadata
+      }),
+      tabIndicatorFor: (_tab, activeWindow) => {
+        const metadata = activeWindow?.pluginMetadata?.[RULES_SKILLS_PLUGIN_ID];
+        if (!metadata || typeof metadata !== "object" || !("selectedProfileId" in metadata)) {
+          return undefined;
+        }
+        return { color: "red", label: String(metadata.selectedProfileId) };
+      }
+    };
+    const store = new SessionStore(registry, pathPolicy, new TabContextService(path.join(root, ".cloudx")), { getPluginConfig: () => ({}) }, workspace, resolver);
+    const tab = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Shell" });
+    await workspace.updateWindow(window.id, { layout: layoutWithTab(tab.id) });
+
+    await workspace.updateWindow(window.id, { pluginMetadata: { [RULES_SKILLS_PLUGIN_ID]: { selectedProfileId: "review" } } });
+    await store.refreshRuntimeIndicators(window.id);
+
+    expect(store.getTab(tab.id).indicator).toMatchObject({ color: "red", label: "review" });
+  });
 });
 
 async function createStore(pluginOptions: { handlesUnhandledVoice?: boolean; withWorkspace?: boolean } = {}) {
@@ -424,10 +563,20 @@ async function createStore(pluginOptions: { handlesUnhandledVoice?: boolean; wit
   registry.register(new WorkspaceControlPlugin());
   const pathPolicy = new PathPolicy([root]);
   const workspace = pluginOptions.withWorkspace ? new WorkspaceLayoutStore(path.join(root, ".cloudx"), pathPolicy) : undefined;
+  const store = new SessionStore(registry, pathPolicy, new TabContextService(path.join(root, ".cloudx")), { getPluginConfig: () => ({}) }, workspace);
   return {
     plugin,
+    registry,
+    pathPolicy,
     root,
     workspace,
-    store: new SessionStore(registry, pathPolicy, new TabContextService(path.join(root, ".cloudx")), { getPluginConfig: () => ({}) }, workspace)
+    store
+  };
+}
+
+function layoutWithTab(tabId: string) {
+  return {
+    root: { type: "pane" as const, pane: { id: "pane-test", tabIds: [tabId], activeTabId: tabId } },
+    activePaneId: "pane-test"
   };
 }

@@ -1,8 +1,12 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { TabIndicatorUpdate, WorkspaceTab } from "@cloudx/shared";
 
-import { CodexTerminalPlugin, CodexTerminalSession, TerminalShellIntegrationParser } from "./CodexTerminalPlugin.js";
+import { CodexTerminalPlugin, CodexTerminalSession, TerminalShellIntegrationParser, materializeCodexProfile } from "./CodexTerminalPlugin.js";
 import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
 
 class FakeTerminalProcess implements TerminalProcess {
@@ -50,10 +54,12 @@ class FakeTerminalProcess implements TerminalProcess {
 class CapturingFactory implements TerminalProcessFactory {
   command: string | undefined;
   args: string[] | undefined;
+  env: NodeJS.ProcessEnv | undefined;
 
-  async spawn(command: string, args: string[]): Promise<TerminalProcess> {
+  async spawn(command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; cols: number; rows: number }): Promise<TerminalProcess> {
     this.command = command;
     this.args = args;
+    this.env = options.env;
     return new FakeTerminalProcess();
   }
 }
@@ -68,10 +74,14 @@ const tab: WorkspaceTab = {
   createdAt: new Date(0).toISOString(),
   updatedAt: new Date(0).toISOString()
 };
+const tempCodexHomes: string[] = [];
 
 describe("CodexTerminalPlugin", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
+    for (const codexHome of tempCodexHomes.splice(0)) {
+      fs.rmSync(codexHome, { recursive: true, force: true });
+    }
   });
 
   it("launches Codex through the user's login shell", async () => {
@@ -85,7 +95,144 @@ describe("CodexTerminalPlugin", () => {
     expect(factory.command).toBe("/bin/bash");
     expect(factory.args).toEqual(["-lc", "exec /usr/bin/codex"]);
   });
+
+  it("uses assistant command and environment from the resolved personality profile", async () => {
+    vi.stubEnv("SHELL", "/bin/bash");
+    vi.stubEnv("CODEX_HOME", createCodexHome({ "code-review": "Code review skill instructions." }));
+    const factory = new CapturingFactory();
+    const plugin = new CodexTerminalPlugin(factory);
+
+    await plugin.createSession({
+      tab,
+      cwd: "/tmp",
+      controls: { setTabIndicator: () => undefined, closeTab: () => undefined },
+      runtimeContext: {
+        pluginRuntime: {
+          "rules-skills": {
+            personalityProfile: {
+              source: "tab",
+              profile: {
+                id: "claude",
+                name: "Claude",
+                color: "yellow",
+                assistantCommand: "/usr/bin/claude",
+                rulesText: "Review carefully.",
+                enabledSkillIds: ["code-review"],
+                enabledPluginIds: ["file-browser"],
+                env: { CLOUDX_PROFILE: "claude" }
+              }
+            }
+          }
+        }
+      }
+    });
+
+    expect(factory.args?.[0]).toBe("-lc");
+    expect(factory.args?.[1]).toContain("exec /usr/bin/claude");
+    expect(factory.args?.[1]).toContain("Review carefully.");
+    expect(factory.args?.[1]).toContain("Code review skill instructions.");
+    expect(factory.env?.CLOUDX_PROFILE).toBe("claude");
+    expect(factory.env).toMatchObject({
+      CLOUDX_PERSONALITY_PROFILE_ID: "claude",
+      CLOUDX_PERSONALITY_PROFILE_NAME: "Claude",
+      CLOUDX_PERSONALITY_INJECTION: "prompt-argument",
+      CLOUDX_PERSONALITY_RULES: "Review carefully.",
+      CLOUDX_ENABLED_SKILL_IDS: "code-review",
+      CLOUDX_ENABLED_PLUGIN_IDS: "file-browser"
+    });
+  });
+
+  it("materializes stored profile fields into launch environment for wrapper commands", () => {
+    const codexHome = createCodexHome({
+      reviewer: "Reviewer skill instructions.",
+      testing: "Testing skill instructions."
+    });
+    const launch = materializeCodexProfile(
+      {
+        id: "review",
+        name: "Review",
+        color: "red",
+        rulesText: "Find correctness issues.",
+        enabledSkillIds: ["reviewer", "testing"],
+        enabledPluginIds: ["file-browser"],
+        env: { CUSTOM_ENV: "1" }
+      },
+      { CLOUDX_ASSISTANT_BIN: "/usr/bin/codex", CODEX_HOME: codexHome }
+    );
+
+    expect(launch.command).toBe("/usr/bin/codex");
+    expect(launch.args).toHaveLength(1);
+    expect(launch.injectionPrompt).toContain("Find correctness issues.");
+    expect(launch.injectionPrompt).toContain("Reviewer skill instructions.");
+    expect(launch.injectionPrompt).toContain("Testing skill instructions.");
+    expect(launch.env).toMatchObject({
+      CUSTOM_ENV: "1",
+      CLOUDX_PERSONALITY_PROFILE_ID: "review",
+      CLOUDX_PERSONALITY_PROFILE_NAME: "Review",
+      CLOUDX_PERSONALITY_INJECTION: "prompt-argument",
+      CLOUDX_PERSONALITY_RULES: "Find correctness issues.",
+      CLOUDX_ENABLED_SKILL_IDS: "reviewer,testing",
+      CLOUDX_ENABLED_PLUGIN_IDS: "file-browser"
+    });
+    expect(launch.voiceSummary).toContain("Review");
+  });
+
+  it("fails clearly when a selected skill cannot be materialized", () => {
+    const codexHome = createCodexHome({});
+
+    expect(() =>
+      materializeCodexProfile(
+        {
+          id: "review",
+          name: "Review",
+          color: "red",
+          enabledSkillIds: ["missing-skill"],
+          enabledPluginIds: []
+        },
+        { CLOUDX_ASSISTANT_BIN: "/usr/bin/codex", CODEX_HOME: codexHome }
+      )
+    ).toThrow(/missing-skill.*SKILL\.md/);
+  });
+
+  it("loads system and plugin-qualified skill instructions", () => {
+    const codexHome = createCodexHome({});
+    writeSkillFile(codexHome, ["skills", ".system", "plugin-creator"], "System plugin creator instructions.");
+    writeSkillFile(
+      codexHome,
+      ["plugins", "cache", "openai-curated", "build-web-apps", "b8edb371", "skills", "react-best-practices"],
+      "React best practices instructions."
+    );
+
+    const launch = materializeCodexProfile(
+      {
+        id: "frontend",
+        name: "Frontend",
+        color: "green",
+        enabledSkillIds: ["plugin-creator", "build-web-apps:react-best-practices"],
+        enabledPluginIds: []
+      },
+      { CLOUDX_ASSISTANT_BIN: "/usr/bin/codex", CODEX_HOME: codexHome }
+    );
+
+    expect(launch.injectionPrompt).toContain("System plugin creator instructions.");
+    expect(launch.injectionPrompt).toContain("React best practices instructions.");
+  });
 });
+
+function createCodexHome(skills: Record<string, string>): string {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-codex-home-"));
+  tempCodexHomes.push(codexHome);
+  for (const [skillId, content] of Object.entries(skills)) {
+    writeSkillFile(codexHome, ["skills", skillId], content);
+  }
+  return codexHome;
+}
+
+function writeSkillFile(codexHome: string, segments: string[], content: string): void {
+  const skillDir = path.join(codexHome, ...segments);
+  fs.mkdirSync(skillDir, { recursive: true });
+  fs.writeFileSync(path.join(skillDir, "SKILL.md"), content);
+}
 
 describe("CodexTerminalSession", () => {
   it("types text and submits when requested", () => {

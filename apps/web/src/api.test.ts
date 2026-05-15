@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { closeTab, fetchJson, getConfig, setActiveTab, startAudioStream, submitTranscript, updateConfig, voiceAudioConstraints } from "./api.js";
+import { callHook, closeTab, fetchJson, getConfig, getHooks, setActiveTab, startAudioStream, submitTranscript, updateConfig, voiceAudioConstraints } from "./api.js";
 
 describe("api client", () => {
   afterEach(() => {
@@ -72,6 +72,26 @@ describe("api client", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/config", {
       method: "PATCH",
       body: JSON.stringify({ plugins: { "file-browser": { showGitDiff: false } } }),
+      headers: { "content-type": "application/json" }
+    });
+  });
+
+  it("loads and calls hooks", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ hooks: [{ id: "workspace.tabs.activate", owner: { kind: "app" }, title: "Activate Tab", description: "", inputSchema: {}, exposures: ["http"] }] }))
+      .mockResolvedValueOnce(jsonResponse({ result: { activeTabId: "tab-1" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getHooks()).resolves.toHaveLength(1);
+    await expect(callHook("workspace.tabs.activate", { tabId: "tab-1" })).resolves.toEqual({ activeTabId: "tab-1" });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/hooks", {
+      headers: undefined
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/hooks/workspace.tabs.activate", {
+      method: "POST",
+      body: JSON.stringify({ input: { tabId: "tab-1" } }),
       headers: { "content-type": "application/json" }
     });
   });

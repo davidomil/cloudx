@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { WorkspaceStateResponse } from "@cloudx/shared";
+import { RULES_SKILLS_PLUGIN_ID, type PluginDescriptor, type WorkspaceStateResponse } from "@cloudx/shared";
 
 import { requestAudioInputEnumerationAccess, workspaceStateWithPreservedLayout } from "./App.js";
+import { pluginMetadataForProfile, selectedProfileId } from "./RulesSkillsPanel.js";
+import { collectUiContributions, selectTabIndicatorContribution } from "./uiContributions.js";
 
 describe("requestAudioInputEnumerationAccess", () => {
   afterEach(() => {
@@ -26,6 +28,60 @@ describe("requestAudioInputEnumerationAccess", () => {
   });
 });
 
+describe("collectUiContributions", () => {
+  it("collects slot contributions from plugin descriptors in stable order", () => {
+    const plugins: PluginDescriptor[] = [
+      pluginDescriptor("audio-ai", [
+        { id: "audio-ai.footer", owner: { kind: "plugin", pluginId: "audio-ai" }, slot: "app.footer.actions", renderer: "audio-ai.voice-console", title: "Voice Console", order: 20 },
+        { id: "audio-ai.topbar", owner: { kind: "plugin", pluginId: "audio-ai" }, slot: "app.topbar.actions", renderer: "audio-ai.voice-control", title: "Voice", order: 10 }
+      ]),
+      pluginDescriptor("tabs-module", [
+        { id: "tabs.trailing", owner: { kind: "plugin", pluginId: "tabs-module" }, slot: "tab.actions.trailing", renderer: "icon-button", title: "Tab Action", order: 5 }
+      ])
+    ];
+
+    expect(collectUiContributions(plugins, "app.topbar.actions").map((contribution) => contribution.id)).toEqual(["audio-ai.topbar"]);
+    expect(collectUiContributions(plugins).map((contribution) => contribution.id)).toEqual(["tabs.trailing", "audio-ai.topbar", "audio-ai.footer"]);
+  });
+
+  it("selects the plugin-owned tab indicator contribution for a tab", () => {
+    const plugins: PluginDescriptor[] = [
+      pluginDescriptor("standard-terminal", [
+        {
+          id: "standard-terminal.tabIndicator",
+          owner: { kind: "plugin", pluginId: "standard-terminal" },
+          slot: "tab.indicator",
+          renderer: "status-dot",
+          title: "Terminal status",
+          targetPluginId: "standard-terminal"
+        }
+      ]),
+      pluginDescriptor("codex-terminal", [
+        {
+          id: "codex-terminal.tabIndicator",
+          owner: { kind: "plugin", pluginId: "codex-terminal" },
+          slot: "tab.indicator",
+          renderer: "status-dot",
+          title: "Codex status",
+          targetPluginId: "codex-terminal"
+        },
+        {
+          id: "codex-terminal.specialTabIndicator",
+          owner: { kind: "plugin", pluginId: "codex-terminal" },
+          slot: "tab.indicator",
+          renderer: "status-dot",
+          title: "Special Codex status",
+          targetTabId: "tab-codex",
+          order: -1
+        }
+      ])
+    ];
+
+    expect(selectTabIndicatorContribution(plugins, workspaceTab("tab-shell", "standard-terminal"))?.id).toBe("standard-terminal.tabIndicator");
+    expect(selectTabIndicatorContribution(plugins, workspaceTab("tab-codex", "codex-terminal"))?.id).toBe("codex-terminal.specialTabIndicator");
+  });
+});
+
 describe("workspaceStateWithPreservedLayout", () => {
   it("keeps a pending local layout instead of accepting a stale active-window snapshot", () => {
     const staleLayout = layoutWithActiveTab("tab-old");
@@ -46,6 +102,16 @@ describe("workspaceStateWithPreservedLayout", () => {
   });
 });
 
+describe("profile metadata helpers", () => {
+  it("builds and reads rules/skills profile metadata", () => {
+    const metadata = pluginMetadataForProfile("focused");
+
+    expect(metadata).toEqual({ [RULES_SKILLS_PLUGIN_ID]: { selectedProfileId: "focused" } });
+    expect(selectedProfileId({ ...workspaceTab("tab-codex", "codex-terminal"), pluginMetadata: metadata })).toBe("focused");
+    expect(pluginMetadataForProfile(undefined)).toBeUndefined();
+  });
+});
+
 function workspaceState(windowId: string, layout: WorkspaceStateResponse["windows"][number]["layout"]): WorkspaceStateResponse {
   return {
     activeTabId: "tab-new",
@@ -62,6 +128,38 @@ function workspaceState(windowId: string, layout: WorkspaceStateResponse["window
     ],
     activeWindowId: windowId,
     templates: []
+  };
+}
+
+function pluginDescriptor(id: string, uiContributions: PluginDescriptor["uiContributions"]): PluginDescriptor {
+  return {
+    id,
+    acronym: id.slice(0, 3).toUpperCase(),
+    displayName: id,
+    description: id,
+    panelKind: "placeholder",
+    creatable: false,
+    requiresDirectory: false,
+    configFields: [],
+    actions: [],
+    uiContributions
+  };
+}
+
+function workspaceTab(id: string, pluginId: string): WorkspaceStateResponse["tabs"][number] {
+  return {
+    id,
+    pluginId,
+    title: id,
+    cwd: "/tmp",
+    status: "running",
+    indicator: {
+      color: "green",
+      label: "OK",
+      updatedAt: new Date(0).toISOString()
+    },
+    createdAt: new Date(0).toISOString(),
+    updatedAt: new Date(0).toISOString()
   };
 }
 
