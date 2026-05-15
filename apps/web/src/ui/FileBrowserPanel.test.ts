@@ -1,14 +1,19 @@
+// @vitest-environment jsdom
+
 import { createElement } from "react";
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
 
-import { buildSearchInput, clampFileBrowserTreeSize, defaultDiffViewMode, disposeFileBrowserPanelStatesExcept, entryTransferPath, FileBrowserPanel, fileBrowserBodyClassName, fileBrowserBodyStyle, filePreviewText, fileTransferUploadPath, gitAutoRefreshIntervalMilliseconds, gitDiffWorkspaceClassName, mergeGitChangesIntoEntries, parsePatch, readFileBrowserPanelState, rememberFileBrowserPanelState, resolveNextCompareRef, searchEntriesFromResult, searchResultSummary, type FileBrowserPanelState, type OpenFileResult } from "./FileBrowserPanel.js";
+import { buildCompareRefOptions, buildSearchInput, clampFileBrowserTreeSize, CompareRefPicker, compareRefListboxStyle, defaultDiffViewMode, disposeFileBrowserPanelStatesExcept, entryTransferPath, FileBrowserPanel, fileBrowserBodyClassName, fileBrowserBodyStyle, filePreviewText, fileTransferUploadPath, filterCompareRefOptions, gitAutoRefreshIntervalMilliseconds, gitDiffWorkspaceClassName, mergeGitChangesIntoEntries, parsePatch, readFileBrowserPanelState, rememberFileBrowserPanelState, resolveNextCompareRef, searchEntriesFromResult, searchResultSummary, type FileBrowserPanelState, type OpenFileResult } from "./FileBrowserPanel.js";
 import { PathEntry } from "./PathEntry.js";
 
 afterEach(() => {
   disposeFileBrowserPanelStatesExcept(new Set());
+  document.body.replaceChildren();
 });
 
 describe("filePreviewText", () => {
@@ -156,6 +161,92 @@ describe("git auto-refresh helpers", () => {
     expect(resolveNextCompareRef(state, "origin/dev")).toBe("origin/dev");
     expect(resolveNextCompareRef(state, "deleted/ref")).toBe("origin/main");
     expect(resolveNextCompareRef(state, undefined)).toBe("origin/main");
+  });
+
+  it("orders compare refs with main first and the current branch upstream second", () => {
+    expect(
+      buildCompareRefOptions({
+        defaultCompareRef: "origin/main",
+        upstream: "origin/feature/cloudx",
+        compareRefs: ["origin/main", "origin/feature/cloudx", "origin/dev"]
+      })
+    ).toEqual([
+      { value: "origin/main", label: "origin/main", detail: "default" },
+      { value: "origin/feature/cloudx", label: "origin/feature/cloudx", detail: "branch upstream" },
+      { value: "origin/dev", label: "origin/dev" }
+    ]);
+    expect(buildCompareRefOptions({ compareRefs: [] })).toEqual([{ value: "", label: "working tree" }]);
+  });
+
+  it("does not offer a stale upstream ref that is absent from compare refs", () => {
+    expect(
+      buildCompareRefOptions({
+        defaultCompareRef: "origin/main",
+        upstream: "origin/deleted-feature",
+        compareRefs: ["origin/main", "origin/dev"]
+      })
+    ).toEqual([
+      { value: "origin/main", label: "origin/main", detail: "default" },
+      { value: "origin/dev", label: "origin/dev" }
+    ]);
+  });
+
+  it("filters compare refs and caps the visible option list", () => {
+    const options = Array.from({ length: 16 }, (_, index) => ({
+      value: `origin/branch-${index}`,
+      label: `origin/branch-${index}`
+    }));
+
+    expect(filterCompareRefOptions(options, "")).toHaveLength(12);
+    expect(filterCompareRefOptions(options, "branch-15")).toEqual([{ value: "origin/branch-15", label: "origin/branch-15" }]);
+  });
+
+  it("positions the compare ref list outside the clipped Git bar", () => {
+    expect(compareRefListboxStyle({ bottom: 20, left: 12, width: 180 })).toEqual({
+      top: "25px",
+      left: "12px",
+      width: "280px"
+    });
+  });
+
+  it("opens a branch autocomplete list and filters typed refs", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const selections: string[] = [];
+    const state = {
+      isRepository: true,
+      cwd: "/repo",
+      folderEmpty: false,
+      defaultCompareRef: "origin/main",
+      upstream: "origin/feature/cloudx",
+      compareRefs: ["origin/main", "origin/feature/cloudx", "origin/dev"],
+      setup: { canInitialize: false, canClone: false, canSetOrigin: false }
+    } satisfies GitRepositoryState;
+
+    await act(async () => {
+      root.render(createElement(CompareRefPicker, { state, compareRef: "origin/main", disabled: false, onCompareRefChange: (value) => selections.push(value) }));
+    });
+
+    const input = container.querySelector('[role="combobox"]') as HTMLInputElement;
+    await act(async () => {
+      input.dispatchEvent(new FocusEvent("focus", { bubbles: true }));
+    });
+    setInputValue(input, "feature");
+    await act(async () => {
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    const optionLabels = Array.from(document.body.querySelectorAll(".git-compare-option span")).map((option) => option.textContent);
+    expect(optionLabels).toEqual(["origin/feature/cloudx"]);
+
+    const featureOption = document.body.querySelector(".git-compare-option") as HTMLButtonElement;
+    await act(async () => {
+      featureOption.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(selections).toEqual(["origin/feature/cloudx"]);
+
+    await unmount(root);
   });
 });
 
@@ -325,4 +416,15 @@ function fileBrowserState(overrides: Partial<FileBrowserPanelState> = {}): FileB
     fileTreeSize: 280,
     ...overrides
   };
+}
+
+function setInputValue(input: HTMLInputElement, value: string): void {
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+  setter?.call(input, value);
+}
+
+async function unmount(root: Root): Promise<void> {
+  await act(async () => {
+    root.unmount();
+  });
 }

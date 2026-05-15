@@ -53,6 +53,46 @@ describe("GitService", () => {
     await expect(fs.readFile(path.join(target, "README.md"), "utf8")).resolves.toBe("hello\n");
   });
 
+  it("defaults comparisons to main and recommends the current branch upstream second", async () => {
+    const service = new GitService();
+    const source = await createMainCommittedRepo("cloudx-git-main-source-");
+    await git(source, "checkout", "-b", "feature/cloudx");
+    await fs.writeFile(path.join(source, "feature.txt"), "feature branch\n");
+    await git(source, "add", ".");
+    await git(source, "-c", "user.name=Cloudx Test", "-c", "user.email=cloudx@example.test", "commit", "-m", "feature");
+    await git(source, "checkout", "main");
+    const target = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-git-main-clone-"));
+    await git(target, "clone", source, ".");
+    await git(target, "checkout", "--track", "origin/feature/cloudx");
+
+    const state = await service.getState(target);
+
+    expect(state.defaultCompareRef).toBe("origin/main");
+    expect(state.upstream).toBe("origin/feature/cloudx");
+    expect(state.compareRefs.slice(0, 2)).toEqual(["origin/main", "origin/feature/cloudx"]);
+  });
+
+  it("does not recommend deleted upstream refs for comparison", async () => {
+    const service = new GitService();
+    const source = await createMainCommittedRepo("cloudx-git-gone-source-");
+    await git(source, "checkout", "-b", "feature/cloudx");
+    await fs.writeFile(path.join(source, "feature.txt"), "feature branch\n");
+    await git(source, "add", ".");
+    await git(source, "-c", "user.name=Cloudx Test", "-c", "user.email=cloudx@example.test", "commit", "-m", "feature");
+    await git(source, "checkout", "main");
+    const target = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-git-gone-clone-"));
+    await git(target, "clone", source, ".");
+    await git(target, "checkout", "--track", "origin/feature/cloudx");
+    await git(target, "update-ref", "-d", "refs/remotes/origin/feature/cloudx");
+
+    const state = await service.getState(target);
+
+    expect(state.defaultCompareRef).toBe("origin/main");
+    expect(state.upstream).toBeUndefined();
+    expect(state.compareRefs).not.toContain("origin/feature/cloudx");
+    await expect(service.listDiff(target, "origin/feature/cloudx")).rejects.toThrow("Comparison ref does not exist: origin/feature/cloudx");
+  });
+
   it("lists and opens modified, renamed, deleted, and untracked file diffs", async () => {
     const service = new GitService();
     const root = await createCommittedRepo("cloudx-git-diff-");
@@ -127,6 +167,12 @@ async function createCommittedRepo(prefix: string): Promise<string> {
   await fs.writeFile(path.join(root, "delete-me.txt"), "delete me\n");
   await git(root, "add", ".");
   await git(root, "-c", "user.name=Cloudx Test", "-c", "user.email=cloudx@example.test", "commit", "-m", "initial");
+  return root;
+}
+
+async function createMainCommittedRepo(prefix: string): Promise<string> {
+  const root = await createCommittedRepo(prefix);
+  await git(root, "branch", "-M", "main");
   return root;
 }
 

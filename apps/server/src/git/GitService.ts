@@ -41,12 +41,14 @@ export class GitService {
       };
     }
 
-    const [status, compareRefs, originUrl, defaultCompareRef] = await Promise.all([
+    const [status, rawCompareRefs, originUrl] = await Promise.all([
       this.readStatusMeta(cwd),
       this.listCompareRefs(cwd),
-      this.getOriginUrl(cwd),
-      this.defaultCompareRef(cwd)
+      this.getOriginUrl(cwd)
     ]);
+    const defaultCompareRef = await this.defaultCompareRef(cwd, rawCompareRefs);
+    const upstream = status.upstream && rawCompareRefs.includes(status.upstream) ? status.upstream : undefined;
+    const compareRefs = orderCompareRefs(rawCompareRefs, defaultCompareRef, upstream);
 
     return {
       isRepository: true,
@@ -55,7 +57,7 @@ export class GitService {
       folderEmpty,
       currentBranch: status.branch,
       headRef: status.headRef,
-      upstream: status.upstream,
+      upstream,
       originUrl,
       defaultCompareRef,
       compareRefs,
@@ -213,21 +215,33 @@ export class GitService {
     return result.code === 0 ? result.stdout.trim() || undefined : undefined;
   }
 
-  private async defaultCompareRef(cwd: string): Promise<string | undefined> {
+  private async defaultCompareRef(cwd: string, compareRefs?: string[]): Promise<string | undefined> {
+    const refs = compareRefs ?? await this.listCompareRefs(cwd);
+    const mainRef = preferredMainCompareRef(refs);
+    if (mainRef) {
+      return mainRef;
+    }
     const originHead = await this.runGit(cwd, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], { allowExitCodes: [0, 1] });
     if (originHead.code === 0 && originHead.stdout.trim()) {
       return originHead.stdout.trim();
     }
-    const refs = await this.listCompareRefs(cwd);
     return refs.find((ref) => ref.startsWith("origin/")) ?? refs[0] ?? ((await this.hasHead(cwd)) ? "HEAD" : undefined);
   }
 
   private async resolveCompareRef(cwd: string, compareRef?: string): Promise<string | undefined> {
     const trimmed = compareRef?.trim();
     if (trimmed) {
+      await this.requireResolvableCommit(cwd, trimmed);
       return trimmed;
     }
     return this.defaultCompareRef(cwd);
+  }
+
+  private async requireResolvableCommit(cwd: string, ref: string): Promise<void> {
+    const result = await this.runGit(cwd, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], { allowExitCodes: [0, 1] });
+    if (result.code !== 0) {
+      throw new Error(`Comparison ref does not exist: ${ref}`);
+    }
   }
 
   private async hasHead(cwd: string): Promise<boolean> {
@@ -318,6 +332,22 @@ function statusFromCode(code: string): GitFileStatus {
 function pathspecForCwd(rootPath: string, cwd: string): string {
   const relative = path.relative(rootPath, cwd);
   return relative && !relative.startsWith("..") ? relative : ".";
+}
+
+function preferredMainCompareRef(refs: string[]): string | undefined {
+  return refs.find((ref) => ref === "origin/main") ?? refs.find((ref) => ref === "main") ?? refs.find((ref) => ref.endsWith("/main"));
+}
+
+function orderCompareRefs(refs: string[], defaultCompareRef: string | undefined, upstream: string | undefined): string[] {
+  const remaining = new Set(refs);
+  const ordered: string[] = [];
+  for (const ref of [defaultCompareRef, upstream]) {
+    if (ref && remaining.has(ref)) {
+      ordered.push(ref);
+      remaining.delete(ref);
+    }
+  }
+  return [...ordered, ...Array.from(remaining).sort((left, right) => left.localeCompare(right))];
 }
 
 async function isDirectoryEmpty(directory: string): Promise<boolean> {

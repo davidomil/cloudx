@@ -1490,6 +1490,7 @@ a:hover svg {
 
 .web-viewer-toolbar input:focus,
 .file-search-bar input:focus,
+.git-bar input:focus,
 .worktree-manager-panel input:focus,
 .worktree-manager-panel select:focus,
 .dialog input:focus,
@@ -1668,6 +1669,93 @@ a:hover svg {
 
 .git-bar select {
   max-width: 220px;
+}
+
+.git-compare-control > span {
+  flex: none;
+}
+
+.git-compare-picker {
+  position: relative;
+  width: min(260px, 34vw);
+  min-width: 180px;
+}
+
+.git-compare-picker input {
+  width: 100%;
+  flex: none;
+  padding-right: 30px;
+  cursor: text;
+}
+
+.git-compare-picker > svg {
+  position: absolute;
+  top: 50%;
+  right: 10px;
+  color: var(--color-muted-foreground);
+  pointer-events: none;
+  transform: translateY(-50%);
+}
+
+.git-compare-options {
+  position: fixed;
+  z-index: 35;
+  max-height: min(420px, 60vh);
+  display: grid;
+  gap: 2px;
+  padding: 5px;
+  overflow-y: auto;
+  background: rgb(9 13 18 / 0.98);
+  border: 1px solid rgb(0 212 255 / 0.34);
+  box-shadow: var(--shadow-elevated);
+}
+
+.git-compare-option {
+  width: 100%;
+  min-width: 0;
+  height: auto;
+  min-height: 34px;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  justify-items: start;
+  gap: 8px;
+  padding: 6px 8px;
+  color: var(--color-muted-foreground);
+  text-align: left;
+  text-transform: none;
+}
+
+.git-compare-option span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-accent);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-compare-option small {
+  color: var(--color-accent-tertiary);
+  font-family: var(--font-label);
+  font-size: 10px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.git-compare-option.active,
+.git-compare-option:hover {
+  color: var(--file-browser-button-hover-color);
+  background: var(--file-browser-button-hover-background);
+  border-color: var(--file-browser-button-hover-border);
+  box-shadow: var(--file-browser-button-hover-shadow);
+}
+
+.git-compare-empty {
+  padding: 9px 10px;
+  color: var(--color-muted-foreground);
+  font-family: var(--font-label);
+  font-size: 11px;
+  text-transform: uppercase;
 }
 
 .git-view-toggle {

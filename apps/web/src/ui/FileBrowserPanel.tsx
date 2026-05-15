@@ -1,7 +1,8 @@
 import { useEffect, useId, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { createPortal } from "react-dom";
 import { Diff, Hunk, parseDiff, type DiffType, type FileData, type HunkData, type ViewType } from "react-diff-view";
 import "react-diff-view/style/index.css";
-import { AlignJustify, Download, FileDiff, FileText, Folder, GitBranch, GitCompareArrows, GitFork, GitPullRequest, RefreshCw, Search, Upload, X } from "lucide-react";
+import { AlignJustify, Check, ChevronDown, Download, FileDiff, FileText, Folder, GitBranch, GitCompareArrows, GitFork, GitPullRequest, RefreshCw, Search, Upload, X } from "lucide-react";
 
 import type { ConfigValue, FileSearchFileResult, FileSearchMode, FileSearchResult, GitDiffFile, GitDiffFileSummary, GitDiffSummary, GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
 
@@ -41,6 +42,7 @@ const DEFAULT_GIT_AUTO_REFRESH_SECONDS = 15;
 const DEFAULT_FILE_TREE_SIZE = 280;
 const MIN_FILE_TREE_SIZE = 160;
 const FILE_TREE_RESIZE_STEP = 24;
+const GIT_COMPARE_REF_OPTION_LIMIT = 12;
 
 export interface FileBrowserPanelState {
   relativePath: string;
@@ -887,6 +889,50 @@ export function resolveNextCompareRef(state: GitRepositoryState, preferredCompar
   return refs.has(preferredCompareRef) ? preferredCompareRef : fallback;
 }
 
+export interface CompareRefOption {
+  value: string;
+  label: string;
+  detail?: string;
+}
+
+export function buildCompareRefOptions(state: Pick<GitRepositoryState, "compareRefs" | "defaultCompareRef" | "upstream">): CompareRefOption[] {
+  const validRefs = new Set(state.compareRefs);
+  if (state.defaultCompareRef) {
+    validRefs.add(state.defaultCompareRef);
+  }
+  const upstream = state.upstream && validRefs.has(state.upstream) ? state.upstream : undefined;
+  const refs = uniqueRefs([state.defaultCompareRef, upstream, ...state.compareRefs]);
+  if (!refs.length) {
+    return [{ value: "", label: "working tree" }];
+  }
+  return refs.map((ref) => ({
+    value: ref,
+    label: ref,
+    detail: ref === state.defaultCompareRef ? "default" : ref === upstream ? "branch upstream" : undefined
+  }));
+}
+
+export function filterCompareRefOptions(options: CompareRefOption[], query: string, limit = GIT_COMPARE_REF_OPTION_LIMIT): CompareRefOption[] {
+  const normalizedQuery = query.trim().toLowerCase();
+  const filtered = normalizedQuery
+    ? options.filter((option) => `${option.label} ${option.detail ?? ""}`.toLowerCase().includes(normalizedQuery))
+    : options;
+  return filtered.slice(0, limit);
+}
+
+function uniqueRefs(refs: Array<string | undefined>): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const ref of refs) {
+    const trimmed = ref?.trim();
+    if (trimmed && !seen.has(trimmed)) {
+      seen.add(trimmed);
+      result.push(trimmed);
+    }
+  }
+  return result;
+}
+
 export function searchEntriesFromResult(result: FileSearchResult | undefined): DisplayDirectoryEntry[] {
   if (!result) {
     return [];
@@ -909,6 +955,163 @@ function TreeChangeBadge({ change }: { change: GitTreeChange }) {
     <span className={`tree-change-badge ${change.status}`} title={label} aria-label={label}>
       {change.file ? change.statusCode : change.changedFileCount}
     </span>
+  );
+}
+
+export function compareRefListboxStyle(rect: Pick<DOMRect, "bottom" | "left" | "width">): CSSProperties {
+  return {
+    top: `${rect.bottom + 5}px`,
+    left: `${rect.left}px`,
+    width: `${Math.max(rect.width, 280)}px`
+  };
+}
+
+export function CompareRefPicker({ state, compareRef, disabled, onCompareRefChange }: { state: GitRepositoryState; compareRef: string; disabled: boolean; onCompareRefChange: (value: string) => void }) {
+  const inputId = useId();
+  const listboxId = `${inputId}-listbox`;
+  const pickerRef = useRef<HTMLDivElement | null>(null);
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [listboxStyle, setListboxStyle] = useState<CSSProperties>();
+  const options = useMemo(() => buildCompareRefOptions(state), [state.compareRefs, state.defaultCompareRef, state.upstream]);
+  const filteredOptions = useMemo(() => filterCompareRefOptions(options, query), [options, query]);
+  const selectedOption = options.find((option) => option.value === compareRef) ?? options[0];
+  const activeOption = open ? filteredOptions[activeIndex] : undefined;
+  const optionId = (index: number) => `${listboxId}-option-${index}`;
+
+  useEffect(() => {
+    setActiveIndex((current) => Math.min(Math.max(current, 0), Math.max(filteredOptions.length - 1, 0)));
+  }, [filteredOptions.length]);
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    const updatePosition = () => {
+      const rect = pickerRef.current?.getBoundingClientRect();
+      if (rect) {
+        setListboxStyle(compareRefListboxStyle(rect));
+      }
+    };
+    updatePosition();
+    window.addEventListener("resize", updatePosition);
+    window.addEventListener("scroll", updatePosition, true);
+    return () => {
+      window.removeEventListener("resize", updatePosition);
+      window.removeEventListener("scroll", updatePosition, true);
+    };
+  }, [open]);
+
+  const openPicker = () => {
+    const selectedIndex = options.findIndex((option) => option.value === compareRef);
+    const rect = pickerRef.current?.getBoundingClientRect();
+    if (rect) {
+      setListboxStyle(compareRefListboxStyle(rect));
+    }
+    setQuery("");
+    setActiveIndex(selectedIndex >= 0 ? Math.min(selectedIndex, GIT_COMPARE_REF_OPTION_LIMIT - 1) : 0);
+    setOpen(true);
+  };
+
+  const selectOption = (option: CompareRefOption) => {
+    onCompareRefChange(option.value);
+    setQuery("");
+    setOpen(false);
+  };
+
+  const listbox = open ? (
+    <div id={listboxId} role="listbox" className="git-compare-options" style={listboxStyle}>
+      {filteredOptions.length ? (
+        filteredOptions.map((option, index) => (
+          <button
+            key={option.value}
+            id={optionId(index)}
+            type="button"
+            role="option"
+            className={`git-compare-option ${index === activeIndex ? "active" : ""}`}
+            aria-selected={option.value === compareRef}
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => selectOption(option)}
+          >
+            <span>{option.label}</span>
+            {option.detail ? <small>{option.detail}</small> : null}
+            {option.value === compareRef ? <Check size={14} aria-hidden="true" /> : null}
+          </button>
+        ))
+      ) : (
+        <div className="git-compare-empty">No refs found</div>
+      )}
+    </div>
+  ) : null;
+
+  return (
+    <label className="git-compare-control" onBlur={(event) => {
+      const nextTarget = event.relatedTarget;
+      if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) {
+        setOpen(false);
+        setQuery("");
+      }
+    }}>
+      <span>Compare</span>
+      <div ref={pickerRef} className={`git-compare-picker ${open ? "open" : ""}`}>
+        <input
+          id={inputId}
+          value={open ? query : selectedOption?.label ?? ""}
+          placeholder={open ? selectedOption?.label : undefined}
+          role="combobox"
+          aria-autocomplete="list"
+          aria-expanded={open}
+          aria-controls={listboxId}
+          aria-activedescendant={activeOption ? optionId(activeIndex) : undefined}
+          aria-label="Compare Git changes against"
+          disabled={disabled}
+          onFocus={openPicker}
+          onClick={() => {
+            if (!open) {
+              openPicker();
+            }
+          }}
+          onChange={(event) => {
+            setQuery(event.target.value);
+            setActiveIndex(0);
+            setOpen(true);
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowDown") {
+              event.preventDefault();
+              if (!open) {
+                openPicker();
+              } else {
+                setActiveIndex((current) => Math.min(current + 1, Math.max(filteredOptions.length - 1, 0)));
+              }
+            } else if (event.key === "ArrowUp") {
+              event.preventDefault();
+              if (!open) {
+                openPicker();
+              } else {
+                setActiveIndex((current) => Math.max(current - 1, 0));
+              }
+            } else if (event.key === "Enter" && open) {
+              event.preventDefault();
+              if (activeOption) {
+                selectOption(activeOption);
+              }
+            } else if (event.key === "Escape") {
+              event.preventDefault();
+              setOpen(false);
+              setQuery("");
+            } else if (event.key === "Tab") {
+              setOpen(false);
+              setQuery("");
+            }
+          }}
+          {...noSystemTextAssistProps}
+        />
+        <ChevronDown size={14} aria-hidden="true" />
+        {listbox && typeof document !== "undefined" ? createPortal(listbox, document.body) : listbox}
+      </div>
+    </label>
   );
 }
 
@@ -1001,20 +1204,7 @@ function GitRepositoryBar({
           <RefreshCw size={14} />
         </ControlButton>
       </div>
-      <label className="git-compare-control">
-        Compare
-        <select value={compareRef} onChange={(event) => onCompareRefChange(event.target.value)} disabled={Boolean(busyAction)}>
-          {state.defaultCompareRef ? <option value={state.defaultCompareRef}>{state.defaultCompareRef}</option> : null}
-          {state.compareRefs
-            .filter((ref) => ref !== state.defaultCompareRef)
-            .map((ref) => (
-              <option key={ref} value={ref}>
-                {ref}
-              </option>
-            ))}
-          {!state.defaultCompareRef && state.compareRefs.length === 0 ? <option value="">working tree</option> : null}
-        </select>
-      </label>
+      <CompareRefPicker state={state} compareRef={compareRef} disabled={Boolean(busyAction)} onCompareRefChange={onCompareRefChange} />
       <SegmentedControl className="git-view-toggle" label="Diff view mode">
         <ControlButton type="button" className={diffViewMode === "unified" ? "active" : ""} iconOnly selected={diffViewMode === "unified"} aria-label="Unified diff view" title="Unified diff view" onClick={() => onDiffViewModeChange("unified")}>
           <AlignJustify size={14} />
