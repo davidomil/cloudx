@@ -8,7 +8,7 @@ import { ControlButton } from "./Control.js";
 
 type BusyAction = "state" | "initialize" | "clone" | "fetch" | "create" | "delete";
 
-const REF_OPTION_LIMIT = 12;
+export const REF_OPTION_LIMIT = 50;
 
 export function WorktreeManagerPanel({ tab, config = {} }: { tab: WorkspaceTab; config?: Record<string, ConfigValue> }) {
   const [state, setState] = useState<WorktreeProjectState | undefined>();

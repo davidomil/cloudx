@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { WorktreeProjectState, WorktreeRef } from "@cloudx/shared";
 
-import { detectionSummary, filterRefOptions, formatBytes, prefillBranchPrefix } from "./WorktreeManagerPanel.js";
+import { REF_OPTION_LIMIT, detectionSummary, filterRefOptions, formatBytes, prefillBranchPrefix } from "./WorktreeManagerPanel.js";
 
 describe("prefillBranchPrefix", () => {
   it("prefills only empty new-branch names", () => {
@@ -13,6 +13,10 @@ describe("prefillBranchPrefix", () => {
 });
 
 describe("filterRefOptions", () => {
+  it("keeps the default ref suggestion list large enough for branch-heavy repos", () => {
+    expect(REF_OPTION_LIMIT).toBeGreaterThanOrEqual(50);
+  });
+
   it("keeps writable ref suggestions filtered and capped", () => {
     const refs = [
       ref("origin/main", "remote"),
