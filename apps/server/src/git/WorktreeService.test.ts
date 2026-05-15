@@ -6,6 +6,8 @@ import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
 
+import type { WorktreeProjectState } from "@cloudx/shared";
+
 import { WorktreeService } from "./WorktreeService.js";
 
 const execFileAsync = promisify(execFile);
@@ -108,9 +110,18 @@ describe("WorktreeService", () => {
     const withoutSizes = await service.getState(project);
     expect(withoutSizes.worktrees[0]?.sizeBytes).toBeUndefined();
 
-    const withSizes = await service.getState(project, { includeSizes: true });
-    expect(withSizes.worktrees[0]?.sizeBytes).toEqual(expect.any(Number));
-    expect(withSizes.worktrees[0]?.sizeBytes).toBeLessThan(10_000);
+    const initialSizeState = await service.getState(project, { includeSizes: true });
+    expect(initialSizeState.worktrees[0]).toMatchObject({ sizePending: true });
+    expect(initialSizeState.worktrees[0]?.sizeBytes).toBeUndefined();
+
+    const withCachedSize = await waitForWorktreeSize(service, project);
+    expect(withCachedSize.worktrees[0]?.sizeBytes).toEqual(expect.any(Number));
+    expect(withCachedSize.worktrees[0]?.sizeBytes).toBeLessThan(10_000);
+    expect(withCachedSize.worktrees[0]?.sizePending).toBeUndefined();
+
+    const cachedAgain = await service.getState(project, { includeSizes: true });
+    expect(cachedAgain.worktrees[0]?.sizeBytes).toBe(withCachedSize.worktrees[0]?.sizeBytes);
+    expect(cachedAgain.worktrees[0]?.sizePending).toBeUndefined();
   });
 
   it("fetches remote branches and syncs divergent tags", async () => {
@@ -273,4 +284,15 @@ async function git(cwd: string, ...args: string[]): Promise<void> {
 async function gitOutput(cwd: string, ...args: string[]): Promise<string> {
   const result = await execFileAsync("git", args, { cwd, encoding: "utf8" });
   return result.stdout.trim();
+}
+
+async function waitForWorktreeSize(service: WorktreeService, project: string): Promise<WorktreeProjectState> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const state = await service.getState(project, { includeSizes: true });
+    if (typeof state.worktrees[0]?.sizeBytes === "number" || state.worktrees[0]?.sizeError) {
+      return state;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Timed out waiting for worktree size cache.");
 }

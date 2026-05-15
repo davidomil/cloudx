@@ -13,6 +13,7 @@ import type { TerminalProcess, TerminalProcessFactory } from "../terminal/Termin
 
 export const DEFAULT_TERMINAL_REPLAY_BYTES = 1_048_576;
 export const CODEX_SUBMIT_DELAY_MS = 25;
+export const CODEX_CLOSE_ON_EXIT_GRACE_MS = 2_000;
 
 export const TERMINAL_ACTIONS: PluginActionDefinition[] = terminalActions({
   enterTextDescription:
@@ -63,6 +64,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     });
     return new CodexTerminalSession(input.tab, terminalProcess, input.controls, {
       closeOnExit: true,
+      closeOnExitAfterMs: CODEX_CLOSE_ON_EXIT_GRACE_MS,
       replayBytes: this.replayBytes,
       submitDelayMs: CODEX_SUBMIT_DELAY_MS,
       voiceKind: "codex-terminal",
@@ -127,6 +129,7 @@ function terminalActions(options: { enterTextDescription: string; enterTextHandl
 
 interface TerminalSessionOptions {
   closeOnExit: boolean;
+  closeOnExitAfterMs?: number;
   replayBytes?: number;
   submitDelayMs?: number;
   voiceKind?: "codex-terminal" | "standard-terminal" | "terminal";
@@ -178,6 +181,7 @@ export class CodexTerminalSession implements PluginSession {
   private stopped = false;
   private status: WorkspaceTab["status"];
   private readonly replayBytes: number;
+  private readonly startedAt = Date.now();
   private readonly shellIntegrationParser = new TerminalShellIntegrationParser();
   private readonly statusListeners = new Set<(status: WorkspaceTab["status"], message?: string) => void>();
 
@@ -198,7 +202,12 @@ export class CodexTerminalSession implements PluginSession {
     this.terminalProcess.onExit((event) => {
       if (this.options.closeOnExit) {
         const message = event.exitCode === 0 ? "Codex exited cleanly." : `Codex exited with code ${event.exitCode}.`;
-        this.controls.closeTab(message);
+        const closeAfterMs = this.options.closeOnExitAfterMs ?? 0;
+        if (Date.now() - this.startedAt >= closeAfterMs) {
+          this.controls.closeTab(message);
+          return;
+        }
+        this.setStatus(event.exitCode === 0 ? "completed" : "failed", message);
         return;
       }
       if (this.stopped) {

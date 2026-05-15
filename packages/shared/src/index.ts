@@ -246,6 +246,7 @@ export interface WorktreeSummary {
   dirty: WorktreeDirtyStatus;
   sizeBytes?: number;
   sizeError?: string;
+  sizePending?: boolean;
 }
 
 export interface WorktreeProjectState {

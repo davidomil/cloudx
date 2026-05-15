@@ -47,18 +47,19 @@ describe("WorktreeManagerPlugin", () => {
     });
   });
 
-  it("passes current folder-size config to worktree state actions", async () => {
+  it("keeps folder sizes opt-in for worktree state actions", async () => {
     const fakeWorktrees = new FakeWorktreeService();
     const session = new WorktreeManagerPlugin(fakeWorktrees as never).createSession({
       tab: tab("/repo"),
       cwd: "/repo",
-      controls: { setTabIndicator: () => undefined, closeTab: () => undefined },
-      getConfig: () => ({ showFolderSize: false })
+      controls: { setTabIndicator: () => undefined, closeTab: () => undefined }
     });
 
     await session.handleAction("get_worktree_project", {});
-
     expect(fakeWorktrees.lastOptions).toEqual({ includeSizes: false });
+
+    await session.handleAction("get_worktree_project", { includeSizes: true });
+    expect(fakeWorktrees.lastOptions).toEqual({ includeSizes: true });
   });
 });
 

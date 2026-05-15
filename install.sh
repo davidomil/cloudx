@@ -85,16 +85,31 @@ run sudo apt-get install -y \
 
 step "Check Node.js and npm"
 NODE_MAJOR="$(node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)"
-if [[ "$NODE_MAJOR" -lt 22 ]] || ! command -v npm >/dev/null 2>&1; then
-  echo "Node.js 22+ and npm are required. Installing the NodeSource Node.js 22 package, which includes npm."
+if [[ "$NODE_MAJOR" -lt 22 ]]; then
+  echo "Node.js 22+ is required. Installing the NodeSource Node.js 22 package."
   if [[ "$DRY_RUN" -eq 1 ]]; then
     echo '$ curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -'
   else
     curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
   fi
   run sudo apt-get install -y nodejs
+fi
+
+if ! command -v npm >/dev/null 2>&1; then
+  echo "npm is missing. Installing Ubuntu's npm package."
+  run sudo apt-get install -y npm
+fi
+
+if [[ "$DRY_RUN" -eq 0 ]] && ! command -v npm >/dev/null 2>&1; then
+  echo "npm is required but was not found after installation. Install npm and rerun ./install.sh." >&2
+  exit 1
+fi
+
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  echo "Using Node.js $(node -v) and npm $(npm -v)."
 else
-  echo "Using existing Node.js $(node -v) and npm $(npm -v)."
+  echo '$ node -v'
+  echo '$ npm -v'
 fi
 
 if [[ "$DRY_RUN" -eq 1 ]] && ! command -v node >/dev/null 2>&1; then
@@ -102,6 +117,8 @@ if [[ "$DRY_RUN" -eq 1 ]] && ! command -v node >/dev/null 2>&1; then
   echo "Node is not installed, so only the shell bootstrap dry-run was printed." >&2
   exit 0
 fi
+
+export CLOUDX_INSTALL_BOOTSTRAPPED=1
 
 if [[ "$UPDATE" -eq 1 ]]; then
   step "Pull latest Cloudx checkout"

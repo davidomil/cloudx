@@ -1,5 +1,5 @@
 import type { CreatePluginSessionInput, PluginActionDefinition, PluginSession, PluginSessionSnapshot, PluginVoiceContext, WorkspacePlugin } from "@cloudx/plugin-api";
-import type { ConfigFieldDescriptor, ConfigValue, WorktreeCreateMode, WorktreeProjectState, WorkspaceTab } from "@cloudx/shared";
+import type { ConfigFieldDescriptor, WorktreeCreateMode, WorktreeProjectState, WorkspaceTab } from "@cloudx/shared";
 
 import { WorktreeService } from "../git/WorktreeService.js";
 
@@ -35,7 +35,9 @@ export class WorktreeManagerPlugin implements WorkspacePlugin {
       voiceExposed: true,
       inputSchema: {
         type: "object",
-        properties: {},
+        properties: {
+          includeSizes: { type: "boolean", description: "Whether to include recursively computed worktree folder sizes." }
+        },
         required: [],
         additionalProperties: false
       }
@@ -125,7 +127,7 @@ export class WorktreeManagerPlugin implements WorkspacePlugin {
   }
 
   createSession(input: CreatePluginSessionInput): PluginSession {
-    return new WorktreeManagerSession(input.tab, this.worktrees, input.getConfig ?? (() => input.config ?? {}));
+    return new WorktreeManagerSession(input.tab, this.worktrees);
   }
 }
 
@@ -134,8 +136,7 @@ class WorktreeManagerSession implements PluginSession {
 
   constructor(
     public readonly tab: WorkspaceTab,
-    private readonly worktrees: WorktreeService,
-    private readonly getConfig: () => Record<string, ConfigValue>
+    private readonly worktrees: WorktreeService
   ) {}
 
   snapshot(): PluginSessionSnapshot {
@@ -181,7 +182,7 @@ class WorktreeManagerSession implements PluginSession {
 
   async handleAction(action: string, input: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (action === "get_worktree_project") {
-      this.state = await this.worktrees.getState(this.tab.cwd, this.stateOptions());
+      this.state = await this.worktrees.getState(this.tab.cwd, this.stateOptions(input));
       return this.state as unknown as Record<string, unknown>;
     }
     if (action === "initialize_bare_repository") {
@@ -216,8 +217,8 @@ class WorktreeManagerSession implements PluginSession {
     throw new Error(`Unsupported worktree manager action: ${action}`);
   }
 
-  private stateOptions() {
-    return { includeSizes: this.getConfig().showFolderSize !== false };
+  private stateOptions(input?: Record<string, unknown>) {
+    return { includeSizes: optionalBoolean(input?.includeSizes, "includeSizes") ?? false };
   }
 }
 

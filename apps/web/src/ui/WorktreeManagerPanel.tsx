@@ -21,6 +21,7 @@ export function WorktreeManagerPanel({ tab, config = {} }: { tab: WorkspaceTab; 
   const [deleteConfirmation, setDeleteConfirmation] = useState("");
   const [forceDelete, setForceDelete] = useState(false);
   const [busyAction, setBusyAction] = useState<BusyAction | undefined>();
+  const [sizesLoading, setSizesLoading] = useState(false);
   const [error, setError] = useState<string | undefined>();
 
   const branchPrefix = typeof config.branchPrefix === "string" ? config.branchPrefix : "";
@@ -34,6 +35,20 @@ export function WorktreeManagerPanel({ tab, config = {} }: { tab: WorkspaceTab; 
   }, [tab.id]);
 
   useEffect(() => {
+    if (showFolderSize && state?.status === "ready" && state.worktrees.some((worktree) => typeof worktree.sizeBytes !== "number" && !worktree.sizeError && !worktree.sizePending)) {
+      void loadSizes();
+    }
+  }, [showFolderSize, state?.status, state?.worktrees]);
+
+  useEffect(() => {
+    if (!showFolderSize || state?.status !== "ready" || !state.worktrees.some((worktree) => worktree.sizePending)) {
+      return undefined;
+    }
+    const timeout = window.setTimeout(() => void loadSizes(), 1_000);
+    return () => window.clearTimeout(timeout);
+  }, [showFolderSize, state?.status, state?.worktrees]);
+
+  useEffect(() => {
     if (mode === "new_branch") {
       setBranchName((current) => prefillBranchPrefix("new_branch", current, branchPrefix));
     }
@@ -43,11 +58,25 @@ export function WorktreeManagerPanel({ tab, config = {} }: { tab: WorkspaceTab; 
     setBusyAction("state");
     setError(undefined);
     try {
-      setState(await runTabAction<WorktreeProjectState>(tab.id, "get_worktree_project", {}));
+      setState(await runTabAction<WorktreeProjectState>(tab.id, "get_worktree_project", { includeSizes: false }));
     } catch (err) {
       setError(errorMessage(err));
     } finally {
       setBusyAction(undefined);
+    }
+  }
+
+  async function loadSizes() {
+    if (sizesLoading) {
+      return;
+    }
+    setSizesLoading(true);
+    try {
+      setState(await runTabAction<WorktreeProjectState>(tab.id, "get_worktree_project", { includeSizes: true }));
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSizesLoading(false);
     }
   }
 
@@ -114,7 +143,7 @@ export function WorktreeManagerPanel({ tab, config = {} }: { tab: WorkspaceTab; 
         </ControlButton>
       </div>
       {error ? <div className="inline-error">{error}</div> : null}
-      {!state ? <LoadingState /> : state.status === "ready" ? <ManagerView state={state} busy={Boolean(busyAction)} localRefs={localRefs} remoteRefs={remoteRefs} tagRefs={tagRefs} mode={mode} folderName={folderName} branchName={branchName} baseRef={baseRef} showFolderSize={showFolderSize} branchPrefix={branchPrefix} deleteTarget={deleteTarget} deleteConfirmation={deleteConfirmation} forceDelete={forceDelete} onModeChange={setMode} onFolderNameChange={setFolderName} onBranchNameChange={setBranchName} onBaseRefChange={setBaseRef} onFetch={() => void fetchRefs()} onCreate={() => void createWorktree()} onOpenDelete={openDelete} onCancelDelete={() => setDeleteTarget(undefined)} onDeleteConfirmationChange={setDeleteConfirmation} onForceDeleteChange={setForceDelete} onDelete={() => void deleteWorktree()} /> : state.status === "empty" ? <SetupView cloneUrl={cloneUrl} busy={Boolean(busyAction)} onCloneUrlChange={setCloneUrl} onInitialize={() => void initializeBareRepository()} onClone={() => void cloneBareRepository()} /> : <BlockedView state={state} />}
+      {!state ? <LoadingState /> : state.status === "ready" ? <ManagerView state={state} busy={Boolean(busyAction)} localRefs={localRefs} remoteRefs={remoteRefs} tagRefs={tagRefs} mode={mode} folderName={folderName} branchName={branchName} baseRef={baseRef} showFolderSize={showFolderSize} sizesLoading={sizesLoading} branchPrefix={branchPrefix} deleteTarget={deleteTarget} deleteConfirmation={deleteConfirmation} forceDelete={forceDelete} onModeChange={setMode} onFolderNameChange={setFolderName} onBranchNameChange={setBranchName} onBaseRefChange={setBaseRef} onFetch={() => void fetchRefs()} onCreate={() => void createWorktree()} onOpenDelete={openDelete} onCancelDelete={() => setDeleteTarget(undefined)} onDeleteConfirmationChange={setDeleteConfirmation} onForceDeleteChange={setForceDelete} onDelete={() => void deleteWorktree()} /> : state.status === "empty" ? <SetupView cloneUrl={cloneUrl} busy={Boolean(busyAction)} onCloneUrlChange={setCloneUrl} onInitialize={() => void initializeBareRepository()} onClone={() => void cloneBareRepository()} /> : <BlockedView state={state} />}
     </div>
   );
 }
@@ -180,6 +209,7 @@ function ManagerView({
   branchName,
   baseRef,
   showFolderSize,
+  sizesLoading,
   branchPrefix,
   deleteTarget,
   deleteConfirmation,
@@ -206,6 +236,7 @@ function ManagerView({
   branchName: string;
   baseRef: string;
   showFolderSize: boolean;
+  sizesLoading: boolean;
   branchPrefix: string;
   deleteTarget: WorktreeSummary | undefined;
   deleteConfirmation: string;
@@ -294,7 +325,7 @@ function ManagerView({
                   <strong>{worktree.folderName}</strong>
                   <span>{worktree.branch ?? worktree.head ?? "detached"}</span>
                 </div>
-                {showFolderSize ? <SizeBadge worktree={worktree} /> : null}
+                {showFolderSize ? <SizeBadge worktree={worktree} loading={sizesLoading || Boolean(worktree.sizePending)} /> : null}
                 <DirtyBadge worktree={worktree} />
                 <ControlButton type="button" tone="danger" iconOnly onClick={() => onOpenDelete(worktree)} disabled={busy} title={`Delete ${worktree.folderName}`}>
                   <Trash2 size={15} />
@@ -402,7 +433,7 @@ function DirtyBadge({ worktree }: { worktree: WorktreeSummary }) {
   );
 }
 
-function SizeBadge({ worktree }: { worktree: WorktreeSummary }) {
+function SizeBadge({ worktree, loading }: { worktree: WorktreeSummary; loading: boolean }) {
   if (typeof worktree.sizeBytes === "number") {
     return (
       <span className="worktree-size" title={`${worktree.sizeBytes} bytes`}>
@@ -416,6 +447,9 @@ function SizeBadge({ worktree }: { worktree: WorktreeSummary }) {
         Size unavailable
       </span>
     );
+  }
+  if (loading) {
+    return <span className="worktree-size unavailable">Size...</span>;
   }
   return null;
 }

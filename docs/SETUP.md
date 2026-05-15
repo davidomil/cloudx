@@ -27,8 +27,9 @@ The installer is split into two visible phases:
 
 1. `install.sh` is the Ubuntu bootstrap. It verifies Ubuntu, installs apt
    packages required by Cloudx, checks for Node.js 22 and npm, and installs the
-   NodeSource Node.js 22 package when either Node.js or npm is missing. That
-   package provides both `node` and `npm`.
+   NodeSource Node.js 22 package when Node.js is too old or missing. It then
+   verifies `node -v` and `npm -v`, and installs Ubuntu's separate `npm` package
+   if the `npm` command is missing.
 2. `scripts/install-cloudx.mjs` is the Cloudx wizard. It prints each phase as it
    runs: Codex CLI verification/login, install choices, `npm ci`, ASR virtualenv
    setup, Hugging Face model download, `npm run build`, certificate creation,
@@ -93,6 +94,8 @@ Run:
 The update path keeps the existing `~/.config/cloudx/cloudx.env` choices and
 does the operational refresh:
 
+- Verifies Ubuntu prerequisites, Node.js, and npm before any Codex or Cloudx npm
+  commands run.
 - Pulls the current checkout with `git pull --ff-only`.
 - Updates the global Codex CLI package with npm and verifies Codex login status.
 - Reinstalls Node dependencies with `npm ci`.

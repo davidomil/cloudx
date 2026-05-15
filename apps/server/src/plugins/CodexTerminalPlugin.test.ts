@@ -167,6 +167,56 @@ describe("CodexTerminalSession", () => {
 
     expect(closed).toEqual(["Codex exited with code 1."]);
   });
+
+  it("keeps immediately failed Codex tabs open long enough to show the failure", () => {
+    vi.useFakeTimers();
+    try {
+      const process = new FakeTerminalProcess();
+      const closed: string[] = [];
+      const statuses: Array<{ status: WorkspaceTab["status"]; message?: string }> = [];
+      const session = new CodexTerminalSession(
+        tab,
+        process,
+        {
+          setTabIndicator: () => undefined,
+          closeTab: (reason) => closed.push(reason ?? "")
+        },
+        { closeOnExit: true, closeOnExitAfterMs: 2000 }
+      );
+      session.onStatusChange((status, message) => statuses.push({ status, message }));
+
+      process.exit(1);
+
+      expect(closed).toEqual([]);
+      expect(statuses).toEqual([{ status: "failed", message: "Codex exited with code 1." }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still closes Codex tabs after the startup grace period", async () => {
+    vi.useFakeTimers();
+    try {
+      const process = new FakeTerminalProcess();
+      const closed: string[] = [];
+      new CodexTerminalSession(
+        tab,
+        process,
+        {
+          setTabIndicator: () => undefined,
+          closeTab: (reason) => closed.push(reason ?? "")
+        },
+        { closeOnExit: true, closeOnExitAfterMs: 2000 }
+      );
+
+      await vi.advanceTimersByTimeAsync(2000);
+      process.exit(0);
+
+      expect(closed).toEqual(["Codex exited cleanly."]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("TerminalShellIntegrationParser", () => {

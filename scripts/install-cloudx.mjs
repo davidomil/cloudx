@@ -203,15 +203,34 @@ export function renderCloudxService({ repoRoot: root, envPath, nodePath, npmPath
 }
 
 export function ubuntuBootstrapPlan({ nodeVersionText = "", hasNpm = false } = {}) {
+  const nodeInstallNeeded = parseNodeMajor(nodeVersionText) < 22;
   const commands = [
     ["sudo", "apt-get", "update"],
     ["sudo", "apt-get", "install", "-y", ...UBUNTU_APT_PACKAGES]
   ];
-  if (needsNodeInstall(nodeVersionText, hasNpm)) {
+  if (nodeInstallNeeded) {
     commands.push(["sh", "-lc", "curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -"]);
     commands.push(["sudo", "apt-get", "install", "-y", "nodejs"]);
   }
+  if (nodeInstallNeeded || !hasNpm) {
+    commands.push(["sh", "-lc", "command -v npm >/dev/null 2>&1 || sudo apt-get install -y npm"]);
+  }
+  commands.push(["node", "-v"]);
+  commands.push(["npm", "-v"]);
   return commands;
+}
+
+export function installUbuntuPrerequisites(commands) {
+  const nodeVersionText = commands.exists("node") ? commands.capture("node", ["-v"]) : "";
+  const hasNpm = commands.exists("npm");
+  for (const [command, ...args] of ubuntuBootstrapPlan({ nodeVersionText, hasNpm })) {
+    commands.run(command, args);
+  }
+}
+
+export function verifyNodeAndNpm(commands) {
+  commands.run("node", ["-v"]);
+  commands.run("npm", ["-v"]);
 }
 
 export function cloudxAccessUrls(port, networkInterfaces = os.networkInterfaces()) {
@@ -317,6 +336,13 @@ export async function runInstaller(options = {}) {
   if (options.uninstall) {
     return await runUninstaller({ paths, commands, runner, prompt, dryRun });
   }
+  section(options.update ? "1/9 Install and verify Ubuntu prerequisites" : "1/8 Install and verify Ubuntu prerequisites");
+  if (process.env.CLOUDX_INSTALL_BOOTSTRAPPED === "1") {
+    console.log("Shell bootstrap already installed Ubuntu packages. Verifying Node.js and npm.");
+    verifyNodeAndNpm(commands);
+  } else {
+    installUbuntuPrerequisites(commands);
+  }
   if (options.update) {
     return await runUpdater({ paths, commands, runner, prompt, noStart: options.noStart, networkInterfaces });
   }
@@ -335,10 +361,10 @@ export async function runInstaller(options = {}) {
     console.log("CUDA/cuDNN runtime libraries were not detected, so GPU mode will fail unless they are installed first.");
   }
 
-  section("1/7 Verify Codex CLI");
+  section("2/8 Verify Codex CLI");
   await ensureCodex(commands, prompt);
 
-  section("2/7 Collect install choices");
+  section("3/8 Collect install choices");
   explainQuestion(
     "Allowed workspace roots",
     "Cloudx can open terminals and files only under these roots. Use ':' to separate multiple roots on Linux, for example '~:/srv/projects'."
@@ -379,12 +405,12 @@ export async function runInstaller(options = {}) {
     enableLinger
   });
 
-  section("3/7 Install Cloudx npm dependencies");
+  section("4/8 Install Cloudx npm dependencies");
   commands.run("npm", ["ci"]);
-  section("4/7 Prepare ASR Python environment and model");
+  section("5/8 Prepare ASR Python environment and model");
   setupAsr(commands, paths);
   downloadModel(commands, paths);
-  section("5/7 Build Cloudx and create HTTPS certificate");
+  section("6/8 Build Cloudx and create HTTPS certificate");
   commands.run("npm", ["run", "build"]);
   commands.run("npm", ["run", "cert:create"], {
     env: certHosts.trim() ? { CLOUDX_CERT_HOSTS: certHosts.trim() } : undefined
@@ -400,11 +426,11 @@ export async function runInstaller(options = {}) {
     cpuThreads,
     ...device
   };
-  section("6/7 Write Cloudx configuration");
+  section("7/8 Write Cloudx configuration");
   runner.writeFile(paths.envPath, renderEnvFile(envConfig));
 
   if (installServices) {
-    section("7/7 Install user-level systemd services");
+    section("8/8 Install user-level systemd services");
     installSystemdServices(commands, runner, paths);
     if (enableLinger) {
       commands.run("sudo", ["loginctl", "enable-linger", os.userInfo().username]);
@@ -416,7 +442,7 @@ export async function runInstaller(options = {}) {
       verifyServices(commands, port);
     }
   } else {
-    section("7/7 Skip systemd service installation");
+    section("8/8 Skip systemd service installation");
     console.log("Cloudx was configured for manual startup with npm run dev.");
   }
 
@@ -515,28 +541,28 @@ async function runUpdater({ paths, commands, runner, prompt, noStart, networkInt
   const port = Number.parseInt(envConfig.CLOUDX_PORT ?? "3001", 10);
   const servicesInstalled = SERVICE_NAMES.every((serviceName) => fs.existsSync(path.join(paths.systemdDir, serviceName)));
 
-  section("1/8 Pull latest Cloudx checkout");
+  section("2/9 Pull latest Cloudx checkout");
   if (process.env.CLOUDX_INSTALL_ALREADY_PULLED === "1") {
     console.log("Checkout was already pulled by install.sh.");
   } else {
     commands.run("git", ["pull", "--ff-only"]);
   }
 
-  section("2/8 Update Codex CLI");
+  section("3/9 Update Codex CLI");
   await updateCodex(commands, prompt);
 
-  section("3/8 Update Cloudx npm dependencies");
+  section("4/9 Update Cloudx npm dependencies");
   commands.run("npm", ["ci"]);
 
-  section("4/8 Update ASR Python environment and model");
+  section("5/9 Update ASR Python environment and model");
   setupAsr(commands, paths);
   downloadModel(commands, paths);
 
-  section("5/8 Rebuild Cloudx and refresh HTTPS certificate if missing");
+  section("6/9 Rebuild Cloudx and refresh HTTPS certificate if missing");
   commands.run("npm", ["run", "build"]);
   commands.run("npm", ["run", "cert:create"]);
 
-  section("6/8 Refresh installed systemd service files");
+  section("7/9 Refresh installed systemd service files");
   if (servicesInstalled) {
     installSystemdServices(commands, runner, paths);
     commands.run("systemctl", ["--user", "daemon-reload"]);
@@ -550,7 +576,7 @@ async function runUpdater({ paths, commands, runner, prompt, noStart, networkInt
     (explainQuestion("Restart services", "Restarts Cloudx and ASR after dependencies and service files are updated, then verifies the health endpoints."),
     await prompt.boolean("restartServices", "Restart Cloudx services after update?", true));
 
-  section("7/8 Restart services");
+  section("8/9 Restart services");
   if (restartServices) {
     commands.run("systemctl", ["--user", "restart", ...SERVICE_NAMES]);
     verifyServices(commands, port);
@@ -560,7 +586,7 @@ async function runUpdater({ paths, commands, runner, prompt, noStart, networkInt
     console.log("No installed services to restart.");
   }
 
-  section("8/8 Update complete");
+  section("9/9 Update complete");
   printUpdateComplete({ paths, port, servicesInstalled, restartServices, networkInterfaces });
   await prompt.close();
   return { runner, paths, port, servicesInstalled, restartServices, urls: cloudxAccessUrls(port, networkInterfaces) };
@@ -707,7 +733,8 @@ function waitForHealth(commands, { label, url, insecure = false }) {
     args.push("--insecure");
   }
   args.push(url);
-  commands.run("curl", args);
+  commands.capture("curl", args);
+  console.log(`  ${label} health ok.`);
 }
 
 async function ensureCodex(commands, prompt) {

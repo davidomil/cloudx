@@ -9,6 +9,7 @@ const execFileAsync = promisify(execFile);
 
 const BARE_DIRECTORY_NAME = ".bare";
 const MAX_GIT_OUTPUT_BYTES = 2_000_000;
+const WORKTREE_SIZE_CACHE_TTL_MS = 30_000;
 
 interface GitCommandResult {
   stdout: string;
@@ -31,6 +32,13 @@ interface DeleteWorktreeInput {
 
 interface WorktreeStateOptions {
   includeSizes?: boolean;
+}
+
+interface WorktreeSizeCacheEntry {
+  sizeBytes?: number;
+  sizeError?: string;
+  updatedAt?: number;
+  pending?: Promise<void>;
 }
 
 interface ParsedWorktree {
@@ -75,6 +83,8 @@ type ResolvedProjectContext =
   | { kind: "empty"; context: EmptyProjectContext };
 
 export class WorktreeService {
+  private readonly sizeCache = new Map<string, WorktreeSizeCacheEntry>();
+
   async getState(projectDir: string, options: WorktreeStateOptions = {}): Promise<WorktreeProjectState> {
     const resolved = await this.resolveProjectContext(projectDir);
     if (resolved.kind === "empty") {
@@ -174,6 +184,7 @@ export class WorktreeService {
     }
 
     await this.runBareGit(context.barePath, ["worktree", "remove", ...(input.force ? ["--force"] : []), worktree.path]);
+    this.sizeCache.delete(worktree.path);
     return this.getState(projectDir, options);
   }
 
@@ -354,11 +365,7 @@ export class WorktreeService {
             dirty: await this.dirtyStatus(worktree.path)
           };
           if (options.includeSizes) {
-            try {
-              summary.sizeBytes = await directorySizeBytes(worktree.path);
-            } catch (error) {
-              summary.sizeError = error instanceof Error ? error.message : String(error);
-            }
+            this.attachCachedSize(summary, worktree.path);
           }
           return summary;
         })
@@ -387,6 +394,49 @@ export class WorktreeService {
       }
     }
     return { dirty: staged + unstaged + untracked > 0, staged, unstaged, untracked };
+  }
+
+  private attachCachedSize(summary: WorktreeSummary, worktreePath: string): void {
+    const cached = this.sizeCache.get(worktreePath);
+    if (typeof cached?.sizeBytes === "number") {
+      summary.sizeBytes = cached.sizeBytes;
+    }
+    if (cached?.sizeError) {
+      summary.sizeError = cached.sizeError;
+    }
+    if (cached?.pending) {
+      summary.sizePending = true;
+      return;
+    }
+
+    const fresh = cached?.updatedAt !== undefined && Date.now() - cached.updatedAt < WORKTREE_SIZE_CACHE_TTL_MS;
+    if (fresh) {
+      return;
+    }
+
+    let pending: Promise<void>;
+    pending = directorySizeBytes(worktreePath)
+      .then((sizeBytes) => {
+        this.sizeCache.set(worktreePath, { sizeBytes, updatedAt: Date.now() });
+      })
+      .catch((error) => {
+        this.sizeCache.set(worktreePath, { sizeError: error instanceof Error ? error.message : String(error), updatedAt: Date.now() });
+      })
+      .finally(() => {
+        const current = this.sizeCache.get(worktreePath);
+        if (current?.pending !== pending) {
+          return;
+        }
+        const { pending: _pending, ...rest } = current;
+        if (typeof rest.sizeBytes === "number" || rest.sizeError) {
+          this.sizeCache.set(worktreePath, rest);
+        } else {
+          this.sizeCache.delete(worktreePath);
+        }
+      });
+
+    this.sizeCache.set(worktreePath, { ...cached, pending });
+    summary.sizePending = true;
   }
 
   private async requireNewWorktreePath(projectDir: string, worktreePath: string, folderName: string): Promise<void> {

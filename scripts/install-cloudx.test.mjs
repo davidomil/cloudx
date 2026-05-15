@@ -8,6 +8,7 @@ import {
   InstallerRunner,
   cloudxAccessUrls,
   defaultCpuThreads,
+  installUbuntuPrerequisites,
   needsNodeInstall,
   parseNodeMajor,
   parseOsRelease,
@@ -42,6 +43,36 @@ describe("install-cloudx helpers", () => {
     expect(commands[0]).toEqual(["sudo", "apt-get", "update"]);
     expect(commands[1]).toContain("build-essential");
     expect(commands).toContainEqual(["sudo", "apt-get", "install", "-y", "nodejs"]);
+    expect(commands).toContainEqual(["sh", "-lc", "command -v npm >/dev/null 2>&1 || sudo apt-get install -y npm"]);
+    expect(commands).toContainEqual(["node", "-v"]);
+    expect(commands).toContainEqual(["npm", "-v"]);
+  });
+
+  it("plans npm fallback when Node is current but npm is missing", () => {
+    const commands = ubuntuBootstrapPlan({ nodeVersionText: "v22.0.0", hasNpm: false });
+
+    expect(commands).not.toContainEqual(["sudo", "apt-get", "install", "-y", "nodejs"]);
+    expect(commands).toContainEqual(["sh", "-lc", "command -v npm >/dev/null 2>&1 || sudo apt-get install -y npm"]);
+    expect(commands).toContainEqual(["npm", "-v"]);
+  });
+
+  it("checks current Node and npm before building a direct wizard bootstrap plan", () => {
+    const runner = new InstallerRunner({ dryRun: true, cwd: "/repo", log: () => undefined });
+
+    installUbuntuPrerequisites({
+      exists: (command) => command === "npm",
+      capture: () => "",
+      run: runner.run.bind(runner)
+    });
+
+    expect(runner.commands.map((command) => [command.command, ...command.args])).toEqual(
+      expect.arrayContaining([
+        ["sudo", "apt-get", "install", "-y", "nodejs"],
+        ["sh", "-lc", "command -v npm >/dev/null 2>&1 || sudo apt-get install -y npm"],
+        ["node", "-v"],
+        ["npm", "-v"]
+      ])
+    );
   });
 
   it("builds local and LAN access URLs", () => {
@@ -125,6 +156,8 @@ describe("runInstaller dry-run", () => {
     expect(result.envConfig).toMatchObject({ device: "cpu", computeType: "int8", cpuThreads: 6 });
     expect(runner.commands.map((command) => [command.command, ...command.args])).toEqual(
       expect.arrayContaining([
+        ["node", "-v"],
+        ["npm", "-v"],
         ["npm", "ci"],
         ["/repo/services/asr/.venv/bin/hf", "download", "Systran/faster-whisper-large-v3", "--local-dir", "/home/me/.cache/cloudx/models/faster-whisper-large-v3"],
         ["npm", "run", "build"]
@@ -173,6 +206,7 @@ describe("runInstaller dry-run", () => {
       "--insecure",
       "https://127.0.0.1:3001/api/health"
     ]);
+    expect(runner.commands.find((command) => command.command === "curl" && command.args.includes("https://127.0.0.1:3001/api/health"))?.capture).toBe(true);
     expect(runner.writes.map((write) => write.path)).toEqual(
       expect.arrayContaining(["/home/me/.config/systemd/user/cloudx.service", "/home/me/.config/systemd/user/cloudx-asr.service"])
     );
@@ -277,6 +311,8 @@ describe("runInstaller dry-run", () => {
     expect(result.urls).toEqual(["https://127.0.0.1:3443", "https://192.168.8.249:3443"]);
     expect(planned).toEqual(
       expect.arrayContaining([
+        ["node", "-v"],
+        ["npm", "-v"],
         ["git", "pull", "--ff-only"],
         ["npm", "i", "-g", "@openai/codex@latest"],
         ["npm", "ci"],
@@ -302,6 +338,7 @@ describe("runInstaller dry-run", () => {
       "--insecure",
       "https://127.0.0.1:3443/api/health"
     ]);
+    expect(runner.commands.find((command) => command.command === "curl" && command.args.includes("https://127.0.0.1:3443/api/health"))?.capture).toBe(true);
     expect(runner.writes.map((write) => write.path)).toEqual(
       expect.arrayContaining([path.join(home, ".config/systemd/user/cloudx.service"), path.join(home, ".config/systemd/user/cloudx-asr.service")])
     );
