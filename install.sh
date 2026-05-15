@@ -6,13 +6,21 @@ cd "$ROOT_DIR"
 
 DRY_RUN=0
 UNINSTALL=0
+UPDATE=0
 for arg in "$@"; do
   if [[ "$arg" == "--dry-run" ]]; then
     DRY_RUN=1
   elif [[ "$arg" == "--uninstall" ]]; then
     UNINSTALL=1
+  elif [[ "$arg" == "--update" ]]; then
+    UPDATE=1
   fi
 done
+
+if [[ "$UNINSTALL" -eq 1 && "$UPDATE" -eq 1 ]]; then
+  echo "--update cannot be combined with --uninstall." >&2
+  exit 1
+fi
 
 if [[ ! -r /etc/os-release ]]; then
   echo "Cloudx installer currently supports Ubuntu first. /etc/os-release is missing." >&2
@@ -93,6 +101,12 @@ if [[ "$DRY_RUN" -eq 1 ]] && ! command -v node >/dev/null 2>&1; then
   echo '$ node scripts/install-cloudx.mjs "$@"'
   echo "Node is not installed, so only the shell bootstrap dry-run was printed." >&2
   exit 0
+fi
+
+if [[ "$UPDATE" -eq 1 ]]; then
+  step "Pull latest Cloudx checkout"
+  run git pull --ff-only
+  export CLOUDX_INSTALL_ALREADY_PULLED=1
 fi
 
 step "Launch the Cloudx installer wizard"

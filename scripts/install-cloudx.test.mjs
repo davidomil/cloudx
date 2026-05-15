@@ -1,3 +1,7 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -238,6 +242,68 @@ describe("runInstaller dry-run", () => {
         ["rm", "-rf", "/repo/node_modules"],
         ["sudo", "loginctl", "disable-linger", process.env.USER ?? "david"]
       ])
+    );
+  });
+
+  it("plans an update that pulls, refreshes dependencies, services, and health checks", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-update-repo-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-update-home-"));
+    const runner = new InstallerRunner({ dryRun: true, cwd: root, log: () => undefined });
+    fs.mkdirSync(path.join(home, ".config/cloudx"), { recursive: true });
+    fs.mkdirSync(path.join(home, ".config/systemd/user"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".config/cloudx/cloudx.env"), "CLOUDX_PORT=3443\n");
+    fs.writeFileSync(path.join(home, ".config/systemd/user/cloudx.service"), "");
+    fs.writeFileSync(path.join(home, ".config/systemd/user/cloudx-asr.service"), "");
+
+    const result = await runInstaller({
+      repoRoot: root,
+      home,
+      dryRun: true,
+      yes: true,
+      update: true,
+      runner,
+      osRelease: { ID: "ubuntu", VERSION_ID: "24.04" },
+      answers: {
+        runCodexLogin: true,
+        restartServices: true
+      },
+      networkInterfaces: {
+        eth0: [{ family: "IPv4", internal: false, address: "192.168.8.249" }]
+      }
+    });
+
+    const planned = runner.commands.map((command) => [command.command, ...command.args]);
+    expect(result).toMatchObject({ port: 3443, servicesInstalled: true, restartServices: true });
+    expect(result.urls).toEqual(["https://127.0.0.1:3443", "https://192.168.8.249:3443"]);
+    expect(planned).toEqual(
+      expect.arrayContaining([
+        ["git", "pull", "--ff-only"],
+        ["npm", "i", "-g", "@openai/codex@latest"],
+        ["npm", "ci"],
+        [path.join(root, "services/asr/.venv/bin/pip"), "install", "-e", `${path.join(root, "services/asr")}[dev]`, "huggingface_hub[cli]"],
+        ["npm", "run", "build"],
+        ["npm", "run", "cert:create"],
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "restart", "cloudx-asr.service", "cloudx.service"]
+      ])
+    );
+    expect(planned).toContainEqual([
+      "curl",
+      "--fail",
+      "--silent",
+      "--show-error",
+      "--max-time",
+      "5",
+      "--retry",
+      "30",
+      "--retry-delay",
+      "1",
+      "--retry-connrefused",
+      "--insecure",
+      "https://127.0.0.1:3443/api/health"
+    ]);
+    expect(runner.writes.map((write) => write.path)).toEqual(
+      expect.arrayContaining([path.join(home, ".config/systemd/user/cloudx.service"), path.join(home, ".config/systemd/user/cloudx-asr.service")])
     );
   });
 });

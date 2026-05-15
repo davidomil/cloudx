@@ -30,7 +30,8 @@ export function parseArgs(argv = process.argv.slice(2)) {
     answersPath: undefined,
     yes: false,
     noStart: false,
-    uninstall: false
+    uninstall: false,
+    update: false
   };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -47,11 +48,16 @@ export function parseArgs(argv = process.argv.slice(2)) {
       options.noStart = true;
     } else if (arg === "--uninstall") {
       options.uninstall = true;
+    } else if (arg === "--update") {
+      options.update = true;
     } else if (arg === "--help" || arg === "-h") {
       options.help = true;
     } else {
       throw new Error(`Unknown installer option: ${arg}`);
     }
+  }
+  if (options.uninstall && options.update) {
+    throw new Error("--update cannot be combined with --uninstall.");
   }
   return options;
 }
@@ -68,6 +74,7 @@ export function helpText() {
     "       node scripts/install-cloudx.mjs [options]",
     "",
     "Options:",
+    "  --update           Pull the latest checkout and update installed dependencies/services.",
     "  --uninstall        Remove Cloudx services and selected local install artifacts.",
     "  --dry-run          Print commands and planned file writes without changing the system.",
     "  --answers <json>   Read wizard answers from a JSON file.",
@@ -310,6 +317,9 @@ export async function runInstaller(options = {}) {
   if (options.uninstall) {
     return await runUninstaller({ paths, commands, runner, prompt, dryRun });
   }
+  if (options.update) {
+    return await runUpdater({ paths, commands, runner, prompt, noStart: options.noStart, networkInterfaces });
+  }
   const gpuDetected = options.gpuDetected ?? commands.exists("nvidia-smi");
   const cudaRuntimeReady = options.cudaRuntimeReady ?? detectCudaRuntime(commands);
   const parallelism = options.parallelism ?? defaultParallelism();
@@ -494,6 +504,68 @@ async function runUninstaller({ paths, commands, runner, prompt }) {
   return { runner, paths, removed: { removeServices, removeConfig, removeVenv, removeRuntimeData, removeModel, removeNodeModules, disableLinger } };
 }
 
+async function runUpdater({ paths, commands, runner, prompt, noStart, networkInterfaces }) {
+  section("Cloudx update wizard");
+  console.log("This updates an existing Cloudx checkout and local install. It keeps your saved Cloudx environment config.");
+  console.log(`Repository: ${paths.repoRoot}`);
+  console.log(`Configuration file: ${paths.envPath}`);
+  console.log(`ASR model directory: ${paths.modelDir}`);
+
+  const envConfig = readEnvFile(paths.envPath);
+  const port = Number.parseInt(envConfig.CLOUDX_PORT ?? "3001", 10);
+  const servicesInstalled = SERVICE_NAMES.every((serviceName) => fs.existsSync(path.join(paths.systemdDir, serviceName)));
+
+  section("1/8 Pull latest Cloudx checkout");
+  if (process.env.CLOUDX_INSTALL_ALREADY_PULLED === "1") {
+    console.log("Checkout was already pulled by install.sh.");
+  } else {
+    commands.run("git", ["pull", "--ff-only"]);
+  }
+
+  section("2/8 Update Codex CLI");
+  await updateCodex(commands, prompt);
+
+  section("3/8 Update Cloudx npm dependencies");
+  commands.run("npm", ["ci"]);
+
+  section("4/8 Update ASR Python environment and model");
+  setupAsr(commands, paths);
+  downloadModel(commands, paths);
+
+  section("5/8 Rebuild Cloudx and refresh HTTPS certificate if missing");
+  commands.run("npm", ["run", "build"]);
+  commands.run("npm", ["run", "cert:create"]);
+
+  section("6/8 Refresh installed systemd service files");
+  if (servicesInstalled) {
+    installSystemdServices(commands, runner, paths);
+    commands.run("systemctl", ["--user", "daemon-reload"]);
+  } else {
+    console.log("Cloudx user services were not found, so service unit refresh is skipped.");
+  }
+
+  const restartServices =
+    servicesInstalled &&
+    !noStart &&
+    (explainQuestion("Restart services", "Restarts Cloudx and ASR after dependencies and service files are updated, then verifies the health endpoints."),
+    await prompt.boolean("restartServices", "Restart Cloudx services after update?", true));
+
+  section("7/8 Restart services");
+  if (restartServices) {
+    commands.run("systemctl", ["--user", "restart", ...SERVICE_NAMES]);
+    verifyServices(commands, port);
+  } else if (servicesInstalled) {
+    console.log("Services were refreshed but not restarted. Restart later with: systemctl --user restart cloudx-asr.service cloudx.service");
+  } else {
+    console.log("No installed services to restart.");
+  }
+
+  section("8/8 Update complete");
+  printUpdateComplete({ paths, port, servicesInstalled, restartServices, networkInterfaces });
+  await prompt.close();
+  return { runner, paths, port, servicesInstalled, restartServices, urls: cloudxAccessUrls(port, networkInterfaces) };
+}
+
 function section(title) {
   console.log(`\n==> ${title}`);
 }
@@ -534,6 +606,22 @@ function printInstallComplete({ paths, port, installServices, startServices, net
     console.log(`    ${url}`);
   }
   if (installServices) {
+    console.log("  status: systemctl --user status cloudx.service cloudx-asr.service");
+  } else {
+    console.log("  run: npm run dev");
+  }
+}
+
+function printUpdateComplete({ paths, port, servicesInstalled, restartServices, networkInterfaces }) {
+  const urls = cloudxAccessUrls(port, networkInterfaces);
+  console.log("Cloudx update complete.");
+  console.log(`  env: ${paths.envPath}`);
+  console.log(`  ASR model: ${paths.modelDir}`);
+  console.log(restartServices ? "  open Cloudx:" : "  after starting or restarting Cloudx, open:");
+  for (const url of urls) {
+    console.log(`    ${url}`);
+  }
+  if (servicesInstalled) {
     console.log("  status: systemctl --user status cloudx.service cloudx-asr.service");
   } else {
     console.log("  run: npm run dev");
@@ -629,6 +717,23 @@ async function ensureCodex(commands, prompt) {
   } else {
     console.log("Codex CLI is already on PATH.");
   }
+  commands.run("codex", ["--version"]);
+  if (!commands.statusOk("codex", ["login", "status"])) {
+    const loginNow = await prompt.boolean("runCodexLogin", "Codex is not authenticated. Run codex login now?", true);
+    if (loginNow) {
+      commands.run("codex", ["login"]);
+      if (!commands.statusOk("codex", ["login", "status"])) {
+        throw new Error("Codex login did not complete successfully.");
+      }
+    } else {
+      throw new Error("Codex must be authenticated before Cloudx voice control and Codex tabs can work.");
+    }
+  }
+}
+
+async function updateCodex(commands, prompt) {
+  console.log("Updating Codex CLI globally with npm.");
+  commands.run("npm", ["i", "-g", "@openai/codex@latest"]);
   commands.run("codex", ["--version"]);
   if (!commands.statusOk("codex", ["login", "status"])) {
     const loginNow = await prompt.boolean("runCodexLogin", "Codex is not authenticated. Run codex login now?", true);
@@ -758,6 +863,23 @@ function readText(filePath, fallback) {
   } catch {
     return fallback;
   }
+}
+
+function readEnvFile(filePath) {
+  const content = readText(filePath, "");
+  const values = {};
+  for (const line of content.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+    const separator = trimmed.indexOf("=");
+    if (separator === -1) {
+      continue;
+    }
+    values[trimmed.slice(0, separator)] = trimmed.slice(separator + 1);
+  }
+  return values;
 }
 
 function defaultParallelism() {

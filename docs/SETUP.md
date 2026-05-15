@@ -56,6 +56,7 @@ Useful non-interactive planning options:
 
 ```bash
 ./install.sh --dry-run
+./install.sh --update --dry-run
 ./install.sh --uninstall --dry-run
 node scripts/install-cloudx.mjs --dry-run --yes
 node scripts/install-cloudx.mjs --dry-run --answers ./answers.json
@@ -80,6 +81,32 @@ The answers JSON can contain:
 GPU support is configure-only in the first Ubuntu installer. If an NVIDIA GPU is
 detected, the wizard asks whether to use it; choosing GPU requires CUDA/cuDNN
 runtime libraries to already be installed.
+
+## Update
+
+Run:
+
+```bash
+./install.sh --update
+```
+
+The update path keeps the existing `~/.config/cloudx/cloudx.env` choices and
+does the operational refresh:
+
+- Pulls the current checkout with `git pull --ff-only`.
+- Updates the global Codex CLI package with npm and verifies Codex login status.
+- Reinstalls Node dependencies with `npm ci`.
+- Updates the ASR virtualenv packages and downloads the model if it is missing.
+- Rebuilds Cloudx and creates the local HTTPS certificate if it is missing.
+- Rewrites user-level systemd service files when they are already installed.
+- Asks whether to restart services now; if restarted, it verifies the Cloudx and
+  ASR health endpoints and then prints the local/LAN URLs.
+
+Preview update without changing the system:
+
+```bash
+./install.sh --update --dry-run --yes
+```
 
 ## Uninstall
 

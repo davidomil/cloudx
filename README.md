@@ -88,6 +88,12 @@ Preview the installer without changing the system:
 ./install.sh --dry-run --yes
 ```
 
+Update an existing install after pulling the latest checkout:
+
+```bash
+./install.sh --update
+```
+
 Remove Cloudx-managed services and local install artifacts:
 
 ```bash
