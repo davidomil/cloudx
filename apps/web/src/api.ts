@@ -39,7 +39,7 @@ export async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> 
   return (await response.json()) as T;
 }
 
-function errorMessageFromResponse(text: string, status: number): string {
+export function errorMessageFromResponse(text: string, status: number): string {
   if (!text) {
     return `Request failed with ${status}`;
   }
@@ -55,6 +55,85 @@ function errorMessageFromResponse(text: string, status: number): string {
     return text;
   }
   return text;
+}
+
+export interface FileDownloadResponse {
+  blob: Blob;
+  filename: string;
+}
+
+export interface FileUploadResponse {
+  path: string;
+  relativePath: string;
+  bytes: number;
+  uploaded: true;
+}
+
+export async function downloadFileBrowserEntries(tabId: string, relativePaths: string[]): Promise<FileDownloadResponse> {
+  const response = await fetch(`/api/tabs/${encodeURIComponent(tabId)}/files/download`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ relativePaths })
+  });
+  if (!response.ok) {
+    throw new Error(errorMessageFromResponse(await response.text(), response.status));
+  }
+  const filename = filenameFromContentDisposition(response.headers.get("content-disposition")) ?? (relativePaths.length === 1 ? relativePaths[0]?.split("/").filter(Boolean).pop() : undefined) ?? "cloudx-files";
+  return {
+    blob: await response.blob(),
+    filename
+  };
+}
+
+export async function uploadFileBrowserFile(tabId: string, relativePath: string, file: Blob): Promise<FileUploadResponse> {
+  const params = new URLSearchParams({ relativePath });
+  const response = await fetch(`/api/tabs/${encodeURIComponent(tabId)}/files/upload?${params.toString()}`, {
+    method: "POST",
+    headers: { "content-type": "application/octet-stream" },
+    body: file
+  });
+  if (!response.ok) {
+    throw new Error(errorMessageFromResponse(await response.text(), response.status));
+  }
+  return (await response.json()) as FileUploadResponse;
+}
+
+export function saveBlobDownload(blob: Blob, filename: string): void {
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = objectUrl;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+}
+
+export function filenameFromContentDisposition(value: string | null): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const parts = value.split(";").map((part) => part.trim());
+  const encodedFilename = parts.find((part) => part.toLowerCase().startsWith("filename*="));
+  if (encodedFilename) {
+    const rawValue = encodedFilename.slice(encodedFilename.indexOf("=") + 1).trim();
+    const match = /^([^']*)'[^']*'(.*)$/.exec(unquoteHeaderValue(rawValue));
+    if (match && (!match[1] || match[1].toLowerCase() === "utf-8")) {
+      return decodeURIComponent(match[2] ?? "");
+    }
+  }
+  const plainFilename = parts.find((part) => part.toLowerCase().startsWith("filename="));
+  if (!plainFilename) {
+    return undefined;
+  }
+  return unquoteHeaderValue(plainFilename.slice(plainFilename.indexOf("=") + 1).trim());
+}
+
+function unquoteHeaderValue(value: string): string {
+  if (value.startsWith('"') && value.endsWith('"')) {
+    return value.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+  }
+  return value;
 }
 
 export async function getPlugins(): Promise<PluginDescriptor[]> {

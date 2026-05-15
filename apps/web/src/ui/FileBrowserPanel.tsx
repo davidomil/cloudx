@@ -1,11 +1,11 @@
-import { useEffect, useId, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { Diff, Hunk, parseDiff, type DiffType, type FileData, type HunkData, type ViewType } from "react-diff-view";
 import "react-diff-view/style/index.css";
-import { AlignJustify, FileDiff, FileText, Folder, GitBranch, GitCompareArrows, GitFork, GitPullRequest, RefreshCw, Search } from "lucide-react";
+import { AlignJustify, Download, FileDiff, FileText, Folder, GitBranch, GitCompareArrows, GitFork, GitPullRequest, RefreshCw, Search, Upload, X } from "lucide-react";
 
 import type { ConfigValue, FileSearchFileResult, FileSearchMode, FileSearchResult, GitDiffFile, GitDiffFileSummary, GitDiffSummary, GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
 
-import { runTabAction } from "../api.js";
+import { downloadFileBrowserEntries, runTabAction, saveBlobDownload, uploadFileBrowserFile } from "../api.js";
 import { ControlButton, SegmentedControl } from "./Control.js";
 import { noSystemTextAssistProps } from "./inputAssist.js";
 
@@ -35,6 +35,7 @@ export interface OpenFileResult {
 
 type GitBusyAction = "state" | "diff" | "file" | "initialize" | "clone" | "origin";
 type SearchBusyAction = "search";
+type FileTransferBusyAction = "download" | "upload";
 export type DiffViewMode = Extract<ViewType, "split" | "unified">;
 const DEFAULT_GIT_AUTO_REFRESH_SECONDS = 15;
 const DEFAULT_FILE_TREE_SIZE = 280;
@@ -98,6 +99,13 @@ interface GitTreeChange {
   file?: GitDiffFileSummary;
 }
 
+interface FileContextMenuState {
+  entry: DisplayDirectoryEntry;
+  transferPath: string;
+  x: number;
+  y: number;
+}
+
 export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; config?: Record<string, ConfigValue> }) {
   const [initialState] = useState(() => readFileBrowserPanelState(tab));
   const [relativePath, setRelativePath] = useState(() => initialState?.relativePath ?? "");
@@ -117,6 +125,11 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   const [searchGlob, setSearchGlob] = useState(() => initialState?.searchGlob ?? "");
   const [searchResult, setSearchResult] = useState<FileSearchResult | undefined>(() => initialState?.searchResult);
   const [searchExpanded, setSearchExpanded] = useState(() => initialState?.searchExpanded ?? false);
+  const [transferSelectionMode, setTransferSelectionMode] = useState(false);
+  const [selectedTransferPaths, setSelectedTransferPaths] = useState<Set<string>>(() => new Set());
+  const [transferBusyAction, setTransferBusyAction] = useState<FileTransferBusyAction | undefined>();
+  const [uploadTargetPath, setUploadTargetPath] = useState<string | undefined>();
+  const [contextMenu, setContextMenu] = useState<FileContextMenuState | undefined>();
   const [treeVisible, setTreeVisible] = useState(() => initialState?.treeVisible ?? true);
   const [searchVisible, setSearchVisible] = useState(() => initialState?.searchVisible ?? false);
   const [gitBarVisible, setGitBarVisible] = useState(() => initialState?.gitBarVisible ?? true);
@@ -125,6 +138,8 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   const [fileTreeResizing, setFileTreeResizing] = useState(false);
   const [error, setError] = useState<string | undefined>();
   const bodyRef = useRef<HTMLDivElement | null>(null);
+  const uploadInputRef = useRef<HTMLInputElement | null>(null);
+  const contextMenuRef = useRef<HTMLDivElement | null>(null);
   const showGitDiff = config.showGitDiff !== false;
   const gitAutoRefresh = config.gitAutoRefresh !== false;
   const gitAutoRefreshIntervalMs = gitAutoRefreshIntervalMilliseconds(config);
@@ -195,6 +210,8 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     if (!input) {
       setSearchResult(undefined);
       setSearchBusyAction(undefined);
+      setSelectedTransferPaths(new Set());
+      setTransferSelectionMode(false);
       return;
     }
     let cancelled = false;
@@ -207,6 +224,8 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
             setSearchResult(result);
             setOpened(undefined);
             setOpenedDiff(undefined);
+            setSelectedTransferPaths(new Set());
+            setTransferSelectionMode(false);
           }
         })
         .catch((err) => {
@@ -226,12 +245,46 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     };
   }, [tab.id, searchQuery, searchMode, searchGlob]);
 
+  useEffect(() => {
+    const visibleTransferPaths = new Set(visibleEntries.filter((entry) => !entry.virtual).map((entry) => entryTransferPath(entry, relativePath)));
+    setSelectedTransferPaths((current) => {
+      const next = new Set(Array.from(current).filter((transferPath) => visibleTransferPaths.has(transferPath)));
+      return next.size === current.size ? current : next;
+    });
+  }, [relativePath, visibleEntries]);
+
+  useEffect(() => {
+    if (!contextMenu) {
+      return;
+    }
+    function closeOnOutsidePointer(event: PointerEvent) {
+      if (contextMenuRef.current?.contains(event.target as Node)) {
+        return;
+      }
+      setContextMenu(undefined);
+    }
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setContextMenu(undefined);
+      }
+    }
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [contextMenu]);
+
   async function loadDirectory(path: string, options: { preserveOpened?: boolean } = {}) {
     setError(undefined);
     try {
       const result = await runTabAction<DirectoryResult>(tab.id, "list_directory", { relativePath: path });
       setRelativePath(path);
       setEntries(result.entries);
+      setSelectedTransferPaths(new Set());
+      setTransferSelectionMode(false);
+      setContextMenu(undefined);
       if (!options.preserveOpened) {
         setOpened(undefined);
       }
@@ -405,6 +458,104 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     setSearchVisible(!searchVisible);
   }
 
+  async function downloadSelectedTransferPaths() {
+    if (!selectedTransferPaths.size) {
+      return;
+    }
+    const transferPaths = Array.from(selectedTransferPaths).sort();
+    await downloadTransferPaths(transferPaths);
+    setSelectedTransferPaths(new Set());
+    setTransferSelectionMode(false);
+  }
+
+  async function downloadTransferPaths(relativePaths: string[]) {
+    setTransferBusyAction("download");
+    setError(undefined);
+    try {
+      const download = await downloadFileBrowserEntries(tab.id, relativePaths);
+      saveBlobDownload(download.blob, download.filename);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTransferBusyAction(undefined);
+    }
+  }
+
+  async function uploadFiles(files: FileList | null) {
+    const selectedFiles = Array.from(files ?? []);
+    if (!selectedFiles.length) {
+      return;
+    }
+    setTransferBusyAction("upload");
+    setError(undefined);
+    const targetDirectory = uploadTargetPath ?? relativePath;
+    try {
+      for (const file of selectedFiles) {
+        await uploadFileBrowserFile(tab.id, fileTransferUploadPath(targetDirectory, file.name), file);
+      }
+      await loadDirectory(relativePath, { preserveOpened: true });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (uploadInputRef.current) {
+        uploadInputRef.current.value = "";
+      }
+      setUploadTargetPath(undefined);
+      setTransferBusyAction(undefined);
+    }
+  }
+
+  function toggleTransferPath(transferPath: string, selected: boolean) {
+    setSelectedTransferPaths((current) => {
+      const next = new Set(current);
+      if (selected) {
+        next.add(transferPath);
+      } else {
+        next.delete(transferPath);
+      }
+      return next;
+    });
+  }
+
+  function startTransferSelectionMode() {
+    setContextMenu(undefined);
+    setSelectedTransferPaths(new Set());
+    setTransferSelectionMode(true);
+  }
+
+  function cancelTransferSelectionMode() {
+    setSelectedTransferPaths(new Set());
+    setTransferSelectionMode(false);
+  }
+
+  function startUploadToCurrentFolder() {
+    setUploadTargetPath(undefined);
+    uploadInputRef.current?.click();
+  }
+
+  function startUploadToFolder(transferPath: string) {
+    setUploadTargetPath(transferPath);
+    setContextMenu(undefined);
+    uploadInputRef.current?.click();
+  }
+
+  function openFileContextMenu(event: ReactMouseEvent<HTMLDivElement>, entry: DisplayDirectoryEntry, transferPath: string) {
+    if (entry.virtual) {
+      return;
+    }
+    event.preventDefault();
+    const rect = event.currentTarget.getBoundingClientRect();
+    setContextMenu({
+      entry,
+      transferPath,
+      x: event.clientX || rect.left + 24,
+      y: event.clientY || rect.top + 24
+    });
+  }
+
+  const selectedTransferCount = selectedTransferPaths.size;
+  const transferBusy = Boolean(transferBusyAction);
+
   return (
     <div className="file-browser-panel">
       <div className="file-browser-toolbar">
@@ -413,6 +564,32 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
         <ControlButton iconOnly onClick={() => void loadDirectory(relativePath)} title="Refresh">
           <RefreshCw size={15} />
         </ControlButton>
+        {transferSelectionMode ? (
+          <>
+            <ControlButton type="button" iconOnly onClick={cancelTransferSelectionMode} aria-label="Cancel multi-select download" title="Cancel multi-select download">
+              <X size={15} />
+            </ControlButton>
+            <ControlButton type="button" iconOnly onClick={() => void downloadSelectedTransferPaths()} disabled={!selectedTransferCount || transferBusyAction === "download"} aria-label={`Download ${selectedTransferCount} selected entries`} title={selectedTransferCount ? `Download ${selectedTransferCount} selected` : "Select files or folders to download"}>
+              <Download size={15} className={transferBusyAction === "download" ? "spinning" : ""} />
+            </ControlButton>
+          </>
+        ) : (
+          <ControlButton type="button" iconOnly onClick={startTransferSelectionMode} aria-label="Select files or folders to download" title="Select files or folders to download">
+            <Download size={15} />
+          </ControlButton>
+        )}
+        <ControlButton type="button" iconOnly onClick={startUploadToCurrentFolder} disabled={transferBusyAction === "upload"} aria-label="Upload files" title="Upload files">
+          <Upload size={15} className={transferBusyAction === "upload" ? "spinning" : ""} />
+        </ControlButton>
+        <input
+          ref={uploadInputRef}
+          className="file-upload-input"
+          type="file"
+          multiple
+          onChange={(event) => {
+            void uploadFiles(event.currentTarget.files);
+          }}
+        />
         <ControlButton type="button" iconOnly pressed={treeVisible} aria-label={treeVisible ? "Hide tree view" : "Show tree view"} title={treeVisible ? "Hide tree view" : "Show tree view"} onClick={() => setTreeVisible(!treeVisible)}>
           <Folder size={15} />
         </ControlButton>
@@ -465,14 +642,31 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
         {treeVisible ? <div className="file-list">
           {activeSearchQuery && searchBusyAction ? <div className="file-list-empty">Searching...</div> : null}
           {activeSearchQuery && !searchBusyAction && activeSearchResult && visibleEntries.length === 0 ? <div className="file-list-empty">No matches.</div> : null}
-          {visibleEntries.map((entry) => (
-            <ControlButton key={`${entry.type}:${entry.name}:${entry.virtual ? "virtual" : "real"}`} className={entry.gitChange ? "has-git-change" : ""} onClick={() => void handleFileListEntry(entry)}>
-              {entry.type === "directory" ? <Folder size={15} /> : <FileText size={15} />}
-              <span>{entry.name}</span>
-              {entry.searchMatch ? <SearchMatchBadge entry={entry} /> : null}
-              {entry.gitChange ? <TreeChangeBadge change={entry.gitChange} /> : null}
-            </ControlButton>
-          ))}
+          {visibleEntries.map((entry) => {
+            const transferPath = entryTransferPath(entry, relativePath);
+            const downloadable = !entry.virtual;
+            const selected = selectedTransferPaths.has(transferPath);
+            return (
+              <div key={`${entry.type}:${entry.name}:${entry.virtual ? "virtual" : "real"}`} className={`file-list-row${transferSelectionMode ? " selecting" : ""}${entry.gitChange ? " has-git-change" : ""}${selected ? " selected" : ""}`} onContextMenu={(event) => openFileContextMenu(event, entry, transferPath)}>
+                {transferSelectionMode ? (
+                  <input
+                    className="file-transfer-checkbox"
+                    type="checkbox"
+                    checked={selected}
+                    disabled={!downloadable || transferBusy}
+                    aria-label={`Select ${entry.name} for download`}
+                    onChange={(event) => toggleTransferPath(transferPath, event.currentTarget.checked)}
+                  />
+                ) : null}
+                <ControlButton className="file-list-entry" selected={transferSelectionMode && selected} onClick={() => void handleFileListEntry(entry)}>
+                  {entry.type === "directory" ? <Folder size={15} /> : <FileText size={15} />}
+                  <span>{entry.name}</span>
+                  {entry.searchMatch ? <SearchMatchBadge entry={entry} /> : null}
+                  {entry.gitChange ? <TreeChangeBadge change={entry.gitChange} /> : null}
+                </ControlButton>
+              </div>
+            );
+          })}
         </div> : null}
         {treeVisible ? (
           <div
@@ -498,6 +692,29 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
           )}
         </div>
       </div>
+      {contextMenu ? (
+        <div ref={contextMenuRef} className="file-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} role="menu" aria-label={`Actions for ${contextMenu.entry.name}`}>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={transferBusyAction === "download"}
+            onClick={() => {
+              const transferPath = contextMenu.transferPath;
+              setContextMenu(undefined);
+              void downloadTransferPaths([transferPath]);
+            }}
+          >
+            <Download size={14} />
+            <span>Download</span>
+          </button>
+          {contextMenu.entry.type === "directory" ? (
+            <button type="button" role="menuitem" disabled={transferBusyAction === "upload"} onClick={() => startUploadToFolder(contextMenu.transferPath)}>
+              <Upload size={14} />
+              <span>Upload to</span>
+            </button>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 
@@ -1073,6 +1290,23 @@ export function filePreviewText(opened: OpenFileResult | undefined): string {
   }
   const displayPath = opened.relativePath ?? opened.path;
   return `${displayPath}${opened.truncated ? "\n[truncated]\n" : "\n\n"}${opened.content}`;
+}
+
+export function entryTransferPath(entry: { name: string; searchPath?: string }, currentRelativePath: string): string {
+  return normalizeTransferPath(entry.searchPath ?? (currentRelativePath ? `${currentRelativePath}/${entry.name}` : entry.name));
+}
+
+export function fileTransferUploadPath(currentRelativePath: string, filename: string): string {
+  const safeFilename = filename.split(/[\\/]+/).filter(Boolean).pop() ?? filename;
+  return normalizeTransferPath(currentRelativePath ? `${currentRelativePath}/${safeFilename}` : safeFilename);
+}
+
+function normalizeTransferPath(value: string): string {
+  const normalized = value
+    .split(/[\\/]+/)
+    .filter((part) => part && part !== ".")
+    .join("/");
+  return normalized || ".";
 }
 
 function parentPath(relativePath: string): string {

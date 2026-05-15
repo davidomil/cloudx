@@ -23,6 +23,7 @@ import { AsrClient } from "./asrClient.js";
 import { PathPolicy } from "./pathPolicy.js";
 import { PluginRegistry } from "./pluginRegistry.js";
 import { LocalWebProxy } from "./localWebProxy.js";
+import { contentDispositionAttachment, FileTransferService } from "./fileTransfer.js";
 import { CodexTerminalPlugin } from "./plugins/CodexTerminalPlugin.js";
 import { FileBrowserPlugin } from "./plugins/FileBrowserPlugin.js";
 import { LocalWebPlugin } from "./plugins/LocalWebPlugin.js";
@@ -58,6 +59,7 @@ export interface AppServices {
   hooks?: HookRegistry;
   pluginData?: PluginDataStore;
   rulesSkills?: RulesSkillsCatalogService;
+  fileTransfer?: FileTransferService;
 }
 
 const MIN_STREAMED_AUDIO_BYTES = 128;
@@ -78,12 +80,16 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   services.workspace ??= new WorkspaceLayoutStore(config.dataDir, services.pathPolicy);
   services.pluginData ??= new PluginDataStore(config.dataDir);
   services.rulesSkills ??= new RulesSkillsCatalogService(config.dataDir);
+  services.fileTransfer ??= new FileTransferService(services.pathPolicy);
   services.hooks ??= buildHookRegistry(services);
   services.sessions.setHookRegistry?.(services.hooks);
   const localWebProxy = new LocalWebProxy(services.sessions);
   await app.register(websocket);
 
   app.addContentTypeParser(/^audio\/.*/, { parseAs: "buffer" }, (_request, body, done) => {
+    done(null, body);
+  });
+  app.addContentTypeParser("application/octet-stream", { parseAs: "buffer" }, (_request, body, done) => {
     done(null, body);
   });
 
@@ -210,6 +216,19 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   app.post<{ Params: { tabId: string }; Body: { action: string; input: Record<string, unknown> } }>("/api/tabs/:tabId/actions", async (request) => {
     const result = await services.sessions.executePluginAction(request.params.tabId, request.body.action, request.body.input);
     return { result };
+  });
+
+  app.post<{ Params: { tabId: string }; Body: { relativePaths?: unknown } }>("/api/tabs/:tabId/files/download", async (request, reply) => {
+    const tab = services.sessions.getTab(request.params.tabId);
+    const download = await services.fileTransfer!.createDownload(tab, request.body?.relativePaths);
+    reply.header("content-type", download.contentType);
+    reply.header("content-disposition", contentDispositionAttachment(download.filename));
+    return reply.send(download.stream);
+  });
+
+  app.post<{ Params: { tabId: string }; Querystring: { relativePath?: string }; Body: Buffer }>("/api/tabs/:tabId/files/upload", async (request) => {
+    const tab = services.sessions.getTab(request.params.tabId);
+    return services.fileTransfer!.upload(tab, request.query.relativePath, request.body);
   });
 
   app.post<{ Params: { hookId: string }; Body: HookCallRequest }>("/api/hooks/:hookId", async (request) => {
@@ -607,9 +626,10 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     logger,
     { includeText: config.voiceDebugTranscripts ?? false }
   );
-  const hooks = buildHookRegistry({ plugins, sessions, pathPolicy, voice, asr, config: configService, workspace });
+  const fileTransfer = new FileTransferService(pathPolicy);
+  const hooks = buildHookRegistry({ plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, fileTransfer });
   sessions.setHookRegistry(hooks);
-  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, pluginData, rulesSkills };
+  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, pluginData, rulesSkills, fileTransfer };
 }
 
 function buildHookRegistry(services: AppServices): HookRegistry {

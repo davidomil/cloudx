@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { callHook, closeTab, fetchJson, getConfig, getHooks, setActiveTab, startAudioStream, submitTranscript, updateConfig, voiceAudioConstraints } from "./api.js";
+import { callHook, closeTab, downloadFileBrowserEntries, fetchJson, filenameFromContentDisposition, getConfig, getHooks, setActiveTab, startAudioStream, submitTranscript, updateConfig, uploadFileBrowserFile, voiceAudioConstraints } from "./api.js";
 
 describe("api client", () => {
   afterEach(() => {
@@ -39,6 +39,41 @@ describe("api client", () => {
     );
 
     await expect(fetchJson("/api/voice/transcript")).rejects.toThrow("planner failed");
+  });
+
+  it("downloads file browser blobs with the server-provided filename", async () => {
+    const fetchMock = vi.fn(async () => new Response(new Blob(["hello"]), { status: 200, headers: { "content-disposition": "attachment; filename=\"demo.txt\"; filename*=UTF-8''demo.txt" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await downloadFileBrowserEntries("tab-1", ["demo.txt"]);
+
+    expect(result.filename).toBe("demo.txt");
+    await expect(result.blob.text()).resolves.toBe("hello");
+    expect(fetchMock).toHaveBeenCalledWith("/api/tabs/tab-1/files/download", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ relativePaths: ["demo.txt"] })
+    });
+  });
+
+  it("uploads file browser blobs as octet streams", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ path: "/repo/docs/demo.txt", relativePath: "docs/demo.txt", bytes: 5, uploaded: true }));
+    vi.stubGlobal("fetch", fetchMock);
+    const file = new Blob(["hello"], { type: "text/plain" });
+
+    await expect(uploadFileBrowserFile("tab-1", "docs/demo.txt", file)).resolves.toMatchObject({ relativePath: "docs/demo.txt", bytes: 5 });
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/tabs/tab-1/files/upload?relativePath=docs%2Fdemo.txt", {
+      method: "POST",
+      headers: { "content-type": "application/octet-stream" },
+      body: file
+    });
+  });
+
+  it("parses utf-8 and plain content disposition filenames", () => {
+    expect(filenameFromContentDisposition("attachment; filename=\"fallback.txt\"; filename*=UTF-8''demo%20archive.tar.gz")).toBe("demo archive.tar.gz");
+    expect(filenameFromContentDisposition("attachment; filename=\"fallback.txt\"")).toBe("fallback.txt");
+    expect(filenameFromContentDisposition(null)).toBeUndefined();
   });
 
   it("sends client voice context with manual transcripts", async () => {

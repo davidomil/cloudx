@@ -194,6 +194,41 @@ describe("buildServer", () => {
     }
   });
 
+  it("uploads and downloads file browser files through tab-scoped routes", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-file-transfer-route-"));
+    const config = testConfig(root);
+    const app = await buildServer(config);
+    try {
+      const created = await app.inject({
+        method: "POST",
+        url: "/api/tabs",
+        payload: { pluginId: "file-browser", cwd: root }
+      });
+      const tabId = created.json().tab.id as string;
+
+      const upload = await app.inject({
+        method: "POST",
+        url: `/api/tabs/${tabId}/files/upload?relativePath=notes.bin`,
+        headers: { "content-type": "application/octet-stream" },
+        payload: Buffer.from([1, 2, 3])
+      });
+      expect(upload.statusCode).toBe(200);
+      expect(upload.json()).toMatchObject({ relativePath: "notes.bin", bytes: 3, uploaded: true });
+
+      const download = await app.inject({
+        method: "POST",
+        url: `/api/tabs/${tabId}/files/download`,
+        payload: { relativePaths: ["notes.bin"] }
+      });
+      expect(download.statusCode).toBe(200);
+      expect(download.headers["content-type"]).toContain("application/octet-stream");
+      expect(download.headers["content-disposition"]).toContain("notes.bin");
+      expect((download as unknown as { rawPayload: Buffer }).rawPayload).toEqual(Buffer.from([1, 2, 3]));
+    } finally {
+      await app.close();
+    }
+  });
+
   it("rejects voice control routes when AI control is disabled", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-config-voice-"));
     const config = testConfig(root);

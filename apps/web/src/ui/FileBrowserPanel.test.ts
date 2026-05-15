@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
 
-import { buildSearchInput, clampFileBrowserTreeSize, defaultDiffViewMode, disposeFileBrowserPanelStatesExcept, FileBrowserPanel, fileBrowserBodyClassName, fileBrowserBodyStyle, filePreviewText, gitAutoRefreshIntervalMilliseconds, gitDiffWorkspaceClassName, mergeGitChangesIntoEntries, parsePatch, readFileBrowserPanelState, rememberFileBrowserPanelState, resolveNextCompareRef, searchEntriesFromResult, searchResultSummary, type FileBrowserPanelState, type OpenFileResult } from "./FileBrowserPanel.js";
+import { buildSearchInput, clampFileBrowserTreeSize, defaultDiffViewMode, disposeFileBrowserPanelStatesExcept, entryTransferPath, FileBrowserPanel, fileBrowserBodyClassName, fileBrowserBodyStyle, filePreviewText, fileTransferUploadPath, gitAutoRefreshIntervalMilliseconds, gitDiffWorkspaceClassName, mergeGitChangesIntoEntries, parsePatch, readFileBrowserPanelState, rememberFileBrowserPanelState, resolveNextCompareRef, searchEntriesFromResult, searchResultSummary, type FileBrowserPanelState, type OpenFileResult } from "./FileBrowserPanel.js";
 import { PathEntry } from "./PathEntry.js";
 
 afterEach(() => {
@@ -62,6 +62,20 @@ describe("buildSearchInput", () => {
   });
 });
 
+describe("file transfer path helpers", () => {
+  it("builds download paths from the current directory or search result path", () => {
+    expect(entryTransferPath({ name: "README.md" }, "")).toBe("README.md");
+    expect(entryTransferPath({ name: "App.tsx" }, "src")).toBe("src/App.tsx");
+    expect(entryTransferPath({ name: "App.tsx", searchPath: "packages/app/src/App.tsx" }, "src")).toBe("packages/app/src/App.tsx");
+  });
+
+  it("builds upload targets under the current directory using the selected filename", () => {
+    expect(fileTransferUploadPath("", "README.md")).toBe("README.md");
+    expect(fileTransferUploadPath("docs", "notes.md")).toBe("docs/notes.md");
+    expect(fileTransferUploadPath("docs", "nested/notes.md")).toBe("docs/notes.md");
+  });
+});
+
 describe("file browser panel state cache", () => {
   it("restores cached directory and open-file state for the same tab cwd", () => {
     const tab = workspaceTab("tab-files", "/repo");
@@ -79,6 +93,9 @@ describe("file browser panel state cache", () => {
     expect(html).toContain("App.tsx");
     expect(html).toContain("src/App.tsx");
     expect(html).toContain("export const app = true;");
+    expect(html).toContain("Select files or folders to download");
+    expect(html).not.toContain('type="checkbox"');
+    expect(html).not.toContain("file-list-download");
     expect(normalizedHtml).toContain('autocomplete="off"');
     expect(normalizedHtml).toContain('autocorrect="off"');
     expect(normalizedHtml).toContain('autocapitalize="none"');

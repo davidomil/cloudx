@@ -1811,6 +1811,34 @@ a:hover svg {
   overflow: auto;
 }
 
+.file-upload-input {
+  display: none;
+}
+
+.file-list-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+}
+
+.file-list-row.selecting {
+  grid-template-columns: auto minmax(0, 1fr);
+}
+
+.file-transfer-checkbox {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--color-accent);
+  cursor: pointer;
+}
+
+.file-transfer-checkbox:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
 .file-tree-resize-handle {
   min-width: 0;
   min-height: 0;
@@ -1831,6 +1859,7 @@ a:hover svg {
 }
 
 .file-list button {
+  min-width: 0;
   min-height: 34px;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto auto;
@@ -1842,6 +1871,10 @@ a:hover svg {
   letter-spacing: 0.02em;
 }
 
+.file-list .file-list-entry {
+  width: 100%;
+}
+
 .file-list span {
   min-width: 0;
   overflow: hidden;
@@ -1849,8 +1882,55 @@ a:hover svg {
   white-space: nowrap;
 }
 
-.file-list button.has-git-change {
+.file-list-row.has-git-change .file-list-entry {
   border-color: rgb(0 212 255 / 0.46);
+}
+
+.file-context-menu {
+  position: fixed;
+  z-index: 260;
+  min-width: 150px;
+  display: grid;
+  gap: 4px;
+  padding: 5px;
+  color: var(--color-foreground);
+  background: rgb(10 10 15 / 0.98);
+  border: 1px solid rgb(0 212 255 / 0.42);
+  clip-path: var(--chamfer-sm);
+  box-shadow: var(--shadow-neon-tertiary), 0 14px 36px rgb(0 0 0 / 0.48);
+}
+
+.file-context-menu button {
+  min-width: 0;
+  min-height: 34px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 0 9px;
+  color: var(--color-accent-tertiary);
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  clip-path: var(--chamfer-xs);
+  cursor: pointer;
+  text-transform: none;
+  letter-spacing: 0.02em;
+}
+
+.file-context-menu button:hover:not(:disabled),
+.file-context-menu button:focus-visible {
+  color: var(--file-browser-button-hover-color);
+  background: var(--file-browser-button-hover-background);
+  border-color: var(--file-browser-button-hover-border);
+  box-shadow: var(--file-browser-button-hover-shadow);
+}
+
+.file-context-menu span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .tree-change-badge {
