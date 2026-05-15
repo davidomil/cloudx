@@ -1,5 +1,5 @@
 import type { CreatePluginSessionInput, PluginActionDefinition, PluginSession, PluginSessionSnapshot, PluginVoiceContext, WorkspacePlugin } from "@cloudx/plugin-api";
-import type { WorktreeCreateMode, WorktreeProjectState, WorkspaceTab } from "@cloudx/shared";
+import type { ConfigFieldDescriptor, ConfigValue, WorktreeCreateMode, WorktreeProjectState, WorkspaceTab } from "@cloudx/shared";
 
 import { WorktreeService } from "../git/WorktreeService.js";
 
@@ -11,6 +11,22 @@ export class WorktreeManagerPlugin implements WorkspacePlugin {
   readonly panelKind = "worktree-manager" as const;
   readonly creatable = true;
   readonly requiresDirectory = true;
+  readonly configFields: ConfigFieldDescriptor[] = [
+    {
+      key: "branchPrefix",
+      label: "Branch prefix",
+      type: "string",
+      description: "Prefill this text when creating a new branch, for example david/.",
+      defaultValue: ""
+    },
+    {
+      key: "showFolderSize",
+      label: "Show folder sizes",
+      type: "boolean",
+      description: "Compute and show each worktree folder size in the Worktrees panel.",
+      defaultValue: true
+    }
+  ];
 
   readonly actions: PluginActionDefinition[] = [
     {
@@ -103,13 +119,13 @@ export class WorktreeManagerPlugin implements WorkspacePlugin {
       panelKind: this.panelKind,
       creatable: this.creatable,
       requiresDirectory: this.requiresDirectory,
-      configFields: [],
+      configFields: this.configFields,
       actions: this.actions
     };
   }
 
   createSession(input: CreatePluginSessionInput): PluginSession {
-    return new WorktreeManagerSession(input.tab, this.worktrees);
+    return new WorktreeManagerSession(input.tab, this.worktrees, input.getConfig ?? (() => input.config ?? {}));
   }
 }
 
@@ -118,7 +134,8 @@ class WorktreeManagerSession implements PluginSession {
 
   constructor(
     public readonly tab: WorkspaceTab,
-    private readonly worktrees: WorktreeService
+    private readonly worktrees: WorktreeService,
+    private readonly getConfig: () => Record<string, ConfigValue>
   ) {}
 
   snapshot(): PluginSessionSnapshot {
@@ -164,19 +181,19 @@ class WorktreeManagerSession implements PluginSession {
 
   async handleAction(action: string, input: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (action === "get_worktree_project") {
-      this.state = await this.worktrees.getState(this.tab.cwd);
+      this.state = await this.worktrees.getState(this.tab.cwd, this.stateOptions());
       return this.state as unknown as Record<string, unknown>;
     }
     if (action === "initialize_bare_repository") {
-      this.state = await this.worktrees.initializeBareRepository(this.tab.cwd);
+      this.state = await this.worktrees.initializeBareRepository(this.tab.cwd, this.stateOptions());
       return this.state as unknown as Record<string, unknown>;
     }
     if (action === "clone_bare_repository") {
-      this.state = await this.worktrees.cloneBareRepository(this.tab.cwd, requireString(input.url, "url"));
+      this.state = await this.worktrees.cloneBareRepository(this.tab.cwd, requireString(input.url, "url"), this.stateOptions());
       return this.state as unknown as Record<string, unknown>;
     }
     if (action === "fetch_refs") {
-      this.state = await this.worktrees.fetchRefs(this.tab.cwd);
+      this.state = await this.worktrees.fetchRefs(this.tab.cwd, this.stateOptions());
       return this.state as unknown as Record<string, unknown>;
     }
     if (action === "create_worktree") {
@@ -185,7 +202,7 @@ class WorktreeManagerSession implements PluginSession {
         folderName: requireString(input.folderName, "folderName"),
         branchName: requireString(input.branchName, "branchName"),
         baseRef: optionalString(input.baseRef, "baseRef")
-      });
+      }, this.stateOptions());
       return this.state as unknown as Record<string, unknown>;
     }
     if (action === "delete_worktree") {
@@ -193,10 +210,14 @@ class WorktreeManagerSession implements PluginSession {
         folderName: requireString(input.folderName, "folderName"),
         confirmation: requireString(input.confirmation, "confirmation"),
         force: optionalBoolean(input.force, "force")
-      });
+      }, this.stateOptions());
       return this.state as unknown as Record<string, unknown>;
     }
     throw new Error(`Unsupported worktree manager action: ${action}`);
+  }
+
+  private stateOptions() {
+    return { includeSizes: this.getConfig().showFolderSize !== false };
   }
 }
 

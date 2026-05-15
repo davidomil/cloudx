@@ -86,6 +86,33 @@ describe("WorktreeService", () => {
     ).rejects.toThrow("folderName");
   });
 
+  it("optionally reports worktree folder size without following symlinks", async () => {
+    const service = new WorktreeService();
+    const remote = await createRemoteRepo();
+    const project = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-wt-size-"));
+    const cloned = await service.cloneBareRepository(project, remote);
+    const baseRef = cloned.refs.find((ref) => ref.kind === "remote" && ref.name.match(/^origin\/(main|master)$/))?.name;
+    expect(baseRef).toBeTruthy();
+
+    await service.createWorktree(project, {
+      mode: "new_branch",
+      folderName: "sized",
+      branchName: "sized",
+      baseRef
+    });
+    await fs.writeFile(path.join(project, "sized", "extra.bin"), "12345");
+    const symlinkTarget = path.join(project, "outside-large.bin");
+    await fs.writeFile(symlinkTarget, "x".repeat(10_000));
+    await fs.symlink(symlinkTarget, path.join(project, "sized", "outside-large.bin"));
+
+    const withoutSizes = await service.getState(project);
+    expect(withoutSizes.worktrees[0]?.sizeBytes).toBeUndefined();
+
+    const withSizes = await service.getState(project, { includeSizes: true });
+    expect(withSizes.worktrees[0]?.sizeBytes).toEqual(expect.any(Number));
+    expect(withSizes.worktrees[0]?.sizeBytes).toBeLessThan(10_000);
+  });
+
   it("fetches remote branches and syncs divergent tags", async () => {
     const service = new WorktreeService();
     const remote = await createRemoteRepo();

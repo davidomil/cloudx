@@ -29,6 +29,10 @@ interface DeleteWorktreeInput {
   force?: boolean;
 }
 
+interface WorktreeStateOptions {
+  includeSizes?: boolean;
+}
+
 interface ParsedWorktree {
   path: string;
   head?: string;
@@ -71,7 +75,7 @@ type ResolvedProjectContext =
   | { kind: "empty"; context: EmptyProjectContext };
 
 export class WorktreeService {
-  async getState(projectDir: string): Promise<WorktreeProjectState> {
+  async getState(projectDir: string, options: WorktreeStateOptions = {}): Promise<WorktreeProjectState> {
     const resolved = await this.resolveProjectContext(projectDir);
     if (resolved.kind === "empty") {
       return {
@@ -96,7 +100,7 @@ export class WorktreeService {
     }
 
     const { context } = resolved;
-    const [originUrl, refs, worktrees] = await Promise.all([this.getOriginUrl(context.barePath), this.listRefs(context.barePath), this.listWorktrees(context.projectDir, context.barePath)]);
+    const [originUrl, refs, worktrees] = await Promise.all([this.getOriginUrl(context.barePath), this.listRefs(context.barePath), this.listWorktrees(context.projectDir, context.barePath, options)]);
     return {
       ...emptyStateBase(context),
       folderEmpty: resolved.folderEmpty,
@@ -108,31 +112,31 @@ export class WorktreeService {
     };
   }
 
-  async initializeBareRepository(projectDir: string): Promise<WorktreeProjectState> {
+  async initializeBareRepository(projectDir: string, options: WorktreeStateOptions = {}): Promise<WorktreeProjectState> {
     await this.requireEmptyProjectWithoutBare(projectDir, "Initialize bare repository");
     await this.runGit(projectDir, ["init", "--bare", this.barePath(projectDir)]);
-    return this.getState(projectDir);
+    return this.getState(projectDir, options);
   }
 
-  async cloneBareRepository(projectDir: string, url: string): Promise<WorktreeProjectState> {
+  async cloneBareRepository(projectDir: string, url: string, options: WorktreeStateOptions = {}): Promise<WorktreeProjectState> {
     requireNonEmptyString(url, "url");
     await this.requireEmptyProjectWithoutBare(projectDir, "Clone bare repository");
     const barePath = this.barePath(projectDir);
     await this.runGit(projectDir, ["init", "--bare", barePath]);
     await this.runBareGit(barePath, ["remote", "add", "origin", url]);
     await this.runBareGit(barePath, ["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
-    await this.fetchRefs(projectDir);
-    return this.getState(projectDir);
+    await this.fetchRefs(projectDir, options);
+    return this.getState(projectDir, options);
   }
 
-  async fetchRefs(projectDir: string): Promise<WorktreeProjectState> {
+  async fetchRefs(projectDir: string, options: WorktreeStateOptions = {}): Promise<WorktreeProjectState> {
     const context = await this.requireReadyProject(projectDir);
     await this.runBareGit(context.barePath, ["fetch", "--prune", "--no-tags", "origin", "+refs/heads/*:refs/remotes/origin/*"]);
     await this.runBareGit(context.barePath, ["fetch", "--no-tags", "origin", "+refs/tags/*:refs/tags/*"]);
-    return this.getState(projectDir);
+    return this.getState(projectDir, options);
   }
 
-  async createWorktree(projectDir: string, input: CreateWorktreeInput): Promise<WorktreeProjectState> {
+  async createWorktree(projectDir: string, input: CreateWorktreeInput, options: WorktreeStateOptions = {}): Promise<WorktreeProjectState> {
     const context = await this.requireReadyProject(projectDir);
     const folderName = requireValidFolderName(input.folderName, context.bareName);
     const branchName = requireBranchName(input.branchName);
@@ -151,10 +155,10 @@ export class WorktreeService {
       throw new Error(`Unsupported worktree creation mode: ${input.mode}`);
     }
 
-    return this.getState(projectDir);
+    return this.getState(projectDir, options);
   }
 
-  async deleteWorktree(projectDir: string, input: DeleteWorktreeInput): Promise<WorktreeProjectState> {
+  async deleteWorktree(projectDir: string, input: DeleteWorktreeInput, options: WorktreeStateOptions = {}): Promise<WorktreeProjectState> {
     const context = await this.requireReadyProject(projectDir);
     const folderName = requireValidFolderName(input.folderName, context.bareName);
     if (input.confirmation !== folderName) {
@@ -170,7 +174,7 @@ export class WorktreeService {
     }
 
     await this.runBareGit(context.barePath, ["worktree", "remove", ...(input.force ? ["--force"] : []), worktree.path]);
-    return this.getState(projectDir);
+    return this.getState(projectDir, options);
   }
 
   private barePath(projectDir: string): string {
@@ -333,21 +337,31 @@ export class WorktreeService {
       .sort((left, right) => `${left.kind}:${left.name}`.localeCompare(`${right.kind}:${right.name}`));
   }
 
-  private async listWorktrees(projectDir: string, barePath: string): Promise<WorktreeSummary[]> {
+  private async listWorktrees(projectDir: string, barePath: string, options: WorktreeStateOptions = {}): Promise<WorktreeSummary[]> {
     const result = await this.runBareGit(barePath, ["worktree", "list", "--porcelain"]);
     const parsed = parseWorktreeList(result.stdout);
     const summaries = await Promise.all(
       parsed
         .filter((worktree) => !worktree.bare)
         .filter((worktree) => isDirectChild(projectDir, worktree.path))
-        .map(async (worktree) => ({
-          folderName: path.basename(worktree.path),
-          path: worktree.path,
-          branch: worktree.branch,
-          head: worktree.head,
-          detached: !worktree.branch,
-          dirty: await this.dirtyStatus(worktree.path)
-        }))
+        .map(async (worktree) => {
+          const summary: WorktreeSummary = {
+            folderName: path.basename(worktree.path),
+            path: worktree.path,
+            branch: worktree.branch,
+            head: worktree.head,
+            detached: !worktree.branch,
+            dirty: await this.dirtyStatus(worktree.path)
+          };
+          if (options.includeSizes) {
+            try {
+              summary.sizeBytes = await directorySizeBytes(worktree.path);
+            } catch (error) {
+              summary.sizeError = error instanceof Error ? error.message : String(error);
+            }
+          }
+          return summary;
+        })
     );
     return summaries.sort((left, right) => left.folderName.localeCompare(right.folderName));
   }
@@ -419,6 +433,21 @@ async function pathExists(target: string): Promise<boolean> {
 
 async function isDirectoryEmpty(directory: string): Promise<boolean> {
   return (await fs.readdir(directory)).length === 0;
+}
+
+async function directorySizeBytes(directory: string): Promise<number> {
+  let total = 0;
+  const entries = await fs.readdir(directory, { withFileTypes: true });
+  for (const entry of entries) {
+    const entryPath = path.join(directory, entry.name);
+    const stats = await fs.lstat(entryPath);
+    if (stats.isDirectory()) {
+      total += await directorySizeBytes(entryPath);
+    } else {
+      total += stats.size;
+    }
+  }
+  return total;
 }
 
 function projectContext(cwd: string, projectDir: string, barePath: string, detectedFrom: WorktreeProjectDetectionSource): WorktreeProjectContext {

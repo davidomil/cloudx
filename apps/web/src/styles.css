@@ -1986,7 +1986,8 @@ a:hover svg {
 .worktree-summary-band small,
 .worktree-row span,
 .worktree-clean,
-.worktree-dirty {
+.worktree-dirty,
+.worktree-size {
   color: var(--color-muted-foreground);
   font-family: var(--font-label);
   font-size: 12px;
@@ -2052,7 +2053,7 @@ a:hover svg {
 .worktree-row {
   min-height: 48px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
   align-items: center;
   gap: 10px;
   padding: 8px;
@@ -2085,7 +2086,8 @@ a:hover svg {
 }
 
 .worktree-clean,
-.worktree-dirty {
+.worktree-dirty,
+.worktree-size {
   padding: 5px 7px;
   color: var(--color-background);
   background: var(--color-accent);
@@ -2094,6 +2096,16 @@ a:hover svg {
 
 .worktree-dirty {
   background: var(--color-destructive);
+}
+
+.worktree-size {
+  color: var(--color-foreground);
+  background: rgb(0 212 255 / 0.2);
+}
+
+.worktree-size.unavailable {
+  color: var(--color-muted-foreground);
+  background: rgb(255 255 255 / 0.1);
 }
 
 .worktree-ref-group {

@@ -1,29 +1,39 @@
 import { describe, expect, it } from "vitest";
 
-import type { WorktreeProjectState } from "@cloudx/shared";
+import type { WorktreeProjectState, WorktreeRef } from "@cloudx/shared";
 
-import { detectionSummary, worktreeSuggestionFromRef } from "./WorktreeManagerPanel.js";
+import { detectionSummary, filterRefOptions, formatBytes, prefillBranchPrefix } from "./WorktreeManagerPanel.js";
 
-describe("worktreeSuggestionFromRef", () => {
-  it("suggests branch and folder names from remote refs", () => {
-    expect(worktreeSuggestionFromRef("origin/feature/deep-linking", "remote_branch")).toEqual({
-      branchName: "feature/deep-linking",
-      folderName: "feature-deep-linking"
-    });
+describe("prefillBranchPrefix", () => {
+  it("prefills only empty new-branch names", () => {
+    expect(prefillBranchPrefix("new_branch", "", "david/")).toBe("david/");
+    expect(prefillBranchPrefix("new_branch", "feature", "david/")).toBe("feature");
+    expect(prefillBranchPrefix("remote_branch", "", "david/")).toBe("");
+  });
+});
+
+describe("filterRefOptions", () => {
+  it("keeps writable ref suggestions filtered and capped", () => {
+    const refs = [
+      ref("origin/main", "remote"),
+      ref("origin/feature-login", "remote"),
+      ref("origin/release/2026.15", "remote"),
+      ref("feature-local", "local")
+    ];
+
+    expect(filterRefOptions(refs, "feature", 2).map((match) => match.name)).toEqual(["feature-local", "origin/feature-login"]);
   });
 
-  it("suggests a new branch name from a base ref without using slash folders", () => {
-    expect(worktreeSuggestionFromRef("origin/main", "new_branch")).toEqual({
-      branchName: "main-worktree",
-      folderName: "main-worktree"
-    });
+  it("shows the first refs when there is no query", () => {
+    expect(filterRefOptions([ref("origin/main", "remote"), ref("feature", "local")], "", 1).map((match) => match.name)).toEqual(["origin/main"]);
   });
+});
 
-  it("keeps local branch names while making direct-child folder names", () => {
-    expect(worktreeSuggestionFromRef("feature/search", "existing_branch")).toEqual({
-      branchName: "feature/search",
-      folderName: "feature-search"
-    });
+describe("formatBytes", () => {
+  it("formats folder sizes compactly", () => {
+    expect(formatBytes(42)).toBe("42 B");
+    expect(formatBytes(1536)).toBe("1.50 KB");
+    expect(formatBytes(2_621_440)).toBe("2.50 MB");
   });
 });
 
@@ -48,5 +58,14 @@ function projectState(overrides: Partial<WorktreeProjectState> = {}): WorktreePr
     worktrees: [],
     setup: { canInitialize: false, canClone: false },
     ...overrides
+  };
+}
+
+function ref(name: string, kind: WorktreeRef["kind"]): WorktreeRef {
+  return {
+    name,
+    fullName: `refs/${kind}/${name}`,
+    kind,
+    commit: "abc123"
   };
 }

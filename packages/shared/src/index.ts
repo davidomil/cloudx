@@ -244,6 +244,8 @@ export interface WorktreeSummary {
   head?: string;
   detached: boolean;
   dirty: WorktreeDirtyStatus;
+  sizeBytes?: number;
+  sizeError?: string;
 }
 
 export interface WorktreeProjectState {

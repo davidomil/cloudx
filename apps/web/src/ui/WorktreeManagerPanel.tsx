@@ -1,19 +1,16 @@
-import { useEffect, useMemo, useState } from "react";
+import { type KeyboardEvent, useEffect, useMemo, useState } from "react";
 import { AlertTriangle, Download, GitBranch, GitFork, Plus, RefreshCw, Trash2 } from "lucide-react";
 
-import type { WorktreeCreateMode, WorktreeProjectState, WorktreeRef, WorktreeSummary, WorkspaceTab } from "@cloudx/shared";
+import type { ConfigValue, WorktreeCreateMode, WorktreeProjectState, WorktreeRef, WorktreeSummary, WorkspaceTab } from "@cloudx/shared";
 
 import { runTabAction } from "../api.js";
 import { ControlButton } from "./Control.js";
 
 type BusyAction = "state" | "initialize" | "clone" | "fetch" | "create" | "delete";
 
-export interface WorktreeCreateSuggestion {
-  branchName: string;
-  folderName: string;
-}
+const REF_OPTION_LIMIT = 12;
 
-export function WorktreeManagerPanel({ tab }: { tab: WorkspaceTab }) {
+export function WorktreeManagerPanel({ tab, config = {} }: { tab: WorkspaceTab; config?: Record<string, ConfigValue> }) {
   const [state, setState] = useState<WorktreeProjectState | undefined>();
   const [cloneUrl, setCloneUrl] = useState("");
   const [mode, setMode] = useState<WorktreeCreateMode>("remote_branch");
@@ -26,24 +23,21 @@ export function WorktreeManagerPanel({ tab }: { tab: WorkspaceTab }) {
   const [busyAction, setBusyAction] = useState<BusyAction | undefined>();
   const [error, setError] = useState<string | undefined>();
 
+  const branchPrefix = typeof config.branchPrefix === "string" ? config.branchPrefix : "";
+  const showFolderSize = config.showFolderSize !== false;
   const localRefs = useMemo(() => refsByKind(state?.refs, "local"), [state?.refs]);
   const remoteRefs = useMemo(() => refsByKind(state?.refs, "remote"), [state?.refs]);
   const tagRefs = useMemo(() => refsByKind(state?.refs, "tag"), [state?.refs]);
-  const baseRefs = mode === "existing_branch" ? localRefs : [...remoteRefs, ...localRefs];
 
   useEffect(() => {
     void loadState();
   }, [tab.id]);
 
   useEffect(() => {
-    if (!baseRef && baseRefs[0]) {
-      const nextRef = baseRefs[0].name;
-      setBaseRef(nextRef);
-      const suggestion = worktreeSuggestionFromRef(nextRef, mode);
-      setBranchName((current) => current.trim() || !suggestion ? current : suggestion.branchName);
-      setFolderName((current) => current.trim() || !suggestion ? current : suggestion.folderName);
+    if (mode === "new_branch") {
+      setBranchName((current) => prefillBranchPrefix("new_branch", current, branchPrefix));
     }
-  }, [baseRef, baseRefs]);
+  }, [branchPrefix, mode]);
 
   async function loadState() {
     setBusyAction("state");
@@ -120,7 +114,7 @@ export function WorktreeManagerPanel({ tab }: { tab: WorkspaceTab }) {
         </ControlButton>
       </div>
       {error ? <div className="inline-error">{error}</div> : null}
-      {!state ? <LoadingState /> : state.status === "ready" ? <ManagerView state={state} busy={Boolean(busyAction)} localRefs={localRefs} remoteRefs={remoteRefs} tagRefs={tagRefs} mode={mode} folderName={folderName} branchName={branchName} baseRef={baseRef} deleteTarget={deleteTarget} deleteConfirmation={deleteConfirmation} forceDelete={forceDelete} onModeChange={setMode} onFolderNameChange={setFolderName} onBranchNameChange={setBranchName} onBaseRefChange={setBaseRef} onFetch={() => void fetchRefs()} onCreate={() => void createWorktree()} onOpenDelete={openDelete} onCancelDelete={() => setDeleteTarget(undefined)} onDeleteConfirmationChange={setDeleteConfirmation} onForceDeleteChange={setForceDelete} onDelete={() => void deleteWorktree()} /> : state.status === "empty" ? <SetupView cloneUrl={cloneUrl} busy={Boolean(busyAction)} onCloneUrlChange={setCloneUrl} onInitialize={() => void initializeBareRepository()} onClone={() => void cloneBareRepository()} /> : <BlockedView state={state} />}
+      {!state ? <LoadingState /> : state.status === "ready" ? <ManagerView state={state} busy={Boolean(busyAction)} localRefs={localRefs} remoteRefs={remoteRefs} tagRefs={tagRefs} mode={mode} folderName={folderName} branchName={branchName} baseRef={baseRef} showFolderSize={showFolderSize} branchPrefix={branchPrefix} deleteTarget={deleteTarget} deleteConfirmation={deleteConfirmation} forceDelete={forceDelete} onModeChange={setMode} onFolderNameChange={setFolderName} onBranchNameChange={setBranchName} onBaseRefChange={setBaseRef} onFetch={() => void fetchRefs()} onCreate={() => void createWorktree()} onOpenDelete={openDelete} onCancelDelete={() => setDeleteTarget(undefined)} onDeleteConfirmationChange={setDeleteConfirmation} onForceDeleteChange={setForceDelete} onDelete={() => void deleteWorktree()} /> : state.status === "empty" ? <SetupView cloneUrl={cloneUrl} busy={Boolean(busyAction)} onCloneUrlChange={setCloneUrl} onInitialize={() => void initializeBareRepository()} onClone={() => void cloneBareRepository()} /> : <BlockedView state={state} />}
     </div>
   );
 }
@@ -185,6 +179,8 @@ function ManagerView({
   folderName,
   branchName,
   baseRef,
+  showFolderSize,
+  branchPrefix,
   deleteTarget,
   deleteConfirmation,
   forceDelete,
@@ -209,6 +205,8 @@ function ManagerView({
   folderName: string;
   branchName: string;
   baseRef: string;
+  showFolderSize: boolean;
+  branchPrefix: string;
   deleteTarget: WorktreeSummary | undefined;
   deleteConfirmation: string;
   forceDelete: boolean;
@@ -227,31 +225,11 @@ function ManagerView({
   const createDisabled = busy || !folderName.trim() || !branchName.trim() || (mode !== "existing_branch" && !baseRef.trim());
   const detectionNote = detectionSummary(state);
 
-  function applyRefSuggestion(refName: string, nextMode: WorktreeCreateMode) {
-    const previousRef = nextMode === "existing_branch" ? branchName : baseRef;
-    const previousSuggestion = worktreeSuggestionFromRef(previousRef, nextMode);
-    const nextSuggestion = worktreeSuggestionFromRef(refName, nextMode);
-    if (!nextSuggestion) {
-      return;
-    }
-    if (!branchName.trim() || branchName === previousSuggestion?.branchName) {
-      onBranchNameChange(nextSuggestion.branchName);
-    }
-    if (!folderName.trim() || folderName === previousSuggestion?.folderName) {
-      onFolderNameChange(nextSuggestion.folderName);
-    }
-  }
-
   function changeMode(nextMode: WorktreeCreateMode) {
     onModeChange(nextMode);
-    const nextRef = nextMode === "existing_branch" ? localRefs[0]?.name : baseRef || remoteRefs[0]?.name || localRefs[0]?.name;
-    if (!nextRef) {
-      return;
+    if (nextMode === "new_branch") {
+      onBranchNameChange(prefillBranchPrefix(nextMode, branchName, branchPrefix));
     }
-    if (nextMode !== "existing_branch") {
-      onBaseRefChange(nextRef);
-    }
-    applyRefSuggestion(nextRef, nextMode);
   }
 
   return (
@@ -289,51 +267,18 @@ function ManagerView({
         </label>
         <label>
           Branch
-          <input value={branchName} onChange={(event) => onBranchNameChange(event.target.value)} placeholder={mode === "remote_branch" ? "feature-ui" : "branch-name"} />
+          {mode === "existing_branch" ? (
+            <RefCombobox value={branchName} refs={localRefs} onChange={onBranchNameChange} placeholder="branch-name" ariaLabel="Local branch" />
+          ) : (
+            <input value={branchName} onChange={(event) => onBranchNameChange(event.target.value)} placeholder={mode === "remote_branch" ? "feature-ui" : branchPrefix || "branch-name"} />
+          )}
         </label>
         {mode !== "existing_branch" ? (
           <label>
             Base
-            <select
-              value={baseRef}
-              onChange={(event) => {
-                const nextRef = event.target.value;
-                onBaseRefChange(nextRef);
-                applyRefSuggestion(nextRef, mode);
-              }}
-            >
-              {remoteRefs.map((ref) => (
-                <option key={ref.fullName} value={ref.name}>
-                  {ref.name}
-                </option>
-              ))}
-              {localRefs.map((ref) => (
-                <option key={ref.fullName} value={ref.name}>
-                  {ref.name}
-                </option>
-              ))}
-            </select>
+            <RefCombobox value={baseRef} refs={[...remoteRefs, ...localRefs]} onChange={onBaseRefChange} placeholder="origin/main" ariaLabel="Base ref" />
           </label>
-        ) : (
-          <label>
-            Local branch
-            <select
-              value={branchName}
-              onChange={(event) => {
-                const nextBranch = event.target.value;
-                onBranchNameChange(nextBranch);
-                applyRefSuggestion(nextBranch, "existing_branch");
-              }}
-            >
-              <option value="">Select branch</option>
-              {localRefs.map((ref) => (
-                <option key={ref.fullName} value={ref.name}>
-                  {ref.name}
-                </option>
-              ))}
-            </select>
-          </label>
-        )}
+        ) : null}
         <ControlButton type="submit" disabled={createDisabled}>
           <Plus size={15} />
           Create
@@ -349,6 +294,7 @@ function ManagerView({
                   <strong>{worktree.folderName}</strong>
                   <span>{worktree.branch ?? worktree.head ?? "detached"}</span>
                 </div>
+                {showFolderSize ? <SizeBadge worktree={worktree} /> : null}
                 <DirtyBadge worktree={worktree} />
                 <ControlButton type="button" tone="danger" iconOnly onClick={() => onOpenDelete(worktree)} disabled={busy} title={`Delete ${worktree.folderName}`}>
                   <Trash2 size={15} />
@@ -376,6 +322,74 @@ function ManagerView({
   );
 }
 
+function RefCombobox({ value, refs, onChange, placeholder, ariaLabel }: { value: string; refs: WorktreeRef[]; onChange: (value: string) => void; placeholder: string; ariaLabel: string }) {
+  const [open, setOpen] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(0);
+  const options = useMemo(() => filterRefOptions(refs, value, REF_OPTION_LIMIT), [refs, value]);
+
+  function choose(ref: WorktreeRef) {
+    onChange(ref.name);
+    setOpen(false);
+    setActiveIndex(0);
+  }
+
+  function onKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+    if (!open && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
+      setOpen(true);
+      return;
+    }
+    if (!open || !options.length) {
+      return;
+    }
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setActiveIndex((current) => Math.min(current + 1, options.length - 1));
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setActiveIndex((current) => Math.max(current - 1, 0));
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      choose(options[activeIndex]!);
+    } else if (event.key === "Escape") {
+      setOpen(false);
+    }
+  }
+
+  return (
+    <div className="path-autocomplete">
+      <input
+        value={value}
+        onChange={(event) => {
+          onChange(event.target.value);
+          setOpen(true);
+          setActiveIndex(0);
+        }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => window.setTimeout(() => setOpen(false), 120)}
+        onKeyDown={onKeyDown}
+        placeholder={placeholder}
+        aria-label={ariaLabel}
+        role="combobox"
+        aria-expanded={open}
+      />
+      {open ? (
+        <div className="path-options" role="listbox">
+          {options.length ? (
+            options.map((ref, index) => (
+              <button key={ref.fullName} type="button" className="path-option" role="option" aria-selected={index === activeIndex} onMouseDown={(event) => event.preventDefault()} onClick={() => choose(ref)}>
+                <span>{ref.name}</span>
+                <small>{ref.kind}</small>
+              </button>
+            ))
+          ) : (
+            <div className="path-options-empty">No matching refs</div>
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function DirtyBadge({ worktree }: { worktree: WorktreeSummary }) {
   const { dirty } = worktree;
   if (!dirty.dirty) {
@@ -386,6 +400,24 @@ function DirtyBadge({ worktree }: { worktree: WorktreeSummary }) {
       Dirty {dirty.staged + dirty.unstaged + dirty.untracked}
     </span>
   );
+}
+
+function SizeBadge({ worktree }: { worktree: WorktreeSummary }) {
+  if (typeof worktree.sizeBytes === "number") {
+    return (
+      <span className="worktree-size" title={`${worktree.sizeBytes} bytes`}>
+        {formatBytes(worktree.sizeBytes)}
+      </span>
+    );
+  }
+  if (worktree.sizeError) {
+    return (
+      <span className="worktree-size unavailable" title={worktree.sizeError}>
+        Size unavailable
+      </span>
+    );
+  }
+  return null;
 }
 
 function RefGroup({ title, refs, disabled }: { title: string; refs: WorktreeRef[]; disabled?: boolean }) {
@@ -431,19 +463,6 @@ function refsByKind(refs: WorktreeRef[] | undefined, kind: WorktreeRef["kind"]):
   return (refs ?? []).filter((ref) => ref.kind === kind);
 }
 
-export function worktreeSuggestionFromRef(refName: string | undefined, mode: WorktreeCreateMode): WorktreeCreateSuggestion | undefined {
-  const trimmed = refName?.trim();
-  if (!trimmed) {
-    return undefined;
-  }
-  const branchBase = mode === "remote_branch" ? stripRemotePrefix(trimmed) : trimmed;
-  const branchName = mode === "new_branch" ? `${stripRemotePrefix(branchBase)}-worktree` : branchBase;
-  return {
-    branchName,
-    folderName: branchName.replaceAll("/", "-")
-  };
-}
-
 export function detectionSummary(state: WorktreeProjectState): string | undefined {
   if (state.detectedFrom === "bare_dir") {
     return `Detected bare repository; managing sibling worktrees in ${state.projectDir}.`;
@@ -454,9 +473,44 @@ export function detectionSummary(state: WorktreeProjectState): string | undefine
   return undefined;
 }
 
-function stripRemotePrefix(refName: string): string {
-  const parts = refName.split("/");
-  return parts.length > 1 ? parts.slice(1).join("/") : refName;
+export function prefillBranchPrefix(mode: WorktreeCreateMode, branchName: string, branchPrefix: string): string {
+  if (mode !== "new_branch" || branchName.trim() || !branchPrefix) {
+    return branchName;
+  }
+  return branchPrefix;
+}
+
+export function filterRefOptions(refs: WorktreeRef[], query: string, limit = REF_OPTION_LIMIT): WorktreeRef[] {
+  const normalizedQuery = query.trim().toLowerCase();
+  return refs
+    .map((ref, index) => ({ ref, index }))
+    .filter(({ ref }) => !normalizedQuery || ref.name.toLowerCase().includes(normalizedQuery))
+    .sort((left, right) => {
+      if (!normalizedQuery) {
+        return left.index - right.index;
+      }
+      const leftName = left.ref.name.toLowerCase();
+      const rightName = right.ref.name.toLowerCase();
+      const leftStarts = leftName.startsWith(normalizedQuery) ? 0 : 1;
+      const rightStarts = rightName.startsWith(normalizedQuery) ? 0 : 1;
+      return leftStarts - rightStarts || left.index - right.index;
+    })
+    .slice(0, limit)
+    .map(({ ref }) => ref);
+}
+
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) {
+    return "0 B";
+  }
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${unitIndex === 0 ? value.toFixed(0) : value.toFixed(value >= 10 ? 1 : 2)} ${units[unitIndex]}`;
 }
 
 function errorMessage(error: unknown): string {

@@ -1364,7 +1364,7 @@ function PluginPanel({ tab, plugin, active, config, uiScale }: { tab: WorkspaceT
     return <WebViewerPanel tab={tab} />;
   }
   if (plugin?.panelKind === "worktree-manager") {
-    return <WorktreeManagerPanel tab={tab} />;
+    return <WorktreeManagerPanel tab={tab} config={config} />;
   }
   if (plugin?.panelKind === "terminal" || !plugin) {
     return <TerminalPanel tab={tab} active={active} uiScale={uiScale} />;
