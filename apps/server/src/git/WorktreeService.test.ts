@@ -38,7 +38,7 @@ describe("WorktreeService", () => {
 
     const cloned = await service.cloneBareRepository(project, remote);
     expect(cloned).toMatchObject({ status: "ready", originUrl: remote });
-    expect(cloned.refs).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "remote", name: expect.stringMatching(/^origin\/(main|master)$/) }), expect.objectContaining({ kind: "remote", name: "origin/feature" })]));
+    expect(cloned.refs).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "remote", name: expect.stringMatching(/^origin\/(main|master)$/) }), expect.objectContaining({ kind: "remote", name: "origin/feature" }), expect.objectContaining({ kind: "tag", name: "v1" })]));
 
     const baseRef = cloned.refs.find((ref) => ref.kind === "remote" && ref.name.match(/^origin\/(main|master)$/))?.name;
     expect(baseRef).toBeTruthy();
@@ -86,7 +86,7 @@ describe("WorktreeService", () => {
     ).rejects.toThrow("folderName");
   });
 
-  it("fetches remote branches without failing on divergent local tags", async () => {
+  it("fetches remote branches and syncs divergent tags", async () => {
     const service = new WorktreeService();
     const remote = await createRemoteRepo();
     const project = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-wt-tags-"));
@@ -98,11 +98,40 @@ describe("WorktreeService", () => {
     await git(remote, "add", ".");
     await git(remote, "commit", "-m", "move remote tag");
     await git(remote, "tag", "moved-tag");
+    const remoteTagCommit = await gitOutput(remote, "rev-parse", "moved-tag");
 
-    await expect(service.fetchRefs(project)).resolves.toMatchObject({
+    const fetched = await service.fetchRefs(project);
+    expect(fetched).toMatchObject({
       status: "ready",
       refs: expect.arrayContaining([expect.objectContaining({ kind: "remote", name: "origin/feature" })])
     });
+    expect(await gitOutput(project, "--git-dir", path.join(project, ".bare"), "rev-parse", "moved-tag")).toBe(remoteTagCommit);
+  });
+
+  it("updates origin tracking branches without moving checked-out local branches", async () => {
+    const service = new WorktreeService();
+    const remote = await createRemoteRepo();
+    const project = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-wt-checked-out-"));
+    await service.cloneBareRepository(project, remote);
+    await service.createWorktree(project, {
+      mode: "remote_branch",
+      folderName: "feature-worktree",
+      branchName: "feature",
+      baseRef: "origin/feature"
+    });
+    const localFeatureBefore = await gitOutput(project, "--git-dir", path.join(project, ".bare"), "rev-parse", "refs/heads/feature");
+
+    await git(remote, "checkout", "feature");
+    await fs.writeFile(path.join(remote, "FEATURE.md"), "updated\n");
+    await git(remote, "add", ".");
+    await git(remote, "commit", "-m", "advance feature");
+    const remoteFeatureAfter = await gitOutput(remote, "rev-parse", "feature");
+
+    await service.fetchRefs(project);
+
+    expect(await gitOutput(project, "--git-dir", path.join(project, ".bare"), "rev-parse", "refs/heads/feature")).toBe(localFeatureBefore);
+    expect(await gitOutput(project, "--git-dir", path.join(project, ".bare"), "rev-parse", "refs/remotes/origin/feature")).toBe(remoteFeatureAfter);
+    expect(await gitOutput(path.join(project, "feature-worktree"), "status", "--porcelain")).toBe("");
   });
 
   it("detects a single non-.bare repository child and the bare directory itself", async () => {
@@ -212,4 +241,9 @@ async function createRemoteRepo(): Promise<string> {
 
 async function git(cwd: string, ...args: string[]): Promise<void> {
   await execFileAsync("git", args, { cwd });
+}
+
+async function gitOutput(cwd: string, ...args: string[]): Promise<string> {
+  const result = await execFileAsync("git", args, { cwd, encoding: "utf8" });
+  return result.stdout.trim();
 }

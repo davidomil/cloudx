@@ -261,7 +261,7 @@ function ManagerView({
         {state.originUrl ? <small title={state.originUrl}>origin</small> : null}
         <small>{state.worktrees.length} worktrees</small>
         <small>{state.refs.length} refs</small>
-        <ControlButton type="button" onClick={onFetch} disabled={busy || !state.originUrl} title="Fetch and prune origin branches">
+        <ControlButton type="button" onClick={onFetch} disabled={busy || !state.originUrl} title="Fetch origin branches and tags">
           <Download size={15} />
           Fetch
         </ControlButton>
