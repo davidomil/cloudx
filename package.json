@@ -14,6 +14,7 @@
     "dev": "npm run cert:create && npm run dev -w @cloudx/server",
     "dev:web": "npm run dev -w @cloudx/web",
     "docs:screenshots": "npm run build && node scripts/capture-readme-screenshots.mjs",
+    "install:wizard": "node scripts/install-cloudx.mjs",
     "service:install": "node scripts/setup-cloudx-whisper-service.mjs",
     "test": "vitest run",
     "typecheck": "tsc -b"

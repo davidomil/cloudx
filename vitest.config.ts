@@ -7,7 +7,7 @@ const repoRoot = path.dirname(fileURLToPath(import.meta.url));
 export default defineConfig({
   test: {
     environment: "node",
-    include: ["packages/**/*.test.ts", "apps/**/*.test.ts"],
+    include: ["packages/**/*.test.ts", "apps/**/*.test.ts", "scripts/**/*.test.mjs"],
     coverage: {
       reporter: ["text", "html"],
       include: ["packages/**/*.ts", "apps/server/src/**/*.ts"]

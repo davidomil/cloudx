@@ -17,6 +17,48 @@ clearly at runtime if it is unavailable.
 
 ## Install
 
+For Ubuntu 22.04 or newer, use the installer wizard:
+
+```bash
+./install.sh
+```
+
+The bootstrap script installs Ubuntu packages, Node.js/npm when needed, and then
+launches the Cloudx wizard. The wizard installs npm dependencies, installs and
+checks Codex CLI, creates the ASR Python environment, downloads the
+`Systran/faster-whisper-large-v3` model, writes `~/.config/cloudx/cloudx.env`,
+and can install/start the user-level systemd services.
+
+Useful non-interactive planning options:
+
+```bash
+./install.sh --dry-run
+node scripts/install-cloudx.mjs --dry-run --yes
+node scripts/install-cloudx.mjs --dry-run --answers ./answers.json
+```
+
+The answers JSON can contain:
+
+```json
+{
+  "allowedRoots": "~",
+  "port": 3001,
+  "certificateHosts": "",
+  "cpuThreads": 6,
+  "useGpu": false,
+  "installServices": true,
+  "startServices": true,
+  "enableLinger": true,
+  "runCodexLogin": true
+}
+```
+
+GPU support is configure-only in the first Ubuntu installer. If an NVIDIA GPU is
+detected, the wizard asks whether to use it; choosing GPU requires CUDA/cuDNN
+runtime libraries to already be installed.
+
+Manual setup remains available:
+
 ```bash
 npm install
 sudo apt install ripgrep
