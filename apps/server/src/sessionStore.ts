@@ -21,6 +21,7 @@ export interface SessionRuntimeContextResolver {
 export class SessionStore {
   private readonly tabs = new Map<string, WorkspaceTab>();
   private readonly sessions = new Map<string, PluginSession>();
+  private readonly sessionDisposers = new Map<string, Array<() => void>>();
   private readonly tabsListeners = new Set<(update: WorkspaceTabsUpdate) => void>();
   private activeTabId: string | undefined;
   private hooks: HookRegistry | undefined;
@@ -58,9 +59,9 @@ export class SessionStore {
       contextPath: ""
     };
     const runtimeContext = await this.runtimeContextResolver?.runtimeContextFor(tab, window);
-    const profileIndicator = await this.runtimeContextResolver?.tabIndicatorFor(tab, window);
-    if (profileIndicator) {
-      tab.indicator = createTabIndicator(profileIndicator, now);
+    const templateIndicator = await this.runtimeContextResolver?.tabIndicatorFor(tab, window);
+    if (templateIndicator) {
+      tab.indicator = createTabIndicator(templateIndicator, now);
     }
     tab.contextPath = await this.contextService.create(tab);
     this.tabs.set(id, tab);
@@ -76,23 +77,8 @@ export class SessionStore {
         config: this.configProvider.getPluginConfig(plugin.id),
         getConfig: () => this.configProvider.getPluginConfig(plugin.id)
       });
-      this.sessions.set(id, session);
-      session.onStatusChange?.((status, statusMessage) => {
-        if (this.tabs.has(id)) {
-          this.updateTab(id, {
-            status,
-            statusMessage,
-            indicator: indicatorForStatus(status, statusMessage)
-          });
-        }
-      });
-      session.onData?.((data) => {
-        const current = this.tabs.get(id);
-        if (current) {
-          void this.contextService.record(current, "terminal-output", data);
-        }
-      });
-      this.updateTab(id, { status: "running", indicator: profileIndicator ? createTabIndicator(profileIndicator) : createTabIndicator({ color: "green", label: "OK", message: "Running." }) });
+      this.bindSession(id, session);
+      this.updateTab(id, { status: "running", indicator: templateIndicator ? createTabIndicator(templateIndicator) : createTabIndicator({ color: "green", label: "OK", message: "Running." }) });
     } catch (error) {
       this.updateTab(id, {
         status: "failed",
@@ -352,6 +338,7 @@ export class SessionStore {
 
   closeTab(tabId: string, options: { stopSession?: boolean } = {}): void {
     const session = this.sessions.get(tabId);
+    this.disposeSessionListeners(tabId);
     if (options.stopSession ?? true) {
       session?.stop?.();
     }
@@ -361,6 +348,91 @@ export class SessionStore {
       this.activeTabId = this.listTabs()[0]?.id;
     }
     this.emitTabsChange();
+  }
+
+  async restartTab(tabId: string, reason = "Restarting tab."): Promise<WorkspaceTab> {
+    const current = this.getTab(tabId);
+    const plugin = this.plugins.get(current.pluginId);
+    const oldSession = this.sessions.get(tabId);
+    this.disposeSessionListeners(tabId);
+    this.sessions.delete(tabId);
+    oldSession?.stop?.();
+
+    const window = this.workspace?.findWindowForTab(tabId) ?? this.workspace?.getActiveWindow();
+    const runtimeContext = await this.runtimeContextResolver?.runtimeContextFor(current, window);
+    const templateIndicator = await this.runtimeContextResolver?.tabIndicatorFor(current, window);
+    this.updateTab(tabId, {
+      status: "starting",
+      statusMessage: reason,
+      indicator: templateIndicator ? createTabIndicator(templateIndicator) : createTabIndicator({ color: "yellow", label: "Restarting", message: reason })
+    });
+
+    try {
+      const tab = this.getTab(tabId);
+      const session = await plugin.createSession({
+        tab,
+        cwd: tab.cwd,
+        runtimeContext,
+        app: this.createAppContext(plugin.id, tabId),
+        controls: this.createControls(tabId),
+        config: this.configProvider.getPluginConfig(plugin.id),
+        getConfig: () => this.configProvider.getPluginConfig(plugin.id)
+      });
+      this.bindSession(tabId, session);
+      this.updateTab(tabId, {
+        status: "running",
+        statusMessage: undefined,
+        indicator: templateIndicator ? createTabIndicator(templateIndicator) : createTabIndicator({ color: "green", label: "OK", message: "Running." })
+      });
+    } catch (error) {
+      this.updateTab(tabId, {
+        status: "failed",
+        statusMessage: error instanceof Error ? error.message : String(error),
+        indicator: createTabIndicator({
+          color: "red",
+          label: "Failed",
+          message: error instanceof Error ? error.message : String(error)
+        })
+      });
+      throw error;
+    }
+
+    return this.getTab(tabId);
+  }
+
+  async restartTabs(predicate: (tab: WorkspaceTab) => boolean, reason = "Restarting tab."): Promise<WorkspaceTab[]> {
+    const tabs = this.listTabs().filter((tab) => this.sessions.has(tab.id) && predicate(tab));
+    const restarted: WorkspaceTab[] = [];
+    for (const tab of tabs) {
+      restarted.push(await this.restartTab(tab.id, reason));
+    }
+    return restarted;
+  }
+
+  async applyRuntimeContext(tabId: string, reason = "Applying runtime context."): Promise<WorkspaceTab> {
+    const tab = this.getTab(tabId);
+    const session = this.sessions.get(tabId);
+    if (!session?.applyRuntimeContext || !this.runtimeContextResolver) {
+      return tab;
+    }
+    const window = this.workspace?.findWindowForTab(tabId) ?? this.workspace?.getActiveWindow();
+    const runtimeContext = await this.runtimeContextResolver.runtimeContextFor(tab, window);
+    const templateIndicator = await this.runtimeContextResolver.tabIndicatorFor(tab, window);
+    const result = await session.applyRuntimeContext(runtimeContext);
+    await this.contextService.record(tab, "runtime-context", JSON.stringify({ reason, result }, null, 2));
+    if (templateIndicator) {
+      this.updateTab(tabId, { indicator: createTabIndicator(templateIndicator) });
+    }
+    return this.getTab(tabId);
+  }
+
+  async applyRuntimeContexts(predicate: (tab: WorkspaceTab) => boolean, reason = "Applying runtime context."): Promise<WorkspaceTab[]> {
+    const tabs = this.listTabs().filter((tab) => this.sessions.has(tab.id) && predicate(tab));
+    const applied: WorkspaceTab[] = [];
+    for (const tab of tabs) {
+      applied.push(await this.applyRuntimeContext(tab.id, reason));
+    }
+    return applied;
   }
 
   private updateTab(tabId: string, patch: Partial<WorkspaceTab>): void {
@@ -382,11 +454,12 @@ export class SessionStore {
     const pluginMetadata = mergePluginMetadata(current.pluginMetadata, pluginId, metadata);
     const nextTab = { ...current, pluginMetadata };
     const window = this.workspace?.findWindowForTab(tabId) ?? this.workspace?.getActiveWindow();
-    const profileIndicator = await this.runtimeContextResolver?.tabIndicatorFor(nextTab, window);
+    const templateIndicator = await this.runtimeContextResolver?.tabIndicatorFor(nextTab, window);
     this.updateTab(tabId, {
       pluginMetadata,
-      ...(profileIndicator ? { indicator: createTabIndicator(profileIndicator) } : {})
+      ...(templateIndicator ? { indicator: createTabIndicator(templateIndicator) } : {})
     });
+    await this.applyRuntimeContext(tabId, `Applying ${pluginId} metadata changes.`);
     return this.getTab(tabId);
   }
 
@@ -401,11 +474,45 @@ export class SessionStore {
       }
       const tab = this.getTab(tabId);
       const window = this.workspace?.findWindowForTab(tabId) ?? this.workspace?.getActiveWindow();
-      const profileIndicator = await this.runtimeContextResolver.tabIndicatorFor(tab, window);
-      if (profileIndicator) {
-        this.updateTab(tabId, { indicator: createTabIndicator(profileIndicator) });
+      const templateIndicator = await this.runtimeContextResolver.tabIndicatorFor(tab, window);
+      if (templateIndicator) {
+        this.updateTab(tabId, { indicator: createTabIndicator(templateIndicator) });
       }
     }
+  }
+
+  private bindSession(tabId: string, session: PluginSession): void {
+    this.sessions.set(tabId, session);
+    const disposers: Array<() => void> = [];
+    const statusDisposer = session.onStatusChange?.((status, statusMessage) => {
+      if (this.tabs.has(tabId)) {
+        this.updateTab(tabId, {
+          status,
+          statusMessage,
+          indicator: indicatorForStatus(status, statusMessage)
+        });
+      }
+    });
+    if (statusDisposer) {
+      disposers.push(statusDisposer);
+    }
+    const dataDisposer = session.onData?.((data) => {
+      const current = this.tabs.get(tabId);
+      if (current) {
+        void this.contextService.record(current, "terminal-output", data);
+      }
+    });
+    if (dataDisposer) {
+      disposers.push(dataDisposer);
+    }
+    this.sessionDisposers.set(tabId, disposers);
+  }
+
+  private disposeSessionListeners(tabId: string): void {
+    for (const dispose of this.sessionDisposers.get(tabId) ?? []) {
+      dispose();
+    }
+    this.sessionDisposers.delete(tabId);
   }
 
   private createControls(tabId: string): PluginTabControls {

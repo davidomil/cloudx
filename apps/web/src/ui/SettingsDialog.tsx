@@ -1,42 +1,42 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
-import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, ConfigValue, PersonalityProfileStore } from "@cloudx/shared";
+import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, ConfigValue, RulesSkillsStore } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
-import { ProfileSelect } from "./RulesSkillsPanel.js";
+import { TemplateSelect } from "./RulesSkillsPanel.js";
 
 export function SettingsDialog({
   config,
-  profileStore,
+  rulesSkillsStore,
   onCancel,
   onSave,
-  onSaveDefaultProfile,
+  onSaveDefaultTemplate,
   children
 }: {
   config: CloudxConfigResponse;
-  profileStore?: PersonalityProfileStore;
+  rulesSkillsStore?: RulesSkillsStore;
   onCancel: () => void;
   onSave: (values: CloudxConfigValues) => Promise<void>;
-  onSaveDefaultProfile?: (profileId: string | undefined) => Promise<void>;
+  onSaveDefaultTemplate?: (templateId: string | undefined) => Promise<void>;
   children?: ReactNode;
 }) {
   const [values, setValues] = useState<CloudxConfigValues>(() => structuredClone(config.values));
-  const [defaultProfileId, setDefaultProfileId] = useState(profileStore?.defaultProfileId ?? "");
+  const [defaultTemplateId, setDefaultTemplateId] = useState(rulesSkillsStore?.defaultTemplateId ?? "");
   const [busy, setBusy] = useState(false);
   const dialogRef = useRef<HTMLDivElement | null>(null);
 
   useOutsidePointerDismiss(true, dialogRef, onCancel);
 
   useEffect(() => {
-    setDefaultProfileId(profileStore?.defaultProfileId ?? "");
-  }, [profileStore?.defaultProfileId]);
+    setDefaultTemplateId(rulesSkillsStore?.defaultTemplateId ?? "");
+  }, [rulesSkillsStore?.defaultTemplateId]);
 
   async function save() {
     setBusy(true);
     try {
-      if (profileStore && onSaveDefaultProfile && defaultProfileId !== (profileStore.defaultProfileId ?? "")) {
-        await onSaveDefaultProfile(defaultProfileId || undefined);
+      if (rulesSkillsStore && onSaveDefaultTemplate && defaultTemplateId !== (rulesSkillsStore.defaultTemplateId ?? "")) {
+        await onSaveDefaultTemplate(defaultTemplateId || undefined);
       }
       await onSave(values);
     } finally {
@@ -70,13 +70,13 @@ export function SettingsDialog({
           {config.globalFields.map((field) => (
             <ConfigField key={field.key} field={field} value={values.global[field.key] ?? field.defaultValue} onChange={(value) => setGlobalValue(field.key, value)} />
           ))}
-          {profileStore ? (
-            <ProfileSelect
-              value={defaultProfileId}
-              profiles={profileStore.profiles}
-              defaultProfileId={defaultProfileId}
-              onChange={setDefaultProfileId}
-              label="Default personality"
+          {rulesSkillsStore ? (
+            <TemplateSelect
+              value={defaultTemplateId}
+              templates={rulesSkillsStore.templates}
+              defaultTemplateId={defaultTemplateId}
+              onChange={setDefaultTemplateId}
+              label="Default template"
             />
           ) : null}
         </section>

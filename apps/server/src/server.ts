@@ -34,7 +34,7 @@ import { PluginDataStore } from "./plugins/PluginDataStore.js";
 import { RulesSkillsPlugin } from "./plugins/RulesSkillsPlugin.js";
 import { SessionStore } from "./sessionStore.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
-import { PersonalityProfileService } from "./profiles/PersonalityProfileService.js";
+import { RulesSkillsCatalogService } from "./rulesSkills/RulesSkillsCatalogService.js";
 import { NodePtyTerminalProcessFactory } from "./terminal/NodePtyTerminalProcess.js";
 import { VoiceController } from "./voice/VoiceController.js";
 import { CodexExecVoicePlanner } from "./voice/VoicePlanner.js";
@@ -57,7 +57,7 @@ export interface AppServices {
   workspace?: WorkspaceLayoutStore;
   hooks?: HookRegistry;
   pluginData?: PluginDataStore;
-  profiles?: PersonalityProfileService;
+  rulesSkills?: RulesSkillsCatalogService;
 }
 
 const MIN_STREAMED_AUDIO_BYTES = 128;
@@ -77,7 +77,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   services.config ??= new ConfigService(config.dataDir, () => services!.plugins.list());
   services.workspace ??= new WorkspaceLayoutStore(config.dataDir, services.pathPolicy);
   services.pluginData ??= new PluginDataStore(config.dataDir);
-  services.profiles ??= new PersonalityProfileService(services.pluginData);
+  services.rulesSkills ??= new RulesSkillsCatalogService(config.dataDir);
   services.hooks ??= buildHookRegistry(services);
   services.sessions.setHookRegistry?.(services.hooks);
   const localWebProxy = new LocalWebProxy(services.sessions);
@@ -120,6 +120,11 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     await services.workspace!.updateWindow(request.params.windowId, request.body);
     if (request.body.pluginMetadata !== undefined) {
       await services.sessions.refreshRuntimeIndicators(request.params.windowId);
+      const windowTabIds = new Set(services.workspace!.tabIdsForWindow(request.params.windowId));
+      await services.sessions.applyRuntimeContexts(
+        (tab) => tab.pluginId === "codex-terminal" && windowTabIds.has(tab.id),
+        "Applying window rules/skills template changes."
+      );
     }
     return await services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId());
   });
@@ -571,18 +576,21 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   const workspace = new WorkspaceLayoutStore(config.dataDir, pathPolicy);
   const terminalFactory = new NodePtyTerminalProcessFactory();
   const pluginData = new PluginDataStore(config.dataDir);
-  const profiles = new PersonalityProfileService(pluginData);
-  plugins.register(new CodexTerminalPlugin(terminalFactory, config.terminalReplayBytes));
+  const rulesSkills = new RulesSkillsCatalogService(config.dataDir);
+  plugins.register(new CodexTerminalPlugin(terminalFactory, config.terminalReplayBytes, config.dataDir));
   plugins.register(new StandardTerminalPlugin(terminalFactory, config.terminalReplayBytes));
   plugins.register(new FileBrowserPlugin(pathPolicy));
   plugins.register(new LocalWebPlugin());
   plugins.register(new WorktreeManagerPlugin());
   plugins.register(new WorkspaceControlPlugin());
-  plugins.register(new RulesSkillsPlugin(profiles));
+  plugins.register(new RulesSkillsPlugin(rulesSkills));
   const configService = new ConfigService(config.dataDir, () => plugins.list());
-  const sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir), configService, workspace, profiles);
-  profiles.onChange(() => {
-    void sessions.refreshRuntimeIndicators();
+  const sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir), configService, workspace, rulesSkills);
+  rulesSkills.onChange(() => {
+    void (async () => {
+      await sessions.refreshRuntimeIndicators();
+      await sessions.applyRuntimeContexts((tab) => tab.pluginId === "codex-terminal", "Applying rules/skills template changes.");
+    })();
   });
   const asr = new AsrClient(config.asrUrl);
   let voice: VoiceController | undefined;
@@ -601,7 +609,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   );
   const hooks = buildHookRegistry({ plugins, sessions, pathPolicy, voice, asr, config: configService, workspace });
   sessions.setHookRegistry(hooks);
-  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, pluginData, profiles };
+  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, pluginData, rulesSkills };
 }
 
 function buildHookRegistry(services: AppServices): HookRegistry {

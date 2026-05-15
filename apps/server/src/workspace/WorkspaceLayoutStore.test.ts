@@ -77,12 +77,12 @@ describe("WorkspaceLayoutStore", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-window-metadata-"));
     const store = new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root]));
     const created = await store.createWindow({
-      name: "Profiled",
+      name: "Templated",
       defaultCwd: root,
-      pluginMetadata: { "rules-skills": { selectedProfileId: "focused" } }
+      pluginMetadata: { "rules-skills": { selectedTemplateId: "focused" } }
     });
 
-    expect(created.pluginMetadata?.["rules-skills"]).toEqual({ selectedProfileId: "focused" });
+    expect(created.pluginMetadata?.["rules-skills"]).toEqual({ selectedTemplateId: "focused" });
 
     const cleared = await store.updateWindow(created.id, { pluginMetadata: { "rules-skills": null } });
     expect(cleared.pluginMetadata?.["rules-skills"]).toBeUndefined();

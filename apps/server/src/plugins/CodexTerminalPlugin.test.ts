@@ -1,4 +1,4 @@
-import fs from "node:fs";
+import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { TabIndicatorUpdate, WorkspaceTab } from "@cloudx/shared";
 
-import { CodexTerminalPlugin, CodexTerminalSession, TerminalShellIntegrationParser, materializeCodexProfile } from "./CodexTerminalPlugin.js";
+import { CodexTerminalPlugin, CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES, TerminalShellIntegrationParser, materializeCodexTemplate } from "./CodexTerminalPlugin.js";
 import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
 
 class FakeTerminalProcess implements TerminalProcess {
@@ -55,12 +55,14 @@ class CapturingFactory implements TerminalProcessFactory {
   command: string | undefined;
   args: string[] | undefined;
   env: NodeJS.ProcessEnv | undefined;
+  process: FakeTerminalProcess | undefined;
 
   async spawn(command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; cols: number; rows: number }): Promise<TerminalProcess> {
     this.command = command;
     this.args = args;
     this.env = options.env;
-    return new FakeTerminalProcess();
+    this.process = new FakeTerminalProcess();
+    return this.process;
   }
 }
 
@@ -74,14 +76,10 @@ const tab: WorkspaceTab = {
   createdAt: new Date(0).toISOString(),
   updatedAt: new Date(0).toISOString()
 };
-const tempCodexHomes: string[] = [];
 
 describe("CodexTerminalPlugin", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
-    for (const codexHome of tempCodexHomes.splice(0)) {
-      fs.rmSync(codexHome, { recursive: true, force: true });
-    }
   });
 
   it("launches Codex through the user's login shell", async () => {
@@ -96,11 +94,16 @@ describe("CodexTerminalPlugin", () => {
     expect(factory.args).toEqual(["-lc", "exec /usr/bin/codex"]);
   });
 
-  it("uses assistant command and environment from the resolved personality profile", async () => {
+  it("launches resolved template rules and skills through a Codex home overlay", async () => {
     vi.stubEnv("SHELL", "/bin/bash");
-    vi.stubEnv("CODEX_HOME", createCodexHome({ "code-review": "Code review skill instructions." }));
+    vi.stubEnv("CLOUDX_ASSISTANT_BIN", "/usr/bin/codex");
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-overlay-"));
+    const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-base-codex-home-"));
+    vi.stubEnv("CODEX_HOME", codexHome);
+    await fs.writeFile(path.join(codexHome, "AGENTS.md"), "Prefer direct answers.\n", "utf8");
+    await seedSkill(dataDir, "code-review", "Code Review", "Review code.", "Code review skill instructions.");
     const factory = new CapturingFactory();
-    const plugin = new CodexTerminalPlugin(factory);
+    const plugin = new CodexTerminalPlugin(factory, DEFAULT_TERMINAL_REPLAY_BYTES, dataDir);
 
     await plugin.createSession({
       tab,
@@ -109,18 +112,17 @@ describe("CodexTerminalPlugin", () => {
       runtimeContext: {
         pluginRuntime: {
           "rules-skills": {
-            personalityProfile: {
+            personalityTemplate: {
               source: "tab",
-              profile: {
-                id: "claude",
-                name: "Claude",
+              template: {
+                id: "review",
+                name: "Review",
                 color: "yellow",
-                assistantCommand: "/usr/bin/claude",
-                rulesText: "Review carefully.",
-                enabledSkillIds: ["code-review"],
-                enabledPluginIds: ["file-browser"],
-                env: { CLOUDX_PROFILE: "claude" }
-              }
+                ruleIds: ["review-carefully"],
+                skillIds: ["code-review"]
+              },
+              rules: [{ id: "review-carefully", description: "Review carefully.", text: "Review carefully." }],
+              skills: [{ id: "code-review", name: "Code Review", description: "Review code.", instructions: "Code review skill instructions." }]
             }
           }
         }
@@ -128,111 +130,155 @@ describe("CodexTerminalPlugin", () => {
     });
 
     expect(factory.args?.[0]).toBe("-lc");
-    expect(factory.args?.[1]).toContain("exec /usr/bin/claude");
-    expect(factory.args?.[1]).toContain("Review carefully.");
-    expect(factory.args?.[1]).toContain("Code review skill instructions.");
-    expect(factory.env?.CLOUDX_PROFILE).toBe("claude");
+    expect(factory.args?.[1]).toContain("exec /usr/bin/codex");
+    expect(factory.args?.[1]).toContain("--add-dir");
+    expect(factory.args?.[1]).not.toContain("Review carefully.");
+    expect(factory.args?.[1]).not.toContain("Code review skill instructions.");
     expect(factory.env).toMatchObject({
-      CLOUDX_PERSONALITY_PROFILE_ID: "claude",
-      CLOUDX_PERSONALITY_PROFILE_NAME: "Claude",
-      CLOUDX_PERSONALITY_INJECTION: "prompt-argument",
-      CLOUDX_PERSONALITY_RULES: "Review carefully.",
-      CLOUDX_ENABLED_SKILL_IDS: "code-review",
-      CLOUDX_ENABLED_PLUGIN_IDS: "file-browser"
+      CLOUDX_PERSONALITY_TEMPLATE_ID: "review",
+      CLOUDX_PERSONALITY_TEMPLATE_NAME: "Review",
+      CLOUDX_PERSONALITY_INJECTION: "codex-home-overlay",
+      CLOUDX_ENABLED_RULE_IDS: "review-carefully",
+      CLOUDX_ENABLED_SKILL_IDS: "code-review"
     });
+    expect(factory.env?.CODEX_HOME).toContain(path.join(dataDir, "codex-homes", "tab-1"));
+    expect(factory.env?.CLOUDX_RULES_SKILLS_DIR).toBe(path.join(dataDir, "rules-skills"));
+    const overlayConfig = await fs.readFile(path.join(factory.env!.CODEX_HOME!, "config.toml"), "utf8");
+    expect(overlayConfig).toContain("skills/cloudx/code-review/SKILL.md");
+    expect(overlayConfig).toContain("skills/cloudx-system/create-cloudx-skill/SKILL.md");
+    await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx", "code-review", "SKILL.md"), "utf8")).resolves.toContain("Code review skill instructions.");
+    await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx-system", "create-cloudx-skill", "SKILL.md"), "utf8")).resolves.toContain("Create CloudX Skill");
+    const overlayInstructions = await fs.readFile(path.join(factory.env!.CODEX_HOME!, "AGENTS.override.md"), "utf8");
+    expect(overlayInstructions).toContain("Prefer direct answers.");
+    expect(overlayInstructions).toContain("Review carefully.");
   });
 
-  it("materializes stored profile fields into launch environment for wrapper commands", () => {
-    const codexHome = createCodexHome({
-      reviewer: "Reviewer skill instructions.",
-      testing: "Testing skill instructions."
-    });
-    const launch = materializeCodexProfile(
+  it("materializes resolved template fields into a Codex home overlay", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-materialized-overlay-"));
+    const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-materialized-base-"));
+    await seedSkill(dataDir, "reviewer", "Reviewer", "Reviewer skill.", "Reviewer skill instructions.");
+    await seedSkill(dataDir, "testing", "Testing", "Testing skill.", "Testing skill instructions.");
+    await fs.writeFile(path.join(codexHome, "config.toml"), "model = \"gpt-5.3-codex\"\n", "utf8");
+    const launch = await materializeCodexTemplate(
       {
-        id: "review",
-        name: "Review",
-        color: "red",
-        rulesText: "Find correctness issues.",
-        enabledSkillIds: ["reviewer", "testing"],
-        enabledPluginIds: ["file-browser"],
-        env: { CUSTOM_ENV: "1" }
+        source: "window",
+        template: {
+          id: "review",
+          name: "Review",
+          color: "red",
+          ruleIds: ["correctness"],
+          skillIds: ["reviewer", "testing"]
+        },
+        rules: [{ id: "correctness", description: "Find correctness issues.", text: "Find correctness issues." }],
+        skills: [
+          { id: "reviewer", name: "Reviewer", description: "Reviewer skill.", instructions: "Reviewer skill instructions." },
+          { id: "testing", name: "Testing", description: "Testing skill.", instructions: "Testing skill instructions." }
+        ]
       },
-      { CLOUDX_ASSISTANT_BIN: "/usr/bin/codex", CODEX_HOME: codexHome }
+      { CLOUDX_ASSISTANT_BIN: "/usr/bin/codex", CUSTOM_ENV: "1", CODEX_HOME: codexHome },
+      { dataDir, tabId: "tab-99" }
     );
 
     expect(launch.command).toBe("/usr/bin/codex");
-    expect(launch.args).toHaveLength(1);
-    expect(launch.injectionPrompt).toContain("Find correctness issues.");
-    expect(launch.injectionPrompt).toContain("Reviewer skill instructions.");
-    expect(launch.injectionPrompt).toContain("Testing skill instructions.");
+    expect(launch.args).toEqual(["--add-dir", path.join(dataDir, "rules-skills")]);
+    expect(launch.overlay?.codexHome).toBe(path.join(dataDir, "codex-homes", "tab-99"));
+    const overlayConfig = await fs.readFile(path.join(launch.overlay!.codexHome, "config.toml"), "utf8");
+    expect(overlayConfig).toContain("model = \"gpt-5.3-codex\"");
+    expect(overlayConfig).toContain("skills/cloudx/reviewer/SKILL.md");
+    expect(overlayConfig).toContain("skills/cloudx/testing/SKILL.md");
+    await expect(fs.readFile(path.join(launch.overlay!.codexHome, "skills", "cloudx", "reviewer", "SKILL.md"), "utf8")).resolves.toContain("Reviewer skill instructions.");
+    await expect(fs.readFile(path.join(launch.overlay!.codexHome, "skills", "cloudx", "testing", "SKILL.md"), "utf8")).resolves.toContain("Testing skill instructions.");
     expect(launch.env).toMatchObject({
       CUSTOM_ENV: "1",
-      CLOUDX_PERSONALITY_PROFILE_ID: "review",
-      CLOUDX_PERSONALITY_PROFILE_NAME: "Review",
-      CLOUDX_PERSONALITY_INJECTION: "prompt-argument",
-      CLOUDX_PERSONALITY_RULES: "Find correctness issues.",
-      CLOUDX_ENABLED_SKILL_IDS: "reviewer,testing",
-      CLOUDX_ENABLED_PLUGIN_IDS: "file-browser"
+      CLOUDX_PERSONALITY_TEMPLATE_ID: "review",
+      CLOUDX_PERSONALITY_TEMPLATE_NAME: "Review",
+      CLOUDX_PERSONALITY_INJECTION: "codex-home-overlay",
+      CLOUDX_ENABLED_RULE_IDS: "correctness",
+      CLOUDX_ENABLED_SKILL_IDS: "reviewer,testing"
     });
     expect(launch.voiceSummary).toContain("Review");
   });
 
-  it("fails clearly when a selected skill cannot be materialized", () => {
-    const codexHome = createCodexHome({});
+  it("can update a materialized Codex home overlay without deleting existing runtime state", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-live-overlay-"));
+    const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-live-base-"));
+    await seedSkill(dataDir, "reviewer", "Reviewer", "Reviewer skill.", "Reviewer skill instructions.");
+    await seedSkill(dataDir, "tester", "Tester", "Tester skill.", "Tester skill instructions.");
+    const first = await materializeCodexTemplate(
+      {
+        source: "default",
+        template: { id: "review", name: "Review", color: "yellow", ruleIds: [], skillIds: ["reviewer"] },
+        rules: [],
+        skills: [{ id: "reviewer", name: "Reviewer", description: "Reviewer skill.", instructions: "Reviewer skill instructions." }]
+      },
+      { CLOUDX_ASSISTANT_BIN: "/usr/bin/codex", CODEX_HOME: codexHome },
+      { dataDir, tabId: "tab-live" }
+    );
+    const sessionState = path.join(first.overlay!.codexHome, "sessions", "current.jsonl");
+    await fs.mkdir(path.dirname(sessionState), { recursive: true });
+    await fs.writeFile(sessionState, "keep me\n", "utf8");
 
-    expect(() =>
-      materializeCodexProfile(
-        {
-          id: "review",
-          name: "Review",
-          color: "red",
-          enabledSkillIds: ["missing-skill"],
-          enabledPluginIds: []
-        },
-        { CLOUDX_ASSISTANT_BIN: "/usr/bin/codex", CODEX_HOME: codexHome }
-      )
-    ).toThrow(/missing-skill.*SKILL\.md/);
+    const second = await materializeCodexTemplate(
+      {
+        source: "default",
+        template: { id: "test", name: "Test", color: "green", ruleIds: [], skillIds: ["tester"] },
+        rules: [],
+        skills: [{ id: "tester", name: "Tester", description: "Tester skill.", instructions: "Tester skill instructions." }]
+      },
+      { CLOUDX_ASSISTANT_BIN: "/usr/bin/codex", CODEX_HOME: codexHome },
+      { dataDir, tabId: "tab-live", resetOverlay: false }
+    );
+
+    await expect(fs.readFile(sessionState, "utf8")).resolves.toBe("keep me\n");
+    await expect(fs.readFile(path.join(second.overlay!.codexHome, "skills", "cloudx", "tester", "SKILL.md"), "utf8")).resolves.toContain("Tester skill instructions.");
+    await expect(fs.stat(path.join(second.overlay!.codexHome, "skills", "cloudx", "reviewer", "SKILL.md"))).rejects.toThrow();
   });
 
-  it("loads system and plugin-qualified skill instructions", () => {
-    const codexHome = createCodexHome({});
-    writeSkillFile(codexHome, ["skills", ".system", "plugin-creator"], "System plugin creator instructions.");
-    writeSkillFile(
-      codexHome,
-      ["plugins", "cache", "openai-curated", "build-web-apps", "b8edb371", "skills", "react-best-practices"],
-      "React best practices instructions."
-    );
+  it("does not create an overlay when no data directory is provided", async () => {
+    const launch = await materializeCodexTemplate(undefined, { CLOUDX_ASSISTANT_BIN: "/usr/bin/codex" });
 
-    const launch = materializeCodexProfile(
-      {
-        id: "frontend",
-        name: "Frontend",
-        color: "green",
-        enabledSkillIds: ["plugin-creator", "build-web-apps:react-best-practices"],
-        enabledPluginIds: []
-      },
-      { CLOUDX_ASSISTANT_BIN: "/usr/bin/codex", CODEX_HOME: codexHome }
-    );
+    expect(launch.command).toBe("/usr/bin/codex");
+    expect(launch.args).toEqual([]);
+    expect(launch.overlay).toBeUndefined();
+    expect(launch.env.CLOUDX_PERSONALITY_TEMPLATE_ID).toBeUndefined();
+  });
 
-    expect(launch.injectionPrompt).toContain("System plugin creator instructions.");
-    expect(launch.injectionPrompt).toContain("React best practices instructions.");
+  it("injects updated rules and skills into a running Codex terminal without stopping it", async () => {
+    vi.stubEnv("SHELL", "/bin/bash");
+    vi.stubEnv("CLOUDX_ASSISTANT_BIN", "/usr/bin/codex");
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-live-update-"));
+    const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-live-home-"));
+    vi.stubEnv("CODEX_HOME", codexHome);
+    await seedSkill(dataDir, "tester", "Tester", "Tester skill.", "Tester skill instructions.");
+    const factory = new CapturingFactory();
+    const plugin = new CodexTerminalPlugin(factory, DEFAULT_TERMINAL_REPLAY_BYTES, dataDir);
+
+    const session = await plugin.createSession({ tab, cwd: "/tmp", controls: { setTabIndicator: () => undefined, closeTab: () => undefined } });
+    factory.process!.written = "";
+    const result = await session.applyRuntimeContext?.({
+      pluginRuntime: {
+        "rules-skills": {
+          personalityTemplate: {
+            source: "default",
+            template: { id: "test", name: "Test", color: "green", ruleIds: ["be-specific"], skillIds: ["tester"] },
+            rules: [{ id: "be-specific", description: "Be specific.", text: "Be specific about changed files." }],
+            skills: [{ id: "tester", name: "Tester", description: "Tester skill.", instructions: "Tester skill instructions." }]
+          }
+        }
+      }
+    });
+
+    expect(factory.process!.killed).toBe(false);
+    expect(result).toMatchObject({ applied: true, templateId: "test", templateName: "Test" });
+    expect(factory.process!.written).toContain("\u001b[200~CloudX rules/skills update");
+    expect(factory.process!.written).toContain("Be specific about changed files.");
+    expect(factory.process!.written).toContain("$tester: Tester - Tester skill.");
+    expect(factory.process!.written).toContain(path.join(dataDir, "rules-skills", "skills", "tester", "SKILL.md"));
+    expect(factory.process!.written).toContain("$create-cloudx-skill");
+    expect(factory.process!.written.endsWith("\u001b[201~\r")).toBe(true);
+    await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx", "tester", "SKILL.md"), "utf8")).resolves.toContain("Tester skill instructions.");
   });
 });
-
-function createCodexHome(skills: Record<string, string>): string {
-  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-codex-home-"));
-  tempCodexHomes.push(codexHome);
-  for (const [skillId, content] of Object.entries(skills)) {
-    writeSkillFile(codexHome, ["skills", skillId], content);
-  }
-  return codexHome;
-}
-
-function writeSkillFile(codexHome: string, segments: string[], content: string): void {
-  const skillDir = path.join(codexHome, ...segments);
-  fs.mkdirSync(skillDir, { recursive: true });
-  fs.writeFileSync(path.join(skillDir, "SKILL.md"), content);
-}
 
 describe("CodexTerminalSession", () => {
   it("types text and submits when requested", () => {
@@ -409,3 +455,13 @@ describe("TerminalShellIntegrationParser", () => {
     expect(parser.push("\u001b]633;D\u001b\\")).toEqual([{ sequence: 633 }]);
   });
 });
+
+async function seedSkill(dataDir: string, id: string, name: string, description: string, body: string): Promise<void> {
+  const skillDir = path.join(dataDir, "rules-skills", "skills", id);
+  await fs.mkdir(skillDir, { recursive: true });
+  await fs.writeFile(
+    path.join(skillDir, "SKILL.md"),
+    `---\nname: "${id}"\ndescription: "${description}"\ncloudx_name: "${name}"\n---\n\n${body}\n`,
+    "utf8"
+  );
+}

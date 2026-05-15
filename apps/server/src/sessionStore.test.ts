@@ -4,7 +4,7 @@ import path from "node:path";
 
 import type { CreatePluginSessionInput, PluginSession, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
 import { pluginActionHookId } from "@cloudx/plugin-api";
-import { RULES_SKILLS_PLUGIN_ID, type WorkspaceTab } from "@cloudx/shared";
+import { RULES_SKILLS_PLUGIN_ID, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
 import { describe, expect, it } from "vitest";
 
 import { TabContextService } from "./context/TabContextService.js";
@@ -20,6 +20,8 @@ import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
 
 class FakeSession implements PluginSession {
   private readonly dataListeners = new Set<(data: string) => void>();
+  appliedRuntimeContexts: Array<WorkspaceRuntimeContext | undefined> = [];
+  stopped = false;
 
   constructor(public readonly tab: WorkspaceTab) {}
 
@@ -46,6 +48,15 @@ class FakeSession implements PluginSession {
     return { action, input };
   }
 
+  stop(): void {
+    this.stopped = true;
+  }
+
+  applyRuntimeContext(runtimeContext?: WorkspaceRuntimeContext): Record<string, unknown> {
+    this.appliedRuntimeContexts.push(runtimeContext);
+    return { applied: true };
+  }
+
   onData(listener: (data: string) => void): () => void {
     this.dataListeners.add(listener);
     return () => this.dataListeners.delete(listener);
@@ -70,6 +81,7 @@ class FakeDefaultPlugin implements WorkspacePlugin {
   lastSession: FakeSession | undefined;
   lastControls: PluginTabControls | undefined;
   lastInput: CreatePluginSessionInput | undefined;
+  createCount = 0;
 
   constructor(input: { handlesUnhandledVoice?: boolean } = {}) {
     this.actions = [
@@ -93,6 +105,7 @@ class FakeDefaultPlugin implements WorkspacePlugin {
   }
 
   createSession(input: CreatePluginSessionInput) {
+    this.createCount += 1;
     this.lastInput = input;
     this.lastControls = input.controls;
     this.lastSession = new FakeSession(input.tab);
@@ -482,8 +495,8 @@ describe("SessionStore voice actions", () => {
     expect(() => plugin.lastSession?.emitData("late output")).not.toThrow();
   });
 
-  it("passes resolved runtime context and updates tab profile metadata", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-session-profile-"));
+  it("passes resolved runtime context and updates tab template metadata", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-session-template-"));
     const plugin = new FakeDefaultPlugin();
     const registry = new PluginRegistry();
     registry.register(plugin);
@@ -495,7 +508,12 @@ describe("SessionStore voice actions", () => {
         tabPluginMetadata: tab.pluginMetadata,
         pluginRuntime: {
           [RULES_SKILLS_PLUGIN_ID]: {
-            personalityProfile: { source: "tab", profile: { id: "focused", name: "Focused", color: "yellow", enabledSkillIds: [], enabledPluginIds: [] } }
+            personalityTemplate: {
+              source: "tab",
+              template: { id: "focused", name: "Focused", color: "yellow", ruleIds: [], skillIds: [] },
+              rules: [],
+              skills: []
+            }
           }
         }
       }),
@@ -509,12 +527,12 @@ describe("SessionStore voice actions", () => {
     const tab = await store.createTab({
       pluginId: "fake-default",
       cwd: root,
-      pluginMetadata: { [RULES_SKILLS_PLUGIN_ID]: { selectedProfileId: "focused" } }
+      pluginMetadata: { [RULES_SKILLS_PLUGIN_ID]: { selectedTemplateId: "focused" } }
     });
 
     expect(plugin.lastInput?.runtimeContext).toMatchObject({
       activeWindowId: expect.stringMatching(/^window-/),
-      pluginRuntime: { [RULES_SKILLS_PLUGIN_ID]: { personalityProfile: { profile: { id: "focused" } } } }
+      pluginRuntime: { [RULES_SKILLS_PLUGIN_ID]: { personalityTemplate: { template: { id: "focused" } } } }
     });
     expect(tab.indicator).toMatchObject({ color: "yellow", label: "Focused" });
 
@@ -522,8 +540,51 @@ describe("SessionStore voice actions", () => {
     expect(cleared.pluginMetadata?.[RULES_SKILLS_PLUGIN_ID]).toBeUndefined();
   });
 
+  it("applies fresh runtime context to matching tabs without recreating sessions", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-session-restart-template-"));
+    const plugin = new FakeDefaultPlugin();
+    const registry = new PluginRegistry();
+    registry.register(plugin);
+    const pathPolicy = new PathPolicy([root]);
+    const workspace = new WorkspaceLayoutStore(path.join(root, ".cloudx"), pathPolicy);
+    let template: { id: string; name: string; color: "green" | "yellow" | "red" } = { id: "focused", name: "Focused", color: "yellow" };
+    const resolver: SessionRuntimeContextResolver = {
+      runtimeContextFor: () => ({
+        pluginRuntime: {
+          [RULES_SKILLS_PLUGIN_ID]: {
+            personalityTemplate: {
+              source: "default",
+              template: { ...template, ruleIds: [], skillIds: [] },
+              rules: [],
+              skills: []
+            }
+          }
+        }
+      }),
+      tabIndicatorFor: () => ({ color: template.color, label: template.name })
+    };
+    const store = new SessionStore(registry, pathPolicy, new TabContextService(path.join(root, ".cloudx")), { getPluginConfig: () => ({}) }, workspace, resolver);
+
+    const tab = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Codex" });
+    const firstSession = plugin.lastSession;
+    template = { id: "review", name: "Review", color: "red" };
+
+    const applied = await store.applyRuntimeContexts((candidate) => candidate.id === tab.id, "Apply template changes.");
+
+    expect(applied).toHaveLength(1);
+    expect(plugin.createCount).toBe(1);
+    expect(firstSession?.stopped).toBe(false);
+    expect(firstSession?.appliedRuntimeContexts[0]).toMatchObject({
+      pluginRuntime: { [RULES_SKILLS_PLUGIN_ID]: { personalityTemplate: { template: { id: "review", name: "Review" } } } }
+    });
+    expect(store.getTab(tab.id)).toMatchObject({
+      status: "running",
+      indicator: { color: "red", label: "Review" }
+    });
+  });
+
   it("refreshes tab indicators from updated window runtime metadata", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-session-window-profile-"));
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-session-window-template-"));
     const plugin = new FakeDefaultPlugin();
     const registry = new PluginRegistry();
     registry.register(plugin);
@@ -538,17 +599,17 @@ describe("SessionStore voice actions", () => {
       }),
       tabIndicatorFor: (_tab, activeWindow) => {
         const metadata = activeWindow?.pluginMetadata?.[RULES_SKILLS_PLUGIN_ID];
-        if (!metadata || typeof metadata !== "object" || !("selectedProfileId" in metadata)) {
+        if (!metadata || typeof metadata !== "object" || !("selectedTemplateId" in metadata)) {
           return undefined;
         }
-        return { color: "red", label: String(metadata.selectedProfileId) };
+        return { color: "red", label: String(metadata.selectedTemplateId) };
       }
     };
     const store = new SessionStore(registry, pathPolicy, new TabContextService(path.join(root, ".cloudx")), { getPluginConfig: () => ({}) }, workspace, resolver);
     const tab = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Shell" });
     await workspace.updateWindow(window.id, { layout: layoutWithTab(tab.id) });
 
-    await workspace.updateWindow(window.id, { pluginMetadata: { [RULES_SKILLS_PLUGIN_ID]: { selectedProfileId: "review" } } });
+    await workspace.updateWindow(window.id, { pluginMetadata: { [RULES_SKILLS_PLUGIN_ID]: { selectedTemplateId: "review" } } });
     await store.refreshRuntimeIndicators(window.id);
 
     expect(store.getTab(tab.id).indicator).toMatchObject({ color: "red", label: "review" });

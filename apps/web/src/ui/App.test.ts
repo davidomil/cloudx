@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { RULES_SKILLS_PLUGIN_ID, type PluginDescriptor, type WorkspaceStateResponse } from "@cloudx/shared";
 
 import { requestAudioInputEnumerationAccess, workspaceStateWithPreservedLayout } from "./App.js";
-import { pluginMetadataForProfile, selectedProfileId } from "./RulesSkillsPanel.js";
+import { pluginMetadataForTemplate, selectedTemplateId } from "./RulesSkillsPanel.js";
 import { collectUiContributions, selectTabIndicatorContribution } from "./uiContributions.js";
 
 describe("requestAudioInputEnumerationAccess", () => {
@@ -102,13 +102,13 @@ describe("workspaceStateWithPreservedLayout", () => {
   });
 });
 
-describe("profile metadata helpers", () => {
-  it("builds and reads rules/skills profile metadata", () => {
-    const metadata = pluginMetadataForProfile("focused");
+describe("template metadata helpers", () => {
+  it("builds and reads rules/skills template metadata", () => {
+    const metadata = pluginMetadataForTemplate("focused");
 
-    expect(metadata).toEqual({ [RULES_SKILLS_PLUGIN_ID]: { selectedProfileId: "focused" } });
-    expect(selectedProfileId({ ...workspaceTab("tab-codex", "codex-terminal"), pluginMetadata: metadata })).toBe("focused");
-    expect(pluginMetadataForProfile(undefined)).toBeUndefined();
+    expect(metadata).toEqual({ [RULES_SKILLS_PLUGIN_ID]: { selectedTemplateId: "focused" } });
+    expect(selectedTemplateId({ ...workspaceTab("tab-codex", "codex-terminal"), pluginMetadata: metadata })).toBe("focused");
+    expect(pluginMetadataForTemplate(undefined)).toBeUndefined();
   });
 });
 

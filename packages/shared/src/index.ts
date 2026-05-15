@@ -16,20 +16,37 @@ export type PluginMetadataPatch = Record<PluginId, PluginMetadata | null>;
 
 export const RULES_SKILLS_PLUGIN_ID = "rules-skills";
 
-export interface PersonalityProfile {
+export type RulesSkillsItemScope = "user" | "system";
+
+export interface CloudxRule {
+  id: string;
+  description: string;
+  text: string;
+  scope?: RulesSkillsItemScope;
+}
+
+export interface CloudxSkill {
+  id: string;
+  name: string;
+  description: string;
+  instructions?: string;
+  scope?: RulesSkillsItemScope;
+}
+
+export interface PersonalityTemplate {
   id: string;
   name: string;
   color: TabIndicatorColor;
-  assistantCommand?: string;
-  rulesText?: string;
-  enabledSkillIds: string[];
-  enabledPluginIds: PluginId[];
-  env?: Record<string, string>;
+  ruleIds: string[];
+  skillIds: string[];
 }
 
-export interface PersonalityProfileStore {
-  defaultProfileId?: string;
-  profiles: PersonalityProfile[];
+export interface RulesSkillsStore {
+  defaultTemplateId?: string;
+  rules: CloudxRule[];
+  skills: CloudxSkill[];
+  systemSkills: CloudxSkill[];
+  templates: PersonalityTemplate[];
 }
 
 export type PluginRuntimeContextMap = Record<PluginId, Record<string, unknown>>;

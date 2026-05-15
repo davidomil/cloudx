@@ -85,6 +85,7 @@ export interface PluginSession {
   write?(data: string): void;
   resize?(cols: number, rows: number): void;
   stop?(): void;
+  applyRuntimeContext?(runtimeContext?: WorkspaceRuntimeContext): Promise<Record<string, unknown>> | Record<string, unknown>;
   snapshot(): PluginSessionSnapshot;
   voiceContext(): Promise<PluginVoiceContext> | PluginVoiceContext;
   handleAction(action: string, input: Record<string, unknown>): Promise<Record<string, unknown>> | Record<string, unknown>;

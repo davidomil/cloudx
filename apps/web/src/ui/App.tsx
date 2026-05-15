@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement, type RefObject } from "react";
 import { AlertTriangle, Bot, ChevronDown, Columns2, GitBranch, LayoutTemplate, Mic, MicOff, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
 
-import { RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, type CloudxConfigResponse, type CloudxConfigValues, type ConfigValue, type CreateTabRequest, type PersonalityProfile, type PersonalityProfileStore, type PluginDescriptor, type PluginId, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceWindow } from "@cloudx/shared";
+import { RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, type CloudxConfigResponse, type CloudxConfigValues, type CloudxRule, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsStore, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceWindow } from "@cloudx/shared";
 
 import {
   applyLayoutTemplate,
@@ -56,7 +56,7 @@ import { applyCloudxTheme, readTerminalColorTheme } from "./theme.js";
 import { normalizeUiScale, uiScaleFactor } from "./uiScale.js";
 import { attemptPortraitOrientationLock } from "./orientationLock.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
-import { ProfileSelect, RulesSkillsPanel, TabProfileSelector, TabProfileToolbar, pluginMetadataForProfile, selectedProfileId } from "./RulesSkillsPanel.js";
+import { RulesSkillsPanel, TemplateSelect, pluginMetadataForTemplate, selectedTemplateId } from "./RulesSkillsPanel.js";
 import {
   PLUGIN_WEBVIEW_RENDERER,
   PluginWebviewPanel,
@@ -140,7 +140,7 @@ export function App() {
   const initialLayout = useMemo(() => defaultLayout(), []);
   const [plugins, setPlugins] = useState<PluginDescriptor[]>([]);
   const [config, setConfig] = useState<CloudxConfigResponse | undefined>();
-  const [profileStore, setProfileStore] = useState<PersonalityProfileStore | undefined>();
+  const [rulesSkillsStore, setRulesSkillsStore] = useState<RulesSkillsStore | undefined>();
   const [tabs, setTabs] = useState<WorkspaceTab[]>([]);
   const [windows, setWindows] = useState<WorkspaceWindow[]>([]);
   const [activeWindowId, setActiveWindowId] = useState<string | undefined>();
@@ -308,10 +308,10 @@ export function App() {
   async function refresh() {
     setConnectionStatus("checking");
     try {
-      const [pluginList, workspaceState, configState, profiles] = await Promise.all([getPlugins(), getWorkspace(), getConfig(), loadProfileStore()]);
+      const [pluginList, workspaceState, configState, rulesSkills] = await Promise.all([getPlugins(), getWorkspace(), getConfig(), loadRulesSkillsStore()]);
       setPlugins(pluginList);
       setConfig(configState);
-      setProfileStore(profiles);
+      setRulesSkillsStore(rulesSkills);
       applyWorkspaceState(workspaceState);
       setConnectionStatus("connected");
       setError(undefined);
@@ -321,9 +321,9 @@ export function App() {
     }
   }
 
-  async function loadProfileStore(): Promise<PersonalityProfileStore | undefined> {
+  async function loadRulesSkillsStore(): Promise<RulesSkillsStore | undefined> {
     try {
-      const result = await callHook<{ store: PersonalityProfileStore }>("rules-skills.profiles.list");
+      const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.catalog.list");
       return result.store;
     } catch {
       return undefined;
@@ -704,8 +704,8 @@ export function App() {
     return config?.values.plugins[pluginId] ?? {};
   }
 
-  async function handleCreateWindow(name: string, defaultCwd: string, profileId?: string) {
-    applyWorkspaceState(await createWindow({ name, defaultCwd, pluginMetadata: pluginMetadataForProfile(profileId) }));
+  async function handleCreateWindow(name: string, defaultCwd: string, templateId?: string) {
+    applyWorkspaceState(await createWindow({ name, defaultCwd, pluginMetadata: pluginMetadataForTemplate(templateId) }));
   }
 
   async function handleSelectWindow(windowId: string) {
@@ -713,8 +713,8 @@ export function App() {
     setWindowMenuOpen(false);
   }
 
-  async function handleRenameWindow(windowId: string, name: string, defaultCwd: string, profileId?: string) {
-    applyWorkspaceState(await updateWindow(windowId, { name, defaultCwd, pluginMetadata: { [RULES_SKILLS_PLUGIN_ID]: profileId ? { selectedProfileId: profileId } : null } }));
+  async function handleRenameWindow(windowId: string, name: string, defaultCwd: string, templateId?: string) {
+    applyWorkspaceState(await updateWindow(windowId, { name, defaultCwd, pluginMetadata: { [RULES_SKILLS_PLUGIN_ID]: templateId ? { selectedTemplateId: templateId } : null } }));
   }
 
   async function handleDeleteWindow(windowId: string) {
@@ -754,23 +754,29 @@ export function App() {
     setTemplateMenuOpen(false);
   }
 
-  async function handleSaveProfile(profile: PersonalityProfile) {
-    const result = await callHook<{ store: PersonalityProfileStore }>("rules-skills.profiles.save", { profile });
-    setProfileStore(result.store);
+  async function handleSavePersonalityTemplate(template: PersonalityTemplate) {
+    const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.templates.save", { template });
+    setRulesSkillsStore(result.store);
   }
 
-  async function handleDeleteProfile(profileId: string) {
-    const result = await callHook<{ store: PersonalityProfileStore }>("rules-skills.profiles.delete", { profileId });
-    setProfileStore(result.store);
+  async function handleDeletePersonalityTemplate(templateId: string) {
+    const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.templates.delete", { templateId });
+    setRulesSkillsStore(result.store);
   }
 
-  async function handleSetDefaultProfile(profileId: string | undefined) {
-    const result = await callHook<{ store: PersonalityProfileStore }>("rules-skills.profiles.setDefault", profileId ? { profileId } : {});
-    setProfileStore(result.store);
+  async function handleSetDefaultTemplate(templateId: string | undefined) {
+    const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.templates.setDefault", templateId ? { templateId } : {});
+    setRulesSkillsStore(result.store);
   }
 
-  async function handleSetTabProfile(tabId: string, profileId: string | undefined) {
-    await callHook("workspace.tabs.setPluginMetadata", profileId ? { tabId, pluginId: RULES_SKILLS_PLUGIN_ID, metadata: { selectedProfileId: profileId } } : { tabId, pluginId: RULES_SKILLS_PLUGIN_ID });
+  async function handleSaveRule(rule: CloudxRule) {
+    const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.rules.save", { rule });
+    setRulesSkillsStore(result.store);
+  }
+
+  async function handleDeleteRule(ruleId: string) {
+    const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.rules.delete", { ruleId });
+    setRulesSkillsStore(result.store);
   }
 
   function renderMicControl(className: string, ref: RefObject<HTMLDivElement | null>, iconSize: number) {
@@ -872,46 +878,16 @@ export function App() {
         </footer>
       );
     },
-    "rules-skills.profile-panel": (_contribution, context) => (
+    "rules-skills.templates-panel": (_contribution, context) => (
       <RulesSkillsPanel
-        store={profileStore}
-        plugins={context.plugins ?? plugins}
-        onSave={handleSaveProfile}
-        onDelete={handleDeleteProfile}
-        onSetDefault={handleSetDefaultProfile}
+        store={rulesSkillsStore}
+        onSaveTemplate={handleSavePersonalityTemplate}
+        onDeleteTemplate={handleDeletePersonalityTemplate}
+        onSetDefault={handleSetDefaultTemplate}
+        onSaveRule={handleSaveRule}
+        onDeleteRule={handleDeleteRule}
       />
     ),
-    "rules-skills.tab-profile-menu": (_contribution, context) => {
-      if (!context.tab || context.tab.pluginId !== "codex-terminal" || !profileStore) {
-        return null;
-      }
-      return (
-        <TabProfileSelector
-          tab={context.tab}
-          profiles={profileStore.profiles}
-          defaultProfileId={profileStore.defaultProfileId}
-          onSelect={(profileId) => void handleSetTabProfile(context.tab!.id, profileId)}
-        />
-      );
-    },
-    "rules-skills.tab-profile-settings": (_contribution, context) => {
-      if (!context.tab || context.tab.pluginId !== "codex-terminal" || !profileStore) {
-        return null;
-      }
-      return (
-        <section className="tab-settings-section">
-          <h3>Personality</h3>
-          <ProfileSelect
-            value={selectedProfileId(context.tab)}
-            profiles={profileStore.profiles}
-            defaultProfileId={profileStore.defaultProfileId}
-            onChange={(profileId) => void handleSetTabProfile(context.tab!.id, profileId || undefined)}
-            label="Profile"
-            includeInherited
-          />
-        </section>
-      );
-    }
   });
 
   function renderUiContributions(slot: UiContributionSlot, context: { tab?: WorkspaceTab; attention?: boolean } = {}): Array<ReactElement | null> {
@@ -951,7 +927,7 @@ export function App() {
           <WindowSwitcher
             windows={windows}
             tabs={tabs}
-            profileStore={profileStore}
+            rulesSkillsStore={rulesSkillsStore}
             activeWindow={activeWindow}
             open={windowMenuOpen}
             onOpenChange={setWindowMenuOpen}
@@ -1029,14 +1005,14 @@ export function App() {
 
       {renderUiContributions("app.footer.actions")}
 
-      {createOpen ? <CreateTabDialog plugins={plugins} profiles={profileStore?.profiles ?? []} defaultCwd={activeWindow?.defaultCwd ?? "~"} onCancel={closeCreateDialog} onCreate={handleCreate} /> : null}
+      {createOpen ? <CreateTabDialog plugins={plugins} templates={rulesSkillsStore?.templates ?? []} defaultCwd={activeWindow?.defaultCwd ?? "~"} onCancel={closeCreateDialog} onCreate={handleCreate} /> : null}
       {settingsOpen && config ? (
         <SettingsDialog
           config={config}
-          profileStore={profileStore}
+          rulesSkillsStore={rulesSkillsStore}
           onCancel={() => setSettingsOpen(false)}
           onSave={handleSaveConfig}
-          onSaveDefaultProfile={handleSetDefaultProfile}
+          onSaveDefaultTemplate={handleSetDefaultTemplate}
         />
       ) : null}
       {tabSettings && tabById.has(tabSettings.tabId) ? (
@@ -1174,10 +1150,8 @@ export function App() {
               active={paneActive}
               config={pluginConfig(tabById.get(pane.activeTabId)!.pluginId)}
               uiScale={uiScale}
-              profileStore={profileStore}
               uiContributionRegistry={uiContributionRegistry}
               callHook={callUiHook}
-              onSetTabProfile={handleSetTabProfile}
             />
           ) : (
             <div className="empty-pane">
@@ -1194,7 +1168,7 @@ export function App() {
 function WindowSwitcher({
   windows,
   tabs,
-  profileStore,
+  rulesSkillsStore,
   activeWindow,
   open,
   onOpenChange,
@@ -1206,13 +1180,13 @@ function WindowSwitcher({
 }: {
   windows: WorkspaceWindow[];
   tabs: WorkspaceTab[];
-  profileStore?: PersonalityProfileStore;
+  rulesSkillsStore?: RulesSkillsStore;
   activeWindow?: WorkspaceWindow;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSelect: (windowId: string) => Promise<void>;
-  onCreate: (name: string, defaultCwd: string, profileId?: string) => Promise<void>;
-  onUpdate: (windowId: string, name: string, defaultCwd: string, profileId?: string) => Promise<void>;
+  onCreate: (name: string, defaultCwd: string, templateId?: string) => Promise<void>;
+  onUpdate: (windowId: string, name: string, defaultCwd: string, templateId?: string) => Promise<void>;
   onDelete: (windowId: string) => Promise<void>;
   onContextSearch: (query: string) => Promise<{ matches: Array<{ window: WorkspaceWindow; score: number; reasons: string[] }> }>;
 }) {
@@ -1222,7 +1196,7 @@ function WindowSwitcher({
   const [contextMatches, setContextMatches] = useState<Array<{ window: WorkspaceWindow; score: number; reasons: string[] }>>([]);
   const [draftName, setDraftName] = useState(activeWindow?.name ?? "");
   const [draftCwd, setDraftCwd] = useState(activeWindow?.defaultCwd ?? "~");
-  const [draftProfileId, setDraftProfileId] = useState(selectedProfileId(activeWindow));
+  const [draftTemplateId, setDraftTemplateId] = useState(selectedTemplateId(activeWindow));
   const [dialogMode, setDialogMode] = useState<"create" | "edit" | undefined>();
   const [editingWindow, setEditingWindow] = useState<WorkspaceWindow | undefined>();
   const [deleteCandidate, setDeleteCandidate] = useState<WorkspaceWindow | undefined>();
@@ -1235,7 +1209,7 @@ function WindowSwitcher({
   useEffect(() => {
     setDraftName(activeWindow?.name ?? "");
     setDraftCwd(activeWindow?.defaultCwd ?? "~");
-    setDraftProfileId(selectedProfileId(activeWindow));
+    setDraftTemplateId(selectedTemplateId(activeWindow));
   }, [activeWindow?.id, activeWindow?.name, activeWindow?.defaultCwd, activeWindow?.pluginMetadata]);
 
   useEffect(() => {
@@ -1281,7 +1255,7 @@ function WindowSwitcher({
     setDeleteCandidate(undefined);
     setDraftName("");
     setDraftCwd(activeWindow?.defaultCwd ?? "~");
-    setDraftProfileId("");
+    setDraftTemplateId("");
     setError(undefined);
   }
 
@@ -1291,7 +1265,7 @@ function WindowSwitcher({
     setDeleteCandidate(undefined);
     setDraftName(window.name);
     setDraftCwd(window.defaultCwd);
-    setDraftProfileId(selectedProfileId(window));
+    setDraftTemplateId(selectedTemplateId(window));
     setError(undefined);
   }
 
@@ -1305,9 +1279,9 @@ function WindowSwitcher({
   async function submitWindowDialog() {
     try {
       if (dialogMode === "edit" && editingWindow) {
-        await onUpdate(editingWindow.id, draftName, draftCwd, draftProfileId || undefined);
+        await onUpdate(editingWindow.id, draftName, draftCwd, draftTemplateId || undefined);
       } else {
-        await onCreate(draftName, draftCwd, draftProfileId || undefined);
+        await onCreate(draftName, draftCwd, draftTemplateId || undefined);
       }
       setDialogMode(undefined);
       setEditingWindow(undefined);
@@ -1374,13 +1348,13 @@ function WindowSwitcher({
               <strong>{dialogMode === "edit" ? "Edit window" : "Create window"}</strong>
               <input value={draftName} onChange={(event) => setDraftName(event.target.value)} placeholder="Window name" />
               <PathEntry inputId="window-default-directory" value={draftCwd} onChange={setDraftCwd} placeholder="Default directory" ariaLabel="Window default directory" />
-              {profileStore ? (
-                <ProfileSelect
-                  value={draftProfileId}
-                  profiles={profileStore.profiles}
-                  defaultProfileId={profileStore.defaultProfileId}
-                  onChange={setDraftProfileId}
-                  label="Personality"
+              {rulesSkillsStore ? (
+                <TemplateSelect
+                  value={draftTemplateId}
+                  templates={rulesSkillsStore.templates}
+                  defaultTemplateId={rulesSkillsStore.defaultTemplateId}
+                  onChange={setDraftTemplateId}
+                  label="Template"
                   includeInherited
                   inheritedLabel="Use default"
                 />
@@ -1648,10 +1622,8 @@ function PluginPanel({
   active,
   config,
   uiScale,
-  profileStore,
   uiContributionRegistry,
-  callHook,
-  onSetTabProfile
+  callHook
 }: {
   tab: WorkspaceTab;
   plugin: PluginDescriptor | undefined;
@@ -1659,10 +1631,8 @@ function PluginPanel({
   active: boolean;
   config: Record<string, ConfigValue>;
   uiScale: number;
-  profileStore?: PersonalityProfileStore;
   uiContributionRegistry: UiContributionRegistry;
   callHook: UiContributionRenderContext["callHook"];
-  onSetTabProfile: (tabId: string, profileId: string | undefined) => Promise<void>;
 }) {
   const panelContribution = selectPluginPanelContribution(plugins, plugin);
   if (panelContribution) {
@@ -1681,14 +1651,6 @@ function PluginPanel({
     return <WorktreeManagerPanel tab={tab} config={config} />;
   }
   if (plugin?.panelKind === "terminal" || !plugin) {
-    if (tab.pluginId === "codex-terminal" && profileStore) {
-      return (
-        <div className="terminal-profile-shell">
-          <TabProfileToolbar tab={tab} profiles={profileStore.profiles} defaultProfileId={profileStore.defaultProfileId} onSelect={(profileId) => onSetTabProfile(tab.id, profileId)} />
-          <TerminalPanel tab={tab} active={active} uiScale={uiScale} />
-        </div>
-      );
-    }
     return <TerminalPanel tab={tab} active={active} uiScale={uiScale} />;
   }
   return <div className="empty-pane">No panel registered for {plugin.displayName}</div>;
@@ -1866,13 +1828,13 @@ function subscribeWorkspaceUpdates(onUpdate: (update: WorkspaceTabsUpdate) => vo
 
 function CreateTabDialog({
   plugins,
-  profiles,
+  templates,
   defaultCwd,
   onCancel,
   onCreate
 }: {
   plugins: PluginDescriptor[];
-  profiles: PersonalityProfile[];
+  templates: PersonalityTemplate[];
   defaultCwd: string;
   onCancel: () => void;
   onCreate: (input: CreateTabRequest) => Promise<void>;
@@ -1882,7 +1844,7 @@ function CreateTabDialog({
   const [cwd, setCwd] = useState(defaultCwd);
   const [title, setTitle] = useState("");
   const [localWebUrl, setLocalWebUrl] = useState("");
-  const [profileId, setProfileId] = useState("");
+  const [templateId, setTemplateId] = useState("");
   const [createDirectory, setCreateDirectory] = useState(false);
   const [busy, setBusy] = useState(false);
   const selectedPlugin = creatablePlugins.find((plugin) => plugin.id === pluginId);
@@ -1899,7 +1861,7 @@ function CreateTabDialog({
 
   useEffect(() => {
     if (!isCodex) {
-      setProfileId("");
+      setTemplateId("");
     }
   }, [isCodex]);
 
@@ -1913,7 +1875,7 @@ function CreateTabDialog({
         title,
         createDirectory: requiresDirectory ? createDirectory : false,
         initialInput,
-        pluginMetadata: isCodex ? pluginMetadataForProfile(profileId || undefined) : undefined
+        pluginMetadata: isCodex ? pluginMetadataForTemplate(templateId || undefined) : undefined
       });
     } finally {
       setBusy(false);
@@ -1952,8 +1914,8 @@ function CreateTabDialog({
             />
           </label>
         ) : null}
-        {isCodex && profiles.length > 0 ? (
-          <ProfileSelect value={profileId} profiles={profiles} onChange={setProfileId} label="Personality" includeInherited />
+        {isCodex && templates.length > 0 ? (
+          <TemplateSelect value={templateId} templates={templates} onChange={setTemplateId} label="Template" includeInherited />
         ) : null}
         <label>
           Title

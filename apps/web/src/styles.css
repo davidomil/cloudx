@@ -629,7 +629,7 @@ a:hover svg {
   color: var(--color-destructive);
 }
 
-.profile-select-row {
+.template-select-row {
   display: grid;
   gap: 5px;
   color: var(--color-muted-foreground);
@@ -638,7 +638,7 @@ a:hover svg {
   text-transform: uppercase;
 }
 
-.profile-select-row select {
+.template-select-row select {
   min-width: 0;
   color: var(--color-accent);
   background: var(--color-input);
@@ -992,8 +992,7 @@ a:hover svg {
 }
 
 .tab-activation,
-.tab-close,
-.tab-profile-cycle {
+.tab-close {
   appearance: none;
   color: inherit;
   background: transparent;
@@ -1085,37 +1084,6 @@ a:hover svg {
   display: flex;
   align-items: center;
   gap: 5px;
-}
-
-.tab-profile-cycle {
-  flex: none;
-  width: 18px;
-  height: 18px;
-  display: grid;
-  place-items: center;
-  border: 1px solid rgb(224 224 224 / 0.18);
-  clip-path: var(--chamfer-sm);
-  cursor: pointer;
-  opacity: 0.82;
-}
-
-.tab-profile-cycle.green {
-  color: var(--color-accent);
-}
-
-.tab-profile-cycle.yellow {
-  color: var(--color-warning);
-}
-
-.tab-profile-cycle.red {
-  color: var(--color-destructive);
-}
-
-.tab-profile-cycle:hover,
-.tab-profile-cycle:focus-visible {
-  opacity: 1;
-  outline: none;
-  border-color: currentColor;
 }
 
 .pane-body {
@@ -1332,28 +1300,6 @@ a:hover svg {
   grid-template-columns: minmax(0, 1fr) auto auto auto auto;
 }
 
-.terminal-profile-shell {
-  height: 100%;
-  min-height: 0;
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-}
-
-.terminal-profile-toolbar {
-  min-height: 42px;
-  display: flex;
-  justify-content: flex-end;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 8px;
-  border-bottom: 1px solid rgb(42 42 58 / 0.92);
-  background: rgb(18 18 26 / 0.82);
-}
-
-.terminal-profile-toolbar .profile-select-row {
-  width: min(320px, 100%);
-}
-
 .rules-skills-panel {
   height: 100%;
   min-height: 0;
@@ -1406,21 +1352,21 @@ a:hover svg {
   white-space: nowrap;
 }
 
-.profile-color {
+.template-color {
   width: 10px;
   height: 10px;
   border-radius: 999px;
 }
 
-.profile-color.green {
+.template-color.green {
   background: var(--color-accent);
 }
 
-.profile-color.yellow {
+.template-color.yellow {
   background: var(--color-warning);
 }
 
-.profile-color.red {
+.template-color.red {
   background: var(--color-destructive);
 }
 
@@ -1447,10 +1393,53 @@ a:hover svg {
   font: inherit;
 }
 
-.rules-skills-plugin-grid {
+.rules-skills-picker {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 6px;
+  gap: 8px;
+}
+
+.rules-skills-picker h3 {
+  margin: 6px 0 0;
+  color: var(--color-accent-tertiary);
+  font-family: var(--font-label);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.rules-skills-inline-create {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.rules-skills-panel .rule-option,
+.rules-skills-panel .skill-option {
+  min-height: 36px;
+  align-items: start;
+  padding: 7px;
+  color: var(--color-accent-tertiary);
+  background: rgb(255 255 255 / 0.025);
+  border: 1px solid var(--color-border);
+  clip-path: var(--chamfer-sm);
+  font-family: inherit;
+  font-size: 12px;
+  text-transform: none;
+}
+
+.rules-skills-panel .rule-option {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+}
+
+.rules-skills-panel .skill-option {
+  grid-template-columns: auto minmax(0, 1fr);
+}
+
+.rules-skills-panel .skill-option small {
+  grid-column: 2;
+  color: var(--color-muted-foreground);
+  font-size: 11px;
+  line-height: 1.35;
 }
 
 .rules-skills-actions {
@@ -1468,7 +1457,6 @@ a:hover svg {
 .rules-skills-panel input,
 .rules-skills-panel select,
 .rules-skills-panel textarea,
-.terminal-profile-toolbar select,
 .voice-console textarea {
   color: var(--color-accent);
   background: var(--color-input);
@@ -1483,8 +1471,7 @@ a:hover svg {
 .dialog input,
 .dialog select,
 .rules-skills-panel input,
-.rules-skills-panel select,
-.terminal-profile-toolbar select {
+.rules-skills-panel select {
   width: 100%;
   min-width: 0;
   height: 40px;
@@ -1510,7 +1497,6 @@ a:hover svg {
 .rules-skills-panel input:focus,
 .rules-skills-panel select:focus,
 .rules-skills-panel textarea:focus,
-.terminal-profile-toolbar select:focus,
 .voice-console textarea:focus {
   border-color: var(--color-accent);
 }

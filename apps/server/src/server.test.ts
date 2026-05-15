@@ -14,7 +14,7 @@ import { HookRegistry } from "./hooks/HookRegistry.js";
 import { PluginRegistry } from "./pluginRegistry.js";
 import { LocalWebPlugin } from "./plugins/LocalWebPlugin.js";
 import { PathPolicy } from "./pathPolicy.js";
-import { buildServer, type AppServices } from "./server.js";
+import { buildServer, buildServices, type AppServices } from "./server.js";
 import { SessionStore } from "./sessionStore.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
 
@@ -65,13 +65,14 @@ describe("buildServer", () => {
   });
 
   it("refreshes runtime indicators when window plugin metadata changes", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-window-profile-route-"));
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-window-template-route-"));
     const config = testConfig(root);
     const registry = new PluginRegistry();
     const pathPolicy = new PathPolicy([root]);
     const workspace = new WorkspaceLayoutStore(config.dataDir, pathPolicy);
     const sessions = new SessionStore(registry, pathPolicy, new TabContextService(config.dataDir), { getPluginConfig: () => ({}) }, workspace);
     const refreshRuntimeIndicators = vi.spyOn(sessions, "refreshRuntimeIndicators").mockResolvedValue();
+    const applyRuntimeContexts = vi.spyOn(sessions, "applyRuntimeContexts").mockResolvedValue([]);
     const app = await buildServer(config, {
       plugins: registry,
       sessions,
@@ -82,18 +83,36 @@ describe("buildServer", () => {
       hooks: new HookRegistry()
     } as AppServices);
     try {
-      const window = await workspace.createWindow({ name: "Profiled", defaultCwd: root });
+      const window = await workspace.createWindow({ name: "Templated", defaultCwd: root });
       const response = await app.inject({
         method: "PATCH",
         url: `/api/windows/${window.id}`,
-        payload: { pluginMetadata: { [RULES_SKILLS_PLUGIN_ID]: { selectedProfileId: "focused" } } }
+        payload: { pluginMetadata: { [RULES_SKILLS_PLUGIN_ID]: { selectedTemplateId: "focused" } } }
       });
 
       expect(response.statusCode).toBe(200);
       expect(refreshRuntimeIndicators).toHaveBeenCalledWith(window.id);
+      expect(applyRuntimeContexts).toHaveBeenCalledWith(expect.any(Function), "Applying window rules/skills template changes.");
     } finally {
       await app.close();
     }
+  });
+
+  it("applies live runtime context to Codex tabs when rules/skills catalog changes", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-rules-live-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    const restartTabs = vi.spyOn(services.sessions, "restartTabs").mockResolvedValue([]);
+    const applyRuntimeContexts = vi.spyOn(services.sessions, "applyRuntimeContexts").mockResolvedValue([]);
+
+    await services.rulesSkills!.saveTemplate({ id: "focused", name: "Focused", color: "yellow", ruleIds: [], skillIds: [] });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(restartTabs).not.toHaveBeenCalled();
+    expect(applyRuntimeContexts).toHaveBeenCalledWith(expect.any(Function), "Applying rules/skills template changes.");
+    const [predicate] = applyRuntimeContexts.mock.calls[0]!;
+    expect(predicate({ pluginId: "codex-terminal" } as never)).toBe(true);
+    expect(predicate({ pluginId: "standard-terminal" } as never)).toBe(false);
   });
 
   it("exposes app and plugin hooks through the hook API", async () => {

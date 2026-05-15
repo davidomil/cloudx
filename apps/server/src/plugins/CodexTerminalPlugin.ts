@@ -1,5 +1,3 @@
-import path from "node:path";
-
 import type {
   CreatePluginSessionInput,
   PluginActionDefinition,
@@ -9,9 +7,10 @@ import type {
   PluginVoiceContext,
   WorkspacePlugin
 } from "@cloudx/plugin-api";
-import { RULES_SKILLS_PLUGIN_ID, isRecord, type PersonalityProfile, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
+import { RULES_SKILLS_PLUGIN_ID, isRecord, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
 
-import { buildCodexProfileInjection } from "./CodexProfileInjection.js";
+import { materializeCodexHomeOverlay, type CodexHomeOverlay } from "../rulesSkills/CodexHomeOverlay.js";
+import { CLOUDX_SYSTEM_SKILLS, cloudxSkillFilePath, cloudxSystemSkillFilePath, type ResolvedPersonalityTemplate } from "../rulesSkills/RulesSkillsCatalogService.js";
 import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
 import { buildLoginShellCommandLaunch, buildToolEnv, resolveAssistantCommand } from "../terminal/ShellLaunch.js";
 
@@ -42,7 +41,8 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
 
   constructor(
     private readonly factory: TerminalProcessFactory,
-    private readonly replayBytes = DEFAULT_TERMINAL_REPLAY_BYTES
+    private readonly replayBytes = DEFAULT_TERMINAL_REPLAY_BYTES,
+    private readonly dataDir?: string
   ) {}
 
   descriptor() {
@@ -60,13 +60,16 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
   }
 
   async createSession(input: CreatePluginSessionInput): Promise<PluginSession> {
-    const profile = profileFromRuntimeContext(input.runtimeContext);
-    const launchProfile = materializeCodexProfile(profile, process.env);
-    const command = launchProfile.command;
-    const launch = buildLoginShellCommandLaunch(command, launchProfile.args, launchProfile.env);
+    const template = templateFromRuntimeContext(input.runtimeContext);
+    const launchTemplate = await materializeCodexTemplate(template, process.env, {
+      dataDir: this.dataDir,
+      tabId: input.tab.id
+    });
+    const command = launchTemplate.command;
+    const launch = buildLoginShellCommandLaunch(command, launchTemplate.args, launchTemplate.env);
     const terminalProcess = await this.factory.spawn(launch.command, launch.args, {
       cwd: input.cwd,
-      env: launchProfile.env,
+      env: launchTemplate.env,
       cols: 100,
       rows: 30
     });
@@ -76,74 +79,153 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       replayBytes: this.replayBytes,
       submitDelayMs: CODEX_SUBMIT_DELAY_MS,
       voiceKind: "codex-terminal",
-      voiceSummary: launchProfile.voiceSummary,
-      profileName: launchProfile.profileName
+      voiceSummary: launchTemplate.voiceSummary,
+      templateName: launchTemplate.templateName,
+      applyRuntimeContext: async (runtimeContext) => {
+        const nextTemplate = templateFromRuntimeContext(runtimeContext);
+        const nextLaunchTemplate = await materializeCodexTemplate(nextTemplate, process.env, {
+          dataDir: this.dataDir,
+          tabId: input.tab.id,
+          resetOverlay: false
+        });
+        return {
+          prompt: buildCodexRuntimeUpdatePrompt(nextTemplate, nextLaunchTemplate.overlay),
+          voiceSummary: nextLaunchTemplate.voiceSummary,
+          templateName: nextLaunchTemplate.templateName,
+          templateId: nextTemplate?.template.id
+        };
+      }
     });
   }
 }
 
-function profileFromRuntimeContext(runtimeContext: WorkspaceRuntimeContext | undefined): PersonalityProfile | undefined {
+function templateFromRuntimeContext(runtimeContext: WorkspaceRuntimeContext | undefined): ResolvedPersonalityTemplate | undefined {
   const rulesSkillsRuntime = runtimeContext?.pluginRuntime?.[RULES_SKILLS_PLUGIN_ID];
-  const personalityProfile = rulesSkillsRuntime?.personalityProfile;
-  if (!isRecord(personalityProfile)) {
+  const personalityTemplate = rulesSkillsRuntime?.personalityTemplate;
+  if (!isResolvedPersonalityTemplate(personalityTemplate)) {
     return undefined;
   }
-  const profile = personalityProfile.profile;
-  return isPersonalityProfile(profile) ? profile : undefined;
+  return personalityTemplate;
 }
 
-function isPersonalityProfile(value: unknown): value is PersonalityProfile {
+function isResolvedPersonalityTemplate(value: unknown): value is ResolvedPersonalityTemplate {
+  if (!isRecord(value) || !isPersonalityTemplate(value.template) || !Array.isArray(value.rules) || !Array.isArray(value.skills)) {
+    return false;
+  }
+  return value.rules.every(isRule) && value.skills.every(isSkill);
+}
+
+function isPersonalityTemplate(value: unknown): value is ResolvedPersonalityTemplate["template"] {
   return (
     isRecord(value) &&
     typeof value.id === "string" &&
     typeof value.name === "string" &&
     (value.color === "green" || value.color === "yellow" || value.color === "red") &&
-    (value.assistantCommand === undefined || typeof value.assistantCommand === "string") &&
-    (value.rulesText === undefined || typeof value.rulesText === "string") &&
-    Array.isArray(value.enabledSkillIds) &&
-    value.enabledSkillIds.every((skillId) => typeof skillId === "string") &&
-    Array.isArray(value.enabledPluginIds) &&
-    value.enabledPluginIds.every((pluginId) => typeof pluginId === "string") &&
-    (value.env === undefined || (isRecord(value.env) && Object.values(value.env).every((envValue) => typeof envValue === "string")))
+    Array.isArray(value.ruleIds) &&
+    value.ruleIds.every((ruleId) => typeof ruleId === "string") &&
+    Array.isArray(value.skillIds) &&
+    value.skillIds.every((skillId) => typeof skillId === "string")
   );
 }
 
-export interface MaterializedCodexProfile {
+function isRule(value: unknown): value is ResolvedPersonalityTemplate["rules"][number] {
+  return isRecord(value) && typeof value.id === "string" && typeof value.description === "string" && typeof value.text === "string";
+}
+
+function isSkill(value: unknown): value is ResolvedPersonalityTemplate["skills"][number] {
+  return isRecord(value) && typeof value.id === "string" && typeof value.name === "string" && typeof value.description === "string" && (value.instructions === undefined || typeof value.instructions === "string");
+}
+
+export interface MaterializedCodexTemplate {
   command: string;
   args: string[];
   env: NodeJS.ProcessEnv;
-  injectionPrompt?: string;
+  overlay?: CodexHomeOverlay;
   voiceSummary: string;
-  profileName?: string;
+  templateName?: string;
 }
 
-export function materializeCodexProfile(profile: PersonalityProfile | undefined, baseEnv: NodeJS.ProcessEnv): MaterializedCodexProfile {
-  const env = {
-    ...buildToolEnv(baseEnv),
-    ...(profile?.env ?? {})
-  };
-  const injection = buildCodexProfileInjection(profile, env);
-  if (profile) {
-    env.CLOUDX_PERSONALITY_PROFILE_ID = profile.id;
-    env.CLOUDX_PERSONALITY_PROFILE_NAME = profile.name;
-    env.CLOUDX_ENABLED_SKILL_IDS = profile.enabledSkillIds.join(",");
-    env.CLOUDX_ENABLED_PLUGIN_IDS = profile.enabledPluginIds.join(",");
-    if (injection.prompt) {
-      env.CLOUDX_PERSONALITY_INJECTION = "prompt-argument";
-      env.CLOUDX_PERSONALITY_SKILL_PATHS = injection.skillDocuments.map((skill) => skill.filePath).join(path.delimiter);
-    }
-    if (profile.rulesText?.trim()) {
-      env.CLOUDX_PERSONALITY_RULES = profile.rulesText.trim();
-    }
+export interface MaterializeCodexTemplateOptions {
+  dataDir?: string;
+  tabId?: string;
+  resetOverlay?: boolean;
+}
+
+export async function materializeCodexTemplate(
+  resolved: ResolvedPersonalityTemplate | undefined,
+  baseEnv: NodeJS.ProcessEnv,
+  options: MaterializeCodexTemplateOptions = {}
+): Promise<MaterializedCodexTemplate> {
+  const env = buildToolEnv(baseEnv);
+  const args: string[] = [];
+  const dataDir = options.dataDir;
+  const overlay = dataDir && options.tabId
+    ? await materializeCodexHomeOverlay({ dataDir, tabId: options.tabId, resolved, baseEnv: env, resetCodexHome: options.resetOverlay })
+    : undefined;
+  if (overlay) {
+    env.CODEX_HOME = overlay.codexHome;
+    env.CLOUDX_RULES_SKILLS_DIR = overlay.rulesSkillsRoot;
+    env.CLOUDX_PERSONALITY_INJECTION = "codex-home-overlay";
+    args.push("--add-dir", overlay.rulesSkillsRoot);
+  }
+  if (resolved) {
+    env.CLOUDX_PERSONALITY_TEMPLATE_ID = resolved.template.id;
+    env.CLOUDX_PERSONALITY_TEMPLATE_NAME = resolved.template.name;
+    env.CLOUDX_ENABLED_RULE_IDS = resolved.template.ruleIds.join(",");
+    env.CLOUDX_ENABLED_SKILL_IDS = resolved.template.skillIds.join(",");
   }
   return {
-    command: profile?.assistantCommand?.trim() || resolveAssistantCommand(env, "codex"),
-    args: injection.prompt ? [injection.prompt] : [],
+    command: resolveAssistantCommand(env, "codex"),
+    args,
     env,
-    injectionPrompt: injection.prompt,
-    voiceSummary: profile?.name ? `Interactive Codex CLI terminal using the ${profile.name} profile.` : "Interactive Codex CLI terminal. Send natural-language coding instructions here.",
-    profileName: profile?.name
+    overlay,
+    voiceSummary: resolved?.template.name ? `Interactive Codex CLI terminal using the ${resolved.template.name} template.` : "Interactive Codex CLI terminal. Send natural-language coding instructions here.",
+    templateName: resolved?.template.name
   };
+}
+
+export function buildCodexRuntimeUpdatePrompt(resolved: ResolvedPersonalityTemplate | undefined, overlay: CodexHomeOverlay | undefined): string {
+  const lines = [
+    "CloudX rules/skills update for this running Codex session.",
+    "",
+    "Apply the following CloudX template state to all future turns in this session. Do not restart, exit, modify files, or run commands because of this update alone."
+  ];
+
+  if (!resolved) {
+    lines.push("", "No CloudX personality template is currently active for this tab.");
+  } else {
+    lines.push("", `Active template: ${resolved.template.name} (${resolved.template.id})`, `Template source: ${resolved.source}`, "", "Active rules:");
+    if (resolved.rules.length === 0) {
+      lines.push("- No CloudX rules are enabled.");
+    } else {
+      lines.push(...resolved.rules.map((rule) => `- ${rule.text}`));
+    }
+
+    lines.push("", "Active user skills:");
+    if (resolved.skills.length === 0) {
+      lines.push("- No user CloudX skills are enabled by this template.");
+    } else {
+      lines.push(...resolved.skills.map((skill) => `- $${skill.id}: ${skill.name} - ${skill.description}${skillPathSuffix(overlay, skill.id, false)}`));
+    }
+  }
+
+  lines.push("", "CloudX system skills:");
+  lines.push(...CLOUDX_SYSTEM_SKILLS.map((skill) => `- $${skill.id}: ${skill.name} - ${skill.description}${skillPathSuffix(overlay, skill.id, true)}`));
+  lines.push(
+    "",
+    "Skill loading rule: if the user invokes one of the listed skills with $skill-name, or if a task clearly matches a listed skill, read that skill's SKILL.md before acting. Treat the listed CloudX skills as available even if the Codex TUI skill list has not refreshed.",
+    "Acknowledge this update briefly and wait for the user's next instruction."
+  );
+
+  return lines.join("\n");
+}
+
+function skillPathSuffix(overlay: CodexHomeOverlay | undefined, skillId: string, system: boolean): string {
+  if (!overlay) {
+    return "";
+  }
+  const skillPath = system ? cloudxSystemSkillFilePath(overlay.rulesSkillsRoot, skillId) : cloudxSkillFilePath(overlay.rulesSkillsRoot, skillId);
+  return ` (${skillPath})`;
 }
 
 function terminalActions(options: { enterTextDescription: string; enterTextHandlesUnhandledVoice?: boolean }): PluginActionDefinition[] {
@@ -207,7 +289,15 @@ interface TerminalSessionOptions {
   submitDelayMs?: number;
   voiceKind?: "codex-terminal" | "standard-terminal" | "terminal";
   voiceSummary?: string;
-  profileName?: string;
+  templateName?: string;
+  applyRuntimeContext?(runtimeContext?: WorkspaceRuntimeContext): Promise<CodexRuntimeContextUpdate> | CodexRuntimeContextUpdate;
+}
+
+interface CodexRuntimeContextUpdate {
+  prompt: string;
+  voiceSummary: string;
+  templateName?: string;
+  templateId?: string;
 }
 
 export interface TerminalCommandFinishEvent {
@@ -274,6 +364,10 @@ export class CodexTerminalSession implements PluginSession {
       }
     });
     this.terminalProcess.onExit((event) => {
+      if (this.stopped) {
+        this.setStatus("stopped", "Terminal was stopped.");
+        return;
+      }
       if (this.options.closeOnExit) {
         const message = event.exitCode === 0 ? "Codex exited cleanly." : `Codex exited with code ${event.exitCode}.`;
         const closeAfterMs = this.options.closeOnExitAfterMs ?? 0;
@@ -282,10 +376,6 @@ export class CodexTerminalSession implements PluginSession {
           return;
         }
         this.setStatus(event.exitCode === 0 ? "completed" : "failed", message);
-        return;
-      }
-      if (this.stopped) {
-        this.setStatus("stopped", "Terminal was stopped.");
         return;
       }
       if (event.exitCode === 0) {
@@ -312,6 +402,22 @@ export class CodexTerminalSession implements PluginSession {
     this.stopped = true;
     this.terminalProcess.kill();
     this.setStatus("stopped", "Terminal was stopped.");
+  }
+
+  async applyRuntimeContext(runtimeContext?: WorkspaceRuntimeContext): Promise<Record<string, unknown>> {
+    if (!this.options.applyRuntimeContext) {
+      return { applied: false };
+    }
+    const update = await this.options.applyRuntimeContext(runtimeContext);
+    this.options.voiceSummary = update.voiceSummary;
+    this.options.templateName = update.templateName;
+    this.writeBracketedPasteSubmit(update.prompt);
+    return {
+      applied: true,
+      templateId: update.templateId,
+      templateName: update.templateName,
+      promptChars: update.prompt.length
+    };
   }
 
   onStatusChange(listener: (status: WorkspaceTab["status"], message?: string) => void): () => void {
@@ -342,7 +448,7 @@ export class CodexTerminalSession implements PluginSession {
       metadata: {
         outputBytes: Buffer.byteLength(this.recentOutput, "utf8"),
         replayBytes: this.replayBytes,
-        profileName: this.options.profileName
+        templateName: this.options.templateName
       }
     };
   }
@@ -392,6 +498,10 @@ export class CodexTerminalSession implements PluginSession {
     this.write("\r");
   }
 
+  private writeBracketedPasteSubmit(text: string): void {
+    this.write(`\u001b[200~${normalizeTerminalPasteText(text)}\u001b[201~\r`);
+  }
+
   private recordCommandFinish(exitCode: number | undefined): void {
     if (typeof exitCode === "number" && exitCode !== 0) {
       this.controls.setTabIndicator({
@@ -418,6 +528,10 @@ function trimRecentOutput(output: string, maxBytes: number): string {
 
 function stripTrailingLineTerminators(text: string): string {
   return text.replace(/[\r\n]+$/u, "");
+}
+
+function normalizeTerminalPasteText(text: string): string {
+  return text.replace(/\r\n?/gu, "\n");
 }
 
 function firstTerminator(belEnd: number, stEnd: number): { index: number; length: number } | undefined {
