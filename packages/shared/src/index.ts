@@ -209,6 +209,8 @@ export interface FileSearchResult {
 
 export type WorktreeProjectStatus = "empty" | "blocked" | "ready";
 
+export type WorktreeProjectDetectionSource = "project_dir" | "bare_dir" | "worktree_dir";
+
 export type WorktreeRefKind = "local" | "remote" | "tag";
 
 export type WorktreeCreateMode = "new_branch" | "existing_branch" | "remote_branch";
@@ -217,6 +219,7 @@ export interface WorktreeProjectSetupState {
   canInitialize: boolean;
   canClone: boolean;
   blockedReason?: string;
+  candidateBarePaths?: string[];
 }
 
 export interface WorktreeRef {
@@ -245,7 +248,10 @@ export interface WorktreeSummary {
 
 export interface WorktreeProjectState {
   cwd: string;
+  projectDir: string;
   barePath: string;
+  bareName: string;
+  detectedFrom: WorktreeProjectDetectionSource;
   status: WorktreeProjectStatus;
   folderEmpty: boolean;
   originUrl?: string;

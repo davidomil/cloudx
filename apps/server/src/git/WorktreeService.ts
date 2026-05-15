@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
-import type { WorktreeCreateMode, WorktreeDirtyStatus, WorktreeProjectState, WorktreeRef, WorktreeSummary } from "@cloudx/shared";
+import type { WorktreeCreateMode, WorktreeDirtyStatus, WorktreeProjectDetectionSource, WorktreeProjectState, WorktreeRef, WorktreeSummary } from "@cloudx/shared";
 
 const execFileAsync = promisify(execFile);
 
@@ -36,56 +36,70 @@ interface ParsedWorktree {
   bare: boolean;
 }
 
+interface WorktreeProjectContext {
+  cwd: string;
+  projectDir: string;
+  barePath: string;
+  bareName: string;
+  detectedFrom: WorktreeProjectDetectionSource;
+}
+
+interface BlockedProjectContext {
+  cwd: string;
+  projectDir: string;
+  barePath: string;
+  bareName: string;
+  detectedFrom: WorktreeProjectDetectionSource;
+  folderEmpty: boolean;
+  blockedReason: string;
+  message: string;
+  candidateBarePaths?: string[];
+}
+
+interface EmptyProjectContext {
+  cwd: string;
+  projectDir: string;
+  barePath: string;
+  bareName: string;
+  detectedFrom: WorktreeProjectDetectionSource;
+  folderEmpty: true;
+}
+
+type ResolvedProjectContext =
+  | { kind: "ready"; context: WorktreeProjectContext; folderEmpty: boolean }
+  | { kind: "blocked"; context: BlockedProjectContext }
+  | { kind: "empty"; context: EmptyProjectContext };
+
 export class WorktreeService {
   async getState(projectDir: string): Promise<WorktreeProjectState> {
-    const barePath = this.barePath(projectDir);
-    const folderEmpty = await isDirectoryEmpty(projectDir);
-    const hasBarePath = await pathExists(barePath);
-    const base = {
-      cwd: projectDir,
-      barePath,
-      folderEmpty,
-      refs: [],
-      worktrees: []
-    };
-
-    if (!hasBarePath) {
-      if (folderEmpty) {
-        return {
-          ...base,
-          status: "empty",
-          setup: { canInitialize: true, canClone: true },
-          message: "Initialize a new bare repository or clone one from a Git URL."
-        };
-      }
+    const resolved = await this.resolveProjectContext(projectDir);
+    if (resolved.kind === "empty") {
       return {
-        ...base,
+        ...emptyStateBase(resolved.context),
+        status: "empty",
+        setup: { canInitialize: true, canClone: true },
+        message: "Initialize a new bare repository or clone one from a Git URL."
+      };
+    }
+    if (resolved.kind === "blocked") {
+      return {
+        ...emptyStateBase(resolved.context),
         status: "blocked",
         setup: {
           canInitialize: false,
           canClone: false,
-          blockedReason: "The selected directory is not empty and does not contain a .bare repository."
+          blockedReason: resolved.context.blockedReason,
+          candidateBarePaths: resolved.context.candidateBarePaths
         },
-        message: "Choose an empty project directory or an existing worktree-manager project."
+        message: resolved.context.message
       };
     }
 
-    if (!(await this.isBareRepository(barePath))) {
-      return {
-        ...base,
-        status: "blocked",
-        setup: {
-          canInitialize: false,
-          canClone: false,
-          blockedReason: ".bare exists but is not a valid bare Git repository."
-        },
-        message: "The .bare folder is not a valid bare Git repository."
-      };
-    }
-
-    const [originUrl, refs, worktrees] = await Promise.all([this.getOriginUrl(barePath), this.listRefs(barePath), this.listWorktrees(projectDir, barePath)]);
+    const { context } = resolved;
+    const [originUrl, refs, worktrees] = await Promise.all([this.getOriginUrl(context.barePath), this.listRefs(context.barePath), this.listWorktrees(context.projectDir, context.barePath)]);
     return {
-      ...base,
+      ...emptyStateBase(context),
+      folderEmpty: resolved.folderEmpty,
       status: "ready",
       originUrl,
       refs,
@@ -112,26 +126,26 @@ export class WorktreeService {
   }
 
   async fetchRefs(projectDir: string): Promise<WorktreeProjectState> {
-    const barePath = await this.requireReadyBare(projectDir);
-    await this.runBareGit(barePath, ["fetch", "--prune", "--tags", "origin"]);
+    const context = await this.requireReadyProject(projectDir);
+    await this.runBareGit(context.barePath, ["fetch", "--prune", "--tags", "origin"]);
     return this.getState(projectDir);
   }
 
   async createWorktree(projectDir: string, input: CreateWorktreeInput): Promise<WorktreeProjectState> {
-    const barePath = await this.requireReadyBare(projectDir);
-    const folderName = requireValidFolderName(input.folderName);
+    const context = await this.requireReadyProject(projectDir);
+    const folderName = requireValidFolderName(input.folderName, context.bareName);
     const branchName = requireBranchName(input.branchName);
-    const worktreePath = path.join(projectDir, folderName);
-    await this.requireNewWorktreePath(projectDir, worktreePath, folderName);
+    const worktreePath = path.join(context.projectDir, folderName);
+    await this.requireNewWorktreePath(context.projectDir, worktreePath, folderName);
 
     if (input.mode === "new_branch") {
       const baseRef = requireNonEmptyString(input.baseRef, "baseRef");
-      await this.runBareGit(barePath, ["worktree", "add", "-b", branchName, worktreePath, baseRef]);
+      await this.runBareGit(context.barePath, ["worktree", "add", "-b", branchName, worktreePath, baseRef]);
     } else if (input.mode === "existing_branch") {
-      await this.runBareGit(barePath, ["worktree", "add", worktreePath, branchName]);
+      await this.runBareGit(context.barePath, ["worktree", "add", worktreePath, branchName]);
     } else if (input.mode === "remote_branch") {
       const baseRef = requireNonEmptyString(input.baseRef, "baseRef");
-      await this.runBareGit(barePath, ["worktree", "add", "--track", "-b", branchName, worktreePath, baseRef]);
+      await this.runBareGit(context.barePath, ["worktree", "add", "--track", "-b", branchName, worktreePath, baseRef]);
     } else {
       throw new Error(`Unsupported worktree creation mode: ${input.mode}`);
     }
@@ -140,13 +154,13 @@ export class WorktreeService {
   }
 
   async deleteWorktree(projectDir: string, input: DeleteWorktreeInput): Promise<WorktreeProjectState> {
-    const barePath = await this.requireReadyBare(projectDir);
-    const folderName = requireValidFolderName(input.folderName);
+    const context = await this.requireReadyProject(projectDir);
+    const folderName = requireValidFolderName(input.folderName, context.bareName);
     if (input.confirmation !== folderName) {
       throw new Error("Delete confirmation must match the worktree folder name.");
     }
 
-    const worktree = (await this.listWorktrees(projectDir, barePath)).find((candidate) => candidate.folderName === folderName);
+    const worktree = (await this.listWorktrees(context.projectDir, context.barePath)).find((candidate) => candidate.folderName === folderName);
     if (!worktree) {
       throw new Error(`Unknown worktree folder: ${folderName}`);
     }
@@ -154,7 +168,7 @@ export class WorktreeService {
       throw new Error("Worktree has uncommitted or untracked changes. Force confirmation is required before deleting it.");
     }
 
-    await this.runBareGit(barePath, ["worktree", "remove", ...(input.force ? ["--force"] : []), worktree.path]);
+    await this.runBareGit(context.barePath, ["worktree", "remove", ...(input.force ? ["--force"] : []), worktree.path]);
     return this.getState(projectDir);
   }
 
@@ -171,12 +185,121 @@ export class WorktreeService {
     }
   }
 
-  private async requireReadyBare(projectDir: string): Promise<string> {
-    const barePath = this.barePath(projectDir);
-    if (!(await this.isBareRepository(barePath))) {
-      throw new Error("Worktree manager requires a valid .bare Git repository.");
+  private async requireReadyProject(projectDir: string): Promise<WorktreeProjectContext> {
+    const resolved = await this.resolveProjectContext(projectDir);
+    if (resolved.kind !== "ready") {
+      throw new Error(resolved.kind === "blocked" ? resolved.context.blockedReason : "Worktree manager requires a valid bare Git repository.");
     }
-    return barePath;
+    return resolved.context;
+  }
+
+  private async resolveProjectContext(inputDir: string): Promise<ResolvedProjectContext> {
+    const cwd = path.resolve(inputDir);
+    const canonicalBarePath = this.barePath(cwd);
+    const selectedFolderEmpty = await isDirectoryEmpty(cwd);
+    const defaultContext = {
+      cwd,
+      projectDir: cwd,
+      barePath: canonicalBarePath,
+      bareName: BARE_DIRECTORY_NAME,
+      detectedFrom: "project_dir" as const
+    };
+
+    if (await this.isBareRepository(cwd)) {
+      const context = projectContext(cwd, path.dirname(cwd), cwd, "bare_dir");
+      return { kind: "ready", context, folderEmpty: await isDirectoryEmpty(context.projectDir) };
+    }
+
+    const canonicalBareExists = await pathExists(canonicalBarePath);
+    if (canonicalBareExists) {
+      if (await this.isBareRepository(canonicalBarePath)) {
+        return { kind: "ready", context: projectContext(cwd, cwd, canonicalBarePath, "project_dir"), folderEmpty: false };
+      }
+      return {
+        kind: "blocked",
+        context: {
+          ...defaultContext,
+          folderEmpty: selectedFolderEmpty,
+          blockedReason: ".bare exists but is not a valid bare Git repository.",
+          message: "The .bare folder is not a valid bare Git repository."
+        }
+      };
+    }
+
+    const bareChildren = await this.findBareChildren(cwd);
+    if (bareChildren.length === 1) {
+      return { kind: "ready", context: projectContext(cwd, cwd, bareChildren[0]!, "project_dir"), folderEmpty: false };
+    }
+    if (bareChildren.length > 1) {
+      const candidateBarePaths = bareChildren.sort((left, right) => left.localeCompare(right));
+      return {
+        kind: "blocked",
+        context: {
+          ...defaultContext,
+          folderEmpty: selectedFolderEmpty,
+          blockedReason: "Multiple bare Git repositories were found under the selected directory.",
+          message: "Select the bare repository folder or remove the ambiguity before using this worktree project.",
+          candidateBarePaths
+        }
+      };
+    }
+
+    const worktreeContext = await this.contextFromLinkedWorktree(cwd);
+    if (worktreeContext) {
+      return { kind: "ready", context: worktreeContext, folderEmpty: false };
+    }
+
+    if (selectedFolderEmpty) {
+      return { kind: "empty", context: { ...defaultContext, folderEmpty: true } };
+    }
+
+    return {
+      kind: "blocked",
+      context: {
+        ...defaultContext,
+        folderEmpty: selectedFolderEmpty,
+        blockedReason: "The selected directory is not empty and does not contain a bare repository or sibling worktree layout.",
+        message: "Choose an empty project directory, a directory containing one bare Git repository, the bare repository itself, or one of its sibling worktrees."
+      }
+    };
+  }
+
+  private async findBareChildren(projectDir: string): Promise<string[]> {
+    const entries = await fs.readdir(projectDir, { withFileTypes: true });
+    const bareChildren: string[] = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      const candidate = path.join(projectDir, entry.name);
+      if (await this.isBareRepository(candidate)) {
+        bareChildren.push(candidate);
+      }
+    }
+    return bareChildren;
+  }
+
+  private async contextFromLinkedWorktree(cwd: string): Promise<WorktreeProjectContext | undefined> {
+    const insideWorktree = await this.runGit(cwd, ["rev-parse", "--is-inside-work-tree"], { allowExitCodes: [0, 128] });
+    if (insideWorktree.code !== 0 || insideWorktree.stdout.trim() !== "true") {
+      return undefined;
+    }
+
+    const [topLevelResult, commonDirResult] = await Promise.all([
+      this.runGit(cwd, ["rev-parse", "--show-toplevel"]),
+      this.runGit(cwd, ["rev-parse", "--git-common-dir"])
+    ]);
+    const topLevel = path.resolve(cwd, topLevelResult.stdout.trim());
+    const barePath = path.resolve(cwd, commonDirResult.stdout.trim());
+    if (!(await this.isBareRepository(barePath))) {
+      return undefined;
+    }
+
+    const projectDir = path.dirname(barePath);
+    if (!isDirectChild(projectDir, topLevel)) {
+      return undefined;
+    }
+    return projectContext(cwd, projectDir, barePath, "worktree_dir");
   }
 
   private async isBareRepository(barePath: string): Promise<boolean> {
@@ -297,6 +420,29 @@ async function isDirectoryEmpty(directory: string): Promise<boolean> {
   return (await fs.readdir(directory)).length === 0;
 }
 
+function projectContext(cwd: string, projectDir: string, barePath: string, detectedFrom: WorktreeProjectDetectionSource): WorktreeProjectContext {
+  return {
+    cwd,
+    projectDir,
+    barePath,
+    bareName: path.basename(barePath),
+    detectedFrom
+  };
+}
+
+function emptyStateBase(context: WorktreeProjectContext | EmptyProjectContext | BlockedProjectContext): Omit<WorktreeProjectState, "status" | "setup"> {
+  return {
+    cwd: context.cwd,
+    projectDir: context.projectDir,
+    barePath: context.barePath,
+    bareName: context.bareName,
+    detectedFrom: context.detectedFrom,
+    folderEmpty: "folderEmpty" in context ? context.folderEmpty : false,
+    refs: [],
+    worktrees: []
+  };
+}
+
 function refKind(fullName: string): WorktreeRef["kind"] {
   if (fullName.startsWith("refs/heads/")) return "local";
   if (fullName.startsWith("refs/remotes/")) return "remote";
@@ -342,9 +488,9 @@ function isDirectChild(parent: string, child: string): boolean {
   return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative) && !relative.includes(path.sep);
 }
 
-function requireValidFolderName(value: string): string {
+function requireValidFolderName(value: string, reservedBareFolderName = BARE_DIRECTORY_NAME): string {
   const trimmed = requireNonEmptyString(value, "folderName");
-  if (trimmed === "." || trimmed === ".." || trimmed === BARE_DIRECTORY_NAME || trimmed.includes("/") || trimmed.includes("\\")) {
+  if (trimmed === "." || trimmed === ".." || trimmed === BARE_DIRECTORY_NAME || trimmed === reservedBareFolderName || trimmed.includes("/") || trimmed.includes("\\")) {
     throw new Error("folderName must be a direct child folder name.");
   }
   return trimmed;

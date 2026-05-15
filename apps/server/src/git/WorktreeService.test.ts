@@ -85,6 +85,97 @@ describe("WorktreeService", () => {
       })
     ).rejects.toThrow("folderName");
   });
+
+  it("detects a single non-.bare repository child and the bare directory itself", async () => {
+    const service = new WorktreeService();
+    const remote = await createRemoteRepo();
+    const project = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-wt-named-bare-"));
+    const barePath = path.join(project, "repo.git");
+    await git(project, "clone", "--bare", remote, barePath);
+
+    await expect(service.getState(project)).resolves.toMatchObject({
+      status: "ready",
+      cwd: project,
+      projectDir: project,
+      barePath,
+      bareName: "repo.git",
+      detectedFrom: "project_dir"
+    });
+    await expect(service.getState(barePath)).resolves.toMatchObject({
+      status: "ready",
+      cwd: barePath,
+      projectDir: project,
+      barePath,
+      bareName: "repo.git",
+      detectedFrom: "bare_dir"
+    });
+    await expect(
+      service.createWorktree(project, {
+        mode: "new_branch",
+        folderName: "repo.git",
+        branchName: "repo-git-worktree",
+        baseRef: "master"
+      })
+    ).rejects.toThrow("folderName");
+  });
+
+  it("detects a selected linked worktree and creates new worktrees beside it", async () => {
+    const service = new WorktreeService();
+    const remote = await createRemoteRepo();
+    const project = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-wt-linked-"));
+    const cloned = await service.cloneBareRepository(project, remote);
+    const baseRef = cloned.refs.find((ref) => ref.kind === "remote" && ref.name.match(/^origin\/(main|master)$/))?.name;
+    expect(baseRef).toBeTruthy();
+
+    await service.createWorktree(project, {
+      mode: "new_branch",
+      folderName: "primary",
+      branchName: "primary",
+      baseRef
+    });
+    const selectedWorktree = path.join(project, "primary");
+
+    await expect(service.getState(selectedWorktree)).resolves.toMatchObject({
+      status: "ready",
+      cwd: selectedWorktree,
+      projectDir: project,
+      barePath: path.join(project, ".bare"),
+      bareName: ".bare",
+      detectedFrom: "worktree_dir",
+      worktrees: [expect.objectContaining({ folderName: "primary" })]
+    });
+
+    await expect(
+      service.createWorktree(selectedWorktree, {
+        mode: "new_branch",
+        folderName: "secondary",
+        branchName: "secondary",
+        baseRef
+      })
+    ).resolves.toMatchObject({
+      cwd: selectedWorktree,
+      projectDir: project,
+      worktrees: [expect.objectContaining({ folderName: "primary" }), expect.objectContaining({ folderName: "secondary" })]
+    });
+    await expect(fs.stat(path.join(project, "secondary", "README.md"))).resolves.toBeTruthy();
+  });
+
+  it("blocks ambiguous directories with multiple bare repository children", async () => {
+    const service = new WorktreeService();
+    const project = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-wt-ambiguous-"));
+    await git(project, "init", "--bare", "one.git");
+    await git(project, "init", "--bare", "two.git");
+
+    await expect(service.getState(project)).resolves.toMatchObject({
+      status: "blocked",
+      setup: {
+        canInitialize: false,
+        canClone: false,
+        blockedReason: "Multiple bare Git repositories were found under the selected directory.",
+        candidateBarePaths: [path.join(project, "one.git"), path.join(project, "two.git")]
+      }
+    });
+  });
 });
 
 async function createRemoteRepo(): Promise<string> {

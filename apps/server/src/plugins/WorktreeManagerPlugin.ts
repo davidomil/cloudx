@@ -136,6 +136,8 @@ class WorktreeManagerSession implements PluginSession {
     const visibleText = this.state
       ? [
           `Worktree project: ${this.state.status}`,
+          this.state.projectDir !== this.state.cwd ? `Resolved project: ${this.state.projectDir}` : undefined,
+          this.state.status === "ready" ? `Bare repository: ${this.state.barePath}` : undefined,
           this.state.originUrl ? `Origin: ${this.state.originUrl}` : undefined,
           this.state.worktrees.length ? `Worktrees:\n${this.state.worktrees.map((worktree) => `${worktree.folderName}\t${worktree.branch ?? worktree.head ?? "detached"}\t${worktree.dirty.dirty ? "dirty" : "clean"}`).join("\n")}` : undefined,
           this.state.refs.length ? `Refs:\n${this.state.refs.map((ref) => `${ref.kind}\t${ref.name}`).join("\n")}` : undefined
@@ -152,6 +154,8 @@ class WorktreeManagerSession implements PluginSession {
       visibleText,
       metadata: {
         projectStatus: this.state?.status,
+        projectDir: this.state?.projectDir,
+        detectedFrom: this.state?.detectedFrom,
         worktreeCount: this.state?.worktrees.length ?? 0,
         refCount: this.state?.refs.length ?? 0
       }

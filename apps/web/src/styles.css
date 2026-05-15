@@ -1937,7 +1937,7 @@ a:hover svg {
 .worktree-setup {
   min-height: 0;
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto minmax(0, 1fr);
   gap: 10px;
   padding: 10px;
   overflow: auto;
@@ -2000,6 +2000,11 @@ a:hover svg {
 
 .worktree-summary-band button {
   margin-left: auto;
+}
+
+.worktree-detection-note {
+  color: var(--color-muted-foreground);
+  font-size: 12px;
 }
 
 .worktree-create-form {

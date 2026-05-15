@@ -8,6 +8,11 @@ import { ControlButton } from "./Control.js";
 
 type BusyAction = "state" | "initialize" | "clone" | "fetch" | "create" | "delete";
 
+export interface WorktreeCreateSuggestion {
+  branchName: string;
+  folderName: string;
+}
+
 export function WorktreeManagerPanel({ tab }: { tab: WorkspaceTab }) {
   const [state, setState] = useState<WorktreeProjectState | undefined>();
   const [cloneUrl, setCloneUrl] = useState("");
@@ -32,7 +37,11 @@ export function WorktreeManagerPanel({ tab }: { tab: WorkspaceTab }) {
 
   useEffect(() => {
     if (!baseRef && baseRefs[0]) {
-      setBaseRef(baseRefs[0].name);
+      const nextRef = baseRefs[0].name;
+      setBaseRef(nextRef);
+      const suggestion = worktreeSuggestionFromRef(nextRef, mode);
+      setBranchName((current) => current.trim() || !suggestion ? current : suggestion.branchName);
+      setFolderName((current) => current.trim() || !suggestion ? current : suggestion.folderName);
     }
   }, [baseRef, baseRefs]);
 
@@ -156,10 +165,12 @@ function SetupView({ cloneUrl, busy, onCloneUrlChange, onInitialize, onClone }: 
 }
 
 function BlockedView({ state }: { state: WorktreeProjectState }) {
+  const candidates = state.setup.candidateBarePaths ?? [];
   return (
     <div className="worktree-empty-state warning">
       <AlertTriangle size={30} />
       <span>{state.setup.blockedReason ?? state.message ?? "This directory cannot be used as a worktree project."}</span>
+      {candidates.length ? <small>Found: {candidates.join(", ")}</small> : state.message ? <small>{state.message}</small> : null}
     </div>
   );
 }
@@ -214,10 +225,39 @@ function ManagerView({
   onDelete: () => void;
 }) {
   const createDisabled = busy || !folderName.trim() || !branchName.trim() || (mode !== "existing_branch" && !baseRef.trim());
+  const detectionNote = detectionSummary(state);
+
+  function applyRefSuggestion(refName: string, nextMode: WorktreeCreateMode) {
+    const previousRef = nextMode === "existing_branch" ? branchName : baseRef;
+    const previousSuggestion = worktreeSuggestionFromRef(previousRef, nextMode);
+    const nextSuggestion = worktreeSuggestionFromRef(refName, nextMode);
+    if (!nextSuggestion) {
+      return;
+    }
+    if (!branchName.trim() || branchName === previousSuggestion?.branchName) {
+      onBranchNameChange(nextSuggestion.branchName);
+    }
+    if (!folderName.trim() || folderName === previousSuggestion?.folderName) {
+      onFolderNameChange(nextSuggestion.folderName);
+    }
+  }
+
+  function changeMode(nextMode: WorktreeCreateMode) {
+    onModeChange(nextMode);
+    const nextRef = nextMode === "existing_branch" ? localRefs[0]?.name : baseRef || remoteRefs[0]?.name || localRefs[0]?.name;
+    if (!nextRef) {
+      return;
+    }
+    if (nextMode !== "existing_branch") {
+      onBaseRefChange(nextRef);
+    }
+    applyRefSuggestion(nextRef, nextMode);
+  }
+
   return (
     <div className="worktree-manager-body">
       <div className="worktree-summary-band">
-        <span title={state.barePath}>.bare</span>
+        <span title={state.barePath}>{state.bareName}</span>
         {state.originUrl ? <small title={state.originUrl}>origin</small> : null}
         <small>{state.worktrees.length} worktrees</small>
         <small>{state.refs.length} refs</small>
@@ -226,6 +266,7 @@ function ManagerView({
           Fetch
         </ControlButton>
       </div>
+      {detectionNote ? <div className="worktree-detection-note">{detectionNote}</div> : null}
 
       <form
         className="worktree-create-form"
@@ -236,7 +277,7 @@ function ManagerView({
       >
         <label>
           Mode
-          <select value={mode} onChange={(event) => onModeChange(event.target.value as WorktreeCreateMode)}>
+          <select value={mode} onChange={(event) => changeMode(event.target.value as WorktreeCreateMode)}>
             <option value="remote_branch">Track remote branch</option>
             <option value="new_branch">New branch from base</option>
             <option value="existing_branch">Existing local branch</option>
@@ -253,7 +294,14 @@ function ManagerView({
         {mode !== "existing_branch" ? (
           <label>
             Base
-            <select value={baseRef} onChange={(event) => onBaseRefChange(event.target.value)}>
+            <select
+              value={baseRef}
+              onChange={(event) => {
+                const nextRef = event.target.value;
+                onBaseRefChange(nextRef);
+                applyRefSuggestion(nextRef, mode);
+              }}
+            >
               {remoteRefs.map((ref) => (
                 <option key={ref.fullName} value={ref.name}>
                   {ref.name}
@@ -272,8 +320,9 @@ function ManagerView({
             <select
               value={branchName}
               onChange={(event) => {
-                onBranchNameChange(event.target.value);
-                if (!folderName.trim()) onFolderNameChange(event.target.value);
+                const nextBranch = event.target.value;
+                onBranchNameChange(nextBranch);
+                applyRefSuggestion(nextBranch, "existing_branch");
               }}
             >
               <option value="">Select branch</option>
@@ -380,6 +429,34 @@ function DeletePanel({ target, confirmation, force, busy, onCancel, onConfirmati
 
 function refsByKind(refs: WorktreeRef[] | undefined, kind: WorktreeRef["kind"]): WorktreeRef[] {
   return (refs ?? []).filter((ref) => ref.kind === kind);
+}
+
+export function worktreeSuggestionFromRef(refName: string | undefined, mode: WorktreeCreateMode): WorktreeCreateSuggestion | undefined {
+  const trimmed = refName?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const branchBase = mode === "remote_branch" ? stripRemotePrefix(trimmed) : trimmed;
+  const branchName = mode === "new_branch" ? `${stripRemotePrefix(branchBase)}-worktree` : branchBase;
+  return {
+    branchName,
+    folderName: branchName.replaceAll("/", "-")
+  };
+}
+
+export function detectionSummary(state: WorktreeProjectState): string | undefined {
+  if (state.detectedFrom === "bare_dir") {
+    return `Detected bare repository; managing sibling worktrees in ${state.projectDir}.`;
+  }
+  if (state.detectedFrom === "worktree_dir") {
+    return `Detected from linked worktree; managing project ${state.projectDir}.`;
+  }
+  return undefined;
+}
+
+function stripRemotePrefix(refName: string): string {
+  const parts = refName.split("/");
+  return parts.length > 1 ? parts.slice(1).join("/") : refName;
 }
 
 function errorMessage(error: unknown): string {
