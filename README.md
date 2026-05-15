@@ -68,6 +68,35 @@ names, and dashboard tokens.
 
 ## Quick Start
 
+On Ubuntu 22.04 or newer, the guided installer is the easiest path:
+
+```bash
+./install.sh
+```
+
+It shows each phase before running it. The bootstrap stage installs Ubuntu
+packages and Node.js 22/npm when needed. The wizard then installs Cloudx npm
+dependencies, installs and checks Codex CLI, prepares the Faster Whisper ASR
+environment, downloads the local ASR model, writes Cloudx config, and optionally
+installs user-level systemd services. Each question includes a short explanation
+of what the choice changes, and the installer prints the local and LAN Cloudx
+URLs when it finishes.
+
+Preview the installer without changing the system:
+
+```bash
+./install.sh --dry-run --yes
+```
+
+Remove Cloudx-managed services and local install artifacts:
+
+```bash
+./install.sh --uninstall
+```
+
+Manual development startup is still available when prerequisites are already
+installed:
+
 ```bash
 npm install
 npm run build
@@ -87,7 +116,8 @@ services/asr/.venv/bin/uvicorn cloudx_asr.main:app \
 ```
 
 The ASR service defaults to the small CPU model. See `docs/SETUP.md` for the
-large-v3 Faster Whisper setup and systemd service install.
+installer details, large-v3 Faster Whisper setup, GPU/CPU choices, and systemd
+service install.
 
 ## Configuration
 

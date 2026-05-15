@@ -23,16 +23,40 @@ For Ubuntu 22.04 or newer, use the installer wizard:
 ./install.sh
 ```
 
-The bootstrap script installs Ubuntu packages, Node.js/npm when needed, and then
-launches the Cloudx wizard. The wizard installs npm dependencies, installs and
-checks Codex CLI, creates the ASR Python environment, downloads the
-`Systran/faster-whisper-large-v3` model, writes `~/.config/cloudx/cloudx.env`,
-and can install/start the user-level systemd services.
+The installer is split into two visible phases:
+
+1. `install.sh` is the Ubuntu bootstrap. It verifies Ubuntu, installs apt
+   packages required by Cloudx, checks for Node.js 22 and npm, and installs the
+   NodeSource Node.js 22 package when either Node.js or npm is missing. That
+   package provides both `node` and `npm`.
+2. `scripts/install-cloudx.mjs` is the Cloudx wizard. It prints each phase as it
+   runs: Codex CLI verification/login, install choices, `npm ci`, ASR virtualenv
+   setup, Hugging Face model download, `npm run build`, certificate creation,
+   `~/.config/cloudx/cloudx.env` rendering, and optional user-level systemd
+   service installation. When services are started, the wizard waits for the
+   HTTPS app health endpoint and ASR health endpoint with bounded retries; if
+   either endpoint does not become healthy, it prints recent systemd status and
+   journal output. When the install finishes, it prints `https://127.0.0.1:<port>`
+   plus detected LAN IPv4 URLs.
+
+The wizard asks for:
+
+- Allowed workspace roots, written to `CLOUDX_ALLOWED_ROOTS`.
+- HTTPS port and optional extra certificate hostnames.
+- ASR CPU thread count.
+- Whether to use a detected NVIDIA GPU. GPU mode is configure-only and requires
+  CUDA/cuDNN runtime libraries to already be installed.
+- Whether to write/start `cloudx.service` and `cloudx-asr.service`.
+- Whether to enable systemd linger so user services can survive logout.
+
+Each prompt includes a short explanation before the question so the tradeoff is
+visible during interactive installs.
 
 Useful non-interactive planning options:
 
 ```bash
 ./install.sh --dry-run
+./install.sh --uninstall --dry-run
 node scripts/install-cloudx.mjs --dry-run --yes
 node scripts/install-cloudx.mjs --dry-run --answers ./answers.json
 ```
@@ -56,6 +80,31 @@ The answers JSON can contain:
 GPU support is configure-only in the first Ubuntu installer. If an NVIDIA GPU is
 detected, the wizard asks whether to use it; choosing GPU requires CUDA/cuDNN
 runtime libraries to already be installed.
+
+## Uninstall
+
+Run:
+
+```bash
+./install.sh --uninstall
+```
+
+The uninstall wizard removes Cloudx-managed local artifacts. By default it:
+
+- Stops, disables, and removes `cloudx.service` and `cloudx-asr.service` from
+  `~/.config/systemd/user`.
+- Removes `~/.config/cloudx/cloudx.env`.
+- Removes the ASR virtualenv at `services/asr/.venv`.
+- Leaves Node.js, npm, Python, apt packages, and Codex CLI installed.
+- Leaves `.cloudx` runtime data/certificates, `node_modules`, the downloaded
+  Faster Whisper model, and systemd linger unchanged unless you explicitly ask
+  to remove or disable them.
+
+Preview uninstall without changing the system:
+
+```bash
+./install.sh --uninstall --dry-run --yes
+```
 
 Manual setup remains available:
 

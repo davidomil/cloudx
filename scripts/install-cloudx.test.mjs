@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   InstallerRunner,
+  cloudxAccessUrls,
   defaultCpuThreads,
   needsNodeInstall,
   parseNodeMajor,
@@ -37,6 +38,16 @@ describe("install-cloudx helpers", () => {
     expect(commands[0]).toEqual(["sudo", "apt-get", "update"]);
     expect(commands[1]).toContain("build-essential");
     expect(commands).toContainEqual(["sudo", "apt-get", "install", "-y", "nodejs"]);
+  });
+
+  it("builds local and LAN access URLs", () => {
+    expect(
+      cloudxAccessUrls(3001, {
+        lo: [{ family: "IPv4", internal: true, address: "127.0.0.1" }],
+        eth0: [{ family: "IPv4", internal: false, address: "192.168.8.249" }],
+        docker0: [{ family: "IPv4", internal: false, address: "172.17.0.1" }]
+      })
+    ).toEqual(["https://127.0.0.1:3001", "https://192.168.8.249:3001", "https://172.17.0.1:3001"]);
   });
 
   it("validates CPU thread choices", () => {
@@ -99,10 +110,14 @@ describe("runInstaller dry-run", () => {
       answers: {
         installServices: false,
         runCodexLogin: true
+      },
+      networkInterfaces: {
+        eth0: [{ family: "IPv4", internal: false, address: "192.168.8.249" }]
       }
     });
 
     expect(result.installServices).toBe(false);
+    expect(result.urls).toEqual(["https://127.0.0.1:3001", "https://192.168.8.249:3001"]);
     expect(result.envConfig).toMatchObject({ device: "cpu", computeType: "int8", cpuThreads: 6 });
     expect(runner.commands.map((command) => [command.command, ...command.args])).toEqual(
       expect.arrayContaining([
@@ -139,9 +154,90 @@ describe("runInstaller dry-run", () => {
     const planned = runner.commands.map((command) => [command.command, ...command.args]);
     expect(planned).toContainEqual(["sudo", "loginctl", "enable-linger", process.env.USER ?? "david"]);
     expect(planned).toContainEqual(["systemctl", "--user", "enable", "cloudx-asr.service", "cloudx.service"]);
-    expect(planned).toContainEqual(["curl", "-fsSk", "https://127.0.0.1:3001/api/health"]);
+    expect(planned).toContainEqual([
+      "curl",
+      "--fail",
+      "--silent",
+      "--show-error",
+      "--max-time",
+      "5",
+      "--retry",
+      "30",
+      "--retry-delay",
+      "1",
+      "--retry-connrefused",
+      "--insecure",
+      "https://127.0.0.1:3001/api/health"
+    ]);
     expect(runner.writes.map((write) => write.path)).toEqual(
       expect.arrayContaining(["/home/me/.config/systemd/user/cloudx.service", "/home/me/.config/systemd/user/cloudx-asr.service"])
+    );
+  });
+
+  it("plans a conservative uninstall by default", async () => {
+    const runner = new InstallerRunner({ dryRun: true, cwd: "/repo", log: () => undefined });
+
+    const result = await runInstaller({
+      repoRoot: "/repo",
+      home: "/home/me",
+      dryRun: true,
+      yes: true,
+      uninstall: true,
+      runner,
+      osRelease: { ID: "ubuntu", VERSION_ID: "24.04" }
+    });
+
+    const planned = runner.commands.map((command) => [command.command, ...command.args]);
+    expect(result.removed).toMatchObject({
+      removeServices: true,
+      removeConfig: true,
+      removeVenv: true,
+      removeRuntimeData: false,
+      removeModel: false,
+      removeNodeModules: false,
+      disableLinger: false
+    });
+    expect(planned).toEqual(
+      expect.arrayContaining([
+        ["systemctl", "--user", "stop", "cloudx-asr.service", "cloudx.service"],
+        ["systemctl", "--user", "disable", "cloudx-asr.service", "cloudx.service"],
+        ["rm", "-rf", "/home/me/.config/systemd/user/cloudx.service"],
+        ["rm", "-rf", "/home/me/.config/systemd/user/cloudx-asr.service"],
+        ["rm", "-rf", "/home/me/.config/cloudx/cloudx.env"],
+        ["rm", "-rf", "/repo/services/asr/.venv"]
+      ])
+    );
+    expect(planned).not.toContainEqual(["rm", "-rf", "/home/me/.cache/cloudx/models/faster-whisper-large-v3"]);
+    expect(planned).not.toContainEqual(["rm", "-rf", "/repo/node_modules"]);
+  });
+
+  it("plans optional uninstall removals when selected", async () => {
+    const runner = new InstallerRunner({ dryRun: true, cwd: "/repo", log: () => undefined });
+
+    await runInstaller({
+      repoRoot: "/repo",
+      home: "/home/me",
+      dryRun: true,
+      yes: true,
+      uninstall: true,
+      runner,
+      osRelease: { ID: "ubuntu", VERSION_ID: "24.04" },
+      answers: {
+        removeRuntimeData: true,
+        removeModel: true,
+        removeNodeModules: true,
+        disableLinger: true
+      }
+    });
+
+    const planned = runner.commands.map((command) => [command.command, ...command.args]);
+    expect(planned).toEqual(
+      expect.arrayContaining([
+        ["rm", "-rf", "/repo/.cloudx"],
+        ["rm", "-rf", "/home/me/.cache/cloudx/models/faster-whisper-large-v3"],
+        ["rm", "-rf", "/repo/node_modules"],
+        ["sudo", "loginctl", "disable-linger", process.env.USER ?? "david"]
+      ])
     );
   });
 });
