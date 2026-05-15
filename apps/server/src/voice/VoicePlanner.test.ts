@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildCodexExecArgs, buildVoicePrompt } from "./VoicePlanner.js";
+import { buildCodexExecArgs, buildCodexExecLaunch, buildVoicePrompt } from "./VoicePlanner.js";
 
 describe("buildVoicePrompt", () => {
   it("keeps plugin-specific behavior in descriptors instead of planner rules", () => {
@@ -36,5 +36,31 @@ describe("buildCodexExecArgs", () => {
     expect(buildCodexExecArgs("gpt-5.3-codex-spark", "/schema.json", "/out.json")).toEqual(
       expect.arrayContaining(["-c", 'model_reasoning_effort="medium"', "--model", "gpt-5.3-codex-spark"])
     );
+  });
+});
+
+describe("buildCodexExecLaunch", () => {
+  it("launches Codex exec with the configured assistant binary", () => {
+    expect(buildCodexExecLaunch("gpt-5.3-codex-spark", "/schema.json", "/out.json", { CLOUDX_ASSISTANT_BIN: "/usr/bin/codex", SHELL: "/bin/bash" })).toEqual({
+      command: "/usr/bin/codex",
+      args: [
+        "exec",
+        "-c",
+        "streamable_shell=false",
+        "-c",
+        'model_reasoning_effort="medium"',
+        "--model",
+        "gpt-5.3-codex-spark",
+        "--sandbox",
+        "read-only",
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "--output-schema",
+        "/schema.json",
+        "--output-last-message",
+        "/out.json",
+        "-"
+      ]
+    });
   });
 });

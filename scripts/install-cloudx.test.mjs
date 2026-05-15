@@ -17,7 +17,9 @@ import {
   renderEnvFile,
   resolveDeviceConfig,
   runInstaller,
+  toolPathFor,
   ubuntuBootstrapPlan,
+  updateEnvFileContent,
   validateCpuThreads
 } from "./install-cloudx.mjs";
 
@@ -110,6 +112,8 @@ describe("install-cloudx helpers", () => {
       port: 3001,
       allowedRoots: "~",
       dataDir: "/repo/.cloudx",
+      assistantBin: "/usr/bin/codex",
+      toolPath: "/usr/bin",
       modelDir: "/home/me/.cache/cloudx/models/faster-whisper-large-v3",
       device: "cpu",
       computeType: "int8",
@@ -118,6 +122,9 @@ describe("install-cloudx helpers", () => {
     });
     expect(env).toContain("CLOUDX_ASR_CPU_THREADS=6");
     expect(env).toContain("CLOUDX_ASR_DEVICE=cpu");
+    expect(env).toContain("CLOUDX_ASSISTANT_BIN=/usr/bin/codex");
+    expect(env).toContain("CLOUDX_TOOL_PATH=/usr/bin");
+    expect(env).not.toContain("CLOUDX_CODEX_BIN");
 
     expect(renderAsrService({ repoRoot: "/repo", envPath: "/home/me/.config/cloudx/cloudx.env", uvicornPath: "/repo/services/asr/.venv/bin/uvicorn", asrDir: "/repo/services/asr" })).toContain(
       "cloudx_asr.main:app"
@@ -125,6 +132,20 @@ describe("install-cloudx helpers", () => {
     expect(renderCloudxService({ repoRoot: "/repo", envPath: "/home/me/.config/cloudx/cloudx.env", nodePath: "/usr/bin/node", npmPath: "/usr/bin/npm" })).toContain(
       "npm run start -w @cloudx/server"
     );
+  });
+
+  it("updates existing env files without dropping user choices", () => {
+    expect(updateEnvFileContent("CLOUDX_PORT=3001\nCLOUDX_ASSISTANT_BIN=/old/codex\n", { CLOUDX_ASSISTANT_BIN: "/usr/bin/codex" })).toBe(
+      "CLOUDX_PORT=3001\nCLOUDX_ASSISTANT_BIN=/usr/bin/codex\n"
+    );
+    expect(updateEnvFileContent("CLOUDX_PORT=3001\n", { CLOUDX_ASSISTANT_BIN: "/usr/bin/codex" })).toBe("CLOUDX_PORT=3001\nCLOUDX_ASSISTANT_BIN=/usr/bin/codex\n");
+  });
+
+  it("builds tool path entries from the assistant command and npm global prefix", () => {
+    expect(toolPathFor("/home/me/.npm-global/bin/codex", "/usr", `/opt/homebrew/bin${path.delimiter}/usr/bin`)).toBe(
+      `/home/me/.npm-global/bin${path.delimiter}/usr/bin${path.delimiter}/opt/homebrew/bin`
+    );
+    expect(toolPathFor("/usr/bin/codex", "/usr")).toBe("/usr/bin");
   });
 });
 
@@ -309,6 +330,10 @@ describe("runInstaller dry-run", () => {
     const planned = runner.commands.map((command) => [command.command, ...command.args]);
     expect(result).toMatchObject({ port: 3443, servicesInstalled: true, restartServices: true });
     expect(result.urls).toEqual(["https://127.0.0.1:3443", "https://192.168.8.249:3443"]);
+    const updatedEnv = runner.writes.find((write) => write.path === path.join(home, ".config/cloudx/cloudx.env"))?.contents;
+    expect(updatedEnv).toContain("CLOUDX_ASSISTANT_BIN=/usr/bin/codex");
+    expect(updatedEnv).toContain("CLOUDX_TOOL_PATH=/usr/bin");
+    expect(updatedEnv).not.toContain("CLOUDX_CODEX_BIN");
     expect(planned).toEqual(
       expect.arrayContaining([
         ["node", "-v"],

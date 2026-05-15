@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { AppServerClient, type AppServerTransport } from "./AppServerClient.js";
+import { AppServerClient, buildCodexAppServerLaunch, type AppServerTransport } from "./AppServerClient.js";
 
 class FakeTransport implements AppServerTransport {
   private listener: ((message: Record<string, unknown>) => void) | undefined;
@@ -26,6 +26,13 @@ class FakeTransport implements AppServerTransport {
 }
 
 describe("AppServerClient", () => {
+  it("launches Codex app-server with the configured assistant binary", () => {
+    expect(buildCodexAppServerLaunch({ CLOUDX_ASSISTANT_BIN: "/usr/bin/codex", SHELL: "/bin/bash" })).toEqual({
+      command: "/usr/bin/codex",
+      args: ["app-server", "--listen", "stdio://"]
+    });
+  });
+
   it("initializes and reads thread context", async () => {
     const transport = new FakeTransport();
     const client = new AppServerClient(transport);

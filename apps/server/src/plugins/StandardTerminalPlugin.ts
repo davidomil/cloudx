@@ -2,6 +2,7 @@ import type { CreatePluginSessionInput, WorkspacePlugin } from "@cloudx/plugin-a
 
 import { CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES, TERMINAL_ACTIONS } from "./CodexTerminalPlugin.js";
 import type { TerminalProcessFactory } from "../terminal/TerminalProcess.js";
+import { buildInteractiveShellLaunch, buildToolEnv, resolveUserShell } from "../terminal/ShellLaunch.js";
 
 export class StandardTerminalPlugin implements WorkspacePlugin {
   readonly id = "standard-terminal";
@@ -33,10 +34,12 @@ export class StandardTerminalPlugin implements WorkspacePlugin {
   }
 
   async createSession(input: CreatePluginSessionInput) {
-    const shell = process.env.SHELL ?? "/bin/bash";
-    const terminalProcess = await this.factory.spawn(shell, [], {
+    const env = buildToolEnv(process.env);
+    const shell = resolveUserShell(env);
+    const launch = buildInteractiveShellLaunch(env);
+    const terminalProcess = await this.factory.spawn(launch.command, launch.args, {
       cwd: input.cwd,
-      env: buildShellIntegrationEnv(process.env, shell),
+      env: buildShellIntegrationEnv(env, shell),
       cols: 100,
       rows: 30
     });

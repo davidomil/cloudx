@@ -1,13 +1,17 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { WorkspaceTab } from "@cloudx/shared";
 import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
 import { buildShellIntegrationEnv, StandardTerminalPlugin } from "./StandardTerminalPlugin.js";
 
 class CapturingFactory implements TerminalProcessFactory {
+  command: string | undefined;
+  args: string[] | undefined;
   env: NodeJS.ProcessEnv | undefined;
 
-  async spawn(_command: string, _args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; cols: number; rows: number }): Promise<TerminalProcess> {
+  async spawn(command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; cols: number; rows: number }): Promise<TerminalProcess> {
+    this.command = command;
+    this.args = args;
     this.env = options.env;
     return {
       onData: () => () => undefined,
@@ -20,6 +24,10 @@ class CapturingFactory implements TerminalProcessFactory {
 }
 
 describe("StandardTerminalPlugin shell integration", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("injects bash PROMPT_COMMAND markers for command exit codes", () => {
     const env = buildShellIntegrationEnv({ PROMPT_COMMAND: "history -a" } as NodeJS.ProcessEnv, "/bin/bash");
 
@@ -34,11 +42,14 @@ describe("StandardTerminalPlugin shell integration", () => {
   });
 
   it("uses the shell integration env when creating standard terminal sessions", async () => {
+    vi.stubEnv("SHELL", "/bin/bash");
     const factory = new CapturingFactory();
     const plugin = new StandardTerminalPlugin(factory);
 
     const session = await plugin.createSession({ tab, cwd: "/tmp", controls: { setTabIndicator: () => undefined, closeTab: () => undefined } });
 
+    expect(factory.command).toBe("/bin/bash");
+    expect(factory.args).toEqual(["-l"]);
     expect(factory.env?.PROMPT_COMMAND).toContain("]633;D;%s");
     await expect(Promise.resolve(session.voiceContext()).then((context) => context.kind)).resolves.toBe("standard-terminal");
   });

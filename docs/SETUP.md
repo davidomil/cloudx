@@ -98,6 +98,9 @@ does the operational refresh:
   commands run.
 - Pulls the current checkout with `git pull --ff-only`.
 - Updates the global Codex CLI package with npm and verifies Codex login status.
+- Records the resolved assistant executable path in `CLOUDX_ASSISTANT_BIN` and
+  relevant command directories in `CLOUDX_TOOL_PATH` so Cloudx services do not
+  depend on systemd's minimal `PATH`.
 - Reinstalls Node dependencies with `npm ci`.
 - Updates the ASR virtualenv packages and downloads the model if it is missing.
 - Rebuilds Cloudx and creates the local HTTPS certificate if it is missing.
@@ -268,6 +271,12 @@ authorization, and process isolation.
 - `CLOUDX_ALLOWED_ROOTS`: path-delimited roots tabs may open, default `~`.
 - `CLOUDX_DATA_DIR`: runtime state directory, default `.cloudx`.
 - `CLOUDX_VOICE_MODEL`: Codex planner model, default `gpt-5.3-codex-spark`.
+- `CLOUDX_ASSISTANT_BIN`: resolved coding-assistant CLI path used by terminal
+  sessions. The installer currently writes the resolved Codex executable here;
+  future providers such as Claude can use the same variable.
+- `CLOUDX_TOOL_PATH`: command directories prepended to child-process `PATH` so
+  Cloudx shells and assistant subprocesses see the same tool installs as the
+  installer.
 - `CLOUDX_ASR_URL`: ASR service URL, default `http://127.0.0.1:7810`.
 - `CLOUDX_TERMINAL_REPLAY_BYTES`: terminal replay buffer for reconnects and
   voice context.

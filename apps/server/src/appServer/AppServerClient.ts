@@ -1,6 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import readline from "node:readline";
 
+import { buildToolEnv, resolveAssistantCommand, type ProcessLaunch } from "../terminal/ShellLaunch.js";
+
 export interface AppServerTransport {
   send(message: Record<string, unknown>): void;
   onMessage(listener: (message: Record<string, unknown>) => void): void;
@@ -11,8 +13,10 @@ export class StdioAppServerTransport implements AppServerTransport {
   private readonly process: ChildProcessWithoutNullStreams;
 
   constructor() {
-    this.process = spawn("codex", ["app-server", "--listen", "stdio://"], {
-      stdio: ["pipe", "pipe", "pipe"]
+    const launch = buildCodexAppServerLaunch();
+    this.process = spawn(launch.command, launch.args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: buildToolEnv(process.env)
     });
   }
 
@@ -33,6 +37,13 @@ export class StdioAppServerTransport implements AppServerTransport {
   close(): void {
     this.process.kill();
   }
+}
+
+export function buildCodexAppServerLaunch(env: NodeJS.ProcessEnv = process.env): ProcessLaunch {
+  return {
+    command: resolveAssistantCommand(env, "codex"),
+    args: ["app-server", "--listen", "stdio://"]
+  };
 }
 
 export class AppServerClient {

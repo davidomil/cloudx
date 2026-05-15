@@ -15,6 +15,7 @@ import {
   type VoiceDebugLogOptions,
   type VoiceTrace
 } from "./VoiceDebugLog.js";
+import { buildToolEnv, resolveAssistantCommand, type ProcessLaunch } from "../terminal/ShellLaunch.js";
 
 export interface VoicePlannerInput extends VoiceTrace {
   transcript: string;
@@ -116,13 +117,11 @@ function runCodexExec(model: string, prompt: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-voice-plan-"));
     const outputPath = path.join(outputDir, "last-message.json");
-    const child = spawn(
-      "codex",
-      buildCodexExecArgs(model, resolveVoiceSchemaPath(), outputPath),
-      {
-        stdio: ["pipe", "pipe", "pipe"]
-      }
-    );
+    const launch = buildCodexExecLaunch(model, resolveVoiceSchemaPath(), outputPath);
+    const child = spawn(launch.command, launch.args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: buildToolEnv(process.env)
+    });
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8");
@@ -150,6 +149,13 @@ function runCodexExec(model: string, prompt: string): Promise<string> {
     });
     child.stdin.end(prompt);
   });
+}
+
+export function buildCodexExecLaunch(model: string, schemaPath: string, outputPath: string, env: NodeJS.ProcessEnv = process.env): ProcessLaunch {
+  return {
+    command: resolveAssistantCommand(env, "codex"),
+    args: buildCodexExecArgs(model, schemaPath, outputPath)
+  };
 }
 
 export function buildCodexExecArgs(model: string, schemaPath: string, outputPath: string): string[] {

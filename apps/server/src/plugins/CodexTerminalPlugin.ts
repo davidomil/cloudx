@@ -10,6 +10,7 @@ import type {
 import type { WorkspaceTab } from "@cloudx/shared";
 
 import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
+import { buildLoginShellCommandLaunch, buildToolEnv, resolveAssistantCommand } from "../terminal/ShellLaunch.js";
 
 export const DEFAULT_TERMINAL_REPLAY_BYTES = 1_048_576;
 export const CODEX_SUBMIT_DELAY_MS = 25;
@@ -56,9 +57,11 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
   }
 
   async createSession(input: CreatePluginSessionInput): Promise<PluginSession> {
-    const terminalProcess = await this.factory.spawn("codex", [], {
+    const env = buildToolEnv(process.env);
+    const launch = buildLoginShellCommandLaunch(resolveAssistantCommand(env, "codex"), [], env);
+    const terminalProcess = await this.factory.spawn(launch.command, launch.args, {
       cwd: input.cwd,
-      env: process.env,
+      env,
       cols: 100,
       rows: 30
     });

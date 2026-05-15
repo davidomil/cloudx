@@ -143,6 +143,8 @@ export function buildEnvLines(config) {
     `CLOUDX_PORT=${config.port}`,
     `CLOUDX_ALLOWED_ROOTS=${config.allowedRoots}`,
     `CLOUDX_DATA_DIR=${config.dataDir}`,
+    `CLOUDX_ASSISTANT_BIN=${config.assistantBin}`,
+    `CLOUDX_TOOL_PATH=${config.toolPath}`,
     `CLOUDX_ASR_URL=http://127.0.0.1:7810`,
     `CLOUDX_ASR_MODEL_PATH=${config.modelDir}`,
     `CLOUDX_ASR_DEVICE=${config.device}`,
@@ -363,6 +365,8 @@ export async function runInstaller(options = {}) {
 
   section("2/8 Verify Codex CLI");
   await ensureCodex(commands, prompt);
+  const assistantBin = commands.which("codex");
+  const toolPath = toolPathFor(assistantBin, commands.capture("npm", ["prefix", "-g"]), process.env.PATH);
 
   section("3/8 Collect install choices");
   explainQuestion(
@@ -421,6 +425,8 @@ export async function runInstaller(options = {}) {
     port,
     allowedRoots,
     dataDir: paths.dataDir,
+    assistantBin,
+    toolPath,
     modelDir: paths.modelDir,
     language: "en",
     cpuThreads,
@@ -550,6 +556,14 @@ async function runUpdater({ paths, commands, runner, prompt, noStart, networkInt
 
   section("3/9 Update Codex CLI");
   await updateCodex(commands, prompt);
+  const assistantBin = commands.which("codex");
+  runner.writeFile(
+    paths.envPath,
+    updateEnvFileContent(readText(paths.envPath, ""), {
+      CLOUDX_ASSISTANT_BIN: assistantBin,
+      CLOUDX_TOOL_PATH: toolPathFor(assistantBin, commands.capture("npm", ["prefix", "-g"]), process.env.PATH)
+    })
+  );
 
   section("4/9 Update Cloudx npm dependencies");
   commands.run("npm", ["ci"]);
@@ -907,6 +921,41 @@ function readEnvFile(filePath) {
     values[trimmed.slice(0, separator)] = trimmed.slice(separator + 1);
   }
   return values;
+}
+
+export function updateEnvFileContent(content, updates) {
+  const seen = new Set();
+  const lines = content.split(/\r?\n/).filter((line, index, allLines) => index < allLines.length - 1 || line !== "");
+  const updatedLines = lines.map((line) => {
+    const separator = line.indexOf("=");
+    if (separator === -1 || line.trim().startsWith("#")) {
+      return line;
+    }
+    const key = line.slice(0, separator);
+    if (!Object.hasOwn(updates, key)) {
+      return line;
+    }
+    seen.add(key);
+    return `${key}=${updates[key]}`;
+  });
+  for (const [key, value] of Object.entries(updates)) {
+    if (!seen.has(key)) {
+      updatedLines.push(`${key}=${value}`);
+    }
+  }
+  return `${updatedLines.join("\n")}\n`;
+}
+
+export function toolPathFor(commandPath, npmPrefix, currentPath = "") {
+  const entries = [];
+  if (path.isAbsolute(commandPath)) {
+    entries.push(path.dirname(commandPath));
+  }
+  if (npmPrefix) {
+    entries.push(path.join(npmPrefix, "bin"));
+  }
+  entries.push(...String(currentPath).split(path.delimiter).filter(Boolean));
+  return [...new Set(entries)].join(path.delimiter);
 }
 
 function defaultParallelism() {

@@ -1,9 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { TabIndicatorUpdate, WorkspaceTab } from "@cloudx/shared";
 
-import { CodexTerminalSession, TerminalShellIntegrationParser } from "./CodexTerminalPlugin.js";
-import type { TerminalProcess } from "../terminal/TerminalProcess.js";
+import { CodexTerminalPlugin, CodexTerminalSession, TerminalShellIntegrationParser } from "./CodexTerminalPlugin.js";
+import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
 
 class FakeTerminalProcess implements TerminalProcess {
   written = "";
@@ -47,6 +47,17 @@ class FakeTerminalProcess implements TerminalProcess {
   }
 }
 
+class CapturingFactory implements TerminalProcessFactory {
+  command: string | undefined;
+  args: string[] | undefined;
+
+  async spawn(command: string, args: string[]): Promise<TerminalProcess> {
+    this.command = command;
+    this.args = args;
+    return new FakeTerminalProcess();
+  }
+}
+
 const tab: WorkspaceTab = {
   id: "tab-1",
   pluginId: "codex-terminal",
@@ -57,6 +68,24 @@ const tab: WorkspaceTab = {
   createdAt: new Date(0).toISOString(),
   updatedAt: new Date(0).toISOString()
 };
+
+describe("CodexTerminalPlugin", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("launches Codex through the user's login shell", async () => {
+    vi.stubEnv("SHELL", "/bin/bash");
+    vi.stubEnv("CLOUDX_ASSISTANT_BIN", "/usr/bin/codex");
+    const factory = new CapturingFactory();
+    const plugin = new CodexTerminalPlugin(factory);
+
+    await plugin.createSession({ tab, cwd: "/tmp", controls: { setTabIndicator: () => undefined, closeTab: () => undefined } });
+
+    expect(factory.command).toBe("/bin/bash");
+    expect(factory.args).toEqual(["-lc", "exec /usr/bin/codex"]);
+  });
+});
 
 describe("CodexTerminalSession", () => {
   it("types text and submits when requested", () => {

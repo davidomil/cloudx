@@ -133,6 +133,8 @@ Common environment variables:
 - `CLOUDX_HOST`: bind address, default `0.0.0.0`.
 - `CLOUDX_PORT`: app port, default `3001`.
 - `CLOUDX_ALLOWED_ROOTS`: path-delimited allowed roots, default `~`.
+- `CLOUDX_ASSISTANT_BIN`: resolved coding-assistant CLI executable for assistant-backed terminals and tools.
+- `CLOUDX_TOOL_PATH`: path-delimited command directories prepended to Cloudx child processes.
 - `CLOUDX_ASR_URL`: ASR endpoint, default `http://127.0.0.1:7810`.
 - `CLOUDX_VOICE_MODEL`: planner model, default `gpt-5.3-codex-spark`.
 - `CLOUDX_VOICE_DEBUG_TRANSCRIPTS`: log raw transcripts and planner text.
