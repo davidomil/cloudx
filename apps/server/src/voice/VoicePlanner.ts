@@ -17,6 +17,21 @@ import {
 } from "./VoiceDebugLog.js";
 import { buildToolEnv, resolveAssistantCommand, type ProcessLaunch } from "../terminal/ShellLaunch.js";
 
+type VoicePromptContextProfileName = "normal" | "tight" | "minimal";
+type StringKeepMode = "start" | "end";
+
+interface VoicePromptContextProfile {
+  name: VoicePromptContextProfileName;
+  maxArrayItems: number;
+  activeHistoryChars: number;
+  inactiveHistoryChars: number;
+  activeVisibleTextChars: number;
+  inactiveVisibleTextChars: number;
+  contentPreviewChars: number;
+  descriptionChars: number;
+  genericStringChars: number;
+}
+
 export interface VoicePlannerInput extends VoiceTrace {
   transcript: string;
   context: Record<string, unknown>;
@@ -82,7 +97,45 @@ export class CodexExecVoicePlanner implements VoicePlanner {
   }
 }
 
+const MAX_VOICE_CONTEXT_JSON_CHARS = 80_000;
+const VOICE_PROMPT_CONTEXT_PROFILES: VoicePromptContextProfile[] = [
+  {
+    name: "normal",
+    maxArrayItems: 50,
+    activeHistoryChars: 12_000,
+    inactiveHistoryChars: 2_000,
+    activeVisibleTextChars: 6_000,
+    inactiveVisibleTextChars: 1_500,
+    contentPreviewChars: 6_000,
+    descriptionChars: 1_200,
+    genericStringChars: 4_000
+  },
+  {
+    name: "tight",
+    maxArrayItems: 30,
+    activeHistoryChars: 6_000,
+    inactiveHistoryChars: 800,
+    activeVisibleTextChars: 3_000,
+    inactiveVisibleTextChars: 800,
+    contentPreviewChars: 3_000,
+    descriptionChars: 800,
+    genericStringChars: 1_500
+  },
+  {
+    name: "minimal",
+    maxArrayItems: 18,
+    activeHistoryChars: 2_500,
+    inactiveHistoryChars: 300,
+    activeVisibleTextChars: 1_200,
+    inactiveVisibleTextChars: 300,
+    contentPreviewChars: 1_200,
+    descriptionChars: 500,
+    genericStringChars: 700
+  }
+];
+
 export function buildVoicePrompt(transcript: string, context: Record<string, unknown>): string {
+  const compactContext = compactVoicePromptContext(context);
   return [
     "You are the Cloudx voice controller.",
     "Return only JSON matching this shape:",
@@ -98,6 +151,7 @@ export function buildVoicePrompt(transcript: string, context: Record<string, unk
     "Actions marked defaultForVoice are safe default tools after you have interpreted the user's intent.",
     "Actions marked handlesUnhandledVoice are plugin-owned fallbacks Cloudx may use if you return zero actions for unresolved general speech.",
     "Plugin descriptions, hook descriptions, action descriptions, input schemas, voiceContext, and history are authoritative for what each plugin can do and how each command should be used.",
+    "Some long context fields may be truncated and marked with Cloudx voice context truncation notes. Treat exact ids, action names, hook ids, schemas, cwd values, and visible untruncated text as authoritative; do not infer omitted text.",
     "Use exact hook ids, plugin ids, tab ids, pane ids, action names, and input fields from the provided context; do not invent plugin capabilities.",
     "For paths, use workspace paths context, the active session cwd, or path guidance exposed by the chosen plugin action schema.",
     "For pane placement, follow the descriptions and enums exposed by the workspace hook schemas and the exact pane ids in client.panes.",
@@ -110,8 +164,40 @@ export function buildVoicePrompt(transcript: string, context: Record<string, unk
     `Transcript: ${transcript}`,
     "",
     "Workspace context:",
-    JSON.stringify(context, null, 2)
+    JSON.stringify(compactContext, null, 2)
   ].join("\n");
+}
+
+export function compactVoicePromptContext(context: Record<string, unknown>): Record<string, unknown> {
+  const originalChars = JSON.stringify(context).length;
+  let selectedProfile = VOICE_PROMPT_CONTEXT_PROFILES[0]!;
+  let compacted = compactValue(context, selectedProfile, { path: [], activeSession: false }) as Record<string, unknown>;
+  let compactedChars = JSON.stringify(compacted).length;
+
+  for (const profile of VOICE_PROMPT_CONTEXT_PROFILES.slice(1)) {
+    if (compactedChars <= MAX_VOICE_CONTEXT_JSON_CHARS) {
+      break;
+    }
+    selectedProfile = profile;
+    compacted = compactValue(context, profile, { path: [], activeSession: false }) as Record<string, unknown>;
+    compactedChars = JSON.stringify(compacted).length;
+  }
+
+  if (compactedChars === originalChars) {
+    return compacted;
+  }
+
+  return {
+    ...compacted,
+    contextBudget: {
+      truncated: true,
+      originalChars,
+      compactedChars,
+      maxChars: MAX_VOICE_CONTEXT_JSON_CHARS,
+      profile: selectedProfile.name,
+      note: "Cloudx compacted long voice context fields before running the planner."
+    }
+  };
 }
 
 function runCodexExec(model: string, prompt: string): Promise<string> {
@@ -157,6 +243,72 @@ export function buildCodexExecLaunch(model: string, schemaPath: string, outputPa
     command: resolveAssistantCommand(env, "codex"),
     args: buildCodexExecArgs(model, schemaPath, outputPath)
   };
+}
+
+function compactValue(value: unknown, profile: VoicePromptContextProfile, context: { path: string[]; activeSession: boolean }): unknown {
+  if (typeof value === "string") {
+    const limit = stringLimitForContext(context, profile);
+    return truncateForVoiceContext(value, limit.maxChars, limit.keep);
+  }
+  if (Array.isArray(value)) {
+    const items = value.slice(0, profile.maxArrayItems).map((item) => {
+      const activeSession = context.path.at(-1) === "sessions" && isRecord(item) ? item.active === true : context.activeSession;
+      return compactValue(item, profile, { path: [...context.path, "[]"], activeSession });
+    });
+    if (value.length <= profile.maxArrayItems) {
+      return items;
+    }
+    return [
+      ...items,
+      {
+        truncated: true,
+        originalItems: value.length,
+        keptItems: items.length,
+        note: "Cloudx voice context array truncated before planner execution."
+      }
+    ];
+  }
+  if (isRecord(value)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, child]) => [
+        key,
+        compactValue(child, profile, {
+          path: [...context.path, key],
+          activeSession: context.activeSession || (key === "active" && child === true)
+        })
+      ])
+    );
+  }
+  return value;
+}
+
+function stringLimitForContext({ path, activeSession }: { path: string[]; activeSession: boolean }, profile: VoicePromptContextProfile): { maxChars: number; keep: StringKeepMode } {
+  const key = path.at(-1);
+  if (key === "text" && path.includes("history")) {
+    return { maxChars: activeSession ? profile.activeHistoryChars : profile.inactiveHistoryChars, keep: "end" };
+  }
+  if (key === "visibleText" || key === "recentOutput") {
+    return { maxChars: activeSession ? profile.activeVisibleTextChars : profile.inactiveVisibleTextChars, keep: "end" };
+  }
+  if (key === "contentPreview") {
+    return { maxChars: profile.contentPreviewChars, keep: "start" };
+  }
+  if (key === "description" || key === "summary") {
+    return { maxChars: profile.descriptionChars, keep: "start" };
+  }
+  return { maxChars: profile.genericStringChars, keep: "start" };
+}
+
+function truncateForVoiceContext(value: string, maxChars: number, keep: StringKeepMode): string {
+  if (value.length <= maxChars) {
+    return value;
+  }
+  const note = `[Cloudx voice context truncated: original ${value.length} chars, kept ${maxChars} ${keep === "end" ? "last" : "first"} chars.]`;
+  return keep === "end" ? `${note}\n${value.slice(-maxChars)}` : `${value.slice(0, maxChars)}\n${note}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export function buildCodexExecArgs(model: string, schemaPath: string, outputPath: string): string[] {
