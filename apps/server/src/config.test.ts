@@ -3,16 +3,23 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { defaultLocalHttpsPaths, loadConfig } from "./config.js";
+import { defaultLocalHttpsPaths, loadConfig, networkBindWarning, shouldWarnForNetworkBind } from "./config.js";
 import { DEFAULT_TERMINAL_REPLAY_BYTES } from "./plugins/CodexTerminalPlugin.js";
 
 describe("loadConfig", () => {
-  it("defaults to LAN/Tailscale-facing host and port", () => {
+  it("defaults to localhost host and port", () => {
     const config = loadConfig({ HOME: "/workspace/test" } as NodeJS.ProcessEnv);
 
-    expect(config.host).toBe("0.0.0.0");
+    expect(config.host).toBe("127.0.0.1");
     expect(config.port).toBe(3001);
     expect(config.terminalReplayBytes).toBe(DEFAULT_TERMINAL_REPLAY_BYTES);
+  });
+
+  it("detects network-facing bind hosts for startup warnings", () => {
+    expect(shouldWarnForNetworkBind("0.0.0.0")).toBe(true);
+    expect(shouldWarnForNetworkBind("::")).toBe(true);
+    expect(shouldWarnForNetworkBind("127.0.0.1")).toBe(false);
+    expect(networkBindWarning("0.0.0.0", 3001)).toContain("Public internet unsupported");
   });
 
   it("leaves configured allowed roots as user-facing path expressions", () => {

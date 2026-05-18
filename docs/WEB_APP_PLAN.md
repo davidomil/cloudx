@@ -4,7 +4,7 @@
 
 Cloudx is a private web workbench for Codex CLI sessions. It provides a responsive app that works on desktop and phone, tmux-like tabs and split panes, a plugin system for panels, and push-to-talk voice control backed by local Faster Whisper plus a restricted Codex controller.
 
-V1 is Tailscale/LAN only. The server binds to `0.0.0.0:3001` for trusted network access. Public internet exposure is not supported.
+V1 is private by default. The server binds to `127.0.0.1:3001` unless the user opts into `--lan` or `CLOUDX_HOST=0.0.0.0` for trusted LAN/tailnet access. Public internet exposure is not supported.
 
 ## Source Notes
 
@@ -45,7 +45,7 @@ Primary sources checked before implementation:
 ### Backend
 
 - Fastify HTTP and WebSocket server.
-- Binds to `0.0.0.0:3001` by default and serves the built frontend from the same process.
+- Binds to `127.0.0.1:3001` by default and serves the built frontend from the same process.
 - Owns:
   - plugin registry
   - tab/session registry
@@ -111,8 +111,9 @@ The controller is not allowed to execute shell commands directly. Prompt restric
 
 ## Security Boundaries
 
-- `0.0.0.0:3001` bind by default for LAN/Tailscale testing.
-- Tailscale Serve is the recommended remote access path.
+- `127.0.0.1:3001` bind by default.
+- `--lan` or `CLOUDX_HOST=0.0.0.0` is required for trusted LAN binding.
+- Tailscale Serve is the recommended remote access path because Cloudx can stay on localhost.
 - User-provided paths must resolve under configured allowed roots.
 - No public internet exposure without real authentication and process isolation.
 - Voice actions are rejected if not exported by the target plugin.

@@ -9,6 +9,9 @@ private tailnet. Public deployment would require authentication, authorization,
 auditing, rate limiting, CSRF protection, process isolation, and a dedicated
 security review.
 
+See `docs/SECURITY_MODEL.md` for the current threat model, limits, and
+recommended deployment patterns.
+
 Never commit local runtime data:
 
 - `.cloudx/`

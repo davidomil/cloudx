@@ -1,6 +1,7 @@
 {
   "name": "Cloudx",
   "short_name": "Cloudx",
+  "description": "Run and supervise Codex CLI from your phone on your own Linux build machine, with local-first sessions, panes, file tools, diffs, worktrees, and constrained voice control.",
   "start_url": "/",
   "display": "standalone",
   "orientation": "portrait",

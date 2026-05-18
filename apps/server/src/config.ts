@@ -6,6 +6,8 @@ import { existsSync } from "node:fs";
 import { DEFAULT_VOICE_MODEL } from "@cloudx/shared";
 import { DEFAULT_TERMINAL_REPLAY_BYTES } from "./plugins/CodexTerminalPlugin.js";
 
+export const DEFAULT_CLOUDX_HOST = "127.0.0.1";
+
 export interface AppConfig {
   host: string;
   port: number;
@@ -24,7 +26,7 @@ export interface AppConfig {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
-  const host = env.CLOUDX_HOST ?? "0.0.0.0";
+  const host = env.CLOUDX_HOST ?? DEFAULT_CLOUDX_HOST;
   const port = Number.parseInt(env.CLOUDX_PORT ?? "3001", 10);
   const terminalReplayBytes = Number.parseInt(env.CLOUDX_TERMINAL_REPLAY_BYTES ?? String(DEFAULT_TERMINAL_REPLAY_BYTES), 10);
   const home = os.homedir();
@@ -59,6 +61,26 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     voiceDebugTranscripts: isTruthy(env.CLOUDX_VOICE_DEBUG_TRANSCRIPTS),
     https
   };
+}
+
+export function shouldWarnForNetworkBind(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  return normalized === "0.0.0.0" || normalized === "::" || normalized === "[::]";
+}
+
+export function networkBindWarning(host: string, port: number): string {
+  return [
+    "",
+    "======================================================================",
+    "WARNING: Cloudx is listening on a network interface.",
+    `CLOUDX_HOST=${host} exposes this shell-controlling service beyond localhost.`,
+    "Cloudx can spawn terminals, edit files, proxy dashboards, and transcribe",
+    "browser microphone audio when voice is enabled.",
+    "Use only on a trusted LAN or private tailnet. Public internet unsupported.",
+    `Local URL: https://127.0.0.1:${port}`,
+    "======================================================================",
+    ""
+  ].join("\n");
 }
 
 function isTruthy(value: string | undefined): boolean {

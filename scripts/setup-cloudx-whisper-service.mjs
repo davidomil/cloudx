@@ -19,8 +19,10 @@ const systemdDir = path.join(home, ".config/systemd/user");
 const envPath = path.join(configDir, "cloudx.env");
 const skipModel = process.argv.includes("--skip-model");
 const noStart = process.argv.includes("--no-start");
+const lan = process.argv.includes("--lan");
 const forceCpu = process.argv.includes("--cpu");
 const forceGpu = process.argv.includes("--gpu");
+const host = lan ? "0.0.0.0" : process.env.CLOUDX_HOST?.trim() || "127.0.0.1";
 const npmPath = findCommand("npm");
 const nodePath = findCommand("node");
 const python = findCommand("python3");
@@ -45,10 +47,13 @@ run(npmPath, ["run", "build"]);
 run(npmPath, ["run", "cert:create"]);
 
 fs.mkdirSync(configDir, { recursive: true });
+if (isNetworkBind(host)) {
+  console.log(networkBindWarning(host));
+}
 fs.writeFileSync(
   envPath,
   [
-    `CLOUDX_HOST=0.0.0.0`,
+    `CLOUDX_HOST=${host}`,
     `CLOUDX_PORT=3001`,
     `CLOUDX_ALLOWED_ROOTS=~`,
     `CLOUDX_DATA_DIR=${path.join(repoRoot, ".cloudx")}`,
@@ -118,7 +123,25 @@ if (!noStart) {
 console.log("Cloudx whisper service setup complete.");
 console.log(`  env: ${envPath}`);
 console.log(`  ASR model: ${modelDir}`);
+console.log(`  Cloudx URL: https://127.0.0.1:3001`);
 console.log("  status: systemctl --user status cloudx.service cloudx-asr.service");
+
+function isNetworkBind(value) {
+  const normalized = String(value).trim().toLowerCase();
+  return normalized === "0.0.0.0" || normalized === "::" || normalized === "[::]";
+}
+
+function networkBindWarning(value) {
+  return [
+    "",
+    "======================================================================",
+    "WARNING: Cloudx is configured for network access.",
+    `CLOUDX_HOST=${value} exposes this shell-controlling service beyond localhost.`,
+    "Use only on a trusted LAN or private tailnet. Public internet unsupported.",
+    "======================================================================",
+    ""
+  ].join("\n");
+}
 
 function resolveDevice() {
   if (forceCpu && forceGpu) {

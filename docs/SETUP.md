@@ -1,4 +1,4 @@
-# Setup
+# Cloudx: Run and supervise Codex CLI from your phone on your own Linux build machine, with local-first sessions, panes, file tools, diffs, worktrees, and constrained voice control
 
 This guide keeps the README short and collects the operational details needed
 to run Cloudx with voice control.
@@ -37,8 +37,8 @@ The installer is split into two visible phases:
    service installation. When services are started, the wizard waits for the
    HTTPS app health endpoint and ASR health endpoint with bounded retries; if
    either endpoint does not become healthy, it prints recent systemd status and
-   journal output. When the install finishes, it prints `https://127.0.0.1:<port>`
-   plus detected LAN IPv4 URLs.
+   journal output. When the install finishes, it prints `https://127.0.0.1:<port>`.
+   It prints detected LAN IPv4 URLs only when installed with `--lan`.
 
 The wizard asks for:
 
@@ -62,6 +62,26 @@ Useful non-interactive planning options:
 node scripts/install-cloudx.mjs --dry-run --yes
 node scripts/install-cloudx.mjs --dry-run --answers ./answers.json
 ```
+
+Cloudx is private by default and binds to `127.0.0.1`. To expose it on a trusted
+LAN or tailnet, opt in explicitly:
+
+```bash
+./install.sh --lan
+```
+
+This writes `CLOUDX_HOST=0.0.0.0`, prints a warning, and advertises detected LAN
+URLs. Do not use this for direct public internet exposure.
+
+For a tailnet-authenticated path, keep Cloudx on localhost and proxy it with
+Tailscale Serve:
+
+```bash
+tailscale serve --bg https+insecure://localhost:3001
+```
+
+Use Tailscale grants or ACLs so only the intended users and devices can reach
+the Cloudx node.
 
 The answers JSON can contain:
 
@@ -106,7 +126,8 @@ does the operational refresh:
 - Rebuilds Cloudx and creates the local HTTPS certificate if it is missing.
 - Rewrites user-level systemd service files when they are already installed.
 - Asks whether to restart services now; if restarted, it verifies the Cloudx and
-  ASR health endpoints and then prints the local/LAN URLs.
+  ASR health endpoints and then prints the local URL. Existing installs that
+  already have `CLOUDX_HOST=0.0.0.0` still print detected LAN URLs.
 
 Preview update without changing the system:
 
@@ -201,6 +222,7 @@ Useful variants:
 npm run service:install -- --cpu
 npm run service:install -- --gpu
 npm run service:install -- --skip-model
+npm run service:install -- --lan
 npm run service:install -- --no-start
 ```
 
@@ -228,7 +250,7 @@ sudo loginctl enable-linger "$USER"
 
 Browsers require a secure context for microphone capture. `npm run dev` creates
 `.cloudx/certs/cloudx-local.{key,crt}` if missing and starts Cloudx over HTTPS
-on `0.0.0.0:3001`.
+on `127.0.0.1:3001`.
 
 Regenerate the certificate:
 
@@ -258,7 +280,7 @@ the certificate is trusted by the OS.
 For a private HTTPS tailnet URL:
 
 ```bash
-tailscale serve 3001
+tailscale serve --bg https+insecure://localhost:3001
 ```
 
 Do not use Tailscale Funnel or any public exposure without real authentication,
@@ -266,7 +288,8 @@ authorization, and process isolation.
 
 ## Full Configuration
 
-- `CLOUDX_HOST`: server bind address, default `0.0.0.0`.
+- `CLOUDX_HOST`: server bind address, default `127.0.0.1`. Set `0.0.0.0` only
+  for a trusted LAN or tailnet.
 - `CLOUDX_PORT`: server port, default `3001`.
 - `CLOUDX_ALLOWED_ROOTS`: path-delimited roots tabs may open, default `~`.
 - `CLOUDX_DATA_DIR`: runtime state directory, default `.cloudx`.

@@ -1,15 +1,14 @@
 # Cloudx
 
-Cloudx is a local-first web workbench for running Codex CLI sessions from a
-laptop or phone, with a mobile-optimized interface for work on the go. It gives
-you split panes, plugin tabs, terminal sessions, file tools, local dashboard
-viewing, and voice control through local Faster Whisper plus a restricted Codex
-planner.
+Cloudx is a local-first mobile workbench for Codex CLI. Run and supervise Codex CLI from your phone on your own Linux build machine, with local-first sessions, panes, file tools, diffs, worktrees, and constrained voice control.
 
-## Status And Disclosure
+Cloudx is built for long-running agent work: multiple Codex terminals, split
+panes, file browsing, rendered diffs, worktree management, local dashboard
+previews, and constrained voice commands backed by local Faster Whisper.
 
-This project was vibe coded and is meant for other people experimenting with
-vibe coding workflows. It is useful, but it is not a hardened service.
+Cloudx is intentionally local-first. Your code, credentials, shell tools, and
+Codex login stay on your machine. Private by default. Tailnet recommended.
+Public internet unsupported.
 
 Do not expose Cloudx to the public internet. It can spawn terminals, send text
 to shells and Codex, read and edit files under configured roots, and embed local
@@ -65,12 +64,15 @@ names, and dashboard tokens.
 - `docs/MOTIVATION.md`: why this exists.
 - `docs/WEB_APP_PLAN.md`: product and architecture plan.
 - `docs/SETUP.md`: install, service, HTTPS, and ASR details.
+- `docs/SECURITY_MODEL.md`: threat model, current limits, and deployment guidance.
 
 ## Quick Start
 
 On Ubuntu 22.04 or newer, the guided installer is the easiest path:
 
 ```bash
+git clone https://github.com/davidomil/cloudx
+cd cloudx
 ./install.sh
 ```
 
@@ -81,7 +83,8 @@ installs Cloudx npm dependencies, installs and checks Codex CLI, prepares the
 Faster Whisper ASR environment, downloads the local ASR model, writes Cloudx
 config, and optionally installs user-level systemd services. Each question
 includes a short explanation of what the choice changes, and the installer
-prints the local and LAN Cloudx URLs when it finishes.
+prints the local Cloudx URL when it finishes. Add `--lan` only when you want
+Cloudx to bind to `0.0.0.0` for a trusted LAN or tailnet.
 
 Preview the installer without changing the system:
 
@@ -110,8 +113,15 @@ npm run build
 npm run dev
 ```
 
-Open `https://127.0.0.1:3001`. For phone access, trust the generated local
-certificate on the client device or proxy Cloudx through a private tailnet.
+Open `https://127.0.0.1:3001`. For phone access, prefer a private tailnet proxy
+to the localhost service. LAN binding is explicit:
+
+```bash
+./install.sh --lan
+```
+
+That writes `CLOUDX_HOST=0.0.0.0` and prints a warning because Cloudx can control
+shells and files. Use it only on a trusted LAN or tailnet.
 
 For voice control:
 
@@ -130,7 +140,7 @@ service install.
 
 Common environment variables:
 
-- `CLOUDX_HOST`: bind address, default `0.0.0.0`.
+- `CLOUDX_HOST`: bind address, default `127.0.0.1`. Set `0.0.0.0` only for a trusted LAN or tailnet.
 - `CLOUDX_PORT`: app port, default `3001`.
 - `CLOUDX_ALLOWED_ROOTS`: path-delimited allowed roots, default `~`.
 - `CLOUDX_ASSISTANT_BIN`: resolved coding-assistant CLI executable for assistant-backed terminals and tools.
@@ -138,6 +148,12 @@ Common environment variables:
 - `CLOUDX_ASR_URL`: ASR endpoint, default `http://127.0.0.1:7810`.
 - `CLOUDX_VOICE_MODEL`: planner model, default `gpt-5.3-codex-spark`.
 - `CLOUDX_VOICE_DEBUG_TRANSCRIPTS`: log raw transcripts and planner text.
+
+## Engineering Status
+
+Cloudx was built through heavy agent-assisted and vibe-coding workflows. It is
+useful, but it is not a hardened service. The current security posture is
+documented in `docs/SECURITY_MODEL.md`.
 
 ## Verify
 

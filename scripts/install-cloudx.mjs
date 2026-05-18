@@ -29,6 +29,7 @@ export function parseArgs(argv = process.argv.slice(2)) {
     dryRun: false,
     answersPath: undefined,
     yes: false,
+    lan: false,
     noStart: false,
     uninstall: false,
     update: false
@@ -44,6 +45,8 @@ export function parseArgs(argv = process.argv.slice(2)) {
       }
     } else if (arg === "--yes") {
       options.yes = true;
+    } else if (arg === "--lan") {
+      options.lan = true;
     } else if (arg === "--no-start") {
       options.noStart = true;
     } else if (arg === "--uninstall") {
@@ -79,6 +82,7 @@ export function helpText() {
     "  --dry-run          Print commands and planned file writes without changing the system.",
     "  --answers <json>   Read wizard answers from a JSON file.",
     "  --yes              Use defaults for prompts not supplied by --answers.",
+    "  --lan              Bind Cloudx to 0.0.0.0 for trusted LAN/tailnet access.",
     "  --no-start         Install services without starting them.",
     "  -h, --help         Show this help."
   ].join("\n");
@@ -235,8 +239,31 @@ export function verifyNodeAndNpm(commands) {
   commands.run("npm", ["-v"]);
 }
 
-export function cloudxAccessUrls(port, networkInterfaces = os.networkInterfaces()) {
+export function shouldAdvertiseLanUrls(host) {
+  const normalized = String(host).trim().toLowerCase();
+  return normalized === "0.0.0.0" || normalized === "::" || normalized === "[::]";
+}
+
+export function networkBindWarning(host, port) {
+  return [
+    "",
+    "======================================================================",
+    "WARNING: Cloudx is configured for network access.",
+    `CLOUDX_HOST=${host} exposes this shell-controlling service beyond localhost.`,
+    "Cloudx can spawn terminals, edit files, proxy dashboards, and transcribe",
+    "browser microphone audio when voice is enabled.",
+    "Use only on a trusted LAN or private tailnet. Public internet unsupported.",
+    `Local URL: https://127.0.0.1:${port}`,
+    "======================================================================",
+    ""
+  ].join("\n");
+}
+
+export function cloudxAccessUrls(port, networkInterfaces = os.networkInterfaces(), host = "127.0.0.1") {
   const urls = [`https://127.0.0.1:${port}`];
+  if (!shouldAdvertiseLanUrls(host)) {
+    return urls;
+  }
   for (const addresses of Object.values(networkInterfaces)) {
     for (const address of addresses ?? []) {
       if (address.family === "IPv4" && !address.internal) {
@@ -377,6 +404,10 @@ export async function runInstaller(options = {}) {
   const allowedRoots = await prompt.text("allowedRoots", "Allowed workspace roots", "~");
   explainQuestion("Cloudx HTTPS port", "This is the HTTPS port for the web UI. Keep 3001 unless it is already in use.");
   const port = await prompt.integer("port", "Cloudx HTTPS port", 3001, { min: 1, max: 65_535 });
+  const host = options.lan ? "0.0.0.0" : env.CLOUDX_HOST?.trim() || "127.0.0.1";
+  if (shouldAdvertiseLanUrls(host)) {
+    console.log(networkBindWarning(host, port));
+  }
   explainQuestion(
     "Additional certificate hostnames",
     "Optional names or IPs to include in the generated local certificate, useful for phone or LAN access. Leave blank for localhost and detected local addresses."
@@ -401,6 +432,7 @@ export async function runInstaller(options = {}) {
   const enableLinger = installServices ? await prompt.boolean("enableLinger", "Enable user lingering so services survive logout and can start before login?", true) : false;
   printChoiceSummary({
     allowedRoots,
+    host,
     port,
     certHosts,
     cpuThreads,
@@ -422,7 +454,7 @@ export async function runInstaller(options = {}) {
   });
 
   const envConfig = {
-    host: "0.0.0.0",
+    host,
     port,
     allowedRoots,
     dataDir: paths.dataDir,
@@ -454,8 +486,8 @@ export async function runInstaller(options = {}) {
   }
 
   await prompt.close();
-  printInstallComplete({ paths, port, installServices, startServices, networkInterfaces });
-  return { runner, paths, envConfig, installServices, startServices, enableLinger, urls: cloudxAccessUrls(port, networkInterfaces) };
+  printInstallComplete({ paths, host, port, installServices, startServices, networkInterfaces });
+  return { runner, paths, envConfig, installServices, startServices, enableLinger, urls: cloudxAccessUrls(port, networkInterfaces, host) };
 }
 
 async function runUninstaller({ paths, commands, runner, prompt }) {
@@ -546,6 +578,7 @@ async function runUpdater({ paths, commands, runner, prompt, noStart, networkInt
 
   const envConfig = readEnvFile(paths.envPath);
   const port = Number.parseInt(envConfig.CLOUDX_PORT ?? "3001", 10);
+  const host = envConfig.CLOUDX_HOST ?? "127.0.0.1";
   const servicesInstalled = SERVICE_NAMES.every((serviceName) => fs.existsSync(path.join(paths.systemdDir, serviceName)));
 
   section("2/9 Pull latest Cloudx checkout");
@@ -602,9 +635,9 @@ async function runUpdater({ paths, commands, runner, prompt, noStart, networkInt
   }
 
   section("9/9 Update complete");
-  printUpdateComplete({ paths, port, servicesInstalled, restartServices, networkInterfaces });
+  printUpdateComplete({ paths, host, port, servicesInstalled, restartServices, networkInterfaces });
   await prompt.close();
-  return { runner, paths, port, servicesInstalled, restartServices, urls: cloudxAccessUrls(port, networkInterfaces) };
+  return { runner, paths, port, servicesInstalled, restartServices, urls: cloudxAccessUrls(port, networkInterfaces, host) };
 }
 
 function section(title) {
@@ -616,9 +649,10 @@ function explainQuestion(title, detail) {
   console.log(`  ${detail}`);
 }
 
-function printChoiceSummary({ allowedRoots, port, certHosts, cpuThreads, device, installServices, startServices, enableLinger }) {
+function printChoiceSummary({ allowedRoots, host, port, certHosts, cpuThreads, device, installServices, startServices, enableLinger }) {
   console.log("Install choices:");
   console.log(`  allowed roots: ${allowedRoots}`);
+  console.log(`  bind host: ${host}`);
   console.log(`  HTTPS port: ${port}`);
   console.log(`  certificate hosts: ${certHosts.trim() || "(default local hosts only)"}`);
   console.log(`  ASR device: ${device.device} (${device.computeType})`);
@@ -637,8 +671,11 @@ function printUninstallSummary(choices) {
   }
 }
 
-function printInstallComplete({ paths, port, installServices, startServices, networkInterfaces }) {
-  const urls = cloudxAccessUrls(port, networkInterfaces);
+function printInstallComplete({ paths, host, port, installServices, startServices, networkInterfaces }) {
+  if (shouldAdvertiseLanUrls(host)) {
+    console.log(networkBindWarning(host, port));
+  }
+  const urls = cloudxAccessUrls(port, networkInterfaces, host);
   console.log("Cloudx installer complete.");
   console.log(`  env: ${paths.envPath}`);
   console.log(`  ASR model: ${paths.modelDir}`);
@@ -653,8 +690,11 @@ function printInstallComplete({ paths, port, installServices, startServices, net
   }
 }
 
-function printUpdateComplete({ paths, port, servicesInstalled, restartServices, networkInterfaces }) {
-  const urls = cloudxAccessUrls(port, networkInterfaces);
+function printUpdateComplete({ paths, host, port, servicesInstalled, restartServices, networkInterfaces }) {
+  if (shouldAdvertiseLanUrls(host)) {
+    console.log(networkBindWarning(host, port));
+  }
+  const urls = cloudxAccessUrls(port, networkInterfaces, host);
   console.log("Cloudx update complete.");
   console.log(`  env: ${paths.envPath}`);
   console.log(`  ASR model: ${paths.modelDir}`);

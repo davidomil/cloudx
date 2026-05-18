@@ -10,6 +10,7 @@ import {
   defaultCpuThreads,
   installUbuntuPrerequisites,
   needsNodeInstall,
+  networkBindWarning,
   parseNodeMajor,
   parseOsRelease,
   renderAsrService,
@@ -17,6 +18,7 @@ import {
   renderEnvFile,
   resolveDeviceConfig,
   runInstaller,
+  shouldAdvertiseLanUrls,
   toolPathFor,
   ubuntuBootstrapPlan,
   updateEnvFileContent,
@@ -79,14 +81,26 @@ describe("install-cloudx helpers", () => {
     );
   });
 
-  it("builds local and LAN access URLs", () => {
+  it("builds local-only access URLs by default", () => {
+    expect(
+      cloudxAccessUrls(3001, {
+        lo: [{ family: "IPv4", internal: true, address: "127.0.0.1" }],
+        eth0: [{ family: "IPv4", internal: false, address: "192.168.8.249" }]
+      })
+    ).toEqual(["https://127.0.0.1:3001"]);
+  });
+
+  it("builds LAN access URLs for network-facing hosts", () => {
     expect(
       cloudxAccessUrls(3001, {
         lo: [{ family: "IPv4", internal: true, address: "127.0.0.1" }],
         eth0: [{ family: "IPv4", internal: false, address: "192.168.8.249" }],
         docker0: [{ family: "IPv4", internal: false, address: "172.17.0.1" }]
-      })
+      }, "0.0.0.0")
     ).toEqual(["https://127.0.0.1:3001", "https://192.168.8.249:3001", "https://172.17.0.1:3001"]);
+    expect(shouldAdvertiseLanUrls("127.0.0.1")).toBe(false);
+    expect(shouldAdvertiseLanUrls("::")).toBe(true);
+    expect(networkBindWarning("0.0.0.0", 3001)).toContain("Public internet unsupported");
   });
 
   it("validates CPU thread choices", () => {
@@ -176,8 +190,8 @@ describe("runInstaller dry-run", () => {
     });
 
     expect(result.installServices).toBe(false);
-    expect(result.urls).toEqual(["https://127.0.0.1:3001", "https://192.168.8.249:3001"]);
-    expect(result.envConfig).toMatchObject({ device: "cpu", computeType: "int8", cpuThreads: 6 });
+    expect(result.urls).toEqual(["https://127.0.0.1:3001"]);
+    expect(result.envConfig).toMatchObject({ host: "127.0.0.1", device: "cpu", computeType: "int8", cpuThreads: 6 });
     expect(runner.commands.map((command) => [command.command, ...command.args])).toEqual(
       expect.arrayContaining([
         ["node", "-v"],
@@ -188,6 +202,34 @@ describe("runInstaller dry-run", () => {
       ])
     );
     expect(runner.writes.some((write) => write.path === "/home/me/.config/cloudx/cloudx.env")).toBe(true);
+  });
+
+  it("uses an explicit LAN bind when requested", async () => {
+    const runner = new InstallerRunner({ dryRun: true, cwd: "/repo", log: () => undefined });
+
+    const result = await runInstaller({
+      repoRoot: "/repo",
+      home: "/home/me",
+      env: TEST_ENV,
+      dryRun: true,
+      yes: true,
+      lan: true,
+      runner,
+      osRelease: { ID: "ubuntu", VERSION_ID: "24.04", PRETTY_NAME: "Ubuntu 24.04 LTS" },
+      gpuDetected: false,
+      cudaRuntimeReady: false,
+      parallelism: 12,
+      answers: {
+        installServices: false,
+        runCodexLogin: true
+      },
+      networkInterfaces: {
+        eth0: [{ family: "IPv4", internal: false, address: "192.168.8.249" }]
+      }
+    });
+
+    expect(result.envConfig.host).toBe("0.0.0.0");
+    expect(result.urls).toEqual(["https://127.0.0.1:3001", "https://192.168.8.249:3001"]);
   });
 
   it("plans service install, linger, and verification when services start", async () => {
@@ -336,7 +378,7 @@ describe("runInstaller dry-run", () => {
 
     const planned = runner.commands.map((command) => [command.command, ...command.args]);
     expect(result).toMatchObject({ port: 3443, servicesInstalled: true, restartServices: true });
-    expect(result.urls).toEqual(["https://127.0.0.1:3443", "https://192.168.8.249:3443"]);
+    expect(result.urls).toEqual(["https://127.0.0.1:3443"]);
     const updatedEnv = runner.writes.find((write) => write.path === path.join(home, ".config/cloudx/cloudx.env"))?.contents;
     expect(updatedEnv).toContain("CLOUDX_ASSISTANT_BIN=/usr/bin/codex");
     expect(updatedEnv).toContain("CLOUDX_TOOL_PATH=/usr/bin");
