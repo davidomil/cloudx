@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
 
-import { buildCompareRefOptions, buildSearchInput, clampFileBrowserTreeSize, CompareRefPicker, compareRefListboxStyle, defaultDiffViewMode, disposeFileBrowserPanelStatesExcept, entryTransferPath, FileBrowserPanel, fileBrowserBodyClassName, fileBrowserBodyStyle, filePreviewText, fileTransferUploadPath, filterCompareRefOptions, gitAutoRefreshIntervalMilliseconds, gitDiffWorkspaceClassName, mergeGitChangesIntoEntries, parsePatch, readFileBrowserPanelState, rememberFileBrowserPanelState, resolveNextCompareRef, searchEntriesFromResult, searchResultSummary, type FileBrowserPanelState, type OpenFileResult } from "./FileBrowserPanel.js";
+import { absoluteTransferPath, buildCompareRefOptions, buildSearchInput, clampFileBrowserTreeSize, CompareRefPicker, compareRefListboxStyle, copyTextToClipboard, defaultDiffViewMode, disposeFileBrowserPanelStatesExcept, entryTransferPath, FileBrowserPanel, fileBrowserBodyClassName, fileBrowserBodyStyle, filePreviewText, fileTransferUploadPath, filterCompareRefOptions, gitAutoRefreshIntervalMilliseconds, gitDiffWorkspaceClassName, mergeGitChangesIntoEntries, normalizedPreviewKind, parsePatch, readFileBrowserPanelState, rememberFileBrowserPanelState, renderMarkdownHtml, resolveNextCompareRef, searchEntriesFromResult, searchResultSummary, toolbarClipboardPath, usesObjectUrlPreview, type FileBrowserPanelState, type OpenFileResult } from "./FileBrowserPanel.js";
 import { PathEntry } from "./PathEntry.js";
 
 afterEach(() => {
@@ -30,6 +30,18 @@ describe("filePreviewText", () => {
 
   it("falls back to path for older open file results", () => {
     expect(filePreviewText({ path: "/workspace/README.md", truncated: true, content: "partial" })).toBe("/workspace/README.md\n[truncated]\npartial");
+  });
+
+  it("detects renderable preview kinds and sanitizes markdown output", () => {
+    expect(normalizedPreviewKind({ path: "/repo/README.md", relativePath: "README.md" })).toBe("markdown");
+    expect(normalizedPreviewKind({ path: "/repo/pixel.png", previewKind: "image" })).toBe("image");
+    expect(usesObjectUrlPreview({ path: "/repo/manual.pdf", previewKind: "pdf" })).toBe(true);
+    expect(usesObjectUrlPreview({ path: "/repo/README.md", previewKind: "markdown" })).toBe(false);
+
+    const html = renderMarkdownHtml("# Title\n\n<img src=x onerror=\"alert(1)\">\n\n**bold**");
+    expect(html).toContain("<h1>Title</h1>");
+    expect(html).toContain("<strong>bold</strong>");
+    expect(html).not.toContain("onerror");
   });
 });
 
@@ -78,6 +90,17 @@ describe("file transfer path helpers", () => {
     expect(fileTransferUploadPath("", "README.md")).toBe("README.md");
     expect(fileTransferUploadPath("docs", "notes.md")).toBe("docs/notes.md");
     expect(fileTransferUploadPath("docs", "nested/notes.md")).toBe("docs/notes.md");
+  });
+
+  it("builds toolbar and context-menu clipboard paths", async () => {
+    const writes: string[] = [];
+    expect(toolbarClipboardPath("")).toBe(".");
+    expect(toolbarClipboardPath("docs/specs")).toBe("docs/specs");
+    expect(absoluteTransferPath("/repo", "docs/specs.md")).toBe("/repo/docs/specs.md");
+    expect(absoluteTransferPath("/", "docs/specs.md")).toBe("/docs/specs.md");
+
+    await copyTextToClipboard("docs/specs.md", { writeText: async (value) => { writes.push(value); } });
+    expect(writes).toEqual(["docs/specs.md"]);
   });
 });
 

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Palette, Plus, RefreshCw, Save, Trash2 } from "lucide-react";
+import { Palette, Pencil, Plus, RefreshCw, Save, Trash2, X } from "lucide-react";
 
 import {
   RULES_SKILLS_PLUGIN_ID,
@@ -69,6 +69,9 @@ export function RulesSkillsPanel({
   const [draft, setDraft] = useState(() => templateDraft(selected));
   const [draftMode, setDraftMode] = useState<"existing" | "new">("existing");
   const [newRuleText, setNewRuleText] = useState("");
+  const [editingRuleId, setEditingRuleId] = useState<string | undefined>();
+  const [editingRuleText, setEditingRuleText] = useState("");
+  const [editingRuleDescription, setEditingRuleDescription] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | undefined>();
 
@@ -178,6 +181,36 @@ export function RulesSkillsPanel({
     }
   }
 
+  function startEditingRule(rule: CloudxRule) {
+    setEditingRuleId(rule.id);
+    setEditingRuleText(rule.text);
+    setEditingRuleDescription(rule.description);
+    setError(undefined);
+  }
+
+  function cancelEditingRule() {
+    setEditingRuleId(undefined);
+    setEditingRuleText("");
+    setEditingRuleDescription("");
+  }
+
+  async function saveEditedRule(rule: CloudxRule) {
+    const edited = cloudxRuleFromEdit(rule, editingRuleText, editingRuleDescription);
+    if (!edited) {
+      return;
+    }
+    setBusy(true);
+    setError(undefined);
+    try {
+      await onSaveRule(edited);
+      cancelEditingRule();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function refreshStore() {
     if (!onRefreshStore) {
       return;
@@ -226,28 +259,61 @@ export function RulesSkillsPanel({
 
         <section className="rules-skills-picker">
           <h3>Rules</h3>
-          {store.rules.map((rule) => (
-            <label key={rule.id} className="checkbox-row rule-option" title={rule.description}>
-              <input type="checkbox" checked={draft.ruleIds.includes(rule.id)} onChange={(event) => toggleRule(rule.id, event.target.checked)} />
-              <span>{rule.text}</span>
-              <ControlButton
-                type="button"
-                className="compact-icon-button danger"
-                tone="danger"
-                size="compact"
-                iconOnly
-                onClick={(event) => {
-                  event.preventDefault();
-                  event.stopPropagation();
-                  void onDeleteRule(rule.id);
-                }}
-                title={`Delete rule ${rule.id}`}
-                aria-label={`Delete rule ${rule.id}`}
-              >
-                <Trash2 size={13} />
-              </ControlButton>
-            </label>
-          ))}
+          {store.rules.map((rule) =>
+            editingRuleId === rule.id ? (
+              <div key={rule.id} className="rule-option rule-option-editing" title={rule.description}>
+                <input type="checkbox" checked={draft.ruleIds.includes(rule.id)} onChange={(event) => toggleRule(rule.id, event.target.checked)} aria-label={`Enable rule ${rule.id}`} />
+                <div className="rule-edit-fields">
+                  <textarea value={editingRuleText} onChange={(event) => setEditingRuleText(event.target.value)} aria-label={`Rule text for ${rule.id}`} rows={3} />
+                  <input value={editingRuleDescription} onChange={(event) => setEditingRuleDescription(event.target.value)} aria-label={`Rule description for ${rule.id}`} placeholder="Description" />
+                </div>
+                <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void saveEditedRule(rule)} disabled={busy || !editingRuleText.trim()} title={`Save rule ${rule.id}`} aria-label={`Save rule ${rule.id}`}>
+                  <Save size={13} />
+                </ControlButton>
+                <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={cancelEditingRule} disabled={busy} title={`Cancel editing ${rule.id}`} aria-label={`Cancel editing ${rule.id}`}>
+                  <X size={13} />
+                </ControlButton>
+              </div>
+            ) : (
+              <label key={rule.id} className="checkbox-row rule-option" title={rule.description}>
+                <input type="checkbox" checked={draft.ruleIds.includes(rule.id)} onChange={(event) => toggleRule(rule.id, event.target.checked)} />
+                <span>{rule.text}</span>
+                <span className="rule-option-actions">
+                  <ControlButton
+                    type="button"
+                    className="compact-icon-button"
+                    size="compact"
+                    iconOnly
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      startEditingRule(rule);
+                    }}
+                    title={`Edit rule ${rule.id}`}
+                    aria-label={`Edit rule ${rule.id}`}
+                  >
+                    <Pencil size={13} />
+                  </ControlButton>
+                  <ControlButton
+                    type="button"
+                    className="compact-icon-button danger"
+                    tone="danger"
+                    size="compact"
+                    iconOnly
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      void onDeleteRule(rule.id);
+                    }}
+                    title={`Delete rule ${rule.id}`}
+                    aria-label={`Delete rule ${rule.id}`}
+                  >
+                    <Trash2 size={13} />
+                  </ControlButton>
+                </span>
+              </label>
+            )
+          )}
           <div className="rules-skills-inline-create">
             <input value={newRuleText} onChange={(event) => setNewRuleText(event.target.value)} placeholder="Add short rule sentence" />
             <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void addRule()} disabled={busy || !newRuleText.trim()} title="Add rule" aria-label="Add rule">
@@ -331,6 +397,18 @@ export function draftWithRuleEnabled(draft: TemplateDraft, ruleId: string): Temp
 export function cloudxRuleFromText(value: string): CloudxRule | undefined {
   const text = value.trim();
   return text ? { id: slugFromText(text), description: text, text } : undefined;
+}
+
+export function cloudxRuleFromEdit(rule: CloudxRule, textValue: string, descriptionValue: string): CloudxRule | undefined {
+  const text = textValue.trim();
+  if (!text) {
+    return undefined;
+  }
+  const previousText = rule.text.trim();
+  const previousDescription = rule.description.trim();
+  const descriptionDraft = descriptionValue.trim();
+  const description = !descriptionDraft || (descriptionDraft === previousDescription && previousDescription === previousText) ? text : descriptionDraft;
+  return { id: rule.id, description, text };
 }
 
 function slugFromText(text: string): string {

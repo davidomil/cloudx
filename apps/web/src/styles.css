@@ -1431,6 +1431,28 @@ a:hover svg {
   grid-template-columns: auto minmax(0, 1fr) auto;
 }
 
+.rules-skills-panel .rule-option-editing {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  gap: 8px;
+}
+
+.rule-option-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.rule-edit-fields {
+  min-width: 0;
+  display: grid;
+  gap: 7px;
+}
+
+.rule-edit-fields textarea {
+  min-height: 72px;
+}
+
 .rules-skills-panel .skill-option {
   grid-template-columns: auto minmax(0, 1fr);
 }
@@ -1592,6 +1614,16 @@ a:hover svg {
   text-overflow: ellipsis;
   text-transform: uppercase;
   white-space: nowrap;
+}
+
+.file-browser-toolbar .file-browser-path {
+  cursor: copy;
+}
+
+.file-browser-toolbar .file-browser-path:hover,
+.file-browser-toolbar .file-browser-path:focus-visible {
+  color: var(--color-accent);
+  outline: none;
 }
 
 .git-bar {
@@ -1775,8 +1807,12 @@ a:hover svg {
   text-overflow: ellipsis;
 }
 
+.git-change-count {
+  flex: 0 0 auto;
+}
+
 .git-bar-end-toggle {
-  flex: none;
+  flex: 0 0 auto;
   margin-left: auto;
 }
 
@@ -2094,6 +2130,89 @@ a:hover svg {
 .file-preview pre {
   margin: 0;
   white-space: pre-wrap;
+}
+
+.file-preview-rendered {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 12px;
+  white-space: normal;
+}
+
+.file-preview-heading {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--color-muted-foreground);
+  font-family: var(--font-label);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.file-preview-heading span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-preview-heading small {
+  color: var(--color-warning);
+}
+
+.file-preview-media {
+  place-items: stretch;
+}
+
+.file-preview-image {
+  max-width: 100%;
+  max-height: 100%;
+  align-self: center;
+  justify-self: center;
+  object-fit: contain;
+}
+
+.file-preview-pdf {
+  width: 100%;
+  height: 100%;
+  min-height: 420px;
+  border: 1px solid var(--color-border);
+  background: var(--color-background);
+}
+
+.file-preview-status {
+  display: grid;
+  place-items: center;
+  color: var(--color-muted-foreground);
+  font-family: var(--font-label);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.file-preview-markdown .markdown-body {
+  min-width: 0;
+  overflow: auto;
+  color: var(--color-foreground);
+  font: 14px/1.6 var(--font-body);
+}
+
+.file-preview-markdown .markdown-body > :first-child {
+  margin-top: 0;
+}
+
+.file-preview-markdown .markdown-body > :last-child {
+  margin-bottom: 0;
+}
+
+.file-preview-markdown .markdown-body pre {
+  padding: 10px;
+  overflow: auto;
+  background: rgb(255 255 255 / 0.05);
+  border: 1px solid var(--color-border);
 }
 
 .git-diff-workspace {

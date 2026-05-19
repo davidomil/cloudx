@@ -25,10 +25,19 @@ interface DirectoryVoiceState {
 interface OpenFileVoiceState {
   path: string;
   relativePath: string;
+  previewKind: FilePreviewKind;
+  mimeType: string;
   contentPreview: string;
   truncated: boolean;
   sizeBytes: number;
   updatedAt: string;
+}
+
+export type FilePreviewKind = "text" | "markdown" | "image" | "pdf";
+
+export interface FilePreviewMetadata {
+  previewKind: FilePreviewKind;
+  mimeType: string;
 }
 
 interface GitVoiceState {
@@ -91,7 +100,7 @@ export class FileBrowserPlugin implements WorkspacePlugin {
     },
     {
       name: "open_file",
-      description: "Open a text file below the tab working directory and expose a preview in voiceContext.openFile.",
+      description: "Open a file below the tab working directory and expose preview metadata in voiceContext.openFile. Text and Markdown files include text content; images and PDFs include renderable metadata for the web UI.",
       voiceExposed: true,
       inputSchema: {
         type: "object",
@@ -321,7 +330,7 @@ class FileBrowserSession implements PluginSession {
       };
     }
     if (action === "open_file") {
-      const result = await this.openTextFile(requireString(input.relativePath, "relativePath"));
+      const result = await this.openFilePreview(requireString(input.relativePath, "relativePath"));
       return result;
     }
     if (action === "search_files") {
@@ -352,7 +361,7 @@ class FileBrowserSession implements PluginSession {
       }
       const nextContent = content.replace(oldText, newText);
       await fs.writeFile(filePath, nextContent, "utf8");
-      this.setOpenFile(filePath, relativePath, nextContent, Buffer.byteLength(nextContent, "utf8"), false);
+      this.setOpenFile(filePath, relativePath, filePreviewMetadataForPath(filePath), nextContent, Buffer.byteLength(nextContent, "utf8"), false);
       return {
         path: filePath,
         relativePath,
@@ -370,7 +379,7 @@ class FileBrowserSession implements PluginSession {
         await fs.mkdir(path.dirname(filePath), { recursive: true });
       }
       await fs.writeFile(filePath, content, "utf8");
-      this.setOpenFile(filePath, relativePath, content, Buffer.byteLength(content, "utf8"), false);
+      this.setOpenFile(filePath, relativePath, filePreviewMetadataForPath(filePath), content, Buffer.byteLength(content, "utf8"), false);
       return {
         path: filePath,
         relativePath,
@@ -437,9 +446,15 @@ class FileBrowserSession implements PluginSession {
     return relative ? relative.split(path.sep).join("/") : ".";
   }
 
-  private async openTextFile(relativePath: string): Promise<Record<string, unknown>> {
+  private async openFilePreview(relativePath: string): Promise<Record<string, unknown>> {
     const filePath = this.resolveUnderCwd(relativePath);
     const stat = await this.requireFile(filePath);
+    const metadata = filePreviewMetadataForPath(filePath);
+    if (metadata.previewKind === "image" || metadata.previewKind === "pdf") {
+      const content = `${metadata.previewKind.toUpperCase()} preview: ${metadata.mimeType}, ${stat.size} bytes.`;
+      this.setOpenFile(filePath, relativePath, metadata, content, stat.size, false);
+      return { path: filePath, relativePath, truncated: false, content: "", sizeBytes: stat.size, ...metadata };
+    }
     const handle = await fs.open(filePath, "r");
     try {
       const length = Math.min(stat.size, MAX_FILE_BYTES);
@@ -447,8 +462,8 @@ class FileBrowserSession implements PluginSession {
       await handle.read(buffer, 0, length, 0);
       const content = buffer.toString("utf8");
       const truncated = stat.size > MAX_FILE_BYTES;
-      this.setOpenFile(filePath, relativePath, content, stat.size, truncated);
-      return { path: filePath, relativePath, truncated, content };
+      this.setOpenFile(filePath, relativePath, metadata, content, stat.size, truncated);
+      return { path: filePath, relativePath, truncated, content, sizeBytes: stat.size, ...metadata };
     } finally {
       await handle.close();
     }
@@ -480,11 +495,13 @@ class FileBrowserSession implements PluginSession {
     }
   }
 
-  private setOpenFile(filePath: string, relativePath: string, content: string, sizeBytes: number, truncated: boolean): void {
+  private setOpenFile(filePath: string, relativePath: string, metadata: FilePreviewMetadata, content: string, sizeBytes: number, truncated: boolean): void {
     const previewTruncated = truncated || Buffer.byteLength(content, "utf8") > VOICE_PREVIEW_BYTES;
     this.openFile = {
       path: filePath,
       relativePath,
+      previewKind: metadata.previewKind,
+      mimeType: metadata.mimeType,
       contentPreview: content.slice(0, VOICE_PREVIEW_BYTES),
       truncated: previewTruncated,
       sizeBytes,
@@ -599,5 +616,46 @@ function countOccurrences(content: string, needle: string): number {
     }
     count += 1;
     index = nextIndex + needle.length;
+  }
+}
+
+export function filePreviewMetadataForPath(filePath: string): FilePreviewMetadata {
+  const extension = path.extname(filePath).toLowerCase();
+  if (extension === ".md" || extension === ".markdown" || extension === ".mdown" || extension === ".mkd") {
+    return { previewKind: "markdown", mimeType: "text/markdown; charset=utf-8" };
+  }
+  const imageMimeType = imageMimeTypeForExtension(extension);
+  if (imageMimeType) {
+    return { previewKind: "image", mimeType: imageMimeType };
+  }
+  if (extension === ".pdf") {
+    return { previewKind: "pdf", mimeType: "application/pdf" };
+  }
+  return { previewKind: "text", mimeType: "text/plain; charset=utf-8" };
+}
+
+function imageMimeTypeForExtension(extension: string): string | undefined {
+  switch (extension) {
+    case ".apng":
+      return "image/apng";
+    case ".avif":
+      return "image/avif";
+    case ".bmp":
+      return "image/bmp";
+    case ".gif":
+      return "image/gif";
+    case ".ico":
+      return "image/x-icon";
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".png":
+      return "image/png";
+    case ".svg":
+      return "image/svg+xml";
+    case ".webp":
+      return "image/webp";
+    default:
+      return undefined;
   }
 }
