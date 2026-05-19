@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import type { FileSearchResult, WorkspaceTab } from "@cloudx/shared";
 
 import { PathPolicy } from "../pathPolicy.js";
-import { FileBrowserPlugin } from "./FileBrowserPlugin.js";
+import { FileBrowserPlugin, filePreviewMetadataForPath } from "./FileBrowserPlugin.js";
 
 describe("FileBrowserPlugin", () => {
   it("exposes Git auto-refresh settings", () => {
@@ -46,6 +46,7 @@ describe("FileBrowserPlugin", () => {
 
     expect(JSON.stringify(listing)).toContain("README.md");
     expect(opened.content).toBe("hello");
+    expect(opened).toMatchObject({ previewKind: "markdown", mimeType: "text/markdown; charset=utf-8", sizeBytes: 5 });
     expect(context).toMatchObject({
       kind: "file-browser",
       cwd: root,
@@ -54,6 +55,56 @@ describe("FileBrowserPlugin", () => {
     });
     expect(context.visibleText).toContain("Directory .");
     expect(context.visibleText).toContain("Open file README.md");
+  });
+
+  it("opens image and PDF files as renderable preview metadata without decoding binary content", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-files-"));
+    await fs.writeFile(path.join(root, "pixel.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    await fs.writeFile(path.join(root, "manual.pdf"), Buffer.from("%PDF-1.7\n"));
+    const tab: WorkspaceTab = {
+      id: "tab-1",
+      pluginId: "file-browser",
+      title: "Files",
+      cwd: root,
+      status: "running",
+      indicator: { color: "green", label: "OK", updatedAt: new Date(0).toISOString() },
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString()
+    };
+    const session = new FileBrowserPlugin(new PathPolicy([root])).createSession({
+      tab,
+      cwd: root,
+      controls: { setTabIndicator: () => undefined, closeTab: () => undefined }
+    });
+
+    await expect(session.handleAction("open_file", { relativePath: "pixel.png" })).resolves.toMatchObject({
+      relativePath: "pixel.png",
+      previewKind: "image",
+      mimeType: "image/png",
+      content: "",
+      truncated: false,
+      sizeBytes: 4
+    });
+    await expect(session.handleAction("open_file", { relativePath: "manual.pdf" })).resolves.toMatchObject({
+      relativePath: "manual.pdf",
+      previewKind: "pdf",
+      mimeType: "application/pdf",
+      content: "",
+      truncated: false
+    });
+    expect((await session.voiceContext()).openFile).toMatchObject({
+      relativePath: "manual.pdf",
+      previewKind: "pdf",
+      mimeType: "application/pdf",
+      contentPreview: "PDF preview: application/pdf, 9 bytes."
+    });
+  });
+
+  it("classifies preview metadata from file extensions", () => {
+    expect(filePreviewMetadataForPath("/repo/docs/README.markdown")).toEqual({ previewKind: "markdown", mimeType: "text/markdown; charset=utf-8" });
+    expect(filePreviewMetadataForPath("/repo/public/photo.webp")).toEqual({ previewKind: "image", mimeType: "image/webp" });
+    expect(filePreviewMetadataForPath("/repo/public/spec.pdf")).toEqual({ previewKind: "pdf", mimeType: "application/pdf" });
+    expect(filePreviewMetadataForPath("/repo/src/App.tsx")).toEqual({ previewKind: "text", mimeType: "text/plain; charset=utf-8" });
   });
 
   it("edits files through voice-exposed file actions", async () => {

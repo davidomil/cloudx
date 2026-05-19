@@ -318,6 +318,7 @@ describe("CodexTerminalPlugin", () => {
     expect(factory.process!.written).toContain("\u001b[200~CloudX rules/skills update");
     expect(factory.process!.written).toContain("Be specific about changed files.");
     expect(factory.process!.written).toContain("$tester: Tester - Tester skill.");
+    expect(factory.process!.written).toContain("prefer using the listed CloudX skills whenever they fit the user's task");
     expect(factory.process!.written).toContain(path.join(dataDir, "rules-skills", "skills", "tester", "SKILL.md"));
     expect(factory.process!.written).toContain("$create-cloudx-skill");
     expect(factory.process!.written.endsWith("\u001b[201~\r")).toBe(true);

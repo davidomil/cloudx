@@ -1,8 +1,10 @@
 import { useEffect, useId, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { createPortal } from "react-dom";
+import DOMPurify from "dompurify";
+import { marked } from "marked";
 import { Diff, Hunk, parseDiff, type DiffType, type FileData, type HunkData, type ViewType } from "react-diff-view";
 import "react-diff-view/style/index.css";
-import { AlignJustify, Check, ChevronDown, Download, FileDiff, FileText, Folder, GitBranch, GitCompareArrows, GitFork, GitPullRequest, RefreshCw, Search, Upload, X } from "lucide-react";
+import { AlignJustify, Check, ChevronDown, Copy, Download, FileDiff, FileText, Folder, GitBranch, GitCompareArrows, GitFork, GitPullRequest, Image as ImageIcon, RefreshCw, Search, Upload, X } from "lucide-react";
 
 import type { ConfigValue, FileSearchFileResult, FileSearchMode, FileSearchResult, GitDiffFile, GitDiffFileSummary, GitDiffSummary, GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
 
@@ -32,7 +34,12 @@ export interface OpenFileResult {
   relativePath?: string;
   truncated: boolean;
   content: string;
+  previewKind?: FilePreviewKind;
+  mimeType?: string;
+  sizeBytes?: number;
 }
+
+type FilePreviewKind = "text" | "markdown" | "image" | "pdf";
 
 type GitBusyAction = "state" | "diff" | "file" | "initialize" | "clone" | "origin";
 type SearchBusyAction = "search";
@@ -132,6 +139,8 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   const [transferBusyAction, setTransferBusyAction] = useState<FileTransferBusyAction | undefined>();
   const [uploadTargetPath, setUploadTargetPath] = useState<string | undefined>();
   const [contextMenu, setContextMenu] = useState<FileContextMenuState | undefined>();
+  const [previewObjectUrl, setPreviewObjectUrl] = useState<string | undefined>();
+  const [previewLoading, setPreviewLoading] = useState(false);
   const [treeVisible, setTreeVisible] = useState(() => initialState?.treeVisible ?? true);
   const [searchVisible, setSearchVisible] = useState(() => initialState?.searchVisible ?? false);
   const [gitBarVisible, setGitBarVisible] = useState(() => initialState?.gitBarVisible ?? true);
@@ -277,6 +286,45 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
       document.removeEventListener("keydown", closeOnEscape);
     };
   }, [contextMenu]);
+
+  useEffect(() => {
+    let active = true;
+    let objectUrl: string | undefined;
+    const transferPath = opened ? openFileTransferPath(opened) : undefined;
+    if (!opened || !transferPath || !usesObjectUrlPreview(opened)) {
+      setPreviewObjectUrl(undefined);
+      setPreviewLoading(false);
+      return;
+    }
+    setPreviewObjectUrl(undefined);
+    setPreviewLoading(true);
+    setError(undefined);
+    void downloadFileBrowserEntries(tab.id, [transferPath])
+      .then((download) => {
+        if (!active) {
+          return;
+        }
+        const typedBlob = opened.mimeType ? new Blob([download.blob], { type: opened.mimeType }) : download.blob;
+        objectUrl = URL.createObjectURL(typedBlob);
+        setPreviewObjectUrl(objectUrl);
+      })
+      .catch((err) => {
+        if (active) {
+          setError(err instanceof Error ? err.message : String(err));
+        }
+      })
+      .finally(() => {
+        if (active) {
+          setPreviewLoading(false);
+        }
+      });
+    return () => {
+      active = false;
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+      }
+    };
+  }, [tab.id, opened?.path, opened?.relativePath, opened?.previewKind, opened?.mimeType]);
 
   async function loadDirectory(path: string, options: { preserveOpened?: boolean } = {}) {
     setError(undefined);
@@ -541,6 +589,15 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     uploadInputRef.current?.click();
   }
 
+  async function copyPathToClipboard(value: string) {
+    setError(undefined);
+    try {
+      await copyTextToClipboard(value);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   function openFileContextMenu(event: ReactMouseEvent<HTMLDivElement>, entry: DisplayDirectoryEntry, transferPath: string) {
     if (entry.virtual) {
       return;
@@ -562,7 +619,22 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     <div className="file-browser-panel">
       <div className="file-browser-toolbar">
         <ControlButton onClick={() => void loadDirectory(parentPath(relativePath))}>..</ControlButton>
-        <span>{relativePath || "."}</span>
+        <span
+          className="file-browser-path"
+          role="button"
+          tabIndex={0}
+          title="Copy current folder path"
+          aria-label="Copy current folder path"
+          onClick={() => void copyPathToClipboard(toolbarClipboardPath(relativePath))}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              void copyPathToClipboard(toolbarClipboardPath(relativePath));
+            }
+          }}
+        >
+          {relativePath || "."}
+        </span>
         <ControlButton iconOnly onClick={() => void loadDirectory(relativePath)} title="Refresh">
           <RefreshCw size={15} />
         </ControlButton>
@@ -684,7 +756,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
         ) : null}
         <div className="file-preview">
           {opened ? (
-            <pre>{filePreviewText(opened)}</pre>
+            <FilePreview opened={opened} objectUrl={previewObjectUrl} loading={previewLoading} />
           ) : searchResult ? (
             <SearchResults result={searchResult} busy={Boolean(searchBusyAction)} onOpenFile={(filePath) => void openFilePath(filePath)} />
           ) : showGitDiff && gitState?.isRepository ? (
@@ -708,6 +780,30 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
           >
             <Download size={14} />
             <span>Download</span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              const transferPath = contextMenu.transferPath;
+              setContextMenu(undefined);
+              void copyPathToClipboard(transferPath);
+            }}
+          >
+            <Copy size={14} />
+            <span>Copy relative path</span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              const transferPath = contextMenu.transferPath;
+              setContextMenu(undefined);
+              void copyPathToClipboard(absoluteTransferPath(tab.cwd, transferPath));
+            }}
+          >
+            <Copy size={14} />
+            <span>Copy absolute path</span>
           </button>
           {contextMenu.entry.type === "directory" ? (
             <button type="button" role="menuitem" disabled={transferBusyAction === "upload"} onClick={() => startUploadToFolder(contextMenu.transferPath)}>
@@ -1240,6 +1336,51 @@ function OriginForm({ originUrl, busy, compact, onSetOrigin, onSetOriginUrl }: {
   );
 }
 
+function FilePreview({ opened, objectUrl, loading }: { opened: OpenFileResult; objectUrl?: string; loading: boolean }) {
+  const displayPath = opened.relativePath ?? opened.path;
+  const kind = normalizedPreviewKind(opened);
+  const markdownHtml = useMemo(() => (kind === "markdown" ? renderMarkdownHtml(opened.content) : ""), [kind, opened.content]);
+
+  if (kind === "image") {
+    return (
+      <div className="file-preview-rendered file-preview-media">
+        <div className="file-preview-heading">
+          <ImageIcon size={16} />
+          <span>{displayPath}</span>
+        </div>
+        {loading ? <div className="file-preview-status">Loading image...</div> : objectUrl ? <img className="file-preview-image" src={objectUrl} alt={displayPath} /> : <div className="file-preview-status">Image preview is unavailable.</div>}
+      </div>
+    );
+  }
+
+  if (kind === "pdf") {
+    return (
+      <div className="file-preview-rendered file-preview-media">
+        <div className="file-preview-heading">
+          <FileText size={16} />
+          <span>{displayPath}</span>
+        </div>
+        {loading ? <div className="file-preview-status">Loading PDF...</div> : objectUrl ? <object className="file-preview-pdf" data={objectUrl} type="application/pdf" aria-label={displayPath} /> : <div className="file-preview-status">PDF preview is unavailable.</div>}
+      </div>
+    );
+  }
+
+  if (kind === "markdown") {
+    return (
+      <div className="file-preview-rendered file-preview-markdown">
+        <div className="file-preview-heading">
+          <FileText size={16} />
+          <span>{displayPath}</span>
+          {opened.truncated ? <small>truncated</small> : null}
+        </div>
+        <div className="markdown-body" dangerouslySetInnerHTML={{ __html: markdownHtml }} />
+      </div>
+    );
+  }
+
+  return <pre>{filePreviewText(opened)}</pre>;
+}
+
 function SearchResults({ result, busy, onOpenFile }: { result: FileSearchResult; busy: boolean; onOpenFile: (filePath: string) => void }) {
   if (!result.files.length) {
     return (
@@ -1482,8 +1623,60 @@ export function filePreviewText(opened: OpenFileResult | undefined): string {
   return `${displayPath}${opened.truncated ? "\n[truncated]\n" : "\n\n"}${opened.content}`;
 }
 
+export function normalizedPreviewKind(opened: Pick<OpenFileResult, "previewKind" | "relativePath" | "path">): FilePreviewKind {
+  if (opened.previewKind) {
+    return opened.previewKind;
+  }
+  const name = (opened.relativePath ?? opened.path).toLowerCase();
+  if (/\.(md|markdown|mdown|mkd)$/.test(name)) {
+    return "markdown";
+  }
+  return "text";
+}
+
+export function usesObjectUrlPreview(opened: Pick<OpenFileResult, "previewKind" | "relativePath" | "path">): boolean {
+  const kind = normalizedPreviewKind(opened);
+  return kind === "image" || kind === "pdf";
+}
+
+export function renderMarkdownHtml(content: string): string {
+  const rawHtml = marked.parse(content, { async: false }) as string;
+  return DOMPurify.sanitize(rawHtml);
+}
+
+export function toolbarClipboardPath(relativePath: string): string {
+  return normalizeTransferPath(relativePath || ".");
+}
+
+export function absoluteTransferPath(cwd: string, transferPath: string): string {
+  const normalized = normalizeTransferPath(transferPath);
+  const base = cwd.replace(/[\\/]+$/u, "") || "/";
+  if (normalized === ".") {
+    return base;
+  }
+  return `${base === "/" ? "" : base}/${normalized}`;
+}
+
+export interface ClipboardWriter {
+  writeText(text: string): Promise<void>;
+}
+
+export async function copyTextToClipboard(text: string, clipboard: ClipboardWriter | undefined = typeof navigator === "undefined" ? undefined : navigator.clipboard): Promise<void> {
+  if (!clipboard?.writeText) {
+    throw new Error("Clipboard API is not available in this browser context.");
+  }
+  await clipboard.writeText(text);
+}
+
 export function entryTransferPath(entry: { name: string; searchPath?: string }, currentRelativePath: string): string {
   return normalizeTransferPath(entry.searchPath ?? (currentRelativePath ? `${currentRelativePath}/${entry.name}` : entry.name));
+}
+
+function openFileTransferPath(opened: OpenFileResult): string | undefined {
+  if (opened.relativePath) {
+    return normalizeTransferPath(opened.relativePath);
+  }
+  return undefined;
 }
 
 export function fileTransferUploadPath(currentRelativePath: string, filename: string): string {
