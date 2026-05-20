@@ -2,6 +2,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 import {
   RULES_SKILLS_PLUGIN_ID,
@@ -484,7 +485,7 @@ function formatRule(rule: CloudxRule): string {
 
 async function writeSkillFile(skillDir: string, skill: CloudxSkill): Promise<void> {
   await fsp.mkdir(skillDir, { recursive: true });
-  await fsp.writeFile(path.join(skillDir, "SKILL.md"), formatSkill(skill), "utf8");
+  await writeUtf8FileIfChanged(path.join(skillDir, "SKILL.md"), formatSkill(skill));
 }
 
 function formatSkill(skill: CloudxSkill): string {
@@ -503,6 +504,54 @@ function formatSkill(skill: CloudxSkill): string {
 
 function stripSkillFrontmatter(content: string): string {
   return parseMarkdownWithFrontmatter(content).body || content;
+}
+
+async function writeUtf8FileIfChanged(filePath: string, content: string): Promise<void> {
+  try {
+    if ((await fsp.readFile(filePath, "utf8")) === content) {
+      return;
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+  }
+  await writeUtf8FileAtomic(filePath, content);
+}
+
+async function writeUtf8FileAtomic(filePath: string, content: string): Promise<void> {
+  const targetPath = await resolveWritableFilePath(filePath);
+  const targetDir = path.dirname(targetPath);
+  const tempPath = path.join(targetDir, `.${path.basename(targetPath)}.${process.pid}.${randomUUID()}.tmp`);
+  let mode: number | undefined;
+  try {
+    mode = (await fsp.stat(targetPath)).mode;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+  }
+  try {
+    await fsp.writeFile(tempPath, content, "utf8");
+    if (mode !== undefined) {
+      await fsp.chmod(tempPath, mode);
+    }
+    await fsp.rename(tempPath, targetPath);
+  } catch (error) {
+    await fsp.rm(tempPath, { force: true });
+    throw error;
+  }
+}
+
+async function resolveWritableFilePath(filePath: string): Promise<string> {
+  try {
+    return (await fsp.lstat(filePath)).isSymbolicLink() ? await fsp.realpath(filePath) : filePath;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return filePath;
+    }
+    throw error;
+  }
 }
 
 function frontmatterString(value: string): string {

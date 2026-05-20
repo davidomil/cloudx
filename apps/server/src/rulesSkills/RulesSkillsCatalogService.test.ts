@@ -49,6 +49,20 @@ describe("RulesSkillsCatalogService", () => {
     });
   });
 
+  it("does not rewrite unchanged system skill files during catalog refresh", async () => {
+    const service = await createService();
+    await service.list();
+    const systemSkillFile = path.join(service.catalogRoot(), "system-skills", "create-cloudx-skill", "SKILL.md");
+    const oldTime = new Date("2001-01-01T00:00:00.000Z");
+    await fs.utimes(systemSkillFile, oldTime, oldTime);
+    const before = await fs.stat(systemSkillFile);
+
+    await service.list();
+
+    const after = await fs.stat(systemSkillFile);
+    expect(after.mtimeMs).toBe(before.mtimeMs);
+  });
+
   it("does not reattach a deleted default rule when recreating the last template", async () => {
     const service = await createService();
     await service.deleteRule("keep-changes-focused");
