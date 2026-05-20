@@ -1,14 +1,28 @@
 import { useEffect, useId, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { createPortal } from "react-dom";
 import DOMPurify from "dompurify";
-import { marked } from "marked";
+import hljs from "highlight.js/lib/core";
+import bash from "highlight.js/lib/languages/bash";
+import css from "highlight.js/lib/languages/css";
+import diff from "highlight.js/lib/languages/diff";
+import go from "highlight.js/lib/languages/go";
+import javascript from "highlight.js/lib/languages/javascript";
+import json from "highlight.js/lib/languages/json";
+import markdown from "highlight.js/lib/languages/markdown";
+import python from "highlight.js/lib/languages/python";
+import rust from "highlight.js/lib/languages/rust";
+import sql from "highlight.js/lib/languages/sql";
+import typescript from "highlight.js/lib/languages/typescript";
+import xml from "highlight.js/lib/languages/xml";
+import yaml from "highlight.js/lib/languages/yaml";
+import { marked, type Tokens } from "marked";
 import { Diff, Hunk, parseDiff, type DiffType, type FileData, type HunkData, type ViewType } from "react-diff-view";
 import "react-diff-view/style/index.css";
-import { AlignJustify, Check, ChevronDown, Copy, Download, FileDiff, FileText, Folder, GitBranch, GitCompareArrows, GitFork, GitPullRequest, Image as ImageIcon, RefreshCw, Search, Upload, X } from "lucide-react";
+import { AlignJustify, ArchiveRestore, Check, ChevronDown, Copy, Download, FileCode, FileDiff, FileText, Folder, GitBranch, GitCompareArrows, GitFork, GitPullRequest, Image as ImageIcon, RefreshCw, Search, Upload, X } from "lucide-react";
 
 import type { ConfigValue, FileSearchFileResult, FileSearchMode, FileSearchResult, GitDiffFile, GitDiffFileSummary, GitDiffSummary, GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
 
-import { downloadFileBrowserEntries, runTabAction, saveBlobDownload, uploadFileBrowserFile } from "../api.js";
+import { downloadFileBrowserEntries, fileBrowserRawFileUrl, runTabAction, saveBlobDownload, uploadFileBrowserFile } from "../api.js";
 import { ControlButton, SegmentedControl } from "./Control.js";
 import { noSystemTextAssistProps } from "./inputAssist.js";
 
@@ -43,13 +57,30 @@ type FilePreviewKind = "text" | "markdown" | "image" | "pdf";
 
 type GitBusyAction = "state" | "diff" | "file" | "initialize" | "clone" | "origin";
 type SearchBusyAction = "search";
-type FileTransferBusyAction = "download" | "upload";
+type FileTransferBusyAction = "download" | "upload" | "extract";
+type ArchiveExtractionDestination = "here" | "folder";
 export type DiffViewMode = Extract<ViewType, "split" | "unified">;
+export type MarkdownPreviewMode = "rendered" | "source";
 const DEFAULT_GIT_AUTO_REFRESH_SECONDS = 15;
 const DEFAULT_FILE_TREE_SIZE = 280;
 const MIN_FILE_TREE_SIZE = 160;
 const FILE_TREE_RESIZE_STEP = 24;
 const GIT_COMPARE_REF_OPTION_LIMIT = 12;
+const HIGHLIGHT_AUTO_LANGUAGES = ["typescript", "javascript", "json", "xml", "css", "markdown", "bash", "python", "yaml", "diff", "sql", "go", "rust"];
+
+hljs.registerLanguage("bash", bash);
+hljs.registerLanguage("css", css);
+hljs.registerLanguage("diff", diff);
+hljs.registerLanguage("go", go);
+hljs.registerLanguage("javascript", javascript);
+hljs.registerLanguage("json", json);
+hljs.registerLanguage("markdown", markdown);
+hljs.registerLanguage("python", python);
+hljs.registerLanguage("rust", rust);
+hljs.registerLanguage("sql", sql);
+hljs.registerLanguage("typescript", typescript);
+hljs.registerLanguage("xml", xml);
+hljs.registerLanguage("yaml", yaml);
 
 export interface FileBrowserPanelState {
   relativePath: string;
@@ -71,6 +102,7 @@ export interface FileBrowserPanelState {
   searchVisible: boolean;
   gitBarVisible: boolean;
   gitDiffFilesVisible: boolean;
+  markdownPreviewMode: MarkdownPreviewMode;
   fileTreeSize: number;
 }
 
@@ -115,6 +147,14 @@ interface FileContextMenuState {
   y: number;
 }
 
+interface UploadProgressState {
+  completedFiles: number;
+  totalFiles: number;
+  uploadedBytes: number;
+  totalBytes: number;
+  activePath?: string;
+}
+
 export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; config?: Record<string, ConfigValue> }) {
   const [initialState] = useState(() => readFileBrowserPanelState(tab));
   const [relativePath, setRelativePath] = useState(() => initialState?.relativePath ?? "");
@@ -145,8 +185,10 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   const [searchVisible, setSearchVisible] = useState(() => initialState?.searchVisible ?? false);
   const [gitBarVisible, setGitBarVisible] = useState(() => initialState?.gitBarVisible ?? true);
   const [gitDiffFilesVisible, setGitDiffFilesVisible] = useState(() => initialState?.gitDiffFilesVisible ?? true);
+  const [markdownPreviewMode, setMarkdownPreviewMode] = useState<MarkdownPreviewMode>(() => initialState?.markdownPreviewMode ?? "rendered");
   const [fileTreeSize, setFileTreeSize] = useState(() => initialState?.fileTreeSize ?? DEFAULT_FILE_TREE_SIZE);
   const [fileTreeResizing, setFileTreeResizing] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<UploadProgressState | undefined>();
   const [error, setError] = useState<string | undefined>();
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
@@ -194,9 +236,10 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
       searchVisible,
       gitBarVisible,
       gitDiffFilesVisible,
+      markdownPreviewMode,
       fileTreeSize
     });
-  }, [tab.id, tab.cwd, relativePath, entries, opened, gitState, compareRef, diffSummary, openedDiff, diffViewMode, cloneUrl, originUrl, searchQuery, searchMode, searchGlob, searchResult, searchExpanded, treeVisible, searchVisible, gitBarVisible, gitDiffFilesVisible, fileTreeSize]);
+  }, [tab.id, tab.cwd, relativePath, entries, opened, gitState, compareRef, diffSummary, openedDiff, diffViewMode, cloneUrl, originUrl, searchQuery, searchMode, searchGlob, searchResult, searchExpanded, treeVisible, searchVisible, gitBarVisible, gitDiffFilesVisible, markdownPreviewMode, fileTreeSize]);
 
   useEffect(() => {
     if (!showGitDiff || !gitAutoRefresh || gitAutoRefreshIntervalMs === undefined) {
@@ -531,7 +574,21 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     }
   }
 
-  async function uploadFiles(files: FileList | null) {
+  async function extractArchive(transferPath: string, destination: ArchiveExtractionDestination) {
+    setTransferBusyAction("extract");
+    setError(undefined);
+    setContextMenu(undefined);
+    try {
+      await runTabAction(tab.id, "extract_archive", { relativePath: transferPath, destination });
+      await loadDirectory(relativePath, { preserveOpened: true });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTransferBusyAction(undefined);
+    }
+  }
+
+  async function uploadFiles(files: FileList | null, options: { preserveDirectoryPath?: boolean } = {}) {
     const selectedFiles = Array.from(files ?? []);
     if (!selectedFiles.length) {
       return;
@@ -539,9 +596,46 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     setTransferBusyAction("upload");
     setError(undefined);
     const targetDirectory = uploadTargetPath ?? relativePath;
+    const uploads = selectedFiles.map((file) => ({
+      file,
+      relativePath: fileTransferUploadPath(targetDirectory, file.name, options.preserveDirectoryPath ? selectedDirectoryRelativePath(file) : undefined)
+    }));
+    const totalBytes = uploads.reduce((sum, upload) => sum + upload.file.size, 0);
+    let completedBytes = 0;
+    setUploadProgress({
+      completedFiles: 0,
+      totalFiles: uploads.length,
+      uploadedBytes: 0,
+      totalBytes,
+      activePath: uploads[0]?.relativePath
+    });
     try {
-      for (const file of selectedFiles) {
-        await uploadFileBrowserFile(tab.id, fileTransferUploadPath(targetDirectory, file.name), file);
+      for (const [index, upload] of uploads.entries()) {
+        setUploadProgress({
+          completedFiles: index,
+          totalFiles: uploads.length,
+          uploadedBytes: completedBytes,
+          totalBytes,
+          activePath: upload.relativePath
+        });
+        await uploadFileBrowserFile(tab.id, upload.relativePath, upload.file, (progress) => {
+          setUploadProgress({
+            completedFiles: index,
+            totalFiles: uploads.length,
+            uploadedBytes: completedBytes + Math.min(progress.loadedBytes, upload.file.size),
+            totalBytes,
+            activePath: upload.relativePath
+          });
+        });
+        completedBytes += upload.file.size;
+        const nextUpload = uploads[index + 1];
+        setUploadProgress({
+          completedFiles: index + 1,
+          totalFiles: uploads.length,
+          uploadedBytes: completedBytes,
+          totalBytes,
+          activePath: nextUpload?.relativePath
+        });
       }
       await loadDirectory(relativePath, { preserveOpened: true });
     } catch (err) {
@@ -551,6 +645,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
         uploadInputRef.current.value = "";
       }
       setUploadTargetPath(undefined);
+      setUploadProgress(undefined);
       setTransferBusyAction(undefined);
     }
   }
@@ -587,6 +682,10 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     setUploadTargetPath(transferPath);
     setContextMenu(undefined);
     uploadInputRef.current?.click();
+  }
+
+  function toggleTreeVisible() {
+    setTreeVisible(!treeVisible);
   }
 
   async function copyPathToClipboard(value: string) {
@@ -653,7 +752,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
           </ControlButton>
         )}
         <ControlButton type="button" iconOnly onClick={startUploadToCurrentFolder} disabled={transferBusyAction === "upload"} aria-label="Upload files" title="Upload files">
-          <Upload size={15} className={transferBusyAction === "upload" ? "spinning" : ""} />
+          <Upload size={15} />
         </ControlButton>
         <input
           ref={uploadInputRef}
@@ -664,7 +763,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
             void uploadFiles(event.currentTarget.files);
           }}
         />
-        <ControlButton type="button" iconOnly pressed={treeVisible} aria-label={treeVisible ? "Hide tree view" : "Show tree view"} title={treeVisible ? "Hide tree view" : "Show tree view"} onClick={() => setTreeVisible(!treeVisible)}>
+        <ControlButton type="button" iconOnly pressed={treeVisible} aria-label={treeVisible ? "Hide tree view" : "Show tree view"} title={treeVisible ? "Hide tree view" : "Show tree view"} onClick={toggleTreeVisible}>
           <Folder size={15} />
         </ControlButton>
         <ControlButton type="button" iconOnly pressed={searchVisible} aria-label={searchVisible ? "Hide search bar" : "Show search bar"} title={searchVisible ? "Hide search bar" : "Show search bar"} onClick={toggleSearchVisible}>
@@ -711,6 +810,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
         onDiffViewModeChange={setDiffViewMode}
         onDiffFilesVisibleChange={setGitDiffFilesVisible}
       /> : null}
+      {uploadProgress ? <UploadProgress progress={uploadProgress} /> : null}
       {error ? <div className="inline-error">{error}</div> : null}
       <div ref={bodyRef} className={fileBrowserBodyClassName(treeVisible, fileTreeResizing)} style={fileBrowserBodyStyle(fileTreeSize)}>
         {treeVisible ? <div className="file-list">
@@ -756,7 +856,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
         ) : null}
         <div className="file-preview">
           {opened ? (
-            <FilePreview opened={opened} objectUrl={previewObjectUrl} loading={previewLoading} />
+            <FilePreview tabId={tab.id} opened={opened} objectUrl={previewObjectUrl} loading={previewLoading} markdownPreviewMode={markdownPreviewMode} onMarkdownPreviewModeChange={setMarkdownPreviewMode} />
           ) : searchResult ? (
             <SearchResults result={searchResult} busy={Boolean(searchBusyAction)} onOpenFile={(filePath) => void openFilePath(filePath)} />
           ) : showGitDiff && gitState?.isRepository ? (
@@ -768,6 +868,18 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
       </div>
       {contextMenu ? (
         <div ref={contextMenuRef} className="file-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} role="menu" aria-label={`Actions for ${contextMenu.entry.name}`}>
+          {contextMenu.entry.type === "file" && isExtractableArchivePath(contextMenu.transferPath) ? (
+            <button type="button" role="menuitem" disabled={transferBusyAction === "extract"} onClick={() => void extractArchive(contextMenu.transferPath, "here")}>
+              <ArchiveRestore size={14} />
+              <span>Extract here</span>
+            </button>
+          ) : null}
+          {contextMenu.entry.type === "file" && isExtractableArchivePath(contextMenu.transferPath) ? (
+            <button type="button" role="menuitem" disabled={transferBusyAction === "extract"} onClick={() => void extractArchive(contextMenu.transferPath, "folder")}>
+              <ArchiveRestore size={14} />
+              <span>Extract to {archiveExtractionFolderName(contextMenu.transferPath)}/</span>
+            </button>
+          ) : null}
           <button
             type="button"
             role="menuitem"
@@ -808,7 +920,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
           {contextMenu.entry.type === "directory" ? (
             <button type="button" role="menuitem" disabled={transferBusyAction === "upload"} onClick={() => startUploadToFolder(contextMenu.transferPath)}>
               <Upload size={14} />
-              <span>Upload to</span>
+              <span>Upload files to</span>
             </button>
           ) : null}
         </div>
@@ -881,6 +993,26 @@ function SearchMatchBadge({ entry }: { entry: DisplayDirectoryEntry }) {
     return null;
   }
   return <span className="tree-search-badge">{entry.type === "directory" ? "dir" : entry.searchMatch.matches.length}</span>;
+}
+
+function UploadProgress({ progress }: { progress: UploadProgressState }) {
+  const percent = uploadProgressPercent(progress);
+  const visibleFileCount = uploadProgressVisibleFileCount(progress);
+  return (
+    <div className="file-upload-progress" role="status" aria-label="Upload progress">
+      <div className="file-upload-progress-summary">
+        <Upload size={14} />
+        <span>
+          Uploading {visibleFileCount}/{progress.totalFiles}
+        </span>
+        <small>{formatUploadBytes(progress.uploadedBytes, progress.totalBytes)}</small>
+      </div>
+      <div className="file-upload-progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}>
+        <span style={{ width: `${percent}%` }} />
+      </div>
+      {progress.activePath ? <small className="file-upload-progress-path" title={progress.activePath}>{progress.activePath}</small> : null}
+    </div>
+  );
 }
 
 function SearchBar({
@@ -1336,10 +1468,27 @@ function OriginForm({ originUrl, busy, compact, onSetOrigin, onSetOriginUrl }: {
   );
 }
 
-function FilePreview({ opened, objectUrl, loading }: { opened: OpenFileResult; objectUrl?: string; loading: boolean }) {
+function FilePreview({
+  tabId,
+  opened,
+  objectUrl,
+  loading,
+  markdownPreviewMode,
+  onMarkdownPreviewModeChange
+}: {
+  tabId: string;
+  opened: OpenFileResult;
+  objectUrl?: string;
+  loading: boolean;
+  markdownPreviewMode: MarkdownPreviewMode;
+  onMarkdownPreviewModeChange: (mode: MarkdownPreviewMode) => void;
+}) {
   const displayPath = opened.relativePath ?? opened.path;
   const kind = normalizedPreviewKind(opened);
-  const markdownHtml = useMemo(() => (kind === "markdown" ? renderMarkdownHtml(opened.content) : ""), [kind, opened.content]);
+  const markdownHtml = useMemo(() => (kind === "markdown" ? renderMarkdownHtml(opened.content, { resolveImageUrl: (href) => markdownImageFileUrl(tabId, displayPath, href) }) : ""), [kind, opened.content, displayPath, tabId]);
+  const markdownSourceHtml = useMemo(() => (kind === "markdown" ? highlightedCodeHtml(opened.content, "markdown") : ""), [kind, opened.content]);
+  const textLanguage = useMemo(() => (kind === "text" ? previewLanguageForPath(displayPath) : undefined), [displayPath, kind]);
+  const textHtml = useMemo(() => (kind === "text" ? highlightedCodeHtml(opened.content, textLanguage) : ""), [kind, opened.content, textLanguage]);
 
   if (kind === "image") {
     return (
@@ -1366,19 +1515,52 @@ function FilePreview({ opened, objectUrl, loading }: { opened: OpenFileResult; o
   }
 
   if (kind === "markdown") {
+    const heading = (
+      <div className="file-preview-heading">
+        <FileText size={16} />
+        <span>{displayPath}</span>
+        {opened.truncated ? <small>truncated</small> : null}
+        <SegmentedControl className="markdown-preview-toggle" label="Markdown preview mode">
+          <ControlButton type="button" iconOnly pressed={markdownPreviewMode === "rendered"} aria-label="Rendered Markdown preview" title="Rendered Markdown preview" onClick={() => onMarkdownPreviewModeChange("rendered")}>
+            <FileText size={14} />
+          </ControlButton>
+          <ControlButton type="button" iconOnly pressed={markdownPreviewMode === "source"} aria-label="Markdown source" title="Markdown source" onClick={() => onMarkdownPreviewModeChange("source")}>
+            <FileCode size={14} />
+          </ControlButton>
+        </SegmentedControl>
+      </div>
+    );
+
+    if (markdownPreviewMode === "source") {
+      return (
+        <div className="file-preview-rendered file-preview-code file-preview-markdown-source">
+          {heading}
+          <pre>
+            <code className="hljs language-markdown" dangerouslySetInnerHTML={{ __html: markdownSourceHtml }} />
+          </pre>
+        </div>
+      );
+    }
+
     return (
       <div className="file-preview-rendered file-preview-markdown">
-        <div className="file-preview-heading">
-          <FileText size={16} />
-          <span>{displayPath}</span>
-          {opened.truncated ? <small>truncated</small> : null}
-        </div>
+        {heading}
         <div className="markdown-body" dangerouslySetInnerHTML={{ __html: markdownHtml }} />
       </div>
     );
   }
 
-  return <pre>{filePreviewText(opened)}</pre>;
+  return (
+    <div className="file-preview-rendered file-preview-code">
+      <div className="file-preview-heading">
+        <FileText size={16} />
+        <span>{displayPath}</span>
+      </div>
+      <pre>
+        <code className={textLanguage ? `hljs language-${textLanguage}` : "hljs"} dangerouslySetInnerHTML={{ __html: textHtml }} />
+      </pre>
+    </div>
+  );
 }
 
 function SearchResults({ result, busy, onOpenFile }: { result: FileSearchResult; busy: boolean; onOpenFile: (filePath: string) => void }) {
@@ -1639,9 +1821,175 @@ export function usesObjectUrlPreview(opened: Pick<OpenFileResult, "previewKind" 
   return kind === "image" || kind === "pdf";
 }
 
-export function renderMarkdownHtml(content: string): string {
-  const rawHtml = marked.parse(content, { async: false }) as string;
-  return DOMPurify.sanitize(rawHtml);
+interface MarkdownRenderOptions {
+  resolveImageUrl?: (href: string) => string | undefined;
+}
+
+export function renderMarkdownHtml(content: string, options: MarkdownRenderOptions = {}): string {
+  const renderer = new marked.Renderer();
+  renderer.code = (token: Tokens.Code) => highlightedCodeBlockHtml(token.text, token.lang);
+  renderer.image = (token: Tokens.Image) => {
+    const altText = token.tokens ? renderer.parser.parseInline(token.tokens, renderer.parser.textRenderer) : token.text;
+    const imageSrc = options.resolveImageUrl?.(token.href) ?? token.href;
+    const title = token.title ? ` title="${escapeHtml(token.title)}"` : "";
+    return `<img src="${escapeHtml(imageSrc)}" alt="${escapeHtml(altText)}"${title}>`;
+  };
+  const rawHtml = marked.parse(content, { async: false, renderer }) as string;
+  return rewriteMarkdownImageSources(DOMPurify.sanitize(rawHtml), options);
+}
+
+function rewriteMarkdownImageSources(html: string, options: MarkdownRenderOptions): string {
+  if (!options.resolveImageUrl || typeof document === "undefined") {
+    return html;
+  }
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  for (const image of Array.from(template.content.querySelectorAll("img[src]"))) {
+    const currentSrc = image.getAttribute("src");
+    const nextSrc = currentSrc ? options.resolveImageUrl(currentSrc) : undefined;
+    if (nextSrc) {
+      image.setAttribute("src", nextSrc);
+    }
+  }
+  return template.innerHTML;
+}
+
+export function markdownImageFileUrl(tabId: string, markdownPath: string, href: string): string | undefined {
+  const transferPath = markdownImageTransferPath(markdownPath, href);
+  return transferPath ? fileBrowserRawFileUrl(tabId, transferPath) : undefined;
+}
+
+export function markdownImageTransferPath(markdownPath: string, href: string): string | undefined {
+  const trimmedHref = href.trim();
+  if (!trimmedHref || isExternalMarkdownResource(trimmedHref)) {
+    return undefined;
+  }
+  const resourcePath = safeDecodeUri(trimmedHref.split(/[?#]/u)[0] ?? "");
+  if (!resourcePath) {
+    return undefined;
+  }
+  const basePath = parentPath(markdownPath);
+  const parts: string[] = [];
+  for (const part of `${basePath ? `${basePath}/` : ""}${resourcePath}`.split(/[\\/]+/u)) {
+    if (!part || part === ".") {
+      continue;
+    }
+    if (part === "..") {
+      if (!parts.length) {
+        return undefined;
+      }
+      parts.pop();
+      continue;
+    }
+    parts.push(part);
+  }
+  return parts.length ? parts.join("/") : undefined;
+}
+
+function isExternalMarkdownResource(href: string): boolean {
+  return href.startsWith("/") || href.startsWith("//") || href.startsWith("#") || /^[a-z][a-z0-9+.-]*:/iu.test(href);
+}
+
+function safeDecodeUri(value: string): string {
+  try {
+    return decodeURI(value);
+  } catch {
+    return value;
+  }
+}
+
+export function highlightedCodeHtml(content: string, language?: string): string {
+  const normalizedLanguage = normalizeHighlightLanguage(language);
+  try {
+    const result = normalizedLanguage ? hljs.highlight(content, { language: normalizedLanguage, ignoreIllegals: true }) : hljs.highlightAuto(content, HIGHLIGHT_AUTO_LANGUAGES);
+    return DOMPurify.sanitize(result.value);
+  } catch {
+    return DOMPurify.sanitize(escapeHtml(content));
+  }
+}
+
+function highlightedCodeBlockHtml(content: string, language?: string): string {
+  const normalizedLanguage = normalizeHighlightLanguage(language);
+  const className = normalizedLanguage ? `hljs language-${normalizedLanguage}` : "hljs";
+  return `<pre><code class="${className}">${highlightedCodeHtml(content, normalizedLanguage)}</code></pre>`;
+}
+
+export function previewLanguageForPath(filePath: string): string | undefined {
+  const name = filePath.toLowerCase();
+  const extension = name.includes(".") ? name.slice(name.lastIndexOf(".")) : "";
+  switch (extension) {
+    case ".cjs":
+    case ".js":
+    case ".jsx":
+    case ".mjs":
+      return "javascript";
+    case ".cts":
+    case ".mts":
+    case ".ts":
+    case ".tsx":
+      return "typescript";
+    case ".css":
+      return "css";
+    case ".html":
+    case ".svg":
+    case ".xml":
+      return "xml";
+    case ".json":
+    case ".jsonc":
+      return "json";
+    case ".md":
+    case ".markdown":
+    case ".mdown":
+    case ".mkd":
+      return "markdown";
+    case ".bash":
+    case ".sh":
+    case ".zsh":
+      return "bash";
+    case ".py":
+      return "python";
+    case ".yaml":
+    case ".yml":
+      return "yaml";
+    case ".diff":
+    case ".patch":
+      return "diff";
+    case ".sql":
+      return "sql";
+    case ".go":
+      return "go";
+    case ".rs":
+      return "rust";
+    default:
+      return undefined;
+  }
+}
+
+function normalizeHighlightLanguage(language: string | undefined): string | undefined {
+  const candidate = language?.trim().split(/\s+/u)[0]?.replace(/^language-/iu, "").toLowerCase();
+  if (!candidate) {
+    return undefined;
+  }
+  const mapped = HIGHLIGHT_LANGUAGE_ALIASES[candidate] ?? candidate;
+  return hljs.getLanguage(mapped) ? mapped : undefined;
+}
+
+const HIGHLIGHT_LANGUAGE_ALIASES: Record<string, string> = {
+  cjs: "javascript",
+  js: "javascript",
+  jsx: "javascript",
+  mjs: "javascript",
+  ts: "typescript",
+  tsx: "typescript",
+  html: "xml",
+  shell: "bash",
+  sh: "bash",
+  zsh: "bash",
+  yml: "yaml"
+};
+
+function escapeHtml(content: string): string {
+  return content.replace(/&/gu, "&amp;").replace(/</gu, "&lt;").replace(/>/gu, "&gt;").replace(/"/gu, "&quot;");
 }
 
 export function toolbarClipboardPath(relativePath: string): string {
@@ -1679,9 +2027,72 @@ function openFileTransferPath(opened: OpenFileResult): string | undefined {
   return undefined;
 }
 
-export function fileTransferUploadPath(currentRelativePath: string, filename: string): string {
+export function fileTransferUploadPath(currentRelativePath: string, filename: string, selectedRelativePath?: string): string {
+  const directoryRelativePath = normalizeUploadSourcePath(selectedRelativePath);
+  if (directoryRelativePath) {
+    return normalizeTransferPath(currentRelativePath ? `${currentRelativePath}/${directoryRelativePath}` : directoryRelativePath);
+  }
   const safeFilename = filename.split(/[\\/]+/).filter(Boolean).pop() ?? filename;
   return normalizeTransferPath(currentRelativePath ? `${currentRelativePath}/${safeFilename}` : safeFilename);
+}
+
+export function isExtractableArchivePath(transferPath: string): boolean {
+  const lower = transferPath.toLowerCase();
+  return lower.endsWith(".zip") || lower.endsWith(".tar") || lower.endsWith(".tar.gz") || lower.endsWith(".tgz");
+}
+
+export function archiveExtractionFolderName(transferPath: string): string {
+  const filename = normalizeTransferPath(transferPath)
+    .split("/")
+    .filter(Boolean)
+    .pop() ?? "archive";
+  return filename.replace(/\.tar\.gz$/iu, "").replace(/\.tgz$/iu, "").replace(/\.(zip|tar)$/iu, "") || "archive";
+}
+
+function selectedDirectoryRelativePath(file: File): string | undefined {
+  const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
+  return typeof relativePath === "string" ? relativePath : undefined;
+}
+
+function normalizeUploadSourcePath(value: string | undefined): string | undefined {
+  const parts = value?.split(/[\\/]+/u).filter((part) => part && part !== ".");
+  if (!parts?.length || parts.includes("..")) {
+    return undefined;
+  }
+  return parts.join("/");
+}
+
+export function uploadProgressPercent(progress: Pick<UploadProgressState, "uploadedBytes" | "totalBytes">): number {
+  if (!progress.totalBytes) {
+    return progress.uploadedBytes > 0 ? 100 : 0;
+  }
+  return Math.max(0, Math.min(100, Math.round((progress.uploadedBytes / progress.totalBytes) * 100)));
+}
+
+export function uploadProgressVisibleFileCount(progress: Pick<UploadProgressState, "completedFiles" | "totalFiles" | "activePath">): number {
+  const activeFileCount = progress.activePath ? progress.completedFiles + 1 : progress.completedFiles;
+  return Math.max(0, Math.min(progress.totalFiles, activeFileCount));
+}
+
+function formatUploadBytes(uploadedBytes: number, totalBytes: number): string {
+  return `${formatBytes(uploadedBytes)} / ${formatBytes(totalBytes)}`;
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0 B";
+  }
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value >= 10 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`;
 }
 
 function normalizeTransferPath(value: string): string {

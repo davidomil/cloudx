@@ -247,6 +247,88 @@ describe("buildServer", () => {
       expect(download.headers["content-type"]).toContain("application/octet-stream");
       expect(download.headers["content-disposition"]).toContain("notes.bin");
       expect((download as unknown as { rawPayload: Buffer }).rawPayload).toEqual(Buffer.from([1, 2, 3]));
+
+      await fs.mkdir(path.join(root, "docs", "screenshots"), { recursive: true });
+      await fs.writeFile(path.join(root, "docs", "screenshots", "panel.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+      const raw = await app.inject({
+        method: "GET",
+        url: `/api/tabs/${tabId}/files/raw?relativePath=${encodeURIComponent("docs/screenshots/panel.png")}`
+      });
+      expect(raw.statusCode).toBe(200);
+      expect(raw.headers["content-type"]).toContain("image/png");
+      expect(raw.headers["cache-control"]).toBe("no-store");
+      expect((raw as unknown as { rawPayload: Buffer }).rawPayload).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("passes file browser upload bodies to the transfer service as streams", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-file-transfer-stream-route-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    const uploadSpy = vi.spyOn(services.fileTransfer!, "upload").mockImplementation(async (_tab, relativePath, body) => {
+      expect(Buffer.isBuffer(body)).toBe(false);
+      expect(typeof (body as AsyncIterable<unknown>)[Symbol.asyncIterator]).toBe("function");
+      const chunks: Buffer[] = [];
+      for await (const chunk of body as AsyncIterable<Buffer | Uint8Array | string>) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      return {
+        path: path.join(root, String(relativePath)),
+        relativePath: String(relativePath),
+        bytes: Buffer.concat(chunks).byteLength,
+        uploaded: true
+      };
+    });
+    const app = await buildServer(config, services);
+    try {
+      const created = await app.inject({
+        method: "POST",
+        url: "/api/tabs",
+        payload: { pluginId: "file-browser", cwd: root }
+      });
+      const tabId = created.json().tab.id as string;
+
+      const upload = await app.inject({
+        method: "POST",
+        url: `/api/tabs/${tabId}/files/upload?relativePath=stream.bin`,
+        headers: { "content-type": "application/octet-stream" },
+        payload: Buffer.from([1, 2, 3])
+      });
+
+      expect(upload.statusCode).toBe(200);
+      expect(upload.json()).toMatchObject({ relativePath: "stream.bin", bytes: 3, uploaded: true });
+      expect(uploadSpy).toHaveBeenCalledWith(expect.objectContaining({ id: tabId }), "stream.bin", expect.anything(), { maxBytes: 25 * 1024 * 1024 * 1024 });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("rejects file browser uploads larger than 25 GiB before streaming the body", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-file-transfer-route-limit-"));
+    const config = testConfig(root);
+    const app = await buildServer(config);
+    try {
+      const created = await app.inject({
+        method: "POST",
+        url: "/api/tabs",
+        payload: { pluginId: "file-browser", cwd: root }
+      });
+      const tabId = created.json().tab.id as string;
+
+      const upload = await app.inject({
+        method: "POST",
+        url: `/api/tabs/${tabId}/files/upload?relativePath=too-large.bin`,
+        headers: {
+          "content-type": "application/octet-stream",
+          "content-length": String(25 * 1024 * 1024 * 1024 + 1)
+        }
+      });
+
+      expect(upload.statusCode).toBe(413);
+      expect(upload.json().message).toContain("25 GiB");
+      await expect(fs.readdir(root)).resolves.not.toContain("too-large.bin");
     } finally {
       await app.close();
     }

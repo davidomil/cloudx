@@ -23,7 +23,7 @@ import { AsrClient } from "./asrClient.js";
 import { PathPolicy } from "./pathPolicy.js";
 import { PluginRegistry } from "./pluginRegistry.js";
 import { LocalWebProxy } from "./localWebProxy.js";
-import { contentDispositionAttachment, FileTransferService } from "./fileTransfer.js";
+import { contentDispositionAttachment, FileTransferService, FileUploadTooLargeError } from "./fileTransfer.js";
 import { CodexTerminalPlugin } from "./plugins/CodexTerminalPlugin.js";
 import { FileBrowserPlugin } from "./plugins/FileBrowserPlugin.js";
 import { LocalWebPlugin } from "./plugins/LocalWebPlugin.js";
@@ -63,11 +63,12 @@ export interface AppServices {
 }
 
 const MIN_STREAMED_AUDIO_BYTES = 128;
+const FILE_UPLOAD_MAX_BYTES = 25 * 1024 * 1024 * 1024;
 
 export async function buildServer(config: AppConfig, services?: AppServices): Promise<FastifyInstance> {
   const app = Fastify({
     logger: true,
-    requestTimeout: 120_000,
+    requestTimeout: 0,
     https: config.https
       ? {
           key: fs.readFileSync(config.https.keyPath),
@@ -89,8 +90,8 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   app.addContentTypeParser(/^audio\/.*/, { parseAs: "buffer" }, (_request, body, done) => {
     done(null, body);
   });
-  app.addContentTypeParser("application/octet-stream", { parseAs: "buffer" }, (_request, body, done) => {
-    done(null, body);
+  app.addContentTypeParser("application/octet-stream", (_request, payload, done) => {
+    done(null, payload);
   });
 
   app.get("/api/health", async () => ({
@@ -226,9 +227,21 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     return reply.send(download.stream);
   });
 
-  app.post<{ Params: { tabId: string }; Querystring: { relativePath?: string }; Body: Buffer }>("/api/tabs/:tabId/files/upload", async (request) => {
+  app.get<{ Params: { tabId: string }; Querystring: { relativePath?: string } }>("/api/tabs/:tabId/files/raw", async (request, reply) => {
     const tab = services.sessions.getTab(request.params.tabId);
-    return services.fileTransfer!.upload(tab, request.query.relativePath, request.body);
+    const file = await services.fileTransfer!.createRawFile(tab, request.query.relativePath);
+    reply.header("content-type", file.contentType);
+    reply.header("cache-control", "no-store");
+    return reply.send(file.stream);
+  });
+
+  app.post<{ Params: { tabId: string }; Querystring: { relativePath?: string }; Body: NodeJS.ReadableStream }>("/api/tabs/:tabId/files/upload", async (request) => {
+    const contentLength = parseContentLength(request.headers["content-length"]);
+    if (contentLength !== undefined && contentLength > FILE_UPLOAD_MAX_BYTES) {
+      throw new FileUploadTooLargeError(FILE_UPLOAD_MAX_BYTES);
+    }
+    const tab = services.sessions.getTab(request.params.tabId);
+    return services.fileTransfer!.upload(tab, request.query.relativePath, request.body, { maxBytes: FILE_UPLOAD_MAX_BYTES });
   });
 
   app.post<{ Params: { hookId: string }; Body: HookCallRequest }>("/api/hooks/:hookId", async (request) => {
@@ -669,6 +682,15 @@ function parseWebSocketProtocols(value: string | string[] | undefined): string[]
     .map((protocol) => protocol.trim())
     .filter(Boolean);
   return protocols?.length ? protocols : undefined;
+}
+
+function parseContentLength(value: string | string[] | undefined): number | undefined {
+  const rawValue = Array.isArray(value) ? value[0] : value;
+  if (rawValue === undefined) {
+    return undefined;
+  }
+  const contentLength = Number(rawValue);
+  return Number.isFinite(contentLength) && contentLength >= 0 ? contentLength : undefined;
 }
 
 function assertSpeechDetected(text: string): void {

@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import type { Dirent } from "node:fs";
 import path from "node:path";
 
 import type { CreatePluginSessionInput, PluginActionDefinition, PluginSession, PluginSessionSnapshot, PluginVoiceContext, WorkspacePlugin } from "@cloudx/plugin-api";
@@ -7,8 +8,8 @@ import type { ConfigFieldDescriptor, ConfigValue, FileSearchMode, FileSearchResu
 import { GitService } from "../git/GitService.js";
 import type { PathPolicy } from "../pathPolicy.js";
 import { FileSearchService } from "../search/FileSearchService.js";
+import { ArchiveExtractionService, type ArchiveExtractionDestination } from "../archive/ArchiveExtractionService.js";
 
-const MAX_FILE_BYTES = 96_000;
 const VOICE_PREVIEW_BYTES = 8_000;
 
 interface FileListingEntry {
@@ -108,6 +109,20 @@ export class FileBrowserPlugin implements WorkspacePlugin {
           relativePath: { type: "string", description: "Relative file path to open." }
         },
         required: ["relativePath"],
+        additionalProperties: false
+      }
+    },
+    {
+      name: "extract_archive",
+      description: "Extract a supported archive below the tab working directory. Supports .zip, .tar, .tar.gz, and .tgz archives.",
+      voiceExposed: false,
+      inputSchema: {
+        type: "object",
+        properties: {
+          relativePath: { type: "string", description: "Relative archive file path to extract." },
+          destination: { type: "string", enum: ["here", "folder"], description: "Use here to extract next to the archive, or folder to extract into a same-named folder." }
+        },
+        required: ["relativePath", "destination"],
         additionalProperties: false
       }
     },
@@ -239,7 +254,8 @@ export class FileBrowserPlugin implements WorkspacePlugin {
   constructor(
     private readonly pathPolicy: PathPolicy,
     private readonly gitService = new GitService(),
-    private readonly fileSearchService = new FileSearchService()
+    private readonly fileSearchService = new FileSearchService(),
+    private readonly archiveExtractionService = new ArchiveExtractionService()
   ) {}
 
   descriptor() {
@@ -257,7 +273,7 @@ export class FileBrowserPlugin implements WorkspacePlugin {
   }
 
   createSession(input: CreatePluginSessionInput): PluginSession {
-    return new FileBrowserSession(input.tab, this.pathPolicy, this.gitService, this.fileSearchService, input.getConfig ?? (() => input.config ?? {}));
+    return new FileBrowserSession(input.tab, this.pathPolicy, this.gitService, this.fileSearchService, this.archiveExtractionService, input.getConfig ?? (() => input.config ?? {}));
   }
 }
 
@@ -272,6 +288,7 @@ class FileBrowserSession implements PluginSession {
     private readonly pathPolicy: PathPolicy,
     private readonly gitService: GitService,
     private readonly fileSearchService: FileSearchService,
+    private readonly archiveExtractionService: ArchiveExtractionService,
     private readonly getConfig: () => Record<string, ConfigValue>
   ) {}
 
@@ -315,8 +332,7 @@ class FileBrowserSession implements PluginSession {
       const relativePath = requireString(input.relativePath, "relativePath");
       const directory = this.resolveUnderCwd(relativePath);
       const entries = await fs.readdir(directory, { withFileTypes: true });
-      const listedEntries = entries
-        .map((entry) => ({ name: entry.name, type: entry.isDirectory() ? ("directory" as const) : ("file" as const) }))
+      const listedEntries = (await Promise.all(entries.map((entry) => fileListingEntry(directory, entry))))
         .sort((a, b) => `${a.type}:${a.name}`.localeCompare(`${b.type}:${b.name}`));
       this.currentDirectory = {
         path: directory,
@@ -332,6 +348,15 @@ class FileBrowserSession implements PluginSession {
     if (action === "open_file") {
       const result = await this.openFilePreview(requireString(input.relativePath, "relativePath"));
       return result;
+    }
+    if (action === "extract_archive") {
+      const archivePath = this.resolveUnderCwd(requireString(input.relativePath, "relativePath"));
+      const result = await this.archiveExtractionService.extract({
+        cwd: this.tab.cwd,
+        archivePath,
+        destination: requireArchiveExtractionDestination(input.destination)
+      });
+      return result as unknown as Record<string, unknown>;
     }
     if (action === "search_files") {
       const result = await this.fileSearchService.search(this.tab.cwd, {
@@ -455,18 +480,9 @@ class FileBrowserSession implements PluginSession {
       this.setOpenFile(filePath, relativePath, metadata, content, stat.size, false);
       return { path: filePath, relativePath, truncated: false, content: "", sizeBytes: stat.size, ...metadata };
     }
-    const handle = await fs.open(filePath, "r");
-    try {
-      const length = Math.min(stat.size, MAX_FILE_BYTES);
-      const buffer = Buffer.alloc(length);
-      await handle.read(buffer, 0, length, 0);
-      const content = buffer.toString("utf8");
-      const truncated = stat.size > MAX_FILE_BYTES;
-      this.setOpenFile(filePath, relativePath, metadata, content, stat.size, truncated);
-      return { path: filePath, relativePath, truncated, content, sizeBytes: stat.size, ...metadata };
-    } finally {
-      await handle.close();
-    }
+    const content = await fs.readFile(filePath, "utf8");
+    this.setOpenFile(filePath, relativePath, metadata, content, stat.size, false);
+    return { path: filePath, relativePath, truncated: false, content, sizeBytes: stat.size, ...metadata };
   }
 
   private async requireFile(filePath: string) {
@@ -568,6 +584,24 @@ function requireString(value: unknown, name: string): string {
   return value;
 }
 
+async function fileListingEntry(directory: string, entry: Dirent): Promise<FileListingEntry> {
+  const type = entry.isDirectory() || await isSymlinkedDirectory(path.join(directory, entry.name), entry) ? "directory" : "file";
+  return { name: entry.name, type };
+}
+
+async function isSymlinkedDirectory(entryPath: string, entry: Dirent): Promise<boolean> {
+  if (!entry.isSymbolicLink()) {
+    return false;
+  }
+  const stat = await fs.stat(entryPath).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT" || error.code === "ENOTDIR" || error.code === "EACCES") {
+      return undefined;
+    }
+    throw error;
+  });
+  return stat?.isDirectory() ?? false;
+}
+
 function optionalString(value: unknown, name: string): string | undefined {
   if (value === undefined) {
     return undefined;
@@ -604,6 +638,13 @@ function optionalSearchMode(value: unknown): FileSearchMode | undefined {
     throw new Error("mode must be all, filename, or content.");
   }
   return mode;
+}
+
+function requireArchiveExtractionDestination(value: unknown): ArchiveExtractionDestination {
+  if (value === "here" || value === "folder") {
+    return value;
+  }
+  throw new Error("destination must be here or folder.");
 }
 
 function countOccurrences(content: string, needle: string): number {

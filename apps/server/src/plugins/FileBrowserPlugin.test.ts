@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { describe, expect, it } from "vitest";
+import { create as createTar } from "tar";
 
 import type { FileSearchResult, WorkspaceTab } from "@cloudx/shared";
 
@@ -57,6 +58,35 @@ describe("FileBrowserPlugin", () => {
     expect(context.visibleText).toContain("Open file README.md");
   });
 
+  it("lists symlinked directories as directories so browsing them does not call open_file", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-files-symlink-"));
+    const target = path.join(root, "target-skill");
+    await fs.mkdir(target);
+    await fs.writeFile(path.join(target, "SKILL.md"), "# Understand Diff\n");
+    await fs.symlink(target, path.join(root, "understand-diff"), "dir");
+    const tab: WorkspaceTab = {
+      id: "tab-1",
+      pluginId: "file-browser",
+      title: "Files",
+      cwd: root,
+      status: "running",
+      indicator: { color: "green", label: "OK", updatedAt: new Date(0).toISOString() },
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString()
+    };
+    const session = new FileBrowserPlugin(new PathPolicy([root])).createSession({
+      tab,
+      cwd: root,
+      controls: { setTabIndicator: () => undefined, closeTab: () => undefined }
+    });
+
+    const listing = await session.handleAction("list_directory", { relativePath: "" }) as { entries: Array<{ name: string; type: string }> };
+    const nested = await session.handleAction("list_directory", { relativePath: "understand-diff" }) as { entries: Array<{ name: string; type: string }> };
+
+    expect(listing.entries).toContainEqual({ name: "understand-diff", type: "directory" });
+    expect(nested.entries).toContainEqual({ name: "SKILL.md", type: "file" });
+  });
+
   it("opens image and PDF files as renderable preview metadata without decoding binary content", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-files-"));
     await fs.writeFile(path.join(root, "pixel.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
@@ -105,6 +135,43 @@ describe("FileBrowserPlugin", () => {
     expect(filePreviewMetadataForPath("/repo/public/photo.webp")).toEqual({ previewKind: "image", mimeType: "image/webp" });
     expect(filePreviewMetadataForPath("/repo/public/spec.pdf")).toEqual({ previewKind: "pdf", mimeType: "application/pdf" });
     expect(filePreviewMetadataForPath("/repo/src/App.tsx")).toEqual({ previewKind: "text", mimeType: "text/plain; charset=utf-8" });
+  });
+
+  it("returns full markdown previews for long files while keeping voice context bounded", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-files-long-"));
+    const longMarkdown = `# Long\n\n${"body line\n".repeat(12_000)}`;
+    await fs.writeFile(path.join(root, "LONG.md"), longMarkdown);
+    const tab: WorkspaceTab = {
+      id: "tab-1",
+      pluginId: "file-browser",
+      title: "Files",
+      cwd: root,
+      status: "running",
+      indicator: { color: "green", label: "OK", updatedAt: new Date(0).toISOString() },
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString()
+    };
+    const session = new FileBrowserPlugin(new PathPolicy([root])).createSession({
+      tab,
+      cwd: root,
+      controls: { setTabIndicator: () => undefined, closeTab: () => undefined }
+    });
+
+    const opened = await session.handleAction("open_file", { relativePath: "LONG.md" });
+    const context = await session.voiceContext();
+
+    expect(opened).toMatchObject({
+      relativePath: "LONG.md",
+      previewKind: "markdown",
+      truncated: false,
+      content: longMarkdown,
+      sizeBytes: Buffer.byteLength(longMarkdown, "utf8")
+    });
+    expect(context.openFile).toMatchObject({
+      relativePath: "LONG.md",
+      truncated: true
+    });
+    expect(context.openFile?.contentPreview.length).toBeLessThan(longMarkdown.length);
   });
 
   it("edits files through voice-exposed file actions", async () => {
@@ -156,6 +223,54 @@ describe("FileBrowserPlugin", () => {
     });
 
     await expect(session.handleAction("open_file", { relativePath: "src" })).rejects.toThrow("Not a file:");
+  });
+
+  it("extracts zip archives from the file browser action into a same-named folder", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-files-zip-extract-"));
+    await fs.writeFile(path.join(root, "release.zip"), createZipArchive([{ path: "docs/readme.txt", content: "zip docs\n" }]));
+    const session = new FileBrowserPlugin(new PathPolicy([root])).createSession({
+      tab: workspaceTab(root),
+      cwd: root,
+      controls: { setTabIndicator: () => undefined, closeTab: () => undefined }
+    });
+
+    const result = await session.handleAction("extract_archive", { relativePath: "release.zip", destination: "folder" });
+
+    expect(result).toMatchObject({ archiveRelativePath: "release.zip", destinationRelativePath: "release", extracted: true });
+    await expect(fs.readFile(path.join(root, "release", "docs", "readme.txt"), "utf8")).resolves.toBe("zip docs\n");
+  });
+
+  it("extracts tar and tar.gz archives next to the archive without overwriting existing files", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-files-tar-extract-"));
+    const source = path.join(root, "source");
+    await fs.mkdir(path.join(source, "dist"), { recursive: true });
+    await fs.writeFile(path.join(source, "dist", "app.txt"), "tar docs\n");
+    await createTar({ cwd: source, file: path.join(root, "bundle.tar.gz"), gzip: true }, ["dist"]);
+    const session = new FileBrowserPlugin(new PathPolicy([root])).createSession({
+      tab: workspaceTab(root),
+      cwd: root,
+      controls: { setTabIndicator: () => undefined, closeTab: () => undefined }
+    });
+
+    const result = await session.handleAction("extract_archive", { relativePath: "bundle.tar.gz", destination: "here" });
+
+    expect(result).toMatchObject({ archiveRelativePath: "bundle.tar.gz", destinationRelativePath: ".", extracted: true });
+    await expect(fs.readFile(path.join(root, "dist", "app.txt"), "utf8")).resolves.toBe("tar docs\n");
+    await expect(session.handleAction("extract_archive", { relativePath: "bundle.tar.gz", destination: "here" })).rejects.toThrow("Extraction target already exists");
+  });
+
+  it("rejects archive entries that try to escape the extraction destination", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-files-unsafe-archive-"));
+    const outsideName = `${path.basename(root)}-escape.txt`;
+    await fs.writeFile(path.join(root, "unsafe.zip"), createZipArchive([{ path: `../${outsideName}`, content: "nope\n" }]));
+    const session = new FileBrowserPlugin(new PathPolicy([root])).createSession({
+      tab: workspaceTab(root),
+      cwd: root,
+      controls: { setTabIndicator: () => undefined, closeTab: () => undefined }
+    });
+
+    await expect(session.handleAction("extract_archive", { relativePath: "unsafe.zip", destination: "here" })).rejects.toThrow();
+    await expect(fs.access(path.join(root, "..", outsideName))).rejects.toThrow();
   });
 
   it("searches files by filename and content and exposes search results to voice context", async () => {
@@ -286,3 +401,84 @@ describe("FileBrowserPlugin", () => {
     await expect(session.handleAction("get_git_state", {})).rejects.toThrow("Git diff is disabled");
   });
 });
+
+function workspaceTab(cwd: string): WorkspaceTab {
+  return {
+    id: "tab-1",
+    pluginId: "file-browser",
+    title: "Files",
+    cwd,
+    status: "running",
+    indicator: { color: "green", label: "OK", updatedAt: new Date(0).toISOString() },
+    createdAt: new Date(0).toISOString(),
+    updatedAt: new Date(0).toISOString()
+  };
+}
+
+function createZipArchive(entries: Array<{ path: string; content: string }>): Buffer {
+  const localParts: Buffer[] = [];
+  const centralParts: Buffer[] = [];
+  let offset = 0;
+  for (const entry of entries) {
+    const filename = Buffer.from(entry.path);
+    const content = Buffer.from(entry.content);
+    const crc = crc32(content);
+    const localHeader = Buffer.alloc(30);
+    localHeader.writeUInt32LE(0x04034b50, 0);
+    localHeader.writeUInt16LE(20, 4);
+    localHeader.writeUInt16LE(0, 6);
+    localHeader.writeUInt16LE(0, 8);
+    localHeader.writeUInt16LE(0, 10);
+    localHeader.writeUInt16LE(0, 12);
+    localHeader.writeUInt32LE(crc, 14);
+    localHeader.writeUInt32LE(content.byteLength, 18);
+    localHeader.writeUInt32LE(content.byteLength, 22);
+    localHeader.writeUInt16LE(filename.byteLength, 26);
+    localHeader.writeUInt16LE(0, 28);
+    localParts.push(localHeader, filename, content);
+
+    const centralHeader = Buffer.alloc(46);
+    centralHeader.writeUInt32LE(0x02014b50, 0);
+    centralHeader.writeUInt16LE(20, 4);
+    centralHeader.writeUInt16LE(20, 6);
+    centralHeader.writeUInt16LE(0, 8);
+    centralHeader.writeUInt16LE(0, 10);
+    centralHeader.writeUInt16LE(0, 12);
+    centralHeader.writeUInt16LE(0, 14);
+    centralHeader.writeUInt32LE(crc, 16);
+    centralHeader.writeUInt32LE(content.byteLength, 20);
+    centralHeader.writeUInt32LE(content.byteLength, 24);
+    centralHeader.writeUInt16LE(filename.byteLength, 28);
+    centralHeader.writeUInt16LE(0, 30);
+    centralHeader.writeUInt16LE(0, 32);
+    centralHeader.writeUInt16LE(0, 34);
+    centralHeader.writeUInt16LE(0, 36);
+    centralHeader.writeUInt32LE(0, 38);
+    centralHeader.writeUInt32LE(offset, 42);
+    centralParts.push(centralHeader, filename);
+    offset += localHeader.byteLength + filename.byteLength + content.byteLength;
+  }
+
+  const centralDirectory = Buffer.concat(centralParts);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(0, 4);
+  end.writeUInt16LE(0, 6);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(centralDirectory.byteLength, 12);
+  end.writeUInt32LE(offset, 16);
+  end.writeUInt16LE(0, 20);
+  return Buffer.concat([...localParts, centralDirectory, end]);
+}
+
+function crc32(buffer: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of buffer) {
+    crc ^= byte;
+    for (let index = 0; index < 8; index += 1) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}

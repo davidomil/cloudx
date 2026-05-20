@@ -1,6 +1,7 @@
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { gunzip } from "node:zlib";
 import { promisify } from "node:util";
 
@@ -27,6 +28,18 @@ describe("FileTransferService", () => {
       archive: false
     });
     await expect(streamToBuffer(download.stream).then((buffer) => buffer.toString("utf8"))).resolves.toBe("hello transfer\n");
+  });
+
+  it("streams one raw file inline with a browser-usable content type", async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), "cloudx-transfer-raw-"));
+    await fsp.mkdir(path.join(root, "docs", "screenshots"), { recursive: true });
+    await fsp.writeFile(path.join(root, "docs", "screenshots", "panel.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    const service = new FileTransferService(new PathPolicy([root]));
+
+    const file = await service.createRawFile(workspaceTab(root), "docs/screenshots/panel.png");
+
+    expect(file.contentType).toBe("image/png");
+    await expect(streamToBuffer(file.stream)).resolves.toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
   });
 
   it("downloads folders and multiple entries as a tar.gz archive", async () => {
@@ -66,6 +79,33 @@ describe("FileTransferService", () => {
       uploaded: true
     });
     await expect(fsp.readFile(path.join(root, "uploads", "image.bin"))).resolves.toEqual(Buffer.from([0, 1, 2, 255]));
+  });
+
+  it("streams uploads to disk without requiring a buffered request body", async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), "cloudx-transfer-stream-upload-"));
+    const service = new FileTransferService(new PathPolicy([root]));
+
+    const result = await service.upload(workspaceTab(root), "uploads/stream.bin", Readable.from([Buffer.from([1, 2]), Buffer.from([3, 4, 5])]), { maxBytes: 5 });
+
+    expect(result).toEqual({
+      path: path.join(root, "uploads", "stream.bin"),
+      relativePath: "uploads/stream.bin",
+      bytes: 5,
+      uploaded: true
+    });
+    await expect(fsp.readFile(path.join(root, "uploads", "stream.bin"))).resolves.toEqual(Buffer.from([1, 2, 3, 4, 5]));
+  });
+
+  it("rejects uploads over the configured byte limit without replacing the existing file", async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), "cloudx-transfer-upload-limit-"));
+    await fsp.mkdir(path.join(root, "uploads"));
+    await fsp.writeFile(path.join(root, "uploads", "stream.bin"), "keep");
+    const service = new FileTransferService(new PathPolicy([root]));
+
+    await expect(service.upload(workspaceTab(root), "uploads/stream.bin", Readable.from([Buffer.from("123"), Buffer.from("456")]), { maxBytes: 5 })).rejects.toMatchObject({ statusCode: 413 });
+
+    await expect(fsp.readFile(path.join(root, "uploads", "stream.bin"), "utf8")).resolves.toBe("keep");
+    await expect(fsp.readdir(path.join(root, "uploads"))).resolves.toEqual(["stream.bin"]);
   });
 
   it("rejects transfer paths that escape the tab cwd even when the root policy allows them", async () => {

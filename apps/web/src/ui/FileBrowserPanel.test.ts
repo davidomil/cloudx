@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
 
-import { absoluteTransferPath, buildCompareRefOptions, buildSearchInput, clampFileBrowserTreeSize, CompareRefPicker, compareRefListboxStyle, copyTextToClipboard, defaultDiffViewMode, disposeFileBrowserPanelStatesExcept, entryTransferPath, FileBrowserPanel, fileBrowserBodyClassName, fileBrowserBodyStyle, filePreviewText, fileTransferUploadPath, filterCompareRefOptions, gitAutoRefreshIntervalMilliseconds, gitDiffWorkspaceClassName, mergeGitChangesIntoEntries, normalizedPreviewKind, parsePatch, readFileBrowserPanelState, rememberFileBrowserPanelState, renderMarkdownHtml, resolveNextCompareRef, searchEntriesFromResult, searchResultSummary, toolbarClipboardPath, usesObjectUrlPreview, type FileBrowserPanelState, type OpenFileResult } from "./FileBrowserPanel.js";
+import { absoluteTransferPath, archiveExtractionFolderName, buildCompareRefOptions, buildSearchInput, clampFileBrowserTreeSize, CompareRefPicker, compareRefListboxStyle, copyTextToClipboard, defaultDiffViewMode, disposeFileBrowserPanelStatesExcept, entryTransferPath, FileBrowserPanel, fileBrowserBodyClassName, fileBrowserBodyStyle, filePreviewText, fileTransferUploadPath, filterCompareRefOptions, gitAutoRefreshIntervalMilliseconds, gitDiffWorkspaceClassName, highlightedCodeHtml, isExtractableArchivePath, markdownImageFileUrl, markdownImageTransferPath, mergeGitChangesIntoEntries, normalizedPreviewKind, parsePatch, previewLanguageForPath, readFileBrowserPanelState, rememberFileBrowserPanelState, renderMarkdownHtml, resolveNextCompareRef, searchEntriesFromResult, searchResultSummary, toolbarClipboardPath, uploadProgressPercent, uploadProgressVisibleFileCount, usesObjectUrlPreview, type FileBrowserPanelState, type OpenFileResult } from "./FileBrowserPanel.js";
 import { PathEntry } from "./PathEntry.js";
 
 afterEach(() => {
@@ -32,16 +32,38 @@ describe("filePreviewText", () => {
     expect(filePreviewText({ path: "/workspace/README.md", truncated: true, content: "partial" })).toBe("/workspace/README.md\n[truncated]\npartial");
   });
 
-  it("detects renderable preview kinds and sanitizes markdown output", () => {
+  it("detects renderable preview kinds, sanitizes markdown output, and highlights code", () => {
     expect(normalizedPreviewKind({ path: "/repo/README.md", relativePath: "README.md" })).toBe("markdown");
     expect(normalizedPreviewKind({ path: "/repo/pixel.png", previewKind: "image" })).toBe("image");
     expect(usesObjectUrlPreview({ path: "/repo/manual.pdf", previewKind: "pdf" })).toBe(true);
     expect(usesObjectUrlPreview({ path: "/repo/README.md", previewKind: "markdown" })).toBe(false);
+    expect(previewLanguageForPath("/repo/src/App.tsx")).toBe("typescript");
 
-    const html = renderMarkdownHtml("# Title\n\n<img src=x onerror=\"alert(1)\">\n\n**bold**");
+    const html = renderMarkdownHtml("# Title\n\n<img src=x onerror=\"alert(1)\">\n\n```ts\nconst value = true;\n```\n\n**bold**");
     expect(html).toContain("<h1>Title</h1>");
     expect(html).toContain("<strong>bold</strong>");
+    expect(html).toContain("hljs-keyword");
     expect(html).not.toContain("onerror");
+    expect(highlightedCodeHtml("const value = true;", "ts")).toContain("hljs-keyword");
+  });
+
+  it("rewrites relative Markdown image sources through the file browser raw file route", () => {
+    const html = renderMarkdownHtml(
+      [
+        "![Split panes](docs/screenshots/cloudx-split-panes.png)",
+        "",
+        '<img src="docs/screenshots/cloudx-mobile-portrait.png" width="390" alt="Mobile portrait">',
+        "",
+        "![External](https://example.test/image.png)"
+      ].join("\n"),
+      { resolveImageUrl: (href) => markdownImageFileUrl("tab-files", "README.md", href) }
+    );
+
+    expect(markdownImageTransferPath("docs/README.md", "../screenshots/panel.png?raw=1#preview")).toBe("screenshots/panel.png");
+    expect(markdownImageTransferPath("README.md", "https://example.test/image.png")).toBeUndefined();
+    expect(html).toContain('/api/tabs/tab-files/files/raw?relativePath=docs%2Fscreenshots%2Fcloudx-split-panes.png');
+    expect(html).toContain('/api/tabs/tab-files/files/raw?relativePath=docs%2Fscreenshots%2Fcloudx-mobile-portrait.png');
+    expect(html).toContain('src="https://example.test/image.png"');
   });
 });
 
@@ -90,6 +112,43 @@ describe("file transfer path helpers", () => {
     expect(fileTransferUploadPath("", "README.md")).toBe("README.md");
     expect(fileTransferUploadPath("docs", "notes.md")).toBe("docs/notes.md");
     expect(fileTransferUploadPath("docs", "nested/notes.md")).toBe("docs/notes.md");
+    expect(fileTransferUploadPath("docs", "notes.md", "Project/nested/notes.md")).toBe("docs/Project/nested/notes.md");
+    expect(fileTransferUploadPath("docs", "notes.md", "../notes.md")).toBe("docs/notes.md");
+  });
+
+  it("detects archives that get right-click extraction options", () => {
+    expect(isExtractableArchivePath("release.zip")).toBe(true);
+    expect(isExtractableArchivePath("release.tar")).toBe(true);
+    expect(isExtractableArchivePath("release.tar.gz")).toBe(true);
+    expect(isExtractableArchivePath("release.tgz")).toBe(true);
+    expect(isExtractableArchivePath("release.gz")).toBe(false);
+    expect(archiveExtractionFolderName("dist/release.tar.gz")).toBe("release");
+    expect(archiveExtractionFolderName("dist/project.zip")).toBe("project");
+  });
+
+  it("reports aggregate upload progress percentages", () => {
+    expect(uploadProgressPercent({ uploadedBytes: 0, totalBytes: 0 })).toBe(0);
+    expect(uploadProgressPercent({ uploadedBytes: 512, totalBytes: 1024 })).toBe(50);
+    expect(uploadProgressPercent({ uploadedBytes: 2048, totalBytes: 1024 })).toBe(100);
+    expect(uploadProgressVisibleFileCount({ completedFiles: 0, totalFiles: 1, activePath: "video.mp4" })).toBe(1);
+    expect(uploadProgressVisibleFileCount({ completedFiles: 1, totalFiles: 2, activePath: "next.mp4" })).toBe(2);
+    expect(uploadProgressVisibleFileCount({ completedFiles: 1, totalFiles: 1 })).toBe(1);
+  });
+
+  it("keeps file upload available while folder upload is absent", () => {
+    const html = renderToStaticMarkup(createElement(FileBrowserPanel, { tab: workspaceTab("tab-files", "/repo"), config: { showGitDiff: false } }));
+    const container = document.createElement("div");
+    container.innerHTML = html;
+
+    const fileUploadButton = container.querySelector('button[aria-label="Upload files"]') as HTMLButtonElement;
+    const folderUploadButton = container.querySelector('button[aria-label="Upload directory"]');
+    const fileInputs = Array.from(container.querySelectorAll('input[type="file"]')) as HTMLInputElement[];
+
+    expect(fileUploadButton.disabled).toBe(false);
+    expect(folderUploadButton).toBeNull();
+    expect(html).not.toContain("Upload directory to");
+    expect(fileInputs).toHaveLength(1);
+    expect(fileInputs[0]!.disabled).toBe(false);
   });
 
   it("builds toolbar and context-menu clipboard paths", async () => {
@@ -120,14 +179,33 @@ describe("file browser panel state cache", () => {
     expect(html).toContain(">src<");
     expect(html).toContain("App.tsx");
     expect(html).toContain("src/App.tsx");
-    expect(html).toContain("export const app = true;");
+    expect(html).toContain("hljs-keyword");
+    expect(html).toContain("app =");
     expect(html).toContain("Select files or folders to download");
+    expect(html).not.toContain("Hide preview");
+    expect(html).not.toContain("Show preview");
     expect(html).not.toContain('type="checkbox"');
     expect(html).not.toContain("file-list-download");
     expect(normalizedHtml).toContain('autocomplete="off"');
     expect(normalizedHtml).toContain('autocorrect="off"');
     expect(normalizedHtml).toContain('autocapitalize="none"');
     expect(normalizedHtml).toContain('spellcheck="false"');
+  });
+
+  it("can restore Markdown source mode for open files", () => {
+    const tab = workspaceTab("tab-files", "/repo");
+    rememberFileBrowserPanelState(tab, fileBrowserState({
+      entries: [{ name: "README.md", type: "file" }],
+      opened: { path: "/repo/README.md", relativePath: "README.md", truncated: false, content: "# Title\n\n```ts\nconst value = true;\n```" },
+      markdownPreviewMode: "source"
+    }));
+
+    const html = renderToStaticMarkup(createElement(FileBrowserPanel, { tab, config: { showGitDiff: false } }));
+
+    expect(html).toContain("Markdown source");
+    expect(html).toContain("language-markdown");
+    expect(html).toContain("# Title");
+    expect(html).not.toContain("<h1>Title</h1>");
   });
 
   it("ignores cached state after cwd changes and disposes closed tabs", () => {
@@ -436,6 +514,7 @@ function fileBrowserState(overrides: Partial<FileBrowserPanelState> = {}): FileB
     searchVisible: false,
     gitBarVisible: true,
     gitDiffFilesVisible: true,
+    markdownPreviewMode: "rendered",
     fileTreeSize: 280,
     ...overrides
   };

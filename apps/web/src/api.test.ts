@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { callHook, closeTab, downloadFileBrowserEntries, fetchJson, filenameFromContentDisposition, getConfig, getHooks, setActiveTab, startAudioStream, submitTranscript, updateConfig, uploadFileBrowserFile, voiceAudioConstraints } from "./api.js";
+import { callHook, closeTab, downloadFileBrowserEntries, fetchJson, fileBrowserRawFileUrl, filenameFromContentDisposition, getConfig, getHooks, setActiveTab, startAudioStream, submitTranscript, updateConfig, uploadFileBrowserFile, voiceAudioConstraints } from "./api.js";
 
 describe("api client", () => {
   afterEach(() => {
@@ -56,18 +56,33 @@ describe("api client", () => {
     });
   });
 
-  it("uploads file browser blobs as octet streams", async () => {
-    const fetchMock = vi.fn(async () => jsonResponse({ path: "/repo/docs/demo.txt", relativePath: "docs/demo.txt", bytes: 5, uploaded: true }));
-    vi.stubGlobal("fetch", fetchMock);
+  it("builds raw file browser URLs for embedded previews", () => {
+    expect(fileBrowserRawFileUrl("tab 1", "docs/screenshots/panel.png")).toBe("/api/tabs/tab%201/files/raw?relativePath=docs%2Fscreenshots%2Fpanel.png");
+  });
+
+  it("uploads file browser blobs as octet streams with progress events", async () => {
     const file = new Blob(["hello"], { type: "text/plain" });
+    const progress: Array<{ loadedBytes: number; totalBytes?: number; lengthComputable: boolean }> = [];
+    const requests: TestXMLHttpRequest[] = [];
+    vi.stubGlobal("XMLHttpRequest", class extends TestXMLHttpRequest {
+      constructor() {
+        super({ path: "/repo/docs/demo.txt", relativePath: "docs/demo.txt", bytes: 5, uploaded: true });
+        requests.push(this);
+      }
+    });
 
-    await expect(uploadFileBrowserFile("tab-1", "docs/demo.txt", file)).resolves.toMatchObject({ relativePath: "docs/demo.txt", bytes: 5 });
+    await expect(uploadFileBrowserFile("tab-1", "docs/demo.txt", file, (event) => progress.push(event))).resolves.toMatchObject({ relativePath: "docs/demo.txt", bytes: 5 });
 
-    expect(fetchMock).toHaveBeenCalledWith("/api/tabs/tab-1/files/upload?relativePath=docs%2Fdemo.txt", {
+    expect(requests[0]).toMatchObject({
       method: "POST",
-      headers: { "content-type": "application/octet-stream" },
+      url: "/api/tabs/tab-1/files/upload?relativePath=docs%2Fdemo.txt",
+      requestHeaders: { "content-type": "application/octet-stream" },
       body: file
     });
+    expect(progress).toEqual([
+      { loadedBytes: 2, totalBytes: 5, lengthComputable: true },
+      { loadedBytes: 5, totalBytes: 5, lengthComputable: true }
+    ]);
   });
 
   it("parses utf-8 and plain content disposition filenames", () => {
@@ -268,6 +283,66 @@ function jsonResponse(value: unknown): Response {
 
 function tick(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+type TestXhrListener = (event: ProgressEvent) => void;
+
+class TestXmlHttpRequestUpload {
+  private readonly listeners = new Map<string, TestXhrListener[]>();
+
+  addEventListener(type: string, listener: TestXhrListener): void {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+  }
+
+  dispatchProgress(event: ProgressEvent): void {
+    for (const listener of this.listeners.get("progress") ?? []) {
+      listener(event);
+    }
+  }
+
+  dispatchLoad(event: ProgressEvent): void {
+    for (const listener of this.listeners.get("load") ?? []) {
+      listener(event);
+    }
+  }
+}
+
+class TestXMLHttpRequest {
+  readonly upload = new TestXmlHttpRequestUpload();
+  readonly requestHeaders: Record<string, string> = {};
+  method = "";
+  url = "";
+  body?: XMLHttpRequestBodyInit | Document | null;
+  status = 200;
+  responseText: string;
+  private readonly listeners = new Map<string, Array<() => void>>();
+
+  constructor(responseBody: unknown) {
+    this.responseText = JSON.stringify(responseBody);
+  }
+
+  addEventListener(type: string, listener: () => void): void {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+  }
+
+  open(method: string, url: string): void {
+    this.method = method;
+    this.url = url;
+  }
+
+  setRequestHeader(name: string, value: string): void {
+    this.requestHeaders[name.toLowerCase()] = value;
+  }
+
+  send(body?: XMLHttpRequestBodyInit | Document | null): void {
+    this.body = body;
+    const size = body instanceof Blob ? body.size : 0;
+    this.upload.dispatchProgress({ lengthComputable: true, loaded: Math.min(2, size), total: size } as ProgressEvent);
+    this.upload.dispatchLoad({ lengthComputable: true, loaded: size, total: size } as ProgressEvent);
+    for (const listener of this.listeners.get("load") ?? []) {
+      listener();
+    }
+  }
 }
 
 class FakeWebSocket extends EventTarget {

@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { once } from "node:events";
+import { randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import { createGzip } from "node:zlib";
 
@@ -15,11 +17,29 @@ export interface FileDownloadResult {
   archive: boolean;
 }
 
+export interface RawFileResult {
+  contentType: string;
+  stream: NodeJS.ReadableStream;
+}
+
 export interface FileUploadResult {
   path: string;
   relativePath: string;
   bytes: number;
   uploaded: true;
+}
+
+export interface FileUploadOptions {
+  maxBytes?: number;
+}
+
+export class FileUploadTooLargeError extends Error {
+  readonly statusCode = 413;
+
+  constructor(readonly maxBytes: number) {
+    super(`Upload exceeds the maximum size of ${formatBytes(maxBytes)}.`);
+    this.name = "FileUploadTooLargeError";
+  }
 }
 
 interface ResolvedTransferPath {
@@ -65,13 +85,27 @@ export class FileTransferService {
     };
   }
 
-  async upload(tab: WorkspaceTab, relativePath: unknown, body: unknown): Promise<FileUploadResult> {
+  async createRawFile(tab: WorkspaceTab, relativePath: unknown): Promise<RawFileResult> {
+    this.requireFileBrowserTab(tab);
+    const entry = await this.resolveExistingPath(tab, parseRelativePath(relativePath, "relativePath"));
+    if (!entry.stat.isFile()) {
+      throw new Error(`Raw file target is not a file: ${entry.resolvedPath}`);
+    }
+    await this.requireRealPathUnderCwd(tab, entry.resolvedPath);
+    return {
+      contentType: inlineContentTypeForPath(entry.resolvedPath),
+      stream: fs.createReadStream(entry.resolvedPath)
+    };
+  }
+
+  async upload(tab: WorkspaceTab, relativePath: unknown, body: unknown, options: FileUploadOptions = {}): Promise<FileUploadResult> {
     this.requireFileBrowserTab(tab);
     if (typeof relativePath !== "string" || !relativePath.trim()) {
       throw new Error("relativePath is required.");
     }
-    if (!Buffer.isBuffer(body)) {
-      throw new Error("Upload body must be a binary buffer.");
+    const bodyStream = uploadBodyStream(body);
+    if (Buffer.isBuffer(body) && options.maxBytes !== undefined && body.byteLength > options.maxBytes) {
+      throw new FileUploadTooLargeError(options.maxBytes);
     }
     const targetPath = this.resolvePathUnderCwd(tab, relativePath);
     if (relativeFor(tab, targetPath) === ".") {
@@ -91,11 +125,18 @@ export class FileTransferService {
     if (existing?.isSymbolicLink()) {
       throw new Error(`Upload target is a symbolic link: ${targetPath}`);
     }
-    await fsp.writeFile(targetPath, body);
+    const tempPath = path.join(path.dirname(targetPath), `.${path.basename(targetPath)}.cloudx-upload-${randomUUID()}.tmp`);
+    const bytes = await writeUploadStream(tempPath, bodyStream, options);
+    try {
+      await fsp.rename(tempPath, targetPath);
+    } catch (error) {
+      await removeFileIfPresent(tempPath);
+      throw error;
+    }
     return {
       path: targetPath,
       relativePath: relativeFor(tab, targetPath),
-      bytes: body.byteLength,
+      bytes,
       uploaded: true
     };
   }
@@ -200,12 +241,88 @@ function parseRelativePaths(value: unknown): string[] {
   if (!Array.isArray(value) || value.length === 0) {
     throw new Error("relativePaths must be a non-empty array.");
   }
-  return value.map((entry, index) => {
-    if (typeof entry !== "string") {
-      throw new Error(`relativePaths[${index}] must be a string.`);
-    }
-    return entry.trim() || ".";
+  return value.map((entry, index) => parseRelativePath(entry, `relativePaths[${index}]`));
+}
+
+function parseRelativePath(value: unknown, name: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`${name} must be a string.`);
+  }
+  return value.trim() || ".";
+}
+
+function uploadBodyStream(body: unknown): AsyncIterable<Buffer | Uint8Array | string> {
+  if (Buffer.isBuffer(body)) {
+    return Readable.from([body]);
+  }
+  if (body && typeof (body as AsyncIterable<unknown>)[Symbol.asyncIterator] === "function") {
+    return body as AsyncIterable<Buffer | Uint8Array | string>;
+  }
+  throw new Error("Upload body must be a binary stream.");
+}
+
+async function writeUploadStream(sourcePath: string, body: AsyncIterable<Buffer | Uint8Array | string>, options: FileUploadOptions): Promise<number> {
+  const stream = fs.createWriteStream(sourcePath, { flags: "wx" });
+  let bytes = 0;
+  let writeError: Error | undefined;
+  stream.on("error", (error) => {
+    writeError = error;
   });
+  try {
+    for await (const chunk of body) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += buffer.byteLength;
+      if (options.maxBytes !== undefined && bytes > options.maxBytes) {
+        throw new FileUploadTooLargeError(options.maxBytes);
+      }
+      if (!stream.write(buffer)) {
+        await once(stream, "drain");
+      }
+      if (writeError) {
+        throw writeError;
+      }
+    }
+    await closeWriteStream(stream);
+    return bytes;
+  } catch (error) {
+    await destroyWriteStream(stream);
+    await removeFileIfPresent(sourcePath);
+    throw error;
+  }
+}
+
+async function closeWriteStream(stream: fs.WriteStream): Promise<void> {
+  if (stream.closed) {
+    return;
+  }
+  stream.end();
+  await once(stream, "close");
+}
+
+async function destroyWriteStream(stream: fs.WriteStream): Promise<void> {
+  if (stream.closed) {
+    return;
+  }
+  stream.destroy();
+  await once(stream, "close");
+}
+
+async function removeFileIfPresent(filePath: string): Promise<void> {
+  await fsp.unlink(filePath).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "ENOENT") {
+      throw error;
+    }
+  });
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 ** 3) {
+    return `${bytes / 1024 ** 3} GiB`;
+  }
+  if (bytes >= 1024 ** 2) {
+    return `${bytes / 1024 ** 2} MiB`;
+  }
+  return `${bytes} bytes`;
 }
 
 function relativeFor(tab: WorkspaceTab, resolvedPath: string): string {
@@ -239,6 +356,38 @@ function sanitizeArchivePath(value: string): string {
     throw new Error(`Invalid archive path: ${value}`);
   }
   return normalized;
+}
+
+function inlineContentTypeForPath(filePath: string): string {
+  switch (path.extname(filePath).toLowerCase()) {
+    case ".apng":
+      return "image/apng";
+    case ".avif":
+      return "image/avif";
+    case ".bmp":
+      return "image/bmp";
+    case ".gif":
+      return "image/gif";
+    case ".ico":
+    case ".cur":
+      return "image/x-icon";
+    case ".jpg":
+    case ".jpeg":
+    case ".jfif":
+    case ".pjpeg":
+    case ".pjp":
+      return "image/jpeg";
+    case ".png":
+      return "image/png";
+    case ".svg":
+      return "image/svg+xml";
+    case ".webp":
+      return "image/webp";
+    case ".pdf":
+      return "application/pdf";
+    default:
+      return "application/octet-stream";
+  }
 }
 
 function createTarHeader(name: string, stat: fs.Stats, typeflag: "0" | "2" | "5", linkName = ""): Buffer {

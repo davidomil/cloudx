@@ -69,6 +69,12 @@ export interface FileUploadResponse {
   uploaded: true;
 }
 
+export interface FileUploadProgress {
+  loadedBytes: number;
+  totalBytes?: number;
+  lengthComputable: boolean;
+}
+
 export async function downloadFileBrowserEntries(tabId: string, relativePaths: string[]): Promise<FileDownloadResponse> {
   const response = await fetch(`/api/tabs/${encodeURIComponent(tabId)}/files/download`, {
     method: "POST",
@@ -85,17 +91,45 @@ export async function downloadFileBrowserEntries(tabId: string, relativePaths: s
   };
 }
 
-export async function uploadFileBrowserFile(tabId: string, relativePath: string, file: Blob): Promise<FileUploadResponse> {
+export function fileBrowserRawFileUrl(tabId: string, relativePath: string): string {
   const params = new URLSearchParams({ relativePath });
-  const response = await fetch(`/api/tabs/${encodeURIComponent(tabId)}/files/upload?${params.toString()}`, {
-    method: "POST",
-    headers: { "content-type": "application/octet-stream" },
-    body: file
+  return `/api/tabs/${encodeURIComponent(tabId)}/files/raw?${params.toString()}`;
+}
+
+export async function uploadFileBrowserFile(tabId: string, relativePath: string, file: Blob, onProgress?: (progress: FileUploadProgress) => void): Promise<FileUploadResponse> {
+  const params = new URLSearchParams({ relativePath });
+  return new Promise<FileUploadResponse>((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    let lastLoadedBytes = 0;
+    function reportProgress(loadedBytes: number, totalBytes: number | undefined, lengthComputable: boolean) {
+      lastLoadedBytes = loadedBytes;
+      onProgress?.({ loadedBytes, totalBytes, lengthComputable });
+    }
+    request.upload.addEventListener("progress", (event) => {
+      reportProgress(event.loaded, event.lengthComputable ? event.total : undefined, event.lengthComputable);
+    });
+    request.upload.addEventListener("load", () => {
+      if (lastLoadedBytes < file.size) {
+        reportProgress(file.size, file.size, true);
+      }
+    });
+    request.addEventListener("load", () => {
+      if (request.status < 200 || request.status >= 300) {
+        reject(new Error(errorMessageFromResponse(request.responseText, request.status)));
+        return;
+      }
+      try {
+        resolve(JSON.parse(request.responseText) as FileUploadResponse);
+      } catch (error) {
+        reject(error);
+      }
+    });
+    request.addEventListener("error", () => reject(new Error("Upload failed.")));
+    request.addEventListener("abort", () => reject(new Error("Upload aborted.")));
+    request.open("POST", `/api/tabs/${encodeURIComponent(tabId)}/files/upload?${params.toString()}`);
+    request.setRequestHeader("content-type", "application/octet-stream");
+    request.send(file);
   });
-  if (!response.ok) {
-    throw new Error(errorMessageFromResponse(await response.text(), response.status));
-  }
-  return (await response.json()) as FileUploadResponse;
 }
 
 export function saveBlobDownload(blob: Blob, filename: string): void {
