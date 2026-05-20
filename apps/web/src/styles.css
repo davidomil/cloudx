@@ -3140,8 +3140,9 @@ a:hover svg {
     grid-auto-rows: minmax(430px, 1fr);
     align-content: start;
     gap: 8px;
-    padding: 6px 6px 0;
+    padding: 6px 6px max(0px, var(--terminal-mobile-keyboard-inset, env(keyboard-inset-height, 0px)));
     overflow: auto;
+    scroll-padding-bottom: calc(var(--terminal-mobile-keyboard-inset, env(keyboard-inset-height, 0px)) + 16px);
     -webkit-overflow-scrolling: touch;
   }
 

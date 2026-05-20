@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
-import WebSocket, { WebSocketServer } from "ws";
+import WebSocket, { type RawData, WebSocketServer } from "ws";
 
 import { RULES_SKILLS_PLUGIN_ID } from "@cloudx/shared";
 
@@ -60,6 +60,29 @@ describe("buildServer", () => {
       expect(result.statusCode).toBe(200);
       expect(result.json().matches[0].window.name).toBe("Server Routes");
     } finally {
+      await app.close();
+    }
+  });
+
+  it("sends the authoritative workspace snapshot first on workspace websocket reconnect", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-workspace-ws-"));
+    const config = testConfig(root);
+    const app = await buildServer(config);
+    let client: WebSocket | undefined;
+    try {
+      await app.listen({ host: "127.0.0.1", port: 0 });
+      const address = app.server.address() as { port: number };
+      client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/workspace`);
+
+      await expect(readWebSocketJson(client)).resolves.toMatchObject({
+        type: "workspace",
+        tabs: expect.any(Array),
+        activeWindowId: expect.any(String),
+        windows: expect.any(Array),
+        templates: expect.any(Array)
+      });
+    } finally {
+      client?.close();
       await app.close();
     }
   });
@@ -688,4 +711,33 @@ function testConfig(root: string): AppConfig {
     appServerEnabled: false,
     terminalReplayBytes: 1024
   };
+}
+
+function readWebSocketJson(client: WebSocket): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    let timeout: ReturnType<typeof setTimeout>;
+    const cleanup = () => {
+      clearTimeout(timeout);
+      client.off("message", onMessage);
+      client.off("error", onError);
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onMessage = (message: RawData) => {
+      cleanup();
+      try {
+        resolve(JSON.parse(message.toString()) as Record<string, unknown>);
+      } catch (error) {
+        reject(error);
+      }
+    };
+    client.once("message", onMessage);
+    client.once("error", onError);
+    timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error("Timed out waiting for websocket message."));
+    }, 1000);
+  });
 }

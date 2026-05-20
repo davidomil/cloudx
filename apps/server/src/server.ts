@@ -534,7 +534,6 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
         ws.send(JSON.stringify(payload));
       }
     };
-    send({ type: "tabs", tabs: services.sessions.listTabs(), activeTabId: services.sessions.getActiveTabId() });
     const sendWorkspace = () => {
       void services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId()).then((state) => send({ type: "workspace", ...state }));
     };
