@@ -8,7 +8,6 @@ import type { GitDiffFile, GitDiffFileSummary, GitDiffSummary, GitFileStatus, Gi
 const execFileAsync = promisify(execFile);
 
 const MAX_GIT_OUTPUT_BYTES = 2_000_000;
-const MAX_DIFF_FILES = 300;
 const MAX_PATCH_BYTES = 400_000;
 
 interface GitCommandResult {
@@ -105,7 +104,6 @@ export class GitService {
     const resolvedCompareRef = await this.resolveCompareRef(cwd, compareRef);
     const pathspec = pathspecForCwd(state.rootPath, cwd);
     const files = new Map<string, GitDiffFileSummary>();
-    let truncated = false;
 
     if (resolvedCompareRef) {
       const nameStatus = await this.runGit(cwd, ["diff", "--name-status", "--find-renames", resolvedCompareRef, "--", pathspec]);
@@ -135,13 +133,8 @@ export class GitService {
       });
     }
 
-    let result = Array.from(files.values()).sort((a, b) => a.path.localeCompare(b.path));
-    if (result.length > MAX_DIFF_FILES) {
-      result = result.slice(0, MAX_DIFF_FILES);
-      truncated = true;
-    }
-
-    return { compareRef: resolvedCompareRef, files: result, truncated };
+    const result = Array.from(files.values()).sort((a, b) => a.path.localeCompare(b.path));
+    return { compareRef: resolvedCompareRef, files: result, truncated: false };
   }
 
   async openDiffFile(cwd: string, filePath: string, compareRef?: string): Promise<GitDiffFile> {

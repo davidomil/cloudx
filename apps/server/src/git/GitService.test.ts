@@ -122,6 +122,30 @@ describe("GitService", () => {
     });
   });
 
+  it("returns every changed file instead of truncating large diff summaries", async () => {
+    const service = new GitService();
+    const root = await createMainCommittedRepo("cloudx-git-many-diff-");
+    await git(root, "checkout", "-b", "feature/many-files");
+    await Promise.all(
+      Array.from({ length: 325 }, (_, index) => {
+        const fileName = `file-${String(index).padStart(3, "0")}.txt`;
+        return fs.writeFile(path.join(root, fileName), `file ${index}\n`);
+      })
+    );
+    await git(root, "add", ".");
+    await git(root, "-c", "user.name=Cloudx Test", "-c", "user.email=cloudx@example.test", "commit", "-m", "many files");
+
+    const diff = await service.listDiff(root, "main");
+
+    expect(diff.truncated).toBe(false);
+    expect(diff.files).toHaveLength(325);
+    expect(diff.files.at(-1)).toMatchObject({ path: "file-324.txt", status: "added" });
+    await expect(service.openDiffFile(root, "file-324.txt", "main")).resolves.toMatchObject({
+      path: "file-324.txt",
+      patch: expect.stringContaining("+file 324")
+    });
+  });
+
   it("reports untracked repository directories without reading them as files", async () => {
     const service = new GitService();
     const root = await createCommittedRepo("cloudx-git-untracked-dir-");

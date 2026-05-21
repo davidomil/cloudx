@@ -228,6 +228,7 @@ a:hover svg {
 .app-shell {
   position: relative;
   isolation: isolate;
+  height: 100vh;
   height: 100dvh;
   min-height: 0;
   display: grid;
@@ -3072,8 +3073,8 @@ a:hover svg {
 
   .app-shell {
     grid-template-rows: auto auto minmax(0, 1fr) auto;
+    height: 100vh;
     height: 100svh;
-    height: 100dvh;
   }
 
   .topbar {
@@ -3158,15 +3159,15 @@ a:hover svg {
     right: 10px;
     left: 10px;
     width: auto;
+    max-height: calc(100vh - 116px);
     max-height: calc(100svh - 116px);
-    max-height: calc(100dvh - 116px);
     z-index: 260;
   }
 
   .template-menu {
     top: max(128px, calc(env(safe-area-inset-top) + 128px));
+    max-height: calc(100vh - 148px);
     max-height: calc(100svh - 148px);
-    max-height: calc(100dvh - 148px);
   }
 
   .window-menu-row,
@@ -3476,7 +3477,8 @@ a:hover svg {
   }
 
   .dialog {
-    max-height: calc(100dvh - 32px);
+    max-height: calc(100vh - 32px);
+    max-height: calc(100svh - 32px);
     overflow: auto;
   }
 }
