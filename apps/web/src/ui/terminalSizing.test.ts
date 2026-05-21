@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { bottomRevealScrollDelta, rowsFittingTerminalViewport, visualViewportBottomInset } from "./terminalSizing.js";
+import { bottomRevealScrollDelta, rowsFittingTerminalViewport, shouldFocusTerminalAfterFit, visualViewportBottomInset } from "./terminalSizing.js";
 
 describe("terminal sizing", () => {
   it("keeps rows unchanged when the rendered terminal screen fits the viewport", () => {
@@ -13,6 +13,12 @@ describe("terminal sizing", () => {
 
   it("never returns fewer than one row", () => {
     expect(rowsFittingTerminalViewport(1, 1, 100)).toBe(1);
+  });
+
+  it("focuses the terminal after activation fits but not viewport change fits", () => {
+    expect(shouldFocusTerminalAfterFit({ active: true, trigger: "activation" })).toBe(true);
+    expect(shouldFocusTerminalAfterFit({ active: true, trigger: "viewport-change" })).toBe(false);
+    expect(shouldFocusTerminalAfterFit({ active: false, trigger: "activation" })).toBe(false);
   });
 
   it("computes bottom space covered below the visual viewport", () => {

@@ -10,6 +10,17 @@ export function rowsFittingTerminalViewport(currentRows: number, viewportHeight:
   return Math.max(1, currentRows - rowsToRemove);
 }
 
+export type TerminalFitTrigger = "activation" | "viewport-change";
+
+export interface TerminalFocusAfterFitInput {
+  active: boolean;
+  trigger: TerminalFitTrigger;
+}
+
+export function shouldFocusTerminalAfterFit(input: TerminalFocusAfterFitInput): boolean {
+  return input.active && input.trigger === "activation";
+}
+
 export interface VisualViewportBottomInsetInput {
   layoutViewportHeight: number;
   visualViewportHeight?: number;

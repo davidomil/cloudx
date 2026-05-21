@@ -4,7 +4,7 @@ import { FitAddon } from "@xterm/addon-fit";
 
 import type { WorkspaceTab } from "@cloudx/shared";
 import { installTerminalMobileScroller } from "./terminalMobileScroll.js";
-import { bottomRevealScrollDelta, rowsFittingTerminalViewport, visualViewportBottomInset } from "./terminalSizing.js";
+import { bottomRevealScrollDelta, rowsFittingTerminalViewport, shouldFocusTerminalAfterFit, visualViewportBottomInset } from "./terminalSizing.js";
 import { readTerminalColorTheme, type TerminalColorTheme } from "./theme.js";
 import { DEFAULT_UI_SCALE, scaledTerminalFontSize } from "./uiScale.js";
 
@@ -14,6 +14,10 @@ interface TerminalView {
   socket: WebSocket;
   container?: HTMLDivElement;
   fitFrame?: number;
+  keyboardInsetFrame?: number;
+  revealTimer?: number;
+  pendingFitFocus?: boolean;
+  keyboardInsetStyleValue?: string;
   releaseMobileScroll?: () => void;
   uiScale: number;
 }
@@ -37,19 +41,22 @@ export function TerminalPanel({ tab, active, uiScale }: { tab: WorkspaceTab; act
     const view = getTerminalView(tab, containerRef.current, uiScale);
     viewRef.current = view;
 
-    const resizeObserver = new ResizeObserver(() => scheduleFitAndResize(view, activeRef.current));
+    const scheduleViewportFit = () => scheduleFitAndResize(view, shouldFocusTerminalAfterFit({ active: activeRef.current, trigger: "viewport-change" }));
+    const scheduleViewportInset = () => scheduleTerminalKeyboardInsetUpdate(view);
+    const resizeObserver = new ResizeObserver(scheduleViewportFit);
     resizeObserver.observe(containerRef.current);
-    const onViewportResize = () => scheduleFitAndResize(view, activeRef.current);
-    window.addEventListener("resize", onViewportResize);
-    window.visualViewport?.addEventListener("resize", onViewportResize);
-    window.visualViewport?.addEventListener("scroll", onViewportResize);
-    scheduleFitAndResize(view, active);
+    window.addEventListener("resize", scheduleViewportFit);
+    window.visualViewport?.addEventListener("resize", scheduleViewportFit);
+    window.visualViewport?.addEventListener("scroll", scheduleViewportInset);
+    scheduleFitAndResize(view, shouldFocusTerminalAfterFit({ active, trigger: "activation" }));
 
     return () => {
       resizeObserver.disconnect();
-      window.removeEventListener("resize", onViewportResize);
-      window.visualViewport?.removeEventListener("resize", onViewportResize);
-      window.visualViewport?.removeEventListener("scroll", onViewportResize);
+      window.removeEventListener("resize", scheduleViewportFit);
+      window.visualViewport?.removeEventListener("resize", scheduleViewportFit);
+      window.visualViewport?.removeEventListener("scroll", scheduleViewportInset);
+      cancelTerminalKeyboardInsetUpdate(view);
+      cancelTerminalInputReveal(view);
       clearTerminalKeyboardInset(view);
       viewRef.current = null;
     };
@@ -58,7 +65,7 @@ export function TerminalPanel({ tab, active, uiScale }: { tab: WorkspaceTab; act
   useEffect(() => {
     const view = viewRef.current;
     if (view) {
-      scheduleFitAndResize(view, active);
+      scheduleFitAndResize(view, shouldFocusTerminalAfterFit({ active, trigger: "activation" }));
     }
   }, [active]);
 
@@ -68,9 +75,9 @@ export function TerminalPanel({ tab, active, uiScale }: { tab: WorkspaceTab; act
 export function disposeTerminalView(tabId: string): void {
   const view = terminalViews.get(tabId);
   if (!view) return;
-  if (view.fitFrame !== undefined) {
-    window.cancelAnimationFrame(view.fitFrame);
-  }
+  cancelScheduledFit(view);
+  cancelTerminalKeyboardInsetUpdate(view);
+  cancelTerminalInputReveal(view);
   view.socket.close();
   view.releaseMobileScroll?.();
   view.terminal.dispose();
@@ -186,9 +193,12 @@ function fitAndResize(view: TerminalView, focus = false): void {
   if (focus) {
     view.terminal.focus();
   }
-  updateTerminalKeyboardInset(view);
+  const keyboardInsetUpdate = updateTerminalKeyboardInset(view);
   if (focus) {
+    cancelTerminalInputReveal(view);
     keepTerminalInputVisible(view);
+  } else if (keyboardInsetUpdate.changed && keyboardInsetUpdate.inset > 0) {
+    scheduleTerminalInputReveal(view);
   }
   if (view.socket.readyState === WebSocket.OPEN) {
     view.socket.send(JSON.stringify({ type: "resize", cols: view.terminal.cols, rows: view.terminal.rows }));
@@ -208,29 +218,82 @@ function trimTerminalRowsToViewport(terminal: Terminal): void {
 }
 
 function scheduleFitAndResize(view: TerminalView, focus = false): void {
+  view.pendingFitFocus = view.pendingFitFocus === true || focus;
   if (view.fitFrame !== undefined) {
-    window.cancelAnimationFrame(view.fitFrame);
+    return;
   }
   view.fitFrame = window.requestAnimationFrame(() => {
+    const shouldFocus = view.pendingFitFocus === true;
+    view.pendingFitFocus = false;
     view.fitFrame = undefined;
-    fitAndResize(view, focus);
+    fitAndResize(view, shouldFocus);
   });
 }
 
-function updateTerminalKeyboardInset(view: TerminalView): void {
+function cancelScheduledFit(view: TerminalView): void {
+  if (view.fitFrame !== undefined) {
+    window.cancelAnimationFrame(view.fitFrame);
+    view.fitFrame = undefined;
+  }
+  view.pendingFitFocus = false;
+}
+
+function scheduleTerminalKeyboardInsetUpdate(view: TerminalView): void {
+  if (view.keyboardInsetFrame !== undefined) {
+    return;
+  }
+  view.keyboardInsetFrame = window.requestAnimationFrame(() => {
+    view.keyboardInsetFrame = undefined;
+    const keyboardInsetUpdate = updateTerminalKeyboardInset(view);
+    if (keyboardInsetUpdate.changed && keyboardInsetUpdate.inset > 0) {
+      scheduleTerminalInputReveal(view);
+    }
+  });
+}
+
+function cancelTerminalKeyboardInsetUpdate(view: TerminalView): void {
+  if (view.keyboardInsetFrame !== undefined) {
+    window.cancelAnimationFrame(view.keyboardInsetFrame);
+    view.keyboardInsetFrame = undefined;
+  }
+}
+
+function scheduleTerminalInputReveal(view: TerminalView): void {
+  cancelTerminalInputReveal(view);
+  view.revealTimer = window.setTimeout(() => {
+    view.revealTimer = undefined;
+    keepTerminalInputVisible(view);
+  }, 120);
+}
+
+function cancelTerminalInputReveal(view: TerminalView): void {
+  if (view.revealTimer !== undefined) {
+    window.clearTimeout(view.revealTimer);
+    view.revealTimer = undefined;
+  }
+}
+
+function updateTerminalKeyboardInset(view: TerminalView): { inset: number; changed: boolean } {
   const paneRoot = terminalPaneRoot(view);
   if (!paneRoot) {
-    return;
+    return { inset: 0, changed: false };
   }
   const inset = currentVisualViewportBottomInset();
+  const nextValue = inset > 0 ? `${inset}px` : undefined;
+  if (view.keyboardInsetStyleValue === nextValue) {
+    return { inset, changed: false };
+  }
+  view.keyboardInsetStyleValue = nextValue;
   if (inset > 0) {
     paneRoot.style.setProperty(TERMINAL_KEYBOARD_INSET_PROPERTY, `${inset}px`);
-    return;
+    return { inset, changed: true };
   }
   paneRoot.style.removeProperty(TERMINAL_KEYBOARD_INSET_PROPERTY);
+  return { inset, changed: true };
 }
 
 function clearTerminalKeyboardInset(view: TerminalView): void {
+  view.keyboardInsetStyleValue = undefined;
   terminalPaneRoot(view)?.style.removeProperty(TERMINAL_KEYBOARD_INSET_PROPERTY);
 }
 
