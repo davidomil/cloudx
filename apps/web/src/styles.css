@@ -17,6 +17,19 @@
   --font-heading: "Orbitron", "Share Tech Mono", monospace;
   --font-body: "JetBrains Mono", "Fira Code", Consolas, monospace;
   --font-label: "Share Tech Mono", "JetBrains Mono", monospace;
+  --automation-minimap-background: rgb(8 8 12 / 0.94);
+  --automation-minimap-mask: rgb(10 10 15 / 0.62);
+  --automation-minimap-mask-stroke: var(--color-accent);
+  --automation-minimap-node: var(--color-accent-tertiary);
+  --automation-minimap-node-stroke: var(--color-border);
+  --automation-minimap-border: rgb(0 212 255 / 0.28);
+  --automation-minimap-shadow: 0 10px 24px rgb(0 0 0 / 0.34), 0 0 14px rgb(0 212 255 / 0.08);
+  --automation-controls-background: rgb(8 8 12 / 0.94);
+  --automation-controls-foreground: var(--color-accent-tertiary);
+  --automation-controls-hover-background: var(--color-accent-tertiary);
+  --automation-controls-hover-foreground: var(--color-background);
+  --automation-controls-border: rgb(0 212 255 / 0.28);
+  --automation-controls-shadow: 0 10px 24px rgb(0 0 0 / 0.34), 0 0 14px rgb(0 212 255 / 0.08);
   --shadow-neon: 0 0 5px #00ff88, 0 0 10px #00ff8840;
   --shadow-neon-sm: 0 0 3px #00ff88, 0 0 6px #00ff8830;
   --shadow-neon-lg: 0 0 10px #00ff88, 0 0 20px #00ff8860, 0 0 40px #00ff8830;
@@ -899,6 +912,86 @@ a:hover svg {
   box-shadow: var(--shadow-danger);
 }
 
+.notification-stack {
+  position: fixed;
+  top: calc(54px * var(--ui-scale));
+  right: 12px;
+  z-index: 80;
+  width: min(360px, calc(100vw - 24px));
+  display: grid;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.notification-toast {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 30px;
+  gap: 8px;
+  align-items: start;
+  padding: 10px;
+  color: var(--color-foreground);
+  background: rgb(10 10 15 / 0.96);
+  border: 1px solid rgb(0 212 255 / 0.38);
+  box-shadow: var(--shadow-neon-tertiary), 0 16px 34px rgb(0 0 0 / 0.38);
+  clip-path: var(--chamfer-sm);
+  pointer-events: auto;
+}
+
+.notification-toast.success {
+  border-color: rgb(0 255 136 / 0.48);
+  box-shadow: var(--shadow-neon-sm), 0 16px 34px rgb(0 0 0 / 0.38);
+}
+
+.notification-toast.warning {
+  border-color: rgb(255 209 102 / 0.54);
+}
+
+.notification-toast.error {
+  border-color: rgb(255 51 102 / 0.54);
+  box-shadow: var(--shadow-danger), 0 16px 34px rgb(0 0 0 / 0.38);
+}
+
+.notification-toast strong,
+.notification-toast p {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.notification-toast strong {
+  display: block;
+  font-family: var(--font-label);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.notification-toast p {
+  margin-top: 4px;
+  color: var(--color-muted-foreground);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.notification-toast button {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  color: var(--color-muted-foreground);
+  background: rgb(18 18 26 / 0.86);
+  border: 1px solid rgb(42 42 58 / 0.92);
+  clip-path: var(--chamfer-xs);
+  cursor: pointer;
+}
+
+.notification-toast button:hover {
+  color: var(--color-foreground);
+  border-color: rgb(0 212 255 / 0.46);
+}
+
 .pane-root {
   grid-row: 3;
   min-height: 0;
@@ -1096,6 +1189,7 @@ a:hover svg {
 .file-browser-panel,
 .worktree-manager-panel,
 .web-viewer-panel,
+.automation-panel,
 .plugin-webview-panel {
   background:
     linear-gradient(180deg, rgb(0 255 136 / 0.035), transparent 38%),
@@ -1198,6 +1292,866 @@ a:hover svg {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.automation-panel {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 230px minmax(0, 1fr) 285px;
+  grid-template-rows: minmax(0, 1fr) 132px;
+  overflow: hidden;
+  color: var(--color-foreground);
+}
+
+.automation-rail,
+.automation-inspector,
+.automation-run-drawer {
+  min-width: 0;
+  min-height: 0;
+  background: rgb(10 10 15 / 0.74);
+  border-color: rgb(42 42 58 / 0.94);
+}
+
+.automation-rail {
+  grid-row: 1 / 3;
+  border-right: 1px solid rgb(42 42 58 / 0.94);
+  overflow: hidden;
+}
+
+.automation-rail-header,
+.automation-inspector-header,
+.automation-run-header,
+.automation-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 42px;
+  padding: 7px 9px;
+  border-bottom: 1px solid rgb(42 42 58 / 0.86);
+  font-family: var(--font-label);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.automation-rail-header {
+  justify-content: space-between;
+}
+
+.automation-rail-title {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.automation-rail-header svg,
+.automation-toolbar svg {
+  color: var(--color-accent);
+}
+
+.automation-create-form {
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+  border-bottom: 1px solid rgb(42 42 58 / 0.86);
+}
+
+.automation-create-form label {
+  display: grid;
+  gap: 5px;
+  color: var(--color-muted-foreground);
+  font-family: var(--font-label);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.automation-create-form input {
+  min-width: 0;
+  width: 100%;
+  min-height: 30px;
+  padding: 0 8px;
+  color: var(--color-foreground);
+  background: rgb(18 18 26 / 0.88);
+  border: 1px solid rgb(0 212 255 / 0.28);
+  clip-path: var(--chamfer-xs);
+  outline: 0;
+  letter-spacing: 0;
+}
+
+.automation-create-actions {
+  display: flex;
+  gap: 7px;
+}
+
+.automation-create-actions .cx-button {
+  flex: 1 1 0;
+}
+
+.automation-group-list {
+  height: calc(100% - 42px);
+  padding: 8px;
+  overflow-y: auto;
+}
+
+.automation-group {
+  width: 100%;
+  min-height: 54px;
+  display: grid;
+  gap: 4px;
+  padding: 9px;
+  color: var(--color-muted-foreground);
+  text-align: left;
+  background: rgb(18 18 26 / 0.78);
+  border: 1px solid rgb(42 42 58 / 0.94);
+  clip-path: var(--chamfer-sm);
+  cursor: pointer;
+}
+
+.automation-group + .automation-group {
+  margin-top: 8px;
+}
+
+.automation-group span,
+.automation-group small,
+.automation-status,
+.automation-run small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.automation-group.selected {
+  color: var(--color-background);
+  background: linear-gradient(90deg, var(--color-accent), var(--color-accent-tertiary));
+  border-color: var(--color-accent);
+  box-shadow: var(--shadow-neon-sm);
+}
+
+.automation-group.selected.dirty {
+  background: linear-gradient(90deg, var(--color-warning), var(--color-accent-tertiary));
+  border-color: var(--color-warning);
+}
+
+.automation-workbench {
+  grid-column: 2;
+  grid-row: 1;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.automation-toolbar {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.automation-search {
+  flex: 0 1 220px;
+  min-width: 120px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 8px;
+  background: rgb(18 18 26 / 0.86);
+  border: 1px solid rgb(0 212 255 / 0.28);
+  clip-path: var(--chamfer-sm);
+}
+
+.automation-search input {
+  min-width: 0;
+  width: 100%;
+  color: var(--color-foreground);
+  background: transparent;
+  border: 0;
+  outline: 0;
+  font: inherit;
+  letter-spacing: 0;
+}
+
+.automation-status {
+  flex: 1 1 auto;
+  color: var(--color-muted-foreground);
+  font-size: 10px;
+  letter-spacing: 0;
+}
+
+.automation-save-state {
+  flex: 0 0 auto;
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 8px;
+  color: var(--color-background);
+  background: var(--color-accent);
+  clip-path: var(--chamfer-xs);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0;
+}
+
+.automation-save-state.dirty {
+  color: rgb(18 18 26);
+  background: var(--color-warning);
+}
+
+.automation-canvas {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+}
+
+.automation-canvas .react-flow {
+  --xy-controls-button-background-color: var(--automation-controls-background);
+  --xy-controls-button-background-color-default: var(--automation-controls-background);
+  --xy-controls-button-background-color-hover: var(--automation-controls-hover-background);
+  --xy-controls-button-background-color-hover-default: var(--automation-controls-hover-background);
+  --xy-controls-button-color: var(--automation-controls-foreground);
+  --xy-controls-button-color-default: var(--automation-controls-foreground);
+  --xy-controls-button-color-hover: var(--automation-controls-hover-foreground);
+  --xy-controls-button-color-hover-default: var(--automation-controls-hover-foreground);
+  --xy-controls-button-border-color: var(--automation-controls-border);
+  --xy-controls-button-border-color-default: var(--automation-controls-border);
+  --xy-controls-box-shadow: none;
+  --xy-controls-box-shadow-default: none;
+
+  background:
+    linear-gradient(135deg, rgb(0 255 136 / 0.07), transparent 34%),
+    rgb(8 8 12 / 0.88);
+}
+
+.automation-canvas .react-flow__controls {
+  border: 1px solid var(--automation-controls-border);
+  background: var(--automation-controls-background);
+  clip-path: var(--chamfer-xs);
+  box-shadow: var(--automation-controls-shadow);
+  overflow: hidden;
+}
+
+.automation-canvas .react-flow__controls-button {
+  color: var(--automation-controls-foreground);
+}
+
+.automation-canvas .react-flow__controls-button:hover {
+  color: var(--automation-controls-hover-foreground);
+}
+
+.automation-canvas .react-flow__minimap {
+  border: 1px solid var(--automation-minimap-border);
+  background: var(--automation-minimap-background);
+  clip-path: var(--chamfer-xs);
+  box-shadow: var(--automation-minimap-shadow);
+}
+
+.automation-routed-edge {
+  stroke: var(--color-accent-tertiary);
+  stroke-width: 1.7;
+  fill: none;
+  stroke-linecap: square;
+  stroke-linejoin: miter;
+}
+
+.automation-routed-edge.exec {
+  stroke: var(--color-accent);
+  stroke-width: 2;
+}
+
+.automation-routed-edge.animated {
+  stroke-dasharray: 9 7;
+  animation: automation-edge-flow 0.85s linear infinite;
+}
+
+.automation-edge-route-drag-path {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 18;
+  cursor: ew-resize;
+  pointer-events: stroke;
+}
+
+.automation-edge-route-handle {
+  fill: rgb(8 8 12 / 0.96);
+  stroke: var(--color-accent-tertiary);
+  stroke-width: 1.5;
+  opacity: 0.76;
+  pointer-events: all;
+  shape-rendering: crispEdges;
+}
+
+.automation-edge-route-handle.exec {
+  stroke: var(--color-accent);
+}
+
+.automation-edge-route-handle.x-axis {
+  cursor: ew-resize;
+}
+
+.automation-edge-route-handle.y-axis {
+  cursor: ns-resize;
+}
+
+.automation-edge-route-handle.xy-axis {
+  cursor: move;
+}
+
+.automation-edge-route-handle:hover,
+.automation-edge-route-handle.selected {
+  fill: rgb(255 209 102 / 0.92);
+  stroke: rgb(255 255 255 / 0.95);
+  opacity: 1;
+}
+
+.automation-edge-route-handle:active {
+  cursor: grabbing;
+}
+
+@keyframes automation-edge-flow {
+  to {
+    stroke-dashoffset: -16;
+  }
+}
+
+.automation-node {
+  position: relative;
+  width: 210px;
+  color: var(--color-foreground);
+  background: rgb(18 18 26 / 0.96);
+  border: 1px solid rgb(0 212 255 / 0.35);
+  box-shadow: 0 12px 28px rgb(0 0 0 / 0.34);
+  clip-path: var(--chamfer-sm);
+  overflow: visible;
+}
+
+.automation-node.trigger {
+  border-color: rgb(0 255 136 / 0.46);
+}
+
+.automation-node.function {
+  border-color: rgb(0 212 255 / 0.48);
+}
+
+.automation-node.converter {
+  border-color: rgb(255 209 102 / 0.48);
+}
+
+.automation-node.selected {
+  background:
+    linear-gradient(180deg, rgb(255 209 102 / 0.075), transparent 56%),
+    rgb(18 18 26 / 0.96);
+  border-color: rgb(255 209 102 / 0.68);
+  box-shadow:
+    0 0 0 1px rgb(255 209 102 / 0.22),
+    0 0 18px rgb(255 209 102 / 0.12),
+    0 12px 28px rgb(0 0 0 / 0.34);
+}
+
+.automation-node-title {
+  display: grid;
+  gap: 3px;
+  padding: 9px 10px 7px;
+  border-bottom: 1px solid rgb(42 42 58 / 0.84);
+}
+
+.automation-node-title span {
+  overflow: hidden;
+  font-family: var(--font-label);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.automation-node-title small,
+.automation-node-summary,
+.automation-port,
+.automation-node-inspector small,
+.automation-run small,
+.automation-group small {
+  color: var(--color-muted-foreground);
+  font-family: var(--font-label);
+  font-size: 10px;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.automation-node-summary {
+  min-width: 0;
+  display: block;
+  overflow: hidden;
+  color: rgb(0 212 255 / 0.88);
+  font-family: var(--font-body);
+  font-size: 11px;
+  font-style: normal;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  text-transform: none;
+  white-space: nowrap;
+}
+
+.automation-node.selected .automation-node-summary {
+  color: rgb(255 209 102 / 0.95);
+}
+
+.automation-node-ports {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  padding: 8px 9px 9px;
+}
+
+.automation-port {
+  position: relative;
+  height: 22px;
+  display: flex;
+  align-items: center;
+}
+
+.automation-port-label {
+  min-width: 0;
+  max-width: 78px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  outline: 0;
+  cursor: help;
+}
+
+.automation-port-tooltip {
+  position: fixed;
+  z-index: 1000;
+  padding: 7px 8px;
+  overflow-y: auto;
+  color: var(--color-foreground);
+  background: rgb(6 8 12 / 0.98);
+  border: 1px solid rgb(0 212 255 / 0.36);
+  box-shadow: 0 12px 24px rgb(0 0 0 / 0.36);
+  clip-path: var(--chamfer-xs);
+  font-family: var(--font-body);
+  font-size: 11px;
+  line-height: 1.35;
+  text-align: left;
+  text-transform: none;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  opacity: 1;
+  pointer-events: none;
+}
+
+.automation-port.input {
+  justify-content: flex-start;
+  padding-left: 17px;
+}
+
+.automation-port.output {
+  justify-content: flex-end;
+  padding-right: 17px;
+  text-align: right;
+}
+
+.automation-port .react-flow__handle {
+  width: 9px;
+  height: 9px;
+  border: 1px solid var(--color-background);
+  background: var(--color-accent-tertiary);
+  cursor: crosshair;
+}
+
+.automation-port .react-flow__handle::before {
+  content: "";
+  position: absolute;
+  inset: -8px;
+  border-radius: 999px;
+}
+
+.automation-port.exec .react-flow__handle {
+  background: var(--color-accent);
+}
+
+.automation-palette {
+  position: fixed;
+  z-index: 50;
+  width: min(286px, calc(100vw - 20px));
+  max-height: min(520px, calc(100vh - 20px));
+  padding: 5px;
+  overflow-y: auto;
+  background: rgb(17 18 22 / 0.99);
+  border: 1px solid rgb(78 82 92 / 0.92);
+  box-shadow: 0 18px 40px rgb(0 0 0 / 0.58);
+  clip-path: var(--chamfer-xs);
+}
+
+.automation-palette-title {
+  padding: 3px 5px 5px;
+  color: rgb(210 214 222 / 0.88);
+  font-family: var(--font-label);
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.automation-palette-search {
+  min-width: 0;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 5px;
+  padding: 0 6px;
+  color: var(--color-muted-foreground);
+  background: rgb(8 9 12 / 0.96);
+  border: 1px solid rgb(74 78 88 / 0.85);
+  clip-path: var(--chamfer-xs);
+}
+
+.automation-palette-search input {
+  min-width: 0;
+  width: 100%;
+  color: var(--color-foreground);
+  background: transparent;
+  border: 0;
+  outline: 0;
+  font-size: 10px;
+  line-height: 1.2;
+}
+
+.automation-palette-groups {
+  display: grid;
+  gap: 4px;
+}
+
+.automation-palette-group {
+  display: grid;
+  gap: 1px;
+}
+
+.automation-palette-group-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 3px 5px 2px;
+  color: rgb(150 158 174 / 0.92);
+  font-family: var(--font-label);
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.automation-palette-group-title span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.automation-palette-empty {
+  margin: 0;
+  padding: 6px 5px;
+  color: var(--color-muted-foreground);
+  font-size: 10px;
+}
+
+.automation-palette button {
+  width: 100%;
+  min-height: 25px;
+  display: grid;
+  gap: 1px;
+  margin: 0;
+  padding: 4px 6px;
+  color: rgb(225 229 236 / 0.92);
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  clip-path: none;
+  cursor: pointer;
+}
+
+.automation-palette button span {
+  min-width: 0;
+  overflow: hidden;
+  font-family: var(--font-body);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.automation-palette button small {
+  min-width: 0;
+  overflow: hidden;
+  color: rgb(140 148 162 / 0.86);
+  font-size: 8px;
+  line-height: 1.05;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.automation-palette button:hover {
+  color: rgb(255 255 255);
+  background: rgb(54 91 140 / 0.88);
+  border-color: rgb(98 142 198 / 0.72);
+}
+
+.automation-inspector {
+  grid-column: 3;
+  grid-row: 1 / 3;
+  border-left: 1px solid rgb(42 42 58 / 0.94);
+  overflow-y: auto;
+}
+
+.automation-inspector-header {
+  justify-content: space-between;
+}
+
+.automation-delete-button {
+  width: auto;
+  min-width: 0;
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 9px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.automation-inspector > p,
+.automation-validation,
+.automation-node-inspector {
+  padding: 10px;
+}
+
+.automation-node-inspector {
+  display: grid;
+  gap: 9px;
+  border-bottom: 1px solid rgb(42 42 58 / 0.72);
+}
+
+.automation-node-inspector label {
+  display: grid;
+  gap: 5px;
+  font-size: 12px;
+}
+
+.automation-node-inspector input,
+.automation-node-inspector select,
+.automation-node-inspector textarea {
+  min-width: 0;
+  width: 100%;
+  min-height: 32px;
+  padding: 0 8px;
+  color: var(--color-foreground);
+  background: rgb(18 18 26 / 0.88);
+  border: 1px solid rgb(0 212 255 / 0.28);
+  clip-path: var(--chamfer-xs);
+  outline: 0;
+  letter-spacing: 0;
+}
+
+.automation-node-inspector textarea {
+  min-height: 72px;
+  padding: 8px;
+  resize: vertical;
+  line-height: 1.35;
+}
+
+.automation-node-inspector label.connected span {
+  color: rgb(150 158 174 / 0.82);
+}
+
+.automation-node-inspector input:disabled,
+.automation-node-inspector select:disabled,
+.automation-node-inspector textarea:disabled {
+  color: rgb(140 148 162 / 0.86);
+  background: rgb(14 15 20 / 0.86);
+  border-color: rgb(80 84 96 / 0.7);
+  cursor: not-allowed;
+  opacity: 1;
+}
+
+.automation-fstring-config,
+.automation-dynamic-inputs {
+  display: grid;
+  gap: 8px;
+}
+
+.automation-dynamic-inputs-title,
+.automation-dynamic-input-row {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.automation-dynamic-inputs-title {
+  justify-content: space-between;
+  color: var(--color-muted-foreground);
+  font-family: var(--font-label);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.automation-dynamic-input-row input {
+  flex: 1 1 auto;
+}
+
+.automation-dynamic-input-row .icon-button,
+.automation-dynamic-inputs-title .icon-button {
+  flex: 0 0 auto;
+}
+
+.automation-config-help {
+  color: var(--color-muted-foreground);
+  font-size: 11px;
+  line-height: 1.35;
+  text-transform: none;
+}
+
+.automation-config-help.connected {
+  color: rgb(255 209 102 / 0.86);
+}
+
+.automation-validation {
+  display: grid;
+  gap: 7px;
+  font-size: 12px;
+}
+
+.automation-unsaved-note {
+  color: var(--color-warning);
+  font-size: 11px;
+  line-height: 1.35;
+  text-transform: none;
+}
+
+.automation-validation p {
+  margin: 0;
+  color: var(--color-muted-foreground);
+}
+
+.automation-diagnostic.error {
+  color: var(--color-destructive);
+}
+
+.automation-diagnostic.warning {
+  color: var(--color-warning);
+}
+
+.automation-run-drawer {
+  grid-column: 2;
+  grid-row: 2;
+  border-top: 1px solid rgb(42 42 58 / 0.94);
+  overflow-y: auto;
+}
+
+.automation-run-header {
+  justify-content: space-between;
+}
+
+.automation-run {
+  min-height: 32px;
+  display: grid;
+  grid-template-columns: 18px 90px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  color: var(--color-muted-foreground);
+  border-top: 1px solid rgb(42 42 58 / 0.42);
+  font-size: 12px;
+}
+
+.automation-run.succeeded {
+  color: var(--color-accent);
+}
+
+.automation-run.failed {
+  color: var(--color-destructive);
+}
+
+.automation-test-sample {
+  margin: 8px 10px 10px;
+  padding: 8px;
+  color: var(--color-muted-foreground);
+  background: rgb(18 18 26 / 0.74);
+  border: 1px solid rgb(42 42 58 / 0.86);
+  clip-path: var(--chamfer-xs);
+}
+
+.automation-test-sample.succeeded {
+  border-color: rgb(0 255 136 / 0.35);
+}
+
+.automation-test-sample.failed {
+  border-color: rgb(255 80 80 / 0.46);
+}
+
+.automation-test-sample-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--color-foreground);
+  font-family: var(--font-label);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.automation-test-sample-title small {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-muted-foreground);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.automation-test-sample pre {
+  max-height: 92px;
+  margin: 7px 0;
+  padding: 7px;
+  overflow: auto;
+  color: var(--color-foreground);
+  background: rgb(8 8 12 / 0.78);
+  border: 1px solid rgb(42 42 58 / 0.7);
+  font-size: 11px;
+  line-height: 1.35;
+  white-space: pre-wrap;
+}
+
+.automation-test-trace {
+  display: grid;
+  gap: 4px;
+}
+
+.automation-test-trace p {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.automation-test-trace .error {
+  color: var(--color-destructive);
+}
+
+.automation-test-trace .warn {
+  color: var(--color-warning);
 }
 
 .resize-handle {
@@ -3474,6 +4428,82 @@ a:hover svg {
     bottom: 10px;
     left: 10px;
     width: auto;
+  }
+
+  .automation-panel {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 380px 220px 170px;
+    overflow-y: auto;
+  }
+
+  .automation-rail {
+    grid-column: 1;
+    grid-row: 1;
+    border-right: 0;
+    border-bottom: 1px solid rgb(42 42 58 / 0.94);
+  }
+
+  .automation-rail-header {
+    display: flex;
+    min-height: 40px;
+  }
+
+  .automation-group-list {
+    height: auto;
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+
+  .automation-group {
+    width: min(210px, 70vw);
+    min-width: min(210px, 70vw);
+    min-height: 48px;
+    margin-top: 0;
+  }
+
+  .automation-workbench {
+    grid-column: 1;
+    grid-row: 2;
+    min-height: 380px;
+  }
+
+  .automation-toolbar {
+    min-height: 48px;
+    overflow-x: auto;
+  }
+
+  .automation-search {
+    flex-basis: 170px;
+  }
+
+  .automation-status {
+    flex: 0 0 150px;
+  }
+
+  .automation-canvas .react-flow__minimap {
+    display: none;
+  }
+
+  .automation-inspector {
+    grid-column: 1;
+    grid-row: 3;
+    min-height: 220px;
+    max-height: none;
+    border-left: 0;
+    border-top: 1px solid rgb(42 42 58 / 0.94);
+  }
+
+  .automation-run-drawer {
+    grid-column: 1;
+    grid-row: 4;
+    min-height: 170px;
+    max-height: none;
+  }
+
+  .automation-run {
+    grid-template-columns: 18px 72px minmax(0, 1fr);
   }
 
   .dialog {

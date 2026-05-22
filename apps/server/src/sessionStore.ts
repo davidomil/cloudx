@@ -12,6 +12,7 @@ import { TabContextService } from "./context/TabContextService.js";
 import { WORKSPACE_CONTROL_PLUGIN_ID } from "./plugins/WorkspaceControlPlugin.js";
 import type { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
 import type { HookRegistry } from "./hooks/HookRegistry.js";
+import type { TriggerRegistry } from "./triggers/TriggerRegistry.js";
 
 export interface SessionRuntimeContextResolver {
   runtimeContextFor(tab: WorkspaceTab, window?: WorkspaceWindow): Promise<WorkspaceRuntimeContext> | WorkspaceRuntimeContext;
@@ -25,6 +26,7 @@ export class SessionStore {
   private readonly tabsListeners = new Set<(update: WorkspaceTabsUpdate) => void>();
   private activeTabId: string | undefined;
   private hooks: HookRegistry | undefined;
+  private triggers: TriggerRegistry | undefined;
 
   constructor(
     private readonly plugins: PluginRegistry,
@@ -37,6 +39,10 @@ export class SessionStore {
 
   setHookRegistry(hooks: HookRegistry): void {
     this.hooks = hooks;
+  }
+
+  setTriggerRegistry(triggers: TriggerRegistry): void {
+    this.triggers = triggers;
   }
 
   async createTab(request: CreateTabRequest): Promise<WorkspaceTab> {
@@ -706,6 +712,12 @@ export class SessionStore {
           targetTab: this.tabs.get(targetTabId),
           activeTabId: this.activeTabId
         }) as Promise<T>;
+      },
+      emitTrigger: async (triggerId, payload = {}) => {
+        if (!this.triggers) {
+          throw new Error("Trigger registry is not available.");
+        }
+        return this.triggers.emit(triggerId, payload, { kind: "plugin", pluginId, tabId });
       },
       getConfig: () => this.configProvider.getPluginConfig(pluginId),
       getTab: () => this.getTab(tabId)

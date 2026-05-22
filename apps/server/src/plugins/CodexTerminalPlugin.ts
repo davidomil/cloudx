@@ -298,15 +298,25 @@ function terminalActions(options: { enterTextDescription: string; enterTextHandl
       name: "enter_text",
       description: options.enterTextDescription,
       voiceExposed: true,
+      automationExposed: true,
+      automationSafety: "external",
       defaultForVoice: true,
       handlesUnhandledVoice: options.enterTextHandlesUnhandledVoice,
       inputSchema: {
         type: "object",
         properties: {
           text: { type: "string", description: "Text to type into the terminal." },
-          submit: { type: "boolean", description: "Whether to press Enter after typing." }
+          submit: { type: "boolean", description: "Whether to press Enter after typing.", default: false }
         },
         required: ["text"],
+        additionalProperties: false
+      },
+      outputSchema: {
+        type: "object",
+        properties: {
+          typed: { type: "number", description: "Number of characters typed." },
+          submitted: { type: "boolean", description: "True when Enter was sent after typing." }
+        },
         additionalProperties: false
       }
     },
@@ -314,12 +324,21 @@ function terminalActions(options: { enterTextDescription: string; enterTextHandl
       name: "send_key",
       description: "Send a supported control key to the terminal.",
       voiceExposed: true,
+      automationExposed: true,
+      automationSafety: "write",
       inputSchema: {
         type: "object",
         properties: {
-          key: { type: "string", enum: ["enter", "escape", "tab", "ctrl-c"] }
+          key: { type: "string", enum: ["enter", "escape", "tab", "ctrl-c"], description: "Supported control key to send.", default: "enter" }
         },
         required: ["key"],
+        additionalProperties: false
+      },
+      outputSchema: {
+        type: "object",
+        properties: {
+          key: { type: "string", enum: ["enter", "escape", "tab", "ctrl-c"], description: "Control key that was sent." }
+        },
         additionalProperties: false
       }
     },
@@ -341,7 +360,16 @@ function terminalActions(options: { enterTextDescription: string; enterTextHandl
       name: "stop",
       description: "Stop the running terminal process.",
       voiceExposed: true,
-      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+      automationExposed: true,
+      automationSafety: "destructive",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      outputSchema: {
+        type: "object",
+        properties: {
+          stopped: { type: "boolean", description: "True when the stop request was sent." }
+        },
+        additionalProperties: false
+      }
     }
   ];
 }

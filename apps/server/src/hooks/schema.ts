@@ -2,6 +2,8 @@ import type { JsonSchemaLike } from "@cloudx/plugin-api";
 import { Ajv, type ValidateFunction } from "ajv/dist/ajv.js";
 
 const ajv = new Ajv({ allErrors: true });
+ajv.addKeyword({ keyword: "x-cloudx-option-source", valid: true });
+ajv.addKeyword({ keyword: "x-cloudx-connectable", valid: true });
 const validators = new WeakMap<JsonSchemaLike, ValidateFunction>();
 
 export function validateObjectSchema(schema: JsonSchemaLike, input: Record<string, unknown>, label: string): void {

@@ -61,6 +61,41 @@ describe("WorkspaceLayoutStore", () => {
     expect(afterDelete.templates).toEqual([]);
   });
 
+  it("prepares layout templates for an existing target window", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-template-existing-window-"));
+    const project = path.join(root, "project");
+    const nextProject = path.join(root, "next");
+    await fs.mkdir(path.join(project, "apps", "web"), { recursive: true });
+    await fs.mkdir(path.join(nextProject, "apps", "web"), { recursive: true });
+    const store = new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root]));
+    const sourceWindow = await store.createWindow({ name: "Source", defaultCwd: project });
+    await store.updateWindow(sourceWindow.id, { layout: layoutWithTab("tab-source") });
+    const template = await store.createTemplate(
+      { name: "Web", basePath: project, windowId: sourceWindow.id },
+      [{ tab: tab("tab-source", path.join(project, "apps", "web")) }]
+    );
+    const targetWindow = await store.createWindow({ name: "Target", defaultCwd: root });
+    await store.updateWindow(targetWindow.id, { layout: layoutWithTab("tab-old") });
+    const before = await store.state([tab("tab-old", root)], "tab-old");
+
+    const prepared = await store.prepareTemplateWindow(template.id, {
+      projectPath: nextProject,
+      windowId: targetWindow.id,
+      name: "Target Applied"
+    });
+    const remapped = store.remapTemplateLayout(prepared.template, new Map([["tab-source", "tab-new"]]));
+    const updated = await store.finishTemplateWindow(prepared.window.id, remapped, {
+      name: "Target Applied",
+      defaultCwd: prepared.projectPath
+    });
+    const after = await store.state([tab("tab-old", root), tab("tab-new", path.join(nextProject, "apps", "web"))], "tab-new");
+
+    expect(prepared).toMatchObject({ createdWindow: false, projectPath: nextProject, window: { id: targetWindow.id } });
+    expect(after.windows).toHaveLength(before.windows.length);
+    expect(updated).toMatchObject({ id: targetWindow.id, name: "Target Applied", defaultCwd: nextProject });
+    expect(after.windows.find((window) => window.id === targetWindow.id)?.layout.root).toMatchObject({ type: "pane", pane: { tabIds: ["tab-new"] } });
+  });
+
   it("searches windows by local context", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-window-search-"));
     const store = new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root]));

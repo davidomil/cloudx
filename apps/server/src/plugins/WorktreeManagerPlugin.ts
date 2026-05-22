@@ -1,7 +1,91 @@
-import type { CreatePluginSessionInput, PluginActionDefinition, PluginSession, PluginSessionSnapshot, PluginVoiceContext, WorkspacePlugin } from "@cloudx/plugin-api";
+import type { CloudxAppContext, CreatePluginSessionInput, JsonSchemaLike, PluginActionDefinition, PluginSession, PluginSessionSnapshot, PluginVoiceContext, TriggerDefinition, WorkspacePlugin } from "@cloudx/plugin-api";
 import type { ConfigFieldDescriptor, WorktreeCreateMode, WorktreeProjectState, WorkspaceTab } from "@cloudx/shared";
 
 import { WorktreeService } from "../git/WorktreeService.js";
+
+const WORKTREE_REF_SCHEMA: JsonSchemaLike = {
+  type: "object",
+  properties: {
+    name: { type: "string", description: "Short ref name." },
+    fullName: { type: "string", description: "Full Git ref name." },
+    kind: { type: "string", enum: ["local", "remote", "tag"], description: "Ref category." },
+    commit: { type: "string", description: "Commit hash for the ref." },
+    upstream: { type: "string", description: "Configured upstream ref, when present." }
+  },
+  additionalProperties: false
+};
+
+const WORKTREE_DIRTY_SCHEMA: JsonSchemaLike = {
+  type: "object",
+  properties: {
+    dirty: { type: "boolean", description: "True when the worktree has uncommitted changes." },
+    staged: { type: "number", description: "Number of staged changes." },
+    unstaged: { type: "number", description: "Number of unstaged changes." },
+    untracked: { type: "number", description: "Number of untracked files." }
+  },
+  additionalProperties: false
+};
+
+const WORKTREE_SUMMARY_SCHEMA: JsonSchemaLike = {
+  type: "object",
+  properties: {
+    folderName: { type: "string", description: "Worktree folder name." },
+    path: { type: "string", description: "Absolute path to the worktree folder." },
+    branch: { type: "string", description: "Checked-out branch name, when attached." },
+    head: { type: "string", description: "Detached HEAD commit, when detached." },
+    detached: { type: "boolean", description: "True when the worktree is detached." },
+    dirty: WORKTREE_DIRTY_SCHEMA,
+    sizeBytes: { type: "number", description: "Computed worktree size in bytes." },
+    sizeError: { type: "string", description: "Folder size error, when size collection failed." },
+    sizePending: { type: "boolean", description: "True when folder size is still being computed." }
+  },
+  additionalProperties: false
+};
+
+const WORKTREE_SETUP_SCHEMA: JsonSchemaLike = {
+  type: "object",
+  properties: {
+    canInitialize: { type: "boolean", description: "True when an empty project can be initialized as a bare worktree project." },
+    canClone: { type: "boolean", description: "True when the project can clone a bare repository." },
+    blockedReason: { type: "string", description: "Reason setup is blocked." },
+    candidateBarePaths: { type: "array", items: { type: "string" }, description: "Possible bare repository paths discovered in the project." }
+  },
+  additionalProperties: false
+};
+
+const WORKTREE_PROJECT_STATE_PROPERTIES: Record<string, JsonSchemaLike> = {
+  cwd: { type: "string", description: "Tab working directory used by the Worktrees plugin." },
+  projectDir: { type: "string", description: "Root project directory containing the bare repo and linked worktree folders." },
+  barePath: { type: "string", description: "Absolute path to the bare Git repository." },
+  bareName: { type: "string", description: "Bare repository folder name." },
+  detectedFrom: { type: "string", enum: ["project_dir", "bare_dir", "worktree_dir"], description: "How the worktree project was detected." },
+  status: { type: "string", enum: ["empty", "blocked", "ready"], description: "Current worktree project setup status." },
+  folderEmpty: { type: "boolean", description: "True when the project folder has no setup files yet." },
+  originUrl: { type: "string", description: "Configured Git origin URL." },
+  refs: { type: "array", items: WORKTREE_REF_SCHEMA, description: "Available local, remote, and tag refs." },
+  worktrees: { type: "array", items: WORKTREE_SUMMARY_SCHEMA, description: "Linked worktree folders in the project." },
+  setup: WORKTREE_SETUP_SCHEMA,
+  message: { type: "string", description: "Human-readable setup or status message." }
+};
+
+const WORKTREE_PROJECT_STATE_SCHEMA: JsonSchemaLike = {
+  type: "object",
+  properties: WORKTREE_PROJECT_STATE_PROPERTIES,
+  additionalProperties: false
+};
+
+const WORKTREE_CREATE_RESULT_SCHEMA: JsonSchemaLike = {
+  type: "object",
+  properties: {
+    ...WORKTREE_PROJECT_STATE_PROPERTIES,
+    createdFolderName: { type: "string", description: "Folder name of the worktree created by this action." },
+    createdBranchName: { type: "string", description: "Branch checked out by the created worktree." },
+    createdMode: { type: "string", enum: ["new_branch", "existing_branch", "remote_branch"], description: "Creation mode used for the new worktree." },
+    createdBaseRef: { type: "string", description: "Base ref used for the new worktree, when provided." },
+    createdPath: { type: "string", description: "Absolute path to the newly created worktree folder." }
+  },
+  additionalProperties: false
+};
 
 export class WorktreeManagerPlugin implements WorkspacePlugin {
   readonly id = "worktree-manager";
@@ -33,6 +117,8 @@ export class WorktreeManagerPlugin implements WorkspacePlugin {
       name: "get_worktree_project",
       description: "Return setup state, refs, and worktrees for this worktree manager project.",
       voiceExposed: true,
+      automationExposed: true,
+      automationSafety: "read",
       inputSchema: {
         type: "object",
         properties: {
@@ -40,7 +126,8 @@ export class WorktreeManagerPlugin implements WorkspacePlugin {
         },
         required: [],
         additionalProperties: false
-      }
+      },
+      outputSchema: WORKTREE_PROJECT_STATE_SCHEMA
     },
     {
       name: "initialize_bare_repository",
@@ -51,7 +138,8 @@ export class WorktreeManagerPlugin implements WorkspacePlugin {
         properties: {},
         required: [],
         additionalProperties: false
-      }
+      },
+      outputSchema: WORKTREE_PROJECT_STATE_SCHEMA
     },
     {
       name: "clone_bare_repository",
@@ -70,28 +158,34 @@ export class WorktreeManagerPlugin implements WorkspacePlugin {
       name: "fetch_refs",
       description: "Fetch and prune origin branches, then sync origin tags without touching checked-out local branches.",
       voiceExposed: true,
+      automationExposed: true,
+      automationSafety: "external",
       inputSchema: {
         type: "object",
         properties: {},
         required: [],
         additionalProperties: false
-      }
+      },
+      outputSchema: WORKTREE_PROJECT_STATE_SCHEMA
     },
     {
       name: "create_worktree",
       description: "Create a linked worktree folder from a local branch, remote branch, or new branch base.",
       voiceExposed: false,
+      automationExposed: true,
+      automationSafety: "write",
       inputSchema: {
         type: "object",
         properties: {
-          mode: { type: "string", enum: ["new_branch", "existing_branch", "remote_branch"], description: "Worktree creation mode." },
+          mode: { type: "string", enum: ["new_branch", "existing_branch", "remote_branch"], description: "Worktree creation mode.", default: "new_branch" },
           folderName: { type: "string", description: "Direct child folder name to create under the project directory." },
           branchName: { type: "string", description: "Local branch name to check out or create." },
           baseRef: { type: "string", description: "Base ref for new branches or remote tracking branches." }
         },
         required: ["mode", "folderName", "branchName"],
         additionalProperties: false
-      }
+      },
+      outputSchema: WORKTREE_CREATE_RESULT_SCHEMA
     },
     {
       name: "delete_worktree",
@@ -109,6 +203,28 @@ export class WorktreeManagerPlugin implements WorkspacePlugin {
       }
     }
   ];
+  readonly triggers: TriggerDefinition[] = [
+    {
+      id: "worktree.created",
+      owner: { kind: "plugin", pluginId: this.id },
+      title: "Worktree Created",
+      description: "Emitted after the Worktrees plugin creates a linked worktree.",
+      exposures: ["plugin", "automation", "http"],
+      payloadSchema: {
+        type: "object",
+        properties: {
+          folderName: { type: "string", description: "Name of the linked worktree folder that was created." },
+          branchName: { type: "string", description: "Local branch checked out in the new worktree." },
+          mode: { type: "string", enum: ["new_branch", "existing_branch", "remote_branch"], description: "Worktree creation mode used by the Worktrees plugin." },
+          baseRef: { type: "string", description: "Base ref used when creating a new branch or remote tracking worktree." },
+          path: { type: "string", description: "Absolute filesystem path to the created worktree folder." },
+          projectDir: { type: "string", description: "Root project directory that owns the bare repository and linked worktrees." }
+        },
+        required: ["folderName", "branchName", "mode", "path", "projectDir"],
+        additionalProperties: false
+      }
+    }
+  ];
 
   constructor(private readonly worktrees = new WorktreeService()) {}
 
@@ -122,12 +238,13 @@ export class WorktreeManagerPlugin implements WorkspacePlugin {
       creatable: this.creatable,
       requiresDirectory: this.requiresDirectory,
       configFields: this.configFields,
-      actions: this.actions
+      actions: this.actions,
+      triggers: this.triggers
     };
   }
 
   createSession(input: CreatePluginSessionInput): PluginSession {
-    return new WorktreeManagerSession(input.tab, this.worktrees);
+    return new WorktreeManagerSession(input.tab, this.worktrees, input.app);
   }
 }
 
@@ -136,7 +253,8 @@ class WorktreeManagerSession implements PluginSession {
 
   constructor(
     public readonly tab: WorkspaceTab,
-    private readonly worktrees: WorktreeService
+    private readonly worktrees: WorktreeService,
+    private readonly app?: CloudxAppContext
   ) {}
 
   snapshot(): PluginSessionSnapshot {
@@ -198,13 +316,34 @@ class WorktreeManagerSession implements PluginSession {
       return this.state as unknown as Record<string, unknown>;
     }
     if (action === "create_worktree") {
+      const mode = requireCreateMode(input.mode);
+      const folderName = requireString(input.folderName, "folderName");
+      const branchName = requireString(input.branchName, "branchName");
+      const baseRef = optionalString(input.baseRef, "baseRef");
       this.state = await this.worktrees.createWorktree(this.tab.cwd, {
-        mode: requireCreateMode(input.mode),
-        folderName: requireString(input.folderName, "folderName"),
-        branchName: requireString(input.branchName, "branchName"),
-        baseRef: optionalString(input.baseRef, "baseRef")
+        mode,
+        folderName,
+        branchName,
+        baseRef
       }, this.stateOptions());
-      return this.state as unknown as Record<string, unknown>;
+      const created = this.state.worktrees.find((worktree) => worktree.folderName === folderName);
+      const createdPath = created?.path ?? `${this.state.projectDir}/${folderName}`;
+      await this.app?.emitTrigger("worktree.created", {
+        folderName,
+        branchName,
+        mode,
+        ...(baseRef ? { baseRef } : {}),
+        path: createdPath,
+        projectDir: this.state.projectDir
+      });
+      return {
+        ...this.state,
+        createdFolderName: folderName,
+        createdBranchName: branchName,
+        createdMode: mode,
+        ...(baseRef ? { createdBaseRef: baseRef } : {}),
+        createdPath
+      } as unknown as Record<string, unknown>;
     }
     if (action === "delete_worktree") {
       this.state = await this.worktrees.deleteWorktree(this.tab.cwd, {

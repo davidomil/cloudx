@@ -1,5 +1,12 @@
 import type {
   ApplyWorkspaceLayoutTemplateRequest,
+  AutomationCatalogResponse,
+  AutomationGraphDocument,
+  AutomationGroup,
+  AutomationGroupsResponse,
+  AutomationRunsResponse,
+  AutomationTestRunResponse,
+  AutomationValidationSummary,
   CloudxConfigResponse,
   CloudxConfigValues,
   CreateTabRequest,
@@ -12,6 +19,8 @@ import type {
   PathOption,
   PluginDescriptor,
   SearchWorkspaceWindowsResponse,
+  TriggerDescriptor,
+  TriggerListResponse,
   UpdateWorkspaceLayoutTemplateRequest,
   UpdateWorkspaceWindowRequest,
   VoiceExecutionResult,
@@ -178,6 +187,61 @@ export async function getPlugins(): Promise<PluginDescriptor[]> {
 export async function getHooks(): Promise<HookDescriptor[]> {
   const body = await fetchJson<{ hooks: HookDescriptor[] }>("/api/hooks");
   return body.hooks;
+}
+
+export async function getTriggers(): Promise<TriggerDescriptor[]> {
+  const body = await fetchJson<TriggerListResponse>("/api/triggers");
+  return body.triggers;
+}
+
+export async function getAutomationCatalog(): Promise<AutomationCatalogResponse> {
+  return fetchJson("/api/automation/catalog");
+}
+
+export async function getAutomationGroups(): Promise<AutomationGroup[]> {
+  const body = await fetchJson<AutomationGroupsResponse>("/api/automation/groups");
+  return body.groups;
+}
+
+export async function saveAutomationGroup(group: AutomationGroup): Promise<AutomationGroup> {
+  const body = await fetchJson<{ group: AutomationGroup }>(`/api/automation/groups/${encodeURIComponent(group.id)}`, {
+    method: "PUT",
+    body: JSON.stringify(group)
+  });
+  return body.group;
+}
+
+export async function setAutomationGroupEnabled(groupId: string, enabled: boolean): Promise<AutomationGroup> {
+  const body = await fetchJson<{ group: AutomationGroup }>(`/api/automation/groups/${encodeURIComponent(groupId)}/enabled`, {
+    method: "PATCH",
+    body: JSON.stringify({ enabled })
+  });
+  return body.group;
+}
+
+export async function validateAutomationGraph(groupId: string, graph: AutomationGraphDocument): Promise<AutomationValidationSummary> {
+  return fetchJson(`/api/automation/groups/${encodeURIComponent(groupId)}/validate`, {
+    method: "POST",
+    body: JSON.stringify({ graph })
+  });
+}
+
+export async function startAutomationTestRun(groupId: string, graph?: AutomationGraphDocument, payload?: Record<string, unknown>): Promise<AutomationTestRunResponse> {
+  return fetchJson(`/api/automation/groups/${encodeURIComponent(groupId)}/test-run`, {
+    method: "POST",
+    body: JSON.stringify({ ...(payload === undefined ? {} : { payload }), ...(graph === undefined ? {} : { graph }) })
+  });
+}
+
+export async function getAutomationRuns(): Promise<AutomationRunsResponse> {
+  return fetchJson("/api/automation/runs");
+}
+
+export async function cancelAutomationRun(runId: string): Promise<AutomationRunsResponse> {
+  return fetchJson(`/api/automation/runs/${encodeURIComponent(runId)}/cancel`, {
+    method: "POST",
+    body: "{}"
+  });
 }
 
 export async function getConfig(): Promise<CloudxConfigResponse> {

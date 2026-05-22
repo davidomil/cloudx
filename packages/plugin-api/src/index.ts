@@ -10,6 +10,9 @@ import {
   type PluginId,
   type PluginPanelKind,
   type TabIndicatorUpdate,
+  type TriggerDescriptor,
+  type TriggerEvent,
+  type TriggerId,
   type UiContributionDescriptor,
   type WorkspaceRuntimeContext,
   type WorkspaceTab
@@ -24,16 +27,28 @@ export interface JsonSchemaLike {
   items?: JsonSchemaLike;
   enum?: string[];
   description?: string;
+  default?: unknown;
+  "x-cloudx-connectable"?: boolean;
+  "x-cloudx-option-source"?:
+    | "plugins.all"
+    | "plugins.creatable"
+    | "workspace.tabs"
+    | "workspace.windows"
+    | "workspace.panes"
+    | "workspace.layoutTemplates"
+    | "rulesSkills.templates";
 }
 
 export interface PluginActionDefinition extends PluginActionDescriptor {
   inputSchema: JsonSchemaLike;
+  outputSchema?: JsonSchemaLike;
 }
 
 export interface HookCaller {
-  kind: "app" | "plugin" | "voice" | "ui" | "http";
+  kind: "app" | "plugin" | "voice" | "ui" | "http" | "automation";
   pluginId?: PluginId;
   tabId?: string;
+  automationGroupId?: string;
 }
 
 export interface HookCallContext {
@@ -46,6 +61,19 @@ export interface HookCallContext {
 export interface HookDefinition extends HookDescriptor {
   inputSchema: JsonSchemaLike;
   execute(input: Record<string, unknown>, context: HookCallContext): Promise<Record<string, unknown>> | Record<string, unknown>;
+}
+
+export interface TriggerEmitContext {
+  source: {
+    kind: "app" | "plugin" | "http" | "test";
+    pluginId?: PluginId;
+    tabId?: string;
+    automationGroupId?: string;
+  };
+}
+
+export interface TriggerDefinition extends TriggerDescriptor {
+  payloadSchema: JsonSchemaLike;
 }
 
 export interface PluginSessionSnapshot {
@@ -107,6 +135,7 @@ export interface CreatePluginSessionInput {
 export interface CloudxAppContext {
   callHook<T extends Record<string, unknown> = Record<string, unknown>>(hookId: HookId, input?: Record<string, unknown>): Promise<T>;
   callTabHook<T extends Record<string, unknown> = Record<string, unknown>>(tabId: string, hookId: HookId, input?: Record<string, unknown>): Promise<T>;
+  emitTrigger(triggerId: TriggerId, payload?: Record<string, unknown>): Promise<TriggerEvent>;
   getConfig(): Record<string, ConfigValue>;
   getTab(): WorkspaceTab;
 }
@@ -126,6 +155,7 @@ export interface WorkspacePlugin {
   requiresDirectory: boolean;
   actions: PluginActionDefinition[];
   hooks?: HookDefinition[];
+  triggers?: TriggerDefinition[];
   uiContributions?: UiContributionDescriptor[];
   configFields?: ConfigFieldDescriptor[];
   defaultTitleContext?(input: { cwd: string; initialInput?: Record<string, unknown> }): string | undefined;
@@ -144,14 +174,18 @@ export function descriptorFromPlugin(plugin: WorkspacePlugin): PluginDescriptor 
     requiresDirectory: plugin.requiresDirectory,
     configFields: plugin.configFields ?? [],
     hooks: plugin.hooks?.map((hook) => descriptorFromHook(hook)) ?? plugin.actions.map((action) => descriptorFromAction(plugin.id, action)),
+    triggers: plugin.triggers?.map((trigger) => descriptorFromTrigger(trigger)) ?? [],
     uiContributions: uiContributionsFromPlugin(plugin),
     actions: plugin.actions.map((action) => ({
       name: action.name,
       description: action.description,
       voiceExposed: action.voiceExposed,
+      automationExposed: action.automationExposed,
+      automationSafety: action.automationSafety,
       defaultForVoice: action.defaultForVoice,
       handlesUnhandledVoice: action.handlesUnhandledVoice,
-      inputSchema: action.inputSchema
+      inputSchema: action.inputSchema,
+      outputSchema: action.outputSchema
     }))
   };
 }
@@ -190,6 +224,7 @@ export function descriptorFromHook(hook: HookDefinition): HookDescriptor {
     inputSchema: hook.inputSchema,
     outputSchema: hook.outputSchema,
     exposures: hook.exposures,
+    automationSafety: hook.automationSafety,
     defaultForVoice: hook.defaultForVoice,
     handlesUnhandledVoice: hook.handlesUnhandledVoice
   };
@@ -199,17 +234,50 @@ export function descriptorFromAction(pluginId: PluginId, action: PluginActionDef
   return {
     id: pluginActionHookId(pluginId, action.name),
     owner: { kind: "plugin", pluginId } satisfies HookOwner,
-    title: action.name,
+    title: displayTitleFromIdentifier(action.name),
     description: action.description,
     inputSchema: action.inputSchema,
-    exposures: action.voiceExposed ? ["plugin", "voice", "ui", "http"] : ["plugin", "ui", "http"],
+    outputSchema: action.outputSchema,
+    exposures: actionHookExposures(action),
+    automationSafety: action.automationSafety,
     defaultForVoice: action.defaultForVoice,
     handlesUnhandledVoice: action.handlesUnhandledVoice
   };
 }
 
+export function descriptorFromTrigger(trigger: TriggerDefinition): TriggerDescriptor {
+  return {
+    id: trigger.id,
+    owner: trigger.owner,
+    title: trigger.title,
+    description: trigger.description,
+    payloadSchema: trigger.payloadSchema,
+    exposures: trigger.exposures
+  };
+}
+
+function actionHookExposures(action: PluginActionDefinition): HookDescriptor["exposures"] {
+  const exposures: HookDescriptor["exposures"] = ["plugin", "ui", "http"];
+  if (action.voiceExposed) {
+    exposures.push("voice");
+  }
+  if (action.automationExposed) {
+    exposures.push("automation");
+  }
+  return exposures;
+}
+
 export function pluginActionHookId(pluginId: PluginId, actionName: string): HookId {
   return `${pluginId}.${snakeToCamel(actionName)}`;
+}
+
+export function displayTitleFromIdentifier(value: string): string {
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_./:-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (match) => match.toUpperCase());
 }
 
 function snakeToCamel(value: string): string {

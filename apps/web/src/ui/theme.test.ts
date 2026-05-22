@@ -21,6 +21,10 @@ describe("theme", () => {
     expect(root.dataset.theme).toBe("minimalist-dark");
     expect(root.style.getPropertyValue("--color-background")).toBe("#0A0A0F");
     expect(root.style.getPropertyValue("--color-accent")).toBe("#F59E0B");
+    expect(root.style.getPropertyValue("--automation-minimap-node")).toBe("#F59E0B");
+    expect(root.style.getPropertyValue("--automation-minimap-border")).toBe("rgba(245, 158, 11, 0.24)");
+    expect(root.style.getPropertyValue("--automation-controls-foreground")).toBe("#F59E0B");
+    expect(root.style.getPropertyValue("--automation-controls-border")).toBe("rgba(245, 158, 11, 0.24)");
     expect(root.style.getPropertyValue("--chamfer")).toBe("inset(0 round 12px)");
   });
 

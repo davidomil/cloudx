@@ -7,12 +7,16 @@ import type { RawData, WebSocket } from "ws";
 
 import type {
   ApplyWorkspaceLayoutTemplateRequest,
+  AutomationDynamicOptionSource,
+  AutomationPortOption,
   CloudxConfigValues,
   CreateTabRequest,
   CreateWorkspaceLayoutTemplateRequest,
   CreateWorkspaceWindowRequest,
   HookCallRequest,
+  AutomationGroup,
   SearchWorkspaceWindowsRequest,
+  TabLayoutNode,
   UpdateWorkspaceLayoutTemplateRequest,
   UpdateWorkspaceWindowRequest
 } from "@cloudx/shared";
@@ -31,6 +35,8 @@ import { StandardTerminalPlugin } from "./plugins/StandardTerminalPlugin.js";
 import { WorktreeManagerPlugin } from "./plugins/WorktreeManagerPlugin.js";
 import { WorkspaceControlPlugin } from "./plugins/WorkspaceControlPlugin.js";
 import { AudioAiPlugin } from "./plugins/AudioAiPlugin.js";
+import { AutomationPlugin } from "./plugins/AutomationPlugin.js";
+import { NotificationsPlugin } from "./plugins/NotificationsPlugin.js";
 import { PluginDataStore } from "./plugins/PluginDataStore.js";
 import { RulesSkillsPlugin } from "./plugins/RulesSkillsPlugin.js";
 import { SessionStore } from "./sessionStore.js";
@@ -47,6 +53,13 @@ import { serializeError, summarizeClientContext, transcriptLogFields, type Struc
 import { HookRegistry } from "./hooks/HookRegistry.js";
 import { registerCoreHooks } from "./hooks/coreHooks.js";
 import { registerPluginActionHooks } from "./hooks/pluginActionHooks.js";
+import { TriggerRegistry, registerPluginTriggers } from "./triggers/TriggerRegistry.js";
+import { AutomationCatalogService, type AutomationDynamicOptionProvider, type AutomationDynamicOptionResult } from "./automation/AutomationCatalogService.js";
+import { AutomationCompiler } from "./automation/AutomationCompiler.js";
+import { AutomationExecutor } from "./automation/AutomationExecutor.js";
+import { AutomationRepository } from "./automation/AutomationRepository.js";
+import { AutomationService } from "./automation/AutomationService.js";
+import { AutomationTypeService } from "./automation/AutomationTypeService.js";
 
 export interface AppServices {
   plugins: PluginRegistry;
@@ -57,9 +70,12 @@ export interface AppServices {
   config?: ConfigService;
   workspace?: WorkspaceLayoutStore;
   hooks?: HookRegistry;
+  triggers?: TriggerRegistry;
+  automation?: AutomationService;
   pluginData?: PluginDataStore;
   rulesSkills?: RulesSkillsCatalogService;
   fileTransfer?: FileTransferService;
+  notifications?: NotificationsPlugin;
 }
 
 const MIN_STREAMED_AUDIO_BYTES = 128;
@@ -83,7 +99,15 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   services.rulesSkills ??= new RulesSkillsCatalogService(config.dataDir);
   services.fileTransfer ??= new FileTransferService(services.pathPolicy);
   services.hooks ??= buildHookRegistry(services);
+  if (!services.triggers) {
+    const automationRepository = new AutomationRepository(config.dataDir);
+    services.triggers = new TriggerRegistry({ recordEvent: (event) => automationRepository.appendTriggerEvent(event) });
+    registerPluginTriggers(services.triggers, services.plugins);
+    services.automation ??= createAutomationService(automationRepository, services, config);
+  }
+  services.automation ??= createAutomationService(new AutomationRepository(config.dataDir), services, config);
   services.sessions.setHookRegistry?.(services.hooks);
+  services.sessions.setTriggerRegistry?.(services.triggers);
   const localWebProxy = new LocalWebProxy(services.sessions);
   await app.register(websocket);
 
@@ -104,6 +128,40 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   app.get("/api/plugins", async () => ({ plugins: services.plugins.list() }));
 
   app.get("/api/hooks", async () => ({ hooks: services.hooks!.list() }));
+
+  app.get("/api/triggers", async () => ({ triggers: services.triggers!.list() }));
+
+  app.get("/api/notifications", async () => ({ notifications: services.notifications?.list() ?? [] }));
+
+  app.post<{ Params: { triggerId: string }; Body: { payload?: Record<string, unknown> } }>("/api/triggers/:triggerId", async (request) => ({
+    event: await services.triggers!.emit(request.params.triggerId, request.body?.payload ?? {}, { kind: "http" })
+  }));
+
+  app.get("/api/automation/catalog", async () => services.automation!.catalog());
+
+  app.get("/api/automation/groups", async () => ({ groups: await services.automation!.listGroups() }));
+
+  app.put<{ Params: { groupId: string }; Body: AutomationGroup }>("/api/automation/groups/:groupId", async (request) => ({
+    group: await services.automation!.saveGroup({ ...request.body, id: request.params.groupId })
+  }));
+
+  app.patch<{ Params: { groupId: string }; Body: { enabled?: boolean } }>("/api/automation/groups/:groupId/enabled", async (request) => ({
+    group: await services.automation!.setEnabled(request.params.groupId, request.body.enabled === true)
+  }));
+
+  app.post<{ Params: { groupId: string }; Body: { graph?: AutomationGroup["graph"] } }>("/api/automation/groups/:groupId/validate", async (request) => {
+    const groups = await services.automation!.listGroups();
+    const group = groups.find((candidate) => candidate.id === request.params.groupId);
+    return services.automation!.validate(request.body.graph ?? group?.graph ?? { schemaVersion: 1, nodes: [], edges: [] });
+  });
+
+  app.post<{ Params: { groupId: string }; Body: { payload?: Record<string, unknown>; graph?: AutomationGroup["graph"] } }>("/api/automation/groups/:groupId/test-run", async (request) =>
+    services.automation!.startTest(request.params.groupId, request.body?.payload, request.body?.graph)
+  );
+
+  app.get("/api/automation/runs", async () => services.automation!.listRuns());
+
+  app.post<{ Params: { runId: string } }>("/api/automation/runs/:runId/cancel", async (request) => services.automation!.cancelRun(request.params.runId));
 
   app.get("/api/config", async () => services.config!.getResponse());
 
@@ -173,6 +231,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     const prepared = await services.workspace!.prepareTemplateWindow(request.params.templateId, request.body);
     const tabIdMap = new Map<string, string>();
     const createdTabIds: string[] = [];
+    const replacedTabIds = prepared.createdWindow ? [] : services.workspace!.tabIdsForWindow(prepared.window.id);
     try {
       for (const templateTab of prepared.template.tabs) {
         const tabInput = services.workspace!.tabInputForTemplate(templateTab, prepared.projectPath);
@@ -181,14 +240,22 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
         createdTabIds.push(tab.id);
       }
       const layout = services.workspace!.remapTemplateLayout(prepared.template, tabIdMap);
-      const window = await services.workspace!.finishTemplateWindow(prepared.window.id, layout);
+      const window = await services.workspace!.finishTemplateWindow(prepared.window.id, layout, {
+        defaultCwd: prepared.projectPath,
+        ...(request.body.name?.trim() ? { name: request.body.name.trim() } : {})
+      });
+      for (const tabId of replacedTabIds) {
+        services.sessions.closeTab(tabId);
+      }
       reply.code(201);
       return { window, workspace: await services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId()) };
     } catch (error) {
       for (const tabId of createdTabIds) {
         services.sessions.closeTab(tabId);
       }
-      await services.workspace!.deleteWindow(prepared.window.id);
+      if (prepared.createdWindow) {
+        await services.workspace!.deleteWindow(prepared.window.id);
+      }
       throw error;
     }
   });
@@ -553,9 +620,11 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     sendWorkspace();
     const disposeTabs = services.sessions.onTabsChange(sendWorkspace);
     const disposeWorkspace = services.workspace!.onChange(sendWorkspace);
+    const disposeNotifications = services.notifications?.onNotification((notification) => send({ type: "notification", notification })) ?? (() => undefined);
     ws.on("close", () => {
       disposeTabs();
       disposeWorkspace();
+      disposeNotifications();
     });
   });
 
@@ -615,6 +684,15 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   plugins.register(new WorktreeManagerPlugin());
   plugins.register(new WorkspaceControlPlugin());
   plugins.register(new RulesSkillsPlugin(rulesSkills));
+  const notifications = new NotificationsPlugin();
+  plugins.register(notifications);
+  let automation: AutomationService | undefined;
+  plugins.register(new AutomationPlugin(() => {
+    if (!automation) {
+      throw new Error("Automation service is not available.");
+    }
+    return automation;
+  }));
   const configService = new ConfigService(config.dataDir, () => plugins.list());
   const sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir), configService, workspace, rulesSkills);
   rulesSkills.onChange(() => {
@@ -641,7 +719,12 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   const fileTransfer = new FileTransferService(pathPolicy);
   const hooks = buildHookRegistry({ plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, fileTransfer });
   sessions.setHookRegistry(hooks);
-  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, pluginData, rulesSkills, fileTransfer };
+  const automationRepository = new AutomationRepository(config.dataDir);
+  const triggers = new TriggerRegistry({ recordEvent: (event) => automationRepository.appendTriggerEvent(event) });
+  registerPluginTriggers(triggers, plugins);
+  sessions.setTriggerRegistry(triggers);
+  automation = createAutomationService(automationRepository, { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config);
+  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, automation, pluginData, rulesSkills, fileTransfer, notifications };
 }
 
 function buildHookRegistry(services: AppServices): HookRegistry {
@@ -662,6 +745,76 @@ function buildHookRegistry(services: AppServices): HookRegistry {
     registerPluginActionHooks(hooks, services.plugins, services.sessions);
   }
   return hooks;
+}
+
+function createAutomationService(repository: AutomationRepository, services: AppServices, config?: Pick<AppConfig, "automationStartDisabled">): AutomationService {
+  const typeService = new AutomationTypeService();
+  const catalog = new AutomationCatalogService(typeService, () => services.triggers!.list(), () => services.hooks!.list(), buildAutomationDynamicOptionsProvider(services));
+  return new AutomationService(repository, services.triggers!, services.hooks!, catalog, new AutomationCompiler(typeService), new AutomationExecutor(), {
+    startDisabled: config?.automationStartDisabled
+  });
+}
+
+function buildAutomationDynamicOptionsProvider(services: AppServices): AutomationDynamicOptionProvider {
+  return async (source) => automationDynamicOptions(source, services);
+}
+
+async function automationDynamicOptions(source: AutomationDynamicOptionSource, services: AppServices): Promise<AutomationDynamicOptionResult> {
+  if (source === "plugins.all" || source === "plugins.creatable") {
+    const plugins = services.plugins.list().filter((plugin) => source === "plugins.all" || plugin.creatable);
+    return {
+      options: plugins.map((plugin) => ({ value: plugin.id, label: plugin.displayName, description: plugin.description })),
+      defaultValue: plugins[0]?.id
+    };
+  }
+
+  if (source === "workspace.tabs") {
+    const tabs = services.sessions.listTabs();
+    return {
+      options: tabs.map((tab) => ({ value: tab.id, label: tab.title, description: `${tab.pluginId} in ${tab.cwd}` })),
+      defaultValue: services.sessions.getActiveTabId() ?? tabs[0]?.id
+    };
+  }
+
+  const workspaceSnapshot = services.workspace?.snapshot();
+  if (source === "workspace.windows") {
+    const windows = workspaceSnapshot?.windows ?? [];
+    return {
+      options: windows.map((window) => ({ value: window.id, label: window.name, description: window.defaultCwd })),
+      defaultValue: workspaceSnapshot?.activeWindowId ?? windows[0]?.id
+    };
+  }
+
+  if (source === "workspace.panes") {
+    const activeWindow = workspaceSnapshot?.windows.find((window) => window.id === workspaceSnapshot.activeWindowId) ?? workspaceSnapshot?.windows[0];
+    const panes = activeWindow ? listPaneOptions(activeWindow.layout.root) : [];
+    return {
+      options: panes,
+      defaultValue: activeWindow?.layout.activePaneId ?? panes[0]?.value
+    };
+  }
+
+  if (source === "workspace.layoutTemplates") {
+    const templates = workspaceSnapshot?.templates ?? [];
+    return {
+      options: templates.map((template) => ({ value: template.id, label: template.name, description: template.basePath })),
+      defaultValue: templates[0]?.id
+    };
+  }
+
+  const store = await services.rulesSkills?.list();
+  const templates = store?.templates ?? [];
+  return {
+    options: templates.map((template) => ({ value: template.id, label: template.name, description: `${template.ruleIds.length} rules, ${template.skillIds.length} skills` })),
+    defaultValue: store?.defaultTemplateId ?? templates[0]?.id
+  };
+}
+
+function listPaneOptions(node: TabLayoutNode): AutomationPortOption[] {
+  if (node.type === "pane") {
+    return [{ value: node.pane.id, label: node.pane.id, description: `${node.pane.tabIds.length} tabs` }];
+  }
+  return node.children.flatMap((child) => listPaneOptions(child));
 }
 
 function templateInitialInput(state: Record<string, unknown> | undefined): Record<string, unknown> | undefined {

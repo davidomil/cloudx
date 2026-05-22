@@ -17,6 +17,7 @@ export interface AppConfig {
   dataDir: string;
   webDistDir: string;
   appServerEnabled: boolean;
+  automationStartDisabled: boolean;
   terminalReplayBytes: number;
   voiceDebugTranscripts?: boolean;
   https?: {
@@ -57,6 +58,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     dataDir,
     webDistDir: path.resolve(env.CLOUDX_WEB_DIST_DIR ?? path.join(repoRoot, "apps/web/dist")),
     appServerEnabled: env.CLOUDX_APP_SERVER_ENABLED !== "false",
+    automationStartDisabled: isTruthy(env.CLOUDX_AUTOMATION_START_DISABLED),
     terminalReplayBytes,
     voiceDebugTranscripts: isTruthy(env.CLOUDX_VOICE_DEBUG_TRANSCRIPTS),
     https

@@ -2,7 +2,7 @@ export const DEFAULT_VOICE_MODEL = "gpt-5.3-codex-spark";
 
 export type PluginId = "codex-terminal" | "standard-terminal" | "file-browser" | "local-web" | string;
 
-export type PluginPanelKind = "terminal" | "file-browser" | "web-viewer" | "worktree-manager" | "placeholder";
+export type PluginPanelKind = "terminal" | "file-browser" | "web-viewer" | "worktree-manager" | "automation" | "placeholder";
 
 export type TabStatus = "idle" | "starting" | "running" | "waiting_approval" | "failed" | "completed" | "stopped";
 
@@ -89,16 +89,19 @@ export interface PluginActionDescriptor {
   name: string;
   description: string;
   voiceExposed: boolean;
+  automationExposed?: boolean;
+  automationSafety?: AutomationSafety;
   defaultForVoice?: boolean;
   handlesUnhandledVoice?: boolean;
   inputSchema: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
 }
 
 export type HookId = string;
 
 export type HookOwnerKind = "app" | "plugin";
 
-export type HookExposure = "app" | "plugin" | "voice" | "ui" | "http";
+export type HookExposure = "app" | "plugin" | "voice" | "ui" | "http" | "automation";
 
 export interface HookOwner {
   kind: HookOwnerKind;
@@ -113,6 +116,7 @@ export interface HookDescriptor {
   inputSchema: Record<string, unknown>;
   outputSchema?: Record<string, unknown>;
   exposures: HookExposure[];
+  automationSafety?: AutomationSafety;
   defaultForVoice?: boolean;
   handlesUnhandledVoice?: boolean;
 }
@@ -124,6 +128,262 @@ export interface HookCallRequest {
 
 export interface HookCallResponse {
   result: Record<string, unknown>;
+}
+
+export type AutomationSafety = "read" | "write" | "destructive" | "external";
+
+export type TriggerId = string;
+
+export type TriggerExposure = "plugin" | "automation" | "ui" | "http";
+
+export interface TriggerDescriptor {
+  id: TriggerId;
+  owner: HookOwner;
+  title: string;
+  description: string;
+  payloadSchema: Record<string, unknown>;
+  exposures: TriggerExposure[];
+}
+
+export interface TriggerEventSource {
+  kind: "app" | "plugin" | "http" | "test";
+  pluginId?: PluginId;
+  tabId?: string;
+  automationGroupId?: string;
+}
+
+export interface TriggerEvent {
+  id: string;
+  triggerId: TriggerId;
+  source: TriggerEventSource;
+  payload: Record<string, unknown>;
+  emittedAt: string;
+}
+
+export interface TriggerListResponse {
+  triggers: TriggerDescriptor[];
+}
+
+export type AutomationTypeKind = "exec" | "never" | "unknown" | "null" | "boolean" | "number" | "string" | "array" | "object" | "union";
+
+export interface AutomationType {
+  kind: AutomationTypeKind;
+  items?: AutomationType;
+  properties?: Record<string, AutomationType>;
+  required?: string[];
+  options?: AutomationType[];
+}
+
+export type AutomationNodeKind = "trigger" | "function" | "primitive" | "converter";
+
+export type AutomationPortKind = "exec" | "data";
+
+export type AutomationPortDirection = "input" | "output";
+
+export type AutomationDynamicOptionSource =
+  | "plugins.all"
+  | "plugins.creatable"
+  | "workspace.tabs"
+  | "workspace.windows"
+  | "workspace.panes"
+  | "workspace.layoutTemplates"
+  | "rulesSkills.templates";
+
+export interface AutomationPortOption {
+  value: string;
+  label: string;
+  description?: string;
+}
+
+export interface AutomationPortOptions {
+  source?: AutomationDynamicOptionSource;
+  values: AutomationPortOption[];
+}
+
+export interface AutomationPortDescriptor {
+  id: string;
+  label: string;
+  kind: AutomationPortKind;
+  direction: AutomationPortDirection;
+  type: AutomationType;
+  description?: string;
+  defaultValue?: unknown;
+  options?: AutomationPortOptions;
+  required?: boolean;
+  connectable?: boolean;
+}
+
+export interface AutomationNodeCatalogEntry {
+  typeId: string;
+  kind: AutomationNodeKind;
+  title: string;
+  description: string;
+  pluginId?: PluginId;
+  hookId?: HookId;
+  triggerId?: TriggerId;
+  safety?: AutomationSafety;
+  inputs: AutomationPortDescriptor[];
+  outputs: AutomationPortDescriptor[];
+}
+
+export const AUTOMATION_FSTRING_TYPE_ID = "primitive:string.fstring";
+
+export function automationFStringInputNames(config?: Record<string, unknown>): string[] {
+  const hasConfiguredNames = Object.prototype.hasOwnProperty.call(config ?? {}, "inputNames");
+  const raw = config?.inputNames;
+  const values = Array.isArray(raw)
+    ? raw
+    : typeof raw === "string"
+      ? raw.split(/[\s,]+/)
+      : hasConfiguredNames
+        ? []
+        : ["value"];
+  const seen = new Set<string>();
+  return values
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .filter((value) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(value))
+    .filter((value) => {
+      if (seen.has(value)) {
+        return false;
+      }
+      seen.add(value);
+      return true;
+    });
+}
+
+export function automationFStringInputPorts(config?: Record<string, unknown>): AutomationPortDescriptor[] {
+  return automationFStringInputNames(config).map((name) => ({
+    id: name,
+    label: automationDynamicInputLabel(name),
+    kind: "data",
+    direction: "input",
+    type: { kind: "unknown" },
+    description: `Value available to the f-string template as {${name}}.`
+  }));
+}
+
+export function automationEntryWithDynamicPorts(entry: AutomationNodeCatalogEntry, config?: Record<string, unknown>): AutomationNodeCatalogEntry {
+  if (entry.typeId !== AUTOMATION_FSTRING_TYPE_ID) {
+    return entry;
+  }
+  return { ...entry, inputs: automationFStringInputPorts(config) };
+}
+
+function automationDynamicInputLabel(value: string): string {
+  return value.replace(/([A-Z])/g, " $1").replace(/[_-]+/g, " ").replace(/\b\w/g, (match) => match.toUpperCase()).trim();
+}
+
+export interface AutomationCatalogResponse {
+  nodes: AutomationNodeCatalogEntry[];
+}
+
+export interface AutomationNodePosition {
+  x: number;
+  y: number;
+}
+
+export interface AutomationNode {
+  id: string;
+  typeId: string;
+  position: AutomationNodePosition;
+  config?: Record<string, unknown>;
+}
+
+export interface AutomationEdge {
+  id: string;
+  kind: AutomationPortKind;
+  sourceNodeId: string;
+  sourcePortId: string;
+  targetNodeId: string;
+  targetPortId: string;
+  route?: AutomationEdgeRoute;
+}
+
+export interface AutomationEdgeRoute {
+  offsetX?: number;
+  offsetY?: number;
+}
+
+export interface AutomationVariableDefinition {
+  name: string;
+  type: AutomationType;
+  defaultValue?: unknown;
+}
+
+export interface AutomationGraphDocument {
+  schemaVersion: 1;
+  nodes: AutomationNode[];
+  edges: AutomationEdge[];
+  variables?: AutomationVariableDefinition[];
+}
+
+export type AutomationDiagnosticSeverity = "error" | "warning" | "info";
+
+export interface AutomationValidationDiagnostic {
+  severity: AutomationDiagnosticSeverity;
+  code: string;
+  message: string;
+  nodeId?: string;
+  edgeId?: string;
+  portId?: string;
+}
+
+export interface AutomationValidationSummary {
+  valid: boolean;
+  diagnostics: AutomationValidationDiagnostic[];
+}
+
+export interface AutomationGroup {
+  id: string;
+  name: string;
+  enabled: boolean;
+  graph: AutomationGraphDocument;
+  createdAt: string;
+  updatedAt: string;
+  lastValidation?: AutomationValidationSummary;
+}
+
+export interface AutomationGroupsResponse {
+  groups: AutomationGroup[];
+}
+
+export type AutomationRunStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+
+export interface AutomationRunTraceEntry {
+  id: string;
+  nodeId?: string;
+  level: "info" | "warn" | "error";
+  message: string;
+  at: string;
+  data?: Record<string, unknown>;
+}
+
+export interface AutomationRunSummary {
+  id: string;
+  groupId: string;
+  triggerEventId?: string;
+  status: AutomationRunStatus;
+  startedAt: string;
+  finishedAt?: string;
+  error?: string;
+  trace: AutomationRunTraceEntry[];
+}
+
+export interface AutomationRunsResponse {
+  runs: AutomationRunSummary[];
+}
+
+export interface AutomationTestRunSample {
+  triggerId: TriggerId;
+  payload: Record<string, unknown>;
+  runId: string;
+  status: AutomationRunStatus;
+  trace: AutomationRunTraceEntry[];
+  error?: string;
+}
+
+export interface AutomationTestRunResponse extends AutomationRunsResponse {
+  sample: AutomationTestRunSample;
 }
 
 export type UiContributionSlot =
@@ -197,6 +457,7 @@ export interface PluginDescriptor {
   requiresDirectory: boolean;
   actions: PluginActionDescriptor[];
   hooks?: HookDescriptor[];
+  triggers?: TriggerDescriptor[];
   uiContributions?: UiContributionDescriptor[];
   configFields: ConfigFieldDescriptor[];
 }
@@ -439,6 +700,16 @@ export interface WorkspaceSnapshot {
   templates?: WorkspaceLayoutTemplate[];
 }
 
+export type CloudxNotificationLevel = "info" | "success" | "warning" | "error";
+
+export interface CloudxNotification {
+  id: string;
+  title: string;
+  body?: string;
+  level: CloudxNotificationLevel;
+  at: string;
+}
+
 export interface WorkspaceTabsUpdate {
   type: "tabs" | "workspace";
   activeTabId?: string;
@@ -447,6 +718,13 @@ export interface WorkspaceTabsUpdate {
   windows?: WorkspaceWindow[];
   templates?: WorkspaceLayoutTemplate[];
 }
+
+export interface WorkspaceNotificationUpdate {
+  type: "notification";
+  notification: CloudxNotification;
+}
+
+export type WorkspaceUpdate = WorkspaceTabsUpdate | WorkspaceNotificationUpdate;
 
 export type TabLayoutDirection = "row" | "column";
 
@@ -528,6 +806,7 @@ export interface UpdateWorkspaceLayoutTemplateRequest {
 
 export interface ApplyWorkspaceLayoutTemplateRequest {
   projectPath: string;
+  windowId?: string;
   name?: string;
 }
 

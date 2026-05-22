@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement, type RefObject } from "react";
 import { AlertTriangle, Bot, ChevronDown, Columns2, GitBranch, LayoutTemplate, Mic, MicOff, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
 
-import { RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, type CloudxConfigResponse, type CloudxConfigValues, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsStore, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceWindow } from "@cloudx/shared";
+import { RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsStore, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUpdate, type WorkspaceWindow } from "@cloudx/shared";
 
 import {
   applyLayoutTemplate,
@@ -72,6 +72,7 @@ import {
 import { applyVoiceWorkspaceResults, buildClientVoiceContext, voiceConsoleValue } from "./voiceWorkspace.js";
 import { WebViewerPanel } from "./WebViewerPanel.js";
 import { WorktreeManagerPanel } from "./WorktreeManagerPanel.js";
+import { AutomationPanel } from "./AutomationPanel.js";
 
 type ConnectionStatus = "checking" | "connected" | "disconnected";
 
@@ -161,6 +162,7 @@ export function App() {
   const [voiceMessage, setVoiceMessage] = useState<string | undefined>();
   const [liveTranscript, setLiveTranscript] = useState<string | undefined>();
   const [manualTranscript, setManualTranscript] = useState("");
+  const [notifications, setNotifications] = useState<CloudxNotification[]>([]);
   const [attentionTabIds, setAttentionTabIds] = useState<Set<string>>(() => new Set());
   const [selectedAudioInputId, setSelectedAudioInputId] = useState<string | undefined>(() => loadAudioInputId());
   const [audioInputs, setAudioInputs] = useState<MediaDeviceInfo[]>([]);
@@ -196,6 +198,9 @@ export function App() {
           applyWorkspaceTabs(update.tabs, update.activeTabId);
         }
         setConnectionStatus("connected");
+      },
+      (notification) => {
+        setNotifications((current) => [notification, ...current.filter((candidate) => candidate.id !== notification.id)].slice(0, 5));
       },
       () => setConnectionStatus("disconnected")
     );
@@ -1006,6 +1011,7 @@ export function App() {
       </header>
 
       {error ? <div className="error-banner">{error}</div> : null}
+      {notifications.length ? <NotificationStack notifications={notifications} onDismiss={(id) => setNotifications((current) => current.filter((notification) => notification.id !== id))} /> : null}
 
       <section className="pane-root">
         {renderLayoutNode(layout.root)}
@@ -1658,6 +1664,9 @@ function PluginPanel({
   if (plugin?.panelKind === "worktree-manager") {
     return <WorktreeManagerPanel tab={tab} config={config} />;
   }
+  if (plugin?.panelKind === "automation") {
+    return <AutomationPanel tab={tab} />;
+  }
   if (plugin?.panelKind === "terminal" || !plugin) {
     return <TerminalPanel tab={tab} active={active} uiScale={uiScale} />;
   }
@@ -1811,15 +1820,37 @@ function getMicrophoneUnavailableReason(): string | undefined {
   return undefined;
 }
 
-function subscribeWorkspaceUpdates(onUpdate: (update: WorkspaceTabsUpdate) => void, onDisconnect: () => void): () => void {
+function NotificationStack({ notifications, onDismiss }: { notifications: CloudxNotification[]; onDismiss: (id: string) => void }) {
+  return (
+    <section className="notification-stack" aria-label="Notifications" aria-live="polite">
+      {notifications.map((notification) => (
+        <article key={notification.id} className={`notification-toast ${notification.level}`}>
+          <div>
+            <strong>{notification.title}</strong>
+            {notification.body ? <p>{notification.body}</p> : null}
+          </div>
+          <button type="button" onClick={() => onDismiss(notification.id)} aria-label={`Dismiss ${notification.title}`}>
+            <X size={14} />
+          </button>
+        </article>
+      ))}
+    </section>
+  );
+}
+
+function subscribeWorkspaceUpdates(onUpdate: (update: WorkspaceTabsUpdate) => void, onNotification: (notification: CloudxNotification) => void, onDisconnect: () => void): () => void {
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
   const socket = new WebSocket(`${protocol}://${window.location.host}/ws/workspace`);
   let closedByClient = false;
 
   socket.addEventListener("message", (event) => {
-    const message = JSON.parse(event.data as string) as WorkspaceTabsUpdate;
+    const message = JSON.parse(event.data as string) as WorkspaceUpdate;
     if (message.type === "tabs" || message.type === "workspace") {
       onUpdate(message);
+      return;
+    }
+    if (message.type === "notification") {
+      onNotification(message.notification);
     }
   });
   socket.addEventListener("close", () => {

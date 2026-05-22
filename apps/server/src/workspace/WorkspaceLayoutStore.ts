@@ -36,6 +36,13 @@ interface TemplateTabSource {
   initialInput?: Record<string, unknown>;
 }
 
+interface PreparedTemplateWindow {
+  template: WorkspaceLayoutTemplate;
+  window: WorkspaceWindow;
+  projectPath: string;
+  createdWindow: boolean;
+}
+
 export class WorkspaceLayoutStore {
   readonly workspacePath: string;
   private activeWindowId: string;
@@ -67,6 +74,14 @@ export class WorkspaceLayoutStore {
     return {
       activeTabId,
       tabs,
+      activeWindowId: this.activeWindowId,
+      windows: this.windows,
+      templates: this.templates
+    };
+  }
+
+  snapshot(): Pick<WorkspaceStateResponse, "activeWindowId" | "windows" | "templates"> {
+    return {
       activeWindowId: this.activeWindowId,
       windows: this.windows,
       templates: this.templates
@@ -208,15 +223,19 @@ export class WorkspaceLayoutStore {
     return deleted;
   }
 
-  async prepareTemplateWindow(templateId: string, input: ApplyWorkspaceLayoutTemplateRequest): Promise<{ template: WorkspaceLayoutTemplate; window: WorkspaceWindow; projectPath: string }> {
+  async prepareTemplateWindow(templateId: string, input: ApplyWorkspaceLayoutTemplateRequest): Promise<PreparedTemplateWindow> {
     const template = this.getTemplate(templateId);
     const projectPath = await this.pathPolicy.ensureDirectory(input.projectPath, false);
+    const windowId = cleanName(input.windowId);
+    if (windowId) {
+      return { template, window: this.getWindow(windowId), projectPath, createdWindow: false };
+    }
     const window = await this.createWindow({ name: input.name?.trim() || template.name, defaultCwd: projectPath });
-    return { template, window, projectPath };
+    return { template, window, projectPath, createdWindow: true };
   }
 
-  async finishTemplateWindow(windowId: string, layout: TabLayoutState): Promise<WorkspaceWindow> {
-    return this.updateWindow(windowId, { layout });
+  async finishTemplateWindow(windowId: string, layout: TabLayoutState, input: Pick<UpdateWorkspaceWindowRequest, "name" | "defaultCwd"> = {}): Promise<WorkspaceWindow> {
+    return this.updateWindow(windowId, { layout, ...input });
   }
 
   async search(query: string, tabs: WorkspaceTab[], sessionTextByTabId: Map<string, string>): Promise<SearchWorkspaceWindowsResponse> {

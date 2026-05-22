@@ -1,4 +1,4 @@
-import { pluginActionHookId } from "@cloudx/plugin-api";
+import { displayTitleFromIdentifier, pluginActionHookId } from "@cloudx/plugin-api";
 import type { HookDefinition, PluginActionDefinition } from "@cloudx/plugin-api";
 
 import type { PluginRegistry } from "../pluginRegistry.js";
@@ -18,10 +18,18 @@ function actionHookDefinition(pluginId: string, action: PluginActionDefinition, 
   return {
     id: hookId,
     owner: { kind: "plugin", pluginId },
-    title: action.name,
+    title: displayTitleFromIdentifier(action.name),
     description: action.description,
     inputSchema: action.inputSchema,
-    exposures: action.voiceExposed ? ["plugin", "voice", "ui", "http"] : ["plugin", "ui", "http"],
+    outputSchema: action.outputSchema,
+    exposures: [
+      "plugin",
+      "ui",
+      "http",
+      ...(action.voiceExposed ? ["voice" as const] : []),
+      ...(action.automationExposed ? ["automation" as const] : [])
+    ],
+    automationSafety: action.automationSafety,
     defaultForVoice: action.defaultForVoice,
     handlesUnhandledVoice: action.handlesUnhandledVoice,
     execute: (input, context) => sessions.executePluginHook(pluginId, hookId, action.name, context.targetTabId, input, context.caller)

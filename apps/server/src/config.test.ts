@@ -39,6 +39,11 @@ describe("loadConfig", () => {
     expect(loadConfig({ CLOUDX_VOICE_DEBUG_TRANSCRIPTS: "true" } as NodeJS.ProcessEnv).voiceDebugTranscripts).toBe(true);
   });
 
+  it("keeps automation startup disabling opt-in", () => {
+    expect(loadConfig({} as NodeJS.ProcessEnv).automationStartDisabled).toBe(false);
+    expect(loadConfig({ CLOUDX_AUTOMATION_START_DISABLED: "1" } as NodeJS.ProcessEnv).automationStartDisabled).toBe(true);
+  });
+
   it("rejects invalid terminal replay buffer size", () => {
     expect(() => loadConfig({ CLOUDX_TERMINAL_REPLAY_BYTES: "0" } as NodeJS.ProcessEnv)).toThrow(/CLOUDX_TERMINAL_REPLAY_BYTES/);
   });

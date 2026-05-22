@@ -40,16 +40,32 @@ export class AudioAiPlugin implements WorkspacePlugin {
         owner: { kind: "plugin", pluginId: AUDIO_AI_PLUGIN_ID },
         title: "Submit Voice Transcript",
         description: "Submit a typed or transcribed voice command to the Cloudx voice controller.",
-        exposures: ["plugin", "ui"],
+        exposures: ["plugin", "ui", "automation"],
+        automationSafety: "external",
         inputSchema: {
           type: "object",
           properties: {
-            transcript: { type: "string" },
-            activeTabId: { type: "string" },
-            clientContext: { type: "object" }
+            transcript: { type: "string", description: "Text command to submit to Cloudx AI control." },
+            activeTabId: { type: "string", description: "Tab used as the active AI context.", "x-cloudx-option-source": "workspace.tabs" },
+            clientContext: { type: "object", description: "Optional UI context object passed to the voice controller." }
           },
           required: ["transcript"],
           additionalProperties: false
+        },
+        outputSchema: {
+          type: "object",
+          properties: {
+            accepted: { type: "boolean", description: "True when the transcript was accepted by the voice controller." },
+            plan: {
+              type: "object",
+              properties: {
+                transcript: { type: "string", description: "Transcript processed by the voice controller." },
+                summary: { type: "string", description: "Short summary of the planned voice action." }
+              },
+              additionalProperties: true
+            }
+          },
+          additionalProperties: true
         },
         execute: async (input) => {
           const clientContext = typeof input.clientContext === "object" && input.clientContext !== null && !Array.isArray(input.clientContext) ? (input.clientContext as Record<string, unknown>) : undefined;

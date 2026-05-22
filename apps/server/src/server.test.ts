@@ -87,6 +87,39 @@ describe("buildServer", () => {
     }
   });
 
+  it("broadcasts notifications created by the notification hook", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-notifications-route-"));
+    const config = testConfig(root);
+    const app = await buildServer(config);
+    let client: WebSocket | undefined;
+    try {
+      await app.listen({ host: "127.0.0.1", port: 0 });
+      const address = app.server.address() as { port: number };
+      client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/workspace`);
+      await readWebSocketJson(client);
+
+      const notificationMessage = readWebSocketJson(client);
+      const sent = await app.inject({
+        method: "POST",
+        url: "/api/hooks/notifications.send",
+        payload: { input: { title: "Build finished", body: "Tests passed", level: "success" } }
+      });
+      expect(sent.statusCode).toBe(200);
+      expect(sent.json().result.notification).toMatchObject({ title: "Build finished", body: "Tests passed", level: "success" });
+      await expect(notificationMessage).resolves.toMatchObject({
+        type: "notification",
+        notification: { title: "Build finished", body: "Tests passed", level: "success" }
+      });
+
+      const notifications = await app.inject({ method: "GET", url: "/api/notifications" });
+      expect(notifications.statusCode).toBe(200);
+      expect(notifications.json().notifications[0]).toMatchObject({ title: "Build finished", body: "Tests passed", level: "success" });
+    } finally {
+      client?.close();
+      await app.close();
+    }
+  });
+
   it("refreshes runtime indicators when window plugin metadata changes", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-window-template-route-"));
     const config = testConfig(root);
@@ -180,6 +213,156 @@ describe("buildServer", () => {
       });
       expect(opened.statusCode).toBe(200);
       expect(opened.json().result.url).toBe("http://127.0.0.1:5174/dashboard");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("exposes automation catalog, groups, validation, and test runs", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-route-"));
+    const config = testConfig(root);
+    const app = await buildServer(config);
+    try {
+      const triggers = await app.inject({ method: "GET", url: "/api/triggers" });
+      expect(triggers.statusCode).toBe(200);
+      expect(triggers.json().triggers).toEqual(expect.arrayContaining([expect.objectContaining({ id: "worktree.created" })]));
+
+      const catalog = await app.inject({ method: "GET", url: "/api/automation/catalog" });
+      expect(catalog.statusCode).toBe(200);
+      const catalogNodes = catalog.json().nodes;
+      const portsMissingDescriptions = catalogNodes.flatMap((node: { typeId: string; inputs: Array<{ id: string; description?: string }>; outputs: Array<{ id: string; description?: string }> }) =>
+        [...node.inputs, ...node.outputs]
+          .filter((port) => !port.description?.trim())
+          .map((port) => `${node.typeId}:${port.id}`)
+      );
+      expect(portsMissingDescriptions).toEqual([]);
+      expect(catalog.json().nodes).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ typeId: "trigger:worktree.created" }),
+          expect.objectContaining({ typeId: "hook:workspace.layoutTemplates.apply" }),
+          expect.objectContaining({ typeId: "hook:workspace.shell.runCommand" }),
+          expect.objectContaining({ typeId: "hook:notifications.send" }),
+          expect.objectContaining({ typeId: "primitive:string.regex.extract" }),
+          expect.objectContaining({ typeId: "primitive:string.split" }),
+          expect.objectContaining({ typeId: "primitive:math.add" }),
+          expect.objectContaining({ typeId: "primitive:math.divide" })
+        ])
+      );
+      expect(catalogNodes.find((node: { typeId: string }) => node.typeId === "hook:codex-terminal.enterText")).toMatchObject({ title: "Enter Text" });
+      expect(catalogNodes.find((node: { typeId: string }) => node.typeId === "hook:worktree-manager.createWorktree")).toMatchObject({ title: "Create Worktree" });
+      expect(
+        catalogNodes.find((node: { typeId: string }) => node.typeId === "hook:workspace.windows.create").inputs.find((port: { id: string }) => port.id === "templateId")
+      ).toMatchObject({
+        description: expect.stringContaining("Rules/skills template"),
+        defaultValue: "default-codex",
+        options: { source: "rulesSkills.templates", values: expect.arrayContaining([expect.objectContaining({ value: "default-codex", label: "Default Codex" })]) }
+      });
+      expect(
+        catalogNodes.find((node: { typeId: string }) => node.typeId === "hook:workspace.layoutTemplates.apply").inputs.find((port: { id: string }) => port.id === "windowId")
+      ).toMatchObject({
+        description: expect.stringContaining("Existing workspace window"),
+        options: { source: "workspace.windows", values: expect.any(Array) }
+      });
+      expect(
+        catalogNodes.find((node: { typeId: string }) => node.typeId === "hook:workspace.tabs.create").inputs.find((port: { id: string }) => port.id === "pluginId")
+      ).toMatchObject({
+        options: { source: "plugins.creatable", values: expect.arrayContaining([expect.objectContaining({ value: "codex-terminal", label: "Codex Terminal" })]) }
+      });
+
+      const groups = await app.inject({ method: "GET", url: "/api/automation/groups" });
+      expect(groups.statusCode).toBe(200);
+      const group = groups.json().groups[0];
+      expect(group).toMatchObject({ id: "worktree-bootstrap", enabled: false });
+
+      const validation = await app.inject({
+        method: "POST",
+        url: `/api/automation/groups/${group.id}/validate`,
+        payload: { graph: group.graph }
+      });
+      expect(validation.statusCode).toBe(200);
+      expect(validation.json()).toMatchObject({ valid: true, diagnostics: [] });
+
+      const run = await app.inject({
+        method: "POST",
+        url: `/api/automation/groups/${group.id}/test-run`,
+        payload: {
+          payload: {
+            folderName: "feature-a",
+            branchName: "feature/a",
+            mode: "new_branch",
+            path: root,
+            projectDir: root
+          }
+        }
+      });
+      expect(run.statusCode).toBe(200);
+      expect(run.json().runs[0]).toMatchObject({ groupId: group.id, status: "succeeded" });
+      expect(run.json().sample).toMatchObject({
+        triggerId: "worktree.created",
+        payload: expect.objectContaining({ folderName: "feature-a" }),
+        status: "succeeded",
+        trace: expect.arrayContaining([expect.objectContaining({ message: "New worktree created" })])
+      });
+
+      const unsavedGraph = {
+        ...group.graph,
+        nodes: group.graph.nodes.map((node: { id: string; config?: Record<string, unknown> }) => (node.id === "log-created-worktree" ? { ...node, config: { message: "unsaved graph executed" } } : node))
+      };
+      const unsavedRun = await app.inject({
+        method: "POST",
+        url: `/api/automation/groups/${group.id}/test-run`,
+        payload: { graph: unsavedGraph }
+      });
+      expect(unsavedRun.statusCode).toBe(200);
+      expect(unsavedRun.json().sample.trace).toEqual(expect.arrayContaining([expect.objectContaining({ message: "unsaved graph executed" })]));
+      const groupsAfterUnsavedRun = await app.inject({ method: "GET", url: "/api/automation/groups" });
+      expect(groupsAfterUnsavedRun.json().groups[0].graph.nodes.find((node: { id: string }) => node.id === "log-created-worktree").config).toMatchObject({ message: "New worktree created" });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("starts with stored automation groups disabled when the startup safety switch is enabled", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-disabled-"));
+    const config = { ...testConfig(root), automationStartDisabled: true };
+    await fs.mkdir(config.dataDir, { recursive: true });
+    const now = new Date(0).toISOString();
+    await fs.writeFile(
+      path.join(config.dataDir, "automation.json"),
+      JSON.stringify({
+        groups: [
+          {
+            id: "dangerous",
+            name: "Dangerous",
+            enabled: true,
+            createdAt: now,
+            updatedAt: now,
+            graph: {
+              schemaVersion: 1,
+              nodes: [
+                { id: "trigger", typeId: "trigger:worktree.created", position: { x: 0, y: 0 } },
+                { id: "log", typeId: "primitive:log", position: { x: 200, y: 0 }, config: { message: "should not run" } }
+              ],
+              edges: [{ id: "exec", kind: "exec", sourceNodeId: "trigger", sourcePortId: "exec", targetNodeId: "log", targetPortId: "exec" }],
+              variables: []
+            }
+          }
+        ],
+        runs: [],
+        triggerEvents: []
+      }),
+      "utf8"
+    );
+
+    const app = await buildServer(config);
+    try {
+      const groups = await app.inject({ method: "GET", url: "/api/automation/groups" });
+      expect(groups.json().groups[0]).toMatchObject({ id: "dangerous", enabled: false });
+
+      await app.inject({ method: "POST", url: "/api/triggers/worktree.created", payload: { payload: { folderName: "x", branchName: "x", mode: "new_branch", path: root, projectDir: root } } });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const runs = await app.inject({ method: "GET", url: "/api/automation/runs" });
+      expect(runs.json().runs).toEqual([]);
     } finally {
       await app.close();
     }
@@ -400,6 +583,7 @@ describe("buildServer", () => {
       dataDir: path.join(root, ".cloudx"),
       webDistDir: path.join(root, "missing-web-dist"),
       appServerEnabled: false,
+      automationStartDisabled: false,
       terminalReplayBytes: 1024
     };
 
@@ -476,6 +660,7 @@ describe("buildServer", () => {
       dataDir: path.join(root, ".cloudx"),
       webDistDir: path.join(root, "missing-web-dist"),
       appServerEnabled: false,
+      automationStartDisabled: false,
       terminalReplayBytes: 1024
     };
 
@@ -525,6 +710,7 @@ describe("buildServer", () => {
       dataDir: path.join(os.tmpdir(), "cloudx-data"),
       webDistDir,
       appServerEnabled: false,
+      automationStartDisabled: false,
       terminalReplayBytes: 1024
     };
     const services = {
@@ -558,6 +744,7 @@ describe("buildServer", () => {
       dataDir: path.join(os.tmpdir(), "cloudx-data"),
       webDistDir: path.join(root, "missing-web-dist"),
       appServerEnabled: false,
+      automationStartDisabled: false,
       terminalReplayBytes: 1024
     };
     const services = {
@@ -599,6 +786,7 @@ describe("buildServer", () => {
       dataDir: path.join(os.tmpdir(), "cloudx-data"),
       webDistDir: path.join(root, "missing-web-dist"),
       appServerEnabled: false,
+      automationStartDisabled: false,
       terminalReplayBytes: 1024
     };
     const calls: unknown[] = [];
@@ -641,6 +829,7 @@ describe("buildServer", () => {
       dataDir: path.join(os.tmpdir(), "cloudx-data"),
       webDistDir: path.join(root, "missing-web-dist"),
       appServerEnabled: false,
+      automationStartDisabled: false,
       terminalReplayBytes: 1024
     };
     const asrCalls: unknown[][] = [];
@@ -690,6 +879,7 @@ describe("buildServer", () => {
       dataDir: path.join(os.tmpdir(), "cloudx-data"),
       webDistDir: path.join(root, "missing-web-dist"),
       appServerEnabled: false,
+      automationStartDisabled: false,
       terminalReplayBytes: 1024
     };
     let handledTranscript = "";
@@ -738,6 +928,7 @@ describe("buildServer", () => {
       dataDir: path.join(os.tmpdir(), "cloudx-data"),
       webDistDir: path.join(root, "missing-web-dist"),
       appServerEnabled: false,
+      automationStartDisabled: false,
       terminalReplayBytes: 1024
     };
     let buildVoiceContextCalled = false;
@@ -791,6 +982,7 @@ function testConfig(root: string): AppConfig {
     dataDir: path.join(root, ".cloudx"),
     webDistDir: path.join(root, "missing-web-dist"),
     appServerEnabled: false,
+    automationStartDisabled: false,
     terminalReplayBytes: 1024
   };
 }
