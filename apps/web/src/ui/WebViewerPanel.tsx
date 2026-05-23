@@ -6,6 +6,8 @@ import type { WorkspaceTab } from "@cloudx/shared";
 import { runTabAction } from "../api.js";
 import { ControlButton, ControlLink } from "./Control.js";
 
+const LOCAL_WEB_IFRAME_SANDBOX = "allow-downloads allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-pointer-lock allow-scripts";
+
 interface LocalWebState {
   url?: string;
   updatedAt?: string;
@@ -42,7 +44,7 @@ export function WebViewerPanel({ tab }: { tab: WorkspaceTab }) {
     return () => {
       cancelled = true;
     };
-  }, [tab.id]);
+  }, [tab.id, tab.updatedAt]);
 
   async function openUrl(event: FormEvent) {
     event.preventDefault();
@@ -105,7 +107,7 @@ export function WebViewerPanel({ tab }: { tab: WorkspaceTab }) {
             src={frameSrc}
             title={`${tab.title} local web viewer`}
             referrerPolicy="no-referrer"
-            sandbox="allow-downloads allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-pointer-lock allow-same-origin allow-scripts"
+            sandbox={LOCAL_WEB_IFRAME_SANDBOX}
           />
         ) : (
           <div className="empty-pane">

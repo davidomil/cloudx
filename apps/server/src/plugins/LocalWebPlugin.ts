@@ -10,6 +10,15 @@ interface LocalWebState {
   updatedAt?: string;
 }
 
+const LOCAL_WEB_STATE_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    url: { type: "string", description: "The normalized local website URL currently loaded in this viewer." },
+    updatedAt: { type: "string", description: "ISO timestamp for the most recent local web viewer state change." }
+  },
+  additionalProperties: false
+} satisfies PluginActionDefinition["outputSchema"];
+
 export class LocalWebPlugin implements WorkspacePlugin {
   readonly id = LOCAL_WEB_PLUGIN_ID;
   readonly acronym = "WEB";
@@ -28,12 +37,14 @@ export class LocalWebPlugin implements WorkspacePlugin {
         type: "object",
         properties: {},
         additionalProperties: false
-      }
+      },
+      outputSchema: LOCAL_WEB_STATE_OUTPUT_SCHEMA
     },
     {
       name: "open_url",
       description: "Open a local website URL in this viewer. Supports query tokens in the URL.",
       voiceExposed: true,
+      updatesTabState: true,
       inputSchema: {
         type: "object",
         properties: {
@@ -41,17 +52,20 @@ export class LocalWebPlugin implements WorkspacePlugin {
         },
         required: ["url"],
         additionalProperties: false
-      }
+      },
+      outputSchema: LOCAL_WEB_STATE_OUTPUT_SCHEMA
     },
     {
       name: "clear_url",
       description: "Clear the current local website URL.",
       voiceExposed: true,
+      updatesTabState: true,
       inputSchema: {
         type: "object",
         properties: {},
         additionalProperties: false
-      }
+      },
+      outputSchema: LOCAL_WEB_STATE_OUTPUT_SCHEMA
     }
   ];
 
@@ -114,17 +128,19 @@ class LocalWebSession implements PluginSession {
   }
 
   voiceContext(): PluginVoiceContext {
+    const voiceUrl = this.state.url ? redactLocalWebUrlForVoice(this.state.url) : undefined;
     return {
       kind: "local-web",
       cwd: this.tab.cwd,
       status: this.tab.status,
-      summary: this.state.url
-        ? `Local web viewer showing ${this.state.url}. Use open_url to navigate to another local dashboard.`
+      summary: voiceUrl
+        ? `Local web viewer showing ${voiceUrl}. Use open_url to navigate to another local dashboard.`
         : "Local web viewer with no URL loaded. Use open_url with an absolute local URL.",
-      visibleText: this.state.url ? `URL: ${this.state.url}` : undefined,
-      currentPath: this.state.url,
+      visibleText: voiceUrl ? `URL: ${voiceUrl}` : undefined,
+      currentPath: voiceUrl,
       metadata: {
-        url: this.state.url,
+        url: voiceUrl,
+        urlRedacted: this.state.url ? this.state.url !== voiceUrl : undefined,
         updatedAt: this.state.updatedAt
       }
     };
@@ -147,10 +163,14 @@ class LocalWebSession implements PluginSession {
   }
 
   private publicState(): Record<string, unknown> {
-    return {
-      url: this.state.url,
-      updatedAt: this.state.updatedAt
-    };
+    const state: Record<string, unknown> = {};
+    if (this.state.url) {
+      state.url = this.state.url;
+    }
+    if (this.state.updatedAt) {
+      state.updatedAt = this.state.updatedAt;
+    }
+    return state;
   }
 }
 
@@ -168,6 +188,9 @@ export function normalizeLocalWebUrl(input: string): string {
   if (parsed.username || parsed.password) {
     throw new Error("Local web URL must not include embedded credentials.");
   }
+  if (isDisallowedLocalWebAddress(parsed.hostname)) {
+    throw new Error("Local web URL host must not be a link-local or cloud metadata address.");
+  }
   if (parsed.protocol === "http:" && !isLoopbackHost(parsed.hostname)) {
     throw new Error("Plain HTTP local web URLs are allowed only for localhost or loopback addresses. Use HTTPS for LAN or tailnet hosts.");
   }
@@ -178,12 +201,23 @@ export function normalizeLocalWebUrl(input: string): string {
   return parsed.href;
 }
 
+export function redactLocalWebUrlForVoice(input: string): string {
+  try {
+    const parsed = new URL(input);
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.href;
+  } catch {
+    return "[invalid local web URL]";
+  }
+}
+
 function isLocalWebHost(hostname: string): boolean {
   return isLoopbackHost(hostname) || isPrivateAddress(hostname) || isLocalHostname(hostname);
 }
 
 function isLoopbackHost(hostname: string): boolean {
-  const normalized = normalizeHostname(hostname);
+  const normalized = classifyableAddressHost(hostname);
   if (normalized === "localhost" || normalized === "localhost." || normalized.endsWith(".localhost") || normalized.endsWith(".localhost.")) {
     return true;
   }
@@ -198,13 +232,25 @@ function isLoopbackHost(hostname: string): boolean {
 }
 
 function isPrivateAddress(hostname: string): boolean {
-  const normalized = normalizeHostname(hostname);
+  const normalized = classifyableAddressHost(hostname);
   const ipVersion = net.isIP(normalized);
   if (ipVersion === 4) {
     return isPrivateIpv4(normalized);
   }
   if (ipVersion === 6) {
-    return normalized.startsWith("fc") || normalized.startsWith("fd") || normalized.startsWith("fe80:");
+    return normalized.startsWith("fc") || normalized.startsWith("fd");
+  }
+  return false;
+}
+
+function isDisallowedLocalWebAddress(hostname: string): boolean {
+  const normalized = classifyableAddressHost(hostname);
+  const ipVersion = net.isIP(normalized);
+  if (ipVersion === 4) {
+    return isLinkLocalIpv4(normalized);
+  }
+  if (ipVersion === 6) {
+    return isLinkLocalIpv6(normalized);
   }
   return false;
 }
@@ -215,6 +261,11 @@ function normalizeHostname(hostname: string): string {
     return normalized.slice(1, -1);
   }
   return normalized;
+}
+
+function classifyableAddressHost(hostname: string): string {
+  const normalized = normalizeHostname(hostname);
+  return ipv4FromMappedIpv6(normalized) ?? normalized;
 }
 
 function isLocalHostname(hostname: string): boolean {
@@ -243,9 +294,64 @@ function isPrivateIpv4(address: string): boolean {
     first === 10 ||
     (first === 172 && second >= 16 && second <= 31) ||
     (first === 192 && second === 168) ||
-    (first === 169 && second === 254) ||
     (first === 100 && second >= 64 && second <= 127)
   );
+}
+
+function isLinkLocalIpv4(address: string): boolean {
+  const octets = address.split(".").map((part) => Number(part));
+  const [first, second] = octets;
+  return first === 169 && second === 254;
+}
+
+function isLinkLocalIpv6(address: string): boolean {
+  const firstHextet = Number.parseInt(address.split(":")[0] ?? "", 16);
+  return Number.isInteger(firstHextet) && (firstHextet & 0xffc0) === 0xfe80;
+}
+
+function ipv4FromMappedIpv6(address: string): string | undefined {
+  const hextets = ipv6Hextets(address);
+  if (!hextets) {
+    return undefined;
+  }
+  if (!hextets.slice(0, 5).every((hextet) => hextet === 0) || hextets[5] !== 0xffff) {
+    return undefined;
+  }
+  return [
+    hextets[6]! >> 8,
+    hextets[6]! & 0xff,
+    hextets[7]! >> 8,
+    hextets[7]! & 0xff
+  ].join(".");
+}
+
+function ipv6Hextets(address: string): number[] | undefined {
+  const compressedParts = address.split("::");
+  if (compressedParts.length > 2) {
+    return undefined;
+  }
+  const head = parseIpv6HextetList(compressedParts[0] ?? "");
+  const tail = parseIpv6HextetList(compressedParts[1] ?? "");
+  if (!head || !tail) {
+    return undefined;
+  }
+  if (compressedParts.length === 1) {
+    return head.length === 8 ? head : undefined;
+  }
+  const missingCount = 8 - head.length - tail.length;
+  if (missingCount < 1) {
+    return undefined;
+  }
+  return [...head, ...Array.from({ length: missingCount }, () => 0), ...tail];
+}
+
+function parseIpv6HextetList(input: string): number[] | undefined {
+  if (!input) {
+    return [];
+  }
+  const hextets = input.split(":");
+  const parsed = hextets.map((part) => (/^[\da-f]{1,4}$/iu.test(part) ? Number.parseInt(part, 16) : Number.NaN));
+  return parsed.every((hextet) => Number.isInteger(hextet) && hextet >= 0 && hextet <= 0xffff) ? parsed : undefined;
 }
 
 function requireString(value: unknown, name: string): string {

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { WorkspaceTab } from "@cloudx/shared";
 
-import { LocalWebPlugin, normalizeLocalWebUrl } from "./LocalWebPlugin.js";
+import { LocalWebPlugin, normalizeLocalWebUrl, redactLocalWebUrlForVoice } from "./LocalWebPlugin.js";
 
 describe("LocalWebPlugin", () => {
   it("declares that it can be created without a directory", () => {
@@ -12,7 +12,7 @@ describe("LocalWebPlugin", () => {
     });
   });
 
-  it("opens a loopback dashboard URL and preserves token query strings", () => {
+  it("opens a loopback dashboard URL, preserving tokens for UI state while redacting voice context", async () => {
     const tab = workspaceTab();
     const session = new LocalWebPlugin().createSession({
       tab,
@@ -26,11 +26,14 @@ describe("LocalWebPlugin", () => {
       pluginId: "local-web",
       state: { url: "http://127.0.0.1:5173/?token=f5d6#graph" }
     });
-    expect(session.voiceContext()).toMatchObject({
+    const voiceContext = await Promise.resolve(session.voiceContext());
+    expect(voiceContext).toMatchObject({
       kind: "local-web",
-      currentPath: "http://127.0.0.1:5173/?token=f5d6#graph",
-      metadata: { url: "http://127.0.0.1:5173/?token=f5d6#graph" }
+      currentPath: "http://127.0.0.1:5173/",
+      metadata: { url: "http://127.0.0.1:5173/", urlRedacted: true }
     });
+    expect(voiceContext.summary).not.toContain("f5d6");
+    expect(voiceContext.visibleText).not.toContain("token=");
   });
 
   it("updates and clears the local web URL through plugin actions", () => {
@@ -47,9 +50,7 @@ describe("LocalWebPlugin", () => {
     expect(session.handleAction("get_state", {})).toMatchObject({
       url: "https://192.168.1.20:8443/dashboard?token=abc"
     });
-    expect(session.handleAction("clear_url", {})).toMatchObject({
-      url: undefined
-    });
+    expect(session.handleAction("clear_url", {})).toEqual({});
   });
 
   it("rejects non-local or unsafe web URLs", () => {
@@ -59,15 +60,35 @@ describe("LocalWebPlugin", () => {
     expect(() => normalizeLocalWebUrl("http://192.168.1.20:5173")).toThrow(/Plain HTTP/);
   });
 
+  it("rejects link-local and cloud metadata IP literals", () => {
+    expect(() => normalizeLocalWebUrl("https://169.254.169.254/latest/meta-data/")).toThrow(/link-local/);
+    expect(() => normalizeLocalWebUrl("https://169.254.10.20/dashboard")).toThrow(/link-local/);
+    expect(() => normalizeLocalWebUrl("https://[fe80::1]/dashboard")).toThrow(/link-local/);
+    expect(() => normalizeLocalWebUrl("https://[febf::1]/dashboard")).toThrow(/link-local/);
+  });
+
   it("accepts loopback host variants for local HTTP", () => {
     expect(normalizeLocalWebUrl("http://localhost:5173")).toBe("http://localhost:5173/");
     expect(normalizeLocalWebUrl("http://dev.localhost:5173/path")).toBe("http://dev.localhost:5173/path");
     expect(normalizeLocalWebUrl("http://[::1]:5173/path")).toBe("http://[::1]:5173/path");
+    expect(normalizeLocalWebUrl("http://[::ffff:127.0.0.1]:5173")).toBe("http://[::ffff:7f00:1]:5173/");
   });
 
   it("accepts local HTTPS hostnames for LAN and tailnet dashboards", () => {
+    expect(normalizeLocalWebUrl("https://192.168.1.20:8443/dashboard")).toBe("https://192.168.1.20:8443/dashboard");
+    expect(normalizeLocalWebUrl("https://[fd00::1]:8443/dashboard")).toBe("https://[fd00::1]:8443/dashboard");
+    expect(normalizeLocalWebUrl("https://[::ffff:192.168.1.20]:8443/dashboard")).toBe("https://[::ffff:c0a8:114]:8443/dashboard");
     expect(normalizeLocalWebUrl("https://devbox.local:5173/?token=host")).toBe("https://devbox.local:5173/?token=host");
     expect(normalizeLocalWebUrl("https://cloudx.tailnet.ts.net:5173/?token=tailnet")).toBe("https://cloudx.tailnet.ts.net:5173/?token=tailnet");
+  });
+
+  it("classifies IPv4-mapped IPv6 link-local addresses as unsafe", () => {
+    expect(() => normalizeLocalWebUrl("https://[::ffff:169.254.169.254]/latest/meta-data/")).toThrow(/link-local/);
+  });
+
+  it("redacts local web query strings and fragments for voice planner context", () => {
+    expect(redactLocalWebUrlForVoice("https://devbox.local:5173/dashboard?token=abc&view=graph#secret")).toBe("https://devbox.local:5173/dashboard");
+    expect(redactLocalWebUrlForVoice("not a url")).toBe("[invalid local web URL]");
   });
 });
 
