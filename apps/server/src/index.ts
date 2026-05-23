@@ -3,7 +3,7 @@ import { buildServer } from "./server.js";
 
 const config = loadConfig();
 if (shouldWarnForNetworkBind(config.host)) {
-  console.warn(networkBindWarning(config.host, config.port));
+  console.warn(networkBindWarning(config.host, config.port, config.https ? "https" : "http"));
 }
 const app = await buildServer(config);
 
