@@ -93,6 +93,7 @@ export interface PluginActionDescriptor {
   automationSafety?: AutomationSafety;
   defaultForVoice?: boolean;
   handlesUnhandledVoice?: boolean;
+  updatesTabState?: boolean;
   inputSchema: Record<string, unknown>;
   outputSchema?: Record<string, unknown>;
 }
@@ -131,6 +132,19 @@ export interface HookCallResponse {
 }
 
 export type AutomationSafety = "read" | "write" | "destructive" | "external";
+
+export const DEFAULT_AUTOMATION_ALLOWED_SAFETY: AutomationSafety[] = ["read", "write"];
+
+export function isAutomationSafety(value: unknown): value is AutomationSafety {
+  return value === "read" || value === "write" || value === "destructive" || value === "external";
+}
+
+export function automationSafetyAllowed(safety: AutomationSafety | undefined, allowedSafety: AutomationSafety[] | undefined): boolean {
+  if (!safety) {
+    return true;
+  }
+  return (allowedSafety ?? DEFAULT_AUTOMATION_ALLOWED_SAFETY).includes(safety);
+}
 
 export type TriggerId = string;
 
@@ -174,6 +188,8 @@ export interface AutomationType {
   options?: AutomationType[];
 }
 
+export * from "./automationType.js";
+
 export type AutomationNodeKind = "trigger" | "function" | "primitive" | "converter";
 
 export type AutomationPortKind = "exec" | "data";
@@ -206,6 +222,7 @@ export interface AutomationPortDescriptor {
   kind: AutomationPortKind;
   direction: AutomationPortDirection;
   type: AutomationType;
+  automationRole?: "pluginTargetTab";
   description?: string;
   defaultValue?: unknown;
   options?: AutomationPortOptions;
@@ -315,6 +332,81 @@ export interface AutomationGraphDocument {
   nodes: AutomationNode[];
   edges: AutomationEdge[];
   variables?: AutomationVariableDefinition[];
+  allowedSafety?: AutomationSafety[];
+}
+
+export function isAutomationGraphDocument(value: unknown): value is AutomationGraphDocument {
+  return (
+    isRecord(value) &&
+    value.schemaVersion === 1 &&
+    Array.isArray(value.nodes) &&
+    value.nodes.every(isAutomationNode) &&
+    Array.isArray(value.edges) &&
+    value.edges.every(isAutomationEdge) &&
+    (value.variables === undefined || Array.isArray(value.variables) && value.variables.every(isAutomationVariableDefinition)) &&
+    (value.allowedSafety === undefined || Array.isArray(value.allowedSafety) && value.allowedSafety.every(isAutomationSafety))
+  );
+}
+
+export function isAutomationNode(value: unknown): value is AutomationNode {
+  return isRecord(value) && typeof value.id === "string" && typeof value.typeId === "string" && isAutomationNodePosition(value.position) && (value.config === undefined || isRecord(value.config));
+}
+
+export function isAutomationNodePosition(value: unknown): value is AutomationNodePosition {
+  return isRecord(value) && isFiniteNumber(value.x) && isFiniteNumber(value.y);
+}
+
+export function isAutomationEdge(value: unknown): value is AutomationEdge {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    isAutomationPortKind(value.kind) &&
+    typeof value.sourceNodeId === "string" &&
+    typeof value.sourcePortId === "string" &&
+    typeof value.targetNodeId === "string" &&
+    typeof value.targetPortId === "string" &&
+    (value.route === undefined || isAutomationEdgeRoute(value.route))
+  );
+}
+
+export function isAutomationEdgeRoute(value: unknown): value is AutomationEdgeRoute {
+  return isRecord(value) && (value.offsetX === undefined || isFiniteNumber(value.offsetX)) && (value.offsetY === undefined || isFiniteNumber(value.offsetY));
+}
+
+export function isAutomationVariableDefinition(value: unknown): value is AutomationVariableDefinition {
+  return isRecord(value) && typeof value.name === "string" && isAutomationType(value.type);
+}
+
+export function isAutomationType(value: unknown): value is AutomationType {
+  return isAutomationTypeAtDepth(value, 0);
+}
+
+function isAutomationTypeAtDepth(value: unknown, depth: number): value is AutomationType {
+  if (depth > 50 || !isRecord(value) || !isAutomationTypeKind(value.kind)) {
+    return false;
+  }
+  if (value.items !== undefined && !isAutomationTypeAtDepth(value.items, depth + 1)) {
+    return false;
+  }
+  if (value.options !== undefined && (!Array.isArray(value.options) || !value.options.every((option) => isAutomationTypeAtDepth(option, depth + 1)))) {
+    return false;
+  }
+  if (value.properties !== undefined && (!isRecord(value.properties) || !Object.values(value.properties).every((property) => isAutomationTypeAtDepth(property, depth + 1)))) {
+    return false;
+  }
+  return value.required === undefined || Array.isArray(value.required) && value.required.every((item) => typeof item === "string");
+}
+
+export function isAutomationPortKind(value: unknown): value is AutomationPortKind {
+  return value === "exec" || value === "data";
+}
+
+export function isAutomationTypeKind(value: unknown): value is AutomationTypeKind {
+  return value === "exec" || value === "never" || value === "unknown" || value === "null" || value === "boolean" || value === "number" || value === "string" || value === "array" || value === "object" || value === "union";
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
 }
 
 export type AutomationDiagnosticSeverity = "error" | "warning" | "info";
@@ -724,9 +816,56 @@ export interface WorkspaceNotificationUpdate {
   notification: CloudxNotification;
 }
 
-export type WorkspaceUpdate = WorkspaceTabsUpdate | WorkspaceNotificationUpdate;
-
 export type TabLayoutDirection = "row" | "column";
+
+export type WorkspaceLayoutInstruction =
+  | {
+      type: "open_tab_in_new_pane";
+      tabId: string;
+      paneId?: string;
+      windowId?: string;
+      splitDirection?: TabLayoutDirection;
+    }
+  | {
+      type: "add_tab_to_active_pane";
+      tabId: string;
+      paneId?: string;
+      windowId?: string;
+      splitDirection?: TabLayoutDirection;
+    }
+  | {
+      type: "select_pane";
+      paneId: string;
+      windowId?: string;
+    }
+  | {
+      type: "split_pane";
+      paneId?: string;
+      windowId?: string;
+      splitDirection?: TabLayoutDirection;
+    }
+  | {
+      type: "select_window";
+      windowId: string;
+    };
+
+export interface WorkspaceUiInstruction {
+  type: "open_tab_settings";
+  tabId: string;
+  sectionId?: string;
+}
+
+export interface WorkspaceUiInstructionUpdate {
+  type: "ui-instruction";
+  instruction: WorkspaceUiInstruction;
+}
+
+export interface WorkspaceAutomationRunsUpdate {
+  type: "automation-runs";
+  runs: AutomationRunSummary[];
+}
+
+export type WorkspaceUpdate = WorkspaceTabsUpdate | WorkspaceNotificationUpdate | WorkspaceUiInstructionUpdate | WorkspaceAutomationRunsUpdate;
 
 export interface TabPaneState {
   id: string;
@@ -751,6 +890,8 @@ export interface TabLayoutState {
   root: TabLayoutNode;
   activePaneId: string;
 }
+
+export * from "./workspaceLayout.js";
 
 export interface WorkspaceWindow {
   id: string;
