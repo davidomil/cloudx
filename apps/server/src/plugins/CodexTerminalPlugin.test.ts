@@ -12,6 +12,7 @@ import type { TerminalProcess, TerminalProcessFactory } from "../terminal/Termin
 class FakeTerminalProcess implements TerminalProcess {
   written = "";
   killed = false;
+  readonly resizes: Array<[cols: number, rows: number]> = [];
   private readonly dataListeners = new Set<(data: string) => void>();
   private exitListener: ((event: { exitCode: number; signal?: number }) => void) | undefined;
 
@@ -31,8 +32,8 @@ class FakeTerminalProcess implements TerminalProcess {
     this.written += data;
   }
 
-  resize(): void {
-    return undefined;
+  resize(cols: number, rows: number): void {
+    this.resizes.push([cols, rows]);
   }
 
   kill(): void {
@@ -286,6 +287,8 @@ describe("CodexTerminalPlugin", () => {
     ]);
     expect(codexResumeInput({ resume: { mode: "new" } })).toBeUndefined();
     expect(() => codexResumeInput({ resume: { mode: "session", sessionId: " " } })).toThrow("Codex resume session id is required.");
+    expect(() => codexResumeInput({ resume: { mode: "picker", all: "true" } })).toThrow("Codex resume all must be a boolean.");
+    expect(() => codexResumeInput({ resume: { mode: "last", includeNonInteractive: "true" } })).toThrow("Codex resume includeNonInteractive must be a boolean.");
   });
 
   it("injects updated rules and skills into a running Codex terminal without stopping it", async () => {
@@ -352,6 +355,41 @@ describe("CodexTerminalSession", () => {
     }
   });
 
+  it("cancels delayed submit keys when the terminal stops", async () => {
+    vi.useFakeTimers();
+    try {
+      const process = new FakeTerminalProcess();
+      const session = new CodexTerminalSession(tab, process, undefined, { closeOnExit: false, submitDelayMs: 25 });
+
+      session.handleAction("enter_text", { text: "run tests", submit: true });
+      session.stop();
+
+      await vi.advanceTimersByTimeAsync(25);
+
+      expect(process.killed).toBe(true);
+      expect(process.written).toBe("run tests");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels delayed submit keys when the terminal exits", async () => {
+    vi.useFakeTimers();
+    try {
+      const process = new FakeTerminalProcess();
+      const session = new CodexTerminalSession(tab, process, undefined, { closeOnExit: false, submitDelayMs: 25 });
+
+      session.handleAction("enter_text", { text: "run tests", submit: true });
+      process.exit(0);
+
+      await vi.advanceTimersByTimeAsync(25);
+
+      expect(process.written).toBe("run tests");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("removes trailing line breaks before adding the submit key", () => {
     const process = new FakeTerminalProcess();
     const session = new CodexTerminalSession(tab, process);
@@ -379,6 +417,28 @@ describe("CodexTerminalSession", () => {
     process.emitData("beta");
 
     expect(session.snapshot().recentOutput).toBe("habeta");
+  });
+
+  it("keeps terminal replay trimming on UTF-8 character boundaries", () => {
+    const process = new FakeTerminalProcess();
+    const session = new CodexTerminalSession(tab, process, undefined, { closeOnExit: false, replayBytes: 1025 });
+
+    process.emitData("🙂".repeat(400));
+
+    expect(session.snapshot().recentOutput).toBe("🙂".repeat(256));
+    expect(session.snapshot().recentOutput).not.toContain("\uFFFD");
+  });
+
+  it("rejects invalid terminal dimensions before resizing", () => {
+    const process = new FakeTerminalProcess();
+    const session = new CodexTerminalSession(tab, process);
+
+    expect(session.handleAction("resize", { cols: 120, rows: 40 })).toEqual({ cols: 120, rows: 40 });
+    expect(process.resizes).toEqual([[120, 40]]);
+    expect(() => session.handleAction("resize", { cols: 0, rows: 24 })).toThrow("cols must be a positive integer.");
+    expect(() => session.handleAction("resize", { cols: 80.5, rows: 24 })).toThrow("cols must be a positive integer.");
+    expect(() => session.handleAction("resize", { cols: 80, rows: -1 })).toThrow("rows must be a positive integer.");
+    expect(process.resizes).toEqual([[120, 40]]);
   });
 
   it("exposes terminal output through standardized voice context", () => {
@@ -499,6 +559,13 @@ describe("TerminalShellIntegrationParser", () => {
     const parser = new TerminalShellIntegrationParser();
 
     expect(parser.push("\u001b]633;D\u001b\\")).toEqual([{ sequence: 633 }]);
+  });
+
+  it("recovers after an overlong unterminated OSC sequence", () => {
+    const parser = new TerminalShellIntegrationParser();
+
+    expect(parser.push(`\u001b]633;${"x".repeat(5000)}`)).toEqual([]);
+    expect(parser.push("\u001b]633;D;0\u0007")).toEqual([{ sequence: 633, exitCode: 0 }]);
   });
 });
 

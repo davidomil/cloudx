@@ -17,6 +17,7 @@ import { buildLoginShellCommandLaunch, buildToolEnv, resolveAssistantCommand } f
 export const DEFAULT_TERMINAL_REPLAY_BYTES = 1_048_576;
 export const CODEX_SUBMIT_DELAY_MS = 25;
 export const CODEX_CLOSE_ON_EXIT_GRACE_MS = 2_000;
+const MAX_OSC_SEQUENCE_CHARS = 4096;
 
 export const TERMINAL_ACTIONS: PluginActionDefinition[] = terminalActions({
   enterTextDescription:
@@ -150,9 +151,19 @@ export function codexResumeInput(initialInput: Record<string, unknown> | undefin
   return {
     mode,
     sessionId: mode === "session" ? sessionId : undefined,
-    all: initialInput.resume.all === true,
-    includeNonInteractive: initialInput.resume.includeNonInteractive === true
+    all: optionalResumeBoolean(initialInput.resume.all, "all") ?? false,
+    includeNonInteractive: optionalResumeBoolean(initialInput.resume.includeNonInteractive, "includeNonInteractive") ?? false
   };
+}
+
+function optionalResumeBoolean(value: unknown, name: string): boolean | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "boolean") {
+    throw new Error(`Codex resume ${name} must be a boolean.`);
+  }
+  return value;
 }
 
 function shortSessionLabel(sessionId: string | undefined): string {
@@ -418,7 +429,9 @@ export class TerminalShellIntegrationParser {
       const stEnd = this.buffer.indexOf("\u001b\\", 2);
       const terminator = firstTerminator(belEnd, stEnd);
       if (!terminator) {
-        this.buffer = this.buffer.slice(0, 4096);
+        if (this.buffer.length > MAX_OSC_SEQUENCE_CHARS) {
+          this.buffer = "";
+        }
         return events;
       }
 
@@ -440,6 +453,8 @@ export class CodexTerminalSession implements PluginSession {
   private readonly startedAt = Date.now();
   private readonly shellIntegrationParser = new TerminalShellIntegrationParser();
   private readonly statusListeners = new Set<(status: WorkspaceTab["status"], message?: string) => void>();
+  private readonly pendingSubmitTimers = new Set<ReturnType<typeof setTimeout>>();
+  private terminalClosed = false;
 
   constructor(
     public readonly tab: WorkspaceTab,
@@ -456,6 +471,8 @@ export class CodexTerminalSession implements PluginSession {
       }
     });
     this.terminalProcess.onExit((event) => {
+      this.terminalClosed = true;
+      this.clearPendingSubmitTimers();
       if (this.stopped) {
         this.setStatus("stopped", "Terminal was stopped.");
         return;
@@ -487,11 +504,13 @@ export class CodexTerminalSession implements PluginSession {
   }
 
   resize(cols: number, rows: number): void {
-    this.terminalProcess.resize(cols, rows);
+    this.terminalProcess.resize(requireTerminalDimension(cols, "cols"), requireTerminalDimension(rows, "rows"));
   }
 
   stop(): void {
     this.stopped = true;
+    this.terminalClosed = true;
+    this.clearPendingSubmitTimers();
     this.terminalProcess.kill();
     this.setStatus("stopped", "Terminal was stopped.");
   }
@@ -562,8 +581,8 @@ export class CodexTerminalSession implements PluginSession {
       return { key };
     }
     if (action === "resize") {
-      const cols = requireNumber(input.cols, "cols");
-      const rows = requireNumber(input.rows, "rows");
+      const cols = requireTerminalDimension(input.cols, "cols");
+      const rows = requireTerminalDimension(input.rows, "rows");
       this.resize(cols, rows);
       return { cols, rows };
     }
@@ -584,10 +603,23 @@ export class CodexTerminalSession implements PluginSession {
   private submit(): void {
     const delayMs = this.options.submitDelayMs ?? 0;
     if (delayMs > 0) {
-      setTimeout(() => this.write("\r"), delayMs);
+      const timer = setTimeout(() => {
+        this.pendingSubmitTimers.delete(timer);
+        if (!this.terminalClosed) {
+          this.write("\r");
+        }
+      }, delayMs);
+      this.pendingSubmitTimers.add(timer);
       return;
     }
     this.write("\r");
+  }
+
+  private clearPendingSubmitTimers(): void {
+    for (const timer of this.pendingSubmitTimers) {
+      clearTimeout(timer);
+    }
+    this.pendingSubmitTimers.clear();
   }
 
   private writeBracketedPasteSubmit(text: string): void {
@@ -615,7 +647,12 @@ function trimRecentOutput(output: string, maxBytes: number): string {
   if (Buffer.byteLength(output, "utf8") <= maxBytes) {
     return output;
   }
-  return Buffer.from(output, "utf8").subarray(-maxBytes).toString("utf8");
+  const bytes = Buffer.from(output, "utf8");
+  let start = bytes.length - maxBytes;
+  while (start < bytes.length && isUtf8ContinuationByte(bytes[start]!)) {
+    start += 1;
+  }
+  return bytes.subarray(start).toString("utf8");
 }
 
 function stripTrailingLineTerminators(text: string): string {
@@ -665,11 +702,15 @@ function requireString(value: unknown, name: string): string {
   return value;
 }
 
-function requireNumber(value: unknown, name: string): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new Error(`${name} must be a finite number.`);
+function requireTerminalDimension(value: unknown, name: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer.`);
   }
   return value;
+}
+
+function isUtf8ContinuationByte(byte: number): boolean {
+  return (byte & 0b1100_0000) === 0b1000_0000;
 }
 
 function keyToSequence(key: string): string {

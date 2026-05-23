@@ -5,7 +5,8 @@ import { FitAddon } from "@xterm/addon-fit";
 import type { WorkspaceTab } from "@cloudx/shared";
 import { installTerminalMobileScroller } from "./terminalMobileScroll.js";
 import { bottomRevealScrollDelta, rowsFittingTerminalViewport, shouldFocusTerminalAfterFit, visualViewportBottomInset } from "./terminalSizing.js";
-import { readTerminalColorTheme, type TerminalColorTheme } from "./theme.js";
+import { readTerminalColorTheme } from "./theme.js";
+import { registerTerminalView, unregisterTerminalView } from "./terminalViewStore.js";
 import { DEFAULT_UI_SCALE, scaledTerminalFontSize } from "./uiScale.js";
 
 interface TerminalView {
@@ -58,6 +59,7 @@ export function TerminalPanel({ tab, active, uiScale }: { tab: WorkspaceTab; act
       cancelTerminalKeyboardInsetUpdate(view);
       cancelTerminalInputReveal(view);
       clearTerminalKeyboardInset(view);
+      releaseTerminalContainerBindings(view);
       viewRef.current = null;
     };
   }, [tab.id, tab.cwd, tab.title, uiScale]);
@@ -72,24 +74,18 @@ export function TerminalPanel({ tab, active, uiScale }: { tab: WorkspaceTab; act
   return <div className="terminal-panel" ref={containerRef} />;
 }
 
-export function disposeTerminalView(tabId: string): void {
+function disposeTerminalViewInternal(tabId: string): void {
   const view = terminalViews.get(tabId);
   if (!view) return;
   cancelScheduledFit(view);
   cancelTerminalKeyboardInsetUpdate(view);
   cancelTerminalInputReveal(view);
+  clearTerminalKeyboardInset(view);
+  releaseTerminalContainerBindings(view);
   view.socket.close();
-  view.releaseMobileScroll?.();
   view.terminal.dispose();
   terminalViews.delete(tabId);
-}
-
-export function disposeTerminalViewsExcept(activeTabIds: Set<string>): void {
-  for (const tabId of terminalViews.keys()) {
-    if (!activeTabIds.has(tabId)) {
-      disposeTerminalView(tabId);
-    }
-  }
+  unregisterTerminalView(tabId);
 }
 
 function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement, uiScale: number): TerminalView {
@@ -111,16 +107,29 @@ function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement, uiScale: 
   terminal.loadAddon(fit);
 
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  const socket = new WebSocket(`${protocol}://${window.location.host}/ws/terminal/${tab.id}`);
+  const socket = new WebSocket(`${protocol}://${window.location.host}/ws/terminal/${encodeURIComponent(tab.id)}`);
   const view = { terminal, fit, socket, uiScale };
   terminalViews.set(tab.id, view);
+  registerTerminalView(tab.id, {
+    dispose: () => disposeTerminalViewInternal(tab.id),
+    applyColorTheme: (theme) => {
+      view.terminal.options.theme = theme;
+    },
+    applyUiScale: (nextUiScale) => {
+      view.uiScale = nextUiScale;
+      scheduleFitAndResize(view);
+    }
+  });
   attachTerminalView(view, container);
   terminal.writeln(`Cloudx tab ${tab.title}`);
   terminal.writeln(`cwd: ${tab.cwd}`);
   terminal.writeln("");
 
   socket.addEventListener("message", (event) => {
-    const message = JSON.parse(event.data as string) as { type: string; data?: string };
+    const message = parseTerminalSocketMessage(event.data);
+    if (!message) {
+      return;
+    }
     if (message.type === "data" && message.data) {
       terminal.write(message.data);
     }
@@ -135,17 +144,26 @@ function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement, uiScale: 
   return view;
 }
 
-export function applyTerminalColorTheme(theme: TerminalColorTheme): void {
-  for (const view of terminalViews.values()) {
-    view.terminal.options.theme = theme;
+function parseTerminalSocketMessage(data: unknown): { type?: string; data?: string } | undefined {
+  if (typeof data !== "string") {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(data) as unknown;
+    if (!isRecord(parsed)) {
+      return undefined;
+    }
+    return {
+      type: typeof parsed.type === "string" ? parsed.type : undefined,
+      data: typeof parsed.data === "string" ? parsed.data : undefined
+    };
+  } catch {
+    return undefined;
   }
 }
 
-export function applyTerminalUiScale(uiScale: number): void {
-  for (const view of terminalViews.values()) {
-    view.uiScale = uiScale;
-    scheduleFitAndResize(view);
-  }
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function attachTerminalView(view: TerminalView, container: HTMLDivElement): void {
@@ -180,8 +198,14 @@ function installMobileScrollForView(view: TerminalView, container: HTMLDivElemen
   view.releaseMobileScroll = installTerminalMobileScroller(view.terminal, container, container.closest(".pane-root"));
 }
 
+function releaseTerminalContainerBindings(view: TerminalView): void {
+  view.releaseMobileScroll?.();
+  view.releaseMobileScroll = undefined;
+  view.container = undefined;
+}
+
 function fitAndResize(view: TerminalView, focus = false): void {
-  if (!view.terminal.element) {
+  if (!view.terminal.element || !view.container) {
     return;
   }
   const fontSize = responsiveTerminalFontSize(view.container, view.uiScale);
