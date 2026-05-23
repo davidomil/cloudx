@@ -75,7 +75,22 @@
               "pluginId": { "type": ["string", "null"] },
               "initialInput": {
                 "type": ["object", "null"],
-                "additionalProperties": true
+                "additionalProperties": false,
+                "required": ["url", "resume"],
+                "properties": {
+                  "url": { "type": ["string", "null"] },
+                  "resume": {
+                    "type": ["object", "null"],
+                    "additionalProperties": false,
+                    "required": ["mode", "sessionId", "all", "includeNonInteractive"],
+                    "properties": {
+                      "mode": { "type": ["string", "null"], "enum": ["picker", "last", "session", null] },
+                      "sessionId": { "type": ["string", "null"] },
+                      "all": { "type": ["boolean", "null"] },
+                      "includeNonInteractive": { "type": ["boolean", "null"] }
+                    }
+                  }
+                }
               },
               "indicator": {
                 "type": ["object", "null"],

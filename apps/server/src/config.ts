@@ -4,21 +4,26 @@ import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
 
 import { DEFAULT_VOICE_MODEL } from "@cloudx/shared";
+import { DEFAULT_ASR_TIMEOUT_MS, MAX_ASR_TIMEOUT_MS } from "./asrClient.js";
 import { DEFAULT_TERMINAL_REPLAY_BYTES } from "./plugins/CodexTerminalPlugin.js";
 
 export const DEFAULT_CLOUDX_HOST = "127.0.0.1";
+export const DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES = 25 * 1024 * 1024;
+export const MAX_VOICE_AUDIO_UPLOAD_MAX_BYTES = 512 * 1024 * 1024;
 
 export interface AppConfig {
   host: string;
   port: number;
   allowedRoots: string[];
   asrUrl: string;
+  asrTimeoutMs: number;
   voiceModel: string;
   dataDir: string;
   webDistDir: string;
   appServerEnabled: boolean;
   automationStartDisabled: boolean;
   terminalReplayBytes: number;
+  voiceAudioUploadMaxBytes: number;
   voiceDebugTranscripts?: boolean;
   https?: {
     keyPath: string;
@@ -28,8 +33,10 @@ export interface AppConfig {
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const host = env.CLOUDX_HOST ?? DEFAULT_CLOUDX_HOST;
-  const port = Number.parseInt(env.CLOUDX_PORT ?? "3001", 10);
-  const terminalReplayBytes = Number.parseInt(env.CLOUDX_TERMINAL_REPLAY_BYTES ?? String(DEFAULT_TERMINAL_REPLAY_BYTES), 10);
+  const port = parsePositiveInteger(env.CLOUDX_PORT ?? "3001", "CLOUDX_PORT");
+  const terminalReplayBytes = parsePositiveInteger(env.CLOUDX_TERMINAL_REPLAY_BYTES ?? String(DEFAULT_TERMINAL_REPLAY_BYTES), "CLOUDX_TERMINAL_REPLAY_BYTES");
+  const asrTimeoutMs = parsePositiveInteger(env.CLOUDX_ASR_TIMEOUT_MS ?? String(DEFAULT_ASR_TIMEOUT_MS), "CLOUDX_ASR_TIMEOUT_MS");
+  const voiceAudioUploadMaxBytes = parsePositiveInteger(env.CLOUDX_VOICE_AUDIO_UPLOAD_MAX_BYTES ?? String(DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES), "CLOUDX_VOICE_AUDIO_UPLOAD_MAX_BYTES");
   const home = os.homedir();
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const dataDir = path.resolve(env.CLOUDX_DATA_DIR ?? path.join(repoRoot, ".cloudx"));
@@ -39,11 +46,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     .map((root) => root.trim())
     .filter(Boolean);
 
-  if (!Number.isInteger(port) || port <= 0) {
-    throw new Error("CLOUDX_PORT must be a positive integer.");
+  if (!Number.isSafeInteger(asrTimeoutMs) || asrTimeoutMs <= 0 || asrTimeoutMs > MAX_ASR_TIMEOUT_MS) {
+    throw new Error(`CLOUDX_ASR_TIMEOUT_MS must be a positive integer no greater than ${MAX_ASR_TIMEOUT_MS}.`);
   }
-  if (!Number.isInteger(terminalReplayBytes) || terminalReplayBytes <= 0) {
-    throw new Error("CLOUDX_TERMINAL_REPLAY_BYTES must be a positive integer.");
+  if (!Number.isSafeInteger(voiceAudioUploadMaxBytes) || voiceAudioUploadMaxBytes <= 0 || voiceAudioUploadMaxBytes > MAX_VOICE_AUDIO_UPLOAD_MAX_BYTES) {
+    throw new Error(`CLOUDX_VOICE_AUDIO_UPLOAD_MAX_BYTES must be a positive integer no greater than ${MAX_VOICE_AUDIO_UPLOAD_MAX_BYTES}.`);
   }
   if (allowedRoots.length === 0) {
     throw new Error("CLOUDX_ALLOWED_ROOTS must include at least one path.");
@@ -54,15 +61,28 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     port,
     allowedRoots,
     asrUrl: env.CLOUDX_ASR_URL ?? "http://127.0.0.1:7810",
+    asrTimeoutMs,
     voiceModel: env.CLOUDX_VOICE_MODEL ?? DEFAULT_VOICE_MODEL,
     dataDir,
     webDistDir: path.resolve(env.CLOUDX_WEB_DIST_DIR ?? path.join(repoRoot, "apps/web/dist")),
     appServerEnabled: env.CLOUDX_APP_SERVER_ENABLED !== "false",
     automationStartDisabled: isTruthy(env.CLOUDX_AUTOMATION_START_DISABLED),
     terminalReplayBytes,
+    voiceAudioUploadMaxBytes,
     voiceDebugTranscripts: isTruthy(env.CLOUDX_VOICE_DEBUG_TRANSCRIPTS),
     https
   };
+}
+
+function parsePositiveInteger(value: string, name: string): number {
+  if (!/^[1-9]\d*$/u.test(value)) {
+    throw new Error(`${name} must be a positive integer.`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`${name} must be a positive integer.`);
+  }
+  return parsed;
 }
 
 export function shouldWarnForNetworkBind(host: string): boolean {
@@ -70,7 +90,7 @@ export function shouldWarnForNetworkBind(host: string): boolean {
   return normalized === "0.0.0.0" || normalized === "::" || normalized === "[::]";
 }
 
-export function networkBindWarning(host: string, port: number): string {
+export function networkBindWarning(host: string, port: number, protocol: "http" | "https" = "https"): string {
   return [
     "",
     "======================================================================",
@@ -79,7 +99,7 @@ export function networkBindWarning(host: string, port: number): string {
     "Cloudx can spawn terminals, edit files, proxy dashboards, and transcribe",
     "browser microphone audio when voice is enabled.",
     "Use only on a trusted LAN or private tailnet. Public internet unsupported.",
-    `Local URL: https://127.0.0.1:${port}`,
+    `Local URL: ${protocol}://127.0.0.1:${port}`,
     "======================================================================",
     ""
   ].join("\n");

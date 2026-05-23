@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { TabLayoutState, VoiceExecutionResult, WorkspaceTab } from "@cloudx/shared";
 
 import { listPanes } from "./layout.js";
-import { applyVoiceWorkspaceResults, buildClientVoiceContext, voiceConsoleValue } from "./voiceWorkspace.js";
+import { applyVoiceWorkspaceResults, applyVoiceWorkspaceResultsToWorkspace, buildClientVoiceContext, voiceConsoleValue } from "./voiceWorkspace.js";
 
 describe("voice workspace helpers", () => {
   it("shows clear voice console status while recording and thinking", () => {
@@ -71,6 +71,26 @@ describe("voice workspace helpers", () => {
       { id: "pane-1", tabIds: ["tab-1"] },
       { id: "pane-2", tabIds: ["tab-2"], activeTabId: "tab-2" }
     ]);
+  });
+
+  it("ignores malformed voice tab results without creating ghost layout entries", () => {
+    const current = { layout: layoutWithTabs([tab("tab-1")]), tabs: [tab("tab-1")], activeTabId: "tab-1" };
+    const result: VoiceExecutionResult = {
+      accepted: true,
+      plan: { transcript: "open tab", summary: "Open malformed tab.", actions: [] },
+      results: [
+        {
+          action: "create_tab",
+          ok: true,
+          result: {
+            tab: { id: "tab-2", pluginId: "standard-terminal", cwd: "/tmp" },
+            layoutInstruction: { type: "open_tab_in_new_pane", tabId: "tab-2", splitDirection: "row" }
+          }
+        }
+      ]
+    };
+
+    expect(applyVoiceWorkspaceResults(current, result, { createPaneId: () => "pane-2", createSplitId: () => "split-1" })).toEqual(current);
   });
 
   it("applies multi-step pane control before opening a tab in the new active pane", () => {
@@ -144,6 +164,44 @@ describe("voice workspace helpers", () => {
     const current = { layout: splitLayout(), tabs: [tab("tab-1"), tab("tab-2")], activeTabId: "tab-2" };
 
     expect(applyVoiceWorkspaceResults(current, result, { createPaneId: () => "pane-3", createSplitId: () => "split-2" })).toEqual(current);
+  });
+
+  it("applies layout instructions to the targeted non-active window", () => {
+    const mainWindow = window("window-1", "Main", layoutWithTabs([tab("tab-1"), tab("tab-3", "file-browser")]));
+    const backendWindow = window("window-2", "Backend", layoutWithTabs([tab("tab-2")]));
+    const result: VoiceExecutionResult = {
+      accepted: true,
+      plan: { transcript: "move files to backend", summary: "Move files.", actions: [] },
+      results: [
+        {
+          action: "create_tab",
+          ok: true,
+          result: {
+            tab: tab("tab-3", "file-browser"),
+            layoutInstruction: { type: "add_tab_to_active_pane", tabId: "tab-3", windowId: "window-2" }
+          }
+        }
+      ]
+    };
+
+    const applied = applyVoiceWorkspaceResultsToWorkspace(
+      {
+        layout: mainWindow.layout,
+        windows: [mainWindow, backendWindow],
+        activeWindowId: "window-1",
+        tabs: [tab("tab-1"), tab("tab-2"), tab("tab-3", "file-browser")],
+        activeTabId: "tab-1"
+      },
+      result,
+      { createPaneId: () => "pane-3", createSplitId: () => "split-2" }
+    );
+
+    expect(applied.activeWindowId).toBe("window-2");
+    expect(applied.activeTabId).toBe("tab-3");
+    expect(applied.changedLayoutWindowIds).toEqual(["window-1", "window-2"]);
+    expect(listPanes(applied.windows.find((candidate) => candidate.id === "window-1")!.layout.root)).toMatchObject([{ tabIds: ["tab-1"] }]);
+    expect(listPanes(applied.windows.find((candidate) => candidate.id === "window-2")!.layout.root)).toMatchObject([{ tabIds: ["tab-2", "tab-3"], activeTabId: "tab-3" }]);
+    expect(listPanes(applied.layout.root)).toMatchObject([{ tabIds: ["tab-2", "tab-3"], activeTabId: "tab-3" }]);
   });
 });
 

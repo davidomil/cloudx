@@ -3,6 +3,7 @@ import type { AppServerClient } from "./AppServerClient.js";
 
 export interface VoiceContextProvider {
   context(activeTabId?: string): Promise<Record<string, unknown>>;
+  dispose?(): void;
 }
 
 export class AppServerContextProvider implements VoiceContextProvider {
@@ -20,11 +21,15 @@ export class AppServerContextProvider implements VoiceContextProvider {
       return { workspace, appServer: { enabled: false } };
     }
 
+    const appServerClient = this.appServer;
     const activeTab = activeTabId ? this.sessions.getTab(activeTabId) : undefined;
     try {
-      const appServer = await this.appServer.readVoiceContext(activeTab?.cwd);
+      const appServer = await appServerClient.readVoiceContext(activeTab?.cwd);
       return { workspace, appServer: { enabled: true, ...appServer } };
     } catch (error) {
+      if (appServerClient.isClosed && this.appServer === appServerClient) {
+        this.appServer = undefined;
+      }
       return {
         workspace,
         appServer: {
@@ -33,5 +38,10 @@ export class AppServerContextProvider implements VoiceContextProvider {
         }
       };
     }
+  }
+
+  dispose(): void {
+    this.appServer?.close();
+    this.appServer = undefined;
   }
 }

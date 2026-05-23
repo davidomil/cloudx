@@ -1,6 +1,15 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { buildCodexExecArgs, buildCodexExecLaunch, buildVoicePrompt, compactVoicePromptContext } from "./VoicePlanner.js";
+import {
+  buildCodexExecArgs,
+  buildCodexExecLaunch,
+  buildVoicePrompt,
+  CodexExecVoicePlanner,
+  compactVoicePromptContext
+} from "./VoicePlanner.js";
 
 describe("buildVoicePrompt", () => {
   it("keeps plugin-specific behavior in descriptors instead of planner rules", () => {
@@ -114,9 +123,22 @@ describe("buildCodexExecArgs", () => {
   });
 });
 
+describe("voice-plan.schema.json", () => {
+  it("keeps every object closed for strict structured output validation", async () => {
+    const schema = JSON.parse(await fs.readFile(new URL("./voice-plan.schema.json", import.meta.url), "utf8"));
+
+    expect(closedObjectSchemaIssues(schema)).toEqual([]);
+  });
+});
+
 describe("buildCodexExecLaunch", () => {
   it("launches Codex exec with the configured assistant binary", () => {
-    expect(buildCodexExecLaunch("gpt-5.3-codex-spark", "/schema.json", "/out.json", { CLOUDX_ASSISTANT_BIN: "/usr/bin/codex", SHELL: "/bin/bash" })).toEqual({
+    expect(
+      buildCodexExecLaunch("gpt-5.3-codex-spark", "/schema.json", "/out.json", {
+        CLOUDX_ASSISTANT_BIN: "/usr/bin/codex",
+        SHELL: "/bin/bash"
+      })
+    ).toEqual({
       command: "/usr/bin/codex",
       args: [
         "exec",
@@ -139,3 +161,76 @@ describe("buildCodexExecLaunch", () => {
     });
   });
 });
+
+describe("CodexExecVoicePlanner", () => {
+  it("rejects when the planner subprocess exceeds the output limit", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-fake-codex-"));
+    const fakeCodexPath = path.join(tempDir, "fake-codex.mjs");
+    const previousAssistantBin = process.env.CLOUDX_ASSISTANT_BIN;
+
+    await fs.writeFile(
+      fakeCodexPath,
+      "#!/usr/bin/env node\nprocess.stdout.write('x'.repeat(1_100_000));\n",
+      "utf8"
+    );
+    await fs.chmod(fakeCodexPath, 0o755);
+    process.env.CLOUDX_ASSISTANT_BIN = fakeCodexPath;
+
+    try {
+      const planner = new CodexExecVoicePlanner("gpt-test");
+      await expect(planner.plan({ transcript: "noop", context: {} })).rejects.toThrow("output limit");
+    } finally {
+      if (previousAssistantBin === undefined) {
+        delete process.env.CLOUDX_ASSISTANT_BIN;
+      } else {
+        process.env.CLOUDX_ASSISTANT_BIN = previousAssistantBin;
+      }
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+});
+
+function closedObjectSchemaIssues(value: unknown, pathParts: string[] = ["#"]): string[] {
+  if (!isRecord(value)) {
+    return [];
+  }
+
+  const issues: string[] = [];
+  if (schemaAllowsObject(value)) {
+    if (value.additionalProperties !== false) {
+      issues.push(`${pathParts.join(".")} must set additionalProperties: false`);
+    }
+    const propertyNames = Object.keys(value.properties ?? {});
+    const required = Array.isArray(value.required) ? value.required : [];
+    const missingRequired = propertyNames.filter((property) => !required.includes(property));
+    if (missingRequired.length > 0) {
+      issues.push(`${pathParts.join(".")} must require properties: ${missingRequired.join(", ")}`);
+    }
+  }
+
+  for (const [key, child] of Object.entries(value.properties ?? {})) {
+    issues.push(...closedObjectSchemaIssues(child, [...pathParts, "properties", key]));
+  }
+  if ("items" in value) {
+    issues.push(...closedObjectSchemaIssues(value.items, [...pathParts, "items"]));
+  }
+  if (Array.isArray(value.anyOf)) {
+    value.anyOf.forEach((child, index) => {
+      issues.push(...closedObjectSchemaIssues(child, [...pathParts, "anyOf", String(index)]));
+    });
+  }
+  if (isRecord(value.$defs)) {
+    for (const [key, child] of Object.entries(value.$defs)) {
+      issues.push(...closedObjectSchemaIssues(child, [...pathParts, "$defs", key]));
+    }
+  }
+  return issues;
+}
+
+function schemaAllowsObject(schema: Record<string, unknown>): boolean {
+  return schema.type === "object" || Array.isArray(schema.type) && schema.type.includes("object");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
