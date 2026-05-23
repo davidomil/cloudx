@@ -1,7 +1,7 @@
 import type { PluginActionDefinition, WorkspacePlugin } from "@cloudx/plugin-api";
 import { descriptorFromPlugin } from "@cloudx/plugin-api";
 import type { PluginDescriptor, PluginId } from "@cloudx/shared";
-import { validateObjectSchema } from "./hooks/schema.js";
+import { assertObjectRecord, validateObjectSchema } from "./hooks/schema.js";
 
 export class PluginRegistry {
   private readonly plugins = new Map<PluginId, WorkspacePlugin>();
@@ -53,6 +53,10 @@ export class PluginRegistry {
     return action;
   }
 
+  updatesTabState(pluginId: PluginId, actionName: string): boolean {
+    return this.getAction(pluginId, actionName).updatesTabState === true;
+  }
+
   validateVoiceInput(pluginId: PluginId, actionName: string, input: Record<string, unknown>): void {
     const action = this.getVoiceAction(pluginId, actionName);
     validateObjectSchema(action.inputSchema, input, `${pluginId}.${actionName}`);
@@ -67,5 +71,15 @@ export class PluginRegistry {
   validateInput(pluginId: PluginId, actionName: string, input: Record<string, unknown>): void {
     const action = this.getAction(pluginId, actionName);
     validateObjectSchema(action.inputSchema, input, `${pluginId}.${actionName}`);
+  }
+
+  validateOutput(pluginId: PluginId, actionName: string, output: unknown): Record<string, unknown> {
+    const action = this.getAction(pluginId, actionName);
+    const normalizedOutput = output ?? {};
+    assertObjectRecord(normalizedOutput, `${pluginId}.${actionName}`, "output");
+    if (action.outputSchema) {
+      validateObjectSchema(action.outputSchema, normalizedOutput, `${pluginId}.${actionName}`, "output");
+    }
+    return normalizedOutput;
   }
 }

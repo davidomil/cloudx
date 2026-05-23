@@ -62,6 +62,9 @@ export function buildUiContributionHookInput(contribution: UiContributionDescrip
 export const PLUGIN_WEBVIEW_RENDERER = UI_RENDERER_PLUGIN_WEBVIEW;
 export const PLUGIN_WEBVIEW_MESSAGE_SOURCE = "cloudx.pluginWebview";
 export const DEFAULT_PLUGIN_WEBVIEW_SANDBOX = "allow-scripts allow-forms allow-popups";
+const PLUGIN_WEBVIEW_BRIDGE_TOKEN_BYTES = 16;
+const PLUGIN_WEBVIEW_MAX_REQUEST_ID_LENGTH = 128;
+const PLUGIN_WEBVIEW_MAX_HOOK_ID_LENGTH = 256;
 
 export interface PluginWebviewSource {
   html?: string;
@@ -74,6 +77,7 @@ export interface PluginWebviewSource {
 interface PluginWebviewHookCallMessage {
   source: typeof PLUGIN_WEBVIEW_MESSAGE_SOURCE;
   type: "hook-call";
+  bridgeToken: string;
   requestId: string;
   hookId: string;
   input?: Record<string, unknown>;
@@ -87,7 +91,22 @@ type PluginWebviewLoadState =
 
 export function PluginWebviewPanel({ contribution, context }: { contribution: UiContributionDescriptor; context: UiContributionRenderContext }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  const bridgeTokenRef = useRef<string | undefined>(undefined);
+  if (!bridgeTokenRef.current) {
+    bridgeTokenRef.current = createPluginWebviewBridgeToken();
+  }
+  const bridgeToken = bridgeTokenRef.current;
   const [loadState, setLoadState] = useState<PluginWebviewLoadState>(() => resolveInitialWebviewState(contribution));
+  const callHook = context.callHook;
+  const contextTabId = context.tab?.id;
+  const callHookAvailable = Boolean(callHook);
+  const callHookRef = useRef(callHook);
+  const hookInput = useMemo(() => buildUiContributionHookInput(contribution, { tab: context.tab }), [contribution, contextTabId]);
+  const loadKey = useMemo(() => pluginWebviewLoadKey(contribution, hookInput, contextTabId, callHookAvailable), [callHookAvailable, contribution, contextTabId, hookInput]);
+
+  useEffect(() => {
+    callHookRef.current = callHook;
+  }, [callHook]);
 
   useEffect(() => {
     let cancelled = false;
@@ -95,13 +114,13 @@ export function PluginWebviewPanel({ contribution, context }: { contribution: Ui
       setLoadState(resolveInitialWebviewState(contribution));
       return undefined;
     }
-    if (!context.callHook) {
+    const currentCallHook = callHookRef.current;
+    if (!currentCallHook) {
       setLoadState({ status: "error", message: "Plugin webview hook bridge is not available." });
       return undefined;
     }
     setLoadState({ status: "loading" });
-    context
-      .callHook(contribution.hookId, buildUiContributionHookInput(contribution, context), context.tab?.id)
+    currentCallHook(contribution.hookId, hookInput, contextTabId)
       .then((result) => {
         if (cancelled) {
           return;
@@ -117,22 +136,30 @@ export function PluginWebviewPanel({ contribution, context }: { contribution: Ui
     return () => {
       cancelled = true;
     };
-  }, [contribution, context]);
+  }, [loadKey]);
 
   useEffect(() => {
     const iframe = iframeRef.current;
-    const callHook = context.callHook;
     if (!iframe || !callHook) {
       return undefined;
     }
     const handleMessage = (event: MessageEvent) => {
-      if (event.source !== iframe.contentWindow || !isPluginWebviewHookCallMessage(event.data)) {
+      if (event.source !== iframe.contentWindow || !isPluginWebviewHookCallMessage(event.data, bridgeToken)) {
         return;
       }
       const message = event.data;
-      callHook(message.hookId, message.input ?? {}, message.targetTabId ?? context.tab?.id)
+      callHook(message.hookId, message.input ?? {}, message.targetTabId ?? contextTabId)
         .then((result) => {
-          iframe.contentWindow?.postMessage({ source: PLUGIN_WEBVIEW_MESSAGE_SOURCE, type: "hook-result", requestId: message.requestId, ok: true, result }, "*");
+          iframe.contentWindow?.postMessage(
+            {
+              source: PLUGIN_WEBVIEW_MESSAGE_SOURCE,
+              type: "hook-result",
+              requestId: message.requestId,
+              ok: true,
+              result
+            },
+            pluginWebviewReplyTargetOrigin(event.origin)
+          );
         })
         .catch((error) => {
           iframe.contentWindow?.postMessage(
@@ -143,16 +170,16 @@ export function PluginWebviewPanel({ contribution, context }: { contribution: Ui
               ok: false,
               error: error instanceof Error ? error.message : String(error)
             },
-            "*"
+            pluginWebviewReplyTargetOrigin(event.origin)
           );
         });
     };
     window.addEventListener("message", handleMessage);
     return () => window.removeEventListener("message", handleMessage);
-  }, [context]);
+  }, [bridgeToken, callHook, contextTabId]);
 
   const iframeTitle = loadState.status === "ready" ? loadState.source.title ?? contribution.title : contribution.title;
-  const srcDoc = useMemo(() => (loadState.status === "ready" && loadState.source.html ? buildPluginWebviewHtml(loadState.source.html) : undefined), [loadState]);
+  const srcDoc = useMemo(() => (loadState.status === "ready" && loadState.source.html ? buildPluginWebviewHtml(loadState.source.html, undefined, bridgeToken) : undefined), [bridgeToken, loadState]);
 
   if (loadState.status === "loading") {
     return <div className="plugin-webview-panel empty-pane">Loading {contribution.title}...</div>;
@@ -193,23 +220,57 @@ export function resolvePluginWebviewSource(contribution: UiContributionDescripto
   return source;
 }
 
-export function buildPluginWebviewHtml(html: string): string {
+export function buildPluginWebviewHtml(html: string, parentTargetOrigin = pluginWebviewCurrentParentTargetOrigin(), bridgeToken = createPluginWebviewBridgeToken()): string {
+  const bridgeScript = pluginWebviewBridgeScript(parentTargetOrigin, bridgeToken);
   if (/<head[\s>]/i.test(html)) {
-    return html.replace(/<head([^>]*)>/i, `<head$1>${PLUGIN_WEBVIEW_BRIDGE_SCRIPT}`);
+    return html.replace(/<head([^>]*)>/i, `<head$1>${bridgeScript}`);
   }
-  return `${PLUGIN_WEBVIEW_BRIDGE_SCRIPT}${html}`;
+  return `${bridgeScript}${html}`;
 }
 
-export function isPluginWebviewHookCallMessage(value: unknown): value is PluginWebviewHookCallMessage {
+export function pluginWebviewLoadKey(contribution: UiContributionDescriptor, hookInput: Record<string, unknown>, targetTabId?: string, hookBridgeAvailable = true): string {
+  return stableStringify({
+    hookId: contribution.hookId,
+    hookBridgeAvailable: contribution.hookId ? hookBridgeAvailable : undefined,
+    input: hookInput,
+    state: sourceFromRecord(contribution.state),
+    targetTabId
+  });
+}
+
+export function isPluginWebviewHookCallMessage(value: unknown, expectedBridgeToken?: string): value is PluginWebviewHookCallMessage {
   return (
     isRecord(value) &&
     value.source === PLUGIN_WEBVIEW_MESSAGE_SOURCE &&
     value.type === "hook-call" &&
-    typeof value.requestId === "string" &&
-    typeof value.hookId === "string" &&
+    isBoundedNonEmptyString(value.bridgeToken, PLUGIN_WEBVIEW_MAX_REQUEST_ID_LENGTH) &&
+    (!expectedBridgeToken || value.bridgeToken === expectedBridgeToken) &&
+    isBoundedNonEmptyString(value.requestId, PLUGIN_WEBVIEW_MAX_REQUEST_ID_LENGTH) &&
+    isBoundedNonEmptyString(value.hookId, PLUGIN_WEBVIEW_MAX_HOOK_ID_LENGTH) &&
     (value.input === undefined || isRecord(value.input)) &&
     (value.targetTabId === undefined || typeof value.targetTabId === "string")
   );
+}
+
+export function pluginWebviewReplyTargetOrigin(origin: string): string {
+  if (!origin || origin === "null" || origin.startsWith("file:")) {
+    return "*";
+  }
+  return origin;
+}
+
+export function pluginWebviewParentTargetOrigin(origin: string): string {
+  return pluginWebviewReplyTargetOrigin(origin);
+}
+
+export function createPluginWebviewBridgeToken(): string {
+  const cryptoApi = globalThis.crypto;
+  if (!cryptoApi?.getRandomValues) {
+    throw new Error("Secure random values are required for plugin webview bridge tokens.");
+  }
+  const bytes = new Uint8Array(PLUGIN_WEBVIEW_BRIDGE_TOKEN_BYTES);
+  cryptoApi.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function resolveInitialWebviewState(contribution: UiContributionDescriptor): PluginWebviewLoadState {
@@ -247,13 +308,41 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isBoundedNonEmptyString(value: unknown, maxLength: number): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= maxLength;
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(",")}]`;
+  }
+  if (isRecord(value)) {
+    return `{${Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${stableStringify(item)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
 function uiContributionTargetsTab(contribution: UiContributionDescriptor, tab: WorkspaceTab): boolean {
   return (!contribution.targetTabId || contribution.targetTabId === tab.id) && (!contribution.targetPluginId || contribution.targetPluginId === tab.pluginId);
 }
 
-const PLUGIN_WEBVIEW_BRIDGE_SCRIPT = `<script>
+function pluginWebviewCurrentParentTargetOrigin(): string {
+  if (typeof window === "undefined") {
+    return "*";
+  }
+  return pluginWebviewParentTargetOrigin(window.location.origin);
+}
+
+function pluginWebviewBridgeScript(parentTargetOrigin: string, bridgeToken: string): string {
+  return `<script>
 (() => {
   const source = "${PLUGIN_WEBVIEW_MESSAGE_SOURCE}";
+  const parentTargetOrigin = ${JSON.stringify(parentTargetOrigin)};
+  const expectedParentOrigin = parentTargetOrigin === "*" ? "" : parentTargetOrigin;
+  const bridgeToken = ${JSON.stringify(bridgeToken)};
   let nextId = 0;
   const pending = new Map();
   window.cloudx = {
@@ -261,13 +350,13 @@ const PLUGIN_WEBVIEW_BRIDGE_SCRIPT = `<script>
       return new Promise((resolve, reject) => {
         const requestId = String(++nextId);
         pending.set(requestId, { resolve, reject });
-        window.parent.postMessage({ source, type: "hook-call", requestId, hookId, input: input || {}, targetTabId }, "*");
+        window.parent.postMessage({ source, type: "hook-call", bridgeToken, requestId, hookId, input: input || {}, targetTabId }, parentTargetOrigin);
       });
     }
   };
   window.addEventListener("message", (event) => {
     const message = event.data;
-    if (!message || message.source !== source || message.type !== "hook-result") {
+    if (event.source !== window.parent || (expectedParentOrigin && event.origin !== expectedParentOrigin) || !message || message.source !== source || message.type !== "hook-result") {
       return;
     }
     const callbacks = pending.get(message.requestId);
@@ -283,3 +372,4 @@ const PLUGIN_WEBVIEW_BRIDGE_SCRIPT = `<script>
   });
 })();
 </script>`;
+}

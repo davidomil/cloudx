@@ -20,12 +20,13 @@ import {
 
 export interface JsonSchemaLike {
   [key: string]: unknown;
-  type: string;
+  type?: string | string[];
   properties?: Record<string, JsonSchemaLike>;
   required?: string[];
   additionalProperties?: boolean | JsonSchemaLike;
   items?: JsonSchemaLike;
-  enum?: string[];
+  enum?: unknown[];
+  const?: unknown;
   description?: string;
   default?: unknown;
   "x-cloudx-connectable"?: boolean;
@@ -56,6 +57,7 @@ export interface HookCallContext {
   targetTab?: WorkspaceTab;
   targetTabId?: string;
   activeTabId?: string;
+  signal?: AbortSignal;
 }
 
 export interface HookDefinition extends HookDescriptor {
@@ -184,6 +186,7 @@ export function descriptorFromPlugin(plugin: WorkspacePlugin): PluginDescriptor 
       automationSafety: action.automationSafety,
       defaultForVoice: action.defaultForVoice,
       handlesUnhandledVoice: action.handlesUnhandledVoice,
+      updatesTabState: action.updatesTabState,
       inputSchema: action.inputSchema,
       outputSchema: action.outputSchema
     }))
