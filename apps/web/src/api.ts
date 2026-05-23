@@ -28,6 +28,7 @@ import type {
   WorkspaceStateResponse,
   WorkspaceTab
 } from "@cloudx/shared";
+import { parseVoiceActionPlan } from "@cloudx/shared";
 
 export interface HealthResponse {
   status: string;
@@ -156,20 +157,75 @@ export function filenameFromContentDisposition(value: string | null): string | u
   if (!value) {
     return undefined;
   }
-  const parts = value.split(";").map((part) => part.trim());
-  const encodedFilename = parts.find((part) => part.toLowerCase().startsWith("filename*="));
+  const parts = splitHeaderParameters(value);
+  const encodedFilename = headerParameterValue(parts, "filename*");
   if (encodedFilename) {
-    const rawValue = encodedFilename.slice(encodedFilename.indexOf("=") + 1).trim();
-    const match = /^([^']*)'[^']*'(.*)$/.exec(unquoteHeaderValue(rawValue));
-    if (match && (!match[1] || match[1].toLowerCase() === "utf-8")) {
-      return decodeURIComponent(match[2] ?? "");
+    const decoded = decodeRfc5987Value(encodedFilename);
+    if (decoded) {
+      return decoded;
     }
   }
-  const plainFilename = parts.find((part) => part.toLowerCase().startsWith("filename="));
+  const plainFilename = headerParameterValue(parts, "filename");
   if (!plainFilename) {
     return undefined;
   }
-  return unquoteHeaderValue(plainFilename.slice(plainFilename.indexOf("=") + 1).trim());
+  return unquoteHeaderValue(plainFilename);
+}
+
+function splitHeaderParameters(value: string): string[] {
+  const parts: string[] = [];
+  let current = "";
+  let quoted = false;
+  let escaped = false;
+  for (const char of value) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+    if (quoted && char === "\\") {
+      current += char;
+      escaped = true;
+      continue;
+    }
+    if (char === '"') {
+      quoted = !quoted;
+    }
+    if (char === ";" && !quoted) {
+      parts.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  parts.push(current.trim());
+  return parts.filter(Boolean);
+}
+
+function headerParameterValue(parts: string[], name: string): string | undefined {
+  const normalized = name.toLowerCase();
+  for (const part of parts) {
+    const separator = part.indexOf("=");
+    if (separator < 0) {
+      continue;
+    }
+    if (part.slice(0, separator).trim().toLowerCase() === normalized) {
+      return part.slice(separator + 1).trim();
+    }
+  }
+  return undefined;
+}
+
+function decodeRfc5987Value(value: string): string | undefined {
+  const match = /^([^']*)'[^']*'(.*)$/.exec(unquoteHeaderValue(value));
+  if (!match || (match[1] && match[1].toLowerCase() !== "utf-8")) {
+    return undefined;
+  }
+  try {
+    return decodeURIComponent(match[2] ?? "") || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function unquoteHeaderValue(value: string): string {
@@ -209,6 +265,13 @@ export async function saveAutomationGroup(group: AutomationGroup): Promise<Autom
     body: JSON.stringify(group)
   });
   return body.group;
+}
+
+export async function deleteAutomationGroup(groupId: string): Promise<AutomationGroup[]> {
+  const body = await fetchJson<AutomationGroupsResponse>(`/api/automation/groups/${encodeURIComponent(groupId)}`, {
+    method: "DELETE"
+  });
+  return body.groups;
 }
 
 export async function setAutomationGroupEnabled(groupId: string, enabled: boolean): Promise<AutomationGroup> {
@@ -281,18 +344,18 @@ export async function createWindow(input: CreateWorkspaceWindowRequest): Promise
 }
 
 export async function updateWindow(windowId: string, input: UpdateWorkspaceWindowRequest): Promise<WorkspaceStateResponse> {
-  return fetchJson(`/api/windows/${windowId}`, {
+  return fetchJson(`/api/windows/${encodeURIComponent(windowId)}`, {
     method: "PATCH",
     body: JSON.stringify(input)
   });
 }
 
 export async function selectWindow(windowId: string): Promise<WorkspaceStateResponse> {
-  return fetchJson(`/api/windows/${windowId}/active`, { method: "POST", body: "{}" });
+  return fetchJson(`/api/windows/${encodeURIComponent(windowId)}/active`, { method: "POST", body: "{}" });
 }
 
 export async function deleteWindow(windowId: string): Promise<WorkspaceStateResponse> {
-  return fetchJson(`/api/windows/${windowId}`, { method: "DELETE" });
+  return fetchJson(`/api/windows/${encodeURIComponent(windowId)}`, { method: "DELETE" });
 }
 
 export async function searchWorkspaceWindows(query: string): Promise<SearchWorkspaceWindowsResponse> {
@@ -310,21 +373,21 @@ export async function saveLayoutTemplate(input: CreateWorkspaceLayoutTemplateReq
 }
 
 export async function applyLayoutTemplate(templateId: string, input: ApplyWorkspaceLayoutTemplateRequest): Promise<{ workspace: WorkspaceStateResponse }> {
-  return fetchJson(`/api/layout-templates/${templateId}/apply`, {
+  return fetchJson(`/api/layout-templates/${encodeURIComponent(templateId)}/apply`, {
     method: "POST",
     body: JSON.stringify(input)
   });
 }
 
 export async function updateLayoutTemplate(templateId: string, input: UpdateWorkspaceLayoutTemplateRequest): Promise<{ template: WorkspaceLayoutTemplate; workspace: WorkspaceStateResponse }> {
-  return fetchJson(`/api/layout-templates/${templateId}`, {
+  return fetchJson(`/api/layout-templates/${encodeURIComponent(templateId)}`, {
     method: "PATCH",
     body: JSON.stringify(input)
   });
 }
 
 export async function deleteLayoutTemplate(templateId: string): Promise<{ template: WorkspaceLayoutTemplate; workspace: WorkspaceStateResponse }> {
-  return fetchJson(`/api/layout-templates/${templateId}`, { method: "DELETE" });
+  return fetchJson(`/api/layout-templates/${encodeURIComponent(templateId)}`, { method: "DELETE" });
 }
 
 export async function createTab(input: CreateTabRequest): Promise<WorkspaceTab> {
@@ -336,15 +399,15 @@ export async function createTab(input: CreateTabRequest): Promise<WorkspaceTab> 
 }
 
 export async function setActiveTab(tabId: string): Promise<void> {
-  await fetchJson(`/api/tabs/${tabId}/active`, { method: "POST", body: "{}" });
+  await fetchJson(`/api/tabs/${encodeURIComponent(tabId)}/active`, { method: "POST", body: "{}" });
 }
 
 export async function closeTab(tabId: string): Promise<{ activeTabId?: string }> {
-  return fetchJson(`/api/tabs/${tabId}`, { method: "DELETE" });
+  return fetchJson(`/api/tabs/${encodeURIComponent(tabId)}`, { method: "DELETE" });
 }
 
 export async function runTabAction<T>(tabId: string, action: string, input: Record<string, unknown>): Promise<T> {
-  const body = await fetchJson<{ result: T }>(`/api/tabs/${tabId}/actions`, {
+  const body = await fetchJson<{ result: T }>(`/api/tabs/${encodeURIComponent(tabId)}/actions`, {
     method: "POST",
     body: JSON.stringify({ action, input })
   });
@@ -382,7 +445,7 @@ export async function submitAudio(audio: Blob, activeTabId?: string): Promise<Vo
     body: audio
   });
   if (!response.ok) {
-    throw new Error(await response.text());
+    throw new Error(errorMessageFromResponse(await response.text(), response.status));
   }
   return (await response.json()) as VoiceExecutionResult;
 }
@@ -422,16 +485,37 @@ export async function startAudioStream(
     url.searchParams.set("activeTabId", activeTabId);
   }
   url.searchParams.set("filename", audioFilenameForMimeType(recorder.mimeType));
+  const socket = createVoiceAudioWebSocket(url, stream);
 
   return new Promise((resolveSession, rejectSession) => {
-    const socket = new WebSocket(url);
     const pendingSends = new Set<Promise<void>>();
     let settled = false;
     let stopping = false;
+    let sessionResolved = false;
+    let sessionRejected = false;
+
+    function rejectSessionIfPending(error: Error) {
+      if (sessionResolved || sessionRejected) {
+        return;
+      }
+      sessionRejected = true;
+      rejectSession(error);
+    }
 
     const resultPromise = new Promise<VoiceExecutionResult>((resolveResult, rejectResult) => {
       function stopStream() {
-        stream.getTracks().forEach((track) => track.stop());
+        stopMediaStreamTracks(stream);
+      }
+
+      function stopRecorderIfActive() {
+        if (recorder.state === "inactive") {
+          return;
+        }
+        try {
+          recorder.stop();
+        } catch {
+          // The recorder may already be transitioning to inactive after an error or ended stream.
+        }
       }
 
       function finish(error?: Error, result?: VoiceExecutionResult) {
@@ -439,26 +523,31 @@ export async function startAudioStream(
           return;
         }
         settled = true;
+        stopRecorderIfActive();
         stopStream();
         if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
           socket.close();
         }
         if (error) {
           rejectResult(error);
+          rejectSessionIfPending(error);
           return;
         }
         resolveResult(result!);
       }
 
       function sendBlob(blob: Blob) {
-        if (blob.size === 0 || socket.readyState !== WebSocket.OPEN) {
+        if (settled || blob.size === 0 || socket.readyState !== WebSocket.OPEN) {
           return;
         }
-        const sendPromise = blob.arrayBuffer().then((buffer) => {
-          if (socket.readyState === WebSocket.OPEN) {
-            socket.send(buffer);
-          }
-        });
+        const sendPromise = blob
+          .arrayBuffer()
+          .then((buffer) => {
+            if (!settled && socket.readyState === WebSocket.OPEN) {
+              socket.send(buffer);
+            }
+          })
+          .catch((error) => finish(normalizeError(error)));
         pendingSends.add(sendPromise);
         void sendPromise.finally(() => pendingSends.delete(sendPromise));
       }
@@ -471,13 +560,16 @@ export async function startAudioStream(
 
       function sendEnd() {
         void waitForPendingSendsToDrain().then(() => {
-          if (socket.readyState === WebSocket.OPEN) {
+          if (!settled && socket.readyState === WebSocket.OPEN) {
             socket.send(JSON.stringify({ type: "end" }));
           }
         });
       }
 
       socket.addEventListener("open", () => {
+        if (settled) {
+          return;
+        }
         try {
           if (socket.readyState === WebSocket.OPEN) {
             socket.send(JSON.stringify({ type: "start", clientContext: attachAudioCaptureContext(clientContext, stream, recorder) }));
@@ -487,6 +579,7 @@ export async function startAudioStream(
           recorder.addEventListener("stop", () => sendEnd());
           recorder.addEventListener("error", () => finish(new Error("Microphone recorder failed.")));
           recorder.start(750);
+          sessionResolved = true;
           resolveSession({
             stop: () => {
               if (!stopping) {
@@ -503,20 +596,16 @@ export async function startAudioStream(
             cancel: () => finish(new Error("Voice audio recording was cancelled."))
           });
         } catch (error) {
-          finish(error instanceof Error ? error : new Error(String(error)));
-          rejectSession(error instanceof Error ? error : new Error(String(error)));
+          finish(normalizeError(error));
         }
       });
 
       socket.addEventListener("message", (event) => {
-        const message = JSON.parse(event.data as string) as {
-          type?: string;
-          status?: VoiceAudioStatus["status"];
-          message?: string;
-          result?: VoiceExecutionResult;
-          transcript?: string;
-          final?: boolean;
-        };
+        const message = parseVoiceAudioStreamMessage(event.data);
+        if (!message) {
+          finish(new Error("Voice audio stream returned an invalid message."));
+          return;
+        }
         if (message.type === "status" && message.status && message.message) {
           onStatus?.({ status: message.status, message: message.message });
         }
@@ -541,10 +630,23 @@ export async function startAudioStream(
     void resultPromise.catch(() => undefined);
 
     socket.addEventListener("error", () => {
-      stream.getTracks().forEach((track) => track.stop());
-      rejectSession(new Error("Voice audio socket failed."));
+      stopMediaStreamTracks(stream);
+      rejectSessionIfPending(new Error("Voice audio socket failed."));
     });
   });
+}
+
+function createVoiceAudioWebSocket(url: URL, stream: MediaStream): WebSocket {
+  try {
+    return new WebSocket(url);
+  } catch (error) {
+    stopMediaStreamTracks(stream);
+    throw error;
+  }
+}
+
+function stopMediaStreamTracks(stream: MediaStream): void {
+  stream.getTracks().forEach((track) => track.stop());
 }
 
 function createAudioRecorder(stream: MediaStream): MediaRecorder {
@@ -596,6 +698,96 @@ function sanitizeAudioTrackSettings(settings: MediaTrackSettings | undefined): R
     }
   }
   return result;
+}
+
+function parseVoiceAudioStreamMessage(data: unknown):
+  | {
+      type?: string;
+      status?: VoiceAudioStatus["status"];
+      message?: string;
+      result?: VoiceExecutionResult;
+      transcript?: string;
+      final?: boolean;
+    }
+  | undefined {
+  if (typeof data !== "string") {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(data) as unknown;
+    if (!isRecord(parsed)) {
+      return undefined;
+    }
+    const type = typeof parsed.type === "string" ? parsed.type : undefined;
+    if (type === "result") {
+      const result = parseVoiceExecutionResult(parsed.result);
+      return result ? { type, result } : undefined;
+    }
+    return {
+      type,
+      status: isVoiceAudioStatus(parsed.status) ? parsed.status : undefined,
+      message: typeof parsed.message === "string" ? parsed.message : undefined,
+      transcript: typeof parsed.transcript === "string" ? parsed.transcript : undefined,
+      final: typeof parsed.final === "boolean" ? parsed.final : undefined
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function parseVoiceExecutionResult(value: unknown): VoiceExecutionResult | undefined {
+  if (!isRecord(value) || typeof value.accepted !== "boolean" || !Array.isArray(value.results)) {
+    return undefined;
+  }
+  try {
+    const plan = parseVoiceActionPlan(value.plan);
+    const results: VoiceExecutionResult["results"] = [];
+    for (const item of value.results) {
+      const result = parseVoiceActionResult(item);
+      if (!result) {
+        return undefined;
+      }
+      results.push(result);
+    }
+    return {
+      accepted: value.accepted,
+      plan,
+      results
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function parseVoiceActionResult(value: unknown): VoiceExecutionResult["results"][number] | undefined {
+  if (!isRecord(value) || typeof value.action !== "string" || !value.action.trim() || typeof value.ok !== "boolean") {
+    return undefined;
+  }
+  if ("targetTabId" in value && value.targetTabId !== undefined && typeof value.targetTabId !== "string") {
+    return undefined;
+  }
+  if ("message" in value && value.message !== undefined && typeof value.message !== "string") {
+    return undefined;
+  }
+  return {
+    action: value.action,
+    targetTabId: typeof value.targetTabId === "string" ? value.targetTabId : undefined,
+    ok: value.ok,
+    message: typeof value.message === "string" ? value.message : undefined,
+    result: value.result
+  };
+}
+
+function isVoiceAudioStatus(value: unknown): value is VoiceAudioStatus["status"] {
+  return value === "recording" || value === "receiving" || value === "transcribing" || value === "thinking";
+}
+
+function normalizeError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function preferredAudioMimeType(): string | undefined {

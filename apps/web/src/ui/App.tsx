@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement, type RefObject } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement, type RefObject } from "react";
 import { AlertTriangle, Bot, ChevronDown, Columns2, GitBranch, LayoutTemplate, Mic, MicOff, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
 
-import { RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsStore, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUpdate, type WorkspaceWindow } from "@cloudx/shared";
+import { RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsStore, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
 
 import {
   applyLayoutTemplate,
@@ -28,7 +28,7 @@ import {
   type VoiceAudioStreamSession
 } from "../api.js";
 import { ControlButton } from "./Control.js";
-import { disposeFileBrowserPanelStatesExcept, FileBrowserPanel } from "./FileBrowserPanel.js";
+import { disposeFileBrowserPanelStatesExcept } from "./fileBrowserPanelState.js";
 import { PathEntry } from "./PathEntry.js";
 import {
   activatePane,
@@ -51,7 +51,7 @@ import {
 import { shouldSubmitVoiceConsoleKey } from "./keyboard.js";
 import { SettingsDialog } from "./SettingsDialog.js";
 import { clearFocusedAttention, isTabFocused, updateAttentionTabs } from "./tabAttention.js";
-import { applyTerminalColorTheme, applyTerminalUiScale, disposeTerminalView, disposeTerminalViewsExcept, TerminalPanel } from "./TerminalPanel.js";
+import { applyTerminalColorTheme, applyTerminalUiScale, disposeTerminalView, disposeTerminalViewsExcept } from "./terminalViewStore.js";
 import { applyCloudxTheme, readTerminalColorTheme } from "./theme.js";
 import { normalizeUiScale, uiScaleFactor } from "./uiScale.js";
 import { noSystemTextAssistProps } from "./inputAssist.js";
@@ -69,15 +69,20 @@ import {
   selectTabSettingsContributions,
   type UiContributionRenderContext
 } from "./uiContributions.js";
-import { applyVoiceWorkspaceResults, buildClientVoiceContext, voiceConsoleValue } from "./voiceWorkspace.js";
+import { applyVoiceWorkspaceResultsToWorkspace, buildClientVoiceContext, voiceConsoleValue } from "./voiceWorkspace.js";
 import { WebViewerPanel } from "./WebViewerPanel.js";
 import { WorktreeManagerPanel } from "./WorktreeManagerPanel.js";
-import { AutomationPanel } from "./AutomationPanel.js";
+import { parseWorkspaceSocketUpdate } from "./workspaceSocketUpdate.js";
 
 type ConnectionStatus = "checking" | "connected" | "disconnected";
 
 const AUDIO_INPUT_KEY = "cloudx-audio-input-v1";
 const MOBILE_ACTIONS_QUERY = "(max-width: 760px), all and (hover: none) and (pointer: coarse) and (max-width: 960px) and (max-height: 520px)";
+const WORKSPACE_SOCKET_RECONNECT_BASE_MS = 500;
+const WORKSPACE_SOCKET_RECONNECT_MAX_MS = 5_000;
+const AutomationPanel = lazy(() => import("./AutomationPanel.js").then((module) => ({ default: module.AutomationPanel })));
+const FileBrowserPanel = lazy(() => import("./FileBrowserPanel.js").then((module) => ({ default: module.FileBrowserPanel })));
+const TerminalPanel = lazy(() => import("./TerminalPanel.js").then((module) => ({ default: module.TerminalPanel })));
 
 function useMediaQuery(query: string): boolean {
   const [matches, setMatches] = useState(() => (typeof window === "undefined" ? false : window.matchMedia(query).matches));
@@ -163,6 +168,7 @@ export function App() {
   const [liveTranscript, setLiveTranscript] = useState<string | undefined>();
   const [manualTranscript, setManualTranscript] = useState("");
   const [notifications, setNotifications] = useState<CloudxNotification[]>([]);
+  const [automationRuns, setAutomationRuns] = useState<AutomationRunSummary[]>([]);
   const [attentionTabIds, setAttentionTabIds] = useState<Set<string>>(() => new Set());
   const [selectedAudioInputId, setSelectedAudioInputId] = useState<string | undefined>(() => loadAudioInputId());
   const [audioInputs, setAudioInputs] = useState<MediaDeviceInfo[]>([]);
@@ -176,6 +182,7 @@ export function App() {
   const createTargetPaneIdRef = useRef<string | undefined>(undefined);
   const persistLayoutTimerRef = useRef<number | undefined>(undefined);
   const pendingLayoutPersistWindowIdRef = useRef<string | undefined>(undefined);
+  const pendingLayoutBaseRef = useRef<TabLayoutState | undefined>(undefined);
   const pendingLayoutPersistRef = useRef<TabLayoutState | undefined>(undefined);
   const audioSessionRef = useRef<VoiceAudioStreamSession | undefined>(undefined);
   const topbarMicControlRef = useRef<HTMLDivElement | null>(null);
@@ -202,6 +209,8 @@ export function App() {
       (notification) => {
         setNotifications((current) => [notification, ...current.filter((candidate) => candidate.id !== notification.id)].slice(0, 5));
       },
+      (runs) => setAutomationRuns(runs),
+      (instruction) => applyHookUiInstruction(instruction),
       () => setConnectionStatus("disconnected")
     );
     const interval = window.setInterval(() => void checkConnection(), 5000);
@@ -343,7 +352,11 @@ export function App() {
   }, [loadRulesSkillsStore]);
 
   function applyWorkspaceState(state: WorkspaceStateResponse, options: { preservePendingLayout?: boolean } = {}) {
-    const effectiveState = options.preservePendingLayout ? workspaceStateWithPreservedLayout(state, layoutRef.current, pendingLayoutPersistWindowIdRef.current) : state;
+    const pendingMerge = options.preservePendingLayout ? workspaceStateWithPreservedLayout(state, layoutRef.current, pendingLayoutPersistWindowIdRef.current, pendingLayoutBaseRef.current, activeTabIdRef.current) : undefined;
+    if (pendingMerge?.decision === "accepted-server") {
+      clearPendingLayoutPersistence();
+    }
+    const effectiveState = pendingMerge?.state ?? state;
     const nextLayout = effectiveState.windows.find((window) => window.id === effectiveState.activeWindowId)?.layout ?? effectiveState.windows[0]?.layout ?? defaultLayout();
     tabsRef.current = effectiveState.tabs;
     windowsRef.current = effectiveState.windows;
@@ -376,22 +389,30 @@ export function App() {
   async function checkConnection() {
     try {
       await getHealth();
-      setConnectionStatus("connected");
     } catch {
       setConnectionStatus("disconnected");
     }
   }
 
-  function commitLayout(nextLayout: TabLayoutState, options: { persist?: boolean } = {}) {
-    const windowId = activeWindowIdRef.current;
-    layoutRef.current = nextLayout;
-    setLayout(nextLayout);
+  function commitLayout(nextLayout: TabLayoutState, options: { persist?: boolean; windowId?: string; baseLayout?: TabLayoutState } = {}) {
+    const windowId = options.windowId ?? activeWindowIdRef.current;
+    const previousWindowLayout = options.baseLayout ?? (windowId ? windowsRef.current.find((window) => window.id === windowId)?.layout : undefined);
+    if (!windowId || windowId === activeWindowIdRef.current) {
+      layoutRef.current = nextLayout;
+      setLayout(nextLayout);
+    }
     if (windowId) {
-      setWindows((current) => current.map((window) => (window.id === windowId ? { ...window, layout: nextLayout, updatedAt: new Date().toISOString() } : window)));
-      windowsRef.current = windowsRef.current.map((window) => (window.id === windowId ? { ...window, layout: nextLayout, updatedAt: new Date().toISOString() } : window));
+      const updatedAt = options.persist === false ? undefined : new Date().toISOString();
+      const withCommittedLayout = (window: WorkspaceWindow): WorkspaceWindow =>
+        window.id === windowId ? { ...window, layout: nextLayout, ...(updatedAt ? { updatedAt } : {}) } : window;
+      setWindows((current) => current.map(withCommittedLayout));
+      windowsRef.current = windowsRef.current.map(withCommittedLayout);
     }
     if (options.persist === false || !windowId) {
       return;
+    }
+    if (pendingLayoutPersistWindowIdRef.current !== windowId || !pendingLayoutBaseRef.current) {
+      pendingLayoutBaseRef.current = previousWindowLayout;
     }
     pendingLayoutPersistWindowIdRef.current = windowId;
     pendingLayoutPersistRef.current = nextLayout;
@@ -403,12 +424,21 @@ export function App() {
       void updateWindow(windowId, { layout: layoutForPersistence })
         .then(() => {
           if (pendingLayoutPersistWindowIdRef.current === windowId && pendingLayoutPersistRef.current === layoutForPersistence) {
-            pendingLayoutPersistWindowIdRef.current = undefined;
-            pendingLayoutPersistRef.current = undefined;
+            clearPendingLayoutPersistence();
           }
         })
         .catch((err) => setError(err instanceof Error ? err.message : String(err)));
     }, 200);
+  }
+
+  function clearPendingLayoutPersistence() {
+    if (persistLayoutTimerRef.current !== undefined) {
+      window.clearTimeout(persistLayoutTimerRef.current);
+      persistLayoutTimerRef.current = undefined;
+    }
+    pendingLayoutPersistWindowIdRef.current = undefined;
+    pendingLayoutBaseRef.current = undefined;
+    pendingLayoutPersistRef.current = undefined;
   }
 
   function updateLayout(updater: (current: TabLayoutState) => TabLayoutState) {
@@ -654,15 +684,17 @@ export function App() {
   }
 
   function applyHookUiInstruction(instruction: unknown) {
-    if (!isRecord(instruction) || instruction.type !== "open_tab_settings" || typeof instruction.tabId !== "string") {
+    const parsed = readWorkspaceUiInstruction(instruction);
+    if (!parsed) {
       return;
     }
-    setTabSettings({ tabId: instruction.tabId, sectionId: typeof instruction.sectionId === "string" ? instruction.sectionId : undefined });
+    setTabSettings({ tabId: parsed.tabId, sectionId: parsed.sectionId });
   }
 
   function applyWorkspaceExecutionResults(results: VoiceExecutionResult["results"]) {
-    const next = applyVoiceWorkspaceResults(
-      { layout: layoutRef.current, tabs: tabsRef.current, activeTabId: activeTabIdRef.current },
+    const previousWindows = windowsRef.current;
+    const next = applyVoiceWorkspaceResultsToWorkspace(
+      { layout: layoutRef.current, windows: previousWindows, activeWindowId: activeWindowIdRef.current, tabs: tabsRef.current, activeTabId: activeTabIdRef.current },
       {
         accepted: true,
         plan: { transcript: "", summary: "", actions: [] },
@@ -674,10 +706,33 @@ export function App() {
       }
     );
     tabsRef.current = next.tabs;
+    windowsRef.current = next.windows;
+    activeWindowIdRef.current = next.activeWindowId;
     layoutRef.current = next.layout;
     activeTabIdRef.current = next.activeTabId;
     setTabs(next.tabs);
-    commitLayout(next.layout);
+    setWindows(next.windows);
+    setActiveWindowId(next.activeWindowId);
+    if (next.changedLayoutWindowIds.length === 1) {
+      const windowId = next.changedLayoutWindowIds[0]!;
+      const changedWindow = next.windows.find((window) => window.id === windowId);
+      if (changedWindow) {
+        commitLayout(changedWindow.layout, { windowId, baseLayout: previousWindows.find((window) => window.id === windowId)?.layout });
+      }
+    } else if (next.changedLayoutWindowIds.length > 1) {
+      clearPendingLayoutPersistence();
+      for (const windowId of next.changedLayoutWindowIds) {
+        const changedWindow = next.windows.find((window) => window.id === windowId);
+        if (changedWindow) {
+          commitLayout(changedWindow.layout, { windowId, baseLayout: previousWindows.find((window) => window.id === windowId)?.layout, persist: false });
+          void updateWindow(windowId, { layout: changedWindow.layout }).catch((err) => setError(err instanceof Error ? err.message : String(err)));
+        }
+      }
+      layoutRef.current = next.layout;
+      setLayout(next.layout);
+    } else {
+      setLayout(next.layout);
+    }
     setActiveTabId(next.activeTabId);
   }
 
@@ -736,9 +791,9 @@ export function App() {
     setWindowMenuOpen(false);
   }
 
-  async function handleContextSearch(query: string) {
+  const handleContextSearch = useCallback(async (query: string) => {
     return searchWorkspaceWindows(query);
-  }
+  }, []);
 
   async function handleSaveTemplate(name: string, basePath: string) {
     const result = await saveLayoutTemplate({ name, basePath, windowId: activeWindowId });
@@ -784,6 +839,11 @@ export function App() {
   async function handleSaveRule(rule: CloudxRule) {
     const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.rules.save", { rule });
     setRulesSkillsStore(result.store);
+  }
+
+  async function handleInjectRulesSkillsRuntime(): Promise<number> {
+    const result = await callHook<{ tabs: WorkspaceTab[] }>("rules-skills.runtime.inject");
+    return result.tabs.length;
   }
 
   async function handleDeleteRule(ruleId: string) {
@@ -898,6 +958,7 @@ export function App() {
         onSetDefault={handleSetDefaultTemplate}
         onSaveRule={handleSaveRule}
         onDeleteRule={handleDeleteRule}
+        onInjectRuntime={handleInjectRulesSkillsRuntime}
         onRefreshStore={handleRefreshRulesSkillsStore}
       />
     ),
@@ -1166,6 +1227,7 @@ export function App() {
               uiScale={uiScale}
               uiContributionRegistry={uiContributionRegistry}
               callHook={callUiHook}
+              automationRuns={automationRuns}
             />
           ) : (
             <div className="empty-pane">
@@ -1637,7 +1699,8 @@ function PluginPanel({
   config,
   uiScale,
   uiContributionRegistry,
-  callHook
+  callHook,
+  automationRuns
 }: {
   tab: WorkspaceTab;
   plugin: PluginDescriptor | undefined;
@@ -1647,6 +1710,7 @@ function PluginPanel({
   uiScale: number;
   uiContributionRegistry: UiContributionRegistry;
   callHook: UiContributionRenderContext["callHook"];
+  automationRuns: AutomationRunSummary[];
 }) {
   const panelContribution = selectPluginPanelContribution(plugins, plugin);
   if (panelContribution) {
@@ -1656,19 +1720,31 @@ function PluginPanel({
     }
   }
   if (plugin?.panelKind === "file-browser") {
-    return <FileBrowserPanel key={`${tab.id}:${tab.cwd}`} tab={tab} config={config} />;
+    return (
+      <Suspense fallback={<div className="empty-pane">Loading files...</div>}>
+        <FileBrowserPanel key={`${tab.id}:${tab.cwd}`} tab={tab} config={config} />
+      </Suspense>
+    );
   }
   if (plugin?.panelKind === "web-viewer") {
-    return <WebViewerPanel tab={tab} />;
+    return <WebViewerPanel key={tab.id} tab={tab} />;
   }
   if (plugin?.panelKind === "worktree-manager") {
-    return <WorktreeManagerPanel tab={tab} config={config} />;
+    return <WorktreeManagerPanel key={tab.id} tab={tab} config={config} />;
   }
   if (plugin?.panelKind === "automation") {
-    return <AutomationPanel tab={tab} />;
+    return (
+      <Suspense fallback={<div className="empty-pane">Loading automation...</div>}>
+        <AutomationPanel key={tab.id} tab={tab} liveRuns={automationRuns} />
+      </Suspense>
+    );
   }
   if (plugin?.panelKind === "terminal" || !plugin) {
-    return <TerminalPanel tab={tab} active={active} uiScale={uiScale} />;
+    return (
+      <Suspense fallback={<div className="empty-pane">Loading terminal...</div>}>
+        <TerminalPanel tab={tab} active={active} uiScale={uiScale} />
+      </Suspense>
+    );
   }
   return <div className="empty-pane">No panel registered for {plugin.displayName}</div>;
 }
@@ -1755,23 +1831,47 @@ function ResizeHandle({ direction, sizes, onResize }: { direction: LayoutDirecti
   );
 }
 
-function loadAudioInputId(): string | undefined {
-  if (typeof window === "undefined") {
+export function loadAudioInputId(): string | undefined {
+  const storage = audioInputStorage();
+  if (!storage) {
     return undefined;
   }
-  return window.localStorage.getItem(AUDIO_INPUT_KEY) || undefined;
+  try {
+    return storage.getItem(AUDIO_INPUT_KEY) || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function persistAudioInputId(deviceId: string | undefined) {
-  if (deviceId) {
-    window.localStorage.setItem(AUDIO_INPUT_KEY, deviceId);
+export function persistAudioInputId(deviceId: string | undefined) {
+  const storage = audioInputStorage();
+  if (!storage) {
     return;
   }
-  window.localStorage.removeItem(AUDIO_INPUT_KEY);
+  try {
+    if (deviceId) {
+      storage.setItem(AUDIO_INPUT_KEY, deviceId);
+      return;
+    }
+    storage.removeItem(AUDIO_INPUT_KEY);
+  } catch {
+    return;
+  }
+}
+
+function audioInputStorage(): Storage | undefined {
+  if (typeof window === "undefined") {
+    return undefined;
+  }
+  try {
+    return window.localStorage;
+  } catch {
+    return undefined;
+  }
 }
 
 function audioInputLabel(device: MediaDeviceInfo, index: number): string {
@@ -1794,14 +1894,59 @@ function upsertTab(tabs: WorkspaceTab[], tab: WorkspaceTab): WorkspaceTab[] {
   return [...tabs.slice(0, existingIndex), tab, ...tabs.slice(existingIndex + 1)];
 }
 
-export function workspaceStateWithPreservedLayout(state: WorkspaceStateResponse, localLayout: TabLayoutState, pendingWindowId: string | undefined): WorkspaceStateResponse {
+export type WorkspaceLayoutMergeDecision = "none" | "preserved-local" | "accepted-server";
+
+export interface WorkspaceLayoutMergeResult {
+  state: WorkspaceStateResponse;
+  decision: WorkspaceLayoutMergeDecision;
+}
+
+export function workspaceStateWithPreservedLayout(
+  state: WorkspaceStateResponse,
+  localLayout: TabLayoutState,
+  pendingWindowId: string | undefined,
+  pendingBaseLayout?: TabLayoutState,
+  localActiveTabId?: string
+): WorkspaceLayoutMergeResult {
   if (!pendingWindowId || state.activeWindowId !== pendingWindowId) {
-    return state;
+    return { state, decision: "none" };
+  }
+  const incomingWindow = state.windows.find((window) => window.id === pendingWindowId);
+  if (!incomingWindow) {
+    return { state, decision: "accepted-server" };
+  }
+  if (pendingBaseLayout && !tabLayoutsEqual(incomingWindow.layout, pendingBaseLayout)) {
+    return { state, decision: "accepted-server" };
   }
   return {
-    ...state,
-    windows: state.windows.map((window) => (window.id === pendingWindowId ? { ...window, layout: localLayout } : window))
+    state: {
+      ...state,
+      activeTabId: localActiveTabId ?? state.activeTabId,
+      windows: state.windows.map((window) => (window.id === pendingWindowId ? { ...window, layout: localLayout } : window))
+    },
+    decision: "preserved-local"
   };
+}
+
+function tabLayoutsEqual(left: TabLayoutState, right: TabLayoutState): boolean {
+  return left.activePaneId === right.activePaneId && tabLayoutNodesEqual(left.root, right.root);
+}
+
+function tabLayoutNodesEqual(left: TabLayoutState["root"], right: TabLayoutState["root"]): boolean {
+  if (left.type !== right.type) {
+    return false;
+  }
+  if (left.type === "pane" && right.type === "pane") {
+    return left.pane.id === right.pane.id && left.pane.activeTabId === right.pane.activeTabId && stringArraysEqual(left.pane.tabIds, right.pane.tabIds);
+  }
+  if (left.type === "split" && right.type === "split") {
+    return left.id === right.id && left.direction === right.direction && left.sizes[0] === right.sizes[0] && left.sizes[1] === right.sizes[1] && tabLayoutNodesEqual(left.children[0], right.children[0]) && tabLayoutNodesEqual(left.children[1], right.children[1]);
+  }
+  return false;
+}
+
+function stringArraysEqual(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function getMicrophoneUnavailableReason(): string | undefined {
@@ -1838,31 +1983,136 @@ function NotificationStack({ notifications, onDismiss }: { notifications: Cloudx
   );
 }
 
-function subscribeWorkspaceUpdates(onUpdate: (update: WorkspaceTabsUpdate) => void, onNotification: (notification: CloudxNotification) => void, onDisconnect: () => void): () => void {
-  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  const socket = new WebSocket(`${protocol}://${window.location.host}/ws/workspace`);
-  let closedByClient = false;
+interface WorkspaceSocketSubscriptionOptions {
+  createSocket?: (url: string) => WebSocket;
+  reconnectDelayMs?: (attempt: number) => number;
+}
 
-  socket.addEventListener("message", (event) => {
-    const message = JSON.parse(event.data as string) as WorkspaceUpdate;
-    if (message.type === "tabs" || message.type === "workspace") {
-      onUpdate(message);
+export function subscribeWorkspaceUpdates(
+  onUpdate: (update: WorkspaceTabsUpdate) => void,
+  onNotification: (notification: CloudxNotification) => void,
+  onAutomationRuns: (runs: AutomationRunSummary[]) => void,
+  onUiInstruction: (instruction: WorkspaceUiInstruction) => void,
+  onDisconnect: () => void,
+  options: WorkspaceSocketSubscriptionOptions = {}
+): () => void {
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  const socketUrl = `${protocol}://${window.location.host}/ws/workspace`;
+  const createSocket = options.createSocket ?? ((url: string) => new WebSocket(url));
+  const reconnectDelayMs = options.reconnectDelayMs ?? workspaceSocketReconnectDelayMs;
+  let socket: WebSocket | undefined;
+  let closedByClient = false;
+  let disconnectNotified = false;
+  let reconnectAttempt = 0;
+  let reconnectTimer: number | undefined;
+
+  const notifyDisconnect = () => {
+    if (closedByClient || disconnectNotified) {
       return;
     }
-    if (message.type === "notification") {
-      onNotification(message.notification);
+    disconnectNotified = true;
+    onDisconnect();
+  };
+
+  const clearReconnectTimer = () => {
+    if (reconnectTimer !== undefined) {
+      window.clearTimeout(reconnectTimer);
+      reconnectTimer = undefined;
     }
-  });
-  socket.addEventListener("close", () => {
-    if (!closedByClient) {
-      onDisconnect();
+  };
+
+  const scheduleReconnect = () => {
+    if (closedByClient || reconnectTimer !== undefined) {
+      return;
     }
-  });
+    const delayMs = reconnectDelayMs(reconnectAttempt);
+    reconnectAttempt += 1;
+    reconnectTimer = window.setTimeout(() => {
+      reconnectTimer = undefined;
+      connect();
+    }, delayMs);
+  };
+
+  const markConnected = () => {
+    reconnectAttempt = 0;
+    disconnectNotified = false;
+  };
+
+  const connect = () => {
+    if (closedByClient) {
+      return;
+    }
+    const currentSocket = createSocket(socketUrl);
+    socket = currentSocket;
+    let socketFinished = false;
+
+    const finishSocket = (reconnect: boolean) => {
+      if (socketFinished || closedByClient) {
+        return;
+      }
+      socketFinished = true;
+      notifyDisconnect();
+      if (reconnect) {
+        scheduleReconnect();
+      }
+    };
+
+    currentSocket.addEventListener("message", (event) => {
+      if (closedByClient || socketFinished || socket !== currentSocket) {
+        return;
+      }
+      const message = parseWorkspaceSocketUpdate(event.data);
+      if (!message) {
+        finishSocket(false);
+        currentSocket.close();
+        return;
+      }
+      if (message.type === "tabs" || message.type === "workspace") {
+        markConnected();
+        onUpdate(message);
+        return;
+      }
+      if (message.type === "notification") {
+        markConnected();
+        onNotification(message.notification);
+        return;
+      }
+      if (message.type === "automation-runs") {
+        markConnected();
+        onAutomationRuns(message.runs);
+        return;
+      }
+      if (message.type === "ui-instruction") {
+        markConnected();
+        onUiInstruction(message.instruction);
+      }
+    });
+    currentSocket.addEventListener("close", () => {
+      if (socket !== currentSocket) {
+        return;
+      }
+      finishSocket(true);
+    });
+    currentSocket.addEventListener("error", () => {
+      if (socket !== currentSocket) {
+        return;
+      }
+      finishSocket(true);
+      currentSocket.close();
+    });
+  };
+
+  connect();
 
   return () => {
     closedByClient = true;
-    socket.close();
+    clearReconnectTimer();
+    socket?.close();
   };
+}
+
+function workspaceSocketReconnectDelayMs(attempt: number): number {
+  return Math.min(WORKSPACE_SOCKET_RECONNECT_BASE_MS * 2 ** attempt, WORKSPACE_SOCKET_RECONNECT_MAX_MS);
 }
 
 function CreateTabDialog({
@@ -1878,8 +2128,8 @@ function CreateTabDialog({
   onCancel: () => void;
   onCreate: (input: CreateTabRequest) => Promise<void>;
 }) {
-  const creatablePlugins = plugins.filter((plugin) => plugin.creatable);
-  const [pluginId, setPluginId] = useState<PluginId>("codex-terminal");
+  const creatablePlugins = useMemo(() => plugins.filter((plugin) => plugin.creatable), [plugins]);
+  const [pluginId, setPluginId] = useState<PluginId>(() => selectCreateTabPluginId(creatablePlugins));
   const [cwd, setCwd] = useState(defaultCwd);
   const [title, setTitle] = useState("");
   const [localWebUrl, setLocalWebUrl] = useState("");
@@ -1895,6 +2145,12 @@ function CreateTabDialog({
   const isCodex = selectedPlugin?.id === "codex-terminal";
   const requiresDirectory = selectedPlugin?.requiresDirectory ?? true;
   const titlePlaceholder = defaultTabTitlePlaceholder(selectedPlugin, cwd, localWebUrl);
+
+  useEffect(() => {
+    if (!selectedPlugin) {
+      setPluginId(selectCreateTabPluginId(creatablePlugins));
+    }
+  }, [creatablePlugins, selectedPlugin]);
 
   useEffect(() => {
     if (!requiresDirectory) {
@@ -1939,7 +2195,7 @@ function CreateTabDialog({
         <h2>New tab</h2>
         <label>
           Plugin
-          <select value={pluginId} onChange={(event) => setPluginId(event.target.value)}>
+          <select value={pluginId} onChange={(event) => setPluginId(event.target.value)} disabled={creatablePlugins.length === 0}>
             {creatablePlugins.map((plugin) => (
               <option key={plugin.id} value={plugin.id}>
                 {plugin.displayName}
@@ -1947,6 +2203,7 @@ function CreateTabDialog({
             ))}
           </select>
         </label>
+        {creatablePlugins.length === 0 ? <div className="empty-pane">No creatable plugins are available.</div> : null}
         {requiresDirectory ? (
           <div className="field-group">
             <label htmlFor="new-tab-directory">Directory</label>
@@ -2009,13 +2266,17 @@ function CreateTabDialog({
         ) : null}
         <div className="dialog-actions">
           <ControlButton onClick={onCancel}>Cancel</ControlButton>
-          <ControlButton className="primary-button" tone="primary" onClick={() => void submit()} disabled={(requiresDirectory && !cwd.trim()) || (isCodex && codexResumeMode === "session" && !codexResumeSessionId.trim()) || busy}>
+          <ControlButton className="primary-button" tone="primary" onClick={() => void submit()} disabled={!selectedPlugin || (requiresDirectory && !cwd.trim()) || (isCodex && codexResumeMode === "session" && !codexResumeSessionId.trim()) || busy}>
             Create
           </ControlButton>
         </div>
       </div>
     </div>
   );
+}
+
+export function selectCreateTabPluginId(plugins: PluginDescriptor[]): PluginId {
+  return plugins.find((plugin) => plugin.id === "codex-terminal")?.id ?? plugins[0]?.id ?? "";
 }
 
 export function codexTabInitialInput(

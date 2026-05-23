@@ -1,6 +1,30 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { callHook, closeTab, downloadFileBrowserEntries, fetchJson, fileBrowserRawFileUrl, filenameFromContentDisposition, getConfig, getHooks, setActiveTab, startAudioStream, submitTranscript, updateConfig, uploadFileBrowserFile, voiceAudioConstraints } from "./api.js";
+import {
+  applyLayoutTemplate,
+  callHook,
+  closeTab,
+  deleteAutomationGroup,
+  deleteLayoutTemplate,
+  deleteWindow,
+  downloadFileBrowserEntries,
+  fetchJson,
+  fileBrowserRawFileUrl,
+  filenameFromContentDisposition,
+  getConfig,
+  getHooks,
+  runTabAction,
+  selectWindow,
+  setActiveTab,
+  startAudioStream,
+  submitAudio,
+  submitTranscript,
+  updateConfig,
+  updateLayoutTemplate,
+  updateWindow,
+  uploadFileBrowserFile,
+  voiceAudioConstraints
+} from "./api.js";
 
 describe("api client", () => {
   afterEach(() => {
@@ -8,12 +32,19 @@ describe("api client", () => {
   });
 
   it("does not send a JSON content-type header for empty DELETE requests", async () => {
-    const fetchMock = vi.fn(async () => jsonResponse({ activeTabId: "next-tab" }));
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ activeTabId: "next-tab" }))
+      .mockResolvedValueOnce(jsonResponse({ groups: [] }));
     vi.stubGlobal("fetch", fetchMock);
 
     await closeTab("tab-1");
+    await deleteAutomationGroup("automation-1");
 
-    expect(fetchMock).toHaveBeenCalledWith("/api/tabs/tab-1", {
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/tabs/tab-1", {
+      method: "DELETE",
+      headers: undefined
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/automation/groups/automation-1", {
       method: "DELETE",
       headers: undefined
     });
@@ -30,6 +61,35 @@ describe("api client", () => {
       body: "{}",
       headers: { "content-type": "application/json" }
     });
+  });
+
+  it("encodes dynamic route segments before building API URLs", async () => {
+    const fetchMock = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) => jsonResponse({ result: { ok: true }, workspace: {}, template: {}, activeTabId: "next-tab" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await updateWindow("window/a b", { name: "Main" });
+    await selectWindow("window/a b");
+    await deleteWindow("window/a b");
+    await applyLayoutTemplate("template/a b", { projectPath: "/repo" });
+    await updateLayoutTemplate("template/a b", { name: "Main" });
+    await deleteLayoutTemplate("template/a b");
+    await deleteAutomationGroup("automation/a b");
+    await setActiveTab("tab/a b");
+    await closeTab("tab/a b");
+    await runTabAction("tab/a b", "ping", {});
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/api/windows/window%2Fa%20b",
+      "/api/windows/window%2Fa%20b/active",
+      "/api/windows/window%2Fa%20b",
+      "/api/layout-templates/template%2Fa%20b/apply",
+      "/api/layout-templates/template%2Fa%20b",
+      "/api/layout-templates/template%2Fa%20b",
+      "/api/automation/groups/automation%2Fa%20b",
+      "/api/tabs/tab%2Fa%20b/active",
+      "/api/tabs/tab%2Fa%20b",
+      "/api/tabs/tab%2Fa%20b/actions"
+    ]);
   });
 
   it("uses the message from JSON error responses", async () => {
@@ -88,6 +148,9 @@ describe("api client", () => {
   it("parses utf-8 and plain content disposition filenames", () => {
     expect(filenameFromContentDisposition("attachment; filename=\"fallback.txt\"; filename*=UTF-8''demo%20archive.tar.gz")).toBe("demo archive.tar.gz");
     expect(filenameFromContentDisposition("attachment; filename=\"fallback.txt\"")).toBe("fallback.txt");
+    expect(filenameFromContentDisposition("attachment; filename = \"semi;colon.txt\"")).toBe("semi;colon.txt");
+    expect(filenameFromContentDisposition("attachment; filename=\"quo\\\"ted.txt\"; filename*=not-utf8''bad")).toBe('quo"ted.txt');
+    expect(filenameFromContentDisposition("attachment; filename=\"fallback.txt\"; filename*=UTF-8''bad%ZZname")).toBe("fallback.txt");
     expect(filenameFromContentDisposition(null)).toBeUndefined();
   });
 
@@ -102,6 +165,16 @@ describe("api client", () => {
       body: JSON.stringify({ transcript: "open terminal", activeTabId: "tab-1", clientContext: { activePaneId: "pane-2" } }),
       headers: { "content-type": "application/json" }
     });
+  });
+
+  it("uses JSON error messages from uploaded audio responses", async () => {
+    vi.stubGlobal("window", { location: { origin: "http://localhost:3001" } });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ statusCode: 403, error: "Forbidden", message: "Microphone capture is disabled." }), { status: 403 }))
+    );
+
+    await expect(submitAudio(new Blob(["audio"], { type: "audio/webm" }))).rejects.toThrow("Microphone capture is disabled.");
   });
 
   it("loads and updates dynamic config", async () => {
@@ -252,6 +325,190 @@ describe("api client", () => {
     session.cancel();
   });
 
+  it("stops the active media recorder when a streamed audio session is cancelled", async () => {
+    const stoppedTrack = vi.fn();
+    const stream = { getTracks: () => [{ stop: stoppedTrack }], getAudioTracks: () => [] } as unknown as MediaStream;
+    const sockets: FakeWebSocket[] = [];
+    const recorders: FakeMediaRecorder[] = [];
+
+    class TestWebSocket extends FakeWebSocket {
+      constructor(url: string | URL) {
+        super(url);
+        sockets.push(this);
+      }
+    }
+    class TestMediaRecorder extends FakeMediaRecorder {
+      constructor(input: MediaStream, options?: MediaRecorderOptions) {
+        super(input, options);
+        recorders.push(this);
+      }
+    }
+
+    vi.stubGlobal("window", {
+      location: { origin: "http://localhost:3001", protocol: "http:" },
+      setTimeout
+    });
+    vi.stubGlobal("WebSocket", TestWebSocket);
+    vi.stubGlobal("MediaRecorder", TestMediaRecorder);
+
+    const session = await startAudioStream(stream);
+    expect(recorders[0]?.state).toBe("recording");
+
+    session.cancel();
+    await tick();
+
+    expect(recorders[0]?.state).toBe("inactive");
+    expect(stoppedTrack).toHaveBeenCalledTimes(1);
+    expect(sockets[0]!.sent).toHaveLength(1);
+  });
+
+  it("rejects invalid streamed audio websocket messages cleanly", async () => {
+    const stoppedTrack = vi.fn();
+    const stream = { getTracks: () => [{ kind: "audio", stop: stoppedTrack }], getAudioTracks: () => [] } as unknown as MediaStream;
+    const sockets: FakeWebSocket[] = [];
+
+    class TestWebSocket extends FakeWebSocket {
+      constructor(url: string | URL) {
+        super(url);
+        sockets.push(this);
+      }
+    }
+
+    vi.stubGlobal("window", {
+      location: { origin: "http://localhost:3001", protocol: "http:" },
+      setTimeout
+    });
+    vi.stubGlobal("WebSocket", TestWebSocket);
+    vi.stubGlobal("MediaRecorder", FakeMediaRecorder);
+
+    const session = await startAudioStream(stream);
+    const resultPromise = session.stop();
+    sockets[0]!.serverRawMessage("{not-json");
+
+    await expect(resultPromise).rejects.toThrow("Voice audio stream returned an invalid message.");
+    expect(stoppedTrack).toHaveBeenCalled();
+  });
+
+  it("rejects malformed streamed voice results instead of trusting object-shaped payloads", async () => {
+    const stoppedTrack = vi.fn();
+    const stream = { getTracks: () => [{ kind: "audio", stop: stoppedTrack }], getAudioTracks: () => [] } as unknown as MediaStream;
+    const sockets: FakeWebSocket[] = [];
+
+    class TestWebSocket extends FakeWebSocket {
+      constructor(url: string | URL) {
+        super(url);
+        sockets.push(this);
+      }
+    }
+
+    vi.stubGlobal("window", {
+      location: { origin: "http://localhost:3001", protocol: "http:" },
+      setTimeout
+    });
+    vi.stubGlobal("WebSocket", TestWebSocket);
+    vi.stubGlobal("MediaRecorder", FakeMediaRecorder);
+
+    const session = await startAudioStream(stream);
+    const resultPromise = session.stop();
+    sockets[0]!.serverMessage({ type: "result", result: { accepted: true, plan: {}, results: [] } });
+
+    await expect(resultPromise).rejects.toThrow("Voice audio stream returned an invalid message.");
+    expect(stoppedTrack).toHaveBeenCalled();
+  });
+
+  it("rejects streamed audio startup if the websocket closes before opening", async () => {
+    const stoppedTrack = vi.fn();
+    const stream = { getTracks: () => [{ kind: "audio", stop: stoppedTrack }], getAudioTracks: () => [] } as unknown as MediaStream;
+
+    class ClosingWebSocket extends EventTarget {
+      static readonly CONNECTING = 0;
+      static readonly OPEN = 1;
+      static readonly CLOSED = 3;
+      readyState = ClosingWebSocket.CONNECTING;
+
+      constructor(readonly url: string | URL) {
+        super();
+        setTimeout(() => {
+          this.readyState = ClosingWebSocket.CLOSED;
+          this.dispatchEvent(new Event("close"));
+        }, 0);
+      }
+
+      send(): void {
+        throw new Error("socket is closed");
+      }
+
+      close(): void {
+        this.readyState = ClosingWebSocket.CLOSED;
+      }
+    }
+
+    vi.stubGlobal("window", {
+      location: { origin: "http://localhost:3001", protocol: "http:" },
+      setTimeout
+    });
+    vi.stubGlobal("WebSocket", ClosingWebSocket);
+    vi.stubGlobal("MediaRecorder", FakeMediaRecorder);
+
+    await expect(startAudioStream(stream)).rejects.toThrow("Voice audio socket closed before a result was received.");
+    expect(stoppedTrack).toHaveBeenCalled();
+  });
+
+  it("stops microphone tracks when streamed audio websocket construction fails", async () => {
+    const stoppedTrack = vi.fn();
+    const stream = { getTracks: () => [{ kind: "audio", stop: stoppedTrack }], getAudioTracks: () => [] } as unknown as MediaStream;
+
+    class ThrowingWebSocket {
+      constructor() {
+        throw new Error("websocket constructor failed");
+      }
+    }
+
+    vi.stubGlobal("window", {
+      location: { origin: "http://localhost:3001", protocol: "http:" },
+      setTimeout
+    });
+    vi.stubGlobal("WebSocket", ThrowingWebSocket);
+    vi.stubGlobal("MediaRecorder", FakeMediaRecorder);
+
+    await expect(startAudioStream(stream)).rejects.toThrow("websocket constructor failed");
+    expect(stoppedTrack).toHaveBeenCalled();
+  });
+
+  it("rejects streamed audio results when a recorded chunk cannot be read", async () => {
+    const stoppedTrack = vi.fn();
+    const stream = { getTracks: () => [{ kind: "audio", stop: stoppedTrack }], getAudioTracks: () => [] } as unknown as MediaStream;
+
+    class TestWebSocket extends FakeWebSocket {}
+    class FailingChunkRecorder extends FakeMediaRecorder {
+      stop() {
+        this.state = "inactive";
+        const event = new Event("dataavailable") as BlobEvent;
+        Object.defineProperty(event, "data", {
+          value: {
+            size: 1,
+            arrayBuffer: async () => {
+              throw new Error("chunk read failed");
+            }
+          }
+        });
+        this.dispatchEvent(event);
+        this.dispatchEvent(new Event("stop"));
+      }
+    }
+
+    vi.stubGlobal("window", {
+      location: { origin: "http://localhost:3001", protocol: "http:" },
+      setTimeout
+    });
+    vi.stubGlobal("WebSocket", TestWebSocket);
+    vi.stubGlobal("MediaRecorder", FailingChunkRecorder);
+
+    const session = await startAudioStream(stream);
+    await expect(session.stop()).rejects.toThrow("chunk read failed");
+    expect(stoppedTrack).toHaveBeenCalled();
+  });
+
   it("requests speech-oriented microphone constraints", () => {
     expect(voiceAudioConstraints()).toEqual({
       echoCancellation: true,
@@ -369,6 +626,10 @@ class FakeWebSocket extends EventTarget {
 
   serverMessage(payload: unknown) {
     this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(payload) }));
+  }
+
+  serverRawMessage(data: string) {
+    this.dispatchEvent(new MessageEvent("message", { data }));
   }
 }
 

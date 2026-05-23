@@ -25,6 +25,9 @@ describe("theme", () => {
     expect(root.style.getPropertyValue("--automation-minimap-border")).toBe("rgba(245, 158, 11, 0.24)");
     expect(root.style.getPropertyValue("--automation-controls-foreground")).toBe("#F59E0B");
     expect(root.style.getPropertyValue("--automation-controls-border")).toBe("rgba(245, 158, 11, 0.24)");
+    expect(root.style.getPropertyValue("--automation-node-background")).toBe("rgba(26, 26, 36, 0.94)");
+    expect(root.style.getPropertyValue("--automation-palette-button-hover-background")).toBe("rgba(245, 158, 11, 0.2)");
+    expect(root.style.getPropertyValue("--automation-input-border")).toBe("rgba(245, 158, 11, 0.24)");
     expect(root.style.getPropertyValue("--chamfer")).toBe("inset(0 round 12px)");
   });
 

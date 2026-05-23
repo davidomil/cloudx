@@ -1,11 +1,28 @@
-import type { TabLayoutDirection, TabLayoutNode, TabLayoutState, TabPaneState, WorkspaceTab } from "@cloudx/shared";
+import {
+  activateTabLayoutPane,
+  activateTabLayoutPaneTab,
+  addTabToTabLayoutPane,
+  findTabLayoutPane,
+  findTabLayoutPaneContainingTab,
+  firstTabLayoutPaneId,
+  isUsableTabLayoutState,
+  listTabLayoutPanes,
+  placeTabInTabLayoutPane,
+  removeTabFromTabLayoutPanes,
+  splitTabLayoutPane,
+  tabLayoutPaneCount,
+  type TabLayoutDirection,
+  type TabLayoutNode,
+  type TabLayoutState,
+  type TabPaneState,
+  type WorkspaceTab
+} from "@cloudx/shared";
 
 export type Pane = TabPaneState;
 export type LayoutDirection = TabLayoutDirection;
 export type LayoutNode = TabLayoutNode;
 export type WorkspaceLayout = TabLayoutState;
 
-const MAX_PANES = 4;
 const MIN_SPLIT_SIZE = 12;
 
 export function defaultLayout(): WorkspaceLayout {
@@ -16,33 +33,27 @@ export function defaultLayout(): WorkspaceLayout {
 }
 
 export function listPanes(root: LayoutNode): Pane[] {
-  if (root.type === "pane") {
-    return [root.pane];
-  }
-  return root.children.flatMap((child) => listPanes(child));
+  return listTabLayoutPanes(root);
 }
 
 export function paneCount(root: LayoutNode): number {
-  return listPanes(root).length;
+  return tabLayoutPaneCount(root);
 }
 
 export function firstPaneId(root: LayoutNode): string {
-  return listPanes(root)[0]?.id ?? defaultLayout().activePaneId;
+  return firstTabLayoutPaneId(root) ?? defaultLayout().activePaneId;
 }
 
 export function findPane(root: LayoutNode, paneId: string): Pane | undefined {
-  return listPanes(root).find((pane) => pane.id === paneId);
+  return findTabLayoutPane(root, paneId);
 }
 
 export function findPaneContainingTab(root: LayoutNode, tabId: string): Pane | undefined {
-  return listPanes(root).find((pane) => pane.tabIds.includes(tabId));
+  return findTabLayoutPaneContainingTab(root, tabId);
 }
 
 export function isStoredLayout(value: unknown): value is WorkspaceLayout {
-  if (!isRecord(value) || typeof value.activePaneId !== "string" || !isLayoutNode(value.root)) {
-    return false;
-  }
-  return listPanes(value.root).some((pane) => pane.id === value.activePaneId);
+  return isUsableTabLayoutState(value);
 }
 
 export function reconcileLayout(current: WorkspaceLayout, tabs: WorkspaceTab[], activeTabId?: string): WorkspaceLayout {
@@ -92,23 +103,11 @@ export function reconcileLayout(current: WorkspaceLayout, tabs: WorkspaceTab[], 
 }
 
 export function activatePane(layout: WorkspaceLayout, paneId: string): WorkspaceLayout {
-  if (!findPane(layout.root, paneId)) {
-    return layout;
-  }
-  return { ...layout, activePaneId: paneId };
+  return activateTabLayoutPane(layout, paneId);
 }
 
 export function activatePaneTab(layout: WorkspaceLayout, paneId: string, tabId: string): WorkspaceLayout {
-  if (!findPane(layout.root, paneId)) {
-    return layout;
-  }
-  return {
-    root: updatePane(layout.root, paneId, (pane) => ({
-      ...pane,
-      activeTabId: pane.tabIds.includes(tabId) ? tabId : pane.activeTabId
-    })),
-    activePaneId: paneId
-  };
+  return activateTabLayoutPaneTab(layout, paneId, tabId);
 }
 
 export function splitPane(
@@ -117,51 +116,15 @@ export function splitPane(
   createPaneId: () => string,
   createSplitId: () => string
 ): WorkspaceLayout {
-  if (paneCount(current.root) >= MAX_PANES || !findPane(current.root, current.activePaneId)) {
-    return current;
-  }
-  const nextPaneId = createPaneId();
-  const nextRoot = replacePane(current.root, current.activePaneId, (pane) => ({
-    type: "split",
-    id: createSplitId(),
-    direction,
-    sizes: [50, 50],
-    children: [
-      { type: "pane", pane },
-      { type: "pane", pane: { id: nextPaneId, tabIds: [], activeTabId: undefined } }
-    ]
-  }));
-  return { root: nextRoot, activePaneId: nextPaneId };
+  return splitTabLayoutPane(current, direction, { createPaneId, createSplitId });
 }
 
 export function placeTabInPane(current: WorkspaceLayout, targetPaneId: string, tabId: string, beforeTabId?: string): WorkspaceLayout {
-  if (!findPane(current.root, targetPaneId)) {
-    return current;
-  }
-  const withoutTab = mapPanes(current.root, (pane) => {
-    const tabIds = pane.tabIds.filter((id) => id !== tabId);
-    return { ...pane, tabIds, activeTabId: pane.activeTabId === tabId ? tabIds[0] : pane.activeTabId };
-  });
-  const root = updatePane(withoutTab, targetPaneId, (pane) => {
-    const tabIds = beforeTabId ? insertBefore(pane.tabIds, tabId, beforeTabId) : [...pane.tabIds, tabId];
-    return { ...pane, tabIds, activeTabId: tabId };
-  });
-  return { root, activePaneId: targetPaneId };
+  return placeTabInTabLayoutPane(current, targetPaneId, tabId, beforeTabId);
 }
 
 export function addTabToPane(current: WorkspaceLayout, targetPaneId: string, tabId: string): WorkspaceLayout {
-  const existingPane = findPaneContainingTab(current.root, tabId);
-  if (existingPane?.id === targetPaneId) {
-    return activatePaneTab(current, existingPane.id, tabId);
-  }
-  const target = findPane(current.root, targetPaneId) ? targetPaneId : firstPaneId(current.root);
-  if (existingPane) {
-    return placeTabInPane(current, target, tabId);
-  }
-  return {
-    root: updatePane(current.root, target, (pane) => ({ ...pane, tabIds: [...pane.tabIds, tabId], activeTabId: tabId })),
-    activePaneId: target
-  };
+  return addTabToTabLayoutPane(current, targetPaneId, tabId);
 }
 
 export function resolveTabCreationPaneId(current: WorkspaceLayout, requestedPaneId?: string): string {
@@ -172,14 +135,7 @@ export function resolveTabCreationPaneId(current: WorkspaceLayout, requestedPane
 }
 
 export function removeTabFromPanes(current: WorkspaceLayout, tabId: string): WorkspaceLayout {
-  const root = mapPanes(current.root, (pane) => {
-    const tabIds = pane.tabIds.filter((id) => id !== tabId);
-    return { ...pane, tabIds, activeTabId: pane.activeTabId === tabId ? tabIds[0] : pane.activeTabId };
-  });
-  return {
-    root,
-    activePaneId: findPane(root, current.activePaneId) ? current.activePaneId : firstPaneId(root)
-  };
+  return removeTabFromTabLayoutPanes(current, tabId);
 }
 
 export function removePane(current: WorkspaceLayout, paneId: string): WorkspaceLayout {
@@ -224,13 +180,6 @@ function mapPanes(root: LayoutNode, mapper: (pane: Pane) => Pane): LayoutNode {
 
 function updatePane(root: LayoutNode, paneId: string, updater: (pane: Pane) => Pane): LayoutNode {
   return mapPanes(root, (pane) => (pane.id === paneId ? updater(pane) : pane));
-}
-
-function replacePane(root: LayoutNode, paneId: string, replacement: (pane: Pane) => LayoutNode): LayoutNode {
-  if (root.type === "pane") {
-    return root.pane.id === paneId ? replacement(root.pane) : root;
-  }
-  return { ...root, children: [replacePane(root.children[0], paneId, replacement), replacePane(root.children[1], paneId, replacement)] };
 }
 
 function mapSplits(root: LayoutNode, mapper: (split: Extract<LayoutNode, { type: "split" }>) => LayoutNode): LayoutNode {
@@ -288,38 +237,6 @@ function findPaneContainingAnyTab(root: LayoutNode, tabIds: string[]): Pane | un
   return listPanes(root).find((pane) => tabIds.some((tabId) => pane.tabIds.includes(tabId)));
 }
 
-function insertBefore(items: string[], item: string, before: string): string[] {
-  const filtered = items.filter((candidate) => candidate !== item);
-  const index = filtered.indexOf(before);
-  if (index === -1) return [...filtered, item];
-  return [...filtered.slice(0, index), item, ...filtered.slice(index)];
-}
-
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
-}
-
-function isLayoutNode(value: unknown): value is LayoutNode {
-  if (!isRecord(value) || (value.type !== "pane" && value.type !== "split")) {
-    return false;
-  }
-  if (value.type === "pane") {
-    return isRecord(value.pane) && typeof value.pane.id === "string" && Array.isArray(value.pane.tabIds);
-  }
-  return (
-    typeof value.id === "string" &&
-    (value.direction === "row" || value.direction === "column") &&
-    Array.isArray(value.sizes) &&
-    value.sizes.length === 2 &&
-    typeof value.sizes[0] === "number" &&
-    typeof value.sizes[1] === "number" &&
-    Array.isArray(value.children) &&
-    value.children.length === 2 &&
-    isLayoutNode(value.children[0]) &&
-    isLayoutNode(value.children[1])
-  );
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

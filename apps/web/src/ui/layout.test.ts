@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { WorkspaceTab } from "@cloudx/shared";
 
-import { activatePane, addTabToPane, defaultLayout, listPanes, placeTabInPane, reconcileLayout, removePane, resolveTabCreationPaneId, resizeSplit, splitPane } from "./layout.js";
+import { activatePane, addTabToPane, defaultLayout, isStoredLayout, listPanes, placeTabInPane, reconcileLayout, removePane, resolveTabCreationPaneId, resizeSplit, splitPane } from "./layout.js";
 
 describe("layout helpers", () => {
   it("splits only the active pane and preserves nested split directions", () => {
@@ -136,6 +136,26 @@ describe("layout helpers", () => {
     const secondMove = resizeSplit(firstMove, "split-1", 200, 1000, [50, 50]);
 
     expect(secondMove.root).toMatchObject({ type: "split", sizes: [70, 30] });
+  });
+
+  it("rejects stored layouts that violate shared layout invariants", () => {
+    expect(isStoredLayout(layoutWithTabs(["tab-1"]))).toBe(true);
+    expect(isStoredLayout({ root: { type: "pane", pane: { id: "pane-1", tabIds: ["tab-1"], activeTabId: "missing" } }, activePaneId: "pane-1" })).toBe(false);
+    expect(
+      isStoredLayout({
+        root: {
+          type: "split",
+          id: "split-1",
+          direction: "row",
+          sizes: [50, 40],
+          children: [
+            { type: "pane", pane: { id: "pane-1", tabIds: [], activeTabId: undefined } },
+            { type: "pane", pane: { id: "pane-2", tabIds: [], activeTabId: undefined } }
+          ]
+        },
+        activePaneId: "pane-1"
+      })
+    ).toBe(false);
   });
 });
 

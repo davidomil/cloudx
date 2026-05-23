@@ -30,6 +30,55 @@
   --automation-controls-hover-foreground: var(--color-background);
   --automation-controls-border: rgb(0 212 255 / 0.28);
   --automation-controls-shadow: 0 10px 24px rgb(0 0 0 / 0.34), 0 0 14px rgb(0 212 255 / 0.08);
+  --automation-canvas-background: linear-gradient(135deg, rgb(0 255 136 / 0.07), transparent 34%), rgb(8 8 12 / 0.88);
+  --automation-node-background: rgb(18 18 26 / 0.96);
+  --automation-node-border: rgb(0 212 255 / 0.35);
+  --automation-node-trigger-border: rgb(0 255 136 / 0.46);
+  --automation-node-function-border: rgb(0 212 255 / 0.48);
+  --automation-node-converter-border: rgb(255 209 102 / 0.48);
+  --automation-node-selected-background: linear-gradient(180deg, rgb(255 209 102 / 0.075), transparent 56%), rgb(18 18 26 / 0.96);
+  --automation-node-selected-border: rgb(255 209 102 / 0.68);
+  --automation-node-selected-shadow: 0 0 0 1px rgb(255 209 102 / 0.22), 0 0 18px rgb(255 209 102 / 0.12), 0 12px 28px rgb(0 0 0 / 0.34);
+  --automation-node-shadow: 0 12px 28px rgb(0 0 0 / 0.34);
+  --automation-node-title-border: rgb(42 42 58 / 0.84);
+  --automation-node-summary: rgb(0 212 255 / 0.88);
+  --automation-node-summary-selected: rgb(255 209 102 / 0.95);
+  --automation-edge-route-handle-fill: rgb(8 8 12 / 0.96);
+  --automation-edge-route-handle-selected-fill: rgb(255 209 102 / 0.92);
+  --automation-edge-route-handle-selected-stroke: rgb(255 255 255 / 0.95);
+  --automation-port-tooltip-background: rgb(6 8 12 / 0.98);
+  --automation-port-tooltip-border: rgb(0 212 255 / 0.36);
+  --automation-port-tooltip-shadow: 0 12px 24px rgb(0 0 0 / 0.36);
+  --automation-palette-background: rgb(17 18 22 / 0.99);
+  --automation-palette-border: rgb(78 82 92 / 0.92);
+  --automation-palette-shadow: 0 18px 40px rgb(0 0 0 / 0.58);
+  --automation-palette-title: rgb(210 214 222 / 0.88);
+  --automation-palette-search-background: rgb(8 9 12 / 0.96);
+  --automation-palette-search-border: rgb(74 78 88 / 0.85);
+  --automation-palette-group-title: rgb(150 158 174 / 0.92);
+  --automation-palette-button-foreground: rgb(225 229 236 / 0.92);
+  --automation-palette-button-muted: rgb(140 148 162 / 0.86);
+  --automation-palette-button-hover-foreground: rgb(255 255 255);
+  --automation-palette-button-hover-background: rgb(54 91 140 / 0.88);
+  --automation-palette-button-hover-border: rgb(98 142 198 / 0.72);
+  --automation-surface-border-muted: rgb(42 42 58 / 0.42);
+  --automation-sample-background: rgb(18 18 26 / 0.74);
+  --automation-sample-border: rgb(42 42 58 / 0.86);
+  --automation-sample-success-border: rgb(0 255 136 / 0.35);
+  --automation-sample-failure-border: rgb(255 80 80 / 0.46);
+  --automation-panel-background: rgb(10 10 15 / 0.74);
+  --automation-panel-border: rgb(42 42 58 / 0.94);
+  --automation-panel-header-border: rgb(42 42 58 / 0.86);
+  --automation-panel-section-border: rgb(42 42 58 / 0.72);
+  --automation-input-background: rgb(18 18 26 / 0.88);
+  --automation-input-border: rgb(0 212 255 / 0.28);
+  --automation-group-background: rgb(18 18 26 / 0.78);
+  --automation-group-border: rgb(42 42 58 / 0.94);
+  --automation-connected-label: rgb(150 158 174 / 0.82);
+  --automation-disabled-foreground: rgb(140 148 162 / 0.86);
+  --automation-disabled-background: rgb(14 15 20 / 0.86);
+  --automation-disabled-border: rgb(80 84 96 / 0.7);
+  --automation-config-connected: rgb(255 209 102 / 0.86);
   --shadow-neon: 0 0 5px #00ff88, 0 0 10px #00ff8840;
   --shadow-neon-sm: 0 0 3px #00ff88, 0 0 6px #00ff8830;
   --shadow-neon-lg: 0 0 10px #00ff88, 0 0 20px #00ff8860, 0 0 40px #00ff8830;
@@ -1310,13 +1359,13 @@ a:hover svg {
 .automation-run-drawer {
   min-width: 0;
   min-height: 0;
-  background: rgb(10 10 15 / 0.74);
-  border-color: rgb(42 42 58 / 0.94);
+  background: var(--automation-panel-background);
+  border-color: var(--automation-panel-border);
 }
 
 .automation-rail {
   grid-row: 1 / 3;
-  border-right: 1px solid rgb(42 42 58 / 0.94);
+  border-right: 1px solid var(--automation-panel-border);
   overflow: hidden;
 }
 
@@ -1329,7 +1378,7 @@ a:hover svg {
   gap: 8px;
   min-height: 42px;
   padding: 7px 9px;
-  border-bottom: 1px solid rgb(42 42 58 / 0.86);
+  border-bottom: 1px solid var(--automation-panel-header-border);
   font-family: var(--font-label);
   font-size: 11px;
   font-weight: 800;
@@ -1353,11 +1402,22 @@ a:hover svg {
   color: var(--color-accent);
 }
 
+.automation-rail-actions {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.automation-delete-group svg {
+  color: var(--color-destructive);
+}
+
 .automation-create-form {
   display: grid;
   gap: 8px;
   padding: 8px;
-  border-bottom: 1px solid rgb(42 42 58 / 0.86);
+  border-bottom: 1px solid var(--automation-panel-header-border);
 }
 
 .automation-create-form label {
@@ -1377,8 +1437,8 @@ a:hover svg {
   min-height: 30px;
   padding: 0 8px;
   color: var(--color-foreground);
-  background: rgb(18 18 26 / 0.88);
-  border: 1px solid rgb(0 212 255 / 0.28);
+  background: var(--automation-input-background);
+  border: 1px solid var(--automation-input-border);
   clip-path: var(--chamfer-xs);
   outline: 0;
   letter-spacing: 0;
@@ -1407,8 +1467,8 @@ a:hover svg {
   padding: 9px;
   color: var(--color-muted-foreground);
   text-align: left;
-  background: rgb(18 18 26 / 0.78);
-  border: 1px solid rgb(42 42 58 / 0.94);
+  background: var(--automation-group-background);
+  border: 1px solid var(--automation-group-border);
   clip-path: var(--chamfer-sm);
   cursor: pointer;
 }
@@ -1453,6 +1513,24 @@ a:hover svg {
   overflow: hidden;
 }
 
+.automation-safety-toggle.active {
+  border-color: var(--color-warning);
+  background: color-mix(in srgb, var(--color-warning) 14%, transparent);
+}
+
+.automation-safety-toggle.active svg {
+  color: var(--color-warning);
+}
+
+.automation-safety-toggle.destructive.active {
+  border-color: var(--color-destructive);
+  background: color-mix(in srgb, var(--color-destructive) 14%, transparent);
+}
+
+.automation-safety-toggle.destructive.active svg {
+  color: var(--color-destructive);
+}
+
 .automation-search {
   flex: 0 1 220px;
   min-width: 120px;
@@ -1461,8 +1539,8 @@ a:hover svg {
   gap: 6px;
   height: 32px;
   padding: 0 8px;
-  background: rgb(18 18 26 / 0.86);
-  border: 1px solid rgb(0 212 255 / 0.28);
+  background: var(--automation-input-background);
+  border: 1px solid var(--automation-input-border);
   clip-path: var(--chamfer-sm);
 }
 
@@ -1499,7 +1577,7 @@ a:hover svg {
 }
 
 .automation-save-state.dirty {
-  color: rgb(18 18 26);
+  color: var(--color-background);
   background: var(--color-warning);
 }
 
@@ -1523,9 +1601,7 @@ a:hover svg {
   --xy-controls-box-shadow: none;
   --xy-controls-box-shadow-default: none;
 
-  background:
-    linear-gradient(135deg, rgb(0 255 136 / 0.07), transparent 34%),
-    rgb(8 8 12 / 0.88);
+  background: var(--automation-canvas-background);
 }
 
 .automation-canvas .react-flow__controls {
@@ -1578,7 +1654,7 @@ a:hover svg {
 }
 
 .automation-edge-route-handle {
-  fill: rgb(8 8 12 / 0.96);
+  fill: var(--automation-edge-route-handle-fill);
   stroke: var(--color-accent-tertiary);
   stroke-width: 1.5;
   opacity: 0.76;
@@ -1604,8 +1680,8 @@ a:hover svg {
 
 .automation-edge-route-handle:hover,
 .automation-edge-route-handle.selected {
-  fill: rgb(255 209 102 / 0.92);
-  stroke: rgb(255 255 255 / 0.95);
+  fill: var(--automation-edge-route-handle-selected-fill);
+  stroke: var(--automation-edge-route-handle-selected-stroke);
   opacity: 1;
 }
 
@@ -1623,41 +1699,36 @@ a:hover svg {
   position: relative;
   width: 210px;
   color: var(--color-foreground);
-  background: rgb(18 18 26 / 0.96);
-  border: 1px solid rgb(0 212 255 / 0.35);
-  box-shadow: 0 12px 28px rgb(0 0 0 / 0.34);
+  background: var(--automation-node-background);
+  border: 1px solid var(--automation-node-border);
+  box-shadow: var(--automation-node-shadow);
   clip-path: var(--chamfer-sm);
   overflow: visible;
 }
 
 .automation-node.trigger {
-  border-color: rgb(0 255 136 / 0.46);
+  border-color: var(--automation-node-trigger-border);
 }
 
 .automation-node.function {
-  border-color: rgb(0 212 255 / 0.48);
+  border-color: var(--automation-node-function-border);
 }
 
 .automation-node.converter {
-  border-color: rgb(255 209 102 / 0.48);
+  border-color: var(--automation-node-converter-border);
 }
 
 .automation-node.selected {
-  background:
-    linear-gradient(180deg, rgb(255 209 102 / 0.075), transparent 56%),
-    rgb(18 18 26 / 0.96);
-  border-color: rgb(255 209 102 / 0.68);
-  box-shadow:
-    0 0 0 1px rgb(255 209 102 / 0.22),
-    0 0 18px rgb(255 209 102 / 0.12),
-    0 12px 28px rgb(0 0 0 / 0.34);
+  background: var(--automation-node-selected-background);
+  border-color: var(--automation-node-selected-border);
+  box-shadow: var(--automation-node-selected-shadow);
 }
 
 .automation-node-title {
   display: grid;
   gap: 3px;
   padding: 9px 10px 7px;
-  border-bottom: 1px solid rgb(42 42 58 / 0.84);
+  border-bottom: 1px solid var(--automation-node-title-border);
 }
 
 .automation-node-title span {
@@ -1688,7 +1759,7 @@ a:hover svg {
   min-width: 0;
   display: block;
   overflow: hidden;
-  color: rgb(0 212 255 / 0.88);
+  color: var(--automation-node-summary);
   font-family: var(--font-body);
   font-size: 11px;
   font-style: normal;
@@ -1699,7 +1770,7 @@ a:hover svg {
 }
 
 .automation-node.selected .automation-node-summary {
-  color: rgb(255 209 102 / 0.95);
+  color: var(--automation-node-summary-selected);
 }
 
 .automation-node-ports {
@@ -1732,9 +1803,9 @@ a:hover svg {
   padding: 7px 8px;
   overflow-y: auto;
   color: var(--color-foreground);
-  background: rgb(6 8 12 / 0.98);
-  border: 1px solid rgb(0 212 255 / 0.36);
-  box-shadow: 0 12px 24px rgb(0 0 0 / 0.36);
+  background: var(--automation-port-tooltip-background);
+  border: 1px solid var(--automation-port-tooltip-border);
+  box-shadow: var(--automation-port-tooltip-shadow);
   clip-path: var(--chamfer-xs);
   font-family: var(--font-body);
   font-size: 11px;
@@ -1784,15 +1855,15 @@ a:hover svg {
   max-height: min(520px, calc(100vh - 20px));
   padding: 5px;
   overflow-y: auto;
-  background: rgb(17 18 22 / 0.99);
-  border: 1px solid rgb(78 82 92 / 0.92);
-  box-shadow: 0 18px 40px rgb(0 0 0 / 0.58);
+  background: var(--automation-palette-background);
+  border: 1px solid var(--automation-palette-border);
+  box-shadow: var(--automation-palette-shadow);
   clip-path: var(--chamfer-xs);
 }
 
 .automation-palette-title {
   padding: 3px 5px 5px;
-  color: rgb(210 214 222 / 0.88);
+  color: var(--automation-palette-title);
   font-family: var(--font-label);
   font-size: 8px;
   font-weight: 800;
@@ -1809,8 +1880,8 @@ a:hover svg {
   margin-bottom: 5px;
   padding: 0 6px;
   color: var(--color-muted-foreground);
-  background: rgb(8 9 12 / 0.96);
-  border: 1px solid rgb(74 78 88 / 0.85);
+  background: var(--automation-palette-search-background);
+  border: 1px solid var(--automation-palette-search-border);
   clip-path: var(--chamfer-xs);
 }
 
@@ -1841,7 +1912,7 @@ a:hover svg {
   justify-content: space-between;
   gap: 6px;
   padding: 3px 5px 2px;
-  color: rgb(150 158 174 / 0.92);
+  color: var(--automation-palette-group-title);
   font-family: var(--font-label);
   font-size: 8px;
   font-weight: 800;
@@ -1870,7 +1941,7 @@ a:hover svg {
   gap: 1px;
   margin: 0;
   padding: 4px 6px;
-  color: rgb(225 229 236 / 0.92);
+  color: var(--automation-palette-button-foreground);
   text-align: left;
   background: transparent;
   border: 1px solid transparent;
@@ -1892,7 +1963,7 @@ a:hover svg {
 .automation-palette button small {
   min-width: 0;
   overflow: hidden;
-  color: rgb(140 148 162 / 0.86);
+  color: var(--automation-palette-button-muted);
   font-size: 8px;
   line-height: 1.05;
   text-overflow: ellipsis;
@@ -1901,15 +1972,15 @@ a:hover svg {
 }
 
 .automation-palette button:hover {
-  color: rgb(255 255 255);
-  background: rgb(54 91 140 / 0.88);
-  border-color: rgb(98 142 198 / 0.72);
+  color: var(--automation-palette-button-hover-foreground);
+  background: var(--automation-palette-button-hover-background);
+  border-color: var(--automation-palette-button-hover-border);
 }
 
 .automation-inspector {
   grid-column: 3;
   grid-row: 1 / 3;
-  border-left: 1px solid rgb(42 42 58 / 0.94);
+  border-left: 1px solid var(--automation-panel-border);
   overflow-y: auto;
 }
 
@@ -1938,7 +2009,7 @@ a:hover svg {
 .automation-node-inspector {
   display: grid;
   gap: 9px;
-  border-bottom: 1px solid rgb(42 42 58 / 0.72);
+  border-bottom: 1px solid var(--automation-panel-section-border);
 }
 
 .automation-node-inspector label {
@@ -1955,8 +2026,8 @@ a:hover svg {
   min-height: 32px;
   padding: 0 8px;
   color: var(--color-foreground);
-  background: rgb(18 18 26 / 0.88);
-  border: 1px solid rgb(0 212 255 / 0.28);
+  background: var(--automation-input-background);
+  border: 1px solid var(--automation-input-border);
   clip-path: var(--chamfer-xs);
   outline: 0;
   letter-spacing: 0;
@@ -1970,15 +2041,15 @@ a:hover svg {
 }
 
 .automation-node-inspector label.connected span {
-  color: rgb(150 158 174 / 0.82);
+  color: var(--automation-connected-label);
 }
 
 .automation-node-inspector input:disabled,
 .automation-node-inspector select:disabled,
 .automation-node-inspector textarea:disabled {
-  color: rgb(140 148 162 / 0.86);
-  background: rgb(14 15 20 / 0.86);
-  border-color: rgb(80 84 96 / 0.7);
+  color: var(--automation-disabled-foreground);
+  background: var(--automation-disabled-background);
+  border-color: var(--automation-disabled-border);
   cursor: not-allowed;
   opacity: 1;
 }
@@ -2024,7 +2095,7 @@ a:hover svg {
 }
 
 .automation-config-help.connected {
-  color: rgb(255 209 102 / 0.86);
+  color: var(--automation-config-connected);
 }
 
 .automation-validation {
@@ -2056,7 +2127,7 @@ a:hover svg {
 .automation-run-drawer {
   grid-column: 2;
   grid-row: 2;
-  border-top: 1px solid rgb(42 42 58 / 0.94);
+  border-top: 1px solid var(--automation-panel-border);
   overflow-y: auto;
 }
 
@@ -2067,13 +2138,18 @@ a:hover svg {
 .automation-run {
   min-height: 32px;
   display: grid;
-  grid-template-columns: 18px 90px minmax(0, 1fr);
+  grid-template-columns: 18px 90px minmax(0, 1fr) 24px;
   align-items: center;
   gap: 8px;
   padding: 5px 10px;
   color: var(--color-muted-foreground);
-  border-top: 1px solid rgb(42 42 58 / 0.42);
+  border-top: 1px solid var(--automation-surface-border-muted);
   font-size: 12px;
+}
+
+.automation-run-cancel {
+  width: 22px;
+  height: 22px;
 }
 
 .automation-run.succeeded {
@@ -2088,17 +2164,17 @@ a:hover svg {
   margin: 8px 10px 10px;
   padding: 8px;
   color: var(--color-muted-foreground);
-  background: rgb(18 18 26 / 0.74);
-  border: 1px solid rgb(42 42 58 / 0.86);
+  background: var(--automation-sample-background);
+  border: 1px solid var(--automation-sample-border);
   clip-path: var(--chamfer-xs);
 }
 
 .automation-test-sample.succeeded {
-  border-color: rgb(0 255 136 / 0.35);
+  border-color: var(--automation-sample-success-border);
 }
 
 .automation-test-sample.failed {
-  border-color: rgb(255 80 80 / 0.46);
+  border-color: var(--automation-sample-failure-border);
 }
 
 .automation-test-sample-title {
@@ -2300,6 +2376,11 @@ a:hover svg {
   border-color: var(--color-accent);
 }
 
+.rules-skills-sidebar button.selected.dirty {
+  background: var(--color-warning);
+  border-color: var(--color-warning);
+}
+
 .rules-skills-sidebar button span:last-child {
   min-width: 0;
   overflow: hidden;
@@ -2419,9 +2500,27 @@ a:hover svg {
   line-height: 1.35;
 }
 
+.rules-skills-footer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.rules-skills-status {
+  flex: 1 1 180px;
+  color: var(--color-muted-foreground);
+  font-size: 11px;
+  letter-spacing: 0;
+}
+
+.rules-skills-save-state {
+  flex: 0 0 auto;
+}
+
 .rules-skills-actions {
   display: flex;
-  justify-content: flex-end;
+  margin-left: auto;
   gap: 6px;
 }
 
