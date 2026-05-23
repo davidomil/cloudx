@@ -1,22 +1,18 @@
 import { describe, expect, it } from "vitest";
 
-import type { AutomationCatalogResponse, AutomationGroup, AutomationNodeCatalogEntry } from "@cloudx/shared";
+import type { AutomationCatalogResponse, AutomationGroup, AutomationNodeCatalogEntry, AutomationSafety } from "@cloudx/shared";
 import { AUTOMATION_FSTRING_TYPE_ID } from "@cloudx/shared";
 
 import {
   automationMiniMapTheme,
-  automationGraphsEqual,
-  automationTypeAssignable,
-  connectedDataInputIds,
-  connectionIsValid,
+  automationAllowedSafetyWithToggle,
+  automationGraphFromPanelState,
   connectionPlanForEntry,
+  compatibilityFromConnectionState,
   defaultConfigForEntry,
-  deleteEdgesForHandle,
+  automationStatusFromError,
   portTooltipText,
-  flowFromGraph,
-  graphFromFlow,
   groupedPaletteEntries,
-  hasProgramFlowConflict,
   newAutomationGroup,
   nextAutomationGroupName,
   normalizedAutomationGroupName,
@@ -25,12 +21,12 @@ import {
   paletteStateFromPoint,
   primitiveConfigSummary,
   portTooltipPlacementFromRect,
-  programFlowConflictEdges,
-  removeProgramFlowConflicts,
-  routedEdgePath,
   searchPaletteStateFromRects,
+  selectedAutomationGroupAfterDelete,
   shouldClosePaletteForPointer
 } from "./AutomationPanel.js";
+import { automationGraphsEqual, flowFromGraph, graphFromFlow, routedEdgePath } from "./automationGraphAdapter.js";
+import { automationTypeAssignable, connectedDataInputIds, connectionIsValid, dataInputConflictEdges, deleteEdgesForHandle, hasProgramFlowConflict, programFlowConflictEdges, removeConnectionConflicts, removeProgramFlowConflicts } from "./automationConnection.js";
 
 describe("AutomationPanel helpers", () => {
   it("routes minimap colors through theme variables", () => {
@@ -49,10 +45,77 @@ describe("AutomationPanel helpers", () => {
 
     expect(flow.nodes).toHaveLength(2);
     expect(flow.edges[0]).toMatchObject({ source: "trigger", sourceHandle: "exec:out:exec", target: "log", targetHandle: "exec:in:exec" });
-    expect(graphFromFlow(flow.nodes, flow.edges)).toMatchObject(group.graph);
-    expect(automationGraphsEqual(graphFromFlow(flow.nodes, flow.edges), group.graph)).toBe(true);
+    expect(graphFromFlow(flow.nodes, flow.edges, group.graph)).toMatchObject(group.graph);
+    expect(automationGraphsEqual(graphFromFlow(flow.nodes, flow.edges, group.graph), group.graph)).toBe(true);
     expect(automationGraphsEqual({ ...group.graph, edges: [...group.graph.edges].reverse() }, group.graph)).toBe(true);
     expect(automationGraphsEqual({ ...group.graph, nodes: group.graph.nodes.map((node) => (node.id === "log" ? { ...node, config: { message: "changed" } } : node)) }, group.graph)).toBe(false);
+  });
+
+  it("preserves full port ids when React Flow handle ids contain delimiters", () => {
+    const group = {
+      ...groupFixture(),
+      graph: {
+        ...groupFixture().graph,
+        edges: [
+          {
+            id: "colon-data",
+            kind: "data" as const,
+            sourceNodeId: "trigger",
+            sourcePortId: "metadata:label",
+            targetNodeId: "log",
+            targetPortId: "message:body"
+          }
+        ]
+      }
+    };
+    const flow = flowFromGraph(group, catalogFixture());
+
+    expect(flow.edges[0]).toMatchObject({ sourceHandle: "data:out:metadata:label", targetHandle: "data:in:message:body" });
+    expect(graphFromFlow(flow.nodes, flow.edges, group.graph).edges[0]).toMatchObject({
+      sourcePortId: "metadata:label",
+      targetPortId: "message:body"
+    });
+  });
+
+  it("preserves graph variables when serializing React Flow state", () => {
+    const group = {
+      ...groupFixture(),
+      graph: {
+        ...groupFixture().graph,
+        allowedSafety: ["read", "write", "external"] as AutomationSafety[],
+        variables: [{ name: "branch", type: { kind: "string" as const }, defaultValue: "main" }]
+      }
+    };
+    const flow = flowFromGraph(group, catalogFixture());
+
+    expect(graphFromFlow(flow.nodes, flow.edges, group.graph).variables).toEqual(group.graph.variables);
+    expect(graphFromFlow(flow.nodes, flow.edges, group.graph).allowedSafety).toEqual(["read", "write", "external"]);
+  });
+
+  it("strips stale saved safety policy when the panel returns to default safety", () => {
+    const group = {
+      ...groupFixture(),
+      graph: {
+        ...groupFixture().graph,
+        allowedSafety: ["read", "write", "external"] as AutomationSafety[],
+        variables: [{ name: "branch", type: { kind: "string" as const }, defaultValue: "main" }]
+      }
+    };
+    const flow = flowFromGraph(group, catalogFixture());
+
+    expect(automationAllowedSafetyWithToggle(["read", "write", "external"], "external", false)).toBeUndefined();
+    const defaultSafetyGraph = automationGraphFromPanelState(flow.nodes, flow.edges, group.graph, undefined);
+    expect(defaultSafetyGraph.allowedSafety).toBeUndefined();
+    expect(defaultSafetyGraph.variables).toEqual(group.graph.variables);
+    expect(defaultSafetyGraph.edges).toEqual(group.graph.edges);
+    expect(automationGraphFromPanelState(flow.nodes, flow.edges, group.graph, ["read", "write", "external"]).allowedSafety).toEqual(["read", "write", "external"]);
+  });
+
+  it("compares missing safety policy using the server default policy semantics", () => {
+    const graph = groupFixture().graph;
+
+    expect(automationGraphsEqual(graph, { ...graph, allowedSafety: ["read", "write"] })).toBe(true);
+    expect(automationGraphsEqual(graph, { ...graph, allowedSafety: [] })).toBe(false);
   });
 
   it("normalizes dragged connector routes through two-elbow orthogonal graph edges", () => {
@@ -68,8 +131,8 @@ describe("AutomationPanel helpers", () => {
     expect(flow.edges[0]?.type).toBe("automation");
     expect(flow.edges[0]?.data).toMatchObject({ kind: "exec", routeOffsetX: 42 });
     expect(flow.edges[0]?.data).not.toHaveProperty("routeOffsetY");
-    expect(graphFromFlow(flow.nodes, flow.edges).edges[0]).toMatchObject({ route: { offsetX: 42 } });
-    expect(automationGraphsEqual(graphFromFlow(flow.nodes, flow.edges), group.graph)).toBe(true);
+    expect(graphFromFlow(flow.nodes, flow.edges, group.graph).edges[0]).toMatchObject({ route: { offsetX: 42 } });
+    expect(automationGraphsEqual(graphFromFlow(flow.nodes, flow.edges, group.graph), group.graph)).toBe(true);
     expect(routedEdgePath(0, 0, 100, 100, { offsetX: 20, offsetY: 30 })).toMatchObject({
       path: "M 0 0 L 70 0 L 70 100 L 100 100",
       control: { x: 70, y: 50 },
@@ -99,12 +162,22 @@ describe("AutomationPanel helpers", () => {
     });
   });
 
+  it("selects the next available automation after deleting the current group", () => {
+    const previousGroups = [{ id: "alpha" }, { id: "beta" }, { id: "gamma" }];
+
+    expect(selectedAutomationGroupAfterDelete(previousGroups, [{ id: "alpha" }, { id: "gamma" }], "beta", "beta")?.id).toBe("gamma");
+    expect(selectedAutomationGroupAfterDelete(previousGroups, [{ id: "alpha" }, { id: "beta" }], "gamma", "gamma")?.id).toBe("beta");
+    expect(selectedAutomationGroupAfterDelete(previousGroups, [{ id: "beta" }, { id: "gamma" }], "alpha", "gamma")?.id).toBe("gamma");
+    expect(selectedAutomationGroupAfterDelete([{ id: "alpha" }], [], "alpha", "alpha")).toBeUndefined();
+  });
+
   it("uses automation type compatibility for connections", () => {
     const flow = flowFromGraph(groupFixture(), catalogFixture());
     const byType = new Map(catalogFixture().nodes.map((entry) => [entry.typeId, entry]));
 
     expect(automationTypeAssignable({ kind: "string" }, { kind: "unknown" })).toBe(true);
     expect(automationTypeAssignable({ kind: "unknown" }, { kind: "string" })).toBe(false);
+    expect(automationTypeAssignable({ kind: "object", properties: { name: { kind: "string" } }, required: [] }, { kind: "object", properties: { name: { kind: "string" } }, required: ["name"] })).toBe(false);
     expect(
       connectionIsValid(
         {
@@ -133,12 +206,103 @@ describe("AutomationPanel helpers", () => {
       connectionIsValid(
         {
           source: "trigger",
+          sourceHandle: "data:out:text",
+          target: "log",
+          targetHandle: "exec:in:message"
+        },
+        flow.nodes,
+        byType
+      )
+    ).toBe(false);
+    expect(
+      connectionIsValid(
+        {
+          source: "trigger",
           sourceHandle: "data:out:payload",
           target: "log",
           targetHandle: "data:in:message"
         },
         flow.nodes,
         byType
+      )
+    ).toBe(false);
+  });
+
+  it("resolves same-name data and exec handles by kind during connection validation", () => {
+    const catalog = sameNamePortCatalogFixture();
+    const flow = flowFromGraph(groupFixture(), catalog);
+    const byType = new Map(catalog.nodes.map((entry) => [entry.typeId, entry]));
+
+    expect(
+      connectionIsValid(
+        {
+          source: "trigger",
+          sourceHandle: "data:out:exec",
+          target: "log",
+          targetHandle: "data:in:exec"
+        },
+        flow.nodes,
+        byType
+      )
+    ).toBe(true);
+    expect(
+      connectionIsValid(
+        {
+          source: "trigger",
+          sourceHandle: "exec:out:exec",
+          target: "log",
+          targetHandle: "exec:in:exec"
+        },
+        flow.nodes,
+        byType
+      )
+    ).toBe(true);
+  });
+
+  it("resolves connector palette compatibility by handle kind when port ids overlap", () => {
+    const catalog = sameNamePortCatalogFixture();
+    const flow = flowFromGraph(groupFixture(), catalog);
+    const byType = new Map(catalog.nodes.map((entry) => [entry.typeId, entry]));
+
+    expect(
+      compatibilityFromConnectionState(
+        { fromHandle: { id: "data:out:exec", nodeId: "trigger", type: "source" } } as never,
+        flow.nodes,
+        byType
+      )
+    ).toMatchObject({
+      handleId: "data:out:exec",
+      kind: "data",
+      type: { kind: "string" }
+    });
+    expect(
+      compatibilityFromConnectionState(
+        { fromHandle: { id: "exec:out:exec", nodeId: "trigger", type: "source" } } as never,
+        flow.nodes,
+        byType
+      )
+    ).toMatchObject({
+      handleId: "exec:out:exec",
+      kind: "exec",
+      type: { kind: "exec" }
+    });
+  });
+
+  it("rejects self-cycles before they reach graph validation", () => {
+    const flow = flowFromGraph(groupFixture(), catalogFixture());
+    const byType = new Map(catalogFixture().nodes.map((entry) => [entry.typeId, entry]));
+
+    expect(
+      connectionIsValid(
+        {
+          source: "log",
+          sourceHandle: "exec:out:exec",
+          target: "log",
+          targetHandle: "exec:in:exec"
+        },
+        flow.nodes,
+        byType,
+        flow.edges
       )
     ).toBe(false);
   });
@@ -180,6 +344,30 @@ describe("AutomationPanel helpers", () => {
     };
 
     expect(removeProgramFlowConflicts(replacement, [...flow.edges, unrelatedDataEdge]).map((edge) => edge.id)).toEqual(["data-edge"]);
+  });
+
+  it("prevents ambiguous duplicate data inputs and supports deliberate replacement", () => {
+    const flow = flowFromGraph(groupFixture(), catalogFixture());
+    const byType = new Map(catalogFixture().nodes.map((entry) => [entry.typeId, entry]));
+    const existingDataEdge = {
+      id: "data-edge",
+      source: "trigger",
+      sourceHandle: "data:out:text",
+      target: "log",
+      targetHandle: "data:in:message"
+    };
+    const replacement = {
+      source: "trigger",
+      sourceHandle: "data:out:text",
+      target: "log",
+      targetHandle: "data:in:message"
+    };
+
+    expect(dataInputConflictEdges(replacement, [existingDataEdge]).map((edge) => edge.id)).toEqual(["data-edge"]);
+    expect(connectionIsValid(replacement, flow.nodes, byType, [existingDataEdge])).toBe(false);
+    expect(connectionIsValid(replacement, flow.nodes, byType, [existingDataEdge], undefined, { allowDataInputReplacement: true })).toBe(true);
+    expect(connectionIsValid(replacement, flow.nodes, byType, [existingDataEdge], "data-edge")).toBe(true);
+    expect(removeConnectionConflicts(replacement, [existingDataEdge, ...flow.edges]).map((edge) => edge.id)).toEqual(["edge"]);
   });
 
   it("removes edges attached to a right-clicked handle", () => {
@@ -323,6 +511,7 @@ describe("AutomationPanel helpers", () => {
   it("summarizes primitive configured values for canvas nodes", () => {
     expect(primitiveConfigSummary(catalogFixture().nodes[1]!, { message: "New worktree created" })).toBe("Message: New worktree created");
     expect(primitiveConfigSummary(constantEntry(), { value: 42 })).toBe("Value: 42");
+    expect(primitiveConfigSummary(defaultedPrimitiveInputEntry(), { value: null })).toBe("Value: null");
     expect(primitiveConfigSummary(paletteEntries()[0]!, { value: "ignored" })).toBeUndefined();
   });
 
@@ -379,6 +568,11 @@ describe("AutomationPanel helpers", () => {
       flowY: 348
     });
   });
+
+  it("formats automation action errors for status text", () => {
+    expect(automationStatusFromError("Save", new Error("network down"))).toBe("Save failed: network down");
+    expect(automationStatusFromError("Run", "bad response")).toBe("Run failed: bad response");
+  });
 });
 
 function catalogFixture(): AutomationCatalogResponse {
@@ -409,6 +603,27 @@ function catalogFixture(): AutomationCatalogResponse {
         outputs: [{ id: "exec", label: "Done", kind: "exec", direction: "output", type: { kind: "exec" } }]
       }
     ]
+  };
+}
+
+function sameNamePortCatalogFixture(): AutomationCatalogResponse {
+  const catalog = catalogFixture();
+  return {
+    nodes: catalog.nodes.map((entry) => {
+      if (entry.typeId === "trigger:test") {
+        return {
+          ...entry,
+          outputs: [...entry.outputs, { id: "exec", label: "Exec Field", kind: "data", direction: "output", type: { kind: "string" } }]
+        };
+      }
+      if (entry.typeId === "primitive:log") {
+        return {
+          ...entry,
+          inputs: [...entry.inputs, { id: "exec", label: "Exec Field", kind: "data", direction: "input", type: { kind: "string" } }]
+        };
+      }
+      return entry;
+    })
   };
 }
 
@@ -591,6 +806,17 @@ function constantEntry(): AutomationNodeCatalogEntry {
     description: "Provide a configured number value.",
     inputs: [],
     outputs: [{ id: "value", label: "Value", kind: "data", direction: "output", type: { kind: "number" } }]
+  };
+}
+
+function defaultedPrimitiveInputEntry(): AutomationNodeCatalogEntry {
+  return {
+    typeId: "primitive:defaulted",
+    kind: "primitive",
+    title: "Defaulted",
+    description: "Uses an input default.",
+    inputs: [{ id: "value", label: "Value", kind: "data", direction: "input", type: { kind: "string" }, defaultValue: "fallback" }],
+    outputs: []
   };
 }
 

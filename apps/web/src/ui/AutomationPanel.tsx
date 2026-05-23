@@ -15,37 +15,37 @@ import {
   reconnectEdge,
   useReactFlow,
   type Connection,
-  type Edge,
   type EdgeChange,
   type EdgeProps,
   type EdgeTypes,
   type FinalConnectionState,
-  type Node,
   type NodeChange,
   type NodeProps,
   type NodeTypes,
   type XYPosition
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { CheckCircle2, FlaskConical, PauseCircle, Play, Plus, Save, Search, ToggleLeft, ToggleRight, Trash2, X, Zap } from "lucide-react";
+import { CheckCircle2, FlaskConical, PauseCircle, Play, Plus, Save, Search, ShieldAlert, ToggleLeft, ToggleRight, Trash2, X, Zap } from "lucide-react";
 
 import type {
   AutomationCatalogResponse,
-  AutomationEdge,
   AutomationEdgeRoute,
   AutomationGroup,
   AutomationNodeCatalogEntry,
   AutomationPortDescriptor,
   AutomationPortKind,
   AutomationRunSummary,
+  AutomationSafety,
   AutomationTestRunSample,
   AutomationType,
   AutomationValidationSummary,
   WorkspaceTab
 } from "@cloudx/shared";
-import { AUTOMATION_FSTRING_TYPE_ID, automationEntryWithDynamicPorts, automationFStringInputNames } from "@cloudx/shared";
+import { AUTOMATION_FSTRING_TYPE_ID, DEFAULT_AUTOMATION_ALLOWED_SAFETY, automationEntryWithDynamicPorts, automationFStringInputNames } from "@cloudx/shared";
 
 import {
+  cancelAutomationRun,
+  deleteAutomationGroup,
   getAutomationCatalog,
   getAutomationGroups,
   getAutomationRuns,
@@ -55,25 +55,43 @@ import {
   validateAutomationGraph
 } from "../api.js";
 import { ControlButton } from "./Control.js";
+import {
+  automationGraphsEqual,
+  edgeRouteFromData,
+  flowEdgeData,
+  flowFromGraph,
+  graphFromFlow,
+  handleForPort,
+  handleKind,
+  handlePort,
+  routedEdgePath,
+  type AutomationEdgeData,
+  type AutomationNodeData,
+  type FlowEdge,
+  type FlowNode
+} from "./automationGraphAdapter.js";
+import {
+  automationTypeAssignable,
+  connectedDataInputIds,
+  connectionIsValid,
+  deleteEdgesForHandle,
+  dataInputConflictEdges,
+  hasProgramFlowConflict,
+  portIsConnectable,
+  programFlowConflictEdges,
+  removeConnectionConflicts,
+  removeProgramFlowConflicts,
+  type AutomationHandleRef,
+  type ConnectionLike
+} from "./automationConnection.js";
+
+export { automationGraphsEqual, flowFromGraph, graphFromFlow, routedEdgePath } from "./automationGraphAdapter.js";
+export { automationTypeAssignable, connectedDataInputIds, connectionIsValid, dataInputConflictEdges, deleteEdgesForHandle, hasProgramFlowConflict, programFlowConflictEdges, removeConnectionConflicts, removeProgramFlowConflicts } from "./automationConnection.js";
 
 interface AutomationPanelProps {
   tab: WorkspaceTab;
+  liveRuns?: AutomationRunSummary[];
 }
-
-interface AutomationNodeData extends Record<string, unknown> {
-  entry: AutomationNodeCatalogEntry;
-  config?: Record<string, unknown>;
-}
-
-interface AutomationEdgeData extends Record<string, unknown> {
-  kind: AutomationPortKind;
-  routeOffsetX?: number;
-  routeOffsetY?: number;
-  onRouteChange?: (edgeId: string, route: AutomationEdgeRoute) => void;
-}
-
-type FlowNode = Node<AutomationNodeData, "automation">;
-type FlowEdge = Edge<AutomationEdgeData, "automation">;
 
 interface PortTooltipPlacement {
   left: number;
@@ -94,23 +112,6 @@ export interface PaletteState {
   flowX: number;
   flowY: number;
   compatibility?: PaletteCompatibility;
-}
-
-interface ConnectionLike {
-  id?: string;
-  source: string | null;
-  sourceHandle?: string | null;
-  target: string | null;
-  targetHandle?: string | null;
-}
-
-interface ConnectionValidationOptions {
-  allowProgramFlowReplacement?: boolean;
-}
-
-interface AutomationHandleRef {
-  nodeId: string;
-  handleId: string;
 }
 
 export interface PaletteCompatibility extends AutomationHandleRef {
@@ -158,21 +159,22 @@ export const automationMiniMapTheme = {
   nodeStrokeWidth: 1.5
 } as const;
 
-export function AutomationPanel({ tab }: AutomationPanelProps) {
+export function AutomationPanel({ tab, liveRuns }: AutomationPanelProps) {
   return (
     <ReactFlowProvider>
-      <AutomationPanelInner tab={tab} />
+      <AutomationPanelInner tab={tab} liveRuns={liveRuns} />
     </ReactFlowProvider>
   );
 }
 
-function AutomationPanelInner({ tab }: AutomationPanelProps) {
+function AutomationPanelInner({ tab, liveRuns }: AutomationPanelProps) {
   const { screenToFlowPosition } = useReactFlow<FlowNode, FlowEdge>();
   const [catalog, setCatalog] = useState<AutomationCatalogResponse>({ nodes: [] });
   const [groups, setGroups] = useState<AutomationGroup[]>([]);
   const [selectedGroupId, setSelectedGroupId] = useState<string>("");
   const [nodes, setNodes] = useState<FlowNode[]>([]);
   const [edges, setEdges] = useState<FlowEdge[]>([]);
+  const [allowedSafety, setAllowedSafety] = useState<AutomationSafety[] | undefined>();
   const [selectedNodeId, setSelectedNodeId] = useState<string | undefined>();
   const [validation, setValidation] = useState<AutomationValidationSummary | undefined>();
   const [runs, setRuns] = useState<AutomationRunSummary[]>([]);
@@ -190,7 +192,12 @@ function AutomationPanelInner({ tab }: AutomationPanelProps) {
   const selectedGroup = groups.find((group) => group.id === selectedGroupId);
   const catalogByType = useMemo(() => new Map(catalog.nodes.map((entry) => [entry.typeId, entry])), [catalog.nodes]);
   const selectedNode = nodes.find((node) => node.id === selectedNodeId);
-  const currentGraph = useMemo(() => (selectedGroup ? graphFromFlow(nodes, edges) : undefined), [edges, nodes, selectedGroup]);
+  const currentGraph = useMemo(() => {
+    if (!selectedGroup) {
+      return undefined;
+    }
+    return automationGraphFromPanelState(nodes, edges, selectedGroup.graph, allowedSafety);
+  }, [allowedSafety, edges, nodes, selectedGroup]);
   const hasUnsavedChanges = Boolean(selectedGroup && currentGraph && !automationGraphsEqual(currentGraph, selectedGroup.graph));
   const selectedNodeConnectedInputIds = useMemo(() => connectedDataInputIds(selectedNodeId, edges), [edges, selectedNodeId]);
   const updateEdgeRoute = useCallback((edgeId: string, route: AutomationEdgeRoute) => {
@@ -207,6 +214,12 @@ function AutomationPanelInner({ tab }: AutomationPanelProps) {
       })),
     [edges, updateEdgeRoute]
   );
+  const externalSafetyAllowed = automationSafetyEnabled(allowedSafety, "external");
+  const destructiveSafetyAllowed = automationSafetyEnabled(allowedSafety, "destructive");
+  const updateSafetyPolicy = useCallback((safety: AutomationSafety, enabled: boolean) => {
+    setAllowedSafety((current) => automationAllowedSafetyWithToggle(current, safety, enabled));
+    setStatus(enabled ? `${automationSafetyLabel(safety)} automation hooks allowed.` : `${automationSafetyLabel(safety)} automation hooks require explicit graph opt-in.`);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -224,17 +237,29 @@ function AutomationPanelInner({ tab }: AutomationPanelProps) {
           const flow = flowFromGraph(group, catalogResponse);
           setNodes(flow.nodes);
           setEdges(flow.edges);
+          setAllowedSafety(group.graph.allowedSafety);
           setValidation(group.lastValidation);
           setStatus("Automation loaded.");
         } else {
+          setAllowedSafety(undefined);
           setStatus("No automation groups saved.");
         }
       })
-      .catch((error) => setStatus(error instanceof Error ? error.message : String(error)));
+      .catch((error) => {
+        if (!cancelled) {
+          setStatus(automationStatusFromError("Load automation", error));
+        }
+      });
     return () => {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (liveRuns) {
+      setRuns(liveRuns);
+    }
+  }, [liveRuns]);
 
   useEffect(() => {
     if (!palette) {
@@ -290,6 +315,7 @@ function AutomationPanelInner({ tab }: AutomationPanelProps) {
     const flow = flowFromGraph(group, catalog);
     setNodes(flow.nodes);
     setEdges(flow.edges);
+    setAllowedSafety(group.graph.allowedSafety);
     setSelectedNodeId(undefined);
     setValidation(group.lastValidation);
     setLastTestSample(undefined);
@@ -313,19 +339,62 @@ function AutomationPanelInner({ tab }: AutomationPanelProps) {
       return;
     }
     const group = newAutomationGroup(name, `automation-${crypto.randomUUID()}`, new Date().toISOString());
-    const saved = await saveAutomationGroup(group);
-    const flow = flowFromGraph(saved, catalog);
-    setGroups((current) => [...current.filter((candidate) => candidate.id !== saved.id), saved]);
-    setSelectedGroupId(saved.id);
-    setNodes(flow.nodes);
-    setEdges(flow.edges);
-    setSelectedNodeId(undefined);
-    setValidation(saved.lastValidation);
-    setLastTestSample(undefined);
-    setPalette(undefined);
-    setCreateGroupOpen(false);
-    setStatus(`Created ${saved.name}. Add a trigger node to start.`);
+    try {
+      const saved = await saveAutomationGroup(group);
+      const flow = flowFromGraph(saved, catalog);
+      setGroups((current) => [...current.filter((candidate) => candidate.id !== saved.id), saved]);
+      setSelectedGroupId(saved.id);
+      setNodes(flow.nodes);
+      setEdges(flow.edges);
+      setAllowedSafety(saved.graph.allowedSafety);
+      setSelectedNodeId(undefined);
+      setValidation(saved.lastValidation);
+      setLastTestSample(undefined);
+      setPalette(undefined);
+      setCreateGroupOpen(false);
+      setStatus(`Created ${saved.name}. Add a trigger node to start.`);
+    } catch (error) {
+      setStatus(automationStatusFromError("Create automation", error));
+    }
   }, [catalog, createGroupName]);
+
+  const deleteCurrentGroup = useCallback(async () => {
+    if (!selectedGroup) {
+      return;
+    }
+    if (!window.confirm(`Delete automation ${selectedGroup.name}?`)) {
+      setStatus("Delete cancelled.");
+      return;
+    }
+    try {
+      const nextGroups = await deleteAutomationGroup(selectedGroup.id);
+      const nextSelectedGroup = selectedAutomationGroupAfterDelete(groups, nextGroups, selectedGroup.id, selectedGroupId);
+      setGroups(nextGroups);
+      setCreateGroupOpen(false);
+      setPalette(undefined);
+      setLastTestSample(undefined);
+      if (nextSelectedGroup) {
+        const flow = flowFromGraph(nextSelectedGroup, catalog);
+        setSelectedGroupId(nextSelectedGroup.id);
+        setNodes(flow.nodes);
+        setEdges(flow.edges);
+        setAllowedSafety(nextSelectedGroup.graph.allowedSafety);
+        setSelectedNodeId(undefined);
+        setValidation(nextSelectedGroup.lastValidation);
+        setStatus(`Deleted ${selectedGroup.name}. Selected ${nextSelectedGroup.name}.`);
+        return;
+      }
+      setSelectedGroupId("");
+      setNodes([]);
+      setEdges([]);
+      setAllowedSafety(undefined);
+      setSelectedNodeId(undefined);
+      setValidation(undefined);
+      setStatus(`Deleted ${selectedGroup.name}.`);
+    } catch (error) {
+      setStatus(automationStatusFromError("Delete automation", error));
+    }
+  }, [catalog, groups, selectedGroup, selectedGroupId]);
 
   const onNodesChange = useCallback((changes: NodeChange<FlowNode>[]) => {
     setNodes((current) => applyNodeChanges(changes, current));
@@ -337,15 +406,15 @@ function AutomationPanelInner({ tab }: AutomationPanelProps) {
 
   const isValidConnection = useCallback((connection: Connection | FlowEdge) => {
     const reconnectingEdgeId = reconnectingEdgeIdRef.current;
-    return connectionIsValid(connection, nodes, catalogByType, edges, reconnectingEdgeId, { allowProgramFlowReplacement: !reconnectingEdgeId });
+    return connectionIsValid(connection, nodes, catalogByType, edges, reconnectingEdgeId, { allowProgramFlowReplacement: !reconnectingEdgeId, allowDataInputReplacement: !reconnectingEdgeId });
   }, [catalogByType, edges, nodes]);
 
   const onConnect = useCallback((connection: Connection) => {
-    if (!connectionIsValid(connection, nodes, catalogByType, edges, undefined, { allowProgramFlowReplacement: true })) {
+    if (!connectionIsValid(connection, nodes, catalogByType, edges, undefined, { allowProgramFlowReplacement: true, allowDataInputReplacement: true })) {
       setStatus("Connection rejected by automation type validation.");
       return;
     }
-    setEdges((current) => addEdge(flowEdgeFromConnection(connection), removeProgramFlowConflicts(connection, current)));
+    setEdges((current) => addEdge(flowEdgeFromConnection(connection), removeConnectionConflicts(connection, current)));
   }, [catalogByType, edges, nodes]);
 
   const onConnectEnd = useCallback((event: MouseEvent | TouchEvent, connectionState: FinalConnectionState) => {
@@ -388,40 +457,67 @@ function AutomationPanelInner({ tab }: AutomationPanelProps) {
     if (!selectedGroup || !currentGraph) {
       return;
     }
-    const group = await saveAutomationGroup({ ...selectedGroup, graph: currentGraph });
-    setGroups((current) => current.map((candidate) => (candidate.id === group.id ? group : candidate)));
-    setValidation(group.lastValidation);
-    setLastTestSample(undefined);
-    setStatus("Automation saved.");
+    try {
+      const group = await saveAutomationGroup({ ...selectedGroup, graph: currentGraph });
+      setGroups((current) => current.map((candidate) => (candidate.id === group.id ? group : candidate)));
+      setAllowedSafety(group.graph.allowedSafety);
+      setValidation(group.lastValidation);
+      setLastTestSample(undefined);
+      setStatus("Automation saved.");
+    } catch (error) {
+      setStatus(automationStatusFromError("Save automation", error));
+    }
   }, [currentGraph, selectedGroup]);
 
   const validateCurrentGroup = useCallback(async () => {
     if (!selectedGroup || !currentGraph) {
       return;
     }
-    const result = await validateAutomationGraph(selectedGroup.id, currentGraph);
-    setValidation(result);
-    setStatus(result.valid ? (hasUnsavedChanges ? "Unsaved graph is valid." : "Graph is valid.") : "Graph has validation errors.");
+    try {
+      const result = await validateAutomationGraph(selectedGroup.id, currentGraph);
+      setValidation(result);
+      setStatus(result.valid ? (hasUnsavedChanges ? "Unsaved graph is valid." : "Graph is valid.") : "Graph has validation errors.");
+    } catch (error) {
+      setStatus(automationStatusFromError("Validate automation", error));
+    }
   }, [currentGraph, hasUnsavedChanges, selectedGroup]);
 
   const testCurrentGroup = useCallback(async () => {
     if (!selectedGroup || !currentGraph) {
       return;
     }
-    const result = await startAutomationTestRun(selectedGroup.id, currentGraph);
-    setRuns(result.runs);
-    setLastTestSample(result.sample);
-    setStatus(result.sample.status === "succeeded" ? (hasUnsavedChanges ? "Unsaved sample test run succeeded." : "Sample test run succeeded.") : "Sample test run finished.");
+    try {
+      const result = await startAutomationTestRun(selectedGroup.id, currentGraph);
+      setRuns(result.runs);
+      setLastTestSample(result.sample);
+      setStatus(result.sample.status === "succeeded" ? (hasUnsavedChanges ? "Unsaved sample test run succeeded." : "Sample test run succeeded.") : "Sample test run finished.");
+    } catch (error) {
+      setStatus(automationStatusFromError("Run automation test", error));
+    }
   }, [currentGraph, hasUnsavedChanges, selectedGroup]);
+
+  const cancelRun = useCallback(async (runId: string) => {
+    try {
+      const result = await cancelAutomationRun(runId);
+      setRuns(result.runs);
+      setStatus("Automation run cancelled.");
+    } catch (error) {
+      setStatus(automationStatusFromError("Cancel automation run", error));
+    }
+  }, []);
 
   const toggleGroup = useCallback(async (group: AutomationGroup) => {
     if (group.id === selectedGroupId && hasUnsavedChanges) {
       setStatus("Save changes before enabling or disabling this automation.");
       return;
     }
-    const updated = await setAutomationGroupEnabled(group.id, !group.enabled);
-    setGroups((current) => current.map((candidate) => (candidate.id === updated.id ? updated : candidate)));
-    setStatus(updated.enabled ? "Automation enabled." : "Automation disabled.");
+    try {
+      const updated = await setAutomationGroupEnabled(group.id, !group.enabled);
+      setGroups((current) => current.map((candidate) => (candidate.id === updated.id ? updated : candidate)));
+      setStatus(updated.enabled ? "Automation enabled." : "Automation disabled.");
+    } catch (error) {
+      setStatus(automationStatusFromError("Update automation", error));
+    }
   }, [hasUnsavedChanges, selectedGroupId]);
 
   const openSearchPalette = useCallback((value: string, input: HTMLInputElement) => {
@@ -455,7 +551,7 @@ function AutomationPanelInner({ tab }: AutomationPanelProps) {
       }
       const created = connectedNodesForPlan(entry, plan, palette.compatibility, position);
       setNodes((current) => [...current, ...created.nodes]);
-      setEdges((current) => [...removeProgramFlowConflicts(created.edges[0], current), ...created.edges]);
+      setEdges((current) => [...created.edges.reduce((next, edge) => removeConnectionConflicts(edge, next), current), ...created.edges]);
       setSelectedNodeId(created.selectedNodeId);
       setPalette(undefined);
       setStatus(plan.converter ? `Node connected through ${plan.converter.title}.` : "Node connected.");
@@ -499,9 +595,14 @@ function AutomationPanelInner({ tab }: AutomationPanelProps) {
             <Zap size={16} />
             <span>Automation</span>
           </span>
-          <ControlButton className="icon-button" title="New automation" aria-label="New automation" onClick={openCreateGroupForm}>
-            <Plus size={14} />
-          </ControlButton>
+          <div className="automation-rail-actions">
+            <ControlButton className="icon-button" title="New automation" aria-label="New automation" onClick={openCreateGroupForm}>
+              <Plus size={14} />
+            </ControlButton>
+            <ControlButton className="icon-button automation-delete-group" tone="danger" title="Delete selected automation" aria-label="Delete selected automation" disabled={!selectedGroup} onClick={deleteCurrentGroup}>
+              <Trash2 size={14} />
+            </ControlButton>
+          </div>
         </div>
         {createGroupOpen ? (
           <form className="automation-create-form" onSubmit={createAutomationGroup}>
@@ -545,6 +646,26 @@ function AutomationPanelInner({ tab }: AutomationPanelProps) {
               {selectedGroup.enabled ? <ToggleRight size={17} /> : <ToggleLeft size={17} />}
             </ControlButton>
           ) : null}
+          <ControlButton
+            className={`icon-button automation-safety-toggle ${externalSafetyAllowed ? "active" : ""}`}
+            title={externalSafetyAllowed ? "Disallow external automation hooks" : "Allow external automation hooks"}
+            aria-label={externalSafetyAllowed ? "Disallow external automation hooks" : "Allow external automation hooks"}
+            aria-pressed={externalSafetyAllowed}
+            disabled={!selectedGroup}
+            onClick={() => updateSafetyPolicy("external", !externalSafetyAllowed)}
+          >
+            <ShieldAlert size={16} />
+          </ControlButton>
+          <ControlButton
+            className={`icon-button automation-safety-toggle destructive ${destructiveSafetyAllowed ? "active" : ""}`}
+            title={destructiveSafetyAllowed ? "Disallow destructive automation hooks" : "Allow destructive automation hooks"}
+            aria-label={destructiveSafetyAllowed ? "Disallow destructive automation hooks" : "Allow destructive automation hooks"}
+            aria-pressed={destructiveSafetyAllowed}
+            disabled={!selectedGroup}
+            onClick={() => updateSafetyPolicy("destructive", !destructiveSafetyAllowed)}
+          >
+            <Trash2 size={16} />
+          </ControlButton>
           {selectedGroup ? <span className={`automation-save-state ${hasUnsavedChanges ? "dirty" : "saved"}`}>{hasUnsavedChanges ? "Unsaved" : "Saved"}</span> : null}
           <div className="automation-search">
             <Search size={14} />
@@ -615,6 +736,7 @@ function AutomationPanelInner({ tab }: AutomationPanelProps) {
             fitView
             minZoom={0.25}
             maxZoom={1.6}
+            proOptions={{ hideAttribution: true }}
           >
             <Background gap={18} size={1} />
             <Controls showInteractive={false} />
@@ -696,6 +818,11 @@ function AutomationPanelInner({ tab }: AutomationPanelProps) {
             {run.status === "running" ? <Play size={13} /> : run.status === "cancelled" ? <PauseCircle size={13} /> : <CheckCircle2 size={13} />}
             <span>{run.status}</span>
             <small>{run.trace.at(-1)?.message ?? run.error ?? run.startedAt}</small>
+            {run.status === "running" || run.status === "queued" ? (
+              <ControlButton className="icon-button automation-run-cancel" title="Cancel run" aria-label="Cancel run" onClick={() => cancelRun(run.id)}>
+                <X size={12} />
+              </ControlButton>
+            ) : null}
           </div>
         ))}
         {lastTestSample ? (
@@ -718,6 +845,53 @@ function AutomationPanelInner({ tab }: AutomationPanelProps) {
       </section>
     </div>
   );
+}
+
+const AUTOMATION_SAFETY_ORDER: AutomationSafety[] = ["read", "write", "external", "destructive"];
+
+export function automationStatusFromError(action: string, error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return `${action} failed: ${message}`;
+}
+
+export function automationSafetyEnabled(allowedSafety: AutomationSafety[] | undefined, safety: AutomationSafety): boolean {
+  return (allowedSafety ?? DEFAULT_AUTOMATION_ALLOWED_SAFETY).includes(safety);
+}
+
+export function automationAllowedSafetyWithToggle(allowedSafety: AutomationSafety[] | undefined, safety: AutomationSafety, enabled: boolean): AutomationSafety[] | undefined {
+  const next = new Set(allowedSafety ?? DEFAULT_AUTOMATION_ALLOWED_SAFETY);
+  if (enabled) {
+    next.add(safety);
+  } else {
+    next.delete(safety);
+  }
+  const ordered = AUTOMATION_SAFETY_ORDER.filter((candidate) => next.has(candidate));
+  return automationSafetyMatchesDefault(ordered) ? undefined : ordered;
+}
+
+export function automationGraphFromPanelState(nodes: FlowNode[], edges: FlowEdge[], baseGraph: AutomationGroup["graph"], allowedSafety: AutomationSafety[] | undefined): AutomationGroup["graph"] {
+  const graph = graphFromFlow(nodes, edges, baseGraph);
+  if (allowedSafety !== undefined) {
+    return { ...graph, allowedSafety: [...allowedSafety] };
+  }
+  const { allowedSafety: _staleAllowedSafety, ...graphWithDefaultSafety } = graph;
+  return graphWithDefaultSafety;
+}
+
+export function selectedAutomationGroupAfterDelete<T extends Pick<AutomationGroup, "id">>(previousGroups: T[], nextGroups: T[], deletedGroupId: string, selectedGroupId: string): T | undefined {
+  if (selectedGroupId !== deletedGroupId) {
+    return nextGroups.find((group) => group.id === selectedGroupId);
+  }
+  const deletedIndex = previousGroups.findIndex((group) => group.id === deletedGroupId);
+  return deletedIndex === -1 ? undefined : nextGroups[Math.min(deletedIndex, nextGroups.length - 1)];
+}
+
+function automationSafetyMatchesDefault(allowedSafety: AutomationSafety[]): boolean {
+  return AUTOMATION_SAFETY_ORDER.every((safety) => allowedSafety.includes(safety) === DEFAULT_AUTOMATION_ALLOWED_SAFETY.includes(safety));
+}
+
+function automationSafetyLabel(safety: AutomationSafety): string {
+  return safety.slice(0, 1).toUpperCase() + safety.slice(1);
 }
 
 function AutomationNodeView({ data, selected }: NodeProps<FlowNode>) {
@@ -975,89 +1149,6 @@ function FStringInspectorControls({ config, onChange }: { config: Record<string,
   );
 }
 
-export function flowFromGraph(group: AutomationGroup, catalog: AutomationCatalogResponse): { nodes: FlowNode[]; edges: FlowEdge[] } {
-  const catalogByType = new Map(catalog.nodes.map((entry) => [entry.typeId, entry]));
-  return {
-    nodes: group.graph.nodes.map((node) => ({
-      id: node.id,
-      type: "automation",
-      position: node.position,
-      data: {
-        entry: automationEntryWithDynamicPorts(catalogByType.get(node.typeId) ?? missingEntry(node.typeId), node.config ?? {}),
-        config: node.config ?? {}
-      }
-    })),
-    edges: group.graph.edges.map((edge) => ({
-      id: edge.id,
-      source: edge.sourceNodeId,
-      sourceHandle: `${edge.kind}:out:${edge.sourcePortId}`,
-      target: edge.targetNodeId,
-      targetHandle: `${edge.kind}:in:${edge.targetPortId}`,
-      type: "automation",
-      reconnectable: true,
-      animated: edge.kind === "exec",
-      data: flowEdgeData(edge.kind, edge.route)
-    }))
-  };
-}
-
-export function graphFromFlow(nodes: FlowNode[], edges: FlowEdge[]): AutomationGroup["graph"] {
-  return {
-    schemaVersion: 1,
-    nodes: nodes.map((node) => ({
-      id: node.id,
-      typeId: node.data.entry.typeId,
-      position: node.position,
-      config: node.data.config ?? {}
-    })),
-    edges: edges.map((edge): AutomationEdge => normalizeAutomationGraphEdge({
-      id: edge.id,
-      kind: handleKind(edge.sourceHandle),
-      sourceNodeId: edge.source,
-      sourcePortId: handlePort(edge.sourceHandle),
-      targetNodeId: edge.target,
-      targetPortId: handlePort(edge.targetHandle),
-      ...routeGraphPatch(edgeRouteFromData(edge.data))
-    })),
-    variables: []
-  };
-}
-
-export function automationGraphsEqual(left: AutomationGroup["graph"] | undefined, right: AutomationGroup["graph"] | undefined): boolean {
-  return stableStringify(normalizeAutomationGraph(left)) === stableStringify(normalizeAutomationGraph(right));
-}
-
-function normalizeAutomationGraph(graph: AutomationGroup["graph"] | undefined): unknown {
-  if (!graph) {
-    return undefined;
-  }
-  return {
-    schemaVersion: graph.schemaVersion,
-    nodes: [...graph.nodes]
-      .map((node) => ({
-        id: node.id,
-        typeId: node.typeId,
-        position: node.position,
-        config: node.config ?? {}
-      }))
-      .sort((left, right) => left.id.localeCompare(right.id)),
-    edges: [...graph.edges].map(normalizeAutomationGraphEdge).sort((left, right) => left.id.localeCompare(right.id)),
-    variables: [...(graph.variables ?? [])].sort((left, right) => left.name.localeCompare(right.name))
-  };
-}
-
-function normalizeAutomationGraphEdge(edge: AutomationEdge): AutomationEdge {
-  return {
-    id: edge.id,
-    kind: edge.kind,
-    sourceNodeId: edge.sourceNodeId,
-    sourcePortId: edge.sourcePortId,
-    targetNodeId: edge.targetNodeId,
-    targetPortId: edge.targetPortId,
-    ...routeGraphPatch(normalizedRoute(edge.route?.offsetX))
-  };
-}
-
 export function normalizedAutomationGroupName(value: string): string | undefined {
   const trimmed = value.trim().replace(/\s+/g, " ");
   return trimmed || undefined;
@@ -1093,214 +1184,8 @@ export function newAutomationGroup(name: string, id: string, now: string): Autom
   };
 }
 
-interface RoutedEdgePath {
-  path: string;
-  control: XYPosition;
-  sourceBreak: XYPosition;
-  targetBreak: XYPosition;
-}
-
-export function routedEdgePath(sourceX: number, sourceY: number, targetX: number, targetY: number, route?: AutomationEdgeRoute): RoutedEdgePath {
-  const breakX = (sourceX + targetX) / 2 + (route?.offsetX ?? 0);
-  const control = {
-    x: breakX,
-    y: (sourceY + targetY) / 2
-  };
-  const sourceBreak = { x: breakX, y: sourceY };
-  const targetBreak = { x: breakX, y: targetY };
-  const points = compactOrthogonalPoints([
-    { x: sourceX, y: sourceY },
-    sourceBreak,
-    targetBreak,
-    { x: targetX, y: targetY }
-  ]);
-  return {
-    path: pathFromOrthogonalPoints(points),
-    control,
-    sourceBreak,
-    targetBreak
-  };
-}
-
-function compactOrthogonalPoints(points: XYPosition[]): XYPosition[] {
-  return points.reduce<XYPosition[]>((result, point) => {
-    const previous = result[result.length - 1];
-    if (previous && previous.x === point.x && previous.y === point.y) {
-      return result;
-    }
-    const beforePrevious = result[result.length - 2];
-    if (beforePrevious && previous && pointsAreCollinear(beforePrevious, previous, point)) {
-      result[result.length - 1] = point;
-      return result;
-    }
-    result.push(point);
-    return result;
-  }, []);
-}
-
-function pointsAreCollinear(first: XYPosition, second: XYPosition, third: XYPosition): boolean {
-  return (first.x === second.x && second.x === third.x) || (first.y === second.y && second.y === third.y);
-}
-
-function pathFromOrthogonalPoints(points: XYPosition[]): string {
-  const [first, ...rest] = points;
-  if (!first) {
-    return "";
-  }
-  return [`M ${first.x} ${first.y}`, ...rest.map((point) => `L ${point.x} ${point.y}`)].join(" ");
-}
-
-function flowEdgeData(kind: AutomationPortKind, route?: AutomationEdgeRoute): AutomationEdgeData {
-  return {
-    kind,
-    ...normalizedRouteData(route)
-  };
-}
-
-function edgeRouteFromData(data: AutomationEdgeData | undefined): AutomationEdgeRoute | undefined {
-  return normalizedRoute(data?.routeOffsetX);
-}
-
-function routeGraphPatch(route: AutomationEdgeRoute | undefined): { route?: AutomationEdgeRoute } {
-  return route ? { route } : {};
-}
-
-function normalizedRouteData(route: AutomationEdgeRoute | undefined): Pick<AutomationEdgeData, "routeOffsetX" | "routeOffsetY"> {
-  const normalized = normalizedRoute(route?.offsetX);
-  return normalized ? { routeOffsetX: normalized.offsetX } : {};
-}
-
-function normalizedRoute(offsetX: unknown): AutomationEdgeRoute | undefined {
-  const x = finiteRouteNumber(offsetX);
-  if (x === undefined) {
-    return undefined;
-  }
-  return {
-    offsetX: x
-  };
-}
-
-function finiteRouteNumber(value: unknown): number | undefined {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    return undefined;
-  }
-  const rounded = Math.round(value);
-  return Math.abs(rounded) >= 1 ? rounded : undefined;
-}
-
 function clampRouteOffset(value: number): number {
   return Math.max(-1200, Math.min(1200, Math.round(value)));
-}
-
-function stableStringify(value: unknown): string {
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
-  }
-  if (value && typeof value === "object") {
-    return `{${Object.entries(value as Record<string, unknown>)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, item]) => `${JSON.stringify(key)}:${stableStringify(item)}`)
-      .join(",")}}`;
-  }
-  return JSON.stringify(value);
-}
-
-export function automationTypeAssignable(source: AutomationType, target: AutomationType): boolean {
-  if (target.kind === "unknown" || source.kind === "never") {
-    return true;
-  }
-  if (source.kind === "unknown") {
-    return false;
-  }
-  if (source.kind === "union") {
-    return (source.options ?? []).every((option) => automationTypeAssignable(option, target));
-  }
-  if (target.kind === "union") {
-    return (target.options ?? []).some((option) => automationTypeAssignable(source, option));
-  }
-  if (source.kind !== target.kind) {
-    return false;
-  }
-  if (source.kind === "array" && target.kind === "array") {
-    return automationTypeAssignable(source.items ?? { kind: "unknown" }, target.items ?? { kind: "unknown" });
-  }
-  if (source.kind === "object" && target.kind === "object") {
-    const sourceProperties = source.properties ?? {};
-    const targetProperties = target.properties ?? {};
-    return (target.required ?? []).every((key) => sourceProperties[key]) && Object.entries(targetProperties).every(([key, targetType]) => !sourceProperties[key] || automationTypeAssignable(sourceProperties[key]!, targetType));
-  }
-  return true;
-}
-
-export function connectionIsValid(
-  connection: ConnectionLike,
-  nodes: FlowNode[],
-  catalogByType: Map<string, AutomationNodeCatalogEntry>,
-  edges: ConnectionLike[] = [],
-  ignoredEdgeId?: string,
-  options: ConnectionValidationOptions = {}
-): boolean {
-  const sourceNode = nodes.find((node) => node.id === connection.source);
-  const targetNode = nodes.find((node) => node.id === connection.target);
-  if (!sourceNode || !targetNode || !connection.sourceHandle || !connection.targetHandle) {
-    return false;
-  }
-  const sourceEntry = sourceNode.data.entry;
-  const targetEntry = targetNode.data.entry;
-  if (!sourceEntry || !targetEntry) {
-    return false;
-  }
-  const sourcePort = sourceEntry.outputs.find((port) => port.id === handlePort(connection.sourceHandle));
-  const targetPort = targetEntry.inputs.find((port) => port.id === handlePort(connection.targetHandle));
-  if (!sourcePort || !targetPort || sourcePort.kind !== targetPort.kind || sourcePort.kind !== handleKind(connection.sourceHandle)) {
-    return false;
-  }
-  if (!portIsConnectable(sourcePort) || !portIsConnectable(targetPort)) {
-    return false;
-  }
-  if (sourcePort.kind === "exec" && hasProgramFlowConflict(connection, edges, ignoredEdgeId) && !options.allowProgramFlowReplacement) {
-    return false;
-  }
-  return sourcePort.kind === "exec" || automationTypeAssignable(sourcePort.type, targetPort.type);
-}
-
-export function hasProgramFlowConflict(connection: ConnectionLike, edges: ConnectionLike[], ignoredEdgeId?: string): boolean {
-  return programFlowConflictEdges(connection, edges, ignoredEdgeId).length > 0;
-}
-
-export function programFlowConflictEdges<T extends ConnectionLike>(connection: ConnectionLike, edges: T[], ignoredEdgeId?: string): T[] {
-  if (!connection.source || !connection.sourceHandle || handleKind(connection.sourceHandle) !== "exec") {
-    return [];
-  }
-  return edges.filter((edge) => edge.id !== ignoredEdgeId && edge.source === connection.source && edge.sourceHandle === connection.sourceHandle && handleKind(edge.sourceHandle) === "exec");
-}
-
-export function removeProgramFlowConflicts<T extends ConnectionLike>(connection: ConnectionLike | undefined, edges: T[], ignoredEdgeId?: string): T[] {
-  if (!connection) {
-    return edges;
-  }
-  const conflictIds = new Set(programFlowConflictEdges(connection, edges, ignoredEdgeId).map((edge) => edge.id).filter((id): id is string => typeof id === "string"));
-  return conflictIds.size > 0 ? edges.filter((edge) => !edge.id || !conflictIds.has(edge.id)) : edges;
-}
-
-export function deleteEdgesForHandle<T extends ConnectionLike>(edges: T[], handle: AutomationHandleRef): T[] {
-  return edges.filter((edge) => !edgeTouchesHandle(edge, handle));
-}
-
-export function connectedDataInputIds(nodeId: string | undefined, edges: ConnectionLike[]): Set<string> {
-  if (!nodeId) {
-    return new Set();
-  }
-  return new Set(
-    edges
-      .filter((edge) => edge.target === nodeId && edge.targetHandle && handleKind(edge.targetHandle) === "data")
-      .map((edge) => handlePort(edge.targetHandle))
-      .filter(Boolean)
-  );
-}
-
-function edgeTouchesHandle(edge: ConnectionLike, handle: AutomationHandleRef): boolean {
-  return (edge.source === handle.nodeId && edge.sourceHandle === handle.handleId) || (edge.target === handle.nodeId && edge.targetHandle === handle.handleId);
 }
 
 export function shouldClosePaletteForPointer(button: number, target: EventTarget | null, paletteElement: HTMLElement | null): boolean {
@@ -1590,7 +1475,7 @@ function connectedNodesForPlan(
   };
 }
 
-function compatibilityFromConnectionState(connectionState: FinalConnectionState, nodes: FlowNode[], catalogByType: Map<string, AutomationNodeCatalogEntry>): PaletteCompatibility | undefined {
+export function compatibilityFromConnectionState(connectionState: FinalConnectionState, nodes: FlowNode[], catalogByType: Map<string, AutomationNodeCatalogEntry>): PaletteCompatibility | undefined {
   const fromHandle = connectionState.fromHandle;
   if (!fromHandle?.id) {
     return undefined;
@@ -1600,8 +1485,12 @@ function compatibilityFromConnectionState(connectionState: FinalConnectionState,
   if (!entry) {
     return undefined;
   }
+  const portKind = handleKind(fromHandle.id);
   const portId = handlePort(fromHandle.id);
-  const port = fromHandle.type === "source" ? entry.outputs.find((candidate) => candidate.id === portId) : entry.inputs.find((candidate) => candidate.id === portId);
+  const port =
+    fromHandle.type === "source"
+      ? entry.outputs.find((candidate) => candidate.kind === portKind && candidate.id === portId)
+      : entry.inputs.find((candidate) => candidate.kind === portKind && candidate.id === portId);
   if (!port || !portIsConnectable(port)) {
     return undefined;
   }
@@ -1682,22 +1571,6 @@ function confirmDiscardUnsavedChanges(groupName: string | undefined): boolean {
   }
   const subject = groupName ? `"${groupName}"` : "this automation";
   return window.confirm(`Discard unsaved changes to ${subject}?`);
-}
-
-function handleKind(handle: string | null | undefined): AutomationPortKind {
-  return handle?.startsWith("exec:") ? "exec" : "data";
-}
-
-function handlePort(handle: string | null | undefined): string {
-  return handle?.split(":").at(-1) ?? "";
-}
-
-function handleForPort(kind: AutomationPortKind, direction: "in" | "out", portId: string): string {
-  return `${kind}:${direction}:${portId}`;
-}
-
-function portIsConnectable(port: AutomationPortDescriptor): boolean {
-  return port.connectable !== false;
 }
 
 function visiblePorts(ports: AutomationPortDescriptor[]): AutomationPortDescriptor[] {
@@ -1873,11 +1746,14 @@ function configEntries(entry: AutomationNodeCatalogEntry, config: Record<string,
     }
   }
   const defaults = defaultConfigForEntry(entry);
-  return Array.from(keys).map((key) => ({
-    key,
-    value: config[key] ?? defaults[key],
-    port: entry.inputs.find((port) => port.id === key && port.kind === "data")
-  }));
+  return Array.from(keys).map((key) => {
+    const configured = Object.prototype.hasOwnProperty.call(config, key);
+    return {
+      key,
+      value: configured ? config[key] : defaults[key],
+      port: entry.inputs.find((port) => port.id === key && port.kind === "data")
+    };
+  });
 }
 
 function addFStringInputName(config: Record<string, unknown>): Record<string, unknown> {
@@ -1900,7 +1776,7 @@ function renameFStringInputName(config: Record<string, unknown>, index: number, 
   }
   const next: Record<string, unknown> = { ...config, inputNames: names.map((name, candidateIndex) => (candidateIndex === index ? nextName : name)) };
   if (previousName !== nextName) {
-    next[nextName] = config[previousName] ?? "";
+    next[nextName] = Object.prototype.hasOwnProperty.call(config, previousName) ? config[previousName] : "";
     delete next[previousName];
   }
   return next;
@@ -1930,17 +1806,6 @@ function coerceConfigValue(previous: unknown, value: string, port?: AutomationPo
     return value === "true";
   }
   return value;
-}
-
-function missingEntry(typeId: string): AutomationNodeCatalogEntry {
-  return {
-    typeId,
-    kind: "primitive",
-    title: "Missing Node",
-    description: `Catalog entry ${typeId} is no longer available.`,
-    inputs: [],
-    outputs: []
-  };
 }
 
 export function primitiveConfigSummary(entry: AutomationNodeCatalogEntry, config: Record<string, unknown>, maxEntries = 3): string | undefined {
