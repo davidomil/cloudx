@@ -1,9 +1,10 @@
 import type { CreatePluginSessionInput, HookDefinition, PluginSession, PluginSessionSnapshot, PluginVoiceContext, WorkspacePlugin } from "@cloudx/plugin-api";
-import type { AutomationGroup, WorkspaceTab } from "@cloudx/shared";
+import { isAutomationGraphDocument, type AutomationGroup, type WorkspaceTab } from "@cloudx/shared";
 
 import type { AutomationService } from "../automation/AutomationService.js";
 
 export const AUTOMATION_PLUGIN_ID = "automation";
+type AutomationGroupInput = Pick<AutomationGroup, "id" | "name" | "enabled" | "graph">;
 
 export class AutomationPlugin implements WorkspacePlugin {
   readonly id = AUTOMATION_PLUGIN_ID;
@@ -67,7 +68,23 @@ export class AutomationPlugin implements WorkspacePlugin {
           required: ["groupId", "enabled"],
           additionalProperties: false
         },
-        execute: async (input) => ({ group: await this.serviceProvider().setEnabled(requireString(input.groupId, "groupId"), input.enabled === true) })
+        execute: async (input) => ({ group: await this.serviceProvider().setEnabled(requireString(input.groupId, "groupId"), requireBoolean(input.enabled, "enabled")) })
+      },
+      {
+        id: "automation.groups.delete",
+        owner: { kind: "plugin", pluginId: this.id },
+        title: "Delete Automation Group",
+        description: "Delete a saved automation group.",
+        exposures: ["plugin", "ui", "http"],
+        inputSchema: {
+          type: "object",
+          properties: {
+            groupId: { type: "string" }
+          },
+          required: ["groupId"],
+          additionalProperties: false
+        },
+        execute: async (input) => ({ groups: await this.serviceProvider().deleteGroup(requireString(input.groupId, "groupId")) })
       },
       {
         id: "automation.graph.validate",
@@ -179,28 +196,28 @@ class AutomationSession implements PluginSession {
   }
 }
 
-function requireGroup(value: unknown): AutomationGroup {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error("group must be an object.");
-  }
-  return value as AutomationGroup;
+function requireGroup(value: unknown): AutomationGroupInput {
+  const group = requireRecord(value, "group");
+  return {
+    id: requireString(group.id, "group.id"),
+    name: requireString(group.name, "group.name"),
+    enabled: requireBoolean(group.enabled, "group.enabled"),
+    graph: requireGroupGraph(group.graph, "group.graph")
+  };
 }
 
-function requireGroupGraph(value: unknown): AutomationGroup["graph"] {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error("graph must be an object.");
+function requireGroupGraph(value: unknown, name = "graph"): AutomationGroup["graph"] {
+  if (!isAutomationGraphDocument(value)) {
+    throwInputError(`${name} must be an automation graph document.`);
   }
-  return value as AutomationGroup["graph"];
+  return value;
 }
 
 function recordOrUndefined(value: unknown): Record<string, unknown> | undefined {
   if (value === undefined) {
     return undefined;
   }
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error("payload must be an object.");
-  }
-  return value as Record<string, unknown>;
+  return requireRecord(value, "payload");
 }
 
 function graphOrUndefined(value: unknown): AutomationGroup["graph"] | undefined {
@@ -209,7 +226,27 @@ function graphOrUndefined(value: unknown): AutomationGroup["graph"] | undefined 
 
 function requireString(value: unknown, name: string): string {
   if (typeof value !== "string" || !value.trim()) {
-    throw new Error(`${name} must be a non-empty string.`);
+    throwInputError(`${name} must be a non-empty string.`);
   }
   return value.trim();
+}
+
+function requireBoolean(value: unknown, name: string): boolean {
+  if (typeof value !== "boolean") {
+    throwInputError(`${name} must be a boolean.`);
+  }
+  return value;
+}
+
+function requireRecord(value: unknown, name: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throwInputError(`${name} must be an object.`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function throwInputError(message: string): never {
+  const error = new Error(message) as Error & { statusCode: number };
+  error.statusCode = 400;
+  throw error;
 }

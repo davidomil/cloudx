@@ -1,7 +1,7 @@
 import type { HookCallContext, HookDefinition } from "@cloudx/plugin-api";
 import { descriptorFromHook } from "@cloudx/plugin-api";
 import type { HookDescriptor, HookExposure, HookId } from "@cloudx/shared";
-import { validateObjectSchema } from "./schema.js";
+import { assertObjectRecord, validateObjectSchema } from "./schema.js";
 
 export class HookRegistry {
   private readonly hooks = new Map<HookId, HookDefinition>();
@@ -30,7 +30,12 @@ export class HookRegistry {
     this.assertExposure(hook, context.caller.kind);
     validateObjectSchema(hook.inputSchema, input, hook.id);
     const result = await hook.execute(input, context);
-    return result ?? {};
+    const output = result ?? {};
+    assertObjectRecord(output, hook.id, "output");
+    if (hook.outputSchema) {
+      validateObjectSchema(hook.outputSchema, output, hook.id, "output");
+    }
+    return output;
   }
 
   private assertExposure(hook: HookDefinition, exposure: HookExposure): void {

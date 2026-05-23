@@ -48,7 +48,7 @@ describe("TriggerRegistry", () => {
     registry.register(trigger);
 
     expect(() => registry.register(trigger)).toThrow("Trigger already registered");
-    await expect(registry.emit("tester.started", {}, { kind: "plugin", pluginId: "tester" })).rejects.toThrow("missing required input: text");
+    await expect(registry.emit("tester.started", {}, { kind: "plugin", pluginId: "tester" })).rejects.toThrow("missing required payload: text");
     await expect(registry.emit("tester.started", { text: "hello" }, { kind: "plugin", pluginId: "other" })).rejects.toThrow("cannot emit trigger");
   });
 });

@@ -1,16 +1,43 @@
 import { randomUUID } from "node:crypto";
 
-import type { AutomationCatalogResponse, AutomationGroup, AutomationRunsResponse, AutomationTestRunResponse, AutomationValidationSummary, TriggerEvent } from "@cloudx/shared";
+import { workspaceAutomationEffectsFromResult, type AutomationCatalogResponse, type AutomationGroup, type AutomationRunsResponse, type AutomationRunSummary, type AutomationTestRunResponse, type AutomationValidationSummary, type TriggerEvent, type WorkspaceLayoutInstruction, type WorkspaceUiInstruction } from "@cloudx/shared";
 
 import type { HookRegistry } from "../hooks/HookRegistry.js";
+import { validateObjectSchema } from "../hooks/schema.js";
 import type { TriggerRegistry } from "../triggers/TriggerRegistry.js";
 import { AutomationCatalogService } from "./AutomationCatalogService.js";
 import { AutomationCompiler } from "./AutomationCompiler.js";
-import { AutomationExecutor } from "./AutomationExecutor.js";
-import { AutomationRepository } from "./AutomationRepository.js";
+import { AutomationExecutor, type AutomationEffectSink } from "./AutomationExecutor.js";
+import { AutomationRepository, type AutomationGroupSave } from "./AutomationRepository.js";
+
+interface AutomationServiceOptions {
+  startDisabled?: boolean;
+  layoutEffects?: {
+    applyLayoutInstruction(instruction: WorkspaceLayoutInstruction): Promise<void> | void;
+  };
+}
+
+interface ActiveAutomationRun {
+  controller: AbortController;
+  groupId: string;
+  cancelled: boolean;
+  cancellationReason?: string;
+  latestRun?: AutomationRunSummary;
+}
+
+type RunsListener = (runs: AutomationRunSummary[]) => void;
+type UiInstructionListener = (instruction: WorkspaceUiInstruction) => void;
+type AutomationListenerKind = "runs" | "ui-instruction";
 
 export class AutomationService {
   private readonly queues = new Map<string, Promise<void>>();
+  private readonly activeRuns = new Map<string, ActiveAutomationRun>();
+  private readonly runsListeners = new Set<RunsListener>();
+  private readonly uiInstructionListeners = new Set<UiInstructionListener>();
+  private readonly effectSink: AutomationEffectSink;
+  private readonly startupPolicy: Promise<void>;
+  private readonly disposeTriggerSubscription: () => void;
+  private disposed = false;
 
   constructor(
     private readonly repository: AutomationRepository,
@@ -19,15 +46,51 @@ export class AutomationService {
     private readonly catalogService: AutomationCatalogService,
     private readonly compiler: AutomationCompiler,
     private readonly executor: AutomationExecutor,
-    options: { startDisabled?: boolean } = {}
+    private readonly options: AutomationServiceOptions = {}
   ) {
+    this.effectSink = {
+      applyHookResult: async (result) => {
+        for (const effect of workspaceAutomationEffectsFromResult(result)) {
+          if (effect.type === "workspace.layout") {
+            await this.options.layoutEffects?.applyLayoutInstruction(effect.instruction);
+          } else {
+            await this.emitUiInstruction(effect.instruction);
+          }
+        }
+      }
+    };
+    const startupTasks: Promise<void>[] = [this.markInterruptedRuns()];
     if (options.startDisabled) {
-      this.startupDisable = this.repository.disableAllGroups();
+      startupTasks.push(this.repository.disableAllGroups());
     }
-    this.triggers.subscribe((event) => this.handleTriggerEvent(event));
+    this.startupPolicy = Promise.all(startupTasks).then(() => undefined);
+    this.disposeTriggerSubscription = this.triggers.subscribe((event) => this.handleTriggerEvent(event));
   }
 
-  private readonly startupDisable?: Promise<void>;
+  dispose(): void {
+    if (this.disposed) {
+      return;
+    }
+    this.disposed = true;
+    this.disposeTriggerSubscription();
+    this.runsListeners.clear();
+    this.uiInstructionListeners.clear();
+    for (const activeRun of this.activeRuns.values()) {
+      activeRun.cancelled = true;
+      activeRun.cancellationReason = "Automation service was stopped.";
+      activeRun.controller.abort();
+    }
+  }
+
+  onRunsChange(listener: RunsListener): () => void {
+    this.runsListeners.add(listener);
+    return () => this.runsListeners.delete(listener);
+  }
+
+  onUiInstruction(listener: UiInstructionListener): () => void {
+    this.uiInstructionListeners.add(listener);
+    return () => this.uiInstructionListeners.delete(listener);
+  }
 
   async catalog(): Promise<AutomationCatalogResponse> {
     await this.ensureStartupPolicy();
@@ -39,10 +102,21 @@ export class AutomationService {
     return this.repository.listGroups();
   }
 
-  async saveGroup(group: AutomationGroup): Promise<AutomationGroup> {
+  async saveGroup(group: AutomationGroupSave): Promise<AutomationGroup> {
     await this.ensureStartupPolicy();
     const validation = await this.validate(group.graph);
     return this.repository.saveGroup({ ...group, lastValidation: validation });
+  }
+
+  async deleteGroup(groupId: string): Promise<AutomationGroup[]> {
+    await this.ensureStartupPolicy();
+    const groups = await this.repository.deleteGroup(groupId);
+    await Promise.all(
+      Array.from(this.activeRuns.entries())
+        .filter(([, run]) => run.groupId === groupId)
+        .map(([runId]) => this.cancelRun(runId))
+    );
+    return groups;
   }
 
   async setEnabled(groupId: string, enabled: boolean): Promise<AutomationGroup> {
@@ -65,6 +139,7 @@ export class AutomationService {
     const catalog = await this.catalog();
     const triggerId = this.firstTriggerId(group, catalog);
     const samplePayload = payload ?? this.samplePayloadForTrigger(triggerId);
+    validateObjectSchema(this.triggers.get(triggerId).payloadSchema, samplePayload, triggerId, "payload");
     const event: TriggerEvent = {
       id: randomUUID(),
       triggerId,
@@ -74,8 +149,9 @@ export class AutomationService {
     };
     await this.repository.appendTriggerEvent(event);
     const run = await this.runGroup(group, event, catalog);
+    const runs = await this.repository.listRuns();
     return {
-      runs: [run],
+      runs,
       sample: {
         triggerId,
         payload: samplePayload,
@@ -94,29 +170,44 @@ export class AutomationService {
 
   async cancelRun(runId: string): Promise<AutomationRunsResponse> {
     await this.ensureStartupPolicy();
+    const activeRun = this.activeRuns.get(runId);
+    if (activeRun) {
+      activeRun.cancelled = true;
+      activeRun.cancellationReason = "Cancelled by user.";
+      activeRun.controller.abort();
+    }
     const runs = await this.repository.listRuns();
-    const run = runs.find((candidate) => candidate.id === runId);
+    const run = activeRun?.latestRun ?? runs.find((candidate) => candidate.id === runId);
     if (!run) {
       throw new Error(`Unknown automation run: ${runId}`);
     }
-    if (run.status === "running" || run.status === "queued") {
-      await this.repository.saveRun({ ...run, status: "cancelled", finishedAt: new Date().toISOString(), error: "Cancelled by user." });
+    if (activeRun || run.status === "running" || run.status === "queued") {
+      await this.saveRunAndEmit({ ...run, status: "cancelled", finishedAt: new Date().toISOString(), error: activeRun?.cancellationReason ?? "Cancelled by user." });
     }
     return this.listRuns();
   }
 
   private handleTriggerEvent(event: TriggerEvent): void {
+    if (this.disposed) {
+      return;
+    }
     const current = this.queues.get(event.triggerId) ?? Promise.resolve();
     const next = current.then(async () => {
+      if (this.disposed) {
+        return;
+      }
       await this.ensureStartupPolicy();
       const catalog = await this.catalog();
       const groups = (await this.repository.listGroups()).filter((group) => group.enabled && this.groupHandlesTrigger(group, event.triggerId, catalog));
       for (const group of groups) {
+        if (this.disposed) {
+          return;
+        }
         await this.runGroup(group, event, catalog);
       }
     });
     this.queues.set(event.triggerId, next.catch(() => undefined));
-    void next.catch(() => undefined);
+    void next.catch((error) => console.warn(`Automation trigger ${event.triggerId} queue failed.`, error));
   }
 
   private async runGroup(group: AutomationGroup, event: TriggerEvent, catalog: AutomationCatalogResponse) {
@@ -138,12 +229,37 @@ export class AutomationService {
           at: new Date().toISOString()
         }))
       };
-      await this.repository.saveRun(run);
+      await this.saveRunAndEmit(run);
       return run;
     }
-    const run = await this.executor.execute(group, event, catalog, this.hooks);
-    await this.repository.saveRun(run);
-    return run;
+    const controller = new AbortController();
+    const activeRun: ActiveAutomationRun = { controller, groupId: group.id, cancelled: false };
+    let activeRunId: string | undefined;
+    try {
+      const run = await this.executor.execute(group, event, catalog, this.hooks, {
+        signal: controller.signal,
+        effectSink: this.effectSink,
+        onRunStarted: async (startedRun) => {
+          activeRunId = startedRun.id;
+          activeRun.latestRun = startedRun;
+          this.activeRuns.set(startedRun.id, activeRun);
+          await this.saveRunAndEmit(startedRun);
+        }
+      });
+      let finalRun = this.finalRunForCancellation(run, activeRun);
+      activeRun.latestRun = finalRun;
+      await this.saveRunAndEmit(finalRun);
+      finalRun = this.finalRunForCancellation(finalRun, activeRun);
+      if (activeRun.latestRun.status !== finalRun.status || activeRun.latestRun.error !== finalRun.error) {
+        activeRun.latestRun = finalRun;
+        await this.saveRunAndEmit(finalRun);
+      }
+      return finalRun;
+    } finally {
+      if (activeRunId && this.activeRuns.get(activeRunId) === activeRun) {
+        this.activeRuns.delete(activeRunId);
+      }
+    }
   }
 
   private groupHandlesTrigger(group: AutomationGroup, triggerId: string, catalog: AutomationCatalogResponse): boolean {
@@ -172,7 +288,53 @@ export class AutomationService {
   }
 
   private async ensureStartupPolicy(): Promise<void> {
-    await this.startupDisable;
+    await this.startupPolicy;
+  }
+
+  private async saveRunAndEmit(run: AutomationRunSummary): Promise<AutomationRunSummary> {
+    const saved = await this.repository.saveRun(run);
+    await this.emitRuns();
+    return saved;
+  }
+
+  private async emitRuns(): Promise<void> {
+    const runs = await this.repository.listRuns();
+    await Promise.all(Array.from(this.runsListeners, (listener) => this.deliverListener("runs", () => listener(runs))));
+  }
+
+  private async emitUiInstruction(instruction: WorkspaceUiInstruction): Promise<void> {
+    await Promise.all(Array.from(this.uiInstructionListeners, (listener) => this.deliverListener("ui-instruction", () => listener(instruction))));
+  }
+
+  private async deliverListener(kind: AutomationListenerKind, deliver: () => void): Promise<void> {
+    try {
+      await deliver();
+    } catch (error) {
+      console.warn(`Automation ${kind} listener failed.`, error);
+    }
+  }
+
+  private finalRunForCancellation(run: AutomationRunSummary, activeRun: ActiveAutomationRun): AutomationRunSummary {
+    if (!activeRun.cancelled && !activeRun.controller.signal.aborted && run.status !== "cancelled") {
+      return run;
+    }
+    return {
+      ...run,
+      status: "cancelled",
+      error: activeRun.cancellationReason ?? run.error ?? "Automation run was cancelled."
+    };
+  }
+
+  private async markInterruptedRuns(): Promise<void> {
+    const runs = await this.repository.listRuns();
+    for (const run of runs.filter((candidate) => candidate.status === "running" || candidate.status === "queued")) {
+      await this.repository.saveRun({
+        ...run,
+        status: "failed",
+        finishedAt: new Date().toISOString(),
+        error: "Automation run was interrupted by server restart."
+      });
+    }
   }
 }
 

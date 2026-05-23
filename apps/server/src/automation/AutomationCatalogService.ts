@@ -61,7 +61,7 @@ export class AutomationCatalogService {
         execOutput("exec", "Start", "Starts automation execution when this trigger fires."),
         dataOutput("payload", "Payload", payloadType, "Complete trigger payload object.", { connectable: false }),
         ...(await Promise.all(
-          Object.entries(payloadProperties).map(async ([id, type]) =>
+          Object.entries(payloadProperties).filter(([id]) => id !== "payload").map(async ([id, type]) =>
             dataOutput(id, titleCase(id), type, descriptionFromSchema(propertySchemas[id]) ?? `${titleCase(id)} value from the ${trigger.title} trigger payload.`)
           )
         ))
@@ -80,6 +80,7 @@ export class AutomationCatalogService {
         this.inputPortsForSchema(id, labelFromSchema(id, propertySchemas[id]), type, propertySchemas[id], required.has(id), `Input value for ${hook.title}.`)
       )
     )).flat();
+    const targetTabPorts = hook.owner.kind === "plugin" && !Object.prototype.hasOwnProperty.call(properties, "targetTabId") ? [await this.targetTabInputPort()] : [];
     return {
       typeId: `hook:${hook.id}`,
       kind: "function",
@@ -90,6 +91,7 @@ export class AutomationCatalogService {
       safety: hook.automationSafety ?? defaultSafety(hook),
       inputs: [
         execInput("exec", "Run", "Run this node after the previous program-flow step."),
+        ...targetTabPorts,
         ...inputPorts
       ],
       outputs: [
@@ -121,6 +123,15 @@ export class AutomationCatalogService {
     return [dataInput(id, label, type, required, { ...metadata, connectable: metadata.connectable ?? type.kind !== "object" })];
   }
 
+  private async targetTabInputPort(): Promise<AutomationPortDescriptor> {
+    const dynamic = await this.dynamicOptionsProvider("workspace.tabs");
+    return dataInput("targetTabId", "Target Tab", STRING_TYPE, false, {
+      automationRole: "pluginTargetTab",
+      description: "Workspace tab that should receive this plugin hook. Leave empty to use the active or only matching plugin tab.",
+      options: { source: "workspace.tabs", values: dynamic.options }
+    });
+  }
+
   private async portMetadata(schema: Record<string, unknown> | undefined): Promise<PortMetadata> {
     if (!schema) {
       return {};
@@ -142,6 +153,7 @@ export class AutomationCatalogService {
 }
 
 interface PortMetadata {
+  automationRole?: AutomationPortDescriptor["automationRole"];
   description?: string;
   defaultValue?: unknown;
   options?: AutomationPortDescriptor["options"];
@@ -470,10 +482,13 @@ function outputPortsForObject(prefix: string, outputType: AutomationType, output
     const portId = prefix ? `${prefix}.${id}` : id;
     const schema = propertySchemas[id];
     const label = labelFromSchema(id, schema);
+    if (schema?.["x-cloudx-connectable"] === false) {
+      return [];
+    }
     if (type.kind === "object" && shouldFlattenObjectSchema(schema)) {
       return outputPortsForObject(portId, type, schema);
     }
-    if (type.kind === "object" && schema?.["x-cloudx-connectable"] !== true) {
+    if (type.kind === "object") {
       return [];
     }
     return [dataOutput(portId, label, type, descriptionFromSchema(schema) ?? `${label} value returned by this hook.`)];

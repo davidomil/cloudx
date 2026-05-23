@@ -44,4 +44,65 @@ describe("HookRegistry", () => {
     await expect(registry.call("app.internal", {}, { caller: { kind: "plugin", pluginId: "tester" } })).rejects.toThrow("not exposed to plugin callers");
     await expect(registry.call("missing", {}, { caller: { kind: "app" } })).rejects.toThrow("Unknown hook");
   });
+
+  it("validates declared hook output schemas before returning results", async () => {
+    const registry = new HookRegistry();
+    registry.register({
+      id: "app.badOutput",
+      owner: { kind: "app" },
+      title: "Bad Output",
+      description: "Returns an invalid shape.",
+      exposures: ["app"],
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      outputSchema: {
+        type: "object",
+        properties: {
+          ok: { type: "boolean" }
+        },
+        required: ["ok"],
+        additionalProperties: false
+      },
+      execute: () => ({ ok: "yes" as unknown as boolean })
+    });
+
+    await expect(registry.call("app.badOutput", {}, { caller: { kind: "app" } })).rejects.toThrow("Action app.badOutput invalid output: /ok must be boolean");
+  });
+
+  it("rejects non-object hook outputs before returning results", async () => {
+    const registry = new HookRegistry();
+    registry.register({
+      id: "app.badRuntimeOutput",
+      owner: { kind: "app" },
+      title: "Bad Runtime Output",
+      description: "Returns a non-object value.",
+      exposures: ["app"],
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute: () => "not an object" as unknown as Record<string, unknown>
+    });
+
+    await expect(registry.call("app.badRuntimeOutput", {}, { caller: { kind: "app" } })).rejects.toThrow("Action app.badRuntimeOutput output must be an object.");
+  });
+
+  it("labels required output schema errors as output errors", async () => {
+    const registry = new HookRegistry();
+    registry.register({
+      id: "app.missingOutput",
+      owner: { kind: "app" },
+      title: "Missing Output",
+      description: "Returns an incomplete output object.",
+      exposures: ["app"],
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      outputSchema: {
+        type: "object",
+        properties: {
+          ok: { type: "boolean" }
+        },
+        required: ["ok"],
+        additionalProperties: false
+      },
+      execute: () => ({})
+    });
+
+    await expect(registry.call("app.missingOutput", {}, { caller: { kind: "app" } })).rejects.toThrow("Action app.missingOutput invalid output: missing required output: ok");
+  });
 });

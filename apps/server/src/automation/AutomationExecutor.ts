@@ -1,17 +1,40 @@
 import { randomUUID } from "node:crypto";
+import safeRegex from "safe-regex2";
 
 import type { HookRegistry } from "../hooks/HookRegistry.js";
 import type { AutomationCatalogResponse, AutomationEdge, AutomationGroup, AutomationNode, AutomationNodeCatalogEntry, AutomationRunSummary, AutomationRunTraceEntry, TriggerEvent } from "@cloudx/shared";
-import { AUTOMATION_FSTRING_TYPE_ID, automationEntryWithDynamicPorts, automationFStringInputNames } from "@cloudx/shared";
+import { AUTOMATION_FSTRING_TYPE_ID, automationEntryWithDynamicPorts, automationFStringInputNames, automationSafetyAllowed } from "@cloudx/shared";
 
 export interface AutomationExecutorOptions {
   activeTabId?: string;
   maxSteps?: number;
   maxDurationMs?: number;
   maxTraceEntries?: number;
+  signal?: AbortSignal;
+  effectSink?: AutomationEffectSink;
+  onRunStarted?: (run: AutomationRunSummary) => Promise<void> | void;
+}
+
+export interface AutomationEffectSink {
+  applyHookResult(result: Record<string, unknown>): Promise<void> | void;
 }
 
 type OutputMap = Map<string, Record<string, unknown>>;
+
+const AUTOMATION_REGEX_PATTERN_MAX_CHARS = 512;
+const AUTOMATION_REGEX_TEXT_MAX_CHARS = 200_000;
+const AUTOMATION_REGEX_REPEAT_LIMIT = 25;
+const AUTOMATION_FSTRING_TEMPLATE_MAX_CHARS = 50_000;
+const AUTOMATION_FSTRING_OUTPUT_MAX_CHARS = 200_000;
+const AUTOMATION_FSTRING_FORMAT_WIDTH_MAX = 10_000;
+const AUTOMATION_FSTRING_FORMAT_PRECISION_MAX = 100;
+
+export class AutomationCancelledError extends Error {
+  constructor() {
+    super("Automation run was cancelled.");
+    this.name = "AutomationCancelledError";
+  }
+}
 
 export class AutomationExecutor {
   async execute(group: AutomationGroup, event: TriggerEvent, catalog: AutomationCatalogResponse, hooks: HookRegistry, options: AutomationExecutorOptions = {}): Promise<AutomationRunSummary> {
@@ -25,12 +48,17 @@ export class AutomationExecutor {
     };
     const runtime = new AutomationRuntime(group, event, catalog, hooks, run, options);
     try {
+      await options.onRunStarted?.(run);
       await runtime.execute();
+      if (options.signal?.aborted) {
+        throw new AutomationCancelledError();
+      }
       run.status = "succeeded";
     } catch (error) {
-      run.status = "failed";
+      const cancelled = error instanceof AutomationCancelledError || options.signal?.aborted;
+      run.status = cancelled ? "cancelled" : "failed";
       run.error = error instanceof Error ? error.message : String(error);
-      runtime.trace("error", run.error);
+      runtime.trace(run.status === "cancelled" ? "warn" : "error", run.error);
     } finally {
       run.finishedAt = new Date().toISOString();
     }
@@ -109,26 +137,34 @@ class AutomationRuntime {
       return;
     }
     if (entry.kind === "function") {
+      this.assertHookSafetyAllowed(entry, node.id);
+      const targetTabPort = entry.inputs.find((port) => isPluginTargetTabPort(entry, port));
+      const targetTabId = targetTabPort ? optionalString(await this.optionalInputValue(node, targetTabPort.id)) : undefined;
       const input = await this.inputObject(node, entry);
+      this.assertNotCancelled();
       const result = await this.hooks.call(entry.hookId!, input, {
         caller: { kind: "automation", pluginId: "automation", automationGroupId: this.group.id },
-        targetTabId: optionalString(node.config?.targetTabId),
-        activeTabId: this.options.activeTabId
+        targetTabId,
+        activeTabId: this.options.activeTabId,
+        signal: this.options.signal
       });
+      this.assertNotCancelled();
+      await this.options.effectSink?.applyHookResult(result);
+      this.assertNotCancelled();
       this.outputs.set(node.id, { result, ...result, ...flattenObject(result) });
       this.trace("info", `${entry.title} completed.`, node.id);
       await this.executeNext(node, "exec");
       return;
     }
     if (node.typeId === "primitive:if") {
-      const condition = Boolean(await this.inputValue(node, "condition"));
+      const condition = booleanValue(await this.inputValue(node, "condition"), node, "condition");
       this.outputs.set(node.id, { condition });
       await this.executeNext(node, condition ? "true" : "false");
       return;
     }
     if (node.typeId === "primitive:while") {
       let iterations = 0;
-      while (Boolean(await this.inputValue(node, "condition"))) {
+      while (booleanValue(await this.inputValue(node, "condition"), node, "condition")) {
         iterations += 1;
         if (iterations > 1000) {
           throw new Error(`Automation loop limit exceeded in node ${node.id}.`);
@@ -145,6 +181,7 @@ class AutomationRuntime {
       }
       const value = await this.optionalInputValue(node, "initial");
       this.variables.set(name, value);
+      this.invalidateCachedDataNodeOutputs();
       this.outputs.set(node.id, { value });
       await this.executeNext(node, "exec");
       return;
@@ -153,6 +190,7 @@ class AutomationRuntime {
       const name = requireConfigString(node, "name");
       const value = await this.inputValue(node, "value");
       this.variables.set(name, value);
+      this.invalidateCachedDataNodeOutputs();
       this.outputs.set(node.id, { value });
       await this.executeNext(node, "exec");
       return;
@@ -188,6 +226,9 @@ class AutomationRuntime {
   private async inputObject(node: AutomationNode, entry: AutomationNodeCatalogEntry): Promise<Record<string, unknown>> {
     const input: Record<string, unknown> = {};
     for (const port of entry.inputs.filter((port) => port.kind === "data")) {
+      if (isPluginTargetTabPort(entry, port)) {
+        continue;
+      }
       const value = await this.optionalInputValue(node, port.id);
       if (value !== undefined) {
         setPathValue(input, port.id, value);
@@ -207,7 +248,7 @@ class AutomationRuntime {
   private async optionalInputValue(node: AutomationNode, portId: string): Promise<unknown> {
     const incoming = this.incomingData.get(`${node.id}:${portId}`)?.[0];
     if (!incoming) {
-      if (node.config && portId in node.config) {
+      if (hasOwn(node.config, portId)) {
         return node.config[portId];
       }
       return this.entry(node)?.inputs.find((port) => port.id === portId)?.defaultValue;
@@ -244,7 +285,7 @@ class AutomationRuntime {
       return value;
     }
     if (node.typeId === "primitive:constant.boolean") {
-      return node.config?.value === true;
+      return booleanValue(node.config?.value ?? false, node, "value");
     }
     if (node.typeId === "primitive:stringTemplate") {
       return this.renderTemplate(node);
@@ -290,16 +331,17 @@ class AutomationRuntime {
       const text = textValue(await this.inputValue(node, "text"));
       const search = textValue(await this.inputValue(node, "search"));
       const replacement = textValue(await this.inputValue(node, "replacement"));
-      if (Boolean(await this.optionalInputValue(node, "regex"))) {
-        return text.replace(new RegExp(search, textValue(await this.optionalInputValue(node, "flags"))), replacement);
+      const regex = await this.optionalInputValue(node, "regex");
+      if (regex === undefined ? false : booleanValue(regex, node, "regex")) {
+        return regexTextValue(text, node, "text").replace(automationRegExp(search, textValue(await this.optionalInputValue(node, "flags")), node), replacement);
       }
       return search ? text.split(search).join(replacement) : text;
     }
     if (node.typeId === "primitive:string.regex.test") {
-      return new RegExp(textValue(await this.inputValue(node, "pattern")), textValue(await this.optionalInputValue(node, "flags"))).test(textValue(await this.inputValue(node, "text")));
+      return automationRegExp(await this.inputValue(node, "pattern"), await this.optionalInputValue(node, "flags"), node).test(regexTextValue(await this.inputValue(node, "text"), node, "text"));
     }
     if (node.typeId === "primitive:string.regex.extract") {
-      const match = new RegExp(textValue(await this.inputValue(node, "pattern")), textValue(await this.optionalInputValue(node, "flags"))).exec(textValue(await this.inputValue(node, "text")));
+      const match = automationRegExp(await this.inputValue(node, "pattern"), await this.optionalInputValue(node, "flags"), node).exec(regexTextValue(await this.inputValue(node, "text"), node, "text"));
       return match?.[integerValue(await this.optionalInputValue(node, "group"), node, "group")] ?? "";
     }
     if (node.typeId === "primitive:string.length") {
@@ -376,7 +418,11 @@ class AutomationRuntime {
       if (typeof value !== "string") {
         throw new Error(`Node ${node.id} requires a string value.`);
       }
-      return JSON.parse(value) as Record<string, unknown>;
+      const parsed = JSON.parse(value) as unknown;
+      if (isPlainObject(parsed)) {
+        return parsed;
+      }
+      throw new Error(`Node ${node.id} requires a JSON object.`);
     }
     throw new Error(`Node ${node.id} does not produce data until it is executed.`);
   }
@@ -390,14 +436,20 @@ class AutomationRuntime {
         return stringify(value);
       }
       if (trimmed.startsWith("payload.")) {
-        return stringify(this.event.payload[trimmed.slice("payload.".length)]);
+        return stringify(pathValue(this.event.payload, trimmed.slice("payload.".length)));
       }
-      return stringify(node.config?.[trimmed] ?? this.variables.get(trimmed));
+      if (hasOwn(node.config, trimmed)) {
+        return stringify(node.config?.[trimmed]);
+      }
+      return stringify(this.variables.get(trimmed));
     });
   }
 
   private async renderFString(node: AutomationNode): Promise<string> {
     const template = typeof node.config?.template === "string" ? node.config.template : "Hello {value}";
+    if (template.length > AUTOMATION_FSTRING_TEMPLATE_MAX_CHARS) {
+      throw new Error(`Node ${node.id} f-string template exceeds ${AUTOMATION_FSTRING_TEMPLATE_MAX_CHARS} characters.`);
+    }
     const values = new Map<string, unknown>();
     for (const name of automationFStringInputNames(node.config)) {
       values.set(name, await this.optionalInputValue(node, name));
@@ -418,7 +470,7 @@ class AutomationRuntime {
   }
 
   private triggerOutputs(): Record<string, unknown> {
-    return { exec: true, payload: this.event.payload, ...this.event.payload };
+    return { ...this.event.payload, payload: this.event.payload };
   }
 
   private entry(node: AutomationNode): AutomationNodeCatalogEntry | undefined {
@@ -434,13 +486,39 @@ class AutomationRuntime {
     return entry;
   }
 
+  private assertHookSafetyAllowed(entry: AutomationNodeCatalogEntry, _nodeId: string): void {
+    if (automationSafetyAllowed(entry.safety, this.group.graph.allowedSafety)) {
+      return;
+    }
+    const safety = entry.safety ?? "unknown";
+    throw new Error(`${entry.title} requires ${safety} automation safety. Enable ${safety} for this graph before it can run.`);
+  }
+
   private guard(nodeId: string): void {
+    this.assertNotCancelled();
     this.steps += 1;
     if (this.steps > (this.options.maxSteps ?? 1000)) {
       throw new Error(`Automation step limit exceeded near node ${nodeId}.`);
     }
     if (Date.now() - this.startedAt > (this.options.maxDurationMs ?? 5 * 60 * 1000)) {
       throw new Error(`Automation duration limit exceeded near node ${nodeId}.`);
+    }
+  }
+
+  private assertNotCancelled(): void {
+    if (this.options.signal?.aborted) {
+      throw new AutomationCancelledError();
+    }
+  }
+
+  private invalidateCachedDataNodeOutputs(): void {
+    for (const [nodeId] of this.outputs) {
+      const node = this.nodesById.get(nodeId);
+      const entry = node ? this.entry(node) : undefined;
+      if (!entry || entry.kind === "trigger" || entry.inputs.some((port) => port.kind === "exec")) {
+        continue;
+      }
+      this.outputs.delete(nodeId);
     }
   }
 }
@@ -455,6 +533,10 @@ function requireConfigString(node: AutomationNode, key: string): string {
 
 function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function isPluginTargetTabPort(entry: AutomationNodeCatalogEntry, port: { automationRole?: string }): boolean {
+  return entry.kind === "function" && typeof entry.pluginId === "string" && port.automationRole === "pluginTargetTab";
 }
 
 function arrayValue(value: unknown, node: AutomationNode, key: string): unknown[] {
@@ -486,8 +568,42 @@ function numberValue(value: unknown, node: AutomationNode, key: string): number 
   return number;
 }
 
+function booleanValue(value: unknown, node: AutomationNode, key: string): boolean {
+  if (typeof value !== "boolean") {
+    throw new Error(`Node ${node.id} requires ${key} to be a boolean.`);
+  }
+  return value;
+}
+
 function textValue(value: unknown): string {
   return value === undefined || value === null ? "" : String(value);
+}
+
+function automationRegExp(patternValue: unknown, flagsValue: unknown, node: AutomationNode): RegExp {
+  const pattern = textValue(patternValue);
+  const flags = textValue(flagsValue);
+  if (pattern.length > AUTOMATION_REGEX_PATTERN_MAX_CHARS) {
+    throw new Error(`Node ${node.id} regular expression pattern exceeds ${AUTOMATION_REGEX_PATTERN_MAX_CHARS} characters.`);
+  }
+  let expression: RegExp;
+  try {
+    expression = new RegExp(pattern, flags);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Node ${node.id} has an invalid regular expression: ${message}`);
+  }
+  if (!safeRegex(expression, { limit: AUTOMATION_REGEX_REPEAT_LIMIT })) {
+    throw new Error(`Node ${node.id} regular expression is too complex and may cause excessive backtracking.`);
+  }
+  return expression;
+}
+
+function regexTextValue(value: unknown, node: AutomationNode, key: string): string {
+  const text = textValue(value);
+  if (text.length > AUTOMATION_REGEX_TEXT_MAX_CHARS) {
+    throw new Error(`Node ${node.id} ${key} exceeds ${AUTOMATION_REGEX_TEXT_MAX_CHARS} characters for regular expression matching.`);
+  }
+  return text;
 }
 
 interface FStringField {
@@ -499,16 +615,22 @@ interface FStringField {
 
 function renderFStringTemplate(template: string, resolve: (expression: string) => unknown): string {
   let result = "";
+  const append = (segment: string) => {
+    if (result.length + segment.length > AUTOMATION_FSTRING_OUTPUT_MAX_CHARS) {
+      throw new Error(`F-string output exceeds ${AUTOMATION_FSTRING_OUTPUT_MAX_CHARS} characters.`);
+    }
+    result += segment;
+  };
   for (let index = 0; index < template.length; index += 1) {
     const char = template[index];
     const next = template[index + 1];
     if (char === "{" && next === "{") {
-      result += "{";
+      append("{");
       index += 1;
       continue;
     }
     if (char === "}" && next === "}") {
-      result += "}";
+      append("}");
       index += 1;
       continue;
     }
@@ -516,7 +638,7 @@ function renderFStringTemplate(template: string, resolve: (expression: string) =
       throw new Error("F-string template contains an unmatched closing brace.");
     }
     if (char !== "{") {
-      result += char;
+      append(char);
       continue;
     }
     const close = template.indexOf("}", index + 1);
@@ -527,7 +649,7 @@ function renderFStringTemplate(template: string, resolve: (expression: string) =
     const field = parseFStringField(fieldText);
     const value = resolve(field.expression);
     const rendered = formatFStringValue(value, field.conversion, field.formatSpec);
-    result += field.debug ? `${field.expression}=${rendered}` : rendered;
+    append(field.debug ? `${field.expression}=${rendered}` : rendered);
     index = close;
   }
   return result;
@@ -570,8 +692,9 @@ function formatFStringValue(value: unknown, conversion?: FStringField["conversio
     return formatNumber(value, formatSpec);
   }
   if (/^\d*s?$/.test(formatSpec)) {
-    const width = Number.parseInt(formatSpec.replace(/s$/, ""), 10);
-    return Number.isFinite(width) && width > converted.length ? converted.padStart(width) : converted;
+    const widthText = formatSpec.replace(/s$/, "");
+    const width = widthText ? parseBoundedFormatInteger(widthText, "width", AUTOMATION_FSTRING_FORMAT_WIDTH_MAX) : undefined;
+    return width !== undefined && width > converted.length ? converted.padStart(width) : converted;
   }
   throw new Error(`Unsupported f-string format specifier: ${formatSpec}.`);
 }
@@ -581,8 +704,17 @@ function formatNumber(value: number, formatSpec: string): string {
   if (!match?.groups) {
     throw new Error(`Unsupported f-string format specifier: ${formatSpec}.`);
   }
-  const precision = match.groups.precision === undefined ? undefined : Number(match.groups.precision);
+  let precision =
+    match.groups.precision === undefined
+      ? undefined
+      : parseBoundedFormatInteger(match.groups.precision, "precision", AUTOMATION_FSTRING_FORMAT_PRECISION_MAX);
   const type = match.groups.type ?? "g";
+  if (type === "d" && precision !== undefined) {
+    throw new Error("F-string precision is not supported for d integer formats.");
+  }
+  if ((type === "g" || type === "G") && precision === 0) {
+    precision = 1;
+  }
   let rendered: string;
   if (type === "d") {
     rendered = String(Math.trunc(value));
@@ -597,13 +729,27 @@ function formatNumber(value: number, formatSpec: string): string {
       rendered = `${Number(whole).toLocaleString("en-US")}${fraction === undefined ? "" : `.${fraction}`}`;
     }
   }
-  const width = match.groups.width === undefined ? undefined : Number(match.groups.width);
+  const width =
+    match.groups.width === undefined
+      ? undefined
+      : parseBoundedFormatInteger(match.groups.width, "width", AUTOMATION_FSTRING_FORMAT_WIDTH_MAX);
   return width && width > rendered.length ? rendered.padStart(width) : rendered;
+}
+
+function parseBoundedFormatInteger(value: string, label: "precision" | "width", max: number): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error(`F-string format ${label} must be a non-negative integer.`);
+  }
+  if (parsed > max) {
+    throw new Error(`F-string format ${label} exceeds ${max}.`);
+  }
+  return parsed;
 }
 
 function pathValue(value: unknown, path: string): unknown {
   return path.split(".").filter(Boolean).reduce<unknown>((current, key) => {
-    if (current && typeof current === "object" && key in current) {
+    if (isSafePathPart(key) && hasOwn(current, key)) {
       return (current as Record<string, unknown>)[key];
     }
     return undefined;
@@ -615,9 +761,14 @@ function setPathValue(target: Record<string, unknown>, path: string, value: unkn
   if (parts.length === 0) {
     return;
   }
+  for (const part of parts) {
+    if (!isSafePathPart(part)) {
+      throw new Error(`Unsafe automation path segment: ${part}.`);
+    }
+  }
   let current = target;
   for (const part of parts.slice(0, -1)) {
-    const existing = current[part];
+    const existing = hasOwn(current, part) ? current[part] : undefined;
     if (!existing || typeof existing !== "object" || Array.isArray(existing)) {
       current[part] = {};
     }
@@ -641,6 +792,14 @@ function flattenObject(value: Record<string, unknown>, prefix = ""): Record<stri
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOwn(value: unknown, key: string): value is Record<string, unknown> {
+  return value !== null && (typeof value === "object" || typeof value === "function") && Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function isSafePathPart(part: string): boolean {
+  return part !== "__proto__" && part !== "prototype" && part !== "constructor";
 }
 
 function repr(value: unknown): string {

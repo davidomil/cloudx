@@ -46,7 +46,7 @@ export class TriggerRegistry {
     const trigger = this.get(triggerId);
     assertExposure(trigger, exposureForSource(source));
     assertSourceOwnsTrigger(trigger, source);
-    validateObjectSchema(trigger.payloadSchema, payload, trigger.id);
+    validateObjectSchema(trigger.payloadSchema, payload, trigger.id, "payload");
     const event: TriggerEvent = {
       id: randomUUID(),
       triggerId,

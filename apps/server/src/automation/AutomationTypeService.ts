@@ -1,4 +1,4 @@
-import type { AutomationType } from "@cloudx/shared";
+import { automationTypeAssignable, type AutomationType } from "@cloudx/shared";
 
 export const EXEC_TYPE: AutomationType = { kind: "exec" };
 export const UNKNOWN_TYPE: AutomationType = { kind: "unknown" };
@@ -12,6 +12,9 @@ export class AutomationTypeService {
   schemaToType(schema: Record<string, unknown> | undefined): AutomationType {
     if (!schema) {
       return UNKNOWN_TYPE;
+    }
+    if (Object.prototype.hasOwnProperty.call(schema, "const")) {
+      return this.valueToType(schema.const);
     }
     const rawType = schema.type;
     if (Array.isArray(rawType)) {
@@ -36,53 +39,43 @@ export class AutomationTypeService {
       };
     }
     if (Array.isArray(schema.enum)) {
-      const primitive = schema.enum.find((value) => value !== null);
-      if (typeof primitive === "string") {
-        return STRING_TYPE;
-      }
-      if (typeof primitive === "number") {
-        return NUMBER_TYPE;
-      }
-      if (typeof primitive === "boolean") {
-        return BOOLEAN_TYPE;
-      }
+      return unionType(schema.enum.map((value) => this.valueToType(value)));
+    }
+    return UNKNOWN_TYPE;
+  }
+
+  valueToType(value: unknown): AutomationType {
+    if (value === null) {
+      return { kind: "null" };
+    }
+    if (value === undefined) {
+      return UNKNOWN_TYPE;
+    }
+    if (typeof value === "string") {
+      return STRING_TYPE;
+    }
+    if (typeof value === "number") {
+      return Number.isFinite(value) ? NUMBER_TYPE : UNKNOWN_TYPE;
+    }
+    if (typeof value === "boolean") {
+      return BOOLEAN_TYPE;
+    }
+    if (Array.isArray(value)) {
+      return { kind: "array", items: unionType(value.map((item) => this.valueToType(item))) };
+    }
+    if (typeof value === "object") {
+      const entries = Object.entries(value as Record<string, unknown>);
+      return {
+        kind: "object",
+        properties: Object.fromEntries(entries.map(([key, child]) => [key, this.valueToType(child)])),
+        required: entries.map(([key]) => key)
+      };
     }
     return UNKNOWN_TYPE;
   }
 
   isAssignable(source: AutomationType, target: AutomationType): boolean {
-    if (target.kind === "unknown" || source.kind === "never") {
-      return true;
-    }
-    if (source.kind === "unknown") {
-      return false;
-    }
-    if (source.kind === "union") {
-      return (source.options ?? []).every((option) => this.isAssignable(option, target));
-    }
-    if (target.kind === "union") {
-      return (target.options ?? []).some((option) => this.isAssignable(source, option));
-    }
-    if (source.kind !== target.kind) {
-      return false;
-    }
-    if (source.kind === "array" && target.kind === "array") {
-      return this.isAssignable(source.items ?? UNKNOWN_TYPE, target.items ?? UNKNOWN_TYPE);
-    }
-    if (source.kind === "object" && target.kind === "object") {
-      const sourceProperties = source.properties ?? {};
-      const targetProperties = target.properties ?? {};
-      for (const required of target.required ?? []) {
-        if (!sourceProperties[required]) {
-          return false;
-        }
-      }
-      return Object.entries(targetProperties).every(([key, targetType]) => {
-        const sourceType = sourceProperties[key];
-        return !sourceType || this.isAssignable(sourceType, targetType);
-      });
-    }
-    return true;
+    return automationTypeAssignable(source, target);
   }
 
   format(type: AutomationType): string {
@@ -94,6 +87,14 @@ export class AutomationTypeService {
     }
     return type.kind;
   }
+}
+
+function unionType(types: AutomationType[]): AutomationType {
+  const unique = Array.from(new Map(types.map((type) => [JSON.stringify(type), type])).values());
+  if (unique.length === 0) {
+    return { kind: "never" };
+  }
+  return unique.length === 1 ? unique[0]! : { kind: "union", options: unique };
 }
 
 function recordOrUndefined(value: unknown): Record<string, unknown> | undefined {

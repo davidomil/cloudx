@@ -1,7 +1,8 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 
 import type { HookDefinition } from "@cloudx/plugin-api";
-import { RULES_SKILLS_PLUGIN_ID, type PluginMetadataMap, type WorkspaceTab } from "@cloudx/shared";
+import { RULES_SKILLS_PLUGIN_ID, type PluginMetadataMap, type WorkspaceLayoutInstruction, type WorkspaceTab, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
 
 import type { PathPolicy } from "../pathPolicy.js";
 import type { PluginRegistry } from "../pluginRegistry.js";
@@ -53,6 +54,21 @@ const LAYOUT_INSTRUCTION_SCHEMA = {
   additionalProperties: true
 } as const;
 
+const AUTOMATION_EFFECTS_SCHEMA = {
+  type: "array",
+  description: "Explicit automation side effects derived from this hook result.",
+  "x-cloudx-connectable": false,
+  items: { type: "object", additionalProperties: true }
+} as const;
+
+const SHELL_TERMINATION_GRACE_MS = 1_000;
+const SHELL_COMMAND_MAX_CHARS = 8_192;
+const SHELL_COMMAND_DEFAULT_TIMEOUT_MS = 60_000;
+const SHELL_COMMAND_MAX_TIMEOUT_MS = 5 * 60 * 1000;
+const SHELL_COMMAND_DEFAULT_OUTPUT_BYTES = 64 * 1024;
+const SHELL_COMMAND_MIN_OUTPUT_BYTES = 1024;
+const SHELL_COMMAND_MAX_OUTPUT_BYTES = 1024 * 1024;
+
 export function registerCoreHooks(hooks: HookRegistry, services: CoreHookServices): void {
   for (const hook of coreHooks(services)) {
     hooks.register(hook);
@@ -94,18 +110,21 @@ function coreHooks({ sessions, plugins, pathPolicy, workspace }: CoreHookService
         properties: {
           tab: WORKSPACE_TAB_SCHEMA,
           activeTabId: { type: "string", description: "Created tab id, also selected as the active tab." },
-          layoutInstruction: LAYOUT_INSTRUCTION_SCHEMA
+          layoutInstruction: LAYOUT_INSTRUCTION_SCHEMA,
+          automationEffects: AUTOMATION_EFFECTS_SCHEMA
         },
         additionalProperties: false
       },
       async execute(input) {
         const pluginId = requireString(input.pluginId, "pluginId");
         const targetPlugin = plugins.get(pluginId);
+        const windowId = optionalString(input.windowId, "windowId") ?? workspace.getActiveWindow().id;
+        const targetWindow = workspace.getWindow(windowId);
         const cwd =
           typeof input.cwd === "string" && input.cwd.trim()
             ? normalizeVoiceCwd(input.cwd)
             : targetPlugin.requiresDirectory
-              ? defaultCreateTabCwdExpression(sessions, pathPolicy)
+              ? defaultCreateTabCwdExpression(sessions, pathPolicy, targetWindow)
               : undefined;
         const tab = await sessions.createTab({
           pluginId,
@@ -113,19 +132,21 @@ function coreHooks({ sessions, plugins, pathPolicy, workspace }: CoreHookService
           title: optionalString(input.title, "title"),
           createDirectory: optionalBoolean(input.createDirectory, "createDirectory") ?? false,
           initialInput: optionalRecord(input.initialInput, "initialInput"),
-          windowId: optionalString(input.windowId, "windowId"),
+          windowId,
           pluginMetadata: mergeTemplateMetadata(optionalPluginMetadata(input.pluginMetadata, "pluginMetadata"), optionalString(input.templateId, "templateId"))
         });
-        return {
+        const layoutInstruction: WorkspaceLayoutInstruction = {
+          type: input.newPane === true ? "open_tab_in_new_pane" : "add_tab_to_active_pane",
+          tabId: tab.id,
+          windowId,
+          paneId: optionalString(input.paneId, "paneId"),
+          splitDirection: input.splitDirection === "column" ? "column" : "row"
+        };
+        return withLayoutAutomationEffect({
           tab,
           activeTabId: tab.id,
-          layoutInstruction: {
-            type: input.newPane === true ? "open_tab_in_new_pane" : "add_tab_to_active_pane",
-            tabId: tab.id,
-            paneId: optionalString(input.paneId, "paneId"),
-            splitDirection: input.splitDirection === "column" ? "column" : "row"
-          }
-        };
+          layoutInstruction
+        }, layoutInstruction);
       }
     },
     {
@@ -183,7 +204,7 @@ function coreHooks({ sessions, plugins, pathPolicy, workspace }: CoreHookService
         additionalProperties: false
       },
       execute(input) {
-        sessions.closeTab(requireString(input.tabId, "tabId"), { stopSession: optionalBoolean(input.stopSession, "stopSession") });
+        sessions.closeTab(requireString(input.tabId, "tabId"), { stopSession: optionalBoolean(input.stopSession, "stopSession") ?? false });
         return { ok: true, activeTabId: sessions.getActiveTabId(), reason: optionalString(input.reason, "reason") };
       }
     },
@@ -274,12 +295,14 @@ function coreHooks({ sessions, plugins, pathPolicy, workspace }: CoreHookService
       outputSchema: {
         type: "object",
         properties: {
-          layoutInstruction: LAYOUT_INSTRUCTION_SCHEMA
+          layoutInstruction: LAYOUT_INSTRUCTION_SCHEMA,
+          automationEffects: AUTOMATION_EFFECTS_SCHEMA
         },
         additionalProperties: false
       },
       execute(input) {
-        return { layoutInstruction: { type: "select_pane", paneId: requireString(input.paneId, "paneId") } };
+        const layoutInstruction: WorkspaceLayoutInstruction = { type: "select_pane", paneId: requireString(input.paneId, "paneId") };
+        return withLayoutAutomationEffect({ layoutInstruction }, layoutInstruction);
       }
     },
     {
@@ -299,18 +322,18 @@ function coreHooks({ sessions, plugins, pathPolicy, workspace }: CoreHookService
       outputSchema: {
         type: "object",
         properties: {
-          layoutInstruction: LAYOUT_INSTRUCTION_SCHEMA
+          layoutInstruction: LAYOUT_INSTRUCTION_SCHEMA,
+          automationEffects: AUTOMATION_EFFECTS_SCHEMA
         },
         additionalProperties: false
       },
       execute(input) {
-        return {
-          layoutInstruction: {
-            type: "split_pane",
-            paneId: optionalString(input.paneId, "paneId"),
-            splitDirection: input.splitDirection === "column" ? "column" : "row"
-          }
+        const layoutInstruction: WorkspaceLayoutInstruction = {
+          type: "split_pane",
+          paneId: optionalString(input.paneId, "paneId"),
+          splitDirection: input.splitDirection === "column" ? "column" : "row"
         };
+        return withLayoutAutomationEffect({ layoutInstruction }, layoutInstruction);
       }
     },
     {
@@ -333,21 +356,25 @@ function coreHooks({ sessions, plugins, pathPolicy, workspace }: CoreHookService
         properties: {
           activeWindowId: { type: "string", description: "Activated workspace window id." },
           window: WORKSPACE_WINDOW_SCHEMA,
-          layoutInstruction: LAYOUT_INSTRUCTION_SCHEMA
+          layoutInstruction: LAYOUT_INSTRUCTION_SCHEMA,
+          automationEffects: AUTOMATION_EFFECTS_SCHEMA
         },
         additionalProperties: false
       },
-      async execute(input) {
+      async execute(input, context) {
         const window = await findWindowForSwitch(input, sessions, workspace);
-        await workspace.selectWindow(window.id);
-        return {
+        const layoutInstruction: WorkspaceLayoutInstruction = {
+          type: "select_window",
+          windowId: window.id
+        };
+        if (context.caller.kind !== "automation") {
+          await workspace.selectWindow(window.id);
+        }
+        return withLayoutAutomationEffect({
           activeWindowId: window.id,
           window,
-          layoutInstruction: {
-            type: "select_window",
-            windowId: window.id
-          }
-        };
+          layoutInstruction
+        }, layoutInstruction);
       }
     },
     {
@@ -457,7 +484,7 @@ function coreHooks({ sessions, plugins, pathPolicy, workspace }: CoreHookService
         try {
           for (const templateTab of prepared.template.tabs) {
             const tabInput = workspace.tabInputForTemplate(templateTab, prepared.projectPath);
-            const tab = await sessions.createTab({ pluginId: tabInput.pluginId, cwd: tabInput.cwd, title: tabInput.title, initialInput: tabInput.initialInput });
+            const tab = await sessions.createTab({ pluginId: tabInput.pluginId, cwd: tabInput.cwd, title: tabInput.title, initialInput: tabInput.initialInput, windowId: prepared.window.id });
             tabIdMap.set(templateTab.id, tab.id);
             createdTabIds.push(tab.id);
           }
@@ -492,10 +519,10 @@ function coreHooks({ sessions, plugins, pathPolicy, workspace }: CoreHookService
       inputSchema: {
         type: "object",
         properties: {
-          command: { type: "string", description: "Shell command run through /bin/sh -lc." },
+          command: { type: "string", maxLength: SHELL_COMMAND_MAX_CHARS, description: "Shell command run through the platform shell." },
           cwd: { type: "string", description: "Working directory. Empty uses the active tab or default workspace directory." },
-          timeoutMs: { type: "number", description: "Command timeout in milliseconds.", default: 60000 },
-          maxOutputBytes: { type: "number", description: "Maximum stdout/stderr bytes retained per stream.", default: 65536 }
+          timeoutMs: { type: "integer", minimum: 1, maximum: SHELL_COMMAND_MAX_TIMEOUT_MS, description: "Command timeout in milliseconds.", default: SHELL_COMMAND_DEFAULT_TIMEOUT_MS },
+          maxOutputBytes: { type: "integer", minimum: SHELL_COMMAND_MIN_OUTPUT_BYTES, maximum: SHELL_COMMAND_MAX_OUTPUT_BYTES, description: "Maximum stdout/stderr bytes retained per stream.", default: SHELL_COMMAND_DEFAULT_OUTPUT_BYTES }
         },
         required: ["command"],
         additionalProperties: false
@@ -505,20 +532,21 @@ function coreHooks({ sessions, plugins, pathPolicy, workspace }: CoreHookService
         properties: {
           command: { type: "string", description: "Shell command that was run." },
           cwd: { type: "string", description: "Working directory used for the command." },
-          exitCode: { type: "number", description: "Process exit code, when available." },
-          signal: { type: "string", description: "Process signal, when available." },
+          exitCode: { type: ["number", "null"], description: "Process exit code, when available." },
+          signal: { type: ["string", "null"], description: "Process signal, when available." },
           timedOut: { type: "boolean", description: "True when the process exceeded the timeout." },
           stdout: { type: "string", description: "Captured standard output." },
           stderr: { type: "string", description: "Captured standard error." }
         },
         additionalProperties: false
       },
-      async execute(input) {
+      async execute(input, context) {
         const command = requireString(input.command, "command");
         const cwd = await pathPolicy.ensureDirectory(optionalString(input.cwd, "cwd") ?? defaultCreateTabCwdExpression(sessions, pathPolicy), false);
         return runShellCommand(command, cwd, {
-          timeoutMs: optionalNumber(input.timeoutMs, "timeoutMs") ?? 60_000,
-          maxOutputBytes: optionalNumber(input.maxOutputBytes, "maxOutputBytes") ?? 64 * 1024
+          timeoutMs: optionalBoundedInteger(input.timeoutMs, "timeoutMs", 1, SHELL_COMMAND_MAX_TIMEOUT_MS) ?? SHELL_COMMAND_DEFAULT_TIMEOUT_MS,
+          maxOutputBytes: optionalBoundedInteger(input.maxOutputBytes, "maxOutputBytes", SHELL_COMMAND_MIN_OUTPUT_BYTES, SHELL_COMMAND_MAX_OUTPUT_BYTES) ?? SHELL_COMMAND_DEFAULT_OUTPUT_BYTES,
+          signal: context.signal
         });
       }
     },
@@ -545,18 +573,18 @@ function coreHooks({ sessions, plugins, pathPolicy, workspace }: CoreHookService
             description: "Client UI instruction object.",
             "x-cloudx-connectable": false,
             additionalProperties: true
-          }
+          },
+          automationEffects: AUTOMATION_EFFECTS_SCHEMA
         },
         additionalProperties: false
       },
       execute(input) {
-        return {
-          uiInstruction: {
-            type: "open_tab_settings",
-            tabId: requireString(input.tabId, "tabId"),
-            sectionId: optionalString(input.sectionId, "sectionId")
-          }
+        const uiInstruction: WorkspaceUiInstruction = {
+          type: "open_tab_settings",
+          tabId: requireString(input.tabId, "tabId"),
+          sectionId: optionalString(input.sectionId, "sectionId")
         };
+        return withUiAutomationEffect({ uiInstruction }, uiInstruction);
       }
     }
   ];
@@ -597,7 +625,10 @@ async function findWindowForSwitch(input: Record<string, unknown>, sessions: Ses
   throw new Error("Window switch requires windowId, title, or context.");
 }
 
-function defaultCreateTabCwdExpression(sessions: SessionStore, pathPolicy: PathPolicy): string {
+function defaultCreateTabCwdExpression(sessions: SessionStore, pathPolicy: PathPolicy, window?: WorkspaceWindow): string {
+  if (window?.defaultCwd) {
+    return window.defaultCwd;
+  }
   const activeTabId = sessions.getActiveTabId();
   if (activeTabId) {
     const activeTab = sessions.listTabs().find((tab) => tab.id === activeTabId);
@@ -643,12 +674,12 @@ function optionalBoolean(value: unknown, name: string): boolean | undefined {
   return value;
 }
 
-function optionalNumber(value: unknown, name: string): number | undefined {
+function optionalBoundedInteger(value: unknown, name: string, min: number, max: number): number | undefined {
   if (value === undefined) {
     return undefined;
   }
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new Error(`${name} must be a finite number.`);
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be an integer from ${min} to ${max}.`);
   }
   return value;
 }
@@ -704,35 +735,87 @@ function requireIndicatorColor(value: unknown): WorkspaceTab["indicator"]["color
   throw new Error("indicator.color must be green, yellow, or red.");
 }
 
-function runShellCommand(command: string, cwd: string, options: { timeoutMs: number; maxOutputBytes: number }): Promise<Record<string, unknown>> {
-  const timeoutMs = Math.max(1, Math.min(options.timeoutMs, 5 * 60 * 1000));
-  const maxOutputBytes = Math.max(1024, Math.min(options.maxOutputBytes, 1024 * 1024));
+function withLayoutAutomationEffect<T extends Record<string, unknown>>(result: T, instruction: WorkspaceLayoutInstruction): T & { automationEffects: Array<{ type: "workspace.layout"; instruction: WorkspaceLayoutInstruction }> } {
+  return {
+    ...result,
+    automationEffects: [{ type: "workspace.layout", instruction }]
+  };
+}
+
+function withUiAutomationEffect<T extends Record<string, unknown>>(result: T, instruction: WorkspaceUiInstruction): T & { automationEffects: Array<{ type: "workspace.ui"; instruction: WorkspaceUiInstruction }> } {
+  return {
+    ...result,
+    automationEffects: [{ type: "workspace.ui", instruction }]
+  };
+}
+
+function runShellCommand(command: string, cwd: string, options: { timeoutMs: number; maxOutputBytes: number; signal?: AbortSignal }): Promise<Record<string, unknown>> {
+  const timeoutMs = optionalBoundedInteger(options.timeoutMs, "timeoutMs", 1, SHELL_COMMAND_MAX_TIMEOUT_MS) ?? SHELL_COMMAND_DEFAULT_TIMEOUT_MS;
+  const maxOutputBytes = optionalBoundedInteger(options.maxOutputBytes, "maxOutputBytes", SHELL_COMMAND_MIN_OUTPUT_BYTES, SHELL_COMMAND_MAX_OUTPUT_BYTES) ?? SHELL_COMMAND_DEFAULT_OUTPUT_BYTES;
   return new Promise((resolve, reject) => {
-    const child = spawn("/bin/sh", ["-lc", command], {
+    if (options.signal?.aborted) {
+      reject(new Error("Shell command was cancelled."));
+      return;
+    }
+    const launch = shellCommandLaunch(command);
+    const child = spawn(launch.command, launch.args, {
       cwd,
       env: shellCommandEnv(process.env),
+      detached: process.platform !== "win32",
+      windowsHide: launch.windowsHide,
       stdio: ["ignore", "pipe", "pipe"]
     });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
-    const append = (current: string, chunk: Buffer) => trimOutput(`${current}${chunk.toString("utf8")}`, maxOutputBytes);
+    let cancelled = false;
+    let forceKillTimer: NodeJS.Timeout | undefined;
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+    const appendDecoded = (current: string, chunk: Buffer, decoder: StringDecoder) => trimOutput(`${current}${decoder.write(chunk)}`, maxOutputBytes);
+    const clearForceKillTimer = () => {
+      if (forceKillTimer) {
+        clearTimeout(forceKillTimer);
+        forceKillTimer = undefined;
+      }
+    };
+    const terminate = (signal: NodeJS.Signals) => {
+      terminateShellProcess(child, signal);
+      if (signal === "SIGTERM" && !forceKillTimer) {
+        forceKillTimer = setTimeout(() => terminateShellProcess(child, "SIGKILL"), SHELL_TERMINATION_GRACE_MS);
+      }
+    };
+    const abort = () => {
+      cancelled = true;
+      terminate("SIGTERM");
+    };
+    options.signal?.addEventListener("abort", abort, { once: true });
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
+      terminate("SIGTERM");
     }, timeoutMs);
     child.stdout.on("data", (chunk: Buffer) => {
-      stdout = append(stdout, chunk);
+      stdout = appendDecoded(stdout, chunk, stdoutDecoder);
     });
     child.stderr.on("data", (chunk: Buffer) => {
-      stderr = append(stderr, chunk);
+      stderr = appendDecoded(stderr, chunk, stderrDecoder);
     });
     child.on("error", (error) => {
       clearTimeout(timer);
+      clearForceKillTimer();
+      options.signal?.removeEventListener("abort", abort);
       reject(error);
     });
     child.on("close", (code, signal) => {
       clearTimeout(timer);
+      clearForceKillTimer();
+      options.signal?.removeEventListener("abort", abort);
+      stdout = trimOutput(`${stdout}${stdoutDecoder.end()}`, maxOutputBytes);
+      stderr = trimOutput(`${stderr}${stderrDecoder.end()}`, maxOutputBytes);
+      if (cancelled) {
+        reject(new Error("Shell command was cancelled."));
+        return;
+      }
       resolve({
         command,
         cwd,
@@ -746,6 +829,31 @@ function runShellCommand(command: string, cwd: string, options: { timeoutMs: num
   });
 }
 
+function terminateShellProcess(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (process.platform !== "win32" && child.pid) {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch (error) {
+      if (isNoSuchProcess(error)) {
+        return;
+      }
+    }
+  }
+  child.kill(signal);
+}
+
+export function shellCommandLaunch(command: string, env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): { command: string; args: string[]; windowsHide?: boolean } {
+  if (platform === "win32") {
+    return {
+      command: env.ComSpec || env.COMSPEC || "cmd.exe",
+      args: ["/d", "/s", "/c", command],
+      windowsHide: true
+    };
+  }
+  return { command: "/bin/sh", args: ["-lc", command] };
+}
+
 function shellCommandEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return {
     HOME: env.HOME,
@@ -757,9 +865,22 @@ function shellCommandEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   };
 }
 
+function isNoSuchProcess(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && (error as { code?: string }).code === "ESRCH";
+}
+
 function trimOutput(value: string, maxBytes: number): string {
   if (Buffer.byteLength(value, "utf8") <= maxBytes) {
     return value;
   }
-  return Buffer.from(value, "utf8").subarray(-maxBytes).toString("utf8");
+  const bytes = Buffer.from(value, "utf8");
+  let start = bytes.length - maxBytes;
+  while (start < bytes.length && isUtf8ContinuationByte(bytes[start]!)) {
+    start += 1;
+  }
+  return bytes.subarray(start).toString("utf8");
+}
+
+function isUtf8ContinuationByte(byte: number): boolean {
+  return (byte & 0b1100_0000) === 0b1000_0000;
 }
