@@ -124,6 +124,18 @@
   box-sizing: border-box;
 }
 
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 html,
 body,
 #root {
@@ -1559,7 +1571,12 @@ a:hover svg {
   flex: 1 1 auto;
   color: var(--color-muted-foreground);
   font-size: 10px;
+  line-height: 1.25;
   letter-spacing: 0;
+  overflow: visible;
+  text-overflow: clip;
+  text-transform: none;
+  white-space: normal;
 }
 
 .automation-save-state {
@@ -1975,6 +1992,22 @@ a:hover svg {
   color: var(--automation-palette-button-hover-foreground);
   background: var(--automation-palette-button-hover-background);
   border-color: var(--automation-palette-button-hover-border);
+}
+
+.automation-palette-entry-external {
+  box-shadow: inset 3px 0 0 var(--color-warning);
+}
+
+.automation-palette button.automation-palette-entry-external small {
+  color: var(--color-warning);
+}
+
+.automation-palette-entry-destructive {
+  box-shadow: inset 3px 0 0 var(--color-destructive);
+}
+
+.automation-palette button.automation-palette-entry-destructive small {
+  color: var(--color-destructive);
 }
 
 .automation-inspector {

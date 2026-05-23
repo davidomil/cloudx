@@ -7,6 +7,8 @@ import {
   automationMiniMapTheme,
   automationAllowedSafetyWithToggle,
   automationGraphFromPanelState,
+  automationPaletteEntryMetaText,
+  automationSafetyToggleCopy,
   connectionPlanForEntry,
   compatibilityFromConnectionState,
   defaultConfigForEntry,
@@ -109,6 +111,38 @@ describe("AutomationPanel helpers", () => {
     expect(defaultSafetyGraph.variables).toEqual(group.graph.variables);
     expect(defaultSafetyGraph.edges).toEqual(group.graph.edges);
     expect(automationGraphFromPanelState(flow.nodes, flow.edges, group.graph, ["read", "write", "external"]).allowedSafety).toEqual(["read", "write", "external"]);
+  });
+
+  it("explains external and destructive safety toggles", () => {
+    expect(automationSafetyToggleCopy("external", false)).toMatchObject({
+      actionLabel: "Allow external automation hooks",
+      status: expect.stringContaining("blocked in this graph"),
+      title: expect.stringContaining("shell commands")
+    });
+    expect(automationSafetyToggleCopy("destructive", true)).toMatchObject({
+      actionLabel: "Disallow destructive automation hooks",
+      status: expect.stringContaining("allowed in this graph"),
+      title: expect.stringContaining("stopping a running terminal process")
+    });
+  });
+
+  it("labels unsafe palette entries in the node picker metadata", () => {
+    expect(automationPaletteEntryMetaText({ ...paletteEntries()[0]!, safety: "external" })).toBe("function - External hook");
+    expect(automationPaletteEntryMetaText({ ...paletteEntries()[0]!, safety: "destructive" })).toBe("function - Destructive hook");
+    expect(automationPaletteEntryMetaText(paletteEntries()[0]!)).toBe("function");
+    expect(
+      automationPaletteEntryMetaText(
+        { ...paletteEntries()[0]!, safety: "external" },
+        {
+          direction: "from-origin",
+          entryPortId: "message",
+          entryPortKind: "data",
+          converter: paletteEntries()[4]!,
+          converterInputPortId: "text",
+          converterOutputPortId: "number"
+        }
+      )
+    ).toBe("function via String To Number - External hook");
   });
 
   it("compares missing safety policy using the server default policy semantics", () => {

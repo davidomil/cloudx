@@ -149,6 +149,20 @@ const PALETTE_MAX_HEIGHT = 420;
 const SEARCH_PALETTE_GAP = 8;
 const CONNECTED_NODE_SPACING = 230;
 
+type AutomationSafetyToggle = Extract<AutomationSafety, "external" | "destructive">;
+
+interface AutomationSafetyToggleCopy {
+  actionLabel: string;
+  description: string;
+  status: string;
+  title: string;
+}
+
+const AUTOMATION_SAFETY_EXPLANATIONS: Record<AutomationSafetyToggle, string> = {
+  external: "External hooks can run shell commands, send terminal input, submit voice requests, fetch Git refs, or otherwise reach outside the automation graph.",
+  destructive: "Destructive hooks can stop or remove active workspace state; current examples include stopping a running terminal process."
+};
+
 export const automationMiniMapTheme = {
   bgColor: "var(--automation-minimap-background)",
   maskColor: "var(--automation-minimap-mask)",
@@ -216,9 +230,13 @@ function AutomationPanelInner({ tab, liveRuns }: AutomationPanelProps) {
   );
   const externalSafetyAllowed = automationSafetyEnabled(allowedSafety, "external");
   const destructiveSafetyAllowed = automationSafetyEnabled(allowedSafety, "destructive");
-  const updateSafetyPolicy = useCallback((safety: AutomationSafety, enabled: boolean) => {
+  const externalSafetyCopy = automationSafetyToggleCopy("external", externalSafetyAllowed);
+  const destructiveSafetyCopy = automationSafetyToggleCopy("destructive", destructiveSafetyAllowed);
+  const externalSafetyDescriptionId = useId();
+  const destructiveSafetyDescriptionId = useId();
+  const updateSafetyPolicy = useCallback((safety: AutomationSafetyToggle, enabled: boolean) => {
     setAllowedSafety((current) => automationAllowedSafetyWithToggle(current, safety, enabled));
-    setStatus(enabled ? `${automationSafetyLabel(safety)} automation hooks allowed.` : `${automationSafetyLabel(safety)} automation hooks require explicit graph opt-in.`);
+    setStatus(automationSafetyToggleCopy(safety, enabled).status);
   }, []);
 
   useEffect(() => {
@@ -648,24 +666,36 @@ function AutomationPanelInner({ tab, liveRuns }: AutomationPanelProps) {
           ) : null}
           <ControlButton
             className={`icon-button automation-safety-toggle ${externalSafetyAllowed ? "active" : ""}`}
-            title={externalSafetyAllowed ? "Disallow external automation hooks" : "Allow external automation hooks"}
-            aria-label={externalSafetyAllowed ? "Disallow external automation hooks" : "Allow external automation hooks"}
+            title={externalSafetyCopy.title}
+            aria-label={externalSafetyCopy.actionLabel}
+            aria-describedby={externalSafetyDescriptionId}
             aria-pressed={externalSafetyAllowed}
             disabled={!selectedGroup}
+            onFocus={() => setStatus(externalSafetyCopy.status)}
+            onMouseEnter={() => setStatus(externalSafetyCopy.status)}
             onClick={() => updateSafetyPolicy("external", !externalSafetyAllowed)}
           >
             <ShieldAlert size={16} />
           </ControlButton>
           <ControlButton
             className={`icon-button automation-safety-toggle destructive ${destructiveSafetyAllowed ? "active" : ""}`}
-            title={destructiveSafetyAllowed ? "Disallow destructive automation hooks" : "Allow destructive automation hooks"}
-            aria-label={destructiveSafetyAllowed ? "Disallow destructive automation hooks" : "Allow destructive automation hooks"}
+            title={destructiveSafetyCopy.title}
+            aria-label={destructiveSafetyCopy.actionLabel}
+            aria-describedby={destructiveSafetyDescriptionId}
             aria-pressed={destructiveSafetyAllowed}
             disabled={!selectedGroup}
+            onFocus={() => setStatus(destructiveSafetyCopy.status)}
+            onMouseEnter={() => setStatus(destructiveSafetyCopy.status)}
             onClick={() => updateSafetyPolicy("destructive", !destructiveSafetyAllowed)}
           >
             <Trash2 size={16} />
           </ControlButton>
+          <span id={externalSafetyDescriptionId} className="visually-hidden">
+            {externalSafetyCopy.description}
+          </span>
+          <span id={destructiveSafetyDescriptionId} className="visually-hidden">
+            {destructiveSafetyCopy.description}
+          </span>
           {selectedGroup ? <span className={`automation-save-state ${hasUnsavedChanges ? "dirty" : "saved"}`}>{hasUnsavedChanges ? "Unsaved" : "Saved"}</span> : null}
           <div className="automation-search">
             <Search size={14} />
@@ -687,7 +717,9 @@ function AutomationPanelInner({ tab, liveRuns }: AutomationPanelProps) {
               aria-expanded={Boolean(palette && !palette.compatibility)}
             />
           </div>
-          <span className="automation-status">{status}</span>
+          <span className="automation-status" role="status">
+            {status}
+          </span>
         </div>
 
         <div
@@ -769,10 +801,11 @@ function AutomationPanelInner({ tab, liveRuns }: AutomationPanelProps) {
                     </div>
                     {group.entries.map((entry) => {
                       const plan = palette.compatibility ? connectionPlanForEntry(entry, palette.compatibility, catalog.nodes, edges) : undefined;
+                      const safety = automationPaletteEntrySafety(entry);
                       return (
-                        <button key={entry.typeId} onClick={() => addNode(entry)}>
+                        <button key={entry.typeId} className={automationPaletteEntryClassName(safety)} onClick={() => addNode(entry)}>
                           <span>{entry.title}</span>
-                          <small>{plan?.converter ? `${entry.kind} via ${plan.converter.title}` : entry.kind}</small>
+                          <small>{automationPaletteEntryMetaText(entry, plan)}</small>
                         </button>
                       );
                     })}
@@ -867,6 +900,34 @@ export function automationAllowedSafetyWithToggle(allowedSafety: AutomationSafet
   }
   const ordered = AUTOMATION_SAFETY_ORDER.filter((candidate) => next.has(candidate));
   return automationSafetyMatchesDefault(ordered) ? undefined : ordered;
+}
+
+export function automationSafetyToggleCopy(safety: AutomationSafetyToggle, allowed: boolean): AutomationSafetyToggleCopy {
+  const actionLabel = `${allowed ? "Disallow" : "Allow"} ${safety} automation hooks`;
+  const description = AUTOMATION_SAFETY_EXPLANATIONS[safety];
+  return {
+    actionLabel,
+    description,
+    status: `${automationSafetyLabel(safety)} automation hooks are ${allowed ? "allowed in this graph" : "blocked in this graph"}. ${description}`,
+    title: `${actionLabel}. ${description}`
+  };
+}
+
+export function automationPaletteEntryMetaText(entry: AutomationNodeCatalogEntry, plan?: PaletteConnectionPlan): string {
+  return [plan?.converter ? `${entry.kind} via ${plan.converter.title}` : entry.kind, automationPaletteEntrySafetyLabel(entry)].filter(Boolean).join(" - ");
+}
+
+function automationPaletteEntrySafety(entry: AutomationNodeCatalogEntry): AutomationSafetyToggle | undefined {
+  return entry.safety === "external" || entry.safety === "destructive" ? entry.safety : undefined;
+}
+
+function automationPaletteEntrySafetyLabel(entry: AutomationNodeCatalogEntry): string | undefined {
+  const safety = automationPaletteEntrySafety(entry);
+  return safety ? `${automationSafetyLabel(safety)} hook` : undefined;
+}
+
+function automationPaletteEntryClassName(safety: AutomationSafetyToggle | undefined): string {
+  return ["automation-palette-entry", safety ? `automation-palette-entry-${safety}` : ""].filter(Boolean).join(" ");
 }
 
 export function automationGraphFromPanelState(nodes: FlowNode[], edges: FlowEdge[], baseGraph: AutomationGroup["graph"], allowedSafety: AutomationSafety[] | undefined): AutomationGroup["graph"] {
