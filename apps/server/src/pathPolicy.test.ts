@@ -41,6 +41,61 @@ describe("PathPolicy", () => {
     expect(() => policy.resolve("/etc")).toThrow(/outside configured Cloudx roots/);
   });
 
+  it("treats a configured filesystem root as the parent of its descendants", () => {
+    const filesystemRoot = path.parse(os.tmpdir()).root;
+    const childPath = path.resolve(filesystemRoot, "cloudx-root-child");
+    const policy = new PathPolicy([filesystemRoot]);
+
+    expect(policy.isAllowed(childPath)).toBe(true);
+    expect(policy.resolve(childPath)).toBe(childPath);
+  });
+
+  it("rejects existing directories that escape allowed roots through symlinks", async () => {
+    const allowedRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-allowed-realpath-"));
+    const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-outside-realpath-"));
+    const linkPath = path.join(allowedRoot, "outside-link");
+    await fs.symlink(outsideRoot, linkPath, "dir");
+    const policy = new PathPolicy([allowedRoot]);
+
+    await expect(policy.ensureDirectory(linkPath, false)).rejects.toThrow(/resolves outside configured Cloudx roots/);
+  });
+
+  it("creates missing directories only after validating the nearest existing real path", async () => {
+    const allowedRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-create-realpath-"));
+    const policy = new PathPolicy([allowedRoot]);
+    const createdPath = path.join(allowedRoot, "project", "apps", "web");
+
+    await expect(policy.ensureDirectory(createdPath, true)).resolves.toBe(createdPath);
+    expect((await fs.stat(createdPath)).isDirectory()).toBe(true);
+  });
+
+  it("does not create directories through symlinked ancestors that escape allowed roots", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const allowedRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-create-link-"));
+    const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-create-link-outside-"));
+    const linkPath = path.join(allowedRoot, "outside-link");
+    await fs.symlink(outsideRoot, linkPath, "dir");
+    const policy = new PathPolicy([allowedRoot]);
+
+    await expect(policy.ensureDirectory(path.join(linkPath, "created-outside"), true)).rejects.toThrow(/resolves outside configured Cloudx roots/);
+    await expect(fs.readdir(outsideRoot)).resolves.toEqual([]);
+  });
+
+  it("does not suggest children from symlinked directories outside configured roots", async () => {
+    const allowedRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-allowed-realpath-options-"));
+    const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-outside-realpath-options-"));
+    await fs.mkdir(path.join(outsideRoot, "secret-project"));
+    const linkPath = path.join(allowedRoot, "outside-link");
+    await fs.symlink(outsideRoot, linkPath, "dir");
+    const policy = new PathPolicy([allowedRoot]);
+
+    const options = await policy.suggestDirectories(`${linkPath}/secret`);
+
+    expect(options.map((option) => option.detail ?? option.value)).not.toContain(path.join(outsideRoot, "secret-project"));
+  });
+
   it("rejects blank paths", () => {
     const policy = new PathPolicy(["~"], { homeDir: path.join(os.tmpdir(), "cloudx-home") });
 

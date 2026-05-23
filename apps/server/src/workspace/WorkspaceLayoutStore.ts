@@ -1,6 +1,4 @@
 import crypto from "node:crypto";
-import fs from "node:fs";
-import fsp from "node:fs/promises";
 import path from "node:path";
 
 import type {
@@ -15,15 +13,18 @@ import type {
   UpdateWorkspaceWindowRequest,
   PluginMetadataMap,
   PluginMetadataPatch,
+  WorkspaceLayoutInstruction,
   WorkspaceLayoutTemplate,
   WorkspaceLayoutTemplateTab,
   WorkspaceStateResponse,
   WorkspaceTab,
   WorkspaceWindow
 } from "@cloudx/shared";
-import { isRecord } from "@cloudx/shared";
+import { applyWorkspaceLayoutInstructionToTabLayout, firstTabLayoutPaneId, isRecord, isUsableTabLayoutState, listTabLayoutPanes, removeTabFromTabLayoutPanes } from "@cloudx/shared";
 
+import { relativeChildPath as relativePathWithin } from "../pathBoundary.js";
 import { PathPolicy } from "../pathPolicy.js";
+import { JsonStateFile } from "../jsonStateFile.js";
 
 interface StoredWorkspace {
   activeWindowId?: string;
@@ -44,7 +45,10 @@ interface PreparedTemplateWindow {
 }
 
 export class WorkspaceLayoutStore {
+  private static readonly writeQueues = new Map<string, Promise<void>>();
+
   readonly workspacePath: string;
+  private readonly workspaceFile: JsonStateFile;
   private activeWindowId: string;
   private windows: WorkspaceWindow[];
   private templates: WorkspaceLayoutTemplate[];
@@ -54,7 +58,8 @@ export class WorkspaceLayoutStore {
     dataDir: string,
     private readonly pathPolicy: PathPolicy
   ) {
-    this.workspacePath = path.join(dataDir, "workspace.json");
+    this.workspaceFile = new JsonStateFile(dataDir, "workspace.json", "Workspace layout");
+    this.workspacePath = this.workspaceFile.filePath;
     const loaded = this.loadStoredWorkspace();
     this.windows = loaded.windows;
     this.templates = loaded.templates;
@@ -92,8 +97,12 @@ export class WorkspaceLayoutStore {
     return this.getWindow(this.activeWindowId);
   }
 
+  findWindow(windowId: string): WorkspaceWindow | undefined {
+    return this.windows.find((candidate) => candidate.id === windowId);
+  }
+
   getWindow(windowId: string): WorkspaceWindow {
-    const window = this.windows.find((candidate) => candidate.id === windowId);
+    const window = this.findWindow(windowId);
     if (!window) {
       throw new Error(`Unknown workspace window: ${windowId}`);
     }
@@ -119,7 +128,7 @@ export class WorkspaceLayoutStore {
   }
 
   async updateWindow(windowId: string, input: UpdateWorkspaceWindowRequest): Promise<WorkspaceWindow> {
-    const current = this.getWindow(windowId);
+    this.getWindow(windowId);
     const patch: Partial<WorkspaceWindow> = {};
     if (input.name !== undefined) {
       patch.name = requireNonEmpty(input.name, "Window name");
@@ -128,11 +137,12 @@ export class WorkspaceLayoutStore {
       patch.defaultCwd = await this.resolveWindowCwd(input.defaultCwd);
     }
     if (input.layout !== undefined) {
-      if (!isLayoutState(input.layout)) {
+      if (!isUsableTabLayoutState(input.layout)) {
         throw new Error("Invalid workspace window layout.");
       }
       patch.layout = input.layout;
     }
+    const current = this.getWindow(windowId);
     if (input.pluginMetadata !== undefined) {
       patch.pluginMetadata = mergePluginMetadata(current.pluginMetadata, input.pluginMetadata);
     }
@@ -147,6 +157,48 @@ export class WorkspaceLayoutStore {
     this.activeWindowId = window.id;
     await this.persistAndEmit();
     return window;
+  }
+
+  async applyLayoutInstruction(instruction: WorkspaceLayoutInstruction): Promise<void> {
+    if (instruction.type === "select_window") {
+      const window = instruction.windowId ? this.findWindow(instruction.windowId) : undefined;
+      if (window) {
+        await this.selectWindow(window.id);
+      }
+      return;
+    }
+    const window = this.windowForLayoutInstruction(instruction);
+    if (!window) {
+      return;
+    }
+    const now = new Date().toISOString();
+    let duplicateTabRemoved = false;
+    const tabPlacement = isTabPlacementInstruction(instruction);
+    const windowsWithoutDuplicateTab = tabPlacement
+      ? this.windows.map((candidate) => {
+          if (candidate.id === window.id) {
+            return candidate;
+          }
+          const layout = removeTabFromTabLayoutPanes(candidate.layout, instruction.tabId);
+          if (layout === candidate.layout) {
+            return candidate;
+          }
+          duplicateTabRemoved = true;
+          return { ...candidate, layout, updatedAt: now };
+        })
+      : this.windows;
+    const currentWindow = windowsWithoutDuplicateTab.find((candidate) => candidate.id === window.id) ?? window;
+    const result = applyWorkspaceLayoutInstructionToTabLayout(currentWindow.layout, instruction, {
+      createPaneId: () => `pane-${crypto.randomUUID()}`,
+      createSplitId: () => `split-${crypto.randomUUID()}`
+    });
+    if (!result.applied && !duplicateTabRemoved) {
+      return;
+    }
+    const updated = { ...currentWindow, layout: result.layout, updatedAt: now };
+    this.windows = windowsWithoutDuplicateTab.map((candidate) => (candidate.id === updated.id ? updated : candidate));
+    this.activeWindowId = updated.id;
+    await this.persistAndEmit();
   }
 
   async deleteWindow(windowId: string): Promise<WorkspaceWindow> {
@@ -171,9 +223,11 @@ export class WorkspaceLayoutStore {
   }
 
   async createTemplate(input: CreateWorkspaceLayoutTemplateRequest, sources: TemplateTabSource[]): Promise<WorkspaceLayoutTemplate> {
-    const window = this.getWindow(input.windowId ?? this.activeWindowId);
+    const windowId = input.windowId ?? this.activeWindowId;
+    this.getWindow(windowId);
     const name = requireNonEmpty(input.name, "Template name");
     const basePath = await this.pathPolicy.ensureDirectory(input.basePath, false);
+    const window = this.getWindow(windowId);
     const sourcesById = new Map(sources.map((source) => [source.tab.id, source]));
     const tabs = uniqueStrings(listPanes(window.layout.root).flatMap((pane) => pane.tabIds))
       .map((tabId) => {
@@ -224,8 +278,9 @@ export class WorkspaceLayoutStore {
   }
 
   async prepareTemplateWindow(templateId: string, input: ApplyWorkspaceLayoutTemplateRequest): Promise<PreparedTemplateWindow> {
-    const template = this.getTemplate(templateId);
+    this.getTemplate(templateId);
     const projectPath = await this.pathPolicy.ensureDirectory(input.projectPath, false);
+    const template = this.getTemplate(templateId);
     const windowId = cleanName(input.windowId);
     if (windowId) {
       return { template, window: this.getWindow(windowId), projectPath, createdWindow: false };
@@ -253,7 +308,7 @@ export class WorkspaceLayoutStore {
   }
 
   tabInputForTemplate(templateTab: WorkspaceLayoutTemplateTab, projectPath: string): { pluginId: string; cwd?: string; title?: string; initialInput?: Record<string, unknown> } {
-    const cwd = templateTab.relativeCwd !== undefined ? path.join(projectPath, templateTab.relativeCwd) : templateTab.cwd;
+    const cwd = templateTab.relativeCwd !== undefined ? resolveTemplateRelativeCwd(projectPath, templateTab.relativeCwd) : templateTab.cwd;
     return {
       pluginId: templateTab.pluginId,
       cwd,
@@ -266,7 +321,7 @@ export class WorkspaceLayoutStore {
     const root = remapLayoutNode(template.layout.root, tabIdMap);
     return {
       root,
-      activePaneId: listPanes(root)[0]?.id ?? defaultLayout().activePaneId
+      activePaneId: firstTabLayoutPaneId(root) ?? defaultLayout().activePaneId
     };
   }
 
@@ -275,19 +330,32 @@ export class WorkspaceLayoutStore {
   }
 
   private loadStoredWorkspace(): { activeWindowId: string; windows: WorkspaceWindow[]; templates: WorkspaceLayoutTemplate[] } {
-    if (!fs.existsSync(this.workspacePath)) {
+    const parsed = this.readStoredWorkspace();
+    if (!parsed) {
       const window = this.createDefaultWindowSync();
       return { activeWindowId: window.id, windows: [window], templates: [] };
     }
-    const parsed = JSON.parse(fs.readFileSync(this.workspacePath, "utf8")) as StoredWorkspace;
-    const windows = (parsed.windows ?? []).map(readWindow).filter((window): window is WorkspaceWindow => Boolean(window));
-    const templates = (parsed.templates ?? []).map(readTemplate).filter((template): template is WorkspaceLayoutTemplate => Boolean(template));
+    const rawWindows = Array.isArray(parsed.windows) ? parsed.windows : [];
+    const rawTemplates = Array.isArray(parsed.templates) ? parsed.templates : [];
+    const windows = rawWindows.map(readWindow).filter((window): window is WorkspaceWindow => Boolean(window));
+    const templates = rawTemplates.map(readTemplate).filter((template): template is WorkspaceLayoutTemplate => Boolean(template));
     if (windows.length === 0) {
       const window = this.createDefaultWindowSync();
       return { activeWindowId: window.id, windows: [window], templates };
     }
     const activeWindowId = typeof parsed.activeWindowId === "string" && windows.some((window) => window.id === parsed.activeWindowId) ? parsed.activeWindowId : windows[0]!.id;
     return { activeWindowId, windows, templates };
+  }
+
+  private readStoredWorkspace(): StoredWorkspace | undefined {
+    try {
+      return this.workspaceFile.readSync<StoredWorkspace>();
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        return undefined;
+      }
+      throw error;
+    }
   }
 
   private createDefaultWindowSync(): WorkspaceWindow {
@@ -337,13 +405,34 @@ export class WorkspaceLayoutStore {
     }
   }
 
+  private windowForLayoutInstruction(instruction: WorkspaceLayoutInstruction): WorkspaceWindow | undefined {
+    if ("windowId" in instruction && instruction.windowId) {
+      return this.findWindow(instruction.windowId);
+    }
+    if ("paneId" in instruction && instruction.paneId) {
+      const window = this.windows.find((candidate) => listPanes(candidate.layout.root).some((pane) => pane.id === instruction.paneId));
+      if (window) {
+        return window;
+      }
+    }
+    if (isTabPlacementInstruction(instruction)) {
+      const window = this.findWindowForTab(instruction.tabId);
+      if (window) {
+        return window;
+      }
+    }
+    return this.getActiveWindow();
+  }
+
   private async persist(): Promise<void> {
-    await fsp.mkdir(path.dirname(this.workspacePath), { recursive: true });
-    await fsp.writeFile(
-      this.workspacePath,
-      `${JSON.stringify({ activeWindowId: this.activeWindowId, windows: this.windows, templates: this.templates }, null, 2)}\n`,
-      "utf8"
-    );
+    const queueKey = this.workspacePath;
+    const operation = this.writeQueue().then(() => this.workspaceFile.write({ activeWindowId: this.activeWindowId, windows: this.windows, templates: this.templates }));
+    WorkspaceLayoutStore.writeQueues.set(queueKey, operation.then(() => undefined, () => undefined));
+    return operation;
+  }
+
+  private writeQueue(): Promise<void> {
+    return WorkspaceLayoutStore.writeQueues.get(this.workspacePath) ?? Promise.resolve();
   }
 }
 
@@ -356,10 +445,7 @@ export function defaultLayout(): TabLayoutState {
 }
 
 export function listPanes(root: TabLayoutNode): TabPaneState[] {
-  if (root.type === "pane") {
-    return [root.pane];
-  }
-  return root.children.flatMap((child) => listPanes(child));
+  return listTabLayoutPanes(root);
 }
 
 function scoreWindow(window: WorkspaceWindow, tokens: string[], tabsById: Map<string, WorkspaceTab>, sessionTextByTabId: Map<string, string>) {
@@ -403,14 +489,7 @@ function templateTabFromSource(source: TemplateTabSource, basePath: string): Wor
 }
 
 function relativeChildPath(basePath: string, candidate: string): string | undefined {
-  const relative = path.relative(basePath, candidate);
-  if (!relative || relative === ".") {
-    return "";
-  }
-  if (relative.startsWith("..") || path.isAbsolute(relative)) {
-    return undefined;
-  }
-  return relative;
+  return relativePathWithin(basePath, candidate);
 }
 
 function remapLayoutNode(node: TabLayoutNode, tabIdMap: Map<string, string>): TabLayoutNode {
@@ -459,7 +538,7 @@ function mapPanes(root: TabLayoutNode, mapper: (pane: TabPaneState) => TabPaneSt
 }
 
 function readWindow(value: unknown): WorkspaceWindow | undefined {
-  if (!isRecord(value) || typeof value.id !== "string" || typeof value.name !== "string" || typeof value.defaultCwd !== "string" || !isLayoutState(value.layout)) {
+  if (!isRecord(value) || typeof value.id !== "string" || typeof value.name !== "string" || typeof value.defaultCwd !== "string" || !isUsableTabLayoutState(value.layout)) {
     return undefined;
   }
   return {
@@ -504,7 +583,7 @@ function readPluginMetadataValue(value: unknown): Record<string, unknown> | unde
 }
 
 function readTemplate(value: unknown): WorkspaceLayoutTemplate | undefined {
-  if (!isRecord(value) || typeof value.id !== "string" || typeof value.name !== "string" || typeof value.basePath !== "string" || !isLayoutState(value.layout) || !Array.isArray(value.tabs)) {
+  if (!isRecord(value) || typeof value.id !== "string" || typeof value.name !== "string" || typeof value.basePath !== "string" || !isUsableTabLayoutState(value.layout) || !Array.isArray(value.tabs)) {
     return undefined;
   }
   const tabs = value.tabs.map(readTemplateTab).filter((tab): tab is WorkspaceLayoutTemplateTab => Boolean(tab));
@@ -523,39 +602,37 @@ function readTemplateTab(value: unknown): WorkspaceLayoutTemplateTab | undefined
   if (!isRecord(value) || typeof value.id !== "string" || typeof value.pluginId !== "string") {
     return undefined;
   }
+  const relativeCwd = readTemplateRelativeCwd(value.relativeCwd);
   return {
     id: value.id,
     pluginId: value.pluginId,
     title: typeof value.title === "string" ? value.title : undefined,
     cwd: typeof value.cwd === "string" ? value.cwd : undefined,
-    relativeCwd: typeof value.relativeCwd === "string" ? value.relativeCwd : undefined,
+    relativeCwd,
     initialInput: isRecord(value.initialInput) ? value.initialInput : undefined
   };
 }
 
-function isLayoutState(value: unknown): value is TabLayoutState {
-  return isRecord(value) && typeof value.activePaneId === "string" && isLayoutNode(value.root) && listPanes(value.root).some((pane) => pane.id === value.activePaneId);
+function resolveTemplateRelativeCwd(projectPath: string, relativeCwd: string): string {
+  const safeRelativeCwd = readTemplateRelativeCwd(relativeCwd);
+  if (safeRelativeCwd === undefined) {
+    throw new Error("Template tab relative cwd must stay within the project path.");
+  }
+  return path.join(projectPath, safeRelativeCwd);
 }
 
-function isLayoutNode(value: unknown): value is TabLayoutNode {
-  if (!isRecord(value) || (value.type !== "pane" && value.type !== "split")) {
-    return false;
+function readTemplateRelativeCwd(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
   }
-  if (value.type === "pane") {
-    return isRecord(value.pane) && typeof value.pane.id === "string" && Array.isArray(value.pane.tabIds) && value.pane.tabIds.every((tabId) => typeof tabId === "string");
+  const normalized = path.normalize(value.trim());
+  if (!normalized || normalized === ".") {
+    return "";
   }
-  return (
-    typeof value.id === "string" &&
-    (value.direction === "row" || value.direction === "column") &&
-    Array.isArray(value.sizes) &&
-    value.sizes.length === 2 &&
-    typeof value.sizes[0] === "number" &&
-    typeof value.sizes[1] === "number" &&
-    Array.isArray(value.children) &&
-    value.children.length === 2 &&
-    isLayoutNode(value.children[0]) &&
-    isLayoutNode(value.children[1])
-  );
+  if (path.isAbsolute(normalized) || normalized === ".." || normalized.startsWith(`..${path.sep}`)) {
+    return undefined;
+  }
+  return normalized;
 }
 
 function requireNonEmpty(value: string, label: string): string {
@@ -577,4 +654,8 @@ function defaultWindowName(count: number): string {
 
 function uniqueStrings(values: string[]): string[] {
   return Array.from(new Set(values));
+}
+
+function isTabPlacementInstruction(instruction: WorkspaceLayoutInstruction): instruction is Extract<WorkspaceLayoutInstruction, { tabId: string }> {
+  return instruction.type === "add_tab_to_active_pane" || instruction.type === "open_tab_in_new_pane";
 }

@@ -1,9 +1,7 @@
-import fs from "node:fs";
-import fsp from "node:fs/promises";
-import path from "node:path";
-
 import { CLOUDX_THEME_OPTIONS, DEFAULT_CLOUDX_THEME_ID } from "@cloudx/shared";
 import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, ConfigValue, PluginDescriptor, PluginId } from "@cloudx/shared";
+
+import { JsonStateFile } from "./jsonStateFile.js";
 
 export const GLOBAL_CONFIG_FIELDS: ConfigFieldDescriptor[] = [
   {
@@ -41,19 +39,32 @@ export const GLOBAL_CONFIG_FIELDS: ConfigFieldDescriptor[] = [
 ];
 
 interface StoredConfig {
-  global?: Record<string, unknown>;
-  plugins?: Record<string, Record<string, unknown>>;
+  global?: unknown;
+  plugins?: unknown;
+}
+
+export class ConfigValidationError extends Error {
+  readonly statusCode = 400;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "ConfigValidationError";
+  }
 }
 
 export class ConfigService {
+  private static readonly writeQueues = new Map<string, Promise<void>>();
+
   readonly configPath: string;
+  private readonly configFile: JsonStateFile;
   private values: CloudxConfigValues;
 
   constructor(
     dataDir: string,
     private readonly listPlugins: () => PluginDescriptor[] = () => []
   ) {
-    this.configPath = path.join(dataDir, "config.json");
+    this.configFile = new JsonStateFile(dataDir, "config.json", "CloudX config");
+    this.configPath = this.configFile.filePath;
     this.values = this.loadStoredConfig();
   }
 
@@ -83,12 +94,22 @@ export class ConfigService {
     return global.aiControlEnabled !== false && global.microphoneEnabled !== false;
   }
 
-  async update(patch: Partial<CloudxConfigValues>): Promise<CloudxConfigResponse> {
-    const plugins = this.pluginSections();
-    this.values = mergeConfigValues(this.values, validatePatch(patch, GLOBAL_CONFIG_FIELDS, plugins));
-    await fsp.mkdir(path.dirname(this.configPath), { recursive: true });
-    await fsp.writeFile(this.configPath, `${JSON.stringify(this.values, null, 2)}\n`, "utf8");
-    return this.getResponse();
+  async update(patch: Partial<CloudxConfigValues> = {}): Promise<CloudxConfigResponse> {
+    const queueKey = this.configPath;
+    const operation = this.writeQueue().then(async () => {
+      const plugins = this.pluginSections();
+      const latestValues = this.loadStoredConfig();
+      const nextValues = mergeConfigValues(latestValues, validatePatch(patch, GLOBAL_CONFIG_FIELDS, plugins));
+      await this.persist(nextValues);
+      this.values = nextValues;
+      return this.getResponse();
+    });
+    ConfigService.writeQueues.set(queueKey, operation.then(() => undefined, () => undefined));
+    return operation;
+  }
+
+  private writeQueue(): Promise<void> {
+    return ConfigService.writeQueues.get(this.configPath) ?? Promise.resolve();
   }
 
   private pluginSections() {
@@ -111,68 +132,109 @@ export class ConfigService {
   }
 
   private loadStoredConfig(): CloudxConfigValues {
-    if (!fs.existsSync(this.configPath)) {
-      return { global: {}, plugins: {} };
-    }
-    const parsed = JSON.parse(fs.readFileSync(this.configPath, "utf8")) as StoredConfig;
+    const parsed = this.readStoredConfig() ?? {};
+    const pluginValues = isRecord(parsed.plugins)
+      ? Object.fromEntries(Object.entries(parsed.plugins).map(([pluginId, values]) => [pluginId, sanitizeUnknownRecord(isRecord(values) ? values : undefined)]))
+      : {};
     return {
-      global: sanitizeUnknownRecord(parsed.global),
-      plugins: Object.fromEntries(Object.entries(parsed.plugins ?? {}).map(([pluginId, values]) => [pluginId, sanitizeUnknownRecord(values)]))
+      global: sanitizeUnknownRecord(isRecord(parsed.global) ? parsed.global : undefined),
+      plugins: pluginValues
     };
+  }
+
+  private readStoredConfig(): StoredConfig | undefined {
+    try {
+      return this.configFile.readSync<StoredConfig>();
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        return undefined;
+      }
+      throw error;
+    }
+  }
+
+  private async persist(values: CloudxConfigValues): Promise<void> {
+    await this.configFile.write(values);
   }
 }
 
-function validatePatch(patch: Partial<CloudxConfigValues>, globalFields: ConfigFieldDescriptor[], plugins: CloudxConfigResponse["plugins"]): CloudxConfigValues {
-  const global = patch.global === undefined ? {} : validateFieldValues(patch.global, globalFields, "global");
+function validatePatch(patch: unknown, globalFields: ConfigFieldDescriptor[], plugins: CloudxConfigResponse["plugins"]): CloudxConfigValues {
+  if (!isRecord(patch)) {
+    throwConfigValidationError("Config patch must be an object.");
+  }
+  const global = patch.global === undefined ? {} : validateFieldValues(requireRecord(patch.global, "global"), globalFields, "global");
   const pluginFieldMap = new Map(plugins.map((plugin) => [plugin.pluginId, plugin.fields]));
   const pluginValues: Record<string, Record<string, ConfigValue>> = {};
-  for (const [pluginId, values] of Object.entries(patch.plugins ?? {})) {
+  const pluginPatch = patch.plugins === undefined ? {} : requireRecord(patch.plugins, "plugins");
+  for (const [pluginId, values] of Object.entries(pluginPatch)) {
     const fields = pluginFieldMap.get(pluginId);
     if (!fields) {
-      throw new Error(`Unknown plugin config section: ${pluginId}`);
+      throwConfigValidationError(`Unknown plugin config section: ${pluginId}`);
     }
-    pluginValues[pluginId] = validateFieldValues(values, fields, `plugins.${pluginId}`);
+    pluginValues[pluginId] = validateFieldValues(requireRecord(values, `plugins.${pluginId}`), fields, `plugins.${pluginId}`);
   }
   return { global, plugins: pluginValues };
 }
 
-function validateFieldValues(values: Record<string, ConfigValue>, fields: ConfigFieldDescriptor[], label: string): Record<string, ConfigValue> {
+function requireRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!isRecord(value)) {
+    throwConfigValidationError(`${label} must be an object.`);
+  }
+  return value;
+}
+
+function validateFieldValues(values: Record<string, unknown>, fields: ConfigFieldDescriptor[], label: string): Record<string, ConfigValue> {
   const fieldMap = new Map(fields.map((field) => [field.key, field]));
   const validated: Record<string, ConfigValue> = {};
   for (const [key, value] of Object.entries(values)) {
     const field = fieldMap.get(key);
     if (!field) {
-      throw new Error(`Unknown config key: ${label}.${key}`);
+      throwConfigValidationError(`Unknown config key: ${label}.${key}`);
     }
     validated[key] = validateFieldValue(value, field, `${label}.${key}`);
   }
   return validated;
 }
 
-function validateFieldValue(value: ConfigValue, field: ConfigFieldDescriptor, label: string): ConfigValue {
+function validateFieldValue(value: unknown, field: ConfigFieldDescriptor, label: string): ConfigValue {
   if (field.type === "boolean" && typeof value !== "boolean") {
-    throw new Error(`${label} must be a boolean.`);
+    throwConfigValidationError(`${label} must be a boolean.`);
   }
   if (field.type === "string" && typeof value !== "string") {
-    throw new Error(`${label} must be a string.`);
+    throwConfigValidationError(`${label} must be a string.`);
   }
   if (field.type === "number" && (typeof value !== "number" || !Number.isFinite(value))) {
-    throw new Error(`${label} must be a finite number.`);
+    throwConfigValidationError(`${label} must be a finite number.`);
   }
   if (field.type === "number" && typeof value === "number" && field.min !== undefined && value < field.min) {
-    throw new Error(`${label} must be greater than or equal to ${field.min}.`);
+    throwConfigValidationError(`${label} must be greater than or equal to ${field.min}.`);
   }
   if (field.type === "number" && typeof value === "number" && field.max !== undefined && value > field.max) {
-    throw new Error(`${label} must be less than or equal to ${field.max}.`);
+    throwConfigValidationError(`${label} must be less than or equal to ${field.max}.`);
   }
   if (field.type === "select" && !field.options?.some((option) => option.value === value)) {
-    throw new Error(`${label} must be one of the configured options.`);
+    throwConfigValidationError(`${label} must be one of the configured options.`);
   }
-  return value;
+  return value as ConfigValue;
+}
+
+function throwConfigValidationError(message: string): never {
+  throw new ConfigValidationError(message);
 }
 
 function resolveFieldValues(fields: ConfigFieldDescriptor[], stored: Record<string, ConfigValue> = {}): Record<string, ConfigValue> {
-  return Object.fromEntries(fields.map((field) => [field.key, stored[field.key] ?? field.defaultValue]));
+  return Object.fromEntries(fields.map((field) => [field.key, resolveStoredFieldValue(stored[field.key], field)]));
+}
+
+function resolveStoredFieldValue(value: ConfigValue | undefined, field: ConfigFieldDescriptor): ConfigValue {
+  if (value === undefined) {
+    return field.defaultValue;
+  }
+  try {
+    return validateFieldValue(value, field, field.key);
+  } catch {
+    return field.defaultValue;
+  }
 }
 
 function mergeConfigValues(current: CloudxConfigValues, patch: CloudxConfigValues): CloudxConfigValues {
@@ -193,4 +255,8 @@ function sanitizeUnknownRecord(values: Record<string, unknown> | undefined): Rec
     }
   }
   return result;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

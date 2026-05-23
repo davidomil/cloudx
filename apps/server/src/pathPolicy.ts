@@ -4,6 +4,8 @@ import path from "node:path";
 
 import type { PathOption } from "@cloudx/shared";
 
+import { isSameOrChildPath } from "./pathBoundary.js";
+
 interface PathPolicyOptions {
   homeDir?: string;
   relativeBaseDir?: string;
@@ -47,6 +49,7 @@ export class PathPolicy {
   async ensureDirectory(candidate: string, createDirectory: boolean): Promise<string> {
     const resolved = this.resolve(candidate);
     if (createDirectory) {
+      await this.requireCreatableDirectoryPathAllowed(resolved, candidate);
       await fs.mkdir(resolved, { recursive: true });
     }
     const stat = await fs.stat(resolved).catch((error: NodeJS.ErrnoException) => {
@@ -58,6 +61,7 @@ export class PathPolicy {
     if (!stat.isDirectory()) {
       throw new Error(`Path is not a directory: ${resolved}`);
     }
+    await this.requireRealPathAllowed(resolved, candidate);
     return resolved;
   }
 
@@ -71,7 +75,7 @@ export class PathPolicy {
 
   isAllowed(resolvedPath: string): boolean {
     const normalized = path.resolve(resolvedPath);
-    return this.roots.some((root) => normalized === root || normalized.startsWith(`${root}${path.sep}`));
+    return this.roots.some((root) => isSameOrChildPath(root, normalized));
   }
 
   async suggestDirectories(candidate: string, limit = 12): Promise<PathOption[]> {
@@ -172,6 +176,9 @@ export class PathPolicy {
     if (!stat?.isDirectory()) {
       return undefined;
     }
+    if (!await this.isExistingRealPathAllowed(resolved)) {
+      return undefined;
+    }
     return {
       value: query,
       label: query,
@@ -181,6 +188,9 @@ export class PathPolicy {
   }
 
   private async childDirectoryOptions(parent: string, parentExpression: string, fragment: string): Promise<PathOption[]> {
+    if (!await this.isExistingRealPathAllowed(parent)) {
+      return [];
+    }
     const entries = await fs.readdir(parent, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT" || error.code === "ENOTDIR" || error.code === "EACCES") {
         return [];
@@ -244,6 +254,60 @@ export class PathPolicy {
       return `~/${path.relative(this.homeDir, resolved).split(path.sep).join("/")}`;
     }
     return configuredExpression;
+  }
+
+  private async requireRealPathAllowed(resolvedPath: string, originalExpression: string): Promise<void> {
+    if (await this.isExistingRealPathAllowed(resolvedPath)) {
+      return;
+    }
+    throw new Error(`Path resolves outside configured Cloudx roots: ${originalExpression}`);
+  }
+
+  private async requireCreatableDirectoryPathAllowed(resolvedPath: string, originalExpression: string): Promise<void> {
+    let current = path.resolve(resolvedPath);
+    for (;;) {
+      const stat = await fs.lstat(current).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT" || error.code === "ENOTDIR") {
+          return undefined;
+        }
+        throw error;
+      });
+      if (stat) {
+        if (!stat.isDirectory() && !stat.isSymbolicLink()) {
+          throw new Error(`Path is not a directory: ${current}`);
+        }
+        await this.requireRealPathAllowed(current, originalExpression);
+        return;
+      }
+      const parent = path.dirname(current);
+      if (parent === current) {
+        throw new Error(`Directory does not exist: ${resolvedPath}`);
+      }
+      current = parent;
+    }
+  }
+
+  private async isExistingRealPathAllowed(resolvedPath: string): Promise<boolean> {
+    const realPath = await fs.realpath(resolvedPath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT" || error.code === "EACCES") {
+        return undefined;
+      }
+      throw error;
+    });
+    if (!realPath) {
+      return false;
+    }
+    const realRoots = await Promise.all(this.roots.map((root) => this.realRootPath(root)));
+    return realRoots.some((root) => isSameOrChildPath(root, realPath));
+  }
+
+  private async realRootPath(root: string): Promise<string> {
+    return await fs.realpath(root).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT" || error.code === "EACCES") {
+        return root;
+      }
+      throw error;
+    });
   }
 }
 
