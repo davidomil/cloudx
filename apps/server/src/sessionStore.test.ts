@@ -12,15 +12,16 @@ import { PathPolicy } from "./pathPolicy.js";
 import { PluginRegistry } from "./pluginRegistry.js";
 import { SessionStore, type SessionRuntimeContextResolver } from "./sessionStore.js";
 import { HookRegistry } from "./hooks/HookRegistry.js";
-import { registerCoreHooks } from "./hooks/coreHooks.js";
+import { registerCoreHooks, shellCommandLaunch } from "./hooks/coreHooks.js";
 import { registerPluginActionHooks } from "./hooks/pluginActionHooks.js";
-import { LocalWebPlugin } from "./plugins/LocalWebPlugin.js";
+import { LOCAL_WEB_PLUGIN_ID, LocalWebPlugin } from "./plugins/LocalWebPlugin.js";
 import { WorkspaceControlPlugin, WORKSPACE_CONTROL_PLUGIN_ID } from "./plugins/WorkspaceControlPlugin.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
 
 class FakeSession implements PluginSession {
   private readonly dataListeners = new Set<(data: string) => void>();
   appliedRuntimeContexts: Array<WorkspaceRuntimeContext | undefined> = [];
+  nextActionResult: Record<string, unknown> | undefined;
   stopped = false;
 
   constructor(public readonly tab: WorkspaceTab) {}
@@ -45,7 +46,7 @@ class FakeSession implements PluginSession {
   }
 
   handleAction(action: string, input: Record<string, unknown>) {
-    return { action, input };
+    return this.nextActionResult ?? { action, input };
   }
 
   stop(): void {
@@ -91,6 +92,7 @@ class FakeDefaultPlugin implements WorkspacePlugin {
         voiceExposed: true,
         defaultForVoice: true,
         handlesUnhandledVoice: input.handlesUnhandledVoice,
+        updatesTabState: true,
         inputSchema: {
           type: "object",
           properties: {
@@ -98,6 +100,15 @@ class FakeDefaultPlugin implements WorkspacePlugin {
             submit: { type: "boolean" }
           },
           required: ["text"],
+          additionalProperties: false
+        },
+        outputSchema: {
+          type: "object",
+          properties: {
+            action: { type: "string" },
+            input: { type: "object", additionalProperties: true }
+          },
+          required: ["action", "input"],
           additionalProperties: false
         }
       }
@@ -150,6 +161,15 @@ describe("SessionStore voice actions", () => {
     const { store } = await createStore();
 
     await expect(store.createTab({ pluginId: "fake-default" })).rejects.toThrow(/Directory is required for Fake Default/);
+  });
+
+  it("does not create directory-backed tabs through symlinks that leave allowed roots", async () => {
+    const { store, root } = await createStore();
+    const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-session-store-outside-"));
+    const linkPath = path.join(root, "outside-link");
+    await fs.symlink(outsideRoot, linkPath, "dir");
+
+    await expect(store.createTab({ pluginId: "fake-default", cwd: linkPath })).rejects.toThrow(/resolves outside configured Cloudx roots/);
   });
 
   it("creates local web tabs without a requested directory", async () => {
@@ -208,6 +228,51 @@ describe("SessionStore voice actions", () => {
     expect(updates).toContain("yellow");
   });
 
+  it("emits tab updates after successful plugin actions and plugin action hooks", async () => {
+    const { store, root } = await createStore();
+    const tab = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Editor" });
+    const updatedTabIds: string[] = [];
+    const dispose = store.onTabsChange((update) => {
+      const updatedTab = update.tabs.find((candidate) => candidate.id === tab.id);
+      if (updatedTab) {
+        updatedTabIds.push(updatedTab.id);
+      }
+    });
+
+    await store.executePluginAction(tab.id, "enter_text", { text: "direct" });
+    await store.executePluginHook("fake-default", pluginActionHookId("fake-default", "enter_text"), "enter_text", tab.id, { text: "hook" }, { kind: "ui" });
+
+    dispose();
+    expect(updatedTabIds).toEqual([tab.id, tab.id]);
+  });
+
+  it("does not emit tab updates for read-only plugin state reads", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-local-web-state-touch-"));
+    const registry = new PluginRegistry();
+    registry.register(new LocalWebPlugin());
+    const pathPolicy = new PathPolicy([root]);
+    const store = new SessionStore(registry, pathPolicy, new TabContextService(path.join(root, ".cloudx")));
+    const tab = await store.createTab({
+      pluginId: LOCAL_WEB_PLUGIN_ID,
+      cwd: root,
+      title: "Local Web",
+      initialInput: { url: "http://127.0.0.1:5173/" }
+    });
+    const updatedTabIds: string[] = [];
+    const dispose = store.onTabsChange((update) => {
+      const updatedTab = update.tabs.find((candidate) => candidate.id === tab.id);
+      if (updatedTab) {
+        updatedTabIds.push(updatedTab.id);
+      }
+    });
+
+    await store.executePluginAction(tab.id, "get_state", {});
+    await store.executePluginAction(tab.id, "open_url", { url: "http://127.0.0.1:5174/dashboard" });
+
+    dispose();
+    expect(updatedTabIds).toEqual([tab.id]);
+  });
+
   it("lets plugin sessions close their own tabs", async () => {
     const { store, root, plugin } = await createStore();
     const tab = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Closable" });
@@ -259,7 +324,7 @@ describe("SessionStore voice actions", () => {
           voiceContext: { kind: "fake", cwd: root, summary: "Fake session." },
           voiceActions: [{ name: "enter_text", defaultForVoice: true }],
           history: {
-            source: expect.stringContaining(`${tab.id}.md`),
+            source: tab.contextPath,
             description: expect.stringContaining("Recent Cloudx tab context"),
             text: expect.stringContaining("Cloudx Tab Context")
           }
@@ -306,6 +371,42 @@ describe("SessionStore voice actions", () => {
     expect(result).toEqual({ action: "enter_text", input: { text: "ls", submit: true } });
   });
 
+  it("rejects explicit plugin hook targets that no longer exist instead of falling back", async () => {
+    const { store, root } = await createStore();
+    await store.createTab({ pluginId: "fake-default", cwd: root, title: "Active Shell" });
+
+    await expect(
+      store.executePluginHook("fake-default", pluginActionHookId("fake-default", "enter_text"), "enter_text", "missing-tab", { text: "ls" }, { kind: "ui" })
+    ).rejects.toThrow("Unknown tab for hook target: missing-tab");
+  });
+
+  it("validates direct plugin action outputs before recording them", async () => {
+    const { store, root, plugin } = await createStore();
+    const tab = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Shell" });
+
+    plugin.lastSession!.nextActionResult = ["not", "a", "record"] as unknown as Record<string, unknown>;
+    await expect(store.executePluginAction(tab.id, "enter_text", { text: "ls" })).rejects.toThrow("Action fake-default.enter_text output must be an object.");
+
+    plugin.lastSession!.nextActionResult = { action: "enter_text", input: { text: "ls" }, extra: true };
+    await expect(store.executePluginAction(tab.id, "enter_text", { text: "ls" })).rejects.toThrow("Action fake-default.enter_text invalid output: does not accept output: extra");
+  });
+
+  it("validates direct voice plugin action outputs before recording them", async () => {
+    const { store, root, plugin } = await createStore();
+    const tab = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Shell" });
+
+    plugin.lastSession!.nextActionResult = ["not", "a", "record"] as unknown as Record<string, unknown>;
+    await expect(
+      store.executeVoiceAction({
+        targetTabId: tab.id,
+        pluginId: "fake-default",
+        action: "enter_text",
+        input: { text: "ls" },
+        reason: "test"
+      })
+    ).rejects.toThrow("Action fake-default.enter_text output must be an object.");
+  });
+
   it("executes workspace controls through voice hook ids", async () => {
     const { store, root, registry, pathPolicy, workspace } = await createStore({ withWorkspace: true });
     const hooks = new HookRegistry();
@@ -328,6 +429,204 @@ describe("SessionStore voice actions", () => {
     expect(result).toMatchObject({
       tab: { pluginId: "fake-default", title: "Voice Hook", cwd: root },
       layoutInstruction: { type: "open_tab_in_new_pane", paneId: "pane-2", splitDirection: "row" }
+    });
+  });
+
+  it("uses the target window default cwd when workspace tabs are created without an explicit cwd", async () => {
+    const { store, root, registry, pathPolicy, workspace } = await createStore({ withWorkspace: true });
+    const project = path.join(root, "project");
+    await fs.mkdir(project);
+    const hooks = new HookRegistry();
+    registerCoreHooks(hooks, { sessions: store, plugins: registry, pathPolicy, workspace: workspace! });
+    await store.createTab({ pluginId: "fake-default", cwd: root, title: "Active" });
+    const target = await workspace!.createWindow({ name: "Project", defaultCwd: project });
+
+    const result = await hooks.call("workspace.tabs.create", {
+      pluginId: "fake-default",
+      title: "Window Default",
+      windowId: target.id
+    }, { caller: { kind: "automation" } });
+
+    expect(result).toMatchObject({
+      tab: { pluginId: "fake-default", title: "Window Default", cwd: project },
+      layoutInstruction: { windowId: target.id }
+    });
+  });
+
+  it("defers workspace window activation side effects for automation callers", async () => {
+    const { store, root, registry, pathPolicy, workspace } = await createStore({ withWorkspace: true });
+    const hooks = new HookRegistry();
+    registerCoreHooks(hooks, { sessions: store, plugins: registry, pathPolicy, workspace: workspace! });
+    const original = workspace!.getActiveWindow();
+    const target = await workspace!.createWindow({ name: "Backend", defaultCwd: root });
+    await workspace!.selectWindow(original.id);
+
+    const automationResult = await hooks.call("workspace.windows.activate", { windowId: target.id }, { caller: { kind: "automation" } });
+
+    expect(automationResult).toMatchObject({ activeWindowId: target.id, layoutInstruction: { type: "select_window", windowId: target.id } });
+    expect(workspace!.snapshot().activeWindowId).toBe(original.id);
+
+    await hooks.call("workspace.windows.activate", { windowId: target.id }, { caller: { kind: "voice" } });
+
+    expect(workspace!.snapshot().activeWindowId).toBe(target.id);
+  });
+
+  it("honors workspace.tabs.close stopSession defaults and explicit session shutdown", async () => {
+    const { store, root, registry, pathPolicy, workspace, plugin } = await createStore({ withWorkspace: true });
+    const hooks = new HookRegistry();
+    registerCoreHooks(hooks, { sessions: store, plugins: registry, pathPolicy, workspace: workspace! });
+    const defaultCloseTab = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Default Close" });
+    const defaultCloseSession = plugin.lastSession;
+
+    await hooks.call("workspace.tabs.close", { tabId: defaultCloseTab.id }, { caller: { kind: "automation" } });
+
+    expect(defaultCloseSession?.stopped).toBe(false);
+
+    const stopCloseTab = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Stop Close" });
+    const stopCloseSession = plugin.lastSession;
+
+    await hooks.call("workspace.tabs.close", { tabId: stopCloseTab.id, stopSession: true }, { caller: { kind: "automation" } });
+
+    expect(stopCloseSession?.stopped).toBe(true);
+  });
+
+  it("creates layout-template tabs with the prepared target window runtime context", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-session-template-window-context-"));
+    const project = path.join(root, "project");
+    const appPath = path.join(project, "app");
+    await fs.mkdir(appPath, { recursive: true });
+    const plugin = new FakeDefaultPlugin();
+    const registry = new PluginRegistry();
+    registry.register(plugin);
+    registry.register(new WorkspaceControlPlugin());
+    const pathPolicy = new PathPolicy([root]);
+    const workspace = new WorkspaceLayoutStore(path.join(root, ".cloudx"), pathPolicy);
+    const resolver: SessionRuntimeContextResolver = {
+      runtimeContextFor: (_tab, window) => ({ activeWindowId: window?.id }),
+      tabIndicatorFor: () => undefined
+    };
+    const store = new SessionStore(registry, pathPolicy, new TabContextService(path.join(root, ".cloudx")), { getPluginConfig: () => ({}) }, workspace, resolver);
+    const hooks = new HookRegistry();
+    registerCoreHooks(hooks, { sessions: store, plugins: registry, pathPolicy, workspace });
+    const sourceWindow = workspace.getActiveWindow();
+    const sourceTab = await store.createTab({ pluginId: "fake-default", cwd: appPath, title: "Template Source", windowId: sourceWindow.id });
+    await workspace.updateWindow(sourceWindow.id, { layout: layoutWithTab(sourceTab.id) });
+    const template = await workspace.createTemplate(
+      { name: "App", basePath: project, windowId: sourceWindow.id },
+      [{ tab: sourceTab }]
+    );
+    const targetWindow = await workspace.createWindow({ name: "Target", defaultCwd: root });
+    await workspace.selectWindow(sourceWindow.id);
+
+    await hooks.call(
+      "workspace.layoutTemplates.apply",
+      { templateId: template.id, projectPath: project, windowId: targetWindow.id },
+      { caller: { kind: "automation" } }
+    );
+
+    expect(plugin.lastInput?.runtimeContext).toMatchObject({ activeWindowId: targetWindow.id });
+  });
+
+  it("terminates shell command process groups when automation cancels the hook", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const { store, root, registry, pathPolicy, workspace } = await createStore({ withWorkspace: true });
+    const hooks = new HookRegistry();
+    registerCoreHooks(hooks, { sessions: store, plugins: registry, pathPolicy, workspace: workspace! });
+    const controller = new AbortController();
+    const childPidPath = path.join(root, "shell-child.pid");
+    const command = `sleep 60 & echo $! > ${shellQuote(childPidPath)}; wait`;
+
+    const run = hooks.call(
+      "workspace.shell.runCommand",
+      { command, cwd: root, timeoutMs: 60_000 },
+      { caller: { kind: "automation" }, signal: controller.signal }
+    );
+    const childPid = Number(await waitForTextFile(childPidPath));
+    controller.abort();
+
+    await expect(run).rejects.toThrow("Shell command was cancelled");
+    await expect(waitForProcessExit(childPid)).resolves.toBeUndefined();
+  });
+
+  it("truncates shell command output without splitting UTF-8 characters", async () => {
+    const { store, root, registry, pathPolicy, workspace } = await createStore({ withWorkspace: true });
+    const hooks = new HookRegistry();
+    registerCoreHooks(hooks, { sessions: store, plugins: registry, pathPolicy, workspace: workspace! });
+    const command = `${shellQuote(process.execPath)} -e ${shellQuote("process.stdout.write('🙂'.repeat(400));")}`;
+
+    const result = await hooks.call(
+      "workspace.shell.runCommand",
+      { command, cwd: root, timeoutMs: 60_000, maxOutputBytes: 1_025 },
+      { caller: { kind: "automation" } }
+    );
+
+    expect(result.stdout).toBe("🙂".repeat(256));
+    expect(result.exitCode).toBe(0);
+    expect(result.signal).toBeNull();
+    expect(Buffer.byteLength(String(result.stdout), "utf8")).toBeLessThanOrEqual(1_025);
+    expect(String(result.stdout)).not.toContain("\uFFFD");
+  });
+
+  it("decodes shell command output across split UTF-8 chunks", async () => {
+    const { store, root, registry, pathPolicy, workspace } = await createStore({ withWorkspace: true });
+    const hooks = new HookRegistry();
+    registerCoreHooks(hooks, { sessions: store, plugins: registry, pathPolicy, workspace: workspace! });
+    const script = "const bytes = Buffer.from('A🙂B', 'utf8'); process.stdout.write(bytes.subarray(0, 3)); setTimeout(() => process.stdout.write(bytes.subarray(3)), 25);";
+    const command = `${shellQuote(process.execPath)} -e ${shellQuote(script)}`;
+
+    const result = await hooks.call(
+      "workspace.shell.runCommand",
+      { command, cwd: root, timeoutMs: 60_000, maxOutputBytes: 1_024 },
+      { caller: { kind: "automation" } }
+    );
+
+    expect(result.stdout).toBe("A🙂B");
+    expect(result.exitCode).toBe(0);
+    expect(result.signal).toBeNull();
+    expect(String(result.stdout)).not.toContain("\uFFFD");
+  });
+
+  it("rejects shell command inputs outside declared bounds instead of silently clamping them", async () => {
+    const { store, root, registry, pathPolicy, workspace } = await createStore({ withWorkspace: true });
+    const hooks = new HookRegistry();
+    registerCoreHooks(hooks, { sessions: store, plugins: registry, pathPolicy, workspace: workspace! });
+
+    await expect(
+      hooks.call(
+        "workspace.shell.runCommand",
+        { command: "x".repeat(8_193), cwd: root },
+        { caller: { kind: "automation" } }
+      )
+    ).rejects.toThrow("command");
+    await expect(
+      hooks.call(
+        "workspace.shell.runCommand",
+        { command: "pwd", cwd: root, timeoutMs: 0 },
+        { caller: { kind: "automation" } }
+      )
+    ).rejects.toThrow("timeoutMs");
+    await expect(
+      hooks.call(
+        "workspace.shell.runCommand",
+        { command: "pwd", cwd: root, maxOutputBytes: 1_023 },
+        { caller: { kind: "automation" } }
+      )
+    ).rejects.toThrow("maxOutputBytes");
+  });
+
+  it("selects shell command launch arguments by platform", () => {
+    expect(shellCommandLaunch("echo hi", {}, "linux")).toEqual({ command: "/bin/sh", args: ["-lc", "echo hi"] });
+    expect(shellCommandLaunch("echo hi", { ComSpec: "C:\\Windows\\System32\\cmd.exe" }, "win32")).toEqual({
+      command: "C:\\Windows\\System32\\cmd.exe",
+      args: ["/d", "/s", "/c", "echo hi"],
+      windowsHide: true
+    });
+    expect(shellCommandLaunch("echo hi", {}, "win32")).toEqual({
+      command: "cmd.exe",
+      args: ["/d", "/s", "/c", "echo hi"],
+      windowsHide: true
     });
   });
 
@@ -633,6 +932,67 @@ async function createStore(pluginOptions: { handlesUnhandledVoice?: boolean; wit
     workspace,
     store
   };
+}
+
+async function waitForTextFile(filePath: string): Promise<string> {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    try {
+      const text = await fs.readFile(filePath, "utf8");
+      if (text.trim()) {
+        return text.trim();
+      }
+    } catch (error) {
+      if (!isNotFound(error)) {
+        throw error;
+      }
+    }
+    await delay(10);
+  }
+  throw new Error(`Timed out waiting for file: ${filePath}`);
+}
+
+async function waitForProcessExit(pid: number): Promise<void> {
+  try {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (!processIsRunning(pid)) {
+        return;
+      }
+      await delay(10);
+    }
+  } finally {
+    if (processIsRunning(pid)) {
+      process.kill(pid, "SIGKILL");
+    }
+  }
+  throw new Error(`Process ${pid} was still running after cancellation.`);
+}
+
+function processIsRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (isNoSuchProcess(error)) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isNotFound(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && (error as { code?: string }).code === "ENOENT";
+}
+
+function isNoSuchProcess(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && (error as { code?: string }).code === "ESRCH";
 }
 
 function layoutWithTab(tabId: string) {

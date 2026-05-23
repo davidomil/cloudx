@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { CloudxRule, PersonalityTemplate, RulesSkillsStore } from "@cloudx/shared";
 
-import { cloudxRuleFromEdit, cloudxRuleFromText, draftWithRuleEnabled, RulesSkillsPanel, templateFromDraft, type TemplateDraft } from "./RulesSkillsPanel.js";
+import { cloudxRuleFromEdit, cloudxRuleFromText, draftWithRuleEnabled, personalityTemplatesEqual, RulesSkillsPanel, templateDraftsEqual, templateFromDraft, type TemplateDraft } from "./RulesSkillsPanel.js";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -22,6 +22,7 @@ describe("RulesSkillsPanel helpers", () => {
       description: "Keep changes focused.",
       text: "Keep changes focused."
     });
+    expect(cloudxRuleFromText(" !!! ")).toBeUndefined();
   });
 
   it("enables newly created rules in the selected template draft without duplicates", () => {
@@ -58,6 +59,26 @@ describe("RulesSkillsPanel helpers", () => {
     });
 
     expect(cloudxRuleFromEdit({ id: "empty", description: "Empty", text: "Empty" }, "   ", "Unused")).toBeUndefined();
+  });
+
+  it("tracks template drafts as dirty only when the saved payload changes", () => {
+    const draft: TemplateDraft = {
+      id: "default",
+      name: "Default ",
+      color: "green",
+      ruleIds: ["keep-focused", "test-first"],
+      skillIds: ["reviewer"]
+    };
+    const saved: TemplateDraft = {
+      id: "default",
+      name: "Default",
+      color: "green",
+      ruleIds: ["keep-focused", "test-first"],
+      skillIds: ["reviewer"]
+    };
+
+    expect(templateDraftsEqual(draft, saved)).toBe(true);
+    expect(personalityTemplatesEqual(templateFromDraft(draft), { ...templateFromDraft(saved), ruleIds: ["test-first", "keep-focused"] })).toBe(false);
   });
 
   it("saves edits to an existing rule from the rules picker", async () => {
@@ -107,6 +128,68 @@ describe("RulesSkillsPanel helpers", () => {
 
     await unmount(root);
   });
+
+  it("separates template saving from runtime injection and shows dirty state", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const savedTemplates: PersonalityTemplate[] = [];
+    let injections = 0;
+
+    await act(async () => {
+      root.render(
+        createElement(RulesSkillsPanel, {
+          store: rulesSkillsStore(),
+          onSaveTemplate: async (template: PersonalityTemplate) => {
+            savedTemplates.push(template);
+          },
+          onDeleteTemplate: async () => undefined,
+          onSetDefault: async () => undefined,
+          onSaveRule: async () => undefined,
+          onDeleteRule: async () => undefined,
+          onInjectRuntime: async () => {
+            injections += 1;
+            return 2;
+          }
+        })
+      );
+    });
+
+    expect(container.querySelector(".rules-skills-save-state")?.textContent).toBe("Saved");
+    const injectButton = container.querySelector('[aria-label="Inject saved rules and skills"]') as HTMLButtonElement;
+    await act(async () => {
+      injectButton.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(injections).toBe(1);
+    expect(savedTemplates).toEqual([]);
+
+    const nameInput = container.querySelector("label input") as HTMLInputElement;
+    setInputValue(nameInput, "Default Codex");
+    await act(async () => {
+      nameInput.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    expect(container.querySelector(".rules-skills-save-state")?.textContent).toBe("Unsaved");
+    expect(injectButton.disabled).toBe(true);
+
+    const saveButton = container.querySelector('[aria-label="Save template"]') as HTMLButtonElement;
+    await act(async () => {
+      saveButton.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(savedTemplates).toEqual([
+      {
+        id: "default",
+        name: "Default Codex",
+        color: "green",
+        ruleIds: ["keep-focused"],
+        skillIds: []
+      }
+    ]);
+    expect(injections).toBe(1);
+
+    await unmount(root);
+  });
 });
 
 function rulesSkillsStore(): RulesSkillsStore {
@@ -129,6 +212,11 @@ function rulesSkillsStore(): RulesSkillsStore {
 function setTextAreaValue(textarea: HTMLTextAreaElement, value: string): void {
   const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
   setter?.call(textarea, value);
+}
+
+function setInputValue(input: HTMLInputElement, value: string): void {
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+  setter?.call(input, value);
 }
 
 async function unmount(root: Root): Promise<void> {

@@ -18,6 +18,8 @@ import {
   type PersonalityTemplate
 } from "@cloudx/shared";
 
+import { isSameOrChildPath } from "../pathBoundary.js";
+
 export const DEFAULT_PERSONALITY_TEMPLATE_ID = "default-codex";
 export const TEMPLATE_METADATA_KEY = "selectedTemplateId";
 
@@ -95,11 +97,13 @@ const SYSTEM_SKILL_INSTRUCTIONS: Record<string, string> = {
 };
 
 export class RulesSkillsCatalogService {
+  private static readonly mutationQueues = new Map<string, Promise<void>>();
+
   private readonly listeners = new Set<() => void>();
   private readonly rootPath: string;
 
   constructor(dataDir: string) {
-    this.rootPath = rulesSkillsRootPath(dataDir);
+    this.rootPath = path.resolve(rulesSkillsRootPath(dataDir));
   }
 
   catalogRoot(): string {
@@ -112,102 +116,124 @@ export class RulesSkillsCatalogService {
   }
 
   async list(): Promise<RulesSkillsStore> {
-    await this.ensureSeeded();
-    return this.readStore();
+    await this.mutationQueue().catch(() => undefined);
+    return this.readFreshStore();
   }
 
   async saveTemplate(input: Record<string, unknown>): Promise<RulesSkillsStore> {
-    const store = await this.list();
-    const template = normalizeTemplate(input);
-    validateTemplateReferences(template, store);
-    await writeJson(this.templatePath(template.id), template);
-    await this.ensureSettings(store.defaultTemplateId ?? template.id);
-    this.emitChange();
-    return this.readStore();
+    return this.withCatalogMutation(async () => {
+      const store = await this.readFreshStore();
+      const template = normalizeTemplate(input);
+      validateTemplateReferences(template, store);
+      await writeJson(this.templatePath(template.id), template, this.rootPath);
+      await writeJson(this.settingsPath(), { defaultTemplateId: store.defaultTemplateId ?? template.id }, this.rootPath);
+      this.emitChange();
+      return this.readStore();
+    });
   }
 
   async deleteTemplate(templateId: string): Promise<RulesSkillsStore> {
-    await this.ensureSeeded();
-    const id = assertSafeId(templateId, "template id");
-    await fsp.rm(this.templatePath(id), { force: true });
-    const store = await this.readStore();
-    if (store.templates.length === 0) {
-      const defaultRuleExists = fs.existsSync(this.rulePath(DEFAULT_RULE.id));
-      await writeJson(this.templatePath(DEFAULT_TEMPLATE.id), defaultRuleExists ? DEFAULT_TEMPLATE : { ...DEFAULT_TEMPLATE, ruleIds: [] });
-      await this.ensureSettings(DEFAULT_TEMPLATE.id);
-    } else if (store.defaultTemplateId === id) {
-      await writeJson(this.settingsPath(), { defaultTemplateId: store.templates[0]?.id });
-    }
-    this.emitChange();
-    return this.readStore();
+    return this.withCatalogMutation(async () => {
+      await this.ensureSeeded();
+      const id = assertSafeId(templateId, "template id");
+      const current = await this.readStore();
+      const deletedEffectiveDefault = current.defaultTemplateId === id;
+      await fsp.rm(this.templatePath(id), { force: true });
+      const store = await this.readStore();
+      if (store.templates.length === 0) {
+        const defaultRuleExists = await pathExists(this.rulePath(DEFAULT_RULE.id));
+        await writeJson(this.templatePath(DEFAULT_TEMPLATE.id), defaultRuleExists ? DEFAULT_TEMPLATE : { ...DEFAULT_TEMPLATE, ruleIds: [] }, this.rootPath);
+        await writeJson(this.settingsPath(), { defaultTemplateId: DEFAULT_TEMPLATE.id }, this.rootPath);
+      } else if (deletedEffectiveDefault) {
+        await writeJson(this.settingsPath(), { defaultTemplateId: store.templates[0]?.id }, this.rootPath);
+      }
+      this.emitChange();
+      return this.readStore();
+    });
   }
 
   async setDefaultTemplate(templateId: string | undefined): Promise<RulesSkillsStore> {
-    const store = await this.list();
-    if (templateId !== undefined && !store.templates.some((template) => template.id === templateId)) {
-      throw new Error(`Unknown personality template: ${templateId}`);
-    }
-    await writeJson(this.settingsPath(), { defaultTemplateId: templateId ?? store.templates[0]?.id });
-    this.emitChange();
-    return this.readStore();
+    return this.withCatalogMutation(async () => {
+      const store = await this.readFreshStore();
+      if (templateId !== undefined && !store.templates.some((template) => template.id === templateId)) {
+        throw new Error(`Unknown personality template: ${templateId}`);
+      }
+      await writeJson(this.settingsPath(), { defaultTemplateId: templateId ?? store.templates[0]?.id }, this.rootPath);
+      this.emitChange();
+      return this.readStore();
+    });
   }
 
   async saveRule(input: Record<string, unknown>): Promise<RulesSkillsStore> {
-    const rule = normalizeRule(input);
-    await this.ensureSeeded();
-    await fsp.writeFile(this.rulePath(rule.id), formatRule(rule), "utf8");
-    this.emitChange();
-    return this.readStore();
+    return this.withCatalogMutation(async () => {
+      const rule = normalizeRule(input);
+      await this.ensureSeeded();
+      await writeUtf8FileAtomic(this.rulePath(rule.id), formatRule(rule), this.rootPath);
+      this.emitChange();
+      return this.readStore();
+    });
   }
 
   async deleteRule(ruleId: string): Promise<RulesSkillsStore> {
-    const id = assertSafeId(ruleId, "rule id");
-    const store = await this.list();
-    await fsp.rm(this.rulePath(id), { force: true });
-    for (const template of store.templates) {
-      if (template.ruleIds.includes(id)) {
-        await writeJson(this.templatePath(template.id), { ...template, ruleIds: template.ruleIds.filter((candidate) => candidate !== id) });
+    return this.withCatalogMutation(async () => {
+      const id = assertSafeId(ruleId, "rule id");
+      const store = await this.readFreshStore();
+      await fsp.rm(this.rulePath(id), { force: true });
+      for (const template of store.templates) {
+        if (template.ruleIds.includes(id)) {
+          await writeJson(this.templatePath(template.id), { ...template, ruleIds: template.ruleIds.filter((candidate) => candidate !== id) }, this.rootPath);
+        }
       }
-    }
-    this.emitChange();
-    return this.readStore();
+      this.emitChange();
+      return this.readStore();
+    });
   }
 
   async saveSkill(input: Record<string, unknown>, options: { failIfExists?: boolean } = {}): Promise<RulesSkillsStore> {
-    const skill = normalizeSkill(input);
-    const skillDir = this.skillPath(skill.id);
-    await this.ensureSeeded();
-    if (options.failIfExists && (fs.existsSync(skillDir) || CLOUDX_SYSTEM_SKILLS.some((systemSkill) => systemSkill.id === skill.id))) {
-      throw new Error(`CloudX skill already exists: ${skill.id}`);
-    }
-    await fsp.mkdir(skillDir, { recursive: true });
-    await writeSkillFile(skillDir, skill);
-    this.emitChange();
-    return this.readStore();
+    return this.withCatalogMutation(async () => {
+      const skill = normalizeSkill(input);
+      const skillDir = this.skillPath(skill.id);
+      await this.ensureSeeded();
+      await requireCatalogDirectory(this.skillsPath(), this.rootPath);
+      if (options.failIfExists && ((await pathExists(skillDir)) || CLOUDX_SYSTEM_SKILLS.some((systemSkill) => systemSkill.id === skill.id))) {
+        throw new Error(`CloudX skill already exists: ${skill.id}`);
+      }
+      await writeSkillFile(skillDir, skill, this.rootPath);
+      this.emitChange();
+      return this.readStore();
+    });
   }
 
   async migrateSkill(input: MigrateCloudxSkillInput): Promise<RulesSkillsStore> {
-    const source = resolveSourceSkill(input);
-    const instructions = await fsp.readFile(source.skillFile, "utf8");
-    const id = assertSafeId(input.id?.trim() || source.id, "skill id");
-    const skill = normalizeSkill({
-      id,
-      name: input.name?.trim() || titleFromId(id),
-      description: input.description?.trim() || summarizeSkill(instructions, source.skillFile),
-      instructions
+    return this.withCatalogMutation(async () => {
+      const source = resolveSourceSkill(input);
+      const instructions = await fsp.readFile(source.skillFile, "utf8");
+      const id = assertSafeId(input.id?.trim() || source.id, "skill id");
+      const skill = normalizeSkill({
+        id,
+        name: input.name?.trim() || titleFromId(id),
+        description: input.description?.trim() || summarizeSkill(instructions, source.skillFile),
+        instructions
+      });
+      const skillDir = this.skillPath(skill.id);
+      await this.ensureSeeded();
+      await requireCatalogDirectory(this.skillsPath(), this.rootPath);
+      if ((await pathExists(skillDir)) || CLOUDX_SYSTEM_SKILLS.some((systemSkill) => systemSkill.id === skill.id)) {
+        throw new Error(`CloudX skill already exists: ${skill.id}`);
+      }
+      await ensureCatalogDirectory(skillDir, this.rootPath);
+      try {
+        if (source.skillDir) {
+          await copySkillResources(source.skillDir, skillDir);
+        }
+        await writeSkillFile(skillDir, skill, this.rootPath);
+      } catch (error) {
+        await fsp.rm(skillDir, { recursive: true, force: true }).catch(() => undefined);
+        throw error;
+      }
+      this.emitChange();
+      return this.readStore();
     });
-    const skillDir = this.skillPath(skill.id);
-    await this.ensureSeeded();
-    if (fs.existsSync(skillDir) || CLOUDX_SYSTEM_SKILLS.some((systemSkill) => systemSkill.id === skill.id)) {
-      throw new Error(`CloudX skill already exists: ${skill.id}`);
-    }
-    await fsp.mkdir(skillDir, { recursive: true });
-    if (source.skillDir) {
-      await copySkillResources(source.skillDir, skillDir);
-    }
-    await writeSkillFile(skillDir, skill);
-    this.emitChange();
-    return this.readStore();
   }
 
   async resolveFor(tab: WorkspaceTab, window?: WorkspaceWindow): Promise<ResolvedPersonalityTemplate | undefined> {
@@ -256,8 +282,23 @@ export class RulesSkillsCatalogService {
     };
   }
 
+  private async readFreshStore(): Promise<RulesSkillsStore> {
+    await this.ensureSeeded();
+    return this.readStore();
+  }
+
+  private withCatalogMutation<T>(mutation: () => Promise<T>): Promise<T> {
+    const operation = this.mutationQueue().then(mutation);
+    RulesSkillsCatalogService.mutationQueues.set(this.rootPath, operation.then(() => undefined, () => undefined));
+    return operation;
+  }
+
+  private mutationQueue(): Promise<void> {
+    return RulesSkillsCatalogService.mutationQueues.get(this.rootPath) ?? Promise.resolve();
+  }
+
   private async readStore(): Promise<RulesSkillsStore> {
-    const settings = await readJson(this.settingsPath());
+    const settings = asRecord(await readJson(this.settingsPath(), this.rootPath));
     const rules = await readRules(this.rulesPath());
     const skills = await readSkills(this.skillsPath());
     const templates = await readTemplates(this.templatesPath());
@@ -274,25 +315,19 @@ export class RulesSkillsCatalogService {
   }
 
   private async ensureSeeded(): Promise<void> {
-    await fsp.mkdir(this.rulesPath(), { recursive: true });
-    await fsp.mkdir(this.skillsPath(), { recursive: true });
-    await fsp.mkdir(this.templatesPath(), { recursive: true });
+    await ensureCatalogDirectory(this.rulesPath(), this.rootPath);
+    await ensureCatalogDirectory(this.skillsPath(), this.rootPath);
+    await ensureCatalogDirectory(this.templatesPath(), this.rootPath);
     await ensureCloudxSystemSkills(this.rootPath);
     const templateFiles = (await readDirectoryEntries(this.templatesPath())).filter((entry) => entry.isFile() && entry.name.endsWith(".json")).sort((a, b) => a.name.localeCompare(b.name));
     const hasTemplates = templateFiles.length > 0;
     if (!hasTemplates) {
-      await fsp.writeFile(this.rulePath(DEFAULT_RULE.id), formatRule(DEFAULT_RULE), "utf8");
-      await writeJson(this.templatePath(DEFAULT_TEMPLATE.id), DEFAULT_TEMPLATE);
+      await writeUtf8FileAtomic(this.rulePath(DEFAULT_RULE.id), formatRule(DEFAULT_RULE), this.rootPath);
+      await writeJson(this.templatePath(DEFAULT_TEMPLATE.id), DEFAULT_TEMPLATE, this.rootPath);
     }
-    if (!fs.existsSync(this.settingsPath())) {
+    if (!(await pathExists(this.settingsPath()))) {
       const defaultTemplateId = hasTemplates ? path.basename(templateFiles[0]?.name ?? "", ".json") : DEFAULT_TEMPLATE.id;
-      await writeJson(this.settingsPath(), { defaultTemplateId });
-    }
-  }
-
-  private async ensureSettings(defaultTemplateId: string): Promise<void> {
-    if (!fs.existsSync(this.settingsPath())) {
-      await writeJson(this.settingsPath(), { defaultTemplateId });
+      await writeJson(this.settingsPath(), { defaultTemplateId }, this.rootPath);
     }
   }
 
@@ -348,7 +383,7 @@ export async function ensureCloudxSystemSkills(rulesSkillsRoot: string): Promise
     await writeSkillFile(path.dirname(cloudxSystemSkillFilePath(rulesSkillsRoot, skill.id)), {
       ...skill,
       instructions: SYSTEM_SKILL_INSTRUCTIONS[skill.id] ?? `# ${skill.name}\n\n${skill.description}`
-    });
+    }, rulesSkillsRoot);
   }
 }
 
@@ -386,12 +421,12 @@ function validateTemplateReferences(template: PersonalityTemplate, store: RulesS
 
 async function readRules(rulesPath: string): Promise<CloudxRule[]> {
   const files = await readDirectoryEntries(rulesPath);
-  const rules = await Promise.all(files.filter((entry) => entry.isFile() && entry.name.endsWith(".md")).map((entry) => readRule(path.join(rulesPath, entry.name))));
+  const rules = await Promise.all(files.filter((entry) => entry.isFile() && entry.name.endsWith(".md")).map((entry) => readRule(path.join(rulesPath, entry.name), path.dirname(rulesPath))));
   return rules.sort(byId);
 }
 
-async function readRule(filePath: string): Promise<CloudxRule> {
-  const content = await fsp.readFile(filePath, "utf8");
+async function readRule(filePath: string, catalogRoot: string): Promise<CloudxRule> {
+  const content = await readUtf8CatalogFile(filePath, catalogRoot);
   const parsed = parseMarkdownWithFrontmatter(content);
   const id = assertSafeId(parsed.frontmatter.id || path.basename(filePath, ".md"), "rule id");
   const text = ruleSentence(parsed.body, filePath);
@@ -413,10 +448,15 @@ async function readSkills(skillsPath: string): Promise<CloudxSkill[]> {
 
 async function readSkill(skillPath: string): Promise<CloudxSkill> {
   const instructionsPath = path.join(skillPath, "SKILL.md");
-  if (!fs.existsSync(instructionsPath)) {
-    throw new Error(`CloudX skill ${skillPath} must contain SKILL.md.`);
+  let instructions: string;
+  try {
+    instructions = await readUtf8CatalogFile(instructionsPath, path.dirname(path.dirname(skillPath)));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new Error(`CloudX skill ${skillPath} must contain SKILL.md.`);
+    }
+    throw error;
   }
-  const instructions = await fsp.readFile(instructionsPath, "utf8");
   const parsed = parseMarkdownWithFrontmatter(instructions);
   const id = assertSafeId(path.basename(skillPath), "skill id");
   if (!parsed.frontmatter.name || !parsed.frontmatter.description) {
@@ -432,7 +472,7 @@ async function readSkill(skillPath: string): Promise<CloudxSkill> {
 
 async function readTemplates(templatesPath: string): Promise<PersonalityTemplate[]> {
   const files = await readDirectoryEntries(templatesPath);
-  const templates = await Promise.all(files.filter((entry) => entry.isFile() && entry.name.endsWith(".json")).map((entry) => readJson(path.join(templatesPath, entry.name)).then(normalizeTemplate)));
+  const templates = await Promise.all(files.filter((entry) => entry.isFile() && entry.name.endsWith(".json")).map((entry) => readJson(path.join(templatesPath, entry.name), path.dirname(templatesPath)).then(normalizeTemplate)));
   return templates.sort(byId);
 }
 
@@ -483,9 +523,9 @@ function formatRule(rule: CloudxRule): string {
   return `---\nid: ${rule.id}\ndescription: ${rule.description}\n---\n${rule.text}\n`;
 }
 
-async function writeSkillFile(skillDir: string, skill: CloudxSkill): Promise<void> {
-  await fsp.mkdir(skillDir, { recursive: true });
-  await writeUtf8FileIfChanged(path.join(skillDir, "SKILL.md"), formatSkill(skill));
+async function writeSkillFile(skillDir: string, skill: CloudxSkill, catalogRoot: string): Promise<void> {
+  await ensureCatalogDirectory(skillDir, catalogRoot);
+  await writeUtf8FileIfChanged(path.join(skillDir, "SKILL.md"), formatSkill(skill), catalogRoot);
 }
 
 function formatSkill(skill: CloudxSkill): string {
@@ -506,7 +546,8 @@ function stripSkillFrontmatter(content: string): string {
   return parseMarkdownWithFrontmatter(content).body || content;
 }
 
-async function writeUtf8FileIfChanged(filePath: string, content: string): Promise<void> {
+async function writeUtf8FileIfChanged(filePath: string, content: string, catalogRoot: string): Promise<void> {
+  await validateWritableCatalogFile(filePath, catalogRoot);
   try {
     if ((await fsp.readFile(filePath, "utf8")) === content) {
       return;
@@ -516,20 +557,17 @@ async function writeUtf8FileIfChanged(filePath: string, content: string): Promis
       throw error;
     }
   }
-  await writeUtf8FileAtomic(filePath, content);
+  await writeUtf8FileAtomic(filePath, content, catalogRoot);
 }
 
-async function writeUtf8FileAtomic(filePath: string, content: string): Promise<void> {
-  const targetPath = await resolveWritableFilePath(filePath);
+async function writeUtf8FileAtomic(filePath: string, content: string, catalogRoot: string): Promise<void> {
+  const targetPath = path.resolve(filePath);
+  const existing = await validateWritableCatalogFile(targetPath, catalogRoot);
   const targetDir = path.dirname(targetPath);
   const tempPath = path.join(targetDir, `.${path.basename(targetPath)}.${process.pid}.${randomUUID()}.tmp`);
   let mode: number | undefined;
-  try {
-    mode = (await fsp.stat(targetPath)).mode;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      throw error;
-    }
+  if (existing) {
+    mode = existing.mode;
   }
   try {
     await fsp.writeFile(tempPath, content, "utf8");
@@ -543,28 +581,131 @@ async function writeUtf8FileAtomic(filePath: string, content: string): Promise<v
   }
 }
 
-async function resolveWritableFilePath(filePath: string): Promise<string> {
-  try {
-    return (await fsp.lstat(filePath)).isSymbolicLink() ? await fsp.realpath(filePath) : filePath;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return filePath;
+async function validateWritableCatalogFile(filePath: string, catalogRoot: string): Promise<fs.Stats | undefined> {
+  const targetPath = path.resolve(filePath);
+  const rootPath = await realCatalogRoot(catalogRoot);
+  const parentPath = await fsp.realpath(path.dirname(targetPath));
+  if (!isSameOrChildPath(rootPath, parentPath)) {
+    throw new Error(`Catalog path resolves outside the rules/skills catalog: ${filePath}`);
+  }
+  const existing = await fsp.lstat(targetPath).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") {
+      return undefined;
     }
     throw error;
+  });
+  if (existing?.isSymbolicLink()) {
+    throw new Error(`Catalog file must not be a symbolic link: ${filePath}`);
   }
+  return existing;
+}
+
+async function validateReadableCatalogFile(filePath: string, catalogRoot: string): Promise<void> {
+  const targetPath = path.resolve(filePath);
+  const rootPath = await realCatalogRoot(catalogRoot);
+  const parentPath = await fsp.realpath(path.dirname(targetPath));
+  if (!isSameOrChildPath(rootPath, parentPath)) {
+    throw new Error(`Catalog path resolves outside the rules/skills catalog: ${filePath}`);
+  }
+  const existing = await fsp.lstat(targetPath);
+  if (existing.isSymbolicLink()) {
+    throw new Error(`Catalog file must not be a symbolic link: ${filePath}`);
+  }
+  if (!existing.isFile()) {
+    throw new Error(`Catalog file must be a regular file: ${filePath}`);
+  }
+}
+
+async function requireCatalogDirectory(directoryPath: string, catalogRoot: string): Promise<void> {
+  const directory = path.resolve(directoryPath);
+  const rootPath = await realCatalogRoot(catalogRoot);
+  const stat = await fsp.lstat(directory);
+  if (stat.isSymbolicLink()) {
+    throw new Error(`Catalog directory must not be a symbolic link: ${directoryPath}`);
+  }
+  if (!stat.isDirectory()) {
+    throw new Error(`Catalog path must be a directory: ${directoryPath}`);
+  }
+  const realDirectory = await fsp.realpath(directory);
+  if (!isSameOrChildPath(rootPath, realDirectory)) {
+    throw new Error(`Catalog directory resolves outside the rules/skills catalog: ${directoryPath}`);
+  }
+}
+
+async function ensureCatalogDirectory(directoryPath: string, catalogRoot: string): Promise<void> {
+  const directory = path.resolve(directoryPath);
+  const root = path.resolve(catalogRoot);
+  if (!isSameOrChildPath(root, directory)) {
+    throw new Error(`Catalog directory resolves outside the rules/skills catalog: ${directoryPath}`);
+  }
+  if (directory !== root) {
+    await ensureCatalogDirectory(path.dirname(directory), root);
+  }
+  const existing = await fsp.lstat(directory).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  });
+  if (!existing) {
+    await fsp.mkdir(directory, directory === root ? { recursive: true } : undefined).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "EEXIST") {
+        throw error;
+      }
+    });
+  }
+  await requireCatalogDirectory(directory, root);
+}
+
+async function realCatalogRoot(catalogRoot: string): Promise<string> {
+  const root = path.resolve(catalogRoot);
+  const stat = await fsp.lstat(root);
+  if (stat.isSymbolicLink()) {
+    throw new Error(`Catalog directory must not be a symbolic link: ${root}`);
+  }
+  if (!stat.isDirectory()) {
+    throw new Error(`Catalog path must be a directory: ${root}`);
+  }
+  return fsp.realpath(root);
 }
 
 function frontmatterString(value: string): string {
   return JSON.stringify(value);
 }
 
-async function readJson(filePath: string): Promise<Record<string, unknown>> {
-  return JSON.parse(await fsp.readFile(filePath, "utf8")) as Record<string, unknown>;
+async function readUtf8CatalogFile(filePath: string, catalogRoot: string): Promise<string> {
+  await validateReadableCatalogFile(filePath, catalogRoot);
+  const file = await fsp.open(path.resolve(filePath), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    return await file.readFile("utf8");
+  } finally {
+    await file.close();
+  }
 }
 
-async function writeJson(filePath: string, value: unknown): Promise<void> {
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  await fsp.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+async function readJson(filePath: string, catalogRoot: string): Promise<unknown> {
+  return JSON.parse(await readUtf8CatalogFile(filePath, catalogRoot)) as unknown;
+}
+
+async function writeJson(filePath: string, value: unknown, catalogRoot: string): Promise<void> {
+  await ensureCatalogDirectory(path.dirname(filePath), catalogRoot);
+  await writeUtf8FileAtomic(filePath, `${JSON.stringify(value, null, 2)}\n`, catalogRoot);
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return isRecord(value) ? value : {};
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
+  try {
+    await fsp.lstat(filePath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
 }
 
 function normalizeTemplate(value: unknown): PersonalityTemplate {
@@ -633,12 +774,27 @@ async function copySkillResources(sourceDir: string, targetDir: string): Promise
     }
     const sourcePath = path.join(sourceDir, entry.name);
     const targetPath = path.join(targetDir, entry.name);
-    if (entry.isDirectory()) {
-      await fsp.cp(sourcePath, targetPath, { recursive: true });
-    } else if (entry.isFile()) {
-      await fsp.copyFile(sourcePath, targetPath);
-    }
+    await copySkillResourceEntry(sourcePath, targetPath);
   }
+}
+
+async function copySkillResourceEntry(sourcePath: string, targetPath: string): Promise<void> {
+  const stat = await fsp.lstat(sourcePath);
+  if (stat.isSymbolicLink()) {
+    throw new Error(`Migrated skill resource must not be a symbolic link: ${sourcePath}`);
+  }
+  if (stat.isDirectory()) {
+    await fsp.mkdir(targetPath);
+    for (const entry of await readDirectoryEntries(sourcePath)) {
+      await copySkillResourceEntry(path.join(sourcePath, entry.name), path.join(targetPath, entry.name));
+    }
+    return;
+  }
+  if (stat.isFile()) {
+    await fsp.copyFile(sourcePath, targetPath, fs.constants.COPYFILE_EXCL);
+    return;
+  }
+  throw new Error(`Migrated skill resource must be a regular file or directory: ${sourcePath}`);
 }
 
 function summarizeSkill(content: string, sourcePath: string): string {

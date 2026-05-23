@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Palette, Pencil, Plus, RefreshCw, Save, Trash2, X } from "lucide-react";
+import { Palette, Pencil, Plus, RefreshCw, Save, Trash2, X, Zap } from "lucide-react";
 
 import {
   RULES_SKILLS_PLUGIN_ID,
@@ -53,6 +53,7 @@ export function RulesSkillsPanel({
   onSetDefault,
   onSaveRule,
   onDeleteRule,
+  onInjectRuntime,
   onRefreshStore
 }: {
   store?: RulesSkillsStore;
@@ -61,6 +62,7 @@ export function RulesSkillsPanel({
   onSetDefault: (templateId: string | undefined) => Promise<void>;
   onSaveRule: (rule: CloudxRule) => Promise<void>;
   onDeleteRule: (ruleId: string) => Promise<void>;
+  onInjectRuntime?: () => Promise<number>;
   onRefreshStore?: () => Promise<void>;
 }) {
   const templates = store?.templates ?? [];
@@ -74,6 +76,9 @@ export function RulesSkillsPanel({
   const [editingRuleDescription, setEditingRuleDescription] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | undefined>();
+  const [status, setStatus] = useState("Templates loaded.");
+  const savedDraft = templateDraft(selected);
+  const hasUnsavedTemplateChanges = draftMode === "new" || !templateDraftsEqual(draft, savedDraft);
 
   useEffect(() => {
     if (!onRefreshStore) {
@@ -112,18 +117,40 @@ export function RulesSkillsPanel({
   }
 
   function createTemplate() {
+    if (hasUnsavedTemplateChanges && !confirmDiscardUnsavedChanges(draft.name)) {
+      setStatus("Create cancelled. Save or discard the current changes first.");
+      return;
+    }
     const id = `template-${crypto.randomUUID()}`;
     setSelectedId(id);
     setDraftMode("new");
     setDraft({ id, name: "New Template", color: "green", ruleIds: [], skillIds: [] });
+    setStatus("New template has unsaved changes.");
+  }
+
+  function selectTemplate(template: PersonalityTemplate) {
+    if (template.id === draft.id) {
+      return;
+    }
+    if (hasUnsavedTemplateChanges && !confirmDiscardUnsavedChanges(draft.name)) {
+      setStatus("Switch cancelled. Save or discard the current changes first.");
+      return;
+    }
+    setSelectedId(template.id);
+    setDraftMode("existing");
+    setDraft(templateDraft(template));
+    setStatus("Template loaded.");
   }
 
   async function submit() {
     setBusy(true);
     setError(undefined);
     try {
-      await onSaveTemplate(templateFromDraft(draft));
+      const template = templateFromDraft(draft);
+      await onSaveTemplate(template);
+      setSelectedId(template.id);
       setDraftMode("existing");
+      setStatus("Template saved.");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -141,6 +168,7 @@ export function RulesSkillsPanel({
       await onDeleteTemplate(draft.id);
       setSelectedId("");
       setDraftMode("existing");
+      setStatus("Template deleted.");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -153,6 +181,7 @@ export function RulesSkillsPanel({
     setError(undefined);
     try {
       await onSetDefault(draft.id || undefined);
+      setStatus("Default template saved.");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -174,6 +203,7 @@ export function RulesSkillsPanel({
       setDraft(nextDraft);
       setDraftMode("existing");
       setNewRuleText("");
+      setStatus("Rule added and template saved.");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -204,6 +234,7 @@ export function RulesSkillsPanel({
     try {
       await onSaveRule(edited);
       cancelEditingRule();
+      setStatus("Rule saved.");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -215,10 +246,35 @@ export function RulesSkillsPanel({
     if (!onRefreshStore) {
       return;
     }
+    if (hasUnsavedTemplateChanges && !confirmDiscardUnsavedChanges(draft.name)) {
+      setStatus("Refresh cancelled. Save or discard the current changes first.");
+      return;
+    }
     setBusy(true);
     setError(undefined);
     try {
       await onRefreshStore();
+      setStatus("Rules and skills refreshed.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function injectRuntime() {
+    if (!onInjectRuntime) {
+      return;
+    }
+    if (hasUnsavedTemplateChanges) {
+      setStatus("Save template changes before injecting.");
+      return;
+    }
+    setBusy(true);
+    setError(undefined);
+    try {
+      const count = await onInjectRuntime();
+      setStatus(count === 1 ? "Injected into 1 Codex tab." : `Injected into ${count} Codex tabs.`);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -234,7 +290,7 @@ export function RulesSkillsPanel({
     <div className="rules-skills-panel">
       <div className="rules-skills-sidebar">
         {templates.map((template) => (
-          <button key={template.id} type="button" className={template.id === draft.id ? "selected" : ""} onClick={() => { setSelectedId(template.id); setDraftMode("existing"); setDraft(templateDraft(template)); }}>
+          <button key={template.id} type="button" className={`${template.id === draft.id ? "selected" : ""} ${template.id === draft.id && hasUnsavedTemplateChanges ? "dirty" : ""}`} onClick={() => selectTemplate(template)}>
             <span className={`template-color ${template.color}`} />
             <span>{template.name}</span>
           </button>
@@ -333,19 +389,26 @@ export function RulesSkillsPanel({
           )) : <p>No CloudX skills yet.</p>}
         </section>
 
-        <div className="rules-skills-actions">
-          <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void refreshStore()} disabled={busy || !onRefreshStore} title="Refresh rules and skills" aria-label="Refresh rules and skills">
-            <RefreshCw size={15} />
-          </ControlButton>
-          <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void submit()} disabled={busy || !draft.id.trim() || !draft.name.trim()} title="Save template" aria-label="Save template">
-            <Save size={15} />
-          </ControlButton>
-          <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void makeDefault()} disabled={busy || draftMode === "new" || draft.id === store.defaultTemplateId} title="Set default" aria-label="Set default">
-            <Palette size={15} />
-          </ControlButton>
-          <ControlButton type="button" className="compact-icon-button danger" tone="danger" size="compact" iconOnly onClick={() => void remove()} disabled={busy || draftMode === "new" || templates.length <= 1} title="Delete template" aria-label="Delete template">
-            <Trash2 size={15} />
-          </ControlButton>
+        <div className="rules-skills-footer">
+          <span className="rules-skills-status" aria-live="polite">{status}</span>
+          {draft.id ? <span className={`rules-skills-save-state automation-save-state ${hasUnsavedTemplateChanges ? "dirty" : "saved"}`}>{hasUnsavedTemplateChanges ? "Unsaved" : "Saved"}</span> : null}
+          <div className="rules-skills-actions">
+            <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void refreshStore()} disabled={busy || !onRefreshStore} title="Refresh rules and skills" aria-label="Refresh rules and skills">
+              <RefreshCw size={15} />
+            </ControlButton>
+            <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void submit()} disabled={busy || !draft.id.trim() || !draft.name.trim() || !hasUnsavedTemplateChanges} title={hasUnsavedTemplateChanges ? "Save template changes" : "Template is saved"} aria-label="Save template">
+              <Save size={15} />
+            </ControlButton>
+            <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void injectRuntime()} disabled={busy || !onInjectRuntime || draftMode === "new" || hasUnsavedTemplateChanges} title={hasUnsavedTemplateChanges ? "Save template changes before injecting" : "Inject saved rules and skills into running Codex tabs"} aria-label="Inject saved rules and skills">
+              <Zap size={15} />
+            </ControlButton>
+            <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void makeDefault()} disabled={busy || draftMode === "new" || hasUnsavedTemplateChanges || draft.id === store.defaultTemplateId} title="Set default" aria-label="Set default">
+              <Palette size={15} />
+            </ControlButton>
+            <ControlButton type="button" className="compact-icon-button danger" tone="danger" size="compact" iconOnly onClick={() => void remove()} disabled={busy || draftMode === "new" || hasUnsavedTemplateChanges || templates.length <= 1} title="Delete template" aria-label="Delete template">
+              <Trash2 size={15} />
+            </ControlButton>
+          </div>
         </div>
         {error ? <div className="window-menu-error">{error}</div> : null}
       </div>
@@ -390,13 +453,22 @@ export function templateFromDraft(draft: TemplateDraft): PersonalityTemplate {
   };
 }
 
+export function templateDraftsEqual(first: TemplateDraft, second: TemplateDraft): boolean {
+  return personalityTemplatesEqual(templateFromDraft(first), templateFromDraft(second));
+}
+
+export function personalityTemplatesEqual(first: PersonalityTemplate, second: PersonalityTemplate): boolean {
+  return first.id === second.id && first.name === second.name && first.color === second.color && stringArraysEqual(first.ruleIds, second.ruleIds) && stringArraysEqual(first.skillIds, second.skillIds);
+}
+
 export function draftWithRuleEnabled(draft: TemplateDraft, ruleId: string): TemplateDraft {
   return { ...draft, ruleIds: [...new Set([...draft.ruleIds, ruleId])] };
 }
 
 export function cloudxRuleFromText(value: string): CloudxRule | undefined {
   const text = value.trim();
-  return text ? { id: slugFromText(text), description: text, text } : undefined;
+  const id = text ? slugFromText(text) : undefined;
+  return id ? { id, description: text, text } : undefined;
 }
 
 export function cloudxRuleFromEdit(rule: CloudxRule, textValue: string, descriptionValue: string): CloudxRule | undefined {
@@ -411,6 +483,15 @@ export function cloudxRuleFromEdit(rule: CloudxRule, textValue: string, descript
   return { id: rule.id, description, text };
 }
 
-function slugFromText(text: string): string {
-  return text.toLowerCase().replace(/[^a-z0-9]+/gu, "-").replace(/^-|-$/gu, "").slice(0, 48) || `rule-${Date.now()}`;
+function slugFromText(text: string): string | undefined {
+  return text.toLowerCase().replace(/[^a-z0-9]+/gu, "-").replace(/^-|-$/gu, "").slice(0, 48) || undefined;
+}
+
+function stringArraysEqual(first: string[], second: string[]): boolean {
+  return first.length === second.length && first.every((value, index) => value === second[index]);
+}
+
+function confirmDiscardUnsavedChanges(templateName: string | undefined): boolean {
+  const subject = templateName?.trim() || "the current template";
+  return window.confirm(`Discard unsaved changes to ${subject}?`);
 }

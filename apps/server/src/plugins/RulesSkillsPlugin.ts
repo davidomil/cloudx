@@ -1,7 +1,13 @@
 import type { CreatePluginSessionInput, HookDefinition, PluginSession, WorkspacePlugin } from "@cloudx/plugin-api";
-import { RULES_SKILLS_PLUGIN_ID } from "@cloudx/shared";
+import { RULES_SKILLS_PLUGIN_ID, type WorkspaceTab } from "@cloudx/shared";
 
 import type { RulesSkillsCatalogService } from "../rulesSkills/RulesSkillsCatalogService.js";
+
+export interface RulesSkillsRuntimeInjectionResult extends Record<string, unknown> {
+  tabs: WorkspaceTab[];
+}
+
+export type RulesSkillsRuntimeInjector = () => Promise<RulesSkillsRuntimeInjectionResult> | RulesSkillsRuntimeInjectionResult;
 
 export class RulesSkillsPlugin implements WorkspacePlugin {
   readonly id = RULES_SKILLS_PLUGIN_ID;
@@ -33,7 +39,7 @@ export class RulesSkillsPlugin implements WorkspacePlugin {
     }
   ];
 
-  constructor(private readonly catalog: RulesSkillsCatalogService) {
+  constructor(private readonly catalog: RulesSkillsCatalogService, private readonly runtimeInjector?: RulesSkillsRuntimeInjector) {
     this.hooks = [
       {
         id: "rules-skills.catalog.list",
@@ -136,6 +142,28 @@ export class RulesSkillsPlugin implements WorkspacePlugin {
           additionalProperties: false
         },
         execute: async (input) => ({ store: await this.catalog.deleteRule(requireString(input.ruleId, "ruleId")) })
+      },
+      {
+        id: "rules-skills.runtime.inject",
+        owner: { kind: "plugin", pluginId: this.id },
+        title: "Inject Saved Rules Skills Runtime",
+        description: "Apply saved rules/skills runtime context to running Codex tabs.",
+        exposures: ["app", "plugin", "ui", "http"],
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        outputSchema: {
+          type: "object",
+          properties: {
+            tabs: { type: "array", items: { type: "object", additionalProperties: true } }
+          },
+          required: ["tabs"],
+          additionalProperties: false
+        },
+        execute: async () => {
+          if (!this.runtimeInjector) {
+            throw new Error("Rules & Skills runtime injector is not available.");
+          }
+          return this.runtimeInjector();
+        }
       },
       {
         id: "rules-skills.skills.createCloudxSkill",

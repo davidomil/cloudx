@@ -241,8 +241,9 @@ export class SessionStore {
     }
     const input = this.plugins.sanitizeVoiceInput(pluginId, action.action, action.input);
     this.plugins.validateVoiceInput(pluginId, action.action, input);
-    const result = await session.handleAction(action.action, input);
+    const result = this.plugins.validateOutput(pluginId, action.action, await session.handleAction(action.action, input));
     await this.contextService.record(this.getTab(targetTabId), "voice-action", JSON.stringify({ action: { ...action, input }, result }, null, 2));
+    this.markTabInteractedIfActionUpdatesState(pluginId, action.action, targetTabId);
     return result;
   }
 
@@ -297,8 +298,9 @@ export class SessionStore {
   async executePluginAction(tabId: string, action: string, input: Record<string, unknown>): Promise<Record<string, unknown>> {
     const session = this.getSession(tabId);
     this.plugins.validateInput(session.tab.pluginId, action, input);
-    const result = await session.handleAction(action, input);
+    const result = this.plugins.validateOutput(session.tab.pluginId, action, await session.handleAction(action, input));
     await this.contextService.record(this.getTab(tabId), "plugin-action", JSON.stringify({ action, input, result }, null, 2));
+    this.markTabInteractedIfActionUpdatesState(session.tab.pluginId, action, tabId);
     return result;
   }
 
@@ -317,8 +319,9 @@ export class SessionStore {
     } else {
       this.plugins.validateInput(pluginId, action, actionInput);
     }
-    const result = await session.handleAction(action, actionInput);
+    const result = this.plugins.validateOutput(pluginId, action, await session.handleAction(action, actionInput));
     await this.contextService.record(this.getTab(tabId), "plugin-hook", JSON.stringify({ hookId, action, input: actionInput, caller, result }, null, 2));
+    this.markTabInteractedIfActionUpdatesState(pluginId, action, tabId);
     return result;
   }
 
@@ -445,6 +448,16 @@ export class SessionStore {
     const current = this.getTab(tabId);
     this.tabs.set(tabId, { ...current, ...patch, updatedAt: new Date().toISOString() });
     this.emitTabsChange();
+  }
+
+  private markTabInteracted(tabId: string): void {
+    this.updateTab(tabId, {});
+  }
+
+  private markTabInteractedIfActionUpdatesState(pluginId: string, action: string, tabId: string): void {
+    if (this.plugins.updatesTabState(pluginId, action)) {
+      this.markTabInteracted(tabId);
+    }
   }
 
   updateTabIndicator(tabId: string, indicator: TabIndicatorUpdate): WorkspaceTab {
@@ -672,8 +685,11 @@ export class SessionStore {
   }
 
   private resolvePluginHookTargetTabId(pluginId: string, targetTabId?: string, fallbackTabId?: string): string | undefined {
-    if (targetTabId && this.sessions.has(targetTabId)) {
-      return targetTabId;
+    if (targetTabId) {
+      if (this.sessions.has(targetTabId)) {
+        return targetTabId;
+      }
+      throw new Error(`Unknown tab for hook target: ${targetTabId}`);
     }
     if (fallbackTabId) {
       const fallbackSession = this.sessions.get(fallbackTabId);
@@ -684,9 +700,6 @@ export class SessionStore {
     const matchingTabs = this.listTabs().filter((tab) => tab.pluginId === pluginId);
     if (matchingTabs.length === 1) {
       return matchingTabs[0]!.id;
-    }
-    if (targetTabId) {
-      throw new Error(`Unknown tab for hook target: ${targetTabId}`);
     }
     return undefined;
   }

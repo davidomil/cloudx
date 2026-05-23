@@ -63,6 +63,38 @@ describe("RulesSkillsCatalogService", () => {
     expect(after.mtimeMs).toBe(before.mtimeMs);
   });
 
+  it("seeds catalog directories idempotently when concurrent reads create the same path", async () => {
+    const service = await createService();
+    const rulesPath = path.join(service.catalogRoot(), "rules");
+    const originalMkdir = fs.mkdir.bind(fs);
+    const enteredRulesMkdir = deferred<void>();
+    const resumeRulesMkdir = deferred<void>();
+    let delayedRulesMkdir = false;
+    const mkdir = vi.spyOn(fs, "mkdir").mockImplementation(async (...args: Parameters<typeof fs.mkdir>) => {
+      if (String(args[0]) === rulesPath && !delayedRulesMkdir) {
+        delayedRulesMkdir = true;
+        enteredRulesMkdir.resolve();
+        await resumeRulesMkdir.promise;
+      }
+      return originalMkdir(...args);
+    });
+
+    try {
+      const firstRead = service.list();
+      await enteredRulesMkdir.promise;
+      const secondRead = service.list();
+      await letPendingOperationsRun();
+      resumeRulesMkdir.resolve();
+
+      await expect(Promise.all([firstRead, secondRead])).resolves.toEqual([
+        expect.objectContaining({ defaultTemplateId: "default-codex" }),
+        expect.objectContaining({ defaultTemplateId: "default-codex" })
+      ]);
+    } finally {
+      mkdir.mockRestore();
+    }
+  });
+
   it("does not reattach a deleted default rule when recreating the last template", async () => {
     const service = await createService();
     await service.deleteRule("keep-changes-focused");
@@ -74,6 +106,127 @@ describe("RulesSkillsCatalogService", () => {
       id: "default-codex",
       ruleIds: []
     }));
+  });
+
+  it("rejects catalog writes through symlinked files", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const service = await createService();
+    await service.list();
+    const outside = path.join(await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-rules-skills-outside-")), "outside.md");
+    await fs.writeFile(outside, "outside\n", "utf8");
+    const ruleFile = path.join(service.catalogRoot(), "rules", "keep-changes-focused.md");
+    await fs.rm(ruleFile);
+    await fs.symlink(outside, ruleFile);
+
+    await expect(service.saveRule({ id: "keep-changes-focused", description: "Changed.", text: "Changed rule." })).rejects.toThrow("symbolic link");
+    await expect(fs.readFile(outside, "utf8")).resolves.toBe("outside\n");
+  });
+
+  it("rejects catalog writes through symlinked catalog directories", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const service = await createService();
+    await service.list();
+    const outsideTemplates = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-rules-skills-templates-"));
+    const templatesPath = path.join(service.catalogRoot(), "templates");
+    await fs.rm(templatesPath, { recursive: true, force: true });
+    await fs.symlink(outsideTemplates, templatesPath, "dir");
+
+    await expect(service.saveTemplate({ id: "outside-template", name: "Outside", color: "yellow", ruleIds: [], skillIds: [] })).rejects.toThrow("symbolic link");
+    await expect(fs.stat(path.join(outsideTemplates, "outside-template.json"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects symlinked catalog roots before seeding default files outside the catalog", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-rules-skills-root-link-"));
+    const dataDir = path.join(root, ".cloudx");
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-rules-skills-root-outside-"));
+    await fs.mkdir(dataDir);
+    await fs.symlink(outside, path.join(dataDir, "rules-skills"), "dir");
+    const service = new RulesSkillsCatalogService(dataDir);
+
+    await expect(service.list()).rejects.toThrow("symbolic link");
+    await expect(fs.readdir(outside)).resolves.toEqual([]);
+  });
+
+  it("rejects symlinked system-skill directories before creating system skill files outside the catalog", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const service = await createService();
+    await service.list();
+    const outsideSystemSkills = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-system-skills-outside-"));
+    const systemSkillsPath = path.join(service.catalogRoot(), "system-skills");
+    await fs.rm(systemSkillsPath, { recursive: true, force: true });
+    await fs.symlink(outsideSystemSkills, systemSkillsPath, "dir");
+
+    await expect(service.list()).rejects.toThrow("symbolic link");
+    await expect(fs.readdir(outsideSystemSkills)).resolves.toEqual([]);
+  });
+
+  it("rejects symlinked catalog settings before reading external default-template state", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const service = await createService();
+    await service.list();
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-rules-skills-settings-outside-"));
+    const outsideSettings = path.join(outside, "settings.json");
+    await fs.writeFile(outsideSettings, JSON.stringify({ defaultTemplateId: "outside-template" }), "utf8");
+    const settingsPath = path.join(service.catalogRoot(), "settings.json");
+    await fs.rm(settingsPath);
+    await fs.symlink(outsideSettings, settingsPath);
+
+    await expect(service.list()).rejects.toThrow("symbolic link");
+  });
+
+  it("rejects migrated skill resource copies through symlinked skills directories", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const service = await createService();
+    await service.list();
+    const sourceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-source-skill-"));
+    const sourceSkill = path.join(sourceRoot, "source-skill");
+    await fs.mkdir(path.join(sourceSkill, "scripts"), { recursive: true });
+    await fs.writeFile(path.join(sourceSkill, "SKILL.md"), "# Source Skill\n\nUse this skill.\n", "utf8");
+    await fs.writeFile(path.join(sourceSkill, "scripts", "run.sh"), "echo escaped\n", "utf8");
+    const outsideSkills = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-rules-skills-skill-dir-"));
+    const skillsPath = path.join(service.catalogRoot(), "skills");
+    await fs.rm(skillsPath, { recursive: true, force: true });
+    await fs.symlink(outsideSkills, skillsPath, "dir");
+
+    await expect(service.migrateSkill({ sourcePath: sourceSkill, id: "escaped-skill" })).rejects.toThrow("symbolic link");
+    await expect(fs.stat(path.join(outsideSkills, "escaped-skill", "scripts", "run.sh"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("persists a replacement default when deleting the active template", async () => {
+    const service = await createService();
+    await service.saveTemplate({ id: "focused", name: "Focused", color: "yellow", ruleIds: [], skillIds: [] });
+    await service.setDefaultTemplate("focused");
+
+    const afterDelete = await service.deleteTemplate("focused");
+
+    expect(afterDelete.defaultTemplateId).toBe("default-codex");
+    await service.saveTemplate({ id: "focused", name: "Focused Again", color: "red", ruleIds: [], skillIds: [] });
+    const afterRecreate = await service.list();
+    expect(afterRecreate.defaultTemplateId).toBe("default-codex");
+    await expect(fs.readFile(path.join(service.catalogRoot(), "settings.json"), "utf8")).resolves.toContain('"defaultTemplateId": "default-codex"');
+  });
+
+  it("normalizes wrong-shaped settings instead of failing catalog reads", async () => {
+    const service = await createService();
+    await service.list();
+    await fs.writeFile(path.join(service.catalogRoot(), "settings.json"), "null\n", "utf8");
+
+    await expect(service.list()).resolves.toMatchObject({
+      defaultTemplateId: "default-codex"
+    });
   });
 
   it("loads skills written directly into the folder-backed catalog", async () => {
@@ -147,6 +300,40 @@ describe("RulesSkillsCatalogService", () => {
     expect(listener).toHaveBeenCalledTimes(3);
   });
 
+  it("does not leave templates referencing rules deleted by concurrent catalog mutations", async () => {
+    const service = await createService();
+    await service.saveRule({ id: "volatile-rule", description: "Volatile.", text: "Volatile rule." });
+    const rulePath = path.join(service.catalogRoot(), "rules", "volatile-rule.md");
+    const originalRm = fs.rm.bind(fs);
+    const enteredRuleRemoval = deferred<void>();
+    const resumeRuleRemoval = deferred<void>();
+    const rm = vi.spyOn(fs, "rm").mockImplementation(async (...args: Parameters<typeof fs.rm>) => {
+      if (String(args[0]) === rulePath) {
+        enteredRuleRemoval.resolve();
+        await resumeRuleRemoval.promise;
+      }
+      return originalRm(...args);
+    });
+
+    const deleteRule = service.deleteRule("volatile-rule");
+    await enteredRuleRemoval.promise;
+    const saveTemplate = service.saveTemplate({
+      id: "late-template",
+      name: "Late Template",
+      color: "yellow",
+      ruleIds: ["volatile-rule"],
+      skillIds: []
+    });
+    await letPendingOperationsRun();
+    resumeRuleRemoval.resolve();
+    await Promise.allSettled([deleteRule, saveTemplate]);
+    rm.mockRestore();
+
+    const store = await service.list();
+    expect(store.rules.map((rule) => rule.id)).not.toContain("volatile-rule");
+    expect(store.templates.flatMap((template) => template.ruleIds)).not.toContain("volatile-rule");
+  });
+
   it("migrates existing skills into the CloudX catalog and rejects duplicates", async () => {
     const service = await createService();
     const sourceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-source-skill-"));
@@ -163,6 +350,23 @@ describe("RulesSkillsCatalogService", () => {
     expect(migratedSkill).toContain('description: "Source Skill"');
     await expect(fs.readFile(path.join(service.catalogRoot(), "skills", "cloudx-source-skill", "scripts", "run.sh"), "utf8")).resolves.toContain("migrated");
     await expect(service.migrateSkill({ sourcePath: sourceSkill, id: "cloudx-source-skill" })).rejects.toThrow("CloudX skill already exists");
+  });
+
+  it("rejects symlinked migrated skill resources and removes the partial target skill", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const service = await createService();
+    const sourceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-source-skill-link-"));
+    const sourceSkill = path.join(sourceRoot, "source-skill");
+    const outsideFile = path.join(sourceRoot, "outside.sh");
+    await fs.mkdir(sourceSkill, { recursive: true });
+    await fs.writeFile(path.join(sourceSkill, "SKILL.md"), "# Source Skill\n\nUse this skill.\n", "utf8");
+    await fs.writeFile(outsideFile, "echo outside\n", "utf8");
+    await fs.symlink(outsideFile, path.join(sourceSkill, "outside-link.sh"));
+
+    await expect(service.migrateSkill({ sourcePath: sourceSkill, id: "linked-resource" })).rejects.toThrow("symbolic link");
+    await expect(fs.stat(path.join(service.catalogRoot(), "skills", "linked-resource"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("rejects unsafe catalog ids and missing migration sources with clear errors", async () => {
@@ -204,4 +408,18 @@ function workspaceWindow(metadata: Record<string, unknown>): WorkspaceWindow {
     createdAt: new Date(0).toISOString(),
     updatedAt: new Date(0).toISOString()
   };
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T | PromiseLike<T>) => void; reject: (error: unknown) => void } {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
+
+async function letPendingOperationsRun(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 20));
 }
