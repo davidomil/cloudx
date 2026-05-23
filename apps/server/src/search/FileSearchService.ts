@@ -1,16 +1,16 @@
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import path from "node:path";
-import { promisify } from "node:util";
+import { StringDecoder } from "node:string_decoder";
 
 import type { FileSearchFileResult, FileSearchMatch, FileSearchMode, FileSearchResult } from "@cloudx/shared";
 
-const execFileAsync = promisify(execFile);
-
-const MAX_RG_OUTPUT_BYTES = 2_000_000;
 const MAX_SEARCH_FILES = 200;
 const MAX_MATCHES_PER_FILE = 5;
+const RG_MATCH_LINES_PER_FILE_LIMIT = MAX_MATCHES_PER_FILE + 1;
 const MAX_SNIPPET_CHARS = 1_000;
 const MAX_FILE_SIZE = "1M";
+const RG_TIMEOUT_MS = 10_000;
+const MAX_RG_STDERR_CHARS = 64_000;
 
 interface SearchInput {
   query: string;
@@ -21,11 +21,12 @@ interface SearchInput {
   maxResults?: number;
 }
 
-interface RgCommandResult {
-  stdout: string;
-  stderr: string;
-  code: number;
+interface FilenameSearchMatches {
+  files: FileSearchFileResult[];
+  truncated: boolean;
 }
+
+type ContentSearchMatches = FilenameSearchMatches;
 
 interface RgMatchMessage {
   type: "match";
@@ -67,47 +68,146 @@ export class FileSearchService {
   }
 
   private async searchFilenames(cwd: string, input: Required<Pick<SearchInput, "query" | "relativePath" | "maxResults" | "caseSensitive">> & { glob?: string }): Promise<FileSearchResult> {
-    const args = ["--no-config", "--files", "--color", "never", ...globArgs(input.glob), input.relativePath];
-    const result = await this.runRg(cwd, args, { allowExitCodes: [0, 1] });
-    const needle = input.caseSensitive ? input.query : input.query.toLowerCase();
-    const files: FileSearchFileResult[] = [];
-    const seen = new Set<string>();
-    let truncated = false;
-
-    for (const filePath of result.stdout.split("\n").map((line) => line.trim()).filter(Boolean)) {
-      for (const entry of filenameCandidates(normalizeResultPath(filePath))) {
-        const haystack = input.caseSensitive ? entry.path : entry.path.toLowerCase();
-        const seenKey = `${entry.entryType}:${entry.path}`;
-        if (!haystack.includes(needle) || seen.has(seenKey)) {
-          continue;
-        }
-        if (files.length >= input.maxResults) {
-          truncated = true;
-          break;
-        }
-        seen.add(seenKey);
-        files.push({
-          path: entry.path,
-          type: "filename",
-          entryType: entry.entryType,
-          matches: [{ text: entry.path, matchText: input.query }],
-          truncated: false
-        });
-      }
-      if (truncated) {
-        break;
-      }
-    }
+    const args = ["--no-config", "--files", "--null", "--color", "never", ...globArgs(input.glob), "--", input.relativePath];
+    const result = await this.streamFilenameMatches(cwd, args, input);
 
     return {
       query: input.query,
       mode: "filename",
       relativePath: input.relativePath,
       glob: input.glob,
-      files,
-      truncated,
+      files: result.files,
+      truncated: result.truncated,
       searchedAt: new Date().toISOString()
     };
+  }
+
+  private async streamFilenameMatches(
+    cwd: string,
+    args: string[],
+    input: Required<Pick<SearchInput, "query" | "relativePath" | "maxResults" | "caseSensitive">> & { glob?: string }
+  ): Promise<FilenameSearchMatches> {
+    const needle = input.caseSensitive ? input.query : input.query.toLowerCase();
+
+    return new Promise((resolve, reject) => {
+      const child = spawn("rg", args, {
+        cwd,
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true
+      });
+      const decoder = new StringDecoder("utf8");
+      const files: FileSearchFileResult[] = [];
+      const seen = new Set<string>();
+      let pending = "";
+      let stderr = "";
+      let truncated = false;
+      let timedOut = false;
+      let stoppedAfterLimit = false;
+      let settled = false;
+
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGTERM");
+      }, RG_TIMEOUT_MS);
+
+      const settle = (callback: () => void): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timeout);
+        callback();
+      };
+
+      const processRecord = (filePath: string): boolean => {
+        const normalizedPath = normalizeResultPath(filePath);
+        if (!normalizedPath) {
+          return false;
+        }
+        for (const entry of filenameCandidates(normalizedPath)) {
+          const haystack = input.caseSensitive ? entry.path : entry.path.toLowerCase();
+          const seenKey = `${entry.entryType}:${entry.path}`;
+          if (!haystack.includes(needle) || seen.has(seenKey)) {
+            continue;
+          }
+          if (files.length >= input.maxResults) {
+            truncated = true;
+            return true;
+          }
+          seen.add(seenKey);
+          files.push({
+            path: entry.path,
+            type: "filename",
+            entryType: entry.entryType,
+            matches: [{ text: entry.path, matchText: input.query }],
+            truncated: false
+          });
+        }
+        return false;
+      };
+
+      const stopAfterLimit = (): void => {
+        stoppedAfterLimit = true;
+        child.kill("SIGTERM");
+      };
+
+      const processOutput = (output: string): void => {
+        pending += output;
+        while (!stoppedAfterLimit) {
+          const separatorIndex = pending.indexOf("\0");
+          if (separatorIndex === -1) {
+            return;
+          }
+          const record = pending.slice(0, separatorIndex);
+          pending = pending.slice(separatorIndex + 1);
+          if (record.length > 0 && processRecord(record)) {
+            stopAfterLimit();
+          }
+        }
+      };
+
+      child.stdout.on("data", (chunk: Buffer) => {
+        if (!stoppedAfterLimit) {
+          processOutput(decoder.write(chunk));
+        }
+      });
+
+      child.stderr.on("data", (chunk: Buffer) => {
+        if (stderr.length < MAX_RG_STDERR_CHARS) {
+          stderr = `${stderr}${chunk.toString("utf8")}`.slice(0, MAX_RG_STDERR_CHARS);
+        }
+      });
+
+      child.on("error", (error: NodeJS.ErrnoException) => {
+        settle(() => {
+          if (error.code === "ENOENT") {
+            reject(new Error("File search requires ripgrep (`rg`) to be installed."));
+            return;
+          }
+          reject(error);
+        });
+      });
+
+      child.on("close", (code) => {
+        settle(() => {
+          if (timedOut) {
+            reject(new Error("File search timed out."));
+            return;
+          }
+          if (!stoppedAfterLimit) {
+            processOutput(decoder.end());
+            if (pending.length > 0) {
+              processRecord(pending);
+            }
+          }
+          if (stoppedAfterLimit || code === 0 || code === 1) {
+            resolve({ files, truncated });
+            return;
+          }
+          reject(new Error((stderr || `ripgrep exited with code ${code ?? "unknown"}`).trim()));
+        });
+      });
+    });
   }
 
   private async searchContent(cwd: string, input: Required<Pick<SearchInput, "query" | "relativePath" | "maxResults" | "caseSensitive">> & { glob?: string }): Promise<FileSearchResult> {
@@ -119,85 +219,179 @@ export class FileSearchService {
       "--color",
       "never",
       "--max-count",
-      String(MAX_MATCHES_PER_FILE),
+      String(RG_MATCH_LINES_PER_FILE_LIMIT),
       "--max-filesize",
       MAX_FILE_SIZE,
       ...(input.caseSensitive ? [] : ["--ignore-case"]),
       ...globArgs(input.glob),
+      "-e",
       input.query,
+      "--",
       input.relativePath
     ];
-    const result = await this.runRg(cwd, args, { allowExitCodes: [0, 1] });
-    const byPath = new Map<string, FileSearchFileResult>();
-    let truncated = false;
-
-    for (const line of result.stdout.split("\n")) {
-      if (!line.trim()) {
-        continue;
-      }
-      const message = parseRgJsonLine(line);
-      if (message?.type !== "match") {
-        continue;
-      }
-      const filePath = normalizeResultPath(textValue(message.data.path));
-      if (!filePath) {
-        continue;
-      }
-      let file = byPath.get(filePath);
-      if (!file) {
-        if (byPath.size >= input.maxResults) {
-          truncated = true;
-          break;
-        }
-        file = { path: filePath, type: "content", entryType: "file", matches: [], truncated: false };
-        byPath.set(filePath, file);
-      }
-      if (file.matches.length >= MAX_MATCHES_PER_FILE) {
-        file.truncated = true;
-        continue;
-      }
-      file.matches.push(matchFromMessage(message));
-    }
+    const result = await this.streamContentMatches(cwd, args, input.maxResults);
 
     return {
       query: input.query,
       mode: "content",
       relativePath: input.relativePath,
       glob: input.glob,
-      files: Array.from(byPath.values()).sort((left, right) => left.path.localeCompare(right.path)),
-      truncated,
+      files: result.files,
+      truncated: result.truncated,
       searchedAt: new Date().toISOString()
     };
   }
 
-  private async runRg(cwd: string, args: string[], options: { allowExitCodes: number[] }): Promise<RgCommandResult> {
-    try {
-      const result = await execFileAsync("rg", args, {
+  private async streamContentMatches(cwd: string, args: string[], maxResults: number): Promise<ContentSearchMatches> {
+    return new Promise((resolve, reject) => {
+      const child = spawn("rg", args, {
         cwd,
-        maxBuffer: MAX_RG_OUTPUT_BYTES,
-        timeout: 10_000,
+        stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true
       });
-      return { stdout: result.stdout, stderr: result.stderr, code: 0 };
-    } catch (error) {
-      const execError = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string; code?: number | string; killed?: boolean };
-      if (execError.code === "ENOENT") {
-        throw new Error("File search requires ripgrep (`rg`) to be installed.");
-      }
-      if (execError.killed) {
-        throw new Error("File search timed out.");
-      }
-      if (execError.message.includes("stdout maxBuffer") || execError.message.includes("stderr maxBuffer")) {
-        throw new Error("File search produced too many results. Narrow the query or glob.");
-      }
-      const code = typeof execError.code === "number" ? execError.code : 1;
-      const stdout = typeof execError.stdout === "string" ? execError.stdout : "";
-      const stderr = typeof execError.stderr === "string" ? execError.stderr : execError.message;
-      if (options.allowExitCodes.includes(code)) {
-        return { stdout, stderr, code };
-      }
-      throw new Error((stderr || stdout || execError.message).trim());
-    }
+      const decoder = new StringDecoder("utf8");
+      const byPath = new Map<string, FileSearchFileResult>();
+      let pending = "";
+      let stderr = "";
+      let truncated = false;
+      let timedOut = false;
+      let stoppedAfterLimit = false;
+      let outputError: Error | undefined;
+      let settled = false;
+
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGTERM");
+      }, RG_TIMEOUT_MS);
+
+      const settle = (callback: () => void): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timeout);
+        callback();
+      };
+
+      const processRecord = (line: string): boolean => {
+        if (!line.trim()) {
+          return false;
+        }
+        const message = parseRgJsonLine(line);
+        if (message?.type !== "match") {
+          return false;
+        }
+        const filePath = normalizeResultPath(textValue(message.data.path));
+        if (!filePath) {
+          return false;
+        }
+        let file = byPath.get(filePath);
+        if (!file) {
+          if (byPath.size >= maxResults) {
+            truncated = true;
+            return true;
+          }
+          file = { path: filePath, type: "content", entryType: "file", matches: [], truncated: false };
+          byPath.set(filePath, file);
+        }
+        if (file.matches.length >= MAX_MATCHES_PER_FILE) {
+          file.truncated = true;
+          return false;
+        }
+        file.matches.push(matchFromMessage(message));
+        return false;
+      };
+
+      const stopAfterLimit = (): void => {
+        stoppedAfterLimit = true;
+        child.kill("SIGTERM");
+      };
+
+      const stopWithOutputError = (error: unknown): void => {
+        if (outputError || settled) {
+          return;
+        }
+        outputError = invalidRipgrepJsonOutputError(error);
+        child.kill("SIGTERM");
+      };
+
+      const processOutput = (output: string): void => {
+        pending += output;
+        while (!stoppedAfterLimit && !outputError) {
+          const separatorIndex = pending.indexOf("\n");
+          if (separatorIndex === -1) {
+            return;
+          }
+          const record = pending.slice(0, separatorIndex);
+          pending = pending.slice(separatorIndex + 1);
+          let limitReached = false;
+          try {
+            limitReached = processRecord(record);
+          } catch (error) {
+            stopWithOutputError(error);
+            return;
+          }
+          if (limitReached) {
+            stopAfterLimit();
+          }
+        }
+      };
+
+      child.stdout.on("data", (chunk: Buffer) => {
+        if (!stoppedAfterLimit && !outputError) {
+          processOutput(decoder.write(chunk));
+        }
+      });
+
+      child.stderr.on("data", (chunk: Buffer) => {
+        if (stderr.length < MAX_RG_STDERR_CHARS) {
+          stderr = `${stderr}${chunk.toString("utf8")}`.slice(0, MAX_RG_STDERR_CHARS);
+        }
+      });
+
+      child.on("error", (error: NodeJS.ErrnoException) => {
+        settle(() => {
+          if (error.code === "ENOENT") {
+            reject(new Error("File search requires ripgrep (`rg`) to be installed."));
+            return;
+          }
+          reject(error);
+        });
+      });
+
+      child.on("close", (code) => {
+        settle(() => {
+          if (timedOut) {
+            reject(new Error("File search timed out."));
+            return;
+          }
+          if (outputError) {
+            reject(outputError);
+            return;
+          }
+          if (!stoppedAfterLimit) {
+            processOutput(decoder.end());
+            if (outputError) {
+              reject(outputError);
+              return;
+            }
+            if (pending.length > 0) {
+              try {
+                processRecord(pending);
+              } catch (error) {
+                reject(invalidRipgrepJsonOutputError(error));
+                return;
+              }
+            }
+          }
+          if (stoppedAfterLimit || code === 0 || code === 1) {
+            resolve({ files: Array.from(byPath.values()).sort((left, right) => left.path.localeCompare(right.path)), truncated });
+            return;
+          }
+          reject(new Error((stderr || `ripgrep exited with code ${code ?? "unknown"}`).trim()));
+        });
+      });
+    });
   }
 }
 
@@ -256,6 +450,10 @@ function parseRgJsonLine(line: string): RgMatchMessage | undefined {
     return undefined;
   }
   return parsed as RgMatchMessage;
+}
+
+function invalidRipgrepJsonOutputError(error: unknown): Error {
+  return new Error(`Invalid ripgrep JSON output: ${error instanceof Error ? error.message : String(error)}`);
 }
 
 function matchFromMessage(message: RgMatchMessage): FileSearchMatch {

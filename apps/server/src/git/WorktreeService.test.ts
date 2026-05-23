@@ -61,6 +61,28 @@ describe("WorktreeService", () => {
     await expect(fs.stat(path.join(project, "feature-ui"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("cleans up failed bare clone setup so the project can be retried", async () => {
+    const service = new WorktreeService();
+    const project = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-wt-clone-fail-"));
+    const missingRemote = path.join(await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-wt-missing-")), "missing.git");
+
+    await expect(service.cloneBareRepository(project, missingRemote)).rejects.toThrow();
+
+    await expect(fs.stat(path.join(project, ".bare"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(service.getState(project)).resolves.toMatchObject({
+      status: "empty",
+      setup: { canClone: true, canInitialize: true }
+    });
+  });
+
+  it("treats clone URLs that start with a dash as remote URL operands", async () => {
+    const service = new WorktreeService();
+    const project = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-wt-dash-url-"));
+
+    await expect(service.cloneBareRepository(project, "--upload-pack=/definitely/missing")).rejects.not.toThrow("unknown option");
+    await expect(fs.stat(path.join(project, ".bare"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("creates a local tracking branch from a remote branch and rejects path traversal folders", async () => {
     const service = new WorktreeService();
     const remote = await createRemoteRepo();
@@ -86,6 +108,80 @@ describe("WorktreeService", () => {
         baseRef: "origin/feature"
       })
     ).rejects.toThrow("folderName");
+  });
+
+  it("allows direct child worktree folders whose names start with two dots", async () => {
+    const service = new WorktreeService();
+    const remote = await createRemoteRepo();
+    const project = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-wt-dotdot-child-"));
+    const cloned = await service.cloneBareRepository(project, remote);
+    const baseRef = cloned.refs.find((ref) => ref.kind === "remote" && ref.name.match(/^origin\/(main|master)$/))?.name;
+    expect(baseRef).toBeTruthy();
+
+    await expect(
+      service.createWorktree(project, {
+        mode: "new_branch",
+        folderName: "..feature",
+        branchName: "feature-dot",
+        baseRef
+      })
+    ).resolves.toMatchObject({
+      worktrees: [expect.objectContaining({ folderName: "..feature", branch: "feature-dot" })]
+    });
+    await expect(fs.readFile(path.join(project, "..feature", "README.md"), "utf8")).resolves.toBe("hello\n");
+  });
+
+  it("parses worktree paths with newlines and validates branch names with Git", async () => {
+    const service = new WorktreeService();
+    const remote = await createRemoteRepo();
+    const project = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-wt-paths-"));
+    const cloned = await service.cloneBareRepository(project, remote);
+    const baseRef = cloned.refs.find((ref) => ref.kind === "remote" && ref.name.match(/^origin\/(main|master)$/))?.name;
+    expect(baseRef).toBeTruthy();
+
+    const folderName = "line\nworktree";
+    await expect(
+      service.createWorktree(project, {
+        mode: "new_branch",
+        folderName,
+        branchName: "line-worktree",
+        baseRef
+      })
+    ).resolves.toMatchObject({
+      worktrees: [expect.objectContaining({ folderName, branch: "line-worktree" })]
+    });
+
+    await expect(
+      service.createWorktree(project, {
+        mode: "new_branch",
+        folderName: "invalid-branch",
+        branchName: "bad.lock",
+        baseRef
+      })
+    ).rejects.toThrow("branchName is not a valid Git branch name.");
+    await expect(fs.stat(path.join(project, "invalid-branch"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("creates new branches from listed refs whose short names start with a dash", async () => {
+    const service = new WorktreeService();
+    const remote = await createRemoteRepo();
+    await git(remote, "update-ref", "refs/tags/--base", "HEAD");
+    const project = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-wt-dash-start-point-"));
+    const cloned = await service.cloneBareRepository(project, remote);
+    const dashTag = cloned.refs.find((ref) => ref.kind === "tag" && ref.name === "--base");
+
+    expect(dashTag).toBeTruthy();
+    await expect(
+      service.createWorktree(project, {
+        mode: "new_branch",
+        folderName: "from-dash-tag",
+        branchName: "from-dash-tag",
+        baseRef: dashTag?.name
+      })
+    ).resolves.toMatchObject({
+      worktrees: [expect.objectContaining({ folderName: "from-dash-tag", branch: "from-dash-tag" })]
+    });
+    await expect(gitOutput(path.join(project, "from-dash-tag"), "rev-parse", "--abbrev-ref", "HEAD")).resolves.toBe("from-dash-tag");
   });
 
   it("optionally reports worktree folder size without following symlinks", async () => {
@@ -146,6 +242,22 @@ describe("WorktreeService", () => {
     expect(await gitOutput(project, "--git-dir", path.join(project, ".bare"), "rev-parse", "moved-tag")).toBe(remoteTagCommit);
   });
 
+  it("preserves remote branches whose names end in HEAD", async () => {
+    const service = new WorktreeService();
+    const remote = await createRemoteRepo();
+    await git(remote, "branch", "topic/HEAD");
+    const project = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-wt-head-suffix-"));
+
+    const cloned = await service.cloneBareRepository(project, remote);
+
+    expect(cloned.refs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "remote", name: "origin/topic/HEAD" })
+    ]));
+    expect(cloned.refs).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "remote", name: "origin/HEAD" })
+    ]));
+  });
+
   it("updates origin tracking branches without moving checked-out local branches", async () => {
     const service = new WorktreeService();
     const remote = await createRemoteRepo();
@@ -203,6 +315,35 @@ describe("WorktreeService", () => {
         baseRef: "master"
       })
     ).rejects.toThrow("folderName");
+  });
+
+  it("blocks symlinked .bare repositories instead of managing a repository outside the project", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const service = new WorktreeService();
+    const project = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-wt-linked-bare-"));
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-wt-outside-bare-"));
+    const outsideBare = path.join(outside, "repo.git");
+    await git(outside, "init", "--bare", outsideBare);
+    await fs.symlink(outsideBare, path.join(project, ".bare"), "dir");
+
+    await expect(service.getState(project)).resolves.toMatchObject({
+      status: "blocked",
+      setup: {
+        canInitialize: false,
+        canClone: false,
+        blockedReason: ".bare exists but is not a valid bare Git repository."
+      }
+    });
+    await expect(
+      service.createWorktree(project, {
+        mode: "new_branch",
+        folderName: "feature",
+        branchName: "feature",
+        baseRef: "HEAD"
+      })
+    ).rejects.toThrow(".bare exists but is not a valid bare Git repository.");
   });
 
   it("detects a selected linked worktree and creates new worktrees beside it", async () => {

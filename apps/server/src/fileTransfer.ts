@@ -8,6 +8,7 @@ import { createGzip } from "node:zlib";
 
 import type { WorkspaceTab } from "@cloudx/shared";
 
+import { isSameOrChildPath } from "./pathBoundary.js";
 import type { PathPolicy } from "./pathPolicy.js";
 
 export interface FileDownloadResult {
@@ -31,6 +32,11 @@ export interface FileUploadResult {
 
 export interface FileUploadOptions {
   maxBytes?: number;
+}
+
+interface OpenTransferFile {
+  stat: fs.Stats;
+  stream: fs.ReadStream;
 }
 
 export class FileUploadTooLargeError extends Error {
@@ -57,6 +63,7 @@ interface TarEntry {
 const TAR_BLOCK_SIZE = 512;
 const TAR_END_BLOCKS = 2;
 const FILE_BROWSER_PLUGIN_ID = "file-browser";
+const SYMLINK_DOWNLOAD_ERROR = "Symbolic links are not supported for file downloads.";
 
 export class FileTransferService {
   constructor(private readonly pathPolicy: PathPolicy) {}
@@ -69,18 +76,20 @@ export class FileTransferService {
     if (entries.length === 1 && entries[0]!.stat.isFile()) {
       const entry = entries[0]!;
       await this.requireRealPathUnderCwd(tab, entry.resolvedPath);
+      const file = await openTransferFileNoFollow(entry.resolvedPath, entry.stat);
       return {
         filename: sanitizeDownloadFilename(path.basename(entry.resolvedPath) || "download"),
         contentType: "application/octet-stream",
-        stream: fs.createReadStream(entry.resolvedPath),
+        stream: file.stream,
         archive: false
       };
     }
 
+    const archiveEntries = (await Promise.all(entries.map((entry) => this.archiveEntriesFor(tab, entry)))).flat();
     return {
       filename: archiveFilenameFor(tab, entries),
       contentType: "application/gzip",
-      stream: Readable.from(this.createTar(entries.map((entry) => this.archiveEntryFor(tab, entry)))).pipe(createGzip()),
+      stream: gzipTarStream(this.createTar(archiveEntries)),
       archive: true
     };
   }
@@ -92,9 +101,10 @@ export class FileTransferService {
       throw new Error(`Raw file target is not a file: ${entry.resolvedPath}`);
     }
     await this.requireRealPathUnderCwd(tab, entry.resolvedPath);
+    const file = await openTransferFileNoFollow(entry.resolvedPath, entry.stat);
     return {
       contentType: inlineContentTypeForPath(entry.resolvedPath),
-      stream: fs.createReadStream(entry.resolvedPath)
+      stream: file.stream
     };
   }
 
@@ -111,8 +121,10 @@ export class FileTransferService {
     if (relativeFor(tab, targetPath) === ".") {
       throw new Error("Upload target must be a file path.");
     }
-    await fsp.mkdir(path.dirname(targetPath), { recursive: true });
-    await this.requireRealPathUnderCwd(tab, path.dirname(targetPath));
+    const targetDir = path.dirname(targetPath);
+    await this.requireUploadParentCanBeCreatedUnderCwd(tab, targetDir);
+    await fsp.mkdir(targetDir, { recursive: true });
+    await this.requireRealPathUnderCwd(tab, targetDir);
     const existing = await fsp.lstat(targetPath).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") {
         return undefined;
@@ -144,12 +156,7 @@ export class FileTransferService {
   private async resolveExistingPath(tab: WorkspaceTab, relativePath: string): Promise<ResolvedTransferPath> {
     const resolvedPath = this.resolvePathUnderCwd(tab, relativePath);
     const stat = await fsp.lstat(resolvedPath);
-    if (stat.isFile() || stat.isDirectory()) {
-      await this.requireRealPathUnderCwd(tab, resolvedPath);
-    }
-    if (!stat.isFile() && !stat.isDirectory() && !stat.isSymbolicLink()) {
-      throw new Error(`Unsupported file type: ${resolvedPath}`);
-    }
+    await this.requireDownloadablePath(tab, resolvedPath, stat);
     return {
       resolvedPath,
       relativePath: relativeFor(tab, resolvedPath),
@@ -157,11 +164,22 @@ export class FileTransferService {
     };
   }
 
+  private async requireDownloadablePath(tab: WorkspaceTab, sourcePath: string, stat: fs.Stats): Promise<void> {
+    if (stat.isSymbolicLink()) {
+      throw new Error(SYMLINK_DOWNLOAD_ERROR);
+    }
+    if (stat.isFile() || stat.isDirectory()) {
+      await this.requireRealPathUnderCwd(tab, sourcePath);
+    }
+    if (!stat.isFile() && !stat.isDirectory() && !stat.isSymbolicLink()) {
+      throw new Error(`Unsupported file type: ${sourcePath}`);
+    }
+  }
+
   private resolvePathUnderCwd(tab: WorkspaceTab, requestedPath: string): string {
     const trimmed = requestedPath.trim();
     const resolvedPath = path.isAbsolute(trimmed) ? this.pathPolicy.resolve(trimmed) : this.pathPolicy.resolve(path.resolve(tab.cwd, trimmed || "."));
-    const relativePath = path.relative(tab.cwd, resolvedPath);
-    if (relativePath === "" || (!relativePath.startsWith("..") && !path.isAbsolute(relativePath))) {
+    if (isSameOrChildPath(tab.cwd, resolvedPath)) {
       return resolvedPath;
     }
     throw new Error("File transfer path is outside the tab working directory.");
@@ -169,59 +187,94 @@ export class FileTransferService {
 
   private async requireRealPathUnderCwd(tab: WorkspaceTab, candidate: string): Promise<void> {
     const [cwdRealPath, candidateRealPath] = await Promise.all([fsp.realpath(tab.cwd), fsp.realpath(candidate)]);
-    const relativePath = path.relative(cwdRealPath, candidateRealPath);
-    if (relativePath === "" || (!relativePath.startsWith("..") && !path.isAbsolute(relativePath))) {
+    if (isSameOrChildPath(cwdRealPath, candidateRealPath)) {
       return;
     }
     throw new Error("File transfer path resolves outside the tab working directory.");
   }
 
-  private archiveEntryFor(tab: WorkspaceTab, entry: ResolvedTransferPath): TarEntry {
+  private async requireUploadParentCanBeCreatedUnderCwd(tab: WorkspaceTab, targetDir: string): Promise<void> {
+    let current = targetDir;
+    for (;;) {
+      const stat = await fsp.lstat(current).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") {
+          return undefined;
+        }
+        throw error;
+      });
+      if (stat) {
+        if (!stat.isDirectory() && !stat.isSymbolicLink()) {
+          throw new Error(`Upload parent path is not a directory: ${current}`);
+        }
+        await this.requireRealPathUnderCwd(tab, current);
+        return;
+      }
+      const parent = path.dirname(current);
+      if (parent === current) {
+        throw new Error(`Upload parent path does not exist: ${targetDir}`);
+      }
+      current = parent;
+    }
+  }
+
+  private async archiveEntriesFor(tab: WorkspaceTab, entry: ResolvedTransferPath): Promise<TarEntry[]> {
     const archivePath = entry.relativePath === "." ? sanitizeArchivePath(path.basename(tab.cwd) || "files") : sanitizeArchivePath(entry.relativePath);
-    return {
-      sourcePath: entry.resolvedPath,
+    return this.snapshotTarEntries(tab, entry.resolvedPath, archivePath);
+  }
+
+  private async snapshotTarEntries(tab: WorkspaceTab, sourcePath: string, archivePath: string): Promise<TarEntry[]> {
+    const stat = await fsp.lstat(sourcePath);
+    await this.requireDownloadablePath(tab, sourcePath, stat);
+    const entry: TarEntry = {
+      sourcePath,
       archivePath,
-      stat: entry.stat
+      stat
     };
+    if (!stat.isDirectory()) {
+      return [entry];
+    }
+    const children = await fsp.readdir(sourcePath, { withFileTypes: true });
+    const childEntries: TarEntry[] = [];
+    for (const child of children.sort((left, right) => left.name.localeCompare(right.name))) {
+      childEntries.push(...await this.snapshotTarEntries(tab, path.join(sourcePath, child.name), `${archivePath}/${child.name}`));
+    }
+    return [entry, ...childEntries];
   }
 
   private async *createTar(entries: TarEntry[]): AsyncGenerator<Buffer> {
     for (const entry of entries) {
-      yield* this.appendTarEntry(entry.sourcePath, entry.archivePath, entry.stat);
+      yield* this.appendTarEntry(entry);
     }
     yield Buffer.alloc(TAR_BLOCK_SIZE * TAR_END_BLOCKS);
   }
 
-  private async *appendTarEntry(sourcePath: string, archivePath: string, stat: fs.Stats): AsyncGenerator<Buffer> {
-    if (stat.isDirectory()) {
-      const directoryArchivePath = archivePath.endsWith("/") ? archivePath : `${archivePath}/`;
-      yield createTarHeader(directoryArchivePath, stat, "5");
-      const children = await fsp.readdir(sourcePath, { withFileTypes: true });
-      for (const child of children.sort((left, right) => left.name.localeCompare(right.name))) {
-        const childPath = path.join(sourcePath, child.name);
-        const childStat = await fsp.lstat(childPath);
-        yield* this.appendTarEntry(childPath, `${archivePath}/${child.name}`, childStat);
+  private async *appendTarEntry(entry: TarEntry): AsyncGenerator<Buffer> {
+    if (entry.stat.isDirectory()) {
+      const directoryArchivePath = entry.archivePath.endsWith("/") ? entry.archivePath : `${entry.archivePath}/`;
+      yield createTarHeader(directoryArchivePath, entry.stat, "5");
+      return;
+    }
+
+    if (entry.stat.isSymbolicLink()) {
+      throw new Error(SYMLINK_DOWNLOAD_ERROR);
+    }
+
+    if (!entry.stat.isFile()) {
+      throw new Error(`Unsupported file type: ${entry.sourcePath}`);
+    }
+
+    const file = await openTransferFileNoFollow(entry.sourcePath, entry.stat);
+    try {
+      yield createTarHeader(entry.archivePath, file.stat, "0");
+      for await (const chunk of file.stream) {
+        yield Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       }
-      return;
-    }
-
-    if (stat.isSymbolicLink()) {
-      const linkName = await fsp.readlink(sourcePath);
-      yield createTarHeader(archivePath, stat, "2", linkName);
-      return;
-    }
-
-    if (!stat.isFile()) {
-      throw new Error(`Unsupported file type: ${sourcePath}`);
-    }
-
-    yield createTarHeader(archivePath, stat, "0");
-    for await (const chunk of fs.createReadStream(sourcePath)) {
-      yield Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    }
-    const padding = tarPadding(stat.size);
-    if (padding > 0) {
-      yield Buffer.alloc(padding);
+      const padding = tarPadding(file.stat.size);
+      if (padding > 0) {
+        yield Buffer.alloc(padding);
+      }
+    } finally {
+      file.stream.destroy();
     }
   }
 
@@ -261,6 +314,44 @@ function uploadBodyStream(body: unknown): AsyncIterable<Buffer | Uint8Array | st
   throw new Error("Upload body must be a binary stream.");
 }
 
+async function openTransferFileNoFollow(filePath: string, expectedStat?: fs.Stats): Promise<OpenTransferFile> {
+  const file = await fsp.open(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW).catch((error) => {
+    if (isSymbolicLinkOpenError(error)) {
+      throw new Error(SYMLINK_DOWNLOAD_ERROR);
+    }
+    throw error;
+  });
+  try {
+    const stat = await file.stat();
+    if (!stat.isFile()) {
+      throw new Error(`Transfer target is not a file: ${filePath}`);
+    }
+    if (expectedStat && !sameFilesystemObject(stat, expectedStat)) {
+      throw new Error(`Transfer target changed during download: ${filePath}`);
+    }
+    return {
+      stat,
+      stream: file.createReadStream()
+    };
+  } catch (error) {
+    await file.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+function sameFilesystemObject(left: fs.Stats, right: fs.Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function gzipTarStream(chunks: AsyncIterable<Buffer>): NodeJS.ReadableStream {
+  const source = Readable.from(chunks);
+  const gzip = createGzip();
+  source.on("error", (error) => {
+    gzip.destroy(error);
+  });
+  return source.pipe(gzip);
+}
+
 async function writeUploadStream(sourcePath: string, body: AsyncIterable<Buffer | Uint8Array | string>, options: FileUploadOptions): Promise<number> {
   const stream = fs.createWriteStream(sourcePath, { flags: "wx" });
   let bytes = 0;
@@ -275,9 +366,7 @@ async function writeUploadStream(sourcePath: string, body: AsyncIterable<Buffer 
       if (options.maxBytes !== undefined && bytes > options.maxBytes) {
         throw new FileUploadTooLargeError(options.maxBytes);
       }
-      if (!stream.write(buffer)) {
-        await once(stream, "drain");
-      }
+      await writeStreamChunk(stream, buffer);
       if (writeError) {
         throw writeError;
       }
@@ -289,6 +378,18 @@ async function writeUploadStream(sourcePath: string, body: AsyncIterable<Buffer 
     await removeFileIfPresent(sourcePath);
     throw error;
   }
+}
+
+async function writeStreamChunk(stream: fs.WriteStream, buffer: Buffer): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    stream.write(buffer, (error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
 }
 
 async function closeWriteStream(stream: fs.WriteStream): Promise<void> {
@@ -379,18 +480,18 @@ function inlineContentTypeForPath(filePath: string): string {
       return "image/jpeg";
     case ".png":
       return "image/png";
-    case ".svg":
-      return "image/svg+xml";
     case ".webp":
       return "image/webp";
     case ".pdf":
       return "application/pdf";
+    case ".svg":
+      return "text/plain; charset=utf-8";
     default:
       return "application/octet-stream";
   }
 }
 
-function createTarHeader(name: string, stat: fs.Stats, typeflag: "0" | "2" | "5", linkName = ""): Buffer {
+function createTarHeader(name: string, stat: fs.Stats, typeflag: "0" | "5"): Buffer {
   const header = Buffer.alloc(TAR_BLOCK_SIZE);
   const pathFields = splitUstarPath(name);
   writeString(header, 0, 100, pathFields.name);
@@ -401,9 +502,6 @@ function createTarHeader(name: string, stat: fs.Stats, typeflag: "0" | "2" | "5"
   writeOctal(header, 136, 12, Math.floor(stat.mtimeMs / 1000));
   header.fill(0x20, 148, 156);
   writeString(header, 156, 1, typeflag);
-  if (linkName) {
-    writeString(header, 157, 100, linkName);
-  }
   writeString(header, 257, 6, "ustar");
   writeString(header, 263, 2, "00");
   writeString(header, 265, 32, "cloudx");
@@ -426,6 +524,9 @@ function splitUstarPath(entryPath: string): { name: string; prefix: string } {
   for (const separator of separators.reverse()) {
     const prefix = entryPath.slice(0, separator);
     const name = entryPath.slice(separator + 1);
+    if (!name) {
+      continue;
+    }
     if (Buffer.byteLength(prefix) <= 155 && Buffer.byteLength(name) <= 100) {
       return { name, prefix };
     }
@@ -462,4 +563,9 @@ function writeChecksum(buffer: Buffer, checksum: number): void {
 function tarPadding(size: number): number {
   const remainder = size % TAR_BLOCK_SIZE;
   return remainder === 0 ? 0 : TAR_BLOCK_SIZE - remainder;
+}
+
+function isSymbolicLinkOpenError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "ELOOP" || code === "EMLINK";
 }

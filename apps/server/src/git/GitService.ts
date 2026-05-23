@@ -1,14 +1,19 @@
 import { execFile } from "node:child_process";
+import { constants, type Stats } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
 import type { GitDiffFile, GitDiffFileSummary, GitDiffSummary, GitFileStatus, GitRepositoryState } from "@cloudx/shared";
 
+import { isSameOrChildPath, relativeChildPath } from "../pathBoundary.js";
+
 const execFileAsync = promisify(execFile);
 
 const MAX_GIT_OUTPUT_BYTES = 2_000_000;
 const MAX_PATCH_BYTES = 400_000;
+const GIT_COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
+const CHANGED_FILE_RACE_MESSAGE = "Changed file changed during diff rendering";
 
 interface GitCommandResult {
   stdout: string;
@@ -81,7 +86,7 @@ export class GitService {
     if (await this.getWorkTree(cwd)) {
       throw new Error("Clone repository requires a folder that is not already inside a Git repository.");
     }
-    await this.runGit(cwd, ["clone", url, "."]);
+    await this.runGit(cwd, ["clone", "--", url, "."]);
     return this.getState(cwd);
   }
 
@@ -91,7 +96,7 @@ export class GitService {
       await this.runGit(cwd, ["init"]);
     }
     const originExists = (await this.runGit(cwd, ["remote", "get-url", "origin"], { allowExitCodes: [0, 2] })).code === 0;
-    await this.runGit(cwd, originExists ? ["remote", "set-url", "origin", url] : ["remote", "add", "origin", url]);
+    await this.runGit(cwd, originExists ? ["remote", "set-url", "origin", "--", url] : ["remote", "add", "--", "origin", url]);
     return this.getState(cwd);
   }
 
@@ -101,17 +106,18 @@ export class GitService {
       throw new Error("Git diff is only available inside a Git repository.");
     }
 
-    const resolvedCompareRef = await this.resolveCompareRef(cwd, compareRef);
+    const gitCwd = state.rootPath;
+    const resolvedCompareRef = await this.resolveCompareRef(gitCwd, compareRef);
     const pathspec = pathspecForCwd(state.rootPath, cwd);
     const files = new Map<string, GitDiffFileSummary>();
 
     if (resolvedCompareRef) {
-      const nameStatus = await this.runGit(cwd, ["diff", "--name-status", "--find-renames", resolvedCompareRef, "--", pathspec]);
+      const nameStatus = await this.runGit(gitCwd, ["diff", "--name-status", "--find-renames", "-z", "--end-of-options", resolvedCompareRef, "--", pathspec]);
       for (const summary of parseNameStatus(nameStatus.stdout)) {
         files.set(summary.path, summary);
       }
 
-      const numstat = await this.runGit(cwd, ["diff", "--numstat", "--find-renames", resolvedCompareRef, "--", pathspec]);
+      const numstat = await this.runGit(gitCwd, ["diff", "--numstat", "--find-renames", "-z", "--end-of-options", resolvedCompareRef, "--", pathspec]);
       for (const stat of parseNumstat(numstat.stdout)) {
         const file = files.get(stat.path);
         if (file) {
@@ -122,8 +128,8 @@ export class GitService {
       }
     }
 
-    const untracked = await this.runGit(cwd, ["ls-files", "--others", "--exclude-standard", "--", pathspec]);
-    for (const relativePath of untracked.stdout.split("\n").map((line) => line.trim()).filter(Boolean)) {
+    const untracked = await this.runGit(gitCwd, ["ls-files", "--others", "--exclude-standard", "-z", "--", pathspec]);
+    for (const relativePath of splitNulRecords(untracked.stdout)) {
       files.set(relativePath, {
         path: relativePath,
         status: "untracked",
@@ -158,11 +164,11 @@ export class GitService {
       return this.untrackedPatch(state.rootPath, summary);
     }
 
-    const resolvedCompareRef = await this.resolveCompareRef(cwd, compareRef);
+    const resolvedCompareRef = await this.resolveCompareRef(state.rootPath, compareRef);
     if (!resolvedCompareRef) {
       throw new Error("A comparison ref is required to open a tracked file diff.");
     }
-    const patch = await this.runGit(cwd, ["diff", "--no-color", "--no-ext-diff", "--find-renames", "--unified=3", resolvedCompareRef, "--", filePath]);
+    const patch = await this.runGit(state.rootPath, ["diff", "--no-color", "--no-ext-diff", "--find-renames", "--unified=3", "--end-of-options", resolvedCompareRef, "--", literalPathspec(filePath)]);
     return patchResponse(summary, patch.stdout);
   }
 
@@ -192,13 +198,14 @@ export class GitService {
   }
 
   private async listCompareRefs(cwd: string): Promise<string[]> {
-    const refs = await this.runGit(cwd, ["for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes"]);
+    const refs = await this.runGit(cwd, ["for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"]);
     return Array.from(
       new Set(
         refs.stdout
           .split("\n")
           .map((line) => line.trim())
-          .filter((line) => line && !line.endsWith("/HEAD"))
+          .filter((fullName) => fullName && !isRemoteHeadRef(fullName))
+          .map(shortCompareRefName)
       )
     ).sort((a, b) => a.localeCompare(b));
   }
@@ -231,7 +238,7 @@ export class GitService {
   }
 
   private async requireResolvableCommit(cwd: string, ref: string): Promise<void> {
-    const result = await this.runGit(cwd, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], { allowExitCodes: [0, 1] });
+    const result = await this.runGit(cwd, ["rev-parse", "--verify", "--quiet", "--end-of-options", `${ref}^{commit}`], { allowExitCodes: [0, 1] });
     if (result.code !== 0) {
       throw new Error(`Comparison ref does not exist: ${ref}`);
     }
@@ -243,19 +250,19 @@ export class GitService {
 
   private async untrackedPatch(rootPath: string, summary: GitDiffFileSummary): Promise<GitDiffFile> {
     const absolutePath = path.join(rootPath, summary.path);
-    const stat = await fs.stat(absolutePath);
+    const stat = await fs.lstat(absolutePath);
     if (!stat.isFile()) {
       return { ...summary, message: "Only regular files can be rendered as a text diff." };
     }
     if (stat.size > MAX_PATCH_BYTES) {
       return { ...summary, tooLarge: true, message: `Diff is too large to preview (${stat.size} bytes).` };
     }
-    const buffer = await fs.readFile(absolutePath);
+    const buffer = await readFileNoFollow(absolutePath, stat);
     if (buffer.includes(0)) {
       return { ...summary, binary: true, message: "Binary files cannot be rendered as a text diff." };
     }
     const content = buffer.toString("utf8");
-    const patch = createUntrackedPatch(summary.path, content);
+    const patch = createUntrackedPatch(summary.path, content, gitFileMode(stat));
     return patchResponse(summary, patch);
   }
 
@@ -264,6 +271,7 @@ export class GitService {
     try {
       const result = await execFileAsync("git", ["-C", cwd, ...args], {
         maxBuffer: MAX_GIT_OUTPUT_BYTES,
+        timeout: GIT_COMMAND_TIMEOUT_MS,
         windowsHide: true
       });
       return { stdout: result.stdout, stderr: result.stderr, code: 0 };
@@ -281,36 +289,83 @@ export class GitService {
 }
 
 function parseNameStatus(output: string): GitDiffFileSummary[] {
-  return output
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const [statusCode, firstPath, secondPath] = line.split("\t");
-      const status = statusFromCode(statusCode);
-      return {
-        path: secondPath ?? firstPath,
-        oldPath: secondPath ? firstPath : undefined,
-        status,
-        statusCode: statusCode.startsWith("R") ? "R" : statusCode.startsWith("C") ? "C" : statusCode
-      };
+  const records = splitNulRecords(output);
+  const summaries: GitDiffFileSummary[] = [];
+  for (let index = 0; index < records.length;) {
+    const statusCode = records[index++];
+    if (!statusCode) {
+      throw new Error("Git diff returned a malformed name-status record.");
+    }
+    const firstPath = records[index++];
+    if (firstPath === undefined) {
+      throw new Error("Git diff returned a name-status record without a path.");
+    }
+    const copiedOrRenamed = statusCode.startsWith("R") || statusCode.startsWith("C");
+    const secondPath = copiedOrRenamed ? records[index++] : undefined;
+    if (copiedOrRenamed && secondPath === undefined) {
+      throw new Error("Git diff returned a rename/copy record without a destination path.");
+    }
+    const status = statusFromCode(statusCode);
+    summaries.push({
+      path: secondPath ?? firstPath,
+      oldPath: secondPath ? firstPath : undefined,
+      status,
+      statusCode: statusCode.startsWith("R") ? "R" : statusCode.startsWith("C") ? "C" : statusCode
     });
+  }
+  return summaries;
 }
 
 function parseNumstat(output: string): Array<{ path: string; additions?: number; deletions?: number; binary?: boolean }> {
-  return output
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const [additions, deletions, firstPath, secondPath] = line.split("\t");
-      return {
-        path: secondPath ?? firstPath,
-        additions: additions === "-" ? undefined : Number(additions),
-        deletions: deletions === "-" ? undefined : Number(deletions),
-        binary: additions === "-" || deletions === "-"
-      };
+  const records = splitNulRecords(output);
+  const stats: Array<{ path: string; additions?: number; deletions?: number; binary?: boolean }> = [];
+  for (let index = 0; index < records.length;) {
+    const header = parseNumstatHeader(records[index++] ?? "");
+    let filePath = header.path;
+    if (filePath === "") {
+      const _oldPath = records[index++];
+      const newPath = records[index++];
+      if (_oldPath === undefined || newPath === undefined) {
+        throw new Error("Git diff returned a numstat rename/copy record without both paths.");
+      }
+      filePath = newPath;
+    }
+    stats.push({
+      path: filePath,
+      additions: parseDiffCount(header.additions),
+      deletions: parseDiffCount(header.deletions),
+      binary: header.additions === "-" || header.deletions === "-"
     });
+  }
+  return stats;
+}
+
+function parseNumstatHeader(record: string): { additions: string; deletions: string; path: string } {
+  const firstTab = record.indexOf("\t");
+  const secondTab = firstTab === -1 ? -1 : record.indexOf("\t", firstTab + 1);
+  if (firstTab === -1 || secondTab === -1) {
+    throw new Error("Git diff returned a malformed numstat record.");
+  }
+  return {
+    additions: record.slice(0, firstTab),
+    deletions: record.slice(firstTab + 1, secondTab),
+    path: record.slice(secondTab + 1)
+  };
+}
+
+function parseDiffCount(value: string): number | undefined {
+  if (value === "-") {
+    return undefined;
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error("Git diff returned an invalid numstat count.");
+  }
+  return parsed;
+}
+
+function splitNulRecords(output: string): string[] {
+  return output.split("\0").filter((record) => record.length > 0);
 }
 
 function statusFromCode(code: string): GitFileStatus {
@@ -323,8 +378,15 @@ function statusFromCode(code: string): GitFileStatus {
 }
 
 function pathspecForCwd(rootPath: string, cwd: string): string {
-  const relative = path.relative(rootPath, cwd);
-  return relative && !relative.startsWith("..") ? relative : ".";
+  const relative = relativeChildPath(rootPath, cwd);
+  if (relative === undefined) {
+    throw new Error("Tab working directory is outside the Git repository root.");
+  }
+  return relative ? literalPathspec(relative) : ".";
+}
+
+function literalPathspec(repositoryRelativePath: string): string {
+  return `:(literal)${repositoryRelativePath.split(path.sep).join("/")}`;
 }
 
 function preferredMainCompareRef(refs: string[]): string | undefined {
@@ -341,6 +403,20 @@ function orderCompareRefs(refs: string[], defaultCompareRef: string | undefined,
     }
   }
   return [...ordered, ...Array.from(remaining).sort((left, right) => left.localeCompare(right))];
+}
+
+function isRemoteHeadRef(fullName: string): boolean {
+  return /^refs\/remotes\/[^/]+\/HEAD$/u.test(fullName);
+}
+
+function shortCompareRefName(fullName: string): string {
+  if (fullName.startsWith("refs/heads/")) {
+    return fullName.slice("refs/heads/".length);
+  }
+  if (fullName.startsWith("refs/remotes/")) {
+    return fullName.slice("refs/remotes/".length);
+  }
+  return fullName;
 }
 
 async function isDirectoryEmpty(directory: string): Promise<boolean> {
@@ -362,21 +438,28 @@ function requireRelativePath(value: string): void {
 
 function ensurePathUnderCwd(rootPath: string, cwd: string, repositoryRelativePath: string): void {
   const absoluteFile = path.resolve(rootPath, repositoryRelativePath);
-  const relative = path.relative(cwd, absoluteFile);
-  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+  if (!isSameOrChildPath(cwd, absoluteFile)) {
     throw new Error("Changed file is outside the tab working directory.");
   }
 }
 
 async function countFileLines(filePath: string): Promise<number | undefined> {
-  const stat = await fs.stat(filePath);
+  const stat = await fs.lstat(filePath);
   if (!stat.isFile()) {
     return undefined;
   }
   if (stat.size > MAX_PATCH_BYTES) {
     return undefined;
   }
-  const buffer = await fs.readFile(filePath);
+  let buffer: Buffer;
+  try {
+    buffer = await readFileNoFollow(filePath, stat);
+  } catch (error) {
+    if (isChangedFileRaceError(error)) {
+      return undefined;
+    }
+    throw error;
+  }
   if (buffer.includes(0)) {
     return undefined;
   }
@@ -387,7 +470,49 @@ async function countFileLines(filePath: string): Promise<number | undefined> {
   return content.endsWith("\n") ? content.split("\n").length - 1 : content.split("\n").length;
 }
 
-function createUntrackedPatch(relativePath: string, content: string): string {
+async function readFileNoFollow(filePath: string, expectedStat: Stats): Promise<Buffer> {
+  const file = await fs.open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW).catch((error) => {
+    if (isSymbolicLinkOpenError(error)) {
+      throw changedFileRaceError(filePath);
+    }
+    throw error;
+  });
+  try {
+    const stat = await file.stat();
+    if (!stat.isFile() || !sameFilesystemObject(stat, expectedStat)) {
+      throw changedFileRaceError(filePath);
+    }
+    return await file.readFile();
+  } finally {
+    await file.close();
+  }
+}
+
+function sameFilesystemObject(left: Stats, right: Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function changedFileRaceError(filePath: string): Error {
+  return new ChangedFileRaceError(`${CHANGED_FILE_RACE_MESSAGE}: ${filePath}`);
+}
+
+function isChangedFileRaceError(error: unknown): boolean {
+  return error instanceof ChangedFileRaceError;
+}
+
+function isSymbolicLinkOpenError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "ELOOP" || code === "EMLINK";
+}
+
+class ChangedFileRaceError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ChangedFileRaceError";
+  }
+}
+
+function createUntrackedPatch(relativePath: string, content: string, fileMode: string): string {
   const lines = content.length ? content.split("\n") : [];
   const hasTrailingNewline = content.endsWith("\n");
   const hunkLines = lines.map((line, index) => {
@@ -398,7 +523,50 @@ function createUntrackedPatch(relativePath: string, content: string): string {
   }).filter((line): line is string => line !== undefined);
   const newlineMarker = content && !hasTrailingNewline ? "\n\\ No newline at end of file" : "";
   const hunk = hunkLines.length ? `@@ -0,0 +1,${hunkLines.length} @@\n${hunkLines.join("\n")}${newlineMarker}\n` : "";
-  return [`diff --git a/${relativePath} b/${relativePath}`, "new file mode 100644", "index 0000000..0000000", "--- /dev/null", `+++ b/${relativePath}`, hunk].join("\n");
+  return [`diff --git ${gitPatchPath("a", relativePath)} ${gitPatchPath("b", relativePath)}`, `new file mode ${fileMode}`, "index 0000000..0000000", "--- /dev/null", `+++ ${gitPatchPath("b", relativePath)}`, hunk].join("\n");
+}
+
+function gitFileMode(stat: { mode: number }): string {
+  return stat.mode & 0o111 ? "100755" : "100644";
+}
+
+function gitPatchPath(prefix: "a" | "b", relativePath: string): string {
+  return quoteGitPathIfNeeded(`${prefix}/${relativePath.split(path.sep).join("/")}`);
+}
+
+function quoteGitPathIfNeeded(value: string): string {
+  if (!/[\u0000-\u001f\u007f"\\]/u.test(value)) {
+    return value;
+  }
+  return `"${Array.from(value, cStyleEscapeCharacter).join("")}"`;
+}
+
+function cStyleEscapeCharacter(character: string): string {
+  switch (character) {
+    case "\\":
+      return "\\\\";
+    case "\"":
+      return "\\\"";
+    case "\n":
+      return "\\n";
+    case "\r":
+      return "\\r";
+    case "\t":
+      return "\\t";
+    case "\b":
+      return "\\b";
+    case "\f":
+      return "\\f";
+    case "\v":
+      return "\\v";
+    default: {
+      const code = character.codePointAt(0) ?? 0;
+      if (code < 0x20 || code === 0x7f) {
+        return `\\${code.toString(8).padStart(3, "0")}`;
+      }
+      return character;
+    }
+  }
 }
 
 function patchResponse(summary: GitDiffFileSummary, patch: string): GitDiffFile {

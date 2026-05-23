@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { GitService } from "./GitService.js";
 
@@ -42,6 +42,20 @@ describe("GitService", () => {
     expect(withOrigin.setup.canSetOrigin).toBe(false);
   });
 
+  it("treats set-origin URLs that start with a dash as remote URL operands", async () => {
+    const service = new GitService();
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-git-origin-dash-url-"));
+    await fs.writeFile(path.join(root, "README.md"), "hello\n");
+
+    const withDashUrl = await service.setOrigin(root, "--push");
+    const updatedDashUrl = await service.setOrigin(root, "--add");
+
+    expect(withDashUrl.originUrl).toBe("--push");
+    expect(updatedDashUrl.originUrl).toBe("--add");
+    await expect(gitOutput(root, "remote", "get-url", "origin")).resolves.toBe("--add");
+    await expect(gitOutput(root, "remote", "get-url", "--push", "origin")).resolves.toBe("--add");
+  });
+
   it("clones a repository into an empty folder", async () => {
     const service = new GitService();
     const source = await createCommittedRepo("cloudx-git-source-");
@@ -51,6 +65,13 @@ describe("GitService", () => {
 
     expect(state.isRepository).toBe(true);
     await expect(fs.readFile(path.join(target, "README.md"), "utf8")).resolves.toBe("hello\n");
+  });
+
+  it("treats clone URLs that start with a dash as repository operands", async () => {
+    const service = new GitService();
+    const target = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-git-clone-dash-url-"));
+
+    await expect(service.cloneRepository(target, "--upload-pack=/definitely/missing")).rejects.toThrow("--upload-pack=/definitely/missing");
   });
 
   it("defaults comparisons to main and recommends the current branch upstream second", async () => {
@@ -93,6 +114,21 @@ describe("GitService", () => {
     await expect(service.listDiff(target, "origin/feature/cloudx")).rejects.toThrow("Comparison ref does not exist: origin/feature/cloudx");
   });
 
+  it("preserves valid refs ending in HEAD while hiding only the remote HEAD pointer", async () => {
+    const service = new GitService();
+    const root = await createMainCommittedRepo("cloudx-git-head-suffix-");
+    await git(root, "update-ref", "refs/heads/feature/HEAD", "HEAD");
+    await git(root, "update-ref", "refs/remotes/origin/main", "HEAD");
+    await git(root, "update-ref", "refs/remotes/origin/topic/HEAD", "HEAD");
+    await git(root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main");
+
+    const state = await service.getState(root);
+
+    expect(state.compareRefs).toContain("feature/HEAD");
+    expect(state.compareRefs).toContain("origin/topic/HEAD");
+    expect(state.compareRefs).not.toContain("origin/HEAD");
+  });
+
   it("lists and opens modified, renamed, deleted, and untracked file diffs", async () => {
     const service = new GitService();
     const root = await createCommittedRepo("cloudx-git-diff-");
@@ -119,6 +155,130 @@ describe("GitService", () => {
     await expect(service.openDiffFile(root, "notes.txt")).resolves.toMatchObject({
       path: "notes.txt",
       patch: expect.stringContaining("new file mode 100644")
+    });
+  });
+
+  it("supports comparison refs whose names start with a dash without treating them as options", async () => {
+    const service = new GitService();
+    const root = await createCommittedRepo("cloudx-git-dash-ref-");
+    await git(root, "update-ref", "refs/heads/--topic", "HEAD");
+    await fs.writeFile(path.join(root, "README.md"), "hello dash ref\n");
+
+    const diff = await service.listDiff(root, "--topic");
+
+    expect(diff.compareRef).toBe("--topic");
+    expect(diff.files).toEqual(expect.arrayContaining([expect.objectContaining({ path: "README.md", status: "modified" })]));
+    await expect(service.openDiffFile(root, "README.md", "--topic")).resolves.toMatchObject({
+      path: "README.md",
+      patch: expect.stringContaining("+hello dash ref")
+    });
+  });
+
+  it("scopes diff summaries and previews to the selected subdirectory", async () => {
+    const service = new GitService();
+    const root = await createCommittedRepo("cloudx-git-subdir-scope-");
+    const subdir = path.join(root, "src");
+    await fs.mkdir(subdir);
+    await fs.writeFile(path.join(subdir, "tracked.txt"), "one\n");
+    await git(root, "add", ".");
+    await git(root, "-c", "user.name=Cloudx Test", "-c", "user.email=cloudx@example.test", "commit", "-m", "add src");
+
+    await fs.writeFile(path.join(subdir, "tracked.txt"), "one\ntwo\n");
+    await fs.writeFile(path.join(subdir, "new.txt"), "new\n");
+    await fs.writeFile(path.join(root, "README.md"), "changed outside subdir\n");
+
+    const diff = await service.listDiff(subdir, "HEAD");
+
+    expect(diff.files.map((file) => file.path)).toEqual(["src/new.txt", "src/tracked.txt"]);
+    await expect(service.openDiffFile(subdir, "src/tracked.txt", "HEAD")).resolves.toMatchObject({
+      path: "src/tracked.txt",
+      patch: expect.stringContaining("+two")
+    });
+    await expect(service.openDiffFile(subdir, "src/new.txt", "HEAD")).resolves.toMatchObject({
+      path: "src/new.txt",
+      patch: expect.stringContaining("+new")
+    });
+  });
+
+  it("keeps repository-relative Git pathspecs scoped for directories that start with two dots", async () => {
+    const service = new GitService();
+    const root = await createCommittedRepo("cloudx-git-dotdot-scope-");
+    const subdir = path.join(root, "..scope");
+    await fs.mkdir(subdir);
+    await fs.writeFile(path.join(subdir, "inside.txt"), "inside\n");
+    await git(root, "add", ".");
+    await git(root, "-c", "user.name=Cloudx Test", "-c", "user.email=cloudx@example.test", "commit", "-m", "add scoped dir");
+
+    await fs.writeFile(path.join(subdir, "inside.txt"), "inside changed\n");
+    await fs.writeFile(path.join(root, "README.md"), "changed outside scoped dir\n");
+
+    const diff = await service.listDiff(subdir, "HEAD");
+
+    expect(diff.files.map((file) => file.path)).toEqual(["..scope/inside.txt"]);
+  });
+
+  it("treats subdirectory pathspecs literally for Git magic and glob characters", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const service = new GitService();
+    const root = await createCommittedRepo("cloudx-git-literal-pathspec-");
+    const magicDir = path.join(root, ":(top)");
+    const globDir = path.join(root, "src*");
+    const globSibling = path.join(root, "src-other");
+    await fs.mkdir(magicDir);
+    await fs.mkdir(globDir);
+    await fs.mkdir(globSibling);
+    await fs.writeFile(path.join(magicDir, "inside.txt"), "magic\n");
+    await fs.writeFile(path.join(globDir, "inside.txt"), "literal glob\n");
+    await fs.writeFile(path.join(globSibling, "inside.txt"), "sibling\n");
+    await git(root, "add", ".");
+    await git(root, "-c", "user.name=Cloudx Test", "-c", "user.email=cloudx@example.test", "commit", "-m", "add literal pathspec dirs");
+
+    await fs.writeFile(path.join(magicDir, "inside.txt"), "magic changed\n");
+    await fs.writeFile(path.join(globDir, "inside.txt"), "literal glob changed\n");
+    await fs.writeFile(path.join(globSibling, "inside.txt"), "sibling changed\n");
+    await fs.writeFile(path.join(root, "README.md"), "changed outside scoped dir\n");
+
+    const magicDiff = await service.listDiff(magicDir, "HEAD");
+    const globDiff = await service.listDiff(globDir, "HEAD");
+    const globPreview = await service.openDiffFile(globDir, "src*/inside.txt", "HEAD");
+
+    expect(magicDiff.files.map((file) => file.path)).toEqual([":(top)/inside.txt"]);
+    expect(globDiff.files.map((file) => file.path)).toEqual(["src*/inside.txt"]);
+    expect(globPreview.patch).toEqual(expect.stringContaining("+literal glob changed"));
+    expect(globPreview.patch ?? "").not.toContain("sibling changed");
+  });
+
+  it("preserves changed paths containing tabs and newlines in diff summaries", async () => {
+    const service = new GitService();
+    const root = await createCommittedRepo("cloudx-git-diff-paths-");
+    const trackedPath = "tab\tname.txt";
+    const renamedPath = "renamed\nfile.txt";
+    const untrackedPath = "notes\nwith\ttab.txt";
+
+    await fs.writeFile(path.join(root, trackedPath), "first\n");
+    await git(root, "add", trackedPath);
+    await git(root, "-c", "user.name=Cloudx Test", "-c", "user.email=cloudx@example.test", "commit", "-m", "add tabbed path");
+    await fs.writeFile(path.join(root, trackedPath), "first\nsecond\n");
+    await git(root, "mv", "move-me.txt", renamedPath);
+    await fs.writeFile(path.join(root, untrackedPath), "new notes\n");
+
+    const diff = await service.listDiff(root);
+
+    expect(diff.files).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: trackedPath, status: "modified", additions: 1, deletions: 0 }),
+        expect.objectContaining({ path: renamedPath, oldPath: "move-me.txt", status: "renamed" }),
+        expect.objectContaining({ path: untrackedPath, status: "untracked", additions: 1 })
+      ])
+    );
+    await expect(service.openDiffFile(root, untrackedPath)).resolves.toMatchObject({
+      path: untrackedPath,
+      patch: expect.stringContaining("+new notes")
+    });
+    await expect(service.openDiffFile(root, untrackedPath)).resolves.toMatchObject({
+      patch: expect.stringContaining('diff --git "a/notes\\nwith\\ttab.txt" "b/notes\\nwith\\ttab.txt"')
     });
   });
 
@@ -172,6 +332,46 @@ describe("GitService", () => {
     });
   });
 
+  it("does not follow untracked symlinks when rendering diff previews", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const service = new GitService();
+    const root = await createCommittedRepo("cloudx-git-untracked-symlink-");
+    const outside = path.join(await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-git-outside-")), "secret.txt");
+    await fs.writeFile(outside, "outside-secret\n");
+    await fs.symlink(outside, path.join(root, "leak.txt"));
+
+    const diff = await service.listDiff(root);
+    expect(diff.files).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: "leak.txt", status: "untracked", additions: undefined })
+      ])
+    );
+    await expect(service.openDiffFile(root, "leak.txt")).resolves.toMatchObject({
+      path: "leak.txt",
+      status: "untracked",
+      message: "Only regular files can be rendered as a text diff."
+    });
+    await expect(service.openDiffFile(root, "leak.txt")).resolves.not.toMatchObject({
+      patch: expect.stringContaining("outside-secret")
+    });
+  });
+
+  it("rejects an untracked diff preview if the file becomes a symlink after classification", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const service = new GitService();
+    const root = await createCommittedRepo("cloudx-git-untracked-race-");
+    const target = path.join(root, "leak.txt");
+    const outside = path.join(await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-git-untracked-race-outside-")), "secret.txt");
+    await fs.writeFile(target, "safe\n");
+    await fs.writeFile(outside, "outside-secret\n");
+
+    await expect(replaceWithSymlinkAfterSecondLstat(target, outside, () => service.openDiffFile(root, "leak.txt"))).rejects.toThrow("Changed file changed during diff rendering");
+  });
+
   it("rejects opening repository changes outside the tab working directory", async () => {
     const service = new GitService();
     const root = await createCommittedRepo("cloudx-git-subdir-");
@@ -202,4 +402,32 @@ async function createMainCommittedRepo(prefix: string): Promise<string> {
 
 async function git(cwd: string, ...args: string[]): Promise<void> {
   await execFileAsync("git", args, { cwd });
+}
+
+async function gitOutput(cwd: string, ...args: string[]): Promise<string> {
+  const result = await execFileAsync("git", args, { cwd });
+  return result.stdout.trim();
+}
+
+async function replaceWithSymlinkAfterSecondLstat<T>(target: string, symlinkTarget: string, operation: () => Promise<T>): Promise<T> {
+  const originalLstat = fs.lstat.bind(fs);
+  let targetCalls = 0;
+  let replaced = false;
+  const lstat = vi.spyOn(fs, "lstat").mockImplementation(async (...args: Parameters<typeof fs.lstat>) => {
+    const result = await originalLstat(...args);
+    if (String(args[0]) === target) {
+      targetCalls += 1;
+    }
+    if (!replaced && targetCalls === 2) {
+      replaced = true;
+      await fs.rm(target);
+      await fs.symlink(symlinkTarget, target);
+    }
+    return result;
+  });
+  try {
+    return await operation();
+  } finally {
+    lstat.mockRestore();
+  }
 }

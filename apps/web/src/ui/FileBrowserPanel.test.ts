@@ -6,9 +6,9 @@ import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
+import type { FileSearchResult, GitDiffFile, GitDiffSummary, GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
 
-import { absoluteTransferPath, archiveExtractionFolderName, buildCompareRefOptions, buildSearchInput, clampFileBrowserTreeSize, CompareRefPicker, compareRefListboxStyle, copyTextToClipboard, defaultDiffViewMode, disposeFileBrowserPanelStatesExcept, entryTransferPath, FileBrowserPanel, fileBrowserBodyClassName, fileBrowserBodyStyle, filePreviewText, fileTransferUploadPath, filterCompareRefOptions, gitAutoRefreshIntervalMilliseconds, gitDiffWorkspaceClassName, highlightedCodeHtml, isExtractableArchivePath, markdownImageFileUrl, markdownImageTransferPath, mergeGitChangesIntoEntries, normalizedPreviewKind, parsePatch, previewLanguageForPath, readFileBrowserPanelState, rememberFileBrowserPanelState, renderMarkdownHtml, resolveNextCompareRef, searchEntriesFromResult, searchResultSummary, toolbarClipboardPath, uploadProgressPercent, uploadProgressVisibleFileCount, usesObjectUrlPreview, type FileBrowserPanelState, type OpenFileResult } from "./FileBrowserPanel.js";
+import { absoluteTransferPath, archiveExtractionFolderName, buildCompareRefOptions, buildSearchInput, clampFileBrowserTreeSize, CompareRefPicker, compareRefListboxStyle, copyTextToClipboard, defaultDiffViewMode, disposeFileBrowserPanelStatesExcept, entryTransferPath, FileBrowserPanel, fileBrowserBodyClassName, fileBrowserBodyStyle, fileBrowserTreeSizeMax, filePreviewText, fileTransferUploadPath, filterCompareRefOptions, gitAutoRefreshIntervalMilliseconds, gitDiffWorkspaceClassName, highlightedCodeHtml, isExtractableArchivePath, markdownImageFileUrl, markdownImageTransferPath, mergeGitChangesIntoEntries, normalizedPreviewKind, parsePatch, previewLanguageForPath, readFileBrowserPanelState, rememberFileBrowserPanelState, renderMarkdownHtml, resolveNextCompareRef, searchEntriesFromResult, searchResultMatchesInput, searchResultSummary, toolbarClipboardPath, uploadProgressPercent, uploadProgressVisibleFileCount, usesObjectUrlPreview, type FileBrowserPanelState, type OpenFileResult } from "./FileBrowserPanel.js";
 import { PathEntry } from "./PathEntry.js";
 
 afterEach(() => {
@@ -39,11 +39,38 @@ describe("filePreviewText", () => {
     expect(usesObjectUrlPreview({ path: "/repo/README.md", previewKind: "markdown" })).toBe(false);
     expect(previewLanguageForPath("/repo/src/App.tsx")).toBe("typescript");
 
-    const html = renderMarkdownHtml("# Title\n\n<img src=x onerror=\"alert(1)\">\n\n```ts\nconst value = true;\n```\n\n**bold**");
+    const html = renderMarkdownHtml(
+      [
+        "# Title",
+        "",
+        '<img src=x onerror="alert(1)">',
+        "",
+        '<style>.file-browser-panel{display:none}</style>',
+        '<div id="preview" name="location" style="position:fixed;inset:0;z-index:9999">spoof</div>',
+        '<form><input name="token"><button>Run</button></form>',
+        '<picture><source srcset="https://example.test/pixel.png"><img src="https://example.test/fallback.png" alt="remote"></picture>',
+        "",
+        "```ts",
+        "const value = true;",
+        "```",
+        "",
+        "**bold**"
+      ].join("\n")
+    );
     expect(html).toContain("<h1>Title</h1>");
     expect(html).toContain("<strong>bold</strong>");
     expect(html).toContain("hljs-keyword");
     expect(html).not.toContain("onerror");
+    expect(html).not.toContain("<style");
+    expect(html).not.toContain("style=");
+    expect(html).not.toContain("<form");
+    expect(html).not.toContain("<input");
+    expect(html).not.toContain("<button");
+    expect(html).not.toContain("<picture");
+    expect(html).not.toContain("<source");
+    expect(html).not.toContain("https://example.test");
+    expect(html).toContain('id="user-content-preview"');
+    expect(html).toContain('name="user-content-location"');
     expect(highlightedCodeHtml("const value = true;", "ts")).toContain("hljs-keyword");
   });
 
@@ -63,7 +90,16 @@ describe("filePreviewText", () => {
     expect(markdownImageTransferPath("README.md", "https://example.test/image.png")).toBeUndefined();
     expect(html).toContain('/api/tabs/tab-files/files/raw?relativePath=docs%2Fscreenshots%2Fcloudx-split-panes.png');
     expect(html).toContain('/api/tabs/tab-files/files/raw?relativePath=docs%2Fscreenshots%2Fcloudx-mobile-portrait.png');
-    expect(html).toContain('src="https://example.test/image.png"');
+    expect(html).not.toContain("https://example.test");
+  });
+
+  it("keeps Markdown image rewrites inside the sanitizer boundary", () => {
+    const html = renderMarkdownHtml('<img src="docs/panel.png" srcset="https://example.test/panel@2x.png 2x" alt="Panel">', { resolveImageUrl: () => "javascript:alert(1)" });
+
+    expect(html).not.toContain("javascript:");
+    expect(html).not.toContain("alert(1)");
+    expect(html).not.toContain("srcset=");
+    expect(html).not.toContain("https://example.test");
   });
 });
 
@@ -206,6 +242,57 @@ describe("file browser panel state cache", () => {
     expect(html).toContain("language-markdown");
     expect(html).toContain("# Title");
     expect(html).not.toContain("<h1>Title</h1>");
+  });
+
+  it("hides rendered Git diffs while keeping changed-file indicators when the Git bar is hidden", () => {
+    const tab = workspaceTab("tab-files", "/repo");
+    rememberFileBrowserPanelState(tab, fileBrowserState({
+      entries: [{ name: "README.md", type: "file" }],
+      gitState: gitRepositoryState(),
+      diffSummary: gitDiffSummary(),
+      openedDiff: gitDiffFile(),
+      gitBarVisible: false
+    }));
+
+    const html = renderToStaticMarkup(createElement(FileBrowserPanel, { tab }));
+
+    expect(html).not.toContain("git-diff-workspace");
+    expect(html).toContain("tree-change-badge");
+    expect(html).toContain("deleted.md");
+    expect(html).not.toContain("updated line");
+    expect(html).toContain("README.md");
+  });
+
+  it("does not render stale search previews after search inputs change", () => {
+    const tab = workspaceTab("tab-files", "/repo");
+    rememberFileBrowserPanelState(tab, fileBrowserState({
+      searchQuery: "TODO",
+      searchMode: "all",
+      searchGlob: "*.md",
+      searchVisible: true,
+      searchResult: {
+        query: "TODO",
+        mode: "all",
+        relativePath: ".",
+        glob: "*.ts",
+        files: [
+          {
+            path: "src/old.ts",
+            type: "content",
+            entryType: "file",
+            matches: [{ lineNumber: 1, column: 1, text: "TODO old\n", matchText: "TODO" }],
+            truncated: false
+          }
+        ],
+        truncated: false,
+        searchedAt: new Date(0).toISOString()
+      }
+    }));
+
+    const html = renderToStaticMarkup(createElement(FileBrowserPanel, { tab, config: { showGitDiff: false } }));
+
+    expect(html).not.toContain("src/old.ts");
+    expect(html).toContain("Select a file to preview it.");
   });
 
   it("ignores cached state after cwd changes and disposes closed tabs", () => {
@@ -364,7 +451,43 @@ describe("file browser visibility class names", () => {
     expect(clampFileBrowserTreeSize(120, 800)).toBe(160);
     expect(clampFileBrowserTreeSize(320, 800)).toBe(320);
     expect(clampFileBrowserTreeSize(900, 800)).toBe(640);
+    expect(fileBrowserTreeSizeMax(800)).toBe(640);
     expect(fileBrowserBodyStyle(320)).toEqual({ "--file-tree-size": "320px" });
+  });
+
+  it("renders splitter value semantics for assistive technology", () => {
+    const tab = workspaceTab("tab-files", "/repo");
+    rememberFileBrowserPanelState(tab, fileBrowserState({ fileTreeSize: 320 }));
+
+    const html = renderToStaticMarkup(createElement(FileBrowserPanel, { tab, config: { showGitDiff: false } }));
+    const container = document.createElement("div");
+    container.innerHTML = html;
+    const splitter = container.querySelector('[role="separator"]');
+
+    expect(splitter?.getAttribute("aria-orientation")).toBe("vertical");
+    expect(splitter?.getAttribute("aria-valuemin")).toBe("160");
+    expect(splitter?.getAttribute("aria-valuemax")).toBe("640");
+    expect(splitter?.getAttribute("aria-valuenow")).toBe("320");
+    expect(splitter?.getAttribute("aria-valuetext")).toBe("320px");
+  });
+});
+
+describe("searchResultMatchesInput", () => {
+  it("invalidates cached search results when query mode or glob changes", () => {
+    const result = {
+      query: "TODO",
+      mode: "all",
+      relativePath: ".",
+      glob: "*.ts",
+      files: [],
+      truncated: false,
+      searchedAt: new Date(0).toISOString()
+    } satisfies FileSearchResult;
+
+    expect(searchResultMatchesInput(result, "TODO", "all", "*.ts")).toBe(true);
+    expect(searchResultMatchesInput(result, "TODO", "all", "*.md")).toBe(false);
+    expect(searchResultMatchesInput(result, "TODO", "content", "*.ts")).toBe(false);
+    expect(searchResultMatchesInput(result, "FIXME", "all", "*.ts")).toBe(false);
   });
 });
 
@@ -432,6 +555,35 @@ index ce01362..94954ab 100644
   it("returns an empty list when no patch is available", () => {
     expect(parsePatch(undefined)).toEqual([]);
     expect(parsePatch("")).toEqual([]);
+  });
+
+  it("parses quoted Git paths and treats malformed patches as unrenderable", () => {
+    const quotedPathPatch = [
+      'diff --git "a/notes\\nwith\\ttab.txt" "b/notes\\nwith\\ttab.txt"',
+      "new file mode 100644",
+      "index 0000000..0000000",
+      "--- /dev/null",
+      '+++ "b/notes\\nwith\\ttab.txt"',
+      "@@ -0,0 +1 @@",
+      "+hello",
+      ""
+    ].join("\n");
+    const malformedPathPatch = [
+      "diff --git a/notes",
+      "with\ttab.txt b/notes",
+      "with\ttab.txt",
+      "new file mode 100644",
+      "index 0000000..0000000",
+      "--- /dev/null",
+      "+++ b/notes",
+      "with\ttab.txt",
+      "@@ -0,0 +1 @@",
+      "+hello",
+      ""
+    ].join("\n");
+
+    expect(parsePatch(quotedPathPatch)).toHaveLength(1);
+    expect(parsePatch(malformedPathPatch)).toEqual([]);
   });
 });
 
@@ -517,6 +669,39 @@ function fileBrowserState(overrides: Partial<FileBrowserPanelState> = {}): FileB
     markdownPreviewMode: "rendered",
     fileTreeSize: 280,
     ...overrides
+  };
+}
+
+function gitRepositoryState(): GitRepositoryState {
+  return {
+    isRepository: true,
+    cwd: "/repo",
+    rootPath: "/repo",
+    folderEmpty: false,
+    currentBranch: "main",
+    defaultCompareRef: "origin/main",
+    compareRefs: ["origin/main"],
+    setup: { canInitialize: false, canClone: false, canSetOrigin: true }
+  };
+}
+
+function gitDiffSummary(): GitDiffSummary {
+  return {
+    compareRef: "origin/main",
+    truncated: false,
+    files: [
+      { path: "src/README.md", status: "modified", statusCode: "M", additions: 1, deletions: 0 },
+      { path: "src/deleted.md", status: "deleted", statusCode: "D", additions: 0, deletions: 1 }
+    ]
+  };
+}
+
+function gitDiffFile(): GitDiffFile {
+  return {
+    path: "src/README.md",
+    status: "modified",
+    statusCode: "M",
+    patch: "diff --git a/src/README.md b/src/README.md\n--- a/src/README.md\n+++ b/src/README.md\n@@ -1 +1 @@\n-old line\n+updated line\n"
   };
 }
 

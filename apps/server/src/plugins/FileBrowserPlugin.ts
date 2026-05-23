@@ -1,16 +1,20 @@
 import fs from "node:fs/promises";
-import type { Dirent } from "node:fs";
+import { constants, type Dirent, type Stats } from "node:fs";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
 import type { CreatePluginSessionInput, PluginActionDefinition, PluginSession, PluginSessionSnapshot, PluginVoiceContext, WorkspacePlugin } from "@cloudx/plugin-api";
 import type { ConfigFieldDescriptor, ConfigValue, FileSearchMode, FileSearchResult, GitDiffFile, GitDiffSummary, GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
 
 import { GitService } from "../git/GitService.js";
 import type { PathPolicy } from "../pathPolicy.js";
+import { isSameOrChildPath, relativeChildPath } from "../pathBoundary.js";
 import { FileSearchService } from "../search/FileSearchService.js";
 import { ArchiveExtractionService, type ArchiveExtractionDestination } from "../archive/ArchiveExtractionService.js";
 
-const VOICE_PREVIEW_BYTES = 8_000;
+export const FILE_BROWSER_TEXT_PREVIEW_BYTES = 512_000;
+export const FILE_BROWSER_VOICE_PREVIEW_BYTES = 8_000;
+const SYMLINK_FILE_ERROR = "File browser paths must not be symbolic links.";
 
 interface FileListingEntry {
   name: string;
@@ -49,6 +53,11 @@ interface GitVoiceState {
 
 interface SearchVoiceState {
   result?: FileSearchResult;
+}
+
+interface TextFilePreview {
+  content: string;
+  truncated: boolean;
 }
 
 export class FileBrowserPlugin implements WorkspacePlugin {
@@ -331,6 +340,7 @@ class FileBrowserSession implements PluginSession {
     if (action === "list_directory") {
       const relativePath = requireString(input.relativePath, "relativePath");
       const directory = this.resolveUnderCwd(relativePath);
+      await this.requireDirectory(directory);
       const entries = await fs.readdir(directory, { withFileTypes: true });
       const listedEntries = (await Promise.all(entries.map((entry) => fileListingEntry(directory, entry))))
         .sort((a, b) => `${a.type}:${a.name}`.localeCompare(`${b.type}:${b.name}`));
@@ -351,6 +361,7 @@ class FileBrowserSession implements PluginSession {
     }
     if (action === "extract_archive") {
       const archivePath = this.resolveUnderCwd(requireString(input.relativePath, "relativePath"));
+      await this.requireFile(archivePath);
       const result = await this.archiveExtractionService.extract({
         cwd: this.tab.cwd,
         archivePath,
@@ -378,14 +389,14 @@ class FileBrowserSession implements PluginSession {
         throw new Error("oldText must not be empty.");
       }
       const filePath = this.resolveUnderCwd(relativePath);
-      await this.requireFile(filePath);
-      const content = await fs.readFile(filePath, "utf8");
+      const stat = await this.requireFile(filePath);
+      const content = await readTextFileNoFollow(filePath, stat);
       const occurrences = countOccurrences(content, oldText);
       if (occurrences !== 1) {
-        throw new Error(`Expected oldText to appear exactly once in ${filePath}; found ${occurrences}.`);
+        throw new Error(`Expected oldText to appear exactly once in ${relativePath}; found ${occurrences}.`);
       }
       const nextContent = content.replace(oldText, newText);
-      await fs.writeFile(filePath, nextContent, "utf8");
+      await writeTextFileNoFollow(filePath, nextContent, stat, this.tab.cwd);
       this.setOpenFile(filePath, relativePath, filePreviewMetadataForPath(filePath), nextContent, Buffer.byteLength(nextContent, "utf8"), false);
       return {
         path: filePath,
@@ -399,11 +410,12 @@ class FileBrowserSession implements PluginSession {
       const content = requireString(input.content, "content");
       const create = typeof input.create === "boolean" ? input.create : false;
       const filePath = this.resolveUnderCwd(relativePath);
-      await this.ensureWritableFileTarget(filePath, create);
+      const stat = await this.ensureWritableFileTarget(filePath, create);
       if (create) {
         await fs.mkdir(path.dirname(filePath), { recursive: true });
+        await this.requireDirectory(path.dirname(filePath));
       }
-      await fs.writeFile(filePath, content, "utf8");
+      await writeTextFileNoFollow(filePath, content, stat, this.tab.cwd);
       this.setOpenFile(filePath, relativePath, filePreviewMetadataForPath(filePath), content, Buffer.byteLength(content, "utf8"), false);
       return {
         path: filePath,
@@ -452,22 +464,21 @@ class FileBrowserSession implements PluginSession {
   }
 
   private resolveUnderCwd(relativePath: string): string {
-    if (path.isAbsolute(relativePath)) {
-      return this.pathPolicy.resolve(relativePath);
+    const cwd = path.resolve(this.tab.cwd);
+    const resolved = path.isAbsolute(relativePath) ? path.resolve(relativePath) : path.resolve(cwd, relativePath || ".");
+    if (!isSameOrChildPath(cwd, resolved)) {
+      throw new Error("Path is outside the tab working directory.");
     }
-    return this.pathPolicy.resolve(path.resolve(this.tab.cwd, relativePath || "."));
+    return this.pathPolicy.resolve(resolved);
   }
 
   private async searchRelativePath(relativePath: string | undefined): Promise<string> {
     const directory = this.resolveUnderCwd(relativePath ?? ".");
-    const relative = path.relative(this.tab.cwd, directory);
-    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    const relative = relativeChildPath(this.tab.cwd, directory);
+    if (relative === undefined) {
       throw new Error("Search path is outside the tab working directory.");
     }
-    const stat = await fs.stat(directory);
-    if (!stat.isDirectory()) {
-      throw new Error(`Search path is not a directory: ${directory}`);
-    }
+    await this.requireDirectory(directory);
     return relative ? relative.split(path.sep).join("/") : ".";
   }
 
@@ -476,25 +487,39 @@ class FileBrowserSession implements PluginSession {
     const stat = await this.requireFile(filePath);
     const metadata = filePreviewMetadataForPath(filePath);
     if (metadata.previewKind === "image" || metadata.previewKind === "pdf") {
+      await verifyFileNoFollow(filePath, stat);
       const content = `${metadata.previewKind.toUpperCase()} preview: ${metadata.mimeType}, ${stat.size} bytes.`;
       this.setOpenFile(filePath, relativePath, metadata, content, stat.size, false);
       return { path: filePath, relativePath, truncated: false, content: "", sizeBytes: stat.size, ...metadata };
     }
-    const content = await fs.readFile(filePath, "utf8");
-    this.setOpenFile(filePath, relativePath, metadata, content, stat.size, false);
-    return { path: filePath, relativePath, truncated: false, content, sizeBytes: stat.size, ...metadata };
+    const preview = await readTextFilePreview(filePath, stat);
+    this.setOpenFile(filePath, relativePath, metadata, preview.content, stat.size, preview.truncated);
+    return { path: filePath, relativePath, truncated: preview.truncated, content: preview.content, sizeBytes: stat.size, ...metadata };
   }
 
   private async requireFile(filePath: string) {
-    const stat = await fs.stat(filePath);
+    const stat = await fs.lstat(filePath);
+    if (stat.isSymbolicLink()) {
+      throw new Error(`${SYMLINK_FILE_ERROR}: ${filePath}`);
+    }
     if (!stat.isFile()) {
       throw new Error(`Not a file: ${filePath}`);
     }
+    await this.requireRealPathUnderCwd(filePath);
     return stat;
   }
 
-  private async ensureWritableFileTarget(filePath: string, create: boolean): Promise<void> {
-    const stat = await fs.stat(filePath).catch((error: NodeJS.ErrnoException) => {
+  private async requireDirectory(directoryPath: string) {
+    const stat = await fs.stat(directoryPath);
+    if (!stat.isDirectory()) {
+      throw new Error(`Not a directory: ${directoryPath}`);
+    }
+    await this.requireRealPathUnderCwd(directoryPath);
+    return stat;
+  }
+
+  private async ensureWritableFileTarget(filePath: string, create: boolean): Promise<Stats | undefined> {
+    const stat = await fs.lstat(filePath).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") {
         return undefined;
       }
@@ -504,21 +529,65 @@ class FileBrowserSession implements PluginSession {
       if (!create) {
         throw new Error(`File does not exist: ${filePath}`);
       }
-      return;
+      await this.requireCreatablePathUnderCwd(filePath);
+      return undefined;
+    }
+    if (stat.isSymbolicLink()) {
+      throw new Error(`${SYMLINK_FILE_ERROR}: ${filePath}`);
     }
     if (!stat.isFile()) {
       throw new Error(`Not a file: ${filePath}`);
     }
+    await this.requireRealPathUnderCwd(filePath);
+    return stat;
+  }
+
+  private async requireCreatablePathUnderCwd(filePath: string): Promise<void> {
+    let ancestor = path.dirname(filePath);
+    const cwd = path.resolve(this.tab.cwd);
+    while (isSameOrChildPath(cwd, ancestor)) {
+      const stat = await fs.stat(ancestor).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") {
+          return undefined;
+        }
+        throw error;
+      });
+      if (!stat) {
+        const parent = path.dirname(ancestor);
+        if (parent === ancestor) {
+          break;
+        }
+        ancestor = parent;
+        continue;
+      }
+      if (!stat.isDirectory()) {
+        throw new Error(`Writable file parent is not a directory: ${ancestor}`);
+      }
+      await this.requireRealPathUnderCwd(ancestor);
+      return;
+    }
+    throw new Error("Path is outside the tab working directory.");
+  }
+
+  private async requireRealPathUnderCwd(filePath: string): Promise<void> {
+    const [realCwd, realPath] = await Promise.all([
+      fs.realpath(this.tab.cwd),
+      fs.realpath(filePath)
+    ]);
+    if (!isSameOrChildPath(realCwd, realPath)) {
+      throw new Error("Path resolves outside the tab working directory.");
+    }
   }
 
   private setOpenFile(filePath: string, relativePath: string, metadata: FilePreviewMetadata, content: string, sizeBytes: number, truncated: boolean): void {
-    const previewTruncated = truncated || Buffer.byteLength(content, "utf8") > VOICE_PREVIEW_BYTES;
+    const contentPreview = trimUtf8ToFirstBytes(content, FILE_BROWSER_VOICE_PREVIEW_BYTES);
+    const previewTruncated = truncated || Buffer.byteLength(content, "utf8") > Buffer.byteLength(contentPreview, "utf8");
     this.openFile = {
       path: filePath,
       relativePath,
       previewKind: metadata.previewKind,
       mimeType: metadata.mimeType,
-      contentPreview: content.slice(0, VOICE_PREVIEW_BYTES),
+      contentPreview,
       truncated: previewTruncated,
       sizeBytes,
       updatedAt: new Date().toISOString()
@@ -575,6 +644,92 @@ class FileBrowserSession implements PluginSession {
       throw new Error("Git diff is disabled for the file browser plugin.");
     }
   }
+}
+
+async function readTextFilePreview(filePath: string, expectedStat: Stats): Promise<TextFilePreview> {
+  const sizeBytes = expectedStat.size;
+  const bytesToRead = Math.min(sizeBytes, FILE_BROWSER_TEXT_PREVIEW_BYTES);
+  if (bytesToRead === 0) {
+    return { content: "", truncated: false };
+  }
+  const file = await openFileNoFollow(filePath, constants.O_RDONLY, expectedStat);
+  try {
+    const buffer = Buffer.alloc(bytesToRead);
+    const { bytesRead } = await file.read(buffer, 0, bytesToRead, 0);
+    return {
+      content: decodeUtf8Prefix(buffer.subarray(0, bytesRead)),
+      truncated: sizeBytes > FILE_BROWSER_TEXT_PREVIEW_BYTES
+    };
+  } finally {
+    await file.close();
+  }
+}
+
+async function readTextFileNoFollow(filePath: string, expectedStat: Stats): Promise<string> {
+  const file = await openFileNoFollow(filePath, constants.O_RDONLY, expectedStat);
+  try {
+    return await file.readFile("utf8");
+  } finally {
+    await file.close();
+  }
+}
+
+async function writeTextFileNoFollow(filePath: string, content: string, expectedStat: Stats | undefined, cwd: string): Promise<void> {
+  const flags = constants.O_WRONLY | constants.O_NOFOLLOW | (expectedStat ? 0 : constants.O_CREAT | constants.O_EXCL);
+  const file = await openFileNoFollow(filePath, flags, expectedStat);
+  try {
+    await requireRealPathUnderCwd(cwd, filePath);
+    await file.truncate(0);
+    await file.writeFile(content, "utf8");
+  } finally {
+    await file.close();
+  }
+}
+
+async function verifyFileNoFollow(filePath: string, expectedStat: Stats): Promise<void> {
+  const file = await openFileNoFollow(filePath, constants.O_RDONLY, expectedStat);
+  await file.close();
+}
+
+async function openFileNoFollow(filePath: string, flags: number, expectedStat?: Stats) {
+  const file = await fs.open(filePath, flags | constants.O_NOFOLLOW).catch((error) => {
+    if (isSymbolicLinkOpenError(error)) {
+      throw new Error(`${SYMLINK_FILE_ERROR}: ${filePath}`);
+    }
+    throw error;
+  });
+  try {
+    const stat = await file.stat();
+    if (!stat.isFile() || (expectedStat && !sameFilesystemObject(stat, expectedStat))) {
+      throw new Error(`File browser path changed during file access: ${filePath}`);
+    }
+    return file;
+  } catch (error) {
+    await file.close();
+    throw error;
+  }
+}
+
+function sameFilesystemObject(left: Stats, right: Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+async function requireRealPathUnderCwd(cwd: string, filePath: string): Promise<void> {
+  const [realCwd, realPath] = await Promise.all([fs.realpath(cwd), fs.realpath(filePath)]);
+  if (!isSameOrChildPath(realCwd, realPath)) {
+    throw new Error("Path resolves outside the tab working directory.");
+  }
+}
+
+function trimUtf8ToFirstBytes(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) {
+    return value;
+  }
+  return decodeUtf8Prefix(Buffer.from(value, "utf8").subarray(0, maxBytes));
+}
+
+function decodeUtf8Prefix(buffer: Buffer): string {
+  return new StringDecoder("utf8").write(buffer);
 }
 
 function requireString(value: unknown, name: string): string {
@@ -656,7 +811,7 @@ function countOccurrences(content: string, needle: string): number {
       return count;
     }
     count += 1;
-    index = nextIndex + needle.length;
+    index = nextIndex + 1;
   }
 }
 
@@ -692,11 +847,13 @@ function imageMimeTypeForExtension(extension: string): string | undefined {
       return "image/jpeg";
     case ".png":
       return "image/png";
-    case ".svg":
-      return "image/svg+xml";
     case ".webp":
       return "image/webp";
     default:
       return undefined;
   }
+}
+
+function isSymbolicLinkOpenError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ELOOP";
 }

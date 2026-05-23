@@ -5,10 +5,13 @@ import { promisify } from "node:util";
 
 import type { WorktreeCreateMode, WorktreeDirtyStatus, WorktreeProjectDetectionSource, WorktreeProjectState, WorktreeRef, WorktreeSummary } from "@cloudx/shared";
 
+import { isDirectChildPath } from "../pathBoundary.js";
+
 const execFileAsync = promisify(execFile);
 
 const BARE_DIRECTORY_NAME = ".bare";
 const MAX_GIT_OUTPUT_BYTES = 2_000_000;
+const GIT_COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
 const WORKTREE_SIZE_CACHE_TTL_MS = 30_000;
 
 interface GitCommandResult {
@@ -132,10 +135,15 @@ export class WorktreeService {
     requireNonEmptyString(url, "url");
     await this.requireEmptyProjectWithoutBare(projectDir, "Clone bare repository");
     const barePath = this.barePath(projectDir);
-    await this.runGit(projectDir, ["init", "--bare", barePath]);
-    await this.runBareGit(barePath, ["remote", "add", "origin", url]);
-    await this.runBareGit(barePath, ["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
-    await this.fetchRefs(projectDir, options);
+    try {
+      await this.runGit(projectDir, ["init", "--bare", barePath]);
+      await this.runBareGit(barePath, ["remote", "add", "--", "origin", url]);
+      await this.runBareGit(barePath, ["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
+      await this.fetchRefs(projectDir, options);
+    } catch (error) {
+      await fs.rm(barePath, { recursive: true, force: true });
+      throw error;
+    }
     return this.getState(projectDir, options);
   }
 
@@ -149,12 +157,12 @@ export class WorktreeService {
   async createWorktree(projectDir: string, input: CreateWorktreeInput, options: WorktreeStateOptions = {}): Promise<WorktreeProjectState> {
     const context = await this.requireReadyProject(projectDir);
     const folderName = requireValidFolderName(input.folderName, context.bareName);
-    const branchName = requireBranchName(input.branchName);
+    const branchName = await this.requireBranchName(input.branchName);
     const worktreePath = path.join(context.projectDir, folderName);
     await this.requireNewWorktreePath(context.projectDir, worktreePath, folderName);
 
     if (input.mode === "new_branch") {
-      const baseRef = requireNonEmptyString(input.baseRef, "baseRef");
+      const baseRef = await this.worktreeStartPoint(context.barePath, requireNonEmptyString(input.baseRef, "baseRef"));
       await this.runBareGit(context.barePath, ["worktree", "add", "-b", branchName, worktreePath, baseRef]);
     } else if (input.mode === "existing_branch") {
       await this.runBareGit(context.barePath, ["worktree", "add", worktreePath, branchName]);
@@ -312,13 +320,22 @@ export class WorktreeService {
     }
 
     const projectDir = path.dirname(barePath);
-    if (!isDirectChild(projectDir, topLevel)) {
+    if (!isDirectChildPath(projectDir, topLevel)) {
       return undefined;
     }
     return projectContext(cwd, projectDir, barePath, "worktree_dir");
   }
 
   private async isBareRepository(barePath: string): Promise<boolean> {
+    const stat = await fs.lstat(barePath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT" || error.code === "ENOTDIR" || error.code === "EACCES") {
+        return undefined;
+      }
+      throw error;
+    });
+    if (!stat?.isDirectory() || stat.isSymbolicLink()) {
+      return false;
+    }
     const result = await this.runBareGit(barePath, ["rev-parse", "--is-bare-repository"], { allowExitCodes: [0, 128] });
     return result.code === 0 && result.stdout.trim() === "true";
   }
@@ -335,26 +352,26 @@ export class WorktreeService {
       .map((line) => line.trim())
       .filter(Boolean)
       .map((line) => {
-        const [fullName, name, commit, upstream] = line.split("\t");
+        const [fullName, , commit, upstream] = line.split("\t");
         return {
           fullName,
-          name,
+          name: shortRefName(fullName),
           commit,
           upstream: upstream || undefined,
           kind: refKind(fullName)
         };
       })
-      .filter((ref) => ref.kind !== "remote" || !ref.name.endsWith("/HEAD"))
+      .filter((ref) => !isRemoteHeadRef(ref.fullName))
       .sort((left, right) => `${left.kind}:${left.name}`.localeCompare(`${right.kind}:${right.name}`));
   }
 
   private async listWorktrees(projectDir: string, barePath: string, options: WorktreeStateOptions = {}): Promise<WorktreeSummary[]> {
-    const result = await this.runBareGit(barePath, ["worktree", "list", "--porcelain"]);
+    const result = await this.runBareGit(barePath, ["worktree", "list", "--porcelain", "-z"]);
     const parsed = parseWorktreeList(result.stdout);
     const summaries = await Promise.all(
       parsed
         .filter((worktree) => !worktree.bare)
-        .filter((worktree) => isDirectChild(projectDir, worktree.path))
+        .filter((worktree) => isDirectChildPath(projectDir, worktree.path))
         .map(async (worktree) => {
           const summary: WorktreeSummary = {
             folderName: path.basename(worktree.path),
@@ -440,12 +457,32 @@ export class WorktreeService {
   }
 
   private async requireNewWorktreePath(projectDir: string, worktreePath: string, folderName: string): Promise<void> {
-    if (!isDirectChild(projectDir, worktreePath)) {
+    if (!isDirectChildPath(projectDir, worktreePath)) {
       throw new Error("Worktree folder must be directly under the project directory.");
     }
     if (await pathExists(worktreePath)) {
       throw new Error(`Worktree folder already exists: ${folderName}`);
     }
+  }
+
+  private async requireBranchName(value: string): Promise<string> {
+    const branchName = requireNonEmptyString(value, "branchName");
+    const result = await this.runGit(process.cwd(), ["check-ref-format", "--branch", branchName], { allowExitCodes: [0, 1, 128] });
+    if (result.code !== 0 || result.stdout.trim() !== branchName) {
+      throw new Error("branchName is not a valid Git branch name.");
+    }
+    return branchName;
+  }
+
+  private async worktreeStartPoint(barePath: string, baseRef: string): Promise<string> {
+    if (!baseRef.startsWith("-")) {
+      return baseRef;
+    }
+    const result = await this.runBareGit(barePath, ["rev-parse", "--verify", "--quiet", "--end-of-options", `${baseRef}^{commit}`], { allowExitCodes: [0, 1, 128] });
+    if (result.code !== 0 || !result.stdout.trim()) {
+      throw new Error(`baseRef does not resolve to a commit: ${baseRef}`);
+    }
+    return result.stdout.trim();
   }
 
   private async runBareGit(barePath: string, args: string[], options?: { allowExitCodes?: number[] }): Promise<GitCommandResult> {
@@ -458,6 +495,7 @@ export class WorktreeService {
       const result = await execFileAsync("git", args, {
         cwd,
         maxBuffer: MAX_GIT_OUTPUT_BYTES,
+        timeout: GIT_COMMAND_TIMEOUT_MS,
         windowsHide: true
       });
       return { stdout: result.stdout, stderr: result.stderr, code: 0 };
@@ -529,27 +567,44 @@ function refKind(fullName: string): WorktreeRef["kind"] {
   return "tag";
 }
 
+function shortRefName(fullName: string): string {
+  if (fullName.startsWith("refs/heads/")) {
+    return fullName.slice("refs/heads/".length);
+  }
+  if (fullName.startsWith("refs/remotes/")) {
+    return fullName.slice("refs/remotes/".length);
+  }
+  if (fullName.startsWith("refs/tags/")) {
+    return fullName.slice("refs/tags/".length);
+  }
+  return fullName;
+}
+
+function isRemoteHeadRef(fullName: string): boolean {
+  return /^refs\/remotes\/[^/]+\/HEAD$/u.test(fullName);
+}
+
 function parseWorktreeList(output: string): ParsedWorktree[] {
   const worktrees: ParsedWorktree[] = [];
   let current: ParsedWorktree | undefined;
-  for (const line of output.split("\n")) {
-    if (!line) {
+  for (const field of output.split("\0")) {
+    if (!field) {
       if (current) {
         worktrees.push(current);
         current = undefined;
       }
       continue;
     }
-    if (line.startsWith("worktree ")) {
+    if (field.startsWith("worktree ")) {
       if (current) {
         worktrees.push(current);
       }
-      current = { path: line.slice("worktree ".length), bare: false };
-    } else if (current && line.startsWith("HEAD ")) {
-      current.head = line.slice("HEAD ".length);
-    } else if (current && line.startsWith("branch ")) {
-      current.branch = shortBranchName(line.slice("branch ".length));
-    } else if (current && line === "bare") {
+      current = { path: field.slice("worktree ".length), bare: false };
+    } else if (current && field.startsWith("HEAD ")) {
+      current.head = field.slice("HEAD ".length);
+    } else if (current && field.startsWith("branch ")) {
+      current.branch = shortBranchName(field.slice("branch ".length));
+    } else if (current && field === "bare") {
       current.bare = true;
     }
   }
@@ -563,23 +618,10 @@ function shortBranchName(ref: string): string {
   return ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
 }
 
-function isDirectChild(parent: string, child: string): boolean {
-  const relative = path.relative(parent, child);
-  return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative) && !relative.includes(path.sep);
-}
-
 function requireValidFolderName(value: string, reservedBareFolderName = BARE_DIRECTORY_NAME): string {
   const trimmed = requireNonEmptyString(value, "folderName");
   if (trimmed === "." || trimmed === ".." || trimmed === BARE_DIRECTORY_NAME || trimmed === reservedBareFolderName || trimmed.includes("/") || trimmed.includes("\\")) {
     throw new Error("folderName must be a direct child folder name.");
-  }
-  return trimmed;
-}
-
-function requireBranchName(value: string): string {
-  const trimmed = requireNonEmptyString(value, "branchName");
-  if (trimmed.includes("..") || trimmed.startsWith("-") || trimmed.includes(" ") || trimmed.includes("\\")) {
-    throw new Error("branchName is not a supported branch name.");
   }
   return trimmed;
 }

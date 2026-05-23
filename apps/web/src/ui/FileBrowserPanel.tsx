@@ -1,6 +1,6 @@
 import { useEffect, useId, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { createPortal } from "react-dom";
-import DOMPurify from "dompurify";
+import DOMPurify, { type Config as DOMPurifyConfig } from "dompurify";
 import hljs from "highlight.js/lib/core";
 import bash from "highlight.js/lib/languages/bash";
 import css from "highlight.js/lib/languages/css";
@@ -16,7 +16,7 @@ import typescript from "highlight.js/lib/languages/typescript";
 import xml from "highlight.js/lib/languages/xml";
 import yaml from "highlight.js/lib/languages/yaml";
 import { marked, type Tokens } from "marked";
-import { Diff, Hunk, parseDiff, type DiffType, type FileData, type HunkData, type ViewType } from "react-diff-view";
+import { Diff, Hunk, parseDiff, type DiffType, type FileData, type HunkData } from "react-diff-view";
 import "react-diff-view/style/index.css";
 import { AlignJustify, ArchiveRestore, Check, ChevronDown, Copy, Download, FileCode, FileDiff, FileText, Folder, GitBranch, GitCompareArrows, GitFork, GitPullRequest, Image as ImageIcon, RefreshCw, Search, Upload, X } from "lucide-react";
 
@@ -24,12 +24,10 @@ import type { ConfigValue, FileSearchFileResult, FileSearchMode, FileSearchResul
 
 import { downloadFileBrowserEntries, fileBrowserRawFileUrl, runTabAction, saveBlobDownload, uploadFileBrowserFile } from "../api.js";
 import { ControlButton, SegmentedControl } from "./Control.js";
+import { readFileBrowserPanelState, rememberFileBrowserPanelState, type DiffViewMode, type DirectoryEntry, type FileBrowserPanelState, type FilePreviewKind, type MarkdownPreviewMode, type OpenFileResult } from "./fileBrowserPanelState.js";
 import { noSystemTextAssistProps } from "./inputAssist.js";
 
-export interface DirectoryEntry {
-  name: string;
-  type: "directory" | "file";
-}
+export { disposeFileBrowserPanelStatesExcept, readFileBrowserPanelState, rememberFileBrowserPanelState, type DiffViewMode, type DirectoryEntry, type FileBrowserPanelState, type MarkdownPreviewMode, type OpenFileResult } from "./fileBrowserPanelState.js";
 
 interface DisplayDirectoryEntry extends DirectoryEntry {
   gitChange?: GitTreeChange;
@@ -43,30 +41,24 @@ interface DirectoryResult {
   entries: DirectoryEntry[];
 }
 
-export interface OpenFileResult {
-  path: string;
-  relativePath?: string;
-  truncated: boolean;
-  content: string;
-  previewKind?: FilePreviewKind;
-  mimeType?: string;
-  sizeBytes?: number;
-}
-
-type FilePreviewKind = "text" | "markdown" | "image" | "pdf";
-
 type GitBusyAction = "state" | "diff" | "file" | "initialize" | "clone" | "origin";
 type SearchBusyAction = "search";
 type FileTransferBusyAction = "download" | "upload" | "extract";
 type ArchiveExtractionDestination = "here" | "folder";
-export type DiffViewMode = Extract<ViewType, "split" | "unified">;
-export type MarkdownPreviewMode = "rendered" | "source";
+type FileTreeResizeAxis = "x" | "y";
 const DEFAULT_GIT_AUTO_REFRESH_SECONDS = 15;
 const DEFAULT_FILE_TREE_SIZE = 280;
 const MIN_FILE_TREE_SIZE = 160;
 const FILE_TREE_RESIZE_STEP = 24;
+const FILE_TREE_STACKED_MEDIA_QUERY = "(max-width: 760px), all and (hover: none) and (pointer: coarse) and (max-width: 960px) and (max-height: 520px)";
 const GIT_COMPARE_REF_OPTION_LIMIT = 12;
 const HIGHLIGHT_AUTO_LANGUAGES = ["typescript", "javascript", "json", "xml", "css", "markdown", "bash", "python", "yaml", "diff", "sql", "go", "rust"];
+const FILE_PREVIEW_SANITIZE_CONFIG = {
+  USE_PROFILES: { html: true },
+  FORBID_TAGS: ["style", "form", "input", "button", "textarea", "select", "option", "picture", "source", "video", "audio", "track", "iframe", "object", "embed"],
+  FORBID_ATTR: ["style"],
+  SANITIZE_NAMED_PROPS: true
+} satisfies DOMPurifyConfig;
 
 hljs.registerLanguage("bash", bash);
 hljs.registerLanguage("css", css);
@@ -81,57 +73,6 @@ hljs.registerLanguage("sql", sql);
 hljs.registerLanguage("typescript", typescript);
 hljs.registerLanguage("xml", xml);
 hljs.registerLanguage("yaml", yaml);
-
-export interface FileBrowserPanelState {
-  relativePath: string;
-  entries: DirectoryEntry[];
-  opened?: OpenFileResult;
-  gitState?: GitRepositoryState;
-  compareRef: string;
-  diffSummary?: GitDiffSummary;
-  openedDiff?: GitDiffFile;
-  diffViewMode: DiffViewMode;
-  cloneUrl: string;
-  originUrl: string;
-  searchQuery: string;
-  searchMode: FileSearchMode;
-  searchGlob: string;
-  searchResult?: FileSearchResult;
-  searchExpanded: boolean;
-  treeVisible: boolean;
-  searchVisible: boolean;
-  gitBarVisible: boolean;
-  gitDiffFilesVisible: boolean;
-  markdownPreviewMode: MarkdownPreviewMode;
-  fileTreeSize: number;
-}
-
-interface CachedFileBrowserPanelState extends FileBrowserPanelState {
-  cwd: string;
-}
-
-const fileBrowserPanelStates = new Map<string, CachedFileBrowserPanelState>();
-
-export function readFileBrowserPanelState(tab: WorkspaceTab): FileBrowserPanelState | undefined {
-  const cached = fileBrowserPanelStates.get(tab.id);
-  if (!cached || cached.cwd !== tab.cwd) {
-    return undefined;
-  }
-  const { cwd: _cwd, ...state } = cached;
-  return state;
-}
-
-export function rememberFileBrowserPanelState(tab: WorkspaceTab, state: FileBrowserPanelState): void {
-  fileBrowserPanelStates.set(tab.id, { cwd: tab.cwd, ...state });
-}
-
-export function disposeFileBrowserPanelStatesExcept(activeTabIds: Set<string>): void {
-  for (const tabId of fileBrowserPanelStates.keys()) {
-    if (!activeTabIds.has(tabId)) {
-      fileBrowserPanelStates.delete(tabId);
-    }
-  }
-}
 
 interface GitTreeChange {
   status: GitDiffFileSummary["status"];
@@ -187,6 +128,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   const [gitDiffFilesVisible, setGitDiffFilesVisible] = useState(() => initialState?.gitDiffFilesVisible ?? true);
   const [markdownPreviewMode, setMarkdownPreviewMode] = useState<MarkdownPreviewMode>(() => initialState?.markdownPreviewMode ?? "rendered");
   const [fileTreeSize, setFileTreeSize] = useState(() => initialState?.fileTreeSize ?? DEFAULT_FILE_TREE_SIZE);
+  const [fileTreeResizeAxisState, setFileTreeResizeAxisState] = useState<FileTreeResizeAxis>(() => currentFileTreeResizeAxis());
   const [fileTreeResizing, setFileTreeResizing] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<UploadProgressState | undefined>();
   const [error, setError] = useState<string | undefined>();
@@ -194,10 +136,13 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
   const contextMenuRef = useRef<HTMLDivElement | null>(null);
   const showGitDiff = config.showGitDiff !== false;
+  const canViewGitDiff = showGitDiff && gitBarVisible;
   const gitAutoRefresh = config.gitAutoRefresh !== false;
   const gitAutoRefreshIntervalMs = gitAutoRefreshIntervalMilliseconds(config);
   const activeSearchQuery = searchQuery.trim();
-  const activeSearchResult = searchResult?.query === activeSearchQuery && searchResult.mode === searchMode ? searchResult : undefined;
+  const activeSearchGlob = searchGlob.trim();
+  const activeSearchResult = searchResultMatchesInput(searchResult, activeSearchQuery, searchMode, activeSearchGlob) ? searchResult : undefined;
+  const fileTreeResizeContainerPixels = fileTreeResizeContainerSize(bodyRef.current, fileTreeResizeAxisState);
   const visibleEntries = useMemo(
     () => (activeSearchQuery ? searchEntriesFromResult(activeSearchResult) : mergeGitChangesIntoEntries(entries, relativePath, showGitDiff ? diffSummary : undefined)),
     [activeSearchQuery, activeSearchResult, entries, relativePath, diffSummary, showGitDiff]
@@ -258,6 +203,28 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     window.addEventListener("resize", updateViewMode);
     return () => window.removeEventListener("resize", updateViewMode);
   }, []);
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") {
+      return;
+    }
+    const mediaQuery = window.matchMedia(FILE_TREE_STACKED_MEDIA_QUERY);
+    const updateAxis = () => setFileTreeResizeAxisState(mediaQuery.matches ? "y" : "x");
+    updateAxis();
+    mediaQuery.addEventListener("change", updateAxis);
+    window.addEventListener("resize", updateAxis);
+    return () => {
+      mediaQuery.removeEventListener("change", updateAxis);
+      window.removeEventListener("resize", updateAxis);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (canViewGitDiff || !openedDiff || opened || openedDiff.status === "deleted") {
+      return;
+    }
+    void openFilePath(openedDiff.path);
+  }, [canViewGitDiff, opened, openedDiff?.path, openedDiff?.status]);
 
   useEffect(() => {
     const input = buildSearchInput(searchQuery, searchMode, searchGlob);
@@ -847,7 +814,11 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
             className="file-tree-resize-handle"
             role="separator"
             aria-label="Resize file tree"
-            aria-orientation="vertical"
+            aria-orientation={fileTreeResizeAxisState === "x" ? "vertical" : "horizontal"}
+            aria-valuemin={MIN_FILE_TREE_SIZE}
+            aria-valuemax={fileBrowserTreeSizeMax(fileTreeResizeContainerPixels)}
+            aria-valuenow={fileTreeSize}
+            aria-valuetext={`${fileTreeSize}px`}
             tabIndex={0}
             title="Resize file tree"
             onPointerDown={startFileTreeResize}
@@ -857,9 +828,9 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
         <div className="file-preview">
           {opened ? (
             <FilePreview tabId={tab.id} opened={opened} objectUrl={previewObjectUrl} loading={previewLoading} markdownPreviewMode={markdownPreviewMode} onMarkdownPreviewModeChange={setMarkdownPreviewMode} />
-          ) : searchResult ? (
-            <SearchResults result={searchResult} busy={Boolean(searchBusyAction)} onOpenFile={(filePath) => void openFilePath(filePath)} />
-          ) : showGitDiff && gitState?.isRepository ? (
+          ) : activeSearchResult ? (
+            <SearchResults result={activeSearchResult} busy={Boolean(searchBusyAction)} onOpenFile={(filePath) => void openFilePath(filePath)} />
+          ) : canViewGitDiff && gitState?.isRepository ? (
             <GitDiffWorkspace diffSummary={diffSummary} openedDiff={openedDiff} viewMode={diffViewMode} filesVisible={gitDiffFilesVisible} busy={busyAction === "file"} onOpenFile={(file) => void openDiffFile(file)} />
           ) : (
             <pre>{filePreviewText(opened)}</pre>
@@ -934,7 +905,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
       return;
     }
     event.preventDefault();
-    setFileTreeSize((current) => clampFileBrowserTreeSize(current + delta, fileTreeResizeContainerSize(bodyRef.current)));
+    setFileTreeSize((current) => clampFileBrowserTreeSize(current + delta, fileTreeResizeContainerSize(bodyRef.current, fileTreeResizeAxisState)));
   }
 
   function startFileTreeResize(event: ReactPointerEvent<HTMLDivElement>) {
@@ -943,7 +914,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     if (!container) {
       return;
     }
-    const axis = fileTreeResizeAxis();
+    const axis = fileTreeResizeAxisState;
     const rect = container.getBoundingClientRect();
     const containerSize = axis === "x" ? rect.width : rect.height;
     setFileTreeResizing(true);
@@ -980,7 +951,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
       await loadDirectory(relativePath ? `${relativePath}/${entry.name}` : entry.name);
       return;
     }
-    if (entry.gitChange?.file) {
+    if (canViewGitDiff && entry.gitChange?.file) {
       await openDiffFile(entry.gitChange.file);
       return;
     }
@@ -1091,6 +1062,10 @@ export function buildSearchInput(query: string, mode: FileSearchMode, glob: stri
     caseSensitive: false,
     ...(trimmedGlob ? { glob: trimmedGlob } : {})
   };
+}
+
+export function searchResultMatchesInput(result: FileSearchResult | undefined, query: string, mode: FileSearchMode, glob: string): result is FileSearchResult {
+  return Boolean(result && result.query === query && result.mode === mode && (result.glob ?? "") === glob);
 }
 
 export function gitAutoRefreshIntervalMilliseconds(config: Record<string, ConfigValue>): number | undefined {
@@ -1649,8 +1624,12 @@ export function clampFileBrowserTreeSize(size: number, containerSize: number): n
   if (!Number.isFinite(size)) {
     return DEFAULT_FILE_TREE_SIZE;
   }
-  const maxSize = Math.max(MIN_FILE_TREE_SIZE, Math.min(640, containerSize - MIN_FILE_TREE_SIZE));
+  const maxSize = fileBrowserTreeSizeMax(containerSize);
   return Math.round(Math.min(maxSize, Math.max(MIN_FILE_TREE_SIZE, size)));
+}
+
+export function fileBrowserTreeSizeMax(containerSize: number): number {
+  return Math.max(MIN_FILE_TREE_SIZE, Math.min(640, containerSize - MIN_FILE_TREE_SIZE));
 }
 
 export function gitDiffWorkspaceClassName(filesVisible: boolean): string {
@@ -1693,7 +1672,11 @@ export function parsePatch(patch: string | undefined): FileData[] {
   if (!patch?.trim()) {
     return [];
   }
-  return parseDiff(patch, { nearbySequences: "zip" });
+  try {
+    return parseDiff(patch, { nearbySequences: "zip" });
+  } catch {
+    return [];
+  }
 }
 
 function diffTypeForFile(file: FileData): DiffType {
@@ -1830,25 +1813,28 @@ export function renderMarkdownHtml(content: string, options: MarkdownRenderOptio
   renderer.code = (token: Tokens.Code) => highlightedCodeBlockHtml(token.text, token.lang);
   renderer.image = (token: Tokens.Image) => {
     const altText = token.tokens ? renderer.parser.parseInline(token.tokens, renderer.parser.textRenderer) : token.text;
-    const imageSrc = options.resolveImageUrl?.(token.href) ?? token.href;
     const title = token.title ? ` title="${escapeHtml(token.title)}"` : "";
-    return `<img src="${escapeHtml(imageSrc)}" alt="${escapeHtml(altText)}"${title}>`;
+    return `<img src="${escapeHtml(token.href)}" alt="${escapeHtml(altText)}"${title}>`;
   };
   const rawHtml = marked.parse(content, { async: false, renderer }) as string;
-  return rewriteMarkdownImageSources(DOMPurify.sanitize(rawHtml), options);
+  const sanitizedHtml = sanitizeFilePreviewHtml(rawHtml);
+  return sanitizeFilePreviewHtml(rewriteMarkdownImageSources(sanitizedHtml, options));
 }
 
 function rewriteMarkdownImageSources(html: string, options: MarkdownRenderOptions): string {
-  if (!options.resolveImageUrl || typeof document === "undefined") {
+  if (typeof document === "undefined") {
     return html;
   }
   const template = document.createElement("template");
   template.innerHTML = html;
-  for (const image of Array.from(template.content.querySelectorAll("img[src]"))) {
+  for (const image of Array.from(template.content.querySelectorAll("img"))) {
+    image.removeAttribute("srcset");
     const currentSrc = image.getAttribute("src");
-    const nextSrc = currentSrc ? options.resolveImageUrl(currentSrc) : undefined;
+    const nextSrc = currentSrc ? options.resolveImageUrl?.(currentSrc) : undefined;
     if (nextSrc) {
       image.setAttribute("src", nextSrc);
+    } else if (currentSrc) {
+      image.removeAttribute("src");
     }
   }
   return template.innerHTML;
@@ -1902,10 +1888,14 @@ export function highlightedCodeHtml(content: string, language?: string): string 
   const normalizedLanguage = normalizeHighlightLanguage(language);
   try {
     const result = normalizedLanguage ? hljs.highlight(content, { language: normalizedLanguage, ignoreIllegals: true }) : hljs.highlightAuto(content, HIGHLIGHT_AUTO_LANGUAGES);
-    return DOMPurify.sanitize(result.value);
+    return sanitizeFilePreviewHtml(result.value);
   } catch {
-    return DOMPurify.sanitize(escapeHtml(content));
+    return sanitizeFilePreviewHtml(escapeHtml(content));
   }
+}
+
+function sanitizeFilePreviewHtml(html: string): string {
+  return DOMPurify.sanitize(html, FILE_PREVIEW_SANITIZE_CONFIG);
 }
 
 function highlightedCodeBlockHtml(content: string, language?: string): string {
@@ -2113,14 +2103,14 @@ export function defaultDiffViewMode(): DiffViewMode {
   return "unified";
 }
 
-function fileTreeResizeAxis(): "x" | "y" {
-  return window.matchMedia("(max-width: 760px)").matches ? "y" : "x";
+function currentFileTreeResizeAxis(): FileTreeResizeAxis {
+  return typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia(FILE_TREE_STACKED_MEDIA_QUERY).matches ? "y" : "x";
 }
 
-function fileTreeResizeContainerSize(container: HTMLElement | null): number {
+function fileTreeResizeContainerSize(container: HTMLElement | null, axis: FileTreeResizeAxis): number {
   if (!container) {
-    return window.innerWidth;
+    return typeof window === "undefined" ? DEFAULT_FILE_TREE_SIZE * 2 : axis === "x" ? window.innerWidth : window.innerHeight;
   }
   const rect = container.getBoundingClientRect();
-  return fileTreeResizeAxis() === "x" ? rect.width : rect.height;
+  return axis === "x" ? rect.width : rect.height;
 }
