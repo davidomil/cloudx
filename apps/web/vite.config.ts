@@ -1,6 +1,9 @@
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
+const backendOrigin = "https://127.0.0.1:3001";
+const backendWebSocketTarget = "wss://127.0.0.1:3001";
+
 export default defineConfig({
   plugins: [react()],
   server: {
@@ -14,10 +17,15 @@ export default defineConfig({
         secure: false
       },
       "/ws": {
-        target: "wss://127.0.0.1:3001",
+        target: backendWebSocketTarget,
         changeOrigin: true,
         secure: false,
-        ws: true
+        ws: true,
+        configure: (proxy) => {
+          proxy.on("proxyReqWs", (proxyReq) => {
+            proxyReq.setHeader("origin", backendOrigin);
+          });
+        }
       }
     }
   }

@@ -20,6 +20,15 @@ describe("mobile viewport stability", () => {
     expect(mobileShellBlock).toContain("height: 100svh;");
     expect(mobileShellBlock).not.toContain("100dvh");
   });
+
+  it("keeps terminal spacing on the xterm element that FitAddon measures", () => {
+    expect(cssBlocksFor(".terminal-panel").some((block) => block.includes("padding:"))).toBe(false);
+    expect(cssBlocksFor(".terminal-panel .xterm").some((block) => block.includes("padding: 17px 8px 8px;"))).toBe(true);
+  });
+
+  it("keeps terminal glyph selection aligned to xterm's measured cell grid", () => {
+    expect(cssBlocksFor(".terminal-panel .xterm").some((block) => block.includes("letter-spacing: 0;"))).toBe(true);
+  });
 });
 
 function cssBlocksFor(selector: string): string[] {
