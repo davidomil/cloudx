@@ -1,9 +1,15 @@
-import { describe, expect, it } from "vitest";
+// @vitest-environment jsdom
 
-import type { AutomationCatalogResponse, AutomationGroup, AutomationNodeCatalogEntry, AutomationSafety } from "@cloudx/shared";
+import { createElement } from "react";
+import { act } from "react";
+import { createRoot } from "react-dom/client";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import type { AutomationCatalogResponse, AutomationGroup, AutomationNodeCatalogEntry, AutomationSafety, WorkspaceTab } from "@cloudx/shared";
 import { AUTOMATION_FSTRING_TYPE_ID } from "@cloudx/shared";
 
 import {
+  AutomationPanel,
   automationMiniMapTheme,
   automationAllowedSafetyWithToggle,
   automationGraphFromPanelState,
@@ -29,6 +35,13 @@ import {
 } from "./AutomationPanel.js";
 import { automationGraphsEqual, flowFromGraph, graphFromFlow, routedEdgePath } from "./automationGraphAdapter.js";
 import { automationTypeAssignable, connectedDataInputIds, connectionIsValid, dataInputConflictEdges, deleteEdgesForHandle, hasProgramFlowConflict, programFlowConflictEdges, removeConnectionConflicts, removeProgramFlowConflicts } from "./automationConnection.js";
+
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+afterEach(() => {
+  document.body.replaceChildren();
+  vi.unstubAllGlobals();
+});
 
 describe("AutomationPanel helpers", () => {
   it("routes minimap colors through theme variables", () => {
@@ -116,14 +129,49 @@ describe("AutomationPanel helpers", () => {
   it("explains external and destructive safety toggles", () => {
     expect(automationSafetyToggleCopy("external", false)).toMatchObject({
       actionLabel: "Allow external automation hooks",
+      confirmation: "External automation hooks are blocked.",
       status: expect.stringContaining("blocked in this graph"),
       title: expect.stringContaining("shell commands")
     });
     expect(automationSafetyToggleCopy("destructive", true)).toMatchObject({
       actionLabel: "Disallow destructive automation hooks",
+      confirmation: "Destructive automation hooks are allowed.",
       status: expect.stringContaining("allowed in this graph"),
       title: expect.stringContaining("stopping a running terminal process")
     });
+  });
+
+  it("clears safety hover help from the visible status when the pointer leaves", async () => {
+    vi.stubGlobal("ResizeObserver", TestResizeObserver);
+    vi.stubGlobal("fetch", automationPanelFetch());
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => {
+        root.render(createElement(AutomationPanel, { tab: workspaceTab() }));
+      });
+      await flushPanelEffects();
+
+      const status = automationStatusElement(container);
+      expect(status.textContent).toBe("Automation loaded.");
+
+      const destructiveToggle = automationButton(container, "Allow destructive automation hooks");
+      await act(async () => {
+        destructiveToggle.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+      });
+      expect(status.textContent).toContain("Destructive automation hooks are blocked in this graph.");
+
+      await act(async () => {
+        destructiveToggle.dispatchEvent(new MouseEvent("mouseout", { bubbles: true, relatedTarget: container }));
+      });
+      expect(status.textContent).toBe("Automation loaded.");
+    } finally {
+      await act(async () => {
+        root.unmount();
+      });
+    }
   });
 
   it("labels unsafe palette entries in the node picker metadata", () => {
@@ -608,6 +656,72 @@ describe("AutomationPanel helpers", () => {
     expect(automationStatusFromError("Run", "bad response")).toBe("Run failed: bad response");
   });
 });
+
+function automationPanelFetch() {
+  return vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url === "/api/automation/catalog") {
+      return jsonResponse(catalogFixture());
+    }
+    if (url === "/api/automation/groups") {
+      return jsonResponse({ groups: [groupFixture()] });
+    }
+    if (url === "/api/automation/runs") {
+      return jsonResponse({ runs: [] });
+    }
+    throw new Error(`Unhandled automation panel request: ${url}`);
+  });
+}
+
+function jsonResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
+}
+
+async function flushPanelEffects(): Promise<void> {
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
+function automationStatusElement(container: HTMLElement): HTMLElement {
+  const status = container.querySelector('[role="status"]');
+  expect(status).toBeInstanceOf(HTMLElement);
+  return status as HTMLElement;
+}
+
+function automationButton(container: HTMLElement, label: string): HTMLButtonElement {
+  const button = container.querySelector(`[aria-label="${label}"]`);
+  expect(button).toBeInstanceOf(HTMLButtonElement);
+  return button as HTMLButtonElement;
+}
+
+function workspaceTab(): WorkspaceTab {
+  return {
+    id: "automation-tab",
+    pluginId: "automation",
+    title: "Automation",
+    cwd: "/repo",
+    status: "running",
+    indicator: { color: "green", label: "OK", updatedAt: new Date(0).toISOString() },
+    createdAt: new Date(0).toISOString(),
+    updatedAt: new Date(0).toISOString()
+  };
+}
+
+class TestResizeObserver {
+  observe(): void {
+    return undefined;
+  }
+
+  unobserve(): void {
+    return undefined;
+  }
+
+  disconnect(): void {
+    return undefined;
+  }
+}
 
 function catalogFixture(): AutomationCatalogResponse {
   return {

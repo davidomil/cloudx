@@ -153,6 +153,7 @@ type AutomationSafetyToggle = Extract<AutomationSafety, "external" | "destructiv
 
 interface AutomationSafetyToggleCopy {
   actionLabel: string;
+  confirmation: string;
   description: string;
   status: string;
   title: string;
@@ -199,6 +200,7 @@ function AutomationPanelInner({ tab, liveRuns }: AutomationPanelProps) {
   const [createGroupOpen, setCreateGroupOpen] = useState(false);
   const [createGroupName, setCreateGroupName] = useState("");
   const [status, setStatus] = useState("Loading automation.");
+  const [transientStatus, setTransientStatus] = useState<string | undefined>();
   const paletteRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLDivElement | null>(null);
   const reconnectingEdgeIdRef = useRef<string | undefined>(undefined);
@@ -236,7 +238,7 @@ function AutomationPanelInner({ tab, liveRuns }: AutomationPanelProps) {
   const destructiveSafetyDescriptionId = useId();
   const updateSafetyPolicy = useCallback((safety: AutomationSafetyToggle, enabled: boolean) => {
     setAllowedSafety((current) => automationAllowedSafetyWithToggle(current, safety, enabled));
-    setStatus(automationSafetyToggleCopy(safety, enabled).status);
+    setStatus(automationSafetyToggleCopy(safety, enabled).confirmation);
   }, []);
 
   useEffect(() => {
@@ -671,8 +673,10 @@ function AutomationPanelInner({ tab, liveRuns }: AutomationPanelProps) {
             aria-describedby={externalSafetyDescriptionId}
             aria-pressed={externalSafetyAllowed}
             disabled={!selectedGroup}
-            onFocus={() => setStatus(externalSafetyCopy.status)}
-            onMouseEnter={() => setStatus(externalSafetyCopy.status)}
+            onFocus={() => setTransientStatus(externalSafetyCopy.status)}
+            onBlur={() => setTransientStatus(undefined)}
+            onMouseEnter={() => setTransientStatus(externalSafetyCopy.status)}
+            onMouseLeave={() => setTransientStatus(undefined)}
             onClick={() => updateSafetyPolicy("external", !externalSafetyAllowed)}
           >
             <ShieldAlert size={16} />
@@ -684,8 +688,10 @@ function AutomationPanelInner({ tab, liveRuns }: AutomationPanelProps) {
             aria-describedby={destructiveSafetyDescriptionId}
             aria-pressed={destructiveSafetyAllowed}
             disabled={!selectedGroup}
-            onFocus={() => setStatus(destructiveSafetyCopy.status)}
-            onMouseEnter={() => setStatus(destructiveSafetyCopy.status)}
+            onFocus={() => setTransientStatus(destructiveSafetyCopy.status)}
+            onBlur={() => setTransientStatus(undefined)}
+            onMouseEnter={() => setTransientStatus(destructiveSafetyCopy.status)}
+            onMouseLeave={() => setTransientStatus(undefined)}
             onClick={() => updateSafetyPolicy("destructive", !destructiveSafetyAllowed)}
           >
             <Trash2 size={16} />
@@ -718,7 +724,7 @@ function AutomationPanelInner({ tab, liveRuns }: AutomationPanelProps) {
             />
           </div>
           <span className="automation-status" role="status">
-            {status}
+            {transientStatus ?? status}
           </span>
         </div>
 
@@ -905,10 +911,12 @@ export function automationAllowedSafetyWithToggle(allowedSafety: AutomationSafet
 export function automationSafetyToggleCopy(safety: AutomationSafetyToggle, allowed: boolean): AutomationSafetyToggleCopy {
   const actionLabel = `${allowed ? "Disallow" : "Allow"} ${safety} automation hooks`;
   const description = AUTOMATION_SAFETY_EXPLANATIONS[safety];
+  const state = allowed ? "allowed" : "blocked";
   return {
     actionLabel,
+    confirmation: `${automationSafetyLabel(safety)} automation hooks are ${state}.`,
     description,
-    status: `${automationSafetyLabel(safety)} automation hooks are ${allowed ? "allowed in this graph" : "blocked in this graph"}. ${description}`,
+    status: `${automationSafetyLabel(safety)} automation hooks are ${state} in this graph. ${description}`,
     title: `${actionLabel}. ${description}`
   };
 }
