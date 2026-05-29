@@ -48,6 +48,15 @@ export function findPane(root: LayoutNode, paneId: string): Pane | undefined {
   return findTabLayoutPane(root, paneId);
 }
 
+export function maximizedLayoutNode(root: LayoutNode, paneId: string | undefined): LayoutNode {
+  const pane = paneId ? findPane(root, paneId) : undefined;
+  return pane ? { type: "pane", pane } : root;
+}
+
+export function isPaneTabActive(layout: WorkspaceLayout, paneId: string, tabId: string): boolean {
+  return layout.activePaneId === paneId && findPane(layout.root, paneId)?.activeTabId === tabId;
+}
+
 export function findPaneContainingTab(root: LayoutNode, tabId: string): Pane | undefined {
   return findTabLayoutPaneContainingTab(root, tabId);
 }

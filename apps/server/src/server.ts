@@ -416,6 +416,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
 
   app.post<{ Body: { transcript: string; activeTabId?: string; clientContext?: Record<string, unknown> } }>("/api/voice/transcript", async (request) => {
     assertAiControlEnabled(services.config!);
+    assertVoiceCommandsEnabled(services.config!);
     const body = voiceTranscriptBody(request.body);
     const voiceRequestId = randomUUID();
     request.log.info(
@@ -447,6 +448,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
 
   app.post<{ Querystring: { activeTabId?: string; filename?: string }; Body: Buffer }>("/api/voice/audio", async (request) => {
     assertAiControlEnabled(services.config!);
+    assertVoiceCommandsEnabled(services.config!);
     assertMicrophoneEnabled(services.config!);
     const voiceRequestId = randomUUID();
     request.log.info(
@@ -537,6 +539,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     void (async () => {
       try {
         assertAiControlEnabled(services.config!);
+        assertVoiceCommandsEnabled(services.config!);
         assertMicrophoneEnabled(services.config!);
         await started;
         request.log.info(
@@ -866,7 +869,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
       throw new Error("Voice controller is not available.");
     }
     return voice;
-  }));
+  }, () => configService.isVoiceCommandsEnabled()));
   voice = new VoiceController(
     sessions,
     new CodexExecVoicePlanner(config.voiceModel, logger, { includeText: config.voiceDebugTranscripts ?? false }),
@@ -1417,6 +1420,12 @@ function assertSpeechDetected(text: string): void {
 function assertAiControlEnabled(config: ConfigService): void {
   if (!config.isAiControlEnabled()) {
     throwForbidden("AI control is disabled in Cloudx settings.");
+  }
+}
+
+function assertVoiceCommandsEnabled(config: ConfigService): void {
+  if (!config.isVoiceCommandsEnabled()) {
+    throwForbidden("Voice commands are disabled in Cloudx settings.");
   }
 }
 

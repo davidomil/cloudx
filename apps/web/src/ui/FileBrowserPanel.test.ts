@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { FileSearchResult, GitDiffFile, GitDiffSummary, GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
 
-import { absoluteTransferPath, archiveExtractionFolderName, buildCompareRefOptions, buildSearchInput, clampFileBrowserTreeSize, CompareRefPicker, compareRefListboxStyle, copyTextToClipboard, defaultDiffViewMode, disposeFileBrowserPanelStatesExcept, entryTransferPath, FileBrowserPanel, fileBrowserBodyClassName, fileBrowserBodyStyle, fileBrowserTreeSizeMax, filePreviewText, fileTransferUploadPath, filterCompareRefOptions, gitAutoRefreshIntervalMilliseconds, gitDiffWorkspaceClassName, highlightedCodeHtml, isExtractableArchivePath, markdownImageFileUrl, markdownImageTransferPath, mergeGitChangesIntoEntries, normalizedPreviewKind, parsePatch, previewLanguageForPath, readFileBrowserPanelState, rememberFileBrowserPanelState, renderMarkdownHtml, resolveNextCompareRef, searchEntriesFromResult, searchResultMatchesInput, searchResultSummary, toolbarClipboardPath, uploadProgressPercent, uploadProgressVisibleFileCount, usesObjectUrlPreview, type FileBrowserPanelState, type OpenFileResult } from "./FileBrowserPanel.js";
+import { absoluteTransferPath, archiveExtractionFolderName, buildCompareRefOptions, buildSearchInput, clampFileBrowserTreeSize, CompareRefPicker, compareRefListboxStyle, copyTextToClipboard, createFolderTransferPath, defaultDiffViewMode, disposeFileBrowserPanelStatesExcept, entryTransferPath, FileBrowserPanel, fileBrowserBodyClassName, fileBrowserBodyStyle, fileBrowserTreeSizeMax, filePreviewText, fileTransferUploadPath, filterCompareRefOptions, gitAutoRefreshIntervalMilliseconds, gitDiffWorkspaceClassName, highlightedCodeHtml, isExtractableArchivePath, markdownImageFileUrl, markdownImageTransferPath, mergeGitChangesIntoEntries, normalizedPreviewKind, parsePatch, previewLanguageForPath, readFileBrowserPanelState, rememberFileBrowserPanelState, renderMarkdownHtml, resolveNextCompareRef, searchEntriesFromResult, searchResultMatchesInput, searchResultSummary, selectElementContents, toolbarClipboardPath, uploadProgressPercent, uploadProgressVisibleFileCount, usesObjectUrlPreview, type FileBrowserPanelState, type OpenFileResult } from "./FileBrowserPanel.js";
 import { PathEntry } from "./PathEntry.js";
 
 afterEach(() => {
@@ -103,6 +103,20 @@ describe("filePreviewText", () => {
   });
 });
 
+describe("selectElementContents", () => {
+  it("scopes browser selection to the provided preview node", () => {
+    const outside = document.createElement("p");
+    outside.textContent = "outside";
+    const preview = document.createElement("pre");
+    preview.textContent = "preview text";
+    document.body.append(outside, preview);
+
+    expect(selectElementContents(preview)).toBe(true);
+
+    expect(window.getSelection()?.toString()).toBe("preview text");
+  });
+});
+
 describe("searchResultSummary", () => {
   it("summarizes scoped and truncated search results", () => {
     expect(
@@ -150,6 +164,15 @@ describe("file transfer path helpers", () => {
     expect(fileTransferUploadPath("docs", "nested/notes.md")).toBe("docs/notes.md");
     expect(fileTransferUploadPath("docs", "notes.md", "Project/nested/notes.md")).toBe("docs/Project/nested/notes.md");
     expect(fileTransferUploadPath("docs", "notes.md", "../notes.md")).toBe("docs/notes.md");
+  });
+
+  it("builds create-folder targets only from single directory names", () => {
+    expect(createFolderTransferPath("", "notes")).toBe("notes");
+    expect(createFolderTransferPath("docs", "notes")).toBe("docs/notes");
+    expect(createFolderTransferPath("docs", " nested ")).toBe("docs/nested");
+    expect(createFolderTransferPath("docs", "../secret")).toBeUndefined();
+    expect(createFolderTransferPath("docs", "nested/folder")).toBeUndefined();
+    expect(createFolderTransferPath("docs", ".")).toBeUndefined();
   });
 
   it("detects archives that get right-click extraction options", () => {
@@ -214,7 +237,7 @@ describe("file browser panel state cache", () => {
 
     expect(html).toContain(">src<");
     expect(html).toContain("App.tsx");
-    expect(html).toContain("src/App.tsx");
+    expect(html).not.toContain("<span>src/App.tsx</span>");
     expect(html).toContain("hljs-keyword");
     expect(html).toContain("app =");
     expect(html).toContain("Select files or folders to download");
@@ -351,16 +374,18 @@ describe("git auto-refresh helpers", () => {
     expect(resolveNextCompareRef(state, undefined)).toBe("origin/main");
   });
 
-  it("orders compare refs with main first and the current branch upstream second", () => {
+  it("orders compare refs with the local branch first and the current branch upstream second", () => {
     expect(
       buildCompareRefOptions({
-        defaultCompareRef: "origin/main",
+        currentBranch: "feature/local",
+        defaultCompareRef: "feature/local",
         upstream: "origin/feature/cloudx",
-        compareRefs: ["origin/main", "origin/feature/cloudx", "origin/dev"]
+        compareRefs: ["origin/main", "feature/local", "origin/feature/cloudx", "origin/dev"]
       })
     ).toEqual([
-      { value: "origin/main", label: "origin/main", detail: "default" },
+      { value: "feature/local", label: "feature/local", detail: "local branch" },
       { value: "origin/feature/cloudx", label: "origin/feature/cloudx", detail: "branch upstream" },
+      { value: "origin/main", label: "origin/main" },
       { value: "origin/dev", label: "origin/dev" }
     ]);
     expect(buildCompareRefOptions({ compareRefs: [] })).toEqual([{ value: "", label: "working tree" }]);

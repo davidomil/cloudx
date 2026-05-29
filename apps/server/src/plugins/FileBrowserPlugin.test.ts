@@ -253,14 +253,29 @@ describe("FileBrowserPlugin", () => {
     });
 
     await session.handleAction("replace_in_file", { relativePath: "README.md", oldText: "world", newText: "Cloudx" });
+    await session.handleAction("create_directory", { relativePath: "notes" });
     await session.handleAction("write_file", { relativePath: "notes/todo.md", content: "ship it\n", create: true });
 
     await expect(fs.readFile(path.join(root, "README.md"), "utf8")).resolves.toBe("hello Cloudx");
+    await expect(fs.stat(path.join(root, "notes")).then((stat) => stat.isDirectory())).resolves.toBe(true);
     await expect(fs.readFile(path.join(root, "notes/todo.md"), "utf8")).resolves.toBe("ship it\n");
     await expect(Promise.resolve(session.voiceContext()).then((context) => context.openFile)).resolves.toMatchObject({
       relativePath: "notes/todo.md",
       contentPreview: "ship it\n"
     });
+  });
+
+  it("rejects create_directory for existing targets and missing parents", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-files-create-dir-"));
+    await fs.mkdir(path.join(root, "existing"));
+    const session = new FileBrowserPlugin(new PathPolicy([root])).createSession({
+      tab: workspaceTab(root),
+      cwd: root,
+      controls: { setTabIndicator: () => undefined, closeTab: () => undefined }
+    });
+
+    await expect(session.handleAction("create_directory", { relativePath: "existing" })).rejects.toThrow("already exists");
+    await expect(session.handleAction("create_directory", { relativePath: "missing/child" })).rejects.toThrow();
   });
 
   it("rejects non-unique replace_in_file matches without changing the file", async () => {
@@ -305,8 +320,10 @@ describe("FileBrowserPlugin", () => {
 
     await expect(session.handleAction("open_file", { relativePath: path.join(outside, "secret.txt") })).rejects.toThrow("outside the tab working directory");
     await expect(session.handleAction("list_directory", { relativePath: outside })).rejects.toThrow("outside the tab working directory");
+    await expect(session.handleAction("create_directory", { relativePath: path.join(outside, "new-folder") })).rejects.toThrow("outside the tab working directory");
     await expect(session.handleAction("write_file", { relativePath: path.join(outside, "new.txt"), content: "nope", create: true })).rejects.toThrow("outside the tab working directory");
     await expect(fs.stat(path.join(outside, "new.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.stat(path.join(outside, "new-folder"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("rejects file actions whose symlinked path resolves outside the tab cwd", async () => {
@@ -325,8 +342,10 @@ describe("FileBrowserPlugin", () => {
 
     await expect(session.handleAction("list_directory", { relativePath: "outside-link" })).rejects.toThrow("resolves outside the tab working directory");
     await expect(session.handleAction("open_file", { relativePath: "outside-link/secret.txt" })).rejects.toThrow("resolves outside the tab working directory");
+    await expect(session.handleAction("create_directory", { relativePath: "outside-link/new-folder" })).rejects.toThrow("resolves outside the tab working directory");
     await expect(session.handleAction("write_file", { relativePath: "outside-link/new.txt", content: "nope", create: true })).rejects.toThrow("resolves outside the tab working directory");
     await expect(fs.stat(path.join(outside, "new.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.stat(path.join(outside, "new-folder"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("rejects file previews if the file becomes a symlink after path validation", async () => {

@@ -50,7 +50,7 @@ export class GitService {
       this.listCompareRefs(cwd),
       this.getOriginUrl(cwd)
     ]);
-    const defaultCompareRef = await this.defaultCompareRef(cwd, rawCompareRefs);
+    const defaultCompareRef = await this.defaultCompareRef(cwd, rawCompareRefs, status.branch);
     const upstream = status.upstream && rawCompareRefs.includes(status.upstream) ? status.upstream : undefined;
     const compareRefs = orderCompareRefs(rawCompareRefs, defaultCompareRef, upstream);
 
@@ -215,8 +215,14 @@ export class GitService {
     return result.code === 0 ? result.stdout.trim() || undefined : undefined;
   }
 
-  private async defaultCompareRef(cwd: string, compareRefs?: string[]): Promise<string | undefined> {
+  private async defaultCompareRef(cwd: string, compareRefs?: string[], currentBranch?: string): Promise<string | undefined> {
     const refs = compareRefs ?? await this.listCompareRefs(cwd);
+    if (currentBranch && refs.includes(currentBranch)) {
+      return currentBranch;
+    }
+    if (await this.hasHead(cwd)) {
+      return "HEAD";
+    }
     const mainRef = preferredMainCompareRef(refs);
     if (mainRef) {
       return mainRef;
@@ -225,7 +231,7 @@ export class GitService {
     if (originHead.code === 0 && originHead.stdout.trim()) {
       return originHead.stdout.trim();
     }
-    return refs.find((ref) => ref.startsWith("origin/")) ?? refs[0] ?? ((await this.hasHead(cwd)) ? "HEAD" : undefined);
+    return refs.find((ref) => ref.startsWith("origin/")) ?? refs[0];
   }
 
   private async resolveCompareRef(cwd: string, compareRef?: string): Promise<string | undefined> {

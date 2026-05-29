@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement, type RefObject } from "react";
-import { AlertTriangle, Bot, ChevronDown, Columns2, GitBranch, LayoutTemplate, Mic, MicOff, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
+import { AlertTriangle, Bot, ChevronDown, Columns2, GitBranch, LayoutTemplate, Maximize2, Mic, MicOff, Minimize2, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
 
 import { RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsStore, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
 
@@ -36,7 +36,9 @@ import {
   addTabToPane,
   defaultLayout,
   findPane,
+  isPaneTabActive,
   listPanes,
+  maximizedLayoutNode,
   placeTabInPane,
   reconcileLayout,
   removePane,
@@ -158,6 +160,7 @@ export function App() {
   const [windowMenuOpen, setWindowMenuOpen] = useState(false);
   const [templateMenuOpen, setTemplateMenuOpen] = useState(false);
   const [mobileActionsOpen, setMobileActionsOpen] = useState(false);
+  const [maximizedPaneId, setMaximizedPaneId] = useState<string | undefined>();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [tabSettings, setTabSettings] = useState<{ tabId: string; sectionId?: string } | undefined>();
   const [createTargetPaneId, setCreateTargetPaneId] = useState<string | undefined>();
@@ -279,7 +282,14 @@ export function App() {
     if (!findPane(layout.root, layout.activePaneId)) {
       updateLayout((current) => activatePane(current, listPanes(current.root)[0]?.id ?? defaultLayout().activePaneId));
     }
-  }, [layout]);
+    if (maximizedPaneId && !findPane(layout.root, maximizedPaneId)) {
+      setMaximizedPaneId(undefined);
+    }
+  }, [layout, maximizedPaneId]);
+
+  useEffect(() => {
+    setMaximizedPaneId(undefined);
+  }, [activeWindowId]);
 
   useEffect(() => {
     const tabIds = new Set(tabs.map((tab) => tab.id));
@@ -299,12 +309,12 @@ export function App() {
   const activeTab = activeTabId ? tabById.get(activeTabId) : undefined;
   const activeWindow = activeWindowId ? windows.find((window) => window.id === activeWindowId) : windows[0];
   const microphoneUnavailableReason = getMicrophoneUnavailableReason();
-  const aiControlEnabled = config?.values.global.aiControlEnabled !== false;
-  const microphoneEnabled = aiControlEnabled && config?.values.global.microphoneEnabled !== false;
+  const { aiControlEnabled, voiceCommandsEnabled, microphoneEnabled } = voiceControlSettings(config?.values.global);
   const uiScale = normalizeUiScale(config?.values.global.uiScale);
   const voiceConsoleText = voiceConsoleValue(voiceState, manualTranscript, voiceMessage, liveTranscript);
   const uiContributions = useMemo(() => collectUiContributions(plugins), [plugins]);
   const mobileActionsEnabled = useMediaQuery(MOBILE_ACTIONS_QUERY);
+  const visibleLayoutRoot = useMemo(() => maximizedLayoutNode(layout.root, maximizedPaneId), [layout.root, maximizedPaneId]);
 
   usePortraitOrientationLock();
   useMobileZoomSuppression();
@@ -446,6 +456,9 @@ export function App() {
   }
 
   async function activateTab(tabId: string, paneId = activePaneId) {
+    if (activeTabIdRef.current === tabId && isPaneTabActive(layoutRef.current, paneId, tabId)) {
+      return;
+    }
     activeTabIdRef.current = tabId;
     setActiveTabId(tabId);
     updateLayout((current) => activatePaneTab(current, paneId, tabId));
@@ -485,7 +498,18 @@ export function App() {
       void activateTab(pane.activeTabId, pane.id);
       return;
     }
+    if (layoutRef.current.activePaneId === pane.id) {
+      return;
+    }
     updateLayout((current) => activatePane(current, pane.id));
+  }
+
+  function togglePaneMaximized(pane: Pane) {
+    const nextPaneId = maximizedPaneId === pane.id ? undefined : pane.id;
+    if (nextPaneId && layoutRef.current.activePaneId !== pane.id) {
+      updateLayout((current) => activatePane(current, pane.id));
+    }
+    setMaximizedPaneId(nextPaneId);
   }
 
   function handleClosePane(paneId: string) {
@@ -551,6 +575,10 @@ export function App() {
       setError("AI control is disabled in Cloudx settings.");
       return;
     }
+    if (!voiceCommandsEnabled) {
+      setError("Voice commands are disabled in Cloudx settings.");
+      return;
+    }
     setVoiceState("processing");
     setVoiceMessage("AI is thinking and controlling Cloudx...");
     setLiveTranscript(undefined);
@@ -571,6 +599,10 @@ export function App() {
   async function handleMic() {
     setError(undefined);
     setAudioInputMenuOpen(false);
+    if (!voiceCommandsEnabled) {
+      setError("Voice commands are disabled in Cloudx settings.");
+      return;
+    }
     if (!microphoneEnabled) {
       setError("Microphone capture is disabled in Cloudx settings.");
       return;
@@ -646,6 +678,9 @@ export function App() {
 
   async function toggleAudioInputMenu() {
     if (voiceState !== "idle") {
+      return;
+    }
+    if (!voiceCommandsEnabled) {
       return;
     }
     if (!microphoneEnabled) {
@@ -762,7 +797,7 @@ export function App() {
     const nextConfig = await updateConfig(values);
     setConfig(nextConfig);
     setSettingsOpen(false);
-    if (nextConfig.values.global.aiControlEnabled === false || nextConfig.values.global.microphoneEnabled === false) {
+    if (nextConfig.values.global.aiControlEnabled === false || nextConfig.values.global.voiceCommandsEnabled === false || nextConfig.values.global.microphoneEnabled === false) {
       setAudioInputMenuOpen(false);
     }
   }
@@ -926,7 +961,7 @@ export function App() {
     [UI_RENDERER_STATUS_DOT]: (_contribution, context) => (context.tab ? <TabIndicatorDot tab={context.tab} attention={context.attention} /> : null),
     "audio-ai.voice-control": () => renderMicControl("topbar-mic-control", topbarMicControlRef, 17),
     "audio-ai.voice-console": () => {
-      if (!aiControlEnabled) {
+      if (!voiceCommandsEnabled) {
         return null;
       }
       return (
@@ -1074,8 +1109,8 @@ export function App() {
       {error ? <div className="error-banner">{error}</div> : null}
       {notifications.length ? <NotificationStack notifications={notifications} onDismiss={(id) => setNotifications((current) => current.filter((notification) => notification.id !== id))} /> : null}
 
-      <section className="pane-root">
-        {renderLayoutNode(layout.root)}
+      <section className={`pane-root${maximizedPaneId ? " maximized" : ""}`}>
+        {renderLayoutNode(visibleLayoutRoot)}
       </section>
 
       {renderUiContributions("app.footer.actions")}
@@ -1125,6 +1160,7 @@ export function App() {
 
   function renderPane(pane: Pane): ReactElement {
     const paneActive = pane.id === activePaneId;
+    const paneMaximized = maximizedPaneId === pane.id;
     return (
       <div
         className={`workspace-pane ${paneActive ? "active" : ""}`}
@@ -1202,6 +1238,20 @@ export function App() {
           >
             <SquarePlus size={18} />
           </ControlButton>
+          {panes.length > 1 ? (
+            <ControlButton
+              className="new-tab-inline pane-maximize-button"
+              iconOnly
+              onClick={(event) => {
+                event.stopPropagation();
+                togglePaneMaximized(pane);
+              }}
+              title={paneMaximized ? "Restore pane" : "Maximize pane"}
+              aria-label={paneMaximized ? "Restore pane" : "Maximize pane"}
+            >
+              {paneMaximized ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+            </ControlButton>
+          ) : null}
           {panes.length > 1 ? (
             <ControlButton
               className="new-tab-inline pane-close-button"
@@ -1876,6 +1926,20 @@ function audioInputStorage(): Storage | undefined {
 
 function audioInputLabel(device: MediaDeviceInfo, index: number): string {
   return device.label || `Microphone ${index + 1}`;
+}
+
+export function voiceControlSettings(global: CloudxConfigResponse["values"]["global"] | undefined): {
+  aiControlEnabled: boolean;
+  voiceCommandsEnabled: boolean;
+  microphoneEnabled: boolean;
+} {
+  const aiControlEnabled = global?.aiControlEnabled !== false;
+  const voiceCommandsEnabled = aiControlEnabled && global?.voiceCommandsEnabled !== false;
+  return {
+    aiControlEnabled,
+    voiceCommandsEnabled,
+    microphoneEnabled: voiceCommandsEnabled && global?.microphoneEnabled !== false
+  };
 }
 
 export async function requestAudioInputEnumerationAccess(): Promise<void> {

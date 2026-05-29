@@ -136,6 +136,19 @@ export class FileBrowserPlugin implements WorkspacePlugin {
       }
     },
     {
+      name: "create_directory",
+      description: "Create one new directory below the tab working directory.",
+      voiceExposed: true,
+      inputSchema: {
+        type: "object",
+        properties: {
+          relativePath: { type: "string", description: "Relative directory path to create." }
+        },
+        required: ["relativePath"],
+        additionalProperties: false
+      }
+    },
+    {
       name: "search_files",
       description: "Search files below the tab working directory by filename or by grep-style file contents.",
       voiceExposed: true,
@@ -322,7 +335,7 @@ class FileBrowserSession implements PluginSession {
       kind: "file-browser",
       cwd: this.tab.cwd,
       status: this.tab.status,
-      summary: "File browser session. Use list_directory, search_files, and open_file to inspect files, Git diff actions to review repository changes, and replace_in_file or write_file to edit files.",
+      summary: "File browser session. Use list_directory, search_files, and open_file to inspect files, Git diff actions to review repository changes, and create_directory, replace_in_file, or write_file to edit files.",
       visibleText: visibleText || undefined,
       currentPath: this.currentDirectory?.path,
       currentRelativePath: this.currentDirectory?.relativePath,
@@ -368,6 +381,16 @@ class FileBrowserSession implements PluginSession {
         destination: requireArchiveExtractionDestination(input.destination)
       });
       return result as unknown as Record<string, unknown>;
+    }
+    if (action === "create_directory") {
+      const relativePath = requireString(input.relativePath, "relativePath");
+      requireNonEmptyString(relativePath, "relativePath");
+      const directoryPath = this.resolveUnderCwd(relativePath);
+      const parentPath = path.dirname(directoryPath);
+      const targetPath = await this.requireCreatableDirectoryTarget(directoryPath, parentPath);
+      await fs.mkdir(targetPath);
+      await this.requireDirectory(targetPath);
+      return { path: directoryPath, relativePath, created: true };
     }
     if (action === "search_files") {
       const result = await this.fileSearchService.search(this.tab.cwd, {
@@ -510,12 +533,15 @@ class FileBrowserSession implements PluginSession {
   }
 
   private async requireDirectory(directoryPath: string) {
+    return (await this.requireDirectoryWithRealPath(directoryPath)).stat;
+  }
+
+  private async requireDirectoryWithRealPath(directoryPath: string): Promise<{ stat: Stats; realPath: string }> {
     const stat = await fs.stat(directoryPath);
     if (!stat.isDirectory()) {
       throw new Error(`Not a directory: ${directoryPath}`);
     }
-    await this.requireRealPathUnderCwd(directoryPath);
-    return stat;
+    return { stat, realPath: await this.realPathUnderCwd(directoryPath) };
   }
 
   private async ensureWritableFileTarget(filePath: string, create: boolean): Promise<Stats | undefined> {
@@ -569,7 +595,25 @@ class FileBrowserSession implements PluginSession {
     throw new Error("Path is outside the tab working directory.");
   }
 
+  private async requireCreatableDirectoryTarget(directoryPath: string, parentPath: string): Promise<string> {
+    const existing = await fs.lstat(directoryPath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") {
+        return undefined;
+      }
+      throw error;
+    });
+    if (existing) {
+      throw new Error(`Directory target already exists: ${directoryPath}`);
+    }
+    const { realPath: realParentPath } = await this.requireDirectoryWithRealPath(parentPath);
+    return path.join(realParentPath, path.basename(directoryPath));
+  }
+
   private async requireRealPathUnderCwd(filePath: string): Promise<void> {
+    await this.realPathUnderCwd(filePath);
+  }
+
+  private async realPathUnderCwd(filePath: string): Promise<string> {
     const [realCwd, realPath] = await Promise.all([
       fs.realpath(this.tab.cwd),
       fs.realpath(filePath)
@@ -577,6 +621,7 @@ class FileBrowserSession implements PluginSession {
     if (!isSameOrChildPath(realCwd, realPath)) {
       throw new Error("Path resolves outside the tab working directory.");
     }
+    return realPath;
   }
 
   private setOpenFile(filePath: string, relativePath: string, metadata: FilePreviewMetadata, content: string, sizeBytes: number, truncated: boolean): void {
@@ -737,6 +782,12 @@ function requireString(value: unknown, name: string): string {
     throw new Error(`${name} must be a string.`);
   }
   return value;
+}
+
+function requireNonEmptyString(value: string, name: string): void {
+  if (!value.trim()) {
+    throw new Error(`${name} must be non-empty.`);
+  }
 }
 
 async function fileListingEntry(directory: string, entry: Dirent): Promise<FileListingEntry> {

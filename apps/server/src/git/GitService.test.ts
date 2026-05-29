@@ -74,7 +74,7 @@ describe("GitService", () => {
     await expect(service.cloneRepository(target, "--upload-pack=/definitely/missing")).rejects.toThrow("--upload-pack=/definitely/missing");
   });
 
-  it("defaults comparisons to main and recommends the current branch upstream second", async () => {
+  it("defaults comparisons to the current local branch and recommends its upstream second", async () => {
     const service = new GitService();
     const source = await createMainCommittedRepo("cloudx-git-main-source-");
     await git(source, "checkout", "-b", "feature/cloudx");
@@ -88,9 +88,9 @@ describe("GitService", () => {
 
     const state = await service.getState(target);
 
-    expect(state.defaultCompareRef).toBe("origin/main");
+    expect(state.defaultCompareRef).toBe("feature/cloudx");
     expect(state.upstream).toBe("origin/feature/cloudx");
-    expect(state.compareRefs.slice(0, 2)).toEqual(["origin/main", "origin/feature/cloudx"]);
+    expect(state.compareRefs.slice(0, 2)).toEqual(["feature/cloudx", "origin/feature/cloudx"]);
   });
 
   it("does not recommend deleted upstream refs for comparison", async () => {
@@ -108,7 +108,7 @@ describe("GitService", () => {
 
     const state = await service.getState(target);
 
-    expect(state.defaultCompareRef).toBe("origin/main");
+    expect(state.defaultCompareRef).toBe("feature/cloudx");
     expect(state.upstream).toBeUndefined();
     expect(state.compareRefs).not.toContain("origin/feature/cloudx");
     await expect(service.listDiff(target, "origin/feature/cloudx")).rejects.toThrow("Comparison ref does not exist: origin/feature/cloudx");

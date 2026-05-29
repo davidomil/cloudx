@@ -33,7 +33,10 @@ export class AudioAiPlugin implements WorkspacePlugin {
     }
   ];
 
-  constructor(private readonly voiceProvider: () => VoiceController) {
+  constructor(
+    private readonly voiceProvider: () => VoiceController,
+    private readonly voiceCommandsEnabled: () => boolean = () => true
+  ) {
     this.hooks = [
       {
         id: "audio-ai.submitTranscript",
@@ -68,6 +71,9 @@ export class AudioAiPlugin implements WorkspacePlugin {
           additionalProperties: true
         },
         execute: async (input) => {
+          if (!this.voiceCommandsEnabled()) {
+            throw new Error("Voice commands are disabled in Cloudx settings.");
+          }
           const clientContext = typeof input.clientContext === "object" && input.clientContext !== null && !Array.isArray(input.clientContext) ? (input.clientContext as Record<string, unknown>) : undefined;
           const result = await this.voiceProvider().handleTranscript(requireString(input.transcript, "transcript"), optionalString(input.activeTabId, "activeTabId"), clientContext, {
             source: "audio-ai-hook"

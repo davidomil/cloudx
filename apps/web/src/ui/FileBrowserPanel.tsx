@@ -18,15 +18,17 @@ import yaml from "highlight.js/lib/languages/yaml";
 import { marked, type Tokens } from "marked";
 import { Diff, Hunk, parseDiff, type DiffType, type FileData, type HunkData } from "react-diff-view";
 import "react-diff-view/style/index.css";
-import { AlignJustify, ArchiveRestore, Check, ChevronDown, Copy, Download, FileCode, FileDiff, FileText, Folder, GitBranch, GitCompareArrows, GitFork, GitPullRequest, Image as ImageIcon, RefreshCw, Search, Upload, X } from "lucide-react";
+import { AlignJustify, ArchiveRestore, Check, ChevronDown, Copy, Download, FileCode, FileDiff, FileText, Folder, FolderPlus, GitBranch, GitCompareArrows, GitFork, GitPullRequest, Image as ImageIcon, RefreshCw, Search, Upload, X } from "lucide-react";
 
 import type { ConfigValue, FileSearchFileResult, FileSearchMode, FileSearchResult, GitDiffFile, GitDiffFileSummary, GitDiffSummary, GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
 
 import { downloadFileBrowserEntries, fileBrowserRawFileUrl, runTabAction, saveBlobDownload, uploadFileBrowserFile } from "../api.js";
+import { copyTextToClipboard } from "./clipboard.js";
 import { ControlButton, SegmentedControl } from "./Control.js";
 import { readFileBrowserPanelState, rememberFileBrowserPanelState, type DiffViewMode, type DirectoryEntry, type FileBrowserPanelState, type FilePreviewKind, type MarkdownPreviewMode, type OpenFileResult } from "./fileBrowserPanelState.js";
 import { noSystemTextAssistProps } from "./inputAssist.js";
 
+export { copyTextToClipboard, type ClipboardWriter } from "./clipboard.js";
 export { disposeFileBrowserPanelStatesExcept, readFileBrowserPanelState, rememberFileBrowserPanelState, type DiffViewMode, type DirectoryEntry, type FileBrowserPanelState, type MarkdownPreviewMode, type OpenFileResult } from "./fileBrowserPanelState.js";
 
 interface DisplayDirectoryEntry extends DirectoryEntry {
@@ -43,7 +45,7 @@ interface DirectoryResult {
 
 type GitBusyAction = "state" | "diff" | "file" | "initialize" | "clone" | "origin";
 type SearchBusyAction = "search";
-type FileTransferBusyAction = "download" | "upload" | "extract";
+type FileTransferBusyAction = "download" | "upload" | "extract" | "folder";
 type ArchiveExtractionDestination = "here" | "folder";
 type FileTreeResizeAxis = "x" | "y";
 const DEFAULT_GIT_AUTO_REFRESH_SECONDS = 15;
@@ -119,6 +121,8 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   const [selectedTransferPaths, setSelectedTransferPaths] = useState<Set<string>>(() => new Set());
   const [transferBusyAction, setTransferBusyAction] = useState<FileTransferBusyAction | undefined>();
   const [uploadTargetPath, setUploadTargetPath] = useState<string | undefined>();
+  const [folderCreateOpen, setFolderCreateOpen] = useState(false);
+  const [folderCreateName, setFolderCreateName] = useState("");
   const [contextMenu, setContextMenu] = useState<FileContextMenuState | undefined>();
   const [previewObjectUrl, setPreviewObjectUrl] = useState<string | undefined>();
   const [previewLoading, setPreviewLoading] = useState(false);
@@ -617,6 +621,26 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     }
   }
 
+  async function createFolder() {
+    const targetPath = createFolderTransferPath(relativePath, folderCreateName);
+    if (!targetPath) {
+      setError("Folder name must be a single directory name.");
+      return;
+    }
+    setTransferBusyAction("folder");
+    setError(undefined);
+    try {
+      await runTabAction(tab.id, "create_directory", { relativePath: targetPath });
+      setFolderCreateName("");
+      setFolderCreateOpen(false);
+      await loadDirectory(relativePath, { preserveOpened: true });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTransferBusyAction(undefined);
+    }
+  }
+
   function toggleTransferPath(transferPath: string, selected: boolean) {
     setSelectedTransferPaths((current) => {
       const next = new Set(current);
@@ -721,6 +745,9 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
         <ControlButton type="button" iconOnly onClick={startUploadToCurrentFolder} disabled={transferBusyAction === "upload"} aria-label="Upload files" title="Upload files">
           <Upload size={15} />
         </ControlButton>
+        <ControlButton type="button" iconOnly pressed={folderCreateOpen} onClick={() => setFolderCreateOpen(!folderCreateOpen)} disabled={transferBusyAction === "folder"} aria-label="New folder" title="New folder">
+          <FolderPlus size={15} />
+        </ControlButton>
         <input
           ref={uploadInputRef}
           className="file-upload-input"
@@ -742,6 +769,23 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
           </ControlButton>
         ) : null}
       </div>
+      {folderCreateOpen ? (
+        <form
+          className="file-folder-create-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void createFolder();
+          }}
+        >
+          <input value={folderCreateName} onChange={(event) => setFolderCreateName(event.target.value)} placeholder="Folder name" aria-label="Folder name" {...noSystemTextAssistProps} />
+          <ControlButton type="submit" iconOnly disabled={transferBusyAction === "folder" || !folderCreateName.trim()} aria-label="Create folder" title="Create folder">
+            <Check size={15} />
+          </ControlButton>
+          <ControlButton type="button" iconOnly onClick={() => { setFolderCreateOpen(false); setFolderCreateName(""); }} aria-label="Cancel new folder" title="Cancel new folder">
+            <X size={15} />
+          </ControlButton>
+        </form>
+      ) : null}
       {searchVisible ? <SearchBar
         query={searchQuery}
         mode={searchMode}
@@ -1098,7 +1142,7 @@ export interface CompareRefOption {
   detail?: string;
 }
 
-export function buildCompareRefOptions(state: Pick<GitRepositoryState, "compareRefs" | "defaultCompareRef" | "upstream">): CompareRefOption[] {
+export function buildCompareRefOptions(state: Pick<GitRepositoryState, "compareRefs" | "currentBranch" | "defaultCompareRef" | "upstream">): CompareRefOption[] {
   const validRefs = new Set(state.compareRefs);
   if (state.defaultCompareRef) {
     validRefs.add(state.defaultCompareRef);
@@ -1111,7 +1155,7 @@ export function buildCompareRefOptions(state: Pick<GitRepositoryState, "compareR
   return refs.map((ref) => ({
     value: ref,
     label: ref,
-    detail: ref === state.defaultCompareRef ? "default" : ref === upstream ? "branch upstream" : undefined
+    detail: ref === state.currentBranch ? "local branch" : ref === state.defaultCompareRef ? "default" : ref === upstream ? "branch upstream" : undefined
   }));
 }
 
@@ -1177,7 +1221,7 @@ export function CompareRefPicker({ state, compareRef, disabled, onCompareRefChan
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
   const [listboxStyle, setListboxStyle] = useState<CSSProperties>();
-  const options = useMemo(() => buildCompareRefOptions(state), [state.compareRefs, state.defaultCompareRef, state.upstream]);
+  const options = useMemo(() => buildCompareRefOptions(state), [state.compareRefs, state.currentBranch, state.defaultCompareRef, state.upstream]);
   const filteredOptions = useMemo(() => filterCompareRefOptions(options, query), [options, query]);
   const selectedOption = options.find((option) => option.value === compareRef) ?? options[0];
   const activeOption = open ? filteredOptions[activeIndex] : undefined;
@@ -1460,17 +1504,23 @@ function FilePreview({
 }) {
   const displayPath = opened.relativePath ?? opened.path;
   const kind = normalizedPreviewKind(opened);
+  const contentRef = useRef<HTMLElement | null>(null);
   const markdownHtml = useMemo(() => (kind === "markdown" ? renderMarkdownHtml(opened.content, { resolveImageUrl: (href) => markdownImageFileUrl(tabId, displayPath, href) }) : ""), [kind, opened.content, displayPath, tabId]);
   const markdownSourceHtml = useMemo(() => (kind === "markdown" ? highlightedCodeHtml(opened.content, "markdown") : ""), [kind, opened.content]);
   const textLanguage = useMemo(() => (kind === "text" ? previewLanguageForPath(displayPath) : undefined), [displayPath, kind]);
   const textHtml = useMemo(() => (kind === "text" ? highlightedCodeHtml(opened.content, textLanguage) : ""), [kind, opened.content, textLanguage]);
+  const handleKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
+      event.preventDefault();
+      selectElementContents(contentRef.current ?? event.currentTarget);
+    }
+  };
 
   if (kind === "image") {
     return (
-      <div className="file-preview-rendered file-preview-media">
+      <div className="file-preview-rendered file-preview-media" tabIndex={0} aria-label={`${displayPath} preview`} onKeyDown={handleKeyDown}>
         <div className="file-preview-heading">
           <ImageIcon size={16} />
-          <span>{displayPath}</span>
         </div>
         {loading ? <div className="file-preview-status">Loading image...</div> : objectUrl ? <img className="file-preview-image" src={objectUrl} alt={displayPath} /> : <div className="file-preview-status">Image preview is unavailable.</div>}
       </div>
@@ -1479,10 +1529,9 @@ function FilePreview({
 
   if (kind === "pdf") {
     return (
-      <div className="file-preview-rendered file-preview-media">
+      <div className="file-preview-rendered file-preview-media" tabIndex={0} aria-label={`${displayPath} preview`} onKeyDown={handleKeyDown}>
         <div className="file-preview-heading">
           <FileText size={16} />
-          <span>{displayPath}</span>
         </div>
         {loading ? <div className="file-preview-status">Loading PDF...</div> : objectUrl ? <object className="file-preview-pdf" data={objectUrl} type="application/pdf" aria-label={displayPath} /> : <div className="file-preview-status">PDF preview is unavailable.</div>}
       </div>
@@ -1493,7 +1542,6 @@ function FilePreview({
     const heading = (
       <div className="file-preview-heading">
         <FileText size={16} />
-        <span>{displayPath}</span>
         {opened.truncated ? <small>truncated</small> : null}
         <SegmentedControl className="markdown-preview-toggle" label="Markdown preview mode">
           <ControlButton type="button" iconOnly pressed={markdownPreviewMode === "rendered"} aria-label="Rendered Markdown preview" title="Rendered Markdown preview" onClick={() => onMarkdownPreviewModeChange("rendered")}>
@@ -1508,9 +1556,9 @@ function FilePreview({
 
     if (markdownPreviewMode === "source") {
       return (
-        <div className="file-preview-rendered file-preview-code file-preview-markdown-source">
+        <div className="file-preview-rendered file-preview-code file-preview-markdown-source" tabIndex={0} aria-label={`${displayPath} preview`} onKeyDown={handleKeyDown}>
           {heading}
-          <pre>
+          <pre ref={(node) => { contentRef.current = node; }}>
             <code className="hljs language-markdown" dangerouslySetInnerHTML={{ __html: markdownSourceHtml }} />
           </pre>
         </div>
@@ -1518,20 +1566,20 @@ function FilePreview({
     }
 
     return (
-      <div className="file-preview-rendered file-preview-markdown">
+      <div className="file-preview-rendered file-preview-markdown" tabIndex={0} aria-label={`${displayPath} preview`} onKeyDown={handleKeyDown}>
         {heading}
-        <div className="markdown-body" dangerouslySetInnerHTML={{ __html: markdownHtml }} />
+        <div ref={(node) => { contentRef.current = node; }} className="markdown-body" dangerouslySetInnerHTML={{ __html: markdownHtml }} />
       </div>
     );
   }
 
   return (
-    <div className="file-preview-rendered file-preview-code">
+    <div className="file-preview-rendered file-preview-code" tabIndex={0} aria-label={`${displayPath} preview`} onKeyDown={handleKeyDown}>
       <div className="file-preview-heading">
         <FileText size={16} />
-        <span>{displayPath}</span>
+        {opened.truncated ? <small>truncated</small> : null}
       </div>
-      <pre>
+      <pre ref={(node) => { contentRef.current = node; }}>
         <code className={textLanguage ? `hljs language-${textLanguage}` : "hljs"} dangerouslySetInnerHTML={{ __html: textHtml }} />
       </pre>
     </div>
@@ -1995,15 +2043,19 @@ export function absoluteTransferPath(cwd: string, transferPath: string): string 
   return `${base === "/" ? "" : base}/${normalized}`;
 }
 
-export interface ClipboardWriter {
-  writeText(text: string): Promise<void>;
-}
-
-export async function copyTextToClipboard(text: string, clipboard: ClipboardWriter | undefined = typeof navigator === "undefined" ? undefined : navigator.clipboard): Promise<void> {
-  if (!clipboard?.writeText) {
-    throw new Error("Clipboard API is not available in this browser context.");
+export function selectElementContents(element: Node): boolean {
+  if (typeof window === "undefined" || typeof document === "undefined") {
+    return false;
   }
-  await clipboard.writeText(text);
+  const selection = window.getSelection();
+  if (!selection) {
+    return false;
+  }
+  const range = document.createRange();
+  range.selectNodeContents(element);
+  selection.removeAllRanges();
+  selection.addRange(range);
+  return true;
 }
 
 export function entryTransferPath(entry: { name: string; searchPath?: string }, currentRelativePath: string): string {
@@ -2024,6 +2076,14 @@ export function fileTransferUploadPath(currentRelativePath: string, filename: st
   }
   const safeFilename = filename.split(/[\\/]+/).filter(Boolean).pop() ?? filename;
   return normalizeTransferPath(currentRelativePath ? `${currentRelativePath}/${safeFilename}` : safeFilename);
+}
+
+export function createFolderTransferPath(currentRelativePath: string, folderName: string): string | undefined {
+  const parts = folderName.trim().split(/[\\/]+/u).filter(Boolean);
+  if (parts.length !== 1 || parts[0] === "." || parts[0] === "..") {
+    return undefined;
+  }
+  return normalizeTransferPath(currentRelativePath ? `${currentRelativePath}/${parts[0]}` : parts[0]);
 }
 
 export function isExtractableArchivePath(transferPath: string): boolean {

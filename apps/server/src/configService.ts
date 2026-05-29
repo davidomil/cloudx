@@ -12,6 +12,13 @@ export const GLOBAL_CONFIG_FIELDS: ConfigFieldDescriptor[] = [
     defaultValue: true
   },
   {
+    key: "voiceCommandsEnabled",
+    label: "Voice commands",
+    type: "boolean",
+    description: "Enable Codex-backed voice command planning.",
+    defaultValue: true
+  },
+  {
     key: "microphoneEnabled",
     label: "Microphone",
     type: "boolean",
@@ -89,9 +96,14 @@ export class ConfigService {
     return this.getValues().global.aiControlEnabled !== false;
   }
 
+  isVoiceCommandsEnabled(): boolean {
+    const global = this.getValues().global;
+    return global.aiControlEnabled !== false && global.voiceCommandsEnabled !== false;
+  }
+
   isMicrophoneEnabled(): boolean {
     const global = this.getValues().global;
-    return global.aiControlEnabled !== false && global.microphoneEnabled !== false;
+    return global.aiControlEnabled !== false && global.voiceCommandsEnabled !== false && global.microphoneEnabled !== false;
   }
 
   async update(patch: Partial<CloudxConfigValues> = {}): Promise<CloudxConfigResponse> {

@@ -1,8 +1,26 @@
-import { describe, expect, it } from "vitest";
+// @vitest-environment jsdom
 
-import type { WorktreeProjectState, WorktreeRef } from "@cloudx/shared";
+import { createElement, type ReactElement } from "react";
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { REF_OPTION_LIMIT, detectionSummary, filterRefOptions, formatBytes, prefillBranchPrefix } from "./WorktreeManagerPanel.js";
+import type { WorktreeProjectState, WorktreeRef, WorkspaceTab } from "@cloudx/shared";
+
+import { runTabAction } from "../api.js";
+import { REF_OPTION_LIMIT, WorktreeManagerPanel, copyWorktreeValueToClipboard, detectionSummary, filterRefOptions, formatBytes, prefillBranchPrefix } from "./WorktreeManagerPanel.js";
+
+vi.mock("../api.js", () => ({
+  runTabAction: vi.fn()
+}));
+
+(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+afterEach(() => {
+  vi.mocked(runTabAction).mockReset();
+  vi.unstubAllGlobals();
+  document.body.replaceChildren();
+});
 
 describe("prefillBranchPrefix", () => {
   it("prefills only empty new-branch names", () => {
@@ -41,6 +59,47 @@ describe("formatBytes", () => {
   });
 });
 
+describe("copyWorktreeValueToClipboard", () => {
+  it("copies exact worktree values without transforming paths or branch names", async () => {
+    const writes: string[] = [];
+
+    await copyWorktreeValueToClipboard("/repo/worktrees/feature/ui", { writeText: async (value) => { writes.push(value); } });
+    await copyWorktreeValueToClipboard("feature/ui", { writeText: async (value) => { writes.push(value); } });
+
+    expect(writes).toEqual(["/repo/worktrees/feature/ui", "feature/ui"]);
+  });
+});
+
+describe("WorktreeManagerPanel", () => {
+  it("copies the row path and branch click targets", async () => {
+    const writes: string[] = [];
+    vi.stubGlobal("navigator", { clipboard: { writeText: vi.fn(async (value: string) => { writes.push(value); }) } });
+    vi.mocked(runTabAction).mockResolvedValueOnce(projectState({
+      originUrl: "git@example.test:repo.git",
+      refs: [ref("origin/main", "remote")],
+      worktrees: [{
+        path: "/repo/worktrees/feature-ui",
+        folderName: "feature-ui",
+        branch: "feature/ui",
+        head: "abc123",
+        detached: false,
+        dirty: { dirty: false, staged: 0, unstaged: 0, untracked: 0 }
+      }]
+    }));
+    const root = await render(createElement(WorktreeManagerPanel, { tab: workspaceTab(), config: { showFolderSize: false } }));
+    const pathButton = await waitForButton('[aria-label="Copy path for feature-ui"]');
+    const branchButton = await waitForButton('[aria-label="Copy branch for feature-ui"]');
+
+    pathButton.click();
+    await flushEffects();
+    branchButton.click();
+    await flushEffects();
+
+    expect(writes).toEqual(["/repo/worktrees/feature-ui", "feature/ui"]);
+    await act(async () => root.unmount());
+  });
+});
+
 describe("detectionSummary", () => {
   it("describes selected bare directories and selected worktree directories", () => {
     expect(detectionSummary(projectState({ detectedFrom: "bare_dir" }))).toBe("Detected bare repository; managing sibling worktrees in /repo.");
@@ -72,4 +131,42 @@ function ref(name: string, kind: WorktreeRef["kind"]): WorktreeRef {
     kind,
     commit: "abc123"
   };
+}
+
+function workspaceTab(): WorkspaceTab {
+  return {
+    id: "tab-worktree",
+    pluginId: "worktree-manager",
+    title: "Worktrees",
+    cwd: "/repo",
+    status: "running",
+    indicator: { color: "green", label: "OK", updatedAt: new Date(0).toISOString() },
+    createdAt: new Date(0).toISOString(),
+    updatedAt: new Date(0).toISOString()
+  };
+}
+
+async function render(element: ReactElement): Promise<Root> {
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  await act(async () => root.render(element));
+  return root;
+}
+
+async function flushEffects() {
+  await act(async () => {
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+  });
+}
+
+async function waitForButton(selector: string): Promise<HTMLButtonElement> {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const button = document.querySelector(selector);
+    if (button instanceof HTMLButtonElement) {
+      return button;
+    }
+    await flushEffects();
+  }
+  throw new Error(`Missing button ${selector}. Rendered: ${document.body.textContent ?? ""}`);
 }

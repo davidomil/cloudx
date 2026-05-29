@@ -1,9 +1,10 @@
 import { type KeyboardEvent, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Download, GitBranch, GitFork, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { AlertTriangle, Copy, Download, GitBranch, GitFork, Plus, RefreshCw, Trash2 } from "lucide-react";
 
 import type { ConfigValue, WorktreeCreateMode, WorktreeProjectState, WorktreeRef, WorktreeSummary, WorkspaceTab } from "@cloudx/shared";
 
 import { runTabAction } from "../api.js";
+import { copyTextToClipboard, type ClipboardWriter } from "./clipboard.js";
 import { ControlButton } from "./Control.js";
 import { noSystemTextAssistProps } from "./inputAssist.js";
 
@@ -24,6 +25,7 @@ export function WorktreeManagerPanel({ tab, config = {} }: { tab: WorkspaceTab; 
   const [busyAction, setBusyAction] = useState<BusyAction | undefined>();
   const [sizesLoading, setSizesLoading] = useState(false);
   const [error, setError] = useState<string | undefined>();
+  const [copiedWorktreeValue, setCopiedWorktreeValue] = useState<string | undefined>();
 
   const branchPrefix = typeof config.branchPrefix === "string" ? config.branchPrefix : "";
   const showFolderSize = config.showFolderSize !== false;
@@ -132,6 +134,17 @@ export function WorktreeManagerPanel({ tab, config = {} }: { tab: WorkspaceTab; 
     setForceDelete(false);
   }
 
+  async function copyWorktreeValue(value: string) {
+    setError(undefined);
+    try {
+      await copyWorktreeValueToClipboard(value);
+      setCopiedWorktreeValue(value);
+      window.setTimeout(() => setCopiedWorktreeValue((current) => (current === value ? undefined : current)), 1400);
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  }
+
   return (
     <div className="worktree-manager-panel">
       <div className="worktree-toolbar">
@@ -144,7 +157,7 @@ export function WorktreeManagerPanel({ tab, config = {} }: { tab: WorkspaceTab; 
         </ControlButton>
       </div>
       {error ? <div className="inline-error">{error}</div> : null}
-      {!state ? <LoadingState /> : state.status === "ready" ? <ManagerView state={state} busy={Boolean(busyAction)} localRefs={localRefs} remoteRefs={remoteRefs} tagRefs={tagRefs} mode={mode} folderName={folderName} branchName={branchName} baseRef={baseRef} showFolderSize={showFolderSize} sizesLoading={sizesLoading} branchPrefix={branchPrefix} deleteTarget={deleteTarget} deleteConfirmation={deleteConfirmation} forceDelete={forceDelete} onModeChange={setMode} onFolderNameChange={setFolderName} onBranchNameChange={setBranchName} onBaseRefChange={setBaseRef} onFetch={() => void fetchRefs()} onCreate={() => void createWorktree()} onOpenDelete={openDelete} onCancelDelete={() => setDeleteTarget(undefined)} onDeleteConfirmationChange={setDeleteConfirmation} onForceDeleteChange={setForceDelete} onDelete={() => void deleteWorktree()} /> : state.status === "empty" ? <SetupView cloneUrl={cloneUrl} busy={Boolean(busyAction)} onCloneUrlChange={setCloneUrl} onInitialize={() => void initializeBareRepository()} onClone={() => void cloneBareRepository()} /> : <BlockedView state={state} />}
+      {!state ? <LoadingState /> : state.status === "ready" ? <ManagerView state={state} busy={Boolean(busyAction)} localRefs={localRefs} remoteRefs={remoteRefs} tagRefs={tagRefs} mode={mode} folderName={folderName} branchName={branchName} baseRef={baseRef} showFolderSize={showFolderSize} sizesLoading={sizesLoading} branchPrefix={branchPrefix} deleteTarget={deleteTarget} deleteConfirmation={deleteConfirmation} forceDelete={forceDelete} copiedWorktreeValue={copiedWorktreeValue} onModeChange={setMode} onFolderNameChange={setFolderName} onBranchNameChange={setBranchName} onBaseRefChange={setBaseRef} onFetch={() => void fetchRefs()} onCreate={() => void createWorktree()} onCopyWorktreeValue={(value) => void copyWorktreeValue(value)} onOpenDelete={openDelete} onCancelDelete={() => setDeleteTarget(undefined)} onDeleteConfirmationChange={setDeleteConfirmation} onForceDeleteChange={setForceDelete} onDelete={() => void deleteWorktree()} /> : state.status === "empty" ? <SetupView cloneUrl={cloneUrl} busy={Boolean(busyAction)} onCloneUrlChange={setCloneUrl} onInitialize={() => void initializeBareRepository()} onClone={() => void cloneBareRepository()} /> : <BlockedView state={state} />}
     </div>
   );
 }
@@ -215,12 +228,14 @@ function ManagerView({
   deleteTarget,
   deleteConfirmation,
   forceDelete,
+  copiedWorktreeValue,
   onModeChange,
   onFolderNameChange,
   onBranchNameChange,
   onBaseRefChange,
   onFetch,
   onCreate,
+  onCopyWorktreeValue,
   onOpenDelete,
   onCancelDelete,
   onDeleteConfirmationChange,
@@ -242,12 +257,14 @@ function ManagerView({
   deleteTarget: WorktreeSummary | undefined;
   deleteConfirmation: string;
   forceDelete: boolean;
+  copiedWorktreeValue: string | undefined;
   onModeChange: (value: WorktreeCreateMode) => void;
   onFolderNameChange: (value: string) => void;
   onBranchNameChange: (value: string) => void;
   onBaseRefChange: (value: string) => void;
   onFetch: () => void;
   onCreate: () => void;
+  onCopyWorktreeValue: (value: string) => void;
   onOpenDelete: (worktree: WorktreeSummary) => void;
   onCancelDelete: () => void;
   onDeleteConfirmationChange: (value: string) => void;
@@ -322,9 +339,16 @@ function ManagerView({
           {state.worktrees.length ? (
             state.worktrees.map((worktree) => (
               <article key={worktree.path} className={`worktree-row ${worktree.dirty.dirty ? "dirty" : ""}`}>
-                <div>
-                  <strong>{worktree.folderName}</strong>
-                  <span>{worktree.branch ?? worktree.head ?? "detached"}</span>
+                <div className="worktree-row-main">
+                  <button type="button" className="worktree-copy-value primary" onClick={() => onCopyWorktreeValue(worktree.path)} title={`Copy path ${worktree.path}`} aria-label={`Copy path for ${worktree.folderName}`}>
+                    <strong>{worktree.folderName}</strong>
+                    <Copy size={13} />
+                  </button>
+                  <button type="button" className="worktree-copy-value" onClick={() => onCopyWorktreeValue(worktree.branch ?? worktree.head ?? "detached")} title={`Copy branch ${worktree.branch ?? worktree.head ?? "detached"}`} aria-label={`Copy branch for ${worktree.folderName}`}>
+                    <span>{worktree.branch ?? worktree.head ?? "detached"}</span>
+                    <Copy size={12} />
+                  </button>
+                  {copiedWorktreeValue === worktree.path || copiedWorktreeValue === (worktree.branch ?? worktree.head ?? "detached") ? <small>Copied</small> : null}
                 </div>
                 {showFolderSize ? <SizeBadge worktree={worktree} loading={sizesLoading || Boolean(worktree.sizePending)} /> : null}
                 <DirtyBadge worktree={worktree} />
@@ -533,6 +557,10 @@ export function filterRefOptions(refs: WorktreeRef[], query: string, limit = REF
     })
     .slice(0, limit)
     .map(({ ref }) => ref);
+}
+
+export async function copyWorktreeValueToClipboard(value: string, clipboard: ClipboardWriter | undefined = typeof navigator === "undefined" ? undefined : navigator.clipboard): Promise<void> {
+  await copyTextToClipboard(value, clipboard);
 }
 
 export function formatBytes(bytes: number): string {

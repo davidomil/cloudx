@@ -8,7 +8,8 @@ import {
   buildCodexExecLaunch,
   buildVoicePrompt,
   CodexExecVoicePlanner,
-  compactVoicePromptContext
+  compactVoicePromptContext,
+  summarizeCodexError
 } from "./VoicePlanner.js";
 
 describe("buildVoicePrompt", () => {
@@ -159,6 +160,22 @@ describe("buildCodexExecLaunch", () => {
         "-"
       ]
     });
+  });
+});
+
+describe("summarizeCodexError", () => {
+  it("extracts one-line Codex JSON errors and explains ChatGPT account model mismatches", () => {
+    const message = summarizeCodexError(
+      [
+        "startup",
+        "ERROR: {\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-5.3-codex-spark' model is not supported when using Codex with a ChatGPT account.\"}}"
+      ].join("\n"),
+      "gpt-5.3-codex-spark"
+    );
+
+    expect(message).toContain("gpt-5.3-codex-spark");
+    expect(message).toContain("active ChatGPT account cannot use that model");
+    expect(message).toContain("CLOUDX_VOICE_MODEL");
   });
 });
 

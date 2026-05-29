@@ -15,13 +15,13 @@ describe("ConfigService", () => {
 
     expect(service.getResponse()).toMatchObject({
       values: {
-        global: { aiControlEnabled: true, microphoneEnabled: true, themeId: "cloudx-neon", uiScale: 100 },
+        global: { aiControlEnabled: true, voiceCommandsEnabled: true, microphoneEnabled: true, themeId: "cloudx-neon", uiScale: 100 },
         plugins: { "file-browser": { showGitDiff: true, gitAutoRefresh: true, gitAutoRefreshSeconds: 15 } }
       }
     });
 
     await service.update({
-      global: { aiControlEnabled: false, themeId: "minimalist-dark", uiScale: 115 },
+      global: { aiControlEnabled: false, voiceCommandsEnabled: false, themeId: "minimalist-dark", uiScale: 115 },
       plugins: { "file-browser": { showGitDiff: false, gitAutoRefresh: false, gitAutoRefreshSeconds: 30 } }
     });
 
@@ -31,7 +31,7 @@ describe("ConfigService", () => {
     const reloaded = new ConfigService(dataDir, () => [fileBrowserDescriptor()]);
     expect(reloaded.getResponse()).toMatchObject({
       values: {
-        global: { aiControlEnabled: false, microphoneEnabled: true, themeId: "minimalist-dark", uiScale: 115 },
+        global: { aiControlEnabled: false, voiceCommandsEnabled: false, microphoneEnabled: true, themeId: "minimalist-dark", uiScale: 115 },
         plugins: { "file-browser": { showGitDiff: false, gitAutoRefresh: false, gitAutoRefreshSeconds: 30 } }
       }
     });
@@ -43,6 +43,7 @@ describe("ConfigService", () => {
 
     await Promise.all([
       service.update({ global: { aiControlEnabled: false } }),
+      service.update({ global: { voiceCommandsEnabled: false } }),
       service.update({ global: { microphoneEnabled: false } }),
       service.update({ plugins: { "file-browser": { showGitDiff: false } } }),
       service.update({ plugins: { "file-browser": { gitAutoRefreshSeconds: 45 } } })
@@ -51,7 +52,7 @@ describe("ConfigService", () => {
     const reloaded = new ConfigService(dataDir, () => [fileBrowserDescriptor()]);
     expect(reloaded.getResponse()).toMatchObject({
       values: {
-        global: { aiControlEnabled: false, microphoneEnabled: false },
+        global: { aiControlEnabled: false, voiceCommandsEnabled: false, microphoneEnabled: false },
         plugins: { "file-browser": { showGitDiff: false, gitAutoRefreshSeconds: 45 } }
       }
     });
@@ -96,6 +97,7 @@ describe("ConfigService", () => {
       `${JSON.stringify({
         global: {
           aiControlEnabled: "false",
+          voiceCommandsEnabled: "no",
           microphoneEnabled: 1,
           themeId: "missing",
           uiScale: 999
@@ -115,7 +117,7 @@ describe("ConfigService", () => {
 
     expect(service.getResponse()).toMatchObject({
       values: {
-        global: { aiControlEnabled: true, microphoneEnabled: true, themeId: "cloudx-neon", uiScale: 100 },
+        global: { aiControlEnabled: true, voiceCommandsEnabled: true, microphoneEnabled: true, themeId: "cloudx-neon", uiScale: 100 },
         plugins: { "file-browser": { showGitDiff: true, gitAutoRefresh: true, gitAutoRefreshSeconds: 15 } }
       }
     });
@@ -138,7 +140,7 @@ describe("ConfigService", () => {
 
     expect(service.getResponse()).toMatchObject({
       values: {
-        global: { aiControlEnabled: true, microphoneEnabled: true, themeId: "cloudx-neon", uiScale: 100 },
+        global: { aiControlEnabled: true, voiceCommandsEnabled: true, microphoneEnabled: true, themeId: "cloudx-neon", uiScale: 100 },
         plugins: { "file-browser": { showGitDiff: true, gitAutoRefresh: true, gitAutoRefreshSeconds: 15 } }
       }
     });
@@ -152,7 +154,7 @@ describe("ConfigService", () => {
 
     expect(service.getResponse()).toMatchObject({
       values: {
-        global: { aiControlEnabled: true, microphoneEnabled: true, themeId: "cloudx-neon", uiScale: 100 },
+        global: { aiControlEnabled: true, voiceCommandsEnabled: true, microphoneEnabled: true, themeId: "cloudx-neon", uiScale: 100 },
         plugins: { "file-browser": { showGitDiff: true, gitAutoRefresh: true, gitAutoRefreshSeconds: 15 } }
       }
     });

@@ -136,6 +136,10 @@ The ASR service defaults to the small CPU model. See `docs/SETUP.md` for the
 installer details, large-v3 Faster Whisper setup, GPU/CPU choices, and systemd
 service install.
 
+If the signed-in Codex account cannot use the configured planner model, disable
+Settings > Global > Voice commands. This hides typed and microphone voice
+command submission without disabling the rest of Cloudx.
+
 ## Configuration
 
 Common environment variables:

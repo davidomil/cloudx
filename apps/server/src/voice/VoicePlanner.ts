@@ -316,7 +316,7 @@ function runCodexExec(model: string, prompt: string): Promise<string> {
           settleResolve(extractLastJsonObject(stdout));
         }
       } else {
-        settleReject(new Error(`codex exec voice planner failed with code ${code}: ${summarizeCodexError(stderr || stdout)}`));
+        settleReject(new Error(`codex exec voice planner failed with code ${code}: ${summarizeCodexError(stderr || stdout, model)}`));
       }
     });
     try {
@@ -440,7 +440,11 @@ function extractLastJsonObject(output: string): string {
   return trimmed;
 }
 
-function summarizeCodexError(output: string): string {
+export function summarizeCodexError(output: string, model?: string): string {
+  const lineMessage = summarizeCodexErrorLines(output, model);
+  if (lineMessage) {
+    return lineMessage;
+  }
   const matches = Array.from(output.matchAll(/ERROR:\s*(\{[\s\S]*?\n\})/g));
   const last = matches.at(-1)?.[1];
   if (last) {
@@ -448,7 +452,7 @@ function summarizeCodexError(output: string): string {
       const parsed = JSON.parse(last) as { error?: { message?: string; code?: string }; status?: number };
       const message = parsed.error?.message;
       if (message) {
-        return parsed.error?.code ? `${parsed.error.code}: ${message}` : message;
+        return formatCodexErrorMessage(message, parsed.error?.code, model);
       }
     } catch {
       return last;
@@ -459,4 +463,37 @@ function summarizeCodexError(output: string): string {
     .map((line) => line.trim())
     .filter(Boolean);
   return lines.slice(-12).join("\n");
+}
+
+function summarizeCodexErrorLines(output: string, model: string | undefined): string | undefined {
+  const messages: string[] = [];
+  for (const line of output.split("\n")) {
+    const markerIndex = line.indexOf("ERROR:");
+    if (markerIndex < 0) {
+      continue;
+    }
+    const candidate = line.slice(markerIndex + "ERROR:".length).trim();
+    if (!candidate.startsWith("{")) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(candidate) as { error?: { message?: string; code?: string } };
+      const message = parsed.error?.message;
+      if (message) {
+        messages.push(formatCodexErrorMessage(message, parsed.error?.code, model));
+      }
+    } catch {
+      // Fall back to the multi-line parser and final line summary below.
+    }
+  }
+  return messages.at(-1);
+}
+
+function formatCodexErrorMessage(message: string, code: string | undefined, model: string | undefined): string {
+  const base = code ? `${code}: ${message}` : message;
+  if (!/model is not supported when using Codex with a ChatGPT account/iu.test(message)) {
+    return base;
+  }
+  const modelText = model ? ` with model ${model}` : "";
+  return `${base} Cloudx invoked Codex CLI${modelText}, but Codex reported that the active ChatGPT account cannot use that model. Sign out of the wrong Codex account and sign back in with the entitled work or enterprise account, or set CLOUDX_VOICE_MODEL to a model that account can use.`;
 }

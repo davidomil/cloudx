@@ -472,6 +472,18 @@ describe("buildServer", () => {
     expect(predicate({ pluginId: "standard-terminal" } as never)).toBe(false);
   });
 
+  it("rejects audio AI transcript hooks when voice commands are disabled", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-audio-ai-hook-disabled-"));
+    const config = testConfig(root);
+    await fs.mkdir(config.dataDir, { recursive: true });
+    await fs.writeFile(path.join(config.dataDir, "config.json"), JSON.stringify({ global: { voiceCommandsEnabled: false } }), "utf8");
+    const services = buildServices(config);
+
+    await expect(services.hooks!.call("audio-ai.submitTranscript", { transcript: "open terminal" }, { caller: { kind: "plugin", pluginId: "audio-ai" } })).rejects.toThrow(
+      "Voice commands are disabled in Cloudx settings."
+    );
+  });
+
   it("exposes app and plugin hooks through the hook API", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-hooks-route-"));
     const config = testConfig(root);
@@ -845,20 +857,21 @@ describe("buildServer", () => {
     try {
       const initial = await app.inject({ method: "GET", url: "/api/config" });
       expect(initial.statusCode).toBe(200);
-      expect(initial.json().values.global).toMatchObject({ aiControlEnabled: true, microphoneEnabled: true, themeId: "cloudx-neon", uiScale: 100 });
+      expect(initial.json().values.global).toMatchObject({ aiControlEnabled: true, voiceCommandsEnabled: true, microphoneEnabled: true, themeId: "cloudx-neon", uiScale: 100 });
       expect(initial.json().values.plugins["file-browser"]).toMatchObject({ showGitDiff: true, gitAutoRefresh: true, gitAutoRefreshSeconds: 15 });
 
       const updated = await app.inject({
         method: "PATCH",
         url: "/api/config",
         payload: {
-          global: { aiControlEnabled: false, themeId: "minimalist-dark", uiScale: 115 },
+          global: { aiControlEnabled: false, voiceCommandsEnabled: false, themeId: "minimalist-dark", uiScale: 115 },
           plugins: { "file-browser": { showGitDiff: false, gitAutoRefresh: false, gitAutoRefreshSeconds: 30 } }
         }
       });
 
       expect(updated.statusCode).toBe(200);
       expect(updated.json().values.global.aiControlEnabled).toBe(false);
+      expect(updated.json().values.global.voiceCommandsEnabled).toBe(false);
       expect(updated.json().values.global.themeId).toBe("minimalist-dark");
       expect(updated.json().values.global.uiScale).toBe(115);
       expect(updated.json().values.plugins["file-browser"].showGitDiff).toBe(false);
@@ -1173,6 +1186,34 @@ describe("buildServer", () => {
 
       expect(response.statusCode).toBe(403);
       expect(response.body).toContain("AI control is disabled");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("rejects voice command routes when voice commands are disabled", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-config-voice-commands-"));
+    const config = testConfig(root);
+    await fs.mkdir(config.dataDir, { recursive: true });
+    await fs.writeFile(path.join(config.dataDir, "config.json"), JSON.stringify({ global: { voiceCommandsEnabled: false } }), "utf8");
+    const app = await buildServer(config);
+    try {
+      const transcript = await app.inject({
+        method: "POST",
+        url: "/api/voice/transcript",
+        payload: { transcript: "open terminal" }
+      });
+      expect(transcript.statusCode).toBe(403);
+      expect(transcript.body).toContain("Voice commands are disabled");
+
+      const audio = await app.inject({
+        method: "POST",
+        url: "/api/voice/audio?filename=voice.webm",
+        headers: { "content-type": "audio/webm" },
+        payload: Buffer.from("audio")
+      });
+      expect(audio.statusCode).toBe(403);
+      expect(audio.body).toContain("Voice commands are disabled");
     } finally {
       await app.close();
     }

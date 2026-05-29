@@ -918,8 +918,14 @@ a:hover svg {
   box-shadow: var(--shadow-neon-sm);
 }
 
-.pane-close-button {
+.pane-maximize-button {
   margin-left: auto;
+  color: var(--color-accent-tertiary);
+  border-color: rgb(0 212 255 / 0.35);
+}
+
+.pane-close-button {
+  margin-left: 0;
   color: var(--color-accent-secondary);
   border-color: rgb(255 0 255 / 0.34);
 }
@@ -1059,6 +1065,10 @@ a:hover svg {
   display: flex;
   padding: 8px 8px 0;
   overflow: hidden;
+}
+
+.pane-root.maximized {
+  padding-bottom: 0;
 }
 
 .pane-split {
@@ -2352,6 +2362,7 @@ a:hover svg {
 .file-browser-toolbar,
 .worktree-toolbar,
 .web-viewer-toolbar {
+  min-width: 0;
   min-height: 44px;
   display: flex;
   align-items: center;
@@ -2643,6 +2654,7 @@ a:hover svg {
   place-items: center;
   padding: 0 10px;
   text-decoration: none;
+  flex: 0 0 auto;
 }
 
 .web-viewer-toolbar button[type="submit"] {
@@ -2706,7 +2718,29 @@ a:hover svg {
 }
 
 .file-browser-toolbar .file-browser-path {
+  flex: 1 1 0;
   cursor: copy;
+}
+
+.file-folder-create-form {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 7px;
+  background: rgb(13 13 20 / 0.9);
+  border-bottom: 1px solid rgb(42 42 58 / 0.72);
+}
+
+.file-folder-create-form input {
+  min-width: 0;
+  height: 38px;
+  padding: 0 10px;
+  color: var(--color-accent);
+  background: var(--color-input);
+  border: 1px solid var(--color-border);
+  clip-path: var(--chamfer-sm);
 }
 
 .file-browser-toolbar .file-browser-path:hover,
@@ -3233,9 +3267,12 @@ a:hover svg {
   text-transform: uppercase;
 }
 
-.tree-change-badge.added,
-.tree-change-badge.untracked {
+.tree-change-badge.added {
   background: var(--color-accent);
+}
+
+.tree-change-badge.untracked {
+  background: var(--color-warning);
 }
 
 .tree-change-badge.deleted {
@@ -3276,6 +3313,11 @@ a:hover svg {
   grid-template-rows: auto minmax(0, 1fr);
   gap: 12px;
   white-space: normal;
+}
+
+.file-preview-rendered:focus-visible {
+  outline: 1px solid rgb(0 212 255 / 0.58);
+  outline-offset: -1px;
 }
 
 .file-preview-heading {
@@ -3491,6 +3533,14 @@ a:hover svg {
   font-family: var(--font-label);
   font-size: 11px;
   text-align: center;
+}
+
+.git-status-badge.added {
+  color: var(--color-accent);
+}
+
+.git-status-badge.untracked {
+  color: var(--color-warning);
 }
 
 .git-status-badge.deleted {
@@ -3788,14 +3838,37 @@ a:hover svg {
   border-color: rgb(255 51 102 / 0.42);
 }
 
-.worktree-row div {
+.worktree-row-main {
   min-width: 0;
   display: grid;
   gap: 3px;
 }
 
+.worktree-manager-panel .worktree-copy-value {
+  min-width: 0;
+  min-height: auto;
+  justify-content: start;
+  gap: 6px;
+  padding: 0;
+  color: var(--color-muted-foreground);
+  background: transparent;
+  border: 0;
+  cursor: copy;
+}
+
+.worktree-manager-panel .worktree-copy-value.primary {
+  color: var(--color-accent);
+}
+
+.worktree-manager-panel .worktree-copy-value:hover,
+.worktree-manager-panel .worktree-copy-value:focus-visible {
+  color: var(--color-accent-tertiary);
+  outline: none;
+}
+
 .worktree-row strong,
-.worktree-row span {
+.worktree-row span,
+.worktree-row-main small {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3805,6 +3878,18 @@ a:hover svg {
 .worktree-row strong {
   color: var(--color-accent);
   font-size: 13px;
+}
+
+.worktree-manager-panel .worktree-copy-value:hover strong,
+.worktree-manager-panel .worktree-copy-value:focus-visible strong {
+  color: var(--color-accent-tertiary);
+}
+
+.worktree-row-main small {
+  color: var(--color-accent-tertiary);
+  font-family: var(--font-label);
+  font-size: 10px;
+  text-transform: uppercase;
 }
 
 .worktree-clean,

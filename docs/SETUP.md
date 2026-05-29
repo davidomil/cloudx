@@ -306,6 +306,11 @@ authorization, and process isolation.
 - `CLOUDX_VOICE_DEBUG_TRANSCRIPTS`: include raw transcript and planner text in
   logs. Leave unset for normal use.
 
+If your signed-in Codex account cannot use the configured planner model, turn
+off Settings > Global > Voice commands. That disables typed and microphone voice
+command submission while leaving terminals, files, worktrees, and other Cloudx
+tools enabled.
+
 ASR options:
 
 - `CLOUDX_ASR_MODEL`: Faster Whisper model name, default `small`.

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RULES_SKILLS_PLUGIN_ID, type PluginDescriptor, type WorkspaceStateResponse } from "@cloudx/shared";
 
-import { codexTabInitialInput, loadAudioInputId, persistAudioInputId, requestAudioInputEnumerationAccess, selectCreateTabPluginId, subscribeWorkspaceUpdates, workspaceStateWithPreservedLayout } from "./App.js";
+import { codexTabInitialInput, loadAudioInputId, persistAudioInputId, requestAudioInputEnumerationAccess, selectCreateTabPluginId, subscribeWorkspaceUpdates, voiceControlSettings, workspaceStateWithPreservedLayout } from "./App.js";
 import { pluginMetadataForTemplate, selectedTemplateId } from "./RulesSkillsPanel.js";
 import { collectUiContributions, selectTabIndicatorContribution } from "./uiContributions.js";
 import { parseWorkspaceSocketUpdate } from "./workspaceSocketUpdate.js";
@@ -62,6 +62,32 @@ describe("audio input storage helpers", () => {
     expect(loadAudioInputId()).toBeUndefined();
     expect(() => persistAudioInputId("mic-1")).not.toThrow();
     expect(() => persistAudioInputId(undefined)).not.toThrow();
+  });
+});
+
+describe("voiceControlSettings", () => {
+  it("keeps voice and microphone controls enabled by default", () => {
+    expect(voiceControlSettings(undefined)).toEqual({
+      aiControlEnabled: true,
+      voiceCommandsEnabled: true,
+      microphoneEnabled: true
+    });
+  });
+
+  it("disables microphone controls when voice commands are disabled", () => {
+    expect(voiceControlSettings({ aiControlEnabled: true, voiceCommandsEnabled: false, microphoneEnabled: true })).toEqual({
+      aiControlEnabled: true,
+      voiceCommandsEnabled: false,
+      microphoneEnabled: false
+    });
+  });
+
+  it("keeps all voice surfaces disabled when AI control is disabled", () => {
+    expect(voiceControlSettings({ aiControlEnabled: false, voiceCommandsEnabled: true, microphoneEnabled: true })).toEqual({
+      aiControlEnabled: false,
+      voiceCommandsEnabled: false,
+      microphoneEnabled: false
+    });
   });
 });
 
