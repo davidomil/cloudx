@@ -1,5 +1,7 @@
 // @vitest-environment jsdom
 
+import fs from "node:fs";
+import path from "node:path";
 import { createElement, type ReactElement } from "react";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -13,6 +15,8 @@ import { REF_OPTION_LIMIT, WorktreeManagerPanel, copyWorktreeValueToClipboard, d
 vi.mock("../api.js", () => ({
   runTabAction: vi.fn()
 }));
+
+const stylesCss = fs.readFileSync(path.join(process.cwd(), "apps/web/src/styles.css"), "utf8");
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -71,6 +75,14 @@ describe("copyWorktreeValueToClipboard", () => {
 });
 
 describe("WorktreeManagerPanel", () => {
+  it("keeps click-to-copy row labels from inheriting the chamfered button clip", () => {
+    const copyValueBlock = cssBlockFor(".worktree-manager-panel .worktree-copy-value");
+
+    expect(copyValueBlock).toContain("width: 100%;");
+    expect(copyValueBlock).toContain("max-width: 100%;");
+    expect(copyValueBlock).toContain("clip-path: none;");
+  });
+
   it("copies the row path and branch click targets", async () => {
     const writes: string[] = [];
     vi.stubGlobal("navigator", { clipboard: { writeText: vi.fn(async (value: string) => { writes.push(value); }) } });
@@ -169,4 +181,13 @@ async function waitForButton(selector: string): Promise<HTMLButtonElement> {
     await flushEffects();
   }
   throw new Error(`Missing button ${selector}. Rendered: ${document.body.textContent ?? ""}`);
+}
+
+function cssBlockFor(selector: string): string {
+  const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(`${escapedSelector}\\s*\\{([^}]*)\\}`).exec(stylesCss);
+  if (!match) {
+    throw new Error(`Missing CSS block ${selector}`);
+  }
+  return match[1]!;
 }

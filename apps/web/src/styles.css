@@ -3845,7 +3845,9 @@ a:hover svg {
 }
 
 .worktree-manager-panel .worktree-copy-value {
+  width: 100%;
   min-width: 0;
+  max-width: 100%;
   min-height: auto;
   justify-content: start;
   gap: 6px;
@@ -3853,7 +3855,12 @@ a:hover svg {
   color: var(--color-muted-foreground);
   background: transparent;
   border: 0;
+  clip-path: none;
   cursor: copy;
+}
+
+.worktree-manager-panel .worktree-copy-value svg {
+  flex: 0 0 auto;
 }
 
 .worktree-manager-panel .worktree-copy-value.primary {
