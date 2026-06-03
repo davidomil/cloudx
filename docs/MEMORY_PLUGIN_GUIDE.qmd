@@ -302,7 +302,7 @@ The indexer tests cover:
 
 The server plugin tests cover hook registration, safety classes, local path policy enforcement, browser upload forwarding, automatic plugin system-rule and system-skill contributions, generic plugin contribution validation, and Codex overlay injection. The web panel tests cover upload ingest, visible text ingest, and search hook calls. The client tests cover JSON POST behavior, multipart upload behavior, browser upload request construction, and propagation of service error messages.
 
-A realistic validation runner in `debug_tooling/documentation-validation/run_validation.py` downloads or reuses public Wikipedia pages, the TurboQuant arXiv PDF, GMSL2 datasheet PDFs, and a generated 2500-record mock corpus with planted facts. The latest required validation run ingested 6 documents into 3347 active chunks, produced 1866 table CSV files, 1866 table Markdown files, and 469 rendered figure PNGs, then passed required hybrid, lexical, rebuild, and stale-state checks. Dense-only checks are retained as diagnostics because the current dense profile is a deterministic local hash embedding, not a semantic embedding model.
+A realistic validation runner in `debug_tooling/documentation-validation/run_validation.py` downloads or reuses public Wikipedia pages, the TurboQuant arXiv PDF, GMSL2 datasheet PDFs, and a generated 2500-record mock corpus with planted facts. The latest required validation run ingested 6 documents into 3347 active chunks, produced 1866 table CSV files, 1866 table Markdown files, and 469 rendered figure PNGs, then passed required hybrid, lexical, rebuild, and stale-state checks. Dense-only checks are retained as diagnostics because the current dense profile is a deterministic local hash embedding, not a semantic embedding model. See `debug_tooling/documentation-validation/README.md` before running it; generated corpus, archive, and summary files stay under the selected `--root` and should not be committed.
 
 # Current Boundaries
 
@@ -339,6 +339,6 @@ rg -n "DocumentationPlugin|documentation\.search|automationSafety|callHook" \
 PYTHONPATH=services/documentation-indexer/src \
   services/documentation-indexer/.venv/bin/python \
   debug_tooling/documentation-validation/run_validation.py \
-  --root /tmp/cloudx-documentation-validation --mock-count 2500 --skip-download
+  --root /tmp/cloudx-documentation-validation --mock-count 2500
 npm run docs:memory:pdf
 ```

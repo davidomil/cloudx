@@ -458,7 +458,10 @@ chunks, produced 1866 table CSV files, 1866 table Markdown files, and
 469 rendered figure PNGs, then passed required hybrid, lexical, rebuild,
 and stale-state checks. Dense-only checks are retained as diagnostics
 because the current dense profile is a deterministic local hash
-embedding, not a semantic embedding model.
+embedding, not a semantic embedding model. See
+`debug_tooling/documentation-validation/README.md` before running it;
+generated corpus, archive, and summary files stay under the selected
+`--root` and should not be committed.
 
 # Current Boundaries
 
@@ -502,6 +505,6 @@ rg -n "DocumentationPlugin|documentation\.search|automationSafety|callHook" \
 PYTHONPATH=services/documentation-indexer/src \
   services/documentation-indexer/.venv/bin/python \
   debug_tooling/documentation-validation/run_validation.py \
-  --root /tmp/cloudx-documentation-validation --mock-count 2500 --skip-download
+  --root /tmp/cloudx-documentation-validation --mock-count 2500
 npm run docs:memory:pdf
 ```

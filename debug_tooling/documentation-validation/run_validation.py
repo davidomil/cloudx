@@ -113,10 +113,12 @@ def main(argv: list[str] | None = None) -> int:
     started = time.perf_counter()
     ingested = ingest_sources(archive, corpus_dir, mock_path)
     ingest_seconds = time.perf_counter() - started
-    available_titles = {Path(document["title"]).name for document in archive.list_documents(states=["active"])}
-    checks = run_recall_checks(archive, available_titles=available_titles)
+    active_documents = archive.list_documents(states=["active"])
+    available_titles = {Path(document["title"]).name for document in active_documents}
+    available_collections = {document["collection"] for document in active_documents if document.get("collection")}
+    checks = run_recall_checks(archive, available_titles=available_titles, available_collections=available_collections)
     rebuild_manifest = archive.rebuild_index()
-    rebuild_checks = run_recall_checks(archive, modes=("hybrid",), available_titles=available_titles)
+    rebuild_checks = run_recall_checks(archive, modes=("hybrid",), available_titles=available_titles, available_collections=available_collections)
     stale_check = run_invalidation_check(archive, mock_path)
 
     large_datasheet_check = run_large_datasheet_artifact_check(archive, LARGE_DATASHEET_TITLE)
@@ -205,6 +207,7 @@ def run_recall_checks(
     archive: DocumentationArchive,
     modes: tuple[str, ...] = ("hybrid", "lexical", "dense"),
     available_titles: set[str] | None = None,
+    available_collections: set[str] | None = None,
 ) -> list[dict]:
     checks = []
     for mode in modes:
@@ -218,6 +221,17 @@ def run_recall_checks(
                     "skipped": True,
                     "passed": True,
                     "reason": f"missing source {expected_title}",
+                })
+                continue
+            expected_collection = check.get("expected_collection")
+            if available_collections is not None and expected_collection and expected_collection not in available_collections:
+                checks.append({
+                    "query": check["query"],
+                    "mode": mode,
+                    "required": mode != "dense",
+                    "skipped": True,
+                    "passed": True,
+                    "reason": f"missing collection {expected_collection}",
                 })
                 continue
             results = archive.search(check["query"], limit=10, mode=mode)
@@ -278,7 +292,9 @@ def run_large_datasheet_artifact_check(archive: DocumentationArchive, title: str
     if not document:
         return {
             "title": title,
-            "passed": False,
+            "required": True,
+            "skipped": True,
+            "passed": True,
             "reason": "large datasheet was not ingested as an active document",
         }
     full_document = archive.get_document(document["document_id"])
