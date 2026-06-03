@@ -8,6 +8,7 @@ import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 
 export const ASR_MODEL_ID = "Systran/faster-whisper-large-v3";
+export const PYTORCH_CPU_WHEEL_INDEX = "https://download.pytorch.org/whl/cpu";
 export const SERVICE_NAMES = ["cloudx-asr.service", "cloudx.service"];
 export const UBUNTU_APT_PACKAGES = [
   "ca-certificates",
@@ -15,6 +16,8 @@ export const UBUNTU_APT_PACKAGES = [
   "gnupg",
   "git",
   "build-essential",
+  "libreoffice",
+  "poppler-utils",
   "python3",
   "python3-venv",
   "python3-pip",
@@ -71,7 +74,8 @@ export function helpText() {
     "",
     "The shell bootstrap installs Ubuntu packages and Node.js/npm when needed.",
     "This Node wizard then installs Cloudx dependencies, Codex CLI, ASR,",
-    "the Faster Whisper model, config files, and optional systemd user services.",
+    "the documentation archive indexer, the Faster Whisper model, config files,",
+    "and optional systemd user services.",
     "",
     "Usage: ./install.sh [options]",
     "       node scripts/install-cloudx.mjs [options]",
@@ -366,7 +370,7 @@ export async function runInstaller(options = {}) {
   if (options.uninstall) {
     return await runUninstaller({ paths, commands, runner, prompt, dryRun });
   }
-  section(options.update ? "1/9 Install and verify Ubuntu prerequisites" : "1/8 Install and verify Ubuntu prerequisites");
+  section(options.update ? "1/10 Install and verify Ubuntu prerequisites" : "1/9 Install and verify Ubuntu prerequisites");
   if (env.CLOUDX_INSTALL_BOOTSTRAPPED === "1") {
     console.log("Shell bootstrap already installed Ubuntu packages. Verifying Node.js and npm.");
     verifyNodeAndNpm(commands);
@@ -391,12 +395,12 @@ export async function runInstaller(options = {}) {
     console.log("CUDA/cuDNN runtime libraries were not detected, so GPU mode will fail unless they are installed first.");
   }
 
-  section("2/8 Verify Codex CLI");
+  section("2/9 Verify Codex CLI");
   await ensureCodex(commands, prompt);
   const assistantBin = commands.which("codex");
   const toolPath = toolPathFor(assistantBin, commands.capture("npm", ["prefix", "-g"]), env.PATH);
 
-  section("3/8 Collect install choices");
+  section("3/9 Collect install choices");
   explainQuestion(
     "Allowed workspace roots",
     "Cloudx can open terminals and files only under these roots. Use ':' to separate multiple roots on Linux, for example '~:/srv/projects'."
@@ -442,12 +446,14 @@ export async function runInstaller(options = {}) {
     enableLinger
   });
 
-  section("4/8 Install Cloudx npm dependencies");
+  section("4/9 Install Cloudx npm dependencies");
   commands.run("npm", ["ci"]);
-  section("5/8 Prepare ASR Python environment and model");
+  section("5/9 Prepare ASR Python environment and model");
   setupAsr(commands, paths);
   downloadModel(commands, paths);
-  section("6/8 Build Cloudx and create HTTPS certificate");
+  section("6/9 Prepare documentation archive Python environment");
+  setupDocumentationIndexer(commands, paths);
+  section("7/9 Build Cloudx and create HTTPS certificate");
   commands.run("npm", ["run", "build"]);
   commands.run("npm", ["run", "cert:create"], {
     env: certHosts.trim() ? { CLOUDX_CERT_HOSTS: certHosts.trim() } : undefined
@@ -465,11 +471,11 @@ export async function runInstaller(options = {}) {
     cpuThreads,
     ...device
   };
-  section("7/8 Write Cloudx configuration");
+  section("8/9 Write Cloudx configuration");
   runner.writeFile(paths.envPath, renderEnvFile(envConfig));
 
   if (installServices) {
-    section("8/8 Install user-level systemd services");
+    section("9/9 Install user-level systemd services");
     installSystemdServices(commands, runner, paths);
     if (enableLinger) {
       commands.run("sudo", ["loginctl", "enable-linger", os.userInfo().username]);
@@ -481,7 +487,7 @@ export async function runInstaller(options = {}) {
       verifyServices(commands, port);
     }
   } else {
-    section("8/8 Skip systemd service installation");
+    section("9/9 Skip systemd service installation");
     console.log("Cloudx was configured for manual startup with npm run dev.");
   }
 
@@ -501,8 +507,8 @@ async function runUninstaller({ paths, commands, runner, prompt }) {
   const removeServices = await prompt.boolean("removeServices", "Stop, disable, and remove Cloudx user-level systemd services?", true);
   explainQuestion("Remove config", "Deletes ~/.config/cloudx/cloudx.env, which contains the port, roots, ASR model path, and CPU/GPU settings written by the installer.");
   const removeConfig = await prompt.boolean("removeConfig", "Remove Cloudx environment config?", true);
-  explainQuestion("Remove ASR virtualenv", "Deletes services/asr/.venv. This frees local Python packages installed for ASR and tests.");
-  const removeVenv = await prompt.boolean("removeVenv", "Remove ASR Python virtualenv?", true);
+  explainQuestion("Remove Python virtualenvs", "Deletes Cloudx-managed Python virtualenvs for ASR and the documentation archive indexer.");
+  const removeVenv = await prompt.boolean("removeVenv", "Remove Cloudx Python virtualenvs?", true);
   explainQuestion("Remove runtime data", "Deletes the repo-local .cloudx directory, including generated HTTPS certificates and workspace runtime state.");
   const removeRuntimeData = await prompt.boolean("removeRuntimeData", "Remove local runtime data and generated HTTPS certificates in .cloudx?", false);
   explainQuestion("Remove ASR model", "Deletes the downloaded Faster Whisper large-v3 model cache. Keeping it avoids another large download later.");
@@ -535,8 +541,9 @@ async function runUninstaller({ paths, commands, runner, prompt }) {
   section("3/6 Remove local environments and caches");
   if (removeVenv) {
     runner.removePath(paths.venvDir);
+    runner.removePath(paths.documentationVenvDir);
   } else {
-    console.log("Keeping ASR Python virtualenv.");
+    console.log("Keeping Cloudx Python virtualenvs.");
   }
   if (removeNodeModules) {
     runner.removePath(path.join(paths.repoRoot, "node_modules"));
@@ -581,14 +588,14 @@ async function runUpdater({ paths, commands, runner, prompt, noStart, networkInt
   const host = envConfig.CLOUDX_HOST ?? "127.0.0.1";
   const servicesInstalled = SERVICE_NAMES.every((serviceName) => fs.existsSync(path.join(paths.systemdDir, serviceName)));
 
-  section("2/9 Pull latest Cloudx checkout");
+  section("2/10 Pull latest Cloudx checkout");
   if (env.CLOUDX_INSTALL_ALREADY_PULLED === "1") {
     console.log("Checkout was already pulled by install.sh.");
   } else {
     commands.run("git", ["pull", "--ff-only"]);
   }
 
-  section("3/9 Update Codex CLI");
+  section("3/10 Update Codex CLI");
   await updateCodex(commands, prompt);
   const assistantBin = commands.which("codex");
   runner.writeFile(
@@ -599,18 +606,21 @@ async function runUpdater({ paths, commands, runner, prompt, noStart, networkInt
     })
   );
 
-  section("4/9 Update Cloudx npm dependencies");
+  section("4/10 Update Cloudx npm dependencies");
   commands.run("npm", ["ci"]);
 
-  section("5/9 Update ASR Python environment and model");
+  section("5/10 Update ASR Python environment and model");
   setupAsr(commands, paths);
   downloadModel(commands, paths);
 
-  section("6/9 Rebuild Cloudx and refresh HTTPS certificate if missing");
+  section("6/10 Update documentation archive Python environment");
+  setupDocumentationIndexer(commands, paths);
+
+  section("7/10 Rebuild Cloudx and refresh HTTPS certificate if missing");
   commands.run("npm", ["run", "build"]);
   commands.run("npm", ["run", "cert:create"]);
 
-  section("7/9 Refresh installed systemd service files");
+  section("8/10 Refresh installed systemd service files");
   if (servicesInstalled) {
     installSystemdServices(commands, runner, paths);
     commands.run("systemctl", ["--user", "daemon-reload"]);
@@ -624,7 +634,7 @@ async function runUpdater({ paths, commands, runner, prompt, noStart, networkInt
     (explainQuestion("Restart services", "Restarts Cloudx and ASR after dependencies and service files are updated, then verifies the health endpoints."),
     await prompt.boolean("restartServices", "Restart Cloudx services after update?", true));
 
-  section("8/9 Restart services");
+  section("9/10 Restart services");
   if (restartServices) {
     commands.run("systemctl", ["--user", "restart", ...SERVICE_NAMES]);
     verifyServices(commands, port);
@@ -634,7 +644,7 @@ async function runUpdater({ paths, commands, runner, prompt, noStart, networkInt
     console.log("No installed services to restart.");
   }
 
-  section("9/9 Update complete");
+  section("10/10 Update complete");
   printUpdateComplete({ paths, host, port, servicesInstalled, restartServices, networkInterfaces });
   await prompt.close();
   return { runner, paths, port, servicesInstalled, restartServices, urls: cloudxAccessUrls(port, networkInterfaces, host) };
@@ -714,6 +724,19 @@ function setupAsr(commands, paths) {
   commands.run("python3", ["-m", "venv", "--upgrade-deps", paths.venvDir]);
   console.log("Installing Cloudx ASR, test dependencies, and Hugging Face CLI.");
   commands.run(paths.pipPath, ["install", "-e", `${paths.asrDir}[dev]`, "huggingface_hub[cli]"]);
+}
+
+function setupDocumentationIndexer(commands, paths) {
+  console.log(`Creating or updating Python virtualenv: ${paths.documentationVenvDir}`);
+  commands.run("python3", ["-m", "venv", "--upgrade-deps", paths.documentationVenvDir]);
+  console.log("Installing Cloudx documentation archive indexer and extraction dependencies.");
+  commands.run(paths.documentationPipPath, [
+    "install",
+    "--extra-index-url",
+    PYTORCH_CPU_WHEEL_INDEX,
+    "-e",
+    `${paths.documentationIndexerDir}[dev]`
+  ]);
 }
 
 function downloadModel(commands, paths) {
@@ -833,6 +856,8 @@ async function updateCodex(commands, prompt) {
 function installerPaths({ repoRoot: root, home, env = process.env }) {
   const asrDir = path.join(root, "services/asr");
   const venvDir = path.join(asrDir, ".venv");
+  const documentationIndexerDir = path.join(root, "services/documentation-indexer");
+  const documentationVenvDir = path.join(documentationIndexerDir, ".venv");
   const configDir = path.join(home, ".config/cloudx");
   return {
     repoRoot: root,
@@ -841,6 +866,9 @@ function installerPaths({ repoRoot: root, home, env = process.env }) {
     pipPath: path.join(venvDir, "bin/pip"),
     hfPath: path.join(venvDir, "bin/hf"),
     uvicornPath: path.join(venvDir, "bin/uvicorn"),
+    documentationIndexerDir,
+    documentationVenvDir,
+    documentationPipPath: path.join(documentationVenvDir, "bin/pip"),
     modelDir: env.CLOUDX_ASR_MODEL_PATH ?? path.join(home, ".cache/cloudx/models/faster-whisper-large-v3"),
     dataDir: path.join(root, ".cloudx"),
     configDir,

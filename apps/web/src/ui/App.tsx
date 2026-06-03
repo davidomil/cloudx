@@ -83,6 +83,7 @@ const MOBILE_ACTIONS_QUERY = "(max-width: 760px), all and (hover: none) and (poi
 const WORKSPACE_SOCKET_RECONNECT_BASE_MS = 500;
 const WORKSPACE_SOCKET_RECONNECT_MAX_MS = 5_000;
 const AutomationPanel = lazy(() => import("./AutomationPanel.js").then((module) => ({ default: module.AutomationPanel })));
+const DocumentationPanel = lazy(() => import("./DocumentationPanel.js").then((module) => ({ default: module.DocumentationPanel })));
 const FileBrowserPanel = lazy(() => import("./FileBrowserPanel.js").then((module) => ({ default: module.FileBrowserPanel })));
 const TerminalPanel = lazy(() => import("./TerminalPanel.js").then((module) => ({ default: module.TerminalPanel })));
 
@@ -996,6 +997,11 @@ export function App() {
         onInjectRuntime={handleInjectRulesSkillsRuntime}
         onRefreshStore={handleRefreshRulesSkillsStore}
       />
+    ),
+    "documentation.panel": (_contribution, context) => (
+      <Suspense fallback={<div className="empty-pane">Loading documentation...</div>}>
+        <DocumentationPanel callHook={context.callHook} />
+      </Suspense>
     ),
   });
 

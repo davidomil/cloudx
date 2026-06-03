@@ -77,6 +77,8 @@ run sudo apt-get install -y \
   gnupg \
   git \
   build-essential \
+  libreoffice \
+  poppler-utils \
   python3 \
   python3-venv \
   python3-pip \

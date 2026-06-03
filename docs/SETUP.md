@@ -9,6 +9,8 @@ to run Cloudx with voice control.
 - OpenSSL 3.x or newer.
 - Python 3.9 or newer; Python 3.12 is tested locally.
 - ripgrep (`rg`) for file-browser search.
+- Poppler utilities and LibreOffice for documentation archive PDF, table,
+  image, and spreadsheet extraction. The Ubuntu installer installs these.
 - Codex CLI installed and authenticated on the backend host.
 - A trusted LAN or private tailnet for remote laptop/phone access.
 
@@ -26,19 +28,22 @@ For Ubuntu 22.04 or newer, use the installer wizard:
 The installer is split into two visible phases:
 
 1. `install.sh` is the Ubuntu bootstrap. It verifies Ubuntu, installs apt
-   packages required by Cloudx, checks for Node.js 22 and npm, and installs the
+   packages required by Cloudx, including `poppler-utils` and `libreoffice` for
+   documentation extraction, checks for Node.js 22 and npm, and installs the
    NodeSource Node.js 22 package when Node.js is too old or missing. It then
    verifies `node -v` and `npm -v`, and installs Ubuntu's separate `npm` package
    if the `npm` command is missing.
 2. `scripts/install-cloudx.mjs` is the Cloudx wizard. It prints each phase as it
    runs: Codex CLI verification/login, install choices, `npm ci`, ASR virtualenv
-   setup, Hugging Face model download, `npm run build`, certificate creation,
-   `~/.config/cloudx/cloudx.env` rendering, and optional user-level systemd
-   service installation. When services are started, the wizard waits for the
-   HTTPS app health endpoint and ASR health endpoint with bounded retries; if
-   either endpoint does not become healthy, it prints recent systemd status and
-   journal output. When the install finishes, it prints `https://127.0.0.1:<port>`.
-   It prints detected LAN IPv4 URLs only when installed with `--lan`.
+   setup, documentation-indexer virtualenv setup with table-aware extraction
+   dependencies, Hugging Face model download, `npm run build`, certificate
+   creation, `~/.config/cloudx/cloudx.env` rendering, and optional user-level
+   systemd service installation. When services are started, the wizard waits for
+   the HTTPS app health endpoint and ASR health endpoint with bounded retries;
+   if either endpoint does not become healthy, it prints recent systemd status
+   and journal output. When the install finishes, it prints
+   `https://127.0.0.1:<port>`. It prints detected LAN IPv4 URLs only when
+   installed with `--lan`.
 
 The wizard asks for:
 
@@ -148,7 +153,8 @@ The uninstall wizard removes Cloudx-managed local artifacts. By default it:
 - Stops, disables, and removes `cloudx.service` and `cloudx-asr.service` from
   `~/.config/systemd/user`.
 - Removes `~/.config/cloudx/cloudx.env`.
-- Removes the ASR virtualenv at `services/asr/.venv`.
+- Removes the Cloudx-managed Python virtualenvs at `services/asr/.venv` and
+  `services/documentation-indexer/.venv`.
 - Leaves Node.js, npm, Python, apt packages, and Codex CLI installed.
 - Leaves `.cloudx` runtime data/certificates, `node_modules`, the downloaded
   Faster Whisper model, and systemd linger unchanged unless you explicitly ask
@@ -164,10 +170,98 @@ Manual setup remains available:
 
 ```bash
 npm install
-sudo apt install ripgrep
+sudo apt install ripgrep poppler-utils libreoffice
 python3 -m venv services/asr/.venv
 services/asr/.venv/bin/pip install -e services/asr
 ```
+
+## Documentation Archive Service
+
+The documentation plugin talks to a local FastAPI indexer that owns the portable
+SQLite, source snapshots, and Turbovec files. Create its virtualenv and install
+the service:
+
+```bash
+npm run documentation:setup
+```
+
+That command creates `services/documentation-indexer/.venv` and installs the
+indexer with the PDF, image, table, and Docling dependencies used for large
+datasheets.
+
+Start it on the default localhost endpoint:
+
+```bash
+npm run documentation:start
+```
+
+Equivalent explicit command:
+
+```bash
+CLOUDX_DOCUMENTATION_DATA_DIR=.cloudx/documentation \
+services/documentation-indexer/.venv/bin/cloudx-documentation-indexer \
+  --host 127.0.0.1 --port 7820
+```
+
+Cloudx defaults to `CLOUDX_DOCUMENTATION_URL=http://127.0.0.1:7820`, so no app
+configuration is required when the service runs on that endpoint. If you run the
+indexer elsewhere, start Cloudx with:
+
+```bash
+CLOUDX_DOCUMENTATION_URL=http://127.0.0.1:7820 npm run dev
+```
+
+For isolated frontend QA when another Cloudx server is already using the
+default port, run the server and Vite dev server on alternate ports:
+
+```bash
+CLOUDX_HOST=127.0.0.1 CLOUDX_PORT=4301 \
+CLOUDX_DOCUMENTATION_URL=http://127.0.0.1:4820 \
+  npm run dev -w @cloudx/server
+
+CLOUDX_WEB_PORT=5178 \
+CLOUDX_DEV_BACKEND_ORIGIN=http://127.0.0.1:4301 \
+  npm run dev:web
+```
+
+In Cloudx, create a Documentation tab. The panel can:
+
+- Search active indexed knowledge.
+- Upload files, add local paths under `CLOUDX_ALLOWED_ROOTS`, ingest URLs, add
+  copied text, and store media transcripts.
+- Mark sources stale, revoked, superseded, or quarantined.
+- Remove a source from active search by marking it deleted.
+- Show the portable archive manifest and rebuild the Turbovec index.
+
+Documentation skills are synced automatically as CloudX system skills when the
+server starts. They use `CLOUDX_DOCUMENTATION_URL`, and Cloudx exports that URL
+to child processes when Codex tabs run from Cloudx.
+
+### Portable Backup And Restore
+
+The portable database is the full directory named by
+`CLOUDX_DOCUMENTATION_DATA_DIR` or, by default, `.cloudx/documentation`. Back up
+the directory as a unit; do not copy only `catalog.sqlite` or only the Turbovec
+index file.
+
+Manual backup:
+
+```bash
+tar -czf cloudx-documentation-$(date +%F).tar.gz -C .cloudx documentation
+```
+
+Manual restore to the default location:
+
+```bash
+mkdir -p .cloudx
+tar -xzf cloudx-documentation-YYYY-MM-DD.tar.gz -C .cloudx
+npm run documentation:start
+curl -sS -X POST http://127.0.0.1:7820/rebuild-index
+```
+
+Run the rebuild after restore when you intentionally changed active document
+states, changed the service version, or want to validate that the Turbovec file
+can be reconstructed from SQLite chunks.
 
 ## Faster Whisper Large Model
 
@@ -301,6 +395,10 @@ authorization, and process isolation.
   Cloudx shells and assistant subprocesses see the same tool installs as the
   installer.
 - `CLOUDX_ASR_URL`: ASR service URL, default `http://127.0.0.1:7810`.
+- `CLOUDX_DOCUMENTATION_URL`: documentation indexer URL, default
+  `http://127.0.0.1:7820`.
+- `CLOUDX_DOCUMENTATION_DATA_DIR`: portable documentation archive directory,
+  default `.cloudx/documentation`.
 - `CLOUDX_TERMINAL_REPLAY_BYTES`: terminal replay buffer for reconnects and
   voice context.
 - `CLOUDX_VOICE_DEBUG_TRANSCRIPTS`: include raw transcript and planner text in

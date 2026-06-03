@@ -442,6 +442,7 @@ describe("buildServer", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-rules-live-"));
     const config = testConfig(root);
     const services = buildServices(config);
+    await services.pluginSkillContributionsReady;
     const restartTabs = vi.spyOn(services.sessions, "restartTabs").mockResolvedValue([]);
     const refreshRuntimeIndicators = vi.spyOn(services.sessions, "refreshRuntimeIndicators").mockResolvedValue();
     const applyRuntimeContexts = vi.spyOn(services.sessions, "applyRuntimeContexts").mockResolvedValue([]);
@@ -452,6 +453,53 @@ describe("buildServer", () => {
     expect(restartTabs).not.toHaveBeenCalled();
     expect(refreshRuntimeIndicators).toHaveBeenCalled();
     expect(applyRuntimeContexts).not.toHaveBeenCalled();
+  });
+
+  it("syncs plugin skill contributions into system skills at startup", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-plugin-skills-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    const applyRuntimeContexts = vi.spyOn(services.sessions, "applyRuntimeContexts").mockResolvedValue([]);
+
+    const store = await services.pluginSkillContributionsReady!;
+
+    expect(store.systemSkills.map((skill) => skill.id)).toContain("documentation-search");
+    await expect(fs.readFile(path.join(services.rulesSkills!.catalogRoot(), "system-skills", "documentation-search", "SKILL.md"), "utf8")).resolves.toContain("CLOUDX_DOCUMENTATION_URL");
+    expect(applyRuntimeContexts).toHaveBeenCalledWith(expect.any(Function), "Injecting plugin-contributed system skills.");
+  });
+
+  it("forwards browser documentation uploads to the documentation indexer", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-upload-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    const ingestUpload = vi.spyOn(services.documentation!, "ingestUpload").mockResolvedValue({
+      document: { documentId: "uploaded-doc", sourceType: "readme" }
+    });
+    const app = await buildServer(config, services);
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/documentation/upload?filename=uploaded-note.md&sourceType=readme&collection=validation",
+        headers: {
+          "content-type": "application/octet-stream",
+          "x-cloudx-file-content-type": "text/markdown"
+        },
+        payload: Buffer.from("Uploaded note says CLOUDX-UPLOAD-17 is searchable.")
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ document: { documentId: "uploaded-doc", sourceType: "readme" } });
+      expect(ingestUpload).toHaveBeenCalledWith({
+        filename: "uploaded-note.md",
+        content: Buffer.from("Uploaded note says CLOUDX-UPLOAD-17 is searchable."),
+        contentType: "text/markdown",
+        title: undefined,
+        sourceType: "readme",
+        collection: "validation"
+      });
+    } finally {
+      await app.close();
+    }
   });
 
   it("injects saved rules/skills runtime through an explicit hook", async () => {

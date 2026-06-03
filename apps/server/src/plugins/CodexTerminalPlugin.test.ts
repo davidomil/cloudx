@@ -137,6 +137,7 @@ describe("CodexTerminalPlugin", () => {
     await fs.mkdir(path.join(codexHome, "sessions", "2026", "05", "15"), { recursive: true });
     await fs.writeFile(path.join(codexHome, "sessions", "2026", "05", "15", "rollout-session.jsonl"), "session\n", "utf8");
     await seedSkill(dataDir, "code-review", "Code Review", "Review code.", "Code review skill instructions.");
+    await seedSystemSkill(dataDir, "documentation-search", "Documentation Search", "Search documentation.", "Documentation search skill instructions.");
     const factory = new CapturingFactory();
     const plugin = new CodexTerminalPlugin(factory, DEFAULT_TERMINAL_REPLAY_BYTES, dataDir);
 
@@ -181,8 +182,10 @@ describe("CodexTerminalPlugin", () => {
     const overlayConfig = await fs.readFile(path.join(factory.env!.CODEX_HOME!, "config.toml"), "utf8");
     expect(overlayConfig).toContain("skills/cloudx/code-review/SKILL.md");
     expect(overlayConfig).toContain("skills/cloudx-system/create-cloudx-skill/SKILL.md");
+    expect(overlayConfig).toContain("skills/cloudx-system/documentation-search/SKILL.md");
     await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx", "code-review", "SKILL.md"), "utf8")).resolves.toContain("Code review skill instructions.");
     await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx-system", "create-cloudx-skill", "SKILL.md"), "utf8")).resolves.toContain("Create CloudX Skill");
+    await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx-system", "documentation-search", "SKILL.md"), "utf8")).resolves.toContain("Documentation search skill instructions.");
     const overlayInstructions = await fs.readFile(path.join(factory.env!.CODEX_HOME!, "AGENTS.override.md"), "utf8");
     expect(overlayInstructions).toContain("Prefer direct answers.");
     expect(overlayInstructions).toContain("Review carefully.");
@@ -298,6 +301,7 @@ describe("CodexTerminalPlugin", () => {
     const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-live-home-"));
     vi.stubEnv("CODEX_HOME", codexHome);
     await seedSkill(dataDir, "tester", "Tester", "Tester skill.", "Tester skill instructions.");
+    await seedSystemSkill(dataDir, "documentation-search", "Documentation Search", "Search documentation.", "Documentation search skill instructions.");
     const factory = new CapturingFactory();
     const plugin = new CodexTerminalPlugin(factory, DEFAULT_TERMINAL_REPLAY_BYTES, dataDir);
 
@@ -324,6 +328,7 @@ describe("CodexTerminalPlugin", () => {
     expect(factory.process!.written).toContain("prefer using the listed CloudX skills whenever they fit the user's task");
     expect(factory.process!.written).toContain(path.join(dataDir, "rules-skills", "skills", "tester", "SKILL.md"));
     expect(factory.process!.written).toContain("$create-cloudx-skill");
+    expect(factory.process!.written).toContain("$documentation-search");
     expect(factory.process!.written.endsWith("\u001b[201~\r")).toBe(true);
     await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx", "tester", "SKILL.md"), "utf8")).resolves.toContain("Tester skill instructions.");
   });
@@ -571,6 +576,16 @@ describe("TerminalShellIntegrationParser", () => {
 
 async function seedSkill(dataDir: string, id: string, name: string, description: string, body: string): Promise<void> {
   const skillDir = path.join(dataDir, "rules-skills", "skills", id);
+  await fs.mkdir(skillDir, { recursive: true });
+  await fs.writeFile(
+    path.join(skillDir, "SKILL.md"),
+    `---\nname: "${id}"\ndescription: "${description}"\ncloudx_name: "${name}"\n---\n\n${body}\n`,
+    "utf8"
+  );
+}
+
+async function seedSystemSkill(dataDir: string, id: string, name: string, description: string, body: string): Promise<void> {
+  const skillDir = path.join(dataDir, "rules-skills", "system-skills", id);
   await fs.mkdir(skillDir, { recursive: true });
   await fs.writeFile(
     path.join(skillDir, "SKILL.md"),

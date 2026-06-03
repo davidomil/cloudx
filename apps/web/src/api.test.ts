@@ -22,6 +22,7 @@ import {
   updateConfig,
   updateLayoutTemplate,
   updateWindow,
+  uploadDocumentationFile,
   uploadFileBrowserFile,
   voiceAudioConstraints
 } from "./api.js";
@@ -143,6 +144,23 @@ describe("api client", () => {
       { loadedBytes: 2, totalBytes: 5, lengthComputable: true },
       { loadedBytes: 5, totalBytes: 5, lengthComputable: true }
     ]);
+  });
+
+  it("uploads documentation files as octet streams with metadata query fields", async () => {
+    const file = new File(["hello documentation"], "note.md", { type: "text/markdown" });
+    const fetchMock = vi.fn(async () => jsonResponse({ document: { documentId: "doc-upload" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(uploadDocumentationFile({ file, title: "Note", sourceType: "readme", collection: "uploads" })).resolves.toEqual({ document: { documentId: "doc-upload" } });
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/documentation/upload?filename=note.md&title=Note&sourceType=readme&collection=uploads", {
+      method: "POST",
+      headers: {
+        "content-type": "application/octet-stream",
+        "x-cloudx-file-content-type": "text/markdown"
+      },
+      body: file
+    });
   });
 
   it("parses utf-8 and plain content disposition filenames", () => {

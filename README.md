@@ -77,14 +77,16 @@ cd cloudx
 ```
 
 It shows each phase before running it. The bootstrap stage installs Ubuntu
-packages, installs Node.js 22 when needed, verifies both `node -v` and `npm -v`,
-and falls back to Ubuntu's `npm` package if npm is still missing. The wizard then
-installs Cloudx npm dependencies, installs and checks Codex CLI, prepares the
-Faster Whisper ASR environment, downloads the local ASR model, writes Cloudx
-config, and optionally installs user-level systemd services. Each question
-includes a short explanation of what the choice changes, and the installer
-prints the local Cloudx URL when it finishes. Add `--lan` only when you want
-Cloudx to bind to `0.0.0.0` for a trusted LAN or tailnet.
+packages, including the PDF and spreadsheet extraction tools used by the
+documentation archive, installs Node.js 22 when needed, verifies both `node -v`
+and `npm -v`, and falls back to Ubuntu's `npm` package if npm is still missing.
+The wizard then installs Cloudx npm dependencies, installs and checks Codex CLI,
+prepares the Faster Whisper ASR environment, prepares the documentation archive
+indexer environment, downloads the local ASR model, writes Cloudx config, and
+optionally installs user-level systemd services. Each question includes a short
+explanation of what the choice changes, and the installer prints the local
+Cloudx URL when it finishes. Add `--lan` only when you want Cloudx to bind to
+`0.0.0.0` for a trusted LAN or tailnet.
 
 Preview the installer without changing the system:
 
@@ -136,6 +138,24 @@ The ASR service defaults to the small CPU model. See `docs/SETUP.md` for the
 installer details, large-v3 Faster Whisper setup, GPU/CPU choices, and systemd
 service install.
 
+For the local documentation archive:
+
+```bash
+npm run documentation:setup
+npm run documentation:start
+```
+
+This starts the Turbovec-backed indexer at `http://127.0.0.1:7820`, which is the
+Cloudx default `CLOUDX_DOCUMENTATION_URL`. Create a Documentation tab in Cloudx
+to upload files, add local paths, ingest URLs, add copied text or media
+transcripts, search active knowledge, invalidate stale sources, remove sources
+from active search, install the documentation skills, and inspect the portable
+backup manifest.
+
+The documentation archive is portable as one directory. Stop writes, then back
+up `.cloudx/documentation` or the directory named by
+`CLOUDX_DOCUMENTATION_DATA_DIR`.
+
 If the signed-in Codex account cannot use the configured planner model, disable
 Settings > Global > Voice commands. This hides typed and microphone voice
 command submission without disabling the rest of Cloudx.
@@ -150,6 +170,8 @@ Common environment variables:
 - `CLOUDX_ASSISTANT_BIN`: resolved coding-assistant CLI executable for assistant-backed terminals and tools.
 - `CLOUDX_TOOL_PATH`: path-delimited command directories prepended to Cloudx child processes.
 - `CLOUDX_ASR_URL`: ASR endpoint, default `http://127.0.0.1:7810`.
+- `CLOUDX_DOCUMENTATION_URL`: documentation indexer endpoint, default `http://127.0.0.1:7820`.
+- `CLOUDX_DOCUMENTATION_DATA_DIR`: portable documentation archive directory, default `.cloudx/documentation`.
 - `CLOUDX_VOICE_MODEL`: planner model, default `gpt-5.3-codex-spark`.
 - `CLOUDX_VOICE_DEBUG_TRANSCRIPTS`: log raw transcripts and planner text.
 
@@ -165,6 +187,7 @@ documented in `docs/SECURITY_MODEL.md`.
 npm run typecheck
 npm test
 npm run build
+services/documentation-indexer/.venv/bin/python -m pytest services/documentation-indexer/tests
 services/asr/.venv/bin/python -m pytest services/asr/tests
 ```
 

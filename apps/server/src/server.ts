@@ -12,6 +12,7 @@ import type {
   AutomationDynamicOptionSource,
   AutomationPortOption,
   CloudxConfigValues,
+  RulesSkillsStore,
   CreateTabRequest,
   CreateWorkspaceLayoutTemplateRequest,
   CreateWorkspaceWindowRequest,
@@ -26,6 +27,7 @@ import type {
 import type { AppConfig } from "./config.js";
 import { ConfigService } from "./configService.js";
 import { AsrClient } from "./asrClient.js";
+import { DEFAULT_DOCUMENTATION_URL, DocumentationClient } from "./documentation/DocumentationClient.js";
 import { PathPolicy } from "./pathPolicy.js";
 import { PluginRegistry } from "./pluginRegistry.js";
 import { LOCAL_WEB_PROXY_MAX_BODY_BYTES, LocalWebProxy } from "./localWebProxy.js";
@@ -41,6 +43,8 @@ import { AutomationPlugin } from "./plugins/AutomationPlugin.js";
 import { NotificationsPlugin } from "./plugins/NotificationsPlugin.js";
 import { PluginDataStore } from "./plugins/PluginDataStore.js";
 import { RulesSkillsPlugin } from "./plugins/RulesSkillsPlugin.js";
+import { DocumentationPlugin } from "./plugins/DocumentationPlugin.js";
+import { syncPluginSkillContributions } from "./plugins/pluginSkillContributions.js";
 import { SessionStore } from "./sessionStore.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
 import { RulesSkillsCatalogService } from "./rulesSkills/RulesSkillsCatalogService.js";
@@ -79,6 +83,8 @@ export interface AppServices {
   rulesSkills?: RulesSkillsCatalogService;
   fileTransfer?: FileTransferService;
   notifications?: NotificationsPlugin;
+  documentation?: DocumentationClient;
+  pluginSkillContributionsReady?: Promise<RulesSkillsStore>;
 }
 
 const MIN_STREAMED_AUDIO_BYTES = 128;
@@ -86,6 +92,7 @@ const VOICE_WS_CONTROL_MESSAGE_MAX_BYTES = 64 * 1024;
 const TERMINAL_WS_CONTROL_MESSAGE_MAX_BYTES = 256 * 1024;
 const MAX_TERMINAL_DIMENSION = 500;
 const FILE_UPLOAD_MAX_BYTES = 25 * 1024 * 1024 * 1024;
+const DOCUMENTATION_UPLOAD_MAX_BYTES = 256 * 1024 * 1024;
 const WS_CONNECTING = 0;
 const WS_OPEN = 1;
 const LOCAL_WEB_PROXY_HTTP_METHODS: HTTPMethods[] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
@@ -352,6 +359,25 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     }
     const tab = services.sessions.getTab(request.params.tabId);
     return services.fileTransfer!.upload(tab, request.query.relativePath, request.body, { maxBytes: FILE_UPLOAD_MAX_BYTES });
+  });
+
+  app.post<{
+    Querystring: { filename?: string; title?: string; sourceType?: string; collection?: string };
+    Body: NodeJS.ReadableStream;
+  }>("/api/documentation/upload", async (request) => {
+    const contentLength = parseContentLength(request.headers["content-length"]);
+    if (contentLength !== undefined && contentLength > DOCUMENTATION_UPLOAD_MAX_BYTES) {
+      throw new FileUploadTooLargeError(DOCUMENTATION_UPLOAD_MAX_BYTES);
+    }
+    const content = await readRequestBodyBuffer(request.body, DOCUMENTATION_UPLOAD_MAX_BYTES);
+    return services.documentation!.ingestUpload({
+      filename: requiredQueryString(request.query.filename, "filename"),
+      content,
+      contentType: optionalHeaderString(request.headers["x-cloudx-file-content-type"]),
+      title: optionalQueryString(request.query.title),
+      sourceType: optionalQueryString(request.query.sourceType),
+      collection: optionalQueryString(request.query.collection)
+    });
   });
 
   app.post<{ Params: { hookId: string }; Body: HookCallRequest }>("/api/hooks/:hookId", async (request) => {
@@ -830,11 +856,15 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   const terminalFactory = new NodePtyTerminalProcessFactory();
   const pluginData = new PluginDataStore(config.dataDir);
   const rulesSkills = new RulesSkillsCatalogService(config.dataDir);
+  const documentationUrl = config.documentationUrl ?? DEFAULT_DOCUMENTATION_URL;
+  const documentation = new DocumentationClient(documentationUrl);
+  process.env.CLOUDX_DOCUMENTATION_URL ??= documentationUrl;
   let sessions: SessionStore | undefined;
   plugins.register(new CodexTerminalPlugin(terminalFactory, config.terminalReplayBytes, config.dataDir));
   plugins.register(new StandardTerminalPlugin(terminalFactory, config.terminalReplayBytes));
   plugins.register(new FileBrowserPlugin(pathPolicy));
   plugins.register(new LocalWebPlugin());
+  plugins.register(new DocumentationPlugin(documentation, pathPolicy));
   plugins.register(new WorktreeManagerPlugin());
   plugins.register(new WorkspaceControlPlugin());
   plugins.register(new RulesSkillsPlugin(rulesSkills, async () => {
@@ -862,6 +892,13 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
       await sessions?.refreshRuntimeIndicators();
     })();
   });
+  const pluginSkillContributionsReady = syncPluginSkillContributions(plugins.values(), rulesSkills).then(async (store) => {
+    await sessions?.applyRuntimeContexts((tab) => tab.pluginId === "codex-terminal", "Injecting plugin-contributed system skills.");
+    return store;
+  });
+  void pluginSkillContributionsReady.catch((error) => {
+    logger?.error({ err: error }, "Failed to sync plugin skill contributions.");
+  });
   const asr = new AsrClient(config.asrUrl, { timeoutMs: config.asrTimeoutMs });
   let voice: VoiceController | undefined;
   plugins.register(new AudioAiPlugin(() => {
@@ -885,7 +922,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   registerPluginTriggers(triggers, plugins);
   sessions.setTriggerRegistry(triggers);
   automation = createAutomationService(automationRepository, { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config);
-  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, automation, pluginData, rulesSkills, fileTransfer, notifications };
+  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, automation, pluginData, rulesSkills, fileTransfer, notifications, documentation, pluginSkillContributionsReady };
 }
 
 export function serializeRequestForLog(request: Pick<FastifyRequest, "method" | "url" | "hostname" | "ip" | "socket">): {
@@ -1384,6 +1421,20 @@ function rawDataByteLength(raw: RawData): number {
   return raw.byteLength;
 }
 
+async function readRequestBodyBuffer(body: NodeJS.ReadableStream, maxBytes: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of body as AsyncIterable<Buffer | Uint8Array | string>) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buffer.byteLength;
+    if (total > maxBytes) {
+      throw new FileUploadTooLargeError(maxBytes);
+    }
+    chunks.push(buffer);
+  }
+  return Buffer.concat(chunks, total);
+}
+
 function parseContentLength(value: string | string[] | undefined): number | undefined {
   const rawValue = Array.isArray(value) ? value[0] : value;
   if (rawValue === undefined) {
@@ -1391,6 +1442,24 @@ function parseContentLength(value: string | string[] | undefined): number | unde
   }
   const contentLength = Number(rawValue);
   return Number.isFinite(contentLength) && contentLength >= 0 ? contentLength : undefined;
+}
+
+function requiredQueryString(value: unknown, field: string): string {
+  const result = optionalQueryString(value);
+  if (!result) {
+    throwBadRequest(`${field} must be a non-empty string.`);
+  }
+  return result;
+}
+
+function optionalQueryString(value: unknown): string | undefined {
+  const raw = Array.isArray(value) ? value[0] : value;
+  return typeof raw === "string" && raw.trim() ? raw.trim() : undefined;
+}
+
+function optionalHeaderString(value: string | string[] | undefined): string | undefined {
+  const raw = Array.isArray(value) ? value[0] : value;
+  return raw?.trim() || undefined;
 }
 
 export function parseVoiceAudioControlMessage(raw: RawData): VoiceAudioControlMessage | undefined {

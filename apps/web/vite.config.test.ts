@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ProxyOptions, UserConfig } from "vite";
 
-import config from "./vite.config.js";
+import config, { devBackendOrigin, devBackendWebSocketTarget, devWebHost, devWebPort } from "./vite.config.js";
 
 describe("Vite dev proxy config", () => {
   it("uses a backend HTTP origin for proxied WebSocket handshakes", () => {
@@ -21,5 +21,19 @@ describe("Vite dev proxy config", () => {
 
     expect(wsProxy.target).toBe("wss://127.0.0.1:3001");
     expect(headers.get("origin")).toBe("https://127.0.0.1:3001");
+  });
+
+  it("can target an alternate backend and web port for isolated QA", () => {
+    const env = {
+      CLOUDX_DEV_BACKEND_ORIGIN: "https://127.0.0.1:4301/",
+      CLOUDX_WEB_HOST: "127.0.0.1",
+      CLOUDX_WEB_PORT: "5178"
+    } satisfies Partial<NodeJS.ProcessEnv>;
+
+    const origin = devBackendOrigin(env as NodeJS.ProcessEnv);
+    expect(origin).toBe("https://127.0.0.1:4301");
+    expect(devBackendWebSocketTarget(origin)).toBe("wss://127.0.0.1:4301");
+    expect(devWebHost(env as NodeJS.ProcessEnv)).toBe("127.0.0.1");
+    expect(devWebPort(env as NodeJS.ProcessEnv)).toBe(5178);
   });
 });

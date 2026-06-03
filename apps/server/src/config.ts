@@ -5,6 +5,7 @@ import { existsSync } from "node:fs";
 
 import { DEFAULT_VOICE_MODEL } from "@cloudx/shared";
 import { DEFAULT_ASR_TIMEOUT_MS, MAX_ASR_TIMEOUT_MS } from "./asrClient.js";
+import { DEFAULT_DOCUMENTATION_URL } from "./documentation/DocumentationClient.js";
 import { DEFAULT_TERMINAL_REPLAY_BYTES } from "./plugins/CodexTerminalPlugin.js";
 
 export const DEFAULT_CLOUDX_HOST = "127.0.0.1";
@@ -24,6 +25,7 @@ export interface AppConfig {
   automationStartDisabled: boolean;
   terminalReplayBytes: number;
   voiceAudioUploadMaxBytes: number;
+  documentationUrl?: string;
   voiceDebugTranscripts?: boolean;
   https?: {
     keyPath: string;
@@ -69,6 +71,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     automationStartDisabled: isTruthy(env.CLOUDX_AUTOMATION_START_DISABLED),
     terminalReplayBytes,
     voiceAudioUploadMaxBytes,
+    documentationUrl: env.CLOUDX_DOCUMENTATION_URL ?? DEFAULT_DOCUMENTATION_URL,
     voiceDebugTranscripts: isTruthy(env.CLOUDX_VOICE_DEBUG_TRANSCRIPTS),
     https
   };

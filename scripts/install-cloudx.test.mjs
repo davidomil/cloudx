@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   InstallerRunner,
+  PYTORCH_CPU_WHEEL_INDEX,
   cloudxAccessUrls,
   defaultCpuThreads,
   installUbuntuPrerequisites,
@@ -48,6 +49,8 @@ describe("install-cloudx helpers", () => {
 
     expect(commands[0]).toEqual(["sudo", "apt-get", "update"]);
     expect(commands[1]).toContain("build-essential");
+    expect(commands[1]).toContain("libreoffice");
+    expect(commands[1]).toContain("poppler-utils");
     expect(commands).toContainEqual(["sudo", "apt-get", "install", "-y", "nodejs"]);
     expect(commands).toContainEqual(["sh", "-lc", "command -v npm >/dev/null 2>&1 || sudo apt-get install -y npm"]);
     expect(commands).toContainEqual(["node", "-v"]);
@@ -197,6 +200,15 @@ describe("runInstaller dry-run", () => {
         ["node", "-v"],
         ["npm", "-v"],
         ["npm", "ci"],
+        ["python3", "-m", "venv", "--upgrade-deps", "/repo/services/documentation-indexer/.venv"],
+        [
+          "/repo/services/documentation-indexer/.venv/bin/pip",
+          "install",
+          "--extra-index-url",
+          PYTORCH_CPU_WHEEL_INDEX,
+          "-e",
+          "/repo/services/documentation-indexer[dev]"
+        ],
         ["/repo/services/asr/.venv/bin/hf", "download", "Systran/faster-whisper-large-v3", "--local-dir", "/home/me/.cache/cloudx/models/faster-whisper-large-v3"],
         ["npm", "run", "build"]
       ])
@@ -310,7 +322,8 @@ describe("runInstaller dry-run", () => {
         ["rm", "-rf", "/home/me/.config/systemd/user/cloudx.service"],
         ["rm", "-rf", "/home/me/.config/systemd/user/cloudx-asr.service"],
         ["rm", "-rf", "/home/me/.config/cloudx/cloudx.env"],
-        ["rm", "-rf", "/repo/services/asr/.venv"]
+        ["rm", "-rf", "/repo/services/asr/.venv"],
+        ["rm", "-rf", "/repo/services/documentation-indexer/.venv"]
       ])
     );
     expect(planned).not.toContainEqual(["rm", "-rf", "/home/me/.cache/cloudx/models/faster-whisper-large-v3"]);
@@ -391,6 +404,15 @@ describe("runInstaller dry-run", () => {
         ["npm", "i", "-g", "@openai/codex@latest"],
         ["npm", "ci"],
         [path.join(root, "services/asr/.venv/bin/pip"), "install", "-e", `${path.join(root, "services/asr")}[dev]`, "huggingface_hub[cli]"],
+        ["python3", "-m", "venv", "--upgrade-deps", path.join(root, "services/documentation-indexer/.venv")],
+        [
+          path.join(root, "services/documentation-indexer/.venv/bin/pip"),
+          "install",
+          "--extra-index-url",
+          PYTORCH_CPU_WHEEL_INDEX,
+          "-e",
+          `${path.join(root, "services/documentation-indexer")}[dev]`
+        ],
         ["npm", "run", "build"],
         ["npm", "run", "cert:create"],
         ["systemctl", "--user", "daemon-reload"],

@@ -63,6 +63,26 @@ describe("RulesSkillsCatalogService", () => {
     expect(after.mtimeMs).toBe(before.mtimeMs);
   });
 
+  it("stores plugin-contributed system skills beside built-in system skills", async () => {
+    const service = await createService();
+
+    const store = await service.saveSystemSkill({
+      id: "documentation-search",
+      name: "Documentation Search",
+      description: "Search the local documentation archive.",
+      instructions: "Read `CLOUDX_DOCUMENTATION_URL` before searching."
+    });
+
+    expect(store.systemSkills.map((skill) => skill.id)).toEqual([
+      "create-cloudx-skill",
+      "documentation-search",
+      "migrate-skill-to-cloudx"
+    ]);
+    const skillFile = await fs.readFile(path.join(service.catalogRoot(), "system-skills", "documentation-search", "SKILL.md"), "utf8");
+    expect(skillFile).toContain("CLOUDX_DOCUMENTATION_URL");
+    await expect(service.saveSkill({ id: "documentation-search", name: "User Shadow", description: "Shadow system skill." })).rejects.toThrow("system skill already exists");
+  });
+
   it("seeds catalog directories idempotently when concurrent reads create the same path", async () => {
     const service = await createService();
     const rulesPath = path.join(service.catalogRoot(), "rules");
@@ -375,7 +395,7 @@ describe("RulesSkillsCatalogService", () => {
     await expect(service.saveRule({ id: ".", description: "Invalid.", text: "Invalid rule id." })).rejects.toThrow("rule id");
     await expect(
       service.saveSkill({ id: "create-cloudx-skill", name: "Shadow", description: "Shadow system skill.", instructions: "No." }, { failIfExists: true })
-    ).rejects.toThrow("CloudX skill already exists: create-cloudx-skill");
+    ).rejects.toThrow("CloudX system skill already exists with the same id: create-cloudx-skill");
     await expect(service.migrateSkill({ sourcePath: path.join(os.tmpdir(), "missing-cloudx-skill") })).rejects.toThrow("Source skill does not exist");
   });
 });

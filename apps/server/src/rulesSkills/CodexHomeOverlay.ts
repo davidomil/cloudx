@@ -4,13 +4,14 @@ import os from "node:os";
 import path from "node:path";
 
 import {
-  CLOUDX_SYSTEM_SKILLS,
   cloudxSkillFilePath,
   cloudxSystemSkillFilePath,
   ensureCloudxSystemSkills,
+  listCloudxSystemSkills,
   rulesSkillsRootPath,
   type ResolvedPersonalityTemplate
 } from "./RulesSkillsCatalogService.js";
+import type { CloudxSkill } from "@cloudx/shared";
 
 export interface CodexHomeOverlayOptions {
   dataDir: string;
@@ -26,6 +27,7 @@ export interface CodexHomeOverlay {
   configPath: string;
   instructionsPath?: string;
   skillPaths: string[];
+  systemSkills: CloudxSkill[];
 }
 
 interface SkillMaterializationSource {
@@ -43,12 +45,13 @@ export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptio
   }
   await fsp.mkdir(codexHome, { recursive: true });
   await ensureCloudxSystemSkills(rulesSkillsRoot);
+  const systemSkills = await listCloudxSystemSkills(rulesSkillsRoot);
 
   await linkOrCopyIfExists(path.join(sourceCodexHome, "auth.json"), path.join(codexHome, "auth.json"));
   await linkOrCopyIfExists(path.join(sourceCodexHome, "rules"), path.join(codexHome, "rules"));
   await linkOrCopyIfExists(path.join(sourceCodexHome, "sessions"), path.join(codexHome, "sessions"));
 
-  const skillPaths = await materializeSelectedSkills(codexHome, rulesSkillsRoot, options.resolved);
+  const skillPaths = await materializeSelectedSkills(codexHome, rulesSkillsRoot, options.resolved, systemSkills);
   const configPath = path.join(codexHome, "config.toml");
   await writeOverlayConfig(path.join(sourceCodexHome, "config.toml"), configPath, skillPaths);
   const instructionsPath = await writeOverlayInstructions(sourceCodexHome, codexHome, options.resolved);
@@ -58,7 +61,8 @@ export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptio
     rulesSkillsRoot,
     configPath,
     instructionsPath,
-    skillPaths
+    skillPaths,
+    systemSkills
   };
 }
 
@@ -66,7 +70,12 @@ export function resolveCodexHome(env: NodeJS.ProcessEnv = process.env): string {
   return env.CODEX_HOME?.trim() || path.join(env.HOME?.trim() || os.homedir(), ".codex");
 }
 
-async function materializeSelectedSkills(codexHome: string, rulesSkillsRoot: string, resolved: ResolvedPersonalityTemplate | undefined): Promise<string[]> {
+async function materializeSelectedSkills(
+  codexHome: string,
+  rulesSkillsRoot: string,
+  resolved: ResolvedPersonalityTemplate | undefined,
+  systemSkills: CloudxSkill[]
+): Promise<string[]> {
   await fsp.rm(path.join(codexHome, "skills", "cloudx"), { recursive: true, force: true });
   await fsp.rm(path.join(codexHome, "skills", "cloudx-system"), { recursive: true, force: true });
   const sources = [
@@ -74,7 +83,7 @@ async function materializeSelectedSkills(codexHome: string, rulesSkillsRoot: str
       sourceDir: path.dirname(cloudxSkillFilePath(rulesSkillsRoot, skill.id)),
       targetDir: path.join(codexHome, "skills", "cloudx", safePathSegment(skill.id))
     })),
-    ...CLOUDX_SYSTEM_SKILLS.map((skill) => ({
+    ...systemSkills.map((skill) => ({
       sourceDir: path.dirname(cloudxSystemSkillFilePath(rulesSkillsRoot, skill.id)),
       targetDir: path.join(codexHome, "skills", "cloudx-system", safePathSegment(skill.id))
     }))

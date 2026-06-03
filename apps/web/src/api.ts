@@ -85,6 +85,10 @@ export interface FileUploadProgress {
   lengthComputable: boolean;
 }
 
+export interface DocumentationUploadResponse {
+  document?: Record<string, unknown>;
+}
+
 export async function downloadFileBrowserEntries(tabId: string, relativePaths: string[]): Promise<FileDownloadResponse> {
   const response = await fetch(`/api/tabs/${encodeURIComponent(tabId)}/files/download`, {
     method: "POST",
@@ -142,6 +146,30 @@ export async function uploadFileBrowserFile(tabId: string, relativePath: string,
   });
 }
 
+export async function uploadDocumentationFile(input: {
+  file: File;
+  title?: string;
+  sourceType?: string;
+  collection?: string;
+}): Promise<DocumentationUploadResponse> {
+  const params = new URLSearchParams({ filename: input.file.name });
+  appendOptionalSearchParam(params, "title", input.title);
+  appendOptionalSearchParam(params, "sourceType", input.sourceType);
+  appendOptionalSearchParam(params, "collection", input.collection);
+  const response = await fetch(`/api/documentation/upload?${params.toString()}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/octet-stream",
+      "x-cloudx-file-content-type": input.file.type || "application/octet-stream"
+    },
+    body: input.file
+  });
+  if (!response.ok) {
+    throw new Error(errorMessageFromResponse(await response.text(), response.status));
+  }
+  return (await response.json()) as DocumentationUploadResponse;
+}
+
 export function saveBlobDownload(blob: Blob, filename: string): void {
   const objectUrl = URL.createObjectURL(blob);
   const link = document.createElement("a");
@@ -151,6 +179,12 @@ export function saveBlobDownload(blob: Blob, filename: string): void {
   link.click();
   link.remove();
   window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+}
+
+function appendOptionalSearchParam(params: URLSearchParams, name: string, value: string | undefined): void {
+  if (value?.trim()) {
+    params.set(name, value.trim());
+  }
 }
 
 export function filenameFromContentDisposition(value: string | null): string | undefined {

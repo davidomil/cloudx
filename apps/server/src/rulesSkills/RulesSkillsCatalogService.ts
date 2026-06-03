@@ -195,10 +195,26 @@ export class RulesSkillsCatalogService {
       const skillDir = this.skillPath(skill.id);
       await this.ensureSeeded();
       await requireCatalogDirectory(this.skillsPath(), this.rootPath);
-      if (options.failIfExists && ((await pathExists(skillDir)) || CLOUDX_SYSTEM_SKILLS.some((systemSkill) => systemSkill.id === skill.id))) {
+      if (await pathExists(this.systemSkillPath(skill.id))) {
+        throw new Error(`CloudX system skill already exists with the same id: ${skill.id}`);
+      }
+      if (options.failIfExists && (await pathExists(skillDir))) {
         throw new Error(`CloudX skill already exists: ${skill.id}`);
       }
       await writeSkillFile(skillDir, skill, this.rootPath);
+      this.emitChange();
+      return this.readStore();
+    });
+  }
+
+  async saveSystemSkill(input: Record<string, unknown>): Promise<RulesSkillsStore> {
+    return this.withCatalogMutation(async () => {
+      const skill = { ...normalizeSkill({ ...input, scope: "system" }), scope: "system" as const };
+      await this.ensureSeeded();
+      if (await pathExists(this.skillPath(skill.id))) {
+        throw new Error(`CloudX user skill already exists with the same id: ${skill.id}`);
+      }
+      await writeSystemSkillFileAtomic(this.systemSkillPath(skill.id), skill, this.rootPath);
       this.emitChange();
       return this.readStore();
     });
@@ -218,7 +234,7 @@ export class RulesSkillsCatalogService {
       const skillDir = this.skillPath(skill.id);
       await this.ensureSeeded();
       await requireCatalogDirectory(this.skillsPath(), this.rootPath);
-      if ((await pathExists(skillDir)) || CLOUDX_SYSTEM_SKILLS.some((systemSkill) => systemSkill.id === skill.id)) {
+      if ((await pathExists(skillDir)) || (await pathExists(this.systemSkillPath(skill.id)))) {
         throw new Error(`CloudX skill already exists: ${skill.id}`);
       }
       await ensureCatalogDirectory(skillDir, this.rootPath);
@@ -300,7 +316,8 @@ export class RulesSkillsCatalogService {
   private async readStore(): Promise<RulesSkillsStore> {
     const settings = asRecord(await readJson(this.settingsPath(), this.rootPath));
     const rules = await readRules(this.rulesPath());
-    const skills = await readSkills(this.skillsPath());
+    const skills = await readSkills(this.skillsPath(), "user");
+    const systemSkills = await readSkills(this.systemSkillsPath(), "system");
     const templates = await readTemplates(this.templatesPath());
     const defaultTemplateId = typeof settings.defaultTemplateId === "string" && templates.some((template) => template.id === settings.defaultTemplateId)
       ? settings.defaultTemplateId
@@ -309,7 +326,7 @@ export class RulesSkillsCatalogService {
       defaultTemplateId,
       rules,
       skills,
-      systemSkills: CLOUDX_SYSTEM_SKILLS,
+      systemSkills,
       templates
     };
   }
@@ -343,6 +360,10 @@ export class RulesSkillsCatalogService {
     return path.join(this.rootPath, "skills");
   }
 
+  private systemSkillsPath(): string {
+    return path.join(this.rootPath, "system-skills");
+  }
+
   private templatesPath(): string {
     return path.join(this.rootPath, "templates");
   }
@@ -353,6 +374,10 @@ export class RulesSkillsCatalogService {
 
   private skillPath(skillId: string): string {
     return path.join(this.skillsPath(), assertSafeId(skillId, "skill id"));
+  }
+
+  private systemSkillPath(skillId: string): string {
+    return path.dirname(cloudxSystemSkillFilePath(this.rootPath, skillId));
   }
 
   private templatePath(templateId: string): string {
@@ -385,6 +410,11 @@ export async function ensureCloudxSystemSkills(rulesSkillsRoot: string): Promise
       instructions: SYSTEM_SKILL_INSTRUCTIONS[skill.id] ?? `# ${skill.name}\n\n${skill.description}`
     }, rulesSkillsRoot);
   }
+}
+
+export async function listCloudxSystemSkills(rulesSkillsRoot: string): Promise<CloudxSkill[]> {
+  await ensureCloudxSystemSkills(rulesSkillsRoot);
+  return readSkills(path.join(rulesSkillsRoot, "system-skills"), "system");
 }
 
 export function templateMetadata(templateId: string | undefined): PluginMetadata | null {
@@ -440,13 +470,13 @@ async function readRule(filePath: string, catalogRoot: string): Promise<CloudxRu
   };
 }
 
-async function readSkills(skillsPath: string): Promise<CloudxSkill[]> {
+async function readSkills(skillsPath: string, scope: CloudxSkill["scope"] = "user"): Promise<CloudxSkill[]> {
   const entries = await readDirectoryEntries(skillsPath);
-  const skills = await Promise.all(entries.filter((entry) => entry.isDirectory()).map((entry) => readSkill(path.join(skillsPath, entry.name))));
+  const skills = await Promise.all(entries.filter((entry) => entry.isDirectory()).map((entry) => readSkill(path.join(skillsPath, entry.name), scope)));
   return skills.sort(byId);
 }
 
-async function readSkill(skillPath: string): Promise<CloudxSkill> {
+async function readSkill(skillPath: string, scope: CloudxSkill["scope"]): Promise<CloudxSkill> {
   const instructionsPath = path.join(skillPath, "SKILL.md");
   let instructions: string;
   try {
@@ -466,7 +496,8 @@ async function readSkill(skillPath: string): Promise<CloudxSkill> {
     id,
     name: parsed.frontmatter.cloudx_name || parsed.frontmatter.name || titleFromId(id),
     description: parsed.frontmatter.description,
-    instructions
+    instructions,
+    scope
   });
 }
 
@@ -526,6 +557,22 @@ function formatRule(rule: CloudxRule): string {
 async function writeSkillFile(skillDir: string, skill: CloudxSkill, catalogRoot: string): Promise<void> {
   await ensureCatalogDirectory(skillDir, catalogRoot);
   await writeUtf8FileIfChanged(path.join(skillDir, "SKILL.md"), formatSkill(skill), catalogRoot);
+}
+
+async function writeSystemSkillFileAtomic(skillDir: string, skill: CloudxSkill, catalogRoot: string): Promise<void> {
+  if (await pathExists(skillDir)) {
+    await writeSkillFile(skillDir, skill, catalogRoot);
+    return;
+  }
+  const stagingDir = path.join(catalogRoot, ".system-skill-staging", `${skill.id}.${process.pid}.${randomUUID()}`);
+  try {
+    await writeSkillFile(stagingDir, skill, catalogRoot);
+    await ensureCatalogDirectory(path.dirname(skillDir), catalogRoot);
+    await fsp.rename(stagingDir, skillDir);
+  } catch (error) {
+    await fsp.rm(stagingDir, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 function formatSkill(skill: CloudxSkill): string {

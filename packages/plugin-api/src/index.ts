@@ -2,6 +2,7 @@ import {
   UI_RENDERER_STATUS_DOT,
   type ConfigFieldDescriptor,
   type ConfigValue,
+  type CloudxSkill,
   type HookDescriptor,
   type HookId,
   type HookOwner,
@@ -123,6 +124,10 @@ export interface PluginSession {
   onStatusChange?(listener: (status: WorkspaceTab["status"], message?: string) => void): () => void;
 }
 
+export type PluginSkillContribution = Omit<CloudxSkill, "scope"> & {
+  scope?: "system";
+};
+
 export interface CreatePluginSessionInput {
   tab: WorkspaceTab;
   cwd: string;
@@ -158,6 +163,7 @@ export interface WorkspacePlugin {
   actions: PluginActionDefinition[];
   hooks?: HookDefinition[];
   triggers?: TriggerDefinition[];
+  skillContributions?: PluginSkillContribution[];
   uiContributions?: UiContributionDescriptor[];
   configFields?: ConfigFieldDescriptor[];
   defaultTitleContext?(input: { cwd: string; initialInput?: Record<string, unknown> }): string | undefined;

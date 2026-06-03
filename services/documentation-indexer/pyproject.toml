@@ -1,0 +1,38 @@
+[project]
+name = "cloudx-documentation-indexer"
+version = "0.1.0"
+description = "Portable Turbovec-backed documentation archive and retrieval service for Cloudx"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+  "beautifulsoup4>=4.14",
+  "docling>=2.70,<3",
+  "fastapi>=0.115",
+  "httpx>=0.28",
+  "numpy>=2.0",
+  "pandas>=2.3",
+  "pdfplumber>=0.11.9,<0.12",
+  "pillow>=12.0",
+  "pydantic>=2.10",
+  "pypdfium2>=5.9,<6",
+  "python-multipart>=0.0.9",
+  "turbovec==0.7.0",
+  "uvicorn[standard]>=0.30",
+  "youtube-transcript-api>=1.2"
+]
+
+[project.scripts]
+cloudx-documentation-indexer = "cloudx_documentation_indexer.main:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "reportlab>=4.5"
+]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

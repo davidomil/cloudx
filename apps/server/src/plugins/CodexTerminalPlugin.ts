@@ -285,7 +285,7 @@ export function buildCodexRuntimeUpdatePrompt(resolved: ResolvedPersonalityTempl
   }
 
   lines.push("", "CloudX system skills:");
-  lines.push(...CLOUDX_SYSTEM_SKILLS.map((skill) => `- $${skill.id}: ${skill.name} - ${skill.description}${skillPathSuffix(overlay, skill.id, true)}`));
+  lines.push(...(overlay?.systemSkills ?? CLOUDX_SYSTEM_SKILLS).map((skill) => `- $${skill.id}: ${skill.name} - ${skill.description}${skillPathSuffix(overlay, skill.id, true)}`));
   lines.push(
     "",
     "Skill loading rule: prefer using the listed CloudX skills whenever they fit the user's task. If the user invokes one with $skill-name, or if a task clearly matches a listed skill, read that skill's SKILL.md before acting. Treat the listed CloudX skills as available even if the Codex TUI skill list has not refreshed.",
