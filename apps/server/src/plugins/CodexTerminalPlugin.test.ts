@@ -137,6 +137,7 @@ describe("CodexTerminalPlugin", () => {
     await fs.mkdir(path.join(codexHome, "sessions", "2026", "05", "15"), { recursive: true });
     await fs.writeFile(path.join(codexHome, "sessions", "2026", "05", "15", "rollout-session.jsonl"), "session\n", "utf8");
     await seedSkill(dataDir, "code-review", "Code Review", "Review code.", "Code review skill instructions.");
+    await seedSystemRule(dataDir, "documentation-ingest-evidence", "Ingest evidence.", "Download evidence into the documentation archive.");
     await seedSystemSkill(dataDir, "documentation-search", "Documentation Search", "Search documentation.", "Documentation search skill instructions.");
     const factory = new CapturingFactory();
     const plugin = new CodexTerminalPlugin(factory, DEFAULT_TERMINAL_REPLAY_BYTES, dataDir);
@@ -174,6 +175,7 @@ describe("CodexTerminalPlugin", () => {
       CLOUDX_PERSONALITY_TEMPLATE_ID: "review",
       CLOUDX_PERSONALITY_TEMPLATE_NAME: "Review",
       CLOUDX_PERSONALITY_INJECTION: "codex-home-overlay",
+      CLOUDX_SYSTEM_RULE_IDS: "documentation-ingest-evidence",
       CLOUDX_ENABLED_RULE_IDS: "review-carefully",
       CLOUDX_ENABLED_SKILL_IDS: "code-review"
     });
@@ -188,6 +190,8 @@ describe("CodexTerminalPlugin", () => {
     await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx-system", "documentation-search", "SKILL.md"), "utf8")).resolves.toContain("Documentation search skill instructions.");
     const overlayInstructions = await fs.readFile(path.join(factory.env!.CODEX_HOME!, "AGENTS.override.md"), "utf8");
     expect(overlayInstructions).toContain("Prefer direct answers.");
+    expect(overlayInstructions).toContain("CloudX System Rules");
+    expect(overlayInstructions).toContain("Download evidence into the documentation archive.");
     expect(overlayInstructions).toContain("Review carefully.");
     await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "sessions", "2026", "05", "15", "rollout-session.jsonl"), "utf8")).resolves.toBe("session\n");
   });
@@ -301,6 +305,7 @@ describe("CodexTerminalPlugin", () => {
     const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-live-home-"));
     vi.stubEnv("CODEX_HOME", codexHome);
     await seedSkill(dataDir, "tester", "Tester", "Tester skill.", "Tester skill instructions.");
+    await seedSystemRule(dataDir, "documentation-ingest-evidence", "Ingest evidence.", "Download evidence into the documentation archive.");
     await seedSystemSkill(dataDir, "documentation-search", "Documentation Search", "Search documentation.", "Documentation search skill instructions.");
     const factory = new CapturingFactory();
     const plugin = new CodexTerminalPlugin(factory, DEFAULT_TERMINAL_REPLAY_BYTES, dataDir);
@@ -324,6 +329,8 @@ describe("CodexTerminalPlugin", () => {
     expect(result).toMatchObject({ applied: true, templateId: "test", templateName: "Test" });
     expect(factory.process!.written).toContain("\u001b[200~CloudX rules/skills update");
     expect(factory.process!.written).toContain("Be specific about changed files.");
+    expect(factory.process!.written).toContain("CloudX system rules:");
+    expect(factory.process!.written).toContain("Download evidence into the documentation archive.");
     expect(factory.process!.written).toContain("$tester: Tester - Tester skill.");
     expect(factory.process!.written).toContain("prefer using the listed CloudX skills whenever they fit the user's task");
     expect(factory.process!.written).toContain(path.join(dataDir, "rules-skills", "skills", "tester", "SKILL.md"));
@@ -582,6 +589,12 @@ async function seedSkill(dataDir: string, id: string, name: string, description:
     `---\nname: "${id}"\ndescription: "${description}"\ncloudx_name: "${name}"\n---\n\n${body}\n`,
     "utf8"
   );
+}
+
+async function seedSystemRule(dataDir: string, id: string, description: string, text: string): Promise<void> {
+  const ruleDir = path.join(dataDir, "rules-skills", "system-rules");
+  await fs.mkdir(ruleDir, { recursive: true });
+  await fs.writeFile(path.join(ruleDir, `${id}.md`), `---\nid: ${id}\ndescription: ${description}\n---\n${text}\n`, "utf8");
 }
 
 async function seedSystemSkill(dataDir: string, id: string, name: string, description: string, body: string): Promise<void> {

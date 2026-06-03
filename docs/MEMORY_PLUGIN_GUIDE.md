@@ -35,8 +35,9 @@ The request path has five layers:
 4.  The indexer extracts content, stores source snapshots, updates
     SQLite and FTS5, and rebuilds the Turbovec index when active chunks
     change.
-5.  Codex tabs receive the documentation skills automatically through
-    the same CloudX system-skill overlay path used by built-in skills.
+5.  Codex tabs receive the documentation system rule and skills
+    automatically through the CloudX overlay path used by built-in rules
+    and skills.
 
 The browser UI and other CloudX surfaces do not directly mutate archive
 files. They call plugin hooks such as `documentation.search`,
@@ -57,7 +58,7 @@ Source: `apps/server/src/plugins/DocumentationPlugin.ts`
 
 Registers the `documentation` plugin, exposes hooks, contributes the UI
 renderer, enforces path policy for local path ingest, and declares
-default documentation skills as automatic CloudX system-skill
+default documentation rules and skills as automatic CloudX system
 contributions.
 
 ## HTTP Client
@@ -337,7 +338,14 @@ operational view:
 The UI defaults search state to `active`, ingest mode to upload, source
 type to `auto`, and search mode to `hybrid`.
 
-# Default Skills
+# Default Rule And Skills
+
+The plugin contributes this universal CloudX system rule automatically at
+server startup:
+
+| Rule | Purpose |
+|----|----|
+| `documentation-ingest-evidence` | Download or otherwise capture task evidence such as datasheets, sample code, vendor documentation, screenshots, flowcharts, API references, and local notes into the documentation knowledge base before relying on it; preserve precise metadata and invalidate older conflicting records. |
 
 The plugin contributes four CloudX system skills automatically at server
 startup:
@@ -353,13 +361,15 @@ Each skill tells Codex to read `CLOUDX_DOCUMENTATION_URL` first. When
 Codex tabs are launched from CloudX, the server exports that URL to
 child processes.
 
-The injection path is generic. Plugins expose a `skillContributions`
-array, `syncPluginSkillContributions` writes those skills into the
-CloudX system-skill catalog, and each Codex home overlay materializes
-all system skills under `skills/cloudx-system/`. A future plugin should
-follow the same pattern: use skill IDs prefixed with the plugin ID,
-provide a complete `SKILL.md` body through the contribution, and let the
-catalog and overlay handle availability for every Codex tab.
+The injection path is generic. Plugins expose `ruleContributions` and
+`skillContributions`, `syncPluginContributions` writes them into the
+CloudX `system-rules/` and `system-skills/` catalogs, and each Codex home
+overlay materializes all system rules into `AGENTS.override.md` plus all
+system skills under `skills/cloudx-system/`. A future plugin should
+follow the same pattern: use IDs prefixed with the plugin ID, provide a
+single-line rule text or complete `SKILL.md` body through the
+contribution, and let the catalog and overlay handle availability for
+every Codex tab.
 
 # Setup And Operations
 
@@ -404,6 +414,19 @@ Run rebuild after restore when active document states changed, the
 service version changed, or you want to prove the Turbovec file can be
 reconstructed from SQLite chunks.
 
+# Rendering This PDF
+
+The Ubuntu installer installs the render toolchain used for this guide:
+Quarto `1.9.38`, Pandoc, and TeX Live's XeLaTeX/LuaLaTeX engines.
+Regenerate the PDF from the Quarto source with:
+
+``` bash
+npm run docs:memory:pdf
+```
+
+That command reads `docs/MEMORY_PLUGIN_GUIDE.qmd` and writes
+`docs/MEMORY_PLUGIN_GUIDE.pdf`.
+
 # What Is Tested
 
 The indexer tests cover:
@@ -420,11 +443,11 @@ The indexer tests cover:
 
 The server plugin tests cover hook registration, safety classes, local
 path policy enforcement, browser upload forwarding, automatic plugin
-system-skill contributions, generic plugin contribution validation, and
-Codex overlay injection. The web panel tests cover upload ingest,
-visible text ingest, and search hook calls. The client tests cover JSON
-POST behavior, multipart upload behavior, browser upload request
-construction, and propagation of service error messages.
+system-rule and system-skill contributions, generic plugin contribution
+validation, and Codex overlay injection. The web panel tests cover upload
+ingest, visible text ingest, and search hook calls. The client tests
+cover JSON POST behavior, multipart upload behavior, browser upload
+request construction, and propagation of service error messages.
 
 A realistic validation runner in
 `debug_tooling/documentation-validation/run_validation.py` downloads or
@@ -480,4 +503,5 @@ PYTHONPATH=services/documentation-indexer/src \
   services/documentation-indexer/.venv/bin/python \
   debug_tooling/documentation-validation/run_validation.py \
   --root /tmp/cloudx-documentation-validation --mock-count 2500 --skip-download
+npm run docs:memory:pdf
 ```

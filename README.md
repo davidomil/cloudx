@@ -78,15 +78,17 @@ cd cloudx
 
 It shows each phase before running it. The bootstrap stage installs Ubuntu
 packages, including the PDF and spreadsheet extraction tools used by the
-documentation archive, installs Node.js 22 when needed, verifies both `node -v`
-and `npm -v`, and falls back to Ubuntu's `npm` package if npm is still missing.
-The wizard then installs Cloudx npm dependencies, installs and checks Codex CLI,
-prepares the Faster Whisper ASR environment, prepares the documentation archive
-indexer environment, downloads the local ASR model, writes Cloudx config, and
-optionally installs user-level systemd services. Each question includes a short
-explanation of what the choice changes, and the installer prints the local
-Cloudx URL when it finishes. Add `--lan` only when you want Cloudx to bind to
-`0.0.0.0` for a trusted LAN or tailnet.
+documentation archive plus the Quarto, Pandoc, and TeX Live toolchain used to
+render the memory-plugin PDF guide. It then installs Node.js 22 when needed,
+verifies `node -v` and `npm -v`, and falls back to Ubuntu's `npm` package if
+npm is still missing. The wizard then installs Cloudx npm dependencies,
+installs and checks Codex CLI, prepares the Faster Whisper ASR environment,
+prepares the documentation archive indexer environment, downloads the local ASR
+model, writes Cloudx config, and optionally installs user-level systemd
+services. Each question includes a short explanation of what the choice
+changes, and the installer prints the local Cloudx URL when it finishes. Add
+`--lan` only when you want Cloudx to bind to `0.0.0.0` for a trusted LAN or
+tailnet.
 
 Preview the installer without changing the system:
 
@@ -155,6 +157,12 @@ backup manifest.
 The documentation archive is portable as one directory. Stop writes, then back
 up `.cloudx/documentation` or the directory named by
 `CLOUDX_DOCUMENTATION_DATA_DIR`.
+
+Render the memory plugin PDF guide after documentation changes:
+
+```bash
+npm run docs:memory:pdf
+```
 
 If the signed-in Codex account cannot use the configured planner model, disable
 Settings > Global > Voice commands. This hides typed and microphone voice

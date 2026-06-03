@@ -44,7 +44,7 @@ import { NotificationsPlugin } from "./plugins/NotificationsPlugin.js";
 import { PluginDataStore } from "./plugins/PluginDataStore.js";
 import { RulesSkillsPlugin } from "./plugins/RulesSkillsPlugin.js";
 import { DocumentationPlugin } from "./plugins/DocumentationPlugin.js";
-import { syncPluginSkillContributions } from "./plugins/pluginSkillContributions.js";
+import { syncPluginContributions } from "./plugins/pluginContributions.js";
 import { SessionStore } from "./sessionStore.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
 import { RulesSkillsCatalogService } from "./rulesSkills/RulesSkillsCatalogService.js";
@@ -84,7 +84,7 @@ export interface AppServices {
   fileTransfer?: FileTransferService;
   notifications?: NotificationsPlugin;
   documentation?: DocumentationClient;
-  pluginSkillContributionsReady?: Promise<RulesSkillsStore>;
+  pluginContributionsReady?: Promise<RulesSkillsStore>;
 }
 
 const MIN_STREAMED_AUDIO_BYTES = 128;
@@ -892,12 +892,12 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
       await sessions?.refreshRuntimeIndicators();
     })();
   });
-  const pluginSkillContributionsReady = syncPluginSkillContributions(plugins.values(), rulesSkills).then(async (store) => {
-    await sessions?.applyRuntimeContexts((tab) => tab.pluginId === "codex-terminal", "Injecting plugin-contributed system skills.");
+  const pluginContributionsReady = syncPluginContributions(plugins.values(), rulesSkills).then(async (store) => {
+    await sessions?.applyRuntimeContexts((tab) => tab.pluginId === "codex-terminal", "Injecting plugin-contributed system rules and skills.");
     return store;
   });
-  void pluginSkillContributionsReady.catch((error) => {
-    logger?.error({ err: error }, "Failed to sync plugin skill contributions.");
+  void pluginContributionsReady.catch((error) => {
+    logger?.error({ err: error }, "Failed to sync plugin contributions.");
   });
   const asr = new AsrClient(config.asrUrl, { timeoutMs: config.asrTimeoutMs });
   let voice: VoiceController | undefined;
@@ -922,7 +922,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   registerPluginTriggers(triggers, plugins);
   sessions.setTriggerRegistry(triggers);
   automation = createAutomationService(automationRepository, { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config);
-  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, automation, pluginData, rulesSkills, fileTransfer, notifications, documentation, pluginSkillContributionsReady };
+  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, automation, pluginData, rulesSkills, fileTransfer, notifications, documentation, pluginContributionsReady };
 }
 
 export function serializeRequestForLog(request: Pick<FastifyRequest, "method" | "url" | "hostname" | "ip" | "socket">): {

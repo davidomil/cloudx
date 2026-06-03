@@ -67,6 +67,8 @@ export const CLOUDX_SYSTEM_SKILLS: CloudxSkill[] = [
   }
 ];
 
+export const CLOUDX_SYSTEM_RULES: CloudxRule[] = [];
+
 const SYSTEM_SKILL_INSTRUCTIONS: Record<string, string> = {
   "create-cloudx-skill": [
     "# Create CloudX Skill",
@@ -168,7 +170,23 @@ export class RulesSkillsCatalogService {
     return this.withCatalogMutation(async () => {
       const rule = normalizeRule(input);
       await this.ensureSeeded();
+      if (await pathExists(this.systemRulePath(rule.id))) {
+        throw new Error(`CloudX system rule already exists with the same id: ${rule.id}`);
+      }
       await writeUtf8FileAtomic(this.rulePath(rule.id), formatRule(rule), this.rootPath);
+      this.emitChange();
+      return this.readStore();
+    });
+  }
+
+  async saveSystemRule(input: Record<string, unknown>): Promise<RulesSkillsStore> {
+    return this.withCatalogMutation(async () => {
+      const rule = { ...normalizeRule({ ...input, scope: "system" }), scope: "system" as const };
+      await this.ensureSeeded();
+      if (await pathExists(this.rulePath(rule.id))) {
+        throw new Error(`CloudX user rule already exists with the same id: ${rule.id}`);
+      }
+      await writeUtf8FileAtomic(this.systemRulePath(rule.id), formatRule(rule), this.rootPath);
       this.emitChange();
       return this.readStore();
     });
@@ -316,6 +334,7 @@ export class RulesSkillsCatalogService {
   private async readStore(): Promise<RulesSkillsStore> {
     const settings = asRecord(await readJson(this.settingsPath(), this.rootPath));
     const rules = await readRules(this.rulesPath());
+    const systemRules = await readRules(this.systemRulesPath(), "system");
     const skills = await readSkills(this.skillsPath(), "user");
     const systemSkills = await readSkills(this.systemSkillsPath(), "system");
     const templates = await readTemplates(this.templatesPath());
@@ -325,6 +344,7 @@ export class RulesSkillsCatalogService {
     return {
       defaultTemplateId,
       rules,
+      systemRules,
       skills,
       systemSkills,
       templates
@@ -333,6 +353,7 @@ export class RulesSkillsCatalogService {
 
   private async ensureSeeded(): Promise<void> {
     await ensureCatalogDirectory(this.rulesPath(), this.rootPath);
+    await ensureCloudxSystemRules(this.rootPath);
     await ensureCatalogDirectory(this.skillsPath(), this.rootPath);
     await ensureCatalogDirectory(this.templatesPath(), this.rootPath);
     await ensureCloudxSystemSkills(this.rootPath);
@@ -356,6 +377,10 @@ export class RulesSkillsCatalogService {
     return path.join(this.rootPath, "rules");
   }
 
+  private systemRulesPath(): string {
+    return path.join(this.rootPath, "system-rules");
+  }
+
   private skillsPath(): string {
     return path.join(this.rootPath, "skills");
   }
@@ -370,6 +395,10 @@ export class RulesSkillsCatalogService {
 
   private rulePath(ruleId: string): string {
     return path.join(this.rulesPath(), `${assertSafeId(ruleId, "rule id")}.md`);
+  }
+
+  private systemRulePath(ruleId: string): string {
+    return cloudxSystemRuleFilePath(this.rootPath, ruleId);
   }
 
   private skillPath(skillId: string): string {
@@ -399,8 +428,24 @@ export function cloudxSkillFilePath(rulesSkillsRoot: string, skillId: string): s
   return path.join(rulesSkillsRoot, "skills", assertSafeId(skillId, "skill id"), "SKILL.md");
 }
 
+export function cloudxSystemRuleFilePath(rulesSkillsRoot: string, ruleId: string): string {
+  return path.join(rulesSkillsRoot, "system-rules", `${assertSafeId(ruleId, "rule id")}.md`);
+}
+
 export function cloudxSystemSkillFilePath(rulesSkillsRoot: string, skillId: string): string {
   return path.join(rulesSkillsRoot, "system-skills", assertSafeId(skillId, "skill id"), "SKILL.md");
+}
+
+export async function ensureCloudxSystemRules(rulesSkillsRoot: string): Promise<void> {
+  await ensureCatalogDirectory(path.join(rulesSkillsRoot, "system-rules"), rulesSkillsRoot);
+  for (const rule of CLOUDX_SYSTEM_RULES) {
+    await writeUtf8FileIfChanged(cloudxSystemRuleFilePath(rulesSkillsRoot, rule.id), formatRule({ ...rule, scope: "system" }), rulesSkillsRoot);
+  }
+}
+
+export async function listCloudxSystemRules(rulesSkillsRoot: string): Promise<CloudxRule[]> {
+  await ensureCloudxSystemRules(rulesSkillsRoot);
+  return readRules(path.join(rulesSkillsRoot, "system-rules"), "system");
 }
 
 export async function ensureCloudxSystemSkills(rulesSkillsRoot: string): Promise<void> {
@@ -449,13 +494,17 @@ function validateTemplateReferences(template: PersonalityTemplate, store: RulesS
   byIds(template.skillIds, store.skills, "skill", template.id);
 }
 
-async function readRules(rulesPath: string): Promise<CloudxRule[]> {
+async function readRules(rulesPath: string, scope: CloudxRule["scope"] = "user"): Promise<CloudxRule[]> {
   const files = await readDirectoryEntries(rulesPath);
-  const rules = await Promise.all(files.filter((entry) => entry.isFile() && entry.name.endsWith(".md")).map((entry) => readRule(path.join(rulesPath, entry.name), path.dirname(rulesPath))));
+  const rules = await Promise.all(
+    files
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
+      .map((entry) => readRule(path.join(rulesPath, entry.name), path.dirname(rulesPath), scope))
+  );
   return rules.sort(byId);
 }
 
-async function readRule(filePath: string, catalogRoot: string): Promise<CloudxRule> {
+async function readRule(filePath: string, catalogRoot: string, scope: CloudxRule["scope"]): Promise<CloudxRule> {
   const content = await readUtf8CatalogFile(filePath, catalogRoot);
   const parsed = parseMarkdownWithFrontmatter(content);
   const id = assertSafeId(parsed.frontmatter.id || path.basename(filePath, ".md"), "rule id");
@@ -466,7 +515,8 @@ async function readRule(filePath: string, catalogRoot: string): Promise<CloudxRu
   return {
     id,
     description: parsed.frontmatter.description || text,
-    text
+    text,
+    scope
   };
 }
 
@@ -773,7 +823,8 @@ function normalizeRule(value: unknown): CloudxRule {
   return {
     id: assertSafeId(typeof source.id === "string" ? source.id.trim() : slugFromText(text), "rule id"),
     description: typeof source.description === "string" && source.description.trim() ? singleLine(source.description) : text,
-    text
+    text,
+    scope: source.scope === "system" ? "system" : "user"
   };
 }
 

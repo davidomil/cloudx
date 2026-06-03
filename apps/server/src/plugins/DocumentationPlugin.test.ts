@@ -54,6 +54,10 @@ describe("DocumentationPlugin", () => {
     const plugin = new DocumentationPlugin(fakeClient(), new PathPolicy(["/tmp"]));
 
     expect(plugin.hooks.some((hook) => hook.id === "documentation.skills.installDefaults")).toBe(false);
+    expect(plugin.ruleContributions.map((rule) => rule.id)).toEqual([
+      "documentation-ingest-evidence"
+    ]);
+    expect(plugin.ruleContributions[0]?.text).toContain("add it to the CloudX documentation knowledge base");
     expect(plugin.skillContributions.map((skill) => skill.id)).toEqual([
       "documentation-search",
       "documentation-ingest",

@@ -23,6 +23,7 @@ describe("RulesSkillsCatalogService", () => {
 
     expect(store.templates.map((template) => template.id)).toContain("focused");
     expect(store.rules.map((rule) => rule.id)).toContain("review-carefully");
+    expect(store.systemRules).toEqual([]);
     expect(store.skills.find((skill) => skill.id === "reviewer")?.instructions).toContain("Reviewer skill instructions.");
     expect(store.systemSkills.map((skill) => skill.id)).toEqual(["create-cloudx-skill", "migrate-skill-to-cloudx"]);
     const skillFile = await fs.readFile(path.join(service.catalogRoot(), "skills", "reviewer", "SKILL.md"), "utf8");
@@ -81,6 +82,26 @@ describe("RulesSkillsCatalogService", () => {
     const skillFile = await fs.readFile(path.join(service.catalogRoot(), "system-skills", "documentation-search", "SKILL.md"), "utf8");
     expect(skillFile).toContain("CLOUDX_DOCUMENTATION_URL");
     await expect(service.saveSkill({ id: "documentation-search", name: "User Shadow", description: "Shadow system skill." })).rejects.toThrow("system skill already exists");
+  });
+
+  it("stores plugin-contributed system rules separately from user rules", async () => {
+    const service = await createService();
+
+    const store = await service.saveSystemRule({
+      id: "documentation-ingest-evidence",
+      description: "Capture task evidence.",
+      text: "Download task evidence and add it to the documentation archive."
+    });
+
+    expect(store.rules.map((rule) => rule.id)).toEqual(["keep-changes-focused"]);
+    expect(store.systemRules).toContainEqual(expect.objectContaining({
+      id: "documentation-ingest-evidence",
+      scope: "system",
+      text: "Download task evidence and add it to the documentation archive."
+    }));
+    const ruleFile = await fs.readFile(path.join(service.catalogRoot(), "system-rules", "documentation-ingest-evidence.md"), "utf8");
+    expect(ruleFile).toContain("Download task evidence");
+    await expect(service.saveRule({ id: "documentation-ingest-evidence", description: "Shadow.", text: "Shadow rule." })).rejects.toThrow("system rule already exists");
   });
 
   it("seeds catalog directories idempotently when concurrent reads create the same path", async () => {

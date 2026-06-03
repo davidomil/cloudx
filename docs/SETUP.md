@@ -11,6 +11,8 @@ to run Cloudx with voice control.
 - ripgrep (`rg`) for file-browser search.
 - Poppler utilities and LibreOffice for documentation archive PDF, table,
   image, and spreadsheet extraction. The Ubuntu installer installs these.
+- Quarto, Pandoc, and TeX Live XeLaTeX/LuaLaTeX engines for rendering the
+  memory-plugin guide PDF. The Ubuntu installer installs these.
 - Codex CLI installed and authenticated on the backend host.
 - A trusted LAN or private tailnet for remote laptop/phone access.
 
@@ -29,10 +31,12 @@ The installer is split into two visible phases:
 
 1. `install.sh` is the Ubuntu bootstrap. It verifies Ubuntu, installs apt
    packages required by Cloudx, including `poppler-utils` and `libreoffice` for
-   documentation extraction, checks for Node.js 22 and npm, and installs the
-   NodeSource Node.js 22 package when Node.js is too old or missing. It then
-   verifies `node -v` and `npm -v`, and installs Ubuntu's separate `npm` package
-   if the `npm` command is missing.
+   documentation extraction plus `pandoc`, TeX Live XeLaTeX/LuaLaTeX packages,
+   and the pinned official Quarto `.deb` for rendering the memory-plugin PDF
+   guide. It checks for Node.js 22 and npm, and installs the NodeSource Node.js
+   22 package when Node.js is too old or missing. It then verifies `node -v` and
+   `npm -v`, and installs Ubuntu's separate `npm` package if the `npm` command
+   is missing.
 2. `scripts/install-cloudx.mjs` is the Cloudx wizard. It prints each phase as it
    runs: Codex CLI verification/login, install choices, `npm ci`, ASR virtualenv
    setup, documentation-indexer virtualenv setup with table-aware extraction
@@ -170,7 +174,12 @@ Manual setup remains available:
 
 ```bash
 npm install
-sudo apt install ripgrep poppler-utils libreoffice
+sudo apt install ripgrep poppler-utils libreoffice pandoc \
+  texlive-xetex texlive-latex-recommended texlive-latex-extra \
+  texlive-fonts-recommended lmodern
+curl -fL -o /tmp/quarto-1.9.38-linux-amd64.deb \
+  https://github.com/quarto-dev/quarto-cli/releases/download/v1.9.38/quarto-1.9.38-linux-amd64.deb
+sudo apt install /tmp/quarto-1.9.38-linux-amd64.deb
 python3 -m venv services/asr/.venv
 services/asr/.venv/bin/pip install -e services/asr
 ```
@@ -236,6 +245,13 @@ In Cloudx, create a Documentation tab. The panel can:
 Documentation skills are synced automatically as CloudX system skills when the
 server starts. They use `CLOUDX_DOCUMENTATION_URL`, and Cloudx exports that URL
 to child processes when Codex tabs run from Cloudx.
+
+Render the memory plugin guide PDF from its Quarto source after documentation
+changes:
+
+```bash
+npm run docs:memory:pdf
+```
 
 ### Portable Backup And Restore
 

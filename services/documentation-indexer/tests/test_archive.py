@@ -138,6 +138,29 @@ def test_fastapi_surface_controls_archive(tmp_path: Path) -> None:
     assert client.post("/search", json={"query": "ADC calibration register"}).json()["results"] == []
 
 
+def test_reingesting_changed_source_supersedes_old_revision(tmp_path: Path) -> None:
+    source = tmp_path / "board-datasheet.md"
+    source.write_text("Board Datasheet\nOLDREG reset mode lives at address 0x10.\n", encoding="utf-8")
+    archive = DocumentationArchive(tmp_path / "archive")
+
+    old_document = archive.ingest_path(source, source_type="datasheet")
+    assert archive.search("OLDREG reset mode", limit=1)[0]["documentId"] == old_document[0].document_id
+
+    source.write_text("Board Datasheet\nNEWREG reset mode lives at address 0x20.\n", encoding="utf-8")
+    new_document = archive.ingest_path(source, source_type="datasheet")
+
+    assert new_document[0].document_id != old_document[0].document_id
+    assert all(result["documentId"] != old_document[0].document_id for result in archive.search("OLDREG reset mode", limit=10))
+    assert archive.search("OLDREG", limit=10, mode="lexical") == []
+    new_results = archive.search("NEWREG reset mode", limit=10)
+    assert new_results and new_results[0]["documentId"] == new_document[0].document_id
+    superseded_results = archive.search("OLDREG reset mode", limit=10, states=["superseded"])
+    assert superseded_results and superseded_results[0]["documentId"] == old_document[0].document_id
+    old_record = archive.get_document(old_document[0].document_id)
+    assert old_record["state"] == "superseded"
+    assert old_record["events"][0]["reason"] == "Superseded by a newer revision from the same source URI."
+
+
 def test_pdf_tables_visuals_and_images_are_extracted_as_portable_artifacts(tmp_path: Path) -> None:
     fixture_dir = tmp_path / "fixtures"
     fixture_dir.mkdir()

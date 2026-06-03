@@ -10,7 +10,7 @@ import type {
 import { RULES_SKILLS_PLUGIN_ID, isRecord, type CodexTerminalInitialInput, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
 
 import { materializeCodexHomeOverlay, type CodexHomeOverlay } from "../rulesSkills/CodexHomeOverlay.js";
-import { CLOUDX_SYSTEM_SKILLS, cloudxSkillFilePath, cloudxSystemSkillFilePath, type ResolvedPersonalityTemplate } from "../rulesSkills/RulesSkillsCatalogService.js";
+import { CLOUDX_SYSTEM_RULES, CLOUDX_SYSTEM_SKILLS, cloudxSkillFilePath, cloudxSystemSkillFilePath, type ResolvedPersonalityTemplate } from "../rulesSkills/RulesSkillsCatalogService.js";
 import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
 import { buildLoginShellCommandLaunch, buildToolEnv, resolveAssistantCommand } from "../terminal/ShellLaunch.js";
 
@@ -241,6 +241,7 @@ export async function materializeCodexTemplate(
     env.CODEX_HOME = overlay.codexHome;
     env.CLOUDX_RULES_SKILLS_DIR = overlay.rulesSkillsRoot;
     env.CLOUDX_PERSONALITY_INJECTION = "codex-home-overlay";
+    env.CLOUDX_SYSTEM_RULE_IDS = overlay.systemRules.map((rule) => rule.id).join(",");
     args.push("--add-dir", overlay.rulesSkillsRoot);
   }
   if (resolved) {
@@ -282,6 +283,14 @@ export function buildCodexRuntimeUpdatePrompt(resolved: ResolvedPersonalityTempl
     } else {
       lines.push(...resolved.skills.map((skill) => `- $${skill.id}: ${skill.name} - ${skill.description}${skillPathSuffix(overlay, skill.id, false)}`));
     }
+  }
+
+  const systemRules = overlay?.systemRules ?? CLOUDX_SYSTEM_RULES;
+  lines.push("", "CloudX system rules:");
+  if (systemRules.length === 0) {
+    lines.push("- No CloudX system rules are enabled.");
+  } else {
+    lines.push(...systemRules.map((rule) => `- ${rule.text}`));
   }
 
   lines.push("", "CloudX system skills:");

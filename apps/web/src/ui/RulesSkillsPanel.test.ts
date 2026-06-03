@@ -204,6 +204,7 @@ function rulesSkillsStore(): RulesSkillsStore {
     templates: [template],
     defaultTemplateId: template.id,
     rules: [{ id: "keep-focused", description: "Keep focused.", text: "Keep focused." }],
+    systemRules: [],
     skills: [],
     systemSkills: []
   };

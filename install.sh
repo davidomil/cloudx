@@ -7,6 +7,9 @@ cd "$ROOT_DIR"
 DRY_RUN=0
 UNINSTALL=0
 UPDATE=0
+QUARTO_VERSION="1.9.38"
+QUARTO_DEB_PATH="/tmp/quarto-${QUARTO_VERSION}-linux-amd64.deb"
+QUARTO_DEB_URL="https://github.com/quarto-dev/quarto-cli/releases/download/v${QUARTO_VERSION}/quarto-${QUARTO_VERSION}-linux-amd64.deb"
 for arg in "$@"; do
   if [[ "$arg" == "--dry-run" ]]; then
     DRY_RUN=1
@@ -54,6 +57,20 @@ run() {
   "$@"
 }
 
+install_quarto() {
+  if [[ "$(dpkg --print-architecture)" != "amd64" ]]; then
+    echo "Cloudx installs the official Quarto linux-amd64 .deb. Detected unsupported architecture: $(dpkg --print-architecture)" >&2
+    exit 1
+  fi
+  if [[ "$DRY_RUN" -eq 0 ]] && command -v quarto >/dev/null 2>&1 && [[ "$(quarto --version)" == "$QUARTO_VERSION" ]]; then
+    echo "Using Quarto $(quarto --version)."
+    return 0
+  fi
+  run curl -fL -o "$QUARTO_DEB_PATH" "$QUARTO_DEB_URL"
+  run sudo apt-get install -y "$QUARTO_DEB_PATH"
+  run quarto --version
+}
+
 if [[ "$UNINSTALL" -eq 1 ]]; then
   step "Launch the Cloudx uninstall wizard"
   if ! command -v node >/dev/null 2>&1; then
@@ -79,11 +96,23 @@ run sudo apt-get install -y \
   build-essential \
   libreoffice \
   poppler-utils \
+  pandoc \
+  texlive-xetex \
+  texlive-latex-recommended \
+  texlive-latex-extra \
+  texlive-fonts-recommended \
+  lmodern \
   python3 \
   python3-venv \
   python3-pip \
   openssl \
   ripgrep
+
+step "Install documentation PDF render tools"
+install_quarto
+run pandoc --version
+run xelatex --version
+run lualatex --version
 
 step "Check Node.js and npm"
 NODE_MAJOR="$(node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)"

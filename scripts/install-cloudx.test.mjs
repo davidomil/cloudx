@@ -7,10 +7,15 @@ import { describe, expect, it } from "vitest";
 import {
   InstallerRunner,
   PYTORCH_CPU_WHEEL_INDEX,
+  QUARTO_DEB_PATH,
+  QUARTO_DEB_URL,
+  QUARTO_VERSION,
+  assertQuartoArchitecture,
   cloudxAccessUrls,
   defaultCpuThreads,
   installUbuntuPrerequisites,
   needsNodeInstall,
+  needsQuartoInstall,
   networkBindWarning,
   parseNodeMajor,
   parseOsRelease,
@@ -42,6 +47,9 @@ describe("install-cloudx helpers", () => {
     expect(needsNodeInstall("v20.20.2", true)).toBe(true);
     expect(needsNodeInstall("v22.22.3", false)).toBe(true);
     expect(needsNodeInstall("v24.15.0", true)).toBe(false);
+    expect(needsQuartoInstall(QUARTO_VERSION)).toBe(false);
+    expect(needsQuartoInstall("1.8.25")).toBe(true);
+    expect(() => assertQuartoArchitecture("arm64")).toThrow(/linux-amd64/);
   });
 
   it("builds the Ubuntu bootstrap command plan", () => {
@@ -51,10 +59,26 @@ describe("install-cloudx helpers", () => {
     expect(commands[1]).toContain("build-essential");
     expect(commands[1]).toContain("libreoffice");
     expect(commands[1]).toContain("poppler-utils");
+    expect(commands[1]).toContain("pandoc");
+    expect(commands[1]).toContain("texlive-xetex");
+    expect(commands).toContainEqual(["curl", "-fL", "-o", QUARTO_DEB_PATH, QUARTO_DEB_URL]);
+    expect(commands).toContainEqual(["sudo", "apt-get", "install", "-y", QUARTO_DEB_PATH]);
     expect(commands).toContainEqual(["sudo", "apt-get", "install", "-y", "nodejs"]);
     expect(commands).toContainEqual(["sh", "-lc", "command -v npm >/dev/null 2>&1 || sudo apt-get install -y npm"]);
     expect(commands).toContainEqual(["node", "-v"]);
     expect(commands).toContainEqual(["npm", "-v"]);
+    expect(commands).toContainEqual(["quarto", "--version"]);
+    expect(commands).toContainEqual(["pandoc", "--version"]);
+    expect(commands).toContainEqual(["xelatex", "--version"]);
+    expect(commands).toContainEqual(["lualatex", "--version"]);
+  });
+
+  it("skips the Quarto .deb download when the pinned version is already installed", () => {
+    const commands = ubuntuBootstrapPlan({ nodeVersionText: "v22.0.0", hasNpm: true, quartoVersionText: QUARTO_VERSION });
+
+    expect(commands).not.toContainEqual(["curl", "-fL", "-o", QUARTO_DEB_PATH, QUARTO_DEB_URL]);
+    expect(commands).not.toContainEqual(["sudo", "apt-get", "install", "-y", QUARTO_DEB_PATH]);
+    expect(commands).toContainEqual(["quarto", "--version"]);
   });
 
   it("plans npm fallback when Node is current but npm is missing", () => {

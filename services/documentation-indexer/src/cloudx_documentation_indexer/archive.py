@@ -436,6 +436,29 @@ class DocumentationArchive:
         now = timestamp()
         with self._connect() as db:
             existing = db.execute("SELECT document_id FROM documents WHERE document_id = ?", (document_id,)).fetchone()
+            superseded_documents = db.execute(
+                "SELECT document_id, state FROM documents WHERE uri = ? AND document_id != ? AND state = ?",
+                (uri, document_id, ACTIVE_STATE),
+            ).fetchall()
+            for superseded in superseded_documents:
+                db.execute(
+                    "UPDATE documents SET state = ?, updated_at = ? WHERE document_id = ?",
+                    ("superseded", now, superseded["document_id"]),
+                )
+                db.execute("UPDATE chunks SET state = ? WHERE document_id = ?", ("superseded", superseded["document_id"]))
+                db.execute(
+                    """
+                    INSERT INTO invalidation_events (document_id, previous_state, next_state, reason, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        superseded["document_id"],
+                        superseded["state"],
+                        "superseded",
+                        "Superseded by a newer revision from the same source URI.",
+                        now,
+                    ),
+                )
             if existing:
                 db.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
             db.execute(

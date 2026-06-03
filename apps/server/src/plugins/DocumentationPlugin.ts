@@ -1,4 +1,4 @@
-import type { CreatePluginSessionInput, HookDefinition, JsonSchemaLike, PluginSession, PluginSessionSnapshot, PluginSkillContribution, PluginVoiceContext, WorkspacePlugin } from "@cloudx/plugin-api";
+import type { CreatePluginSessionInput, HookDefinition, JsonSchemaLike, PluginRuleContribution, PluginSession, PluginSessionSnapshot, PluginSkillContribution, PluginVoiceContext, WorkspacePlugin } from "@cloudx/plugin-api";
 import type { WorkspaceTab } from "@cloudx/shared";
 
 import type { DocumentationClient } from "../documentation/DocumentationClient.js";
@@ -16,6 +16,7 @@ export class DocumentationPlugin implements WorkspacePlugin {
   readonly requiresDirectory = false;
   readonly actions = [];
   readonly configFields = [];
+  readonly ruleContributions = defaultDocumentationRules();
   readonly skillContributions = defaultDocumentationSkills();
   readonly hooks: HookDefinition[];
   readonly uiContributions = [
@@ -246,6 +247,16 @@ function defaultDocumentationSkills(): PluginSkillContribution[] {
         "The portable archive is the complete directory reported by `/health.archiveRoot`; back it up as a directory after stopping writes.",
         "Use `/rebuild-index` after restoring an archive or changing active documentation state."
       ])
+    }
+  ];
+}
+
+function defaultDocumentationRules(): PluginRuleContribution[] {
+  return [
+    {
+      id: "documentation-ingest-evidence",
+      description: "Capture task evidence in the local documentation archive before relying on it.",
+      text: "When task evidence such as datasheets, sample code, vendor documentation, screenshots, flowcharts, API references, or local notes is needed, download or otherwise capture the source and add it to the CloudX documentation knowledge base before relying on it; preserve precise title and URI metadata and invalidate older conflicting archive records."
     }
   ];
 }

@@ -10,6 +10,9 @@ import { fileURLToPath } from "node:url";
 export const ASR_MODEL_ID = "Systran/faster-whisper-large-v3";
 export const PYTORCH_CPU_WHEEL_INDEX = "https://download.pytorch.org/whl/cpu";
 export const SERVICE_NAMES = ["cloudx-asr.service", "cloudx.service"];
+export const QUARTO_VERSION = "1.9.38";
+export const QUARTO_DEB_PATH = `/tmp/quarto-${QUARTO_VERSION}-linux-amd64.deb`;
+export const QUARTO_DEB_URL = `https://github.com/quarto-dev/quarto-cli/releases/download/v${QUARTO_VERSION}/quarto-${QUARTO_VERSION}-linux-amd64.deb`;
 export const UBUNTU_APT_PACKAGES = [
   "ca-certificates",
   "curl",
@@ -18,6 +21,12 @@ export const UBUNTU_APT_PACKAGES = [
   "build-essential",
   "libreoffice",
   "poppler-utils",
+  "pandoc",
+  "texlive-xetex",
+  "texlive-latex-recommended",
+  "texlive-latex-extra",
+  "texlive-fonts-recommended",
+  "lmodern",
   "python3",
   "python3-venv",
   "python3-pip",
@@ -72,7 +81,7 @@ export function helpText() {
   return [
     "Cloudx installer wizard",
     "",
-    "The shell bootstrap installs Ubuntu packages and Node.js/npm when needed.",
+    "The shell bootstrap installs Ubuntu packages, Quarto/Pandoc/TeX PDF rendering, and Node.js/npm when needed.",
     "This Node wizard then installs Cloudx dependencies, Codex CLI, ASR,",
     "the documentation archive indexer, the Faster Whisper model, config files,",
     "and optional systemd user services.",
@@ -121,6 +130,17 @@ export function parseNodeMajor(versionText) {
 
 export function needsNodeInstall(nodeVersionText, hasNpm) {
   return parseNodeMajor(nodeVersionText) < 22 || !hasNpm;
+}
+
+export function needsQuartoInstall(versionText) {
+  return String(versionText).trim().split(/\s+/)[0] !== QUARTO_VERSION;
+}
+
+export function assertQuartoArchitecture(architecture) {
+  const normalized = String(architecture).trim();
+  if (normalized !== "amd64") {
+    throw new Error(`Cloudx installs the official Quarto linux-amd64 .deb. Detected unsupported architecture: ${normalized || "unknown"}.`);
+  }
 }
 
 export function defaultCpuThreads(parallelism = defaultParallelism()) {
@@ -212,12 +232,16 @@ export function renderCloudxService({ repoRoot: root, envPath, nodePath, npmPath
   ].join("\n");
 }
 
-export function ubuntuBootstrapPlan({ nodeVersionText = "", hasNpm = false } = {}) {
+export function ubuntuBootstrapPlan({ nodeVersionText = "", hasNpm = false, quartoVersionText = "" } = {}) {
   const nodeInstallNeeded = parseNodeMajor(nodeVersionText) < 22;
   const commands = [
     ["sudo", "apt-get", "update"],
     ["sudo", "apt-get", "install", "-y", ...UBUNTU_APT_PACKAGES]
   ];
+  if (needsQuartoInstall(quartoVersionText)) {
+    commands.push(["curl", "-fL", "-o", QUARTO_DEB_PATH, QUARTO_DEB_URL]);
+    commands.push(["sudo", "apt-get", "install", "-y", QUARTO_DEB_PATH]);
+  }
   if (nodeInstallNeeded) {
     commands.push(["sh", "-lc", "curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -"]);
     commands.push(["sudo", "apt-get", "install", "-y", "nodejs"]);
@@ -227,13 +251,21 @@ export function ubuntuBootstrapPlan({ nodeVersionText = "", hasNpm = false } = {
   }
   commands.push(["node", "-v"]);
   commands.push(["npm", "-v"]);
+  commands.push(["quarto", "--version"]);
+  commands.push(["pandoc", "--version"]);
+  commands.push(["xelatex", "--version"]);
+  commands.push(["lualatex", "--version"]);
   return commands;
 }
 
 export function installUbuntuPrerequisites(commands) {
+  if (commands.exists("dpkg")) {
+    assertQuartoArchitecture(commands.capture("dpkg", ["--print-architecture"]));
+  }
   const nodeVersionText = commands.exists("node") ? commands.capture("node", ["-v"]) : "";
   const hasNpm = commands.exists("npm");
-  for (const [command, ...args] of ubuntuBootstrapPlan({ nodeVersionText, hasNpm })) {
+  const quartoVersionText = commands.exists("quarto") ? commands.capture("quarto", ["--version"]) : "";
+  for (const [command, ...args] of ubuntuBootstrapPlan({ nodeVersionText, hasNpm, quartoVersionText })) {
     commands.run(command, args);
   }
 }

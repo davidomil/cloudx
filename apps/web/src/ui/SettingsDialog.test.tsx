@@ -39,6 +39,7 @@ function rulesSkillsStore(): RulesSkillsStore {
   return {
     defaultTemplateId: "focused",
     rules: [],
+    systemRules: [],
     skills: [],
     systemSkills: [],
     templates: [

@@ -6,12 +6,14 @@ import path from "node:path";
 import {
   cloudxSkillFilePath,
   cloudxSystemSkillFilePath,
+  ensureCloudxSystemRules,
   ensureCloudxSystemSkills,
+  listCloudxSystemRules,
   listCloudxSystemSkills,
   rulesSkillsRootPath,
   type ResolvedPersonalityTemplate
 } from "./RulesSkillsCatalogService.js";
-import type { CloudxSkill } from "@cloudx/shared";
+import type { CloudxRule, CloudxSkill } from "@cloudx/shared";
 
 export interface CodexHomeOverlayOptions {
   dataDir: string;
@@ -27,6 +29,7 @@ export interface CodexHomeOverlay {
   configPath: string;
   instructionsPath?: string;
   skillPaths: string[];
+  systemRules: CloudxRule[];
   systemSkills: CloudxSkill[];
 }
 
@@ -44,7 +47,9 @@ export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptio
     await fsp.rm(codexHome, { recursive: true, force: true });
   }
   await fsp.mkdir(codexHome, { recursive: true });
+  await ensureCloudxSystemRules(rulesSkillsRoot);
   await ensureCloudxSystemSkills(rulesSkillsRoot);
+  const systemRules = await listCloudxSystemRules(rulesSkillsRoot);
   const systemSkills = await listCloudxSystemSkills(rulesSkillsRoot);
 
   await linkOrCopyIfExists(path.join(sourceCodexHome, "auth.json"), path.join(codexHome, "auth.json"));
@@ -54,7 +59,7 @@ export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptio
   const skillPaths = await materializeSelectedSkills(codexHome, rulesSkillsRoot, options.resolved, systemSkills);
   const configPath = path.join(codexHome, "config.toml");
   await writeOverlayConfig(path.join(sourceCodexHome, "config.toml"), configPath, skillPaths);
-  const instructionsPath = await writeOverlayInstructions(sourceCodexHome, codexHome, options.resolved);
+  const instructionsPath = await writeOverlayInstructions(sourceCodexHome, codexHome, options.resolved, systemRules);
 
   return {
     codexHome,
@@ -62,6 +67,7 @@ export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptio
     configPath,
     instructionsPath,
     skillPaths,
+    systemRules,
     systemSkills
   };
 }
@@ -115,14 +121,19 @@ async function writeOverlayConfig(sourceConfigPath: string, targetConfigPath: st
   await fsp.writeFile(targetConfigPath, `${config.trimEnd()}\n`, "utf8");
 }
 
-async function writeOverlayInstructions(sourceCodexHome: string, targetCodexHome: string, resolved: ResolvedPersonalityTemplate | undefined): Promise<string | undefined> {
+async function writeOverlayInstructions(
+  sourceCodexHome: string,
+  targetCodexHome: string,
+  resolved: ResolvedPersonalityTemplate | undefined,
+  systemRules: CloudxRule[]
+): Promise<string | undefined> {
   const baseInstructions = await readFirstExisting([
     path.join(sourceCodexHome, "AGENTS.override.md"),
     path.join(sourceCodexHome, "AGENTS.md")
   ]);
   const cloudxRules = resolved?.rules ?? [];
   const instructionsPath = path.join(targetCodexHome, "AGENTS.override.md");
-  if (!baseInstructions && cloudxRules.length === 0) {
+  if (!baseInstructions && systemRules.length === 0 && cloudxRules.length === 0) {
     await fsp.rm(instructionsPath, { force: true });
     return undefined;
   }
@@ -130,6 +141,9 @@ async function writeOverlayInstructions(sourceCodexHome: string, targetCodexHome
   const sections = ["# CloudX Codex Session Instructions"];
   if (baseInstructions?.trim()) {
     sections.push("", "## Base Codex Home Instructions", "", baseInstructions.trim());
+  }
+  if (systemRules.length > 0) {
+    sections.push("", "## CloudX System Rules", "", ...systemRules.map((rule) => `- ${rule.text}`));
   }
   if (resolved && cloudxRules.length > 0) {
     sections.push("", `## CloudX Template: ${resolved.template.name}`, "", ...cloudxRules.map((rule) => `- ${rule.text}`));

@@ -44,6 +44,7 @@ export interface PersonalityTemplate {
 export interface RulesSkillsStore {
   defaultTemplateId?: string;
   rules: CloudxRule[];
+  systemRules: CloudxRule[];
   skills: CloudxSkill[];
   systemSkills: CloudxSkill[];
   templates: PersonalityTemplate[];
