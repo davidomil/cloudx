@@ -59,6 +59,37 @@ describe("ConfigService", () => {
     expect((await fs.readdir(dataDir)).some((entry) => entry.endsWith(".tmp"))).toBe(false);
   });
 
+  it("resolves and validates internal plugin config fields", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-config-internal-"));
+    const service = new ConfigService(dataDir, () => [internalConfigDescriptor()]);
+
+    expect(service.getResponse()).toMatchObject({
+      plugins: [
+        {
+          pluginId: "internal-config",
+          fields: [
+            expect.objectContaining({
+              key: "skillIds",
+              visibility: "internal",
+              defaultValue: "metadata,visuals"
+            })
+          ]
+        }
+      ],
+      values: {
+        plugins: {
+          "internal-config": {
+            skillIds: "metadata,visuals"
+          }
+        }
+      }
+    });
+
+    await service.update({ plugins: { "internal-config": { skillIds: "metadata" } } });
+
+    expect(service.getPluginConfig("internal-config").skillIds).toBe("metadata");
+  });
+
   it("merges updates from separate service instances against the latest persisted config", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-config-cross-instance-"));
     const first = new ConfigService(dataDir, () => [fileBrowserDescriptor()]);
@@ -218,6 +249,28 @@ function fileBrowserDescriptor(): PluginDescriptor {
         defaultValue: 15,
         min: 1,
         step: 1
+      }
+    ]
+  };
+}
+
+function internalConfigDescriptor(): PluginDescriptor {
+  return {
+    id: "internal-config",
+    acronym: "IC",
+    displayName: "Internal Config",
+    description: "Internal Config",
+    panelKind: "placeholder",
+    creatable: false,
+    requiresDirectory: false,
+    actions: [],
+    configFields: [
+      {
+        key: "skillIds",
+        label: "Skill IDs",
+        type: "string",
+        visibility: "internal",
+        defaultValue: "metadata,visuals"
       }
     ]
   };

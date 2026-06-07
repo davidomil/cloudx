@@ -60,11 +60,22 @@ export interface HookCallContext {
   targetTabId?: string;
   activeTabId?: string;
   signal?: AbortSignal;
+  reportProgress?: (progress: HookProgressEvent) => void;
 }
 
 export interface HookDefinition extends HookDescriptor {
   inputSchema: JsonSchemaLike;
   execute(input: Record<string, unknown>, context: HookCallContext): Promise<Record<string, unknown>> | Record<string, unknown>;
+}
+
+export interface HookProgressEvent {
+  message: string;
+  progress?: number;
+  stage?: string;
+  status?: string;
+  jobId?: string;
+  detail?: string;
+  position?: number;
 }
 
 export interface TriggerEmitContext {

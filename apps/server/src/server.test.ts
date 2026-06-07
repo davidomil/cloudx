@@ -525,6 +525,54 @@ describe("buildServer", () => {
     }
   });
 
+  it("proxies documentation artifact files from the indexer", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-artifact-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    const upstream = new Response(new Uint8Array([9, 8, 7]), {
+      status: 206,
+      headers: {
+        "content-type": "image/png",
+        "content-length": "3",
+        "content-range": "bytes 0-2/12",
+        "accept-ranges": "bytes"
+      }
+    });
+    const streamArtifact = vi.spyOn(services.documentation!, "streamArtifact").mockResolvedValue({
+      statusCode: upstream.status,
+      headers: upstream.headers,
+      body: upstream.body
+    });
+    const app = await buildServer(config, services);
+    try {
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/documentation/documents/doc-1/artifact?path=figures%2Ffigure-030.png",
+        headers: {
+          range: "bytes=0-2"
+        }
+      });
+
+      expect(response.statusCode).toBe(206);
+      expect(response.headers["content-type"]).toBe("image/png");
+      expect(response.headers["content-range"]).toBe("bytes 0-2/12");
+      expect(response.headers["accept-ranges"]).toBe("bytes");
+      expect(Array.from(response.rawPayload)).toEqual([9, 8, 7]);
+      expect(streamArtifact).toHaveBeenCalledWith(
+        {
+          documentId: "doc-1",
+          path: "figures/figure-030.png"
+        },
+        {
+          range: "bytes=0-2",
+          "if-range": undefined
+        }
+      );
+    } finally {
+      await app.close();
+    }
+  });
+
   it("passes browser documentation upload bytes to the enrichment service", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-upload-enrich-"));
     const config = testConfig(root);
@@ -563,6 +611,75 @@ describe("buildServer", () => {
           sourceType: "media"
         }
       );
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("streams documentation ingest hook progress before the final blocking result", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-ingest-stream-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    vi.spyOn(services.documentation!, "ingestText").mockResolvedValue({
+      document: { documentId: "streamed-doc", sourceType: "text" }
+    });
+    vi.spyOn(services.documentationEnrichment!, "enrichIngestResponse").mockImplementation(async (result) => result);
+    const app = await buildServer(config, services);
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/hooks/documentation.ingest.text?stream=1",
+        headers: {
+          "accept": "application/x-ndjson",
+          "content-type": "application/json"
+        },
+        payload: {
+          input: {
+            title: "Streaming text source",
+            text: "Streaming ingest says DOC-STREAM-44."
+          }
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers["content-type"]).toContain("application/x-ndjson");
+      const events = ndjsonEvents(response.body);
+      expect(events[0]).toMatchObject({ type: "progress", status: "queued", message: expect.stringContaining("Streaming text source") });
+      expect(events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "progress", status: "running", stage: expect.stringContaining("writing text") }),
+        expect.objectContaining({ type: "progress", status: "complete", progress: 100 }),
+        expect.objectContaining({ type: "result", result: { document: { documentId: "streamed-doc", sourceType: "text" } } })
+      ]));
+      expect(events.findIndex((event) => event.type === "progress" && event.status === "running")).toBeLessThan(events.findIndex((event) => event.type === "result"));
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("records browser documentation uploads in the shared ingest queue", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-upload-queue-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    vi.spyOn(services.documentation!, "ingestUpload").mockResolvedValue({
+      document: { documentId: "queued-upload", sourceType: "readme" }
+    });
+    vi.spyOn(services.documentationEnrichment!, "enrichIngestResponse").mockImplementation(async (result) => result);
+    const app = await buildServer(config, services);
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/documentation/upload?filename=queued-note.md&title=Queued%20Note",
+        headers: {
+          "content-type": "application/octet-stream",
+          "x-cloudx-file-content-type": "text/markdown"
+        },
+        payload: Buffer.from("Queued upload says DOC-UPLOAD-QUEUE-9.")
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(services.documentationIngestQueue!.list().jobs).toEqual([
+        expect.objectContaining({ label: "Queued Note", detail: "queued-note.md", status: "complete", progress: 100 })
+      ]);
     } finally {
       await app.close();
     }
@@ -2634,6 +2751,10 @@ function testConfig(root: string): AppConfig {
     documentationResponseMaxBytes: DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES,
     documentationUploadMaxBytes: DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES
   };
+}
+
+function ndjsonEvents(body: string): Record<string, unknown>[] {
+  return body.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
 function readWebSocketJson(client: WebSocket): Promise<Record<string, unknown>> {

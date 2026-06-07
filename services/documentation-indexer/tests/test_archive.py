@@ -25,6 +25,7 @@ from cloudx_documentation_indexer.archive import (
     fetch_url_bytes,
     reciprocal_rank_fusion,
 )
+from cloudx_documentation_indexer.extraction import plausible_tables, table_span_text
 
 
 def test_archive_ingests_searches_invalidates_and_remains_portable(tmp_path: Path) -> None:
@@ -327,8 +328,80 @@ def test_youtube_video_ingest_preserves_transcript_metadata_and_keyframes(tmp_pa
         "0\tmedia/keyframes/frame-000001.png",
         "1\tmedia/keyframes/frame-000002.png",
     ]
+    keyframe_chunk = next(chunk for chunk in record["chunks"] if chunk["locator"] == "media keyframes")
+    assert "Keyframe count: 2." in keyframe_chunk["text"]
+    assert "Time range seconds: 0 to 1." in keyframe_chunk["text"]
     assert (extracted / "media" / "keyframes" / "frame-000001.png").exists()
     assert (extracted / "media" / "keyframes" / "frame-000002.png").exists()
+
+
+def test_document_detail_supports_chunk_windows_and_truncation(tmp_path: Path) -> None:
+    app = create_app(tmp_path / "windowed-archive")
+    client = TestClient(app)
+    text = "\n\n".join(f"Section {index} " + "alpha " * 260 for index in range(4))
+    ingest_response = client.post("/ingest/text", json={"title": "Large source", "text": text})
+    document_id = ingest_response.json()["document"]["documentId"]
+
+    response = client.get(
+        f"/documents/{document_id}",
+        params={
+            "chunkOffset": 1,
+            "chunkLimit": 1,
+            "chunkTextMaxChars": 40,
+            "artifactOffset": 0,
+            "artifactLimit": 0,
+        },
+    )
+
+    assert response.status_code == 200
+    document = response.json()["document"]
+    assert len(document["chunks"]) == 1
+    assert document["chunks"][0]["textTruncated"] is True
+    assert document["chunks"][0]["textLength"] > 40
+    assert len(document["chunks"][0]["text"]) <= 43
+    assert document["chunkWindow"]["offset"] == 1
+    assert document["chunkWindow"]["limit"] == 1
+    assert document["chunkWindow"]["total"] > 1
+    assert document["chunkWindow"]["hasMore"] is True
+    assert document["artifacts"] == []
+    assert document["artifactWindow"] == {"offset": 0, "limit": 0, "total": 0, "hasMore": False}
+
+
+def test_youtube_keyframe_span_compacts_large_keyframe_indexes() -> None:
+    keyframes = [
+        {"offsetSeconds": index, "path": f"media/keyframes/frame-{index + 1:06d}.png"}
+        for index in range(25)
+    ]
+
+    span = archive_module.youtube_keyframe_span(keyframes)
+
+    assert "Keyframe count: 25." in span
+    assert "Time range seconds: 0 to 24." in span
+    assert "second 19: media/keyframes/frame-000020.png" in span
+    assert "5 additional keyframes are listed in media/keyframes.tsv." in span
+    assert "second 24: media/keyframes/frame-000025.png" not in span
+
+
+def test_snapshot_artifact_window_paginates_large_keyframe_index(tmp_path: Path) -> None:
+    snapshot = tmp_path / "snapshots" / "video-source.bin"
+    media_dir = snapshot.parent / "extracted" / "media"
+    frames_dir = media_dir / "keyframes"
+    frames_dir.mkdir(parents=True)
+    snapshot.parent.mkdir(exist_ok=True)
+    snapshot.write_bytes(b"video")
+    keyframes = [
+        {"offsetSeconds": index, "path": f"media/keyframes/frame-{index + 1:06d}.png"}
+        for index in range(25)
+    ]
+    for index in range(10, 15):
+        Image.new("RGB", (64, 36), "white").save(frames_dir / f"frame-{index + 1:06d}.png")
+    archive_module.write_keyframe_index(media_dir / "keyframes.tsv", keyframes)
+
+    window = archive_module.snapshot_artifact_window("doc-video", snapshot, offset=10, limit=5)
+
+    assert window.total == 25
+    assert [artifact["offsetSeconds"] for artifact in window.artifacts] == [10, 11, 12, 13, 14]
+    assert all(artifact["available"] is True for artifact in window.artifacts)
 
 
 def test_failed_youtube_playlist_does_not_leave_active_partial_documents(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -430,10 +503,60 @@ def test_pdf_tables_visuals_and_images_are_extracted_as_portable_artifacts(tmp_p
     assert (extracted / "figure_index.tsv").exists()
     assert any(path.name.endswith(".png") for path in (extracted / "figures").iterdir())
     assert archive.search("flowcharts schematics visual layout", source_types=["datasheet"], limit=1)
+    pdf_record = archive.get_document(table_result["documentId"])
+    figure_artifact = next(artifact for artifact in pdf_record["artifacts"] if artifact["type"] == "figure")
+    table_artifact = next(artifact for artifact in pdf_record["artifacts"] if artifact["type"] == "table")
+    assert figure_artifact["path"].startswith("figures/")
+    assert figure_artifact["mimeType"] == "image/png"
+    assert figure_artifact["available"] is True
+    assert table_artifact["alternatePaths"][0]["kind"] == "csv"
+    assert table_artifact["nonEmptyCells"] >= 3
+    assert table_artifact["totalCells"] >= table_artifact["nonEmptyCells"]
+    served_figure = archive.document_artifact_file(table_result["documentId"], figure_artifact["path"])
+    assert served_figure.media_type == "image/png"
+    assert served_figure.path.is_file()
+    with pytest.raises(ArchiveError):
+        archive.document_artifact_file(table_result["documentId"], "../catalog.sqlite")
+
+    client = TestClient(create_app(tmp_path / "archive"))
+    artifact_response = client.get(f"/documents/{table_result['documentId']}/artifact", params={"path": figure_artifact["path"]})
+    assert artifact_response.status_code == 200
+    assert artifact_response.headers["content-type"].startswith("image/png")
 
     image_result = archive.search("320x160 flowcharts screenshots", source_types=["image"], limit=1)[0]
     image_snapshot = tmp_path / "archive" / image_result["citation"]["snapshotPath"]
     assert (image_snapshot.parent / "extracted" / "images" / "debug-flowchart.png").exists()
+    image_record = archive.get_document(image_result["documentId"])
+    assert image_record["artifacts"][0]["type"] == "image"
+    assert image_record["artifacts"][0]["path"] == "images/debug-flowchart.png"
+
+
+def test_pdf_table_filter_rejects_single_cell_diagram_fragments() -> None:
+    assert plausible_tables([[[None], ["EXPANDED TIME SCALE"]]]) == []
+
+    tables = plausible_tables([[["Signal", "Min", "Max"], ["POWER GOOD", "1.7 V", "1.9 V"]]])
+    assert len(tables) == 1
+    assert tables[0].non_empty_cells == 6
+    assert tables[0].total_cells == 6
+
+
+def test_pdf_register_bit_tables_expand_merged_bit_cells() -> None:
+    tables = plausible_tables([[
+        ["BIT", "7", "6", "5", "4", "3", "2", "1", "0"],
+        ["Field", "-", "mem_dt8_selu[6:0]", None, None, None, None, None, None],
+        ["Reset", "-", "0x00", None, None, None, None, None, None],
+        ["Access\nType", "-", "Write, Read", None, None, None, None, None, None],
+    ]])
+
+    assert len(tables) == 1
+    table = tables[0]
+    assert table.rows[1] == ["Field", "-", *(["mem_dt8_selu[6:0]"] * 7)]
+    assert table.rows[3][0] == "Access Type"
+    assert table.non_empty_cells == table.total_cells
+
+    span = table_span_text("table-463", 145, table)
+    assert "bits 6:0: Field mem_dt8_selu[6:0]; Reset 0x00; Access Type Write, Read" in span
+    assert "| Field | - | mem_dt8_selu[6:0] | mem_dt8_selu[6:0] |" in span
 
 
 def test_multiframe_images_preserve_every_frame_as_artifacts(tmp_path: Path) -> None:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
+import mimetypes
 import os
 import re
 import shutil
@@ -9,7 +11,7 @@ import sqlite3
 import subprocess
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
 from importlib.metadata import version
 from dataclasses import dataclass
 from pathlib import Path
@@ -97,6 +99,19 @@ class YouTubeVideoMetadata:
     chapters: list[dict[str, Any]] | None = None
 
 
+@dataclass(frozen=True)
+class DocumentArtifactFile:
+    path: Path
+    media_type: str
+    filename: str
+
+
+@dataclass(frozen=True)
+class DocumentArtifactWindow:
+    artifacts: list[dict[str, Any]]
+    total: int
+
+
 class DocumentationArchive:
     def __init__(self, root: Path | str):
         self.root = Path(root).resolve()
@@ -180,15 +195,32 @@ class DocumentationArchive:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def get_document(self, document_id: str) -> dict:
+    def get_document(
+        self,
+        document_id: str,
+        *,
+        chunk_offset: int | None = None,
+        chunk_limit: int | None = None,
+        chunk_text_max_chars: int | None = None,
+        artifact_offset: int | None = None,
+        artifact_limit: int | None = None,
+    ) -> dict:
+        chunk_offset = normalized_window_value(chunk_offset, "chunk_offset")
+        artifact_offset = normalized_window_value(artifact_offset, "artifact_offset")
+        chunk_limit = normalized_window_value(chunk_limit, "chunk_limit") if chunk_limit is not None else None
+        artifact_limit = normalized_window_value(artifact_limit, "artifact_limit") if artifact_limit is not None else None
+        chunk_text_max_chars = normalized_window_value(chunk_text_max_chars, "chunk_text_max_chars") if chunk_text_max_chars is not None else None
         with self._connect() as db:
             document = db.execute("SELECT * FROM documents WHERE document_id = ?", (document_id,)).fetchone()
             if not document:
                 raise ArchiveError(f"Unknown document: {document_id}")
-            chunks = db.execute(
-                "SELECT chunk_id, locator, text, state, chunk_origin, enrichment_id FROM chunks WHERE document_id = ? ORDER BY chunk_id",
-                (document_id,),
-            ).fetchall()
+            chunk_total = int(db.execute("SELECT COUNT(*) FROM chunks WHERE document_id = ?", (document_id,)).fetchone()[0])
+            chunk_sql = "SELECT chunk_id, locator, text, state, chunk_origin, enrichment_id FROM chunks WHERE document_id = ? ORDER BY chunk_id"
+            chunk_params: list[str | int] = [document_id]
+            if chunk_limit is not None:
+                chunk_sql += " LIMIT ? OFFSET ?"
+                chunk_params.extend([chunk_limit, chunk_offset])
+            chunks = db.execute(chunk_sql, chunk_params).fetchall()
             enrichments = db.execute(
                 "SELECT * FROM document_enrichments WHERE document_id = ? ORDER BY enrichment_id DESC",
                 (document_id,),
@@ -198,10 +230,38 @@ class DocumentationArchive:
                 (document_id,),
             ).fetchall()
         result = dict(document)
-        result["chunks"] = [dict(row) for row in chunks]
+        result["chunks"] = [document_chunk_dict(row, chunk_text_max_chars) for row in chunks]
+        result["chunkWindow"] = window_metadata(chunk_offset, chunk_limit, chunk_total)
         result["enrichments"] = [dict(row) for row in enrichments]
         result["events"] = [dict(row) for row in events]
+        artifact_window = self.document_artifact_window(document_id, offset=artifact_offset, limit=artifact_limit)
+        result["artifacts"] = artifact_window.artifacts
+        result["artifactWindow"] = window_metadata(artifact_offset, artifact_limit, artifact_window.total)
         return result
+
+    def document_artifacts(self, document_id: str) -> list[dict[str, Any]]:
+        document = self._document_row(document_id)
+        return snapshot_artifacts(document_id, self.root / document["snapshot_path"])
+
+    def document_artifact_window(self, document_id: str, *, offset: int = 0, limit: int | None = None) -> DocumentArtifactWindow:
+        document = self._document_row(document_id)
+        return snapshot_artifact_window(document_id, self.root / document["snapshot_path"], offset=offset, limit=limit)
+
+    def document_artifact_file(self, document_id: str, artifact_path: str) -> DocumentArtifactFile:
+        document = self._document_row(document_id)
+        snapshot_path = self.root / document["snapshot_path"]
+        extracted_root = snapshot_path.parent / "extracted"
+        relative_path = safe_artifact_relative_path(artifact_path)
+        if not snapshot_artifact_path_exists(snapshot_path, relative_path):
+            raise ArchiveError(f"Unknown document artifact: {artifact_path}")
+        absolute_path = (extracted_root / relative_path).resolve()
+        if not is_relative_to(absolute_path, extracted_root.resolve()) or not absolute_path.is_file():
+            raise ArchiveError(f"Document artifact is not available: {artifact_path}")
+        return DocumentArtifactFile(
+            path=absolute_path,
+            media_type=mimetypes.guess_type(absolute_path.name)[0] or "application/octet-stream",
+            filename=absolute_path.name,
+        )
 
     def ingest_path(
         self,
@@ -823,6 +883,13 @@ class DocumentationArchive:
             (directory / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return artifact
 
+    def _document_row(self, document_id: str) -> sqlite3.Row:
+        with self._connect() as db:
+            document = db.execute("SELECT * FROM documents WHERE document_id = ?", (document_id,)).fetchone()
+        if not document:
+            raise ArchiveError(f"Unknown document: {document_id}")
+        return document
+
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.db_path)
         db.row_factory = sqlite3.Row
@@ -1007,6 +1074,36 @@ def snippet(text: str, max_chars: int = 320) -> str:
     return clean if len(clean) <= max_chars else clean[: max_chars - 1].rstrip() + "..."
 
 
+def normalized_window_value(value: int | None, name: str) -> int:
+    if value is None:
+        return 0
+    if not isinstance(value, int) or value < 0:
+        raise ArchiveError(f"{name} must be a non-negative integer.")
+    return value
+
+
+def window_metadata(offset: int, limit: int | None, total: int) -> dict[str, int | bool]:
+    resolved_limit = total if limit is None else limit
+    return {
+        "offset": offset,
+        "limit": resolved_limit,
+        "total": total,
+        "hasMore": offset + resolved_limit < total,
+    }
+
+
+def document_chunk_dict(row: sqlite3.Row, text_max_chars: int | None) -> dict[str, Any]:
+    chunk = dict(row)
+    text = str(chunk.get("text") or "")
+    chunk["textLength"] = len(text)
+    if text_max_chars is not None and len(text) > text_max_chars:
+        chunk["text"] = text[:text_max_chars].rstrip() + "..."
+        chunk["textTruncated"] = True
+    else:
+        chunk["textTruncated"] = False
+    return chunk
+
+
 def infer_source_type(name: str, content_type: str | None) -> str:
     suffix = Path(urlparse(name).path).suffix.lower()
     if suffix == ".pdf" or content_type == "application/pdf":
@@ -1021,6 +1118,317 @@ def infer_source_type(name: str, content_type: str | None) -> str:
     if suffix in {".srt", ".vtt"}:
         return "media"
     return "readme" if Path(name).name.lower().startswith("readme") else "text"
+
+
+def snapshot_artifacts(document_id: str, snapshot_path: Path) -> list[dict[str, Any]]:
+    return snapshot_artifact_window(document_id, snapshot_path).artifacts
+
+
+def snapshot_artifact_window(document_id: str, snapshot_path: Path, *, offset: int = 0, limit: int | None = None) -> DocumentArtifactWindow:
+    artifact_root = snapshot_path.parent / "extracted"
+    if not artifact_root.is_dir():
+        return DocumentArtifactWindow([], 0)
+    sources: list[tuple[int, Callable[[int, int | None], list[dict[str, Any]]]]] = [
+        (pdf_figure_artifact_count(artifact_root), lambda local_offset, local_limit: pdf_figure_artifacts(document_id, artifact_root, offset=local_offset, limit=local_limit)),
+        (pdf_table_artifact_count(artifact_root), lambda local_offset, local_limit: pdf_table_artifacts(document_id, artifact_root, offset=local_offset, limit=local_limit)),
+        (image_artifact_count(artifact_root), lambda local_offset, local_limit: image_artifacts(document_id, artifact_root, offset=local_offset, limit=local_limit)),
+        (media_keyframe_artifact_count(artifact_root), lambda local_offset, local_limit: media_keyframe_artifacts(document_id, artifact_root, offset=local_offset, limit=local_limit)),
+    ]
+    total = sum(source_total for source_total, _ in sources)
+    if limit == 0 or offset >= total:
+        return DocumentArtifactWindow([], total)
+
+    artifacts: list[dict[str, Any]] = []
+    skipped = offset
+    for source_total, read_source_window in sources:
+        if skipped >= source_total:
+            skipped -= source_total
+            continue
+        remaining_limit = None if limit is None else max(0, limit - len(artifacts))
+        if remaining_limit == 0:
+            break
+        artifacts.extend(read_source_window(skipped, remaining_limit))
+        skipped = 0
+    return DocumentArtifactWindow(artifacts, total)
+
+
+def pdf_figure_artifact_count(artifact_root: Path) -> int:
+    return count_tsv_rows(artifact_root / "figure_index.tsv", is_pdf_figure_artifact_row)
+
+
+def pdf_figure_artifacts(document_id: str, artifact_root: Path, *, offset: int = 0, limit: int | None = None) -> list[dict[str, Any]]:
+    records = []
+    for row in window_tsv_rows(artifact_root / "figure_index.tsv", offset, limit, is_pdf_figure_artifact_row):
+        path = optional_text(row.get("path"))
+        figure_id = optional_text(row.get("id"))
+        page = optional_int(row.get("page"))
+        records.append(
+            with_artifact_file_metadata(
+                artifact_root,
+                {
+                    "documentId": document_id,
+                    "type": "figure",
+                    "kind": optional_text(row.get("kind")) or "page-render",
+                    "id": figure_id,
+                    "page": page,
+                    "path": safe_artifact_relative_path(path),
+                    "locator": f"page {page} {figure_id}" if page is not None else figure_id,
+                    "metrics": {
+                        "images": optional_int(row.get("images")) or 0,
+                        "lines": optional_int(row.get("lines")) or 0,
+                        "rectangles": optional_int(row.get("rectangles")) or 0,
+                        "curves": optional_int(row.get("curves")) or 0,
+                    },
+                },
+            )
+        )
+    return records
+
+
+def is_pdf_figure_artifact_row(row: dict[str, str]) -> bool:
+    return bool(optional_text(row.get("path")) and optional_text(row.get("id")))
+
+
+def pdf_table_artifact_count(artifact_root: Path) -> int:
+    return count_tsv_rows(artifact_root / "table_index.tsv", is_pdf_table_artifact_row)
+
+
+def pdf_table_artifacts(document_id: str, artifact_root: Path, *, offset: int = 0, limit: int | None = None) -> list[dict[str, Any]]:
+    records = []
+    for row in window_tsv_rows(artifact_root / "table_index.tsv", offset, limit, is_pdf_table_artifact_row):
+        table_id = optional_text(row.get("id"))
+        page = optional_int(row.get("page"))
+        csv_path = optional_text(row.get("csv"))
+        markdown_path = optional_text(row.get("markdown"))
+        path = markdown_path or csv_path
+        alternate_paths = []
+        if csv_path:
+            alternate_paths.append(artifact_link("csv", artifact_root, csv_path))
+        if markdown_path:
+            alternate_paths.append(artifact_link("markdown", artifact_root, markdown_path))
+        records.append(
+            with_artifact_file_metadata(
+                artifact_root,
+                {
+                    "documentId": document_id,
+                    "type": "table",
+                    "kind": "table",
+                    "id": table_id,
+                    "page": page,
+                    "path": safe_artifact_relative_path(path),
+                    "locator": f"page {page} {table_id}" if page is not None else table_id,
+                    "rows": optional_int(row.get("rows")) or 0,
+                    "columns": optional_int(row.get("columns")) or 0,
+                    "nonEmptyCells": optional_int(row.get("non_empty_cells")),
+                    "totalCells": optional_int(row.get("total_cells")),
+                    "csvPath": safe_artifact_relative_path(csv_path) if csv_path else None,
+                    "markdownPath": safe_artifact_relative_path(markdown_path) if markdown_path else None,
+                    "alternatePaths": alternate_paths,
+                },
+            )
+        )
+    return records
+
+
+def is_pdf_table_artifact_row(row: dict[str, str]) -> bool:
+    return bool(optional_text(row.get("id")) and (optional_text(row.get("markdown")) or optional_text(row.get("csv"))))
+
+
+def image_artifact_count(artifact_root: Path) -> int:
+    return len(image_artifact_paths(artifact_root))
+
+
+def image_artifacts(document_id: str, artifact_root: Path, *, offset: int = 0, limit: int | None = None) -> list[dict[str, Any]]:
+    metadata_path = artifact_root / "image_metadata.json"
+    if not metadata_path.is_file():
+        return []
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    paths = image_artifact_paths_from_metadata(metadata)
+    records = []
+    selected_paths = paths[offset:] if limit is None else paths[offset:offset + limit]
+    for index, path in enumerate(selected_paths, start=offset + 1):
+        records.append(
+            with_artifact_file_metadata(
+                artifact_root,
+                {
+                    "documentId": document_id,
+                    "type": "image",
+                    "kind": "image",
+                    "id": f"image-{index:03d}",
+                    "path": safe_artifact_relative_path(path),
+                    "locator": "image",
+                    "width": optional_int(metadata.get("width")),
+                    "height": optional_int(metadata.get("height")),
+                    "frames": optional_int(metadata.get("frames")) or len(paths),
+                    "format": optional_text(str(metadata.get("format") or "")),
+                },
+            )
+        )
+    return records
+
+
+def image_artifact_paths(artifact_root: Path) -> list[str]:
+    metadata_path = artifact_root / "image_metadata.json"
+    if not metadata_path.is_file():
+        return []
+    return image_artifact_paths_from_metadata(json.loads(metadata_path.read_text(encoding="utf-8")))
+
+
+def image_artifact_paths_from_metadata(metadata: Mapping[str, Any]) -> list[str]:
+    paths = string_list(metadata.get("artifacts"))
+    if not paths and (path := optional_text(str(metadata.get("artifact") or ""))):
+        paths = [path]
+    return paths
+
+
+def media_keyframe_artifact_count(artifact_root: Path) -> int:
+    return count_tsv_rows(artifact_root / "media" / "keyframes.tsv", is_media_keyframe_artifact_row)
+
+
+def media_keyframe_artifacts(document_id: str, artifact_root: Path, *, offset: int = 0, limit: int | None = None) -> list[dict[str, Any]]:
+    records = []
+    for row in window_tsv_rows(artifact_root / "media" / "keyframes.tsv", offset, limit, is_media_keyframe_artifact_row):
+        path = optional_text(row.get("path"))
+        offset_seconds = optional_int(row.get("offset_seconds"))
+        records.append(
+            with_artifact_file_metadata(
+                artifact_root,
+                {
+                    "documentId": document_id,
+                    "type": "media-keyframe",
+                    "kind": "keyframe",
+                    "id": f"keyframe-{offset_seconds:06d}",
+                    "path": safe_artifact_relative_path(path),
+                    "locator": "media keyframes",
+                    "offsetSeconds": offset_seconds,
+                },
+            )
+        )
+    return records
+
+
+def is_media_keyframe_artifact_row(row: dict[str, str]) -> bool:
+    return bool(optional_text(row.get("path")) and optional_int(row.get("offset_seconds")) is not None)
+
+
+def read_tsv(path: Path) -> list[dict[str, str]]:
+    return list(iter_tsv(path))
+
+
+def iter_tsv(path: Path) -> Iterator[dict[str, str]]:
+    if not path.is_file():
+        return
+    with path.open(encoding="utf-8", newline="") as handle:
+        yield from csv.DictReader(handle, delimiter="\t")
+
+
+def count_tsv_rows(path: Path, predicate: Callable[[dict[str, str]], bool]) -> int:
+    return sum(1 for row in iter_tsv(path) if predicate(row))
+
+
+def window_tsv_rows(path: Path, offset: int, limit: int | None, predicate: Callable[[dict[str, str]], bool]) -> list[dict[str, str]]:
+    if limit == 0:
+        return []
+    rows = []
+    valid_index = 0
+    for row in iter_tsv(path):
+        if not predicate(row):
+            continue
+        if valid_index >= offset:
+            rows.append(row)
+            if limit is not None and len(rows) >= limit:
+                break
+        valid_index += 1
+    return rows
+
+
+def artifact_link(kind: str, artifact_root: Path, path: str) -> dict[str, Any]:
+    return with_artifact_file_metadata(
+        artifact_root,
+        {
+            "kind": kind,
+            "path": safe_artifact_relative_path(path),
+        },
+    )
+
+
+def with_artifact_file_metadata(artifact_root: Path, record: dict[str, Any]) -> dict[str, Any]:
+    relative_path = safe_artifact_relative_path(str(record["path"]))
+    file_path = (artifact_root / relative_path).resolve()
+    record["path"] = relative_path
+    record["mimeType"] = mimetypes.guess_type(relative_path)[0] or "application/octet-stream"
+    record["available"] = is_relative_to(file_path, artifact_root.resolve()) and file_path.is_file()
+    if record["available"]:
+        record["bytes"] = file_path.stat().st_size
+    return {key: value for key, value in record.items() if value is not None}
+
+
+def artifact_paths(artifacts: list[dict[str, Any]]) -> set[str]:
+    paths = set()
+    for artifact in artifacts:
+        if path := optional_text(str(artifact.get("path") or "")):
+            paths.add(safe_artifact_relative_path(path))
+        alternate_paths = artifact.get("alternatePaths")
+        if isinstance(alternate_paths, list):
+            for alternate in alternate_paths:
+                if isinstance(alternate, Mapping) and (path := optional_text(str(alternate.get("path") or ""))):
+                    paths.add(safe_artifact_relative_path(path))
+    return paths
+
+
+def snapshot_artifact_path_exists(snapshot_path: Path, relative_path: str) -> bool:
+    artifact_root = snapshot_path.parent / "extracted"
+    if not artifact_root.is_dir():
+        return False
+    normalized_path = safe_artifact_relative_path(relative_path)
+    return any(path == normalized_path for path in snapshot_artifact_paths(artifact_root))
+
+
+def snapshot_artifact_paths(artifact_root: Path) -> Iterator[str]:
+    yield from pdf_figure_artifact_paths(artifact_root)
+    yield from pdf_table_artifact_paths(artifact_root)
+    yield from image_artifact_paths(artifact_root)
+    yield from media_keyframe_artifact_paths(artifact_root)
+
+
+def pdf_figure_artifact_paths(artifact_root: Path) -> Iterator[str]:
+    for row in iter_tsv(artifact_root / "figure_index.tsv"):
+        if is_pdf_figure_artifact_row(row) and (path := optional_text(row.get("path"))):
+            yield safe_artifact_relative_path(path)
+
+
+def pdf_table_artifact_paths(artifact_root: Path) -> Iterator[str]:
+    for row in iter_tsv(artifact_root / "table_index.tsv"):
+        if not is_pdf_table_artifact_row(row):
+            continue
+        if csv_path := optional_text(row.get("csv")):
+            yield safe_artifact_relative_path(csv_path)
+        if markdown_path := optional_text(row.get("markdown")):
+            yield safe_artifact_relative_path(markdown_path)
+
+
+def media_keyframe_artifact_paths(artifact_root: Path) -> Iterator[str]:
+    for row in iter_tsv(artifact_root / "media" / "keyframes.tsv"):
+        if is_media_keyframe_artifact_row(row) and (path := optional_text(row.get("path"))):
+            yield safe_artifact_relative_path(path)
+
+
+def safe_artifact_relative_path(path: str) -> str:
+    normalized = optional_text(path)
+    if not normalized:
+        raise ArchiveError("Document artifact path is required.")
+    candidate = Path(normalized)
+    if candidate.is_absolute() or any(part == ".." for part in candidate.parts):
+        raise ArchiveError("Document artifact path must stay inside the extracted artifact directory.")
+    return candidate.as_posix()
+
+
+def is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
 
 
 def optional_text(value: str | None) -> str | None:
@@ -1283,12 +1691,18 @@ def youtube_description_text(metadata: YouTubeVideoMetadata) -> str | None:
 
 
 def youtube_keyframe_span(keyframes: list[dict[str, str | int]]) -> str:
+    sample_limit = 20
     lines = [
         "Extracted YouTube video keyframes at one frame per second.",
         "Each keyframe path points to a PNG artifact preserved with the source snapshot.",
+        f"Keyframe count: {len(keyframes)}.",
     ]
-    for keyframe in keyframes:
+    if keyframes:
+        lines.append(f"Time range seconds: {keyframes[0]['offsetSeconds']} to {keyframes[-1]['offsetSeconds']}.")
+    for keyframe in keyframes[:sample_limit]:
         lines.append(f"second {keyframe['offsetSeconds']}: {keyframe['path']}")
+    if len(keyframes) > sample_limit:
+        lines.append(f"{len(keyframes) - sample_limit} additional keyframes are listed in media/keyframes.tsv.")
     return "\n".join(lines)
 
 

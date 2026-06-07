@@ -1,10 +1,17 @@
-import type { CreatePluginSessionInput, HookDefinition, JsonSchemaLike, PluginRuleContribution, PluginSession, PluginSessionSnapshot, PluginSkillContribution, PluginVoiceContext, WorkspacePlugin } from "@cloudx/plugin-api";
+import type { CreatePluginSessionInput, HookCallContext, HookDefinition, JsonSchemaLike, PluginRuleContribution, PluginSession, PluginSessionSnapshot, PluginSkillContribution, PluginVoiceContext, WorkspacePlugin } from "@cloudx/plugin-api";
 import type { ConfigFieldDescriptor, WorkspaceTab } from "@cloudx/shared";
 
 import type { DocumentationClient } from "../documentation/DocumentationClient.js";
+import { DocumentationIngestQueue, type DocumentationIngestJobSnapshot, type DocumentationIngestQueueOperationContext } from "../documentation/DocumentationIngestQueue.js";
 import {
   DEFAULT_DOCUMENTATION_ENRICHMENT_SKILL_IDS,
+  DEFAULT_DOCUMENTATION_IMAGE_ANALYSIS_MODEL,
   DOCUMENTATION_AI_ENRICHMENT_ENABLED_KEY,
+  DOCUMENTATION_AI_ANSWER_MODEL_KEY,
+  DOCUMENTATION_AI_IMAGE_ANALYSIS_MODEL_KEY,
+  DOCUMENTATION_AI_MODEL_OPTIONS,
+  DOCUMENTATION_AI_TEXT_ANALYSIS_MODEL_KEY,
+  DOCUMENTATION_AI_USE_VOICE_MODEL,
   DOCUMENTATION_AI_ENRICHMENT_SKILLS_KEY,
   DOCUMENTATION_PLUGIN_ID,
   type DocumentationEnrichmentService
@@ -29,10 +36,35 @@ export class DocumentationPlugin implements WorkspacePlugin {
       defaultValue: true
     },
     {
+      key: DOCUMENTATION_AI_IMAGE_ANALYSIS_MODEL_KEY,
+      label: "Image analysis model",
+      type: "select",
+      description: "Model used for visual, image, table, graph, and keyframe enrichment. Defaults to the cheapest Codex image-capable model from current OpenAI docs.",
+      defaultValue: DEFAULT_DOCUMENTATION_IMAGE_ANALYSIS_MODEL,
+      options: DOCUMENTATION_AI_MODEL_OPTIONS
+    },
+    {
+      key: DOCUMENTATION_AI_TEXT_ANALYSIS_MODEL_KEY,
+      label: "Text enrichment model",
+      type: "select",
+      description: "Model used for non-visual documentation enrichment such as metadata and text-only imports.",
+      defaultValue: DOCUMENTATION_AI_USE_VOICE_MODEL,
+      options: DOCUMENTATION_AI_MODEL_OPTIONS
+    },
+    {
+      key: DOCUMENTATION_AI_ANSWER_MODEL_KEY,
+      label: "Assisted answer model",
+      type: "select",
+      description: "Model used when the Documentation panel synthesizes source-grounded answers.",
+      defaultValue: DOCUMENTATION_AI_USE_VOICE_MODEL,
+      options: DOCUMENTATION_AI_MODEL_OPTIONS
+    },
+    {
       key: DOCUMENTATION_AI_ENRICHMENT_SKILLS_KEY,
       label: "AI enrichment skills",
       type: "string",
       description: "Comma-separated CloudX skill ids that define how imported documentation should be improved.",
+      visibility: "internal",
       defaultValue: DEFAULT_DOCUMENTATION_ENRICHMENT_SKILL_IDS.join(",")
     }
   ];
@@ -60,17 +92,25 @@ export class DocumentationPlugin implements WorkspacePlugin {
   constructor(
     private readonly client: DocumentationClient,
     private readonly pathPolicy: PathPolicy,
+    private readonly ingestQueue: DocumentationIngestQueue,
     private readonly enrichmentProvider: () => DocumentationEnrichmentService | undefined = () => undefined
   ) {
     this.hooks = [
       readHook("documentation.health", "Documentation Health", "Return documentation indexer health.", () => this.client.health()),
       readHook("documentation.stats", "Documentation Stats", "Return archive counts and portable paths.", () => this.client.stats()),
+      readHook("documentation.ingest.queue", "Documentation Ingest Queue", "Return queued, running, and recent documentation ingest jobs.", () => this.ingestQueue.list()),
+      writeHook("documentation.ingest.queue.clearFinished", "Clear Documentation Ingest Queue", "Remove completed and failed documentation ingest jobs from the queue view.", () => this.ingestQueue.clearFinished()),
       readHook("documentation.portableManifest", "Documentation Portable Manifest", "Return files that make up the portable archive.", () => this.client.portableManifest()),
       readHook("documentation.documents.list", "List Documentation", "List documentation records.", (input) => this.client.listDocuments(input), {
         states: { type: "array", items: { type: "string" } }
       }),
       readHook("documentation.documents.get", "Get Documentation", "Fetch one documentation record with chunks and events.", (input) => this.client.getDocument(input), {
-        documentId: { type: "string" }
+        documentId: { type: "string" },
+        chunkOffset: { type: "number" },
+        chunkLimit: { type: "number" },
+        chunkTextMaxChars: { type: "number" },
+        artifactOffset: { type: "number" },
+        artifactLimit: { type: "number" }
       }, ["documentId"]),
       readHook("documentation.search", "Search Documentation", "Search active local documentation and return source-grounded results.", (input) => this.client.search(input), {
         query: { type: "string" },
@@ -95,9 +135,12 @@ export class DocumentationPlugin implements WorkspacePlugin {
         collection: { type: "string" },
         mode: { type: "string", enum: ["hybrid", "dense", "lexical"] }
       }, ["question"], ["ui", "http"]),
-      writeHook("documentation.ingest.path", "Ingest Documentation Path", "Ingest a local file or directory under configured allowed roots.", async (input) => {
+      writeHook("documentation.ingest.path", "Ingest Documentation Path", "Ingest a local file or directory under configured allowed roots.", async (input, context) => {
         const path = this.pathPolicy.resolve(requireString(input.path, "path"));
-        return this.enrich(await this.client.ingestPath({ ...input, path }));
+        return this.enqueueIngest("path", titleOrFallback(input.title, path), path, "Reading local path and extracting source evidence.", async (job) => {
+          job.update({ progress: 35, stage: "Indexer is reading the local path and extracting source evidence." });
+          return this.enrichQueued(await this.client.ingestPath({ ...input, path }), job);
+        }, context);
       }, {
         path: { type: "string" },
         title: { type: "string" },
@@ -105,7 +148,10 @@ export class DocumentationPlugin implements WorkspacePlugin {
         collection: { type: "string" },
         tags: { type: "array", items: { type: "string" } }
       }, ["path"]),
-      externalHook("documentation.ingest.url", "Ingest Documentation URL", "Download a URL source, ingest a YouTube video with transcript and keyframes, or ingest every video in a YouTube playlist.", async (input) => this.enrich(await this.client.ingestUrl(input)), {
+      externalHook("documentation.ingest.url", "Ingest Documentation URL", "Download a URL source, ingest a YouTube video with transcript and keyframes, or ingest every video in a YouTube playlist.", async (input, context) => this.enqueueIngest("url", titleOrFallback(input.title, requireString(input.url, "url")), requireString(input.url, "url"), "Downloading URL and extracting source evidence.", async (job) => {
+        job.update({ progress: 30, stage: urlIngestStage(requireString(input.url, "url")) });
+        return this.enrichQueued(await this.client.ingestUrl(input), job);
+      }, context), {
         url: { type: "string" },
         title: { type: "string" },
         sourceType: { type: "string" },
@@ -113,7 +159,10 @@ export class DocumentationPlugin implements WorkspacePlugin {
         tags: { type: "array", items: { type: "string" } },
         transcript: { type: "string" }
       }, ["url"]),
-      writeHook("documentation.ingest.text", "Ingest Documentation Text", "Ingest direct text, transcript, or copied source material.", async (input) => this.enrich(await this.client.ingestText(input)), {
+      writeHook("documentation.ingest.text", "Ingest Documentation Text", "Ingest direct text, transcript, or copied source material.", async (input, context) => this.enqueueIngest("text", titleOrFallback(input.title, "Text source"), optionalString(input.uri) ?? "direct text", "Writing text into the archive.", async (job) => {
+        job.update({ progress: 35, stage: "Indexer is writing text into the archive." });
+        return this.enrichQueued(await this.client.ingestText(input), job);
+      }, context), {
         title: { type: "string" },
         text: { type: "string" },
         uri: { type: "string" },
@@ -155,6 +204,30 @@ export class DocumentationPlugin implements WorkspacePlugin {
 
   private enrich(response: Record<string, unknown>): Promise<Record<string, unknown>> | Record<string, unknown> {
     return this.enrichmentProvider()?.enrichIngestResponse(response) ?? response;
+  }
+
+  private enqueueIngest(
+    kind: "path" | "url" | "text",
+    label: string,
+    detail: string,
+    runningStage: string,
+    operation: (context: DocumentationIngestQueueOperationContext) => Promise<Record<string, unknown>>,
+    hookContext?: HookCallContext
+  ): Promise<Record<string, unknown>> {
+    return this.ingestQueue.enqueue({
+      kind,
+      label,
+      detail,
+      runningStage,
+      operation
+    }, hookContext?.reportProgress ? (snapshot) => hookContext.reportProgress?.(hookProgress(snapshot)) : undefined);
+  }
+
+  private async enrichQueued(response: Record<string, unknown>, job: DocumentationIngestQueueOperationContext): Promise<Record<string, unknown>> {
+    job.update({ progress: 78, stage: "Running AI enrichment for the imported documentation." });
+    const enriched = await this.enrich(response);
+    job.update({ progress: 92, stage: "Finalizing documentation import." });
+    return enriched;
   }
 }
 
@@ -249,6 +322,32 @@ function requireString(value: unknown, name: string): string {
   return value.trim();
 }
 
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function titleOrFallback(value: unknown, fallback: string): string {
+  return optionalString(value) ?? fallback;
+}
+
+function urlIngestStage(url: string): string {
+  return /(?:youtube\.com|youtu\.be)/iu.test(url)
+    ? "Fetching media metadata, transcript, keyframes, and enrichment evidence."
+    : "Downloading URL and extracting source evidence.";
+}
+
+function hookProgress(snapshot: DocumentationIngestJobSnapshot) {
+  return {
+    message: `${snapshot.label}: ${snapshot.stage}`,
+    progress: snapshot.progress,
+    stage: snapshot.stage,
+    status: snapshot.status,
+    jobId: snapshot.id,
+    detail: snapshot.detail,
+    position: snapshot.position
+  };
+}
+
 function defaultDocumentationSkills(): PluginSkillContribution[] {
   return [
     {
@@ -273,8 +372,9 @@ function defaultDocumentationSkills(): PluginSkillContribution[] {
       name: "Documentation Ingest",
       description: "Add uploaded files, local files, directories, websites, YouTube videos/playlists, copied text, or transcripts to the documentation archive.",
       instructions: skillInstructions("Ingest", [
-        "Read `CLOUDX_DOCUMENTATION_URL`. If it is missing, stop and explain that the documentation indexer URL is not available.",
-        "Use multipart `/ingest/upload` for file bytes, `/ingest/path` for local files or directories already visible to the indexer, `/ingest/url` for websites, URLs, YouTube videos, and YouTube playlists, and `/ingest/text` for copied text or manual transcripts.",
+        "Read `CLOUDX_SERVER_URL` and `CLOUDX_DOCUMENTATION_URL`. If both are missing, stop and explain that no documentation ingest endpoint is available.",
+        "For Codex or automation ingest, prefer the CloudX server streaming hook when `CLOUDX_SERVER_URL` is set: call `POST $CLOUDX_SERVER_URL/api/hooks/documentation.ingest.url?stream=1`, `documentation.ingest.path?stream=1`, or `documentation.ingest.text?stream=1` with JSON `{ \"input\": ... }`; read NDJSON `progress` events until the final `result` or `error` event so the blocking call stays visibly alive and the plugin UI shows the queued job.",
+        "Use `documentation.ingest.path` for local files or directories visible to the server, `documentation.ingest.url` for websites, URLs, YouTube videos, and YouTube playlists, and `documentation.ingest.text` for copied text or manual transcripts. Use direct `$CLOUDX_DOCUMENTATION_URL/ingest/*` endpoints only when `CLOUDX_SERVER_URL` is unavailable; direct indexer calls bypass the CloudX queue and streamed progress.",
         "Set `sourceType` to one of `datasheet`, `book`, `website`, `repo_code`, `readme`, `media`, `image`, or `text` when the user gives enough context.",
         "Leave `title` and `collection` blank when the indexer should autodetect them from the file, folder, URL, playlist, upload, or first text line.",
         "When ingesting sources found online, prefer durable primary URLs and include the original source URL. Do not ingest search-result pages, low-trust mirrors, or unsupported summaries when a better source is available.",
@@ -362,6 +462,6 @@ function skillInstructions(title: string, steps: string[]): string {
     "",
     "## Request Pattern",
     "",
-    "Use `curl -sS` with `-H 'content-type: application/json'` for JSON POST endpoints. For `/ingest/upload`, use multipart form fields such as `curl -sS -F file=@source.pdf -F sourceType=datasheet \"$CLOUDX_DOCUMENTATION_URL/ingest/upload\"`. Keep JSON compact and quote user text safely."
+    "Use `curl -sS` with `-H 'content-type: application/json'` for JSON POST endpoints. For streaming CloudX server hook calls, use `curl -k -N -sS -H 'content-type: application/json' -H 'accept: application/x-ndjson'`. For direct fallback `/ingest/upload` calls, use multipart form fields such as `curl -sS -F file=@source.pdf -F sourceType=datasheet \"$CLOUDX_DOCUMENTATION_URL/ingest/upload\"`. Keep JSON compact and quote user text safely."
   ].join("\n");
 }

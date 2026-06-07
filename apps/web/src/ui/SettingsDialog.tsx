@@ -61,13 +61,18 @@ export function SettingsDialog({
     }));
   }
 
+  const globalFields = config.globalFields.filter(isUserVisibleConfigField);
+  const pluginSections = config.plugins
+    .map((plugin) => ({ ...plugin, fields: plugin.fields.filter(isUserVisibleConfigField) }))
+    .filter((plugin) => plugin.fields.length > 0);
+
   return (
     <div className="dialog-backdrop">
       <div className="dialog settings-dialog" ref={dialogRef}>
         <h2>Settings</h2>
         <section className="settings-section">
           <h3>Global</h3>
-          {config.globalFields.map((field) => (
+          {globalFields.map((field) => (
             <ConfigField key={field.key} field={field} value={values.global[field.key] ?? field.defaultValue} onChange={(value) => setGlobalValue(field.key, value)} />
           ))}
           {rulesSkillsStore ? (
@@ -83,8 +88,8 @@ export function SettingsDialog({
         {children}
         <section className="settings-section">
           <h3>Plugins</h3>
-          {config.plugins.length ? (
-            config.plugins.map((plugin) => (
+          {pluginSections.length ? (
+            pluginSections.map((plugin) => (
               <div key={plugin.pluginId} className="settings-plugin-section">
                 <h4>{plugin.displayName}</h4>
                 {plugin.fields.map((field) => (
@@ -125,7 +130,7 @@ function ConfigField({ field, value, onChange }: { field: ConfigFieldDescriptor;
         <select value={String(value)} onChange={(event) => onChange(parseSelectValue(event.target.value, field))}>
           {(field.options ?? []).map((option) => (
             <option key={`${field.key}:${String(option.value)}`} value={String(option.value)}>
-              {option.label}
+              {selectOptionLabel(option)}
             </option>
           ))}
         </select>
@@ -152,4 +157,12 @@ function ConfigField({ field, value, onChange }: { field: ConfigFieldDescriptor;
 
 function parseSelectValue(raw: string, field: ConfigFieldDescriptor): ConfigValue {
   return field.options?.find((option) => String(option.value) === raw)?.value ?? raw;
+}
+
+function selectOptionLabel(option: NonNullable<ConfigFieldDescriptor["options"]>[number]): string {
+  return option.description ? `${option.label} - ${option.description}` : option.label;
+}
+
+function isUserVisibleConfigField(field: ConfigFieldDescriptor): boolean {
+  return field.visibility !== "internal";
 }

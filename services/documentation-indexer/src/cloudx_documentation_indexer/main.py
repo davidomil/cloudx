@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import Annotated
 from typing import Sequence
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .archive import ACTIVE_STATE, ArchiveError, DocumentationArchive
@@ -89,8 +90,31 @@ def create_app(root: str | Path | None = None) -> FastAPI:
         return {"documents": archive.list_documents(states=[state.strip() for state in states.split(",") if state.strip()])}
 
     @app.get("/documents/{document_id}")
-    def document(document_id: str) -> dict:
-        return {"document": handle_archive_error(lambda: archive.get_document(document_id))}
+    def document(
+        document_id: str,
+        chunk_offset: Annotated[int | None, Query(alias="chunkOffset", ge=0)] = None,
+        chunk_limit: Annotated[int | None, Query(alias="chunkLimit", ge=0)] = None,
+        chunk_text_max_chars: Annotated[int | None, Query(alias="chunkTextMaxChars", ge=0)] = None,
+        artifact_offset: Annotated[int | None, Query(alias="artifactOffset", ge=0)] = None,
+        artifact_limit: Annotated[int | None, Query(alias="artifactLimit", ge=0)] = None,
+    ) -> dict:
+        return {
+            "document": handle_archive_error(
+                lambda: archive.get_document(
+                    document_id,
+                    chunk_offset=chunk_offset,
+                    chunk_limit=chunk_limit,
+                    chunk_text_max_chars=chunk_text_max_chars,
+                    artifact_offset=artifact_offset,
+                    artifact_limit=artifact_limit,
+                )
+            )
+        }
+
+    @app.get("/documents/{document_id}/artifact")
+    def document_artifact(document_id: str, path: str) -> FileResponse:
+        artifact = handle_archive_error(lambda: archive.document_artifact_file(document_id, path))
+        return FileResponse(artifact.path, media_type=artifact.media_type, filename=artifact.filename)
 
     @app.delete("/documents/{document_id}")
     def remove_document(document_id: str) -> dict:

@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { CloudxSkill, RulesSkillsStore } from "@cloudx/shared";
+import type { CloudxSkill, ConfigFieldOption, RulesSkillsStore } from "@cloudx/shared";
 
 import type { AsrClient } from "../asrClient.js";
 import type { ConfigService } from "../configService.js";
@@ -16,6 +16,38 @@ import { DEFAULT_DOCUMENTATION_TIMEOUT_MS, type DocumentationClient } from "./Do
 export const DOCUMENTATION_PLUGIN_ID = "documentation";
 export const DOCUMENTATION_AI_ENRICHMENT_ENABLED_KEY = "aiEnrichmentEnabled";
 export const DOCUMENTATION_AI_ENRICHMENT_SKILLS_KEY = "aiEnrichmentSkillIds";
+export const DOCUMENTATION_AI_IMAGE_ANALYSIS_MODEL_KEY = "aiImageAnalysisModel";
+export const DOCUMENTATION_AI_TEXT_ANALYSIS_MODEL_KEY = "aiTextAnalysisModel";
+export const DOCUMENTATION_AI_ANSWER_MODEL_KEY = "aiAnswerModel";
+export const DOCUMENTATION_AI_USE_VOICE_MODEL = "__voice_model__";
+export const DEFAULT_DOCUMENTATION_IMAGE_ANALYSIS_MODEL = "gpt-5.4-mini";
+export const DOCUMENTATION_AI_MODEL_OPTIONS: ConfigFieldOption[] = [
+  {
+    label: "Same as voice control",
+    value: DOCUMENTATION_AI_USE_VOICE_MODEL,
+    description: "Use the current CloudX voice-control Codex model."
+  },
+  {
+    label: "GPT-5.5",
+    value: "gpt-5.5",
+    description: "Frontier model for complex coding, research, and real-world work."
+  },
+  {
+    label: "GPT-5.4",
+    value: "gpt-5.4",
+    description: "Strong model for everyday coding."
+  },
+  {
+    label: "GPT-5.4-Mini",
+    value: "gpt-5.4-mini",
+    description: "Small, fast, and cost-efficient model for simpler coding tasks."
+  },
+  {
+    label: "GPT-5.3-Codex-Spark",
+    value: "gpt-5.3-codex-spark",
+    description: "Ultra-fast coding model."
+  }
+];
 export const DEFAULT_DOCUMENTATION_ENRICHMENT_SKILL_IDS = [
   "documentation-enrich-metadata",
   "documentation-enrich-visuals",
@@ -36,11 +68,12 @@ export interface DocumentationEnrichmentRunner {
   run(prompt: string, options?: DocumentationRunnerOptions): Promise<unknown>;
 }
 
-interface DocumentationRunnerOptions {
+export interface DocumentationRunnerOptions {
   schemaPath?: string;
   outputPrefix?: string;
   timeoutMs?: number;
   taskLabel?: string;
+  model?: string;
 }
 
 export interface DocumentationEnrichmentSource {
@@ -66,8 +99,9 @@ export class CodexDocumentationEnrichmentRunner implements DocumentationEnrichme
   ) {}
 
   async run(prompt: string, options: DocumentationRunnerOptions = {}): Promise<unknown> {
+    const model = options.model ?? this.model;
     return JSON.parse(
-      await runCodexExec(this.model, prompt, {
+      await runCodexExec(model, prompt, {
         schemaPath: options.schemaPath ?? ENRICHMENT_SCHEMA_PATH,
         outputPrefix: options.outputPrefix ?? "cloudx-doc-enrich-",
         timeoutMs: options.timeoutMs ?? this.timeoutMs,
@@ -114,6 +148,7 @@ export class DocumentationEnrichmentService {
     if (!this.isEnabled()) {
       throw new Error("Documentation AI assistance is disabled. Manual search can inspect source text only.");
     }
+    const model = this.configuredModel(DOCUMENTATION_AI_ANSWER_MODEL_KEY, this.options.runner.model);
     const question = requiredQuestion(input);
     const searchInput = answerSearchInput(input, question);
     const searchResponse = await this.options.client.search(searchInput);
@@ -125,7 +160,7 @@ export class DocumentationEnrichmentService {
         citations: [],
         warnings: ["No archive search results matched the question."],
         results,
-        model: this.options.runner.model
+        model
       };
     }
     const evidence = await this.answerEvidence(results);
@@ -133,10 +168,11 @@ export class DocumentationEnrichmentService {
       await this.options.runner.run(buildAnswerPrompt(question, evidence), {
         schemaPath: ANSWER_SCHEMA_PATH,
         outputPrefix: "cloudx-doc-answer-",
-        taskLabel: "documentation answer"
+        taskLabel: "documentation answer",
+        model
       })
     );
-    return { ...output, results, model: this.options.runner.model };
+    return { ...output, results, model };
   }
 
   private async enrichDocument(document: IngestedDocumentRef, source: DocumentationEnrichmentSource): Promise<Record<string, unknown>> {
@@ -152,10 +188,11 @@ export class DocumentationEnrichmentService {
         artifacts: await this.documentArtifacts(fullDocument),
         media: mediaEvidence
       };
+      const model = this.enrichmentModel(skillIds, evidence);
       const batches = buildEvidenceBatches(evidence);
       const outputs = [];
       for (const batch of batches) {
-        outputs.push(normalizeEnrichmentOutput(await this.options.runner.run(buildEnrichmentPrompt(skills, batch))));
+        outputs.push(normalizeEnrichmentOutput(await this.options.runner.run(buildEnrichmentPrompt(skills, batch), { model })));
       }
       const output = mergeEnrichmentOutputs(outputs);
       if (output.spans.length === 0) {
@@ -169,7 +206,7 @@ export class DocumentationEnrichmentService {
       await this.options.client.enrichDocument({
         documentId: document.documentId,
         spans: output.spans,
-        model: this.options.runner.model,
+        model,
         skillIds,
         summary: output.summary,
         payload: {
@@ -292,6 +329,22 @@ export class DocumentationEnrichmentService {
       languageProbability: transcript?.language_probability,
       keyframes
     };
+  }
+
+  private enrichmentModel(skillIds: string[], evidence: EnrichmentEvidence): string {
+    const imageAnalysis = usesImageAnalysis(skillIds, evidence);
+    return this.configuredModel(
+      imageAnalysis ? DOCUMENTATION_AI_IMAGE_ANALYSIS_MODEL_KEY : DOCUMENTATION_AI_TEXT_ANALYSIS_MODEL_KEY,
+      imageAnalysis ? DEFAULT_DOCUMENTATION_IMAGE_ANALYSIS_MODEL : this.options.runner.model
+    );
+  }
+
+  private configuredModel(key: string, defaultModel: string): string {
+    const value = this.options.config.getPluginConfig(DOCUMENTATION_PLUGIN_ID)[key];
+    if (typeof value !== "string" || value === DOCUMENTATION_AI_USE_VOICE_MODEL) {
+      return value === DOCUMENTATION_AI_USE_VOICE_MODEL ? this.options.runner.model : defaultModel;
+    }
+    return value;
   }
 }
 
@@ -422,6 +475,12 @@ function configuredSkillIds(value: unknown): string[] {
   return skillIds.length > 0 ? skillIds : DEFAULT_DOCUMENTATION_ENRICHMENT_SKILL_IDS;
 }
 
+function usesImageAnalysis(skillIds: string[], evidence: EnrichmentEvidence): boolean {
+  return skillIds.some((skillId) => /(?:visual|image)/iu.test(skillId))
+    || evidence.artifacts.length > 0
+    || Boolean(evidence.media?.keyframes.length);
+}
+
 function requiredQuestion(input: Record<string, unknown>): string {
   const value = typeof input.question === "string" ? input.question : typeof input.query === "string" ? input.query : "";
   const question = value.trim();
@@ -516,6 +575,7 @@ function buildEnrichmentPrompt(skills: CloudxSkill[], evidence: EnrichmentEviden
     "Create derived spans that make missing metadata, tables, graphs, flowcharts, screenshots, media transcript details, and extraction gaps searchable.",
     "Do not invent facts not grounded in the document chunks, extracted artifacts, ASR transcript, or keyframe evidence.",
     "When the evidence is insufficient, describe the limitation in warnings instead of guessing.",
+    "Return `metadata` as an array of { key, value } entries so each metadata value is source-grounded and explicitly named.",
     `This is evidence batch ${evidence.batch.index} of ${evidence.batch.total}. Process this batch only; CloudX will run every batch and merge all returned spans and warnings.`,
     "",
     "Configured skills:",
@@ -558,7 +618,7 @@ function normalizeEnrichmentOutput(value: unknown): EnrichmentOutput {
         text: typeof span.text === "string" ? span.text.trim() : ""
       }))
       .filter((span) => span.locator && span.text),
-    metadata: scalarRecord(record.metadata),
+    metadata: metadataEntriesRecord(record.metadata),
     warnings: arrayOfStrings(record.warnings)
   };
 }
@@ -596,6 +656,21 @@ function mergeEnrichmentOutputs(outputs: EnrichmentOutput[]): EnrichmentOutput {
     metadata,
     warnings: outputs.flatMap((output, index) => output.warnings.map((warning) => `batch ${index + 1}: ${warning}`))
   };
+}
+
+function metadataEntriesRecord(value: unknown): Record<string, string | number | boolean | null> {
+  const metadata: Record<string, string | number | boolean | null> = {};
+  for (const entry of recordsArray(value)) {
+    const key = typeof entry.key === "string" ? entry.key.trim() : "";
+    if (!key) {
+      continue;
+    }
+    const candidate = entry.value;
+    if (typeof candidate === "string" || typeof candidate === "number" || typeof candidate === "boolean" || candidate === null) {
+      metadata[key] = candidate;
+    }
+  }
+  return metadata;
 }
 
 function documentSummary(document: Record<string, unknown>): Record<string, unknown> {
@@ -806,17 +881,6 @@ function isVideoSource(source: DocumentationEnrichmentSource): boolean {
 function safeMediaFilename(filename: string | undefined): string {
   const safe = path.basename(filename || "upload.media").replace(/[^A-Za-z0-9._-]+/gu, "_");
   return safe || "upload.media";
-}
-
-function scalarRecord(value: unknown): Record<string, string | number | boolean | null> {
-  if (!isRecord(value)) {
-    return {};
-  }
-  return Object.fromEntries(
-    Object.entries(value).filter((entry): entry is [string, string | number | boolean | null] =>
-      typeof entry[1] === "string" || typeof entry[1] === "number" || typeof entry[1] === "boolean" || entry[1] === null
-    )
-  );
 }
 
 function recordsArray(value: unknown): Record<string, unknown>[] {

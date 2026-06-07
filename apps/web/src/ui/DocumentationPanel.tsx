@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type FormEvent, type SetStateAction } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type Dispatch, type FormEvent, type SetStateAction } from "react";
 import DOMPurify, { type Config as DOMPurifyConfig } from "dompurify";
-import { AlertTriangle, Archive, Bot, BookOpen, FilePlus, RefreshCw, Search, Trash2, Wrench } from "lucide-react";
+import { AlertTriangle, Bot, BookOpen, ExternalLink, FileImage, FilePlus, Info, RefreshCw, Search, Table2, Trash2 } from "lucide-react";
 
 import type { UiContributionRenderContext } from "./uiContributions.js";
 import { ControlButton } from "./Control.js";
@@ -46,13 +46,49 @@ export interface DocumentationChunk {
   chunkId?: number;
   locator?: string;
   text?: string;
+  textLength?: number;
+  textTruncated?: boolean;
   state?: string;
   chunk_origin?: string;
   chunkOrigin?: string;
 }
 
+export interface DocumentationArtifactLink {
+  kind?: string;
+  path?: string;
+  mimeType?: string;
+  bytes?: number;
+  available?: boolean;
+}
+
+export interface DocumentationArtifact extends DocumentationArtifactLink {
+  id?: string;
+  type?: string;
+  locator?: string;
+  page?: number;
+  rows?: number;
+  columns?: number;
+  nonEmptyCells?: number;
+  totalCells?: number;
+  width?: number;
+  height?: number;
+  frames?: number;
+  offsetSeconds?: number;
+  alternatePaths?: DocumentationArtifactLink[];
+}
+
 export interface DocumentationDetail extends DocumentationRecord {
   chunks?: DocumentationChunk[];
+  artifacts?: DocumentationArtifact[];
+  chunkWindow?: DocumentationWindow;
+  artifactWindow?: DocumentationWindow;
+}
+
+export interface DocumentationWindow {
+  offset?: number;
+  limit?: number;
+  total?: number;
+  hasMore?: boolean;
 }
 
 export interface DocumentationAnswerCitation {
@@ -92,20 +128,42 @@ interface DocumentationEnrichmentNotice {
 
 export type IngestMode = "upload" | "path" | "url" | "text";
 export type SearchPresentationMode = "answer" | "manual";
-export type SearchMode = "hybrid" | "dense" | "lexical";
 export type DocumentationIngestJobStatus = "queued" | "running" | "complete" | "failed";
 
+export interface DocumentationServerIngestJob {
+  id: string;
+  kind?: string;
+  label?: string;
+  detail?: string;
+  status?: DocumentationIngestJobStatus;
+  progress?: number;
+  stage?: string;
+  position?: number;
+  error?: string;
+}
+
 export type DocumentationIngestRequest =
-  | { mode: "upload"; file: File; title?: string; sourceType?: string; collection?: string }
-  | { mode: "path"; path: string; title?: string; sourceType?: string; collection?: string }
-  | { mode: "url"; url: string; title?: string; sourceType?: string; collection?: string; transcript?: string }
-  | { mode: "text"; title?: string; text: string; uri?: string; sourceType?: string; collection?: string };
+  | { mode: "upload"; file: File; title?: string; collection?: string }
+  | { mode: "path"; path: string; title?: string; collection?: string }
+  | { mode: "url"; url: string; title?: string; collection?: string }
+  | { mode: "text"; title?: string; text: string; uri?: string; collection?: string };
 
 export interface DocumentationIngestJob {
   id: string;
   label: string;
   detail: string;
   request: DocumentationIngestRequest;
+  progress: number;
+  status: DocumentationIngestJobStatus;
+  stage: string;
+  error?: string;
+  notice?: string;
+}
+
+interface DocumentationIngestJobView {
+  id: string;
+  label: string;
+  detail: string;
   progress: number;
   status: DocumentationIngestJobStatus;
   stage: string;
@@ -125,36 +183,31 @@ export interface DocumentationPanelState {
   searchBusy: boolean;
   documentBusy: boolean;
   searchPresentationMode: SearchPresentationMode;
-  searchMode: SearchMode;
-  searchSourceType: string;
-  searchState: string;
   searchCollection: string;
   mode: IngestMode;
-  sourceType: string;
   uploadValue: File | undefined;
   pathValue: string;
   urlValue: string;
   title: string;
   textValue: string;
-  transcriptValue: string;
   collection: string;
   uploadInputKey: number;
-  portableFiles: Array<{ path?: string; bytes?: number }>;
   ingestJobs: DocumentationIngestJob[];
+  serverIngestJobs: DocumentationServerIngestJob[];
 }
 
 export type DocumentationPanelStateUpdater = (state: DocumentationPanelState | undefined) => DocumentationPanelState;
 
-const SEARCH_MODES: SearchMode[] = ["hybrid", "dense", "lexical"];
-const SOURCE_TYPES = ["datasheet", "book", "website", "repo_code", "readme", "media", "image", "text"];
-const INGEST_SOURCE_TYPES = ["auto", ...SOURCE_TYPES];
 const INVALIDATION_STATES = ["stale", "revoked", "superseded", "quarantined", "deleted"];
-const SEARCH_STATES = ["active", ...INVALIDATION_STATES];
 const DOCUMENTATION_ANSWER_SANITIZE_CONFIG = {
   ALLOWED_TAGS: ["div", "section", "h4", "h5", "p", "ol", "ul", "li", "strong", "em", "code", "pre", "blockquote", "table", "thead", "tbody", "tr", "th", "td"],
   ALLOWED_ATTR: []
 } satisfies DOMPurifyConfig;
 const DEFAULT_DOCUMENTATION_PANEL_STATE_KEY = "documentation-panel-default";
+const SOURCE_CHUNK_PAGE_SIZE = 75;
+const SOURCE_ARTIFACT_PAGE_SIZE = 100;
+const SOURCE_CHUNK_TEXT_MAX_CHARS = 4_000;
+const MAX_INLINE_ARTIFACT_PREVIEWS_PER_CHUNK = 6;
 let documentationIngestJobCounter = 0;
 
 export function createInitialDocumentationPanelState(): DocumentationPanelState {
@@ -170,22 +223,17 @@ export function createInitialDocumentationPanelState(): DocumentationPanelState 
     searchBusy: false,
     documentBusy: false,
     searchPresentationMode: "answer",
-    searchMode: "hybrid",
-    searchSourceType: "",
-    searchState: "active",
     searchCollection: "",
     mode: "upload",
-    sourceType: "auto",
     uploadValue: undefined,
     pathValue: "",
     urlValue: "",
     title: "",
     textValue: "",
-    transcriptValue: "",
     collection: "",
     uploadInputKey: 0,
-    portableFiles: [],
-    ingestJobs: []
+    ingestJobs: [],
+    serverIngestJobs: []
   };
 }
 
@@ -223,23 +271,20 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   const [searchBusy, setSearchBusy] = useDocumentationStateField("searchBusy", state, onStateChange);
   const [documentBusy, setDocumentBusy] = useDocumentationStateField("documentBusy", state, onStateChange);
   const [searchPresentationMode, setSearchPresentationMode] = useDocumentationStateField("searchPresentationMode", state, onStateChange);
-  const [searchMode, setSearchMode] = useDocumentationStateField("searchMode", state, onStateChange);
-  const [searchSourceType, setSearchSourceType] = useDocumentationStateField("searchSourceType", state, onStateChange);
-  const [searchState, setSearchState] = useDocumentationStateField("searchState", state, onStateChange);
   const [searchCollection, setSearchCollection] = useDocumentationStateField("searchCollection", state, onStateChange);
   const [mode, setMode] = useDocumentationStateField("mode", state, onStateChange);
-  const [sourceType, setSourceType] = useDocumentationStateField("sourceType", state, onStateChange);
   const [uploadValue, setUploadValue] = useDocumentationStateField("uploadValue", state, onStateChange);
   const [pathValue, setPathValue] = useDocumentationStateField("pathValue", state, onStateChange);
   const [urlValue, setUrlValue] = useDocumentationStateField("urlValue", state, onStateChange);
   const [title, setTitle] = useDocumentationStateField("title", state, onStateChange);
   const [textValue, setTextValue] = useDocumentationStateField("textValue", state, onStateChange);
-  const [transcriptValue, setTranscriptValue] = useDocumentationStateField("transcriptValue", state, onStateChange);
   const [collection, setCollection] = useDocumentationStateField("collection", state, onStateChange);
   const [uploadInputKey, setUploadInputKey] = useDocumentationStateField("uploadInputKey", state, onStateChange);
-  const [portableFiles, setPortableFiles] = useDocumentationStateField("portableFiles", state, onStateChange);
   const [ingestJobs, setIngestJobs] = useDocumentationStateField("ingestJobs", state, onStateChange);
+  const [serverIngestJobs, setServerIngestJobs] = useDocumentationStateField("serverIngestJobs", state, onStateChange);
   const sourceViewerRef = useRef<HTMLElement | null>(null);
+  const sourceViewerScrollDocumentIdRef = useRef("");
+  const aiNoticeId = useId();
   const ingestController = useMemo(() => documentationIngestController(stateKey), [stateKey]);
 
   const canCall = Boolean(callHook);
@@ -252,13 +297,28 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   }, []);
 
   useEffect(() => {
+    if (!canCall) {
+      return undefined;
+    }
+    void loadIngestQueue();
+    const interval = window.setInterval(() => void loadIngestQueue(), 1_500);
+    return () => window.clearInterval(interval);
+  }, [canCall]);
+
+  useEffect(() => {
     if (!aiAssistanceEnabled && searchPresentationMode === "answer") {
       setSearchPresentationMode("manual");
     }
   }, [aiAssistanceEnabled, searchPresentationMode]);
 
   useEffect(() => {
-    if (selectedDocument && typeof sourceViewerRef.current?.scrollIntoView === "function") {
+    const currentDocumentId = selectedDocument ? documentId(selectedDocument) : "";
+    if (!currentDocumentId) {
+      sourceViewerScrollDocumentIdRef.current = "";
+      return;
+    }
+    if (sourceViewerScrollDocumentIdRef.current !== currentDocumentId && typeof sourceViewerRef.current?.scrollIntoView === "function") {
+      sourceViewerScrollDocumentIdRef.current = currentDocumentId;
       sourceViewerRef.current?.scrollIntoView({ block: "start", behavior: "auto" });
     }
   }, [selectedDocument]);
@@ -272,7 +332,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
 
   async function refresh() {
     await run("Documentation archive refreshed.", async () => {
-      await loadArchiveSummary();
+      await Promise.all([loadArchiveSummary(), loadIngestQueue()]);
     });
   }
 
@@ -283,6 +343,18 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
     ]);
     setStats(statsResult);
     setDocuments(docsResult.documents ?? []);
+  }
+
+  async function loadIngestQueue() {
+    if (!canCall) {
+      return;
+    }
+    try {
+      const result = await call<{ jobs?: DocumentationServerIngestJob[] }>("documentation.ingest.queue");
+      setServerIngestJobs(result.jobs ?? []);
+    } catch {
+      setServerIngestJobs([]);
+    }
   }
 
   async function search(event?: FormEvent) {
@@ -323,9 +395,8 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
       query: query.trim(),
       question: includeQuestion ? query.trim() : undefined,
       limit: 12,
-      mode: searchMode,
-      sourceTypes: searchSourceType ? [searchSourceType] : undefined,
-      states: searchState ? [searchState] : undefined,
+      mode: "hybrid",
+      states: ["active"],
       collection: searchCollection.trim()
     });
   }
@@ -339,13 +410,11 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
     try {
       const job = createIngestJob({
         mode,
-        sourceType,
         uploadValue,
         pathValue,
         urlValue,
         title,
         textValue,
-        transcriptValue,
         collection
       });
       ingestController.queue.push(job);
@@ -364,7 +433,6 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
     setUrlValue("");
     setTitle("");
     setTextValue("");
-    setTranscriptValue("");
     setUploadInputKey((current) => current + 1);
   }
 
@@ -405,6 +473,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
         stage: enrichmentNotice?.stage ?? "Import complete.",
         notice: enrichmentNotice?.notice
       });
+      await loadIngestQueue();
       setStatus(enrichmentNotice?.status ?? `Imported ${job.label}.`);
     } catch (error) {
       if (ingestController.disposed) {
@@ -416,6 +485,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
         stage: "Import failed.",
         error: error instanceof Error ? error.message : String(error)
       });
+      await loadIngestQueue();
       setStatus(error instanceof Error ? error.message : String(error));
     }
   }
@@ -424,13 +494,12 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
     const request = job.request;
     if (request.mode === "path") {
       updateIngestJob(job.id, { progress: 25, stage: "Reading local path and extracting source evidence." });
-      return call<DocumentationIngestResponse>("documentation.ingest.path", compactInput({ path: request.path, title: request.title, sourceType: request.sourceType, collection: request.collection }));
+      return call<DocumentationIngestResponse>("documentation.ingest.path", compactInput({ path: request.path, title: request.title, collection: request.collection }));
     } else if (request.mode === "upload") {
       updateIngestJob(job.id, { progress: 10, stage: "Uploading file bytes." });
       const response = await uploadFile({
         file: request.file,
         title: request.title,
-        sourceType: request.sourceType,
         collection: request.collection,
         onProgress: (progress) => updateUploadIngestProgress(job.id, progress)
       });
@@ -438,10 +507,10 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
       return response as DocumentationIngestResponse;
     } else if (request.mode === "url") {
       updateIngestJob(job.id, { progress: 30, stage: urlIngestStage(request) });
-      return call<DocumentationIngestResponse>("documentation.ingest.url", compactInput({ url: request.url, title: request.title, sourceType: request.sourceType, collection: request.collection, transcript: request.transcript }));
+      return call<DocumentationIngestResponse>("documentation.ingest.url", compactInput({ url: request.url, title: request.title, collection: request.collection }));
     } else {
       updateIngestJob(job.id, { progress: 35, stage: "Writing text into the archive." });
-      return call<DocumentationIngestResponse>("documentation.ingest.text", compactInput({ title: request.title, text: request.text, uri: request.uri, sourceType: request.sourceType, collection: request.collection }));
+      return call<DocumentationIngestResponse>("documentation.ingest.text", compactInput({ title: request.title, text: request.text, uri: request.uri, collection: request.collection }));
     }
   }
 
@@ -463,6 +532,11 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
 
   function clearFinishedIngestJobs() {
     setIngestJobs((current) => current.filter((job) => job.status === "queued" || job.status === "running"));
+    if (canCall) {
+      void call<Record<string, unknown>>("documentation.ingest.queue.clearFinished")
+        .then((result) => setServerIngestJobs(Array.isArray(result.jobs) ? result.jobs as DocumentationServerIngestJob[] : []))
+        .catch((error) => setStatus(error instanceof Error ? error.message : String(error)));
+    }
   }
 
   async function invalidate(documentId: string, state: string) {
@@ -473,9 +547,10 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
     });
   }
 
-  async function remove(documentId: string) {
+  async function remove(targetDocumentId: string) {
     await run("Document removed from active search.", async () => {
-      await call("documentation.remove", { documentId });
+      await call("documentation.remove", { documentId: targetDocumentId });
+      setSelectedDocument((current) => current && documentId(current) === targetDocumentId ? undefined : current);
       await search();
       await refresh();
     });
@@ -491,7 +566,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
     }
     setDocumentBusy(true);
     try {
-      const result = await call<{ document?: DocumentationDetail }>("documentation.documents.get", { documentId: id });
+      const result = await call<{ document?: DocumentationDetail }>("documentation.documents.get", sourceDocumentWindowInput(id));
       setSelectedDocument(result.document);
       setStatus("Source loaded.");
     } catch (error) {
@@ -501,18 +576,56 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
     }
   }
 
-  async function loadPortableManifest() {
-    await run("Portable manifest loaded.", async () => {
-      const manifest = await call<{ files?: Array<{ path?: string; bytes?: number }> }>("documentation.portableManifest");
-      setPortableFiles(manifest.files ?? []);
-    });
+  async function loadMoreSourceChunks() {
+    const current = selectedDocument;
+    const id = current ? documentId(current) : "";
+    if (!current || !id) {
+      return;
+    }
+    setDocumentBusy(true);
+    try {
+      const currentChunks = current.chunks ?? [];
+      const result = await call<{ document?: DocumentationDetail }>("documentation.documents.get", {
+        documentId: id,
+        chunkOffset: currentChunks.length,
+        chunkLimit: SOURCE_CHUNK_PAGE_SIZE,
+        chunkTextMaxChars: SOURCE_CHUNK_TEXT_MAX_CHARS,
+        artifactOffset: current.artifacts?.length ?? 0,
+        artifactLimit: 0
+      });
+      setSelectedDocument((latest) => latest && documentId(latest) === id ? mergeSourceWindow(latest, result.document, "chunks") : latest);
+      setStatus("Loaded more source chunks.");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDocumentBusy(false);
+    }
   }
 
-  async function rebuildIndex() {
-    await run("Turbovec index rebuilt.", async () => {
-      await call("documentation.rebuildIndex");
-      await refresh();
-    });
+  async function loadMoreSourceArtifacts() {
+    const current = selectedDocument;
+    const id = current ? documentId(current) : "";
+    if (!current || !id) {
+      return;
+    }
+    setDocumentBusy(true);
+    try {
+      const currentArtifacts = current.artifacts ?? [];
+      const result = await call<{ document?: DocumentationDetail }>("documentation.documents.get", {
+        documentId: id,
+        chunkOffset: current.chunks?.length ?? 0,
+        chunkLimit: 0,
+        chunkTextMaxChars: SOURCE_CHUNK_TEXT_MAX_CHARS,
+        artifactOffset: currentArtifacts.length,
+        artifactLimit: SOURCE_ARTIFACT_PAGE_SIZE
+      });
+      setSelectedDocument((latest) => latest && documentId(latest) === id ? mergeSourceWindow(latest, result.document, "artifacts") : latest);
+      setStatus("Loaded more source artifacts.");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDocumentBusy(false);
+    }
   }
 
   async function run(message: string, operation: () => Promise<void>) {
@@ -536,9 +649,13 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
     ? "AI assistance is enabled. Assisted search can synthesize source-grounded answers."
     : "AI assistance is disabled. Manual mode searches source text only; use View Source to inspect chunks, transcript text, tables, and metadata manually.";
   const sanitizedAnswerHtml = useMemo(() => answer ? sanitizeDocumentationAnswerHtml(answer.answerHtml ?? "") : "", [answer]);
-  const runningIngestCount = ingestJobs.filter((job) => job.status === "running").length;
-  const queuedIngestCount = ingestJobs.filter((job) => job.status === "queued").length;
-  const finishedIngestCount = ingestJobs.filter((job) => job.status === "complete" || job.status === "failed").length;
+  const visibleIngestJobs = useMemo(() => {
+    return serverIngestJobs.length > 0 ? serverIngestJobs.map(serverIngestJobView) : ingestJobs;
+  }, [serverIngestJobs, ingestJobs]);
+  const runningIngestCount = visibleIngestJobs.filter((job) => job.status === "running").length;
+  const queuedIngestCount = visibleIngestJobs.filter((job) => job.status === "queued").length;
+  const finishedIngestCount = visibleIngestJobs.filter((job) => job.status === "complete" || job.status === "failed").length;
+  const selectedDocumentId = selectedDocument ? documentId(selectedDocument) : "";
 
   return (
     <div className="documentation-panel">
@@ -548,22 +665,17 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
           <p>{activeCount} active documents, {chunkCount} active chunks</p>
         </div>
         <div className="documentation-toolbar">
+          <span className={aiAssistanceEnabled ? "documentation-ai-status" : "documentation-ai-status documentation-ai-status-warning"}>
+            <span className="documentation-ai-info" tabIndex={0} aria-label="AI assistance information" aria-describedby={aiNoticeId}>
+              {aiAssistanceEnabled ? <Info size={14} /> : <AlertTriangle size={14} />}
+            </span>
+            <span id={aiNoticeId} role="tooltip" className="documentation-ai-tooltip">{aiNotice}</span>
+          </span>
           <ControlButton size="compact" onClick={() => void refresh()} disabled={busy} title="Refresh archive">
             <RefreshCw size={14} /> Refresh
           </ControlButton>
-          <ControlButton size="compact" onClick={() => void loadPortableManifest()} disabled={busy} title="Show portable archive files">
-            <Archive size={14} /> Manifest
-          </ControlButton>
-          <ControlButton size="compact" onClick={() => void rebuildIndex()} disabled={busy} title="Rebuild Turbovec index">
-            <Wrench size={14} /> Rebuild
-          </ControlButton>
         </div>
       </header>
-
-      <div className={aiAssistanceEnabled ? "documentation-ai-notice" : "documentation-ai-notice documentation-ai-notice-warning"}>
-        {aiAssistanceEnabled ? <Bot size={14} /> : <AlertTriangle size={14} />}
-        <span>{aiNotice}</span>
-      </div>
 
       <form className="documentation-search" onSubmit={(event) => void search(event)}>
         <label>
@@ -579,9 +691,6 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
               <BookOpen size={13} /> Manual
             </ControlButton>
           </div>
-          <label><span>Mode</span><select value={searchMode} onChange={(event) => setSearchMode(event.target.value as SearchMode)}>{SEARCH_MODES.map((candidate) => <option key={candidate} value={candidate}>{candidate}</option>)}</select></label>
-          <label><span>Source</span><select value={searchSourceType} onChange={(event) => setSearchSourceType(event.target.value)}><option value="">all sources</option>{SOURCE_TYPES.map((type) => <option key={type} value={type}>{type}</option>)}</select></label>
-          <label><span>State</span><select value={searchState} onChange={(event) => setSearchState(event.target.value)}><option value="">all states</option>{SEARCH_STATES.map((state) => <option key={state} value={state}>{state}</option>)}</select></label>
           <label><span>Search Collection</span><input value={searchCollection} onChange={(event) => setSearchCollection(event.target.value)} placeholder="optional" /></label>
         </div>
         <ControlButton type="submit" tone="primary" disabled={busy || !query.trim()}>
@@ -594,23 +703,42 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
           <div className="documentation-source-header">
             <div>
               <h3>Source Viewer</h3>
-              <p>{selectedDocument.title ?? documentId(selectedDocument)} · {selectedDocument.source_type ?? selectedDocument.sourceType} · {selectedDocument.chunks?.length ?? 0} chunks</p>
+              <p>{selectedDocument.title ?? documentId(selectedDocument)} · {selectedDocument.source_type ?? selectedDocument.sourceType} · {sourceWindowLabel(selectedDocument.chunks?.length ?? 0, selectedDocument.chunkWindow, "chunks")}</p>
               {selectedDocument.uri ? <p>{selectedDocument.uri}</p> : null}
+              {selectedDocument.artifacts?.length || selectedDocument.artifactWindow?.total ? <p>{sourceWindowLabel(selectedDocument.artifacts?.length ?? 0, selectedDocument.artifactWindow, "extracted artifacts")} available.</p> : null}
             </div>
-            <ControlButton size="compact" onClick={() => setSelectedDocument(undefined)}>Close</ControlButton>
+            <div className="documentation-source-actions">
+              {selectedDocument.chunkWindow?.hasMore ? (
+                <ControlButton size="compact" disabled={documentBusy} onClick={() => void loadMoreSourceChunks()}>Load More Chunks</ControlButton>
+              ) : null}
+              {selectedDocument.artifactWindow?.hasMore ? (
+                <ControlButton size="compact" disabled={documentBusy} onClick={() => void loadMoreSourceArtifacts()}>Load More Artifacts</ControlButton>
+              ) : null}
+              <ControlButton size="compact" tone="danger" disabled={busy || !selectedDocumentId} onClick={() => void remove(selectedDocumentId)} title="Remove document">
+                <Trash2 size={13} /> Remove
+              </ControlButton>
+              <ControlButton size="compact" onClick={() => setSelectedDocument(undefined)}>Close</ControlButton>
+            </div>
           </div>
           <div className="documentation-chunk-list">
             {(selectedDocument.chunks ?? []).map((chunk) => (
-              <article className="documentation-chunk" key={`${chunkId(chunk)}:${chunk.locator ?? "chunk"}`}>
-                <strong>{chunk.locator ?? "chunk"} · {chunk.chunk_origin ?? chunk.chunkOrigin ?? "source"}</strong>
-                <p>{chunk.text ?? ""}</p>
-              </article>
+              <DocumentationChunkArticle key={`${chunkId(chunk)}:${chunk.locator ?? "chunk"}`} document={selectedDocument} chunk={chunk} />
             ))}
           </div>
+          {selectedDocument.chunkWindow?.hasMore || selectedDocument.artifactWindow?.hasMore ? (
+            <div className="documentation-source-footer">
+              {selectedDocument.chunkWindow?.hasMore ? (
+                <ControlButton size="compact" disabled={documentBusy} onClick={() => void loadMoreSourceChunks()}>Load More Chunks</ControlButton>
+              ) : null}
+              {selectedDocument.artifactWindow?.hasMore ? (
+                <ControlButton size="compact" disabled={documentBusy} onClick={() => void loadMoreSourceArtifacts()}>Load More Artifacts</ControlButton>
+              ) : null}
+            </div>
+          ) : null}
         </section>
       ) : null}
 
-      <div className="documentation-grid">
+      {!selectedDocument ? <div className="documentation-grid">
         <section className="documentation-section">
           <h3>{searchPresentationMode === "answer" ? "Answer And Sources" : "Results"}</h3>
           <div className="documentation-results">
@@ -698,15 +826,13 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
             {mode === "path" ? <label><span>Path</span><input value={pathValue} onChange={(event) => setPathValue(event.target.value)} placeholder="/path/to/datasheet.pdf or docs/" /></label> : null}
             {mode === "url" || mode === "text" ? <label><span>URL or URI</span><input value={urlValue} onChange={(event) => setUrlValue(event.target.value)} placeholder="https://vendor.example/doc, youtube playlist, or optional manual URI" /></label> : null}
             <label><span>Title</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="auto from source" /></label>
-            <label><span>Type</span><select value={sourceType} onChange={(event) => setSourceType(event.target.value)}>{INGEST_SOURCE_TYPES.map((type) => <option key={type} value={type}>{type}</option>)}</select></label>
             <label><span>Collection</span><input value={collection} onChange={(event) => setCollection(event.target.value)} placeholder="auto from folder, domain, playlist, or upload" /></label>
             {mode === "text" ? <label><span>Text</span><textarea value={textValue} onChange={(event) => setTextValue(event.target.value)} rows={5} /></label> : null}
-            {mode === "url" && sourceType === "media" ? <label><span>Transcript</span><textarea value={transcriptValue} onChange={(event) => setTranscriptValue(event.target.value)} rows={4} placeholder="Optional transcript text. Leave empty to let the indexer try transcript fetching." /></label> : null}
             <ControlButton type="submit" tone="primary" disabled={!canCall || !ingestReady(mode, uploadValue, pathValue, urlValue, textValue)}>
               <FilePlus size={15} /> Queue
             </ControlButton>
           </form>
-          {ingestJobs.length > 0 ? (
+          {visibleIngestJobs.length > 0 ? (
             <div className="documentation-ingest-queue" aria-label="Documentation ingest queue">
               <div className="documentation-ingest-queue-header">
                 <div>
@@ -718,7 +844,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
                 ) : null}
               </div>
               <div className="documentation-ingest-queue-list">
-                {ingestJobs.map((job, index) => <IngestQueueJob key={job.id} job={job} index={index} />)}
+                {visibleIngestJobs.map((job, index) => <IngestQueueJob key={job.id} job={job} index={index} />)}
               </div>
             </div>
           ) : null}
@@ -740,28 +866,68 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
             </div>
           ) : <p className="documentation-empty">No active documents.</p>}
         </section>
-      </div>
-
-      {portableFiles.length > 0 ? (
-        <section className="documentation-section documentation-manifest">
-          <h3>Portable Files</h3>
-          <div className="documentation-document-list">
-            {portableFiles.slice(0, 12).map((file) => (
-              <div className="documentation-document-row" key={file.path}>
-                <span>{file.path}</span>
-                <small>{file.bytes ?? 0} bytes</small>
-              </div>
-            ))}
-          </div>
-        </section>
-      ) : null}
+      </div> : null}
 
       <footer className="documentation-status" aria-live="polite">{status}</footer>
     </div>
   );
 }
 
-function IngestQueueJob({ job, index }: { job: DocumentationIngestJob; index: number }) {
+function DocumentationChunkArticle({ document, chunk }: { document: DocumentationDetail; chunk: DocumentationChunk }) {
+  const attachments = artifactsForChunk(document, chunk);
+  const visibleAttachments = attachments.slice(0, MAX_INLINE_ARTIFACT_PREVIEWS_PER_CHUNK);
+  const hiddenAttachmentCount = Math.max(0, attachments.length - visibleAttachments.length);
+  return (
+    <article className={attachments.length > 0 ? "documentation-chunk documentation-chunk-with-artifacts" : "documentation-chunk"}>
+      <div className="documentation-chunk-body">
+        <strong>{chunk.locator ?? "chunk"} · {chunk.chunk_origin ?? chunk.chunkOrigin ?? "source"}</strong>
+        <p>{chunk.text ?? ""}</p>
+        {chunk.textTruncated ? <small>Chunk preview truncated at {formatCount((chunk.text ?? "").length)} of {formatCount(chunk.textLength ?? 0)} characters.</small> : null}
+      </div>
+      {attachments.length > 0 ? (
+        <div className="documentation-artifact-list">
+          {visibleAttachments.map((artifact) => <DocumentationArtifactPreview key={`${artifact.id ?? artifact.path}:${artifact.path}`} document={document} artifact={artifact} />)}
+          {hiddenAttachmentCount > 0 ? <p className="documentation-artifact-more">{hiddenAttachmentCount} more loaded artifacts for this chunk. Use Open on a specific artifact or load more artifacts in the source header.</p> : null}
+        </div>
+      ) : null}
+    </article>
+  );
+}
+
+function DocumentationArtifactPreview({ document, artifact }: { document: DocumentationDetail; artifact: DocumentationArtifact }) {
+  const href = artifact.path ? documentationArtifactUrl(documentId(document), artifact.path) : undefined;
+  const label = artifactLabel(artifact);
+  if (href && isPreviewableImageArtifact(artifact)) {
+    return (
+      <figure className="documentation-artifact documentation-artifact-image">
+        <img src={href} alt={label} loading="lazy" decoding="async" />
+        <figcaption>
+          <FileImage size={13} />
+          <span>{label}</span>
+          <a href={href} target="_blank" rel="noreferrer"><ExternalLink size={12} /> Open</a>
+        </figcaption>
+      </figure>
+    );
+  }
+  return (
+    <div className="documentation-artifact documentation-artifact-file">
+      <div>
+        {artifact.type === "table" ? <Table2 size={14} /> : <FileImage size={14} />}
+        <span>{label}</span>
+      </div>
+      <div>
+        {artifact.alternatePaths?.filter((path) => path.path && path.available !== false).map((path) => (
+          <a key={`${path.kind}:${path.path}`} href={documentationArtifactUrl(documentId(document), path.path!)} target="_blank" rel="noreferrer">
+            <ExternalLink size={12} /> {path.kind ?? "file"}
+          </a>
+        ))}
+        {href && !artifact.alternatePaths?.length ? <a href={href} target="_blank" rel="noreferrer"><ExternalLink size={12} /> Open</a> : null}
+      </div>
+    </div>
+  );
+}
+
+function IngestQueueJob({ job, index }: { job: DocumentationIngestJobView; index: number }) {
   return (
     <article className={`documentation-ingest-job documentation-ingest-job-${job.status}`}>
       <div className="documentation-ingest-job-main">
@@ -783,16 +949,13 @@ function IngestQueueJob({ job, index }: { job: DocumentationIngestJob; index: nu
 
 function createIngestJob(input: {
   mode: IngestMode;
-  sourceType: string;
   uploadValue: File | undefined;
   pathValue: string;
   urlValue: string;
   title: string;
   textValue: string;
-  transcriptValue: string;
   collection: string;
 }): DocumentationIngestJob {
-  const selectedSourceType = input.sourceType === "auto" ? undefined : input.sourceType;
   const title = optionalTrimmedString(input.title);
   const collection = optionalTrimmedString(input.collection);
   let request: DocumentationIngestRequest;
@@ -800,25 +963,25 @@ function createIngestJob(input: {
     if (!input.uploadValue) {
       throw new Error("Choose a file to upload.");
     }
-    request = { mode: "upload", file: input.uploadValue, title, sourceType: selectedSourceType, collection };
+    request = { mode: "upload", file: input.uploadValue, title, collection };
   } else if (input.mode === "path") {
     const path = input.pathValue.trim();
     if (!path) {
       throw new Error("Path is required.");
     }
-    request = { mode: "path", path, title, sourceType: selectedSourceType, collection };
+    request = { mode: "path", path, title, collection };
   } else if (input.mode === "url") {
     const url = input.urlValue.trim();
     if (!url) {
       throw new Error("URL is required.");
     }
-    request = { mode: "url", url, title, sourceType: selectedSourceType, collection, transcript: optionalTrimmedString(input.transcriptValue) };
+    request = { mode: "url", url, title, collection };
   } else {
     const text = input.textValue.trim();
     if (!text) {
       throw new Error("Text is required.");
     }
-    request = { mode: "text", title, text, uri: optionalTrimmedString(input.urlValue), sourceType: selectedSourceType, collection };
+    request = { mode: "text", title, text, uri: optionalTrimmedString(input.urlValue), collection };
   }
   return {
     id: nextDocumentationIngestJobId(),
@@ -850,16 +1013,27 @@ function ingestRequestLabel(request: DocumentationIngestRequest): string {
 }
 
 function ingestRequestDetail(request: DocumentationIngestRequest): string {
-  const parts = [request.mode, request.sourceType ?? "auto"];
+  const parts: string[] = [request.mode];
   if ("collection" in request && request.collection) {
     parts.push(`collection ${request.collection}`);
   }
   if (request.mode === "upload") {
     parts.push(formatBytes(request.file.size));
-  } else if (request.mode === "url" && request.transcript) {
-    parts.push("manual transcript");
   }
   return parts.join(" · ");
+}
+
+function serverIngestJobView(job: DocumentationServerIngestJob): DocumentationIngestJobView {
+  const detailParts = [job.detail, job.position && job.position > 0 ? `queue position ${job.position}` : undefined].filter((part): part is string => Boolean(part));
+  return {
+    id: job.id,
+    label: job.label?.trim() || `${job.kind ?? "documentation"} import`,
+    detail: detailParts.join(" · ") || job.kind || "server queue",
+    progress: Math.max(0, Math.min(100, Math.round(job.progress ?? 0))),
+    status: job.status ?? "queued",
+    stage: job.stage?.trim() || "Waiting for documentation import.",
+    error: job.error
+  };
 }
 
 function initialIngestStage(request: DocumentationIngestRequest): string {
@@ -876,7 +1050,7 @@ function initialIngestStage(request: DocumentationIngestRequest): string {
 }
 
 function urlIngestStage(request: Extract<DocumentationIngestRequest, { mode: "url" }>): string {
-  if (request.sourceType === "media" || /(?:youtube\.com|youtu\.be)/iu.test(request.url)) {
+  if (/(?:youtube\.com|youtu\.be)/iu.test(request.url)) {
     return "Fetching media metadata, transcript, keyframes, and enrichment evidence.";
   }
   return "Downloading URL and extracting source evidence.";
@@ -978,6 +1152,66 @@ function compactInput(values: Record<string, unknown>): Record<string, unknown> 
   return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== undefined && value !== ""));
 }
 
+function sourceDocumentWindowInput(documentIdValue: string): Record<string, unknown> {
+  return {
+    documentId: documentIdValue,
+    chunkOffset: 0,
+    chunkLimit: SOURCE_CHUNK_PAGE_SIZE,
+    chunkTextMaxChars: SOURCE_CHUNK_TEXT_MAX_CHARS,
+    artifactOffset: 0,
+    artifactLimit: SOURCE_ARTIFACT_PAGE_SIZE
+  };
+}
+
+function mergeSourceWindow(current: DocumentationDetail, next: DocumentationDetail | undefined, mode: "chunks" | "artifacts"): DocumentationDetail {
+  if (!next) {
+    return current;
+  }
+  if (mode === "chunks") {
+    return {
+      ...current,
+      chunks: uniqueChunks([...(current.chunks ?? []), ...(next.chunks ?? [])]),
+      chunkWindow: next.chunkWindow ?? current.chunkWindow,
+      artifactWindow: mergeWindowTotal(current.artifactWindow, next.artifactWindow)
+    };
+  }
+  return {
+    ...current,
+    artifacts: uniqueArtifacts([...(current.artifacts ?? []), ...(next.artifacts ?? [])]),
+    artifactWindow: next.artifactWindow ?? current.artifactWindow,
+    chunkWindow: mergeWindowTotal(current.chunkWindow, next.chunkWindow)
+  };
+}
+
+function mergeWindowTotal(current: DocumentationWindow | undefined, next: DocumentationWindow | undefined): DocumentationWindow | undefined {
+  if (!current) {
+    return next;
+  }
+  if (!next) {
+    return current;
+  }
+  return {
+    ...current,
+    total: next.total ?? current.total
+  };
+}
+
+function uniqueChunks(chunks: DocumentationChunk[]): DocumentationChunk[] {
+  const seen = new Set<string>();
+  return chunks.filter((chunk) => {
+    const key = `${chunkId(chunk)}:${chunk.locator ?? ""}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function sourceWindowLabel(loaded: number, window: DocumentationWindow | undefined, label: string): string {
+  return typeof window?.total === "number" ? `${formatCount(loaded)} of ${formatCount(window.total)} ${label}` : `${formatCount(loaded)} ${label}`;
+}
+
 function numberStat(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
@@ -988,6 +1222,69 @@ function documentId(document: DocumentationRecord): string {
 
 function chunkId(chunk: DocumentationChunk): number {
   return chunk.chunk_id ?? chunk.chunkId ?? 0;
+}
+
+function artifactsForChunk(document: DocumentationDetail, chunk: DocumentationChunk): DocumentationArtifact[] {
+  const locator = (chunk.locator ?? "").toLowerCase();
+  if (!locator) {
+    return [];
+  }
+  const page = pageNumberFromLocator(locator);
+  const artifacts = document.artifacts ?? [];
+  return uniqueArtifacts(artifacts.filter((artifact) => {
+    const artifactLocator = (artifact.locator ?? "").toLowerCase();
+    const artifactId = (artifact.id ?? "").toLowerCase();
+    return artifact.available !== false && (artifactLocator === locator || Boolean(artifactId && locator.includes(artifactId)));
+  }).concat(artifacts.filter((artifact) => {
+    return artifact.available !== false && page !== undefined && artifact.page === page && artifact.kind === "page-render";
+  })));
+}
+
+function uniqueArtifacts(artifacts: DocumentationArtifact[]): DocumentationArtifact[] {
+  const seen = new Set<string>();
+  return artifacts.filter((artifact) => {
+    const key = artifact.path ?? `${artifact.type ?? ""}:${artifact.id ?? ""}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function pageNumberFromLocator(locator: string): number | undefined {
+  const match = /^page\s+(\d+)(?:\s|$)/iu.exec(locator);
+  if (!match) {
+    return undefined;
+  }
+  return Number.parseInt(match[1], 10);
+}
+
+function isPreviewableImageArtifact(artifact: DocumentationArtifact): boolean {
+  return artifact.available !== false && typeof artifact.path === "string" && (artifact.mimeType?.startsWith("image/") ?? false);
+}
+
+function documentationArtifactUrl(documentIdValue: string, artifactPath: string): string {
+  const params = new URLSearchParams({ path: artifactPath });
+  return `/api/documentation/documents/${encodeURIComponent(documentIdValue)}/artifact?${params.toString()}`;
+}
+
+function artifactLabel(artifact: DocumentationArtifact): string {
+  const parts = [artifact.id ?? artifact.type ?? "artifact"];
+  if (artifact.page !== undefined) {
+    parts.push(`page ${artifact.page}`);
+  }
+  if (artifact.rows !== undefined && artifact.columns !== undefined) {
+    parts.push(`${artifact.rows}x${artifact.columns}`);
+  } else if (artifact.width !== undefined && artifact.height !== undefined) {
+    parts.push(`${artifact.width}x${artifact.height}`);
+  } else if (artifact.offsetSeconds !== undefined) {
+    parts.push(`${artifact.offsetSeconds}s`);
+  }
+  if (artifact.bytes !== undefined) {
+    parts.push(formatBytes(artifact.bytes));
+  }
+  return parts.join(" · ");
 }
 
 function sanitizeDocumentationAnswerHtml(html: string): string {
@@ -1019,6 +1316,10 @@ function formatBytes(bytes: number): string {
     return `${(bytes / 1024).toFixed(1)} KiB`;
   }
   return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+}
+
+function formatCount(value: number): string {
+  return Math.max(0, value).toLocaleString("en-US");
 }
 
 function formatUploadBytes(uploadedBytes: number, totalBytes: number | undefined): string {

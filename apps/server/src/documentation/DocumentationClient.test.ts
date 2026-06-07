@@ -33,6 +33,85 @@ describe("DocumentationClient", () => {
     expect(JSON.parse(requestBody)).toEqual({ query: "reset" });
   });
 
+  it("preserves appended query strings with base URL query strings", async () => {
+    let requestUrl = "";
+    const url = await startServer((request, response) => {
+      requestUrl = request.url ?? "";
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ documents: [] }));
+    });
+    const client = new DocumentationClient(`${url}/docs/?token=local`);
+
+    await client.listDocuments({ states: ["active", "stale"] });
+
+    expect(requestUrl).toBe("/docs/documents?token=local&states=active%2Cstale");
+  });
+
+  it("forwards document detail window parameters", async () => {
+    let requestUrl = "";
+    const url = await startServer((request, response) => {
+      requestUrl = request.url ?? "";
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ document: { documentId: "doc-1", chunks: [] } }));
+    });
+    const client = new DocumentationClient(`${url}/docs/?token=local`);
+
+    await client.getDocument({
+      documentId: "doc-1",
+      chunkOffset: 75,
+      chunkLimit: 25,
+      chunkTextMaxChars: 4000,
+      artifactOffset: 100,
+      artifactLimit: 50
+    });
+
+    expect(requestUrl).toBe("/docs/documents/doc-1?token=local&chunkOffset=75&chunkLimit=25&chunkTextMaxChars=4000&artifactOffset=100&artifactLimit=50");
+  });
+
+  it("fetches document artifact bytes", async () => {
+    let requestUrl = "";
+    const url = await startServer((request, response) => {
+      requestUrl = request.url ?? "";
+      response.writeHead(200, {
+        "content-type": "image/png",
+        "content-disposition": 'attachment; filename="figure-001.png"'
+      });
+      response.end(Buffer.from([1, 2, 3]));
+    });
+    const client = new DocumentationClient(`${url}/docs`);
+
+    const artifact = await client.getArtifact({ documentId: "doc-1", path: "figures/figure-001.png" });
+
+    expect(requestUrl).toBe("/docs/documents/doc-1/artifact?path=figures%2Ffigure-001.png");
+    expect(artifact.contentType).toBe("image/png");
+    expect(artifact.filename).toBe("figure-001.png");
+    expect(Array.from(artifact.content)).toEqual([1, 2, 3]);
+  });
+
+  it("streams document artifact bytes with range request headers", async () => {
+    let requestUrl = "";
+    let rangeHeader = "";
+    const url = await startServer((request, response) => {
+      requestUrl = request.url ?? "";
+      rangeHeader = String(request.headers.range ?? "");
+      response.writeHead(206, {
+        "content-type": "video/mp4",
+        "content-range": "bytes 0-2/12",
+        "accept-ranges": "bytes"
+      });
+      response.end(Buffer.from([1, 2, 3]));
+    });
+    const client = new DocumentationClient(`${url}/docs`);
+
+    const artifact = await client.streamArtifact({ documentId: "doc-1", path: "media/source.mp4" }, { range: "bytes=0-2" });
+
+    expect(requestUrl).toBe("/docs/documents/doc-1/artifact?path=media%2Fsource.mp4");
+    expect(rangeHeader).toBe("bytes=0-2");
+    expect(artifact.statusCode).toBe(206);
+    expect(artifact.headers.get("content-range")).toBe("bytes 0-2/12");
+    expect(Array.from(new Uint8Array(await new Response(artifact.body).arrayBuffer()))).toEqual([1, 2, 3]);
+  });
+
   it("returns service error details", async () => {
     const url = await startServer((_request, response) => {
       response.writeHead(400, { "content-type": "application/json" });

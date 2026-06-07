@@ -4,7 +4,10 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type { HookProgressEvent } from "@cloudx/plugin-api";
+
 import type { DocumentationClient } from "../documentation/DocumentationClient.js";
+import { DocumentationIngestQueue } from "../documentation/DocumentationIngestQueue.js";
 import { PathPolicy } from "../pathPolicy.js";
 import { DocumentationPlugin } from "./DocumentationPlugin.js";
 
@@ -16,15 +19,34 @@ describe("DocumentationPlugin", () => {
   });
 
   it("exposes documentation hooks with conservative safety labels", () => {
-    const plugin = new DocumentationPlugin(fakeClient(), new PathPolicy(["/tmp"]));
+    const plugin = new DocumentationPlugin(fakeClient(), new PathPolicy(["/tmp"]), new DocumentationIngestQueue());
 
     expect(plugin.descriptor()).toMatchObject({
       id: "documentation",
       displayName: "Documentation",
       creatable: true
     });
-    expect(plugin.configFields.map((field) => field.key)).toEqual(["aiEnrichmentEnabled", "aiEnrichmentSkillIds"]);
+    expect(plugin.configFields.map((field) => field.key)).toEqual([
+      "aiEnrichmentEnabled",
+      "aiImageAnalysisModel",
+      "aiTextAnalysisModel",
+      "aiAnswerModel",
+      "aiEnrichmentSkillIds"
+    ]);
     expect(plugin.configFields.find((field) => field.key === "aiEnrichmentEnabled")?.defaultValue).toBe(true);
+    expect(plugin.configFields.find((field) => field.key === "aiImageAnalysisModel")).toMatchObject({
+      type: "select",
+      defaultValue: "gpt-5.4-mini",
+      options: expect.arrayContaining([
+        { label: "GPT-5.5", value: "gpt-5.5", description: "Frontier model for complex coding, research, and real-world work." },
+        { label: "GPT-5.4-Mini", value: "gpt-5.4-mini", description: "Small, fast, and cost-efficient model for simpler coding tasks." },
+        { label: "GPT-5.3-Codex-Spark", value: "gpt-5.3-codex-spark", description: "Ultra-fast coding model." }
+      ])
+    });
+    expect(plugin.configFields.find((field) => field.key === "aiEnrichmentSkillIds")).toMatchObject({
+      visibility: "internal",
+      defaultValue: "documentation-enrich-metadata,documentation-enrich-visuals,documentation-enrich-media"
+    });
     expect(plugin.hooks.find((hook) => hook.id === "documentation.search")).toMatchObject({
       exposures: ["plugin", "ui", "http", "automation", "voice"],
       automationSafety: "read"
@@ -33,6 +55,10 @@ describe("DocumentationPlugin", () => {
       exposures: ["ui", "http"],
       automationSafety: "read",
       inputSchema: expect.objectContaining({ required: ["question"] })
+    });
+    expect(plugin.hooks.find((hook) => hook.id === "documentation.ingest.queue")).toMatchObject({
+      exposures: ["plugin", "ui", "http"],
+      automationSafety: "read"
     });
     expect(plugin.hooks.find((hook) => hook.id === "documentation.ingest.url")).toMatchObject({
       exposures: ["ui", "http", "automation"],
@@ -51,7 +77,7 @@ describe("DocumentationPlugin", () => {
     const allowedFile = path.join(root, "datasheet.pdf");
     await fs.writeFile(allowedFile, "data");
     const client = fakeClient();
-    const plugin = new DocumentationPlugin(client, new PathPolicy([root]));
+    const plugin = new DocumentationPlugin(client, new PathPolicy([root]), new DocumentationIngestQueue());
     const hook = plugin.hooks.find((candidate) => candidate.id === "documentation.ingest.path")!;
 
     await hook.execute({ path: allowedFile, sourceType: "datasheet" }, { caller: { kind: "http" } });
@@ -66,7 +92,7 @@ describe("DocumentationPlugin", () => {
     await fs.writeFile(allowedFile, "data");
     const client = fakeClient();
     const enrichIngestResponse = vi.fn(async (response: Record<string, unknown>) => ({ ...response, enrichment: { enabled: true } }));
-    const plugin = new DocumentationPlugin(client, new PathPolicy([root]), () => ({ enrichIngestResponse }) as never);
+    const plugin = new DocumentationPlugin(client, new PathPolicy([root]), new DocumentationIngestQueue(), () => ({ enrichIngestResponse }) as never);
     const hook = plugin.hooks.find((candidate) => candidate.id === "documentation.ingest.path")!;
 
     const result = await hook.execute({ path: allowedFile, sourceType: "datasheet" }, { caller: { kind: "http" } });
@@ -75,9 +101,38 @@ describe("DocumentationPlugin", () => {
     expect(enrichIngestResponse).toHaveBeenCalledWith({ documents: [] });
   });
 
+  it("queues blocking ingest hooks and reports progress before completion", async () => {
+    const queue = new DocumentationIngestQueue();
+    const client = fakeClient();
+    const ingest = deferred<Record<string, unknown>>();
+    vi.mocked(client.ingestText).mockReturnValueOnce(ingest.promise);
+    const plugin = new DocumentationPlugin(client, new PathPolicy(["/tmp"]), queue);
+    const hook = plugin.hooks.find((candidate) => candidate.id === "documentation.ingest.text")!;
+    const progress: HookProgressEvent[] = [];
+
+    const run = hook.execute({ title: "Queued text", text: "Long import" }, {
+      caller: { kind: "http" },
+      reportProgress: (event) => progress.push(event)
+    });
+    await flushPromises();
+
+    expect(queue.list().jobs[0]).toMatchObject({ label: "Queued text", status: "running" });
+    expect(progress).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: "queued", message: expect.stringContaining("Queued text") }),
+      expect.objectContaining({ status: "running", stage: expect.stringContaining("writing text") })
+    ]));
+
+    ingest.resolve({ document: { documentId: "queued-doc" } });
+
+    await expect(run).resolves.toEqual({ document: { documentId: "queued-doc" } });
+    expect(progress).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: "complete", progress: 100 })
+    ]));
+  });
+
   it("routes assisted question answering through the enrichment provider", async () => {
     const answerQuestion = vi.fn(async () => ({ answer: "Source-grounded answer.", answerHtml: "<p>Source-grounded answer.</p>", citations: [], warnings: [] }));
-    const plugin = new DocumentationPlugin(fakeClient(), new PathPolicy(["/tmp"]), () => ({ answerQuestion }) as never);
+    const plugin = new DocumentationPlugin(fakeClient(), new PathPolicy(["/tmp"]), new DocumentationIngestQueue(), () => ({ answerQuestion }) as never);
     const hook = plugin.hooks.find((candidate) => candidate.id === "documentation.answer")!;
 
     await expect(hook.execute({ question: "What does the source say?" }, { caller: { kind: "ui" } })).resolves.toEqual({
@@ -90,7 +145,7 @@ describe("DocumentationPlugin", () => {
   });
 
   it("declares default documentation skills as plugin system contributions", () => {
-    const plugin = new DocumentationPlugin(fakeClient(), new PathPolicy(["/tmp"]));
+    const plugin = new DocumentationPlugin(fakeClient(), new PathPolicy(["/tmp"]), new DocumentationIngestQueue());
 
     expect(plugin.hooks.some((hook) => hook.id === "documentation.skills.installDefaults")).toBe(false);
     expect(plugin.ruleContributions.map((rule) => rule.id)).toEqual([
@@ -141,5 +196,20 @@ describe("DocumentationPlugin", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-plugin-"));
     roots.push(root);
     return root;
+  }
+
+  async function flushPromises(): Promise<void> {
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
+  function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: unknown) => void } {
+    let resolve!: (value: T) => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<T>((promiseResolve, promiseReject) => {
+      resolve = promiseResolve;
+      reject = promiseReject;
+    });
+    return { promise, resolve, reject };
   }
 });

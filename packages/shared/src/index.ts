@@ -526,6 +526,7 @@ export type ConfigFieldType = "boolean" | "string" | "number" | "select";
 export interface ConfigFieldOption {
   label: string;
   value: ConfigValue;
+  description?: string;
 }
 
 export interface ConfigFieldDescriptor {
@@ -533,6 +534,7 @@ export interface ConfigFieldDescriptor {
   label: string;
   type: ConfigFieldType;
   description?: string;
+  visibility?: "user" | "internal";
   defaultValue: ConfigValue;
   options?: ConfigFieldOption[];
   min?: number;

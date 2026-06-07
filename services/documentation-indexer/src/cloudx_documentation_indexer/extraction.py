@@ -54,6 +54,13 @@ class ExtractedSpan:
     locator: str
 
 
+@dataclass(frozen=True)
+class ExtractedTable:
+    rows: list[list[str]]
+    non_empty_cells: int
+    total_cells: int
+
+
 def extract_file(path: Path, content: bytes, source_type: str, artifact_dir: Path | None = None) -> list[ExtractedSpan]:
     return extract_bytes(content, path.name, source_type, mimetypes.guess_type(path.name)[0], artifact_dir)
 
@@ -102,7 +109,7 @@ class PdfExtractionPipeline:
                     if text:
                         spans.append(ExtractedSpan(text, f"page {page_number}"))
 
-                    page_tables = non_empty_tables(page.extract_tables() or [])
+                    page_tables = plausible_tables(page.extract_tables() or [])
                     for table_number, table in enumerate(page_tables, start=1):
                         table_id = f"table-{len(table_records) + 1:03d}"
                         table_records.append(write_table_artifacts(artifact_root, table_id, page_number, table))
@@ -169,21 +176,84 @@ def prepare_artifact_dir(artifact_dir: Path | None) -> Path | None:
     return artifact_dir
 
 
-def non_empty_tables(tables: list[list[list[str | None]]]) -> list[list[list[str]]]:
-    normalized: list[list[list[str]]] = []
+def plausible_tables(tables: list[list[list[str | None]]]) -> list[ExtractedTable]:
+    extracted: list[ExtractedTable] = []
     for table in tables:
-        rows = [[(cell or "").strip() for cell in row] for row in table if any((cell or "").strip() for cell in row)]
-        if rows and any(any(cell for cell in row) for row in rows):
-            normalized.append(rows)
-    return normalized
+        rows = clean_table_rows(table)
+        if not rows:
+            continue
+        column_count = max((len(row) for row in rows), default=0)
+        non_empty_cells = sum(1 for row in rows for cell in row if cell)
+        total_cells = max(1, len(rows) * max(1, column_count))
+        if is_plausible_table(rows, column_count, non_empty_cells):
+            extracted.append(ExtractedTable(rows, non_empty_cells, total_cells))
+    return extracted
 
 
-def write_table_artifacts(artifact_root: Path | None, table_id: str, page_number: int, table: list[list[str]]) -> dict[str, str | int]:
+def is_plausible_table(rows: list[list[str]], column_count: int, non_empty_cells: int) -> bool:
+    return len(rows) >= 2 and column_count >= 2 and non_empty_cells >= 3
+
+
+def clean_table_rows(table: list[list[str | None]]) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for row in table:
+        cleaned = [clean_table_cell(cell) for cell in row]
+        if any(cleaned):
+            rows.append(cleaned)
+    return expand_register_bit_table(rows)
+
+
+def clean_table_cell(cell: str | None) -> str:
+    return " ".join((cell or "").split())
+
+
+def expand_register_bit_table(rows: list[list[str]]) -> list[list[str]]:
+    if not rows or not is_register_bit_header(rows[0]):
+        return rows
+    width = len(rows[0])
+    expanded = [rows[0]]
+    for row in rows[1:]:
+        padded = row + [""] * (width - len(row))
+        if normalized_table_label(padded[0]) in {"field", "reset", "access", "access type"}:
+            expanded.append(expand_merged_register_cells(padded))
+        else:
+            expanded.append(padded)
+    return expanded
+
+
+def expand_merged_register_cells(row: list[str]) -> list[str]:
+    expanded = row[:]
+    previous = ""
+    for index in range(1, len(expanded)):
+        if expanded[index]:
+            previous = expanded[index]
+        elif previous:
+            expanded[index] = previous
+    return expanded
+
+
+def is_register_bit_header(row: list[str]) -> bool:
+    if len(row) < 3 or normalized_table_label(row[0]) != "bit":
+        return False
+    try:
+        bits = [int(cell, 10) for cell in row[1:]]
+    except ValueError:
+        return False
+    return bits == list(range(bits[0], bits[-1] - 1, -1))
+
+
+def normalized_table_label(value: str) -> str:
+    return " ".join(value.lower().split())
+
+
+def write_table_artifacts(artifact_root: Path | None, table_id: str, page_number: int, table: ExtractedTable) -> dict[str, str | int]:
     record: dict[str, str | int] = {
         "id": table_id,
         "page": page_number,
-        "rows": len(table),
-        "columns": max((len(row) for row in table), default=0),
+        "rows": len(table.rows),
+        "columns": max((len(row) for row in table.rows), default=0),
+        "non_empty_cells": table.non_empty_cells,
+        "total_cells": table.total_cells,
     }
     if not artifact_root:
         return record
@@ -193,8 +263,8 @@ def write_table_artifacts(artifact_root: Path | None, table_id: str, page_number
     md_path = tables_dir / f"{table_id}.md"
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerows(table)
-    md_path.write_text(markdown_table(table), encoding="utf-8")
+        writer.writerows(table.rows)
+    md_path.write_text(table_markdown_document(table), encoding="utf-8")
     record["csv"] = csv_path.relative_to(artifact_root).as_posix()
     record["markdown"] = md_path.relative_to(artifact_root).as_posix()
     return record
@@ -222,7 +292,7 @@ def page_visual_summary(page: pdfplumber.page.Page) -> dict[str, int] | None:
 
 def write_index_files(artifact_root: Path, tables: list[dict[str, str | int]], figures: list[dict[str, str | int]]) -> None:
     if tables:
-        write_tsv(artifact_root / "table_index.tsv", tables, ["id", "page", "rows", "columns", "csv", "markdown"])
+        write_tsv(artifact_root / "table_index.tsv", tables, ["id", "page", "rows", "columns", "non_empty_cells", "total_cells", "csv", "markdown"])
     if figures:
         write_tsv(artifact_root / "figure_index.tsv", figures, ["id", "page", "kind", "path", "images", "lines", "rectangles", "curves"])
         lines = ["# Extracted Visual Artifacts", ""]
@@ -241,10 +311,11 @@ def write_tsv(path: Path, rows: list[dict[str, str | int]], fields: list[str]) -
         writer.writerows(rows)
 
 
-def table_span_text(table_id: str, page_number: int, table: list[list[str]]) -> str:
+def table_span_text(table_id: str, page_number: int, table: ExtractedTable) -> str:
     return "\n".join([
         f"Extracted PDF table {table_id} from page {page_number}.",
-        markdown_table(table),
+        "Review the page render for layout-sensitive or visually dense tables.",
+        table_markdown_document(table),
     ]).strip()
 
 
@@ -281,6 +352,50 @@ def markdown_table(table: list[list[str]]) -> str:
         *["| " + " | ".join(escape_table_cell(cell) for cell in row) + " |" for row in body],
     ]
     return "\n".join(lines)
+
+
+def table_markdown_document(table: ExtractedTable) -> str:
+    summary = register_bit_summary(table.rows)
+    if summary:
+        return f"{summary}\n\n{markdown_table(table.rows)}"
+    return markdown_table(table.rows)
+
+
+def register_bit_summary(rows: list[list[str]]) -> str:
+    if not rows or not is_register_bit_header(rows[0]):
+        return ""
+    width = len(rows[0])
+    bit_headers = [int(cell, 10) for cell in rows[0][1:]]
+    values_by_label = {
+        normalized_table_label(row[0]): (row + [""] * (width - len(row)))[1:width]
+        for row in rows[1:]
+    }
+    field_values = values_by_label.get("field")
+    if not field_values:
+        return ""
+    labels = [
+        ("Field", field_values),
+        ("Reset", values_by_label.get("reset", [""] * len(bit_headers))),
+        ("Access Type", values_by_label.get("access type", values_by_label.get("access", [""] * len(bit_headers)))),
+    ]
+    lines = ["Register bit layout:"]
+    start = 0
+    while start < len(bit_headers):
+        current = tuple(values[start] for _, values in labels)
+        end = start + 1
+        while end < len(bit_headers) and tuple(values[end] for _, values in labels) == current:
+            end += 1
+        description = "; ".join(f"{label} {value}" for label, values in labels if (value := values[start]))
+        if description:
+            lines.append(f"- {format_bit_range(bit_headers[start:end])}: {description}")
+        start = end
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def format_bit_range(bits: list[int]) -> str:
+    if len(bits) == 1:
+        return f"bit {bits[0]}"
+    return f"bits {bits[0]}:{bits[-1]}"
 
 
 def escape_table_cell(value: str) -> str:

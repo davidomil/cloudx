@@ -54,6 +54,13 @@ describe("DocumentationPanel", () => {
     });
     await flush();
 
+    expect(container.textContent).not.toContain("Manifest");
+    expect(container.textContent).not.toContain("Rebuild");
+    expect(controlByLabel(container, "Mode", "select")).toBeNull();
+    expect(controlByLabel(container, "Source", "select")).toBeNull();
+    expect(controlByLabel(container, "State", "select")).toBeNull();
+    expect(controlByLabel(container, "Type", "select")).toBeNull();
+
     await click(buttonByText(container, "text"));
     setTextAreaValue(textAreaByLabel(container, "Text"), "Panel text about turbovec search.");
     await click(buttonByText(container, "Queue"));
@@ -76,9 +83,6 @@ describe("DocumentationPanel", () => {
     });
     expect(container.textContent).toContain("Panel Source");
 
-    setSelectValue(selectByLabel(container, "Mode"), "dense");
-    setSelectValue(selectByLabel(container, "Source"), "media");
-    setSelectValue(selectByLabel(container, "State"), "stale");
     setInputValue(inputByLabel(container, "Search Collection"), "lectures");
     await click(buttonByText(container, "Search"));
 
@@ -87,9 +91,8 @@ describe("DocumentationPanel", () => {
       input: {
         query: "turbovec search",
         limit: 12,
-        mode: "dense",
-        sourceTypes: ["media"],
-        states: ["stale"],
+        mode: "hybrid",
+        states: ["active"],
         collection: "lectures"
       }
     });
@@ -145,7 +148,22 @@ describe("DocumentationPanel", () => {
             sourceType: "media",
             uri: "https://youtube.example/watch?v=brownies",
             chunks: [
-              { chunkId: 4, locator: "transcript 00:01", chunkOrigin: "source", text: "Mix cocoa, sugar, eggs, and flour before baking the brownies." }
+              { chunkId: 4, locator: "transcript 00:01", chunkOrigin: "source", text: "Mix cocoa, sugar, eggs, and flour before baking the brownies." },
+              { chunkId: 5, locator: "page 30", chunkOrigin: "source", text: "PAGE 30 extracted text is diagram-like and hard to read." },
+              { chunkId: 6, locator: "page 30 figure-030", chunkOrigin: "source", text: "Extracted PDF visual artifact figure-030 from page 30." }
+            ],
+            artifacts: [
+              {
+                id: "figure-030",
+                type: "figure",
+                kind: "page-render",
+                page: 30,
+                locator: "page 30 figure-030",
+                path: "figures/figure-030.png",
+                mimeType: "image/png",
+                bytes: 4096,
+                available: true
+              }
             ]
           }
         });
@@ -158,7 +176,11 @@ describe("DocumentationPanel", () => {
     });
     await flush();
 
-    expect(container.textContent).toContain("AI assistance is enabled");
+    expect(container.querySelector(".documentation-ai-notice")).toBeNull();
+    const enabledTooltip = container.querySelector('[role="tooltip"]');
+    const enabledInfo = container.querySelector(".documentation-ai-info");
+    expect(enabledTooltip?.textContent).toContain("AI assistance is enabled");
+    expect(enabledInfo?.getAttribute("aria-describedby")).toBe(enabledTooltip?.id);
     expect(container.textContent).toContain("Document 11");
     setInputValue(inputByLabel(container, "Question"), "How do I bake brownies?");
     await click(buttonByText(container, "Search"));
@@ -174,8 +196,154 @@ describe("DocumentationPanel", () => {
 
     await click(buttonByText(container, "View Source"));
 
-    expect(calls).toContainEqual({ hookId: "documentation.documents.get", input: { documentId: "doc-2" } });
+    expect(calls).toContainEqual({ hookId: "documentation.documents.get", input: sourceWindowInput("doc-2") });
     expect(container.textContent).toContain("Mix cocoa, sugar, eggs, and flour");
+    const pageChunk = Array.from(container.querySelectorAll(".documentation-chunk")).find((chunk) => chunk.textContent?.includes("PAGE 30 extracted text"));
+    expect(pageChunk?.classList.contains("documentation-chunk-with-artifacts")).toBe(true);
+    const artifactImage = pageChunk?.querySelector<HTMLImageElement>(".documentation-artifact-image img");
+    expect(artifactImage?.getAttribute("src")).toBe("/api/documentation/documents/doc-2/artifact?path=figures%2Ffigure-030.png");
+    expect(pageChunk?.querySelector<HTMLAnchorElement>(".documentation-artifact-image a")?.textContent).toContain("Open");
+    expect(container.textContent).toContain("figure-030 · page 30 · 4.0 KiB");
+
+    await unmount(root);
+  });
+
+  it("opens active documents in source viewer mode and removes them there", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const calls: Array<{ hookId: string; input: Record<string, unknown> }> = [];
+    let removed = false;
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}) => {
+      calls.push({ hookId, input });
+      if (hookId === "documentation.stats") {
+        return hookResult<T>({ activeDocumentCount: removed ? 0 : 1, activeChunkCount: removed ? 0 : 127 });
+      }
+      if (hookId === "documentation.documents.list") {
+        return hookResult<T>({
+          documents: removed ? [] : [{
+            documentId: "doc-uploaded-note",
+            title: "Uploaded Operations Note.doc",
+            sourceType: "text",
+            state: "active",
+            chunkCount: 127
+          }]
+        });
+      }
+      if (hookId === "documentation.documents.get") {
+        return hookResult<T>({
+          document: {
+            documentId: "doc-uploaded-note",
+            title: "Uploaded Operations Note.doc",
+            sourceType: "text",
+            uri: "upload://uploaded_operations_note.doc",
+            chunks: [{ chunkId: 1, locator: "text 1", chunkOrigin: "source", text: "Scheduling source chunk text." }]
+          }
+        });
+      }
+      if (hookId === "documentation.remove") {
+        removed = true;
+        return {} as T;
+      }
+      return {} as T;
+    };
+
+    await act(async () => {
+      root.render(createElement(DocumentationPanel, { callHook }));
+    });
+    await flush();
+
+    await click(buttonByText(container, "View"));
+
+    expect(container.textContent).toContain("Source Viewer");
+    expect(container.textContent).toContain("Scheduling source chunk text.");
+    expect(container.textContent).not.toContain("Answer And Sources");
+    expect(container.textContent).not.toContain("Add Knowledge");
+
+    await click(buttonByText(container, "Remove"));
+
+    expect(calls).toContainEqual({ hookId: "documentation.remove", input: { documentId: "doc-uploaded-note" } });
+    expect(container.textContent).not.toContain("Source Viewer");
+    expect(container.textContent).not.toContain("Scheduling source chunk text.");
+
+    await unmount(root);
+  });
+
+  it("opens large media sources progressively and caps inline keyframe previews", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const calls: Array<{ hookId: string; input: Record<string, unknown> }> = [];
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}) => {
+      calls.push({ hookId, input });
+      if (hookId === "documentation.stats") {
+        return hookResult<T>({ activeDocumentCount: 1, activeChunkCount: 3 });
+      }
+      if (hookId === "documentation.documents.list") {
+        return hookResult<T>({
+          documents: [{ documentId: "doc-large-video", title: "Large video", sourceType: "media", state: "active", chunkCount: 3 }]
+        });
+      }
+      if (hookId === "documentation.documents.get") {
+        const chunkOffset = typeof input.chunkOffset === "number" ? input.chunkOffset : 0;
+        return hookResult<T>({
+          document: {
+            documentId: "doc-large-video",
+            title: "Large video",
+            sourceType: "media",
+            chunks: chunkOffset === 0 ? [
+              { chunkId: 1, locator: "media keyframes", chunkOrigin: "source", text: "Extracted YouTube video keyframes at one frame per second.", textLength: 12000, textTruncated: true },
+              { chunkId: 2, locator: "transcript 00:00", chunkOrigin: "source", text: "Opening the source should not render every transcript chunk." }
+            ] : [
+              { chunkId: 3, locator: "transcript 10:00", chunkOrigin: "source", text: "Later transcript chunk loaded on demand." }
+            ],
+            chunkWindow: chunkOffset === 0 ? { offset: 0, limit: 75, total: 3, hasMore: true } : { offset: 2, limit: 75, total: 3, hasMore: false },
+            artifacts: chunkOffset === 0 ? Array.from({ length: 10 }, (_unused, index) => ({
+              id: `keyframe-${index}`,
+              type: "media-keyframe",
+              kind: "keyframe",
+              locator: "media keyframes",
+              path: `media/keyframes/frame-${String(index + 1).padStart(6, "0")}.png`,
+              mimeType: "image/png",
+              available: true,
+              bytes: 1024,
+              offsetSeconds: index
+            })) : [],
+            artifactWindow: chunkOffset === 0 ? { offset: 0, limit: 100, total: 10000, hasMore: true } : { offset: 10, limit: 0, total: 10000, hasMore: true }
+          }
+        });
+      }
+      return {} as T;
+    };
+
+    await act(async () => {
+      root.render(createElement(DocumentationPanel, { callHook }));
+    });
+    await flush();
+
+    await click(buttonByText(container, "View"));
+
+    expect(calls).toContainEqual({ hookId: "documentation.documents.get", input: sourceWindowInput("doc-large-video") });
+    expect(container.textContent).toContain("2 of 3 chunks");
+    expect(container.textContent).toContain("10 of 10,000 extracted artifacts");
+    expect(container.textContent).toContain("Chunk preview truncated");
+    expect(container.querySelectorAll(".documentation-artifact-image img")).toHaveLength(6);
+
+    await click(buttonByText(container, "Load More Chunks"));
+
+    expect(calls).toContainEqual({
+      hookId: "documentation.documents.get",
+      input: {
+        documentId: "doc-large-video",
+        chunkOffset: 2,
+        chunkLimit: 75,
+        chunkTextMaxChars: 4000,
+        artifactOffset: 10,
+        artifactLimit: 0
+      }
+    });
+    expect(container.textContent).toContain("Later transcript chunk loaded on demand.");
+    expect(container.textContent).toContain("3 of 3 chunks");
 
     await unmount(root);
   });
@@ -216,7 +384,9 @@ describe("DocumentationPanel", () => {
     });
     await flush();
 
-    expect(container.textContent).toContain("AI assistance is disabled");
+    expect(container.querySelector(".documentation-ai-notice")).toBeNull();
+    expect(container.querySelector(".documentation-ai-status-warning")).toBeInstanceOf(HTMLSpanElement);
+    expect(container.querySelector('[role="tooltip"]')?.textContent).toContain("AI assistance is disabled");
     expect(buttonByText(container, "Answer").disabled).toBe(true);
     setInputValue(inputByLabel(container, "Search"), "recipe steps");
     await click(buttonByText(container, "Search"));
@@ -321,13 +491,67 @@ describe("DocumentationPanel", () => {
     expect(uploadFile).toHaveBeenCalledWith(expect.objectContaining({
       file,
       title: "Uploaded Note",
-      sourceType: undefined,
       collection: "validation",
       onProgress: expect.any(Function)
     }));
     expect(container.textContent).toContain("Import Queue");
     expect(container.textContent).toContain("Import complete. AI enrichment failed.");
     expect(container.textContent).toContain("AI enrichment failed for 1 document: uploaded-doc ASR service unavailable.");
+
+    await unmount(root);
+  });
+
+  it("shows server-side documentation ingest jobs started outside the panel", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const calls: Array<{ hookId: string; input: Record<string, unknown> }> = [];
+    let queueJobs = [{
+      id: "server-job-1",
+      kind: "url",
+      label: "Codex URL import",
+      detail: "https://vendor.example/doc",
+      status: "running",
+      progress: 35,
+      stage: "Downloading URL and extracting source evidence.",
+      position: 0
+    }];
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}) => {
+      calls.push({ hookId, input });
+      if (hookId === "documentation.stats") {
+        return hookResult<T>({ activeDocumentCount: 0, activeChunkCount: 0 });
+      }
+      if (hookId === "documentation.documents.list") {
+        return hookResult<T>({ documents: [] });
+      }
+      if (hookId === "documentation.ingest.queue") {
+        return hookResult<T>({ jobs: queueJobs });
+      }
+      if (hookId === "documentation.ingest.queue.clearFinished") {
+        queueJobs = [];
+        return hookResult<T>({ jobs: queueJobs });
+      }
+      return {} as T;
+    };
+
+    await act(async () => {
+      root.render(createElement(DocumentationPanel, { callHook }));
+    });
+    await flush();
+
+    expect(container.textContent).toContain("Import Queue");
+    expect(container.textContent).toContain("Codex URL import");
+    expect(container.textContent).toContain("Downloading URL and extracting source evidence.");
+    expect(progressBars(container).map((bar) => bar.getAttribute("aria-valuenow"))).toContain("35");
+
+    queueJobs = [{ ...queueJobs[0]!, status: "complete", progress: 100, stage: "Import complete." }];
+    await click(buttonByText(container, "Refresh"));
+
+    expect(container.textContent).toContain("Import complete.");
+    await click(buttonByText(container, "Clear Finished"));
+
+    expect(calls).toContainEqual({ hookId: "documentation.ingest.queue.clearFinished", input: {} });
+    expect(container.textContent).not.toContain("Codex URL import");
 
     await unmount(root);
   });
@@ -565,14 +789,6 @@ function optionalInputByLabel(container: HTMLElement, label: string): HTMLInputE
   return input instanceof HTMLInputElement ? input : null;
 }
 
-function selectByLabel(container: HTMLElement, label: string): HTMLSelectElement {
-  const select = controlByLabel(container, label, "select");
-  if (!(select instanceof HTMLSelectElement)) {
-    throw new Error(`Missing select ${label}.`);
-  }
-  return select;
-}
-
 function textAreaByLabel(container: HTMLElement, label: string): HTMLTextAreaElement {
   const textArea = controlByLabel(container, label, "textarea");
   if (!(textArea instanceof HTMLTextAreaElement)) {
@@ -594,11 +810,6 @@ function setInputValue(input: HTMLInputElement, value: string): void {
   input.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
-function setSelectValue(select: HTMLSelectElement, value: string): void {
-  Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set?.call(select, value);
-  select.dispatchEvent(new Event("change", { bubbles: true }));
-}
-
 function setTextAreaValue(textArea: HTMLTextAreaElement, value: string): void {
   Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set?.call(textArea, value);
   textArea.dispatchEvent(new Event("input", { bubbles: true }));
@@ -611,6 +822,17 @@ function setFileValue(input: HTMLInputElement, file: File): void {
 
 function hookResult<T extends Record<string, unknown>>(value: Record<string, unknown>): T {
   return value as unknown as T;
+}
+
+function sourceWindowInput(documentId: string): Record<string, unknown> {
+  return {
+    documentId,
+    chunkOffset: 0,
+    chunkLimit: 75,
+    chunkTextMaxChars: 4000,
+    artifactOffset: 0,
+    artifactLimit: 100
+  };
 }
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: unknown) => void } {

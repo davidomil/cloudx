@@ -24,9 +24,24 @@
       }
     },
     "metadata": {
-      "type": "object",
-      "additionalProperties": {
-        "type": ["string", "number", "boolean", "null"]
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["key", "value"],
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "value": {
+            "anyOf": [
+              { "type": "string" },
+              { "type": "number" },
+              { "type": "boolean" },
+              { "type": "null" }
+            ]
+          }
+        }
       }
     },
     "warnings": {

@@ -4,9 +4,11 @@ import staticPlugin from "@fastify/static";
 import fs from "node:fs";
 import type { IncomingHttpHeaders } from "node:http";
 import { randomUUID } from "node:crypto";
+import { Readable } from "node:stream";
 import type { RawData, WebSocket } from "ws";
 
 import { isAutomationGraphDocument, isUsableTabLayoutState } from "@cloudx/shared";
+import type { HookCallContext } from "@cloudx/plugin-api";
 import type {
   ApplyWorkspaceLayoutTemplateRequest,
   AutomationDynamicOptionSource,
@@ -28,6 +30,7 @@ import type { AppConfig } from "./config.js";
 import { ConfigService } from "./configService.js";
 import { AsrClient } from "./asrClient.js";
 import { DEFAULT_DOCUMENTATION_URL, DocumentationClient } from "./documentation/DocumentationClient.js";
+import { DocumentationIngestQueue } from "./documentation/DocumentationIngestQueue.js";
 import { CodexDocumentationEnrichmentRunner, DocumentationEnrichmentService } from "./documentation/DocumentationEnrichmentService.js";
 import { PathPolicy } from "./pathPolicy.js";
 import { PluginRegistry } from "./pluginRegistry.js";
@@ -85,6 +88,7 @@ export interface AppServices {
   fileTransfer?: FileTransferService;
   notifications?: NotificationsPlugin;
   documentation?: DocumentationClient;
+  documentationIngestQueue?: DocumentationIngestQueue;
   documentationEnrichment?: DocumentationEnrichmentService;
   pluginContributionsReady?: Promise<RulesSkillsStore>;
 }
@@ -96,6 +100,15 @@ const MAX_TERMINAL_DIMENSION = 500;
 const FILE_UPLOAD_MAX_BYTES = 25 * 1024 * 1024 * 1024;
 const WS_CONNECTING = 0;
 const WS_OPEN = 1;
+const DOCUMENTATION_ARTIFACT_PROXY_HEADERS = [
+  "accept-ranges",
+  "content-disposition",
+  "content-length",
+  "content-range",
+  "content-type",
+  "etag",
+  "last-modified"
+];
 const LOCAL_WEB_PROXY_HTTP_METHODS: HTTPMethods[] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
 
 export type TerminalControlMessage = { type: "input"; data: string } | { type: "resize"; cols: number; rows: number };
@@ -117,6 +130,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       : null
   });
   services ??= buildServices(config, app.log);
+  services.documentationIngestQueue ??= new DocumentationIngestQueue();
   services.config ??= new ConfigService(config.dataDir, () => services!.plugins.list());
   services.workspace ??= new WorkspaceLayoutStore(config.dataDir, services.pathPolicy);
   services.pluginData ??= new PluginDataStore(config.dataDir);
@@ -383,27 +397,82 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     const contentType = optionalHeaderString(request.headers["x-cloudx-file-content-type"]);
     const sourceType = optionalQueryString(request.query.sourceType);
     const content = await readRequestBodyBuffer(request.body, config.documentationUploadMaxBytes);
-    const result = await services.documentation!.ingestUpload({
-      filename,
-      content,
-      contentType,
-      title: optionalQueryString(request.query.title),
-      sourceType,
-      collection: optionalQueryString(request.query.collection)
+    const title = optionalQueryString(request.query.title);
+    const collection = optionalQueryString(request.query.collection);
+    return services.documentationIngestQueue!.enqueue({
+      kind: "upload",
+      label: title ?? filename,
+      detail: filename,
+      runningStage: "Forwarding uploaded file to the documentation indexer.",
+      operation: async (job) => {
+        job.update({ progress: 25, stage: "Indexer is extracting source evidence from the uploaded file." });
+        const result = await services.documentation!.ingestUpload({
+          filename,
+          content,
+          contentType,
+          title,
+          sourceType,
+          collection
+        });
+        job.update({ progress: 78, stage: "Running AI enrichment for the imported documentation." });
+        const enriched = await (services.documentationEnrichment?.enrichIngestResponse(result, {
+          filename,
+          content,
+          contentType,
+          sourceType
+        }) ?? result);
+        job.update({ progress: 92, stage: "Finalizing documentation import." });
+        return enriched;
+      }
     });
-    return services.documentationEnrichment?.enrichIngestResponse(result, {
-      filename,
-      content,
-      contentType,
-      sourceType
-    }) ?? result;
   });
 
-  app.post<{ Params: { hookId: string }; Body: HookCallRequest }>("/api/hooks/:hookId", async (request) => {
+  app.get<{
+    Params: { documentId: string };
+    Querystring: { path?: string };
+  }>("/api/documentation/documents/:documentId/artifact", async (request, reply) => {
+    const artifact = await services.documentation!.streamArtifact({
+      documentId: request.params.documentId,
+      path: requiredQueryString(request.query.path, "path")
+    }, {
+      range: optionalHeaderString(request.headers.range),
+      "if-range": optionalHeaderString(request.headers["if-range"])
+    });
+    reply.code(artifact.statusCode);
+    for (const header of DOCUMENTATION_ARTIFACT_PROXY_HEADERS) {
+      const value = artifact.headers.get(header);
+      if (value) {
+        reply.header(header, value);
+      }
+    }
+    reply.header("cache-control", "no-store");
+    reply.header("x-content-type-options", "nosniff");
+    if (!artifact.body) {
+      return reply.send();
+    }
+    return reply.send(Readable.fromWeb(artifact.body as Parameters<typeof Readable.fromWeb>[0]));
+  });
+
+  app.post<{ Params: { hookId: string }; Querystring: { stream?: string }; Body: HookCallRequest }>("/api/hooks/:hookId", async (request, reply) => {
     const body = optionalRequestBody(request.body);
     const targetTabId = optionalBodyString(body.targetTabId, "targetTabId");
     const input = optionalBodyRecord(body.input, "input") ?? {};
     const targetTab = targetTabId ? services.sessions.getTab(targetTabId) : undefined;
+    if (isStreamingHookRequest(request)) {
+      reply.header("cache-control", "no-store");
+      reply.type("application/x-ndjson");
+      return reply.send(hookProgressStream({
+        hookId: request.params.hookId,
+        input,
+        context: {
+          caller: { kind: "http" },
+          targetTab,
+          targetTabId,
+          activeTabId: services.sessions.getActiveTabId()
+        },
+        services: services!
+      }));
+    }
     const result = await services.hooks!.call(request.params.hookId, input, {
       caller: { kind: "http" },
       targetTab,
@@ -880,14 +949,16 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     timeoutMs: config.documentationTimeoutMs,
     responseMaxBytes: config.documentationResponseMaxBytes
   });
+  const documentationIngestQueue = new DocumentationIngestQueue();
   process.env.CLOUDX_DOCUMENTATION_URL ??= documentationUrl;
+  process.env.CLOUDX_SERVER_URL ??= `${config.https ? "https" : "http"}://127.0.0.1:${config.port}`;
   let sessions: SessionStore | undefined;
   let documentationEnrichment: DocumentationEnrichmentService | undefined;
   plugins.register(new CodexTerminalPlugin(terminalFactory, config.terminalReplayBytes, config.dataDir));
   plugins.register(new StandardTerminalPlugin(terminalFactory, config.terminalReplayBytes));
   plugins.register(new FileBrowserPlugin(pathPolicy));
   plugins.register(new LocalWebPlugin());
-  plugins.register(new DocumentationPlugin(documentation, pathPolicy, () => documentationEnrichment));
+  plugins.register(new DocumentationPlugin(documentation, pathPolicy, documentationIngestQueue, () => documentationEnrichment));
   plugins.register(new WorktreeManagerPlugin());
   plugins.register(new WorkspaceControlPlugin());
   plugins.register(new RulesSkillsPlugin(rulesSkills, async () => {
@@ -953,7 +1024,75 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   registerPluginTriggers(triggers, plugins);
   sessions.setTriggerRegistry(triggers);
   automation = createAutomationService(automationRepository, { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config);
-  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, automation, pluginData, rulesSkills, fileTransfer, notifications, documentation, documentationEnrichment, pluginContributionsReady };
+  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, automation, pluginData, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, pluginContributionsReady };
+}
+
+function isStreamingHookRequest(request: FastifyRequest<{ Querystring: { stream?: string } }>): boolean {
+  const accept = request.headers.accept;
+  return request.query.stream === "1" || request.query.stream === "true" || typeof accept === "string" && accept.includes("application/x-ndjson");
+}
+
+function hookProgressStream(input: {
+  hookId: string;
+  input: Record<string, unknown>;
+  context: HookCallContext;
+  services: AppServices;
+}): Readable {
+  const events = new AsyncEventQueue<Record<string, unknown>>();
+  void input.services.hooks!.call(input.hookId, input.input, {
+    ...input.context,
+    reportProgress: (progress) => events.push({ type: "progress", hookId: input.hookId, at: new Date().toISOString(), ...progress })
+  }).then((result) => {
+    events.push({ type: "result", hookId: input.hookId, at: new Date().toISOString(), result });
+  }).catch((error) => {
+    events.push({ type: "error", hookId: input.hookId, at: new Date().toISOString(), error: error instanceof Error ? error.message : String(error) });
+  }).finally(() => events.end());
+  return Readable.from(ndjsonEvents(events));
+}
+
+async function* ndjsonEvents(events: AsyncIterable<Record<string, unknown>>): AsyncGenerator<string> {
+  for await (const event of events) {
+    yield `${JSON.stringify(event)}\n`;
+  }
+}
+
+class AsyncEventQueue<T> implements AsyncIterable<T> {
+  private readonly items: T[] = [];
+  private readonly waiters: Array<(result: IteratorResult<T>) => void> = [];
+  private done = false;
+
+  push(item: T): void {
+    const waiter = this.waiters.shift();
+    if (waiter) {
+      waiter({ value: item, done: false });
+      return;
+    }
+    this.items.push(item);
+  }
+
+  end(): void {
+    this.done = true;
+    for (const waiter of this.waiters.splice(0)) {
+      waiter({ value: undefined, done: true });
+    }
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<T> {
+    while (true) {
+      if (this.items.length > 0) {
+        yield this.items.shift()!;
+        continue;
+      }
+      if (this.done) {
+        return;
+      }
+      const result = await new Promise<IteratorResult<T>>((resolve) => this.waiters.push(resolve));
+      if (result.done) {
+        return;
+      }
+      yield result.value;
+    }
+  }
 }
 
 export function serializeRequestForLog(request: Pick<FastifyRequest, "method" | "url" | "hostname" | "ip" | "socket">): {
