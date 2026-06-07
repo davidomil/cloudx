@@ -30,10 +30,10 @@ class IngestUrlRequest(BaseModel):
 
 
 class IngestTextRequest(BaseModel):
-    title: str
+    title: str | None = None
     text: str
-    uri: str
-    source_type: str = Field(alias="sourceType")
+    uri: str | None = None
+    source_type: str | None = Field(default=None, alias="sourceType")
     collection: str | None = None
     tags: list[str] = Field(default_factory=list)
 
@@ -51,6 +51,19 @@ class InvalidateRequest(BaseModel):
     document_id: str = Field(alias="documentId")
     state: str = "stale"
     reason: str
+
+
+class EnrichmentSpan(BaseModel):
+    locator: str
+    text: str
+
+
+class EnrichDocumentRequest(BaseModel):
+    spans: list[EnrichmentSpan]
+    model: str
+    skill_ids: list[str] = Field(default_factory=list, alias="skillIds")
+    summary: str = ""
+    payload: dict = Field(default_factory=dict)
 
 
 def create_app(root: str | Path | None = None) -> FastAPI:
@@ -83,6 +96,21 @@ def create_app(root: str | Path | None = None) -> FastAPI:
     def remove_document(document_id: str) -> dict:
         return {"document": handle_archive_error(lambda: archive.remove_document(document_id))}
 
+    @app.post("/documents/{document_id}/enrich")
+    def enrich_document(document_id: str, request: EnrichDocumentRequest) -> dict:
+        return {
+            "document": handle_archive_error(
+                lambda: archive.enrich_document(
+                    document_id,
+                    spans=[span_to_extracted_span(span) for span in request.spans],
+                    model=request.model,
+                    skill_ids=request.skill_ids,
+                    summary=request.summary,
+                    payload=request.payload,
+                )
+            )
+        }
+
     @app.post("/ingest/path")
     def ingest_path(request: IngestPathRequest) -> dict:
         return {
@@ -102,8 +130,8 @@ def create_app(root: str | Path | None = None) -> FastAPI:
 
     @app.post("/ingest/url")
     def ingest_url(request: IngestUrlRequest) -> dict:
-        document = handle_archive_error(
-            lambda: archive.ingest_url(
+        documents = handle_archive_error(
+            lambda: archive.ingest_url_documents(
                 request.url,
                 title=request.title,
                 source_type=request.source_type,
@@ -112,7 +140,7 @@ def create_app(root: str | Path | None = None) -> FastAPI:
                 transcript=request.transcript,
             )
         )
-        return {"document": document.as_dict()}
+        return {"document": documents[0].as_dict(), "documents": [document.as_dict() for document in documents]}
 
     @app.post("/ingest/upload")
     async def ingest_upload(
@@ -189,6 +217,12 @@ def handle_archive_error(operation):
         return operation()
     except ArchiveError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+def span_to_extracted_span(span: EnrichmentSpan):
+    from .extraction import ExtractedSpan
+
+    return ExtractedSpan(span.text, span.locator)
 
 
 def main(argv: Sequence[str] | None = None) -> None:

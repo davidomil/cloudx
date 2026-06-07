@@ -4,7 +4,22 @@ import os from "node:os";
 import path from "node:path";
 
 import { DEFAULT_ASR_TIMEOUT_MS, MAX_ASR_TIMEOUT_MS } from "./asrClient.js";
-import { DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES, MAX_VOICE_AUDIO_UPLOAD_MAX_BYTES, defaultLocalHttpsPaths, loadConfig, networkBindWarning, shouldWarnForNetworkBind } from "./config.js";
+import {
+  DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES,
+  DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES,
+  MAX_DOCUMENTATION_UPLOAD_MAX_BYTES,
+  MAX_VOICE_AUDIO_UPLOAD_MAX_BYTES,
+  defaultLocalHttpsPaths,
+  loadConfig,
+  networkBindWarning,
+  shouldWarnForNetworkBind
+} from "./config.js";
+import {
+  DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES,
+  DEFAULT_DOCUMENTATION_TIMEOUT_MS,
+  MAX_DOCUMENTATION_RESPONSE_MAX_BYTES,
+  MAX_DOCUMENTATION_TIMEOUT_MS
+} from "./documentation/DocumentationClient.js";
 import { DEFAULT_TERMINAL_REPLAY_BYTES } from "./plugins/CodexTerminalPlugin.js";
 
 describe("loadConfig", () => {
@@ -15,6 +30,9 @@ describe("loadConfig", () => {
     expect(config.port).toBe(3001);
     expect(config.terminalReplayBytes).toBe(DEFAULT_TERMINAL_REPLAY_BYTES);
     expect(config.asrTimeoutMs).toBe(DEFAULT_ASR_TIMEOUT_MS);
+    expect(config.documentationTimeoutMs).toBe(DEFAULT_DOCUMENTATION_TIMEOUT_MS);
+    expect(config.documentationResponseMaxBytes).toBe(DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES);
+    expect(config.documentationUploadMaxBytes).toBe(DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES);
     expect(config.voiceAudioUploadMaxBytes).toBe(DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES);
   });
 
@@ -42,6 +60,22 @@ describe("loadConfig", () => {
     const config = loadConfig({ CLOUDX_ASR_TIMEOUT_MS: "45000" } as NodeJS.ProcessEnv);
 
     expect(config.asrTimeoutMs).toBe(45_000);
+  });
+
+  it("parses documentation timeout", () => {
+    const config = loadConfig({ CLOUDX_DOCUMENTATION_TIMEOUT_MS: "3600000" } as NodeJS.ProcessEnv);
+
+    expect(config.documentationTimeoutMs).toBe(3_600_000);
+  });
+
+  it("parses documentation response and upload size limits", () => {
+    const config = loadConfig({
+      CLOUDX_DOCUMENTATION_RESPONSE_MAX_BYTES: "16777216",
+      CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES: "536870912"
+    } as NodeJS.ProcessEnv);
+
+    expect(config.documentationResponseMaxBytes).toBe(16_777_216);
+    expect(config.documentationUploadMaxBytes).toBe(536_870_912);
   });
 
   it("parses voice audio upload body limit", () => {
@@ -76,6 +110,23 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ CLOUDX_ASR_TIMEOUT_MS: "1e3" } as NodeJS.ProcessEnv)).toThrow(/CLOUDX_ASR_TIMEOUT_MS/);
     expect(() => loadConfig({ CLOUDX_ASR_TIMEOUT_MS: "1abc" } as NodeJS.ProcessEnv)).toThrow(/CLOUDX_ASR_TIMEOUT_MS/);
     expect(() => loadConfig({ CLOUDX_ASR_TIMEOUT_MS: String(MAX_ASR_TIMEOUT_MS + 1) } as NodeJS.ProcessEnv)).toThrow(/CLOUDX_ASR_TIMEOUT_MS/);
+  });
+
+  it("rejects invalid documentation timeout", () => {
+    expect(() => loadConfig({ CLOUDX_DOCUMENTATION_TIMEOUT_MS: "0" } as NodeJS.ProcessEnv)).toThrow(/CLOUDX_DOCUMENTATION_TIMEOUT_MS/);
+    expect(() => loadConfig({ CLOUDX_DOCUMENTATION_TIMEOUT_MS: "1.5" } as NodeJS.ProcessEnv)).toThrow(/CLOUDX_DOCUMENTATION_TIMEOUT_MS/);
+    expect(() => loadConfig({ CLOUDX_DOCUMENTATION_TIMEOUT_MS: "1e3" } as NodeJS.ProcessEnv)).toThrow(/CLOUDX_DOCUMENTATION_TIMEOUT_MS/);
+    expect(() => loadConfig({ CLOUDX_DOCUMENTATION_TIMEOUT_MS: "1abc" } as NodeJS.ProcessEnv)).toThrow(/CLOUDX_DOCUMENTATION_TIMEOUT_MS/);
+    expect(() => loadConfig({ CLOUDX_DOCUMENTATION_TIMEOUT_MS: String(MAX_DOCUMENTATION_TIMEOUT_MS + 1) } as NodeJS.ProcessEnv)).toThrow(/CLOUDX_DOCUMENTATION_TIMEOUT_MS/);
+  });
+
+  it("rejects invalid documentation response and upload size limits", () => {
+    expect(() => loadConfig({ CLOUDX_DOCUMENTATION_RESPONSE_MAX_BYTES: "0" } as NodeJS.ProcessEnv)).toThrow(/CLOUDX_DOCUMENTATION_RESPONSE_MAX_BYTES/);
+    expect(() => loadConfig({ CLOUDX_DOCUMENTATION_RESPONSE_MAX_BYTES: "1.5" } as NodeJS.ProcessEnv)).toThrow(/CLOUDX_DOCUMENTATION_RESPONSE_MAX_BYTES/);
+    expect(() => loadConfig({ CLOUDX_DOCUMENTATION_RESPONSE_MAX_BYTES: String(MAX_DOCUMENTATION_RESPONSE_MAX_BYTES + 1) } as NodeJS.ProcessEnv)).toThrow(/CLOUDX_DOCUMENTATION_RESPONSE_MAX_BYTES/);
+    expect(() => loadConfig({ CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES: "0" } as NodeJS.ProcessEnv)).toThrow(/CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES/);
+    expect(() => loadConfig({ CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES: "1.5" } as NodeJS.ProcessEnv)).toThrow(/CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES/);
+    expect(() => loadConfig({ CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES: String(MAX_DOCUMENTATION_UPLOAD_MAX_BYTES + 1) } as NodeJS.ProcessEnv)).toThrow(/CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES/);
   });
 
   it("rejects invalid voice audio upload body limit", () => {

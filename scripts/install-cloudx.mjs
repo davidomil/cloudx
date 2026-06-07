@@ -21,6 +21,7 @@ export const UBUNTU_APT_PACKAGES = [
   "build-essential",
   "libreoffice",
   "poppler-utils",
+  "ffmpeg",
   "pandoc",
   "texlive-xetex",
   "texlive-latex-recommended",

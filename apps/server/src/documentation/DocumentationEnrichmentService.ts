@@ -1,0 +1,844 @@
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import type { CloudxSkill, RulesSkillsStore } from "@cloudx/shared";
+
+import type { AsrClient } from "../asrClient.js";
+import type { ConfigService } from "../configService.js";
+import type { RulesSkillsCatalogService } from "../rulesSkills/RulesSkillsCatalogService.js";
+import { runCodexExec } from "../voice/VoicePlanner.js";
+import { DEFAULT_DOCUMENTATION_TIMEOUT_MS, type DocumentationClient } from "./DocumentationClient.js";
+
+export const DOCUMENTATION_PLUGIN_ID = "documentation";
+export const DOCUMENTATION_AI_ENRICHMENT_ENABLED_KEY = "aiEnrichmentEnabled";
+export const DOCUMENTATION_AI_ENRICHMENT_SKILLS_KEY = "aiEnrichmentSkillIds";
+export const DEFAULT_DOCUMENTATION_ENRICHMENT_SKILL_IDS = [
+  "documentation-enrich-metadata",
+  "documentation-enrich-visuals",
+  "documentation-enrich-media"
+];
+
+const ENRICHMENT_SCHEMA_PATH = fileURLToPath(new URL("./documentation-enrichment.schema.json", import.meta.url));
+const ANSWER_SCHEMA_PATH = fileURLToPath(new URL("./documentation-answer.schema.json", import.meta.url));
+const ENRICHMENT_BATCH_TARGET_CHARS = 60_000;
+const ANSWER_DOCUMENT_TARGET_CHARS = 40_000;
+const ANSWER_EVIDENCE_TARGET_CHARS = 90_000;
+const MEDIA_KEYFRAME_INTERVAL_SECONDS = 1;
+const MEDIA_TOOL_TIMEOUT_MS = 30 * 60 * 1000;
+const TRANSCRIPT_SEGMENT_TARGET_CHARS = 12_000;
+
+export interface DocumentationEnrichmentRunner {
+  readonly model: string;
+  run(prompt: string, options?: DocumentationRunnerOptions): Promise<unknown>;
+}
+
+interface DocumentationRunnerOptions {
+  schemaPath?: string;
+  outputPrefix?: string;
+  timeoutMs?: number;
+  taskLabel?: string;
+}
+
+export interface DocumentationEnrichmentSource {
+  filename?: string;
+  content?: Buffer;
+  contentType?: string;
+  sourceType?: string;
+}
+
+export interface DocumentationEnrichmentOptions {
+  client: DocumentationClient;
+  config: ConfigService;
+  rulesSkills: RulesSkillsCatalogService;
+  runner: DocumentationEnrichmentRunner;
+  asr?: AsrClient;
+  pluginContributionsReady?: () => Promise<RulesSkillsStore> | undefined;
+}
+
+export class CodexDocumentationEnrichmentRunner implements DocumentationEnrichmentRunner {
+  constructor(
+    readonly model: string,
+    private readonly timeoutMs = DEFAULT_DOCUMENTATION_TIMEOUT_MS
+  ) {}
+
+  async run(prompt: string, options: DocumentationRunnerOptions = {}): Promise<unknown> {
+    return JSON.parse(
+      await runCodexExec(this.model, prompt, {
+        schemaPath: options.schemaPath ?? ENRICHMENT_SCHEMA_PATH,
+        outputPrefix: options.outputPrefix ?? "cloudx-doc-enrich-",
+        timeoutMs: options.timeoutMs ?? this.timeoutMs,
+        taskLabel: options.taskLabel ?? "documentation enrichment"
+      })
+    );
+  }
+}
+
+export class DocumentationEnrichmentService {
+  constructor(private readonly options: DocumentationEnrichmentOptions) {}
+
+  isEnabled(): boolean {
+    if (!this.options.config.isAiControlEnabled()) {
+      return false;
+    }
+    return this.options.config.getPluginConfig(DOCUMENTATION_PLUGIN_ID)[DOCUMENTATION_AI_ENRICHMENT_ENABLED_KEY] === true;
+  }
+
+  async enrichIngestResponse(response: Record<string, unknown>, source: DocumentationEnrichmentSource = {}): Promise<Record<string, unknown>> {
+    if (!this.isEnabled()) {
+      return response;
+    }
+    const documents = uniqueDocuments(response);
+    if (documents.length === 0) {
+      return response;
+    }
+    const results = [];
+    for (const document of documents) {
+      try {
+        results.push(await this.enrichDocument(document, source));
+      } catch (error) {
+        results.push({
+          documentId: document.documentId,
+          status: "failed",
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+    return { ...response, enrichment: { enabled: true, results } };
+  }
+
+  async answerQuestion(input: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (!this.isEnabled()) {
+      throw new Error("Documentation AI assistance is disabled. Manual search can inspect source text only.");
+    }
+    const question = requiredQuestion(input);
+    const searchInput = answerSearchInput(input, question);
+    const searchResponse = await this.options.client.search(searchInput);
+    const results = recordsArray(searchResponse.results);
+    if (results.length === 0) {
+      return {
+        answer: "No matching source material was found.",
+        answerHtml: "<p>No matching source material was found.</p>",
+        citations: [],
+        warnings: ["No archive search results matched the question."],
+        results,
+        model: this.options.runner.model
+      };
+    }
+    const evidence = await this.answerEvidence(results);
+    const output = normalizeAnswerOutput(
+      await this.options.runner.run(buildAnswerPrompt(question, evidence), {
+        schemaPath: ANSWER_SCHEMA_PATH,
+        outputPrefix: "cloudx-doc-answer-",
+        taskLabel: "documentation answer"
+      })
+    );
+    return { ...output, results, model: this.options.runner.model };
+  }
+
+  private async enrichDocument(document: IngestedDocumentRef, source: DocumentationEnrichmentSource): Promise<Record<string, unknown>> {
+    const skillIds = configuredSkillIds(this.options.config.getPluginConfig(DOCUMENTATION_PLUGIN_ID)[DOCUMENTATION_AI_ENRICHMENT_SKILLS_KEY]);
+    const skills = await this.resolveSkills(skillIds);
+    const fullDocument = getRecord((await this.options.client.getDocument({ documentId: document.documentId })).document, "document");
+    const cleanup: Array<() => Promise<void>> = [];
+    try {
+      const mediaEvidence = await this.prepareMediaEvidence(source, cleanup);
+      const evidence = {
+        document: documentSummary(fullDocument),
+        chunks: documentChunks(fullDocument),
+        artifacts: await this.documentArtifacts(fullDocument),
+        media: mediaEvidence
+      };
+      const batches = buildEvidenceBatches(evidence);
+      const outputs = [];
+      for (const batch of batches) {
+        outputs.push(normalizeEnrichmentOutput(await this.options.runner.run(buildEnrichmentPrompt(skills, batch))));
+      }
+      const output = mergeEnrichmentOutputs(outputs);
+      if (output.spans.length === 0) {
+        return {
+          documentId: document.documentId,
+          status: "skipped",
+          reason: "Codex returned no enrichment spans.",
+          warnings: output.warnings
+        };
+      }
+      await this.options.client.enrichDocument({
+        documentId: document.documentId,
+        spans: output.spans,
+        model: this.options.runner.model,
+        skillIds,
+        summary: output.summary,
+        payload: {
+          metadata: output.metadata,
+          warnings: output.warnings,
+          evidence: evidenceSummary(evidence, batches)
+        }
+      });
+      return {
+        documentId: document.documentId,
+        status: "written",
+        chunkCount: output.spans.length,
+        warnings: output.warnings
+      };
+    } finally {
+      await Promise.allSettled(cleanup.map((operation) => operation()));
+    }
+  }
+
+  private async resolveSkills(skillIds: string[]): Promise<CloudxSkill[]> {
+    const store = await (this.options.pluginContributionsReady?.() ?? this.options.rulesSkills.list());
+    const skills = new Map([...store.systemSkills, ...store.skills].map((skill) => [skill.id, skill]));
+    return skillIds.map((skillId) => {
+      const skill = skills.get(skillId);
+      if (!skill?.instructions?.trim()) {
+        throw new Error(`Documentation enrichment skill is not available: ${skillId}`);
+      }
+      return skill;
+    });
+  }
+
+  private async answerEvidence(results: Record<string, unknown>[]): Promise<AnswerEvidence[]> {
+    const evidence: AnswerEvidence[] = [];
+    const documents = new Map<string, Record<string, unknown>>();
+    const resultGroups = groupAnswerResults(results);
+    let evidenceChars = 0;
+    for (const [documentId, documentResults] of resultGroups) {
+      let document = documents.get(documentId);
+      if (!document) {
+        document = getRecord((await this.options.client.getDocument({ documentId })).document, "document");
+        documents.set(documentId, document);
+      }
+      for (const chunk of selectAnswerChunks(recordsArray(document.chunks), documentResults)) {
+        const nextChars = chunk.text.length + 400;
+        if (evidence.length > 0 && evidenceChars + nextChars > ANSWER_EVIDENCE_TARGET_CHARS) {
+          return evidence;
+        }
+        const result = documentResults.find((candidate) => candidate.chunkId === chunk.chunkId) ?? documentResults[0];
+        evidence.push({
+          result: {
+            chunkId: chunk.chunkId,
+            documentId,
+            title: result?.title ?? "",
+            sourceType: result?.sourceType ?? "",
+            locator: chunk.locator,
+            uri: result?.uri
+          },
+          text: chunk.text
+        });
+        evidenceChars += nextChars;
+      }
+    }
+    return evidence.filter((item) => item.text.trim());
+  }
+
+  private async documentArtifacts(document: Record<string, unknown>): Promise<ArtifactEvidence[]> {
+    const archiveRoot = await this.archiveRoot();
+    const snapshotPath = typeof document.snapshot_path === "string" ? document.snapshot_path : undefined;
+    if (!archiveRoot || !snapshotPath) {
+      return [];
+    }
+    const root = path.resolve(archiveRoot);
+    const snapshot = path.resolve(root, snapshotPath);
+    if (!isSameOrChild(root, snapshot)) {
+      return [];
+    }
+    const extracted = path.join(path.dirname(snapshot), "extracted");
+    if (!fs.existsSync(extracted)) {
+      return [];
+    }
+    const paths = await listFiles(extracted);
+    const artifacts: ArtifactEvidence[] = [];
+    for (const artifactPath of paths) {
+      const relativePath = path.relative(root, artifactPath);
+      const stat = await fsp.stat(artifactPath);
+      artifacts.push({
+        path: artifactPath,
+        archivePath: relativePath,
+        bytes: stat.size,
+        kind: artifactKind(artifactPath)
+      });
+    }
+    return artifacts;
+  }
+
+  private async archiveRoot(): Promise<string | undefined> {
+    const health = await this.options.client.health();
+    return typeof health.archiveRoot === "string" ? health.archiveRoot : undefined;
+  }
+
+  private async prepareMediaEvidence(source: DocumentationEnrichmentSource, cleanup: Array<() => Promise<void>>): Promise<MediaEvidence | undefined> {
+    if (!source.content || !isMediaSource(source)) {
+      return undefined;
+    }
+    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-media-"));
+    cleanup.push(() => fsp.rm(tempDir, { recursive: true, force: true }));
+    const mediaPath = path.join(tempDir, safeMediaFilename(source.filename));
+    await fsp.writeFile(mediaPath, source.content);
+    if (!this.options.asr) {
+      throw new Error("Documentation media enrichment requires the ASR service so uploaded audio/video is not indexed without transcript evidence.");
+    }
+    const transcript = await this.options.asr.transcribe(source.content, source.filename || "upload.media");
+    const keyframes = isVideoSource(source) ? captureIntervalKeyframes(mediaPath, path.join(tempDir, "frames")) : [];
+    return {
+      filename: source.filename,
+      contentType: source.contentType,
+      sourceType: source.sourceType,
+      transcript: transcript?.text,
+      language: transcript?.language,
+      languageProbability: transcript?.language_probability,
+      keyframes
+    };
+  }
+}
+
+interface IngestedDocumentRef {
+  documentId: string;
+}
+
+interface ArtifactEvidence {
+  path: string;
+  archivePath: string;
+  bytes: number;
+  kind: string;
+}
+
+interface MediaEvidence {
+  filename?: string;
+  contentType?: string;
+  sourceType?: string;
+  transcript?: string;
+  language?: string;
+  languageProbability?: number;
+  keyframes: Array<{ path: string; offsetSeconds?: number }>;
+}
+
+interface EnrichmentOutput {
+  summary: string;
+  spans: Array<{ locator: string; text: string }>;
+  metadata: Record<string, string | number | boolean | null>;
+  warnings: string[];
+}
+
+interface AnswerEvidence {
+  result: {
+    chunkId?: number;
+    documentId: string;
+    title: string;
+    sourceType: string;
+    locator: string;
+    uri?: string;
+  };
+  text: string;
+}
+
+interface AnswerResultRef {
+  chunkId?: number;
+  title: string;
+  sourceType: string;
+  locator: string;
+  uri?: string;
+}
+
+interface AnswerChunkRef {
+  chunkId?: number;
+  locator: string;
+  text: string;
+}
+
+interface AnswerOutput {
+  answer: string;
+  answerHtml: string;
+  citations: Array<{ documentId: string; title: string; locator: string }>;
+  warnings: string[];
+}
+
+interface EnrichmentEvidence {
+  document: Record<string, unknown>;
+  chunks: DocumentChunkEvidence[];
+  artifacts: ArtifactEvidence[];
+  media?: MediaEvidence;
+}
+
+interface DocumentChunkEvidence {
+  locator: unknown;
+  origin: unknown;
+  text: string;
+}
+
+interface EnrichmentEvidenceBatch {
+  document: Record<string, unknown>;
+  batch: {
+    index: number;
+    total: number;
+    itemCount: number;
+  };
+  chunks: DocumentChunkEvidence[];
+  artifacts: ArtifactEvidence[];
+  media?: BatchedMediaEvidence;
+}
+
+interface BatchedMediaEvidence {
+  filename?: string;
+  contentType?: string;
+  sourceType?: string;
+  language?: string;
+  languageProbability?: number;
+  transcriptSegments: Array<{ segmentIndex: number; text: string }>;
+  keyframes: Array<{ path: string; offsetSeconds?: number }>;
+}
+
+type EvidenceBatchItem =
+  | { kind: "chunk"; value: DocumentChunkEvidence }
+  | { kind: "artifact"; value: ArtifactEvidence }
+  | { kind: "transcript"; value: { segmentIndex: number; text: string } }
+  | { kind: "keyframe"; value: { path: string; offsetSeconds?: number } };
+
+function uniqueDocuments(response: Record<string, unknown>): IngestedDocumentRef[] {
+  const documents = [
+    ...recordsArray(response.documents),
+    ...(isRecord(response.document) ? [response.document] : [])
+  ];
+  const unique = new Map<string, IngestedDocumentRef>();
+  for (const document of documents) {
+    if (typeof document.documentId === "string" && document.documentId.trim()) {
+      unique.set(document.documentId, { documentId: document.documentId });
+    }
+  }
+  return [...unique.values()];
+}
+
+function configuredSkillIds(value: unknown): string[] {
+  if (typeof value !== "string") {
+    return DEFAULT_DOCUMENTATION_ENRICHMENT_SKILL_IDS;
+  }
+  const skillIds = value
+    .split(/[,\s]+/u)
+    .map((skillId) => skillId.trim())
+    .filter(Boolean);
+  return skillIds.length > 0 ? skillIds : DEFAULT_DOCUMENTATION_ENRICHMENT_SKILL_IDS;
+}
+
+function requiredQuestion(input: Record<string, unknown>): string {
+  const value = typeof input.question === "string" ? input.question : typeof input.query === "string" ? input.query : "";
+  const question = value.trim();
+  if (!question) {
+    throw new Error("question must be a non-empty string.");
+  }
+  return question;
+}
+
+function answerSearchInput(input: Record<string, unknown>, question: string): Record<string, unknown> {
+  return compactRecord({
+    query: question,
+    limit: answerLimit(input.limit),
+    mode: input.mode,
+    sourceTypes: arrayOfStrings(input.sourceTypes),
+    states: arrayOfStrings(input.states),
+    collection: typeof input.collection === "string" ? input.collection.trim() : undefined
+  });
+}
+
+function answerLimit(value: unknown): number {
+  if (value === undefined) {
+    return 8;
+  }
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > 20) {
+    throw new Error("limit must be an integer between 1 and 20.");
+  }
+  return value;
+}
+
+function groupAnswerResults(results: Record<string, unknown>[]): Map<string, AnswerResultRef[]> {
+  const groups = new Map<string, AnswerResultRef[]>();
+  for (const result of results) {
+    const documentId = typeof result.documentId === "string" ? result.documentId : "";
+    if (!documentId) {
+      continue;
+    }
+    const group = groups.get(documentId) ?? [];
+    group.push({
+      chunkId: typeof result.chunkId === "number" ? result.chunkId : undefined,
+      title: typeof result.title === "string" ? result.title : "",
+      sourceType: typeof result.sourceType === "string" ? result.sourceType : "",
+      locator: typeof result.locator === "string" ? result.locator : "",
+      uri: typeof result.uri === "string" ? result.uri : undefined
+    });
+    groups.set(documentId, group);
+  }
+  return groups;
+}
+
+function selectAnswerChunks(chunks: Record<string, unknown>[], results: AnswerResultRef[]): AnswerChunkRef[] {
+  const sourceChunks = chunks
+    .filter((chunk) => chunk.chunk_origin !== "ai" && chunk.chunkOrigin !== "ai")
+    .map((chunk): AnswerChunkRef => ({
+      chunkId: typeof chunk.chunk_id === "number" ? chunk.chunk_id : typeof chunk.chunkId === "number" ? chunk.chunkId : undefined,
+      locator: typeof chunk.locator === "string" ? chunk.locator : "",
+      text: typeof chunk.text === "string" ? chunk.text : ""
+    }))
+    .filter((chunk) => chunk.locator && chunk.text);
+  const documentChars = sourceChunks.reduce((total, chunk) => total + chunk.text.length, 0);
+  if (documentChars <= ANSWER_DOCUMENT_TARGET_CHARS) {
+    return sourceChunks;
+  }
+  const matchedChunkIds = new Set(results.map((result) => result.chunkId).filter((chunkId): chunkId is number => typeof chunkId === "number"));
+  const selectedIndexes = new Set<number>();
+  for (const [index, chunk] of sourceChunks.entries()) {
+    if (chunk.chunkId !== undefined && matchedChunkIds.has(chunk.chunkId)) {
+      selectedIndexes.add(index);
+      if (index > 0) {
+        selectedIndexes.add(index - 1);
+      }
+      if (index + 1 < sourceChunks.length) {
+        selectedIndexes.add(index + 1);
+      }
+    }
+  }
+  return [...selectedIndexes]
+    .sort((left, right) => left - right)
+    .map((index) => sourceChunks[index])
+    .filter((chunk): chunk is AnswerChunkRef => Boolean(chunk));
+}
+
+function compactRecord(values: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== undefined && !(Array.isArray(value) && value.length === 0) && value !== ""));
+}
+
+function buildEnrichmentPrompt(skills: CloudxSkill[], evidence: EnrichmentEvidenceBatch): string {
+  return [
+    "You are improving a CloudX documentation archive import.",
+    "Use only the configured skills below and the provided source-grounded evidence.",
+    "Return only JSON matching the requested schema.",
+    "Create derived spans that make missing metadata, tables, graphs, flowcharts, screenshots, media transcript details, and extraction gaps searchable.",
+    "Do not invent facts not grounded in the document chunks, extracted artifacts, ASR transcript, or keyframe evidence.",
+    "When the evidence is insufficient, describe the limitation in warnings instead of guessing.",
+    `This is evidence batch ${evidence.batch.index} of ${evidence.batch.total}. Process this batch only; CloudX will run every batch and merge all returned spans and warnings.`,
+    "",
+    "Configured skills:",
+    JSON.stringify(skills.map((skill) => ({
+      id: skill.id,
+      name: skill.name,
+      description: skill.description,
+      instructions: skill.instructions ?? ""
+    })), null, 2),
+    "",
+    "Evidence:",
+    JSON.stringify(evidence, null, 2)
+  ].join("\n");
+}
+
+function buildAnswerPrompt(question: string, evidence: AnswerEvidence[]): string {
+  return [
+    "You answer questions using the CloudX documentation archive.",
+    "Use only the source chunks below. If the chunks are insufficient, say what is missing in warnings.",
+    "Return only JSON matching the requested schema.",
+    "Return `answer` as concise plaintext and `answerHtml` as semantic HTML using only these tags: div, section, h4, h5, p, ol, ul, li, strong, em, code, pre, blockquote, table, thead, tbody, tr, th, and td. Do not include attributes, scripts, styles, images, links, forms, or iframes.",
+    "Use short sections, paragraphs, lists, or tables in `answerHtml`; do not put numbered steps into one long paragraph.",
+    "For procedural content such as recipes, include enough concrete steps and ingredients from the source chunks for the user to act manually.",
+    "Citations must reference documentId, title, and locator from the evidence.",
+    "",
+    `Question: ${question}`,
+    "",
+    "Evidence:",
+    JSON.stringify(evidence, null, 2)
+  ].join("\n");
+}
+
+function normalizeEnrichmentOutput(value: unknown): EnrichmentOutput {
+  const record = getRecord(value, "enrichment output");
+  return {
+    summary: typeof record.summary === "string" ? record.summary.trim() : "",
+    spans: recordsArray(record.spans)
+      .map((span) => ({
+        locator: typeof span.locator === "string" ? span.locator.trim() : "",
+        text: typeof span.text === "string" ? span.text.trim() : ""
+      }))
+      .filter((span) => span.locator && span.text),
+    metadata: scalarRecord(record.metadata),
+    warnings: arrayOfStrings(record.warnings)
+  };
+}
+
+function normalizeAnswerOutput(value: unknown): AnswerOutput {
+  const record = getRecord(value, "answer output");
+  return {
+    answer: typeof record.answer === "string" ? record.answer.trim() : "",
+    answerHtml: typeof record.answerHtml === "string" ? record.answerHtml.trim() : "",
+    citations: recordsArray(record.citations)
+      .map((citation) => ({
+        documentId: typeof citation.documentId === "string" ? citation.documentId.trim() : "",
+        title: typeof citation.title === "string" ? citation.title.trim() : "",
+        locator: typeof citation.locator === "string" ? citation.locator.trim() : ""
+      }))
+      .filter((citation) => citation.documentId && citation.title && citation.locator),
+    warnings: arrayOfStrings(record.warnings)
+  };
+}
+
+function mergeEnrichmentOutputs(outputs: EnrichmentOutput[]): EnrichmentOutput {
+  const metadata: Record<string, string | number | boolean | null> = {};
+  for (const [batchIndex, output] of outputs.entries()) {
+    for (const [key, value] of Object.entries(output.metadata)) {
+      const metadataKey = Object.hasOwn(metadata, key) ? `batch_${batchIndex + 1}_${key}` : key;
+      metadata[metadataKey] = value;
+    }
+  }
+  return {
+    summary: outputs
+      .map((output, index) => output.summary ? `Batch ${index + 1}: ${output.summary}` : "")
+      .filter(Boolean)
+      .join("\n\n"),
+    spans: outputs.flatMap((output) => output.spans),
+    metadata,
+    warnings: outputs.flatMap((output, index) => output.warnings.map((warning) => `batch ${index + 1}: ${warning}`))
+  };
+}
+
+function documentSummary(document: Record<string, unknown>): Record<string, unknown> {
+  return {
+    documentId: document.document_id,
+    title: document.title,
+    sourceType: document.source_type,
+    uri: document.uri,
+    collection: document.collection,
+    contentSha256: document.content_sha256,
+    snapshotPath: document.snapshot_path
+  };
+}
+
+function documentChunks(document: Record<string, unknown>): DocumentChunkEvidence[] {
+  return recordsArray(document.chunks)
+    .filter((chunk) => chunk.chunk_origin !== "ai")
+    .map((chunk) => ({
+      locator: chunk.locator,
+      origin: chunk.chunk_origin,
+      text: typeof chunk.text === "string" ? chunk.text : ""
+    }))
+    .filter((chunk) => chunk.text);
+}
+
+function buildEvidenceBatches(evidence: EnrichmentEvidence): EnrichmentEvidenceBatch[] {
+  const items: EvidenceBatchItem[] = [
+    ...evidence.chunks.map((value) => ({ kind: "chunk" as const, value })),
+    ...evidence.artifacts.map((value) => ({ kind: "artifact" as const, value })),
+    ...transcriptSegments(evidence.media?.transcript).map((value) => ({ kind: "transcript" as const, value })),
+    ...(evidence.media?.keyframes ?? []).map((value) => ({ kind: "keyframe" as const, value }))
+  ];
+  const grouped = groupEvidenceItems(items);
+  return grouped.map((batchItems, index) => evidenceBatch(evidence, batchItems, index + 1, grouped.length));
+}
+
+function groupEvidenceItems(items: EvidenceBatchItem[]): EvidenceBatchItem[][] {
+  if (items.length === 0) {
+    return [[]];
+  }
+  const groups: EvidenceBatchItem[][] = [];
+  let current: EvidenceBatchItem[] = [];
+  let currentChars = 0;
+  for (const item of items) {
+    const itemChars = JSON.stringify(item).length;
+    if (current.length > 0 && currentChars + itemChars > ENRICHMENT_BATCH_TARGET_CHARS) {
+      groups.push(current);
+      current = [];
+      currentChars = 0;
+    }
+    current.push(item);
+    currentChars += itemChars;
+  }
+  if (current.length > 0) {
+    groups.push(current);
+  }
+  return groups;
+}
+
+function evidenceBatch(evidence: EnrichmentEvidence, items: EvidenceBatchItem[], index: number, total: number): EnrichmentEvidenceBatch {
+  const batch: EnrichmentEvidenceBatch = {
+    document: evidence.document,
+    batch: {
+      index,
+      total,
+      itemCount: items.length
+    },
+    chunks: [],
+    artifacts: []
+  };
+  for (const item of items) {
+    if (item.kind === "chunk") {
+      batch.chunks.push(item.value);
+    } else if (item.kind === "artifact") {
+      batch.artifacts.push(item.value);
+    } else {
+      batch.media ??= mediaBatchMetadata(evidence.media);
+      if (item.kind === "transcript") {
+        batch.media.transcriptSegments.push(item.value);
+      } else {
+        batch.media.keyframes.push(item.value);
+      }
+    }
+  }
+  if (evidence.media && !batch.media && total === 1) {
+    batch.media = mediaBatchMetadata(evidence.media);
+  }
+  return batch;
+}
+
+function mediaBatchMetadata(media: MediaEvidence | undefined): BatchedMediaEvidence {
+  return {
+    filename: media?.filename,
+    contentType: media?.contentType,
+    sourceType: media?.sourceType,
+    language: media?.language,
+    languageProbability: media?.languageProbability,
+    transcriptSegments: [],
+    keyframes: []
+  };
+}
+
+function transcriptSegments(transcript: string | undefined): Array<{ segmentIndex: number; text: string }> {
+  if (!transcript?.trim()) {
+    return [];
+  }
+  const segments: Array<{ segmentIndex: number; text: string }> = [];
+  for (const text of splitText(transcript, TRANSCRIPT_SEGMENT_TARGET_CHARS)) {
+    segments.push({ segmentIndex: segments.length + 1, text });
+  }
+  return segments;
+}
+
+function splitText(text: string, targetChars: number): string[] {
+  const normalized = text.trim();
+  if (!normalized) {
+    return [];
+  }
+  const segments: string[] = [];
+  let start = 0;
+  while (start < normalized.length) {
+    let end = Math.min(start + targetChars, normalized.length);
+    if (end < normalized.length) {
+      const newline = normalized.lastIndexOf("\n", end);
+      const sentence = normalized.lastIndexOf(". ", end);
+      const boundary = Math.max(newline, sentence);
+      if (boundary > start) {
+        end = boundary + (boundary === sentence ? 1 : 0);
+      }
+    }
+    segments.push(normalized.slice(start, end).trim());
+    start = end;
+  }
+  return segments.filter(Boolean);
+}
+
+function evidenceSummary(evidence: EnrichmentEvidence, batches: EnrichmentEvidenceBatch[]): Record<string, unknown> {
+  const transcript = evidence.media?.transcript ?? "";
+  return {
+    chunkCount: evidence.chunks.length,
+    artifactCount: evidence.artifacts.length,
+    mediaTranscriptChars: transcript.length,
+    keyframeCount: evidence.media?.keyframes.length ?? 0,
+    batchCount: batches.length,
+    batchItemCounts: batches.map((batch) => batch.batch.itemCount)
+  };
+}
+
+async function listFiles(root: string): Promise<string[]> {
+  const files: string[] = [];
+  async function walk(directory: string): Promise<void> {
+    const entries = await fsp.readdir(directory, { withFileTypes: true });
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        await walk(entryPath);
+      } else if (entry.isFile()) {
+        files.push(entryPath);
+      }
+    }
+  }
+  await walk(root);
+  return files;
+}
+
+function captureIntervalKeyframes(inputPath: string, outputDir: string): Array<{ path: string; offsetSeconds?: number }> {
+  fs.mkdirSync(outputDir, { recursive: true });
+  const result = spawnSync(
+    "ffmpeg",
+    [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-i",
+      inputPath,
+      "-vf",
+      `fps=1/${MEDIA_KEYFRAME_INTERVAL_SECONDS}`,
+      path.join(outputDir, "frame-%04d.jpg")
+    ],
+    { encoding: "utf8", timeout: MEDIA_TOOL_TIMEOUT_MS }
+  );
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.status !== 0) {
+    throw new Error(`ffmpeg keyframe extraction failed: ${result.stderr || result.stdout || `exit ${result.status}`}`);
+  }
+  return fs.readdirSync(outputDir)
+    .filter((name) => name.endsWith(".jpg"))
+    .sort()
+    .map((name, index) => ({ path: path.join(outputDir, name), offsetSeconds: index * MEDIA_KEYFRAME_INTERVAL_SECONDS }));
+}
+
+function artifactKind(filePath: string): string {
+  return path.extname(filePath).toLowerCase().replace(/^\./u, "") || "file";
+}
+
+function isMediaSource(source: DocumentationEnrichmentSource): boolean {
+  const value = `${source.sourceType ?? ""} ${source.contentType ?? ""} ${source.filename ?? ""}`.toLowerCase();
+  return /\bmedia\b/u.test(value) || /\baudio\//u.test(value) || /\bvideo\//u.test(value) || /\.(mp3|wav|m4a|aac|ogg|webm|mp4|mov|mkv|avi)\b/u.test(value);
+}
+
+function isVideoSource(source: DocumentationEnrichmentSource): boolean {
+  const value = `${source.contentType ?? ""} ${source.filename ?? ""}`.toLowerCase();
+  return /\bvideo\//u.test(value) || /\.(webm|mp4|mov|mkv|avi)\b/u.test(value);
+}
+
+function safeMediaFilename(filename: string | undefined): string {
+  const safe = path.basename(filename || "upload.media").replace(/[^A-Za-z0-9._-]+/gu, "_");
+  return safe || "upload.media";
+}
+
+function scalarRecord(value: unknown): Record<string, string | number | boolean | null> {
+  if (!isRecord(value)) {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(value).filter((entry): entry is [string, string | number | boolean | null] =>
+      typeof entry[1] === "string" || typeof entry[1] === "number" || typeof entry[1] === "boolean" || entry[1] === null
+    )
+  );
+}
+
+function recordsArray(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value) ? value.filter(isRecord) : [];
+}
+
+function arrayOfStrings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean) : [];
+}
+
+function getRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!isRecord(value)) {
+    throw new Error(`${label} must be an object.`);
+  }
+  return value;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isSameOrChild(parentPath: string, childPath: string): boolean {
+  const relative = path.relative(parentPath, childPath);
+  return relative === "" || Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
+}

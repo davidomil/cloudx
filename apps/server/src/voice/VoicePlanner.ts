@@ -41,6 +41,14 @@ export interface VoicePlanner {
   plan(input: VoicePlannerInput): Promise<VoiceActionPlan>;
 }
 
+export interface CodexExecRunOptions {
+  schemaPath?: string;
+  outputPrefix?: string;
+  timeoutMs?: number;
+  maxOutputBytes?: number;
+  taskLabel?: string;
+}
+
 export class CodexExecVoicePlanner implements VoicePlanner {
   constructor(
     private readonly model: string,
@@ -65,7 +73,11 @@ export class CodexExecVoicePlanner implements VoicePlanner {
     );
 
     try {
-      const output = await runCodexExec(this.model, prompt);
+      const output = await runCodexExec(this.model, prompt, {
+        schemaPath: resolveVoiceSchemaPath(),
+        outputPrefix: "cloudx-voice-plan-",
+        taskLabel: "voice planner"
+      });
       const plan = parseVoiceActionPlan(JSON.parse(output));
       this.logger?.info(
         {
@@ -98,8 +110,8 @@ export class CodexExecVoicePlanner implements VoicePlanner {
 }
 
 const MAX_VOICE_CONTEXT_JSON_CHARS = 80_000;
-const CODEX_EXEC_TIMEOUT_MS = 30_000;
-const CODEX_EXEC_MAX_OUTPUT_BYTES = 1_000_000;
+export const CODEX_EXEC_TIMEOUT_MS = 30_000;
+export const CODEX_EXEC_MAX_OUTPUT_BYTES = 1_000_000;
 const VOICE_PROMPT_CONTEXT_PROFILES: VoicePromptContextProfile[] = [
   {
     name: "normal",
@@ -202,11 +214,14 @@ export function compactVoicePromptContext(context: Record<string, unknown>): Rec
   };
 }
 
-function runCodexExec(model: string, prompt: string): Promise<string> {
+export function runCodexExec(model: string, prompt: string, options: CodexExecRunOptions = {}): Promise<string> {
   return new Promise((resolve, reject) => {
-    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-voice-plan-"));
+    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), options.outputPrefix ?? "cloudx-codex-structured-"));
     const outputPath = path.join(outputDir, "last-message.json");
-    const launch = buildCodexExecLaunch(model, resolveVoiceSchemaPath(), outputPath);
+    const launch = buildCodexExecLaunch(model, options.schemaPath ?? resolveVoiceSchemaPath(), outputPath);
+    const taskLabel = options.taskLabel ?? "structured runner";
+    const timeoutMs = options.timeoutMs ?? CODEX_EXEC_TIMEOUT_MS;
+    const maxOutputBytes = options.maxOutputBytes ?? CODEX_EXEC_MAX_OUTPUT_BYTES;
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn(launch.command, launch.args, {
@@ -224,7 +239,7 @@ function runCodexExec(model: string, prompt: string): Promise<string> {
     if (!childStdout || !childStderr || !childStdin) {
       child.kill("SIGTERM");
       fs.rmSync(outputDir, { recursive: true, force: true });
-      reject(new Error("codex exec voice planner did not expose piped stdio streams."));
+      reject(new Error(`codex exec ${taskLabel} did not expose piped stdio streams.`));
       return;
     }
     let stdout = "";
@@ -267,24 +282,24 @@ function runCodexExec(model: string, prompt: string): Promise<string> {
       const chunkBytes = Buffer.byteLength(chunk, "utf8");
       if (streamName === "stdout") {
         stdoutBytes += chunkBytes;
-        if (stdoutBytes > CODEX_EXEC_MAX_OUTPUT_BYTES) {
-          stopAndReject(new Error(`codex exec voice planner stdout exceeded the ${CODEX_EXEC_MAX_OUTPUT_BYTES} byte output limit.`));
+        if (stdoutBytes > maxOutputBytes) {
+          stopAndReject(new Error(`codex exec ${taskLabel} stdout exceeded the ${maxOutputBytes} byte output limit.`));
           return;
         }
         stdout += chunk;
         return;
       }
       stderrBytes += chunkBytes;
-      if (stderrBytes > CODEX_EXEC_MAX_OUTPUT_BYTES) {
-        stopAndReject(new Error(`codex exec voice planner stderr exceeded the ${CODEX_EXEC_MAX_OUTPUT_BYTES} byte output limit.`));
+      if (stderrBytes > maxOutputBytes) {
+        stopAndReject(new Error(`codex exec ${taskLabel} stderr exceeded the ${maxOutputBytes} byte output limit.`));
         return;
       }
       stderr += chunk;
     };
 
     timeout = setTimeout(() => {
-      stopAndReject(new Error(`codex exec voice planner timed out after ${CODEX_EXEC_TIMEOUT_MS} ms.`));
-    }, CODEX_EXEC_TIMEOUT_MS);
+      stopAndReject(new Error(`codex exec ${taskLabel} timed out after ${timeoutMs} ms.`));
+    }, timeoutMs);
     timeout.unref();
 
     childStdout.setEncoding("utf8");
@@ -316,7 +331,7 @@ function runCodexExec(model: string, prompt: string): Promise<string> {
           settleResolve(extractLastJsonObject(stdout));
         }
       } else {
-        settleReject(new Error(`codex exec voice planner failed with code ${code}: ${summarizeCodexError(stderr || stdout, model)}`));
+        settleReject(new Error(`codex exec ${taskLabel} failed with code ${code}: ${summarizeCodexError(stderr || stdout, model)}`));
       }
     });
     try {

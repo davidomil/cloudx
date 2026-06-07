@@ -1,5 +1,8 @@
 export const DEFAULT_DOCUMENTATION_URL = "http://127.0.0.1:7820";
-export const DEFAULT_DOCUMENTATION_TIMEOUT_MS = 30_000;
+export const DEFAULT_DOCUMENTATION_TIMEOUT_MS = 30 * 60_000;
+export const MAX_DOCUMENTATION_TIMEOUT_MS = 12 * 60 * 60_000;
+export const DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES = 8 * 1024 * 1024;
+export const MAX_DOCUMENTATION_RESPONSE_MAX_BYTES = 1024 * 1024 * 1024;
 
 export interface DocumentationClientOptions {
   timeoutMs?: number;
@@ -16,6 +19,15 @@ export interface DocumentationUploadInput {
   tags?: string[];
 }
 
+export interface DocumentationEnrichInput {
+  documentId: string;
+  spans: Array<{ locator: string; text: string }>;
+  model: string;
+  skillIds: string[];
+  summary?: string;
+  payload?: Record<string, unknown>;
+}
+
 export class DocumentationClient {
   private readonly timeoutMs: number;
   private readonly responseMaxBytes: number;
@@ -24,8 +36,8 @@ export class DocumentationClient {
     private readonly baseUrl: string = DEFAULT_DOCUMENTATION_URL,
     options: DocumentationClientOptions = {}
   ) {
-    this.timeoutMs = options.timeoutMs ?? DEFAULT_DOCUMENTATION_TIMEOUT_MS;
-    this.responseMaxBytes = options.responseMaxBytes ?? 8 * 1024 * 1024;
+    this.timeoutMs = normalizeDocumentationTimeoutMs(options.timeoutMs);
+    this.responseMaxBytes = normalizeDocumentationResponseMaxBytes(options.responseMaxBytes);
   }
 
   health(): Promise<Record<string, unknown>> {
@@ -47,6 +59,11 @@ export class DocumentationClient {
 
   getDocument(input: Record<string, unknown>): Promise<Record<string, unknown>> {
     return this.get(`/documents/${encodeURIComponent(requireString(input.documentId, "documentId"))}`);
+  }
+
+  enrichDocument(input: DocumentationEnrichInput): Promise<Record<string, unknown>> {
+    const { documentId, ...body } = input;
+    return this.post(`/documents/${encodeURIComponent(requireString(documentId, "documentId"))}/enrich`, body);
   }
 
   remove(input: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -126,6 +143,20 @@ export class DocumentationClient {
     url.pathname = appendUrlPath(url.pathname, pathname);
     return url.toString();
   }
+}
+
+export function normalizeDocumentationTimeoutMs(timeoutMs = DEFAULT_DOCUMENTATION_TIMEOUT_MS): number {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_DOCUMENTATION_TIMEOUT_MS) {
+    throw new Error(`Documentation timeout must be a positive integer no greater than ${MAX_DOCUMENTATION_TIMEOUT_MS} ms.`);
+  }
+  return timeoutMs;
+}
+
+export function normalizeDocumentationResponseMaxBytes(maxBytes = DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES): number {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > MAX_DOCUMENTATION_RESPONSE_MAX_BYTES) {
+    throw new Error(`Documentation response size must be a positive integer no greater than ${MAX_DOCUMENTATION_RESPONSE_MAX_BYTES} bytes.`);
+  }
+  return maxBytes;
 }
 
 async function readBoundedText(response: Response, maxBytes: number): Promise<string> {

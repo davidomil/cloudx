@@ -77,9 +77,9 @@ cd cloudx
 ```
 
 It shows each phase before running it. The bootstrap stage installs Ubuntu
-packages, including the PDF and spreadsheet extraction tools used by the
-documentation archive plus the Quarto, Pandoc, and TeX Live toolchain used to
-render the memory-plugin PDF guide. It then installs Node.js 22 when needed,
+packages, including the PDF, spreadsheet, image, and media keyframe extraction
+tools used by the documentation archive plus the Quarto, Pandoc, and TeX Live
+toolchain used to render the memory-plugin PDF guide. It then installs Node.js 22 when needed,
 verifies `node -v` and `npm -v`, and falls back to Ubuntu's `npm` package if
 npm is still missing. The wizard then installs Cloudx npm dependencies,
 installs and checks Codex CLI, prepares the Faster Whisper ASR environment,
@@ -147,12 +147,19 @@ npm run documentation:setup
 npm run documentation:start
 ```
 
-This starts the Turbovec-backed indexer at `http://127.0.0.1:7820`, which is the
-Cloudx default `CLOUDX_DOCUMENTATION_URL`. Create a Documentation tab in Cloudx
-to upload files, add local paths, ingest URLs, add copied text or media
-transcripts, search active knowledge, invalidate stale sources, remove sources
-from active search, install the documentation skills, and inspect the portable
-backup manifest.
+This installs the PDF/image/table extraction stack plus YouTube transcript,
+playlist metadata, YouTube keyframe capture, and media enrichment support, then starts the Turbovec-backed indexer at
+`http://127.0.0.1:7820`, which is the Cloudx default
+`CLOUDX_DOCUMENTATION_URL`. Create a Documentation tab in Cloudx to upload
+files, add local paths, ingest URLs or YouTube playlists, add copied text or
+media transcripts, search active knowledge, invalidate stale sources, remove
+sources from active search, install the documentation skills, and inspect the
+portable backup manifest.
+
+Documentation AI assistance is enabled by default when global AI control is on.
+If it is disabled, the Documentation tab still supports manual source-text
+search and full source inspection, but assisted answers and post-ingest AI
+enrichment are unavailable.
 
 The documentation archive is portable as one directory. Stop writes, then back
 up `.cloudx/documentation` or the directory named by
@@ -179,6 +186,9 @@ Common environment variables:
 - `CLOUDX_TOOL_PATH`: path-delimited command directories prepended to Cloudx child processes.
 - `CLOUDX_ASR_URL`: ASR endpoint, default `http://127.0.0.1:7810`.
 - `CLOUDX_DOCUMENTATION_URL`: documentation indexer endpoint, default `http://127.0.0.1:7820`.
+- `CLOUDX_DOCUMENTATION_TIMEOUT_MS`: documentation indexer and AI enrichment timeout, default `1800000`.
+- `CLOUDX_DOCUMENTATION_RESPONSE_MAX_BYTES`: maximum indexer response size, default `8388608`.
+- `CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES`: browser documentation upload cap, default `268435456`.
 - `CLOUDX_DOCUMENTATION_DATA_DIR`: portable documentation archive directory, default `.cloudx/documentation`.
 - `CLOUDX_VOICE_MODEL`: planner model, default `gpt-5.3-codex-spark`.
 - `CLOUDX_VOICE_DEBUG_TRANSCRIPTS`: log raw transcripts and planner text.

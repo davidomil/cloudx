@@ -28,6 +28,7 @@ import type { AppConfig } from "./config.js";
 import { ConfigService } from "./configService.js";
 import { AsrClient } from "./asrClient.js";
 import { DEFAULT_DOCUMENTATION_URL, DocumentationClient } from "./documentation/DocumentationClient.js";
+import { CodexDocumentationEnrichmentRunner, DocumentationEnrichmentService } from "./documentation/DocumentationEnrichmentService.js";
 import { PathPolicy } from "./pathPolicy.js";
 import { PluginRegistry } from "./pluginRegistry.js";
 import { LOCAL_WEB_PROXY_MAX_BODY_BYTES, LocalWebProxy } from "./localWebProxy.js";
@@ -84,6 +85,7 @@ export interface AppServices {
   fileTransfer?: FileTransferService;
   notifications?: NotificationsPlugin;
   documentation?: DocumentationClient;
+  documentationEnrichment?: DocumentationEnrichmentService;
   pluginContributionsReady?: Promise<RulesSkillsStore>;
 }
 
@@ -92,7 +94,6 @@ const VOICE_WS_CONTROL_MESSAGE_MAX_BYTES = 64 * 1024;
 const TERMINAL_WS_CONTROL_MESSAGE_MAX_BYTES = 256 * 1024;
 const MAX_TERMINAL_DIMENSION = 500;
 const FILE_UPLOAD_MAX_BYTES = 25 * 1024 * 1024 * 1024;
-const DOCUMENTATION_UPLOAD_MAX_BYTES = 256 * 1024 * 1024;
 const WS_CONNECTING = 0;
 const WS_OPEN = 1;
 const LOCAL_WEB_PROXY_HTTP_METHODS: HTTPMethods[] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
@@ -121,6 +122,15 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   services.pluginData ??= new PluginDataStore(config.dataDir);
   services.rulesSkills ??= new RulesSkillsCatalogService(config.dataDir);
   services.fileTransfer ??= new FileTransferService(services.pathPolicy);
+  if (services.documentation) {
+    services.documentationEnrichment ??= new DocumentationEnrichmentService({
+      client: services.documentation,
+      config: services.config,
+      rulesSkills: services.rulesSkills,
+      runner: new CodexDocumentationEnrichmentRunner(config.voiceModel, config.documentationTimeoutMs),
+      asr: services.asr
+    });
+  }
   services.hooks ??= buildHookRegistry(services);
   if (!services.triggers) {
     const automationRepository = new AutomationRepository(config.dataDir);
@@ -366,18 +376,27 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     Body: NodeJS.ReadableStream;
   }>("/api/documentation/upload", async (request) => {
     const contentLength = parseContentLength(request.headers["content-length"]);
-    if (contentLength !== undefined && contentLength > DOCUMENTATION_UPLOAD_MAX_BYTES) {
-      throw new FileUploadTooLargeError(DOCUMENTATION_UPLOAD_MAX_BYTES);
+    if (contentLength !== undefined && contentLength > config.documentationUploadMaxBytes) {
+      throw new FileUploadTooLargeError(config.documentationUploadMaxBytes);
     }
-    const content = await readRequestBodyBuffer(request.body, DOCUMENTATION_UPLOAD_MAX_BYTES);
-    return services.documentation!.ingestUpload({
-      filename: requiredQueryString(request.query.filename, "filename"),
+    const filename = requiredQueryString(request.query.filename, "filename");
+    const contentType = optionalHeaderString(request.headers["x-cloudx-file-content-type"]);
+    const sourceType = optionalQueryString(request.query.sourceType);
+    const content = await readRequestBodyBuffer(request.body, config.documentationUploadMaxBytes);
+    const result = await services.documentation!.ingestUpload({
+      filename,
       content,
-      contentType: optionalHeaderString(request.headers["x-cloudx-file-content-type"]),
+      contentType,
       title: optionalQueryString(request.query.title),
-      sourceType: optionalQueryString(request.query.sourceType),
+      sourceType,
       collection: optionalQueryString(request.query.collection)
     });
+    return services.documentationEnrichment?.enrichIngestResponse(result, {
+      filename,
+      content,
+      contentType,
+      sourceType
+    }) ?? result;
   });
 
   app.post<{ Params: { hookId: string }; Body: HookCallRequest }>("/api/hooks/:hookId", async (request) => {
@@ -857,14 +876,18 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   const pluginData = new PluginDataStore(config.dataDir);
   const rulesSkills = new RulesSkillsCatalogService(config.dataDir);
   const documentationUrl = config.documentationUrl ?? DEFAULT_DOCUMENTATION_URL;
-  const documentation = new DocumentationClient(documentationUrl);
+  const documentation = new DocumentationClient(documentationUrl, {
+    timeoutMs: config.documentationTimeoutMs,
+    responseMaxBytes: config.documentationResponseMaxBytes
+  });
   process.env.CLOUDX_DOCUMENTATION_URL ??= documentationUrl;
   let sessions: SessionStore | undefined;
+  let documentationEnrichment: DocumentationEnrichmentService | undefined;
   plugins.register(new CodexTerminalPlugin(terminalFactory, config.terminalReplayBytes, config.dataDir));
   plugins.register(new StandardTerminalPlugin(terminalFactory, config.terminalReplayBytes));
   plugins.register(new FileBrowserPlugin(pathPolicy));
   plugins.register(new LocalWebPlugin());
-  plugins.register(new DocumentationPlugin(documentation, pathPolicy));
+  plugins.register(new DocumentationPlugin(documentation, pathPolicy, () => documentationEnrichment));
   plugins.register(new WorktreeManagerPlugin());
   plugins.register(new WorkspaceControlPlugin());
   plugins.register(new RulesSkillsPlugin(rulesSkills, async () => {
@@ -900,6 +923,14 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     logger?.error({ err: error }, "Failed to sync plugin contributions.");
   });
   const asr = new AsrClient(config.asrUrl, { timeoutMs: config.asrTimeoutMs });
+  documentationEnrichment = new DocumentationEnrichmentService({
+    client: documentation,
+    config: configService,
+    rulesSkills,
+    runner: new CodexDocumentationEnrichmentRunner(config.voiceModel, config.documentationTimeoutMs),
+    asr,
+    pluginContributionsReady: () => pluginContributionsReady
+  });
   let voice: VoiceController | undefined;
   plugins.register(new AudioAiPlugin(() => {
     if (!voice) {
@@ -922,7 +953,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   registerPluginTriggers(triggers, plugins);
   sessions.setTriggerRegistry(triggers);
   automation = createAutomationService(automationRepository, { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config);
-  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, automation, pluginData, rulesSkills, fileTransfer, notifications, documentation, pluginContributionsReady };
+  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, automation, pluginData, rulesSkills, fileTransfer, notifications, documentation, documentationEnrichment, pluginContributionsReady };
 }
 
 export function serializeRequestForLog(request: Pick<FastifyRequest, "method" | "url" | "hostname" | "ip" | "socket">): {

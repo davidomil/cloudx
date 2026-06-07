@@ -6,7 +6,7 @@ import type { RulesSkillsStore } from "@cloudx/shared";
 import type { RulesSkillsCatalogService } from "../rulesSkills/RulesSkillsCatalogService.js";
 import { syncPluginContributions } from "./pluginContributions.js";
 
-type FakeCatalog = Pick<RulesSkillsCatalogService, "saveSystemRule" | "saveSystemSkill" | "list">;
+type FakeCatalog = Pick<RulesSkillsCatalogService, "deleteRule" | "deleteSkill" | "deleteSystemRule" | "deleteSystemSkill" | "saveSystemRule" | "saveSystemSkill" | "list">;
 
 describe("syncPluginContributions", () => {
   it("stores plugin rules and skills as system catalog entries", async () => {
@@ -33,7 +33,7 @@ describe("syncPluginContributions", () => {
       id: "beta-ingest",
       scope: "system"
     }));
-    expect(catalog.list).not.toHaveBeenCalled();
+    expect(catalog.list).toHaveBeenCalledOnce();
   });
 
   it("returns the catalog unchanged when no plugin contributes rules or skills", async () => {
@@ -67,16 +67,90 @@ describe("syncPluginContributions", () => {
     expect(catalog.saveSystemRule).not.toHaveBeenCalled();
     expect(catalog.saveSystemSkill).not.toHaveBeenCalled();
   });
+
+  it("rejects user-owned id conflicts before writing to the catalog", async () => {
+    const catalog = fakeCatalog({
+      rules: [rule("alpha-existing-rule")],
+      skills: [skill("alpha-existing-skill")]
+    });
+
+    await expect(syncPluginContributions([
+      plugin("alpha", {
+        rules: [rule("alpha-existing-rule"), rule("alpha-new-rule")],
+        skills: [skill("alpha-existing-skill"), skill("alpha-new-skill")]
+      })
+    ], catalog as RulesSkillsCatalogService)).rejects.toThrow(
+      "Plugin contribution ids conflict with user-defined catalog entries: rule alpha-existing-rule, skill alpha-existing-skill"
+    );
+    expect(catalog.saveSystemRule).not.toHaveBeenCalled();
+    expect(catalog.saveSystemSkill).not.toHaveBeenCalled();
+    expect(catalog.list).toHaveBeenCalledOnce();
+  });
+
+  it("adopts plugin-declared legacy user contributions before writing system entries", async () => {
+    const catalog = fakeCatalog({
+      rules: [rule("alpha-existing-rule")],
+      skills: [skill("alpha-existing-skill")]
+    });
+
+    await syncPluginContributions([
+      plugin("alpha", {
+        rules: [rule("alpha-existing-rule")],
+        skills: [skill("alpha-existing-skill")],
+        adoptUserRuleIds: ["alpha-existing-rule"],
+        adoptUserSkillIds: ["alpha-existing-skill"]
+      })
+    ], catalog as RulesSkillsCatalogService);
+
+    expect(catalog.deleteRule).toHaveBeenCalledWith("alpha-existing-rule");
+    expect(catalog.deleteSkill).toHaveBeenCalledWith("alpha-existing-skill");
+    expect(catalog.saveSystemRule).toHaveBeenCalledWith(expect.objectContaining({ id: "alpha-existing-rule", scope: "system" }));
+    expect(catalog.saveSystemSkill).toHaveBeenCalledWith(expect.objectContaining({ id: "alpha-existing-skill", scope: "system" }));
+  });
+
+  it("prunes obsolete plugin-owned system contributions before writing current entries", async () => {
+    const catalog = fakeCatalog({
+      systemRules: [
+        { ...rule("alpha-current-rule"), scope: "system" },
+        { ...rule("alpha-old-rule"), scope: "system" },
+        { ...rule("gamma-old-rule"), scope: "system" }
+      ],
+      systemSkills: [
+        { ...skill("alpha-current-skill"), scope: "system" },
+        { ...skill("alpha-old-skill"), scope: "system" },
+        { ...skill("gamma-old-skill"), scope: "system" }
+      ]
+    });
+
+    await syncPluginContributions([
+      plugin("alpha", {
+        rules: [rule("alpha-current-rule")],
+        skills: [skill("alpha-current-skill")]
+      })
+    ], catalog as RulesSkillsCatalogService);
+
+    expect(catalog.deleteSystemRule).toHaveBeenCalledTimes(1);
+    expect(catalog.deleteSystemRule).toHaveBeenCalledWith("alpha-old-rule");
+    expect(catalog.deleteSystemSkill).toHaveBeenCalledTimes(1);
+    expect(catalog.deleteSystemSkill).toHaveBeenCalledWith("alpha-old-skill");
+    expect(catalog.deleteSystemRule).not.toHaveBeenCalledWith("alpha-current-rule");
+    expect(catalog.deleteSystemSkill).not.toHaveBeenCalledWith("alpha-current-skill");
+    expect(catalog.deleteSystemRule).not.toHaveBeenCalledWith("gamma-old-rule");
+    expect(catalog.deleteSystemSkill).not.toHaveBeenCalledWith("gamma-old-skill");
+    expect(catalog.saveSystemRule).toHaveBeenCalledWith(expect.objectContaining({ id: "alpha-current-rule", scope: "system" }));
+    expect(catalog.saveSystemSkill).toHaveBeenCalledWith(expect.objectContaining({ id: "alpha-current-skill", scope: "system" }));
+  });
 });
 
-function fakeCatalog(): FakeCatalog {
+function fakeCatalog(overrides: Partial<RulesSkillsStore> = {}): FakeCatalog {
   const emptyStore: RulesSkillsStore = {
     rules: [],
     systemRules: [],
     skills: [],
     systemSkills: [],
     templates: [],
-    defaultTemplateId: undefined
+    defaultTemplateId: undefined,
+    ...overrides
   };
   return {
     saveSystemRule: vi.fn(async (rule: PluginRuleContribution) => ({
@@ -87,11 +161,18 @@ function fakeCatalog(): FakeCatalog {
       ...emptyStore,
       systemSkills: [{ ...skill, scope: "system" as const }]
     })),
+    deleteRule: vi.fn(async () => emptyStore),
+    deleteSkill: vi.fn(async () => emptyStore),
+    deleteSystemRule: vi.fn(async () => emptyStore),
+    deleteSystemSkill: vi.fn(async () => emptyStore),
     list: vi.fn(async () => emptyStore)
   };
 }
 
-function plugin(id: string, contributions: { rules?: PluginRuleContribution[]; skills?: PluginSkillContribution[] }): WorkspacePlugin {
+function plugin(
+  id: string,
+  contributions: { adoptUserRuleIds?: string[]; adoptUserSkillIds?: string[]; rules?: PluginRuleContribution[]; skills?: PluginSkillContribution[] }
+): WorkspacePlugin {
   return {
     id,
     acronym: id.slice(0, 3).toUpperCase(),
@@ -103,6 +184,8 @@ function plugin(id: string, contributions: { rules?: PluginRuleContribution[]; s
     actions: [],
     ruleContributions: contributions.rules,
     skillContributions: contributions.skills,
+    adoptUserRuleContributionIds: contributions.adoptUserRuleIds,
+    adoptUserSkillContributionIds: contributions.adoptUserSkillIds,
     createSession() {
       throw new Error("not used");
     },

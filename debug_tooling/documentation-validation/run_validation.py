@@ -29,15 +29,36 @@ class Source:
     url: str
 
 
+@dataclass(frozen=True)
+class YouTubeSource:
+    collection: str
+    title: str
+    url: str
+
+
 SOURCES = [
     Source("wiki-quantization", "website", "turboquant-wikipedia.html", "https://en.wikipedia.org/wiki/TurboQuant"),
     Source("wiki-quantization", "website", "vector-quantization-wikipedia.html", "https://en.wikipedia.org/wiki/Vector_quantization"),
     Source("papers-quantization", "book", "turboquant-arxiv.pdf", "https://arxiv.org/pdf/2504.19874"),
+    Source("linux-memory-management", "book", "linux-virtual-memory-manager.pdf", "https://www.kernel.org/doc/gorman/pdf/understand.pdf"),
     Source("gmsl2-hardware", "datasheet", "max96717.pdf", "https://www.datasheetall.com/pdf/max96717.pdf"),
     Source("gmsl2-hardware", "datasheet", "max9295d.pdf", "https://www.datasheetall.com/pdf/max9295d.pdf"),
 ]
 
 LARGE_DATASHEET_TITLE = "max96717.pdf"
+
+YOUTUBE_SOURCES = [
+    YouTubeSource(
+        "recipe-videos",
+        "Tasty brownies recipe video",
+        "https://www.youtube.com/watch?v=VvJm4pQZ04s",
+    ),
+    YouTubeSource(
+        "linux-presentations",
+        "MM101 introduction to memory management",
+        "https://www.youtube.com/watch?v=i17b3xJv3Uo",
+    ),
+]
 
 
 QUERIES = [
@@ -72,6 +93,11 @@ QUERIES = [
         "top_k": 10,
     },
     {
+        "query": "Linux virtual memory manager zones watermarks pages_min pages_low pages_high",
+        "expected_title": "linux-virtual-memory-manager.pdf",
+        "top_k": 10,
+    },
+    {
         "query": "CXMOCK-04217 regulator brownout threshold",
         "expected_title": "bulk-mock.md",
         "top_k": 3,
@@ -88,12 +114,26 @@ QUERIES = [
     },
 ]
 
+YOUTUBE_QUERIES = [
+    {
+        "query": "gooey chocolatey fudgy brownies cocoa powder espresso powder",
+        "expected_title": "Tasty brownies recipe video",
+        "top_k": 10,
+    },
+    {
+        "query": "usually talk highly specialized memory management subjects paging virtual physical swap",
+        "expected_title": "MM101 introduction to memory management",
+        "top_k": 10,
+    },
+]
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Validate CloudX documentation archive recall on a mixed public and mock corpus.")
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--mock-count", type=int, default=2500)
     parser.add_argument("--skip-download", action="store_true")
+    parser.add_argument("--include-youtube", action="store_true", help="Also ingest real YouTube videos with transcripts and one-frame-per-second keyframe artifacts. Requires live YouTube and ffmpeg access.")
     args = parser.parse_args(argv)
 
     corpus_dir = args.root / "corpus"
@@ -112,6 +152,9 @@ def main(argv: list[str] | None = None) -> int:
     archive = DocumentationArchive(archive_root)
     started = time.perf_counter()
     ingested = ingest_sources(archive, corpus_dir, mock_path)
+    youtube_ingested, youtube_skipped = ingest_youtube_sources(archive) if args.include_youtube and not args.skip_download else ([], [])
+    ingested.extend(youtube_ingested)
+    skipped_downloads.extend(youtube_skipped)
     ingest_seconds = time.perf_counter() - started
     active_documents = archive.list_documents(states=["active"])
     available_titles = {Path(document["title"]).name for document in active_documents}
@@ -122,7 +165,8 @@ def main(argv: list[str] | None = None) -> int:
     stale_check = run_invalidation_check(archive, mock_path)
 
     large_datasheet_check = run_large_datasheet_artifact_check(archive, LARGE_DATASHEET_TITLE)
-    required_checks = [check for check in [*checks, *rebuild_checks, stale_check, large_datasheet_check] if check.get("required", True)]
+    youtube_artifact_checks = run_youtube_artifact_checks(archive, YOUTUBE_SOURCES) if args.include_youtube and not args.skip_download else []
+    required_checks = [check for check in [*checks, *rebuild_checks, stale_check, large_datasheet_check, *youtube_artifact_checks] if check.get("required", True)]
     diagnostic_failures = [check for check in [*checks, *rebuild_checks] if not check.get("required", True) and not check["passed"]]
     summary = {
         "root": str(args.root),
@@ -137,8 +181,10 @@ def main(argv: list[str] | None = None) -> int:
         "rebuildManifest": rebuild_manifest,
         "staleCheck": stale_check,
         "largeDatasheetCheck": large_datasheet_check,
+        "youtubeArtifactChecks": youtube_artifact_checks,
         "artifactCounts": artifact_counts(archive_root),
         "diagnosticFailures": diagnostic_failures,
+        "youtubeIncluded": args.include_youtube and not args.skip_download,
         "passed": all(check["passed"] for check in required_checks),
     }
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -203,6 +249,24 @@ def ingest_sources(archive: DocumentationArchive, corpus_dir: Path, mock_path: P
     return ingested
 
 
+def ingest_youtube_sources(archive: DocumentationArchive) -> tuple[list[dict], list[dict]]:
+    ingested = []
+    skipped = []
+    for source in YOUTUBE_SOURCES:
+        try:
+            document = archive.ingest_url(
+                source.url,
+                title=source.title,
+                source_type="media",
+                collection=source.collection,
+            )
+        except Exception as error:
+            skipped.append({"title": source.title, "url": source.url, "error": str(error)})
+            continue
+        ingested.append(document.as_dict())
+    return ingested, skipped
+
+
 def run_recall_checks(
     archive: DocumentationArchive,
     modes: tuple[str, ...] = ("hybrid", "lexical", "dense"),
@@ -211,7 +275,7 @@ def run_recall_checks(
 ) -> list[dict]:
     checks = []
     for mode in modes:
-        for check in QUERIES:
+        for check in [*QUERIES, *YOUTUBE_QUERIES]:
             expected_title = check.get("expected_title")
             if available_titles is not None and expected_title and expected_title not in available_titles:
                 checks.append({
@@ -323,6 +387,38 @@ def run_large_datasheet_artifact_check(archive: DocumentationArchive, title: str
     }
 
 
+def run_youtube_artifact_checks(archive: DocumentationArchive, sources: list[YouTubeSource]) -> list[dict]:
+    documents = archive.list_documents(states=["active"])
+    checks = []
+    for source in sources:
+        document = next((candidate for candidate in documents if candidate["title"] == source.title), None)
+        if not document:
+            checks.append({
+                "title": source.title,
+                "required": True,
+                "skipped": True,
+                "passed": True,
+                "reason": "YouTube source was not ingested as an active document",
+            })
+            continue
+        full_document = archive.get_document(document["document_id"])
+        snapshot_path = Path(full_document["snapshot_path"])
+        if not snapshot_path.is_absolute():
+            snapshot_path = archive.root / snapshot_path
+        extracted_root = snapshot_path.parent / "extracted"
+        counts = artifact_counts(extracted_root)
+        checks.append({
+            "title": source.title,
+            "required": True,
+            "passed": counts["mediaKeyframePng"] >= 1 and counts["mediaKeyframeIndex"] == 1 and counts["youtubeMetadata"] == 1,
+            "documentId": document["document_id"],
+            "chunkCount": int(document["chunk_count"]),
+            "snapshotPath": str(snapshot_path),
+            "artifactCounts": counts,
+        })
+    return checks
+
+
 def artifact_counts(root: Path) -> dict[str, int]:
     if not root.exists():
         return {
@@ -332,6 +428,9 @@ def artifact_counts(root: Path) -> dict[str, int]:
             "imagePng": 0,
             "figureIndex": 0,
             "tableIndex": 0,
+            "mediaKeyframePng": 0,
+            "mediaKeyframeIndex": 0,
+            "youtubeMetadata": 0,
         }
     return {
         "tableMarkdown": count_paths(root, "tables/*.md"),
@@ -340,6 +439,9 @@ def artifact_counts(root: Path) -> dict[str, int]:
         "imagePng": count_paths(root, "images/*.png"),
         "figureIndex": count_paths(root, "figure_index.tsv"),
         "tableIndex": count_paths(root, "table_index.tsv"),
+        "mediaKeyframePng": count_paths(root, "media/keyframes/*.png"),
+        "mediaKeyframeIndex": count_paths(root, "media/keyframes.tsv"),
+        "youtubeMetadata": count_paths(root, "media/youtube_metadata.json"),
     }
 
 

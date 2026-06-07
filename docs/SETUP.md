@@ -9,8 +9,9 @@ to run Cloudx with voice control.
 - OpenSSL 3.x or newer.
 - Python 3.9 or newer; Python 3.12 is tested locally.
 - ripgrep (`rg`) for file-browser search.
-- Poppler utilities and LibreOffice for documentation archive PDF, table,
-  image, and spreadsheet extraction. The Ubuntu installer installs these.
+- Poppler utilities, LibreOffice, and FFmpeg for documentation archive PDF,
+  table, image, spreadsheet, and media keyframe extraction. The Ubuntu
+  installer installs these.
 - Quarto, Pandoc, and TeX Live XeLaTeX/LuaLaTeX engines for rendering the
   memory-plugin guide PDF. The Ubuntu installer installs these.
 - Codex CLI installed and authenticated on the backend host.
@@ -30,9 +31,9 @@ For Ubuntu 22.04 or newer, use the installer wizard:
 The installer is split into two visible phases:
 
 1. `install.sh` is the Ubuntu bootstrap. It verifies Ubuntu, installs apt
-   packages required by Cloudx, including `poppler-utils` and `libreoffice` for
-   documentation extraction plus `pandoc`, TeX Live XeLaTeX/LuaLaTeX packages,
-   and the pinned official Quarto `.deb` for rendering the memory-plugin PDF
+   packages required by Cloudx, including `poppler-utils`, `libreoffice`, and
+   `ffmpeg` for documentation extraction plus `pandoc`, TeX Live
+   XeLaTeX/LuaLaTeX packages, and the pinned official Quarto `.deb` for rendering the memory-plugin PDF
    guide. It checks for Node.js 22 and npm, and installs the NodeSource Node.js
    22 package when Node.js is too old or missing. It then verifies `node -v` and
    `npm -v`, and installs Ubuntu's separate `npm` package if the `npm` command
@@ -174,7 +175,7 @@ Manual setup remains available:
 
 ```bash
 npm install
-sudo apt install ripgrep poppler-utils libreoffice pandoc \
+sudo apt install ripgrep poppler-utils libreoffice ffmpeg pandoc \
   texlive-xetex texlive-latex-recommended texlive-latex-extra \
   texlive-fonts-recommended lmodern
 curl -fL -o /tmp/quarto-1.9.38-linux-amd64.deb \
@@ -195,8 +196,10 @@ npm run documentation:setup
 ```
 
 That command creates `services/documentation-indexer/.venv` and installs the
-indexer with the PDF, image, table, and Docling dependencies used for large
-datasheets.
+indexer with the PDF, image, table, Docling, YouTube transcript, and YouTube
+playlist metadata dependencies used for large datasheets and media sources.
+FFmpeg is installed by the main installer and is required for media and YouTube
+keyframe extraction.
 
 Start it on the default localhost endpoint:
 
@@ -235,7 +238,10 @@ CLOUDX_DEV_BACKEND_ORIGIN=http://127.0.0.1:4301 \
 
 In Cloudx, create a Documentation tab. The panel can:
 
-- Search active indexed knowledge.
+- Ask assisted archive questions when Documentation AI assistance and global AI
+  control are enabled.
+- Search active indexed knowledge manually and open full source chunks when AI
+  assistance is disabled.
 - Upload files, add local paths under `CLOUDX_ALLOWED_ROOTS`, ingest URLs, add
   copied text, and store media transcripts.
 - Mark sources stale, revoked, superseded, or quarantined.
@@ -413,6 +419,13 @@ authorization, and process isolation.
 - `CLOUDX_ASR_URL`: ASR service URL, default `http://127.0.0.1:7810`.
 - `CLOUDX_DOCUMENTATION_URL`: documentation indexer URL, default
   `http://127.0.0.1:7820`.
+- `CLOUDX_DOCUMENTATION_TIMEOUT_MS`: documentation indexer and AI enrichment
+  timeout, default `1800000`. Increase it for very long media imports, up to
+  12 hours.
+- `CLOUDX_DOCUMENTATION_RESPONSE_MAX_BYTES`: maximum indexer response size,
+  default `8388608`.
+- `CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES`: browser documentation upload cap,
+  default `268435456`.
 - `CLOUDX_DOCUMENTATION_DATA_DIR`: portable documentation archive directory,
   default `.cloudx/documentation`.
 - `CLOUDX_TERMINAL_REPLAY_BYTES`: terminal replay buffer for reconnects and

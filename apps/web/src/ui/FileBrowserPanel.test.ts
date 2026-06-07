@@ -333,7 +333,7 @@ describe("file browser panel state cache", () => {
 
 describe("path entry text assistance attributes", () => {
   it("disables browser and OS corrections while keeping the custom suggestions list", () => {
-    const html = renderToStaticMarkup(createElement(PathEntry, { inputId: "directory", value: "/home/david", onChange: () => undefined }));
+    const html = renderToStaticMarkup(createElement(PathEntry, { inputId: "directory", value: "/workspace/project", onChange: () => undefined }));
     const normalizedHtml = html.toLowerCase();
 
     expect(normalizedHtml).toContain('autocomplete="off"');

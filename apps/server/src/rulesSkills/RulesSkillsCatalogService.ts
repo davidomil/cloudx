@@ -207,6 +207,41 @@ export class RulesSkillsCatalogService {
     });
   }
 
+  async deleteSystemRule(ruleId: string): Promise<RulesSkillsStore> {
+    return this.withCatalogMutation(async () => {
+      const id = assertSafeId(ruleId, "system rule id");
+      await this.ensureSeeded();
+      await fsp.rm(this.systemRulePath(id), { force: true });
+      this.emitChange();
+      return this.readStore();
+    });
+  }
+
+  async deleteSkill(skillId: string): Promise<RulesSkillsStore> {
+    return this.withCatalogMutation(async () => {
+      const id = assertSafeId(skillId, "skill id");
+      const store = await this.readFreshStore();
+      await fsp.rm(this.skillPath(id), { recursive: true, force: true });
+      for (const template of store.templates) {
+        if (template.skillIds.includes(id)) {
+          await writeJson(this.templatePath(template.id), { ...template, skillIds: template.skillIds.filter((candidate) => candidate !== id) }, this.rootPath);
+        }
+      }
+      this.emitChange();
+      return this.readStore();
+    });
+  }
+
+  async deleteSystemSkill(skillId: string): Promise<RulesSkillsStore> {
+    return this.withCatalogMutation(async () => {
+      const id = assertSafeId(skillId, "system skill id");
+      await this.ensureSeeded();
+      await fsp.rm(this.systemSkillPath(id), { recursive: true, force: true });
+      this.emitChange();
+      return this.readStore();
+    });
+  }
+
   async saveSkill(input: Record<string, unknown>, options: { failIfExists?: boolean } = {}): Promise<RulesSkillsStore> {
     return this.withCatalogMutation(async () => {
       const skill = normalizeSkill(input);

@@ -170,6 +170,16 @@ export interface WorkspacePlugin {
   triggers?: TriggerDefinition[];
   ruleContributions?: PluginRuleContribution[];
   skillContributions?: PluginSkillContribution[];
+  /**
+   * User catalog rule ids from older plugin versions that should be removed
+   * before writing the same ids as system rule contributions.
+   */
+  adoptUserRuleContributionIds?: readonly string[];
+  /**
+   * User catalog skill ids from older plugin versions that should be removed
+   * before writing the same ids as system skill contributions.
+   */
+  adoptUserSkillContributionIds?: readonly string[];
   uiContributions?: UiContributionDescriptor[];
   configFields?: ConfigFieldDescriptor[];
   defaultTitleContext?(input: { cwd: string; initialInput?: Record<string, unknown> }): string | undefined;

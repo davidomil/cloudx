@@ -1,15 +1,16 @@
 # CloudX Memory Plugin Guide
 CloudX
-2026-06-03
+2026-06-07
 
 # Executive Summary
 
 The new memory plugin is implemented as the CloudX `documentation`
 plugin plus a local FastAPI service called the Documentation Indexer.
 Its job is to turn uploaded files, allowed local files and directories,
-URLs, copied text, and transcripts into a portable local knowledge
-archive that CloudX can search later through plugin hooks, the
-Documentation tab, HTTP, automation, and voice-aware read paths.
+URLs, YouTube videos/playlists, copied text, and transcripts into a
+portable local knowledge archive that CloudX can search later through
+plugin hooks, the Documentation tab, HTTP, automation, and voice-aware
+read paths.
 
 The system is intentionally local-first. The archive lives under
 `CLOUDX_DOCUMENTATION_DATA_DIR`, defaulting to `.cloudx/documentation`.
@@ -24,7 +25,7 @@ rebuilt only from active chunks.
 
 # Big Picture
 
-The request path has five layers:
+The request path has six layers:
 
 1.  The browser panel, plugin hooks, HTTP routes, automation, or a Codex
     skill creates an ingest, search, invalidate, or maintenance request.
@@ -35,7 +36,11 @@ The request path has five layers:
 4.  The indexer extracts content, stores source snapshots, updates
     SQLite and FTS5, and rebuilds the Turbovec index when active chunks
     change.
-5.  Codex tabs receive the documentation system rule and skills
+5.  If Documentation AI enrichment is enabled in Settings and global AI
+    control is on, the server loads the configured documentation
+    enrichment skills, calls the same Codex exec model used by voice
+    control, and writes derived AI chunks back through the indexer.
+6.  Codex tabs receive the documentation system rule and skills
     automatically through the CloudX overlay path used by built-in rules
     and skills.
 
@@ -68,6 +73,20 @@ Source: `apps/server/src/documentation/DocumentationClient.ts`
 Wraps the indexer REST API, applies request timeout, bounds response
 size, and normalizes service errors.
 
+## AI Enrichment Service
+
+Source:
+`apps/server/src/documentation/DocumentationEnrichmentService.ts`
+
+Runs only when the `documentation.aiEnrichmentEnabled` plugin setting is
+true and global AI control is enabled. It reads the configured CloudX
+skills from the rules/skills catalog, builds complete evidence batches
+from all source-origin chunks, extracted table/figure/image artifact
+manifests, optional ASR transcript segments, and one-frame-per-second
+video keyframe paths, then invokes Codex exec with a strict JSON schema
+for each batch. Returned spans are merged and written as AI-origin
+chunks by `POST /documents/{id}/enrich`.
+
 ## Web Panel
 
 Source: `apps/web/src/ui/DocumentationPanel.tsx`
@@ -80,8 +99,8 @@ view, and index rebuild controls.
 Source:
 `services/documentation-indexer/src/cloudx_documentation_indexer/main.py`
 
-Defines FastAPI routes for health, stats, documents, ingest, search,
-invalidate, delete, and rebuild.
+Defines FastAPI routes for health, stats, documents, ingest, enrichment,
+search, invalidate, delete, and rebuild.
 
 ## Archive Engine
 
@@ -101,7 +120,7 @@ The archive root contains:
 
 | Path | Purpose |
 |----|----|
-| `catalog.sqlite` | SQLite catalog for documents, chunks, FTS5 search rows, and invalidation events. |
+| `catalog.sqlite` | SQLite catalog for documents, chunks, AI enrichment records, FTS5 search rows, and invalidation events. |
 | `snapshots/<sha256>/...` | Immutable source bytes captured at ingest time. URL snapshots may also include `metadata.json` with final URL, content type, ETag, and last-modified headers. Rich extraction sidecars live under `snapshots/<sha256>/extracted/`. |
 | `indexes/local-hash-64/chunks.tvim` | Turbovec dense index built from active chunks only. |
 | `indexes/local-hash-64/manifest.json` | Rebuild metadata for schema version, embedding profile, Turbovec version, index format, dense threshold, and active chunk count. |
@@ -123,11 +142,21 @@ the configured upload cap and forwards the bytes to the indexer’s
 multipart `POST /ingest/upload` route.
 
 Upload ingest stores the original filename and content type in snapshot
-metadata, infers a source type when the UI is left on `auto`, and
+metadata, infers a source type when the UI is left on `auto`,
+autodetects the title from the filename when the title field is blank,
+assigns the default `uploads` collection when collection is blank, and
 records a stable `upload://<safe-name>` URI. This path is the preferred
 user workflow for datasheets, PDFs, images, Markdown, copied exports,
 and other files that are on the user’s workstation but not necessarily
 visible as a local path to the indexer process.
+
+When AI enrichment is enabled, browser upload is also the path that can
+pass media bytes to the enrichment service. Uploaded audio/video can be
+transcribed through the existing Faster Whisper ASR service, and
+uploaded video is converted into a one-frame-per-second keyframe
+manifest with FFmpeg before Codex is asked to improve the import. Long
+media files can produce large keyframe manifests, so the enrichment
+service batches the manifest instead of silently capping it.
 
 ## Local Path Ingest
 
@@ -139,8 +168,8 @@ documentation file suffixes.
 
 Supported suffixes include Markdown, text, PDF, HTML, JSON, YAML, XML,
 CSV, SRT/VTT, Python, TypeScript, JavaScript, C/C++, Rust, CSS,
-AsciiDoc, LaTeX, and images (`.png`, `.jpg`, `.jpeg`, `.tif`, `.tiff`,
-`.bmp`, `.webp`).
+AsciiDoc, LaTeX, and images (`.png`, `.jpg`, `.jpeg`, `.gif`, `.tif`,
+`.tiff`, `.bmp`, `.webp`).
 
 The supported source-type labels are `datasheet`, `book`, `website`,
 `repo_code`, `readme`, `media`, `image`, and `text`. Source type
@@ -149,10 +178,14 @@ selected from the actual file suffix, content type, and file signature.
 That means setting `sourceType` to `datasheet` no longer forces a
 Markdown, text, or image file through the PDF extractor.
 
+When title is blank, path ingest uses the file name. When collection is
+blank, directory ingest uses the directory name for every file under
+that ingest request and single-file ingest uses the parent folder name.
+
 | Input class | Examples | Extraction behavior |
 |----|----|----|
 | PDF | `.pdf`, `application/pdf`, `%PDF-` bytes | Page text, tables, and rendered visual page artifacts. |
-| Image | `.png`, `.jpg`, `.jpeg`, `.tif`, `.tiff`, `.bmp`, `.webp`, `image/*` | Normalized PNG artifact plus format, size, mode, and frame metadata. |
+| Image | `.png`, `.jpg`, `.jpeg`, `.gif`, `.tif`, `.tiff`, `.bmp`, `.webp`, `image/*` | Normalized PNG artifacts for all frames plus format, size, mode, and frame metadata. |
 | HTML | `.html`, `.htm`, `text/html` | Text after removing script, style, template, and noscript content. |
 | Text and code | `.md`, `.txt`, `.json`, `.yaml`, `.xml`, `.csv`, `.py`, `.ts`, `.tsx`, `.js`, `.c`, `.cpp`, `.h`, `.rs`, `.css`, `.adoc`, `.tex` | UTF-8 text decode with replacement for invalid bytes. |
 | Captions and transcripts | `.srt`, `.vtt`, manually supplied transcript text | Text chunks marked as media when requested. |
@@ -164,17 +197,52 @@ Markdown, text, or image file through the PDF extractor.
 content type, ETag, and last-modified header when those values are
 available.
 
+When title is blank, URL ingest uses the URL leaf or a YouTube
+video/playlist label. When collection is blank, normal URL ingest uses
+the URL host and YouTube ingest uses `youtube` unless the URL is a
+playlist.
+
 If the caller provides a transcript, the URL is ingested as media text
 without downloading page content. If the source type is `media` or the
-URL is recognized as YouTube, the indexer tries to fetch the transcript
-and stores it as media text.
+URL is recognized as a single YouTube video, the indexer fetches the
+transcript, reads video metadata with `yt-dlp`, stores the video
+description as its own searchable source chunk, and uses FFmpeg to
+preserve one PNG keyframe per second under the source snapshot’s
+`extracted/media/keyframes/` directory. The keyframe index, YouTube
+metadata JSON, optional `description.txt`, description chunks,
+transcript chunks, and original URL are all stored as source evidence.
+Missing `yt-dlp`, missing `ffmpeg`, transcript failures, or keyframe
+extraction failures fail the ingest request explicitly.
+
+If the URL contains a YouTube `list=` playlist ID and no manual
+transcript is supplied, `/ingest/url` treats it as a playlist. The
+indexer uses `yt-dlp` in flat playlist mode to read playlist metadata,
+then ingests each video through the same single-video path. Each
+playlist entry becomes one archive document: the document title comes
+from the video entry title, the URI is the canonical
+`https://www.youtube.com/watch?v=<video-id>` URL, the source type is
+`media`, and the collection is the playlist title unless the caller
+provided an explicit collection. Transcript text still comes from
+`youtube-transcript-api`, and every successfully ingested playlist entry
+gets its own keyframe manifest. If a later playlist entry fails, earlier
+entries from that request are marked deleted so active search does not
+contain a partial playlist import.
+
+YouTube enrichment follows the same document boundary. A single video
+URL enriches the media document that was created for that video. A
+playlist URL expands first, then each playlist entry is enriched
+independently using that entry’s description chunk, transcript chunks,
+metadata, and keyframe artifact paths.
 
 ## Text Ingest
 
 `documentation.ingest.text` stores direct text, copied source material,
-or manually supplied transcripts. It requires a title, URI, source type,
-and non-empty text. If the text is blank after trimming, the indexer
-rejects the request.
+or manually supplied transcripts. It requires only non-empty text. If
+title is blank, the indexer uses the first non-empty text line. If URI
+is blank, it creates a deterministic `manual://<title>-<hash>` URI. If
+source type is blank, it infers one from the URI and otherwise uses
+`text`. If collection is blank, it uses the URI scheme such as `manual`
+or the URL host when an HTTP URI is supplied.
 
 ## Extraction And Chunking
 
@@ -184,7 +252,8 @@ portable sidecars under `extracted/tables/`; pages with visual objects
 are rendered to PNG sidecars under `extracted/figures/` so graphs,
 plots, flowcharts, schematics, and layout-heavy pages can be inspected
 later. Image input is normalized to a PNG sidecar under
-`extracted/images/` and indexed with format, size, mode, frame count,
+`extracted/images/`; multi-frame images preserve every frame as a
+separate artifact and are indexed with format, size, mode, frame count,
 and visual-artifact metadata. HTML input is parsed with script, style,
 template, and noscript content removed. Other input is decoded as text.
 Extracted spans are split into paragraph-like chunks with a maximum
@@ -202,14 +271,60 @@ Each document ID is deterministic for a `(uri, content_sha256)` pair.
 Re-ingesting the same URI and content replaces its chunks and keeps the
 document active.
 
+## AI Enrichment
+
+AI enrichment is a plugin-wide setting in Settings under Documentation:
+
+| Setting | Default | Meaning |
+|----|---:|----|
+| `aiEnrichmentEnabled` | `true` | Enables the post-ingest AI pass and assisted answers when global AI control is also enabled. |
+| `aiEnrichmentSkillIds` | `documentation-enrich-metadata,documentation-enrich-visuals,documentation-enrich-media` | Comma-separated CloudX skill ids that define what the AI should extract and how it should write derived spans. |
+
+There is no per-upload hardcoded extraction recipe. The service loads
+the configured skills from the same folder-backed rules/skills catalog
+used by `create-cloudx-skill`, includes those instructions in the Codex
+prompt, and requires Codex to return structured JSON with `summary`,
+`spans`, `metadata`, and `warnings`.
+
+The AI pass runs after the source import succeeds. It reads the newly
+ingested document, all source-origin chunks, portable extraction
+artifact manifests, and media evidence when available. For media
+uploads, the existing ASR service produces a transcript and FFmpeg
+produces one-frame-per-second keyframe artifacts. For YouTube URL
+imports, the indexer itself stores the transcript, metadata, and
+one-frame-per-second keyframe artifact manifest before enrichment runs.
+The service batches all chunks, artifact paths, transcript segments, and
+keyframe paths so prompt size is controlled without dropping later
+evidence. Codex returns derived spans with locators such as
+`ai:metadata`, `ai:visual`, and `ai:media`; the indexer stores them as
+`chunk_origin = 'ai'` so search can distinguish source extraction from
+AI-derived enrichment. Re-running enrichment for a document replaces
+previous AI chunks for that document and leaves source chunks unchanged.
+
+If enrichment fails, the base source document remains active. The ingest
+response includes an `enrichment` status block with the affected
+document id and error message.
+
+The same setting also controls assisted archive answers in the browser
+panel. When AI assistance is available, the Documentation panel's answer
+mode calls the `documentation.answer` hook. That hook searches the
+archive, opens matching source documents, sends selected source evidence
+to Codex with a strict answer schema, and returns plaintext,
+sanitized-renderable semantic HTML, citations, warnings, and the
+underlying results. The panel shows an explicit running state while this
+search and answer pass is active. When AI assistance is disabled, the
+answer mode is unavailable; CloudX falls back to manual search and
+source viewing only.
+
 # Storage Model
 
-SQLite has three durable tables and one FTS5 virtual table:
+SQLite has four durable tables and one FTS5 virtual table:
 
 | Store | Meaning |
 |----|----|
 | `documents` | One row per ingested source, including title, source type, URI, snapshot path, content hash, state, collection, tags, and timestamps. |
-| `chunks` | Extracted text chunks with locators and state. Each chunk belongs to a document. |
+| `chunks` | Extracted and AI-derived chunks with locators, state, `chunk_origin`, and optional `enrichment_id`. Each chunk belongs to a document. |
+| `document_enrichments` | Append-only record of each AI enrichment write, including model, skill ids, summary, payload, and timestamp. |
 | `chunks_fts` | SQLite FTS5 table over chunk text and locator. Triggers keep it synchronized on chunk insert, update, and delete. |
 | `invalidation_events` | Append-only audit trail for state transitions, with previous state, next state, reason, and timestamp. |
 
@@ -251,10 +366,22 @@ candidates below `0.2`, and combines the ranked lists with reciprocal
 rank fusion plus lexical relevance.
 
 The result payload includes the chunk ID, document ID, title, source
-type, URI, locator, snippet, fused score, optional dense and lexical
-scores, and citation metadata with the content SHA and snapshot path.
-That makes search results usable as source-grounded references instead
-of free-floating text.
+type, URI, locator, snippet, `chunkOrigin`, optional `enrichmentId`,
+fused score, optional dense and lexical scores, and citation metadata
+with the content SHA and snapshot path. That makes search results usable
+as source-grounded references instead of free-floating text, while still
+flagging whether a hit came from direct source extraction or AI
+enrichment.
+
+`documentation.answer` builds on this search flow for the browser/API
+assisted-answer option instead of replacing source search. It answers a
+user question by retrieving the highest-value chunks, opening source
+documents for those chunks, and asking Codex to synthesize only from
+selected evidence. Small matched documents are eligible to be included
+as a whole; larger documents use the matched chunks and nearby source
+context. The answer response includes plaintext, semantic HTML for the
+panel, warnings when evidence is incomplete, citations, model name, and
+the search results used to build the prompt.
 
 # State And Invalidation
 
@@ -290,15 +417,24 @@ audit and explicit non-active searches.
   document with chunks and invalidation history.
 - `documentation.search`: `POST /search`. Searches the archive and is
   exposed to plugin, UI, HTTP, automation, and voice.
+- `documentation.answer`: UI/HTTP assisted-answer option. It searches
+  the archive, opens source evidence, and returns a source-grounded AI
+  answer when global AI control and Documentation AI enrichment are
+  enabled. Codex-facing skills use `documentation.search` plus
+  `documentation.documents.get` directly so Codex can inspect sources
+  itself.
 
 ## Write And External Hooks
 
 - `documentation.ingest.path`: `POST /ingest/path`, safety `write`.
   Ingests allowed local files or directories.
 - `documentation.ingest.url`: `POST /ingest/url`, safety `external`.
-  Downloads or transcript-ingests external content.
+  Downloads external content, ingests a YouTube video with description,
+  transcript, and keyframe artifacts, or expands a YouTube playlist into
+  one media document per video.
 - `documentation.ingest.text`: `POST /ingest/text`, safety `write`.
-  Ingests copied text or manually supplied transcript text.
+  Ingests copied text or manually supplied transcript text; only `text`
+  is required.
 - `documentation.invalidate`: `POST /invalidate`, safety `write`. Marks
   a document non-active with a reason.
 - `documentation.remove`: `DELETE /documents/{id}`, safety `write`.
@@ -307,15 +443,23 @@ audit and explicit non-active searches.
   Rebuilds Turbovec from active SQLite chunks.
 
 The `DocumentationClient` defaults to `http://127.0.0.1:7820`, a 30
-second timeout, and an 8 MiB maximum response body. Failed service
-responses are converted into plain error messages when the response
-includes `detail`, `message`, or `error`.
+minute timeout, and an 8 MiB maximum response body.
+`CLOUDX_DOCUMENTATION_TIMEOUT_MS` sets the indexer request and AI
+enrichment timeout up to 12 hours for large PDF extraction or long media
+imports. `CLOUDX_DOCUMENTATION_RESPONSE_MAX_BYTES` sets the maximum
+indexer response size, and `CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES` sets
+the browser documentation upload cap. Failed service responses are
+converted into plain error messages when the response includes `detail`,
+`message`, or `error`.
 
 Binary upload is exposed through HTTP rather than a plugin hook because
 hook inputs are JSON-shaped. The browser route is
 `POST /api/documentation/upload` with an `application/octet-stream` body
 and metadata in query parameters. The indexer route is
-`POST /ingest/upload` with multipart form data.
+`POST /ingest/upload` with multipart form data. When AI enrichment is
+enabled, the same upload bytes are also passed to the enrichment service
+so media uploads can be transcribed and sampled before derived chunks
+are written by `POST /documents/{id}/enrich`.
 
 # UI Workflow
 
@@ -323,53 +467,89 @@ In CloudX, create a Documentation tab. The panel gives a compact
 operational view:
 
 1.  Refresh archive stats and active document list.
-2.  Search with `hybrid`, `dense`, or `lexical` mode.
-3.  Filter by source type, state, and collection.
-4.  Add knowledge from an uploaded file, path, URL, or text.
-5.  Leave source type on `auto` for uploads, paths, and URLs unless the
+2.  Ask an AI-assisted archive question by default when AI assistance is
+    enabled.
+3.  Switch to manual search when the user needs raw matching chunks or
+    AI assistance is disabled.
+4.  Search with `hybrid`, `dense`, or `lexical` mode.
+5.  Filter by source type, state, and collection.
+6.  Queue knowledge imports from uploaded files, paths, URLs, or text.
+    Imports run one at a time so long YouTube/video work does not
+    overlap.
+7.  Track queued, running, complete, and failed imports in the Import
+    Queue. File uploads report real byte progress from browser upload
+    events; server-side extraction, URL download, transcript, keyframe,
+    and enrichment work reports phase progress while the synchronous
+    indexer request is running.
+8.  Leave source type on `auto` for uploads, paths, and URLs unless the
     user knows the source category.
-6.  Supply optional media transcripts when URL ingest is set to source
+9.  Leave title and collection blank when the indexer should autodetect
+    them.
+10. Supply optional media transcripts when URL ingest is set to source
     type `media`.
-7.  Mark search results `stale`, `revoked`, `superseded`, or
+11. Mark search results `stale`, `revoked`, `superseded`, or
     `quarantined`.
-8.  Remove a document from active search.
-9.  Load the portable manifest and rebuild the Turbovec index.
+12. Remove a document from active search.
+13. Open full source documents from search results or the Active
+    Documents list to inspect chunks, transcript text, table Markdown,
+    and extracted artifact metadata.
+14. Load the portable manifest and rebuild the Turbovec index.
 
 The UI defaults search state to `active`, ingest mode to upload, source
-type to `auto`, and search mode to `hybrid`.
+type to `auto`, and search mode to `hybrid`. It also shows whether AI
+assistance is active. If AI is disabled, the warning explicitly says
+only text/manual source analysis is available, and the Answer mode is
+disabled. The Queue button snapshots the current form into a queued
+import and immediately clears the form so another source can be queued
+while the previous source is still downloading, transcribing, extracting,
+or enriching.
 
 # Default Rule And Skills
 
-The plugin contributes this universal CloudX system rule automatically at
-server startup:
+The plugin contributes this universal CloudX system rule automatically
+at server startup:
 
 | Rule | Purpose |
 |----|----|
-| `documentation-ingest-evidence` | Download or otherwise capture task evidence such as datasheets, sample code, vendor documentation, screenshots, flowcharts, API references, and local notes into the documentation knowledge base before relying on it; preserve precise metadata and invalidate older conflicting records. |
+| `documentation-ingest-evidence` | Before factual, research, recipe, recommendation, troubleshooting, summary, or source-grounded answers, query the active local documentation archive first with `POST $CLOUDX_DOCUMENTATION_URL/search`; when local evidence is absent, stale, or insufficient, use reliable online sources, add useful sources back into the archive when ingestion is possible, rerun local search, preserve precise metadata, and invalidate older conflicting records. |
 
-The plugin contributes four CloudX system skills automatically at server
-startup:
+The plugin contributes seven CloudX system skills automatically at
+server startup:
 
 | Skill | Purpose |
 |----|----|
-| `documentation-search` | Search the local archive and use active source-grounded results. |
-| `documentation-ingest` | Add local files, directories, websites, copied text, or transcripts. |
+| `documentation-search` | Mandatory local-first lookup for factual, research, recipe, recommendation, troubleshooting, summary, and source-grounded questions; open matching documents and use active source-grounded results, then use reliable online sources only when local evidence is weak or missing, ingest them, rerun local search, and answer from the refreshed archive. |
+| `documentation-ingest` | Add files, directories, durable websites, YouTube videos/playlists, copied text, or transcripts with optional auto metadata; prefer primary online source URLs over search-result pages or low-trust mirrors. |
 | `documentation-invalidate` | Find and invalidate stale, wrong, superseded, quarantined, or deleted sources. |
+| `documentation-enrich-metadata` | Derive source-grounded metadata and searchable import-improvement notes. |
+| `documentation-enrich-visuals` | Describe extracted tables, graphs, diagrams, screenshots, and flowcharts without inventing visual facts. |
+| `documentation-enrich-media` | Improve media imports using transcripts and interval keyframes when available. |
 | `documentation-archive-control` | Inspect health, stats, portable manifest, and rebuild status. |
 
-Each skill tells Codex to read `CLOUDX_DOCUMENTATION_URL` first. When
-Codex tabs are launched from CloudX, the server exports that URL to
+Each skill tells Codex to read `CLOUDX_DOCUMENTATION_URL` first. The
+search skill explicitly tells Codex to call `/search` and
+`/documents/{documentId}` directly instead of routing through
+`documentation.answer`, because Codex can inspect the retrieved sources
+itself. It also instructs Codex to prefer active local archive evidence,
+use built-in web search only when local evidence is absent or
+insufficient, prefer official, vendor, spec, peer-reviewed, government,
+or reputable-news sources depending on the domain, ingest useful online
+sources back into the archive, and rerun local search before answering.
+When Codex tabs are launched from CloudX, the server exports that URL to
 child processes.
 
 The injection path is generic. Plugins expose `ruleContributions` and
 `skillContributions`, `syncPluginContributions` writes them into the
-CloudX `system-rules/` and `system-skills/` catalogs, and each Codex home
-overlay materializes all system rules into `AGENTS.override.md` plus all
-system skills under `skills/cloudx-system/`. A future plugin should
-follow the same pattern: use IDs prefixed with the plugin ID, provide a
-single-line rule text or complete `SKILL.md` body through the
+CloudX `system-rules/` and `system-skills/` catalogs, and each Codex
+home overlay materializes all system rules into `AGENTS.override.md`
+plus all system skills under `skills/cloudx-system/`. A future plugin
+should follow the same pattern: use IDs prefixed with the plugin ID,
+provide a single-line rule text or complete `SKILL.md` body through the
 contribution, and let the catalog and overlay handle availability for
-every Codex tab.
+every Codex tab. Documentation enrichment deliberately uses this same
+catalog lookup; adding another plugin-owned enrichment pipeline should
+mean adding plugin skills and a service that reads configured skill ids,
+not adding hardcoded extraction instructions.
 
 # Setup And Operations
 
@@ -417,8 +597,9 @@ reconstructed from SQLite chunks.
 # Rendering This PDF
 
 The Ubuntu installer installs the render toolchain used for this guide:
-Quarto `1.9.38`, Pandoc, and TeX Live's XeLaTeX/LuaLaTeX engines.
-Regenerate the PDF from the Quarto source with:
+Quarto `1.9.38`, Pandoc, and TeX Live’s XeLaTeX/LuaLaTeX engines. It
+also installs FFmpeg for documentation media keyframes. Regenerate the
+PDF from the Quarto source with:
 
 ``` bash
 npm run docs:memory:pdf
@@ -432,7 +613,8 @@ That command reads `docs/MEMORY_PLUGIN_GUIDE.qmd` and writes
 The indexer tests cover:
 
 - Ingesting uploaded files, PDFs, local directories, image files, HTML
-  websites, README/code-like files, and media transcripts.
+  websites, README/code-like files, media transcripts, and AI-derived
+  enrichment chunks.
 - Extracting PDF table sidecars, rendered visual artifacts, and
   normalized image artifacts.
 - Searching with hybrid retrieval, lexical-only behavior, strict
@@ -442,23 +624,31 @@ The indexer tests cover:
   reopen/restore behavior, FastAPI controls, and CLI help.
 
 The server plugin tests cover hook registration, safety classes, local
-path policy enforcement, browser upload forwarding, automatic plugin
-system-rule and system-skill contributions, generic plugin contribution
-validation, and Codex overlay injection. The web panel tests cover upload
-ingest, visible text ingest, and search hook calls. The client tests
-cover JSON POST behavior, multipart upload behavior, browser upload
-request construction, and propagation of service error messages.
+path policy enforcement, browser upload forwarding, enrichment routing,
+assisted-answer routing, automatic plugin system-rule and system-skill
+contributions, direct Codex search-skill guidance, generic plugin
+contribution validation, and Codex overlay injection. The web panel
+tests cover upload ingest, visible text ingest, assisted-answer mode,
+assisted-search loading state, sanitized HTML answer rendering,
+disabled-AI manual mode, full source viewing, and search hook calls. The
+client tests cover JSON POST behavior, multipart upload behavior,
+enrichment POST behavior, browser upload request construction, and
+propagation of service error messages.
 
 A realistic validation runner in
 `debug_tooling/documentation-validation/run_validation.py` downloads or
-reuses public Wikipedia pages, the TurboQuant arXiv PDF, GMSL2 datasheet
-PDFs, and a generated 2500-record mock corpus with planted facts. The
-latest required validation run ingested 6 documents into 3347 active
-chunks, produced 1866 table CSV files, 1866 table Markdown files, and
-469 rendered figure PNGs, then passed required hybrid, lexical, rebuild,
-and stale-state checks. Dense-only checks are retained as diagnostics
-because the current dense profile is a deterministic local hash
-embedding, not a semantic embedding model. See
+reuses public Wikipedia pages, the TurboQuant arXiv PDF, the kernel.org
+Linux virtual memory manager book, GMSL2 datasheet PDFs, optional live
+YouTube videos with transcripts and keyframes, and a generated
+2500-record mock corpus with planted facts. The latest required
+validation run used `--include-youtube`, ingested 9 documents into 5324
+active chunks, produced 1885 table CSV files, 1885 table Markdown files,
+596 rendered figure PNGs, 3134 YouTube keyframe PNGs, 2 YouTube keyframe
+indexes, and 2 YouTube metadata JSON files, then passed required hybrid,
+lexical, rebuild, stale-state, YouTube transcript recall, and YouTube
+artifact checks. Dense-only checks are retained as diagnostics because
+the current dense profile is a deterministic local hash embedding, not a
+semantic embedding model. See
 `debug_tooling/documentation-validation/README.md` before running it;
 generated corpus, archive, and summary files stay under the selected
 `--root` and should not be committed.
@@ -472,10 +662,17 @@ generated corpus, archive, and summary files stay under the selected
 - Dense search is restricted to active chunks because only active chunks
   are loaded into Turbovec.
 - URL ingest supports only HTTP and HTTPS, performs direct fetches or
-  transcript ingest, and does not crawl a site recursively.
+  YouTube media ingest, and does not crawl a site recursively.
+- YouTube URL ingest stores transcript, metadata, and
+  one-frame-per-second keyframe artifacts, but it depends on live YouTube
+  access, `youtube-transcript-api`, `yt-dlp`, and FFmpeg.
 - Browser uploads and URL downloads are capped at 256 MiB.
 - PDF graph and flowchart extraction preserves rendered visual
   artifacts, but it does not OCR labels or infer graph semantics.
+- AI enrichment is enabled by default as a Documentation plugin setting,
+  but it still requires global AI control. If either setting is
+  disabled, assisted answers and post-ingest AI spans are unavailable;
+  manual source-text search and full source inspection still work.
 - Path ingest is limited by CloudX path policy and the supported file
   suffix list.
 - Backup is directory-level. Copying only `catalog.sqlite` or only

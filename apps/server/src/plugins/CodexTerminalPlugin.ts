@@ -264,7 +264,7 @@ export function buildCodexRuntimeUpdatePrompt(resolved: ResolvedPersonalityTempl
   const lines = [
     "CloudX rules/skills update for this running Codex session.",
     "",
-    "Apply the following CloudX template state to all future turns in this session. Do not restart, exit, modify files, or run commands because of this update alone."
+    "Apply the following CloudX template state to all future turns in this session. This update supersedes all earlier CloudX rules/skills update messages; ignore CloudX rules or skills from earlier updates when they are not listed below. Do not restart, exit, modify files, or run commands because of this update alone."
   ];
 
   if (!resolved) {
@@ -297,6 +297,7 @@ export function buildCodexRuntimeUpdatePrompt(resolved: ResolvedPersonalityTempl
   lines.push(...(overlay?.systemSkills ?? CLOUDX_SYSTEM_SKILLS).map((skill) => `- $${skill.id}: ${skill.name} - ${skill.description}${skillPathSuffix(overlay, skill.id, true)}`));
   lines.push(
     "",
+    "Documentation lookup rule: before answering any factual, research, recipe, recommendation, troubleshooting, summary, or source-grounded question, use $documentation-search and query the local CloudX documentation archive first. Only move to web or model memory after that local search is absent, stale, or insufficient.",
     "Skill loading rule: prefer using the listed CloudX skills whenever they fit the user's task. If the user invokes one with $skill-name, or if a task clearly matches a listed skill, read that skill's SKILL.md before acting. Treat the listed CloudX skills as available even if the Codex TUI skill list has not refreshed.",
     "Acknowledge this update briefly and wait for the user's next instruction."
   );

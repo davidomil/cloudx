@@ -38,6 +38,8 @@ interface SkillMaterializationSource {
   targetDir: string;
 }
 
+const GENERATED_SKILL_CONFIG_MARKER = "# CloudX generated skill enablement for this Codex tab.";
+
 export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptions): Promise<CodexHomeOverlay> {
   const baseEnv = options.baseEnv ?? process.env;
   const sourceCodexHome = resolveCodexHome(baseEnv);
@@ -107,9 +109,9 @@ async function materializeSelectedSkills(
 }
 
 async function writeOverlayConfig(sourceConfigPath: string, targetConfigPath: string, skillPaths: string[]): Promise<void> {
-  const baseConfig = await readOptionalText(sourceConfigPath);
+  const baseConfig = stripGeneratedCloudxConfig(await readOptionalText(sourceConfigPath));
   const generated = [
-    "# CloudX generated skill enablement for this Codex tab.",
+    GENERATED_SKILL_CONFIG_MARKER,
     ...skillPaths.flatMap((skillPath) => [
       "",
       "[[skills.config]]",
@@ -121,16 +123,25 @@ async function writeOverlayConfig(sourceConfigPath: string, targetConfigPath: st
   await fsp.writeFile(targetConfigPath, `${config.trimEnd()}\n`, "utf8");
 }
 
+function stripGeneratedCloudxConfig(config: string | undefined): string | undefined {
+  if (!config) {
+    return undefined;
+  }
+  const generatedIndex = config.indexOf(GENERATED_SKILL_CONFIG_MARKER);
+  const stripped = (generatedIndex >= 0 ? config.slice(0, generatedIndex) : config).trim();
+  return stripped || undefined;
+}
+
 async function writeOverlayInstructions(
   sourceCodexHome: string,
   targetCodexHome: string,
   resolved: ResolvedPersonalityTemplate | undefined,
   systemRules: CloudxRule[]
 ): Promise<string | undefined> {
-  const baseInstructions = await readFirstExisting([
+  const baseInstructions = stripGeneratedCloudxSections(await readFirstExisting([
     path.join(sourceCodexHome, "AGENTS.override.md"),
     path.join(sourceCodexHome, "AGENTS.md")
-  ]);
+  ]));
   const cloudxRules = resolved?.rules ?? [];
   const instructionsPath = path.join(targetCodexHome, "AGENTS.override.md");
   if (!baseInstructions && systemRules.length === 0 && cloudxRules.length === 0) {
@@ -150,6 +161,29 @@ async function writeOverlayInstructions(
   }
   await fsp.writeFile(instructionsPath, `${sections.join("\n").trimEnd()}\n`, "utf8");
   return instructionsPath;
+}
+
+function stripGeneratedCloudxSections(instructions: string | undefined): string | undefined {
+  if (!instructions) {
+    return undefined;
+  }
+  const lines = instructions.split(/\r?\n/u);
+  const kept: string[] = [];
+  let skipping = false;
+  for (const line of lines) {
+    if (/^## CloudX System Rules\s*$/u.test(line) || /^## CloudX Template:/u.test(line)) {
+      skipping = true;
+      continue;
+    }
+    if (skipping && /^## /u.test(line)) {
+      skipping = false;
+    }
+    if (!skipping) {
+      kept.push(line);
+    }
+  }
+  const stripped = kept.join("\n").trim();
+  return stripped || undefined;
 }
 
 async function linkOrCopyIfExists(sourcePath: string, targetPath: string): Promise<void> {

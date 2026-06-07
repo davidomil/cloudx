@@ -149,6 +149,23 @@ describe("RulesSkillsCatalogService", () => {
     }));
   });
 
+  it("removes deleted user skills from templates", async () => {
+    const service = await createService();
+    await service.saveSkill({ id: "documentation-search", name: "Documentation Search", description: "Legacy documentation skill.", instructions: "# Documentation Search\n\nLegacy documentation search." });
+    await service.saveTemplate({
+      id: "legacy-docs",
+      name: "Legacy Docs",
+      color: "green",
+      ruleIds: ["keep-changes-focused"],
+      skillIds: ["documentation-search"]
+    });
+
+    const store = await service.deleteSkill("documentation-search");
+
+    expect(store.skills.map((skill) => skill.id)).not.toContain("documentation-search");
+    expect(store.templates.find((template) => template.id === "legacy-docs")?.skillIds).toEqual([]);
+  });
+
   it("rejects catalog writes through symlinked files", async () => {
     if (process.platform === "win32") {
       return;

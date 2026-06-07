@@ -453,8 +453,8 @@ describe("codexTabInitialInput", () => {
     expect(codexTabInitialInput("last", "", true, true)).toEqual({
       resume: { mode: "last", all: true, includeNonInteractive: true }
     });
-    expect(codexTabInitialInput("session", " 019e2c73-53ab-79f1-9b0c-4d63bfcfbdcd ", false, false)).toEqual({
-      resume: { mode: "session", sessionId: "019e2c73-53ab-79f1-9b0c-4d63bfcfbdcd" }
+    expect(codexTabInitialInput("session", " session-example ", false, false)).toEqual({
+      resume: { mode: "session", sessionId: "session-example" }
     });
   });
 });

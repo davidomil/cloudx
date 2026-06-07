@@ -3,12 +3,25 @@ import type { RulesSkillsStore } from "@cloudx/shared";
 
 import type { RulesSkillsCatalogService } from "../rulesSkills/RulesSkillsCatalogService.js";
 
+interface PluginContributionSet {
+  pluginIds: Set<string>;
+  rules: Array<PluginRuleContribution & { scope: "system" }>;
+  skills: Array<PluginSkillContribution & { scope: "system" }>;
+  ruleIds: Set<string>;
+  skillIds: Set<string>;
+  adoptUserRuleIds: Set<string>;
+  adoptUserSkillIds: Set<string>;
+}
+
 export async function syncPluginContributions(
   plugins: WorkspacePlugin[],
   rulesSkills: RulesSkillsCatalogService
 ): Promise<RulesSkillsStore> {
   const contributions = pluginContributions(plugins);
-  let store: RulesSkillsStore | undefined;
+  const initialStore = await rulesSkills.list();
+  await assertNoUserContributionConflicts(contributions, rulesSkills, initialStore);
+  const pruned = await pruneObsoleteSystemContributions(contributions, rulesSkills, initialStore);
+  let store: RulesSkillsStore | undefined = pruned ? undefined : initialStore;
   for (const rule of contributions.rules) {
     store = await rulesSkills.saveSystemRule(rule);
   }
@@ -18,11 +31,68 @@ export async function syncPluginContributions(
   return store ?? await rulesSkills.list();
 }
 
-function pluginContributions(plugins: WorkspacePlugin[]): { rules: PluginRuleContribution[]; skills: PluginSkillContribution[] } {
-  return {
-    rules: ownedContributions(plugins, (plugin) => plugin.ruleContributions ?? [], "rule"),
-    skills: ownedContributions(plugins, (plugin) => plugin.skillContributions ?? [], "skill")
-  };
+async function assertNoUserContributionConflicts(
+  contributions: PluginContributionSet,
+  rulesSkills: RulesSkillsCatalogService,
+  store: RulesSkillsStore
+): Promise<void> {
+  if (contributions.rules.length === 0 && contributions.skills.length === 0) {
+    return;
+  }
+  const userRuleIds = new Set(store.rules.map((rule) => rule.id));
+  const userSkillIds = new Set(store.skills.map((skill) => skill.id));
+  const conflicts = [
+    ...contributions.rules.filter((rule) => userRuleIds.has(rule.id) && !contributions.adoptUserRuleIds.has(rule.id)).map((rule) => `rule ${rule.id}`),
+    ...contributions.skills.filter((skill) => userSkillIds.has(skill.id) && !contributions.adoptUserSkillIds.has(skill.id)).map((skill) => `skill ${skill.id}`)
+  ];
+  if (conflicts.length > 0) {
+    throw new Error(
+      `Plugin contribution ids conflict with user-defined catalog entries: ${conflicts.join(", ")}. ` +
+      "Rename or remove the user-defined entry, or change the plugin contribution id."
+    );
+  }
+  for (const rule of contributions.rules) {
+    if (userRuleIds.has(rule.id) && contributions.adoptUserRuleIds.has(rule.id)) {
+      await rulesSkills.deleteRule(rule.id);
+    }
+  }
+  for (const skill of contributions.skills) {
+    if (userSkillIds.has(skill.id) && contributions.adoptUserSkillIds.has(skill.id)) {
+      await rulesSkills.deleteSkill(skill.id);
+    }
+  }
+}
+
+async function pruneObsoleteSystemContributions(
+  contributions: PluginContributionSet,
+  rulesSkills: RulesSkillsCatalogService,
+  store: RulesSkillsStore
+): Promise<boolean> {
+  let pruned = false;
+  for (const rule of store.systemRules) {
+    if (isOwnedBySyncedPlugin(rule.id, contributions.pluginIds) && !contributions.ruleIds.has(rule.id)) {
+      await rulesSkills.deleteSystemRule(rule.id);
+      pruned = true;
+    }
+  }
+  for (const skill of store.systemSkills) {
+    if (isOwnedBySyncedPlugin(skill.id, contributions.pluginIds) && !contributions.skillIds.has(skill.id)) {
+      await rulesSkills.deleteSystemSkill(skill.id);
+      pruned = true;
+    }
+  }
+  return pruned;
+}
+
+function pluginContributions(plugins: WorkspacePlugin[]): PluginContributionSet {
+  const pluginIds = new Set(plugins.map((plugin) => plugin.id));
+  const rules = ownedContributions(plugins, (plugin) => plugin.ruleContributions ?? [], "rule");
+  const skills = ownedContributions(plugins, (plugin) => plugin.skillContributions ?? [], "skill");
+  const ruleIds = new Set(rules.map((rule) => rule.id));
+  const skillIds = new Set(skills.map((skill) => skill.id));
+  const adoptUserRuleIds = adoptedIds(plugins, "adoptUserRuleContributionIds", ruleIds, "rule");
+  const adoptUserSkillIds = adoptedIds(plugins, "adoptUserSkillContributionIds", skillIds, "skill");
+  return { pluginIds, rules, skills, ruleIds, skillIds, adoptUserRuleIds, adoptUserSkillIds };
 }
 
 function ownedContributions<T extends { id: string }>(
@@ -46,4 +116,35 @@ function ownedContributions<T extends { id: string }>(
     }
   }
   return contributions;
+}
+
+function adoptedIds(
+  plugins: WorkspacePlugin[],
+  property: "adoptUserRuleContributionIds" | "adoptUserSkillContributionIds",
+  contributedIds: Set<string>,
+  label: "rule" | "skill"
+): Set<string> {
+  const ids = new Set<string>();
+  for (const plugin of plugins) {
+    const declared = plugin[property] ?? [];
+    for (const id of declared) {
+      if (!id.startsWith(`${plugin.id}-`)) {
+        throw new Error(`Plugin ${plugin.id} adopted user ${label} contribution must use the plugin id prefix: ${id}`);
+      }
+      if (!contributedIds.has(id)) {
+        throw new Error(`Plugin ${plugin.id} adopted user ${label} contribution is not contributed by the plugin: ${id}`);
+      }
+      ids.add(id);
+    }
+  }
+  return ids;
+}
+
+function isOwnedBySyncedPlugin(id: string, pluginIds: Set<string>): boolean {
+  for (const pluginId of pluginIds) {
+    if (id.startsWith(`${pluginId}-`)) {
+      return true;
+    }
+  }
+  return false;
 }

@@ -1,10 +1,15 @@
 import type { CreatePluginSessionInput, HookDefinition, JsonSchemaLike, PluginRuleContribution, PluginSession, PluginSessionSnapshot, PluginSkillContribution, PluginVoiceContext, WorkspacePlugin } from "@cloudx/plugin-api";
-import type { WorkspaceTab } from "@cloudx/shared";
+import type { ConfigFieldDescriptor, WorkspaceTab } from "@cloudx/shared";
 
 import type { DocumentationClient } from "../documentation/DocumentationClient.js";
+import {
+  DEFAULT_DOCUMENTATION_ENRICHMENT_SKILL_IDS,
+  DOCUMENTATION_AI_ENRICHMENT_ENABLED_KEY,
+  DOCUMENTATION_AI_ENRICHMENT_SKILLS_KEY,
+  DOCUMENTATION_PLUGIN_ID,
+  type DocumentationEnrichmentService
+} from "../documentation/DocumentationEnrichmentService.js";
 import type { PathPolicy } from "../pathPolicy.js";
-
-export const DOCUMENTATION_PLUGIN_ID = "documentation";
 
 export class DocumentationPlugin implements WorkspacePlugin {
   readonly id = DOCUMENTATION_PLUGIN_ID;
@@ -15,7 +20,29 @@ export class DocumentationPlugin implements WorkspacePlugin {
   readonly creatable = true;
   readonly requiresDirectory = false;
   readonly actions = [];
-  readonly configFields = [];
+  readonly configFields: ConfigFieldDescriptor[] = [
+    {
+      key: DOCUMENTATION_AI_ENRICHMENT_ENABLED_KEY,
+      label: "AI enrichment",
+      type: "boolean",
+      description: "Use the configured CloudX AI model to improve documentation imports after the source extraction completes.",
+      defaultValue: true
+    },
+    {
+      key: DOCUMENTATION_AI_ENRICHMENT_SKILLS_KEY,
+      label: "AI enrichment skills",
+      type: "string",
+      description: "Comma-separated CloudX skill ids that define how imported documentation should be improved.",
+      defaultValue: DEFAULT_DOCUMENTATION_ENRICHMENT_SKILL_IDS.join(",")
+    }
+  ];
+  readonly adoptUserRuleContributionIds = ["documentation-ingest-evidence"];
+  readonly adoptUserSkillContributionIds = [
+    "documentation-search",
+    "documentation-ingest",
+    "documentation-invalidate",
+    "documentation-archive-control"
+  ];
   readonly ruleContributions = defaultDocumentationRules();
   readonly skillContributions = defaultDocumentationSkills();
   readonly hooks: HookDefinition[];
@@ -32,7 +59,8 @@ export class DocumentationPlugin implements WorkspacePlugin {
 
   constructor(
     private readonly client: DocumentationClient,
-    private readonly pathPolicy: PathPolicy
+    private readonly pathPolicy: PathPolicy,
+    private readonly enrichmentProvider: () => DocumentationEnrichmentService | undefined = () => undefined
   ) {
     this.hooks = [
       readHook("documentation.health", "Documentation Health", "Return documentation indexer health.", () => this.client.health()),
@@ -52,9 +80,24 @@ export class DocumentationPlugin implements WorkspacePlugin {
         collection: { type: "string" },
         mode: { type: "string", enum: ["hybrid", "dense", "lexical"] }
       }, ["query"], ["plugin", "ui", "http", "automation", "voice"]),
+      readHook("documentation.answer", "Answer Documentation Question", "Use AI assistance to answer a question from source-grounded documentation search results.", (input) => {
+        const service = this.enrichmentProvider();
+        if (!service) {
+          throw new Error("Documentation AI assistance is not available. Use documentation.search for manual source-text search.");
+        }
+        return service.answerQuestion(input);
+      }, {
+        question: { type: "string" },
+        query: { type: "string" },
+        limit: { type: "number" },
+        states: { type: "array", items: { type: "string" } },
+        sourceTypes: { type: "array", items: { type: "string" } },
+        collection: { type: "string" },
+        mode: { type: "string", enum: ["hybrid", "dense", "lexical"] }
+      }, ["question"], ["ui", "http"]),
       writeHook("documentation.ingest.path", "Ingest Documentation Path", "Ingest a local file or directory under configured allowed roots.", async (input) => {
         const path = this.pathPolicy.resolve(requireString(input.path, "path"));
-        return this.client.ingestPath({ ...input, path });
+        return this.enrich(await this.client.ingestPath({ ...input, path }));
       }, {
         path: { type: "string" },
         title: { type: "string" },
@@ -62,7 +105,7 @@ export class DocumentationPlugin implements WorkspacePlugin {
         collection: { type: "string" },
         tags: { type: "array", items: { type: "string" } }
       }, ["path"]),
-      externalHook("documentation.ingest.url", "Ingest Documentation URL", "Download or transcript-ingest a URL source.", (input) => this.client.ingestUrl(input), {
+      externalHook("documentation.ingest.url", "Ingest Documentation URL", "Download a URL source, ingest a YouTube video with transcript and keyframes, or ingest every video in a YouTube playlist.", async (input) => this.enrich(await this.client.ingestUrl(input)), {
         url: { type: "string" },
         title: { type: "string" },
         sourceType: { type: "string" },
@@ -70,14 +113,14 @@ export class DocumentationPlugin implements WorkspacePlugin {
         tags: { type: "array", items: { type: "string" } },
         transcript: { type: "string" }
       }, ["url"]),
-      writeHook("documentation.ingest.text", "Ingest Documentation Text", "Ingest direct text, transcript, or copied source material.", (input) => this.client.ingestText(input), {
+      writeHook("documentation.ingest.text", "Ingest Documentation Text", "Ingest direct text, transcript, or copied source material.", async (input) => this.enrich(await this.client.ingestText(input)), {
         title: { type: "string" },
         text: { type: "string" },
         uri: { type: "string" },
         sourceType: { type: "string" },
         collection: { type: "string" },
         tags: { type: "array", items: { type: "string" } }
-      }, ["title", "text", "uri", "sourceType"]),
+      }, ["text"]),
       writeHook("documentation.invalidate", "Invalidate Documentation", "Mark a document stale, revoked, superseded, quarantined, or deleted.", (input) => this.client.invalidate(input), {
         documentId: { type: "string" },
         state: { type: "string", enum: ["stale", "revoked", "superseded", "quarantined", "deleted"] },
@@ -108,6 +151,10 @@ export class DocumentationPlugin implements WorkspacePlugin {
 
   createSession(input: CreatePluginSessionInput): PluginSession {
     return new DocumentationSession(input.tab);
+  }
+
+  private enrich(response: Record<string, unknown>): Promise<Record<string, unknown>> | Record<string, unknown> {
+    return this.enrichmentProvider()?.enrichIngestResponse(response) ?? response;
   }
 }
 
@@ -207,23 +254,32 @@ function defaultDocumentationSkills(): PluginSkillContribution[] {
     {
       id: "documentation-search",
       name: "Documentation Search",
-      description: "Search the local CloudX documentation archive and use active source-grounded results.",
+      description: "Mandatory local-first lookup for factual, research, recipe, troubleshooting, and source-grounded answer tasks; enrich the archive from reliable online sources when local evidence is missing.",
       instructions: skillInstructions("Search", [
         "Read `CLOUDX_DOCUMENTATION_URL`. If it is missing, stop and explain that the documentation indexer URL is not available.",
-        "Call `POST $CLOUDX_DOCUMENTATION_URL/search` with JSON containing `query`, optional `limit`, and optional filters.",
+        "Before answering any factual, research, recipe, recommendation, troubleshooting, summary, or source-grounded question, run local archive search first even when the question looks general or answerable from memory.",
+        "Call `POST $CLOUDX_DOCUMENTATION_URL/search` with JSON containing `query`, `mode: \"hybrid\"`, optional `limit`, and optional filters. Use the user's exact topic as the first query, then broaden or narrow only after seeing local results.",
+        "When Codex is answering the user, use this direct search path instead of `documentation.answer`; Codex should inspect sources itself rather than chaining through another AI answer pass.",
+        "Open the strongest matching documents with `GET $CLOUDX_DOCUMENTATION_URL/documents/{documentId}` and read relevant chunks, transcripts, tables, descriptions, and artifact metadata before answering.",
         "Use only results whose `state` is `active` unless the user explicitly asks for stale, revoked, deleted, or audit history.",
+        "If active local results are absent, weak, stale, or do not cover the user's question, use built-in web search before answering. Prefer official product/project documentation, vendor datasheets, standards/specs, peer-reviewed or government/institutional sources for high-stakes domains, and reputable news sources for current events. Avoid forum or blog claims unless they are explicitly requested or corroborated by stronger sources.",
+        "Ingest reliable online sources that materially answer the question with `/ingest/url` whenever the source has a stable URL; use `/ingest/text` only for source text that cannot be downloaded directly. Preserve title, URI, source type, and collection metadata.",
+        "After ingesting web sources, rerun local archive search and answer from the local documentation records. If no reliable source can be ingested, say so and answer only with the evidence that was actually inspected.",
         "When writing, carry forward each result's title, source type, locator, URI, and content SHA."
       ])
     },
     {
       id: "documentation-ingest",
       name: "Documentation Ingest",
-      description: "Add uploaded files, local files, directories, websites, copied text, or transcripts to the documentation archive.",
+      description: "Add uploaded files, local files, directories, websites, YouTube videos/playlists, copied text, or transcripts to the documentation archive.",
       instructions: skillInstructions("Ingest", [
         "Read `CLOUDX_DOCUMENTATION_URL`. If it is missing, stop and explain that the documentation indexer URL is not available.",
-        "Use multipart `/ingest/upload` for file bytes, `/ingest/path` for local files or directories already visible to the indexer, `/ingest/url` for websites or URLs, and `/ingest/text` for copied text or video transcripts.",
+        "Use multipart `/ingest/upload` for file bytes, `/ingest/path` for local files or directories already visible to the indexer, `/ingest/url` for websites, URLs, YouTube videos, and YouTube playlists, and `/ingest/text` for copied text or manual transcripts.",
         "Set `sourceType` to one of `datasheet`, `book`, `website`, `repo_code`, `readme`, `media`, `image`, or `text` when the user gives enough context.",
-        "Do not ingest outdated or untrusted material silently. Mark the source title and URI precisely."
+        "Leave `title` and `collection` blank when the indexer should autodetect them from the file, folder, URL, playlist, upload, or first text line.",
+        "When ingesting sources found online, prefer durable primary URLs and include the original source URL. Do not ingest search-result pages, low-trust mirrors, or unsupported summaries when a better source is available.",
+        "When AI enrichment is disabled, only source text and extracted artifact metadata are immediately searchable. Do manual follow-up by searching, opening full documents, reading transcript chunks or table artifacts, and writing source-grounded notes yourself.",
+        "Do not ingest outdated or untrusted material silently. Preserve precise source URI metadata whenever the user provides it."
       ])
     },
     {
@@ -235,6 +291,39 @@ function defaultDocumentationSkills(): PluginSkillContribution[] {
         "Find the target document with `/search` or `/documents` before invalidating it.",
         "Call `/invalidate` with `documentId`, `state`, and a concrete `reason`.",
         "Use `stale` for outdated sources, `revoked` for wrong sources, `superseded` for replaced revisions, `quarantined` for trust or extraction concerns, and `deleted` for removal."
+      ])
+    },
+    {
+      id: "documentation-enrich-metadata",
+      name: "Documentation Enrich Metadata",
+      description: "Derive source-grounded metadata and searchable import-improvement notes for newly ingested documentation.",
+      instructions: skillInstructions("Enrich Metadata", [
+        "Read the provided document title, URI, source type, collection, chunks, and artifact manifest before producing output.",
+        "Identify source-grounded title, collection, tags, product names, versions, dates, authors, and section names that the importer may not have captured.",
+        "Write concise derived spans using locators that start with `ai:metadata`; include only facts visible in the evidence.",
+        "When metadata is ambiguous or absent, put the uncertainty in `warnings` instead of inventing a value."
+      ])
+    },
+    {
+      id: "documentation-enrich-visuals",
+      name: "Documentation Enrich Visuals",
+      description: "Improve imports by describing extracted tables, graphs, diagrams, screenshots, and flowcharts.",
+      instructions: skillInstructions("Enrich Visuals", [
+        "Use extracted table files, figure indexes, image metadata, keyframe paths, and surrounding chunks as the visual evidence.",
+        "Describe tables, graphs, flowcharts, block diagrams, screenshots, and visible labels in short searchable spans with locators that start with `ai:visual`.",
+        "Call out where the current extraction looks incomplete, such as cropped figures, missing axis labels, unreadable callouts, or tables that need manual review.",
+        "Do not infer visual details unless they are present in artifact previews, filenames, nearby text, or keyframe evidence."
+      ])
+    },
+    {
+      id: "documentation-enrich-media",
+      name: "Documentation Enrich Media",
+      description: "Improve media imports using transcripts and interval keyframes when they are available.",
+      instructions: skillInstructions("Enrich Media", [
+        "Use transcript text, ASR transcript evidence, and one-frame-per-second keyframe offsets to identify meaningful sections in videos or audio.",
+        "Write derived spans with locators that start with `ai:media`; include section titles, timestamps or offsets when evidence supports them, and searchable details that the transcript alone may miss.",
+        "When a YouTube playlist import contains separate documents, enrich each document independently using only that document's evidence.",
+        "Report missing audio, missing keyframes, low-confidence transcript language, or insufficient visual evidence in `warnings`."
       ])
     },
     {
@@ -256,7 +345,7 @@ function defaultDocumentationRules(): PluginRuleContribution[] {
     {
       id: "documentation-ingest-evidence",
       description: "Capture task evidence in the local documentation archive before relying on it.",
-      text: "When task evidence such as datasheets, sample code, vendor documentation, screenshots, flowcharts, API references, or local notes is needed, download or otherwise capture the source and add it to the CloudX documentation knowledge base before relying on it; preserve precise title and URI metadata and invalidate older conflicting archive records."
+      text: "Before answering any factual, research, recipe, recommendation, troubleshooting, summary, or source-grounded user question, query `POST $CLOUDX_DOCUMENTATION_URL/search` against the active CloudX documentation archive first and prefer local source-grounded evidence even when the topic seems general; if active local documentation is absent, stale, or insufficient, use reliable online sources, prioritizing official documentation, vendor/source material, standards/specs, peer-reviewed or government/institutional sources for high-stakes domains, and reputable news for current events, then add each useful online source back into the CloudX documentation knowledge base before relying on it when ingestion is possible, preserve precise title and URI metadata, rerun local search after ingestion, and invalidate older conflicting archive records."
     }
   ];
 }

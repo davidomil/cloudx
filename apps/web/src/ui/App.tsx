@@ -29,6 +29,7 @@ import {
 } from "../api.js";
 import { ControlButton } from "./Control.js";
 import { disposeFileBrowserPanelStatesExcept } from "./fileBrowserPanelState.js";
+import { disposeDocumentationIngestController, disposeDocumentationIngestControllersExcept } from "./documentationPanelQueue.js";
 import { PathEntry } from "./PathEntry.js";
 import {
   activatePane,
@@ -75,6 +76,7 @@ import { applyVoiceWorkspaceResultsToWorkspace, buildClientVoiceContext, voiceCo
 import { WebViewerPanel } from "./WebViewerPanel.js";
 import { WorktreeManagerPanel } from "./WorktreeManagerPanel.js";
 import { parseWorkspaceSocketUpdate } from "./workspaceSocketUpdate.js";
+import type { DocumentationPanelState, DocumentationPanelStateUpdater } from "./DocumentationPanel.js";
 
 type ConnectionStatus = "checking" | "connected" | "disconnected";
 
@@ -174,6 +176,7 @@ export function App() {
   const [notifications, setNotifications] = useState<CloudxNotification[]>([]);
   const [automationRuns, setAutomationRuns] = useState<AutomationRunSummary[]>([]);
   const [attentionTabIds, setAttentionTabIds] = useState<Set<string>>(() => new Set());
+  const [documentationPanelStates, setDocumentationPanelStates] = useState<Record<string, DocumentationPanelState>>({});
   const [selectedAudioInputId, setSelectedAudioInputId] = useState<string | undefined>(() => loadAudioInputId());
   const [audioInputs, setAudioInputs] = useState<MediaDeviceInfo[]>([]);
   const [audioInputMenuOpen, setAudioInputMenuOpen] = useState(false);
@@ -251,6 +254,14 @@ export function App() {
   }, [tabs]);
 
   useEffect(() => {
+    const tabIds = new Set(tabs.map((tab) => tab.id));
+    setDocumentationPanelStates((current) => {
+      const next = Object.fromEntries(Object.entries(current).filter(([tabId]) => tabIds.has(tabId)));
+      return Object.keys(next).length === Object.keys(current).length ? current : next;
+    });
+  }, [tabs]);
+
+  useEffect(() => {
     windowsRef.current = windows;
   }, [windows]);
 
@@ -296,6 +307,7 @@ export function App() {
     const tabIds = new Set(tabs.map((tab) => tab.id));
     disposeTerminalViewsExcept(tabIds);
     disposeFileBrowserPanelStatesExcept(tabIds);
+    disposeDocumentationIngestControllersExcept(tabIds);
   }, [tabs]);
 
   useEffect(() => {
@@ -553,6 +565,8 @@ export function App() {
       activeTabIdRef.current = result.activeTabId;
       setActiveTabId(result.activeTabId);
       disposeTerminalView(tabId);
+      disposeDocumentationIngestController(tabId);
+      setDocumentationPanelStates((current) => omitRecordKey(current, tabId));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -807,6 +821,10 @@ export function App() {
     return config?.values.plugins[pluginId] ?? {};
   }
 
+  function updateDocumentationPanelState(tabId: string, updater: DocumentationPanelStateUpdater) {
+    setDocumentationPanelStates((current) => ({ ...current, [tabId]: updater(current[tabId]) }));
+  }
+
   async function handleCreateWindow(name: string, defaultCwd: string, templateId?: string) {
     applyWorkspaceState(await createWindow({ name, defaultCwd, pluginMetadata: pluginMetadataForTemplate(templateId) }));
   }
@@ -998,11 +1016,21 @@ export function App() {
         onRefreshStore={handleRefreshRulesSkillsStore}
       />
     ),
-    "documentation.panel": (_contribution, context) => (
-      <Suspense fallback={<div className="empty-pane">Loading documentation...</div>}>
-        <DocumentationPanel callHook={context.callHook} />
-      </Suspense>
-    ),
+    "documentation.panel": (_contribution, context) => {
+      const tabId = context.tab?.id;
+      return (
+        <Suspense fallback={<div className="empty-pane">Loading documentation...</div>}>
+          <DocumentationPanel
+            callHook={context.callHook}
+            config={pluginConfig("documentation")}
+            globalConfig={config?.values.global}
+            stateKey={tabId}
+            state={tabId ? documentationPanelStates[tabId] : undefined}
+            onStateChange={tabId ? (updater) => updateDocumentationPanelState(tabId, updater) : undefined}
+          />
+        </Suspense>
+      );
+    },
   });
 
   function renderUiContributions(slot: UiContributionSlot, context: { tab?: WorkspaceTab; attention?: boolean } = {}): Array<ReactElement | null> {
@@ -2369,6 +2397,14 @@ export function codexTabInitialInput(
       includeNonInteractive
     }
   };
+}
+
+function omitRecordKey<T>(record: Record<string, T>, key: string): Record<string, T> {
+  if (!(key in record)) {
+    return record;
+  }
+  const { [key]: _removed, ...rest } = record;
+  return rest;
 }
 
 function defaultTabTitlePlaceholder(plugin: PluginDescriptor | undefined, cwd: string, localWebUrl: string): string {

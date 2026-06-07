@@ -59,6 +59,7 @@ describe("install-cloudx helpers", () => {
     expect(commands[1]).toContain("build-essential");
     expect(commands[1]).toContain("libreoffice");
     expect(commands[1]).toContain("poppler-utils");
+    expect(commands[1]).toContain("ffmpeg");
     expect(commands[1]).toContain("pandoc");
     expect(commands[1]).toContain("texlive-xetex");
     expect(commands).toContainEqual(["curl", "-fL", "-o", QUARTO_DEB_PATH, QUARTO_DEB_URL]);
@@ -112,7 +113,7 @@ describe("install-cloudx helpers", () => {
     expect(
       cloudxAccessUrls(3001, {
         lo: [{ family: "IPv4", internal: true, address: "127.0.0.1" }],
-        eth0: [{ family: "IPv4", internal: false, address: "192.168.8.249" }]
+        eth0: [{ family: "IPv4", internal: false, address: "192.0.2.249" }]
       })
     ).toEqual(["https://127.0.0.1:3001"]);
   });
@@ -121,10 +122,10 @@ describe("install-cloudx helpers", () => {
     expect(
       cloudxAccessUrls(3001, {
         lo: [{ family: "IPv4", internal: true, address: "127.0.0.1" }],
-        eth0: [{ family: "IPv4", internal: false, address: "192.168.8.249" }],
-        docker0: [{ family: "IPv4", internal: false, address: "172.17.0.1" }]
+        eth0: [{ family: "IPv4", internal: false, address: "192.0.2.249" }],
+        docker0: [{ family: "IPv4", internal: false, address: "198.51.100.17" }]
       }, "0.0.0.0")
-    ).toEqual(["https://127.0.0.1:3001", "https://192.168.8.249:3001", "https://172.17.0.1:3001"]);
+    ).toEqual(["https://127.0.0.1:3001", "https://192.0.2.249:3001", "https://198.51.100.17:3001"]);
     expect(shouldAdvertiseLanUrls("127.0.0.1")).toBe(false);
     expect(shouldAdvertiseLanUrls("::")).toBe(true);
     expect(networkBindWarning("0.0.0.0", 3001)).toContain("Public internet unsupported");
@@ -212,7 +213,7 @@ describe("runInstaller dry-run", () => {
         runCodexLogin: true
       },
       networkInterfaces: {
-        eth0: [{ family: "IPv4", internal: false, address: "192.168.8.249" }]
+        eth0: [{ family: "IPv4", internal: false, address: "192.0.2.249" }]
       }
     });
 
@@ -260,12 +261,12 @@ describe("runInstaller dry-run", () => {
         runCodexLogin: true
       },
       networkInterfaces: {
-        eth0: [{ family: "IPv4", internal: false, address: "192.168.8.249" }]
+        eth0: [{ family: "IPv4", internal: false, address: "192.0.2.249" }]
       }
     });
 
     expect(result.envConfig.host).toBe("0.0.0.0");
-    expect(result.urls).toEqual(["https://127.0.0.1:3001", "https://192.168.8.249:3001"]);
+    expect(result.urls).toEqual(["https://127.0.0.1:3001", "https://192.0.2.249:3001"]);
   });
 
   it("plans service install, linger, and verification when services start", async () => {
@@ -409,7 +410,7 @@ describe("runInstaller dry-run", () => {
         restartServices: true
       },
       networkInterfaces: {
-        eth0: [{ family: "IPv4", internal: false, address: "192.168.8.249" }]
+        eth0: [{ family: "IPv4", internal: false, address: "192.0.2.249" }]
       }
     });
 

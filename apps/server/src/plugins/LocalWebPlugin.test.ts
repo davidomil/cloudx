@@ -44,11 +44,11 @@ describe("LocalWebPlugin", () => {
       controls: { setTabIndicator: () => undefined, closeTab: () => undefined }
     });
 
-    expect(session.handleAction("open_url", { url: "https://192.168.1.20:8443/dashboard?token=abc" })).toMatchObject({
-      url: "https://192.168.1.20:8443/dashboard?token=abc"
+    expect(session.handleAction("open_url", { url: "https://100.64.0.20:8443/dashboard?token=abc" })).toMatchObject({
+      url: "https://100.64.0.20:8443/dashboard?token=abc"
     });
     expect(session.handleAction("get_state", {})).toMatchObject({
-      url: "https://192.168.1.20:8443/dashboard?token=abc"
+      url: "https://100.64.0.20:8443/dashboard?token=abc"
     });
     expect(session.handleAction("clear_url", {})).toEqual({});
   });
@@ -57,7 +57,7 @@ describe("LocalWebPlugin", () => {
     expect(() => normalizeLocalWebUrl("https://example.com")).toThrow(/host must be/);
     expect(() => normalizeLocalWebUrl("file:///tmp/report.html")).toThrow(/http/);
     expect(() => normalizeLocalWebUrl("https://user:pass@127.0.0.1:5173")).toThrow(/credentials/);
-    expect(() => normalizeLocalWebUrl("http://192.168.1.20:5173")).toThrow(/Plain HTTP/);
+    expect(() => normalizeLocalWebUrl("http://100.64.0.20:5173")).toThrow(/Plain HTTP/);
   });
 
   it("rejects link-local and cloud metadata IP literals", () => {
@@ -75,9 +75,9 @@ describe("LocalWebPlugin", () => {
   });
 
   it("accepts local HTTPS hostnames for LAN and tailnet dashboards", () => {
-    expect(normalizeLocalWebUrl("https://192.168.1.20:8443/dashboard")).toBe("https://192.168.1.20:8443/dashboard");
+    expect(normalizeLocalWebUrl("https://100.64.0.20:8443/dashboard")).toBe("https://100.64.0.20:8443/dashboard");
     expect(normalizeLocalWebUrl("https://[fd00::1]:8443/dashboard")).toBe("https://[fd00::1]:8443/dashboard");
-    expect(normalizeLocalWebUrl("https://[::ffff:192.168.1.20]:8443/dashboard")).toBe("https://[::ffff:c0a8:114]:8443/dashboard");
+    expect(normalizeLocalWebUrl("https://[::ffff:100.64.0.20]:8443/dashboard")).toBe("https://[::ffff:6440:14]:8443/dashboard");
     expect(normalizeLocalWebUrl("https://devbox.local:5173/?token=host")).toBe("https://devbox.local:5173/?token=host");
     expect(normalizeLocalWebUrl("https://cloudx.tailnet.ts.net:5173/?token=tailnet")).toBe("https://cloudx.tailnet.ts.net:5173/?token=tailnet");
   });

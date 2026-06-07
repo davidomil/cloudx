@@ -7,7 +7,7 @@ Archive indexer.
 
 | File | Keep? | Value |
 |---|---:|---|
-| `run_validation.py` | Yes | Builds a mixed corpus from public web/PDF sources plus generated mock records, ingests it into a temporary archive, checks hybrid/lexical/dense recall, verifies invalidation, rebuilds the index, and counts extracted PDF table/figure artifacts. |
+| `run_validation.py` | Yes | Builds a mixed corpus from public web/PDF sources, the kernel.org Linux virtual memory manager book, optional live YouTube transcripts and keyframes, plus generated mock records; ingests it into a temporary archive, checks hybrid/lexical/dense recall, verifies invalidation, rebuilds the index, and counts extracted PDF table/figure/media artifacts. |
 
 The runner writes all downloaded corpus files, archive files, and summaries
 under `--root`, which defaults to `/tmp/cloudx-documentation-validation`.
@@ -36,3 +36,18 @@ PYTHONPATH=services/documentation-indexer/src \
 When public sources are unavailable or `--skip-download` is used against a clean
 root, source-specific checks are reported as skipped. The mock-corpus and
 invalidation checks still run.
+
+Run live YouTube transcript and keyframe validation too:
+
+```bash
+PYTHONPATH=services/documentation-indexer/src \
+  services/documentation-indexer/.venv/bin/python \
+  debug_tooling/documentation-validation/run_validation.py \
+  --root /tmp/cloudx-documentation-validation --mock-count 2500 \
+  --include-youtube
+```
+
+`--include-youtube` ingests a real recipe video and a real Linux
+memory-management presentation with transcript, metadata, and one PNG keyframe
+per second. Keep it opt-in because YouTube caption availability, media access,
+rate limits, and FFmpeg runtime are external state.

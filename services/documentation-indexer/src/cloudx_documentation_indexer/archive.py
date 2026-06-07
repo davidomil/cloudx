@@ -4,11 +4,16 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
+import threading
 import time
+from collections.abc import Mapping
 from importlib.metadata import version
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -21,6 +26,11 @@ try:
     from youtube_transcript_api import YouTubeTranscriptApi
 except Exception:  # pragma: no cover - import errors should surface only when YouTube fetch is requested.
     YouTubeTranscriptApi = None
+
+try:
+    import yt_dlp
+except Exception:  # pragma: no cover - import errors should surface only when playlist ingest is requested.
+    yt_dlp = None
 
 
 ARCHIVE_SCHEMA_VERSION = 1
@@ -37,6 +47,8 @@ IDENTIFIER_TERM_MATCH_BONUS = 4.0
 MAX_URL_INGEST_BYTES = 256 * 1024 * 1024
 ACTIVE_STATE = "active"
 EXCLUDED_STATES = {"stale", "superseded", "revoked", "quarantined", "deleted"}
+
+
 @dataclass(frozen=True)
 class IngestedDocument:
     document_id: str
@@ -57,6 +69,34 @@ class IngestedDocument:
         }
 
 
+@dataclass(frozen=True)
+class YouTubePlaylistEntry:
+    title: str
+    video_id: str
+    url: str
+
+
+@dataclass(frozen=True)
+class YouTubePlaylist:
+    title: str
+    entries: list[YouTubePlaylistEntry]
+
+
+@dataclass(frozen=True)
+class YouTubeVideoMetadata:
+    title: str
+    webpage_url: str
+    stream_url: str
+    http_headers: dict[str, str]
+    duration: int | None = None
+    uploader: str | None = None
+    upload_date: str | None = None
+    description: str | None = None
+    thumbnail: str | None = None
+    tags: list[str] | None = None
+    chapters: list[dict[str, Any]] | None = None
+
+
 class DocumentationArchive:
     def __init__(self, root: Path | str):
         self.root = Path(root).resolve()
@@ -65,6 +105,7 @@ class DocumentationArchive:
         self.db_path = self.root / "catalog.sqlite"
         self.index_path = self.index_dir / "chunks.tvim"
         self.manifest_path = self.index_dir / "manifest.json"
+        self._write_lock = threading.RLock()
         self.root.mkdir(parents=True, exist_ok=True)
         self.snapshots_dir.mkdir(parents=True, exist_ok=True)
         self.index_dir.mkdir(parents=True, exist_ok=True)
@@ -145,7 +186,11 @@ class DocumentationArchive:
             if not document:
                 raise ArchiveError(f"Unknown document: {document_id}")
             chunks = db.execute(
-                "SELECT chunk_id, locator, text, state FROM chunks WHERE document_id = ? ORDER BY chunk_id",
+                "SELECT chunk_id, locator, text, state, chunk_origin, enrichment_id FROM chunks WHERE document_id = ? ORDER BY chunk_id",
+                (document_id,),
+            ).fetchall()
+            enrichments = db.execute(
+                "SELECT * FROM document_enrichments WHERE document_id = ? ORDER BY enrichment_id DESC",
                 (document_id,),
             ).fetchall()
             events = db.execute(
@@ -154,6 +199,7 @@ class DocumentationArchive:
             ).fetchall()
         result = dict(document)
         result["chunks"] = [dict(row) for row in chunks]
+        result["enrichments"] = [dict(row) for row in enrichments]
         result["events"] = [dict(row) for row in events]
         return result
 
@@ -170,6 +216,7 @@ class DocumentationArchive:
         if not path.exists():
             raise ArchiveError(f"Path does not exist: {path}")
         if path.is_dir():
+            detected_collection = autodetect_collection(collection, path=path)
             documents = []
             for file_path in sorted(path.rglob("*")):
                 if file_path.is_file() and file_path.suffix.lower() in SUPPORTED_FILE_SUFFIXES:
@@ -178,7 +225,7 @@ class DocumentationArchive:
                             file_path,
                             title=None,
                             source_type=source_type,
-                            collection=collection,
+                            collection=detected_collection,
                             tags=tags,
                         )
                     )
@@ -187,21 +234,37 @@ class DocumentationArchive:
             return documents
         source_bytes = path.read_bytes()
         inferred_type = source_type or infer_source_type(path.name, None)
-        document_title = title or path.name
-        snapshot_path = self._store_snapshot(source_bytes, path.name)
-        spans = extract_file(path, source_bytes, inferred_type, snapshot_path.parent / "extracted")
-        return [
-            self._write_document(
-                title=document_title,
-                source_type=inferred_type,
-                uri=str(path),
-                snapshot_path=snapshot_path,
-                content_bytes=source_bytes,
-                spans=spans,
-                collection=collection,
-                tags=tags,
-            )
-        ]
+        document_title = autodetect_title(title, path=path)
+        document_collection = autodetect_collection(collection, path=path)
+        with self._write_lock:
+            snapshot_path = self._store_snapshot(source_bytes, path.name)
+            spans = extract_file(path, source_bytes, inferred_type, snapshot_path.parent / "extracted")
+            return [
+                self._write_document(
+                    title=document_title,
+                    source_type=inferred_type,
+                    uri=str(path),
+                    snapshot_path=snapshot_path,
+                    content_bytes=source_bytes,
+                    spans=spans,
+                    collection=document_collection,
+                    tags=tags,
+                )
+            ]
+
+    def ingest_url_documents(
+        self,
+        url: str,
+        *,
+        title: str | None = None,
+        source_type: str | None = None,
+        collection: str | None = None,
+        tags: list[str] | None = None,
+        transcript: str | None = None,
+    ) -> list[IngestedDocument]:
+        if transcript is None and is_youtube_playlist_url(url):
+            return self.ingest_youtube_playlist(url, title=title, source_type=source_type, collection=collection, tags=tags)
+        return [self.ingest_url(url, title=title, source_type=source_type, collection=collection, tags=tags, transcript=transcript)]
 
     def ingest_url(
         self,
@@ -215,47 +278,113 @@ class DocumentationArchive:
     ) -> IngestedDocument:
         if transcript is not None:
             return self.ingest_text(
-                title=title or url,
+                title=autodetect_title(title, url=url, text=transcript),
                 text=transcript,
                 source_type=source_type or "media",
                 uri=url,
-                collection=collection,
+                collection=autodetect_collection(collection, url=url, source_type=source_type or "media"),
                 tags=tags,
             )
         if (source_type or "").lower() == "media" or is_youtube_url(url):
-            return self.ingest_text(
-                title=title or url,
-                text=fetch_youtube_transcript(url),
-                source_type="media",
-                uri=url,
-                collection=collection,
-                tags=tags,
-            )
+            return self.ingest_youtube_video(url, title=title, collection=collection, tags=tags)
         response, source_bytes = fetch_url_bytes(url, MAX_URL_INGEST_BYTES)
         content_type = response.headers.get("content-type")
         inferred_type = source_type or infer_source_type(url, content_type)
-        snapshot_path = self._store_snapshot(
-            source_bytes,
-            safe_file_name(urlparse(str(response.url)).path.rsplit("/", 1)[-1] or "downloaded-source"),
-            metadata={
-                "url": url,
-                "finalUrl": str(response.url),
-                "contentType": content_type,
-                "etag": response.headers.get("etag"),
-                "lastModified": response.headers.get("last-modified"),
-            },
-        )
-        spans = extract_bytes(source_bytes, url, inferred_type, content_type, snapshot_path.parent / "extracted")
-        return self._write_document(
-            title=title or title_from_url(url),
-            source_type=inferred_type,
-            uri=url,
-            snapshot_path=snapshot_path,
-            content_bytes=source_bytes,
-            spans=spans,
-            collection=collection,
-            tags=tags,
-        )
+        with self._write_lock:
+            snapshot_path = self._store_snapshot(
+                source_bytes,
+                safe_file_name(urlparse(str(response.url)).path.rsplit("/", 1)[-1] or "downloaded-source"),
+                metadata={
+                    "url": url,
+                    "finalUrl": str(response.url),
+                    "contentType": content_type,
+                    "etag": response.headers.get("etag"),
+                    "lastModified": response.headers.get("last-modified"),
+                },
+            )
+            spans = extract_bytes(source_bytes, url, inferred_type, content_type, snapshot_path.parent / "extracted")
+            return self._write_document(
+                title=autodetect_title(title, url=url),
+                source_type=inferred_type,
+                uri=url,
+                snapshot_path=snapshot_path,
+                content_bytes=source_bytes,
+                spans=spans,
+                collection=autodetect_collection(collection, url=url, source_type=inferred_type),
+                tags=tags,
+            )
+
+    def ingest_youtube_playlist(
+        self,
+        url: str,
+        *,
+        title: str | None = None,
+        source_type: str | None = None,
+        collection: str | None = None,
+        tags: list[str] | None = None,
+    ) -> list[IngestedDocument]:
+        playlist = extract_youtube_playlist(url)
+        playlist_title = optional_text(title) or playlist.title
+        playlist_collection = autodetect_collection(collection, playlist_title=playlist_title, url=url, source_type=source_type or "media")
+        documents: list[IngestedDocument] = []
+        try:
+            for entry in playlist.entries:
+                documents.append(
+                    self.ingest_youtube_video(
+                        entry.url,
+                        title=entry.title,
+                        collection=playlist_collection,
+                        tags=tags,
+                    )
+                )
+        except Exception:
+            for document in documents:
+                self.invalidate_document(document.document_id, state="deleted", reason="Rolled back incomplete YouTube playlist ingest.")
+            raise
+        return documents
+
+    def ingest_youtube_video(
+        self,
+        url: str,
+        *,
+        title: str | None = None,
+        collection: str | None = None,
+        tags: list[str] | None = None,
+    ) -> IngestedDocument:
+        transcript = fetch_youtube_transcript(url)
+        metadata = extract_youtube_video_metadata(url)
+        document_title = autodetect_title(title or metadata.title, url=url, text=transcript)
+        source_text = youtube_source_text(metadata, transcript)
+        source_bytes = source_text.encode("utf-8")
+        with self._write_lock:
+            snapshot_path = self._store_snapshot(
+                source_bytes,
+                safe_file_name(document_title) + ".youtube.txt",
+                metadata={
+                    "url": url,
+                    "sourceType": "media",
+                    "youtube": youtube_metadata_json(metadata),
+                },
+            )
+            artifact_dir = snapshot_path.parent / "extracted"
+            reset_directory(artifact_dir)
+            keyframes = capture_youtube_keyframes(metadata, artifact_dir)
+            spans = [
+                ExtractedSpan(youtube_metadata_span(metadata), "media metadata"),
+                *youtube_description_spans(metadata),
+                ExtractedSpan(transcript, "transcript"),
+                ExtractedSpan(youtube_keyframe_span(keyframes), "media keyframes"),
+            ]
+            return self._write_document(
+                title=document_title,
+                source_type="media",
+                uri=url,
+                snapshot_path=snapshot_path,
+                content_bytes=source_bytes,
+                spans=spans,
+                collection=autodetect_collection(collection, url=url, source_type="media"),
+                tags=tags,
+            )
 
     def ingest_upload(
         self,
@@ -272,34 +401,37 @@ class DocumentationArchive:
             raise ArchiveError("Uploaded source is empty.")
         safe_name = safe_file_name(filename or title or "uploaded-source")
         inferred_type = source_type or infer_source_type(safe_name, content_type)
-        snapshot_path = self._store_snapshot(
-            content,
-            safe_name,
-            metadata={
-                "filename": filename,
-                "contentType": content_type,
-                "upload": True,
-            },
-        )
-        spans = extract_bytes(content, safe_name, inferred_type, content_type, snapshot_path.parent / "extracted")
-        return self._write_document(
-            title=title or filename or safe_name,
-            source_type=inferred_type,
-            uri=f"upload://{safe_name}",
-            snapshot_path=snapshot_path,
-            content_bytes=content,
-            spans=spans,
-            collection=collection,
-            tags=tags,
-        )
+        document_title = autodetect_title(title, filename=filename or safe_name)
+        document_collection = autodetect_collection(collection, upload=True, source_type=inferred_type)
+        with self._write_lock:
+            snapshot_path = self._store_snapshot(
+                content,
+                safe_name,
+                metadata={
+                    "filename": filename,
+                    "contentType": content_type,
+                    "upload": True,
+                },
+            )
+            spans = extract_bytes(content, safe_name, inferred_type, content_type, snapshot_path.parent / "extracted")
+            return self._write_document(
+                title=document_title,
+                source_type=inferred_type,
+                uri=f"upload://{safe_name}",
+                snapshot_path=snapshot_path,
+                content_bytes=content,
+                spans=spans,
+                collection=document_collection,
+                tags=tags,
+            )
 
     def ingest_text(
         self,
         *,
-        title: str,
+        title: str | None = None,
         text: str,
-        source_type: str,
-        uri: str,
+        source_type: str | None = None,
+        uri: str | None = None,
         collection: str | None = None,
         tags: list[str] | None = None,
     ) -> IngestedDocument:
@@ -307,17 +439,22 @@ class DocumentationArchive:
         if not normalized_text:
             raise ArchiveError("Text source is empty.")
         source_bytes = normalized_text.encode("utf-8")
-        snapshot_path = self._store_snapshot(source_bytes, safe_file_name(title) + ".txt")
-        return self._write_document(
-            title=title,
-            source_type=source_type,
-            uri=uri,
-            snapshot_path=snapshot_path,
-            content_bytes=source_bytes,
-            spans=[ExtractedSpan(normalized_text, "text")],
-            collection=collection,
-            tags=tags,
-        )
+        document_title = autodetect_title(title, url=uri, text=normalized_text)
+        document_uri = optional_text(uri) or f"manual://{safe_file_name(document_title)}-{sha256_bytes(source_bytes)[:12]}"
+        inferred_type = source_type or infer_source_type(document_uri, None)
+        document_collection = autodetect_collection(collection, uri=document_uri, source_type=inferred_type)
+        with self._write_lock:
+            snapshot_path = self._store_snapshot(source_bytes, safe_file_name(document_title) + ".txt")
+            return self._write_document(
+                title=document_title,
+                source_type=inferred_type,
+                uri=document_uri,
+                snapshot_path=snapshot_path,
+                content_bytes=source_bytes,
+                spans=[ExtractedSpan(normalized_text, "text")],
+                collection=document_collection,
+                tags=tags,
+            )
 
     def search(
         self,
@@ -365,56 +502,110 @@ class DocumentationArchive:
         if not reason.strip():
             raise ArchiveError("Invalidation reason is required.")
         now = timestamp()
-        with self._connect() as db:
-            document = db.execute("SELECT state FROM documents WHERE document_id = ?", (document_id,)).fetchone()
-            if not document:
-                raise ArchiveError(f"Unknown document: {document_id}")
-            db.execute(
-                "UPDATE documents SET state = ?, updated_at = ? WHERE document_id = ?",
-                (state, now, document_id),
-            )
-            db.execute("UPDATE chunks SET state = ? WHERE document_id = ?", (state, document_id))
-            db.execute(
-                """
-                INSERT INTO invalidation_events (document_id, previous_state, next_state, reason, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (document_id, document["state"], state, reason.strip(), now),
-            )
-        self.rebuild_index()
+        with self._write_lock:
+            with self._connect() as db:
+                document = db.execute("SELECT state FROM documents WHERE document_id = ?", (document_id,)).fetchone()
+                if not document:
+                    raise ArchiveError(f"Unknown document: {document_id}")
+                db.execute(
+                    "UPDATE documents SET state = ?, updated_at = ? WHERE document_id = ?",
+                    (state, now, document_id),
+                )
+                db.execute("UPDATE chunks SET state = ? WHERE document_id = ?", (state, document_id))
+                db.execute(
+                    """
+                    INSERT INTO invalidation_events (document_id, previous_state, next_state, reason, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (document_id, document["state"], state, reason.strip(), now),
+                )
+            self.rebuild_index()
+        return self.get_document(document_id)
+
+    def enrich_document(
+        self,
+        document_id: str,
+        *,
+        spans: list[ExtractedSpan],
+        model: str,
+        skill_ids: list[str],
+        summary: str = "",
+        payload: dict[str, Any] | None = None,
+    ) -> dict:
+        chunks = chunk_spans(spans)
+        if not chunks:
+            raise ArchiveError("Enrichment did not produce extractable text.")
+        normalized_model = optional_text(model)
+        if not normalized_model:
+            raise ArchiveError("Enrichment model is required.")
+        now = timestamp()
+        with self._write_lock:
+            with self._connect() as db:
+                document = db.execute("SELECT state FROM documents WHERE document_id = ?", (document_id,)).fetchone()
+                if not document:
+                    raise ArchiveError(f"Unknown document: {document_id}")
+                if document["state"] != ACTIVE_STATE:
+                    raise ArchiveError("Only active documents can be enriched.")
+                db.execute("DELETE FROM chunks WHERE document_id = ? AND chunk_origin = ?", (document_id, "ai"))
+                cursor = db.execute(
+                    """
+                    INSERT INTO document_enrichments (document_id, model, skill_ids_json, summary, payload_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        document_id,
+                        normalized_model,
+                        json.dumps([skill_id for skill_id in skill_ids if optional_text(skill_id)]),
+                        summary.strip(),
+                        json.dumps(payload or {}, sort_keys=True),
+                        now,
+                    ),
+                )
+                enrichment_id = int(cursor.lastrowid)
+                for locator, text in chunks:
+                    db.execute(
+                        """
+                        INSERT INTO chunks (document_id, locator, text, state, chunk_origin, enrichment_id)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (document_id, locator, text, ACTIVE_STATE, "ai", enrichment_id),
+                    )
+                db.execute("UPDATE documents SET updated_at = ? WHERE document_id = ?", (now, document_id))
+            self.rebuild_index()
         return self.get_document(document_id)
 
     def remove_document(self, document_id: str, *, reason: str = "Removed by user.") -> dict:
         return self.invalidate_document(document_id, state="deleted", reason=reason)
 
     def rebuild_index(self) -> dict:
-        with self._connect() as db:
-            rows = db.execute(
-                "SELECT chunk_id, text FROM chunks WHERE state = ? ORDER BY chunk_id",
-                (ACTIVE_STATE,),
-            ).fetchall()
-        index = IdMapIndex(dim=EMBEDDING_DIM, bit_width=TURBOVEC_BIT_WIDTH)
-        if rows:
-            vectors = np.vstack([embed_text(row["text"]) for row in rows]).astype(np.float32)
-            ids = np.array([row["chunk_id"] for row in rows], dtype=np.uint64)
-            index.add_with_ids(vectors, ids)
-        tmp_path = self.index_path.with_suffix(".tvim.tmp")
-        index.write(str(tmp_path))
-        os.replace(tmp_path, self.index_path)
-        manifest = {
-            "schemaVersion": ARCHIVE_SCHEMA_VERSION,
-            "embeddingProfileId": EMBEDDING_PROFILE_ID,
-            "embeddingDimension": EMBEDDING_DIM,
-            "turbovecBitWidth": TURBOVEC_BIT_WIDTH,
-            "turbovecDistribution": TURBOVEC_DISTRIBUTION,
-            "turbovecVersion": TURBOVEC_VERSION,
-            "turbovecIndexFormat": TURBOVEC_INDEX_FORMAT,
-            "denseOnlyMinScore": DENSE_ONLY_MIN_SCORE,
-            "activeChunkCount": len(rows),
-            "rebuiltAt": timestamp(),
-        }
-        self.manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        return manifest
+        with self._write_lock:
+            with self._connect() as db:
+                rows = db.execute(
+                    "SELECT chunk_id, text FROM chunks WHERE state = ? ORDER BY chunk_id",
+                    (ACTIVE_STATE,),
+                ).fetchall()
+            index = IdMapIndex(dim=EMBEDDING_DIM, bit_width=TURBOVEC_BIT_WIDTH)
+            if rows:
+                vectors = np.vstack([embed_text(row["text"]) for row in rows]).astype(np.float32)
+                ids = np.array([row["chunk_id"] for row in rows], dtype=np.uint64)
+                index.add_with_ids(vectors, ids)
+            tmp_path = self.index_path.with_suffix(".tvim.tmp")
+            index.write(str(tmp_path))
+            os.replace(tmp_path, self.index_path)
+            manifest = {
+                "schemaVersion": ARCHIVE_SCHEMA_VERSION,
+                "embeddingProfileId": EMBEDDING_PROFILE_ID,
+                "embeddingDimension": EMBEDDING_DIM,
+                "turbovecBitWidth": TURBOVEC_BIT_WIDTH,
+                "turbovecDistribution": TURBOVEC_DISTRIBUTION,
+                "turbovecVersion": TURBOVEC_VERSION,
+                "turbovecIndexFormat": TURBOVEC_INDEX_FORMAT,
+                "denseOnlyMinScore": DENSE_ONLY_MIN_SCORE,
+                "activeChunkCount": len(rows),
+                "rebuiltAt": timestamp(),
+            }
+            self.manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            return manifest
 
     def _write_document(
         self,
@@ -428,78 +619,82 @@ class DocumentationArchive:
         collection: str | None,
         tags: list[str] | None,
     ) -> IngestedDocument:
-        chunks = chunk_spans(spans)
-        if not chunks:
-            raise ArchiveError("No extractable text was found.")
-        content_sha256 = sha256_bytes(content_bytes)
-        document_id = "doc_" + sha256_bytes(f"{uri}\0{content_sha256}".encode("utf-8"))[:24]
-        now = timestamp()
-        with self._connect() as db:
-            existing = db.execute("SELECT document_id FROM documents WHERE document_id = ?", (document_id,)).fetchone()
-            superseded_documents = db.execute(
-                "SELECT document_id, state FROM documents WHERE uri = ? AND document_id != ? AND state = ?",
-                (uri, document_id, ACTIVE_STATE),
-            ).fetchall()
-            for superseded in superseded_documents:
-                db.execute(
-                    "UPDATE documents SET state = ?, updated_at = ? WHERE document_id = ?",
-                    ("superseded", now, superseded["document_id"]),
-                )
-                db.execute("UPDATE chunks SET state = ? WHERE document_id = ?", ("superseded", superseded["document_id"]))
+        with self._write_lock:
+            chunks = chunk_spans(spans)
+            if not chunks:
+                raise ArchiveError("No extractable text was found.")
+            content_sha256 = sha256_bytes(content_bytes)
+            document_id = "doc_" + sha256_bytes(f"{uri}\0{content_sha256}".encode("utf-8"))[:24]
+            now = timestamp()
+            with self._connect() as db:
+                existing = db.execute("SELECT document_id FROM documents WHERE document_id = ?", (document_id,)).fetchone()
+                superseded_documents = db.execute(
+                    "SELECT document_id, state FROM documents WHERE uri = ? AND document_id != ? AND state = ?",
+                    (uri, document_id, ACTIVE_STATE),
+                ).fetchall()
+                for superseded in superseded_documents:
+                    db.execute(
+                        "UPDATE documents SET state = ?, updated_at = ? WHERE document_id = ?",
+                        ("superseded", now, superseded["document_id"]),
+                    )
+                    db.execute("UPDATE chunks SET state = ? WHERE document_id = ?", ("superseded", superseded["document_id"]))
+                    db.execute(
+                        """
+                        INSERT INTO invalidation_events (document_id, previous_state, next_state, reason, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            superseded["document_id"],
+                            superseded["state"],
+                            "superseded",
+                            "Superseded by a newer revision from the same source URI.",
+                            now,
+                        ),
+                    )
+                if existing:
+                    db.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
                 db.execute(
                     """
-                    INSERT INTO invalidation_events (document_id, previous_state, next_state, reason, created_at)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO documents (
+                      document_id, title, source_type, uri, snapshot_path, content_sha256, state, collection,
+                      tags_json, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(document_id) DO UPDATE SET
+                      title = excluded.title,
+                      source_type = excluded.source_type,
+                      uri = excluded.uri,
+                      snapshot_path = excluded.snapshot_path,
+                      content_sha256 = excluded.content_sha256,
+                      state = excluded.state,
+                      collection = excluded.collection,
+                      tags_json = excluded.tags_json,
+                      updated_at = excluded.updated_at
                     """,
                     (
-                        superseded["document_id"],
-                        superseded["state"],
-                        "superseded",
-                        "Superseded by a newer revision from the same source URI.",
+                        document_id,
+                        title.strip() or uri,
+                        source_type,
+                        uri,
+                        snapshot_path.relative_to(self.root).as_posix(),
+                        content_sha256,
+                        ACTIVE_STATE,
+                        collection,
+                        json.dumps(tags or []),
+                        now,
                         now,
                     ),
                 )
-            if existing:
-                db.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
-            db.execute(
-                """
-                INSERT INTO documents (
-                  document_id, title, source_type, uri, snapshot_path, content_sha256, state, collection,
-                  tags_json, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(document_id) DO UPDATE SET
-                  title = excluded.title,
-                  source_type = excluded.source_type,
-                  uri = excluded.uri,
-                  snapshot_path = excluded.snapshot_path,
-                  content_sha256 = excluded.content_sha256,
-                  state = excluded.state,
-                  collection = excluded.collection,
-                  tags_json = excluded.tags_json,
-                  updated_at = excluded.updated_at
-                """,
-                (
-                    document_id,
-                    title.strip() or uri,
-                    source_type,
-                    uri,
-                    snapshot_path.relative_to(self.root).as_posix(),
-                    content_sha256,
-                    ACTIVE_STATE,
-                    collection,
-                    json.dumps(tags or []),
-                    now,
-                    now,
-                ),
-            )
-            for locator, text in chunks:
-                db.execute(
-                    "INSERT INTO chunks (document_id, locator, text, state) VALUES (?, ?, ?, ?)",
-                    (document_id, locator, text, ACTIVE_STATE),
-                )
-        self.rebuild_index()
-        return IngestedDocument(document_id, title.strip() or uri, source_type, ACTIVE_STATE, len(chunks), content_sha256)
+                for locator, text in chunks:
+                    db.execute(
+                        """
+                        INSERT INTO chunks (document_id, locator, text, state, chunk_origin, enrichment_id)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (document_id, locator, text, ACTIVE_STATE, "source", None),
+                    )
+            self.rebuild_index()
+            return IngestedDocument(document_id, title.strip() or uri, source_type, ACTIVE_STATE, len(chunks), content_sha256)
 
     def _allowed_chunk_ids(self, *, states: list[str], source_types: list[str] | None, collection: str | None) -> list[int]:
         where = ["c.state IN ({})".format(", ".join("?" for _ in states))]
@@ -577,7 +772,7 @@ class DocumentationArchive:
         with self._connect() as db:
             rows = db.execute(
                 f"""
-                SELECT c.chunk_id, c.locator, c.text, c.state AS chunk_state,
+                SELECT c.chunk_id, c.locator, c.text, c.state AS chunk_state, c.chunk_origin, c.enrichment_id,
                        d.document_id, d.title, d.source_type, d.uri, d.snapshot_path, d.content_sha256, d.state AS document_state
                 FROM chunks c
                 JOIN documents d ON d.document_id = c.document_id
@@ -601,6 +796,8 @@ class DocumentationArchive:
                     "uri": row["uri"],
                     "state": row["chunk_state"],
                     "documentState": row["document_state"],
+                    "chunkOrigin": row["chunk_origin"],
+                    "enrichmentId": row["enrichment_id"],
                     "locator": row["locator"],
                     "snippet": snippet(text),
                     "score": fused_scores.get(chunk_id, 0.0),
@@ -655,7 +852,19 @@ class DocumentationArchive:
                   document_id TEXT NOT NULL REFERENCES documents(document_id) ON DELETE CASCADE,
                   locator TEXT NOT NULL,
                   text TEXT NOT NULL,
-                  state TEXT NOT NULL
+                  state TEXT NOT NULL,
+                  chunk_origin TEXT NOT NULL DEFAULT 'source',
+                  enrichment_id INTEGER
+                );
+
+                CREATE TABLE IF NOT EXISTS document_enrichments (
+                  enrichment_id INTEGER PRIMARY KEY,
+                  document_id TEXT NOT NULL REFERENCES documents(document_id) ON DELETE CASCADE,
+                  model TEXT NOT NULL,
+                  skill_ids_json TEXT NOT NULL DEFAULT '[]',
+                  summary TEXT NOT NULL DEFAULT '',
+                  payload_json TEXT NOT NULL DEFAULT '{}',
+                  created_at TEXT NOT NULL
                 );
 
                 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -688,6 +897,11 @@ class DocumentationArchive:
                 );
                 """
             )
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(chunks)").fetchall()}
+            if "chunk_origin" not in columns:
+                db.execute("ALTER TABLE chunks ADD COLUMN chunk_origin TEXT NOT NULL DEFAULT 'source'")
+            if "enrichment_id" not in columns:
+                db.execute("ALTER TABLE chunks ADD COLUMN enrichment_id INTEGER")
 
 
 class ArchiveError(ValueError):
@@ -700,15 +914,36 @@ def chunk_spans(spans: list[ExtractedSpan], max_chars: int = 1200) -> list[tuple
         paragraphs = [part.strip() for part in re.split(r"\n\s*\n|(?<=\.)\s+(?=[A-Z0-9])", span.text) if part.strip()]
         current: list[str] = []
         for paragraph in paragraphs:
-            candidate = " ".join([*current, paragraph]).strip()
-            if len(candidate) > max_chars and current:
-                chunks.append((span.locator, " ".join(current)))
-                current = [paragraph]
-            else:
-                current = [*current, paragraph]
+            for part in split_long_text(paragraph, max_chars):
+                candidate = " ".join([*current, part]).strip()
+                if len(candidate) > max_chars and current:
+                    chunks.append((span.locator, " ".join(current)))
+                    current = [part]
+                else:
+                    current = [*current, part]
         if current:
             chunks.append((span.locator, " ".join(current)))
     return chunks
+
+
+def split_long_text(text: str, max_chars: int) -> list[str]:
+    if len(text) <= max_chars:
+        return [text]
+    parts: list[str] = []
+    current: list[str] = []
+    current_length = 0
+    for word in text.split():
+        separator = 1 if current else 0
+        if current and current_length + separator + len(word) > max_chars:
+            parts.append(" ".join(current))
+            current = [word]
+            current_length = len(word)
+        else:
+            current.append(word)
+            current_length += separator + len(word)
+    if current:
+        parts.append(" ".join(current))
+    return parts or [text]
 
 
 def embed_text(text: str) -> np.ndarray:
@@ -788,6 +1023,134 @@ def infer_source_type(name: str, content_type: str | None) -> str:
     return "readme" if Path(name).name.lower().startswith("readme") else "text"
 
 
+def optional_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def optional_int(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [text for item in value if (text := optional_text(str(item)))]
+
+
+def chapter_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    chapters: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        title = optional_text(str(item.get("title") or ""))
+        start_time = optional_int(item.get("start_time"))
+        end_time = optional_int(item.get("end_time"))
+        if title or start_time is not None or end_time is not None:
+            chapters.append({"title": title or "", "start_time": start_time, "end_time": end_time})
+    return chapters
+
+
+def autodetect_title(
+    explicit: str | None,
+    *,
+    path: Path | str | None = None,
+    filename: str | None = None,
+    url: str | None = None,
+    text: str | None = None,
+) -> str:
+    if explicit_title := optional_text(explicit):
+        return explicit_title
+    if path is not None:
+        return Path(path).name
+    if filename_title := optional_text(filename):
+        return filename_title
+    if text_title := title_from_text(text):
+        return text_title
+    if url_title := title_from_uri(url):
+        return url_title
+    return "Untitled source"
+
+
+def title_from_text(text: str | None) -> str | None:
+    if not text:
+        return None
+    for line in text.splitlines():
+        normalized = " ".join(line.split())
+        if normalized:
+            return normalized[:120]
+    return None
+
+
+def title_from_uri(uri: str | None) -> str | None:
+    if not uri:
+        return None
+    if is_youtube_url(uri):
+        if video_id := youtube_video_id(uri):
+            return f"YouTube video {video_id}"
+        if playlist_id := youtube_playlist_id(uri):
+            return f"YouTube playlist {playlist_id}"
+    parsed = urlparse(uri)
+    if parsed.scheme and parsed.scheme not in {"http", "https"}:
+        leaf = parsed.path.rsplit("/", 1)[-1]
+        return leaf or parsed.netloc or parsed.scheme
+    return title_from_url(uri)
+
+
+def autodetect_collection(
+    explicit: str | None,
+    *,
+    path: Path | str | None = None,
+    url: str | None = None,
+    uri: str | None = None,
+    playlist_title: str | None = None,
+    upload: bool = False,
+    source_type: str | None = None,
+) -> str | None:
+    if explicit_collection := optional_text(explicit):
+        return explicit_collection
+    if playlist_collection := optional_text(playlist_title):
+        return playlist_collection
+    if path is not None:
+        source_path = Path(path)
+        if source_path.is_dir():
+            return source_path.name or None
+        return source_path.parent.name or source_path.stem or None
+    if url_collection := collection_from_uri(url):
+        return url_collection
+    if uri_collection := collection_from_uri(uri):
+        return uri_collection
+    if upload:
+        return "uploads"
+    return source_type or "text"
+
+
+def collection_from_uri(uri: str | None) -> str | None:
+    if not uri:
+        return None
+    if is_youtube_url(uri):
+        return "youtube"
+    parsed = urlparse(uri)
+    if parsed.scheme in {"http", "https"}:
+        host = parsed.netloc.lower()
+        return host.removeprefix("www.") or None
+    if parsed.scheme:
+        return parsed.scheme
+    return None
+
+
 def fetch_youtube_transcript(url: str) -> str:
     if YouTubeTranscriptApi is None:
         raise ArchiveError("youtube-transcript-api is not importable.")
@@ -799,9 +1162,229 @@ def fetch_youtube_transcript(url: str) -> str:
     return "\n".join(snippet.text for snippet in transcript.snippets)
 
 
+def extract_youtube_video_metadata(url: str) -> YouTubeVideoMetadata:
+    if yt_dlp is None:
+        raise ArchiveError("yt-dlp is not importable.")
+    try:
+        with yt_dlp.YoutubeDL(
+            {
+                "format": "bestvideo",
+                "ignoreerrors": False,
+                "noplaylist": True,
+                "no_warnings": True,
+                "quiet": True,
+                "skip_download": True,
+            }
+        ) as downloader:
+            raw_info = downloader.extract_info(url, download=False)
+            info = downloader.sanitize_info(raw_info)
+    except Exception as error:
+        raise ArchiveError(f"Could not extract YouTube video metadata: {error}") from error
+    if not isinstance(info, Mapping):
+        raise ArchiveError("YouTube video metadata response is invalid.")
+    stream_url = optional_text(str(info.get("url") or ""))
+    if not stream_url:
+        raise ArchiveError("YouTube video metadata did not include a playable video stream URL.")
+    title = optional_text(str(info.get("title") or "")) or title_from_url(url)
+    headers = {
+        str(key): str(value)
+        for key, value in dict(info.get("http_headers") or {}).items()
+        if optional_text(str(key)) and optional_text(str(value))
+    }
+    return YouTubeVideoMetadata(
+        title=title,
+        webpage_url=optional_text(str(info.get("webpage_url") or "")) or url,
+        stream_url=stream_url,
+        http_headers=headers,
+        duration=optional_int(info.get("duration")),
+        uploader=optional_text(str(info.get("uploader") or "")),
+        upload_date=optional_text(str(info.get("upload_date") or "")),
+        description=optional_text(str(info.get("description") or "")),
+        thumbnail=optional_text(str(info.get("thumbnail") or "")),
+        tags=string_list(info.get("tags")),
+        chapters=chapter_list(info.get("chapters")),
+    )
+
+
+def capture_youtube_keyframes(metadata: YouTubeVideoMetadata, artifact_dir: Path) -> list[dict[str, str | int]]:
+    frames_dir = artifact_dir / "media" / "keyframes"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    output_pattern = frames_dir / "frame-%06d.png"
+    command = ["ffmpeg", "-hide_banner", "-nostdin", "-y"]
+    if metadata.http_headers:
+        command.extend(["-headers", "".join(f"{key}: {value}\r\n" for key, value in metadata.http_headers.items())])
+    command.extend(["-i", metadata.stream_url, "-vf", "fps=1", str(output_pattern)])
+    try:
+        result = subprocess.run(command, check=False, capture_output=True, text=True)
+    except FileNotFoundError as error:
+        raise ArchiveError("ffmpeg is required to extract YouTube video keyframes.") from error
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
+        raise ArchiveError(f"ffmpeg keyframe extraction failed for YouTube video: {message}")
+    frame_paths = sorted(frames_dir.glob("frame-*.png"))
+    if not frame_paths:
+        raise ArchiveError("ffmpeg did not produce any YouTube video keyframes.")
+    keyframes = [
+        {
+            "offsetSeconds": index - 1,
+            "path": path.relative_to(artifact_dir).as_posix(),
+        }
+        for index, path in enumerate(frame_paths, start=1)
+    ]
+    media_dir = artifact_dir / "media"
+    (media_dir / "youtube_metadata.json").write_text(json.dumps(youtube_metadata_json(metadata), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if description := optional_text(metadata.description):
+        (media_dir / "description.txt").write_text(description + "\n", encoding="utf-8")
+    write_keyframe_index(media_dir / "keyframes.tsv", keyframes)
+    return keyframes
+
+
+def youtube_source_text(metadata: YouTubeVideoMetadata, transcript: str) -> str:
+    parts = [
+        youtube_metadata_span(metadata),
+    ]
+    if description := youtube_description_text(metadata):
+        parts.extend(["", description])
+    parts.extend(["", "Transcript:", transcript.strip()])
+    return "\n".join(parts).strip()
+
+
+def youtube_metadata_span(metadata: YouTubeVideoMetadata) -> str:
+    lines = [
+        f"YouTube video title: {metadata.title}",
+        f"YouTube video URL: {metadata.webpage_url}",
+    ]
+    if metadata.duration is not None:
+        lines.append(f"Duration seconds: {metadata.duration}")
+    if metadata.uploader:
+        lines.append(f"Uploader: {metadata.uploader}")
+    if metadata.upload_date:
+        lines.append(f"Upload date: {metadata.upload_date}")
+    if metadata.thumbnail:
+        lines.append(f"Thumbnail: {metadata.thumbnail}")
+    if metadata.tags:
+        lines.append("Tags: " + ", ".join(metadata.tags))
+    if metadata.chapters:
+        lines.append("Chapters:")
+        for chapter in metadata.chapters:
+            lines.append(f"- {chapter.get('start_time', '')}-{chapter.get('end_time', '')}: {chapter.get('title', '')}")
+    return "\n".join(lines).strip()
+
+
+def youtube_description_spans(metadata: YouTubeVideoMetadata) -> list[ExtractedSpan]:
+    description = youtube_description_text(metadata)
+    return [ExtractedSpan(description, "description")] if description else []
+
+
+def youtube_description_text(metadata: YouTubeVideoMetadata) -> str | None:
+    if not (description := optional_text(metadata.description)):
+        return None
+    return "\n".join(["YouTube video description:", description])
+
+
+def youtube_keyframe_span(keyframes: list[dict[str, str | int]]) -> str:
+    lines = [
+        "Extracted YouTube video keyframes at one frame per second.",
+        "Each keyframe path points to a PNG artifact preserved with the source snapshot.",
+    ]
+    for keyframe in keyframes:
+        lines.append(f"second {keyframe['offsetSeconds']}: {keyframe['path']}")
+    return "\n".join(lines)
+
+
+def youtube_metadata_json(metadata: YouTubeVideoMetadata) -> dict:
+    return {
+        "title": metadata.title,
+        "webpageUrl": metadata.webpage_url,
+        "duration": metadata.duration,
+        "uploader": metadata.uploader,
+        "uploadDate": metadata.upload_date,
+        "description": metadata.description,
+        "thumbnail": metadata.thumbnail,
+        "tags": metadata.tags or [],
+        "chapters": metadata.chapters or [],
+    }
+
+
+def write_keyframe_index(path: Path, keyframes: list[dict[str, str | int]]) -> None:
+    lines = ["offset_seconds\tpath"]
+    lines.extend(f"{keyframe['offsetSeconds']}\t{keyframe['path']}" for keyframe in keyframes)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def reset_directory(path: Path) -> None:
+    shutil.rmtree(path, ignore_errors=True)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def extract_youtube_playlist(url: str) -> YouTubePlaylist:
+    if yt_dlp is None:
+        raise ArchiveError("yt-dlp is not importable.")
+    try:
+        with yt_dlp.YoutubeDL(
+            {
+                "extract_flat": "in_playlist",
+                "ignoreerrors": False,
+                "noplaylist": False,
+                "no_warnings": True,
+                "quiet": True,
+                "skip_download": True,
+            }
+        ) as downloader:
+            raw_info = downloader.extract_info(url, download=False)
+            info = downloader.sanitize_info(raw_info)
+    except Exception as error:
+        raise ArchiveError(f"Could not extract YouTube playlist metadata: {error}") from error
+    if not isinstance(info, Mapping):
+        raise ArchiveError("YouTube playlist metadata response is invalid.")
+    entries = youtube_playlist_entries(info.get("entries"))
+    if not entries:
+        raise ArchiveError("YouTube playlist did not contain ingestible video entries.")
+    return YouTubePlaylist(title=playlist_metadata_title(info, url), entries=entries)
+
+
+def youtube_playlist_entries(raw_entries: Any) -> list[YouTubePlaylistEntry]:
+    if raw_entries is None:
+        return []
+    entries: list[YouTubePlaylistEntry] = []
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, Mapping):
+            continue
+        entry_url = optional_text(str(raw_entry.get("webpage_url") or raw_entry.get("url") or ""))
+        video_id = optional_text(str(raw_entry.get("id") or "")) or youtube_video_id(entry_url or "")
+        if not video_id:
+            continue
+        title = optional_text(str(raw_entry.get("title") or "")) or f"YouTube video {video_id}"
+        entries.append(YouTubePlaylistEntry(title=title, video_id=video_id, url=canonical_youtube_video_url(video_id)))
+    return entries
+
+
+def playlist_metadata_title(info: Mapping[str, Any], url: str) -> str:
+    for key in ["title", "playlist_title", "playlist"]:
+        if title := optional_text(str(info.get(key) or "")):
+            return title
+    if playlist_id := youtube_playlist_id(url):
+        return f"YouTube playlist {playlist_id}"
+    return "YouTube playlist"
+
+
+def canonical_youtube_video_url(video_id: str) -> str:
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
 def is_youtube_url(url: str) -> bool:
     host = urlparse(url).netloc.lower()
     return host.endswith("youtube.com") or host.endswith("youtu.be")
+
+
+def is_youtube_playlist_url(url: str) -> bool:
+    return youtube_playlist_id(url) is not None
+
+
+def youtube_playlist_id(url: str) -> str | None:
+    if not is_youtube_url(url):
+        return None
+    return optional_text(parse_qs(urlparse(url).query).get("list", [None])[0])
 
 
 def youtube_video_id(url: str) -> str | None:

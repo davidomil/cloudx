@@ -9,7 +9,8 @@ import WebSocket, { type RawData, WebSocketServer } from "ws";
 import { RULES_SKILLS_PLUGIN_ID } from "@cloudx/shared";
 
 import { DEFAULT_ASR_TIMEOUT_MS } from "./asrClient.js";
-import { DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES, type AppConfig } from "./config.js";
+import { DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES, DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES, type AppConfig } from "./config.js";
+import { DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES } from "./documentation/DocumentationClient.js";
 import { TabContextService } from "./context/TabContextService.js";
 import { HookRegistry } from "./hooks/HookRegistry.js";
 import { PluginRegistry } from "./pluginRegistry.js";
@@ -458,6 +459,18 @@ describe("buildServer", () => {
   it("syncs plugin contributions into system rules and skills at startup", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-plugin-skills-"));
     const config = testConfig(root);
+    const staleAnswerSkillDir = path.join(config.dataDir, "rules-skills", "system-skills", "documentation-answer");
+    await fs.mkdir(staleAnswerSkillDir, { recursive: true });
+    await fs.writeFile(path.join(staleAnswerSkillDir, "SKILL.md"), [
+      "---",
+      'name: "documentation-answer"',
+      'description: "Stale answer skill."',
+      "---",
+      "",
+      "# Stale Documentation Answer",
+      "",
+      "Use documentation.answer instead of documentation.search."
+    ].join("\n"), "utf8");
     const services = buildServices(config);
     const applyRuntimeContexts = vi.spyOn(services.sessions, "applyRuntimeContexts").mockResolvedValue([]);
 
@@ -465,8 +478,15 @@ describe("buildServer", () => {
 
     expect(store.systemRules.map((rule) => rule.id)).toContain("documentation-ingest-evidence");
     expect(store.systemSkills.map((skill) => skill.id)).toContain("documentation-search");
-    await expect(fs.readFile(path.join(services.rulesSkills!.catalogRoot(), "system-rules", "documentation-ingest-evidence.md"), "utf8")).resolves.toContain("download");
-    await expect(fs.readFile(path.join(services.rulesSkills!.catalogRoot(), "system-skills", "documentation-search", "SKILL.md"), "utf8")).resolves.toContain("CLOUDX_DOCUMENTATION_URL");
+    expect(store.systemSkills.map((skill) => skill.id)).not.toContain("documentation-answer");
+    const ruleFile = await fs.readFile(path.join(services.rulesSkills!.catalogRoot(), "system-rules", "documentation-ingest-evidence.md"), "utf8");
+    const searchSkillFile = await fs.readFile(path.join(services.rulesSkills!.catalogRoot(), "system-skills", "documentation-search", "SKILL.md"), "utf8");
+    expect(ruleFile).toContain("Before answering any factual, research, recipe, recommendation, troubleshooting, summary, or source-grounded user question");
+    expect(ruleFile).toContain("POST $CLOUDX_DOCUMENTATION_URL/search");
+    expect(ruleFile).toContain("add each useful online source back into the CloudX documentation knowledge base");
+    expect(searchSkillFile).toContain("CLOUDX_DOCUMENTATION_URL");
+    expect(searchSkillFile).toContain("Before answering any factual, research, recipe, recommendation, troubleshooting, summary, or source-grounded question");
+    await expect(fs.stat(staleAnswerSkillDir)).rejects.toThrow();
     expect(applyRuntimeContexts).toHaveBeenCalledWith(expect.any(Function), "Injecting plugin-contributed system rules and skills.");
   });
 
@@ -477,6 +497,7 @@ describe("buildServer", () => {
     const ingestUpload = vi.spyOn(services.documentation!, "ingestUpload").mockResolvedValue({
       document: { documentId: "uploaded-doc", sourceType: "readme" }
     });
+    vi.spyOn(services.documentationEnrichment!, "enrichIngestResponse").mockImplementation(async (result) => result);
     const app = await buildServer(config, services);
     try {
       const response = await app.inject({
@@ -499,6 +520,73 @@ describe("buildServer", () => {
         sourceType: "readme",
         collection: "validation"
       });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("passes browser documentation upload bytes to the enrichment service", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-upload-enrich-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    vi.spyOn(services.documentation!, "ingestUpload").mockResolvedValue({
+      document: { documentId: "uploaded-media", sourceType: "media" }
+    });
+    const enrichIngestResponse = vi.spyOn(services.documentationEnrichment!, "enrichIngestResponse").mockResolvedValue({
+      document: { documentId: "uploaded-media", sourceType: "media" },
+      enrichment: { enabled: true }
+    });
+    const app = await buildServer(config, services);
+    try {
+      const payload = Buffer.from("fake video bytes");
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/documentation/upload?filename=lecture.mp4&sourceType=media",
+        headers: {
+          "content-type": "application/octet-stream",
+          "x-cloudx-file-content-type": "video/mp4"
+        },
+        payload
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({
+        document: { documentId: "uploaded-media", sourceType: "media" },
+        enrichment: { enabled: true }
+      });
+      expect(enrichIngestResponse).toHaveBeenCalledWith(
+        { document: { documentId: "uploaded-media", sourceType: "media" } },
+        {
+          filename: "lecture.mp4",
+          content: payload,
+          contentType: "video/mp4",
+          sourceType: "media"
+        }
+      );
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("rejects browser documentation uploads larger than the configured documentation cap", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-upload-limit-"));
+    const config = { ...testConfig(root), documentationUploadMaxBytes: 8 };
+    const services = buildServices(config);
+    const ingestUpload = vi.spyOn(services.documentation!, "ingestUpload");
+    const app = await buildServer(config, services);
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/documentation/upload?filename=too-large.md",
+        headers: {
+          "content-type": "application/octet-stream",
+          "content-length": "9"
+        }
+      });
+
+      expect(response.statusCode).toBe(413);
+      expect(response.json().message).toContain("8 bytes");
+      expect(ingestUpload).not.toHaveBeenCalled();
     } finally {
       await app.close();
     }
@@ -1391,7 +1479,9 @@ describe("buildServer", () => {
       appServerEnabled: false,
       automationStartDisabled: false,
       terminalReplayBytes: 1024,
-      voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES
+      voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES,
+      documentationResponseMaxBytes: DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES,
+      documentationUploadMaxBytes: DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES
     };
 
     const app = await buildServer(config, services);
@@ -1535,7 +1625,9 @@ describe("buildServer", () => {
       appServerEnabled: false,
       automationStartDisabled: false,
       terminalReplayBytes: 1024,
-      voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES
+      voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES,
+      documentationResponseMaxBytes: DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES,
+      documentationUploadMaxBytes: DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES
     };
 
     const app = await buildServer(config, services);
@@ -1603,7 +1695,9 @@ describe("buildServer", () => {
       appServerEnabled: false,
       automationStartDisabled: false,
       terminalReplayBytes: 1024,
-      voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES
+      voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES,
+      documentationResponseMaxBytes: DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES,
+      documentationUploadMaxBytes: DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES
     };
 
     const app = await buildServer(config, services);
@@ -1675,7 +1769,9 @@ describe("buildServer", () => {
       appServerEnabled: false,
       automationStartDisabled: false,
       terminalReplayBytes: 1024,
-      voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES
+      voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES,
+      documentationResponseMaxBytes: DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES,
+      documentationUploadMaxBytes: DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES
     };
 
     const app = await buildServer(config, services);
@@ -1891,7 +1987,9 @@ describe("buildServer", () => {
       appServerEnabled: false,
       automationStartDisabled: false,
       terminalReplayBytes: 1024,
-      voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES
+      voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES,
+      documentationResponseMaxBytes: DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES,
+      documentationUploadMaxBytes: DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES
     };
     const services = {
       plugins: { list: () => [] },
@@ -1927,7 +2025,9 @@ describe("buildServer", () => {
       appServerEnabled: false,
       automationStartDisabled: false,
       terminalReplayBytes: 1024,
-      voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES
+      voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES,
+      documentationResponseMaxBytes: DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES,
+      documentationUploadMaxBytes: DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES
     };
     const services = {
       plugins: { list: () => [] },
@@ -1971,7 +2071,9 @@ describe("buildServer", () => {
       appServerEnabled: false,
       automationStartDisabled: false,
       terminalReplayBytes: 1024,
-      voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES
+      voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES,
+      documentationResponseMaxBytes: DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES,
+      documentationUploadMaxBytes: DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES
     };
     const calls: unknown[] = [];
     const services = {
@@ -2063,7 +2165,9 @@ describe("buildServer", () => {
       appServerEnabled: false,
       automationStartDisabled: false,
       terminalReplayBytes: 1024,
-      voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES
+      voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES,
+      documentationResponseMaxBytes: DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES,
+      documentationUploadMaxBytes: DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES
     };
     const asrCalls: unknown[][] = [];
     const services = {
@@ -2115,7 +2219,9 @@ describe("buildServer", () => {
       appServerEnabled: false,
       automationStartDisabled: false,
       terminalReplayBytes: 1024,
-      voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES
+      voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES,
+      documentationResponseMaxBytes: DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES,
+      documentationUploadMaxBytes: DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES
     };
     let handledTranscript = "";
     const services = {
@@ -2312,7 +2418,9 @@ describe("buildServer", () => {
         appServerEnabled: false,
         automationStartDisabled: false,
         terminalReplayBytes: 1024,
-        voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES
+        voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES,
+        documentationResponseMaxBytes: DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES,
+        documentationUploadMaxBytes: DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES
       };
       const services = {
         plugins: { list: () => [] },
@@ -2379,7 +2487,9 @@ describe("buildServer", () => {
       appServerEnabled: false,
       automationStartDisabled: false,
       terminalReplayBytes: 1024,
-      voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES
+      voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES,
+      documentationResponseMaxBytes: DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES,
+      documentationUploadMaxBytes: DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES
     };
     let voiceCalled = false;
     let streamError: Error | undefined;
@@ -2462,7 +2572,9 @@ describe("buildServer", () => {
       appServerEnabled: false,
       automationStartDisabled: false,
       terminalReplayBytes: 1024,
-      voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES
+      voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES,
+      documentationResponseMaxBytes: DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES,
+      documentationUploadMaxBytes: DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES
     };
     let buildVoiceContextCalled = false;
     const asrCalls: unknown[][] = [];
@@ -2518,7 +2630,9 @@ function testConfig(root: string): AppConfig {
     appServerEnabled: false,
     automationStartDisabled: false,
     terminalReplayBytes: 1024,
-    voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES
+    voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES,
+    documentationResponseMaxBytes: DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES,
+    documentationUploadMaxBytes: DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES
   };
 }
 

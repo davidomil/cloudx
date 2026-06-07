@@ -5,6 +5,8 @@ import json
 import subprocess
 import sys
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.metadata import version
 from pathlib import Path
@@ -14,6 +16,7 @@ from PIL import Image, ImageDraw
 import pytest
 from reportlab.pdfgen import canvas
 
+import cloudx_documentation_indexer.archive as archive_module
 from cloudx_documentation_indexer import DocumentationArchive, create_app
 from cloudx_documentation_indexer.archive import (
     DENSE_ONLY_MIN_SCORE,
@@ -138,6 +141,252 @@ def test_fastapi_surface_controls_archive(tmp_path: Path) -> None:
     assert client.post("/search", json={"query": "ADC calibration register"}).json()["results"] == []
 
 
+def test_ai_enrichment_adds_searchable_provenance_and_replaces_prior_ai_chunks(tmp_path: Path) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+    document = archive.ingest_text(
+        title="Visual import note",
+        text="The PDF extraction captured a POWER table and a reset sequencing flowchart.",
+        source_type="datasheet",
+        uri="mock://visual-import",
+    )
+
+    enriched = archive.enrich_document(
+        document.document_id,
+        spans=[
+            archive_module.ExtractedSpan("AI visual summary says FLOWCHART-ENRICH-1 has RESET LOW then ENABLE RAIL.", "ai:visual:flowchart"),
+            archive_module.ExtractedSpan("AI metadata summary says the source has a power sequencing table.", "ai:metadata:tables"),
+        ],
+        model="gpt-test",
+        skill_ids=["documentation-enrich-visuals"],
+        summary="Added visual extraction notes.",
+        payload={"warning": "none"},
+    )
+
+    ai_chunks = [chunk for chunk in enriched["chunks"] if chunk["chunk_origin"] == "ai"]
+    assert len(ai_chunks) == 2
+    assert {chunk["locator"] for chunk in ai_chunks} == {"ai:visual:flowchart", "ai:metadata:tables"}
+    assert enriched["enrichments"][0]["model"] == "gpt-test"
+
+    result = archive.search("FLOWCHART-ENRICH-1 RESET LOW", limit=1)[0]
+    assert result["documentId"] == document.document_id
+    assert result["chunkOrigin"] == "ai"
+    assert result["enrichmentId"] == ai_chunks[0]["enrichment_id"]
+
+    archive.enrich_document(
+        document.document_id,
+        spans=[archive_module.ExtractedSpan("AI rerun summary says FLOWCHART-ENRICH-2 replaced the prior visual note.", "ai:visual:rerun")],
+        model="gpt-test",
+        skill_ids=["documentation-enrich-visuals"],
+        summary="Replaced visual extraction notes.",
+        payload={},
+    )
+
+    record = archive.get_document(document.document_id)
+    assert [chunk["locator"] for chunk in record["chunks"] if chunk["chunk_origin"] == "ai"] == ["ai:visual:rerun"]
+    assert archive.search("FLOWCHART-ENRICH-1", limit=10) == []
+    assert archive.search("FLOWCHART-ENRICH-2", limit=1)[0]["chunkOrigin"] == "ai"
+
+
+def test_fastapi_enrich_endpoint_writes_derived_chunks(tmp_path: Path) -> None:
+    app = create_app(tmp_path / "archive")
+    client = TestClient(app)
+    ingested = client.post(
+        "/ingest/text",
+        json={"title": "Media note", "text": "Transcript source mentions a setup screen.", "sourceType": "media"},
+    )
+    document_id = ingested.json()["document"]["documentId"]
+
+    response = client.post(
+        f"/documents/{document_id}/enrich",
+        json={
+            "model": "gpt-test",
+            "skillIds": ["documentation-enrich-media"],
+            "summary": "Added media sections.",
+            "spans": [{"locator": "ai:media:0", "text": "AI media summary says MEDIA-ENRICH-7 appears in the setup section."}],
+            "payload": {"source": "test"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["document"]["enrichments"][0]["skill_ids_json"] == '["documentation-enrich-media"]'
+    search = client.post("/search", json={"query": "MEDIA-ENRICH-7 setup section"})
+    assert search.json()["results"][0]["chunkOrigin"] == "ai"
+
+
+def test_ingest_autodetects_title_collection_uri_and_source_type(tmp_path: Path) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+
+    text_document = archive.ingest_text(text="Autodetected Manual\nThe AXI-77 register controls burst length.")
+    text_record = archive.get_document(text_document.document_id)
+    assert text_record["title"] == "Autodetected Manual"
+    assert text_record["source_type"] == "text"
+    assert text_record["uri"].startswith("manual://Autodetected_Manual-")
+    assert text_record["collection"] == "manual"
+    assert archive.search("AXI-77 burst length", collection="manual", limit=1)[0]["documentId"] == text_document.document_id
+
+    upload_document = archive.ingest_upload(
+        filename="uploaded-note.md",
+        content=b"Uploaded metadata note says AUTO-UPLOAD-9.",
+        content_type="text/markdown",
+    )
+    upload_record = archive.get_document(upload_document.document_id)
+    assert upload_record["title"] == "uploaded-note.md"
+    assert upload_record["collection"] == "uploads"
+
+    docs_dir = tmp_path / "vendor-docs"
+    docs_dir.mkdir()
+    note = docs_dir / "board-guide.md"
+    note.write_text("Board guide says AUTO-PATH-12 configures strap pins.\n", encoding="utf-8")
+    path_document = archive.ingest_path(note)[0]
+    path_record = archive.get_document(path_document.document_id)
+    assert path_record["title"] == "board-guide.md"
+    assert path_record["collection"] == "vendor-docs"
+
+    server = HtmlFixtureServer("<html><body><h1>Thermal Layout Note</h1><p>AUTO-URL-33 improves thermal layout.</p></body></html>")
+    server.start()
+    try:
+        url_document = archive.ingest_url(server.url)
+    finally:
+        server.stop()
+    url_record = archive.get_document(url_document.document_id)
+    assert url_record["title"] == "thermal.html"
+    assert url_record["collection"].startswith("127.0.0.1:")
+
+
+def test_youtube_playlist_url_ingests_each_video_transcript(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    playlist_url = "https://www.youtube.com/playlist?list=PLbringup"
+    playlist = archive_module.YouTubePlaylist(
+        title="Board Bringup Playlist",
+        entries=[
+            archive_module.YouTubePlaylistEntry("Reset Sequencing", "video-one", "https://www.youtube.com/watch?v=video-one"),
+            archive_module.YouTubePlaylistEntry("Power Rail Checks", "video-two", "https://www.youtube.com/watch?v=video-two"),
+        ],
+    )
+    transcripts = {
+        "https://www.youtube.com/watch?v=video-one": "Reset transcript explains PLAYLIST-RESET-1.",
+        "https://www.youtube.com/watch?v=video-two": "Power transcript explains PLAYLIST-POWER-2.",
+    }
+    monkeypatch.setattr(archive_module, "extract_youtube_playlist", lambda url: playlist)
+    stub_youtube_media(monkeypatch, transcripts)
+
+    archive = DocumentationArchive(tmp_path / "archive")
+    documents = archive.ingest_url_documents(playlist_url)
+
+    assert [document.title for document in documents] == ["Reset Sequencing", "Power Rail Checks"]
+    records = [archive.get_document(document.document_id) for document in documents]
+    assert {record["collection"] for record in records} == {"Board Bringup Playlist"}
+    assert {record["source_type"] for record in records} == {"media"}
+    for record in records:
+        assert "description" in {chunk["locator"] for chunk in record["chunks"]}
+        snapshot = tmp_path / "archive" / record["snapshot_path"]
+        assert (snapshot.parent / "extracted" / "media" / "keyframes.tsv").exists()
+        assert (snapshot.parent / "extracted" / "media" / "keyframes" / "frame-000001.png").exists()
+    assert archive.search("PLAYLIST-POWER-2", collection="Board Bringup Playlist", limit=1)[0]["title"] == "Power Rail Checks"
+    assert archive.search("Metadata for video-one allocator pressure slides", collection="Board Bringup Playlist", limit=1)[0]["title"] == "Reset Sequencing"
+    assert archive.search("Metadata for video-two allocator pressure slides", collection="Board Bringup Playlist", limit=1)[0]["title"] == "Power Rail Checks"
+    assert archive.search("one frame per second", collection="Board Bringup Playlist", limit=2)
+
+    app = create_app(tmp_path / "api-archive")
+    client = TestClient(app)
+    response = client.post("/ingest/url", json={"url": playlist_url})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["document"]["title"] == "Reset Sequencing"
+    assert [document["title"] for document in payload["documents"]] == ["Reset Sequencing", "Power Rail Checks"]
+
+
+def test_youtube_video_ingest_preserves_transcript_metadata_and_keyframes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    video_url = "https://www.youtube.com/watch?v=visual-demo"
+    stub_youtube_media(
+        monkeypatch,
+        {video_url: "Transcript explains YOUTUBE-VISUAL-9 while the slides show allocator pressure."},
+    )
+    archive = DocumentationArchive(tmp_path / "archive")
+
+    document = archive.ingest_url(video_url)
+    record = archive.get_document(document.document_id)
+    snapshot = tmp_path / "archive" / record["snapshot_path"]
+    extracted = snapshot.parent / "extracted"
+
+    assert record["title"] == "Video visual-demo"
+    assert record["source_type"] == "media"
+    description_chunk = next(chunk for chunk in record["chunks"] if chunk["locator"] == "description")
+    metadata_chunk = next(chunk for chunk in record["chunks"] if chunk["locator"] == "media metadata")
+    assert "YouTube video description:" in description_chunk["text"]
+    assert "Metadata for visual-demo includes allocator pressure slides." in description_chunk["text"]
+    assert "Metadata for visual-demo includes allocator pressure slides." not in metadata_chunk["text"]
+    assert archive.search("YOUTUBE-VISUAL-9 allocator pressure", limit=1)[0]["documentId"] == document.document_id
+    assert archive.search("Duration seconds 1234", limit=1)[0]["documentId"] == document.document_id
+    assert archive.search("Metadata for visual-demo allocator pressure slides", limit=1)[0]["documentId"] == document.document_id
+    assert (extracted / "media" / "youtube_metadata.json").exists()
+    assert json.loads((extracted / "media" / "youtube_metadata.json").read_text(encoding="utf-8"))["description"] == "Metadata for visual-demo includes allocator pressure slides."
+    assert (extracted / "media" / "description.txt").read_text(encoding="utf-8") == "Metadata for visual-demo includes allocator pressure slides.\n"
+    assert (extracted / "media" / "keyframes.tsv").read_text(encoding="utf-8").splitlines() == [
+        "offset_seconds\tpath",
+        "0\tmedia/keyframes/frame-000001.png",
+        "1\tmedia/keyframes/frame-000002.png",
+    ]
+    assert (extracted / "media" / "keyframes" / "frame-000001.png").exists()
+    assert (extracted / "media" / "keyframes" / "frame-000002.png").exists()
+
+
+def test_failed_youtube_playlist_does_not_leave_active_partial_documents(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    playlist_url = "https://www.youtube.com/playlist?list=PLpartial"
+    playlist = archive_module.YouTubePlaylist(
+        title="Partial Playlist",
+        entries=[
+            archive_module.YouTubePlaylistEntry("Good Video", "video-good", "https://www.youtube.com/watch?v=video-good"),
+            archive_module.YouTubePlaylistEntry("Bad Video", "video-bad", "https://www.youtube.com/watch?v=video-bad"),
+        ],
+    )
+    monkeypatch.setattr(archive_module, "extract_youtube_playlist", lambda url: playlist)
+    stub_youtube_media(monkeypatch, {"https://www.youtube.com/watch?v=video-good": "Good transcript says PLAYLIST-PARTIAL-1."})
+    archive = DocumentationArchive(tmp_path / "archive")
+
+    with pytest.raises(KeyError):
+        archive.ingest_url_documents(playlist_url)
+
+    assert archive.search("PLAYLIST-PARTIAL-1", limit=10) == []
+    deleted = archive.list_documents(states=["deleted"])
+    assert [document["title"] for document in deleted] == ["Good Video"]
+
+
+def test_youtube_video_without_description_omits_empty_description_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    video_url = "https://www.youtube.com/watch?v=no-description"
+    stub_youtube_media(
+        monkeypatch,
+        {video_url: "Transcript explains YOUTUBE-NODESC-4 without description text."},
+        descriptions={video_url: None},
+    )
+    archive = DocumentationArchive(tmp_path / "archive")
+
+    document = archive.ingest_url(video_url)
+    record = archive.get_document(document.document_id)
+    extracted = tmp_path / "archive" / record["snapshot_path"]
+
+    assert "description" not in {chunk["locator"] for chunk in record["chunks"]}
+    assert archive.search("YOUTUBE-NODESC-4", limit=1)[0]["documentId"] == document.document_id
+    assert not (extracted.parent / "extracted" / "media" / "description.txt").exists()
+
+
+def test_long_unpunctuated_text_is_chunked_without_dropping_tail(tmp_path: Path) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+    body = " ".join(f"transcriptword{index}" for index in range(900))
+    tail = "YTTAIL-900 allocator reclaim pressure watermark"
+
+    document = archive.ingest_text(
+        title="Long transcript",
+        text=f"{body} {tail}",
+        source_type="media",
+        uri="mock://long-transcript",
+    )
+
+    record = archive.get_document(document.document_id)
+    assert len(record["chunks"]) > 1
+    assert archive.search("YTTAIL-900 allocator reclaim pressure watermark", limit=1)[0]["documentId"] == document.document_id
+
+
 def test_reingesting_changed_source_supersedes_old_revision(tmp_path: Path) -> None:
     source = tmp_path / "board-datasheet.md"
     source.write_text("Board Datasheet\nOLDREG reset mode lives at address 0x10.\n", encoding="utf-8")
@@ -185,6 +434,25 @@ def test_pdf_tables_visuals_and_images_are_extracted_as_portable_artifacts(tmp_p
     image_result = archive.search("320x160 flowcharts screenshots", source_types=["image"], limit=1)[0]
     image_snapshot = tmp_path / "archive" / image_result["citation"]["snapshotPath"]
     assert (image_snapshot.parent / "extracted" / "images" / "debug-flowchart.png").exists()
+
+
+def test_multiframe_images_preserve_every_frame_as_artifacts(tmp_path: Path) -> None:
+    fixture_dir = tmp_path / "fixtures"
+    fixture_dir.mkdir()
+    image_path = fixture_dir / "animated-flow.gif"
+    make_multiframe_image(image_path)
+    archive = DocumentationArchive(tmp_path / "archive")
+
+    archive.ingest_path(image_path)
+
+    result = archive.search("frames 2 frame artifacts", source_types=["image"], limit=1)[0]
+    image_snapshot = tmp_path / "archive" / result["citation"]["snapshotPath"]
+    extracted = image_snapshot.parent / "extracted"
+    metadata = json.loads((extracted / "image_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["frames"] == 2
+    assert metadata["artifacts"] == ["images/animated-flow-frame-0001.png", "images/animated-flow-frame-0002.png"]
+    assert (extracted / "images" / "animated-flow-frame-0001.png").exists()
+    assert (extracted / "images" / "animated-flow-frame-0002.png").exists()
 
 
 def test_hybrid_search_preserves_strict_identifier_hits(tmp_path: Path) -> None:
@@ -264,6 +532,50 @@ def test_url_fetch_rejects_unsupported_schemes_and_oversized_downloads() -> None
         server.stop()
 
 
+def test_concurrent_mutations_serialize_index_rebuilds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    active_writes = 0
+    max_active_writes = 0
+    state_lock = threading.Lock()
+
+    class SlowIdMapIndex:
+        def __init__(self, **_kwargs: object):
+            pass
+
+        def add_with_ids(self, *_args: object) -> None:
+            pass
+
+        def write(self, path: str) -> None:
+            nonlocal active_writes, max_active_writes
+            with state_lock:
+                active_writes += 1
+                max_active_writes = max(max_active_writes, active_writes)
+            try:
+                time.sleep(0.05)
+                Path(path).write_bytes(b"fake-index")
+            finally:
+                with state_lock:
+                    active_writes -= 1
+
+    monkeypatch.setattr(archive_module, "IdMapIndex", SlowIdMapIndex)
+    archive = DocumentationArchive(tmp_path / "archive")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                archive.ingest_text,
+                title=f"Concurrent document {index}",
+                text=f"Concurrent ingest {index} says LOCK-SERIAL-{index}.",
+                uri=f"mock://concurrent/{index}",
+            )
+            for index in range(2)
+        ]
+        documents = [future.result(timeout=5) for future in futures]
+
+    assert max_active_writes == 1
+    assert {document.title for document in documents} == {"Concurrent document 0", "Concurrent document 1"}
+    assert len(archive.list_documents()) == 2
+
+
 def test_cli_help_documents_service_options() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "cloudx_documentation_indexer.main", "--help"],
@@ -325,6 +637,58 @@ def make_image(path: Path) -> None:
     draw.rectangle((200, 48, 296, 96), outline="black", width=3)
     draw.text((218, 63), "DONE", fill="black")
     image.save(path)
+
+
+def make_multiframe_image(path: Path) -> None:
+    first = Image.new("RGB", (160, 90), "white")
+    draw = ImageDraw.Draw(first)
+    draw.rectangle((16, 24, 72, 64), outline="black", width=3)
+    draw.text((28, 38), "ONE", fill="black")
+    second = Image.new("RGB", (160, 90), "white")
+    draw = ImageDraw.Draw(second)
+    draw.rectangle((88, 24, 144, 64), outline="black", width=3)
+    draw.text((99, 38), "TWO", fill="black")
+    first.save(path, save_all=True, append_images=[second], duration=100, loop=0)
+
+
+def stub_youtube_media(monkeypatch: pytest.MonkeyPatch, transcripts: dict[str, str], descriptions: dict[str, str | None] | None = None) -> None:
+    monkeypatch.setattr(archive_module, "fetch_youtube_transcript", lambda url: transcripts[url])
+
+    def metadata(url: str) -> archive_module.YouTubeVideoMetadata:
+        video_id = url.rsplit("=", 1)[-1]
+        return archive_module.YouTubeVideoMetadata(
+            title=f"Video {video_id}",
+            webpage_url=url,
+            stream_url=f"mock://stream/{video_id}",
+            http_headers={"User-Agent": "cloudx-test"},
+            duration=1234,
+            uploader="CloudX Test",
+            upload_date="20260607",
+            description=descriptions.get(url, f"Metadata for {video_id} includes allocator pressure slides.") if descriptions is not None else f"Metadata for {video_id} includes allocator pressure slides.",
+            thumbnail=f"https://img.youtube.com/vi/{video_id}/0.jpg",
+            tags=["memory", "slides"],
+            chapters=[{"title": "Intro", "start_time": 0, "end_time": 60}],
+        )
+
+    def keyframes(_metadata: archive_module.YouTubeVideoMetadata, artifact_dir: Path) -> list[dict[str, str | int]]:
+        frames_dir = artifact_dir / "media" / "keyframes"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        for index in range(1, 3):
+            Image.new("RGB", (64, 36), "white").save(frames_dir / f"frame-{index:06d}.png")
+        frames = [
+            {"offsetSeconds": 0, "path": "media/keyframes/frame-000001.png"},
+            {"offsetSeconds": 1, "path": "media/keyframes/frame-000002.png"},
+        ]
+        media_dir = artifact_dir / "media"
+        media_dir.mkdir(parents=True, exist_ok=True)
+        archive_module.write_keyframe_index(media_dir / "keyframes.tsv", frames)
+        (media_dir / "youtube_metadata.json").write_text(json.dumps(archive_module.youtube_metadata_json(_metadata), indent=2) + "\n", encoding="utf-8")
+        if _metadata.description:
+            (media_dir / "description.txt").write_text(_metadata.description + "\n", encoding="utf-8")
+        return frames
+
+    monkeypatch.setattr(archive_module, "extract_youtube_video_metadata", metadata)
+    monkeypatch.setattr(archive_module, "capture_youtube_keyframes", keyframes)
 
 
 def dense_collision_query(reference_tokens: list[str]) -> str:

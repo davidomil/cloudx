@@ -43,6 +43,41 @@ describe("DocumentationClient", () => {
     await expect(client.search({ query: "" })).rejects.toThrow("Search query is required.");
   });
 
+  it("posts AI enrichment spans to the document enrich endpoint", async () => {
+    let requestUrl = "";
+    let requestBody = "";
+    const url = await startServer((request, response) => {
+      requestUrl = request.url ?? "";
+      request.on("data", (chunk) => {
+        requestBody += chunk.toString();
+      });
+      request.on("end", () => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ document: { documentId: "doc-1" } }));
+      });
+    });
+    const client = new DocumentationClient(`${url}/docs`);
+
+    const result = await client.enrichDocument({
+      documentId: "doc-1",
+      spans: [{ locator: "ai:metadata", text: "Metadata summary." }],
+      model: "gpt-test",
+      skillIds: ["documentation-enrich-metadata"],
+      summary: "Added metadata.",
+      payload: { source: "test" }
+    });
+
+    expect(result).toEqual({ document: { documentId: "doc-1" } });
+    expect(requestUrl).toBe("/docs/documents/doc-1/enrich");
+    expect(JSON.parse(requestBody)).toEqual({
+      spans: [{ locator: "ai:metadata", text: "Metadata summary." }],
+      model: "gpt-test",
+      skillIds: ["documentation-enrich-metadata"],
+      summary: "Added metadata.",
+      payload: { source: "test" }
+    });
+  });
+
   it("uploads files to the indexer as multipart form data", async () => {
     let requestUrl = "";
     let contentType = "";
@@ -80,6 +115,16 @@ describe("DocumentationClient", () => {
     expect(bodyText).toContain("readme");
     expect(bodyText).toContain('name="collection"');
     expect(bodyText).toContain("client-test");
+  });
+
+  it("rejects oversized documentation service responses with the configured response limit", async () => {
+    const url = await startServer((_request, response) => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ body: "0123456789" }));
+    });
+    const client = new DocumentationClient(url, { responseMaxBytes: 8 });
+
+    await expect(client.stats()).rejects.toThrow("Documentation service response exceeded 8 bytes.");
   });
 
   async function startServer(handler: http.RequestListener): Promise<string> {

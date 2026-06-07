@@ -9,6 +9,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from bs4 import BeautifulSoup
 from PIL import Image, ImageSequence
@@ -18,7 +19,7 @@ import pypdfium2 as pdfium
 
 PDF_SUFFIXES = {".pdf"}
 HTML_SUFFIXES = {".html", ".htm"}
-IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+IMAGE_SUFFIXES = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 TEXT_SUFFIXES = {
     ".adoc",
     ".asciidoc",
@@ -137,7 +138,7 @@ class ImageExtractionPipeline:
         with Image.open(io.BytesIO(content)) as image:
             image.load()
             frames = frame_count(image)
-            metadata = {
+            metadata: dict[str, Any] = {
                 "filename": name,
                 "format": image.format or Path(name).suffix.lstrip(".").upper() or "IMAGE",
                 "width": image.width,
@@ -148,11 +149,15 @@ class ImageExtractionPipeline:
             if artifact_root:
                 images_dir = artifact_root / "images"
                 images_dir.mkdir(parents=True, exist_ok=True)
-                normalized_path = images_dir / f"{safe_stem(name)}.png"
-                image.seek(0)
-                image.convert("RGBA").save(normalized_path)
+                frame_paths: list[str] = []
+                for frame_index, frame in enumerate(ImageSequence.Iterator(image), start=1):
+                    output_name = f"{safe_stem(name)}.png" if frames == 1 else f"{safe_stem(name)}-frame-{frame_index:04d}.png"
+                    normalized_path = images_dir / output_name
+                    frame.convert("RGBA").save(normalized_path)
+                    frame_paths.append(normalized_path.relative_to(artifact_root).as_posix())
+                metadata["artifact"] = frame_paths[0] if frame_paths else ""
+                metadata["artifacts"] = frame_paths
                 (artifact_root / "image_metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-                metadata["artifact"] = normalized_path.relative_to(artifact_root).as_posix()
         return [ExtractedSpan(image_span_text(metadata), "image")]
 
 
@@ -252,12 +257,14 @@ def visual_span_text(figure_id: str, page_number: int, summary: dict[str, int]) 
     )
 
 
-def image_span_text(metadata: dict[str, str | int]) -> str:
+def image_span_text(metadata: dict[str, Any]) -> str:
     artifact = f" Artifact: {metadata['artifact']}." if "artifact" in metadata else ""
+    artifacts = metadata.get("artifacts")
+    frame_artifacts = f" Frame artifacts: {', '.join(artifacts)}." if isinstance(artifacts, list) and len(artifacts) > 1 else ""
     return (
         f"Image source {metadata['filename']}. Format {metadata['format']}; "
         f"size {metadata['width']}x{metadata['height']}; mode {metadata['mode']}; frames {metadata['frames']}."
-        f"{artifact} Use this visual artifact for diagrams, graphs, flowcharts, screenshots, scanned pages, and photos."
+        f"{artifact}{frame_artifacts} Use these visual artifacts for diagrams, graphs, flowcharts, screenshots, scanned pages, and photos."
     )
 
 
