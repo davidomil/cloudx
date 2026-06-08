@@ -10,6 +10,9 @@ import {
   QUARTO_DEB_PATH,
   QUARTO_DEB_URL,
   QUARTO_VERSION,
+  WHISPER_CPP_MODEL,
+  WHISPER_CPP_REPO_URL,
+  WHISPER_CPP_VAD_MODEL,
   assertQuartoArchitecture,
   cloudxAccessUrls,
   defaultCpuThreads,
@@ -17,6 +20,7 @@ import {
   needsNodeInstall,
   needsQuartoInstall,
   networkBindWarning,
+  normalizeWhisperCppBuild,
   parseNodeMajor,
   parseOsRelease,
   renderAsrService,
@@ -57,6 +61,10 @@ describe("install-cloudx helpers", () => {
 
     expect(commands[0]).toEqual(["sudo", "apt-get", "update"]);
     expect(commands[1]).toContain("build-essential");
+    expect(commands[1]).toContain("cmake");
+    expect(commands[1]).toContain("pciutils");
+    expect(commands[1]).toContain("gpg-agent");
+    expect(commands[1]).toContain("wget");
     expect(commands[1]).toContain("libreoffice");
     expect(commands[1]).toContain("poppler-utils");
     expect(commands[1]).toContain("ffmpeg");
@@ -139,6 +147,14 @@ describe("install-cloudx helpers", () => {
   });
 
   it("resolves CPU and GPU ASR device configuration", () => {
+    expect(resolveDeviceConfig({ gpuDetected: true, cudaRuntimeReady: true })).toEqual({
+      device: "cuda",
+      computeType: "float16"
+    });
+    expect(resolveDeviceConfig({ gpuDetected: true, cudaRuntimeReady: false })).toEqual({
+      device: "cpu",
+      computeType: "int8"
+    });
     expect(resolveDeviceConfig({ gpuDetected: true, useGpu: false, cudaRuntimeReady: false })).toEqual({
       device: "cpu",
       computeType: "int8"
@@ -148,6 +164,8 @@ describe("install-cloudx helpers", () => {
       computeType: "float16"
     });
     expect(() => resolveDeviceConfig({ gpuDetected: true, useGpu: true, cudaRuntimeReady: false })).toThrow(/CUDA\/cuDNN/);
+    expect(normalizeWhisperCppBuild("SYCL")).toBe("sycl");
+    expect(() => normalizeWhisperCppBuild("vulkan")).toThrow(/cpu or sycl/);
   });
 
   it("renders env and systemd units", () => {
@@ -267,6 +285,86 @@ describe("runInstaller dry-run", () => {
 
     expect(result.envConfig.host).toBe("0.0.0.0");
     expect(result.urls).toEqual(["https://127.0.0.1:3001", "https://192.0.2.249:3001"]);
+  });
+
+  it("plans optional whisper.cpp documentation ASR installation", async () => {
+    const runner = new InstallerRunner({ dryRun: true, cwd: "/repo", log: () => undefined });
+
+    const result = await runInstaller({
+      repoRoot: "/repo",
+      home: "/home/me",
+      env: TEST_ENV,
+      dryRun: true,
+      yes: true,
+      runner,
+      osRelease: { ID: "ubuntu", VERSION_ID: "24.04", PRETTY_NAME: "Ubuntu 24.04 LTS" },
+      gpuDetected: false,
+      cudaRuntimeReady: false,
+      intelGpuDetected: true,
+      parallelism: 12,
+      answers: {
+        installWhisperCpp: true,
+        whisperCppBuild: "sycl",
+        installServices: false,
+        runCodexLogin: true
+      }
+    });
+
+    const planned = runner.commands.map((command) => [command.command, ...command.args]);
+    expect(result.envConfig.documentationAsrBackend).toBe("whisper-cpp");
+    expect(result.envConfig.whisperCpp).toMatchObject({
+      build: "sycl",
+      model: WHISPER_CPP_MODEL,
+      bin: "/home/me/.local/share/cloudx/whisper.cpp/build-sycl/bin/whisper-cli",
+      modelPath: "/home/me/.cache/cloudx/models/whisper.cpp/ggml-large-v3-turbo.bin",
+      vadModelPath: "/home/me/.cache/cloudx/models/whisper.cpp/ggml-silero-v6.2.0.bin"
+    });
+    expect(planned).toContainEqual([
+      "bash",
+      "-lc",
+      "wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null"
+    ]);
+    expect(planned).toContainEqual([
+      "sudo",
+      "apt-get",
+      "install",
+      "-y",
+      "intel-oneapi-compiler-dpcpp-cpp",
+      "intel-oneapi-mkl-sycl-devel",
+      "intel-opencl-icd",
+      "libze-intel-gpu1",
+      "libze1",
+      "libze-dev",
+      "clinfo"
+    ]);
+    expect(planned).toContainEqual(["git", "clone", "--depth", "1", WHISPER_CPP_REPO_URL, "/home/me/.local/share/cloudx/whisper.cpp"]);
+    expect(planned).toContainEqual([
+      "bash",
+      "-lc",
+      "source /opt/intel/oneapi/setvars.sh >/dev/null && cmake -B '/home/me/.local/share/cloudx/whisper.cpp/build-sycl' -S '/home/me/.local/share/cloudx/whisper.cpp' -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx && cmake --build '/home/me/.local/share/cloudx/whisper.cpp/build-sycl' -j --config Release --target whisper-cli"
+    ]);
+    expect(planned).toContainEqual([
+      "bash",
+      "/home/me/.local/share/cloudx/whisper.cpp/models/download-ggml-model.sh",
+      "large-v3-turbo",
+      "/home/me/.cache/cloudx/models/whisper.cpp"
+    ]);
+    expect(planned).toContainEqual([
+      "bash",
+      "/home/me/.local/share/cloudx/whisper.cpp/models/download-vad-model.sh",
+      WHISPER_CPP_VAD_MODEL,
+      "/home/me/.cache/cloudx/models/whisper.cpp"
+    ]);
+    const env = runner.writes.find((write) => write.path === "/home/me/.config/cloudx/cloudx.env")?.contents;
+    expect(env).toContain("CLOUDX_DOCUMENTATION_ASR_BACKEND=whisper-cpp");
+    expect(env).toContain("CLOUDX_DOCUMENTATION_WHISPER_CPP_BUILD=sycl");
+    expect(env).toContain("CLOUDX_ASR_BACKEND=whisper-cpp");
+    expect(env).toContain("CLOUDX_ASR_WHISPER_CPP_MODEL_PATH=/home/me/.cache/cloudx/models/whisper.cpp/ggml-large-v3-turbo.bin");
+    expect(env).toContain("CLOUDX_ASR_WHISPER_CPP_VAD=true");
+    expect(env).toContain("CLOUDX_ASR_WHISPER_CPP_VAD_MODEL_PATH=/home/me/.cache/cloudx/models/whisper.cpp/ggml-silero-v6.2.0.bin");
+    expect(env).toContain("CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD=true");
+    expect(env).toContain("CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD_MODEL_PATH=/home/me/.cache/cloudx/models/whisper.cpp/ggml-silero-v6.2.0.bin");
+    expect(env).toContain("ONEAPI_DEVICE_SELECTOR=opencl:gpu");
   });
 
   it("plans service install, linger, and verification when services start", async () => {

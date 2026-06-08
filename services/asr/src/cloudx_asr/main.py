@@ -5,6 +5,9 @@ import hashlib
 import os
 import json
 import logging
+import re
+import shlex
+import subprocess
 import tempfile
 import time
 from collections import deque
@@ -13,18 +16,29 @@ from functools import lru_cache
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+
+class TranscriptionSegment(BaseModel):
+    start_seconds: float
+    end_seconds: float
+    text: str
 
 
 class TranscriptionResponse(BaseModel):
     text: str
     language: str | None = None
     language_probability: float | None = None
+    duration_seconds: float | None = None
+    duration_after_vad_seconds: float | None = None
+    segments: list[TranscriptionSegment] = Field(default_factory=list)
 
 
 app = FastAPI(title="Cloudx ASR", version="0.1.0")
 logger = logging.getLogger("cloudx_asr")
 MIN_DECODABLE_AUDIO_BYTES = 128
+ASR_BACKEND_FASTER_WHISPER = "faster-whisper"
+ASR_BACKEND_WHISPER_CPP = "whisper-cpp"
 
 
 class InvalidAudioInput(ValueError):
@@ -83,6 +97,19 @@ def get_model():
         cpu_threads=asr_cpu_threads(),
         num_workers=asr_num_workers(),
     )
+
+
+def asr_backend() -> str:
+    backend = os.getenv("CLOUDX_ASR_BACKEND", ASR_BACKEND_FASTER_WHISPER).strip().lower().replace("_", "-")
+    aliases = {
+        "fasterwhisper": ASR_BACKEND_FASTER_WHISPER,
+        ASR_BACKEND_FASTER_WHISPER: ASR_BACKEND_FASTER_WHISPER,
+        "whispercpp": ASR_BACKEND_WHISPER_CPP,
+        ASR_BACKEND_WHISPER_CPP: ASR_BACKEND_WHISPER_CPP,
+    }
+    if backend not in aliases:
+        raise RuntimeError(f"Unsupported ASR backend: {backend}. Use faster-whisper or whisper-cpp.")
+    return aliases[backend]
 
 
 def use_vad_filter() -> bool:
@@ -383,12 +410,18 @@ def write_partial_audio_file(filename: str, chunks: list[bytes]) -> Path:
 
 def transcribe_file(path: Path, beam_size: int | None = None) -> TranscriptionResponse:
     actual_beam_size = beam_size if beam_size is not None else final_beam_size()
-    segments, info = get_model().transcribe(
+    if asr_backend() == ASR_BACKEND_WHISPER_CPP:
+        return transcribe_file_whisper_cpp(path, actual_beam_size)
+    return transcribe_file_faster_whisper(path, actual_beam_size)
+
+
+def transcribe_file_faster_whisper(path: Path, beam_size: int) -> TranscriptionResponse:
+    raw_segments, info = get_model().transcribe(
         str(path),
         language=transcription_language(),
         task="transcribe",
-        beam_size=actual_beam_size,
-        best_of=max(1, actual_beam_size),
+        beam_size=beam_size,
+        best_of=max(1, beam_size),
         temperature=transcription_temperature(),
         vad_filter=use_vad_filter(),
         initial_prompt=None,
@@ -396,12 +429,166 @@ def transcribe_file(path: Path, beam_size: int | None = None) -> TranscriptionRe
         condition_on_previous_text=condition_on_previous_text(),
         max_new_tokens=max_new_tokens(),
     )
-    text = "".join(segment.text for segment in segments).strip()
+    segments = [
+        TranscriptionSegment(
+            start_seconds=float(getattr(segment, "start", 0.0) or 0.0),
+            end_seconds=float(getattr(segment, "end", getattr(segment, "start", 0.0)) or 0.0),
+            text=str(getattr(segment, "text", "")).strip(),
+        )
+        for segment in raw_segments
+        if str(getattr(segment, "text", "")).strip()
+    ]
+    text = " ".join(segment.text for segment in segments).strip()
     return TranscriptionResponse(
         text=text,
         language=getattr(info, "language", None),
         language_probability=getattr(info, "language_probability", None),
+        duration_seconds=getattr(info, "duration", None),
+        duration_after_vad_seconds=getattr(info, "duration_after_vad", None),
+        segments=segments,
     )
+
+
+def transcribe_file_whisper_cpp(path: Path, beam_size: int) -> TranscriptionResponse:
+    model_path = os.getenv("CLOUDX_ASR_WHISPER_CPP_MODEL_PATH", os.getenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_MODEL_PATH", "")).strip()
+    if not model_path:
+        raise RuntimeError("CLOUDX_ASR_WHISPER_CPP_MODEL_PATH is required when CLOUDX_ASR_BACKEND=whisper-cpp.")
+    binary = os.getenv("CLOUDX_ASR_WHISPER_CPP_BIN", os.getenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_BIN", "whisper-cli")).strip() or "whisper-cli"
+    with tempfile.TemporaryDirectory(prefix="cloudx-asr-whisper-cpp-") as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        wav_path = temp_dir / "input.wav"
+        convert_command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-i",
+            str(path),
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            str(wav_path),
+        ]
+        conversion = subprocess.run(convert_command, check=False, capture_output=True, text=True)
+        if conversion.returncode != 0:
+            raise RuntimeError(f"ffmpeg could not prepare audio for whisper.cpp: {conversion.stderr.strip() or conversion.stdout.strip() or conversion.returncode}")
+        output_base = temp_dir / "transcript"
+        command = [
+            binary,
+            "-m",
+            model_path,
+            "-f",
+            str(wav_path),
+            "-oj",
+            "-of",
+            str(output_base),
+            "-pp",
+            "-l",
+            transcription_language() or "auto",
+            "-bs",
+            str(beam_size),
+            "-t",
+            str(asr_whisper_cpp_threads()),
+            *asr_whisper_cpp_stability_args(),
+            *asr_whisper_cpp_vad_args(),
+            *asr_whisper_cpp_extra_args(),
+        ]
+        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"whisper.cpp transcription failed with code {result.returncode}: {tail_text(result.stderr or result.stdout)}")
+        output_json = output_base.with_suffix(".json")
+        if not output_json.exists():
+            raise RuntimeError(f"whisper.cpp transcription did not produce {output_json.name}.")
+        segments = parse_whisper_cpp_json(output_json)
+    text = " ".join(segment.text for segment in segments).strip()
+    duration = max((segment.end_seconds for segment in segments), default=None)
+    return TranscriptionResponse(text=text, language=transcription_language(), duration_seconds=duration, segments=segments)
+
+
+def asr_whisper_cpp_threads() -> int:
+    return max(1, read_int_env("CLOUDX_ASR_WHISPER_CPP_THREADS", asr_cpu_threads()))
+
+
+def asr_whisper_cpp_stability_args() -> list[str]:
+    return ["-sns", "-nf", "-mc", "0"]
+
+
+def asr_whisper_cpp_vad_args() -> list[str]:
+    enabled = os.getenv("CLOUDX_ASR_WHISPER_CPP_VAD", os.getenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD", "false")).strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return []
+    model_path = os.getenv("CLOUDX_ASR_WHISPER_CPP_VAD_MODEL_PATH", os.getenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD_MODEL_PATH", "")).strip()
+    if not model_path:
+        raise RuntimeError("CLOUDX_ASR_WHISPER_CPP_VAD_MODEL_PATH is required when CLOUDX_ASR_WHISPER_CPP_VAD=true.")
+    if not Path(model_path).exists():
+        raise RuntimeError(f"CLOUDX_ASR_WHISPER_CPP_VAD_MODEL_PATH does not exist: {model_path}")
+    return ["--vad", "--vad-model", model_path]
+
+
+def asr_whisper_cpp_extra_args() -> list[str]:
+    value = os.getenv("CLOUDX_ASR_WHISPER_CPP_ARGS", os.getenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_ARGS", "")).strip()
+    return shlex.split(value) if value else []
+
+
+def parse_whisper_cpp_json(path: Path) -> list[TranscriptionSegment]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    raw_segments = payload.get("transcription")
+    if not isinstance(raw_segments, list):
+        return []
+    segments: list[TranscriptionSegment] = []
+    for raw_segment in raw_segments:
+        if not isinstance(raw_segment, dict):
+            continue
+        text = str(raw_segment.get("text") or "").strip()
+        if not text:
+            continue
+        start_seconds, end_seconds = whisper_cpp_segment_seconds(raw_segment)
+        segments.append(TranscriptionSegment(start_seconds=start_seconds, end_seconds=max(start_seconds, end_seconds), text=text))
+    return segments
+
+
+def whisper_cpp_segment_seconds(segment: dict) -> tuple[float, float]:
+    offsets = segment.get("offsets")
+    if isinstance(offsets, dict):
+        start = optional_float(offsets.get("from"))
+        end = optional_float(offsets.get("to"))
+        if start is not None and end is not None:
+            return max(0.0, start / 1000.0), max(0.0, end / 1000.0)
+    timestamps = segment.get("timestamps")
+    if isinstance(timestamps, dict):
+        start = parse_whisper_cpp_timestamp(str(timestamps.get("from") or ""))
+        end = parse_whisper_cpp_timestamp(str(timestamps.get("to") or ""))
+        if start is not None and end is not None:
+            return start, end
+    return 0.0, 0.0
+
+
+def parse_whisper_cpp_timestamp(value: str) -> float | None:
+    match = re.fullmatch(r"(?:(\d+):)?(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?", value.strip())
+    if not match:
+        return None
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2))
+    seconds = int(match.group(3))
+    milliseconds = int((match.group(4) or "0").ljust(3, "0")[:3])
+    return hours * 3600 + minutes * 60 + seconds + milliseconds / 1000.0
+
+
+def optional_float(value) -> float | None:
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def tail_text(output: str) -> str:
+    return "\n".join(line for line in output.splitlines()[-10:] if line).strip()
+
 
 def read_float_env(name: str, default: float) -> float:
     value = os.getenv(name)

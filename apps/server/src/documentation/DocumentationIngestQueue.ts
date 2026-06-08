@@ -16,6 +16,19 @@ export interface DocumentationIngestJobSnapshot {
   startedAt?: string;
   finishedAt?: string;
   error?: string;
+  etaSeconds?: number;
+  metrics?: Record<string, unknown>;
+  progressChannels?: DocumentationIngestProgressChannel[];
+}
+
+export interface DocumentationIngestProgressChannel {
+  id: string;
+  label: string;
+  progress: number;
+  stage: string;
+  etaSeconds?: number;
+  metrics?: Record<string, unknown>;
+  updatedAt: string;
 }
 
 export interface DocumentationIngestQueueJobInput {
@@ -28,14 +41,22 @@ export interface DocumentationIngestQueueJobInput {
 }
 
 export interface DocumentationIngestQueueOperationContext {
-  update(patch: Pick<Partial<DocumentationIngestJobSnapshot>, "progress" | "stage">): void;
+  update(patch: DocumentationIngestQueueUpdate): void;
 }
 
 export type DocumentationIngestProgressReporter = (snapshot: DocumentationIngestJobSnapshot) => void;
 
 interface DocumentationIngestJobState extends DocumentationIngestJobSnapshot {
   result?: Record<string, unknown>;
+  progressChannelsById?: Map<string, DocumentationIngestProgressChannel>;
 }
+
+export type DocumentationIngestQueueUpdate = Pick<Partial<DocumentationIngestJobSnapshot>, "progress" | "stage" | "etaSeconds" | "metrics"> & {
+  channelId?: string;
+  channelLabel?: string;
+  channelStage?: string;
+  channelProgress?: number;
+};
 
 const MAX_RETAINED_JOBS = 30;
 const PROGRESS_HEARTBEAT_MS = 5_000;
@@ -109,6 +130,13 @@ export class DocumentationIngestQueue {
           if (patch.stage !== undefined) {
             job.stage = patch.stage;
           }
+          if (patch.etaSeconds !== undefined) {
+            job.etaSeconds = boundedEtaSeconds(patch.etaSeconds);
+          }
+          if (patch.metrics !== undefined) {
+            job.metrics = patch.metrics;
+          }
+          this.updateProgressChannel(job, patch);
           this.report(job, reportProgress);
         }
       });
@@ -151,8 +179,32 @@ export class DocumentationIngestQueue {
       createdAt: job.createdAt,
       startedAt: job.startedAt,
       finishedAt: job.finishedAt,
-      error: job.error
+      error: job.error,
+      etaSeconds: job.etaSeconds,
+      metrics: job.metrics,
+      progressChannels: job.progressChannelsById ? Array.from(job.progressChannelsById.values()) : undefined
     };
+  }
+
+  private updateProgressChannel(job: DocumentationIngestJobState, patch: DocumentationIngestQueueUpdate): void {
+    if (!patch.channelId) {
+      return;
+    }
+    const id = normalizeProgressChannelId(patch.channelId);
+    if (!id) {
+      return;
+    }
+    const existing = job.progressChannelsById?.get(id);
+    job.progressChannelsById ??= new Map();
+    job.progressChannelsById.set(id, {
+      id,
+      label: patch.channelLabel?.trim() || existing?.label || id,
+      progress: patch.channelProgress !== undefined ? boundedProgress(patch.channelProgress) : patch.progress !== undefined ? boundedProgress(patch.progress) : existing?.progress ?? job.progress,
+      stage: patch.channelStage?.trim() || patch.stage?.trim() || existing?.stage || job.stage,
+      etaSeconds: patch.etaSeconds !== undefined ? boundedEtaSeconds(patch.etaSeconds) : existing?.etaSeconds,
+      metrics: patch.metrics !== undefined ? patch.metrics : existing?.metrics,
+      updatedAt: new Date().toISOString()
+    });
   }
 
   private position(job: DocumentationIngestJobState): number {
@@ -189,6 +241,17 @@ function boundedProgress(value: number): number {
     return 0;
   }
   return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+function boundedEtaSeconds(value: number): number | undefined {
+  if (!Number.isFinite(value) || value < 0) {
+    return undefined;
+  }
+  return Math.round(value);
+}
+
+function normalizeProgressChannelId(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9]+/gu, "-").replace(/^-|-$/gu, "");
 }
 
 function isJob(value: DocumentationIngestJobState | undefined): value is DocumentationIngestJobState {

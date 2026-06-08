@@ -8,9 +8,18 @@ export interface TranscriptionResult {
   text: string;
   language?: string;
   language_probability?: number;
+  duration_seconds?: number;
+  duration_after_vad_seconds?: number;
+  segments?: TranscriptionSegment[];
 }
 
 export interface PartialTranscriptionResult {
+  text: string;
+}
+
+export interface TranscriptionSegment {
+  start_seconds: number;
+  end_seconds: number;
   text: string;
 }
 
@@ -20,6 +29,9 @@ interface AsrStreamMessage {
   text?: string;
   language?: string;
   language_probability?: number;
+  duration_seconds?: number;
+  duration_after_vad_seconds?: number;
+  segments?: unknown;
 }
 
 export interface AsrClientOptions {
@@ -200,7 +212,10 @@ function waitForTranscript(ws: WebSocket, responseMaxBytes: number, onPartial?: 
         resolveOnce({
           text: message.text,
           language: message.language,
-          language_probability: message.language_probability
+          language_probability: message.language_probability,
+          duration_seconds: typeof message.duration_seconds === "number" ? message.duration_seconds : undefined,
+          duration_after_vad_seconds: typeof message.duration_after_vad_seconds === "number" ? message.duration_after_vad_seconds : undefined,
+          segments: parseTranscriptionSegments(message.segments)
         });
         return;
       }
@@ -287,7 +302,10 @@ export function parseAsrStreamMessage(raw: WebSocket.RawData, maxBytes = DEFAULT
       message: typeof parsed.message === "string" ? parsed.message : undefined,
       text: typeof parsed.text === "string" ? parsed.text : undefined,
       language: typeof parsed.language === "string" ? parsed.language : undefined,
-      language_probability: typeof parsed.language_probability === "number" ? parsed.language_probability : undefined
+      language_probability: typeof parsed.language_probability === "number" ? parsed.language_probability : undefined,
+      duration_seconds: typeof parsed.duration_seconds === "number" ? parsed.duration_seconds : undefined,
+      duration_after_vad_seconds: typeof parsed.duration_after_vad_seconds === "number" ? parsed.duration_after_vad_seconds : undefined,
+      segments: parsed.segments
     };
   } catch {
     return undefined;
@@ -342,8 +360,25 @@ function parseAsrHttpResponse(value: unknown): TranscriptionResult {
   return {
     text: value.text,
     language: typeof value.language === "string" ? value.language : undefined,
-    language_probability: typeof value.language_probability === "number" ? value.language_probability : undefined
+    language_probability: typeof value.language_probability === "number" ? value.language_probability : undefined,
+    duration_seconds: typeof value.duration_seconds === "number" ? value.duration_seconds : undefined,
+    duration_after_vad_seconds: typeof value.duration_after_vad_seconds === "number" ? value.duration_after_vad_seconds : undefined,
+    segments: parseTranscriptionSegments(value.segments)
   };
+}
+
+function parseTranscriptionSegments(value: unknown): TranscriptionSegment[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  return value
+    .filter(isRecord)
+    .map((segment) => ({
+      start_seconds: typeof segment.start_seconds === "number" ? segment.start_seconds : 0,
+      end_seconds: typeof segment.end_seconds === "number" ? segment.end_seconds : 0,
+      text: typeof segment.text === "string" ? segment.text : ""
+    }))
+    .filter((segment) => segment.text);
 }
 
 function rawAsrMessageToString(raw: WebSocket.RawData): string {

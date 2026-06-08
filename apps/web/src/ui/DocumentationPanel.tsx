@@ -140,6 +140,18 @@ export interface DocumentationServerIngestJob {
   stage?: string;
   position?: number;
   error?: string;
+  etaSeconds?: number;
+  metrics?: Record<string, unknown>;
+  progressChannels?: DocumentationIngestProgressChannel[];
+}
+
+export interface DocumentationIngestProgressChannel {
+  id: string;
+  label: string;
+  progress?: number;
+  stage?: string;
+  etaSeconds?: number;
+  metrics?: Record<string, unknown>;
 }
 
 export type DocumentationIngestRequest =
@@ -158,6 +170,8 @@ export interface DocumentationIngestJob {
   stage: string;
   error?: string;
   notice?: string;
+  etaSeconds?: number;
+  metrics?: Record<string, unknown>;
 }
 
 interface DocumentationIngestJobView {
@@ -169,6 +183,9 @@ interface DocumentationIngestJobView {
   stage: string;
   error?: string;
   notice?: string;
+  etaSeconds?: number;
+  metrics?: Record<string, unknown>;
+  progressChannels?: DocumentationIngestProgressChannel[];
 }
 
 export interface DocumentationPanelState {
@@ -218,7 +235,7 @@ export function createInitialDocumentationPanelState(): DocumentationPanelState 
     selectedDocument: undefined,
     documents: [],
     stats: {},
-    status: "Documentation archive not loaded.",
+    status: "",
     busy: false,
     searchBusy: false,
     documentBusy: false,
@@ -283,6 +300,9 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   const [ingestJobs, setIngestJobs] = useDocumentationStateField("ingestJobs", state, onStateChange);
   const [serverIngestJobs, setServerIngestJobs] = useDocumentationStateField("serverIngestJobs", state, onStateChange);
   const sourceViewerRef = useRef<HTMLElement | null>(null);
+  const sourceChunkListRef = useRef<HTMLDivElement | null>(null);
+  const sourceAutoLoadSentinelRef = useRef<HTMLDivElement | null>(null);
+  const sourceAutoLoadInFlightRef = useRef(false);
   const sourceViewerScrollDocumentIdRef = useRef("");
   const aiNoticeId = useId();
   const ingestController = useMemo(() => documentationIngestController(stateKey), [stateKey]);
@@ -323,6 +343,21 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
     }
   }, [selectedDocument]);
 
+  useEffect(() => {
+    const target = sourceAutoLoadSentinelRef.current;
+    const root = sourceChunkListRef.current;
+    if (!target || !root || !selectedDocument || !sourceNeedsAutoLoad(selectedDocument) || documentBusy || !canCall || typeof window.IntersectionObserver !== "function") {
+      return undefined;
+    }
+    const observer = new window.IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
+        void loadNextSourceWindow();
+      }
+    }, { root, rootMargin: "120px 0px" });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [selectedDocument, documentBusy, canCall]);
+
   async function call<T extends Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}): Promise<T> {
     if (!callHook) {
       throw new Error("Documentation hook bridge is not available.");
@@ -331,7 +366,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   }
 
   async function refresh() {
-    await run("Documentation archive refreshed.", async () => {
+    await run(async () => {
       await Promise.all([loadArchiveSummary(), loadIngestQueue()]);
     });
   }
@@ -369,18 +404,15 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
     setAnswer(undefined);
     setResults([]);
     setSearchBusy(true);
-    setStatus(searchRunningStatus(searchPresentationMode, aiAssistanceEnabled));
+    setStatus("");
     try {
-      await run("Search completed.", async () => {
+      await run(async () => {
         if (searchPresentationMode === "answer" && aiAssistanceEnabled) {
           const result = await call<Record<string, unknown>>("documentation.answer", searchInput({ includeQuestion: true }));
           const answerResult = result as unknown as DocumentationAnswer;
           setAnswer(answerResult);
           setResults(answerResult.results ?? []);
           return;
-        }
-        if (searchPresentationMode === "answer" && !aiAssistanceEnabled) {
-          setStatus("AI assistance is disabled. Manual search is available for source text only.");
         }
         const result = await call<{ results: DocumentationSearchResult[] }>("documentation.search", searchInput());
         setResults(result.results ?? []);
@@ -420,7 +452,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
       ingestController.queue.push(job);
       setIngestJobs((current) => [...current, job]);
       resetIngestForm();
-      setStatus(`Queued ${job.label}.`);
+      setStatus("");
       void processIngestQueue();
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -453,9 +485,6 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
 
   async function processIngestJob(job: DocumentationIngestJob) {
     updateIngestJob(job.id, { status: "running", progress: 5, stage: initialIngestStage(job.request) });
-    if (!ingestController.disposed) {
-      setStatus(`Importing ${job.label}.`);
-    }
     try {
       const ingestResponse = await runIngestRequest(job);
       if (ingestController.disposed) {
@@ -474,7 +503,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
         notice: enrichmentNotice?.notice
       });
       await loadIngestQueue();
-      setStatus(enrichmentNotice?.status ?? `Imported ${job.label}.`);
+      setStatus("");
     } catch (error) {
       if (ingestController.disposed) {
         return;
@@ -540,7 +569,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   }
 
   async function invalidate(documentId: string, state: string) {
-    await run(`Document marked ${state}.`, async () => {
+    await run(async () => {
       await call("documentation.invalidate", { documentId, state, reason: `Marked ${state} from the CloudX Documentation panel.` });
       await search();
       await refresh();
@@ -548,7 +577,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   }
 
   async function remove(targetDocumentId: string) {
-    await run("Document removed from active search.", async () => {
+    await run(async () => {
       await call("documentation.remove", { documentId: targetDocumentId });
       setSelectedDocument((current) => current && documentId(current) === targetDocumentId ? undefined : current);
       await search();
@@ -565,10 +594,10 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
       return;
     }
     setDocumentBusy(true);
+    setStatus("");
     try {
       const result = await call<{ document?: DocumentationDetail }>("documentation.documents.get", sourceDocumentWindowInput(id));
       setSelectedDocument(result.document);
-      setStatus("Source loaded.");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -576,67 +605,50 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
     }
   }
 
-  async function loadMoreSourceChunks() {
+  async function loadNextSourceWindow() {
     const current = selectedDocument;
     const id = current ? documentId(current) : "";
-    if (!current || !id) {
+    if (!current || !id || sourceAutoLoadInFlightRef.current) {
       return;
     }
+    const currentChunks = current.chunks ?? [];
+    const currentArtifacts = current.artifacts ?? [];
+    const hasMoreChunks = current.chunkWindow?.hasMore === true;
+    const targetChunkCount = hasMoreChunks ? currentChunks.length + SOURCE_CHUNK_PAGE_SIZE : currentChunks.length;
+    const artifactLimit = sourceArtifactRequestLimit(current, targetChunkCount);
+    if (!hasMoreChunks && artifactLimit <= 0) {
+      return;
+    }
+    sourceAutoLoadInFlightRef.current = true;
     setDocumentBusy(true);
+    setStatus("");
     try {
-      const currentChunks = current.chunks ?? [];
       const result = await call<{ document?: DocumentationDetail }>("documentation.documents.get", {
         documentId: id,
         chunkOffset: currentChunks.length,
-        chunkLimit: SOURCE_CHUNK_PAGE_SIZE,
-        chunkTextMaxChars: SOURCE_CHUNK_TEXT_MAX_CHARS,
-        artifactOffset: current.artifacts?.length ?? 0,
-        artifactLimit: 0
-      });
-      setSelectedDocument((latest) => latest && documentId(latest) === id ? mergeSourceWindow(latest, result.document, "chunks") : latest);
-      setStatus("Loaded more source chunks.");
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : String(error));
-    } finally {
-      setDocumentBusy(false);
-    }
-  }
-
-  async function loadMoreSourceArtifacts() {
-    const current = selectedDocument;
-    const id = current ? documentId(current) : "";
-    if (!current || !id) {
-      return;
-    }
-    setDocumentBusy(true);
-    try {
-      const currentArtifacts = current.artifacts ?? [];
-      const result = await call<{ document?: DocumentationDetail }>("documentation.documents.get", {
-        documentId: id,
-        chunkOffset: current.chunks?.length ?? 0,
-        chunkLimit: 0,
+        chunkLimit: hasMoreChunks ? SOURCE_CHUNK_PAGE_SIZE : 0,
         chunkTextMaxChars: SOURCE_CHUNK_TEXT_MAX_CHARS,
         artifactOffset: currentArtifacts.length,
-        artifactLimit: SOURCE_ARTIFACT_PAGE_SIZE
+        artifactLimit
       });
-      setSelectedDocument((latest) => latest && documentId(latest) === id ? mergeSourceWindow(latest, result.document, "artifacts") : latest);
-      setStatus("Loaded more source artifacts.");
+      setSelectedDocument((latest) => latest && documentId(latest) === id ? mergeSourceWindow(latest, result.document) : latest);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
+      sourceAutoLoadInFlightRef.current = false;
       setDocumentBusy(false);
     }
   }
 
-  async function run(message: string, operation: () => Promise<void>) {
+  async function run(operation: () => Promise<void>) {
     if (!canCall) {
       setStatus("Documentation hook bridge is not available.");
       return;
     }
     setBusy(true);
+    setStatus("");
     try {
       await operation();
-      setStatus(message);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -677,6 +689,8 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
         </div>
       </header>
 
+      {status ? <div className="documentation-notice" role="alert">{status}</div> : null}
+
       <form className="documentation-search" onSubmit={(event) => void search(event)}>
         <label>
           <span>{searchPresentationMode === "answer" ? "Question" : "Search"}</span>
@@ -708,33 +722,22 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
               {selectedDocument.artifacts?.length || selectedDocument.artifactWindow?.total ? <p>{sourceWindowLabel(selectedDocument.artifacts?.length ?? 0, selectedDocument.artifactWindow, "extracted artifacts")} available.</p> : null}
             </div>
             <div className="documentation-source-actions">
-              {selectedDocument.chunkWindow?.hasMore ? (
-                <ControlButton size="compact" disabled={documentBusy} onClick={() => void loadMoreSourceChunks()}>Load More Chunks</ControlButton>
-              ) : null}
-              {selectedDocument.artifactWindow?.hasMore ? (
-                <ControlButton size="compact" disabled={documentBusy} onClick={() => void loadMoreSourceArtifacts()}>Load More Artifacts</ControlButton>
-              ) : null}
               <ControlButton size="compact" tone="danger" disabled={busy || !selectedDocumentId} onClick={() => void remove(selectedDocumentId)} title="Remove document">
                 <Trash2 size={13} /> Remove
               </ControlButton>
               <ControlButton size="compact" onClick={() => setSelectedDocument(undefined)}>Close</ControlButton>
             </div>
           </div>
-          <div className="documentation-chunk-list">
+          <div ref={sourceChunkListRef} className="documentation-chunk-list">
             {(selectedDocument.chunks ?? []).map((chunk) => (
               <DocumentationChunkArticle key={`${chunkId(chunk)}:${chunk.locator ?? "chunk"}`} document={selectedDocument} chunk={chunk} />
             ))}
+            {sourceNeedsAutoLoad(selectedDocument) ? (
+              <div ref={sourceAutoLoadSentinelRef} className="documentation-source-autoload" aria-live="polite">
+                <span>{documentBusy ? "Loading more source data." : sourceAutoLoadLabel(selectedDocument)}</span>
+              </div>
+            ) : null}
           </div>
-          {selectedDocument.chunkWindow?.hasMore || selectedDocument.artifactWindow?.hasMore ? (
-            <div className="documentation-source-footer">
-              {selectedDocument.chunkWindow?.hasMore ? (
-                <ControlButton size="compact" disabled={documentBusy} onClick={() => void loadMoreSourceChunks()}>Load More Chunks</ControlButton>
-              ) : null}
-              {selectedDocument.artifactWindow?.hasMore ? (
-                <ControlButton size="compact" disabled={documentBusy} onClick={() => void loadMoreSourceArtifacts()}>Load More Artifacts</ControlButton>
-              ) : null}
-            </div>
-          ) : null}
         </section>
       ) : null}
 
@@ -868,7 +871,6 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
         </section>
       </div> : null}
 
-      <footer className="documentation-status" aria-live="polite">{status}</footer>
     </div>
   );
 }
@@ -928,6 +930,8 @@ function DocumentationArtifactPreview({ document, artifact }: { document: Docume
 }
 
 function IngestQueueJob({ job, index }: { job: DocumentationIngestJobView; index: number }) {
+  const progressChannels = job.progressChannels ?? [];
+  const hasProgressChannels = progressChannels.length > 0;
   return (
     <article className={`documentation-ingest-job documentation-ingest-job-${job.status}`}>
       <div className="documentation-ingest-job-main">
@@ -936,14 +940,38 @@ function IngestQueueJob({ job, index }: { job: DocumentationIngestJobView; index
       </div>
       <div className="documentation-ingest-job-state">
         <span>{ingestJobStatusLabel(job.status)}</span>
-        <small>{job.stage}</small>
+        {!hasProgressChannels ? <small>{job.stage}</small> : null}
+        {!hasProgressChannels && job.etaSeconds !== undefined ? <small>ETA {formatDuration(job.etaSeconds)}</small> : null}
+        {!hasProgressChannels && job.metrics ? <small>{formatIngestMetrics(job.metrics)}</small> : null}
       </div>
+      {hasProgressChannels ? (
+        <div className="documentation-ingest-channels" aria-label={`${job.label} parallel progress`}>
+          {progressChannels.map((channel) => <IngestProgressChannel key={channel.id} channel={channel} />)}
+        </div>
+      ) : null}
       <div className="documentation-ingest-progress" role="progressbar" aria-label={`${job.label} progress`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={job.progress}>
         <span style={{ width: `${job.progress}%` }} />
       </div>
       {job.error ? <p>{job.error}</p> : null}
       {job.notice ? <p>{job.notice}</p> : null}
     </article>
+  );
+}
+
+function IngestProgressChannel({ channel }: { channel: DocumentationIngestProgressChannel }) {
+  const metrics = channel.metrics ? formatIngestMetrics(channel.metrics) : "";
+  return (
+    <div className="documentation-ingest-channel">
+      <span>{channel.label}</span>
+      <small>{channel.stage || "Waiting for progress."}</small>
+      {channel.etaSeconds !== undefined ? <small>ETA {formatDuration(channel.etaSeconds)}</small> : null}
+      {metrics ? <small>{metrics}</small> : null}
+      {channel.progress !== undefined ? (
+        <div className="documentation-ingest-channel-progress" role="progressbar" aria-label={`${channel.label} progress`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={channel.progress}>
+          <span style={{ width: `${channel.progress}%` }} />
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -1032,8 +1060,36 @@ function serverIngestJobView(job: DocumentationServerIngestJob): DocumentationIn
     progress: Math.max(0, Math.min(100, Math.round(job.progress ?? 0))),
     status: job.status ?? "queued",
     stage: job.stage?.trim() || "Waiting for documentation import.",
-    error: job.error
+    error: job.error,
+    etaSeconds: typeof job.etaSeconds === "number" ? job.etaSeconds : undefined,
+    metrics: job.metrics && typeof job.metrics === "object" ? job.metrics : undefined,
+    progressChannels: normalizeProgressChannels(job.progressChannels)
   };
+}
+
+function normalizeProgressChannels(value: unknown): DocumentationIngestProgressChannel[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const channels = value.flatMap((item): DocumentationIngestProgressChannel[] => {
+    if (!item || typeof item !== "object") {
+      return [];
+    }
+    const record = item as Record<string, unknown>;
+    const id = typeof record.id === "string" && record.id.trim() ? record.id.trim() : undefined;
+    if (!id) {
+      return [];
+    }
+    return [{
+      id,
+      label: typeof record.label === "string" && record.label.trim() ? record.label.trim() : id,
+      progress: typeof record.progress === "number" ? Math.max(0, Math.min(100, Math.round(record.progress))) : undefined,
+      stage: typeof record.stage === "string" && record.stage.trim() ? record.stage.trim() : undefined,
+      etaSeconds: typeof record.etaSeconds === "number" ? record.etaSeconds : undefined,
+      metrics: record.metrics && typeof record.metrics === "object" ? record.metrics as Record<string, unknown> : undefined
+    }];
+  });
+  return channels.length ? channels : undefined;
 }
 
 function initialIngestStage(request: DocumentationIngestRequest): string {
@@ -1163,36 +1219,16 @@ function sourceDocumentWindowInput(documentIdValue: string): Record<string, unkn
   };
 }
 
-function mergeSourceWindow(current: DocumentationDetail, next: DocumentationDetail | undefined, mode: "chunks" | "artifacts"): DocumentationDetail {
+function mergeSourceWindow(current: DocumentationDetail, next: DocumentationDetail | undefined): DocumentationDetail {
   if (!next) {
     return current;
   }
-  if (mode === "chunks") {
-    return {
-      ...current,
-      chunks: uniqueChunks([...(current.chunks ?? []), ...(next.chunks ?? [])]),
-      chunkWindow: next.chunkWindow ?? current.chunkWindow,
-      artifactWindow: mergeWindowTotal(current.artifactWindow, next.artifactWindow)
-    };
-  }
   return {
     ...current,
+    chunks: uniqueChunks([...(current.chunks ?? []), ...(next.chunks ?? [])]),
     artifacts: uniqueArtifacts([...(current.artifacts ?? []), ...(next.artifacts ?? [])]),
-    artifactWindow: next.artifactWindow ?? current.artifactWindow,
-    chunkWindow: mergeWindowTotal(current.chunkWindow, next.chunkWindow)
-  };
-}
-
-function mergeWindowTotal(current: DocumentationWindow | undefined, next: DocumentationWindow | undefined): DocumentationWindow | undefined {
-  if (!current) {
-    return next;
-  }
-  if (!next) {
-    return current;
-  }
-  return {
-    ...current,
-    total: next.total ?? current.total
+    chunkWindow: next.chunkWindow ?? current.chunkWindow,
+    artifactWindow: next.artifactWindow ?? current.artifactWindow
   };
 }
 
@@ -1210,6 +1246,27 @@ function uniqueChunks(chunks: DocumentationChunk[]): DocumentationChunk[] {
 
 function sourceWindowLabel(loaded: number, window: DocumentationWindow | undefined, label: string): string {
   return typeof window?.total === "number" ? `${formatCount(loaded)} of ${formatCount(window.total)} ${label}` : `${formatCount(loaded)} ${label}`;
+}
+
+function sourceNeedsAutoLoad(document: DocumentationDetail): boolean {
+  return document.chunkWindow?.hasMore === true || sourceArtifactRequestLimit(document, document.chunks?.length ?? 0) > 0;
+}
+
+function sourceArtifactRequestLimit(document: DocumentationDetail, targetChunkCount: number): number {
+  if (document.artifactWindow?.hasMore !== true) {
+    return 0;
+  }
+  const loadedArtifacts = document.artifacts?.length ?? 0;
+  const totalArtifacts = document.artifactWindow.total;
+  const targetArtifacts = typeof totalArtifacts === "number" ? Math.min(Math.max(0, targetChunkCount), totalArtifacts) : Math.max(0, targetChunkCount);
+  return Math.max(0, targetArtifacts - loadedArtifacts);
+}
+
+function sourceAutoLoadLabel(document: DocumentationDetail): string {
+  if (document.chunkWindow?.hasMore === true) {
+    return "More source chunks load automatically here.";
+  }
+  return "More extracted artifacts load automatically here.";
 }
 
 function numberStat(value: unknown): number {
@@ -1291,10 +1348,6 @@ function sanitizeDocumentationAnswerHtml(html: string): string {
   return DOMPurify.sanitize(html, DOCUMENTATION_ANSWER_SANITIZE_CONFIG);
 }
 
-function searchRunningStatus(mode: SearchPresentationMode, aiAssistanceEnabled: boolean): string {
-  return mode === "answer" && aiAssistanceEnabled ? "AI assisted search is running." : "Search is running.";
-}
-
 function ingestReady(mode: IngestMode, uploadValue: File | undefined, pathValue: string, urlValue: string, textValue: string): boolean {
   if (mode === "upload") {
     return Boolean(uploadValue);
@@ -1324,6 +1377,54 @@ function formatCount(value: number): string {
 
 function formatUploadBytes(uploadedBytes: number, totalBytes: number | undefined): string {
   return totalBytes ? `${formatBytes(Math.min(uploadedBytes, totalBytes))} / ${formatBytes(totalBytes)}` : formatBytes(uploadedBytes);
+}
+
+function formatDuration(seconds: number): string {
+  const total = Math.max(0, Math.round(seconds));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const remainingSeconds = total % 60;
+  if (hours) {
+    return `${hours}h ${minutes}m`;
+  }
+  if (minutes) {
+    return `${minutes}m ${remainingSeconds}s`;
+  }
+  return `${remainingSeconds}s`;
+}
+
+function formatIngestMetrics(metrics: Record<string, unknown>): string {
+  const parts = [
+    downloadMetric(metrics),
+    metricPart(metrics, "transcribedSeconds", "transcribed", formatDuration),
+    metricPart(metrics, "framesScanned", "scanned", formatCount),
+    metricPart(metrics, "candidateFrames", "candidates", formatCount),
+    metricPart(metrics, "selectedFrames", "slides", formatCount),
+    playlistMetric(metrics)
+  ].filter((part): part is string => Boolean(part));
+  return parts.slice(0, 3).join(" · ");
+}
+
+function metricPart(metrics: Record<string, unknown>, key: string, label: string, format: (value: number) => string): string | undefined {
+  const value = metrics[key];
+  return typeof value === "number" && Number.isFinite(value) ? `${label} ${format(value)}` : undefined;
+}
+
+function playlistMetric(metrics: Record<string, unknown>): string | undefined {
+  const index = metrics.playlistIndex;
+  const total = metrics.playlistTotal;
+  return typeof index === "number" && typeof total === "number" ? `playlist ${index}/${total}` : undefined;
+}
+
+function downloadMetric(metrics: Record<string, unknown>): string | undefined {
+  const downloaded = metrics.downloadedBytes;
+  const total = metrics.totalBytes;
+  if (typeof downloaded !== "number" || !Number.isFinite(downloaded)) {
+    return undefined;
+  }
+  return typeof total === "number" && Number.isFinite(total)
+    ? `downloaded ${formatBytes(Math.min(downloaded, total))} / ${formatBytes(total)}`
+    : `downloaded ${formatBytes(downloaded)}`;
 }
 
 export default DocumentationPanel;

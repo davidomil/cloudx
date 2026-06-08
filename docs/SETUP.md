@@ -41,9 +41,10 @@ The installer is split into two visible phases:
 2. `scripts/install-cloudx.mjs` is the Cloudx wizard. It prints each phase as it
    runs: Codex CLI verification/login, install choices, `npm ci`, ASR virtualenv
    setup, documentation-indexer virtualenv setup with table-aware extraction
-   dependencies, Hugging Face model download, `npm run build`, certificate
-   creation, `~/.config/cloudx/cloudx.env` rendering, and optional user-level
-   systemd service installation. When services are started, the wizard waits for
+   dependencies, optional `whisper.cpp` ASR setup, Hugging Face
+   model download, `npm run build`, certificate creation,
+   `~/.config/cloudx/cloudx.env` rendering, and optional user-level systemd
+   service installation. When services are started, the wizard waits for
    the HTTPS app health endpoint and ASR health endpoint with bounded retries;
    if either endpoint does not become healthy, it prints recent systemd status
    and journal output. When the install finishes, it prints
@@ -55,10 +56,16 @@ The wizard asks for:
 - Allowed workspace roots, written to `CLOUDX_ALLOWED_ROOTS`.
 - HTTPS port and optional extra certificate hostnames.
 - ASR CPU thread count.
-- Whether to use a detected NVIDIA GPU. GPU mode is configure-only and requires
-  CUDA/cuDNN runtime libraries to already be installed.
+- Optional `whisper.cpp` ASR setup for documentation imports and voice control.
+  Choose `sycl` only after the Intel GPU runtime, oneAPI, and device access are
+  available.
 - Whether to write/start `cloudx.service` and `cloudx-asr.service`.
 - Whether to enable systemd linger so user services can survive logout.
+
+When an NVIDIA GPU and CUDA/cuDNN runtime are detected, faster-whisper ASR is
+configured for CUDA automatically. If NVIDIA is present but the runtime is not
+ready, the installer keeps faster-whisper on CPU and prints the missing runtime
+condition.
 
 Each prompt includes a short explanation before the question so the tradeoff is
 visible during interactive installs.
@@ -102,6 +109,9 @@ The answers JSON can contain:
   "certificateHosts": "",
   "cpuThreads": 6,
   "useGpu": false,
+  "installWhisperCpp": false,
+  "whisperCppBuild": "sycl",
+  "whisperCppModel": "large-v3-turbo",
   "installServices": true,
   "startServices": true,
   "enableLinger": true,
@@ -109,9 +119,10 @@ The answers JSON can contain:
 }
 ```
 
-GPU support is configure-only in the first Ubuntu installer. If an NVIDIA GPU is
-detected, the wizard asks whether to use it; choosing GPU requires CUDA/cuDNN
-runtime libraries to already be installed.
+Faster-whisper GPU support is configure-only in the first Ubuntu installer. If
+an NVIDIA GPU and CUDA/cuDNN runtime are detected, the wizard writes
+`CLOUDX_ASR_DEVICE=cuda` and `CLOUDX_ASR_COMPUTE_TYPE=float16` automatically.
+Set `"useGpu": false` in answers JSON to force CPU.
 
 ## Update
 
@@ -196,10 +207,9 @@ npm run documentation:setup
 ```
 
 That command creates `services/documentation-indexer/.venv` and installs the
-indexer with the PDF, image, table, Docling, YouTube transcript, and YouTube
-playlist metadata dependencies used for large datasheets and media sources.
-FFmpeg is installed by the main installer and is required for media and YouTube
-keyframe extraction.
+indexer with the PDF, image, table, Docling, yt-dlp, and faster-whisper
+dependencies used for large datasheets and media sources. FFmpeg is installed by
+the main installer and is required for media and YouTube slide-frame extraction.
 
 Start it on the default localhost endpoint:
 
@@ -318,6 +328,51 @@ CLOUDX_ASR_LANGUAGE=en \
 CLOUDX_ASR_CPU_THREADS=12 \
 services/asr/.venv/bin/uvicorn cloudx_asr.main:app --app-dir services/asr/src --host 127.0.0.1 --port 7810
 ```
+
+## ASR Backends
+
+YouTube documentation ingest uses faster-whisper by default:
+
+```bash
+CLOUDX_DOCUMENTATION_ASR_BACKEND=faster-whisper
+```
+
+Direct faster-whisper GPU acceleration requires NVIDIA CUDA. Intel Arc GPUs do
+not use the faster-whisper CUDA path. For Intel Arc, install the optional
+`whisper.cpp` backend after oneAPI and GPU device access are available:
+
+```bash
+node scripts/install-cloudx.mjs --answers ./answers.json
+```
+
+Use `"installWhisperCpp": true`, `"whisperCppBuild": "sycl"`, and
+`"whisperCppModel": "large-v3-turbo"` in `answers.json`. The installer clones
+`ggml-org/whisper.cpp` under `~/.local/share/cloudx/whisper.cpp`, builds
+`whisper-cli`, downloads the GGML model under
+`~/.cache/cloudx/models/whisper.cpp`, downloads the Silero VAD model, and writes
+the same backend, binary, model, VAD, and thread settings for both voice control
+and documentation import. VAD is important for long videos because silent
+windows can otherwise be decoded as repeated filler text instead of being
+skipped:
+
+```bash
+CLOUDX_ASR_BACKEND=whisper-cpp
+CLOUDX_ASR_WHISPER_CPP_BIN=...
+CLOUDX_ASR_WHISPER_CPP_MODEL_PATH=...
+CLOUDX_ASR_WHISPER_CPP_VAD=true
+CLOUDX_ASR_WHISPER_CPP_VAD_MODEL_PATH=...
+CLOUDX_DOCUMENTATION_ASR_BACKEND=whisper-cpp
+CLOUDX_DOCUMENTATION_WHISPER_CPP_BIN=...
+CLOUDX_DOCUMENTATION_WHISPER_CPP_MODEL_PATH=...
+CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD=true
+CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD_MODEL_PATH=...
+ONEAPI_DEVICE_SELECTOR=opencl:gpu
+```
+
+For Docker or containerized runs on Linux, the container must see `/dev/dri` and
+the process user must have render/video access. The host also needs the Intel
+graphics compute runtime. Inside the container, `ls /dev/dri` and `clinfo -l` or
+`sycl-ls` should show the Arc device before selecting the `whisper-cpp` backend.
 
 For a small first test, omit `CLOUDX_ASR_MODEL_PATH` and set
 `CLOUDX_ASR_MODEL=small`.
@@ -440,10 +495,21 @@ tools enabled.
 
 ASR options:
 
+- `CLOUDX_ASR_BACKEND`: `faster-whisper` or `whisper-cpp`, default
+  `faster-whisper`.
 - `CLOUDX_ASR_MODEL`: Faster Whisper model name, default `small`.
 - `CLOUDX_ASR_MODEL_PATH`: local Faster Whisper model directory.
 - `CLOUDX_ASR_DEVICE`: `cuda` or `cpu`, default `cpu`.
 - `CLOUDX_ASR_COMPUTE_TYPE`: for example `float16` or `int8`.
+- `CLOUDX_ASR_WHISPER_CPP_BIN`: `whisper-cli` binary used when
+  `CLOUDX_ASR_BACKEND=whisper-cpp`.
+- `CLOUDX_ASR_WHISPER_CPP_MODEL_PATH`: GGML model file used by whisper.cpp.
+- `CLOUDX_ASR_WHISPER_CPP_THREADS`: CPU helper threads for whisper.cpp.
+- `CLOUDX_ASR_WHISPER_CPP_VAD`: set `true` to enable whisper.cpp VAD.
+- `CLOUDX_ASR_WHISPER_CPP_VAD_MODEL_PATH`: GGML Silero VAD model file used
+  when whisper.cpp VAD is enabled.
+- `CLOUDX_ASR_WHISPER_CPP_ARGS`: optional explicit extra `whisper-cli`
+  arguments.
 - `CLOUDX_ASR_LANGUAGE`: language code, default `en`; use `auto` for detection.
 - `CLOUDX_ASR_CPU_THREADS`: CPU threads.
 - `CLOUDX_ASR_NUM_WORKERS`: Faster Whisper worker count, default `1`.

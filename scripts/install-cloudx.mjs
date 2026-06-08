@@ -13,12 +13,19 @@ export const SERVICE_NAMES = ["cloudx-asr.service", "cloudx.service"];
 export const QUARTO_VERSION = "1.9.38";
 export const QUARTO_DEB_PATH = `/tmp/quarto-${QUARTO_VERSION}-linux-amd64.deb`;
 export const QUARTO_DEB_URL = `https://github.com/quarto-dev/quarto-cli/releases/download/v${QUARTO_VERSION}/quarto-${QUARTO_VERSION}-linux-amd64.deb`;
+export const WHISPER_CPP_REPO_URL = "https://github.com/ggml-org/whisper.cpp.git";
+export const WHISPER_CPP_MODEL = "large-v3-turbo";
+export const WHISPER_CPP_VAD_MODEL = "silero-v6.2.0";
 export const UBUNTU_APT_PACKAGES = [
   "ca-certificates",
   "curl",
   "gnupg",
   "git",
   "build-essential",
+  "cmake",
+  "pciutils",
+  "gpg-agent",
+  "wget",
   "libreoffice",
   "poppler-utils",
   "ffmpeg",
@@ -84,8 +91,8 @@ export function helpText() {
     "",
     "The shell bootstrap installs Ubuntu packages, Quarto/Pandoc/TeX PDF rendering, and Node.js/npm when needed.",
     "This Node wizard then installs Cloudx dependencies, Codex CLI, ASR,",
-    "the documentation archive indexer, the Faster Whisper model, config files,",
-    "and optional systemd user services.",
+    "the documentation archive indexer, the Faster Whisper model, optional",
+    "whisper.cpp documentation ASR, config files, and optional systemd user services.",
     "",
     "Usage: ./install.sh [options]",
     "       node scripts/install-cloudx.mjs [options]",
@@ -157,17 +164,40 @@ export function validateCpuThreads(value, parallelism = defaultParallelism()) {
 }
 
 export function resolveDeviceConfig({ gpuDetected, useGpu, cudaRuntimeReady }) {
-  if (useGpu && !gpuDetected) {
+  const resolvedUseGpu = useGpu ?? (gpuDetected && cudaRuntimeReady);
+  if (resolvedUseGpu && !gpuDetected) {
     throw new Error("GPU mode was requested, but no NVIDIA GPU was detected with nvidia-smi.");
   }
-  if (useGpu && !cudaRuntimeReady) {
+  if (resolvedUseGpu && !cudaRuntimeReady) {
     throw new Error("GPU mode was requested, but CUDA/cuDNN runtime libraries were not detected. Install NVIDIA CUDA/cuDNN first or rerun with CPU mode.");
   }
-  return useGpu ? { device: "cuda", computeType: "float16" } : { device: "cpu", computeType: "int8" };
+  return resolvedUseGpu ? { device: "cuda", computeType: "float16" } : { device: "cpu", computeType: "int8" };
+}
+
+export function normalizeWhisperCppBuild(value) {
+  const build = String(value || "cpu").trim().toLowerCase();
+  if (build !== "cpu" && build !== "sycl") {
+    throw new Error("whisper.cpp build must be cpu or sycl.");
+  }
+  return build;
+}
+
+export function parseBooleanChoice(label, value) {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  const normalized = String(value).trim().toLowerCase();
+  if (["y", "yes", "true", "1", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["n", "no", "false", "0", "off"].includes(normalized)) {
+    return false;
+  }
+  throw new Error(`${label} must be yes or no.`);
 }
 
 export function buildEnvLines(config) {
-  return [
+  const lines = [
     `CLOUDX_HOST=${config.host}`,
     `CLOUDX_PORT=${config.port}`,
     `CLOUDX_ALLOWED_ROOTS=${config.allowedRoots}`,
@@ -182,8 +212,36 @@ export function buildEnvLines(config) {
     `CLOUDX_ASR_CPU_THREADS=${config.cpuThreads}`,
     `CLOUDX_ASR_NUM_WORKERS=1`,
     `CLOUDX_VOICE_DEBUG_TRANSCRIPTS=false`,
-    ""
   ];
+  if (config.documentationAsrBackend) {
+    lines.push(`CLOUDX_DOCUMENTATION_ASR_BACKEND=${config.documentationAsrBackend}`);
+  }
+  if (config.whisperCpp) {
+    lines.push(
+      `CLOUDX_ASR_BACKEND=whisper-cpp`,
+      `CLOUDX_ASR_WHISPER_CPP_BIN=${config.whisperCpp.bin}`,
+      `CLOUDX_ASR_WHISPER_CPP_MODEL_PATH=${config.whisperCpp.modelPath}`,
+      `CLOUDX_ASR_WHISPER_CPP_THREADS=${config.whisperCpp.threads}`,
+      `CLOUDX_ASR_WHISPER_CPP_BUILD=${config.whisperCpp.build}`,
+      `CLOUDX_ASR_WHISPER_CPP_MODEL=${config.whisperCpp.model}`,
+      `CLOUDX_ASR_WHISPER_CPP_VAD=true`,
+      `CLOUDX_ASR_WHISPER_CPP_VAD_MODEL_PATH=${config.whisperCpp.vadModelPath}`
+    );
+    if (config.whisperCpp.build === "sycl") {
+      lines.push("ONEAPI_DEVICE_SELECTOR=opencl:gpu");
+    }
+    lines.push(
+      `CLOUDX_DOCUMENTATION_WHISPER_CPP_BIN=${config.whisperCpp.bin}`,
+      `CLOUDX_DOCUMENTATION_WHISPER_CPP_MODEL_PATH=${config.whisperCpp.modelPath}`,
+      `CLOUDX_DOCUMENTATION_WHISPER_CPP_THREADS=${config.whisperCpp.threads}`,
+      `CLOUDX_DOCUMENTATION_WHISPER_CPP_BUILD=${config.whisperCpp.build}`,
+      `CLOUDX_DOCUMENTATION_WHISPER_CPP_MODEL=${config.whisperCpp.model}`,
+      `CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD=true`,
+      `CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD_MODEL_PATH=${config.whisperCpp.vadModelPath}`
+    );
+  }
+  lines.push("");
+  return lines;
 }
 
 export function renderEnvFile(config) {
@@ -191,16 +249,20 @@ export function renderEnvFile(config) {
 }
 
 export function renderAsrService({ repoRoot: root, envPath, uvicornPath, asrDir }) {
+  const startCommand = [
+    'if [ "${CLOUDX_ASR_BACKEND:-}" = "whisper-cpp" ] && [ -r /opt/intel/oneapi/setvars.sh ]; then source /opt/intel/oneapi/setvars.sh >/dev/null; fi',
+    `exec ${shellQuote(uvicornPath)} cloudx_asr.main:app --app-dir ${shellQuote(path.join(asrDir, "src"))} --host 127.0.0.1 --port 7810`
+  ].join("; ");
   return [
     "[Unit]",
-    "Description=Cloudx local Faster Whisper ASR",
+    "Description=Cloudx local ASR",
     "After=network-online.target",
     "",
     "[Service]",
     "Type=simple",
     `WorkingDirectory=${root}`,
     `EnvironmentFile=${envPath}`,
-    `ExecStart=${uvicornPath} cloudx_asr.main:app --app-dir ${path.join(asrDir, "src")} --host 127.0.0.1 --port 7810`,
+    `ExecStart=/bin/bash -lc ${shellQuote(startCommand)}`,
     "Restart=on-failure",
     "RestartSec=5",
     "",
@@ -403,7 +465,7 @@ export async function runInstaller(options = {}) {
   if (options.uninstall) {
     return await runUninstaller({ paths, commands, runner, prompt, dryRun });
   }
-  section(options.update ? "1/10 Install and verify Ubuntu prerequisites" : "1/9 Install and verify Ubuntu prerequisites");
+  section("1/10 Install and verify Ubuntu prerequisites");
   if (env.CLOUDX_INSTALL_BOOTSTRAPPED === "1") {
     console.log("Shell bootstrap already installed Ubuntu packages. Verifying Node.js and npm.");
     verifyNodeAndNpm(commands);
@@ -415,6 +477,7 @@ export async function runInstaller(options = {}) {
   }
   const gpuDetected = options.gpuDetected ?? commands.exists("nvidia-smi");
   const cudaRuntimeReady = options.cudaRuntimeReady ?? detectCudaRuntime(commands);
+  const intelGpuDetected = options.intelGpuDetected ?? detectIntelGpu(commands);
   const parallelism = options.parallelism ?? defaultParallelism();
   const defaultThreads = defaultCpuThreads(parallelism);
 
@@ -423,9 +486,12 @@ export async function runInstaller(options = {}) {
   console.log(`Repository: ${root}`);
   console.log(`Configuration file: ${paths.envPath}`);
   console.log(`ASR model directory: ${paths.modelDir}`);
-  console.log(gpuDetected ? "NVIDIA GPU detected with nvidia-smi." : "No NVIDIA GPU detected with nvidia-smi; ASR will default to CPU.");
+  console.log(gpuDetected && cudaRuntimeReady ? "NVIDIA GPU and CUDA/cuDNN runtime detected; faster-whisper ASR will use CUDA." : "No ready NVIDIA CUDA runtime detected; faster-whisper ASR will use CPU.");
   if (gpuDetected && !cudaRuntimeReady) {
     console.log("CUDA/cuDNN runtime libraries were not detected, so GPU mode will fail unless they are installed first.");
+  }
+  if (intelGpuDetected) {
+    console.log("Intel GPU detected; optional whisper.cpp SYCL documentation ASR can be installed.");
   }
 
   section("2/9 Verify Codex CLI");
@@ -452,11 +518,20 @@ export async function runInstaller(options = {}) {
   const certHosts = await prompt.text("certificateHosts", "Additional certificate hostnames (comma-separated, blank for none)", "");
   explainQuestion("ASR CPU threads", "Controls how many CPU threads Faster Whisper may use. More threads can improve transcription speed but leaves fewer cores for Codex and builds.");
   const cpuThreads = validateCpuThreads(await prompt.integer("cpuThreads", "ASR CPU threads", defaultThreads, { min: 1, max: parallelism }), parallelism);
-  if (gpuDetected) {
-    explainQuestion("Use detected NVIDIA GPU", "GPU ASR is faster, but this installer only configures it. CUDA/cuDNN runtime libraries must already be installed.");
+  if (answers.useGpu !== undefined) {
+    explainQuestion("NVIDIA GPU override", "The installer automatically uses CUDA when NVIDIA and CUDA/cuDNN are ready. The useGpu answer can still force CPU or require GPU.");
   }
-  const useGpu = gpuDetected ? await prompt.boolean("useGpu", "NVIDIA GPU detected. Use it for ASR?", false) : false;
+  const useGpu = answers.useGpu === undefined ? undefined : parseBooleanChoice("useGpu", answers.useGpu);
   const device = resolveDeviceConfig({ gpuDetected, useGpu, cudaRuntimeReady });
+  explainQuestion("Optional whisper.cpp ASR", "Installs a compiled CLI backend for documentation YouTube transcription and voice-control ASR. Choose SYCL for Intel Arc after oneAPI and GPU device access are available.");
+  const installWhisperCpp = await prompt.boolean("installWhisperCpp", "Install optional whisper.cpp ASR backend?", false);
+  const whisperCpp = installWhisperCpp
+    ? {
+        build: normalizeWhisperCppBuild(await prompt.text("whisperCppBuild", "whisper.cpp build backend (cpu or sycl)", intelGpuDetected ? "sycl" : "cpu")),
+        model: await prompt.text("whisperCppModel", "whisper.cpp GGML model", WHISPER_CPP_MODEL),
+        threads: cpuThreads
+      }
+    : undefined;
   explainQuestion("Install systemd services", "Writes user-level services so Cloudx and ASR can run in the background instead of being started manually.");
   const installServices = await prompt.boolean("installServices", "Install Cloudx user-level systemd services?", true);
   if (installServices) {
@@ -474,19 +549,26 @@ export async function runInstaller(options = {}) {
     certHosts,
     cpuThreads,
     device,
+    whisperCpp,
     installServices,
     startServices,
     enableLinger
   });
 
-  section("4/9 Install Cloudx npm dependencies");
+  section("4/10 Install Cloudx npm dependencies");
   commands.run("npm", ["ci"]);
-  section("5/9 Prepare ASR Python environment and model");
+  section("5/10 Prepare ASR Python environment and model");
   setupAsr(commands, paths);
   downloadModel(commands, paths);
-  section("6/9 Prepare documentation archive Python environment");
+  section("6/10 Prepare documentation archive Python environment");
   setupDocumentationIndexer(commands, paths);
-  section("7/9 Build Cloudx and create HTTPS certificate");
+  section("7/10 Prepare optional whisper.cpp documentation ASR backend");
+  if (whisperCpp) {
+    setupWhisperCpp(commands, paths, whisperCpp);
+  } else {
+    console.log("Skipping optional whisper.cpp documentation ASR backend.");
+  }
+  section("8/10 Build Cloudx and create HTTPS certificate");
   commands.run("npm", ["run", "build"]);
   commands.run("npm", ["run", "cert:create"], {
     env: certHosts.trim() ? { CLOUDX_CERT_HOSTS: certHosts.trim() } : undefined
@@ -502,13 +584,15 @@ export async function runInstaller(options = {}) {
     modelDir: paths.modelDir,
     language: "en",
     cpuThreads,
+    documentationAsrBackend: whisperCpp ? "whisper-cpp" : "faster-whisper",
+    whisperCpp: whisperCpp ? whisperCppEnv(paths, whisperCpp) : undefined,
     ...device
   };
-  section("8/9 Write Cloudx configuration");
+  section("9/10 Write Cloudx configuration");
   runner.writeFile(paths.envPath, renderEnvFile(envConfig));
 
   if (installServices) {
-    section("9/9 Install user-level systemd services");
+    section("10/10 Install user-level systemd services");
     installSystemdServices(commands, runner, paths);
     if (enableLinger) {
       commands.run("sudo", ["loginctl", "enable-linger", os.userInfo().username]);
@@ -520,7 +604,7 @@ export async function runInstaller(options = {}) {
       verifyServices(commands, port);
     }
   } else {
-    section("9/9 Skip systemd service installation");
+    section("10/10 Skip systemd service installation");
     console.log("Cloudx was configured for manual startup with npm run dev.");
   }
 
@@ -649,11 +733,22 @@ async function runUpdater({ paths, commands, runner, prompt, noStart, networkInt
   section("6/10 Update documentation archive Python environment");
   setupDocumentationIndexer(commands, paths);
 
-  section("7/10 Rebuild Cloudx and refresh HTTPS certificate if missing");
+  section("7/10 Update optional whisper.cpp documentation ASR backend");
+  if (envConfig.CLOUDX_DOCUMENTATION_ASR_BACKEND === "whisper-cpp") {
+    setupWhisperCpp(commands, paths, {
+      build: envConfig.CLOUDX_DOCUMENTATION_WHISPER_CPP_BUILD ?? "cpu",
+      model: envConfig.CLOUDX_DOCUMENTATION_WHISPER_CPP_MODEL ?? WHISPER_CPP_MODEL,
+      threads: Number.parseInt(envConfig.CLOUDX_DOCUMENTATION_WHISPER_CPP_THREADS ?? envConfig.CLOUDX_ASR_CPU_THREADS ?? String(defaultCpuThreads()), 10)
+    });
+  } else {
+    console.log("No whisper.cpp documentation ASR backend configured; skipping.");
+  }
+
+  section("8/10 Rebuild Cloudx and refresh HTTPS certificate if missing");
   commands.run("npm", ["run", "build"]);
   commands.run("npm", ["run", "cert:create"]);
 
-  section("8/10 Refresh installed systemd service files");
+  section("9/10 Refresh installed systemd service files");
   if (servicesInstalled) {
     installSystemdServices(commands, runner, paths);
     commands.run("systemctl", ["--user", "daemon-reload"]);
@@ -667,7 +762,7 @@ async function runUpdater({ paths, commands, runner, prompt, noStart, networkInt
     (explainQuestion("Restart services", "Restarts Cloudx and ASR after dependencies and service files are updated, then verifies the health endpoints."),
     await prompt.boolean("restartServices", "Restart Cloudx services after update?", true));
 
-  section("9/10 Restart services");
+  section("10/10 Restart services");
   if (restartServices) {
     commands.run("systemctl", ["--user", "restart", ...SERVICE_NAMES]);
     verifyServices(commands, port);
@@ -677,7 +772,7 @@ async function runUpdater({ paths, commands, runner, prompt, noStart, networkInt
     console.log("No installed services to restart.");
   }
 
-  section("10/10 Update complete");
+  section("Update complete");
   printUpdateComplete({ paths, host, port, servicesInstalled, restartServices, networkInterfaces });
   await prompt.close();
   return { runner, paths, port, servicesInstalled, restartServices, urls: cloudxAccessUrls(port, networkInterfaces, host) };
@@ -692,7 +787,7 @@ function explainQuestion(title, detail) {
   console.log(`  ${detail}`);
 }
 
-function printChoiceSummary({ allowedRoots, host, port, certHosts, cpuThreads, device, installServices, startServices, enableLinger }) {
+function printChoiceSummary({ allowedRoots, host, port, certHosts, cpuThreads, device, whisperCpp, installServices, startServices, enableLinger }) {
   console.log("Install choices:");
   console.log(`  allowed roots: ${allowedRoots}`);
   console.log(`  bind host: ${host}`);
@@ -700,6 +795,7 @@ function printChoiceSummary({ allowedRoots, host, port, certHosts, cpuThreads, d
   console.log(`  certificate hosts: ${certHosts.trim() || "(default local hosts only)"}`);
   console.log(`  ASR device: ${device.device} (${device.computeType})`);
   console.log(`  ASR CPU threads: ${cpuThreads}`);
+  console.log(`  ASR backend: ${whisperCpp ? `whisper.cpp (${whisperCpp.build}, ${whisperCpp.model})` : "faster-whisper"}`);
   console.log(`  install services: ${installServices ? "yes" : "no"}`);
   if (installServices) {
     console.log(`  start services now: ${startServices ? "yes" : "no"}`);
@@ -770,6 +866,79 @@ function setupDocumentationIndexer(commands, paths) {
     "-e",
     `${paths.documentationIndexerDir}[dev]`
   ]);
+}
+
+function setupWhisperCpp(commands, paths, config) {
+  const build = normalizeWhisperCppBuild(config.build);
+  const buildDir = whisperCppBuildDir(paths, build);
+  console.log(`Preparing whisper.cpp ${build} build in ${paths.whisperCppDir}.`);
+  if (build === "sycl") {
+    installWhisperCppSyclPrerequisites(commands);
+  }
+  if (fs.existsSync(path.join(paths.whisperCppDir, ".git"))) {
+    commands.run("git", ["-C", paths.whisperCppDir, "pull", "--ff-only"]);
+  } else {
+    commands.mkdir(path.dirname(paths.whisperCppDir));
+    commands.run("git", ["clone", "--depth", "1", WHISPER_CPP_REPO_URL, paths.whisperCppDir]);
+  }
+  if (build === "sycl") {
+    commands.run("bash", [
+      "-lc",
+      [
+        "source /opt/intel/oneapi/setvars.sh >/dev/null",
+        `cmake -B ${shellQuote(buildDir)} -S ${shellQuote(paths.whisperCppDir)} -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx`,
+        `cmake --build ${shellQuote(buildDir)} -j --config Release --target whisper-cli`
+      ].join(" && ")
+    ]);
+  } else {
+    commands.run("cmake", ["-B", buildDir, "-S", paths.whisperCppDir]);
+    commands.run("cmake", ["--build", buildDir, "-j", "--config", "Release", "--target", "whisper-cli"]);
+  }
+  commands.mkdir(paths.whisperCppModelDir);
+  commands.run("bash", [path.join(paths.whisperCppDir, "models/download-ggml-model.sh"), config.model, paths.whisperCppModelDir]);
+  commands.run("bash", [path.join(paths.whisperCppDir, "models/download-vad-model.sh"), WHISPER_CPP_VAD_MODEL, paths.whisperCppModelDir]);
+}
+
+function installWhisperCppSyclPrerequisites(commands) {
+  console.log("Installing Intel oneAPI/SYCL prerequisites for whisper.cpp.");
+  commands.run("bash", [
+    "-lc",
+    "wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null"
+  ]);
+  commands.run("bash", [
+    "-lc",
+    "echo 'deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main' | sudo tee /etc/apt/sources.list.d/oneAPI.list > /dev/null"
+  ]);
+  commands.run("sudo", ["apt-get", "update"]);
+  commands.run("sudo", [
+    "apt-get",
+    "install",
+    "-y",
+    "intel-oneapi-compiler-dpcpp-cpp",
+    "intel-oneapi-mkl-sycl-devel",
+    "intel-opencl-icd",
+    "libze-intel-gpu1",
+    "libze1",
+    "libze-dev",
+    "clinfo"
+  ]);
+}
+
+function whisperCppBuildDir(paths, build) {
+  return path.join(paths.whisperCppDir, build === "sycl" ? "build-sycl" : "build");
+}
+
+function whisperCppEnv(paths, config) {
+  const model = config.model || WHISPER_CPP_MODEL;
+  const build = normalizeWhisperCppBuild(config.build);
+  return {
+    bin: path.join(whisperCppBuildDir(paths, build), "bin/whisper-cli"),
+    modelPath: path.join(paths.whisperCppModelDir, `ggml-${model}.bin`),
+    vadModelPath: path.join(paths.whisperCppModelDir, `ggml-${WHISPER_CPP_VAD_MODEL}.bin`),
+    threads: config.threads,
+    build,
+    model
+  };
 }
 
 function downloadModel(commands, paths) {
@@ -891,6 +1060,8 @@ function installerPaths({ repoRoot: root, home, env = process.env }) {
   const venvDir = path.join(asrDir, ".venv");
   const documentationIndexerDir = path.join(root, "services/documentation-indexer");
   const documentationVenvDir = path.join(documentationIndexerDir, ".venv");
+  const whisperCppDir = env.CLOUDX_WHISPER_CPP_DIR ?? path.join(home, ".local/share/cloudx/whisper.cpp");
+  const whisperCppModelDir = env.CLOUDX_WHISPER_CPP_MODEL_DIR ?? path.join(home, ".cache/cloudx/models/whisper.cpp");
   const configDir = path.join(home, ".config/cloudx");
   return {
     repoRoot: root,
@@ -902,6 +1073,8 @@ function installerPaths({ repoRoot: root, home, env = process.env }) {
     documentationIndexerDir,
     documentationVenvDir,
     documentationPipPath: path.join(documentationVenvDir, "bin/pip"),
+    whisperCppDir,
+    whisperCppModelDir,
     modelDir: env.CLOUDX_ASR_MODEL_PATH ?? path.join(home, ".cache/cloudx/models/faster-whisper-large-v3"),
     dataDir: path.join(root, ".cloudx"),
     configDir,
@@ -956,6 +1129,14 @@ function detectCudaRuntime(commands) {
   return fs.existsSync("/usr/local/cuda/lib64/libcudart.so") && fs.existsSync("/usr/local/cuda/lib64/libcudnn.so");
 }
 
+function detectIntelGpu(commands) {
+  if (!commands.exists("lspci")) {
+    return false;
+  }
+  const output = commands.capture("lspci", []);
+  return /intel.*(arc|dg2)|dg2.*intel/i.test(output);
+}
+
 function createPrompter({ answers = {}, yes = false, dryRun = false, input = process.stdin, output = process.stdout }) {
   const rl = !yes && !dryRun ? readline.createInterface({ input, output }) : undefined;
   async function ask(key, label, defaultValue) {
@@ -982,17 +1163,7 @@ function createPrompter({ answers = {}, yes = false, dryRun = false, input = pro
     },
     async boolean(key, label, defaultValue) {
       const raw = await ask(key, `${label} ${defaultValue ? "[Y/n]" : "[y/N]"}`, defaultValue ? "yes" : "no");
-      if (typeof raw === "boolean") {
-        return raw;
-      }
-      const normalized = String(raw).trim().toLowerCase();
-      if (["y", "yes", "true", "1", "on"].includes(normalized)) {
-        return true;
-      }
-      if (["n", "no", "false", "0", "off"].includes(normalized)) {
-        return false;
-      }
-      throw new Error(`${label} must be yes or no.`);
+      return parseBooleanChoice(label, raw);
     },
     async close() {
       rl?.close();

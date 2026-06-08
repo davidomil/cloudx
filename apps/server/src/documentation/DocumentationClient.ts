@@ -28,6 +28,20 @@ export interface DocumentationEnrichInput {
   payload?: Record<string, unknown>;
 }
 
+export interface DocumentationIngestProgressEvent {
+  stage?: string;
+  progress?: number;
+  etaSeconds?: number;
+  metrics?: Record<string, unknown>;
+  channel?: string;
+  channelLabel?: string;
+  channelProgress?: number;
+}
+
+export interface DocumentationIngestRequestOptions {
+  onProgress?: (event: DocumentationIngestProgressEvent) => void;
+}
+
 export interface DocumentationArtifactResponse {
   content: Uint8Array;
   contentType: string;
@@ -133,7 +147,10 @@ export class DocumentationClient {
     return this.post("/ingest/path", input);
   }
 
-  ingestUrl(input: Record<string, unknown>): Promise<Record<string, unknown>> {
+  ingestUrl(input: Record<string, unknown>, options: DocumentationIngestRequestOptions = {}): Promise<Record<string, unknown>> {
+    if (options.onProgress) {
+      return this.postStream("/ingest/url?stream=1", input, options.onProgress);
+    }
     return this.post("/ingest/url", input);
   }
 
@@ -167,6 +184,39 @@ export class DocumentationClient {
 
   private post(pathname: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
     return this.request(pathname, { method: "POST", body: JSON.stringify(body), headers: { "content-type": "application/json" } });
+  }
+
+  private async postStream(pathname: string, body: Record<string, unknown>, onProgress: (event: DocumentationIngestProgressEvent) => void): Promise<Record<string, unknown>> {
+    const controller = new AbortController();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const resetTimeout = () => {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    };
+    resetTimeout();
+    try {
+      const response = await fetch(this.serviceUrl(pathname), {
+        method: "POST",
+        body: JSON.stringify(body),
+        headers: { "content-type": "application/json", "accept": "application/x-ndjson" },
+        signal: controller.signal
+      });
+      if (!response.ok) {
+        throw new Error(errorMessage(await readBoundedText(response, this.responseMaxBytes), response.status));
+      }
+      return await readDocumentationProgressStream(response, this.responseMaxBytes, onProgress, resetTimeout);
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new Error(`Documentation progress stream was quiet for ${this.timeoutMs} ms.`);
+      }
+      throw error;
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+    }
   }
 
   private async request(pathname: string, init: RequestInit): Promise<Record<string, unknown>> {
@@ -246,6 +296,84 @@ export function normalizeDocumentationResponseMaxBytes(maxBytes = DEFAULT_DOCUME
 
 async function readBoundedText(response: Response, maxBytes: number): Promise<string> {
   return new TextDecoder().decode(await readBoundedBytes(response, maxBytes));
+}
+
+async function readDocumentationProgressStream(
+  response: Response,
+  maxBytes: number,
+  onProgress: (event: DocumentationIngestProgressEvent) => void,
+  onActivity: () => void
+): Promise<Record<string, unknown>> {
+  const reader = response.body?.getReader();
+  if (!reader) {
+    throw new Error("Documentation progress response did not include a stream.");
+  }
+  const decoder = new TextDecoder();
+  let buffered = "";
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    onActivity();
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => undefined);
+      throw new Error(`Documentation service response exceeded ${maxBytes} bytes.`);
+    }
+    buffered += decoder.decode(value, { stream: true });
+    let newline = buffered.indexOf("\n");
+    while (newline !== -1) {
+      const line = buffered.slice(0, newline).trim();
+      buffered = buffered.slice(newline + 1);
+      if (line) {
+        const result = handleDocumentationStreamEvent(line, onProgress);
+        if (result) {
+          await reader.cancel().catch(() => undefined);
+          return result;
+        }
+      }
+      newline = buffered.indexOf("\n");
+    }
+  }
+  const finalLine = buffered.trim();
+  if (finalLine) {
+    const result = handleDocumentationStreamEvent(finalLine, onProgress);
+    if (result) {
+      return result;
+    }
+  }
+  throw new Error("Documentation progress stream ended without a result.");
+}
+
+function handleDocumentationStreamEvent(line: string, onProgress: (event: DocumentationIngestProgressEvent) => void): Record<string, unknown> | undefined {
+  const event = JSON.parse(line) as unknown;
+  if (!isRecord(event)) {
+    throw new Error("Documentation progress stream event was not a JSON object.");
+  }
+  if (event.type === "progress") {
+    onProgress({
+      stage: typeof event.stage === "string" ? event.stage : undefined,
+      progress: typeof event.progress === "number" ? event.progress : undefined,
+      etaSeconds: typeof event.etaSeconds === "number" ? event.etaSeconds : undefined,
+      metrics: isRecord(event.metrics) ? event.metrics : undefined,
+      channel: typeof event.channel === "string" ? event.channel : undefined,
+      channelLabel: typeof event.channelLabel === "string" ? event.channelLabel : undefined,
+      channelProgress: typeof event.channelProgress === "number" ? event.channelProgress : undefined
+    });
+    return undefined;
+  }
+  if (event.type === "error") {
+    throw new Error(typeof event.error === "string" ? event.error : "Documentation ingest stream failed.");
+  }
+  if (event.type === "result") {
+    if (!isRecord(event.result)) {
+      throw new Error("Documentation progress stream result was not a JSON object.");
+    }
+    return event.result;
+  }
+  return undefined;
 }
 
 async function readBoundedBytes(response: Response, maxBytes: number): Promise<Uint8Array> {

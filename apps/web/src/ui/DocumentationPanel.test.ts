@@ -13,6 +13,8 @@ import { disposeDocumentationIngestController, disposeDocumentationIngestControl
 type DocumentationCallHook = NonNullable<Parameters<typeof DocumentationPanel>[0]["callHook"]>;
 
 afterEach(() => {
+  vi.unstubAllGlobals();
+  Reflect.deleteProperty(window, "IntersectionObserver");
   disposeDocumentationIngestControllersExcept(new Set());
   document.body.replaceChildren();
 });
@@ -96,6 +98,44 @@ describe("DocumentationPanel", () => {
         collection: "lectures"
       }
     });
+
+    await unmount(root);
+  });
+
+  it("shows actionable errors as notices without the legacy status footer", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string) => {
+      if (hookId === "documentation.stats") {
+        return hookResult<T>({ activeDocumentCount: 0, activeChunkCount: 0 });
+      }
+      if (hookId === "documentation.documents.list") {
+        return hookResult<T>({ documents: [] });
+      }
+      if (hookId === "documentation.search") {
+        throw new Error("Search backend unavailable.");
+      }
+      return {} as T;
+    };
+
+    await act(async () => {
+      root.render(createElement(DocumentationPanel, { callHook }));
+    });
+    await flush();
+
+    expect(container.querySelector(".documentation-status")).toBeNull();
+    expect(container.querySelector(".documentation-notice")).toBeNull();
+
+    await click(buttonByText(container, "Manual"));
+    setInputValue(inputByLabel(container, "Search"), "scheduler");
+    await click(buttonByText(container, "Search"));
+    await flushAsyncWork();
+
+    const notice = container.querySelector(".documentation-notice");
+    expect(container.querySelector(".documentation-status")).toBeNull();
+    expect(notice?.getAttribute("role")).toBe("alert");
+    expect(notice?.textContent).toBe("Search backend unavailable.");
 
     await unmount(root);
   });
@@ -269,7 +309,10 @@ describe("DocumentationPanel", () => {
     await unmount(root);
   });
 
-  it("opens large media sources progressively and caps inline keyframe previews", async () => {
+  it("opens large media sources progressively and attaches timestamped keyframes", async () => {
+    TestIntersectionObserver.reset();
+    vi.stubGlobal("IntersectionObserver", TestIntersectionObserver);
+    Object.defineProperty(window, "IntersectionObserver", { configurable: true, value: TestIntersectionObserver });
     const container = document.createElement("div");
     document.body.append(container);
     const root = createRoot(container);
@@ -286,30 +329,32 @@ describe("DocumentationPanel", () => {
       }
       if (hookId === "documentation.documents.get") {
         const chunkOffset = typeof input.chunkOffset === "number" ? input.chunkOffset : 0;
+        const artifactOffset = typeof input.artifactOffset === "number" ? input.artifactOffset : 0;
+        const artifactLimit = typeof input.artifactLimit === "number" ? input.artifactLimit : 0;
         return hookResult<T>({
           document: {
             documentId: "doc-large-video",
             title: "Large video",
             sourceType: "media",
             chunks: chunkOffset === 0 ? [
-              { chunkId: 1, locator: "media keyframes", chunkOrigin: "source", text: "Extracted YouTube video keyframes at one frame per second.", textLength: 12000, textTruncated: true },
+              { chunkId: 1, locator: testMediaKeyframeLocator(0), chunkOrigin: "source", text: "Selected YouTube slide frame keyframe-000000 at 00:00 with transcript context.", textLength: 12000, textTruncated: true },
               { chunkId: 2, locator: "transcript 00:00", chunkOrigin: "source", text: "Opening the source should not render every transcript chunk." }
             ] : [
               { chunkId: 3, locator: "transcript 10:00", chunkOrigin: "source", text: "Later transcript chunk loaded on demand." }
             ],
             chunkWindow: chunkOffset === 0 ? { offset: 0, limit: 75, total: 3, hasMore: true } : { offset: 2, limit: 75, total: 3, hasMore: false },
-            artifacts: chunkOffset === 0 ? Array.from({ length: 10 }, (_unused, index) => ({
-              id: `keyframe-${index}`,
+            artifacts: Array.from({ length: chunkOffset === 0 ? 10 : artifactLimit }, (_unused, index) => ({
+              id: `keyframe-${artifactOffset + index}`,
               type: "media-keyframe",
               kind: "keyframe",
-              locator: "media keyframes",
-              path: `media/keyframes/frame-${String(index + 1).padStart(6, "0")}.png`,
+              locator: testMediaKeyframeLocator(artifactOffset + index),
+              path: `media/keyframes/frame-${String(artifactOffset + index + 1).padStart(6, "0")}.png`,
               mimeType: "image/png",
               available: true,
               bytes: 1024,
-              offsetSeconds: index
-            })) : [],
-            artifactWindow: chunkOffset === 0 ? { offset: 0, limit: 100, total: 10000, hasMore: true } : { offset: 10, limit: 0, total: 10000, hasMore: true }
+              offsetSeconds: artifactOffset + index
+            })),
+            artifactWindow: { offset: artifactOffset, limit: artifactLimit, total: 10000, hasMore: true }
           }
         });
       }
@@ -327,9 +372,17 @@ describe("DocumentationPanel", () => {
     expect(container.textContent).toContain("2 of 3 chunks");
     expect(container.textContent).toContain("10 of 10,000 extracted artifacts");
     expect(container.textContent).toContain("Chunk preview truncated");
-    expect(container.querySelectorAll(".documentation-artifact-image img")).toHaveLength(6);
+    expect(container.querySelectorAll(".documentation-artifact-image img")).toHaveLength(1);
+    expect(container.textContent).not.toContain("Load More Chunks");
+    expect(container.textContent).not.toContain("Load More Artifacts");
+    expect(container.textContent).toContain("More source chunks load automatically here.");
+    await flushAsyncWork();
+    await flushAsyncWork();
 
-    await click(buttonByText(container, "Load More Chunks"));
+    await act(async () => {
+      TestIntersectionObserver.latest().trigger(true);
+    });
+    await flushAsyncWork();
 
     expect(calls).toContainEqual({
       hookId: "documentation.documents.get",
@@ -339,11 +392,12 @@ describe("DocumentationPanel", () => {
         chunkLimit: 75,
         chunkTextMaxChars: 4000,
         artifactOffset: 10,
-        artifactLimit: 0
+        artifactLimit: 67
       }
     });
     expect(container.textContent).toContain("Later transcript chunk loaded on demand.");
     expect(container.textContent).toContain("3 of 3 chunks");
+    expect(container.textContent).toContain("77 of 10,000 extracted artifacts");
 
     await unmount(root);
   });
@@ -514,7 +568,27 @@ describe("DocumentationPanel", () => {
       status: "running",
       progress: 35,
       stage: "Downloading URL and extracting source evidence.",
-      position: 0
+      position: 0,
+      etaSeconds: 95,
+      metrics: { downloadedBytes: 512 * 1024, totalBytes: 1024 * 1024, framesScanned: 120, selectedFrames: 8 },
+      progressChannels: [
+        {
+          id: "transcript",
+          label: "Transcript",
+          progress: 42,
+          stage: "whisper.cpp transcription 10% complete.",
+          etaSeconds: 2883,
+          metrics: { transcribedSeconds: 2945 }
+        },
+        {
+          id: "visual-scan",
+          label: "Visual scan",
+          progress: 58,
+          stage: "Selected 193 slide frames from 29450 scanned frames.",
+          etaSeconds: 0,
+          metrics: { selectedFrames: 193, framesScanned: 29450 }
+        }
+      ]
     }];
     const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}) => {
       calls.push({ hookId, input });
@@ -541,13 +615,23 @@ describe("DocumentationPanel", () => {
 
     expect(container.textContent).toContain("Import Queue");
     expect(container.textContent).toContain("Codex URL import");
-    expect(container.textContent).toContain("Downloading URL and extracting source evidence.");
-    expect(progressBars(container).map((bar) => bar.getAttribute("aria-valuenow"))).toContain("35");
+    expect(container.textContent).not.toContain("Downloading URL and extracting source evidence.");
+    expect(container.textContent).not.toContain("ETA 1m 35s");
+    expect(container.textContent).not.toContain("downloaded 512.0 KiB / 1.0 MiB");
+    expect(container.textContent).not.toContain("scanned 120");
+    expect(container.textContent).toContain("Transcript");
+    expect(container.textContent).toContain("whisper.cpp transcription 10% complete.");
+    expect(container.textContent).toContain("ETA 48m 3s");
+    expect(container.textContent).toContain("transcribed 49m 5s");
+    expect(container.textContent).toContain("Visual scan");
+    expect(container.textContent).toContain("Selected 193 slide frames from 29450 scanned frames.");
+    expect(container.textContent).toContain("slides 193");
+    expect(progressBars(container).map((bar) => bar.getAttribute("aria-valuenow"))).toEqual(expect.arrayContaining(["35", "42", "58"]));
 
     queueJobs = [{ ...queueJobs[0]!, status: "complete", progress: 100, stage: "Import complete." }];
     await click(buttonByText(container, "Refresh"));
 
-    expect(container.textContent).toContain("Import complete.");
+    expect(container.textContent).not.toContain("Import complete.");
     await click(buttonByText(container, "Clear Finished"));
 
     expect(calls).toContainEqual({ hookId: "documentation.ingest.queue.clearFinished", input: {} });
@@ -835,6 +919,12 @@ function sourceWindowInput(documentId: string): Record<string, unknown> {
   };
 }
 
+function testMediaKeyframeLocator(offsetSeconds: number): string {
+  const minutes = Math.floor(offsetSeconds / 60);
+  const seconds = offsetSeconds % 60;
+  return `media keyframe keyframe-${String(offsetSeconds).padStart(6, "0")} ${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: unknown) => void } {
   let resolve!: (value: T) => void;
   let reject!: (error: unknown) => void;
@@ -843,4 +933,54 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reje
     reject = promiseReject;
   });
   return { promise, resolve, reject };
+}
+
+class TestIntersectionObserver {
+  static instances: TestIntersectionObserver[] = [];
+
+  private readonly observed = new Set<Element>();
+
+  constructor(private readonly callback: IntersectionObserverCallback) {
+    TestIntersectionObserver.instances.push(this);
+  }
+
+  static reset(): void {
+    TestIntersectionObserver.instances = [];
+  }
+
+  static latest(): TestIntersectionObserver {
+    const observer = TestIntersectionObserver.instances.at(-1);
+    if (!observer) {
+      throw new Error("Missing IntersectionObserver instance.");
+    }
+    return observer;
+  }
+
+  observe(target: Element): void {
+    this.observed.add(target);
+  }
+
+  unobserve(target: Element): void {
+    this.observed.delete(target);
+  }
+
+  disconnect(): void {
+    this.observed.clear();
+  }
+
+  takeRecords(): IntersectionObserverEntry[] {
+    return [];
+  }
+
+  trigger(isIntersecting: boolean): void {
+    this.callback([...this.observed].map((target) => ({
+      boundingClientRect: target.getBoundingClientRect(),
+      intersectionRatio: isIntersecting ? 1 : 0,
+      intersectionRect: target.getBoundingClientRect(),
+      isIntersecting,
+      rootBounds: null,
+      target,
+      time: 0
+    })), this as unknown as IntersectionObserver);
+  }
 }

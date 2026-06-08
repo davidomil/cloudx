@@ -82,10 +82,10 @@ Runs only when the `documentation.aiEnrichmentEnabled` plugin setting is
 true and global AI control is enabled. It reads the configured CloudX
 skills from the rules/skills catalog, builds complete evidence batches
 from all source-origin chunks, extracted table/figure/image artifact
-manifests, optional ASR transcript segments, and one-frame-per-second
-video keyframe paths, then invokes Codex exec with a strict JSON schema
-for each batch. Returned spans are merged and written as AI-origin
-chunks by `POST /documents/{id}/enrich`.
+manifests, optional ASR transcript segments, and video keyframe paths,
+then invokes Codex exec with a strict JSON schema for each batch.
+Returned spans are merged and written as AI-origin chunks by
+`POST /documents/{id}/enrich`.
 
 ## Web Panel
 
@@ -153,9 +153,9 @@ visible as a local path to the indexer process.
 When AI enrichment is enabled, browser upload is also the path that can
 pass media bytes to the enrichment service. Uploaded audio/video can be
 transcribed through the existing Faster Whisper ASR service, and
-uploaded video is converted into a one-frame-per-second keyframe
-manifest with FFmpeg before Codex is asked to improve the import. Long
-media files can produce large keyframe manifests, so the enrichment
+uploaded video is converted into a scene-selected keyframe manifest
+with FFmpeg before Codex is asked to improve the import. Long media
+files can still produce large keyframe manifests, so the enrichment
 service batches the manifest instead of silently capping it.
 
 ## Local Path Ingest
@@ -204,15 +204,29 @@ playlist.
 
 If the caller provides a transcript, the URL is ingested as media text
 without downloading page content. If the source type is `media` or the
-URL is recognized as a single YouTube video, the indexer fetches the
-transcript, reads video metadata with `yt-dlp`, stores the video
-description as its own searchable source chunk, and uses FFmpeg to
-preserve one PNG keyframe per second under the source snapshot’s
-`extracted/media/keyframes/` directory. The keyframe index, YouTube
-metadata JSON, optional `description.txt`, description chunks,
-transcript chunks, and original URL are all stored as source evidence.
-Missing `yt-dlp`, missing `ffmpeg`, transcript failures, or keyframe
-extraction failures fail the ingest request explicitly.
+URL is recognized as a single YouTube video, the indexer reads video
+metadata with `yt-dlp`, stores the video description as its own
+searchable source chunk, and runs timestamped ASR transcript extraction
+alongside local slide-frame scanning. The visual path downloads one
+bounded-resolution video source, FFmpeg scans local video segments in
+parallel, and deterministic image-difference checks preserve one
+selected JPEG frame per detected slide or visual state under the source
+snapshot’s `extracted/media/keyframes/` directory. After ASR and visual
+scan both finish, selected frames are aligned to transcript timestamps.
+The keyframe index, timestamped transcript segment index, visual sampling
+manifest, YouTube metadata JSON, optional `description.txt`, description
+chunks, transcript chunks, and original URL are all stored as source
+evidence. The default ASR backend is faster-whisper.
+`CLOUDX_DOCUMENTATION_ASR_BACKEND=whisper-cpp`
+selects a compiled `whisper.cpp` CLI backend, which requires an explicit
+`CLOUDX_DOCUMENTATION_WHISPER_CPP_BIN` and
+`CLOUDX_DOCUMENTATION_WHISPER_CPP_MODEL_PATH`. When
+`CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD=true`, it also requires
+`CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD_MODEL_PATH`; the installer configures
+Silero VAD so silent windows are skipped instead of decoded into repeated
+filler text. Missing `yt-dlp`, missing `ffmpeg`, missing backend dependencies,
+transcript failures, or keyframe extraction failures fail the ingest request
+explicitly.
 
 If the URL contains a YouTube `list=` playlist ID and no manual
 transcript is supplied, `/ingest/url` treats it as a playlist. The
@@ -224,9 +238,9 @@ from the video entry title, the URI is the canonical
 `media`, and the collection is the playlist title unless the caller
 provided an explicit collection. Transcript text still comes from
 `youtube-transcript-api`, and every successfully ingested playlist entry
-gets its own keyframe manifest. If a later playlist entry fails, earlier
-entries from that request are marked deleted so active search does not
-contain a partial playlist import.
+gets its own selected slide-frame manifest. If a later playlist entry
+fails, earlier entries from that request are marked deleted so active
+search does not contain a partial playlist import.
 
 YouTube enrichment follows the same document boundary. A single video
 URL enriches the media document that was created for that video. A
@@ -289,10 +303,11 @@ prompt, and requires Codex to return structured JSON with `summary`,
 The AI pass runs after the source import succeeds. It reads the newly
 ingested document, all source-origin chunks, portable extraction
 artifact manifests, and media evidence when available. For media
-uploads, the existing ASR service produces a transcript and FFmpeg
-produces one-frame-per-second keyframe artifacts. For YouTube URL
-imports, the indexer itself stores the transcript, metadata, and
-one-frame-per-second keyframe artifact manifest before enrichment runs.
+uploads, the existing ASR service produces a timestamped transcript and
+FFmpeg produces scene-selected keyframe artifacts. For YouTube URL
+imports, the indexer itself stores timestamped faster-whisper
+transcript segments, metadata, selected slide-frame artifacts, and a
+visual sampling manifest before enrichment runs.
 The service batches all chunks, artifact paths, transcript segments, and
 keyframe paths so prompt size is controlled without dropping later
 evidence. Codex returns derived spans with locators such as
@@ -643,8 +658,8 @@ YouTube videos with transcripts and keyframes, and a generated
 2500-record mock corpus with planted facts. The latest required
 validation run used `--include-youtube`, ingested 9 documents into 5324
 active chunks, produced 1885 table CSV files, 1885 table Markdown files,
-596 rendered figure PNGs, 3134 YouTube keyframe PNGs, 2 YouTube keyframe
-indexes, and 2 YouTube metadata JSON files, then passed required hybrid,
+596 rendered figure PNGs, 3134 YouTube keyframe artifacts, 2 YouTube
+keyframe indexes, and 2 YouTube metadata JSON files, then passed required hybrid,
 lexical, rebuild, stale-state, YouTube transcript recall, and YouTube
 artifact checks. Dense-only checks are retained as diagnostics because
 the current dense profile is a deterministic local hash embedding, not a
@@ -663,9 +678,14 @@ generated corpus, archive, and summary files stay under the selected
   are loaded into Turbovec.
 - URL ingest supports only HTTP and HTTPS, performs direct fetches or
   YouTube media ingest, and does not crawl a site recursively.
-- YouTube URL ingest stores transcript, metadata, and
-  one-frame-per-second keyframe artifacts, but it depends on live YouTube
-  access, `youtube-transcript-api`, `yt-dlp`, and FFmpeg.
+- YouTube URL ingest stores timestamped transcript, metadata, selected
+  slide-frame artifacts, and a visual sampling manifest. It runs ASR and
+  the CPU-heavy visual scan concurrently, downloads a bounded video source
+  once before local parallel slide scanning, and it depends on live
+  YouTube access, `yt-dlp`, FFmpeg, and the configured ASR backend.
+  Faster-whisper is the default; Intel Arc acceleration requires the
+  explicit `whisper-cpp` backend with a SYCL/OpenVINO-capable
+  `whisper-cli` and visible `/dev/dri` GPU device access.
 - Browser uploads and URL downloads are capped at 256 MiB.
 - PDF graph and flowchart extraction preserves rendered visual
   artifacts, but it does not OCR labels or infer graph semantics.

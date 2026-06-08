@@ -130,6 +130,48 @@ describe("DocumentationPlugin", () => {
     ]));
   });
 
+  it("relays indexer URL ingest progress with ETA and metrics", async () => {
+    const client = fakeClient();
+    vi.mocked(client.ingestUrl).mockImplementationOnce(async (_input, options) => {
+      options?.onProgress?.({
+        channel: "visual-scan",
+        channelLabel: "Visual scan",
+        stage: "Visual scan: Scanned 2 of 4 video segments.",
+        progress: 66,
+        channelProgress: 80,
+        etaSeconds: 45,
+        metrics: { framesScanned: 120, selectedFrames: 8 }
+      });
+      return { document: { documentId: "video-doc" } };
+    });
+    const plugin = new DocumentationPlugin(client, new PathPolicy(["/tmp"]), new DocumentationIngestQueue());
+    const hook = plugin.hooks.find((candidate) => candidate.id === "documentation.ingest.url")!;
+    const progress: HookProgressEvent[] = [];
+
+    await hook.execute({ url: "https://www.youtube.com/watch?v=slides" }, {
+      caller: { kind: "http" },
+      reportProgress: (event) => progress.push(event)
+    });
+
+    expect(progress).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        stage: "Visual scan: Scanned 2 of 4 video segments.",
+        etaSeconds: 45,
+        metrics: { framesScanned: 120, selectedFrames: 8 },
+        progressChannels: expect.arrayContaining([
+          expect.objectContaining({
+            id: "visual-scan",
+            label: "Visual scan",
+            progress: 80,
+            stage: "Scanned 2 of 4 video segments.",
+            etaSeconds: 45,
+            metrics: { framesScanned: 120, selectedFrames: 8 }
+          })
+        ])
+      })
+    ]));
+  });
+
   it("routes assisted question answering through the enrichment provider", async () => {
     const answerQuestion = vi.fn(async () => ({ answer: "Source-grounded answer.", answerHtml: "<p>Source-grounded answer.</p>", citations: [], warnings: [] }));
     const plugin = new DocumentationPlugin(fakeClient(), new PathPolicy(["/tmp"]), new DocumentationIngestQueue(), () => ({ answerQuestion }) as never);
@@ -173,6 +215,7 @@ describe("DocumentationPlugin", () => {
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-ingest")?.instructions).toContain("prefer durable primary URLs");
     expect(plugin.skillContributions.some((skill) => skill.id === "documentation-answer")).toBe(false);
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-enrich-visuals")?.instructions).toContain("ai:visual");
+    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-enrich-visuals")?.instructions).toContain("one concise visual span per meaningful frame");
   });
 
   function fakeClient(): DocumentationClient {

@@ -59,9 +59,9 @@ const ANSWER_SCHEMA_PATH = fileURLToPath(new URL("./documentation-answer.schema.
 const ENRICHMENT_BATCH_TARGET_CHARS = 60_000;
 const ANSWER_DOCUMENT_TARGET_CHARS = 40_000;
 const ANSWER_EVIDENCE_TARGET_CHARS = 90_000;
-const MEDIA_KEYFRAME_INTERVAL_SECONDS = 1;
 const MEDIA_TOOL_TIMEOUT_MS = 30 * 60 * 1000;
 const TRANSCRIPT_SEGMENT_TARGET_CHARS = 12_000;
+const MEDIA_SCENE_KEYFRAME_FILTER = "fps=1,select='eq(n,0)+gt(scene,0.08)',showinfo,scale=960:-2:flags=fast_bilinear";
 
 export interface DocumentationEnrichmentRunner {
   readonly model: string;
@@ -284,6 +284,10 @@ export class DocumentationEnrichmentService {
       return [];
     }
     const extracted = path.join(path.dirname(snapshot), "extracted");
+    const structuredArtifacts = await documentArtifactEvidence(document, root, extracted);
+    if (structuredArtifacts.length > 0) {
+      return structuredArtifacts;
+    }
     if (!fs.existsSync(extracted)) {
       return [];
     }
@@ -319,12 +323,17 @@ export class DocumentationEnrichmentService {
       throw new Error("Documentation media enrichment requires the ASR service so uploaded audio/video is not indexed without transcript evidence.");
     }
     const transcript = await this.options.asr.transcribe(source.content, source.filename || "upload.media");
-    const keyframes = isVideoSource(source) ? captureIntervalKeyframes(mediaPath, path.join(tempDir, "frames")) : [];
+    const keyframes = isVideoSource(source) ? captureSceneKeyframes(mediaPath, path.join(tempDir, "frames")) : [];
     return {
       filename: source.filename,
       contentType: source.contentType,
       sourceType: source.sourceType,
       transcript: transcript?.text,
+      transcriptSegments: transcript?.segments?.map((segment) => ({
+        startSeconds: segment.start_seconds,
+        endSeconds: segment.end_seconds,
+        text: segment.text
+      })),
       language: transcript?.language,
       languageProbability: transcript?.language_probability,
       keyframes
@@ -357,6 +366,14 @@ interface ArtifactEvidence {
   archivePath: string;
   bytes: number;
   kind: string;
+  locator?: string;
+  id?: string;
+  type?: string;
+  offsetSeconds?: number;
+  transcriptStartSeconds?: number;
+  transcriptEndSeconds?: number;
+  reason?: string;
+  changeScore?: number;
 }
 
 interface MediaEvidence {
@@ -364,6 +381,7 @@ interface MediaEvidence {
   contentType?: string;
   sourceType?: string;
   transcript?: string;
+  transcriptSegments?: Array<{ startSeconds: number; endSeconds: number; text: string }>;
   language?: string;
   languageProbability?: number;
   keyframes: Array<{ path: string; offsetSeconds?: number }>;
@@ -440,14 +458,14 @@ interface BatchedMediaEvidence {
   sourceType?: string;
   language?: string;
   languageProbability?: number;
-  transcriptSegments: Array<{ segmentIndex: number; text: string }>;
+  transcriptSegments: Array<{ segmentIndex: number; text: string; startSeconds?: number; endSeconds?: number }>;
   keyframes: Array<{ path: string; offsetSeconds?: number }>;
 }
 
 type EvidenceBatchItem =
   | { kind: "chunk"; value: DocumentChunkEvidence }
   | { kind: "artifact"; value: ArtifactEvidence }
-  | { kind: "transcript"; value: { segmentIndex: number; text: string } }
+  | { kind: "transcript"; value: { segmentIndex: number; text: string; startSeconds?: number; endSeconds?: number } }
   | { kind: "keyframe"; value: { path: string; offsetSeconds?: number } };
 
 function uniqueDocuments(response: Record<string, unknown>): IngestedDocumentRef[] {
@@ -685,6 +703,39 @@ function documentSummary(document: Record<string, unknown>): Record<string, unkn
   };
 }
 
+async function documentArtifactEvidence(document: Record<string, unknown>, archiveRoot: string, extractedRoot: string): Promise<ArtifactEvidence[]> {
+  const evidence: ArtifactEvidence[] = [];
+  for (const artifact of recordsArray(document.artifacts)) {
+    if (artifact.available === false) {
+      continue;
+    }
+    const relativePath = typeof artifact.path === "string" ? artifact.path : "";
+    if (!relativePath) {
+      continue;
+    }
+    const artifactPath = path.resolve(extractedRoot, relativePath);
+    if (!isSameOrChild(extractedRoot, artifactPath) || !fs.existsSync(artifactPath)) {
+      continue;
+    }
+    const stat = await fsp.stat(artifactPath);
+    evidence.push({
+      path: artifactPath,
+      archivePath: path.relative(archiveRoot, artifactPath),
+      bytes: typeof artifact.bytes === "number" ? artifact.bytes : stat.size,
+      kind: typeof artifact.kind === "string" ? artifact.kind : artifactKind(relativePath),
+      locator: optionalRecordString(artifact, "locator"),
+      id: optionalRecordString(artifact, "id"),
+      type: optionalRecordString(artifact, "type"),
+      offsetSeconds: optionalRecordNumber(artifact, "offsetSeconds"),
+      transcriptStartSeconds: optionalRecordNumber(artifact, "transcriptStartSeconds"),
+      transcriptEndSeconds: optionalRecordNumber(artifact, "transcriptEndSeconds"),
+      reason: optionalRecordString(artifact, "reason"),
+      changeScore: optionalRecordNumber(artifact, "changeScore")
+    });
+  }
+  return evidence;
+}
+
 function documentChunks(document: Record<string, unknown>): DocumentChunkEvidence[] {
   return recordsArray(document.chunks)
     .filter((chunk) => chunk.chunk_origin !== "ai")
@@ -697,14 +748,42 @@ function documentChunks(document: Record<string, unknown>): DocumentChunkEvidenc
 }
 
 function buildEvidenceBatches(evidence: EnrichmentEvidence): EnrichmentEvidenceBatch[] {
-  const items: EvidenceBatchItem[] = [
-    ...evidence.chunks.map((value) => ({ kind: "chunk" as const, value })),
-    ...evidence.artifacts.map((value) => ({ kind: "artifact" as const, value })),
-    ...transcriptSegments(evidence.media?.transcript).map((value) => ({ kind: "transcript" as const, value })),
-    ...(evidence.media?.keyframes ?? []).map((value) => ({ kind: "keyframe" as const, value }))
-  ];
+  const items = buildEvidenceItems(evidence);
   const grouped = groupEvidenceItems(items);
   return grouped.map((batchItems, index) => evidenceBatch(evidence, batchItems, index + 1, grouped.length));
+}
+
+function buildEvidenceItems(evidence: EnrichmentEvidence): EvidenceBatchItem[] {
+  const items: EvidenceBatchItem[] = [];
+  const remainingArtifacts = new Set(evidence.artifacts);
+  for (const chunk of evidence.chunks) {
+    items.push({ kind: "chunk", value: chunk });
+    for (const artifact of evidence.artifacts) {
+      if (remainingArtifacts.has(artifact) && artifactMatchesChunk(artifact, chunk)) {
+        items.push({ kind: "artifact", value: artifact });
+        remainingArtifacts.delete(artifact);
+      }
+    }
+  }
+  for (const artifact of evidence.artifacts) {
+    if (remainingArtifacts.has(artifact)) {
+      items.push({ kind: "artifact", value: artifact });
+    }
+  }
+  items.push(...mediaTranscriptSegments(evidence.media).map((value) => ({ kind: "transcript" as const, value })));
+  items.push(...(evidence.media?.keyframes ?? []).map((value) => ({ kind: "keyframe" as const, value })));
+  return items;
+}
+
+function artifactMatchesChunk(artifact: ArtifactEvidence, chunk: DocumentChunkEvidence): boolean {
+  const chunkLocator = typeof chunk.locator === "string" ? chunk.locator : "";
+  if (artifact.locator && artifact.locator === chunkLocator) {
+    return true;
+  }
+  if (artifact.id && (chunkLocator.includes(artifact.id) || chunk.text.includes(artifact.id))) {
+    return true;
+  }
+  return Boolean(artifact.archivePath && chunk.text.includes(path.basename(artifact.archivePath)));
 }
 
 function groupEvidenceItems(items: EvidenceBatchItem[]): EvidenceBatchItem[][] {
@@ -773,6 +852,20 @@ function mediaBatchMetadata(media: MediaEvidence | undefined): BatchedMediaEvide
   };
 }
 
+function mediaTranscriptSegments(media: MediaEvidence | undefined): Array<{ segmentIndex: number; text: string; startSeconds?: number; endSeconds?: number }> {
+  if (media?.transcriptSegments?.length) {
+    return media.transcriptSegments
+      .filter((segment) => segment.text.trim())
+      .map((segment, index) => ({
+        segmentIndex: index + 1,
+        text: segment.text,
+        startSeconds: segment.startSeconds,
+        endSeconds: segment.endSeconds
+      }));
+  }
+  return transcriptSegments(media?.transcript);
+}
+
 function transcriptSegments(transcript: string | undefined): Array<{ segmentIndex: number; text: string }> {
   if (!transcript?.trim()) {
     return [];
@@ -836,18 +929,20 @@ async function listFiles(root: string): Promise<string[]> {
   return files;
 }
 
-function captureIntervalKeyframes(inputPath: string, outputDir: string): Array<{ path: string; offsetSeconds?: number }> {
+function captureSceneKeyframes(inputPath: string, outputDir: string): Array<{ path: string; offsetSeconds?: number }> {
   fs.mkdirSync(outputDir, { recursive: true });
   const result = spawnSync(
     "ffmpeg",
     [
       "-hide_banner",
       "-loglevel",
-      "error",
+      "info",
       "-i",
       inputPath,
       "-vf",
-      `fps=1/${MEDIA_KEYFRAME_INTERVAL_SECONDS}`,
+      MEDIA_SCENE_KEYFRAME_FILTER,
+      "-fps_mode",
+      "vfr",
       path.join(outputDir, "frame-%04d.jpg")
     ],
     { encoding: "utf8", timeout: MEDIA_TOOL_TIMEOUT_MS }
@@ -858,14 +953,33 @@ function captureIntervalKeyframes(inputPath: string, outputDir: string): Array<{
   if (result.status !== 0) {
     throw new Error(`ffmpeg keyframe extraction failed: ${result.stderr || result.stdout || `exit ${result.status}`}`);
   }
-  return fs.readdirSync(outputDir)
+  const frameNames = fs.readdirSync(outputDir)
     .filter((name) => name.endsWith(".jpg"))
-    .sort()
-    .map((name, index) => ({ path: path.join(outputDir, name), offsetSeconds: index * MEDIA_KEYFRAME_INTERVAL_SECONDS }));
+    .sort();
+  const offsets = parseFfmpegShowinfoPtsTimes(result.stderr ?? "");
+  if (frameNames.length !== offsets.length) {
+    throw new Error(`ffmpeg keyframe extraction produced ${frameNames.length} frame files but ${offsets.length} frame timestamps.`);
+  }
+  return frameNames.map((name, index) => ({ path: path.join(outputDir, name), offsetSeconds: Math.max(0, Math.round(offsets[index] ?? 0)) }));
+}
+
+export function parseFfmpegShowinfoPtsTimes(output: string): number[] {
+  return Array.from(output.matchAll(/\bpts_time:(-?\d+(?:\.\d+)?)/gu), (match) => Number.parseFloat(match[1] ?? "0"))
+    .filter((value) => Number.isFinite(value));
 }
 
 function artifactKind(filePath: string): string {
   return path.extname(filePath).toLowerCase().replace(/^\./u, "") || "file";
+}
+
+function optionalRecordString(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function optionalRecordNumber(record: Record<string, unknown>, key: string): number | undefined {
+  const value = record[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function isMediaSource(source: DocumentationEnrichmentSource): boolean {

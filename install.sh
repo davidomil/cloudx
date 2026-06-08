@@ -94,8 +94,13 @@ run sudo apt-get install -y \
   gnupg \
   git \
   build-essential \
+  cmake \
+  pciutils \
+  gpg-agent \
+  wget \
   libreoffice \
   poppler-utils \
+  ffmpeg \
   pandoc \
   texlive-xetex \
   texlive-latex-recommended \

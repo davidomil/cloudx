@@ -2628,11 +2628,21 @@ a:hover svg {
 .documentation-result p,
 .documentation-source-header p,
 .documentation-empty,
-.documentation-status,
 .documentation-selected-file {
   margin: 0;
   color: var(--color-muted-foreground);
   font-size: 12px;
+}
+
+.documentation-notice {
+  margin: 0;
+  padding: 8px 10px;
+  color: #ffe4ea;
+  background: rgb(255 51 102 / 0.12);
+  border: 1px solid rgb(255 51 102 / 0.42);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.4;
 }
 
 .documentation-ai-status {
@@ -2784,6 +2794,51 @@ a:hover svg {
   display: grid;
   gap: 2px;
   min-width: 0;
+}
+
+.documentation-ingest-channels {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 6px;
+  min-width: 0;
+}
+
+.documentation-ingest-channel {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  border: 1px solid rgb(255 255 255 / 0.08);
+  background: rgb(0 0 0 / 0.16);
+  padding: 6px 7px;
+}
+
+.documentation-ingest-channel > span {
+  color: var(--color-accent);
+  font-family: var(--font-label);
+  font-size: 11px;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.documentation-ingest-channel small {
+  color: var(--color-muted-foreground);
+  font-size: 11px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.documentation-ingest-channel-progress {
+  height: 4px;
+  overflow: hidden;
+  border: 1px solid rgb(0 229 255 / 0.12);
+  background: rgb(255 255 255 / 0.08);
+}
+
+.documentation-ingest-channel-progress span {
+  display: block;
+  height: 100%;
+  background: var(--color-accent);
+  transition: width 160ms ease;
 }
 
 .documentation-ingest-job-failed .documentation-ingest-job-state > span,
@@ -3180,11 +3235,14 @@ a:hover svg {
 }
 
 .documentation-source-viewer {
-  flex: 0 0 auto;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  flex: 1 1 auto;
   min-height: 0;
   border: 1px solid var(--color-border);
   clip-path: var(--chamfer-sm);
   background: rgb(14 18 26 / 0.82);
+  gap: 10px;
   padding: 10px;
 }
 
@@ -3210,10 +3268,21 @@ a:hover svg {
   padding-top: 8px;
 }
 
+.documentation-source-autoload {
+  display: flex;
+  justify-content: center;
+  min-height: 34px;
+  padding: 8px;
+  border: 1px dashed rgb(0 229 255 / 0.18);
+  color: var(--color-muted-foreground);
+  font-size: 11px;
+}
+
 .documentation-chunk-list {
   display: grid;
   gap: 8px;
-  max-height: min(34vh, 420px);
+  min-height: 0;
+  max-height: none;
   overflow-y: auto;
   padding-right: 4px;
 }
@@ -3309,11 +3378,6 @@ a:hover svg {
   overflow-wrap: anywhere;
 }
 
-.documentation-status {
-  border-top: 1px solid var(--color-border);
-  padding-top: 8px;
-}
-
 @media (max-width: 1180px) {
   .documentation-panel {
     overflow: auto;
@@ -3326,6 +3390,12 @@ a:hover svg {
 
   .documentation-section {
     overflow: visible;
+  }
+
+  .documentation-source-viewer {
+    flex: 1 1 auto;
+    min-height: min(70vh, 640px);
+    overflow: hidden;
   }
 
   .documentation-chunk-with-artifacts {

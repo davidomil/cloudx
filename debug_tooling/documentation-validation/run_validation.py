@@ -133,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--mock-count", type=int, default=2500)
     parser.add_argument("--skip-download", action="store_true")
-    parser.add_argument("--include-youtube", action="store_true", help="Also ingest real YouTube videos with transcripts and one-frame-per-second keyframe artifacts. Requires live YouTube and ffmpeg access.")
+    parser.add_argument("--include-youtube", action="store_true", help="Also ingest real YouTube videos with timestamped transcripts and selected slide-frame artifacts. Requires live YouTube, yt-dlp, faster-whisper, and ffmpeg access.")
     args = parser.parse_args(argv)
 
     corpus_dir = args.root / "corpus"

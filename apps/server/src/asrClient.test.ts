@@ -50,13 +50,13 @@ describe("AsrClient", () => {
     const { url } = await startAsrHttpServer((request, response) => {
       requestUrl = request.url;
       response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ text: "list directory" }));
+      response.end(JSON.stringify({ text: "list directory", duration_seconds: 1.5, segments: [{ start_seconds: 0, end_seconds: 1.5, text: "list directory" }] }));
     });
     const client = new AsrClient(`${url}/speech/?token=local`);
 
     const result = await client.transcribe(Buffer.from("audio"), "voice.webm");
 
-    expect(result).toEqual({ text: "list directory" });
+    expect(result).toEqual({ text: "list directory", duration_seconds: 1.5, segments: [{ start_seconds: 0, end_seconds: 1.5, text: "list directory" }] });
     expect(requestUrl).toBe("/speech/transcribe?token=local");
   });
 
@@ -172,7 +172,16 @@ describe("AsrClient", () => {
     const payload = Buffer.from(JSON.stringify({ type: "transcript", text: "list directory", language: "en" }));
     const raw = payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength) as ArrayBuffer;
 
-    expect(parseAsrStreamMessage(raw)).toEqual({ type: "transcript", text: "list directory", language: "en", language_probability: undefined, message: undefined });
+    expect(parseAsrStreamMessage(raw)).toEqual({
+      type: "transcript",
+      text: "list directory",
+      language: "en",
+      language_probability: undefined,
+      message: undefined,
+      duration_seconds: undefined,
+      duration_after_vad_seconds: undefined,
+      segments: undefined
+    });
   });
 
   it("parses fragmented streaming transcript payloads", () => {

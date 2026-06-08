@@ -48,6 +48,7 @@ PYTHONPATH=services/documentation-indexer/src \
 ```
 
 `--include-youtube` ingests a real recipe video and a real Linux
-memory-management presentation with transcript, metadata, and one PNG keyframe
-per second. Keep it opt-in because YouTube caption availability, media access,
-rate limits, and FFmpeg runtime are external state.
+memory-management presentation with timestamped transcript, metadata, and
+selected slide-frame artifacts. Keep it opt-in because YouTube media access,
+rate limits, local faster-whisper runtime, and FFmpeg runtime are external
+state.

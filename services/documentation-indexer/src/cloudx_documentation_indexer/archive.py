@@ -6,11 +6,14 @@ import json
 import mimetypes
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable, Iterator, Mapping
 from importlib.metadata import version
 from dataclasses import dataclass
@@ -20,6 +23,7 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 import numpy as np
+from PIL import Image
 from turbovec import IdMapIndex
 
 from .extraction import ExtractedSpan, IMAGE_SUFFIXES, SUPPORTED_FILE_SUFFIXES, extract_bytes, extract_file
@@ -49,6 +53,24 @@ IDENTIFIER_TERM_MATCH_BONUS = 4.0
 MAX_URL_INGEST_BYTES = 256 * 1024 * 1024
 ACTIVE_STATE = "active"
 EXCLUDED_STATES = {"stale", "superseded", "revoked", "quarantined", "deleted"}
+VIDEO_SCAN_FPS = 1
+VIDEO_SEGMENT_SECONDS = 5 * 60
+VIDEO_LOCAL_WORKERS = max(2, min(8, (os.cpu_count() or 4) // 2))
+VIDEO_COMPARISON_WIDTH = 320
+VIDEO_ARTIFACT_MAX_WIDTH = 960
+VIDEO_SLIDE_MEAN_DELTA_THRESHOLD = 0.035
+VIDEO_SLIDE_CHANGED_PIXEL_THRESHOLD = 0.06
+VIDEO_SLIDE_PIXEL_DELTA_THRESHOLD = 0.08
+VIDEO_SLIDE_SETTLE_SECONDS = 2
+VIDEO_MAX_SELECTED_FRAMES = 5000
+VIDEO_VISUAL_DOWNLOAD_FORMAT = "bestvideo[height<=720][vcodec!=none]/best[height<=720]/bestvideo[vcodec!=none]/bestvideo/best"
+ASR_BACKEND_FASTER_WHISPER = "faster-whisper"
+ASR_BACKEND_WHISPER_CPP = "whisper-cpp"
+WHISPER_CPP_CHUNK_SECONDS = 30 * 60
+WHISPER_CPP_CHUNK_OVERLAP_SECONDS = 5
+
+
+ProgressReporter = Callable[[dict[str, Any]], None]
 
 
 @dataclass(frozen=True)
@@ -97,6 +119,37 @@ class YouTubeVideoMetadata:
     thumbnail: str | None = None
     tags: list[str] | None = None
     chapters: list[dict[str, Any]] | None = None
+
+
+@dataclass(frozen=True)
+class TranscriptSegment:
+    start_seconds: float
+    end_seconds: float
+    text: str
+
+
+@dataclass(frozen=True)
+class WhisperCppAudioChunk:
+    index: int
+    start_seconds: float
+    duration_seconds: float
+    keep_start_seconds: float
+    keep_end_seconds: float
+    path: Path
+
+
+@dataclass(frozen=True)
+class VideoVisualProfile:
+    scan_fps: int = VIDEO_SCAN_FPS
+    segment_seconds: int = VIDEO_SEGMENT_SECONDS
+    local_workers: int = VIDEO_LOCAL_WORKERS
+    comparison_width: int = VIDEO_COMPARISON_WIDTH
+    artifact_max_width: int = VIDEO_ARTIFACT_MAX_WIDTH
+    mean_delta_threshold: float = VIDEO_SLIDE_MEAN_DELTA_THRESHOLD
+    changed_pixel_threshold: float = VIDEO_SLIDE_CHANGED_PIXEL_THRESHOLD
+    pixel_delta_threshold: float = VIDEO_SLIDE_PIXEL_DELTA_THRESHOLD
+    settle_seconds: int = VIDEO_SLIDE_SETTLE_SECONDS
+    max_selected_frames: int = VIDEO_MAX_SELECTED_FRAMES
 
 
 @dataclass(frozen=True)
@@ -321,10 +374,11 @@ class DocumentationArchive:
         collection: str | None = None,
         tags: list[str] | None = None,
         transcript: str | None = None,
+        progress: ProgressReporter | None = None,
     ) -> list[IngestedDocument]:
         if transcript is None and is_youtube_playlist_url(url):
-            return self.ingest_youtube_playlist(url, title=title, source_type=source_type, collection=collection, tags=tags)
-        return [self.ingest_url(url, title=title, source_type=source_type, collection=collection, tags=tags, transcript=transcript)]
+            return self.ingest_youtube_playlist(url, title=title, source_type=source_type, collection=collection, tags=tags, progress=progress)
+        return [self.ingest_url(url, title=title, source_type=source_type, collection=collection, tags=tags, transcript=transcript, progress=progress)]
 
     def ingest_url(
         self,
@@ -335,6 +389,7 @@ class DocumentationArchive:
         collection: str | None = None,
         tags: list[str] | None = None,
         transcript: str | None = None,
+        progress: ProgressReporter | None = None,
     ) -> IngestedDocument:
         if transcript is not None:
             return self.ingest_text(
@@ -346,7 +401,8 @@ class DocumentationArchive:
                 tags=tags,
             )
         if (source_type or "").lower() == "media" or is_youtube_url(url):
-            return self.ingest_youtube_video(url, title=title, collection=collection, tags=tags)
+            return self.ingest_youtube_video(url, title=title, collection=collection, tags=tags, progress=progress)
+        report_progress(progress, stage="Downloading URL and reading response metadata.", progress=12)
         response, source_bytes = fetch_url_bytes(url, MAX_URL_INGEST_BYTES)
         content_type = response.headers.get("content-type")
         inferred_type = source_type or infer_source_type(url, content_type)
@@ -382,19 +438,28 @@ class DocumentationArchive:
         source_type: str | None = None,
         collection: str | None = None,
         tags: list[str] | None = None,
+        progress: ProgressReporter | None = None,
     ) -> list[IngestedDocument]:
+        report_progress(progress, stage="Fetching YouTube playlist metadata.", progress=8)
         playlist = extract_youtube_playlist(url)
         playlist_title = optional_text(title) or playlist.title
         playlist_collection = autodetect_collection(collection, playlist_title=playlist_title, url=url, source_type=source_type or "media")
         documents: list[IngestedDocument] = []
         try:
-            for entry in playlist.entries:
+            for index, entry in enumerate(playlist.entries, start=1):
+                report_progress(
+                    progress,
+                    stage=f"Ingesting playlist video {index} of {len(playlist.entries)}: {entry.title}",
+                    progress=10 + int(((index - 1) / max(1, len(playlist.entries))) * 80),
+                    metrics={"playlistIndex": index, "playlistTotal": len(playlist.entries)},
+                )
                 documents.append(
                     self.ingest_youtube_video(
                         entry.url,
                         title=entry.title,
                         collection=playlist_collection,
                         tags=tags,
+                        progress=progress,
                     )
                 )
         except Exception:
@@ -410,41 +475,50 @@ class DocumentationArchive:
         title: str | None = None,
         collection: str | None = None,
         tags: list[str] | None = None,
+        progress: ProgressReporter | None = None,
     ) -> IngestedDocument:
-        transcript = fetch_youtube_transcript(url)
+        report_progress(progress, stage="Fetching YouTube video metadata.", progress=12)
         metadata = extract_youtube_video_metadata(url)
-        document_title = autodetect_title(title or metadata.title, url=url, text=transcript)
-        source_text = youtube_source_text(metadata, transcript)
-        source_bytes = source_text.encode("utf-8")
-        with self._write_lock:
-            snapshot_path = self._store_snapshot(
-                source_bytes,
-                safe_file_name(document_title) + ".youtube.txt",
-                metadata={
-                    "url": url,
-                    "sourceType": "media",
-                    "youtube": youtube_metadata_json(metadata),
-                },
-            )
-            artifact_dir = snapshot_path.parent / "extracted"
-            reset_directory(artifact_dir)
-            keyframes = capture_youtube_keyframes(metadata, artifact_dir)
-            spans = [
-                ExtractedSpan(youtube_metadata_span(metadata), "media metadata"),
-                *youtube_description_spans(metadata),
-                ExtractedSpan(transcript, "transcript"),
-                ExtractedSpan(youtube_keyframe_span(keyframes), "media keyframes"),
-            ]
-            return self._write_document(
-                title=document_title,
-                source_type="media",
-                uri=url,
-                snapshot_path=snapshot_path,
-                content_bytes=source_bytes,
-                spans=spans,
-                collection=autodetect_collection(collection, url=url, source_type="media"),
-                tags=tags,
-            )
+        with tempfile.TemporaryDirectory(prefix="cloudx-youtube-evidence-") as temp_dir_name:
+            temp_artifact_dir = Path(temp_dir_name) / "extracted"
+            transcript_segments, keyframes = extract_youtube_video_evidence(url, metadata, temp_artifact_dir, progress=progress)
+            transcript = transcript_segments_text(transcript_segments)
+            document_title = autodetect_title(title or metadata.title, url=url, text=transcript)
+            source_text = youtube_source_text(metadata, transcript)
+            source_bytes = source_text.encode("utf-8")
+            with self._write_lock:
+                report_progress(progress, stage="Writing YouTube source snapshot.", progress=59)
+                snapshot_path = self._store_snapshot(
+                    source_bytes,
+                    safe_file_name(document_title) + ".youtube.txt",
+                    metadata={
+                        "url": url,
+                        "sourceType": "media",
+                        "youtube": youtube_metadata_json(metadata),
+                    },
+                )
+                artifact_dir = snapshot_path.parent / "extracted"
+                reset_directory(artifact_dir)
+                shutil.copytree(temp_artifact_dir / "media", artifact_dir / "media", dirs_exist_ok=True)
+                write_transcript_segment_index(artifact_dir / "media" / "transcript_segments.tsv", transcript_segments)
+                write_keyframe_index(artifact_dir / "media" / "keyframes.tsv", keyframes)
+                spans = [
+                    ExtractedSpan(youtube_metadata_span(metadata), "media metadata"),
+                    *youtube_description_spans(metadata),
+                    *youtube_transcript_spans(transcript_segments),
+                    *youtube_keyframe_spans(keyframes, transcript_segments),
+                ]
+                report_progress(progress, stage="Writing indexed YouTube archive chunks.", progress=75)
+                return self._write_document(
+                    title=document_title,
+                    source_type="media",
+                    uri=url,
+                    snapshot_path=snapshot_path,
+                    content_bytes=source_bytes,
+                    spans=spans,
+                    collection=autodetect_collection(collection, url=url, source_type="media"),
+                    tags=tags,
+                )
 
     def ingest_upload(
         self,
@@ -1290,6 +1364,7 @@ def media_keyframe_artifacts(document_id: str, artifact_root: Path, *, offset: i
     for row in window_tsv_rows(artifact_root / "media" / "keyframes.tsv", offset, limit, is_media_keyframe_artifact_row):
         path = optional_text(row.get("path"))
         offset_seconds = optional_int(row.get("offset_seconds"))
+        keyframe_id = youtube_keyframe_id(offset_seconds)
         records.append(
             with_artifact_file_metadata(
                 artifact_root,
@@ -1297,10 +1372,14 @@ def media_keyframe_artifacts(document_id: str, artifact_root: Path, *, offset: i
                     "documentId": document_id,
                     "type": "media-keyframe",
                     "kind": "keyframe",
-                    "id": f"keyframe-{offset_seconds:06d}",
+                    "id": keyframe_id,
                     "path": safe_artifact_relative_path(path),
-                    "locator": "media keyframes",
+                    "locator": youtube_keyframe_locator(offset_seconds),
                     "offsetSeconds": offset_seconds,
+                    "reason": optional_text(row.get("reason")),
+                    "changeScore": optional_float(row.get("change_score")),
+                    "transcriptStartSeconds": optional_float(row.get("transcript_start_seconds")),
+                    "transcriptEndSeconds": optional_float(row.get("transcript_end_seconds")),
                 },
             )
         )
@@ -1450,6 +1529,19 @@ def optional_int(value: Any) -> int | None:
     return None
 
 
+def optional_float(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
 def string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
@@ -1560,6 +1652,10 @@ def collection_from_uri(uri: str | None) -> str | None:
 
 
 def fetch_youtube_transcript(url: str) -> str:
+    return transcript_segments_text(fetch_youtube_transcript_segments(url))
+
+
+def fetch_youtube_transcript_segments(url: str) -> list[TranscriptSegment]:
     if YouTubeTranscriptApi is None:
         raise ArchiveError("youtube-transcript-api is not importable.")
     video_id = youtube_video_id(url)
@@ -1567,7 +1663,822 @@ def fetch_youtube_transcript(url: str) -> str:
         raise ArchiveError("YouTube URL does not contain a video id.")
     api = YouTubeTranscriptApi()
     transcript = api.fetch(video_id)
-    return "\n".join(snippet.text for snippet in transcript.snippets)
+    segments = [
+        TranscriptSegment(
+            start_seconds=float(snippet.start),
+            end_seconds=float(snippet.start) + max(0.0, float(snippet.duration)),
+            text=snippet.text.strip(),
+        )
+        for snippet in transcript.snippets
+        if snippet.text.strip()
+    ]
+    if not segments:
+        raise ArchiveError("YouTube transcript did not contain any text segments.")
+    return segments
+
+
+def extract_youtube_video_evidence(
+    url: str,
+    metadata: YouTubeVideoMetadata,
+    artifact_dir: Path,
+    *,
+    progress: ProgressReporter | None = None,
+) -> tuple[list[TranscriptSegment], list[dict[str, Any]]]:
+    report_progress(
+        progress,
+        stage="Extracting YouTube transcript and slide frames in parallel.",
+        progress=22,
+        metrics={"durationSeconds": metadata.duration, "workers": 2},
+    )
+    parallel_progress = YouTubeParallelProgress(progress)
+    transcript_progress = parallel_progress.channel("Transcript", 26, 58)
+    keyframe_progress = parallel_progress.channel("Visual scan", 60, 74)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        transcript_future = executor.submit(transcribe_youtube_video, url, metadata, progress=transcript_progress)
+        keyframe_future = executor.submit(capture_youtube_keyframes, metadata, artifact_dir, progress=keyframe_progress)
+        transcript_segments = transcript_future.result()
+        keyframes = keyframe_future.result()
+    align_keyframes_to_transcript(keyframes, transcript_segments, metadata.duration)
+    write_keyframe_index(artifact_dir / "media" / "keyframes.tsv", keyframes)
+    return transcript_segments, keyframes
+
+
+class YouTubeParallelProgress:
+    def __init__(self, reporter: ProgressReporter | None):
+        self._reporter = reporter
+        self.lock = threading.Lock()
+        self.best_progress = 22
+
+    def channel(self, label: str, source_start: int, source_end: int) -> ProgressReporter | None:
+        if self._reporter is None:
+            return None
+
+        def wrapped(event: dict[str, Any]) -> None:
+            mapped = dict(event)
+            mapped["channel"] = progress_channel_id(label)
+            mapped["channelLabel"] = label
+            local_progress = optional_float(mapped.get("progress"))
+            if local_progress is not None:
+                fraction = (local_progress - source_start) / max(1, source_end - source_start)
+                bounded_fraction = max(0.0, min(1.0, fraction))
+                mapped["channelProgress"] = int(round(bounded_fraction * 100))
+                candidate = 22 + bounded_fraction * 36
+                with self.lock:
+                    self.best_progress = max(self.best_progress, int(round(candidate)))
+                    mapped["progress"] = self.best_progress
+            stage = str(mapped.get("stage") or "").strip()
+            mapped["stage"] = f"{label}: {stage}" if stage else label
+            self._reporter(mapped)
+
+        return wrapped
+
+
+def progress_channel_id(label: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", label.strip().lower()).strip("-") or "progress"
+
+
+def transcribe_youtube_video(url: str, metadata: YouTubeVideoMetadata, *, progress: ProgressReporter | None = None) -> list[TranscriptSegment]:
+    transcript_source = os.getenv("CLOUDX_DOCUMENTATION_YOUTUBE_TRANSCRIPT_SOURCE", "asr").strip().lower()
+    if transcript_source == "captions":
+        segments = fetch_youtube_transcript_segments(url)
+        report_progress(progress, stage="Fetched timestamped YouTube captions.", progress=40, metrics={"transcriptSegments": len(segments)})
+        return segments
+    return transcribe_youtube_audio(url, metadata, progress=progress)
+
+
+def transcribe_youtube_audio(url: str, metadata: YouTubeVideoMetadata, *, progress: ProgressReporter | None = None) -> list[TranscriptSegment]:
+    if yt_dlp is None:
+        raise ArchiveError("yt-dlp is not importable.")
+    backend = documentation_asr_backend()
+    started_at = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="cloudx-youtube-audio-") as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        report_progress(progress, stage="Downloading YouTube audio for local transcription.", progress=26, metrics={"durationSeconds": metadata.duration})
+        try:
+            with yt_dlp.YoutubeDL(
+                {
+                    "format": "bestaudio/best",
+                    "ignoreerrors": False,
+                    "noplaylist": True,
+                    "no_warnings": True,
+                    "noprogress": True,
+                    "outtmpl": str(temp_dir / "%(id)s.%(ext)s"),
+                    "progress_hooks": [youtube_audio_download_progress_hook(progress, started_at, metadata.duration)],
+                    "quiet": True,
+                }
+            ) as downloader:
+                downloader.extract_info(url, download=True)
+        except Exception as error:
+            raise ArchiveError(f"Could not download YouTube audio for transcription: {error}") from error
+        audio_files = sorted(path for path in temp_dir.iterdir() if path.is_file() and not path.name.endswith(".part"))
+        if not audio_files:
+            raise ArchiveError("yt-dlp did not produce an audio file for YouTube transcription.")
+        audio_path = audio_files[0]
+        audio_bytes = audio_path.stat().st_size
+        if backend == ASR_BACKEND_WHISPER_CPP:
+            return transcribe_audio_whisper_cpp(audio_path, temp_dir, metadata, audio_bytes, started_at, progress=progress)
+        return transcribe_audio_faster_whisper(audio_path, metadata, audio_bytes, started_at, progress=progress)
+
+
+def transcribe_audio_faster_whisper(
+    audio_path: Path,
+    metadata: YouTubeVideoMetadata,
+    audio_bytes: int,
+    started_at: float,
+    *,
+    progress: ProgressReporter | None = None,
+) -> list[TranscriptSegment]:
+    try:
+        from faster_whisper import BatchedInferencePipeline, WhisperModel
+    except Exception as error:
+        raise ArchiveError("faster-whisper is required for YouTube audio transcription.") from error
+
+    report_progress(progress, stage="Loading faster-whisper model.", progress=32, metrics={"durationSeconds": metadata.duration, "audioBytes": audio_bytes})
+    heartbeat = ProgressHeartbeat(
+        progress,
+        stage="Running faster-whisper transcription; waiting for timestamped segments.",
+        progress=32,
+        metrics={"durationSeconds": metadata.duration, "audioBytes": audio_bytes},
+    )
+    model_name = os.getenv("CLOUDX_DOCUMENTATION_ASR_MODEL_PATH") or os.getenv("CLOUDX_ASR_MODEL_PATH") or os.getenv("CLOUDX_DOCUMENTATION_ASR_MODEL") or os.getenv("CLOUDX_ASR_MODEL", "small")
+    try:
+        model = WhisperModel(
+            model_name,
+            device=os.getenv("CLOUDX_DOCUMENTATION_ASR_DEVICE", os.getenv("CLOUDX_ASR_DEVICE", "cpu")),
+            compute_type=os.getenv("CLOUDX_DOCUMENTATION_ASR_COMPUTE_TYPE", os.getenv("CLOUDX_ASR_COMPUTE_TYPE", "int8")),
+            cpu_threads=max(0, int(os.getenv("CLOUDX_DOCUMENTATION_ASR_CPU_THREADS", os.getenv("CLOUDX_ASR_CPU_THREADS", str(default_asr_cpu_threads()))))),
+            num_workers=max(1, int(os.getenv("CLOUDX_DOCUMENTATION_ASR_NUM_WORKERS", os.getenv("CLOUDX_ASR_NUM_WORKERS", "1")))),
+        )
+        batch_size = max(1, int(os.getenv("CLOUDX_DOCUMENTATION_ASR_BATCH_SIZE", "8")))
+        transcribe_options = {
+            "language": documentation_asr_language(),
+            "task": "transcribe",
+            "beam_size": documentation_asr_beam_size(),
+            "vad_filter": documentation_asr_vad_filter(),
+            "condition_on_previous_text": False,
+        }
+        heartbeat.update(stage="Running faster-whisper transcription; waiting for timestamped segments.", progress=32, metrics={"durationSeconds": metadata.duration, "audioBytes": audio_bytes})
+        if batch_size > 1:
+            runner = BatchedInferencePipeline(model=model)
+            segments_iter, info = runner.transcribe(str(audio_path), batch_size=batch_size, **transcribe_options)
+        else:
+            segments_iter, info = model.transcribe(str(audio_path), **transcribe_options)
+        duration = float(getattr(info, "duration", 0) or metadata.duration or 0)
+        segments: list[TranscriptSegment] = []
+        last_report_at = 0.0
+        for segment in segments_iter:
+            text = str(getattr(segment, "text", "")).strip()
+            if not text:
+                continue
+            start_seconds = float(getattr(segment, "start", 0.0) or 0.0)
+            end_seconds = float(getattr(segment, "end", start_seconds) or start_seconds)
+            segments.append(TranscriptSegment(start_seconds=start_seconds, end_seconds=max(start_seconds, end_seconds), text=text))
+            now = time.monotonic()
+            if now - last_report_at >= 5:
+                last_report_at = now
+                transcription_progress = 32 + min(25, int((end_seconds / max(duration, 1.0)) * 25))
+                transcription_eta = estimate_eta(started_at, end_seconds, duration)
+                transcription_metrics = {"durationSeconds": duration, "transcribedSeconds": round(end_seconds, 1), "transcriptSegments": len(segments)}
+                heartbeat.update(
+                    stage=f"Transcribed through {format_seconds(end_seconds)}.",
+                    progress=transcription_progress,
+                    eta_seconds=transcription_eta,
+                    metrics=transcription_metrics,
+                )
+                report_progress(
+                    progress,
+                    stage=f"Transcribed through {format_seconds(end_seconds)}.",
+                    progress=transcription_progress,
+                    eta_seconds=transcription_eta,
+                    metrics=transcription_metrics,
+                )
+        if not segments:
+            raise ArchiveError("faster-whisper did not produce any transcript segments.")
+        report_progress(progress, stage="Finished faster-whisper transcription.", progress=58, metrics={"transcriptSegments": len(segments), "durationSeconds": duration})
+        return segments
+    finally:
+        heartbeat.stop()
+
+
+def transcribe_audio_whisper_cpp(
+    audio_path: Path,
+    temp_dir: Path,
+    metadata: YouTubeVideoMetadata,
+    audio_bytes: int,
+    started_at: float,
+    *,
+    progress: ProgressReporter | None = None,
+) -> list[TranscriptSegment]:
+    model_path = os.getenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_MODEL_PATH", os.getenv("CLOUDX_ASR_WHISPER_CPP_MODEL_PATH", "")).strip()
+    if not model_path:
+        raise ArchiveError("CLOUDX_DOCUMENTATION_WHISPER_CPP_MODEL_PATH is required when CLOUDX_DOCUMENTATION_ASR_BACKEND=whisper-cpp.")
+    binary = os.getenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_BIN", os.getenv("CLOUDX_ASR_WHISPER_CPP_BIN", "whisper-cli")).strip() or "whisper-cli"
+    wav_path = temp_dir / "whisper-cpp-input.wav"
+    report_progress(progress, stage="Converting YouTube audio for whisper.cpp.", progress=31, metrics={"durationSeconds": metadata.duration, "audioBytes": audio_bytes})
+    convert_command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-progress",
+        "pipe:1",
+        "-stats_period",
+        "5",
+        "-y",
+        "-i",
+        str(audio_path),
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        str(wav_path),
+    ]
+    run_ffmpeg_audio_conversion(convert_command, metadata, audio_bytes, progress=progress)
+
+    duration = float(metadata.duration or 0)
+    chunk_seconds = documentation_whisper_cpp_chunk_seconds()
+    chunks = prepare_whisper_cpp_audio_chunks(
+        wav_path,
+        temp_dir,
+        duration_seconds=duration,
+        chunk_seconds=chunk_seconds,
+        overlap_seconds=documentation_whisper_cpp_chunk_overlap_seconds(chunk_seconds),
+        progress=progress,
+    )
+    segments: list[TranscriptSegment] = []
+    for chunk in chunks:
+        output_base = temp_dir / f"whisper-cpp-transcript-{chunk.index:04d}"
+        command = [
+            binary,
+            "-m",
+            model_path,
+            "-f",
+            str(chunk.path),
+            "-oj",
+            "-of",
+            str(output_base),
+            "-pp",
+            "-l",
+            documentation_asr_language() or "auto",
+            "-bs",
+            str(documentation_asr_beam_size()),
+            "-t",
+            str(documentation_whisper_cpp_threads()),
+            *documentation_whisper_cpp_stability_args(),
+            *documentation_whisper_cpp_vad_args(),
+        ]
+        command.extend(documentation_whisper_cpp_extra_args())
+        run_whisper_cpp_command(
+            command,
+            output_base.with_suffix(".json"),
+            metadata,
+            started_at,
+            progress=progress,
+            progress_start_seconds=chunk.keep_start_seconds,
+            progress_duration_seconds=chunk.keep_end_seconds - chunk.keep_start_seconds,
+            progress_total_seconds=duration,
+            progress_metrics={"chunkIndex": chunk.index, "chunksTotal": len(chunks), "chunkOverlapSeconds": chunk.keep_start_seconds - chunk.start_seconds},
+        )
+        segments.extend(keep_whisper_cpp_chunk_segments(parse_whisper_cpp_json(output_base.with_suffix(".json")), chunk))
+    if not segments:
+        raise ArchiveError("whisper.cpp did not produce any transcript segments.")
+    duration = metadata.duration or max((segment.end_seconds for segment in segments), default=0.0)
+    report_progress(progress, stage="Finished whisper.cpp transcription.", progress=58, metrics={"transcriptSegments": len(segments), "durationSeconds": duration})
+    return segments
+
+
+def prepare_whisper_cpp_audio_chunks(
+    wav_path: Path,
+    temp_dir: Path,
+    *,
+    duration_seconds: float,
+    chunk_seconds: int,
+    overlap_seconds: int,
+    progress: ProgressReporter | None = None,
+) -> list[WhisperCppAudioChunk]:
+    if duration_seconds <= 0 or duration_seconds <= chunk_seconds:
+        return [WhisperCppAudioChunk(index=1, start_seconds=0.0, duration_seconds=max(duration_seconds, 0.0), keep_start_seconds=0.0, keep_end_seconds=max(duration_seconds, 0.0), path=wav_path)]
+    chunks_dir = temp_dir / "whisper-cpp-chunks"
+    reset_directory(chunks_dir)
+    expected_chunks = int(np.ceil(duration_seconds / chunk_seconds))
+    report_progress(
+        progress,
+        stage=f"Splitting YouTube audio into {expected_chunks} whisper.cpp chunks with {overlap_seconds}s overlap.",
+        progress=32,
+        metrics={"durationSeconds": duration_seconds, "chunkSeconds": chunk_seconds, "chunkOverlapSeconds": overlap_seconds, "chunksTotal": expected_chunks},
+    )
+    chunks: list[WhisperCppAudioChunk] = []
+    for index in range(1, expected_chunks + 1):
+        keep_start = float((index - 1) * chunk_seconds)
+        keep_end = min(float(duration_seconds), keep_start + chunk_seconds)
+        start = max(0.0, keep_start - overlap_seconds)
+        end = min(float(duration_seconds), keep_end + overlap_seconds)
+        path = chunks_dir / f"chunk-{index - 1:04d}.wav"
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-ss",
+            f"{start:.3f}",
+            "-t",
+            f"{end - start:.3f}",
+            "-i",
+            str(wav_path),
+            "-map",
+            "0:a:0",
+            "-c",
+            "copy",
+            str(path),
+        ]
+        try:
+            result = subprocess.run(command, check=False, capture_output=True, text=True)
+        except FileNotFoundError as error:
+            raise ArchiveError("ffmpeg is required to split audio for whisper.cpp transcription.") from error
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
+            raise ArchiveError(f"ffmpeg could not split audio for whisper.cpp transcription: {message}")
+        if not path.exists():
+            raise ArchiveError(f"ffmpeg did not produce whisper.cpp audio chunk {path.name}.")
+        chunks.append(
+            WhisperCppAudioChunk(
+                index=index,
+                start_seconds=start,
+                duration_seconds=end - start,
+                keep_start_seconds=keep_start,
+                keep_end_seconds=keep_end,
+                path=path,
+            )
+        )
+    report_progress(
+        progress,
+        stage=f"Prepared {len(chunks)} whisper.cpp audio chunks.",
+        progress=32,
+        metrics={"durationSeconds": duration_seconds, "chunkSeconds": chunk_seconds, "chunkOverlapSeconds": overlap_seconds, "chunksTotal": len(chunks)},
+    )
+    return chunks
+
+
+def keep_whisper_cpp_chunk_segments(segments: list[TranscriptSegment], chunk: WhisperCppAudioChunk) -> list[TranscriptSegment]:
+    kept: list[TranscriptSegment] = []
+    for segment in segments:
+        shifted = TranscriptSegment(
+            start_seconds=segment.start_seconds + chunk.start_seconds,
+            end_seconds=segment.end_seconds + chunk.start_seconds,
+            text=segment.text,
+        )
+        midpoint = (shifted.start_seconds + shifted.end_seconds) / 2
+        if chunk.keep_start_seconds <= midpoint < chunk.keep_end_seconds:
+            kept.append(shifted)
+    return kept
+
+
+def run_ffmpeg_audio_conversion(
+    command: list[str],
+    metadata: YouTubeVideoMetadata,
+    audio_bytes: int,
+    *,
+    progress: ProgressReporter | None = None,
+) -> None:
+    duration = float(metadata.duration or 0)
+    started_at = time.monotonic()
+    metrics = {"durationSeconds": metadata.duration, "audioBytes": audio_bytes}
+    heartbeat = ProgressHeartbeat(
+        progress,
+        stage="Converting YouTube audio for whisper.cpp; waiting for ffmpeg progress.",
+        progress=31,
+        metrics=metrics,
+        interval_seconds=15,
+    )
+    output_lines: list[str] = []
+    try:
+        try:
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        except FileNotFoundError as error:
+            raise ArchiveError("ffmpeg is required to prepare audio for whisper.cpp transcription.") from error
+        if process.stdout is not None:
+            for line in process.stdout:
+                stripped = line.rstrip()
+                output_lines = [*output_lines[-40:], stripped]
+                converted_seconds = ffmpeg_audio_progress_seconds(stripped)
+                if converted_seconds is None:
+                    continue
+                conversion_metrics = {
+                    **metrics,
+                    "convertedSeconds": round(converted_seconds, 1),
+                }
+                conversion_progress = 31 + min(1.0, converted_seconds / duration) if duration > 0 else 31
+                stage = f"Converted YouTube audio through {format_seconds(converted_seconds)} for whisper.cpp."
+                eta_seconds = estimate_eta(started_at, converted_seconds, duration)
+                heartbeat.update(stage=stage, progress=conversion_progress, eta_seconds=eta_seconds, metrics=conversion_metrics)
+                report_progress(progress, stage=stage, progress=conversion_progress, eta_seconds=eta_seconds, metrics=conversion_metrics)
+        return_code = process.wait()
+        if return_code != 0:
+            raise ArchiveError(f"ffmpeg could not prepare audio for whisper.cpp transcription: {tail_text(output_lines)}")
+        report_progress(progress, stage="Finished converting YouTube audio for whisper.cpp.", progress=32, metrics=metrics)
+    finally:
+        heartbeat.stop()
+
+
+def ffmpeg_audio_progress_seconds(line: str) -> float | None:
+    key, separator, value = line.partition("=")
+    if separator != "=":
+        return None
+    key = key.strip()
+    value = value.strip()
+    if key in {"out_time_ms", "out_time_us"}:
+        parsed = optional_float(value)
+        return max(0.0, parsed / 1_000_000) if parsed is not None else None
+    if key == "out_time":
+        return parse_ffmpeg_time(value)
+    return None
+
+
+def parse_ffmpeg_time(value: str) -> float | None:
+    match = re.fullmatch(r"(?P<hours>\d+):(?P<minutes>\d{2}):(?P<seconds>\d{2}(?:\.\d+)?)", value.strip())
+    if not match:
+        return None
+    return int(match.group("hours")) * 3600 + int(match.group("minutes")) * 60 + float(match.group("seconds"))
+
+
+def documentation_asr_language() -> str | None:
+    language = os.getenv("CLOUDX_DOCUMENTATION_ASR_LANGUAGE", os.getenv("CLOUDX_ASR_LANGUAGE", "en")).strip().lower()
+    return None if language in {"", "auto", "detect"} else language
+
+
+def documentation_asr_backend() -> str:
+    backend = os.getenv("CLOUDX_DOCUMENTATION_ASR_BACKEND", os.getenv("CLOUDX_ASR_BACKEND", ASR_BACKEND_FASTER_WHISPER)).strip().lower().replace("_", "-")
+    aliases = {
+        "fasterwhisper": ASR_BACKEND_FASTER_WHISPER,
+        ASR_BACKEND_FASTER_WHISPER: ASR_BACKEND_FASTER_WHISPER,
+        "whispercpp": ASR_BACKEND_WHISPER_CPP,
+        ASR_BACKEND_WHISPER_CPP: ASR_BACKEND_WHISPER_CPP,
+    }
+    if backend not in aliases:
+        raise ArchiveError(f"Unsupported documentation ASR backend: {backend}. Use faster-whisper or whisper-cpp.")
+    return aliases[backend]
+
+
+def documentation_asr_beam_size() -> int:
+    return max(1, int(os.getenv("CLOUDX_DOCUMENTATION_ASR_BEAM_SIZE", os.getenv("CLOUDX_ASR_BEAM_SIZE", "5"))))
+
+
+def documentation_asr_vad_filter() -> bool:
+    return os.getenv("CLOUDX_DOCUMENTATION_ASR_VAD_FILTER", os.getenv("CLOUDX_ASR_VAD_FILTER", "true")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def default_asr_cpu_threads() -> int:
+    return max(1, (os.cpu_count() or 4) // 2)
+
+
+def documentation_whisper_cpp_threads() -> int:
+    return max(1, int(os.getenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_THREADS", os.getenv("CLOUDX_ASR_WHISPER_CPP_THREADS", str(default_asr_cpu_threads())))))
+
+
+def documentation_whisper_cpp_chunk_seconds() -> int:
+    return max(60, int(os.getenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_CHUNK_SECONDS", os.getenv("CLOUDX_ASR_WHISPER_CPP_CHUNK_SECONDS", str(WHISPER_CPP_CHUNK_SECONDS)))))
+
+
+def documentation_whisper_cpp_chunk_overlap_seconds(chunk_seconds: int) -> int:
+    overlap = int(os.getenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_CHUNK_OVERLAP_SECONDS", os.getenv("CLOUDX_ASR_WHISPER_CPP_CHUNK_OVERLAP_SECONDS", str(WHISPER_CPP_CHUNK_OVERLAP_SECONDS))))
+    if overlap < 0:
+        raise ArchiveError("CLOUDX_DOCUMENTATION_WHISPER_CPP_CHUNK_OVERLAP_SECONDS must be zero or greater.")
+    if overlap >= chunk_seconds:
+        raise ArchiveError("CLOUDX_DOCUMENTATION_WHISPER_CPP_CHUNK_OVERLAP_SECONDS must be smaller than CLOUDX_DOCUMENTATION_WHISPER_CPP_CHUNK_SECONDS.")
+    return overlap
+
+
+def documentation_whisper_cpp_stability_args() -> list[str]:
+    return ["-sns", "-nf", "-mc", "0"]
+
+
+def documentation_whisper_cpp_vad_args() -> list[str]:
+    enabled = os.getenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD", os.getenv("CLOUDX_ASR_WHISPER_CPP_VAD", "false")).strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return []
+    model_path = os.getenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD_MODEL_PATH", os.getenv("CLOUDX_ASR_WHISPER_CPP_VAD_MODEL_PATH", "")).strip()
+    if not model_path:
+        raise ArchiveError("CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD_MODEL_PATH is required when CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD=true.")
+    if not Path(model_path).exists():
+        raise ArchiveError(f"CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD_MODEL_PATH does not exist: {model_path}")
+    return ["--vad", "--vad-model", model_path]
+
+
+def documentation_whisper_cpp_extra_args() -> list[str]:
+    value = os.getenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_ARGS", os.getenv("CLOUDX_ASR_WHISPER_CPP_ARGS", "")).strip()
+    return shlex.split(value) if value else []
+
+
+def run_whisper_cpp_command(
+    command: list[str],
+    output_json: Path,
+    metadata: YouTubeVideoMetadata,
+    started_at: float,
+    *,
+    progress: ProgressReporter | None = None,
+    progress_start_seconds: float = 0.0,
+    progress_duration_seconds: float | None = None,
+    progress_total_seconds: float | None = None,
+    progress_metrics: Mapping[str, Any] | None = None,
+) -> None:
+    duration = float(progress_total_seconds or metadata.duration or 0)
+    chunk_duration = float(progress_duration_seconds if progress_duration_seconds is not None else duration)
+    extra_metrics = dict(progress_metrics or {})
+    heartbeat = ProgressHeartbeat(
+        progress,
+        stage="Running whisper.cpp transcription.",
+        progress=32,
+        metrics={"durationSeconds": metadata.duration, **extra_metrics},
+    )
+    output_lines: list[str] = []
+    last_reported_percent = -1
+    try:
+        try:
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        except FileNotFoundError as error:
+            raise ArchiveError(f"whisper.cpp binary was not found: {command[0]}") from error
+        if process.stdout is not None:
+            for line in process.stdout:
+                output_lines = [*output_lines[-40:], line.rstrip()]
+                percent = whisper_cpp_progress_percent(line)
+                if percent is not None:
+                    completed_seconds = whisper_cpp_completed_seconds(progress_start_seconds, chunk_duration, duration, percent)
+                    overall_percent = whisper_cpp_overall_percent(completed_seconds, duration, percent)
+                    if overall_percent <= last_reported_percent:
+                        continue
+                    last_reported_percent = overall_percent
+                    metrics = {"durationSeconds": metadata.duration, "transcribedSeconds": round(completed_seconds, 1), **extra_metrics}
+                    stage = f"whisper.cpp transcription {overall_percent}% complete."
+                    progress_value = 32 + min(25, int(overall_percent * 0.25))
+                    eta_seconds = estimate_eta(started_at, completed_seconds, duration)
+                    heartbeat.update(
+                        stage=stage,
+                        progress=progress_value,
+                        eta_seconds=eta_seconds,
+                        metrics=metrics,
+                    )
+                    report_progress(
+                        progress,
+                        stage=stage,
+                        progress=progress_value,
+                        eta_seconds=eta_seconds,
+                        metrics=metrics,
+                    )
+        return_code = process.wait()
+        if return_code != 0:
+            raise ArchiveError(f"whisper.cpp transcription failed with code {return_code}: {tail_text(output_lines)}")
+        if not output_json.exists():
+            raise ArchiveError(f"whisper.cpp transcription did not produce {output_json.name}.")
+    finally:
+        heartbeat.stop()
+
+
+def whisper_cpp_completed_seconds(start_seconds: float, chunk_duration: float, total_duration: float, percent: int) -> float:
+    completed = max(0.0, start_seconds) + max(0.0, chunk_duration) * (percent / 100)
+    return min(max(0.0, total_duration), completed) if total_duration > 0 else completed
+
+
+def whisper_cpp_overall_percent(completed_seconds: float, total_duration: float, local_percent: int) -> int:
+    if total_duration <= 0:
+        return local_percent
+    return min(100, max(0, int(round((completed_seconds / total_duration) * 100))))
+
+
+def whisper_cpp_progress_percent(line: str) -> int | None:
+    match = re.search(r"(?:progress\s*=\s*)?(\d{1,3})\s*%", line, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return min(100, max(0, int(match.group(1))))
+
+
+def parse_whisper_cpp_json(path: Path) -> list[TranscriptSegment]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    raw_segments = payload.get("transcription")
+    if not isinstance(raw_segments, list):
+        return []
+    segments: list[TranscriptSegment] = []
+    for raw_segment in raw_segments:
+        if not isinstance(raw_segment, dict):
+            continue
+        text = str(raw_segment.get("text") or "").strip()
+        if not text:
+            continue
+        start_seconds, end_seconds = whisper_cpp_segment_seconds(raw_segment)
+        segments.append(TranscriptSegment(start_seconds=start_seconds, end_seconds=max(start_seconds, end_seconds), text=text))
+    return segments
+
+
+def whisper_cpp_segment_seconds(segment: Mapping[str, Any]) -> tuple[float, float]:
+    offsets = segment.get("offsets")
+    if isinstance(offsets, Mapping):
+        start = optional_float(offsets.get("from"))
+        end = optional_float(offsets.get("to"))
+        if start is not None and end is not None:
+            return max(0.0, start / 1000.0), max(0.0, end / 1000.0)
+    timestamps = segment.get("timestamps")
+    if isinstance(timestamps, Mapping):
+        start = parse_whisper_cpp_timestamp(str(timestamps.get("from") or ""))
+        end = parse_whisper_cpp_timestamp(str(timestamps.get("to") or ""))
+        if start is not None and end is not None:
+            return start, end
+    return 0.0, 0.0
+
+
+def parse_whisper_cpp_timestamp(value: str) -> float | None:
+    match = re.fullmatch(r"(?:(\d+):)?(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?", value.strip())
+    if not match:
+        return None
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2))
+    seconds = int(match.group(3))
+    milliseconds = int((match.group(4) or "0").ljust(3, "0")[:3])
+    return hours * 3600 + minutes * 60 + seconds + milliseconds / 1000.0
+
+
+def tail_text(lines: list[str]) -> str:
+    return "\n".join(line for line in lines[-10:] if line).strip()
+
+
+def youtube_audio_download_progress_hook(
+    reporter: ProgressReporter | None,
+    started_at: float,
+    duration_seconds: int | None,
+) -> Callable[[dict[str, Any]], None]:
+    last_reported_at = 0.0
+
+    def hook(status: dict[str, Any]) -> None:
+        nonlocal last_reported_at
+        state = str(status.get("status") or "")
+        if state == "downloading":
+            downloaded = optional_float(status.get("downloaded_bytes")) or 0.0
+            total = optional_float(status.get("total_bytes")) or optional_float(status.get("total_bytes_estimate"))
+            now = time.monotonic()
+            if now - last_reported_at < 2:
+                return
+            last_reported_at = now
+            fraction = min(1.0, downloaded / total) if total and total > 0 else 0.0
+            metrics: dict[str, Any] = {"durationSeconds": duration_seconds, "downloadedBytes": int(downloaded)}
+            if total and total > 0:
+                metrics["totalBytes"] = int(total)
+            report_progress(
+                reporter,
+                stage="Downloading YouTube audio for local transcription.",
+                progress=26 + fraction * 5,
+                eta_seconds=youtube_download_eta(status, started_at, downloaded, total),
+                metrics=metrics,
+            )
+        elif state == "finished":
+            downloaded = optional_float(status.get("total_bytes")) or optional_float(status.get("downloaded_bytes")) or 0.0
+            report_progress(
+                reporter,
+                stage="Finished downloading YouTube audio.",
+                progress=31,
+                metrics={"durationSeconds": duration_seconds, "downloadedBytes": int(downloaded)},
+            )
+
+    return hook
+
+
+def youtube_download_eta(status: dict[str, Any], started_at: float, downloaded: float, total: float | None) -> int | None:
+    explicit_eta = optional_float(status.get("eta"))
+    if explicit_eta is not None:
+        return int(explicit_eta)
+    if downloaded < 1024 * 1024:
+        return None
+    return estimate_eta(started_at, downloaded, total)
+
+
+def transcript_segments_text(segments: list[TranscriptSegment]) -> str:
+    return "\n".join(f"[{format_seconds(segment.start_seconds)} -> {format_seconds(segment.end_seconds)}] {segment.text}" for segment in segments)
+
+
+def youtube_transcript_spans(segments: list[TranscriptSegment]) -> list[ExtractedSpan]:
+    grouped: list[ExtractedSpan] = []
+    batch: list[TranscriptSegment] = []
+    batch_chars = 0
+    for segment in segments:
+        batch.append(segment)
+        batch_chars += len(segment.text)
+        if batch_chars >= 4000:
+            grouped.append(transcript_batch_span(batch))
+            batch = []
+            batch_chars = 0
+    if batch:
+        grouped.append(transcript_batch_span(batch))
+    return grouped
+
+
+def transcript_batch_span(segments: list[TranscriptSegment]) -> ExtractedSpan:
+    start = segments[0].start_seconds
+    end = segments[-1].end_seconds
+    return ExtractedSpan(transcript_segments_text(segments), f"transcript {format_seconds(start)}-{format_seconds(end)}")
+
+
+def write_transcript_segment_index(path: Path, segments: list[TranscriptSegment]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["start_seconds\tend_seconds\ttext"]
+    lines.extend(f"{segment.start_seconds:.3f}\t{segment.end_seconds:.3f}\t{tsv_escape(segment.text)}" for segment in segments)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def report_progress(
+    reporter: ProgressReporter | None,
+    *,
+    stage: str,
+    progress: int | float,
+    eta_seconds: int | float | None = None,
+    metrics: dict[str, Any] | None = None,
+) -> None:
+    if reporter is None:
+        return
+    event: dict[str, Any] = {
+        "stage": stage,
+        "progress": max(0, min(100, int(round(progress)))),
+    }
+    if eta_seconds is not None and np.isfinite(eta_seconds):
+        event["etaSeconds"] = max(0, int(round(float(eta_seconds))))
+    if metrics:
+        event["metrics"] = metrics
+    reporter(event)
+
+
+class ProgressHeartbeat:
+    def __init__(
+        self,
+        reporter: ProgressReporter | None,
+        *,
+        stage: str,
+        progress: int | float,
+        eta_seconds: int | float | None = None,
+        metrics: dict[str, Any] | None = None,
+        interval_seconds: float = 30,
+    ) -> None:
+        self._reporter = reporter
+        self._interval_seconds = interval_seconds
+        self._stopped = threading.Event()
+        self._lock = threading.Lock()
+        self._event: dict[str, Any] = {}
+        self.update(stage=stage, progress=progress, eta_seconds=eta_seconds, metrics=metrics)
+        self._thread = threading.Thread(target=self._run, daemon=True) if reporter is not None else None
+        if self._thread is not None:
+            self._thread.start()
+
+    def update(
+        self,
+        *,
+        stage: str,
+        progress: int | float,
+        eta_seconds: int | float | None = None,
+        metrics: dict[str, Any] | None = None,
+    ) -> None:
+        with self._lock:
+            self._event = {
+                "stage": stage,
+                "progress": progress,
+                "eta_seconds": eta_seconds,
+                "metrics": metrics,
+            }
+
+    def stop(self) -> None:
+        self._stopped.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+
+    def _run(self) -> None:
+        while not self._stopped.wait(self._interval_seconds):
+            with self._lock:
+                event = dict(self._event)
+            report_progress(
+                self._reporter,
+                stage=str(event["stage"]),
+                progress=event["progress"],
+                eta_seconds=event.get("eta_seconds"),
+                metrics=event.get("metrics"),
+            )
+
+
+def estimate_eta(started_at: float, completed: float, total: float | int | None) -> int | None:
+    if not total or total <= 0 or completed <= 0:
+        return None
+    elapsed = time.monotonic() - started_at
+    remaining = max(0.0, float(total) - completed)
+    return int((elapsed / completed) * remaining)
+
+
+def format_seconds(value: float | int) -> str:
+    total = max(0, int(round(float(value))))
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
+
+
+def tsv_escape(value: str) -> str:
+    return " ".join(value.split())
 
 
 def extract_youtube_video_metadata(url: str) -> YouTubeVideoMetadata:
@@ -1576,7 +2487,7 @@ def extract_youtube_video_metadata(url: str) -> YouTubeVideoMetadata:
     try:
         with yt_dlp.YoutubeDL(
             {
-                "format": "bestvideo",
+                "format": "bestvideo[height<=720]/best[height<=720]/bestvideo/best",
                 "ignoreerrors": False,
                 "noplaylist": True,
                 "no_warnings": True,
@@ -1614,37 +2525,353 @@ def extract_youtube_video_metadata(url: str) -> YouTubeVideoMetadata:
     )
 
 
-def capture_youtube_keyframes(metadata: YouTubeVideoMetadata, artifact_dir: Path) -> list[dict[str, str | int]]:
+def capture_youtube_keyframes(
+    metadata: YouTubeVideoMetadata,
+    artifact_dir: Path,
+    *,
+    transcript_segments: list[TranscriptSegment] | None = None,
+    progress: ProgressReporter | None = None,
+    profile: VideoVisualProfile = VideoVisualProfile(),
+) -> list[dict[str, Any]]:
+    started_at = time.monotonic()
+    media_dir = artifact_dir / "media"
     frames_dir = artifact_dir / "media" / "keyframes"
     frames_dir.mkdir(parents=True, exist_ok=True)
-    output_pattern = frames_dir / "frame-%06d.png"
-    command = ["ffmpeg", "-hide_banner", "-nostdin", "-y"]
-    if metadata.http_headers:
-        command.extend(["-headers", "".join(f"{key}: {value}\r\n" for key, value in metadata.http_headers.items())])
-    command.extend(["-i", metadata.stream_url, "-vf", "fps=1", str(output_pattern)])
-    try:
-        result = subprocess.run(command, check=False, capture_output=True, text=True)
-    except FileNotFoundError as error:
-        raise ArchiveError("ffmpeg is required to extract YouTube video keyframes.") from error
-    if result.returncode != 0:
-        message = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
-        raise ArchiveError(f"ffmpeg keyframe extraction failed for YouTube video: {message}")
-    frame_paths = sorted(frames_dir.glob("frame-*.png"))
-    if not frame_paths:
-        raise ArchiveError("ffmpeg did not produce any YouTube video keyframes.")
-    keyframes = [
-        {
-            "offsetSeconds": index - 1,
-            "path": path.relative_to(artifact_dir).as_posix(),
-        }
-        for index, path in enumerate(frame_paths, start=1)
-    ]
-    media_dir = artifact_dir / "media"
+    report_progress(
+        progress,
+        stage="Downloading YouTube video for local slide-frame scan.",
+        progress=60,
+        metrics={"durationSeconds": metadata.duration, "scanFps": profile.scan_fps, "workers": profile.local_workers},
+    )
+    segments = video_scan_segments(metadata.duration, profile.segment_seconds)
+    selected: list[dict[str, Any]] = []
+    scanned_frames = 0
+    with tempfile.TemporaryDirectory(prefix="cloudx-video-scan-") as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        visual_path = download_youtube_visual_source(metadata, temp_dir, progress=progress, started_at=started_at, profile=profile)
+        report_progress(
+            progress,
+            stage="Scanning downloaded video frames for slide changes.",
+            progress=64,
+            metrics={"durationSeconds": metadata.duration, "scanFps": profile.scan_fps, "workers": profile.local_workers, "visualBytes": visual_path.stat().st_size},
+        )
+        scan_started_at = time.monotonic()
+        with ThreadPoolExecutor(max_workers=max(1, min(profile.local_workers, len(segments)))) as executor:
+            futures = [
+                executor.submit(scan_video_segment, str(visual_path), None, start, duration, temp_dir / f"segment-{index:04d}", profile)
+                for index, (start, duration) in enumerate(segments, start=1)
+            ]
+            for completed, future in enumerate(as_completed(futures), start=1):
+                result = future.result()
+                scanned_frames += result["scannedFrames"]
+                selected.extend(result["selected"])
+                report_progress(
+                    progress,
+                    stage=f"Scanned {completed} of {len(segments)} video segments for slide changes.",
+                    progress=64 + int((completed / max(1, len(segments))) * 8),
+                    eta_seconds=estimate_eta(scan_started_at, completed, len(segments)),
+                    metrics={
+                        "durationSeconds": metadata.duration,
+                        "segmentsCompleted": completed,
+                        "segmentsTotal": len(segments),
+                        "framesScanned": scanned_frames,
+                        "candidateFrames": len(selected),
+                    },
+                )
+        selected = merge_selected_slide_frames(selected, profile)
+        if len(selected) > profile.max_selected_frames:
+            raise ArchiveError(f"Video produced {len(selected)} distinct slide frames, exceeding the configured limit of {profile.max_selected_frames}.")
+        keyframes = materialize_selected_keyframes(selected, frames_dir, artifact_dir, metadata.duration, profile)
+    if not keyframes:
+        raise ArchiveError("ffmpeg did not produce any selected YouTube slide frames.")
+    align_keyframes_to_transcript(keyframes, transcript_segments or [], metadata.duration)
+    report_progress(
+        progress,
+        stage=f"Selected {len(keyframes)} slide frames from {scanned_frames} scanned frames.",
+        progress=74,
+        metrics={"framesScanned": scanned_frames, "selectedFrames": len(keyframes), "durationSeconds": metadata.duration},
+    )
     (media_dir / "youtube_metadata.json").write_text(json.dumps(youtube_metadata_json(metadata), indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if description := optional_text(metadata.description):
         (media_dir / "description.txt").write_text(description + "\n", encoding="utf-8")
+    write_visual_sampling_manifest(
+        media_dir / "visual_sampling.json",
+        metadata=metadata,
+        profile=profile,
+        scanned_frames=scanned_frames,
+        selected_frames=len(keyframes),
+        elapsed_seconds=time.monotonic() - started_at,
+    )
     write_keyframe_index(media_dir / "keyframes.tsv", keyframes)
     return keyframes
+
+
+def video_scan_segments(duration: int | None, segment_seconds: int) -> list[tuple[int, int | None]]:
+    if duration is None or duration <= 0:
+        return [(0, None)]
+    return [(start, min(segment_seconds, duration - start)) for start in range(0, duration, segment_seconds)]
+
+
+def download_youtube_visual_source(
+    metadata: YouTubeVideoMetadata,
+    output_dir: Path,
+    *,
+    progress: ProgressReporter | None,
+    started_at: float,
+    profile: VideoVisualProfile,
+) -> Path:
+    if yt_dlp is None:
+        raise ArchiveError("yt-dlp is not importable.")
+    download_dir = output_dir / "visual-source"
+    download_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with yt_dlp.YoutubeDL(
+            {
+                "format": VIDEO_VISUAL_DOWNLOAD_FORMAT,
+                "ignoreerrors": False,
+                "noplaylist": True,
+                "no_warnings": True,
+                "noprogress": True,
+                "outtmpl": str(download_dir / "visual-source.%(ext)s"),
+                "progress_hooks": [youtube_visual_download_progress_hook(progress, started_at, metadata.duration, profile)],
+                "quiet": True,
+            }
+        ) as downloader:
+            downloader.extract_info(metadata.webpage_url, download=True)
+    except Exception as error:
+        raise ArchiveError(f"Could not download YouTube video for visual slide scan: {error}") from error
+    files = sorted((path for path in download_dir.iterdir() if path.is_file() and not path.name.endswith(".part")), key=lambda path: path.stat().st_size, reverse=True)
+    if not files:
+        raise ArchiveError("yt-dlp did not produce a video file for visual slide scan.")
+    return files[0]
+
+
+def youtube_visual_download_progress_hook(
+    reporter: ProgressReporter | None,
+    started_at: float,
+    duration_seconds: int | None,
+    profile: VideoVisualProfile,
+) -> Callable[[dict[str, Any]], None]:
+    last_reported_at = 0.0
+
+    def hook(status: dict[str, Any]) -> None:
+        nonlocal last_reported_at
+        state = str(status.get("status") or "")
+        if state == "downloading":
+            downloaded = optional_float(status.get("downloaded_bytes")) or 0.0
+            total = optional_float(status.get("total_bytes")) or optional_float(status.get("total_bytes_estimate"))
+            now = time.monotonic()
+            if now - last_reported_at < 2:
+                return
+            last_reported_at = now
+            fraction = min(1.0, downloaded / total) if total and total > 0 else 0.0
+            metrics: dict[str, Any] = {
+                "durationSeconds": duration_seconds,
+                "downloadedBytes": int(downloaded),
+                "scanFps": profile.scan_fps,
+                "workers": profile.local_workers,
+            }
+            if total and total > 0:
+                metrics["totalBytes"] = int(total)
+            report_progress(
+                reporter,
+                stage="Downloading YouTube video for local slide-frame scan.",
+                progress=60 + fraction * 3,
+                eta_seconds=youtube_download_eta(status, started_at, downloaded, total),
+                metrics=metrics,
+            )
+        elif state == "finished":
+            downloaded = optional_float(status.get("total_bytes")) or optional_float(status.get("downloaded_bytes")) or 0.0
+            report_progress(
+                reporter,
+                stage="Finished downloading YouTube video for local slide-frame scan.",
+                progress=63,
+                metrics={"durationSeconds": duration_seconds, "downloadedBytes": int(downloaded), "scanFps": profile.scan_fps, "workers": profile.local_workers},
+            )
+
+    return hook
+
+
+def scan_video_segment(
+    input_url: str,
+    http_headers: Mapping[str, str] | None,
+    start_seconds: int,
+    duration_seconds: int | None,
+    output_dir: Path,
+    profile: VideoVisualProfile,
+) -> dict[str, Any]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_pattern = output_dir / "frame-%06d.jpg"
+    command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
+    if http_headers:
+        command.extend(["-headers", "".join(f"{key}: {value}\r\n" for key, value in http_headers.items())])
+    if start_seconds > 0:
+        command.extend(["-ss", str(start_seconds)])
+    command.extend(["-i", input_url])
+    if duration_seconds is not None:
+        command.extend(["-t", str(duration_seconds)])
+    command.extend([
+        "-vf",
+        f"fps={profile.scan_fps},scale={profile.artifact_max_width}:-2:flags=fast_bilinear",
+        "-q:v",
+        "4",
+        str(output_pattern),
+    ])
+    try:
+        result = subprocess.run(command, check=False, capture_output=True, text=True)
+    except FileNotFoundError as error:
+        raise ArchiveError("ffmpeg is required to extract YouTube video slide frames.") from error
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
+        raise ArchiveError(f"ffmpeg slide-frame scan failed for YouTube video: {message}")
+    frame_paths = sorted(output_dir.glob("frame-*.jpg"))
+    return {
+        "scannedFrames": len(frame_paths),
+        "selected": select_slide_frames(frame_paths, start_seconds, profile),
+    }
+
+
+def select_slide_frames(frame_paths: list[Path], start_seconds: int, profile: VideoVisualProfile) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    selected_indexes: set[int] = set()
+    baseline: np.ndarray | None = None
+    for index, frame_path in enumerate(frame_paths):
+        current = comparison_frame(frame_path, profile.comparison_width)
+        if baseline is None:
+            selected.append(slide_candidate(frame_paths, index, start_seconds, "segment-start", 0.0, profile))
+            selected_indexes.add(index)
+            baseline = current
+            continue
+        mean_delta, changed_ratio = frame_delta(baseline, current, profile.pixel_delta_threshold)
+        if mean_delta >= profile.mean_delta_threshold and changed_ratio >= profile.changed_pixel_threshold:
+            stable_index = min(len(frame_paths) - 1, index + profile.settle_seconds * profile.scan_fps)
+            if stable_index not in selected_indexes:
+                selected.append(slide_candidate(frame_paths, stable_index, start_seconds, "visual-change", mean_delta, profile))
+                selected_indexes.add(stable_index)
+            baseline = comparison_frame(frame_paths[stable_index], profile.comparison_width)
+    return selected
+
+
+def slide_candidate(frame_paths: list[Path], index: int, start_seconds: int, reason: str, change_score: float, profile: VideoVisualProfile) -> dict[str, Any]:
+    return {
+        "offsetSeconds": start_seconds + int(index / max(1, profile.scan_fps)),
+        "sourcePath": frame_paths[index],
+        "reason": reason,
+        "changeScore": round(change_score, 6),
+    }
+
+
+def merge_selected_slide_frames(selected: list[dict[str, Any]], profile: VideoVisualProfile) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    baseline: np.ndarray | None = None
+    for candidate in sorted(selected, key=lambda value: int(value["offsetSeconds"])):
+        current = comparison_frame(Path(candidate["sourcePath"]), profile.comparison_width)
+        if baseline is None:
+            merged.append(candidate)
+            baseline = current
+            continue
+        mean_delta, changed_ratio = frame_delta(baseline, current, profile.pixel_delta_threshold)
+        if mean_delta >= profile.mean_delta_threshold and changed_ratio >= profile.changed_pixel_threshold:
+            merged.append(candidate)
+            baseline = current
+    return merged
+
+
+def materialize_selected_keyframes(
+    selected: list[dict[str, Any]],
+    frames_dir: Path,
+    artifact_dir: Path,
+    duration_seconds: int | None,
+    profile: VideoVisualProfile,
+) -> list[dict[str, Any]]:
+    keyframes: list[dict[str, Any]] = []
+    for index, candidate in enumerate(selected, start=1):
+        output_path = frames_dir / f"frame-{index:06d}.jpg"
+        shutil.copyfile(Path(candidate["sourcePath"]), output_path)
+        keyframes.append({
+            "offsetSeconds": int(candidate["offsetSeconds"]),
+            "path": output_path.relative_to(artifact_dir).as_posix(),
+            "reason": str(candidate.get("reason") or "visual-change"),
+            "changeScore": float(candidate.get("changeScore") or 0.0),
+        })
+    for index, keyframe in enumerate(keyframes):
+        next_offset = keyframes[index + 1]["offsetSeconds"] if index + 1 < len(keyframes) else duration_seconds
+        keyframe["transcriptStartSeconds"] = keyframe["offsetSeconds"]
+        keyframe["transcriptEndSeconds"] = next_offset if next_offset is not None else keyframe["offsetSeconds"]
+    return keyframes
+
+
+def align_keyframes_to_transcript(keyframes: list[dict[str, Any]], segments: list[TranscriptSegment], duration_seconds: int | None) -> None:
+    if not keyframes:
+        return
+    for index, keyframe in enumerate(keyframes):
+        start = float(keyframe.get("offsetSeconds") or 0)
+        if index + 1 < len(keyframes):
+            end = float(keyframes[index + 1]["offsetSeconds"])
+        elif duration_seconds is not None:
+            end = float(duration_seconds)
+        elif segments:
+            end = segments[-1].end_seconds
+        else:
+            end = start
+        overlapping = [segment for segment in segments if segment.end_seconds >= start and segment.start_seconds <= end]
+        if overlapping:
+            keyframe["transcriptStartSeconds"] = overlapping[0].start_seconds
+            keyframe["transcriptEndSeconds"] = overlapping[-1].end_seconds
+
+
+def comparison_frame(path: Path, width: int) -> np.ndarray:
+    with Image.open(path) as image:
+        image = image.convert("L")
+        if image.width > width:
+            height = max(1, round(image.height * (width / image.width)))
+            image = image.resize((width, height))
+        return np.asarray(image, dtype=np.float32) / 255.0
+
+
+def frame_delta(left: np.ndarray, right: np.ndarray, pixel_delta_threshold: float) -> tuple[float, float]:
+    height = min(left.shape[0], right.shape[0])
+    width = min(left.shape[1], right.shape[1])
+    if height <= 0 or width <= 0:
+        return 1.0, 1.0
+    delta = np.abs(left[:height, :width] - right[:height, :width])
+    return float(delta.mean()), float((delta >= pixel_delta_threshold).mean())
+
+
+def write_visual_sampling_manifest(
+    path: Path,
+    *,
+    metadata: YouTubeVideoMetadata,
+    profile: VideoVisualProfile,
+    scanned_frames: int,
+    selected_frames: int,
+    elapsed_seconds: float,
+) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "strategy": "downloaded-slide-change",
+                "durationSeconds": metadata.duration,
+                "scanFps": profile.scan_fps,
+                "segmentSeconds": profile.segment_seconds,
+                "workers": profile.local_workers,
+                "comparisonWidth": profile.comparison_width,
+                "artifactMaxWidth": profile.artifact_max_width,
+                "meanDeltaThreshold": profile.mean_delta_threshold,
+                "changedPixelThreshold": profile.changed_pixel_threshold,
+                "pixelDeltaThreshold": profile.pixel_delta_threshold,
+                "settleSeconds": profile.settle_seconds,
+                "maxSelectedFrames": profile.max_selected_frames,
+                "framesScanned": scanned_frames,
+                "selectedFrames": selected_frames,
+                "elapsedSeconds": round(elapsed_seconds, 3),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def youtube_source_text(metadata: YouTubeVideoMetadata, transcript: str) -> str:
@@ -1690,20 +2917,63 @@ def youtube_description_text(metadata: YouTubeVideoMetadata) -> str | None:
     return "\n".join(["YouTube video description:", description])
 
 
-def youtube_keyframe_span(keyframes: list[dict[str, str | int]]) -> str:
-    sample_limit = 20
-    lines = [
-        "Extracted YouTube video keyframes at one frame per second.",
-        "Each keyframe path points to a PNG artifact preserved with the source snapshot.",
-        f"Keyframe count: {len(keyframes)}.",
+def youtube_keyframe_spans(keyframes: list[dict[str, Any]], transcript_segments: list[TranscriptSegment]) -> list[ExtractedSpan]:
+    return [
+        ExtractedSpan(youtube_keyframe_span_text(keyframe, transcript_segments), youtube_keyframe_locator(keyframe.get("offsetSeconds")))
+        for keyframe in keyframes
     ]
-    if keyframes:
-        lines.append(f"Time range seconds: {keyframes[0]['offsetSeconds']} to {keyframes[-1]['offsetSeconds']}.")
-    for keyframe in keyframes[:sample_limit]:
-        lines.append(f"second {keyframe['offsetSeconds']}: {keyframe['path']}")
-    if len(keyframes) > sample_limit:
-        lines.append(f"{len(keyframes) - sample_limit} additional keyframes are listed in media/keyframes.tsv.")
+
+
+def youtube_keyframe_span_text(keyframe: Mapping[str, Any], transcript_segments: list[TranscriptSegment], max_transcript_chars: int = 650) -> str:
+    offset_seconds = optional_float(keyframe.get("offsetSeconds")) or 0.0
+    transcript_start, transcript_end = keyframe_transcript_window(keyframe)
+    overlapping = overlapping_transcript_segments(transcript_segments, transcript_start, transcript_end)
+    transcript_text = transcript_segments_text(overlapping)
+    transcript_truncated = len(transcript_text) > max_transcript_chars
+    if transcript_truncated:
+        transcript_text = transcript_text[:max_transcript_chars].rsplit(" ", 1)[0].rstrip() + "..."
+    lines = [
+        f"Selected YouTube slide frame {youtube_keyframe_id(offset_seconds)} at {format_seconds(offset_seconds)} ({int(round(offset_seconds))} seconds).",
+        f"Artifact path: {keyframe.get('path')}.",
+        f"Selection reason: {keyframe.get('reason') or 'visual-change'}.",
+        f"Transcript window: {format_seconds(transcript_start)}-{format_seconds(transcript_end)}.",
+    ]
+    if change_score := optional_float(keyframe.get("changeScore")):
+        lines.append(f"Visual change score: {change_score}.")
+    if transcript_text:
+        lines.extend(["Transcript near this frame:", transcript_text])
+        if transcript_truncated:
+            lines.append("Transcript context truncated for this frame chunk.")
+    else:
+        lines.append("No transcript segment overlapped this frame window.")
+    lines.append("The preserved image artifact is the source evidence for visual labels, diagrams, flowcharts, screenshots, and slide content at this timestamp.")
     return "\n".join(lines)
+
+
+def youtube_keyframe_id(offset_seconds: int | float | None) -> str:
+    return f"keyframe-{max(0, int(round(float(offset_seconds or 0)))):06d}"
+
+
+def youtube_keyframe_locator(offset_seconds: int | float | None) -> str:
+    seconds = max(0.0, float(offset_seconds or 0))
+    return f"media keyframe {youtube_keyframe_id(seconds)} {format_seconds(seconds)}"
+
+
+def keyframe_transcript_window(keyframe: Mapping[str, Any]) -> tuple[float, float]:
+    offset_seconds = optional_float(keyframe.get("offsetSeconds")) or 0.0
+    start = optional_float(keyframe.get("transcriptStartSeconds"))
+    end = optional_float(keyframe.get("transcriptEndSeconds"))
+    start = offset_seconds if start is None else start
+    end = start if end is None else end
+    return max(0.0, start), max(start, end)
+
+
+def overlapping_transcript_segments(segments: list[TranscriptSegment], start_seconds: float, end_seconds: float) -> list[TranscriptSegment]:
+    return [
+        segment
+        for segment in segments
+        if segment.end_seconds >= start_seconds and segment.start_seconds <= end_seconds
+    ]
 
 
 def youtube_metadata_json(metadata: YouTubeVideoMetadata) -> dict:
@@ -1720,10 +2990,26 @@ def youtube_metadata_json(metadata: YouTubeVideoMetadata) -> dict:
     }
 
 
-def write_keyframe_index(path: Path, keyframes: list[dict[str, str | int]]) -> None:
-    lines = ["offset_seconds\tpath"]
-    lines.extend(f"{keyframe['offsetSeconds']}\t{keyframe['path']}" for keyframe in keyframes)
+def write_keyframe_index(path: Path, keyframes: list[dict[str, Any]]) -> None:
+    lines = ["offset_seconds\tpath\treason\tchange_score\ttranscript_start_seconds\ttranscript_end_seconds"]
+    lines.extend(
+        "\t".join(
+            [
+                str(keyframe["offsetSeconds"]),
+                str(keyframe["path"]),
+                str(keyframe.get("reason") or ""),
+                optional_tsv_value(keyframe.get("changeScore")),
+                optional_tsv_value(keyframe.get("transcriptStartSeconds")),
+                optional_tsv_value(keyframe.get("transcriptEndSeconds")),
+            ]
+        )
+        for keyframe in keyframes
+    )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def optional_tsv_value(value: Any) -> str:
+    return "" if value is None else str(value)
 
 
 def reset_directory(path: Path) -> None:

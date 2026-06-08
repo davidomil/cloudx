@@ -281,11 +281,11 @@ def test_youtube_playlist_url_ingests_each_video_transcript(tmp_path: Path, monk
         assert "description" in {chunk["locator"] for chunk in record["chunks"]}
         snapshot = tmp_path / "archive" / record["snapshot_path"]
         assert (snapshot.parent / "extracted" / "media" / "keyframes.tsv").exists()
-        assert (snapshot.parent / "extracted" / "media" / "keyframes" / "frame-000001.png").exists()
+        assert (snapshot.parent / "extracted" / "media" / "keyframes" / "frame-000001.jpg").exists()
     assert archive.search("PLAYLIST-POWER-2", collection="Board Bringup Playlist", limit=1)[0]["title"] == "Power Rail Checks"
     assert archive.search("Metadata for video-one allocator pressure slides", collection="Board Bringup Playlist", limit=1)[0]["title"] == "Reset Sequencing"
     assert archive.search("Metadata for video-two allocator pressure slides", collection="Board Bringup Playlist", limit=1)[0]["title"] == "Power Rail Checks"
-    assert archive.search("one frame per second", collection="Board Bringup Playlist", limit=2)
+    assert archive.search("selected YouTube slide frame", collection="Board Bringup Playlist", limit=2)
 
     app = create_app(tmp_path / "api-archive")
     client = TestClient(app)
@@ -295,6 +295,58 @@ def test_youtube_playlist_url_ingests_each_video_transcript(tmp_path: Path, monk
     payload = response.json()
     assert payload["document"]["title"] == "Reset Sequencing"
     assert [document["title"] for document in payload["documents"]] == ["Reset Sequencing", "Power Rail Checks"]
+
+
+def test_youtube_url_streams_progress_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    video_url = "https://www.youtube.com/watch?v=stream-demo"
+    stub_youtube_media(monkeypatch, {video_url: "Transcript explains STREAM-PROGRESS-1."})
+    app = create_app(tmp_path / "api-archive")
+    client = TestClient(app)
+
+    with client.stream("POST", "/ingest/url?stream=1", json={"url": video_url}) as response:
+        lines = [json.loads(line) for line in response.iter_lines() if line]
+
+    assert response.status_code == 200
+    assert any(line.get("type") == "progress" and "transcript" in line.get("stage", "").lower() for line in lines)
+    assert lines[-1]["type"] == "result"
+    assert lines[-1]["result"]["document"]["title"] == "Video stream-demo"
+
+
+def test_youtube_evidence_extracts_transcript_and_keyframes_in_parallel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    metadata = archive_module.YouTubeVideoMetadata(
+        title="Parallel video",
+        webpage_url="https://www.youtube.com/watch?v=parallel",
+        stream_url="https://example.com/parallel.mp4",
+        http_headers={},
+        duration=120,
+    )
+    events: list[str] = []
+    keyframe_started = threading.Event()
+
+    def transcribe(_url: str, _metadata: archive_module.YouTubeVideoMetadata, *, progress=None) -> list[archive_module.TranscriptSegment]:
+        events.append("transcript-start")
+        assert keyframe_started.wait(1)
+        events.append("transcript-finish")
+        return [archive_module.TranscriptSegment(0.0, 30.0, "parallel transcript")]
+
+    def keyframes(_metadata: archive_module.YouTubeVideoMetadata, artifact_dir: Path, *, transcript_segments=None, progress=None) -> list[dict[str, object]]:
+        events.append("keyframe-start")
+        (artifact_dir / "media").mkdir(parents=True, exist_ok=True)
+        keyframe_started.set()
+        time.sleep(0.02)
+        events.append("keyframe-finish")
+        return [{"offsetSeconds": 0, "path": "media/keyframes/frame-000001.jpg", "reason": "segment-start"}]
+
+    monkeypatch.setattr(archive_module, "transcribe_youtube_video", transcribe)
+    monkeypatch.setattr(archive_module, "capture_youtube_keyframes", keyframes)
+
+    segments, selected = archive_module.extract_youtube_video_evidence("https://www.youtube.com/watch?v=parallel", metadata, tmp_path / "artifact")
+
+    assert [segment.text for segment in segments] == ["parallel transcript"]
+    assert events.index("keyframe-start") < events.index("transcript-finish")
+    assert selected[0]["transcriptStartSeconds"] == 0.0
+    assert selected[0]["transcriptEndSeconds"] == 30.0
+    assert (tmp_path / "artifact" / "media" / "keyframes.tsv").exists()
 
 
 def test_youtube_video_ingest_preserves_transcript_metadata_and_keyframes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -324,15 +376,31 @@ def test_youtube_video_ingest_preserves_transcript_metadata_and_keyframes(tmp_pa
     assert json.loads((extracted / "media" / "youtube_metadata.json").read_text(encoding="utf-8"))["description"] == "Metadata for visual-demo includes allocator pressure slides."
     assert (extracted / "media" / "description.txt").read_text(encoding="utf-8") == "Metadata for visual-demo includes allocator pressure slides.\n"
     assert (extracted / "media" / "keyframes.tsv").read_text(encoding="utf-8").splitlines() == [
-        "offset_seconds\tpath",
-        "0\tmedia/keyframes/frame-000001.png",
-        "1\tmedia/keyframes/frame-000002.png",
+        "offset_seconds\tpath\treason\tchange_score\ttranscript_start_seconds\ttranscript_end_seconds",
+        "0\tmedia/keyframes/frame-000001.jpg\tsegment-start\t\t0.0\t2.0",
+        "2\tmedia/keyframes/frame-000002.jpg\tvisual-change\t0.5\t0.0\t2.0",
     ]
-    keyframe_chunk = next(chunk for chunk in record["chunks"] if chunk["locator"] == "media keyframes")
-    assert "Keyframe count: 2." in keyframe_chunk["text"]
-    assert "Time range seconds: 0 to 1." in keyframe_chunk["text"]
-    assert (extracted / "media" / "keyframes" / "frame-000001.png").exists()
-    assert (extracted / "media" / "keyframes" / "frame-000002.png").exists()
+    keyframe_chunks = [chunk for chunk in record["chunks"] if chunk["locator"].startswith("media keyframe ")]
+    assert [chunk["locator"] for chunk in keyframe_chunks] == [
+        "media keyframe keyframe-000000 00:00",
+        "media keyframe keyframe-000002 00:02",
+    ]
+    assert "Artifact path: media/keyframes/frame-000001.jpg." in keyframe_chunks[0]["text"]
+    assert "Selected YouTube slide frame keyframe-000000 at 00:00 (0 seconds)." in keyframe_chunks[0]["text"]
+    assert "Transcript near this frame:" in keyframe_chunks[0]["text"]
+    assert "[00:00 -> 00:02] Transcript explains YOUTUBE-VISUAL-9 while the slides show allocator pressure." in keyframe_chunks[0]["text"]
+    assert "Artifact path: media/keyframes/frame-000002.jpg." in keyframe_chunks[1]["text"]
+    assert "Selection reason: visual-change." in keyframe_chunks[1]["text"]
+    assert "media keyframes" not in {chunk["locator"] for chunk in record["chunks"]}
+    artifacts = record["artifacts"]
+    assert [artifact["locator"] for artifact in artifacts] == [
+        "media keyframe keyframe-000000 00:00",
+        "media keyframe keyframe-000002 00:02",
+    ]
+    assert (extracted / "media" / "transcript_segments.tsv").exists()
+    assert (extracted / "media" / "visual_sampling.json").exists()
+    assert (extracted / "media" / "keyframes" / "frame-000001.jpg").exists()
+    assert (extracted / "media" / "keyframes" / "frame-000002.jpg").exists()
 
 
 def test_document_detail_supports_chunk_windows_and_truncation(tmp_path: Path) -> None:
@@ -367,19 +435,415 @@ def test_document_detail_supports_chunk_windows_and_truncation(tmp_path: Path) -
     assert document["artifactWindow"] == {"offset": 0, "limit": 0, "total": 0, "hasMore": False}
 
 
-def test_youtube_keyframe_span_compacts_large_keyframe_indexes() -> None:
+def test_youtube_keyframe_spans_include_timestamped_transcript_context() -> None:
     keyframes = [
-        {"offsetSeconds": index, "path": f"media/keyframes/frame-{index + 1:06d}.png"}
-        for index in range(25)
+        {
+            "offsetSeconds": 12,
+            "path": "media/keyframes/frame-000001.png",
+            "reason": "visual-change",
+            "changeScore": 0.42,
+            "transcriptStartSeconds": 10.0,
+            "transcriptEndSeconds": 20.0,
+        }
+    ]
+    transcript_segments = [
+        archive_module.TranscriptSegment(8.0, 9.5, "before the selected slide"),
+        archive_module.TranscriptSegment(10.0, 14.0, "the slide explains KEYFRAME-CONTEXT-12"),
+        archive_module.TranscriptSegment(21.0, 22.0, "after the selected slide"),
     ]
 
-    span = archive_module.youtube_keyframe_span(keyframes)
+    spans = archive_module.youtube_keyframe_spans(keyframes, transcript_segments)
 
-    assert "Keyframe count: 25." in span
-    assert "Time range seconds: 0 to 24." in span
-    assert "second 19: media/keyframes/frame-000020.png" in span
-    assert "5 additional keyframes are listed in media/keyframes.tsv." in span
-    assert "second 24: media/keyframes/frame-000025.png" not in span
+    assert len(spans) == 1
+    assert spans[0].locator == "media keyframe keyframe-000012 00:12"
+    assert "Selected YouTube slide frame keyframe-000012 at 00:12 (12 seconds)." in spans[0].text
+    assert "Artifact path: media/keyframes/frame-000001.png." in spans[0].text
+    assert "Transcript window: 00:10-00:20." in spans[0].text
+    assert "KEYFRAME-CONTEXT-12" in spans[0].text
+    assert "before the selected slide" not in spans[0].text
+
+
+def test_slide_frame_selector_keeps_one_frame_per_visual_state(tmp_path: Path) -> None:
+    frame_paths = []
+    for index, color in enumerate(["white", "white", "white", "black", "black", "black"], start=1):
+        path = tmp_path / f"frame-{index:06d}.jpg"
+        Image.new("RGB", (64, 36), color).save(path)
+        frame_paths.append(path)
+
+    selected = archive_module.select_slide_frames(
+        frame_paths,
+        0,
+        archive_module.VideoVisualProfile(settle_seconds=1),
+    )
+
+    assert [(candidate["offsetSeconds"], candidate["reason"]) for candidate in selected] == [
+        (0, "segment-start"),
+        (4, "visual-change"),
+    ]
+
+
+def test_youtube_keyframe_capture_scans_downloaded_local_video(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    metadata = archive_module.YouTubeVideoMetadata(
+        title="Long presentation",
+        webpage_url="https://www.youtube.com/watch?v=local-scan",
+        stream_url="https://video.example/remote.mp4",
+        http_headers={"User-Agent": "cloudx-test"},
+        duration=601,
+    )
+    visual_path = tmp_path / "downloaded-video.mp4"
+    download_calls: list[str] = []
+    scan_calls: list[tuple[str, object, int, int | None]] = []
+
+    def download_once(
+        metadata_arg: archive_module.YouTubeVideoMetadata,
+        _output_dir: Path,
+        *,
+        progress,
+        started_at: float,
+        profile: archive_module.VideoVisualProfile,
+    ) -> Path:
+        download_calls.append(metadata_arg.webpage_url)
+        visual_path.write_bytes(b"downloaded video")
+        return visual_path
+
+    def scan_local(input_url: str, http_headers, start: int, duration: int | None, output_dir: Path, profile: archive_module.VideoVisualProfile) -> dict[str, object]:
+        scan_calls.append((input_url, http_headers, start, duration))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        colors = {0: "white", 300: "black", 600: "blue"}
+        frame_path = output_dir / "frame-000001.jpg"
+        Image.new("RGB", (64, 36), colors[start]).save(frame_path)
+        return {
+            "scannedFrames": 1,
+            "selected": [{
+                "offsetSeconds": start,
+                "sourcePath": frame_path,
+                "reason": "segment-start",
+                "changeScore": 0.0,
+            }],
+        }
+
+    monkeypatch.setattr(archive_module, "download_youtube_visual_source", download_once)
+    monkeypatch.setattr(archive_module, "scan_video_segment", scan_local)
+
+    keyframes = archive_module.capture_youtube_keyframes(
+        metadata,
+        tmp_path / "artifact",
+        profile=archive_module.VideoVisualProfile(segment_seconds=300, local_workers=2),
+    )
+
+    assert download_calls == ["https://www.youtube.com/watch?v=local-scan"]
+    assert sorted(scan_calls, key=lambda call: call[2]) == [
+        (str(visual_path), None, 0, 300),
+        (str(visual_path), None, 300, 300),
+        (str(visual_path), None, 600, 1),
+    ]
+    assert [keyframe["offsetSeconds"] for keyframe in keyframes] == [0, 300, 600]
+    manifest = json.loads((tmp_path / "artifact" / "media" / "visual_sampling.json").read_text(encoding="utf-8"))
+    assert manifest["strategy"] == "downloaded-slide-change"
+    assert manifest["workers"] == 2
+    assert manifest["selectedFrames"] == 3
+
+
+def test_youtube_audio_download_progress_reports_bytes_and_eta() -> None:
+    events: list[dict[str, object]] = []
+    hook = archive_module.youtube_audio_download_progress_hook(events.append, time.monotonic(), 29450)
+
+    hook({"status": "downloading", "downloaded_bytes": 50, "total_bytes": 200, "eta": 12})
+    hook({"status": "finished", "downloaded_bytes": 200})
+
+    assert events[0]["stage"] == "Downloading YouTube audio for local transcription."
+    assert events[0]["progress"] == 27
+    assert events[0]["etaSeconds"] == 12
+    assert events[0]["metrics"] == {"durationSeconds": 29450, "downloadedBytes": 50, "totalBytes": 200}
+    assert events[-1]["stage"] == "Finished downloading YouTube audio."
+    assert events[-1]["progress"] == 31
+    assert events[-1]["metrics"] == {"durationSeconds": 29450, "downloadedBytes": 200}
+
+
+def test_youtube_audio_download_progress_omits_unstable_early_eta() -> None:
+    events: list[dict[str, object]] = []
+    hook = archive_module.youtube_audio_download_progress_hook(events.append, time.monotonic(), 29450)
+
+    hook({"status": "downloading", "downloaded_bytes": 1024, "total_bytes": 386095778})
+
+    assert "etaSeconds" not in events[0]
+    assert events[0]["metrics"] == {"durationSeconds": 29450, "downloadedBytes": 1024, "totalBytes": 386095778}
+
+
+def test_documentation_asr_backend_is_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLOUDX_DOCUMENTATION_ASR_BACKEND", "whisper_cpp")
+    assert archive_module.documentation_asr_backend() == "whisper-cpp"
+
+    monkeypatch.setenv("CLOUDX_DOCUMENTATION_ASR_BACKEND", "openvino")
+    with pytest.raises(ArchiveError, match="Unsupported documentation ASR backend"):
+        archive_module.documentation_asr_backend()
+
+
+def test_whisper_cpp_extra_args_are_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_ARGS", raising=False)
+
+    assert archive_module.documentation_whisper_cpp_extra_args() == []
+    assert archive_module.documentation_whisper_cpp_stability_args() == ["-sns", "-nf", "-mc", "0"]
+
+    monkeypatch.setenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_ARGS", "--print-colors")
+    assert archive_module.documentation_whisper_cpp_extra_args() == ["--print-colors"]
+
+
+def test_whisper_cpp_vad_requires_configured_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD", "true")
+    monkeypatch.delenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD_MODEL_PATH", raising=False)
+    monkeypatch.delenv("CLOUDX_ASR_WHISPER_CPP_VAD_MODEL_PATH", raising=False)
+
+    with pytest.raises(ArchiveError, match="VAD_MODEL_PATH is required"):
+        archive_module.documentation_whisper_cpp_vad_args()
+
+
+def test_whisper_cpp_backend_converts_invokes_cli_and_parses_segments(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    audio_path = tmp_path / "audio.webm"
+    audio_path.write_bytes(b"audio")
+    model_path = tmp_path / "ggml-large-v3.bin"
+    model_path.write_bytes(b"model")
+    vad_model_path = tmp_path / "ggml-silero-v6.2.0.bin"
+    vad_model_path.write_bytes(b"vad")
+    binary_path = tmp_path / "whisper-cli"
+    binary_path.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary_path.chmod(0o755)
+    events: list[dict[str, object]] = []
+    commands: list[list[str]] = []
+
+    class FakeProcess:
+        def __init__(self, command, **_kwargs):
+            commands.append(command)
+            if command[0] == "ffmpeg":
+                Path(command[-1]).write_bytes(b"wav")
+                self.stdout = iter(["out_time_ms=30000000\n", "progress=continue\n", "out_time_ms=60000000\n", "progress=end\n"])
+            else:
+                output_base = Path(command[command.index("-of") + 1])
+                output_base.with_suffix(".json").write_text(
+                    json.dumps(
+                        {
+                            "transcription": [
+                                {
+                                    "offsets": {"from": 1230, "to": 4560},
+                                    "text": " GPU accelerated transcript ",
+                                }
+                            ]
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                self.stdout = iter(["whisper_print_progress_callback: progress = 25%\n", "progress = 100%\n"])
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(archive_module.subprocess, "Popen", FakeProcess)
+    monkeypatch.setenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_MODEL_PATH", str(model_path))
+    monkeypatch.setenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_BIN", str(binary_path))
+    monkeypatch.setenv("CLOUDX_DOCUMENTATION_ASR_BEAM_SIZE", "1")
+    monkeypatch.setenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_THREADS", "3")
+    monkeypatch.setenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD", "true")
+    monkeypatch.setenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD_MODEL_PATH", str(vad_model_path))
+    metadata = archive_module.YouTubeVideoMetadata(
+        title="GPU Demo",
+        webpage_url="https://www.youtube.com/watch?v=gpu",
+        stream_url="https://example.com/gpu.mp4",
+        http_headers={},
+        duration=60,
+    )
+
+    segments = archive_module.transcribe_audio_whisper_cpp(audio_path, tmp_path, metadata, audio_path.stat().st_size, time.monotonic(), progress=events.append)
+
+    assert segments == [archive_module.TranscriptSegment(1.23, 4.56, "GPU accelerated transcript")]
+    assert commands[0][:5] == ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
+    assert commands[0][commands[0].index("-progress") + 1] == "pipe:1"
+    assert commands[0][commands[0].index("-stats_period") + 1] == "5"
+    assert commands[1][0] == str(binary_path)
+    assert commands[1][commands[1].index("-m") + 1] == str(model_path)
+    assert commands[1][commands[1].index("-f") + 1] == str(tmp_path / "whisper-cpp-input.wav")
+    assert "-oj" in commands[1]
+    assert commands[1][commands[1].index("-bs") + 1] == "1"
+    assert commands[1][commands[1].index("-t") + 1] == "3"
+    assert commands[1][commands[1].index("-sns") + 1] == "-nf"
+    assert commands[1][commands[1].index("-mc") + 1] == "0"
+    assert commands[1][commands[1].index("--vad-model") + 1] == str(vad_model_path)
+    assert any("Converted YouTube audio through 00:30" in str(event["stage"]) for event in events)
+    assert any("25% complete" in str(event["stage"]) for event in events)
+
+
+def test_whisper_cpp_backend_chunks_long_audio_and_offsets_segments(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    audio_path = tmp_path / "audio.webm"
+    audio_path.write_bytes(b"audio")
+    model_path = tmp_path / "ggml-large-v3.bin"
+    model_path.write_bytes(b"model")
+    binary_path = tmp_path / "whisper-cli"
+    binary_path.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary_path.chmod(0o755)
+    commands: list[list[str]] = []
+    split_commands: list[list[str]] = []
+    events: list[dict[str, object]] = []
+
+    def fake_conversion(command, *_args, **_kwargs):
+        Path(command[-1]).write_bytes(b"wav")
+
+    def fake_run(command, **_kwargs):
+        split_commands.append(command)
+        output_path = Path(command[-1])
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"chunk")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    class FakeProcess:
+        def __init__(self, command, **_kwargs):
+            commands.append(command)
+            output_base = Path(command[command.index("-of") + 1])
+            chunk_path = Path(command[command.index("-f") + 1])
+            chunk_number = int(chunk_path.stem.rsplit("-", 1)[1])
+            start_milliseconds = 1000 if chunk_number == 0 else 6000
+            output_base.with_suffix(".json").write_text(
+                json.dumps(
+                    {
+                        "transcription": [
+                            {
+                                "offsets": {"from": start_milliseconds, "to": start_milliseconds + 1000},
+                                "text": f" transcript for {chunk_path.stem} ",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.stdout = iter(["progress = 0%\n", "progress = 100%\n"])
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(archive_module, "run_ffmpeg_audio_conversion", fake_conversion)
+    monkeypatch.setattr(archive_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(archive_module.subprocess, "Popen", FakeProcess)
+    monkeypatch.setenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_MODEL_PATH", str(model_path))
+    monkeypatch.setenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_BIN", str(binary_path))
+    monkeypatch.setenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_CHUNK_SECONDS", "60")
+    monkeypatch.setenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_CHUNK_OVERLAP_SECONDS", "5")
+    monkeypatch.setenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD", "false")
+    metadata = archive_module.YouTubeVideoMetadata(
+        title="Chunked Demo",
+        webpage_url="https://www.youtube.com/watch?v=chunked",
+        stream_url="https://example.com/chunked.mp4",
+        http_headers={},
+        duration=125,
+    )
+
+    segments = archive_module.transcribe_audio_whisper_cpp(audio_path, tmp_path, metadata, audio_path.stat().st_size, time.monotonic(), progress=events.append)
+
+    assert [round(segment.start_seconds, 1) for segment in segments] == [1.0, 61.0, 121.0]
+    assert [round(segment.end_seconds, 1) for segment in segments] == [2.0, 62.0, 122.0]
+    assert len(commands) == 3
+    assert len(split_commands) == 3
+    assert [(command[command.index("-ss") + 1], command[command.index("-t") + 1]) for command in split_commands] == [
+        ("0.000", "65.000"),
+        ("55.000", "70.000"),
+        ("115.000", "10.000"),
+    ]
+    assert all(command[command.index("-f") + 1].endswith(f"chunk-{index:04d}.wav") for index, command in enumerate(commands))
+    assert any(event.get("metrics", {}).get("chunkOverlapSeconds") == 5 for event in events)
+    assert any(event.get("metrics", {}).get("chunksTotal") == 3 for event in events)
+
+
+def test_whisper_cpp_overlap_merge_keeps_segments_once() -> None:
+    left_chunk = archive_module.WhisperCppAudioChunk(
+        index=1,
+        start_seconds=0.0,
+        duration_seconds=65.0,
+        keep_start_seconds=0.0,
+        keep_end_seconds=60.0,
+        path=Path("chunk-0000.wav"),
+    )
+    right_chunk = archive_module.WhisperCppAudioChunk(
+        index=2,
+        start_seconds=55.0,
+        duration_seconds=70.0,
+        keep_start_seconds=60.0,
+        keep_end_seconds=120.0,
+        path=Path("chunk-0001.wav"),
+    )
+
+    left_segments = archive_module.keep_whisper_cpp_chunk_segments(
+        [
+            archive_module.TranscriptSegment(57.0, 62.0, "sentence crossing the boundary"),
+            archive_module.TranscriptSegment(62.0, 64.0, "right overlap duplicate"),
+        ],
+        left_chunk,
+    )
+    right_segments = archive_module.keep_whisper_cpp_chunk_segments(
+        [
+            archive_module.TranscriptSegment(2.0, 7.0, "sentence crossing the boundary"),
+            archive_module.TranscriptSegment(6.0, 8.0, "next sentence"),
+        ],
+        right_chunk,
+    )
+
+    assert left_segments == [archive_module.TranscriptSegment(57.0, 62.0, "sentence crossing the boundary")]
+    assert right_segments == [archive_module.TranscriptSegment(61.0, 63.0, "next sentence")]
+
+
+def test_youtube_parallel_progress_reports_channel_percent() -> None:
+    events: list[dict[str, object]] = []
+    reporter = archive_module.YouTubeParallelProgress(events.append).channel("Transcript", 26, 58)
+    assert reporter is not None
+
+    reporter({"stage": "whisper.cpp transcription 50% complete.", "progress": 42})
+
+    assert events == [
+        {
+            "stage": "Transcript: whisper.cpp transcription 50% complete.",
+            "progress": 40,
+            "channel": "transcript",
+            "channelLabel": "Transcript",
+            "channelProgress": 50,
+        }
+    ]
+
+
+def test_progress_heartbeat_reports_latest_event() -> None:
+    events: list[dict[str, object]] = []
+    heartbeat = archive_module.ProgressHeartbeat(
+        events.append,
+        stage="Running faster-whisper transcription; waiting for timestamped segments.",
+        progress=32,
+        metrics={"durationSeconds": 29450},
+        interval_seconds=0.01,
+    )
+    try:
+        deadline = time.monotonic() + 1
+        while not events and time.monotonic() < deadline:
+            time.sleep(0.01)
+        heartbeat.update(
+            stage="Transcribed through 16:27.",
+            progress=33,
+            eta_seconds=6039,
+            metrics={"durationSeconds": 29450, "transcribedSeconds": 986.9},
+        )
+        deadline = time.monotonic() + 1
+        while not any(event.get("stage") == "Transcribed through 16:27." for event in events) and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        heartbeat.stop()
+
+    assert events[0] == {
+        "stage": "Running faster-whisper transcription; waiting for timestamped segments.",
+        "progress": 32,
+        "metrics": {"durationSeconds": 29450},
+    }
+    assert any(
+        event == {
+            "stage": "Transcribed through 16:27.",
+            "progress": 33,
+            "etaSeconds": 6039,
+            "metrics": {"durationSeconds": 29450, "transcribedSeconds": 986.9},
+        }
+        for event in events
+    )
 
 
 def test_snapshot_artifact_window_paginates_large_keyframe_index(tmp_path: Path) -> None:
@@ -401,6 +865,13 @@ def test_snapshot_artifact_window_paginates_large_keyframe_index(tmp_path: Path)
 
     assert window.total == 25
     assert [artifact["offsetSeconds"] for artifact in window.artifacts] == [10, 11, 12, 13, 14]
+    assert [artifact["locator"] for artifact in window.artifacts] == [
+        "media keyframe keyframe-000010 00:10",
+        "media keyframe keyframe-000011 00:11",
+        "media keyframe keyframe-000012 00:12",
+        "media keyframe keyframe-000013 00:13",
+        "media keyframe keyframe-000014 00:14",
+    ]
     assert all(artifact["available"] is True for artifact in window.artifacts)
 
 
@@ -776,6 +1247,13 @@ def make_multiframe_image(path: Path) -> None:
 
 def stub_youtube_media(monkeypatch: pytest.MonkeyPatch, transcripts: dict[str, str], descriptions: dict[str, str | None] | None = None) -> None:
     monkeypatch.setattr(archive_module, "fetch_youtube_transcript", lambda url: transcripts[url])
+    monkeypatch.setattr(
+        archive_module,
+        "transcribe_youtube_video",
+        lambda url, _metadata, progress=None: [
+            archive_module.TranscriptSegment(0.0, 2.0, transcripts[url]),
+        ],
+    )
 
     def metadata(url: str) -> archive_module.YouTubeVideoMetadata:
         video_id = url.rsplit("=", 1)[-1]
@@ -793,18 +1271,26 @@ def stub_youtube_media(monkeypatch: pytest.MonkeyPatch, transcripts: dict[str, s
             chapters=[{"title": "Intro", "start_time": 0, "end_time": 60}],
         )
 
-    def keyframes(_metadata: archive_module.YouTubeVideoMetadata, artifact_dir: Path) -> list[dict[str, str | int]]:
+    def keyframes(_metadata: archive_module.YouTubeVideoMetadata, artifact_dir: Path, *, transcript_segments=None, progress=None) -> list[dict[str, object]]:
         frames_dir = artifact_dir / "media" / "keyframes"
         frames_dir.mkdir(parents=True, exist_ok=True)
         for index in range(1, 3):
-            Image.new("RGB", (64, 36), "white").save(frames_dir / f"frame-{index:06d}.png")
+            Image.new("RGB", (64, 36), "white").save(frames_dir / f"frame-{index:06d}.jpg")
         frames = [
-            {"offsetSeconds": 0, "path": "media/keyframes/frame-000001.png"},
-            {"offsetSeconds": 1, "path": "media/keyframes/frame-000002.png"},
+            {"offsetSeconds": 0, "path": "media/keyframes/frame-000001.jpg", "reason": "segment-start", "transcriptStartSeconds": 0.0, "transcriptEndSeconds": 2.0},
+            {"offsetSeconds": 2, "path": "media/keyframes/frame-000002.jpg", "reason": "visual-change", "changeScore": 0.5, "transcriptStartSeconds": 0.0, "transcriptEndSeconds": 2.0},
         ]
         media_dir = artifact_dir / "media"
         media_dir.mkdir(parents=True, exist_ok=True)
         archive_module.write_keyframe_index(media_dir / "keyframes.tsv", frames)
+        archive_module.write_visual_sampling_manifest(
+            media_dir / "visual_sampling.json",
+            metadata=_metadata,
+            profile=archive_module.VideoVisualProfile(),
+            scanned_frames=4,
+            selected_frames=2,
+            elapsed_seconds=0.1,
+        )
         (media_dir / "youtube_metadata.json").write_text(json.dumps(archive_module.youtube_metadata_json(_metadata), indent=2) + "\n", encoding="utf-8")
         if _metadata.description:
             (media_dir / "description.txt").write_text(_metadata.description + "\n", encoding="utf-8")

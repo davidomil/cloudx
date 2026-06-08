@@ -196,6 +196,47 @@ describe("DocumentationClient", () => {
     expect(bodyText).toContain("client-test");
   });
 
+  it("streams ingest URL progress and returns the final result", async () => {
+    const progress: unknown[] = [];
+    let requestUrl = "";
+    const url = await startServer((request, response) => {
+      requestUrl = request.url ?? "";
+      response.writeHead(200, { "content-type": "application/x-ndjson" });
+      response.write(JSON.stringify({ type: "progress", stage: "Transcribing video.", progress: 42, etaSeconds: 120, metrics: { transcribedSeconds: 60 }, channel: "transcript", channelLabel: "Transcript", channelProgress: 50 }) + "\n");
+      response.end(JSON.stringify({ type: "result", result: { document: { documentId: "video-doc" } } }) + "\n");
+    });
+    const client = new DocumentationClient(`${url}/docs`);
+
+    const result = await client.ingestUrl({ url: "https://youtube.example/watch?v=slides" }, { onProgress: (event) => progress.push(event) });
+
+    expect(requestUrl).toBe("/docs/ingest/url?stream=1");
+    expect(progress).toEqual([{ stage: "Transcribing video.", progress: 42, etaSeconds: 120, metrics: { transcribedSeconds: 60 }, channel: "transcript", channelLabel: "Transcript", channelProgress: 50 }]);
+    expect(result).toEqual({ document: { documentId: "video-doc" } });
+  });
+
+  it("keeps streaming ingest URL requests alive while progress arrives", async () => {
+    const progress: unknown[] = [];
+    const url = await startServer((_request, response) => {
+      response.writeHead(200, { "content-type": "application/x-ndjson" });
+      response.write(JSON.stringify({ type: "progress", stage: "Transcribing video.", progress: 35 }) + "\n");
+      setTimeout(() => {
+        response.write(JSON.stringify({ type: "progress", stage: "Scanning video.", progress: 60 }) + "\n");
+      }, 20);
+      setTimeout(() => {
+        response.end(JSON.stringify({ type: "result", result: { document: { documentId: "long-video-doc" } } }) + "\n");
+      }, 40);
+    });
+    const client = new DocumentationClient(`${url}/docs`, { timeoutMs: 30 });
+
+    const result = await client.ingestUrl({ url: "https://youtube.example/watch?v=long-slides" }, { onProgress: (event) => progress.push(event) });
+
+    expect(progress).toEqual([
+      { stage: "Transcribing video.", progress: 35, etaSeconds: undefined, metrics: undefined },
+      { stage: "Scanning video.", progress: 60, etaSeconds: undefined, metrics: undefined }
+    ]);
+    expect(result).toEqual({ document: { documentId: "long-video-doc" } });
+  });
+
   it("rejects oversized documentation service responses with the configured response limit", async () => {
     const url = await startServer((_request, response) => {
       response.writeHead(200, { "content-type": "application/json" });

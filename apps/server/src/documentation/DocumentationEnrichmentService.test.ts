@@ -1,4 +1,6 @@
 import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
 
@@ -16,6 +18,7 @@ import {
   DOCUMENTATION_AI_TEXT_ANALYSIS_MODEL_KEY,
   DOCUMENTATION_AI_USE_VOICE_MODEL,
   DocumentationEnrichmentService,
+  parseFfmpegShowinfoPtsTimes,
   type DocumentationEnrichmentRunner
 } from "./DocumentationEnrichmentService.js";
 
@@ -258,6 +261,65 @@ describe("DocumentationEnrichmentService", () => {
     }));
   });
 
+  it("keeps timestamped video keyframe artifacts next to their transcript chunk for visual enrichment", async () => {
+    const archiveRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-enrich-"));
+    const keyframePath = path.join(archiveRoot, "snapshots", "video", "extracted", "media", "keyframes", "frame-000001.jpg");
+    await fs.mkdir(path.dirname(keyframePath), { recursive: true });
+    await fs.writeFile(keyframePath, Buffer.from([1, 2, 3]));
+    const runner = fakeRunner({
+      summary: "keyframe visualized",
+      spans: [{ locator: "ai:visual:keyframe-000012", text: "Keyframe visual span says KEYFRAME-VISUAL-12 is described from the frame." }],
+      metadata: [],
+      warnings: []
+    });
+    const locator = "media keyframe keyframe-000012 00:12";
+    const client = fakeDocumentationClient({
+      source_type: "media",
+      snapshot_path: "snapshots/video/source.youtube.txt",
+      chunks: [{
+        chunk_id: 41,
+        locator,
+        text: "Selected YouTube slide frame keyframe-000012 at 00:12. Artifact path: media/keyframes/frame-000001.jpg. Transcript near this frame: KEYFRAME-TRANSCRIPT-12.",
+        chunk_origin: "source"
+      }],
+      artifacts: [{
+        id: "keyframe-000012",
+        type: "media-keyframe",
+        kind: "keyframe",
+        locator,
+        path: "media/keyframes/frame-000001.jpg",
+        mimeType: "image/jpeg",
+        available: true,
+        bytes: 3,
+        offsetSeconds: 12,
+        transcriptStartSeconds: 10,
+        transcriptEndSeconds: 20,
+        reason: "visual-change",
+        changeScore: 0.42
+      }]
+    }, { archiveRoot });
+    const service = new DocumentationEnrichmentService({
+      client,
+      config: fakeConfig(true),
+      rulesSkills: fakeRulesSkills(),
+      runner
+    });
+
+    await service.enrichIngestResponse({ document: { documentId: "doc-1" } });
+
+    const prompt = runner.run.mock.calls[0]?.[0] ?? "";
+    expect(prompt).toContain("KEYFRAME-TRANSCRIPT-12");
+    expect(prompt).toContain('"locator": "media keyframe keyframe-000012 00:12"');
+    expect(prompt).toContain('"offsetSeconds": 12');
+    expect(prompt).toContain("frame-000001.jpg");
+    expect(runner.run).toHaveBeenCalledTimes(1);
+    expect(client.enrichDocument).toHaveBeenCalledWith(expect.objectContaining({
+      payload: expect.objectContaining({
+        evidence: expect.objectContaining({ artifactCount: 1, chunkCount: 1 })
+      })
+    }));
+  });
+
   it("persists all valid returned spans and warnings without fixed output caps", async () => {
     const spans = Array.from({ length: 105 }, (_unused, index) => ({
       locator: `ai:item:${index + 1}`,
@@ -346,6 +408,14 @@ describe("DocumentationEnrichmentService", () => {
       results: [{ documentId: "doc-1", status: "written", chunkCount: 1 }]
     });
   });
+
+  it("parses ffmpeg showinfo timestamps for scene-selected media frames", () => {
+    expect(parseFfmpegShowinfoPtsTimes([
+      "[Parsed_showinfo_2 @ 0x1] n:   0 pts:      0 pts_time:0 pos:123",
+      "[Parsed_showinfo_2 @ 0x1] n:   1 pts:   3000 pts_time:120.042 pos:456",
+      "[Parsed_showinfo_2 @ 0x1] n:   2 pts:   6000 pts_time:3599.5 pos:789"
+    ].join("\n"))).toEqual([0, 120.042, 3599.5]);
+  });
 });
 
 function fakeConfig(enabled: boolean, options: {
@@ -383,12 +453,12 @@ function fakeAsr(text: string): AsrClient & { transcribe: ReturnType<typeof vi.f
   } as unknown as AsrClient & { transcribe: ReturnType<typeof vi.fn> };
 }
 
-function fakeDocumentationClient(documentOverrides: Record<string, unknown> = {}): DocumentationClient & {
+function fakeDocumentationClient(documentOverrides: Record<string, unknown> = {}, options: { archiveRoot?: string } = {}): DocumentationClient & {
   enrichDocument: ReturnType<typeof vi.fn>;
   search: ReturnType<typeof vi.fn>;
 } {
   return {
-    health: vi.fn(async () => ({ archiveRoot: "/tmp/archive" })),
+    health: vi.fn(async () => ({ archiveRoot: options.archiveRoot ?? "/tmp/archive" })),
     getDocument: vi.fn(async () => ({
       document: {
         document_id: "doc-1",

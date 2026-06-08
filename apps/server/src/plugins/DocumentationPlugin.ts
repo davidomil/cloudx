@@ -150,7 +150,15 @@ export class DocumentationPlugin implements WorkspacePlugin {
       }, ["path"]),
       externalHook("documentation.ingest.url", "Ingest Documentation URL", "Download a URL source, ingest a YouTube video with transcript and keyframes, or ingest every video in a YouTube playlist.", async (input, context) => this.enqueueIngest("url", titleOrFallback(input.title, requireString(input.url, "url")), requireString(input.url, "url"), "Downloading URL and extracting source evidence.", async (job) => {
         job.update({ progress: 30, stage: urlIngestStage(requireString(input.url, "url")) });
-        return this.enrichQueued(await this.client.ingestUrl(input), job);
+        return this.enrichQueued(await this.client.ingestUrl(input, {
+          onProgress: (event) => job.update({
+            progress: typeof event.progress === "number" ? Math.max(30, Math.min(76, event.progress)) : undefined,
+            stage: event.stage,
+            etaSeconds: event.etaSeconds,
+            metrics: event.metrics,
+            ...progressChannelPatch(event)
+          })
+        }), job);
       }, context), {
         url: { type: "string" },
         title: { type: "string" },
@@ -344,8 +352,41 @@ function hookProgress(snapshot: DocumentationIngestJobSnapshot) {
     status: snapshot.status,
     jobId: snapshot.id,
     detail: snapshot.detail,
-    position: snapshot.position
+    position: snapshot.position,
+    etaSeconds: snapshot.etaSeconds,
+    metrics: snapshot.metrics,
+    progressChannels: snapshot.progressChannels
   };
+}
+
+function progressChannelPatch(event: { stage?: string; channel?: string; channelLabel?: string; channelProgress?: number }) {
+  const explicitId = optionalString(event.channel);
+  const explicitLabel = optionalString(event.channelLabel);
+  const parsed = progressChannelFromStage(event.stage);
+  if (explicitId) {
+    const normalizedExplicitId = progressChannelId(explicitId);
+    return {
+      channelId: explicitId,
+      channelLabel: explicitLabel ?? parsed?.label ?? explicitId,
+      channelStage: parsed && parsed.id === normalizedExplicitId ? parsed.stage : event.stage,
+      channelProgress: event.channelProgress
+    };
+  }
+  return parsed ? { channelId: parsed.id, channelLabel: parsed.label, channelStage: parsed.stage, channelProgress: event.channelProgress } : {};
+}
+
+function progressChannelFromStage(stage: string | undefined): { id: string; label: string; stage: string } | undefined {
+  const match = /^([^:]{2,32}):\s*(.+)$/u.exec(stage ?? "");
+  if (!match) {
+    return undefined;
+  }
+  const label = match[1]!.trim();
+  const id = progressChannelId(label);
+  return id ? { id, label, stage: match[2]!.trim() } : undefined;
+}
+
+function progressChannelId(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/gu, "-").replace(/^-|-$/gu, "");
 }
 
 function defaultDocumentationSkills(): PluginSkillContribution[] {
@@ -411,6 +452,8 @@ function defaultDocumentationSkills(): PluginSkillContribution[] {
       instructions: skillInstructions("Enrich Visuals", [
         "Use extracted table files, figure indexes, image metadata, keyframe paths, and surrounding chunks as the visual evidence.",
         "Describe tables, graphs, flowcharts, block diagrams, screenshots, and visible labels in short searchable spans with locators that start with `ai:visual`.",
+        "For video keyframes, use the timestamped `media keyframe ...` chunk, keyframe artifact path, and nearby transcript context to write one concise visual span per meaningful frame.",
+        "Keep each video-frame span grounded to that frame's timestamp and visible image evidence; do not collapse all frames into one generic video summary.",
         "Call out where the current extraction looks incomplete, such as cropped figures, missing axis labels, unreadable callouts, or tables that need manual review.",
         "Do not infer visual details unless they are present in artifact previews, filenames, nearby text, or keyframe evidence."
       ])
@@ -418,9 +461,9 @@ function defaultDocumentationSkills(): PluginSkillContribution[] {
     {
       id: "documentation-enrich-media",
       name: "Documentation Enrich Media",
-      description: "Improve media imports using transcripts and interval keyframes when they are available.",
+      description: "Improve media imports using transcripts and selected visual keyframes when they are available.",
       instructions: skillInstructions("Enrich Media", [
-        "Use transcript text, ASR transcript evidence, and one-frame-per-second keyframe offsets to identify meaningful sections in videos or audio.",
+        "Use transcript text, ASR transcript evidence, and timestamped selected slide or keyframe offsets to identify meaningful sections in videos or audio.",
         "Write derived spans with locators that start with `ai:media`; include section titles, timestamps or offsets when evidence supports them, and searchable details that the transcript alone may miss.",
         "When a YouTube playlist import contains separate documents, enrich each document independently using only that document's evidence.",
         "Report missing audio, missing keyframes, low-confidence transcript language, or insufficient visual evidence in `warnings`."

@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import queue
+import threading
 from pathlib import Path
 from typing import Annotated
+from typing import Any
+from typing import Callable
 from typing import Sequence
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from .archive import ACTIVE_STATE, ArchiveError, DocumentationArchive
@@ -153,7 +159,23 @@ def create_app(root: str | Path | None = None) -> FastAPI:
         }
 
     @app.post("/ingest/url")
-    def ingest_url(request: IngestUrlRequest) -> dict:
+    def ingest_url(request: IngestUrlRequest, stream: Annotated[bool, Query()] = False):
+        if stream:
+            return StreamingResponse(
+                archive_progress_stream(
+                    lambda progress: archive.ingest_url_documents(
+                        request.url,
+                        title=request.title,
+                        source_type=request.source_type,
+                        collection=request.collection,
+                        tags=request.tags,
+                        transcript=request.transcript,
+                        progress=progress,
+                    ),
+                    lambda documents: {"document": documents[0].as_dict(), "documents": [document.as_dict() for document in documents]},
+                ),
+                media_type="application/x-ndjson",
+            )
         documents = handle_archive_error(
             lambda: archive.ingest_url_documents(
                 request.url,
@@ -241,6 +263,31 @@ def handle_archive_error(operation):
         return operation()
     except ArchiveError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+def archive_progress_stream(operation: Callable[[Callable[[dict[str, Any]], None]], Any], serialize: Callable[[Any], dict]):
+    events: queue.Queue[dict[str, Any] | None] = queue.Queue()
+
+    def progress(event: dict[str, Any]) -> None:
+        events.put({"type": "progress", **event})
+
+    def run() -> None:
+        try:
+            result = operation(progress)
+            events.put({"type": "result", "result": serialize(result)})
+        except ArchiveError as error:
+            events.put({"type": "error", "error": str(error)})
+        except Exception as error:  # pragma: no cover - defensive stream boundary.
+            events.put({"type": "error", "error": str(error)})
+        finally:
+            events.put(None)
+
+    threading.Thread(target=run, daemon=True).start()
+    while True:
+        event = events.get()
+        if event is None:
+            break
+        yield json.dumps(event, ensure_ascii=False) + "\n"
 
 
 def span_to_extracted_span(span: EnrichmentSpan):
