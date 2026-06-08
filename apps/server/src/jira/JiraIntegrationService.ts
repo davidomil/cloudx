@@ -12,7 +12,8 @@ import {
   sortJiraIssues,
   type JiraCommentSummary,
   type JiraDashboardResponse,
-  type JiraIssueSummary
+  type JiraIssueSummary,
+  type JiraUserSummary
 } from "./JiraIssue.js";
 
 export const JIRA_PLUGIN_ID = "jira";
@@ -56,6 +57,17 @@ export interface JiraDashboardInput {
   sortBy?: string;
   groupBy?: string;
   maxResults?: number;
+}
+
+export interface JiraIssueSearchInput {
+  jql?: string;
+  maxResults?: number;
+  nextPageToken?: string;
+  pageSize?: number;
+}
+
+export interface JiraPollingAccount extends JiraUserSummary {
+  configuredEmail?: string;
 }
 
 export class JiraIntegrationService {
@@ -125,11 +137,30 @@ export class JiraIntegrationService {
     };
   }
 
-  async search(input: { jql?: string; maxResults?: number } = {}): Promise<Record<string, unknown>> {
+  async search(input: JiraIssueSearchInput = {}): Promise<Record<string, unknown>> {
     const client = this.client();
-    const jql = input.jql ?? dashboardJql(stringConfig(this.configValues().dashboardFilterJql) ?? "resolution = EMPTY", "priority_desc_updated_desc");
-    const issues = await this.searchNormalized(client, jql, numberConfig(input.maxResults) ?? 50);
-    return { issues, jql, siteUrl: client.normalizedSiteUrl };
+    const page = await this.searchNormalizedPage(client, searchJql(input.jql, this.configValues()), numberConfig(input.maxResults) ?? 50, optionalString(input.nextPageToken));
+    return searchResponse(client.normalizedSiteUrl, page.jql, page.issues, page.nextPageToken, page.isLast);
+  }
+
+  async searchAll(input: JiraIssueSearchInput = {}): Promise<Record<string, unknown>> {
+    const client = this.client();
+    const jql = searchJql(input.jql, this.configValues());
+    const maxResults = boundedPositiveInteger(input.maxResults, 100, 1000);
+    const pageSize = boundedPositiveInteger(input.pageSize, Math.min(maxResults, 100), Math.min(maxResults, 100));
+    const issues: JiraIssueSummary[] = [];
+    let nextPageToken = optionalString(input.nextPageToken);
+    let isLast = false;
+    let pages = 0;
+    do {
+      pages += 1;
+      const remaining = maxResults - issues.length;
+      const page = await this.searchNormalizedPage(client, jql, Math.min(pageSize, remaining), nextPageToken);
+      issues.push(...page.issues);
+      nextPageToken = page.nextPageToken;
+      isLast = page.isLast === true || !nextPageToken;
+    } while (!isLast && issues.length < maxResults && pages < maxResults);
+    return searchResponse(client.normalizedSiteUrl, jql, issues, nextPageToken, isLast);
   }
 
   async currentUser(): Promise<Record<string, unknown>> {
@@ -257,14 +288,33 @@ export class JiraIntegrationService {
     return this.searchNormalized(client, config.jql, config.maxIssues);
   }
 
+  async pollingAccount(): Promise<JiraPollingAccount> {
+    const user = await this.client().myself();
+    return {
+      accountId: stringValue(user.accountId),
+      displayName: stringValue(user.displayName),
+      emailAddress: stringValue(user.emailAddress),
+      configuredEmail: stringConfig(this.configValues().accountEmail)
+    };
+  }
+
   async pollingComments(issueKey: string): Promise<JiraCommentSummary[]> {
     const client = this.client();
     return (await client.listComments(issueKey)).map((comment) => normalizeJiraComment(comment, client.normalizedSiteUrl, issueKey));
   }
 
   private async searchNormalized(client: JiraClient, jql: string, maxResults: number): Promise<JiraIssueSummary[]> {
-    const response = await client.search({ jql, fields: JIRA_ISSUE_FIELDS, maxResults });
-    return response.issues.map((issue) => normalizeJiraIssue(issue, client.normalizedSiteUrl)).filter((issue) => issue.key);
+    return (await this.searchNormalizedPage(client, jql, maxResults)).issues;
+  }
+
+  private async searchNormalizedPage(client: JiraClient, jql: string, maxResults: number, nextPageToken?: string): Promise<{ jql: string; issues: JiraIssueSummary[]; nextPageToken?: string; isLast?: boolean }> {
+    const response = await client.search({ jql, fields: JIRA_ISSUE_FIELDS, maxResults, nextPageToken });
+    return {
+      jql,
+      issues: response.issues.map((issue) => normalizeJiraIssue(issue, client.normalizedSiteUrl)).filter((issue) => issue.key),
+      nextPageToken: response.nextPageToken,
+      isLast: response.isLast
+    };
   }
 
   private configValues(): Record<string, ConfigValue> {
@@ -356,6 +406,26 @@ function dashboardJql(filterJql: string, sortBy: string): string {
   return `${base} ORDER BY priority DESC, updated DESC`;
 }
 
+function searchJql(inputJql: string | undefined, values: Record<string, ConfigValue>): string {
+  return optionalString(inputJql) ?? dashboardJql(stringConfig(values.dashboardFilterJql) ?? "resolution = EMPTY", "priority_desc_updated_desc");
+}
+
+function searchResponse(siteUrl: string, jql: string, issues: JiraIssueSummary[], nextPageToken: string | undefined, isLast: boolean | undefined): Record<string, unknown> {
+  const hasMore = Boolean(nextPageToken) && isLast !== true;
+  return {
+    issues,
+    issueKeys: issues.map((issue) => issue.key),
+    issueCount: issues.length,
+    firstIssueKey: issues[0]?.key,
+    lastIssueKey: issues.at(-1)?.key,
+    jql,
+    siteUrl,
+    nextPageToken,
+    isLast: !hasMore,
+    hasMore
+  };
+}
+
 function prefixAssignee(filterJql: string): string {
   const filter = filterJql || "resolution = EMPTY";
   if (/\bassignee\s*=\s*currentUser\(\)/i.test(filter)) {
@@ -412,6 +482,14 @@ function stringConfig(value: ConfigValue | undefined): string | undefined {
 
 function numberConfig(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function boundedPositiveInteger(value: unknown, defaultValue: number, maxValue: number): number {
+  const number = numberConfig(value);
+  if (number === undefined) {
+    return defaultValue;
+  }
+  return Math.max(1, Math.min(maxValue, Math.floor(number)));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

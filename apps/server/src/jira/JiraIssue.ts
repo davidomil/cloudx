@@ -210,6 +210,8 @@ export function jiraIssueEventPayload(
     epicKey: issue.epicKey,
     epicId: issue.epicId,
     assigneeAccountId: issue.assignee?.accountId,
+    assigneeEmailAddress: issue.assignee?.emailAddress,
+    assigneeDisplayName: issue.assignee?.displayName,
     reporterAccountId: issue.reporter?.accountId,
     createdAt: issue.created,
     updatedAt: issue.updated,

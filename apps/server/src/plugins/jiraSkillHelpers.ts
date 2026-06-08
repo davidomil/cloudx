@@ -39,6 +39,8 @@ async function main() {
       return printJson(await callHook("jira.dashboard.list", dashboardInput(options)));
     case "search":
       return printJson(await callHook("jira.issues.search", searchInput(args, options)));
+    case "search-all":
+      return printJson(await callHook("jira.issues.searchAll", searchAllInput(args, options)));
     case "view":
       return printJson(await viewIssue(args, options));
     case "comments":
@@ -117,7 +119,16 @@ function searchInput(args, options) {
   const jql = option(options, "jql") || args.join(" ").trim();
   return compactRecord({
     jql: jql || undefined,
-    maxResults: integerOption(option(options, "limit"))
+    maxResults: integerOption(option(options, "limit")),
+    nextPageToken: option(options, "page-token")
+  });
+}
+
+function searchAllInput(args, options) {
+  const input = searchInput(args, options);
+  return compactRecord({
+    ...input,
+    pageSize: integerOption(option(options, "page-size"))
   });
 }
 
@@ -390,7 +401,8 @@ function usage() {
     "Usage:",
     "  cloudx-jira.mjs status|meta|projects|types|fields|priorities|link-types",
     "  cloudx-jira.mjs triage [--limit 25] [--filter JQL] [--group epic|status|priority|project|none]",
-    "  cloudx-jira.mjs search \"project = ENG ORDER BY updated DESC\" [--limit 20]",
+    "  cloudx-jira.mjs search \"project = ENG ORDER BY updated DESC\" [--limit 20] [--page-token TOKEN]",
+    "  cloudx-jira.mjs search-all \"project = ENG\" [--limit 200] [--page-size 100]",
     "  cloudx-jira.mjs view ENG-123 [--comments false] [--transitions false]",
     "  cloudx-jira.mjs create ENG Task \"Summary\" [--description text] [--priority High] [--label a,b] [--field customfield_123=value]",
     "  cloudx-jira.mjs epic ENG \"Summary\" [--description text]",

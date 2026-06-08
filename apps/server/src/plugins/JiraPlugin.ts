@@ -64,11 +64,24 @@ export class JiraPlugin implements WorkspacePlugin {
       readHook("jira.issueLinkTypes.list", "List Jira Issue Link Types", "Return Jira issue link types.", () => this.serviceProvider().issueLinkTypes(), {}, ["automation"]),
       readHook("jira.issues.search", "Search Jira Issues", "Search Jira issues with JQL and return normalized issue summaries.", (input) => this.serviceProvider().search({
         jql: optionalString(input.jql),
-        maxResults: optionalNumber(input.maxResults)
+        maxResults: optionalNumber(input.maxResults),
+        nextPageToken: optionalString(input.nextPageToken)
       }), {
         jql: { type: "string", description: "JQL query to execute." },
-        maxResults: { type: "number", description: "Maximum issues to return.", default: 50 }
-      }, ["automation"]),
+        maxResults: { type: "number", description: "Maximum issues to return for this page.", default: 50 },
+        nextPageToken: { type: "string", description: "Token returned by the previous search page." }
+      }, ["automation"], jiraSearchOutputSchema()),
+      readHook("jira.issues.searchAll", "Search All Jira Issues", "Search Jira issues with JQL and return every page up to a bounded maximum.", (input) => this.serviceProvider().searchAll({
+        jql: optionalString(input.jql),
+        maxResults: optionalNumber(input.maxResults),
+        pageSize: optionalNumber(input.pageSize),
+        nextPageToken: optionalString(input.nextPageToken)
+      }), {
+        jql: { type: "string", description: "JQL query to execute." },
+        maxResults: { type: "number", description: "Maximum total issues to return.", default: 100 },
+        pageSize: { type: "number", description: "Issues requested from Jira per page.", default: 100 },
+        nextPageToken: { type: "string", description: "Optional token to resume a previous bounded scan." }
+      }, ["automation"], jiraSearchOutputSchema()),
       readHook("jira.issue.get", "Get Jira Issue", "Fetch one Jira issue and return a normalized issue summary.", (input) => this.serviceProvider().getIssue(requiredString(input.issueIdOrKey, "issueIdOrKey")), {
         issueIdOrKey: { type: "string" }
       }, ["automation"]),
@@ -240,6 +253,7 @@ function jiraTriggers(): TriggerDefinition[] {
     jiraTrigger("jira.issueUpdated", "Jira Issue Updated", "Emitted when polling sees an issue updated timestamp change."),
     jiraTrigger("jira.issueTransitioned", "Jira Issue Transitioned", "Emitted when polling sees a Jira issue status change."),
     jiraTrigger("jira.issueNewlyAssigned", "Jira Issue Newly Assigned", "Emitted when polling sees a Jira issue assigned to an account."),
+    jiraTrigger("jira.issueAssignedToMe", "Jira Issue Assigned To Me", "Emitted when polling sees a new or newly assigned issue whose assignee matches the configured Jira account."),
     {
       ...jiraTrigger("jira.commentCreated", "Jira Comment Created", "Emitted when polling sees a new Jira issue comment."),
       payloadSchema: {
@@ -302,7 +316,12 @@ function jiraTriggerPayloadProperties(): Record<string, JsonSchemaLike> {
     epicKey: { type: "string" },
     epicId: { type: "string" },
     assigneeAccountId: { type: "string" },
+    assigneeEmailAddress: { type: "string" },
+    assigneeDisplayName: { type: "string" },
+    assigneeMatchedAccountId: { type: "string" },
+    assigneeMatchedEmailAddress: { type: "string" },
     previousAssigneeAccountId: { type: "string" },
+    previousAssigneeEmailAddress: { type: "string" },
     reporterAccountId: { type: "string" },
     actorAccountId: { type: "string" },
     changedFieldIds: { type: "array", items: { type: "string" } },
@@ -313,15 +332,36 @@ function jiraTriggerPayloadProperties(): Record<string, JsonSchemaLike> {
   };
 }
 
+function jiraSearchOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      issues: { type: "array", items: { type: "object", additionalProperties: true }, description: "Normalized Jira issues returned by this search." },
+      issueKeys: { type: "array", items: { type: "string" }, description: "Issue keys from the returned issues." },
+      issueCount: { type: "number", description: "Number of issues returned." },
+      firstIssueKey: { type: "string", description: "First returned issue key when at least one issue matched." },
+      lastIssueKey: { type: "string", description: "Last returned issue key when at least one issue matched." },
+      jql: { type: "string", description: "JQL query executed." },
+      siteUrl: { type: "string", description: "Configured Jira site URL." },
+      nextPageToken: { type: "string", description: "Token to pass to the next Jira issue search page." },
+      isLast: { type: "boolean", description: "True when Jira returned the final page for this search." },
+      hasMore: { type: "boolean", description: "True when another search page is available." }
+    },
+    required: ["issues", "issueKeys", "issueCount", "jql", "siteUrl", "isLast", "hasMore"],
+    additionalProperties: true
+  };
+}
+
 function readHook(
   id: string,
   title: string,
   description: string,
   execute: HookDefinition["execute"],
   properties: Record<string, JsonSchemaLike> = {},
-  extraExposures: HookDefinition["exposures"] = []
+  extraExposures: HookDefinition["exposures"] = [],
+  outputSchema: Record<string, unknown> = { type: "object", additionalProperties: true }
 ): HookDefinition {
-  return hook(id, title, description, execute, properties, "read", extraExposures);
+  return hook(id, title, description, execute, properties, "read", extraExposures, [], outputSchema);
 }
 
 function writeHook(
@@ -344,7 +384,8 @@ function hook(
   properties: Record<string, JsonSchemaLike>,
   safety: AutomationSafety,
   extraExposures: HookDefinition["exposures"],
-  required: string[] = []
+  required: string[] = [],
+  outputSchema: Record<string, unknown> = { type: "object", additionalProperties: true }
 ): HookDefinition {
   return {
     id,
@@ -354,7 +395,7 @@ function hook(
     exposures: uniqueExposures(["plugin", "ui", "http", ...extraExposures]),
     automationSafety: safety,
     inputSchema: { type: "object", properties, required, additionalProperties: false },
-    outputSchema: { type: "object", additionalProperties: true },
+    outputSchema,
     execute
   };
 }
@@ -368,6 +409,10 @@ function jiraSkillContributions(): PluginSkillContribution[] {
     jiraSkill("jira-triage-assigned", "Jira Assigned Triage", "Inspect assigned Jira work before planning.", [
       "Run `node \"$JIRA\" status`, then `node \"$JIRA\" triage --limit 25` or `node \"$JIRA\" search \"assignee = currentUser() AND resolution = EMPTY\" --limit 25`.",
       "Use issue keys and Jira URLs from the helper output in summaries."
+    ]),
+    jiraSkill("jira-search-tickets", "Search Jira Tickets", "Search or page through Jira tickets by JQL from a Codex session.", [
+      "Run `node \"$JIRA\" search \"project = ENG AND resolution = EMPTY ORDER BY updated DESC\" --limit 50` for one page.",
+      "Run `node \"$JIRA\" search-all \"project = ENG AND statusCategory != Done\" --limit 200` for a bounded all-pages scan."
     ]),
     jiraSkill("jira-view-ticket", "View Jira Ticket", "Inspect Jira issues, comments, transitions, and links.", [
       "Run `node \"$JIRA\" view ENG-123` for issue fields, comments, and valid transitions.",

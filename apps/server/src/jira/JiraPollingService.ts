@@ -1,14 +1,15 @@
 import type { TriggerRegistry } from "../triggers/TriggerRegistry.js";
 import type { PluginDataStore } from "../plugins/PluginDataStore.js";
 import { JiraRateLimitError } from "./JiraClient.js";
-import { JIRA_PLUGIN_ID, type JiraIntegrationService } from "./JiraIntegrationService.js";
-import type { JiraCommentSummary, JiraIssueSummary } from "./JiraIssue.js";
+import { JIRA_PLUGIN_ID, type JiraIntegrationService, type JiraPollingAccount } from "./JiraIntegrationService.js";
+import type { JiraCommentSummary, JiraIssueSummary, JiraUserSummary } from "./JiraIssue.js";
 import { jiraCommentEventPayload, jiraIssueEventPayload } from "./JiraIssue.js";
 
 interface StoredIssueSnapshot {
   updated?: string;
   status?: string;
   assigneeAccountId?: string;
+  assigneeEmailAddress?: string;
   commentIds?: string[];
 }
 
@@ -88,7 +89,9 @@ export class JiraPollingService {
     }
     const config = this.integration.pollingConfig();
     let issues: JiraIssueSummary[];
+    let account: JiraPollingAccount | undefined;
     try {
+      account = config.assignmentsEnabled ? await this.integration.pollingAccount() : undefined;
       issues = await this.integration.pollingIssues();
     } catch (error) {
       if (error instanceof JiraRateLimitError) {
@@ -118,6 +121,10 @@ export class JiraPollingService {
       if (!previous) {
         await emitIssueTrigger(triggers, "jira.issueCreated", issue, detectedAt);
         emitted.push("jira.issueCreated");
+        if (config.assignmentsEnabled && isAssignedToPollingAccount(issue.assignee, account)) {
+          await emitIssueTrigger(triggers, "jira.issueAssignedToMe", issue, detectedAt, assignedToMeExtras(account));
+          emitted.push("jira.issueAssignedToMe");
+        }
         continue;
       }
       if (previous.updated !== issue.updated && previous.status === issue.status) {
@@ -131,6 +138,10 @@ export class JiraPollingService {
       if (config.assignmentsEnabled && previous.assigneeAccountId !== issue.assignee?.accountId && issue.assignee?.accountId) {
         await emitIssueTrigger(triggers, "jira.issueNewlyAssigned", issue, detectedAt, { previousAssigneeAccountId: previous.assigneeAccountId });
         emitted.push("jira.issueNewlyAssigned");
+        if (isAssignedToPollingAccount(issue.assignee, account)) {
+          await emitIssueTrigger(triggers, "jira.issueAssignedToMe", issue, detectedAt, assignedToMeExtras(account, previous));
+          emitted.push("jira.issueAssignedToMe");
+        }
       }
       for (const comment of newComments(comments, previous.commentIds ?? [])) {
         await triggers.emit("jira.commentCreated", jiraCommentEventPayload(issue, comment, detectedAt), { kind: "plugin", pluginId: JIRA_PLUGIN_ID });
@@ -168,6 +179,7 @@ function snapshotIssue(issue: JiraIssueSummary, comments: JiraCommentSummary[]):
     updated: issue.updated,
     status: issue.status,
     assigneeAccountId: issue.assignee?.accountId,
+    assigneeEmailAddress: issue.assignee?.emailAddress,
     commentIds: comments.map((comment) => comment.id).filter(Boolean)
   };
 }
@@ -175,6 +187,26 @@ function snapshotIssue(issue: JiraIssueSummary, comments: JiraCommentSummary[]):
 function newComments(comments: JiraCommentSummary[], previousIds: string[]): JiraCommentSummary[] {
   const previous = new Set(previousIds);
   return comments.filter((comment) => comment.id && !previous.has(comment.id));
+}
+
+function isAssignedToPollingAccount(assignee: JiraUserSummary | undefined, account: JiraPollingAccount | undefined): boolean {
+  if (!assignee || !account) {
+    return false;
+  }
+  if (account.accountId && assignee.accountId === account.accountId) {
+    return true;
+  }
+  const expectedEmails = new Set([account.emailAddress, account.configuredEmail].filter((email): email is string => typeof email === "string" && email.trim().length > 0).map((email) => email.toLowerCase()));
+  return Boolean(assignee.emailAddress && expectedEmails.has(assignee.emailAddress.toLowerCase()));
+}
+
+function assignedToMeExtras(account: JiraPollingAccount | undefined, previous?: StoredIssueSnapshot): Record<string, unknown> {
+  return {
+    assigneeMatchedAccountId: account?.accountId,
+    assigneeMatchedEmailAddress: account?.emailAddress ?? account?.configuredEmail,
+    previousAssigneeAccountId: previous?.assigneeAccountId,
+    previousAssigneeEmailAddress: previous?.assigneeEmailAddress
+  };
 }
 
 async function emitIssueTrigger(triggers: TriggerRegistry, triggerId: string, issue: JiraIssueSummary, detectedAt: string, extras: Record<string, unknown> = {}): Promise<void> {
@@ -200,6 +232,7 @@ function sanitizeIssueSnapshot(value: Record<string, unknown>): StoredIssueSnaps
     updated: typeof value.updated === "string" ? value.updated : undefined,
     status: typeof value.status === "string" ? value.status : undefined,
     assigneeAccountId: typeof value.assigneeAccountId === "string" ? value.assigneeAccountId : undefined,
+    assigneeEmailAddress: typeof value.assigneeEmailAddress === "string" ? value.assigneeEmailAddress : undefined,
     commentIds: Array.isArray(value.commentIds) ? value.commentIds.filter((item): item is string => typeof item === "string") : []
   };
 }

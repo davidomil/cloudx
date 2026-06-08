@@ -71,6 +71,70 @@ describe("JiraIntegrationService", () => {
     });
   });
 
+  it("returns automation-friendly issue search pages and bounded all-page searches", async () => {
+    const config = await configuredJiraConfig({});
+    const calls: Array<Record<string, unknown>> = [];
+    const fetchImpl: FetchLike = async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      calls.push(body);
+      if (body.nextPageToken === "token-2") {
+        return jsonResponse({
+          issues: [jiraIssue("ENG-3", "Medium", "ENG-1", "Epic One", "2026-06-08")],
+          isLast: true
+        });
+      }
+      return jsonResponse({
+        issues: [
+          jiraIssue("ENG-1", "High", "ENG-9", "Epic Nine", "2026-06-08"),
+          jiraIssue("ENG-2", "Low", "ENG-9", "Epic Nine", "2026-06-07")
+        ],
+        nextPageToken: "token-2",
+        isLast: false
+      });
+    };
+    const service = new JiraIntegrationService(config, fetchImpl);
+
+    await expect(service.search({ jql: "project = ENG ORDER BY updated DESC", maxResults: 2 })).resolves.toMatchObject({
+      issueKeys: ["ENG-1", "ENG-2"],
+      issueCount: 2,
+      firstIssueKey: "ENG-1",
+      lastIssueKey: "ENG-2",
+      nextPageToken: "token-2",
+      isLast: false,
+      hasMore: true
+    });
+    await expect(service.searchAll({ jql: "project = ENG", maxResults: 3, pageSize: 2 })).resolves.toMatchObject({
+      issueKeys: ["ENG-1", "ENG-2", "ENG-3"],
+      issueCount: 3,
+      isLast: true,
+      hasMore: false
+    });
+    expect(calls).toEqual([
+      expect.objectContaining({ jql: "project = ENG ORDER BY updated DESC", maxResults: 2 }),
+      expect.objectContaining({ jql: "project = ENG", maxResults: 2 }),
+      expect.objectContaining({ jql: "project = ENG", maxResults: 1, nextPageToken: "token-2" })
+    ]);
+  });
+
+  it("bounds all-page issue searches even when Jira returns empty tokenized pages", async () => {
+    const config = await configuredJiraConfig({});
+    const calls: Array<Record<string, unknown>> = [];
+    const fetchImpl: FetchLike = async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      calls.push(body);
+      return jsonResponse({ issues: [], nextPageToken: `token-${calls.length}`, isLast: false });
+    };
+
+    await expect(new JiraIntegrationService(config, fetchImpl).searchAll({ jql: "project = ENG", maxResults: 3, pageSize: 1 })).resolves.toMatchObject({
+      issueKeys: [],
+      issueCount: 0,
+      isLast: false,
+      hasMore: true,
+      nextPageToken: "token-3"
+    });
+    expect(calls).toHaveLength(3);
+  });
+
   it("updates issues, adds comments, transitions issues, links issues, and returns browser URLs", async () => {
     const config = await configuredJiraConfig({});
     const calls: Array<[string, RequestInit | undefined]> = [];

@@ -32,5 +32,6 @@ apps/web/dist-ts/
 .cloudx/
 .understand-anything/
 auth.json
+docs/JIRA_INTEGRATION_IMPLEMENTATION.md
 
 *.egg-info/

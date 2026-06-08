@@ -31,6 +31,7 @@ describe("JiraPlugin", () => {
       "jira.priorities.list",
       "jira.issueLinkTypes.list",
       "jira.issues.search",
+      "jira.issues.searchAll",
       "jira.issue.create",
       "jira.issue.comment.add",
       "jira.issue.transition",
@@ -42,6 +43,7 @@ describe("JiraPlugin", () => {
       "jira.issueUpdated",
       "jira.issueTransitioned",
       "jira.issueNewlyAssigned",
+      "jira.issueAssignedToMe",
       "jira.commentCreated"
     ]);
     expect(descriptor.triggers?.find((trigger) => trigger.id === "jira.issueUpdated")?.payloadSchema).toMatchObject({
@@ -49,15 +51,26 @@ describe("JiraPlugin", () => {
         issueKey: { type: "string" },
         issueUrl: { type: "string" },
         summary: { type: "string" },
+        assigneeEmailAddress: { type: "string" },
         issue: { type: "object", "x-cloudx-connectable": false }
       },
       required: expect.arrayContaining(["eventId", "issueKey", "issueUrl", "summary", "detectedAt"])
+    });
+    expect(descriptor.hooks?.find((hook) => hook.id === "jira.issues.searchAll")?.outputSchema).toMatchObject({
+      properties: {
+        issues: { type: "array" },
+        issueKeys: { type: "array" },
+        issueCount: { type: "number" },
+        hasMore: { type: "boolean" },
+        nextPageToken: { type: "string" }
+      }
     });
     expect(descriptor.uiContributions).toEqual(expect.arrayContaining([
       expect.objectContaining({ slot: "plugin.panel", renderer: "jira.panel", targetPluginId: "jira" })
     ]));
     expect(plugin.skillContributions.map((skill) => skill.id)).toEqual([
       "jira-triage-assigned",
+      "jira-search-tickets",
       "jira-view-ticket",
       "jira-create-ticket",
       "jira-create-epic",
@@ -77,6 +90,8 @@ describe("JiraPlugin", () => {
     expect(plugin.skillContributions.find((skill) => skill.id === "jira-transition-ticket")?.instructions).toContain("--to \"Done\"");
     expect(plugin.skillContributions[0]?.files?.[0]?.content).toContain("case \"transition\"");
     expect(plugin.skillContributions[0]?.files?.[0]?.content).toContain("jira.issue.transition");
+    expect(plugin.skillContributions[0]?.files?.[0]?.content).toContain("case \"search-all\"");
+    expect(plugin.skillContributions[0]?.files?.[0]?.content).toContain("jira.issues.searchAll");
   });
 
   it("marks write hooks as automation-visible with explicit safety", () => {

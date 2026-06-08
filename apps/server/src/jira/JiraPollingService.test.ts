@@ -22,6 +22,7 @@ describe("JiraPollingService", () => {
     const integration = {
       configured: () => true,
       pollingConfig: () => ({ enabled: true, intervalSeconds: 300, jql: "", maxIssues: 10, commentsEnabled: false, assignmentsEnabled: true }),
+      pollingAccount: vi.fn().mockResolvedValue({ accountId: "me", configuredEmail: "me@example.com" }),
       pollingIssues: vi.fn()
         .mockResolvedValueOnce([issue("ENG-1", "Open", "old", "2026-06-08T10:00:00.000+0000"), issue("ENG-3", "Open", "old", "2026-06-08T10:01:00.000+0000")])
         .mockResolvedValueOnce([issue("ENG-1", "Done", "new", "2026-06-08T10:05:00.000+0000"), issue("ENG-2", "Open", "new", "2026-06-08T10:06:00.000+0000"), issue("ENG-3", "Open", "old", "2026-06-08T10:07:00.000+0000")])
@@ -38,6 +39,45 @@ describe("JiraPollingService", () => {
     });
     await expect(polling.runOnce()).resolves.toMatchObject({ initialized: true, emitted: [] });
     expect(events).toEqual(["jira.issueTransitioned", "jira.issueNewlyAssigned", "jira.issueCreated", "jira.issueUpdated"]);
+  });
+
+  it("emits a targeted assigned-to-me trigger for new and newly assigned issues", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-jira-assigned-to-me-"));
+    const payloads: Record<string, unknown>[] = [];
+    const triggers = jiraTriggers((event) => {
+      payloads.push({ triggerId: event.triggerId, ...event.payload });
+    });
+    const integration = {
+      configured: () => true,
+      pollingConfig: () => ({ enabled: true, intervalSeconds: 300, jql: "", maxIssues: 10, commentsEnabled: false, assignmentsEnabled: true }),
+      pollingAccount: vi.fn().mockResolvedValue({ accountId: "me", emailAddress: "david@example.com", configuredEmail: "david@example.com" }),
+      pollingIssues: vi.fn()
+        .mockResolvedValueOnce([issue("ENG-1", "Open", "old", "2026-06-08T10:00:00.000+0000", "old@example.com"), issue("ENG-3", "Open", "old", "2026-06-08T10:01:00.000+0000", "old@example.com")])
+        .mockResolvedValueOnce([issue("ENG-1", "Open", "me", "2026-06-08T10:05:00.000+0000", "david@example.com"), issue("ENG-2", "Open", "me", "2026-06-08T10:06:00.000+0000", "david@example.com"), issue("ENG-3", "Open", "old", "2026-06-08T10:07:00.000+0000", "old@example.com")]),
+      pollingComments: vi.fn()
+    } as unknown as JiraIntegrationService;
+    const polling = new JiraPollingService(integration, new PluginDataStore(dataDir), () => triggers);
+
+    await polling.runOnce();
+    await expect(polling.runOnce()).resolves.toMatchObject({
+      emitted: ["jira.issueUpdated", "jira.issueNewlyAssigned", "jira.issueAssignedToMe", "jira.issueCreated", "jira.issueAssignedToMe", "jira.issueUpdated"]
+    });
+
+    expect(payloads.filter((payload) => payload.triggerId === "jira.issueAssignedToMe")).toEqual([
+      expect.objectContaining({
+        issueKey: "ENG-1",
+        assigneeAccountId: "me",
+        assigneeEmailAddress: "david@example.com",
+        assigneeMatchedEmailAddress: "david@example.com",
+        previousAssigneeAccountId: "old"
+      }),
+      expect.objectContaining({
+        issueKey: "ENG-2",
+        assigneeAccountId: "me",
+        assigneeEmailAddress: "david@example.com",
+        assigneeMatchedEmailAddress: "david@example.com"
+      })
+    ]);
   });
 
   it("detects new comments with scalar trigger payload fields", async () => {
@@ -80,6 +120,7 @@ describe("JiraPollingService", () => {
       pollingConfig: vi.fn()
         .mockReturnValueOnce({ enabled: false, intervalSeconds: 300, jql: "", maxIssues: 10, commentsEnabled: false, assignmentsEnabled: true })
         .mockReturnValue({ enabled: true, intervalSeconds: 300, jql: "", maxIssues: 10, commentsEnabled: false, assignmentsEnabled: true }),
+      pollingAccount: vi.fn().mockResolvedValue({ accountId: "me", configuredEmail: "me@example.com" }),
       pollingIssues: vi.fn()
         .mockResolvedValueOnce([issue("ENG-1", "Open", "old", "2026-06-08T10:00:00.000+0000")])
         .mockRejectedValueOnce(new JiraRateLimitError("Jira rate limit exceeded.", 60, "cost")),
@@ -103,7 +144,7 @@ function jiraTriggers(recordEvent?: TriggerRegistryOptions["recordEvent"]): Trig
   return triggers;
 }
 
-function issue(key: string, status: string, assigneeAccountId: string, updated: string): JiraIssueSummary {
+function issue(key: string, status: string, assigneeAccountId: string, updated: string, assigneeEmailAddress?: string): JiraIssueSummary {
   return {
     id: key,
     key,
@@ -114,7 +155,7 @@ function issue(key: string, status: string, assigneeAccountId: string, updated: 
     isEpic: false,
     status,
     priorityRank: 3,
-    assignee: { accountId: assigneeAccountId, displayName: assigneeAccountId },
+    assignee: { accountId: assigneeAccountId, displayName: assigneeAccountId, emailAddress: assigneeEmailAddress },
     labels: [],
     updated,
     raw: {}
