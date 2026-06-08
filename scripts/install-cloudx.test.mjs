@@ -82,6 +82,7 @@ describe("install-cloudx helpers", () => {
     expect(commands[1]).toContain("pandoc");
     expect(commands[1]).toContain("software-properties-common");
     expect(commands[1]).toContain("texlive-xetex");
+    expect(commands[1]).toContain("jq");
     expect(commands).toContainEqual(["curl", "-fL", "-o", QUARTO_DEB_PATH, QUARTO_DEB_URL]);
     expect(commands).toContainEqual(["sudo", "apt-get", "install", "-y", QUARTO_DEB_PATH]);
     expect(commands).toContainEqual(["sudo", "apt-get", "install", "-y", "nodejs"]);

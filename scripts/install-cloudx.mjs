@@ -46,6 +46,7 @@ export const UBUNTU_APT_PACKAGES = [
   "python3-venv",
   "python3-pip",
   "openssl",
+  "jq",
   "ripgrep"
 ];
 

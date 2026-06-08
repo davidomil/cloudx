@@ -85,10 +85,11 @@ cd cloudx
 ```
 
 It shows each phase before running it. The bootstrap stage installs Ubuntu
-packages, including the PDF, spreadsheet, image, and media keyframe extraction
-tools used by the documentation archive plus the Quarto, Pandoc, and TeX Live
-toolchain used to render the memory-plugin PDF guide. It then installs Node.js
-22 when needed, verifies `node -v` and `npm -v`, and falls back to Ubuntu's
+packages, including jq for JSON helper scripts, the PDF, spreadsheet, image,
+and media keyframe extraction tools used by the documentation archive plus the
+Quarto, Pandoc, and TeX Live toolchain used to render the memory-plugin PDF
+guide. It then installs Node.js 22 when needed, verifies `node -v` and
+`npm -v`, and falls back to Ubuntu's
 `npm` package if npm is still missing. The wizard checks Git 2.36+ for the
 Worktree Manager and, on older Ubuntu Git packages such as 22.04's 2.34.x,
 offers to install the current stable Git package from `ppa:git-core/ppa`.

@@ -114,6 +114,7 @@ run sudo apt-get install -y \
   python3-venv \
   python3-pip \
   openssl \
+  jq \
   ripgrep
 
 step "Install documentation PDF render tools"

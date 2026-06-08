@@ -8,7 +8,7 @@ to run Cloudx with voice control.
 - Node.js 22 or newer.
 - OpenSSL 3.x or newer.
 - Python 3.9 or newer; Python 3.12 is tested locally.
-- ripgrep (`rg`) for file-browser search.
+- ripgrep (`rg`) for file-browser search and jq for JSON helper scripts.
 - Poppler utilities, LibreOffice, and FFmpeg for documentation archive PDF,
   table, image, spreadsheet, and media keyframe extraction. The Ubuntu
   installer installs these.
@@ -31,10 +31,11 @@ For Ubuntu 22.04 or newer, use the installer wizard:
 The installer is split into two visible phases:
 
 1. `install.sh` is the Ubuntu bootstrap. It verifies Ubuntu, installs apt
-   packages required by Cloudx, including `poppler-utils`, `libreoffice`, and
-   `ffmpeg` for documentation extraction plus `pandoc`, TeX Live
-   XeLaTeX/LuaLaTeX packages, and the pinned official Quarto `.deb` for rendering the memory-plugin PDF
-   guide. It checks for Node.js 22 and npm, and installs the NodeSource Node.js
+   packages required by Cloudx, including `jq` for JSON helper scripts,
+   `poppler-utils`, `libreoffice`, and `ffmpeg` for documentation extraction
+   plus `pandoc`, TeX Live XeLaTeX/LuaLaTeX packages, and the pinned official
+   Quarto `.deb` for rendering the memory-plugin PDF guide. It checks for
+   Node.js 22 and npm, and installs the NodeSource Node.js
    22 package when Node.js is too old or missing. It then verifies `node -v` and
    `npm -v`, and installs Ubuntu's separate `npm` package if the `npm` command
    is missing. It checks for Git 2.36+ because the Worktree Manager uses
@@ -204,7 +205,7 @@ Manual setup remains available:
 
 ```bash
 npm install
-sudo apt install ripgrep poppler-utils libreoffice ffmpeg pandoc \
+sudo apt install ripgrep jq poppler-utils libreoffice ffmpeg pandoc \
   texlive-xetex texlive-latex-recommended texlive-latex-extra \
   texlive-fonts-recommended lmodern
 curl -fL -o /tmp/quarto-1.9.38-linux-amd64.deb \
