@@ -43,7 +43,7 @@ The installer is split into two visible phases:
 2. `scripts/install-cloudx.mjs` is the Cloudx wizard. It prints each phase as it
    runs: Codex CLI verification/login, install choices, `npm ci`, ASR virtualenv
    setup, documentation-indexer virtualenv setup with table-aware extraction
-   dependencies, optional `whisper.cpp` ASR setup, Hugging Face
+   dependencies, optional alternate `whisper.cpp` ASR setup, Hugging Face
    model download, `npm run build`, certificate creation,
    `~/.config/cloudx/cloudx.env` rendering, and optional user-level systemd
    service installation. When services are started, the wizard waits for
@@ -59,9 +59,10 @@ The wizard asks for:
 - HTTPS port, localhost versus trusted LAN/tailnet bind, and optional extra
   certificate hostnames.
 - ASR CPU thread count.
-- Optional `whisper.cpp` ASR setup for documentation imports and voice control.
-  Choose `sycl` only after the Intel GPU runtime, oneAPI, and device access are
-  available.
+- Optional alternate `whisper.cpp` ASR setup for documentation imports and
+  voice control. Leave it disabled for CPU-only and NVIDIA CUDA installs because
+  Faster Whisper already covers those paths. Choose `sycl` only after the Intel
+  GPU runtime, oneAPI, and device access are available.
 - Whether to write/start `cloudx.service`, `cloudx-asr.service`, and
   `cloudx-documentation.service`.
 - Whether to enable systemd linger so user services can survive logout.
@@ -124,6 +125,10 @@ The answers JSON can contain:
   "runCodexLogin": true
 }
 ```
+
+Keep `"installWhisperCpp": false` for normal CPU-only or NVIDIA CUDA installs.
+Enable it only when you want the alternate compiled backend, such as the Intel
+Arc SYCL path.
 
 Faster-whisper GPU support is installed by the Ubuntu installer when
 `nvidia-smi` reports an NVIDIA GPU with a CUDA 12-compatible driver. Linux
@@ -352,15 +357,18 @@ services/asr/.venv/bin/uvicorn cloudx_asr.main:app --app-dir services/asr/src --
 
 ## ASR Backends
 
-YouTube documentation ingest uses faster-whisper by default:
+YouTube documentation ingest uses Faster Whisper by default. This is the normal
+CPU-only and NVIDIA CUDA path:
 
 ```bash
 CLOUDX_DOCUMENTATION_ASR_BACKEND=faster-whisper
 ```
 
-Direct faster-whisper GPU acceleration requires NVIDIA CUDA. Intel Arc GPUs do
-not use the faster-whisper CUDA path. For Intel Arc, install the optional
-`whisper.cpp` backend after oneAPI and GPU device access are available:
+Direct Faster Whisper GPU acceleration requires NVIDIA CUDA. Intel Arc GPUs do
+not use the Faster Whisper CUDA path. `whisper.cpp` is not required for CPU-only
+or NVIDIA CUDA installs; install it only when you want the alternate compiled
+backend, primarily Intel Arc SYCL after oneAPI and GPU device access are
+available:
 
 ```bash
 node scripts/install-cloudx.mjs --answers ./answers.json

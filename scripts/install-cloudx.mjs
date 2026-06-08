@@ -650,7 +650,7 @@ export async function runInstaller(options = {}) {
     console.log("System CUDA/cuDNN libraries were not detected; if CUDA ASR is selected, the installer will add the required Python NVIDIA runtime libraries.");
   }
   if (intelGpuDetected) {
-    console.log("Intel GPU detected; optional whisper.cpp SYCL documentation ASR can be installed.");
+    console.log("Intel GPU detected; optional whisper.cpp SYCL ASR can be installed for Intel GPU acceleration. CPU-only and NVIDIA installs do not need whisper.cpp.");
   }
 
   section("2/10 Verify Codex CLI");
@@ -688,8 +688,8 @@ export async function runInstaller(options = {}) {
   if (device.device === "cuda") {
     console.log(`faster-whisper ASR will use CUDA with ${device.computeType}.`);
   }
-  explainQuestion("Optional whisper.cpp ASR", "Installs a compiled CLI backend for documentation YouTube transcription and voice-control ASR. Choose SYCL for Intel Arc after oneAPI and GPU device access are available.");
-  const installWhisperCpp = await prompt.boolean("installWhisperCpp", "Install optional whisper.cpp ASR backend?", false);
+  explainQuestion("Optional whisper.cpp ASR", "Faster Whisper is the default ASR backend and covers CPU-only and NVIDIA CUDA installs. Install whisper.cpp only when you explicitly want the alternate compiled backend, mainly SYCL for Intel Arc after oneAPI and GPU device access are available.");
+  const installWhisperCpp = await prompt.boolean("installWhisperCpp", "Install optional whisper.cpp alternate ASR backend?", false);
   const whisperCpp = installWhisperCpp
     ? {
         build: normalizeWhisperCppBuild(await prompt.text("whisperCppBuild", "whisper.cpp build backend (cpu or sycl)", intelGpuDetected ? "sycl" : "cpu")),
@@ -730,11 +730,11 @@ export async function runInstaller(options = {}) {
   if (device.device === "cuda") {
     setupFasterWhisperCuda(commands, paths);
   }
-  section("7/10 Prepare optional whisper.cpp documentation ASR backend");
+  section("7/10 Prepare optional whisper.cpp alternate ASR backend");
   if (whisperCpp) {
     setupWhisperCpp(commands, paths, whisperCpp);
   } else {
-    console.log("Skipping optional whisper.cpp documentation ASR backend.");
+    console.log("Skipping optional whisper.cpp backend; Faster Whisper remains active.");
   }
   section("8/10 Build Cloudx and create HTTPS certificate");
   commands.run("npm", ["run", "build"]);
@@ -909,7 +909,7 @@ async function runUpdater({ paths, commands, runner, prompt, noStart, networkInt
     setupFasterWhisperCuda(commands, paths);
   }
 
-  section("7/10 Update optional whisper.cpp documentation ASR backend");
+  section("7/10 Update optional whisper.cpp alternate ASR backend");
   if (envConfig.CLOUDX_DOCUMENTATION_ASR_BACKEND === "whisper-cpp") {
     setupWhisperCpp(commands, paths, {
       build: envConfig.CLOUDX_DOCUMENTATION_WHISPER_CPP_BUILD ?? "cpu",
@@ -917,7 +917,7 @@ async function runUpdater({ paths, commands, runner, prompt, noStart, networkInt
       threads: Number.parseInt(envConfig.CLOUDX_DOCUMENTATION_WHISPER_CPP_THREADS ?? envConfig.CLOUDX_ASR_CPU_THREADS ?? String(defaultCpuThreads()), 10)
     });
   } else {
-    console.log("No whisper.cpp documentation ASR backend configured; skipping.");
+    console.log("No whisper.cpp alternate ASR backend configured; Faster Whisper remains active.");
   }
 
   section("8/10 Rebuild Cloudx and refresh HTTPS certificate if missing");

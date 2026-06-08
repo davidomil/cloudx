@@ -99,10 +99,12 @@ optionally installs user-level services for Cloudx, ASR, and the documentation
 indexer. On NVIDIA systems, the wizard reads `nvidia-smi`; Linux driver
 525.60.13 or newer selects CUDA ASR, installs the required Python cuBLAS/cuDNN
 runtime wheels, and uses `int8_float16` on smaller GPUs such as 4GB cards. Each
-question includes a short explanation of what the choice changes, and the
-installer prints the local Cloudx URL when it finishes. Choose the LAN bind
-prompt, or pass `--lan`, only when you want Cloudx to bind to `0.0.0.0` for a
-trusted LAN or tailnet.
+question includes a short explanation of what the choice changes. The optional
+`whisper.cpp` step is not needed for CPU-only or NVIDIA CUDA installs because
+Faster Whisper handles those paths; use it only for an alternate compiled
+backend such as Intel Arc SYCL. The installer prints the local Cloudx URL when
+it finishes. Choose the LAN bind prompt, or pass `--lan`, only when you want
+Cloudx to bind to `0.0.0.0` for a trusted LAN or tailnet.
 
 Preview the installer without changing the system:
 
