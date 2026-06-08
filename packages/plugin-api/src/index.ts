@@ -136,8 +136,15 @@ export interface PluginSession {
   onStatusChange?(listener: (status: WorkspaceTab["status"], message?: string) => void): () => void;
 }
 
+export interface PluginSkillContributionFile {
+  path: string;
+  content: string;
+  executable?: boolean;
+}
+
 export type PluginSkillContribution = Omit<CloudxSkill, "scope"> & {
   scope?: "system";
+  files?: PluginSkillContributionFile[];
 };
 
 export type PluginRuleContribution = Omit<CloudxRule, "scope"> & {

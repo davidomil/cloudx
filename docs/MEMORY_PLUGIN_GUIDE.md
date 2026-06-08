@@ -541,17 +541,22 @@ server startup:
 | `documentation-enrich-media` | Improve media imports using transcripts and selected keyframes when available. |
 | `documentation-archive-control` | Inspect health, stats, portable manifest, and rebuild status. |
 
-Each skill tells Codex to read `CLOUDX_DOCUMENTATION_URL` first. The
-search skill explicitly tells Codex to call `/search` and
-`/documents/{documentId}` directly instead of routing through
-`documentation.answer`, because Codex can inspect the retrieved sources
-itself. It also instructs Codex to prefer active local archive evidence,
-use built-in web search only when local evidence is absent or
-insufficient, prefer official, vendor, spec, peer-reviewed, government,
-or reputable-news sources depending on the domain, ingest useful online
-sources back into the archive, and rerun local search before answering.
-When Codex tabs are launched from CloudX, the server exports that URL to
-child processes.
+The operational skills tell Codex to read `CLOUDX_DOCUMENTATION_URL` first and
+prefer the bundled helper over raw endpoint calls. The search skill still routes
+Codex away from `documentation.answer`, because Codex should inspect retrieved
+sources itself. It also instructs Codex to prefer active local archive evidence,
+use built-in web search only when local evidence is absent or insufficient,
+prefer official, vendor, spec, peer-reviewed, government, or reputable-news
+sources depending on the domain, ingest useful online sources back into the
+archive, and rerun local search before answering. When Codex tabs are launched
+from CloudX, the server exports that URL to child processes.
+
+The operational documentation skills also bundle `scripts/cloudx-doc.mjs`, a
+small helper that wraps search, open, list, ingest-url, ingest-path,
+ingest-text, invalidate, remove, health, stats, manifest, and rebuild calls so
+Codex can use short commands instead of handwritten curl/JSON/NDJSON requests.
+The enrichment skills stay instruction-only because they define model output
+behavior rather than endpoint operation.
 
 The injection path is generic. Plugins expose `ruleContributions` and
 `skillContributions`, `syncPluginContributions` writes them into the
@@ -560,10 +565,11 @@ home overlay materializes all system rules into `AGENTS.override.md`
 plus all system skills under `skills/cloudx-system/`. A future plugin
 should follow the same pattern: use IDs prefixed with the plugin ID,
 provide a single-line rule text or complete `SKILL.md` body through the
-contribution, and let the catalog and overlay handle availability for
-every Codex tab. Documentation enrichment deliberately uses this same
-catalog lookup; adding another plugin-owned enrichment pipeline should
-mean adding plugin skills and a service that reads configured skill ids,
+contribution, add bundled helper files when they reduce repeated tool
+boilerplate, and let the catalog and overlay handle availability for every
+Codex tab. Documentation enrichment deliberately uses this same catalog lookup;
+adding another plugin-owned enrichment pipeline should mean adding plugin
+skills, optional helper files, and a service that reads configured skill ids,
 not adding hardcoded extraction instructions.
 
 # Setup And Operations

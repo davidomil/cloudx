@@ -207,16 +207,34 @@ describe("DocumentationPlugin", () => {
       "documentation-archive-control"
     ]);
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("CLOUDX_DOCUMENTATION_URL");
+    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("node \"$DOC\" search");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("instead of `documentation.answer`");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("Before answering any factual, research, recipe, recommendation, troubleshooting, summary, or source-grounded question");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("If active local results are absent, weak, stale, or do not cover the user's question, use built-in web search");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("After ingesting web sources, rerun local archive search");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("ingest the original file, PDF, image, URL, YouTube video, or playlist");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-ingest")?.instructions).toContain("Always ingest PDFs, images, documents, YouTube videos, and YouTube playlists as original sources");
+    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-ingest")?.instructions).toContain("node \"$DOC\" ingest-url");
+    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-ingest")?.files).toContainEqual(expect.objectContaining({
+      path: "scripts/cloudx-doc.mjs",
+      executable: true,
+      content: expect.stringContaining("ingest-url")
+    }));
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-ingest")?.instructions).toContain("prefer durable primary URLs");
+    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-invalidate")?.instructions).toContain("node \"$DOC\" invalidate");
+    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-invalidate")?.files).toContainEqual(expect.objectContaining({
+      path: "scripts/cloudx-doc.mjs",
+      content: expect.stringContaining("invalidate")
+    }));
     expect(plugin.skillContributions.some((skill) => skill.id === "documentation-answer")).toBe(false);
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-enrich-visuals")?.instructions).toContain("ai:visual");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-enrich-visuals")?.instructions).toContain("one concise visual span per meaningful frame");
+    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-enrich-visuals")?.instructions).not.toContain("curl -sS");
+    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-archive-control")?.instructions).toContain("node \"$DOC\" manifest");
+    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-archive-control")?.files).toContainEqual(expect.objectContaining({
+      path: "scripts/cloudx-doc.mjs",
+      content: expect.stringContaining("rebuild")
+    }));
   });
 
   function fakeClient(): DocumentationClient {

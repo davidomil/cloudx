@@ -17,6 +17,7 @@ import {
   type DocumentationEnrichmentService
 } from "../documentation/DocumentationEnrichmentService.js";
 import type { PathPolicy } from "../pathPolicy.js";
+import { DOCUMENTATION_HELPER_FILES, DOCUMENTATION_HELPER_SCRIPT_PATH } from "./documentationSkillHelpers.js";
 
 export class DocumentationPlugin implements WorkspacePlugin {
   readonly id = DOCUMENTATION_PLUGIN_ID;
@@ -397,16 +398,18 @@ function defaultDocumentationSkills(): PluginSkillContribution[] {
       description: "Mandatory local-first lookup for factual, research, recipe, troubleshooting, and source-grounded answer tasks; enrich the archive from reliable online sources when local evidence is missing.",
       instructions: skillInstructions("Search", [
         "Read `CLOUDX_DOCUMENTATION_URL`. If it is missing, stop and explain that the documentation indexer URL is not available.",
+        `Use the bundled helper to keep commands short: \`DOC="$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-search/${DOCUMENTATION_HELPER_SCRIPT_PATH}"\`; then run \`node "$DOC" search "query"\`, \`node "$DOC" open DOCUMENT_ID\`, or \`node "$DOC" ingest-url URL\`.`,
         "Before answering any factual, research, recipe, recommendation, troubleshooting, summary, or source-grounded question, run local archive search first even when the question looks general or answerable from memory.",
-        "Call `POST $CLOUDX_DOCUMENTATION_URL/search` with JSON containing `query`, `mode: \"hybrid\"`, optional `limit`, and optional filters. Use the user's exact topic as the first query, then broaden or narrow only after seeing local results.",
+        "Use the user's exact topic as the first helper search query, then broaden or narrow only after seeing local results.",
         "When Codex is answering the user, use this direct search path instead of `documentation.answer`; Codex should inspect sources itself rather than chaining through another AI answer pass.",
-        "Open the strongest matching documents with `GET $CLOUDX_DOCUMENTATION_URL/documents/{documentId}` and read relevant chunks, transcripts, tables, descriptions, and artifact metadata before answering.",
+        "Open the strongest matching documents with the helper and read relevant chunks, transcripts, tables, descriptions, and artifact metadata before answering.",
         "Use only results whose `state` is `active` unless the user explicitly asks for stale, revoked, deleted, or audit history.",
         "If active local results are absent, weak, stale, or do not cover the user's question, use built-in web search before answering. Prefer official product/project documentation, vendor datasheets, standards/specs, peer-reviewed or government/institutional sources for high-stakes domains, and reputable news sources for current events. Avoid forum or blog claims unless they are explicitly requested or corroborated by stronger sources.",
         "When adding evidence, ingest the original file, PDF, image, URL, YouTube video, or playlist through the ingest skill so the full extractor can capture text, tables, figures, screenshots, transcripts, and keyframes; use `/ingest/text` only when no original source is available. Preserve title, URI, source type, and collection metadata.",
         "After ingesting web sources, rerun local archive search and answer from the local documentation records. If no reliable source can be ingested, say so and answer only with the evidence that was actually inspected.",
         "When writing, carry forward each result's title, source type, locator, URI, and content SHA."
-      ])
+      ]),
+      files: DOCUMENTATION_HELPER_FILES
     },
     {
       id: "documentation-ingest",
@@ -414,15 +417,17 @@ function defaultDocumentationSkills(): PluginSkillContribution[] {
       description: "Add uploaded files, local files, directories, websites, YouTube videos/playlists, copied text, or transcripts to the documentation archive.",
       instructions: skillInstructions("Ingest", [
         "Read `CLOUDX_SERVER_URL` and `CLOUDX_DOCUMENTATION_URL`. If both are missing, stop and explain that no documentation ingest endpoint is available.",
-        "For Codex or automation ingest, prefer the CloudX server streaming hook when `CLOUDX_SERVER_URL` is set: call `POST $CLOUDX_SERVER_URL/api/hooks/documentation.ingest.url?stream=1`, `documentation.ingest.path?stream=1`, or `documentation.ingest.text?stream=1` with JSON `{ \"input\": ... }`; read NDJSON `progress` events until the final `result` or `error` event so the blocking call stays visibly alive and the plugin UI shows the queued job.",
-        "Use `documentation.ingest.path` for local files or directories visible to the server, `documentation.ingest.url` for websites, URLs, YouTube videos, and YouTube playlists, and `documentation.ingest.text` only for copied text that has no retrievable original source. Use direct `$CLOUDX_DOCUMENTATION_URL/ingest/*` endpoints only when `CLOUDX_SERVER_URL` is unavailable; direct indexer calls bypass the CloudX queue and streamed progress.",
+        `Use the bundled helper to keep commands short: \`DOC="$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-ingest/${DOCUMENTATION_HELPER_SCRIPT_PATH}"\`; then run \`node "$DOC" ingest-url URL\`, \`node "$DOC" ingest-path PATH\`, \`node "$DOC" ingest-text "text"\`, \`node "$DOC" search "query"\`, or \`node "$DOC" open DOCUMENT_ID\`.`,
+        "Use `ingest-path` for local files or directories visible to the server, `ingest-url` for websites, URLs, YouTube videos, and YouTube playlists, and `ingest-text` only for copied text that has no retrievable original source.",
+        "The helper uses the CloudX streaming hook when `CLOUDX_SERVER_URL` is set, so keep the command running until progress ends with a final result or error.",
         "Always ingest PDFs, images, documents, YouTube videos, and YouTube playlists as original sources, not pasted excerpts or transcripts, so the extractor can preserve pages, tables, figures, screenshots, visual keyframes, timestamps, and source artifacts.",
         "Set `sourceType` to one of `datasheet`, `book`, `website`, `repo_code`, `readme`, `media`, `image`, or `text` when the user gives enough context.",
         "Leave `title` and `collection` blank when the indexer should autodetect them from the file, folder, URL, playlist, upload, or first text line.",
         "When ingesting sources found online, prefer durable primary URLs and include the original source URL. Do not ingest search-result pages, low-trust mirrors, or unsupported summaries when a better source is available.",
         "When AI enrichment is disabled, only source text and extracted artifact metadata are immediately searchable. Do manual follow-up by searching, opening full documents, reading transcript chunks or table artifacts, and writing source-grounded notes yourself.",
         "Do not ingest outdated or untrusted material silently. Preserve precise source URI metadata whenever the user provides it."
-      ])
+      ]),
+      files: DOCUMENTATION_HELPER_FILES
     },
     {
       id: "documentation-invalidate",
@@ -430,10 +435,12 @@ function defaultDocumentationSkills(): PluginSkillContribution[] {
       description: "Invalidate outdated or wrong documentation in the local archive.",
       instructions: skillInstructions("Invalidate", [
         "Read `CLOUDX_DOCUMENTATION_URL`. If it is missing, stop and explain that the documentation indexer URL is not available.",
-        "Find the target document with `/search` or `/documents` before invalidating it.",
-        "Call `/invalidate` with `documentId`, `state`, and a concrete `reason`.",
+        `Use the bundled helper to keep commands short: \`DOC="$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-invalidate/${DOCUMENTATION_HELPER_SCRIPT_PATH}"\`; then run \`node "$DOC" search "query"\`, \`node "$DOC" open DOCUMENT_ID\`, or \`node "$DOC" invalidate DOCUMENT_ID stale --reason "reason"\`.`,
+        "Find and open the target document before invalidating it.",
+        "Invalidate with a concrete reason.",
         "Use `stale` for outdated sources, `revoked` for wrong sources, `superseded` for replaced revisions, `quarantined` for trust or extraction concerns, and `deleted` for removal."
-      ])
+      ]),
+      files: DOCUMENTATION_HELPER_FILES
     },
     {
       id: "documentation-enrich-metadata",
@@ -476,10 +483,12 @@ function defaultDocumentationSkills(): PluginSkillContribution[] {
       description: "Inspect portable archive health, backup manifest, and index rebuild status.",
       instructions: skillInstructions("Archive Control", [
         "Read `CLOUDX_DOCUMENTATION_URL`. If it is missing, stop and explain that the documentation indexer URL is not available.",
-        "Use `/health`, `/stats`, and `/portable-manifest` to inspect archive state before advising backup or restore work.",
+        `Use the bundled helper to keep commands short: \`DOC="$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-archive-control/${DOCUMENTATION_HELPER_SCRIPT_PATH}"\`; then run \`node "$DOC" health\`, \`node "$DOC" stats\`, \`node "$DOC" manifest\`, \`node "$DOC" list\`, or \`node "$DOC" rebuild\`.`,
+        "Use health, stats, and manifest output to inspect archive state before advising backup or restore work.",
         "The portable archive is the complete directory reported by `/health.archiveRoot`; back it up as a directory after stopping writes.",
-        "Use `/rebuild-index` after restoring an archive or changing active documentation state."
-      ])
+        "Run rebuild after restoring an archive or changing active documentation state."
+      ]),
+      files: DOCUMENTATION_HELPER_FILES
     }
   ];
 }
@@ -502,10 +511,6 @@ function skillInstructions(title: string, steps: string[]): string {
     "",
     "## Procedure",
     "",
-    ...steps.map((step, index) => `${index + 1}. ${step}`),
-    "",
-    "## Request Pattern",
-    "",
-    "Use `curl -sS` with `-H 'content-type: application/json'` for JSON POST endpoints. For streaming CloudX server hook calls, use `curl -k -N -sS -H 'content-type: application/json' -H 'accept: application/x-ndjson'`. For direct fallback `/ingest/upload` calls, use multipart form fields such as `curl -sS -F file=@source.pdf -F sourceType=datasheet \"$CLOUDX_DOCUMENTATION_URL/ingest/upload\"`. Keep JSON compact and quote user text safely."
+    ...steps.map((step, index) => `${index + 1}. ${step}`)
   ].join("\n");
 }

@@ -84,6 +84,43 @@ describe("RulesSkillsCatalogService", () => {
     await expect(service.saveSkill({ id: "documentation-search", name: "User Shadow", description: "Shadow system skill." })).rejects.toThrow("system skill already exists");
   });
 
+  it("stores plugin-contributed system skill helper files", async () => {
+    const service = await createService();
+
+    await service.saveSystemSkill({
+      id: "documentation-ingest",
+      name: "Documentation Ingest",
+      description: "Ingest documentation.",
+      instructions: "Use the helper script.",
+      files: [
+        { path: "scripts/cloudx-doc.mjs", content: "#!/usr/bin/env node\nconsole.log('first');\n", executable: true }
+      ]
+    });
+
+    const helperPath = path.join(service.catalogRoot(), "system-skills", "documentation-ingest", "scripts", "cloudx-doc.mjs");
+    await expect(fs.readFile(helperPath, "utf8")).resolves.toContain("first");
+    expect((await fs.stat(helperPath)).mode & 0o111).not.toBe(0);
+
+    await service.saveSystemSkill({
+      id: "documentation-ingest",
+      name: "Documentation Ingest",
+      description: "Ingest documentation.",
+      instructions: "Use the replacement helper script.",
+      files: [
+        { path: "scripts/new-doc.mjs", content: "console.log('second');\n" }
+      ]
+    });
+
+    await expect(fs.stat(helperPath)).rejects.toThrow();
+    await expect(fs.readFile(path.join(service.catalogRoot(), "system-skills", "documentation-ingest", "scripts", "new-doc.mjs"), "utf8")).resolves.toContain("second");
+    await expect(service.saveSystemSkill({
+      id: "documentation-search",
+      name: "Documentation Search",
+      description: "Search documentation.",
+      files: [{ path: "../escape.mjs", content: "" }]
+    })).rejects.toThrow("skill file path must be a safe relative path");
+  });
+
   it("stores plugin-contributed system rules separately from user rules", async () => {
     const service = await createService();
 

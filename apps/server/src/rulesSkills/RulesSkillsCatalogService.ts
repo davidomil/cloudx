@@ -17,6 +17,7 @@ import {
   type WorkspaceWindow,
   type PersonalityTemplate
 } from "@cloudx/shared";
+import type { PluginSkillContributionFile } from "@cloudx/plugin-api";
 
 import { isSameOrChildPath } from "../pathBoundary.js";
 
@@ -263,11 +264,12 @@ export class RulesSkillsCatalogService {
   async saveSystemSkill(input: Record<string, unknown>): Promise<RulesSkillsStore> {
     return this.withCatalogMutation(async () => {
       const skill = { ...normalizeSkill({ ...input, scope: "system" }), scope: "system" as const };
+      const files = normalizeSkillContributionFiles(input.files);
       await this.ensureSeeded();
       if (await pathExists(this.skillPath(skill.id))) {
         throw new Error(`CloudX user skill already exists with the same id: ${skill.id}`);
       }
-      await writeSystemSkillFileAtomic(this.systemSkillPath(skill.id), skill, this.rootPath);
+      await writeSystemSkillDirectoryAtomic(this.systemSkillPath(skill.id), skill, files, this.rootPath);
       this.emitChange();
       return this.readStore();
     });
@@ -644,19 +646,41 @@ async function writeSkillFile(skillDir: string, skill: CloudxSkill, catalogRoot:
   await writeUtf8FileIfChanged(path.join(skillDir, "SKILL.md"), formatSkill(skill), catalogRoot);
 }
 
-async function writeSystemSkillFileAtomic(skillDir: string, skill: CloudxSkill, catalogRoot: string): Promise<void> {
-  if (await pathExists(skillDir)) {
-    await writeSkillFile(skillDir, skill, catalogRoot);
-    return;
-  }
+async function writeSystemSkillDirectoryAtomic(skillDir: string, skill: CloudxSkill, files: PluginSkillContributionFile[], catalogRoot: string): Promise<void> {
   const stagingDir = path.join(catalogRoot, ".system-skill-staging", `${skill.id}.${process.pid}.${randomUUID()}`);
+  const backupDir = path.join(catalogRoot, ".system-skill-staging", `${skill.id}.previous.${process.pid}.${randomUUID()}`);
   try {
     await writeSkillFile(stagingDir, skill, catalogRoot);
+    await writeSkillContributionFiles(stagingDir, files, catalogRoot);
     await ensureCatalogDirectory(path.dirname(skillDir), catalogRoot);
-    await fsp.rename(stagingDir, skillDir);
+    if (await pathExists(skillDir)) {
+      await fsp.rename(skillDir, backupDir);
+      try {
+        await fsp.rename(stagingDir, skillDir);
+      } catch (error) {
+        await fsp.rm(skillDir, { recursive: true, force: true }).catch(() => undefined);
+        await fsp.rename(backupDir, skillDir).catch(() => undefined);
+        throw error;
+      }
+      await fsp.rm(backupDir, { recursive: true, force: true }).catch(() => undefined);
+    } else {
+      await fsp.rename(stagingDir, skillDir);
+    }
   } catch (error) {
     await fsp.rm(stagingDir, { recursive: true, force: true });
+    await fsp.rm(backupDir, { recursive: true, force: true });
     throw error;
+  }
+}
+
+async function writeSkillContributionFiles(skillDir: string, files: PluginSkillContributionFile[], catalogRoot: string): Promise<void> {
+  for (const file of files) {
+    const targetPath = path.join(skillDir, file.path);
+    await ensureCatalogDirectory(path.dirname(targetPath), catalogRoot);
+    await writeUtf8FileAtomic(targetPath, file.content, catalogRoot);
+    if (file.executable) {
+      await fsp.chmod(targetPath, 0o755);
+    }
   }
 }
 
@@ -872,6 +896,41 @@ function normalizeSkill(value: unknown): CloudxSkill {
     instructions: typeof source.instructions === "string" ? source.instructions : undefined,
     scope: source.scope === "system" ? "system" : "user"
   };
+}
+
+function normalizeSkillContributionFiles(value: unknown): PluginSkillContributionFile[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((item, index) => {
+    if (!isRecord(item)) {
+      throw new Error(`skill file ${index + 1} must be an object.`);
+    }
+    const filePath = normalizeSkillContributionFilePath(item.path, index);
+    if (typeof item.content !== "string") {
+      throw new Error(`skill file ${filePath} content must be a string.`);
+    }
+    return {
+      path: filePath,
+      content: item.content,
+      executable: item.executable === true
+    };
+  });
+}
+
+function normalizeSkillContributionFilePath(value: unknown, index: number): string {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error(`skill file ${index + 1} path must be a non-empty string.`);
+  }
+  const filePath = value.trim();
+  if (path.isAbsolute(filePath) || filePath.includes("\\") || filePath.split("/").some((segment) => segment === "" || segment === "." || segment === "..")) {
+    throw new Error(`skill file path must be a safe relative path: ${filePath}`);
+  }
+  const normalized = path.posix.normalize(filePath);
+  if (normalized === "SKILL.md" || normalized === "skill.json") {
+    throw new Error(`skill file path is reserved: ${filePath}`);
+  }
+  return normalized;
 }
 
 function resolveSourceSkill(input: MigrateCloudxSkillInput): { id: string; skillFile: string; skillDir?: string } {
