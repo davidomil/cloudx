@@ -142,7 +142,7 @@ the configured upload cap and forwards the bytes to the indexer’s
 multipart `POST /ingest/upload` route.
 
 Upload ingest stores the original filename and content type in snapshot
-metadata, infers a source type when the UI is left on `auto`,
+metadata, infers a source type from the filename and content type,
 autodetects the title from the filename when the title field is blank,
 assigns the default `uploads` collection when collection is blank, and
 records a stable `upload://<safe-name>` URI. This path is the preferred
@@ -153,10 +153,10 @@ visible as a local path to the indexer process.
 When AI enrichment is enabled, browser upload is also the path that can
 pass media bytes to the enrichment service. Uploaded audio/video can be
 transcribed through the existing Faster Whisper ASR service, and
-uploaded video is converted into a scene-selected keyframe manifest
-with FFmpeg before Codex is asked to improve the import. Long media
-files can still produce large keyframe manifests, so the enrichment
-service batches the manifest instead of silently capping it.
+uploaded video is converted into a scene-selected keyframe manifest with
+FFmpeg before Codex is asked to improve the import. Long media files can
+still produce large keyframe manifests, so the enrichment service
+batches the manifest instead of silently capping it.
 
 ## Local Path Ingest
 
@@ -173,10 +173,10 @@ AsciiDoc, LaTeX, and images (`.png`, `.jpg`, `.jpeg`, `.gif`, `.tif`,
 
 The supported source-type labels are `datasheet`, `book`, `website`,
 `repo_code`, `readme`, `media`, `image`, and `text`. Source type
-describes the source for filtering and skill behavior; extraction is
-selected from the actual file suffix, content type, and file signature.
-That means setting `sourceType` to `datasheet` no longer forces a
-Markdown, text, or image file through the PDF extractor.
+describes the source for hook/API filters and skill behavior; extraction
+is selected from the actual file suffix, content type, and file
+signature. That means setting `sourceType` to `datasheet` no longer
+forces a Markdown, text, or image file through the PDF extractor.
 
 When title is blank, path ingest uses the file name. When collection is
 blank, directory ingest uses the directory name for every file under
@@ -213,20 +213,20 @@ parallel, and deterministic image-difference checks preserve one
 selected JPEG frame per detected slide or visual state under the source
 snapshot’s `extracted/media/keyframes/` directory. After ASR and visual
 scan both finish, selected frames are aligned to transcript timestamps.
-The keyframe index, timestamped transcript segment index, visual sampling
-manifest, YouTube metadata JSON, optional `description.txt`, description
-chunks, transcript chunks, and original URL are all stored as source
-evidence. The default ASR backend is faster-whisper.
-`CLOUDX_DOCUMENTATION_ASR_BACKEND=whisper-cpp`
-selects a compiled `whisper.cpp` CLI backend, which requires an explicit
+The keyframe index, timestamped transcript segment index, visual
+sampling manifest, YouTube metadata JSON, optional `description.txt`,
+description chunks, transcript chunks, and original URL are all stored
+as source evidence. The default ASR backend is faster-whisper.
+`CLOUDX_DOCUMENTATION_ASR_BACKEND=whisper-cpp` selects a compiled
+`whisper.cpp` CLI backend, which requires an explicit
 `CLOUDX_DOCUMENTATION_WHISPER_CPP_BIN` and
 `CLOUDX_DOCUMENTATION_WHISPER_CPP_MODEL_PATH`. When
 `CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD=true`, it also requires
-`CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD_MODEL_PATH`; the installer configures
-Silero VAD so silent windows are skipped instead of decoded into repeated
-filler text. Missing `yt-dlp`, missing `ffmpeg`, missing backend dependencies,
-transcript failures, or keyframe extraction failures fail the ingest request
-explicitly.
+`CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD_MODEL_PATH`; the installer
+configures Silero VAD so silent windows are skipped instead of decoded
+into repeated filler text. Missing `yt-dlp`, missing `ffmpeg`, missing
+backend dependencies, transcript failures, or keyframe extraction
+failures fail the ingest request explicitly.
 
 If the URL contains a YouTube `list=` playlist ID and no manual
 transcript is supplied, `/ingest/url` treats it as a playlist. The
@@ -236,11 +236,11 @@ playlist entry becomes one archive document: the document title comes
 from the video entry title, the URI is the canonical
 `https://www.youtube.com/watch?v=<video-id>` URL, the source type is
 `media`, and the collection is the playlist title unless the caller
-provided an explicit collection. Transcript text still comes from
-`youtube-transcript-api`, and every successfully ingested playlist entry
-gets its own selected slide-frame manifest. If a later playlist entry
-fails, earlier entries from that request are marked deleted so active
-search does not contain a partial playlist import.
+provided an explicit collection. Transcript text comes from
+faster-whisper by default, and every successfully ingested playlist
+entry gets its own selected slide-frame manifest. If a later playlist
+entry fails, earlier entries from that request are marked deleted so
+active search does not contain a partial playlist import.
 
 YouTube enrichment follows the same document boundary. A single video
 URL enriches the media document that was created for that video. A
@@ -265,7 +265,7 @@ PDF input is extracted with a table-aware pipeline. Page text uses
 portable sidecars under `extracted/tables/`; pages with visual objects
 are rendered to PNG sidecars under `extracted/figures/` so graphs,
 plots, flowcharts, schematics, and layout-heavy pages can be inspected
-later. Image input is normalized to a PNG sidecar under
+later. Image input is normalized to PNG sidecars under
 `extracted/images/`; multi-frame images preserve every frame as a
 separate artifact and are indexed with format, size, mode, frame count,
 and visual-artifact metadata. HTML input is parsed with script, style,
@@ -305,23 +305,23 @@ ingested document, all source-origin chunks, portable extraction
 artifact manifests, and media evidence when available. For media
 uploads, the existing ASR service produces a timestamped transcript and
 FFmpeg produces scene-selected keyframe artifacts. For YouTube URL
-imports, the indexer itself stores timestamped faster-whisper
-transcript segments, metadata, selected slide-frame artifacts, and a
-visual sampling manifest before enrichment runs.
-The service batches all chunks, artifact paths, transcript segments, and
-keyframe paths so prompt size is controlled without dropping later
-evidence. Codex returns derived spans with locators such as
-`ai:metadata`, `ai:visual`, and `ai:media`; the indexer stores them as
-`chunk_origin = 'ai'` so search can distinguish source extraction from
-AI-derived enrichment. Re-running enrichment for a document replaces
-previous AI chunks for that document and leaves source chunks unchanged.
+imports, the indexer itself stores timestamped faster-whisper transcript
+segments, metadata, selected slide-frame artifacts, and a visual
+sampling manifest before enrichment runs. The service batches all
+chunks, artifact paths, transcript segments, and keyframe paths so
+prompt size is controlled without dropping later evidence. Codex returns
+derived spans with locators such as `ai:metadata`, `ai:visual`, and
+`ai:media`; the indexer stores them as `chunk_origin = 'ai'` so search
+can distinguish source extraction from AI-derived enrichment. Re-running
+enrichment for a document replaces previous AI chunks for that document
+and leaves source chunks unchanged.
 
 If enrichment fails, the base source document remains active. The ingest
 response includes an `enrichment` status block with the affected
 document id and error message.
 
 The same setting also controls assisted archive answers in the browser
-panel. When AI assistance is available, the Documentation panel's answer
+panel. When AI assistance is available, the Documentation panel’s answer
 mode calls the `documentation.answer` hook. That hook searches the
 archive, opens matching source documents, sends selected source evidence
 to Codex with a strict answer schema, and returns plaintext,
@@ -486,38 +486,38 @@ operational view:
     enabled.
 3.  Switch to manual search when the user needs raw matching chunks or
     AI assistance is disabled.
-4.  Search with `hybrid`, `dense`, or `lexical` mode.
-5.  Filter by source type, state, and collection.
-6.  Queue knowledge imports from uploaded files, paths, URLs, or text.
-    Imports run one at a time so long YouTube/video work does not
-    overlap.
+4.  Search active knowledge with the default hybrid retrieval path and
+    optionally narrow by collection.
+5.  Queue knowledge imports from uploaded files, allowed local paths,
+    URLs, YouTube videos/playlists, or direct text. Imports run one at a
+    time so long YouTube/video work does not overlap.
+6.  Leave title and collection blank when the indexer should autodetect
+    them from uploaded filenames, local folders, URL hosts, playlist
+    metadata, or the first text line.
 7.  Track queued, running, complete, and failed imports in the Import
     Queue. File uploads report real byte progress from browser upload
     events; server-side extraction, URL download, transcript, keyframe,
     and enrichment work reports phase progress while the synchronous
     indexer request is running.
-8.  Leave source type on `auto` for uploads, paths, and URLs unless the
-    user knows the source category.
-9.  Leave title and collection blank when the indexer should autodetect
-    them.
-10. Supply optional media transcripts when URL ingest is set to source
-    type `media`.
-11. Mark search results `stale`, `revoked`, `superseded`, or
+8.  Read parallel progress channels for long media imports, including
+    visual scan and audio transcript work when both are running.
+9.  Mark search results `stale`, `revoked`, `superseded`, or
     `quarantined`.
-12. Remove a document from active search.
-13. Open full source documents from search results or the Active
+10. Remove a document from active search.
+11. Open full source documents from search results or the Active
     Documents list to inspect chunks, transcript text, table Markdown,
-    and extracted artifact metadata.
-14. Load the portable manifest and rebuild the Turbovec index.
+    and extracted artifact metadata. Large sources auto-load more chunks
+    and artifacts as the source viewer reaches the end.
+12. Load the portable manifest and rebuild the Turbovec index.
 
-The UI defaults search state to `active`, ingest mode to upload, source
-type to `auto`, and search mode to `hybrid`. It also shows whether AI
-assistance is active. If AI is disabled, the warning explicitly says
-only text/manual source analysis is available, and the Answer mode is
-disabled. The Queue button snapshots the current form into a queued
-import and immediately clears the form so another source can be queued
-while the previous source is still downloading, transcribing, extracting,
-or enriching.
+The UI defaults to active-document search, upload ingest,
+assisted-answer mode when AI assistance is available, and hybrid search
+under the hood. It shows AI-assistance state as a compact header icon.
+If AI is disabled, Answer mode is unavailable and the panel keeps manual
+search plus full source viewing. The Queue button snapshots the current
+form into a queued import and immediately clears the form so another
+source can be queued while the previous source is still downloading,
+transcribing, extracting, or enriching.
 
 # Default Rule And Skills
 
@@ -538,7 +538,7 @@ server startup:
 | `documentation-invalidate` | Find and invalidate stale, wrong, superseded, quarantined, or deleted sources. |
 | `documentation-enrich-metadata` | Derive source-grounded metadata and searchable import-improvement notes. |
 | `documentation-enrich-visuals` | Describe extracted tables, graphs, diagrams, screenshots, and flowcharts without inventing visual facts. |
-| `documentation-enrich-media` | Improve media imports using transcripts and interval keyframes when available. |
+| `documentation-enrich-media` | Improve media imports using transcripts and selected keyframes when available. |
 | `documentation-archive-control` | Inspect health, stats, portable manifest, and rebuild status. |
 
 Each skill tells Codex to read `CLOUDX_DOCUMENTATION_URL` first. The
@@ -643,12 +643,14 @@ path policy enforcement, browser upload forwarding, enrichment routing,
 assisted-answer routing, automatic plugin system-rule and system-skill
 contributions, direct Codex search-skill guidance, generic plugin
 contribution validation, and Codex overlay injection. The web panel
-tests cover upload ingest, visible text ingest, assisted-answer mode,
-assisted-search loading state, sanitized HTML answer rendering,
-disabled-AI manual mode, full source viewing, and search hook calls. The
-client tests cover JSON POST behavior, multipart upload behavior,
-enrichment POST behavior, browser upload request construction, and
-propagation of service error messages.
+tests cover upload ingest, visible text ingest, queued sequential
+imports, progress channels, assisted-answer mode, assisted-search
+loading state, sanitized HTML answer rendering, disabled-AI manual mode,
+source-viewer removal controls, progressive source auto-loading, full
+source viewing, and search hook calls. The client tests cover JSON POST
+behavior, multipart upload behavior, documentation upload progress
+events, enrichment POST behavior, browser upload request construction,
+and propagation of service error messages.
 
 A realistic validation runner in
 `debug_tooling/documentation-validation/run_validation.py` downloads or
@@ -659,11 +661,11 @@ YouTube videos with transcripts and keyframes, and a generated
 validation run used `--include-youtube`, ingested 9 documents into 5324
 active chunks, produced 1885 table CSV files, 1885 table Markdown files,
 596 rendered figure PNGs, 3134 YouTube keyframe artifacts, 2 YouTube
-keyframe indexes, and 2 YouTube metadata JSON files, then passed required hybrid,
-lexical, rebuild, stale-state, YouTube transcript recall, and YouTube
-artifact checks. Dense-only checks are retained as diagnostics because
-the current dense profile is a deterministic local hash embedding, not a
-semantic embedding model. See
+keyframe indexes, and 2 YouTube metadata JSON files, then passed
+required hybrid, lexical, rebuild, stale-state, YouTube transcript
+recall, and YouTube artifact checks. Dense-only checks are retained as
+diagnostics because the current dense profile is a deterministic local
+hash embedding, not a semantic embedding model. See
 `debug_tooling/documentation-validation/README.md` before running it;
 generated corpus, archive, and summary files stay under the selected
 `--root` and should not be committed.
@@ -680,8 +682,8 @@ generated corpus, archive, and summary files stay under the selected
   YouTube media ingest, and does not crawl a site recursively.
 - YouTube URL ingest stores timestamped transcript, metadata, selected
   slide-frame artifacts, and a visual sampling manifest. It runs ASR and
-  the CPU-heavy visual scan concurrently, downloads a bounded video source
-  once before local parallel slide scanning, and it depends on live
+  the CPU-heavy visual scan concurrently, downloads a bounded video
+  source once before local parallel slide scanning, and depends on live
   YouTube access, `yt-dlp`, FFmpeg, and the configured ASR backend.
   Faster-whisper is the default; Intel Arc acceleration requires the
   explicit `whisper-cpp` backend with a SYCL/OpenVINO-capable

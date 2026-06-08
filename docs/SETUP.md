@@ -253,7 +253,13 @@ In Cloudx, create a Documentation tab. The panel can:
 - Search active indexed knowledge manually and open full source chunks when AI
   assistance is disabled.
 - Upload files, add local paths under `CLOUDX_ALLOWED_ROOTS`, ingest URLs, add
-  copied text, and store media transcripts.
+  copied text, ingest YouTube videos or playlists, and store media transcripts.
+- Autodetect titles and collections from uploaded filenames, local folders, URL
+  hosts, playlist metadata, or the first text line when those fields are blank.
+- Show queued imports with upload, download, transcript, keyframe, and
+  enrichment progress channels while long media work is running.
+- Inspect extracted source chunks next to table, figure, image, and keyframe
+  artifacts in the source viewer.
 - Mark sources stale, revoked, superseded, or quarantined.
 - Remove a source from active search by marking it deleted.
 - Show the portable archive manifest and rebuild the Turbovec index.

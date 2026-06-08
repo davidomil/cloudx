@@ -45,6 +45,9 @@ names, and dashboard tokens.
 - Worktree manager plugin for creating or cloning a bare repository and managing
   project worktree folders.
 - Local web plugin for dashboards such as Understand Anything.
+- Documentation archive plugin for portable local knowledge ingestion, search,
+  source viewing, invalidation, assisted answers, queued imports, and automatic
+  Codex rule/skill injection.
 - Dynamic settings for global AI/microphone controls and plugin-owned options
   such as file-browser Git diff visibility.
 - Shared path autocomplete for tab, window, and template directory fields.
@@ -61,6 +64,11 @@ names, and dashboard tokens.
 - `packages/plugin-api`: plugin contracts.
 - `packages/shared`: shared domain types and validation helpers.
 - `services/asr`: local Faster Whisper service.
+- `services/documentation-indexer`: local FastAPI documentation archive indexer,
+  extraction pipeline, and retrieval tests.
+- `debug_tooling/documentation-validation`: optional validation runner for the
+  documentation archive.
+- `docs/MEMORY_PLUGIN_GUIDE.md`: source-grounded documentation archive guide.
 - `docs/MOTIVATION.md`: why this exists.
 - `docs/WEB_APP_PLAN.md`: product and architecture plan.
 - `docs/SETUP.md`: install, service, HTTPS, and ASR details.
@@ -79,13 +87,13 @@ cd cloudx
 It shows each phase before running it. The bootstrap stage installs Ubuntu
 packages, including the PDF, spreadsheet, image, and media keyframe extraction
 tools used by the documentation archive plus the Quarto, Pandoc, and TeX Live
-toolchain used to render the memory-plugin PDF guide. It then installs Node.js 22 when needed,
-verifies `node -v` and `npm -v`, and falls back to Ubuntu's `npm` package if
-npm is still missing. The wizard then installs Cloudx npm dependencies,
-installs and checks Codex CLI, prepares the Faster Whisper ASR environment,
-prepares the documentation archive indexer environment, downloads the local ASR
-model, writes Cloudx config, and optionally installs user-level systemd
-services. Each question includes a short explanation of what the choice
+toolchain used to render the memory-plugin PDF guide. It then installs Node.js
+22 when needed, verifies `node -v` and `npm -v`, and falls back to Ubuntu's
+`npm` package if npm is still missing. The wizard then installs Cloudx npm
+dependencies, installs and checks Codex CLI, prepares the Faster Whisper ASR
+environment, prepares the documentation archive indexer environment, downloads
+the local ASR model, writes Cloudx config, and optionally installs user-level
+systemd services. Each question includes a short explanation of what the choice
 changes, and the installer prints the local Cloudx URL when it finishes. Add
 `--lan` only when you want Cloudx to bind to `0.0.0.0` for a trusted LAN or
 tailnet.
@@ -148,13 +156,17 @@ npm run documentation:start
 ```
 
 This installs the PDF/image/table extraction stack plus YouTube transcript,
-playlist metadata, YouTube keyframe capture, and media enrichment support, then starts the Turbovec-backed indexer at
-`http://127.0.0.1:7820`, which is the Cloudx default
-`CLOUDX_DOCUMENTATION_URL`. Create a Documentation tab in Cloudx to upload
-files, add local paths, ingest URLs or YouTube playlists, add copied text or
-media transcripts, search active knowledge, invalidate stale sources, remove
-sources from active search, install the documentation skills, and inspect the
-portable backup manifest.
+playlist metadata, YouTube keyframe capture, and media enrichment support, then
+starts the Turbovec-backed indexer at `http://127.0.0.1:7820`, which is the
+Cloudx default `CLOUDX_DOCUMENTATION_URL`. Create a Documentation tab in Cloudx
+to upload files, add local paths, ingest URLs or YouTube playlists, add copied
+text or media transcripts, search active knowledge, inspect full source chunks
+and extracted artifacts, invalidate stale sources, remove sources from active
+search, and inspect the portable backup manifest.
+
+Documentation rules and skills are synced automatically as CloudX system
+contributions when the server starts, so Codex tabs can use the archive without
+a separate install step.
 
 Documentation AI assistance is enabled by default when global AI control is on.
 If it is disabled, the Documentation tab still supports manual source-text

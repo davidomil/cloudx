@@ -96,7 +96,7 @@ The plugin supports four ingest paths.
 
 The Documentation panel defaults to upload mode. The browser sends file bytes to `POST /api/documentation/upload`; the CloudX server enforces the configured upload cap and forwards the bytes to the indexer's multipart `POST /ingest/upload` route.
 
-Upload ingest stores the original filename and content type in snapshot metadata, infers a source type when the UI is left on `auto`, autodetects the title from the filename when the title field is blank, assigns the default `uploads` collection when collection is blank, and records a stable `upload://<safe-name>` URI. This path is the preferred user workflow for datasheets, PDFs, images, Markdown, copied exports, and other files that are on the user's workstation but not necessarily visible as a local path to the indexer process.
+Upload ingest stores the original filename and content type in snapshot metadata, infers a source type from the filename and content type, autodetects the title from the filename when the title field is blank, assigns the default `uploads` collection when collection is blank, and records a stable `upload://<safe-name>` URI. This path is the preferred user workflow for datasheets, PDFs, images, Markdown, copied exports, and other files that are on the user's workstation but not necessarily visible as a local path to the indexer process.
 
 When AI enrichment is enabled, browser upload is also the path that can pass media bytes to the enrichment service. Uploaded audio/video can be transcribed through the existing Faster Whisper ASR service, and uploaded video is converted into a scene-selected keyframe manifest with FFmpeg before Codex is asked to improve the import. Long media files can still produce large keyframe manifests, so the enrichment service batches the manifest instead of silently capping it.
 
@@ -106,7 +106,7 @@ When AI enrichment is enabled, browser upload is also the path that can pass med
 
 Supported suffixes include Markdown, text, PDF, HTML, JSON, YAML, XML, CSV, SRT/VTT, Python, TypeScript, JavaScript, C/C++, Rust, CSS, AsciiDoc, LaTeX, and images (`.png`, `.jpg`, `.jpeg`, `.gif`, `.tif`, `.tiff`, `.bmp`, `.webp`).
 
-The supported source-type labels are `datasheet`, `book`, `website`, `repo_code`, `readme`, `media`, `image`, and `text`. Source type describes the source for filtering and skill behavior; extraction is selected from the actual file suffix, content type, and file signature. That means setting `sourceType` to `datasheet` no longer forces a Markdown, text, or image file through the PDF extractor.
+The supported source-type labels are `datasheet`, `book`, `website`, `repo_code`, `readme`, `media`, `image`, and `text`. Source type describes the source for hook/API filters and skill behavior; extraction is selected from the actual file suffix, content type, and file signature. That means setting `sourceType` to `datasheet` no longer forces a Markdown, text, or image file through the PDF extractor.
 
 When title is blank, path ingest uses the file name. When collection is blank, directory ingest uses the directory name for every file under that ingest request and single-file ingest uses the parent folder name.
 
@@ -248,19 +248,17 @@ In CloudX, create a Documentation tab. The panel gives a compact operational vie
 1. Refresh archive stats and active document list.
 2. Ask an AI-assisted archive question by default when AI assistance is enabled.
 3. Switch to manual search when the user needs raw matching chunks or AI assistance is disabled.
-4. Search with `hybrid`, `dense`, or `lexical` mode.
-5. Filter by source type, state, and collection.
-6. Queue knowledge imports from uploaded files, paths, URLs, or text. Imports run one at a time so long YouTube/video work does not overlap.
+4. Search active knowledge with the default hybrid retrieval path and optionally narrow by collection.
+5. Queue knowledge imports from uploaded files, allowed local paths, URLs, YouTube videos/playlists, or direct text. Imports run one at a time so long YouTube/video work does not overlap.
+6. Leave title and collection blank when the indexer should autodetect them from uploaded filenames, local folders, URL hosts, playlist metadata, or the first text line.
 7. Track queued, running, complete, and failed imports in the Import Queue. File uploads report real byte progress from browser upload events; server-side extraction, URL download, transcript, keyframe, and enrichment work reports phase progress while the synchronous indexer request is running.
-8. Leave source type on `auto` for uploads, paths, and URLs unless the user knows the source category.
-9. Leave title and collection blank when the indexer should autodetect them.
-10. Supply optional media transcripts when URL ingest is set to source type `media`.
-11. Mark search results `stale`, `revoked`, `superseded`, or `quarantined`.
-12. Remove a document from active search.
-13. Open full source documents from search results or the Active Documents list to inspect chunks, transcript text, table Markdown, and extracted artifact metadata.
-14. Load the portable manifest and rebuild the Turbovec index.
+8. Read parallel progress channels for long media imports, including visual scan and audio transcript work when both are running.
+9. Mark search results `stale`, `revoked`, `superseded`, or `quarantined`.
+10. Remove a document from active search.
+11. Open full source documents from search results or the Active Documents list to inspect chunks, transcript text, table Markdown, and extracted artifact metadata. Large sources auto-load more chunks and artifacts as the source viewer reaches the end.
+12. Load the portable manifest and rebuild the Turbovec index.
 
-The UI defaults search state to `active`, ingest mode to upload, source type to `auto`, and search mode to `hybrid`. It also shows whether AI assistance is active. If AI is disabled, the warning explicitly says only text/manual source analysis is available, and the Answer mode is disabled. The Queue button snapshots the current form into a queued import and immediately clears the form so another source can be queued while the previous source is still downloading, transcribing, extracting, or enriching.
+The UI defaults to active-document search, upload ingest, assisted-answer mode when AI assistance is available, and hybrid search under the hood. It shows AI-assistance state as a compact header icon. If AI is disabled, Answer mode is unavailable and the panel keeps manual search plus full source viewing. The Queue button snapshots the current form into a queued import and immediately clears the form so another source can be queued while the previous source is still downloading, transcribing, extracting, or enriching.
 
 # Default Rule And Skills
 
@@ -279,7 +277,7 @@ The plugin contributes seven CloudX system skills automatically at server startu
 | `documentation-invalidate` | Find and invalidate stale, wrong, superseded, quarantined, or deleted sources. |
 | `documentation-enrich-metadata` | Derive source-grounded metadata and searchable import-improvement notes. |
 | `documentation-enrich-visuals` | Describe extracted tables, graphs, diagrams, screenshots, and flowcharts without inventing visual facts. |
-| `documentation-enrich-media` | Improve media imports using transcripts and interval keyframes when available. |
+| `documentation-enrich-media` | Improve media imports using transcripts and selected keyframes when available. |
 | `documentation-archive-control` | Inspect health, stats, portable manifest, and rebuild status. |
 
 Each skill tells Codex to read `CLOUDX_DOCUMENTATION_URL` first. The search skill explicitly tells Codex to call `/search` and `/documents/{documentId}` directly instead of routing through `documentation.answer`, because Codex can inspect the retrieved sources itself. It also instructs Codex to prefer active local archive evidence, use built-in web search only when local evidence is absent or insufficient, prefer official, vendor, spec, peer-reviewed, government, or reputable-news sources depending on the domain, ingest useful online sources back into the archive, and rerun local search before answering. When Codex tabs are launched from CloudX, the server exports that URL to child processes.
@@ -346,7 +344,7 @@ The indexer tests cover:
 - Searching with hybrid retrieval, lexical-only behavior, strict identifier recall, and dense-only fallback above the configured threshold.
 - Invalidation, deletion, portable manifest generation, archive reopen/restore behavior, FastAPI controls, and CLI help.
 
-The server plugin tests cover hook registration, safety classes, local path policy enforcement, browser upload forwarding, enrichment routing, assisted-answer routing, automatic plugin system-rule and system-skill contributions, direct Codex search-skill guidance, generic plugin contribution validation, and Codex overlay injection. The web panel tests cover upload ingest, visible text ingest, queued sequential imports, assisted-answer mode, assisted-search loading state, sanitized HTML answer rendering, disabled-AI manual mode, full source viewing, and search hook calls. The client tests cover JSON POST behavior, multipart upload behavior, documentation upload progress events, enrichment POST behavior, browser upload request construction, and propagation of service error messages.
+The server plugin tests cover hook registration, safety classes, local path policy enforcement, browser upload forwarding, enrichment routing, assisted-answer routing, automatic plugin system-rule and system-skill contributions, direct Codex search-skill guidance, generic plugin contribution validation, and Codex overlay injection. The web panel tests cover upload ingest, visible text ingest, queued sequential imports, progress channels, assisted-answer mode, assisted-search loading state, sanitized HTML answer rendering, disabled-AI manual mode, source-viewer removal controls, progressive source auto-loading, full source viewing, and search hook calls. The client tests cover JSON POST behavior, multipart upload behavior, documentation upload progress events, enrichment POST behavior, browser upload request construction, and propagation of service error messages.
 
 A realistic validation runner in `debug_tooling/documentation-validation/run_validation.py` downloads or reuses public Wikipedia pages, the TurboQuant arXiv PDF, the kernel.org Linux virtual memory manager book, GMSL2 datasheet PDFs, optional live YouTube videos with transcripts and keyframes, and a generated 2500-record mock corpus with planted facts. The latest required validation run used `--include-youtube`, ingested 9 documents into 5324 active chunks, produced 1885 table CSV files, 1885 table Markdown files, 596 rendered figure PNGs, 3134 YouTube keyframe artifacts, 2 YouTube keyframe indexes, and 2 YouTube metadata JSON files, then passed required hybrid, lexical, rebuild, stale-state, YouTube transcript recall, and YouTube artifact checks. Dense-only checks are retained as diagnostics because the current dense profile is a deterministic local hash embedding, not a semantic embedding model. See `debug_tooling/documentation-validation/README.md` before running it; generated corpus, archive, and summary files stay under the selected `--root` and should not be committed.
 
