@@ -89,14 +89,20 @@ packages, including the PDF, spreadsheet, image, and media keyframe extraction
 tools used by the documentation archive plus the Quarto, Pandoc, and TeX Live
 toolchain used to render the memory-plugin PDF guide. It then installs Node.js
 22 when needed, verifies `node -v` and `npm -v`, and falls back to Ubuntu's
-`npm` package if npm is still missing. The wizard then installs Cloudx npm
-dependencies, installs and checks Codex CLI, prepares the Faster Whisper ASR
-environment, prepares the documentation archive indexer environment, downloads
-the local ASR model, writes Cloudx config, and optionally installs user-level
-systemd services. Each question includes a short explanation of what the choice
-changes, and the installer prints the local Cloudx URL when it finishes. Add
-`--lan` only when you want Cloudx to bind to `0.0.0.0` for a trusted LAN or
-tailnet.
+`npm` package if npm is still missing. The wizard checks Git 2.36+ for the
+Worktree Manager and, on older Ubuntu Git packages such as 22.04's 2.34.x,
+offers to install the current stable Git package from `ppa:git-core/ppa`.
+The wizard then installs Cloudx npm dependencies, installs and checks Codex CLI,
+prepares the Faster Whisper ASR environment, prepares the documentation archive
+indexer environment, downloads the local ASR model, writes Cloudx config, and
+optionally installs user-level services for Cloudx, ASR, and the documentation
+indexer. On NVIDIA systems, the wizard reads `nvidia-smi`; Linux driver
+525.60.13 or newer selects CUDA ASR, installs the required Python cuBLAS/cuDNN
+runtime wheels, and uses `int8_float16` on smaller GPUs such as 4GB cards. Each
+question includes a short explanation of what the choice changes, and the
+installer prints the local Cloudx URL when it finishes. Choose the LAN bind
+prompt, or pass `--lan`, only when you want Cloudx to bind to `0.0.0.0` for a
+trusted LAN or tailnet.
 
 Preview the installer without changing the system:
 
@@ -126,7 +132,8 @@ npm run dev
 ```
 
 Open `https://127.0.0.1:3001`. For phone access, prefer a private tailnet proxy
-to the localhost service. LAN binding is explicit:
+to the localhost service. LAN binding is explicit and can be selected during
+installer prompts:
 
 ```bash
 ./install.sh --lan
@@ -197,7 +204,11 @@ Common environment variables:
 - `CLOUDX_ASSISTANT_BIN`: resolved coding-assistant CLI executable for assistant-backed terminals and tools.
 - `CLOUDX_TOOL_PATH`: path-delimited command directories prepended to Cloudx child processes.
 - `CLOUDX_ASR_URL`: ASR endpoint, default `http://127.0.0.1:7810`.
+- `CLOUDX_ASR_DEVICE`: Faster Whisper device, `cpu` or `cuda`.
+- `CLOUDX_ASR_COMPUTE_TYPE`: Faster Whisper compute profile, for example `int8`, `int8_float16`, or `float16`.
 - `CLOUDX_DOCUMENTATION_URL`: documentation indexer endpoint, default `http://127.0.0.1:7820`.
+- `CLOUDX_DOCUMENTATION_HOST`: documentation indexer bind address, default `127.0.0.1`.
+- `CLOUDX_DOCUMENTATION_PORT`: documentation indexer port, default `7820`.
 - `CLOUDX_DOCUMENTATION_TIMEOUT_MS`: documentation indexer and AI enrichment timeout, default `1800000`.
 - `CLOUDX_DOCUMENTATION_RESPONSE_MAX_BYTES`: maximum indexer response size, default `8388608`.
 - `CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES`: browser documentation upload cap, default `268435456`.

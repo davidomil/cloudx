@@ -5,7 +5,11 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
+  CUDA_12_MIN_DRIVER_VERSION,
+  FASTER_WHISPER_CUDA_PIP_PACKAGES,
+  GIT_CORE_PPA,
   InstallerRunner,
+  MIN_WORKTREE_GIT_VERSION,
   PYTORCH_CPU_WHEEL_INDEX,
   QUARTO_DEB_PATH,
   QUARTO_DEB_URL,
@@ -16,19 +20,26 @@ import {
   assertQuartoArchitecture,
   cloudxAccessUrls,
   defaultCpuThreads,
+  ensureSupportedGit,
   installUbuntuPrerequisites,
+  parseNvidiaGpuInfo,
+  needsGitUpgrade,
   needsNodeInstall,
   needsQuartoInstall,
   networkBindWarning,
   normalizeWhisperCppBuild,
+  parseGitVersion,
   parseNodeMajor,
   parseOsRelease,
   renderAsrService,
   renderCloudxService,
+  renderDocumentationService,
   renderEnvFile,
   resolveDeviceConfig,
   runInstaller,
+  selectNvidiaGpuInfo,
   shouldAdvertiseLanUrls,
+  supportsCuda12Driver,
   toolPathFor,
   ubuntuBootstrapPlan,
   updateEnvFileContent,
@@ -69,6 +80,7 @@ describe("install-cloudx helpers", () => {
     expect(commands[1]).toContain("poppler-utils");
     expect(commands[1]).toContain("ffmpeg");
     expect(commands[1]).toContain("pandoc");
+    expect(commands[1]).toContain("software-properties-common");
     expect(commands[1]).toContain("texlive-xetex");
     expect(commands).toContainEqual(["curl", "-fL", "-o", QUARTO_DEB_PATH, QUARTO_DEB_URL]);
     expect(commands).toContainEqual(["sudo", "apt-get", "install", "-y", QUARTO_DEB_PATH]);
@@ -96,6 +108,45 @@ describe("install-cloudx helpers", () => {
     expect(commands).not.toContainEqual(["sudo", "apt-get", "install", "-y", "nodejs"]);
     expect(commands).toContainEqual(["sh", "-lc", "command -v npm >/dev/null 2>&1 || sudo apt-get install -y npm"]);
     expect(commands).toContainEqual(["npm", "-v"]);
+  });
+
+  it("detects Git versions that are too old for worktree porcelain NUL output", () => {
+    expect(parseGitVersion("git version 2.34.1")).toEqual([2, 34, 1]);
+    expect(needsGitUpgrade("git version 2.34.1")).toBe(true);
+    expect(needsGitUpgrade(`git version ${MIN_WORKTREE_GIT_VERSION}`)).toBe(false);
+    expect(needsGitUpgrade("git version 2.53.0")).toBe(false);
+  });
+
+  it("offers the Git stable PPA when the installed Git is too old", async () => {
+    const planned = [];
+    let gitVersion = "git version 2.34.1";
+
+    const result = await ensureSupportedGit(
+      {
+        exists: (command) => command === "git",
+        capture: () => gitVersion,
+        run: (command, args) => {
+          planned.push([command, ...args]);
+          if (command === "sudo" && args[0] === "apt-get" && args.at(-1) === "git") {
+            gitVersion = "git version 2.53.0";
+          }
+        }
+      },
+      {
+        boolean: async (key) => {
+          expect(key).toBe("upgradeGit");
+          return true;
+        }
+      }
+    );
+
+    expect(result).toMatchObject({ upgraded: true, versionText: "git version 2.53.0" });
+    expect(planned).toEqual([
+      ["sudo", "apt-get", "install", "-y", "software-properties-common"],
+      ["sudo", "add-apt-repository", GIT_CORE_PPA, "-y"],
+      ["sudo", "apt-get", "update"],
+      ["sudo", "apt-get", "install", "-y", "git"]
+    ]);
   });
 
   it("checks current Node and npm before building a direct wizard bootstrap plan", () => {
@@ -147,7 +198,16 @@ describe("install-cloudx helpers", () => {
   });
 
   it("resolves CPU and GPU ASR device configuration", () => {
-    expect(resolveDeviceConfig({ gpuDetected: true, cudaRuntimeReady: true })).toEqual({
+    const t400 = selectNvidiaGpuInfo(parseNvidiaGpuInfo("NVIDIA T400, 595.57.01, 4096"));
+    expect(t400).toMatchObject({ name: "NVIDIA T400", driverVersion: "595.57.01", memoryMb: 4096 });
+    expect(supportsCuda12Driver(t400.driverVersion)).toBe(true);
+    expect(supportsCuda12Driver("520.61.05")).toBe(false);
+    expect(CUDA_12_MIN_DRIVER_VERSION).toBe("525.60.13");
+    expect(resolveDeviceConfig({ gpuDetected: true, nvidiaGpuInfo: t400 })).toEqual({
+      device: "cuda",
+      computeType: "int8_float16"
+    });
+    expect(resolveDeviceConfig({ gpuDetected: true, nvidiaGpuInfo: { name: "RTX", driverVersion: "595.57.01", memoryMb: 12_288 } })).toEqual({
       device: "cuda",
       computeType: "float16"
     });
@@ -161,9 +221,9 @@ describe("install-cloudx helpers", () => {
     });
     expect(resolveDeviceConfig({ gpuDetected: true, useGpu: true, cudaRuntimeReady: true })).toEqual({
       device: "cuda",
-      computeType: "float16"
+      computeType: "int8_float16"
     });
-    expect(() => resolveDeviceConfig({ gpuDetected: true, useGpu: true, cudaRuntimeReady: false })).toThrow(/CUDA\/cuDNN/);
+    expect(() => resolveDeviceConfig({ gpuDetected: true, useGpu: true, nvidiaGpuInfo: { name: "Old NVIDIA", driverVersion: "520.61.05", memoryMb: 8192 } })).toThrow(/CUDA 12 minimum/);
     expect(normalizeWhisperCppBuild("SYCL")).toBe("sycl");
     expect(() => normalizeWhisperCppBuild("vulkan")).toThrow(/cpu or sycl/);
   });
@@ -186,13 +246,25 @@ describe("install-cloudx helpers", () => {
     expect(env).toContain("CLOUDX_ASR_DEVICE=cpu");
     expect(env).toContain("CLOUDX_ASSISTANT_BIN=/usr/bin/codex");
     expect(env).toContain("CLOUDX_TOOL_PATH=/usr/bin");
+    expect(env).toContain("CLOUDX_DOCUMENTATION_URL=http://127.0.0.1:7820");
+    expect(env).toContain("CLOUDX_DOCUMENTATION_HOST=127.0.0.1");
+    expect(env).toContain("CLOUDX_DOCUMENTATION_DATA_DIR=/repo/.cloudx/documentation");
     expect(env).not.toContain("CLOUDX_CODEX_BIN");
 
-    expect(renderAsrService({ repoRoot: "/repo", envPath: "/home/me/.config/cloudx/cloudx.env", uvicornPath: "/repo/services/asr/.venv/bin/uvicorn", asrDir: "/repo/services/asr" })).toContain(
+    expect(renderAsrService({ repoRoot: "/repo", envPath: "/home/me/.config/cloudx/cloudx.env", pythonPath: "/repo/services/asr/.venv/bin/python", uvicornPath: "/repo/services/asr/.venv/bin/uvicorn", asrDir: "/repo/services/asr" })).toContain(
       "cloudx_asr.main:app"
+    );
+    expect(renderAsrService({ repoRoot: "/repo", envPath: "/home/me/.config/cloudx/cloudx.env", pythonPath: "/repo/services/asr/.venv/bin/python", uvicornPath: "/repo/services/asr/.venv/bin/uvicorn", asrDir: "/repo/services/asr" })).toContain(
+      "nvidia.cublas.lib"
     );
     expect(renderCloudxService({ repoRoot: "/repo", envPath: "/home/me/.config/cloudx/cloudx.env", nodePath: "/usr/bin/node", npmPath: "/usr/bin/npm" })).toContain(
       "npm run start -w @cloudx/server"
+    );
+    expect(renderCloudxService({ repoRoot: "/repo", envPath: "/home/me/.config/cloudx/cloudx.env", nodePath: "/usr/bin/node", npmPath: "/usr/bin/npm" })).toContain(
+      "Wants=cloudx-asr.service cloudx-documentation.service"
+    );
+    expect(renderDocumentationService({ repoRoot: "/repo", envPath: "/home/me/.config/cloudx/cloudx.env", documentationPythonPath: "/repo/services/documentation-indexer/.venv/bin/python", documentationIndexerPath: "/repo/services/documentation-indexer/.venv/bin/cloudx-documentation-indexer" })).toContain(
+      "cloudx-documentation-indexer"
     );
   });
 
@@ -237,7 +309,7 @@ describe("runInstaller dry-run", () => {
 
     expect(result.installServices).toBe(false);
     expect(result.urls).toEqual(["https://127.0.0.1:3001"]);
-    expect(result.envConfig).toMatchObject({ host: "127.0.0.1", device: "cpu", computeType: "int8", cpuThreads: 6 });
+    expect(result.envConfig).toMatchObject({ host: "127.0.0.1", device: "cpu", computeType: "int8", cpuThreads: 6, documentationUrl: "http://127.0.0.1:7820" });
     expect(runner.commands.map((command) => [command.command, ...command.args])).toEqual(
       expect.arrayContaining([
         ["node", "-v"],
@@ -256,7 +328,38 @@ describe("runInstaller dry-run", () => {
         ["npm", "run", "build"]
       ])
     );
-    expect(runner.writes.some((write) => write.path === "/home/me/.config/cloudx/cloudx.env")).toBe(true);
+    const env = runner.writes.find((write) => write.path === "/home/me/.config/cloudx/cloudx.env")?.contents;
+    expect(env).toContain("CLOUDX_DOCUMENTATION_URL=http://127.0.0.1:7820");
+  });
+
+  it("plans an auto-detected NVIDIA T400 install with CUDA ASR libraries", async () => {
+    const runner = new InstallerRunner({ dryRun: true, cwd: "/repo", log: () => undefined });
+
+    const result = await runInstaller({
+      repoRoot: "/repo",
+      home: "/home/me",
+      env: TEST_ENV,
+      dryRun: true,
+      yes: true,
+      runner,
+      osRelease: { ID: "ubuntu", VERSION_ID: "22.04", PRETTY_NAME: "Ubuntu 22.04 LTS" },
+      gpuDetected: true,
+      nvidiaGpuInfo: { name: "NVIDIA T400", driverVersion: "595.57.01", memoryMb: 4096 },
+      cudaRuntimeReady: false,
+      parallelism: 12,
+      answers: {
+        installServices: false,
+        runCodexLogin: true
+      }
+    });
+
+    const planned = runner.commands.map((command) => [command.command, ...command.args]);
+    expect(result.envConfig).toMatchObject({ device: "cuda", computeType: "int8_float16" });
+    expect(planned).toContainEqual(["/repo/services/asr/.venv/bin/pip", "install", ...FASTER_WHISPER_CUDA_PIP_PACKAGES]);
+    expect(planned).toContainEqual(["/repo/services/documentation-indexer/.venv/bin/pip", "install", ...FASTER_WHISPER_CUDA_PIP_PACKAGES]);
+    const env = runner.writes.find((write) => write.path === "/home/me/.config/cloudx/cloudx.env")?.contents;
+    expect(env).toContain("CLOUDX_ASR_DEVICE=cuda");
+    expect(env).toContain("CLOUDX_ASR_COMPUTE_TYPE=int8_float16");
   });
 
   it("uses an explicit LAN bind when requested", async () => {
@@ -285,6 +388,62 @@ describe("runInstaller dry-run", () => {
 
     expect(result.envConfig.host).toBe("0.0.0.0");
     expect(result.urls).toEqual(["https://127.0.0.1:3001", "https://192.0.2.249:3001"]);
+  });
+
+  it("uses the installer LAN prompt for trusted tailnet access", async () => {
+    const runner = new InstallerRunner({ dryRun: true, cwd: "/repo", log: () => undefined });
+
+    const result = await runInstaller({
+      repoRoot: "/repo",
+      home: "/home/me",
+      env: TEST_ENV,
+      dryRun: true,
+      yes: true,
+      runner,
+      osRelease: { ID: "ubuntu", VERSION_ID: "24.04", PRETTY_NAME: "Ubuntu 24.04 LTS" },
+      gpuDetected: false,
+      cudaRuntimeReady: false,
+      parallelism: 12,
+      answers: {
+        bindLan: true,
+        installServices: false,
+        runCodexLogin: true
+      },
+      networkInterfaces: {
+        tailscale0: [{ family: "IPv4", internal: false, address: "100.64.0.24" }]
+      }
+    });
+
+    expect(result.envConfig.host).toBe("0.0.0.0");
+    expect(result.urls).toEqual(["https://127.0.0.1:3001", "https://100.64.0.24:3001"]);
+  });
+
+  it("can return an existing network bind environment to localhost", async () => {
+    const runner = new InstallerRunner({ dryRun: true, cwd: "/repo", log: () => undefined });
+
+    const result = await runInstaller({
+      repoRoot: "/repo",
+      home: "/home/me",
+      env: { ...TEST_ENV, CLOUDX_HOST: "0.0.0.0" },
+      dryRun: true,
+      yes: true,
+      runner,
+      osRelease: { ID: "ubuntu", VERSION_ID: "24.04", PRETTY_NAME: "Ubuntu 24.04 LTS" },
+      gpuDetected: false,
+      cudaRuntimeReady: false,
+      parallelism: 12,
+      answers: {
+        bindLan: false,
+        installServices: false,
+        runCodexLogin: true
+      },
+      networkInterfaces: {
+        eth0: [{ family: "IPv4", internal: false, address: "192.0.2.249" }]
+      }
+    });
+
+    expect(result.envConfig.host).toBe("127.0.0.1");
+    expect(result.urls).toEqual(["https://127.0.0.1:3001"]);
   });
 
   it("plans optional whisper.cpp documentation ASR installation", async () => {
@@ -392,7 +551,8 @@ describe("runInstaller dry-run", () => {
 
     const planned = runner.commands.map((command) => [command.command, ...command.args]);
     expect(planned).toContainEqual(["sudo", "loginctl", "enable-linger", process.env.USER ?? "david"]);
-    expect(planned).toContainEqual(["systemctl", "--user", "enable", "cloudx-asr.service", "cloudx.service"]);
+    expect(planned).toContainEqual(["systemctl", "--user", "enable", "cloudx-asr.service", "cloudx-documentation.service", "cloudx.service"]);
+    expect(planned).toContainEqual(["systemctl", "--user", "restart", "cloudx-asr.service", "cloudx-documentation.service", "cloudx.service"]);
     expect(planned).toContainEqual([
       "curl",
       "--fail",
@@ -408,9 +568,23 @@ describe("runInstaller dry-run", () => {
       "--insecure",
       "https://127.0.0.1:3001/api/health"
     ]);
+    expect(planned).toContainEqual([
+      "curl",
+      "--fail",
+      "--silent",
+      "--show-error",
+      "--max-time",
+      "5",
+      "--retry",
+      "30",
+      "--retry-delay",
+      "1",
+      "--retry-connrefused",
+      "http://127.0.0.1:7820/health"
+    ]);
     expect(runner.commands.find((command) => command.command === "curl" && command.args.includes("https://127.0.0.1:3001/api/health"))?.capture).toBe(true);
     expect(runner.writes.map((write) => write.path)).toEqual(
-      expect.arrayContaining(["/home/me/.config/systemd/user/cloudx.service", "/home/me/.config/systemd/user/cloudx-asr.service"])
+      expect.arrayContaining(["/home/me/.config/systemd/user/cloudx.service", "/home/me/.config/systemd/user/cloudx-asr.service", "/home/me/.config/systemd/user/cloudx-documentation.service"])
     );
   });
 
@@ -440,10 +614,11 @@ describe("runInstaller dry-run", () => {
     });
     expect(planned).toEqual(
       expect.arrayContaining([
-        ["systemctl", "--user", "stop", "cloudx-asr.service", "cloudx.service"],
-        ["systemctl", "--user", "disable", "cloudx-asr.service", "cloudx.service"],
+        ["systemctl", "--user", "stop", "cloudx-asr.service", "cloudx-documentation.service", "cloudx.service"],
+        ["systemctl", "--user", "disable", "cloudx-asr.service", "cloudx-documentation.service", "cloudx.service"],
         ["rm", "-rf", "/home/me/.config/systemd/user/cloudx.service"],
         ["rm", "-rf", "/home/me/.config/systemd/user/cloudx-asr.service"],
+        ["rm", "-rf", "/home/me/.config/systemd/user/cloudx-documentation.service"],
         ["rm", "-rf", "/home/me/.config/cloudx/cloudx.env"],
         ["rm", "-rf", "/repo/services/asr/.venv"],
         ["rm", "-rf", "/repo/services/documentation-indexer/.venv"]
@@ -490,7 +665,7 @@ describe("runInstaller dry-run", () => {
     const runner = new InstallerRunner({ dryRun: true, cwd: root, log: () => undefined });
     fs.mkdirSync(path.join(home, ".config/cloudx"), { recursive: true });
     fs.mkdirSync(path.join(home, ".config/systemd/user"), { recursive: true });
-    fs.writeFileSync(path.join(home, ".config/cloudx/cloudx.env"), "CLOUDX_PORT=3443\n");
+    fs.writeFileSync(path.join(home, ".config/cloudx/cloudx.env"), "CLOUDX_PORT=3443\nCLOUDX_ASR_DEVICE=cuda\nCLOUDX_ASR_COMPUTE_TYPE=int8_float16\nCLOUDX_DOCUMENTATION_URL=http://127.0.0.1:9000\n");
     fs.writeFileSync(path.join(home, ".config/systemd/user/cloudx.service"), "");
     fs.writeFileSync(path.join(home, ".config/systemd/user/cloudx-asr.service"), "");
 
@@ -518,6 +693,11 @@ describe("runInstaller dry-run", () => {
     const updatedEnv = runner.writes.find((write) => write.path === path.join(home, ".config/cloudx/cloudx.env"))?.contents;
     expect(updatedEnv).toContain("CLOUDX_ASSISTANT_BIN=/usr/bin/codex");
     expect(updatedEnv).toContain("CLOUDX_TOOL_PATH=/usr/bin");
+    expect(updatedEnv).toContain("CLOUDX_ASR_DEVICE=cuda");
+    expect(updatedEnv).toContain("CLOUDX_ASR_COMPUTE_TYPE=int8_float16");
+    expect(updatedEnv).toContain("CLOUDX_DOCUMENTATION_URL=http://127.0.0.1:9000");
+    expect(updatedEnv).not.toContain("CLOUDX_DOCUMENTATION_URL=http://127.0.0.1:7820");
+    expect(updatedEnv).toContain(`CLOUDX_DOCUMENTATION_DATA_DIR=${path.join(root, ".cloudx/documentation")}`);
     expect(updatedEnv).not.toContain("CLOUDX_CODEX_BIN");
     expect(planned).toEqual(
       expect.arrayContaining([
@@ -536,10 +716,12 @@ describe("runInstaller dry-run", () => {
           "-e",
           `${path.join(root, "services/documentation-indexer")}[dev]`
         ],
+        [path.join(root, "services/asr/.venv/bin/pip"), "install", ...FASTER_WHISPER_CUDA_PIP_PACKAGES],
+        [path.join(root, "services/documentation-indexer/.venv/bin/pip"), "install", ...FASTER_WHISPER_CUDA_PIP_PACKAGES],
         ["npm", "run", "build"],
         ["npm", "run", "cert:create"],
         ["systemctl", "--user", "daemon-reload"],
-        ["systemctl", "--user", "restart", "cloudx-asr.service", "cloudx.service"]
+        ["systemctl", "--user", "restart", "cloudx-asr.service", "cloudx-documentation.service", "cloudx.service"]
       ])
     );
     expect(planned).toContainEqual([
@@ -557,9 +739,23 @@ describe("runInstaller dry-run", () => {
       "--insecure",
       "https://127.0.0.1:3443/api/health"
     ]);
+    expect(planned).toContainEqual([
+      "curl",
+      "--fail",
+      "--silent",
+      "--show-error",
+      "--max-time",
+      "5",
+      "--retry",
+      "30",
+      "--retry-delay",
+      "1",
+      "--retry-connrefused",
+      "http://127.0.0.1:7820/health"
+    ]);
     expect(runner.commands.find((command) => command.command === "curl" && command.args.includes("https://127.0.0.1:3443/api/health"))?.capture).toBe(true);
     expect(runner.writes.map((write) => write.path)).toEqual(
-      expect.arrayContaining([path.join(home, ".config/systemd/user/cloudx.service"), path.join(home, ".config/systemd/user/cloudx-asr.service")])
+      expect.arrayContaining([path.join(home, ".config/systemd/user/cloudx.service"), path.join(home, ".config/systemd/user/cloudx-asr.service"), path.join(home, ".config/systemd/user/cloudx-documentation.service")])
     );
   });
 });

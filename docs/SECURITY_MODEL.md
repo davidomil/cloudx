@@ -44,7 +44,8 @@ files as the local user running Cloudx.
 
 ## Trusted LAN Or Tailnet Access
 
-For direct LAN binding, opt in explicitly:
+For direct LAN binding, opt in explicitly through the installer prompt or pass
+`--lan`:
 
 ```bash
 ./install.sh --lan

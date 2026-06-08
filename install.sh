@@ -78,8 +78,10 @@ if [[ "$UNINSTALL" -eq 1 ]]; then
     echo "Manual cleanup targets:" >&2
     echo "  ~/.config/systemd/user/cloudx.service" >&2
     echo "  ~/.config/systemd/user/cloudx-asr.service" >&2
+    echo "  ~/.config/systemd/user/cloudx-documentation.service" >&2
     echo "  ~/.config/cloudx/cloudx.env" >&2
     echo "  services/asr/.venv" >&2
+    echo "  services/documentation-indexer/.venv" >&2
     echo "  .cloudx" >&2
     exit 1
   fi
@@ -93,6 +95,7 @@ run sudo apt-get install -y \
   curl \
   gnupg \
   git \
+  software-properties-common \
   build-essential \
   cmake \
   pciutils \

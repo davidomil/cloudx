@@ -37,7 +37,9 @@ The installer is split into two visible phases:
    guide. It checks for Node.js 22 and npm, and installs the NodeSource Node.js
    22 package when Node.js is too old or missing. It then verifies `node -v` and
    `npm -v`, and installs Ubuntu's separate `npm` package if the `npm` command
-   is missing.
+   is missing. It checks for Git 2.36+ because the Worktree Manager uses
+   `git worktree list --porcelain -z`; on older Git packages it can add
+   `ppa:git-core/ppa` and install the current stable Git package after approval.
 2. `scripts/install-cloudx.mjs` is the Cloudx wizard. It prints each phase as it
    runs: Codex CLI verification/login, install choices, `npm ci`, ASR virtualenv
    setup, documentation-indexer virtualenv setup with table-aware extraction
@@ -45,27 +47,29 @@ The installer is split into two visible phases:
    model download, `npm run build`, certificate creation,
    `~/.config/cloudx/cloudx.env` rendering, and optional user-level systemd
    service installation. When services are started, the wizard waits for
-   the HTTPS app health endpoint and ASR health endpoint with bounded retries;
-   if either endpoint does not become healthy, it prints recent systemd status
-   and journal output. When the install finishes, it prints
-   `https://127.0.0.1:<port>`. It prints detected LAN IPv4 URLs only when
-   installed with `--lan`.
+   the HTTPS app, ASR, and documentation indexer health endpoints with bounded
+   retries; if any endpoint does not become healthy, it prints recent systemd
+   status and journal output. When the install finishes, it prints
+   `https://127.0.0.1:<port>`. It prints detected LAN IPv4 URLs only when the
+   LAN/tailnet bind choice is selected or `--lan` is passed.
 
 The wizard asks for:
 
 - Allowed workspace roots, written to `CLOUDX_ALLOWED_ROOTS`.
-- HTTPS port and optional extra certificate hostnames.
+- HTTPS port, localhost versus trusted LAN/tailnet bind, and optional extra
+  certificate hostnames.
 - ASR CPU thread count.
 - Optional `whisper.cpp` ASR setup for documentation imports and voice control.
   Choose `sycl` only after the Intel GPU runtime, oneAPI, and device access are
   available.
-- Whether to write/start `cloudx.service` and `cloudx-asr.service`.
+- Whether to write/start `cloudx.service`, `cloudx-asr.service`, and
+  `cloudx-documentation.service`.
 - Whether to enable systemd linger so user services can survive logout.
 
-When an NVIDIA GPU and CUDA/cuDNN runtime are detected, faster-whisper ASR is
-configured for CUDA automatically. If NVIDIA is present but the runtime is not
-ready, the installer keeps faster-whisper on CPU and prints the missing runtime
-condition.
+When `nvidia-smi` reports an NVIDIA GPU with Linux driver 525.60.13 or newer,
+faster-whisper ASR is configured for CUDA automatically. The installer adds the
+Python CUDA/cuDNN runtime wheels to the managed ASR and documentation virtualenvs
+instead of requiring system-wide CUDA libraries before install.
 
 Each prompt includes a short explanation before the question so the tradeoff is
 visible during interactive installs.
@@ -81,7 +85,7 @@ node scripts/install-cloudx.mjs --dry-run --answers ./answers.json
 ```
 
 Cloudx is private by default and binds to `127.0.0.1`. To expose it on a trusted
-LAN or tailnet, opt in explicitly:
+LAN or tailnet, opt in through the installer prompt or pass:
 
 ```bash
 ./install.sh --lan
@@ -106,9 +110,11 @@ The answers JSON can contain:
 {
   "allowedRoots": "~",
   "port": 3001,
+  "bindLan": false,
   "certificateHosts": "",
   "cpuThreads": 6,
   "useGpu": false,
+  "upgradeGit": true,
   "installWhisperCpp": false,
   "whisperCppBuild": "sycl",
   "whisperCppModel": "large-v3-turbo",
@@ -119,10 +125,14 @@ The answers JSON can contain:
 }
 ```
 
-Faster-whisper GPU support is configure-only in the first Ubuntu installer. If
-an NVIDIA GPU and CUDA/cuDNN runtime are detected, the wizard writes
-`CLOUDX_ASR_DEVICE=cuda` and `CLOUDX_ASR_COMPUTE_TYPE=float16` automatically.
-Set `"useGpu": false` in answers JSON to force CPU.
+Faster-whisper GPU support is installed by the Ubuntu installer when
+`nvidia-smi` reports an NVIDIA GPU with a CUDA 12-compatible driver. Linux
+driver 525.60.13 or newer is required; a 595-series driver is sufficient. The
+wizard installs the Python `nvidia-cublas-cu12` and `nvidia-cudnn-cu12` wheels
+into both managed Python environments, writes `CLOUDX_ASR_DEVICE=cuda`, and
+chooses `CLOUDX_ASR_COMPUTE_TYPE=int8_float16` for smaller GPUs such as 4GB
+cards. Larger GPUs use `float16`. Set `"useGpu": false` in answers JSON to force
+CPU.
 
 ## Update
 
@@ -135,8 +145,8 @@ Run:
 The update path keeps the existing `~/.config/cloudx/cloudx.env` choices and
 does the operational refresh:
 
-- Verifies Ubuntu prerequisites, Node.js, and npm before any Codex or Cloudx npm
-  commands run.
+- Verifies Ubuntu prerequisites, Node.js, npm, and Git 2.36+ before any Codex or
+  Cloudx npm commands run.
 - Pulls the current checkout with `git pull --ff-only`.
 - Updates the global Codex CLI package with npm and verifies Codex login status.
 - Records the resolved assistant executable path in `CLOUDX_ASSISTANT_BIN` and
@@ -144,11 +154,14 @@ does the operational refresh:
   depend on systemd's minimal `PATH`.
 - Reinstalls Node dependencies with `npm ci`.
 - Updates the ASR virtualenv packages and downloads the model if it is missing.
+- Reinstalls the Python NVIDIA cuBLAS/cuDNN wheels when the saved environment
+  config uses `CLOUDX_ASR_DEVICE=cuda`.
 - Rebuilds Cloudx and creates the local HTTPS certificate if it is missing.
 - Rewrites user-level systemd service files when they are already installed.
-- Asks whether to restart services now; if restarted, it verifies the Cloudx and
-  ASR health endpoints and then prints the local URL. Existing installs that
-  already have `CLOUDX_HOST=0.0.0.0` still print detected LAN URLs.
+- Asks whether to restart services now; if restarted, it verifies the Cloudx,
+  ASR, and documentation indexer health endpoints and then prints the local URL.
+  Existing installs that already have `CLOUDX_HOST=0.0.0.0` still print detected
+  LAN URLs.
 
 Preview update without changing the system:
 
@@ -166,8 +179,8 @@ Run:
 
 The uninstall wizard removes Cloudx-managed local artifacts. By default it:
 
-- Stops, disables, and removes `cloudx.service` and `cloudx-asr.service` from
-  `~/.config/systemd/user`.
+- Stops, disables, and removes `cloudx.service`, `cloudx-asr.service`, and
+  `cloudx-documentation.service` from `~/.config/systemd/user`.
 - Removes `~/.config/cloudx/cloudx.env`.
 - Removes the Cloudx-managed Python virtualenvs at `services/asr/.venv` and
   `services/documentation-indexer/.venv`.
@@ -317,9 +330,11 @@ services/asr/.venv/bin/hf download Systran/faster-whisper-large-v3 \
 GPU:
 
 ```bash
+services/asr/.venv/bin/pip install nvidia-cublas-cu12 'nvidia-cudnn-cu12==9.*'
+export LD_LIBRARY_PATH="$(services/asr/.venv/bin/python -c 'import os, nvidia.cublas.lib, nvidia.cudnn.lib; print(os.path.dirname(nvidia.cublas.lib.__file__) + ":" + os.path.dirname(nvidia.cudnn.lib.__file__))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 CLOUDX_ASR_MODEL_PATH=$HOME/.cache/cloudx/models/faster-whisper-large-v3 \
 CLOUDX_ASR_DEVICE=cuda \
-CLOUDX_ASR_COMPUTE_TYPE=float16 \
+CLOUDX_ASR_COMPUTE_TYPE=int8_float16 \
 CLOUDX_ASR_LANGUAGE=en \
 services/asr/.venv/bin/uvicorn cloudx_asr.main:app --app-dir services/asr/src --host 127.0.0.1 --port 7810
 ```
@@ -385,9 +400,9 @@ For a small first test, omit `CLOUDX_ASR_MODEL_PATH` and set
 
 ## Systemd User Services
 
-This command installs ripgrep on Debian/Ubuntu when missing, creates the Python
-venv if needed, downloads the large-v3 model, builds Cloudx, writes user-level
-units, and starts both services:
+This command installs ripgrep on Debian/Ubuntu when missing, creates the ASR and
+documentation indexer Python virtualenvs when needed, downloads the large-v3
+model, builds Cloudx, writes user-level units, and starts all three services:
 
 ```bash
 npm run service:install
@@ -407,14 +422,15 @@ The setup writes:
 
 - `~/.config/cloudx/cloudx.env`
 - `~/.config/systemd/user/cloudx-asr.service`
+- `~/.config/systemd/user/cloudx-documentation.service`
 - `~/.config/systemd/user/cloudx.service`
 
 Service commands:
 
 ```bash
-systemctl --user status cloudx.service cloudx-asr.service
-systemctl --user restart cloudx-asr.service cloudx.service
-journalctl --user -u cloudx.service -u cloudx-asr.service -f
+systemctl --user status cloudx.service cloudx-asr.service cloudx-documentation.service
+systemctl --user restart cloudx-asr.service cloudx-documentation.service cloudx.service
+journalctl --user -u cloudx.service -u cloudx-asr.service -u cloudx-documentation.service -f
 ```
 
 Enable lingering only if you want services to start before login:
@@ -480,6 +496,9 @@ authorization, and process isolation.
 - `CLOUDX_ASR_URL`: ASR service URL, default `http://127.0.0.1:7810`.
 - `CLOUDX_DOCUMENTATION_URL`: documentation indexer URL, default
   `http://127.0.0.1:7820`.
+- `CLOUDX_DOCUMENTATION_HOST`: documentation indexer bind address, default
+  `127.0.0.1`.
+- `CLOUDX_DOCUMENTATION_PORT`: documentation indexer port, default `7820`.
 - `CLOUDX_DOCUMENTATION_TIMEOUT_MS`: documentation indexer and AI enrichment
   timeout, default `1800000`. Increase it for very long media imports, up to
   12 hours.
@@ -506,7 +525,7 @@ ASR options:
 - `CLOUDX_ASR_MODEL`: Faster Whisper model name, default `small`.
 - `CLOUDX_ASR_MODEL_PATH`: local Faster Whisper model directory.
 - `CLOUDX_ASR_DEVICE`: `cuda` or `cpu`, default `cpu`.
-- `CLOUDX_ASR_COMPUTE_TYPE`: for example `float16` or `int8`.
+- `CLOUDX_ASR_COMPUTE_TYPE`: for example `int8`, `int8_float16`, or `float16`.
 - `CLOUDX_ASR_WHISPER_CPP_BIN`: `whisper-cli` binary used when
   `CLOUDX_ASR_BACKEND=whisper-cpp`.
 - `CLOUDX_ASR_WHISPER_CPP_MODEL_PATH`: GGML model file used by whisper.cpp.
