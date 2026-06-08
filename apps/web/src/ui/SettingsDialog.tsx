@@ -11,6 +11,7 @@ export function SettingsDialog({
   rulesSkillsStore,
   onCancel,
   onSave,
+  onClearPluginSecret,
   onSaveDefaultTemplate,
   children
 }: {
@@ -18,6 +19,7 @@ export function SettingsDialog({
   rulesSkillsStore?: RulesSkillsStore;
   onCancel: () => void;
   onSave: (values: CloudxConfigValues) => Promise<void>;
+  onClearPluginSecret?: (pluginId: string, key: string) => Promise<void>;
   onSaveDefaultTemplate?: (templateId: string | undefined) => Promise<void>;
   children?: ReactNode;
 }) {
@@ -93,7 +95,13 @@ export function SettingsDialog({
               <div key={plugin.pluginId} className="settings-plugin-section">
                 <h4>{plugin.displayName}</h4>
                 {plugin.fields.map((field) => (
-                  <ConfigField key={`${plugin.pluginId}:${field.key}`} field={field} value={values.plugins[plugin.pluginId]?.[field.key] ?? field.defaultValue} onChange={(value) => setPluginValue(plugin.pluginId, field.key, value)} />
+                  <ConfigField
+                    key={`${plugin.pluginId}:${field.key}`}
+                    field={field}
+                    value={values.plugins[plugin.pluginId]?.[field.key] ?? field.defaultValue}
+                    onChange={(value) => setPluginValue(plugin.pluginId, field.key, value)}
+                    onClearSecret={field.type === "secret" && field.secretConfigured && onClearPluginSecret ? () => onClearPluginSecret(plugin.pluginId, field.key) : undefined}
+                  />
                 ))}
               </div>
             ))
@@ -110,7 +118,22 @@ export function SettingsDialog({
   );
 }
 
-function ConfigField({ field, value, onChange }: { field: ConfigFieldDescriptor; value: ConfigValue; onChange: (value: ConfigValue) => void }) {
+function ConfigField({ field, value, onChange, onClearSecret }: { field: ConfigFieldDescriptor; value: ConfigValue; onChange: (value: ConfigValue) => void; onClearSecret?: () => Promise<void> }) {
+  const [clearing, setClearing] = useState(false);
+
+  async function clearSecret() {
+    if (!onClearSecret) {
+      return;
+    }
+    setClearing(true);
+    try {
+      await onClearSecret();
+      onChange("");
+    } finally {
+      setClearing(false);
+    }
+  }
+
   if (field.type === "boolean") {
     return (
       <label className="settings-toggle">
@@ -135,6 +158,26 @@ function ConfigField({ field, value, onChange }: { field: ConfigFieldDescriptor;
           ))}
         </select>
         {field.description ? <small>{field.description}</small> : null}
+      </label>
+    );
+  }
+
+  if (field.type === "secret") {
+    return (
+      <label>
+        {field.label}
+        <span className="settings-secret-control">
+          <input
+            type="password"
+            value={String(value)}
+            placeholder={field.secretConfigured ? "Configured" : ""}
+            autoComplete="off"
+            onChange={(event) => onChange(event.target.value)}
+          />
+          {onClearSecret ? <ControlButton size="compact" onClick={() => void clearSecret()} disabled={clearing}>Clear</ControlButton> : null}
+        </span>
+        {field.description ? <small>{field.description}</small> : null}
+        {field.secretConfigured ? <small>Configured. Leave blank to keep the current value.</small> : null}
       </label>
     );
   }

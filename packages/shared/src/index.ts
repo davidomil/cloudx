@@ -521,7 +521,7 @@ export interface UiContributionDescriptor {
 
 export type ConfigValue = boolean | string | number;
 
-export type ConfigFieldType = "boolean" | "string" | "number" | "select";
+export type ConfigFieldType = "boolean" | "string" | "number" | "select" | "secret";
 
 export interface ConfigFieldOption {
   label: string;
@@ -536,6 +536,7 @@ export interface ConfigFieldDescriptor {
   description?: string;
   visibility?: "user" | "internal";
   defaultValue: ConfigValue;
+  secretConfigured?: boolean;
   options?: ConfigFieldOption[];
   min?: number;
   max?: number;

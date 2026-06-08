@@ -1,6 +1,7 @@
 import { CLOUDX_THEME_OPTIONS, DEFAULT_CLOUDX_THEME_ID } from "@cloudx/shared";
 import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, ConfigValue, PluginDescriptor, PluginId } from "@cloudx/shared";
 
+import { ConfigSecretStore, type ConfigSecretPatch } from "./configSecretStore.js";
 import { JsonStateFile } from "./jsonStateFile.js";
 
 export const GLOBAL_CONFIG_FIELDS: ConfigFieldDescriptor[] = [
@@ -64,6 +65,7 @@ export class ConfigService {
 
   readonly configPath: string;
   private readonly configFile: JsonStateFile;
+  private readonly secrets: ConfigSecretStore;
   private values: CloudxConfigValues;
 
   constructor(
@@ -71,6 +73,7 @@ export class ConfigService {
     private readonly listPlugins: () => PluginDescriptor[] = () => []
   ) {
     this.configFile = new JsonStateFile(dataDir, "config.json", "CloudX config");
+    this.secrets = new ConfigSecretStore(dataDir);
     this.configPath = this.configFile.filePath;
     this.values = this.loadStoredConfig();
   }
@@ -92,6 +95,10 @@ export class ConfigService {
     return this.getValues().plugins[pluginId] ?? {};
   }
 
+  getPluginSecret(pluginId: PluginId, key: string): string | undefined {
+    return this.secrets.getPluginSecret(pluginId, key);
+  }
+
   isAiControlEnabled(): boolean {
     return this.getValues().global.aiControlEnabled !== false;
   }
@@ -111,13 +118,31 @@ export class ConfigService {
     const operation = this.writeQueue().then(async () => {
       const plugins = this.pluginSections();
       const latestValues = this.loadStoredConfig();
-      const nextValues = mergeConfigValues(latestValues, validatePatch(patch, GLOBAL_CONFIG_FIELDS, plugins));
+      const validated = validatePatch(patch, GLOBAL_CONFIG_FIELDS, plugins);
+      await this.secrets.update(validated.secrets);
+      const nextValues = mergeConfigValues(latestValues, validated.values);
       await this.persist(nextValues);
       this.values = nextValues;
       return this.getResponse();
     });
     ConfigService.writeQueues.set(queueKey, operation.then(() => undefined, () => undefined));
     return operation;
+  }
+
+  async clearPluginSecret(pluginId: PluginId, key: string): Promise<CloudxConfigResponse> {
+    const fields = this.pluginSections().find((plugin) => plugin.pluginId === pluginId)?.fields;
+    if (!fields) {
+      throwConfigValidationError(`Unknown plugin config section: ${pluginId}`);
+    }
+    const field = fields.find((candidate) => candidate.key === key);
+    if (!field) {
+      throwConfigValidationError(`Unknown config key: plugins.${pluginId}.${key}`);
+    }
+    if (field.type !== "secret") {
+      throwConfigValidationError(`plugins.${pluginId}.${key} is not a secret field.`);
+    }
+    await this.secrets.deletePluginSecret(pluginId, key);
+    return this.getResponse();
   }
 
   private writeQueue(): Promise<void> {
@@ -130,7 +155,7 @@ export class ConfigService {
       .map((plugin) => ({
         pluginId: plugin.id,
         displayName: plugin.displayName,
-        fields: plugin.configFields
+        fields: withPluginSecretState(plugin.id, plugin.configFields, this.secrets)
       }));
   }
 
@@ -170,22 +195,33 @@ export class ConfigService {
   }
 }
 
-function validatePatch(patch: unknown, globalFields: ConfigFieldDescriptor[], plugins: CloudxConfigResponse["plugins"]): CloudxConfigValues {
+interface ValidatedConfigPatch {
+  values: CloudxConfigValues;
+  secrets: ConfigSecretPatch;
+}
+
+function validatePatch(patch: unknown, globalFields: ConfigFieldDescriptor[], plugins: CloudxConfigResponse["plugins"]): ValidatedConfigPatch {
   if (!isRecord(patch)) {
     throwConfigValidationError("Config patch must be an object.");
   }
-  const global = patch.global === undefined ? {} : validateFieldValues(requireRecord(patch.global, "global"), globalFields, "global");
+  const global = patch.global === undefined ? validatedEmptyFields() : validateFieldValues(requireRecord(patch.global, "global"), globalFields, "global");
   const pluginFieldMap = new Map(plugins.map((plugin) => [plugin.pluginId, plugin.fields]));
   const pluginValues: Record<string, Record<string, ConfigValue>> = {};
+  const pluginSecrets: Record<string, Record<string, string>> = {};
   const pluginPatch = patch.plugins === undefined ? {} : requireRecord(patch.plugins, "plugins");
   for (const [pluginId, values] of Object.entries(pluginPatch)) {
     const fields = pluginFieldMap.get(pluginId);
     if (!fields) {
       throwConfigValidationError(`Unknown plugin config section: ${pluginId}`);
     }
-    pluginValues[pluginId] = validateFieldValues(requireRecord(values, `plugins.${pluginId}`), fields, `plugins.${pluginId}`);
+    const validated = validateFieldValues(requireRecord(values, `plugins.${pluginId}`), fields, `plugins.${pluginId}`);
+    pluginValues[pluginId] = validated.values;
+    pluginSecrets[pluginId] = validated.secrets;
   }
-  return { global, plugins: pluginValues };
+  return {
+    values: { global: global.values, plugins: pluginValues },
+    secrets: { global: global.secrets, plugins: pluginSecrets }
+  };
 }
 
 function requireRecord(value: unknown, label: string): Record<string, unknown> {
@@ -195,20 +231,39 @@ function requireRecord(value: unknown, label: string): Record<string, unknown> {
   return value;
 }
 
-function validateFieldValues(values: Record<string, unknown>, fields: ConfigFieldDescriptor[], label: string): Record<string, ConfigValue> {
+interface ValidatedFieldValues {
+  values: Record<string, ConfigValue>;
+  secrets: Record<string, string>;
+}
+
+function validatedEmptyFields(): ValidatedFieldValues {
+  return { values: {}, secrets: {} };
+}
+
+function validateFieldValues(values: Record<string, unknown>, fields: ConfigFieldDescriptor[], label: string): ValidatedFieldValues {
   const fieldMap = new Map(fields.map((field) => [field.key, field]));
-  const validated: Record<string, ConfigValue> = {};
+  const validated = validatedEmptyFields();
   for (const [key, value] of Object.entries(values)) {
     const field = fieldMap.get(key);
     if (!field) {
       throwConfigValidationError(`Unknown config key: ${label}.${key}`);
     }
-    validated[key] = validateFieldValue(value, field, `${label}.${key}`);
+    if (field.type === "secret") {
+      const secret = validateSecretFieldValue(value, `${label}.${key}`);
+      if (secret) {
+        validated.secrets[key] = secret;
+      }
+      continue;
+    }
+    validated.values[key] = validateFieldValue(value, field, `${label}.${key}`);
   }
   return validated;
 }
 
 function validateFieldValue(value: unknown, field: ConfigFieldDescriptor, label: string): ConfigValue {
+  if (field.type === "secret") {
+    return "";
+  }
   if (field.type === "boolean" && typeof value !== "boolean") {
     throwConfigValidationError(`${label} must be a boolean.`);
   }
@@ -230,6 +285,14 @@ function validateFieldValue(value: unknown, field: ConfigFieldDescriptor, label:
   return value as ConfigValue;
 }
 
+function validateSecretFieldValue(value: unknown, label: string): string | undefined {
+  if (typeof value !== "string") {
+    throwConfigValidationError(`${label} must be a string.`);
+  }
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
 function throwConfigValidationError(message: string): never {
   throw new ConfigValidationError(message);
 }
@@ -239,6 +302,9 @@ function resolveFieldValues(fields: ConfigFieldDescriptor[], stored: Record<stri
 }
 
 function resolveStoredFieldValue(value: ConfigValue | undefined, field: ConfigFieldDescriptor): ConfigValue {
+  if (field.type === "secret") {
+    return "";
+  }
   if (value === undefined) {
     return field.defaultValue;
   }
@@ -247,6 +313,12 @@ function resolveStoredFieldValue(value: ConfigValue | undefined, field: ConfigFi
   } catch {
     return field.defaultValue;
   }
+}
+
+function withPluginSecretState(pluginId: PluginId, fields: ConfigFieldDescriptor[], secrets: ConfigSecretStore): ConfigFieldDescriptor[] {
+  return fields.map((field) => field.type === "secret"
+    ? { ...field, defaultValue: "", secretConfigured: secrets.hasPluginSecret(pluginId, field.key) }
+    : field);
 }
 
 function mergeConfigValues(current: CloudxConfigValues, patch: CloudxConfigValues): CloudxConfigValues {

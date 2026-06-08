@@ -46,9 +46,12 @@ import { AudioAiPlugin } from "./plugins/AudioAiPlugin.js";
 import { AutomationPlugin } from "./plugins/AutomationPlugin.js";
 import { NotificationsPlugin } from "./plugins/NotificationsPlugin.js";
 import { PluginDataStore } from "./plugins/PluginDataStore.js";
+import { JiraPlugin } from "./plugins/JiraPlugin.js";
 import { RulesSkillsPlugin } from "./plugins/RulesSkillsPlugin.js";
 import { DocumentationPlugin } from "./plugins/DocumentationPlugin.js";
 import { syncPluginContributions } from "./plugins/pluginContributions.js";
+import { JiraIntegrationService } from "./jira/JiraIntegrationService.js";
+import { JiraPollingService } from "./jira/JiraPollingService.js";
 import { SessionStore } from "./sessionStore.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
 import { RulesSkillsCatalogService } from "./rulesSkills/RulesSkillsCatalogService.js";
@@ -90,6 +93,8 @@ export interface AppServices {
   documentation?: DocumentationClient;
   documentationIngestQueue?: DocumentationIngestQueue;
   documentationEnrichment?: DocumentationEnrichmentService;
+  jira?: JiraIntegrationService;
+  jiraPolling?: JiraPollingService;
   pluginContributionsReady?: Promise<RulesSkillsStore>;
 }
 
@@ -166,6 +171,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
 
   app.addHook("onClose", async () => {
     services.automation?.dispose();
+    services.jiraPolling?.dispose();
     services.voice.dispose?.();
   });
 
@@ -233,6 +239,10 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   app.get("/api/config", async () => services.config!.getResponse());
 
   app.patch<{ Body: Partial<CloudxConfigValues> }>("/api/config", async (request) => services.config!.update(configPatchBody(request.body)));
+
+  app.delete<{ Params: { pluginId: string; key: string } }>("/api/config/plugins/:pluginId/secrets/:key", async (request) =>
+    services.config!.clearPluginSecret(request.params.pluginId, request.params.key)
+  );
 
   app.get<{ Querystring: { query?: string } }>("/api/paths/options", async (request) => ({
     options: await services.pathPolicy.suggestDirectories(request.query.query ?? "")
@@ -961,6 +971,14 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   plugins.register(new DocumentationPlugin(documentation, pathPolicy, documentationIngestQueue, () => documentationEnrichment));
   plugins.register(new WorktreeManagerPlugin());
   plugins.register(new WorkspaceControlPlugin());
+  let jira: JiraIntegrationService | undefined;
+  let jiraPolling: JiraPollingService | undefined;
+  plugins.register(new JiraPlugin(() => {
+    if (!jira) {
+      throw new Error("Jira integration service is not available.");
+    }
+    return jira;
+  }, () => jiraPolling));
   plugins.register(new RulesSkillsPlugin(rulesSkills, async () => {
     if (!sessions) {
       throw new Error("Session store is not available.");
@@ -980,6 +998,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     return automation;
   }));
   const configService = new ConfigService(config.dataDir, () => plugins.list());
+  jira = new JiraIntegrationService(configService);
   sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir), configService, workspace, rulesSkills);
   rulesSkills.onChange(() => {
     void (async () => {
@@ -1023,8 +1042,10 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   const triggers = new TriggerRegistry({ recordEvent: (event) => automationRepository.appendTriggerEvent(event) });
   registerPluginTriggers(triggers, plugins);
   sessions.setTriggerRegistry(triggers);
+  jiraPolling = new JiraPollingService(jira, pluginData, () => triggers);
+  jiraPolling.start();
   automation = createAutomationService(automationRepository, { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config);
-  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, automation, pluginData, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, pluginContributionsReady };
+  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, automation, pluginData, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, pluginContributionsReady };
 }
 
 function isStreamingHookRequest(request: FastifyRequest<{ Querystring: { stream?: string } }>): boolean {

@@ -110,6 +110,39 @@ describe("SettingsDialog", () => {
     expect(html).not.toContain("AI enrichment skills");
     expect(html).not.toContain("Internal Only");
   });
+
+  it("renders a clear action for configured plugin secrets", () => {
+    const html = renderToStaticMarkup(
+      createElement(SettingsDialog, {
+        config: {
+          globalFields: [],
+          plugins: [
+            {
+              pluginId: "jira",
+              displayName: "Jira",
+              fields: [
+                {
+                  key: "apiToken",
+                  label: "Jira API token",
+                  type: "secret",
+                  defaultValue: "",
+                  secretConfigured: true
+                }
+              ]
+            }
+          ],
+          values: { global: {}, plugins: { jira: { apiToken: "" } } }
+        },
+        onCancel: vi.fn(),
+        onSave: vi.fn(async () => undefined),
+        onClearPluginSecret: vi.fn(async () => undefined)
+      })
+    );
+
+    expect(html).toContain("Jira API token");
+    expect(html).toContain("Configured. Leave blank to keep the current value.");
+    expect(html).toContain(">Clear<");
+  });
 });
 
 function configResponse(): CloudxConfigResponse {

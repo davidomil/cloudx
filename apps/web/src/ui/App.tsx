@@ -6,6 +6,7 @@ import { RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT
 import {
   applyLayoutTemplate,
   callHook,
+  clearPluginSecret,
   closeTab,
   createTab,
   createWindow,
@@ -87,6 +88,7 @@ const WORKSPACE_SOCKET_RECONNECT_MAX_MS = 5_000;
 const AutomationPanel = lazy(() => import("./AutomationPanel.js").then((module) => ({ default: module.AutomationPanel })));
 const DocumentationPanel = lazy(() => import("./DocumentationPanel.js").then((module) => ({ default: module.DocumentationPanel })));
 const FileBrowserPanel = lazy(() => import("./FileBrowserPanel.js").then((module) => ({ default: module.FileBrowserPanel })));
+const JiraPanel = lazy(() => import("./JiraPanel.js").then((module) => ({ default: module.JiraPanel })));
 const TerminalPanel = lazy(() => import("./TerminalPanel.js").then((module) => ({ default: module.TerminalPanel })));
 
 function useMediaQuery(query: string): boolean {
@@ -817,6 +819,11 @@ export function App() {
     }
   }
 
+  async function handleClearPluginSecret(pluginId: string, key: string) {
+    const nextConfig = await clearPluginSecret(pluginId, key);
+    setConfig(nextConfig);
+  }
+
   function pluginConfig(pluginId: PluginId): Record<string, ConfigValue> {
     return config?.values.plugins[pluginId] ?? {};
   }
@@ -977,6 +984,11 @@ export function App() {
       );
     },
     [PLUGIN_WEBVIEW_RENDERER]: (contribution, context) => <PluginWebviewPanel contribution={contribution} context={context} />,
+    "jira.panel": (_contribution, context) => context.callHook ? (
+      <Suspense fallback={<div className="empty-pane">Loading Jira...</div>}>
+        <JiraPanel callHook={context.callHook} />
+      </Suspense>
+    ) : <div className="empty-pane">Jira hooks are unavailable.</div>,
     [UI_RENDERER_STATUS_DOT]: (_contribution, context) => (context.tab ? <TabIndicatorDot tab={context.tab} attention={context.attention} /> : null),
     "audio-ai.voice-control": () => renderMicControl("topbar-mic-control", topbarMicControlRef, 17),
     "audio-ai.voice-console": () => {
@@ -1156,6 +1168,7 @@ export function App() {
           rulesSkillsStore={rulesSkillsStore}
           onCancel={() => setSettingsOpen(false)}
           onSave={handleSaveConfig}
+          onClearPluginSecret={handleClearPluginSecret}
           onSaveDefaultTemplate={handleSetDefaultTemplate}
         />
       ) : null}

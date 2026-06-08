@@ -377,6 +377,12 @@ export async function updateConfig(patch: Partial<CloudxConfigValues>): Promise<
   });
 }
 
+export async function clearPluginSecret(pluginId: string, key: string): Promise<CloudxConfigResponse> {
+  return fetchJson(`/api/config/plugins/${encodeURIComponent(pluginId)}/secrets/${encodeURIComponent(key)}`, {
+    method: "DELETE"
+  });
+}
+
 export async function getHealth(): Promise<HealthResponse> {
   return fetchJson("/api/health");
 }

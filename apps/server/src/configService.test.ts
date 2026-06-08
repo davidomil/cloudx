@@ -90,6 +90,36 @@ describe("ConfigService", () => {
     expect(service.getPluginConfig("internal-config").skillIds).toBe("metadata");
   });
 
+  it("stores secret plugin config values outside config.json and redacts responses", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-config-secret-"));
+    const service = new ConfigService(dataDir, () => [secretConfigDescriptor()]);
+
+    const response = await service.update({ plugins: { jira: { siteUrl: "https://example.atlassian.net", apiToken: "secret-token" } } });
+
+    expect(response.values.plugins.jira.apiToken).toBe("");
+    expect(response.plugins[0]?.fields.find((field) => field.key === "apiToken")).toMatchObject({
+      type: "secret",
+      secretConfigured: true
+    });
+    await expect(fs.readFile(path.join(dataDir, "config.json"), "utf8")).resolves.not.toContain("secret-token");
+    const secretPath = path.join(dataDir, "secrets", "config-secrets.json");
+    await expect(fs.readFile(secretPath, "utf8")).resolves.toContain("secret-token");
+    if (process.platform !== "win32") {
+      expect((await fs.stat(secretPath)).mode & 0o777).toBe(0o600);
+    }
+
+    const reloaded = new ConfigService(dataDir, () => [secretConfigDescriptor()]);
+    expect(reloaded.getResponse().values.plugins.jira.apiToken).toBe("");
+    expect(reloaded.getPluginSecret("jira", "apiToken")).toBe("secret-token");
+    await reloaded.update({ plugins: { jira: { siteUrl: "https://other.atlassian.net", apiToken: "" } } });
+    expect(reloaded.getPluginSecret("jira", "apiToken")).toBe("secret-token");
+
+    const cleared = await reloaded.clearPluginSecret("jira", "apiToken");
+    expect(cleared.plugins[0]?.fields.find((field) => field.key === "apiToken")).toMatchObject({ secretConfigured: false });
+    expect(reloaded.getPluginSecret("jira", "apiToken")).toBeUndefined();
+    await expect(fs.readFile(secretPath, "utf8")).resolves.not.toContain("secret-token");
+  });
+
   it("merges updates from separate service instances against the latest persisted config", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-config-cross-instance-"));
     const first = new ConfigService(dataDir, () => [fileBrowserDescriptor()]);
@@ -271,6 +301,33 @@ function internalConfigDescriptor(): PluginDescriptor {
         type: "string",
         visibility: "internal",
         defaultValue: "metadata,visuals"
+      }
+    ]
+  };
+}
+
+function secretConfigDescriptor(): PluginDescriptor {
+  return {
+    id: "jira",
+    acronym: "JIR",
+    displayName: "Jira",
+    description: "Jira",
+    panelKind: "placeholder",
+    creatable: true,
+    requiresDirectory: false,
+    actions: [],
+    configFields: [
+      {
+        key: "siteUrl",
+        label: "Site URL",
+        type: "string",
+        defaultValue: ""
+      },
+      {
+        key: "apiToken",
+        label: "API token",
+        type: "secret",
+        defaultValue: ""
       }
     ]
   };

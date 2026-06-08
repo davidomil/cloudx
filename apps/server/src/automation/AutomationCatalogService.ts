@@ -61,9 +61,16 @@ export class AutomationCatalogService {
         execOutput("exec", "Start", "Starts automation execution when this trigger fires."),
         dataOutput("payload", "Payload", payloadType, "Complete trigger payload object.", { connectable: false }),
         ...(await Promise.all(
-          Object.entries(payloadProperties).filter(([id]) => id !== "payload").map(async ([id, type]) =>
-            dataOutput(id, titleCase(id), type, descriptionFromSchema(propertySchemas[id]) ?? `${titleCase(id)} value from the ${trigger.title} trigger payload.`)
-          )
+          Object.entries(payloadProperties).filter(([id]) => id !== "payload").map(async ([id, type]) => {
+            const metadata = await this.portMetadata(propertySchemas[id]);
+            return dataOutput(
+              id,
+              titleCase(id),
+              type,
+              metadata.description ?? descriptionFromSchema(propertySchemas[id]) ?? `${titleCase(id)} value from the ${trigger.title} trigger payload.`,
+              { connectable: metadata.connectable }
+            );
+          })
         ))
       ]
     };

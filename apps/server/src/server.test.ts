@@ -478,11 +478,14 @@ describe("buildServer", () => {
 
     expect(store.systemRules.map((rule) => rule.id)).toContain("documentation-ingest-evidence");
     expect(store.systemSkills.map((skill) => skill.id)).toContain("documentation-search");
+    expect(store.systemSkills.map((skill) => skill.id)).toContain("jira-create-ticket");
     expect(store.systemSkills.map((skill) => skill.id)).not.toContain("documentation-answer");
     const ruleFile = await fs.readFile(path.join(services.rulesSkills!.catalogRoot(), "system-rules", "documentation-ingest-evidence.md"), "utf8");
     const searchSkillFile = await fs.readFile(path.join(services.rulesSkills!.catalogRoot(), "system-skills", "documentation-search", "SKILL.md"), "utf8");
     const ingestHelperFile = await fs.readFile(path.join(services.rulesSkills!.catalogRoot(), "system-skills", "documentation-ingest", "scripts", "cloudx-doc.mjs"), "utf8");
     const archiveHelperFile = await fs.readFile(path.join(services.rulesSkills!.catalogRoot(), "system-skills", "documentation-archive-control", "scripts", "cloudx-doc.mjs"), "utf8");
+    const jiraSkillFile = await fs.readFile(path.join(services.rulesSkills!.catalogRoot(), "system-skills", "jira-create-ticket", "SKILL.md"), "utf8");
+    const jiraHelperFile = await fs.readFile(path.join(services.rulesSkills!.catalogRoot(), "system-skills", "jira-create-ticket", "scripts", "cloudx-jira.mjs"), "utf8");
     expect(ruleFile).toContain("Before answering source-grounded questions");
     expect(ruleFile).toContain("ingest the original source through the documentation ingest hooks");
     expect(ruleFile).toContain("use text ingest only when no original source is available");
@@ -491,6 +494,10 @@ describe("buildServer", () => {
     expect(searchSkillFile).toContain("ingest the original file, PDF, image, URL, YouTube video, or playlist");
     expect(ingestHelperFile).toContain("ingest-url");
     expect(archiveHelperFile).toContain("manifest");
+    expect(jiraSkillFile).toContain("cloudx-jira.mjs");
+    expect(jiraSkillFile).toContain("node \"$JIRA\" create");
+    expect(jiraHelperFile).toContain("jira.connection.status");
+    expect(jiraHelperFile).toContain("jira.issue.create");
     await expect(fs.stat(staleAnswerSkillDir)).rejects.toThrow();
     expect(applyRuntimeContexts).toHaveBeenCalledWith(expect.any(Function), "Injecting plugin-contributed system rules and skills.");
   });
@@ -752,10 +759,15 @@ describe("buildServer", () => {
       const hooks = await app.inject({ method: "GET", url: "/api/hooks" });
       expect(hooks.statusCode).toBe(200);
       expect(hooks.json().hooks.map((hook: { id: string }) => hook.id)).toEqual(
-        expect.arrayContaining(["workspace.tabs.create", "local-web.openUrl", "audio-ai.submitTranscript"])
+        expect.arrayContaining(["workspace.tabs.create", "local-web.openUrl", "audio-ai.submitTranscript", "jira.dashboard.list", "jira.issue.create"])
       );
 
       const plugins = await app.inject({ method: "GET", url: "/api/plugins" });
+      expect(plugins.json().plugins.find((plugin: { id: string }) => plugin.id === "jira")).toEqual(
+        expect.objectContaining({
+          uiContributions: expect.arrayContaining([expect.objectContaining({ id: "jira.panel", slot: "plugin.panel", renderer: "jira.panel" })])
+        })
+      );
       expect(plugins.json().plugins.find((plugin: { id: string }) => plugin.id === "audio-ai").uiContributions).toEqual(
         expect.arrayContaining([expect.objectContaining({ slot: "app.footer.actions", renderer: "audio-ai.voice-console" })])
       );
@@ -813,7 +825,7 @@ describe("buildServer", () => {
     try {
       const triggers = await app.inject({ method: "GET", url: "/api/triggers" });
       expect(triggers.statusCode).toBe(200);
-      expect(triggers.json().triggers).toEqual(expect.arrayContaining([expect.objectContaining({ id: "worktree.created" })]));
+      expect(triggers.json().triggers).toEqual(expect.arrayContaining([expect.objectContaining({ id: "worktree.created" }), expect.objectContaining({ id: "jira.issueUpdated" })]));
 
       const malformedTrigger = await app.inject({
         method: "POST",
@@ -835,6 +847,8 @@ describe("buildServer", () => {
       expect(catalog.json().nodes).toEqual(
         expect.arrayContaining([
           expect.objectContaining({ typeId: "trigger:worktree.created" }),
+          expect.objectContaining({ typeId: "trigger:jira.issueUpdated" }),
+          expect.objectContaining({ typeId: "hook:jira.issue.create" }),
           expect.objectContaining({ typeId: "hook:workspace.layoutTemplates.apply" }),
           expect.objectContaining({ typeId: "hook:workspace.shell.runCommand" }),
           expect.objectContaining({ typeId: "hook:notifications.send" }),
@@ -842,6 +856,14 @@ describe("buildServer", () => {
           expect.objectContaining({ typeId: "primitive:string.split" }),
           expect.objectContaining({ typeId: "primitive:math.add" }),
           expect.objectContaining({ typeId: "primitive:math.divide" })
+        ])
+      );
+      expect(catalogNodes.find((node: { typeId: string }) => node.typeId === "trigger:jira.issueUpdated").outputs).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: "issueKey", kind: "data" }),
+          expect.objectContaining({ id: "issueUrl", kind: "data" }),
+          expect.objectContaining({ id: "summary", kind: "data" }),
+          expect.objectContaining({ id: "issue", connectable: false })
         ])
       );
       expect(catalogNodes.find((node: { typeId: string }) => node.typeId === "hook:codex-terminal.enterText")).toMatchObject({ title: "Enter Text" });
@@ -987,6 +1009,50 @@ describe("buildServer", () => {
       const missingDelete = await app.inject({ method: "DELETE", url: "/api/automation/groups/missing-group" });
       expect(missingDelete.statusCode).toBe(404);
       expect(missingDelete.json().message).toBe("Unknown automation group: missing-group");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("runs a saved automation graph from a Jira trigger event", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-jira-trigger-automation-"));
+    const app = await buildServer(testConfig(root));
+    try {
+      const graph = {
+        schemaVersion: 1,
+        nodes: [
+          { id: "trigger", typeId: "trigger:jira.issueUpdated", position: { x: 0, y: 0 } },
+          { id: "notify", typeId: "hook:notifications.send", position: { x: 280, y: 0 }, config: { level: "info" } }
+        ],
+        edges: [
+          { id: "exec", kind: "exec", sourceNodeId: "trigger", sourcePortId: "exec", targetNodeId: "notify", targetPortId: "exec" },
+          { id: "title", kind: "data", sourceNodeId: "trigger", sourcePortId: "issueKey", targetNodeId: "notify", targetPortId: "title" },
+          { id: "body", kind: "data", sourceNodeId: "trigger", sourcePortId: "summary", targetNodeId: "notify", targetPortId: "body" }
+        ],
+        variables: [],
+        allowedSafety: ["read", "write", "external"]
+      };
+      const saved = await app.inject({
+        method: "PUT",
+        url: "/api/automation/groups/jira-notify",
+        payload: { name: "Jira notify", enabled: true, graph }
+      });
+      expect(saved.statusCode).toBe(200);
+      expect(saved.json().group.lastValidation).toEqual({ valid: true, diagnostics: [] });
+
+      const emitted = await app.inject({
+        method: "POST",
+        url: "/api/triggers/jira.issueUpdated",
+        payload: {
+          payload: jiraTriggerPayload()
+        }
+      });
+      expect(emitted.statusCode).toBe(200);
+
+      const run = await waitForServerRun(app, "jira-notify");
+      expect(run).toMatchObject({ groupId: "jira-notify", status: "succeeded" });
+      const notifications = await app.inject({ method: "GET", url: "/api/notifications" });
+      expect(notifications.json().notifications[0]).toMatchObject({ title: "ENG-7", body: "Fix deploy pipeline" });
     } finally {
       await app.close();
     }
@@ -1142,6 +1208,28 @@ describe("buildServer", () => {
       const emptyPatch = await app.inject({ method: "PATCH", url: "/api/config" });
       expect(emptyPatch.statusCode).toBe(200);
       expect(emptyPatch.json().values.global.aiControlEnabled).toBe(false);
+
+      const jiraSecret = await app.inject({
+        method: "PATCH",
+        url: "/api/config",
+        payload: {
+          plugins: {
+            jira: {
+              siteUrl: "https://example.atlassian.net",
+              accountEmail: "david@example.com",
+              apiToken: "jira-secret-token"
+            }
+          }
+        }
+      });
+      expect(jiraSecret.statusCode).toBe(200);
+      expect(jiraSecret.json().values.plugins.jira.apiToken).toBe("");
+      expect(jiraSecret.json().plugins.find((plugin: { pluginId: string }) => plugin.pluginId === "jira").fields.find((field: { key: string }) => field.key === "apiToken")).toMatchObject({ secretConfigured: true });
+      await expect(fs.readFile(path.join(config.dataDir, "config.json"), "utf8")).resolves.not.toContain("jira-secret-token");
+
+      const clearedJiraSecret = await app.inject({ method: "DELETE", url: "/api/config/plugins/jira/secrets/apiToken" });
+      expect(clearedJiraSecret.statusCode).toBe(200);
+      expect(clearedJiraSecret.json().plugins.find((plugin: { pluginId: string }) => plugin.pluginId === "jira").fields.find((field: { key: string }) => field.key === "apiToken")).toMatchObject({ secretConfigured: false });
 
       const malformedGlobalPatch = await app.inject({ method: "PATCH", url: "/api/config", payload: { global: null } });
       expect(malformedGlobalPatch.statusCode).toBe(400);
@@ -2841,4 +2929,41 @@ function withTimeout<T>(promise: Promise<T>, message: string): Promise<T> {
       }
     );
   });
+}
+
+async function waitForServerRun(app: Awaited<ReturnType<typeof buildServer>>, groupId: string): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + 1000;
+  while (Date.now() < deadline) {
+    const runs = await app.inject({ method: "GET", url: "/api/automation/runs" });
+    const run = (runs.json().runs as Record<string, unknown>[]).find((candidate) => candidate.groupId === groupId);
+    if (run && run.status !== "running" && run.status !== "queued") {
+      return run;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for automation run ${groupId}.`);
+}
+
+function jiraTriggerPayload(): Record<string, unknown> {
+  return {
+    eventId: "jira:test:jira.issueUpdated:10001:updated",
+    eventType: "jira.issueUpdated",
+    transport: "poll",
+    siteUrl: "https://example.atlassian.net",
+    projectKey: "ENG",
+    projectId: "100",
+    issueId: "10001",
+    issueKey: "ENG-7",
+    issueUrl: "https://example.atlassian.net/browse/ENG-7",
+    summary: "Fix deploy pipeline",
+    issueType: "Task",
+    issueTypeId: "10001",
+    status: "Open",
+    statusId: "3",
+    priority: "High",
+    priorityId: "2",
+    assigneeAccountId: "abc",
+    changedFieldIds: ["updated"],
+    detectedAt: "2026-06-08T10:00:00.000Z"
+  };
 }
