@@ -266,14 +266,14 @@ The plugin contributes this universal CloudX system rule automatically at server
 
 | Rule | Purpose |
 |---|---|
-| `documentation-ingest-evidence` | Before factual, research, recipe, recommendation, troubleshooting, summary, or source-grounded answers, query the active local documentation archive first with `POST $CLOUDX_DOCUMENTATION_URL/search`; when local evidence is absent, stale, or insufficient, use reliable online sources, add useful sources back into the archive when ingestion is possible, rerun local search, preserve precise metadata, and invalidate older conflicting records. |
+| `documentation-ingest-evidence` | Search active local archive records first. When adding evidence from a file, PDF, image, URL, YouTube video, or playlist, ingest the original source so the full extractor runs; use text ingest only when no original source is available. |
 
 The plugin contributes seven CloudX system skills automatically at server startup:
 
 | Skill | Purpose |
 |---|---|
-| `documentation-search` | Mandatory local-first lookup for factual, research, recipe, recommendation, troubleshooting, summary, and source-grounded questions; open matching documents and use active source-grounded results, then use reliable online sources only when local evidence is weak or missing, ingest them, rerun local search, and answer from the refreshed archive. |
-| `documentation-ingest` | Add files, directories, durable websites, YouTube videos/playlists, copied text, or transcripts with optional auto metadata; prefer primary online source URLs over search-result pages or low-trust mirrors. |
+| `documentation-search` | Mandatory local-first lookup for factual, research, recipe, recommendation, troubleshooting, summary, and source-grounded questions; when adding evidence, route original files, PDFs, images, URLs, YouTube videos, and playlists through full ingest before answering from refreshed archive records. |
+| `documentation-ingest` | Add original files, directories, websites, PDFs, images, YouTube videos/playlists, and copied text only when no retrievable original exists; prefer primary source URLs over search-result pages or low-trust mirrors. |
 | `documentation-invalidate` | Find and invalidate stale, wrong, superseded, quarantined, or deleted sources. |
 | `documentation-enrich-metadata` | Derive source-grounded metadata and searchable import-improvement notes. |
 | `documentation-enrich-visuals` | Describe extracted tables, graphs, diagrams, screenshots, and flowcharts without inventing visual facts. |

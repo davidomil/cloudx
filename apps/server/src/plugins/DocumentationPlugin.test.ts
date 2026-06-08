@@ -194,10 +194,9 @@ describe("DocumentationPlugin", () => {
       "documentation-ingest-evidence"
     ]);
     expect(plugin.adoptUserSkillContributionIds).toContain("documentation-search");
-    expect(plugin.ruleContributions[0]?.text).toContain("Before answering any factual, research, recipe, recommendation, troubleshooting, summary, or source-grounded user question");
-    expect(plugin.ruleContributions[0]?.text).toContain("POST $CLOUDX_DOCUMENTATION_URL/search");
-    expect(plugin.ruleContributions[0]?.text).toContain("reliable online sources");
-    expect(plugin.ruleContributions[0]?.text).toContain("add each useful online source back into the CloudX documentation knowledge base");
+    expect(plugin.ruleContributions[0]?.text).toContain("Before answering source-grounded questions");
+    expect(plugin.ruleContributions[0]?.text).toContain("ingest the original source through the documentation ingest hooks");
+    expect(plugin.ruleContributions[0]?.text).toContain("use text ingest only when no original source is available");
     expect(plugin.skillContributions.map((skill) => skill.id)).toEqual([
       "documentation-search",
       "documentation-ingest",
@@ -212,6 +211,8 @@ describe("DocumentationPlugin", () => {
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("Before answering any factual, research, recipe, recommendation, troubleshooting, summary, or source-grounded question");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("If active local results are absent, weak, stale, or do not cover the user's question, use built-in web search");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("After ingesting web sources, rerun local archive search");
+    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("ingest the original file, PDF, image, URL, YouTube video, or playlist");
+    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-ingest")?.instructions).toContain("Always ingest PDFs, images, documents, YouTube videos, and YouTube playlists as original sources");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-ingest")?.instructions).toContain("prefer durable primary URLs");
     expect(plugin.skillContributions.some((skill) => skill.id === "documentation-answer")).toBe(false);
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-enrich-visuals")?.instructions).toContain("ai:visual");

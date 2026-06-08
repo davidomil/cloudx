@@ -481,11 +481,12 @@ describe("buildServer", () => {
     expect(store.systemSkills.map((skill) => skill.id)).not.toContain("documentation-answer");
     const ruleFile = await fs.readFile(path.join(services.rulesSkills!.catalogRoot(), "system-rules", "documentation-ingest-evidence.md"), "utf8");
     const searchSkillFile = await fs.readFile(path.join(services.rulesSkills!.catalogRoot(), "system-skills", "documentation-search", "SKILL.md"), "utf8");
-    expect(ruleFile).toContain("Before answering any factual, research, recipe, recommendation, troubleshooting, summary, or source-grounded user question");
-    expect(ruleFile).toContain("POST $CLOUDX_DOCUMENTATION_URL/search");
-    expect(ruleFile).toContain("add each useful online source back into the CloudX documentation knowledge base");
+    expect(ruleFile).toContain("Before answering source-grounded questions");
+    expect(ruleFile).toContain("ingest the original source through the documentation ingest hooks");
+    expect(ruleFile).toContain("use text ingest only when no original source is available");
     expect(searchSkillFile).toContain("CLOUDX_DOCUMENTATION_URL");
     expect(searchSkillFile).toContain("Before answering any factual, research, recipe, recommendation, troubleshooting, summary, or source-grounded question");
+    expect(searchSkillFile).toContain("ingest the original file, PDF, image, URL, YouTube video, or playlist");
     await expect(fs.stat(staleAnswerSkillDir)).rejects.toThrow();
     expect(applyRuntimeContexts).toHaveBeenCalledWith(expect.any(Function), "Injecting plugin-contributed system rules and skills.");
   });
