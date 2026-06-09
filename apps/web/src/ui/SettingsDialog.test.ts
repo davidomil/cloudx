@@ -143,6 +143,22 @@ describe("SettingsDialog", () => {
     expect(html).toContain("Configured. Leave blank to keep the current value.");
     expect(html).toContain(">Clear<");
   });
+
+  it("renders browser notification permission status and request action", () => {
+    const html = renderToStaticMarkup(
+      createElement(SettingsDialog, {
+        config: configResponse(),
+        browserNotificationState: "default",
+        onRequestBrowserNotifications: vi.fn(async () => undefined),
+        onCancel: vi.fn(),
+        onSave: vi.fn(async () => undefined)
+      })
+    );
+
+    expect(html).toContain("Browser Notifications");
+    expect(html).toContain("Allow Cloudx to mirror in-app notifications through the browser notification system.");
+    expect(html).toContain("Request permission");
+  });
 });
 
 function configResponse(): CloudxConfigResponse {

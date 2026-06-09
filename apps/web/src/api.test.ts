@@ -4,10 +4,13 @@ import {
   applyLayoutTemplate,
   callHook,
   closeTab,
+  deleteAllNotifications,
   deleteAutomationGroup,
+  deleteNotification,
   deleteLayoutTemplate,
   deleteWindow,
   downloadFileBrowserEntries,
+  emitTrigger,
   fetchJson,
   fileBrowserRawFileUrl,
   filenameFromContentDisposition,
@@ -33,19 +36,32 @@ describe("api client", () => {
   });
 
   it("does not send a JSON content-type header for empty DELETE requests", async () => {
+    const notification = { id: "n/1", title: "Done", level: "info", at: new Date(0).toISOString() };
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(jsonResponse({ activeTabId: "next-tab" }))
-      .mockResolvedValueOnce(jsonResponse({ groups: [] }));
+      .mockResolvedValueOnce(jsonResponse({ groups: [] }))
+      .mockResolvedValueOnce(jsonResponse({ notifications: [notification] }))
+      .mockResolvedValueOnce(jsonResponse({ notifications: [] }));
     vi.stubGlobal("fetch", fetchMock);
 
     await closeTab("tab-1");
     await deleteAutomationGroup("automation-1");
+    await expect(deleteNotification("n/1")).resolves.toEqual([notification]);
+    await expect(deleteAllNotifications()).resolves.toEqual([]);
 
     expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/tabs/tab-1", {
       method: "DELETE",
       headers: undefined
     });
     expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/automation/groups/automation-1", {
+      method: "DELETE",
+      headers: undefined
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/notifications/n%2F1", {
+      method: "DELETE",
+      headers: undefined
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(4, "/api/notifications", {
       method: "DELETE",
       headers: undefined
     });
@@ -60,6 +76,19 @@ describe("api client", () => {
     expect(fetchMock).toHaveBeenCalledWith("/api/tabs/tab-1/active", {
       method: "POST",
       body: "{}",
+      headers: { "content-type": "application/json" }
+    });
+  });
+
+  it("emits automation triggers through the trigger endpoint", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ event: { id: "event-1", triggerId: "jira.issueManualRun", source: { kind: "http" }, payload: {}, emittedAt: new Date(0).toISOString() } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(emitTrigger("jira.issueManualRun", { issueKey: "ENG-7" })).resolves.toMatchObject({ id: "event-1" });
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/triggers/jira.issueManualRun", {
+      method: "POST",
+      body: JSON.stringify({ payload: { issueKey: "ENG-7" } }),
       headers: { "content-type": "application/json" }
     });
   });

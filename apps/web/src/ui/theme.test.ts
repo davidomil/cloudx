@@ -28,7 +28,34 @@ describe("theme", () => {
     expect(root.style.getPropertyValue("--automation-node-background")).toBe("rgba(26, 26, 36, 0.94)");
     expect(root.style.getPropertyValue("--automation-palette-button-hover-background")).toBe("rgba(245, 158, 11, 0.2)");
     expect(root.style.getPropertyValue("--automation-input-border")).toBe("rgba(245, 158, 11, 0.24)");
+    expect(root.style.getPropertyValue("--surface-popover-background")).toBe("rgba(10, 10, 15, 0.98)");
+    expect(root.style.getPropertyValue("--surface-popover-border")).toBe("rgba(245, 158, 11, 0.32)");
+    expect(root.style.getPropertyValue("--surface-dock-button-shadow")).toContain("rgba(245, 158, 11");
+    expect(root.style.getPropertyValue("--resize-handle-background")).toContain("rgba(245, 158, 11");
+    expect(root.style.getPropertyValue("--plugin-panel-dock-button-size")).toBe("44px");
+    expect(root.style.getPropertyValue("--plugin-panel-dock-panel-height")).toBe("580px");
+    expect(root.style.getPropertyValue("--notification-count-size")).toBe("17px");
+    expect(root.style.getPropertyValue("--notification-popover-width")).toBe("420px");
+    expect(root.style.getPropertyValue("--font-body")).toContain("\"Inter\"");
+    expect(root.style.getPropertyValue("--font-mono")).toContain("\"JetBrains Mono\"");
+    expect(root.style.getPropertyValue("--font-size-sm")).toBe("0.6875rem");
+    expect(root.style.getPropertyValue("--line-height-normal")).toBe("1.45");
     expect(root.style.getPropertyValue("--chamfer")).toBe("inset(0 round 12px)");
+  });
+
+  it("keeps typography scale and layout tokens shared without flattening theme fonts", () => {
+    const neonRoot = document.createElement("div");
+    const minimalistRoot = document.createElement("div");
+
+    expect(applyCloudxTheme("cloudx-neon", neonRoot)).toBe("cloudx-neon");
+    expect(applyCloudxTheme("minimalist-dark", minimalistRoot)).toBe("minimalist-dark");
+
+    expect(neonRoot.style.getPropertyValue("--font-heading")).toContain("\"Orbitron\"");
+    expect(minimalistRoot.style.getPropertyValue("--font-heading")).toContain("\"Space Grotesk\"");
+    expect(neonRoot.style.getPropertyValue("--font-body")).not.toBe(minimalistRoot.style.getPropertyValue("--font-body"));
+    for (const token of ["--font-size-xs", "--font-size-md", "--line-height-compact", "--plugin-panel-dock-button-size", "--plugin-panel-dock-menu-gap", "--notification-count-size", "--notification-popover-width"]) {
+      expect(neonRoot.style.getPropertyValue(token)).toBe(minimalistRoot.style.getPropertyValue(token));
+    }
   });
 
   it("reads terminal colors from CSS variables", () => {

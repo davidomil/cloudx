@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RULES_SKILLS_PLUGIN_ID, type PluginDescriptor, type WorkspaceStateResponse } from "@cloudx/shared";
 
-import { codexTabInitialInput, loadAudioInputId, persistAudioInputId, requestAudioInputEnumerationAccess, selectCreateTabPluginId, subscribeWorkspaceUpdates, voiceControlSettings, workspaceStateWithPreservedLayout } from "./App.js";
+import { codexTabInitialInput, loadAudioInputId, notificationToastIdsAfterDismiss, persistAudioInputId, requestAudioInputEnumerationAccess, selectCreateTabPluginId, subscribeWorkspaceUpdates, voiceControlSettings, workspaceStateWithPreservedLayout } from "./App.js";
 import { pluginMetadataForTemplate, selectedTemplateId } from "./RulesSkillsPanel.js";
 import { collectUiContributions, selectTabIndicatorContribution } from "./uiContributions.js";
 import { parseWorkspaceSocketUpdate } from "./workspaceSocketUpdate.js";
@@ -88,6 +88,16 @@ describe("voiceControlSettings", () => {
       voiceCommandsEnabled: false,
       microphoneEnabled: false
     });
+  });
+});
+
+describe("notification toast helpers", () => {
+  it("removes a toast id without removing durable notification state", () => {
+    const current = new Set(["n1", "n2"]);
+    const next = notificationToastIdsAfterDismiss(current, "n1");
+
+    expect([...next]).toEqual(["n2"]);
+    expect([...current]).toEqual(["n1", "n2"]);
   });
 });
 

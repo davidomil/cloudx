@@ -18,7 +18,9 @@ import type {
   PathOptionsResponse,
   PathOption,
   PluginDescriptor,
+  CloudxNotification,
   SearchWorkspaceWindowsResponse,
+  TriggerEvent,
   TriggerDescriptor,
   TriggerListResponse,
   UpdateWorkspaceLayoutTemplateRequest,
@@ -309,6 +311,14 @@ export async function getTriggers(): Promise<TriggerDescriptor[]> {
   return body.triggers;
 }
 
+export async function emitTrigger(triggerId: string, payload: Record<string, unknown> = {}): Promise<TriggerEvent> {
+  const body = await fetchJson<{ event: TriggerEvent }>(`/api/triggers/${encodeURIComponent(triggerId)}`, {
+    method: "POST",
+    body: JSON.stringify({ payload })
+  });
+  return body.event;
+}
+
 export async function getAutomationCatalog(): Promise<AutomationCatalogResponse> {
   return fetchJson("/api/automation/catalog");
 }
@@ -381,6 +391,25 @@ export async function clearPluginSecret(pluginId: string, key: string): Promise<
   return fetchJson(`/api/config/plugins/${encodeURIComponent(pluginId)}/secrets/${encodeURIComponent(key)}`, {
     method: "DELETE"
   });
+}
+
+export async function getNotifications(): Promise<CloudxNotification[]> {
+  const body = await fetchJson<{ notifications: CloudxNotification[] }>("/api/notifications");
+  return body.notifications;
+}
+
+export async function deleteAllNotifications(): Promise<CloudxNotification[]> {
+  const body = await fetchJson<{ notifications: CloudxNotification[] }>("/api/notifications", {
+    method: "DELETE"
+  });
+  return body.notifications;
+}
+
+export async function deleteNotification(notificationId: string): Promise<CloudxNotification[]> {
+  const body = await fetchJson<{ notifications: CloudxNotification[] }>(`/api/notifications/${encodeURIComponent(notificationId)}`, {
+    method: "DELETE"
+  });
+  return body.notifications;
 }
 
 export async function getHealth(): Promise<HealthResponse> {

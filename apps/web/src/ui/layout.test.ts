@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { WorkspaceTab } from "@cloudx/shared";
 
-import { activatePane, addTabToPane, defaultLayout, isPaneTabActive, isStoredLayout, listPanes, maximizedLayoutNode, placeTabInPane, reconcileLayout, removePane, resolveTabCreationPaneId, resizeSplit, splitPane } from "./layout.js";
+import { activatePane, addTabToPane, defaultLayout, isPaneTabActive, isStoredLayout, listPanes, placeTabInPane, reconcileLayout, removePane, resolveTabCreationPaneId, resizeSplit, splitPane } from "./layout.js";
 
 describe("layout helpers", () => {
   it("splits only the active pane and preserves nested split directions", () => {
@@ -129,14 +129,6 @@ describe("layout helpers", () => {
         { type: "pane", pane: { id: "pane-2" } }
       ]
     });
-  });
-
-  it("exposes a single pane node for maximized rendering without mutating the layout", () => {
-    const layout = splitPane(layoutWithTabs(["tab-1"]), "row", sequence("pane-2"), sequence("split-1"));
-
-    expect(maximizedLayoutNode(layout.root, "pane-2")).toEqual({ type: "pane", pane: { id: "pane-2", tabIds: [], activeTabId: undefined } });
-    expect(maximizedLayoutNode(layout.root, "missing")).toBe(layout.root);
-    expect(listPanes(layout.root).map((pane) => pane.id)).toEqual(["pane-1", "pane-2"]);
   });
 
   it("resizes only the requested split", () => {

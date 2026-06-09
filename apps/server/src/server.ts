@@ -195,7 +195,17 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
 
   app.get("/api/triggers", async () => ({ triggers: services.triggers!.list() }));
 
-  app.get("/api/notifications", async () => ({ notifications: services.notifications?.list() ?? [] }));
+  app.get("/api/notifications", async () => ({ notifications: requireNotifications(services).list() }));
+
+  app.delete("/api/notifications", async () => ({ notifications: requireNotifications(services).dismissAll() }));
+
+  app.delete<{ Params: { notificationId: string } }>("/api/notifications/:notificationId", async (request) => {
+    const notifications = requireNotifications(services).dismiss(request.params.notificationId);
+    if (!notifications) {
+      throwNotFound(`Unknown notification: ${request.params.notificationId}`);
+    }
+    return { notifications };
+  });
 
   app.post<{ Params: { triggerId: string }; Body: { payload?: Record<string, unknown> } }>("/api/triggers/:triggerId", async (request) => ({
     event: await services.triggers!.emit(request.params.triggerId, optionalBodyRecord(optionalRequestBody(request.body).payload, "payload") ?? {}, { kind: "http" })
@@ -1182,6 +1192,13 @@ function createAutomationService(repository: AutomationRepository, services: App
     startDisabled: config?.automationStartDisabled,
     layoutEffects: services.workspace
   });
+}
+
+function requireNotifications(services: AppServices): NotificationsPlugin {
+  if (!services.notifications) {
+    throw new Error("Notifications service is not available.");
+  }
+  return services.notifications;
 }
 
 function buildAutomationDynamicOptionsProvider(services: AppServices): AutomationDynamicOptionProvider {

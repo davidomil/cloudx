@@ -44,8 +44,16 @@ describe("JiraPlugin", () => {
       "jira.issueTransitioned",
       "jira.issueNewlyAssigned",
       "jira.issueAssignedToMe",
+      "jira.issueManualRun",
       "jira.commentCreated"
     ]);
+    expect(descriptor.triggers?.find((trigger) => trigger.id === "jira.issueManualRun")).toMatchObject({
+      title: "Jira Issue Play Clicked",
+      exposures: expect.arrayContaining(["http", "automation"]),
+      payloadSchema: {
+        required: expect.arrayContaining(["eventId", "issueKey", "issueUrl", "summary", "detectedAt"])
+      }
+    });
     expect(descriptor.triggers?.find((trigger) => trigger.id === "jira.issueUpdated")?.payloadSchema).toMatchObject({
       properties: {
         issueKey: { type: "string" },

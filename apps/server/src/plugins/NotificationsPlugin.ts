@@ -71,6 +71,20 @@ export class NotificationsPlugin implements WorkspacePlugin {
     return [...this.sent];
   }
 
+  dismiss(id: string): CloudxNotification[] | undefined {
+    const index = this.sent.findIndex((notification) => notification.id === id);
+    if (index === -1) {
+      return undefined;
+    }
+    this.sent.splice(index, 1);
+    return this.list();
+  }
+
+  dismissAll(): CloudxNotification[] {
+    this.sent.splice(0);
+    return [];
+  }
+
   onNotification(listener: (notification: CloudxNotification) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -117,8 +131,11 @@ function optionalString(value: unknown, name: string): string | undefined {
 }
 
 function notificationLevel(value: unknown): CloudxNotificationLevel {
-  if (value === "success" || value === "warning" || value === "error") {
+  if (value === undefined) {
+    return "info";
+  }
+  if (value === "info" || value === "success" || value === "warning" || value === "error") {
     return value;
   }
-  return "info";
+  throw new Error("level must be one of info, success, warning, or error.");
 }

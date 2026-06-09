@@ -5,6 +5,7 @@ import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, C
 import { ControlButton } from "./Control.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
 import { TemplateSelect } from "./RulesSkillsPanel.js";
+import type { BrowserNotificationPermissionState } from "./notifications.js";
 
 export function SettingsDialog({
   config,
@@ -13,6 +14,8 @@ export function SettingsDialog({
   onSave,
   onClearPluginSecret,
   onSaveDefaultTemplate,
+  browserNotificationState,
+  onRequestBrowserNotifications,
   children
 }: {
   config: CloudxConfigResponse;
@@ -21,6 +24,8 @@ export function SettingsDialog({
   onSave: (values: CloudxConfigValues) => Promise<void>;
   onClearPluginSecret?: (pluginId: string, key: string) => Promise<void>;
   onSaveDefaultTemplate?: (templateId: string | undefined) => Promise<void>;
+  browserNotificationState?: BrowserNotificationPermissionState;
+  onRequestBrowserNotifications?: () => Promise<void>;
   children?: ReactNode;
 }) {
   const [values, setValues] = useState<CloudxConfigValues>(() => structuredClone(config.values));
@@ -87,6 +92,9 @@ export function SettingsDialog({
             />
           ) : null}
         </section>
+        {browserNotificationState ? (
+          <BrowserNotificationSettings state={browserNotificationState} onRequest={onRequestBrowserNotifications} />
+        ) : null}
         {children}
         <section className="settings-section">
           <h3>Plugins</h3>
@@ -116,6 +124,55 @@ export function SettingsDialog({
       </div>
     </div>
   );
+}
+
+function BrowserNotificationSettings({ state, onRequest }: { state: BrowserNotificationPermissionState; onRequest?: () => Promise<void> }) {
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<string | undefined>();
+  const requestDisabled = busy || !onRequest || state === "granted" || state === "denied" || state === "unsupported" || state === "insecure";
+
+  async function requestPermission() {
+    if (!onRequest) {
+      return;
+    }
+    setBusy(true);
+    setMessage(undefined);
+    try {
+      await onRequest();
+      setMessage("Browser notification permission was updated.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="settings-section browser-notification-settings">
+      <h3>Browser Notifications</h3>
+      <p>{browserNotificationMessage(state)}</p>
+      <ControlButton type="button" size="compact" onClick={() => void requestPermission()} disabled={requestDisabled}>
+        Request permission
+      </ControlButton>
+      {message ? <small>{message}</small> : null}
+    </section>
+  );
+}
+
+function browserNotificationMessage(state: BrowserNotificationPermissionState): string {
+  if (state === "granted") {
+    return "Browser notifications are allowed for this Cloudx origin.";
+  }
+  if (state === "denied") {
+    return "Browser notifications are blocked in the browser permission settings for this origin.";
+  }
+  if (state === "unsupported") {
+    return "This browser does not expose desktop notifications.";
+  }
+  if (state === "insecure") {
+    return "Browser notifications require HTTPS or another secure context.";
+  }
+  return "Allow Cloudx to mirror in-app notifications through the browser notification system.";
 }
 
 function ConfigField({ field, value, onChange, onClearSecret }: { field: ConfigFieldDescriptor; value: ConfigValue; onChange: (value: ConfigValue) => void; onClearSecret?: () => Promise<void> }) {

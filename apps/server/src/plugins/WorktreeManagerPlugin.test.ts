@@ -20,6 +20,14 @@ describe("WorktreeManagerPlugin", () => {
     });
     expect(plugin.actions.find((action) => action.name === "delete_worktree")?.voiceExposed).toBe(false);
     expect(plugin.actions.find((action) => action.name === "get_worktree_project")?.voiceExposed).toBe(true);
+    expect(plugin.descriptor().triggers?.map((trigger) => trigger.id)).toEqual(["worktree.createRequested", "worktree.created"]);
+    expect(plugin.descriptor().triggers?.find((trigger) => trigger.id === "worktree.createRequested")).toMatchObject({
+      title: "New Worktree Play Clicked",
+      exposures: expect.arrayContaining(["http", "automation"]),
+      payloadSchema: {
+        required: expect.arrayContaining(["eventId", "mode", "folderName", "branchName", "projectDir", "detectedAt"])
+      }
+    });
     expect(plugin.descriptor().configFields).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ key: "branchPrefix", type: "string", defaultValue: "" }),

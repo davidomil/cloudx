@@ -255,6 +255,18 @@ function jiraTriggers(): TriggerDefinition[] {
     jiraTrigger("jira.issueNewlyAssigned", "Jira Issue Newly Assigned", "Emitted when polling sees a Jira issue assigned to an account."),
     jiraTrigger("jira.issueAssignedToMe", "Jira Issue Assigned To Me", "Emitted when polling sees a new or newly assigned issue whose assignee matches the configured Jira account."),
     {
+      ...jiraTrigger("jira.issueManualRun", "Jira Issue Play Clicked", "Emitted when a user clicks the play action on a Jira issue in the Jira panel."),
+      payloadSchema: {
+        type: "object",
+        properties: {
+          ...jiraTriggerPayloadProperties(),
+          transport: { type: "string", enum: ["ui"] }
+        },
+        required: ["eventId", "eventType", "transport", "issueKey", "issueUrl", "summary", "detectedAt"],
+        additionalProperties: false
+      }
+    },
+    {
       ...jiraTrigger("jira.commentCreated", "Jira Comment Created", "Emitted when polling sees a new Jira issue comment."),
       payloadSchema: {
         type: "object",

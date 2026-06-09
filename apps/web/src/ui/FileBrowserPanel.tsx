@@ -27,6 +27,7 @@ import { copyTextToClipboard } from "./clipboard.js";
 import { ControlButton, SegmentedControl } from "./Control.js";
 import { readFileBrowserPanelState, rememberFileBrowserPanelState, type DiffViewMode, type DirectoryEntry, type FileBrowserPanelState, type FilePreviewKind, type MarkdownPreviewMode, type OpenFileResult } from "./fileBrowserPanelState.js";
 import { noSystemTextAssistProps } from "./inputAssist.js";
+import { PluginPanelDock } from "./PluginPanelDock.js";
 
 export { copyTextToClipboard, type ClipboardWriter } from "./clipboard.js";
 export { disposeFileBrowserPanelStatesExcept, readFileBrowserPanelState, rememberFileBrowserPanelState, type DiffViewMode, type DirectoryEntry, type FileBrowserPanelState, type MarkdownPreviewMode, type OpenFileResult } from "./fileBrowserPanelState.js";
@@ -512,14 +513,14 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     }
   }
 
-  function toggleSearchVisible() {
-    if (searchVisible) {
+  function setSearchPanelVisible(visible: boolean) {
+    if (!visible) {
       setSearchQuery("");
       setSearchResult(undefined);
       setSearchBusyAction(undefined);
       setSearchExpanded(false);
     }
-    setSearchVisible(!searchVisible);
+    setSearchVisible(visible);
   }
 
   async function downloadSelectedTransferPaths() {
@@ -675,10 +676,6 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     uploadInputRef.current?.click();
   }
 
-  function toggleTreeVisible() {
-    setTreeVisible(!treeVisible);
-  }
-
   async function copyPathToClipboard(value: string) {
     setError(undefined);
     try {
@@ -757,17 +754,6 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
             void uploadFiles(event.currentTarget.files);
           }}
         />
-        <ControlButton type="button" iconOnly pressed={treeVisible} aria-label={treeVisible ? "Hide tree view" : "Show tree view"} title={treeVisible ? "Hide tree view" : "Show tree view"} onClick={toggleTreeVisible}>
-          <Folder size={15} />
-        </ControlButton>
-        <ControlButton type="button" iconOnly pressed={searchVisible} aria-label={searchVisible ? "Hide search bar" : "Show search bar"} title={searchVisible ? "Hide search bar" : "Show search bar"} onClick={toggleSearchVisible}>
-          <Search size={15} />
-        </ControlButton>
-        {showGitDiff ? (
-          <ControlButton type="button" iconOnly pressed={gitBarVisible} aria-label={gitBarVisible ? "Hide Git bar" : "Show Git bar"} title={gitBarVisible ? "Hide Git bar" : "Show Git bar"} onClick={() => setGitBarVisible(!gitBarVisible)}>
-            <GitBranch size={15} />
-          </ControlButton>
-        ) : null}
       </div>
       {folderCreateOpen ? (
         <form
@@ -786,96 +772,137 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
           </ControlButton>
         </form>
       ) : null}
-      {searchVisible ? <SearchBar
-        query={searchQuery}
-        mode={searchMode}
-        glob={searchGlob}
-        busy={Boolean(searchBusyAction)}
-        expanded={searchExpanded}
-        onQueryChange={setSearchQuery}
-        onModeChange={setSearchMode}
-        onGlobChange={setSearchGlob}
-        onExpandedChange={setSearchExpanded}
-        onSearch={() => void runSearch()}
-      /> : null}
-      {showGitDiff && gitBarVisible ? <GitRepositoryBar
-        state={gitState}
-        compareRef={compareRef}
-        diffSummary={diffSummary}
-        openedDiff={openedDiff}
-        cloneUrl={cloneUrl}
-        originUrl={originUrl}
-        busyAction={busyAction}
-        diffViewMode={diffViewMode}
-        diffFilesVisible={gitDiffFilesVisible}
-        onRefresh={() => void loadGitState()}
-        onInitialize={() => void initializeRepository()}
-        onClone={() => void cloneRepository()}
-        onSetCloneUrl={setCloneUrl}
-        onSetOrigin={() => void setOrigin()}
-        onSetOriginUrl={setOriginUrl}
-        onCompareRefChange={(value) => {
-          setCompareRef(value);
-          void loadDiff(value);
-        }}
-        onDiffViewModeChange={setDiffViewMode}
-        onDiffFilesVisibleChange={setGitDiffFilesVisible}
-      /> : null}
+      <PluginPanelDock
+        className="file-secondary-dock"
+        controls="compact-or-hidden"
+        items={[
+          {
+            id: "search",
+            label: "File search",
+            icon: <Search size={15} />,
+            visible: searchVisible,
+            showLabel: "Show search bar",
+            hideLabel: "Hide search bar",
+            onVisibleChange: setSearchPanelVisible,
+            children: (
+              <SearchBar
+                query={searchQuery}
+                mode={searchMode}
+                glob={searchGlob}
+                busy={Boolean(searchBusyAction)}
+                expanded={searchExpanded}
+                onQueryChange={setSearchQuery}
+                onModeChange={setSearchMode}
+                onGlobChange={setSearchGlob}
+                onExpandedChange={setSearchExpanded}
+                onSearch={() => void runSearch()}
+              />
+            )
+          },
+          ...(showGitDiff ? [{
+            id: "git",
+            label: "Git controls",
+            icon: <GitBranch size={15} />,
+            visible: gitBarVisible,
+            showLabel: "Show Git bar",
+            hideLabel: "Hide Git bar",
+            onVisibleChange: setGitBarVisible,
+            children: (
+              <GitRepositoryBar
+                state={gitState}
+                compareRef={compareRef}
+                diffSummary={diffSummary}
+                openedDiff={openedDiff}
+                cloneUrl={cloneUrl}
+                originUrl={originUrl}
+                busyAction={busyAction}
+                diffViewMode={diffViewMode}
+                onRefresh={() => void loadGitState()}
+                onInitialize={() => void initializeRepository()}
+                onClone={() => void cloneRepository()}
+                onSetCloneUrl={setCloneUrl}
+                onSetOrigin={() => void setOrigin()}
+                onSetOriginUrl={setOriginUrl}
+                onCompareRefChange={(value) => {
+                  setCompareRef(value);
+                  void loadDiff(value);
+                }}
+                onDiffViewModeChange={setDiffViewMode}
+              />
+            )
+          }] : [])
+        ]}
+      />
       {uploadProgress ? <UploadProgress progress={uploadProgress} /> : null}
       {error ? <div className="inline-error">{error}</div> : null}
       <div ref={bodyRef} className={fileBrowserBodyClassName(treeVisible, fileTreeResizing)} style={fileBrowserBodyStyle(fileTreeSize)}>
-        {treeVisible ? <div className="file-list">
-          {activeSearchQuery && searchBusyAction ? <div className="file-list-empty">Searching...</div> : null}
-          {activeSearchQuery && !searchBusyAction && activeSearchResult && visibleEntries.length === 0 ? <div className="file-list-empty">No matches.</div> : null}
-          {visibleEntries.map((entry) => {
-            const transferPath = entryTransferPath(entry, relativePath);
-            const downloadable = !entry.virtual;
-            const selected = selectedTransferPaths.has(transferPath);
-            return (
-              <div key={`${entry.type}:${entry.name}:${entry.virtual ? "virtual" : "real"}`} className={`file-list-row${transferSelectionMode ? " selecting" : ""}${entry.gitChange ? " has-git-change" : ""}${selected ? " selected" : ""}`} onContextMenu={(event) => openFileContextMenu(event, entry, transferPath)}>
-                {transferSelectionMode ? (
-                  <input
-                    className="file-transfer-checkbox"
-                    type="checkbox"
-                    checked={selected}
-                    disabled={!downloadable || transferBusy}
-                    aria-label={`Select ${entry.name} for download`}
-                    onChange={(event) => toggleTransferPath(transferPath, event.currentTarget.checked)}
-                  />
-                ) : null}
-                <ControlButton className="file-list-entry" selected={transferSelectionMode && selected} onClick={() => void handleFileListEntry(entry)}>
-                  {entry.type === "directory" ? <Folder size={15} /> : <FileText size={15} />}
-                  <span>{entry.name}</span>
-                  {entry.searchMatch ? <SearchMatchBadge entry={entry} /> : null}
-                  {entry.gitChange ? <TreeChangeBadge change={entry.gitChange} /> : null}
-                </ControlButton>
-              </div>
-            );
-          })}
-        </div> : null}
-        {treeVisible ? (
-          <div
-            className="file-tree-resize-handle"
-            role="separator"
-            aria-label="Resize file tree"
-            aria-orientation={fileTreeResizeAxisState === "x" ? "vertical" : "horizontal"}
-            aria-valuemin={MIN_FILE_TREE_SIZE}
-            aria-valuemax={fileBrowserTreeSizeMax(fileTreeResizeContainerPixels)}
-            aria-valuenow={fileTreeSize}
-            aria-valuetext={`${fileTreeSize}px`}
-            tabIndex={0}
-            title="Resize file tree"
-            onPointerDown={startFileTreeResize}
-            onKeyDown={handleFileTreeResizeKeyDown}
-          />
-        ) : null}
+        <PluginPanelDock
+          className="file-tree-dock"
+          controls="compact-or-hidden"
+          items={[{
+            id: "tree",
+            label: "File tree",
+            icon: <Folder size={15} />,
+            visible: treeVisible,
+            showLabel: "Show tree view",
+            hideLabel: "Hide tree view",
+            onVisibleChange: setTreeVisible,
+            children: (
+              <>
+                <div className="file-list">
+                  {activeSearchQuery && searchBusyAction ? <div className="file-list-empty">Searching...</div> : null}
+                  {activeSearchQuery && !searchBusyAction && activeSearchResult && visibleEntries.length === 0 ? <div className="file-list-empty">No matches.</div> : null}
+                  {visibleEntries.map((entry) => {
+                    const transferPath = entryTransferPath(entry, relativePath);
+                    const downloadable = !entry.virtual;
+                    const selected = selectedTransferPaths.has(transferPath);
+                    return (
+                      <div key={`${entry.type}:${entry.name}:${entry.virtual ? "virtual" : "real"}`} className={`file-list-row${transferSelectionMode ? " selecting" : ""}${entry.gitChange ? " has-git-change" : ""}${selected ? " selected" : ""}`} onContextMenu={(event) => openFileContextMenu(event, entry, transferPath)}>
+                        {transferSelectionMode ? (
+                          <input
+                            className="file-transfer-checkbox"
+                            type="checkbox"
+                            checked={selected}
+                            disabled={!downloadable || transferBusy}
+                            aria-label={`Select ${entry.name} for download`}
+                            onChange={(event) => toggleTransferPath(transferPath, event.currentTarget.checked)}
+                          />
+                        ) : null}
+                        <ControlButton className="file-list-entry" selected={transferSelectionMode && selected} onClick={() => void handleFileListEntry(entry)}>
+                          {entry.type === "directory" ? <Folder size={15} /> : <FileText size={15} />}
+                          <span>{entry.name}</span>
+                          {entry.searchMatch ? <SearchMatchBadge entry={entry} /> : null}
+                          {entry.gitChange ? <TreeChangeBadge change={entry.gitChange} /> : null}
+                        </ControlButton>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div
+                  className="file-tree-resize-handle"
+                  role="separator"
+                  aria-label="Resize file tree"
+                  aria-orientation={fileTreeResizeAxisState === "x" ? "vertical" : "horizontal"}
+                  aria-valuemin={MIN_FILE_TREE_SIZE}
+                  aria-valuemax={fileBrowserTreeSizeMax(fileTreeResizeContainerPixels)}
+                  aria-valuenow={fileTreeSize}
+                  aria-valuetext={`${fileTreeSize}px`}
+                  tabIndex={0}
+                  title="Resize file tree"
+                  onPointerDown={startFileTreeResize}
+                  onKeyDown={handleFileTreeResizeKeyDown}
+                />
+              </>
+            )
+          }]}
+        />
         <div className="file-preview">
           {opened ? (
             <FilePreview tabId={tab.id} opened={opened} objectUrl={previewObjectUrl} loading={previewLoading} markdownPreviewMode={markdownPreviewMode} onMarkdownPreviewModeChange={setMarkdownPreviewMode} />
           ) : activeSearchResult ? (
             <SearchResults result={activeSearchResult} busy={Boolean(searchBusyAction)} onOpenFile={(filePath) => void openFilePath(filePath)} />
           ) : canViewGitDiff && gitState?.isRepository ? (
-            <GitDiffWorkspace diffSummary={diffSummary} openedDiff={openedDiff} viewMode={diffViewMode} filesVisible={gitDiffFilesVisible} busy={busyAction === "file"} onOpenFile={(file) => void openDiffFile(file)} />
+            <GitDiffWorkspace diffSummary={diffSummary} openedDiff={openedDiff} viewMode={diffViewMode} filesVisible={gitDiffFilesVisible} busy={busyAction === "file"} onFilesVisibleChange={setGitDiffFilesVisible} onOpenFile={(file) => void openDiffFile(file)} />
           ) : (
             <pre>{filePreviewText(opened)}</pre>
           )}
@@ -1371,7 +1398,6 @@ function GitRepositoryBar({
   originUrl,
   busyAction,
   diffViewMode,
-  diffFilesVisible,
   onRefresh,
   onInitialize,
   onClone,
@@ -1379,8 +1405,7 @@ function GitRepositoryBar({
   onSetOrigin,
   onSetOriginUrl,
   onCompareRefChange,
-  onDiffViewModeChange,
-  onDiffFilesVisibleChange
+  onDiffViewModeChange
 }: {
   state: GitRepositoryState | undefined;
   compareRef: string;
@@ -1390,7 +1415,6 @@ function GitRepositoryBar({
   originUrl: string;
   busyAction: GitBusyAction | undefined;
   diffViewMode: DiffViewMode;
-  diffFilesVisible: boolean;
   onRefresh: () => void;
   onInitialize: () => void;
   onClone: () => void;
@@ -1399,7 +1423,6 @@ function GitRepositoryBar({
   onSetOriginUrl: (value: string) => void;
   onCompareRefChange: (value: string) => void;
   onDiffViewModeChange: (value: DiffViewMode) => void;
-  onDiffFilesVisibleChange: (value: boolean) => void;
 }) {
   if (!state) {
     return (
@@ -1463,9 +1486,6 @@ function GitRepositoryBar({
       <span className="git-change-count">{diffSummary ? `${diffSummary.files.length}${diffSummary.truncated ? "+" : ""} changed` : "No diff loaded"}</span>
       {state.setup.canSetOrigin ? <OriginForm originUrl={originUrl} busy={Boolean(busyAction)} onSetOrigin={onSetOrigin} onSetOriginUrl={onSetOriginUrl} compact /> : null}
       {openedDiff ? <span className="git-open-file" title={openedDiff.path}>{openedDiff.path}</span> : null}
-      <ControlButton type="button" className="git-bar-end-toggle" iconOnly pressed={diffFilesVisible} aria-label={diffFilesVisible ? "Hide changed files" : "Show changed files"} title={diffFilesVisible ? "Hide changed files" : "Show changed files"} onClick={() => onDiffFilesVisibleChange(!diffFilesVisible)}>
-        <FileDiff size={14} />
-      </ControlButton>
     </div>
   );
 }
@@ -1636,25 +1656,52 @@ export function searchResultSummary(result: FileSearchResult): string {
   return `${count} ${noun} matched ${result.mode} search "${result.query}" in ${scope}`;
 }
 
-function GitDiffWorkspace({ diffSummary, openedDiff, viewMode, filesVisible, busy, onOpenFile }: { diffSummary: GitDiffSummary | undefined; openedDiff: GitDiffFile | undefined; viewMode: DiffViewMode; filesVisible: boolean; busy: boolean; onOpenFile: (file: GitDiffFileSummary) => void }) {
+function GitDiffWorkspace({
+  diffSummary,
+  openedDiff,
+  viewMode,
+  filesVisible,
+  busy,
+  onFilesVisibleChange,
+  onOpenFile
+}: {
+  diffSummary: GitDiffSummary | undefined;
+  openedDiff: GitDiffFile | undefined;
+  viewMode: DiffViewMode;
+  filesVisible: boolean;
+  busy: boolean;
+  onFilesVisibleChange: (visible: boolean) => void;
+  onOpenFile: (file: GitDiffFileSummary) => void;
+}) {
   return (
     <div className={gitDiffWorkspaceClassName(filesVisible)}>
-      {filesVisible ? <div className="git-diff-files" aria-label="Changed files">
-        {diffSummary?.files.length ? (
-          diffSummary.files.map((file) => (
-            <ControlButton key={`${file.statusCode}:${file.path}`} type="button" className={openedDiff?.path === file.path ? "selected" : ""} selected={openedDiff?.path === file.path} onClick={() => onOpenFile(file)} disabled={busy}>
-              <StatusBadge file={file} />
-              <span>{file.path}</span>
-              {file.additions !== undefined || file.deletions !== undefined ? <small>{formatStat(file)}</small> : null}
-            </ControlButton>
-          ))
-        ) : (
-          <div className="git-diff-empty">
-            <FileDiff size={22} />
-            <span>{diffSummary ? "No working-tree changes under this folder." : "Load a Git diff to inspect changes."}</span>
-          </div>
-        )}
-      </div> : null}
+      <PluginPanelDock className="git-diff-files-dock" controls="compact-or-hidden" items={[{
+          id: "changed-files",
+          label: "Changed files",
+          icon: <FileDiff size={15} />,
+          visible: filesVisible,
+          showLabel: "Show changed files",
+          hideLabel: "Hide changed files",
+          onVisibleChange: onFilesVisibleChange,
+          children: (
+            <div className="git-diff-files" aria-label="Changed files">
+              {diffSummary?.files.length ? (
+                diffSummary.files.map((file) => (
+                  <ControlButton key={`${file.statusCode}:${file.path}`} type="button" className={openedDiff?.path === file.path ? "selected" : ""} selected={openedDiff?.path === file.path} onClick={() => onOpenFile(file)} disabled={busy}>
+                    <StatusBadge file={file} />
+                    <span>{file.path}</span>
+                    {file.additions !== undefined || file.deletions !== undefined ? <small>{formatStat(file)}</small> : null}
+                  </ControlButton>
+                ))
+              ) : (
+                <div className="git-diff-empty">
+                  <FileDiff size={22} />
+                  <span>{diffSummary ? "No working-tree changes under this folder." : "Load a Git diff to inspect changes."}</span>
+                </div>
+              )}
+            </div>
+          )
+        }]} />
       <GitDiffPreview diffFile={openedDiff} viewMode={viewMode} />
     </div>
   );

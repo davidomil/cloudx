@@ -13,6 +13,7 @@ import {
 } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
+import { PluginPanelDock } from "./PluginPanelDock.js";
 
 export function TemplateSelect({
   value,
@@ -288,17 +289,24 @@ export function RulesSkillsPanel({
 
   return (
     <div className="rules-skills-panel">
-      <div className="rules-skills-sidebar">
-        {templates.map((template) => (
-          <button key={template.id} type="button" className={`${template.id === draft.id ? "selected" : ""} ${template.id === draft.id && hasUnsavedTemplateChanges ? "dirty" : ""}`} onClick={() => selectTemplate(template)}>
-            <span className={`template-color ${template.color}`} />
-            <span>{template.name}</span>
-          </button>
-        ))}
-        <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={createTemplate} title="Create template" aria-label="Create template">
-          <Plus size={15} />
-        </ControlButton>
-      </div>
+      <PluginPanelDock items={[{
+        id: "templates",
+        label: "Templates",
+        icon: <Palette size={15} />,
+        children: (
+          <div className="rules-skills-sidebar">
+            {templates.map((template) => (
+              <button key={template.id} type="button" className={`${template.id === draft.id ? "selected" : ""} ${template.id === draft.id && hasUnsavedTemplateChanges ? "dirty" : ""}`} onClick={() => selectTemplate(template)}>
+                <span className={`template-color ${template.color}`} />
+                <span>{template.name}</span>
+              </button>
+            ))}
+            <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={createTemplate} title="Create template" aria-label="Create template">
+              <Plus size={15} />
+            </ControlButton>
+          </div>
+        )
+      }]} />
       <div className="rules-skills-editor">
         <label>
           Name

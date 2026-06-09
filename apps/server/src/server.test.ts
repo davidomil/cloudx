@@ -352,6 +352,70 @@ describe("buildServer", () => {
     }
   });
 
+  it("dismisses notifications from the server history", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-notifications-dismiss-"));
+    const config = testConfig(root);
+    const app = await buildServer(config);
+    try {
+      const first = await app.inject({
+        method: "POST",
+        url: "/api/hooks/notifications.send",
+        payload: { input: { title: "First" } }
+      });
+      const second = await app.inject({
+        method: "POST",
+        url: "/api/hooks/notifications.send",
+        payload: { input: { title: "Second" } }
+      });
+      const firstNotification = first.json().result.notification as { id: string };
+      const secondNotification = second.json().result.notification as { id: string };
+
+      const dismissed = await app.inject({ method: "DELETE", url: `/api/notifications/${encodeURIComponent(secondNotification.id)}` });
+      expect(dismissed.statusCode).toBe(200);
+      expect(dismissed.json().notifications).toEqual([expect.objectContaining({ id: firstNotification.id, title: "First" })]);
+
+      const afterSingleDismiss = await app.inject({ method: "GET", url: "/api/notifications" });
+      expect(afterSingleDismiss.json().notifications.map((notification: { title: string }) => notification.title)).toEqual(["First"]);
+
+      const missing = await app.inject({ method: "DELETE", url: "/api/notifications/missing" });
+      expect(missing.statusCode).toBe(404);
+
+      const dismissedAll = await app.inject({ method: "DELETE", url: "/api/notifications" });
+      expect(dismissedAll.statusCode).toBe(200);
+      expect(dismissedAll.json().notifications).toEqual([]);
+
+      const afterDismissAll = await app.inject({ method: "GET", url: "/api/notifications" });
+      expect(afterDismissAll.json().notifications).toEqual([]);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("fails notification routes clearly when the notification service is not wired", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-notifications-missing-service-"));
+    const config = testConfig(root);
+    const registry = new PluginRegistry();
+    const pathPolicy = new PathPolicy([root]);
+    const workspace = new WorkspaceLayoutStore(config.dataDir, pathPolicy);
+    const app = await buildServer(config, {
+      plugins: registry,
+      sessions: new SessionStore(registry, pathPolicy, new TabContextService(config.dataDir), { getPluginConfig: () => ({}) }, workspace),
+      pathPolicy,
+      voice: {},
+      asr: {},
+      workspace,
+      hooks: new HookRegistry()
+    } as AppServices);
+    try {
+      const response = await app.inject({ method: "GET", url: "/api/notifications" });
+
+      expect(response.statusCode).toBe(500);
+      expect(response.json().message).toBe("Notifications service is not available.");
+    } finally {
+      await app.close();
+    }
+  });
+
   it("broadcasts automation run updates on the workspace websocket", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-ws-"));
     const config = testConfig(root);

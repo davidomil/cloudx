@@ -84,6 +84,7 @@ import {
   type AutomationHandleRef,
   type ConnectionLike
 } from "./automationConnection.js";
+import { PluginPanelDock } from "./PluginPanelDock.js";
 
 export { automationGraphsEqual, flowFromGraph, graphFromFlow, routedEdgePath } from "./automationGraphAdapter.js";
 export { automationTypeAssignable, connectedDataInputIds, connectionIsValid, dataInputConflictEdges, deleteEdgesForHandle, hasProgramFlowConflict, programFlowConflictEdges, removeConnectionConflicts, removeProgramFlowConflicts } from "./automationConnection.js";
@@ -91,6 +92,7 @@ export { automationTypeAssignable, connectedDataInputIds, connectionIsValid, dat
 interface AutomationPanelProps {
   tab: WorkspaceTab;
   liveRuns?: AutomationRunSummary[];
+  onAutomationGroupsChanged?: () => Promise<void> | void;
 }
 
 interface PortTooltipPlacement {
@@ -174,16 +176,16 @@ export const automationMiniMapTheme = {
   nodeStrokeWidth: 1.5
 } as const;
 
-export function AutomationPanel({ tab, liveRuns }: AutomationPanelProps) {
+export function AutomationPanel({ tab, liveRuns, onAutomationGroupsChanged }: AutomationPanelProps) {
   return (
     <ReactFlowProvider>
-      <AutomationPanelInner tab={tab} liveRuns={liveRuns} />
+      <AutomationPanelInner tab={tab} liveRuns={liveRuns} onAutomationGroupsChanged={onAutomationGroupsChanged} />
     </ReactFlowProvider>
   );
 }
 
-function AutomationPanelInner({ tab, liveRuns }: AutomationPanelProps) {
-  const { screenToFlowPosition } = useReactFlow<FlowNode, FlowEdge>();
+function AutomationPanelInner({ tab, liveRuns, onAutomationGroupsChanged }: AutomationPanelProps) {
+  const { fitView, screenToFlowPosition } = useReactFlow<FlowNode, FlowEdge>();
   const [catalog, setCatalog] = useState<AutomationCatalogResponse>({ nodes: [] });
   const [groups, setGroups] = useState<AutomationGroup[]>([]);
   const [selectedGroupId, setSelectedGroupId] = useState<string>("");
@@ -203,6 +205,8 @@ function AutomationPanelInner({ tab, liveRuns }: AutomationPanelProps) {
   const [transientStatus, setTransientStatus] = useState<string | undefined>();
   const paletteRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLDivElement | null>(null);
+  const fitViewFrameRef = useRef<number | undefined>(undefined);
+  const nodeCountRef = useRef(0);
   const reconnectingEdgeIdRef = useRef<string | undefined>(undefined);
   const suppressNextPaneClickRef = useRef(false);
   const selectedGroup = groups.find((group) => group.id === selectedGroupId);
@@ -240,6 +244,60 @@ function AutomationPanelInner({ tab, liveRuns }: AutomationPanelProps) {
     setAllowedSafety((current) => automationAllowedSafetyWithToggle(current, safety, enabled));
     setStatus(automationSafetyToggleCopy(safety, enabled).confirmation);
   }, []);
+
+  useEffect(() => {
+    nodeCountRef.current = nodes.length;
+  }, [nodes.length]);
+
+  const scheduleAutomationViewFit = useCallback(() => {
+    const ownerWindow = canvasRef.current?.ownerDocument.defaultView;
+    if (!ownerWindow || !nodeCountRef.current) {
+      return;
+    }
+    if (fitViewFrameRef.current !== undefined) {
+      ownerWindow.cancelAnimationFrame(fitViewFrameRef.current);
+    }
+    fitViewFrameRef.current = ownerWindow.requestAnimationFrame(() => {
+      fitViewFrameRef.current = undefined;
+      void fitView({ padding: 0.18, duration: 140 });
+    });
+  }, [fitView]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || typeof ResizeObserver === "undefined") {
+      return undefined;
+    }
+
+    let width = 0;
+    let height = 0;
+    const observer = new ResizeObserver(([entry]) => {
+      if (!entry) {
+        return;
+      }
+      const nextWidth = entry.contentRect.width;
+      const nextHeight = entry.contentRect.height;
+      if (nextWidth <= 0 || nextHeight <= 0) {
+        return;
+      }
+      if (Math.abs(nextWidth - width) < 1 && Math.abs(nextHeight - height) < 1) {
+        return;
+      }
+      width = nextWidth;
+      height = nextHeight;
+      scheduleAutomationViewFit();
+    });
+    observer.observe(canvas);
+
+    return () => {
+      observer.disconnect();
+      const ownerWindow = canvas.ownerDocument.defaultView;
+      if (ownerWindow && fitViewFrameRef.current !== undefined) {
+        ownerWindow.cancelAnimationFrame(fitViewFrameRef.current);
+        fitViewFrameRef.current = undefined;
+      }
+    };
+  }, [scheduleAutomationViewFit]);
 
   useEffect(() => {
     let cancelled = false;
@@ -351,6 +409,15 @@ function AutomationPanelInner({ tab, liveRuns }: AutomationPanelProps) {
     setCreateGroupOpen(true);
   }, [groups, hasUnsavedChanges, selectedGroup?.name]);
 
+  const reportAutomationGroupsChanged = useCallback(async (successStatus: string) => {
+    try {
+      await onAutomationGroupsChanged?.();
+      setStatus(successStatus);
+    } catch (error) {
+      setStatus(`${successStatus} ${automationStatusFromError("Refresh automation triggers", error)}`);
+    }
+  }, [onAutomationGroupsChanged]);
+
   const createAutomationGroup = useCallback(async (event: ReactFormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const name = normalizedAutomationGroupName(createGroupName);
@@ -372,11 +439,11 @@ function AutomationPanelInner({ tab, liveRuns }: AutomationPanelProps) {
       setLastTestSample(undefined);
       setPalette(undefined);
       setCreateGroupOpen(false);
-      setStatus(`Created ${saved.name}. Add a trigger node to start.`);
+      await reportAutomationGroupsChanged(`Created ${saved.name}. Add a trigger node to start.`);
     } catch (error) {
       setStatus(automationStatusFromError("Create automation", error));
     }
-  }, [catalog, createGroupName]);
+  }, [catalog, createGroupName, reportAutomationGroupsChanged]);
 
   const deleteCurrentGroup = useCallback(async () => {
     if (!selectedGroup) {
@@ -401,7 +468,7 @@ function AutomationPanelInner({ tab, liveRuns }: AutomationPanelProps) {
         setAllowedSafety(nextSelectedGroup.graph.allowedSafety);
         setSelectedNodeId(undefined);
         setValidation(nextSelectedGroup.lastValidation);
-        setStatus(`Deleted ${selectedGroup.name}. Selected ${nextSelectedGroup.name}.`);
+        await reportAutomationGroupsChanged(`Deleted ${selectedGroup.name}. Selected ${nextSelectedGroup.name}.`);
         return;
       }
       setSelectedGroupId("");
@@ -410,11 +477,11 @@ function AutomationPanelInner({ tab, liveRuns }: AutomationPanelProps) {
       setAllowedSafety(undefined);
       setSelectedNodeId(undefined);
       setValidation(undefined);
-      setStatus(`Deleted ${selectedGroup.name}.`);
+      await reportAutomationGroupsChanged(`Deleted ${selectedGroup.name}.`);
     } catch (error) {
       setStatus(automationStatusFromError("Delete automation", error));
     }
-  }, [catalog, groups, selectedGroup, selectedGroupId]);
+  }, [catalog, groups, reportAutomationGroupsChanged, selectedGroup, selectedGroupId]);
 
   const onNodesChange = useCallback((changes: NodeChange<FlowNode>[]) => {
     setNodes((current) => applyNodeChanges(changes, current));
@@ -483,11 +550,11 @@ function AutomationPanelInner({ tab, liveRuns }: AutomationPanelProps) {
       setAllowedSafety(group.graph.allowedSafety);
       setValidation(group.lastValidation);
       setLastTestSample(undefined);
-      setStatus("Automation saved.");
+      await reportAutomationGroupsChanged("Automation saved.");
     } catch (error) {
       setStatus(automationStatusFromError("Save automation", error));
     }
-  }, [currentGraph, selectedGroup]);
+  }, [currentGraph, reportAutomationGroupsChanged, selectedGroup]);
 
   const validateCurrentGroup = useCallback(async () => {
     if (!selectedGroup || !currentGraph) {
@@ -534,11 +601,11 @@ function AutomationPanelInner({ tab, liveRuns }: AutomationPanelProps) {
     try {
       const updated = await setAutomationGroupEnabled(group.id, !group.enabled);
       setGroups((current) => current.map((candidate) => (candidate.id === updated.id ? updated : candidate)));
-      setStatus(updated.enabled ? "Automation enabled." : "Automation disabled.");
+      await reportAutomationGroupsChanged(updated.enabled ? "Automation enabled." : "Automation disabled.");
     } catch (error) {
       setStatus(automationStatusFromError("Update automation", error));
     }
-  }, [hasUnsavedChanges, selectedGroupId]);
+  }, [hasUnsavedChanges, reportAutomationGroupsChanged, selectedGroupId]);
 
   const openSearchPalette = useCallback((value: string, input: HTMLInputElement) => {
     setSearch(value);
@@ -609,46 +676,126 @@ function AutomationPanelInner({ tab, liveRuns }: AutomationPanelProps) {
 
   return (
     <div className="automation-panel" data-testid="automation-panel">
-      <aside className="automation-rail" aria-label="Automation groups">
-        <div className="automation-rail-header">
-          <span className="automation-rail-title">
-            <Zap size={16} />
-            <span>Automation</span>
-          </span>
-          <div className="automation-rail-actions">
-            <ControlButton className="icon-button" title="New automation" aria-label="New automation" onClick={openCreateGroupForm}>
-              <Plus size={14} />
-            </ControlButton>
-            <ControlButton className="icon-button automation-delete-group" tone="danger" title="Delete selected automation" aria-label="Delete selected automation" disabled={!selectedGroup} onClick={deleteCurrentGroup}>
-              <Trash2 size={14} />
-            </ControlButton>
-          </div>
-        </div>
-        {createGroupOpen ? (
-          <form className="automation-create-form" onSubmit={createAutomationGroup}>
-            <label>
-              <span>Name</span>
-              <input autoFocus value={createGroupName} onChange={(event) => setCreateGroupName(event.target.value)} aria-label="Automation name" />
-            </label>
-            <div className="automation-create-actions">
-              <ControlButton size="compact" onClick={() => setCreateGroupOpen(false)}>
-                Cancel
-              </ControlButton>
-              <ControlButton size="compact" tone="primary" type="submit">
-                Create
-              </ControlButton>
-            </div>
-          </form>
-        ) : null}
-        <div className="automation-group-list">
-          {groups.map((group) => (
-            <button key={group.id} className={`automation-group ${group.id === selectedGroupId ? "selected" : ""} ${group.id === selectedGroupId && hasUnsavedChanges ? "dirty" : ""}`} onClick={() => selectGroup(group)}>
-              <span>{group.name}</span>
-              <small>{group.id === selectedGroupId && hasUnsavedChanges ? "Unsaved changes" : group.enabled ? "Enabled" : "Disabled"}</small>
-            </button>
-          ))}
-        </div>
-      </aside>
+      <PluginPanelDock compactAt="medium" className="automation-panel-dock" items={[
+        {
+          id: "automations",
+          label: "Automation groups",
+          icon: <Zap size={15} />,
+          children: (
+            <aside className="automation-rail" aria-label="Automation groups">
+              <div className="automation-rail-header">
+                <span className="automation-rail-title">
+                  <Zap size={16} />
+                  <span>Automation</span>
+                </span>
+                <div className="automation-rail-actions">
+                  <ControlButton className="icon-button" title="New automation" aria-label="New automation" onClick={openCreateGroupForm}>
+                    <Plus size={14} />
+                  </ControlButton>
+                  <ControlButton className="icon-button automation-delete-group" tone="danger" title="Delete selected automation" aria-label="Delete selected automation" disabled={!selectedGroup} onClick={deleteCurrentGroup}>
+                    <Trash2 size={14} />
+                  </ControlButton>
+                </div>
+              </div>
+              {createGroupOpen ? (
+                <form className="automation-create-form" onSubmit={createAutomationGroup}>
+                  <label>
+                    <span>Name</span>
+                    <input autoFocus value={createGroupName} onChange={(event) => setCreateGroupName(event.target.value)} aria-label="Automation name" />
+                  </label>
+                  <div className="automation-create-actions">
+                    <ControlButton size="compact" onClick={() => setCreateGroupOpen(false)}>
+                      Cancel
+                    </ControlButton>
+                    <ControlButton size="compact" tone="primary" type="submit">
+                      Create
+                    </ControlButton>
+                  </div>
+                </form>
+              ) : null}
+              <div className="automation-group-list">
+                {groups.map((group) => (
+                  <button key={group.id} className={`automation-group ${group.id === selectedGroupId ? "selected" : ""} ${group.id === selectedGroupId && hasUnsavedChanges ? "dirty" : ""}`} onClick={() => selectGroup(group)}>
+                    <span>{group.name}</span>
+                    <small>{group.id === selectedGroupId && hasUnsavedChanges ? "Unsaved changes" : group.enabled ? "Enabled" : "Disabled"}</small>
+                  </button>
+                ))}
+              </div>
+            </aside>
+          )
+        },
+        {
+          id: "inspector",
+          label: "Automation inspector",
+          icon: <ShieldAlert size={15} />,
+          children: (
+            <aside className="automation-inspector" aria-label="Automation inspector">
+              <div className="automation-inspector-header">
+                <span>Inspector</span>
+                {selectedNodeId ? (
+                  <ControlButton className="automation-delete-button" tone="danger" title="Delete selected node" aria-label="Delete selected node" onClick={deleteSelectedNode}>
+                    <Trash2 size={15} />
+                    <span>Delete Node</span>
+                  </ControlButton>
+                ) : null}
+              </div>
+              {selectedNode ? <NodeInspector node={selectedNode} connectedInputIds={selectedNodeConnectedInputIds} onChange={(config) => updateNodeConfig(selectedNode.id, config, setNodes)} /> : <p>Select a node to inspect configuration and ports.</p>}
+              <div className="automation-validation">
+                <strong>Validation</strong>
+                {hasUnsavedChanges ? <small className="automation-unsaved-note">Current canvas has unsaved changes.</small> : null}
+                {(validation?.diagnostics ?? []).length === 0 ? <p>No diagnostics.</p> : null}
+                {(validation?.diagnostics ?? []).slice(0, 6).map((diagnostic) => (
+                  <p key={`${diagnostic.code}:${diagnostic.nodeId ?? diagnostic.edgeId ?? diagnostic.message}`} className={`automation-diagnostic ${diagnostic.severity}`}>
+                    {diagnostic.message}
+                  </p>
+                ))}
+              </div>
+            </aside>
+          )
+        },
+        {
+          id: "runs",
+          label: "Automation runs",
+          icon: <Play size={15} />,
+          children: (
+            <section className="automation-run-drawer" aria-label="Automation run history">
+              <div className="automation-run-header">
+                <span>Runs</span>
+                <small>{runs.length} recent</small>
+              </div>
+              {runs.slice(0, 5).map((run) => (
+                <div key={run.id} className={`automation-run ${run.status}`}>
+                  {run.status === "running" ? <Play size={13} /> : run.status === "cancelled" ? <PauseCircle size={13} /> : <CheckCircle2 size={13} />}
+                  <span>{run.status}</span>
+                  <small>{run.trace.at(-1)?.message ?? run.error ?? run.startedAt}</small>
+                  {run.status === "running" || run.status === "queued" ? (
+                    <ControlButton className="icon-button automation-run-cancel" title="Cancel run" aria-label="Cancel run" onClick={() => cancelRun(run.id)}>
+                      <X size={12} />
+                    </ControlButton>
+                  ) : null}
+                </div>
+              ))}
+              {lastTestSample ? (
+                <div className={`automation-test-sample ${lastTestSample.status}`}>
+                  <div className="automation-test-sample-title">
+                    <span>Sample Run</span>
+                    <small>{hasUnsavedChanges ? `${lastTestSample.triggerId} unsaved` : lastTestSample.triggerId}</small>
+                  </div>
+                  <pre>{JSON.stringify(lastTestSample.payload, null, 2)}</pre>
+                  <div className="automation-test-trace">
+                    {lastTestSample.trace.slice(0, 6).map((entry) => (
+                      <p key={entry.id} className={entry.level}>
+                        {entry.message}
+                      </p>
+                    ))}
+                    {lastTestSample.error ? <p className="error">{lastTestSample.error}</p> : null}
+                  </div>
+                </div>
+              ) : null}
+            </section>
+          )
+        }
+      ]} />
 
       <section className="automation-workbench">
         <div className="automation-toolbar">
@@ -824,64 +971,6 @@ function AutomationPanelInner({ tab, liveRuns }: AutomationPanelProps) {
         </div>
       </section>
 
-      <aside className="automation-inspector" aria-label="Automation inspector">
-        <div className="automation-inspector-header">
-          <span>Inspector</span>
-          {selectedNodeId ? (
-            <ControlButton className="automation-delete-button" tone="danger" title="Delete selected node" aria-label="Delete selected node" onClick={deleteSelectedNode}>
-              <Trash2 size={15} />
-              <span>Delete Node</span>
-            </ControlButton>
-          ) : null}
-        </div>
-        {selectedNode ? <NodeInspector node={selectedNode} connectedInputIds={selectedNodeConnectedInputIds} onChange={(config) => updateNodeConfig(selectedNode.id, config, setNodes)} /> : <p>Select a node to inspect configuration and ports.</p>}
-        <div className="automation-validation">
-          <strong>Validation</strong>
-          {hasUnsavedChanges ? <small className="automation-unsaved-note">Current canvas has unsaved changes.</small> : null}
-          {(validation?.diagnostics ?? []).length === 0 ? <p>No diagnostics.</p> : null}
-          {(validation?.diagnostics ?? []).slice(0, 6).map((diagnostic) => (
-            <p key={`${diagnostic.code}:${diagnostic.nodeId ?? diagnostic.edgeId ?? diagnostic.message}`} className={`automation-diagnostic ${diagnostic.severity}`}>
-              {diagnostic.message}
-            </p>
-          ))}
-        </div>
-      </aside>
-
-      <section className="automation-run-drawer" aria-label="Automation run history">
-        <div className="automation-run-header">
-          <span>Runs</span>
-          <small>{runs.length} recent</small>
-        </div>
-        {runs.slice(0, 5).map((run) => (
-          <div key={run.id} className={`automation-run ${run.status}`}>
-            {run.status === "running" ? <Play size={13} /> : run.status === "cancelled" ? <PauseCircle size={13} /> : <CheckCircle2 size={13} />}
-            <span>{run.status}</span>
-            <small>{run.trace.at(-1)?.message ?? run.error ?? run.startedAt}</small>
-            {run.status === "running" || run.status === "queued" ? (
-              <ControlButton className="icon-button automation-run-cancel" title="Cancel run" aria-label="Cancel run" onClick={() => cancelRun(run.id)}>
-                <X size={12} />
-              </ControlButton>
-            ) : null}
-          </div>
-        ))}
-        {lastTestSample ? (
-          <div className={`automation-test-sample ${lastTestSample.status}`}>
-            <div className="automation-test-sample-title">
-              <span>Sample Run</span>
-              <small>{hasUnsavedChanges ? `${lastTestSample.triggerId} unsaved` : lastTestSample.triggerId}</small>
-            </div>
-            <pre>{JSON.stringify(lastTestSample.payload, null, 2)}</pre>
-            <div className="automation-test-trace">
-              {lastTestSample.trace.slice(0, 6).map((entry) => (
-                <p key={entry.id} className={entry.level}>
-                  {entry.message}
-                </p>
-              ))}
-              {lastTestSample.error ? <p className="error">{lastTestSample.error}</p> : null}
-            </div>
-          </div>
-        ) : null}
-      </section>
     </div>
   );
 }

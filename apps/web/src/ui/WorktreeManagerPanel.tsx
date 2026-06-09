@@ -1,18 +1,30 @@
 import { type KeyboardEvent, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Copy, Download, GitBranch, GitFork, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { AlertTriangle, Copy, Download, GitBranch, GitFork, Play, Plus, RefreshCw, Trash2 } from "lucide-react";
 
 import type { ConfigValue, WorktreeCreateMode, WorktreeProjectState, WorktreeRef, WorktreeSummary, WorkspaceTab } from "@cloudx/shared";
 
 import { runTabAction } from "../api.js";
+import { WORKTREE_CREATE_REQUESTED_TRIGGER_ID, worktreeCreateRequestedPayload, type TriggerEmitter } from "./automationTriggers.js";
 import { copyTextToClipboard, type ClipboardWriter } from "./clipboard.js";
 import { ControlButton } from "./Control.js";
 import { noSystemTextAssistProps } from "./inputAssist.js";
+import { PluginPanelDock } from "./PluginPanelDock.js";
 
 type BusyAction = "state" | "initialize" | "clone" | "fetch" | "create" | "delete";
 
 export const REF_OPTION_LIMIT = 50;
 
-export function WorktreeManagerPanel({ tab, config = {} }: { tab: WorkspaceTab; config?: Record<string, ConfigValue> }) {
+export function WorktreeManagerPanel({
+  tab,
+  config = {},
+  activeTriggerIds,
+  emitTrigger
+}: {
+  tab: WorkspaceTab;
+  config?: Record<string, ConfigValue>;
+  activeTriggerIds?: ReadonlySet<string>;
+  emitTrigger?: TriggerEmitter;
+}) {
   const [state, setState] = useState<WorktreeProjectState | undefined>();
   const [cloneUrl, setCloneUrl] = useState("");
   const [mode, setMode] = useState<WorktreeCreateMode>("remote_branch");
@@ -32,6 +44,7 @@ export function WorktreeManagerPanel({ tab, config = {} }: { tab: WorkspaceTab; 
   const localRefs = useMemo(() => refsByKind(state?.refs, "local"), [state?.refs]);
   const remoteRefs = useMemo(() => refsByKind(state?.refs, "remote"), [state?.refs]);
   const tagRefs = useMemo(() => refsByKind(state?.refs, "tag"), [state?.refs]);
+  const createRequestedTriggerActive = Boolean(activeTriggerIds?.has(WORKTREE_CREATE_REQUESTED_TRIGGER_ID) && emitTrigger);
 
   useEffect(() => {
     void loadState();
@@ -102,6 +115,27 @@ export function WorktreeManagerPanel({ tab, config = {} }: { tab: WorkspaceTab; 
     setBranchName("");
   }
 
+  async function runCreateRequestedAutomation() {
+    if (!emitTrigger || !state) {
+      return;
+    }
+    setBusyAction("create");
+    setError(undefined);
+    try {
+      await emitTrigger(WORKTREE_CREATE_REQUESTED_TRIGGER_ID, worktreeCreateRequestedPayload({
+        mode,
+        folderName: folderName.trim(),
+        branchName: branchName.trim(),
+        baseRef: baseRef.trim() || undefined,
+        projectDir: state.projectDir
+      }));
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusyAction(undefined);
+    }
+  }
+
   async function deleteWorktree() {
     if (!deleteTarget) {
       return;
@@ -157,7 +191,7 @@ export function WorktreeManagerPanel({ tab, config = {} }: { tab: WorkspaceTab; 
         </ControlButton>
       </div>
       {error ? <div className="inline-error">{error}</div> : null}
-      {!state ? <LoadingState /> : state.status === "ready" ? <ManagerView state={state} busy={Boolean(busyAction)} localRefs={localRefs} remoteRefs={remoteRefs} tagRefs={tagRefs} mode={mode} folderName={folderName} branchName={branchName} baseRef={baseRef} showFolderSize={showFolderSize} sizesLoading={sizesLoading} branchPrefix={branchPrefix} deleteTarget={deleteTarget} deleteConfirmation={deleteConfirmation} forceDelete={forceDelete} copiedWorktreeValue={copiedWorktreeValue} onModeChange={setMode} onFolderNameChange={setFolderName} onBranchNameChange={setBranchName} onBaseRefChange={setBaseRef} onFetch={() => void fetchRefs()} onCreate={() => void createWorktree()} onCopyWorktreeValue={(value) => void copyWorktreeValue(value)} onOpenDelete={openDelete} onCancelDelete={() => setDeleteTarget(undefined)} onDeleteConfirmationChange={setDeleteConfirmation} onForceDeleteChange={setForceDelete} onDelete={() => void deleteWorktree()} /> : state.status === "empty" ? <SetupView cloneUrl={cloneUrl} busy={Boolean(busyAction)} onCloneUrlChange={setCloneUrl} onInitialize={() => void initializeBareRepository()} onClone={() => void cloneBareRepository()} /> : <BlockedView state={state} />}
+      {!state ? <LoadingState /> : state.status === "ready" ? <ManagerView state={state} busy={Boolean(busyAction)} localRefs={localRefs} remoteRefs={remoteRefs} tagRefs={tagRefs} mode={mode} folderName={folderName} branchName={branchName} baseRef={baseRef} showFolderSize={showFolderSize} sizesLoading={sizesLoading} branchPrefix={branchPrefix} deleteTarget={deleteTarget} deleteConfirmation={deleteConfirmation} forceDelete={forceDelete} copiedWorktreeValue={copiedWorktreeValue} createRequestedTriggerActive={createRequestedTriggerActive} onModeChange={setMode} onFolderNameChange={setFolderName} onBranchNameChange={setBranchName} onBaseRefChange={setBaseRef} onFetch={() => void fetchRefs()} onCreate={() => void createWorktree()} onRunCreateRequestedAutomation={() => void runCreateRequestedAutomation()} onCopyWorktreeValue={(value) => void copyWorktreeValue(value)} onOpenDelete={openDelete} onCancelDelete={() => setDeleteTarget(undefined)} onDeleteConfirmationChange={setDeleteConfirmation} onForceDeleteChange={setForceDelete} onDelete={() => void deleteWorktree()} /> : state.status === "empty" ? <SetupView cloneUrl={cloneUrl} busy={Boolean(busyAction)} onCloneUrlChange={setCloneUrl} onInitialize={() => void initializeBareRepository()} onClone={() => void cloneBareRepository()} /> : <BlockedView state={state} />}
     </div>
   );
 }
@@ -229,12 +263,14 @@ function ManagerView({
   deleteConfirmation,
   forceDelete,
   copiedWorktreeValue,
+  createRequestedTriggerActive,
   onModeChange,
   onFolderNameChange,
   onBranchNameChange,
   onBaseRefChange,
   onFetch,
   onCreate,
+  onRunCreateRequestedAutomation,
   onCopyWorktreeValue,
   onOpenDelete,
   onCancelDelete,
@@ -258,12 +294,14 @@ function ManagerView({
   deleteConfirmation: string;
   forceDelete: boolean;
   copiedWorktreeValue: string | undefined;
+  createRequestedTriggerActive: boolean;
   onModeChange: (value: WorktreeCreateMode) => void;
   onFolderNameChange: (value: string) => void;
   onBranchNameChange: (value: string) => void;
   onBaseRefChange: (value: string) => void;
   onFetch: () => void;
   onCreate: () => void;
+  onRunCreateRequestedAutomation: () => void;
   onCopyWorktreeValue: (value: string) => void;
   onOpenDelete: (worktree: WorktreeSummary) => void;
   onCancelDelete: () => void;
@@ -283,56 +321,69 @@ function ManagerView({
 
   return (
     <div className="worktree-manager-body">
-      <div className="worktree-summary-band">
-        <span title={state.barePath}>{state.bareName}</span>
-        {state.originUrl ? <small title={state.originUrl}>origin</small> : null}
-        <small>{state.worktrees.length} worktrees</small>
-        <small>{state.refs.length} refs</small>
-        <ControlButton type="button" onClick={onFetch} disabled={busy || !state.originUrl} title="Fetch origin branches and tags">
-          <Download size={15} />
-          Fetch
-        </ControlButton>
-      </div>
-      {detectionNote ? <div className="worktree-detection-note">{detectionNote}</div> : null}
-
-      <form
-        className="worktree-create-form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          onCreate();
-        }}
-      >
-        <label>
-          Mode
-          <select value={mode} onChange={(event) => changeMode(event.target.value as WorktreeCreateMode)}>
-            <option value="remote_branch">Track remote branch</option>
-            <option value="new_branch">New branch from base</option>
-            <option value="existing_branch">Existing local branch</option>
-          </select>
-        </label>
-        <label>
-          Folder
-          <input value={folderName} onChange={(event) => onFolderNameChange(event.target.value)} placeholder="feature-ui" />
-        </label>
-        <label>
-          Branch
-          {mode === "existing_branch" ? (
-            <RefCombobox value={branchName} refs={localRefs} onChange={onBranchNameChange} placeholder="branch-name" ariaLabel="Local branch" />
-          ) : (
-            <input value={branchName} onChange={(event) => onBranchNameChange(event.target.value)} placeholder={mode === "remote_branch" ? "feature-ui" : branchPrefix || "branch-name"} />
-          )}
-        </label>
-        {mode !== "existing_branch" ? (
-          <label>
-            Base
-            <RefCombobox value={baseRef} refs={[...remoteRefs, ...localRefs]} onChange={onBaseRefChange} placeholder="origin/main" ariaLabel="Base ref" />
-          </label>
-        ) : null}
-        <ControlButton type="submit" disabled={createDisabled}>
-          <Plus size={15} />
-          Create
-        </ControlButton>
-      </form>
+      <PluginPanelDock className="worktree-controls-dock" items={[{
+        id: "controls",
+        label: "Worktree controls",
+        icon: <Plus size={15} />,
+        children: (
+          <>
+            <div className="worktree-summary-band">
+              <span title={state.barePath}>{state.bareName}</span>
+              {state.originUrl ? <small title={state.originUrl}>origin</small> : null}
+              <small>{state.worktrees.length} worktrees</small>
+              <small>{state.refs.length} refs</small>
+              <ControlButton type="button" onClick={onFetch} disabled={busy || !state.originUrl} title="Fetch origin branches and tags">
+                <Download size={15} />
+                Fetch
+              </ControlButton>
+            </div>
+            {detectionNote ? <div className="worktree-detection-note">{detectionNote}</div> : null}
+            <form
+              className="worktree-create-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                onCreate();
+              }}
+            >
+              <label>
+                Mode
+                <select value={mode} onChange={(event) => changeMode(event.target.value as WorktreeCreateMode)}>
+                  <option value="remote_branch">Track remote branch</option>
+                  <option value="new_branch">New branch from base</option>
+                  <option value="existing_branch">Existing local branch</option>
+                </select>
+              </label>
+              <label>
+                Folder
+                <input value={folderName} onChange={(event) => onFolderNameChange(event.target.value)} placeholder="feature-ui" />
+              </label>
+              <label>
+                Branch
+                {mode === "existing_branch" ? (
+                  <RefCombobox value={branchName} refs={localRefs} onChange={onBranchNameChange} placeholder="branch-name" ariaLabel="Local branch" />
+                ) : (
+                  <input value={branchName} onChange={(event) => onBranchNameChange(event.target.value)} placeholder={mode === "remote_branch" ? "feature-ui" : branchPrefix || "branch-name"} />
+                )}
+              </label>
+              {mode !== "existing_branch" ? (
+                <label>
+                  Base
+                  <RefCombobox value={baseRef} refs={[...remoteRefs, ...localRefs]} onChange={onBaseRefChange} placeholder="origin/main" ariaLabel="Base ref" />
+                </label>
+              ) : null}
+              <ControlButton type="submit" disabled={createDisabled}>
+                <Plus size={15} />
+                Create
+              </ControlButton>
+              {createRequestedTriggerActive ? (
+                <ControlButton type="button" className="worktree-create-trigger" iconOnly disabled={createDisabled} onClick={onRunCreateRequestedAutomation} title="Run new-worktree automation" aria-label="Run new-worktree automation">
+                  <Play size={15} />
+                </ControlButton>
+              ) : null}
+            </form>
+          </>
+        )
+      }]} />
 
       <div className="worktree-content-grid">
         <section className="worktree-list" aria-label="Worktrees">
@@ -364,11 +415,18 @@ function ManagerView({
             </div>
           )}
         </section>
-        <section className="worktree-ref-list" aria-label="Refs">
-          <RefGroup title="Remote branches" refs={remoteRefs} />
-          <RefGroup title="Local branches" refs={localRefs} />
-          <RefGroup title="Tags" refs={tagRefs} disabled />
-        </section>
+        <PluginPanelDock className="worktree-ref-dock" items={[{
+          id: "refs",
+          label: "Worktree refs",
+          icon: <GitBranch size={15} />,
+          children: (
+            <section className="worktree-ref-list" aria-label="Refs">
+              <RefGroup title="Remote branches" refs={remoteRefs} />
+              <RefGroup title="Local branches" refs={localRefs} />
+              <RefGroup title="Tags" refs={tagRefs} disabled />
+            </section>
+          )
+        }]} />
       </div>
 
       {deleteTarget ? (

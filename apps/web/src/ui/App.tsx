@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement, type RefObject } from "react";
-import { AlertTriangle, Bot, ChevronDown, Columns2, GitBranch, LayoutTemplate, Maximize2, Mic, MicOff, Minimize2, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
+import { AlertTriangle, Bell, BellRing, Bot, CheckCheck, ChevronDown, Columns2, GitBranch, LayoutTemplate, Maximize2, Mic, MicOff, Minimize2, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
 
 import { RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsStore, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
 
@@ -10,10 +10,16 @@ import {
   closeTab,
   createTab,
   createWindow,
+  deleteAllNotifications,
   deleteLayoutTemplate,
+  deleteNotification,
   deleteWindow,
+  emitTrigger,
+  getAutomationCatalog,
+  getAutomationGroups,
   getConfig,
   getHealth,
+  getNotifications,
   getPlugins,
   getWorkspace,
   saveLayoutTemplate,
@@ -29,6 +35,7 @@ import {
   type VoiceAudioStreamSession
 } from "../api.js";
 import { ControlButton } from "./Control.js";
+import { activeAutomationTriggerIds as triggerIdsFromAutomation, type TriggerEmitter } from "./automationTriggers.js";
 import { disposeFileBrowserPanelStatesExcept } from "./fileBrowserPanelState.js";
 import { disposeDocumentationIngestController, disposeDocumentationIngestControllersExcept } from "./documentationPanelQueue.js";
 import { PathEntry } from "./PathEntry.js";
@@ -40,7 +47,6 @@ import {
   findPane,
   isPaneTabActive,
   listPanes,
-  maximizedLayoutNode,
   placeTabInPane,
   reconcileLayout,
   removePane,
@@ -58,6 +64,7 @@ import { clearFocusedAttention, isTabFocused, updateAttentionTabs } from "./tabA
 import { applyTerminalColorTheme, applyTerminalUiScale, disposeTerminalView, disposeTerminalViewsExcept } from "./terminalViewStore.js";
 import { applyCloudxTheme, readTerminalColorTheme } from "./theme.js";
 import { normalizeUiScale, uiScaleFactor } from "./uiScale.js";
+import { browserNotificationPermissionState, NOTIFICATION_TOAST_MS, requestBrowserNotificationPermission, showBrowserNotification, upsertNotification, type BrowserNotificationPermissionState } from "./notifications.js";
 import { noSystemTextAssistProps } from "./inputAssist.js";
 import { attemptPortraitOrientationLock } from "./orientationLock.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
@@ -176,6 +183,10 @@ export function App() {
   const [liveTranscript, setLiveTranscript] = useState<string | undefined>();
   const [manualTranscript, setManualTranscript] = useState("");
   const [notifications, setNotifications] = useState<CloudxNotification[]>([]);
+  const [notificationToastIds, setNotificationToastIds] = useState<Set<string>>(() => new Set());
+  const [notificationCenterOpen, setNotificationCenterOpen] = useState(false);
+  const [browserNotificationState, setBrowserNotificationState] = useState<BrowserNotificationPermissionState>(() => browserNotificationPermissionState());
+  const [activeAutomationTriggerIds, setActiveAutomationTriggerIds] = useState<Set<string>>(() => new Set());
   const [automationRuns, setAutomationRuns] = useState<AutomationRunSummary[]>([]);
   const [attentionTabIds, setAttentionTabIds] = useState<Set<string>>(() => new Set());
   const [documentationPanelStates, setDocumentationPanelStates] = useState<Record<string, DocumentationPanelState>>({});
@@ -194,6 +205,7 @@ export function App() {
   const pendingLayoutBaseRef = useRef<TabLayoutState | undefined>(undefined);
   const pendingLayoutPersistRef = useRef<TabLayoutState | undefined>(undefined);
   const audioSessionRef = useRef<VoiceAudioStreamSession | undefined>(undefined);
+  const notificationToastTimersRef = useRef<Map<string, number>>(new Map());
   const topbarMicControlRef = useRef<HTMLDivElement | null>(null);
   const footerMicControlRef = useRef<HTMLDivElement | null>(null);
   const mobileActionsRef = useRef<HTMLDivElement | null>(null);
@@ -215,9 +227,7 @@ export function App() {
         }
         setConnectionStatus("connected");
       },
-      (notification) => {
-        setNotifications((current) => [notification, ...current.filter((candidate) => candidate.id !== notification.id)].slice(0, 5));
-      },
+      (notification) => receiveNotification(notification),
       (runs) => setAutomationRuns(runs),
       (instruction) => applyHookUiInstruction(instruction),
       () => setConnectionStatus("disconnected")
@@ -229,7 +239,18 @@ export function App() {
       if (persistLayoutTimerRef.current !== undefined) {
         window.clearTimeout(persistLayoutTimerRef.current);
       }
+      clearNotificationToastTimers();
       window.clearInterval(interval);
+    };
+  }, []);
+
+  useEffect(() => {
+    const updatePermissionState = () => setBrowserNotificationState(browserNotificationPermissionState());
+    window.addEventListener("focus", updatePermissionState);
+    document.addEventListener("visibilitychange", updatePermissionState);
+    return () => {
+      window.removeEventListener("focus", updatePermissionState);
+      document.removeEventListener("visibilitychange", updatePermissionState);
     };
   }, []);
 
@@ -329,7 +350,6 @@ export function App() {
   const voiceConsoleText = voiceConsoleValue(voiceState, manualTranscript, voiceMessage, liveTranscript);
   const uiContributions = useMemo(() => collectUiContributions(plugins), [plugins]);
   const mobileActionsEnabled = useMediaQuery(MOBILE_ACTIONS_QUERY);
-  const visibleLayoutRoot = useMemo(() => maximizedLayoutNode(layout.root, maximizedPaneId), [layout.root, maximizedPaneId]);
 
   usePortraitOrientationLock();
   useMobileZoomSuppression();
@@ -350,10 +370,19 @@ export function App() {
   async function refresh() {
     setConnectionStatus("checking");
     try {
-      const [pluginList, workspaceState, configState, rulesSkills] = await Promise.all([getPlugins(), getWorkspace(), getConfig(), loadRulesSkillsStore()]);
+      const [pluginList, workspaceState, configState, rulesSkills, activeTriggers, notificationHistory] = await Promise.all([
+        getPlugins(),
+        getWorkspace(),
+        getConfig(),
+        loadRulesSkillsStore(),
+        loadActiveAutomationTriggerIds(),
+        getNotifications()
+      ]);
       setPlugins(pluginList);
       setConfig(configState);
       setRulesSkillsStore(rulesSkills);
+      setActiveAutomationTriggerIds(activeTriggers);
+      setNotifications(notificationHistory);
       applyWorkspaceState(workspaceState);
       setConnectionStatus("connected");
       setError(undefined);
@@ -417,6 +446,88 @@ export function App() {
     } catch {
       setConnectionStatus("disconnected");
     }
+  }
+
+  async function loadActiveAutomationTriggerIds(): Promise<Set<string>> {
+    const [catalog, groups] = await Promise.all([getAutomationCatalog(), getAutomationGroups()]);
+    return triggerIdsFromAutomation(groups, catalog);
+  }
+
+  async function refreshActiveAutomationTriggerIds(): Promise<void> {
+    setActiveAutomationTriggerIds(await loadActiveAutomationTriggerIds());
+  }
+
+  async function handleEmitTrigger(triggerId: string, payload: Record<string, unknown> = {}): Promise<void> {
+    await emitTrigger(triggerId, payload);
+    setError(undefined);
+  }
+
+  function receiveNotification(notification: CloudxNotification) {
+    setNotifications((current) => upsertNotification(current, notification));
+    setNotificationToastIds((current) => new Set(current).add(notification.id));
+    scheduleNotificationToastCollapse(notification.id);
+    showBrowserNotification(notification);
+  }
+
+  function scheduleNotificationToastCollapse(id: string) {
+    const existing = notificationToastTimersRef.current.get(id);
+    if (existing !== undefined) {
+      window.clearTimeout(existing);
+    }
+    const timer = window.setTimeout(() => {
+      notificationToastTimersRef.current.delete(id);
+      setNotificationToastIds((current) => notificationToastIdsAfterDismiss(current, id));
+    }, NOTIFICATION_TOAST_MS);
+    notificationToastTimersRef.current.set(id, timer);
+  }
+
+  function dismissNotificationToast(id: string) {
+    const existing = notificationToastTimersRef.current.get(id);
+    if (existing !== undefined) {
+      window.clearTimeout(existing);
+      notificationToastTimersRef.current.delete(id);
+    }
+    setNotificationToastIds((current) => notificationToastIdsAfterDismiss(current, id));
+  }
+
+  async function dismissNotification(id: string) {
+    setError(undefined);
+    try {
+      const nextNotifications = await deleteNotification(id);
+      const existing = notificationToastTimersRef.current.get(id);
+      if (existing !== undefined) {
+        window.clearTimeout(existing);
+        notificationToastTimersRef.current.delete(id);
+      }
+      setNotifications(nextNotifications);
+      setNotificationToastIds((current) => notificationToastIdsAfterDismiss(current, id));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function dismissAllNotifications() {
+    setError(undefined);
+    try {
+      const nextNotifications = await deleteAllNotifications();
+      clearNotificationToastTimers();
+      setNotifications(nextNotifications);
+      setNotificationToastIds(new Set());
+      setNotificationCenterOpen(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  function clearNotificationToastTimers() {
+    for (const timer of notificationToastTimersRef.current.values()) {
+      window.clearTimeout(timer);
+    }
+    notificationToastTimersRef.current.clear();
+  }
+
+  async function handleRequestBrowserNotifications() {
+    setBrowserNotificationState(await requestBrowserNotificationPermission());
   }
 
   function commitLayout(nextLayout: TabLayoutState, options: { persist?: boolean; windowId?: string; baseLayout?: TabLayoutState } = {}) {
@@ -799,12 +910,12 @@ export function App() {
     }
   }
 
-  async function callUiHook<T extends Record<string, unknown> = Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}, targetTabId?: string): Promise<T> {
+  const callUiHook = useCallback(async <T extends Record<string, unknown> = Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}, targetTabId?: string): Promise<T> => {
     const result = await callHook<T>(hookId, input, targetTabId);
     applyHookResult(result);
     setError(undefined);
     return result;
-  }
+  }, []);
 
   function currentVoiceClientContext() {
     return buildClientVoiceContext(layoutRef.current, tabsRef.current, windowsRef.current, activeWindowIdRef.current);
@@ -986,7 +1097,7 @@ export function App() {
     [PLUGIN_WEBVIEW_RENDERER]: (contribution, context) => <PluginWebviewPanel contribution={contribution} context={context} />,
     "jira.panel": (_contribution, context) => context.callHook ? (
       <Suspense fallback={<div className="empty-pane">Loading Jira...</div>}>
-        <JiraPanel callHook={context.callHook} />
+        <JiraPanel callHook={context.callHook} activeTriggerIds={activeAutomationTriggerIds} emitTrigger={handleEmitTrigger} />
       </Suspense>
     ) : <div className="empty-pane">Jira hooks are unavailable.</div>,
     [UI_RENDERER_STATUS_DOT]: (_contribution, context) => (context.tab ? <TabIndicatorDot tab={context.tab} attention={context.attention} /> : null),
@@ -1101,6 +1212,13 @@ export function App() {
                 <ControlButton className="icon-button" iconOnly onClick={() => window.location.reload()} title="Reload app" aria-label="Reload app" role="menuitem">
                   <RefreshCw size={17} />
                 </ControlButton>
+                <NotificationCenter
+                  notifications={notifications}
+                  open={notificationCenterOpen}
+                  onOpenChange={setNotificationCenterOpen}
+                  onDismiss={dismissNotification}
+                  onDismissAll={dismissAllNotifications}
+                />
                 <ControlButton className="icon-button" iconOnly onClick={() => { setSettingsOpen(true); setMobileActionsOpen(false); }} title="Settings" aria-label="Settings" role="menuitem">
                   <Settings size={17} />
                 </ControlButton>
@@ -1126,6 +1244,13 @@ export function App() {
             <ControlButton className="icon-button" iconOnly onClick={() => window.location.reload()} title="Reload app">
               <RefreshCw size={17} />
             </ControlButton>
+            <NotificationCenter
+              notifications={notifications}
+              open={notificationCenterOpen}
+              onOpenChange={setNotificationCenterOpen}
+              onDismiss={dismissNotification}
+              onDismissAll={dismissAllNotifications}
+            />
             <ControlButton className="icon-button" iconOnly onClick={() => setSettingsOpen(true)} title="Settings">
               <Settings size={17} />
             </ControlButton>
@@ -1153,10 +1278,10 @@ export function App() {
       </header>
 
       {error ? <div className="error-banner">{error}</div> : null}
-      {notifications.length ? <NotificationStack notifications={notifications} onDismiss={(id) => setNotifications((current) => current.filter((notification) => notification.id !== id))} /> : null}
+      {notificationToastIds.size ? <NotificationStack notifications={notifications.filter((notification) => notificationToastIds.has(notification.id))} onDismiss={dismissNotificationToast} /> : null}
 
       <section className={`pane-root${maximizedPaneId ? " maximized" : ""}`}>
-        {renderLayoutNode(visibleLayoutRoot)}
+        {renderLayoutNode(layout.root)}
       </section>
 
       {renderUiContributions("app.footer.actions")}
@@ -1170,6 +1295,8 @@ export function App() {
           onSave={handleSaveConfig}
           onClearPluginSecret={handleClearPluginSecret}
           onSaveDefaultTemplate={handleSetDefaultTemplate}
+          browserNotificationState={browserNotificationState}
+          onRequestBrowserNotifications={handleRequestBrowserNotifications}
         />
       ) : null}
       {tabSettings && tabById.has(tabSettings.tabId) ? (
@@ -1192,17 +1319,33 @@ export function App() {
     if (node.type === "pane") {
       return renderPane(node.pane);
     }
+    const firstContainsMaximizedPane = Boolean(maximizedPaneId && findPane(node.children[0], maximizedPaneId));
+    const secondContainsMaximizedPane = Boolean(maximizedPaneId && findPane(node.children[1], maximizedPaneId));
     return (
       <div className={`pane-split ${node.direction}`} data-split-id={node.id}>
-        <div className="pane-split-child" style={{ flexBasis: `${node.sizes[0]}%` }}>
+        <div className={paneSplitChildClass(firstContainsMaximizedPane)} style={{ flexBasis: paneSplitChildBasis(node.sizes[0], firstContainsMaximizedPane) }}>
           {renderLayoutNode(node.children[0])}
         </div>
         <ResizeHandle direction={node.direction} sizes={[node.sizes[0], node.sizes[1]]} onResize={(delta, total, startSizes) => resizePane(node.id, delta, total, startSizes)} />
-        <div className="pane-split-child" style={{ flexBasis: `${node.sizes[1]}%` }}>
+        <div className={paneSplitChildClass(secondContainsMaximizedPane)} style={{ flexBasis: paneSplitChildBasis(node.sizes[1], secondContainsMaximizedPane) }}>
           {renderLayoutNode(node.children[1])}
         </div>
       </div>
     );
+  }
+
+  function paneSplitChildClass(containsMaximizedPane: boolean): string {
+    if (!maximizedPaneId) {
+      return "pane-split-child";
+    }
+    return `pane-split-child ${containsMaximizedPane ? "maximized-visible-branch" : "maximized-hidden-branch"}`;
+  }
+
+  function paneSplitChildBasis(size: number, containsMaximizedPane: boolean): string {
+    if (!maximizedPaneId) {
+      return `${size}%`;
+    }
+    return containsMaximizedPane ? "100%" : "0%";
   }
 
   function renderPane(pane: Pane): ReactElement {
@@ -1325,6 +1468,9 @@ export function App() {
               uiContributionRegistry={uiContributionRegistry}
               callHook={callUiHook}
               automationRuns={automationRuns}
+              activeAutomationTriggerIds={activeAutomationTriggerIds}
+              emitTrigger={handleEmitTrigger}
+              onAutomationGroupsChanged={refreshActiveAutomationTriggerIds}
             />
           ) : (
             <div className="empty-pane">
@@ -1797,7 +1943,10 @@ function PluginPanel({
   uiScale,
   uiContributionRegistry,
   callHook,
-  automationRuns
+  automationRuns,
+  activeAutomationTriggerIds,
+  emitTrigger,
+  onAutomationGroupsChanged
 }: {
   tab: WorkspaceTab;
   plugin: PluginDescriptor | undefined;
@@ -1808,6 +1957,9 @@ function PluginPanel({
   uiContributionRegistry: UiContributionRegistry;
   callHook: UiContributionRenderContext["callHook"];
   automationRuns: AutomationRunSummary[];
+  activeAutomationTriggerIds: ReadonlySet<string>;
+  emitTrigger: TriggerEmitter;
+  onAutomationGroupsChanged: () => Promise<void>;
 }) {
   const panelContribution = selectPluginPanelContribution(plugins, plugin);
   if (panelContribution) {
@@ -1827,12 +1979,12 @@ function PluginPanel({
     return <WebViewerPanel key={tab.id} tab={tab} />;
   }
   if (plugin?.panelKind === "worktree-manager") {
-    return <WorktreeManagerPanel key={tab.id} tab={tab} config={config} />;
+    return <WorktreeManagerPanel key={tab.id} tab={tab} config={config} activeTriggerIds={activeAutomationTriggerIds} emitTrigger={emitTrigger} />;
   }
   if (plugin?.panelKind === "automation") {
     return (
       <Suspense fallback={<div className="empty-pane">Loading automation...</div>}>
-        <AutomationPanel key={tab.id} tab={tab} liveRuns={automationRuns} />
+        <AutomationPanel key={tab.id} tab={tab} liveRuns={automationRuns} onAutomationGroupsChanged={onAutomationGroupsChanged} />
       </Suspense>
     );
   }
@@ -2076,6 +2228,70 @@ function getMicrophoneUnavailableReason(): string | undefined {
   return undefined;
 }
 
+function NotificationCenter({
+  notifications,
+  open,
+  onOpenChange,
+  onDismiss,
+  onDismissAll
+}: {
+  notifications: CloudxNotification[];
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onDismiss: (id: string) => void;
+  onDismissAll: () => void;
+}) {
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  useOutsidePointerDismiss(open, rootRef, () => onOpenChange(false));
+  const count = notifications.length;
+
+  return (
+    <div className="notification-center" ref={rootRef}>
+      <ControlButton
+        className="icon-button notification-center-button"
+        iconOnly
+        pressed={open}
+        onClick={() => onOpenChange(!open)}
+        title={count ? `${count} notification${count === 1 ? "" : "s"}` : "Notifications"}
+        aria-label={count ? `${count} notification${count === 1 ? "" : "s"}` : "Notifications"}
+        aria-expanded={open}
+        aria-haspopup="dialog"
+      >
+        {count ? <BellRing size={17} /> : <Bell size={17} />}
+      </ControlButton>
+      {count ? <span className="notification-count">{count > 99 ? "99+" : count}</span> : null}
+      {open ? (
+        <div className="notification-center-popover" role="dialog" aria-label="Notifications">
+          <div className="notification-center-header">
+            <strong>Notifications</strong>
+            <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={onDismissAll} disabled={!count} title="Dismiss all notifications" aria-label="Dismiss all notifications">
+              <CheckCheck size={15} />
+            </ControlButton>
+          </div>
+          {count ? (
+            <div className="notification-list">
+              {notifications.map((notification) => (
+                <article key={notification.id} className={`notification-list-item ${notification.level}`}>
+                  <div>
+                    <strong>{notification.title}</strong>
+                    {notification.body ? <p>{notification.body}</p> : null}
+                    <small>{formatNotificationTime(notification.at)}</small>
+                  </div>
+                  <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => onDismiss(notification.id)} title={`Dismiss ${notification.title}`} aria-label={`Dismiss ${notification.title}`}>
+                    <X size={14} />
+                  </ControlButton>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <p className="notification-center-empty">No notifications.</p>
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function NotificationStack({ notifications, onDismiss }: { notifications: CloudxNotification[]; onDismiss: (id: string) => void }) {
   return (
     <section className="notification-stack" aria-label="Notifications" aria-live="polite">
@@ -2092,6 +2308,20 @@ function NotificationStack({ notifications, onDismiss }: { notifications: Cloudx
       ))}
     </section>
   );
+}
+
+export function notificationToastIdsAfterDismiss(current: ReadonlySet<string>, id: string): Set<string> {
+  const next = new Set(current);
+  next.delete(id);
+  return next;
+}
+
+function formatNotificationTime(value: string): string {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) {
+    return value;
+  }
+  return new Date(timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 interface WorkspaceSocketSubscriptionOptions {

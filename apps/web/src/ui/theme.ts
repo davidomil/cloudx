@@ -7,9 +7,43 @@ interface CloudxTheme {
   tokens: ThemeTokenMap;
 }
 
+const TYPOGRAPHY_SCALE_TOKENS: ThemeTokenMap = {
+  "font-root-size": "16px",
+  "font-mono": "\"JetBrains Mono\", \"SFMono-Regular\", Consolas, \"Liberation Mono\", monospace",
+  "font-size-3xs": "0.5rem",
+  "font-size-2xs": "0.5625rem",
+  "font-size-xs": "0.625rem",
+  "font-size-sm": "0.6875rem",
+  "font-size-md": "0.75rem",
+  "font-size-lg": "0.8125rem",
+  "font-size-xl": "1rem",
+  "line-height-tight": "1.2",
+  "line-height-compact": "1.35",
+  "line-height-normal": "1.45",
+  "line-height-reading": "1.55"
+};
+
+const LAYOUT_TOKENS: ThemeTokenMap = {
+  "plugin-panel-dock-button-size": "44px",
+  "plugin-panel-dock-menu-gap": "4px",
+  "plugin-panel-dock-hover-bridge": "12px",
+  "plugin-panel-dock-panel-width": "360px",
+  "plugin-panel-dock-panel-height": "580px",
+  "notification-center-hit-padding": "7px",
+  "notification-count-size": "17px",
+  "notification-count-inset": "1px",
+  "notification-popover-offset": "8px",
+  "notification-popover-width": "420px",
+  "notification-popover-max-height": "520px",
+  "notification-popover-viewport-margin": "24px",
+  "notification-popover-viewport-reserve": "92px"
+};
+
 const CLOUDX_THEME: CloudxTheme = {
   id: "cloudx-neon",
   tokens: {
+    ...TYPOGRAPHY_SCALE_TOKENS,
+    ...LAYOUT_TOKENS,
     "color-background": "#0a0a0f",
     "color-foreground": "#e0e0e0",
     "color-card": "#12121a",
@@ -89,6 +123,16 @@ const CLOUDX_THEME: CloudxTheme = {
     "automation-disabled-background": "rgb(14 15 20 / 0.86)",
     "automation-disabled-border": "rgb(80 84 96 / 0.7)",
     "automation-config-connected": "rgb(255 209 102 / 0.86)",
+    "surface-badge-border": "rgb(10 10 15 / 0.95)",
+    "surface-popover-background": "rgb(10 10 15 / 0.98)",
+    "surface-popover-border": "rgb(0 212 255 / 0.42)",
+    "surface-popover-shadow": "var(--shadow-neon-tertiary), 0 20px 54px rgb(0 0 0 / 0.52)",
+    "surface-dock-button-shadow": "var(--shadow-neon-tertiary), 0 10px 28px rgb(0 0 0 / 0.35)",
+    "surface-nested-panel-background": "rgb(14 18 26 / 0.98)",
+    "surface-list-item-background": "rgb(18 18 26 / 0.82)",
+    "surface-divider-border": "rgb(42 42 58 / 0.92)",
+    "resize-handle-background": "linear-gradient(90deg, transparent, rgb(0 212 255 / 0.24), transparent), rgb(18 18 26 / 0.56)",
+    "resize-handle-border": "rgb(0 212 255 / 0.18)",
     "shadow-neon": "0 0 5px #00ff88, 0 0 10px #00ff8840",
     "shadow-neon-sm": "0 0 3px #00ff88, 0 0 6px #00ff8830",
     "shadow-neon-lg": "0 0 10px #00ff88, 0 0 20px #00ff8860, 0 0 40px #00ff8830",
@@ -129,6 +173,8 @@ const CLOUDX_THEME: CloudxTheme = {
 const MINIMALIST_DARK_THEME: CloudxTheme = {
   id: "minimalist-dark",
   tokens: {
+    ...TYPOGRAPHY_SCALE_TOKENS,
+    ...LAYOUT_TOKENS,
     "color-background": "#0A0A0F",
     "color-foreground": "#FAFAFA",
     "color-card": "rgba(26, 26, 36, 0.6)",
@@ -208,6 +254,16 @@ const MINIMALIST_DARK_THEME: CloudxTheme = {
     "automation-disabled-background": "rgba(18, 18, 24, 0.86)",
     "automation-disabled-border": "rgba(255, 255, 255, 0.12)",
     "automation-config-connected": "rgba(245, 158, 11, 0.86)",
+    "surface-badge-border": "rgba(10, 10, 15, 0.95)",
+    "surface-popover-background": "rgba(10, 10, 15, 0.98)",
+    "surface-popover-border": "rgba(245, 158, 11, 0.32)",
+    "surface-popover-shadow": "0 20px 54px rgba(0, 0, 0, 0.52), 0 0 28px rgba(245, 158, 11, 0.18)",
+    "surface-dock-button-shadow": "0 10px 28px rgba(0, 0, 0, 0.35), 0 0 18px rgba(245, 158, 11, 0.16)",
+    "surface-nested-panel-background": "rgba(20, 20, 28, 0.98)",
+    "surface-list-item-background": "rgba(26, 26, 36, 0.82)",
+    "surface-divider-border": "rgba(255, 255, 255, 0.12)",
+    "resize-handle-background": "linear-gradient(90deg, transparent, rgba(245, 158, 11, 0.22), transparent), rgba(26, 26, 36, 0.56)",
+    "resize-handle-border": "rgba(245, 158, 11, 0.18)",
     "shadow-neon": "0 0 20px rgba(245, 158, 11, 0.15)",
     "shadow-neon-sm": "0 0 20px rgba(245, 158, 11, 0.15)",
     "shadow-neon-lg": "0 0 60px rgba(245, 158, 11, 0.25)",

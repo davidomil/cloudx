@@ -174,6 +174,39 @@ describe("AutomationPanel helpers", () => {
     }
   });
 
+  it("surfaces automation trigger refresh failures after successful saves", async () => {
+    vi.stubGlobal("ResizeObserver", TestResizeObserver);
+    vi.stubGlobal("fetch", automationPanelFetch({
+      "/api/automation/groups/group": { group: groupFixture() }
+    }));
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => {
+        root.render(createElement(AutomationPanel, {
+          tab: workspaceTab(),
+          onAutomationGroupsChanged: async () => {
+            throw new Error("catalog unavailable");
+          }
+        }));
+      });
+      await flushPanelEffects();
+
+      await act(async () => {
+        automationButton(container, "Save automation").click();
+      });
+      await flushPanelEffects();
+
+      expect(automationStatusElement(container).textContent).toBe("Automation saved. Refresh automation triggers failed: catalog unavailable");
+    } finally {
+      await act(async () => {
+        root.unmount();
+      });
+    }
+  });
+
   it("labels unsafe palette entries in the node picker metadata", () => {
     expect(automationPaletteEntryMetaText({ ...paletteEntries()[0]!, safety: "external" })).toBe("function - External hook");
     expect(automationPaletteEntryMetaText({ ...paletteEntries()[0]!, safety: "destructive" })).toBe("function - Destructive hook");
@@ -657,9 +690,12 @@ describe("AutomationPanel helpers", () => {
   });
 });
 
-function automationPanelFetch() {
+function automationPanelFetch(responses: Record<string, unknown> = {}) {
   return vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
+    if (url in responses) {
+      return jsonResponse(responses[url]);
+    }
     if (url === "/api/automation/catalog") {
       return jsonResponse(catalogFixture());
     }

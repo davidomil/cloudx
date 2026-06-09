@@ -1,18 +1,23 @@
-import { useCallback, useEffect, useState } from "react";
-import { ExternalLink, MessageSquare, RefreshCw, Send } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ExternalLink, MessageSquare, PanelLeft, Play, RefreshCw, Send } from "lucide-react";
 
 import type { UiContributionRenderContext } from "./uiContributions.js";
 import { ControlButton } from "./Control.js";
+import { JIRA_ISSUE_MANUAL_TRIGGER_ID, jiraIssueManualRunPayload, type TriggerEmitter } from "./automationTriggers.js";
+import { PluginPanelDock } from "./PluginPanelDock.js";
 
 type JiraCallHook = NonNullable<UiContributionRenderContext["callHook"]>;
 
 interface JiraUserSummary {
+  accountId?: string;
   displayName?: string;
   emailAddress?: string;
 }
 
 interface JiraIssueSummary {
+  id?: string;
   key: string;
+  siteUrl?: string;
   url: string;
   summary: string;
   description?: string;
@@ -24,6 +29,7 @@ interface JiraIssueSummary {
   epicKey?: string;
   epicSummary?: string;
   epicUrl?: string;
+  created?: string;
   updated?: string;
 }
 
@@ -55,16 +61,34 @@ interface JiraTransition {
   to?: { name?: string };
 }
 
-export function JiraPanel({ callHook }: { callHook: JiraCallHook }) {
+interface JiraIssueDetails {
+  issue: JiraIssueSummary;
+  comments: JiraCommentSummary[];
+  transitions: JiraTransition[];
+}
+
+export function JiraPanel({
+  callHook,
+  activeTriggerIds,
+  emitTrigger
+}: {
+  callHook: JiraCallHook;
+  activeTriggerIds?: ReadonlySet<string>;
+  emitTrigger?: TriggerEmitter;
+}) {
   const [dashboard, setDashboard] = useState<JiraDashboardResponse | undefined>();
   const [selectedKey, setSelectedKey] = useState<string | undefined>();
   const [selectedIssue, setSelectedIssue] = useState<JiraIssueSummary | undefined>();
   const [comments, setComments] = useState<JiraCommentSummary[]>([]);
   const [transitions, setTransitions] = useState<JiraTransition[]>([]);
   const [commentDraft, setCommentDraft] = useState("");
+  const [detailBusy, setDetailBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
   const [notice, setNotice] = useState<string | undefined>();
+  const issueManualTriggerActive = Boolean(activeTriggerIds?.has(JIRA_ISSUE_MANUAL_TRIGGER_ID) && emitTrigger);
+  const selectedDashboardIssue = useMemo(() => dashboard?.issues.find((issue) => issue.key === selectedKey), [dashboard?.issues, selectedKey]);
+  const selectedDashboardIssueRef = useRef<JiraIssueSummary | undefined>(undefined);
 
   const loadDashboard = useCallback(async () => {
     setBusy(true);
@@ -84,15 +108,21 @@ export function JiraPanel({ callHook }: { callHook: JiraCallHook }) {
     void loadDashboard();
   }, [loadDashboard]);
 
-  const loadIssueDetails = useCallback(async (issueKey: string) => {
+  useEffect(() => {
+    selectedDashboardIssueRef.current = selectedDashboardIssue;
+  }, [selectedDashboardIssue]);
+
+  const loadIssueDetails = useCallback(async (issueKey: string): Promise<JiraIssueDetails> => {
     const [issueResponse, commentResponse, transitionResponse] = await Promise.all([
       callHook<{ issue: JiraIssueSummary }>("jira.issue.get", { issueIdOrKey: issueKey }),
       callHook<{ comments: JiraCommentSummary[] }>("jira.issue.comments.list", { issueIdOrKey: issueKey }),
       callHook<{ transitions: JiraTransition[] }>("jira.issue.transitions.list", { issueIdOrKey: issueKey })
     ]);
-    setSelectedIssue(issueResponse.issue);
-    setComments(commentResponse.comments);
-    setTransitions(transitionResponse.transitions);
+    return {
+      issue: issueResponse.issue,
+      comments: commentResponse.comments,
+      transitions: transitionResponse.transitions
+    };
   }, [callHook]);
 
   useEffect(() => {
@@ -100,18 +130,30 @@ export function JiraPanel({ callHook }: { callHook: JiraCallHook }) {
       setSelectedIssue(undefined);
       setComments([]);
       setTransitions([]);
+      setDetailBusy(false);
       return;
     }
     let cancelled = false;
+    setSelectedIssue(selectedDashboardIssueRef.current);
+    setComments([]);
+    setTransitions([]);
+    setDetailBusy(true);
     void (async () => {
       setNotice(undefined);
       try {
+        const details = await loadIssueDetails(selectedKey);
         if (!cancelled) {
-          await loadIssueDetails(selectedKey);
+          setSelectedIssue(details.issue);
+          setComments(details.comments);
+          setTransitions(details.transitions);
         }
       } catch (error) {
         if (!cancelled) {
           setNotice(error instanceof Error ? error.message : String(error));
+        }
+      } finally {
+        if (!cancelled) {
+          setDetailBusy(false);
         }
       }
     })();
@@ -119,6 +161,13 @@ export function JiraPanel({ callHook }: { callHook: JiraCallHook }) {
       cancelled = true;
     };
   }, [loadIssueDetails, selectedKey]);
+
+  const refreshSelectedIssueDetails = useCallback(async (issueKey: string) => {
+    const details = await loadIssueDetails(issueKey);
+    setSelectedIssue(details.issue);
+    setComments(details.comments);
+    setTransitions(details.transitions);
+  }, [loadIssueDetails]);
 
   const addComment = useCallback(async () => {
     const body = commentDraft.trim();
@@ -130,13 +179,13 @@ export function JiraPanel({ callHook }: { callHook: JiraCallHook }) {
     try {
       await callHook("jira.issue.comment.add", { issueIdOrKey: selectedKey, body });
       setCommentDraft("");
-      await loadIssueDetails(selectedKey);
+      await refreshSelectedIssueDetails(selectedKey);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
     } finally {
       setActionBusy(false);
     }
-  }, [callHook, commentDraft, loadIssueDetails, selectedKey]);
+  }, [callHook, commentDraft, refreshSelectedIssueDetails, selectedKey]);
 
   const transitionIssue = useCallback(async (transitionId: string | undefined) => {
     if (!selectedKey || !transitionId) {
@@ -146,13 +195,63 @@ export function JiraPanel({ callHook }: { callHook: JiraCallHook }) {
     setNotice(undefined);
     try {
       await callHook("jira.issue.transition", { issueIdOrKey: selectedKey, transitionId });
-      await Promise.all([loadDashboard(), loadIssueDetails(selectedKey)]);
+      await Promise.all([loadDashboard(), refreshSelectedIssueDetails(selectedKey)]);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
     } finally {
       setActionBusy(false);
     }
-  }, [callHook, loadDashboard, loadIssueDetails, selectedKey]);
+  }, [callHook, loadDashboard, refreshSelectedIssueDetails, selectedKey]);
+
+  const runIssueAutomation = useCallback(async (issue: JiraIssueSummary) => {
+    if (!emitTrigger) {
+      return;
+    }
+    setActionBusy(true);
+    setNotice(undefined);
+    try {
+      await emitTrigger(JIRA_ISSUE_MANUAL_TRIGGER_ID, jiraIssueManualRunPayload(issue));
+      setNotice(`Triggered Jira automation for ${issue.key}.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setActionBusy(false);
+    }
+  }, [emitTrigger]);
+
+  const issueList = (className: string) => (
+    <div className={className} aria-label="Jira issues">
+      {(dashboard?.groups ?? []).map((group) => (
+        <section className="jira-group" key={group.id}>
+          <h3>{group.title}</h3>
+          {group.issues.map((issue) => (
+            <article key={issue.key} className={`jira-issue-row${selectedKey === issue.key ? " selected" : ""}`}>
+              <button type="button" className="jira-issue-main" onClick={() => setSelectedKey(issue.key)}>
+                <span className="jira-issue-key">{issue.key}</span>
+                <span className="jira-issue-summary">{issue.summary}</span>
+                <span className="jira-issue-meta">{[issue.priority, issue.status].filter(Boolean).join(" · ")}</span>
+              </button>
+              {issueManualTriggerActive ? (
+                <ControlButton
+                  type="button"
+                  className="compact-icon-button jira-issue-trigger"
+                  size="compact"
+                  iconOnly
+                  onClick={() => void runIssueAutomation(issue)}
+                  disabled={actionBusy}
+                  title={`Run Jira automation for ${issue.key}`}
+                  aria-label={`Run Jira automation for ${issue.key}`}
+                >
+                  <Play size={14} />
+                </ControlButton>
+              ) : null}
+            </article>
+          ))}
+        </section>
+      ))}
+      {!busy && dashboard && dashboard.issues.length === 0 ? <div className="empty-pane">No Jira issues matched the dashboard JQL.</div> : null}
+    </div>
+  );
 
   return (
     <section className="jira-panel">
@@ -161,27 +260,21 @@ export function JiraPanel({ callHook }: { callHook: JiraCallHook }) {
           <h2>Jira</h2>
           <p>{dashboard?.jql ?? "Dashboard"}</p>
         </div>
-        <ControlButton size="compact" iconOnly title="Refresh Jira" aria-label="Refresh Jira" onClick={() => void loadDashboard()} disabled={busy}>
-          <RefreshCw size={15} />
-        </ControlButton>
+        <div className="jira-panel-header-actions">
+          <PluginPanelDock className="jira-issues-dock" items={[{
+            id: "issues",
+            label: "Jira issues",
+            icon: <PanelLeft size={15} />,
+            children: issueList("jira-dashboard-list jira-dashboard-list-dock")
+          }]} />
+          <ControlButton size="compact" iconOnly title="Refresh Jira" aria-label="Refresh Jira" onClick={() => void loadDashboard()} disabled={busy}>
+            <RefreshCw size={15} />
+          </ControlButton>
+        </div>
       </header>
       {notice ? <div className="jira-notice" role="alert">{notice}</div> : null}
       <div className="jira-panel-body">
-        <div className="jira-dashboard-list" aria-label="Jira issues">
-          {(dashboard?.groups ?? []).map((group) => (
-            <section className="jira-group" key={group.id}>
-              <h3>{group.title}</h3>
-              {group.issues.map((issue) => (
-                <button type="button" key={issue.key} className={`jira-issue-row${selectedKey === issue.key ? " selected" : ""}`} onClick={() => setSelectedKey(issue.key)}>
-                  <span className="jira-issue-key">{issue.key}</span>
-                  <span className="jira-issue-summary">{issue.summary}</span>
-                  <span className="jira-issue-meta">{[issue.priority, issue.status].filter(Boolean).join(" · ")}</span>
-                </button>
-              ))}
-            </section>
-          ))}
-          {!busy && dashboard && dashboard.issues.length === 0 ? <div className="empty-pane">No Jira issues matched the dashboard JQL.</div> : null}
-        </div>
+        {issueList("jira-dashboard-list jira-dashboard-list-inline")}
         <aside className="jira-detail" aria-label="Jira issue detail">
           {selectedIssue ? (
             <>
@@ -194,6 +287,7 @@ export function JiraPanel({ callHook }: { callHook: JiraCallHook }) {
                   <ExternalLink size={15} />
                 </a>
               </div>
+              {detailBusy ? <div className="jira-detail-status" role="status">Loading latest Jira details...</div> : null}
               <dl className="jira-fields">
                 <div><dt>Status</dt><dd>{selectedIssue.status ?? "Unknown"}</dd></div>
                 <div><dt>Priority</dt><dd>{selectedIssue.priority ?? "None"}</dd></div>
@@ -216,7 +310,7 @@ export function JiraPanel({ callHook }: { callHook: JiraCallHook }) {
                       {transition.name ?? transition.to?.name ?? transition.id}
                     </button>
                   ))}
-                  {transitions.length === 0 ? <span className="jira-muted">None</span> : null}
+                  {detailBusy ? <span className="jira-muted">Loading...</span> : transitions.length === 0 ? <span className="jira-muted">None</span> : null}
                 </div>
               </section>
               <section className="jira-comments">
@@ -236,7 +330,7 @@ export function JiraPanel({ callHook }: { callHook: JiraCallHook }) {
                     <p>{comment.bodyText}</p>
                   </article>
                 ))}
-                {comments.length === 0 ? <span className="jira-muted">No comments</span> : null}
+                {detailBusy ? <span className="jira-muted">Loading...</span> : comments.length === 0 ? <span className="jira-muted">No comments</span> : null}
               </section>
             </>
           ) : (

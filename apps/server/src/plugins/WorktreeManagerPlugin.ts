@@ -205,6 +205,29 @@ export class WorktreeManagerPlugin implements WorkspacePlugin {
   ];
   readonly triggers: TriggerDefinition[] = [
     {
+      id: "worktree.createRequested",
+      owner: { kind: "plugin", pluginId: this.id },
+      title: "New Worktree Play Clicked",
+      description: "Emitted when a user clicks the play action beside the new-worktree form.",
+      exposures: ["plugin", "automation", "http"],
+      payloadSchema: {
+        type: "object",
+        properties: {
+          eventId: { type: "string", description: "Unique event id for this click." },
+          eventType: { type: "string", enum: ["worktree.createRequested"], description: "Trigger event type." },
+          transport: { type: "string", enum: ["ui"], description: "How the trigger was emitted." },
+          mode: { type: "string", enum: ["new_branch", "existing_branch", "remote_branch"], description: "Current worktree creation mode." },
+          folderName: { type: "string", description: "Requested linked worktree folder name." },
+          branchName: { type: "string", description: "Requested local branch name." },
+          baseRef: { type: "string", description: "Requested base ref when applicable." },
+          projectDir: { type: "string", description: "Root project directory that owns the bare repository and linked worktrees." },
+          detectedAt: { type: "string", description: "ISO timestamp when the click was emitted." }
+        },
+        required: ["eventId", "eventType", "transport", "mode", "folderName", "branchName", "projectDir", "detectedAt"],
+        additionalProperties: false
+      }
+    },
+    {
       id: "worktree.created",
       owner: { kind: "plugin", pluginId: this.id },
       title: "Worktree Created",

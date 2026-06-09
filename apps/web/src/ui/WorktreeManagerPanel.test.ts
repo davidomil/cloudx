@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { WorktreeProjectState, WorktreeRef, WorkspaceTab } from "@cloudx/shared";
 
 import { runTabAction } from "../api.js";
+import { WORKTREE_CREATE_REQUESTED_TRIGGER_ID } from "./automationTriggers.js";
 import { REF_OPTION_LIMIT, WorktreeManagerPanel, copyWorktreeValueToClipboard, detectionSummary, filterRefOptions, formatBytes, prefillBranchPrefix } from "./WorktreeManagerPanel.js";
 
 vi.mock("../api.js", () => ({
@@ -110,6 +111,53 @@ describe("WorktreeManagerPanel", () => {
     expect(writes).toEqual(["/repo/worktrees/feature-ui", "feature/ui"]);
     await act(async () => root.unmount());
   });
+
+  it("shows the new-worktree play action only for active create-requested automations", async () => {
+    const emitted: Array<{ triggerId: string; payload?: Record<string, unknown> }> = [];
+    vi.mocked(runTabAction).mockResolvedValueOnce(projectState({
+      originUrl: "git@example.test:repo.git",
+      refs: [ref("origin/main", "remote")]
+    }));
+    const root = await render(createElement(WorktreeManagerPanel, {
+      tab: workspaceTab(),
+      config: { showFolderSize: false },
+      activeTriggerIds: new Set([WORKTREE_CREATE_REQUESTED_TRIGGER_ID]),
+      emitTrigger: async (triggerId: string, payload?: Record<string, unknown>) => {
+        emitted.push({ triggerId, payload });
+      }
+    }));
+
+    const folderInput = await waitForInput('input[placeholder="feature-ui"]');
+    const branchInput = document.querySelectorAll<HTMLInputElement>('input[placeholder="feature-ui"]')[1]!;
+    const baseInput = await waitForInput('[aria-label="Base ref"]');
+    await act(async () => {
+      setInputValue(folderInput, "feature-ui");
+      setInputValue(branchInput, "david/feature-ui");
+      setInputValue(baseInput, "origin/main");
+    });
+
+    const playButton = await waitForButton('[aria-label="Run new-worktree automation"]');
+    await act(async () => {
+      playButton.click();
+    });
+    await flushEffects();
+
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({
+      triggerId: WORKTREE_CREATE_REQUESTED_TRIGGER_ID,
+      payload: {
+        eventType: WORKTREE_CREATE_REQUESTED_TRIGGER_ID,
+        transport: "ui",
+        mode: "remote_branch",
+        folderName: "feature-ui",
+        branchName: "david/feature-ui",
+        baseRef: "origin/main",
+        projectDir: "/repo"
+      }
+    });
+
+    await act(async () => root.unmount());
+  });
 });
 
 describe("detectionSummary", () => {
@@ -181,6 +229,22 @@ async function waitForButton(selector: string): Promise<HTMLButtonElement> {
     await flushEffects();
   }
   throw new Error(`Missing button ${selector}. Rendered: ${document.body.textContent ?? ""}`);
+}
+
+async function waitForInput(selector: string): Promise<HTMLInputElement> {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const input = document.querySelector(selector);
+    if (input instanceof HTMLInputElement) {
+      return input;
+    }
+    await flushEffects();
+  }
+  throw new Error(`Missing input ${selector}. Rendered: ${document.body.textContent ?? ""}`);
+}
+
+function setInputValue(input: HTMLInputElement, value: string) {
+  Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, value);
+  input.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
 function cssBlockFor(selector: string): string {

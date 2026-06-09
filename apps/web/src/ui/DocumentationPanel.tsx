@@ -4,6 +4,7 @@ import { AlertTriangle, Bot, BookOpen, ExternalLink, FileImage, FilePlus, Info, 
 
 import type { UiContributionRenderContext } from "./uiContributions.js";
 import { ControlButton } from "./Control.js";
+import { PluginPanelDock } from "./PluginPanelDock.js";
 import { uploadDocumentationFile, type DocumentationUploadProgress, type DocumentationUploadResponse } from "../api.js";
 import { documentationIngestController } from "./documentationPanelQueue.js";
 
@@ -809,66 +810,81 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
           </div>
         </section>
 
-        <section className="documentation-section">
-          <h3>Add Knowledge</h3>
-          <form className="documentation-ingest" onSubmit={(event) => void ingest(event)}>
-            <div className="documentation-mode-row" role="group" aria-label="Ingest mode">
-              {(["upload", "path", "url", "text"] as const).map((candidate) => (
-                <ControlButton key={candidate} selected={mode === candidate} onClick={() => setMode(candidate)} size="compact">
-                  {candidate}
-                </ControlButton>
-              ))}
-            </div>
-            {mode === "upload" ? (
-              <label>
-                <span>Upload</span>
-                <input key={uploadInputKey} type="file" onChange={(event) => setUploadValue(event.target.files?.[0])} />
-              </label>
-            ) : null}
-            {mode === "upload" && uploadValue ? <p className="documentation-selected-file">{uploadValue.name} · {formatBytes(uploadValue.size)}</p> : null}
-            {mode === "path" ? <label><span>Path</span><input value={pathValue} onChange={(event) => setPathValue(event.target.value)} placeholder="/path/to/datasheet.pdf or docs/" /></label> : null}
-            {mode === "url" || mode === "text" ? <label><span>URL or URI</span><input value={urlValue} onChange={(event) => setUrlValue(event.target.value)} placeholder="https://vendor.example/doc, youtube playlist, or optional manual URI" /></label> : null}
-            <label><span>Title</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="auto from source" /></label>
-            <label><span>Collection</span><input value={collection} onChange={(event) => setCollection(event.target.value)} placeholder="auto from folder, domain, playlist, or upload" /></label>
-            {mode === "text" ? <label><span>Text</span><textarea value={textValue} onChange={(event) => setTextValue(event.target.value)} rows={5} /></label> : null}
-            <ControlButton type="submit" tone="primary" disabled={!canCall || !ingestReady(mode, uploadValue, pathValue, urlValue, textValue)}>
-              <FilePlus size={15} /> Queue
-            </ControlButton>
-          </form>
-          {visibleIngestJobs.length > 0 ? (
-            <div className="documentation-ingest-queue" aria-label="Documentation ingest queue">
-              <div className="documentation-ingest-queue-header">
-                <div>
-                  <h4>Import Queue</h4>
-                  <span>{runningIngestCount ? "1 running" : "idle"} · {queuedIngestCount} queued</span>
-                </div>
-                {finishedIngestCount > 0 ? (
-                  <ControlButton size="compact" onClick={clearFinishedIngestJobs}>Clear Finished</ControlButton>
-                ) : null}
-              </div>
-              <div className="documentation-ingest-queue-list">
-                {visibleIngestJobs.map((job, index) => <IngestQueueJob key={job.id} job={job} index={index} />)}
-              </div>
-            </div>
-          ) : null}
-        </section>
-
-        <section className="documentation-section documentation-documents">
-          <h3>Active Documents</h3>
-          {visibleDocuments.length > 0 ? (
-            <div className="documentation-document-list">
-              {visibleDocuments.map((document) => (
-                <div className="documentation-document-row" key={documentId(document)}>
-                  <span>{document.title ?? documentId(document)}</span>
-                  <small>{document.source_type ?? document.sourceType} · {document.chunk_count ?? document.chunkCount ?? 0} chunks</small>
-                  <ControlButton size="compact" disabled={documentBusy} onClick={() => void viewDocument(documentId(document))}>
-                    <BookOpen size={13} /> View
+        <PluginPanelDock compactAt="wide" items={[
+          {
+            id: "ingest",
+            label: "Add knowledge",
+            icon: <FilePlus size={15} />,
+            children: (
+              <section className="documentation-section">
+                <h3>Add Knowledge</h3>
+                <form className="documentation-ingest" onSubmit={(event) => void ingest(event)}>
+                  <div className="documentation-mode-row" role="group" aria-label="Ingest mode">
+                    {(["upload", "path", "url", "text"] as const).map((candidate) => (
+                      <ControlButton key={candidate} selected={mode === candidate} onClick={() => setMode(candidate)} size="compact">
+                        {candidate}
+                      </ControlButton>
+                    ))}
+                  </div>
+                  {mode === "upload" ? (
+                    <label>
+                      <span>Upload</span>
+                      <input key={uploadInputKey} type="file" onChange={(event) => setUploadValue(event.target.files?.[0])} />
+                    </label>
+                  ) : null}
+                  {mode === "upload" && uploadValue ? <p className="documentation-selected-file">{uploadValue.name} · {formatBytes(uploadValue.size)}</p> : null}
+                  {mode === "path" ? <label><span>Path</span><input value={pathValue} onChange={(event) => setPathValue(event.target.value)} placeholder="/path/to/datasheet.pdf or docs/" /></label> : null}
+                  {mode === "url" || mode === "text" ? <label><span>URL or URI</span><input value={urlValue} onChange={(event) => setUrlValue(event.target.value)} placeholder="https://vendor.example/doc, youtube playlist, or optional manual URI" /></label> : null}
+                  <label><span>Title</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="auto from source" /></label>
+                  <label><span>Collection</span><input value={collection} onChange={(event) => setCollection(event.target.value)} placeholder="auto from folder, domain, playlist, or upload" /></label>
+                  {mode === "text" ? <label><span>Text</span><textarea value={textValue} onChange={(event) => setTextValue(event.target.value)} rows={5} /></label> : null}
+                  <ControlButton type="submit" tone="primary" disabled={!canCall || !ingestReady(mode, uploadValue, pathValue, urlValue, textValue)}>
+                    <FilePlus size={15} /> Queue
                   </ControlButton>
-                </div>
-              ))}
-            </div>
-          ) : <p className="documentation-empty">No active documents.</p>}
-        </section>
+                </form>
+                {visibleIngestJobs.length > 0 ? (
+                  <div className="documentation-ingest-queue" aria-label="Documentation ingest queue">
+                    <div className="documentation-ingest-queue-header">
+                      <div>
+                        <h4>Import Queue</h4>
+                        <span>{runningIngestCount ? "1 running" : "idle"} · {queuedIngestCount} queued</span>
+                      </div>
+                      {finishedIngestCount > 0 ? (
+                        <ControlButton size="compact" onClick={clearFinishedIngestJobs}>Clear Finished</ControlButton>
+                      ) : null}
+                    </div>
+                    <div className="documentation-ingest-queue-list">
+                      {visibleIngestJobs.map((job, index) => <IngestQueueJob key={job.id} job={job} index={index} />)}
+                    </div>
+                  </div>
+                ) : null}
+              </section>
+            )
+          },
+          {
+            id: "documents",
+            label: "Active documents",
+            icon: <BookOpen size={15} />,
+            children: (
+              <section className="documentation-section documentation-documents">
+                <h3>Active Documents</h3>
+                {visibleDocuments.length > 0 ? (
+                  <div className="documentation-document-list">
+                    {visibleDocuments.map((document) => (
+                      <div className="documentation-document-row" key={documentId(document)}>
+                        <span>{document.title ?? documentId(document)}</span>
+                        <small>{document.source_type ?? document.sourceType} · {document.chunk_count ?? document.chunkCount ?? 0} chunks</small>
+                        <ControlButton size="compact" disabled={documentBusy} onClick={() => void viewDocument(documentId(document))}>
+                          <BookOpen size={13} /> View
+                        </ControlButton>
+                      </div>
+                    ))}
+                  </div>
+                ) : <p className="documentation-empty">No active documents.</p>}
+              </section>
+            )
+          }
+        ]} />
       </div> : null}
 
     </div>
