@@ -8,6 +8,7 @@ export interface DirectoryEntry {
 export type FilePreviewKind = "text" | "markdown" | "image" | "pdf";
 export type DiffViewMode = "split" | "unified";
 export type MarkdownPreviewMode = "rendered" | "source";
+export type OpenFileViewMode = "file" | "diff";
 
 export interface OpenFileResult {
   path: string;
@@ -27,6 +28,7 @@ export interface FileBrowserPanelState {
   compareRef: string;
   diffSummary?: GitDiffSummary;
   openedDiff?: GitDiffFile;
+  openFileViewMode: OpenFileViewMode;
   diffViewMode: DiffViewMode;
   cloneUrl: string;
   originUrl: string;

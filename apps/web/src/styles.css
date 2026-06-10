@@ -4906,8 +4906,16 @@ a:hover svg {
   color: var(--color-warning);
 }
 
-.markdown-preview-toggle {
+.file-preview-heading-actions {
+  flex: none;
   margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.markdown-preview-toggle {
+  margin-left: 0;
 }
 
 .file-preview-media {
@@ -5035,6 +5043,32 @@ a:hover svg {
 
 .git-diff-workspace.files-hidden {
   grid-template-columns: minmax(0, 1fr);
+}
+
+.git-diff-main {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  background: var(--color-background);
+}
+
+.git-diff-main-header {
+  min-width: 0;
+  padding: 10px var(--file-preview-padding, 14px) 0;
+}
+
+.git-diff-main-header:empty {
+  padding: 0;
+}
+
+.git-diff-main > .git-diff-preview,
+.git-diff-main > .git-file-preview {
+  grid-row: 2;
+}
+
+.git-file-preview {
+  min-height: 0;
 }
 
 .git-diff-files {

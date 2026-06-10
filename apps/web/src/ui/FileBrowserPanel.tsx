@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import DOMPurify, { type Config as DOMPurifyConfig } from "dompurify";
 import hljs from "highlight.js/lib/core";
@@ -25,12 +25,12 @@ import type { ConfigValue, FileSearchFileResult, FileSearchMode, FileSearchResul
 import { downloadFileBrowserEntries, fileBrowserRawFileUrl, runTabAction, saveBlobDownload, uploadFileBrowserFile } from "../api.js";
 import { copyTextToClipboard } from "./clipboard.js";
 import { ControlButton, SegmentedControl } from "./Control.js";
-import { readFileBrowserPanelState, rememberFileBrowserPanelState, type DiffViewMode, type DirectoryEntry, type FileBrowserPanelState, type FilePreviewKind, type MarkdownPreviewMode, type OpenFileResult } from "./fileBrowserPanelState.js";
+import { readFileBrowserPanelState, rememberFileBrowserPanelState, type DiffViewMode, type DirectoryEntry, type FileBrowserPanelState, type FilePreviewKind, type MarkdownPreviewMode, type OpenFileResult, type OpenFileViewMode } from "./fileBrowserPanelState.js";
 import { noSystemTextAssistProps } from "./inputAssist.js";
 import { PluginPanelDock } from "./PluginPanelDock.js";
 
 export { copyTextToClipboard, type ClipboardWriter } from "./clipboard.js";
-export { disposeFileBrowserPanelStatesExcept, readFileBrowserPanelState, rememberFileBrowserPanelState, type DiffViewMode, type DirectoryEntry, type FileBrowserPanelState, type MarkdownPreviewMode, type OpenFileResult } from "./fileBrowserPanelState.js";
+export { disposeFileBrowserPanelStatesExcept, readFileBrowserPanelState, rememberFileBrowserPanelState, type DiffViewMode, type DirectoryEntry, type FileBrowserPanelState, type MarkdownPreviewMode, type OpenFileResult, type OpenFileViewMode } from "./fileBrowserPanelState.js";
 
 interface DisplayDirectoryEntry extends DirectoryEntry {
   gitChange?: GitTreeChange;
@@ -99,6 +99,11 @@ interface UploadProgressState {
   activePath?: string;
 }
 
+interface FileClipboardPaths {
+  relativePath?: string;
+  absolutePath: string;
+}
+
 export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; config?: Record<string, ConfigValue> }) {
   const [initialState] = useState(() => readFileBrowserPanelState(tab));
   const [relativePath, setRelativePath] = useState(() => initialState?.relativePath ?? "");
@@ -108,6 +113,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   const [compareRef, setCompareRef] = useState(() => initialState?.compareRef ?? "");
   const [diffSummary, setDiffSummary] = useState<GitDiffSummary | undefined>(() => initialState?.diffSummary);
   const [openedDiff, setOpenedDiff] = useState<GitDiffFile | undefined>(() => initialState?.openedDiff);
+  const [openFileViewMode, setOpenFileViewMode] = useState<OpenFileViewMode>(() => initialState?.openFileViewMode ?? (initialState?.openedDiff && !initialState.opened ? "diff" : "file"));
   const [diffViewMode, setDiffViewMode] = useState<DiffViewMode>(() => initialState?.diffViewMode ?? defaultDiffViewMode());
   const [cloneUrl, setCloneUrl] = useState(() => initialState?.cloneUrl ?? "");
   const [originUrl, setOriginUrl] = useState(() => initialState?.originUrl ?? "");
@@ -174,6 +180,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
       compareRef,
       diffSummary,
       openedDiff,
+      openFileViewMode,
       diffViewMode,
       cloneUrl,
       originUrl,
@@ -189,7 +196,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
       markdownPreviewMode,
       fileTreeSize
     });
-  }, [tab.id, tab.cwd, relativePath, entries, opened, gitState, compareRef, diffSummary, openedDiff, diffViewMode, cloneUrl, originUrl, searchQuery, searchMode, searchGlob, searchResult, searchExpanded, treeVisible, searchVisible, gitBarVisible, gitDiffFilesVisible, markdownPreviewMode, fileTreeSize]);
+  }, [tab.id, tab.cwd, relativePath, entries, opened, gitState, compareRef, diffSummary, openedDiff, openFileViewMode, diffViewMode, cloneUrl, originUrl, searchQuery, searchMode, searchGlob, searchResult, searchExpanded, treeVisible, searchVisible, gitBarVisible, gitDiffFilesVisible, markdownPreviewMode, fileTreeSize]);
 
   useEffect(() => {
     if (!showGitDiff || !gitAutoRefresh || gitAutoRefreshIntervalMs === undefined) {
@@ -228,7 +235,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     if (canViewGitDiff || !openedDiff || opened || openedDiff.status === "deleted") {
       return;
     }
-    void openFilePath(openedDiff.path);
+    void openFilePath(openedDiff.path, { preserveOpenedDiff: true });
   }, [canViewGitDiff, opened, openedDiff?.path, openedDiff?.status]);
 
   useEffect(() => {
@@ -472,6 +479,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
       const result = await runTabAction<GitDiffFile>(tab.id, "open_git_diff_file", compareRef ? { path: file.path, compareRef } : { path: file.path });
       setOpenedDiff(result);
       setOpened(undefined);
+      setOpenFileViewMode("diff");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -483,15 +491,33 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     await openFilePath(relativePath ? `${relativePath}/${name}` : name);
   }
 
-  async function openFilePath(filePath: string) {
+  async function openFilePath(filePath: string, options: { preserveOpenedDiff?: boolean } = {}) {
     setError(undefined);
     try {
       const result = await runTabAction<OpenFileResult>(tab.id, "open_file", { relativePath: filePath });
       setOpened(result);
-      setOpenedDiff(undefined);
+      if (!options.preserveOpenedDiff) {
+        setOpenedDiff(undefined);
+      }
+      setOpenFileViewMode("file");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
+  }
+
+  async function setChangedFileViewMode(mode: OpenFileViewMode) {
+    if (mode === "diff") {
+      setOpenFileViewMode("diff");
+      return;
+    }
+    if (!openedDiff || openedDiff.status === "deleted") {
+      return;
+    }
+    if (opened && openFileTransferPath(opened) === normalizeTransferPath(openedDiff.path)) {
+      setOpenFileViewMode("file");
+      return;
+    }
+    await openFilePath(openedDiff.path, { preserveOpenedDiff: true });
   }
 
   async function runSearch() {
@@ -701,6 +727,15 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
 
   const selectedTransferCount = selectedTransferPaths.size;
   const transferBusy = Boolean(transferBusyAction);
+  const openedFileClipboardPaths = opened ? openFileClipboardPaths(opened, tab.cwd) : undefined;
+  const openedDiffClipboardPaths = openedDiff ? changedFileClipboardPaths(openedDiff.path, tab.cwd) : undefined;
+  const changedFileViewToggle = openedDiff ? (
+    <ChangedFileViewToggle
+      mode={openFileViewMode}
+      canOpenFile={openedDiff.status !== "deleted" && busyAction !== "file"}
+      onModeChange={(mode) => void setChangedFileViewMode(mode)}
+    />
+  ) : undefined;
 
   return (
     <div className="file-browser-panel">
@@ -774,7 +809,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
       ) : null}
       <PluginPanelDock
         className="file-secondary-dock"
-        controls="compact-or-hidden"
+        controls="always"
         items={[
           {
             id: "search",
@@ -838,7 +873,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
       <div ref={bodyRef} className={fileBrowserBodyClassName(treeVisible, fileTreeResizing)} style={fileBrowserBodyStyle(fileTreeSize)}>
         <PluginPanelDock
           className="file-tree-dock"
-          controls="compact-or-hidden"
+          controls="always"
           items={[{
             id: "tree",
             label: "File tree",
@@ -897,8 +932,53 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
           }]}
         />
         <div className="file-preview">
-          {opened ? (
-            <FilePreview tabId={tab.id} opened={opened} objectUrl={previewObjectUrl} loading={previewLoading} markdownPreviewMode={markdownPreviewMode} onMarkdownPreviewModeChange={setMarkdownPreviewMode} />
+          {canViewGitDiff && openedDiff && (openFileViewMode === "diff" || opened) ? (
+            <GitDiffWorkspace
+              diffSummary={diffSummary}
+              openedDiff={openedDiff}
+              viewMode={diffViewMode}
+              filesVisible={gitDiffFilesVisible}
+              busy={busyAction === "file"}
+              header={openFileViewMode === "diff" ? (
+                <FilePreviewHeading
+                  icon={<FileDiff size={16} />}
+                  displayPath={openedDiff.path}
+                  clipboardPaths={openedDiffClipboardPaths}
+                  onCopyPath={(value) => void copyPathToClipboard(value)}
+                >
+                  {changedFileViewToggle}
+                </FilePreviewHeading>
+              ) : undefined}
+              preview={openFileViewMode === "file" && opened ? (
+                <div className="file-preview git-file-preview">
+                  <FilePreview
+                    tabId={tab.id}
+                    opened={opened}
+                    objectUrl={previewObjectUrl}
+                    loading={previewLoading}
+                    markdownPreviewMode={markdownPreviewMode}
+                    viewModeControls={changedFileViewToggle}
+                    clipboardPaths={openedFileClipboardPaths}
+                    onMarkdownPreviewModeChange={setMarkdownPreviewMode}
+                    onCopyPath={(value) => void copyPathToClipboard(value)}
+                  />
+                </div>
+              ) : undefined}
+              onFilesVisibleChange={setGitDiffFilesVisible}
+              onOpenFile={(file) => void openDiffFile(file)}
+            />
+          ) : opened ? (
+            <FilePreview
+              tabId={tab.id}
+              opened={opened}
+              objectUrl={previewObjectUrl}
+              loading={previewLoading}
+              markdownPreviewMode={markdownPreviewMode}
+              viewModeControls={changedFileViewToggle}
+              clipboardPaths={openedFileClipboardPaths}
+              onMarkdownPreviewModeChange={setMarkdownPreviewMode}
+              onCopyPath={(value) => void copyPathToClipboard(value)}
+            />
           ) : activeSearchResult ? (
             <SearchResults result={activeSearchResult} busy={Boolean(searchBusyAction)} onOpenFile={(filePath) => void openFilePath(filePath)} />
           ) : canViewGitDiff && gitState?.isRepository ? (
@@ -1513,14 +1593,20 @@ function FilePreview({
   objectUrl,
   loading,
   markdownPreviewMode,
-  onMarkdownPreviewModeChange
+  viewModeControls,
+  clipboardPaths,
+  onMarkdownPreviewModeChange,
+  onCopyPath
 }: {
   tabId: string;
   opened: OpenFileResult;
   objectUrl?: string;
   loading: boolean;
   markdownPreviewMode: MarkdownPreviewMode;
+  viewModeControls?: ReactNode;
+  clipboardPaths?: FileClipboardPaths;
   onMarkdownPreviewModeChange: (mode: MarkdownPreviewMode) => void;
+  onCopyPath?: (value: string) => void;
 }) {
   const displayPath = opened.relativePath ?? opened.path;
   const kind = normalizedPreviewKind(opened);
@@ -1539,9 +1625,9 @@ function FilePreview({
   if (kind === "image") {
     return (
       <div className="file-preview-rendered file-preview-media" tabIndex={0} aria-label={`${displayPath} preview`} onKeyDown={handleKeyDown}>
-        <div className="file-preview-heading">
-          <ImageIcon size={16} />
-        </div>
+        <FilePreviewHeading icon={<ImageIcon size={16} />} displayPath={displayPath} clipboardPaths={clipboardPaths} onCopyPath={onCopyPath}>
+          {viewModeControls}
+        </FilePreviewHeading>
         {loading ? <div className="file-preview-status">Loading image...</div> : objectUrl ? <img className="file-preview-image" src={objectUrl} alt={displayPath} /> : <div className="file-preview-status">Image preview is unavailable.</div>}
       </div>
     );
@@ -1550,9 +1636,9 @@ function FilePreview({
   if (kind === "pdf") {
     return (
       <div className="file-preview-rendered file-preview-media" tabIndex={0} aria-label={`${displayPath} preview`} onKeyDown={handleKeyDown}>
-        <div className="file-preview-heading">
-          <FileText size={16} />
-        </div>
+        <FilePreviewHeading icon={<FileText size={16} />} displayPath={displayPath} clipboardPaths={clipboardPaths} onCopyPath={onCopyPath}>
+          {viewModeControls}
+        </FilePreviewHeading>
         {loading ? <div className="file-preview-status">Loading PDF...</div> : objectUrl ? <object className="file-preview-pdf" data={objectUrl} type="application/pdf" aria-label={displayPath} /> : <div className="file-preview-status">PDF preview is unavailable.</div>}
       </div>
     );
@@ -1560,9 +1646,8 @@ function FilePreview({
 
   if (kind === "markdown") {
     const heading = (
-      <div className="file-preview-heading">
-        <FileText size={16} />
-        {opened.truncated ? <small>truncated</small> : null}
+      <FilePreviewHeading icon={<FileText size={16} />} displayPath={displayPath} truncated={opened.truncated} clipboardPaths={clipboardPaths} onCopyPath={onCopyPath}>
+        {viewModeControls}
         <SegmentedControl className="markdown-preview-toggle" label="Markdown preview mode">
           <ControlButton type="button" iconOnly pressed={markdownPreviewMode === "rendered"} aria-label="Rendered Markdown preview" title="Rendered Markdown preview" onClick={() => onMarkdownPreviewModeChange("rendered")}>
             <FileText size={14} />
@@ -1571,7 +1656,7 @@ function FilePreview({
             <FileCode size={14} />
           </ControlButton>
         </SegmentedControl>
-      </div>
+      </FilePreviewHeading>
     );
 
     if (markdownPreviewMode === "source") {
@@ -1595,14 +1680,64 @@ function FilePreview({
 
   return (
     <div className="file-preview-rendered file-preview-code" tabIndex={0} aria-label={`${displayPath} preview`} onKeyDown={handleKeyDown}>
-      <div className="file-preview-heading">
-        <FileText size={16} />
-        {opened.truncated ? <small>truncated</small> : null}
-      </div>
+      <FilePreviewHeading icon={<FileText size={16} />} displayPath={displayPath} truncated={opened.truncated} clipboardPaths={clipboardPaths} onCopyPath={onCopyPath}>
+        {viewModeControls}
+      </FilePreviewHeading>
       <pre ref={(node) => { contentRef.current = node; }}>
         <code className={textLanguage ? `hljs language-${textLanguage}` : "hljs"} dangerouslySetInnerHTML={{ __html: textHtml }} />
       </pre>
     </div>
+  );
+}
+
+function FilePreviewHeading({
+  icon,
+  displayPath,
+  truncated,
+  clipboardPaths,
+  onCopyPath,
+  children
+}: {
+  icon: ReactNode;
+  displayPath: string;
+  truncated?: boolean;
+  clipboardPaths?: FileClipboardPaths;
+  onCopyPath?: (value: string) => void;
+  children?: ReactNode;
+}) {
+  const relativePath = clipboardPaths?.relativePath;
+  return (
+    <div className="file-preview-heading">
+      {icon}
+      <span title={displayPath}>{displayPath}</span>
+      {truncated ? <small>truncated</small> : null}
+      <div className="file-preview-heading-actions">
+        {children}
+        {relativePath ? (
+          <ControlButton type="button" iconOnly size="compact" aria-label="Copy open file relative path" title="Copy open file relative path" onClick={() => onCopyPath?.(relativePath)}>
+            <Copy size={13} />
+          </ControlButton>
+        ) : null}
+        {clipboardPaths ? (
+          <ControlButton type="button" iconOnly size="compact" aria-label="Copy open file absolute path" title="Copy open file absolute path" onClick={() => onCopyPath?.(clipboardPaths.absolutePath)}>
+            <Copy size={13} />
+          </ControlButton>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function ChangedFileViewToggle({ mode, canOpenFile, onModeChange }: { mode: OpenFileViewMode; canOpenFile: boolean; onModeChange: (mode: OpenFileViewMode) => void }) {
+  return (
+    <SegmentedControl className="changed-file-view-toggle" label="Changed file view mode">
+      <ControlButton type="button" iconOnly pressed={mode === "diff"} aria-label="Changed file diff" title="Changed file diff" onClick={() => onModeChange("diff")}>
+        <FileDiff size={13} />
+      </ControlButton>
+      <ControlButton type="button" iconOnly pressed={mode === "file"} disabled={!canOpenFile} aria-label="Rendered file preview" title="Rendered file preview" onClick={() => onModeChange("file")}>
+        <FileText size={13} />
+      </ControlButton>
+    </SegmentedControl>
   );
 }
 
@@ -1662,6 +1797,8 @@ function GitDiffWorkspace({
   viewMode,
   filesVisible,
   busy,
+  header,
+  preview,
   onFilesVisibleChange,
   onOpenFile
 }: {
@@ -1670,12 +1807,14 @@ function GitDiffWorkspace({
   viewMode: DiffViewMode;
   filesVisible: boolean;
   busy: boolean;
+  header?: ReactNode;
+  preview?: ReactNode;
   onFilesVisibleChange: (visible: boolean) => void;
   onOpenFile: (file: GitDiffFileSummary) => void;
 }) {
   return (
     <div className={gitDiffWorkspaceClassName(filesVisible)}>
-      <PluginPanelDock className="git-diff-files-dock" controls="compact-or-hidden" items={[{
+      <PluginPanelDock className="git-diff-files-dock" controls="always" items={[{
           id: "changed-files",
           label: "Changed files",
           icon: <FileDiff size={15} />,
@@ -1702,7 +1841,10 @@ function GitDiffWorkspace({
             </div>
           )
         }]} />
-      <GitDiffPreview diffFile={openedDiff} viewMode={viewMode} />
+      <div className="git-diff-main">
+        <div className="git-diff-main-header">{header}</div>
+        {preview ?? <GitDiffPreview diffFile={openedDiff} viewMode={viewMode} />}
+      </div>
     </div>
   );
 }
@@ -2114,6 +2256,22 @@ function openFileTransferPath(opened: OpenFileResult): string | undefined {
     return normalizeTransferPath(opened.relativePath);
   }
   return undefined;
+}
+
+export function openFileClipboardPaths(opened: OpenFileResult, cwd: string): FileClipboardPaths {
+  const relativePath = openFileTransferPath(opened);
+  return {
+    relativePath,
+    absolutePath: opened.path || (relativePath ? absoluteTransferPath(cwd, relativePath) : cwd)
+  };
+}
+
+export function changedFileClipboardPaths(relativePath: string, cwd: string): FileClipboardPaths {
+  const normalized = normalizeTransferPath(relativePath);
+  return {
+    relativePath: normalized,
+    absolutePath: absoluteTransferPath(cwd, normalized)
+  };
 }
 
 export function fileTransferUploadPath(currentRelativePath: string, filename: string, selectedRelativePath?: string): string {
