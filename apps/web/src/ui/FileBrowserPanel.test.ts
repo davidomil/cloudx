@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { FileSearchResult, GitDiffFile, GitDiffSummary, GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
 
-import { absoluteTransferPath, archiveExtractionFolderName, buildCompareRefOptions, buildSearchInput, changedFileClipboardPaths, clampFileBrowserTreeSize, CompareRefPicker, compareRefListboxStyle, copyTextToClipboard, createFolderTransferPath, defaultDiffViewMode, disposeFileBrowserPanelStatesExcept, entryTransferPath, FileBrowserPanel, fileBrowserBodyClassName, fileBrowserBodyStyle, fileBrowserTreeSizeMax, filePreviewText, fileTransferUploadPath, filterCompareRefOptions, gitAutoRefreshIntervalMilliseconds, gitDiffWorkspaceClassName, highlightedCodeHtml, isExtractableArchivePath, markdownImageFileUrl, markdownImageTransferPath, mergeGitChangesIntoEntries, normalizedPreviewKind, openFileClipboardPaths, parsePatch, previewLanguageForPath, readFileBrowserPanelState, rememberFileBrowserPanelState, renderMarkdownHtml, resolveNextCompareRef, searchEntriesFromResult, searchResultMatchesInput, searchResultSummary, selectElementContents, toolbarClipboardPath, uploadProgressPercent, uploadProgressVisibleFileCount, usesObjectUrlPreview, type FileBrowserPanelState, type OpenFileResult } from "./FileBrowserPanel.js";
+import { absoluteTransferPath, archiveExtractionFolderName, buildCompareRefOptions, buildSearchInput, changedFileClipboardPaths, clampFileBrowserTreeSize, CompareRefPicker, compareRefListboxStyle, copyTextToClipboard, createFolderTransferPath, defaultDiffViewMode, disposeFileBrowserPanelStatesExcept, entryTransferPath, FileBrowserPanel, fileBrowserBodyClassName, fileBrowserBodyStyle, fileBrowserTreeSizeMax, filePreviewPathParts, filePreviewText, fileTransferUploadPath, filterCompareRefOptions, gitAutoRefreshIntervalMilliseconds, gitDiffWorkspaceClassName, highlightedCodeHtml, isExtractableArchivePath, markdownImageFileUrl, markdownImageTransferPath, mergeGitChangesIntoEntries, normalizedPreviewKind, openFileClipboardPaths, parsePatch, previewLanguageForPath, readFileBrowserPanelState, rememberFileBrowserPanelState, renderMarkdownHtml, resolveNextCompareRef, searchEntriesFromResult, searchResultMatchesInput, searchResultSummary, selectElementContents, toolbarClipboardPath, uploadProgressPercent, uploadProgressVisibleFileCount, usesObjectUrlPreview, type FileBrowserPanelState, type OpenFileResult } from "./FileBrowserPanel.js";
 import { PathEntry } from "./PathEntry.js";
 
 afterEach(() => {
@@ -225,6 +225,14 @@ describe("file transfer path helpers", () => {
       relativePath: "docs/specs.md",
       absolutePath: "/repo/docs/specs.md"
     });
+    expect(filePreviewPathParts("docs/specs/final.md")).toEqual({
+      prefix: "docs/specs/",
+      name: "final.md"
+    });
+    expect(filePreviewPathParts("final.md")).toEqual({
+      prefix: "",
+      name: "final.md"
+    });
 
     await copyTextToClipboard("docs/specs.md", { writeText: async (value) => { writes.push(value); } });
     expect(writes).toEqual(["docs/specs.md"]);
@@ -276,7 +284,7 @@ describe("file browser panel state cache", () => {
     expect(html).not.toContain("<h1>Title</h1>");
   });
 
-  it("renders hide and show controls for expanded file-browser docks", () => {
+  it("renders expanded panel visibility controls in the file-browser toolbar", () => {
     const tab = workspaceTab("tab-files", "/repo");
     rememberFileBrowserPanelState(tab, fileBrowserState({
       entries: [{ name: "README.md", type: "file" }],
@@ -291,11 +299,16 @@ describe("file browser panel state cache", () => {
     }));
 
     const html = renderToStaticMarkup(createElement(FileBrowserPanel, { tab }));
+    const container = document.createElement("div");
+    container.innerHTML = html;
+    const toolbar = container.querySelector(".file-browser-toolbar");
 
-    expect(html).toContain("Hide search bar");
-    expect(html).toContain("Hide Git bar");
-    expect(html).toContain("Hide tree view");
-    expect(html).toContain("Hide changed files");
+    expect(toolbar).not.toBeNull();
+    expect(buttonByLabel(toolbar as HTMLElement, "Hide search bar")).not.toBeNull();
+    expect(buttonByLabel(toolbar as HTMLElement, "Hide Git bar")).not.toBeNull();
+    expect(buttonByLabel(toolbar as HTMLElement, "Hide tree view")).not.toBeNull();
+    expect(buttonByLabel(toolbar as HTMLElement, "Hide changed files")).not.toBeNull();
+    expect(container.querySelector('.file-secondary-dock [aria-label="Hide Git bar"]')).toBeNull();
 
     rememberFileBrowserPanelState(tab, fileBrowserState({
       entries: [{ name: "README.md", type: "file" }],
@@ -310,13 +323,17 @@ describe("file browser panel state cache", () => {
     }));
 
     const hiddenHtml = renderToStaticMarkup(createElement(FileBrowserPanel, { tab }));
+    const hiddenContainer = document.createElement("div");
+    hiddenContainer.innerHTML = hiddenHtml;
+    const hiddenToolbar = hiddenContainer.querySelector(".file-browser-toolbar");
 
-    expect(hiddenHtml).toContain("Show search bar");
-    expect(hiddenHtml).toContain("Show tree view");
-    expect(hiddenHtml).toContain("Show changed files");
+    expect(hiddenToolbar).not.toBeNull();
+    expect(buttonByLabel(hiddenToolbar as HTMLElement, "Show search bar")).not.toBeNull();
+    expect(buttonByLabel(hiddenToolbar as HTMLElement, "Show tree view")).not.toBeNull();
+    expect(buttonByLabel(hiddenToolbar as HTMLElement, "Show changed files")).not.toBeNull();
   });
 
-  it("hides rendered Git diffs while keeping changed-file indicators when the Git bar is hidden", () => {
+  it("hides Git controls without hiding rendered Git diffs", () => {
     const tab = workspaceTab("tab-files", "/repo");
     rememberFileBrowserPanelState(tab, fileBrowserState({
       entries: [{ name: "README.md", type: "file" }],
@@ -328,10 +345,11 @@ describe("file browser panel state cache", () => {
 
     const html = renderToStaticMarkup(createElement(FileBrowserPanel, { tab }));
 
-    expect(html).not.toContain("git-diff-workspace");
+    expect(html).toContain("git-diff-workspace");
+    expect(html).not.toContain("git-bar repository");
     expect(html).toContain("tree-change-badge");
     expect(html).toContain("deleted.md");
-    expect(html).not.toContain("updated line");
+    expect(html).toContain("updated line");
     expect(html).toContain("README.md");
   });
 
@@ -385,6 +403,44 @@ describe("file browser panel state cache", () => {
     }
   });
 
+  it("switches a changed file back to diff view when Git controls are hidden", async () => {
+    const fetch = fileBrowserFetch();
+    vi.stubGlobal("fetch", fetch);
+    const tab = workspaceTab("tab-files", "/repo");
+    rememberFileBrowserPanelState(tab, fileBrowserState({
+      entries: [{ name: "README.md", type: "file" }],
+      gitState: gitRepositoryState(),
+      diffSummary: gitDiffSummary(),
+      openedDiff: gitDiffFile(),
+      opened: { path: "/repo/src/README.md", relativePath: "src/README.md", truncated: false, content: "# Changed file" },
+      openFileViewMode: "file",
+      gitBarVisible: false
+    }));
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => {
+        root.render(createElement(FileBrowserPanel, { tab }));
+      });
+      await flushEffects();
+
+      expect(container.textContent).toContain("Changed file");
+      expect(container.textContent).not.toContain("updated line");
+
+      await act(async () => {
+        buttonByLabel(container, "Changed file diff").click();
+      });
+      await flushEffects();
+
+      expect(container.textContent).toContain("updated line");
+      expect(container.querySelector(".git-bar")).toBeNull();
+    } finally {
+      await unmount(root);
+    }
+  });
+
   it("copies relative and absolute paths for the open file heading", async () => {
     const fetch = fileBrowserFetch();
     const writes: string[] = [];
@@ -414,6 +470,8 @@ describe("file browser panel state cache", () => {
       });
 
       expect(writes).toEqual(["src/README.md", "/repo/src/README.md"]);
+      expect(container.querySelector(".file-preview-path-prefix")?.textContent).toBe("src/");
+      expect(container.querySelector(".file-preview-path-name")?.textContent).toBe("README.md");
     } finally {
       await unmount(root);
     }

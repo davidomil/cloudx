@@ -4264,6 +4264,13 @@ a:hover svg {
   cursor: copy;
 }
 
+.file-browser-panel-controls {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .file-folder-create-form {
   min-width: 0;
   display: grid;
@@ -4895,11 +4902,28 @@ a:hover svg {
   text-transform: uppercase;
 }
 
-.file-preview-heading span {
+.file-preview-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.file-preview-path-prefix {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
+}
+
+.file-preview-path-name {
+  flex: 0 1 auto;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .file-preview-heading small {
@@ -6794,6 +6818,10 @@ a:hover svg {
 }
 
 @container plugin-pane (width <= 760px) {
+  .file-browser-panel-controls {
+    display: none;
+  }
+
   .plugin-panel-dock.compact-narrow {
     position: absolute;
     z-index: 90;

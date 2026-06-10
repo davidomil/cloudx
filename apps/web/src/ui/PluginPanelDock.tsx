@@ -41,7 +41,7 @@ export function PluginPanelDock({
         const canToggleVisible = Boolean(item.onVisibleChange);
         const open = openId === item.id;
         const panelAvailable = compact || visible;
-        const canChangeVisibility = canToggleVisible && !compact;
+        const canChangeVisibility = canToggleVisible && !compact && controls !== "compact";
         const canHideFromButton = canChangeVisibility && controls === "always";
         const buttonLabel = compact ? item.label : visible
           ? canHideFromButton ? item.hideLabel ?? `Hide ${item.label}` : item.label

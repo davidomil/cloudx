@@ -147,7 +147,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
   const contextMenuRef = useRef<HTMLDivElement | null>(null);
   const showGitDiff = config.showGitDiff !== false;
-  const canViewGitDiff = showGitDiff && gitBarVisible;
+  const canViewGitDiff = showGitDiff;
   const gitAutoRefresh = config.gitAutoRefresh !== false;
   const gitAutoRefreshIntervalMs = gitAutoRefreshIntervalMilliseconds(config);
   const activeSearchQuery = searchQuery.trim();
@@ -780,6 +780,18 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
         <ControlButton type="button" iconOnly pressed={folderCreateOpen} onClick={() => setFolderCreateOpen(!folderCreateOpen)} disabled={transferBusyAction === "folder"} aria-label="New folder" title="New folder">
           <FolderPlus size={15} />
         </ControlButton>
+        <FileBrowserToolbarPanelControls
+          showGitDiff={showGitDiff}
+          gitRepository={Boolean(gitState?.isRepository)}
+          searchVisible={searchVisible}
+          gitBarVisible={gitBarVisible}
+          treeVisible={treeVisible}
+          gitDiffFilesVisible={gitDiffFilesVisible}
+          onSearchVisibleChange={setSearchPanelVisible}
+          onGitBarVisibleChange={setGitBarVisible}
+          onTreeVisibleChange={setTreeVisible}
+          onGitDiffFilesVisibleChange={setGitDiffFilesVisible}
+        />
         <input
           ref={uploadInputRef}
           className="file-upload-input"
@@ -809,7 +821,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
       ) : null}
       <PluginPanelDock
         className="file-secondary-dock"
-        controls="always"
+        controls="compact"
         items={[
           {
             id: "search",
@@ -873,7 +885,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
       <div ref={bodyRef} className={fileBrowserBodyClassName(treeVisible, fileTreeResizing)} style={fileBrowserBodyStyle(fileTreeSize)}>
         <PluginPanelDock
           className="file-tree-dock"
-          controls="always"
+          controls="compact"
           items={[{
             id: "tree",
             label: "File tree",
@@ -1102,7 +1114,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
       await loadDirectory(relativePath ? `${relativePath}/${entry.name}` : entry.name);
       return;
     }
-    if (canViewGitDiff && entry.gitChange?.file) {
+    if (showGitDiff && entry.gitChange?.file) {
       await openDiffFile(entry.gitChange.file);
       return;
     }
@@ -1134,6 +1146,88 @@ function UploadProgress({ progress }: { progress: UploadProgressState }) {
       </div>
       {progress.activePath ? <small className="file-upload-progress-path" title={progress.activePath}>{progress.activePath}</small> : null}
     </div>
+  );
+}
+
+function FileBrowserToolbarPanelControls({
+  showGitDiff,
+  gitRepository,
+  searchVisible,
+  gitBarVisible,
+  treeVisible,
+  gitDiffFilesVisible,
+  onSearchVisibleChange,
+  onGitBarVisibleChange,
+  onTreeVisibleChange,
+  onGitDiffFilesVisibleChange
+}: {
+  showGitDiff: boolean;
+  gitRepository: boolean;
+  searchVisible: boolean;
+  gitBarVisible: boolean;
+  treeVisible: boolean;
+  gitDiffFilesVisible: boolean;
+  onSearchVisibleChange: (visible: boolean) => void;
+  onGitBarVisibleChange: (visible: boolean) => void;
+  onTreeVisibleChange: (visible: boolean) => void;
+  onGitDiffFilesVisibleChange: (visible: boolean) => void;
+}) {
+  return (
+    <div className="file-browser-panel-controls" aria-label="File browser panels">
+      <ToolbarPanelToggle
+        visible={searchVisible}
+        showLabel="Show search bar"
+        hideLabel="Hide search bar"
+        icon={<Search size={14} />}
+        onVisibleChange={onSearchVisibleChange}
+      />
+      {showGitDiff ? (
+        <ToolbarPanelToggle
+          visible={gitBarVisible}
+          showLabel="Show Git bar"
+          hideLabel="Hide Git bar"
+          icon={<GitBranch size={14} />}
+          onVisibleChange={onGitBarVisibleChange}
+        />
+      ) : null}
+      <ToolbarPanelToggle
+        visible={treeVisible}
+        showLabel="Show tree view"
+        hideLabel="Hide tree view"
+        icon={<Folder size={14} />}
+        onVisibleChange={onTreeVisibleChange}
+      />
+      {showGitDiff && gitRepository ? (
+        <ToolbarPanelToggle
+          visible={gitDiffFilesVisible}
+          showLabel="Show changed files"
+          hideLabel="Hide changed files"
+          icon={<FileDiff size={14} />}
+          onVisibleChange={onGitDiffFilesVisibleChange}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function ToolbarPanelToggle({
+  visible,
+  showLabel,
+  hideLabel,
+  icon,
+  onVisibleChange
+}: {
+  visible: boolean;
+  showLabel: string;
+  hideLabel: string;
+  icon: ReactNode;
+  onVisibleChange: (visible: boolean) => void;
+}) {
+  const label = visible ? hideLabel : showLabel;
+  return (
+    <ControlButton type="button" className="file-browser-panel-toggle" iconOnly pressed={visible} aria-label={label} title={label} onClick={() => onVisibleChange(!visible)}>
+      {icon}
+    </ControlButton>
   );
 }
 
@@ -1706,10 +1800,14 @@ function FilePreviewHeading({
   children?: ReactNode;
 }) {
   const relativePath = clipboardPaths?.relativePath;
+  const pathParts = filePreviewPathParts(displayPath);
   return (
     <div className="file-preview-heading">
       {icon}
-      <span title={displayPath}>{displayPath}</span>
+      <span className="file-preview-path" title={displayPath}>
+        {pathParts.prefix ? <span className="file-preview-path-prefix">{pathParts.prefix}</span> : null}
+        <span className="file-preview-path-name">{pathParts.name}</span>
+      </span>
       {truncated ? <small>truncated</small> : null}
       <div className="file-preview-heading-actions">
         {children}
@@ -1726,6 +1824,17 @@ function FilePreviewHeading({
       </div>
     </div>
   );
+}
+
+export function filePreviewPathParts(displayPath: string): { prefix: string; name: string } {
+  const separatorIndex = Math.max(displayPath.lastIndexOf("/"), displayPath.lastIndexOf("\\"));
+  if (separatorIndex < 0) {
+    return { prefix: "", name: displayPath };
+  }
+  return {
+    prefix: displayPath.slice(0, separatorIndex + 1),
+    name: displayPath.slice(separatorIndex + 1)
+  };
 }
 
 function ChangedFileViewToggle({ mode, canOpenFile, onModeChange }: { mode: OpenFileViewMode; canOpenFile: boolean; onModeChange: (mode: OpenFileViewMode) => void }) {
@@ -1814,7 +1923,7 @@ function GitDiffWorkspace({
 }) {
   return (
     <div className={gitDiffWorkspaceClassName(filesVisible)}>
-      <PluginPanelDock className="git-diff-files-dock" controls="always" items={[{
+      <PluginPanelDock className="git-diff-files-dock" controls="compact" items={[{
           id: "changed-files",
           label: "Changed files",
           icon: <FileDiff size={15} />,
