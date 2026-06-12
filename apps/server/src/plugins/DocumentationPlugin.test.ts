@@ -67,6 +67,16 @@ describe("DocumentationPlugin", () => {
     expect(plugin.hooks.find((hook) => hook.id === "documentation.ingest.text")?.inputSchema).toMatchObject({
       required: ["text"]
     });
+    expect(plugin.hooks.find((hook) => hook.id === "documentation.documents.list")?.inputSchema).toMatchObject({
+      properties: {
+        states: { type: "array", items: { type: "string" } },
+        limit: { type: "number" },
+        offset: { type: "number" },
+        query: { type: "string" },
+        collection: { type: "string" },
+        sortDirection: { type: "string", enum: ["asc", "desc"] }
+      }
+    });
     expect(plugin.hooks.find((hook) => hook.id === "documentation.invalidate")).toMatchObject({
       automationSafety: "write"
     });

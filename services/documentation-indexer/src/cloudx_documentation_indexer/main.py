@@ -92,8 +92,24 @@ def create_app(root: str | Path | None = None) -> FastAPI:
         return archive.portable_manifest()
 
     @app.get("/documents")
-    def documents(states: str = ACTIVE_STATE) -> dict:
-        return {"documents": archive.list_documents(states=[state.strip() for state in states.split(",") if state.strip()])}
+    def documents(
+        states: str = ACTIVE_STATE,
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+        offset: Annotated[int, Query(ge=0)] = 0,
+        query: str | None = None,
+        collection: str | None = None,
+        sort_direction: Annotated[str, Query(alias="sortDirection")] = "desc",
+    ) -> dict:
+        return handle_archive_error(
+            lambda: archive.list_document_page(
+                states=[state.strip() for state in states.split(",") if state.strip()],
+                limit=limit,
+                offset=offset,
+                query=query,
+                collection=collection,
+                sort_direction=sort_direction,
+            )
+        )
 
     @app.get("/documents/{document_id}")
     def document(

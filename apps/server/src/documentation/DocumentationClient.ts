@@ -80,7 +80,15 @@ export class DocumentationClient {
 
   listDocuments(input: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
     const states = Array.isArray(input.states) ? input.states.filter((state): state is string => typeof state === "string" && state.trim().length > 0).join(",") : undefined;
-    return this.get(states ? `/documents?states=${encodeURIComponent(states)}` : "/documents");
+    const params = new URLSearchParams();
+    appendOptionalQueryString(params, "states", states);
+    appendOptionalQueryNumber(params, "limit", input.limit);
+    appendOptionalQueryNumber(params, "offset", input.offset);
+    appendOptionalQueryString(params, "query", input.query);
+    appendOptionalQueryString(params, "collection", input.collection);
+    appendOptionalQueryString(params, "sortDirection", input.sortDirection);
+    const query = params.toString();
+    return this.get(`/documents${query ? `?${query}` : ""}`);
   }
 
   getDocument(input: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -453,6 +461,12 @@ function appendOptionalFormValue(form: FormData, name: string, value: string | u
 function appendOptionalQueryNumber(params: URLSearchParams, name: string, value: unknown): void {
   if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
     params.set(name, String(value));
+  }
+}
+
+function appendOptionalQueryString(params: URLSearchParams, name: string, value: unknown): void {
+  if (typeof value === "string" && value.trim()) {
+    params.set(name, value.trim());
   }
 }
 

@@ -103,7 +103,12 @@ export class DocumentationPlugin implements WorkspacePlugin {
       writeHook("documentation.ingest.queue.clearFinished", "Clear Documentation Ingest Queue", "Remove completed and failed documentation ingest jobs from the queue view.", () => this.ingestQueue.clearFinished()),
       readHook("documentation.portableManifest", "Documentation Portable Manifest", "Return files that make up the portable archive.", () => this.client.portableManifest()),
       readHook("documentation.documents.list", "List Documentation", "List documentation records.", (input) => this.client.listDocuments(input), {
-        states: { type: "array", items: { type: "string" } }
+        states: { type: "array", items: { type: "string" } },
+        limit: { type: "number" },
+        offset: { type: "number" },
+        query: { type: "string" },
+        collection: { type: "string" },
+        sortDirection: { type: "string", enum: ["asc", "desc"] }
       }),
       readHook("documentation.documents.get", "Get Documentation", "Fetch one documentation record with chunks and events.", (input) => this.client.getDocument(input), {
         documentId: { type: "string" },

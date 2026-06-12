@@ -20,7 +20,7 @@
   - UI/skill target: show the label in `apps/web/src/ui/DocumentationPanel.tsx` and include totals in `node "$DOC" stats` / `manifest` output from `documentationSkillHelpers.ts`.
   - Tests: Python archive stats for logical and allocated byte totals, TypeScript client/panel rendering, and helper output shape.
 
-- [ ] Load active documentation documents asynchronously and on demand
+- [x] Load active documentation documents asynchronously and on demand
   - Current state: `DocumentationPanel.tsx` calls `documentation.documents.list` during archive summary refresh and stores every returned active document in UI state. `DocumentationClient.listDocuments()` only forwards optional `states`, `/documents` returns the full list, and `DocumentationArchive.list_documents()` selects and groups all matching documents at once. Source chunk viewing already has paged autoload, but the active document list does not.
   - API target: add bounded document listing parameters such as `limit`, `cursor` or `offset`, `query`, `collection`, and sort direction through the indexer route, `DocumentationClient`, plugin hook schema, and helper command.
   - UI target: keep the stats/header load independent from document-list loading, fetch the first page only when the Active Documents panel is opened, load more on scroll or button press, and virtualize the visible rows so hundreds or thousands of documents do not create a large DOM or block initial panel load.

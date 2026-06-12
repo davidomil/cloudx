@@ -124,6 +124,28 @@ describe("documentation skill helper", () => {
     expect(JSON.parse(result.stdout)).toEqual({ activeDocumentCount: 2, activeChunkCount: 9, archiveSize });
   });
 
+  it("passes bounded list options to the raw indexer", async () => {
+    const workspace = await tempRoot();
+    let requestUrl = "";
+    const documentationUrl = await startServer((request, response) => {
+      requestUrl = request.url ?? "";
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        documents: [{ documentId: "doc-1", title: "Reset Manual", sourceType: "datasheet", state: "active", chunkCount: 9 }],
+        window: { offset: 50, limit: 25, total: 125, hasMore: true }
+      }));
+    });
+
+    const result = await runHelper(["list", "--states", "active,stale", "--limit", "25", "--offset", "50", "--query", "reset manual", "--collection", "board", "--sortDirection", "asc"], {
+      cwd: workspace,
+      env: { CLOUDX_DOCUMENTATION_URL: documentationUrl }
+    });
+
+    expect(requestUrl).toBe("/documents?states=active%2Cstale&limit=25&offset=50&query=reset+manual&collection=board&sortDirection=asc");
+    expect(result.stdout).toContain("Reset Manual [datasheet]");
+    expect(result.stdout).toContain("Window offset=50 limit=25 total=125 hasMore=true");
+  });
+
   async function runHelper(args: string[], options: { cwd: string; env: Record<string, string> }): Promise<{ stdout: string; stderr: string }> {
     const script = await writeHelperScript();
     const { stdout, stderr } = await execFileAsync(process.execPath, [script, ...args], {

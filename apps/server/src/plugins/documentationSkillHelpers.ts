@@ -79,8 +79,15 @@ async function openDocument(args, options) {
 
 async function listDocuments(options) {
   const states = options.states || options.state || "active";
-  const result = await getJson(documentationEndpoint("/documents?states=" + encodeURIComponent(states)));
+  const params = new URLSearchParams({ states });
+  if (options.limit) params.set("limit", String(integerOption(options.limit, 50)));
+  if (options.offset) params.set("offset", String(integerOption(options.offset, 0)));
+  if (options.query) params.set("query", options.query);
+  if (options.collection) params.set("collection", options.collection);
+  if (options.sortDirection) params.set("sortDirection", options.sortDirection);
+  const result = await getJson(documentationEndpoint("/documents?" + params.toString()));
   printDocuments(result.documents);
+  printWindow(result.window);
 }
 
 async function ingest(kind, input) {
@@ -383,6 +390,13 @@ function printDocuments(documents) {
   }
 }
 
+function printWindow(window) {
+  if (!window || typeof window !== "object" || typeof window.total !== "number") {
+    return;
+  }
+  console.log("Window offset=" + (window.offset ?? 0) + " limit=" + (window.limit ?? 0) + " total=" + window.total + " hasMore=" + Boolean(window.hasMore));
+}
+
 function printJson(value) {
   console.log(JSON.stringify(value, null, 2));
 }
@@ -401,7 +415,7 @@ function usage() {
     "Usage:",
     "  cloudx-doc.mjs search <query> [--limit 8] [--collection name] [--sourceType datasheet,media]",
     "  cloudx-doc.mjs open <documentId> [--chunks 8] [--chars 1200] [--artifacts 8]",
-    "  cloudx-doc.mjs list [--states active,stale]",
+    "  cloudx-doc.mjs list [--states active,stale] [--limit 50] [--offset 0] [--query text] [--collection name] [--sortDirection desc]",
     "  cloudx-doc.mjs ingest-url <url> [--sourceType media] [--collection name]",
     "  cloudx-doc.mjs ingest-path <path> [--sourceType datasheet] [--collection name]",
     "  cloudx-doc.mjs ingest-text <text> [--title title] [--uri uri]",

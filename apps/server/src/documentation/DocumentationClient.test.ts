@@ -33,7 +33,7 @@ describe("DocumentationClient", () => {
     expect(JSON.parse(requestBody)).toEqual({ query: "reset" });
   });
 
-  it("preserves appended query strings with base URL query strings", async () => {
+  it("forwards bounded document list parameters with base URL query strings", async () => {
     let requestUrl = "";
     const url = await startServer((request, response) => {
       requestUrl = request.url ?? "";
@@ -42,9 +42,16 @@ describe("DocumentationClient", () => {
     });
     const client = new DocumentationClient(`${url}/docs/?token=local`);
 
-    await client.listDocuments({ states: ["active", "stale"] });
+    await client.listDocuments({
+      states: ["active", "stale"],
+      limit: 25,
+      offset: 50,
+      query: "reset manual",
+      collection: "board",
+      sortDirection: "asc"
+    });
 
-    expect(requestUrl).toBe("/docs/documents?token=local&states=active%2Cstale");
+    expect(requestUrl).toBe("/docs/documents?token=local&states=active%2Cstale&limit=25&offset=50&query=reset+manual&collection=board&sortDirection=asc");
   });
 
   it("forwards document detail window parameters", async () => {

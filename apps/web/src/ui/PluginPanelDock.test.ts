@@ -145,6 +145,7 @@ describe("PluginPanelDock", () => {
   it("opens compact drawers without changing remembered panel visibility", async () => {
     const restoreResizeObserver = installResizeObserver();
     const visibilityChanges: boolean[] = [];
+    const openChanges: boolean[] = [];
     const { container, root } = await render(createElement(PluginPanelDock, {
       controls: "compact-or-hidden",
       items: [{
@@ -155,6 +156,7 @@ describe("PluginPanelDock", () => {
         showLabel: "Show tree view",
         hideLabel: "Hide tree view",
         onVisibleChange: (visible) => visibilityChanges.push(visible),
+        onOpenChange: (open) => openChanges.push(open),
         children: createElement("div", null, "Files")
       }]
     }), { parentWidth: 420 });
@@ -170,6 +172,7 @@ describe("PluginPanelDock", () => {
     });
 
     expect(visibilityChanges).toEqual([]);
+    expect(openChanges).toEqual([true]);
     expect(button.getAttribute("aria-expanded")).toBe("true");
     expect(item.classList.contains("open")).toBe(true);
 

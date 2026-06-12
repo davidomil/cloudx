@@ -182,7 +182,7 @@ describe("DocumentationPanel", () => {
     await unmount(root);
   });
 
-  it("uses AI answer mode by default, lists every document, and opens full source chunks", async () => {
+  it("uses AI answer mode by default without eager document-list loading and opens full source chunks", async () => {
     const container = document.createElement("div");
     document.body.append(container);
     const root = createRoot(container);
@@ -263,7 +263,8 @@ describe("DocumentationPanel", () => {
     const enabledInfo = container.querySelector(".documentation-ai-info");
     expect(enabledTooltip?.textContent).toContain("AI assistance is enabled");
     expect(enabledInfo?.getAttribute("aria-describedby")).toBe(enabledTooltip?.id);
-    expect(container.textContent).toContain("Document 11");
+    expect(calls.some((call) => call.hookId === "documentation.documents.list")).toBe(false);
+    expect(container.textContent).not.toContain("Document 11");
     setInputValue(inputByLabel(container, "Question"), "How do I bake brownies?");
     await click(buttonByText(container, "Search"));
 
@@ -286,6 +287,65 @@ describe("DocumentationPanel", () => {
     expect(artifactImage?.getAttribute("src")).toBe("/api/documentation/documents/doc-2/artifact?path=figures%2Ffigure-030.png");
     expect(pageChunk?.querySelector<HTMLAnchorElement>(".documentation-artifact-image a")?.textContent).toContain("Open");
     expect(container.textContent).toContain("figure-030 · page 30 · 4.0 KiB");
+
+    await unmount(root);
+  });
+
+  it("loads active documents on panel open, appends pages without duplicates, and virtualizes rows", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const calls: Array<{ hookId: string; input: Record<string, unknown> }> = [];
+    const documents = Array.from({ length: 120 }, (_unused, index) => ({
+      documentId: `doc-${index + 1}`,
+      title: `Document ${index + 1}`,
+      sourceType: "text",
+      state: "active",
+      chunkCount: index + 1
+    }));
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}) => {
+      calls.push({ hookId, input });
+      if (hookId === "documentation.stats") {
+        return hookResult<T>({ activeDocumentCount: documents.length, activeChunkCount: 400 });
+      }
+      if (hookId === "documentation.documents.list") {
+        const offset = typeof input.offset === "number" ? input.offset : 0;
+        const page = offset === 50 ? [documents[49]!, ...documents.slice(50, 100)] : documents.slice(offset, offset + 50);
+        return hookResult<T>({
+          documents: page,
+          window: { offset, limit: 50, total: documents.length, hasMore: offset + 50 < documents.length }
+        });
+      }
+      return {} as T;
+    };
+
+    await act(async () => {
+      root.render(createElement(DocumentationPanel, { callHook }));
+    });
+    await flush();
+
+    expect(calls.some((call) => call.hookId === "documentation.documents.list")).toBe(false);
+
+    await click(buttonByLabel(container, "Show Active documents"));
+    await flushAsyncWork();
+
+    expect(calls).toContainEqual({
+      hookId: "documentation.documents.list",
+      input: { states: ["active"], limit: 50, offset: 0, sortDirection: "desc" }
+    });
+    expect(container.textContent).toContain("Document 1");
+    expect(container.textContent).toContain("50 of 120 loaded");
+    expect(container.querySelectorAll(".documentation-document-row").length).toBeLessThan(50);
+
+    await click(buttonByText(container, "Load More"));
+    await flushAsyncWork();
+
+    expect(calls).toContainEqual({
+      hookId: "documentation.documents.list",
+      input: { states: ["active"], limit: 50, offset: 50, sortDirection: "desc" }
+    });
+    expect(container.textContent).toContain("100 of 120 loaded");
+    expect(container.querySelectorAll(".documentation-document-row").length).toBeLessThan(100);
 
     await unmount(root);
   });
@@ -335,6 +395,8 @@ describe("DocumentationPanel", () => {
     });
     await flush();
 
+    await click(buttonByLabel(container, "Show Active documents"));
+    await flushAsyncWork();
     await click(buttonByText(container, "View"));
 
     expect(container.textContent).toContain("Source Viewer");
@@ -408,6 +470,8 @@ describe("DocumentationPanel", () => {
     });
     await flush();
 
+    await click(buttonByLabel(container, "Show Active documents"));
+    await flushAsyncWork();
     await click(buttonByText(container, "View"));
 
     expect(calls).toContainEqual({ hookId: "documentation.documents.get", input: sourceWindowInput("doc-large-video") });
@@ -898,6 +962,14 @@ function buttonByText(container: HTMLElement, text: string): HTMLButtonElement {
   const button = Array.from(container.querySelectorAll("button")).find((candidate) => candidate.textContent?.trim() === text);
   if (!(button instanceof HTMLButtonElement)) {
     throw new Error(`Missing button ${text}.`);
+  }
+  return button;
+}
+
+function buttonByLabel(container: HTMLElement, label: string): HTMLButtonElement {
+  const button = Array.from(container.querySelectorAll("button")).find((candidate) => candidate.getAttribute("aria-label") === label);
+  if (!(button instanceof HTMLButtonElement)) {
+    throw new Error(`Missing button ${label}.`);
   }
   return button;
 }

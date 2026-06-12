@@ -3768,7 +3768,31 @@ a:hover svg {
 .documentation-document-row {
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
+  min-height: 62px;
   padding: 8px 10px;
+}
+
+.documentation-document-virtual-list {
+  position: relative;
+  min-height: 0;
+}
+
+.documentation-document-virtual-list .documentation-document-row {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 62px;
+}
+
+.documentation-document-list-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  color: var(--color-muted-foreground);
+  font-size: var(--font-size-xs);
 }
 
 .documentation-document-row .cx-button {

@@ -220,6 +220,34 @@ def test_archive_locality_reports_unsafe_artifact_paths(tmp_path: Path) -> None:
     ]
 
 
+def test_archive_lists_documents_with_pagination_filters_and_order(tmp_path: Path) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+    alpha = archive.ingest_text(title="Alpha Manual", text="Alpha board calibration notes.", uri="manual://alpha", collection="board")
+    beta = archive.ingest_text(title="Beta Manual", text="Beta board reset notes.", uri="manual://beta", collection="board")
+    gamma = archive.ingest_text(title="Gamma Note", text="Gamma operations note.", uri="manual://gamma", collection="ops")
+    with archive._connect() as db:
+        db.execute("UPDATE documents SET updated_at = ? WHERE document_id = ?", ("2026-01-01T00:00:00Z", alpha.document_id))
+        db.execute("UPDATE documents SET updated_at = ? WHERE document_id = ?", ("2026-01-02T00:00:00Z", beta.document_id))
+        db.execute("UPDATE documents SET updated_at = ? WHERE document_id = ?", ("2026-01-03T00:00:00Z", gamma.document_id))
+
+    first_page = archive.list_document_page(limit=2, offset=0, sort_direction="desc")
+    assert [document["title"] for document in first_page["documents"]] == ["Gamma Note", "Beta Manual"]
+    assert first_page["window"] == {"offset": 0, "limit": 2, "total": 3, "hasMore": True}
+
+    second_page = archive.list_document_page(limit=2, offset=2, sort_direction="desc")
+    assert [document["title"] for document in second_page["documents"]] == ["Alpha Manual"]
+    assert second_page["window"] == {"offset": 2, "limit": 2, "total": 3, "hasMore": False}
+
+    filtered = archive.list_document_page(limit=10, query="manual://beta", collection="board", sort_direction="asc")
+    assert [document["document_id"] for document in filtered["documents"]] == [beta.document_id]
+    assert filtered["window"] == {"offset": 0, "limit": 10, "total": 1, "hasMore": False}
+
+    with pytest.raises(ArchiveError, match="limit must be between"):
+        archive.list_document_page(limit=0)
+    with pytest.raises(ArchiveError, match="sort_direction must be asc or desc"):
+        archive.list_document_page(sort_direction="sideways")
+
+
 def test_fastapi_surface_controls_archive(tmp_path: Path) -> None:
     app = create_app(tmp_path / "archive")
     client = TestClient(app)
@@ -244,6 +272,11 @@ def test_fastapi_surface_controls_archive(tmp_path: Path) -> None:
     search = client.post("/search", json={"query": "ADC calibration register", "limit": 5})
     assert search.status_code == 200
     assert search.json()["results"][0]["documentId"] == document_id
+
+    listed = client.get("/documents", params={"limit": 1, "offset": 0, "query": "manual", "sortDirection": "asc"})
+    assert listed.status_code == 200
+    assert listed.json()["documents"][0]["document_id"] == document_id
+    assert listed.json()["window"] == {"offset": 0, "limit": 1, "total": 1, "hasMore": False}
 
     stats = client.get("/stats")
     manifest = client.get("/portable-manifest")

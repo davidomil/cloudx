@@ -13,6 +13,7 @@ export interface PluginPanelDockItem {
   showLabel?: string;
   hideLabel?: string;
   onVisibleChange?: (visible: boolean) => void;
+  onOpenChange?: (open: boolean) => void;
 }
 
 export function PluginPanelDock({
@@ -32,7 +33,10 @@ export function PluginPanelDock({
   const [openId, setOpenId] = useState<string | undefined>();
   const compact = useDockCompact(rootRef, compactAt);
 
-  useOutsidePointerDismiss(Boolean(openId), rootRef, () => setOpenId(undefined));
+  useOutsidePointerDismiss(Boolean(openId), rootRef, () => {
+    items.find((item) => item.id === openId)?.onOpenChange?.(false);
+    setOpenId(undefined);
+  });
 
   return (
     <div ref={rootRef} className={["plugin-panel-dock", `compact-${compactAt}`, `controls-${controls}`, className].filter(Boolean).join(" ")} aria-label={ariaLabel}>
@@ -50,7 +54,15 @@ export function PluginPanelDock({
         const itemStyle = { "--plugin-panel-dock-offset": pluginPanelDockOffset(index) } as CSSProperties;
         function toggleOpen() {
           if (compact) {
-            setOpenId((current) => (current === item.id ? undefined : item.id));
+            const previousItem = items.find((candidate) => candidate.id === openId);
+            if (open) {
+              item.onOpenChange?.(false);
+              setOpenId(undefined);
+            } else {
+              previousItem?.onOpenChange?.(false);
+              item.onOpenChange?.(true);
+              setOpenId(item.id);
+            }
             return;
           }
           if (!visible) {
@@ -60,13 +72,16 @@ export function PluginPanelDock({
           }
           if (canHideFromButton) {
             item.onVisibleChange?.(false);
+            item.onOpenChange?.(false);
             setOpenId(undefined);
             return;
           }
-          setOpenId((current) => (current === item.id ? undefined : item.id));
+          item.onOpenChange?.(!open);
+          setOpenId(open ? undefined : item.id);
         }
         function hidePanel() {
           item.onVisibleChange?.(false);
+          item.onOpenChange?.(false);
           setOpenId(undefined);
         }
         return (

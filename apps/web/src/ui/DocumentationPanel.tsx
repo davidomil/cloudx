@@ -92,6 +92,11 @@ export interface DocumentationWindow {
   hasMore?: boolean;
 }
 
+interface DocumentationDocumentListResponse extends Record<string, unknown> {
+  documents?: DocumentationRecord[];
+  window?: DocumentationWindow;
+}
+
 export interface DocumentationArchiveSize {
   fileCount?: number;
   logicalBytes?: number;
@@ -236,6 +241,10 @@ const DOCUMENTATION_ANSWER_SANITIZE_CONFIG = {
   ALLOWED_ATTR: []
 } satisfies DOMPurifyConfig;
 const DEFAULT_DOCUMENTATION_PANEL_STATE_KEY = "documentation-panel-default";
+const DOCUMENT_LIST_PAGE_SIZE = 50;
+const DOCUMENT_LIST_ROW_HEIGHT = 70;
+const DOCUMENT_LIST_VISIBLE_ROWS = 18;
+const DOCUMENT_LIST_OVERSCAN_ROWS = 4;
 const SOURCE_CHUNK_PAGE_SIZE = 75;
 const SOURCE_ARTIFACT_PAGE_SIZE = 100;
 const SOURCE_CHUNK_TEXT_MAX_CHARS = 4_000;
@@ -314,9 +323,16 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   const [uploadInputKey, setUploadInputKey] = useDocumentationStateField("uploadInputKey", state, onStateChange);
   const [ingestJobs, setIngestJobs] = useDocumentationStateField("ingestJobs", state, onStateChange);
   const [serverIngestJobs, setServerIngestJobs] = useDocumentationStateField("serverIngestJobs", state, onStateChange);
+  const [documentListVisible, setDocumentListVisible] = useState(false);
+  const [documentListLoaded, setDocumentListLoaded] = useState(false);
+  const [documentListBusy, setDocumentListBusy] = useState(false);
+  const [documentListScrollTop, setDocumentListScrollTop] = useState(0);
+  const [documentListWindow, setDocumentListWindow] = useState<DocumentationWindow>({ offset: 0, limit: 0, total: 0, hasMore: false });
   const sourceViewerRef = useRef<HTMLElement | null>(null);
   const sourceChunkListRef = useRef<HTMLDivElement | null>(null);
   const sourceAutoLoadSentinelRef = useRef<HTMLDivElement | null>(null);
+  const documentListRef = useRef<HTMLDivElement | null>(null);
+  const documentListRequestIdRef = useRef(0);
   const sourceAutoLoadInFlightRef = useRef(false);
   const sourceViewerScrollDocumentIdRef = useRef("");
   const aiNoticeId = useId();
@@ -383,17 +399,81 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
 
   async function refresh() {
     await run(async () => {
-      await Promise.all([loadArchiveSummary(), loadIngestQueue()]);
+      await Promise.all([
+        loadArchiveSummary(),
+        loadIngestQueue(),
+        documentListLoaded ? loadDocumentPage("replace") : Promise.resolve()
+      ]);
     });
   }
 
   async function loadArchiveSummary() {
-    const [statsResult, docsResult] = await Promise.all([
-      call<Record<string, unknown>>("documentation.stats"),
-      call<{ documents: DocumentationRecord[] }>("documentation.documents.list")
-    ]);
+    const statsResult = await call<Record<string, unknown>>("documentation.stats");
     setStats(statsResult);
-    setDocuments(docsResult.documents ?? []);
+  }
+
+  function showDocumentList(visible: boolean) {
+    setDocumentListVisible(visible);
+    if (visible) {
+      void ensureDocumentListLoaded();
+    }
+  }
+
+  function handleDocumentListOpenChange(open: boolean) {
+    if (open) {
+      void ensureDocumentListLoaded();
+    }
+  }
+
+  async function ensureDocumentListLoaded() {
+    if (documentListLoaded || documentListBusy) {
+      return;
+    }
+    await loadDocumentPage("replace");
+  }
+
+  async function loadDocumentPage(mode: "replace" | "append") {
+    if (!canCall) {
+      setStatus("Documentation hook bridge is not available.");
+      return;
+    }
+    if (documentListBusy) {
+      return;
+    }
+    const offset = mode === "append" ? nextDocumentListOffset(documentListWindow, documents.length) : 0;
+    const requestId = documentListRequestIdRef.current + 1;
+    documentListRequestIdRef.current = requestId;
+    setDocumentListBusy(true);
+    setStatus("");
+    try {
+      const result = await call<DocumentationDocumentListResponse>("documentation.documents.list", {
+        states: ["active"],
+        limit: DOCUMENT_LIST_PAGE_SIZE,
+        offset,
+        sortDirection: "desc"
+      });
+      if (documentListRequestIdRef.current !== requestId) {
+        return;
+      }
+      const nextDocuments = result.documents ?? [];
+      setDocumentListLoaded(true);
+      setDocumentListWindow(result.window ?? documentListWindowFromPage(offset, DOCUMENT_LIST_PAGE_SIZE, nextDocuments.length));
+      setDocuments((current) => mode === "append" ? uniqueDocuments([...current, ...nextDocuments]) : nextDocuments);
+      if (mode === "replace") {
+        setDocumentListScrollTop(0);
+        if (documentListRef.current) {
+          documentListRef.current.scrollTop = 0;
+        }
+      }
+    } catch (error) {
+      if (documentListRequestIdRef.current === requestId) {
+        setStatus(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      if (documentListRequestIdRef.current === requestId) {
+        setDocumentListBusy(false);
+      }
+    }
   }
 
   async function loadIngestQueue() {
@@ -507,8 +587,11 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
         return;
       }
       const enrichmentNotice = documentationEnrichmentNotice(ingestResponse);
-      updateIngestJob(job.id, { progress: 90, stage: "Refreshing archive list." });
+      updateIngestJob(job.id, { progress: 90, stage: "Refreshing archive stats." });
       await loadArchiveSummary();
+      if (documentListLoaded) {
+        await loadDocumentPage("replace");
+      }
       if (ingestController.disposed) {
         return;
       }
@@ -587,6 +670,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   async function invalidate(documentId: string, state: string) {
     await run(async () => {
       await call("documentation.invalidate", { documentId, state, reason: `Marked ${state} from the CloudX Documentation panel.` });
+      removeDocumentFromLoadedList(documentId);
       await search();
       await refresh();
     });
@@ -596,9 +680,18 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
     await run(async () => {
       await call("documentation.remove", { documentId: targetDocumentId });
       setSelectedDocument((current) => current && documentId(current) === targetDocumentId ? undefined : current);
+      removeDocumentFromLoadedList(targetDocumentId);
       await search();
       await refresh();
     });
+  }
+
+  function removeDocumentFromLoadedList(targetDocumentId: string) {
+    setDocuments((current) => current.filter((document) => documentId(document) !== targetDocumentId));
+    setDocumentListWindow((current) => ({
+      ...current,
+      total: typeof current.total === "number" ? Math.max(0, current.total - 1) : current.total
+    }));
   }
 
   async function viewDocument(id: string) {
@@ -672,7 +765,9 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
     }
   }
 
-  const visibleDocuments = useMemo(() => documents, [documents]);
+  const virtualDocuments = useMemo(() => virtualDocumentRows(documents, documentListScrollTop), [documents, documentListScrollTop]);
+  const documentListHasMore = documentListWindow.hasMore === true;
+  const documentListSummary = documentListLoaded ? documentListLoadedLabel(documents.length, documentListWindow) : "";
   const aiNotice = aiAssistanceEnabled
     ? "AI assistance is enabled. Assisted search can synthesize source-grounded answers."
     : "AI assistance is disabled. Manual mode searches source text only; use View Source to inspect chunks, transcript text, tables, and metadata manually.";
@@ -826,7 +921,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
           </div>
         </section>
 
-        <PluginPanelDock compactAt="wide" items={[
+        <PluginPanelDock compactAt="wide" controls="compact-or-hidden" items={[
           {
             id: "ingest",
             label: "Add knowledge",
@@ -881,22 +976,48 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
             id: "documents",
             label: "Active documents",
             icon: <BookOpen size={15} />,
+            visible: documentListVisible,
+            showLabel: "Show Active documents",
+            hideLabel: "Hide Active documents",
+            onVisibleChange: showDocumentList,
+            onOpenChange: handleDocumentListOpenChange,
             children: (
               <section className="documentation-section documentation-documents">
                 <h3>Active Documents</h3>
-                {visibleDocuments.length > 0 ? (
-                  <div className="documentation-document-list">
-                    {visibleDocuments.map((document) => (
-                      <div className="documentation-document-row" key={documentId(document)}>
-                        <span>{document.title ?? documentId(document)}</span>
-                        <small>{document.source_type ?? document.sourceType} · {document.chunk_count ?? document.chunkCount ?? 0} chunks</small>
-                        <ControlButton size="compact" disabled={documentBusy} onClick={() => void viewDocument(documentId(document))}>
-                          <BookOpen size={13} /> View
-                        </ControlButton>
+                {documentListBusy && !documentListLoaded ? <p className="documentation-empty" role="status">Loading active documents.</p> : null}
+                {documentListLoaded && documents.length > 0 ? (
+                  <>
+                    <div
+                      ref={documentListRef}
+                      className="documentation-document-list"
+                      onScroll={(event) => setDocumentListScrollTop(event.currentTarget.scrollTop)}
+                    >
+                      <div className="documentation-document-virtual-list" style={{ height: `${virtualDocuments.totalHeight}px` }}>
+                        {virtualDocuments.rows.map(({ document, index, offset }) => (
+                          <div className="documentation-document-row" key={documentId(document)} style={{ transform: `translateY(${offset}px)` }}>
+                            <span>{document.title ?? documentId(document)}</span>
+                            <small>{index + 1}. {document.source_type ?? document.sourceType} · {document.chunk_count ?? document.chunkCount ?? 0} chunks</small>
+                            <ControlButton size="compact" disabled={documentBusy} onClick={() => void viewDocument(documentId(document))}>
+                              <BookOpen size={13} /> View
+                            </ControlButton>
+                          </div>
+                        ))}
                       </div>
-                    ))}
-                  </div>
-                ) : <p className="documentation-empty">No active documents.</p>}
+                    </div>
+                    <div className="documentation-document-list-footer">
+                      <span>{documentListSummary}</span>
+                      {documentListHasMore ? (
+                        <ControlButton size="compact" disabled={documentListBusy} onClick={() => void loadDocumentPage("append")}>
+                          {documentListBusy ? "Loading" : "Load More"}
+                        </ControlButton>
+                      ) : null}
+                    </div>
+                  </>
+                ) : documentListLoaded ? (
+                  <p className="documentation-empty">No active documents.</p>
+                ) : (
+                  <p className="documentation-empty">Open the panel to load active documents.</p>
+                )}
               </section>
             )
           }
@@ -1248,6 +1369,57 @@ function sourceDocumentWindowInput(documentIdValue: string): Record<string, unkn
     chunkTextMaxChars: SOURCE_CHUNK_TEXT_MAX_CHARS,
     artifactOffset: 0,
     artifactLimit: SOURCE_ARTIFACT_PAGE_SIZE
+  };
+}
+
+function nextDocumentListOffset(window: DocumentationWindow, fallback: number): number {
+  if (typeof window.offset === "number" && typeof window.limit === "number") {
+    return Math.max(0, window.offset + window.limit);
+  }
+  return Math.max(0, fallback);
+}
+
+function documentListWindowFromPage(offset: number, limit: number, count: number): DocumentationWindow {
+  return {
+    offset,
+    limit,
+    total: offset + count,
+    hasMore: false
+  };
+}
+
+function documentListLoadedLabel(loaded: number, window: DocumentationWindow): string {
+  return typeof window.total === "number" ? `${formatCount(loaded)} of ${formatCount(window.total)} loaded` : `${formatCount(loaded)} loaded`;
+}
+
+function uniqueDocuments(documents: DocumentationRecord[]): DocumentationRecord[] {
+  const seen = new Set<string>();
+  return documents.filter((document) => {
+    const key = documentId(document);
+    if (!key) {
+      return true;
+    }
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function virtualDocumentRows(documents: DocumentationRecord[], scrollTop: number): {
+  rows: Array<{ document: DocumentationRecord; index: number; offset: number }>;
+  totalHeight: number;
+} {
+  const start = Math.max(0, Math.floor(Math.max(0, scrollTop) / DOCUMENT_LIST_ROW_HEIGHT) - DOCUMENT_LIST_OVERSCAN_ROWS);
+  const end = Math.min(documents.length, start + DOCUMENT_LIST_VISIBLE_ROWS + DOCUMENT_LIST_OVERSCAN_ROWS * 2);
+  return {
+    rows: documents.slice(start, end).map((document, index) => ({
+      document,
+      index: start + index,
+      offset: (start + index) * DOCUMENT_LIST_ROW_HEIGHT
+    })),
+    totalHeight: documents.length * DOCUMENT_LIST_ROW_HEIGHT
   };
 }
 

@@ -52,6 +52,8 @@ STRICT_TERM_MATCH_BONUS = 4.0
 IDENTIFIER_TERM_MATCH_BONUS = 4.0
 MAX_URL_INGEST_BYTES = 256 * 1024 * 1024
 ACTIVE_STATE = "active"
+DOCUMENT_LIST_DEFAULT_LIMIT = 50
+DOCUMENT_LIST_MAX_LIMIT = 200
 EXCLUDED_STATES = {"stale", "superseded", "revoked", "quarantined", "deleted"}
 VIDEO_SCAN_FPS = 1
 VIDEO_SEGMENT_SECONDS = 5 * 60
@@ -331,22 +333,52 @@ class DocumentationArchive:
         }
 
     def list_documents(self, states: list[str] | None = None) -> list[dict]:
+        return self.list_document_page(states=states, limit=None)["documents"]
+
+    def list_document_page(
+        self,
+        states: list[str] | None = None,
+        *,
+        limit: int | None = DOCUMENT_LIST_DEFAULT_LIMIT,
+        offset: int = 0,
+        query: str | None = None,
+        collection: str | None = None,
+        sort_direction: str = "desc",
+    ) -> dict:
         if not states:
             states = [ACTIVE_STATE]
+        offset = normalized_window_value(offset, "offset")
+        if limit is not None:
+            limit = normalized_window_value(limit, "limit")
+            if limit < 1 or limit > DOCUMENT_LIST_MAX_LIMIT:
+                raise ArchiveError(f"limit must be between 1 and {DOCUMENT_LIST_MAX_LIMIT}.")
+        direction = sort_direction.lower()
+        if direction not in {"asc", "desc"}:
+            raise ArchiveError("sort_direction must be asc or desc.")
+        where_sql, params = document_list_filter(states, query=query, collection=collection)
         with self._connect() as db:
-            rows = db.execute(
-                """
+            total = int(db.execute(f"SELECT COUNT(*) FROM documents d WHERE {where_sql}", params).fetchone()[0])
+            document_sql = """
                 SELECT d.document_id, d.title, d.source_type, d.uri, d.state, d.collection, d.created_at, d.updated_at,
                        COUNT(c.chunk_id) AS chunk_count
                 FROM documents d
                 LEFT JOIN chunks c ON c.document_id = d.document_id
-                WHERE d.state IN ({placeholders})
+                WHERE {where_sql}
                 GROUP BY d.document_id
-                ORDER BY d.updated_at DESC, d.title
-                """.format(placeholders=", ".join("?" for _ in states)),
-                states,
+                ORDER BY d.updated_at {direction}, d.title COLLATE NOCASE, d.document_id
+            """.format(where_sql=where_sql, direction=direction.upper())
+            document_params: list[str | int] = list(params)
+            if limit is not None:
+                document_sql += " LIMIT ? OFFSET ?"
+                document_params.extend([limit, offset])
+            rows = db.execute(
+                document_sql,
+                document_params,
             ).fetchall()
-        return [dict(row) for row in rows]
+        return {
+            "documents": [dict(row) for row in rows],
+            "window": window_metadata(offset, limit, total),
+        }
 
     def get_document(
         self,
@@ -1349,6 +1381,26 @@ def window_metadata(offset: int, limit: int | None, total: int) -> dict[str, int
         "total": total,
         "hasMore": offset + resolved_limit < total,
     }
+
+
+def document_list_filter(states: list[str], *, query: str | None, collection: str | None) -> tuple[str, list[str]]:
+    clean_states = [state.strip() for state in states if state.strip()]
+    if not clean_states:
+        clean_states = [ACTIVE_STATE]
+    clauses = [f"d.state IN ({', '.join('?' for _ in clean_states)})"]
+    params = list(clean_states)
+    if collection and collection.strip():
+        clauses.append("d.collection = ?")
+        params.append(collection.strip())
+    if query and query.strip():
+        pattern = f"%{escape_sql_like(query.strip().lower())}%"
+        clauses.append("(LOWER(d.title) LIKE ? ESCAPE '\\' OR LOWER(d.uri) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(d.collection, '')) LIKE ? ESCAPE '\\')")
+        params.extend([pattern, pattern, pattern])
+    return " AND ".join(clauses), params
+
+
+def escape_sql_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def document_chunk_dict(row: sqlite3.Row, text_max_chars: int | None) -> dict[str, Any]:
