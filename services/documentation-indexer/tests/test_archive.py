@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
 import threading
@@ -144,6 +145,81 @@ def test_archive_stats_reports_storage_totals(tmp_path: Path) -> None:
     assert archive_size["runtimeEstimateKind"] == "dense-index-file"
 
 
+def test_archive_locality_survives_archive_root_move(tmp_path: Path) -> None:
+    archive_root = tmp_path / "archive"
+    archive = DocumentationArchive(archive_root)
+    document = archive.ingest_text(
+        title="Migrated archive note",
+        text="Moved archive still searches for MIGRATE-LOCALITY-7.",
+        uri="manual://migrated-locality",
+    )
+
+    migrated_root = tmp_path / "migrated-archive"
+    shutil.copytree(archive_root, migrated_root)
+    migrated = DocumentationArchive(migrated_root)
+    locality = migrated.stats()["archiveLocality"]
+
+    assert locality["ok"] is True
+    assert locality["checkedPathCount"] >= 4
+    assert locality["violations"] == []
+    assert migrated.search("MIGRATE-LOCALITY-7", limit=1)[0]["documentId"] == document.document_id
+
+
+def test_archive_locality_reports_absolute_and_outside_snapshot_paths(tmp_path: Path) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+    absolute_document = archive.ingest_text(
+        title="Absolute snapshot path",
+        text="Absolute snapshot paths should be reported.",
+        uri="manual://absolute-snapshot",
+    )
+    outside_document = archive.ingest_text(
+        title="Outside snapshot path",
+        text="Outside relative snapshot paths should be reported.",
+        uri="manual://outside-snapshot",
+    )
+    with archive._connect() as db:
+        db.execute("UPDATE documents SET snapshot_path = ? WHERE document_id = ?", (str(tmp_path / "outside.md"), absolute_document.document_id))
+        db.execute("UPDATE documents SET snapshot_path = ? WHERE document_id = ?", ("../outside.md", outside_document.document_id))
+
+    locality = archive.locality_report()
+
+    assert locality["ok"] is False
+    assert {
+        (violation["documentId"], violation["reason"])
+        for violation in locality["violations"]
+        if violation["kind"] == "document-snapshot"
+    } == {
+        (absolute_document.document_id, "stored path must be relative to archiveRoot"),
+        (outside_document.document_id, "stored path resolves outside archiveRoot"),
+    }
+
+
+def test_archive_locality_reports_unsafe_artifact_paths(tmp_path: Path) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+    document = archive.ingest_text(
+        title="Unsafe artifact path",
+        text="Artifact metadata should stay below the extracted artifact directory.",
+        uri="manual://unsafe-artifact",
+    )
+    stored_snapshot_path = archive.get_document(document.document_id)["snapshot_path"]
+    snapshot_path = tmp_path / "archive" / stored_snapshot_path
+    artifact_root = snapshot_path.parent / "extracted"
+    artifact_root.mkdir()
+    (artifact_root / "image_metadata.json").write_text(json.dumps({"artifacts": ["../outside.png"]}), encoding="utf-8")
+
+    locality = archive.locality_report()
+
+    assert locality["ok"] is False
+    assert locality["violations"] == [
+        {
+            "kind": "document-artifact",
+            "path": stored_snapshot_path,
+            "reason": "Document artifact path must stay inside the extracted artifact directory.",
+            "documentId": document.document_id,
+        }
+    ]
+
+
 def test_fastapi_surface_controls_archive(tmp_path: Path) -> None:
     app = create_app(tmp_path / "archive")
     client = TestClient(app)
@@ -151,6 +227,7 @@ def test_fastapi_surface_controls_archive(tmp_path: Path) -> None:
     health = client.get("/health")
     assert health.status_code == 200
     assert health.json()["portable"] is True
+    assert health.json()["archiveLocality"]["ok"] is True
 
     ingested = client.post(
         "/ingest/text",
@@ -172,6 +249,7 @@ def test_fastapi_surface_controls_archive(tmp_path: Path) -> None:
     manifest = client.get("/portable-manifest")
     assert stats.status_code == 200
     assert manifest.status_code == 200
+    assert stats.json()["archiveLocality"]["ok"] is True
     assert stats.json()["archiveSize"] == manifest.json()["archiveSize"]
     assert stats.json()["archiveSize"]["fileCount"] == len(manifest.json()["files"])
     assert stats.json()["archiveSize"]["logicalBytes"] == sum(entry["bytes"] for entry in manifest.json()["files"])

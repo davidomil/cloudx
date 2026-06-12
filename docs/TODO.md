@@ -59,7 +59,7 @@
   - Surfaces: indexer endpoints, `DocumentationClient`, documentation plugin hooks, helper commands, UI controls, and setup docs.
   - Tests: replace import warning path, merge duplicate handling, conflict reporting, manifest validation failure, and post-import search/rebuild.
 
-- [ ] Audit archive locality and add a migration path for documentation data
+- [x] Audit archive locality and add a migration path for documentation data
   - Current state: `DocumentationArchive` stores `catalog.sqlite`, `snapshots/`, and Turbovec indexes under one root, and `snapshot_path` is stored relative to that root. That is migration-friendly, but needs an explicit invariant check.
   - Implementation target: add a health/stats invariant that confirms every stored `snapshot_path`, artifact path, and index path is inside `archiveRoot`, with no absolute stored paths except user-facing `uri` metadata.
   - Migration target: document and/or implement a command to move the archive root, update `CLOUDX_DOCUMENTATION_DATA_DIR`, verify the manifest, and rebuild the dense index after the move.

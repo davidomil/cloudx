@@ -184,8 +184,9 @@ search and full source inspection, but assisted answers and post-ingest AI
 enrichment are unavailable.
 
 The documentation archive is portable as one directory. Stop writes, then back
-up `.cloudx/documentation` or the directory named by
-`CLOUDX_DOCUMENTATION_DATA_DIR`.
+up or move `.cloudx/documentation` or the directory named by
+`CLOUDX_DOCUMENTATION_DATA_DIR`. After changing the directory, restart the
+indexer and verify `/stats` reports `archiveLocality.ok: true`.
 
 Render the memory plugin PDF guide after documentation changes:
 

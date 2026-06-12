@@ -484,11 +484,11 @@ function defaultDocumentationSkills(): PluginSkillContribution[] {
     {
       id: "documentation-archive-control",
       name: "Documentation Archive Control",
-      description: "Inspect portable archive health, size, backup manifest, and index rebuild status.",
+      description: "Inspect portable archive health, size, locality, backup manifest, and index rebuild status.",
       instructions: skillInstructions("Archive Control", [
         "Read `CLOUDX_DOCUMENTATION_URL`. If it is missing, stop and explain that the documentation indexer URL is not available.",
         `Use the bundled helper to keep commands short: \`DOC="$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-archive-control/${DOCUMENTATION_HELPER_SCRIPT_PATH}"\`; then run \`node "$DOC" health\`, \`node "$DOC" stats\`, \`node "$DOC" manifest\`, \`node "$DOC" list\`, or \`node "$DOC" rebuild\`.`,
-        "Use health, stats, and manifest output, including archiveSize totals, to inspect archive state before advising backup or restore work.",
+        "Use health, stats, and manifest output, including archiveSize totals and archiveLocality, to inspect archive state before advising backup, restore, or archive-root migration work.",
         "The portable archive is the complete directory reported by `/health.archiveRoot`; back it up as a directory after stopping writes.",
         "Run rebuild after restoring an archive or changing active documentation state."
       ]),

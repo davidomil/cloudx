@@ -324,6 +324,18 @@ Run the rebuild after restore when you intentionally changed active document
 states, changed the service version, or want to validate that the Turbovec file
 can be reconstructed from SQLite chunks.
 
+Manual archive-root move:
+
+1. Stop CloudX or otherwise stop writes to the documentation indexer.
+2. Copy or move the complete archive directory, not individual files.
+3. Update `CLOUDX_DOCUMENTATION_DATA_DIR` to the new directory and restart the
+   indexer.
+4. Verify `curl -sS http://127.0.0.1:7820/stats` reports
+   `"archiveLocality": {"ok": true, ...}`.
+5. Run `curl -sS -X POST http://127.0.0.1:7820/rebuild-index` when changing
+   service versions or when you want to prove the dense index can be rebuilt
+   from SQLite chunks.
+
 ## Faster Whisper Large Model
 
 The ASR service accepts either a Faster Whisper model name or a local model

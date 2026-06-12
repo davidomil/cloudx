@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable, Iterator, Mapping
 from importlib.metadata import version
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -181,6 +181,24 @@ class ArchiveFileSize:
         }
 
 
+@dataclass(frozen=True)
+class ArchiveLocalityViolation:
+    kind: str
+    path: str
+    reason: str
+    document_id: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        record = {
+            "kind": self.kind,
+            "path": self.path,
+            "reason": self.reason,
+        }
+        if self.document_id:
+            record["documentId"] = self.document_id
+        return record
+
+
 class DocumentationArchive:
     def __init__(self, root: Path | str):
         self.root = Path(root).resolve()
@@ -204,6 +222,7 @@ class DocumentationArchive:
             "embeddingDimension": EMBEDDING_DIM,
             "turbovecIndexPath": str(self.index_path),
             "portable": True,
+            "archiveLocality": self.locality_report(),
         }
 
     def stats(self) -> dict:
@@ -224,6 +243,7 @@ class DocumentationArchive:
             "manifestPath": str(self.manifest_path),
             "portableFiles": manifest["files"],
             "archiveSize": manifest["archiveSize"],
+            "archiveLocality": self.locality_report(),
         }
 
     def portable_manifest(self) -> dict:
@@ -248,6 +268,66 @@ class DocumentationArchive:
             "denseOnlyMinScore": DENSE_ONLY_MIN_SCORE,
             "archiveSize": self._archive_size(files),
             "files": file_entries,
+        }
+
+    def locality_report(self) -> dict[str, Any]:
+        archive_root = self.root.resolve()
+        violations: list[ArchiveLocalityViolation] = []
+        checked_path_count = 0
+
+        def check_runtime_path(kind: str, path: Path) -> None:
+            nonlocal checked_path_count
+            checked_path_count += 1
+            if not is_relative_to(path.resolve(), archive_root):
+                violations.append(ArchiveLocalityViolation(kind, str(path), "runtime path must stay inside archiveRoot"))
+
+        def check_stored_archive_path(kind: str, stored_path: str, document_id: str | None = None) -> Path | None:
+            nonlocal checked_path_count
+            checked_path_count += 1
+            if not stored_path:
+                violations.append(ArchiveLocalityViolation(kind, stored_path, "stored path is empty", document_id))
+                return None
+            if is_absolute_stored_path(stored_path):
+                violations.append(ArchiveLocalityViolation(kind, stored_path, "stored path must be relative to archiveRoot", document_id))
+                return None
+            resolved = (archive_root / stored_path).resolve()
+            if not is_relative_to(resolved, archive_root):
+                violations.append(ArchiveLocalityViolation(kind, stored_path, "stored path resolves outside archiveRoot", document_id))
+                return None
+            return resolved
+
+        def check_artifact_path(document_id: str, artifact_root: Path, artifact_path: str) -> None:
+            nonlocal checked_path_count
+            checked_path_count += 1
+            relative_path = safe_artifact_relative_path(artifact_path)
+            resolved = (artifact_root / relative_path).resolve()
+            if not is_relative_to(resolved, artifact_root.resolve()) or not is_relative_to(resolved, archive_root):
+                violations.append(ArchiveLocalityViolation("document-artifact", artifact_path, "artifact path resolves outside archiveRoot", document_id))
+
+        check_runtime_path("database", self.db_path)
+        check_runtime_path("index", self.index_path)
+        check_runtime_path("index-manifest", self.manifest_path)
+        with self._connect() as db:
+            documents = db.execute("SELECT document_id, snapshot_path FROM documents ORDER BY document_id").fetchall()
+        for document in documents:
+            document_id = str(document["document_id"])
+            stored_snapshot_path = str(document["snapshot_path"])
+            snapshot_path = check_stored_archive_path("document-snapshot", stored_snapshot_path, document_id)
+            if not snapshot_path:
+                continue
+            artifact_root = snapshot_path.parent / "extracted"
+            if not artifact_root.is_dir():
+                continue
+            try:
+                for artifact_path in snapshot_artifact_paths(artifact_root):
+                    check_artifact_path(document_id, artifact_root, artifact_path)
+            except ArchiveError as error:
+                checked_path_count += 1
+                violations.append(ArchiveLocalityViolation("document-artifact", stored_snapshot_path, str(error), document_id))
+        return {
+            "ok": not violations,
+            "checkedPathCount": checked_path_count,
+            "violations": [violation.as_dict() for violation in violations],
         }
 
     def list_documents(self, states: list[str] | None = None) -> list[dict]:
@@ -1105,6 +1185,10 @@ def archive_file_category(relative_path: str) -> str:
     if relative_path.startswith("snapshots/"):
         return "artifact" if "/extracted/" in relative_path else "snapshot"
     return "other"
+
+
+def is_absolute_stored_path(path: str) -> bool:
+    return Path(path).is_absolute() or PureWindowsPath(path).is_absolute()
 
 
 def archive_size_totals(files: list[ArchiveFileSize], dense_index_path: str) -> dict[str, Any]:

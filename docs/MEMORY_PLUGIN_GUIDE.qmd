@@ -220,8 +220,8 @@ Invalidation updates both the document row and its chunks, records an invalidati
 
 ## Read Hooks
 
-- `documentation.health`: `GET /health`. Returns health, archive root, schema, embedding profile, index path, and portability flag.
-- `documentation.stats`: `GET /stats`. Returns document and chunk counts plus portable paths and `archiveSize` storage/runtime totals.
+- `documentation.health`: `GET /health`. Returns health, archive root, schema, embedding profile, index path, portability flag, and `archiveLocality` invariant status.
+- `documentation.stats`: `GET /stats`. Returns document and chunk counts plus portable paths, `archiveSize` storage/runtime totals, and `archiveLocality`.
 - `documentation.portableManifest`: `GET /portable-manifest`. Returns the complete archive file manifest plus the same `archiveSize` totals.
 - `documentation.documents.list`: `GET /documents`. Lists documents and defaults to active state.
 - `documentation.documents.get`: `GET /documents/{id}`. Fetches one document with chunks and invalidation history.
@@ -326,6 +326,14 @@ curl -sS -X POST http://127.0.0.1:7820/rebuild-index
 ```
 
 Run rebuild after restore when active document states changed, the service version changed, or you want to prove the Turbovec file can be reconstructed from SQLite chunks.
+
+Manual archive-root move:
+
+1. Stop CloudX or otherwise stop writes to the documentation indexer.
+2. Copy or move the complete archive directory, not individual files.
+3. Update `CLOUDX_DOCUMENTATION_DATA_DIR` to the new directory and restart the indexer.
+4. Verify `curl -sS http://127.0.0.1:7820/stats` reports `"archiveLocality": {"ok": true, ...}`.
+5. Run `curl -sS -X POST http://127.0.0.1:7820/rebuild-index` when changing service versions or when you want to prove the dense index can be rebuilt from SQLite chunks.
 
 # Rendering This PDF
 
