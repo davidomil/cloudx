@@ -109,6 +109,41 @@ def test_archive_ingests_searches_invalidates_and_remains_portable(tmp_path: Pat
     assert restored.search("reciprocal rank fusion", limit=1)[0]["sourceType"] == "book"
 
 
+def test_archive_stats_reports_storage_totals(tmp_path: Path) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+    snapshot_dir = tmp_path / "archive" / "snapshots" / "manual"
+    artifact_dir = snapshot_dir / "extracted" / "tables"
+    artifact_dir.mkdir(parents=True)
+    (snapshot_dir / "source.md").write_text("Snapshot bytes for size accounting.\n", encoding="utf-8")
+    (artifact_dir / "table.csv").write_text("name,value\nalpha,1\n", encoding="utf-8")
+    archive.rebuild_index()
+
+    stats = archive.stats()
+    manifest = archive.portable_manifest()
+    files = stats["portableFiles"]
+    by_path = {entry["path"]: entry for entry in files}
+    archive_size = stats["archiveSize"]
+
+    assert manifest["archiveSize"] == archive_size
+    assert archive_size["fileCount"] == len(files)
+    assert archive_size["logicalBytes"] == sum(entry["bytes"] for entry in files)
+    if archive_size["allocatedBytesAvailable"]:
+        assert archive_size["allocatedBytes"] == sum(entry["allocatedBytes"] for entry in files)
+    else:
+        assert archive_size["allocatedBytes"] is None
+    assert by_path["catalog.sqlite"]["category"] == "database"
+    assert by_path["snapshots/manual/source.md"]["category"] == "snapshot"
+    assert by_path["snapshots/manual/extracted/tables/table.csv"]["category"] == "artifact"
+    assert by_path["indexes/local-hash-64/chunks.tvim"]["category"] == "index"
+    assert archive_size["databaseBytes"] == (tmp_path / "archive" / "catalog.sqlite").stat().st_size
+    assert archive_size["snapshotBytes"] >= by_path["snapshots/manual/source.md"]["bytes"]
+    assert archive_size["artifactBytes"] == by_path["snapshots/manual/extracted/tables/table.csv"]["bytes"]
+    assert archive_size["indexBytes"] >= by_path["indexes/local-hash-64/chunks.tvim"]["bytes"]
+    assert archive_size["denseIndexBytes"] == by_path["indexes/local-hash-64/chunks.tvim"]["bytes"]
+    assert archive_size["runtimeEstimateBytes"] == archive_size["denseIndexBytes"]
+    assert archive_size["runtimeEstimateKind"] == "dense-index-file"
+
+
 def test_fastapi_surface_controls_archive(tmp_path: Path) -> None:
     app = create_app(tmp_path / "archive")
     client = TestClient(app)
@@ -132,6 +167,14 @@ def test_fastapi_surface_controls_archive(tmp_path: Path) -> None:
     search = client.post("/search", json={"query": "ADC calibration register", "limit": 5})
     assert search.status_code == 200
     assert search.json()["results"][0]["documentId"] == document_id
+
+    stats = client.get("/stats")
+    manifest = client.get("/portable-manifest")
+    assert stats.status_code == 200
+    assert manifest.status_code == 200
+    assert stats.json()["archiveSize"] == manifest.json()["archiveSize"]
+    assert stats.json()["archiveSize"]["fileCount"] == len(manifest.json()["files"])
+    assert stats.json()["archiveSize"]["logicalBytes"] == sum(entry["bytes"] for entry in manifest.json()["files"])
 
     invalidated = client.post(
         "/invalidate",

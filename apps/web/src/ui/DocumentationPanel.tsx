@@ -92,6 +92,20 @@ export interface DocumentationWindow {
   hasMore?: boolean;
 }
 
+export interface DocumentationArchiveSize {
+  fileCount?: number;
+  logicalBytes?: number;
+  allocatedBytes?: number;
+  allocatedBytesAvailable?: boolean;
+  databaseBytes?: number;
+  snapshotBytes?: number;
+  artifactBytes?: number;
+  indexBytes?: number;
+  denseIndexBytes?: number;
+  runtimeEstimateBytes?: number;
+  runtimeEstimateKind?: string;
+}
+
 export interface DocumentationAnswerCitation {
   documentId?: string;
   title?: string;
@@ -311,6 +325,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   const canCall = Boolean(callHook);
   const activeCount = numberStat(stats.activeDocumentCount);
   const chunkCount = numberStat(stats.activeChunkCount);
+  const archiveSizeLabel = archiveSizeSummaryLabel(archiveSizeStats(stats));
   const aiAssistanceEnabled = globalConfig.aiControlEnabled !== false && config.aiEnrichmentEnabled !== false;
 
   useEffect(() => {
@@ -676,6 +691,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
         <div>
           <h2>Documentation Archive</h2>
           <p>{activeCount} active documents, {chunkCount} active chunks</p>
+          {archiveSizeLabel ? <p>{archiveSizeLabel}</p> : null}
         </div>
         <div className="documentation-toolbar">
           <span className={aiAssistanceEnabled ? "documentation-ai-status" : "documentation-ai-status documentation-ai-status-warning"}>
@@ -1287,6 +1303,61 @@ function sourceAutoLoadLabel(document: DocumentationDetail): string {
 
 function numberStat(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function archiveSizeStats(stats: Record<string, unknown>): DocumentationArchiveSize | undefined {
+  if (!isRecord(stats.archiveSize)) {
+    return undefined;
+  }
+  const archiveSize = stats.archiveSize;
+  return {
+    fileCount: optionalNumber(archiveSize.fileCount),
+    logicalBytes: optionalNumber(archiveSize.logicalBytes),
+    allocatedBytes: optionalNumber(archiveSize.allocatedBytes),
+    allocatedBytesAvailable: typeof archiveSize.allocatedBytesAvailable === "boolean" ? archiveSize.allocatedBytesAvailable : undefined,
+    databaseBytes: optionalNumber(archiveSize.databaseBytes),
+    snapshotBytes: optionalNumber(archiveSize.snapshotBytes),
+    artifactBytes: optionalNumber(archiveSize.artifactBytes),
+    indexBytes: optionalNumber(archiveSize.indexBytes),
+    denseIndexBytes: optionalNumber(archiveSize.denseIndexBytes),
+    runtimeEstimateBytes: optionalNumber(archiveSize.runtimeEstimateBytes),
+    runtimeEstimateKind: typeof archiveSize.runtimeEstimateKind === "string" ? archiveSize.runtimeEstimateKind : undefined
+  };
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function archiveSizeSummaryLabel(size: DocumentationArchiveSize | undefined): string {
+  if (!size || size.logicalBytes === undefined) {
+    return "";
+  }
+  const summary = [`Archive ${formatBytes(size.logicalBytes)} logical`];
+  if (size.allocatedBytes !== undefined && size.allocatedBytesAvailable !== false) {
+    summary.push(`${formatBytes(size.allocatedBytes)} on disk`);
+  }
+  if (size.fileCount !== undefined) {
+    summary.push(`${formatCount(size.fileCount)} files`);
+  }
+  const breakdown = [
+    archiveSizePart("database", size.databaseBytes),
+    archiveSizePart("snapshots", size.snapshotBytes),
+    archiveSizePart("artifacts", size.artifactBytes),
+    archiveSizePart("index", size.indexBytes),
+  ].filter(Boolean).join(", ");
+  const runtime = size.runtimeEstimateBytes !== undefined
+    ? `runtime estimate ${formatBytes(size.runtimeEstimateBytes)} ${runtimeEstimateKindLabel(size.runtimeEstimateKind)}`
+    : "";
+  return [summary.join(", "), breakdown, runtime].filter(Boolean).join(" · ");
+}
+
+function archiveSizePart(label: string, bytes: number | undefined): string {
+  return bytes === undefined ? "" : `${label} ${formatBytes(bytes)}`;
+}
+
+function runtimeEstimateKindLabel(kind: string | undefined): string {
+  return kind === "dense-index-file" ? "dense index" : "estimate";
 }
 
 function documentId(document: DocumentationRecord): string {

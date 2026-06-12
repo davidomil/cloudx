@@ -95,6 +95,35 @@ describe("documentation skill helper", () => {
     expect(JSON.parse(requestBody)).toEqual({ path: source });
   });
 
+  it("prints archive size totals from raw indexer stats", async () => {
+    const workspace = await tempRoot();
+    let requestUrl = "";
+    const archiveSize = {
+      logicalBytes: 4096,
+      allocatedBytes: 8192,
+      fileCount: 4,
+      databaseBytes: 1024,
+      snapshotBytes: 1536,
+      artifactBytes: 512,
+      indexBytes: 1024,
+      runtimeEstimateBytes: 1024,
+      runtimeEstimateKind: "dense-index-file"
+    };
+    const documentationUrl = await startServer((request, response) => {
+      requestUrl = request.url ?? "";
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ activeDocumentCount: 2, activeChunkCount: 9, archiveSize }));
+    });
+
+    const result = await runHelper(["stats"], {
+      cwd: workspace,
+      env: { CLOUDX_DOCUMENTATION_URL: documentationUrl }
+    });
+
+    expect(requestUrl).toBe("/stats");
+    expect(JSON.parse(result.stdout)).toEqual({ activeDocumentCount: 2, activeChunkCount: 9, archiveSize });
+  });
+
   async function runHelper(args: string[], options: { cwd: string; env: Record<string, string> }): Promise<{ stdout: string; stderr: string }> {
     const script = await writeHelperScript();
     const { stdout, stderr } = await execFileAsync(process.execPath, [script, ...args], {

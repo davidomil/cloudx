@@ -165,6 +165,22 @@ class DocumentArtifactWindow:
     total: int
 
 
+@dataclass(frozen=True)
+class ArchiveFileSize:
+    relative_path: str
+    logical_bytes: int
+    allocated_bytes: int | None
+    category: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "path": self.relative_path,
+            "bytes": self.logical_bytes,
+            "allocatedBytes": self.allocated_bytes,
+            "category": self.category,
+        }
+
+
 class DocumentationArchive:
     def __init__(self, root: Path | str):
         self.root = Path(root).resolve()
@@ -196,6 +212,7 @@ class DocumentationArchive:
             active_document_count = db.execute("SELECT COUNT(*) FROM documents WHERE state = ?", (ACTIVE_STATE,)).fetchone()[0]
             chunk_count = db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
             active_chunk_count = db.execute("SELECT COUNT(*) FROM chunks WHERE state = ?", (ACTIVE_STATE,)).fetchone()[0]
+        manifest = self.portable_manifest()
         return {
             "documentCount": document_count,
             "activeDocumentCount": active_document_count,
@@ -205,20 +222,22 @@ class DocumentationArchive:
             "databasePath": str(self.db_path),
             "indexPath": str(self.index_path),
             "manifestPath": str(self.manifest_path),
-            "portableFiles": self.portable_manifest()["files"],
+            "portableFiles": manifest["files"],
+            "archiveSize": manifest["archiveSize"],
         }
 
     def portable_manifest(self) -> dict:
-        files = []
+        files: list[ArchiveFileSize] = []
         for path in sorted(self.root.rglob("*")):
             if path.is_file():
-                files.append(
-                    {
-                        "path": path.relative_to(self.root).as_posix(),
-                        "bytes": path.stat().st_size,
-                        "sha256": sha256_file(path),
-                    }
-                )
+                files.append(archive_file_size(self.root, path))
+        file_entries = [
+            {
+                **file.as_dict(),
+                "sha256": sha256_file(self.root / file.relative_path),
+            }
+            for file in files
+        ]
         return {
             "archiveRoot": str(self.root),
             "schemaVersion": ARCHIVE_SCHEMA_VERSION,
@@ -227,7 +246,8 @@ class DocumentationArchive:
             "turbovecVersion": TURBOVEC_VERSION,
             "turbovecIndexFormat": TURBOVEC_INDEX_FORMAT,
             "denseOnlyMinScore": DENSE_ONLY_MIN_SCORE,
-            "files": files,
+            "archiveSize": self._archive_size(files),
+            "files": file_entries,
         }
 
     def list_documents(self, states: list[str] | None = None) -> list[dict]:
@@ -973,6 +993,13 @@ class DocumentationArchive:
         db.execute("PRAGMA foreign_keys = ON")
         return db
 
+    def _archive_size(self, files: list[ArchiveFileSize]) -> dict[str, Any]:
+        dense_index_path = self.index_path.relative_to(self.root).as_posix()
+        totals = archive_size_totals(files, dense_index_path)
+        with self._connect() as db:
+            totals["databaseBytes"] = sqlite_database_bytes(db)
+        return totals
+
     def _init_db(self) -> None:
         with self._connect() as db:
             db.executescript(
@@ -1050,6 +1077,77 @@ class DocumentationArchive:
 
 class ArchiveError(ValueError):
     pass
+
+
+def archive_file_size(root: Path, path: Path) -> ArchiveFileSize:
+    stat_result = path.stat()
+    relative_path = path.relative_to(root).as_posix()
+    return ArchiveFileSize(
+        relative_path=relative_path,
+        logical_bytes=stat_result.st_size,
+        allocated_bytes=allocated_file_bytes(stat_result),
+        category=archive_file_category(relative_path),
+    )
+
+
+def allocated_file_bytes(stat_result: os.stat_result) -> int | None:
+    blocks = getattr(stat_result, "st_blocks", None)
+    if isinstance(blocks, int) and blocks >= 0:
+        return blocks * 512
+    return None
+
+
+def archive_file_category(relative_path: str) -> str:
+    if relative_path == "catalog.sqlite" or relative_path.startswith("catalog.sqlite-"):
+        return "database"
+    if relative_path.startswith("indexes/"):
+        return "index"
+    if relative_path.startswith("snapshots/"):
+        return "artifact" if "/extracted/" in relative_path else "snapshot"
+    return "other"
+
+
+def archive_size_totals(files: list[ArchiveFileSize], dense_index_path: str) -> dict[str, Any]:
+    category_bytes = {
+        "database": 0,
+        "snapshot": 0,
+        "artifact": 0,
+        "index": 0,
+        "other": 0,
+    }
+    logical_bytes = 0
+    allocated_bytes = 0
+    allocated_available = True
+    dense_index_bytes = 0
+    for file in files:
+        logical_bytes += file.logical_bytes
+        category_bytes[file.category] = category_bytes.get(file.category, 0) + file.logical_bytes
+        if file.allocated_bytes is None:
+            allocated_available = False
+        else:
+            allocated_bytes += file.allocated_bytes
+        if file.relative_path == dense_index_path:
+            dense_index_bytes = file.logical_bytes
+    return {
+        "fileCount": len(files),
+        "logicalBytes": logical_bytes,
+        "allocatedBytes": allocated_bytes if allocated_available else None,
+        "allocatedBytesAvailable": allocated_available,
+        "databaseBytes": category_bytes["database"],
+        "snapshotBytes": category_bytes["snapshot"],
+        "artifactBytes": category_bytes["artifact"],
+        "indexBytes": category_bytes["index"],
+        "otherBytes": category_bytes["other"],
+        "denseIndexBytes": dense_index_bytes,
+        "runtimeEstimateBytes": dense_index_bytes,
+        "runtimeEstimateKind": "dense-index-file",
+    }
+
+
+def sqlite_database_bytes(db: sqlite3.Connection) -> int:
+    page_count = int(db.execute("PRAGMA page_count").fetchone()[0])
+    page_size = int(db.execute("PRAGMA page_size").fetchone()[0])
+    return page_count * page_size
 
 
 def chunk_spans(spans: list[ExtractedSpan], max_chars: int = 1200) -> list[tuple[str, str]]:

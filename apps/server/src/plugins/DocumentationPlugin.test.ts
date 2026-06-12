@@ -248,6 +248,7 @@ describe("DocumentationPlugin", () => {
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-enrich-visuals")?.instructions).toContain("one concise visual span per meaningful frame");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-enrich-visuals")?.instructions).not.toContain("curl -sS");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-archive-control")?.instructions).toContain("node \"$DOC\" manifest");
+    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-archive-control")?.instructions).toContain("archiveSize totals");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-archive-control")?.files).toContainEqual(expect.objectContaining({
       path: "scripts/cloudx-doc.mjs",
       content: expect.stringContaining("rebuild")

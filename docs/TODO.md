@@ -14,7 +14,7 @@
   - Implementation target: make `apps/server/src/plugins/documentationSkillHelpers.ts` prefer the Cloudx server hook for path ingest, pass an explicit cwd/base path when available, and fail clearly for relative paths when only the raw indexer URL is available.
   - Tests: helper command construction, server hook path resolution, direct-indexer relative path rejection, and an integration-style ingest-path test from a non-service cwd.
 
-- [ ] Show documentation archive size in real disk and runtime terms
+- [x] Show documentation archive size in real disk and runtime terms
   - Current state: `/stats` already returns `portableFiles` from `portable_manifest()`, and each file has logical byte size plus SHA-256. The UI can format bytes, but there is no summarized size label.
   - Implementation target: add archive totals to `DocumentationArchive.stats()` and/or `/portable-manifest`: logical bytes, allocated disk bytes, file count, database bytes, snapshot/artifact bytes, index bytes, and a clearly named memory/runtime estimate such as dense index bytes plus optional process RSS when available.
   - UI/skill target: show the label in `apps/web/src/ui/DocumentationPanel.tsx` and include totals in `node "$DOC" stats` / `manifest` output from `documentationSkillHelpers.ts`.

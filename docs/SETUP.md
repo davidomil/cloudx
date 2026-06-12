@@ -281,7 +281,8 @@ In Cloudx, create a Documentation tab. The panel can:
   artifacts in the source viewer.
 - Mark sources stale, revoked, superseded, or quarantined.
 - Remove a source from active search by marking it deleted.
-- Show the portable archive manifest and rebuild the Turbovec index.
+- Show archive logical/disk size totals, the dense-index runtime estimate, the
+  portable archive manifest, and rebuild the Turbovec index.
 
 Documentation skills are synced automatically as CloudX system skills when the
 server starts. They use `CLOUDX_DOCUMENTATION_URL`, and Cloudx exports that URL

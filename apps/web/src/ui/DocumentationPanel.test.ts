@@ -140,6 +140,48 @@ describe("DocumentationPanel", () => {
     await unmount(root);
   });
 
+  it("renders archive storage and runtime size totals", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string) => {
+      if (hookId === "documentation.stats") {
+        return hookResult<T>({
+          activeDocumentCount: 2,
+          activeChunkCount: 19,
+          archiveSize: {
+            logicalBytes: 5 * 1024 * 1024,
+            allocatedBytes: 6 * 1024 * 1024,
+            allocatedBytesAvailable: true,
+            fileCount: 12,
+            databaseBytes: 1024 * 1024,
+            snapshotBytes: 2 * 1024 * 1024,
+            artifactBytes: 1536,
+            indexBytes: 512 * 1024,
+            runtimeEstimateBytes: 512 * 1024,
+            runtimeEstimateKind: "dense-index-file"
+          }
+        });
+      }
+      if (hookId === "documentation.documents.list") {
+        return hookResult<T>({ documents: [] });
+      }
+      return {} as T;
+    };
+
+    await act(async () => {
+      root.render(createElement(DocumentationPanel, { callHook }));
+    });
+    await flush();
+
+    expect(container.textContent).toContain("2 active documents, 19 active chunks");
+    expect(container.textContent).toContain("Archive 5.0 MiB logical, 6.0 MiB on disk, 12 files");
+    expect(container.textContent).toContain("database 1.0 MiB, snapshots 2.0 MiB, artifacts 1.5 KiB, index 512.0 KiB");
+    expect(container.textContent).toContain("runtime estimate 512.0 KiB dense index");
+
+    await unmount(root);
+  });
+
   it("uses AI answer mode by default, lists every document, and opens full source chunks", async () => {
     const container = document.createElement("div");
     document.body.append(container);

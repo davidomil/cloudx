@@ -126,9 +126,12 @@ The archive root contains:
 | `indexes/local-hash-64/manifest.json` | Rebuild metadata for schema version, embedding profile, Turbovec version, index format, dense threshold, and active chunk count. |
 
 The portable manifest endpoint walks the archive root and returns each
-file path, byte size, and SHA-256. The guide-level rule is simple: stop
-writes and back up the whole archive directory, not just the SQLite
-database or the vector file.
+file path, logical byte size, allocated byte size when the platform
+reports it, category, and SHA-256. It also returns `archiveSize` totals
+for logical bytes, allocated disk bytes, database bytes, source snapshot
+bytes, extracted artifact bytes, index bytes, and the dense-index runtime
+estimate. The guide-level rule is simple: stop writes and back up the
+whole archive directory, not just the SQLite database or the vector file.
 
 # Ingestion Flow
 
@@ -426,9 +429,9 @@ audit and explicit non-active searches.
 - `documentation.health`: `GET /health`. Returns health, archive root,
   schema, embedding profile, index path, and portability flag.
 - `documentation.stats`: `GET /stats`. Returns document and chunk counts
-  plus portable paths.
+  plus portable paths and `archiveSize` storage/runtime totals.
 - `documentation.portableManifest`: `GET /portable-manifest`. Returns
-  the complete archive file manifest.
+  the complete archive file manifest plus the same `archiveSize` totals.
 - `documentation.documents.list`: `GET /documents`. Lists documents and
   defaults to active state.
 - `documentation.documents.get`: `GET /documents/{id}`. Fetches one
