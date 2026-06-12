@@ -129,6 +129,47 @@ describe("RulesSkillsPanel helpers", () => {
     await unmount(root);
   });
 
+  it("renders one rule editor when refreshed rules contain duplicate ids", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const store = rulesSkillsStore();
+    const duplicateStore: RulesSkillsStore = {
+      ...store,
+      rules: [
+        ...store.rules,
+        { id: "keep-focused", description: "Duplicate focused rule.", text: "Duplicate focused rule." }
+      ]
+    };
+    const props = {
+      onSaveTemplate: async () => undefined,
+      onDeleteTemplate: async () => undefined,
+      onSetDefault: async () => undefined,
+      onSaveRule: async () => undefined,
+      onDeleteRule: async () => undefined
+    };
+
+    await act(async () => {
+      root.render(createElement(RulesSkillsPanel, { ...props, store }));
+    });
+    const editButton = container.querySelector('[aria-label="Edit rule keep-focused"]') as HTMLButtonElement;
+    await act(async () => {
+      editButton.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(container.querySelectorAll(".rule-option-editing")).toHaveLength(1);
+    expect(container.querySelectorAll('[aria-label="Rule text for keep-focused"]')).toHaveLength(1);
+
+    await act(async () => {
+      root.render(createElement(RulesSkillsPanel, { ...props, store: duplicateStore }));
+    });
+
+    expect(container.querySelectorAll(".rule-option-editing")).toHaveLength(1);
+    expect(container.querySelectorAll('[aria-label="Rule text for keep-focused"]')).toHaveLength(1);
+    expect(container.querySelectorAll('[aria-label="Edit rule keep-focused"]')).toHaveLength(0);
+
+    await unmount(root);
+  });
+
   it("separates template saving from runtime injection and shows dirty state", async () => {
     const container = document.createElement("div");
     document.body.append(container);

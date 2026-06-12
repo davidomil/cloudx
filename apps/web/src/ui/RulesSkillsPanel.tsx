@@ -287,6 +287,8 @@ export function RulesSkillsPanel({
     return <div className="rules-skills-panel empty-pane">Templates are not available.</div>;
   }
 
+  const visibleRules = uniqueById(store.rules);
+
   return (
     <div className="rules-skills-panel">
       <PluginPanelDock items={[{
@@ -323,7 +325,7 @@ export function RulesSkillsPanel({
 
         <section className="rules-skills-picker">
           <h3>Rules</h3>
-          {store.rules.map((rule) =>
+          {visibleRules.map((rule) =>
             editingRuleId === rule.id ? (
               <div key={rule.id} className="rule-option rule-option-editing" title={rule.description}>
                 <input type="checkbox" checked={draft.ruleIds.includes(rule.id)} onChange={(event) => toggleRule(rule.id, event.target.checked)} aria-label={`Enable rule ${rule.id}`} />
@@ -497,6 +499,19 @@ function slugFromText(text: string): string | undefined {
 
 function stringArraysEqual(first: string[], second: string[]): boolean {
   return first.length === second.length && first.every((value, index) => value === second[index]);
+}
+
+function uniqueById<T extends { id: string }>(items: T[]): T[] {
+  const seen = new Set<string>();
+  const unique: T[] = [];
+  for (const item of items) {
+    if (seen.has(item.id)) {
+      continue;
+    }
+    seen.add(item.id);
+    unique.push(item);
+  }
+  return unique;
 }
 
 function confirmDiscardUnsavedChanges(templateName: string | undefined): boolean {
