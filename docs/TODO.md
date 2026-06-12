@@ -65,7 +65,7 @@
   - Migration target: document and/or implement a command to move the archive root, update `CLOUDX_DOCUMENTATION_DATA_DIR`, verify the manifest, and rebuild the dense index after the move.
   - Tests: archive with relative snapshot paths migrates to a new root, absolute/outside snapshot path is rejected or reported, and migrated documents remain searchable.
 
-- [ ] Add verbose mode for install/update/uninstall debugging
+- [x] Add verbose mode for install/update/uninstall debugging
   - Current state: `install.sh` and `scripts/install-cloudx.mjs` print phases and commands, but `parseArgs()` has no `--verbose`/`--debug` option and captured probes can hide useful stdout/stderr until a failure is hard to diagnose.
   - Implementation target: add `--verbose` to both the shell bootstrap and Node wizard, pass it through the environment, and make `InstallerRunner` include cwd, selected safe environment values, command stdout/stderr for captured commands, service unit paths, and recent health-check/journal context.
   - Shell target: optionally enable xtrace-style command tracing for `install.sh` in verbose mode, while redacting secrets and avoiding noisy output by default.

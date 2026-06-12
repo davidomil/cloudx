@@ -86,6 +86,12 @@ node scripts/install-cloudx.mjs --dry-run --yes
 node scripts/install-cloudx.mjs --dry-run --answers ./answers.json
 ```
 
+Add `--verbose` to install, update, or uninstall commands when debugging. In
+verbose mode, `install.sh` enables Bash command tracing and the Node wizard
+prints command working directories, allowlisted installer environment values,
+captured stdout/stderr from probes, service unit write paths, and health-check
+failure context.
+
 Cloudx is private by default and binds to `127.0.0.1`. To expose it on a trusted
 LAN or tailnet, opt in through the installer prompt or pass:
 

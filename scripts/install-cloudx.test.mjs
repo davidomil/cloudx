@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 
 import { describe, expect, it } from "vitest";
 
@@ -28,7 +29,9 @@ import {
   needsQuartoInstall,
   networkBindWarning,
   normalizeWhisperCppBuild,
+  helpText,
   parseGitVersion,
+  parseArgs,
   parseNodeMajor,
   parseOsRelease,
   renderAsrService,
@@ -49,6 +52,15 @@ import {
 const TEST_ENV = { PATH: "/usr/bin" };
 
 describe("install-cloudx helpers", () => {
+  it("parses and advertises verbose installer diagnostics", () => {
+    expect(parseArgs(["--dry-run", "--update", "--verbose"])).toMatchObject({
+      dryRun: true,
+      update: true,
+      verbose: true
+    });
+    expect(helpText()).toContain("--verbose");
+  });
+
   it("parses Ubuntu os-release files", () => {
     expect(parseOsRelease('ID=ubuntu\nVERSION_ID="24.04"\nPRETTY_NAME="Ubuntu 24.04.4 LTS"\n')).toMatchObject({
       ID: "ubuntu",
@@ -281,6 +293,65 @@ describe("install-cloudx helpers", () => {
       `/home/me/.npm-global/bin${path.delimiter}/usr/bin${path.delimiter}/opt/homebrew/bin`
     );
     expect(toolPathFor("/usr/bin/codex", "/usr")).toBe("/usr/bin");
+  });
+
+  it("prints verbose cwd, safe env, stdout, and stderr for captured commands", () => {
+    const logs = [];
+    const runner = new InstallerRunner({ cwd: "/tmp", log: (line) => logs.push(line), verbose: true });
+
+    const output = runner.capture(process.execPath, ["-e", "console.log('probe stdout'); console.error('probe stderr')"], {
+      env: {
+        CLOUDX_HOST: "127.0.0.1",
+        SECRET_TOKEN: "do-not-print"
+      }
+    });
+
+    expect(output).toBe("probe stdout");
+    const logText = logs.join("\n");
+    expect(logText).toContain("[verbose] cwd: /tmp");
+    expect(logText).toContain("[verbose] env: CLOUDX_HOST=127.0.0.1");
+    expect(logText).not.toContain("SECRET_TOKEN");
+    expect(logText).toContain("[verbose] stdout:\n  probe stdout");
+    expect(logText).toContain("[verbose] stderr:\n  probe stderr");
+  });
+
+  it("prints captured stdout and stderr before throwing in verbose mode", () => {
+    const logs = [];
+    const runner = new InstallerRunner({ cwd: "/tmp", log: (line) => logs.push(line), verbose: true });
+
+    expect(() => runner.capture(process.execPath, ["-e", "console.log('before failure'); console.error('failure detail'); process.exit(7)"])).toThrow(/exit code 7/);
+    const logText = logs.join("\n");
+    expect(logText).toContain("[verbose] stdout:\n  before failure");
+    expect(logText).toContain("[verbose] stderr:\n  failure detail");
+  });
+
+  it("keeps captured output quiet by default", () => {
+    const logs = [];
+    const runner = new InstallerRunner({ cwd: "/tmp", log: (line) => logs.push(line) });
+
+    expect(runner.capture(process.execPath, ["-e", "console.log('quiet stdout')"])).toBe("quiet stdout");
+    expect(logs.join("\n")).not.toContain("[verbose]");
+  });
+
+  it("routes status probes through verbose runner diagnostics", () => {
+    const logs = [];
+    const runner = new InstallerRunner({ cwd: "/tmp", log: (line) => logs.push(line), verbose: true });
+
+    expect(runner.statusOk(process.execPath, ["-e", "console.error('status stderr'); process.exit(9)"])).toBe(false);
+    const logText = logs.join("\n");
+    expect(logText).toContain("$ ");
+    expect(logText).toContain("[verbose] cwd: /tmp");
+    expect(logText).toContain("[verbose] stderr:\n  status stderr");
+  });
+
+  it("accepts verbose in the shell bootstrap and forwards it to the Node wizard", () => {
+    const shellScript = fs.readFileSync(path.join(process.cwd(), "install.sh"), "utf8");
+
+    execFileSync("bash", ["-n", "install.sh"], { cwd: process.cwd(), stdio: "pipe" });
+    expect(shellScript).toContain('elif [[ "$arg" == "--verbose" ]]; then');
+    expect(shellScript).toContain("export CLOUDX_INSTALL_VERBOSE=1");
+    expect(shellScript).toContain("set -x");
+    expect(shellScript).toContain('exec node scripts/install-cloudx.mjs "$@"');
   });
 });
 

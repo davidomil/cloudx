@@ -113,6 +113,10 @@ Preview the installer without changing the system:
 ./install.sh --dry-run --yes
 ```
 
+Add `--verbose` to install, update, or uninstall commands when debugging. It
+prints command working directories, safe installer environment values, captured
+stdout/stderr from probes, and service health-check context.
+
 Update an existing install after pulling the latest checkout:
 
 ```bash

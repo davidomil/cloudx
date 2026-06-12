@@ -7,6 +7,7 @@ cd "$ROOT_DIR"
 DRY_RUN=0
 UNINSTALL=0
 UPDATE=0
+VERBOSE=0
 QUARTO_VERSION="1.9.38"
 QUARTO_DEB_PATH="/tmp/quarto-${QUARTO_VERSION}-linux-amd64.deb"
 QUARTO_DEB_URL="https://github.com/quarto-dev/quarto-cli/releases/download/v${QUARTO_VERSION}/quarto-${QUARTO_VERSION}-linux-amd64.deb"
@@ -17,12 +18,20 @@ for arg in "$@"; do
     UNINSTALL=1
   elif [[ "$arg" == "--update" ]]; then
     UPDATE=1
+  elif [[ "$arg" == "--verbose" ]]; then
+    VERBOSE=1
   fi
 done
 
 if [[ "$UNINSTALL" -eq 1 && "$UPDATE" -eq 1 ]]; then
   echo "--update cannot be combined with --uninstall." >&2
   exit 1
+fi
+
+if [[ "$VERBOSE" -eq 1 ]]; then
+  export CLOUDX_INSTALL_VERBOSE=1
+  export PS4='+ install.sh:${LINENO}: '
+  set -x
 fi
 
 if [[ ! -r /etc/os-release ]]; then

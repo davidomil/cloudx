@@ -22,6 +22,21 @@ export const SMALL_GPU_MEMORY_MB = 6 * 1024;
 export const WHISPER_CPP_REPO_URL = "https://github.com/ggml-org/whisper.cpp.git";
 export const WHISPER_CPP_MODEL = "large-v3-turbo";
 export const WHISPER_CPP_VAD_MODEL = "silero-v6.2.0";
+export const SAFE_VERBOSE_ENV_KEYS = [
+  "CLOUDX_INSTALL_BOOTSTRAPPED",
+  "CLOUDX_INSTALL_ALREADY_PULLED",
+  "CLOUDX_HOST",
+  "CLOUDX_PORT",
+  "CLOUDX_CERT_HOSTS",
+  "CLOUDX_ASR_DEVICE",
+  "CLOUDX_ASR_COMPUTE_TYPE",
+  "CLOUDX_DOCUMENTATION_URL",
+  "CLOUDX_DOCUMENTATION_HOST",
+  "CLOUDX_DOCUMENTATION_PORT",
+  "CLOUDX_DOCUMENTATION_DATA_DIR",
+  "CLOUDX_DOCUMENTATION_ASR_BACKEND",
+  "ONEAPI_DEVICE_SELECTOR"
+];
 export const UBUNTU_APT_PACKAGES = [
   "ca-certificates",
   "curl",
@@ -60,7 +75,8 @@ export function parseArgs(argv = process.argv.slice(2)) {
     lan: false,
     noStart: false,
     uninstall: false,
-    update: false
+    update: false,
+    verbose: false
   };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -81,6 +97,8 @@ export function parseArgs(argv = process.argv.slice(2)) {
       options.uninstall = true;
     } else if (arg === "--update") {
       options.update = true;
+    } else if (arg === "--verbose") {
+      options.verbose = true;
     } else if (arg === "--help" || arg === "-h") {
       options.help = true;
     } else {
@@ -113,6 +131,7 @@ export function helpText() {
     "  --yes              Use defaults for prompts not supplied by --answers.",
     "  --lan              Bind Cloudx to 0.0.0.0 for trusted LAN/tailnet access.",
     "  --no-start         Install services without starting them.",
+    "  --verbose          Print debugging details for installer commands and captured output.",
     "  -h, --help         Show this help."
   ].join("\n");
 }
@@ -528,10 +547,11 @@ export function cloudxAccessUrls(port, networkInterfaces = os.networkInterfaces(
 }
 
 export class InstallerRunner {
-  constructor({ dryRun = false, cwd = repoRoot, log = console.log } = {}) {
+  constructor({ dryRun = false, cwd = repoRoot, log = console.log, verbose = false } = {}) {
     this.dryRun = dryRun;
     this.cwd = cwd;
     this.log = log;
+    this.verbose = verbose;
     this.commands = [];
     this.writes = [];
   }
@@ -540,14 +560,26 @@ export class InstallerRunner {
     const display = formatCommand(command, args, options);
     this.commands.push({ command, args, cwd: options.cwd ?? this.cwd });
     this.log(`$ ${display}`);
+    this.logVerboseCommand(options);
     if (this.dryRun) {
+      return "";
+    }
+    if (options.capture) {
+      const result = this.spawnCaptured(command, args, options);
+      this.logVerboseProcessResult(result);
+      if (!processSucceeded(result)) {
+        if (options.allowFailure) {
+          this.log(`command failed but continuing: ${display}`);
+          return "";
+        }
+        throw commandFailure(command, args, result);
+      }
       return "";
     }
     try {
       execFileSync(command, args, {
         cwd: options.cwd ?? this.cwd,
-        stdio: options.capture ? ["ignore", "pipe", "pipe"] : "inherit",
-        encoding: options.capture ? "utf8" : undefined,
+        stdio: "inherit",
         env: options.env ? { ...process.env, ...options.env } : process.env
       });
     } catch (error) {
@@ -564,19 +596,41 @@ export class InstallerRunner {
     if (this.dryRun) {
       this.commands.push({ command, args, cwd: options.cwd ?? this.cwd, capture: true });
       this.log(`$ ${[command, ...args].join(" ")}`);
+      this.logVerboseCommand(options);
       return "";
     }
-    return execFileSync(command, args, {
-      cwd: options.cwd ?? this.cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-      encoding: "utf8",
-      env: options.env ? { ...process.env, ...options.env } : process.env
-    }).trim();
+    if (this.verbose) {
+      this.log(`$ ${formatCommand(command, args, options)}`);
+      this.logVerboseCommand(options);
+    }
+    const result = this.spawnCaptured(command, args, options);
+    this.logVerboseProcessResult(result);
+    if (!processSucceeded(result)) {
+      throw commandFailure(command, args, result);
+    }
+    return result.stdout.trim();
+  }
+
+  statusOk(command, args = [], options = {}) {
+    this.commands.push({ command, args, statusCheck: true, cwd: options.cwd ?? this.cwd });
+    if (this.dryRun || this.verbose) {
+      this.log(`$ ${[command, ...args].join(" ")}`);
+      this.logVerboseCommand(options);
+    }
+    if (this.dryRun) {
+      return true;
+    }
+    const result = this.verbose
+      ? this.spawnCaptured(command, args, options)
+      : spawnSync(command, args, { cwd: options.cwd ?? this.cwd, stdio: "ignore", env: options.env ? { ...process.env, ...options.env } : process.env });
+    this.logVerboseProcessResult(result);
+    return processSucceeded(result);
   }
 
   writeFile(filePath, contents) {
     this.writes.push({ path: filePath, contents });
     this.log(`write ${filePath}`);
+    this.logVerbose(`write bytes: ${Buffer.byteLength(contents, "utf8")}`);
     if (this.dryRun) {
       return;
     }
@@ -599,6 +653,38 @@ export class InstallerRunner {
     }
     fs.rmSync(targetPath, { recursive: true, force: true, ...options });
   }
+
+  spawnCaptured(command, args, options = {}) {
+    return spawnSync(command, args, {
+      cwd: options.cwd ?? this.cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf8",
+      env: options.env ? { ...process.env, ...options.env } : process.env
+    });
+  }
+
+  logVerboseCommand(options = {}) {
+    this.logVerbose(`cwd: ${options.cwd ?? this.cwd}`);
+    const safeEnv = safeVerboseEnv(options.env ? { ...process.env, ...options.env } : process.env);
+    if (Object.keys(safeEnv).length > 0) {
+      this.logVerbose(`env: ${Object.entries(safeEnv).map(([key, value]) => `${key}=${value}`).join(" ")}`);
+    }
+  }
+
+  logVerboseProcessResult(result) {
+    if (!this.verbose) {
+      return;
+    }
+    this.logVerbose(`exit: ${result.error ? result.error.message : result.signal ? `signal ${result.signal}` : result.status ?? 0}`);
+    logVerboseBlock(this.log, "stdout", result.stdout);
+    logVerboseBlock(this.log, "stderr", result.stderr);
+  }
+
+  logVerbose(message) {
+    if (this.verbose) {
+      this.log(`[verbose] ${message}`);
+    }
+  }
 }
 
 export async function runInstaller(options = {}) {
@@ -608,7 +694,11 @@ export async function runInstaller(options = {}) {
   const answers = options.answers ?? {};
   const yes = options.yes ?? false;
   const dryRun = options.dryRun ?? false;
-  const runner = options.runner ?? new InstallerRunner({ dryRun, cwd: root });
+  const verbose = Boolean(options.verbose) || env.CLOUDX_INSTALL_VERBOSE === "1";
+  const runner = options.runner ?? new InstallerRunner({ dryRun, cwd: root, verbose });
+  if (verbose) {
+    runner.verbose = true;
+  }
   const prompt = createPrompter({ answers, yes, dryRun, input: options.input, output: options.output });
   const osRelease = options.osRelease ?? parseOsRelease(readText("/etc/os-release", "ID=unknown\n"));
   assertSupportedPlatform(osRelease);
@@ -1295,30 +1385,40 @@ function commandMap(runner) {
       if (runner.dryRun) {
         return command === "codex" || command === "node" || command === "npm" || command === "python3" || command === "curl" || command === "git";
       }
-      return spawnSync("sh", ["-lc", `command -v ${shellQuote(command)}`], { stdio: "ignore" }).status === 0;
+      if (runner.verbose) {
+        runner.log(`$ command -v ${command}`);
+        runner.logVerboseCommand();
+      }
+      const result = spawnSync("sh", ["-lc", `command -v ${shellQuote(command)}`], {
+        stdio: runner.verbose ? ["ignore", "pipe", "pipe"] : "ignore",
+        encoding: runner.verbose ? "utf8" : undefined
+      });
+      runner.logVerboseProcessResult(result);
+      return processSucceeded(result);
     },
     which(command) {
       if (runner.dryRun) {
         return `/usr/bin/${command}`;
       }
+      if (runner.verbose) {
+        runner.log(`$ command -v ${command}`);
+        runner.logVerboseCommand();
+      }
       const result = spawnSync("sh", ["-lc", `command -v ${shellQuote(command)}`], { encoding: "utf8" });
+      runner.logVerboseProcessResult(result);
       if (result.status !== 0) {
         throw new Error(`Missing required command: ${command}`);
       }
       return result.stdout.trim();
     },
     statusOk(command, args) {
-      if (runner.dryRun) {
-        runner.commands.push({ command, args, statusCheck: true, cwd: runner.cwd });
-        console.log(`$ ${[command, ...args].join(" ")}`);
-        return true;
-      }
-      return spawnSync(command, args, { cwd: runner.cwd, stdio: "ignore" }).status === 0;
+      return runner.statusOk(command, args);
     },
     capture(command, args, options) {
       if (runner.dryRun && command === "git" && args?.[0] === "--version") {
         runner.commands.push({ command, args, cwd: runner.cwd, capture: true });
-        console.log("$ git --version");
+        runner.log("$ git --version");
+        runner.logVerboseCommand(options);
         return `git version ${MIN_WORKTREE_GIT_VERSION}`;
       }
       return runner.capture(command, args, options);
@@ -1452,10 +1552,40 @@ function shellQuote(value) {
 function formatCommand(command, args, options = {}) {
   const envPrefix = options.env
     ? Object.entries(options.env)
+        .filter(([key]) => SAFE_VERBOSE_ENV_KEYS.includes(key))
         .map(([key, value]) => `${key}=${value}`)
         .join(" ")
     : "";
   return [envPrefix, command, ...args].filter(Boolean).join(" ");
+}
+
+function safeVerboseEnv(env) {
+  return Object.fromEntries(SAFE_VERBOSE_ENV_KEYS.filter((key) => env[key]).map((key) => [key, env[key]]));
+}
+
+function processSucceeded(result) {
+  return !result.error && result.status === 0 && !result.signal;
+}
+
+function commandFailure(command, args, result) {
+  const reason = result.error?.message ?? (result.signal ? `signal ${result.signal}` : `exit code ${result.status ?? "unknown"}`);
+  const error = new Error(`Command failed (${reason}): ${[command, ...args].join(" ")}`);
+  error.status = result.status;
+  error.signal = result.signal;
+  error.stdout = result.stdout;
+  error.stderr = result.stderr;
+  return error;
+}
+
+function logVerboseBlock(log, label, value) {
+  const text = String(value ?? "").trimEnd();
+  if (!text) {
+    return;
+  }
+  log(`[verbose] ${label}:`);
+  for (const line of text.split(/\r?\n/)) {
+    log(`  ${line}`);
+  }
 }
 
 async function main() {
@@ -1470,7 +1600,8 @@ async function main() {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   main().catch((error) => {
-    console.error(error instanceof Error ? error.message : error);
+    const verbose = process.env.CLOUDX_INSTALL_VERBOSE === "1" || process.argv.includes("--verbose");
+    console.error(verbose && error instanceof Error && error.stack ? error.stack : error instanceof Error ? error.message : error);
     process.exitCode = 1;
   });
 }
