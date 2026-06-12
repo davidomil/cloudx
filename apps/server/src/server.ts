@@ -46,6 +46,7 @@ import { AudioAiPlugin } from "./plugins/AudioAiPlugin.js";
 import { AutomationPlugin } from "./plugins/AutomationPlugin.js";
 import { NotificationsPlugin } from "./plugins/NotificationsPlugin.js";
 import { PluginDataStore } from "./plugins/PluginDataStore.js";
+import { InstalledPluginInstallError, InstalledPluginService } from "./plugins/InstalledPluginService.js";
 import { JiraPlugin } from "./plugins/JiraPlugin.js";
 import { RulesSkillsPlugin } from "./plugins/RulesSkillsPlugin.js";
 import { DocumentationPlugin } from "./plugins/DocumentationPlugin.js";
@@ -87,6 +88,7 @@ export interface AppServices {
   triggers?: TriggerRegistry;
   automation?: AutomationService;
   pluginData?: PluginDataStore;
+  installedPlugins?: InstalledPluginService;
   rulesSkills?: RulesSkillsCatalogService;
   fileTransfer?: FileTransferService;
   notifications?: NotificationsPlugin;
@@ -139,6 +141,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   services.config ??= new ConfigService(config.dataDir, () => services!.plugins.list());
   services.workspace ??= new WorkspaceLayoutStore(config.dataDir, services.pathPolicy);
   services.pluginData ??= new PluginDataStore(config.dataDir);
+  services.installedPlugins ??= new InstalledPluginService(config.dataDir);
   services.rulesSkills ??= new RulesSkillsCatalogService(config.dataDir);
   services.fileTransfer ??= new FileTransferService(services.pathPolicy);
   if (services.documentation) {
@@ -190,6 +193,26 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   }));
 
   app.get("/api/plugins", async () => ({ plugins: services.plugins.list() }));
+
+  app.get("/api/plugins/installed", async () => ({ plugins: services.installedPlugins!.listPublicRecordsSync() }));
+
+  app.post<{ Body: unknown }>("/api/plugins/install", async (request, reply) => {
+    try {
+      const existingPluginIds = new Set(services.plugins.values().map((plugin) => plugin.id));
+      const result = await services.installedPlugins!.installFromGithub(pluginGithubInstallBody(request.body).url, existingPluginIds);
+      services.plugins.register(result.plugin);
+      reply.code(201);
+      return {
+        plugin: result.plugin.descriptor(),
+        installedPlugin: result.record
+      };
+    } catch (error) {
+      if (error instanceof InstalledPluginInstallError) {
+        throwBadRequest(error.message);
+      }
+      throw error;
+    }
+  });
 
   app.get("/api/hooks", async () => ({ hooks: services.hooks!.list() }));
 
@@ -963,6 +986,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   const workspace = new WorkspaceLayoutStore(config.dataDir, pathPolicy);
   const terminalFactory = new NodePtyTerminalProcessFactory();
   const pluginData = new PluginDataStore(config.dataDir);
+  const installedPlugins = new InstalledPluginService(config.dataDir);
   const rulesSkills = new RulesSkillsCatalogService(config.dataDir);
   const documentationUrl = config.documentationUrl ?? DEFAULT_DOCUMENTATION_URL;
   const documentation = new DocumentationClient(documentationUrl, {
@@ -1007,6 +1031,9 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     }
     return automation;
   }));
+  for (const plugin of installedPlugins.pluginsFromCatalog()) {
+    plugins.register(plugin);
+  }
   const configService = new ConfigService(config.dataDir, () => plugins.list());
   jira = new JiraIntegrationService(configService);
   sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir), configService, workspace, rulesSkills);
@@ -1055,7 +1082,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   jiraPolling = new JiraPollingService(jira, pluginData, () => triggers);
   jiraPolling.start();
   automation = createAutomationService(automationRepository, { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config);
-  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, automation, pluginData, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, pluginContributionsReady };
+  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, pluginContributionsReady };
 }
 
 function isStreamingHookRequest(request: FastifyRequest<{ Querystring: { stream?: string } }>): boolean {
@@ -1378,6 +1405,13 @@ function createTabBody(body: unknown): CreateTabRequest {
     initialInput: optionalBodyRecord(payload.initialInput, "initialInput"),
     windowId: optionalBodyString(payload.windowId, "windowId"),
     pluginMetadata: optionalBodyRecord(payload.pluginMetadata, "pluginMetadata") as CreateTabRequest["pluginMetadata"] | undefined
+  };
+}
+
+function pluginGithubInstallBody(body: unknown): { url: string } {
+  const payload = optionalRequestBody(body);
+  return {
+    url: requiredTrimmedBodyString(payload.url, "url")
   };
 }
 

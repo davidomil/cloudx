@@ -74,6 +74,33 @@ names, and dashboard tokens.
 - `docs/SETUP.md`: install, service, HTTPS, and ASR details.
 - `docs/SECURITY_MODEL.md`: threat model, current limits, and deployment guidance.
 
+## GitHub Plugin Metadata Installs
+
+Cloudx can install plugin metadata from a public or credential-helper-backed
+GitHub HTTPS repository:
+
+```bash
+curl -sS -X POST http://127.0.0.1:3001/api/plugins/install \
+  -H 'content-type: application/json' \
+  -d '{"url":"https://github.com/owner/repo"}'
+```
+
+The repository must contain `.cloudx-plugin/plugin.json`:
+
+```json
+{
+  "schemaVersion": 1,
+  "id": "example-plugin",
+  "acronym": "EXP",
+  "displayName": "Example Plugin",
+  "description": "Short plugin description."
+}
+```
+
+Installed GitHub plugins are enabled as non-creatable placeholder descriptors
+after metadata validation. Cloudx does not execute third-party plugin code in
+this install path.
+
 ## Quick Start
 
 On Ubuntu 22.04 or newer, the guided installer is the easiest path:

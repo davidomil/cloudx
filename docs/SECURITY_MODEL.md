@@ -20,6 +20,8 @@ tailnet.
 - Multi-user isolation.
 - Public internet hardening.
 - Sandboxing of arbitrary shell commands.
+- Runtime execution of third-party GitHub plugin code; GitHub plugin installs
+  currently register validated metadata only.
 - Zero-trust authentication by itself.
 - Auditing suitable for untrusted users.
 - Authorization boundaries between different projects under the same allowed

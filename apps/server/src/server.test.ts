@@ -15,6 +15,7 @@ import { TabContextService } from "./context/TabContextService.js";
 import { HookRegistry } from "./hooks/HookRegistry.js";
 import { PluginRegistry } from "./pluginRegistry.js";
 import { LocalWebPlugin } from "./plugins/LocalWebPlugin.js";
+import { InstalledPluginService, type PluginGitClient } from "./plugins/InstalledPluginService.js";
 import { PathPolicy } from "./pathPolicy.js";
 import {
   buildServer,
@@ -877,6 +878,59 @@ describe("buildServer", () => {
       });
       expect(malformedInputHook.statusCode).toBe(400);
       expect(malformedInputHook.json().message).toBe("input must be an object.");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("installs a GitHub plugin manifest and exposes the plugin descriptor", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-plugin-install-route-"));
+    const config = testConfig(root);
+    const fixture = await installedPluginFixture("github-installed", "GHI");
+    const services = buildServices(config);
+    services.installedPlugins = new InstalledPluginService(config.dataDir, { git: fakePluginGit(fixture, "cafebabe") });
+    const app = await buildServer(config, services);
+    try {
+      const installed = await app.inject({
+        method: "POST",
+        url: "/api/plugins/install",
+        payload: { url: "https://github.com/cloudx/github-installed" }
+      });
+
+      expect(installed.statusCode).toBe(201);
+      expect(installed.json().plugin).toMatchObject({
+        id: "github-installed",
+        displayName: "GitHub Installed",
+        panelKind: "placeholder",
+        creatable: false
+      });
+      expect(installed.json().installedPlugin).toMatchObject({
+        id: "github-installed",
+        commit: "cafebabe",
+        source: { cloneUrl: "https://github.com/cloudx/github-installed.git" }
+      });
+
+      const plugins = await app.inject({ method: "GET", url: "/api/plugins" });
+      expect(plugins.json().plugins.map((plugin: { id: string }) => plugin.id)).toContain("github-installed");
+      const listed = await app.inject({ method: "GET", url: "/api/plugins/installed" });
+      expect(listed.json().plugins).toHaveLength(1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("rejects invalid GitHub plugin install requests", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-plugin-install-invalid-route-"));
+    const app = await buildServer(testConfig(root));
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/plugins/install",
+        payload: { url: "https://gitlab.com/cloudx/plugin" }
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().message).toBe("GitHub plugin URL must use https://github.com.");
     } finally {
       await app.close();
     }
@@ -3029,5 +3083,36 @@ function jiraTriggerPayload(): Record<string, unknown> {
     assigneeAccountId: "abc",
     changedFieldIds: ["updated"],
     detectedAt: "2026-06-08T10:00:00.000Z"
+  };
+}
+
+async function installedPluginFixture(id: string, acronym: string): Promise<string> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-plugin-install-fixture-"));
+  await fs.mkdir(path.join(root, ".cloudx-plugin"), { recursive: true });
+  await fs.writeFile(
+    path.join(root, ".cloudx-plugin/plugin.json"),
+    JSON.stringify({
+      schemaVersion: 1,
+      id,
+      acronym,
+      displayName: "GitHub Installed",
+      description: "Installed from a GitHub repository manifest."
+    }, null, 2),
+    "utf8"
+  );
+  return root;
+}
+
+function fakePluginGit(fixture: string, commit = "deadbeef"): PluginGitClient {
+  return {
+    async lsRemote() {
+      return undefined;
+    },
+    async clone(_url, directory) {
+      await fs.cp(fixture, directory, { recursive: true });
+    },
+    async revParseHead() {
+      return commit;
+    }
   };
 }
