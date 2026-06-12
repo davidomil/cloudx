@@ -11,14 +11,18 @@ dependencies = [
   "faster-whisper>=1.1",
   "httpx>=0.28",
   "numpy>=2.0",
+  "odfpy>=1.4",
+  "openpyxl>=3.1",
   "pandas>=2.3",
   "pdfplumber>=0.11.9,<0.12",
   "pillow>=12.0",
+  "pyxlsb>=1.0",
   "pydantic>=2.10",
   "pypdfium2>=5.9,<6",
   "python-multipart>=0.0.9",
   "turbovec==0.7.0",
   "uvicorn[standard]>=0.30",
+  "xlrd>=2.0",
   "youtube-transcript-api>=1.2",
   "yt-dlp>=2026.3.17"
 ]
@@ -29,7 +33,8 @@ cloudx-documentation-indexer = "cloudx_documentation_indexer.main:main"
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
-  "reportlab>=4.5"
+  "reportlab>=4.5",
+  "xlwt>=1.3"
 ]
 
 [build-system]

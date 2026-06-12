@@ -556,7 +556,7 @@ describe("buildServer", () => {
     expect(ruleFile).toContain("use text ingest only when no original source is available");
     expect(searchSkillFile).toContain("CLOUDX_DOCUMENTATION_URL");
     expect(searchSkillFile).toContain("Before answering any factual, research, recipe, recommendation, troubleshooting, summary, or source-grounded question");
-    expect(searchSkillFile).toContain("ingest the original file, PDF, image, URL, YouTube video, or playlist");
+    expect(searchSkillFile).toContain("ingest the original file, PDF, spreadsheet, image, URL, YouTube video, or playlist");
     expect(ingestHelperFile).toContain("ingest-url");
     expect(archiveHelperFile).toContain("manifest");
     expect(jiraSkillFile).toContain("cloudx-jira.mjs");

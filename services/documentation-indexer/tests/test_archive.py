@@ -1156,6 +1156,92 @@ def test_pdf_tables_visuals_and_images_are_extracted_as_portable_artifacts(tmp_p
     assert image_record["artifacts"][0]["path"] == "images/debug-flowchart.png"
 
 
+def test_spreadsheet_workbook_extracts_searchable_sheet_artifacts(tmp_path: Path) -> None:
+    workbook_path = tmp_path / "power-budget.xlsx"
+    make_xlsx_workbook(workbook_path)
+    archive = DocumentationArchive(tmp_path / "archive")
+
+    document = archive.ingest_path(workbook_path)[0]
+
+    assert document.source_type == "spreadsheet"
+    result = archive.search("SPREADSHEET-REG-42 I2C gain", source_types=["spreadsheet"], limit=1)[0]
+    assert result["documentId"] == document.document_id
+    assert result["locator"] == "sheet Register Map range A1:C3"
+    snapshot = tmp_path / "archive" / result["citation"]["snapshotPath"]
+    extracted = snapshot.parent / "extracted"
+    assert (extracted / "spreadsheet_index.tsv").exists()
+    assert "SPREADSHEET-REG-42" in (extracted / "spreadsheets" / "sheet-002-Register_Map.csv").read_text(encoding="utf-8")
+
+    record = archive.get_document(document.document_id)
+    artifacts = [artifact for artifact in record["artifacts"] if artifact["type"] == "spreadsheet"]
+    assert len(artifacts) == 2
+    power_artifact = next(artifact for artifact in artifacts if artifact["sheet"] == "Power Budget")
+    assert power_artifact["path"] == "spreadsheets/sheet-001-Power_Budget.md"
+    assert power_artifact["mimeType"] == "text/markdown"
+    assert power_artifact["available"] is True
+    assert power_artifact["formulaCells"] == 1
+    assert power_artifact["mergedRanges"] == ["A6:C6"]
+    assert {alternate["kind"] for alternate in power_artifact["alternatePaths"]} == {"csv", "markdown", "json"}
+
+    served_markdown = archive.document_artifact_file(document.document_id, power_artifact["path"])
+    assert served_markdown.path.read_text(encoding="utf-8").startswith("# Sheet Power Budget")
+    served_json = archive.document_artifact_file(document.document_id, power_artifact["jsonPath"])
+    assert json.loads(served_json.path.read_text(encoding="utf-8"))["formulas"][0]["formula"] == "=SUM(C2:C3)"
+    with pytest.raises(ArchiveError):
+        archive.document_artifact_file(document.document_id, "spreadsheets/unknown.csv")
+
+
+def test_directory_ingest_includes_xlsx_and_legacy_xls_workbooks(tmp_path: Path) -> None:
+    fixture_dir = tmp_path / "workbooks"
+    fixture_dir.mkdir()
+    make_xlsx_workbook(fixture_dir / "power-budget.xlsx")
+    make_xls_workbook(fixture_dir / "legacy-registers.xls")
+    archive = DocumentationArchive(tmp_path / "archive")
+
+    documents = archive.ingest_path(fixture_dir)
+
+    assert {document.source_type for document in documents} == {"spreadsheet"}
+    assert archive.search("SPREADSHEET-REG-42", source_types=["spreadsheet"], limit=1)[0]["sourceType"] == "spreadsheet"
+    legacy_result = archive.search("LEGACY-XLS-991 trim mode", source_types=["spreadsheet"], limit=1)[0]
+    assert legacy_result["title"] == "legacy-registers.xls"
+    legacy_record = archive.get_document(legacy_result["documentId"])
+    legacy_artifact = next(artifact for artifact in legacy_record["artifacts"] if artifact["type"] == "spreadsheet")
+    assert legacy_artifact["sheet"] == "Legacy XLS"
+    assert legacy_artifact["csvPath"].endswith(".csv")
+
+
+def test_fastapi_upload_autodetects_spreadsheet_source_type_and_serves_artifacts(tmp_path: Path) -> None:
+    workbook_path = tmp_path / "upload-register-map.xlsx"
+    make_xlsx_workbook(workbook_path)
+    app = create_app(tmp_path / "archive")
+    client = TestClient(app)
+
+    response = client.post(
+        "/ingest/upload",
+        files={
+            "file": (
+                "upload-register-map.xlsx",
+                workbook_path.read_bytes(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    document = response.json()["document"]
+    assert document["sourceType"] == "spreadsheet"
+    search = client.post("/search", json={"query": "SPREADSHEET-REG-42 I2C gain", "sourceTypes": ["spreadsheet"]})
+    assert search.status_code == 200
+    document_id = search.json()["results"][0]["documentId"]
+    detail = client.get(f"/documents/{document_id}", params={"artifactLimit": 1})
+    assert detail.status_code == 200
+    artifact = detail.json()["document"]["artifacts"][0]
+    assert detail.json()["document"]["artifactWindow"]["total"] == 2
+    artifact_response = client.get(f"/documents/{document_id}/artifact", params={"path": artifact["path"]})
+    assert artifact_response.status_code == 200
+    assert "Sheet Power Budget" in artifact_response.text
+
+
 def test_pdf_table_filter_rejects_single_cell_diagram_fragments() -> None:
     assert plausible_tables([[[None], ["EXPANDED TIME SCALE"]]]) == []
 
@@ -1433,6 +1519,41 @@ def make_multiframe_image(path: Path) -> None:
     draw.rectangle((88, 24, 144, 64), outline="black", width=3)
     draw.text((99, 38), "TWO", fill="black")
     first.save(path, save_all=True, append_images=[second], duration=100, loop=0)
+
+
+def make_xlsx_workbook(path: Path) -> None:
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    power = workbook.active
+    power.title = "Power Budget"
+    power.append(["Component", "Rail", "Current_mA"])
+    power.append(["MCU", "3V3", 45])
+    power.append(["Sensor", "1V8", 12])
+    power.append(["Total", "", "=SUM(C2:C3)"])
+    power["A6"] = "Notes: merged range captures board bring-up context"
+    power.merge_cells("A6:C6")
+    registers = workbook.create_sheet("Register Map")
+    registers.append(["Register", "Address", "Purpose"])
+    registers.append(["SPREADSHEET-REG-42", "0x2A", "I2C gain trim"])
+    registers.append(["BOOT_DELAY", "0x2B", "reset delay cycles"])
+    workbook.save(path)
+
+
+def make_xls_workbook(path: Path) -> None:
+    import xlwt
+
+    workbook = xlwt.Workbook()
+    sheet = workbook.add_sheet("Legacy XLS")
+    rows = [
+        ["Name", "Value", "Purpose"],
+        ["LEGACY-XLS-991", 17, "trim mode"],
+        ["LEGACY-XLS-992", 23, "reset mode"],
+    ]
+    for row_index, row in enumerate(rows):
+        for column_index, value in enumerate(row):
+            sheet.write(row_index, column_index, value)
+    workbook.save(str(path))
 
 
 def stub_youtube_media(monkeypatch: pytest.MonkeyPatch, transcripts: dict[str, str], descriptions: dict[str, str | None] | None = None) -> None:

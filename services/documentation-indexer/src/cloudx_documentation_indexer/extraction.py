@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import csv
+from datetime import date, datetime, time
 import io
 import json
+import math
 import mimetypes
 import re
 import shutil
@@ -10,6 +12,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 from PIL import Image, ImageSequence
@@ -20,6 +23,14 @@ import pypdfium2 as pdfium
 PDF_SUFFIXES = {".pdf"}
 HTML_SUFFIXES = {".html", ".htm"}
 IMAGE_SUFFIXES = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+SPREADSHEET_SUFFIXES = {".xls", ".xlsx", ".xlsm", ".xlsb", ".ods", ".ots"}
+SPREADSHEET_CONTENT_TYPES = {
+    "application/vnd.ms-excel",
+    "application/vnd.ms-excel.sheet.binary.macroenabled.12",
+    "application/vnd.ms-excel.sheet.macroenabled.12",
+    "application/vnd.oasis.opendocument.spreadsheet",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
 TEXT_SUFFIXES = {
     ".adoc",
     ".asciidoc",
@@ -45,7 +56,7 @@ TEXT_SUFFIXES = {
     ".yaml",
     ".yml",
 }
-SUPPORTED_FILE_SUFFIXES = PDF_SUFFIXES | HTML_SUFFIXES | IMAGE_SUFFIXES | TEXT_SUFFIXES
+SUPPORTED_FILE_SUFFIXES = PDF_SUFFIXES | HTML_SUFFIXES | IMAGE_SUFFIXES | SPREADSHEET_SUFFIXES | TEXT_SUFFIXES
 
 
 @dataclass(frozen=True)
@@ -61,6 +72,16 @@ class ExtractedTable:
     total_cells: int
 
 
+@dataclass(frozen=True)
+class ExtractedSpreadsheetSheet:
+    id: str
+    name: str
+    rows: list[list[str]]
+    range_ref: str
+    formulas: list[dict[str, str]]
+    merged_ranges: list[str]
+
+
 def extract_file(path: Path, content: bytes, source_type: str, artifact_dir: Path | None = None) -> list[ExtractedSpan]:
     return extract_bytes(content, path.name, source_type, mimetypes.guess_type(path.name)[0], artifact_dir)
 
@@ -72,12 +93,15 @@ def extract_bytes(
     content_type: str | None,
     artifact_dir: Path | None = None,
 ) -> list[ExtractedSpan]:
-    suffix = Path(name).suffix.lower()
-    if suffix in PDF_SUFFIXES or content_type == "application/pdf" or looks_like_pdf(content):
+    suffix = source_suffix(name)
+    normalized_type = normalized_content_type(content_type)
+    if suffix in PDF_SUFFIXES or normalized_type == "application/pdf" or looks_like_pdf(content):
         return PdfExtractionPipeline(artifact_dir).extract(content)
-    if source_type == "image" or suffix in IMAGE_SUFFIXES or (content_type or "").lower().startswith("image/"):
+    if source_type == "spreadsheet" or suffix in SPREADSHEET_SUFFIXES or normalized_type in SPREADSHEET_CONTENT_TYPES:
+        return SpreadsheetExtractionPipeline(artifact_dir).extract(content, name, normalized_type)
+    if source_type == "image" or suffix in IMAGE_SUFFIXES or normalized_type.startswith("image/"):
         return ImageExtractionPipeline(artifact_dir).extract(content, name)
-    if source_type == "website" or suffix in HTML_SUFFIXES or (content_type or "").startswith("text/html"):
+    if source_type == "website" or suffix in HTML_SUFFIXES or normalized_type.startswith("text/html"):
         return [ExtractedSpan(extract_html(content), "html")]
     return [ExtractedSpan(decode_text(content), "text")]
 
@@ -166,6 +190,27 @@ class ImageExtractionPipeline:
                 metadata["artifacts"] = frame_paths
                 (artifact_root / "image_metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return [ExtractedSpan(image_span_text(metadata), "image")]
+
+
+class SpreadsheetExtractionPipeline:
+    def __init__(self, artifact_dir: Path | None = None):
+        self.artifact_dir = artifact_dir
+
+    def extract(self, content: bytes, name: str, content_type: str | None = None) -> list[ExtractedSpan]:
+        suffix = source_suffix(name)
+        artifact_root = prepare_artifact_dir(self.artifact_dir)
+        if suffix in {".xlsx", ".xlsm"} or content_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+            sheets = extract_ooxml_workbook(content, suffix)
+        else:
+            sheets = extract_pandas_workbook(content, suffix)
+        records = write_spreadsheet_artifacts(artifact_root, sheets)
+        return [
+            ExtractedSpan(
+                spreadsheet_sheet_span_text(sheet, records.get(sheet.id)),
+                f"sheet {sheet.name} range {sheet.range_ref}",
+            )
+            for sheet in sheets
+        ]
 
 
 def prepare_artifact_dir(artifact_dir: Path | None) -> Path | None:
@@ -268,6 +313,218 @@ def write_table_artifacts(artifact_root: Path | None, table_id: str, page_number
     record["csv"] = csv_path.relative_to(artifact_root).as_posix()
     record["markdown"] = md_path.relative_to(artifact_root).as_posix()
     return record
+
+
+def extract_ooxml_workbook(content: bytes, suffix: str) -> list[ExtractedSpreadsheetSheet]:
+    from openpyxl import load_workbook
+
+    keep_vba = suffix == ".xlsm"
+    formulas_workbook = load_workbook(io.BytesIO(content), data_only=False, read_only=False, keep_vba=keep_vba)
+    values_workbook = load_workbook(io.BytesIO(content), data_only=True, read_only=False, keep_vba=keep_vba)
+    sheets: list[ExtractedSpreadsheetSheet] = []
+    for index, formula_sheet in enumerate(formulas_workbook.worksheets, start=1):
+        value_sheet = values_workbook[formula_sheet.title]
+        raw_rows: list[list[str]] = []
+        formulas: list[dict[str, str]] = []
+        for row_index in range(1, formula_sheet.max_row + 1):
+            row: list[str] = []
+            for column_index in range(1, formula_sheet.max_column + 1):
+                formula_cell = formula_sheet.cell(row_index, column_index)
+                value_cell = value_sheet.cell(row_index, column_index)
+                row.append(spreadsheet_cell_text(formula_cell.value, value_cell.value))
+                if isinstance(formula_cell.value, str) and formula_cell.value.startswith("="):
+                    formulas.append(
+                        {
+                            "cell": spreadsheet_cell_ref(row_index, column_index),
+                            "formula": formula_cell.value,
+                            "cached_value": spreadsheet_value_text(value_cell.value),
+                        }
+                    )
+            raw_rows.append(row)
+        rows, range_ref = trim_spreadsheet_grid(raw_rows)
+        sheets.append(
+            ExtractedSpreadsheetSheet(
+                id=f"sheet-{index:03d}",
+                name=formula_sheet.title,
+                rows=rows,
+                range_ref=range_ref,
+                formulas=[{key: value for key, value in formula.items() if value} for formula in formulas],
+                merged_ranges=[str(merged_range) for merged_range in formula_sheet.merged_cells.ranges],
+            )
+        )
+    return sheets
+
+
+def extract_pandas_workbook(content: bytes, suffix: str) -> list[ExtractedSpreadsheetSheet]:
+    import pandas as pd
+
+    workbook = pd.ExcelFile(io.BytesIO(content), engine=pandas_engine_for_suffix(suffix))
+    sheets: list[ExtractedSpreadsheetSheet] = []
+    for index, sheet_name in enumerate(workbook.sheet_names, start=1):
+        frame = workbook.parse(sheet_name=sheet_name, header=None, dtype=object, keep_default_na=False, na_filter=False)
+        raw_rows = [[spreadsheet_value_text(value) for value in row] for row in frame.itertuples(index=False, name=None)]
+        rows, range_ref = trim_spreadsheet_grid(raw_rows)
+        sheets.append(
+            ExtractedSpreadsheetSheet(
+                id=f"sheet-{index:03d}",
+                name=str(sheet_name),
+                rows=rows,
+                range_ref=range_ref,
+                formulas=[],
+                merged_ranges=[],
+            )
+        )
+    return sheets
+
+
+def pandas_engine_for_suffix(suffix: str) -> str:
+    engines = {
+        ".xls": "xlrd",
+        ".xlsb": "pyxlsb",
+        ".ods": "odf",
+        ".ots": "odf",
+        ".xlsx": "openpyxl",
+        ".xlsm": "openpyxl",
+    }
+    return engines.get(suffix, "openpyxl")
+
+
+def write_spreadsheet_artifacts(artifact_root: Path | None, sheets: list[ExtractedSpreadsheetSheet]) -> dict[str, dict[str, str | int]]:
+    records: dict[str, dict[str, str | int]] = {}
+    for sheet in sheets:
+        record = spreadsheet_artifact_record(sheet)
+        records[sheet.id] = record
+        if artifact_root:
+            spreadsheets_dir = artifact_root / "spreadsheets"
+            spreadsheets_dir.mkdir(parents=True, exist_ok=True)
+            base_name = f"{sheet.id}-{safe_stem(sheet.name)}"
+            csv_path = spreadsheets_dir / f"{base_name}.csv"
+            md_path = spreadsheets_dir / f"{base_name}.md"
+            json_path = spreadsheets_dir / f"{base_name}.json"
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerows(sheet.rows)
+            md_path.write_text(spreadsheet_markdown_document(sheet), encoding="utf-8")
+            json_path.write_text(json.dumps(spreadsheet_json_document(sheet), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            record["csv"] = csv_path.relative_to(artifact_root).as_posix()
+            record["markdown"] = md_path.relative_to(artifact_root).as_posix()
+            record["json"] = json_path.relative_to(artifact_root).as_posix()
+    if artifact_root and records:
+        write_tsv(
+            artifact_root / "spreadsheet_index.tsv",
+            list(records.values()),
+            ["id", "sheet", "range", "rows", "columns", "non_empty_cells", "formula_cells", "merged_ranges", "csv", "markdown", "json"],
+        )
+    return records
+
+
+def spreadsheet_artifact_record(sheet: ExtractedSpreadsheetSheet) -> dict[str, str | int]:
+    return {
+        "id": sheet.id,
+        "sheet": sheet.name,
+        "range": sheet.range_ref,
+        "rows": len(sheet.rows),
+        "columns": max((len(row) for row in sheet.rows), default=0),
+        "non_empty_cells": sum(1 for row in sheet.rows for cell in row if cell),
+        "formula_cells": len(sheet.formulas),
+        "merged_ranges": ", ".join(sheet.merged_ranges),
+    }
+
+
+def spreadsheet_json_document(sheet: ExtractedSpreadsheetSheet) -> dict[str, Any]:
+    return {
+        "id": sheet.id,
+        "sheet": sheet.name,
+        "range": sheet.range_ref,
+        "rows": sheet.rows,
+        "formulas": sheet.formulas,
+        "mergedRanges": sheet.merged_ranges,
+    }
+
+
+def spreadsheet_markdown_document(sheet: ExtractedSpreadsheetSheet) -> str:
+    lines = [
+        f"# Sheet {sheet.name}",
+        "",
+        f"Range: {sheet.range_ref}",
+        f"Rows: {len(sheet.rows)}",
+        f"Columns: {max((len(row) for row in sheet.rows), default=0)}",
+        f"Formula cells: {len(sheet.formulas)}",
+    ]
+    if sheet.merged_ranges:
+        lines.append(f"Merged ranges: {', '.join(sheet.merged_ranges)}")
+    lines.append("")
+    lines.append(markdown_table(sheet.rows) if sheet.rows else "_Empty sheet._")
+    if sheet.formulas:
+        lines.extend(["", "## Formulas"])
+        lines.extend(f"- {formula['cell']}: {formula['formula']}" for formula in sheet.formulas)
+    return "\n".join(lines).strip() + "\n"
+
+
+def spreadsheet_sheet_span_text(sheet: ExtractedSpreadsheetSheet, record: dict[str, str | int] | None) -> str:
+    lines = [
+        f"Extracted spreadsheet sheet {sheet.name}.",
+        f"Range: {sheet.range_ref}. Rows: {len(sheet.rows)}. Columns: {max((len(row) for row in sheet.rows), default=0)}.",
+    ]
+    if record and record.get("markdown"):
+        lines.append(f"Artifact: {record['markdown']}.")
+    if sheet.merged_ranges:
+        lines.append(f"Merged ranges: {', '.join(sheet.merged_ranges)}.")
+    if sheet.formulas:
+        formula_summary = "; ".join(f"{formula['cell']} {formula['formula']}" for formula in sheet.formulas[:20])
+        lines.append(f"Formulas: {formula_summary}.")
+    lines.append(markdown_table(sheet.rows) if sheet.rows else "Sheet is empty.")
+    return "\n\n".join(lines).strip()
+
+
+def spreadsheet_cell_text(formula_value: Any, cached_value: Any) -> str:
+    if isinstance(formula_value, str) and formula_value.startswith("="):
+        return spreadsheet_value_text(cached_value) or formula_value
+    return spreadsheet_value_text(formula_value)
+
+
+def spreadsheet_value_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and math.isnan(value):
+        return ""
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except ValueError:
+            pass
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    return " ".join(str(value).split())
+
+
+def trim_spreadsheet_grid(rows: list[list[str]]) -> tuple[list[list[str]], str]:
+    occupied = [
+        (row_index, column_index)
+        for row_index, row in enumerate(rows, start=1)
+        for column_index, value in enumerate(row, start=1)
+        if value
+    ]
+    if not occupied:
+        return [], "A1"
+    min_row = min(row for row, _ in occupied)
+    max_row = max(row for row, _ in occupied)
+    min_column = min(column for _, column in occupied)
+    max_column = max(column for _, column in occupied)
+    cropped = [row[min_column - 1:max_column] for row in rows[min_row - 1:max_row]]
+    return cropped, f"{spreadsheet_cell_ref(min_row, min_column)}:{spreadsheet_cell_ref(max_row, max_column)}"
+
+
+def spreadsheet_cell_ref(row: int, column: int) -> str:
+    return f"{spreadsheet_column_name(column)}{row}"
+
+
+def spreadsheet_column_name(column: int) -> str:
+    name = ""
+    while column:
+        column, remainder = divmod(column - 1, 26)
+        name = chr(ord("A") + remainder) + name
+    return name or "A"
 
 
 def render_page_artifact(pdf: pdfium.PdfDocument, page_number: int, output_path: Path) -> Path:
@@ -418,6 +675,14 @@ def extract_html(content: bytes) -> str:
 
 def decode_text(content: bytes) -> str:
     return content.decode("utf-8", errors="replace").strip()
+
+
+def source_suffix(name: str) -> str:
+    return Path(urlparse(name).path or name).suffix.lower()
+
+
+def normalized_content_type(content_type: str | None) -> str:
+    return (content_type or "").split(";", 1)[0].strip().lower()
 
 
 def looks_like_pdf(content: bytes) -> bool:

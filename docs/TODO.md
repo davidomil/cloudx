@@ -36,12 +36,12 @@
   - Quality target: reuse the datasheet-analysis workflow for page-grounded schematic evidence, including rendered page inspection when text extraction is insufficient. Keep generic diagrams on the existing visual-enrichment path.
   - Tests: fixture PDF with a schematic-like page, standalone schematic image ingest, non-schematic image control case, image and description persistence, description chunk indexing/search, artifact lookup from a search result, and schema readback with an empty/future analysis-output slot.
 
-- [ ] Add spreadsheet ingest support for XLS/XLSX workbooks
-  - Current state: docs mention spreadsheet extraction and the indexer depends on `pandas`/`docling`, but `services/documentation-indexer/src/cloudx_documentation_indexer/extraction.py` does not include `.xls`, `.xlsx`, `.xlsm`, `.xlsb`, `.ods`, or `.ots` in `SUPPORTED_FILE_SUFFIXES`; unsupported workbooks in directory ingest are skipped, and direct ingest falls through to UTF-8 text decode.
-  - Implementation target: add a spreadsheet extraction pipeline that preserves sheet names, dimensions, formulas vs displayed values when available, and table-like ranges as searchable Markdown/CSV artifacts under `extracted/spreadsheets/`.
-  - Format target: use Docling for native `.xlsx` layout/table extraction where it gives useful structure, and use pandas Excel engines for broad workbook support. Handle legacy `.xls` explicitly with the appropriate engine dependency instead of assuming the `.xlsx` path covers it.
-  - UX target: update upload/path supported-format labels, source type inference, setup docs, memory plugin guide, and helper skill instructions so spreadsheets are advertised only after the extractor is real.
-  - Tests: `.xlsx` multi-sheet fixture, legacy `.xls` fixture or generated sample, formulas/empty cells/merged cells edge cases, directory ingest inclusion, artifact readback, and search hits from sheet/table content.
+- [x] Add spreadsheet ingest support for XLS/XLSX workbooks
+  - Done: `SUPPORTED_FILE_SUFFIXES` includes `.xls`, `.xlsx`, `.xlsm`, `.xlsb`, `.ods`, and `.ots`; directory, upload, and URL ingest infer `sourceType: "spreadsheet"` from suffixes or spreadsheet content types.
+  - Implementation: `SpreadsheetExtractionPipeline` preserves sheet names, dimensions, formulas when available, merged ranges for XLSX/XLSM, and per-sheet searchable Markdown/CSV/JSON artifacts under `extracted/spreadsheets/`.
+  - Format coverage: XLSX/XLSM use `openpyxl` for formula and merged-range metadata; legacy `.xls` uses the explicit `xlrd` engine; `.xlsb` and OpenDocument spreadsheet suffixes use their pandas engines through explicit dependencies.
+  - UX/docs: upload/path labels, source type inference, memory plugin guide, helper skill instructions, and documentation skill tests advertise spreadsheets only after extractor support is real.
+  - Tests: generated `.xlsx` fixture with multiple sheets, formulas, empty cells, and merged cells; generated legacy `.xls` sample; directory ingest inclusion; upload ingest; search hits from sheet/table content; and artifact readback for CSV/Markdown/JSON sidecars.
 
 - [ ] Require documentation-first ingest for vendor code sources
   - Current state: `TEXT_SUFFIXES` includes code-like formats such as `.c`, `.cpp`, `.h`, `.hpp`, `.js`, `.py`, `.rs`, `.ts`, and `.tsx`, and unknown text-like direct ingest falls through to `decode_text()`. That means vendor source drops can become chunks of raw code without an explanation layer for how the code works.

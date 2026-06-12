@@ -413,11 +413,11 @@ function stdin() {
 function usage() {
   console.error([
     "Usage:",
-    "  cloudx-doc.mjs search <query> [--limit 8] [--collection name] [--sourceType datasheet,media]",
+    "  cloudx-doc.mjs search <query> [--limit 8] [--collection name] [--sourceType datasheet,media,spreadsheet]",
     "  cloudx-doc.mjs open <documentId> [--chunks 8] [--chars 1200] [--artifacts 8]",
     "  cloudx-doc.mjs list [--states active,stale] [--limit 50] [--offset 0] [--query text] [--collection name] [--sortDirection desc]",
     "  cloudx-doc.mjs ingest-url <url> [--sourceType media] [--collection name]",
-    "  cloudx-doc.mjs ingest-path <path> [--sourceType datasheet] [--collection name]",
+    "  cloudx-doc.mjs ingest-path <path> [--sourceType datasheet|spreadsheet] [--collection name]",
     "  cloudx-doc.mjs ingest-text <text> [--title title] [--uri uri]",
     "  cloudx-doc.mjs invalidate <documentId> <state> --reason reason",
     "  cloudx-doc.mjs remove <documentId>",

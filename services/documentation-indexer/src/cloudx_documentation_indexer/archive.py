@@ -26,7 +26,15 @@ import numpy as np
 from PIL import Image
 from turbovec import IdMapIndex
 
-from .extraction import ExtractedSpan, IMAGE_SUFFIXES, SUPPORTED_FILE_SUFFIXES, extract_bytes, extract_file
+from .extraction import (
+    ExtractedSpan,
+    IMAGE_SUFFIXES,
+    SPREADSHEET_CONTENT_TYPES,
+    SPREADSHEET_SUFFIXES,
+    SUPPORTED_FILE_SUFFIXES,
+    extract_bytes,
+    extract_file,
+)
 
 try:
     from youtube_transcript_api import YouTubeTranscriptApi
@@ -1417,13 +1425,16 @@ def document_chunk_dict(row: sqlite3.Row, text_max_chars: int | None) -> dict[st
 
 def infer_source_type(name: str, content_type: str | None) -> str:
     suffix = Path(urlparse(name).path).suffix.lower()
-    if suffix == ".pdf" or content_type == "application/pdf":
+    normalized_type = (content_type or "").split(";", 1)[0].strip().lower()
+    if suffix == ".pdf" or normalized_type == "application/pdf":
         lower = name.lower()
         return "datasheet" if any(term in lower for term in ["datasheet", "manual", "reference"]) else "book"
-    if suffix in {".html", ".htm"} or (content_type or "").startswith("text/html"):
+    if suffix in {".html", ".htm"} or normalized_type.startswith("text/html"):
         return "website"
-    if suffix in IMAGE_SUFFIXES or (content_type or "").startswith("image/"):
+    if suffix in IMAGE_SUFFIXES or normalized_type.startswith("image/"):
         return "image"
+    if suffix in SPREADSHEET_SUFFIXES or normalized_type in SPREADSHEET_CONTENT_TYPES:
+        return "spreadsheet"
     if suffix in {".c", ".cpp", ".h", ".hpp", ".js", ".py", ".rs", ".ts", ".tsx"}:
         return "repo_code"
     if suffix in {".srt", ".vtt"}:
@@ -1442,6 +1453,7 @@ def snapshot_artifact_window(document_id: str, snapshot_path: Path, *, offset: i
     sources: list[tuple[int, Callable[[int, int | None], list[dict[str, Any]]]]] = [
         (pdf_figure_artifact_count(artifact_root), lambda local_offset, local_limit: pdf_figure_artifacts(document_id, artifact_root, offset=local_offset, limit=local_limit)),
         (pdf_table_artifact_count(artifact_root), lambda local_offset, local_limit: pdf_table_artifacts(document_id, artifact_root, offset=local_offset, limit=local_limit)),
+        (spreadsheet_artifact_count(artifact_root), lambda local_offset, local_limit: spreadsheet_artifacts(document_id, artifact_root, offset=local_offset, limit=local_limit)),
         (image_artifact_count(artifact_root), lambda local_offset, local_limit: image_artifacts(document_id, artifact_root, offset=local_offset, limit=local_limit)),
         (media_keyframe_artifact_count(artifact_root), lambda local_offset, local_limit: media_keyframe_artifacts(document_id, artifact_root, offset=local_offset, limit=local_limit)),
     ]
@@ -1543,6 +1555,62 @@ def pdf_table_artifacts(document_id: str, artifact_root: Path, *, offset: int = 
 
 def is_pdf_table_artifact_row(row: dict[str, str]) -> bool:
     return bool(optional_text(row.get("id")) and (optional_text(row.get("markdown")) or optional_text(row.get("csv"))))
+
+
+def spreadsheet_artifact_count(artifact_root: Path) -> int:
+    return count_tsv_rows(artifact_root / "spreadsheet_index.tsv", is_spreadsheet_artifact_row)
+
+
+def spreadsheet_artifacts(document_id: str, artifact_root: Path, *, offset: int = 0, limit: int | None = None) -> list[dict[str, Any]]:
+    records = []
+    for row in window_tsv_rows(artifact_root / "spreadsheet_index.tsv", offset, limit, is_spreadsheet_artifact_row):
+        sheet_id = optional_text(row.get("id"))
+        sheet_name = optional_text(row.get("sheet"))
+        csv_path = optional_text(row.get("csv"))
+        markdown_path = optional_text(row.get("markdown"))
+        json_path = optional_text(row.get("json"))
+        path = markdown_path or csv_path or json_path
+        alternate_paths = []
+        if csv_path:
+            alternate_paths.append(artifact_link("csv", artifact_root, csv_path))
+        if markdown_path:
+            alternate_paths.append(artifact_link("markdown", artifact_root, markdown_path))
+        if json_path:
+            alternate_paths.append(artifact_link("json", artifact_root, json_path))
+        records.append(
+            with_artifact_file_metadata(
+                artifact_root,
+                {
+                    "documentId": document_id,
+                    "type": "spreadsheet",
+                    "kind": "sheet",
+                    "id": sheet_id,
+                    "sheet": sheet_name,
+                    "path": safe_artifact_relative_path(path),
+                    "locator": spreadsheet_artifact_locator(sheet_name, row.get("range")),
+                    "range": optional_text(row.get("range")),
+                    "rows": optional_int(row.get("rows")) or 0,
+                    "columns": optional_int(row.get("columns")) or 0,
+                    "nonEmptyCells": optional_int(row.get("non_empty_cells")),
+                    "formulaCells": optional_int(row.get("formula_cells")),
+                    "mergedRanges": [item.strip() for item in (row.get("merged_ranges") or "").split(",") if item.strip()],
+                    "csvPath": safe_artifact_relative_path(csv_path) if csv_path else None,
+                    "markdownPath": safe_artifact_relative_path(markdown_path) if markdown_path else None,
+                    "jsonPath": safe_artifact_relative_path(json_path) if json_path else None,
+                    "alternatePaths": alternate_paths,
+                },
+            )
+        )
+    return records
+
+
+def spreadsheet_artifact_locator(sheet_name: str | None, range_ref: str | None) -> str:
+    name = sheet_name or "sheet"
+    return f"sheet {name} range {range_ref}" if optional_text(range_ref) else f"sheet {name}"
+
+
+def is_spreadsheet_artifact_row(row: dict[str, str]) -> bool:
+    return bool(optional_text(row.get("id")) and (optional_text(row.get("markdown")) or optional_text(row.get("csv")) or optional_text(row.get("json"))))
 
 
 def image_artifact_count(artifact_root: Path) -> int:
@@ -1703,6 +1771,7 @@ def snapshot_artifact_path_exists(snapshot_path: Path, relative_path: str) -> bo
 def snapshot_artifact_paths(artifact_root: Path) -> Iterator[str]:
     yield from pdf_figure_artifact_paths(artifact_root)
     yield from pdf_table_artifact_paths(artifact_root)
+    yield from spreadsheet_artifact_paths(artifact_root)
     yield from image_artifact_paths(artifact_root)
     yield from media_keyframe_artifact_paths(artifact_root)
 
@@ -1721,6 +1790,18 @@ def pdf_table_artifact_paths(artifact_root: Path) -> Iterator[str]:
             yield safe_artifact_relative_path(csv_path)
         if markdown_path := optional_text(row.get("markdown")):
             yield safe_artifact_relative_path(markdown_path)
+
+
+def spreadsheet_artifact_paths(artifact_root: Path) -> Iterator[str]:
+    for row in iter_tsv(artifact_root / "spreadsheet_index.tsv"):
+        if not is_spreadsheet_artifact_row(row):
+            continue
+        if csv_path := optional_text(row.get("csv")):
+            yield safe_artifact_relative_path(csv_path)
+        if markdown_path := optional_text(row.get("markdown")):
+            yield safe_artifact_relative_path(markdown_path)
+        if json_path := optional_text(row.get("json")):
+            yield safe_artifact_relative_path(json_path)
 
 
 def media_keyframe_artifact_paths(artifact_root: Path) -> Iterator[str]:

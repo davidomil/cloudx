@@ -944,7 +944,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
                     </label>
                   ) : null}
                   {mode === "upload" && uploadValue ? <p className="documentation-selected-file">{uploadValue.name} · {formatBytes(uploadValue.size)}</p> : null}
-                  {mode === "path" ? <label><span>Path</span><input value={pathValue} onChange={(event) => setPathValue(event.target.value)} placeholder="/path/to/datasheet.pdf or docs/" /></label> : null}
+                  {mode === "path" ? <label><span>Path</span><input value={pathValue} onChange={(event) => setPathValue(event.target.value)} placeholder="/path/to/datasheet.pdf, workbook.xlsx, or docs/" /></label> : null}
                   {mode === "url" || mode === "text" ? <label><span>URL or URI</span><input value={urlValue} onChange={(event) => setUrlValue(event.target.value)} placeholder="https://vendor.example/doc, youtube playlist, or optional manual URI" /></label> : null}
                   <label><span>Title</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="auto from source" /></label>
                   <label><span>Collection</span><input value={collection} onChange={(event) => setCollection(event.target.value)} placeholder="auto from folder, domain, playlist, or upload" /></label>

@@ -149,9 +149,9 @@ metadata, infers a source type from the filename and content type,
 autodetects the title from the filename when the title field is blank,
 assigns the default `uploads` collection when collection is blank, and
 records a stable `upload://<safe-name>` URI. This path is the preferred
-user workflow for datasheets, PDFs, images, Markdown, copied exports,
-and other files that are on the user’s workstation but not necessarily
-visible as a local path to the indexer process.
+user workflow for datasheets, PDFs, spreadsheets, images, Markdown,
+copied exports, and other files that are on the user’s workstation but
+not necessarily visible as a local path to the indexer process.
 
 When AI enrichment is enabled, browser upload is also the path that can
 pass media bytes to the enrichment service. Uploaded audio/video can be
@@ -173,16 +173,18 @@ is passed, the indexer recursively ingests supported documentation file
 suffixes.
 
 Supported suffixes include Markdown, text, PDF, HTML, JSON, YAML, XML,
-CSV, SRT/VTT, Python, TypeScript, JavaScript, C/C++, Rust, CSS,
+CSV, XLS/XLSX workbooks (`.xls`, `.xlsx`, `.xlsm`, `.xlsb`, `.ods`,
+`.ots`), SRT/VTT, Python, TypeScript, JavaScript, C/C++, Rust, CSS,
 AsciiDoc, LaTeX, and images (`.png`, `.jpg`, `.jpeg`, `.gif`, `.tif`,
 `.tiff`, `.bmp`, `.webp`).
 
 The supported source-type labels are `datasheet`, `book`, `website`,
-`repo_code`, `readme`, `media`, `image`, and `text`. Source type
-describes the source for hook/API filters and skill behavior; extraction
-is selected from the actual file suffix, content type, and file
-signature. That means setting `sourceType` to `datasheet` no longer
-forces a Markdown, text, or image file through the PDF extractor.
+`repo_code`, `readme`, `media`, `image`, `spreadsheet`, and `text`.
+Source type describes the source for hook/API filters and skill
+behavior; extraction is selected from the actual file suffix, content
+type, and file signature. That means setting `sourceType` to `datasheet`
+no longer forces a Markdown, text, spreadsheet, or image file through the
+PDF extractor.
 
 When title is blank, path ingest uses the file name. When collection is
 blank, directory ingest uses the directory name for every file under
@@ -192,6 +194,7 @@ that ingest request and single-file ingest uses the parent folder name.
 |----|----|----|
 | PDF | `.pdf`, `application/pdf`, `%PDF-` bytes | Page text, tables, and rendered visual page artifacts. |
 | Image | `.png`, `.jpg`, `.jpeg`, `.gif`, `.tif`, `.tiff`, `.bmp`, `.webp`, `image/*` | Normalized PNG artifacts for all frames plus format, size, mode, and frame metadata. |
+| Spreadsheet | `.xls`, `.xlsx`, `.xlsm`, `.xlsb`, `.ods`, `.ots`, Excel/OpenDocument spreadsheet content types | One searchable chunk per sheet plus portable CSV, Markdown, JSON, and `spreadsheet_index.tsv` artifacts. XLSX/XLSM formulas and merged ranges are preserved as metadata where the file exposes them. |
 | HTML | `.html`, `.htm`, `text/html` | Text after removing script, style, template, and noscript content. |
 | Text and code | `.md`, `.txt`, `.json`, `.yaml`, `.xml`, `.csv`, `.py`, `.ts`, `.tsx`, `.js`, `.c`, `.cpp`, `.h`, `.rs`, `.css`, `.adoc`, `.tex` | UTF-8 text decode with replacement for invalid bytes. |
 | Captions and transcripts | `.srt`, `.vtt`, manually supplied transcript text | Text chunks marked as media when requested. |
@@ -271,8 +274,12 @@ PDF input is extracted with a table-aware pipeline. Page text uses
 portable sidecars under `extracted/tables/`; pages with visual objects
 are rendered to PNG sidecars under `extracted/figures/` so graphs,
 plots, flowcharts, schematics, and layout-heavy pages can be inspected
-later. Image input is normalized to PNG sidecars under
-`extracted/images/`; multi-frame images preserve every frame as a
+later. Spreadsheet input creates one source chunk per sheet with
+`sheet <name> range <A1:...>` locators and writes CSV, Markdown, JSON,
+and manifest sidecars under `extracted/spreadsheets/`. XLSX/XLSM sheets
+retain formula text and merged-range metadata; legacy XLS values are
+read through the XLS engine. Image input is normalized to PNG sidecars
+under `extracted/images/`; multi-frame images preserve every frame as a
 separate artifact and are indexed with format, size, mode, frame count,
 and visual-artifact metadata. HTML input is parsed with script, style,
 template, and noscript content removed. Other input is decoded as text.
@@ -374,7 +381,7 @@ The search API accepts:
 | `query` | Required, non-empty search text. |
 | `limit` | Must be between 1 and 100. |
 | `states` | Defaults to `active`. |
-| `sourceTypes` | Optional filter such as `datasheet`, `book`, `website`, `repo_code`, `readme`, `media`, `image`, or `text`. |
+| `sourceTypes` | Optional filter such as `datasheet`, `book`, `website`, `repo_code`, `readme`, `media`, `image`, `spreadsheet`, or `text`. |
 | `collection` | Optional exact collection filter. |
 | `mode` | `hybrid`, `dense`, or `lexical`; defaults to `hybrid`. |
 
