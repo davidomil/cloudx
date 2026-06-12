@@ -53,7 +53,7 @@ Wraps the indexer REST API, applies request timeout, bounds response size, and n
 
 Source: `apps/server/src/documentation/DocumentationEnrichmentService.ts`
 
-Runs only when the `documentation.aiEnrichmentEnabled` plugin setting is true and global AI control is enabled. It reads the configured CloudX skills from the rules/skills catalog, builds complete evidence batches from all source-origin chunks, extracted table/figure/image artifact manifests, optional ASR transcript segments, and video keyframe paths, then invokes Codex exec with a strict JSON schema for each batch. Returned spans are merged and written as AI-origin chunks by `POST /documents/{id}/enrich`.
+Runs only when the `documentation.aiEnrichmentEnabled` plugin setting is true and global AI control is enabled. It reads the configured CloudX skills from the rules/skills catalog, builds complete evidence batches from all source-origin chunks, extracted table/figure/image/schematic artifact manifests, optional ASR transcript segments, and video keyframe paths, then invokes Codex exec with a strict JSON schema for each batch. Returned spans are merged and written as AI-origin chunks by `POST /documents/{id}/enrich`.
 
 ## Web Panel
 
@@ -112,8 +112,8 @@ When title is blank, path ingest uses the file name. When collection is blank, d
 
 | Input class | Examples | Extraction behavior |
 |---|---|---|
-| PDF | `.pdf`, `application/pdf`, `%PDF-` bytes | Page text, tables, and rendered visual page artifacts. |
-| Image | `.png`, `.jpg`, `.jpeg`, `.gif`, `.tif`, `.tiff`, `.bmp`, `.webp`, `image/*` | Normalized PNG artifacts for all frames plus format, size, mode, and frame metadata. |
+| PDF | `.pdf`, `application/pdf`, `%PDF-` bytes | Page text, tables, rendered visual page artifacts, and Phase 1 schematic description artifacts for schematic-like pages. |
+| Image | `.png`, `.jpg`, `.jpeg`, `.gif`, `.tif`, `.tiff`, `.bmp`, `.webp`, `image/*` | Normalized PNG artifacts for all frames plus format, size, mode, frame metadata, and Phase 1 schematic description artifacts for schematic-like images. |
 | Spreadsheet | `.xls`, `.xlsx`, `.xlsm`, `.xlsb`, `.ods`, `.ots`, Excel/OpenDocument spreadsheet content types | One searchable chunk per sheet plus portable CSV, Markdown, JSON, and `spreadsheet_index.tsv` artifacts. XLSX/XLSM formulas and merged ranges are preserved as metadata where the file exposes them. |
 | HTML | `.html`, `.htm`, `text/html` | Text after removing script, style, template, and noscript content. |
 | Text and code | `.md`, `.txt`, `.json`, `.yaml`, `.xml`, `.csv`, `.py`, `.ts`, `.tsx`, `.js`, `.c`, `.cpp`, `.h`, `.rs`, `.css`, `.adoc`, `.tex` | UTF-8 text decode with replacement for invalid bytes. |
@@ -137,7 +137,7 @@ YouTube enrichment follows the same document boundary. A single video URL enrich
 
 ## Extraction And Chunking
 
-PDF input is extracted with a table-aware pipeline. Page text uses `page N` locators; detected tables become searchable Markdown chunks and portable sidecars under `extracted/tables/`; pages with visual objects are rendered to PNG sidecars under `extracted/figures/` so graphs, plots, flowcharts, schematics, and layout-heavy pages can be inspected later. Spreadsheet input creates one source chunk per sheet with `sheet <name> range <A1:...>` locators and writes CSV, Markdown, JSON, and manifest sidecars under `extracted/spreadsheets/`. XLSX/XLSM sheets retain formula text and merged-range metadata; legacy XLS values are read through the XLS engine. Image input is normalized to PNG sidecars under `extracted/images/`; multi-frame images preserve every frame as a separate artifact and are indexed with format, size, mode, frame count, and visual-artifact metadata. HTML input is parsed with script, style, template, and noscript content removed. Other input is decoded as text. Extracted spans are split into paragraph-like chunks with a maximum target size of 1200 characters.
+PDF input is extracted with a table-aware pipeline. Page text uses `page N` locators; detected tables become searchable Markdown chunks and portable sidecars under `extracted/tables/`; pages with visual objects are rendered to PNG sidecars under `extracted/figures/` so graphs, plots, flowcharts, schematics, and layout-heavy pages can be inspected later. Schematic-like PDF pages and standalone images get Phase 1 schematic records under `extracted/schematics/<id>/` with a searchable source chunk, saved description Markdown, JSON analysis metadata, a pointer back to the exact rendered/original image artifact, deterministic classification reasons, reference designator and net-label candidates from existing text or filenames, connection-cue metrics, and `analysisOutputs: []` for future structured analyzers. Spreadsheet input creates one source chunk per sheet with `sheet <name> range <A1:...>` locators and writes CSV, Markdown, JSON, and manifest sidecars under `extracted/spreadsheets/`. XLSX/XLSM sheets retain formula text and merged-range metadata; legacy XLS values are read through the XLS engine. Image input is normalized to PNG sidecars under `extracted/images/`; multi-frame images preserve every frame as a separate artifact and are indexed with format, size, mode, frame count, and visual-artifact metadata. HTML input is parsed with script, style, template, and noscript content removed. Other input is decoded as text. Extracted spans are split into paragraph-like chunks with a maximum target size of 1200 characters.
 
 This is similar to the datasheet-analysis workflow in the important ways for storage and recall: tables become standalone artifacts, visual pages are preserved as rendered images, and each chunk carries a locator. It is not OCR. Text inside a graph or scanned page is searchable only when it is present in the PDF text layer or table extraction output; otherwise the graph or flowchart is preserved as an artifact for inspection and citation.
 
@@ -267,23 +267,23 @@ The plugin contributes this universal CloudX system rule automatically at server
 
 | Rule | Purpose |
 |---|---|
-| `documentation-ingest-evidence` | Search active local archive records first. When adding evidence from a file, PDF, image, URL, YouTube video, or playlist, ingest the original source so the full extractor runs; use text ingest only when no original source is available. |
+| `documentation-ingest-evidence` | Search active local archive records first. When adding evidence from a file, PDF, spreadsheet, image, URL, YouTube video, or playlist, ingest the original source so the full extractor runs; use text ingest only when no original source is available. |
 
 The plugin contributes seven CloudX system skills automatically at server startup:
 
 | Skill | Purpose |
 |---|---|
-| `documentation-search` | Mandatory local-first lookup for factual, research, recipe, recommendation, troubleshooting, summary, and source-grounded questions; when adding evidence, route original files, PDFs, images, URLs, YouTube videos, and playlists through full ingest before answering from refreshed archive records. |
+| `documentation-search` | Mandatory local-first lookup for factual, research, recipe, recommendation, troubleshooting, summary, and source-grounded questions; when adding evidence, route original files, PDFs, spreadsheets, images, URLs, YouTube videos, and playlists through full ingest before answering from refreshed archive records. |
 | `documentation-ingest` | Add original files, directories, websites, PDFs, images, YouTube videos/playlists, and copied text only when no retrievable original exists; prefer primary source URLs over search-result pages or low-trust mirrors. |
 | `documentation-invalidate` | Find and invalidate stale, wrong, superseded, quarantined, or deleted sources. |
 | `documentation-enrich-metadata` | Derive source-grounded metadata and searchable import-improvement notes. |
-| `documentation-enrich-visuals` | Describe extracted tables, graphs, diagrams, screenshots, and flowcharts without inventing visual facts. |
+| `documentation-enrich-visuals` | Describe extracted tables, graphs, diagrams, screenshots, flowcharts, and schematic artifacts without inventing visual facts, netlists, or connectivity maps. |
 | `documentation-enrich-media` | Improve media imports using transcripts and selected keyframes when available. |
 | `documentation-archive-control` | Inspect health, stats, portable manifest, and rebuild status. |
 
 The operational skills tell Codex to read `CLOUDX_DOCUMENTATION_URL` first and prefer the bundled helper over raw endpoint calls. The search skill still routes Codex away from `documentation.answer`, because Codex should inspect retrieved sources itself. It also instructs Codex to prefer active local archive evidence, use built-in web search only when local evidence is absent or insufficient, prefer official, vendor, spec, peer-reviewed, government, or reputable-news sources depending on the domain, ingest useful online sources back into the archive, and rerun local search before answering. When Codex tabs are launched from CloudX, the server exports that URL to child processes.
 
-The operational documentation skills also bundle `scripts/cloudx-doc.mjs`, a small helper that wraps search, open, list, ingest-url, ingest-path, ingest-text, invalidate, remove, health, stats, manifest, and rebuild calls so Codex can use short commands instead of handwritten curl/JSON/NDJSON requests. The enrichment skills stay instruction-only because they define model output behavior rather than endpoint operation.
+The operational documentation skills also bundle `scripts/cloudx-doc.mjs`, a small helper that wraps search, schematic search, open, list, ingest-url, ingest-path, ingest-text, invalidate, remove, health, stats, manifest, and rebuild calls so Codex can use short commands instead of handwritten curl/JSON/NDJSON requests. The enrichment skills stay instruction-only because they define model output behavior rather than endpoint operation.
 
 The injection path is generic. Plugins expose `ruleContributions` and `skillContributions`, `syncPluginContributions` writes them into the CloudX `system-rules/` and `system-skills/` catalogs, and each Codex home overlay materializes all system rules into `AGENTS.override.md` plus all system skills under `skills/cloudx-system/`. A future plugin should follow the same pattern: use IDs prefixed with the plugin ID, provide a single-line rule text or complete `SKILL.md` body through the contribution, add bundled helper files when they reduce repeated tool boilerplate, and let the catalog and overlay handle availability for every Codex tab. Documentation enrichment deliberately uses this same catalog lookup; adding another plugin-owned enrichment pipeline should mean adding plugin skills, optional helper files, and a service that reads configured skill ids, not adding hardcoded extraction instructions.
 
@@ -351,7 +351,7 @@ That command reads `docs/MEMORY_PLUGIN_GUIDE.qmd` and writes `docs/MEMORY_PLUGIN
 The indexer tests cover:
 
 - Ingesting uploaded files, PDFs, local directories, image files, HTML websites, README/code-like files, media transcripts, and AI-derived enrichment chunks.
-- Extracting PDF table sidecars, rendered visual artifacts, and normalized image artifacts.
+- Extracting PDF table sidecars, rendered visual artifacts, normalized image artifacts, schematic description artifacts, and spreadsheet sheet artifacts.
 - Searching with hybrid retrieval, lexical-only behavior, strict identifier recall, and dense-only fallback above the configured threshold.
 - Invalidation, deletion, portable manifest generation, archive reopen/restore behavior, FastAPI controls, and CLI help.
 
@@ -368,6 +368,7 @@ A realistic validation runner in `debug_tooling/documentation-validation/run_val
 - YouTube URL ingest stores timestamped transcript, metadata, selected slide-frame artifacts, and a visual sampling manifest. It runs ASR and the CPU-heavy visual scan concurrently, downloads a bounded video source once before local parallel slide scanning, and depends on live YouTube access, `yt-dlp`, FFmpeg, and the configured ASR backend. Faster-whisper is the default; Intel Arc acceleration requires the explicit `whisper-cpp` backend with a SYCL/OpenVINO-capable `whisper-cli` and visible `/dev/dri` GPU device access.
 - Browser uploads and URL downloads are capped at 256 MiB.
 - PDF graph and flowchart extraction preserves rendered visual artifacts, but it does not OCR labels or infer graph semantics.
+- Schematic-aware ingest is Phase 1 only: it classifies schematic-like visual artifacts, writes searchable descriptions and schema-ready JSON, and leaves `analysisOutputs` empty. It does not run OCR, component detection, connectivity mapping, SPICE export, or netlist generation.
 - AI enrichment is enabled by default as a Documentation plugin setting, but it still requires global AI control. If either setting is disabled, assisted answers and post-ingest AI spans are unavailable; manual source-text search and full source inspection still work.
 - Path ingest is limited by CloudX path policy and the supported file suffix list.
 - Backup is directory-level. Copying only `catalog.sqlite` or only `chunks.tvim` is incomplete.

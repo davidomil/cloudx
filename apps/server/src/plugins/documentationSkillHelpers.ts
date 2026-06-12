@@ -24,6 +24,8 @@ async function main() {
   switch (command) {
     case "search":
       return search(args, options);
+    case "schematics":
+      return searchSchematics(args, options);
     case "open":
       return openDocument(args, options);
     case "list":
@@ -64,6 +66,42 @@ async function search(args, options) {
     sourceTypes: csvOption(options.sourceType || options.sourceTypes)
   });
   printSearch(result);
+}
+
+async function searchSchematics(args, options) {
+  const query = args.join(" ").trim();
+  if (!query) {
+    usage();
+  }
+  const result = await postJson(documentationEndpoint("/search"), {
+    query: "schematic " + query,
+    mode: options.mode || "hybrid",
+    limit: integerOption(options.limit, 8),
+    collection: options.collection,
+    sourceTypes: csvOption(options.sourceType || options.sourceTypes)
+  });
+  const rows = [];
+  for (const item of Array.isArray(result.results) ? result.results : []) {
+    const documentId = item.documentId || item.document_id;
+    if (!documentId) {
+      continue;
+    }
+    const params = new URLSearchParams({
+      chunkLimit: "0",
+      chunkTextMaxChars: "1",
+      artifactLimit: String(integerOption(options.artifacts, 32))
+    });
+    const detail = await getJson(documentationEndpoint("/documents/" + encodeURIComponent(documentId) + "?" + params.toString()));
+    const artifacts = Array.isArray(detail.document?.artifacts) ? detail.document.artifacts : [];
+    const schematicArtifacts = artifacts.filter((artifact) => artifact.type === "schematic");
+    const matched = schematicArtifacts.find((artifact) => artifact.locator && artifact.locator === item.locator)
+      || schematicArtifacts.find((artifact) => artifact.id && String(item.locator || "").includes(String(artifact.id)))
+      || schematicArtifacts[0];
+    if (matched) {
+      rows.push({ result: item, artifact: matched });
+    }
+  }
+  printSchematicResults(rows);
 }
 
 async function openDocument(args, options) {
@@ -362,6 +400,22 @@ function printSearch(result) {
   }
 }
 
+function printSchematicResults(rows) {
+  for (const [index, row] of rows.entries()) {
+    const item = row.result;
+    const artifact = row.artifact;
+    console.log(String(index + 1) + ". " + (item.title || item.documentId || "document") + " [" + (item.sourceType || "source") + "]");
+    console.log("   doc=" + (item.documentId || "") + " loc=" + (item.locator || artifact.locator || ""));
+    console.log("   image=" + (artifact.imagePath || ""));
+    console.log("   description=" + (artifact.descriptionPath || artifact.path || ""));
+    if (artifact.jsonPath) console.log("   json=" + artifact.jsonPath);
+    if (item.snippet) console.log("   " + String(item.snippet).replace(/\s+/gu, " ").trim());
+  }
+  if (rows.length === 0) {
+    console.log("No schematic documentation results.");
+  }
+}
+
 function printDocument(document) {
   console.log((document.title || document.document_id || document.documentId || "document") + " [" + (document.source_type || document.sourceType || "source") + "]");
   console.log("doc=" + (document.document_id || document.documentId || "") + " uri=" + (document.uri || ""));
@@ -414,6 +468,7 @@ function usage() {
   console.error([
     "Usage:",
     "  cloudx-doc.mjs search <query> [--limit 8] [--collection name] [--sourceType datasheet,media,spreadsheet]",
+    "  cloudx-doc.mjs schematics <query> [--limit 8] [--collection name] [--sourceType datasheet,image] [--artifacts 32]",
     "  cloudx-doc.mjs open <documentId> [--chunks 8] [--chars 1200] [--artifacts 8]",
     "  cloudx-doc.mjs list [--states active,stale] [--limit 50] [--offset 0] [--query text] [--collection name] [--sortDirection desc]",
     "  cloudx-doc.mjs ingest-url <url> [--sourceType media] [--collection name]",

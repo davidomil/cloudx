@@ -255,6 +255,8 @@ describe("DocumentationPlugin", () => {
     }));
     expect(plugin.skillContributions.some((skill) => skill.id === "documentation-answer")).toBe(false);
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-enrich-visuals")?.instructions).toContain("ai:visual");
+    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-enrich-visuals")?.instructions).toContain("ai:schematic");
+    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-enrich-visuals")?.instructions).toContain("do not invent component detections");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-enrich-visuals")?.instructions).toContain("one concise visual span per meaningful frame");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-enrich-visuals")?.instructions).not.toContain("curl -sS");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-archive-control")?.instructions).toContain("node \"$DOC\" manifest");

@@ -81,9 +81,9 @@ Source:
 Runs only when the `documentation.aiEnrichmentEnabled` plugin setting is
 true and global AI control is enabled. It reads the configured CloudX
 skills from the rules/skills catalog, builds complete evidence batches
-from all source-origin chunks, extracted table/figure/image artifact
-manifests, optional ASR transcript segments, and video keyframe paths,
-then invokes Codex exec with a strict JSON schema for each batch.
+from all source-origin chunks, extracted table/figure/image/schematic
+artifact manifests, optional ASR transcript segments, and video keyframe
+paths, then invokes Codex exec with a strict JSON schema for each batch.
 Returned spans are merged and written as AI-origin chunks by
 `POST /documents/{id}/enrich`.
 
@@ -192,8 +192,8 @@ that ingest request and single-file ingest uses the parent folder name.
 
 | Input class | Examples | Extraction behavior |
 |----|----|----|
-| PDF | `.pdf`, `application/pdf`, `%PDF-` bytes | Page text, tables, and rendered visual page artifacts. |
-| Image | `.png`, `.jpg`, `.jpeg`, `.gif`, `.tif`, `.tiff`, `.bmp`, `.webp`, `image/*` | Normalized PNG artifacts for all frames plus format, size, mode, and frame metadata. |
+| PDF | `.pdf`, `application/pdf`, `%PDF-` bytes | Page text, tables, rendered visual page artifacts, and Phase 1 schematic description artifacts for schematic-like pages. |
+| Image | `.png`, `.jpg`, `.jpeg`, `.gif`, `.tif`, `.tiff`, `.bmp`, `.webp`, `image/*` | Normalized PNG artifacts for all frames plus format, size, mode, frame metadata, and Phase 1 schematic description artifacts for schematic-like images. |
 | Spreadsheet | `.xls`, `.xlsx`, `.xlsm`, `.xlsb`, `.ods`, `.ots`, Excel/OpenDocument spreadsheet content types | One searchable chunk per sheet plus portable CSV, Markdown, JSON, and `spreadsheet_index.tsv` artifacts. XLSX/XLSM formulas and merged ranges are preserved as metadata where the file exposes them. |
 | HTML | `.html`, `.htm`, `text/html` | Text after removing script, style, template, and noscript content. |
 | Text and code | `.md`, `.txt`, `.json`, `.yaml`, `.xml`, `.csv`, `.py`, `.ts`, `.tsx`, `.js`, `.c`, `.cpp`, `.h`, `.rs`, `.css`, `.adoc`, `.tex` | UTF-8 text decode with replacement for invalid bytes. |
@@ -278,13 +278,20 @@ later. Spreadsheet input creates one source chunk per sheet with
 `sheet <name> range <A1:...>` locators and writes CSV, Markdown, JSON,
 and manifest sidecars under `extracted/spreadsheets/`. XLSX/XLSM sheets
 retain formula text and merged-range metadata; legacy XLS values are
-read through the XLS engine. Image input is normalized to PNG sidecars
-under `extracted/images/`; multi-frame images preserve every frame as a
-separate artifact and are indexed with format, size, mode, frame count,
-and visual-artifact metadata. HTML input is parsed with script, style,
-template, and noscript content removed. Other input is decoded as text.
-Extracted spans are split into paragraph-like chunks with a maximum
-target size of 1200 characters.
+read through the XLS engine. Schematic-like PDF pages and standalone
+images get Phase 1 schematic records under `extracted/schematics/<id>/`
+with a searchable source chunk, saved description Markdown, JSON
+analysis metadata, a pointer back to the exact rendered/original image
+artifact, deterministic classification reasons, reference designator and
+net-label candidates from existing text or filenames, connection-cue
+metrics, and `analysisOutputs: []` for future structured analyzers.
+Image input is normalized to PNG sidecars under `extracted/images/`;
+multi-frame images preserve every frame as a separate artifact and are
+indexed with format, size, mode, frame count, and visual-artifact
+metadata. HTML input is parsed with script, style, template, and noscript
+content removed. Other input is decoded as text. Extracted spans are
+split into paragraph-like chunks with a maximum target size of 1200
+characters.
 
 This is similar to the datasheet-analysis workflow in the important ways
 for storage and recall: tables become standalone artifacts, visual pages
@@ -541,18 +548,18 @@ at server startup:
 
 | Rule | Purpose |
 |----|----|
-| `documentation-ingest-evidence` | Search active local archive records first. When adding evidence from a file, PDF, image, URL, YouTube video, or playlist, ingest the original source so the full extractor runs; use text ingest only when no original source is available. |
+| `documentation-ingest-evidence` | Search active local archive records first. When adding evidence from a file, PDF, spreadsheet, image, URL, YouTube video, or playlist, ingest the original source so the full extractor runs; use text ingest only when no original source is available. |
 
 The plugin contributes seven CloudX system skills automatically at
 server startup:
 
 | Skill | Purpose |
 |----|----|
-| `documentation-search` | Mandatory local-first lookup for factual, research, recipe, recommendation, troubleshooting, summary, and source-grounded questions; when adding evidence, route original files, PDFs, images, URLs, YouTube videos, and playlists through full ingest before answering from refreshed archive records. |
+| `documentation-search` | Mandatory local-first lookup for factual, research, recipe, recommendation, troubleshooting, summary, and source-grounded questions; when adding evidence, route original files, PDFs, spreadsheets, images, URLs, YouTube videos, and playlists through full ingest before answering from refreshed archive records. |
 | `documentation-ingest` | Add original files, directories, websites, PDFs, images, YouTube videos/playlists, and copied text only when no retrievable original exists; prefer primary source URLs over search-result pages or low-trust mirrors. |
 | `documentation-invalidate` | Find and invalidate stale, wrong, superseded, quarantined, or deleted sources. |
 | `documentation-enrich-metadata` | Derive source-grounded metadata and searchable import-improvement notes. |
-| `documentation-enrich-visuals` | Describe extracted tables, graphs, diagrams, screenshots, and flowcharts without inventing visual facts. |
+| `documentation-enrich-visuals` | Describe extracted tables, graphs, diagrams, screenshots, flowcharts, and schematic artifacts without inventing visual facts, netlists, or connectivity maps. |
 | `documentation-enrich-media` | Improve media imports using transcripts and selected keyframes when available. |
 | `documentation-archive-control` | Inspect health, stats, portable manifest, and rebuild status. |
 
@@ -567,7 +574,7 @@ archive, and rerun local search before answering. When Codex tabs are launched
 from CloudX, the server exports that URL to child processes.
 
 The operational documentation skills also bundle `scripts/cloudx-doc.mjs`, a
-small helper that wraps search, open, list, ingest-url, ingest-path,
+small helper that wraps search, schematic search, open, list, ingest-url, ingest-path,
 ingest-text, invalidate, remove, health, stats, manifest, and rebuild calls so
 Codex can use short commands instead of handwritten curl/JSON/NDJSON requests.
 The enrichment skills stay instruction-only because they define model output
@@ -663,8 +670,9 @@ The indexer tests cover:
 - Ingesting uploaded files, PDFs, local directories, image files, HTML
   websites, README/code-like files, media transcripts, and AI-derived
   enrichment chunks.
-- Extracting PDF table sidecars, rendered visual artifacts, and
-  normalized image artifacts.
+- Extracting PDF table sidecars, rendered visual artifacts, normalized
+  image artifacts, schematic description artifacts, and spreadsheet
+  sheet artifacts.
 - Searching with hybrid retrieval, lexical-only behavior, strict
   identifier recall, and dense-only fallback above the configured
   threshold.
@@ -724,6 +732,10 @@ generated corpus, archive, and summary files stay under the selected
 - Browser uploads and URL downloads are capped at 256 MiB.
 - PDF graph and flowchart extraction preserves rendered visual
   artifacts, but it does not OCR labels or infer graph semantics.
+- Schematic-aware ingest is Phase 1 only: it classifies schematic-like
+  visual artifacts, writes searchable descriptions and schema-ready JSON,
+  and leaves `analysisOutputs` empty. It does not run OCR, component
+  detection, connectivity mapping, SPICE export, or netlist generation.
 - AI enrichment is enabled by default as a Documentation plugin setting,
   but it still requires global AI control. If either setting is
   disabled, assisted answers and post-ingest AI spans are unavailable;

@@ -410,7 +410,7 @@ function defaultDocumentationSkills(): PluginSkillContribution[] {
         "Before answering any factual, research, recipe, recommendation, troubleshooting, summary, or source-grounded question, run local archive search first even when the question looks general or answerable from memory.",
         "Use the user's exact topic as the first helper search query, then broaden or narrow only after seeing local results.",
         "When Codex is answering the user, use this direct search path instead of `documentation.answer`; Codex should inspect sources itself rather than chaining through another AI answer pass.",
-        "Open the strongest matching documents with the helper and read relevant chunks, transcripts, tables, descriptions, and artifact metadata before answering.",
+        "Open the strongest matching documents with the helper and read relevant chunks, transcripts, tables, schematic descriptions, and artifact metadata before answering.",
         "Use only results whose `state` is `active` unless the user explicitly asks for stale, revoked, deleted, or audit history.",
         "If active local results are absent, weak, stale, or do not cover the user's question, use built-in web search before answering. Prefer official product/project documentation, vendor datasheets, standards/specs, peer-reviewed or government/institutional sources for high-stakes domains, and reputable news sources for current events. Avoid forum or blog claims unless they are explicitly requested or corroborated by stronger sources.",
         "When adding evidence, ingest the original file, PDF, spreadsheet, image, URL, YouTube video, or playlist through the ingest skill so the full extractor can capture text, tables, workbook sheets, figures, screenshots, transcripts, and keyframes; use `/ingest/text` only when no original source is available. Preserve title, URI, source type, and collection metadata.",
@@ -433,7 +433,7 @@ function defaultDocumentationSkills(): PluginSkillContribution[] {
         "Set `sourceType` to one of `datasheet`, `book`, `website`, `repo_code`, `readme`, `media`, `image`, `spreadsheet`, or `text` when the user gives enough context.",
         "Leave `title` and `collection` blank when the indexer should autodetect them from the file, folder, URL, playlist, upload, or first text line.",
         "When ingesting sources found online, prefer durable primary URLs and include the original source URL. Do not ingest search-result pages, low-trust mirrors, or unsupported summaries when a better source is available.",
-        "When AI enrichment is disabled, only source text and extracted artifact metadata are immediately searchable. Do manual follow-up by searching, opening full documents, reading transcript chunks or table artifacts, and writing source-grounded notes yourself.",
+        "When AI enrichment is disabled, only source text and extracted artifact metadata are immediately searchable. Do manual follow-up by searching, opening full documents, reading transcript chunks, table artifacts, or schematic descriptions, and writing source-grounded notes yourself.",
         "Do not ingest outdated or untrusted material silently. Preserve precise source URI metadata whenever the user provides it."
       ]),
       files: DOCUMENTATION_HELPER_FILES
@@ -465,10 +465,11 @@ function defaultDocumentationSkills(): PluginSkillContribution[] {
     {
       id: "documentation-enrich-visuals",
       name: "Documentation Enrich Visuals",
-      description: "Improve imports by describing extracted tables, graphs, diagrams, screenshots, and flowcharts.",
+      description: "Improve imports by describing extracted tables, graphs, diagrams, screenshots, flowcharts, and schematic description artifacts.",
       instructions: skillInstructions("Enrich Visuals", [
-        "Use extracted table files, figure indexes, image metadata, keyframe paths, and surrounding chunks as the visual evidence.",
-        "Describe tables, graphs, flowcharts, block diagrams, screenshots, and visible labels in short searchable spans with locators that start with `ai:visual`.",
+        "Use extracted table files, figure indexes, image metadata, schematic description artifacts, keyframe paths, and surrounding chunks as the visual evidence.",
+        "Describe tables, graphs, flowcharts, block diagrams, screenshots, schematic description artifacts, and visible labels in short searchable spans with locators that start with `ai:visual`.",
+        "When a schematic artifact is present, write grounded `ai:schematic:<id>` spans only from its saved image path, deterministic description, and nearby source chunks; do not invent component detections, connectivity maps, OCR assignments, SPICE, or netlists.",
         "For video keyframes, use the timestamped `media keyframe ...` chunk, keyframe artifact path, and nearby transcript context to write one concise visual span per meaningful frame.",
         "Keep each video-frame span grounded to that frame's timestamp and visible image evidence; do not collapse all frames into one generic video summary.",
         "Call out where the current extraction looks incomplete, such as cropped figures, missing axis labels, unreadable callouts, or tables that need manual review.",
@@ -507,7 +508,7 @@ function defaultDocumentationRules(): PluginRuleContribution[] {
     {
       id: "documentation-ingest-evidence",
       description: "Capture task evidence in the local documentation archive before relying on it.",
-      text: "Before answering source-grounded questions, search active records in the local CloudX documentation archive first. When adding evidence from a file, PDF, image, URL, YouTube video, or playlist, ingest the original source through the documentation ingest hooks so the full extractor runs; use text ingest only when no original source is available, then rerun search and answer from the archive."
+      text: "Before answering source-grounded questions, search active records in the local CloudX documentation archive first. When adding evidence from a file, PDF, spreadsheet, image, URL, YouTube video, or playlist, ingest the original source through the documentation ingest hooks so the full extractor runs; use text ingest only when no original source is available, then rerun search and answer from the archive."
     }
   ];
 }

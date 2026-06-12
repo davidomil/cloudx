@@ -15,7 +15,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
-from PIL import Image, ImageSequence
+from PIL import Image, ImageFilter, ImageSequence
 import pdfplumber
 import pypdfium2 as pdfium
 
@@ -31,6 +31,10 @@ SPREADSHEET_CONTENT_TYPES = {
     "application/vnd.oasis.opendocument.spreadsheet",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
+SCHEMATIC_SCHEMA_VERSION = 1
+SCHEMATIC_TERMS = {"schematic", "circuit", "netlist", "reference designator", "power rail"}
+REFERENCE_DESIGNATOR_RE = re.compile(r"\b(?:R|C|L|U|J|P|Q|D|TP|FB|Y|X|K|F|SW|RN)\d+[A-Za-z]?\b")
+NET_LABEL_RE = re.compile(r"\b(?:VCC|VDD|VSS|GND|AGND|DGND|VIN|VOUT|SDA|SCL|MISO|MOSI|RESET|ENABLE|EN|BOOT|INT|CLK|TX|RX)\b")
 TEXT_SUFFIXES = {
     ".adoc",
     ".asciidoc",
@@ -82,6 +86,21 @@ class ExtractedSpreadsheetSheet:
     merged_ranges: list[str]
 
 
+@dataclass(frozen=True)
+class SchematicArtifact:
+    id: str
+    source: str
+    locator: str
+    image: str
+    width: int
+    height: int
+    reasons: list[str]
+    reference_designators: list[str]
+    labels: list[str]
+    connection_cues: list[str]
+    metrics: dict[str, int | float]
+
+
 def extract_file(path: Path, content: bytes, source_type: str, artifact_dir: Path | None = None) -> list[ExtractedSpan]:
     return extract_bytes(content, path.name, source_type, mimetypes.guess_type(path.name)[0], artifact_dir)
 
@@ -96,7 +115,7 @@ def extract_bytes(
     suffix = source_suffix(name)
     normalized_type = normalized_content_type(content_type)
     if suffix in PDF_SUFFIXES or normalized_type == "application/pdf" or looks_like_pdf(content):
-        return PdfExtractionPipeline(artifact_dir).extract(content)
+        return PdfExtractionPipeline(artifact_dir).extract(content, name)
     if source_type == "spreadsheet" or suffix in SPREADSHEET_SUFFIXES or normalized_type in SPREADSHEET_CONTENT_TYPES:
         return SpreadsheetExtractionPipeline(artifact_dir).extract(content, name, normalized_type)
     if source_type == "image" or suffix in IMAGE_SUFFIXES or normalized_type.startswith("image/"):
@@ -110,19 +129,20 @@ class PdfExtractionPipeline:
     def __init__(self, artifact_dir: Path | None = None):
         self.artifact_dir = artifact_dir
 
-    def extract(self, content: bytes) -> list[ExtractedSpan]:
+    def extract(self, content: bytes, name: str = "source.pdf") -> list[ExtractedSpan]:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temp_file:
             temp_file.write(content)
             temp_path = Path(temp_file.name)
         try:
-            return self._extract_from_path(temp_path)
+            return self._extract_from_path(temp_path, name)
         finally:
             temp_path.unlink(missing_ok=True)
 
-    def _extract_from_path(self, pdf_path: Path) -> list[ExtractedSpan]:
+    def _extract_from_path(self, pdf_path: Path, name: str) -> list[ExtractedSpan]:
         spans: list[ExtractedSpan] = []
         table_records: list[dict[str, str | int]] = []
         figure_records: list[dict[str, str | int]] = []
+        schematic_records: list[dict[str, Any]] = []
         artifact_root = prepare_artifact_dir(self.artifact_dir)
 
         with pdfplumber.open(pdf_path) as pdf:
@@ -143,20 +163,35 @@ class PdfExtractionPipeline:
                     if visual_summary and artifact_root and pdfium_doc:
                         figure_id = f"figure-{len(figure_records) + 1:03d}"
                         figure_path = render_page_artifact(pdfium_doc, page_number, artifact_root / "figures" / f"{figure_id}.png")
+                        relative_figure_path = figure_path.relative_to(artifact_root).as_posix()
                         figure_records.append({
                             "id": figure_id,
                             "page": page_number,
                             "kind": "page-render",
-                            "path": figure_path.relative_to(artifact_root).as_posix(),
+                            "path": relative_figure_path,
                             **visual_summary,
                         })
                         spans.append(ExtractedSpan(visual_span_text(figure_id, page_number, visual_summary), f"page {page_number} {figure_id}"))
+                        schematic = schematic_artifact_from_pdf_page(
+                            schematic_id=f"schematic-{len(schematic_records) + 1:03d}",
+                            filename=name,
+                            page_number=page_number,
+                            figure_id=figure_id,
+                            image_path=relative_figure_path,
+                            image_file=figure_path,
+                            page_text=text,
+                            visual_summary=visual_summary,
+                        )
+                        if schematic:
+                            record = write_schematic_artifact(artifact_root, schematic)
+                            schematic_records.append(record)
+                            spans.append(ExtractedSpan(schematic_span_text(schematic, record), f"schematic {schematic.id} page {page_number} {figure_id}"))
             finally:
                 if pdfium_doc is not None:
                     pdfium_doc.close()
 
         if artifact_root:
-            write_index_files(artifact_root, table_records, figure_records)
+            write_index_files(artifact_root, table_records, figure_records, schematic_records)
         return spans
 
 
@@ -165,6 +200,8 @@ class ImageExtractionPipeline:
         self.artifact_dir = artifact_dir
 
     def extract(self, content: bytes, name: str) -> list[ExtractedSpan]:
+        spans: list[ExtractedSpan] = []
+        schematic_records: list[dict[str, Any]] = []
         artifact_root = prepare_artifact_dir(self.artifact_dir)
         with Image.open(io.BytesIO(content)) as image:
             image.load()
@@ -184,12 +221,28 @@ class ImageExtractionPipeline:
                 for frame_index, frame in enumerate(ImageSequence.Iterator(image), start=1):
                     output_name = f"{safe_stem(name)}.png" if frames == 1 else f"{safe_stem(name)}-frame-{frame_index:04d}.png"
                     normalized_path = images_dir / output_name
-                    frame.convert("RGBA").save(normalized_path)
-                    frame_paths.append(normalized_path.relative_to(artifact_root).as_posix())
+                    normalized_frame = frame.convert("RGBA")
+                    normalized_frame.save(normalized_path)
+                    relative_frame_path = normalized_path.relative_to(artifact_root).as_posix()
+                    frame_paths.append(relative_frame_path)
+                    schematic = schematic_artifact_from_image(
+                        schematic_id=f"schematic-{len(schematic_records) + 1:03d}",
+                        filename=name,
+                        frame_index=frame_index,
+                        frames=frames,
+                        image_path=relative_frame_path,
+                        image=normalized_frame,
+                    )
+                    if schematic:
+                        record = write_schematic_artifact(artifact_root, schematic)
+                        schematic_records.append(record)
+                        spans.append(ExtractedSpan(schematic_span_text(schematic, record), f"schematic {schematic.id} image frame {frame_index}"))
                 metadata["artifact"] = frame_paths[0] if frame_paths else ""
                 metadata["artifacts"] = frame_paths
                 (artifact_root / "image_metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        return [ExtractedSpan(image_span_text(metadata), "image")]
+        if artifact_root and schematic_records:
+            write_schematic_index(artifact_root, schematic_records)
+        return [ExtractedSpan(image_span_text(metadata), "image"), *spans]
 
 
 class SpreadsheetExtractionPipeline:
@@ -527,6 +580,226 @@ def spreadsheet_column_name(column: int) -> str:
     return name or "A"
 
 
+def schematic_artifact_from_pdf_page(
+    *,
+    schematic_id: str,
+    filename: str,
+    page_number: int,
+    figure_id: str,
+    image_path: str,
+    image_file: Path,
+    page_text: str,
+    visual_summary: dict[str, int],
+) -> SchematicArtifact | None:
+    metrics = schematic_image_metrics(image_file)
+    references = reference_designators(page_text)
+    labels = schematic_labels(page_text)
+    reasons = schematic_reasons(filename, page_text, references, labels, visual_summary, metrics)
+    if not reasons:
+        return None
+    return SchematicArtifact(
+        id=schematic_id,
+        source="pdf-page",
+        locator=f"page {page_number} {figure_id}",
+        image=image_path,
+        width=int(metrics["width"]),
+        height=int(metrics["height"]),
+        reasons=reasons,
+        reference_designators=references,
+        labels=labels,
+        connection_cues=schematic_connection_cues(visual_summary, metrics),
+        metrics=metrics,
+    )
+
+
+def schematic_artifact_from_image(
+    *,
+    schematic_id: str,
+    filename: str,
+    frame_index: int,
+    frames: int,
+    image_path: str,
+    image: Image.Image,
+) -> SchematicArtifact | None:
+    metrics = schematic_image_metrics(image)
+    references = reference_designators(filename)
+    labels = schematic_labels(filename)
+    locator = "image" if frames == 1 else f"image frame {frame_index}"
+    reasons = schematic_reasons(filename, filename, references, labels, {}, metrics)
+    if not reasons:
+        return None
+    return SchematicArtifact(
+        id=schematic_id,
+        source="image",
+        locator=locator,
+        image=image_path,
+        width=int(metrics["width"]),
+        height=int(metrics["height"]),
+        reasons=reasons,
+        reference_designators=references,
+        labels=labels,
+        connection_cues=schematic_connection_cues({}, metrics),
+        metrics=metrics,
+    )
+
+
+def schematic_reasons(
+    filename: str,
+    source_text: str,
+    references: list[str],
+    labels: list[str],
+    visual_summary: dict[str, int],
+    metrics: dict[str, int | float],
+) -> list[str]:
+    reasons: list[str] = []
+    lower_text = f"{filename}\n{source_text}".lower()
+    has_schematic_terms = any(term in lower_text for term in SCHEMATIC_TERMS)
+    if has_schematic_terms:
+        reasons.append("source text or filename contains schematic/circuit terms")
+    if len(references) >= 2:
+        reasons.append("source text contains multiple reference-designator-like labels")
+    if labels and (has_schematic_terms or references):
+        reasons.append("source text contains schematic net or signal labels")
+    if visual_summary and references and (visual_summary.get("lines", 0) + visual_summary.get("curves", 0) + visual_summary.get("rectangles", 0)) >= 6:
+        reasons.append("rendered page has schematic-like line geometry near electrical labels")
+    if not visual_summary and any(term in lower_text for term in {"schematic", "circuit"}) and float(metrics.get("edge_ratio", 0.0)) >= 0.01:
+        reasons.append("image filename indicates a schematic and the image has line-art edges")
+    return reasons
+
+
+def schematic_connection_cues(visual_summary: dict[str, int], metrics: dict[str, int | float]) -> list[str]:
+    cues: list[str] = []
+    line_count = visual_summary.get("lines", 0)
+    curve_count = visual_summary.get("curves", 0)
+    rectangle_count = visual_summary.get("rectangles", 0)
+    if line_count:
+        cues.append(f"{line_count} PDF vector line objects")
+    if curve_count:
+        cues.append(f"{curve_count} PDF vector curve objects")
+    if rectangle_count:
+        cues.append(f"{rectangle_count} PDF rectangle objects")
+    edge_ratio = float(metrics.get("edge_ratio", 0.0))
+    dark_ratio = float(metrics.get("dark_ratio", 0.0))
+    if edge_ratio:
+        cues.append(f"line-art edge ratio {edge_ratio:.3f}")
+    if dark_ratio:
+        cues.append(f"dark-pixel ratio {dark_ratio:.3f}")
+    return cues
+
+
+def schematic_image_metrics(image_or_path: Image.Image | Path) -> dict[str, int | float]:
+    if isinstance(image_or_path, Path):
+        with Image.open(image_or_path) as image:
+            return schematic_image_metrics(image)
+    grayscale = image_or_path.convert("L")
+    width, height = grayscale.size
+    pixels = max(1, width * height)
+    dark_pixels = sum(grayscale.histogram()[:96])
+    edges = grayscale.filter(ImageFilter.FIND_EDGES)
+    edge_pixels = sum(edges.histogram()[33:])
+    return {
+        "width": width,
+        "height": height,
+        "dark_ratio": round(dark_pixels / pixels, 6),
+        "edge_ratio": round(edge_pixels / pixels, 6),
+    }
+
+
+def reference_designators(text: str) -> list[str]:
+    return sorted(set(REFERENCE_DESIGNATOR_RE.findall(text.upper())))
+
+
+def schematic_labels(text: str) -> list[str]:
+    return sorted(set(NET_LABEL_RE.findall(text.upper().replace("_", " ").replace("-", " "))))
+
+
+def write_schematic_artifact(artifact_root: Path, schematic: SchematicArtifact) -> dict[str, Any]:
+    schematic_dir = artifact_root / "schematics" / schematic.id
+    schematic_dir.mkdir(parents=True, exist_ok=True)
+    description_path = schematic_dir / "description.md"
+    json_path = schematic_dir / "analysis.json"
+    record: dict[str, Any] = {
+        "id": schematic.id,
+        "schema_version": SCHEMATIC_SCHEMA_VERSION,
+        "source": schematic.source,
+        "locator": schematic.locator,
+        "image": schematic.image,
+        "description": description_path.relative_to(artifact_root).as_posix(),
+        "json": json_path.relative_to(artifact_root).as_posix(),
+        "references": ", ".join(schematic.reference_designators),
+        "labels": ", ".join(schematic.labels),
+        "connection_cues": "; ".join(schematic.connection_cues),
+        "reasons": "; ".join(schematic.reasons),
+        "analysis_outputs": "[]",
+    }
+    description_path.write_text(schematic_markdown_document(schematic), encoding="utf-8")
+    json_path.write_text(json.dumps(schematic_json_document(schematic), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return record
+
+
+def write_schematic_index(artifact_root: Path, records: list[dict[str, Any]]) -> None:
+    write_tsv(
+        artifact_root / "schematic_index.tsv",
+        records,
+        ["id", "schema_version", "source", "locator", "image", "description", "json", "references", "labels", "connection_cues", "reasons", "analysis_outputs"],
+    )
+
+
+def schematic_json_document(schematic: SchematicArtifact) -> dict[str, Any]:
+    return {
+        "schemaVersion": SCHEMATIC_SCHEMA_VERSION,
+        "id": schematic.id,
+        "source": schematic.source,
+        "locator": schematic.locator,
+        "image": schematic.image,
+        "imageSize": {"width": schematic.width, "height": schematic.height},
+        "classification": {"isSchematic": True, "reasons": schematic.reasons, "metrics": schematic.metrics},
+        "referenceDesignators": schematic.reference_designators,
+        "labels": schematic.labels,
+        "connectionCues": schematic.connection_cues,
+        "analysisOutputs": [],
+    }
+
+
+def schematic_markdown_document(schematic: SchematicArtifact) -> str:
+    lines = [
+        f"# Schematic Artifact {schematic.id}",
+        "",
+        f"Source locator: {schematic.locator}",
+        f"Image artifact: {schematic.image}",
+        f"Schema version: {SCHEMATIC_SCHEMA_VERSION}",
+        "",
+        "## Classification",
+        *[f"- {reason}" for reason in schematic.reasons],
+        "",
+        "## Visible Text Candidates",
+        f"Reference designators: {', '.join(schematic.reference_designators) if schematic.reference_designators else 'not extracted by the deterministic Phase 1 analyzer'}",
+        f"Labels and nets: {', '.join(schematic.labels) if schematic.labels else 'not extracted by the deterministic Phase 1 analyzer'}",
+        "",
+        "## Connection Cues",
+        *[f"- {cue}" for cue in schematic.connection_cues],
+        "",
+        "## Structured Analysis Outputs",
+        "No component detection, connectivity mapping, OCR assignment, or netlist output is attached yet. Future SINA-style analyzers can append outputs to this schema without re-ingesting the source document.",
+    ]
+    return "\n".join(lines).strip() + "\n"
+
+
+def schematic_span_text(schematic: SchematicArtifact, record: dict[str, Any]) -> str:
+    references = ", ".join(schematic.reference_designators) if schematic.reference_designators else "not extracted"
+    labels = ", ".join(schematic.labels) if schematic.labels else "not extracted"
+    cues = "; ".join(schematic.connection_cues) if schematic.connection_cues else "no geometric cues recorded"
+    reasons = "; ".join(schematic.reasons)
+    return "\n".join([
+        f"Schematic image artifact {schematic.id} from {schematic.locator}.",
+        f"Description artifact: {record['description']}. Image artifact: {schematic.image}. JSON artifact: {record['json']}.",
+        f"Classification reasons: {reasons}.",
+        f"Reference designator candidates: {references}. Labels and net candidates: {labels}.",
+        f"Connection cues: {cues}.",
+        "Analysis outputs are empty in Phase 1; this record is schema-ready for future component detections, connectivity mappings, OCR/designator assignments, and SPICE netlists.",
+    ]).strip()
+
+
 def render_page_artifact(pdf: pdfium.PdfDocument, page_number: int, output_path: Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     page = pdf[page_number - 1]
@@ -547,7 +820,7 @@ def page_visual_summary(page: pdfplumber.page.Page) -> dict[str, int] | None:
     return summary if any(summary.values()) else None
 
 
-def write_index_files(artifact_root: Path, tables: list[dict[str, str | int]], figures: list[dict[str, str | int]]) -> None:
+def write_index_files(artifact_root: Path, tables: list[dict[str, str | int]], figures: list[dict[str, str | int]], schematics: list[dict[str, Any]] | None = None) -> None:
     if tables:
         write_tsv(artifact_root / "table_index.tsv", tables, ["id", "page", "rows", "columns", "non_empty_cells", "total_cells", "csv", "markdown"])
     if figures:
@@ -559,6 +832,8 @@ def write_index_files(artifact_root: Path, tables: list[dict[str, str | int]], f
                 f"(images={figure['images']}, lines={figure['lines']}, rectangles={figure['rectangles']}, curves={figure['curves']})"
             )
         (artifact_root / "figures.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if schematics:
+        write_schematic_index(artifact_root, schematics)
 
 
 def write_tsv(path: Path, rows: list[dict[str, str | int]], fields: list[str]) -> None:

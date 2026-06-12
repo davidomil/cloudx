@@ -1453,6 +1453,7 @@ def snapshot_artifact_window(document_id: str, snapshot_path: Path, *, offset: i
     sources: list[tuple[int, Callable[[int, int | None], list[dict[str, Any]]]]] = [
         (pdf_figure_artifact_count(artifact_root), lambda local_offset, local_limit: pdf_figure_artifacts(document_id, artifact_root, offset=local_offset, limit=local_limit)),
         (pdf_table_artifact_count(artifact_root), lambda local_offset, local_limit: pdf_table_artifacts(document_id, artifact_root, offset=local_offset, limit=local_limit)),
+        (schematic_artifact_count(artifact_root), lambda local_offset, local_limit: schematic_artifacts(document_id, artifact_root, offset=local_offset, limit=local_limit)),
         (spreadsheet_artifact_count(artifact_root), lambda local_offset, local_limit: spreadsheet_artifacts(document_id, artifact_root, offset=local_offset, limit=local_limit)),
         (image_artifact_count(artifact_root), lambda local_offset, local_limit: image_artifacts(document_id, artifact_root, offset=local_offset, limit=local_limit)),
         (media_keyframe_artifact_count(artifact_root), lambda local_offset, local_limit: media_keyframe_artifacts(document_id, artifact_root, offset=local_offset, limit=local_limit)),
@@ -1555,6 +1556,56 @@ def pdf_table_artifacts(document_id: str, artifact_root: Path, *, offset: int = 
 
 def is_pdf_table_artifact_row(row: dict[str, str]) -> bool:
     return bool(optional_text(row.get("id")) and (optional_text(row.get("markdown")) or optional_text(row.get("csv"))))
+
+
+def schematic_artifact_count(artifact_root: Path) -> int:
+    return count_tsv_rows(artifact_root / "schematic_index.tsv", is_schematic_artifact_row)
+
+
+def schematic_artifacts(document_id: str, artifact_root: Path, *, offset: int = 0, limit: int | None = None) -> list[dict[str, Any]]:
+    records = []
+    for row in window_tsv_rows(artifact_root / "schematic_index.tsv", offset, limit, is_schematic_artifact_row):
+        schematic_id = optional_text(row.get("id"))
+        description_path = optional_text(row.get("description"))
+        image_path = optional_text(row.get("image"))
+        json_path = optional_text(row.get("json"))
+        path = description_path or json_path or image_path
+        alternate_paths = []
+        if description_path:
+            alternate_paths.append(artifact_link("description", artifact_root, description_path))
+        if json_path:
+            alternate_paths.append(artifact_link("json", artifact_root, json_path))
+        if image_path:
+            alternate_paths.append(artifact_link("image", artifact_root, image_path))
+        records.append(
+            with_artifact_file_metadata(
+                artifact_root,
+                {
+                    "documentId": document_id,
+                    "type": "schematic",
+                    "kind": "schematic-description",
+                    "id": schematic_id,
+                    "path": safe_artifact_relative_path(path),
+                    "locator": optional_text(row.get("locator")) or schematic_id,
+                    "source": optional_text(row.get("source")),
+                    "schemaVersion": optional_int(row.get("schema_version")),
+                    "imagePath": safe_artifact_relative_path(image_path) if image_path else None,
+                    "jsonPath": safe_artifact_relative_path(json_path) if json_path else None,
+                    "descriptionPath": safe_artifact_relative_path(description_path) if description_path else None,
+                    "referenceDesignators": csv_string_list(row.get("references")),
+                    "labels": csv_string_list(row.get("labels")),
+                    "connectionCues": semicolon_string_list(row.get("connection_cues")),
+                    "classificationReasons": semicolon_string_list(row.get("reasons")),
+                    "analysisOutputs": [],
+                    "alternatePaths": alternate_paths,
+                },
+            )
+        )
+    return records
+
+
+def is_schematic_artifact_row(row: dict[str, str]) -> bool:
+    return bool(optional_text(row.get("id")) and (optional_text(row.get("description")) or optional_text(row.get("json")) or optional_text(row.get("image"))))
 
 
 def spreadsheet_artifact_count(artifact_root: Path) -> int:
@@ -1771,6 +1822,7 @@ def snapshot_artifact_path_exists(snapshot_path: Path, relative_path: str) -> bo
 def snapshot_artifact_paths(artifact_root: Path) -> Iterator[str]:
     yield from pdf_figure_artifact_paths(artifact_root)
     yield from pdf_table_artifact_paths(artifact_root)
+    yield from schematic_artifact_paths(artifact_root)
     yield from spreadsheet_artifact_paths(artifact_root)
     yield from image_artifact_paths(artifact_root)
     yield from media_keyframe_artifact_paths(artifact_root)
@@ -1790,6 +1842,18 @@ def pdf_table_artifact_paths(artifact_root: Path) -> Iterator[str]:
             yield safe_artifact_relative_path(csv_path)
         if markdown_path := optional_text(row.get("markdown")):
             yield safe_artifact_relative_path(markdown_path)
+
+
+def schematic_artifact_paths(artifact_root: Path) -> Iterator[str]:
+    for row in iter_tsv(artifact_root / "schematic_index.tsv"):
+        if not is_schematic_artifact_row(row):
+            continue
+        if description_path := optional_text(row.get("description")):
+            yield safe_artifact_relative_path(description_path)
+        if json_path := optional_text(row.get("json")):
+            yield safe_artifact_relative_path(json_path)
+        if image_path := optional_text(row.get("image")):
+            yield safe_artifact_relative_path(image_path)
 
 
 def spreadsheet_artifact_paths(artifact_root: Path) -> Iterator[str]:
@@ -1864,6 +1928,14 @@ def string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [text for item in value if (text := optional_text(str(item)))]
+
+
+def csv_string_list(value: Any) -> list[str]:
+    return [text.strip() for text in str(value or "").split(",") if text.strip()]
+
+
+def semicolon_string_list(value: Any) -> list[str]:
+    return [text.strip() for text in str(value or "").split(";") if text.strip()]
 
 
 def chapter_list(value: Any) -> list[dict[str, Any]]:

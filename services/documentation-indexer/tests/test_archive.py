@@ -1156,6 +1156,65 @@ def test_pdf_tables_visuals_and_images_are_extracted_as_portable_artifacts(tmp_p
     assert image_record["artifacts"][0]["path"] == "images/debug-flowchart.png"
 
 
+def test_schematic_pdf_page_creates_searchable_artifacts(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "buck-converter-schematic.pdf"
+    make_schematic_pdf(pdf_path)
+    archive = DocumentationArchive(tmp_path / "archive")
+
+    document = archive.ingest_path(pdf_path, source_type="datasheet")[0]
+
+    result = archive.search("Phase 1 analysis outputs R3 VDD schematic", source_types=["datasheet"], limit=1)[0]
+    assert result["documentId"] == document.document_id
+    assert result["locator"].startswith("schematic schematic-001 page 1 figure-001")
+    snapshot = tmp_path / "archive" / result["citation"]["snapshotPath"]
+    extracted = snapshot.parent / "extracted"
+    assert (extracted / "schematic_index.tsv").exists()
+    description_path = extracted / "schematics" / "schematic-001" / "description.md"
+    analysis_path = extracted / "schematics" / "schematic-001" / "analysis.json"
+    assert "Reference designators: R3, U1" in description_path.read_text(encoding="utf-8")
+    analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+    assert analysis["analysisOutputs"] == []
+    assert analysis["referenceDesignators"] == ["R3", "U1"]
+    assert {"GND", "VDD"}.issubset(set(analysis["labels"]))
+
+    record = archive.get_document(document.document_id)
+    schematic = next(artifact for artifact in record["artifacts"] if artifact["type"] == "schematic")
+    assert schematic["kind"] == "schematic-description"
+    assert schematic["imagePath"] == "figures/figure-001.png"
+    assert schematic["descriptionPath"] == "schematics/schematic-001/description.md"
+    assert schematic["jsonPath"] == "schematics/schematic-001/analysis.json"
+    assert schematic["analysisOutputs"] == []
+    assert archive.document_artifact_file(document.document_id, schematic["descriptionPath"]).media_type == "text/markdown"
+    assert archive.document_artifact_file(document.document_id, schematic["imagePath"]).media_type == "image/png"
+
+
+def test_schematic_image_creates_description_without_overclassifying_generic_images(tmp_path: Path) -> None:
+    schematic_image = tmp_path / "r3-vdd-schematic.png"
+    flowchart_image = tmp_path / "debug-flowchart.png"
+    make_schematic_image(schematic_image)
+    make_image(flowchart_image)
+    archive = DocumentationArchive(tmp_path / "archive")
+
+    schematic_document = archive.ingest_path(schematic_image)[0]
+    flowchart_document = archive.ingest_path(flowchart_image)[0]
+
+    result = archive.search("R3 VDD line-art schematic", source_types=["image"], limit=1)[0]
+    assert result["documentId"] == schematic_document.document_id
+    assert result["locator"] == "schematic schematic-001 image frame 1"
+    schematic_record = archive.get_document(schematic_document.document_id)
+    schematic_artifact = next(artifact for artifact in schematic_record["artifacts"] if artifact["type"] == "schematic")
+    assert schematic_artifact["imagePath"] == "images/r3-vdd-schematic.png"
+    assert schematic_artifact["referenceDesignators"] == ["R3"]
+    assert "VDD" in schematic_artifact["labels"]
+
+    flowchart_record = archive.get_document(flowchart_document.document_id)
+    assert [artifact for artifact in flowchart_record["artifacts"] if artifact["type"] == "schematic"] == []
+    assert all(not chunk["locator"].startswith("schematic ") for chunk in flowchart_record["chunks"])
+    assert all("Analysis outputs are empty in Phase 1" not in chunk["text"] for chunk in flowchart_record["chunks"])
+    flowchart_snapshot = tmp_path / "archive" / flowchart_record["snapshot_path"]
+    assert not (flowchart_snapshot.parent / "extracted" / "schematic_index.tsv").exists()
+
+
 def test_spreadsheet_workbook_extracts_searchable_sheet_artifacts(tmp_path: Path) -> None:
     workbook_path = tmp_path / "power-budget.xlsx"
     make_xlsx_workbook(workbook_path)
@@ -1498,6 +1557,27 @@ def make_table_and_flowchart_pdf(path: Path) -> None:
     pdf.save()
 
 
+def make_schematic_pdf(path: Path) -> None:
+    pdf = canvas.Canvas(str(path))
+    pdf.drawString(72, 760, "Buck Converter Schematic")
+    pdf.drawString(72, 736, "U1 drives R3 from VDD to GND in the feedback circuit.")
+    pdf.rect(180, 610, 120, 80)
+    pdf.drawString(216, 650, "U1")
+    pdf.drawString(206, 632, "REGULATOR")
+    pdf.line(72, 650, 180, 650)
+    pdf.drawString(78, 662, "VDD")
+    pdf.line(300, 650, 430, 650)
+    pdf.rect(430, 630, 50, 40)
+    pdf.drawString(444, 645, "R3")
+    pdf.line(480, 650, 520, 650)
+    pdf.line(520, 650, 520, 590)
+    pdf.line(500, 590, 540, 590)
+    pdf.line(506, 582, 534, 582)
+    pdf.line(514, 574, 526, 574)
+    pdf.drawString(548, 586, "GND")
+    pdf.save()
+
+
 def make_image(path: Path) -> None:
     image = Image.new("RGB", (320, 160), "white")
     draw = ImageDraw.Draw(image)
@@ -1506,6 +1586,25 @@ def make_image(path: Path) -> None:
     draw.line((128, 72, 200, 72), fill="black", width=3)
     draw.rectangle((200, 48, 296, 96), outline="black", width=3)
     draw.text((218, 63), "DONE", fill="black")
+    image.save(path)
+
+
+def make_schematic_image(path: Path) -> None:
+    image = Image.new("RGB", (360, 180), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((142, 58, 218, 118), outline="black", width=3)
+    draw.text((168, 78), "U1", fill="black")
+    draw.line((40, 88, 142, 88), fill="black", width=3)
+    draw.text((48, 64), "VDD", fill="black")
+    draw.rectangle((236, 72, 286, 104), outline="black", width=3)
+    draw.text((250, 80), "R3", fill="black")
+    draw.line((218, 88, 236, 88), fill="black", width=3)
+    draw.line((286, 88, 326, 88), fill="black", width=3)
+    draw.line((326, 88, 326, 132), fill="black", width=3)
+    draw.line((306, 132, 346, 132), fill="black", width=3)
+    draw.line((313, 140, 339, 140), fill="black", width=3)
+    draw.line((321, 148, 331, 148), fill="black", width=3)
+    draw.text((292, 152), "GND", fill="black")
     image.save(path)
 
 

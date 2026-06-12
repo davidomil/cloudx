@@ -146,6 +146,57 @@ describe("documentation skill helper", () => {
     expect(result.stdout).toContain("Window offset=50 limit=25 total=125 hasMore=true");
   });
 
+  it("prints schematic search results with saved image and description paths", async () => {
+    const workspace = await tempRoot();
+    const requests: string[] = [];
+    const documentationUrl = await startServer((request, response) => {
+      requests.push(`${request.method} ${request.url ?? ""}`);
+      if (request.method === "POST" && request.url === "/search") {
+        request.resume();
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({
+          results: [{
+            documentId: "doc-schematic",
+            title: "Power Schematic",
+            sourceType: "datasheet",
+            locator: "schematic schematic-001 page 1 figure-001",
+            snippet: "Schematic image artifact schematic-001 includes R1 and VCC."
+          }]
+        }));
+        return;
+      }
+      if (request.method === "GET" && request.url?.startsWith("/documents/doc-schematic?")) {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({
+          document: {
+            artifacts: [{
+              type: "schematic",
+              id: "schematic-001",
+              locator: "schematic schematic-001 page 1 figure-001",
+              imagePath: "figures/figure-001.png",
+              descriptionPath: "schematics/schematic-001/description.md",
+              jsonPath: "schematics/schematic-001/analysis.json"
+            }]
+          }
+        }));
+        return;
+      }
+      response.writeHead(404);
+      response.end("missing");
+    });
+
+    const result = await runHelper(["schematics", "R1 VCC", "--limit", "3"], {
+      cwd: workspace,
+      env: { CLOUDX_DOCUMENTATION_URL: documentationUrl }
+    });
+
+    expect(requests[0]).toBe("POST /search");
+    expect(requests[1]).toContain("GET /documents/doc-schematic?");
+    expect(result.stdout).toContain("Power Schematic [datasheet]");
+    expect(result.stdout).toContain("image=figures/figure-001.png");
+    expect(result.stdout).toContain("description=schematics/schematic-001/description.md");
+  });
+
   async function runHelper(args: string[], options: { cwd: string; env: Record<string, string> }): Promise<{ stdout: string; stderr: string }> {
     const script = await writeHelperScript();
     const { stdout, stderr } = await execFileAsync(process.execPath, [script, ...args], {

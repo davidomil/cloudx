@@ -27,14 +27,12 @@
   - UX target: preserve refresh semantics, loading/error states, selection by document ID from search results, and invalidation/removal updates without forcing a full list reload.
   - Tests: archive list pagination and ordering, hook/client parameter forwarding, UI initial render without document-list fetch, opening the panel triggers the first page, load-more appends without duplicates, and a large fixture does not render every row at once.
 
-- [ ] Design schematic-aware ingest and searchable schematic image artifacts
-  - Current state: `services/documentation-indexer/src/cloudx_documentation_indexer/extraction.py` renders visual PDF pages and image artifacts, and media ingest creates selected keyframes. Visual enrichment can describe artifact paths, but there is no OCR/net/component extraction or schematic-specific searchable map.
-  - Phase 1 target: classify every PDF page render and standalone image artifact for schematic content. For schematic pages/images, save or reference the exact rendered/original image, generate a detailed description with sheet/page/source locator, visible reference designators, labels, likely functional blocks, symbols, connection cues, and uncertainty, and persist it under `extracted/schematics/<id>/` as description Markdown/JSON.
-  - Search target: add source chunks from the generated detailed description so existing hybrid/Turbovec search can find schematics by description terms. Results should carry an artifact locator so a helper/UI can open the saved image for manual analysis.
-  - Helper target: add a stable bash/helper command that searches schematic descriptions and prints the source document, page/image locator, matched description context, and saved image path.
-  - Extensibility target: keep the schematic artifact manifest/schema versioned and analysis-output oriented so later tools can attach structured outputs, such as an implementation of arXiv:2601.22114 SINA producing component detections, connectivity mappings, OCR/designator assignments, or SPICE netlists, without re-ingesting source documents. Start without those structured analyzers.
-  - Quality target: reuse the datasheet-analysis workflow for page-grounded schematic evidence, including rendered page inspection when text extraction is insufficient. Keep generic diagrams on the existing visual-enrichment path.
-  - Tests: fixture PDF with a schematic-like page, standalone schematic image ingest, non-schematic image control case, image and description persistence, description chunk indexing/search, artifact lookup from a search result, and schema readback with an empty/future analysis-output slot.
+- [x] Design schematic-aware ingest and searchable schematic image artifacts
+  - Done: PDF page renders and standalone image artifacts are classified for schematic-like evidence using deterministic source-text, filename, reference-designator, net-label, and geometry cues.
+  - Implementation: schematic records are stored under `extracted/schematics/<id>/` with `description.md`, `analysis.json`, `schematic_index.tsv`, relative image pointers, classification reasons, reference/net-label candidates, connection cues, and `analysisOutputs: []`.
+  - Search/helper: source-origin schematic description chunks use `schematic ...` locators, and `cloudx-doc.mjs schematics <query>` prints matched document, locator, snippet, image path, description path, and JSON path.
+  - Scope: Phase 1 does not run OCR, component detection, connectivity mapping, SPICE export, or netlist generation; the schema is ready for future SINA-style structured analyzer outputs.
+  - Tests: generated schematic PDF, standalone schematic image, non-schematic image control, artifact persistence/readback, JSON schema empty `analysisOutputs`, search hits, and helper output.
 
 - [x] Add spreadsheet ingest support for XLS/XLSX workbooks
   - Done: `SUPPORTED_FILE_SUFFIXES` includes `.xls`, `.xlsx`, `.xlsm`, `.xlsb`, `.ods`, and `.ots`; directory, upload, and URL ingest infer `sourceType: "spreadsheet"` from suffixes or spreadsheet content types.
