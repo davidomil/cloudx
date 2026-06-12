@@ -11,6 +11,10 @@ interface PathPolicyOptions {
   relativeBaseDir?: string;
 }
 
+interface ResolvePathOptions {
+  relativeBaseDir?: string;
+}
+
 interface PathRoot {
   expression: string;
   resolved: string;
@@ -38,8 +42,8 @@ export class PathPolicy {
     this.roots = this.rootEntries.map((root) => root.resolved);
   }
 
-  resolve(candidate: string): string {
-    const resolved = this.resolveUserPath(candidate);
+  resolve(candidate: string, options: ResolvePathOptions = {}): string {
+    const resolved = this.resolveUserPath(candidate, options.relativeBaseDir);
     if (!this.isAllowed(resolved)) {
       throw new Error(`Path is outside configured Cloudx roots: ${candidate}`);
     }
@@ -114,7 +118,7 @@ export class PathPolicy {
     };
   }
 
-  private resolveUserPath(candidate: string): string {
+  private resolveUserPath(candidate: string, relativeBaseDir = this.relativeBaseDir): string {
     const trimmed = candidate.trim();
     if (!trimmed) {
       throw new Error("Path is required.");
@@ -128,7 +132,7 @@ export class PathPolicy {
     if (path.isAbsolute(trimmed)) {
       return path.resolve(trimmed);
     }
-    return path.resolve(this.relativeBaseDir, trimmed);
+    return path.resolve(relativeBaseDir, trimmed);
   }
 
   private resolveRootPath(candidate: string): string {

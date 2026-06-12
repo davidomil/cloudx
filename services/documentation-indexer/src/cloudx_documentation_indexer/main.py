@@ -143,6 +143,8 @@ def create_app(root: str | Path | None = None) -> FastAPI:
 
     @app.post("/ingest/path")
     def ingest_path(request: IngestPathRequest) -> dict:
+        if not Path(request.path).is_absolute():
+            raise HTTPException(status_code=400, detail="Documentation path ingest requires an absolute path when calling the indexer directly. Route relative paths through the CloudX server hook so they resolve from the active workspace.")
         return {
             "documents": [
                 document.as_dict()

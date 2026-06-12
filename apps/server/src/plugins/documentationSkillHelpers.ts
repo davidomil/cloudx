@@ -9,6 +9,7 @@ export const DOCUMENTATION_HELPER_FILES: PluginSkillContributionFile[] = [
     content: String.raw`#!/usr/bin/env node
 import http from "node:http";
 import https from "node:https";
+import path from "node:path";
 import { URL } from "node:url";
 
 const [command, ...rawArgs] = process.argv.slice(2);
@@ -30,7 +31,7 @@ async function main() {
     case "ingest-url":
       return ingest("url", { url: requiredArg(args, "url"), ...metadata(options) });
     case "ingest-path":
-      return ingest("path", { path: requiredArg(args, "path"), ...metadata(options) });
+      return ingestPath(args, options);
     case "ingest-text":
       return ingestText(args, options);
     case "health":
@@ -92,6 +93,19 @@ async function ingest(kind, input) {
     return printJson(await postNdjson(documentationEndpoint("/ingest/url?stream=1"), input));
   }
   return printJson(await postJson(documentationEndpoint("/ingest/" + kind), input));
+}
+
+async function ingestPath(args, options) {
+  const sourcePath = requiredArg(args, "path");
+  const input = { path: sourcePath, ...metadata(options) };
+  const serverUrl = process.env.CLOUDX_SERVER_URL?.trim();
+  if (serverUrl) {
+    return ingest("path", { ...input, cwd: process.cwd() });
+  }
+  if (!path.isAbsolute(sourcePath)) {
+    throw new Error("Relative ingest paths require CLOUDX_SERVER_URL so CloudX can resolve them from the current workspace. Pass an absolute path when using CLOUDX_DOCUMENTATION_URL directly.");
+  }
+  return ingest("path", input);
 }
 
 async function ingestText(args, options) {

@@ -8,7 +8,7 @@
 
 ## Researched Fixes
 
-- [ ] Fix skill-driven documentation path ingest for relative paths
+- [x] Fix skill-driven documentation path ingest for relative paths
   - Problem: the bundled skill helper posts `ingest-path` directly to the documentation indexer when `CLOUDX_SERVER_URL` is not set. In that path, `services/documentation-indexer/src/cloudx_documentation_indexer/archive.py` resolves `Path(source_path).resolve()` relative to the documentation service process cwd, so relative paths from a Codex workspace can miss the intended file.
   - Existing safe path: `apps/server/src/plugins/DocumentationPlugin.ts` routes `documentation.ingest.path` through `PathPolicy.resolve(...)`, which resolves relative paths against the configured Cloudx base dir and enforces `CLOUDX_ALLOWED_ROOTS`.
   - Implementation target: make `apps/server/src/plugins/documentationSkillHelpers.ts` prefer the Cloudx server hook for path ingest, pass an explicit cwd/base path when available, and fail clearly for relative paths when only the raw indexer URL is available.

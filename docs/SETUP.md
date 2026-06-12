@@ -285,7 +285,10 @@ In Cloudx, create a Documentation tab. The panel can:
 
 Documentation skills are synced automatically as CloudX system skills when the
 server starts. They use `CLOUDX_DOCUMENTATION_URL`, and Cloudx exports that URL
-to child processes when Codex tabs run from Cloudx.
+to child processes when Codex tabs run from Cloudx. Cloudx-launched Codex tabs
+also receive `CLOUDX_SERVER_URL`; the bundled documentation helper needs that
+server URL to resolve relative `ingest-path` arguments from the active
+workspace. With only `CLOUDX_DOCUMENTATION_URL`, pass an absolute local path.
 
 Render the memory plugin guide PDF from its Quarto source after documentation
 changes:

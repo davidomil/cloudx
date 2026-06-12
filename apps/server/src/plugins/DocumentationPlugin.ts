@@ -137,13 +137,16 @@ export class DocumentationPlugin implements WorkspacePlugin {
         mode: { type: "string", enum: ["hybrid", "dense", "lexical"] }
       }, ["question"], ["ui", "http"]),
       writeHook("documentation.ingest.path", "Ingest Documentation Path", "Ingest a local file or directory under configured allowed roots.", async (input, context) => {
-        const path = this.pathPolicy.resolve(requireString(input.path, "path"));
+        const cwd = optionalString(input.cwd);
+        const path = this.pathPolicy.resolve(requireString(input.path, "path"), cwd ? { relativeBaseDir: this.pathPolicy.resolve(cwd) } : undefined);
+        const { cwd: _cwd, ...clientInput } = input;
         return this.enqueueIngest("path", titleOrFallback(input.title, path), path, "Reading local path and extracting source evidence.", async (job) => {
           job.update({ progress: 35, stage: "Indexer is reading the local path and extracting source evidence." });
-          return this.enrichQueued(await this.client.ingestPath({ ...input, path }), job);
+          return this.enrichQueued(await this.client.ingestPath({ ...clientInput, path }), job);
         }, context);
       }, {
         path: { type: "string" },
+        cwd: { type: "string" },
         title: { type: "string" },
         sourceType: { type: "string" },
         collection: { type: "string" },
@@ -420,6 +423,7 @@ function defaultDocumentationSkills(): PluginSkillContribution[] {
         `Use the bundled helper to keep commands short: \`DOC="$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-ingest/${DOCUMENTATION_HELPER_SCRIPT_PATH}"\`; then run \`node "$DOC" ingest-url URL\`, \`node "$DOC" ingest-path PATH\`, \`node "$DOC" ingest-text "text"\`, \`node "$DOC" search "query"\`, or \`node "$DOC" open DOCUMENT_ID\`.`,
         "Use `ingest-path` for local files or directories visible to the server, `ingest-url` for websites, URLs, YouTube videos, and YouTube playlists, and `ingest-text` only for copied text that has no retrievable original source.",
         "The helper uses the CloudX streaming hook when `CLOUDX_SERVER_URL` is set, so keep the command running until progress ends with a final result or error.",
+        "When ingesting a relative local path, run the helper from the intended workspace with `CLOUDX_SERVER_URL` set. If only `CLOUDX_DOCUMENTATION_URL` is available, pass an absolute path.",
         "Always ingest PDFs, images, documents, YouTube videos, and YouTube playlists as original sources, not pasted excerpts or transcripts, so the extractor can preserve pages, tables, figures, screenshots, visual keyframes, timestamps, and source artifacts.",
         "Set `sourceType` to one of `datasheet`, `book`, `website`, `repo_code`, `readme`, `media`, `image`, or `text` when the user gives enough context.",
         "Leave `title` and `collection` blank when the indexer should autodetect them from the file, folder, URL, playlist, upload, or first text line.",

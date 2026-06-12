@@ -86,6 +86,22 @@ describe("DocumentationPlugin", () => {
     await expect(hook.execute({ path: "/etc/passwd" }, { caller: { kind: "http" } })).rejects.toThrow("Path is outside configured Cloudx roots");
   });
 
+  it("resolves relative ingest paths from an explicit allowed cwd", async () => {
+    const root = await tempRoot();
+    const workspace = path.join(root, "workspace");
+    const allowedFile = path.join(workspace, "docs", "datasheet.pdf");
+    await fs.mkdir(path.dirname(allowedFile), { recursive: true });
+    await fs.writeFile(allowedFile, "data");
+    const client = fakeClient();
+    const plugin = new DocumentationPlugin(client, new PathPolicy([root]), new DocumentationIngestQueue());
+    const hook = plugin.hooks.find((candidate) => candidate.id === "documentation.ingest.path")!;
+
+    await hook.execute({ path: "docs/datasheet.pdf", cwd: workspace, sourceType: "datasheet" }, { caller: { kind: "http" } });
+
+    expect(client.ingestPath).toHaveBeenCalledWith({ path: allowedFile, sourceType: "datasheet" });
+    await expect(hook.execute({ path: "docs/datasheet.pdf", cwd: "/etc" }, { caller: { kind: "http" } })).rejects.toThrow("Path is outside configured Cloudx roots");
+  });
+
   it("passes ingest results through the enrichment provider when configured", async () => {
     const root = await tempRoot();
     const allowedFile = path.join(root, "datasheet.pdf");
@@ -215,6 +231,7 @@ describe("DocumentationPlugin", () => {
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("ingest the original file, PDF, image, URL, YouTube video, or playlist");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-ingest")?.instructions).toContain("Always ingest PDFs, images, documents, YouTube videos, and YouTube playlists as original sources");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-ingest")?.instructions).toContain("node \"$DOC\" ingest-url");
+    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-ingest")?.instructions).toContain("If only `CLOUDX_DOCUMENTATION_URL` is available, pass an absolute path.");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-ingest")?.files).toContainEqual(expect.objectContaining({
       path: "scripts/cloudx-doc.mjs",
       executable: true,

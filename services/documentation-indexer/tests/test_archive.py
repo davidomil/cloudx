@@ -1113,6 +1113,42 @@ def test_fastapi_upload_ingests_documentation_file(tmp_path: Path) -> None:
     assert result["citation"]["snapshotPath"].endswith("/uploaded-note.md")
 
 
+def test_fastapi_path_ingest_rejects_relative_paths_from_service_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service_cwd = tmp_path / "service"
+    workspace = tmp_path / "workspace"
+    service_cwd.mkdir()
+    workspace.mkdir()
+    note = workspace / "relative-note.md"
+    note.write_text("Relative note says RELATIVE-PATH-77 resolves through CloudX.\n", encoding="utf-8")
+    monkeypatch.chdir(service_cwd)
+    app = create_app(tmp_path / "archive")
+    client = TestClient(app)
+
+    rejected = client.post("/ingest/path", json={"path": "relative-note.md"})
+
+    assert rejected.status_code == 400
+    assert "absolute path" in rejected.json()["detail"]
+
+    accepted = client.post("/ingest/path", json={"path": str(note), "sourceType": "readme"})
+    assert accepted.status_code == 200
+    search = client.post("/search", json={"query": "RELATIVE-PATH-77 CloudX", "sourceTypes": ["readme"]})
+    assert search.status_code == 200
+    assert search.json()["results"][0]["sourceType"] == "readme"
+
+
+def test_archive_path_ingest_rejects_relative_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service_cwd = tmp_path / "service"
+    workspace = tmp_path / "workspace"
+    service_cwd.mkdir()
+    workspace.mkdir()
+    (workspace / "relative-note.md").write_text("Relative note should not resolve from service cwd.\n", encoding="utf-8")
+    monkeypatch.chdir(service_cwd)
+    archive = DocumentationArchive(tmp_path / "archive")
+
+    with pytest.raises(ArchiveError, match="absolute path"):
+        archive.ingest_path("../workspace/relative-note.md")
+
+
 def test_url_fetch_rejects_unsupported_schemes_and_oversized_downloads() -> None:
     with pytest.raises(ArchiveError, match="only http and https"):
         fetch_url_bytes("file:///etc/passwd", 1024)

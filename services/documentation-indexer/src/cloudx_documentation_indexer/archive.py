@@ -325,7 +325,10 @@ class DocumentationArchive:
         collection: str | None = None,
         tags: list[str] | None = None,
     ) -> list[IngestedDocument]:
-        path = Path(source_path).resolve()
+        raw_path = Path(source_path)
+        if not raw_path.is_absolute():
+            raise ArchiveError("Path ingest requires an absolute path. Use the CloudX server hook for workspace-relative paths.")
+        path = raw_path.resolve()
         if not path.exists():
             raise ArchiveError(f"Path does not exist: {path}")
         if path.is_dir():

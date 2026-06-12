@@ -162,9 +162,12 @@ batches the manifest instead of silently capping it.
 
 `documentation.ingest.path` accepts a file or directory. Before the
 request reaches the indexer, CloudX resolves the path through
-`PathPolicy`, so the file must be under configured allowed roots. If a
-directory is passed, the indexer recursively ingests supported
-documentation file suffixes.
+`PathPolicy`, so the file must be under configured allowed roots. When
+the bundled helper runs with `CLOUDX_SERVER_URL`, relative paths resolve
+from the helper process’s current workspace. Direct raw indexer calls
+through `CLOUDX_DOCUMENTATION_URL` require absolute paths. If a directory
+is passed, the indexer recursively ingests supported documentation file
+suffixes.
 
 Supported suffixes include Markdown, text, PDF, HTML, JSON, YAML, XML,
 CSV, SRT/VTT, Python, TypeScript, JavaScript, C/C++, Rust, CSS,
