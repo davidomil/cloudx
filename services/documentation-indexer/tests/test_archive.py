@@ -125,10 +125,11 @@ def test_archive_stats_reports_storage_totals(tmp_path: Path) -> None:
 
     stats = archive.stats()
     manifest = archive.portable_manifest()
-    files = stats["portableFiles"]
+    files = manifest["files"]
     by_path = {entry["path"]: entry for entry in files}
     archive_size = stats["archiveSize"]
 
+    assert "portableFiles" not in stats
     assert manifest["archiveSize"] == archive_size
     assert archive_size["fileCount"] == len(files)
     assert archive_size["logicalBytes"] == sum(entry["bytes"] for entry in files)
@@ -147,6 +148,22 @@ def test_archive_stats_reports_storage_totals(tmp_path: Path) -> None:
     assert archive_size["denseIndexBytes"] == by_path["indexes/local-hash-64/chunks.tvim"]["bytes"]
     assert archive_size["runtimeEstimateBytes"] == archive_size["denseIndexBytes"]
     assert archive_size["runtimeEstimateKind"] == "dense-index-file"
+
+
+def test_archive_stats_omits_full_file_manifest_for_large_archives(tmp_path: Path) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+    bulk_dir = tmp_path / "archive" / "snapshots" / "bulk" / "extracted" / "images"
+    bulk_dir.mkdir(parents=True)
+    for index in range(500):
+        (bulk_dir / f"figure-{index:04d}.txt").write_text(f"large archive fixture {index}\n", encoding="utf-8")
+
+    stats = archive.stats()
+    manifest = archive.portable_manifest()
+
+    assert "portableFiles" not in stats
+    assert stats["archiveSize"]["fileCount"] == len(manifest["files"])
+    assert len(json.dumps(stats)) < 20_000
+    assert len(json.dumps(manifest)) > len(json.dumps(stats))
 
 
 def test_archive_export_package_contains_manifest_hashes_and_live_catalog_backup(tmp_path: Path) -> None:
@@ -416,6 +433,7 @@ def test_fastapi_surface_controls_archive(tmp_path: Path) -> None:
     assert stats.status_code == 200
     assert manifest.status_code == 200
     assert stats.json()["archiveLocality"]["ok"] is True
+    assert "portableFiles" not in stats.json()
     assert stats.json()["archiveSize"] == manifest.json()["archiveSize"]
     assert stats.json()["archiveSize"]["fileCount"] == len(manifest.json()["files"])
     assert stats.json()["archiveSize"]["logicalBytes"] == sum(entry["bytes"] for entry in manifest.json()["files"])

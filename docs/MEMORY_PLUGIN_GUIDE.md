@@ -465,8 +465,7 @@ audit and explicit non-active searches.
   schema, embedding profile, index path, portability flag, and
   `archiveLocality` invariant status.
 - `documentation.stats`: `GET /stats`. Returns document and chunk counts
-  plus portable paths, `archiveSize` storage/runtime totals, and
-  `archiveLocality`.
+  plus aggregate `archiveSize` storage/runtime totals and `archiveLocality`.
 - `documentation.portableManifest`: `GET /portable-manifest`. Returns
   the complete archive file manifest plus the same `archiveSize` totals.
 - `documentation.documents.list`: `GET /documents`. Lists documents and

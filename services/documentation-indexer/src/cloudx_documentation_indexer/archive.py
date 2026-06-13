@@ -278,7 +278,7 @@ class DocumentationArchive:
             active_document_count = db.execute("SELECT COUNT(*) FROM documents WHERE state = ?", (ACTIVE_STATE,)).fetchone()[0]
             chunk_count = db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
             active_chunk_count = db.execute("SELECT COUNT(*) FROM chunks WHERE state = ?", (ACTIVE_STATE,)).fetchone()[0]
-        manifest = self.portable_manifest()
+        files = self._archive_files()
         return {
             "documentCount": document_count,
             "activeDocumentCount": active_document_count,
@@ -288,16 +288,12 @@ class DocumentationArchive:
             "databasePath": str(self.db_path),
             "indexPath": str(self.index_path),
             "manifestPath": str(self.manifest_path),
-            "portableFiles": manifest["files"],
-            "archiveSize": manifest["archiveSize"],
+            "archiveSize": self._archive_size(files),
             "archiveLocality": self.locality_report(),
         }
 
     def portable_manifest(self) -> dict:
-        files: list[ArchiveFileSize] = []
-        for path in sorted(self.root.rglob("*")):
-            if path.is_file():
-                files.append(archive_file_size(self.root, path))
+        files = self._archive_files()
         file_entries = [
             {
                 **file.as_dict(),
@@ -1381,6 +1377,9 @@ class DocumentationArchive:
         with self._connect() as db:
             totals["databaseBytes"] = sqlite_database_bytes(db)
         return totals
+
+    def _archive_files(self) -> list[ArchiveFileSize]:
+        return [archive_file_size(self.root, path) for path in sorted(self.root.rglob("*")) if path.is_file()]
 
     def _copy_archive_root_for_export(self, staged_root: Path) -> None:
         for path in sorted(self.root.rglob("*")):
