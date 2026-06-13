@@ -476,6 +476,54 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     });
   });
 
+  app.get("/api/documentation/archive/export", async (_request, reply) => {
+    const exported = await services.documentation!.streamArchiveExport();
+    reply.code(exported.statusCode);
+    for (const header of DOCUMENTATION_ARTIFACT_PROXY_HEADERS) {
+      const value = exported.headers.get(header);
+      if (value) {
+        reply.header(header, value);
+      }
+    }
+    reply.header("cache-control", "no-store");
+    reply.header("x-content-type-options", "nosniff");
+    if (!exported.body) {
+      return reply.send();
+    }
+    return reply.send(Readable.fromWeb(exported.body as Parameters<typeof Readable.fromWeb>[0]));
+  });
+
+  app.post<{
+    Params: { mode: string };
+    Querystring: { filename?: string; confirmation?: string };
+    Body: NodeJS.ReadableStream;
+  }>("/api/documentation/archive/import/:mode", async (request) => {
+    const mode = request.params.mode;
+    if (mode !== "replace" && mode !== "merge") {
+      throwBadRequest("Archive import mode must be replace or merge.");
+    }
+    const contentLength = parseContentLength(request.headers["content-length"]);
+    if (contentLength !== undefined && contentLength > config.documentationUploadMaxBytes) {
+      throw new FileUploadTooLargeError(config.documentationUploadMaxBytes);
+    }
+    const filename = optionalQueryString(request.query.filename) ?? "documentation-archive.zip";
+    const contentType = optionalHeaderString(request.headers["x-cloudx-file-content-type"]) ?? optionalHeaderString(request.headers["content-type"]);
+    const content = await readRequestBodyBuffer(request.body, config.documentationUploadMaxBytes);
+    if (mode === "replace") {
+      return services.documentation!.importArchiveReplaceUpload({
+        filename,
+        content,
+        contentType,
+        confirmation: requiredQueryString(request.query.confirmation, "confirmation")
+      });
+    }
+    return services.documentation!.importArchiveMergeUpload({
+      filename,
+      content,
+      contentType
+    });
+  });
+
   app.get<{
     Params: { documentId: string };
     Querystring: { path?: string };

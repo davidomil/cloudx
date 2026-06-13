@@ -2904,6 +2904,7 @@ a:hover svg {
 .documentation-toolbar,
 .documentation-result-actions,
 .documentation-mode-row,
+.documentation-archive-controls,
 .documentation-search-filters {
   display: flex;
   align-items: center;
@@ -3185,7 +3186,8 @@ a:hover svg {
 }
 
 .documentation-search label,
-.documentation-ingest label {
+.documentation-ingest label,
+.documentation-archive-controls label {
   display: grid;
   gap: 5px;
   min-width: min(100%, 220px);
@@ -3198,7 +3200,8 @@ a:hover svg {
 
 .documentation-search input,
 .documentation-ingest input,
-.documentation-ingest textarea {
+.documentation-ingest textarea,
+.documentation-archive-controls input {
   width: 100%;
   min-width: 0;
   border: 1px solid var(--color-border);
@@ -3232,6 +3235,10 @@ a:hover svg {
 
 .documentation-search-mode-toggle .cx-button {
   flex: 1 1 auto;
+}
+
+.documentation-archive-controls {
+  align-items: end;
 }
 
 .documentation-ingest textarea {

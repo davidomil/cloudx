@@ -56,6 +56,13 @@ export interface DocumentationArtifactStreamResponse {
   body: ReadableStream<Uint8Array> | null;
 }
 
+export interface DocumentationArchiveUploadInput {
+  filename: string;
+  content: Uint8Array;
+  contentType?: string;
+  confirmation?: string;
+}
+
 export class DocumentationClient {
   private readonly timeoutMs: number;
   private readonly responseMaxBytes: number;
@@ -138,6 +145,63 @@ export class DocumentationClient {
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  exportArchive(): Promise<DocumentationArtifactResponse> {
+    return this.requestBytes("/archive/export", { method: "GET" });
+  }
+
+  async streamArchiveExport(headers: Record<string, string | undefined> = {}): Promise<DocumentationArtifactStreamResponse> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const response = await fetch(this.serviceUrl("/archive/export"), {
+        method: "GET",
+        headers: compactHeaders(headers),
+        signal: controller.signal
+      });
+      if (!response.ok) {
+        throw new Error(errorMessage(await response.text(), response.status));
+      }
+      return {
+        statusCode: response.status,
+        headers: response.headers,
+        body: response.body
+      };
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new Error(`Documentation request timed out after ${this.timeoutMs} ms.`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  importArchiveReplacePath(input: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return this.post("/archive/import/replace/path", {
+      path: requireString(input.path, "path"),
+      confirmation: requireString(input.confirmation, "confirmation")
+    });
+  }
+
+  importArchiveMergePath(input: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return this.post("/archive/import/merge/path", {
+      path: requireString(input.path, "path")
+    });
+  }
+
+  importArchiveReplaceUpload(input: DocumentationArchiveUploadInput): Promise<Record<string, unknown>> {
+    const form = new FormData();
+    form.append("file", new Blob([arrayBufferCopy(input.content)], { type: input.contentType || "application/zip" }), input.filename);
+    appendOptionalFormValue(form, "confirmation", input.confirmation);
+    return this.request("/archive/import/replace", { method: "POST", body: form });
+  }
+
+  importArchiveMergeUpload(input: DocumentationArchiveUploadInput): Promise<Record<string, unknown>> {
+    const form = new FormData();
+    form.append("file", new Blob([arrayBufferCopy(input.content)], { type: input.contentType || "application/zip" }), input.filename);
+    return this.request("/archive/import/merge", { method: "POST", body: form });
   }
 
   enrichDocument(input: DocumentationEnrichInput): Promise<Record<string, unknown>> {

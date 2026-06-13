@@ -94,6 +94,10 @@ export interface DocumentationUploadResponse {
 
 export type DocumentationUploadProgress = FileUploadProgress;
 
+export interface DocumentationArchiveImportResponse {
+  import?: Record<string, unknown>;
+}
+
 export async function downloadFileBrowserEntries(tabId: string, relativePaths: string[]): Promise<FileDownloadResponse> {
   const response = await fetch(`/api/tabs/${encodeURIComponent(tabId)}/files/download`, {
     method: "POST",
@@ -197,6 +201,60 @@ export async function uploadDocumentationFile(input: {
     request.open("POST", `/api/documentation/upload?${params.toString()}`);
     request.setRequestHeader("content-type", "application/octet-stream");
     request.setRequestHeader("x-cloudx-file-content-type", input.file.type || "application/octet-stream");
+    request.send(input.file);
+  });
+}
+
+export async function downloadDocumentationArchive(): Promise<FileDownloadResponse> {
+  const response = await fetch("/api/documentation/archive/export");
+  if (!response.ok) {
+    throw new Error(errorMessageFromResponse(await response.text(), response.status));
+  }
+  return {
+    blob: await response.blob(),
+    filename: filenameFromContentDisposition(response.headers.get("content-disposition")) ?? "cloudx-documentation.zip"
+  };
+}
+
+export async function importDocumentationArchive(input: {
+  file: File;
+  mode: "replace" | "merge";
+  confirmation?: string;
+  onProgress?: (progress: DocumentationUploadProgress) => void;
+}): Promise<DocumentationArchiveImportResponse> {
+  const params = new URLSearchParams({ filename: input.file.name });
+  appendOptionalSearchParam(params, "confirmation", input.confirmation);
+  return new Promise<DocumentationArchiveImportResponse>((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    let lastLoadedBytes = 0;
+    function reportProgress(loadedBytes: number, totalBytes: number | undefined, lengthComputable: boolean) {
+      lastLoadedBytes = loadedBytes;
+      input.onProgress?.({ loadedBytes, totalBytes, lengthComputable });
+    }
+    request.upload.addEventListener("progress", (event) => {
+      reportProgress(event.loaded, event.lengthComputable ? event.total : undefined, event.lengthComputable);
+    });
+    request.upload.addEventListener("load", () => {
+      if (lastLoadedBytes < input.file.size) {
+        reportProgress(input.file.size, input.file.size, true);
+      }
+    });
+    request.addEventListener("load", () => {
+      if (request.status < 200 || request.status >= 300) {
+        reject(new Error(errorMessageFromResponse(request.responseText, request.status)));
+        return;
+      }
+      try {
+        resolve(JSON.parse(request.responseText) as DocumentationArchiveImportResponse);
+      } catch (error) {
+        reject(error);
+      }
+    });
+    request.addEventListener("error", () => reject(new Error("Documentation archive import failed.")));
+    request.addEventListener("abort", () => reject(new Error("Documentation archive import aborted.")));
+    request.open("POST", `/api/documentation/archive/import/${input.mode}?${params.toString()}`);
+    request.setRequestHeader("content-type", "application/octet-stream");
+    request.setRequestHeader("x-cloudx-file-content-type", input.file.type || "application/zip");
     request.send(input.file);
   });
 }

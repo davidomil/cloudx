@@ -692,6 +692,94 @@ describe("buildServer", () => {
     }
   });
 
+  it("proxies documentation archive exports from the indexer", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-archive-export-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    const upstream = new Response(new Uint8Array([4, 3, 2, 1]), {
+      status: 200,
+      headers: {
+        "content-type": "application/zip",
+        "content-length": "4",
+        "content-disposition": 'attachment; filename="cloudx-documentation-test.zip"'
+      }
+    });
+    const streamArchiveExport = vi.spyOn(services.documentation!, "streamArchiveExport").mockResolvedValue({
+      statusCode: upstream.status,
+      headers: upstream.headers,
+      body: upstream.body
+    });
+    const app = await buildServer(config, services);
+    try {
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/documentation/archive/export"
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers["content-type"]).toBe("application/zip");
+      expect(response.headers["content-disposition"]).toBe('attachment; filename="cloudx-documentation-test.zip"');
+      expect(Array.from(response.rawPayload)).toEqual([4, 3, 2, 1]);
+      expect(streamArchiveExport).toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("forwards browser documentation archive imports to the indexer", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-archive-import-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    const replaceImport = vi.spyOn(services.documentation!, "importArchiveReplaceUpload").mockResolvedValue({ import: { mode: "replace" } });
+    const mergeImport = vi.spyOn(services.documentation!, "importArchiveMergeUpload").mockResolvedValue({ import: { mode: "merge" } });
+    const app = await buildServer(config, services);
+    try {
+      const replace = await app.inject({
+        method: "POST",
+        url: "/api/documentation/archive/import/replace?filename=archive.zip&confirmation=REPLACE_DOCUMENTATION_ARCHIVE",
+        headers: {
+          "content-type": "application/octet-stream",
+          "x-cloudx-file-content-type": "application/zip"
+        },
+        payload: Buffer.from([1, 2, 3])
+      });
+      const merge = await app.inject({
+        method: "POST",
+        url: "/api/documentation/archive/import/merge?filename=archive.zip",
+        headers: {
+          "content-type": "application/octet-stream",
+          "x-cloudx-file-content-type": "application/zip"
+        },
+        payload: Buffer.from([4, 5, 6])
+      });
+
+      expect(replace.statusCode).toBe(200);
+      expect(merge.statusCode).toBe(200);
+      expect(replaceImport).toHaveBeenCalledWith({
+        filename: "archive.zip",
+        content: Buffer.from([1, 2, 3]),
+        contentType: "application/zip",
+        confirmation: "REPLACE_DOCUMENTATION_ARCHIVE"
+      });
+      expect(mergeImport).toHaveBeenCalledWith({
+        filename: "archive.zip",
+        content: Buffer.from([4, 5, 6]),
+        contentType: "application/zip"
+      });
+
+      const invalidMode = await app.inject({
+        method: "POST",
+        url: "/api/documentation/archive/import/unknown",
+        headers: { "content-type": "application/octet-stream" },
+        payload: Buffer.from([7])
+      });
+      expect(invalidMode.statusCode).toBe(400);
+      expect(invalidMode.json().message).toContain("replace or merge");
+    } finally {
+      await app.close();
+    }
+  });
+
   it("passes browser documentation upload bytes to the enrichment service", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-upload-enrich-"));
     const config = testConfig(root);

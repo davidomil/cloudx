@@ -1,16 +1,18 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type Dispatch, type FormEvent, type SetStateAction } from "react";
 import DOMPurify, { type Config as DOMPurifyConfig } from "dompurify";
-import { AlertTriangle, Bot, BookOpen, ExternalLink, FileImage, FilePlus, Info, RefreshCw, Search, Table2, Trash2 } from "lucide-react";
+import { AlertTriangle, Bot, BookOpen, Download, ExternalLink, FileImage, FilePlus, Info, RefreshCw, Search, Table2, Trash2, Upload } from "lucide-react";
 
 import type { UiContributionRenderContext } from "./uiContributions.js";
 import { ControlButton } from "./Control.js";
 import { PluginPanelDock } from "./PluginPanelDock.js";
-import { uploadDocumentationFile, type DocumentationUploadProgress, type DocumentationUploadResponse } from "../api.js";
+import { downloadDocumentationArchive, importDocumentationArchive, saveBlobDownload, uploadDocumentationFile, type DocumentationUploadProgress, type DocumentationUploadResponse } from "../api.js";
 import { documentationIngestController } from "./documentationPanelQueue.js";
 
 interface DocumentationPanelProps {
   callHook: UiContributionRenderContext["callHook"];
   uploadFile?: typeof uploadDocumentationFile;
+  downloadArchive?: typeof downloadDocumentationArchive;
+  importArchive?: typeof importDocumentationArchive;
   config?: Record<string, unknown>;
   globalConfig?: Record<string, unknown>;
   stateKey?: string;
@@ -147,6 +149,7 @@ interface DocumentationEnrichmentNotice {
 }
 
 export type IngestMode = "upload" | "path" | "url" | "text";
+export type ArchiveImportMode = "merge" | "replace";
 export type SearchPresentationMode = "answer" | "manual";
 export type DocumentationIngestJobStatus = "queued" | "running" | "complete" | "failed";
 
@@ -230,6 +233,10 @@ export interface DocumentationPanelState {
   collection: string;
   acceptGeneratedCodeDocumentation: boolean;
   uploadInputKey: number;
+  archiveImportMode: ArchiveImportMode;
+  archiveImportValue: File | undefined;
+  archiveImportConfirmation: string;
+  archiveImportInputKey: number;
   ingestJobs: DocumentationIngestJob[];
   serverIngestJobs: DocumentationServerIngestJob[];
 }
@@ -250,6 +257,7 @@ const SOURCE_CHUNK_PAGE_SIZE = 75;
 const SOURCE_ARTIFACT_PAGE_SIZE = 100;
 const SOURCE_CHUNK_TEXT_MAX_CHARS = 4_000;
 const MAX_INLINE_ARTIFACT_PREVIEWS_PER_CHUNK = 6;
+const ARCHIVE_REPLACE_CONFIRMATION = "REPLACE_DOCUMENTATION_ARCHIVE";
 let documentationIngestJobCounter = 0;
 
 export function createInitialDocumentationPanelState(): DocumentationPanelState {
@@ -275,6 +283,10 @@ export function createInitialDocumentationPanelState(): DocumentationPanelState 
     collection: "",
     acceptGeneratedCodeDocumentation: false,
     uploadInputKey: 0,
+    archiveImportMode: "merge",
+    archiveImportValue: undefined,
+    archiveImportConfirmation: "",
+    archiveImportInputKey: 0,
     ingestJobs: [],
     serverIngestJobs: []
   };
@@ -302,7 +314,7 @@ function useDocumentationStateField<K extends keyof DocumentationPanelState>(
   return [value, setValue];
 }
 
-export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationFile, config = {}, globalConfig = {}, stateKey = DEFAULT_DOCUMENTATION_PANEL_STATE_KEY, state, onStateChange }: DocumentationPanelProps) {
+export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationFile, downloadArchive = downloadDocumentationArchive, importArchive = importDocumentationArchive, config = {}, globalConfig = {}, stateKey = DEFAULT_DOCUMENTATION_PANEL_STATE_KEY, state, onStateChange }: DocumentationPanelProps) {
   const [query, setQuery] = useDocumentationStateField("query", state, onStateChange);
   const [results, setResults] = useDocumentationStateField("results", state, onStateChange);
   const [answer, setAnswer] = useDocumentationStateField("answer", state, onStateChange);
@@ -324,6 +336,10 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   const [collection, setCollection] = useDocumentationStateField("collection", state, onStateChange);
   const [acceptGeneratedCodeDocumentation, setAcceptGeneratedCodeDocumentation] = useDocumentationStateField("acceptGeneratedCodeDocumentation", state, onStateChange);
   const [uploadInputKey, setUploadInputKey] = useDocumentationStateField("uploadInputKey", state, onStateChange);
+  const [archiveImportMode, setArchiveImportMode] = useDocumentationStateField("archiveImportMode", state, onStateChange);
+  const [archiveImportValue, setArchiveImportValue] = useDocumentationStateField("archiveImportValue", state, onStateChange);
+  const [archiveImportConfirmation, setArchiveImportConfirmation] = useDocumentationStateField("archiveImportConfirmation", state, onStateChange);
+  const [archiveImportInputKey, setArchiveImportInputKey] = useDocumentationStateField("archiveImportInputKey", state, onStateChange);
   const [ingestJobs, setIngestJobs] = useDocumentationStateField("ingestJobs", state, onStateChange);
   const [serverIngestJobs, setServerIngestJobs] = useDocumentationStateField("serverIngestJobs", state, onStateChange);
   const [documentListVisible, setDocumentListVisible] = useState(false);
@@ -700,6 +716,49 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
     }));
   }
 
+  async function exportArchive() {
+    await run(async () => {
+      const download = await downloadArchive();
+      saveBlobDownload(download.blob, download.filename);
+      setStatus(`Archive export downloaded as ${download.filename}.`);
+    });
+  }
+
+  async function importArchivePackage() {
+    const file = archiveImportValue;
+    if (!file) {
+      setStatus("Select an archive ZIP package to import.");
+      return;
+    }
+    if (archiveImportMode === "replace" && archiveImportConfirmation !== ARCHIVE_REPLACE_CONFIRMATION) {
+      setStatus(`Type ${ARCHIVE_REPLACE_CONFIRMATION} to replace the archive.`);
+      return;
+    }
+    await run(async () => {
+      await importArchive({
+        file,
+        mode: archiveImportMode,
+        confirmation: archiveImportMode === "replace" ? archiveImportConfirmation : undefined
+      });
+      setArchiveImportValue(undefined);
+      setArchiveImportConfirmation("");
+      setArchiveImportInputKey((current) => current + 1);
+      if (archiveImportMode === "replace") {
+        setSelectedDocument(undefined);
+        setResults([]);
+        setAnswer(undefined);
+        setDocuments([]);
+        setDocumentListLoaded(false);
+        setDocumentListWindow({ offset: 0, limit: 0, total: 0, hasMore: false });
+      }
+      await loadArchiveSummary();
+      if (documentListLoaded || documentListVisible) {
+        await loadDocumentPage("replace");
+      }
+      setStatus(archiveImportMode === "replace" ? "Archive replace import complete." : "Archive merge import complete.");
+    });
+  }
+
   async function viewDocument(id: string) {
     if (!id) {
       return;
@@ -1030,6 +1089,46 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
                 ) : (
                   <p className="documentation-empty">Open the panel to load active documents.</p>
                 )}
+              </section>
+            )
+          },
+          {
+            id: "archive",
+            label: "Archive",
+            icon: <Download size={15} />,
+            children: (
+              <section className="documentation-section">
+                <h3>Archive Controls</h3>
+                <div className="documentation-archive-controls">
+                  <ControlButton size="compact" disabled={busy} onClick={() => void exportArchive()}>
+                    <Download size={14} /> Export
+                  </ControlButton>
+                  <div className="documentation-mode-row" role="group" aria-label="Archive import mode">
+                    {(["merge", "replace"] as const).map((candidate) => (
+                      <ControlButton key={candidate} selected={archiveImportMode === candidate} onClick={() => setArchiveImportMode(candidate)} size="compact" tone={candidate === "replace" ? "danger" : "neutral"}>
+                        {candidate}
+                      </ControlButton>
+                    ))}
+                  </div>
+                  <label>
+                    <span>Archive ZIP</span>
+                    <input key={archiveImportInputKey} type="file" accept=".zip,application/zip" onChange={(event) => setArchiveImportValue(event.target.files?.[0])} />
+                  </label>
+                  {archiveImportValue ? <p className="documentation-selected-file">{archiveImportValue.name} · {formatBytes(archiveImportValue.size)}</p> : null}
+                  {archiveImportMode === "replace" ? (
+                    <label>
+                      <span>Confirmation</span>
+                      <input value={archiveImportConfirmation} onChange={(event) => setArchiveImportConfirmation(event.target.value)} placeholder={ARCHIVE_REPLACE_CONFIRMATION} />
+                    </label>
+                  ) : null}
+                  <ControlButton
+                    tone={archiveImportMode === "replace" ? "danger" : "primary"}
+                    disabled={busy || !archiveImportValue || (archiveImportMode === "replace" && archiveImportConfirmation !== ARCHIVE_REPLACE_CONFIRMATION)}
+                    onClick={() => void importArchivePackage()}
+                  >
+                    <Upload size={14} /> Import
+                  </ControlButton>
+                </div>
               </section>
             )
           }

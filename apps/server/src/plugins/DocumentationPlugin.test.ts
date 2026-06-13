@@ -92,6 +92,18 @@ describe("DocumentationPlugin", () => {
     expect(plugin.hooks.find((hook) => hook.id === "documentation.invalidate")).toMatchObject({
       automationSafety: "write"
     });
+    expect(plugin.hooks.find((hook) => hook.id === "documentation.archive.export")).toMatchObject({
+      automationSafety: "write",
+      inputSchema: expect.objectContaining({ required: ["path"] })
+    });
+    expect(plugin.hooks.find((hook) => hook.id === "documentation.archive.import.replace")).toMatchObject({
+      automationSafety: "destructive",
+      inputSchema: expect.objectContaining({ required: ["path", "confirmation"] })
+    });
+    expect(plugin.hooks.find((hook) => hook.id === "documentation.archive.import.merge")).toMatchObject({
+      automationSafety: "write",
+      inputSchema: expect.objectContaining({ required: ["path"] })
+    });
   });
 
   it("resolves ingest paths through the CloudX path policy before calling the service", async () => {
@@ -224,6 +236,38 @@ describe("DocumentationPlugin", () => {
     expect(answerQuestion).toHaveBeenCalledWith({ question: "What does the source say?" });
   });
 
+  it("exports documentation archives to an allowed local file without overwriting", async () => {
+    const root = await tempRoot();
+    const output = path.join(root, "archive-export.zip");
+    const client = fakeClient();
+    const plugin = new DocumentationPlugin(client, new PathPolicy([root]), new DocumentationIngestQueue());
+    const hook = plugin.hooks.find((candidate) => candidate.id === "documentation.archive.export")!;
+
+    const result = await hook.execute({ path: output }, { caller: { kind: "http" } });
+
+    expect(result).toEqual({ path: output, bytes: 3 });
+    expect(await fs.readFile(output)).toEqual(Buffer.from([1, 2, 3]));
+    expect(client.streamArchiveExport).toHaveBeenCalled();
+    await expect(hook.execute({ path: output }, { caller: { kind: "http" } })).rejects.toThrow("File already exists");
+    await expect(hook.execute({ path: "/etc/archive.zip" }, { caller: { kind: "http" } })).rejects.toThrow("Path is outside configured Cloudx roots");
+  });
+
+  it("resolves archive import package paths before calling the indexer", async () => {
+    const root = await tempRoot();
+    const packagePath = path.join(root, "documentation.zip");
+    await fs.writeFile(packagePath, "zip");
+    const client = fakeClient();
+    const plugin = new DocumentationPlugin(client, new PathPolicy([root]), new DocumentationIngestQueue());
+    const replaceHook = plugin.hooks.find((candidate) => candidate.id === "documentation.archive.import.replace")!;
+    const mergeHook = plugin.hooks.find((candidate) => candidate.id === "documentation.archive.import.merge")!;
+
+    await replaceHook.execute({ path: "documentation.zip", cwd: root, confirmation: "REPLACE_DOCUMENTATION_ARCHIVE" }, { caller: { kind: "http" } });
+    await mergeHook.execute({ path: packagePath }, { caller: { kind: "http" } });
+
+    expect(client.importArchiveReplacePath).toHaveBeenCalledWith({ path: packagePath, confirmation: "REPLACE_DOCUMENTATION_ARCHIVE" });
+    expect(client.importArchiveMergePath).toHaveBeenCalledWith({ path: packagePath });
+  });
+
   it("declares default documentation skills as plugin system contributions", () => {
     const plugin = new DocumentationPlugin(fakeClient(), new PathPolicy(["/tmp"]), new DocumentationIngestQueue());
 
@@ -275,11 +319,14 @@ describe("DocumentationPlugin", () => {
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-enrich-visuals")?.instructions).toContain("one concise visual span per meaningful frame");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-enrich-visuals")?.instructions).not.toContain("curl -sS");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-archive-control")?.instructions).toContain("node \"$DOC\" manifest");
+    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-archive-control")?.instructions).toContain("node \"$DOC\" export --output archive.zip");
+    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-archive-control")?.instructions).toContain("node \"$DOC\" import-replace archive.zip --confirm REPLACE_DOCUMENTATION_ARCHIVE");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-archive-control")?.instructions).toContain("archiveSize totals");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-archive-control")?.instructions).toContain("archiveLocality");
+    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-archive-control")?.instructions).toContain("SQLite online backup snapshot");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-archive-control")?.files).toContainEqual(expect.objectContaining({
       path: "scripts/cloudx-doc.mjs",
-      content: expect.stringContaining("rebuild")
+      content: expect.stringContaining("import-replace")
     }));
   });
 
@@ -288,6 +335,18 @@ describe("DocumentationPlugin", () => {
       health: vi.fn(async () => ({ status: "ok" })),
       stats: vi.fn(async () => ({ activeDocumentCount: 1 })),
       portableManifest: vi.fn(async () => ({ files: [] })),
+      streamArchiveExport: vi.fn(async () => ({
+        statusCode: 200,
+        headers: new Headers({ "content-type": "application/zip" }),
+        body: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array([1, 2, 3]));
+            controller.close();
+          }
+        })
+      })),
+      importArchiveReplacePath: vi.fn(async () => ({ import: { mode: "replace" } })),
+      importArchiveMergePath: vi.fn(async () => ({ import: { mode: "merge" } })),
       listDocuments: vi.fn(async () => ({ documents: [] })),
       getDocument: vi.fn(async () => ({ document: { documentId: "doc" } })),
       remove: vi.fn(async () => ({ document: { documentId: "doc", state: "deleted" } })),

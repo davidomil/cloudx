@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.metadata import version
@@ -20,6 +21,8 @@ from reportlab.pdfgen import canvas
 import cloudx_documentation_indexer.archive as archive_module
 from cloudx_documentation_indexer import DocumentationArchive, create_app
 from cloudx_documentation_indexer.archive import (
+    ARCHIVE_EXPORT_MANIFEST_NAME,
+    ARCHIVE_IMPORT_REPLACE_CONFIRMATION,
     DENSE_ONLY_MIN_SCORE,
     EMBEDDING_DIM,
     ArchiveError,
@@ -143,6 +146,135 @@ def test_archive_stats_reports_storage_totals(tmp_path: Path) -> None:
     assert archive_size["denseIndexBytes"] == by_path["indexes/local-hash-64/chunks.tvim"]["bytes"]
     assert archive_size["runtimeEstimateBytes"] == archive_size["denseIndexBytes"]
     assert archive_size["runtimeEstimateKind"] == "dense-index-file"
+
+
+def test_archive_export_package_contains_manifest_hashes_and_live_catalog_backup(tmp_path: Path) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+    document = archive.ingest_text(
+        title="Exported archive note",
+        text="Export package should preserve EXPORT-PACKAGE-17.",
+        uri="manual://export-package",
+    )
+
+    exported = archive.export_archive()
+    try:
+        assert exported.path.is_file()
+        assert exported.filename.startswith("cloudx-documentation-")
+        with zipfile.ZipFile(exported.path) as package:
+            names = set(package.namelist())
+            assert ARCHIVE_EXPORT_MANIFEST_NAME in names
+            assert "archive/catalog.sqlite" in names
+            assert any(name.startswith("archive/snapshots/") for name in names)
+            assert "archive/indexes/local-hash-64/chunks.tvim" in names
+            manifest = json.loads(package.read(ARCHIVE_EXPORT_MANIFEST_NAME))
+            assert manifest == exported.manifest
+            catalog_entry = next(entry for entry in manifest["files"] if entry["path"] == "catalog.sqlite")
+            assert hashlib.sha256(package.read("archive/catalog.sqlite")).hexdigest() == catalog_entry["sha256"]
+            restored_catalog = tmp_path / "exported-catalog.sqlite"
+            restored_catalog.write_bytes(package.read("archive/catalog.sqlite"))
+        restored = DocumentationArchive(tmp_path / "restored")
+        shutil.copy2(restored_catalog, tmp_path / "restored" / "catalog.sqlite")
+        shutil.copytree(tmp_path / "archive" / "snapshots", tmp_path / "restored" / "snapshots", dirs_exist_ok=True)
+        restored.rebuild_index()
+        assert restored.search("EXPORT-PACKAGE-17", limit=1)[0]["documentId"] == document.document_id
+    finally:
+        exported.path.unlink(missing_ok=True)
+
+
+def test_archive_replace_import_requires_confirmation_and_rebuilds_search(tmp_path: Path) -> None:
+    source = DocumentationArchive(tmp_path / "source")
+    imported = source.ingest_text(
+        title="Imported replacement note",
+        text="Replacement import should find REPLACE-IMPORT-21.",
+        uri="manual://replace-import",
+    )
+    exported = source.export_archive()
+    target = DocumentationArchive(tmp_path / "target")
+    target.ingest_text(
+        title="Old target note",
+        text="Old archive text should disappear as OLD-REPLACE-21.",
+        uri="manual://old-replace",
+    )
+    try:
+        with pytest.raises(ArchiveError, match=ARCHIVE_IMPORT_REPLACE_CONFIRMATION):
+            target.import_archive_replace(exported.path, confirmation="replace")
+        assert target.search("OLD-REPLACE-21", limit=1)
+
+        result = target.import_archive_replace(exported.path, confirmation=ARCHIVE_IMPORT_REPLACE_CONFIRMATION)
+
+        assert Path(result["backupPath"]).is_dir()
+        assert target.search("REPLACE-IMPORT-21", limit=1)[0]["documentId"] == imported.document_id
+        assert target.search("OLD-REPLACE-21", limit=10) == []
+        assert result["rebuildManifest"]["activeChunkCount"] == 1
+    finally:
+        exported.path.unlink(missing_ok=True)
+
+
+def test_archive_import_rejects_manifest_hash_mismatch_before_replace(tmp_path: Path) -> None:
+    source = DocumentationArchive(tmp_path / "source")
+    source.ingest_text(title="Source", text="Tamper source text TAMPER-SOURCE-1.", uri="manual://tamper-source")
+    exported = source.export_archive()
+    tampered = tmp_path / "tampered.zip"
+    with zipfile.ZipFile(exported.path) as original, zipfile.ZipFile(tampered, "w", compression=zipfile.ZIP_DEFLATED) as modified:
+        tampered_member = next(name for name in original.namelist() if name.startswith("archive/snapshots/") and not name.endswith("/"))
+        for name in original.namelist():
+            modified.writestr(name, b"tampered bytes" if name == tampered_member else original.read(name))
+    target = DocumentationArchive(tmp_path / "target")
+    target.ingest_text(title="Target", text="Target should remain TARGET-TAMPER-1.", uri="manual://target-tamper")
+    try:
+        with pytest.raises(ArchiveError, match="hash mismatch"):
+            target.import_archive_replace(tampered, confirmation=ARCHIVE_IMPORT_REPLACE_CONFIRMATION)
+        assert target.search("TARGET-TAMPER-1", limit=1)
+        assert target.search("TAMPER-SOURCE-1", limit=10) == []
+    finally:
+        exported.path.unlink(missing_ok=True)
+
+
+def test_archive_merge_skips_duplicates_imports_new_documents_and_reports_uri_conflicts(tmp_path: Path) -> None:
+    target = DocumentationArchive(tmp_path / "target")
+    duplicate_target = target.ingest_text(
+        title="Duplicate target",
+        text="Shared duplicate content says MERGE-DUP-31.",
+        uri="manual://merge-duplicate",
+    )
+    target.ingest_text(
+        title="Conflict local",
+        text="Local conflict content says MERGE-CONFLICT-LOCAL-31.",
+        uri="manual://merge-conflict",
+    )
+
+    source = DocumentationArchive(tmp_path / "source")
+    duplicate_source = source.ingest_text(
+        title="Duplicate source",
+        text="Shared duplicate content says MERGE-DUP-31.",
+        uri="manual://merge-duplicate",
+    )
+    source.invalidate_document(duplicate_source.document_id, state="stale", reason="Imported archive marked the duplicate stale.")
+    source.ingest_text(
+        title="Conflict imported",
+        text="Imported conflict content says MERGE-CONFLICT-IMPORTED-31.",
+        uri="manual://merge-conflict",
+    )
+    new_source = source.ingest_text(
+        title="New imported",
+        text="New merge content says MERGE-NEW-31.",
+        uri="manual://merge-new",
+    )
+    exported = source.export_archive()
+    try:
+        result = target.import_archive_merge(exported.path)
+
+        assert result["importedDocuments"] == 2
+        assert result["skippedDocuments"] == 1
+        assert result["importedChunks"] == 2
+        assert any(conflict["kind"] == "uri" and conflict["uri"] == "manual://merge-conflict" for conflict in result["conflicts"])
+        assert target.search("MERGE-NEW-31", limit=1)[0]["documentId"] == new_source.document_id
+        assert target.search("MERGE-CONFLICT-IMPORTED-31", limit=1)
+        assert target.search("MERGE-DUP-31", limit=10)[0]["documentId"] == duplicate_target.document_id
+        duplicate_record = target.get_document(duplicate_target.document_id)
+        assert any(event["reason"] == "Imported archive marked the duplicate stale." for event in duplicate_record["events"])
+    finally:
+        exported.path.unlink(missing_ok=True)
 
 
 def test_archive_locality_survives_archive_root_move(tmp_path: Path) -> None:
@@ -294,6 +426,57 @@ def test_fastapi_surface_controls_archive(tmp_path: Path) -> None:
     assert invalidated.status_code == 200
     assert invalidated.json()["document"]["state"] == "revoked"
     assert client.post("/search", json={"query": "ADC calibration register"}).json()["results"] == []
+
+
+def test_fastapi_archive_export_import_replace_and_merge_endpoints(tmp_path: Path) -> None:
+    source_app = create_app(tmp_path / "source")
+    source_client = TestClient(source_app)
+    source_client.post(
+        "/ingest/text",
+        json={"title": "Export source", "text": "FastAPI export source says API-EXPORT-41.", "uri": "manual://api-export"},
+    )
+    exported = source_client.get("/archive/export")
+
+    assert exported.status_code == 200
+    assert exported.headers["content-type"].startswith("application/zip")
+    assert "cloudx-documentation-" in exported.headers["content-disposition"]
+
+    replace_app = create_app(tmp_path / "replace-target")
+    replace_client = TestClient(replace_app)
+    replace_client.post(
+        "/ingest/text",
+        json={"title": "Old target", "text": "Old target says API-OLD-41.", "uri": "manual://api-old"},
+    )
+    rejected = replace_client.post(
+        "/archive/import/replace",
+        files={"file": ("archive.zip", exported.content, "application/zip")},
+        data={"confirmation": "wrong"},
+    )
+    assert rejected.status_code == 400
+    assert replace_client.post("/search", json={"query": "API-OLD-41"}).json()["results"]
+
+    imported = replace_client.post(
+        "/archive/import/replace",
+        files={"file": ("archive.zip", exported.content, "application/zip")},
+        data={"confirmation": ARCHIVE_IMPORT_REPLACE_CONFIRMATION},
+    )
+    assert imported.status_code == 200
+    assert imported.json()["import"]["mode"] == "replace"
+    assert replace_client.post("/search", json={"query": "API-EXPORT-41"}).json()["results"]
+    assert replace_client.post("/search", json={"query": "API-OLD-41"}).json()["results"] == []
+
+    merge_source = DocumentationArchive(tmp_path / "merge-source")
+    merge_source.ingest_text(title="Merge source", text="Path merge says API-MERGE-41.", uri="manual://api-merge")
+    merge_export = merge_source.export_archive()
+    merge_app = create_app(tmp_path / "merge-target")
+    merge_client = TestClient(merge_app)
+    try:
+        merged = merge_client.post("/archive/import/merge/path", json={"path": str(merge_export.path)})
+        assert merged.status_code == 200
+        assert merged.json()["import"]["mode"] == "merge"
+        assert merge_client.post("/search", json={"query": "API-MERGE-41"}).json()["results"]
+    finally:
+        merge_export.path.unlink(missing_ok=True)
 
 
 def test_ai_enrichment_adds_searchable_provenance_and_replaces_prior_ai_chunks(tmp_path: Path) -> None:

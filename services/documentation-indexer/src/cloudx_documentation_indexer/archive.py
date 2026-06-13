@@ -9,10 +9,12 @@ import re
 import shlex
 import shutil
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import threading
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable, Iterator, Mapping
 from importlib.metadata import version
@@ -59,6 +61,11 @@ except Exception:  # pragma: no cover - import errors should surface only when p
 
 
 ARCHIVE_SCHEMA_VERSION = 1
+ARCHIVE_EXPORT_SCHEMA_VERSION = 1
+ARCHIVE_EXPORT_MANIFEST_NAME = "documentation-export-manifest.json"
+ARCHIVE_EXPORT_ROOT_NAME = "archive"
+ARCHIVE_IMPORT_REPLACE_CONFIRMATION = "REPLACE_DOCUMENTATION_ARCHIVE"
+ARCHIVE_IMPORT_MAX_UNCOMPRESSED_BYTES = 25 * 1024 * 1024 * 1024
 EMBEDDING_PROFILE_ID = "local-hash-64"
 EMBEDDING_DIM = 64
 TURBOVEC_BIT_WIDTH = 4
@@ -112,6 +119,20 @@ class IngestedDocument:
             "chunkCount": self.chunk_count,
             "contentSha256": self.content_sha256,
         }
+
+
+@dataclass(frozen=True)
+class ExportedArchive:
+    path: Path
+    filename: str
+    manifest: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ValidatedArchivePackage:
+    temp_dir: Path
+    archive_root: Path
+    manifest: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -290,6 +311,71 @@ class DocumentationArchive:
             "archiveSize": self._archive_size(files),
             "files": file_entries,
         }
+
+    def export_archive(self) -> ExportedArchive:
+        with self._write_lock:
+            self.rebuild_index()
+            package_fd, package_name = tempfile.mkstemp(
+                prefix="cloudx-documentation-export-",
+                suffix=".zip",
+                dir=self.root.parent,
+            )
+            os.close(package_fd)
+            package_path = Path(package_name)
+            staging_dir = Path(tempfile.mkdtemp(prefix="cloudx-documentation-export-stage-", dir=self.root.parent))
+            completed = False
+            try:
+                staged_root = staging_dir / ARCHIVE_EXPORT_ROOT_NAME
+                staged_root.mkdir(parents=True)
+                self._copy_archive_root_for_export(staged_root)
+                self._backup_catalog_to(staged_root / "catalog.sqlite")
+                manifest = self._export_manifest(staged_root)
+                self._write_export_zip(staged_root, manifest, package_path)
+                completed = True
+                return ExportedArchive(
+                    path=package_path,
+                    filename=f"cloudx-documentation-{safe_timestamp()}.zip",
+                    manifest=manifest,
+                )
+            finally:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                if not completed:
+                    package_path.unlink(missing_ok=True)
+
+    def import_archive_replace(self, package_path: Path | str, *, confirmation: str) -> dict[str, Any]:
+        if confirmation != ARCHIVE_IMPORT_REPLACE_CONFIRMATION:
+            raise ArchiveError(f"Archive replace import requires confirmation token: {ARCHIVE_IMPORT_REPLACE_CONFIRMATION}")
+        package = self._validated_archive_package(Path(package_path))
+        try:
+            with self._write_lock:
+                install_root = Path(tempfile.mkdtemp(prefix=f".{self.root.name}-import-", dir=self.root.parent))
+                shutil.rmtree(install_root)
+                shutil.copytree(package.archive_root, install_root)
+                backup_path = self._install_replacement_archive(install_root)
+                self.index_dir.mkdir(parents=True, exist_ok=True)
+                rebuild_manifest = self.rebuild_index()
+                return {
+                    "mode": "replace",
+                    "status": "imported",
+                    "backupPath": str(backup_path),
+                    "manifest": package.manifest,
+                    "rebuildManifest": rebuild_manifest,
+                    "archiveSize": self.portable_manifest()["archiveSize"],
+                }
+        finally:
+            shutil.rmtree(package.temp_dir, ignore_errors=True)
+
+    def import_archive_merge(self, package_path: Path | str) -> dict[str, Any]:
+        package = self._validated_archive_package(Path(package_path))
+        try:
+            with self._write_lock:
+                summary = self._merge_archive_root(package.archive_root)
+                summary["manifest"] = package.manifest
+                summary["rebuildManifest"] = self.rebuild_index()
+                summary["archiveSize"] = self.portable_manifest()["archiveSize"]
+                return summary
+        finally:
+            shutil.rmtree(package.temp_dir, ignore_errors=True)
 
     def locality_report(self) -> dict[str, Any]:
         archive_root = self.root.resolve()
@@ -1260,6 +1346,416 @@ class DocumentationArchive:
             totals["databaseBytes"] = sqlite_database_bytes(db)
         return totals
 
+    def _copy_archive_root_for_export(self, staged_root: Path) -> None:
+        for path in sorted(self.root.rglob("*")):
+            relative_path = path.relative_to(self.root)
+            if is_catalog_database_relative_path(relative_path):
+                continue
+            target = staged_root / relative_path
+            if path.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+            elif path.is_file():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, target)
+
+    def _backup_catalog_to(self, target_path: Path) -> None:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.unlink(missing_ok=True)
+        source = sqlite3.connect(self.db_path)
+        target = sqlite3.connect(target_path)
+        try:
+            with target:
+                source.backup(target, pages=256, sleep=0.05)
+        finally:
+            target.close()
+            source.close()
+
+    def _export_manifest(self, staged_root: Path) -> dict[str, Any]:
+        files = [archive_file_size(staged_root, path) for path in sorted(staged_root.rglob("*")) if path.is_file()]
+        file_entries = [
+            {
+                **file.as_dict(),
+                "sha256": sha256_file(staged_root / file.relative_path),
+            }
+            for file in files
+        ]
+        dense_index_path = self.index_path.relative_to(self.root).as_posix()
+        archive_size = archive_size_totals(files, dense_index_path)
+        with sqlite3.connect(staged_root / "catalog.sqlite") as db:
+            archive_size["databaseBytes"] = sqlite_database_bytes(db)
+        return {
+            "exportSchemaVersion": ARCHIVE_EXPORT_SCHEMA_VERSION,
+            "createdAt": timestamp(),
+            "packageRoot": ARCHIVE_EXPORT_ROOT_NAME,
+            "schemaVersion": ARCHIVE_SCHEMA_VERSION,
+            "embeddingProfileId": EMBEDDING_PROFILE_ID,
+            "embeddingDimension": EMBEDDING_DIM,
+            "turbovecDistribution": TURBOVEC_DISTRIBUTION,
+            "turbovecVersion": TURBOVEC_VERSION,
+            "turbovecIndexFormat": TURBOVEC_INDEX_FORMAT,
+            "denseOnlyMinScore": DENSE_ONLY_MIN_SCORE,
+            "archiveSize": archive_size,
+            "files": file_entries,
+        }
+
+    def _write_export_zip(self, staged_root: Path, manifest: dict[str, Any], package_path: Path) -> None:
+        with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as archive_zip:
+            archive_zip.writestr(ARCHIVE_EXPORT_MANIFEST_NAME, json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+            for path in sorted(staged_root.rglob("*")):
+                if path.is_file():
+                    archive_zip.write(path, f"{ARCHIVE_EXPORT_ROOT_NAME}/{path.relative_to(staged_root).as_posix()}")
+
+    def _validated_archive_package(self, package_path: Path) -> ValidatedArchivePackage:
+        resolved_package_path = package_path.expanduser().resolve()
+        if not resolved_package_path.is_file():
+            raise ArchiveError(f"Archive import package does not exist: {package_path}")
+        temp_dir = Path(tempfile.mkdtemp(prefix="cloudx-documentation-import-", dir=self.root.parent))
+        try:
+            self._extract_archive_zip(resolved_package_path, temp_dir)
+            manifest_path = temp_dir / ARCHIVE_EXPORT_MANIFEST_NAME
+            archive_root = temp_dir / ARCHIVE_EXPORT_ROOT_NAME
+            if not manifest_path.is_file():
+                raise ArchiveError("Archive import package is missing documentation export manifest.")
+            if not archive_root.is_dir():
+                raise ArchiveError("Archive import package is missing archive root.")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                raise ArchiveError("Archive export manifest must be a JSON object.")
+            self._validate_export_manifest(manifest, archive_root)
+            self._validate_archive_database(archive_root / "catalog.sqlite")
+            self._validate_import_locality(archive_root)
+            return ValidatedArchivePackage(temp_dir=temp_dir, archive_root=archive_root, manifest=manifest)
+        except (OSError, json.JSONDecodeError, zipfile.BadZipFile) as error:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise ArchiveError(f"Invalid archive import package: {error}") from error
+        except Exception:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
+
+    def _extract_archive_zip(self, package_path: Path, target_dir: Path) -> None:
+        target_root = target_dir.resolve()
+        seen: set[str] = set()
+        total_uncompressed = 0
+        with zipfile.ZipFile(package_path) as archive_zip:
+            for member in archive_zip.infolist():
+                normalized_name = safe_zip_member_name(member.filename)
+                if normalized_name in seen:
+                    raise ArchiveError(f"Archive import package contains duplicate member: {normalized_name}")
+                seen.add(normalized_name)
+                total_uncompressed += member.file_size
+                if total_uncompressed > ARCHIVE_IMPORT_MAX_UNCOMPRESSED_BYTES:
+                    raise ArchiveError("Archive import package exceeds the maximum uncompressed size.")
+                mode = (member.external_attr >> 16) & 0o170000
+                if mode and not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                    raise ArchiveError(f"Archive import package contains unsupported member type: {normalized_name}")
+                destination = (target_dir / normalized_name).resolve()
+                if not is_relative_to(destination, target_root):
+                    raise ArchiveError(f"Archive import package member escapes extraction directory: {normalized_name}")
+                if member.is_dir():
+                    destination.mkdir(parents=True, exist_ok=True)
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with archive_zip.open(member) as source, destination.open("wb") as target:
+                    shutil.copyfileobj(source, target)
+
+    def _validate_export_manifest(self, manifest: dict[str, Any], archive_root: Path) -> None:
+        expected_values = {
+            "exportSchemaVersion": ARCHIVE_EXPORT_SCHEMA_VERSION,
+            "packageRoot": ARCHIVE_EXPORT_ROOT_NAME,
+            "schemaVersion": ARCHIVE_SCHEMA_VERSION,
+            "embeddingProfileId": EMBEDDING_PROFILE_ID,
+            "embeddingDimension": EMBEDDING_DIM,
+            "turbovecDistribution": TURBOVEC_DISTRIBUTION,
+            "turbovecIndexFormat": TURBOVEC_INDEX_FORMAT,
+        }
+        for key, expected_value in expected_values.items():
+            if manifest.get(key) != expected_value:
+                raise ArchiveError(f"Archive export manifest has unsupported {key}: {manifest.get(key)!r}")
+        files = manifest.get("files")
+        if not isinstance(files, list):
+            raise ArchiveError("Archive export manifest files must be a list.")
+        actual_files = {
+            path.relative_to(archive_root).as_posix(): path
+            for path in archive_root.rglob("*")
+            if path.is_file()
+        }
+        manifest_files: dict[str, dict[str, Any]] = {}
+        for entry in files:
+            if not isinstance(entry, dict):
+                raise ArchiveError("Archive export manifest file entries must be objects.")
+            relative_path = safe_archive_relative_path(str(entry.get("path") or ""))
+            if relative_path in manifest_files:
+                raise ArchiveError(f"Archive export manifest contains duplicate file entry: {relative_path}")
+            if not isinstance(entry.get("sha256"), str) or len(str(entry["sha256"])) != 64:
+                raise ArchiveError(f"Archive export manifest file entry is missing sha256: {relative_path}")
+            manifest_files[relative_path] = entry
+        if set(manifest_files) != set(actual_files):
+            missing = sorted(set(manifest_files) - set(actual_files))
+            extra = sorted(set(actual_files) - set(manifest_files))
+            raise ArchiveError(f"Archive export manifest does not match package files. missing={missing} extra={extra}")
+        if "catalog.sqlite" not in actual_files:
+            raise ArchiveError("Archive import package is missing catalog.sqlite.")
+        for relative_path, entry in manifest_files.items():
+            actual_hash = sha256_file(actual_files[relative_path])
+            if actual_hash != entry["sha256"]:
+                raise ArchiveError(f"Archive import package hash mismatch for {relative_path}.")
+
+    def _validate_archive_database(self, db_path: Path) -> None:
+        required_columns = {
+            "documents": {"document_id", "title", "source_type", "uri", "snapshot_path", "content_sha256", "state", "collection", "tags_json", "created_at", "updated_at"},
+            "chunks": {"chunk_id", "document_id", "locator", "text", "state", "chunk_origin", "enrichment_id"},
+            "document_enrichments": {"enrichment_id", "document_id", "model", "skill_ids_json", "summary", "payload_json", "created_at"},
+            "invalidation_events": {"event_id", "document_id", "previous_state", "next_state", "reason", "created_at"},
+        }
+        with sqlite3.connect(db_path) as db:
+            db.row_factory = sqlite3.Row
+            integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
+            if integrity != "ok":
+                raise ArchiveError(f"Archive import catalog failed SQLite integrity_check: {integrity}")
+            tables = {row["name"] for row in db.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'view')").fetchall()}
+            missing_tables = sorted(set(required_columns) - tables)
+            if missing_tables:
+                raise ArchiveError(f"Archive import catalog is missing required tables: {', '.join(missing_tables)}")
+            if "chunks_fts" not in tables:
+                raise ArchiveError("Archive import catalog is missing chunks_fts search table.")
+            for table, columns in required_columns.items():
+                present = {row["name"] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+                missing_columns = sorted(columns - present)
+                if missing_columns:
+                    raise ArchiveError(f"Archive import catalog table {table} is missing columns: {', '.join(missing_columns)}")
+
+    def _validate_import_locality(self, archive_root: Path) -> None:
+        violations: list[str] = []
+        with sqlite3.connect(archive_root / "catalog.sqlite") as db:
+            db.row_factory = sqlite3.Row
+            documents = db.execute("SELECT document_id, snapshot_path FROM documents ORDER BY document_id").fetchall()
+        for document in documents:
+            document_id = str(document["document_id"])
+            try:
+                relative_snapshot = safe_archive_relative_path(str(document["snapshot_path"]))
+            except ArchiveError as error:
+                violations.append(f"{document_id}: {error}")
+                continue
+            snapshot_path = (archive_root / relative_snapshot).resolve()
+            if not is_relative_to(snapshot_path, archive_root.resolve()):
+                violations.append(f"{document_id}: snapshot path resolves outside archive root")
+                continue
+            if not snapshot_path.is_file():
+                violations.append(f"{document_id}: snapshot file is missing: {relative_snapshot}")
+                continue
+            artifact_root = snapshot_path.parent / "extracted"
+            if not artifact_root.is_dir():
+                continue
+            try:
+                for artifact_path in snapshot_artifact_paths(artifact_root):
+                    relative_artifact = safe_artifact_relative_path(artifact_path)
+                    resolved_artifact = (artifact_root / relative_artifact).resolve()
+                    if not is_relative_to(resolved_artifact, artifact_root.resolve()) or not is_relative_to(resolved_artifact, archive_root.resolve()):
+                        violations.append(f"{document_id}: artifact path resolves outside archive root: {artifact_path}")
+            except ArchiveError as error:
+                violations.append(f"{document_id}: {error}")
+        if violations:
+            raise ArchiveError("Archive import locality validation failed: " + "; ".join(violations))
+
+    def _install_replacement_archive(self, install_root: Path) -> Path:
+        backup_path = self._next_backup_path()
+        moved_current = False
+        try:
+            if self.root.exists():
+                self.root.replace(backup_path)
+                moved_current = True
+            install_root.replace(self.root)
+            return backup_path
+        except Exception:
+            if moved_current and not self.root.exists() and backup_path.exists():
+                backup_path.replace(self.root)
+            raise
+
+    def _next_backup_path(self) -> Path:
+        base = self.root.parent / f"{self.root.name}.pre-import-{safe_timestamp()}"
+        if not base.exists():
+            return base
+        for index in range(1, 1000):
+            candidate = self.root.parent / f"{base.name}-{index}"
+            if not candidate.exists():
+                return candidate
+        raise ArchiveError("Could not allocate archive import backup path.")
+
+    def _merge_archive_root(self, source_root: Path) -> dict[str, Any]:
+        summary: dict[str, Any] = {
+            "mode": "merge",
+            "status": "imported",
+            "importedDocuments": 0,
+            "skippedDocuments": 0,
+            "conflictedDocuments": 0,
+            "importedChunks": 0,
+            "importedEnrichments": 0,
+            "importedInvalidationEvents": 0,
+            "conflicts": [],
+        }
+        source = sqlite3.connect(source_root / "catalog.sqlite")
+        source.row_factory = sqlite3.Row
+        try:
+            with self._connect() as target:
+                documents = source.execute("SELECT * FROM documents ORDER BY created_at, document_id").fetchall()
+                for document in documents:
+                    document_id = str(document["document_id"])
+                    existing = target.execute("SELECT document_id, uri, content_sha256 FROM documents WHERE document_id = ?", (document_id,)).fetchone()
+                    if existing:
+                        if existing["content_sha256"] == document["content_sha256"]:
+                            summary["skippedDocuments"] += 1
+                            summary["importedInvalidationEvents"] += self._merge_invalidation_events(source, target, document_id)
+                            continue
+                        summary["conflictedDocuments"] += 1
+                        summary["conflicts"].append(
+                            {
+                                "kind": "document-id",
+                                "documentId": document_id,
+                                "existingContentSha256": existing["content_sha256"],
+                                "importedContentSha256": document["content_sha256"],
+                            }
+                        )
+                        continue
+                    uri_conflicts = target.execute(
+                        "SELECT document_id, content_sha256, state FROM documents WHERE uri = ? AND content_sha256 != ? ORDER BY document_id",
+                        (document["uri"], document["content_sha256"]),
+                    ).fetchall()
+                    if uri_conflicts:
+                        summary["conflicts"].append(
+                            {
+                                "kind": "uri",
+                                "uri": document["uri"],
+                                "importedDocumentId": document_id,
+                                "existingDocuments": [dict(row) for row in uri_conflicts],
+                            }
+                        )
+                    self._copy_import_snapshot_tree(source_root, str(document["snapshot_path"]))
+                    target.execute(
+                        """
+                        INSERT INTO documents (
+                          document_id, title, source_type, uri, snapshot_path, content_sha256, state, collection,
+                          tags_json, created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            document["document_id"],
+                            document["title"],
+                            document["source_type"],
+                            document["uri"],
+                            document["snapshot_path"],
+                            document["content_sha256"],
+                            document["state"],
+                            document["collection"],
+                            document["tags_json"],
+                            document["created_at"],
+                            document["updated_at"],
+                        ),
+                    )
+                    enrichment_id_map: dict[int, int] = {}
+                    enrichments = source.execute(
+                        "SELECT * FROM document_enrichments WHERE document_id = ? ORDER BY enrichment_id",
+                        (document_id,),
+                    ).fetchall()
+                    for enrichment in enrichments:
+                        cursor = target.execute(
+                            """
+                            INSERT INTO document_enrichments (document_id, model, skill_ids_json, summary, payload_json, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                enrichment["document_id"],
+                                enrichment["model"],
+                                enrichment["skill_ids_json"],
+                                enrichment["summary"],
+                                enrichment["payload_json"],
+                                enrichment["created_at"],
+                            ),
+                        )
+                        enrichment_id_map[int(enrichment["enrichment_id"])] = int(cursor.lastrowid)
+                        summary["importedEnrichments"] += 1
+                    chunks = source.execute("SELECT * FROM chunks WHERE document_id = ? ORDER BY chunk_id", (document_id,)).fetchall()
+                    for chunk in chunks:
+                        source_enrichment_id = chunk["enrichment_id"]
+                        target_enrichment_id = None
+                        if source_enrichment_id is not None:
+                            source_enrichment_id = int(source_enrichment_id)
+                            if source_enrichment_id not in enrichment_id_map:
+                                raise ArchiveError(f"Archive import chunk references unknown enrichment_id: {source_enrichment_id}")
+                            target_enrichment_id = enrichment_id_map[source_enrichment_id]
+                        target.execute(
+                            """
+                            INSERT INTO chunks (document_id, locator, text, state, chunk_origin, enrichment_id)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                chunk["document_id"],
+                                chunk["locator"],
+                                chunk["text"],
+                                chunk["state"],
+                                chunk["chunk_origin"],
+                                target_enrichment_id,
+                            ),
+                        )
+                        summary["importedChunks"] += 1
+                    summary["importedInvalidationEvents"] += self._merge_invalidation_events(source, target, document_id)
+                    summary["importedDocuments"] += 1
+        finally:
+            source.close()
+        return summary
+
+    def _merge_invalidation_events(self, source: sqlite3.Connection, target: sqlite3.Connection, document_id: str) -> int:
+        imported = 0
+        events = source.execute(
+            """
+            SELECT document_id, previous_state, next_state, reason, created_at
+            FROM invalidation_events
+            WHERE document_id = ?
+            ORDER BY event_id
+            """,
+            (document_id,),
+        ).fetchall()
+        for event in events:
+            exists = target.execute(
+                """
+                SELECT 1
+                FROM invalidation_events
+                WHERE document_id = ? AND previous_state = ? AND next_state = ? AND reason = ? AND created_at = ?
+                """,
+                (event["document_id"], event["previous_state"], event["next_state"], event["reason"], event["created_at"]),
+            ).fetchone()
+            if exists:
+                continue
+            target.execute(
+                """
+                INSERT INTO invalidation_events (document_id, previous_state, next_state, reason, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (event["document_id"], event["previous_state"], event["next_state"], event["reason"], event["created_at"]),
+            )
+            imported += 1
+        return imported
+
+    def _copy_import_snapshot_tree(self, source_root: Path, stored_snapshot_path: str) -> None:
+        relative_snapshot = safe_archive_relative_path(stored_snapshot_path)
+        source_snapshot = source_root / relative_snapshot
+        source_parent = source_snapshot.parent
+        target_parent = self.root / source_parent.relative_to(source_root)
+        for source_path in sorted(source_parent.rglob("*")):
+            relative_path = source_path.relative_to(source_parent)
+            target_path = target_parent / relative_path
+            if source_path.is_dir():
+                target_path.mkdir(parents=True, exist_ok=True)
+                continue
+            if not source_path.is_file():
+                continue
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            if target_path.exists():
+                if sha256_file(source_path) != sha256_file(target_path):
+                    raise ArchiveError(f"Imported snapshot file conflicts with existing archive path: {target_path.relative_to(self.root).as_posix()}")
+                continue
+            shutil.copy2(source_path, target_path)
+
     def _init_db(self) -> None:
         with self._connect() as db:
             db.executescript(
@@ -1337,6 +1833,41 @@ class DocumentationArchive:
 
 class ArchiveError(ValueError):
     pass
+
+
+def safe_timestamp() -> str:
+    return timestamp().replace("-", "").replace(":", "").replace("T", "-").removesuffix("Z")
+
+
+def is_catalog_database_relative_path(path: Path) -> bool:
+    return len(path.parts) == 1 and (path.name == "catalog.sqlite" or path.name.startswith("catalog.sqlite-"))
+
+
+def safe_archive_relative_path(path: str) -> str:
+    normalized = optional_text(path)
+    if not normalized:
+        raise ArchiveError("Archive path is required.")
+    if "\\" in normalized:
+        raise ArchiveError(f"Archive path must use portable separators: {path}")
+    candidate = Path(normalized)
+    if candidate.is_absolute() or PureWindowsPath(normalized).is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts):
+        raise ArchiveError(f"Archive path must stay inside archive root: {path}")
+    return candidate.as_posix()
+
+
+def safe_zip_member_name(name: str) -> str:
+    normalized = name.rstrip("/")
+    if not normalized:
+        raise ArchiveError("Archive import package contains an empty member name.")
+    relative_name = safe_archive_relative_path(normalized)
+    parts = relative_name.split("/")
+    if parts[0] == ARCHIVE_EXPORT_MANIFEST_NAME:
+        if len(parts) != 1:
+            raise ArchiveError(f"Archive import package contains invalid manifest member: {name}")
+        return ARCHIVE_EXPORT_MANIFEST_NAME
+    if parts[0] != ARCHIVE_EXPORT_ROOT_NAME:
+        raise ArchiveError(f"Archive import package contains unexpected top-level member: {name}")
+    return relative_name
 
 
 def archive_file_size(root: Path, path: Path) -> ArchiveFileSize:

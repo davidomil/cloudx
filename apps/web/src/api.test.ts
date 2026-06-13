@@ -9,6 +9,7 @@ import {
   deleteNotification,
   deleteLayoutTemplate,
   deleteWindow,
+  downloadDocumentationArchive,
   downloadFileBrowserEntries,
   emitTrigger,
   fetchJson,
@@ -16,6 +17,7 @@ import {
   filenameFromContentDisposition,
   getConfig,
   getHooks,
+  importDocumentationArchive,
   runTabAction,
   selectWindow,
   setActiveTab,
@@ -214,6 +216,50 @@ describe("api client", () => {
     expect(progress).toEqual([
       { loadedBytes: 2, totalBytes: 19, lengthComputable: true },
       { loadedBytes: 19, totalBytes: 19, lengthComputable: true }
+    ]);
+  });
+
+  it("downloads documentation archive exports with the server filename", async () => {
+    const fetchMock = vi.fn(async () => new Response(new Blob(["zip"]), { status: 200, headers: { "content-disposition": "attachment; filename=\"cloudx-documentation-test.zip\"" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await downloadDocumentationArchive();
+
+    expect(result.filename).toBe("cloudx-documentation-test.zip");
+    await expect(result.blob.text()).resolves.toBe("zip");
+    expect(fetchMock).toHaveBeenCalledWith("/api/documentation/archive/export");
+  });
+
+  it("uploads documentation archive imports as octet streams with confirmation", async () => {
+    const file = new File(["archive"], "archive.zip", { type: "application/zip" });
+    const requests: TestXMLHttpRequest[] = [];
+    const progress: Array<{ loadedBytes: number; totalBytes?: number; lengthComputable: boolean }> = [];
+    vi.stubGlobal("XMLHttpRequest", class extends TestXMLHttpRequest {
+      constructor() {
+        super({ import: { mode: "replace" } });
+        requests.push(this);
+      }
+    });
+
+    await expect(importDocumentationArchive({
+      file,
+      mode: "replace",
+      confirmation: "REPLACE_DOCUMENTATION_ARCHIVE",
+      onProgress: (event) => progress.push(event)
+    })).resolves.toEqual({ import: { mode: "replace" } });
+
+    expect(requests[0]).toMatchObject({
+      method: "POST",
+      url: "/api/documentation/archive/import/replace?filename=archive.zip&confirmation=REPLACE_DOCUMENTATION_ARCHIVE",
+      requestHeaders: {
+        "content-type": "application/octet-stream",
+        "x-cloudx-file-content-type": "application/zip"
+      },
+      body: file
+    });
+    expect(progress).toEqual([
+      { loadedBytes: 2, totalBytes: 7, lengthComputable: true },
+      { loadedBytes: 7, totalBytes: 7, lengthComputable: true }
     ]);
   });
 

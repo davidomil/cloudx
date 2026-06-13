@@ -304,31 +304,47 @@ changes:
 npm run docs:memory:pdf
 ```
 
-### Portable Backup And Restore
+### Portable Export, Import, And Restore
 
 The portable database is the full directory named by
 `CLOUDX_DOCUMENTATION_DATA_DIR` or, by default, `.cloudx/documentation`. Back up
 the directory as a unit; do not copy only `catalog.sqlite` or only the Turbovec
-index file.
+index file. The preferred backup path is a first-class ZIP export because it
+uses SQLite online backup semantics for the live catalog and stores a manifest
+with hashes for every packaged file.
 
-Manual backup:
-
-```bash
-tar -czf cloudx-documentation-$(date +%F).tar.gz -C .cloudx documentation
-```
-
-Manual restore to the default location:
+First-class export:
 
 ```bash
-mkdir -p .cloudx
-tar -xzf cloudx-documentation-YYYY-MM-DD.tar.gz -C .cloudx
-npm run documentation:start
-curl -sS -X POST http://127.0.0.1:7820/rebuild-index
+DOC="$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-archive-control/scripts/cloudx-doc.mjs"
+node "$DOC" export --output documentation-archive.zip
 ```
 
-Run the rebuild after restore when you intentionally changed active document
-states, changed the service version, or want to validate that the Turbovec file
-can be reconstructed from SQLite chunks.
+First-class import:
+
+```bash
+DOC="$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-archive-control/scripts/cloudx-doc.mjs"
+node "$DOC" import-merge documentation-archive.zip
+node "$DOC" import-replace documentation-archive.zip --confirm REPLACE_DOCUMENTATION_ARCHIVE
+```
+
+Raw indexer archive endpoints:
+
+```bash
+curl -L http://127.0.0.1:7820/archive/export -o documentation-archive.zip
+curl -F file=@documentation-archive.zip \
+  -F confirmation=REPLACE_DOCUMENTATION_ARCHIVE \
+  http://127.0.0.1:7820/archive/import/replace
+curl -F file=@documentation-archive.zip \
+  http://127.0.0.1:7820/archive/import/merge
+```
+
+Merge import validates the package, imports missing stable documents, skips
+identical document IDs, reports document or URI conflicts, preserves
+invalidation events, and rebuilds the dense index. Replace import is
+destructive: it requires the exact confirmation token, validates the package
+before touching the current root, moves the current archive aside as a backup,
+installs the imported root, and rebuilds the dense index.
 
 Manual archive-root move:
 

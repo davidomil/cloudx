@@ -663,6 +663,58 @@ describe("DocumentationPanel", () => {
     await unmount(root);
   });
 
+  it("exports archives and gates replace import with the confirmation token", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const archiveFile = new File(["zip"], "archive.zip", { type: "application/zip" });
+    const downloadArchive = vi.fn(async () => ({ blob: new Blob(["zip"]), filename: "cloudx-documentation-test.zip" }));
+    const importArchive = vi.fn(async () => ({ import: { mode: "replace" } }));
+    const createObjectUrl = vi.fn(() => "blob:archive");
+    const revokeObjectUrl = vi.fn();
+    vi.stubGlobal("URL", { ...URL, createObjectURL: createObjectUrl, revokeObjectURL: revokeObjectUrl });
+    let statsCalls = 0;
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string) => {
+      if (hookId === "documentation.stats") {
+        statsCalls += 1;
+        return hookResult<T>({ activeDocumentCount: statsCalls > 1 ? 2 : 1, activeChunkCount: 4 });
+      }
+      if (hookId === "documentation.documents.list") {
+        return hookResult<T>({ documents: [], window: { offset: 0, limit: 50, total: 0, hasMore: false } });
+      }
+      return {} as T;
+    };
+
+    await act(async () => {
+      root.render(createElement(DocumentationPanel, { callHook, downloadArchive, importArchive }));
+    });
+    await flush();
+
+    await click(buttonByText(container, "Export"));
+    await flushAsyncWork();
+
+    expect(downloadArchive).toHaveBeenCalled();
+    expect(createObjectUrl).toHaveBeenCalled();
+    expect(container.textContent).toContain("Archive export downloaded as cloudx-documentation-test.zip.");
+
+    await click(buttonByText(container, "replace"));
+    setFileValue(inputByLabel(container, "Archive ZIP"), archiveFile);
+    expect(buttonByText(container, "Import").disabled).toBe(true);
+    setInputValue(inputByLabel(container, "Confirmation"), "REPLACE_DOCUMENTATION_ARCHIVE");
+    await click(buttonByText(container, "Import"));
+    await flushAsyncWork();
+
+    expect(importArchive).toHaveBeenCalledWith({
+      file: archiveFile,
+      mode: "replace",
+      confirmation: "REPLACE_DOCUMENTATION_ARCHIVE"
+    });
+    expect(container.textContent).toContain("Archive replace import complete.");
+    expect(statsCalls).toBeGreaterThan(1);
+
+    await unmount(root);
+  });
+
   it("shows server-side documentation ingest jobs started outside the panel", async () => {
     const container = document.createElement("div");
     document.body.append(container);

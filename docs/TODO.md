@@ -49,13 +49,12 @@
   - Surfaces: FastAPI, the TypeScript documentation client, browser upload proxy, plugin hook schemas, helper flags, and the Documentation panel review checkbox all forward the generated-code acceptance path.
   - Tests: code-heavy path rejection, mixed docs-plus-code directory handling, unsupported-language failure, upload/URL accepted code docs, raw-token non-search, manifest/artifact readback, helper/plugin/UI/client flag forwarding, full Python documentation tests, typecheck, full Vitest, build, and diff hygiene.
 
-- [ ] Add export/import for the documentation knowledge database
-  - Current state: docs describe manual backup by archiving the whole `CLOUDX_DOCUMENTATION_DATA_DIR`; there is no first-class API, UI, or helper command for export/import.
-  - Export target: add a write-locked archive export that packages the complete archive root: `catalog.sqlite`, `snapshots/`, extracted artifacts, `indexes/`, and a manifest with schema/profile/version and file hashes. Use SQLite online backup semantics for a live catalog snapshot instead of copying a writable database file directly.
-  - Import replace target: require an explicit warning/confirmation, pause writes, validate manifest and schema, move the current archive aside or back it up, install the imported root, and rebuild the dense index.
-  - Import merge target: import into a staging archive, validate hashes, merge documents/chunks/enrichments by stable document/content identifiers, preserve invalidation history, skip identical content, report conflicts, and rebuild the dense index.
-  - Surfaces: indexer endpoints, `DocumentationClient`, documentation plugin hooks, helper commands, UI controls, and setup docs.
-  - Tests: replace import warning path, merge duplicate handling, conflict reporting, manifest validation failure, and post-import search/rebuild.
+- [x] Add export/import for the documentation knowledge database
+  - Done: the indexer exports a validated ZIP package with the complete archive root, manifest schema/profile metadata, file hashes, and a live `catalog.sqlite` copy created with SQLite online backup semantics.
+  - Replace import: requires the exact `REPLACE_DOCUMENTATION_ARCHIVE` confirmation token, validates the package before touching the current root, moves the current archive aside as a backup, installs the imported root, and rebuilds the dense index.
+  - Merge import: validates the package, imports missing stable documents/chunks/enrichments, preserves invalidation history, skips identical document IDs, reports document or URI conflicts, copies missing snapshot/artifact files, and rebuilds the dense index.
+  - Surfaces: FastAPI export/import endpoints, TypeScript `DocumentationClient`, plugin hooks, helper commands, browser HTTP routes, Documentation panel controls, setup docs, and the rendered memory plugin PDF.
+  - Tests: export manifest and live catalog backup, replace confirmation and post-import search, manifest hash rejection, merge duplicate/conflict reporting, FastAPI endpoints, server/plugin/helper/API/UI forwarding, full Python documentation tests, typecheck, full Vitest, build, Quarto PDF render, and diff hygiene.
 
 - [x] Audit archive locality and add a migration path for documentation data
   - Current state: `DocumentationArchive` stores `catalog.sqlite`, `snapshots/`, and Turbovec indexes under one root, and `snapshot_path` is stored relative to that root. That is migration-friendly, but needs an explicit invariant check.

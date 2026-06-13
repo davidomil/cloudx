@@ -15,8 +15,9 @@ read paths.
 The system is intentionally local-first. The archive lives under
 `CLOUDX_DOCUMENTATION_DATA_DIR`, defaulting to `.cloudx/documentation`.
 That directory contains the SQLite catalog, immutable source snapshots,
-and the Turbovec dense index. Backing up that directory as a unit is the
-backup story.
+and the Turbovec dense index. First-class archive export/import packages
+that directory as a validated ZIP with an SQLite online-backup snapshot
+of `catalog.sqlite`, file hashes, and explicit merge or replace flows.
 
 The retrieval model is hybrid by default: lexical SQLite FTS5 search and
 a local hash-based dense vector search are combined with reciprocal rank
@@ -92,7 +93,7 @@ Returned spans are merged and written as AI-origin chunks by
 Source: `apps/web/src/ui/DocumentationPanel.tsx`
 
 Provides search, filters, ingest forms, invalidation buttons, manifest
-view, and index rebuild controls.
+view, archive export/import controls, and index rebuild controls.
 
 ## Indexer API
 
@@ -100,7 +101,7 @@ Source:
 `services/documentation-indexer/src/cloudx_documentation_indexer/main.py`
 
 Defines FastAPI routes for health, stats, documents, ingest, enrichment,
-search, invalidate, delete, and rebuild.
+search, invalidate, delete, rebuild, archive export, and archive import.
 
 ## Archive Engine
 
@@ -130,8 +131,12 @@ file path, logical byte size, allocated byte size when the platform
 reports it, category, and SHA-256. It also returns `archiveSize` totals
 for logical bytes, allocated disk bytes, database bytes, source snapshot
 bytes, extracted artifact bytes, index bytes, and the dense-index runtime
-estimate. The guide-level rule is simple: stop writes and back up the
-whole archive directory, not just the SQLite database or the vector file.
+estimate. Archive export creates a ZIP package with that same archive
+root, a manifest with file hashes and schema/profile metadata, and a
+live `catalog.sqlite` snapshot produced through SQLite online backup
+semantics. Manual root copies are still possible for low-level
+maintenance, but only after writes are stopped and only as a complete
+archive directory.
 
 # Ingestion Flow
 
@@ -488,6 +493,20 @@ audit and explicit non-active searches.
   Marks a document deleted.
 - `documentation.rebuildIndex`: `POST /rebuild-index`, safety `write`.
   Rebuilds Turbovec from active SQLite chunks.
+- `documentation.archive.export`: `GET /archive/export`, safety
+  `write`. Streams a validated ZIP package to an allowed local output
+  path without overwriting an existing file.
+- `documentation.archive.import.merge`: `POST /archive/import/merge` or
+  `POST /archive/import/merge/path`, safety `write`. Validates a ZIP
+  package, imports missing stable documents, skips identical document
+  IDs, reports document or URI conflicts, preserves invalidation events,
+  and rebuilds the dense index.
+- `documentation.archive.import.replace`:
+  `POST /archive/import/replace` or `POST /archive/import/replace/path`,
+  safety `destructive`. Requires the exact
+  `REPLACE_DOCUMENTATION_ARCHIVE` confirmation token, validates the ZIP
+  package, moves the current archive root aside, installs the imported
+  root, and rebuilds the dense index.
 
 The `DocumentationClient` defaults to `http://127.0.0.1:7820`, a 30
 minute timeout, and an 8 MiB maximum response body.
@@ -507,6 +526,11 @@ and metadata in query parameters. The indexer route is
 enabled, the same upload bytes are also passed to the enrichment service
 so media uploads can be transcribed and sampled before derived chunks
 are written by `POST /documents/{id}/enrich`.
+
+Browser archive controls use `GET /api/documentation/archive/export` for
+downloads and `POST /api/documentation/archive/import/{merge|replace}`
+for ZIP uploads. The server forwards archive imports to the indexer as
+multipart uploads and forwards archive exports as streamed ZIP responses.
 
 # UI Workflow
 
@@ -540,7 +564,9 @@ operational view:
     Documents list to inspect chunks, transcript text, table Markdown,
     and extracted artifact metadata. Large sources auto-load more chunks
     and artifacts as the source viewer reaches the end.
-12. Load the portable manifest and rebuild the Turbovec index.
+12. Export the archive as a ZIP, import another archive by merge or
+    confirmed replace, load the portable manifest, and rebuild the
+    Turbovec index.
 
 The UI defaults to active-document search, upload ingest,
 assisted-answer mode when AI assistance is available, and hybrid search
@@ -571,7 +597,7 @@ server startup:
 | `documentation-enrich-metadata` | Derive source-grounded metadata and searchable import-improvement notes. |
 | `documentation-enrich-visuals` | Describe extracted tables, graphs, diagrams, screenshots, flowcharts, and schematic artifacts without inventing visual facts, netlists, or connectivity maps. |
 | `documentation-enrich-media` | Improve media imports using transcripts and selected keyframes when available. |
-| `documentation-archive-control` | Inspect health, stats, portable manifest, and rebuild status. |
+| `documentation-archive-control` | Inspect health, stats, portable manifest, export/import ZIP packages, and rebuild status. |
 
 The operational skills tell Codex to read `CLOUDX_DOCUMENTATION_URL` first and
 prefer the bundled helper over raw endpoint calls. The search skill still routes
@@ -585,8 +611,12 @@ from CloudX, the server exports that URL to child processes.
 
 The operational documentation skills also bundle `scripts/cloudx-doc.mjs`, a
 small helper that wraps search, schematic search, open, list, ingest-url, ingest-path,
-ingest-text, invalidate, remove, health, stats, manifest, and rebuild calls so
-Codex can use short commands instead of handwritten curl/JSON/NDJSON requests.
+ingest-text, invalidate, remove, health, stats, manifest, rebuild, archive export,
+archive merge import, and archive replace import calls so Codex can use short
+commands instead of handwritten curl/JSON/NDJSON requests. Archive helpers are
+`node "$DOC" export --output documentation-archive.zip`,
+`node "$DOC" import-merge documentation-archive.zip`, and
+`node "$DOC" import-replace documentation-archive.zip --confirm REPLACE_DOCUMENTATION_ARCHIVE`.
 Code-heavy path and URL helper ingests accept
 `--acceptGeneratedCodeDocumentation` and optional `--retainRawCodeArtifacts`;
 without the review flag the indexer rejects code-heavy input before writing
@@ -631,24 +661,42 @@ CLOUDX_DOCUMENTATION_URL=http://127.0.0.1:7820
 CLOUDX_DOCUMENTATION_DATA_DIR=.cloudx/documentation
 ```
 
-Manual backup:
+First-class export:
 
 ``` bash
-tar -czf cloudx-documentation-$(date +%F).tar.gz -C .cloudx documentation
+DOC="$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-archive-control/scripts/cloudx-doc.mjs"
+node "$DOC" export --output documentation-archive.zip
 ```
 
-Manual restore:
+First-class import:
 
 ``` bash
-mkdir -p .cloudx
-tar -xzf cloudx-documentation-YYYY-MM-DD.tar.gz -C .cloudx
-npm run documentation:start
-curl -sS -X POST http://127.0.0.1:7820/rebuild-index
+DOC="$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-archive-control/scripts/cloudx-doc.mjs"
+node "$DOC" import-merge documentation-archive.zip
+node "$DOC" import-replace documentation-archive.zip --confirm REPLACE_DOCUMENTATION_ARCHIVE
 ```
 
-Run rebuild after restore when active document states changed, the
-service version changed, or you want to prove the Turbovec file can be
-reconstructed from SQLite chunks.
+Raw indexer archive endpoints:
+
+``` bash
+curl -L http://127.0.0.1:7820/archive/export -o documentation-archive.zip
+curl -F file=@documentation-archive.zip \
+  -F confirmation=REPLACE_DOCUMENTATION_ARCHIVE \
+  http://127.0.0.1:7820/archive/import/replace
+curl -F file=@documentation-archive.zip \
+  http://127.0.0.1:7820/archive/import/merge
+```
+
+Archive export uses a write lock, rebuilds the dense index first, copies
+non-database archive files, snapshots `catalog.sqlite` through SQLite
+online backup semantics, and writes a manifest with hashes for every ZIP
+member. Merge import validates the package, imports missing stable
+documents and related chunks/enrichments, skips identical document IDs,
+reports conflicts, preserves invalidation events, copies missing
+snapshot/artifact files, and rebuilds the dense index. Replace import is
+destructive: it requires the exact confirmation token, validates the
+package before touching the current root, moves the current archive aside
+as a backup, installs the imported root, and rebuilds the dense index.
 
 Manual archive-root move:
 
@@ -690,7 +738,8 @@ The indexer tests cover:
   identifier recall, and dense-only fallback above the configured
   threshold.
 - Invalidation, deletion, portable manifest generation, archive
-  reopen/restore behavior, FastAPI controls, and CLI help.
+  export/import, archive reopen/restore behavior, FastAPI controls, and
+  CLI help.
 
 The server plugin tests cover hook registration, safety classes, local
 path policy enforcement, browser upload forwarding including generated-code

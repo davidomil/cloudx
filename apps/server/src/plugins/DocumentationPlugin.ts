@@ -1,3 +1,9 @@
+import fs from "node:fs/promises";
+import { createWriteStream } from "node:fs";
+import path from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+
 import type { CreatePluginSessionInput, HookCallContext, HookDefinition, JsonSchemaLike, PluginRuleContribution, PluginSession, PluginSessionSnapshot, PluginSkillContribution, PluginVoiceContext, WorkspacePlugin } from "@cloudx/plugin-api";
 import type { ConfigFieldDescriptor, WorkspaceTab } from "@cloudx/shared";
 
@@ -102,6 +108,24 @@ export class DocumentationPlugin implements WorkspacePlugin {
       readHook("documentation.ingest.queue", "Documentation Ingest Queue", "Return queued, running, and recent documentation ingest jobs.", () => this.ingestQueue.list()),
       writeHook("documentation.ingest.queue.clearFinished", "Clear Documentation Ingest Queue", "Remove completed and failed documentation ingest jobs from the queue view.", () => this.ingestQueue.clearFinished()),
       readHook("documentation.portableManifest", "Documentation Portable Manifest", "Return files that make up the portable archive.", () => this.client.portableManifest()),
+      writeHook("documentation.archive.export", "Export Documentation Archive", "Export the complete documentation archive to an allowed local ZIP path without overwriting an existing file.", (input) => this.exportArchive(input), {
+        path: { type: "string" },
+        cwd: { type: "string" }
+      }, ["path"]),
+      destructiveHook("documentation.archive.import.replace", "Replace Documentation Archive", "Replace the documentation archive from an allowed local ZIP package after exact confirmation.", (input) => this.client.importArchiveReplacePath({
+        path: this.resolveArchivePath(input),
+        confirmation: requireString(input.confirmation, "confirmation")
+      }), {
+        path: { type: "string" },
+        cwd: { type: "string" },
+        confirmation: { type: "string" }
+      }, ["path", "confirmation"]),
+      writeHook("documentation.archive.import.merge", "Merge Documentation Archive", "Merge missing documentation records from an allowed local ZIP package into the current archive.", (input) => this.client.importArchiveMergePath({
+        path: this.resolveArchivePath(input)
+      }), {
+        path: { type: "string" },
+        cwd: { type: "string" }
+      }, ["path"]),
       readHook("documentation.documents.list", "List Documentation", "List documentation records.", (input) => this.client.listDocuments(input), {
         states: { type: "array", items: { type: "string" } },
         limit: { type: "number" },
@@ -223,6 +247,34 @@ export class DocumentationPlugin implements WorkspacePlugin {
     return new DocumentationSession(input.tab);
   }
 
+  private async exportArchive(input: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const outputPath = this.resolveArchivePath(input);
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    await assertFileDoesNotExist(outputPath);
+    const tempPath = `${outputPath}.tmp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    try {
+      const exported = await this.client.streamArchiveExport();
+      if (!exported.body) {
+        throw new Error("Documentation archive export response did not include a stream.");
+      }
+      await pipeline(
+        Readable.fromWeb(exported.body as Parameters<typeof Readable.fromWeb>[0]),
+        createWriteStream(tempPath, { flags: "wx" })
+      );
+      await fs.rename(tempPath, outputPath);
+      const stat = await fs.stat(outputPath);
+      return { path: outputPath, bytes: stat.size };
+    } catch (error) {
+      await fs.rm(tempPath, { force: true });
+      throw error;
+    }
+  }
+
+  private resolveArchivePath(input: Record<string, unknown>): string {
+    const cwd = optionalString(input.cwd);
+    return this.pathPolicy.resolve(requireString(input.path, "path"), cwd ? { relativeBaseDir: this.pathPolicy.resolve(cwd) } : undefined);
+  }
+
   private enrich(response: Record<string, unknown>): Promise<Record<string, unknown>> | Record<string, unknown> {
     return this.enrichmentProvider()?.enrichIngestResponse(response) ?? response;
   }
@@ -302,6 +354,17 @@ function writeHook(
   return hook(id, title, description, execute, properties, required, ["ui", "http", "automation"], "write");
 }
 
+function destructiveHook(
+  id: string,
+  title: string,
+  description: string,
+  execute: HookDefinition["execute"],
+  properties: Record<string, JsonSchemaLike> = {},
+  required: string[] = []
+): HookDefinition {
+  return hook(id, title, description, execute, properties, required, ["ui", "http", "automation"], "destructive");
+}
+
 function externalHook(
   id: string,
   title: string,
@@ -349,6 +412,18 @@ function optionalString(value: unknown): string | undefined {
 
 function titleOrFallback(value: unknown, fallback: string): string {
   return optionalString(value) ?? fallback;
+}
+
+async function assertFileDoesNotExist(filePath: string): Promise<void> {
+  const stat = await fs.stat(filePath).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  });
+  if (stat) {
+    throw new Error(`File already exists: ${filePath}`);
+  }
 }
 
 function urlIngestStage(url: string): string {
@@ -496,13 +571,15 @@ function defaultDocumentationSkills(): PluginSkillContribution[] {
     {
       id: "documentation-archive-control",
       name: "Documentation Archive Control",
-      description: "Inspect portable archive health, size, locality, backup manifest, and index rebuild status.",
+      description: "Inspect, export, import, and rebuild the portable documentation archive.",
       instructions: skillInstructions("Archive Control", [
         "Read `CLOUDX_DOCUMENTATION_URL`. If it is missing, stop and explain that the documentation indexer URL is not available.",
-        `Use the bundled helper to keep commands short: \`DOC="$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-archive-control/${DOCUMENTATION_HELPER_SCRIPT_PATH}"\`; then run \`node "$DOC" health\`, \`node "$DOC" stats\`, \`node "$DOC" manifest\`, \`node "$DOC" list\`, or \`node "$DOC" rebuild\`.`,
+        `Use the bundled helper to keep commands short: \`DOC="$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-archive-control/${DOCUMENTATION_HELPER_SCRIPT_PATH}"\`; then run \`node "$DOC" health\`, \`node "$DOC" stats\`, \`node "$DOC" manifest\`, \`node "$DOC" list\`, \`node "$DOC" rebuild\`, \`node "$DOC" export --output archive.zip\`, \`node "$DOC" import-merge archive.zip\`, or \`node "$DOC" import-replace archive.zip --confirm REPLACE_DOCUMENTATION_ARCHIVE\`.`,
         "Use health, stats, and manifest output, including archiveSize totals and archiveLocality, to inspect archive state before advising backup, restore, or archive-root migration work.",
-        "The portable archive is the complete directory reported by `/health.archiveRoot`; back it up as a directory after stopping writes.",
-        "Run rebuild after restoring an archive or changing active documentation state."
+        "Use `export` for a validated ZIP package containing the complete archive root, an SQLite online backup snapshot of `catalog.sqlite`, and a manifest with file hashes.",
+        "Use `import-merge` to import missing stable documents while skipping identical document IDs, reporting document or URI conflicts, preserving invalidation events, and rebuilding the dense index.",
+        "Use `import-replace` only when destructive replacement is intended; it requires the exact `REPLACE_DOCUMENTATION_ARCHIVE` token, moves the current archive root aside, installs the validated package, and rebuilds the dense index.",
+        "Manual archive-root copies are still acceptable for low-level maintenance only after stopping writes."
       ]),
       files: DOCUMENTATION_HELPER_FILES
     }

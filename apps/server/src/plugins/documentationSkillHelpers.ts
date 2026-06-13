@@ -9,6 +9,7 @@ export const DOCUMENTATION_HELPER_FILES: PluginSkillContributionFile[] = [
     content: String.raw`#!/usr/bin/env node
 import http from "node:http";
 import https from "node:https";
+import fs from "node:fs";
 import path from "node:path";
 import { URL } from "node:url";
 
@@ -42,6 +43,12 @@ async function main() {
       return printJson(await getJson(documentationEndpoint("/stats")));
     case "manifest":
       return printJson(await getJson(documentationEndpoint("/portable-manifest")));
+    case "export":
+      return exportArchive(args, options);
+    case "import-replace":
+      return importArchive("replace", args, options);
+    case "import-merge":
+      return importArchive("merge", args, options);
     case "invalidate":
       return invalidateDocument(args, options);
     case "remove":
@@ -128,6 +135,41 @@ async function listDocuments(options) {
   printWindow(result.window);
 }
 
+async function exportArchive(args, options) {
+  const outputPath = options.output || args[0];
+  if (!outputPath) {
+    throw new Error("missing output path");
+  }
+  const serverUrl = process.env.CLOUDX_SERVER_URL?.trim();
+  if (serverUrl) {
+    return printJson(await postHookJson(joinUrl(serverUrl, "/api/hooks/documentation.archive.export"), { input: { path: outputPath, cwd: process.cwd() } }));
+  }
+  const resolvedOutputPath = path.resolve(outputPath);
+  await ensureOutputFileAvailable(resolvedOutputPath);
+  await downloadToFile(documentationEndpoint("/archive/export"), resolvedOutputPath);
+  const stat = await fs.promises.stat(resolvedOutputPath);
+  return printJson({ path: resolvedOutputPath, bytes: stat.size });
+}
+
+async function importArchive(mode, args, options) {
+  const packagePath = requiredArg(args, "path");
+  const serverUrl = process.env.CLOUDX_SERVER_URL?.trim();
+  if (serverUrl) {
+    const input = { path: packagePath, cwd: process.cwd() };
+    if (mode === "replace") {
+      input.confirmation = requiredConfirmation(options);
+    }
+    return printJson(await postHookJson(joinUrl(serverUrl, "/api/hooks/documentation.archive.import." + mode), { input }));
+  }
+  if (!path.isAbsolute(packagePath)) {
+    throw new Error("Relative archive import paths require CLOUDX_SERVER_URL so CloudX can resolve them from the current workspace. Pass an absolute path when using CLOUDX_DOCUMENTATION_URL directly.");
+  }
+  if (mode === "replace") {
+    return printJson(await postJson(documentationEndpoint("/archive/import/replace/path"), { path: packagePath, confirmation: requiredConfirmation(options) }));
+  }
+  return printJson(await postJson(documentationEndpoint("/archive/import/merge/path"), { path: packagePath }));
+}
+
 async function ingest(kind, input) {
   const serverUrl = process.env.CLOUDX_SERVER_URL?.trim();
   if (serverUrl) {
@@ -176,6 +218,14 @@ async function invalidateDocument(args, options) {
 async function removeDocument(args) {
   const documentId = requiredArg(args, "documentId");
   return printJson(await requestJson(documentationEndpoint("/documents/" + encodeURIComponent(documentId)), { method: "DELETE" }));
+}
+
+function requiredConfirmation(options) {
+  const confirmation = options.confirm || options.confirmation;
+  if (!confirmation) {
+    throw new Error("missing confirmation");
+  }
+  return confirmation;
 }
 
 function metadata(options) {
@@ -263,6 +313,11 @@ async function postJson(url, payload) {
   return requestJson(url, { method: "POST", payload });
 }
 
+async function postHookJson(url, payload) {
+  const response = await postJson(url, payload);
+  return response && typeof response === "object" && response.result && typeof response.result === "object" ? response.result : response;
+}
+
 async function requestJson(url, { method, payload }) {
   const body = payload === undefined ? undefined : JSON.stringify(payload);
   const response = await request(url, {
@@ -301,6 +356,53 @@ function request(urlString, options) {
     });
     req.on("error", reject);
     if (options.body) req.write(options.body);
+    req.end();
+  });
+}
+
+function downloadToFile(urlString, outputPath) {
+  return new Promise((resolve, reject) => {
+    const tempPath = outputPath + ".tmp-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+    const url = new URL(urlString);
+    const req = transport(url).request(url, requestOptionsFor(url, { method: "GET", headers: { accept: "application/zip" } }), (res) => {
+      if ((res.statusCode || 0) < 200 || (res.statusCode || 0) >= 300) {
+        const chunks = [];
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => chunks.push(chunk));
+        res.on("end", () => {
+          fs.rm(tempPath, { force: true }, () => undefined);
+          reject(new Error("GET " + urlString + " failed with " + res.statusCode + ": " + chunks.join("")));
+        });
+        return;
+      }
+      const file = fs.createWriteStream(tempPath, { flags: "wx" });
+      res.pipe(file);
+      file.on("finish", () => {
+        file.close((error) => {
+          if (error) {
+            fs.rm(tempPath, { force: true }, () => undefined);
+            reject(error);
+            return;
+          }
+          fs.rename(tempPath, outputPath, (renameError) => {
+            if (renameError) {
+              fs.rm(tempPath, { force: true }, () => undefined);
+              reject(renameError);
+              return;
+            }
+            resolve();
+          });
+        });
+      });
+      file.on("error", (error) => {
+        fs.rm(tempPath, { force: true }, () => undefined);
+        reject(error);
+      });
+    });
+    req.on("error", (error) => {
+      fs.rm(tempPath, { force: true }, () => undefined);
+      reject(error);
+    });
     req.end();
   });
 }
@@ -463,6 +565,19 @@ function printJson(value) {
   console.log(JSON.stringify(value, null, 2));
 }
 
+async function ensureOutputFileAvailable(outputPath) {
+  await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
+  try {
+    await fs.promises.stat(outputPath);
+  } catch (error) {
+    if (error && error.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+  throw new Error("File already exists: " + outputPath);
+}
+
 function stdin() {
   return new Promise((resolve) => {
     const chunks = [];
@@ -484,6 +599,9 @@ function usage() {
     "  cloudx-doc.mjs ingest-text <text> [--title title] [--uri uri]",
     "  cloudx-doc.mjs invalidate <documentId> <state> --reason reason",
     "  cloudx-doc.mjs remove <documentId>",
+    "  cloudx-doc.mjs export --output archive.zip",
+    "  cloudx-doc.mjs import-replace <archive.zip> --confirm REPLACE_DOCUMENTATION_ARCHIVE",
+    "  cloudx-doc.mjs import-merge <archive.zip>",
     "  cloudx-doc.mjs health|stats|manifest|rebuild"
   ].join("\n"));
   process.exit(2);

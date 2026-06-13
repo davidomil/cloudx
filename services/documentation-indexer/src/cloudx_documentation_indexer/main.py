@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import queue
+import tempfile
 import threading
 from pathlib import Path
 from typing import Annotated
@@ -15,6 +16,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from .archive import ACTIVE_STATE, ArchiveError, DocumentationArchive
 
@@ -77,6 +79,15 @@ class EnrichDocumentRequest(BaseModel):
     payload: dict = Field(default_factory=dict)
 
 
+class ImportArchiveReplacePathRequest(BaseModel):
+    path: str
+    confirmation: str
+
+
+class ImportArchiveMergePathRequest(BaseModel):
+    path: str
+
+
 def create_app(root: str | Path | None = None) -> FastAPI:
     archive_root = Path(root or os.getenv("CLOUDX_DOCUMENTATION_DATA_DIR", ".cloudx/documentation"))
     archive = DocumentationArchive(archive_root)
@@ -94,6 +105,40 @@ def create_app(root: str | Path | None = None) -> FastAPI:
     @app.get("/portable-manifest")
     def portable_manifest() -> dict:
         return archive.portable_manifest()
+
+    @app.get("/archive/export")
+    def export_archive() -> FileResponse:
+        exported = handle_archive_error(lambda: archive.export_archive())
+        return FileResponse(
+            exported.path,
+            media_type="application/zip",
+            filename=exported.filename,
+            background=BackgroundTask(lambda: exported.path.unlink(missing_ok=True)),
+        )
+
+    @app.post("/archive/import/replace/path")
+    def import_archive_replace_path(request: ImportArchiveReplacePathRequest) -> dict:
+        return {"import": handle_archive_error(lambda: archive.import_archive_replace(request.path, confirmation=request.confirmation))}
+
+    @app.post("/archive/import/merge/path")
+    def import_archive_merge_path(request: ImportArchiveMergePathRequest) -> dict:
+        return {"import": handle_archive_error(lambda: archive.import_archive_merge(request.path))}
+
+    @app.post("/archive/import/replace")
+    async def import_archive_replace_upload(file: Annotated[UploadFile, File()], confirmation: Annotated[str, Form()]) -> dict:
+        package_path = await uploaded_archive_package(file, archive.root)
+        try:
+            return {"import": handle_archive_error(lambda: archive.import_archive_replace(package_path, confirmation=confirmation))}
+        finally:
+            package_path.unlink(missing_ok=True)
+
+    @app.post("/archive/import/merge")
+    async def import_archive_merge_upload(file: Annotated[UploadFile, File()]) -> dict:
+        package_path = await uploaded_archive_package(file, archive.root)
+        try:
+            return {"import": handle_archive_error(lambda: archive.import_archive_merge(package_path))}
+        finally:
+            package_path.unlink(missing_ok=True)
 
     @app.get("/documents")
     def documents(
@@ -295,6 +340,18 @@ def handle_archive_error(operation):
         return operation()
     except ArchiveError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+async def uploaded_archive_package(file: UploadFile, archive_root: Path) -> Path:
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Archive import package is empty.")
+    handle = tempfile.NamedTemporaryFile(prefix="cloudx-documentation-import-upload-", suffix=".zip", dir=archive_root.parent, delete=False)
+    try:
+        handle.write(content)
+        return Path(handle.name)
+    finally:
+        handle.close()
 
 
 def archive_progress_stream(operation: Callable[[Callable[[dict[str, Any]], None]], Any], serialize: Callable[[Any], dict]):

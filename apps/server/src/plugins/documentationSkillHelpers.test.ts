@@ -126,6 +126,92 @@ describe("documentation skill helper", () => {
     expect(JSON.parse(result.stdout)).toEqual({ activeDocumentCount: 2, activeChunkCount: 9, archiveSize });
   });
 
+  it("routes archive export and imports through CloudX server hooks with cwd", async () => {
+    const workspace = await tempRoot();
+    const requests: Array<{ url: string; body: unknown }> = [];
+    const serverUrl = await startServer((request, response) => {
+      let requestBody = "";
+      request.on("data", (chunk) => {
+        requestBody += chunk.toString();
+      });
+      request.on("end", () => {
+        requests.push({ url: request.url ?? "", body: JSON.parse(requestBody) });
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ result: { ok: true } }));
+      });
+    });
+
+    await runHelper(["export", "--output", "archive.zip"], { cwd: workspace, env: { CLOUDX_SERVER_URL: serverUrl } });
+    await runHelper(["import-replace", "archive.zip", "--confirm", "REPLACE_DOCUMENTATION_ARCHIVE"], { cwd: workspace, env: { CLOUDX_SERVER_URL: serverUrl } });
+    await runHelper(["import-merge", "archive.zip"], { cwd: workspace, env: { CLOUDX_SERVER_URL: serverUrl } });
+
+    expect(requests).toEqual([
+      { url: "/api/hooks/documentation.archive.export", body: { input: { path: "archive.zip", cwd: workspace } } },
+      { url: "/api/hooks/documentation.archive.import.replace", body: { input: { path: "archive.zip", cwd: workspace, confirmation: "REPLACE_DOCUMENTATION_ARCHIVE" } } },
+      { url: "/api/hooks/documentation.archive.import.merge", body: { input: { path: "archive.zip", cwd: workspace } } }
+    ]);
+  });
+
+  it("downloads archive exports from the raw indexer without overwriting", async () => {
+    const workspace = await tempRoot();
+    const outputPath = path.join(workspace, "export.zip");
+    let requestUrl = "";
+    const documentationUrl = await startServer((request, response) => {
+      requestUrl = request.url ?? "";
+      response.writeHead(200, { "content-type": "application/zip" });
+      response.end(Buffer.from([1, 2, 3, 4]));
+    });
+
+    const result = await runHelper(["export", "--output", outputPath], {
+      cwd: workspace,
+      env: { CLOUDX_DOCUMENTATION_URL: documentationUrl }
+    });
+
+    expect(requestUrl).toBe("/archive/export");
+    expect(await fs.readFile(outputPath)).toEqual(Buffer.from([1, 2, 3, 4]));
+    expect(JSON.parse(result.stdout)).toEqual({ path: outputPath, bytes: 4 });
+    await expect(runHelper(["export", "--output", outputPath], {
+      cwd: workspace,
+      env: { CLOUDX_DOCUMENTATION_URL: documentationUrl }
+    })).rejects.toMatchObject({ stderr: expect.stringContaining("File already exists") });
+  });
+
+  it("requires absolute raw-indexer archive import paths and posts them to path endpoints", async () => {
+    const workspace = await tempRoot();
+    const packagePath = path.join(workspace, "archive.zip");
+    await fs.writeFile(packagePath, "zip");
+    const requests: Array<{ url: string; body: unknown }> = [];
+    const documentationUrl = await startServer((request, response) => {
+      let requestBody = "";
+      request.on("data", (chunk) => {
+        requestBody += chunk.toString();
+      });
+      request.on("end", () => {
+        requests.push({ url: request.url ?? "", body: JSON.parse(requestBody) });
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ import: { mode: "ok" } }));
+      });
+    });
+
+    await expect(runHelper(["import-merge", "archive.zip"], {
+      cwd: workspace,
+      env: { CLOUDX_DOCUMENTATION_URL: documentationUrl }
+    })).rejects.toMatchObject({ stderr: expect.stringContaining("Relative archive import paths require CLOUDX_SERVER_URL") });
+    await runHelper(["import-replace", packagePath, "--confirm", "REPLACE_DOCUMENTATION_ARCHIVE"], {
+      cwd: workspace,
+      env: { CLOUDX_DOCUMENTATION_URL: documentationUrl }
+    });
+    await runHelper(["import-merge", packagePath], {
+      cwd: workspace,
+      env: { CLOUDX_DOCUMENTATION_URL: documentationUrl }
+    });
+
+    expect(requests).toEqual([
+      { url: "/archive/import/replace/path", body: { path: packagePath, confirmation: "REPLACE_DOCUMENTATION_ARCHIVE" } },
+      { url: "/archive/import/merge/path", body: { path: packagePath } }
+    ]);
+  });
+
   it("passes bounded list options to the raw indexer", async () => {
     const workspace = await tempRoot();
     let requestUrl = "";

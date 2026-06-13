@@ -119,6 +119,83 @@ describe("DocumentationClient", () => {
     expect(Array.from(new Uint8Array(await new Response(artifact.body).arrayBuffer()))).toEqual([1, 2, 3]);
   });
 
+  it("streams archive export bytes", async () => {
+    let requestUrl = "";
+    const url = await startServer((request, response) => {
+      requestUrl = request.url ?? "";
+      response.writeHead(200, {
+        "content-type": "application/zip",
+        "content-disposition": 'attachment; filename="cloudx-documentation-test.zip"'
+      });
+      response.end(Buffer.from([4, 5, 6]));
+    });
+    const client = new DocumentationClient(`${url}/docs`);
+
+    const exported = await client.streamArchiveExport();
+
+    expect(requestUrl).toBe("/docs/archive/export");
+    expect(exported.statusCode).toBe(200);
+    expect(exported.headers.get("content-type")).toBe("application/zip");
+    expect(Array.from(new Uint8Array(await new Response(exported.body).arrayBuffer()))).toEqual([4, 5, 6]);
+  });
+
+  it("forwards archive import path requests", async () => {
+    const requests: Array<{ url: string; body: unknown }> = [];
+    const url = await startServer((request, response) => {
+      let requestBody = "";
+      request.on("data", (chunk) => {
+        requestBody += chunk.toString();
+      });
+      request.on("end", () => {
+        requests.push({ url: request.url ?? "", body: JSON.parse(requestBody) });
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ import: { mode: "ok" } }));
+      });
+    });
+    const client = new DocumentationClient(`${url}/docs`);
+
+    await client.importArchiveReplacePath({ path: "/tmp/archive.zip", confirmation: "REPLACE_DOCUMENTATION_ARCHIVE" });
+    await client.importArchiveMergePath({ path: "/tmp/archive.zip" });
+
+    expect(requests).toEqual([
+      { url: "/docs/archive/import/replace/path", body: { path: "/tmp/archive.zip", confirmation: "REPLACE_DOCUMENTATION_ARCHIVE" } },
+      { url: "/docs/archive/import/merge/path", body: { path: "/tmp/archive.zip" } }
+    ]);
+  });
+
+  it("uploads archive import packages as multipart form data", async () => {
+    let requestUrl = "";
+    let contentType = "";
+    let requestBody = Buffer.alloc(0);
+    const url = await startServer((request, response) => {
+      requestUrl = request.url ?? "";
+      contentType = String(request.headers["content-type"] ?? "");
+      const chunks: Buffer[] = [];
+      request.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      request.on("end", () => {
+        requestBody = Buffer.concat(chunks);
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ import: { mode: "replace" } }));
+      });
+    });
+    const client = new DocumentationClient(`${url}/docs`);
+
+    const result = await client.importArchiveReplaceUpload({
+      filename: "archive.zip",
+      content: new Uint8Array([7, 8, 9]),
+      contentType: "application/zip",
+      confirmation: "REPLACE_DOCUMENTATION_ARCHIVE"
+    });
+
+    expect(result).toEqual({ import: { mode: "replace" } });
+    expect(requestUrl).toBe("/docs/archive/import/replace");
+    expect(contentType).toContain("multipart/form-data");
+    const bodyText = requestBody.toString("latin1");
+    expect(bodyText).toContain('filename="archive.zip"');
+    expect(bodyText).toContain('name="confirmation"');
+    expect(bodyText).toContain("REPLACE_DOCUMENTATION_ARCHIVE");
+  });
+
   it("returns service error details", async () => {
     const url = await startServer((_request, response) => {
       response.writeHead(400, { "content-type": "application/json" });
