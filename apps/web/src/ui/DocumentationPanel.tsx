@@ -804,7 +804,9 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
         chunkLimit: hasMoreChunks ? SOURCE_CHUNK_PAGE_SIZE : 0,
         chunkTextMaxChars: SOURCE_CHUNK_TEXT_MAX_CHARS,
         artifactOffset: currentArtifacts.length,
-        artifactLimit
+        artifactLimit,
+        includeEnrichments: false,
+        includeEvents: false
       });
       setSelectedDocument((latest) => latest && documentId(latest) === id ? mergeSourceWindow(latest, result.document) : latest);
     } catch (error) {
@@ -1498,7 +1500,9 @@ function sourceDocumentWindowInput(documentIdValue: string): Record<string, unkn
     chunkLimit: SOURCE_CHUNK_PAGE_SIZE,
     chunkTextMaxChars: SOURCE_CHUNK_TEXT_MAX_CHARS,
     artifactOffset: 0,
-    artifactLimit: SOURCE_ARTIFACT_PAGE_SIZE
+    artifactLimit: SOURCE_ARTIFACT_PAGE_SIZE,
+    includeEnrichments: false,
+    includeEvents: false
   };
 }
 

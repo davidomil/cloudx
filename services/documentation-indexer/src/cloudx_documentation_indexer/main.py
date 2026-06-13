@@ -175,6 +175,8 @@ def create_app(root: str | Path | None = None) -> FastAPI:
         chunk_text_max_chars: Annotated[int | None, Query(alias="chunkTextMaxChars", ge=0)] = None,
         artifact_offset: Annotated[int | None, Query(alias="artifactOffset", ge=0)] = None,
         artifact_limit: Annotated[int | None, Query(alias="artifactLimit", ge=0)] = None,
+        include_enrichments: Annotated[bool, Query(alias="includeEnrichments")] = True,
+        include_events: Annotated[bool, Query(alias="includeEvents")] = True,
     ) -> dict:
         return {
             "document": handle_archive_error(
@@ -187,6 +189,8 @@ def create_app(root: str | Path | None = None) -> FastAPI:
                     chunk_text_max_chars=chunk_text_max_chars,
                     artifact_offset=artifact_offset,
                     artifact_limit=artifact_limit,
+                    include_enrichments=include_enrichments,
+                    include_events=include_events,
                 )
             )
         }

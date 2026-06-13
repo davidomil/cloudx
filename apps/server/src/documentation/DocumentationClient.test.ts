@@ -69,10 +69,12 @@ describe("DocumentationClient", () => {
       chunkLimit: 25,
       chunkTextMaxChars: 4000,
       artifactOffset: 100,
-      artifactLimit: 50
+      artifactLimit: 50,
+      includeEnrichments: false,
+      includeEvents: false
     });
 
-    expect(requestUrl).toBe("/docs/documents/doc-1?token=local&chunkOffset=75&chunkLimit=25&chunkTextMaxChars=4000&artifactOffset=100&artifactLimit=50");
+    expect(requestUrl).toBe("/docs/documents/doc-1?token=local&chunkOffset=75&chunkLimit=25&chunkTextMaxChars=4000&artifactOffset=100&artifactLimit=50&includeEnrichments=false&includeEvents=false");
   });
 
   it("forwards selected document chunk ids with context", async () => {

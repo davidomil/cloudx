@@ -110,6 +110,8 @@ export class DocumentationClient {
     appendOptionalQueryNumber(params, "chunkTextMaxChars", input.chunkTextMaxChars);
     appendOptionalQueryNumber(params, "artifactOffset", input.artifactOffset);
     appendOptionalQueryNumber(params, "artifactLimit", input.artifactLimit);
+    appendOptionalQueryBoolean(params, "includeEnrichments", input.includeEnrichments);
+    appendOptionalQueryBoolean(params, "includeEvents", input.includeEvents);
     const query = params.toString();
     return this.get(`/documents/${documentId}${query ? `?${query}` : ""}`);
   }
@@ -536,6 +538,12 @@ function appendOptionalFormBoolean(form: FormData, name: string, value: boolean 
 
 function appendOptionalQueryNumber(params: URLSearchParams, name: string, value: unknown): void {
   if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
+    params.set(name, String(value));
+  }
+}
+
+function appendOptionalQueryBoolean(params: URLSearchParams, name: string, value: unknown): void {
+  if (typeof value === "boolean") {
     params.set(name, String(value));
   }
 }

@@ -96,7 +96,9 @@ async function searchSchematics(args, options) {
     const params = new URLSearchParams({
       chunkLimit: "0",
       chunkTextMaxChars: "1",
-      artifactLimit: String(integerOption(options.artifacts, 32))
+      artifactLimit: String(integerOption(options.artifacts, 32)),
+      includeEnrichments: "false",
+      includeEvents: "false"
     });
     const detail = await getJson(documentationEndpoint("/documents/" + encodeURIComponent(documentId) + "?" + params.toString()));
     const artifacts = Array.isArray(detail.document?.artifacts) ? detail.document.artifacts : [];
@@ -116,7 +118,9 @@ async function openDocument(args, options) {
   const params = new URLSearchParams({
     chunkLimit: String(integerOption(options.chunks, 8)),
     chunkTextMaxChars: String(integerOption(options.chars, 1200)),
-    artifactLimit: String(integerOption(options.artifacts, 8))
+    artifactLimit: String(integerOption(options.artifacts, 8)),
+    includeEnrichments: "false",
+    includeEvents: "false"
   });
   const result = await getJson(documentationEndpoint("/documents/" + encodeURIComponent(documentId) + "?" + params.toString()));
   printDocument(result.document || result);

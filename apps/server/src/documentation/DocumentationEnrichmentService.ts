@@ -261,7 +261,9 @@ export class DocumentationEnrichmentService {
           chunkIds,
           chunkContext: ANSWER_CHUNK_CONTEXT,
           chunkTextMaxChars: ANSWER_CHUNK_TEXT_MAX_CHARS,
-          artifactLimit: 0
+          artifactLimit: 0,
+          includeEnrichments: false,
+          includeEvents: false
         })).document, "document");
         documents.set(documentId, document);
       }

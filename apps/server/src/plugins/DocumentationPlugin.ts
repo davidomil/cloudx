@@ -142,7 +142,9 @@ export class DocumentationPlugin implements WorkspacePlugin {
         chunkContext: { type: "number" },
         chunkTextMaxChars: { type: "number" },
         artifactOffset: { type: "number" },
-        artifactLimit: { type: "number" }
+        artifactLimit: { type: "number" },
+        includeEnrichments: { type: "boolean" },
+        includeEvents: { type: "boolean" }
       }, ["documentId"]),
       readHook("documentation.search", "Search Documentation", "Search active local documentation and return source-grounded results.", (input) => this.client.search(input), {
         query: { type: "string" },

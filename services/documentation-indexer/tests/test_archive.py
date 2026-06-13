@@ -526,6 +526,47 @@ def test_ai_enrichment_adds_searchable_provenance_and_replaces_prior_ai_chunks(t
     assert archive.search("FLOWCHART-ENRICH-2", limit=1)[0]["chunkOrigin"] == "ai"
 
 
+def test_document_detail_can_exclude_large_enrichment_and_event_metadata(tmp_path: Path) -> None:
+    app = create_app(tmp_path / "metadata-window-archive")
+    client = TestClient(app)
+    ingest_response = client.post(
+        "/ingest/text",
+        json={
+            "title": "Large enrichment note",
+            "text": "The source says RESPONSE-METADATA-88 should stay searchable.",
+        },
+    )
+    document_id = ingest_response.json()["document"]["documentId"]
+    archive = app.state.archive
+    archive.enrich_document(
+        document_id,
+        spans=[archive_module.ExtractedSpan("AI note repeats RESPONSE-METADATA-88.", "ai:metadata")],
+        model="gpt-test",
+        skill_ids=["documentation-enrich-metadata"],
+        summary="large payload regression",
+        payload={"large": "x" * (1024 * 1024)},
+    )
+    archive.invalidate_document(document_id, state="stale", reason="large metadata regression event")
+
+    full = client.get(f"/documents/{document_id}", params={"artifactLimit": 0})
+    lean = client.get(
+        f"/documents/{document_id}",
+        params={"artifactLimit": 0, "includeEnrichments": "false", "includeEvents": "false"},
+    )
+
+    assert full.status_code == 200
+    assert lean.status_code == 200
+    full_document = full.json()["document"]
+    lean_document = lean.json()["document"]
+    assert full_document["enrichments"][0]["payload_json"]
+    assert full_document["events"][0]["reason"] == "large metadata regression event"
+    assert lean_document["enrichments"] == []
+    assert lean_document["events"] == []
+    assert lean_document["chunks"]
+    assert len(json.dumps(full_document)) > 1024 * 1024
+    assert len(json.dumps(lean_document)) < 20_000
+
+
 def test_fastapi_enrich_endpoint_writes_derived_chunks(tmp_path: Path) -> None:
     app = create_app(tmp_path / "archive")
     client = TestClient(app)

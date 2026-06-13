@@ -89,6 +89,12 @@ describe("DocumentationPlugin", () => {
         sortDirection: { type: "string", enum: ["asc", "desc"] }
       }
     });
+    expect(plugin.hooks.find((hook) => hook.id === "documentation.documents.get")?.inputSchema).toMatchObject({
+      properties: expect.objectContaining({
+        includeEnrichments: { type: "boolean" },
+        includeEvents: { type: "boolean" }
+      })
+    });
     expect(plugin.hooks.find((hook) => hook.id === "documentation.invalidate")).toMatchObject({
       automationSafety: "write"
     });

@@ -501,6 +501,8 @@ class DocumentationArchive:
         chunk_text_max_chars: int | None = None,
         artifact_offset: int | None = None,
         artifact_limit: int | None = None,
+        include_enrichments: bool = True,
+        include_events: bool = True,
     ) -> dict:
         chunk_offset = normalized_window_value(chunk_offset, "chunk_offset")
         artifact_offset = normalized_window_value(artifact_offset, "artifact_offset")
@@ -548,11 +550,11 @@ class DocumentationArchive:
             enrichments = db.execute(
                 "SELECT * FROM document_enrichments WHERE document_id = ? ORDER BY enrichment_id DESC",
                 (document_id,),
-            ).fetchall()
+            ).fetchall() if include_enrichments else []
             events = db.execute(
                 "SELECT * FROM invalidation_events WHERE document_id = ? ORDER BY created_at DESC",
                 (document_id,),
-            ).fetchall()
+            ).fetchall() if include_events else []
         result = dict(document)
         result["chunks"] = [document_chunk_dict(row, chunk_text_max_chars) for row in chunks]
         result["chunkWindow"] = chunk_window

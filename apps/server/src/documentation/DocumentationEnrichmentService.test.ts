@@ -110,7 +110,9 @@ describe("DocumentationEnrichmentService", () => {
       chunkIds: [11],
       chunkContext: 1,
       chunkTextMaxChars: 4000,
-      artifactLimit: 0
+      artifactLimit: 0,
+      includeEnrichments: false,
+      includeEvents: false
     });
     expect(runner.run).toHaveBeenCalledWith(
       expect.stringContaining("Mix cocoa, sugar, eggs, and flour"),

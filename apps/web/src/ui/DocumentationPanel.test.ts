@@ -507,7 +507,9 @@ describe("DocumentationPanel", () => {
         chunkLimit: 75,
         chunkTextMaxChars: 4000,
         artifactOffset: 10,
-        artifactLimit: 67
+        artifactLimit: 67,
+        includeEnrichments: false,
+        includeEvents: false
       }
     });
     expect(container.textContent).toContain("Later transcript chunk loaded on demand.");
@@ -1099,7 +1101,9 @@ function sourceWindowInput(documentId: string): Record<string, unknown> {
     chunkLimit: 75,
     chunkTextMaxChars: 4000,
     artifactOffset: 0,
-    artifactLimit: 100
+    artifactLimit: 100,
+    includeEnrichments: false,
+    includeEvents: false
   };
 }
 
