@@ -1694,6 +1694,8 @@ void configure_boot_pin(void) {
     assert manifest_artifact["rawSourceIndexed"] is False
     assert manifest_artifact["rawSourceRetained"] is False
     assert manifest_artifact["coveredFileCount"] == 1
+    assert manifest_artifact["coveredFilePreview"] == [{"path": "boot_driver.c", "language": "C", "parser": "line-pattern", "symbolCount": 3}]
+    assert "coveredFiles" not in manifest_artifact
     assert not any(artifact["type"] == "vendor_code" and artifact["kind"] == "source" for artifact in artifacts)
 
     manifest_file = archive.document_artifact_file(document.document_id, manifest_artifact["path"])
@@ -1703,6 +1705,31 @@ void configure_boot_pin(void) {
     assert covered["sha256"] == hashlib.sha256(source_text.encode("utf-8")).hexdigest()
     assert {"kind": "function", "name": "configure_boot_pin", "line": 6} in covered["symbols"]
     assert covered["artifactPath"] is None
+
+
+def test_vendor_code_manifest_artifact_detail_stays_lean_for_large_manifests(tmp_path: Path) -> None:
+    source = tmp_path / "large_driver.py"
+    source.write_text("def configure_large_driver():\n    return LARGE_DRIVER_MODE\n", encoding="utf-8")
+    archive = DocumentationArchive(tmp_path / "archive")
+    document = archive.ingest_path(source, accept_generated_code_documentation=True)[0]
+    manifest_path = archive.document_artifact_file(document.document_id, "vendor_code/code_manifest.json").path
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["coveredFiles"][0]["symbols"] = [{"kind": "function", "name": "large_symbol_" + "x" * (9 * 1024 * 1024), "line": 1}]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    record = archive.get_document(
+        document.document_id,
+        chunk_limit=0,
+        artifact_limit=1,
+        include_enrichments=False,
+        include_events=False,
+    )
+
+    manifest_artifact = record["artifacts"][0]
+    assert manifest_artifact["coveredFileCount"] == 1
+    assert manifest_artifact["coveredFilePreview"] == [{"path": "large_driver.py", "language": "Python", "parser": "python-ast", "symbolCount": 1}]
+    assert "coveredFiles" not in manifest_artifact
+    assert len(json.dumps(record).encode("utf-8")) < 32 * 1024
 
 
 def test_vendor_code_directory_mixes_docs_with_generated_repo_doc_and_rejects_unsupported_code(tmp_path: Path) -> None:

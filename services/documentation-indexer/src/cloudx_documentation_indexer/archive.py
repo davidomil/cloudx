@@ -2447,20 +2447,29 @@ def vendor_code_artifacts(document_id: str, artifact_root: Path, *, offset: int 
             "coveredFileCount": len(manifest.get("coveredFiles") or []),
         }
         if kind == "manifest":
-            record["coveredFiles"] = [
-                {
-                    "path": optional_text(str(file_record.get("path") or "")),
-                    "artifactPath": optional_text(str(file_record.get("artifactPath") or "")),
-                    "language": optional_text(str(file_record.get("language") or "")),
-                    "sha256": optional_text(str(file_record.get("sha256") or "")),
-                    "parser": optional_text(str(file_record.get("parser") or "")),
-                    "symbols": file_record.get("symbols") if isinstance(file_record.get("symbols"), list) else [],
-                }
-                for file_record in manifest.get("coveredFiles") or []
-                if isinstance(file_record, dict)
-            ]
+            record["coveredFilePreview"] = vendor_code_covered_file_preview(manifest)
         records.append(with_artifact_file_metadata(artifact_root, record))
     return records
+
+
+def vendor_code_covered_file_preview(manifest: Mapping[str, Any], *, limit: int = 5) -> list[dict[str, Any]]:
+    preview = []
+    for file_record in manifest.get("coveredFiles") or []:
+        if not isinstance(file_record, dict):
+            continue
+        symbols = file_record.get("symbols")
+        preview.append(
+            {
+                "path": optional_text(str(file_record.get("path") or "")),
+                "artifactPath": optional_text(str(file_record.get("artifactPath") or "")),
+                "language": optional_text(str(file_record.get("language") or "")),
+                "parser": optional_text(str(file_record.get("parser") or "")),
+                "symbolCount": len(symbols) if isinstance(symbols, list) else 0,
+            }
+        )
+        if len(preview) >= limit:
+            break
+    return [{key: value for key, value in item.items() if value is not None} for item in preview]
 
 
 def read_vendor_code_manifest(artifact_root: Path) -> dict[str, Any] | None:
