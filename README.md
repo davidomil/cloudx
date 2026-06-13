@@ -45,6 +45,9 @@ names, and dashboard tokens.
 - Worktree manager plugin for creating or cloning a bare repository and managing
   project worktree folders.
 - Local web plugin for dashboards such as Understand Anything.
+- Jira plugin for Jira Cloud issue dashboards, comments, transitions, issue
+  links, browser links, helper skills, and automation triggers from polling or
+  a manual play action in the Jira panel.
 - Documentation archive plugin for portable local knowledge ingestion, search,
   source viewing, invalidation, assisted answers, queued imports, and automatic
   Codex rule/skill injection.
@@ -100,6 +103,32 @@ The repository must contain `.cloudx-plugin/plugin.json`:
 Installed GitHub plugins are enabled as non-creatable placeholder descriptors
 after metadata validation. Cloudx does not execute third-party plugin code in
 this install path.
+
+## Jira Integration
+
+Cloudx includes a built-in Jira Cloud plugin. Configure it in Settings > Jira
+with the Jira site URL, Atlassian account email, and Jira API token. The token is
+stored as a plugin secret outside normal `config.json` and is not returned by
+`/api/config`.
+
+Create a Jira tab to view assigned work grouped by Epic by default. The panel can
+refresh dashboard issues, open Jira browser links, view comments and transitions,
+add comments, transition issues, and fire the `jira.issueManualRun` automation
+trigger from an issue row.
+
+Jira hooks expose search, bounded all-page search, current user, metadata, issue
+read/write, comments, transitions, links, URL generation, and one-shot polling.
+Jira polling is disabled by default. When enabled, Cloudx polls bounded JQL and
+emits automation triggers for created, updated, transitioned, newly assigned,
+assigned-to-me, and comment-created events.
+
+## Automation Workflows
+
+The Automation tab composes trigger events, plugin hooks, primitives, and
+converters into saved graphs. It can run from manual UI triggers such as Jira's
+issue play action or from plugin-owned triggers such as Jira polling events.
+Poll-based Jira triggers are exposed only to plugins and automation; external
+HTTP callers use the explicit manual Jira trigger instead.
 
 ## Quick Start
 
@@ -203,7 +232,9 @@ Cloudx default `CLOUDX_DOCUMENTATION_URL`. Create a Documentation tab in Cloudx
 to upload files, add local paths, ingest URLs or YouTube playlists, add copied
 text or media transcripts, search active knowledge, inspect full source chunks
 and extracted artifacts, invalidate stale sources, remove sources from active
-search, and inspect the portable backup manifest.
+search, and manage archive ZIP export/import. Portable manifest inspection and
+Turbovec index rebuild are available through the documentation helper, plugin
+hooks, and local indexer API.
 
 Documentation rules and skills are synced automatically as CloudX system
 contributions when the server starts, so Codex tabs can use the archive without
@@ -246,7 +277,9 @@ Common environment variables:
 - `CLOUDX_DOCUMENTATION_PORT`: documentation indexer port, default `7820`.
 - `CLOUDX_DOCUMENTATION_TIMEOUT_MS`: documentation indexer and AI enrichment timeout, default `1800000`.
 - `CLOUDX_DOCUMENTATION_RESPONSE_MAX_BYTES`: maximum indexer response size, default `8388608`.
-- `CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES`: browser documentation upload cap, default `268435456`.
+- `CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES`: browser/server/indexer documentation upload cap, default `268435456`.
+- `CLOUDX_DOCUMENTATION_IMPORT_UPLOAD_MAX_BYTES`: indexer archive import upload cap, default `1073741824`.
+- `CLOUDX_DOCUMENTATION_ALLOW_PRIVATE_URL_INGEST`: set to `true` only for trusted private URL ingest sources.
 - `CLOUDX_DOCUMENTATION_DATA_DIR`: portable documentation archive directory, default `.cloudx/documentation`.
 - `CLOUDX_VOICE_MODEL`: planner model, default `gpt-5.3-codex-spark`.
 - `CLOUDX_VOICE_DEBUG_TRANSCRIPTS`: log raw transcripts and planner text.

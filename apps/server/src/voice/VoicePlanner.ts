@@ -47,6 +47,7 @@ export interface CodexExecRunOptions {
   timeoutMs?: number;
   maxOutputBytes?: number;
   taskLabel?: string;
+  imagePaths?: string[];
 }
 
 export class CodexExecVoicePlanner implements VoicePlanner {
@@ -218,7 +219,7 @@ export function runCodexExec(model: string, prompt: string, options: CodexExecRu
   return new Promise((resolve, reject) => {
     const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), options.outputPrefix ?? "cloudx-codex-structured-"));
     const outputPath = path.join(outputDir, "last-message.json");
-    const launch = buildCodexExecLaunch(model, options.schemaPath ?? resolveVoiceSchemaPath(), outputPath);
+    const launch = buildCodexExecLaunch(model, options.schemaPath ?? resolveVoiceSchemaPath(), outputPath, process.env, options.imagePaths);
     const taskLabel = options.taskLabel ?? "structured runner";
     const timeoutMs = options.timeoutMs ?? CODEX_EXEC_TIMEOUT_MS;
     const maxOutputBytes = options.maxOutputBytes ?? CODEX_EXEC_MAX_OUTPUT_BYTES;
@@ -342,10 +343,10 @@ export function runCodexExec(model: string, prompt: string, options: CodexExecRu
   });
 }
 
-export function buildCodexExecLaunch(model: string, schemaPath: string, outputPath: string, env: NodeJS.ProcessEnv = process.env): ProcessLaunch {
+export function buildCodexExecLaunch(model: string, schemaPath: string, outputPath: string, env: NodeJS.ProcessEnv = process.env, imagePaths: string[] = []): ProcessLaunch {
   return {
     command: resolveAssistantCommand(env, "codex"),
-    args: buildCodexExecArgs(model, schemaPath, outputPath)
+    args: buildCodexExecArgs(model, schemaPath, outputPath, imagePaths)
   };
 }
 
@@ -415,7 +416,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-export function buildCodexExecArgs(model: string, schemaPath: string, outputPath: string): string[] {
+export function buildCodexExecArgs(model: string, schemaPath: string, outputPath: string, imagePaths: string[] = []): string[] {
   return [
     "exec",
     "-c",
@@ -428,6 +429,7 @@ export function buildCodexExecArgs(model: string, schemaPath: string, outputPath
     "read-only",
     "--skip-git-repo-check",
     "--ephemeral",
+    ...imagePaths.flatMap((imagePath) => ["--image", imagePath]),
     "--output-schema",
     schemaPath,
     "--output-last-message",

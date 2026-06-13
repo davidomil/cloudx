@@ -325,10 +325,19 @@ describe("DocumentationPanel", () => {
     await flush();
 
     expect(calls.some((call) => call.hookId === "documentation.documents.list")).toBe(false);
+    const documentsButton = buttonByLabel(container, "Show active documents");
+    expect(documentsButton.getAttribute("aria-pressed")).toBe("false");
+    expect(documentsButton.getAttribute("aria-expanded")).toBe("false");
 
-    await click(buttonByLabel(container, "Show Active documents"));
+    await click(documentsButton);
     await flushAsyncWork();
 
+    const expandedDocumentsButton = buttonByLabel(container, "Hide active documents");
+    const documentsPanelId = expandedDocumentsButton.getAttribute("aria-controls");
+    expect(expandedDocumentsButton.getAttribute("aria-pressed")).toBe("true");
+    expect(expandedDocumentsButton.getAttribute("aria-expanded")).toBe("true");
+    expect(documentsPanelId).toBeTruthy();
+    expect(document.getElementById(documentsPanelId ?? "")?.textContent).toContain("Active Documents");
     expect(calls).toContainEqual({
       hookId: "documentation.documents.list",
       input: { states: ["active"], limit: 50, offset: 0, sortDirection: "desc" }

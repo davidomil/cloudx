@@ -20,6 +20,10 @@ from starlette.background import BackgroundTask
 
 from .archive import ACTIVE_STATE, ArchiveError, DocumentationArchive
 
+UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
+DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES = 256 * 1024 * 1024
+DEFAULT_ARCHIVE_IMPORT_UPLOAD_MAX_BYTES = 1024 * 1024 * 1024
+
 
 class IngestPathRequest(BaseModel):
     path: str
@@ -271,7 +275,7 @@ def create_app(root: str | Path | None = None) -> FastAPI:
         accept_generated_code_documentation: Annotated[bool, Form(alias="acceptGeneratedCodeDocumentation")] = False,
         retain_raw_code_artifacts: Annotated[bool, Form(alias="retainRawCodeArtifacts")] = False,
     ) -> dict:
-        content = await file.read()
+        content = await read_upload_bytes(file, configured_byte_limit("CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES", DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES))
         document = handle_archive_error(
             lambda: archive.ingest_upload(
                 filename=file.filename or title or "uploaded-source",
@@ -343,15 +347,53 @@ def handle_archive_error(operation):
 
 
 async def uploaded_archive_package(file: UploadFile, archive_root: Path) -> Path:
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Archive import package is empty.")
     handle = tempfile.NamedTemporaryFile(prefix="cloudx-documentation-import-upload-", suffix=".zip", dir=archive_root.parent, delete=False)
+    total = 0
+    max_bytes = configured_byte_limit("CLOUDX_DOCUMENTATION_IMPORT_UPLOAD_MAX_BYTES", DEFAULT_ARCHIVE_IMPORT_UPLOAD_MAX_BYTES)
     try:
-        handle.write(content)
+        while True:
+            chunk = await file.read(min(UPLOAD_READ_CHUNK_BYTES, max_bytes - total + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise HTTPException(status_code=413, detail=f"Archive import package exceeds the maximum size of {max_bytes} bytes.")
+            handle.write(chunk)
+        if total == 0:
+            raise HTTPException(status_code=400, detail="Archive import package is empty.")
         return Path(handle.name)
+    except Exception:
+        Path(handle.name).unlink(missing_ok=True)
+        raise
     finally:
         handle.close()
+
+
+async def read_upload_bytes(file: UploadFile, max_bytes: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(min(UPLOAD_READ_CHUNK_BYTES, max_bytes - total + 1))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(status_code=413, detail=f"Uploaded documentation file exceeds the maximum size of {max_bytes} bytes.")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def configured_byte_limit(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        limit = int(value)
+    except ValueError as error:
+        raise HTTPException(status_code=500, detail=f"{name} must be a positive integer.") from error
+    if limit < 1:
+        raise HTTPException(status_code=500, detail=f"{name} must be a positive integer.")
+    return limit
 
 
 def archive_progress_stream(operation: Callable[[Callable[[dict[str, Any]], None]], Any], serialize: Callable[[Any], dict]):

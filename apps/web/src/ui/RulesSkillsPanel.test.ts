@@ -46,19 +46,23 @@ describe("RulesSkillsPanel helpers", () => {
       cloudxRuleFromEdit(
         {
           id: "keep-changes-focused",
-          description: "Keep changes focused.",
+          description: "Old separate description.",
           text: "Keep changes focused."
         },
-        " Keep changes focused and tested. ",
-        " "
+        " Keep changes focused and tested. "
       )
     ).toEqual({
       id: "keep-changes-focused",
-      description: "Keep changes focused and tested.",
+      description: "Old separate description.",
       text: "Keep changes focused and tested."
     });
 
-    expect(cloudxRuleFromEdit({ id: "empty", description: "Empty", text: "Empty" }, "   ", "Unused")).toBeUndefined();
+    expect(cloudxRuleFromEdit({ id: "mirror", description: "Old rule.", text: "Old rule." }, "New rule.")).toEqual({
+      id: "mirror",
+      description: "New rule.",
+      text: "New rule."
+    });
+    expect(cloudxRuleFromEdit({ id: "empty", description: "Empty", text: "Empty" }, "   ")).toBeUndefined();
   });
 
   it("tracks template drafts as dirty only when the saved payload changes", () => {
@@ -107,10 +111,15 @@ describe("RulesSkillsPanel helpers", () => {
       editButton.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
 
-    const textArea = container.querySelector('[aria-label="Rule text for keep-focused"]') as HTMLTextAreaElement;
-    setTextAreaValue(textArea, "Keep focused and test the change.");
+    const editRow = container.querySelector(".rule-option-editing") as HTMLElement;
+    expect(editRow.querySelector("input")).toBeNull();
+    expect(editRow.querySelector("textarea")).toBeNull();
+    expect(editRow.querySelectorAll('[role="textbox"]')).toHaveLength(1);
+
+    const textEditor = container.querySelector('[aria-label="Rule text for keep-focused"]') as HTMLElement;
+    setEditableText(textEditor, "Keep focused and test the change.");
     await act(async () => {
-      textArea.dispatchEvent(new Event("input", { bubbles: true }));
+      textEditor.dispatchEvent(new Event("input", { bubbles: true }));
     });
 
     const saveButton = container.querySelector('[aria-label="Save rule keep-focused"]') as HTMLButtonElement;
@@ -251,9 +260,8 @@ function rulesSkillsStore(): RulesSkillsStore {
   };
 }
 
-function setTextAreaValue(textarea: HTMLTextAreaElement, value: string): void {
-  const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
-  setter?.call(textarea, value);
+function setEditableText(element: HTMLElement, value: string): void {
+  element.textContent = value;
 }
 
 function setInputValue(input: HTMLInputElement, value: string): void {

@@ -1083,6 +1083,14 @@ describe("buildServer", () => {
       expect(malformedTrigger.statusCode).toBe(400);
       expect(malformedTrigger.json().message).toBe("payload must be an object.");
 
+      const spoofedJiraPollTrigger = await app.inject({
+        method: "POST",
+        url: "/api/triggers/jira.issueUpdated",
+        payload: { payload: jiraTriggerPayload() }
+      });
+      expect(spoofedJiraPollTrigger.statusCode).toBe(403);
+      expect(spoofedJiraPollTrigger.json().message).toBe("Trigger jira.issueUpdated is not exposed to http callers.");
+
       const catalog = await app.inject({ method: "GET", url: "/api/automation/catalog" });
       expect(catalog.statusCode).toBe(200);
       const catalogNodes = catalog.json().nodes;
@@ -1110,8 +1118,13 @@ describe("buildServer", () => {
         expect.arrayContaining([
           expect.objectContaining({ id: "issueKey", kind: "data" }),
           expect.objectContaining({ id: "issueUrl", kind: "data" }),
-          expect.objectContaining({ id: "summary", kind: "data" }),
-          expect.objectContaining({ id: "issue", connectable: false })
+          expect.objectContaining({ id: "summary", kind: "data" })
+        ])
+      );
+      expect(catalogNodes.find((node: { typeId: string }) => node.typeId === "trigger:jira.issueUpdated").outputs).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: "issue" }),
+          expect.objectContaining({ id: "assigneeEmailAddress" })
         ])
       );
       expect(catalogNodes.find((node: { typeId: string }) => node.typeId === "hook:codex-terminal.enterText")).toMatchObject({ title: "Enter Text" });
@@ -1262,14 +1275,14 @@ describe("buildServer", () => {
     }
   });
 
-  it("runs a saved automation graph from a Jira trigger event", async () => {
+  it("runs a saved automation graph from a manual Jira trigger event", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-jira-trigger-automation-"));
     const app = await buildServer(testConfig(root));
     try {
       const graph = {
         schemaVersion: 1,
         nodes: [
-          { id: "trigger", typeId: "trigger:jira.issueUpdated", position: { x: 0, y: 0 } },
+          { id: "trigger", typeId: "trigger:jira.issueManualRun", position: { x: 0, y: 0 } },
           { id: "notify", typeId: "hook:notifications.send", position: { x: 280, y: 0 }, config: { level: "info" } }
         ],
         edges: [
@@ -1290,9 +1303,9 @@ describe("buildServer", () => {
 
       const emitted = await app.inject({
         method: "POST",
-        url: "/api/triggers/jira.issueUpdated",
+        url: "/api/triggers/jira.issueManualRun",
         payload: {
-          payload: jiraTriggerPayload()
+          payload: { ...jiraTriggerPayload(), eventType: "jira.issueManualRun", transport: "ui" }
         }
       });
       expect(emitted.statusCode).toBe(200);

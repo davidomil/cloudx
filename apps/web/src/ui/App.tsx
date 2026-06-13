@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement, type RefObject } from "react";
 import { AlertTriangle, Bell, BellRing, Bot, CheckCheck, ChevronDown, Columns2, GitBranch, LayoutTemplate, Maximize2, Mic, MicOff, Minimize2, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
 
-import { RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsStore, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
+import { DEFAULT_WORKSPACE_MAX_PANES, RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsStore, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
 
 import {
   applyLayoutTemplate,
@@ -34,6 +34,7 @@ import {
   voiceAudioConstraints,
   type VoiceAudioStreamSession
 } from "../api.js";
+import { createBrowserId } from "./browserId.js";
 import { ControlButton } from "./Control.js";
 import { activeAutomationTriggerIds as triggerIdsFromAutomation, type TriggerEmitter } from "./automationTriggers.js";
 import { disposeFileBrowserPanelStatesExcept } from "./fileBrowserPanelState.js";
@@ -47,6 +48,7 @@ import {
   findPane,
   isPaneTabActive,
   listPanes,
+  paneCount,
   placeTabInPane,
   reconcileLayout,
   removePane,
@@ -341,6 +343,10 @@ export function App() {
   const pluginById = useMemo(() => new Map(plugins.map((plugin) => [plugin.id, plugin])), [plugins]);
   const panes = useMemo(() => listPanes(layout.root), [layout.root]);
   const activePaneId = layout.activePaneId;
+  const splitDisabledReason = panes.length >= DEFAULT_WORKSPACE_MAX_PANES
+    ? `Maximum of ${DEFAULT_WORKSPACE_MAX_PANES} panes reached. Close a pane before splitting again.`
+    : findPane(layout.root, activePaneId) ? undefined : "Select a pane before splitting.";
+  const canSplitWorkspace = !splitDisabledReason;
   const serverLabel = window.location.host || "Cloudx";
   const activeTab = activeTabId ? tabById.get(activeTabId) : undefined;
   const activeWindow = activeWindowId ? windows.find((window) => window.id === activeWindowId) : windows[0];
@@ -593,7 +599,26 @@ export function App() {
 
   function split(direction: LayoutDirection) {
     const effectiveDirection = mobileActionsEnabled ? "column" : direction;
-    updateLayout((current) => splitPane(current, effectiveDirection, () => `pane-${crypto.randomUUID()}`, () => `split-${crypto.randomUUID()}`));
+    const current = layoutRef.current;
+    if (paneCount(current.root) >= DEFAULT_WORKSPACE_MAX_PANES) {
+      setError(`Maximum of ${DEFAULT_WORKSPACE_MAX_PANES} panes reached. Close a pane before splitting again.`);
+      return;
+    }
+    if (!findPane(current.root, current.activePaneId)) {
+      setError("Select a pane before splitting.");
+      return;
+    }
+    const next = splitPane(current, effectiveDirection, () => createBrowserId("pane"), () => createBrowserId("split"));
+    if (next === current) {
+      setError("Select a pane before splitting.");
+      return;
+    }
+    if (maximizedPaneId) {
+      setMaximizedPaneId(undefined);
+    }
+    setError(undefined);
+    commitLayout(next);
+    scrollPaneIntoView(next.activePaneId);
   }
 
   function resizePane(splitId: string, deltaPixels: number, containerPixels: number, startSizes: [number, number]) {
@@ -864,8 +889,8 @@ export function App() {
         results
       },
       {
-        createPaneId: () => `pane-${crypto.randomUUID()}`,
-        createSplitId: () => `split-${crypto.randomUUID()}`
+        createPaneId: () => createBrowserId("pane"),
+        createSplitId: () => createBrowserId("split")
       }
     );
     tabsRef.current = next.tabs;
@@ -1222,7 +1247,7 @@ export function App() {
                 <ControlButton className="icon-button" iconOnly onClick={() => { setSettingsOpen(true); setMobileActionsOpen(false); }} title="Settings" aria-label="Settings" role="menuitem">
                   <Settings size={17} />
                 </ControlButton>
-                <ControlButton className="icon-button" iconOnly onClick={() => { split("column"); setMobileActionsOpen(false); }} title="Split vertically" aria-label="Split vertically" role="menuitem">
+                <ControlButton className="icon-button" iconOnly onClick={() => { split("column"); setMobileActionsOpen(false); }} disabled={!canSplitWorkspace} title={splitDisabledReason ?? "Split vertically"} aria-label="Split vertically" role="menuitem">
                   <Rows3 size={17} />
                 </ControlButton>
                 {mobileActionsEnabled ? (
@@ -1254,10 +1279,10 @@ export function App() {
             <ControlButton className="icon-button" iconOnly onClick={() => setSettingsOpen(true)} title="Settings">
               <Settings size={17} />
             </ControlButton>
-            <ControlButton className="icon-button" iconOnly onClick={() => split("row")} title="Split columns">
+            <ControlButton className="icon-button" iconOnly onClick={() => split("row")} disabled={!canSplitWorkspace} title={splitDisabledReason ?? "Split columns"} aria-label="Split columns">
               <Columns2 size={17} />
             </ControlButton>
-            <ControlButton className="icon-button" iconOnly onClick={() => split("column")} title="Split rows">
+            <ControlButton className="icon-button" iconOnly onClick={() => split("column")} disabled={!canSplitWorkspace} title={splitDisabledReason ?? "Split rows"} aria-label="Split rows">
               <Rows3 size={17} />
             </ControlButton>
             {!mobileActionsEnabled ? (
@@ -2648,6 +2673,15 @@ function omitRecordKey<T>(record: Record<string, T>, key: string): Record<string
   }
   const { [key]: _removed, ...rest } = record;
   return rest;
+}
+
+function scrollPaneIntoView(paneId: string): void {
+  window.requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
+      const pane = Array.from(document.querySelectorAll<HTMLElement>("[data-pane-id]")).find((element) => element.dataset.paneId === paneId);
+      pane?.scrollIntoView({ block: "center", inline: "nearest" });
+    });
+  });
 }
 
 function defaultTabTitlePlaceholder(plugin: PluginDescriptor | undefined, cwd: string, localWebUrl: string): string {

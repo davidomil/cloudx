@@ -21,7 +21,7 @@ describe("automation trigger helpers", () => {
       summary: "Fix deploy",
       issueType: "Task",
       status: "Open",
-      assignee: { displayName: "David", emailAddress: "david@example.test" }
+      assignee: { accountId: "abc" }
     }, "2026-06-09T00:00:00.000Z")).toMatchObject({
       eventId: "jira.issueManualRun:ENG-7:2026-06-09T00:00:00.000Z",
       eventType: JIRA_ISSUE_MANUAL_TRIGGER_ID,
@@ -31,7 +31,7 @@ describe("automation trigger helpers", () => {
       issueUrl: "https://example.atlassian.net/browse/ENG-7",
       summary: "Fix deploy",
       detectedAt: "2026-06-09T00:00:00.000Z",
-      assigneeEmailAddress: "david@example.test"
+      assigneeAccountId: "abc"
     });
   });
 

@@ -33,5 +33,8 @@ apps/web/dist-ts/
 .understand-anything/
 auth.json
 docs/JIRA_INTEGRATION_IMPLEMENTATION.md
+docs/DOCUMENTATION_INGESTION_GUIDE.*
+docs/assets/generated/ingestion-flow.*
+REVIEW_TRACKING.md
 
 *.egg-info/

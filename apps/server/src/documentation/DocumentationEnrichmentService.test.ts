@@ -320,6 +320,208 @@ describe("DocumentationEnrichmentService", () => {
     }));
   });
 
+  it("fails artifact enrichment explicitly when the archive filesystem is not shared with the server", async () => {
+    const archiveRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-missing-artifact-"));
+    const runner = fakeRunner({
+      summary: "should not run",
+      spans: [{ locator: "ai:visual:keyframe", text: "Should not be written." }],
+      metadata: [],
+      warnings: []
+    });
+    const client = fakeDocumentationClient({
+      source_type: "media",
+      snapshot_path: "snapshots/video/source.youtube.txt",
+      chunks: [{
+        chunk_id: 41,
+        locator: "media keyframe keyframe-000012 00:12",
+        text: "Selected frame. Artifact path: media/keyframes/frame-000001.jpg.",
+        chunk_origin: "source"
+      }],
+      artifacts: [{
+        id: "keyframe-000012",
+        type: "media-keyframe",
+        kind: "keyframe",
+        locator: "media keyframe keyframe-000012 00:12",
+        path: "media/keyframes/frame-000001.jpg",
+        mimeType: "image/jpeg",
+        available: true
+      }]
+    }, { archiveRoot });
+    const service = new DocumentationEnrichmentService({
+      client,
+      config: fakeConfig(true),
+      rulesSkills: fakeRulesSkills(),
+      runner
+    });
+
+    const response = await service.enrichIngestResponse({ document: { documentId: "doc-1" } });
+
+    expect(response.enrichment).toMatchObject({
+      enabled: true,
+      results: [{
+        documentId: "doc-1",
+        status: "failed",
+        error: expect.stringContaining("share the documentation archive filesystem")
+      }]
+    });
+    expect(runner.run).not.toHaveBeenCalled();
+    expect(client.enrichDocument).not.toHaveBeenCalled();
+  });
+
+  it("attaches schematic page renders to the image-analysis runner for component and connection extraction", async () => {
+    const archiveRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-schematic-enrich-"));
+    const extractedRoot = path.join(archiveRoot, "snapshots", "schematic", "extracted");
+    const descriptionPath = path.join(extractedRoot, "schematics", "schematic-001", "description.md");
+    const imagePath = path.join(extractedRoot, "figures", "figure-001.png");
+    const jsonPath = path.join(extractedRoot, "schematics", "schematic-001", "analysis.json");
+    await fs.mkdir(path.dirname(descriptionPath), { recursive: true });
+    await fs.mkdir(path.dirname(imagePath), { recursive: true });
+    await fs.writeFile(descriptionPath, "Schematic description for U1, R3, VDD, and GND.\n");
+    await fs.writeFile(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    await fs.writeFile(jsonPath, "{}\n");
+    const runner = fakeRunner({
+      summary: "schematic visual extraction",
+      spans: [
+        { locator: "ai:schematic:schematic-001:components", text: "Components: U1 regulator and R3 resistor are visible." },
+        { locator: "ai:schematic:schematic-001:connections", text: "Connections: VDD enters U1; U1 output routes through R3 toward GND." }
+      ],
+      metadata: [],
+      warnings: []
+    });
+    const client = fakeDocumentationClient({
+      source_type: "datasheet",
+      snapshot_path: "snapshots/schematic/source.pdf",
+      chunks: [{
+        chunk_id: 51,
+        locator: "schematic schematic-001 page 1 figure-001",
+        text: "Schematic image artifact schematic-001 from page 1 figure-001. Image artifact: figures/figure-001.png.",
+        chunk_origin: "source"
+      }],
+      artifacts: [{
+        id: "schematic-001",
+        type: "schematic",
+        kind: "schematic-description",
+        locator: "page 1 figure-001",
+        path: "schematics/schematic-001/description.md",
+        imagePath: "figures/figure-001.png",
+        jsonPath: "schematics/schematic-001/analysis.json",
+        descriptionPath: "schematics/schematic-001/description.md",
+        available: true,
+        bytes: 48,
+        referenceDesignators: ["R3", "U1"],
+        labels: ["GND", "VDD"],
+        connectionCues: ["12 PDF vector line objects", "line-art edge ratio 0.030"],
+        classificationReasons: ["source text or filename contains schematic/circuit terms"],
+        analysisOutputs: []
+      }]
+    }, { archiveRoot });
+    const service = new DocumentationEnrichmentService({
+      client,
+      config: fakeConfig(true),
+      rulesSkills: fakeRulesSkills(),
+      runner
+    });
+
+    await service.enrichIngestResponse({ document: { documentId: "doc-1" } });
+
+    const prompt = runner.run.mock.calls[0]?.[0] ?? "";
+    expect(prompt).toContain("Inspect the attached image pixels directly");
+    expect(prompt).toContain("visible components/reference designators");
+    expect(prompt).toContain("how wires connect components and nets");
+    expect(prompt).toContain('"attachedImages"');
+    expect(prompt).toContain('"role": "schematic rendered image"');
+    expect(prompt).toContain('"referenceDesignators": [');
+    expect(prompt).toContain('"R3"');
+    expect(prompt).toContain('"U1"');
+    expect(runner.run).toHaveBeenCalledWith(expect.any(String), {
+      model: DEFAULT_DOCUMENTATION_IMAGE_ANALYSIS_MODEL,
+      imagePaths: [imagePath]
+    });
+    expect(client.enrichDocument).toHaveBeenCalledWith(expect.objectContaining({
+      spans: [
+        { locator: "ai:schematic:schematic-001:components", text: "Components: U1 regulator and R3 resistor are visible." },
+        { locator: "ai:schematic:schematic-001:connections", text: "Connections: VDD enters U1; U1 output routes through R3 toward GND." }
+      ],
+      payload: expect.objectContaining({
+        evidence: expect.objectContaining({ artifactCount: 1, chunkCount: 1 })
+      })
+    }));
+  });
+
+  it("splits large schematic imports into image-bounded batches without dropping page renders", async () => {
+    const archiveRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-large-schematic-enrich-"));
+    const extractedRoot = path.join(archiveRoot, "snapshots", "schematic", "extracted");
+    const chunks = [];
+    const artifacts = [];
+    for (let index = 1; index <= 12; index += 1) {
+      const id = `schematic-${String(index).padStart(3, "0")}`;
+      const figure = `figure-${String(index).padStart(3, "0")}`;
+      const descriptionPath = path.join(extractedRoot, "schematics", id, "description.md");
+      const imagePath = path.join(extractedRoot, "figures", `${figure}.png`);
+      await fs.mkdir(path.dirname(descriptionPath), { recursive: true });
+      await fs.mkdir(path.dirname(imagePath), { recursive: true });
+      await fs.writeFile(descriptionPath, `Schematic ${id} metadata.\n`);
+      await fs.writeFile(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+      chunks.push({
+        chunk_id: 100 + index,
+        locator: `schematic ${id} page ${index} ${figure}`,
+        text: `Schematic image artifact ${id} from page ${index} ${figure}. Image artifact: figures/${figure}.png.`,
+        chunk_origin: "source"
+      });
+      artifacts.push({
+        id,
+        type: "schematic",
+        kind: "schematic-description",
+        locator: `page ${index} ${figure}`,
+        path: `schematics/${id}/description.md`,
+        imagePath: `figures/${figure}.png`,
+        available: true,
+        bytes: 24,
+        referenceDesignators: [`R${index}`],
+        labels: [],
+        connectionCues: ["line-art edge ratio 0.030"],
+        classificationReasons: ["rendered page has schematic-like line geometry near electrical labels"],
+        analysisOutputs: []
+      });
+    }
+    const runner = fakeRunner({
+      summary: "bounded schematic image attachments",
+      spans: [{ locator: "ai:schematic:bounded", text: "Large schematic import was enriched from bounded visual evidence." }],
+      metadata: [],
+      warnings: []
+    });
+    const client = fakeDocumentationClient({
+      source_type: "datasheet",
+      snapshot_path: "snapshots/schematic/source.pdf",
+      chunks,
+      artifacts
+    }, { archiveRoot });
+    const service = new DocumentationEnrichmentService({
+      client,
+      config: fakeConfig(true),
+      rulesSkills: fakeRulesSkills(),
+      runner
+    });
+
+    await service.enrichIngestResponse({ document: { documentId: "doc-1" } });
+
+    const prompts = runner.run.mock.calls.map(([prompt]) => prompt);
+    const imagePaths = runner.run.mock.calls.flatMap(([, options]) => options?.imagePaths ?? []);
+    expect(runner.run).toHaveBeenCalledTimes(2);
+    expect(runner.run.mock.calls.map(([, options]) => options?.imagePaths?.length)).toEqual([8, 4]);
+    expect(imagePaths).toHaveLength(12);
+    for (let index = 1; index <= 12; index += 1) {
+      expect(imagePaths.some((imagePath) => imagePath.includes(`figure-${String(index).padStart(3, "0")}.png`))).toBe(true);
+    }
+    expect(prompts.every((prompt) => prompt.includes('"attachedImageBatchSize": 8'))).toBe(true);
+    expect(prompts.join("\n")).toContain("schematic-012");
+    expect(client.enrichDocument).toHaveBeenCalledWith(expect.objectContaining({
+      payload: expect.objectContaining({
+        evidence: expect.objectContaining({ artifactCount: 12, chunkCount: 12 })
+      })
+    }));
+  });
+
   it("persists all valid returned spans and warnings without fixed output caps", async () => {
     const spans = Array.from({ length: 105 }, (_unused, index) => ({
       locator: `ai:item:${index + 1}`,

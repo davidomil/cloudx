@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import ipaddress
 import json
 import mimetypes
 import os
 import re
 import shlex
 import shutil
+import socket
 import sqlite3
 import stat
 import subprocess
@@ -21,7 +23,7 @@ from importlib.metadata import version
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 import numpy as np
@@ -77,6 +79,7 @@ LEXICAL_RELEVANCE_WEIGHT = 0.02
 STRICT_TERM_MATCH_BONUS = 4.0
 IDENTIFIER_TERM_MATCH_BONUS = 4.0
 MAX_URL_INGEST_BYTES = 256 * 1024 * 1024
+MAX_URL_REDIRECTS = 10
 ACTIVE_STATE = "active"
 DOCUMENT_LIST_DEFAULT_LIMIT = 50
 DOCUMENT_LIST_MAX_LIMIT = 200
@@ -4245,20 +4248,58 @@ def title_from_url(url: str) -> str:
 
 
 def fetch_url_bytes(url: str, max_bytes: int) -> tuple[httpx.Response, bytes]:
+    next_url = url
+    with httpx.Client(follow_redirects=False, timeout=20.0) as client:
+        for _redirect_count in range(MAX_URL_REDIRECTS + 1):
+            validate_url_ingest_target(next_url)
+            with client.stream("GET", next_url) as response:
+                if response.is_redirect:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise ArchiveError("URL ingest redirect response did not include a Location header.")
+                    next_url = urljoin(str(response.url), location)
+                    validate_url_ingest_target(next_url)
+                    continue
+                response.raise_for_status()
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in response.iter_bytes():
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ArchiveError(f"Downloaded source exceeds the maximum size of {max_bytes} bytes.")
+                    chunks.append(chunk)
+                return response, b"".join(chunks)
+    raise ArchiveError(f"URL ingest exceeded the maximum redirect count of {MAX_URL_REDIRECTS}.")
+
+
+def validate_url_ingest_target(url: str) -> None:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         raise ArchiveError("URL ingest supports only http and https URLs.")
-    chunks: list[bytes] = []
-    total = 0
-    with httpx.Client(follow_redirects=True, timeout=20.0) as client:
-        with client.stream("GET", url) as response:
-            response.raise_for_status()
-            for chunk in response.iter_bytes():
-                total += len(chunk)
-                if total > max_bytes:
-                    raise ArchiveError(f"Downloaded source exceeds the maximum size of {max_bytes} bytes.")
-                chunks.append(chunk)
-            return response, b"".join(chunks)
+    if not parsed.hostname:
+        raise ArchiveError("URL ingest requires a URL host.")
+    if private_url_ingest_allowed():
+        return
+    host = parsed.hostname.rstrip(".").lower()
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ArchiveError("URL ingest target has an invalid port.") from error
+    try:
+        address_info = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as error:
+        raise ArchiveError(f"URL ingest could not resolve host: {host}.") from error
+    if not address_info:
+        raise ArchiveError(f"URL ingest could not resolve host: {host}.")
+    for _family, _socket_type, _proto, _canonical_name, socket_address in address_info:
+        address = socket_address[0]
+        ip = ipaddress.ip_address(address)
+        if not ip.is_global:
+            raise ArchiveError(f"URL ingest refuses non-public host {host} resolved to {ip}.")
+
+
+def private_url_ingest_allowed() -> bool:
+    return os.getenv("CLOUDX_DOCUMENTATION_ALLOW_PRIVATE_URL_INGEST", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def safe_file_name(name: str) -> str:

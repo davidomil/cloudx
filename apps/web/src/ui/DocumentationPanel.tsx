@@ -355,6 +355,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   const sourceAutoLoadInFlightRef = useRef(false);
   const sourceViewerScrollDocumentIdRef = useRef("");
   const aiNoticeId = useId();
+  const documentListPanelId = useId();
   const ingestController = useMemo(() => documentationIngestController(stateKey), [stateKey]);
 
   const canCall = Boolean(callHook);
@@ -863,6 +864,18 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
           <ControlButton size="compact" onClick={() => void refresh()} disabled={busy} title="Refresh archive">
             <RefreshCw size={14} /> Refresh
           </ControlButton>
+          <ControlButton
+            size="compact"
+            selected={documentListVisible}
+            pressed={documentListVisible}
+            onClick={() => showDocumentList(!documentListVisible)}
+            title={documentListVisible ? "Hide active documents" : "Show active documents"}
+            aria-label={documentListVisible ? "Hide active documents" : "Show active documents"}
+            aria-expanded={documentListVisible}
+            aria-controls={documentListPanelId}
+          >
+            <BookOpen size={14} /> Documents
+          </ControlButton>
         </div>
       </header>
 
@@ -986,7 +999,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
           </div>
         </section>
 
-        <PluginPanelDock compactAt="wide" controls="compact-or-hidden" items={[
+        <PluginPanelDock compactAt="wide" controls="compact" items={[
           {
             id: "ingest",
             label: "Add knowledge",
@@ -1053,7 +1066,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
             onVisibleChange: showDocumentList,
             onOpenChange: handleDocumentListOpenChange,
             children: (
-              <section className="documentation-section documentation-documents">
+              <section id={documentListPanelId} className="documentation-section documentation-documents">
                 <h3>Active Documents</h3>
                 {documentListBusy && !documentListLoaded ? <p className="documentation-empty" role="status">Loading active documents.</p> : null}
                 {documentListLoaded && documents.length > 0 ? (
@@ -1100,20 +1113,31 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
               <section className="documentation-section">
                 <h3>Archive Controls</h3>
                 <div className="documentation-archive-controls">
-                  <ControlButton size="compact" disabled={busy} onClick={() => void exportArchive()}>
-                    <Download size={14} /> Export
-                  </ControlButton>
-                  <div className="documentation-mode-row" role="group" aria-label="Archive import mode">
-                    {(["merge", "replace"] as const).map((candidate) => (
-                      <ControlButton key={candidate} selected={archiveImportMode === candidate} onClick={() => setArchiveImportMode(candidate)} size="compact" tone={candidate === "replace" ? "danger" : "neutral"}>
-                        {candidate}
-                      </ControlButton>
-                    ))}
+                  <div className="documentation-archive-actions">
+                    <ControlButton size="compact" disabled={busy} onClick={() => void exportArchive()}>
+                      <Download size={14} /> Export
+                    </ControlButton>
+                    <div className="documentation-mode-row" role="group" aria-label="Archive import mode">
+                      {(["merge", "replace"] as const).map((candidate) => (
+                        <ControlButton key={candidate} selected={archiveImportMode === candidate} onClick={() => setArchiveImportMode(candidate)} size="compact" tone={candidate === "replace" ? "danger" : "neutral"}>
+                          {candidate}
+                        </ControlButton>
+                      ))}
+                    </div>
                   </div>
-                  <label>
-                    <span>Archive ZIP</span>
-                    <input key={archiveImportInputKey} type="file" accept=".zip,application/zip" onChange={(event) => setArchiveImportValue(event.target.files?.[0])} />
-                  </label>
+                  <div className="documentation-archive-import">
+                    <label>
+                      <span>Archive ZIP</span>
+                      <input key={archiveImportInputKey} type="file" accept=".zip,application/zip" onChange={(event) => setArchiveImportValue(event.target.files?.[0])} />
+                    </label>
+                    <ControlButton
+                      tone={archiveImportMode === "replace" ? "danger" : "primary"}
+                      disabled={busy || !archiveImportValue || (archiveImportMode === "replace" && archiveImportConfirmation !== ARCHIVE_REPLACE_CONFIRMATION)}
+                      onClick={() => void importArchivePackage()}
+                    >
+                      <Upload size={14} /> Import
+                    </ControlButton>
+                  </div>
                   {archiveImportValue ? <p className="documentation-selected-file">{archiveImportValue.name} · {formatBytes(archiveImportValue.size)}</p> : null}
                   {archiveImportMode === "replace" ? (
                     <label>
@@ -1121,13 +1145,6 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
                       <input value={archiveImportConfirmation} onChange={(event) => setArchiveImportConfirmation(event.target.value)} placeholder={ARCHIVE_REPLACE_CONFIRMATION} />
                     </label>
                   ) : null}
-                  <ControlButton
-                    tone={archiveImportMode === "replace" ? "danger" : "primary"}
-                    disabled={busy || !archiveImportValue || (archiveImportMode === "replace" && archiveImportConfirmation !== ARCHIVE_REPLACE_CONFIRMATION)}
-                    onClick={() => void importArchivePackage()}
-                  >
-                    <Upload size={14} /> Import
-                  </ControlButton>
                 </div>
               </section>
             )

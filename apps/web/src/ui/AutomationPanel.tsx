@@ -54,6 +54,7 @@ import {
   startAutomationTestRun,
   validateAutomationGraph
 } from "../api.js";
+import { createBrowserId } from "./browserId.js";
 import { ControlButton } from "./Control.js";
 import {
   automationGraphsEqual,
@@ -425,7 +426,7 @@ function AutomationPanelInner({ tab, liveRuns, onAutomationGroupsChanged }: Auto
       setStatus("Automation name is required.");
       return;
     }
-    const group = newAutomationGroup(name, `automation-${crypto.randomUUID()}`, new Date().toISOString());
+    const group = newAutomationGroup(name, createBrowserId("automation"), new Date().toISOString());
     try {
       const saved = await saveAutomationGroup(group);
       const flow = flowFromGraph(saved, catalog);
@@ -645,7 +646,7 @@ function AutomationPanelInner({ tab, liveRuns, onAutomationGroupsChanged }: Auto
       return;
     }
 
-    const id = `node-${crypto.randomUUID()}`;
+    const id = createBrowserId("node");
     setNodes((current) => [...current, automationFlowNode(id, entry, position)]);
     setSelectedNodeId(id);
     setPalette(undefined);
@@ -1546,7 +1547,7 @@ function automationHandleFromTarget(target: EventTarget | null): AutomationHandl
 function flowEdgeFromConnection(connection: Connection): FlowEdge {
   return normalizeFlowEdge({
     ...connection,
-    id: `edge-${crypto.randomUUID()}`,
+    id: createBrowserId("edge"),
     type: "automation",
     data: flowEdgeData(handleKind(connection.sourceHandle))
   });
@@ -1565,7 +1566,7 @@ function normalizeFlowEdge(edge: FlowEdge): FlowEdge {
 
 function flowEdgeFromEndpoints(source: string, sourceHandle: string, target: string, targetHandle: string): FlowEdge {
   return normalizeFlowEdge({
-    id: `edge-${crypto.randomUUID()}`,
+    id: createBrowserId("edge"),
     source,
     sourceHandle,
     target,
@@ -1591,7 +1592,7 @@ function connectedNodesForPlan(
   compatibility: PaletteCompatibility,
   position: XYPosition
 ): { nodes: FlowNode[]; edges: FlowEdge[]; selectedNodeId: string } {
-  const mainId = `node-${crypto.randomUUID()}`;
+  const mainId = createBrowserId("node");
   const mainNode = automationFlowNode(mainId, entry, position);
   const entryHandle = handleForPort(plan.entryPortKind, plan.direction === "from-origin" ? "in" : "out", plan.entryPortId);
 
@@ -1603,7 +1604,7 @@ function connectedNodesForPlan(
     return { nodes: [mainNode], edges: [edge], selectedNodeId: mainId };
   }
 
-  const converterId = `node-${crypto.randomUUID()}`;
+  const converterId = createBrowserId("node");
   const converterPosition =
     plan.direction === "from-origin"
       ? { x: position.x - CONNECTED_NODE_SPACING, y: position.y }

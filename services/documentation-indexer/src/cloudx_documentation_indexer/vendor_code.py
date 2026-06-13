@@ -180,7 +180,7 @@ def code_review_required_message(label: str, count: int) -> str:
     plural = "file" if count == 1 else "files"
     return (
         f"Code-heavy documentation ingest requires generated documentation review for {count} code {plural} in {label}. "
-        "Re-run with acceptGeneratedCodeDocumentation=true to store generated Markdown and retained code artifacts instead of indexing raw code."
+        "Re-run with acceptGeneratedCodeDocumentation=true to store generated Markdown instead of indexing raw code. Add retainRawCodeArtifacts=true only when raw source artifacts should be retained."
     )
 
 

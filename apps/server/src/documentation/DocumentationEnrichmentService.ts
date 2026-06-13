@@ -57,6 +57,7 @@ export const DEFAULT_DOCUMENTATION_ENRICHMENT_SKILL_IDS = [
 const ENRICHMENT_SCHEMA_PATH = fileURLToPath(new URL("./documentation-enrichment.schema.json", import.meta.url));
 const ANSWER_SCHEMA_PATH = fileURLToPath(new URL("./documentation-answer.schema.json", import.meta.url));
 const ENRICHMENT_BATCH_TARGET_CHARS = 60_000;
+const ENRICHMENT_IMAGE_ATTACHMENT_BATCH_SIZE = 8;
 const ANSWER_DOCUMENT_TARGET_CHARS = 40_000;
 const ANSWER_EVIDENCE_TARGET_CHARS = 90_000;
 const MEDIA_TOOL_TIMEOUT_MS = 30 * 60 * 1000;
@@ -74,6 +75,7 @@ export interface DocumentationRunnerOptions {
   timeoutMs?: number;
   taskLabel?: string;
   model?: string;
+  imagePaths?: string[];
 }
 
 export interface DocumentationEnrichmentSource {
@@ -105,7 +107,8 @@ export class CodexDocumentationEnrichmentRunner implements DocumentationEnrichme
         schemaPath: options.schemaPath ?? ENRICHMENT_SCHEMA_PATH,
         outputPrefix: options.outputPrefix ?? "cloudx-doc-enrich-",
         timeoutMs: options.timeoutMs ?? this.timeoutMs,
-        taskLabel: options.taskLabel ?? "documentation enrichment"
+        taskLabel: options.taskLabel ?? "documentation enrichment",
+        imagePaths: options.imagePaths
       })
     );
   }
@@ -192,7 +195,8 @@ export class DocumentationEnrichmentService {
       const batches = buildEvidenceBatches(evidence);
       const outputs = [];
       for (const batch of batches) {
-        outputs.push(normalizeEnrichmentOutput(await this.options.runner.run(buildEnrichmentPrompt(skills, batch), { model })));
+        const imagePaths = batchImagePaths(batch);
+        outputs.push(normalizeEnrichmentOutput(await this.options.runner.run(buildEnrichmentPrompt(skills, batch), imagePaths.length > 0 ? { model, imagePaths } : { model })));
       }
       const output = mergeEnrichmentOutputs(outputs);
       if (output.spans.length === 0) {
@@ -273,14 +277,21 @@ export class DocumentationEnrichmentService {
   }
 
   private async documentArtifacts(document: Record<string, unknown>): Promise<ArtifactEvidence[]> {
+    const availableArtifacts = availableArtifactRecords(document);
     const archiveRoot = await this.archiveRoot();
     const snapshotPath = typeof document.snapshot_path === "string" ? document.snapshot_path : undefined;
     if (!archiveRoot || !snapshotPath) {
+      if (availableArtifacts.length > 0) {
+        throw new Error(sharedArtifactFilesystemMessage("archive root or snapshot path is missing"));
+      }
       return [];
     }
     const root = path.resolve(archiveRoot);
     const snapshot = path.resolve(root, snapshotPath);
     if (!isSameOrChild(root, snapshot)) {
+      if (availableArtifacts.length > 0) {
+        throw new Error(sharedArtifactFilesystemMessage(`snapshot path escapes the archive root: ${snapshotPath}`));
+      }
       return [];
     }
     const extracted = path.join(path.dirname(snapshot), "extracted");
@@ -289,6 +300,9 @@ export class DocumentationEnrichmentService {
       return structuredArtifacts;
     }
     if (!fs.existsSync(extracted)) {
+      if (availableArtifacts.length > 0) {
+        throw new Error(sharedArtifactFilesystemMessage(`extracted artifact directory is missing for ${snapshotPath}`));
+      }
       return [];
     }
     const paths = await listFiles(extracted);
@@ -366,9 +380,21 @@ interface ArtifactEvidence {
   archivePath: string;
   bytes: number;
   kind: string;
+  mimeType?: string;
   locator?: string;
   id?: string;
   type?: string;
+  imagePath?: string;
+  imageArchivePath?: string;
+  jsonPath?: string;
+  jsonArchivePath?: string;
+  descriptionPath?: string;
+  descriptionArchivePath?: string;
+  referenceDesignators?: string[];
+  labels?: string[];
+  connectionCues?: string[];
+  classificationReasons?: string[];
+  analysisOutputs?: unknown[];
   offsetSeconds?: number;
   transcriptStartSeconds?: number;
   transcriptEndSeconds?: number;
@@ -446,10 +472,22 @@ interface EnrichmentEvidenceBatch {
     index: number;
     total: number;
     itemCount: number;
+    attachedImageBatchSize?: number;
+    attachedImageCount?: number;
   };
   chunks: DocumentChunkEvidence[];
   artifacts: ArtifactEvidence[];
+  attachedImages?: AttachedImageEvidence[];
   media?: BatchedMediaEvidence;
+}
+
+interface AttachedImageEvidence {
+  path: string;
+  archivePath?: string;
+  artifactId?: string;
+  artifactType?: string;
+  locator?: string;
+  role: string;
 }
 
 interface BatchedMediaEvidence {
@@ -591,6 +629,11 @@ function buildEnrichmentPrompt(skills: CloudxSkill[], evidence: EnrichmentEviden
     "Use only the configured skills below and the provided source-grounded evidence.",
     "Return only JSON matching the requested schema.",
     "Create derived spans that make missing metadata, tables, graphs, flowcharts, screenshots, media transcript details, and extraction gaps searchable.",
+    "When `attachedImages` is non-empty, those files are attached to this Codex exec request. Inspect the attached image pixels directly instead of relying only on OCR, filenames, or heuristic metadata.",
+    "Large imports are split so each Codex exec request receives a bounded number of attached images. Every attached image group is processed by a separate request.",
+    "For schematic artifacts, extract detailed visual facts from the rendered schematic image: visible components/reference designators, component roles or values when legible, pin/net labels, power and ground symbols, and how wires connect components and nets.",
+    "For schematic outputs, prefer separate spans with locators like `ai:schematic:<artifact-id>:components`, `ai:schematic:<artifact-id>:connections`, and `ai:schematic:<artifact-id>:uncertainties`.",
+    "State uncertain readings as uncertain; do not infer hidden wires, values, or nets that are not visible in the image or source text.",
     "Do not invent facts not grounded in the document chunks, extracted artifacts, ASR transcript, or keyframe evidence.",
     "When the evidence is insufficient, describe the limitation in warnings instead of guessing.",
     "Return `metadata` as an array of { key, value } entries so each metadata value is source-grounded and explicitly named.",
@@ -705,27 +748,39 @@ function documentSummary(document: Record<string, unknown>): Record<string, unkn
 
 async function documentArtifactEvidence(document: Record<string, unknown>, archiveRoot: string, extractedRoot: string): Promise<ArtifactEvidence[]> {
   const evidence: ArtifactEvidence[] = [];
-  for (const artifact of recordsArray(document.artifacts)) {
-    if (artifact.available === false) {
-      continue;
-    }
+  for (const artifact of availableArtifactRecords(document)) {
     const relativePath = typeof artifact.path === "string" ? artifact.path : "";
     if (!relativePath) {
       continue;
     }
-    const artifactPath = path.resolve(extractedRoot, relativePath);
-    if (!isSameOrChild(extractedRoot, artifactPath) || !fs.existsSync(artifactPath)) {
+    const artifactPath = resolvedArtifactPath(extractedRoot, relativePath, "artifact file");
+    if (!artifactPath) {
       continue;
     }
     const stat = await fsp.stat(artifactPath);
+    const imagePath = resolvedArtifactPath(extractedRoot, optionalRecordString(artifact, "imagePath"), "image artifact file");
+    const jsonPath = resolvedArtifactPath(extractedRoot, optionalRecordString(artifact, "jsonPath"), "JSON artifact file");
+    const descriptionPath = resolvedArtifactPath(extractedRoot, optionalRecordString(artifact, "descriptionPath"), "description artifact file");
     evidence.push({
       path: artifactPath,
       archivePath: path.relative(archiveRoot, artifactPath),
       bytes: typeof artifact.bytes === "number" ? artifact.bytes : stat.size,
       kind: typeof artifact.kind === "string" ? artifact.kind : artifactKind(relativePath),
+      mimeType: optionalRecordString(artifact, "mimeType"),
       locator: optionalRecordString(artifact, "locator"),
       id: optionalRecordString(artifact, "id"),
       type: optionalRecordString(artifact, "type"),
+      imagePath,
+      imageArchivePath: imagePath ? path.relative(archiveRoot, imagePath) : undefined,
+      jsonPath,
+      jsonArchivePath: jsonPath ? path.relative(archiveRoot, jsonPath) : undefined,
+      descriptionPath,
+      descriptionArchivePath: descriptionPath ? path.relative(archiveRoot, descriptionPath) : undefined,
+      referenceDesignators: recordStringArray(artifact, "referenceDesignators"),
+      labels: recordStringArray(artifact, "labels"),
+      connectionCues: recordStringArray(artifact, "connectionCues"),
+      classificationReasons: recordStringArray(artifact, "classificationReasons"),
+      analysisOutputs: Array.isArray(artifact.analysisOutputs) ? artifact.analysisOutputs : undefined,
       offsetSeconds: optionalRecordNumber(artifact, "offsetSeconds"),
       transcriptStartSeconds: optionalRecordNumber(artifact, "transcriptStartSeconds"),
       transcriptEndSeconds: optionalRecordNumber(artifact, "transcriptEndSeconds"),
@@ -734,6 +789,10 @@ async function documentArtifactEvidence(document: Record<string, unknown>, archi
     });
   }
   return evidence;
+}
+
+function availableArtifactRecords(document: Record<string, unknown>): Record<string, unknown>[] {
+  return recordsArray(document.artifacts).filter((artifact) => artifact.available !== false);
 }
 
 function documentChunks(document: Record<string, unknown>): DocumentChunkEvidence[] {
@@ -793,20 +852,34 @@ function groupEvidenceItems(items: EvidenceBatchItem[]): EvidenceBatchItem[][] {
   const groups: EvidenceBatchItem[][] = [];
   let current: EvidenceBatchItem[] = [];
   let currentChars = 0;
+  let currentImages = 0;
   for (const item of items) {
     const itemChars = JSON.stringify(item).length;
-    if (current.length > 0 && currentChars + itemChars > ENRICHMENT_BATCH_TARGET_CHARS) {
+    const itemImages = imageAttachmentCountForItem(item);
+    if (current.length > 0 && (currentChars + itemChars > ENRICHMENT_BATCH_TARGET_CHARS || currentImages + itemImages > ENRICHMENT_IMAGE_ATTACHMENT_BATCH_SIZE)) {
       groups.push(current);
       current = [];
       currentChars = 0;
+      currentImages = 0;
     }
     current.push(item);
     currentChars += itemChars;
+    currentImages += itemImages;
   }
   if (current.length > 0) {
     groups.push(current);
   }
   return groups;
+}
+
+function imageAttachmentCountForItem(item: EvidenceBatchItem): number {
+  if (item.kind === "artifact") {
+    return attachedImagesForArtifact(item.value).length;
+  }
+  if (item.kind === "keyframe") {
+    return isReadableImagePath(item.value.path) ? 1 : 0;
+  }
+  return 0;
 }
 
 function evidenceBatch(evidence: EnrichmentEvidence, items: EvidenceBatchItem[], index: number, total: number): EnrichmentEvidenceBatch {
@@ -834,10 +907,64 @@ function evidenceBatch(evidence: EnrichmentEvidence, items: EvidenceBatchItem[],
       }
     }
   }
+  const attachedImages = attachedImagesForBatch(batch);
+  if (attachedImages.length > 0) {
+    batch.attachedImages = attachedImages;
+    batch.batch.attachedImageBatchSize = ENRICHMENT_IMAGE_ATTACHMENT_BATCH_SIZE;
+    batch.batch.attachedImageCount = attachedImages.length;
+  }
   if (evidence.media && !batch.media && total === 1) {
     batch.media = mediaBatchMetadata(evidence.media);
   }
   return batch;
+}
+
+function attachedImagesForBatch(batch: EnrichmentEvidenceBatch): AttachedImageEvidence[] {
+  const images = new Map<string, AttachedImageEvidence>();
+  for (const artifact of batch.artifacts) {
+    for (const image of attachedImagesForArtifact(artifact)) {
+      images.set(image.path, image);
+    }
+  }
+  for (const keyframe of batch.media?.keyframes ?? []) {
+    if (isReadableImagePath(keyframe.path)) {
+      images.set(keyframe.path, {
+        path: keyframe.path,
+        role: "media keyframe",
+        locator: keyframe.offsetSeconds !== undefined ? `media keyframe ${keyframe.offsetSeconds}s` : "media keyframe"
+      });
+    }
+  }
+  return [...images.values()];
+}
+
+function attachedImagesForArtifact(artifact: ArtifactEvidence): AttachedImageEvidence[] {
+  const images: AttachedImageEvidence[] = [];
+  if (isReadableImagePath(artifact.path) && isImageEvidence(artifact.path, artifact.mimeType, artifact.kind, artifact.type)) {
+    images.push({
+      path: artifact.path,
+      archivePath: artifact.archivePath,
+      artifactId: artifact.id,
+      artifactType: artifact.type,
+      locator: artifact.locator,
+      role: artifact.type === "schematic" ? "schematic rendered image" : "visual artifact"
+    });
+  }
+  if (artifact.imagePath && isReadableImagePath(artifact.imagePath)) {
+    images.push({
+      path: artifact.imagePath,
+      archivePath: artifact.imageArchivePath,
+      artifactId: artifact.id,
+      artifactType: artifact.type,
+      locator: artifact.locator,
+      role: artifact.type === "schematic" ? "schematic rendered image" : "related image artifact"
+    });
+  }
+  return images;
+}
+
+function batchImagePaths(batch: EnrichmentEvidenceBatch): string[] {
+  return (batch.attachedImages ?? []).map((image) => image.path);
 }
 
 function mediaBatchMetadata(media: MediaEvidence | undefined): BatchedMediaEvidence {
@@ -972,6 +1099,39 @@ function artifactKind(filePath: string): string {
   return path.extname(filePath).toLowerCase().replace(/^\./u, "") || "file";
 }
 
+function resolvedArtifactPath(extractedRoot: string, relativePath: string | undefined, label: string): string | undefined {
+  if (!relativePath) {
+    return undefined;
+  }
+  const artifactPath = path.resolve(extractedRoot, relativePath);
+  if (!isSameOrChild(extractedRoot, artifactPath)) {
+    throw new Error(sharedArtifactFilesystemMessage(`${label} escapes the extracted artifact directory: ${relativePath}`));
+  }
+  if (!fs.existsSync(artifactPath)) {
+    throw new Error(sharedArtifactFilesystemMessage(`${label} is missing from the local archive filesystem: ${relativePath}`));
+  }
+  return artifactPath;
+}
+
+function sharedArtifactFilesystemMessage(reason: string): string {
+  return `Documentation artifact enrichment requires CloudX server and documentation indexer to share the documentation archive filesystem; ${reason}.`;
+}
+
+function isReadableImagePath(filePath: string): boolean {
+  return fs.existsSync(filePath) && isImageEvidence(filePath);
+}
+
+function isImageEvidence(filePath: string, mimeType?: string, kind?: string, type?: string): boolean {
+  if (mimeType?.startsWith("image/")) {
+    return true;
+  }
+  const label = `${kind ?? ""} ${type ?? ""}`.toLowerCase();
+  if (/(?:image|figure|keyframe|page-render|schematic)/u.test(label) && /\.(?:png|jpe?g|webp|gif|bmp|tiff?)$/iu.test(filePath)) {
+    return true;
+  }
+  return /\.(?:png|jpe?g|webp|gif|bmp|tiff?)$/iu.test(filePath);
+}
+
 function optionalRecordString(record: Record<string, unknown>, key: string): string | undefined {
   const value = record[key];
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
@@ -980,6 +1140,15 @@ function optionalRecordString(record: Record<string, unknown>, key: string): str
 function optionalRecordNumber(record: Record<string, unknown>, key: string): number | undefined {
   const value = record[key];
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function recordStringArray(record: Record<string, unknown>, key: string): string[] | undefined {
+  const value = record[key];
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const strings = value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean);
+  return strings.length > 0 ? strings : undefined;
 }
 
 function isMediaSource(source: DocumentationEnrichmentSource): boolean {

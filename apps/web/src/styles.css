@@ -2837,6 +2837,10 @@ a:hover svg {
   gap: 8px;
 }
 
+.rule-enable-toggle {
+  align-self: start;
+}
+
 .rule-option-actions {
   display: flex;
   align-items: center;
@@ -2849,8 +2853,30 @@ a:hover svg {
   gap: 7px;
 }
 
-.rule-edit-fields textarea {
+.rule-edit-text {
+  min-width: 0;
+  min-height: 40px;
+  padding: 10px 11px;
+  color: var(--color-accent);
+  background: var(--color-input);
+  border: 1px solid var(--color-border);
+  clip-path: var(--chamfer-sm);
+  outline: none;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.rule-edit-text:first-child {
   min-height: 72px;
+}
+
+.rule-edit-text:empty::before {
+  color: var(--color-muted-foreground);
+  content: attr(data-placeholder);
+}
+
+.rule-edit-text:focus {
+  border-color: var(--color-accent);
 }
 
 .rules-skills-panel .skill-option {
@@ -3238,7 +3264,32 @@ a:hover svg {
 }
 
 .documentation-archive-controls {
+  display: grid;
+  align-items: stretch;
+  align-content: start;
+  gap: 10px;
+}
+
+.documentation-archive-actions,
+.documentation-archive-import {
+  display: flex;
   align-items: end;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.documentation-archive-actions {
+  justify-content: flex-start;
+}
+
+.documentation-archive-import {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.documentation-archive-import label {
+  min-width: 0;
 }
 
 .documentation-ingest textarea {

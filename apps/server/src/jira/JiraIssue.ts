@@ -210,13 +210,10 @@ export function jiraIssueEventPayload(
     epicKey: issue.epicKey,
     epicId: issue.epicId,
     assigneeAccountId: issue.assignee?.accountId,
-    assigneeEmailAddress: issue.assignee?.emailAddress,
-    assigneeDisplayName: issue.assignee?.displayName,
     reporterAccountId: issue.reporter?.accountId,
     createdAt: issue.created,
     updatedAt: issue.updated,
     detectedAt,
-    issue,
     ...extras
   });
 }
@@ -229,9 +226,7 @@ export function jiraCommentEventPayload(
   return jiraIssueEventPayload("jira.commentCreated", issue, detectedAt, {
     commentId: comment.id,
     commentUrl: comment.url,
-    commentBody: comment.bodyText,
-    actorAccountId: comment.author?.accountId,
-    comment
+    actorAccountId: comment.author?.accountId
   });
 }
 

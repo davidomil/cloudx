@@ -92,8 +92,11 @@ Returned spans are merged and written as AI-origin chunks by
 
 Source: `apps/web/src/ui/DocumentationPanel.tsx`
 
-Provides search, filters, ingest forms, invalidation buttons, manifest
-view, archive export/import controls, and index rebuild controls.
+Provides assisted answers, manual search, ingest forms, active document
+listing, source chunk and artifact inspection, invalidation buttons, and
+archive export/import controls. Portable manifest inspection and index
+rebuild are exposed through plugin hooks, the bundled documentation helper,
+and the local indexer API.
 
 ## Indexer API
 
@@ -211,10 +214,14 @@ that ingest request and single-file ingest uses the parent folder name.
 
 ## URL Ingest
 
-`documentation.ingest.url` downloads a URL with redirects enabled and a
-20 second timeout. The indexer records the original URL, final URL,
-content type, ETag, and last-modified header when those values are
-available.
+`documentation.ingest.url` downloads HTTP or HTTPS URLs with a 20 second
+timeout and validates each redirect target before it is fetched. By
+default, URL ingest rejects hosts that resolve to loopback, private,
+link-local, or otherwise non-public IP addresses. Set
+`CLOUDX_DOCUMENTATION_ALLOW_PRIVATE_URL_INGEST=true` only for trusted local
+fixtures or private documentation networks. The indexer records the
+original URL, final URL, content type, ETag, and last-modified header when
+those values are available.
 
 When title is blank, URL ingest uses the URL leaf or a YouTube
 video/playlist label. When collection is blank, normal URL ingest uses
@@ -513,10 +520,11 @@ minute timeout, and an 8 MiB maximum response body.
 `CLOUDX_DOCUMENTATION_TIMEOUT_MS` sets the indexer request and AI
 enrichment timeout up to 12 hours for large PDF extraction or long media
 imports. `CLOUDX_DOCUMENTATION_RESPONSE_MAX_BYTES` sets the maximum
-indexer response size, and `CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES` sets
-the browser documentation upload cap. Failed service responses are
-converted into plain error messages when the response includes `detail`,
-`message`, or `error`.
+indexer response size, `CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES` sets the
+browser/server/indexer documentation upload cap, and
+`CLOUDX_DOCUMENTATION_IMPORT_UPLOAD_MAX_BYTES` sets the indexer archive
+import upload cap. Failed service responses are converted into plain error
+messages when the response includes `detail`, `message`, or `error`.
 
 Binary upload is exposed through HTTP rather than a plugin hook because
 hook inputs are JSON-shaped. The browser route is
@@ -564,9 +572,10 @@ operational view:
     Documents list to inspect chunks, transcript text, table Markdown,
     and extracted artifact metadata. Large sources auto-load more chunks
     and artifacts as the source viewer reaches the end.
-12. Export the archive as a ZIP, import another archive by merge or
-    confirmed replace, load the portable manifest, and rebuild the
-    Turbovec index.
+12. Export the archive as a ZIP and import another archive by merge or
+    confirmed replace. Portable manifest inspection and Turbovec rebuild
+    are available through helper commands, plugin hooks, and the local
+    indexer API.
 
 The UI defaults to active-document search, upload ingest,
 assisted-answer mode when AI assistance is available, and hybrid search
@@ -782,8 +791,10 @@ generated corpus, archive, and summary files stay under the selected
   the default user-facing recall mode.
 - Dense search is restricted to active chunks because only active chunks
   are loaded into Turbovec.
-- URL ingest supports only HTTP and HTTPS, performs direct fetches or
-  YouTube media ingest, and does not crawl a site recursively.
+- URL ingest supports only HTTP and HTTPS, validates redirect targets before
+  fetching them, blocks loopback/private/link-local/non-public IP targets by
+  default, performs direct fetches or YouTube media ingest, and does not
+  crawl a site recursively.
 - YouTube URL ingest stores timestamped transcript, metadata, selected
   slide-frame artifacts, and a visual sampling manifest. It runs ASR and
   the CPU-heavy visual scan concurrently, downloads a bounded video
@@ -792,7 +803,9 @@ generated corpus, archive, and summary files stay under the selected
   Faster-whisper is the default; Intel Arc acceleration requires the
   explicit `whisper-cpp` backend with a SYCL/OpenVINO-capable
   `whisper-cli` and visible `/dev/dri` GPU device access.
-- Browser uploads and URL downloads are capped at 256 MiB.
+- Browser documentation uploads, server forwarding, indexer upload reads, and
+  URL downloads are capped at 256 MiB by default. Archive import multipart
+  uploads are capped at 1 GiB by default.
 - PDF graph and flowchart extraction preserves rendered visual
   artifacts, but it does not OCR labels or infer graph semantics.
 - Schematic-aware ingest is Phase 1 only: it classifies schematic-like

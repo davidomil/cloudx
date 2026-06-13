@@ -67,15 +67,13 @@ describe("JiraPollingService", () => {
       expect.objectContaining({
         issueKey: "ENG-1",
         assigneeAccountId: "me",
-        assigneeEmailAddress: "david@example.com",
-        assigneeMatchedEmailAddress: "david@example.com",
+        assigneeMatchedAccountId: "me",
         previousAssigneeAccountId: "old"
       }),
       expect.objectContaining({
         issueKey: "ENG-2",
         assigneeAccountId: "me",
-        assigneeEmailAddress: "david@example.com",
-        assigneeMatchedEmailAddress: "david@example.com"
+        assigneeMatchedAccountId: "me"
       })
     ]);
   });
@@ -110,6 +108,99 @@ describe("JiraPollingService", () => {
       commentId: "2",
       commentUrl: "https://example.atlassian.net/browse/ENG-1?focusedCommentId=2"
     });
+    expect(JSON.stringify(payloads[0])).not.toContain("Second");
+    expect(payloads[0]).not.toHaveProperty("comment");
+    expect(payloads[0]).not.toHaveProperty("commentBody");
+  });
+
+  it("persists minimal Jira trigger payloads without raw Jira records or email addresses", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-jira-minimal-payload-"));
+    const payloads: Record<string, unknown>[] = [];
+    const triggers = jiraTriggers((event) => {
+      payloads.push(event.payload);
+    });
+    const integration = {
+      configured: () => true,
+      pollingConfig: () => ({ enabled: true, intervalSeconds: 300, jql: "", maxIssues: 10, commentsEnabled: true, assignmentsEnabled: true }),
+      pollingAccount: vi.fn().mockResolvedValue({ accountId: "me", emailAddress: "david@example.com", configuredEmail: "david@example.com" }),
+      pollingIssues: vi.fn()
+        .mockResolvedValueOnce([issue("ENG-1", "Open", "old", "2026-06-08T10:00:00.000+0000", "old@example.com")])
+        .mockResolvedValueOnce([issue("ENG-1", "Open", "me", "2026-06-08T10:05:00.000+0000", "david@example.com")]),
+      pollingComments: vi.fn()
+        .mockResolvedValueOnce([comment("1", "First private comment")])
+        .mockResolvedValueOnce([comment("1", "First private comment"), comment("2", "Second private comment")])
+    } as unknown as JiraIntegrationService;
+    const polling = new JiraPollingService(integration, new PluginDataStore(dataDir), () => triggers);
+
+    await polling.runOnce();
+    await polling.runOnce();
+
+    const serialized = JSON.stringify(payloads);
+    expect(serialized).not.toContain("david@example.com");
+    expect(serialized).not.toContain("old@example.com");
+    expect(serialized).not.toContain("private comment");
+    for (const payload of payloads) {
+      expect(payload).not.toHaveProperty("issue");
+      expect(payload).not.toHaveProperty("comment");
+      expect(payload).not.toHaveProperty("commentBody");
+      expect(payload).not.toHaveProperty("assigneeEmailAddress");
+    }
+  });
+
+  it("keeps prior issue snapshots outside the current polling result window", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-jira-polling-window-"));
+    const events: string[] = [];
+    const triggers = jiraTriggers((event) => {
+      events.push(`${event.triggerId}:${String(event.payload.issueKey)}`);
+    });
+    const integration = {
+      configured: () => true,
+      pollingConfig: () => ({ enabled: true, intervalSeconds: 300, jql: "", maxIssues: 10, commentsEnabled: false, assignmentsEnabled: false }),
+      pollingIssues: vi.fn()
+        .mockResolvedValueOnce([issue("ENG-1", "Open", "old", "2026-06-08T10:00:00.000+0000")])
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([issue("ENG-1", "Open", "old", "2026-06-08T10:05:00.000+0000")]),
+      pollingComments: vi.fn()
+    } as unknown as JiraIntegrationService;
+    const polling = new JiraPollingService(integration, new PluginDataStore(dataDir), () => triggers);
+
+    await polling.runOnce();
+    await expect(polling.runOnce()).resolves.toMatchObject({ emitted: [] });
+    await expect(polling.runOnce()).resolves.toMatchObject({ emitted: ["jira.issueUpdated"] });
+    expect(events).toEqual(["jira.issueUpdated:ENG-1"]);
+  });
+
+  it("does not emit partial triggers when a later Jira comment fetch is rate-limited", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-jira-partial-rate-limit-"));
+    const events: string[] = [];
+    const triggers = jiraTriggers((event) => {
+      events.push(`${event.triggerId}:${String(event.payload.issueKey)}`);
+    });
+    const integration = {
+      configured: () => true,
+      pollingConfig: () => ({ enabled: true, intervalSeconds: 300, jql: "", maxIssues: 10, commentsEnabled: true, assignmentsEnabled: false }),
+      pollingIssues: vi.fn()
+        .mockResolvedValueOnce([issue("ENG-1", "Open", "old", "2026-06-08T10:00:00.000+0000"), issue("ENG-2", "Open", "old", "2026-06-08T10:00:00.000+0000")])
+        .mockResolvedValueOnce([issue("ENG-1", "Open", "old", "2026-06-08T10:05:00.000+0000"), issue("ENG-2", "Open", "old", "2026-06-08T10:00:00.000+0000")])
+        .mockResolvedValueOnce([issue("ENG-1", "Open", "old", "2026-06-08T10:05:00.000+0000"), issue("ENG-2", "Open", "old", "2026-06-08T10:00:00.000+0000")]),
+      pollingComments: vi.fn()
+        .mockResolvedValueOnce([comment("1", "First")])
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([comment("1", "First"), comment("2", "Second")])
+        .mockRejectedValueOnce(new JiraRateLimitError("Jira rate limit exceeded.", 0, "cost"))
+        .mockResolvedValueOnce([comment("1", "First"), comment("2", "Second")])
+        .mockResolvedValueOnce([])
+    } as unknown as JiraIntegrationService;
+    const polling = new JiraPollingService(integration, new PluginDataStore(dataDir), () => triggers);
+
+    await polling.runOnce();
+    await expect(polling.runOnce()).resolves.toMatchObject({ skipped: true, reason: "rate_limited" });
+    expect(events).toEqual([]);
+
+    await expect(polling.runOnce()).resolves.toMatchObject({
+      emitted: ["jira.issueUpdated", "jira.commentCreated"]
+    });
+    expect(events).toEqual(["jira.issueUpdated:ENG-1", "jira.commentCreated:ENG-1"]);
   });
 
   it("skips disabled, interval-blocked, and rate-limited polling runs", async () => {

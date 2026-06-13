@@ -15,7 +15,7 @@ export interface JiraIssueTriggerSummary {
   status?: string;
   priority?: string;
   projectKey?: string;
-  assignee?: { accountId?: string; displayName?: string; emailAddress?: string };
+  assignee?: { accountId?: string };
   epicKey?: string;
   created?: string;
   updated?: string;
@@ -66,12 +66,9 @@ export function jiraIssueManualRunPayload(issue: JiraIssueTriggerSummary, detect
     priority: issue.priority,
     epicKey: issue.epicKey,
     assigneeAccountId: issue.assignee?.accountId,
-    assigneeEmailAddress: issue.assignee?.emailAddress,
-    assigneeDisplayName: issue.assignee?.displayName,
     createdAt: issue.created,
     updatedAt: issue.updated,
-    detectedAt,
-    issue
+    detectedAt
   });
 }
 

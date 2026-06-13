@@ -122,6 +122,12 @@ describe("buildCodexExecArgs", () => {
       expect.arrayContaining(["-c", 'model_reasoning_effort="medium"', "--model", "gpt-5.3-codex-spark"])
     );
   });
+
+  it("attaches image files to Codex exec prompts", () => {
+    expect(buildCodexExecArgs("gpt-5.4-mini", "/schema.json", "/out.json", ["/tmp/schematic.png", "/tmp/detail.jpg"])).toEqual(
+      expect.arrayContaining(["--image", "/tmp/schematic.png", "--image", "/tmp/detail.jpg", "--output-schema", "/schema.json"])
+    );
+  });
 });
 
 describe("voice-plan.schema.json", () => {

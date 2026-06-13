@@ -256,6 +256,7 @@ function jiraTriggers(): TriggerDefinition[] {
     jiraTrigger("jira.issueAssignedToMe", "Jira Issue Assigned To Me", "Emitted when polling sees a new or newly assigned issue whose assignee matches the configured Jira account."),
     {
       ...jiraTrigger("jira.issueManualRun", "Jira Issue Play Clicked", "Emitted when a user clicks the play action on a Jira issue in the Jira panel."),
+      exposures: ["http", "automation"],
       payloadSchema: {
         type: "object",
         properties: {
@@ -274,8 +275,7 @@ function jiraTriggers(): TriggerDefinition[] {
           ...jiraTriggerPayloadProperties(),
           commentId: { type: "string" },
           commentUrl: { type: "string" },
-          commentBody: { type: "string" },
-          comment: { type: "object", additionalProperties: true, "x-cloudx-connectable": false }
+          actorAccountId: { type: "string" }
         },
         required: [...jiraTriggerRequiredProperties(), "commentId", "commentUrl"],
         additionalProperties: false
@@ -290,7 +290,7 @@ function jiraTrigger(id: string, title: string, description: string): TriggerDef
     owner: { kind: "plugin", pluginId: JIRA_PLUGIN_ID },
     title,
     description,
-    exposures: ["plugin", "automation", "http"],
+    exposures: ["plugin", "automation"],
     payloadSchema: {
       type: "object",
       properties: jiraTriggerPayloadProperties(),
@@ -328,19 +328,14 @@ function jiraTriggerPayloadProperties(): Record<string, JsonSchemaLike> {
     epicKey: { type: "string" },
     epicId: { type: "string" },
     assigneeAccountId: { type: "string" },
-    assigneeEmailAddress: { type: "string" },
-    assigneeDisplayName: { type: "string" },
     assigneeMatchedAccountId: { type: "string" },
-    assigneeMatchedEmailAddress: { type: "string" },
     previousAssigneeAccountId: { type: "string" },
-    previousAssigneeEmailAddress: { type: "string" },
     reporterAccountId: { type: "string" },
     actorAccountId: { type: "string" },
     changedFieldIds: { type: "array", items: { type: "string" } },
     createdAt: { type: "string" },
     updatedAt: { type: "string" },
-    detectedAt: { type: "string" },
-    issue: { type: "object", description: "Normalized Jira issue object. Use scalar top-level fields for most automation wiring.", additionalProperties: true, "x-cloudx-connectable": false }
+    detectedAt: { type: "string" }
   };
 }
 

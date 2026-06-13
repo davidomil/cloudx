@@ -97,6 +97,8 @@ function assertSourceOwnsTrigger(trigger: TriggerDefinition, source: TriggerEven
 
 function assertExposure(trigger: TriggerDefinition, exposure: TriggerExposure): void {
   if (!trigger.exposures.includes(exposure)) {
-    throw new Error(`Trigger ${trigger.id} is not exposed to ${exposure} callers.`);
+    const error = new Error(`Trigger ${trigger.id} is not exposed to ${exposure} callers.`) as Error & { statusCode: number };
+    error.statusCode = 403;
+    throw error;
   }
 }

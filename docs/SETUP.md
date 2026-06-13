@@ -221,6 +221,47 @@ python3 -m venv services/asr/.venv
 services/asr/.venv/bin/pip install -e services/asr
 ```
 
+## Jira Cloud Integration
+
+The built-in Jira plugin uses Jira Cloud REST API v3 through the configured site
+URL. Configure it from Settings > Jira:
+
+- `Jira site URL`: the HTTPS Jira Cloud site, for example
+  `https://example.atlassian.net`.
+- `Jira account email`: the Atlassian account email used with the API token.
+- `Jira API token`: a plugin secret. Cloudx stores it outside `config.json` and
+  never returns the token value from `/api/config`.
+- Dashboard settings: filter JQL, grouping, sort order, and refresh interval.
+- Polling settings: enabled flag, interval, overlap window, project-key bounds,
+  additional JQL filter, comment detection, assignment detection, and issue
+  limit.
+
+Create a Jira tab after configuring the connection. The panel shows assigned
+issues, groups them by Epic by default, opens the original Jira issue URL, lists
+comments and valid transitions, adds comments, transitions issues, and can emit
+the `jira.issueManualRun` automation trigger from an issue row.
+
+Jira hooks are available to UI, HTTP, automation, and Cloudx-contributed skills.
+They cover status checks, dashboard reads, JQL search, bounded all-page search,
+current user, metadata, issue create/update/get, comments, transitions, issue
+links, issue URLs, and one-shot polling. The helper skills call those hooks
+through the Cloudx server so the API token remains server-side.
+
+Polling is disabled by default. When enabled, Cloudx runs bounded polling and
+emits automation triggers for issue created, issue updated, issue transitioned,
+issue newly assigned, issue assigned to the configured account, comment created,
+and the manual play action from the Jira panel. Use project-key bounds or a
+narrow polling JQL filter before enabling polling on a large Jira site.
+
+## Automation Workflows
+
+Create an Automation tab to build saved graphs from triggers, plugin hooks,
+primitive steps, and converter steps. Jira issue rows can start a saved flow
+through the manual play action, while Jira polling can emit automation-only
+events for created, updated, transitioned, newly assigned, assigned-to-me, and
+comment-created issues. Poll-based Jira triggers are not exposed as public HTTP
+trigger IDs.
+
 ## Documentation Archive Service
 
 The documentation plugin talks to a local FastAPI indexer that owns the portable
@@ -288,7 +329,9 @@ In Cloudx, create a Documentation tab. The panel can:
 - Mark sources stale, revoked, superseded, or quarantined.
 - Remove a source from active search by marking it deleted.
 - Show archive logical/disk size totals, the dense-index runtime estimate, the
-  portable archive manifest, and rebuild the Turbovec index.
+  active document list, source chunks, extracted artifacts, and archive
+  export/import controls. Portable manifest inspection and Turbovec rebuild are
+  available through the documentation helper, plugin hooks, and indexer API.
 
 Documentation skills are synced automatically as CloudX system skills when the
 server starts. They use `CLOUDX_DOCUMENTATION_URL`, and Cloudx exports that URL
@@ -552,7 +595,14 @@ authorization, and process isolation.
 - `CLOUDX_DOCUMENTATION_RESPONSE_MAX_BYTES`: maximum indexer response size,
   default `8388608`.
 - `CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES`: browser documentation upload cap,
-  default `268435456`.
+  Cloudx server forwarding cap, and indexer multipart file cap, default
+  `268435456`.
+- `CLOUDX_DOCUMENTATION_IMPORT_UPLOAD_MAX_BYTES`: indexer multipart archive
+  import upload cap, default `1073741824`.
+- `CLOUDX_DOCUMENTATION_ALLOW_PRIVATE_URL_INGEST`: set to `true` only for
+  trusted local fixtures or private documentation networks. By default, URL
+  ingest rejects hosts resolving to loopback, private, link-local, or otherwise
+  non-public IP addresses, including redirect targets.
 - `CLOUDX_DOCUMENTATION_DATA_DIR`: portable documentation archive directory,
   default `.cloudx/documentation`.
 - `CLOUDX_TERMINAL_REPLAY_BYTES`: terminal replay buffer for reconnects and

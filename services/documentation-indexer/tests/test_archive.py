@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -1711,6 +1712,35 @@ def test_fastapi_upload_ingests_documentation_file(tmp_path: Path) -> None:
     assert result["citation"]["snapshotPath"].endswith("/uploaded-note.md")
 
 
+def test_fastapi_upload_rejects_oversized_documentation_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES", "4")
+    app = create_app(tmp_path / "archive")
+    client = TestClient(app)
+
+    response = client.post(
+        "/ingest/upload",
+        files={"file": ("uploaded-note.md", b"12345", "text/markdown")},
+    )
+
+    assert response.status_code == 413
+    assert "maximum size" in response.json()["detail"]
+
+
+def test_fastapi_archive_import_rejects_oversized_package(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLOUDX_DOCUMENTATION_IMPORT_UPLOAD_MAX_BYTES", "4")
+    app = create_app(tmp_path / "archive")
+    client = TestClient(app)
+
+    response = client.post(
+        "/archive/import/replace",
+        data={"confirmation": ARCHIVE_IMPORT_REPLACE_CONFIRMATION},
+        files={"file": ("archive.zip", b"12345", "application/zip")},
+    )
+
+    assert response.status_code == 413
+    assert "maximum size" in response.json()["detail"]
+
+
 def test_fastapi_path_ingest_rejects_relative_paths_from_service_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     service_cwd = tmp_path / "service"
     workspace = tmp_path / "workspace"
@@ -1758,6 +1788,13 @@ def test_url_fetch_rejects_unsupported_schemes_and_oversized_downloads() -> None
             fetch_url_bytes(server.url, 8)
     finally:
         server.stop()
+
+
+def test_url_fetch_rejects_private_network_without_explicit_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CLOUDX_DOCUMENTATION_ALLOW_PRIVATE_URL_INGEST", raising=False)
+
+    with pytest.raises(ArchiveError, match="non-public host"):
+        fetch_url_bytes("http://127.0.0.1:1/source.txt", 1024)
 
 
 def test_concurrent_mutations_serialize_index_rebuilds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2033,8 +2070,11 @@ class HtmlFixtureServer:
         self.server: ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
         self.url = ""
+        self._previous_private_url_ingest: str | None = None
 
     def start(self) -> None:
+        self._previous_private_url_ingest = os.environ.get("CLOUDX_DOCUMENTATION_ALLOW_PRIVATE_URL_INGEST")
+        os.environ["CLOUDX_DOCUMENTATION_ALLOW_PRIVATE_URL_INGEST"] = "true"
         html = self.html
 
         class Handler(BaseHTTPRequestHandler):
@@ -2058,3 +2098,7 @@ class HtmlFixtureServer:
             self.server.server_close()
         if self.thread:
             self.thread.join(timeout=5)
+        if self._previous_private_url_ingest is None:
+            os.environ.pop("CLOUDX_DOCUMENTATION_ALLOW_PRIVATE_URL_INGEST", None)
+        else:
+            os.environ["CLOUDX_DOCUMENTATION_ALLOW_PRIVATE_URL_INGEST"] = self._previous_private_url_ingest

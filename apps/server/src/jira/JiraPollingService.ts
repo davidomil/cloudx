@@ -9,8 +9,8 @@ interface StoredIssueSnapshot {
   updated?: string;
   status?: string;
   assigneeAccountId?: string;
-  assigneeEmailAddress?: string;
   commentIds?: string[];
+  lastSeenAt?: string;
 }
 
 interface JiraPollingState {
@@ -21,6 +21,13 @@ interface JiraPollingState {
   nextAllowedPollAt?: string;
   lastError?: string;
 }
+
+interface PendingJiraTrigger {
+  triggerId: string;
+  payload: Record<string, unknown>;
+}
+
+const POLLING_SNAPSHOT_RETENTION_FLOOR = 1000;
 
 export class JiraPollingService {
   private timer: NodeJS.Timeout | undefined;
@@ -99,9 +106,10 @@ export class JiraPollingService {
       }
       throw error;
     }
-    const nextState: JiraPollingState = { initialized: true, issues: {}, lastRunAt: startedAt, lastSuccessfulPollAt: new Date().toISOString() };
-    const emitted: string[] = [];
     const previousIssues = state.issues ?? {};
+    const nextIssues: Record<string, StoredIssueSnapshot> = { ...previousIssues };
+    const nextState: JiraPollingState = { initialized: true, issues: nextIssues, lastRunAt: startedAt, lastSuccessfulPollAt: new Date().toISOString() };
+    const pendingTriggers: PendingJiraTrigger[] = [];
     const detectedAt = new Date().toISOString();
     for (const issue of issues) {
       const previous = previousIssues[issue.key];
@@ -114,39 +122,38 @@ export class JiraPollingService {
         }
         throw error;
       }
-      nextState.issues![issue.key] = snapshotIssue(issue, comments);
+      nextIssues[issue.key] = snapshotIssue(issue, comments, detectedAt);
       if (!state.initialized) {
         continue;
       }
       if (!previous) {
-        await emitIssueTrigger(triggers, "jira.issueCreated", issue, detectedAt);
-        emitted.push("jira.issueCreated");
+        pendingTriggers.push(issueTrigger("jira.issueCreated", issue, detectedAt));
         if (config.assignmentsEnabled && isAssignedToPollingAccount(issue.assignee, account)) {
-          await emitIssueTrigger(triggers, "jira.issueAssignedToMe", issue, detectedAt, assignedToMeExtras(account));
-          emitted.push("jira.issueAssignedToMe");
+          pendingTriggers.push(issueTrigger("jira.issueAssignedToMe", issue, detectedAt, assignedToMeExtras(account)));
         }
         continue;
       }
       if (previous.updated !== issue.updated && previous.status === issue.status) {
-        await emitIssueTrigger(triggers, "jira.issueUpdated", issue, detectedAt, { changedFieldIds: ["updated"] });
-        emitted.push("jira.issueUpdated");
+        pendingTriggers.push(issueTrigger("jira.issueUpdated", issue, detectedAt, { changedFieldIds: ["updated"] }));
       }
       if (previous.status !== issue.status) {
-        await emitIssueTrigger(triggers, "jira.issueTransitioned", issue, detectedAt, { previousStatus: previous.status });
-        emitted.push("jira.issueTransitioned");
+        pendingTriggers.push(issueTrigger("jira.issueTransitioned", issue, detectedAt, { previousStatus: previous.status }));
       }
       if (config.assignmentsEnabled && previous.assigneeAccountId !== issue.assignee?.accountId && issue.assignee?.accountId) {
-        await emitIssueTrigger(triggers, "jira.issueNewlyAssigned", issue, detectedAt, { previousAssigneeAccountId: previous.assigneeAccountId });
-        emitted.push("jira.issueNewlyAssigned");
+        pendingTriggers.push(issueTrigger("jira.issueNewlyAssigned", issue, detectedAt, { previousAssigneeAccountId: previous.assigneeAccountId }));
         if (isAssignedToPollingAccount(issue.assignee, account)) {
-          await emitIssueTrigger(triggers, "jira.issueAssignedToMe", issue, detectedAt, assignedToMeExtras(account, previous));
-          emitted.push("jira.issueAssignedToMe");
+          pendingTriggers.push(issueTrigger("jira.issueAssignedToMe", issue, detectedAt, assignedToMeExtras(account, previous)));
         }
       }
       for (const comment of newComments(comments, previous.commentIds ?? [])) {
-        await triggers.emit("jira.commentCreated", jiraCommentEventPayload(issue, comment, detectedAt), { kind: "plugin", pluginId: JIRA_PLUGIN_ID });
-        emitted.push("jira.commentCreated");
+        pendingTriggers.push(commentTrigger(issue, comment, detectedAt));
       }
+    }
+    nextState.issues = retainedIssueSnapshots(nextIssues, Math.max(POLLING_SNAPSHOT_RETENTION_FLOOR, config.maxIssues * 20));
+    const emitted: string[] = [];
+    for (const event of pendingTriggers) {
+      await triggers.emit(event.triggerId, event.payload, { kind: "plugin", pluginId: JIRA_PLUGIN_ID });
+      emitted.push(event.triggerId);
     }
     await this.pluginData.write(JIRA_PLUGIN_ID, nextState);
     const finishedAt = new Date().toISOString();
@@ -174,14 +181,28 @@ export class JiraPollingService {
   }
 }
 
-function snapshotIssue(issue: JiraIssueSummary, comments: JiraCommentSummary[]): StoredIssueSnapshot {
+function snapshotIssue(issue: JiraIssueSummary, comments: JiraCommentSummary[], lastSeenAt: string): StoredIssueSnapshot {
   return {
     updated: issue.updated,
     status: issue.status,
     assigneeAccountId: issue.assignee?.accountId,
-    assigneeEmailAddress: issue.assignee?.emailAddress,
-    commentIds: comments.map((comment) => comment.id).filter(Boolean)
+    commentIds: comments.map((comment) => comment.id).filter(Boolean),
+    lastSeenAt
   };
+}
+
+function retainedIssueSnapshots(issues: Record<string, StoredIssueSnapshot>, maxSnapshots: number): Record<string, StoredIssueSnapshot> {
+  const entries = Object.entries(issues);
+  if (entries.length <= maxSnapshots) {
+    return issues;
+  }
+  return Object.fromEntries(entries
+    .sort((left, right) => comparableSnapshotTimestamp(right[1]).localeCompare(comparableSnapshotTimestamp(left[1])) || left[0].localeCompare(right[0]))
+    .slice(0, maxSnapshots));
+}
+
+function comparableSnapshotTimestamp(snapshot: StoredIssueSnapshot): string {
+  return snapshot.lastSeenAt ?? snapshot.updated ?? "";
 }
 
 function newComments(comments: JiraCommentSummary[], previousIds: string[]): JiraCommentSummary[] {
@@ -203,14 +224,16 @@ function isAssignedToPollingAccount(assignee: JiraUserSummary | undefined, accou
 function assignedToMeExtras(account: JiraPollingAccount | undefined, previous?: StoredIssueSnapshot): Record<string, unknown> {
   return {
     assigneeMatchedAccountId: account?.accountId,
-    assigneeMatchedEmailAddress: account?.emailAddress ?? account?.configuredEmail,
-    previousAssigneeAccountId: previous?.assigneeAccountId,
-    previousAssigneeEmailAddress: previous?.assigneeEmailAddress
+    previousAssigneeAccountId: previous?.assigneeAccountId
   };
 }
 
-async function emitIssueTrigger(triggers: TriggerRegistry, triggerId: string, issue: JiraIssueSummary, detectedAt: string, extras: Record<string, unknown> = {}): Promise<void> {
-  await triggers.emit(triggerId, jiraIssueEventPayload(triggerId, issue, detectedAt, extras), { kind: "plugin", pluginId: JIRA_PLUGIN_ID });
+function issueTrigger(triggerId: string, issue: JiraIssueSummary, detectedAt: string, extras: Record<string, unknown> = {}): PendingJiraTrigger {
+  return { triggerId, payload: jiraIssueEventPayload(triggerId, issue, detectedAt, extras) };
+}
+
+function commentTrigger(issue: JiraIssueSummary, comment: JiraCommentSummary, detectedAt: string): PendingJiraTrigger {
+  return { triggerId: "jira.commentCreated", payload: jiraCommentEventPayload(issue, comment, detectedAt) };
 }
 
 function sanitizeState(value: Record<string, unknown>): JiraPollingState {
@@ -232,8 +255,8 @@ function sanitizeIssueSnapshot(value: Record<string, unknown>): StoredIssueSnaps
     updated: typeof value.updated === "string" ? value.updated : undefined,
     status: typeof value.status === "string" ? value.status : undefined,
     assigneeAccountId: typeof value.assigneeAccountId === "string" ? value.assigneeAccountId : undefined,
-    assigneeEmailAddress: typeof value.assigneeEmailAddress === "string" ? value.assigneeEmailAddress : undefined,
-    commentIds: Array.isArray(value.commentIds) ? value.commentIds.filter((item): item is string => typeof item === "string") : []
+    commentIds: Array.isArray(value.commentIds) ? value.commentIds.filter((item): item is string => typeof item === "string") : [],
+    lastSeenAt: typeof value.lastSeenAt === "string" ? value.lastSeenAt : undefined
   };
 }
 

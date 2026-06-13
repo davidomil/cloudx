@@ -59,7 +59,7 @@ Runs only when the `documentation.aiEnrichmentEnabled` plugin setting is true an
 
 Source: `apps/web/src/ui/DocumentationPanel.tsx`
 
-Provides search, filters, ingest forms, invalidation buttons, manifest view, archive export/import controls, and index rebuild controls.
+Provides assisted answers, manual search, ingest forms, active document listing, source chunk and artifact inspection, invalidation buttons, and archive export/import controls. Portable manifest inspection and index rebuild are exposed through plugin hooks, the bundled documentation helper, and the local indexer API.
 
 ## Indexer API
 
@@ -122,7 +122,7 @@ When title is blank, path ingest uses the file name. When collection is blank, d
 
 ## URL Ingest
 
-`documentation.ingest.url` downloads a URL with redirects enabled and a 20 second timeout. The indexer records the original URL, final URL, content type, ETag, and last-modified header when those values are available.
+`documentation.ingest.url` downloads HTTP or HTTPS URLs with a 20 second timeout and validates each redirect target before it is fetched. By default, URL ingest rejects hosts that resolve to loopback, private, link-local, or otherwise non-public IP addresses. Set `CLOUDX_DOCUMENTATION_ALLOW_PRIVATE_URL_INGEST=true` only for trusted local fixtures or private documentation networks. The indexer records the original URL, final URL, content type, ETag, and last-modified header when those values are available.
 
 When title is blank, URL ingest uses the URL leaf or a YouTube video/playlist label. When collection is blank, normal URL ingest uses the URL host and YouTube ingest uses `youtube` unless the URL is a playlist.
 
@@ -242,7 +242,7 @@ Invalidation updates both the document row and its chunks, records an invalidati
 - `documentation.archive.import.merge`: `POST /archive/import/merge` or `POST /archive/import/merge/path`, safety `write`. Validates a ZIP package, imports missing stable documents, skips identical document IDs, reports document or URI conflicts, preserves invalidation events, and rebuilds the dense index.
 - `documentation.archive.import.replace`: `POST /archive/import/replace` or `POST /archive/import/replace/path`, safety `destructive`. Requires the exact `REPLACE_DOCUMENTATION_ARCHIVE` confirmation token, validates the ZIP package, moves the current archive root aside, installs the imported root, and rebuilds the dense index.
 
-The `DocumentationClient` defaults to `http://127.0.0.1:7820`, a 30 minute timeout, and an 8 MiB maximum response body. `CLOUDX_DOCUMENTATION_TIMEOUT_MS` sets the indexer request and AI enrichment timeout up to 12 hours for large PDF extraction or long media imports. `CLOUDX_DOCUMENTATION_RESPONSE_MAX_BYTES` sets the maximum indexer response size, and `CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES` sets the browser documentation upload cap. Failed service responses are converted into plain error messages when the response includes `detail`, `message`, or `error`.
+The `DocumentationClient` defaults to `http://127.0.0.1:7820`, a 30 minute timeout, and an 8 MiB maximum response body. `CLOUDX_DOCUMENTATION_TIMEOUT_MS` sets the indexer request and AI enrichment timeout up to 12 hours for large PDF extraction or long media imports. `CLOUDX_DOCUMENTATION_RESPONSE_MAX_BYTES` sets the maximum indexer response size, `CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES` sets the browser, server, and indexer documentation upload cap, and `CLOUDX_DOCUMENTATION_IMPORT_UPLOAD_MAX_BYTES` sets the indexer archive import upload cap. Failed service responses are converted into plain error messages when the response includes `detail`, `message`, or `error`.
 
 Binary upload is exposed through HTTP rather than a plugin hook because hook inputs are JSON-shaped. The browser route is `POST /api/documentation/upload` with an `application/octet-stream` body and metadata in query parameters. The indexer route is `POST /ingest/upload` with multipart form data. When AI enrichment is enabled, the same upload bytes are also passed to the enrichment service so media uploads can be transcribed and sampled before derived chunks are written by `POST /documents/{id}/enrich`.
 
@@ -263,7 +263,7 @@ In CloudX, create a Documentation tab. The panel gives a compact operational vie
 9. Mark search results `stale`, `revoked`, `superseded`, or `quarantined`.
 10. Remove a document from active search.
 11. Open full source documents from search results or the Active Documents list to inspect chunks, transcript text, table Markdown, and extracted artifact metadata. Large sources auto-load more chunks and artifacts as the source viewer reaches the end.
-12. Export the archive as a ZIP, import another archive by merge or confirmed replace, load the portable manifest, and rebuild the Turbovec index.
+12. Export the archive as a ZIP and import another archive by merge or confirmed replace. Portable manifest inspection and Turbovec rebuild are available through helper commands, plugin hooks, and the local indexer API.
 
 The UI defaults to active-document search, upload ingest, assisted-answer mode when AI assistance is available, and hybrid search under the hood. It shows AI-assistance state as a compact header icon. If AI is disabled, Answer mode is unavailable and the panel keeps manual search plus full source viewing. The Queue button snapshots the current form into a queued import and immediately clears the form so another source can be queued while the previous source is still downloading, transcribing, extracting, or enriching.
 
@@ -381,9 +381,9 @@ A realistic validation runner in `debug_tooling/documentation-validation/run_val
 - The dense embedding model is deterministic local hashing, not a semantic model from a remote embedding service.
 - Dense-only mode is diagnostic for this implementation. Use hybrid as the default user-facing recall mode.
 - Dense search is restricted to active chunks because only active chunks are loaded into Turbovec.
-- URL ingest supports only HTTP and HTTPS, performs direct fetches or YouTube media ingest, and does not crawl a site recursively.
+- URL ingest supports only HTTP and HTTPS, validates redirect targets before fetching them, blocks loopback/private/link-local/non-public IP targets by default, performs direct fetches or YouTube media ingest, and does not crawl a site recursively.
 - YouTube URL ingest stores timestamped transcript, metadata, selected slide-frame artifacts, and a visual sampling manifest. It runs ASR and the CPU-heavy visual scan concurrently, downloads a bounded video source once before local parallel slide scanning, and depends on live YouTube access, `yt-dlp`, FFmpeg, and the configured ASR backend. Faster-whisper is the default; Intel Arc acceleration requires the explicit `whisper-cpp` backend with a SYCL/OpenVINO-capable `whisper-cli` and visible `/dev/dri` GPU device access.
-- Browser uploads and URL downloads are capped at 256 MiB.
+- Browser documentation uploads, server forwarding, indexer upload reads, and URL downloads are capped at 256 MiB by default. Archive import multipart uploads are capped at 1 GiB by default.
 - PDF graph and flowchart extraction preserves rendered visual artifacts, but it does not OCR labels or infer graph semantics.
 - Schematic-aware ingest is Phase 1 only: it classifies schematic-like visual artifacts, writes searchable descriptions and schema-ready JSON, and leaves `analysisOutputs` empty. It does not run OCR, component detection, connectivity mapping, SPICE export, or netlist generation.
 - AI enrichment is enabled by default as a Documentation plugin setting, but it still requires global AI control. If either setting is disabled, assisted answers and post-ingest AI spans are unavailable; manual source-text search and full source inspection still work.

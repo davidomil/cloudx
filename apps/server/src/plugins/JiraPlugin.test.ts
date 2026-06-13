@@ -58,12 +58,13 @@ describe("JiraPlugin", () => {
       properties: {
         issueKey: { type: "string" },
         issueUrl: { type: "string" },
-        summary: { type: "string" },
-        assigneeEmailAddress: { type: "string" },
-        issue: { type: "object", "x-cloudx-connectable": false }
+        summary: { type: "string" }
       },
       required: expect.arrayContaining(["eventId", "issueKey", "issueUrl", "summary", "detectedAt"])
     });
+    expect(descriptor.triggers?.find((trigger) => trigger.id === "jira.issueUpdated")?.exposures).not.toContain("http");
+    expect(descriptor.triggers?.find((trigger) => trigger.id === "jira.issueUpdated")?.payloadSchema.properties).not.toHaveProperty("assigneeEmailAddress");
+    expect(descriptor.triggers?.find((trigger) => trigger.id === "jira.issueUpdated")?.payloadSchema.properties).not.toHaveProperty("issue");
     expect(descriptor.hooks?.find((hook) => hook.id === "jira.issues.searchAll")?.outputSchema).toMatchObject({
       properties: {
         issues: { type: "array" },
