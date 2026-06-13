@@ -262,6 +262,14 @@ events for created, updated, transitioned, newly assigned, assigned-to-me, and
 comment-created issues. Poll-based Jira triggers are not exposed as public HTTP
 trigger IDs.
 
+## Codex Terminal Image Paste
+
+Built-in Codex terminal tabs accept pasted PNG, JPEG, WebP, and GIF clipboard
+images. Cloudx uploads each pasted image into `.cloudx/pasted-images/` under the
+tab workspace and inserts an `@.cloudx/pasted-images/...` reference into the
+Codex prompt so the assistant can read the saved image. Standard shell terminal
+tabs keep normal paste behavior and do not intercept image files.
+
 ## Documentation Archive Service
 
 The documentation plugin talks to a local FastAPI indexer that owns the portable
@@ -340,8 +348,8 @@ also receive `CLOUDX_SERVER_URL`; the bundled documentation helper needs that
 server URL to resolve relative `ingest-path` arguments from the active
 workspace. With only `CLOUDX_DOCUMENTATION_URL`, pass an absolute local path.
 
-Render the memory plugin guide PDF from its Quarto source after documentation
-changes:
+Render the memory plugin guide PDF from its Quarto source locally when a PDF
+artifact is needed:
 
 ```bash
 npm run docs:memory:pdf

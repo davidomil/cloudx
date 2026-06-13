@@ -172,7 +172,100 @@ describe("DocumentationEnrichmentService", () => {
         evidence: { artifactCount: 0, batchCount: 1, batchItemCounts: [1], chunkCount: 1, keyframeCount: 0, mediaTranscriptChars: 0 }
       }
     });
+    expect(client.getDocument).toHaveBeenCalledWith({
+      documentId: "doc-1",
+      chunkOffset: 0,
+      chunkLimit: 100,
+      chunkTextMaxChars: 4000,
+      artifactOffset: 0,
+      artifactLimit: 100,
+      includeEnrichments: false,
+      includeEvents: false
+    });
     expect(runner.run).toHaveBeenCalledWith(expect.stringContaining("documentation-enrich-visuals"), { model: DEFAULT_DOCUMENTATION_IMAGE_ANALYSIS_MODEL });
+  });
+
+  it("pages enrichment document detail requests without dropping later source chunks", async () => {
+    const runner = fakeRunner({
+      summary: "paged",
+      spans: [{ locator: "ai:paged", text: "Paged enrichment saw every chunk." }],
+      metadata: [],
+      warnings: []
+    });
+    const chunks = Array.from({ length: 125 }, (_unused, index) => ({
+      chunk_id: index + 1,
+      locator: `page ${index + 1}`,
+      text: index === 124 ? "PAGED-LAST-CHUNK remains available." : `Paged source chunk ${index + 1}.`,
+      chunk_origin: "source"
+    }));
+    const client = fakeDocumentationClient();
+    client.getDocument.mockImplementation(async (input: Record<string, unknown>) => {
+      const chunkOffset = typeof input.chunkOffset === "number" ? input.chunkOffset : 0;
+      const chunkLimit = typeof input.chunkLimit === "number" ? input.chunkLimit : chunks.length;
+      const chunkPage = chunks.slice(chunkOffset, chunkOffset + chunkLimit);
+      return {
+        document: {
+          document_id: "doc-1",
+          title: "Power datasheet",
+          source_type: "datasheet",
+          uri: "mock://power",
+          collection: "board",
+          content_sha256: "abc",
+          snapshot_path: "snapshots/abc/power.pdf",
+          chunks: chunkPage,
+          artifacts: [],
+          chunkWindow: {
+            offset: chunkOffset,
+            limit: chunkLimit,
+            total: chunks.length,
+            hasMore: chunkOffset + chunkLimit < chunks.length
+          },
+          artifactWindow: {
+            offset: 0,
+            limit: 0,
+            total: 0,
+            hasMore: false
+          }
+        }
+      };
+    });
+    const service = new DocumentationEnrichmentService({
+      client,
+      config: fakeConfig(true),
+      rulesSkills: fakeRulesSkills(),
+      runner
+    });
+
+    await service.enrichIngestResponse({ document: { documentId: "doc-1" } });
+
+    expect(client.getDocument.mock.calls.map(([input]) => input)).toEqual([
+      {
+        documentId: "doc-1",
+        chunkOffset: 0,
+        chunkLimit: 100,
+        chunkTextMaxChars: 4000,
+        artifactOffset: 0,
+        artifactLimit: 100,
+        includeEnrichments: false,
+        includeEvents: false
+      },
+      {
+        documentId: "doc-1",
+        chunkOffset: 100,
+        chunkLimit: 100,
+        chunkTextMaxChars: 4000,
+        artifactOffset: 0,
+        artifactLimit: 0,
+        includeEnrichments: false,
+        includeEvents: false
+      }
+    ]);
+    expect(runner.run.mock.calls.some(([prompt]) => prompt.includes("PAGED-LAST-CHUNK"))).toBe(true);
+    expect(client.enrichDocument).toHaveBeenCalledWith(expect.objectContaining({
+      payload: expect.objectContaining({
+        evidence: expect.objectContaining({ chunkCount: 125 })
+      })
+    }));
   });
 
   it("uses configured models independently for visual enrichment, text enrichment, and assisted answers", async () => {
@@ -665,6 +758,7 @@ function fakeAsr(text: string): AsrClient & { transcribe: ReturnType<typeof vi.f
 }
 
 function fakeDocumentationClient(documentOverrides: Record<string, unknown> = {}, options: { archiveRoot?: string } = {}): DocumentationClient & {
+  getDocument: ReturnType<typeof vi.fn>;
   enrichDocument: ReturnType<typeof vi.fn>;
   search: ReturnType<typeof vi.fn>;
 } {
@@ -697,6 +791,7 @@ function fakeDocumentationClient(documentOverrides: Record<string, unknown> = {}
     })),
     enrichDocument: vi.fn(async () => ({ document: { document_id: "doc-1" } }))
   } as unknown as DocumentationClient & {
+    getDocument: ReturnType<typeof vi.fn>;
     enrichDocument: ReturnType<typeof vi.fn>;
     search: ReturnType<typeof vi.fn>;
   };

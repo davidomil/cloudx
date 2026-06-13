@@ -58,6 +58,9 @@ const ENRICHMENT_SCHEMA_PATH = fileURLToPath(new URL("./documentation-enrichment
 const ANSWER_SCHEMA_PATH = fileURLToPath(new URL("./documentation-answer.schema.json", import.meta.url));
 const ENRICHMENT_BATCH_TARGET_CHARS = 60_000;
 const ENRICHMENT_IMAGE_ATTACHMENT_BATCH_SIZE = 8;
+const ENRICHMENT_DOCUMENT_CHUNK_PAGE_SIZE = 100;
+const ENRICHMENT_DOCUMENT_ARTIFACT_PAGE_SIZE = 100;
+const ENRICHMENT_CHUNK_TEXT_MAX_CHARS = 4_000;
 const ANSWER_DOCUMENT_TARGET_CHARS = 40_000;
 const ANSWER_EVIDENCE_TARGET_CHARS = 90_000;
 const ANSWER_CHUNK_CONTEXT = 1;
@@ -183,7 +186,7 @@ export class DocumentationEnrichmentService {
   private async enrichDocument(document: IngestedDocumentRef, source: DocumentationEnrichmentSource): Promise<Record<string, unknown>> {
     const skillIds = configuredSkillIds(this.options.config.getPluginConfig(DOCUMENTATION_PLUGIN_ID)[DOCUMENTATION_AI_ENRICHMENT_SKILLS_KEY]);
     const skills = await this.resolveSkills(skillIds);
-    const fullDocument = getRecord((await this.options.client.getDocument({ documentId: document.documentId })).document, "document");
+    const fullDocument = await this.enrichmentDocument(document.documentId);
     const cleanup: Array<() => Promise<void>> = [];
     try {
       const mediaEvidence = await this.prepareMediaEvidence(source, cleanup);
@@ -230,6 +233,53 @@ export class DocumentationEnrichmentService {
     } finally {
       await Promise.allSettled(cleanup.map((operation) => operation()));
     }
+  }
+
+  private async enrichmentDocument(documentId: string): Promise<Record<string, unknown>> {
+    let chunkOffset = 0;
+    let artifactOffset = 0;
+    let needsChunks = true;
+    let needsArtifacts = true;
+    let document: Record<string, unknown> | undefined;
+    const chunks: Record<string, unknown>[] = [];
+    const artifacts: Record<string, unknown>[] = [];
+    while (!document || needsChunks || needsArtifacts) {
+      const loadChunks = !document || needsChunks;
+      const loadArtifacts = !document || needsArtifacts;
+      const nextDocument = getRecord((await this.options.client.getDocument({
+        documentId,
+        chunkOffset: loadChunks ? chunkOffset : 0,
+        chunkLimit: loadChunks ? ENRICHMENT_DOCUMENT_CHUNK_PAGE_SIZE : 0,
+        chunkTextMaxChars: ENRICHMENT_CHUNK_TEXT_MAX_CHARS,
+        artifactOffset: loadArtifacts ? artifactOffset : 0,
+        artifactLimit: loadArtifacts ? ENRICHMENT_DOCUMENT_ARTIFACT_PAGE_SIZE : 0,
+        includeEnrichments: false,
+        includeEvents: false
+      })).document, "document");
+      document ??= nextDocument;
+      if (loadChunks) {
+        const nextChunks = recordsArray(nextDocument.chunks);
+        chunks.push(...nextChunks);
+        needsChunks = windowHasMore(nextDocument.chunkWindow);
+        if (needsChunks && nextChunks.length === 0) {
+          throw new Error("Documentation enrichment chunk window did not advance.");
+        }
+        chunkOffset = nextWindowOffset(nextDocument.chunkWindow, chunkOffset, nextChunks.length);
+      }
+      if (loadArtifacts) {
+        const nextArtifacts = recordsArray(nextDocument.artifacts);
+        artifacts.push(...nextArtifacts);
+        needsArtifacts = windowHasMore(nextDocument.artifactWindow);
+        if (needsArtifacts && nextArtifacts.length === 0) {
+          throw new Error("Documentation enrichment artifact window did not advance.");
+        }
+        artifactOffset = nextWindowOffset(nextDocument.artifactWindow, artifactOffset, nextArtifacts.length);
+      }
+    }
+    if (!document) {
+      throw new Error("Documentation enrichment could not load document details.");
+    }
+    return { ...document, chunks, artifacts, enrichments: [], events: [] };
   }
 
   private async resolveSkills(skillIds: string[]): Promise<CloudxSkill[]> {
@@ -639,6 +689,19 @@ function selectAnswerChunks(chunks: Record<string, unknown>[], results: AnswerRe
 
 function compactRecord(values: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== undefined && !(Array.isArray(value) && value.length === 0) && value !== ""));
+}
+
+function windowHasMore(value: unknown): boolean {
+  return isRecord(value) && value.hasMore === true;
+}
+
+function nextWindowOffset(value: unknown, fallbackOffset: number, count: number): number {
+  if (!isRecord(value)) {
+    return fallbackOffset + count;
+  }
+  const offset = typeof value.offset === "number" ? value.offset : fallbackOffset;
+  const limit = typeof value.limit === "number" ? value.limit : count;
+  return offset + Math.max(limit, count);
 }
 
 function buildEnrichmentPrompt(skills: CloudxSkill[], evidence: EnrichmentEvidenceBatch): string {

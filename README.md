@@ -38,7 +38,8 @@ names, and dashboard tokens.
 - tmux-like panes with movable plugin tabs.
 - Layout templates that save the current pane/tab arrangement and reopen it on a
   different project path.
-- Codex terminal and standard shell terminal plugins.
+- Codex terminal and standard shell terminal plugins, including clipboard image
+  paste into Codex tabs as workspace-backed `@` file references.
 - File browser plugin with voice-exposed read/write actions, active file search,
   optional Git setup controls, changed-file badges in the tree, and rendered
   per-file diffs.
@@ -129,6 +130,13 @@ converters into saved graphs. It can run from manual UI triggers such as Jira's
 issue play action or from plugin-owned triggers such as Jira polling events.
 Poll-based Jira triggers are exposed only to plugins and automation; external
 HTTP callers use the explicit manual Jira trigger instead.
+
+## Codex Image Paste
+
+Codex terminal tabs accept pasted PNG, JPEG, WebP, and GIF clipboard images.
+Cloudx saves each image under `.cloudx/pasted-images/` in the tab workspace and
+inserts an `@.cloudx/pasted-images/...` reference into the Codex prompt. Standard
+shell terminal tabs do not intercept image paste.
 
 ## Quick Start
 
@@ -250,7 +258,8 @@ up or move `.cloudx/documentation` or the directory named by
 `CLOUDX_DOCUMENTATION_DATA_DIR`. After changing the directory, restart the
 indexer and verify `/stats` reports `archiveLocality.ok: true`.
 
-Render the memory plugin PDF guide after documentation changes:
+Render the memory plugin guide PDF locally after documentation changes when a
+PDF artifact is needed:
 
 ```bash
 npm run docs:memory:pdf
