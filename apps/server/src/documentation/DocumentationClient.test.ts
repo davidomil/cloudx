@@ -75,6 +75,26 @@ describe("DocumentationClient", () => {
     expect(requestUrl).toBe("/docs/documents/doc-1?token=local&chunkOffset=75&chunkLimit=25&chunkTextMaxChars=4000&artifactOffset=100&artifactLimit=50");
   });
 
+  it("forwards selected document chunk ids with context", async () => {
+    let requestUrl = "";
+    const url = await startServer((request, response) => {
+      requestUrl = request.url ?? "";
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ document: { documentId: "doc-1", chunks: [] } }));
+    });
+    const client = new DocumentationClient(`${url}/docs/?token=local`);
+
+    await client.getDocument({
+      documentId: "doc-1",
+      chunkIds: [101, 102],
+      chunkContext: 1,
+      chunkTextMaxChars: 4000,
+      artifactLimit: 0
+    });
+
+    expect(requestUrl).toBe("/docs/documents/doc-1?token=local&chunkIds=101%2C102&chunkContext=1&chunkTextMaxChars=4000&artifactLimit=0");
+  });
+
   it("fetches document artifact bytes", async () => {
     let requestUrl = "";
     const url = await startServer((request, response) => {

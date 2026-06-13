@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import tempfile
 import threading
 from pathlib import Path
@@ -169,6 +170,8 @@ def create_app(root: str | Path | None = None) -> FastAPI:
         document_id: str,
         chunk_offset: Annotated[int | None, Query(alias="chunkOffset", ge=0)] = None,
         chunk_limit: Annotated[int | None, Query(alias="chunkLimit", ge=0)] = None,
+        chunk_ids: Annotated[str | None, Query(alias="chunkIds")] = None,
+        chunk_context: Annotated[int | None, Query(alias="chunkContext", ge=0)] = None,
         chunk_text_max_chars: Annotated[int | None, Query(alias="chunkTextMaxChars", ge=0)] = None,
         artifact_offset: Annotated[int | None, Query(alias="artifactOffset", ge=0)] = None,
         artifact_limit: Annotated[int | None, Query(alias="artifactLimit", ge=0)] = None,
@@ -179,6 +182,8 @@ def create_app(root: str | Path | None = None) -> FastAPI:
                     document_id,
                     chunk_offset=chunk_offset,
                     chunk_limit=chunk_limit,
+                    chunk_ids=parse_chunk_ids(chunk_ids),
+                    chunk_context=chunk_context,
                     chunk_text_max_chars=chunk_text_max_chars,
                     artifact_offset=artifact_offset,
                     artifact_limit=artifact_limit,
@@ -344,6 +349,20 @@ def handle_archive_error(operation):
         return operation()
     except ArchiveError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+def parse_chunk_ids(value: str | None) -> list[int] | None:
+    if value is None:
+        return None
+    chunk_ids = []
+    for part in value.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if not re.fullmatch(r"[1-9]\d*", token):
+            raise ArchiveError("chunkIds must be a comma-separated list of positive integers.")
+        chunk_ids.append(int(token))
+    return chunk_ids or None
 
 
 async def uploaded_archive_package(file: UploadFile, archive_root: Path) -> Path:

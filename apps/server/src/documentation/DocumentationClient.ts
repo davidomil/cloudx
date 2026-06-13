@@ -105,6 +105,8 @@ export class DocumentationClient {
     const params = new URLSearchParams();
     appendOptionalQueryNumber(params, "chunkOffset", input.chunkOffset);
     appendOptionalQueryNumber(params, "chunkLimit", input.chunkLimit);
+    appendOptionalQueryIntegerList(params, "chunkIds", input.chunkIds);
+    appendOptionalQueryNumber(params, "chunkContext", input.chunkContext);
     appendOptionalQueryNumber(params, "chunkTextMaxChars", input.chunkTextMaxChars);
     appendOptionalQueryNumber(params, "artifactOffset", input.artifactOffset);
     appendOptionalQueryNumber(params, "artifactLimit", input.artifactLimit);
@@ -535,6 +537,16 @@ function appendOptionalFormBoolean(form: FormData, name: string, value: boolean 
 function appendOptionalQueryNumber(params: URLSearchParams, name: string, value: unknown): void {
   if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
     params.set(name, String(value));
+  }
+}
+
+function appendOptionalQueryIntegerList(params: URLSearchParams, name: string, value: unknown): void {
+  if (!Array.isArray(value)) {
+    return;
+  }
+  const integers = value.filter((candidate): candidate is number => typeof candidate === "number" && Number.isSafeInteger(candidate) && candidate > 0);
+  if (integers.length > 0) {
+    params.set(name, integers.join(","));
   }
 }
 

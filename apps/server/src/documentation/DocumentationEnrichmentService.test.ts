@@ -105,6 +105,13 @@ describe("DocumentationEnrichmentService", () => {
     const answer = await service.answerQuestion({ question: "How do I bake brownies?", limit: 5, mode: "hybrid" });
 
     expect(client.search).toHaveBeenCalledWith({ query: "How do I bake brownies?", limit: 5, mode: "hybrid" });
+    expect(client.getDocument).toHaveBeenCalledWith({
+      documentId: "doc-1",
+      chunkIds: [11],
+      chunkContext: 1,
+      chunkTextMaxChars: 4000,
+      artifactLimit: 0
+    });
     expect(runner.run).toHaveBeenCalledWith(
       expect.stringContaining("Mix cocoa, sugar, eggs, and flour"),
       expect.objectContaining({ outputPrefix: "cloudx-doc-answer-", taskLabel: "documentation answer", model: "gpt-test" })

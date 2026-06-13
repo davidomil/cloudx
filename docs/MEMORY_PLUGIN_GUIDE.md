@@ -432,13 +432,12 @@ enrichment.
 
 `documentation.answer` builds on this search flow for the browser/API
 assisted-answer option instead of replacing source search. It answers a
-user question by retrieving the highest-value chunks, opening source
-documents for those chunks, and asking Codex to synthesize only from
-selected evidence. Small matched documents are eligible to be included
-as a whole; larger documents use the matched chunks and nearby source
-context. The answer response includes plaintext, semantic HTML for the
-panel, warnings when evidence is incomplete, citations, model name, and
-the search results used to build the prompt.
+user question by retrieving the highest-value chunks, opening only the
+matched source chunks plus a small neighboring context window, and asking
+Codex to synthesize only from selected evidence. The answer response
+includes plaintext, semantic HTML for the panel, warnings when evidence
+is incomplete, citations, model name, and the search results used to
+build the prompt.
 
 # State And Invalidation
 
@@ -473,7 +472,10 @@ audit and explicit non-active searches.
 - `documentation.documents.list`: `GET /documents`. Lists documents and
   defaults to active state.
 - `documentation.documents.get`: `GET /documents/{id}`. Fetches one
-  document with chunks and invalidation history.
+  document with chunks and invalidation history. Source chunks can be
+  paged with `chunkOffset`/`chunkLimit` or selected with `chunkIds` plus
+  `chunkContext`; callers can bound returned text with
+  `chunkTextMaxChars`.
 - `documentation.search`: `POST /search`. Searches the archive and is
   exposed to plugin, UI, HTTP, automation, and voice.
 - `documentation.answer`: UI/HTTP assisted-answer option. It searches

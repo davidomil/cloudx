@@ -773,6 +773,33 @@ def test_document_detail_supports_chunk_windows_and_truncation(tmp_path: Path) -
     assert document["artifactWindow"] == {"offset": 0, "limit": 0, "total": 0, "hasMore": False}
 
 
+def test_document_detail_supports_selected_chunks_with_context(tmp_path: Path) -> None:
+    app = create_app(tmp_path / "selected-chunks-archive")
+    client = TestClient(app)
+    text = "\n\n".join(f"Section {index} " + "selected " * 260 for index in range(5))
+    ingest_response = client.post("/ingest/text", json={"title": "Selected chunk source", "text": text})
+    document_id = ingest_response.json()["document"]["documentId"]
+    full_document = client.get(f"/documents/{document_id}", params={"artifactLimit": 0}).json()["document"]
+    chunk_ids = [chunk["chunk_id"] for chunk in full_document["chunks"]]
+
+    response = client.get(
+        f"/documents/{document_id}",
+        params={
+            "chunkIds": str(chunk_ids[2]),
+            "chunkContext": 1,
+            "chunkTextMaxChars": 40,
+            "artifactLimit": 0,
+        },
+    )
+
+    assert response.status_code == 200
+    document = response.json()["document"]
+    assert [chunk["chunk_id"] for chunk in document["chunks"]] == chunk_ids[1:4]
+    assert all(chunk["textTruncated"] is True for chunk in document["chunks"])
+    assert document["chunkWindow"] == {"offset": 0, "limit": 3, "total": len(chunk_ids), "hasMore": True}
+    assert document["artifacts"] == []
+
+
 def test_youtube_keyframe_spans_include_timestamped_transcript_context() -> None:
     keyframes = [
         {

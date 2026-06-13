@@ -138,6 +138,8 @@ export class DocumentationPlugin implements WorkspacePlugin {
         documentId: { type: "string" },
         chunkOffset: { type: "number" },
         chunkLimit: { type: "number" },
+        chunkIds: { type: "array", items: { type: "number" } },
+        chunkContext: { type: "number" },
         chunkTextMaxChars: { type: "number" },
         artifactOffset: { type: "number" },
         artifactLimit: { type: "number" }

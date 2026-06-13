@@ -202,7 +202,7 @@ The search API accepts:
 
 The result payload includes the chunk ID, document ID, title, source type, URI, locator, snippet, `chunkOrigin`, optional `enrichmentId`, fused score, optional dense and lexical scores, and citation metadata with the content SHA and snapshot path. That makes search results usable as source-grounded references instead of free-floating text, while still flagging whether a hit came from direct source extraction or AI enrichment.
 
-`documentation.answer` builds on this search flow for the browser/API assisted-answer option instead of replacing source search. It answers a user question by retrieving the highest-value chunks, opening source documents for those chunks, and asking Codex to synthesize only from selected evidence. Small matched documents are eligible to be included as a whole; larger documents use the matched chunks and nearby source context. The answer response includes plaintext, semantic HTML for the panel, warnings when evidence is incomplete, citations, model name, and the search results used to build the prompt.
+`documentation.answer` builds on this search flow for the browser/API assisted-answer option instead of replacing source search. It answers a user question by retrieving the highest-value chunks, opening only the matched source chunks plus a small neighboring context window, and asking Codex to synthesize only from selected evidence. The answer response includes plaintext, semantic HTML for the panel, warnings when evidence is incomplete, citations, model name, and the search results used to build the prompt.
 
 # State And Invalidation
 
@@ -226,7 +226,7 @@ Invalidation updates both the document row and its chunks, records an invalidati
 - `documentation.stats`: `GET /stats`. Returns document and chunk counts plus portable paths, `archiveSize` storage/runtime totals, and `archiveLocality`.
 - `documentation.portableManifest`: `GET /portable-manifest`. Returns the complete archive file manifest plus the same `archiveSize` totals.
 - `documentation.documents.list`: `GET /documents`. Lists documents and defaults to active state.
-- `documentation.documents.get`: `GET /documents/{id}`. Fetches one document with chunks and invalidation history.
+- `documentation.documents.get`: `GET /documents/{id}`. Fetches one document with chunks and invalidation history. Source chunks can be paged with `chunkOffset`/`chunkLimit` or selected with `chunkIds` plus `chunkContext`; callers can bound returned text with `chunkTextMaxChars`.
 - `documentation.search`: `POST /search`. Searches the archive and is exposed to plugin, UI, HTTP, automation, and voice.
 - `documentation.answer`: UI/HTTP assisted-answer option. It searches the archive, opens source evidence, and returns a source-grounded AI answer when global AI control and Documentation AI enrichment are enabled. Codex-facing skills use `documentation.search` plus `documentation.documents.get` directly so Codex can inspect sources itself.
 

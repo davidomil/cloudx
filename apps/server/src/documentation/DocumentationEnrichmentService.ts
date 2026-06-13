@@ -60,6 +60,8 @@ const ENRICHMENT_BATCH_TARGET_CHARS = 60_000;
 const ENRICHMENT_IMAGE_ATTACHMENT_BATCH_SIZE = 8;
 const ANSWER_DOCUMENT_TARGET_CHARS = 40_000;
 const ANSWER_EVIDENCE_TARGET_CHARS = 90_000;
+const ANSWER_CHUNK_CONTEXT = 1;
+const ANSWER_CHUNK_TEXT_MAX_CHARS = 4_000;
 const MEDIA_TOOL_TIMEOUT_MS = 30 * 60 * 1000;
 const TRANSCRIPT_SEGMENT_TARGET_CHARS = 12_000;
 const MEDIA_SCENE_KEYFRAME_FILTER = "fps=1,select='eq(n,0)+gt(scene,0.08)',showinfo,scale=960:-2:flags=fast_bilinear";
@@ -248,9 +250,19 @@ export class DocumentationEnrichmentService {
     const resultGroups = groupAnswerResults(results);
     let evidenceChars = 0;
     for (const [documentId, documentResults] of resultGroups) {
+      const chunkIds = answerChunkIds(documentResults);
+      if (chunkIds.length === 0) {
+        continue;
+      }
       let document = documents.get(documentId);
       if (!document) {
-        document = getRecord((await this.options.client.getDocument({ documentId })).document, "document");
+        document = getRecord((await this.options.client.getDocument({
+          documentId,
+          chunkIds,
+          chunkContext: ANSWER_CHUNK_CONTEXT,
+          chunkTextMaxChars: ANSWER_CHUNK_TEXT_MAX_CHARS,
+          artifactLimit: 0
+        })).document, "document");
         documents.set(documentId, document);
       }
       for (const chunk of selectAnswerChunks(recordsArray(document.chunks), documentResults)) {
@@ -585,6 +597,10 @@ function groupAnswerResults(results: Record<string, unknown>[]): Map<string, Ans
     groups.set(documentId, group);
   }
   return groups;
+}
+
+function answerChunkIds(results: AnswerResultRef[]): number[] {
+  return [...new Set(results.map((result) => result.chunkId).filter((chunkId): chunkId is number => typeof chunkId === "number"))];
 }
 
 function selectAnswerChunks(chunks: Record<string, unknown>[], results: AnswerResultRef[]): AnswerChunkRef[] {

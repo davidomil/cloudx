@@ -83,6 +83,8 @@ MAX_URL_REDIRECTS = 10
 ACTIVE_STATE = "active"
 DOCUMENT_LIST_DEFAULT_LIMIT = 50
 DOCUMENT_LIST_MAX_LIMIT = 200
+DOCUMENT_DETAIL_MAX_CHUNK_IDS = 100
+DOCUMENT_DETAIL_MAX_CHUNK_CONTEXT = 5
 EXCLUDED_STATES = {"stale", "superseded", "revoked", "quarantined", "deleted"}
 VIDEO_SCAN_FPS = 1
 VIDEO_SEGMENT_SECONDS = 5 * 60
@@ -494,6 +496,8 @@ class DocumentationArchive:
         *,
         chunk_offset: int | None = None,
         chunk_limit: int | None = None,
+        chunk_ids: list[int] | None = None,
+        chunk_context: int | None = None,
         chunk_text_max_chars: int | None = None,
         artifact_offset: int | None = None,
         artifact_limit: int | None = None,
@@ -501,6 +505,10 @@ class DocumentationArchive:
         chunk_offset = normalized_window_value(chunk_offset, "chunk_offset")
         artifact_offset = normalized_window_value(artifact_offset, "artifact_offset")
         chunk_limit = normalized_window_value(chunk_limit, "chunk_limit") if chunk_limit is not None else None
+        chunk_ids = normalized_chunk_ids(chunk_ids)
+        chunk_context = normalized_chunk_context(chunk_context)
+        if chunk_ids is not None and (chunk_offset != 0 or chunk_limit is not None):
+            raise ArchiveError("chunkIds cannot be combined with chunkOffset or chunkLimit.")
         artifact_limit = normalized_window_value(artifact_limit, "artifact_limit") if artifact_limit is not None else None
         chunk_text_max_chars = normalized_window_value(chunk_text_max_chars, "chunk_text_max_chars") if chunk_text_max_chars is not None else None
         with self._connect() as db:
@@ -508,12 +516,35 @@ class DocumentationArchive:
             if not document:
                 raise ArchiveError(f"Unknown document: {document_id}")
             chunk_total = int(db.execute("SELECT COUNT(*) FROM chunks WHERE document_id = ?", (document_id,)).fetchone()[0])
-            chunk_sql = "SELECT chunk_id, locator, text, state, chunk_origin, enrichment_id FROM chunks WHERE document_id = ? ORDER BY chunk_id"
-            chunk_params: list[str | int] = [document_id]
-            if chunk_limit is not None:
-                chunk_sql += " LIMIT ? OFFSET ?"
-                chunk_params.extend([chunk_limit, chunk_offset])
-            chunks = db.execute(chunk_sql, chunk_params).fetchall()
+            if chunk_ids is None:
+                chunk_sql = "SELECT chunk_id, locator, text, state, chunk_origin, enrichment_id FROM chunks WHERE document_id = ? ORDER BY chunk_id"
+                chunk_params: list[str | int] = [document_id]
+                if chunk_limit is not None:
+                    chunk_sql += " LIMIT ? OFFSET ?"
+                    chunk_params.extend([chunk_limit, chunk_offset])
+                chunks = db.execute(chunk_sql, chunk_params).fetchall()
+                chunk_window = window_metadata(chunk_offset, chunk_limit, chunk_total)
+            else:
+                selected_ids = selected_chunk_ids_with_context(db, document_id, chunk_ids, chunk_context)
+                if selected_ids:
+                    placeholders = ", ".join("?" for _ in selected_ids)
+                    chunks = db.execute(
+                        f"""
+                        SELECT chunk_id, locator, text, state, chunk_origin, enrichment_id
+                        FROM chunks
+                        WHERE document_id = ? AND chunk_id IN ({placeholders})
+                        ORDER BY chunk_id
+                        """,
+                        [document_id, *selected_ids],
+                    ).fetchall()
+                else:
+                    chunks = []
+                chunk_window = {
+                    "offset": 0,
+                    "limit": len(chunks),
+                    "total": chunk_total,
+                    "hasMore": len(chunks) < chunk_total,
+                }
             enrichments = db.execute(
                 "SELECT * FROM document_enrichments WHERE document_id = ? ORDER BY enrichment_id DESC",
                 (document_id,),
@@ -524,7 +555,7 @@ class DocumentationArchive:
             ).fetchall()
         result = dict(document)
         result["chunks"] = [document_chunk_dict(row, chunk_text_max_chars) for row in chunks]
-        result["chunkWindow"] = window_metadata(chunk_offset, chunk_limit, chunk_total)
+        result["chunkWindow"] = chunk_window
         result["enrichments"] = [dict(row) for row in enrichments]
         result["events"] = [dict(row) for row in events]
         artifact_window = self.document_artifact_window(document_id, offset=artifact_offset, limit=artifact_limit)
@@ -2053,6 +2084,43 @@ def normalized_window_value(value: int | None, name: str) -> int:
     if not isinstance(value, int) or value < 0:
         raise ArchiveError(f"{name} must be a non-negative integer.")
     return value
+
+
+def normalized_chunk_ids(chunk_ids: list[int] | None) -> list[int] | None:
+    if chunk_ids is None:
+        return None
+    unique: list[int] = []
+    seen: set[int] = set()
+    for chunk_id in chunk_ids:
+        if type(chunk_id) is not int or chunk_id < 1:
+            raise ArchiveError("chunkIds must be positive integers.")
+        if chunk_id not in seen:
+            seen.add(chunk_id)
+            unique.append(chunk_id)
+    if len(unique) > DOCUMENT_DETAIL_MAX_CHUNK_IDS:
+        raise ArchiveError(f"chunkIds must contain at most {DOCUMENT_DETAIL_MAX_CHUNK_IDS} values.")
+    return unique
+
+
+def normalized_chunk_context(chunk_context: int | None) -> int:
+    value = normalized_window_value(chunk_context, "chunk_context") if chunk_context is not None else 0
+    if value > DOCUMENT_DETAIL_MAX_CHUNK_CONTEXT:
+        raise ArchiveError(f"chunkContext must be between 0 and {DOCUMENT_DETAIL_MAX_CHUNK_CONTEXT}.")
+    return value
+
+
+def selected_chunk_ids_with_context(db: sqlite3.Connection, document_id: str, chunk_ids: list[int], context: int) -> list[int]:
+    if not chunk_ids:
+        return []
+    ordered_ids = [int(row["chunk_id"]) for row in db.execute("SELECT chunk_id FROM chunks WHERE document_id = ? ORDER BY chunk_id", (document_id,)).fetchall()]
+    target_ids = set(chunk_ids)
+    selected_indexes: set[int] = set()
+    for index, chunk_id in enumerate(ordered_ids):
+        if chunk_id in target_ids:
+            start = max(0, index - context)
+            end = min(len(ordered_ids), index + context + 1)
+            selected_indexes.update(range(start, end))
+    return [ordered_ids[index] for index in sorted(selected_indexes)]
 
 
 def window_metadata(offset: int, limit: int | None, total: int) -> dict[str, int | bool]:
