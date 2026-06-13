@@ -8,8 +8,11 @@ import { bottomRevealScrollDelta, rowsFittingTerminalViewport, shouldFocusTermin
 import { readTerminalColorTheme } from "./theme.js";
 import { registerTerminalView, unregisterTerminalView } from "./terminalViewStore.js";
 import { DEFAULT_UI_SCALE, scaledTerminalFontSize } from "./uiScale.js";
+import { uploadFileBrowserFile } from "../api.js";
 
 interface TerminalView {
+  tabId: string;
+  pluginId: string;
   terminal: Terminal;
   fit: FitAddon;
   socket: WebSocket;
@@ -20,12 +23,28 @@ interface TerminalView {
   pendingFitFocus?: boolean;
   keyboardInsetStyleValue?: string;
   releaseMobileScroll?: () => void;
+  releaseImagePaste?: () => void;
   uiScale: number;
+}
+
+interface PastedTerminalImage {
+  extension: string;
+  file: File;
 }
 
 const terminalViews = new Map<string, TerminalView>();
 const TERMINAL_KEYBOARD_INSET_PROPERTY = "--terminal-mobile-keyboard-inset";
 const TERMINAL_VISIBILITY_MARGIN_PX = 14;
+const CODEX_TERMINAL_PLUGIN_ID = "codex-terminal";
+const CODEX_PASTED_IMAGE_DIRECTORY = ".cloudx/pasted-images";
+const CODEX_PASTED_IMAGE_EXTENSIONS = new Map([
+  ["image/png", "png"],
+  ["image/jpeg", "jpg"],
+  ["image/jpg", "jpg"],
+  ["image/webp", "webp"],
+  ["image/gif", "gif"]
+]);
+let pastedImageSequence = 0;
 
 export function TerminalPanel({ tab, active, uiScale }: { tab: WorkspaceTab; active: boolean; uiScale: number }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -92,6 +111,8 @@ function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement, uiScale: 
   const existing = terminalViews.get(tab.id);
   if (existing) {
     existing.uiScale = uiScale;
+    existing.tabId = tab.id;
+    existing.pluginId = tab.pluginId;
     attachTerminalView(existing, container);
     return existing;
   }
@@ -108,7 +129,7 @@ function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement, uiScale: 
 
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
   const socket = new WebSocket(`${protocol}://${window.location.host}/ws/terminal/${encodeURIComponent(tab.id)}`);
-  const view = { terminal, fit, socket, uiScale };
+  const view = { tabId: tab.id, pluginId: tab.pluginId, terminal, fit, socket, uiScale };
   terminalViews.set(tab.id, view);
   registerTerminalView(tab.id, {
     dispose: () => disposeTerminalViewInternal(tab.id),
@@ -136,9 +157,7 @@ function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement, uiScale: 
   });
   socket.addEventListener("open", () => fitAndResize(view));
   terminal.onData((data) => {
-    if (socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "input", data }));
-    }
+    sendTerminalInput(view, data);
   });
 
   return view;
@@ -174,11 +193,13 @@ function attachTerminalView(view: TerminalView, container: HTMLDivElement): void
       container.appendChild(view.terminal.element);
     }
     installMobileScrollForView(view, container);
+    installImagePasteForView(view);
     return;
   }
   view.terminal.open(container);
   removeInactiveTerminalElements(container, view.terminal.element);
   installMobileScrollForView(view, container);
+  installImagePasteForView(view);
 }
 
 function removeInactiveTerminalElements(container: HTMLDivElement, activeElement: HTMLElement | undefined): void {
@@ -201,7 +222,103 @@ function installMobileScrollForView(view: TerminalView, container: HTMLDivElemen
 function releaseTerminalContainerBindings(view: TerminalView): void {
   view.releaseMobileScroll?.();
   view.releaseMobileScroll = undefined;
+  view.releaseImagePaste?.();
+  view.releaseImagePaste = undefined;
   view.container = undefined;
+}
+
+function installImagePasteForView(view: TerminalView): void {
+  view.releaseImagePaste?.();
+  view.releaseImagePaste = undefined;
+  if (view.pluginId !== CODEX_TERMINAL_PLUGIN_ID || !view.terminal.element) {
+    return;
+  }
+  const terminalElement = view.terminal.element;
+  const onPaste = (event: ClipboardEvent) => {
+    const images = pastedTerminalImagesFrom(event);
+    if (images.length === 0) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    void uploadAndInsertPastedTerminalImages(view, images);
+  };
+  terminalElement.addEventListener("paste", onPaste, true);
+  view.releaseImagePaste = () => terminalElement.removeEventListener("paste", onPaste, true);
+}
+
+function pastedTerminalImagesFrom(event: ClipboardEvent): PastedTerminalImage[] {
+  const clipboardData = event.clipboardData;
+  if (!clipboardData) {
+    return [];
+  }
+  const itemImages = Array.from(clipboardData.items ?? []).flatMap((item) => {
+    const image = pastedTerminalImageFromItem(item);
+    return image ? [image] : [];
+  });
+  if (itemImages.length > 0) {
+    return itemImages;
+  }
+  return Array.from(clipboardData.files ?? []).flatMap((file) => {
+    const image = pastedTerminalImageFromFile(file);
+    return image ? [image] : [];
+  });
+}
+
+function pastedTerminalImageFromItem(item: DataTransferItem): PastedTerminalImage | undefined {
+  if (item.kind !== "file") {
+    return undefined;
+  }
+  const extension = CODEX_PASTED_IMAGE_EXTENSIONS.get(item.type.toLowerCase());
+  if (!extension) {
+    return undefined;
+  }
+  const file = item.getAsFile();
+  return file ? { extension, file } : undefined;
+}
+
+function pastedTerminalImageFromFile(file: File): PastedTerminalImage | undefined {
+  const extension = CODEX_PASTED_IMAGE_EXTENSIONS.get(file.type.toLowerCase());
+  return extension ? { extension, file } : undefined;
+}
+
+async function uploadAndInsertPastedTerminalImages(view: TerminalView, images: PastedTerminalImage[]): Promise<void> {
+  if (view.socket.readyState !== WebSocket.OPEN) {
+    reportImagePasteFailure(view, "terminal is not connected");
+    return;
+  }
+  const pastedAt = new Date();
+  const pasteSequence = ++pastedImageSequence;
+  try {
+    const references: string[] = [];
+    for (const [index, image] of images.entries()) {
+      const relativePath = pastedImageRelativePath(image.extension, pastedAt, pasteSequence, index);
+      const upload = await uploadFileBrowserFile(view.tabId, relativePath, image.file);
+      references.push(`@${upload.relativePath}`);
+    }
+    if (references.length > 0 && !sendTerminalInput(view, ` ${references.join(" ")}`)) {
+      reportImagePasteFailure(view, "terminal disconnected before image reference could be inserted");
+    }
+  } catch (error) {
+    reportImagePasteFailure(view, error instanceof Error ? error.message : String(error));
+  }
+}
+
+function pastedImageRelativePath(extension: string, pastedAt: Date, pasteSequence: number, imageIndex: number): string {
+  const timestamp = pastedAt.toISOString().replace(/\D/gu, "").slice(0, 17);
+  return `${CODEX_PASTED_IMAGE_DIRECTORY}/pasted-image-${timestamp}-${pasteSequence}-${imageIndex + 1}.${extension}`;
+}
+
+function sendTerminalInput(view: TerminalView, data: string): boolean {
+  if (view.socket.readyState !== WebSocket.OPEN) {
+    return false;
+  }
+  view.socket.send(JSON.stringify({ type: "input", data }));
+  return true;
+}
+
+function reportImagePasteFailure(view: TerminalView, message: string): void {
+  view.terminal.writeln(`\r\nCloudx image paste failed: ${message}`);
 }
 
 function fitAndResize(view: TerminalView, focus = false): void {

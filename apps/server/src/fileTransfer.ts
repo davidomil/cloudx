@@ -63,6 +63,7 @@ interface TarEntry {
 const TAR_BLOCK_SIZE = 512;
 const TAR_END_BLOCKS = 2;
 const FILE_BROWSER_PLUGIN_ID = "file-browser";
+const CODEX_TERMINAL_PLUGIN_ID = "codex-terminal";
 const SYMLINK_DOWNLOAD_ERROR = "Symbolic links are not supported for file downloads.";
 
 export class FileTransferService {
@@ -109,7 +110,7 @@ export class FileTransferService {
   }
 
   async upload(tab: WorkspaceTab, relativePath: unknown, body: unknown, options: FileUploadOptions = {}): Promise<FileUploadResult> {
-    this.requireFileBrowserTab(tab);
+    this.requireUploadTab(tab);
     if (typeof relativePath !== "string" || !relativePath.trim()) {
       throw new Error("relativePath is required.");
     }
@@ -281,6 +282,12 @@ export class FileTransferService {
   private requireFileBrowserTab(tab: WorkspaceTab): void {
     if (tab.pluginId !== FILE_BROWSER_PLUGIN_ID) {
       throw new Error(`File transfers are only available for ${FILE_BROWSER_PLUGIN_ID} tabs.`);
+    }
+  }
+
+  private requireUploadTab(tab: WorkspaceTab): void {
+    if (tab.pluginId !== FILE_BROWSER_PLUGIN_ID && tab.pluginId !== CODEX_TERMINAL_PLUGIN_ID) {
+      throw new Error(`File uploads are only available for ${FILE_BROWSER_PLUGIN_ID} and ${CODEX_TERMINAL_PLUGIN_ID} tabs.`);
     }
   }
 }

@@ -1565,6 +1565,33 @@ describe("buildServer", () => {
     }
   });
 
+  it("uploads pasted image files through Codex terminal tab-scoped routes", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-image-upload-route-"));
+    const config = testConfig(root);
+    const app = await buildServer(config);
+    try {
+      const created = await app.inject({
+        method: "POST",
+        url: "/api/tabs",
+        payload: { pluginId: "codex-terminal", cwd: root }
+      });
+      const tabId = created.json().tab.id as string;
+
+      const upload = await app.inject({
+        method: "POST",
+        url: `/api/tabs/${tabId}/files/upload?relativePath=${encodeURIComponent(".cloudx/pasted-images/screenshot.png")}`,
+        headers: { "content-type": "application/octet-stream" },
+        payload: Buffer.from([0x89, 0x50, 0x4e, 0x47])
+      });
+
+      expect(upload.statusCode).toBe(200);
+      expect(upload.json()).toMatchObject({ relativePath: ".cloudx/pasted-images/screenshot.png", bytes: 4, uploaded: true });
+      await expect(fs.readFile(path.join(root, ".cloudx", "pasted-images", "screenshot.png"))).resolves.toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    } finally {
+      await app.close();
+    }
+  });
+
   it("rejects malformed file download requests before file transfer work", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-file-download-route-validation-"));
     const config = testConfig(root);

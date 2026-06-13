@@ -134,6 +134,22 @@ describe("FileTransferService", () => {
     await expect(fsp.readFile(path.join(root, "uploads", "image.bin"))).resolves.toEqual(Buffer.from([0, 1, 2, 255]));
   });
 
+  it("uploads pasted image bytes under a Codex terminal cwd", async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), "cloudx-transfer-codex-upload-"));
+    const service = new FileTransferService(new PathPolicy([root]));
+    const codexTab = { ...workspaceTab(root), pluginId: "codex-terminal", title: "Codex" };
+
+    const result = await service.upload(codexTab, ".cloudx/pasted-images/screenshot.png", Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+
+    expect(result).toEqual({
+      path: path.join(root, ".cloudx", "pasted-images", "screenshot.png"),
+      relativePath: ".cloudx/pasted-images/screenshot.png",
+      bytes: 4,
+      uploaded: true
+    });
+    await expect(fsp.readFile(path.join(root, ".cloudx", "pasted-images", "screenshot.png"))).resolves.toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+  });
+
   it("transfers files under child directories whose names start with two dots", async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), "cloudx-transfer-dotdot-child-"));
     const service = new FileTransferService(new PathPolicy([root]));

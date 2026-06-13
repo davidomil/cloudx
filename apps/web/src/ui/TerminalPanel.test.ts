@@ -9,7 +9,8 @@ const terminalPanelMocks = vi.hoisted(() => ({
   fitCalls: [] as unknown[],
   installMobileScroller: vi.fn(),
   releaseMobileScroller: vi.fn(),
-  terminals: [] as Array<{ disposed: boolean; element?: HTMLElement }>
+  terminals: [] as Array<{ disposed: boolean; element?: HTMLElement; writelnCalls: string[] }>,
+  uploadFileBrowserFile: vi.fn()
 }));
 
 vi.mock("@xterm/addon-fit", () => ({
@@ -27,6 +28,7 @@ vi.mock("@xterm/xterm", () => ({
     disposed = false;
     element?: HTMLElement;
     readonly options: Record<string, unknown>;
+    readonly writelnCalls: string[] = [];
 
     constructor(options: Record<string, unknown>) {
       this.options = options;
@@ -48,8 +50,8 @@ vi.mock("@xterm/xterm", () => ({
       container.appendChild(element);
     }
 
-    writeln(): void {
-      return undefined;
+    writeln(data = ""): void {
+      this.writelnCalls.push(data);
     }
 
     write(): void {
@@ -78,6 +80,10 @@ vi.mock("./terminalMobileScroll.js", async (importOriginal) => {
   };
 });
 
+vi.mock("../api.js", () => ({
+  uploadFileBrowserFile: terminalPanelMocks.uploadFileBrowserFile
+}));
+
 import { TerminalPanel } from "./TerminalPanel.js";
 import { disposeTerminalView } from "./terminalViewStore.js";
 
@@ -102,6 +108,14 @@ describe("TerminalPanel", () => {
     terminalPanelMocks.releaseMobileScroller = vi.fn();
     terminalPanelMocks.installMobileScroller.mockReset();
     terminalPanelMocks.installMobileScroller.mockReturnValue(terminalPanelMocks.releaseMobileScroller);
+    terminalPanelMocks.uploadFileBrowserFile.mockReset();
+    terminalPanelMocks.uploadFileBrowserFile.mockImplementation(async (_tabId: string, relativePath: string, file: Blob) => ({
+      path: `/tmp/${relativePath}`,
+      relativePath,
+      bytes: file.size,
+      uploaded: true
+    }));
+    TestWebSocket.latest = undefined;
     vi.stubGlobal("ResizeObserver", TestResizeObserver);
     vi.stubGlobal("WebSocket", TestWebSocket);
     window.requestAnimationFrame = (callback: FrameRequestCallback) => {
@@ -119,6 +133,7 @@ describe("TerminalPanel", () => {
       root?.unmount();
     });
     disposeTerminalView(tab.id);
+    disposeTerminalView("tab/a b");
     root = undefined;
     host?.remove();
     host = undefined;
@@ -161,7 +176,70 @@ describe("TerminalPanel", () => {
 
     expect(new URL(TestWebSocket.latest!.url).pathname).toBe("/ws/terminal/tab%2Fa%20b");
   });
+
+  it("uploads pasted images into Codex terminal tabs and inserts workspace image references", async () => {
+    act(() => {
+      root!.render(createElement(TerminalPanel, { tab: { ...tab, pluginId: "codex-terminal", title: "Codex" }, active: true, uiScale: 1 }));
+    });
+    TestWebSocket.latest?.open();
+    const file = new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], "screenshot.png", { type: "image/png" });
+    const event = pasteImageEvent(file);
+
+    const dispatched = terminalPanelMocks.terminals[0]!.element!.dispatchEvent(event);
+    await flushAsyncWork();
+
+    expect(dispatched).toBe(false);
+    expect(event.defaultPrevented).toBe(true);
+    expect(terminalPanelMocks.uploadFileBrowserFile).toHaveBeenCalledTimes(1);
+    const [tabId, relativePath, uploadedFile] = terminalPanelMocks.uploadFileBrowserFile.mock.calls[0]!;
+    expect(tabId).toBe(tab.id);
+    expect(relativePath).toMatch(/^\.cloudx\/pasted-images\/pasted-image-\d+-\d+-1\.png$/u);
+    expect(uploadedFile).toBe(file);
+    expect(inputMessages(TestWebSocket.latest!)).toContainEqual({ type: "input", data: ` @${relativePath}` });
+  });
+
+  it("leaves image paste events alone in standard terminal tabs", async () => {
+    act(() => {
+      root!.render(createElement(TerminalPanel, { tab, active: true, uiScale: 1 }));
+    });
+    TestWebSocket.latest?.open();
+    const file = new File([new Uint8Array([1, 2, 3])], "screenshot.png", { type: "image/png" });
+    const event = pasteImageEvent(file);
+
+    const dispatched = terminalPanelMocks.terminals[0]!.element!.dispatchEvent(event);
+    await flushAsyncWork();
+
+    expect(dispatched).toBe(true);
+    expect(event.defaultPrevented).toBe(false);
+    expect(terminalPanelMocks.uploadFileBrowserFile).not.toHaveBeenCalled();
+    expect(inputMessages(TestWebSocket.latest!).some((message) => message.data.includes("@.cloudx/pasted-images"))).toBe(false);
+  });
 });
+
+function pasteImageEvent(file: File): ClipboardEvent {
+  const event = new Event("paste", { bubbles: true, cancelable: true }) as ClipboardEvent;
+  Object.defineProperty(event, "clipboardData", {
+    value: {
+      items: [{ kind: "file", type: file.type, getAsFile: () => file }],
+      files: []
+    }
+  });
+  return event;
+}
+
+async function flushAsyncWork(): Promise<void> {
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
+function inputMessages(socket: TestWebSocket): Array<{ type: string; data: string }> {
+  return socket.sent.flatMap((message) => {
+    const parsed = JSON.parse(message) as { type?: unknown; data?: unknown };
+    return parsed.type === "input" && typeof parsed.data === "string" ? [{ type: "input", data: parsed.data }] : [];
+  });
+}
 
 class TestResizeObserver {
   observe(): void {
