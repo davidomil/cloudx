@@ -58,7 +58,7 @@ def test_archive_ingests_searches_invalidates_and_remains_portable(tmp_path: Pat
     archive = DocumentationArchive(tmp_path / "archive")
     archive.ingest_path(datasheet_pdf, source_type="datasheet", collection="board")
     archive.ingest_path(book_pdf, source_type="book", collection="books")
-    archive.ingest_path(fixture_dir, collection="vendor")
+    archive.ingest_path(fixture_dir, collection="vendor", accept_generated_code_documentation=True)
 
     server = HtmlFixtureServer("<html><body><h1>Thermal Layout Note</h1><p>The website says copper pours improve regulator thermal layout.</p></body></html>")
     server.start()
@@ -1391,6 +1391,122 @@ def test_datasheet_source_type_does_not_force_non_pdf_through_pdf_extractor(tmp_
     result = archive.search("CXRAIL-77 brownout threshold", limit=1)[0]
     assert result["sourceType"] == "datasheet"
     assert result["locator"] == "text"
+
+
+def test_vendor_code_path_requires_review_and_generates_searchable_documentation(tmp_path: Path) -> None:
+    source = tmp_path / "boot_driver.c"
+    source_text = """
+#define BOOT_DRIVER_MODE 3
+static void apply_reset_delay(void) {
+  hardware_write(0x40000010, BOOT_DRIVER_MODE);
+  const char *raw_only = "RAW_ONLY_CODE_TOKEN";
+}
+void configure_boot_pin(void) {
+  apply_reset_delay();
+}
+""".strip()
+    source.write_text(source_text, encoding="utf-8")
+    archive = DocumentationArchive(tmp_path / "archive")
+
+    with pytest.raises(ArchiveError, match="acceptGeneratedCodeDocumentation=true"):
+        archive.ingest_path(source)
+
+    document = archive.ingest_path(source, accept_generated_code_documentation=True)[0]
+
+    record = archive.get_document(document.document_id)
+    assert record["source_type"] == "repo_code"
+    assert record["snapshot_path"].endswith(".generated-code.md")
+    assert archive.search("configure_boot_pin BOOT_DRIVER_MODE", source_types=["repo_code"], limit=1)[0]["documentId"] == document.document_id
+    assert archive.search("RAW_ONLY_CODE_TOKEN", source_types=["repo_code"], limit=5, mode="lexical") == []
+
+    artifacts = record["artifacts"]
+    manifest_artifact = next(artifact for artifact in artifacts if artifact["type"] == "vendor_code" and artifact["kind"] == "manifest")
+    assert manifest_artifact["rawSourceIndexed"] is False
+    assert manifest_artifact["rawSourceRetained"] is False
+    assert manifest_artifact["coveredFileCount"] == 1
+    assert not any(artifact["type"] == "vendor_code" and artifact["kind"] == "source" for artifact in artifacts)
+
+    manifest_file = archive.document_artifact_file(document.document_id, manifest_artifact["path"])
+    manifest = json.loads(manifest_file.path.read_text(encoding="utf-8"))
+    covered = manifest["coveredFiles"][0]
+    assert covered["path"] == "boot_driver.c"
+    assert covered["sha256"] == hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+    assert {"kind": "function", "name": "configure_boot_pin", "line": 6} in covered["symbols"]
+    assert covered["artifactPath"] is None
+
+
+def test_vendor_code_directory_mixes_docs_with_generated_repo_doc_and_rejects_unsupported_code(tmp_path: Path) -> None:
+    fixture_dir = tmp_path / "vendor-drop"
+    src_dir = fixture_dir / "src"
+    src_dir.mkdir(parents=True)
+    (fixture_dir / "README.md").write_text("Vendor guide says VENDOR-DOC-42 configures reset straps.\n", encoding="utf-8")
+    (src_dir / "driver.py").write_text(
+        "class ResetDriver:\n"
+        "    def configure_reset_strap(self):\n"
+        "        write_register(0x44, RESET_STRAP_MODE)\n",
+        encoding="utf-8",
+    )
+    unsupported = src_dir / "rtl.sv"
+    unsupported.write_text("module unsupported; endmodule\n", encoding="utf-8")
+    archive = DocumentationArchive(tmp_path / "archive")
+
+    with pytest.raises(ArchiveError, match="Unsupported code source files"):
+        archive.ingest_path(fixture_dir, accept_generated_code_documentation=True)
+    unsupported.unlink()
+
+    with pytest.raises(ArchiveError, match="acceptGeneratedCodeDocumentation=true"):
+        archive.ingest_path(fixture_dir)
+
+    documents = archive.ingest_path(fixture_dir, accept_generated_code_documentation=True)
+
+    assert sorted(document.source_type for document in documents) == ["readme", "repo_code"]
+    assert archive.search("VENDOR-DOC-42 reset straps", source_types=["readme"], limit=1)[0]["sourceType"] == "readme"
+    repo_result = archive.search("ResetDriver configure_reset_strap", source_types=["repo_code"], limit=1)[0]
+    assert repo_result["sourceType"] == "repo_code"
+    repo_record = archive.get_document(repo_result["documentId"])
+    manifest = json.loads(archive.document_artifact_file(repo_result["documentId"], "vendor_code/code_manifest.json").path.read_text(encoding="utf-8"))
+    assert manifest["coveredFiles"][0]["path"] == "src/driver.py"
+    assert manifest["coveredFiles"][0]["parser"] == "python-ast"
+    assert repo_record["collection"] == "vendor-drop"
+
+
+def test_vendor_code_upload_url_and_text_policy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+
+    with pytest.raises(ArchiveError, match="Direct text repo_code ingest is not supported"):
+        archive.ingest_text(title="Pasted source", text="def raw_source(): pass", source_type="repo_code")
+
+    app = create_app(tmp_path / "api-archive")
+    client = TestClient(app)
+    rejected = client.post(
+        "/ingest/upload",
+        files={"file": ("sensor.ts", b"export function configureSensor() { return SENSOR_MODE; }\n", "text/typescript")},
+    )
+    assert rejected.status_code == 400
+    assert "acceptGeneratedCodeDocumentation=true" in rejected.json()["detail"]
+
+    accepted = client.post(
+        "/ingest/upload",
+        data={"acceptGeneratedCodeDocumentation": "true", "retainRawCodeArtifacts": "true"},
+        files={"file": ("sensor.ts", b"export function configureSensor() { return SENSOR_MODE; }\n", "text/typescript")},
+    )
+    assert accepted.status_code == 200
+    document = accepted.json()["document"]
+    assert document["sourceType"] == "repo_code"
+    uploaded_record = client.get(f"/documents/{document['documentId']}").json()["document"]
+    assert any(artifact["type"] == "vendor_code" and artifact["kind"] == "source" for artifact in uploaded_record["artifacts"])
+
+    class Response:
+        headers = {"content-type": "text/plain"}
+        url = "https://vendor.example/driver.py"
+
+    monkeypatch.setattr(
+        archive_module,
+        "fetch_url_bytes",
+        lambda url, limit: (Response(), b"def configure_url_driver():\n    return URL_DRIVER_MODE\n"),
+    )
+    url_doc = archive.ingest_url("https://vendor.example/driver.py", accept_generated_code_documentation=True)
+    assert archive.search("configure_url_driver URL_DRIVER_MODE", source_types=["repo_code"], limit=1)[0]["documentId"] == url_doc.document_id
 
 
 def test_fastapi_upload_ingests_documentation_file(tmp_path: Path) -> None:

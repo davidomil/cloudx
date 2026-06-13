@@ -35,7 +35,7 @@ describe("documentation skill helper", () => {
       });
     });
 
-    const result = await runHelper(["ingest-path", "docs/reference.md", "--sourceType", "datasheet"], {
+    const result = await runHelper(["ingest-path", "docs/reference.md", "--sourceType", "datasheet", "--acceptGeneratedCodeDocumentation", "--retainRawCodeArtifacts", "false"], {
       cwd: workspace,
       env: { CLOUDX_SERVER_URL: serverUrl }
     });
@@ -46,7 +46,9 @@ describe("documentation skill helper", () => {
       input: {
         path: "docs/reference.md",
         cwd: workspace,
-        sourceType: "datasheet"
+        sourceType: "datasheet",
+        acceptGeneratedCodeDocumentation: true,
+        retainRawCodeArtifacts: false
       }
     });
   });

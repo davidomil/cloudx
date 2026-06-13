@@ -17,6 +17,8 @@ export interface DocumentationUploadInput {
   sourceType?: string;
   collection?: string;
   tags?: string[];
+  acceptGeneratedCodeDocumentation?: boolean;
+  retainRawCodeArtifacts?: boolean;
 }
 
 export interface DocumentationEnrichInput {
@@ -168,6 +170,8 @@ export class DocumentationClient {
     appendOptionalFormValue(form, "title", input.title);
     appendOptionalFormValue(form, "sourceType", input.sourceType);
     appendOptionalFormValue(form, "collection", input.collection);
+    appendOptionalFormBoolean(form, "acceptGeneratedCodeDocumentation", input.acceptGeneratedCodeDocumentation);
+    appendOptionalFormBoolean(form, "retainRawCodeArtifacts", input.retainRawCodeArtifacts);
     for (const tag of input.tags ?? []) {
       appendOptionalFormValue(form, "tags", tag);
     }
@@ -455,6 +459,12 @@ function requireString(value: unknown, name: string): string {
 function appendOptionalFormValue(form: FormData, name: string, value: string | undefined): void {
   if (value?.trim()) {
     form.append(name, value.trim());
+  }
+}
+
+function appendOptionalFormBoolean(form: FormData, name: string, value: boolean | undefined): void {
+  if (value !== undefined) {
+    form.append(name, String(value));
   }
 }
 

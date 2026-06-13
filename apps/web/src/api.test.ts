@@ -189,14 +189,22 @@ describe("api client", () => {
       }
     });
 
-    await expect(uploadDocumentationFile({ file, title: "Note", sourceType: "readme", collection: "uploads", onProgress: (event) => progress.push(event) })).resolves.toEqual({
+    await expect(uploadDocumentationFile({
+      file,
+      title: "Note",
+      sourceType: "readme",
+      collection: "uploads",
+      acceptGeneratedCodeDocumentation: true,
+      retainRawCodeArtifacts: false,
+      onProgress: (event) => progress.push(event)
+    })).resolves.toEqual({
       document: { documentId: "doc-upload" },
       enrichment: { enabled: true, results: [{ documentId: "doc-upload", status: "written" }] }
     });
 
     expect(requests[0]).toMatchObject({
       method: "POST",
-      url: "/api/documentation/upload?filename=note.md&title=Note&sourceType=readme&collection=uploads",
+      url: "/api/documentation/upload?filename=note.md&title=Note&sourceType=readme&collection=uploads&acceptGeneratedCodeDocumentation=true&retainRawCodeArtifacts=false",
       requestHeaders: {
         "content-type": "application/octet-stream",
         "x-cloudx-file-content-type": "text/markdown"

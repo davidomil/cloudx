@@ -19,6 +19,8 @@ from PIL import Image, ImageFilter, ImageSequence
 import pdfplumber
 import pypdfium2 as pdfium
 
+from .vendor_code import CODE_SOURCE_SUFFIXES
+
 
 PDF_SUFFIXES = {".pdf"}
 HTML_SUFFIXES = {".html", ".htm"}
@@ -38,29 +40,20 @@ NET_LABEL_RE = re.compile(r"\b(?:VCC|VDD|VSS|GND|AGND|DGND|VIN|VOUT|SDA|SCL|MISO
 TEXT_SUFFIXES = {
     ".adoc",
     ".asciidoc",
-    ".c",
-    ".cpp",
     ".css",
     ".csv",
-    ".h",
-    ".hpp",
-    ".js",
     ".json",
     ".md",
-    ".py",
-    ".rs",
     ".srt",
     ".text",
     ".tex",
-    ".ts",
-    ".tsx",
     ".txt",
     ".vtt",
     ".xml",
     ".yaml",
     ".yml",
 }
-SUPPORTED_FILE_SUFFIXES = PDF_SUFFIXES | HTML_SUFFIXES | IMAGE_SUFFIXES | SPREADSHEET_SUFFIXES | TEXT_SUFFIXES
+SUPPORTED_FILE_SUFFIXES = PDF_SUFFIXES | HTML_SUFFIXES | IMAGE_SUFFIXES | SPREADSHEET_SUFFIXES | TEXT_SUFFIXES | CODE_SOURCE_SUFFIXES
 
 
 @dataclass(frozen=True)
@@ -122,6 +115,8 @@ def extract_bytes(
         return ImageExtractionPipeline(artifact_dir).extract(content, name)
     if source_type == "website" or suffix in HTML_SUFFIXES or normalized_type.startswith("text/html"):
         return [ExtractedSpan(extract_html(content), "html")]
+    if suffix in CODE_SOURCE_SUFFIXES or source_type == "repo_code":
+        raise ValueError("Code source extraction requires documentation-first ingest.")
     return [ExtractedSpan(decode_text(content), "text")]
 
 

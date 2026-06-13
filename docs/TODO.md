@@ -41,13 +41,13 @@
   - UX/docs: upload/path labels, source type inference, memory plugin guide, helper skill instructions, and documentation skill tests advertise spreadsheets only after extractor support is real.
   - Tests: generated `.xlsx` fixture with multiple sheets, formulas, empty cells, and merged cells; generated legacy `.xls` sample; directory ingest inclusion; upload ingest; search hits from sheet/table content; and artifact readback for CSV/Markdown/JSON sidecars.
 
-- [ ] Require documentation-first ingest for vendor code sources
-  - Current state: `TEXT_SUFFIXES` includes code-like formats such as `.c`, `.cpp`, `.h`, `.hpp`, `.js`, `.py`, `.rs`, `.ts`, and `.tsx`, and unknown text-like direct ingest falls through to `decode_text()`. That means vendor source drops can become chunks of raw code without an explanation layer for how the code works.
-  - Ingest policy target: detect code-heavy files and directories before generic text extraction. For vendor code, require a documentation-generation pass that produces source-grounded Markdown describing modules, public APIs, call flow, configuration knobs, hardware/register interactions when present, build/runtime assumptions, and known integration hazards, then ingest that generated documentation instead of blindly indexing raw code.
-  - Evidence target: preserve links from generated documentation sections back to source files and line/function locators, store a manifest of covered files and hashes, and keep raw vendor code as an artifact or snapshot only when licensing and retention policy allow it.
-  - Tooling target: use a structural parser where practical for language-aware outlines and symbol extraction, with a clear unsupported-language path that fails or asks for manual documentation rather than silently ingesting raw source.
-  - UI/helper target: show a warning or separate mode when the user selects code-heavy paths, expose the generated documentation for review before commit to the archive, and allow explicit override only through a named unsafe/debug option.
-  - Tests: code-heavy path detection, mixed docs-plus-code directory handling, generated-doc manifest coverage, raw-code non-ingest by default, review/approval flow, unsupported language behavior, and search hits from generated explanation rather than source code tokens.
+- [x] Require documentation-first ingest for vendor code sources
+  - Done: code-like path, upload, URL, and directory ingest now fail before writes unless generated code documentation review is explicitly accepted with `acceptGeneratedCodeDocumentation`.
+  - Implementation: supported vendor code inputs generate a `repo_code` Markdown snapshot with `code-doc ...` source chunks, deterministic symbol/import/call/config/hardware/hazard cues, and `extracted/vendor_code/code_manifest.json` coverage metadata.
+  - Evidence: the manifest records schema version, policy, raw-source indexing state, covered file paths, hashes, languages, parser status, symbols, imports, config/hardware tokens, and hazards; pasted `ingest_text(sourceType="repo_code")` is rejected.
+  - Retention: raw source bodies are not indexed and are retained as artifacts only when `retainRawCodeArtifacts` is explicitly supplied.
+  - Surfaces: FastAPI, the TypeScript documentation client, browser upload proxy, plugin hook schemas, helper flags, and the Documentation panel review checkbox all forward the generated-code acceptance path.
+  - Tests: code-heavy path rejection, mixed docs-plus-code directory handling, unsupported-language failure, upload/URL accepted code docs, raw-token non-search, manifest/artifact readback, helper/plugin/UI/client flag forwarding, full Python documentation tests, typecheck, full Vitest, build, and diff hygiene.
 
 - [ ] Add export/import for the documentation knowledge database
   - Current state: docs describe manual backup by archiving the whole `CLOUDX_DOCUMENTATION_DATA_DIR`; there is no first-class API, UI, or helper command for export/import.

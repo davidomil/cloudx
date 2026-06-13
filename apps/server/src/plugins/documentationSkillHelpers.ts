@@ -185,6 +185,8 @@ function metadata(options) {
   if (options.sourceType) result.sourceType = options.sourceType;
   if (options.tags) result.tags = csvOption(options.tags);
   if (options.uri) result.uri = options.uri;
+  if (options.acceptGeneratedCodeDocumentation) result.acceptGeneratedCodeDocumentation = booleanOption(options.acceptGeneratedCodeDocumentation, "acceptGeneratedCodeDocumentation");
+  if (options.retainRawCodeArtifacts) result.retainRawCodeArtifacts = booleanOption(options.retainRawCodeArtifacts, "retainRawCodeArtifacts");
   return result;
 }
 
@@ -224,6 +226,12 @@ function integerOption(value, fallback) {
     throw new Error("invalid integer option: " + value);
   }
   return parsed;
+}
+
+function booleanOption(value, name) {
+  if (value === true || value === "true") return true;
+  if (value === false || value === "false") return false;
+  throw new Error("invalid boolean option " + name + ": " + value);
 }
 
 function csvOption(value) {
@@ -471,8 +479,8 @@ function usage() {
     "  cloudx-doc.mjs schematics <query> [--limit 8] [--collection name] [--sourceType datasheet,image] [--artifacts 32]",
     "  cloudx-doc.mjs open <documentId> [--chunks 8] [--chars 1200] [--artifacts 8]",
     "  cloudx-doc.mjs list [--states active,stale] [--limit 50] [--offset 0] [--query text] [--collection name] [--sortDirection desc]",
-    "  cloudx-doc.mjs ingest-url <url> [--sourceType media] [--collection name]",
-    "  cloudx-doc.mjs ingest-path <path> [--sourceType datasheet|spreadsheet] [--collection name]",
+    "  cloudx-doc.mjs ingest-url <url> [--sourceType media] [--collection name] [--acceptGeneratedCodeDocumentation]",
+    "  cloudx-doc.mjs ingest-path <path> [--sourceType datasheet|spreadsheet] [--collection name] [--acceptGeneratedCodeDocumentation] [--retainRawCodeArtifacts]",
     "  cloudx-doc.mjs ingest-text <text> [--title title] [--uri uri]",
     "  cloudx-doc.mjs invalidate <documentId> <state> --reason reason",
     "  cloudx-doc.mjs remove <documentId>",

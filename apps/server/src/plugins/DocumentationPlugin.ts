@@ -155,7 +155,9 @@ export class DocumentationPlugin implements WorkspacePlugin {
         title: { type: "string" },
         sourceType: { type: "string" },
         collection: { type: "string" },
-        tags: { type: "array", items: { type: "string" } }
+        tags: { type: "array", items: { type: "string" } },
+        acceptGeneratedCodeDocumentation: { type: "boolean" },
+        retainRawCodeArtifacts: { type: "boolean" }
       }, ["path"]),
       externalHook("documentation.ingest.url", "Ingest Documentation URL", "Download a URL source, ingest a YouTube video with transcript and keyframes, or ingest every video in a YouTube playlist.", async (input, context) => this.enqueueIngest("url", titleOrFallback(input.title, requireString(input.url, "url")), requireString(input.url, "url"), "Downloading URL and extracting source evidence.", async (job) => {
         job.update({ progress: 30, stage: urlIngestStage(requireString(input.url, "url")) });
@@ -174,7 +176,9 @@ export class DocumentationPlugin implements WorkspacePlugin {
         sourceType: { type: "string" },
         collection: { type: "string" },
         tags: { type: "array", items: { type: "string" } },
-        transcript: { type: "string" }
+        transcript: { type: "string" },
+        acceptGeneratedCodeDocumentation: { type: "boolean" },
+        retainRawCodeArtifacts: { type: "boolean" }
       }, ["url"]),
       writeHook("documentation.ingest.text", "Ingest Documentation Text", "Ingest direct text, transcript, or copied source material.", async (input, context) => this.enqueueIngest("text", titleOrFallback(input.title, "Text source"), optionalString(input.uri) ?? "direct text", "Writing text into the archive.", async (job) => {
         job.update({ progress: 35, stage: "Indexer is writing text into the archive." });
@@ -414,6 +418,7 @@ function defaultDocumentationSkills(): PluginSkillContribution[] {
         "Use only results whose `state` is `active` unless the user explicitly asks for stale, revoked, deleted, or audit history.",
         "If active local results are absent, weak, stale, or do not cover the user's question, use built-in web search before answering. Prefer official product/project documentation, vendor datasheets, standards/specs, peer-reviewed or government/institutional sources for high-stakes domains, and reputable news sources for current events. Avoid forum or blog claims unless they are explicitly requested or corroborated by stronger sources.",
         "When adding evidence, ingest the original file, PDF, spreadsheet, image, URL, YouTube video, or playlist through the ingest skill so the full extractor can capture text, tables, workbook sheets, figures, screenshots, transcripts, and keyframes; use `/ingest/text` only when no original source is available. Preserve title, URI, source type, and collection metadata.",
+        "For vendor source-code files or code-heavy directories, do not index raw source directly. Use path, upload, or URL ingest with `acceptGeneratedCodeDocumentation: true` only after reviewing that generated documentation is acceptable; use `retainRawCodeArtifacts: true` only when raw source retention is allowed.",
         "After ingesting web sources, rerun local archive search and answer from the local documentation records. If no reliable source can be ingested, say so and answer only with the evidence that was actually inspected.",
         "When writing, carry forward each result's title, source type, locator, URI, and content SHA."
       ]),
@@ -430,7 +435,8 @@ function defaultDocumentationSkills(): PluginSkillContribution[] {
         "The helper uses the CloudX streaming hook when `CLOUDX_SERVER_URL` is set, so keep the command running until progress ends with a final result or error.",
         "When ingesting a relative local path, run the helper from the intended workspace with `CLOUDX_SERVER_URL` set. If only `CLOUDX_DOCUMENTATION_URL` is available, pass an absolute path.",
         "Always ingest PDFs, spreadsheets, images, documents, YouTube videos, and YouTube playlists as original sources, not pasted excerpts or transcripts, so the extractor can preserve pages, tables, workbook sheets, figures, screenshots, visual keyframes, timestamps, and source artifacts.",
-        "Set `sourceType` to one of `datasheet`, `book`, `website`, `repo_code`, `readme`, `media`, `image`, `spreadsheet`, or `text` when the user gives enough context.",
+        "For vendor source-code files or directories, do not use `ingest-text` and do not request raw-code indexing. Use path, upload, or URL ingest with `acceptGeneratedCodeDocumentation: true` after reviewing the generated Markdown path is acceptable; set `retainRawCodeArtifacts: true` only when raw source retention is allowed.",
+        "Set `sourceType` to one of `datasheet`, `book`, `website`, `readme`, `media`, `image`, `spreadsheet`, or `text` when the user gives enough context. The indexer assigns `repo_code` to generated code documentation.",
         "Leave `title` and `collection` blank when the indexer should autodetect them from the file, folder, URL, playlist, upload, or first text line.",
         "When ingesting sources found online, prefer durable primary URLs and include the original source URL. Do not ingest search-result pages, low-trust mirrors, or unsupported summaries when a better source is available.",
         "When AI enrichment is disabled, only source text and extracted artifact metadata are immediately searchable. Do manual follow-up by searching, opening full documents, reading transcript chunks, table artifacts, or schematic descriptions, and writing source-grounded notes yourself.",

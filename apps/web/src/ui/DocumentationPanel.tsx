@@ -175,9 +175,9 @@ export interface DocumentationIngestProgressChannel {
 }
 
 export type DocumentationIngestRequest =
-  | { mode: "upload"; file: File; title?: string; collection?: string }
-  | { mode: "path"; path: string; title?: string; collection?: string }
-  | { mode: "url"; url: string; title?: string; collection?: string }
+  | { mode: "upload"; file: File; title?: string; collection?: string; acceptGeneratedCodeDocumentation?: boolean }
+  | { mode: "path"; path: string; title?: string; collection?: string; acceptGeneratedCodeDocumentation?: boolean }
+  | { mode: "url"; url: string; title?: string; collection?: string; acceptGeneratedCodeDocumentation?: boolean }
   | { mode: "text"; title?: string; text: string; uri?: string; collection?: string };
 
 export interface DocumentationIngestJob {
@@ -228,6 +228,7 @@ export interface DocumentationPanelState {
   title: string;
   textValue: string;
   collection: string;
+  acceptGeneratedCodeDocumentation: boolean;
   uploadInputKey: number;
   ingestJobs: DocumentationIngestJob[];
   serverIngestJobs: DocumentationServerIngestJob[];
@@ -272,6 +273,7 @@ export function createInitialDocumentationPanelState(): DocumentationPanelState 
     title: "",
     textValue: "",
     collection: "",
+    acceptGeneratedCodeDocumentation: false,
     uploadInputKey: 0,
     ingestJobs: [],
     serverIngestJobs: []
@@ -320,6 +322,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   const [title, setTitle] = useDocumentationStateField("title", state, onStateChange);
   const [textValue, setTextValue] = useDocumentationStateField("textValue", state, onStateChange);
   const [collection, setCollection] = useDocumentationStateField("collection", state, onStateChange);
+  const [acceptGeneratedCodeDocumentation, setAcceptGeneratedCodeDocumentation] = useDocumentationStateField("acceptGeneratedCodeDocumentation", state, onStateChange);
   const [uploadInputKey, setUploadInputKey] = useDocumentationStateField("uploadInputKey", state, onStateChange);
   const [ingestJobs, setIngestJobs] = useDocumentationStateField("ingestJobs", state, onStateChange);
   const [serverIngestJobs, setServerIngestJobs] = useDocumentationStateField("serverIngestJobs", state, onStateChange);
@@ -543,7 +546,8 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
         urlValue,
         title,
         textValue,
-        collection
+        collection,
+        acceptGeneratedCodeDocumentation
       });
       ingestController.queue.push(job);
       setIngestJobs((current) => [...current, job]);
@@ -561,6 +565,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
     setUrlValue("");
     setTitle("");
     setTextValue("");
+    setAcceptGeneratedCodeDocumentation(false);
     setUploadInputKey((current) => current + 1);
   }
 
@@ -622,20 +627,21 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
     const request = job.request;
     if (request.mode === "path") {
       updateIngestJob(job.id, { progress: 25, stage: "Reading local path and extracting source evidence." });
-      return call<DocumentationIngestResponse>("documentation.ingest.path", compactInput({ path: request.path, title: request.title, collection: request.collection }));
+      return call<DocumentationIngestResponse>("documentation.ingest.path", compactInput({ path: request.path, title: request.title, collection: request.collection, acceptGeneratedCodeDocumentation: request.acceptGeneratedCodeDocumentation }));
     } else if (request.mode === "upload") {
       updateIngestJob(job.id, { progress: 10, stage: "Uploading file bytes." });
       const response = await uploadFile({
         file: request.file,
         title: request.title,
         collection: request.collection,
+        acceptGeneratedCodeDocumentation: request.acceptGeneratedCodeDocumentation,
         onProgress: (progress) => updateUploadIngestProgress(job.id, progress)
       });
       updateIngestJob(job.id, { progress: 82, stage: "Indexer finished extraction and enrichment." });
       return response as DocumentationIngestResponse;
     } else if (request.mode === "url") {
       updateIngestJob(job.id, { progress: 30, stage: urlIngestStage(request) });
-      return call<DocumentationIngestResponse>("documentation.ingest.url", compactInput({ url: request.url, title: request.title, collection: request.collection }));
+      return call<DocumentationIngestResponse>("documentation.ingest.url", compactInput({ url: request.url, title: request.title, collection: request.collection, acceptGeneratedCodeDocumentation: request.acceptGeneratedCodeDocumentation }));
     } else {
       updateIngestJob(job.id, { progress: 35, stage: "Writing text into the archive." });
       return call<DocumentationIngestResponse>("documentation.ingest.text", compactInput({ title: request.title, text: request.text, uri: request.uri, collection: request.collection }));
@@ -948,6 +954,12 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
                   {mode === "url" || mode === "text" ? <label><span>URL or URI</span><input value={urlValue} onChange={(event) => setUrlValue(event.target.value)} placeholder="https://vendor.example/doc, youtube playlist, or optional manual URI" /></label> : null}
                   <label><span>Title</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="auto from source" /></label>
                   <label><span>Collection</span><input value={collection} onChange={(event) => setCollection(event.target.value)} placeholder="auto from folder, domain, playlist, or upload" /></label>
+                  {mode !== "text" ? (
+                    <label className="checkbox-row">
+                      <input type="checkbox" checked={acceptGeneratedCodeDocumentation} onChange={(event) => setAcceptGeneratedCodeDocumentation(event.currentTarget.checked)} />
+                      <span>Accept generated code documentation</span>
+                    </label>
+                  ) : null}
                   {mode === "text" ? <label><span>Text</span><textarea value={textValue} onChange={(event) => setTextValue(event.target.value)} rows={5} /></label> : null}
                   <ControlButton type="submit" tone="primary" disabled={!canCall || !ingestReady(mode, uploadValue, pathValue, urlValue, textValue)}>
                     <FilePlus size={15} /> Queue
@@ -1136,27 +1148,29 @@ function createIngestJob(input: {
   title: string;
   textValue: string;
   collection: string;
+  acceptGeneratedCodeDocumentation: boolean;
 }): DocumentationIngestJob {
   const title = optionalTrimmedString(input.title);
   const collection = optionalTrimmedString(input.collection);
+  const acceptGeneratedCodeDocumentation = input.acceptGeneratedCodeDocumentation ? true : undefined;
   let request: DocumentationIngestRequest;
   if (input.mode === "upload") {
     if (!input.uploadValue) {
       throw new Error("Choose a file to upload.");
     }
-    request = { mode: "upload", file: input.uploadValue, title, collection };
+    request = { mode: "upload", file: input.uploadValue, title, collection, acceptGeneratedCodeDocumentation };
   } else if (input.mode === "path") {
     const path = input.pathValue.trim();
     if (!path) {
       throw new Error("Path is required.");
     }
-    request = { mode: "path", path, title, collection };
+    request = { mode: "path", path, title, collection, acceptGeneratedCodeDocumentation };
   } else if (input.mode === "url") {
     const url = input.urlValue.trim();
     if (!url) {
       throw new Error("URL is required.");
     }
-    request = { mode: "url", url, title, collection };
+    request = { mode: "url", url, title, collection, acceptGeneratedCodeDocumentation };
   } else {
     const text = input.textValue.trim();
     if (!text) {

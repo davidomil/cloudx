@@ -25,6 +25,8 @@ class IngestPathRequest(BaseModel):
     source_type: str | None = Field(default=None, alias="sourceType")
     collection: str | None = None
     tags: list[str] = Field(default_factory=list)
+    accept_generated_code_documentation: bool = Field(default=False, alias="acceptGeneratedCodeDocumentation")
+    retain_raw_code_artifacts: bool = Field(default=False, alias="retainRawCodeArtifacts")
 
 
 class IngestUrlRequest(BaseModel):
@@ -34,6 +36,8 @@ class IngestUrlRequest(BaseModel):
     collection: str | None = None
     tags: list[str] = Field(default_factory=list)
     transcript: str | None = None
+    accept_generated_code_documentation: bool = Field(default=False, alias="acceptGeneratedCodeDocumentation")
+    retain_raw_code_artifacts: bool = Field(default=False, alias="retainRawCodeArtifacts")
 
 
 class IngestTextRequest(BaseModel):
@@ -171,6 +175,8 @@ def create_app(root: str | Path | None = None) -> FastAPI:
                         source_type=request.source_type,
                         collection=request.collection,
                         tags=request.tags,
+                        accept_generated_code_documentation=request.accept_generated_code_documentation,
+                        retain_raw_code_artifacts=request.retain_raw_code_artifacts,
                     )
                 )
             ]
@@ -189,6 +195,8 @@ def create_app(root: str | Path | None = None) -> FastAPI:
                         tags=request.tags,
                         transcript=request.transcript,
                         progress=progress,
+                        accept_generated_code_documentation=request.accept_generated_code_documentation,
+                        retain_raw_code_artifacts=request.retain_raw_code_artifacts,
                     ),
                     lambda documents: {"document": documents[0].as_dict(), "documents": [document.as_dict() for document in documents]},
                 ),
@@ -202,6 +210,8 @@ def create_app(root: str | Path | None = None) -> FastAPI:
                 collection=request.collection,
                 tags=request.tags,
                 transcript=request.transcript,
+                accept_generated_code_documentation=request.accept_generated_code_documentation,
+                retain_raw_code_artifacts=request.retain_raw_code_artifacts,
             )
         )
         return {"document": documents[0].as_dict(), "documents": [document.as_dict() for document in documents]}
@@ -213,6 +223,8 @@ def create_app(root: str | Path | None = None) -> FastAPI:
         source_type: Annotated[str | None, Form(alias="sourceType")] = None,
         collection: Annotated[str | None, Form()] = None,
         tags: Annotated[list[str] | None, Form()] = None,
+        accept_generated_code_documentation: Annotated[bool, Form(alias="acceptGeneratedCodeDocumentation")] = False,
+        retain_raw_code_artifacts: Annotated[bool, Form(alias="retainRawCodeArtifacts")] = False,
     ) -> dict:
         content = await file.read()
         document = handle_archive_error(
@@ -224,6 +236,8 @@ def create_app(root: str | Path | None = None) -> FastAPI:
                 source_type=source_type,
                 collection=collection,
                 tags=tags or [],
+                accept_generated_code_documentation=accept_generated_code_documentation,
+                retain_raw_code_artifacts=retain_raw_code_artifacts,
             )
         )
         return {"document": document.as_dict()}

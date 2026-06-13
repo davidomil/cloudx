@@ -645,6 +645,7 @@ describe("DocumentationPanel", () => {
     setFileValue(inputByLabel(container, "Upload"), file);
     setInputValue(inputByLabel(container, "Title"), "Uploaded Note");
     setInputValue(inputByLabel(container, "Collection"), "validation");
+    await clickCheckbox(inputByLabel(container, "Accept generated code documentation"));
     await click(buttonByText(container, "Queue"));
     await flushAsyncWork();
 
@@ -652,6 +653,7 @@ describe("DocumentationPanel", () => {
       file,
       title: "Uploaded Note",
       collection: "validation",
+      acceptGeneratedCodeDocumentation: true,
       onProgress: expect.any(Function)
     }));
     expect(container.textContent).toContain("Import Queue");
@@ -1016,6 +1018,13 @@ function setTextAreaValue(textArea: HTMLTextAreaElement, value: string): void {
 function setFileValue(input: HTMLInputElement, file: File): void {
   Object.defineProperty(input, "files", { configurable: true, value: [file] });
   input.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+async function clickCheckbox(input: HTMLInputElement): Promise<void> {
+  await act(async () => {
+    input.click();
+  });
+  await flush();
 }
 
 function hookResult<T extends Record<string, unknown>>(value: Record<string, unknown>): T {

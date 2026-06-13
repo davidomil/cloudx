@@ -602,6 +602,48 @@ describe("buildServer", () => {
     }
   });
 
+  it("forwards generated code documentation upload flags to the documentation indexer", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-code-upload-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    const ingestUpload = vi.spyOn(services.documentation!, "ingestUpload").mockResolvedValue({
+      document: { documentId: "uploaded-code-doc", sourceType: "repo_code" }
+    });
+    vi.spyOn(services.documentationEnrichment!, "enrichIngestResponse").mockImplementation(async (result) => result);
+    const app = await buildServer(config, services);
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/documentation/upload?filename=driver.ts&acceptGeneratedCodeDocumentation=true&retainRawCodeArtifacts=true",
+        headers: { "content-type": "application/octet-stream" },
+        payload: Buffer.from("export function configureDriver() { return DRIVER_MODE; }")
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(ingestUpload).toHaveBeenCalledWith({
+        filename: "driver.ts",
+        content: Buffer.from("export function configureDriver() { return DRIVER_MODE; }"),
+        contentType: undefined,
+        title: undefined,
+        sourceType: undefined,
+        collection: undefined,
+        acceptGeneratedCodeDocumentation: true,
+        retainRawCodeArtifacts: true
+      });
+
+      const invalid = await app.inject({
+        method: "POST",
+        url: "/api/documentation/upload?filename=driver.ts&acceptGeneratedCodeDocumentation=yes",
+        headers: { "content-type": "application/octet-stream" },
+        payload: Buffer.from("export function configureDriver() { return DRIVER_MODE; }")
+      });
+      expect(invalid.statusCode).toBe(400);
+      expect(invalid.json().message).toContain("acceptGeneratedCodeDocumentation must be true or false");
+    } finally {
+      await app.close();
+    }
+  });
+
   it("proxies documentation artifact files from the indexer", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-artifact-"));
     const config = testConfig(root);

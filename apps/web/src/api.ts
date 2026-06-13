@@ -156,12 +156,16 @@ export async function uploadDocumentationFile(input: {
   title?: string;
   sourceType?: string;
   collection?: string;
+  acceptGeneratedCodeDocumentation?: boolean;
+  retainRawCodeArtifacts?: boolean;
   onProgress?: (progress: DocumentationUploadProgress) => void;
 }): Promise<DocumentationUploadResponse> {
   const params = new URLSearchParams({ filename: input.file.name });
   appendOptionalSearchParam(params, "title", input.title);
   appendOptionalSearchParam(params, "sourceType", input.sourceType);
   appendOptionalSearchParam(params, "collection", input.collection);
+  appendOptionalBooleanSearchParam(params, "acceptGeneratedCodeDocumentation", input.acceptGeneratedCodeDocumentation);
+  appendOptionalBooleanSearchParam(params, "retainRawCodeArtifacts", input.retainRawCodeArtifacts);
   return new Promise<DocumentationUploadResponse>((resolve, reject) => {
     const request = new XMLHttpRequest();
     let lastLoadedBytes = 0;
@@ -211,6 +215,12 @@ export function saveBlobDownload(blob: Blob, filename: string): void {
 function appendOptionalSearchParam(params: URLSearchParams, name: string, value: string | undefined): void {
   if (value?.trim()) {
     params.set(name, value.trim());
+  }
+}
+
+function appendOptionalBooleanSearchParam(params: URLSearchParams, name: string, value: boolean | undefined): void {
+  if (value !== undefined) {
+    params.set(name, String(value));
   }
 }
 

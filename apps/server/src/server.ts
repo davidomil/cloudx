@@ -429,7 +429,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   });
 
   app.post<{
-    Querystring: { filename?: string; title?: string; sourceType?: string; collection?: string };
+    Querystring: { filename?: string; title?: string; sourceType?: string; collection?: string; acceptGeneratedCodeDocumentation?: string; retainRawCodeArtifacts?: string };
     Body: NodeJS.ReadableStream;
   }>("/api/documentation/upload", async (request) => {
     const contentLength = parseContentLength(request.headers["content-length"]);
@@ -439,6 +439,8 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     const filename = requiredQueryString(request.query.filename, "filename");
     const contentType = optionalHeaderString(request.headers["x-cloudx-file-content-type"]);
     const sourceType = optionalQueryString(request.query.sourceType);
+    const acceptGeneratedCodeDocumentation = optionalQueryBoolean(request.query.acceptGeneratedCodeDocumentation, "acceptGeneratedCodeDocumentation");
+    const retainRawCodeArtifacts = optionalQueryBoolean(request.query.retainRawCodeArtifacts, "retainRawCodeArtifacts");
     const content = await readRequestBodyBuffer(request.body, config.documentationUploadMaxBytes);
     const title = optionalQueryString(request.query.title);
     const collection = optionalQueryString(request.query.collection);
@@ -455,14 +457,18 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
           contentType,
           title,
           sourceType,
-          collection
+          collection,
+          ...(acceptGeneratedCodeDocumentation !== undefined ? { acceptGeneratedCodeDocumentation } : {}),
+          ...(retainRawCodeArtifacts !== undefined ? { retainRawCodeArtifacts } : {})
         });
         job.update({ progress: 78, stage: "Running AI enrichment for the imported documentation." });
         const enriched = await (services.documentationEnrichment?.enrichIngestResponse(result, {
           filename,
           content,
           contentType,
-          sourceType
+          sourceType,
+          ...(acceptGeneratedCodeDocumentation !== undefined ? { acceptGeneratedCodeDocumentation } : {}),
+          ...(retainRawCodeArtifacts !== undefined ? { retainRawCodeArtifacts } : {})
         }) ?? result);
         job.update({ progress: 92, stage: "Finalizing documentation import." });
         return enriched;
@@ -1697,6 +1703,20 @@ function requiredQueryString(value: unknown, field: string): string {
 function optionalQueryString(value: unknown): string | undefined {
   const raw = Array.isArray(value) ? value[0] : value;
   return typeof raw === "string" && raw.trim() ? raw.trim() : undefined;
+}
+
+function optionalQueryBoolean(value: unknown, field: string): boolean | undefined {
+  const raw = optionalQueryString(value);
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (raw === "true") {
+    return true;
+  }
+  if (raw === "false") {
+    return false;
+  }
+  throwBadRequest(`${field} must be true or false.`);
 }
 
 function optionalHeaderString(value: string | string[] | undefined): string | undefined {

@@ -62,7 +62,19 @@ describe("DocumentationPlugin", () => {
     });
     expect(plugin.hooks.find((hook) => hook.id === "documentation.ingest.url")).toMatchObject({
       exposures: ["ui", "http", "automation"],
-      automationSafety: "external"
+      automationSafety: "external",
+      inputSchema: expect.objectContaining({
+        properties: expect.objectContaining({
+          acceptGeneratedCodeDocumentation: { type: "boolean" },
+          retainRawCodeArtifacts: { type: "boolean" }
+        })
+      })
+    });
+    expect(plugin.hooks.find((hook) => hook.id === "documentation.ingest.path")?.inputSchema).toMatchObject({
+      properties: expect.objectContaining({
+        acceptGeneratedCodeDocumentation: { type: "boolean" },
+        retainRawCodeArtifacts: { type: "boolean" }
+      })
     });
     expect(plugin.hooks.find((hook) => hook.id === "documentation.ingest.text")?.inputSchema).toMatchObject({
       required: ["text"]
@@ -239,9 +251,12 @@ describe("DocumentationPlugin", () => {
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("If active local results are absent, weak, stale, or do not cover the user's question, use built-in web search");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("After ingesting web sources, rerun local archive search");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("ingest the original file, PDF, spreadsheet, image, URL, YouTube video, or playlist");
+    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("acceptGeneratedCodeDocumentation: true");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-ingest")?.instructions).toContain("Always ingest PDFs, spreadsheets, images, documents, YouTube videos, and YouTube playlists as original sources");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-ingest")?.instructions).toContain("node \"$DOC\" ingest-url");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-ingest")?.instructions).toContain("If only `CLOUDX_DOCUMENTATION_URL` is available, pass an absolute path.");
+    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-ingest")?.instructions).toContain("The indexer assigns `repo_code` to generated code documentation.");
+    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-ingest")?.instructions).not.toContain("`repo_code`, `readme`");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-ingest")?.files).toContainEqual(expect.objectContaining({
       path: "scripts/cloudx-doc.mjs",
       executable: true,

@@ -188,7 +188,9 @@ describe("DocumentationClient", () => {
       content: new TextEncoder().encode("UPLOAD-CLIENT-7"),
       contentType: "text/markdown",
       sourceType: "readme",
-      collection: "client-test"
+      collection: "client-test",
+      acceptGeneratedCodeDocumentation: true,
+      retainRawCodeArtifacts: false
     });
 
     expect(result).toEqual({ document: { documentId: "uploaded-doc" } });
@@ -201,6 +203,10 @@ describe("DocumentationClient", () => {
     expect(bodyText).toContain("readme");
     expect(bodyText).toContain('name="collection"');
     expect(bodyText).toContain("client-test");
+    expect(bodyText).toContain('name="acceptGeneratedCodeDocumentation"');
+    expect(bodyText).toContain("true");
+    expect(bodyText).toContain('name="retainRawCodeArtifacts"');
+    expect(bodyText).toContain("false");
   });
 
   it("streams ingest URL progress and returns the final result", async () => {

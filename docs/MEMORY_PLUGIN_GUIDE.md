@@ -170,21 +170,25 @@ the bundled helper runs with `CLOUDX_SERVER_URL`, relative paths resolve
 from the helper process’s current workspace. Direct raw indexer calls
 through `CLOUDX_DOCUMENTATION_URL` require absolute paths. If a directory
 is passed, the indexer recursively ingests supported documentation file
-suffixes.
+suffixes. Code-heavy files or directories require
+`acceptGeneratedCodeDocumentation: true`; otherwise the request fails before
+writing archive documents.
 
 Supported suffixes include Markdown, text, PDF, HTML, JSON, YAML, XML,
 CSV, XLS/XLSX workbooks (`.xls`, `.xlsx`, `.xlsm`, `.xlsb`, `.ods`,
 `.ots`), SRT/VTT, Python, TypeScript, JavaScript, C/C++, Rust, CSS,
 AsciiDoc, LaTeX, and images (`.png`, `.jpg`, `.jpeg`, `.gif`, `.tif`,
-`.tiff`, `.bmp`, `.webp`).
+`.tiff`, `.bmp`, `.webp`). Python, TypeScript, JavaScript, C/C++, and Rust
+source files are documentation-first inputs: the indexer stores generated
+Markdown as the searchable document and does not index raw source bodies.
 
 The supported source-type labels are `datasheet`, `book`, `website`,
-`repo_code`, `readme`, `media`, `image`, `spreadsheet`, and `text`.
-Source type describes the source for hook/API filters and skill
-behavior; extraction is selected from the actual file suffix, content
-type, and file signature. That means setting `sourceType` to `datasheet`
-no longer forces a Markdown, text, spreadsheet, or image file through the
-PDF extractor.
+`readme`, `media`, `image`, `spreadsheet`, and `text`; generated code
+documentation is stored with source type `repo_code`. Source type describes
+the source for hook/API filters and skill behavior; extraction is selected
+from the actual file suffix, content type, and file signature. That means
+setting `sourceType` to `datasheet` no longer forces a Markdown, text,
+spreadsheet, or image file through the PDF extractor.
 
 When title is blank, path ingest uses the file name. When collection is
 blank, directory ingest uses the directory name for every file under
@@ -196,7 +200,8 @@ that ingest request and single-file ingest uses the parent folder name.
 | Image | `.png`, `.jpg`, `.jpeg`, `.gif`, `.tif`, `.tiff`, `.bmp`, `.webp`, `image/*` | Normalized PNG artifacts for all frames plus format, size, mode, frame metadata, and Phase 1 schematic description artifacts for schematic-like images. |
 | Spreadsheet | `.xls`, `.xlsx`, `.xlsm`, `.xlsb`, `.ods`, `.ots`, Excel/OpenDocument spreadsheet content types | One searchable chunk per sheet plus portable CSV, Markdown, JSON, and `spreadsheet_index.tsv` artifacts. XLSX/XLSM formulas and merged ranges are preserved as metadata where the file exposes them. |
 | HTML | `.html`, `.htm`, `text/html` | Text after removing script, style, template, and noscript content. |
-| Text and code | `.md`, `.txt`, `.json`, `.yaml`, `.xml`, `.csv`, `.py`, `.ts`, `.tsx`, `.js`, `.c`, `.cpp`, `.h`, `.rs`, `.css`, `.adoc`, `.tex` | UTF-8 text decode with replacement for invalid bytes. |
+| Text | `.md`, `.txt`, `.json`, `.yaml`, `.xml`, `.csv`, `.css`, `.adoc`, `.tex` | UTF-8 text decode with replacement for invalid bytes. |
+| Vendor code | `.py`, `.ts`, `.tsx`, `.js`, `.c`, `.cpp`, `.h`, `.hpp`, `.rs` | Requires generated-code documentation review. The searchable snapshot is generated Markdown with file hashes, symbol summaries, imports, call-flow cues, configuration/hardware tokens, and integration hazards. `extracted/vendor_code/code_manifest.json` records covered files and parser status. Raw source artifacts are retained only when `retainRawCodeArtifacts: true` is explicitly supplied. |
 | Captions and transcripts | `.srt`, `.vtt`, manually supplied transcript text | Text chunks marked as media when requested. |
 
 ## URL Ingest
@@ -261,11 +266,13 @@ metadata, and keyframe artifact paths.
 
 `documentation.ingest.text` stores direct text, copied source material,
 or manually supplied transcripts. It requires only non-empty text. If
-title is blank, the indexer uses the first non-empty text line. If URI
-is blank, it creates a deterministic `manual://<title>-<hash>` URI. If
-source type is blank, it infers one from the URI and otherwise uses
-`text`. If collection is blank, it uses the URI scheme such as `manual`
-or the URL host when an HTTP URI is supplied.
+title is blank, the indexer uses the first non-empty text line. It
+rejects `repo_code` and code-like URI suffixes because pasted raw source
+has no file provenance for generated documentation or manifest coverage.
+If URI is blank, it creates a deterministic `manual://<title>-<hash>`
+URI. If source type is blank, it infers one from the URI and otherwise
+uses `text`. If collection is blank, it uses the URI scheme such as
+`manual` or the URL host when an HTTP URI is supplied.
 
 ## Extraction And Chunking
 
@@ -288,10 +295,13 @@ metrics, and `analysisOutputs: []` for future structured analyzers.
 Image input is normalized to PNG sidecars under `extracted/images/`;
 multi-frame images preserve every frame as a separate artifact and are
 indexed with format, size, mode, frame count, and visual-artifact
-metadata. HTML input is parsed with script, style, template, and noscript
-content removed. Other input is decoded as text. Extracted spans are
-split into paragraph-like chunks with a maximum target size of 1200
-characters.
+metadata. Vendor code input generates searchable Markdown with
+`code-doc ...` locators and writes
+`extracted/vendor_code/code_manifest.json`; raw source code is not indexed
+and is retained as artifacts only when explicitly requested. HTML input
+is parsed with script, style, template, and noscript content removed.
+Other input is decoded as text. Extracted spans are split into
+paragraph-like chunks with a maximum target size of 1200 characters.
 
 This is similar to the datasheet-analysis workflow in the important ways
 for storage and recall: tables become standalone artifacts, visual pages
@@ -577,8 +587,11 @@ The operational documentation skills also bundle `scripts/cloudx-doc.mjs`, a
 small helper that wraps search, schematic search, open, list, ingest-url, ingest-path,
 ingest-text, invalidate, remove, health, stats, manifest, and rebuild calls so
 Codex can use short commands instead of handwritten curl/JSON/NDJSON requests.
-The enrichment skills stay instruction-only because they define model output
-behavior rather than endpoint operation.
+Code-heavy path and URL helper ingests accept
+`--acceptGeneratedCodeDocumentation` and optional `--retainRawCodeArtifacts`;
+without the review flag the indexer rejects code-heavy input before writing
+documents. The enrichment skills stay instruction-only because they define
+model output behavior rather than endpoint operation.
 
 The injection path is generic. Plugins expose `ruleContributions` and
 `skillContributions`, `syncPluginContributions` writes them into the
@@ -668,11 +681,11 @@ That command reads `docs/MEMORY_PLUGIN_GUIDE.qmd` and writes
 The indexer tests cover:
 
 - Ingesting uploaded files, PDFs, local directories, image files, HTML
-  websites, README/code-like files, media transcripts, and AI-derived
-  enrichment chunks.
+  websites, README files, generated vendor-code documentation, media
+  transcripts, and AI-derived enrichment chunks.
 - Extracting PDF table sidecars, rendered visual artifacts, normalized
-  image artifacts, schematic description artifacts, and spreadsheet
-  sheet artifacts.
+  image artifacts, schematic description artifacts, spreadsheet sheet
+  artifacts, and vendor-code manifests.
 - Searching with hybrid retrieval, lexical-only behavior, strict
   identifier recall, and dense-only fallback above the configured
   threshold.
@@ -680,18 +693,19 @@ The indexer tests cover:
   reopen/restore behavior, FastAPI controls, and CLI help.
 
 The server plugin tests cover hook registration, safety classes, local
-path policy enforcement, browser upload forwarding, enrichment routing,
-assisted-answer routing, automatic plugin system-rule and system-skill
-contributions, direct Codex search-skill guidance, generic plugin
-contribution validation, and Codex overlay injection. The web panel
-tests cover upload ingest, visible text ingest, queued sequential
-imports, progress channels, assisted-answer mode, assisted-search
-loading state, sanitized HTML answer rendering, disabled-AI manual mode,
-source-viewer removal controls, progressive source auto-loading, full
-source viewing, and search hook calls. The client tests cover JSON POST
-behavior, multipart upload behavior, documentation upload progress
-events, enrichment POST behavior, browser upload request construction,
-and propagation of service error messages.
+path policy enforcement, browser upload forwarding including generated-code
+flags, enrichment routing, assisted-answer routing, automatic plugin
+system-rule and system-skill contributions, direct Codex search-skill
+guidance, generic plugin contribution validation, and Codex overlay
+injection. The web panel tests cover upload ingest, visible text ingest,
+generated-code review acceptance, queued sequential imports, progress
+channels, assisted-answer mode, assisted-search loading state, sanitized
+HTML answer rendering, disabled-AI manual mode, source-viewer removal
+controls, progressive source auto-loading, full source viewing, and search
+hook calls. The client tests cover JSON POST behavior, multipart upload
+behavior, documentation upload progress events, enrichment POST behavior,
+browser upload request construction, and propagation of service error
+messages.
 
 A realistic validation runner in
 `debug_tooling/documentation-validation/run_validation.py` downloads or

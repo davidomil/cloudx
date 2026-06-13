@@ -35,6 +35,17 @@ from .extraction import (
     extract_bytes,
     extract_file,
 )
+from .vendor_code import (
+    CODE_SOURCE_SUFFIXES,
+    VENDOR_CODE_MANIFEST_PATH,
+    VendorCodeSource,
+    code_review_required_message,
+    generate_vendor_code_documentation,
+    is_supported_code_source_name,
+    is_unsupported_code_source_name,
+    unsupported_code_source_message,
+    write_vendor_code_artifacts,
+)
 
 try:
     from youtube_transcript_api import YouTubeTranscriptApi
@@ -464,6 +475,8 @@ class DocumentationArchive:
         source_type: str | None = None,
         collection: str | None = None,
         tags: list[str] | None = None,
+        accept_generated_code_documentation: bool = False,
+        retain_raw_code_artifacts: bool = False,
     ) -> list[IngestedDocument]:
         raw_path = Path(source_path)
         if not raw_path.is_absolute():
@@ -473,21 +486,60 @@ class DocumentationArchive:
             raise ArchiveError(f"Path does not exist: {path}")
         if path.is_dir():
             detected_collection = autodetect_collection(collection, path=path)
+            code_files, unsupported_code_files = directory_code_files(path)
+            if unsupported_code_files:
+                raise ArchiveError(unsupported_code_source_message([file_path.relative_to(path).as_posix() for file_path in unsupported_code_files]))
+            if code_files and not accept_generated_code_documentation:
+                raise ArchiveError(code_review_required_message(str(path), len(code_files)))
             documents = []
+            document_source_type = None if (source_type or "").lower() == "repo_code" else source_type
             for file_path in sorted(path.rglob("*")):
-                if file_path.is_file() and file_path.suffix.lower() in SUPPORTED_FILE_SUFFIXES:
+                if file_path.is_file() and file_path.suffix.lower() in SUPPORTED_FILE_SUFFIXES and not is_supported_code_source_name(file_path.name):
                     documents.extend(
                         self.ingest_path(
                             file_path,
                             title=None,
-                            source_type=source_type,
+                            source_type=document_source_type,
                             collection=detected_collection,
                             tags=tags,
                         )
                     )
+            if code_files:
+                documents.append(
+                    self._ingest_generated_vendor_code_documentation(
+                        title=title or f"{path.name} code documentation",
+                        uri=str(path),
+                        sources=[
+                            VendorCodeSource(
+                                relative_path=file_path.relative_to(path).as_posix(),
+                                content=file_path.read_bytes(),
+                                source_uri=str(file_path),
+                            )
+                            for file_path in code_files
+                        ],
+                        collection=detected_collection,
+                        tags=tags,
+                        retain_raw_code_artifacts=retain_raw_code_artifacts,
+                    )
+                )
             if not documents:
                 raise ArchiveError(f"No supported documentation files found in directory: {path}")
             return documents
+        if is_unsupported_code_source_name(path.name):
+            raise ArchiveError(unsupported_code_source_message([path.name]))
+        if is_supported_code_source_name(path.name):
+            if not accept_generated_code_documentation:
+                raise ArchiveError(code_review_required_message(str(path), 1))
+            return [
+                self._ingest_generated_vendor_code_documentation(
+                    title=autodetect_title(title, path=path),
+                    uri=str(path),
+                    sources=[VendorCodeSource(relative_path=path.name, content=path.read_bytes(), source_uri=str(path))],
+                    collection=autodetect_collection(collection, path=path),
+                    tags=tags,
+                    retain_raw_code_artifacts=retain_raw_code_artifacts,
+                )
+            ]
         source_bytes = path.read_bytes()
         inferred_type = source_type or infer_source_type(path.name, None)
         document_title = autodetect_title(title, path=path)
@@ -518,10 +570,24 @@ class DocumentationArchive:
         tags: list[str] | None = None,
         transcript: str | None = None,
         progress: ProgressReporter | None = None,
+        accept_generated_code_documentation: bool = False,
+        retain_raw_code_artifacts: bool = False,
     ) -> list[IngestedDocument]:
         if transcript is None and is_youtube_playlist_url(url):
             return self.ingest_youtube_playlist(url, title=title, source_type=source_type, collection=collection, tags=tags, progress=progress)
-        return [self.ingest_url(url, title=title, source_type=source_type, collection=collection, tags=tags, transcript=transcript, progress=progress)]
+        return [
+            self.ingest_url(
+                url,
+                title=title,
+                source_type=source_type,
+                collection=collection,
+                tags=tags,
+                transcript=transcript,
+                progress=progress,
+                accept_generated_code_documentation=accept_generated_code_documentation,
+                retain_raw_code_artifacts=retain_raw_code_artifacts,
+            )
+        ]
 
     def ingest_url(
         self,
@@ -533,8 +599,12 @@ class DocumentationArchive:
         tags: list[str] | None = None,
         transcript: str | None = None,
         progress: ProgressReporter | None = None,
+        accept_generated_code_documentation: bool = False,
+        retain_raw_code_artifacts: bool = False,
     ) -> IngestedDocument:
         if transcript is not None:
+            if (source_type or "").lower() == "repo_code":
+                raise ArchiveError("Direct text repo_code ingest is not supported. Use path, upload, or URL ingest with generated code documentation review.")
             return self.ingest_text(
                 title=autodetect_title(title, url=url, text=transcript),
                 text=transcript,
@@ -549,10 +619,24 @@ class DocumentationArchive:
         response, source_bytes = fetch_url_bytes(url, MAX_URL_INGEST_BYTES)
         content_type = response.headers.get("content-type")
         inferred_type = source_type or infer_source_type(url, content_type)
+        final_name = safe_file_name(urlparse(str(response.url)).path.rsplit("/", 1)[-1] or urlparse(url).path.rsplit("/", 1)[-1] or "downloaded-source")
+        if is_unsupported_code_source_name(final_name) or is_unsupported_code_source_name(url):
+            raise ArchiveError(unsupported_code_source_message([url]))
+        if is_supported_code_source_name(final_name) or is_supported_code_source_name(url) or inferred_type == "repo_code":
+            if not accept_generated_code_documentation:
+                raise ArchiveError(code_review_required_message(url, 1))
+            return self._ingest_generated_vendor_code_documentation(
+                title=autodetect_title(title, url=url),
+                uri=url,
+                sources=[VendorCodeSource(relative_path=final_name, content=source_bytes, source_uri=url)],
+                collection=autodetect_collection(collection, url=url, source_type="repo_code"),
+                tags=tags,
+                retain_raw_code_artifacts=retain_raw_code_artifacts,
+            )
         with self._write_lock:
             snapshot_path = self._store_snapshot(
                 source_bytes,
-                safe_file_name(urlparse(str(response.url)).path.rsplit("/", 1)[-1] or "downloaded-source"),
+                final_name,
                 metadata={
                     "url": url,
                     "finalUrl": str(response.url),
@@ -673,6 +757,8 @@ class DocumentationArchive:
         source_type: str | None = None,
         collection: str | None = None,
         tags: list[str] | None = None,
+        accept_generated_code_documentation: bool = False,
+        retain_raw_code_artifacts: bool = False,
     ) -> IngestedDocument:
         if not content:
             raise ArchiveError("Uploaded source is empty.")
@@ -680,6 +766,19 @@ class DocumentationArchive:
         inferred_type = source_type or infer_source_type(safe_name, content_type)
         document_title = autodetect_title(title, filename=filename or safe_name)
         document_collection = autodetect_collection(collection, upload=True, source_type=inferred_type)
+        if is_unsupported_code_source_name(safe_name):
+            raise ArchiveError(unsupported_code_source_message([safe_name]))
+        if is_supported_code_source_name(safe_name) or inferred_type == "repo_code":
+            if not accept_generated_code_documentation:
+                raise ArchiveError(code_review_required_message(safe_name, 1))
+            return self._ingest_generated_vendor_code_documentation(
+                title=document_title,
+                uri=f"upload://{safe_name}",
+                sources=[VendorCodeSource(relative_path=safe_name, content=content, source_uri=f"upload://{safe_name}")],
+                collection=document_collection,
+                tags=tags,
+                retain_raw_code_artifacts=retain_raw_code_artifacts,
+            )
         with self._write_lock:
             snapshot_path = self._store_snapshot(
                 content,
@@ -719,6 +818,8 @@ class DocumentationArchive:
         document_title = autodetect_title(title, url=uri, text=normalized_text)
         document_uri = optional_text(uri) or f"manual://{safe_file_name(document_title)}-{sha256_bytes(source_bytes)[:12]}"
         inferred_type = source_type or infer_source_type(document_uri, None)
+        if inferred_type == "repo_code" or is_supported_code_source_name(document_uri) or is_unsupported_code_source_name(document_uri):
+            raise ArchiveError("Direct text repo_code ingest is not supported. Use path, upload, or URL ingest with generated code documentation review.")
         document_collection = autodetect_collection(collection, uri=document_uri, source_type=inferred_type)
         with self._write_lock:
             snapshot_path = self._store_snapshot(source_bytes, safe_file_name(document_title) + ".txt")
@@ -730,6 +831,45 @@ class DocumentationArchive:
                 content_bytes=source_bytes,
                 spans=[ExtractedSpan(normalized_text, "text")],
                 collection=document_collection,
+                tags=tags,
+            )
+
+    def _ingest_generated_vendor_code_documentation(
+        self,
+        *,
+        title: str,
+        uri: str,
+        sources: list[VendorCodeSource],
+        collection: str | None,
+        tags: list[str] | None,
+        retain_raw_code_artifacts: bool,
+    ) -> IngestedDocument:
+        generated = generate_vendor_code_documentation(
+            title=title,
+            uri=uri,
+            sources=sources,
+            retain_raw_source=retain_raw_code_artifacts,
+        )
+        with self._write_lock:
+            snapshot_path = self._store_snapshot(
+                generated.content,
+                safe_file_name(title) + ".generated-code.md",
+                metadata={
+                    "sourceType": "repo_code",
+                    "generatedCodeDocumentation": True,
+                    "rawSourceRetained": retain_raw_code_artifacts,
+                },
+            )
+            artifact_root = snapshot_path.parent / "extracted"
+            write_vendor_code_artifacts(artifact_root, generated)
+            return self._write_document(
+                title=title,
+                source_type="repo_code",
+                uri=uri,
+                snapshot_path=snapshot_path,
+                content_bytes=generated.content,
+                spans=[ExtractedSpan(text, locator) for locator, text in generated.spans],
+                collection=collection,
                 tags=tags,
             )
 
@@ -1435,11 +1575,24 @@ def infer_source_type(name: str, content_type: str | None) -> str:
         return "image"
     if suffix in SPREADSHEET_SUFFIXES or normalized_type in SPREADSHEET_CONTENT_TYPES:
         return "spreadsheet"
-    if suffix in {".c", ".cpp", ".h", ".hpp", ".js", ".py", ".rs", ".ts", ".tsx"}:
+    if suffix in CODE_SOURCE_SUFFIXES:
         return "repo_code"
     if suffix in {".srt", ".vtt"}:
         return "media"
     return "readme" if Path(name).name.lower().startswith("readme") else "text"
+
+
+def directory_code_files(path: Path) -> tuple[list[Path], list[Path]]:
+    code_files = []
+    unsupported_code_files = []
+    for file_path in sorted(path.rglob("*")):
+        if not file_path.is_file():
+            continue
+        if is_supported_code_source_name(file_path.name):
+            code_files.append(file_path)
+        elif is_unsupported_code_source_name(file_path.name):
+            unsupported_code_files.append(file_path)
+    return code_files, unsupported_code_files
 
 
 def snapshot_artifacts(document_id: str, snapshot_path: Path) -> list[dict[str, Any]]:
@@ -1455,6 +1608,7 @@ def snapshot_artifact_window(document_id: str, snapshot_path: Path, *, offset: i
         (pdf_table_artifact_count(artifact_root), lambda local_offset, local_limit: pdf_table_artifacts(document_id, artifact_root, offset=local_offset, limit=local_limit)),
         (schematic_artifact_count(artifact_root), lambda local_offset, local_limit: schematic_artifacts(document_id, artifact_root, offset=local_offset, limit=local_limit)),
         (spreadsheet_artifact_count(artifact_root), lambda local_offset, local_limit: spreadsheet_artifacts(document_id, artifact_root, offset=local_offset, limit=local_limit)),
+        (vendor_code_artifact_count(artifact_root), lambda local_offset, local_limit: vendor_code_artifacts(document_id, artifact_root, offset=local_offset, limit=local_limit)),
         (image_artifact_count(artifact_root), lambda local_offset, local_limit: image_artifacts(document_id, artifact_root, offset=local_offset, limit=local_limit)),
         (media_keyframe_artifact_count(artifact_root), lambda local_offset, local_limit: media_keyframe_artifacts(document_id, artifact_root, offset=local_offset, limit=local_limit)),
     ]
@@ -1664,6 +1818,73 @@ def is_spreadsheet_artifact_row(row: dict[str, str]) -> bool:
     return bool(optional_text(row.get("id")) and (optional_text(row.get("markdown")) or optional_text(row.get("csv")) or optional_text(row.get("json"))))
 
 
+def vendor_code_artifact_count(artifact_root: Path) -> int:
+    return len(vendor_code_artifact_paths(artifact_root))
+
+
+def vendor_code_artifacts(document_id: str, artifact_root: Path, *, offset: int = 0, limit: int | None = None) -> list[dict[str, Any]]:
+    manifest = read_vendor_code_manifest(artifact_root)
+    if not manifest:
+        return []
+    paths = vendor_code_artifact_paths_from_manifest(manifest)
+    selected_paths = paths[offset:] if limit is None else paths[offset:offset + limit]
+    records = []
+    for path in selected_paths:
+        kind = "manifest" if path == VENDOR_CODE_MANIFEST_PATH else "source"
+        record: dict[str, Any] = {
+            "documentId": document_id,
+            "type": "vendor_code",
+            "kind": kind,
+            "path": safe_artifact_relative_path(path),
+            "locator": "code manifest" if kind == "manifest" else f"code source {Path(path).name}",
+            "schemaVersion": optional_int(manifest.get("schemaVersion")),
+            "policy": optional_text(str(manifest.get("policy") or "")),
+            "rawSourceIndexed": bool(manifest.get("rawSourceIndexed")),
+            "rawSourceRetained": bool(manifest.get("rawSourceRetained")),
+            "coveredFileCount": len(manifest.get("coveredFiles") or []),
+        }
+        if kind == "manifest":
+            record["coveredFiles"] = [
+                {
+                    "path": optional_text(str(file_record.get("path") or "")),
+                    "artifactPath": optional_text(str(file_record.get("artifactPath") or "")),
+                    "language": optional_text(str(file_record.get("language") or "")),
+                    "sha256": optional_text(str(file_record.get("sha256") or "")),
+                    "parser": optional_text(str(file_record.get("parser") or "")),
+                    "symbols": file_record.get("symbols") if isinstance(file_record.get("symbols"), list) else [],
+                }
+                for file_record in manifest.get("coveredFiles") or []
+                if isinstance(file_record, dict)
+            ]
+        records.append(with_artifact_file_metadata(artifact_root, record))
+    return records
+
+
+def read_vendor_code_manifest(artifact_root: Path) -> dict[str, Any] | None:
+    path = artifact_root / VENDOR_CODE_MANIFEST_PATH
+    if not path.is_file():
+        return None
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ArchiveError(f"Invalid vendor code artifact manifest: {error}") from error
+    return manifest if isinstance(manifest, dict) else None
+
+
+def vendor_code_artifact_paths(artifact_root: Path) -> list[str]:
+    manifest = read_vendor_code_manifest(artifact_root)
+    return vendor_code_artifact_paths_from_manifest(manifest) if manifest else []
+
+
+def vendor_code_artifact_paths_from_manifest(manifest: Mapping[str, Any]) -> list[str]:
+    paths = [VENDOR_CODE_MANIFEST_PATH]
+    if manifest.get("rawSourceRetained"):
+        for file_record in manifest.get("coveredFiles") or []:
+            if isinstance(file_record, dict) and (artifact_path := optional_text(str(file_record.get("artifactPath") or ""))):
+                paths.append(safe_artifact_relative_path(artifact_path))
+    return paths
+
+
 def image_artifact_count(artifact_root: Path) -> int:
     return len(image_artifact_paths(artifact_root))
 
@@ -1824,6 +2045,7 @@ def snapshot_artifact_paths(artifact_root: Path) -> Iterator[str]:
     yield from pdf_table_artifact_paths(artifact_root)
     yield from schematic_artifact_paths(artifact_root)
     yield from spreadsheet_artifact_paths(artifact_root)
+    yield from vendor_code_artifact_paths(artifact_root)
     yield from image_artifact_paths(artifact_root)
     yield from media_keyframe_artifact_paths(artifact_root)
 
