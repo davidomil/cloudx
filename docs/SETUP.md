@@ -582,6 +582,10 @@ authorization, and process isolation.
 - `CLOUDX_HOST`: server bind address, default `127.0.0.1`. Set `0.0.0.0` only
   for a trusted LAN or tailnet.
 - `CLOUDX_PORT`: server port, default `3001`.
+- `CLOUDX_LOG_LEVEL`: server log level, one of `fatal`, `error`, `warn`,
+  `info`, `debug`, `trace`, or `silent`; default `info`. Use `debug` or
+  `trace` when collecting runtime diagnostics for plugin installation, plugin
+  contribution sync, terminal, workspace, and voice issues.
 - `CLOUDX_ALLOWED_ROOTS`: path-delimited roots tabs may open, default `~`.
 - `CLOUDX_DATA_DIR`: runtime state directory, default `.cloudx`.
 - `CLOUDX_VOICE_MODEL`: Codex planner model, default `gpt-5.3-codex-spark`.

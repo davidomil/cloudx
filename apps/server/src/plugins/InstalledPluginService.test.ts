@@ -46,6 +46,33 @@ describe("InstalledPluginService", () => {
     expect(new InstalledPluginService(root, { git: fakeGit(fixture) }).pluginsFromCatalog()[0]?.descriptor().id).toBe("github-demo");
   });
 
+  it("emits debug logs for GitHub plugin install phases and catalog loading", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-installed-plugin-debug-"));
+    const fixture = await pluginFixture("github-debug", "GHD");
+    const logs: Array<{ fields: Record<string, unknown>; message?: string }> = [];
+    const service = new InstalledPluginService(root, {
+      git: fakeGit(fixture, "abc123"),
+      logger: { debug: (fields, message) => logs.push({ fields, message }) }
+    });
+
+    await service.installFromGithub("https://github.com/cloudx/github-debug", new Set());
+    service.pluginsFromCatalog();
+
+    expect(logs.map((entry) => entry.message)).toEqual(expect.arrayContaining([
+      "Checking GitHub plugin repository.",
+      "Installing GitHub plugin.",
+      "Cloning GitHub plugin repository.",
+      "Reading GitHub plugin manifest.",
+      "Promoted GitHub plugin install directory.",
+      "Persisted GitHub plugin install record.",
+      "Loaded installed plugins from catalog."
+    ]));
+    expect(logs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ fields: expect.objectContaining({ pluginId: "github-debug", commit: "abc123" }) }),
+      expect.objectContaining({ fields: expect.objectContaining({ cloneUrl: "https://github.com/cloudx/github-debug.git" }) })
+    ]));
+  });
+
   it("rejects invalid manifests before persisting the plugin", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-installed-plugin-invalid-"));
     const fixture = await pluginFixture("Bad_ID", "BAD");

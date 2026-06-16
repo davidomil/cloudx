@@ -28,6 +28,7 @@ describe("loadConfig", () => {
 
     expect(config.host).toBe("127.0.0.1");
     expect(config.port).toBe(3001);
+    expect(config.logLevel).toBe("info");
     expect(config.terminalReplayBytes).toBe(DEFAULT_TERMINAL_REPLAY_BYTES);
     expect(config.asrTimeoutMs).toBe(DEFAULT_ASR_TIMEOUT_MS);
     expect(config.documentationTimeoutMs).toBe(DEFAULT_DOCUMENTATION_TIMEOUT_MS);
@@ -54,6 +55,11 @@ describe("loadConfig", () => {
     const config = loadConfig({ CLOUDX_TERMINAL_REPLAY_BYTES: "2097152" } as NodeJS.ProcessEnv);
 
     expect(config.terminalReplayBytes).toBe(2_097_152);
+  });
+
+  it("parses runtime log level", () => {
+    expect(loadConfig({ CLOUDX_LOG_LEVEL: "debug" } as NodeJS.ProcessEnv).logLevel).toBe("debug");
+    expect(loadConfig({ CLOUDX_LOG_LEVEL: "TRACE" } as NodeJS.ProcessEnv).logLevel).toBe("trace");
   });
 
   it("parses ASR timeout", () => {
@@ -102,6 +108,11 @@ describe("loadConfig", () => {
   it("rejects invalid port", () => {
     expect(() => loadConfig({ CLOUDX_PORT: "0" } as NodeJS.ProcessEnv)).toThrow(/CLOUDX_PORT/);
     expect(() => loadConfig({ CLOUDX_PORT: "3001abc" } as NodeJS.ProcessEnv)).toThrow(/CLOUDX_PORT/);
+  });
+
+  it("rejects invalid runtime log level", () => {
+    expect(() => loadConfig({ CLOUDX_LOG_LEVEL: "verbose" } as NodeJS.ProcessEnv)).toThrow(/CLOUDX_LOG_LEVEL/);
+    expect(() => loadConfig({ CLOUDX_LOG_LEVEL: "" } as NodeJS.ProcessEnv)).toThrow(/CLOUDX_LOG_LEVEL/);
   });
 
   it("rejects invalid ASR timeout", () => {

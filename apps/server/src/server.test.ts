@@ -30,6 +30,16 @@ import { SessionStore } from "./sessionStore.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
 
 describe("buildServer", () => {
+  it("uses the configured runtime log level", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-log-level-"));
+    const app = await buildServer({ ...testConfig(root), logLevel: "debug" });
+    try {
+      expect(app.log.level).toBe("debug");
+    } finally {
+      await app.close();
+    }
+  });
+
   it("redacts query strings and fragments from request log URLs", () => {
     const serialized = serializeRequestForLog({
       method: "GET",
@@ -1968,6 +1978,7 @@ describe("buildServer", () => {
     const config: AppConfig = {
       host: "0.0.0.0",
       port: 3001,
+      logLevel: "info",
       allowedRoots: [root],
       asrUrl: "http://127.0.0.1:7810",
       asrTimeoutMs: DEFAULT_ASR_TIMEOUT_MS,
@@ -2114,6 +2125,7 @@ describe("buildServer", () => {
     const config: AppConfig = {
       host: "127.0.0.1",
       port: 0,
+      logLevel: "info",
       allowedRoots: [root],
       asrUrl: "http://127.0.0.1:7810",
       asrTimeoutMs: DEFAULT_ASR_TIMEOUT_MS,
@@ -2184,6 +2196,7 @@ describe("buildServer", () => {
     const config: AppConfig = {
       host: "127.0.0.1",
       port: 0,
+      logLevel: "info",
       allowedRoots: [root],
       asrUrl: "http://127.0.0.1:7810",
       asrTimeoutMs: DEFAULT_ASR_TIMEOUT_MS,
@@ -2258,6 +2271,7 @@ describe("buildServer", () => {
     const config: AppConfig = {
       host: "127.0.0.1",
       port: 0,
+      logLevel: "info",
       allowedRoots: [root],
       asrUrl: "http://127.0.0.1:7810",
       asrTimeoutMs: DEFAULT_ASR_TIMEOUT_MS,
@@ -2476,6 +2490,7 @@ describe("buildServer", () => {
     const config: AppConfig = {
       host: "0.0.0.0",
       port: 3001,
+      logLevel: "info",
       allowedRoots: [os.tmpdir()],
       asrUrl: "http://127.0.0.1:7810",
       asrTimeoutMs: DEFAULT_ASR_TIMEOUT_MS,
@@ -2514,6 +2529,7 @@ describe("buildServer", () => {
     const config: AppConfig = {
       host: "0.0.0.0",
       port: 3001,
+      logLevel: "info",
       allowedRoots: [root],
       asrUrl: "http://127.0.0.1:7810",
       asrTimeoutMs: DEFAULT_ASR_TIMEOUT_MS,
@@ -2560,6 +2576,7 @@ describe("buildServer", () => {
     const config: AppConfig = {
       host: "0.0.0.0",
       port: 3001,
+      logLevel: "info",
       allowedRoots: [root],
       asrUrl: "http://127.0.0.1:7810",
       asrTimeoutMs: DEFAULT_ASR_TIMEOUT_MS,
@@ -2654,6 +2671,7 @@ describe("buildServer", () => {
     const config: AppConfig = {
       host: "0.0.0.0",
       port: 3001,
+      logLevel: "info",
       allowedRoots: [root],
       asrUrl: "http://127.0.0.1:7810",
       asrTimeoutMs: DEFAULT_ASR_TIMEOUT_MS,
@@ -2708,6 +2726,7 @@ describe("buildServer", () => {
     const config: AppConfig = {
       host: "0.0.0.0",
       port: 3001,
+      logLevel: "info",
       allowedRoots: [root],
       asrUrl: "http://127.0.0.1:7810",
       asrTimeoutMs: DEFAULT_ASR_TIMEOUT_MS,
@@ -2907,6 +2926,7 @@ describe("buildServer", () => {
       const config: AppConfig = {
         host: "127.0.0.1",
         port: 0,
+        logLevel: "info",
         allowedRoots: [root],
         asrUrl: "http://127.0.0.1:7810",
         asrTimeoutMs: DEFAULT_ASR_TIMEOUT_MS,
@@ -2976,6 +2996,7 @@ describe("buildServer", () => {
     const config: AppConfig = {
       host: "127.0.0.1",
       port: 0,
+      logLevel: "info",
       allowedRoots: [root],
       asrUrl: "http://127.0.0.1:7810",
       asrTimeoutMs: DEFAULT_ASR_TIMEOUT_MS,
@@ -3061,6 +3082,7 @@ describe("buildServer", () => {
     const config: AppConfig = {
       host: "0.0.0.0",
       port: 3001,
+      logLevel: "info",
       allowedRoots: [root],
       asrUrl: "http://127.0.0.1:7810",
       asrTimeoutMs: DEFAULT_ASR_TIMEOUT_MS,
@@ -3119,6 +3141,7 @@ function testConfig(root: string): AppConfig {
   return {
     host: "0.0.0.0",
     port: 3001,
+    logLevel: "info",
     allowedRoots: [root],
     asrUrl: "http://127.0.0.1:7810",
     asrTimeoutMs: DEFAULT_ASR_TIMEOUT_MS,

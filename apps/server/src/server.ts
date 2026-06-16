@@ -124,6 +124,7 @@ export type VoiceAudioControlMessage = { type?: string; clientContext?: unknown 
 export async function buildServer(config: AppConfig, services?: AppServices): Promise<FastifyInstance> {
   const app = Fastify({
     logger: {
+      level: config.logLevel,
       serializers: {
         req: serializeRequestForLog
       }
@@ -141,7 +142,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   services.config ??= new ConfigService(config.dataDir, () => services!.plugins.list());
   services.workspace ??= new WorkspaceLayoutStore(config.dataDir, services.pathPolicy);
   services.pluginData ??= new PluginDataStore(config.dataDir);
-  services.installedPlugins ??= new InstalledPluginService(config.dataDir);
+  services.installedPlugins ??= new InstalledPluginService(config.dataDir, { logger: app.log });
   services.rulesSkills ??= new RulesSkillsCatalogService(config.dataDir);
   services.fileTransfer ??= new FileTransferService(services.pathPolicy);
   if (services.documentation) {
@@ -201,6 +202,10 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       const existingPluginIds = new Set(services.plugins.values().map((plugin) => plugin.id));
       const result = await services.installedPlugins!.installFromGithub(pluginGithubInstallBody(request.body).url, existingPluginIds);
       services.plugins.register(result.plugin);
+      request.log.debug(
+        { pluginId: result.record.id, directoryName: result.record.directoryName, commit: result.record.commit },
+        "GitHub plugin installed and registered."
+      );
       reply.code(201);
       return {
         plugin: result.plugin.descriptor(),
@@ -1040,7 +1045,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   const workspace = new WorkspaceLayoutStore(config.dataDir, pathPolicy);
   const terminalFactory = new NodePtyTerminalProcessFactory();
   const pluginData = new PluginDataStore(config.dataDir);
-  const installedPlugins = new InstalledPluginService(config.dataDir);
+  const installedPlugins = new InstalledPluginService(config.dataDir, { logger });
   const rulesSkills = new RulesSkillsCatalogService(config.dataDir);
   const documentationUrl = config.documentationUrl ?? DEFAULT_DOCUMENTATION_URL;
   const documentation = new DocumentationClient(documentationUrl, {
@@ -1096,7 +1101,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
       await sessions?.refreshRuntimeIndicators();
     })();
   });
-  const pluginContributionsReady = syncPluginContributions(plugins.values(), rulesSkills).then(async (store) => {
+  const pluginContributionsReady = syncPluginContributions(plugins.values(), rulesSkills, logger).then(async (store) => {
     await sessions?.applyRuntimeContexts((tab) => tab.pluginId === "codex-terminal", "Injecting plugin-contributed system rules and skills.");
     return store;
   });

@@ -13,14 +13,23 @@ interface PluginContributionSet {
   adoptUserSkillIds: Set<string>;
 }
 
+interface PluginContributionLogger {
+  debug?(fields: Record<string, unknown>, message?: string): void;
+}
+
 export async function syncPluginContributions(
   plugins: WorkspacePlugin[],
-  rulesSkills: RulesSkillsCatalogService
+  rulesSkills: RulesSkillsCatalogService,
+  logger?: PluginContributionLogger
 ): Promise<RulesSkillsStore> {
   const contributions = pluginContributions(plugins);
+  logger?.debug?.(
+    { pluginCount: plugins.length, ruleCount: contributions.rules.length, skillCount: contributions.skills.length },
+    "Syncing plugin rule and skill contributions."
+  );
   const initialStore = await rulesSkills.list();
-  await assertNoUserContributionConflicts(contributions, rulesSkills, initialStore);
-  const pruned = await pruneObsoleteSystemContributions(contributions, rulesSkills, initialStore);
+  await assertNoUserContributionConflicts(contributions, rulesSkills, initialStore, logger);
+  const pruned = await pruneObsoleteSystemContributions(contributions, rulesSkills, initialStore, logger);
   let store: RulesSkillsStore | undefined = pruned ? undefined : initialStore;
   for (const rule of contributions.rules) {
     store = await rulesSkills.saveSystemRule(rule);
@@ -28,13 +37,19 @@ export async function syncPluginContributions(
   for (const skill of contributions.skills) {
     store = await rulesSkills.saveSystemSkill(skill);
   }
-  return store ?? await rulesSkills.list();
+  const syncedStore = store ?? await rulesSkills.list();
+  logger?.debug?.(
+    { pluginCount: plugins.length, ruleCount: contributions.rules.length, skillCount: contributions.skills.length, pruned },
+    "Synced plugin rule and skill contributions."
+  );
+  return syncedStore;
 }
 
 async function assertNoUserContributionConflicts(
   contributions: PluginContributionSet,
   rulesSkills: RulesSkillsCatalogService,
-  store: RulesSkillsStore
+  store: RulesSkillsStore,
+  logger?: PluginContributionLogger
 ): Promise<void> {
   if (contributions.rules.length === 0 && contributions.skills.length === 0) {
     return;
@@ -53,11 +68,13 @@ async function assertNoUserContributionConflicts(
   }
   for (const rule of contributions.rules) {
     if (userRuleIds.has(rule.id) && contributions.adoptUserRuleIds.has(rule.id)) {
+      logger?.debug?.({ ruleId: rule.id }, "Adopting user rule contribution for plugin-owned system rule.");
       await rulesSkills.deleteRule(rule.id);
     }
   }
   for (const skill of contributions.skills) {
     if (userSkillIds.has(skill.id) && contributions.adoptUserSkillIds.has(skill.id)) {
+      logger?.debug?.({ skillId: skill.id }, "Adopting user skill contribution for plugin-owned system skill.");
       await rulesSkills.deleteSkill(skill.id);
     }
   }
@@ -66,17 +83,20 @@ async function assertNoUserContributionConflicts(
 async function pruneObsoleteSystemContributions(
   contributions: PluginContributionSet,
   rulesSkills: RulesSkillsCatalogService,
-  store: RulesSkillsStore
+  store: RulesSkillsStore,
+  logger?: PluginContributionLogger
 ): Promise<boolean> {
   let pruned = false;
   for (const rule of store.systemRules) {
     if (isOwnedBySyncedPlugin(rule.id, contributions.pluginIds) && !contributions.ruleIds.has(rule.id)) {
+      logger?.debug?.({ ruleId: rule.id }, "Pruning obsolete plugin-owned system rule.");
       await rulesSkills.deleteSystemRule(rule.id);
       pruned = true;
     }
   }
   for (const skill of store.systemSkills) {
     if (isOwnedBySyncedPlugin(skill.id, contributions.pluginIds) && !contributions.skillIds.has(skill.id)) {
+      logger?.debug?.({ skillId: skill.id }, "Pruning obsolete plugin-owned system skill.");
       await rulesSkills.deleteSystemSkill(skill.id);
       pruned = true;
     }

@@ -140,6 +140,35 @@ describe("syncPluginContributions", () => {
     expect(catalog.saveSystemRule).toHaveBeenCalledWith(expect.objectContaining({ id: "alpha-current-rule", scope: "system" }));
     expect(catalog.saveSystemSkill).toHaveBeenCalledWith(expect.objectContaining({ id: "alpha-current-skill", scope: "system" }));
   });
+
+  it("emits debug logs for contribution sync, adoption, and pruning", async () => {
+    const catalog = fakeCatalog({
+      rules: [rule("alpha-current-rule")],
+      systemSkills: [{ ...skill("alpha-old-skill"), scope: "system" }]
+    });
+    const logs: Array<{ fields: Record<string, unknown>; message?: string }> = [];
+
+    await syncPluginContributions([
+      plugin("alpha", {
+        rules: [rule("alpha-current-rule")],
+        skills: [skill("alpha-current-skill")],
+        adoptUserRuleIds: ["alpha-current-rule"]
+      })
+    ], catalog as RulesSkillsCatalogService, { debug: (fields, message) => logs.push({ fields, message }) });
+
+    expect(logs.map((entry) => entry.message)).toEqual(expect.arrayContaining([
+      "Syncing plugin rule and skill contributions.",
+      "Adopting user rule contribution for plugin-owned system rule.",
+      "Pruning obsolete plugin-owned system skill.",
+      "Synced plugin rule and skill contributions."
+    ]));
+    expect(logs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ fields: expect.objectContaining({ pluginCount: 1, ruleCount: 1, skillCount: 1 }) }),
+      expect.objectContaining({ fields: expect.objectContaining({ ruleId: "alpha-current-rule" }) }),
+      expect.objectContaining({ fields: expect.objectContaining({ skillId: "alpha-old-skill" }) }),
+      expect.objectContaining({ fields: expect.objectContaining({ pruned: true }) })
+    ]));
+  });
 });
 
 function fakeCatalog(overrides: Partial<RulesSkillsStore> = {}): FakeCatalog {

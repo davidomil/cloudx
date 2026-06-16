@@ -27,6 +27,7 @@ export const SAFE_VERBOSE_ENV_KEYS = [
   "CLOUDX_INSTALL_ALREADY_PULLED",
   "CLOUDX_HOST",
   "CLOUDX_PORT",
+  "CLOUDX_LOG_LEVEL",
   "CLOUDX_CERT_HOSTS",
   "CLOUDX_ASR_DEVICE",
   "CLOUDX_ASR_COMPUTE_TYPE",
@@ -283,6 +284,7 @@ export function buildEnvLines(config) {
   const lines = [
     `CLOUDX_HOST=${config.host}`,
     `CLOUDX_PORT=${config.port}`,
+    `CLOUDX_LOG_LEVEL=${config.logLevel ?? "info"}`,
     `CLOUDX_ALLOWED_ROOTS=${config.allowedRoots}`,
     `CLOUDX_DATA_DIR=${config.dataDir}`,
     `CLOUDX_ASSISTANT_BIN=${config.assistantBin}`,

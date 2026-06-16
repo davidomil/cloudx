@@ -49,6 +49,10 @@ export interface PluginGitClient {
   revParseHead(directory: string): Promise<string>;
 }
 
+interface InstalledPluginLogger {
+  debug?(fields: Record<string, unknown>, message?: string): void;
+}
+
 export class InstalledPluginInstallError extends Error {
   constructor(message: string) {
     super(message);
@@ -65,11 +69,13 @@ export class InstalledPluginService {
   private readonly catalog: JsonStateFile;
   private readonly installRoot: string;
   private readonly git: PluginGitClient;
+  private readonly logger?: InstalledPluginLogger;
 
-  constructor(dataDir: string, options: { git?: PluginGitClient } = {}) {
+  constructor(dataDir: string, options: { git?: PluginGitClient; logger?: InstalledPluginLogger } = {}) {
     this.catalog = new JsonStateFile(dataDir, "installed-plugins.json", "Installed plugins catalog");
     this.installRoot = path.join(path.resolve(dataDir), "plugins", "github");
     this.git = options.git ?? new DefaultGitClient();
+    this.logger = options.logger;
   }
 
   listRecordsSync(): InstalledPluginRecord[] {
@@ -81,7 +87,9 @@ export class InstalledPluginService {
   }
 
   pluginsFromCatalog(): WorkspacePlugin[] {
-    return this.listRecordsSync().filter((record) => record.enabled).map((record) => installedManifestPlugin(record));
+    const plugins = this.listRecordsSync().filter((record) => record.enabled).map((record) => installedManifestPlugin(record));
+    this.logger?.debug?.({ pluginCount: plugins.length, installRoot: this.installRoot }, "Loaded installed plugins from catalog.");
+    return plugins;
   }
 
   async installFromGithub(url: string, existingPluginIds: Set<string>): Promise<{ record: InstalledPluginRecord; plugin: WorkspacePlugin }> {
@@ -91,6 +99,7 @@ export class InstalledPluginService {
       throw new InstalledPluginInstallError(`GitHub plugin repository is already installed: ${source.cloneUrl}`);
     }
     try {
+      this.logger?.debug?.({ cloneUrl: source.cloneUrl }, "Checking GitHub plugin repository.");
       await this.git.lsRemote(source.cloneUrl);
     } catch {
       throw new InstalledPluginInstallError(`GitHub plugin repository is not reachable: ${source.cloneUrl}`);
@@ -98,16 +107,23 @@ export class InstalledPluginService {
     const directoryName = installedPluginDirectoryName(source.owner, source.repo, source.cloneUrl);
     const finalDirectory = path.join(this.installRoot, directoryName);
     const tempDirectory = path.join(this.installRoot, `.tmp-${process.pid}-${Date.now()}-${randomUUID()}`);
+    this.logger?.debug?.(
+      { owner: source.owner, repo: source.repo, cloneUrl: source.cloneUrl, directoryName, existingPluginCount: existingPluginIds.size, installedPluginCount: current.plugins.length },
+      "Installing GitHub plugin."
+    );
     await fs.mkdir(this.installRoot, { recursive: true });
     await fs.rm(tempDirectory, { recursive: true, force: true });
     try {
+      this.logger?.debug?.({ cloneUrl: source.cloneUrl, tempDirectory }, "Cloning GitHub plugin repository.");
       await this.git.clone(source.cloneUrl, tempDirectory);
+      this.logger?.debug?.({ directoryName, tempDirectory }, "Reading GitHub plugin manifest.");
       const manifest = await readInstalledPluginManifest(tempDirectory);
       if (existingPluginIds.has(manifest.id) || current.plugins.some((plugin) => plugin.id === manifest.id)) {
         throw new InstalledPluginInstallError(`Plugin already registered: ${manifest.id}`);
       }
       await fs.rm(finalDirectory, { recursive: true, force: true });
       await fs.rename(tempDirectory, finalDirectory);
+      this.logger?.debug?.({ pluginId: manifest.id, directoryName, finalDirectory }, "Promoted GitHub plugin install directory.");
       const now = new Date().toISOString();
       const record: InstalledPluginRecord = {
         schemaVersion: INSTALLED_PLUGIN_CATALOG_SCHEMA_VERSION,
@@ -121,6 +137,7 @@ export class InstalledPluginService {
         manifest
       };
       await this.writeCatalog({ schemaVersion: INSTALLED_PLUGIN_CATALOG_SCHEMA_VERSION, plugins: [...current.plugins, record] });
+      this.logger?.debug?.({ pluginId: record.id, commit: record.commit, directoryName }, "Persisted GitHub plugin install record.");
       return { record, plugin: installedManifestPlugin(record) };
     } catch (error) {
       await fs.rm(tempDirectory, { recursive: true, force: true }).catch(() => undefined);

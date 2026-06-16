@@ -19,10 +19,14 @@ export const DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES = 25 * 1024 * 1024;
 export const MAX_VOICE_AUDIO_UPLOAD_MAX_BYTES = 512 * 1024 * 1024;
 export const DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES = 256 * 1024 * 1024;
 export const MAX_DOCUMENTATION_UPLOAD_MAX_BYTES = 25 * 1024 * 1024 * 1024;
+export const CLOUDX_LOG_LEVELS = ["fatal", "error", "warn", "info", "debug", "trace", "silent"] as const;
+
+export type CloudxLogLevel = typeof CLOUDX_LOG_LEVELS[number];
 
 export interface AppConfig {
   host: string;
   port: number;
+  logLevel: CloudxLogLevel;
   allowedRoots: string[];
   asrUrl: string;
   asrTimeoutMs: number;
@@ -47,6 +51,7 @@ export interface AppConfig {
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const host = env.CLOUDX_HOST ?? DEFAULT_CLOUDX_HOST;
   const port = parsePositiveInteger(env.CLOUDX_PORT ?? "3001", "CLOUDX_PORT");
+  const logLevel = parseLogLevel(env.CLOUDX_LOG_LEVEL ?? "info");
   const terminalReplayBytes = parsePositiveInteger(env.CLOUDX_TERMINAL_REPLAY_BYTES ?? String(DEFAULT_TERMINAL_REPLAY_BYTES), "CLOUDX_TERMINAL_REPLAY_BYTES");
   const asrTimeoutMs = parsePositiveInteger(env.CLOUDX_ASR_TIMEOUT_MS ?? String(DEFAULT_ASR_TIMEOUT_MS), "CLOUDX_ASR_TIMEOUT_MS");
   const documentationTimeoutMs = parsePositiveInteger(env.CLOUDX_DOCUMENTATION_TIMEOUT_MS ?? String(DEFAULT_DOCUMENTATION_TIMEOUT_MS), "CLOUDX_DOCUMENTATION_TIMEOUT_MS");
@@ -84,6 +89,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   return {
     host,
     port,
+    logLevel,
     allowedRoots,
     asrUrl: env.CLOUDX_ASR_URL ?? "http://127.0.0.1:7810",
     asrTimeoutMs,
@@ -101,6 +107,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     voiceDebugTranscripts: isTruthy(env.CLOUDX_VOICE_DEBUG_TRANSCRIPTS),
     https
   };
+}
+
+function parseLogLevel(value: string): CloudxLogLevel {
+  const normalized = value.trim().toLowerCase();
+  if (CLOUDX_LOG_LEVELS.includes(normalized as CloudxLogLevel)) {
+    return normalized as CloudxLogLevel;
+  }
+  throw new Error(`CLOUDX_LOG_LEVEL must be one of ${CLOUDX_LOG_LEVELS.join(", ")}.`);
 }
 
 function parsePositiveInteger(value: string, name: string): number {

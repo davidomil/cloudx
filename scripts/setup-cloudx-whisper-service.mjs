@@ -72,6 +72,7 @@ fs.writeFileSync(
   [
     `CLOUDX_HOST=${host}`,
     `CLOUDX_PORT=3001`,
+    `CLOUDX_LOG_LEVEL=info`,
     `CLOUDX_ALLOWED_ROOTS=~`,
     `CLOUDX_DATA_DIR=${path.join(repoRoot, ".cloudx")}`,
     `CLOUDX_ASR_URL=http://127.0.0.1:7810`,

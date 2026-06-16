@@ -181,6 +181,12 @@ Add `--verbose` to install, update, or uninstall commands when debugging. It
 prints command working directories, safe installer environment values, captured
 stdout/stderr from probes, and service health-check context.
 
+For runtime debugging after Cloudx is installed, set `CLOUDX_LOG_LEVEL=debug`
+or `CLOUDX_LOG_LEVEL=trace` in the Cloudx environment file and restart the
+service. Runtime debug logs include plugin catalog loading, GitHub plugin
+installation phases, plugin contribution sync, request context, terminal,
+workspace, and voice workflow diagnostics.
+
 Update an existing install after pulling the latest checkout:
 
 ```bash
@@ -275,6 +281,7 @@ Common environment variables:
 
 - `CLOUDX_HOST`: bind address, default `127.0.0.1`. Set `0.0.0.0` only for a trusted LAN or tailnet.
 - `CLOUDX_PORT`: app port, default `3001`.
+- `CLOUDX_LOG_LEVEL`: server log level, one of `fatal`, `error`, `warn`, `info`, `debug`, `trace`, or `silent`; default `info`.
 - `CLOUDX_ALLOWED_ROOTS`: path-delimited allowed roots, default `~`.
 - `CLOUDX_ASSISTANT_BIN`: resolved coding-assistant CLI executable for assistant-backed terminals and tools.
 - `CLOUDX_TOOL_PATH`: path-delimited command directories prepended to Cloudx child processes.

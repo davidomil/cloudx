@@ -257,6 +257,7 @@ describe("install-cloudx helpers", () => {
     });
     expect(env).toContain("CLOUDX_ASR_CPU_THREADS=6");
     expect(env).toContain("CLOUDX_ASR_DEVICE=cpu");
+    expect(env).toContain("CLOUDX_LOG_LEVEL=info");
     expect(env).toContain("CLOUDX_ASSISTANT_BIN=/usr/bin/codex");
     expect(env).toContain("CLOUDX_TOOL_PATH=/usr/bin");
     expect(env).toContain("CLOUDX_DOCUMENTATION_URL=http://127.0.0.1:7820");
@@ -302,6 +303,7 @@ describe("install-cloudx helpers", () => {
     const output = runner.capture(process.execPath, ["-e", "console.log('probe stdout'); console.error('probe stderr')"], {
       env: {
         CLOUDX_HOST: "127.0.0.1",
+        CLOUDX_LOG_LEVEL: "debug",
         SECRET_TOKEN: "do-not-print"
       }
     });
@@ -310,6 +312,7 @@ describe("install-cloudx helpers", () => {
     const logText = logs.join("\n");
     expect(logText).toContain("[verbose] cwd: /tmp");
     expect(logText).toContain("[verbose] env: CLOUDX_HOST=127.0.0.1");
+    expect(logText).toContain("CLOUDX_LOG_LEVEL=debug");
     expect(logText).not.toContain("SECRET_TOKEN");
     expect(logText).toContain("[verbose] stdout:\n  probe stdout");
     expect(logText).toContain("[verbose] stderr:\n  probe stderr");
