@@ -1536,7 +1536,7 @@ export function App() {
   }
 }
 
-function WindowSwitcher({
+export function WindowSwitcher({
   windows,
   tabs,
   rulesSkillsStore,
@@ -1723,12 +1723,9 @@ function WindowSwitcher({
               <input value={draftName} onChange={(event) => setDraftName(event.target.value)} placeholder="Window name" />
               <PathEntry inputId="window-default-directory" value={draftCwd} onChange={setDraftCwd} placeholder="Default directory" ariaLabel="Window default directory" />
               {dialogMode === "create" ? (
-                <label className="settings-toggle">
+                <label className="checkbox-row">
                   <input type="checkbox" checked={createDirectory} onChange={(event) => setCreateDirectory(event.target.checked)} />
-                  <span>
-                    Create directory if needed
-                    <small>Create the new window directory under the configured CloudX roots.</small>
-                  </span>
+                  Create directory if needed
                 </label>
               ) : null}
               {rulesSkillsStore ? (

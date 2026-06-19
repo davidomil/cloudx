@@ -6046,6 +6046,7 @@ a:hover svg {
 }
 
 .checkbox-row {
+  display: grid;
   grid-template-columns: auto 1fr;
   align-items: center;
 }
@@ -6501,7 +6502,7 @@ a:hover svg {
   }
 
   .window-search-row input,
-  .menu-form-panel input {
+  .menu-form-panel input:not([type="checkbox"]) {
     height: 44px;
   }
 
