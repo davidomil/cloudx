@@ -388,6 +388,7 @@ function coreHooks({ sessions, plugins, pathPolicy, workspace }: CoreHookService
         properties: {
           name: { type: "string", description: "Window name. Empty uses the next default workspace name." },
           defaultCwd: { type: "string", description: "Default working directory for tabs opened in the new window." },
+          createDirectory: { type: "boolean", description: "Create the default working directory when it does not exist." },
           pluginMetadata: {
             type: "object",
             description: "Plugin metadata to attach to the new window.",
@@ -409,6 +410,7 @@ function coreHooks({ sessions, plugins, pathPolicy, workspace }: CoreHookService
         const window = await workspace.createWindow({
           name: optionalString(input.name, "name"),
           defaultCwd: optionalString(input.defaultCwd, "defaultCwd"),
+          createDirectory: optionalBoolean(input.createDirectory, "createDirectory"),
           pluginMetadata: mergeTemplateMetadata(optionalPluginMetadata(input.pluginMetadata, "pluginMetadata"), optionalString(input.templateId, "templateId"))
         });
         return { window, workspace: await workspace.state(sessions.listTabs(), sessions.getActiveTabId()) };

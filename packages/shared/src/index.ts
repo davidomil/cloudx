@@ -217,6 +217,20 @@ export interface AutomationPortOptions {
   values: AutomationPortOption[];
 }
 
+export interface AutomationCodeCompletionDescriptor {
+  label: string;
+  type?: string;
+  detail?: string;
+  info?: string;
+  apply?: string;
+}
+
+export interface AutomationCodeEditorDescriptor {
+  language: "python" | "bash" | "json" | "text" | string;
+  completions?: AutomationCodeCompletionDescriptor[];
+  minHeight?: number;
+}
+
 export interface AutomationPortDescriptor {
   id: string;
   label: string;
@@ -227,6 +241,7 @@ export interface AutomationPortDescriptor {
   description?: string;
   defaultValue?: unknown;
   options?: AutomationPortOptions;
+  codeEditor?: AutomationCodeEditorDescriptor;
   required?: boolean;
   connectable?: boolean;
 }
@@ -426,6 +441,19 @@ export interface AutomationValidationSummary {
   diagnostics: AutomationValidationDiagnostic[];
 }
 
+export interface AutomationTestCaseExpected {
+  status?: AutomationRunStatus;
+  errorIncludes?: string;
+  traceIncludes?: string[];
+}
+
+export interface AutomationTestCase {
+  id: string;
+  name: string;
+  payload: Record<string, unknown>;
+  expected?: AutomationTestCaseExpected;
+}
+
 export interface AutomationGroup {
   id: string;
   name: string;
@@ -434,6 +462,7 @@ export interface AutomationGroup {
   createdAt: string;
   updatedAt: string;
   lastValidation?: AutomationValidationSummary;
+  testCases?: AutomationTestCase[];
 }
 
 export interface AutomationGroupsResponse {
@@ -473,6 +502,16 @@ export interface AutomationTestRunSample {
   status: AutomationRunStatus;
   trace: AutomationRunTraceEntry[];
   error?: string;
+  testCaseId?: string;
+  testCaseName?: string;
+  assertions?: AutomationTestAssertionResult[];
+}
+
+export interface AutomationTestAssertionResult {
+  id: string;
+  label: string;
+  passed: boolean;
+  message?: string;
 }
 
 export interface AutomationTestRunResponse extends AutomationRunsResponse {
@@ -540,6 +579,9 @@ export interface ConfigFieldDescriptor {
   options?: ConfigFieldOption[];
   min?: number;
   max?: number;
+  minLength?: number;
+  maxLength?: number;
+  pattern?: string;
   step?: number;
 }
 
@@ -794,6 +836,7 @@ export interface WorkspaceSnapshot {
   activeWindowId?: string;
   windows?: WorkspaceWindow[];
   templates?: WorkspaceLayoutTemplate[];
+  persistence?: StatePersistenceStatus[];
 }
 
 export type CloudxNotificationLevel = "info" | "success" | "warning" | "error";
@@ -813,6 +856,7 @@ export interface WorkspaceTabsUpdate {
   activeWindowId?: string;
   windows?: WorkspaceWindow[];
   templates?: WorkspaceLayoutTemplate[];
+  persistence?: StatePersistenceStatus[];
 }
 
 export interface WorkspaceNotificationUpdate {
@@ -910,6 +954,7 @@ export interface WorkspaceWindow {
 export interface CreateWorkspaceWindowRequest {
   name?: string;
   defaultCwd?: string;
+  createDirectory?: boolean;
   pluginMetadata?: PluginMetadataMap;
 }
 
@@ -976,6 +1021,19 @@ export interface WorkspaceStateResponse {
   activeWindowId: string;
   windows: WorkspaceWindow[];
   templates: WorkspaceLayoutTemplate[];
+  persistence?: StatePersistenceStatus[];
+}
+
+export type StatePersistenceMode = "available" | "degraded";
+
+export interface StatePersistenceStatus {
+  name: string;
+  state: StatePersistenceMode;
+  path: string;
+  code?: string;
+  message?: string;
+  failedAt?: string;
+  lastSuccessfulWriteAt?: string;
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {

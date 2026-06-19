@@ -262,6 +262,11 @@ events for created, updated, transitioned, newly assigned, assigned-to-me, and
 comment-created issues. Poll-based Jira triggers are not exposed as public HTTP
 trigger IDs.
 
+For code-driven steps, use the Run Python and Run Bash primitives. Run Python
+can call automation-exposed Cloudx hooks with `cloudx.call_hook(...)`; see
+`docs/AUTOMATION_CODE_EXECUTION.md` for the exact hook ID format, examples,
+outputs, and runtime limits.
+
 ## Codex Terminal Image Paste
 
 Built-in Codex terminal tabs accept pasted PNG, JPEG, WebP, and GIF clipboard

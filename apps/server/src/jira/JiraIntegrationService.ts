@@ -66,6 +66,15 @@ export interface JiraIssueSearchInput {
   pageSize?: number;
 }
 
+export interface JiraTransitionInput {
+  transitionId?: string;
+  transitionName?: string;
+  targetStatus?: string;
+  comment?: string;
+  fields?: Record<string, unknown>;
+  update?: Record<string, unknown>;
+}
+
 export interface JiraPollingAccount extends JiraUserSummary {
   configuredEmail?: string;
 }
@@ -170,14 +179,21 @@ export class JiraIntegrationService {
   async getIssue(issueIdOrKey: string): Promise<Record<string, unknown>> {
     const client = this.client();
     const issue = normalizeJiraIssue(await client.getIssue(issueIdOrKey, JIRA_ISSUE_FIELDS), client.normalizedSiteUrl);
-    return { issue };
+    return issueResult(issue);
   }
 
   async listComments(issueIdOrKey: string): Promise<Record<string, unknown>> {
     const client = this.client();
     const issueKey = issueIdOrKey.trim();
     const comments = (await client.listComments(issueKey)).map((comment) => normalizeJiraComment(comment, client.normalizedSiteUrl, issueKey));
-    return { comments };
+    const firstComment = comments[0];
+    return {
+      comments,
+      commentCount: comments.length,
+      firstCommentId: firstComment?.id,
+      firstCommentUrl: firstComment?.url,
+      firstCommentBody: firstComment?.bodyText
+    };
   }
 
   async addComment(issueIdOrKey: string, bodyText: string): Promise<Record<string, unknown>> {
@@ -190,10 +206,11 @@ export class JiraIntegrationService {
     const client = this.client();
     const fields = issueFieldsFromInput(input);
     const issue = await client.createIssue(fields);
+    const issueKey = stringValue(issue.key);
     return {
       issue,
-      issueKey: stringValue(issue.key),
-      issueUrl: stringValue(issue.key) ? issueUrl(client.normalizedSiteUrl, stringValue(issue.key)!) : undefined
+      issueKey,
+      issueUrl: issueKey ? issueUrl(client.normalizedSiteUrl, issueKey) : undefined
     };
   }
 
@@ -205,15 +222,39 @@ export class JiraIntegrationService {
     return { ...result, issueUrl: issueUrl(client.normalizedSiteUrl, issueIdOrKey) };
   }
 
-  async listTransitions(issueIdOrKey: string): Promise<Record<string, unknown>> {
-    return { transitions: await this.client().listTransitions(issueIdOrKey) };
+  async listTransitions(issueIdOrKey: string, input: { expandFields?: boolean } = {}): Promise<Record<string, unknown>> {
+    const transitions = await this.client().listTransitions(issueIdOrKey, { expandFields: input.expandFields !== false });
+    const firstTransition = transitions[0];
+    return {
+      transitions,
+      transitionCount: transitions.length,
+      firstTransitionId: firstTransition ? stringValue(firstTransition.id) : undefined,
+      firstTransitionName: firstTransition ? stringValue(firstTransition.name) : undefined,
+      firstTargetStatus: firstTransition ? transitionTargetStatusName(firstTransition) : undefined
+    };
   }
 
-  async transitionIssue(issueIdOrKey: string, transitionId: string, input: { comment?: string; fields?: Record<string, unknown> } = {}): Promise<Record<string, unknown>> {
+  async transitionIssue(issueIdOrKey: string, input: JiraTransitionInput): Promise<Record<string, unknown>> {
     const client = this.client();
-    const update = input.comment ? { comment: [{ add: { body: adfFromPlainText(input.comment) } }] } : undefined;
-    const result = await client.transitionIssue(issueIdOrKey, transitionId, { fields: input.fields, update });
-    return { ...result, issueUrl: issueUrl(client.normalizedSiteUrl, issueIdOrKey) };
+    const transitions = await client.listTransitions(issueIdOrKey, { expandFields: true });
+    const transition = resolveTransition(transitions, input);
+    const transitionId = requireString(transition.id, "transition.id");
+    const commentUpdate = input.comment ? { comment: [{ add: { body: adfFromPlainText(input.comment) } }] } : undefined;
+    const combinedUpdate = compactRecord({ ...(input.update ?? {}), ...(commentUpdate ?? {}) });
+    const result = await client.transitionIssue(issueIdOrKey, transitionId, { fields: input.fields, update: Object.keys(combinedUpdate).length ? combinedUpdate : undefined });
+    const issue = normalizeJiraIssue(await client.getIssue(issueIdOrKey, JIRA_ISSUE_FIELDS), client.normalizedSiteUrl);
+    return {
+      ...result,
+      transition,
+      transitionId,
+      transitionName: stringValue(transition.name),
+      targetStatus: transitionTargetStatusName(transition),
+      transitionFields: isRecord(transition.fields) ? transition.fields : undefined,
+      issue,
+      status: issue.status,
+      statusId: issue.statusId,
+      issueUrl: issueUrl(client.normalizedSiteUrl, issueIdOrKey)
+    };
   }
 
   async linkIssues(input: { inwardIssueKey: string; outwardIssueKey: string; typeName: string; comment?: string }): Promise<Record<string, unknown>> {
@@ -234,27 +275,43 @@ export class JiraIntegrationService {
   async metadata(): Promise<Record<string, unknown>> {
     const client = this.client();
     const [fields, projects, priorities, issueTypes, issueLinkTypes] = await Promise.all([client.fields(), client.projects(), client.priorities(), client.issueTypes(), client.issueLinkTypes()]);
-    return { fields, projects, priorities, issueTypes, issueLinkTypes };
+    return {
+      fields,
+      projects,
+      priorities,
+      issueTypes,
+      issueLinkTypes,
+      fieldCount: fields.length,
+      projectCount: projects.length,
+      priorityCount: priorities.length,
+      issueTypeCount: issueTypes.length,
+      issueLinkTypeCount: issueLinkTypes.length
+    };
   }
 
   async projects(): Promise<Record<string, unknown>> {
-    return { projects: await this.client().projects() };
+    const projects = await this.client().projects();
+    return { projects, projectCount: projects.length, firstProjectKey: firstStringValue(projects, "key"), firstProjectName: firstStringValue(projects, "name") };
   }
 
   async issueTypes(): Promise<Record<string, unknown>> {
-    return { issueTypes: await this.client().issueTypes() };
+    const issueTypes = await this.client().issueTypes();
+    return { issueTypes, issueTypeCount: issueTypes.length, firstIssueTypeId: firstStringValue(issueTypes, "id"), firstIssueTypeName: firstStringValue(issueTypes, "name") };
   }
 
   async fields(): Promise<Record<string, unknown>> {
-    return { fields: await this.client().fields() };
+    const fields = await this.client().fields();
+    return { fields, fieldCount: fields.length, firstFieldId: firstStringValue(fields, "id"), firstFieldName: firstStringValue(fields, "name") };
   }
 
   async priorities(): Promise<Record<string, unknown>> {
-    return { priorities: await this.client().priorities() };
+    const priorities = await this.client().priorities();
+    return { priorities, priorityCount: priorities.length, firstPriorityId: firstStringValue(priorities, "id"), firstPriorityName: firstStringValue(priorities, "name") };
   }
 
   async issueLinkTypes(): Promise<Record<string, unknown>> {
-    return { issueLinkTypes: await this.client().issueLinkTypes() };
+    const issueLinkTypes = await this.client().issueLinkTypes();
+    return { issueLinkTypes, issueLinkTypeCount: issueLinkTypes.length, firstIssueLinkTypeId: firstStringValue(issueLinkTypes, "id"), firstIssueLinkTypeName: firstStringValue(issueLinkTypes, "name") };
   }
 
   issueUrl(issueKey: string, commentId?: string): Record<string, unknown> {
@@ -322,6 +379,26 @@ export class JiraIntegrationService {
   }
 }
 
+function issueResult(issue: JiraIssueSummary): Record<string, unknown> {
+  return {
+    issue,
+    issueKey: issue.key,
+    issueUrl: issue.url,
+    summary: issue.summary,
+    status: issue.status,
+    statusId: issue.statusId,
+    issueType: issue.issueType,
+    priority: issue.priority,
+    assigneeAccountId: issue.assignee?.accountId,
+    projectKey: issue.projectKey,
+    epicKey: issue.epicKey
+  };
+}
+
+function firstStringValue(records: Record<string, unknown>[], key: string): string | undefined {
+  return stringValue(records[0]?.[key]);
+}
+
 function issueFieldsFromInput(input: Record<string, unknown>): Record<string, unknown> {
   const fields: Record<string, unknown> = {
     project: { key: requireString(input.projectKey, "projectKey") },
@@ -383,6 +460,49 @@ function issueUpdateFieldsFromInput(input: Record<string, unknown>): Record<stri
     Object.assign(fields, input.fields);
   }
   return fields;
+}
+
+function resolveTransition(transitions: Record<string, unknown>[], input: JiraTransitionInput): Record<string, unknown> {
+  const transitionId = optionalString(input.transitionId);
+  const transitionName = optionalString(input.transitionName);
+  const targetStatus = optionalString(input.targetStatus);
+  if (!transitionId && !transitionName && !targetStatus) {
+    throw new Error("transitionId, transitionName, or targetStatus must be provided.");
+  }
+  const matches = transitions.filter((transition) => {
+    if (transitionId && stringValue(transition.id) !== transitionId) {
+      return false;
+    }
+    if (transitionName && !caseInsensitiveEquals(stringValue(transition.name), transitionName)) {
+      return false;
+    }
+    if (targetStatus && !caseInsensitiveEquals(transitionTargetStatusName(transition), targetStatus)) {
+      return false;
+    }
+    return true;
+  });
+  if (matches.length === 1) {
+    return matches[0]!;
+  }
+  const selector = transitionSelectorLabel({ transitionId, transitionName, targetStatus });
+  const available = transitions.map((transition) => `${stringValue(transition.id) ?? "unknown"}:${stringValue(transition.name) ?? "unnamed"} -> ${transitionTargetStatusName(transition) ?? "unknown"}`).join(", ");
+  if (matches.length > 1) {
+    throw new Error(`Jira transition selector ${selector} matched multiple transitions. Available: ${available}`);
+  }
+  throw new Error(`Jira transition selector ${selector} did not match any transition. Available: ${available}`);
+}
+
+function transitionTargetStatusName(transition: Record<string, unknown>): string | undefined {
+  const to = isRecord(transition.to) ? transition.to : undefined;
+  return stringValue(to?.name);
+}
+
+function caseInsensitiveEquals(left: string | undefined, right: string): boolean {
+  return left?.toLowerCase() === right.toLowerCase();
+}
+
+function transitionSelectorLabel(input: { transitionId?: string; transitionName?: string; targetStatus?: string }): string {
+  return JSON.stringify(compactRecord({ transitionId: input.transitionId, transitionName: input.transitionName, targetStatus: input.targetStatus }));
 }
 
 function dashboardJql(filterJql: string, sortBy: string): string {

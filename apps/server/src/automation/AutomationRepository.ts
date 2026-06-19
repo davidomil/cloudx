@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 
-import { isAutomationGraphDocument, type AutomationGroup, type AutomationGraphDocument, type AutomationRunStatus, type AutomationRunSummary, type AutomationRunTraceEntry, type AutomationValidationSummary, type TriggerEvent, type TriggerEventSource } from "@cloudx/shared";
+import { isAutomationGraphDocument, type AutomationGroup, type AutomationGraphDocument, type AutomationRunStatus, type AutomationRunSummary, type AutomationRunTraceEntry, type AutomationTestCase, type AutomationValidationSummary, type StatePersistenceStatus, type TriggerEvent, type TriggerEventSource } from "@cloudx/shared";
 
 import { JsonStateFile } from "../jsonStateFile.js";
+import { availablePersistenceStatus, degradedPersistenceStatus, initialPersistenceStatus, isCapacityStateWriteError, persistenceStatusChanged } from "../statePersistence.js";
 
 interface AutomationStoreDocument {
   groups: AutomationGroup[];
@@ -10,7 +11,7 @@ interface AutomationStoreDocument {
   triggerEvents: TriggerEvent[];
 }
 
-export type AutomationGroupSave = Pick<AutomationGroup, "id" | "name" | "enabled" | "graph"> & Partial<Pick<AutomationGroup, "createdAt" | "updatedAt" | "lastValidation">>;
+export type AutomationGroupSave = Pick<AutomationGroup, "id" | "name" | "enabled" | "graph"> & Partial<Pick<AutomationGroup, "createdAt" | "updatedAt" | "lastValidation" | "testCases">>;
 
 const STORE_MUTATION: unique symbol = Symbol("AutomationRepository.StoreMutation");
 
@@ -26,11 +27,24 @@ const EVENT_HISTORY_LIMIT = 500;
 
 export class AutomationRepository {
   private static readonly writeQueues = new Map<string, Promise<void>>();
+  private static readonly storeCaches = new Map<string, AutomationStoreDocument>();
 
   private readonly storeFile: JsonStateFile;
+  private readonly persistenceListeners = new Set<(status: StatePersistenceStatus) => void>();
+  private persistence: StatePersistenceStatus;
 
   constructor(dataDir: string) {
     this.storeFile = new JsonStateFile(dataDir, STORE_FILE, "Automation store");
+    this.persistence = initialPersistenceStatus("Automation store", this.storeFile.filePath);
+  }
+
+  onPersistenceStatusChange(listener: (status: StatePersistenceStatus) => void): () => void {
+    this.persistenceListeners.add(listener);
+    return () => this.persistenceListeners.delete(listener);
+  }
+
+  persistenceStatus(): StatePersistenceStatus {
+    return { ...this.persistence };
   }
 
   async listGroups(): Promise<AutomationGroup[]> {
@@ -121,21 +135,22 @@ export class AutomationRepository {
 
   private async readStore(): Promise<AutomationStoreDocument> {
     await this.writeQueue().catch(() => undefined);
-    return this.load();
+    return cloneStore(await this.loadCached());
   }
 
   private async withStore<T>(mutate: (store: AutomationStoreDocument) => T | StoreMutation<T> | Promise<T | StoreMutation<T>>): Promise<T> {
     const queueKey = this.storePath();
     const operation = this.writeQueue().then(async () => {
-      const store = await this.load();
+      const previous = await this.loadCached();
+      const store = cloneStore(previous);
       const result = await mutate(store);
       if (isStoreMutation(result)) {
         if (result.changed) {
-          await this.save(store);
+          await this.saveCached(store, previous);
         }
         return result.result;
       }
-      await this.save(store);
+      await this.saveCached(store, previous);
       return result;
     });
     AutomationRepository.writeQueues.set(queueKey, operation.then(() => undefined, () => undefined));
@@ -158,6 +173,34 @@ export class AutomationRepository {
     await this.storeFile.write(store);
   }
 
+  private async loadCached(): Promise<AutomationStoreDocument> {
+    const cached = AutomationRepository.storeCaches.get(this.storePath());
+    if (cached) {
+      return cached;
+    }
+    const loaded = await this.load();
+    const current = AutomationRepository.storeCaches.get(this.storePath());
+    if (current) {
+      return current;
+    }
+    AutomationRepository.storeCaches.set(this.storePath(), loaded);
+    return loaded;
+  }
+
+  private async saveCached(store: AutomationStoreDocument, previous: AutomationStoreDocument): Promise<void> {
+    AutomationRepository.storeCaches.set(this.storePath(), store);
+    try {
+      await this.save(store);
+      this.setPersistenceStatus(availablePersistenceStatus(this.persistence));
+    } catch (error) {
+      if (!isCapacityStateWriteError(error)) {
+        AutomationRepository.storeCaches.set(this.storePath(), previous);
+        throw error;
+      }
+      this.setPersistenceStatus(degradedPersistenceStatus("Automation store", this.storePath(), error));
+    }
+  }
+
   private storePath(): string {
     return this.storeFile.filePath;
   }
@@ -165,6 +208,25 @@ export class AutomationRepository {
   private writeQueue(): Promise<void> {
     return AutomationRepository.writeQueues.get(this.storePath()) ?? Promise.resolve();
   }
+
+  private setPersistenceStatus(status: StatePersistenceStatus): void {
+    const previous = this.persistence;
+    this.persistence = status;
+    if (!persistenceStatusChanged(previous, status)) {
+      return;
+    }
+    for (const listener of this.persistenceListeners) {
+      listener(this.persistenceStatus());
+    }
+  }
+}
+
+function cloneStore(store: AutomationStoreDocument): AutomationStoreDocument {
+  return {
+    groups: store.groups.map((group) => structuredClone(group)),
+    runs: store.runs.map((run) => structuredClone(run)),
+    triggerEvents: store.triggerEvents.map((event) => structuredClone(event))
+  };
 }
 
 function storeMutation<T>(result: T, changed: boolean): StoreMutation<T> {
@@ -209,7 +271,27 @@ function isAutomationGroup(value: unknown): value is AutomationGroup {
     typeof value.createdAt === "string" &&
     typeof value.updatedAt === "string" &&
     isAutomationGraphDocument(value.graph) &&
-    (value.lastValidation === undefined || isAutomationValidationSummary(value.lastValidation))
+    (value.lastValidation === undefined || isAutomationValidationSummary(value.lastValidation)) &&
+    (value.testCases === undefined || Array.isArray(value.testCases) && value.testCases.every(isAutomationTestCase))
+  );
+}
+
+function isAutomationTestCase(value: unknown): value is AutomationTestCase {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.name === "string" &&
+    isRecord(value.payload) &&
+    (value.expected === undefined || isAutomationTestCaseExpected(value.expected))
+  );
+}
+
+function isAutomationTestCaseExpected(value: unknown): value is AutomationTestCase["expected"] {
+  return (
+    isRecord(value) &&
+    (value.status === undefined || isAutomationRunStatus(value.status)) &&
+    (value.errorIncludes === undefined || typeof value.errorIncludes === "string") &&
+    (value.traceIncludes === undefined || Array.isArray(value.traceIncludes) && value.traceIncludes.every((entry) => typeof entry === "string"))
   );
 }
 

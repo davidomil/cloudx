@@ -84,7 +84,7 @@ export class AutomationCatalogService {
     const required = new Set(inputType.kind === "object" ? inputType.required ?? [] : []);
     const inputPorts = (await Promise.all(
       Object.entries(properties).map(async ([id, type]) =>
-        this.inputPortsForSchema(id, labelFromSchema(id, propertySchemas[id]), type, propertySchemas[id], required.has(id), `Input value for ${hook.title}.`)
+        this.inputPortsForSchema(id, labelFromSchema(id, propertySchemas[id]), type, propertySchemas[id], required.has(id), inputPortFallbackDescription(hook, id, type))
       )
     )).flat();
     const targetTabPorts = hook.owner.kind === "plugin" && !Object.prototype.hasOwnProperty.call(properties, "targetTabId") ? [await this.targetTabInputPort()] : [];
@@ -103,7 +103,7 @@ export class AutomationCatalogService {
       ],
       outputs: [
         execOutput("exec", "Done", "Continue program flow after this node completes."),
-        ...outputPortsForSchema(hook.outputSchema, this.typeService)
+        ...outputPortsForSchema(hook.outputSchema, this.typeService, hook.title)
       ]
     };
   }
@@ -161,11 +161,80 @@ export class AutomationCatalogService {
 
 interface PortMetadata {
   automationRole?: AutomationPortDescriptor["automationRole"];
+  codeEditor?: AutomationPortDescriptor["codeEditor"];
   description?: string;
   defaultValue?: unknown;
   options?: AutomationPortDescriptor["options"];
   connectable?: boolean;
 }
+
+const PYTHON_CODE_COMPLETIONS = [
+  {
+    label: "cloudx.call_hook",
+    type: "function",
+    detail: "Queue a CloudX hook call.",
+    info: [
+      "Queue an automation-exposed CloudX hook call from Python.",
+      "",
+      "Signature:",
+      "cloudx.call_hook(hook_id, input=None, target_tab_id=None)",
+      "",
+      "Use the registry hook id, such as \"workspace.tabs.create\" or \"jira.issues.search\". Do not include the automation node prefix \"hook:\".",
+      "",
+      "The Python process writes hook requests to stdout. CloudX removes those request lines from STDOUT and calls the hooks after Python exits successfully. Results are returned on the Hook Results output port in call order.",
+      "",
+      "Example:",
+      "cloudx.call_hook(\"notifications.send\", {\"title\": \"Done\", \"body\": \"Automation finished\"})"
+    ].join("\n"),
+    apply: "cloudx.call_hook(\"hook.id\", {})"
+  },
+  {
+    label: "call_hook",
+    type: "function",
+    detail: "Short alias for cloudx.call_hook.",
+    info: [
+      "Alias for cloudx.call_hook(hook_id, input=None, target_tab_id=None).",
+      "",
+      "Use the same plain hook id and input object rules as cloudx.call_hook. Hook requests run after Python exits successfully, and returned objects are collected on the Hook Results output port."
+    ].join("\n"),
+    apply: "call_hook(\"hook.id\", {})"
+  },
+  {
+    label: "json.dumps",
+    type: "function",
+    detail: "Serialize JSON to STDOUT.",
+    info: "Use json.dumps(value) with print(...) when Parse JSON is enabled and the node should expose structured data on the JSON output port.",
+    apply: "json.dumps(value)"
+  },
+  {
+    label: "sys.stdin.read",
+    type: "function",
+    detail: "Read node STDIN.",
+    info: "Read the Run Python node's STDIN input as a string. Import sys before calling sys.stdin.read().",
+    apply: "sys.stdin.read()"
+  }
+] satisfies NonNullable<AutomationPortDescriptor["codeEditor"]>["completions"];
+
+const BASH_CODE_COMPLETIONS = [
+  {
+    label: "set -euo pipefail",
+    type: "keyword",
+    detail: "Fail on errors, unset variables, and pipeline errors.",
+    apply: "set -euo pipefail"
+  },
+  {
+    label: "printf",
+    type: "function",
+    detail: "Write formatted output.",
+    apply: "printf '%s\\n' \"\""
+  },
+  {
+    label: "jq",
+    type: "function",
+    detail: "Process JSON when jq is installed in the environment.",
+    apply: "jq '.'"
+  }
+] satisfies NonNullable<AutomationPortDescriptor["codeEditor"]>["completions"];
 
 function primitiveEntries(): AutomationNodeCatalogEntry[] {
   return [
@@ -290,7 +359,102 @@ function primitiveEntries(): AutomationNodeCatalogEntry[] {
       outputs: [dataOutput("value", "Value", STRING_TYPE, "Rendered f-string text.")]
     },
     ...stringOperationEntries(),
+    ...stringComparisonEntries(),
     ...mathOperationEntries(),
+    ...numberComparisonEntries(),
+    {
+      typeId: "primitive:sleep",
+      kind: "primitive",
+      title: "Sleep",
+      description: "Delay program flow for a bounded number of milliseconds.",
+      inputs: [
+        execInput("exec", "Run", "Incoming program-flow step."),
+        dataInput("durationMs", "Duration", NUMBER_TYPE, true, { description: "Delay duration in milliseconds.", defaultValue: 1000 })
+      ],
+      outputs: [execOutput("exec", "Done", "Continue after the delay completes.")]
+    },
+    {
+      typeId: "primitive:python.exec",
+      kind: "primitive",
+      title: "Run Python",
+      description: "Run Python code in a bounded subprocess without an implicit shell.",
+      safety: "external",
+      inputs: [
+        execInput("exec", "Run", "Incoming program-flow step."),
+        dataInput("code", "Code", STRING_TYPE, true, {
+          description: "Python source code passed to python3 -c. Use cloudx.call_hook(hook_id, input) to invoke automation-exposed CloudX hooks.",
+          codeEditor: { language: "python", minHeight: 260, completions: PYTHON_CODE_COMPLETIONS }
+        }),
+        dataInput("stdin", "STDIN", STRING_TYPE, false, { description: "Optional UTF-8 stdin passed to the Python process.", defaultValue: "" }),
+        dataInput("cwd", "CWD", STRING_TYPE, false, { description: "Working directory. Relative paths resolve from the first configured CloudX root." }),
+        dataInput("timeoutMs", "Timeout", NUMBER_TYPE, false, { description: "Process timeout in milliseconds.", defaultValue: 30_000 }),
+        dataInput("cloudxHooks", "CloudX Hooks", BOOLEAN_TYPE, false, { description: "Expose cloudx.call_hook and call_hook helpers in the Python process.", defaultValue: true }),
+        dataInput("parseJson", "Parse JSON", BOOLEAN_TYPE, false, { description: "Parse stdout as JSON and expose it on the JSON output port.", defaultValue: false })
+      ],
+      outputs: [
+        execOutput("exec", "Done", "Continue after the Python process exits with code 0."),
+        dataOutput("stdout", "STDOUT", STRING_TYPE, "Captured standard output."),
+        dataOutput("stderr", "STDERR", STRING_TYPE, "Captured standard error."),
+        dataOutput("exitCode", "Exit Code", NUMBER_TYPE, "Numeric process exit code."),
+        dataOutput("json", "JSON", UNKNOWN_TYPE, "Parsed stdout JSON when Parse JSON is enabled."),
+        dataOutput("hookResults", "Hook Results", ARRAY_TYPE, "Results returned by queued cloudx.call_hook calls."),
+        dataOutput("hookResultCount", "Hook Count", NUMBER_TYPE, "Number of CloudX hook calls executed.")
+      ]
+    },
+    {
+      typeId: "primitive:bash.exec",
+      kind: "primitive",
+      title: "Run Bash",
+      description: "Run bash commands in a bounded subprocess.",
+      safety: "external",
+      inputs: [
+        execInput("exec", "Run", "Incoming program-flow step."),
+        dataInput("script", "Script", STRING_TYPE, true, {
+          description: "Bash script passed to bash --noprofile --norc -euo pipefail -c.",
+          codeEditor: { language: "bash", minHeight: 220, completions: BASH_CODE_COMPLETIONS }
+        }),
+        dataInput("stdin", "STDIN", STRING_TYPE, false, { description: "Optional UTF-8 stdin passed to the bash process.", defaultValue: "" }),
+        dataInput("cwd", "CWD", STRING_TYPE, false, { description: "Working directory. Relative paths resolve from the first configured CloudX root." }),
+        dataInput("timeoutMs", "Timeout", NUMBER_TYPE, false, { description: "Process timeout in milliseconds.", defaultValue: 30_000 }),
+        dataInput("parseJson", "Parse JSON", BOOLEAN_TYPE, false, { description: "Parse stdout as JSON and expose it on the JSON output port.", defaultValue: false })
+      ],
+      outputs: [
+        execOutput("exec", "Done", "Continue after the bash process exits with code 0."),
+        dataOutput("stdout", "STDOUT", STRING_TYPE, "Captured standard output."),
+        dataOutput("stderr", "STDERR", STRING_TYPE, "Captured standard error."),
+        dataOutput("exitCode", "Exit Code", NUMBER_TYPE, "Numeric process exit code."),
+        dataOutput("json", "JSON", UNKNOWN_TYPE, "Parsed stdout JSON when Parse JSON is enabled.")
+      ]
+    },
+    {
+      typeId: "primitive:codex.exec",
+      kind: "primitive",
+      title: "Run Codex Exec",
+      description: "Run Codex non-interactively in a bounded subprocess.",
+      safety: "external",
+      inputs: [
+        execInput("exec", "Run", "Incoming program-flow step."),
+        dataInput("prompt", "Prompt", STRING_TYPE, true, { description: "Task prompt passed to codex exec." }),
+        dataInput("stdin", "STDIN", STRING_TYPE, false, { description: "Optional UTF-8 stdin passed as extra context.", defaultValue: "" }),
+        dataInput("cwd", "CWD", STRING_TYPE, false, { description: "Working directory. Relative paths resolve from the first configured CloudX root." }),
+        dataInput("timeoutMs", "Timeout", NUMBER_TYPE, false, { description: "Process timeout in milliseconds.", defaultValue: 300_000 }),
+        dataInput("profile", "Profile", STRING_TYPE, false, { description: "Optional Codex profile or template name passed with --profile." }),
+        dataInput("model", "Model", STRING_TYPE, false, { description: "Optional Codex model override passed with --model." }),
+        dataInput("sandbox", "Sandbox", STRING_TYPE, false, { description: "Codex sandbox mode.", defaultValue: "read-only", options: { values: enumOptions(["read-only", "workspace-write", "danger-full-access"]) } }),
+        dataInput("approvalPolicy", "Approval", STRING_TYPE, false, { description: "Codex approval policy.", defaultValue: "never", options: { values: enumOptions(["untrusted", "on-request", "never"]) } }),
+        dataInput("ephemeral", "Ephemeral", BOOLEAN_TYPE, false, { description: "Pass --ephemeral so the run does not persist session rollout files.", defaultValue: true }),
+        dataInput("json", "JSONL", BOOLEAN_TYPE, false, { description: "Run codex exec with --json and parse stdout JSONL events.", defaultValue: false }),
+        dataInput("skipGitRepoCheck", "Skip Git Check", BOOLEAN_TYPE, false, { description: "Pass --skip-git-repo-check for trusted non-repository workspaces.", defaultValue: false })
+      ],
+      outputs: [
+        execOutput("exec", "Done", "Continue after codex exec exits with code 0."),
+        dataOutput("finalMessage", "Final Message", STRING_TYPE, "Final Codex response."),
+        dataOutput("stdout", "STDOUT", STRING_TYPE, "Captured standard output."),
+        dataOutput("stderr", "STDERR", STRING_TYPE, "Captured standard error and progress output."),
+        dataOutput("exitCode", "Exit Code", NUMBER_TYPE, "Numeric process exit code."),
+        dataOutput("jsonEvents", "JSON Events", ARRAY_TYPE, "Parsed JSONL events when JSONL is enabled.")
+      ]
+    },
     {
       typeId: "primitive:log",
       kind: "primitive",
@@ -298,6 +462,36 @@ function primitiveEntries(): AutomationNodeCatalogEntry[] {
       description: "Append a message to the automation run trace.",
       inputs: [execInput("exec", "Run", "Incoming program-flow step."), dataInput("message", "Message", UNKNOWN_TYPE, false, { description: "Message written to the run trace. Empty uses node config.message." })],
       outputs: [execOutput("exec", "Done", "Continue after the message is logged.")]
+    }
+  ];
+}
+
+function stringComparisonEntries(): AutomationNodeCatalogEntry[] {
+  return [
+    {
+      typeId: "primitive:string.compare",
+      kind: "primitive",
+      title: "Compare Text",
+      description: "Compare text for equality, containment, prefix, or suffix.",
+      inputs: [
+        dataInput("left", "Left", STRING_TYPE, true, { description: "Text to compare.", defaultValue: "" }),
+        dataInput("right", "Right", STRING_TYPE, true, { description: "Comparison text.", defaultValue: "" }),
+        dataInput("operator", "Operator", STRING_TYPE, true, {
+          description: "Text comparison operation.",
+          defaultValue: "equals",
+          options: {
+            values: [
+              { value: "equals", label: "Equals" },
+              { value: "notEquals", label: "Not Equals" },
+              { value: "contains", label: "Contains" },
+              { value: "startsWith", label: "Starts With" },
+              { value: "endsWith", label: "Ends With" }
+            ]
+          }
+        }),
+        dataInput("caseSensitive", "Case Sensitive", BOOLEAN_TYPE, false, { description: "Compare uppercase and lowercase letters as distinct.", defaultValue: true })
+      ],
+      outputs: [dataOutput("value", "Value", BOOLEAN_TYPE, "Boolean comparison result.")]
     }
   ];
 }
@@ -412,6 +606,60 @@ function stringOperationEntries(): AutomationNodeCatalogEntry[] {
   ];
 }
 
+function numberComparisonEntries(): AutomationNodeCatalogEntry[] {
+  return [
+    {
+      typeId: "primitive:number.compare",
+      kind: "primitive",
+      title: "Compare Numbers",
+      description: "Compare two numbers for equality or order.",
+      inputs: [
+        dataInput("left", "Left", NUMBER_TYPE, true, { description: "Left operand.", defaultValue: 0 }),
+        dataInput("right", "Right", NUMBER_TYPE, true, { description: "Right operand.", defaultValue: 0 }),
+        dataInput("operator", "Operator", STRING_TYPE, true, {
+          description: "Numeric comparison operation.",
+          defaultValue: "equals",
+          options: {
+            values: [
+              { value: "equals", label: "Equals" },
+              { value: "notEquals", label: "Not Equals" },
+              { value: "lessThan", label: "Less Than" },
+              { value: "lessThanOrEqual", label: "Less Than Or Equal" },
+              { value: "greaterThan", label: "Greater Than" },
+              { value: "greaterThanOrEqual", label: "Greater Than Or Equal" }
+            ]
+          }
+        })
+      ],
+      outputs: [dataOutput("value", "Value", BOOLEAN_TYPE, "Boolean comparison result.")]
+    },
+    {
+      typeId: "primitive:number.range",
+      kind: "primitive",
+      title: "Number In Range",
+      description: "Check whether a number is inside or outside a range.",
+      inputs: [
+        dataInput("value", "Value", NUMBER_TYPE, true, { description: "Number to test.", defaultValue: 0 }),
+        dataInput("min", "Minimum", NUMBER_TYPE, true, { description: "Range lower bound.", defaultValue: 0 }),
+        dataInput("max", "Maximum", NUMBER_TYPE, true, { description: "Range upper bound.", defaultValue: 1 }),
+        dataInput("mode", "Mode", STRING_TYPE, true, {
+          description: "Range inclusion mode.",
+          defaultValue: "inclusive",
+          options: {
+            values: [
+              { value: "inclusive", label: "Inclusive" },
+              { value: "exclusive", label: "Exclusive" },
+              { value: "outsideInclusive", label: "Outside Inclusive" },
+              { value: "outsideExclusive", label: "Outside Exclusive" }
+            ]
+          }
+        })
+      ],
+      outputs: [dataOutput("value", "Value", BOOLEAN_TYPE, "Boolean range result.")]
+    }
+  ];
+}
+
 function mathOperationEntries(): AutomationNodeCatalogEntry[] {
   return [
     binaryMathEntry("primitive:math.add", "Add Numbers", "Add Left and Right.", "Sum of Left and Right."),
@@ -475,15 +723,134 @@ function converter(typeId: string, title: string, input: AutomationType, output:
   };
 }
 
-function outputPortsForSchema(outputSchema: Record<string, unknown> | undefined, typeService: AutomationTypeService): AutomationPortDescriptor[] {
-  const outputType = typeService.schemaToType(outputSchema);
-  if (outputType.kind !== "object") {
-    return outputType.kind === "unknown" ? [] : [dataOutput("value", "Value", outputType, descriptionFromSchema(outputSchema))];
+function inputPortFallbackDescription(hook: HookDescriptor, id: string, type: AutomationType): string {
+  const label = titleCase(id);
+  const jiraDescription = jiraInputPortDescription(hook.id, id);
+  if (jiraDescription) {
+    return jiraDescription;
   }
-  return outputPortsForObject("", outputType, outputSchema);
+  const documentationDescription = documentationInputPortDescription(hook.id, id);
+  if (documentationDescription) {
+    return documentationDescription;
+  }
+  const commonDescription = commonInputPortDescription(id);
+  if (commonDescription) {
+    return commonDescription;
+  }
+  if (type.kind === "boolean") {
+    return `${label} flag used by ${hook.title}.`;
+  }
+  if (type.kind === "array") {
+    return `${label} list used by ${hook.title}.`;
+  }
+  if (type.kind === "object") {
+    return `${label} object sent to ${hook.title}.`;
+  }
+  return `${label} value used by ${hook.title}.`;
 }
 
-function outputPortsForObject(prefix: string, outputType: AutomationType, outputSchema: Record<string, unknown> | undefined): AutomationPortDescriptor[] {
+function jiraInputPortDescription(hookId: string, id: string): string | undefined {
+  if (!hookId.startsWith("jira.")) {
+    return undefined;
+  }
+  const descriptions: Record<string, string> = {
+    issueIdOrKey: "Jira issue key or numeric issue ID this node reads or modifies.",
+    issueKey: "Jira issue key used by this node.",
+    projectKey: "Jira project key for the issue operation.",
+    issueType: "Jira issue type name, such as Task, Bug, Story, or Epic.",
+    summary: "Jira issue summary text.",
+    description: "Jira issue description text.",
+    parentKey: "Parent Jira issue key for a child issue.",
+    epicKey: "Epic Jira issue key for the issue relationship.",
+    priority: "Jira priority name to set on the issue.",
+    assigneeAccountId: "Jira account ID to assign to the issue.",
+    labels: "Jira labels to add or replace on the issue.",
+    customFields: "Additional Jira create fields keyed by field ID.",
+    fields: "Jira REST fields object for fields accepted by this operation or transition screen.",
+    update: "Jira REST update object for update operations such as labels or comments.",
+    body: "Plain-text Jira comment body.",
+    comment: "Plain-text Jira comment added while performing this operation.",
+    transitionId: "Exact Jira transition ID to execute.",
+    transitionName: "Exact Jira transition name to execute, matched case-insensitively.",
+    targetStatus: "Exact target Jira status name to transition to, matched case-insensitively.",
+    expandFields: "Include Jira transition-screen field metadata in the transition list.",
+    inwardIssueKey: "Jira issue key for the inward side of the link.",
+    outwardIssueKey: "Jira issue key for the outward side of the link.",
+    typeName: "Jira issue link type name, such as Relates.",
+    commentId: "Jira comment ID to include in the generated issue URL.",
+    jql: "JQL query to execute.",
+    maxResults: hookId === "jira.issues.searchAll" ? "Maximum total Jira issues to return across pages." : "Maximum Jira issues to return for this page.",
+    pageSize: "Number of Jira issues requested per page.",
+    nextPageToken: "Jira page token used to continue a previous search."
+  };
+  return descriptions[id];
+}
+
+function documentationInputPortDescription(hookId: string, id: string): string | undefined {
+  if (!hookId.startsWith("documentation.")) {
+    return undefined;
+  }
+  const descriptions: Record<string, string> = {
+    path: hookId.includes(".archive.") ? "Filesystem path for the documentation archive file." : "File or directory path to ingest into the documentation archive.",
+    cwd: "Base directory used to resolve a relative documentation path.",
+    confirmation: "Required confirmation text for the destructive archive replacement.",
+    query: "Search query sent to the documentation archive.",
+    limit: "Maximum documentation search results to return.",
+    states: "Documentation record states to include in the search.",
+    sourceTypes: "Documentation source types to include in the search.",
+    collection: "Documentation collection name used to group records.",
+    mode: "Documentation search mode.",
+    url: "Source URL to ingest into the documentation archive.",
+    title: "Human-readable documentation record title.",
+    text: "Raw text content to ingest as a documentation record.",
+    uri: "Original source URI stored with the ingested text record.",
+    sourceType: "Documentation source type stored with the record.",
+    tags: "Tags stored with the documentation record.",
+    transcript: "Transcript text associated with the ingested URL.",
+    acceptGeneratedCodeDocumentation: "Allow generated summaries when ingesting source-code-heavy inputs.",
+    retainRawCodeArtifacts: "Retain raw code artifacts during documentation ingestion when allowed.",
+    documentId: "Documentation record ID to update or remove.",
+    state: "New documentation record state.",
+    reason: "Reason recorded for the documentation state change."
+  };
+  return descriptions[id];
+}
+
+function commonInputPortDescription(id: string): string | undefined {
+  const descriptions: Record<string, string> = {
+    targetTabId: "Workspace tab ID that receives this hook call.",
+    pluginId: "Workspace plugin ID used by this operation.",
+    tabId: "Workspace tab ID used by this operation.",
+    windowId: "Workspace window ID used by this operation.",
+    paneId: "Workspace pane ID used by this operation.",
+    templateId: "Rules/skills or layout template ID used by this operation.",
+    cwd: "Working directory used by this operation.",
+    defaultCwd: "Default working directory for the created workspace window.",
+    createDirectory: "Create the target directory when it does not already exist.",
+    name: "Name assigned by this operation.",
+    title: "Title assigned by this operation.",
+    reason: "Reason recorded by this operation.",
+    timeoutMs: "Maximum time this operation may run before it is cancelled.",
+    command: "Shell command to execute.",
+    text: "Text passed to this operation.",
+    key: "Key press sent to the target tab.",
+    submit: "Submit the entered text after typing it.",
+    quietMs: "Quiet period required before the target is considered ready.",
+    includeSizes: "Include filesystem size information in the returned project state.",
+    mode: "Mode selected for this operation."
+  };
+  return descriptions[id];
+}
+
+function outputPortsForSchema(outputSchema: Record<string, unknown> | undefined, typeService: AutomationTypeService, sourceTitle: string): AutomationPortDescriptor[] {
+  const outputType = typeService.schemaToType(outputSchema);
+  if (outputType.kind !== "object") {
+    return outputType.kind === "unknown" ? [] : [dataOutput("value", "Value", outputType, descriptionFromSchema(outputSchema) ?? `Value returned by ${sourceTitle}.`)];
+  }
+  return outputPortsForObject("", outputType, outputSchema, sourceTitle);
+}
+
+function outputPortsForObject(prefix: string, outputType: AutomationType, outputSchema: Record<string, unknown> | undefined, sourceTitle: string): AutomationPortDescriptor[] {
   const propertySchemas = recordOfRecords(outputSchema?.properties);
   return Object.entries(outputType.properties ?? {}).flatMap(([id, type]) => {
     const portId = prefix ? `${prefix}.${id}` : id;
@@ -493,12 +860,12 @@ function outputPortsForObject(prefix: string, outputType: AutomationType, output
       return [];
     }
     if (type.kind === "object" && shouldFlattenObjectSchema(schema)) {
-      return outputPortsForObject(portId, type, schema);
+      return outputPortsForObject(portId, type, schema, sourceTitle);
     }
     if (type.kind === "object") {
       return [];
     }
-    return [dataOutput(portId, label, type, descriptionFromSchema(schema) ?? `${label} value returned by this hook.`)];
+    return [dataOutput(portId, label, type, descriptionFromSchema(schema) ?? `${label} returned by ${sourceTitle}.`)];
   });
 }
 

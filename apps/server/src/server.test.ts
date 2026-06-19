@@ -120,6 +120,16 @@ describe("buildServer", () => {
       const windowId = created.json().activeWindowId as string;
       expect(created.json().windows.find((window: { id: string }) => window.id === windowId)).toMatchObject({ name: "Feature", defaultCwd: root });
 
+      const generatedProject = path.join(root, "generated-project");
+      const generated = await app.inject({
+        method: "POST",
+        url: "/api/windows",
+        payload: { name: "Generated", defaultCwd: generatedProject, createDirectory: true }
+      });
+      expect(generated.statusCode).toBe(201);
+      await expect(fs.stat(generatedProject).then((stat) => stat.isDirectory())).resolves.toBe(true);
+      expect(generated.json().windows.find((window: { name: string }) => window.name === "Generated")).toMatchObject({ defaultCwd: generatedProject });
+
       const renamed = await app.inject({
         method: "PATCH",
         url: `/api/windows/${windowId}`,
@@ -151,6 +161,10 @@ describe("buildServer", () => {
       const malformedCwd = await app.inject({ method: "POST", url: "/api/windows", payload: { defaultCwd: false } });
       expect(malformedCwd.statusCode).toBe(400);
       expect(malformedCwd.json().message).toBe("defaultCwd must be a string.");
+
+      const malformedCreateDirectory = await app.inject({ method: "POST", url: "/api/windows", payload: { createDirectory: "yes" } });
+      expect(malformedCreateDirectory.statusCode).toBe(400);
+      expect(malformedCreateDirectory.json().message).toBe("createDirectory must be a boolean.");
 
       const malformedMetadata = await app.inject({ method: "POST", url: "/api/windows", payload: { pluginMetadata: [] } });
       expect(malformedMetadata.statusCode).toBe(400);
@@ -325,6 +339,51 @@ describe("buildServer", () => {
         windows: expect.arrayContaining([expect.objectContaining({ name: "Recovered" })])
       });
     } finally {
+      client?.close();
+      await app.close();
+    }
+  });
+
+  it("keeps workspace snapshots reachable and notifies when persistence is degraded", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-workspace-degraded-route-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    const workspaceFile = (services.workspace! as unknown as { workspaceFile: { write(value: unknown): Promise<void> } }).workspaceFile;
+    const originalWrite = workspaceFile.write.bind(workspaceFile);
+    workspaceFile.write = vi.fn()
+      .mockRejectedValueOnce(Object.assign(new Error("no space left on device"), { code: "ENOSPC" }))
+      .mockImplementation(originalWrite);
+    const app = await buildServer(config, services);
+    let client: WebSocket | undefined;
+    try {
+      await app.listen({ host: "127.0.0.1", port: 0 });
+      const address = app.server.address() as { port: number };
+      client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/workspace`);
+      await readWebSocketJson(client);
+
+      const notificationMessage = readWebSocketJsonMatching(client, (message) => message.type === "notification");
+      const workspaceMessage = readWebSocketJsonMatching(client, (message) => message.type === "workspace");
+      const created = await app.inject({ method: "POST", url: "/api/windows", payload: { name: "Still Live", defaultCwd: root } });
+
+      expect(created.statusCode).toBe(201);
+      expect(created.json()).toMatchObject({
+        windows: expect.arrayContaining([expect.objectContaining({ name: "Still Live" })]),
+        persistence: expect.arrayContaining([expect.objectContaining({ name: "Workspace layout", state: "degraded", code: "ENOSPC" })])
+      });
+      await expect(notificationMessage).resolves.toMatchObject({
+        type: "notification",
+        notification: {
+          level: "warning",
+          title: "Workspace layout is not being saved"
+        }
+      });
+      await expect(workspaceMessage).resolves.toMatchObject({
+        type: "workspace",
+        windows: expect.arrayContaining([expect.objectContaining({ name: "Still Live" })]),
+        persistence: expect.arrayContaining([expect.objectContaining({ state: "degraded", code: "ENOSPC" })])
+      });
+    } finally {
+      workspaceFile.write = originalWrite;
       client?.close();
       await app.close();
     }
@@ -865,9 +924,56 @@ describe("buildServer", () => {
       expect(events).toEqual(expect.arrayContaining([
         expect.objectContaining({ type: "progress", status: "running", stage: expect.stringContaining("writing text") }),
         expect.objectContaining({ type: "progress", status: "complete", progress: 100 }),
-        expect.objectContaining({ type: "result", result: { document: { documentId: "streamed-doc", sourceType: "text" } } })
+        expect.objectContaining({
+          type: "result",
+          result: expect.objectContaining({
+            document: { documentId: "streamed-doc", sourceType: "text" },
+            documents: [{ documentId: "streamed-doc", sourceType: "text" }],
+            documentCount: 1,
+            firstDocumentId: "streamed-doc",
+            kind: "text"
+          })
+        })
       ]));
       expect(events.findIndex((event) => event.type === "progress" && event.status === "running")).toBeLessThan(events.findIndex((event) => event.type === "result"));
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("passes request abort signals to normal and streaming hook calls", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-hook-signal-route-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    services.hooks!.register({
+      id: "test.signal",
+      owner: { kind: "app" },
+      title: "Signal",
+      description: "Report whether an HTTP hook call received an abort signal.",
+      exposures: ["http"],
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute: (_input, context) => ({ hasSignal: Boolean(context.signal), aborted: context.signal?.aborted ?? true })
+    });
+    const app = await buildServer(config, services);
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/hooks/test.signal",
+        payload: { input: {} }
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().result).toEqual({ hasSignal: true, aborted: false });
+
+      const streamed = await app.inject({
+        method: "POST",
+        url: "/api/hooks/test.signal?stream=1",
+        headers: { accept: "application/x-ndjson" },
+        payload: { input: {} }
+      });
+      expect(streamed.statusCode).toBe(200);
+      expect(ndjsonEvents(streamed.body)).toEqual([
+        expect.objectContaining({ type: "result", result: { hasSignal: true, aborted: false } })
+      ]);
     } finally {
       await app.close();
     }
@@ -1109,7 +1215,23 @@ describe("buildServer", () => {
           .filter((port) => !port.description?.trim())
           .map((port) => `${node.typeId}:${port.id}`)
       );
+      const weakPortDescriptions = catalogNodes.flatMap((node: { typeId: string; inputs: Array<{ id: string; description?: string }>; outputs: Array<{ id: string; description?: string }> }) =>
+        [...node.inputs, ...node.outputs]
+          .filter((port) => /^(Input value for|Output value from|Value returned by this hook\.?$)/i.test(port.description?.trim() ?? ""))
+          .map((port) => `${node.typeId}:${port.id}:${port.description}`)
+      );
+      const execOnlyFunctionNodes = catalogNodes
+        .filter((node: { kind: string; outputs: Array<{ kind: string; id: string }> }) => node.kind === "function" && node.outputs.every((port) => port.kind === "control" || port.id === "exec"))
+        .map((node: { typeId: string }) => node.typeId)
+        .sort();
+      expect(catalogNodes).toHaveLength(114);
       expect(portsMissingDescriptions).toEqual([]);
+      expect(weakPortDescriptions).toEqual([]);
+      expect(execOnlyFunctionNodes).toEqual([
+        "hook:workspace.panes.select",
+        "hook:workspace.panes.split",
+        "hook:workspace.settings.openTabConfig"
+      ]);
       expect(catalog.json().nodes).toEqual(
         expect.arrayContaining([
           expect.objectContaining({ typeId: "trigger:worktree.created" }),
@@ -1121,7 +1243,8 @@ describe("buildServer", () => {
           expect.objectContaining({ typeId: "primitive:string.regex.extract" }),
           expect.objectContaining({ typeId: "primitive:string.split" }),
           expect.objectContaining({ typeId: "primitive:math.add" }),
-          expect.objectContaining({ typeId: "primitive:math.divide" })
+          expect.objectContaining({ typeId: "primitive:math.divide" }),
+          expect.objectContaining({ typeId: "primitive:bash.exec" })
         ])
       );
       expect(catalogNodes.find((node: { typeId: string }) => node.typeId === "trigger:jira.issueUpdated").outputs).toEqual(
@@ -1135,6 +1258,52 @@ describe("buildServer", () => {
         expect.arrayContaining([
           expect.objectContaining({ id: "issue" }),
           expect.objectContaining({ id: "assigneeEmailAddress" })
+        ])
+      );
+      expect(catalogNodes.find((node: { typeId: string }) => node.typeId === "hook:documentation.search").outputs).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: "results", kind: "data" }),
+          expect.objectContaining({ id: "resultCount", kind: "data" }),
+          expect.objectContaining({ id: "firstDocumentId", kind: "data" })
+        ])
+      );
+      expect(catalogNodes.find((node: { typeId: string }) => node.typeId === "hook:documentation.ingest.text").outputs).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: "documents", kind: "data" }),
+          expect.objectContaining({ id: "documentCount", kind: "data" }),
+          expect.objectContaining({ id: "kind", kind: "data" }),
+          expect.objectContaining({ id: "source", kind: "data" })
+        ])
+      );
+      expect(catalogNodes.find((node: { typeId: string }) => node.typeId === "hook:documentation.archive.export").outputs).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: "path", kind: "data" }),
+          expect.objectContaining({ id: "bytes", kind: "data" })
+        ])
+      );
+      expect(catalogNodes.find((node: { typeId: string }) => node.typeId === "hook:jira.currentUser.get").outputs).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: "user.accountId", kind: "data" }),
+          expect.objectContaining({ id: "user.displayName", kind: "data" })
+        ])
+      );
+      expect(catalogNodes.find((node: { typeId: string }) => node.typeId === "hook:jira.issue.get").outputs).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: "issueKey", kind: "data" }),
+          expect.objectContaining({ id: "issueUrl", kind: "data" }),
+          expect.objectContaining({ id: "status", kind: "data" })
+        ])
+      );
+      expect(catalogNodes.find((node: { typeId: string }) => node.typeId === "hook:jira.issue.create").outputs).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: "issueKey", kind: "data" }),
+          expect.objectContaining({ id: "issueUrl", kind: "data" })
+        ])
+      );
+      expect(catalogNodes.find((node: { typeId: string }) => node.typeId === "hook:jira.priorities.list").outputs).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: "priorityCount", kind: "data" }),
+          expect.objectContaining({ id: "firstPriorityName", kind: "data" })
         ])
       );
       expect(catalogNodes.find((node: { typeId: string }) => node.typeId === "hook:codex-terminal.enterText")).toMatchObject({ title: "Enter Text" });
@@ -1454,14 +1623,14 @@ describe("buildServer", () => {
     try {
       const initial = await app.inject({ method: "GET", url: "/api/config" });
       expect(initial.statusCode).toBe(200);
-      expect(initial.json().values.global).toMatchObject({ aiControlEnabled: true, voiceCommandsEnabled: true, microphoneEnabled: true, themeId: "cloudx-neon", uiScale: 100 });
+      expect(initial.json().values.global).toMatchObject({ aiControlEnabled: true, voiceCommandsEnabled: true, microphoneEnabled: true, voiceModel: config.voiceModel, themeId: "cloudx-neon", uiScale: 100 });
       expect(initial.json().values.plugins["file-browser"]).toMatchObject({ showGitDiff: true, gitAutoRefresh: true, gitAutoRefreshSeconds: 15 });
 
       const updated = await app.inject({
         method: "PATCH",
         url: "/api/config",
         payload: {
-          global: { aiControlEnabled: false, voiceCommandsEnabled: false, themeId: "minimalist-dark", uiScale: 115 },
+          global: { aiControlEnabled: false, voiceCommandsEnabled: false, voiceModel: "gpt-5.4-mini", themeId: "minimalist-dark", uiScale: 115 },
           plugins: { "file-browser": { showGitDiff: false, gitAutoRefresh: false, gitAutoRefreshSeconds: 30 } }
         }
       });
@@ -1469,6 +1638,7 @@ describe("buildServer", () => {
       expect(updated.statusCode).toBe(200);
       expect(updated.json().values.global.aiControlEnabled).toBe(false);
       expect(updated.json().values.global.voiceCommandsEnabled).toBe(false);
+      expect(updated.json().values.global.voiceModel).toBe("gpt-5.4-mini");
       expect(updated.json().values.global.themeId).toBe("minimalist-dark");
       expect(updated.json().values.global.uiScale).toBe(115);
       expect(updated.json().values.plugins["file-browser"].showGitDiff).toBe(false);
@@ -1509,6 +1679,10 @@ describe("buildServer", () => {
       const malformedValuePatch = await app.inject({ method: "PATCH", url: "/api/config", payload: { global: { uiScale: "large" } } });
       expect(malformedValuePatch.statusCode).toBe(400);
       expect(malformedValuePatch.json().message).toBe("global.uiScale must be a finite number.");
+
+      const malformedVoiceModelPatch = await app.inject({ method: "PATCH", url: "/api/config", payload: { global: { voiceModel: "gpt 5.4" } } });
+      expect(malformedVoiceModelPatch.statusCode).toBe(400);
+      expect(malformedVoiceModelPatch.json().message).toBe("global.voiceModel must be one of the configured options.");
 
       const unknownPluginPatch = await app.inject({ method: "PATCH", url: "/api/config", payload: { plugins: { missing: {} } } });
       expect(unknownPluginPatch.statusCode).toBe(400);

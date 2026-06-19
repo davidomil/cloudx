@@ -45,6 +45,10 @@
     "docs:screenshots": "npm run build && node scripts/capture-readme-screenshots.mjs",
     "install:wizard": "node scripts/install-cloudx.mjs",
     "service:install": "node scripts/setup-cloudx-whisper-service.mjs",
+    "testenv:setup": "node scripts/setup-test-environment.mjs",
+    "testenv:start": "npm run build -w @cloudx/web && node scripts/setup-test-environment.mjs --start",
+    "testenv:start:lan": "CLOUDX_TEST_HOST=0.0.0.0 npm run testenv:start",
+    "testenv:stop": "node scripts/setup-test-environment.mjs --stop",
     "test": "vitest run",
     "typecheck": "tsc -b"
   },

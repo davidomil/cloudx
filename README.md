@@ -131,6 +131,11 @@ issue play action or from plugin-owned triggers such as Jira polling events.
 Poll-based Jira triggers are exposed only to plugins and automation; external
 HTTP callers use the explicit manual Jira trigger instead.
 
+Python and Bash execution primitives are available for graph steps that need
+custom code. Python code can call automation-exposed Cloudx hooks with
+`cloudx.call_hook(...)`; see `docs/AUTOMATION_CODE_EXECUTION.md` for hook ID
+format, examples, outputs, and runtime limits.
+
 ## Codex Image Paste
 
 Codex terminal tabs accept pasted PNG, JPEG, WebP, and GIF clipboard images.

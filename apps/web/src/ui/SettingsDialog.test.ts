@@ -111,6 +111,35 @@ describe("SettingsDialog", () => {
     expect(html).not.toContain("Internal Only");
   });
 
+  it("renders the runtime voice model setting", () => {
+    const html = renderToStaticMarkup(
+      createElement(SettingsDialog, {
+        config: {
+          globalFields: [
+            {
+              key: "voiceModel",
+              label: "Voice model",
+              type: "string",
+              description: "Codex model used for voice command planning.",
+              defaultValue: "gpt-5.4"
+            }
+          ],
+          plugins: [],
+          values: {
+            global: { voiceModel: "gpt-5.4-mini" },
+            plugins: {}
+          }
+        },
+        onCancel: vi.fn(),
+        onSave: vi.fn(async () => undefined)
+      })
+    );
+
+    expect(html).toContain("Voice model");
+    expect(html).toContain("gpt-5.4-mini");
+    expect(html).toContain("Codex model used for voice command planning.");
+  });
+
   it("renders a clear action for configured plugin secrets", () => {
     const html = renderToStaticMarkup(
       createElement(SettingsDialog, {

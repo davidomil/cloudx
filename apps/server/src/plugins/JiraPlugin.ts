@@ -56,12 +56,12 @@ export class JiraPlugin implements WorkspacePlugin {
         groupBy: { type: "string", enum: ["epic", "status", "priority", "project", "none"] },
         maxResults: { type: "number", minimum: 1 }
       }),
-      readHook("jira.currentUser.get", "Get Jira Current User", "Return the authenticated Jira user.", () => this.serviceProvider().currentUser(), {}, ["automation"]),
-      readHook("jira.projects.list", "List Jira Projects", "Return Jira projects visible to the authenticated account.", () => this.serviceProvider().projects(), {}, ["automation"]),
-      readHook("jira.issueTypes.list", "List Jira Issue Types", "Return Jira issue types visible to the authenticated account.", () => this.serviceProvider().issueTypes(), {}, ["automation"]),
-      readHook("jira.fields.list", "List Jira Fields", "Return Jira system and custom issue fields.", () => this.serviceProvider().fields(), {}, ["automation"]),
-      readHook("jira.priorities.list", "List Jira Priorities", "Return Jira issue priorities.", () => this.serviceProvider().priorities(), {}, ["automation"]),
-      readHook("jira.issueLinkTypes.list", "List Jira Issue Link Types", "Return Jira issue link types.", () => this.serviceProvider().issueLinkTypes(), {}, ["automation"]),
+      readHook("jira.currentUser.get", "Get Jira Current User", "Return the authenticated Jira user.", () => this.serviceProvider().currentUser(), {}, ["automation"], jiraCurrentUserOutputSchema()),
+      readHook("jira.projects.list", "List Jira Projects", "Return Jira projects visible to the authenticated account.", () => this.serviceProvider().projects(), {}, ["automation"], jiraProjectsOutputSchema()),
+      readHook("jira.issueTypes.list", "List Jira Issue Types", "Return Jira issue types visible to the authenticated account.", () => this.serviceProvider().issueTypes(), {}, ["automation"], jiraIssueTypesOutputSchema()),
+      readHook("jira.fields.list", "List Jira Fields", "Return Jira system and custom issue fields.", () => this.serviceProvider().fields(), {}, ["automation"], jiraFieldsOutputSchema()),
+      readHook("jira.priorities.list", "List Jira Priorities", "Return Jira issue priorities.", () => this.serviceProvider().priorities(), {}, ["automation"], jiraPrioritiesOutputSchema()),
+      readHook("jira.issueLinkTypes.list", "List Jira Issue Link Types", "Return Jira issue link types.", () => this.serviceProvider().issueLinkTypes(), {}, ["automation"], jiraIssueLinkTypesOutputSchema()),
       readHook("jira.issues.search", "Search Jira Issues", "Search Jira issues with JQL and return normalized issue summaries.", (input) => this.serviceProvider().search({
         jql: optionalString(input.jql),
         maxResults: optionalNumber(input.maxResults),
@@ -84,14 +84,14 @@ export class JiraPlugin implements WorkspacePlugin {
       }, ["automation"], jiraSearchOutputSchema()),
       readHook("jira.issue.get", "Get Jira Issue", "Fetch one Jira issue and return a normalized issue summary.", (input) => this.serviceProvider().getIssue(requiredString(input.issueIdOrKey, "issueIdOrKey")), {
         issueIdOrKey: { type: "string" }
-      }, ["automation"]),
+      }, ["automation"], jiraIssueOutputSchema()),
       readHook("jira.issue.comments.list", "List Jira Comments", "List normalized comments for a Jira issue.", (input) => this.serviceProvider().listComments(requiredString(input.issueIdOrKey, "issueIdOrKey")), {
         issueIdOrKey: { type: "string" }
-      }, ["automation"]),
+      }, ["automation"], jiraCommentsOutputSchema()),
       writeHook("jira.issue.comment.add", "Add Jira Comment", "Add a plain-text comment to a Jira issue.", (input) => this.serviceProvider().addComment(requiredString(input.issueIdOrKey, "issueIdOrKey"), requiredString(input.body, "body")), {
         issueIdOrKey: { type: "string" },
         body: { type: "string" }
-      }, "external", ["issueIdOrKey", "body"]),
+      }, "external", ["issueIdOrKey", "body"], jiraCommentAddOutputSchema()),
       writeHook("jira.issue.create", "Create Jira Issue", "Create a Jira issue, ticket, task, bug, story, or Epic child.", (input) => this.serviceProvider().createIssue(input), {
         projectKey: { type: "string" },
         issueType: { type: "string", default: "Task" },
@@ -103,7 +103,7 @@ export class JiraPlugin implements WorkspacePlugin {
         assigneeAccountId: { type: "string" },
         labels: { type: "array", items: { type: "string" } },
         customFields: { type: "object", additionalProperties: true }
-      }, "external", ["projectKey", "issueType", "summary"]),
+      }, "external", ["projectKey", "issueType", "summary"], jiraCreateIssueOutputSchema()),
       writeHook("jira.issue.update", "Update Jira Issue", "Update Jira issue fields using Jira REST field payloads.", (input) => this.serviceProvider().updateIssue(requiredString(input.issueIdOrKey, "issueIdOrKey"), input), {
         issueIdOrKey: { type: "string" },
         summary: { type: "string" },
@@ -114,19 +114,29 @@ export class JiraPlugin implements WorkspacePlugin {
         parentKey: { type: "string" },
         fields: { type: "object", additionalProperties: true },
         update: { type: "object", additionalProperties: true }
-      }, "external", ["issueIdOrKey"]),
-      readHook("jira.issue.transitions.list", "List Jira Transitions", "List valid workflow transitions for a Jira issue.", (input) => this.serviceProvider().listTransitions(requiredString(input.issueIdOrKey, "issueIdOrKey")), {
-        issueIdOrKey: { type: "string" }
-      }, ["automation"]),
-      writeHook("jira.issue.transition", "Transition Jira Issue", "Move a Jira issue through a workflow transition.", (input) => this.serviceProvider().transitionIssue(requiredString(input.issueIdOrKey, "issueIdOrKey"), requiredString(input.transitionId, "transitionId"), {
-        comment: optionalString(input.comment),
-        fields: isRecord(input.fields) ? input.fields : undefined
+      }, "external", ["issueIdOrKey"], jiraUpdateIssueOutputSchema()),
+      readHook("jira.issue.transitions.list", "List Jira Transitions", "List valid workflow transitions and transition-screen fields for a Jira issue.", (input) => this.serviceProvider().listTransitions(requiredString(input.issueIdOrKey, "issueIdOrKey"), {
+        expandFields: input.expandFields !== false
       }), {
         issueIdOrKey: { type: "string" },
-        transitionId: { type: "string" },
+        expandFields: { type: "boolean", default: true, description: "Include transition-screen fields using Jira's transitions.fields expansion." }
+      }, ["automation"], jiraTransitionsOutputSchema()),
+      writeHook("jira.issue.transition", "Transition Jira Issue", "Move a Jira issue through a workflow transition by ID, transition name, or target status.", (input) => this.serviceProvider().transitionIssue(requiredString(input.issueIdOrKey, "issueIdOrKey"), {
+        transitionId: optionalString(input.transitionId),
+        transitionName: optionalString(input.transitionName),
+        targetStatus: optionalString(input.targetStatus),
+        comment: optionalString(input.comment),
+        fields: isRecord(input.fields) ? input.fields : undefined,
+        update: isRecord(input.update) ? input.update : undefined
+      }), {
+        issueIdOrKey: { type: "string" },
+        transitionId: { type: "string", description: "Exact Jira transition ID. Optional when transitionName or targetStatus is provided." },
+        transitionName: { type: "string", description: "Exact Jira transition name, matched case-insensitively." },
+        targetStatus: { type: "string", description: "Exact target status name, matched case-insensitively." },
         comment: { type: "string" },
-        fields: { type: "object", additionalProperties: true }
-      }, "external", ["issueIdOrKey", "transitionId"]),
+        fields: { type: "object", additionalProperties: true },
+        update: { type: "object", additionalProperties: true }
+      }, "external", ["issueIdOrKey"], jiraTransitionOutputSchema()),
       writeHook("jira.issue.link", "Link Jira Issues", "Create a relationship between two Jira issues.", (input) => this.serviceProvider().linkIssues({
         inwardIssueKey: requiredString(input.inwardIssueKey, "inwardIssueKey"),
         outwardIssueKey: requiredString(input.outwardIssueKey, "outwardIssueKey"),
@@ -137,19 +147,19 @@ export class JiraPlugin implements WorkspacePlugin {
         outwardIssueKey: { type: "string" },
         typeName: { type: "string", default: "Relates" },
         comment: { type: "string" }
-      }, "external", ["inwardIssueKey", "outwardIssueKey", "typeName"]),
-      readHook("jira.metadata.get", "Get Jira Metadata", "Return Jira fields, projects, and priorities for issue creation and updates.", () => this.serviceProvider().metadata(), {}, ["automation"]),
+      }, "external", ["inwardIssueKey", "outwardIssueKey", "typeName"], jiraIssueLinkOutputSchema()),
+      readHook("jira.metadata.get", "Get Jira Metadata", "Return Jira fields, projects, and priorities for issue creation and updates.", () => this.serviceProvider().metadata(), {}, ["automation"], jiraMetadataOutputSchema()),
       readHook("jira.issue.url", "Jira Issue URL", "Generate a browser URL for a Jira issue key or issue comment.", (input) => this.serviceProvider().issueUrl(requiredString(input.issueKey, "issueKey"), optionalString(input.commentId)), {
         issueKey: { type: "string" },
         commentId: { type: "string" }
-      }, ["automation"]),
+      }, ["automation"], jiraIssueUrlOutputSchema()),
       writeHook("jira.poll.run", "Run Jira Poll", "Run Jira polling once and emit automation triggers for detected changes.", async () => {
         const polling = this.pollingProvider();
         if (!polling) {
           throw new Error("Jira polling service is not available.");
         }
         return polling.runOnce();
-      }, {}, "external")
+      }, {}, "external", [], jiraPollOutputSchema())
     ];
   }
 
@@ -339,6 +349,204 @@ function jiraTriggerPayloadProperties(): Record<string, JsonSchemaLike> {
   };
 }
 
+function jiraCurrentUserOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      user: {
+        type: "object",
+        properties: {
+          accountId: { type: "string", description: "Authenticated Jira account ID." },
+          displayName: { type: "string", description: "Authenticated Jira display name." },
+          emailAddress: { type: "string", description: "Authenticated Jira email address when visible." }
+        },
+        additionalProperties: true
+      }
+    },
+    additionalProperties: true
+  };
+}
+
+function jiraProjectsOutputSchema(): Record<string, unknown> {
+  return listOutputSchema("projects", "projectCount", "Project", {
+    firstProjectKey: "First returned Jira project key.",
+    firstProjectName: "First returned Jira project name."
+  });
+}
+
+function jiraIssueTypesOutputSchema(): Record<string, unknown> {
+  return listOutputSchema("issueTypes", "issueTypeCount", "Issue type", {
+    firstIssueTypeId: "First returned Jira issue type ID.",
+    firstIssueTypeName: "First returned Jira issue type name."
+  });
+}
+
+function jiraFieldsOutputSchema(): Record<string, unknown> {
+  return listOutputSchema("fields", "fieldCount", "Field", {
+    firstFieldId: "First returned Jira field ID.",
+    firstFieldName: "First returned Jira field name."
+  });
+}
+
+function jiraPrioritiesOutputSchema(): Record<string, unknown> {
+  return listOutputSchema("priorities", "priorityCount", "Priority", {
+    firstPriorityId: "First returned Jira priority ID.",
+    firstPriorityName: "First returned Jira priority name."
+  });
+}
+
+function jiraIssueLinkTypesOutputSchema(): Record<string, unknown> {
+  return listOutputSchema("issueLinkTypes", "issueLinkTypeCount", "Issue link type", {
+    firstIssueLinkTypeId: "First returned Jira issue link type ID.",
+    firstIssueLinkTypeName: "First returned Jira issue link type name."
+  });
+}
+
+function jiraIssueOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      issue: { type: "object", additionalProperties: true, description: "Normalized Jira issue summary object." },
+      issueKey: { type: "string", description: "Normalized Jira issue key." },
+      issueUrl: { type: "string", description: "Browser URL for the Jira issue." },
+      summary: { type: "string", description: "Normalized Jira issue summary." },
+      status: { type: "string", description: "Normalized Jira issue status name." },
+      statusId: { type: "string", description: "Normalized Jira issue status ID." },
+      issueType: { type: "string", description: "Normalized Jira issue type name." },
+      priority: { type: "string", description: "Normalized Jira issue priority name." },
+      assigneeAccountId: { type: "string", description: "Assigned Jira account ID." },
+      projectKey: { type: "string", description: "Jira project key for the issue." },
+      epicKey: { type: "string", description: "Epic issue key related to this issue." }
+    },
+    required: ["issueKey", "issueUrl", "summary"],
+    additionalProperties: true
+  };
+}
+
+function jiraCommentsOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      comments: { type: "array", items: { type: "object", additionalProperties: true }, description: "Normalized Jira comments returned for the issue." },
+      commentCount: { type: "number", description: "Number of comments returned." },
+      firstCommentId: { type: "string", description: "First returned Jira comment ID." },
+      firstCommentUrl: { type: "string", description: "Browser URL for the first returned comment." },
+      firstCommentBody: { type: "string", description: "Plain text body of the first returned comment." }
+    },
+    required: ["comments", "commentCount"],
+    additionalProperties: true
+  };
+}
+
+function jiraCommentAddOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      commentId: { type: "string", description: "Created Jira comment ID." },
+      commentUrl: { type: "string", description: "Browser URL focused on the created comment." },
+      issueUrl: { type: "string", description: "Browser URL for the commented Jira issue." }
+    },
+    required: ["commentId", "commentUrl", "issueUrl"],
+    additionalProperties: true
+  };
+}
+
+function jiraCreateIssueOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      issue: { type: "object", additionalProperties: true, description: "Created Jira issue response object." },
+      issueKey: { type: "string", description: "Created Jira issue key." },
+      issueUrl: { type: "string", description: "Browser URL for the created Jira issue." }
+    },
+    required: ["issueKey"],
+    additionalProperties: true
+  };
+}
+
+function jiraUpdateIssueOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      issueKey: { type: "string", description: "Updated Jira issue key." },
+      updated: { type: "boolean", description: "True when Jira accepted the update request." },
+      issueUrl: { type: "string", description: "Browser URL for the updated Jira issue." }
+    },
+    required: ["issueKey", "updated", "issueUrl"],
+    additionalProperties: true
+  };
+}
+
+function jiraIssueLinkOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      linked: { type: "boolean", description: "True when Jira accepted the issue-link request." },
+      inwardIssueKey: { type: "string", description: "Jira issue key for the inward side of the link." },
+      outwardIssueKey: { type: "string", description: "Jira issue key for the outward side of the link." },
+      typeName: { type: "string", description: "Jira issue link type name used." },
+      inwardIssueUrl: { type: "string", description: "Browser URL for the inward Jira issue." },
+      outwardIssueUrl: { type: "string", description: "Browser URL for the outward Jira issue." }
+    },
+    required: ["linked", "inwardIssueKey", "outwardIssueKey", "typeName", "inwardIssueUrl", "outwardIssueUrl"],
+    additionalProperties: true
+  };
+}
+
+function jiraMetadataOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      fields: { type: "array", items: { type: "object", additionalProperties: true }, description: "Jira fields available to issue operations." },
+      projects: { type: "array", items: { type: "object", additionalProperties: true }, description: "Jira projects visible to the authenticated account." },
+      priorities: { type: "array", items: { type: "object", additionalProperties: true }, description: "Jira priorities available to issue operations." },
+      issueTypes: { type: "array", items: { type: "object", additionalProperties: true }, description: "Jira issue types available to issue operations." },
+      issueLinkTypes: { type: "array", items: { type: "object", additionalProperties: true }, description: "Jira issue link types available to issue operations." },
+      fieldCount: { type: "number", description: "Number of Jira fields returned." },
+      projectCount: { type: "number", description: "Number of Jira projects returned." },
+      priorityCount: { type: "number", description: "Number of Jira priorities returned." },
+      issueTypeCount: { type: "number", description: "Number of Jira issue types returned." },
+      issueLinkTypeCount: { type: "number", description: "Number of Jira issue link types returned." }
+    },
+    required: ["fields", "projects", "priorities", "issueTypes", "issueLinkTypes", "fieldCount", "projectCount", "priorityCount", "issueTypeCount", "issueLinkTypeCount"],
+    additionalProperties: true
+  };
+}
+
+function jiraIssueUrlOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      issueKey: { type: "string", description: "Jira issue key used to build the URL." },
+      commentId: { type: "string", description: "Jira comment ID included in the URL." },
+      url: { type: "string", description: "Browser URL for the issue or focused comment." }
+    },
+    required: ["issueKey", "url"],
+    additionalProperties: true
+  };
+}
+
+function jiraPollOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      initialized: { type: "boolean", description: "True when Jira polling had previous state before this run." },
+      skipped: { type: "boolean", description: "True when polling did not scan Jira." },
+      reason: { type: "string", description: "Reason polling was skipped." },
+      startedAt: { type: "string", description: "ISO timestamp when polling started." },
+      finishedAt: { type: "string", description: "ISO timestamp when polling finished." },
+      candidateIssueCount: { type: "number", description: "Number of Jira issues considered by polling." },
+      scanned: { type: "number", description: "Number of Jira issues scanned by polling." },
+      emitted: { type: "array", items: { type: "string" }, description: "Automation trigger IDs emitted by polling." },
+      emittedEventCount: { type: "number", description: "Number of automation trigger events emitted." },
+      lastUpdated: { type: "string", description: "Latest Jira updated timestamp seen during polling." },
+      nextAllowedPollAt: { type: "string", description: "ISO timestamp when rate-limited polling may retry." },
+      lastRunAt: { type: "string", description: "Previous Jira polling run timestamp." }
+    },
+    additionalProperties: true
+  };
+}
+
 function jiraSearchOutputSchema(): Record<string, unknown> {
   return {
     type: "object",
@@ -355,6 +563,53 @@ function jiraSearchOutputSchema(): Record<string, unknown> {
       hasMore: { type: "boolean", description: "True when another search page is available." }
     },
     required: ["issues", "issueKeys", "issueCount", "jql", "siteUrl", "isLast", "hasMore"],
+    additionalProperties: true
+  };
+}
+
+function listOutputSchema(listKey: string, countKey: string, label: string, extra: Record<string, string>): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      [listKey]: { type: "array", items: { type: "object", additionalProperties: true }, description: `${label} records returned by Jira.` },
+      [countKey]: { type: "number", description: `Number of ${label.toLowerCase()} records returned.` },
+      ...Object.fromEntries(Object.entries(extra).map(([key, description]) => [key, { type: "string", description }]))
+    },
+    required: [listKey, countKey],
+    additionalProperties: true
+  };
+}
+
+function jiraTransitionsOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      transitions: { type: "array", items: { type: "object", additionalProperties: true }, description: "Valid Jira transitions, including transition-screen fields when expandFields is true." },
+      transitionCount: { type: "number", description: "Number of transitions returned." },
+      firstTransitionId: { type: "string", description: "First returned transition ID." },
+      firstTransitionName: { type: "string", description: "First returned transition name." },
+      firstTargetStatus: { type: "string", description: "First returned transition target status." }
+    },
+    required: ["transitions", "transitionCount"],
+    additionalProperties: true
+  };
+}
+
+function jiraTransitionOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      issueKey: { type: "string", description: "Transitioned issue key." },
+      transitionId: { type: "string", description: "Resolved transition ID used in the Jira request." },
+      transitionName: { type: "string", description: "Resolved transition name." },
+      targetStatus: { type: "string", description: "Transition target status." },
+      transitionFields: { type: "object", additionalProperties: true, description: "Transition-screen fields returned by Jira for the resolved transition." },
+      issue: { type: "object", additionalProperties: true, description: "Normalized issue after the transition request." },
+      status: { type: "string", description: "Post-transition normalized issue status." },
+      statusId: { type: "string", description: "Post-transition normalized issue status ID." },
+      issueUrl: { type: "string", description: "Browser URL for the transitioned issue." }
+    },
+    required: ["issueKey", "transitionId", "transitionName", "targetStatus", "issueUrl"],
     additionalProperties: true
   };
 }
@@ -378,9 +633,10 @@ function writeHook(
   execute: HookDefinition["execute"],
   properties: Record<string, JsonSchemaLike> = {},
   safety: AutomationSafety,
-  required: string[] = []
+  required: string[] = [],
+  outputSchema: Record<string, unknown> = { type: "object", additionalProperties: true }
 ): HookDefinition {
-  return hook(id, title, description, execute, properties, safety, ["automation"], required);
+  return hook(id, title, description, execute, properties, safety, ["automation"], required, outputSchema);
 }
 
 function hook(

@@ -1,7 +1,11 @@
-import { describe, expect, it } from "vitest";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { JsonSchemaLike } from "@cloudx/plugin-api";
-import type { AutomationCatalogResponse, AutomationGroup, TriggerEvent } from "@cloudx/shared";
+import type { AutomationCatalogResponse, AutomationGroup, AutomationSafety, TriggerEvent } from "@cloudx/shared";
 
 import { HookRegistry } from "../hooks/HookRegistry.js";
 import { AutomationCatalogService } from "./AutomationCatalogService.js";
@@ -9,6 +13,11 @@ import { AutomationExecutor } from "./AutomationExecutor.js";
 import { AutomationTypeService } from "./AutomationTypeService.js";
 
 describe("AutomationExecutor", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+  });
+
   it("runs a trigger-to-hook graph and records trace output", async () => {
     const hooks = new HookRegistry();
     hooks.register({
@@ -408,6 +417,387 @@ describe("AutomationExecutor", () => {
 
     expect(run.status).toBe("succeeded");
     expect(run.trace.map((entry) => entry.message)).toEqual(expect.arrayContaining(["10", "8", "3"]));
+  });
+
+  it("evaluates number and string comparison primitives", async () => {
+    const run = await new AutomationExecutor().execute(comparisonOperationGroup(), event(), await primitiveCatalog(), new HookRegistry());
+
+    expect(run.status).toBe("succeeded");
+    expect(run.trace.map((entry) => entry.message)).toEqual(expect.arrayContaining(["true", "false", "true"]));
+  });
+
+  it("runs sleep primitives with cancellable fake-timer coverage", async () => {
+    vi.useFakeTimers();
+    let settled = false;
+    const runPromise = new AutomationExecutor()
+      .execute(sleepGroup(1000), event(), await primitiveCatalog(), new HookRegistry())
+      .then((run) => {
+        settled = true;
+        return run;
+      });
+
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1000);
+    const run = await runPromise;
+
+    expect(run.status).toBe("succeeded");
+    expect(run.trace.map((entry) => entry.message)).toEqual(expect.arrayContaining(["Sleeping for 1000 ms.", "Sleep completed.", "after sleep"]));
+  });
+
+  it("cancels sleep primitives without running the next node", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const runPromise = new AutomationExecutor().execute(sleepGroup(1000), event(), await primitiveCatalog(), new HookRegistry(), { signal: controller.signal });
+
+    await Promise.resolve();
+    controller.abort();
+    const run = await runPromise;
+
+    expect(run.status).toBe("cancelled");
+    expect(run.trace.map((entry) => entry.message)).not.toContain("after sleep");
+  });
+
+  it("runs Python primitives with bounded subprocess output and parsed JSON", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-python-"));
+    const hooks = new HookRegistry();
+    let captured: unknown;
+    hooks.register({
+      id: "test.capture",
+      owner: { kind: "app" },
+      title: "Capture",
+      description: "Capture Python JSON.",
+      exposures: ["automation"],
+      inputSchema: {
+        type: "object",
+        properties: {
+          value: {}
+        },
+        required: ["value"],
+        additionalProperties: false
+      },
+      execute: (input) => {
+        captured = input.value;
+        return {};
+      }
+    });
+
+    const run = await new AutomationExecutor().execute(pythonJsonGroup(), event(), pythonCaptureCatalog(await primitiveCatalog()), hooks, { allowedRoots: [dataDir] });
+
+    expect(run.status).toBe("succeeded");
+    expect(captured).toEqual({ stdin: "from automation" });
+    expect(run.trace.map((entry) => entry.message)).toEqual(expect.arrayContaining(["Starting Python process.", "Python process completed."]));
+  });
+
+  it("lets Python primitives call automation-exposed CloudX hooks", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-python-hooks-"));
+    const hooks = new HookRegistry();
+    let captured: unknown;
+    hooks.register({
+      id: "test.upper",
+      owner: { kind: "app" },
+      title: "Uppercase",
+      description: "Uppercase text.",
+      exposures: ["automation"],
+      inputSchema: {
+        type: "object",
+        properties: {
+          text: { type: "string" }
+        },
+        required: ["text"],
+        additionalProperties: false
+      },
+      outputSchema: {
+        type: "object",
+        properties: {
+          upper: { type: "string" }
+        },
+        required: ["upper"],
+        additionalProperties: false
+      },
+      execute: (input) => ({ upper: String(input.text).toUpperCase() })
+    });
+    hooks.register({
+      id: "test.capture",
+      owner: { kind: "app" },
+      title: "Capture",
+      description: "Capture hook results.",
+      exposures: ["automation"],
+      inputSchema: {
+        type: "object",
+        properties: {
+          value: {}
+        },
+        required: ["value"],
+        additionalProperties: false
+      },
+      execute: (input) => {
+        captured = input.value;
+        return {};
+      }
+    });
+
+    const run = await new AutomationExecutor().execute(pythonHookGroup(), event(), pythonCaptureCatalog(await primitiveCatalog()), hooks, { allowedRoots: [dataDir] });
+
+    expect(run.status).toBe("succeeded");
+    expect(captured).toEqual([{ upper: "HELLO" }]);
+    expect(run.trace.map((entry) => entry.message)).toEqual(expect.arrayContaining(["Calling CloudX hook test.upper.", "Python process completed."]));
+  });
+
+  it("requires external safety for Python primitives at execution time", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-python-safety-"));
+    const run = await new AutomationExecutor().execute(pythonJsonGroup({ allowedSafety: ["read", "write"] }), event(), await primitiveCatalog(), new HookRegistry(), { allowedRoots: [dataDir] });
+
+    expect(run.status).toBe("failed");
+    expect(run.error).toContain("Run Python requires external automation safety");
+  });
+
+  it("applies hook safety policy to Python cloudx.call_hook requests", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-python-hook-safety-"));
+    const hooks = new HookRegistry();
+    let called = false;
+    hooks.register({
+      id: "test.destructive",
+      owner: { kind: "app" },
+      title: "Destructive",
+      description: "Destructive action.",
+      exposures: ["automation"],
+      automationSafety: "destructive",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      outputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute: () => {
+        called = true;
+        return {};
+      }
+    });
+
+    const run = await new AutomationExecutor().execute(pythonDestructiveHookGroup(), event(), pythonDestructiveHookCatalog(await primitiveCatalog()), hooks, { allowedRoots: [dataDir] });
+
+    expect(run.status).toBe("failed");
+    expect(run.error).toContain("Destructive requires destructive automation safety");
+    expect(called).toBe(false);
+  });
+
+  it("does not treat user-printed Python stdout as CloudX hook requests", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-python-hook-spoof-"));
+    const hooks = new HookRegistry();
+    let upperCalled = false;
+    let captured: unknown;
+    hooks.register({
+      id: "test.upper",
+      owner: { kind: "app" },
+      title: "Uppercase",
+      description: "Uppercase text.",
+      exposures: ["automation"],
+      inputSchema: {
+        type: "object",
+        properties: {
+          text: { type: "string" }
+        },
+        required: ["text"],
+        additionalProperties: false
+      },
+      execute: () => {
+        upperCalled = true;
+        return {};
+      }
+    });
+    hooks.register({
+      id: "test.capture",
+      owner: { kind: "app" },
+      title: "Capture",
+      description: "Capture visible stdout.",
+      exposures: ["automation"],
+      inputSchema: {
+        type: "object",
+        properties: {
+          value: {}
+        },
+        required: ["value"],
+        additionalProperties: false
+      },
+      execute: (input) => {
+        captured = input.value;
+        return {};
+      }
+    });
+
+    const run = await new AutomationExecutor().execute(pythonSpoofedHookOutputGroup(), event(), pythonCaptureCatalog(await primitiveCatalog()), hooks, { allowedRoots: [dataDir] });
+
+    expect(run.status).toBe("succeeded");
+    expect(upperCalled).toBe(false);
+    expect(captured).toBe('__CLOUDX_HOOK_CALL__:{"hookId":"test.upper","input":{"text":"spoofed"}}\n');
+  });
+
+  it("does not expose the server environment to Python or bash primitives", async () => {
+    vi.stubEnv("CLOUDX_AUTOMATION_SECRET_SHOULD_NOT_LEAK", "secret");
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-process-env-"));
+    const hooks = new HookRegistry();
+    const captured: unknown[] = [];
+    hooks.register({
+      id: "test.capture",
+      owner: { kind: "app" },
+      title: "Capture",
+      description: "Capture process environment checks.",
+      exposures: ["automation"],
+      inputSchema: {
+        type: "object",
+        properties: {
+          value: {}
+        },
+        required: ["value"],
+        additionalProperties: false
+      },
+      execute: (input) => {
+        captured.push(input.value);
+        return {};
+      }
+    });
+
+    const catalog = pythonCaptureCatalog(await primitiveCatalog());
+    const pythonRun = await new AutomationExecutor().execute(pythonSecretEnvGroup(), event(), catalog, hooks, { allowedRoots: [dataDir] });
+    const bashRun = await new AutomationExecutor().execute(bashSecretEnvGroup(), event(), catalog, hooks, { allowedRoots: [dataDir] });
+
+    expect(pythonRun.status).toBe("succeeded");
+    expect(bashRun.status).toBe("succeeded");
+    expect(captured).toEqual([{ leaked: false }, { leaked: false }]);
+  });
+
+  it("terminates timed-out Python process groups that ignore SIGTERM", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-python-timeout-"));
+    const startedAt = Date.now();
+
+    const run = await new AutomationExecutor().execute(pythonIgnoresSigtermGroup(), event(), await primitiveCatalog(), new HookRegistry(), { allowedRoots: [dataDir] });
+
+    expect(run.status).toBe("failed");
+    expect(run.error).toContain("Python process timed out after 20 ms");
+    expect(Date.now() - startedAt).toBeLessThan(3000);
+  });
+
+  it("rejects Python working directories outside allowed roots", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-python-root-"));
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-python-outside-"));
+    const run = await new AutomationExecutor().execute(pythonJsonGroup({ cwd: outside }), event(), await primitiveCatalog(), new HookRegistry(), { allowedRoots: [dataDir] });
+
+    expect(run.status).toBe("failed");
+    expect(run.error).toContain("outside configured Cloudx roots");
+  });
+
+  it("runs bash primitives with bounded subprocess output and parsed JSON", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-bash-"));
+    const hooks = new HookRegistry();
+    let captured: unknown;
+    hooks.register({
+      id: "test.capture",
+      owner: { kind: "app" },
+      title: "Capture",
+      description: "Capture bash JSON.",
+      exposures: ["automation"],
+      inputSchema: {
+        type: "object",
+        properties: {
+          value: {}
+        },
+        required: ["value"],
+        additionalProperties: false
+      },
+      execute: (input) => {
+        captured = input.value;
+        return {};
+      }
+    });
+
+    const run = await new AutomationExecutor().execute(bashJsonGroup(), event(), pythonCaptureCatalog(await primitiveCatalog()), hooks, { allowedRoots: [dataDir] });
+
+    expect(run.status).toBe("succeeded");
+    expect(captured).toEqual({ stdin: "from bash" });
+    expect(run.trace.map((entry) => entry.message)).toEqual(expect.arrayContaining(["Starting bash process.", "Bash process completed."]));
+  });
+
+  it("runs Codex exec primitives with bounded subprocess output and parsed JSONL", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-exec-"));
+    const fakeCodex = await fakeCodexExecutable(dataDir, `
+const stdin = await new Promise((resolve) => {
+  let value = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (chunk) => value += chunk);
+  process.stdin.on("end", () => resolve(value));
+});
+console.error("progress: running");
+console.log(JSON.stringify({ type: "thread.started", thread_id: "thread-1" }));
+console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ args: process.argv.slice(2), cwd: process.cwd(), stdin }) } }));
+`);
+    vi.stubEnv("CLOUDX_ASSISTANT_BIN", fakeCodex);
+    const hooks = new HookRegistry();
+    let captured: unknown;
+    hooks.register({
+      id: "test.capture",
+      owner: { kind: "app" },
+      title: "Capture",
+      description: "Capture Codex response.",
+      exposures: ["automation"],
+      inputSchema: {
+        type: "object",
+        properties: {
+          value: {}
+        },
+        required: ["value"],
+        additionalProperties: false
+      },
+      execute: (input) => {
+        captured = input.value;
+        return {};
+      }
+    });
+
+    const run = await new AutomationExecutor().execute(codexExecGroup(), event(), codexCaptureCatalog(await primitiveCatalog()), hooks, { allowedRoots: [dataDir] });
+
+    expect(run.status).toBe("succeeded");
+    expect(run.trace.map((entry) => entry.message)).toEqual(expect.arrayContaining(["Starting Codex exec process.", "Codex exec process completed."]));
+    const parsed = JSON.parse(String(captured)) as { args: string[]; cwd: string; stdin: string };
+    expect(parsed.cwd).toBe(dataDir);
+    expect(parsed.stdin).toBe("context from automation");
+    expect(parsed.args).toEqual([
+      "exec",
+      "--cd",
+      dataDir,
+      "--sandbox",
+      "read-only",
+      "--ask-for-approval",
+      "never",
+      "--ephemeral",
+      "--profile",
+      "ci",
+      "--model",
+      "gpt-5.5",
+      "--json",
+      "--skip-git-repo-check",
+      "summarize the repo"
+    ]);
+  });
+
+  it("cancels Codex exec primitives without running the next node", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-cancel-"));
+    const fakeCodex = await fakeCodexExecutable(dataDir, "setInterval(() => undefined, 1000);");
+    vi.stubEnv("CLOUDX_ASSISTANT_BIN", fakeCodex);
+    const controller = new AbortController();
+    const runPromise = new AutomationExecutor().execute(codexExecGroup({ json: false }), event(), await primitiveCatalog(), new HookRegistry(), { allowedRoots: [dataDir], signal: controller.signal });
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    controller.abort();
+    const run = await runPromise;
+
+    expect(run.status).toBe("cancelled");
+    expect(run.trace.map((entry) => entry.message)).not.toContain("after codex");
+  });
+
+  it("rejects Codex exec working directories outside allowed roots", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-root-"));
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-outside-"));
+    const run = await new AutomationExecutor().execute(codexExecGroup({ cwd: outside }), event(), await primitiveCatalog(), new HookRegistry(), { allowedRoots: [dataDir] });
+
+    expect(run.status).toBe("failed");
+    expect(run.error).toContain("Codex working directory is outside configured Cloudx roots");
   });
 
   it("rejects non-object JSON values from the string-to-object converter", async () => {
@@ -1144,6 +1534,462 @@ function mathOperationGroup(): AutomationGroup {
       variables: []
     }
   };
+}
+
+function comparisonOperationGroup(): AutomationGroup {
+  const now = new Date(0).toISOString();
+  return {
+    id: "group-comparison",
+    name: "Comparison Operations",
+    enabled: true,
+    createdAt: now,
+    updatedAt: now,
+    graph: {
+      schemaVersion: 1,
+      nodes: [
+        { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
+        { id: "number", typeId: "primitive:number.compare", position: { x: 120, y: 120 }, config: { left: 7, right: 3, operator: "greaterThan" } },
+        { id: "string", typeId: "primitive:string.compare", position: { x: 120, y: 240 }, config: { left: "CloudX", right: "cloud", operator: "startsWith", caseSensitive: true } },
+        { id: "range", typeId: "primitive:number.range", position: { x: 120, y: 360 }, config: { value: 5, min: 5, max: 10, mode: "inclusive" } },
+        { id: "log-number", typeId: "primitive:log", position: { x: 400, y: 0 } },
+        { id: "log-string", typeId: "primitive:log", position: { x: 600, y: 0 } },
+        { id: "log-range", typeId: "primitive:log", position: { x: 800, y: 0 } }
+      ],
+      edges: [
+        { id: "exec-1", kind: "exec", sourceNodeId: "trigger", sourcePortId: "exec", targetNodeId: "log-number", targetPortId: "exec" },
+        { id: "exec-2", kind: "exec", sourceNodeId: "log-number", sourcePortId: "exec", targetNodeId: "log-string", targetPortId: "exec" },
+        { id: "exec-3", kind: "exec", sourceNodeId: "log-string", sourcePortId: "exec", targetNodeId: "log-range", targetPortId: "exec" },
+        { id: "number-log", kind: "data", sourceNodeId: "number", sourcePortId: "value", targetNodeId: "log-number", targetPortId: "message" },
+        { id: "string-log", kind: "data", sourceNodeId: "string", sourcePortId: "value", targetNodeId: "log-string", targetPortId: "message" },
+        { id: "range-log", kind: "data", sourceNodeId: "range", sourcePortId: "value", targetNodeId: "log-range", targetPortId: "message" }
+      ],
+      variables: []
+    }
+  };
+}
+
+function sleepGroup(durationMs: number): AutomationGroup {
+  const now = new Date(0).toISOString();
+  return {
+    id: "group-sleep",
+    name: "Sleep",
+    enabled: true,
+    createdAt: now,
+    updatedAt: now,
+    graph: {
+      schemaVersion: 1,
+      nodes: [
+        { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
+        { id: "sleep", typeId: "primitive:sleep", position: { x: 160, y: 0 }, config: { durationMs } },
+        { id: "log", typeId: "primitive:log", position: { x: 360, y: 0 }, config: { message: "after sleep" } }
+      ],
+      edges: [
+        { id: "exec-1", kind: "exec", sourceNodeId: "trigger", sourcePortId: "exec", targetNodeId: "sleep", targetPortId: "exec" },
+        { id: "exec-2", kind: "exec", sourceNodeId: "sleep", sourcePortId: "exec", targetNodeId: "log", targetPortId: "exec" }
+      ],
+      variables: []
+    }
+  };
+}
+
+function pythonJsonGroup({
+  allowedSafety = ["read", "write", "external"],
+  cwd
+}: {
+  allowedSafety?: AutomationSafety[];
+  cwd?: string;
+} = {}): AutomationGroup {
+  const now = new Date(0).toISOString();
+  return {
+    id: "group-python-json",
+    name: "Python JSON",
+    enabled: true,
+    createdAt: now,
+    updatedAt: now,
+    graph: {
+      schemaVersion: 1,
+      allowedSafety,
+      nodes: [
+        { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
+        {
+          id: "python",
+          typeId: "primitive:python.exec",
+          position: { x: 160, y: 0 },
+          config: {
+            code: "import json, sys\nprint(json.dumps({'stdin': sys.stdin.read()}))",
+            stdin: "from automation",
+            parseJson: true,
+            ...(cwd ? { cwd } : {})
+          }
+        },
+        { id: "capture", typeId: "hook:test.capture", position: { x: 420, y: 0 } }
+      ],
+      edges: [
+        { id: "exec-1", kind: "exec", sourceNodeId: "trigger", sourcePortId: "exec", targetNodeId: "python", targetPortId: "exec" },
+        { id: "exec-2", kind: "exec", sourceNodeId: "python", sourcePortId: "exec", targetNodeId: "capture", targetPortId: "exec" },
+        { id: "json-capture", kind: "data", sourceNodeId: "python", sourcePortId: "json", targetNodeId: "capture", targetPortId: "value" }
+      ],
+      variables: []
+    }
+  };
+}
+
+function pythonHookGroup(): AutomationGroup {
+  const now = new Date(0).toISOString();
+  return {
+    id: "group-python-hooks",
+    name: "Python Hooks",
+    enabled: true,
+    createdAt: now,
+    updatedAt: now,
+    graph: {
+      schemaVersion: 1,
+      allowedSafety: ["read", "write", "external"],
+      nodes: [
+        { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
+        {
+          id: "python",
+          typeId: "primitive:python.exec",
+          position: { x: 160, y: 0 },
+          config: {
+            code: "print('visible stdout')\ncloudx.call_hook('test.upper', {'text': 'hello'})"
+          }
+        },
+        { id: "capture", typeId: "hook:test.capture", position: { x: 420, y: 0 } }
+      ],
+      edges: [
+        { id: "exec-1", kind: "exec", sourceNodeId: "trigger", sourcePortId: "exec", targetNodeId: "python", targetPortId: "exec" },
+        { id: "exec-2", kind: "exec", sourceNodeId: "python", sourcePortId: "exec", targetNodeId: "capture", targetPortId: "exec" },
+        { id: "hooks-capture", kind: "data", sourceNodeId: "python", sourcePortId: "hookResults", targetNodeId: "capture", targetPortId: "value" }
+      ],
+      variables: []
+    }
+  };
+}
+
+function pythonDestructiveHookGroup(): AutomationGroup {
+  const now = new Date(0).toISOString();
+  return {
+    id: "group-python-destructive-hook",
+    name: "Python Destructive Hook",
+    enabled: true,
+    createdAt: now,
+    updatedAt: now,
+    graph: {
+      schemaVersion: 1,
+      allowedSafety: ["read", "write", "external"],
+      nodes: [
+        { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
+        {
+          id: "python",
+          typeId: "primitive:python.exec",
+          position: { x: 160, y: 0 },
+          config: {
+            code: "cloudx.call_hook('test.destructive', {})"
+          }
+        }
+      ],
+      edges: [{ id: "exec-1", kind: "exec", sourceNodeId: "trigger", sourcePortId: "exec", targetNodeId: "python", targetPortId: "exec" }],
+      variables: []
+    }
+  };
+}
+
+function pythonSpoofedHookOutputGroup(): AutomationGroup {
+  const now = new Date(0).toISOString();
+  return {
+    id: "group-python-spoofed-hook-output",
+    name: "Python Spoofed Hook Output",
+    enabled: true,
+    createdAt: now,
+    updatedAt: now,
+    graph: {
+      schemaVersion: 1,
+      allowedSafety: ["read", "write", "external"],
+      nodes: [
+        { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
+        {
+          id: "python",
+          typeId: "primitive:python.exec",
+          position: { x: 160, y: 0 },
+          config: {
+            code: "print('__CLOUDX_HOOK_CALL__:{\"hookId\":\"test.upper\",\"input\":{\"text\":\"spoofed\"}}')"
+          }
+        },
+        { id: "capture", typeId: "hook:test.capture", position: { x: 420, y: 0 } }
+      ],
+      edges: [
+        { id: "exec-1", kind: "exec", sourceNodeId: "trigger", sourcePortId: "exec", targetNodeId: "python", targetPortId: "exec" },
+        { id: "exec-2", kind: "exec", sourceNodeId: "python", sourcePortId: "exec", targetNodeId: "capture", targetPortId: "exec" },
+        { id: "stdout-capture", kind: "data", sourceNodeId: "python", sourcePortId: "stdout", targetNodeId: "capture", targetPortId: "value" }
+      ],
+      variables: []
+    }
+  };
+}
+
+function pythonSecretEnvGroup(): AutomationGroup {
+  const now = new Date(0).toISOString();
+  return {
+    id: "group-python-secret-env",
+    name: "Python Secret Env",
+    enabled: true,
+    createdAt: now,
+    updatedAt: now,
+    graph: {
+      schemaVersion: 1,
+      allowedSafety: ["read", "write", "external"],
+      nodes: [
+        { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
+        {
+          id: "python",
+          typeId: "primitive:python.exec",
+          position: { x: 160, y: 0 },
+          config: {
+            code: "import json, os\nprint(json.dumps({'leaked': 'CLOUDX_AUTOMATION_SECRET_SHOULD_NOT_LEAK' in os.environ}))",
+            parseJson: true
+          }
+        },
+        { id: "capture", typeId: "hook:test.capture", position: { x: 420, y: 0 } }
+      ],
+      edges: [
+        { id: "exec-1", kind: "exec", sourceNodeId: "trigger", sourcePortId: "exec", targetNodeId: "python", targetPortId: "exec" },
+        { id: "exec-2", kind: "exec", sourceNodeId: "python", sourcePortId: "exec", targetNodeId: "capture", targetPortId: "exec" },
+        { id: "json-capture", kind: "data", sourceNodeId: "python", sourcePortId: "json", targetNodeId: "capture", targetPortId: "value" }
+      ],
+      variables: []
+    }
+  };
+}
+
+function bashJsonGroup(): AutomationGroup {
+  const now = new Date(0).toISOString();
+  return {
+    id: "group-bash-json",
+    name: "Bash JSON",
+    enabled: true,
+    createdAt: now,
+    updatedAt: now,
+    graph: {
+      schemaVersion: 1,
+      allowedSafety: ["read", "write", "external"],
+      nodes: [
+        { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
+        {
+          id: "bash",
+          typeId: "primitive:bash.exec",
+          position: { x: 160, y: 0 },
+          config: {
+            script: "stdin=$(cat)\nprintf '{\"stdin\":\"%s\"}\\n' \"$stdin\"",
+            stdin: "from bash",
+            parseJson: true
+          }
+        },
+        { id: "capture", typeId: "hook:test.capture", position: { x: 420, y: 0 } }
+      ],
+      edges: [
+        { id: "exec-1", kind: "exec", sourceNodeId: "trigger", sourcePortId: "exec", targetNodeId: "bash", targetPortId: "exec" },
+        { id: "exec-2", kind: "exec", sourceNodeId: "bash", sourcePortId: "exec", targetNodeId: "capture", targetPortId: "exec" },
+        { id: "json-capture", kind: "data", sourceNodeId: "bash", sourcePortId: "json", targetNodeId: "capture", targetPortId: "value" }
+      ],
+      variables: []
+    }
+  };
+}
+
+function bashSecretEnvGroup(): AutomationGroup {
+  const now = new Date(0).toISOString();
+  return {
+    id: "group-bash-secret-env",
+    name: "Bash Secret Env",
+    enabled: true,
+    createdAt: now,
+    updatedAt: now,
+    graph: {
+      schemaVersion: 1,
+      allowedSafety: ["read", "write", "external"],
+      nodes: [
+        { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
+        {
+          id: "bash",
+          typeId: "primitive:bash.exec",
+          position: { x: 160, y: 0 },
+          config: {
+            script: "if [ \"${CLOUDX_AUTOMATION_SECRET_SHOULD_NOT_LEAK+x}\" = \"x\" ]; then printf '{\"leaked\":true}\\n'; else printf '{\"leaked\":false}\\n'; fi",
+            parseJson: true
+          }
+        },
+        { id: "capture", typeId: "hook:test.capture", position: { x: 420, y: 0 } }
+      ],
+      edges: [
+        { id: "exec-1", kind: "exec", sourceNodeId: "trigger", sourcePortId: "exec", targetNodeId: "bash", targetPortId: "exec" },
+        { id: "exec-2", kind: "exec", sourceNodeId: "bash", sourcePortId: "exec", targetNodeId: "capture", targetPortId: "exec" },
+        { id: "json-capture", kind: "data", sourceNodeId: "bash", sourcePortId: "json", targetNodeId: "capture", targetPortId: "value" }
+      ],
+      variables: []
+    }
+  };
+}
+
+function pythonIgnoresSigtermGroup(): AutomationGroup {
+  const now = new Date(0).toISOString();
+  return {
+    id: "group-python-ignore-sigterm",
+    name: "Python Ignore Sigterm",
+    enabled: true,
+    createdAt: now,
+    updatedAt: now,
+    graph: {
+      schemaVersion: 1,
+      allowedSafety: ["read", "write", "external"],
+      nodes: [
+        { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
+        {
+          id: "python",
+          typeId: "primitive:python.exec",
+          position: { x: 160, y: 0 },
+          config: {
+            code: "import signal, time\nsignal.signal(signal.SIGTERM, lambda *_: None)\nwhile True:\n    time.sleep(0.1)",
+            timeoutMs: 20
+          }
+        }
+      ],
+      edges: [{ id: "exec-1", kind: "exec", sourceNodeId: "trigger", sourcePortId: "exec", targetNodeId: "python", targetPortId: "exec" }],
+      variables: []
+    }
+  };
+}
+
+function pythonCaptureCatalog(catalog: AutomationCatalogResponse): AutomationCatalogResponse {
+  return {
+    nodes: [
+      ...catalog.nodes,
+      {
+        typeId: "hook:test.capture",
+        kind: "function",
+        title: "Capture",
+        description: "Capture Python JSON.",
+        hookId: "test.capture",
+        inputs: [
+          { id: "exec", label: "Run", kind: "exec", direction: "input", type: { kind: "exec" } },
+          { id: "value", label: "Value", kind: "data", direction: "input", type: { kind: "unknown" }, required: true }
+        ],
+        outputs: [{ id: "exec", label: "Done", kind: "exec", direction: "output", type: { kind: "exec" } }]
+      },
+      {
+        typeId: "hook:test.upper",
+        kind: "function",
+        title: "Upper",
+        description: "Uppercase text.",
+        hookId: "test.upper",
+        safety: "write",
+        inputs: [
+          { id: "exec", label: "Run", kind: "exec", direction: "input", type: { kind: "exec" } },
+          { id: "text", label: "Text", kind: "data", direction: "input", type: { kind: "string" }, required: true }
+        ],
+        outputs: [
+          { id: "exec", label: "Done", kind: "exec", direction: "output", type: { kind: "exec" } },
+          { id: "upper", label: "Upper", kind: "data", direction: "output", type: { kind: "string" } }
+        ]
+      }
+    ]
+  };
+}
+
+function pythonDestructiveHookCatalog(catalog: AutomationCatalogResponse): AutomationCatalogResponse {
+  return {
+    nodes: [
+      ...catalog.nodes,
+      {
+        typeId: "hook:test.destructive",
+        kind: "function",
+        title: "Destructive",
+        description: "Destructive action.",
+        hookId: "test.destructive",
+        safety: "destructive",
+        inputs: [{ id: "exec", label: "Run", kind: "exec", direction: "input", type: { kind: "exec" } }],
+        outputs: [{ id: "exec", label: "Done", kind: "exec", direction: "output", type: { kind: "exec" } }]
+      }
+    ]
+  };
+}
+
+function codexExecGroup({
+  cwd,
+  json = true
+}: {
+  cwd?: string;
+  json?: boolean;
+} = {}): AutomationGroup {
+  const now = new Date(0).toISOString();
+  return {
+    id: "group-codex-exec",
+    name: "Codex Exec",
+    enabled: true,
+    createdAt: now,
+    updatedAt: now,
+    graph: {
+      schemaVersion: 1,
+      allowedSafety: ["read", "write", "external"],
+      nodes: [
+        { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
+        {
+          id: "codex",
+          typeId: "primitive:codex.exec",
+          position: { x: 160, y: 0 },
+          config: {
+            prompt: "summarize the repo",
+            stdin: "context from automation",
+            timeoutMs: 10_000,
+            profile: "ci",
+            model: "gpt-5.5",
+            sandbox: "read-only",
+            approvalPolicy: "never",
+            ephemeral: true,
+            json,
+            skipGitRepoCheck: true,
+            ...(cwd ? { cwd } : {})
+          }
+        },
+        { id: "capture", typeId: "hook:test.capture", position: { x: 420, y: 0 } },
+        { id: "log", typeId: "primitive:log", position: { x: 640, y: 0 }, config: { message: "after codex" } }
+      ],
+      edges: [
+        { id: "exec-1", kind: "exec", sourceNodeId: "trigger", sourcePortId: "exec", targetNodeId: "codex", targetPortId: "exec" },
+        { id: "exec-2", kind: "exec", sourceNodeId: "codex", sourcePortId: "exec", targetNodeId: "capture", targetPortId: "exec" },
+        { id: "exec-3", kind: "exec", sourceNodeId: "capture", sourcePortId: "exec", targetNodeId: "log", targetPortId: "exec" },
+        { id: "message-capture", kind: "data", sourceNodeId: "codex", sourcePortId: "finalMessage", targetNodeId: "capture", targetPortId: "value" }
+      ],
+      variables: []
+    }
+  };
+}
+
+function codexCaptureCatalog(catalog: AutomationCatalogResponse): AutomationCatalogResponse {
+  return {
+    nodes: [
+      ...catalog.nodes,
+      {
+        typeId: "hook:test.capture",
+        kind: "function",
+        title: "Capture",
+        description: "Capture Codex output.",
+        hookId: "test.capture",
+        inputs: [
+          { id: "exec", label: "Run", kind: "exec", direction: "input", type: { kind: "exec" } },
+          { id: "value", label: "Value", kind: "data", direction: "input", type: { kind: "unknown" }, required: true }
+        ],
+        outputs: [{ id: "exec", label: "Done", kind: "exec", direction: "output", type: { kind: "exec" } }]
+      }
+    ]
+  };
+}
+
+async function fakeCodexExecutable(directory: string, body: string): Promise<string> {
+  const file = path.join(directory, `fake-codex-${Math.random().toString(16).slice(2)}.mjs`);
+  await fs.writeFile(file, `#!/usr/bin/env node\n${body}\n`, "utf8");
+  await fs.chmod(file, 0o755);
+  return file;
 }
 
 function nonObjectJsonConverterGroup(value: string): AutomationGroup {

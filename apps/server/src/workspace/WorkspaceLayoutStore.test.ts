@@ -30,6 +30,19 @@ describe("WorkspaceLayoutStore", () => {
     expect(afterDelete.windows.length).toBeGreaterThan(0);
   });
 
+  it("creates missing window directories only when explicitly requested", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-workspace-create-directory-"));
+    const store = new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root]));
+    const project = path.join(root, "project");
+
+    await expect(store.createWindow({ name: "Missing", defaultCwd: project })).rejects.toThrow("Directory does not exist");
+
+    const created = await store.createWindow({ name: "Created", defaultCwd: project, createDirectory: true });
+
+    await expect(fs.stat(project).then((stat) => stat.isDirectory())).resolves.toBe(true);
+    expect(created).toMatchObject({ name: "Created", defaultCwd: project });
+  });
+
   it("does not lose concurrent window field updates while resolving directories", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-workspace-concurrent-update-"));
     const next = path.join(root, "next");
@@ -88,6 +101,36 @@ describe("WorkspaceLayoutStore", () => {
     const reloaded = new WorkspaceLayoutStore(dataDir, new PathPolicy([root]));
     const names = (await reloaded.state([], undefined)).windows.map((window) => window.name);
     expect(names).toEqual(expect.arrayContaining(["First", "Second"]));
+  });
+
+  it("keeps in-memory windows reachable when workspace persistence runs out of space", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-workspace-enospc-"));
+    const dataDir = path.join(root, ".cloudx");
+    const store = new WorkspaceLayoutStore(dataDir, new PathPolicy([root]));
+    const workspaceFile = (store as unknown as { workspaceFile: { write(value: unknown): Promise<void> } }).workspaceFile;
+    const originalWrite = workspaceFile.write.bind(workspaceFile);
+    const statuses: string[] = [];
+    workspaceFile.write = vi.fn()
+      .mockRejectedValueOnce(Object.assign(new Error("no space left on device"), { code: "ENOSPC" }))
+      .mockImplementation(originalWrite);
+    const dispose = store.onPersistenceStatusChange((status) => statuses.push(status.state));
+
+    const created = await store.createWindow({ name: "Live", defaultCwd: root });
+    const degraded = await store.state([tab("tab-live", root)], "tab-live");
+
+    expect(degraded.windows.find((window) => window.id === created.id)).toMatchObject({ name: "Live" });
+    expect(degraded.tabs).toEqual([expect.objectContaining({ id: "tab-live" })]);
+    expect(degraded.persistence).toEqual([expect.objectContaining({ name: "Workspace layout", state: "degraded", code: "ENOSPC" })]);
+    await expect(fs.access(path.join(dataDir, "workspace.json"))).rejects.toMatchObject({ code: "ENOENT" });
+
+    await store.updateWindow(created.id, { name: "Recovered" });
+    const recovered = await store.state([], undefined);
+    dispose();
+    workspaceFile.write = originalWrite;
+
+    expect(statuses).toEqual(["degraded", "available"]);
+    expect(recovered.persistence).toEqual([expect.objectContaining({ name: "Workspace layout", state: "available" })]);
+    expect(new WorkspaceLayoutStore(dataDir, new PathPolicy([root])).getWindow(created.id)).toMatchObject({ name: "Recovered" });
   });
 
   it("normalizes stored workspace collection shapes instead of crashing on valid JSON with wrong field types", async () => {

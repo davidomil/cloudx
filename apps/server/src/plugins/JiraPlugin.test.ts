@@ -74,6 +74,75 @@ describe("JiraPlugin", () => {
         nextPageToken: { type: "string" }
       }
     });
+    expect(descriptor.hooks?.find((hook) => hook.id === "jira.currentUser.get")?.outputSchema).toMatchObject({
+      properties: {
+        user: {
+          properties: {
+            accountId: { type: "string" },
+            displayName: { type: "string" },
+            emailAddress: { type: "string" }
+          }
+        }
+      }
+    });
+    expect(descriptor.hooks?.find((hook) => hook.id === "jira.projects.list")?.outputSchema).toMatchObject({
+      properties: {
+        projects: { type: "array" },
+        projectCount: { type: "number" },
+        firstProjectKey: { type: "string" }
+      },
+      required: expect.arrayContaining(["projects", "projectCount"])
+    });
+    expect(descriptor.hooks?.find((hook) => hook.id === "jira.priorities.list")?.outputSchema).toMatchObject({
+      properties: {
+        priorities: { type: "array" },
+        priorityCount: { type: "number" },
+        firstPriorityName: { type: "string" }
+      },
+      required: expect.arrayContaining(["priorities", "priorityCount"])
+    });
+    expect(descriptor.hooks?.find((hook) => hook.id === "jira.issue.get")?.outputSchema).toMatchObject({
+      properties: {
+        issue: { type: "object" },
+        issueKey: { type: "string" },
+        issueUrl: { type: "string" },
+        status: { type: "string" }
+      }
+    });
+    expect(descriptor.hooks?.find((hook) => hook.id === "jira.issue.comment.add")?.outputSchema).toMatchObject({
+      properties: {
+        commentId: { type: "string" },
+        commentUrl: { type: "string" },
+        issueUrl: { type: "string" }
+      }
+    });
+    expect(descriptor.hooks?.find((hook) => hook.id === "jira.issue.transitions.list")?.inputSchema).toMatchObject({
+      properties: {
+        issueIdOrKey: { type: "string" },
+        expandFields: { type: "boolean", default: true }
+      }
+    });
+    expect(descriptor.hooks?.find((hook) => hook.id === "jira.issue.transition")).toMatchObject({
+      inputSchema: {
+        properties: {
+          transitionId: { type: "string" },
+          transitionName: { type: "string" },
+          targetStatus: { type: "string" },
+          update: { type: "object" }
+        },
+        required: ["issueIdOrKey"]
+      }
+    });
+    expect(descriptor.hooks?.find((hook) => hook.id === "jira.issue.transition")?.outputSchema).toMatchObject({
+      properties: {
+        issueKey: { type: "string" },
+        transitionId: { type: "string" },
+        targetStatus: { type: "string" },
+        status: { type: "string" },
+        statusId: { type: "string" },
+        issueUrl: { type: "string" }
+      }
+    });
     expect(descriptor.uiContributions).toEqual(expect.arrayContaining([
       expect.objectContaining({ slot: "plugin.panel", renderer: "jira.panel", targetPluginId: "jira" })
     ]));

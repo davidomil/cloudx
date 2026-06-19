@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement, type RefObject } from "react";
 import { AlertTriangle, Bell, BellRing, Bot, CheckCheck, ChevronDown, Columns2, GitBranch, LayoutTemplate, Maximize2, Mic, MicOff, Minimize2, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
 
-import { DEFAULT_WORKSPACE_MAX_PANES, RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsStore, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
+import { DEFAULT_WORKSPACE_MAX_PANES, RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsStore, type StatePersistenceStatus, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
 
 import {
   applyLayoutTemplate,
@@ -86,6 +86,7 @@ import { applyVoiceWorkspaceResultsToWorkspace, buildClientVoiceContext, voiceCo
 import { WebViewerPanel } from "./WebViewerPanel.js";
 import { WorktreeManagerPanel } from "./WorktreeManagerPanel.js";
 import { parseWorkspaceSocketUpdate } from "./workspaceSocketUpdate.js";
+import type { AutomationPanelState, AutomationPanelStateUpdater } from "./AutomationPanel.js";
 import type { DocumentationPanelState, DocumentationPanelStateUpdater } from "./DocumentationPanel.js";
 
 type ConnectionStatus = "checking" | "connected" | "disconnected";
@@ -187,11 +188,13 @@ export function App() {
   const [notifications, setNotifications] = useState<CloudxNotification[]>([]);
   const [notificationToastIds, setNotificationToastIds] = useState<Set<string>>(() => new Set());
   const [notificationCenterOpen, setNotificationCenterOpen] = useState(false);
+  const [persistenceStatuses, setPersistenceStatuses] = useState<StatePersistenceStatus[]>([]);
   const [browserNotificationState, setBrowserNotificationState] = useState<BrowserNotificationPermissionState>(() => browserNotificationPermissionState());
   const [activeAutomationTriggerIds, setActiveAutomationTriggerIds] = useState<Set<string>>(() => new Set());
   const [automationRuns, setAutomationRuns] = useState<AutomationRunSummary[]>([]);
   const [attentionTabIds, setAttentionTabIds] = useState<Set<string>>(() => new Set());
   const [documentationPanelStates, setDocumentationPanelStates] = useState<Record<string, DocumentationPanelState>>({});
+  const [automationPanelStates, setAutomationPanelStates] = useState<Record<string, AutomationPanelState>>({});
   const [selectedAudioInputId, setSelectedAudioInputId] = useState<string | undefined>(() => loadAudioInputId());
   const [audioInputs, setAudioInputs] = useState<MediaDeviceInfo[]>([]);
   const [audioInputMenuOpen, setAudioInputMenuOpen] = useState(false);
@@ -222,7 +225,8 @@ export function App() {
             activeTabId: update.activeTabId,
             windows: update.windows,
             activeWindowId: update.activeWindowId,
-            templates: update.templates
+            templates: update.templates,
+            persistence: update.persistence
           }, { preservePendingLayout: true });
         } else {
           applyWorkspaceTabs(update.tabs, update.activeTabId);
@@ -281,6 +285,10 @@ export function App() {
   useEffect(() => {
     const tabIds = new Set(tabs.map((tab) => tab.id));
     setDocumentationPanelStates((current) => {
+      const next = Object.fromEntries(Object.entries(current).filter(([tabId]) => tabIds.has(tabId)));
+      return Object.keys(next).length === Object.keys(current).length ? current : next;
+    });
+    setAutomationPanelStates((current) => {
       const next = Object.fromEntries(Object.entries(current).filter(([tabId]) => tabIds.has(tabId)));
       return Object.keys(next).length === Object.keys(current).length ? current : next;
     });
@@ -347,6 +355,9 @@ export function App() {
     ? `Maximum of ${DEFAULT_WORKSPACE_MAX_PANES} panes reached. Close a pane before splitting again.`
     : findPane(layout.root, activePaneId) ? undefined : "Select a pane before splitting.";
   const canSplitWorkspace = !splitDisabledReason;
+  const degradedPersistence = useMemo(() => degradedPersistenceStatuses(persistenceStatuses), [persistenceStatuses]);
+  const persistenceLabel = persistenceWarningLabel(degradedPersistence);
+  const persistenceTitle = persistenceWarningTitle(degradedPersistence);
   const serverLabel = window.location.host || "Cloudx";
   const activeTab = activeTabId ? tabById.get(activeTabId) : undefined;
   const activeWindow = activeWindowId ? windows.find((window) => window.id === activeWindowId) : windows[0];
@@ -428,6 +439,7 @@ export function App() {
     setActiveWindowId(effectiveState.activeWindowId);
     setTemplates(effectiveState.templates);
     setActiveTabId(effectiveState.activeTabId);
+    setPersistenceStatuses(effectiveState.persistence ?? []);
     commitLayout(nextLayout, { persist: false });
   }
 
@@ -705,6 +717,7 @@ export function App() {
       disposeTerminalView(tabId);
       disposeDocumentationIngestController(tabId);
       setDocumentationPanelStates((current) => omitRecordKey(current, tabId));
+      setAutomationPanelStates((current) => omitRecordKey(current, tabId));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -968,8 +981,12 @@ export function App() {
     setDocumentationPanelStates((current) => ({ ...current, [tabId]: updater(current[tabId]) }));
   }
 
-  async function handleCreateWindow(name: string, defaultCwd: string, templateId?: string) {
-    applyWorkspaceState(await createWindow({ name, defaultCwd, pluginMetadata: pluginMetadataForTemplate(templateId) }));
+  function updateAutomationPanelState(tabId: string, updater: AutomationPanelStateUpdater) {
+    setAutomationPanelStates((current) => ({ ...current, [tabId]: updater(current[tabId]) }));
+  }
+
+  async function handleCreateWindow(name: string, defaultCwd: string, templateId?: string, createDirectory = false) {
+    applyWorkspaceState(await createWindow({ name, defaultCwd, createDirectory, pluginMetadata: pluginMetadataForTemplate(templateId) }));
   }
 
   async function handleSelectWindow(windowId: string) {
@@ -1213,6 +1230,12 @@ export function App() {
           </span>
           {activeTab ? <span className="brand-active-tab" title={`Active tab: ${activeTab.title}`}>{activeTab.title}</span> : null}
           {voiceState !== "idle" ? <span className={`voice-status ${voiceState}`}>{voiceState}</span> : null}
+          {persistenceLabel ? (
+            <span className="persistence-status degraded" title={persistenceTitle} aria-label={persistenceTitle}>
+              <AlertTriangle size={14} />
+              <span>{persistenceLabel}</span>
+            </span>
+          ) : null}
         </div>
         <div className="topbar-actions">
           <WindowSwitcher
@@ -1376,6 +1399,8 @@ export function App() {
   function renderPane(pane: Pane): ReactElement {
     const paneActive = pane.id === activePaneId;
     const paneMaximized = maximizedPaneId === pane.id;
+    const activePaneTabId = pane.activeTabId;
+    const activePaneTab = activePaneTabId ? tabById.get(activePaneTabId) : undefined;
     return (
       <div
         className={`workspace-pane ${paneActive ? "active" : ""}`}
@@ -1482,17 +1507,19 @@ export function App() {
           ) : null}
         </div>
         <div className="pane-body">
-          {pane.activeTabId && tabById.has(pane.activeTabId) ? (
+          {activePaneTabId && activePaneTab ? (
             <PluginPanel
-              tab={tabById.get(pane.activeTabId)!}
-              plugin={pluginById.get(tabById.get(pane.activeTabId)!.pluginId)}
+              tab={activePaneTab}
+              plugin={pluginById.get(activePaneTab.pluginId)}
               plugins={plugins}
               active={paneActive}
-              config={pluginConfig(tabById.get(pane.activeTabId)!.pluginId)}
+              config={pluginConfig(activePaneTab.pluginId)}
               uiScale={uiScale}
               uiContributionRegistry={uiContributionRegistry}
               callHook={callUiHook}
               automationRuns={automationRuns}
+              automationPanelState={automationPanelStates[activePaneTabId]}
+              onAutomationPanelStateChange={(updater) => updateAutomationPanelState(activePaneTabId, updater)}
               activeAutomationTriggerIds={activeAutomationTriggerIds}
               emitTrigger={handleEmitTrigger}
               onAutomationGroupsChanged={refreshActiveAutomationTriggerIds}
@@ -1529,7 +1556,7 @@ function WindowSwitcher({
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSelect: (windowId: string) => Promise<void>;
-  onCreate: (name: string, defaultCwd: string, templateId?: string) => Promise<void>;
+  onCreate: (name: string, defaultCwd: string, templateId?: string, createDirectory?: boolean) => Promise<void>;
   onUpdate: (windowId: string, name: string, defaultCwd: string, templateId?: string) => Promise<void>;
   onDelete: (windowId: string) => Promise<void>;
   onContextSearch: (query: string) => Promise<{ matches: Array<{ window: WorkspaceWindow; score: number; reasons: string[] }> }>;
@@ -1541,6 +1568,7 @@ function WindowSwitcher({
   const [draftName, setDraftName] = useState(activeWindow?.name ?? "");
   const [draftCwd, setDraftCwd] = useState(activeWindow?.defaultCwd ?? "~");
   const [draftTemplateId, setDraftTemplateId] = useState(selectedTemplateId(activeWindow));
+  const [createDirectory, setCreateDirectory] = useState(false);
   const [dialogMode, setDialogMode] = useState<"create" | "edit" | undefined>();
   const [editingWindow, setEditingWindow] = useState<WorkspaceWindow | undefined>();
   const [deleteCandidate, setDeleteCandidate] = useState<WorkspaceWindow | undefined>();
@@ -1600,6 +1628,7 @@ function WindowSwitcher({
     setDraftName("");
     setDraftCwd(activeWindow?.defaultCwd ?? "~");
     setDraftTemplateId("");
+    setCreateDirectory(false);
     setError(undefined);
   }
 
@@ -1610,6 +1639,7 @@ function WindowSwitcher({
     setDraftName(window.name);
     setDraftCwd(window.defaultCwd);
     setDraftTemplateId(selectedTemplateId(window));
+    setCreateDirectory(false);
     setError(undefined);
   }
 
@@ -1625,7 +1655,7 @@ function WindowSwitcher({
       if (dialogMode === "edit" && editingWindow) {
         await onUpdate(editingWindow.id, draftName, draftCwd, draftTemplateId || undefined);
       } else {
-        await onCreate(draftName, draftCwd, draftTemplateId || undefined);
+        await onCreate(draftName, draftCwd, draftTemplateId || undefined, createDirectory);
       }
       setDialogMode(undefined);
       setEditingWindow(undefined);
@@ -1692,6 +1722,15 @@ function WindowSwitcher({
               <strong>{dialogMode === "edit" ? "Edit window" : "Create window"}</strong>
               <input value={draftName} onChange={(event) => setDraftName(event.target.value)} placeholder="Window name" />
               <PathEntry inputId="window-default-directory" value={draftCwd} onChange={setDraftCwd} placeholder="Default directory" ariaLabel="Window default directory" />
+              {dialogMode === "create" ? (
+                <label className="settings-toggle">
+                  <input type="checkbox" checked={createDirectory} onChange={(event) => setCreateDirectory(event.target.checked)} />
+                  <span>
+                    Create directory if needed
+                    <small>Create the new window directory under the configured CloudX roots.</small>
+                  </span>
+                </label>
+              ) : null}
               {rulesSkillsStore ? (
                 <TemplateSelect
                   value={draftTemplateId}
@@ -1969,6 +2008,8 @@ function PluginPanel({
   uiContributionRegistry,
   callHook,
   automationRuns,
+  automationPanelState,
+  onAutomationPanelStateChange,
   activeAutomationTriggerIds,
   emitTrigger,
   onAutomationGroupsChanged
@@ -1982,6 +2023,8 @@ function PluginPanel({
   uiContributionRegistry: UiContributionRegistry;
   callHook: UiContributionRenderContext["callHook"];
   automationRuns: AutomationRunSummary[];
+  automationPanelState?: AutomationPanelState;
+  onAutomationPanelStateChange?: (updater: AutomationPanelStateUpdater) => void;
   activeAutomationTriggerIds: ReadonlySet<string>;
   emitTrigger: TriggerEmitter;
   onAutomationGroupsChanged: () => Promise<void>;
@@ -2009,7 +2052,7 @@ function PluginPanel({
   if (plugin?.panelKind === "automation") {
     return (
       <Suspense fallback={<div className="empty-pane">Loading automation...</div>}>
-        <AutomationPanel key={tab.id} tab={tab} liveRuns={automationRuns} onAutomationGroupsChanged={onAutomationGroupsChanged} />
+        <AutomationPanel key={tab.id} tab={tab} liveRuns={automationRuns} onAutomationGroupsChanged={onAutomationGroupsChanged} state={automationPanelState} onStateChange={onAutomationPanelStateChange} />
       </Suspense>
     );
   }
@@ -2164,6 +2207,27 @@ export function voiceControlSettings(global: CloudxConfigResponse["values"]["glo
     voiceCommandsEnabled,
     microphoneEnabled: voiceCommandsEnabled && global?.microphoneEnabled !== false
   };
+}
+
+export function degradedPersistenceStatuses(statuses: StatePersistenceStatus[]): StatePersistenceStatus[] {
+  return statuses.filter((status) => status.state === "degraded");
+}
+
+export function persistenceWarningLabel(degradedStatuses: StatePersistenceStatus[]): string | undefined {
+  if (degradedStatuses.length === 0) {
+    return undefined;
+  }
+  if (degradedStatuses.length === 1) {
+    return `${degradedStatuses[0]!.name} not saved`;
+  }
+  return `${degradedStatuses.length} stores not saved`;
+}
+
+export function persistenceWarningTitle(degradedStatuses: StatePersistenceStatus[]): string | undefined {
+  if (degradedStatuses.length === 0) {
+    return undefined;
+  }
+  return degradedStatuses.map((status) => `${status.name}: ${status.code ? `${status.code}: ` : ""}${status.message ?? "State writes failed."}`).join("\n");
 }
 
 export async function requestAudioInputEnumerationAccess(): Promise<void> {

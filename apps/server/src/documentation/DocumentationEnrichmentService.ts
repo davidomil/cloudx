@@ -5,12 +5,13 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { CloudxSkill, ConfigFieldOption, RulesSkillsStore } from "@cloudx/shared";
+import type { CloudxSkill, RulesSkillsStore } from "@cloudx/shared";
 
 import type { AsrClient } from "../asrClient.js";
 import type { ConfigService } from "../configService.js";
 import type { RulesSkillsCatalogService } from "../rulesSkills/RulesSkillsCatalogService.js";
 import { runCodexExec } from "../voice/VoicePlanner.js";
+import { DEFAULT_DOCUMENTATION_IMAGE_ANALYSIS_MODEL, DOCUMENTATION_AI_USE_VOICE_MODEL } from "../aiModelOptions.js";
 import { DEFAULT_DOCUMENTATION_TIMEOUT_MS, type DocumentationClient } from "./DocumentationClient.js";
 
 export const DOCUMENTATION_PLUGIN_ID = "documentation";
@@ -19,35 +20,7 @@ export const DOCUMENTATION_AI_ENRICHMENT_SKILLS_KEY = "aiEnrichmentSkillIds";
 export const DOCUMENTATION_AI_IMAGE_ANALYSIS_MODEL_KEY = "aiImageAnalysisModel";
 export const DOCUMENTATION_AI_TEXT_ANALYSIS_MODEL_KEY = "aiTextAnalysisModel";
 export const DOCUMENTATION_AI_ANSWER_MODEL_KEY = "aiAnswerModel";
-export const DOCUMENTATION_AI_USE_VOICE_MODEL = "__voice_model__";
-export const DEFAULT_DOCUMENTATION_IMAGE_ANALYSIS_MODEL = "gpt-5.4-mini";
-export const DOCUMENTATION_AI_MODEL_OPTIONS: ConfigFieldOption[] = [
-  {
-    label: "Same as voice control",
-    value: DOCUMENTATION_AI_USE_VOICE_MODEL,
-    description: "Use the current CloudX voice-control Codex model."
-  },
-  {
-    label: "GPT-5.5",
-    value: "gpt-5.5",
-    description: "Frontier model for complex coding, research, and real-world work."
-  },
-  {
-    label: "GPT-5.4",
-    value: "gpt-5.4",
-    description: "Strong model for everyday coding."
-  },
-  {
-    label: "GPT-5.4-Mini",
-    value: "gpt-5.4-mini",
-    description: "Small, fast, and cost-efficient model for simpler coding tasks."
-  },
-  {
-    label: "GPT-5.3-Codex-Spark",
-    value: "gpt-5.3-codex-spark",
-    description: "Ultra-fast coding model."
-  }
-];
+export { DEFAULT_DOCUMENTATION_IMAGE_ANALYSIS_MODEL, DOCUMENTATION_AI_MODEL_OPTIONS, DOCUMENTATION_AI_USE_VOICE_MODEL } from "../aiModelOptions.js";
 export const DEFAULT_DOCUMENTATION_ENRICHMENT_SKILL_IDS = [
   "documentation-enrich-metadata",
   "documentation-enrich-visuals",

@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import type { CreatePluginSessionInput, PluginSession, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
+import type { CreatePluginSessionInput, PluginActionContext, PluginSession, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
 import { pluginActionHookId } from "@cloudx/plugin-api";
 import { RULES_SKILLS_PLUGIN_ID, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
 import { describe, expect, it } from "vitest";
@@ -22,6 +22,7 @@ class FakeSession implements PluginSession {
   private readonly dataListeners = new Set<(data: string) => void>();
   appliedRuntimeContexts: Array<WorkspaceRuntimeContext | undefined> = [];
   nextActionResult: Record<string, unknown> | undefined;
+  lastActionContext: PluginActionContext | undefined;
   stopped = false;
 
   constructor(public readonly tab: WorkspaceTab) {}
@@ -45,7 +46,8 @@ class FakeSession implements PluginSession {
     };
   }
 
-  handleAction(action: string, input: Record<string, unknown>) {
+  handleAction(action: string, input: Record<string, unknown>, context?: PluginActionContext) {
+    this.lastActionContext = context;
     return this.nextActionResult ?? { action, input };
   }
 
@@ -244,6 +246,16 @@ describe("SessionStore voice actions", () => {
 
     dispose();
     expect(updatedTabIds).toEqual([tab.id, tab.id]);
+  });
+
+  it("passes hook abort signals into plugin action contexts", async () => {
+    const { store, root, plugin } = await createStore();
+    const tab = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Editor" });
+    const controller = new AbortController();
+
+    await store.executePluginHook("fake-default", pluginActionHookId("fake-default", "enter_text"), "enter_text", tab.id, { text: "hook" }, { kind: "automation" }, controller.signal);
+
+    expect(plugin.lastSession?.lastActionContext).toMatchObject({ caller: { kind: "automation" }, signal: controller.signal });
   });
 
   it("does not emit tab updates for read-only plugin state reads", async () => {
@@ -450,6 +462,25 @@ describe("SessionStore voice actions", () => {
     expect(result).toMatchObject({
       tab: { pluginId: "fake-default", title: "Window Default", cwd: project },
       layoutInstruction: { windowId: target.id }
+    });
+  });
+
+  it("creates workspace window directories through the core hook when requested", async () => {
+    const { store, root, registry, pathPolicy, workspace } = await createStore({ withWorkspace: true });
+    const project = path.join(root, "hook-created-project");
+    const hooks = new HookRegistry();
+    registerCoreHooks(hooks, { sessions: store, plugins: registry, pathPolicy, workspace: workspace! });
+
+    const result = await hooks.call(
+      "workspace.windows.create",
+      { name: "Hook Project", defaultCwd: project, createDirectory: true },
+      { caller: { kind: "automation" } }
+    );
+
+    await expect(fs.stat(project).then((stat) => stat.isDirectory())).resolves.toBe(true);
+    expect(result).toMatchObject({
+      window: { name: "Hook Project", defaultCwd: project },
+      workspace: { windows: expect.arrayContaining([expect.objectContaining({ name: "Hook Project", defaultCwd: project })]) }
     });
   });
 

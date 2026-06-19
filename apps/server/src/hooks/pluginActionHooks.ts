@@ -32,6 +32,6 @@ function actionHookDefinition(pluginId: string, action: PluginActionDefinition, 
     automationSafety: action.automationSafety,
     defaultForVoice: action.defaultForVoice,
     handlesUnhandledVoice: action.handlesUnhandledVoice,
-    execute: (input, context) => sessions.executePluginHook(pluginId, hookId, action.name, context.targetTabId, input, context.caller)
+    execute: (input, context) => sessions.executePluginHook(pluginId, hookId, action.name, context.targetTabId, input, context.caller, context.signal)
   };
 }

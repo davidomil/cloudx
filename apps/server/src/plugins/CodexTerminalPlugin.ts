@@ -1,6 +1,7 @@
 import type {
   CreatePluginSessionInput,
   PluginActionDefinition,
+  PluginActionContext,
   PluginSession,
   PluginSessionSnapshot,
   PluginTabControls,
@@ -17,6 +18,10 @@ import { buildLoginShellCommandLaunch, buildToolEnv, resolveAssistantCommand } f
 export const DEFAULT_TERMINAL_REPLAY_BYTES = 1_048_576;
 export const CODEX_SUBMIT_DELAY_MS = 25;
 export const CODEX_CLOSE_ON_EXIT_GRACE_MS = 2_000;
+export const CODEX_READY_QUIET_MS = 350;
+export const CODEX_READY_TIMEOUT_MS = 30_000;
+export const CODEX_READY_MAX_TIMEOUT_MS = 10 * 60 * 1000;
+export const CODEX_READY_MAX_QUIET_MS = 10_000;
 const MAX_OSC_SEQUENCE_CHARS = 4096;
 
 export const TERMINAL_ACTIONS: PluginActionDefinition[] = terminalActions({
@@ -27,7 +32,7 @@ export const CODEX_TERMINAL_ACTIONS: PluginActionDefinition[] = terminalActions(
   enterTextDescription:
     "Type into an interactive Codex CLI terminal. For voice, send the coding instruction Codex should receive, usually as natural language rather than a shell command.",
   enterTextHandlesUnhandledVoice: true
-});
+}).concat(codexReadinessAction());
 
 export class CodexTerminalPlugin implements WorkspacePlugin {
   readonly id = "codex-terminal";
@@ -395,11 +400,40 @@ function terminalActions(options: { enterTextDescription: string; enterTextHandl
   ];
 }
 
+function codexReadinessAction(): PluginActionDefinition {
+  return {
+    name: "wait_until_ready",
+    description: "Wait until an interactive Codex terminal is ready to receive the next prompt.",
+    voiceExposed: false,
+    automationExposed: true,
+    automationSafety: "read",
+    inputSchema: {
+      type: "object",
+      properties: {
+        timeoutMs: { type: "number", description: "Maximum time to wait for Codex readiness.", default: CODEX_READY_TIMEOUT_MS },
+        quietMs: { type: "number", description: "Required terminal-output quiet time before the terminal is treated as ready.", default: CODEX_READY_QUIET_MS }
+      },
+      additionalProperties: false
+    },
+    outputSchema: {
+      type: "object",
+      properties: {
+        ready: { type: "boolean", description: "True when the target Codex terminal is ready." },
+        state: { type: "string", enum: ["ready"], description: "Final readiness state." },
+        reason: { type: "string", description: "Reason the terminal became ready." },
+        waitedMs: { type: "number", description: "Elapsed wait time in milliseconds." }
+      },
+      additionalProperties: false
+    }
+  };
+}
+
 interface TerminalSessionOptions {
   closeOnExit: boolean;
   closeOnExitAfterMs?: number;
   replayBytes?: number;
   submitDelayMs?: number;
+  readyQuietMs?: number;
   voiceKind?: "codex-terminal" | "standard-terminal" | "terminal";
   voiceSummary?: string;
   templateName?: string;
@@ -416,6 +450,20 @@ interface CodexRuntimeContextUpdate {
 export interface TerminalCommandFinishEvent {
   exitCode?: number;
   sequence: 133 | 633;
+}
+
+export type TerminalReadinessState = "starting" | "busy" | "ready" | "closed";
+
+interface TerminalReadinessSnapshot {
+  state: TerminalReadinessState;
+  reason: string;
+  changedAt: number;
+}
+
+interface TerminalWaitUntilReadyOptions {
+  timeoutMs: number;
+  quietMs: number;
+  signal?: AbortSignal;
 }
 
 export class TerminalShellIntegrationParser {
@@ -459,11 +507,15 @@ export class CodexTerminalSession implements PluginSession {
   private recentOutput = "";
   private stopped = false;
   private status: WorkspaceTab["status"];
+  private readiness: TerminalReadinessSnapshot = { state: "starting", reason: "Waiting for terminal output.", changedAt: Date.now() };
   private readonly replayBytes: number;
   private readonly startedAt = Date.now();
   private readonly shellIntegrationParser = new TerminalShellIntegrationParser();
   private readonly statusListeners = new Set<(status: WorkspaceTab["status"], message?: string) => void>();
+  private readonly readinessListeners = new Set<() => void>();
   private readonly pendingSubmitTimers = new Set<ReturnType<typeof setTimeout>>();
+  private readyQuietTimer: ReturnType<typeof setTimeout> | undefined;
+  private lastOutputAt = 0;
   private terminalClosed = false;
 
   constructor(
@@ -475,14 +527,25 @@ export class CodexTerminalSession implements PluginSession {
     this.status = tab.status;
     this.replayBytes = options.replayBytes ?? DEFAULT_TERMINAL_REPLAY_BYTES;
     this.terminalProcess.onData((data) => {
+      this.lastOutputAt = Date.now();
       this.recentOutput = trimRecentOutput(`${this.recentOutput}${data}`, this.replayBytes);
+      let sawCommandFinish = false;
       for (const event of this.shellIntegrationParser.push(data)) {
+        sawCommandFinish = true;
         this.recordCommandFinish(event.exitCode);
+      }
+      if (sawCommandFinish) {
+        this.clearReadyQuietTimer();
+        this.setReadiness("ready", "Shell integration reported command completion.");
+      } else if (this.readiness.state === "starting" || this.readiness.state === "busy") {
+        this.scheduleReadyAfterQuietOutput();
       }
     });
     this.terminalProcess.onExit((event) => {
       this.terminalClosed = true;
       this.clearPendingSubmitTimers();
+      this.clearReadyQuietTimer();
+      this.setReadiness("closed", "Terminal process exited.");
       if (this.stopped) {
         this.setStatus("stopped", "Terminal was stopped.");
         return;
@@ -521,7 +584,9 @@ export class CodexTerminalSession implements PluginSession {
     this.stopped = true;
     this.terminalClosed = true;
     this.clearPendingSubmitTimers();
+    this.clearReadyQuietTimer();
     this.terminalProcess.kill();
+    this.setReadiness("closed", "Terminal was stopped.");
     this.setStatus("stopped", "Terminal was stopped.");
   }
 
@@ -532,6 +597,7 @@ export class CodexTerminalSession implements PluginSession {
     const update = await this.options.applyRuntimeContext(runtimeContext);
     this.options.voiceSummary = update.voiceSummary;
     this.options.templateName = update.templateName;
+    this.markBusy("Runtime context update submitted.");
     this.writeBracketedPasteSubmit(update.prompt);
     return {
       applied: true,
@@ -553,7 +619,8 @@ export class CodexTerminalSession implements PluginSession {
       title: this.tab.title,
       cwd: this.tab.cwd,
       status: this.status,
-      recentOutput: this.recentOutput
+      recentOutput: this.recentOutput,
+      state: { readiness: this.readinessSnapshot() }
     };
   }
 
@@ -569,26 +636,42 @@ export class CodexTerminalSession implements PluginSession {
       metadata: {
         outputBytes: Buffer.byteLength(this.recentOutput, "utf8"),
         replayBytes: this.replayBytes,
-        templateName: this.options.templateName
+        templateName: this.options.templateName,
+        readiness: this.readinessSnapshot()
       }
     };
   }
 
-  handleAction(action: string, input: Record<string, unknown>): Record<string, unknown> {
+  handleAction(action: string, input: Record<string, unknown>, context: PluginActionContext = {}): Promise<Record<string, unknown>> | Record<string, unknown> {
     if (action === "enter_text") {
       const text = requireString(input.text, "text");
       const submit = typeof input.submit === "boolean" ? input.submit : false;
       const textToWrite = submit ? stripTrailingLineTerminators(text) : text;
       this.write(textToWrite);
       if (submit) {
+        this.markBusy("Input submitted.");
         this.submit();
       }
       return { typed: textToWrite.length, submitted: submit };
     }
     if (action === "send_key") {
       const key = requireString(input.key, "key");
+      if (key === "enter" || key === "ctrl-c") {
+        this.markBusy(`Control key ${key} sent.`);
+      }
       this.write(keyToSequence(key));
       return { key };
+    }
+    if (action === "wait_until_ready") {
+      const timeoutMs = optionalDurationMs(input.timeoutMs, "timeoutMs", CODEX_READY_TIMEOUT_MS, CODEX_READY_MAX_TIMEOUT_MS);
+      const quietMs = optionalDurationMs(input.quietMs, "quietMs", CODEX_READY_QUIET_MS, CODEX_READY_MAX_QUIET_MS);
+      const startedAt = Date.now();
+      return this.waitUntilReady({ timeoutMs, quietMs, signal: context.signal }).then((readiness) => ({
+        ready: true,
+        state: readiness.state,
+        reason: readiness.reason,
+        waitedMs: Date.now() - startedAt
+      }));
     }
     if (action === "resize") {
       const cols = requireTerminalDimension(input.cols, "cols");
@@ -608,6 +691,94 @@ export class CodexTerminalSession implements PluginSession {
     for (const listener of this.statusListeners) {
       listener(status, message);
     }
+  }
+
+  private readinessSnapshot(): Record<string, unknown> {
+    return {
+      state: this.readiness.state,
+      reason: this.readiness.reason,
+      changedAt: new Date(this.readiness.changedAt).toISOString(),
+      quietForMs: this.lastOutputAt > 0 ? Math.max(0, Date.now() - this.lastOutputAt) : undefined
+    };
+  }
+
+  private markBusy(reason: string): void {
+    this.clearReadyQuietTimer();
+    this.setReadiness("busy", reason);
+  }
+
+  private setReadiness(state: TerminalReadinessState, reason: string): void {
+    if (this.readiness.state === state && this.readiness.reason === reason) {
+      return;
+    }
+    this.readiness = { state, reason, changedAt: Date.now() };
+    for (const listener of this.readinessListeners) {
+      listener();
+    }
+  }
+
+  private scheduleReadyAfterQuietOutput(): void {
+    this.clearReadyQuietTimer();
+    this.readyQuietTimer = setTimeout(() => {
+      this.readyQuietTimer = undefined;
+      if (!this.terminalClosed && (this.readiness.state === "starting" || this.readiness.state === "busy")) {
+        this.setReadiness("ready", "Terminal output became quiet.");
+      }
+    }, this.options.readyQuietMs ?? CODEX_READY_QUIET_MS);
+  }
+
+  private clearReadyQuietTimer(): void {
+    if (this.readyQuietTimer) {
+      clearTimeout(this.readyQuietTimer);
+      this.readyQuietTimer = undefined;
+    }
+  }
+
+  private async waitUntilReady(options: TerminalWaitUntilReadyOptions): Promise<TerminalReadinessSnapshot> {
+    const deadline = Date.now() + options.timeoutMs;
+    while (true) {
+      if (options.signal?.aborted) {
+        throw new Error("Wait for Codex readiness was cancelled.");
+      }
+      if (this.readiness.state === "closed") {
+        throw new Error(`Terminal closed before becoming ready: ${this.readiness.reason}`);
+      }
+      const quietForMs = this.lastOutputAt > 0 ? Date.now() - this.lastOutputAt : 0;
+      if (this.readiness.state === "ready" && quietForMs >= options.quietMs) {
+        return this.readiness;
+      }
+      const remainingTimeoutMs = deadline - Date.now();
+      if (remainingTimeoutMs <= 0) {
+        throw new Error(`Timed out waiting for Codex readiness after ${options.timeoutMs} ms. Current state: ${this.readiness.state}. ${this.readiness.reason}`);
+      }
+      const remainingQuietMs = this.readiness.state === "ready" ? Math.max(1, options.quietMs - quietForMs) : remainingTimeoutMs;
+      await this.waitForReadinessChange(Math.min(remainingTimeoutMs, remainingQuietMs), options.signal);
+    }
+  }
+
+  private waitForReadinessChange(timeoutMs: number, signal: AbortSignal | undefined): Promise<void> {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        this.readinessListeners.delete(onReadinessChange);
+        signal?.removeEventListener("abort", onAbort);
+        if (error) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      };
+      const onReadinessChange = () => finish();
+      const onAbort = () => finish(new Error("Wait for Codex readiness was cancelled."));
+      const timer = setTimeout(() => finish(), timeoutMs);
+      this.readinessListeners.add(onReadinessChange);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
   }
 
   private submit(): void {
@@ -715,6 +886,16 @@ function requireString(value: unknown, name: string): string {
 function requireTerminalDimension(value: unknown, name: string): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
     throw new Error(`${name} must be a positive integer.`);
+  }
+  return value;
+}
+
+function optionalDurationMs(value: unknown, name: string, defaultValue: number, maxValue: number): number {
+  if (value === undefined) {
+    return defaultValue;
+  }
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0 || value > maxValue) {
+    throw new Error(`${name} must be a positive integer no greater than ${maxValue}.`);
   }
   return value;
 }

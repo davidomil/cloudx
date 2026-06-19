@@ -58,6 +58,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const documentationResponseMaxBytes = parsePositiveInteger(env.CLOUDX_DOCUMENTATION_RESPONSE_MAX_BYTES ?? String(DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES), "CLOUDX_DOCUMENTATION_RESPONSE_MAX_BYTES");
   const documentationUploadMaxBytes = parsePositiveInteger(env.CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES ?? String(DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES), "CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES");
   const voiceAudioUploadMaxBytes = parsePositiveInteger(env.CLOUDX_VOICE_AUDIO_UPLOAD_MAX_BYTES ?? String(DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES), "CLOUDX_VOICE_AUDIO_UPLOAD_MAX_BYTES");
+  const voiceModel = parseVoiceModel(env.CLOUDX_VOICE_MODEL ?? DEFAULT_VOICE_MODEL);
   const home = os.homedir();
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const dataDir = path.resolve(env.CLOUDX_DATA_DIR ?? path.join(repoRoot, ".cloudx"));
@@ -93,7 +94,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     allowedRoots,
     asrUrl: env.CLOUDX_ASR_URL ?? "http://127.0.0.1:7810",
     asrTimeoutMs,
-    voiceModel: env.CLOUDX_VOICE_MODEL ?? DEFAULT_VOICE_MODEL,
+    voiceModel,
     dataDir,
     webDistDir: path.resolve(env.CLOUDX_WEB_DIST_DIR ?? path.join(repoRoot, "apps/web/dist")),
     appServerEnabled: env.CLOUDX_APP_SERVER_ENABLED !== "false",
@@ -126,6 +127,14 @@ function parsePositiveInteger(value: string, name: string): number {
     throw new Error(`${name} must be a positive integer.`);
   }
   return parsed;
+}
+
+function parseVoiceModel(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 128 || !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/u.test(trimmed)) {
+    throw new Error("CLOUDX_VOICE_MODEL must be a non-empty model id using letters, numbers, dots, underscores, colons, or dashes.");
+  }
+  return trimmed;
 }
 
 export function shouldWarnForNetworkBind(host: string): boolean {

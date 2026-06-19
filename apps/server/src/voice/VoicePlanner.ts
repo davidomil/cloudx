@@ -50,22 +50,25 @@ export interface CodexExecRunOptions {
   imagePaths?: string[];
 }
 
+type ModelProvider = string | (() => string);
+
 export class CodexExecVoicePlanner implements VoicePlanner {
   constructor(
-    private readonly model: string,
+    private readonly modelProvider: ModelProvider,
     private readonly logger?: StructuredVoiceLogger,
     private readonly logOptions: VoiceDebugLogOptions = {}
   ) {}
 
   async plan(input: VoicePlannerInput): Promise<VoiceActionPlan> {
     const prompt = buildVoicePrompt(input.transcript, input.context);
+    const model = typeof this.modelProvider === "function" ? this.modelProvider() : this.modelProvider;
     const startedAt = Date.now();
     this.logger?.info(
       {
         event: "voice_planner_codex_exec_started",
         voiceRequestId: input.voiceRequestId,
         source: input.source,
-        model: this.model,
+        model,
         promptChars: prompt.length,
         ...transcriptLogFields(input.transcript, this.logOptions.includeText),
         context: summarizeVoiceContext(input.context)
@@ -74,7 +77,7 @@ export class CodexExecVoicePlanner implements VoicePlanner {
     );
 
     try {
-      const output = await runCodexExec(this.model, prompt, {
+      const output = await runCodexExec(model, prompt, {
         schemaPath: resolveVoiceSchemaPath(),
         outputPrefix: "cloudx-voice-plan-",
         taskLabel: "voice planner"
@@ -85,7 +88,7 @@ export class CodexExecVoicePlanner implements VoicePlanner {
           event: "voice_planner_codex_exec_completed",
           voiceRequestId: input.voiceRequestId,
           source: input.source,
-          model: this.model,
+          model,
           durationMs: Date.now() - startedAt,
           outputChars: output.length,
           ...planLogFields(plan, this.logOptions.includeText)
@@ -99,7 +102,7 @@ export class CodexExecVoicePlanner implements VoicePlanner {
           event: "voice_planner_codex_exec_failed",
           voiceRequestId: input.voiceRequestId,
           source: input.source,
-          model: this.model,
+          model,
           durationMs: Date.now() - startedAt,
           err: serializeError(error)
         },

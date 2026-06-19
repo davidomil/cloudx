@@ -393,7 +393,7 @@ describe("AutomationCompiler", () => {
     );
   });
 
-  it("requires explicit graph safety policy for external and destructive hooks", () => {
+  it("requires explicit graph safety policy for external and destructive automation nodes", () => {
     const compiler = new AutomationCompiler(new AutomationTypeService());
     const unsafeCatalog: AutomationCatalogResponse = {
       nodes: [
@@ -404,6 +404,15 @@ describe("AutomationCompiler", () => {
           title: "Run Shell",
           description: "Runs a shell command.",
           hookId: "runShell",
+          safety: "external",
+          inputs: [{ id: "exec", label: "Run", kind: "exec", direction: "input", type: EXEC_TYPE }],
+          outputs: [{ id: "exec", label: "Done", kind: "exec", direction: "output", type: EXEC_TYPE }]
+        },
+        {
+          typeId: "primitive:python.exec",
+          kind: "primitive",
+          title: "Run Python",
+          description: "Runs Python.",
           safety: "external",
           inputs: [{ id: "exec", label: "Run", kind: "exec", direction: "input", type: EXEC_TYPE }],
           outputs: [{ id: "exec", label: "Done", kind: "exec", direction: "output", type: EXEC_TYPE }]
@@ -423,6 +432,18 @@ describe("AutomationCompiler", () => {
       expect.arrayContaining([expect.objectContaining({ code: "automation-safety-policy", nodeId: "shell" })])
     );
     expect(compiler.validate({ ...graph, allowedSafety: ["read", "write", "external"] }, unsafeCatalog)).toEqual({ valid: true, diagnostics: [] });
+
+    const primitiveGraph: AutomationGraphDocument = {
+      schemaVersion: 1,
+      nodes: [
+        { id: "trigger", typeId: "trigger:test", position: { x: 0, y: 0 } },
+        { id: "python", typeId: "primitive:python.exec", position: { x: 200, y: 0 } }
+      ],
+      edges: [{ id: "exec-python", kind: "exec", sourceNodeId: "trigger", sourcePortId: "exec", targetNodeId: "python", targetPortId: "exec" }]
+    };
+    expect(compiler.validate(primitiveGraph, unsafeCatalog).diagnostics).toEqual(
+      expect.arrayContaining([expect.objectContaining({ code: "automation-safety-policy", nodeId: "python" })])
+    );
   });
 
   it("validates f-string dynamic input ports from node config", () => {

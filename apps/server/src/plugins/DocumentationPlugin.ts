@@ -106,26 +106,32 @@ export class DocumentationPlugin implements WorkspacePlugin {
       readHook("documentation.health", "Documentation Health", "Return documentation indexer health.", () => this.client.health()),
       readHook("documentation.stats", "Documentation Stats", "Return archive counts and portable paths.", () => this.client.stats()),
       readHook("documentation.ingest.queue", "Documentation Ingest Queue", "Return queued, running, and recent documentation ingest jobs.", () => this.ingestQueue.list()),
-      writeHook("documentation.ingest.queue.clearFinished", "Clear Documentation Ingest Queue", "Remove completed and failed documentation ingest jobs from the queue view.", () => this.ingestQueue.clearFinished()),
+      writeHook("documentation.ingest.queue.clearFinished", "Clear Documentation Ingest Queue", "Remove completed and failed documentation ingest jobs from the queue view.", () => queueResult(this.ingestQueue.clearFinished()), {}, [], documentationQueueOutputSchema()),
       readHook("documentation.portableManifest", "Documentation Portable Manifest", "Return files that make up the portable archive.", () => this.client.portableManifest()),
       writeHook("documentation.archive.export", "Export Documentation Archive", "Export the complete documentation archive to an allowed local ZIP path without overwriting an existing file.", (input) => this.exportArchive(input), {
         path: { type: "string" },
         cwd: { type: "string" }
-      }, ["path"]),
-      destructiveHook("documentation.archive.import.replace", "Replace Documentation Archive", "Replace the documentation archive from an allowed local ZIP package after exact confirmation.", (input) => this.client.importArchiveReplacePath({
-        path: this.resolveArchivePath(input),
-        confirmation: requireString(input.confirmation, "confirmation")
-      }), {
+      }, ["path"], documentationArchiveExportOutputSchema()),
+      destructiveHook("documentation.archive.import.replace", "Replace Documentation Archive", "Replace the documentation archive from an allowed local ZIP package after exact confirmation.", async (input) => {
+        const archivePath = this.resolveArchivePath(input);
+        return archiveImportResult(await this.client.importArchiveReplacePath({
+          path: archivePath,
+          confirmation: requireString(input.confirmation, "confirmation")
+        }), "replace", archivePath);
+      }, {
         path: { type: "string" },
         cwd: { type: "string" },
         confirmation: { type: "string" }
-      }, ["path", "confirmation"]),
-      writeHook("documentation.archive.import.merge", "Merge Documentation Archive", "Merge missing documentation records from an allowed local ZIP package into the current archive.", (input) => this.client.importArchiveMergePath({
-        path: this.resolveArchivePath(input)
-      }), {
+      }, ["path", "confirmation"], documentationArchiveImportOutputSchema()),
+      writeHook("documentation.archive.import.merge", "Merge Documentation Archive", "Merge missing documentation records from an allowed local ZIP package into the current archive.", async (input) => {
+        const archivePath = this.resolveArchivePath(input);
+        return archiveImportResult(await this.client.importArchiveMergePath({
+          path: archivePath
+        }), "merge", archivePath);
+      }, {
         path: { type: "string" },
         cwd: { type: "string" }
-      }, ["path"]),
+      }, ["path"], documentationArchiveImportOutputSchema()),
       readHook("documentation.documents.list", "List Documentation", "List documentation records.", (input) => this.client.listDocuments(input), {
         states: { type: "array", items: { type: "string" } },
         limit: { type: "number" },
@@ -146,14 +152,14 @@ export class DocumentationPlugin implements WorkspacePlugin {
         includeEnrichments: { type: "boolean" },
         includeEvents: { type: "boolean" }
       }, ["documentId"]),
-      readHook("documentation.search", "Search Documentation", "Search active local documentation and return source-grounded results.", (input) => this.client.search(input), {
+      readHook("documentation.search", "Search Documentation", "Search active local documentation and return source-grounded results.", (input) => this.client.search(input).then(searchResult), {
         query: { type: "string" },
         limit: { type: "number" },
         states: { type: "array", items: { type: "string" } },
         sourceTypes: { type: "array", items: { type: "string" } },
         collection: { type: "string" },
         mode: { type: "string", enum: ["hybrid", "dense", "lexical"] }
-      }, ["query"], ["plugin", "ui", "http", "automation", "voice"]),
+      }, ["query"], ["plugin", "ui", "http", "automation", "voice"], documentationSearchOutputSchema()),
       readHook("documentation.answer", "Answer Documentation Question", "Use AI assistance to answer a question from source-grounded documentation search results.", (input) => {
         const service = this.enrichmentProvider();
         if (!service) {
@@ -175,7 +181,7 @@ export class DocumentationPlugin implements WorkspacePlugin {
         const { cwd: _cwd, ...clientInput } = input;
         return this.enqueueIngest("path", titleOrFallback(input.title, path), path, "Reading local path and extracting source evidence.", async (job) => {
           job.update({ progress: 35, stage: "Indexer is reading the local path and extracting source evidence." });
-          return this.enrichQueued(await this.client.ingestPath({ ...clientInput, path }), job);
+          return ingestResult(await this.enrichQueued(await this.client.ingestPath({ ...clientInput, path }), job), "path", path);
         }, context);
       }, {
         path: { type: "string" },
@@ -186,10 +192,10 @@ export class DocumentationPlugin implements WorkspacePlugin {
         tags: { type: "array", items: { type: "string" } },
         acceptGeneratedCodeDocumentation: { type: "boolean" },
         retainRawCodeArtifacts: { type: "boolean" }
-      }, ["path"]),
+      }, ["path"], documentationIngestOutputSchema()),
       externalHook("documentation.ingest.url", "Ingest Documentation URL", "Download a URL source, ingest a YouTube video with transcript and keyframes, or ingest every video in a YouTube playlist.", async (input, context) => this.enqueueIngest("url", titleOrFallback(input.title, requireString(input.url, "url")), requireString(input.url, "url"), "Downloading URL and extracting source evidence.", async (job) => {
         job.update({ progress: 30, stage: urlIngestStage(requireString(input.url, "url")) });
-        return this.enrichQueued(await this.client.ingestUrl(input, {
+        return ingestResult(await this.enrichQueued(await this.client.ingestUrl(input, {
           onProgress: (event) => job.update({
             progress: typeof event.progress === "number" ? Math.max(30, Math.min(76, event.progress)) : undefined,
             stage: event.stage,
@@ -197,7 +203,7 @@ export class DocumentationPlugin implements WorkspacePlugin {
             metrics: event.metrics,
             ...progressChannelPatch(event)
           })
-        }), job);
+        }), job), "url", requireString(input.url, "url"));
       }, context), {
         url: { type: "string" },
         title: { type: "string" },
@@ -207,10 +213,10 @@ export class DocumentationPlugin implements WorkspacePlugin {
         transcript: { type: "string" },
         acceptGeneratedCodeDocumentation: { type: "boolean" },
         retainRawCodeArtifacts: { type: "boolean" }
-      }, ["url"]),
+      }, ["url"], documentationIngestOutputSchema()),
       writeHook("documentation.ingest.text", "Ingest Documentation Text", "Ingest direct text, transcript, or copied source material.", async (input, context) => this.enqueueIngest("text", titleOrFallback(input.title, "Text source"), optionalString(input.uri) ?? "direct text", "Writing text into the archive.", async (job) => {
         job.update({ progress: 35, stage: "Indexer is writing text into the archive." });
-        return this.enrichQueued(await this.client.ingestText(input), job);
+        return ingestResult(await this.enrichQueued(await this.client.ingestText(input), job), "text", optionalString(input.uri) ?? "direct text");
       }, context), {
         title: { type: "string" },
         text: { type: "string" },
@@ -218,16 +224,16 @@ export class DocumentationPlugin implements WorkspacePlugin {
         sourceType: { type: "string" },
         collection: { type: "string" },
         tags: { type: "array", items: { type: "string" } }
-      }, ["text"]),
-      writeHook("documentation.invalidate", "Invalidate Documentation", "Mark a document stale, revoked, superseded, quarantined, or deleted.", (input) => this.client.invalidate(input), {
+      }, ["text"], documentationIngestOutputSchema()),
+      writeHook("documentation.invalidate", "Invalidate Documentation", "Mark a document stale, revoked, superseded, quarantined, or deleted.", (input) => this.client.invalidate(input).then(documentMutationResult), {
         documentId: { type: "string" },
         state: { type: "string", enum: ["stale", "revoked", "superseded", "quarantined", "deleted"] },
         reason: { type: "string" }
-      }, ["documentId", "state", "reason"]),
-      writeHook("documentation.remove", "Remove Documentation", "Remove a document from default search by marking it deleted.", (input) => this.client.remove(input), {
+      }, ["documentId", "state", "reason"], documentationDocumentMutationOutputSchema()),
+      writeHook("documentation.remove", "Remove Documentation", "Remove a document from default search by marking it deleted.", (input) => this.client.remove(input).then(documentMutationResult), {
         documentId: { type: "string" }
-      }, ["documentId"]),
-      writeHook("documentation.rebuildIndex", "Rebuild Documentation Index", "Rebuild the Turbovec index from active SQLite chunks.", () => this.client.rebuildIndex())
+      }, ["documentId"], documentationDocumentMutationOutputSchema()),
+      writeHook("documentation.rebuildIndex", "Rebuild Documentation Index", "Rebuild the Turbovec index from active SQLite chunks.", () => this.client.rebuildIndex().then(rebuildIndexResult), {}, [], documentationRebuildOutputSchema())
     ];
   }
 
@@ -335,6 +341,207 @@ class DocumentationSession implements PluginSession {
   }
 }
 
+function documentationQueueOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      jobs: { type: "array", items: { type: "object", additionalProperties: true }, description: "Documentation ingest queue jobs after this operation." },
+      jobCount: { type: "number", description: "Number of documentation ingest queue jobs returned." }
+    },
+    required: ["jobs", "jobCount"],
+    additionalProperties: true
+  };
+}
+
+function documentationArchiveExportOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      path: { type: "string", description: "Allowed local ZIP path written by the archive export." },
+      bytes: { type: "number", description: "Size of the exported ZIP file in bytes." }
+    },
+    required: ["path", "bytes"],
+    additionalProperties: true
+  };
+}
+
+function documentationArchiveImportOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      mode: { type: "string", description: "Archive import mode, either merge or replace." },
+      status: { type: "string", description: "Archive import status reported by the indexer." },
+      path: { type: "string", description: "Allowed local ZIP path used for the archive import." },
+      importedDocuments: { type: "number", description: "Number of documents imported by a merge import." },
+      skippedDocuments: { type: "number", description: "Number of duplicate documents skipped by a merge import." },
+      conflictedDocuments: { type: "number", description: "Number of document conflicts reported by a merge import." },
+      importedChunks: { type: "number", description: "Number of chunks imported by a merge import." }
+    },
+    required: ["mode", "path"],
+    additionalProperties: true
+  };
+}
+
+function documentationSearchOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      results: { type: "array", items: { type: "object", additionalProperties: true }, description: "Documentation search results returned by the local archive." },
+      resultCount: { type: "number", description: "Number of documentation search results returned." },
+      firstDocumentId: { type: "string", description: "Document ID from the first search result." },
+      firstTitle: { type: "string", description: "Title from the first search result." },
+      firstLocator: { type: "string", description: "Source locator from the first search result." },
+      firstUri: { type: "string", description: "Source URI from the first search result." }
+    },
+    required: ["results", "resultCount"],
+    additionalProperties: true
+  };
+}
+
+function documentationIngestOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      documents: { type: "array", items: { type: "object", additionalProperties: true }, description: "Documentation records created or updated by the ingest." },
+      documentCount: { type: "number", description: "Number of documentation records returned by the ingest." },
+      firstDocumentId: { type: "string", description: "Document ID from the first ingested record." },
+      firstTitle: { type: "string", description: "Title from the first ingested record." },
+      firstUri: { type: "string", description: "Source URI from the first ingested record." },
+      kind: { type: "string", description: "Documentation ingest kind: path, url, or text." },
+      source: { type: "string", description: "Path, URL, or URI used as the ingest source." }
+    },
+    required: ["documents", "documentCount", "kind", "source"],
+    additionalProperties: true
+  };
+}
+
+function documentationDocumentMutationOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      documentId: { type: "string", description: "Documentation record ID changed by this operation." },
+      state: { type: "string", description: "Documentation record state after this operation." },
+      title: { type: "string", description: "Documentation record title after this operation." },
+      uri: { type: "string", description: "Documentation record source URI after this operation." }
+    },
+    additionalProperties: true
+  };
+}
+
+function documentationRebuildOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      rebuilt: { type: "boolean", description: "True when the documentation index rebuild completed." },
+      activeChunkCount: { type: "number", description: "Number of active chunks written into the rebuilt index." },
+      rebuiltAt: { type: "string", description: "Timestamp reported by the rebuilt index manifest." }
+    },
+    required: ["rebuilt"],
+    additionalProperties: true
+  };
+}
+
+function searchResult(response: Record<string, unknown>): Record<string, unknown> {
+  const results = recordsArray(response.results);
+  const first = results[0];
+  return compactRecord({
+    ...response,
+    results,
+    resultCount: results.length,
+    firstDocumentId: stringValue(first?.documentId),
+    firstTitle: stringValue(first?.title),
+    firstLocator: stringValue(first?.locator),
+    firstUri: stringValue(first?.uri)
+  });
+}
+
+function queueResult(response: Record<string, unknown>): Record<string, unknown> {
+  const jobs = recordsArray(response.jobs);
+  return {
+    ...response,
+    jobs,
+    jobCount: jobs.length
+  };
+}
+
+function ingestResult(response: Record<string, unknown>, kind: "path" | "url" | "text", source: string): Record<string, unknown> {
+  const documents = documentsFromResponse(response);
+  const first = documents[0];
+  return compactRecord({
+    ...response,
+    documents,
+    documentCount: documents.length,
+    firstDocumentId: stringValue(first?.documentId),
+    firstTitle: stringValue(first?.title),
+    firstUri: stringValue(first?.uri),
+    kind,
+    source
+  });
+}
+
+function archiveImportResult(response: Record<string, unknown>, fallbackMode: "merge" | "replace", archivePath: string): Record<string, unknown> {
+  const imported = isRecord(response.import) ? response.import : response;
+  return compactRecord({
+    ...response,
+    mode: stringValue(imported.mode) ?? fallbackMode,
+    status: stringValue(imported.status),
+    path: archivePath,
+    importedDocuments: numberValue(imported.importedDocuments),
+    skippedDocuments: numberValue(imported.skippedDocuments),
+    conflictedDocuments: numberValue(imported.conflictedDocuments),
+    importedChunks: numberValue(imported.importedChunks)
+  });
+}
+
+function documentMutationResult(response: Record<string, unknown>): Record<string, unknown> {
+  const document = isRecord(response.document) ? response.document : undefined;
+  return compactRecord({
+    ...response,
+    documentId: stringValue(document?.documentId) ?? stringValue(document?.document_id),
+    state: stringValue(document?.state),
+    title: stringValue(document?.title),
+    uri: stringValue(document?.uri)
+  });
+}
+
+function rebuildIndexResult(response: Record<string, unknown>): Record<string, unknown> {
+  const manifest = isRecord(response.manifest) ? response.manifest : response;
+  return compactRecord({
+    ...response,
+    rebuilt: true,
+    activeChunkCount: numberValue(manifest.activeChunkCount),
+    rebuiltAt: stringValue(manifest.rebuiltAt)
+  });
+}
+
+function documentsFromResponse(response: Record<string, unknown>): Record<string, unknown>[] {
+  const documents = recordsArray(response.documents);
+  if (documents.length > 0) {
+    return documents;
+  }
+  return isRecord(response.document) ? [response.document] : [];
+}
+
+function recordsArray(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value) ? value.filter(isRecord) : [];
+}
+
+function compactRecord(record: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(record).filter(([, value]) => value !== undefined));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
 function readHook(
   id: string,
   title: string,
@@ -342,9 +549,10 @@ function readHook(
   execute: HookDefinition["execute"],
   properties: Record<string, JsonSchemaLike> = {},
   required: string[] = [],
-  exposures: HookDefinition["exposures"] = ["plugin", "ui", "http"]
+  exposures: HookDefinition["exposures"] = ["plugin", "ui", "http"],
+  outputSchema: Record<string, unknown> = { type: "object", additionalProperties: true }
 ): HookDefinition {
-  return hook(id, title, description, execute, properties, required, exposures, "read");
+  return hook(id, title, description, execute, properties, required, exposures, "read", outputSchema);
 }
 
 function writeHook(
@@ -353,9 +561,10 @@ function writeHook(
   description: string,
   execute: HookDefinition["execute"],
   properties: Record<string, JsonSchemaLike> = {},
-  required: string[] = []
+  required: string[] = [],
+  outputSchema: Record<string, unknown> = { type: "object", additionalProperties: true }
 ): HookDefinition {
-  return hook(id, title, description, execute, properties, required, ["ui", "http", "automation"], "write");
+  return hook(id, title, description, execute, properties, required, ["ui", "http", "automation"], "write", outputSchema);
 }
 
 function destructiveHook(
@@ -364,9 +573,10 @@ function destructiveHook(
   description: string,
   execute: HookDefinition["execute"],
   properties: Record<string, JsonSchemaLike> = {},
-  required: string[] = []
+  required: string[] = [],
+  outputSchema: Record<string, unknown> = { type: "object", additionalProperties: true }
 ): HookDefinition {
-  return hook(id, title, description, execute, properties, required, ["ui", "http", "automation"], "destructive");
+  return hook(id, title, description, execute, properties, required, ["ui", "http", "automation"], "destructive", outputSchema);
 }
 
 function externalHook(
@@ -375,9 +585,10 @@ function externalHook(
   description: string,
   execute: HookDefinition["execute"],
   properties: Record<string, JsonSchemaLike>,
-  required: string[]
+  required: string[],
+  outputSchema: Record<string, unknown> = { type: "object", additionalProperties: true }
 ): HookDefinition {
-  return hook(id, title, description, execute, properties, required, ["ui", "http", "automation"], "external");
+  return hook(id, title, description, execute, properties, required, ["ui", "http", "automation"], "external", outputSchema);
 }
 
 function hook(
@@ -388,7 +599,8 @@ function hook(
   properties: Record<string, JsonSchemaLike>,
   required: string[],
   exposures: HookDefinition["exposures"],
-  automationSafety: HookDefinition["automationSafety"]
+  automationSafety: HookDefinition["automationSafety"],
+  outputSchema: Record<string, unknown>
 ): HookDefinition {
   return {
     id,
@@ -398,7 +610,7 @@ function hook(
     exposures,
     automationSafety,
     inputSchema: { type: "object", properties, required, additionalProperties: false },
-    outputSchema: { type: "object", additionalProperties: true },
+    outputSchema,
     execute
   };
 }

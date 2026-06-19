@@ -147,15 +147,27 @@ describe("JiraIntegrationService", () => {
           author: { accountId: "abc", displayName: "Ari" }
         });
       }
+      if (url.includes("/transitions") && init?.method === "GET") {
+        return jsonResponse({ transitions: [{ id: "21", name: "Start Progress", hasScreen: true, fields: { resolution: { required: true } }, to: { id: "3", name: "In Progress" } }] });
+      }
+      if (url.includes("/issue/ENG-7?") && init?.method === "GET") {
+        const issue = jiraIssue("ENG-7", "High", "ENG-1", "Epic One", "2026-06-09");
+        return jsonResponse({ ...issue, fields: { ...(issue.fields as Record<string, unknown>), status: { id: "3", name: "In Progress" } } });
+      }
       return new Response(undefined, { status: 204 });
     };
     const service = new JiraIntegrationService(config, fetchImpl);
 
-    await service.updateIssue("ENG-7", { summary: "New summary", description: "Updated.", priority: "High", fields: { customfield_10010: "field value" } });
+    const updated = await service.updateIssue("ENG-7", { summary: "New summary", description: "Updated.", priority: "High", fields: { customfield_10010: "field value" } });
     const comment = await service.addComment("ENG-7", "Added context.");
-    await service.transitionIssue("ENG-7", "21", { comment: "Starting work.", fields: { resolution: { name: "Done" } } });
+    const transition = await service.transitionIssue("ENG-7", { targetStatus: "in progress", comment: "Starting work.", fields: { resolution: { name: "Done" } }, update: { labels: [{ add: "automation" }] } });
     const link = await service.linkIssues({ inwardIssueKey: "ENG-7", outwardIssueKey: "ENG-8", typeName: "Relates", comment: "Related work." });
 
+    expect(updated).toMatchObject({
+      issueKey: "ENG-7",
+      updated: true,
+      issueUrl: "https://example.atlassian.net/browse/ENG-7"
+    });
     expect(comment).toMatchObject({
       commentId: "9001",
       issueUrl: "https://example.atlassian.net/browse/ENG-7",
@@ -164,6 +176,16 @@ describe("JiraIntegrationService", () => {
     expect(link).toMatchObject({
       inwardIssueUrl: "https://example.atlassian.net/browse/ENG-7",
       outwardIssueUrl: "https://example.atlassian.net/browse/ENG-8"
+    });
+    expect(transition).toMatchObject({
+      transitionId: "21",
+      transitionName: "Start Progress",
+      targetStatus: "In Progress",
+      status: "In Progress",
+      statusId: "3",
+      issueUrl: "https://example.atlassian.net/browse/ENG-7",
+      transitionFields: { resolution: { required: true } },
+      issue: expect.objectContaining({ key: "ENG-7", status: "In Progress" })
     });
     expect(JSON.parse(String(calls[0]?.[1]?.body))).toMatchObject({
       fields: {
@@ -174,17 +196,36 @@ describe("JiraIntegrationService", () => {
       }
     });
     expect(JSON.parse(String(calls[1]?.[1]?.body))).toMatchObject({ body: { type: "doc", version: 1 } });
-    expect(JSON.parse(String(calls[2]?.[1]?.body))).toMatchObject({
+    expect(calls[2]?.[0]).toContain("/rest/api/3/issue/ENG-7/transitions?expand=transitions.fields");
+    expect(JSON.parse(String(calls[3]?.[1]?.body))).toMatchObject({
       transition: { id: "21" },
       fields: { resolution: { name: "Done" } },
-      update: { comment: [{ add: { body: { type: "doc", version: 1 } } }] }
+      update: { labels: [{ add: "automation" }], comment: [{ add: { body: { type: "doc", version: 1 } } }] }
     });
-    expect(JSON.parse(String(calls[3]?.[1]?.body))).toMatchObject({
+    expect(JSON.parse(String(calls[5]?.[1]?.body))).toMatchObject({
       inwardIssue: { key: "ENG-7" },
       outwardIssue: { key: "ENG-8" },
       type: { name: "Relates" },
       comment: { body: { type: "doc", version: 1 } }
     });
+  });
+
+  it("rejects ambiguous Jira transition name or target-status selectors", async () => {
+    const config = await configuredJiraConfig({});
+    const fetchImpl: FetchLike = async (url) => {
+      if (url.includes("/transitions")) {
+        return jsonResponse({
+          transitions: [
+            { id: "21", name: "Review", to: { id: "4", name: "QA" } },
+            { id: "31", name: "Review", to: { id: "5", name: "QA" } }
+          ]
+        });
+      }
+      throw new Error(`Unexpected URL ${url}`);
+    };
+
+    await expect(new JiraIntegrationService(config, fetchImpl).transitionIssue("ENG-7", { transitionName: "review" })).rejects.toThrow("matched multiple transitions");
+    await expect(new JiraIntegrationService(config, fetchImpl).transitionIssue("ENG-7", { targetStatus: "qa" })).rejects.toThrow("matched multiple transitions");
   });
 
   it("fetches Jira metadata and builds issue and comment URLs", async () => {
@@ -214,10 +255,77 @@ describe("JiraIntegrationService", () => {
       projects: [expect.objectContaining({ key: "ENG" })],
       priorities: [expect.objectContaining({ name: "High" })],
       issueTypes: [expect.objectContaining({ name: "Task" })],
-      issueLinkTypes: [expect.objectContaining({ name: "Relates" })]
+      issueLinkTypes: [expect.objectContaining({ name: "Relates" })],
+      fieldCount: 1,
+      projectCount: 1,
+      priorityCount: 1,
+      issueTypeCount: 1,
+      issueLinkTypeCount: 1
     });
+    await expect(service.projects()).resolves.toMatchObject({ projectCount: 1, firstProjectKey: "ENG", firstProjectName: "Engineering" });
+    await expect(service.issueTypes()).resolves.toMatchObject({ issueTypeCount: 1, firstIssueTypeId: "10001", firstIssueTypeName: "Task" });
+    await expect(service.fields()).resolves.toMatchObject({ fieldCount: 1, firstFieldId: "summary", firstFieldName: "Summary" });
+    await expect(service.priorities()).resolves.toMatchObject({ priorityCount: 1, firstPriorityId: "1", firstPriorityName: "High" });
+    await expect(service.issueLinkTypes()).resolves.toMatchObject({ issueLinkTypeCount: 1, firstIssueLinkTypeId: "10000", firstIssueLinkTypeName: "Relates" });
     expect(service.issueUrl("ENG-7")).toEqual({ issueKey: "ENG-7", commentId: undefined, url: "https://example.atlassian.net/browse/ENG-7" });
     expect(service.issueUrl("ENG-7", "9001")).toEqual({ issueKey: "ENG-7", commentId: "9001", url: "https://example.atlassian.net/browse/ENG-7?focusedCommentId=9001" });
+  });
+
+  it("returns normalized issue, comment, current user, and transition list fields for automation connections", async () => {
+    const config = await configuredJiraConfig({});
+    const fetchImpl: FetchLike = async (url, init) => {
+      if (url.endsWith("/myself")) {
+        return jsonResponse({ accountId: "abc", displayName: "Ari", emailAddress: "ari@example.com" });
+      }
+      if (url.includes("/issue/ENG-7?") && init?.method === "GET") {
+        return jsonResponse(jiraIssue("ENG-7", "High", "ENG-1", "Epic One", "2026-06-09"));
+      }
+      if (url.endsWith("/issue/ENG-7/comment")) {
+        return jsonResponse({
+          comments: [
+            {
+              id: "9001",
+              body: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "First comment." }] }] },
+              author: { accountId: "abc", displayName: "Ari" }
+            }
+          ]
+        });
+      }
+      if (url.includes("/issue/ENG-7/transitions") && init?.method === "GET") {
+        return jsonResponse({ transitions: [{ id: "21", name: "Start Progress", to: { id: "3", name: "In Progress" } }] });
+      }
+      throw new Error(`Unexpected URL ${url}`);
+    };
+    const service = new JiraIntegrationService(config, fetchImpl);
+
+    await expect(service.currentUser()).resolves.toMatchObject({
+      user: { accountId: "abc", displayName: "Ari", emailAddress: "ari@example.com" }
+    });
+    await expect(service.getIssue("ENG-7")).resolves.toMatchObject({
+      issue: expect.objectContaining({ key: "ENG-7" }),
+      issueKey: "ENG-7",
+      issueUrl: "https://example.atlassian.net/browse/ENG-7",
+      summary: "ENG-7",
+      status: "Open",
+      statusId: "3",
+      issueType: "Task",
+      priority: "High",
+      projectKey: undefined,
+      epicKey: "ENG-1"
+    });
+    await expect(service.listComments("ENG-7")).resolves.toMatchObject({
+      comments: [expect.objectContaining({ id: "9001", bodyText: "First comment." })],
+      commentCount: 1,
+      firstCommentId: "9001",
+      firstCommentUrl: "https://example.atlassian.net/browse/ENG-7?focusedCommentId=9001",
+      firstCommentBody: "First comment."
+    });
+    await expect(service.listTransitions("ENG-7")).resolves.toMatchObject({
+      transitionCount: 1,
+      firstTransitionId: "21",
+      firstTransitionName: "Start Progress",
+      firstTargetStatus: "In Progress"
+    });
   });
 });
 

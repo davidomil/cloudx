@@ -1,4 +1,4 @@
-import Fastify, { type FastifyInstance, type FastifyRequest, type HTTPMethods } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest, type HTTPMethods } from "fastify";
 import websocket from "@fastify/websocket";
 import staticPlugin from "@fastify/static";
 import fs from "node:fs";
@@ -20,8 +20,12 @@ import type {
   CreateWorkspaceWindowRequest,
   HookCallRequest,
   AutomationGroup,
+  AutomationRunStatus,
+  AutomationTestCase,
   SearchWorkspaceWindowsRequest,
+  StatePersistenceStatus,
   TabLayoutNode,
+  WorkspaceStateResponse,
   UpdateWorkspaceLayoutTemplateRequest,
   UpdateWorkspaceWindowRequest
 } from "@cloudx/shared";
@@ -139,7 +143,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   });
   services ??= buildServices(config, app.log);
   services.documentationIngestQueue ??= new DocumentationIngestQueue();
-  services.config ??= new ConfigService(config.dataDir, () => services!.plugins.list());
+  services.config ??= new ConfigService(config.dataDir, () => services!.plugins.list(), { voiceModel: config.voiceModel });
   services.workspace ??= new WorkspaceLayoutStore(config.dataDir, services.pathPolicy);
   services.pluginData ??= new PluginDataStore(config.dataDir);
   services.installedPlugins ??= new InstalledPluginService(config.dataDir, { logger: app.log });
@@ -164,6 +168,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   services.automation ??= createAutomationService(new AutomationRepository(config.dataDir), services, config);
   services.sessions.setHookRegistry?.(services.hooks);
   services.sessions.setTriggerRegistry?.(services.triggers);
+  const disposePersistenceNotifications = bindPersistenceNotifications(services);
   const localWebProxy = new LocalWebProxy(services.sessions);
   await app.register(websocket, {
     options: {
@@ -174,6 +179,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   });
 
   app.addHook("onClose", async () => {
+    disposePersistenceNotifications();
     services.automation?.dispose();
     services.jiraPolling?.dispose();
     services.voice.dispose?.();
@@ -265,9 +271,15 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     return services.automation!.validate(optionalAutomationGraph(body.graph, "graph") ?? group.graph);
   });
 
-  app.post<{ Params: { groupId: string }; Body: { payload?: Record<string, unknown>; graph?: AutomationGroup["graph"] } }>("/api/automation/groups/:groupId/test-run", async (request) => {
+  app.post<{ Params: { groupId: string }; Body: { payload?: Record<string, unknown>; graph?: AutomationGroup["graph"]; testCaseId?: unknown; testCase?: unknown } }>("/api/automation/groups/:groupId/test-run", async (request) => {
     const body = optionalRequestBody(request.body);
-    return services.automation!.startTest(request.params.groupId, optionalBodyRecord(body.payload, "payload"), optionalAutomationGraph(body.graph, "graph"));
+    return services.automation!.startTest(
+      request.params.groupId,
+      optionalBodyRecord(body.payload, "payload"),
+      optionalAutomationGraph(body.graph, "graph"),
+      optionalBodyString(body.testCaseId, "testCaseId"),
+      optionalAutomationTestCase(body.testCase, "testCase")
+    );
   });
 
   app.get("/api/automation/runs", async () => services.automation!.listRuns());
@@ -288,12 +300,12 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
 
   app.get("/api/tabs", async () => ({ tabs: services.sessions.listTabs(), activeTabId: services.sessions.getActiveTabId() }));
 
-  app.get("/api/workspace", async () => services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId()));
+  app.get("/api/workspace", async () => workspaceState(services));
 
   app.post<{ Body: unknown }>("/api/windows", async (request, reply) => {
     await services.workspace!.createWindow(createWindowBody(request.body));
     reply.code(201);
-    return await services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId());
+    return await workspaceState(services);
   });
 
   app.patch<{ Params: { windowId: string }; Body: unknown }>("/api/windows/:windowId", async (request) => {
@@ -307,12 +319,12 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
         "Applying window rules/skills template changes."
       );
     }
-    return await services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId());
+    return await workspaceState(services);
   });
 
   app.post<{ Params: { windowId: string } }>("/api/windows/:windowId/active", async (request) => {
     await services.workspace!.selectWindow(request.params.windowId);
-    return await services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId());
+    return await workspaceState(services);
   });
 
   app.delete<{ Params: { windowId: string } }>("/api/windows/:windowId", async (request) => {
@@ -321,7 +333,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       services.sessions.closeTab(tabId);
     }
     await services.workspace!.deleteWindow(request.params.windowId);
-    return await services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId());
+    return await workspaceState(services);
   });
 
   app.post<{ Body: SearchWorkspaceWindowsRequest }>("/api/windows/search-context", async (request) => {
@@ -342,7 +354,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     }
     const template = await services.workspace!.createTemplate(body, sources);
     reply.code(201);
-    return { template, workspace: await services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId()) };
+    return { template, workspace: await workspaceState(services) };
   });
 
   app.post<{ Params: { templateId: string }; Body: unknown }>("/api/layout-templates/:templateId/apply", async (request, reply) => {
@@ -367,7 +379,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
         services.sessions.closeTab(tabId);
       }
       reply.code(201);
-      return { window, workspace: await services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId()) };
+      return { window, workspace: await workspaceState(services) };
     } catch (error) {
       for (const tabId of createdTabIds) {
         services.sessions.closeTab(tabId);
@@ -381,12 +393,12 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
 
   app.patch<{ Params: { templateId: string }; Body: unknown }>("/api/layout-templates/:templateId", async (request) => {
     const template = await services.workspace!.updateTemplate(request.params.templateId, updateLayoutTemplateBody(request.body));
-    return { template, workspace: await services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId()) };
+    return { template, workspace: await workspaceState(services) };
   });
 
   app.delete<{ Params: { templateId: string } }>("/api/layout-templates/:templateId", async (request) => {
     const template = await services.workspace!.deleteTemplate(request.params.templateId);
-    return { template, workspace: await services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId()) };
+    return { template, workspace: await workspaceState(services) };
   });
 
   app.post<{ Body: CreateTabRequest }>("/api/tabs", async (request, reply) => {
@@ -561,6 +573,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     const input = optionalBodyRecord(body.input, "input") ?? {};
     const targetTab = targetTabId ? services.sessions.getTab(targetTabId) : undefined;
     if (isStreamingHookRequest(request)) {
+      const abortScope = hookRequestAbortScope(request, reply);
       reply.header("cache-control", "no-store");
       reply.type("application/x-ndjson");
       return reply.send(hookProgressStream({
@@ -570,18 +583,26 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
           caller: { kind: "http" },
           targetTab,
           targetTabId,
-          activeTabId: services.sessions.getActiveTabId()
+          activeTabId: services.sessions.getActiveTabId(),
+          signal: abortScope.signal
         },
-        services: services!
+        services: services!,
+        onDone: abortScope.dispose
       }));
     }
-    const result = await services.hooks!.call(request.params.hookId, input, {
-      caller: { kind: "http" },
-      targetTab,
-      targetTabId,
-      activeTabId: services.sessions.getActiveTabId()
-    });
-    return { result };
+    const abortScope = hookRequestAbortScope(request, reply);
+    try {
+      const result = await services.hooks!.call(request.params.hookId, input, {
+        caller: { kind: "http" },
+        targetTab,
+        targetTabId,
+        activeTabId: services.sessions.getActiveTabId(),
+        signal: abortScope.signal
+      });
+      return { result };
+    } finally {
+      abortScope.dispose();
+    }
   });
 
   app.delete<{ Params: { tabId: string } }>("/api/tabs/:tabId", async (request) => {
@@ -953,7 +974,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       sendWebSocketJson(ws, payload, (error) => request.log.debug({ err: serializeError(error) }, "workspace websocket send failed"));
     };
     const sendWorkspace = () => {
-      void services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId())
+      void workspaceState(services)
         .then((state) => send({ type: "workspace", ...state }))
         .catch((error) => request.log.debug({ err: serializeError(error) }, "workspace websocket state failed"));
     };
@@ -1093,7 +1114,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   for (const plugin of installedPlugins.pluginsFromCatalog()) {
     plugins.register(plugin);
   }
-  const configService = new ConfigService(config.dataDir, () => plugins.list());
+  const configService = new ConfigService(config.dataDir, () => plugins.list(), { voiceModel: config.voiceModel });
   jira = new JiraIntegrationService(configService);
   sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir), configService, workspace, rulesSkills);
   rulesSkills.onChange(() => {
@@ -1126,7 +1147,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   }, () => configService.isVoiceCommandsEnabled()));
   voice = new VoiceController(
     sessions,
-    new CodexExecVoicePlanner(config.voiceModel, logger, { includeText: config.voiceDebugTranscripts ?? false }),
+    new CodexExecVoicePlanner(() => configService.getVoiceModel(), logger, { includeText: config.voiceDebugTranscripts ?? false }),
     new AppServerContextProvider(sessions, config.appServerEnabled ? () => new AppServerClient() : undefined),
     logger,
     { includeText: config.voiceDebugTranscripts ?? false }
@@ -1149,11 +1170,26 @@ function isStreamingHookRequest(request: FastifyRequest<{ Querystring: { stream?
   return request.query.stream === "1" || request.query.stream === "true" || typeof accept === "string" && accept.includes("application/x-ndjson");
 }
 
+function hookRequestAbortScope(request: FastifyRequest, reply: FastifyReply): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  request.raw.on("aborted", abort);
+  reply.raw.on("close", abort);
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      request.raw.off("aborted", abort);
+      reply.raw.off("close", abort);
+    }
+  };
+}
+
 function hookProgressStream(input: {
   hookId: string;
   input: Record<string, unknown>;
   context: HookCallContext;
   services: AppServices;
+  onDone?: () => void;
 }): Readable {
   const events = new AsyncEventQueue<Record<string, unknown>>();
   void input.services.hooks!.call(input.hookId, input.input, {
@@ -1163,7 +1199,10 @@ function hookProgressStream(input: {
     events.push({ type: "result", hookId: input.hookId, at: new Date().toISOString(), result });
   }).catch((error) => {
     events.push({ type: "error", hookId: input.hookId, at: new Date().toISOString(), error: error instanceof Error ? error.message : String(error) });
-  }).finally(() => events.end());
+  }).finally(() => {
+    input.onDone?.();
+    events.end();
+  });
   return Readable.from(ndjsonEvents(events));
 }
 
@@ -1276,7 +1315,59 @@ function createAutomationService(repository: AutomationRepository, services: App
   const catalog = new AutomationCatalogService(typeService, () => services.triggers!.list(), () => services.hooks!.list(), buildAutomationDynamicOptionsProvider(services));
   return new AutomationService(repository, services.triggers!, services.hooks!, catalog, new AutomationCompiler(typeService), new AutomationExecutor(), {
     startDisabled: config?.automationStartDisabled,
+    executorOptions: { allowedRoots: automationAllowedRoots(services.pathPolicy) },
     layoutEffects: services.workspace
+  });
+}
+
+function automationAllowedRoots(pathPolicy: PathPolicy): string[] {
+  const context = pathPolicy.voiceContext();
+  const roots = Array.isArray(context.allowedRoots) ? context.allowedRoots : [];
+  return roots
+    .map((root) => typeof root === "object" && root !== null && "resolved" in root ? (root as { resolved?: unknown }).resolved : undefined)
+    .filter((root): root is string => typeof root === "string" && root.trim().length > 0);
+}
+
+async function workspaceState(services: AppServices): Promise<WorkspaceStateResponse> {
+  const state = await services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId());
+  return { ...state, persistence: persistenceStatuses(services) };
+}
+
+function persistenceStatuses(services: AppServices): StatePersistenceStatus[] {
+  return [
+    services.workspace?.persistenceStatus(),
+    services.automation?.persistenceStatus()
+  ].filter((status): status is StatePersistenceStatus => Boolean(status));
+}
+
+function bindPersistenceNotifications(services: AppServices): () => void {
+  const disposers = [
+    services.workspace?.onPersistenceStatusChange((status) => notifyPersistenceStatus(services, status)),
+    services.automation?.onPersistenceStatusChange((status) => notifyPersistenceStatus(services, status))
+  ].filter((dispose): dispose is () => void => Boolean(dispose));
+  return () => {
+    for (const dispose of disposers) {
+      dispose();
+    }
+  };
+}
+
+function notifyPersistenceStatus(services: AppServices, status: StatePersistenceStatus): void {
+  if (!services.notifications) {
+    return;
+  }
+  if (status.state === "degraded") {
+    services.notifications.send({
+      title: `${status.name} is not being saved`,
+      body: `${status.code ? `${status.code}: ` : ""}${status.message ?? "State writes failed."} Running tabs and in-memory automation state remain reachable until the server stops.`,
+      level: "warning"
+    });
+    return;
+  }
+  services.notifications.send({
+    title: `${status.name} saving recovered`,
+    body: "State writes are succeeding again.",
+    level: "success"
   });
 }
 
@@ -1397,7 +1488,8 @@ function automationGroupBody(body: unknown, groupId: string): AutomationGroupSav
     id: groupId,
     name: requiredTrimmedBodyString(payload.name, "name"),
     enabled: requiredBodyBoolean(payload.enabled, "enabled"),
-    graph: requiredAutomationGraph(payload.graph, "graph")
+    graph: requiredAutomationGraph(payload.graph, "graph"),
+    testCases: optionalAutomationTestCases(payload.testCases, "testCases")
   };
 }
 
@@ -1406,6 +1498,7 @@ function createWindowBody(body: unknown): CreateWorkspaceWindowRequest {
   return {
     name: optionalBodyString(payload.name, "name"),
     defaultCwd: optionalBodyString(payload.defaultCwd, "defaultCwd"),
+    createDirectory: optionalBodyBoolean(payload.createDirectory, "createDirectory"),
     pluginMetadata: optionalPluginMetadataMap(payload.pluginMetadata, "pluginMetadata")
   };
 }
@@ -1575,6 +1668,67 @@ function optionalAutomationGraph(value: unknown, field: string): AutomationGroup
     return undefined;
   }
   return requiredAutomationGraph(value, field);
+}
+
+function optionalAutomationTestCases(value: unknown, field: string): AutomationTestCase[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value)) {
+    throwBadRequest(`${field} must be an array.`);
+  }
+  return value.map((entry, index) => requiredAutomationTestCase(entry, `${field}[${index}]`));
+}
+
+function optionalAutomationTestCase(value: unknown, field: string): AutomationTestCase | undefined {
+  return value === undefined ? undefined : requiredAutomationTestCase(value, field);
+}
+
+function requiredAutomationTestCase(value: unknown, field: string): AutomationTestCase {
+  const payload = optionalRequestBody(value);
+  return {
+    id: requiredTrimmedBodyString(payload.id, `${field}.id`),
+    name: requiredTrimmedBodyString(payload.name, `${field}.name`),
+    payload: optionalBodyRecord(payload.payload, `${field}.payload`) ?? {},
+    expected: optionalAutomationTestExpected(payload.expected, `${field}.expected`)
+  };
+}
+
+function optionalAutomationTestExpected(value: unknown, field: string): AutomationTestCase["expected"] {
+  const expected = optionalBodyRecord(value, field);
+  if (!expected) {
+    return undefined;
+  }
+  return {
+    status: optionalAutomationRunStatus(expected.status, `${field}.status`),
+    errorIncludes: optionalBodyString(expected.errorIncludes, `${field}.errorIncludes`),
+    traceIncludes: optionalBodyStringArray(expected.traceIncludes, `${field}.traceIncludes`)
+  };
+}
+
+function optionalAutomationRunStatus(value: unknown, field: string): AutomationRunStatus | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value !== "queued" && value !== "running" && value !== "succeeded" && value !== "failed" && value !== "cancelled") {
+    throwBadRequest(`${field} must be a valid automation run status.`);
+  }
+  return value;
+}
+
+function optionalBodyStringArray(value: unknown, field: string): string[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value)) {
+    throwBadRequest(`${field} must be an array.`);
+  }
+  return value.map((entry, index) => {
+    if (typeof entry !== "string") {
+      throwBadRequest(`${field}[${index}] must be a string.`);
+    }
+    return entry;
+  });
 }
 
 function requiredTrimmedBodyString(value: unknown, field: string): string {

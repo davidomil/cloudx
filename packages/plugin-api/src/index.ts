@@ -131,9 +131,14 @@ export interface PluginSession {
   applyRuntimeContext?(runtimeContext?: WorkspaceRuntimeContext): Promise<Record<string, unknown>> | Record<string, unknown>;
   snapshot(): PluginSessionSnapshot;
   voiceContext(): Promise<PluginVoiceContext> | PluginVoiceContext;
-  handleAction(action: string, input: Record<string, unknown>): Promise<Record<string, unknown>> | Record<string, unknown>;
+  handleAction(action: string, input: Record<string, unknown>, context?: PluginActionContext): Promise<Record<string, unknown>> | Record<string, unknown>;
   onData?(listener: (data: string) => void): () => void;
   onStatusChange?(listener: (status: WorkspaceTab["status"], message?: string) => void): () => void;
+}
+
+export interface PluginActionContext {
+  signal?: AbortSignal;
+  caller?: HookCaller;
 }
 
 export interface PluginSkillContributionFile {

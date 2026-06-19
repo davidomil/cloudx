@@ -4,6 +4,7 @@ import {
   readWorkspaceUiInstruction,
   type AutomationRunSummary,
   type CloudxNotification,
+  type StatePersistenceStatus,
   type TabLayoutState,
   type WorkspaceLayoutTemplate,
   type WorkspaceTab,
@@ -32,6 +33,7 @@ export function parseWorkspaceSocketUpdate(data: unknown): WorkspaceUpdate | und
       isWorkspaceTabArray(parsed.tabs) &&
       isWorkspaceWindowArray(parsed.windows) &&
       isWorkspaceLayoutTemplateArray(parsed.templates) &&
+      isPersistenceStatusArray(parsed.persistence) &&
       typeof parsed.activeWindowId === "string" &&
       parsed.windows.some((window) => window.id === parsed.activeWindowId)
     ) {
@@ -41,7 +43,8 @@ export function parseWorkspaceSocketUpdate(data: unknown): WorkspaceUpdate | und
         activeTabId: typeof parsed.activeTabId === "string" ? parsed.activeTabId : undefined,
         activeWindowId: parsed.activeWindowId,
         windows: parsed.windows,
-        templates: parsed.templates
+        templates: parsed.templates,
+        persistence: isPersistenceStatusArray(parsed.persistence) ? parsed.persistence : undefined
       };
     }
     if (parsed.type === "notification" && isNotification(parsed.notification)) {
@@ -68,6 +71,23 @@ function isNotification(value: unknown): value is CloudxNotification {
     (value.body === undefined || typeof value.body === "string") &&
     (value.level === "info" || value.level === "success" || value.level === "warning" || value.level === "error") &&
     typeof value.at === "string"
+  );
+}
+
+function isPersistenceStatusArray(value: unknown): value is StatePersistenceStatus[] {
+  return value === undefined || Array.isArray(value) && value.every(isPersistenceStatus);
+}
+
+function isPersistenceStatus(value: unknown): value is StatePersistenceStatus {
+  return (
+    isRecord(value) &&
+    typeof value.name === "string" &&
+    (value.state === "available" || value.state === "degraded") &&
+    typeof value.path === "string" &&
+    (value.code === undefined || typeof value.code === "string") &&
+    (value.message === undefined || typeof value.message === "string") &&
+    (value.failedAt === undefined || typeof value.failedAt === "string") &&
+    (value.lastSuccessfulWriteAt === undefined || typeof value.lastSuccessfulWriteAt === "string")
   );
 }
 

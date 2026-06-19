@@ -186,6 +186,42 @@ describe("summarizeCodexError", () => {
 });
 
 describe("CodexExecVoicePlanner", () => {
+  it("resolves the configured model provider for each plan request", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-fake-codex-model-"));
+    const fakeCodexPath = path.join(tempDir, "fake-codex.mjs");
+    const previousAssistantBin = process.env.CLOUDX_ASSISTANT_BIN;
+    let currentModel = "gpt-5.4";
+
+    await fs.writeFile(
+      fakeCodexPath,
+      [
+        "#!/usr/bin/env node",
+        "import fs from 'node:fs';",
+        "const args = process.argv.slice(2);",
+        "const model = args[args.indexOf('--model') + 1];",
+        "const outputPath = args[args.indexOf('--output-last-message') + 1];",
+        "fs.writeFileSync(outputPath, JSON.stringify({ transcript: model, summary: model, actions: [] }));"
+      ].join("\n"),
+      "utf8"
+    );
+    await fs.chmod(fakeCodexPath, 0o755);
+    process.env.CLOUDX_ASSISTANT_BIN = fakeCodexPath;
+
+    try {
+      const planner = new CodexExecVoicePlanner(() => currentModel);
+      await expect(planner.plan({ transcript: "noop", context: {} })).resolves.toMatchObject({ summary: "gpt-5.4" });
+      currentModel = "gpt-5.4-mini";
+      await expect(planner.plan({ transcript: "noop", context: {} })).resolves.toMatchObject({ summary: "gpt-5.4-mini" });
+    } finally {
+      if (previousAssistantBin === undefined) {
+        delete process.env.CLOUDX_ASSISTANT_BIN;
+      } else {
+        process.env.CLOUDX_ASSISTANT_BIN = previousAssistantBin;
+      }
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("rejects when the planner subprocess exceeds the output limit", async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-fake-codex-"));
     const fakeCodexPath = path.join(tempDir, "fake-codex.mjs");

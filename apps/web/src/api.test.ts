@@ -4,6 +4,7 @@ import {
   applyLayoutTemplate,
   callHook,
   closeTab,
+  createWindow,
   deleteAllNotifications,
   deleteAutomationGroup,
   deleteNotification,
@@ -78,6 +79,19 @@ describe("api client", () => {
     expect(fetchMock).toHaveBeenCalledWith("/api/tabs/tab-1/active", {
       method: "POST",
       body: "{}",
+      headers: { "content-type": "application/json" }
+    });
+  });
+
+  it("serializes createDirectory when creating workspace windows", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ windows: [], templates: [], activeWindowId: "window-1" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await createWindow({ name: "Generated", defaultCwd: "/repo/generated", createDirectory: true });
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/windows", {
+      method: "POST",
+      body: JSON.stringify({ name: "Generated", defaultCwd: "/repo/generated", createDirectory: true }),
       headers: { "content-type": "application/json" }
     });
   });

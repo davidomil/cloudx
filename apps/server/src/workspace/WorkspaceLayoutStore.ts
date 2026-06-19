@@ -17,6 +17,7 @@ import type {
   WorkspaceLayoutTemplate,
   WorkspaceLayoutTemplateTab,
   WorkspaceStateResponse,
+  StatePersistenceStatus,
   WorkspaceTab,
   WorkspaceWindow
 } from "@cloudx/shared";
@@ -25,6 +26,7 @@ import { applyWorkspaceLayoutInstructionToTabLayout, firstTabLayoutPaneId, isRec
 import { relativeChildPath as relativePathWithin } from "../pathBoundary.js";
 import { PathPolicy } from "../pathPolicy.js";
 import { JsonStateFile } from "../jsonStateFile.js";
+import { availablePersistenceStatus, degradedPersistenceStatus, initialPersistenceStatus, isCapacityStateWriteError, persistenceStatusChanged } from "../statePersistence.js";
 
 interface StoredWorkspace {
   activeWindowId?: string;
@@ -53,6 +55,8 @@ export class WorkspaceLayoutStore {
   private windows: WorkspaceWindow[];
   private templates: WorkspaceLayoutTemplate[];
   private readonly listeners = new Set<() => void>();
+  private readonly persistenceListeners = new Set<(status: StatePersistenceStatus) => void>();
+  private persistence: StatePersistenceStatus;
 
   constructor(
     dataDir: string,
@@ -60,6 +64,7 @@ export class WorkspaceLayoutStore {
   ) {
     this.workspaceFile = new JsonStateFile(dataDir, "workspace.json", "Workspace layout");
     this.workspacePath = this.workspaceFile.filePath;
+    this.persistence = initialPersistenceStatus("Workspace layout", this.workspacePath);
     const loaded = this.loadStoredWorkspace();
     this.windows = loaded.windows;
     this.templates = loaded.templates;
@@ -69,6 +74,15 @@ export class WorkspaceLayoutStore {
   onChange(listener: () => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  onPersistenceStatusChange(listener: (status: StatePersistenceStatus) => void): () => void {
+    this.persistenceListeners.add(listener);
+    return () => this.persistenceListeners.delete(listener);
+  }
+
+  persistenceStatus(): StatePersistenceStatus {
+    return { ...this.persistence };
   }
 
   async state(tabs: WorkspaceTab[], activeTabId?: string): Promise<WorkspaceStateResponse> {
@@ -81,15 +95,17 @@ export class WorkspaceLayoutStore {
       tabs,
       activeWindowId: this.activeWindowId,
       windows: this.windows,
-      templates: this.templates
+      templates: this.templates,
+      persistence: [this.persistenceStatus()]
     };
   }
 
-  snapshot(): Pick<WorkspaceStateResponse, "activeWindowId" | "windows" | "templates"> {
+  snapshot(): Pick<WorkspaceStateResponse, "activeWindowId" | "windows" | "templates" | "persistence"> {
     return {
       activeWindowId: this.activeWindowId,
       windows: this.windows,
-      templates: this.templates
+      templates: this.templates,
+      persistence: [this.persistenceStatus()]
     };
   }
 
@@ -111,7 +127,7 @@ export class WorkspaceLayoutStore {
 
   async createWindow(input: CreateWorkspaceWindowRequest = {}): Promise<WorkspaceWindow> {
     const now = new Date().toISOString();
-    const defaultCwd = await this.resolveWindowCwd(input.defaultCwd);
+    const defaultCwd = await this.resolveWindowCwd(input.defaultCwd, input.createDirectory === true);
     const window: WorkspaceWindow = {
       id: `window-${crypto.randomUUID()}`,
       name: cleanName(input.name) || defaultWindowName(this.windows.length),
@@ -325,8 +341,8 @@ export class WorkspaceLayoutStore {
     };
   }
 
-  private async resolveWindowCwd(candidate: string | undefined): Promise<string> {
-    return this.pathPolicy.ensureDirectory(candidate?.trim() || this.pathPolicy.defaultDirectoryExpression(), false);
+  private async resolveWindowCwd(candidate: string | undefined, createDirectory = false): Promise<string> {
+    return this.pathPolicy.ensureDirectory(candidate?.trim() || this.pathPolicy.defaultDirectoryExpression(), createDirectory);
   }
 
   private loadStoredWorkspace(): { activeWindowId: string; windows: WorkspaceWindow[]; templates: WorkspaceLayoutTemplate[] } {
@@ -426,13 +442,34 @@ export class WorkspaceLayoutStore {
 
   private async persist(): Promise<void> {
     const queueKey = this.workspacePath;
-    const operation = this.writeQueue().then(() => this.workspaceFile.write({ activeWindowId: this.activeWindowId, windows: this.windows, templates: this.templates }));
+    const operation = this.writeQueue().then(async () => {
+      try {
+        await this.workspaceFile.write({ activeWindowId: this.activeWindowId, windows: this.windows, templates: this.templates });
+        this.setPersistenceStatus(availablePersistenceStatus(this.persistence));
+      } catch (error) {
+        if (!isCapacityStateWriteError(error)) {
+          throw error;
+        }
+        this.setPersistenceStatus(degradedPersistenceStatus("Workspace layout", this.workspacePath, error));
+      }
+    });
     WorkspaceLayoutStore.writeQueues.set(queueKey, operation.then(() => undefined, () => undefined));
     return operation;
   }
 
   private writeQueue(): Promise<void> {
     return WorkspaceLayoutStore.writeQueues.get(this.workspacePath) ?? Promise.resolve();
+  }
+
+  private setPersistenceStatus(status: StatePersistenceStatus): void {
+    const previous = this.persistence;
+    this.persistence = status;
+    if (!persistenceStatusChanged(previous, status)) {
+      return;
+    }
+    for (const listener of this.persistenceListeners) {
+      listener(this.persistenceStatus());
+    }
   }
 }
 

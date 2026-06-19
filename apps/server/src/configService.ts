@@ -1,6 +1,7 @@
-import { CLOUDX_THEME_OPTIONS, DEFAULT_CLOUDX_THEME_ID } from "@cloudx/shared";
+import { CLOUDX_THEME_OPTIONS, DEFAULT_CLOUDX_THEME_ID, DEFAULT_VOICE_MODEL } from "@cloudx/shared";
 import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, ConfigValue, PluginDescriptor, PluginId } from "@cloudx/shared";
 
+import { VOICE_MODEL_OPTIONS } from "./aiModelOptions.js";
 import { ConfigSecretStore, type ConfigSecretPatch } from "./configSecretStore.js";
 import { JsonStateFile } from "./jsonStateFile.js";
 
@@ -25,6 +26,14 @@ export const GLOBAL_CONFIG_FIELDS: ConfigFieldDescriptor[] = [
     type: "boolean",
     description: "Enable microphone capture for AI control.",
     defaultValue: true
+  },
+  {
+    key: "voiceModel",
+    label: "Voice model",
+    type: "select",
+    description: "Codex model used for voice command planning.",
+    defaultValue: DEFAULT_VOICE_MODEL,
+    options: VOICE_MODEL_OPTIONS
   },
   {
     key: "themeId",
@@ -70,7 +79,8 @@ export class ConfigService {
 
   constructor(
     dataDir: string,
-    private readonly listPlugins: () => PluginDescriptor[] = () => []
+    private readonly listPlugins: () => PluginDescriptor[] = () => [],
+    private readonly runtimeDefaults: Partial<Record<string, ConfigValue>> = {}
   ) {
     this.configFile = new JsonStateFile(dataDir, "config.json", "CloudX config");
     this.secrets = new ConfigSecretStore(dataDir);
@@ -80,8 +90,9 @@ export class ConfigService {
 
   getResponse(): CloudxConfigResponse {
     const plugins = this.pluginSections();
+    const globalFields = fieldsWithRuntimeDefaults(GLOBAL_CONFIG_FIELDS, this.runtimeDefaults);
     return {
-      globalFields: GLOBAL_CONFIG_FIELDS,
+      globalFields,
       plugins,
       values: this.resolvedValues(plugins)
     };
@@ -111,6 +122,11 @@ export class ConfigService {
   isMicrophoneEnabled(): boolean {
     const global = this.getValues().global;
     return global.aiControlEnabled !== false && global.voiceCommandsEnabled !== false && global.microphoneEnabled !== false;
+  }
+
+  getVoiceModel(): string {
+    const value = this.getValues().global.voiceModel;
+    return typeof value === "string" && value.trim() ? value.trim() : DEFAULT_VOICE_MODEL;
   }
 
   async update(patch: Partial<CloudxConfigValues> = {}): Promise<CloudxConfigResponse> {
@@ -160,7 +176,7 @@ export class ConfigService {
   }
 
   private resolvedValues(plugins: CloudxConfigResponse["plugins"]): CloudxConfigValues {
-    const global = resolveFieldValues(GLOBAL_CONFIG_FIELDS, this.values.global);
+    const global = resolveFieldValues(fieldsWithRuntimeDefaults(GLOBAL_CONFIG_FIELDS, this.runtimeDefaults), this.values.global);
     const pluginValues: Record<string, Record<string, ConfigValue>> = {};
     for (const plugin of plugins) {
       pluginValues[plugin.pluginId] = resolveFieldValues(plugin.fields, this.values.plugins[plugin.pluginId]);
@@ -270,6 +286,18 @@ function validateFieldValue(value: unknown, field: ConfigFieldDescriptor, label:
   if (field.type === "string" && typeof value !== "string") {
     throwConfigValidationError(`${label} must be a string.`);
   }
+  if (field.type === "string" && typeof value === "string" && field.minLength !== undefined && value.trim().length < field.minLength) {
+    throwConfigValidationError(`${label} must be at least ${field.minLength} character${field.minLength === 1 ? "" : "s"}.`);
+  }
+  if (field.type === "string" && typeof value === "string" && field.maxLength !== undefined && value.trim().length > field.maxLength) {
+    throwConfigValidationError(`${label} must be no more than ${field.maxLength} characters.`);
+  }
+  if (field.type === "string" && typeof value === "string" && field.pattern !== undefined && !new RegExp(field.pattern, "u").test(value.trim())) {
+    throwConfigValidationError(`${label} has an invalid format.`);
+  }
+  if (field.type === "string" && typeof value === "string" && stringFieldHasConstraints(field)) {
+    return value.trim();
+  }
   if (field.type === "number" && (typeof value !== "number" || !Number.isFinite(value))) {
     throwConfigValidationError(`${label} must be a finite number.`);
   }
@@ -283,6 +311,10 @@ function validateFieldValue(value: unknown, field: ConfigFieldDescriptor, label:
     throwConfigValidationError(`${label} must be one of the configured options.`);
   }
   return value as ConfigValue;
+}
+
+function stringFieldHasConstraints(field: ConfigFieldDescriptor): boolean {
+  return field.minLength !== undefined || field.maxLength !== undefined || field.pattern !== undefined;
 }
 
 function validateSecretFieldValue(value: unknown, label: string): string | undefined {
@@ -319,6 +351,13 @@ function withPluginSecretState(pluginId: PluginId, fields: ConfigFieldDescriptor
   return fields.map((field) => field.type === "secret"
     ? { ...field, defaultValue: "", secretConfigured: secrets.hasPluginSecret(pluginId, field.key) }
     : field);
+}
+
+function fieldsWithRuntimeDefaults(fields: ConfigFieldDescriptor[], runtimeDefaults: Partial<Record<string, ConfigValue>>): ConfigFieldDescriptor[] {
+  return fields.map((field) => {
+    const defaultValue = runtimeDefaults[field.key];
+    return defaultValue === undefined ? field : { ...field, defaultValue };
+  });
 }
 
 function mergeConfigValues(current: CloudxConfigValues, patch: CloudxConfigValues): CloudxConfigValues {

@@ -293,6 +293,60 @@ describe("AutomationService", () => {
     await expect(repository.listRuns()).resolves.toEqual([]);
   });
 
+  it("runs saved test cases with fixtures and records assertion failures", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-service-test-case-"));
+    const repository = new AutomationRepository(dataDir);
+    const triggers = new TriggerRegistry({ recordEvent: (event) => repository.appendTriggerEvent(event) });
+    triggers.register(triggerDefinition());
+    const hooks = new HookRegistry();
+    hooks.register({
+      id: "fake.record",
+      owner: { kind: "app" },
+      title: "Record",
+      description: "Record text.",
+      exposures: ["automation"],
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      outputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute: () => ({})
+    });
+    const typeService = new AutomationTypeService();
+    const service = new AutomationService(
+      repository,
+      triggers,
+      hooks,
+      new AutomationCatalogService(typeService, () => triggers.list(), () => hooks.list()),
+      new AutomationCompiler(typeService),
+      new AutomationExecutor()
+    );
+    await service.saveGroup({
+      ...recordOnlyGroup("case"),
+      testCases: [
+        {
+          id: "case-1",
+          name: "Happy path",
+          payload: {},
+          expected: { status: "succeeded", traceIncludes: ["Record completed.", "missing trace"] }
+        }
+      ]
+    });
+
+    const result = await service.startTest("case", undefined, undefined, "case-1");
+
+    expect(result.sample).toMatchObject({
+      testCaseId: "case-1",
+      testCaseName: "Happy path",
+      payload: {},
+      status: "failed",
+      error: expect.stringContaining("Automation test case assertions failed")
+    });
+    expect(result.sample.assertions).toEqual([
+      expect.objectContaining({ id: "status", passed: true }),
+      expect.objectContaining({ id: "traceIncludes:Record completed.", passed: true }),
+      expect.objectContaining({ id: "traceIncludes:missing trace", passed: false })
+    ]);
+    await expect(repository.listRuns()).resolves.toEqual([expect.objectContaining({ groupId: "case", status: "failed" })]);
+  });
+
   it("fails unsafe automation runs unless the graph explicitly allows the hook safety class", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-service-safety-"));
     const repository = new AutomationRepository(dataDir);

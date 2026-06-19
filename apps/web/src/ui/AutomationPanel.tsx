@@ -1,5 +1,11 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type FocusEvent as ReactFocusEvent, type FormEvent as ReactFormEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type Dispatch, type FocusEvent as ReactFocusEvent, type FormEvent as ReactFormEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type SetStateAction } from "react";
 import { createPortal } from "react-dom";
+import { completeFromList, type Completion } from "@codemirror/autocomplete";
+import { python, pythonLanguage } from "@codemirror/lang-python";
+import { StreamLanguage } from "@codemirror/language";
+import { shell } from "@codemirror/legacy-modes/mode/shell";
+import { EditorState, type Extension } from "@codemirror/state";
+import { basicSetup, EditorView } from "codemirror";
 import {
   BaseEdge,
   Background,
@@ -35,9 +41,12 @@ import type {
   AutomationPortDescriptor,
   AutomationPortKind,
   AutomationRunSummary,
+  AutomationRunStatus,
   AutomationSafety,
+  AutomationTestCase,
   AutomationTestRunSample,
   AutomationType,
+  AutomationValidationDiagnostic,
   AutomationValidationSummary,
   WorkspaceTab
 } from "@cloudx/shared";
@@ -94,6 +103,8 @@ interface AutomationPanelProps {
   tab: WorkspaceTab;
   liveRuns?: AutomationRunSummary[];
   onAutomationGroupsChanged?: () => Promise<void> | void;
+  state?: AutomationPanelState;
+  onStateChange?: (updater: AutomationPanelStateUpdater) => void;
 }
 
 interface PortTooltipPlacement {
@@ -122,6 +133,31 @@ export interface PaletteCompatibility extends AutomationHandleRef {
   kind: AutomationPortKind;
   type: AutomationType;
 }
+
+export interface AutomationPanelState {
+  loaded: boolean;
+  catalog: AutomationCatalogResponse;
+  groups: AutomationGroup[];
+  selectedGroupId: string;
+  nodes: FlowNode[];
+  edges: FlowEdge[];
+  allowedSafety: AutomationSafety[] | undefined;
+  testCases: AutomationTestCase[];
+  selectedNodeId: string | undefined;
+  selectedTestCaseId: string | undefined;
+  testCasePayloadDraft: string;
+  validation: AutomationValidationSummary | undefined;
+  runs: AutomationRunSummary[];
+  lastTestSample: AutomationTestRunSample | undefined;
+  palette: PaletteState | undefined;
+  paletteSearch: string;
+  search: string;
+  createGroupOpen: boolean;
+  createGroupName: string;
+  status: string;
+}
+
+export type AutomationPanelStateUpdater = (state: AutomationPanelState | undefined) => AutomationPanelState;
 
 export interface AutomationPaletteGroup {
   id: string;
@@ -166,6 +202,7 @@ const AUTOMATION_SAFETY_EXPLANATIONS: Record<AutomationSafetyToggle, string> = {
   external: "External hooks can run shell commands, send terminal input, submit voice requests, fetch Git refs, or otherwise reach outside the automation graph.",
   destructive: "Destructive hooks can stop or remove active workspace state; current examples include stopping a running terminal process."
 };
+const AUTOMATION_TEST_STATUS_OPTIONS: AutomationRunStatus[] = ["succeeded", "failed", "cancelled"];
 
 export const automationMiniMapTheme = {
   bgColor: "var(--automation-minimap-background)",
@@ -177,37 +214,113 @@ export const automationMiniMapTheme = {
   nodeStrokeWidth: 1.5
 } as const;
 
-export function AutomationPanel({ tab, liveRuns, onAutomationGroupsChanged }: AutomationPanelProps) {
+export function createInitialAutomationPanelState(): AutomationPanelState {
+  return {
+    loaded: false,
+    catalog: { nodes: [] },
+    groups: [],
+    selectedGroupId: "",
+    nodes: [],
+    edges: [],
+    allowedSafety: undefined,
+    testCases: [],
+    selectedNodeId: undefined,
+    selectedTestCaseId: undefined,
+    testCasePayloadDraft: "",
+    validation: undefined,
+    runs: [],
+    lastTestSample: undefined,
+    palette: undefined,
+    paletteSearch: "",
+    search: "",
+    createGroupOpen: false,
+    createGroupName: "",
+    status: "Loading automation."
+  };
+}
+
+function automationPanelStateHasUnsavedChanges(state: AutomationPanelState): boolean {
+  const selectedGroup = state.groups.find((group) => group.id === state.selectedGroupId);
+  if (!selectedGroup) {
+    return false;
+  }
+  const currentGraph = automationGraphFromPanelState(state.nodes, state.edges, selectedGroup.graph, state.allowedSafety);
+  const selectedTestCase = selectedTestCaseFromList(state.testCases, state.selectedTestCaseId);
+  const testCaseDraftChanged = Boolean(selectedTestCase && state.testCasePayloadDraft !== automationTestCasePayloadText(selectedTestCase));
+  return !automationGraphsEqual(currentGraph, selectedGroup.graph) || !automationTestCasesEqual(state.testCases, selectedGroup.testCases ?? []) || testCaseDraftChanged;
+}
+
+function useAutomationPanelState(
+  state: AutomationPanelState | undefined,
+  onStateChange: ((updater: AutomationPanelStateUpdater) => void) | undefined
+): [AutomationPanelState, Dispatch<SetStateAction<AutomationPanelState>>] {
+  const [localState, setLocalState] = useState<AutomationPanelState>(() => createInitialAutomationPanelState());
+  const panelState = state ?? localState;
+  const setPanelState = useCallback<Dispatch<SetStateAction<AutomationPanelState>>>((nextState) => {
+    if (!onStateChange) {
+      setLocalState(nextState);
+      return;
+    }
+    onStateChange((previous) => {
+      const base = { ...createInitialAutomationPanelState(), ...previous };
+      return typeof nextState === "function" ? (nextState as (current: AutomationPanelState) => AutomationPanelState)(base) : nextState;
+    });
+  }, [onStateChange]);
+  return [panelState, setPanelState];
+}
+
+function useAutomationStateField<K extends keyof AutomationPanelState>(
+  key: K,
+  panelState: AutomationPanelState,
+  setPanelState: Dispatch<SetStateAction<AutomationPanelState>>
+): [AutomationPanelState[K], Dispatch<SetStateAction<AutomationPanelState[K]>>] {
+  const setValue = useCallback<Dispatch<SetStateAction<AutomationPanelState[K]>>>((nextValue) => {
+    setPanelState((previous) => {
+      const currentValue = previous[key];
+      const resolvedValue = typeof nextValue === "function" ? (nextValue as (current: AutomationPanelState[K]) => AutomationPanelState[K])(currentValue) : nextValue;
+      return { ...previous, [key]: resolvedValue };
+    });
+  }, [key, setPanelState]);
+  return [panelState[key], setValue];
+}
+
+export function AutomationPanel({ tab, liveRuns, onAutomationGroupsChanged, state, onStateChange }: AutomationPanelProps) {
   return (
     <ReactFlowProvider>
-      <AutomationPanelInner tab={tab} liveRuns={liveRuns} onAutomationGroupsChanged={onAutomationGroupsChanged} />
+      <AutomationPanelInner tab={tab} liveRuns={liveRuns} onAutomationGroupsChanged={onAutomationGroupsChanged} state={state} onStateChange={onStateChange} />
     </ReactFlowProvider>
   );
 }
 
-function AutomationPanelInner({ tab, liveRuns, onAutomationGroupsChanged }: AutomationPanelProps) {
+function AutomationPanelInner({ tab, liveRuns, onAutomationGroupsChanged, state, onStateChange }: AutomationPanelProps) {
   const { fitView, screenToFlowPosition } = useReactFlow<FlowNode, FlowEdge>();
-  const [catalog, setCatalog] = useState<AutomationCatalogResponse>({ nodes: [] });
-  const [groups, setGroups] = useState<AutomationGroup[]>([]);
-  const [selectedGroupId, setSelectedGroupId] = useState<string>("");
-  const [nodes, setNodes] = useState<FlowNode[]>([]);
-  const [edges, setEdges] = useState<FlowEdge[]>([]);
-  const [allowedSafety, setAllowedSafety] = useState<AutomationSafety[] | undefined>();
-  const [selectedNodeId, setSelectedNodeId] = useState<string | undefined>();
-  const [validation, setValidation] = useState<AutomationValidationSummary | undefined>();
-  const [runs, setRuns] = useState<AutomationRunSummary[]>([]);
-  const [lastTestSample, setLastTestSample] = useState<AutomationTestRunSample | undefined>();
-  const [palette, setPalette] = useState<PaletteState | undefined>();
-  const [paletteSearch, setPaletteSearch] = useState("");
-  const [search, setSearch] = useState("");
-  const [createGroupOpen, setCreateGroupOpen] = useState(false);
-  const [createGroupName, setCreateGroupName] = useState("");
-  const [status, setStatus] = useState("Loading automation.");
+  const [panelState, setPanelState] = useAutomationPanelState(state, onStateChange);
+  const [loaded] = useAutomationStateField("loaded", panelState, setPanelState);
+  const [catalog] = useAutomationStateField("catalog", panelState, setPanelState);
+  const [groups, setGroups] = useAutomationStateField("groups", panelState, setPanelState);
+  const [selectedGroupId, setSelectedGroupId] = useAutomationStateField("selectedGroupId", panelState, setPanelState);
+  const [nodes, setNodes] = useAutomationStateField("nodes", panelState, setPanelState);
+  const [edges, setEdges] = useAutomationStateField("edges", panelState, setPanelState);
+  const [allowedSafety, setAllowedSafety] = useAutomationStateField("allowedSafety", panelState, setPanelState);
+  const [testCases, setTestCases] = useAutomationStateField("testCases", panelState, setPanelState);
+  const [selectedNodeId, setSelectedNodeId] = useAutomationStateField("selectedNodeId", panelState, setPanelState);
+  const [selectedTestCaseId, setSelectedTestCaseId] = useAutomationStateField("selectedTestCaseId", panelState, setPanelState);
+  const [testCasePayloadDraft, setTestCasePayloadDraft] = useAutomationStateField("testCasePayloadDraft", panelState, setPanelState);
+  const [validation, setValidation] = useAutomationStateField("validation", panelState, setPanelState);
+  const [runs, setRuns] = useAutomationStateField("runs", panelState, setPanelState);
+  const [lastTestSample, setLastTestSample] = useAutomationStateField("lastTestSample", panelState, setPanelState);
+  const [palette, setPalette] = useAutomationStateField("palette", panelState, setPanelState);
+  const [paletteSearch, setPaletteSearch] = useAutomationStateField("paletteSearch", panelState, setPanelState);
+  const [search, setSearch] = useAutomationStateField("search", panelState, setPanelState);
+  const [createGroupOpen, setCreateGroupOpen] = useAutomationStateField("createGroupOpen", panelState, setPanelState);
+  const [createGroupName, setCreateGroupName] = useAutomationStateField("createGroupName", panelState, setPanelState);
+  const [status, setStatus] = useAutomationStateField("status", panelState, setPanelState);
   const [transientStatus, setTransientStatus] = useState<string | undefined>();
   const paletteRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLDivElement | null>(null);
   const fitViewFrameRef = useRef<number | undefined>(undefined);
   const nodeCountRef = useRef(0);
+  const cleanCacheRefreshAttemptedRef = useRef(false);
   const reconnectingEdgeIdRef = useRef<string | undefined>(undefined);
   const suppressNextPaneClickRef = useRef(false);
   const selectedGroup = groups.find((group) => group.id === selectedGroupId);
@@ -219,7 +332,13 @@ function AutomationPanelInner({ tab, liveRuns, onAutomationGroupsChanged }: Auto
     }
     return automationGraphFromPanelState(nodes, edges, selectedGroup.graph, allowedSafety);
   }, [allowedSafety, edges, nodes, selectedGroup]);
-  const hasUnsavedChanges = Boolean(selectedGroup && currentGraph && !automationGraphsEqual(currentGraph, selectedGroup.graph));
+  const selectedTestCase = selectedTestCaseFromList(testCases, selectedTestCaseId);
+  const testCaseDraftChanged = Boolean(selectedTestCase && testCasePayloadDraft !== automationTestCasePayloadText(selectedTestCase));
+  const hasUnsavedChanges = Boolean(
+    selectedGroup &&
+      currentGraph &&
+      (!automationGraphsEqual(currentGraph, selectedGroup.graph) || !automationTestCasesEqual(testCases, selectedGroup.testCases ?? []) || testCaseDraftChanged)
+  );
   const selectedNodeConnectedInputIds = useMemo(() => connectedDataInputIds(selectedNodeId, edges), [edges, selectedNodeId]);
   const updateEdgeRoute = useCallback((edgeId: string, route: AutomationEdgeRoute) => {
     setEdges((current) => current.map((edge) => (edge.id === edgeId ? { ...edge, data: flowEdgeData(handleKind(edge.sourceHandle), route) } : edge)));
@@ -245,6 +364,91 @@ function AutomationPanelInner({ tab, liveRuns, onAutomationGroupsChanged }: Auto
     setAllowedSafety((current) => automationAllowedSafetyWithToggle(current, safety, enabled));
     setStatus(automationSafetyToggleCopy(safety, enabled).confirmation);
   }, []);
+
+  const currentTestCasesForSave = useCallback((): AutomationTestCase[] => {
+    return selectedTestCaseId ? automationTestCasesWithPayloadDraft(testCases, selectedTestCaseId, testCasePayloadDraft) : testCases;
+  }, [selectedTestCaseId, testCasePayloadDraft, testCases]);
+
+  const selectTestCase = useCallback((testCaseId: string) => {
+    let currentTestCases: AutomationTestCase[];
+    try {
+      currentTestCases = currentTestCasesForSave();
+    } catch (error) {
+      setStatus(automationStatusFromError("Update test fixture", error));
+      return;
+    }
+    const nextTestCase = selectedTestCaseFromList(currentTestCases, testCaseId);
+    setTestCases(currentTestCases);
+    setSelectedTestCaseId(nextTestCase?.id);
+    setTestCasePayloadDraft(automationTestCasePayloadText(nextTestCase));
+    setStatus(nextTestCase ? `Selected test case ${nextTestCase.name}.` : "No test case selected.");
+  }, [currentTestCasesForSave]);
+
+  const updateSelectedTestCase = useCallback((update: (testCase: AutomationTestCase) => AutomationTestCase) => {
+    const activeId = selectedTestCase?.id;
+    if (!activeId) {
+      return;
+    }
+    setTestCases((current) => current.map((testCase) => (testCase.id === activeId ? update(testCase) : testCase)));
+  }, [selectedTestCase?.id]);
+
+  const addTestCase = useCallback(() => {
+    let currentTestCases: AutomationTestCase[];
+    try {
+      currentTestCases = currentTestCasesForSave();
+    } catch (error) {
+      setStatus(automationStatusFromError("Add test case", error));
+      return;
+    }
+    const testCase = newAutomationTestCase(createBrowserId("test-case"), currentTestCases.length + 1);
+    setTestCases([...currentTestCases, testCase]);
+    setSelectedTestCaseId(testCase.id);
+    setTestCasePayloadDraft(automationTestCasePayloadText(testCase));
+    setStatus("Test case added.");
+  }, [currentTestCasesForSave]);
+
+  const deleteSelectedTestCase = useCallback(() => {
+    if (!selectedTestCase) {
+      return;
+    }
+    const nextTestCases = testCases.filter((testCase) => testCase.id !== selectedTestCase.id);
+    const nextTestCase = nextTestCases[0];
+    setTestCases(nextTestCases);
+    setSelectedTestCaseId(nextTestCase?.id);
+    setTestCasePayloadDraft(automationTestCasePayloadText(nextTestCase));
+    setStatus("Test case removed.");
+  }, [selectedTestCase, testCases]);
+
+  const updateSelectedTestCasePayloadDraft = useCallback((value: string) => {
+    setTestCasePayloadDraft(value);
+    if (!selectedTestCase) {
+      return;
+    }
+    try {
+      const payload = parseAutomationTestCasePayload(value);
+      setTestCases((current) => current.map((testCase) => (testCase.id === selectedTestCase.id ? { ...testCase, payload } : testCase)));
+    } catch {
+      return;
+    }
+  }, [selectedTestCase]);
+
+  const focusDiagnostic = useCallback((diagnostic: AutomationValidationDiagnostic) => {
+    if (diagnostic.nodeId && nodes.some((node) => node.id === diagnostic.nodeId)) {
+      setSelectedNodeId(diagnostic.nodeId);
+      setStatus(`Focused node ${diagnostic.nodeId}.`);
+      return;
+    }
+    if (diagnostic.edgeId) {
+      const edge = currentGraph?.edges.find((candidate) => candidate.id === diagnostic.edgeId);
+      const nodeId = edge?.targetNodeId ?? edge?.sourceNodeId;
+      if (nodeId && nodes.some((node) => node.id === nodeId)) {
+        setSelectedNodeId(nodeId);
+        setStatus(`Focused edge ${diagnostic.edgeId}.`);
+        return;
+      }
+    }
+    setStatus("Diagnostic has no focusable node or edge.");
+  }, [currentGraph?.edges, nodes]);
 
   useEffect(() => {
     nodeCountRef.current = nodes.length;
@@ -301,28 +505,63 @@ function AutomationPanelInner({ tab, liveRuns, onAutomationGroupsChanged }: Auto
   }, [scheduleAutomationViewFit]);
 
   useEffect(() => {
+    const refreshCleanCachedState = loaded && !hasUnsavedChanges && !cleanCacheRefreshAttemptedRef.current;
+    if (loaded && !refreshCleanCachedState) {
+      return undefined;
+    }
+    cleanCacheRefreshAttemptedRef.current = true;
     let cancelled = false;
     void Promise.all([getAutomationCatalog(), getAutomationGroups(), getAutomationRuns()])
       .then(([catalogResponse, groupResponse, runResponse]) => {
         if (cancelled) {
           return;
         }
-        setCatalog(catalogResponse);
-        setGroups(groupResponse);
-        setRuns(runResponse.runs);
-        const group = groupResponse[0];
-        if (group) {
-          setSelectedGroupId(group.id);
+        setPanelState((current) => {
+          if (refreshCleanCachedState && automationPanelStateHasUnsavedChanges(current)) {
+            return current;
+          }
+          const group = groupResponse.find((candidate) => candidate.id === current.selectedGroupId) ?? groupResponse[0];
+          if (!group) {
+            return {
+              ...current,
+              loaded: true,
+              catalog: catalogResponse,
+              groups: groupResponse,
+              runs: runResponse.runs,
+              selectedGroupId: "",
+              nodes: [],
+              edges: [],
+              allowedSafety: undefined,
+              testCases: [],
+              selectedNodeId: undefined,
+              selectedTestCaseId: undefined,
+              testCasePayloadDraft: "",
+              validation: undefined,
+              lastTestSample: undefined,
+              status: "No automation groups saved."
+            };
+          }
           const flow = flowFromGraph(group, catalogResponse);
-          setNodes(flow.nodes);
-          setEdges(flow.edges);
-          setAllowedSafety(group.graph.allowedSafety);
-          setValidation(group.lastValidation);
-          setStatus("Automation loaded.");
-        } else {
-          setAllowedSafety(undefined);
-          setStatus("No automation groups saved.");
-        }
+          const firstTestCase = (group.testCases ?? [])[0];
+          return {
+            ...current,
+            loaded: true,
+            catalog: catalogResponse,
+            groups: groupResponse,
+            runs: runResponse.runs,
+            selectedGroupId: group.id,
+            nodes: flow.nodes,
+            edges: flow.edges,
+            allowedSafety: group.graph.allowedSafety,
+            testCases: group.testCases ?? [],
+            selectedNodeId: undefined,
+            selectedTestCaseId: firstTestCase?.id,
+            testCasePayloadDraft: automationTestCasePayloadText(firstTestCase),
+            validation: group.lastValidation,
+            lastTestSample: undefined,
+            status: "Automation loaded."
+          };
+        });
       })
       .catch((error) => {
         if (!cancelled) {
@@ -332,7 +571,7 @@ function AutomationPanelInner({ tab, liveRuns, onAutomationGroupsChanged }: Auto
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [hasUnsavedChanges, loaded]);
 
   useEffect(() => {
     if (liveRuns) {
@@ -392,10 +631,14 @@ function AutomationPanelInner({ tab, liveRuns, onAutomationGroupsChanged }: Auto
     }
     setSelectedGroupId(group.id);
     const flow = flowFromGraph(group, catalog);
+    const firstTestCase = (group.testCases ?? [])[0];
     setNodes(flow.nodes);
     setEdges(flow.edges);
     setAllowedSafety(group.graph.allowedSafety);
+    setTestCases(group.testCases ?? []);
     setSelectedNodeId(undefined);
+    setSelectedTestCaseId(firstTestCase?.id);
+    setTestCasePayloadDraft(automationTestCasePayloadText(firstTestCase));
     setValidation(group.lastValidation);
     setLastTestSample(undefined);
     setStatus(`Selected ${group.name}.`);
@@ -435,7 +678,10 @@ function AutomationPanelInner({ tab, liveRuns, onAutomationGroupsChanged }: Auto
       setNodes(flow.nodes);
       setEdges(flow.edges);
       setAllowedSafety(saved.graph.allowedSafety);
+      setTestCases(saved.testCases ?? []);
       setSelectedNodeId(undefined);
+      setSelectedTestCaseId(undefined);
+      setTestCasePayloadDraft("");
       setValidation(saved.lastValidation);
       setLastTestSample(undefined);
       setPalette(undefined);
@@ -467,7 +713,11 @@ function AutomationPanelInner({ tab, liveRuns, onAutomationGroupsChanged }: Auto
         setNodes(flow.nodes);
         setEdges(flow.edges);
         setAllowedSafety(nextSelectedGroup.graph.allowedSafety);
+        setTestCases(nextSelectedGroup.testCases ?? []);
         setSelectedNodeId(undefined);
+        const firstTestCase = (nextSelectedGroup.testCases ?? [])[0];
+        setSelectedTestCaseId(firstTestCase?.id);
+        setTestCasePayloadDraft(automationTestCasePayloadText(firstTestCase));
         setValidation(nextSelectedGroup.lastValidation);
         await reportAutomationGroupsChanged(`Deleted ${selectedGroup.name}. Selected ${nextSelectedGroup.name}.`);
         return;
@@ -476,7 +726,10 @@ function AutomationPanelInner({ tab, liveRuns, onAutomationGroupsChanged }: Auto
       setNodes([]);
       setEdges([]);
       setAllowedSafety(undefined);
+      setTestCases([]);
       setSelectedNodeId(undefined);
+      setSelectedTestCaseId(undefined);
+      setTestCasePayloadDraft("");
       setValidation(undefined);
       await reportAutomationGroupsChanged(`Deleted ${selectedGroup.name}.`);
     } catch (error) {
@@ -546,16 +799,21 @@ function AutomationPanelInner({ tab, liveRuns, onAutomationGroupsChanged }: Auto
       return;
     }
     try {
-      const group = await saveAutomationGroup({ ...selectedGroup, graph: currentGraph });
+      const savedTestCases = currentTestCasesForSave();
+      const group = await saveAutomationGroup({ ...selectedGroup, graph: currentGraph, testCases: savedTestCases });
       setGroups((current) => current.map((candidate) => (candidate.id === group.id ? group : candidate)));
       setAllowedSafety(group.graph.allowedSafety);
+      setTestCases(group.testCases ?? []);
+      const activeTestCase = selectedTestCaseFromList(group.testCases ?? [], selectedTestCaseId);
+      setSelectedTestCaseId(activeTestCase?.id);
+      setTestCasePayloadDraft(automationTestCasePayloadText(activeTestCase));
       setValidation(group.lastValidation);
       setLastTestSample(undefined);
       await reportAutomationGroupsChanged("Automation saved.");
     } catch (error) {
       setStatus(automationStatusFromError("Save automation", error));
     }
-  }, [currentGraph, reportAutomationGroupsChanged, selectedGroup]);
+  }, [currentGraph, currentTestCasesForSave, reportAutomationGroupsChanged, selectedGroup, selectedTestCaseId]);
 
   const validateCurrentGroup = useCallback(async () => {
     if (!selectedGroup || !currentGraph) {
@@ -575,14 +833,23 @@ function AutomationPanelInner({ tab, liveRuns, onAutomationGroupsChanged }: Auto
       return;
     }
     try {
-      const result = await startAutomationTestRun(selectedGroup.id, currentGraph);
+      const runTestCases = currentTestCasesForSave();
+      const testCase = selectedTestCaseFromList(runTestCases, selectedTestCaseId);
+      const result = await startAutomationTestRun(selectedGroup.id, currentGraph, testCase?.payload, testCase?.id, testCase);
       setRuns(result.runs);
       setLastTestSample(result.sample);
-      setStatus(result.sample.status === "succeeded" ? (hasUnsavedChanges ? "Unsaved sample test run succeeded." : "Sample test run succeeded.") : "Sample test run finished.");
+      const assertionFailed = result.sample.assertions?.some((assertion) => !assertion.passed);
+      setStatus(
+        assertionFailed
+          ? "Automation test assertions failed."
+          : result.sample.status === "succeeded"
+            ? (hasUnsavedChanges ? "Unsaved test run succeeded." : "Test run succeeded.")
+            : "Test run finished."
+      );
     } catch (error) {
       setStatus(automationStatusFromError("Run automation test", error));
     }
-  }, [currentGraph, hasUnsavedChanges, selectedGroup]);
+  }, [currentGraph, currentTestCasesForSave, hasUnsavedChanges, selectedGroup, selectedTestCaseId]);
 
   const cancelRun = useCallback(async (runId: string) => {
     try {
@@ -745,10 +1012,15 @@ function AutomationPanelInner({ tab, liveRuns, onAutomationGroupsChanged }: Auto
                 <strong>Validation</strong>
                 {hasUnsavedChanges ? <small className="automation-unsaved-note">Current canvas has unsaved changes.</small> : null}
                 {(validation?.diagnostics ?? []).length === 0 ? <p>No diagnostics.</p> : null}
-                {(validation?.diagnostics ?? []).slice(0, 6).map((diagnostic) => (
-                  <p key={`${diagnostic.code}:${diagnostic.nodeId ?? diagnostic.edgeId ?? diagnostic.message}`} className={`automation-diagnostic ${diagnostic.severity}`}>
-                    {diagnostic.message}
-                  </p>
+                {(validation?.diagnostics ?? []).map((diagnostic) => (
+                  <div key={`${diagnostic.code}:${diagnostic.nodeId ?? diagnostic.edgeId ?? diagnostic.message}`} className={`automation-diagnostic ${diagnostic.severity}`}>
+                    <p>{diagnostic.message}</p>
+                    {diagnostic.nodeId || diagnostic.edgeId ? (
+                      <ControlButton size="compact" onClick={() => focusDiagnostic(diagnostic)}>
+                        Focus
+                      </ControlButton>
+                    ) : null}
+                  </div>
                 ))}
               </div>
             </aside>
@@ -763,6 +1035,72 @@ function AutomationPanelInner({ tab, liveRuns, onAutomationGroupsChanged }: Auto
               <div className="automation-run-header">
                 <span>Runs</span>
                 <small>{runs.length} recent</small>
+              </div>
+              <div className="automation-test-cases">
+                <div className="automation-test-case-header">
+                  <span>Test Cases</span>
+                  <div>
+                    <ControlButton size="compact" onClick={addTestCase} disabled={!selectedGroup}>
+                      Add
+                    </ControlButton>
+                    <ControlButton size="compact" tone="danger" onClick={deleteSelectedTestCase} disabled={!selectedTestCase}>
+                      Delete
+                    </ControlButton>
+                  </div>
+                </div>
+                <label>
+                  <span>Case</span>
+                  <select aria-label="Automation test case" value={selectedTestCase?.id ?? ""} disabled={testCases.length === 0} onChange={(event) => selectTestCase(event.target.value)}>
+                    {testCases.length === 0 ? <option value="">Generated sample</option> : null}
+                    {testCases.map((testCase) => (
+                      <option key={testCase.id} value={testCase.id}>{testCase.name}</option>
+                    ))}
+                  </select>
+                </label>
+                {selectedTestCase ? (
+                  <>
+                    <label>
+                      <span>Name</span>
+                      <input aria-label="Test case name" value={selectedTestCase.name} onChange={(event) => updateSelectedTestCase((testCase) => ({ ...testCase, name: event.target.value }))} />
+                    </label>
+                    <label>
+                      <span>Trigger Payload</span>
+                      <textarea aria-label="Trigger fixture payload" rows={5} value={testCasePayloadDraft} onChange={(event) => updateSelectedTestCasePayloadDraft(event.target.value)} spellCheck={false} />
+                    </label>
+                    <label>
+                      <span>Expected Status</span>
+                      <select
+                        aria-label="Expected run status"
+                        value={selectedTestCase.expected?.status ?? ""}
+                        onChange={(event) => updateSelectedTestCase((testCase) => automationTestCaseWithExpected(testCase, { status: (event.target.value || undefined) as AutomationRunStatus | undefined }))}
+                      >
+                        <option value="">Any</option>
+                        {AUTOMATION_TEST_STATUS_OPTIONS.map((status) => (
+                          <option key={status} value={status}>{status}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      <span>Expected Error Text</span>
+                      <input
+                        aria-label="Expected error text"
+                        value={selectedTestCase.expected?.errorIncludes ?? ""}
+                        onChange={(event) => updateSelectedTestCase((testCase) => automationTestCaseWithExpected(testCase, { errorIncludes: event.target.value }))}
+                      />
+                    </label>
+                    <label>
+                      <span>Expected Trace Text</span>
+                      <textarea
+                        aria-label="Expected trace text"
+                        rows={3}
+                        value={(selectedTestCase.expected?.traceIncludes ?? []).join("\n")}
+                        onChange={(event) => updateSelectedTestCase((testCase) => automationTestCaseWithExpected(testCase, { traceIncludes: event.target.value.split("\n") }))}
+                      />
+                    </label>
+                  </>
+                ) : (
+                  <p>Add a test case to persist a trigger fixture and expected run assertions.</p>
+                )}
               </div>
               {runs.slice(0, 5).map((run) => (
                 <div key={run.id} className={`automation-run ${run.status}`}>
@@ -779,10 +1117,19 @@ function AutomationPanelInner({ tab, liveRuns, onAutomationGroupsChanged }: Auto
               {lastTestSample ? (
                 <div className={`automation-test-sample ${lastTestSample.status}`}>
                   <div className="automation-test-sample-title">
-                    <span>Sample Run</span>
+                    <span>{lastTestSample.testCaseName ?? "Sample Run"}</span>
                     <small>{hasUnsavedChanges ? `${lastTestSample.triggerId} unsaved` : lastTestSample.triggerId}</small>
                   </div>
                   <pre>{JSON.stringify(lastTestSample.payload, null, 2)}</pre>
+                  {lastTestSample.assertions?.length ? (
+                    <div className="automation-test-assertions">
+                      {lastTestSample.assertions.map((assertion) => (
+                        <p key={assertion.id} className={assertion.passed ? "passed" : "failed"}>
+                          {assertion.label}{assertion.message ? `: ${assertion.message}` : ""}
+                        </p>
+                      ))}
+                    </div>
+                  ) : null}
                   <div className="automation-test-trace">
                     {lastTestSample.trace.slice(0, 6).map((entry) => (
                       <p key={entry.id} className={entry.level}>
@@ -1251,7 +1598,15 @@ function NodeInspector({ node, connectedInputIds, onChange }: { node: FlowNode; 
       {rows.map((row) => (
         <label key={row.key} className={connectedInputIds.has(row.key) ? "connected" : undefined}>
           <span title={row.port ? portTooltipText(row.port) : undefined}>{row.port?.label ?? row.key}</span>
-          {row.port?.options?.values.length ? (
+          {row.port?.codeEditor ? (
+            <CodeConfigEditor
+              disabled={connectedInputIds.has(row.key)}
+              label={row.port.label}
+              port={row.port}
+              value={String(row.value ?? "")}
+              onChange={(value) => onChange({ ...config, [row.key]: value })}
+            />
+          ) : row.port?.options?.values.length ? (
             <select disabled={connectedInputIds.has(row.key)} value={String(row.value ?? "")} onChange={(event) => onChange({ ...config, [row.key]: coerceConfigValue(row.value, event.target.value, row.port) })}>
               {!row.port.required ? <option value="">Unset</option> : null}
               {row.port.options.values.map((option) => (
@@ -1273,6 +1628,86 @@ function NodeInspector({ node, connectedInputIds, onChange }: { node: FlowNode; 
       ))}
     </div>
   );
+}
+
+function CodeConfigEditor({ disabled, label, port, value, onChange }: { disabled: boolean; label: string; port: AutomationPortDescriptor; value: string; onChange: (value: string) => void }) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const viewRef = useRef<EditorView | undefined>(undefined);
+  const onChangeRef = useRef(onChange);
+  const extensions = useMemo(() => codeEditorExtensions(port, label, disabled, onChangeRef), [disabled, label, port]);
+
+  useEffect(() => {
+    onChangeRef.current = onChange;
+  }, [onChange]);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) {
+      return undefined;
+    }
+    const view = new EditorView({
+      doc: value,
+      extensions,
+      parent: container
+    });
+    viewRef.current = view;
+    return () => {
+      viewRef.current = undefined;
+      view.destroy();
+    };
+  }, [extensions]);
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view || value === view.state.doc.toString()) {
+      return;
+    }
+    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: value } });
+  }, [value]);
+
+  return <div ref={containerRef} className="automation-code-editor" style={{ minHeight: port.codeEditor?.minHeight ?? 180 }} />;
+}
+
+function codeEditorExtensions(port: AutomationPortDescriptor, label: string, disabled: boolean, onChangeRef: { current: (value: string) => void }): Extension[] {
+  const codeEditor = port.codeEditor;
+  const completions = codeEditor?.completions?.map<Completion>((completion) => ({
+    label: completion.label,
+    type: completion.type,
+    detail: completion.detail,
+    info: completion.info,
+    apply: completion.apply
+  })) ?? [];
+  return [
+    basicSetup,
+    EditorView.lineWrapping,
+    EditorView.editable.of(!disabled),
+    EditorState.readOnly.of(disabled),
+    EditorView.contentAttributes.of({ "aria-label": label }),
+    EditorView.updateListener.of((update) => {
+      if (update.docChanged) {
+        onChangeRef.current(update.state.doc.toString());
+      }
+    }),
+    ...automationCodeLanguageExtensions(codeEditor?.language, completions)
+  ];
+}
+
+export function automationCodeLanguageExtensions(language: string | undefined, completions: Completion[]): Extension[] {
+  const completionSource = completions.length ? completeFromList(completions) : undefined;
+  if (language === "python") {
+    return [
+      python(),
+      ...(completionSource ? [pythonLanguage.data.of({ autocomplete: completionSource })] : [])
+    ];
+  }
+  if (language === "bash") {
+    const bashLanguage = StreamLanguage.define(shell);
+    return [
+      bashLanguage,
+      ...(completionSource ? [bashLanguage.data.of({ autocomplete: completionSource })] : [])
+    ];
+  }
+  return [];
 }
 
 function FStringInspectorControls({ config, onChange }: { config: Record<string, unknown>; onChange: (config: Record<string, unknown>) => void }) {
@@ -1341,6 +1776,58 @@ export function newAutomationGroup(name: string, id: string, now: string): Autom
       variables: []
     }
   };
+}
+
+export function newAutomationTestCase(id: string, index: number): AutomationTestCase {
+  return {
+    id,
+    name: `Test case ${index}`,
+    payload: {},
+    expected: { status: "succeeded" }
+  };
+}
+
+export function selectedTestCaseFromList(testCases: AutomationTestCase[], selectedTestCaseId: string | undefined): AutomationTestCase | undefined {
+  return testCases.find((testCase) => testCase.id === selectedTestCaseId) ?? testCases[0];
+}
+
+export function automationTestCasePayloadText(testCase: AutomationTestCase | undefined): string {
+  return testCase ? JSON.stringify(testCase.payload, null, 2) : "";
+}
+
+export function parseAutomationTestCasePayload(value: string): Record<string, unknown> {
+  const parsed = JSON.parse(value || "{}") as unknown;
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("Trigger fixture payload must be a JSON object.");
+  }
+  return parsed as Record<string, unknown>;
+}
+
+export function automationTestCasesWithPayloadDraft(testCases: AutomationTestCase[], selectedTestCaseId: string, payloadDraft: string): AutomationTestCase[] {
+  const selected = selectedTestCaseFromList(testCases, selectedTestCaseId);
+  if (!selected) {
+    return testCases;
+  }
+  const payload = parseAutomationTestCasePayload(payloadDraft);
+  return testCases.map((testCase) => (testCase.id === selected.id ? { ...testCase, payload } : testCase));
+}
+
+export function automationTestCaseWithExpected(testCase: AutomationTestCase, patch: NonNullable<AutomationTestCase["expected"]>): AutomationTestCase {
+  const expected = {
+    ...testCase.expected,
+    ...patch,
+    errorIncludes: patch.errorIncludes === undefined ? testCase.expected?.errorIncludes : patch.errorIncludes.trim(),
+    traceIncludes: patch.traceIncludes === undefined ? testCase.expected?.traceIncludes : patch.traceIncludes.map((entry) => entry.trim()).filter(Boolean)
+  };
+  const compactExpected = Object.fromEntries(Object.entries(expected).filter(([, value]) => value !== undefined && !(Array.isArray(value) && value.length === 0) && value !== ""));
+  return {
+    ...testCase,
+    expected: Object.keys(compactExpected).length > 0 ? compactExpected as AutomationTestCase["expected"] : undefined
+  };
+}
+
+export function automationTestCasesEqual(left: AutomationTestCase[], right: AutomationTestCase[]): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function clampRouteOffset(value: number): number {

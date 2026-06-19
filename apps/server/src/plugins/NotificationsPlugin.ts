@@ -52,20 +52,30 @@ export class NotificationsPlugin implements WorkspacePlugin {
         additionalProperties: false
       },
       execute: (input) => {
-        const notification = {
-          id: randomUUID(),
-          title: requireString(input.title, "title"),
-          body: optionalString(input.body, "body"),
-          level: notificationLevel(input.level),
-          at: new Date().toISOString()
-        } satisfies CloudxNotification;
-        this.sent.unshift(notification);
-        this.sent.splice(50);
-        this.emit(notification);
-        return { notification };
+        return {
+          notification: this.send({
+            title: requireString(input.title, "title"),
+            body: optionalString(input.body, "body"),
+            level: notificationLevel(input.level)
+          })
+        };
       }
     }
   ];
+
+  send(input: { title: string; body?: string; level?: CloudxNotificationLevel }): CloudxNotification {
+    const notification = {
+      id: randomUUID(),
+      title: input.title,
+      body: input.body,
+      level: input.level ?? "info",
+      at: new Date().toISOString()
+    } satisfies CloudxNotification;
+    this.sent.unshift(notification);
+    this.sent.splice(50);
+    this.emit(notification);
+    return notification;
+  }
 
   list(): CloudxNotification[] {
     return [...this.sent];

@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { TabIndicatorUpdate, WorkspaceTab } from "@cloudx/shared";
 
-import { CodexTerminalPlugin, CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES, TerminalShellIntegrationParser, buildCodexLaunchArgs, codexResumeInput, materializeCodexTemplate } from "./CodexTerminalPlugin.js";
+import { CODEX_TERMINAL_ACTIONS, CodexTerminalPlugin, CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES, TERMINAL_ACTIONS, TerminalShellIntegrationParser, buildCodexLaunchArgs, codexResumeInput, materializeCodexTemplate } from "./CodexTerminalPlugin.js";
 import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
 
 class FakeTerminalProcess implements TerminalProcess {
@@ -329,6 +329,14 @@ describe("CodexTerminalPlugin", () => {
     expect(() => codexResumeInput({ resume: { mode: "last", includeNonInteractive: "true" } })).toThrow("Codex resume includeNonInteractive must be a boolean.");
   });
 
+  it("exposes Codex readiness waiting only on Codex terminal actions", () => {
+    expect(CODEX_TERMINAL_ACTIONS.find((action) => action.name === "wait_until_ready")).toMatchObject({
+      automationExposed: true,
+      automationSafety: "read"
+    });
+    expect(TERMINAL_ACTIONS.find((action) => action.name === "wait_until_ready")).toBeUndefined();
+  });
+
   it("injects updated rules and skills into a running Codex terminal without stopping it", async () => {
     vi.stubEnv("SHELL", "/bin/bash");
     vi.stubEnv("CLOUDX_ASSISTANT_BIN", "/usr/bin/codex");
@@ -396,6 +404,78 @@ describe("CodexTerminalSession", () => {
       expect(process.written).toBe("run tests");
       await vi.advanceTimersByTimeAsync(25);
       expect(process.written).toBe("run tests\r");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("waits for initial Codex terminal output to become quiet", async () => {
+    vi.useFakeTimers();
+    try {
+      const process = new FakeTerminalProcess();
+      const session = new CodexTerminalSession(tab, process, undefined, { closeOnExit: false, readyQuietMs: 20 });
+      const ready = session.handleAction("wait_until_ready", { timeoutMs: 1000, quietMs: 20 }) as Promise<Record<string, unknown>>;
+
+      process.emitData("Codex ready screen");
+      await vi.advanceTimersByTimeAsync(19);
+      await expect(Promise.race([ready.then(() => "ready"), Promise.resolve("pending")])).resolves.toBe("pending");
+
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(ready).resolves.toMatchObject({ ready: true, state: "ready", reason: "Terminal output became quiet." });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("marks submitted Codex input busy until later output quiets", async () => {
+    vi.useFakeTimers();
+    try {
+      const process = new FakeTerminalProcess();
+      const session = new CodexTerminalSession(tab, process, undefined, { closeOnExit: false, readyQuietMs: 30 });
+
+      process.emitData("loaded");
+      await vi.advanceTimersByTimeAsync(30);
+      session.handleAction("enter_text", { text: "run tests", submit: true });
+      expect(session.snapshot().state?.readiness).toMatchObject({ state: "busy" });
+
+      const ready = session.handleAction("wait_until_ready", { timeoutMs: 1000, quietMs: 30 }) as Promise<Record<string, unknown>>;
+      process.emitData("working");
+      await vi.advanceTimersByTimeAsync(30);
+
+      await expect(ready).resolves.toMatchObject({ ready: true, state: "ready" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("times out when Codex readiness never arrives", async () => {
+    vi.useFakeTimers();
+    try {
+      const process = new FakeTerminalProcess();
+      const session = new CodexTerminalSession(tab, process, undefined, { closeOnExit: false, readyQuietMs: 10 });
+      const ready = session.handleAction("wait_until_ready", { timeoutMs: 50, quietMs: 10 }) as Promise<Record<string, unknown>>;
+      const expectation = expect(ready).rejects.toThrow("Timed out waiting for Codex readiness after 50 ms");
+
+      await vi.advanceTimersByTimeAsync(50);
+
+      await expectation;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels pending Codex readiness waits through the action context signal", async () => {
+    vi.useFakeTimers();
+    try {
+      const process = new FakeTerminalProcess();
+      const session = new CodexTerminalSession(tab, process, undefined, { closeOnExit: false, readyQuietMs: 10 });
+      const controller = new AbortController();
+      const ready = session.handleAction("wait_until_ready", { timeoutMs: 1000, quietMs: 10 }, { signal: controller.signal }) as Promise<Record<string, unknown>>;
+      const expectation = expect(ready).rejects.toThrow("Wait for Codex readiness was cancelled.");
+
+      controller.abort();
+
+      await expectation;
     } finally {
       vi.useRealTimers();
     }

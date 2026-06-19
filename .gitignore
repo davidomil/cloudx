@@ -30,6 +30,7 @@ apps/web/dist-ts/
 
 .codex/
 .cloudx/
+.cloudx-test-*/
 .understand-anything/
 auth.json
 docs/JIRA_INTEGRATION_IMPLEMENTATION.md

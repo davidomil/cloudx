@@ -55,4 +55,56 @@ describe("AutomationPlugin", () => {
     expect(service.validate).not.toHaveBeenCalled();
     expect(service.startTest).not.toHaveBeenCalled();
   });
+
+  it("forwards test case inputs when executing the start test hook", async () => {
+    const testCase = {
+      id: "case-1",
+      name: "Happy path",
+      payload: { issueKey: "CX-1" },
+      expected: {
+        status: "succeeded" as const,
+        errorIncludes: "not used",
+        traceIncludes: ["done"]
+      }
+    };
+    const service = {
+      startTest: vi.fn(async () => ({
+        runs: [],
+        sample: {
+          triggerId: "trigger:test.started",
+          payload: testCase.payload,
+          runId: "run-1",
+          status: "succeeded",
+          trace: [],
+          testCaseId: testCase.id
+        }
+      }))
+    } as unknown as AutomationService;
+    const plugin = new AutomationPlugin(() => service);
+    const hook = plugin.hooks.find((candidate) => candidate.id === "automation.runs.startTest");
+
+    await expect(hook!.execute({
+      groupId: " group ",
+      payload: { override: true },
+      testCaseId: " case-1 ",
+      testCase
+    }, { caller: { kind: "plugin", pluginId: plugin.id } })).resolves.toMatchObject({
+      sample: { testCaseId: "case-1" }
+    });
+    expect(service.startTest).toHaveBeenCalledWith("group", { override: true }, undefined, "case-1", testCase);
+  });
+
+  it("rejects malformed test case inputs before service calls", async () => {
+    const service = {
+      startTest: vi.fn()
+    } as unknown as AutomationService;
+    const plugin = new AutomationPlugin(() => service);
+    const hook = plugin.hooks.find((candidate) => candidate.id === "automation.runs.startTest");
+
+    await expect(hook!.execute({
+      groupId: "group",
+      testCase: { id: "case-1", name: "Broken", payload: [] }
+    }, { caller: { kind: "plugin", pluginId: plugin.id } })).rejects.toThrow("testCase.payload must be an object.");
+    expect(service.startTest).not.toHaveBeenCalled();
+  });
 });

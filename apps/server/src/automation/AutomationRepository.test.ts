@@ -105,6 +105,32 @@ describe("AutomationRepository", () => {
     expect(entries.filter((entry) => entry.endsWith(".tmp"))).toEqual([]);
   });
 
+  it("keeps automation state in memory when store persistence runs out of space", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-repo-enospc-"));
+    const repository = new AutomationRepository(dataDir);
+    const [group] = await repository.listGroups();
+    const storeFile = (repository as unknown as { storeFile: { write(value: unknown): Promise<void> } }).storeFile;
+    const originalWrite = storeFile.write.bind(storeFile);
+    const statuses: string[] = [];
+    storeFile.write = vi.fn()
+      .mockRejectedValueOnce(Object.assign(new Error("no space left on device"), { code: "ENOSPC" }))
+      .mockImplementation(originalWrite);
+    const dispose = repository.onPersistenceStatusChange((status) => statuses.push(status.state));
+
+    await expect(repository.saveRun(runSummary(group!.id, "run-degraded"))).resolves.toMatchObject({ id: "run-degraded" });
+    await expect(repository.listRuns()).resolves.toEqual([expect.objectContaining({ id: "run-degraded" })]);
+    expect(repository.persistenceStatus()).toMatchObject({ name: "Automation store", state: "degraded", code: "ENOSPC" });
+    await expect(fs.access(path.join(dataDir, "automation.json"))).rejects.toMatchObject({ code: "ENOENT" });
+
+    await repository.saveRun(runSummary(group!.id, "run-recovered"));
+    dispose();
+    storeFile.write = originalWrite;
+
+    expect(statuses).toEqual(["degraded", "available"]);
+    expect(repository.persistenceStatus()).toMatchObject({ name: "Automation store", state: "available" });
+    expect((await new AutomationRepository(dataDir).listRuns()).map((run) => run.id)).toEqual(["run-recovered", "run-degraded"]);
+  });
+
   it("stores domain objects that contain result and changed fields", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-repo-sentinel-"));
     const repository = new AutomationRepository(dataDir);

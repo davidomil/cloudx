@@ -1,17 +1,18 @@
 import { randomUUID } from "node:crypto";
 
-import { workspaceAutomationEffectsFromResult, type AutomationCatalogResponse, type AutomationGroup, type AutomationRunsResponse, type AutomationRunSummary, type AutomationTestRunResponse, type AutomationValidationSummary, type TriggerEvent, type WorkspaceLayoutInstruction, type WorkspaceUiInstruction } from "@cloudx/shared";
+import { workspaceAutomationEffectsFromResult, type AutomationCatalogResponse, type AutomationGroup, type AutomationRunsResponse, type AutomationRunSummary, type AutomationTestAssertionResult, type AutomationTestCase, type AutomationTestRunResponse, type AutomationValidationSummary, type StatePersistenceStatus, type TriggerEvent, type WorkspaceLayoutInstruction, type WorkspaceUiInstruction } from "@cloudx/shared";
 
 import type { HookRegistry } from "../hooks/HookRegistry.js";
 import { validateObjectSchema } from "../hooks/schema.js";
 import type { TriggerRegistry } from "../triggers/TriggerRegistry.js";
 import { AutomationCatalogService } from "./AutomationCatalogService.js";
 import { AutomationCompiler } from "./AutomationCompiler.js";
-import { AutomationExecutor, type AutomationEffectSink } from "./AutomationExecutor.js";
+import { AutomationExecutor, type AutomationEffectSink, type AutomationExecutorOptions } from "./AutomationExecutor.js";
 import { AutomationRepository, type AutomationGroupSave } from "./AutomationRepository.js";
 
 interface AutomationServiceOptions {
   startDisabled?: boolean;
+  executorOptions?: Pick<AutomationExecutorOptions, "allowedRoots">;
   layoutEffects?: {
     applyLayoutInstruction(instruction: WorkspaceLayoutInstruction): Promise<void> | void;
   };
@@ -92,6 +93,14 @@ export class AutomationService {
     return () => this.uiInstructionListeners.delete(listener);
   }
 
+  onPersistenceStatusChange(listener: (status: StatePersistenceStatus) => void): () => void {
+    return this.repository.onPersistenceStatusChange(listener);
+  }
+
+  persistenceStatus(): StatePersistenceStatus {
+    return this.repository.persistenceStatus();
+  }
+
   async catalog(): Promise<AutomationCatalogResponse> {
     await this.ensureStartupPolicy();
     return this.catalogService.catalog();
@@ -128,7 +137,7 @@ export class AutomationService {
     return this.compiler.validate(graph, await this.catalog());
   }
 
-  async startTest(groupId: string, payload?: Record<string, unknown>, graph?: AutomationGroup["graph"]): Promise<AutomationTestRunResponse> {
+  async startTest(groupId: string, payload?: Record<string, unknown>, graph?: AutomationGroup["graph"], testCaseId?: string, testCaseInput?: AutomationTestCase): Promise<AutomationTestRunResponse> {
     await this.ensureStartupPolicy();
     const groups = await this.repository.listGroups();
     const storedGroup = groups.find((candidate) => candidate.id === groupId);
@@ -138,7 +147,8 @@ export class AutomationService {
     const group = graph ? { ...storedGroup, graph } : storedGroup;
     const catalog = await this.catalog();
     const triggerId = this.firstTriggerId(group, catalog);
-    const samplePayload = payload ?? this.samplePayloadForTrigger(triggerId);
+    const testCase = testCaseInput ?? (testCaseId ? this.requireTestCase(storedGroup, testCaseId) : undefined);
+    const samplePayload = payload ?? testCase?.payload ?? this.samplePayloadForTrigger(triggerId);
     validateObjectSchema(this.triggers.get(triggerId).payloadSchema, samplePayload, triggerId, "payload");
     const event: TriggerEvent = {
       id: randomUUID(),
@@ -149,16 +159,24 @@ export class AutomationService {
     };
     await this.repository.appendTriggerEvent(event);
     const run = await this.runGroup(group, event, catalog);
+    const assertions = testCase ? automationTestAssertions(testCase, run) : undefined;
+    const assertedRun = runWithAssertionFailure(run, assertions);
+    if (assertedRun !== run) {
+      await this.saveRunAndEmit(assertedRun);
+    }
     const runs = await this.repository.listRuns();
     return {
       runs,
       sample: {
         triggerId,
         payload: samplePayload,
-        runId: run.id,
-        status: run.status,
-        trace: run.trace,
-        error: run.error
+        runId: assertedRun.id,
+        status: assertedRun.status,
+        trace: assertedRun.trace,
+        error: assertedRun.error,
+        testCaseId: testCase?.id,
+        testCaseName: testCase?.name,
+        assertions
       }
     };
   }
@@ -237,6 +255,7 @@ export class AutomationService {
     let activeRunId: string | undefined;
     try {
       const run = await this.executor.execute(group, event, catalog, this.hooks, {
+        ...this.options.executorOptions,
         signal: controller.signal,
         effectSink: this.effectSink,
         onRunStarted: async (startedRun) => {
@@ -275,6 +294,14 @@ export class AutomationService {
       throw new Error(`Automation group ${group.id} has no trigger node.`);
     }
     return entry.triggerId;
+  }
+
+  private requireTestCase(group: AutomationGroup, testCaseId: string): AutomationTestCase {
+    const testCase = (group.testCases ?? []).find((candidate) => candidate.id === testCaseId);
+    if (!testCase) {
+      throw new Error(`Unknown automation test case: ${testCaseId}`);
+    }
+    return testCase;
   }
 
   private samplePayloadForTrigger(triggerId: string): Record<string, unknown> {
@@ -358,6 +385,58 @@ function sampleValue(schema: Record<string, unknown>, key: string): unknown {
     return Object.fromEntries(Object.entries(recordOfRecords(schema.properties)).map(([childKey, childSchema]) => [childKey, sampleValue(childSchema, childKey)]));
   }
   return `sample-${key.replace(/([a-z0-9])([A-Z])/g, "$1-$2").replace(/[_\s]+/g, "-").toLowerCase()}`;
+}
+
+function automationTestAssertions(testCase: AutomationTestCase, run: AutomationRunSummary): AutomationTestAssertionResult[] {
+  const expected = testCase.expected;
+  if (!expected) {
+    return [];
+  }
+  const assertions: AutomationTestAssertionResult[] = [];
+  if (expected.status) {
+    assertions.push({
+      id: "status",
+      label: `Status is ${expected.status}`,
+      passed: run.status === expected.status,
+      message: run.status === expected.status ? undefined : `Actual status was ${run.status}.`
+    });
+  }
+  if (expected.errorIncludes?.trim()) {
+    const expectedText = expected.errorIncludes.trim();
+    const errorText = run.error ?? "";
+    assertions.push({
+      id: "errorIncludes",
+      label: `Error includes ${expectedText}`,
+      passed: errorText.includes(expectedText),
+      message: errorText.includes(expectedText) ? undefined : "Run error did not include the expected text."
+    });
+  }
+  for (const expectedText of expected.traceIncludes ?? []) {
+    const text = expectedText.trim();
+    if (!text) {
+      continue;
+    }
+    const matched = run.trace.some((entry) => entry.message.includes(text));
+    assertions.push({
+      id: `traceIncludes:${text}`,
+      label: `Trace includes ${text}`,
+      passed: matched,
+      message: matched ? undefined : "No trace entry included the expected text."
+    });
+  }
+  return assertions;
+}
+
+function runWithAssertionFailure(run: AutomationRunSummary, assertions: AutomationTestAssertionResult[] | undefined): AutomationRunSummary {
+  const failures = assertions?.filter((assertion) => !assertion.passed) ?? [];
+  if (failures.length === 0) {
+    return run;
+  }
+  return {
+    ...run,
+    status: "failed",
+    error: `Automation test case assertions failed: ${failures.map((failure) => failure.label).join("; ")}`
+  };
 }
 
 function recordOfRecords(value: unknown): Record<string, Record<string, unknown>> {

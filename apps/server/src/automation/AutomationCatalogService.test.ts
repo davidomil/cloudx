@@ -89,6 +89,22 @@ describe("AutomationCatalogService", () => {
     expect(hook?.inputs.find((port) => port.id === "targetTabId")?.automationRole).toBeUndefined();
   });
 
+  it("uses purposeful fallback descriptions when hook schemas omit field descriptions", async () => {
+    const service = new AutomationCatalogService(
+      new AutomationTypeService(),
+      () => [],
+      () => [jiraLikeHookDescriptor(), genericHookDescriptor()]
+    );
+
+    const jiraHook = (await service.catalog()).nodes.find((entry) => entry.typeId === "hook:jira.issue.transition");
+    const genericHook = (await service.catalog()).nodes.find((entry) => entry.typeId === "hook:test.generic");
+
+    expect(jiraHook?.inputs.find((port) => port.id === "issueIdOrKey")?.description).toBe("Jira issue key or numeric issue ID this node reads or modifies.");
+    expect(jiraHook?.inputs.find((port) => port.id === "comment")?.description).toBe("Plain-text Jira comment added while performing this operation.");
+    expect(genericHook?.inputs.find((port) => port.id === "enabled")?.description).toBe("Enabled flag used by Generic Hook.");
+    expect(genericHook?.outputs.find((port) => port.id === "result")?.description).toBe("Result returned by Generic Hook.");
+  });
+
   it("keeps reserved trigger payload output unique while exposing same-name exec data by kind", async () => {
     const service = new AutomationCatalogService(
       new AutomationTypeService(),
@@ -108,6 +124,84 @@ describe("AutomationCatalogService", () => {
         expect.objectContaining({ id: "text", kind: "data" })
       ])
     );
+  });
+
+  it("catalogs comparison, sleep, Python, bash, and Codex execution primitives with typed ports", async () => {
+    const catalog = await new AutomationCatalogService(new AutomationTypeService(), () => [], () => []).catalog();
+    const numberCompare = catalog.nodes.find((entry) => entry.typeId === "primitive:number.compare");
+    const numberRange = catalog.nodes.find((entry) => entry.typeId === "primitive:number.range");
+    const stringCompare = catalog.nodes.find((entry) => entry.typeId === "primitive:string.compare");
+    const sleep = catalog.nodes.find((entry) => entry.typeId === "primitive:sleep");
+    const python = catalog.nodes.find((entry) => entry.typeId === "primitive:python.exec");
+    const bash = catalog.nodes.find((entry) => entry.typeId === "primitive:bash.exec");
+    const codex = catalog.nodes.find((entry) => entry.typeId === "primitive:codex.exec");
+
+    expect(numberCompare).toMatchObject({
+      kind: "primitive",
+      inputs: expect.arrayContaining([
+        expect.objectContaining({ id: "left", type: { kind: "number" } }),
+        expect.objectContaining({ id: "operator", type: { kind: "string" } })
+      ]),
+      outputs: [expect.objectContaining({ id: "value", type: { kind: "boolean" } })]
+    });
+    expect(numberRange?.inputs.find((port) => port.id === "mode")?.options?.values.map((option) => option.value)).toEqual(["inclusive", "exclusive", "outsideInclusive", "outsideExclusive"]);
+    expect(stringCompare?.inputs.find((port) => port.id === "operator")?.options?.values.map((option) => option.value)).toEqual(["equals", "notEquals", "contains", "startsWith", "endsWith"]);
+    expect(sleep).toMatchObject({
+      inputs: [expect.objectContaining({ id: "exec" }), expect.objectContaining({ id: "durationMs", type: { kind: "number" } })],
+      outputs: [expect.objectContaining({ id: "exec" })]
+    });
+    expect(python).toMatchObject({
+      safety: "external",
+      inputs: expect.arrayContaining([
+        expect.objectContaining({ id: "exec", kind: "exec" }),
+        expect.objectContaining({ id: "code", type: { kind: "string" }, codeEditor: expect.objectContaining({ language: "python" }) }),
+        expect.objectContaining({ id: "cloudxHooks", type: { kind: "boolean" } }),
+        expect.objectContaining({ id: "parseJson", type: { kind: "boolean" } })
+      ]),
+      outputs: expect.arrayContaining([
+        expect.objectContaining({ id: "stdout", type: { kind: "string" } }),
+        expect.objectContaining({ id: "stderr", type: { kind: "string" } }),
+        expect.objectContaining({ id: "exitCode", type: { kind: "number" } }),
+        expect.objectContaining({ id: "json", type: { kind: "unknown" } }),
+        expect.objectContaining({ id: "hookResults", type: expect.objectContaining({ kind: "array" }) })
+      ])
+    });
+    const pythonCompletions = python?.inputs.find((port) => port.id === "code")?.codeEditor?.completions ?? [];
+    expect(pythonCompletions.map((completion) => completion.label)).toEqual(expect.arrayContaining(["cloudx.call_hook"]));
+    expect(pythonCompletions.find((completion) => completion.label === "cloudx.call_hook")).toMatchObject({
+      detail: "Queue a CloudX hook call.",
+      info: expect.stringContaining("Do not include the automation node prefix \"hook:\"")
+    });
+    expect(bash).toMatchObject({
+      safety: "external",
+      inputs: expect.arrayContaining([
+        expect.objectContaining({ id: "exec", kind: "exec" }),
+        expect.objectContaining({ id: "script", type: { kind: "string" }, codeEditor: expect.objectContaining({ language: "bash" }) }),
+        expect.objectContaining({ id: "parseJson", type: { kind: "boolean" } })
+      ]),
+      outputs: expect.arrayContaining([
+        expect.objectContaining({ id: "stdout", type: { kind: "string" } }),
+        expect.objectContaining({ id: "stderr", type: { kind: "string" } }),
+        expect.objectContaining({ id: "exitCode", type: { kind: "number" } }),
+        expect.objectContaining({ id: "json", type: { kind: "unknown" } })
+      ])
+    });
+    expect(codex).toMatchObject({
+      safety: "external",
+      inputs: expect.arrayContaining([
+        expect.objectContaining({ id: "exec", kind: "exec" }),
+        expect.objectContaining({ id: "prompt", type: { kind: "string" } }),
+        expect.objectContaining({ id: "profile", type: { kind: "string" } }),
+        expect.objectContaining({ id: "sandbox", options: { values: expect.arrayContaining([expect.objectContaining({ value: "read-only" })]) } }),
+        expect.objectContaining({ id: "approvalPolicy", options: { values: expect.arrayContaining([expect.objectContaining({ value: "never" })]) } })
+      ]),
+      outputs: expect.arrayContaining([
+        expect.objectContaining({ id: "finalMessage", type: { kind: "string" } }),
+        expect.objectContaining({ id: "stderr", type: { kind: "string" } }),
+        expect.objectContaining({ id: "exitCode", type: { kind: "number" } }),
+        expect.objectContaining({ id: "jsonEvents", type: expect.objectContaining({ kind: "array" }) })
+      ])
+    });
   });
 });
 
@@ -229,6 +323,54 @@ function pluginHookDescriptorWithTargetTabInput(): HookDescriptor {
     outputSchema: {
       type: "object",
       properties: {},
+      additionalProperties: false
+    }
+  };
+}
+
+function jiraLikeHookDescriptor(): HookDescriptor {
+  return {
+    id: "jira.issue.transition",
+    owner: { kind: "plugin", pluginId: "jira" },
+    title: "Transition Jira Issue",
+    description: "Move a Jira issue.",
+    exposures: ["automation"],
+    inputSchema: {
+      type: "object",
+      properties: {
+        issueIdOrKey: { type: "string" },
+        comment: { type: "string" }
+      },
+      required: ["issueIdOrKey"],
+      additionalProperties: false
+    },
+    outputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false
+    }
+  };
+}
+
+function genericHookDescriptor(): HookDescriptor {
+  return {
+    id: "test.generic",
+    owner: { kind: "app" },
+    title: "Generic Hook",
+    description: "Tests fallback descriptions.",
+    exposures: ["automation"],
+    inputSchema: {
+      type: "object",
+      properties: {
+        enabled: { type: "boolean" }
+      },
+      additionalProperties: false
+    },
+    outputSchema: {
+      type: "object",
+      properties: {
+        result: { type: "string" }
+      },
       additionalProperties: false
     }
   };

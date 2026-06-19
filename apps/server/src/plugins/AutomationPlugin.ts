@@ -1,10 +1,10 @@
 import type { CreatePluginSessionInput, HookDefinition, PluginSession, PluginSessionSnapshot, PluginVoiceContext, WorkspacePlugin } from "@cloudx/plugin-api";
-import { isAutomationGraphDocument, type AutomationGroup, type WorkspaceTab } from "@cloudx/shared";
+import { isAutomationGraphDocument, type AutomationGroup, type AutomationRunStatus, type AutomationTestCase, type AutomationTestCaseExpected, type WorkspaceTab } from "@cloudx/shared";
 
 import type { AutomationService } from "../automation/AutomationService.js";
 
 export const AUTOMATION_PLUGIN_ID = "automation";
-type AutomationGroupInput = Pick<AutomationGroup, "id" | "name" | "enabled" | "graph">;
+type AutomationGroupInput = Pick<AutomationGroup, "id" | "name" | "enabled" | "graph" | "testCases">;
 
 export class AutomationPlugin implements WorkspacePlugin {
   readonly id = AUTOMATION_PLUGIN_ID;
@@ -113,12 +113,20 @@ export class AutomationPlugin implements WorkspacePlugin {
           properties: {
             groupId: { type: "string" },
             payload: { type: "object" },
-            graph: { type: "object" }
+            graph: { type: "object" },
+            testCaseId: { type: "string" },
+            testCase: { type: "object" }
           },
           required: ["groupId"],
           additionalProperties: false
         },
-        execute: async (input) => await this.serviceProvider().startTest(requireString(input.groupId, "groupId"), recordOrUndefined(input.payload), graphOrUndefined(input.graph)) as unknown as Record<string, unknown>
+        execute: async (input) => await this.serviceProvider().startTest(
+          requireString(input.groupId, "groupId"),
+          recordOrUndefined(input.payload, "payload"),
+          graphOrUndefined(input.graph),
+          optionalString(input.testCaseId, "testCaseId"),
+          testCaseOrUndefined(input.testCase, "testCase")
+        ) as unknown as Record<string, unknown>
       },
       {
         id: "automation.runs.cancel",
@@ -202,7 +210,8 @@ function requireGroup(value: unknown): AutomationGroupInput {
     id: requireString(group.id, "group.id"),
     name: requireString(group.name, "group.name"),
     enabled: requireBoolean(group.enabled, "group.enabled"),
-    graph: requireGroupGraph(group.graph, "group.graph")
+    graph: requireGroupGraph(group.graph, "group.graph"),
+    testCases: testCasesOrUndefined(group.testCases, "group.testCases")
   };
 }
 
@@ -213,15 +222,72 @@ function requireGroupGraph(value: unknown, name = "graph"): AutomationGroup["gra
   return value;
 }
 
-function recordOrUndefined(value: unknown): Record<string, unknown> | undefined {
+function recordOrUndefined(value: unknown, name: string): Record<string, unknown> | undefined {
   if (value === undefined) {
     return undefined;
   }
-  return requireRecord(value, "payload");
+  return requireRecord(value, name);
 }
 
 function graphOrUndefined(value: unknown): AutomationGroup["graph"] | undefined {
   return value === undefined ? undefined : requireGroupGraph(value);
+}
+
+function testCasesOrUndefined(value: unknown, name: string): AutomationTestCase[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value)) {
+    throwInputError(`${name} must be an array.`);
+  }
+  return value.map((entry, index) => requireTestCase(entry, `${name}[${index}]`));
+}
+
+function testCaseOrUndefined(value: unknown, name: string): AutomationTestCase | undefined {
+  return value === undefined ? undefined : requireTestCase(value, name);
+}
+
+function requireTestCase(value: unknown, name: string): AutomationTestCase {
+  const testCase = requireRecord(value, name);
+  return {
+    id: requireString(testCase.id, `${name}.id`),
+    name: requireString(testCase.name, `${name}.name`),
+    payload: requireRecord(testCase.payload, `${name}.payload`),
+    expected: expectedOrUndefined(testCase.expected, `${name}.expected`)
+  };
+}
+
+function expectedOrUndefined(value: unknown, name: string): AutomationTestCaseExpected | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const expected = requireRecord(value, name);
+  return {
+    status: statusOrUndefined(expected.status, `${name}.status`),
+    errorIncludes: expected.errorIncludes === undefined ? undefined : requireString(expected.errorIncludes, `${name}.errorIncludes`),
+    traceIncludes: traceIncludesOrUndefined(expected.traceIncludes, `${name}.traceIncludes`)
+  };
+}
+
+function statusOrUndefined(value: unknown, name: string): AutomationRunStatus | undefined {
+  if (value === undefined || value === "queued" || value === "running" || value === "succeeded" || value === "failed" || value === "cancelled") {
+    return value;
+  }
+  throwInputError(`${name} must be one of queued, running, succeeded, failed, or cancelled.`);
+}
+
+function traceIncludesOrUndefined(value: unknown, name: string): string[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+    throwInputError(`${name} must be an array of strings.`);
+  }
+  return value;
+}
+
+function optionalString(value: unknown, name: string): string | undefined {
+  return value === undefined ? undefined : requireString(value, name);
 }
 
 function requireString(value: unknown, name: string): string {

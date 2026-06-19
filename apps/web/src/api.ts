@@ -5,6 +5,7 @@ import type {
   AutomationGroup,
   AutomationGroupsResponse,
   AutomationRunsResponse,
+  AutomationTestCase,
   AutomationTestRunResponse,
   AutomationValidationSummary,
   CloudxConfigResponse,
@@ -426,10 +427,10 @@ export async function validateAutomationGraph(groupId: string, graph: Automation
   });
 }
 
-export async function startAutomationTestRun(groupId: string, graph?: AutomationGraphDocument, payload?: Record<string, unknown>): Promise<AutomationTestRunResponse> {
+export async function startAutomationTestRun(groupId: string, graph?: AutomationGraphDocument, payload?: Record<string, unknown>, testCaseId?: string, testCase?: AutomationTestCase): Promise<AutomationTestRunResponse> {
   return fetchJson(`/api/automation/groups/${encodeURIComponent(groupId)}/test-run`, {
     method: "POST",
-    body: JSON.stringify({ ...(payload === undefined ? {} : { payload }), ...(graph === undefined ? {} : { graph }) })
+    body: JSON.stringify({ ...(payload === undefined ? {} : { payload }), ...(graph === undefined ? {} : { graph }), ...(testCaseId === undefined ? {} : { testCaseId }), ...(testCase === undefined ? {} : { testCase }) })
   });
 }
 

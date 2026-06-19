@@ -116,8 +116,12 @@ export class JiraClient {
     return recordOrEmpty(await this.requestJson("POST", `/rest/api/3/issue/${encodeURIComponent(issueIdOrKey)}/comment`, { body }));
   }
 
-  async listTransitions(issueIdOrKey: string): Promise<Record<string, unknown>[]> {
-    const body = recordOrEmpty(await this.requestJson("GET", `/rest/api/3/issue/${encodeURIComponent(issueIdOrKey)}/transitions`));
+  async listTransitions(issueIdOrKey: string, options: { expandFields?: boolean } = {}): Promise<Record<string, unknown>[]> {
+    const params = new URLSearchParams();
+    if (options.expandFields) {
+      params.set("expand", "transitions.fields");
+    }
+    const body = recordOrEmpty(await this.requestJson("GET", `/rest/api/3/issue/${encodeURIComponent(issueIdOrKey)}/transitions${params.size ? `?${params.toString()}` : ""}`));
     return Array.isArray(body.transitions) ? body.transitions.filter(isRecord) : [];
   }
 

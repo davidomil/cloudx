@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RULES_SKILLS_PLUGIN_ID, type PluginDescriptor, type WorkspaceStateResponse } from "@cloudx/shared";
 
-import { codexTabInitialInput, loadAudioInputId, notificationToastIdsAfterDismiss, persistAudioInputId, requestAudioInputEnumerationAccess, selectCreateTabPluginId, subscribeWorkspaceUpdates, voiceControlSettings, workspaceStateWithPreservedLayout } from "./App.js";
+import { codexTabInitialInput, degradedPersistenceStatuses, loadAudioInputId, notificationToastIdsAfterDismiss, persistAudioInputId, persistenceWarningLabel, persistenceWarningTitle, requestAudioInputEnumerationAccess, selectCreateTabPluginId, subscribeWorkspaceUpdates, voiceControlSettings, workspaceStateWithPreservedLayout } from "./App.js";
 import { pluginMetadataForTemplate, selectedTemplateId } from "./RulesSkillsPanel.js";
 import { collectUiContributions, selectTabIndicatorContribution } from "./uiContributions.js";
 import { parseWorkspaceSocketUpdate } from "./workspaceSocketUpdate.js";
@@ -98,6 +98,22 @@ describe("notification toast helpers", () => {
 
     expect([...next]).toEqual(["n2"]);
     expect([...current]).toEqual(["n1", "n2"]);
+  });
+});
+
+describe("persistence warning helpers", () => {
+  it("summarizes degraded persistence stores without showing healthy stores", () => {
+    const degraded = degradedPersistenceStatuses([
+      { name: "Workspace layout", state: "available", path: "/tmp/workspace.json" },
+      { name: "Automation groups", state: "degraded", path: "/tmp/automation.json", code: "ENOSPC", message: "No space left" }
+    ]);
+
+    expect(degraded).toEqual([
+      expect.objectContaining({ name: "Automation groups", state: "degraded" })
+    ]);
+    expect(persistenceWarningLabel(degraded)).toBe("Automation groups not saved");
+    expect(persistenceWarningTitle(degraded)).toBe("Automation groups: ENOSPC: No space left");
+    expect(persistenceWarningLabel([])).toBeUndefined();
   });
 });
 
@@ -224,8 +240,25 @@ describe("parseWorkspaceSocketUpdate", () => {
       tabs: [],
       activeWindowId: "window-1",
       windows: state.windows,
-      templates: []
+      templates: [],
+      persistence: undefined
     });
+    expect(
+      parseWorkspaceSocketUpdate(
+        JSON.stringify({
+          type: "workspace",
+          tabs: [],
+          activeWindowId: "window-1",
+          windows: state.windows,
+          templates: [],
+          persistence: [{ name: "Workspace layout", state: "degraded", path: "/tmp/workspace.json", code: "ENOSPC", failedAt: new Date(0).toISOString() }]
+        })
+      )
+    ).toMatchObject({
+      type: "workspace",
+      persistence: [expect.objectContaining({ name: "Workspace layout", state: "degraded", code: "ENOSPC" })]
+    });
+    expect(parseWorkspaceSocketUpdate(JSON.stringify({ type: "workspace", tabs: [], activeWindowId: "window-1", windows: state.windows, templates: [], persistence: [{ state: "degraded" }] }))).toBeUndefined();
   });
 
   it("keeps tab updates lightweight while rejecting malformed socket payloads", () => {

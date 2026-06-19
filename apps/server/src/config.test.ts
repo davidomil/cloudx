@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { DEFAULT_VOICE_MODEL } from "@cloudx/shared";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -30,6 +31,7 @@ describe("loadConfig", () => {
     expect(config.port).toBe(3001);
     expect(config.logLevel).toBe("info");
     expect(config.terminalReplayBytes).toBe(DEFAULT_TERMINAL_REPLAY_BYTES);
+    expect(config.voiceModel).toBe(DEFAULT_VOICE_MODEL);
     expect(config.asrTimeoutMs).toBe(DEFAULT_ASR_TIMEOUT_MS);
     expect(config.documentationTimeoutMs).toBe(DEFAULT_DOCUMENTATION_TIMEOUT_MS);
     expect(config.documentationResponseMaxBytes).toBe(DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES);
@@ -88,6 +90,12 @@ describe("loadConfig", () => {
     const config = loadConfig({ CLOUDX_VOICE_AUDIO_UPLOAD_MAX_BYTES: "2097152" } as NodeJS.ProcessEnv);
 
     expect(config.voiceAudioUploadMaxBytes).toBe(2_097_152);
+  });
+
+  it("parses and validates the Codex voice model", () => {
+    expect(loadConfig({ CLOUDX_VOICE_MODEL: " gpt-5.4-mini " } as NodeJS.ProcessEnv).voiceModel).toBe("gpt-5.4-mini");
+    expect(() => loadConfig({ CLOUDX_VOICE_MODEL: "" } as NodeJS.ProcessEnv)).toThrow(/CLOUDX_VOICE_MODEL/);
+    expect(() => loadConfig({ CLOUDX_VOICE_MODEL: "gpt 5.4" } as NodeJS.ProcessEnv)).toThrow(/CLOUDX_VOICE_MODEL/);
   });
 
   it("keeps raw voice transcript logging opt-in", () => {

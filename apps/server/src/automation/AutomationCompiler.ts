@@ -119,7 +119,7 @@ export class AutomationCompiler {
       if (!entry) {
         continue;
       }
-      if (entry.kind === "function" && !automationSafetyAllowed(entry.safety, graph.allowedSafety)) {
+      if (entry.safety && !automationSafetyAllowed(entry.safety, graph.allowedSafety)) {
         diagnostics.push(error("automation-safety-policy", `${entry.title} requires ${entry.safety} automation safety. Enable ${entry.safety} for this graph before it can run.`, node.id));
       }
       for (const port of entry.inputs.filter((port) => port.kind === "data" && port.required)) {

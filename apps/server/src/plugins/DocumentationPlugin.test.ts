@@ -49,7 +49,14 @@ describe("DocumentationPlugin", () => {
     });
     expect(plugin.hooks.find((hook) => hook.id === "documentation.search")).toMatchObject({
       exposures: ["plugin", "ui", "http", "automation", "voice"],
-      automationSafety: "read"
+      automationSafety: "read",
+      outputSchema: expect.objectContaining({
+        properties: expect.objectContaining({
+          results: { type: "array", items: { type: "object", additionalProperties: true }, description: "Documentation search results returned by the local archive." },
+          resultCount: { type: "number", description: "Number of documentation search results returned." },
+          firstDocumentId: { type: "string", description: "Document ID from the first search result." }
+        })
+      })
     });
     expect(plugin.hooks.find((hook) => hook.id === "documentation.answer")).toMatchObject({
       exposures: ["ui", "http"],
@@ -67,6 +74,13 @@ describe("DocumentationPlugin", () => {
         properties: expect.objectContaining({
           acceptGeneratedCodeDocumentation: { type: "boolean" },
           retainRawCodeArtifacts: { type: "boolean" }
+        })
+      }),
+      outputSchema: expect.objectContaining({
+        properties: expect.objectContaining({
+          documents: { type: "array", items: { type: "object", additionalProperties: true }, description: "Documentation records created or updated by the ingest." },
+          documentCount: { type: "number", description: "Number of documentation records returned by the ingest." },
+          firstDocumentId: { type: "string", description: "Document ID from the first ingested record." }
         })
       })
     });
@@ -100,7 +114,13 @@ describe("DocumentationPlugin", () => {
     });
     expect(plugin.hooks.find((hook) => hook.id === "documentation.archive.export")).toMatchObject({
       automationSafety: "write",
-      inputSchema: expect.objectContaining({ required: ["path"] })
+      inputSchema: expect.objectContaining({ required: ["path"] }),
+      outputSchema: expect.objectContaining({
+        properties: expect.objectContaining({
+          path: { type: "string", description: "Allowed local ZIP path written by the archive export." },
+          bytes: { type: "number", description: "Size of the exported ZIP file in bytes." }
+        })
+      })
     });
     expect(plugin.hooks.find((hook) => hook.id === "documentation.archive.import.replace")).toMatchObject({
       automationSafety: "destructive",
@@ -153,7 +173,7 @@ describe("DocumentationPlugin", () => {
 
     const result = await hook.execute({ path: allowedFile, sourceType: "datasheet" }, { caller: { kind: "http" } });
 
-    expect(result).toEqual({ documents: [], enrichment: { enabled: true } });
+    expect(result).toMatchObject({ documents: [], documentCount: 0, kind: "path", source: allowedFile, enrichment: { enabled: true } });
     expect(enrichIngestResponse).toHaveBeenCalledWith({ documents: [] });
   });
 
@@ -180,7 +200,14 @@ describe("DocumentationPlugin", () => {
 
     ingest.resolve({ document: { documentId: "queued-doc" } });
 
-    await expect(run).resolves.toEqual({ document: { documentId: "queued-doc" } });
+    await expect(run).resolves.toMatchObject({
+      document: { documentId: "queued-doc" },
+      documents: [{ documentId: "queued-doc" }],
+      documentCount: 1,
+      firstDocumentId: "queued-doc",
+      kind: "text",
+      source: "direct text"
+    });
     expect(progress).toEqual(expect.arrayContaining([
       expect.objectContaining({ status: "complete", progress: 100 })
     ]));

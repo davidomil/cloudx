@@ -5,6 +5,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import type { PluginDescriptor } from "@cloudx/shared";
+import { DEFAULT_VOICE_MODEL } from "@cloudx/shared";
 
 import { ConfigService } from "./configService.js";
 
@@ -15,13 +16,13 @@ describe("ConfigService", () => {
 
     expect(service.getResponse()).toMatchObject({
       values: {
-        global: { aiControlEnabled: true, voiceCommandsEnabled: true, microphoneEnabled: true, themeId: "cloudx-neon", uiScale: 100 },
+        global: { aiControlEnabled: true, voiceCommandsEnabled: true, microphoneEnabled: true, voiceModel: DEFAULT_VOICE_MODEL, themeId: "cloudx-neon", uiScale: 100 },
         plugins: { "file-browser": { showGitDiff: true, gitAutoRefresh: true, gitAutoRefreshSeconds: 15 } }
       }
     });
 
     await service.update({
-      global: { aiControlEnabled: false, voiceCommandsEnabled: false, themeId: "minimalist-dark", uiScale: 115 },
+      global: { aiControlEnabled: false, voiceCommandsEnabled: false, voiceModel: "gpt-5.4-mini", themeId: "minimalist-dark", uiScale: 115 },
       plugins: { "file-browser": { showGitDiff: false, gitAutoRefresh: false, gitAutoRefreshSeconds: 30 } }
     });
 
@@ -31,10 +32,30 @@ describe("ConfigService", () => {
     const reloaded = new ConfigService(dataDir, () => [fileBrowserDescriptor()]);
     expect(reloaded.getResponse()).toMatchObject({
       values: {
-        global: { aiControlEnabled: false, voiceCommandsEnabled: false, microphoneEnabled: true, themeId: "minimalist-dark", uiScale: 115 },
+        global: { aiControlEnabled: false, voiceCommandsEnabled: false, microphoneEnabled: true, voiceModel: "gpt-5.4-mini", themeId: "minimalist-dark", uiScale: 115 },
         plugins: { "file-browser": { showGitDiff: false, gitAutoRefresh: false, gitAutoRefreshSeconds: 30 } }
       }
     });
+  });
+
+  it("uses the startup voice model as the runtime default and persists overrides", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-config-voice-model-"));
+    const service = new ConfigService(dataDir, () => [fileBrowserDescriptor()], { voiceModel: "gpt-5.4" });
+
+    expect(service.getResponse().globalFields.find((field) => field.key === "voiceModel")).toMatchObject({
+      type: "select",
+      defaultValue: "gpt-5.4",
+      options: expect.arrayContaining([
+        expect.objectContaining({ value: "gpt-5.4", label: "GPT-5.4" }),
+        expect.objectContaining({ value: "gpt-5.4-mini", label: "GPT-5.4-Mini" })
+      ])
+    });
+    expect(service.getVoiceModel()).toBe("gpt-5.4");
+
+    await service.update({ global: { voiceModel: "gpt-5.4-mini" } });
+
+    expect(service.getVoiceModel()).toBe("gpt-5.4-mini");
+    expect(new ConfigService(dataDir, () => [fileBrowserDescriptor()], { voiceModel: "gpt-5.4" }).getVoiceModel()).toBe("gpt-5.4-mini");
   });
 
   it("serializes concurrent updates without losing earlier config patches", async () => {
@@ -142,6 +163,9 @@ describe("ConfigService", () => {
 
     await expect(service.update({ global: { nope: true } })).rejects.toThrow("Unknown config key");
     await expect(service.update({ global: { themeId: "missing" } })).rejects.toThrow("must be one of the configured options");
+    await expect(service.update({ global: { voiceModel: "" } })).rejects.toThrow("must be one of the configured options");
+    await expect(service.update({ global: { voiceModel: "gpt 5.4" } })).rejects.toThrow("must be one of the configured options");
+    await expect(service.update({ global: { voiceModel: "x".repeat(129) } })).rejects.toThrow("must be one of the configured options");
     await expect(service.update({ global: { uiScale: 50 } })).rejects.toThrow("must be greater than or equal to 75");
     await expect(service.update({ global: { uiScale: 175 } })).rejects.toThrow("must be less than or equal to 150");
     await expect(service.update({ plugins: { "file-browser": { showGitDiff: "no" } } })).rejects.toThrow("must be a boolean");
@@ -160,6 +184,7 @@ describe("ConfigService", () => {
           aiControlEnabled: "false",
           voiceCommandsEnabled: "no",
           microphoneEnabled: 1,
+          voiceModel: "bad model",
           themeId: "missing",
           uiScale: 999
         },
@@ -178,7 +203,7 @@ describe("ConfigService", () => {
 
     expect(service.getResponse()).toMatchObject({
       values: {
-        global: { aiControlEnabled: true, voiceCommandsEnabled: true, microphoneEnabled: true, themeId: "cloudx-neon", uiScale: 100 },
+        global: { aiControlEnabled: true, voiceCommandsEnabled: true, microphoneEnabled: true, voiceModel: DEFAULT_VOICE_MODEL, themeId: "cloudx-neon", uiScale: 100 },
         plugins: { "file-browser": { showGitDiff: true, gitAutoRefresh: true, gitAutoRefreshSeconds: 15 } }
       }
     });

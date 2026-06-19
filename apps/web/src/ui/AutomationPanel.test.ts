@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
 
-import { createElement } from "react";
+import { CompletionContext, type Completion, type CompletionSource } from "@codemirror/autocomplete";
+import { EditorState } from "@codemirror/state";
+import { createElement, useState } from "react";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -10,18 +12,25 @@ import { AUTOMATION_FSTRING_TYPE_ID } from "@cloudx/shared";
 
 import {
   AutomationPanel,
+  automationCodeLanguageExtensions,
   automationMiniMapTheme,
   automationAllowedSafetyWithToggle,
   automationGraphFromPanelState,
+  automationTestCasePayloadText,
+  automationTestCaseWithExpected,
+  automationTestCasesEqual,
+  automationTestCasesWithPayloadDraft,
   automationPaletteEntryMetaText,
   automationSafetyToggleCopy,
   connectionPlanForEntry,
   compatibilityFromConnectionState,
+  createInitialAutomationPanelState,
   defaultConfigForEntry,
   automationStatusFromError,
   portTooltipText,
   groupedPaletteEntries,
   newAutomationGroup,
+  newAutomationTestCase,
   nextAutomationGroupName,
   normalizedAutomationGroupName,
   paletteGroupForEntry,
@@ -31,7 +40,9 @@ import {
   portTooltipPlacementFromRect,
   searchPaletteStateFromRects,
   selectedAutomationGroupAfterDelete,
-  shouldClosePaletteForPointer
+  shouldClosePaletteForPointer,
+  type AutomationPanelState,
+  type AutomationPanelStateUpdater
 } from "./AutomationPanel.js";
 import { automationGraphsEqual, flowFromGraph, graphFromFlow, routedEdgePath } from "./automationGraphAdapter.js";
 import { automationTypeAssignable, connectedDataInputIds, connectionIsValid, dataInputConflictEdges, deleteEdgesForHandle, hasProgramFlowConflict, programFlowConflictEdges, removeConnectionConflicts, removeProgramFlowConflicts } from "./automationConnection.js";
@@ -43,6 +54,27 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+async function completionLabels(sources: readonly (CompletionSource | readonly Completion[])[], context: CompletionContext): Promise<Set<string>> {
+  const labels = new Set<string>();
+  for (const source of sources) {
+    if (isCompletionList(source)) {
+      for (const completion of source) {
+        labels.add(completion.label);
+      }
+      continue;
+    }
+    const result = await source(context);
+    for (const completion of result?.options ?? []) {
+      labels.add(completion.label);
+    }
+  }
+  return labels;
+}
+
+function isCompletionList(source: CompletionSource | readonly Completion[]): source is readonly Completion[] {
+  return Array.isArray(source);
+}
+
 describe("AutomationPanel helpers", () => {
   it("routes minimap colors through theme variables", () => {
     expect(automationMiniMapTheme).toMatchObject({
@@ -52,6 +84,25 @@ describe("AutomationPanel helpers", () => {
       nodeColor: "var(--automation-minimap-node)",
       nodeStrokeColor: "var(--automation-minimap-node-stroke)"
     });
+  });
+
+  it("keeps Python language completions when adding CloudX helper completions", async () => {
+    const state = EditorState.create({
+      doc: "value = 1\npri",
+      extensions: automationCodeLanguageExtensions("python", [
+        {
+          label: "cloudx.call_hook",
+          type: "function",
+          detail: "CloudX hook",
+          apply: "cloudx.call_hook(\"hook.id\", {})"
+        }
+      ])
+    });
+    const context = new CompletionContext(state, state.doc.length, true);
+    const labels = await completionLabels(state.languageDataAt<CompletionSource | readonly Completion[]>("autocomplete", state.doc.length), context);
+
+    expect(labels).toContain("print");
+    expect(labels).toContain("cloudx.call_hook");
   });
 
   it("round-trips graph documents through React Flow nodes and edges", () => {
@@ -207,6 +258,234 @@ describe("AutomationPanel helpers", () => {
     }
   });
 
+  it("keeps unsaved panel state when the automation panel remounts", async () => {
+    vi.stubGlobal("ResizeObserver", TestResizeObserver);
+    vi.stubGlobal("fetch", automationPanelFetch());
+    const stateStore: { current?: AutomationPanelState } = {};
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => {
+        root.render(createElement(StatefulAutomationPanel, { stateStore }));
+      });
+      await flushPanelEffects();
+
+      await act(async () => {
+        automationButton(container, "Allow external automation hooks").click();
+      });
+      expect(stateStore.current?.loaded).toBe(true);
+      expect(stateStore.current?.allowedSafety).toEqual(["read", "write", "external"]);
+      expect(automationButton(container, "Disallow external automation hooks").getAttribute("aria-pressed")).toBe("true");
+      expect(container.textContent).toContain("Unsaved");
+
+      await act(async () => {
+        root.unmount();
+      });
+
+      const reloadFetch = vi.fn(async () => {
+        throw new Error("unexpected automation reload");
+      });
+      vi.stubGlobal("fetch", reloadFetch);
+      const restoredRoot = createRoot(container);
+      await act(async () => {
+        restoredRoot.render(createElement(StatefulAutomationPanel, { stateStore }));
+      });
+      await flushPanelEffects();
+
+      expect(reloadFetch).not.toHaveBeenCalled();
+      expect(automationButton(container, "Disallow external automation hooks").getAttribute("aria-pressed")).toBe("true");
+      expect(container.textContent).toContain("Unsaved");
+
+      await act(async () => {
+        restoredRoot.unmount();
+      });
+    } finally {
+      if (container.isConnected) {
+        container.remove();
+      }
+    }
+  });
+
+  it("refreshes clean cached panel state when the automation panel remounts", async () => {
+    vi.stubGlobal("ResizeObserver", TestResizeObserver);
+    vi.stubGlobal("fetch", automationPanelFetch());
+    const stateStore: { current?: AutomationPanelState } = {};
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => {
+        root.render(createElement(StatefulAutomationPanel, { stateStore }));
+      });
+      await flushPanelEffects();
+      expect(stateStore.current?.loaded).toBe(true);
+
+      await act(async () => {
+        root.unmount();
+      });
+
+      const updatedGroup = { ...groupFixture(), name: "Updated Server Group" };
+      const reloadFetch = automationPanelFetch({
+        "/api/automation/groups": { groups: [updatedGroup] }
+      });
+      vi.stubGlobal("fetch", reloadFetch);
+      const restoredRoot = createRoot(container);
+      await act(async () => {
+        restoredRoot.render(createElement(StatefulAutomationPanel, { stateStore }));
+      });
+      await flushPanelEffects();
+
+      expect(reloadFetch.mock.calls.map(([input]) => String(input))).toEqual(expect.arrayContaining([
+        "/api/automation/catalog",
+        "/api/automation/groups",
+        "/api/automation/runs"
+      ]));
+      expect(stateStore.current?.groups[0]?.name).toBe("Updated Server Group");
+
+      await act(async () => {
+        restoredRoot.unmount();
+      });
+    } finally {
+      if (container.isConnected) {
+        container.remove();
+      }
+    }
+  });
+
+  it("restores draft node state without overwriting it from the server", async () => {
+    vi.stubGlobal("ResizeObserver", TestResizeObserver);
+    const reloadFetch = vi.fn(async () => {
+      throw new Error("unexpected automation reload");
+    });
+    vi.stubGlobal("fetch", reloadFetch);
+    const group = groupFixture();
+    const flow = flowFromGraph(group, catalogFixture());
+    const draftState: AutomationPanelState = {
+      ...createInitialAutomationPanelState(),
+      loaded: true,
+      catalog: catalogFixture(),
+      groups: [group],
+      selectedGroupId: group.id,
+      nodes: flow.nodes.map((node) => (node.id === "log" ? { ...node, data: { ...node.data, config: { message: "unsaved draft" } } } : node)),
+      edges: flow.edges,
+      selectedNodeId: "log",
+      status: "Restored draft."
+    };
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => {
+        root.render(createElement(AutomationPanel, { tab: workspaceTab(), state: draftState }));
+      });
+      await flushPanelEffects();
+
+      expect(reloadFetch).not.toHaveBeenCalled();
+      expect(container.textContent).toContain("Restored draft.");
+      expect(container.textContent).toContain("Unsaved");
+      const inspectorInput = container.querySelector(".automation-node-inspector input");
+      expect(inspectorInput).toBeInstanceOf(HTMLInputElement);
+      expect((inspectorInput as HTMLInputElement).value).toBe("unsaved draft");
+    } finally {
+      await act(async () => {
+        root.unmount();
+      });
+    }
+  });
+
+  it("runs selected test cases with edited fixture payloads and expectations", async () => {
+    vi.stubGlobal("ResizeObserver", TestResizeObserver);
+    const group = {
+      ...groupFixture(),
+      testCases: [
+        {
+          id: "case-1",
+          name: "Case 1",
+          payload: { text: "old" },
+          expected: { status: "succeeded" as const }
+        }
+      ]
+    };
+    const testRunBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/automation/catalog") {
+        return jsonResponse(catalogFixture());
+      }
+      if (url === "/api/automation/groups") {
+        return jsonResponse({ groups: [group] });
+      }
+      if (url === "/api/automation/runs") {
+        return jsonResponse({ runs: [] });
+      }
+      if (url === "/api/automation/groups/group/test-run") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        testRunBodies.push(body);
+        return jsonResponse({
+          runs: [],
+          sample: {
+            triggerId: "test",
+            payload: body.payload,
+            runId: "run-1",
+            status: "failed",
+            trace: [],
+            testCaseId: "case-1",
+            testCaseName: "Case 1",
+            assertions: [{ id: "status", label: "Status is failed", passed: true }]
+          }
+        });
+      }
+      throw new Error(`Unhandled automation panel request: ${url}`);
+    }));
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => {
+        root.render(createElement(AutomationPanel, { tab: workspaceTab() }));
+      });
+      await flushPanelEffects();
+
+      const payload = container.querySelector('[aria-label="Trigger fixture payload"]');
+      expect(payload).toBeInstanceOf(HTMLTextAreaElement);
+      const payloadTextarea = payload as HTMLTextAreaElement;
+      await act(async () => {
+        setNativeControlValue(payloadTextarea, '{"text":"edited"}');
+        payloadTextarea.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+
+      const expectedStatus = container.querySelector('[aria-label="Expected run status"]');
+      expect(expectedStatus).toBeInstanceOf(HTMLSelectElement);
+      const expectedStatusSelect = expectedStatus as HTMLSelectElement;
+      await act(async () => {
+        setNativeControlValue(expectedStatusSelect, "failed");
+        expectedStatusSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+
+      await act(async () => {
+        automationButton(container, "Run test").click();
+      });
+      await flushPanelEffects();
+
+      expect(testRunBodies).toHaveLength(1);
+      expect(testRunBodies[0]).toMatchObject({
+        payload: { text: "edited" },
+        testCaseId: "case-1",
+        testCase: { id: "case-1", payload: { text: "edited" }, expected: { status: "failed" } }
+      });
+      expect(container.textContent).toContain("Status is failed");
+    } finally {
+      await act(async () => {
+        root.unmount();
+      });
+    }
+  });
+
   it("labels unsafe palette entries in the node picker metadata", () => {
     expect(automationPaletteEntryMetaText({ ...paletteEntries()[0]!, safety: "external" })).toBe("function - External hook");
     expect(automationPaletteEntryMetaText({ ...paletteEntries()[0]!, safety: "destructive" })).toBe("function - Destructive hook");
@@ -275,6 +554,21 @@ describe("AutomationPanel helpers", () => {
         variables: []
       }
     });
+  });
+
+  it("edits automation test case fixtures and expectations as typed JSON state", () => {
+    const testCase = newAutomationTestCase("case-1", 1);
+
+    expect(testCase).toMatchObject({ id: "case-1", name: "Test case 1", payload: {}, expected: { status: "succeeded" } });
+    expect(automationTestCasePayloadText({ ...testCase, payload: { text: "go" } })).toBe('{\n  "text": "go"\n}');
+    expect(automationTestCasesWithPayloadDraft([testCase], "case-1", '{"text":"go"}')).toEqual([{ ...testCase, payload: { text: "go" } }]);
+    expect(() => automationTestCasesWithPayloadDraft([testCase], "case-1", "[]")).toThrow("Trigger fixture payload must be a JSON object.");
+    expect(automationTestCaseWithExpected(testCase, { traceIncludes: ["Record completed.", "  "], errorIncludes: " failed " }).expected).toEqual({
+      status: "succeeded",
+      errorIncludes: "failed",
+      traceIncludes: ["Record completed."]
+    });
+    expect(automationTestCasesEqual([testCase], [testCase])).toBe(true);
   });
 
   it("selects the next available automation after deleting the current group", () => {
@@ -709,8 +1003,26 @@ function automationPanelFetch(responses: Record<string, unknown> = {}) {
   });
 }
 
+function StatefulAutomationPanel({ stateStore }: { stateStore: { current?: AutomationPanelState } }) {
+  const [state, setState] = useState<AutomationPanelState | undefined>(() => stateStore.current);
+  const onStateChange = (updater: AutomationPanelStateUpdater) => {
+    setState((current) => {
+      const next = updater(current);
+      stateStore.current = next;
+      return next;
+    });
+  };
+  return createElement(AutomationPanel, { tab: workspaceTab(), state, onStateChange });
+}
+
 function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
+}
+
+function setNativeControlValue(control: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement, value: string): void {
+  const prototype = Object.getPrototypeOf(control) as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
+  const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+  descriptor?.set?.call(control, value);
 }
 
 async function flushPanelEffects(): Promise<void> {

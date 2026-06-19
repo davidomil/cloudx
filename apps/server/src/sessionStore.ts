@@ -157,7 +157,8 @@ export class SessionStore {
       plugins: this.plugins.list(),
       activeWindowId: workspace?.activeWindowId,
       windows: workspace?.windows,
-      templates: workspace?.templates
+      templates: workspace?.templates,
+      persistence: workspace?.persistence
     };
   }
 
@@ -207,6 +208,7 @@ export class SessionStore {
       activeWindowId: workspace?.activeWindowId,
       windows: workspace?.windows,
       templates: workspace?.templates,
+      persistence: workspace?.persistence,
       plugins: this.plugins.list(),
       hooks: voiceHooks,
       paths: this.pathPolicy.voiceContext(),
@@ -304,7 +306,7 @@ export class SessionStore {
     return result;
   }
 
-  async executePluginHook(pluginId: string, hookId: HookId, action: string, targetTabId: string | undefined, input: Record<string, unknown>, caller: HookCaller): Promise<Record<string, unknown>> {
+  async executePluginHook(pluginId: string, hookId: HookId, action: string, targetTabId: string | undefined, input: Record<string, unknown>, caller: HookCaller, signal?: AbortSignal): Promise<Record<string, unknown>> {
     const tabId = this.resolvePluginHookTargetTabId(pluginId, targetTabId, caller.tabId ?? this.activeTabId);
     if (!tabId) {
       throw new Error(`Hook ${hookId} requires a target tab for plugin ${pluginId}.`);
@@ -319,7 +321,7 @@ export class SessionStore {
     } else {
       this.plugins.validateInput(pluginId, action, actionInput);
     }
-    const result = this.plugins.validateOutput(pluginId, action, await session.handleAction(action, actionInput));
+    const result = this.plugins.validateOutput(pluginId, action, await session.handleAction(action, actionInput, { signal, caller }));
     await this.contextService.record(this.getTab(tabId), "plugin-hook", JSON.stringify({ hookId, action, input: actionInput, caller, result }, null, 2));
     this.markTabInteractedIfActionUpdatesState(pluginId, action, tabId);
     return result;

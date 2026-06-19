@@ -1,15 +1,21 @@
+import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 import safeRegex from "safe-regex2";
 
 import type { HookRegistry } from "../hooks/HookRegistry.js";
+import { isSameOrChildPath } from "../pathBoundary.js";
 import type { AutomationCatalogResponse, AutomationEdge, AutomationGroup, AutomationNode, AutomationNodeCatalogEntry, AutomationRunSummary, AutomationRunTraceEntry, TriggerEvent } from "@cloudx/shared";
 import { AUTOMATION_FSTRING_TYPE_ID, automationEntryWithDynamicPorts, automationFStringInputNames, automationSafetyAllowed } from "@cloudx/shared";
+import { buildToolEnv, resolveAssistantCommand } from "../terminal/ShellLaunch.js";
 
 export interface AutomationExecutorOptions {
   activeTabId?: string;
   maxSteps?: number;
   maxDurationMs?: number;
   maxTraceEntries?: number;
+  allowedRoots?: string[];
   signal?: AbortSignal;
   effectSink?: AutomationEffectSink;
   onRunStarted?: (run: AutomationRunSummary) => Promise<void> | void;
@@ -28,6 +34,43 @@ const AUTOMATION_FSTRING_TEMPLATE_MAX_CHARS = 50_000;
 const AUTOMATION_FSTRING_OUTPUT_MAX_CHARS = 200_000;
 const AUTOMATION_FSTRING_FORMAT_WIDTH_MAX = 10_000;
 const AUTOMATION_FSTRING_FORMAT_PRECISION_MAX = 100;
+const AUTOMATION_SLEEP_MAX_MS = 60 * 60 * 1000;
+const AUTOMATION_PYTHON_CODE_MAX_CHARS = 100_000;
+const AUTOMATION_PYTHON_STDIN_MAX_BYTES = 1024 * 1024;
+const AUTOMATION_PYTHON_OUTPUT_MAX_BYTES = 1024 * 1024;
+const AUTOMATION_PYTHON_TIMEOUT_MAX_MS = 5 * 60 * 1000;
+const AUTOMATION_PYTHON_DEFAULT_TIMEOUT_MS = 30_000;
+const AUTOMATION_BASH_SCRIPT_MAX_CHARS = 100_000;
+const AUTOMATION_BASH_STDIN_MAX_BYTES = 1024 * 1024;
+const AUTOMATION_BASH_OUTPUT_MAX_BYTES = 1024 * 1024;
+const AUTOMATION_BASH_TIMEOUT_MAX_MS = 5 * 60 * 1000;
+const AUTOMATION_BASH_DEFAULT_TIMEOUT_MS = 30_000;
+const AUTOMATION_CODEX_PROMPT_MAX_CHARS = 100_000;
+const AUTOMATION_CODEX_STDIN_MAX_BYTES = 1024 * 1024;
+const AUTOMATION_CODEX_OUTPUT_MAX_BYTES = 2 * 1024 * 1024;
+const AUTOMATION_CODEX_TIMEOUT_MAX_MS = 60 * 60 * 1000;
+const AUTOMATION_CODEX_DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
+const AUTOMATION_PROCESS_TERMINATION_GRACE_MS = 250;
+const AUTOMATION_PROCESS_ENV_KEYS = ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"] as const;
+const CLOUDX_HOOK_STDOUT_PREFIX = "__CLOUDX_HOOK_CALL__:";
+function cloudxPythonHookPrelude(hookToken: string): string {
+  const prefix = `${CLOUDX_HOOK_STDOUT_PREFIX}${hookToken}:`;
+  return `
+import json as _cloudx_json
+
+class __CloudxAutomation:
+    def call_hook(self, hook_id, input=None, target_tab_id=None):
+        payload = {"hookId": hook_id, "input": {} if input is None else input}
+        if target_tab_id is not None:
+            payload["targetTabId"] = target_tab_id
+        print(${JSON.stringify(prefix)} + _cloudx_json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
+
+cloudx = __CloudxAutomation()
+
+def call_hook(hook_id, input=None, target_tab_id=None):
+    return cloudx.call_hook(hook_id, input, target_tab_id)
+`;
+}
 
 export class AutomationCancelledError extends Error {
   constructor() {
@@ -130,6 +173,7 @@ class AutomationRuntime {
   private async executeNode(node: AutomationNode): Promise<void> {
     this.guard(node.id);
     const entry = this.requireEntry(node);
+    this.assertSafetyAllowed(entry);
     this.trace("info", `Running ${entry.title}.`, node.id);
     if (entry.kind === "trigger") {
       this.outputs.set(node.id, this.triggerOutputs());
@@ -137,7 +181,6 @@ class AutomationRuntime {
       return;
     }
     if (entry.kind === "function") {
-      this.assertHookSafetyAllowed(entry, node.id);
       const targetTabPort = entry.inputs.find((port) => isPluginTargetTabPort(entry, port));
       const targetTabId = targetTabPort ? optionalString(await this.optionalInputValue(node, targetTabPort.id)) : undefined;
       const input = await this.inputObject(node, entry);
@@ -204,6 +247,152 @@ class AutomationRuntime {
     }
     if (node.typeId === "primitive:sequence") {
       this.outputs.set(node.id, {});
+      await this.executeNext(node, "exec");
+      return;
+    }
+    if (node.typeId === "primitive:sleep") {
+      const durationMs = durationMsValue(await this.inputValue(node, "durationMs"), node, "durationMs", AUTOMATION_SLEEP_MAX_MS);
+      const remainingMs = this.remainingDurationBudgetMs();
+      if (durationMs > remainingMs) {
+        throw new Error(`Node ${node.id} sleep duration ${durationMs} ms exceeds the remaining automation duration budget of ${remainingMs} ms.`);
+      }
+      this.trace("info", `Sleeping for ${durationMs} ms.`, node.id, { durationMs });
+      await sleepForAutomation(durationMs, this.options.signal);
+      this.assertNotCancelled();
+      this.outputs.set(node.id, {});
+      this.trace("info", "Sleep completed.", node.id, { durationMs });
+      await this.executeNext(node, "exec");
+      return;
+    }
+    if (node.typeId === "primitive:python.exec") {
+      const code = textValue(await this.inputValue(node, "code"));
+      if (code.length > AUTOMATION_PYTHON_CODE_MAX_CHARS) {
+        throw new Error(`Node ${node.id} Python code exceeds ${AUTOMATION_PYTHON_CODE_MAX_CHARS} characters.`);
+      }
+      const stdin = textValue(await this.optionalInputValue(node, "stdin"));
+      if (Buffer.byteLength(stdin, "utf8") > AUTOMATION_PYTHON_STDIN_MAX_BYTES) {
+        throw new Error(`Node ${node.id} Python stdin exceeds ${AUTOMATION_PYTHON_STDIN_MAX_BYTES} bytes.`);
+      }
+      const timeoutMs = durationMsValue(await this.optionalInputValue(node, "timeoutMs") ?? AUTOMATION_PYTHON_DEFAULT_TIMEOUT_MS, node, "timeoutMs", AUTOMATION_PYTHON_TIMEOUT_MAX_MS);
+      const remainingMs = this.remainingDurationBudgetMs();
+      if (timeoutMs > remainingMs) {
+        throw new Error(`Node ${node.id} Python timeout ${timeoutMs} ms exceeds the remaining automation duration budget of ${remainingMs} ms.`);
+      }
+      const cwd = await resolveAutomationProcessCwd(await this.optionalInputValue(node, "cwd"), this.options.allowedRoots, "Python");
+      const cloudxHooks = booleanValue(await this.optionalInputValue(node, "cloudxHooks") ?? true, node, "cloudxHooks");
+      const parseJson = booleanValue(await this.optionalInputValue(node, "parseJson") ?? false, node, "parseJson");
+      const hookToken = cloudxHooks ? randomUUID() : "";
+      this.trace("info", "Starting Python process.", node.id, { cwd, timeoutMs, cloudxHooks });
+      const result = await runPythonCode({ code: cloudxHooks ? `${cloudxPythonHookPrelude(hookToken)}\n${code}` : code, stdin, cwd, timeoutMs, signal: this.options.signal });
+      this.assertNotCancelled();
+      const hookExtraction = cloudxHooks ? extractCloudxHookCalls(result.stdout, node, hookToken) : { stdout: result.stdout, calls: [] };
+      const outputs: Record<string, unknown> = { stdout: hookExtraction.stdout, stderr: result.stderr, exitCode: result.exitCode, hookResults: [], hookResultCount: 0 };
+      if (result.exitCode !== 0) {
+        this.outputs.set(node.id, outputs);
+        throw new Error(`Node ${node.id} Python process exited with code ${result.exitCode}.${result.stderr ? ` ${result.stderr.trim()}` : ""}`);
+      }
+      const hookResults = await this.callCloudxHooks(node, hookExtraction.calls);
+      outputs.hookResults = hookResults;
+      outputs.hookResultCount = hookResults.length;
+      if (parseJson) {
+        try {
+          outputs.json = JSON.parse(hookExtraction.stdout) as unknown;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          throw new Error(`Node ${node.id} could not parse Python stdout as JSON: ${message}`);
+        }
+      }
+      this.outputs.set(node.id, outputs);
+      this.trace("info", "Python process completed.", node.id, {
+        exitCode: result.exitCode,
+        stdoutBytes: Buffer.byteLength(hookExtraction.stdout, "utf8"),
+        stderrBytes: Buffer.byteLength(result.stderr, "utf8"),
+        hookResultCount: hookResults.length
+      });
+      await this.executeNext(node, "exec");
+      return;
+    }
+    if (node.typeId === "primitive:bash.exec") {
+      const script = textValue(await this.inputValue(node, "script"));
+      if (script.length > AUTOMATION_BASH_SCRIPT_MAX_CHARS) {
+        throw new Error(`Node ${node.id} bash script exceeds ${AUTOMATION_BASH_SCRIPT_MAX_CHARS} characters.`);
+      }
+      const stdin = textValue(await this.optionalInputValue(node, "stdin"));
+      if (Buffer.byteLength(stdin, "utf8") > AUTOMATION_BASH_STDIN_MAX_BYTES) {
+        throw new Error(`Node ${node.id} bash stdin exceeds ${AUTOMATION_BASH_STDIN_MAX_BYTES} bytes.`);
+      }
+      const timeoutMs = durationMsValue(await this.optionalInputValue(node, "timeoutMs") ?? AUTOMATION_BASH_DEFAULT_TIMEOUT_MS, node, "timeoutMs", AUTOMATION_BASH_TIMEOUT_MAX_MS);
+      const remainingMs = this.remainingDurationBudgetMs();
+      if (timeoutMs > remainingMs) {
+        throw new Error(`Node ${node.id} bash timeout ${timeoutMs} ms exceeds the remaining automation duration budget of ${remainingMs} ms.`);
+      }
+      const cwd = await resolveAutomationProcessCwd(await this.optionalInputValue(node, "cwd"), this.options.allowedRoots, "Bash");
+      const parseJson = booleanValue(await this.optionalInputValue(node, "parseJson") ?? false, node, "parseJson");
+      this.trace("info", "Starting bash process.", node.id, { cwd, timeoutMs });
+      const result = await runBashScript({ script, stdin, cwd, timeoutMs, signal: this.options.signal });
+      this.assertNotCancelled();
+      const outputs: Record<string, unknown> = { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
+      if (result.exitCode !== 0) {
+        this.outputs.set(node.id, outputs);
+        throw new Error(`Node ${node.id} bash process exited with code ${result.exitCode}.${result.stderr ? ` ${result.stderr.trim()}` : ""}`);
+      }
+      if (parseJson) {
+        try {
+          outputs.json = JSON.parse(result.stdout) as unknown;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          throw new Error(`Node ${node.id} could not parse bash stdout as JSON: ${message}`);
+        }
+      }
+      this.outputs.set(node.id, outputs);
+      this.trace("info", "Bash process completed.", node.id, {
+        exitCode: result.exitCode,
+        stdoutBytes: Buffer.byteLength(result.stdout, "utf8"),
+        stderrBytes: Buffer.byteLength(result.stderr, "utf8")
+      });
+      await this.executeNext(node, "exec");
+      return;
+    }
+    if (node.typeId === "primitive:codex.exec") {
+      const prompt = textValue(await this.inputValue(node, "prompt"));
+      if (prompt.length > AUTOMATION_CODEX_PROMPT_MAX_CHARS) {
+        throw new Error(`Node ${node.id} Codex prompt exceeds ${AUTOMATION_CODEX_PROMPT_MAX_CHARS} characters.`);
+      }
+      const stdin = textValue(await this.optionalInputValue(node, "stdin"));
+      if (Buffer.byteLength(stdin, "utf8") > AUTOMATION_CODEX_STDIN_MAX_BYTES) {
+        throw new Error(`Node ${node.id} Codex stdin exceeds ${AUTOMATION_CODEX_STDIN_MAX_BYTES} bytes.`);
+      }
+      const timeoutMs = durationMsValue(await this.optionalInputValue(node, "timeoutMs") ?? AUTOMATION_CODEX_DEFAULT_TIMEOUT_MS, node, "timeoutMs", AUTOMATION_CODEX_TIMEOUT_MAX_MS);
+      const remainingMs = this.remainingDurationBudgetMs();
+      if (timeoutMs > remainingMs) {
+        throw new Error(`Node ${node.id} Codex timeout ${timeoutMs} ms exceeds the remaining automation duration budget of ${remainingMs} ms.`);
+      }
+      const cwd = await resolveAutomationProcessCwd(await this.optionalInputValue(node, "cwd"), this.options.allowedRoots, "Codex");
+      const profile = optionalString(await this.optionalInputValue(node, "profile"));
+      const model = optionalString(await this.optionalInputValue(node, "model"));
+      const sandbox = enumInputValue(await this.optionalInputValue(node, "sandbox") ?? "read-only", ["read-only", "workspace-write", "danger-full-access"], node, "sandbox");
+      const approvalPolicy = enumInputValue(await this.optionalInputValue(node, "approvalPolicy") ?? "never", ["untrusted", "on-request", "never"], node, "approvalPolicy");
+      const ephemeral = booleanValue(await this.optionalInputValue(node, "ephemeral") ?? true, node, "ephemeral");
+      const json = booleanValue(await this.optionalInputValue(node, "json") ?? false, node, "json");
+      const skipGitRepoCheck = booleanValue(await this.optionalInputValue(node, "skipGitRepoCheck") ?? false, node, "skipGitRepoCheck");
+      this.trace("info", "Starting Codex exec process.", node.id, { cwd, timeoutMs, sandbox, approvalPolicy, json });
+      const result = await runCodexExec({ prompt, stdin, cwd, timeoutMs, profile, model, sandbox, approvalPolicy, ephemeral, json, skipGitRepoCheck, signal: this.options.signal });
+      this.assertNotCancelled();
+      const jsonEvents = json ? parseCodexJsonLines(result.stdout, node) : undefined;
+      const finalMessage = jsonEvents ? finalMessageFromCodexEvents(jsonEvents) : result.stdout.trimEnd();
+      const outputs: Record<string, unknown> = { finalMessage, stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
+      if (jsonEvents) {
+        outputs.jsonEvents = jsonEvents;
+      }
+      this.outputs.set(node.id, outputs);
+      if (result.exitCode !== 0) {
+        throw new Error(`Node ${node.id} Codex exec exited with code ${result.exitCode}.${result.stderr ? ` ${result.stderr.trim()}` : ""}`);
+      }
+      this.trace("info", "Codex exec process completed.", node.id, {
+        exitCode: result.exitCode,
+        stdoutBytes: Buffer.byteLength(result.stdout, "utf8"),
+        stderrBytes: Buffer.byteLength(result.stderr, "utf8")
+      });
       await this.executeNext(node, "exec");
       return;
     }
@@ -356,6 +545,15 @@ class AutomationRuntime {
     if (node.typeId === "primitive:string.uppercase") {
       return textValue(await this.inputValue(node, "text")).toUpperCase();
     }
+    if (node.typeId === "primitive:string.compare") {
+      return compareStrings(
+        textValue(await this.inputValue(node, "left")),
+        textValue(await this.inputValue(node, "right")),
+        textValue(await this.inputValue(node, "operator")),
+        booleanValue(await this.optionalInputValue(node, "caseSensitive") ?? true, node, "caseSensitive"),
+        node
+      );
+    }
     if (node.typeId === "primitive:math.add") {
       return numberValue(await this.inputValue(node, "left"), node, "left") + numberValue(await this.inputValue(node, "right"), node, "right");
     }
@@ -399,6 +597,18 @@ class AutomationRuntime {
     }
     if (node.typeId === "primitive:math.ceil") {
       return Math.ceil(numberValue(await this.inputValue(node, "value"), node, "value"));
+    }
+    if (node.typeId === "primitive:number.compare") {
+      return compareNumbers(numberValue(await this.inputValue(node, "left"), node, "left"), numberValue(await this.inputValue(node, "right"), node, "right"), textValue(await this.inputValue(node, "operator")), node);
+    }
+    if (node.typeId === "primitive:number.range") {
+      return numberInRange(
+        numberValue(await this.inputValue(node, "value"), node, "value"),
+        numberValue(await this.inputValue(node, "min"), node, "min"),
+        numberValue(await this.inputValue(node, "max"), node, "max"),
+        textValue(await this.inputValue(node, "mode")),
+        node
+      );
     }
     if (node.typeId === "converter:string.toNumber") {
       const value = Number(await this.inputValue(node, "value"));
@@ -473,6 +683,34 @@ class AutomationRuntime {
     return { ...this.event.payload, payload: this.event.payload };
   }
 
+  private async callCloudxHooks(node: AutomationNode, calls: CloudxHookCallRequest[]): Promise<Record<string, unknown>[]> {
+    const results: Record<string, unknown>[] = [];
+    for (const call of calls) {
+      this.assertNotCancelled();
+      const entry = this.requireHookCatalogEntry(call.hookId);
+      this.assertSafetyAllowed(entry);
+      this.trace("info", `Calling CloudX hook ${call.hookId}.`, node.id, { hookId: call.hookId });
+      const result = await this.hooks.call(call.hookId, call.input, {
+        caller: { kind: "automation", pluginId: "automation", automationGroupId: this.group.id },
+        targetTabId: call.targetTabId,
+        activeTabId: this.options.activeTabId,
+        signal: this.options.signal
+      });
+      this.assertNotCancelled();
+      await this.options.effectSink?.applyHookResult(result);
+      results.push(result);
+    }
+    return results;
+  }
+
+  private requireHookCatalogEntry(hookId: string): AutomationNodeCatalogEntry {
+    const entry = this.catalogByType.get(`hook:${hookId}`);
+    if (!entry || entry.kind !== "function") {
+      throw new Error(`Hook ${hookId} is not available in the automation catalog.`);
+    }
+    return entry;
+  }
+
   private entry(node: AutomationNode): AutomationNodeCatalogEntry | undefined {
     const entry = this.catalogByType.get(node.typeId);
     return entry ? automationEntryWithDynamicPorts(entry, node.config) : undefined;
@@ -486,7 +724,7 @@ class AutomationRuntime {
     return entry;
   }
 
-  private assertHookSafetyAllowed(entry: AutomationNodeCatalogEntry, _nodeId: string): void {
+  private assertSafetyAllowed(entry: AutomationNodeCatalogEntry): void {
     if (automationSafetyAllowed(entry.safety, this.group.graph.allowedSafety)) {
       return;
     }
@@ -503,6 +741,10 @@ class AutomationRuntime {
     if (Date.now() - this.startedAt > (this.options.maxDurationMs ?? 5 * 60 * 1000)) {
       throw new Error(`Automation duration limit exceeded near node ${nodeId}.`);
     }
+  }
+
+  private remainingDurationBudgetMs(): number {
+    return Math.max(0, (this.options.maxDurationMs ?? 5 * 60 * 1000) - (Date.now() - this.startedAt));
   }
 
   private assertNotCancelled(): void {
@@ -568,6 +810,17 @@ function numberValue(value: unknown, node: AutomationNode, key: string): number 
   return number;
 }
 
+function durationMsValue(value: unknown, node: AutomationNode, key: string, max: number): number {
+  const number = integerValue(value, node, key);
+  if (number < 0) {
+    throw new Error(`Node ${node.id} requires ${key} to be non-negative.`);
+  }
+  if (number > max) {
+    throw new Error(`Node ${node.id} requires ${key} to be no greater than ${max} ms.`);
+  }
+  return number;
+}
+
 function booleanValue(value: unknown, node: AutomationNode, key: string): boolean {
   if (typeof value !== "boolean") {
     throw new Error(`Node ${node.id} requires ${key} to be a boolean.`);
@@ -575,8 +828,99 @@ function booleanValue(value: unknown, node: AutomationNode, key: string): boolea
   return value;
 }
 
+function enumInputValue<T extends string>(value: unknown, allowed: readonly T[], node: AutomationNode, key: string): T {
+  if (typeof value !== "string" || !allowed.includes(value as T)) {
+    throw new Error(`Node ${node.id} requires ${key} to be one of: ${allowed.join(", ")}.`);
+  }
+  return value as T;
+}
+
+function compareStrings(left: string, right: string, operator: string, caseSensitive: boolean, node: AutomationNode): boolean {
+  const actualLeft = caseSensitive ? left : left.toLocaleLowerCase();
+  const actualRight = caseSensitive ? right : right.toLocaleLowerCase();
+  if (operator === "equals") {
+    return actualLeft === actualRight;
+  }
+  if (operator === "notEquals") {
+    return actualLeft !== actualRight;
+  }
+  if (operator === "contains") {
+    return actualLeft.includes(actualRight);
+  }
+  if (operator === "startsWith") {
+    return actualLeft.startsWith(actualRight);
+  }
+  if (operator === "endsWith") {
+    return actualLeft.endsWith(actualRight);
+  }
+  throw new Error(`Node ${node.id} has unsupported string comparison operator: ${operator}.`);
+}
+
+function compareNumbers(left: number, right: number, operator: string, node: AutomationNode): boolean {
+  if (operator === "equals") {
+    return left === right;
+  }
+  if (operator === "notEquals") {
+    return left !== right;
+  }
+  if (operator === "lessThan") {
+    return left < right;
+  }
+  if (operator === "lessThanOrEqual") {
+    return left <= right;
+  }
+  if (operator === "greaterThan") {
+    return left > right;
+  }
+  if (operator === "greaterThanOrEqual") {
+    return left >= right;
+  }
+  throw new Error(`Node ${node.id} has unsupported number comparison operator: ${operator}.`);
+}
+
+function numberInRange(value: number, min: number, max: number, mode: string, node: AutomationNode): boolean {
+  if (min > max) {
+    throw new Error(`Node ${node.id} requires min to be less than or equal to max.`);
+  }
+  const inclusive = value >= min && value <= max;
+  const exclusive = value > min && value < max;
+  if (mode === "inclusive") {
+    return inclusive;
+  }
+  if (mode === "exclusive") {
+    return exclusive;
+  }
+  if (mode === "outsideInclusive") {
+    return !inclusive;
+  }
+  if (mode === "outsideExclusive") {
+    return !exclusive;
+  }
+  throw new Error(`Node ${node.id} has unsupported range mode: ${mode}.`);
+}
+
 function textValue(value: unknown): string {
   return value === undefined || value === null ? "" : String(value);
+}
+
+function sleepForAutomation(durationMs: number, signal: AbortSignal | undefined): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(new AutomationCancelledError());
+  }
+  return new Promise((resolve, reject) => {
+    const cleanup = () => signal?.removeEventListener("abort", abort);
+    const timeout = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, durationMs);
+    const abort = () => {
+      clearTimeout(timeout);
+      cleanup();
+      reject(new AutomationCancelledError());
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    timeout.unref?.();
+  });
 }
 
 function automationRegExp(patternValue: unknown, flagsValue: unknown, node: AutomationNode): RegExp {
@@ -829,4 +1173,494 @@ function trimData(data: Record<string, unknown> | undefined): Record<string, unk
     return data;
   }
   return { truncated: true };
+}
+
+interface PythonRunInput {
+  code: string;
+  stdin: string;
+  cwd: string;
+  timeoutMs: number;
+  signal?: AbortSignal;
+}
+
+interface BashRunInput {
+  script: string;
+  stdin: string;
+  cwd: string;
+  timeoutMs: number;
+  signal?: AbortSignal;
+}
+
+interface ProcessRunInput {
+  command: string;
+  args: string[];
+  cwd: string;
+  stdin: string;
+  timeoutMs: number;
+  processName: string;
+  outputMaxBytes: number;
+  signal?: AbortSignal;
+}
+
+interface ProcessRunResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+}
+
+type PythonRunResult = ProcessRunResult;
+type BashRunResult = ProcessRunResult;
+
+interface CloudxHookCallRequest {
+  hookId: string;
+  input: Record<string, unknown>;
+  targetTabId?: string;
+}
+
+interface CodexExecInput {
+  prompt: string;
+  stdin: string;
+  cwd: string;
+  timeoutMs: number;
+  profile?: string;
+  model?: string;
+  sandbox: "read-only" | "workspace-write" | "danger-full-access";
+  approvalPolicy: "untrusted" | "on-request" | "never";
+  ephemeral: boolean;
+  json: boolean;
+  skipGitRepoCheck: boolean;
+  signal?: AbortSignal;
+}
+
+interface CodexExecResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+}
+
+async function resolveAutomationProcessCwd(cwdValue: unknown, allowedRoots: string[] | undefined, processName: string): Promise<string> {
+  const roots = allowedRoots?.length ? allowedRoots : [process.cwd()];
+  const rootRealPaths = await Promise.all(roots.map((root) => realpathOrResolved(root)));
+  const base = rootRealPaths[0];
+  if (!base) {
+    throw new Error(`Automation ${processName} execution requires at least one allowed root.`);
+  }
+  const cwdText = optionalString(cwdValue);
+  const resolved = cwdText ? (path.isAbsolute(cwdText) ? path.resolve(cwdText) : path.resolve(base, cwdText)) : base;
+  const real = await fs.realpath(resolved).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") {
+      throw new Error(`${processName} working directory does not exist: ${resolved}`);
+    }
+    throw error;
+  });
+  if (!rootRealPaths.some((root) => isSameOrChildPath(root, real))) {
+    throw new Error(`${processName} working directory is outside configured Cloudx roots: ${cwdText ?? resolved}`);
+  }
+  return real;
+}
+
+async function realpathOrResolved(candidate: string): Promise<string> {
+  const resolved = path.resolve(candidate);
+  return fs.realpath(resolved).catch(() => resolved);
+}
+
+function runPythonCode(input: PythonRunInput): Promise<PythonRunResult> {
+  return runBoundedProcess({
+    command: "python3",
+    args: ["-c", input.code],
+    cwd: input.cwd,
+    stdin: input.stdin,
+    timeoutMs: input.timeoutMs,
+    processName: "Python",
+    outputMaxBytes: AUTOMATION_PYTHON_OUTPUT_MAX_BYTES,
+    signal: input.signal
+  });
+}
+
+function runBashScript(input: BashRunInput): Promise<BashRunResult> {
+  return runBoundedProcess({
+    command: "bash",
+    args: ["--noprofile", "--norc", "-e", "-u", "-o", "pipefail", "-c", input.script],
+    cwd: input.cwd,
+    stdin: input.stdin,
+    timeoutMs: input.timeoutMs,
+    processName: "Bash",
+    outputMaxBytes: AUTOMATION_BASH_OUTPUT_MAX_BYTES,
+    signal: input.signal
+  });
+}
+
+function runBoundedProcess(input: ProcessRunInput): Promise<ProcessRunResult> {
+  if (input.signal?.aborted) {
+    return Promise.reject(new AutomationCancelledError());
+  }
+  return new Promise((resolve, reject) => {
+    const child = spawn(input.command, input.args, {
+      cwd: input.cwd,
+      detached: process.platform !== "win32",
+      env: automationProcessEnv(process.env),
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    let killTimeout: ReturnType<typeof setTimeout> | undefined;
+    const terminate = (signal: NodeJS.Signals) => {
+      stopChildProcess(child, signal);
+      if (signal === "SIGTERM" && !killTimeout) {
+        killTimeout = setTimeout(() => stopChildProcess(child, "SIGKILL"), AUTOMATION_PROCESS_TERMINATION_GRACE_MS);
+        killTimeout.unref();
+      }
+    };
+    const childStdout = child.stdout;
+    const childStderr = child.stderr;
+    const childStdin = child.stdin;
+    if (!childStdout || !childStderr || !childStdin) {
+      terminate("SIGTERM");
+      reject(new Error(`${input.processName} process did not expose piped stdio streams.`));
+      return;
+    }
+
+    let stdout = "";
+    let stderr = "";
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let stoppingError: Error | undefined;
+    let cancelled = false;
+    let settled = false;
+
+    const cleanup = () => {
+      clearTimeout(timeout);
+      if (killTimeout) {
+        clearTimeout(killTimeout);
+      }
+      input.signal?.removeEventListener("abort", abort);
+    };
+    const settleReject = (error: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const stopWithError = (error: Error) => {
+      if (!stoppingError) {
+        stoppingError = error;
+      }
+      terminate("SIGTERM");
+    };
+    const abort = () => {
+      cancelled = true;
+      terminate("SIGTERM");
+    };
+    const timeout = setTimeout(() => {
+      stopWithError(new Error(`${input.processName} process timed out after ${input.timeoutMs} ms.`));
+    }, input.timeoutMs);
+    timeout.unref();
+    input.signal?.addEventListener("abort", abort, { once: true });
+
+    const appendOutput = (streamName: "stdout" | "stderr", chunk: string) => {
+      if (stoppingError || cancelled) {
+        return;
+      }
+      const chunkBytes = Buffer.byteLength(chunk, "utf8");
+      if (streamName === "stdout") {
+        stdoutBytes += chunkBytes;
+        if (stdoutBytes > input.outputMaxBytes) {
+          stopWithError(new Error(`${input.processName} stdout exceeded the ${input.outputMaxBytes} byte output limit.`));
+          return;
+        }
+        stdout += chunk;
+        return;
+      }
+      stderrBytes += chunkBytes;
+      if (stderrBytes > input.outputMaxBytes) {
+        stopWithError(new Error(`${input.processName} stderr exceeded the ${input.outputMaxBytes} byte output limit.`));
+        return;
+      }
+      stderr += chunk;
+    };
+
+    childStdout.setEncoding("utf8");
+    childStderr.setEncoding("utf8");
+    childStdout.on("data", (chunk) => appendOutput("stdout", chunk));
+    childStderr.on("data", (chunk) => appendOutput("stderr", chunk));
+    childStdout.on("error", (error) => stopWithError(error));
+    childStderr.on("error", (error) => stopWithError(error));
+    childStdin.on("error", (error) => {
+      if (!stoppingError && !cancelled) {
+        stopWithError(error);
+      }
+    });
+    child.on("error", (error) => {
+      settleReject(error);
+    });
+    child.on("close", (code) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      if (cancelled) {
+        reject(new AutomationCancelledError());
+        return;
+      }
+      if (stoppingError) {
+        reject(stoppingError);
+        return;
+      }
+      resolve({ stdout, stderr, exitCode: code ?? 1 });
+    });
+    childStdin.end(input.stdin);
+  });
+}
+
+function extractCloudxHookCalls(stdout: string, node: AutomationNode, hookToken: string): { stdout: string; calls: CloudxHookCallRequest[] } {
+  const hookPrefix = `${CLOUDX_HOOK_STDOUT_PREFIX}${hookToken}:`;
+  const visibleChunks: string[] = [];
+  const calls: CloudxHookCallRequest[] = [];
+  for (const chunk of stdout.match(/[^\n]*(?:\n|$)/g) ?? []) {
+    if (!chunk) {
+      continue;
+    }
+    const line = chunk.endsWith("\n") ? chunk.slice(0, -1).replace(/\r$/, "") : chunk;
+    if (!line.startsWith(hookPrefix)) {
+      visibleChunks.push(chunk);
+      continue;
+    }
+    const payloadText = line.slice(hookPrefix.length);
+    let payload: unknown;
+    try {
+      payload = JSON.parse(payloadText) as unknown;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Node ${node.id} emitted an invalid CloudX hook request: ${message}`);
+    }
+    calls.push(cloudxHookCallRequest(payload, node));
+  }
+  return { stdout: visibleChunks.join(""), calls };
+}
+
+function cloudxHookCallRequest(payload: unknown, node: AutomationNode): CloudxHookCallRequest {
+  if (!isPlainObject(payload)) {
+    throw new Error(`Node ${node.id} emitted a CloudX hook request that is not an object.`);
+  }
+  const hookId = payload.hookId;
+  if (typeof hookId !== "string" || !hookId.trim()) {
+    throw new Error(`Node ${node.id} emitted a CloudX hook request without a hookId.`);
+  }
+  const input = payload.input;
+  if (input !== undefined && !isPlainObject(input)) {
+    throw new Error(`Node ${node.id} emitted a CloudX hook request whose input is not an object.`);
+  }
+  const targetTabId = payload.targetTabId;
+  if (targetTabId !== undefined && (typeof targetTabId !== "string" || !targetTabId.trim())) {
+    throw new Error(`Node ${node.id} emitted a CloudX hook request with an invalid targetTabId.`);
+  }
+  return { hookId: hookId.trim(), input: input ?? {}, targetTabId: typeof targetTabId === "string" ? targetTabId.trim() : undefined };
+}
+
+function automationProcessEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of AUTOMATION_PROCESS_ENV_KEYS) {
+    const value = source[key];
+    if (typeof value === "string") {
+      env[key] = value;
+    }
+  }
+  return env;
+}
+
+function stopChildProcess(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (!child.pid) {
+    child.kill(signal);
+    return;
+  }
+  if (process.platform !== "win32") {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+        child.kill(signal);
+      }
+      return;
+    }
+  }
+  child.kill(signal);
+}
+
+function runCodexExec(input: CodexExecInput): Promise<CodexExecResult> {
+  const args = [
+    "exec",
+    "--cd",
+    input.cwd,
+    "--sandbox",
+    input.sandbox,
+    "--ask-for-approval",
+    input.approvalPolicy
+  ];
+  if (input.ephemeral) {
+    args.push("--ephemeral");
+  }
+  if (input.profile) {
+    args.push("--profile", input.profile);
+  }
+  if (input.model) {
+    args.push("--model", input.model);
+  }
+  if (input.json) {
+    args.push("--json");
+  }
+  if (input.skipGitRepoCheck) {
+    args.push("--skip-git-repo-check");
+  }
+  args.push(input.prompt);
+  return runCodexProcess({
+    command: resolveAssistantCommand(process.env, "codex"),
+    args,
+    cwd: input.cwd,
+    stdin: input.stdin,
+    timeoutMs: input.timeoutMs,
+    signal: input.signal
+  });
+}
+
+function runCodexProcess(input: { command: string; args: string[]; cwd: string; stdin: string; timeoutMs: number; signal?: AbortSignal }): Promise<CodexExecResult> {
+  if (input.signal?.aborted) {
+    return Promise.reject(new AutomationCancelledError());
+  }
+  return new Promise((resolve, reject) => {
+    const child = spawn(input.command, input.args, {
+      cwd: input.cwd,
+      detached: process.platform !== "win32",
+      env: buildToolEnv(process.env),
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    let killTimeout: ReturnType<typeof setTimeout> | undefined;
+    const terminate = (signal: NodeJS.Signals) => {
+      stopChildProcess(child, signal);
+      if (signal === "SIGTERM" && !killTimeout) {
+        killTimeout = setTimeout(() => stopChildProcess(child, "SIGKILL"), AUTOMATION_PROCESS_TERMINATION_GRACE_MS);
+        killTimeout.unref();
+      }
+    };
+    const childStdout = child.stdout;
+    const childStderr = child.stderr;
+    const childStdin = child.stdin;
+    if (!childStdout || !childStderr || !childStdin) {
+      terminate("SIGTERM");
+      reject(new Error("Codex exec process did not expose piped stdio streams."));
+      return;
+    }
+
+    let stdout = "";
+    let stderr = "";
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let stoppingError: Error | undefined;
+    let cancelled = false;
+    let settled = false;
+
+    const cleanup = () => {
+      clearTimeout(timeout);
+      if (killTimeout) {
+        clearTimeout(killTimeout);
+      }
+      input.signal?.removeEventListener("abort", abort);
+    };
+    const settleReject = (error: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const stopWithError = (error: Error) => {
+      if (!stoppingError) {
+        stoppingError = error;
+      }
+      terminate("SIGTERM");
+    };
+    const abort = () => {
+      cancelled = true;
+      terminate("SIGTERM");
+    };
+    const timeout = setTimeout(() => {
+      stopWithError(new Error(`Codex exec process timed out after ${input.timeoutMs} ms.`));
+    }, input.timeoutMs);
+    timeout.unref();
+    input.signal?.addEventListener("abort", abort, { once: true });
+
+    const appendOutput = (streamName: "stdout" | "stderr", chunk: string) => {
+      if (stoppingError || cancelled) {
+        return;
+      }
+      const bytes = Buffer.byteLength(chunk, "utf8");
+      if (streamName === "stdout") {
+        stdoutBytes += bytes;
+        if (stdoutBytes > AUTOMATION_CODEX_OUTPUT_MAX_BYTES) {
+          stopWithError(new Error(`Codex exec stdout exceeded ${AUTOMATION_CODEX_OUTPUT_MAX_BYTES} bytes.`));
+          return;
+        }
+        stdout += chunk;
+        return;
+      }
+      stderrBytes += bytes;
+      if (stderrBytes > AUTOMATION_CODEX_OUTPUT_MAX_BYTES) {
+        stopWithError(new Error(`Codex exec stderr exceeded ${AUTOMATION_CODEX_OUTPUT_MAX_BYTES} bytes.`));
+        return;
+      }
+      stderr += chunk;
+    };
+
+    child.once("error", (error) => settleReject(error));
+    child.once("close", (code, signal) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      if (cancelled) {
+        reject(new AutomationCancelledError());
+        return;
+      }
+      if (stoppingError) {
+        reject(stoppingError);
+        return;
+      }
+      resolve({ stdout, stderr, exitCode: typeof code === "number" ? code : signal ? 128 : 1 });
+    });
+    childStdout.setEncoding("utf8");
+    childStderr.setEncoding("utf8");
+    childStdout.on("data", (chunk: string) => appendOutput("stdout", chunk));
+    childStderr.on("data", (chunk: string) => appendOutput("stderr", chunk));
+    childStdin.end(input.stdin);
+  });
+}
+
+function parseCodexJsonLines(stdout: string, node: AutomationNode): Record<string, unknown>[] {
+  const events: Record<string, unknown>[] = [];
+  for (const line of stdout.split(/\r?\n/u)) {
+    if (!line.trim()) {
+      continue;
+    }
+    const parsed = JSON.parse(line) as unknown;
+    if (!isPlainObject(parsed)) {
+      throw new Error(`Node ${node.id} Codex JSONL output contained a non-object event.`);
+    }
+    events.push(parsed);
+  }
+  return events;
+}
+
+function finalMessageFromCodexEvents(events: Record<string, unknown>[]): string {
+  for (const event of [...events].reverse()) {
+    if (event.type !== "item.completed" || !isPlainObject(event.item)) {
+      continue;
+    }
+    if (event.item.type === "agent_message" && typeof event.item.text === "string") {
+      return event.item.text;
+    }
+  }
+  return "";
 }
