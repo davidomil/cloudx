@@ -2,11 +2,21 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { WorkspaceTab } from "@cloudx/shared";
 
-import { TabContextService } from "./TabContextService.js";
+import { appendTextFileNoFollow, readTextFileNoFollow, requireRegularFile, requireSafeDirectory, writeNewTextFileNoFollow, writeTextFileAtomic } from "../jsonStateFile.js";
+import { TabContextService, type TabContextFileOperations } from "./TabContextService.js";
+
+const fileOperations: TabContextFileOperations = {
+  appendTextFileNoFollow,
+  readTextFileNoFollow,
+  requireRegularFile,
+  requireSafeDirectory,
+  writeNewTextFileNoFollow,
+  writeTextFileAtomic
+};
 
 describe("TabContextService", () => {
   it("creates context files and records sanitized events", async () => {
@@ -73,6 +83,35 @@ describe("TabContextService", () => {
     expect(text).not.toContain("\uFFFD");
   });
 
+  it("lets tabs start without context history when the disk is full", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-tab-context-create-enospc-"));
+    const service = new TabContextService(path.join(root, ".cloudx"), {
+      ...fileOperations,
+      writeNewTextFileNoFollow: vi.fn(async () => {
+        throw capacityError();
+      })
+    });
+
+    await expect(service.create(tabFixture(root))).resolves.toBeUndefined();
+  });
+
+  it("drops context history writes instead of crashing when the disk is full", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-tab-context-record-enospc-"));
+    const dataDir = path.join(root, ".cloudx");
+    const initialService = new TabContextService(dataDir);
+    const tab = tabFixture(root);
+    tab.contextPath = await initialService.create(tab);
+    const service = new TabContextService(dataDir, {
+      ...fileOperations,
+      appendTextFileNoFollow: vi.fn(async () => {
+        throw capacityError();
+      })
+    });
+
+    await expect(service.record(tab, "terminal-output", "still running")).resolves.toBeUndefined();
+    await expect(initialService.read(tab)).resolves.not.toContain("still running");
+  });
+
   it("serializes concurrent records to the same context file", async () => {
     const { service, tab } = await createContext();
 
@@ -130,7 +169,8 @@ describe("TabContextService", () => {
     const tab = tabFixture(root, "../outside");
     const contextPath = await service.create(tab);
 
-    expect(path.dirname(contextPath)).toBe(path.join(root, ".cloudx", "context"));
+    expect(contextPath).toBeDefined();
+    expect(path.dirname(contextPath!)).toBe(path.join(root, ".cloudx", "context"));
     await expect(fs.access(path.join(root, ".cloudx", "outside.md"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
@@ -154,4 +194,8 @@ function tabFixture(root: string, id = "tab-1"): WorkspaceTab {
     createdAt: new Date(0).toISOString(),
     updatedAt: new Date(0).toISOString()
   };
+}
+
+function capacityError(): Error & { code: string } {
+  return Object.assign(new Error("no space left on device"), { code: "ENOSPC" });
 }
