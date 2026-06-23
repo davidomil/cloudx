@@ -15,6 +15,7 @@ import {
   QUARTO_DEB_PATH,
   QUARTO_DEB_URL,
   QUARTO_VERSION,
+  SERVER_RUNTIME_SCHEMA_FILES,
   WHISPER_CPP_MODEL,
   WHISPER_CPP_REPO_URL,
   WHISPER_CPP_VAD_MODEL,
@@ -22,6 +23,7 @@ import {
   cloudxAccessUrls,
   defaultCpuThreads,
   ensureSupportedGit,
+  installServerRuntimeSchemas,
   installUbuntuPrerequisites,
   parseNvidiaGpuInfo,
   needsGitUpgrade,
@@ -51,6 +53,14 @@ import {
 
 const TEST_ENV = { PATH: "/usr/bin" };
 
+function runtimeSchemaDistPaths(root) {
+  return SERVER_RUNTIME_SCHEMA_FILES.map((relativePath) => path.join(root, "apps/server/dist", relativePath));
+}
+
+function expectRuntimeSchemaWrites(runner, root) {
+  expect(runner.writes.map((write) => write.path)).toEqual(expect.arrayContaining(runtimeSchemaDistPaths(root)));
+}
+
 describe("install-cloudx helpers", () => {
   it("parses and advertises verbose installer diagnostics", () => {
     expect(parseArgs(["--dry-run", "--update", "--verbose"])).toMatchObject({
@@ -77,6 +87,26 @@ describe("install-cloudx helpers", () => {
     expect(needsQuartoInstall(QUARTO_VERSION)).toBe(false);
     expect(needsQuartoInstall("1.8.25")).toBe(true);
     expect(() => assertQuartoArchitecture("arm64")).toThrow(/linux-amd64/);
+  });
+
+  it("copies server runtime schemas into dist after the TypeScript build", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-install-schemas-"));
+    const runner = new InstallerRunner({ cwd: root, log: () => undefined });
+    try {
+      for (const relativePath of SERVER_RUNTIME_SCHEMA_FILES) {
+        const sourcePath = path.join(root, "apps/server/src", relativePath);
+        fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+        fs.writeFileSync(sourcePath, `{"schema":"${relativePath}"}`);
+      }
+
+      installServerRuntimeSchemas(runner, { repoRoot: root });
+
+      for (const relativePath of SERVER_RUNTIME_SCHEMA_FILES) {
+        expect(fs.readFileSync(path.join(root, "apps/server/dist", relativePath), "utf8")).toBe(`{"schema":"${relativePath}"}`);
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("builds the Ubuntu bootstrap command plan", () => {
@@ -405,6 +435,7 @@ describe("runInstaller dry-run", () => {
     );
     const env = runner.writes.find((write) => write.path === "/home/me/.config/cloudx/cloudx.env")?.contents;
     expect(env).toContain("CLOUDX_DOCUMENTATION_URL=http://127.0.0.1:7820");
+    expectRuntimeSchemaWrites(runner, "/repo");
   });
 
   it("plans an auto-detected NVIDIA T400 install with CUDA ASR libraries", async () => {
@@ -774,6 +805,7 @@ describe("runInstaller dry-run", () => {
     expect(updatedEnv).not.toContain("CLOUDX_DOCUMENTATION_URL=http://127.0.0.1:7820");
     expect(updatedEnv).toContain(`CLOUDX_DOCUMENTATION_DATA_DIR=${path.join(root, ".cloudx/documentation")}`);
     expect(updatedEnv).not.toContain("CLOUDX_CODEX_BIN");
+    expectRuntimeSchemaWrites(runner, root);
     expect(planned).toEqual(
       expect.arrayContaining([
         ["node", "-v"],

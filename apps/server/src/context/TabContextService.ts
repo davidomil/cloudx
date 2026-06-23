@@ -6,6 +6,7 @@ import type { WorkspaceTab } from "@cloudx/shared";
 
 import { appendTextFileNoFollow, readTextFileNoFollow, requireRegularFile, requireSafeDirectory, writeNewTextFileNoFollow, writeTextFileAtomic } from "../jsonStateFile.js";
 import { isDirectChildPath } from "../pathBoundary.js";
+import { isCapacityStateWriteError } from "../statePersistence.js";
 
 const MAX_CONTEXT_BYTES = 64_000;
 const MAX_CONTEXT_ENTRY_BYTES = 12_000;
@@ -30,36 +31,56 @@ const SENSITIVE_URL_PARAM_NAMES = new Set([
   "token"
 ]);
 
+export interface TabContextFileOperations {
+  appendTextFileNoFollow: typeof appendTextFileNoFollow;
+  readTextFileNoFollow: typeof readTextFileNoFollow;
+  requireRegularFile: typeof requireRegularFile;
+  requireSafeDirectory: typeof requireSafeDirectory;
+  writeNewTextFileNoFollow: typeof writeNewTextFileNoFollow;
+  writeTextFileAtomic: typeof writeTextFileAtomic;
+}
+
+const defaultFileOperations: TabContextFileOperations = {
+  appendTextFileNoFollow,
+  readTextFileNoFollow,
+  requireRegularFile,
+  requireSafeDirectory,
+  writeNewTextFileNoFollow,
+  writeTextFileAtomic
+};
+
 export class TabContextService {
   private readonly dataRoot: string;
   private readonly contextDir: string;
   private readonly writeQueues = new Map<string, Promise<void>>();
 
-  constructor(dataDir: string) {
+  constructor(dataDir: string, private readonly files: TabContextFileOperations = defaultFileOperations) {
     this.dataRoot = path.resolve(dataDir);
     this.contextDir = path.join(this.dataRoot, "context");
   }
 
-  async create(tab: Pick<WorkspaceTab, "id" | "pluginId" | "title" | "cwd" | "status">): Promise<string> {
+  async create(tab: Pick<WorkspaceTab, "id" | "pluginId" | "title" | "cwd" | "status">): Promise<string | undefined> {
     const contextPath = path.join(this.contextDir, `${tabContextFileStem(tab.id)}.md`);
-    await writeNewTextFileNoFollow(
-      this.dataRoot,
-      contextPath,
-      [
-        "# Cloudx Tab Context",
-        "",
-        `- tabId: ${tab.id}`,
-        `- plugin: ${tab.pluginId}`,
-        `- title: ${tab.title}`,
-        `- cwd: ${tab.cwd}`,
-        `- status: ${tab.status}`,
-        "",
-        "## Events",
-        ""
-      ].join("\n"),
-      "Tab context file"
-    );
-    return contextPath;
+    return this.ignoreCapacityError(async () => {
+      await this.files.writeNewTextFileNoFollow(
+        this.dataRoot,
+        contextPath,
+        [
+          "# Cloudx Tab Context",
+          "",
+          `- tabId: ${tab.id}`,
+          `- plugin: ${tab.pluginId}`,
+          `- title: ${tab.title}`,
+          `- cwd: ${tab.cwd}`,
+          `- status: ${tab.status}`,
+          "",
+          "## Events",
+          ""
+        ].join("\n"),
+        "Tab context file"
+      );
+      return contextPath;
+    });
   }
 
   async record(tab: WorkspaceTab, kind: string, payload: string): Promise<void> {
@@ -72,10 +93,10 @@ export class TabContextService {
       return;
     }
     const entry = [`### ${new Date().toISOString()} ${kind}`, "", "```text", sanitized, "```", ""].join("\n");
-    await this.enqueue(contextPath, async () => {
-      await appendTextFileNoFollow(contextPath, entry, "Tab context file");
+    await this.ignoreCapacityError(() => this.enqueue(contextPath, async () => {
+      await this.files.appendTextFileNoFollow(contextPath, entry, "Tab context file");
       await this.truncate(contextPath);
-    });
+    }));
   }
 
   async read(tab: WorkspaceTab): Promise<string> {
@@ -84,7 +105,7 @@ export class TabContextService {
       return "";
     }
     await this.writeQueues.get(contextPath);
-    return readTextFileNoFollow(contextPath, "Tab context file").catch((error) => {
+    return this.files.readTextFileNoFollow(contextPath, "Tab context file").catch((error) => {
       if (isNotFound(error)) {
         return "";
       }
@@ -93,7 +114,7 @@ export class TabContextService {
   }
 
   private async truncate(contextPath: string): Promise<void> {
-    const content = await readTextFileNoFollow(contextPath, "Tab context file").catch((error) => {
+    const content = await this.files.readTextFileNoFollow(contextPath, "Tab context file").catch((error) => {
       if (isNotFound(error)) {
         return undefined;
       }
@@ -103,7 +124,7 @@ export class TabContextService {
       return;
     }
     const keepBytes = Math.max(0, MAX_CONTEXT_BYTES - Buffer.byteLength(TRIMMED_CONTEXT_HEADER, "utf8"));
-    await writeTextFileAtomic(this.dataRoot, contextPath, `${TRIMMED_CONTEXT_HEADER}${trimUtf8ToLastBytes(content, keepBytes)}`, "Tab context file");
+    await this.files.writeTextFileAtomic(this.dataRoot, contextPath, `${TRIMMED_CONTEXT_HEADER}${trimUtf8ToLastBytes(content, keepBytes)}`, "Tab context file");
   }
 
   private async requireContextPath(candidate: string | undefined): Promise<string | undefined> {
@@ -114,13 +135,24 @@ export class TabContextService {
     if (!isDirectChildPath(this.contextDir, contextPath)) {
       throw new Error(`Tab context file must stay directly within the CloudX context directory: ${contextPath}`);
     }
-    if (!(await requireSafeDirectory(this.dataRoot, path.dirname(contextPath), { create: false, label: "Tab context directory" }))) {
+    if (!(await this.files.requireSafeDirectory(this.dataRoot, path.dirname(contextPath), { create: false, label: "Tab context directory" }))) {
       return undefined;
     }
-    if (!(await requireRegularFile(contextPath, "Tab context file"))) {
+    if (!(await this.files.requireRegularFile(contextPath, "Tab context file"))) {
       return undefined;
     }
     return contextPath;
+  }
+
+  private async ignoreCapacityError<T>(operation: () => Promise<T>): Promise<T | undefined> {
+    try {
+      return await operation();
+    } catch (error) {
+      if (isCapacityStateWriteError(error)) {
+        return undefined;
+      }
+      throw error;
+    }
   }
 
   private enqueue(contextPath: string, operation: () => Promise<void>): Promise<void> {

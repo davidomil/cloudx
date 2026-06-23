@@ -65,6 +65,11 @@ export const UBUNTU_APT_PACKAGES = [
   "jq",
   "ripgrep"
 ];
+export const SERVER_RUNTIME_SCHEMA_FILES = [
+  "documentation/documentation-enrichment.schema.json",
+  "documentation/documentation-answer.schema.json",
+  "voice/voice-plan.schema.json"
+];
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -831,6 +836,7 @@ export async function runInstaller(options = {}) {
   }
   section("8/10 Build Cloudx and create HTTPS certificate");
   commands.run("npm", ["run", "build"]);
+  installServerRuntimeSchemas(runner, paths);
   commands.run("npm", ["run", "cert:create"], {
     env: certHosts.trim() ? { CLOUDX_CERT_HOSTS: certHosts.trim() } : undefined
   });
@@ -1015,6 +1021,7 @@ async function runUpdater({ paths, commands, runner, prompt, noStart, networkInt
 
   section("8/10 Rebuild Cloudx and refresh HTTPS certificate if missing");
   commands.run("npm", ["run", "build"]);
+  installServerRuntimeSchemas(runner, paths);
   commands.run("npm", ["run", "cert:create"]);
 
   section("9/10 Refresh installed systemd service files");
@@ -1373,6 +1380,21 @@ function installerPaths({ repoRoot: root, home, env = process.env }) {
     envPath: path.join(configDir, "cloudx.env"),
     systemdDir: path.join(home, ".config/systemd/user")
   };
+}
+
+export function installServerRuntimeSchemas(runner, paths) {
+  for (const relativePath of SERVER_RUNTIME_SCHEMA_FILES) {
+    const sourcePath = path.join(paths.repoRoot, "apps/server/src", relativePath);
+    const targetPath = path.join(paths.repoRoot, "apps/server/dist", relativePath);
+    if (!fs.existsSync(sourcePath)) {
+      if (runner.dryRun) {
+        runner.writeFile(targetPath, "");
+        continue;
+      }
+      throw new Error(`Server runtime schema file is missing: ${sourcePath}`);
+    }
+    runner.writeFile(targetPath, fs.readFileSync(sourcePath, "utf8"));
+  }
 }
 
 function commandMap(runner) {
