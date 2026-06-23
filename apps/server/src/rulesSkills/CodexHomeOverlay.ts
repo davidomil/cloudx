@@ -55,6 +55,7 @@ export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptio
   const systemSkills = await listCloudxSystemSkills(rulesSkillsRoot);
 
   await linkOrCopyIfExists(path.join(sourceCodexHome, "auth.json"), path.join(codexHome, "auth.json"));
+  await linkOrCopyIfExists(path.join(sourceCodexHome, ".credentials.json"), path.join(codexHome, ".credentials.json"));
   await linkOrCopyIfExists(path.join(sourceCodexHome, "rules"), path.join(codexHome, "rules"));
   await linkOrCopyIfExists(path.join(sourceCodexHome, "sessions"), path.join(codexHome, "sessions"));
 

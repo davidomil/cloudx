@@ -148,6 +148,8 @@ describe("CodexTerminalPlugin", () => {
       "",
       "Keep local notes."
     ].join("\n"), "utf8");
+    await fs.writeFile(path.join(codexHome, "auth.json"), "{\"auth\":\"linked\"}\n", "utf8");
+    await fs.writeFile(path.join(codexHome, ".credentials.json"), "{\"mcp\":\"linked\"}\n", "utf8");
     await fs.mkdir(path.join(codexHome, "sessions", "2026", "05", "15"), { recursive: true });
     await fs.writeFile(path.join(codexHome, "sessions", "2026", "05", "15", "rollout-session.jsonl"), "session\n", "utf8");
     await seedSkill(dataDir, "code-review", "Code Review", "Review code.", "Code review skill instructions.");
@@ -213,6 +215,8 @@ describe("CodexTerminalPlugin", () => {
     expect(overlayInstructions).toContain("Review carefully.");
     expect(overlayInstructions).not.toContain("Stale generated system rule.");
     expect(overlayInstructions).not.toContain("Stale generated template rule.");
+    await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "auth.json"), "utf8")).resolves.toBe("{\"auth\":\"linked\"}\n");
+    await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, ".credentials.json"), "utf8")).resolves.toBe("{\"mcp\":\"linked\"}\n");
     await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "sessions", "2026", "05", "15", "rollout-session.jsonl"), "utf8")).resolves.toBe("session\n");
   });
 
