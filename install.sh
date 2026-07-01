@@ -81,6 +81,7 @@ install_nodesource_node() {
   else
     curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
   fi
+  run sudo apt-get remove -y libnode-dev
   run sudo apt-get install -y nodejs
 }
 

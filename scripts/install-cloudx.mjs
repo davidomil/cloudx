@@ -15,6 +15,7 @@ export const LEGACY_SERVICE_NAMES = ["cloudx-asr.service", "cloudx.service"];
 export const QUARTO_VERSION = "1.9.38";
 export const QUARTO_DEB_PATH = `/tmp/quarto-${QUARTO_VERSION}-linux-amd64.deb`;
 export const QUARTO_DEB_URL = `https://github.com/quarto-dev/quarto-cli/releases/download/v${QUARTO_VERSION}/quarto-${QUARTO_VERSION}-linux-amd64.deb`;
+export const NODESOURCE_CONFLICTING_APT_PACKAGES = ["libnode-dev"];
 export const MIN_WORKTREE_GIT_VERSION = "2.36.0";
 export const GIT_CORE_PPA = "ppa:git-core/ppa";
 export const CUDA_12_MIN_DRIVER_VERSION = "525.60.13";
@@ -461,6 +462,7 @@ export function ubuntuBootstrapPlan({ nodeVersionText = "", npmVersionText = "",
   }
   if (nodeInstallNeeded) {
     commands.push(["sh", "-lc", "curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -"]);
+    commands.push(["sudo", "apt-get", "remove", "-y", ...NODESOURCE_CONFLICTING_APT_PACKAGES]);
     commands.push(["sudo", "apt-get", "install", "-y", "nodejs"]);
   }
   return commands;

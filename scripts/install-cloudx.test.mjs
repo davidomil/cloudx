@@ -11,6 +11,7 @@ import {
   GIT_CORE_PPA,
   InstallerRunner,
   MIN_WORKTREE_GIT_VERSION,
+  NODESOURCE_CONFLICTING_APT_PACKAGES,
   PYTORCH_CPU_WHEEL_INDEX,
   QUARTO_DEB_PATH,
   QUARTO_DEB_URL,
@@ -130,6 +131,7 @@ describe("install-cloudx helpers", () => {
     expect(commands[1]).toContain("jq");
     expect(commands).toContainEqual(["curl", "-fL", "-o", QUARTO_DEB_PATH, QUARTO_DEB_URL]);
     expect(commands).toContainEqual(["sudo", "apt-get", "install", "-y", QUARTO_DEB_PATH]);
+    expect(commands).toContainEqual(["sudo", "apt-get", "remove", "-y", ...NODESOURCE_CONFLICTING_APT_PACKAGES]);
     expect(commands).toContainEqual(["sudo", "apt-get", "install", "-y", "nodejs"]);
     expect(ubuntuPrerequisiteVerificationPlan()).toEqual([
       ["node", "-v"],
@@ -152,6 +154,7 @@ describe("install-cloudx helpers", () => {
     const commands = ubuntuBootstrapPlan({ nodeVersionText: "v25.8.1", npmVersionText: "" });
 
     expect(commands).toContainEqual(["sh", "-lc", "curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -"]);
+    expect(commands).toContainEqual(["sudo", "apt-get", "remove", "-y", "libnode-dev"]);
     expect(commands).toContainEqual(["sudo", "apt-get", "install", "-y", "nodejs"]);
   });
 
@@ -205,6 +208,7 @@ describe("install-cloudx helpers", () => {
 
     expect(runner.commands.map((command) => [command.command, ...command.args])).toEqual(
       expect.arrayContaining([
+        ["sudo", "apt-get", "remove", "-y", "libnode-dev"],
         ["sudo", "apt-get", "install", "-y", "nodejs"],
         ["node", "-v"],
         ["npm", "-v"]
@@ -239,6 +243,7 @@ describe("install-cloudx helpers", () => {
     expect(planned).toEqual(
       expect.arrayContaining([
         ["sh", "-lc", "curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -"],
+        ["sudo", "apt-get", "remove", "-y", "libnode-dev"],
         ["sudo", "apt-get", "install", "-y", "nodejs"],
         ["node", "-v"],
         ["npm", "-v"]
