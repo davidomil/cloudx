@@ -16,6 +16,7 @@ export const QUARTO_VERSION = "1.9.38";
 export const QUARTO_DEB_PATH = `/tmp/quarto-${QUARTO_VERSION}-linux-amd64.deb`;
 export const QUARTO_DEB_URL = `https://github.com/quarto-dev/quarto-cli/releases/download/v${QUARTO_VERSION}/quarto-${QUARTO_VERSION}-linux-amd64.deb`;
 export const NODESOURCE_CONFLICTING_APT_PACKAGES = ["libnode-dev"];
+export const CLOUDX_NPM_GLOBAL_DIR = ".local/share/cloudx/npm-global";
 export const MIN_WORKTREE_GIT_VERSION = "2.36.0";
 export const GIT_CORE_PPA = "ppa:git-core/ppa";
 export const CUDA_12_MIN_DRIVER_VERSION = "525.60.13";
@@ -178,6 +179,19 @@ export function systemNodePath(pathText = "") {
   const preferred = ["/usr/sbin", "/usr/bin", "/sbin", "/bin"];
   const entries = String(pathText).split(path.delimiter).filter(Boolean);
   return [...preferred, ...entries.filter((entry) => !preferred.includes(entry))].join(path.delimiter);
+}
+
+export function codexCliBin(paths) {
+  return path.join(paths.npmGlobalDir, "bin", "codex");
+}
+
+export function codexNpmEnv(paths, env = process.env) {
+  const binDir = path.join(paths.npmGlobalDir, "bin");
+  return {
+    NPM_CONFIG_PREFIX: paths.npmGlobalDir,
+    npm_config_prefix: paths.npmGlobalDir,
+    PATH: [binDir, ...String(env.PATH ?? "").split(path.delimiter).filter(Boolean)].join(path.delimiter)
+  };
 }
 
 export function needsQuartoInstall(versionText) {
@@ -766,7 +780,7 @@ export async function runInstaller(options = {}) {
     console.log("Shell bootstrap already installed Ubuntu packages. Verifying Node.js and npm.");
     verifyNodeAndNpm(commands);
   } else {
-    installUbuntuPrerequisites(commands);
+    installUbuntuPrerequisites(commands, env);
   }
   await ensureSupportedGit(commands, prompt);
   if (options.update) {
@@ -797,9 +811,8 @@ export async function runInstaller(options = {}) {
   }
 
   section("2/10 Verify Codex CLI");
-  await ensureCodex(commands, prompt);
-  const assistantBin = commands.which("codex");
-  const toolPath = toolPathFor(assistantBin, commands.capture("npm", ["prefix", "-g"]), env.PATH);
+  const assistantBin = await ensureCodex(commands, prompt, paths, env);
+  const toolPath = toolPathFor(assistantBin, paths.npmGlobalDir, env.PATH);
 
   section("3/10 Collect install choices");
   explainQuestion(
@@ -1029,13 +1042,12 @@ async function runUpdater({ paths, commands, runner, prompt, noStart, networkInt
   }
 
   section("3/10 Update Codex CLI");
-  await updateCodex(commands, prompt);
-  const assistantBin = commands.which("codex");
+  const assistantBin = await updateCodex(commands, prompt, paths, env);
   runner.writeFile(
     paths.envPath,
     updateEnvFileContent(readText(paths.envPath, ""), {
       CLOUDX_ASSISTANT_BIN: assistantBin,
-      CLOUDX_TOOL_PATH: toolPathFor(assistantBin, commands.capture("npm", ["prefix", "-g"]), env.PATH),
+      CLOUDX_TOOL_PATH: toolPathFor(assistantBin, paths.npmGlobalDir, env.PATH),
       ...missingEnvVars(envConfig, defaultDocumentationEnvVars(paths))
     })
   );
@@ -1358,19 +1370,22 @@ function waitForHealth(commands, { label, url, insecure = false }) {
   console.log(`  ${label} health ok.`);
 }
 
-async function ensureCodex(commands, prompt) {
-  if (!commands.exists("codex")) {
-    console.log("Codex CLI was not found. Installing @openai/codex globally with npm.");
-    commands.run("npm", ["i", "-g", "@openai/codex@latest"]);
-  } else {
-    console.log("Codex CLI is already on PATH.");
-  }
-  commands.run("codex", ["--version"]);
-  if (!commands.statusOk("codex", ["login", "status"])) {
+function installCodexCli(commands, paths, env) {
+  const assistantBin = codexCliBin(paths);
+  const npmEnv = codexNpmEnv(paths, env);
+  commands.mkdir(paths.npmGlobalDir);
+  commands.run("npm", ["i", "-g", "--prefix", paths.npmGlobalDir, "@openai/codex@latest"], { env: npmEnv });
+  return assistantBin;
+}
+
+async function verifyCodex(commands, prompt, assistantBin, paths, env) {
+  const npmEnv = codexNpmEnv(paths, env);
+  commands.run(assistantBin, ["--version"], { env: npmEnv });
+  if (!commands.statusOk(assistantBin, ["login", "status"], { env: npmEnv })) {
     const loginNow = await prompt.boolean("runCodexLogin", "Codex is not authenticated. Run codex login now?", true);
     if (loginNow) {
-      commands.run("codex", ["login"]);
-      if (!commands.statusOk("codex", ["login", "status"])) {
+      commands.run(assistantBin, ["login"], { env: npmEnv });
+      if (!commands.statusOk(assistantBin, ["login", "status"], { env: npmEnv })) {
         throw new Error("Codex login did not complete successfully.");
       }
     } else {
@@ -1379,21 +1394,18 @@ async function ensureCodex(commands, prompt) {
   }
 }
 
-async function updateCodex(commands, prompt) {
-  console.log("Updating Codex CLI globally with npm.");
-  commands.run("npm", ["i", "-g", "@openai/codex@latest"]);
-  commands.run("codex", ["--version"]);
-  if (!commands.statusOk("codex", ["login", "status"])) {
-    const loginNow = await prompt.boolean("runCodexLogin", "Codex is not authenticated. Run codex login now?", true);
-    if (loginNow) {
-      commands.run("codex", ["login"]);
-      if (!commands.statusOk("codex", ["login", "status"])) {
-        throw new Error("Codex login did not complete successfully.");
-      }
-    } else {
-      throw new Error("Codex must be authenticated before Cloudx voice control and Codex tabs can work.");
-    }
-  }
+async function ensureCodex(commands, prompt, paths, env) {
+  console.log(`Installing Codex CLI into ${paths.npmGlobalDir}.`);
+  const assistantBin = installCodexCli(commands, paths, env);
+  await verifyCodex(commands, prompt, assistantBin, paths, env);
+  return assistantBin;
+}
+
+async function updateCodex(commands, prompt, paths, env) {
+  console.log(`Updating Codex CLI in ${paths.npmGlobalDir}.`);
+  const assistantBin = installCodexCli(commands, paths, env);
+  await verifyCodex(commands, prompt, assistantBin, paths, env);
+  return assistantBin;
 }
 
 function installerPaths({ repoRoot: root, home, env = process.env }) {
@@ -1403,6 +1415,7 @@ function installerPaths({ repoRoot: root, home, env = process.env }) {
   const documentationVenvDir = path.join(documentationIndexerDir, ".venv");
   const whisperCppDir = env.CLOUDX_WHISPER_CPP_DIR ?? path.join(home, ".local/share/cloudx/whisper.cpp");
   const whisperCppModelDir = env.CLOUDX_WHISPER_CPP_MODEL_DIR ?? path.join(home, ".cache/cloudx/models/whisper.cpp");
+  const npmGlobalDir = env.CLOUDX_NPM_GLOBAL_DIR ?? path.join(home, CLOUDX_NPM_GLOBAL_DIR);
   const configDir = path.join(home, ".config/cloudx");
   return {
     repoRoot: root,
@@ -1419,6 +1432,7 @@ function installerPaths({ repoRoot: root, home, env = process.env }) {
     documentationIndexerPath: path.join(documentationVenvDir, "bin/cloudx-documentation-indexer"),
     whisperCppDir,
     whisperCppModelDir,
+    npmGlobalDir,
     modelDir: env.CLOUDX_ASR_MODEL_PATH ?? path.join(home, ".cache/cloudx/models/faster-whisper-large-v3"),
     dataDir: path.join(root, ".cloudx"),
     configDir,
@@ -1480,8 +1494,8 @@ function commandMap(runner) {
       }
       return result.stdout.trim();
     },
-    statusOk(command, args) {
-      return runner.statusOk(command, args);
+    statusOk(command, args, options) {
+      return runner.statusOk(command, args, options);
     },
     capture(command, args, options) {
       if (runner.dryRun && command === "git" && args?.[0] === "--version") {

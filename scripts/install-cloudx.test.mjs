@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   CUDA_12_MIN_DRIVER_VERSION,
+  CLOUDX_NPM_GLOBAL_DIR,
   FASTER_WHISPER_CUDA_PIP_PACKAGES,
   GIT_CORE_PPA,
   InstallerRunner,
@@ -22,6 +23,8 @@ import {
   WHISPER_CPP_VAD_MODEL,
   assertQuartoArchitecture,
   cloudxAccessUrls,
+  codexCliBin,
+  codexNpmEnv,
   defaultCpuThreads,
   ensureSupportedGit,
   installServerRuntimeSchemas,
@@ -56,6 +59,8 @@ import {
 } from "./install-cloudx.mjs";
 
 const TEST_ENV = { PATH: "/usr/bin" };
+const TEST_CODEX_PREFIX = path.join("/home/me", CLOUDX_NPM_GLOBAL_DIR);
+const TEST_CODEX_BIN = path.join(TEST_CODEX_PREFIX, "bin/codex");
 
 function runtimeSchemaDistPaths(root) {
   return SERVER_RUNTIME_SCHEMA_FILES.map((relativePath) => path.join(root, "apps/server/dist", relativePath));
@@ -386,6 +391,17 @@ describe("install-cloudx helpers", () => {
     expect(toolPathFor("/usr/bin/codex", "/usr")).toBe("/usr/bin");
   });
 
+  it("uses a Cloudx-owned npm prefix for Codex CLI installs", () => {
+    const paths = { npmGlobalDir: TEST_CODEX_PREFIX };
+
+    expect(codexCliBin(paths)).toBe(TEST_CODEX_BIN);
+    expect(codexNpmEnv(paths, { PATH: "/usr/local/bin:/usr/bin", npm_config_prefix: "/usr/local/lib/node_modules/node" })).toMatchObject({
+      NPM_CONFIG_PREFIX: TEST_CODEX_PREFIX,
+      npm_config_prefix: TEST_CODEX_PREFIX,
+      PATH: `${path.join(TEST_CODEX_PREFIX, "bin")}:/usr/local/bin:/usr/bin`
+    });
+  });
+
   it("prints verbose cwd, safe env, stdout, and stderr for captured commands", () => {
     const logs = [];
     const runner = new InstallerRunner({ cwd: "/tmp", log: (line) => logs.push(line), verbose: true });
@@ -479,6 +495,8 @@ describe("runInstaller dry-run", () => {
       expect.arrayContaining([
         ["node", "-v"],
         ["npm", "-v"],
+        ["npm", "i", "-g", "--prefix", TEST_CODEX_PREFIX, "@openai/codex@latest"],
+        [TEST_CODEX_BIN, "--version"],
         ["npm", "ci"],
         ["python3", "-m", "venv", "--upgrade-deps", "/repo/services/documentation-indexer/.venv"],
         [
@@ -494,6 +512,8 @@ describe("runInstaller dry-run", () => {
       ])
     );
     const env = runner.writes.find((write) => write.path === "/home/me/.config/cloudx/cloudx.env")?.contents;
+    expect(env).toContain(`CLOUDX_ASSISTANT_BIN=${TEST_CODEX_BIN}`);
+    expect(env).toContain(`CLOUDX_TOOL_PATH=${path.join(TEST_CODEX_PREFIX, "bin")}:/usr/bin`);
     expect(env).toContain("CLOUDX_DOCUMENTATION_URL=http://127.0.0.1:7820");
     expectRuntimeSchemaWrites(runner, "/repo");
   });
@@ -834,11 +854,13 @@ describe("runInstaller dry-run", () => {
     fs.writeFileSync(path.join(home, ".config/cloudx/cloudx.env"), "CLOUDX_PORT=3443\nCLOUDX_ASR_DEVICE=cuda\nCLOUDX_ASR_COMPUTE_TYPE=int8_float16\nCLOUDX_DOCUMENTATION_URL=http://127.0.0.1:9000\n");
     fs.writeFileSync(path.join(home, ".config/systemd/user/cloudx.service"), "");
     fs.writeFileSync(path.join(home, ".config/systemd/user/cloudx-asr.service"), "");
+    const codexPrefix = path.join(home, CLOUDX_NPM_GLOBAL_DIR);
+    const codexBin = path.join(codexPrefix, "bin/codex");
 
     const result = await runInstaller({
       repoRoot: root,
       home,
-      env: TEST_ENV,
+      env: { ...TEST_ENV, npm_config_prefix: "/usr/local/lib/node_modules/node" },
       dryRun: true,
       yes: true,
       update: true,
@@ -857,8 +879,8 @@ describe("runInstaller dry-run", () => {
     expect(result).toMatchObject({ port: 3443, servicesInstalled: true, restartServices: true });
     expect(result.urls).toEqual(["https://127.0.0.1:3443"]);
     const updatedEnv = runner.writes.find((write) => write.path === path.join(home, ".config/cloudx/cloudx.env"))?.contents;
-    expect(updatedEnv).toContain("CLOUDX_ASSISTANT_BIN=/usr/bin/codex");
-    expect(updatedEnv).toContain("CLOUDX_TOOL_PATH=/usr/bin");
+    expect(updatedEnv).toContain(`CLOUDX_ASSISTANT_BIN=${codexBin}`);
+    expect(updatedEnv).toContain(`CLOUDX_TOOL_PATH=${path.join(codexPrefix, "bin")}:/usr/bin`);
     expect(updatedEnv).toContain("CLOUDX_ASR_DEVICE=cuda");
     expect(updatedEnv).toContain("CLOUDX_ASR_COMPUTE_TYPE=int8_float16");
     expect(updatedEnv).toContain("CLOUDX_DOCUMENTATION_URL=http://127.0.0.1:9000");
@@ -871,7 +893,8 @@ describe("runInstaller dry-run", () => {
         ["node", "-v"],
         ["npm", "-v"],
         ["git", "pull", "--ff-only"],
-        ["npm", "i", "-g", "@openai/codex@latest"],
+        ["npm", "i", "-g", "--prefix", codexPrefix, "@openai/codex@latest"],
+        [codexBin, "--version"],
         ["npm", "ci"],
         [path.join(root, "services/asr/.venv/bin/pip"), "install", "-e", `${path.join(root, "services/asr")}[dev]`, "huggingface_hub[cli]"],
         ["python3", "-m", "venv", "--upgrade-deps", path.join(root, "services/documentation-indexer/.venv")],
