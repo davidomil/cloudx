@@ -36,6 +36,7 @@ import {
   parseArgs,
   parseNodeMajor,
   parseOsRelease,
+  preferSystemNodePath,
   renderAsrService,
   renderCloudxService,
   renderDocumentationService,
@@ -44,9 +45,11 @@ import {
   runInstaller,
   selectNvidiaGpuInfo,
   shouldAdvertiseLanUrls,
+  systemNodePath,
   supportsCuda12Driver,
   toolPathFor,
   ubuntuBootstrapPlan,
+  ubuntuPrerequisiteVerificationPlan,
   updateEnvFileContent,
   validateCpuThreads
 } from "./install-cloudx.mjs";
@@ -81,9 +84,9 @@ describe("install-cloudx helpers", () => {
 
   it("decides when Node needs to be installed", () => {
     expect(parseNodeMajor("v22.22.3")).toBe(22);
-    expect(needsNodeInstall("v20.20.2", true)).toBe(true);
-    expect(needsNodeInstall("v22.22.3", false)).toBe(true);
-    expect(needsNodeInstall("v24.15.0", true)).toBe(false);
+    expect(needsNodeInstall("v20.20.2", "10.0.0")).toBe(true);
+    expect(needsNodeInstall("v22.22.3", "")).toBe(true);
+    expect(needsNodeInstall("v24.15.0", "11.0.0")).toBe(false);
     expect(needsQuartoInstall(QUARTO_VERSION)).toBe(false);
     expect(needsQuartoInstall("1.8.25")).toBe(true);
     expect(() => assertQuartoArchitecture("arm64")).toThrow(/linux-amd64/);
@@ -110,7 +113,7 @@ describe("install-cloudx helpers", () => {
   });
 
   it("builds the Ubuntu bootstrap command plan", () => {
-    const commands = ubuntuBootstrapPlan({ nodeVersionText: "v20.0.0", hasNpm: true });
+    const commands = ubuntuBootstrapPlan({ nodeVersionText: "v20.0.0", npmVersionText: "10.0.0" });
 
     expect(commands[0]).toEqual(["sudo", "apt-get", "update"]);
     expect(commands[1]).toContain("build-essential");
@@ -128,29 +131,28 @@ describe("install-cloudx helpers", () => {
     expect(commands).toContainEqual(["curl", "-fL", "-o", QUARTO_DEB_PATH, QUARTO_DEB_URL]);
     expect(commands).toContainEqual(["sudo", "apt-get", "install", "-y", QUARTO_DEB_PATH]);
     expect(commands).toContainEqual(["sudo", "apt-get", "install", "-y", "nodejs"]);
-    expect(commands).toContainEqual(["sh", "-lc", "command -v npm >/dev/null 2>&1 || sudo apt-get install -y npm"]);
-    expect(commands).toContainEqual(["node", "-v"]);
-    expect(commands).toContainEqual(["npm", "-v"]);
-    expect(commands).toContainEqual(["quarto", "--version"]);
-    expect(commands).toContainEqual(["pandoc", "--version"]);
-    expect(commands).toContainEqual(["xelatex", "--version"]);
-    expect(commands).toContainEqual(["lualatex", "--version"]);
+    expect(ubuntuPrerequisiteVerificationPlan()).toEqual([
+      ["node", "-v"],
+      ["npm", "-v"],
+      ["quarto", "--version"],
+      ["pandoc", "--version"],
+      ["xelatex", "--version"],
+      ["lualatex", "--version"]
+    ]);
   });
 
   it("skips the Quarto .deb download when the pinned version is already installed", () => {
-    const commands = ubuntuBootstrapPlan({ nodeVersionText: "v22.0.0", hasNpm: true, quartoVersionText: QUARTO_VERSION });
+    const commands = ubuntuBootstrapPlan({ nodeVersionText: "v22.0.0", npmVersionText: "10.0.0", quartoVersionText: QUARTO_VERSION });
 
     expect(commands).not.toContainEqual(["curl", "-fL", "-o", QUARTO_DEB_PATH, QUARTO_DEB_URL]);
     expect(commands).not.toContainEqual(["sudo", "apt-get", "install", "-y", QUARTO_DEB_PATH]);
-    expect(commands).toContainEqual(["quarto", "--version"]);
   });
 
-  it("plans npm fallback when Node is current but npm is missing", () => {
-    const commands = ubuntuBootstrapPlan({ nodeVersionText: "v22.0.0", hasNpm: false });
+  it("plans NodeSource repair when Node is current but npm cannot run", () => {
+    const commands = ubuntuBootstrapPlan({ nodeVersionText: "v25.8.1", npmVersionText: "" });
 
-    expect(commands).not.toContainEqual(["sudo", "apt-get", "install", "-y", "nodejs"]);
-    expect(commands).toContainEqual(["sh", "-lc", "command -v npm >/dev/null 2>&1 || sudo apt-get install -y npm"]);
-    expect(commands).toContainEqual(["npm", "-v"]);
+    expect(commands).toContainEqual(["sh", "-lc", "curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -"]);
+    expect(commands).toContainEqual(["sudo", "apt-get", "install", "-y", "nodejs"]);
   });
 
   it("detects Git versions that are too old for worktree porcelain NUL output", () => {
@@ -204,11 +206,64 @@ describe("install-cloudx helpers", () => {
     expect(runner.commands.map((command) => [command.command, ...command.args])).toEqual(
       expect.arrayContaining([
         ["sudo", "apt-get", "install", "-y", "nodejs"],
-        ["sh", "-lc", "command -v npm >/dev/null 2>&1 || sudo apt-get install -y npm"],
         ["node", "-v"],
         ["npm", "-v"]
       ])
     );
+  });
+
+  it("repairs a broken npm even when the current Node version is new enough", () => {
+    const planned = [];
+    const env = { PATH: "/usr/local/bin:/usr/bin" };
+
+    installUbuntuPrerequisites(
+      {
+        exists: (command) => command === "node" || command === "npm",
+        capture: (command, args, options = {}) => {
+          if (command === "node" && args[0] === "-v") {
+            return options.env?.PATH === systemNodePath(env.PATH) ? "v22.0.0" : "v25.8.1";
+          }
+          if (command === "npm" && args[0] === "-v") {
+            if (options.env?.PATH === systemNodePath(env.PATH)) {
+              return "10.9.0";
+            }
+            throw new Error("Cannot find module 'semver'");
+          }
+          return "";
+        },
+        run: (command, args) => planned.push([command, ...args])
+      },
+      env
+    );
+
+    expect(planned).toEqual(
+      expect.arrayContaining([
+        ["sh", "-lc", "curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -"],
+        ["sudo", "apt-get", "install", "-y", "nodejs"],
+        ["node", "-v"],
+        ["npm", "-v"]
+      ])
+    );
+    expect(env.PATH).toBe(systemNodePath("/usr/local/bin:/usr/bin"));
+  });
+
+  it("prefers the system Node path only when that Node and npm pair works", () => {
+    const env = { PATH: "/usr/local/bin:/usr/bin" };
+    const commands = {
+      capture: (command, args, options = {}) => {
+        expect(options.env?.PATH).toBe(systemNodePath("/usr/local/bin:/usr/bin"));
+        if (command === "node") {
+          return "v22.0.0";
+        }
+        if (command === "npm") {
+          return "10.9.0";
+        }
+        return "";
+      }
+    };
+
+    expect(preferSystemNodePath(commands, env)).toBe(true);
+    expect(env.PATH).toBe("/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bin");
   });
 
   it("builds local-only access URLs by default", () => {

@@ -169,8 +169,14 @@ export function parseNodeMajor(versionText) {
   return match ? Number.parseInt(match[1], 10) : 0;
 }
 
-export function needsNodeInstall(nodeVersionText, hasNpm) {
-  return parseNodeMajor(nodeVersionText) < 22 || !hasNpm;
+export function needsNodeInstall(nodeVersionText, npmVersionText) {
+  return parseNodeMajor(nodeVersionText) < 22 || !String(npmVersionText).trim();
+}
+
+export function systemNodePath(pathText = "") {
+  const preferred = ["/usr/sbin", "/usr/bin", "/sbin", "/bin"];
+  const entries = String(pathText).split(path.delimiter).filter(Boolean);
+  return [...preferred, ...entries.filter((entry) => !preferred.includes(entry))].join(path.delimiter);
 }
 
 export function needsQuartoInstall(versionText) {
@@ -443,8 +449,8 @@ export function renderDocumentationService({ repoRoot: root, envPath, documentat
   ].join("\n");
 }
 
-export function ubuntuBootstrapPlan({ nodeVersionText = "", hasNpm = false, quartoVersionText = "" } = {}) {
-  const nodeInstallNeeded = parseNodeMajor(nodeVersionText) < 22;
+export function ubuntuBootstrapPlan({ nodeVersionText = "", npmVersionText = "", quartoVersionText = "" } = {}) {
+  const nodeInstallNeeded = needsNodeInstall(nodeVersionText, npmVersionText);
   const commands = [
     ["sudo", "apt-get", "update"],
     ["sudo", "apt-get", "install", "-y", ...UBUNTU_APT_PACKAGES]
@@ -457,28 +463,65 @@ export function ubuntuBootstrapPlan({ nodeVersionText = "", hasNpm = false, quar
     commands.push(["sh", "-lc", "curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -"]);
     commands.push(["sudo", "apt-get", "install", "-y", "nodejs"]);
   }
-  if (nodeInstallNeeded || !hasNpm) {
-    commands.push(["sh", "-lc", "command -v npm >/dev/null 2>&1 || sudo apt-get install -y npm"]);
-  }
-  commands.push(["node", "-v"]);
-  commands.push(["npm", "-v"]);
-  commands.push(["quarto", "--version"]);
-  commands.push(["pandoc", "--version"]);
-  commands.push(["xelatex", "--version"]);
-  commands.push(["lualatex", "--version"]);
   return commands;
 }
 
-export function installUbuntuPrerequisites(commands) {
+export function ubuntuPrerequisiteVerificationPlan() {
+  return [
+    ["node", "-v"],
+    ["npm", "-v"],
+    ["quarto", "--version"],
+    ["pandoc", "--version"],
+    ["xelatex", "--version"],
+    ["lualatex", "--version"]
+  ];
+}
+
+function captureOptional(commands, command, args, options) {
+  try {
+    return commands.capture(command, args, options);
+  } catch {
+    return "";
+  }
+}
+
+function commandVersion(commands, command, args, options) {
+  return commands.exists(command) ? captureOptional(commands, command, args, options) : "";
+}
+
+export function preferSystemNodePath(commands, env = process.env) {
+  const preferredPath = systemNodePath(env.PATH);
+  const options = { env: { PATH: preferredPath } };
+  const nodeVersionText = captureOptional(commands, "node", ["-v"], options);
+  const npmVersionText = captureOptional(commands, "npm", ["-v"], options);
+  if (needsNodeInstall(nodeVersionText, npmVersionText)) {
+    return false;
+  }
+  env.PATH = preferredPath;
+  return true;
+}
+
+export function verifyUbuntuPrerequisites(commands) {
+  for (const [command, ...args] of ubuntuPrerequisiteVerificationPlan()) {
+    commands.run(command, args);
+  }
+}
+
+export function installUbuntuPrerequisites(commands, env = process.env) {
   if (commands.exists("dpkg")) {
     assertQuartoArchitecture(commands.capture("dpkg", ["--print-architecture"]));
   }
-  const nodeVersionText = commands.exists("node") ? commands.capture("node", ["-v"]) : "";
-  const hasNpm = commands.exists("npm");
-  const quartoVersionText = commands.exists("quarto") ? commands.capture("quarto", ["--version"]) : "";
-  for (const [command, ...args] of ubuntuBootstrapPlan({ nodeVersionText, hasNpm, quartoVersionText })) {
+  const nodeVersionText = commandVersion(commands, "node", ["-v"]);
+  const npmVersionText = commandVersion(commands, "npm", ["-v"]);
+  const quartoVersionText = commandVersion(commands, "quarto", ["--version"]);
+  const nodeInstallNeeded = needsNodeInstall(nodeVersionText, npmVersionText);
+  for (const [command, ...args] of ubuntuBootstrapPlan({ nodeVersionText, npmVersionText, quartoVersionText })) {
     commands.run(command, args);
   }
+  if (nodeInstallNeeded) {
+    preferSystemNodePath(commands, env);
+  }
+  verifyUbuntuPrerequisites(commands);
 }
 
 export async function ensureSupportedGit(commands, prompt) {

@@ -66,6 +66,33 @@ run() {
   "$@"
 }
 
+node_major() {
+  node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || echo 0
+}
+
+npm_works() {
+  command -v npm >/dev/null 2>&1 && npm -v >/dev/null 2>&1
+}
+
+install_nodesource_node() {
+  echo "Node.js 22+ with a working npm is required. Installing the NodeSource Node.js 22 package."
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo '$ curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -'
+  else
+    curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+  fi
+  run sudo apt-get install -y nodejs
+}
+
+prefer_system_node_path() {
+  local system_path
+  system_path="/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+  if [[ "$(PATH="$system_path" node_major)" -ge 22 ]] && PATH="$system_path" npm -v >/dev/null 2>&1; then
+    export PATH="$system_path"
+    hash -r
+  fi
+}
+
 install_quarto() {
   if [[ "$(dpkg --print-architecture)" != "amd64" ]]; then
     echo "Cloudx installs the official Quarto linux-amd64 .deb. Detected unsupported architecture: $(dpkg --print-architecture)" >&2
@@ -133,29 +160,15 @@ run xelatex --version
 run lualatex --version
 
 step "Check Node.js and npm"
-NODE_MAJOR="$(node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)"
-if [[ "$NODE_MAJOR" -lt 22 ]]; then
-  echo "Node.js 22+ is required. Installing the NodeSource Node.js 22 package."
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo '$ curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -'
-  else
-    curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-  fi
-  run sudo apt-get install -y nodejs
-fi
-
-if ! command -v npm >/dev/null 2>&1; then
-  echo "npm is missing. Installing Ubuntu's npm package."
-  run sudo apt-get install -y npm
-fi
-
-if [[ "$DRY_RUN" -eq 0 ]] && ! command -v npm >/dev/null 2>&1; then
-  echo "npm is required but was not found after installation. Install npm and rerun ./install.sh." >&2
-  exit 1
+if [[ "$(node_major)" -lt 22 ]] || ! npm_works; then
+  install_nodesource_node
+  prefer_system_node_path
 fi
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
-  echo "Using Node.js $(node -v) and npm $(npm -v)."
+  NODE_VERSION="$(node -v)"
+  NPM_VERSION="$(npm -v)"
+  echo "Using Node.js $NODE_VERSION and npm $NPM_VERSION."
 else
   echo '$ node -v'
   echo '$ npm -v'
