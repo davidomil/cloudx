@@ -12,7 +12,7 @@ describe("AI change policy", () => {
   it("defines layered activation and three least-privilege App authorities", () => {
     expect(policy.activation).toMatchObject({
       branch: "main",
-      controller_tag: "cloudx-ai-controller-v1",
+      controller_tag: "cloudx-ai-controller-v3",
       update_authority_ruleset_name: "CloudX main update authority",
       integrity_ruleset_name: "CloudX main integrity",
       controller_tag_ruleset_name: "CloudX controller tag immutability",
@@ -26,7 +26,7 @@ describe("AI change policy", () => {
       required_check_app_slug: "cloudx-ai-publisher",
       intent_check_app_slug: "github-actions",
       manager_permissions: [
-        "actions:write",
+        "actions:read",
         "checks:read",
         "contents:read",
         "issues:write",

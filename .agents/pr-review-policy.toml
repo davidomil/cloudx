@@ -30,7 +30,7 @@ require_protected_path_approval = true
 
 [activation]
 branch = "main"
-controller_tag = "cloudx-ai-controller-v1"
+controller_tag = "cloudx-ai-controller-v3"
 update_authority_ruleset_name = "CloudX main update authority"
 integrity_ruleset_name = "CloudX main integrity"
 controller_tag_ruleset_name = "CloudX controller tag immutability"
@@ -43,7 +43,7 @@ publisher_app_slug = "cloudx-ai-publisher"
 merge_app_slug = "cloudx-ai-merge"
 required_check_app_slug = "cloudx-ai-publisher"
 intent_check_app_slug = "github-actions"
-manager_permissions = ["actions:write", "checks:read", "contents:read", "issues:write", "metadata:read", "pull_requests:read"]
+manager_permissions = ["actions:read", "checks:read", "contents:read", "issues:write", "metadata:read", "pull_requests:read"]
 publisher_permissions = ["checks:write", "contents:write", "issues:write", "metadata:read", "pull_requests:write"]
 merge_permissions = ["checks:write", "contents:write", "metadata:read", "pull_requests:read"]
 required_workflows = [".github/workflows/ai-review.yml", ".github/workflows/ci.yml", ".github/workflows/classify-pr.yml", ".github/workflows/managed-automerge.yml", ".github/workflows/managed-issue.yml", ".github/workflows/protected-merge.yml", ".github/workflows/publish-ci.yml", ".github/workflows/trusted-automerge.yml"]

@@ -804,7 +804,7 @@
             [
               "CloudX controller tag immutability",
               "No bypass",
-              "Exact cloudx-ai-controller-v1 deletion and update blocked"
+              "Exact cloudx-ai-controller-v3 deletion and update blocked"
             ],
             [
               "cloudx-codex runner",

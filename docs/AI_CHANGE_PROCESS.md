@@ -365,7 +365,7 @@ The activation verifier requires three active repository rulesets:
   linear history, stale review dismissal, CODEOWNER review, resolved threads,
   and strict App-bound current checks; and
 - `CloudX controller tag immutability` permits no update or deletion bypass for
-  `cloudx-ai-controller-v1`.
+  `cloudx-ai-controller-v3`.
 
 Activation additionally requires a public CloudX target, a separate private
 controller repository, exactly one online runner there with the exact

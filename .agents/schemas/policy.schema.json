@@ -101,7 +101,7 @@
       ],
       "properties": {
         "branch": { "const": "main" },
-        "controller_tag": { "const": "cloudx-ai-controller-v1" },
+        "controller_tag": { "const": "cloudx-ai-controller-v3" },
         "update_authority_ruleset_name": {
           "const": "CloudX main update authority"
         },
@@ -122,7 +122,7 @@
         "intent_check_app_slug": { "const": "github-actions" },
         "manager_permissions": {
           "const": [
-            "actions:write",
+            "actions:read",
             "checks:read",
             "contents:read",
             "issues:write",
