@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "id",
+    "repository",
+    "issue_number",
+    "attempt",
+    "snapshot_sha256",
+    "base_sha",
+    "policy_sha256",
+    "status",
+    "version",
+    "created_at",
+    "updated_at",
+    "terminal_reason"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "const": "managed-run" },
+    "id": { "$ref": "#/$defs/nonEmpty" },
+    "repository": { "$ref": "#/$defs/repository" },
+    "issue_number": { "type": "integer", "minimum": 1 },
+    "attempt": { "type": "integer", "minimum": 1 },
+    "snapshot_sha256": { "$ref": "#/$defs/sha256" },
+    "base_sha": { "$ref": "#/$defs/gitSha" },
+    "policy_sha256": { "$ref": "#/$defs/sha256" },
+    "status": { "$ref": "#/$defs/status" },
+    "version": { "type": "integer", "minimum": 1 },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "terminal_reason": { "type": ["string", "null"], "minLength": 1 }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "enum": ["merged", "blocked", "failed", "cancelled", "superseded"]
+          }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": { "terminal_reason": { "$ref": "#/$defs/nonEmpty" } }
+      },
+      "else": { "properties": { "terminal_reason": { "type": "null" } } }
+    }
+  ],
+  "$defs": {
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "repository": {
+      "type": "string",
+      "pattern": "^[^/\\s]+/[^/\\s]+$"
+    },
+    "gitSha": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "status": {
+      "enum": [
+        "received",
+        "ingested",
+        "triaged",
+        "triage_review_clean",
+        "planned",
+        "plan_review_clean",
+        "reproduced",
+        "implemented",
+        "verified",
+        "implementation_review_clean",
+        "candidate_published",
+        "pr_open",
+        "ci_green",
+        "ai_review_clean",
+        "authorized",
+        "merged",
+        "blocked",
+        "failed",
+        "cancelled",
+        "superseded"
+      ]
+    }
+  }
+}

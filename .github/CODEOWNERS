@@ -1,0 +1,24 @@
+# Repository governance and release authority
+/.github/ @davidomil
+/.agents/ @davidomil
+/AGENTS.md @davidomil
+/**/AGENTS.md @davidomil
+/CONTRIBUTING.md @davidomil
+/docs/AI_CHANGE_PROCESS.md @davidomil
+/docs/architecture/ @davidomil
+/docs/architecture-review/phase-inspired-repository-ai-process.md @davidomil
+/package.json @davidomil
+/package-lock.json @davidomil
+/**/package.json @davidomil
+/**/pyproject.toml @davidomil
+/scripts/ai-change/ @davidomil
+/services/asr/pyproject.toml @davidomil
+/services/documentation-indexer/pyproject.toml @davidomil
+/install.sh @davidomil
+/scripts/install-cloudx.mjs @davidomil
+/SECURITY.md @davidomil
+/docs/SECURITY_MODEL.md @davidomil
+/apps/server/src/pathPolicy.ts @davidomil
+/apps/server/src/configSecretStore.ts @davidomil
+/apps/server/src/localWebProxy.ts @davidomil
+/apps/server/src/fileTransfer.ts @davidomil

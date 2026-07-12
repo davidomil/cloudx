@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "run_id",
+    "base_sha",
+    "head_sha",
+    "policy_sha256",
+    "skill_versions",
+    "task",
+    "classification",
+    "anchors",
+    "claims",
+    "allowed_paths",
+    "forbidden_paths",
+    "verification"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "const": "change-plan" },
+    "run_id": { "$ref": "#/$defs/nonEmpty" },
+    "base_sha": { "$ref": "#/$defs/gitSha" },
+    "head_sha": { "$ref": "#/$defs/gitSha" },
+    "policy_sha256": { "$ref": "#/$defs/sha256" },
+    "skill_versions": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "$ref": "#/$defs/sha256" }
+    },
+    "task": { "$ref": "#/$defs/nonEmpty" },
+    "classification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "areas",
+        "risk",
+        "skills",
+        "human_review_required",
+        "automerge_eligible"
+      ],
+      "properties": {
+        "type": {
+          "enum": ["bug", "feature", "refactor", "test", "docs", "chore"]
+        },
+        "areas": { "$ref": "#/$defs/nonEmptyStrings" },
+        "risk": { "enum": ["low", "medium", "high", "human-required"] },
+        "skills": { "$ref": "#/$defs/nonEmptyStrings" },
+        "human_review_required": { "type": "boolean" },
+        "automerge_eligible": { "type": "boolean" }
+      }
+    },
+    "anchors": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "line", "reason"],
+        "properties": {
+          "path": { "$ref": "#/$defs/repoPath" },
+          "line": { "type": "integer", "minimum": 1 },
+          "reason": { "$ref": "#/$defs/nonEmpty" }
+        }
+      }
+    },
+    "claims": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "behavior",
+          "production_seam",
+          "test",
+          "negative_cases"
+        ],
+        "properties": {
+          "id": { "type": "string", "pattern": "^CLAIM-[A-Z0-9-]+$" },
+          "behavior": { "$ref": "#/$defs/nonEmpty" },
+          "production_seam": { "$ref": "#/$defs/nonEmpty" },
+          "test": { "$ref": "#/$defs/nonEmpty" },
+          "negative_cases": { "$ref": "#/$defs/nonEmptyStrings" }
+        }
+      }
+    },
+    "allowed_paths": { "$ref": "#/$defs/nonEmptyStrings" },
+    "forbidden_paths": { "$ref": "#/$defs/nonEmptyStrings" },
+    "verification": { "$ref": "#/$defs/nonEmptyStrings" }
+  },
+  "$defs": {
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "gitSha": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "repoPath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+    },
+    "nonEmptyStrings": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/nonEmpty" }
+    }
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "run_id",
+    "base_sha",
+    "head_sha",
+    "policy_sha256",
+    "plan_sha256",
+    "changed_files",
+    "claim_evidence",
+    "deviations"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "const": "change-implementation" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "base_sha": { "$ref": "#/$defs/gitSha" },
+    "head_sha": { "$ref": "#/$defs/gitSha" },
+    "policy_sha256": { "$ref": "#/$defs/sha256" },
+    "plan_sha256": { "$ref": "#/$defs/sha256" },
+    "changed_files": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "claim_evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "claim_id",
+          "production_path",
+          "test_path",
+          "revert_failing_assertion",
+          "negative_cases"
+        ],
+        "properties": {
+          "claim_id": { "type": "string", "pattern": "^CLAIM-[A-Z0-9-]+$" },
+          "production_path": { "type": "string", "minLength": 1 },
+          "test_path": { "type": "string", "minLength": 1 },
+          "revert_failing_assertion": { "type": "string", "minLength": 1 },
+          "negative_cases": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "deviations": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    }
+  },
+  "$defs": {
+    "gitSha": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+  }
+}

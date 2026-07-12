@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "run_id",
+    "subject",
+    "subject_sha256",
+    "base_sha",
+    "head_sha",
+    "policy_sha256",
+    "reviewer_role",
+    "verdict",
+    "tags",
+    "findings"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "const": "change-review" },
+    "run_id": { "$ref": "#/$defs/nonEmpty" },
+    "subject": {
+      "enum": ["issue-classification", "plan", "implementation", "pull-request"]
+    },
+    "subject_sha256": { "$ref": "#/$defs/sha256" },
+    "base_sha": { "$ref": "#/$defs/gitSha" },
+    "head_sha": { "$ref": "#/$defs/gitSha" },
+    "policy_sha256": { "$ref": "#/$defs/sha256" },
+    "reviewer_role": { "$ref": "#/$defs/nonEmpty" },
+    "verdict": { "enum": ["clean", "blocked"] },
+    "tags": {
+      "description": "Durable review dispositions. Use manual-review when findings may be empty but a maintainer must decide or approve the exact head.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "enum": ["manual-review"] }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "severity",
+          "category",
+          "path",
+          "line",
+          "evidence",
+          "required_fix"
+        ],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[A-Z][A-Z0-9-]*-[0-9]{3}$" },
+          "severity": { "enum": ["critical", "high", "medium", "low"] },
+          "category": {
+            "enum": [
+              "correctness",
+              "architecture",
+              "test-discrimination",
+              "security",
+              "reliability",
+              "performance",
+              "ux",
+              "documentation",
+              "process"
+            ]
+          },
+          "path": { "$ref": "#/$defs/nonEmpty" },
+          "line": { "type": "integer", "minimum": 1 },
+          "evidence": { "$ref": "#/$defs/nonEmpty" },
+          "required_fix": { "$ref": "#/$defs/nonEmpty" }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "verdict": { "const": "clean" } } },
+      "then": {
+        "properties": { "findings": { "type": "array", "maxItems": 0 } }
+      }
+    },
+    {
+      "if": { "properties": { "verdict": { "const": "blocked" } } },
+      "then": {
+        "properties": { "findings": { "type": "array", "minItems": 1 } }
+      }
+    }
+  ],
+  "$defs": {
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "gitSha": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+  }
+}

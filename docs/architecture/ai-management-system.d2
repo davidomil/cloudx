@@ -1,0 +1,94 @@
+direction: down
+
+source: |md
+  **GitHub issue and pull-request surface**
+
+  - Issue text and author-or-writer comments
+  - Revision-fresh approval and bounded public media
+  - Managed and ordinary PRs plus discussion
+|
+
+manager: |md
+  **Manager App control plane**
+
+  - Signed intake and canonical double read
+  - Writer authority and physical capacity
+  - CAS lifecycle, tagged dispatch, audited recovery
+|
+
+stores: |md
+  **Durable evidence stores**
+
+  - PostgreSQL runs, stages, and outboxes
+  - Observations, quotas, and audit digests
+  - Addressed snapshots and artifacts
+|
+
+controller: |md
+  **Private model runner and trusted controllers**
+
+  - Serialized `cloudx-codex` ChatGPT login
+  - Workspace-only profiles and shell-free proposal
+  - GitHub-hosted credential-free verifier
+  - 11 area reviews and non-lossy aggregate
+|
+
+publisher: |md
+  **Candidate Publisher App**
+
+  - Validate the candidate and open its PR
+  - Publish exact `CI / merge-gate` evidence
+  - Publish exact `AI Review / head` evidence
+|
+
+protection: |md
+  **Exact identity and repository protection**
+
+  - Bind v2 base, head, tree, policy, and subject
+  - Strict checks and Merge-App update authority
+  - Audited immutable tag, environments, and mutex
+|
+
+merge: |md
+  **Merge Authority App**
+
+  - Managed, writer, or reviewed intent
+  - Two readiness reads plus final ref read
+  - SHA-bound squash with exact proof
+|
+
+outcome: |md
+  **Authoritative outcome**
+
+  - Exact tested tree reaches `main`
+  - Progress and proof remain in discussion
+  - Durable manager audit state remains authoritative
+|
+
+source -> manager: "Signed delivery"
+manager -> stores: "Single durable state authority"
+stores -> controller: "Immutable context and one-time capabilities"
+controller -> publisher: "Verified candidate and non-lossy review"
+publisher -> protection: "Exact App-origin evidence"
+protection -> merge: "Eligible identity only"
+merge -> outcome: "Confirmed SHA-bound squash"
+outcome -> source: "Discussion projection and base invalidation" {
+  style.stroke-dash: 4
+}
+
+source.style.fill: "#f4f7fb"
+source.style.stroke: "#44546a"
+manager.style.fill: "#e8f2ff"
+manager.style.stroke: "#245ea8"
+stores.style.fill: "#fff4d6"
+stores.style.stroke: "#8a5c00"
+controller.style.fill: "#f3edff"
+controller.style.stroke: "#6941a5"
+publisher.style.fill: "#f7f1de"
+publisher.style.stroke: "#7a6500"
+protection.style.fill: "#e8f7ec"
+protection.style.stroke: "#25713a"
+merge.style.fill: "#ffeceb"
+merge.style.stroke: "#a33a32"
+outcome.style.fill: "#f4f7fb"
+outcome.style.stroke: "#44546a"

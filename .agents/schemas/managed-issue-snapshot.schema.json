@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "snapshot_sha256 is SHA-256 over UTF-8 RFC 8785 JCS serialization after omitting only the top-level snapshot_sha256 member.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "run_id",
+    "repository",
+    "repository_id",
+    "repository_private",
+    "issue_number",
+    "title",
+    "body",
+    "state",
+    "author",
+    "labels",
+    "issue_created_at",
+    "issue_updated_at",
+    "comments",
+    "timeline",
+    "base_sha",
+    "policy_sha256",
+    "source_revision_sha256",
+    "media",
+    "captured_at",
+    "snapshot_sha256"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "const": "managed-issue-snapshot" },
+    "run_id": { "$ref": "#/$defs/nonEmpty" },
+    "repository": { "$ref": "#/$defs/repositoryName" },
+    "repository_id": { "$ref": "#/$defs/safeId" },
+    "repository_private": { "type": "boolean" },
+    "issue_number": { "$ref": "#/$defs/safeId" },
+    "title": { "$ref": "#/$defs/nonEmpty" },
+    "body": { "type": "string" },
+    "state": { "enum": ["open", "closed"] },
+    "author": { "$ref": "#/$defs/author" },
+    "labels": { "$ref": "#/$defs/uniqueStrings" },
+    "issue_created_at": { "$ref": "#/$defs/dateTime" },
+    "issue_updated_at": { "$ref": "#/$defs/dateTime" },
+    "comments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "body",
+          "author",
+          "author_permission",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "id": { "$ref": "#/$defs/safeId" },
+          "body": { "type": "string" },
+          "author": { "$ref": "#/$defs/author" },
+          "author_permission": { "$ref": "#/$defs/repositoryPermission" },
+          "created_at": { "$ref": "#/$defs/dateTime" },
+          "updated_at": { "$ref": "#/$defs/dateTime" }
+        }
+      }
+    },
+    "timeline": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "event", "actor", "actor_permission", "created_at"],
+        "properties": {
+          "id": {
+            "oneOf": [
+              { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+              { "type": "string", "minLength": 1 }
+            ]
+          },
+          "event": { "$ref": "#/$defs/nonEmpty" },
+          "actor": {
+            "oneOf": [{ "$ref": "#/$defs/author" }, { "type": "null" }]
+          },
+          "actor_permission": {
+            "oneOf": [
+              { "$ref": "#/$defs/repositoryPermission" },
+              { "type": "null" }
+            ]
+          },
+          "created_at": {
+            "oneOf": [{ "$ref": "#/$defs/dateTime" }, { "type": "null" }]
+          }
+        }
+      }
+    },
+    "base_sha": { "$ref": "#/$defs/gitSha" },
+    "policy_sha256": { "$ref": "#/$defs/sha256" },
+    "source_revision_sha256": { "$ref": "#/$defs/sha256" },
+    "media": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source_url",
+          "final_url",
+          "artifact_sha256",
+          "content_type",
+          "size_bytes"
+        ],
+        "properties": {
+          "source_url": { "type": "string", "format": "uri" },
+          "final_url": { "type": "string", "format": "uri" },
+          "artifact_sha256": { "$ref": "#/$defs/sha256" },
+          "content_type": { "$ref": "#/$defs/nonEmpty" },
+          "size_bytes": { "type": "integer", "minimum": 1 }
+        }
+      }
+    },
+    "captured_at": { "$ref": "#/$defs/dateTime" },
+    "snapshot_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "repositoryName": {
+      "type": "string",
+      "pattern": "^[^/\\s]+/[^/\\s]+$"
+    },
+    "safeId": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "gitSha": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "dateTime": { "type": "string", "format": "date-time" },
+    "repositoryPermission": {
+      "enum": ["admin", "maintain", "write", "triage", "read", "none"]
+    },
+    "uniqueStrings": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/nonEmpty" }
+    },
+    "author": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["login", "association"],
+      "properties": {
+        "login": {
+          "oneOf": [{ "$ref": "#/$defs/nonEmpty" }, { "type": "null" }]
+        },
+        "association": {
+          "enum": [
+            "COLLABORATOR",
+            "CONTRIBUTOR",
+            "FIRST_TIME_CONTRIBUTOR",
+            "FIRST_TIMER",
+            "MANNEQUIN",
+            "MEMBER",
+            "NONE",
+            "OWNER"
+          ]
+        }
+      }
+    }
+  }
+}

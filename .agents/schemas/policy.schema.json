@@ -1,0 +1,296 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "labels",
+    "defaults",
+    "cross_area",
+    "merge",
+    "activation",
+    "managed_generation",
+    "path_rules",
+    "generated_rules"
+  ],
+  "properties": {
+    "version": { "const": 1 },
+    "labels": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "types",
+        "areas",
+        "risks",
+        "review_states",
+        "intent",
+        "generated",
+        "manual_review",
+        "issue_approved"
+      ],
+      "properties": {
+        "types": { "$ref": "#/$defs/nonEmptyUniqueStrings" },
+        "areas": { "$ref": "#/$defs/nonEmptyUniqueStrings" },
+        "risks": {
+          "type": "array",
+          "const": ["low", "medium", "high", "human-required"]
+        },
+        "review_states": {
+          "type": "array",
+          "const": ["pending", "clean", "blocked", "stale"]
+        },
+        "intent": { "const": "trusted-auto-merge" },
+        "generated": { "const": "ai:generated" },
+        "manual_review": { "const": "manual review" },
+        "issue_approved": { "const": "ai:issue-approved" }
+      }
+    },
+    "defaults": { "$ref": "#/$defs/routingRule" },
+    "cross_area": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["risk", "skills"],
+      "properties": {
+        "risk": { "$ref": "#/$defs/risk" },
+        "skills": { "$ref": "#/$defs/nonEmptyUniqueStrings" }
+      }
+    },
+    "merge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required_checks",
+        "allowed_method",
+        "require_resolved_conversations",
+        "require_protected_path_approval"
+      ],
+      "properties": {
+        "required_checks": { "$ref": "#/$defs/nonEmptyUniqueStrings" },
+        "allowed_method": { "const": "squash" },
+        "require_resolved_conversations": { "const": true },
+        "require_protected_path_approval": { "const": true }
+      }
+    },
+    "activation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "branch",
+        "controller_tag",
+        "update_authority_ruleset_name",
+        "integrity_ruleset_name",
+        "controller_tag_ruleset_name",
+        "protected_environment",
+        "controller_environment",
+        "require_private_repository",
+        "model_runner_labels",
+        "manager_app_slug",
+        "publisher_app_slug",
+        "merge_app_slug",
+        "required_check_app_slug",
+        "intent_check_app_slug",
+        "manager_permissions",
+        "publisher_permissions",
+        "merge_permissions",
+        "required_workflows",
+        "required_repository_variables",
+        "required_repository_secrets",
+        "controller_environment_secrets",
+        "protected_environment_secrets",
+        "allowed_action_patterns"
+      ],
+      "properties": {
+        "branch": { "const": "main" },
+        "controller_tag": { "const": "cloudx-ai-controller-v1" },
+        "update_authority_ruleset_name": {
+          "const": "CloudX main update authority"
+        },
+        "integrity_ruleset_name": { "const": "CloudX main integrity" },
+        "controller_tag_ruleset_name": {
+          "const": "CloudX controller tag immutability"
+        },
+        "protected_environment": { "const": "cloudx-protected-merge" },
+        "controller_environment": { "const": "cloudx-controller" },
+        "require_private_repository": { "const": false },
+        "model_runner_labels": {
+          "const": ["self-hosted", "Linux", "X64", "cloudx-codex"]
+        },
+        "manager_app_slug": { "const": "cloudx-ai-manager" },
+        "publisher_app_slug": { "const": "cloudx-ai-publisher" },
+        "merge_app_slug": { "const": "cloudx-ai-merge" },
+        "required_check_app_slug": { "const": "cloudx-ai-publisher" },
+        "intent_check_app_slug": { "const": "github-actions" },
+        "manager_permissions": {
+          "const": [
+            "actions:write",
+            "checks:read",
+            "contents:read",
+            "issues:write",
+            "metadata:read",
+            "pull_requests:read"
+          ]
+        },
+        "publisher_permissions": {
+          "const": [
+            "checks:write",
+            "contents:write",
+            "issues:write",
+            "metadata:read",
+            "pull_requests:write"
+          ]
+        },
+        "merge_permissions": {
+          "const": [
+            "checks:write",
+            "contents:write",
+            "metadata:read",
+            "pull_requests:read"
+          ]
+        },
+        "required_workflows": {
+          "const": [
+            ".github/workflows/ai-review.yml",
+            ".github/workflows/ci.yml",
+            ".github/workflows/classify-pr.yml",
+            ".github/workflows/managed-automerge.yml",
+            ".github/workflows/managed-issue.yml",
+            ".github/workflows/protected-merge.yml",
+            ".github/workflows/publish-ci.yml",
+            ".github/workflows/trusted-automerge.yml"
+          ]
+        },
+        "required_repository_variables": {
+          "const": [
+            "CLOUDX_MANAGER_URL",
+            "CLOUDX_MERGE_APP_ID",
+            "CLOUDX_PUBLISHER_APP_ID"
+          ]
+        },
+        "required_repository_secrets": { "type": "array", "const": [] },
+        "controller_environment_secrets": {
+          "const": [
+            "CLOUDX_MANAGER_ARTIFACT_TOKEN",
+            "CLOUDX_MANAGER_RESULT_TOKEN",
+            "CLOUDX_MERGE_APP_PRIVATE_KEY",
+            "CLOUDX_PUBLISHER_APP_PRIVATE_KEY"
+          ]
+        },
+        "protected_environment_secrets": {
+          "const": ["CLOUDX_MERGE_APP_PRIVATE_KEY"]
+        },
+        "allowed_action_patterns": {
+          "const": [
+            "astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b"
+          ]
+        }
+      }
+    },
+    "managed_generation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provenance_app_slug",
+        "intent_app_slug",
+        "author_login",
+        "branch_prefix",
+        "publication_allowed_risks",
+        "automerge_allowed_risks",
+        "provenance_check",
+        "intent_check",
+        "max_files",
+        "max_additions",
+        "max_deletions",
+        "max_patch_bytes"
+      ],
+      "properties": {
+        "provenance_app_slug": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "intent_app_slug": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "author_login": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9-]+\\[bot\\]$"
+        },
+        "branch_prefix": { "type": "string", "pattern": "^[A-Za-z0-9._/-]+-$" },
+        "publication_allowed_risks": {
+          "type": "array",
+          "const": ["low", "medium", "high", "human-required"]
+        },
+        "automerge_allowed_risks": {
+          "type": "array",
+          "const": ["low", "medium"]
+        },
+        "provenance_check": { "const": "Managed Generation / head" },
+        "intent_check": { "const": "Automation Intent / head" },
+        "max_files": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "max_additions": { "type": "integer", "minimum": 1, "maximum": 5000 },
+        "max_deletions": { "type": "integer", "minimum": 1, "maximum": 5000 },
+        "max_patch_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 900000
+        }
+      }
+    },
+    "path_rules": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "allOf": [
+          { "$ref": "#/$defs/routingRule" },
+          {
+            "type": "object",
+            "required": ["name", "globs", "areas"],
+            "properties": {
+              "name": { "$ref": "#/$defs/name" },
+              "globs": { "$ref": "#/$defs/nonEmptyUniqueStrings" },
+              "areas": { "$ref": "#/$defs/nonEmptyUniqueStrings" }
+            }
+          }
+        ]
+      }
+    },
+    "generated_rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "globs"],
+        "properties": {
+          "name": { "$ref": "#/$defs/name" },
+          "globs": { "$ref": "#/$defs/nonEmptyUniqueStrings" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+    "risk": { "enum": ["low", "medium", "high", "human-required"] },
+    "nonEmptyUniqueStrings": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "routingRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["risk", "human_review", "automerge", "skills", "checks"],
+      "properties": {
+        "name": { "$ref": "#/$defs/name" },
+        "globs": { "$ref": "#/$defs/nonEmptyUniqueStrings" },
+        "area": { "type": "string", "minLength": 1 },
+        "areas": { "$ref": "#/$defs/nonEmptyUniqueStrings" },
+        "risk": { "$ref": "#/$defs/risk" },
+        "human_review": { "type": "boolean" },
+        "automerge": { "type": "boolean" },
+        "skills": { "$ref": "#/$defs/nonEmptyUniqueStrings" },
+        "checks": { "$ref": "#/$defs/nonEmptyUniqueStrings" }
+      }
+    }
+  }
+}

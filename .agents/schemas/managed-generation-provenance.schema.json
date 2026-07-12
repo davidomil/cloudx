@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "run_id",
+    "repository",
+    "issue_number",
+    "base_sha",
+    "head_sha",
+    "snapshot_sha256",
+    "policy_sha256",
+    "triage_sha256",
+    "triage_review_sha256",
+    "plan_sha256",
+    "plan_review_sha256",
+    "reproduction_sha256",
+    "implementation_sha256",
+    "verification_sha256",
+    "implementation_review_sha256",
+    "bundle_sha256",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "const": "managed-generation-provenance" },
+    "run_id": { "$ref": "#/$defs/nonEmpty" },
+    "repository": { "type": "string", "pattern": "^[^/\\s]+/[^/\\s]+$" },
+    "issue_number": { "type": "integer", "minimum": 1 },
+    "base_sha": { "$ref": "#/$defs/gitSha" },
+    "head_sha": { "$ref": "#/$defs/gitSha" },
+    "snapshot_sha256": { "$ref": "#/$defs/sha256" },
+    "policy_sha256": { "$ref": "#/$defs/sha256" },
+    "triage_sha256": { "$ref": "#/$defs/sha256" },
+    "triage_review_sha256": { "$ref": "#/$defs/sha256" },
+    "plan_sha256": { "$ref": "#/$defs/sha256" },
+    "plan_review_sha256": { "$ref": "#/$defs/sha256" },
+    "reproduction_sha256": { "$ref": "#/$defs/sha256" },
+    "implementation_sha256": { "$ref": "#/$defs/sha256" },
+    "verification_sha256": { "$ref": "#/$defs/sha256" },
+    "implementation_review_sha256": { "$ref": "#/$defs/sha256" },
+    "bundle_sha256": { "$ref": "#/$defs/sha256" },
+    "created_at": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "gitSha": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+  }
+}
