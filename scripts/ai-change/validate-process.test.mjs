@@ -79,6 +79,31 @@ jobs:
     );
   });
 
+  it("rejects a dependency on a removed private-controller job", () => {
+    const workflow = parseDocument(`
+name: Stale dependency
+on: push
+permissions: {}
+jobs:
+  public-check:
+    runs-on: ubuntu-latest
+    steps:
+      - run: npm test
+  aggregate:
+    needs: [public-check, manager-postgres]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo done
+`).toJS();
+    const issues = [];
+
+    validateWorkflow(process.cwd(), "ci.yml", workflow, issues);
+
+    expect(issues).toContainEqual(
+      expect.stringMatching(/aggregate.*undefined job.*manager-postgres/i),
+    );
+  });
+
   it("fails closed when policy references a skill that is not synchronized", () => {
     const issues = [];
     validatePolicyReferences(

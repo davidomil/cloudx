@@ -173,6 +173,7 @@ export function validateWorkflow(
     issues.push(`Workflow '${workflowName}' must define a jobs object.`);
     return issues;
   }
+  const jobNames = new Set(Object.keys(workflow.jobs));
   if (workflowName === "managed-issue.yml") {
     validateManagedIssueWorkflow(workflowName, workflow, issues);
   }
@@ -203,6 +204,19 @@ export function validateWorkflow(
         `Workflow '${workflowName}' job '${jobName}' must be an object.`,
       );
       continue;
+    }
+    const dependencies =
+      typeof job.needs === "string"
+        ? [job.needs]
+        : Array.isArray(job.needs)
+          ? job.needs
+          : [];
+    for (const dependency of dependencies) {
+      if (typeof dependency !== "string" || !jobNames.has(dependency)) {
+        issues.push(
+          `Workflow '${workflowName}' job '${jobName}' needs undefined job '${String(dependency)}'.`,
+        );
+      }
     }
     if (Object.hasOwn(job, "uses")) {
       validateUsesReference(

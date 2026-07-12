@@ -227,7 +227,6 @@ jobs:
       [
         policy,
         typescript,
-        manager-postgres,
         python-services,
         browser,
         isolated-verifier,
@@ -240,7 +239,6 @@ jobs:
         env:
           POLICY_RESULT: ${{ needs.policy.result }}
           TYPESCRIPT_RESULT: ${{ needs.typescript.result }}
-          MANAGER_POSTGRES_RESULT: ${{ needs.manager-postgres.result }}
           PYTHON_RESULT: ${{ needs.python-services.result }}
           BROWSER_RESULT: ${{ needs.browser.result }}
           ISOLATED_VERIFIER_RESULT: ${{ needs.isolated-verifier.result }}
