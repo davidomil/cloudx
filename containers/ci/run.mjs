@@ -15,11 +15,15 @@ const maximumOutputBytes = 64 * 1024 * 1024;
 const forcedProcessGroupStopMs = 5_000;
 const candidateTerminationPollMs = 25;
 
-export const candidateIdentity = Object.freeze({ uid: 10_001, gid: 10_001 });
+export const candidateIdentity = Object.freeze({
+  uid: 10_001,
+  gid: 10_001,
+  username: "cloudx-ci-candidate",
+});
 
 export function verificationCommands() {
   return [
-    command(10 * 60 * 1_000, "npm", "ci", "--offline", "--ignore-scripts"),
+    command(10 * 60 * 1_000, "npm", "ci", "--offline"),
     command(commandTimeoutMs, "node", "scripts/ai-change/validate-process.mjs"),
     command(commandTimeoutMs, "npm", "run", "format:check"),
     command(commandTimeoutMs, "npm", "run", "lint"),
@@ -192,8 +196,9 @@ export async function runCommand(planned, root, identity = candidateIdentity) {
     const child = spawn(planned.command, planned.args, {
       cwd: root,
       detached: true,
-      env: { ...process.env, ...planned.env },
-      ...identity,
+      env: { ...process.env, USER: identity.username, ...planned.env },
+      uid: identity.uid,
+      gid: identity.gid,
       stdio: ["ignore", "pipe", "pipe"],
     });
     const stdoutHash = createHash("sha256");

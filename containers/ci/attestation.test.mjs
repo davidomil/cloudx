@@ -15,7 +15,46 @@ import {
   publishAttestation,
   runCommand,
   terminateCandidateProcesses,
+  verificationCommands,
 } from "./run.mjs";
+
+test("dependency installation runs lifecycle scripts only inside the candidate sandbox", () => {
+  const install = verificationCommands()[0];
+
+  assert.deepEqual(install.args, ["ci", "--offline"]);
+  assert.equal(install.command, "npm");
+});
+
+test("candidate commands receive an identity-consistent login environment", async () => {
+  assert.equal(process.getuid?.(), 0, "test must run as root");
+  prepareSupervisor();
+  const sandbox = await fs.mkdtemp(
+    path.join(os.tmpdir(), "cloudx-candidate-user-"),
+  );
+  await fs.chmod(sandbox, 0o777);
+  const output = path.join(sandbox, "user.txt");
+
+  try {
+    const result = await runCommand(
+      {
+        command: "sh",
+        args: ["-c", 'printf "%s" "$USER" > "$OUTPUT"'],
+        env: { OUTPUT: output },
+        timeoutMs: 1_000,
+      },
+      sandbox,
+    );
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(await fs.readFile(output, "utf8"), candidateIdentity.username);
+  } finally {
+    await terminateCandidateProcesses({
+      terminateGraceMs: 250,
+      killGraceMs: 2_000,
+    });
+    await fs.rm(sandbox, { recursive: true, force: true });
+  }
+});
 
 test("candidate commands cannot create or replace supervisor attestation", async () => {
   assert.equal(process.getuid?.(), 0, "test must run as root");

@@ -10,7 +10,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 COPY --from=uv /uv /uvx /usr/local/bin/
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends git python3 python3-venv ripgrep \
+    && apt-get install --yes --no-install-recommends build-essential git python3 python3-venv ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/cloudx-base
