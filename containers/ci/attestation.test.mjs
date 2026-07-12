@@ -18,6 +18,12 @@ import {
   verificationCommands,
 } from "./run.mjs";
 
+test("verifier image pins the CI Node runtime and offline native headers", async () => {
+  assert.equal(process.versions.node, "22.23.1");
+  await fs.access("/usr/local/include/node/node.h");
+  assert.equal(process.env.npm_config_nodedir, "/usr/local");
+});
+
 test("dependency installation runs lifecycle scripts only inside the candidate sandbox", () => {
   const install = verificationCommands()[0];
 
