@@ -42,8 +42,9 @@ For every non-trivial change, use `$change-orchestrator`:
 7. Route findings back through implementation, verification, and review until
    clean. An iteration ceiling blocks the change; it never permits a bypass.
 8. Use `$review-pr` for current-head PR review. Only `$ship-change` may perform
-   interactive or model-directed GitHub mutations; trusted workflow controllers
-   may publish deterministic labels, checks, intent, and exact-head merges.
+   interactive or model-directed GitHub mutations. External Publisher and Merge
+   controllers may perform only the deterministic operations granted to their
+   separate GitHub App identities.
 
 The planner, implementer, verifier, reviewer, and shipper are separate roles.
 Never let an author review its own prior conversation. Pass a reviewer only the

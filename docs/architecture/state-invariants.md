@@ -25,24 +25,6 @@ must remain blocked.
 - Secret values never appear in public configuration, logs, notifications,
   browser state, or review artifacts.
 
-## Local AI Controller
-
-- Account-authenticated model work requires an explicit unsupported-use risk
-  acceptance and current-writer authorization bound to the exact subject.
-- The manager owns durable execution identity. A claimed or running lease that
-  expires becomes uncertain and is never automatically retried.
-- Repository instructions, hooks, plugins, MCP configuration, links, special
-  files, binary files, and oversized content cannot become model authority.
-- The executor owns credential-free static verification; Codex, Publisher, and
-  Merge run as separate service identities under fixed operation schemas.
-- Model work is ephemeral, read-only, shell-free, output-schema-bound, process
-  bounded, and serialized for one persistent `auth.json`.
-- Actuator capabilities are one-time, execution-bound, operation-bound,
-  subject-bound, expiring, and consumed before a current-state revalidation.
-- Public routing exposes only health and the HMAC-signed target webhook.
-- Runtime code comes from a root-owned exact commit and canonical source digest,
-  not a mutable private branch or tag.
-
 ## Workspace And UI
 
 - Persisted workspace state is the server authority. Browser state is a
@@ -54,29 +36,10 @@ must remain blocked.
 - Subscriptions, timers, object URLs, terminal views, audio streams, and sockets
   are disposed when their owner unmounts or is removed.
 
-## Deployment And Recovery
-
-- A read-only Docker and Compose capability check runs before image, container,
-  service, network, or volume mutation. Unsupported commands or options fail the
-  operation; there is no compatibility fallback.
-- Container authority uses full 64-character IDs. Deployment identity includes
-  concrete network and volume names, immutable image IDs, static OCI revision
-  labels, non-secret configuration, and secret fingerprints.
-- PostgreSQL remains on major version 18. An in-place deployment may change only
-  to an equal or newer minor image while preserving every non-image setting,
-  exact named data volume, and network. It validates the live server version and
-  complete migration ledger before manager replacement.
-- Newly started manager or PostgreSQL containers retain `restart=no` until all
-  final identity, data, migration, and readiness checks pass. Failure stops each
-  uncommitted container and never retries the start.
-- Backup, upgrade, and restore bind the same database dump, artifact archive,
-  stopped manager, repository revision, immutable manager image, deployment
-  identity, and seven-entry checksum manifest. Restore requires an empty target;
-  rollback restores the prior co-consistent bundle rather than down-migrating.
-
 ## Automation
 
-- Graph schemas and referenced hooks/triggers validate before a run is queued.
+- Graph schemas and referenced hooks or triggers validate before a run is
+  queued.
 - Compile-time and runtime safety decisions use the same safety vocabulary.
 - Run steps, duration, process output, loop counts, and concurrent work are
   bounded.
@@ -88,118 +51,50 @@ must remain blocked.
   crash-interrupted dispatch may replay only the same stable key; a controlled
   delivery failure becomes failed and requires explicit operator resolution.
 - Automation derives a namespaced event identity from a plugin `eventId` and
-  durably claims one queued run per group before acknowledging the trigger. If
-  the claim cannot reach disk, acknowledgement fails.
-- Python and Bash nodes are host execution. Changes to them are
-  `human-required` and receive security review.
+  durably claims one queued run per group before acknowledging the trigger.
+- Python and Bash nodes are host execution. Changes require explicit human
+  review and adversarial path, environment, timeout, cancellation, and output
+  tests.
 
-## ASR And Documentation
+## Voice And ASR
 
-- ASR validates audio before inference, cleans temporary files on every exit,
-  keeps model ownership explicit, and does not expose transcript text in logs
-  unless the debug privacy setting explicitly permits it.
-- Blocking model, media, extraction, and archive work does not run on an async
-  request loop without an explicit worker boundary.
-- Documentation import/export either commits a valid archive state or preserves
-  the previous valid state. Failed extraction or index rebuild cannot publish a
-  half-updated document.
-- Uploaded, extracted, and generated artifacts remain bounded and path-safe.
+- Each captured utterance has one queue identity and one terminal outcome.
+- Stopping capture or removing its owner closes browser, server, and ASR stream
+  resources.
+- Transcript ordering follows accepted utterance identity, not callback timing.
+- Audio, transcripts, and model diagnostics do not enter logs unless the user
+  explicitly enables the documented diagnostic path.
 
-## Historical V3 Repository AI Process
+## Documentation Archive
 
-This section and its managed-issue subsection preserve the retired private
-Actions design for migration evidence. V4 authority is defined under Local AI
-Controller above and in `local-ai-controller.md`.
+- Catalog metadata and on-disk artifacts commit as one logical import or expose
+  a recoverable incomplete state.
+- Rebuild, import, and invalidation do not silently discard the last usable
+  archive.
+- Extraction and enrichment enforce file, archive, page, frame, transcript,
+  memory, time, and concurrency bounds before expensive work begins.
+- Derived chunks, keyframes, transcripts, and metadata retain source and
+  transformation provenance.
 
-The authoritative transition implementation is
-`scripts/ai-change/state-machine.mjs`.
+## Repository AI Automation
 
-- Planning, plan review, implementation, deterministic verification,
-  implementation review, PR CI, PR AI review, and merge authorization are
-  distinct states.
-- Review findings and iteration ceilings block; they never grant progress.
-- Verification is read-only. A changed worktree invalidates the verification.
-- Every review and merge intent is bound to the current 40-character head SHA.
-- A new implementation or PR head clears prior exact-head evidence.
-- `trusted-auto-merge` is intent display, not authorization evidence.
-- Only `$ship-change` may perform interactive or model-directed GitHub
-  mutations. Trusted workflow controllers may perform their narrow,
-  deterministic label, check, intent, and exact-head merge operations.
-
-### Managed Issue Automation
-
-- A webhook delivery ID is deduplicated for the configured terminal-retention
-  horizon. The default is 90 days and the minimum is 30 days, both beyond GitHub
-  Cloud's documented three-day redelivery window. A retained
-  `abandon-delivery` audit is a permanent tombstone after raw-body compaction.
-  One issue has at most one non-terminal managed run.
-- Canonical issue text, comments, timeline, base SHA, and allowed media are
-  content-addressed before model execution. An issue or base change supersedes
-  evidence derived from the old snapshot.
-- External-author work requires a writer-applied approval event strictly newer
-  than the latest authoritative revision. Calculated current repository
-  permission, not author association, decides writer authority. Read, triage,
-  drive-by, and manager-authored comments are excluded from model context,
-  media, and revision identity.
-- Workflow dispatch is bound to one exact workflow definition, repository,
-  issue, run, snapshot, and one-time capability. Only run attempt 1 can consume
-  secrets or write authority.
-- Every fresh reviewer produces its own subject-bound artifact. The trusted
-  controller recomputes the required reviewer set and fails closed when any
-  role, digest, or classification is absent or different.
-- Every model job runs as the non-root `cloudx-codex` service account on the one
-  dedicated self-hosted model runner. Direct `codex exec` reuses file-backed
-  ChatGPT account authentication; no API-key path exists. Exact audited
-  profiles expose minimal runtime paths, temporary files, and workspace read
-  access, with workspace write access only for bounded reproduction. The
-  implementation model has no shell tool and cannot apply or execute its
-  proposal. Generated code runs only in the credential-free verifier. The
-  verifier supervisor owns its
-  attestation path, drops candidate commands to an unprivileged identity,
-  runs with an init process that reaps descendants, gives every command an
-  explicit timeout and output ceiling, owns a detached POSIX process group,
-  applies bounded TERM/KILL cleanup, hashes source only after the process tree
-  stops, and stops on the first mutation.
-- The Manager App can read repository state, project issue state, and dispatch
-  workflows. Its host never receives the Publisher App key.
-- The Candidate Publisher App can create candidate branches, pull requests,
-  labels, and provenance checks but cannot bypass protection on `main`. Its
-  token never reaches generated code or the manager host.
-- The Merge Authority App can publish automation intent and perform exact-head
-  merges but cannot publish candidate code. Its key is available only to
-  SHA-bound merge controllers.
-- Any managed fingerprint, including App author, branch prefix, body marker, or
-  generated label, selects the managed merge path. Removing a label cannot
-  downgrade a managed PR to maintainer intent.
-- A successful workflow process exit is not merge authorization. The manager
-  advances only from a typed terminal result bound to the registered workflow
-  run and confirmed current PR state.
-- Managed live source authorization executes inside the deterministic exact
-  merge controller after the final main/PR identity read and immediately before
-  its sole SHA-bound merge request. A rejected authorization causes no merge
-  request or `main` update. Only this controller briefly holds both the manager
-  result token and scoped Merge Authority App token; model and candidate code
-  receive neither.
-- Snapshot, media, and stage bytes reserve repository and global capacity
-  before no-overwrite publication. Known failures delete only newly created,
-  locked-and-unreferenced content. Unknown commit outcomes retain bytes for the
-  bounded orphan scanner.
-- Active-work capacity is keyed by run. A new canonical revision excludes the
-  same issue's replaceable managed-run slot so it can reach supersession, but
-  processing, registration-ambiguous, and dispatched workflows retain their
-  external-execution lease. Saturation persists a non-active blocked admission
-  and cannot dispatch another workflow.
-- Operator recovery mutates only one exact dispatch-registration,
-  workflow-completion, or issue-projection target listed by read-only
-  inspection. The request binds target ID, run ID, complete state digest,
-  sanitized workflow correlation when present, stable operation ID, and
-  evidence note. Completion recovery applies the normal lifecycle, releases
-  the external lease, projects status, and records its audit in one
-  transaction. A recurrence requires a new inspection and operation ID. No
-  automatic privileged mutation retry exists.
-- The active `main` ruleset permits updates only through the Merge Authority App and
-  binds required checks to their expected Apps. Without that live rule, the
-  automated merge system is not activated.
-- Activation also requires the immutable controller tag to resolve to an
-  independently supplied audited commit SHA. Tag immutability alone is not
-  controller provenance.
+- Issue text, comments, media, pull-request content, patches, model output,
+  links, repository instructions below the trusted root, and workflow artifacts
+  are untrusted data.
+- The public repository contains policy, schemas, role contracts, deterministic
+  validators, and credential-free CI; it contains no private model session or
+  privileged controller credential.
+- A typed artifact is valid only for its declared subject, base, head, policy,
+  role, schema version, and evidence. A later push makes earlier head-bound
+  evidence stale.
+- Candidate code cannot replace the verifier, publish its own trusted check, or
+  gain a privileged repository token from the verification environment.
+- Labels and prose are projections. They cannot satisfy a required check,
+  weaken policy, or authorize a merge.
+- Human review remains required for protected instruction, policy, workflow,
+  security, installer, and host-execution paths.
+- Automated publication and merge use separate, least-privilege external
+  identities. Merge readiness is revalidated against current GitHub state and
+  the exact reviewed head immediately before the update request.
+- The public ruleset is the authority for required checks and permitted updates
+  to `main`; private deployment details cannot override it.
