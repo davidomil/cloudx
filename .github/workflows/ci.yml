@@ -69,7 +69,7 @@ jobs:
           cache-dependency-glob: services/asr/uv.lock
       - run: uv lock --check --project services/asr
       - run: uv sync --locked --project services/asr --extra dev
-      - run: uv run --locked --no-sync --project services/asr python -m pytest services/asr/tests -q
+      - run: uv run --locked --no-sync --project services/asr env PYTHONPATH=services/asr/src python -m pytest services/asr/tests -q
 
   documentation:
     name: Documentation indexer (pytest)
