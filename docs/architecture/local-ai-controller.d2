@@ -1,0 +1,47 @@
+direction: down
+
+public: Public CloudX {
+  shape: rectangle
+  ci: GitHub-hosted CI and classification
+  rules: Public rulesets
+}
+
+manager: Intake manager {
+  shape: rectangle
+  state: PostgreSQL local executions
+  key: Target Manager App only
+}
+
+executor: Local executor {
+  shape: rectangle
+  creds: No App key or Codex auth
+}
+
+codex: Codex worker {
+  shape: rectangle
+  auth: auth.json only
+}
+
+verifier: Static verifier {
+  shape: rectangle
+  boundary: No candidate execution or credential
+}
+
+publisher: Publisher actuator {
+  shape: rectangle
+  key: Publisher App only
+}
+
+merge: Merge actuator {
+  shape: rectangle
+  key: Merge Authority App only
+}
+
+public -> manager: signed target webhook
+manager -> executor: one-attempt execution capability
+executor -> codex: bounded prompt and schema
+executor -> verifier: exact patch and subject identity
+executor -> publisher: one-time typed request
+executor -> merge: one-time typed request
+publisher -> public: branch, PR, labels, checks
+merge -> public: exact-head managed merge

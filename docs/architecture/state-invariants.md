@@ -25,6 +25,24 @@ must remain blocked.
 - Secret values never appear in public configuration, logs, notifications,
   browser state, or review artifacts.
 
+## Local AI Controller
+
+- Account-authenticated model work requires an explicit unsupported-use risk
+  acceptance and current-writer authorization bound to the exact subject.
+- The manager owns durable execution identity. A claimed or running lease that
+  expires becomes uncertain and is never automatically retried.
+- Repository instructions, hooks, plugins, MCP configuration, links, special
+  files, binary files, and oversized content cannot become model authority.
+- The executor owns credential-free static verification; Codex, Publisher, and
+  Merge run as separate service identities under fixed operation schemas.
+- Model work is ephemeral, read-only, shell-free, output-schema-bound, process
+  bounded, and serialized for one persistent `auth.json`.
+- Actuator capabilities are one-time, execution-bound, operation-bound,
+  subject-bound, expiring, and consumed before a current-state revalidation.
+- Public routing exposes only health and the HMAC-signed target webhook.
+- Runtime code comes from a root-owned exact commit and canonical source digest,
+  not a mutable private branch or tag.
+
 ## Workspace And UI
 
 - Persisted workspace state is the server authority. Browser state is a
@@ -87,7 +105,11 @@ must remain blocked.
   half-updated document.
 - Uploaded, extracted, and generated artifacts remain bounded and path-safe.
 
-## Repository AI Process
+## Historical V3 Repository AI Process
+
+This section and its managed-issue subsection preserve the retired private
+Actions design for migration evidence. V4 authority is defined under Local AI
+Controller above and in `local-ai-controller.md`.
 
 The authoritative transition implementation is
 `scripts/ai-change/state-machine.mjs`.
@@ -104,7 +126,7 @@ The authoritative transition implementation is
   mutations. Trusted workflow controllers may perform their narrow,
   deterministic label, check, intent, and exact-head merge operations.
 
-## Managed Issue Automation
+### Managed Issue Automation
 
 - A webhook delivery ID is deduplicated for the configured terminal-retention
   horizon. The default is 90 days and the minimum is 30 days, both beyond GitHub

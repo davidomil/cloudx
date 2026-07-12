@@ -26,7 +26,8 @@
         "intent",
         "generated",
         "manual_review",
-        "issue_approved"
+        "issue_approved",
+        "pr_model_authorized"
       ],
       "properties": {
         "types": { "$ref": "#/$defs/nonEmptyUniqueStrings" },
@@ -42,7 +43,8 @@
         "intent": { "const": "trusted-auto-merge" },
         "generated": { "const": "ai:generated" },
         "manual_review": { "const": "manual review" },
-        "issue_approved": { "const": "ai:issue-approved" }
+        "issue_approved": { "const": "ai:issue-approved" },
+        "pr_model_authorized": { "const": "ai:review-requested" }
       }
     },
     "defaults": { "$ref": "#/$defs/routingRule" },
@@ -76,14 +78,10 @@
       "additionalProperties": false,
       "required": [
         "branch",
-        "controller_tag",
+        "local_controller_protocol",
         "update_authority_ruleset_name",
         "integrity_ruleset_name",
-        "controller_tag_ruleset_name",
-        "protected_environment",
-        "controller_environment",
-        "require_private_repository",
-        "model_runner_labels",
+        "private_actions_required",
         "manager_app_slug",
         "publisher_app_slug",
         "merge_app_slug",
@@ -92,34 +90,24 @@
         "manager_permissions",
         "publisher_permissions",
         "merge_permissions",
-        "required_workflows",
+        "required_public_workflows",
         "required_repository_variables",
         "required_repository_secrets",
-        "controller_environment_secrets",
-        "protected_environment_secrets",
         "allowed_action_patterns"
       ],
       "properties": {
         "branch": { "const": "main" },
-        "controller_tag": { "const": "cloudx-ai-controller-v3" },
+        "local_controller_protocol": { "const": 4 },
         "update_authority_ruleset_name": {
           "const": "CloudX main update authority"
         },
         "integrity_ruleset_name": { "const": "CloudX main integrity" },
-        "controller_tag_ruleset_name": {
-          "const": "CloudX controller tag immutability"
-        },
-        "protected_environment": { "const": "cloudx-protected-merge" },
-        "controller_environment": { "const": "cloudx-controller" },
-        "require_private_repository": { "const": false },
-        "model_runner_labels": {
-          "const": ["self-hosted", "Linux", "X64", "cloudx-codex"]
-        },
+        "private_actions_required": { "const": false },
         "manager_app_slug": { "const": "cloudx-ai-manager" },
         "publisher_app_slug": { "const": "cloudx-ai-publisher" },
         "merge_app_slug": { "const": "cloudx-ai-merge" },
         "required_check_app_slug": { "const": "cloudx-ai-publisher" },
-        "intent_check_app_slug": { "const": "github-actions" },
+        "intent_check_app_slug": { "const": "cloudx-ai-merge" },
         "manager_permissions": {
           "const": [
             "actions:read",
@@ -132,6 +120,7 @@
         },
         "publisher_permissions": {
           "const": [
+            "actions:read",
             "checks:write",
             "contents:write",
             "issues:write",
@@ -141,43 +130,20 @@
         },
         "merge_permissions": {
           "const": [
-            "checks:write",
+            "checks:read",
             "contents:write",
             "metadata:read",
             "pull_requests:read"
           ]
         },
-        "required_workflows": {
+        "required_public_workflows": {
           "const": [
-            ".github/workflows/ai-review.yml",
             ".github/workflows/ci.yml",
-            ".github/workflows/classify-pr.yml",
-            ".github/workflows/managed-automerge.yml",
-            ".github/workflows/managed-issue.yml",
-            ".github/workflows/protected-merge.yml",
-            ".github/workflows/publish-ci.yml",
-            ".github/workflows/trusted-automerge.yml"
+            ".github/workflows/classify-pr.yml"
           ]
         },
-        "required_repository_variables": {
-          "const": [
-            "CLOUDX_MANAGER_URL",
-            "CLOUDX_MERGE_APP_ID",
-            "CLOUDX_PUBLISHER_APP_ID"
-          ]
-        },
+        "required_repository_variables": { "type": "array", "const": [] },
         "required_repository_secrets": { "type": "array", "const": [] },
-        "controller_environment_secrets": {
-          "const": [
-            "CLOUDX_MANAGER_ARTIFACT_TOKEN",
-            "CLOUDX_MANAGER_RESULT_TOKEN",
-            "CLOUDX_MERGE_APP_PRIVATE_KEY",
-            "CLOUDX_PUBLISHER_APP_PRIVATE_KEY"
-          ]
-        },
-        "protected_environment_secrets": {
-          "const": ["CLOUDX_MERGE_APP_PRIVATE_KEY"]
-        },
         "allowed_action_patterns": {
           "const": [
             "astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b"

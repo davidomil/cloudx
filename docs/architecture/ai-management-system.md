@@ -10,6 +10,12 @@ format:
     variant: +yaml_metadata_block
 ---
 
+> [!WARNING]
+>
+> This document records the V3 private-Actions design. It is retained as
+> migration history and is not an activation contract. The normative design is
+> [CloudX Local AI Controller V4](local-ai-controller.md).
+
 ## Decision
 
 > [!IMPORTANT]

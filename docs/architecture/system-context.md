@@ -14,21 +14,19 @@ tracked repository artifacts and GitHub controls; it must not be added to
 
 ## Repository Automation Processes
 
-| Process                          | Responsibility                                                                                                                            | Must not own                                                                            |
-| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| AI manager, `apps/ai-manager`    | Verify webhooks, snapshot issue context and media, persist run authority, project discussion state, and dispatch exact workflow revisions | Repository-code execution, model credentials, publisher credentials, or merge actuation |
-| Logged-in Codex runner           | Run serialized model-only jobs as `cloudx-codex` with persistent ChatGPT account authentication and exact workspace profiles              | GitHub mutation credentials, candidate execution, durable run authority, or host sudo   |
-| Managed GitHub Actions workflows | Orchestrate model jobs and run credential-free verification, publication, and merge controllers                                           | Durable run authority or direct access to the Codex account credential                  |
-| CI verifier, `containers/ci`     | Supervise candidate commands in a no-network, read-only container and write trusted deterministic evidence                                | Model judgment or GitHub mutation                                                       |
-| Candidate publisher controllers  | Validate candidate artifacts, create the candidate branch and PR, and publish provenance                                                  | Issue intake, generated-code execution, or authority to update `main`                   |
-| Merge authority controllers      | Recompute exact-head readiness, publish automation intent, and perform one SHA-bound merge                                                | Candidate publication, model judgment, or issue intake                                  |
+| Process                       | Responsibility                                                                                                        | Must not own                                                                              |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| AI manager, `apps/ai-manager` | Verify signed target webhooks, snapshot exact subjects, own PostgreSQL execution state, and issue one-time capability | Model authentication, candidate execution, publication, or merge keys                     |
+| Local executor                | Claim one execution, materialize bounded context, route fixed stages, and statically validate proposed patches        | App keys, Codex authentication, candidate execution, arbitrary commands, or durable state |
+| Codex worker                  | Run one serialized, schema-bound, read-only and shell-free model stream                                               | GitHub credentials, source fetching, verification, or host sudo                           |
+| Public CI verifier            | Execute exact candidates on GitHub-hosted runners with pinned tooling and no privileged repository credential         | Model judgment or GitHub mutation                                                         |
+| Publisher actuator            | Revalidate typed publication requests and publish candidate branches, PRs, labels, and checks                         | Model authentication, merge authority, or arbitrary repository writes                     |
+| Merge actuator                | Re-fetch current readiness, publish exact intent, and perform one SHA-bound merge                                     | Candidate publication, model judgment, or issue intake                                    |
 
-The manager host holds the read-oriented Manager App key. The private
-self-hosted runner holds only the persistent ChatGPT Codex login. Trusted
-GitHub-hosted Actions jobs hold separate Candidate Publisher and Merge Authority
-App keys. These credentials are not interchangeable, and model jobs receive no
-GitHub write credential. Only the Merge Authority App appears in the active
-`main` ruleset bypass list.
+The private repository is source distribution, not the runtime trust anchor.
+The host installs a root-owned exact commit and canonical source digest. Public
+CloudX keeps GitHub-hosted CI and public rulesets; no public workflow can select
+the logged-in Codex worker. See [CloudX Local AI Controller V4](local-ai-controller.md).
 
 ## Runtime Processes
 

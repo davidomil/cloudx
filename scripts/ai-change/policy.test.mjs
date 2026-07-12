@@ -9,22 +9,18 @@ import { classifyChange, loadPolicy, reconcileLabels } from "./policy.mjs";
 const policy = await loadPolicy();
 
 describe("AI change policy", () => {
-  it("defines layered activation and three least-privilege App authorities", () => {
+  it("defines public rulesets and three local-controller App authorities", () => {
     expect(policy.activation).toMatchObject({
       branch: "main",
-      controller_tag: "cloudx-ai-controller-v3",
+      local_controller_protocol: 4,
       update_authority_ruleset_name: "CloudX main update authority",
       integrity_ruleset_name: "CloudX main integrity",
-      controller_tag_ruleset_name: "CloudX controller tag immutability",
-      protected_environment: "cloudx-protected-merge",
-      controller_environment: "cloudx-controller",
-      require_private_repository: false,
-      model_runner_labels: ["self-hosted", "Linux", "X64", "cloudx-codex"],
+      private_actions_required: false,
       manager_app_slug: "cloudx-ai-manager",
       publisher_app_slug: "cloudx-ai-publisher",
       merge_app_slug: "cloudx-ai-merge",
       required_check_app_slug: "cloudx-ai-publisher",
-      intent_check_app_slug: "github-actions",
+      intent_check_app_slug: "cloudx-ai-merge",
       manager_permissions: [
         "actions:read",
         "checks:read",
@@ -34,6 +30,7 @@ describe("AI change policy", () => {
         "pull_requests:read",
       ],
       publisher_permissions: [
+        "actions:read",
         "checks:write",
         "contents:write",
         "issues:write",
@@ -41,25 +38,18 @@ describe("AI change policy", () => {
         "pull_requests:write",
       ],
       merge_permissions: [
-        "checks:write",
+        "checks:read",
         "contents:write",
         "metadata:read",
         "pull_requests:read",
       ],
     });
+    expect(policy.activation.required_public_workflows).toEqual([
+      ".github/workflows/ci.yml",
+      ".github/workflows/classify-pr.yml",
+    ]);
+    expect(policy.activation.required_repository_variables).toEqual([]);
     expect(policy.activation.required_repository_secrets).toEqual([]);
-    expect(policy.activation.controller_environment_secrets).toEqual([
-      "CLOUDX_MANAGER_ARTIFACT_TOKEN",
-      "CLOUDX_MANAGER_RESULT_TOKEN",
-      "CLOUDX_MERGE_APP_PRIVATE_KEY",
-      "CLOUDX_PUBLISHER_APP_PRIVATE_KEY",
-    ]);
-    expect(policy.activation.protected_environment_secrets).toEqual([
-      "CLOUDX_MERGE_APP_PRIVATE_KEY",
-    ]);
-    expect(policy.activation.required_workflows).toContain(
-      ".github/workflows/protected-merge.yml",
-    );
     expect(policy.activation.allowed_action_patterns).toEqual([
       "astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b",
     ]);
@@ -85,6 +75,7 @@ describe("AI change policy", () => {
 
   it("defines one bounded generated-change authority", () => {
     expect(policy.labels.issue_approved).toBe("ai:issue-approved");
+    expect(policy.labels.pr_model_authorized).toBe("ai:review-requested");
     expect(policy.managed_generation).toMatchObject({
       provenance_app_slug: "cloudx-ai-publisher",
       intent_app_slug: "cloudx-ai-merge",
@@ -193,6 +184,55 @@ describe("AI change policy", () => {
       });
       expect(change.matchedRules).toContain(expectedRule);
       expect(change.skills).toContain("review-security");
+    },
+  );
+
+  it.each([
+    "apps/ai-manager/src/main.ts",
+    "apps/local-executor/src/main.ts",
+    "scripts/local/executor.mjs",
+    "deploy/ai-manager/compose.yaml",
+    "deploy/host/install-services.sh",
+    "deploy/systemd/cloudx-ai-executor.service",
+  ])(
+    "routes V4 privileged path %s through automation and security",
+    (changedPath) => {
+      const change = classifyChange(policy, {
+        type: "chore",
+        paths: [changedPath],
+      });
+
+      expect(change).toMatchObject({
+        areas: ["automation", "security"],
+        risk: "human-required",
+        humanReviewRequired: true,
+        automergeEligible: false,
+      });
+      expect(change.matchedRules).toContain("local-ai-control-plane");
+      expect(change.skills).toEqual(
+        expect.arrayContaining(["review-automation", "review-security"]),
+      );
+    },
+  );
+
+  it.each(["setup.sh", "scripts/setup/SetupOrchestrator.mjs"])(
+    "routes V4 setup path %s through installer review",
+    (changedPath) => {
+      const change = classifyChange(policy, {
+        type: "chore",
+        paths: [changedPath],
+      });
+
+      expect(change).toMatchObject({
+        areas: ["installer"],
+        risk: "human-required",
+        humanReviewRequired: true,
+        automergeEligible: false,
+      });
+      expect(change.matchedRules).toContain("installer");
+      expect(change.skills).toEqual(
+        expect.arrayContaining(["review-installer", "review-security"]),
+      );
     },
   );
 

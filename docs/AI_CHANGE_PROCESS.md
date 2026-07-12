@@ -1,5 +1,10 @@
 # AI Change Process
 
+> **V4 authority:** [CloudX Local AI Controller V4](architecture/local-ai-controller.md)
+> is the normative activation and trust-boundary document. The workflow-runner
+> details retained below describe the V3 implementation and are non-normative
+> during the breaking V4 migration.
+
 ## Goal
 
 CloudX uses repository-resident engineering automation for two entry paths:
@@ -58,14 +63,15 @@ instructions, the original task, a bounded typed subject, repository source,
 the current diff, and test evidence. It does not inherit the conversation that
 created the subject.
 
-Every model job runs on the single dedicated `cloudx-codex` self-hosted runner
-as its non-root service account. The local action invokes the pinned Codex CLI
-directly and reuses that account's file-backed ChatGPT login. The audited Codex
-profiles expose only minimal runtime paths, temporary files, and the workspace;
-only bounded reproduction receives workspace write authority. Implementation
-synthesis disables `shell_tool` and emits a proposal without trusted byte or
-digest claims. Trusted code captures the patch; only the credential-free
-no-network verifier applies or executes candidate code.
+Every model job runs in the private host's serialized
+`cloudx-ai-codex-worker.service` as the non-root `cloudx-codex` account. The
+local executor invokes that worker over a root-installed Unix socket; no GitHub
+Actions workflow can select it. The pinned Codex CLI reuses only the account's
+file-backed ChatGPT login, and the worker receives bounded schema-bound input
+without GitHub credentials or candidate execution authority. Implementation
+synthesis emits a proposal without trusted byte or digest claims. Trusted code
+captures the patch; only public credential-free GitHub-hosted CI executes the
+candidate.
 
 This is Phase-inspired rather than behaviorally identical. One immutable issue
 revision receives one logged-in model workflow attempt and one bounded
@@ -73,7 +79,12 @@ synthesis-review sequence. A finding or changed requirement starts from a new
 canonical issue revision and durable run instead of opening an unbounded
 model repair loop.
 
-## Managed Issue Intake
+## Historical V3 Actions Design
+
+The remaining sections describe the retired V3 workflow implementation for
+migration and audit context. They are not V4 setup instructions.
+
+### Managed Issue Intake
 
 1. `POST /webhooks/github/target` verifies the exact raw body with HMAC-SHA256 and
    durably inserts the GitHub delivery identity before returning `202`.
@@ -106,7 +117,7 @@ model repair loop.
 Issue text, comments, media, patches, model output, workflow artifacts, and PR
 content remain untrusted data. They never become controller instructions.
 
-## Managed Stage Chain
+### Managed Stage Chain
 
 The managed workflow reports eight content-addressed artifacts to
 `POST /v1/workflow-stages` under the result token:
@@ -142,7 +153,7 @@ The terminal managed result is invalid until all eight rows and exact artifact
 digests exist in order. Triage through implementation bind to the generation
 base; verification and implementation review bind to the candidate head.
 
-## Static Area Review
+### Static Area Review
 
 Both managed generation and ordinary PR review select from the same finite set:
 
@@ -154,7 +165,7 @@ and `review-web`.
 The workflows declare 11 explicit conditional jobs. They do not let model output
 create a dynamic reviewer matrix.
 
-### Managed Generation
+#### Managed Generation
 
 The verified candidate metadata supplies the selected skills and remains bound
 to the accepted triage digest. Every selected area job must succeed with one
@@ -163,7 +174,7 @@ canonical manifest records exact role coverage, artifact digests, verdicts,
 durable tags, and findings. A fresh `review-change` context aggregates that
 manifest.
 
-### Ordinary Pull Requests
+#### Ordinary Pull Requests
 
 The target App sends public pull-request events to the manager. The manager
 dispatches the private controller with exact base and head identities.
@@ -177,7 +188,7 @@ unknown, missing, duplicate, non-file, noncanonical, wrong-role, and stale
 artifacts before sealing `area-review-manifest.json`. A fresh `review-pr`
 context aggregates that exact bundle.
 
-### Aggregate Invariant
+#### Aggregate Invariant
 
 An aggregate must preserve the complete area-finding multiset and the union of
 all area-review tags. It cannot remove a finding, discard `manual-review`, or
@@ -185,7 +196,7 @@ turn any blocked area verdict into `clean`. The trusted publisher repeats
 manifest, artifact, aggregate, and live identity validation before publishing
 `AI Review / head`.
 
-## Typed Artifacts
+### Typed Artifacts
 
 The repository schemas bind every handoff to its exact subject:
 
@@ -211,7 +222,7 @@ Any material deviation requires replanning and fresh review. A schema error,
 unknown field, missing artifact, stale digest, or ambiguous identity blocks the
 transition.
 
-## Exact Check Identity
+### Exact Check Identity
 
 Canonical v2 check IDs bind:
 
@@ -230,7 +241,7 @@ and bound head second. The manager accepts the current CI and review only from
 the configured Candidate Publisher App and requires both checks to name the
 same test-merge commit and tree before dispatching managed automerge.
 
-## GitHub Controllers
+### GitHub Controllers
 
 CloudX owns only `classify-pr.yml` and `ci.yml`. Every workflow named below
 other than those two exists only in the private controller repository and is
@@ -273,7 +284,7 @@ that need manager, publisher, or merge credentials run under
 manual merge uses its separate environment and only the Merge App key.
 Repository secrets are not a credential authority.
 
-## Logged-In Codex Runner
+### Logged-In Codex Runner
 
 Activation requires a private controller repository and exactly one online self-hosted
 runner carrying `self-hosted`, `Linux`, `X64`, and `cloudx-codex`. The runner
@@ -304,9 +315,9 @@ target officially supported. Production setup therefore requires explicit
 `AI_MANAGER_ACCOUNT_AUTH_RISK_ACCEPTED=true` and should not proceed without an
 owner accepting that residual support and credential risk.
 
-## Merge Routes
+### Merge Routes
 
-### Managed
+#### Managed
 
 The manager observes exact Candidate-Publisher-origin CI and AI review checks,
 correlates their test-merge commit and tree, and dispatches managed automerge.
@@ -319,13 +330,13 @@ immediately precedes the sole SHA-bound Merge Authority App request. A stale or
 rejected authorization makes no merge request or `main` update. Model and
 candidate code receive neither the manager result token nor the Merge App token.
 
-### Ordinary
+#### Ordinary
 
 A current repository writer applies `trusted-auto-merge` or dispatches the
 trusted intent workflow. The resulting intent check binds that actor and the
 complete v2 identity. Fork heads and policy-protected paths are ineligible.
 
-### Human-Required
+#### Human-Required
 
 Human-required paths cannot use either automated route. The same is true when
 an exact-head review carries `manual-review` or the live PR has the exact
@@ -335,7 +346,7 @@ an exact-head review carries `manual-review` or the live PR has the exact
 `cloudx-protected-merge` environment requires a reviewer, prevents self review,
 disables administrator bypass, and restricts deployment to `main`.
 
-### Shared Actuation
+#### Shared Actuation
 
 All merge-capable jobs acquire the repository-wide `cloudx-main-merge-v1`
 concurrency group with queued, non-cancelling semantics. After acquisition, the
@@ -355,7 +366,7 @@ controller:
 There is no merge retry after a moved head, moved base, conflict, refusal, or
 post-merge mismatch.
 
-## Repository Enforcement
+### Repository Enforcement
 
 The activation verifier requires three active repository rulesets:
 
@@ -380,7 +391,7 @@ absence of legacy branch protection or background merge mechanisms.
 `.agents/pr-review-policy.toml` remains the machine authority for those exact
 values.
 
-## Invalidation And Failure
+### Invalidation And Failure
 
 - An authoritative issue revision or media change supersedes dependent managed
   evidence.
@@ -431,7 +442,7 @@ the payload identity, all three timestamps, and failure. The audit remains as a
 permanent admission tombstone while the stored-item and byte budgets are
 released.
 
-## Deployment And Activation
+### Deployment And Activation
 
 The supported manager topology is one active process, one PostgreSQL database,
 and one content-addressed volume behind a loopback-published TLS proxy.
@@ -473,7 +484,7 @@ confirmed exact merge path.
 
 Private attachment support remains unproven and disabled.
 
-## Design Basis
+### Design Basis
 
 - The pinned Phase contribution skill is primary upstream evidence for fresh
   roles, architecture review, verification, adversarial review, and shipping

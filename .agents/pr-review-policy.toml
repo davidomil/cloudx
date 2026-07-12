@@ -9,6 +9,7 @@ intent = "trusted-auto-merge"
 generated = "ai:generated"
 manual_review = "manual review"
 issue_approved = "ai:issue-approved"
+pr_model_authorized = "ai:review-requested"
 
 [defaults]
 area = "repository"
@@ -30,27 +31,21 @@ require_protected_path_approval = true
 
 [activation]
 branch = "main"
-controller_tag = "cloudx-ai-controller-v3"
+local_controller_protocol = 4
 update_authority_ruleset_name = "CloudX main update authority"
 integrity_ruleset_name = "CloudX main integrity"
-controller_tag_ruleset_name = "CloudX controller tag immutability"
-protected_environment = "cloudx-protected-merge"
-controller_environment = "cloudx-controller"
-require_private_repository = false
-model_runner_labels = ["self-hosted", "Linux", "X64", "cloudx-codex"]
+private_actions_required = false
 manager_app_slug = "cloudx-ai-manager"
 publisher_app_slug = "cloudx-ai-publisher"
 merge_app_slug = "cloudx-ai-merge"
 required_check_app_slug = "cloudx-ai-publisher"
-intent_check_app_slug = "github-actions"
+intent_check_app_slug = "cloudx-ai-merge"
 manager_permissions = ["actions:read", "checks:read", "contents:read", "issues:write", "metadata:read", "pull_requests:read"]
-publisher_permissions = ["checks:write", "contents:write", "issues:write", "metadata:read", "pull_requests:write"]
-merge_permissions = ["checks:write", "contents:write", "metadata:read", "pull_requests:read"]
-required_workflows = [".github/workflows/ai-review.yml", ".github/workflows/ci.yml", ".github/workflows/classify-pr.yml", ".github/workflows/managed-automerge.yml", ".github/workflows/managed-issue.yml", ".github/workflows/protected-merge.yml", ".github/workflows/publish-ci.yml", ".github/workflows/trusted-automerge.yml"]
-required_repository_variables = ["CLOUDX_MANAGER_URL", "CLOUDX_MERGE_APP_ID", "CLOUDX_PUBLISHER_APP_ID"]
+publisher_permissions = ["actions:read", "checks:write", "contents:write", "issues:write", "metadata:read", "pull_requests:write"]
+merge_permissions = ["checks:read", "contents:write", "metadata:read", "pull_requests:read"]
+required_public_workflows = [".github/workflows/ci.yml", ".github/workflows/classify-pr.yml"]
+required_repository_variables = []
 required_repository_secrets = []
-controller_environment_secrets = ["CLOUDX_MANAGER_ARTIFACT_TOKEN", "CLOUDX_MANAGER_RESULT_TOKEN", "CLOUDX_MERGE_APP_PRIVATE_KEY", "CLOUDX_PUBLISHER_APP_PRIVATE_KEY"]
-protected_environment_secrets = ["CLOUDX_MERGE_APP_PRIVATE_KEY"]
 allowed_action_patterns = ["astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b"]
 
 [managed_generation]
@@ -121,6 +116,16 @@ checks = ["policy"]
 name = "automation-execution"
 globs = ["apps/server/src/automation/**", "scripts/install-cloudx.mjs", "install.sh"]
 areas = ["automation"]
+risk = "human-required"
+human_review = true
+automerge = false
+skills = ["review-automation", "review-security"]
+checks = ["typescript", "security"]
+
+[[path_rules]]
+name = "local-ai-control-plane"
+globs = ["apps/ai-manager/**", "apps/local-executor/**", "scripts/local/**", "deploy/ai-manager/**", "deploy/host/**", "deploy/systemd/**"]
+areas = ["automation", "security"]
 risk = "human-required"
 human_review = true
 automerge = false
@@ -259,7 +264,7 @@ checks = ["python"]
 
 [[path_rules]]
 name = "installer"
-globs = ["scripts/setup-*.mjs", "docs/SETUP.md"]
+globs = ["setup.sh", "scripts/setup/**", "scripts/setup-*.mjs", "docs/SETUP.md"]
 areas = ["installer"]
 risk = "human-required"
 human_review = true
