@@ -16,7 +16,6 @@ RUN apt-get update \
 WORKDIR /opt/cloudx-base
 
 COPY package.json package-lock.json ./
-COPY apps/ai-manager/package.json apps/ai-manager/package.json
 COPY apps/server/package.json apps/server/package.json
 COPY apps/web/package.json apps/web/package.json
 COPY packages/plugin-api/package.json packages/plugin-api/package.json

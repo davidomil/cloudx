@@ -37,6 +37,7 @@ export async function validateProcess(options = {}) {
     validatePolicyReferences(policy, skills, issues);
   }
   const workflows = validateWorkflows(repoRoot, issues);
+  validateVerifierBuildContext(repoRoot, issues);
   if (issues.length > 0) {
     throw new Error(
       `Repository AI process validation failed:\n${issues
@@ -161,6 +162,29 @@ export function validateWorkflows(repoRoot, issues = []) {
     }
   }
   return workflows;
+}
+
+export function validateVerifierBuildContext(repoRoot, issues = []) {
+  const dockerfile = path.join(repoRoot, "containers", "ci", "Dockerfile");
+  if (!fs.existsSync(dockerfile)) {
+    issues.push(
+      "Required verifier Dockerfile containers/ci/Dockerfile does not exist.",
+    );
+    return issues;
+  }
+  for (const line of fs.readFileSync(dockerfile, "utf8").split(/\r?\n/u)) {
+    const copy = /^COPY\s+(?!--from=)(\S+(?:\s+\S+)*)$/u.exec(line.trim());
+    if (!copy) continue;
+    const sources = copy[1].split(/\s+/u).slice(0, -1);
+    for (const source of sources) {
+      if (!fs.existsSync(path.join(repoRoot, source))) {
+        issues.push(
+          `Verifier Dockerfile copies missing build-context path '${source}'.`,
+        );
+      }
+    }
+  }
+  return issues;
 }
 
 export function validateWorkflow(
@@ -1096,11 +1120,14 @@ export function validateCiWorkflow(workflowName, workflow, issues = []) {
     !identityCheckouts.some(
       (step) =>
         step.with?.path === "controller" &&
-        step.with?.ref === "${{ github.sha }}",
+        step.with?.ref === "${{ github.sha }}" &&
+        step.with?.["fetch-depth"] === 2,
     ) ||
     !identityCheckouts.some(
       (step) =>
-        step.with?.path === "source" && step.with?.ref === "${{ github.sha }}",
+        step.with?.path === "source" &&
+        step.with?.ref === "${{ github.sha }}" &&
+        step.with?.["fetch-depth"] === 2,
     ) ||
     !identityCommands.includes("check-identity.mjs create-ci-artifact") ||
     !identitySteps.some(

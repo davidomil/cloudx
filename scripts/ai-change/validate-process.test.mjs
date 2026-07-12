@@ -8,6 +8,7 @@ import { parseDocument } from "yaml";
 import {
   validatePolicyReferences,
   validateProcess,
+  validateVerifierBuildContext,
   validateWorkflow,
 } from "./validate-process.mjs";
 
@@ -101,6 +102,38 @@ jobs:
 
     expect(issues).toContainEqual(
       expect.stringMatching(/aggregate.*undefined job.*manager-postgres/i),
+    );
+  });
+
+  it("rejects verifier build-context references to private extracted paths", () => {
+    const root = fs.mkdtempSync(
+      path.join(os.tmpdir(), "cloudx-verifier-context-"),
+    );
+    fs.mkdirSync(path.join(root, "containers", "ci"), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, "containers", "ci", "Dockerfile"),
+      "COPY apps/ai-manager/package.json apps/ai-manager/package.json\n",
+    );
+    const issues = [];
+
+    validateVerifierBuildContext(root, issues);
+
+    expect(issues).toEqual([
+      "Verifier Dockerfile copies missing build-context path 'apps/ai-manager/package.json'.",
+    ]);
+  });
+
+  it("requires enough test-merge history to validate both bound parents", () => {
+    const source = fs.readFileSync(".github/workflows/ci.yml", "utf8");
+    const workflow = parseDocument(
+      source.replaceAll("          fetch-depth: 2\n", ""),
+    ).toJS();
+    const issues = [];
+
+    validateWorkflow(process.cwd(), "ci.yml", workflow, issues);
+
+    expect(issues).toContainEqual(
+      expect.stringMatching(/test-merge identity artifact/i),
     );
   });
 
