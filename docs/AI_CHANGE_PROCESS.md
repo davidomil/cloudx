@@ -239,10 +239,13 @@ other than those two exists only in the private controller repository and is
 - `classify-pr.yml` loads policy from trusted controller source, classifies both
   sides of renames, and reconciles manager-owned labels. Labels are projections,
   not authority.
-- `ci.yml` executes untrusted PR code without write credentials. The target App
-  observes completion and dispatches private `publish-ci.yml`, which validates
-  its exact identity artifact and publishes
-  `CI / merge-gate` through a short-lived Candidate Publisher App token.
+- `ci.yml` executes the exact GitHub test-merge without write credentials or
+  secrets. Its verifier and identity artifact are candidate evidence, not
+  authority. Any change to CI or its verifier requires `manual review`. The
+  target App observes completion and dispatches private `publish-ci.yml`, which
+  independently revalidates the live run, pull request, base, head, test merge,
+  tree, and policy before publishing `CI / merge-gate` through a short-lived
+  Candidate Publisher App token.
 - `managed-issue.yml` runs the eight managed stages, 11 explicit conditional
   area reviews, fresh aggregation, capability-free patch synthesis,
   credential-free patch application and verification, and trusted candidate

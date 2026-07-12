@@ -1034,10 +1034,9 @@ export function validateCiWorkflow(workflowName, workflow, issues = []) {
       typeof step.uses === "string" &&
       step.uses.startsWith("actions/checkout@"),
   );
-  const trusted = checkouts.some(
+  const controller = checkouts.some(
     (step) =>
-      step.with?.ref ===
-        "${{ github.event.pull_request.base.sha || github.sha }}" &&
+      step.with?.ref === "${{ github.sha }}" &&
       step.with?.path === "controller",
   );
   const source = checkouts.some(
@@ -1046,7 +1045,7 @@ export function validateCiWorkflow(workflowName, workflow, issues = []) {
   );
   const commands = jobCommands(verifier);
   if (
-    !trusted ||
+    !controller ||
     !source ||
     !commands.includes(
       "--file controller/containers/ci/Dockerfile controller",
@@ -1059,7 +1058,7 @@ export function validateCiWorkflow(workflowName, workflow, issues = []) {
     )
   ) {
     issues.push(
-      `Workflow '${workflowName}' isolated verifier must build from the trusted controller and mount only read-only candidate source plus one evidence file.`,
+      `Workflow '${workflowName}' isolated verifier must build from the exact test-merge checkout and mount only read-only candidate source plus one evidence file.`,
     );
   }
   if (
@@ -1097,7 +1096,7 @@ export function validateCiWorkflow(workflowName, workflow, issues = []) {
     !identityCheckouts.some(
       (step) =>
         step.with?.path === "controller" &&
-        step.with?.ref === "${{ github.event.pull_request.base.sha }}",
+        step.with?.ref === "${{ github.sha }}",
     ) ||
     !identityCheckouts.some(
       (step) =>
@@ -1112,7 +1111,7 @@ export function validateCiWorkflow(workflowName, workflow, issues = []) {
     )
   ) {
     issues.push(
-      `Workflow '${workflowName}' must emit one trusted controller-generated identity for the exact tested merge.`,
+      `Workflow '${workflowName}' must emit one test-merge identity artifact for private-controller revalidation.`,
     );
   }
   return issues;

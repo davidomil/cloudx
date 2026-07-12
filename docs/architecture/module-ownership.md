@@ -39,7 +39,7 @@ state with the Node server.
 | `apps/ai-manager`                                                 | Durable issue intake, canonical snapshots, run transitions, workflow correlation, discussion projection, and dispatch       | Generated-code execution, model secrets, publisher credentials, or merge actuation |
 | `.agents/`                                                        | Repository policy, schemas, and fresh planning, implementation, verification, review, and shipping role contracts           | Runtime state or GitHub mutation                                                   |
 | `scripts/ai-change/`                                              | Deterministic artifact validation, policy classification, state transitions, and exact-head readiness                       | Model judgment or durable manager state                                            |
-| `.github/workflows/`                                              | Ephemeral job isolation, trusted controller checkout, credential routing, artifact transfer, and repository event handling  | Policy redefinition or durable run authority                                       |
+| `.github/workflows/`                                              | Ephemeral public test-merge isolation, artifact transfer, and repository event handling                                     | Privileged publication, model credentials, or durable run authority                 |
 | `containers/ci`                                                   | Trusted verification supervision and unprivileged candidate command execution                                               | GitHub credentials, model judgment, or issue state                                 |
 
 ## Composition Rules

@@ -46,6 +46,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck -- --pretty false
+      - run: sudo apt-get update && sudo apt-get install --yes ripgrep
       - run: npm run test:coverage
       - run: npm run build
 
@@ -129,7 +130,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          ref: ${{ github.sha }}
           path: controller
           persist-credentials: false
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -137,8 +138,8 @@ jobs:
           ref: ${{ github.sha }}
           path: source
           persist-credentials: false
-      - name: Build verifier only from the exact trusted controller
-        run: docker build --pull --tag cloudx-ci-verifier:${{ github.event.pull_request.base.sha || github.sha }} --file controller/containers/ci/Dockerfile controller
+      - name: Build verifier from the exact test merge
+        run: docker build --pull --tag cloudx-ci-verifier:${{ github.sha }} --file controller/containers/ci/Dockerfile controller
       - name: Run with no network and read-only source
         run: |
           install -d -m 0700 container-results
@@ -161,7 +162,7 @@ jobs:
             --tmpfs /work:rw,exec,nosuid,nodev,size=8g,mode=1777 \
             --volume "${PWD}/source:/source:ro" \
             --volume "${PWD}/container-results/results.json:/results/results.json:rw" \
-            cloudx-ci-verifier:${{ github.event.pull_request.base.sha || github.sha }}
+            cloudx-ci-verifier:${{ github.sha }}
       - name: Upload exact verifier evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -181,7 +182,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.sha }}
           path: controller
           persist-credentials: false
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
