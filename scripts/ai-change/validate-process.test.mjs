@@ -8,6 +8,7 @@ import { parseDocument } from "yaml";
 
 import {
   GATE_B_LOCAL_CHANGE_BASE_SHA,
+  GATE_B_PLANNING_HEAD_SHA,
   GATE_B_POLICY_SHA256,
   GATE_B_REVIEW_ROLES,
   validateGateBArtifactBundle,
@@ -309,9 +310,12 @@ jobs:
       (source) => source.replace('"--porcelain"', '"--force", "--porcelain"'),
     ],
     [
-      "force-with-lease option",
+      "general force-with-lease option",
       (source) =>
-        source.replace('"--porcelain"', '"--force-with-lease", "--porcelain"'),
+        source.replace(
+          "`--force-with-lease=${GATE_B_CANDIDATE_REF}:${expectedOldHead}`",
+          '"--force-with-lease"',
+        ),
     ],
     [
       "force-if-includes option",
@@ -354,6 +358,76 @@ jobs:
     expect(validatePublicationContractSources(sources, [])).not.toEqual([]);
   });
 
+  it.each([
+    [
+      "token-bearing authorization schema",
+      (sources) => {
+        const schema = JSON.parse(sources.authorizationSchema);
+        schema.properties.token = { type: "string" };
+        sources.authorizationSchema = JSON.stringify(schema);
+      },
+    ],
+    [
+      "missing authorization file channel",
+      (sources) => {
+        sources.publisher = sources.publisher.replaceAll(
+          "authorization-file",
+          "removed-authorization-file",
+        );
+      },
+    ],
+    [
+      "aliased publication and manifest digest",
+      (sources) => {
+        sources.publisher = sources.publisher.replaceAll(
+          "authorizedPublicationSha256",
+          "authorizedManifestSha256",
+        );
+      },
+    ],
+    [
+      "missing attended-user mode",
+      (sources) => {
+        sources.publisher = sources.publisher.replaceAll(
+          "attended-user",
+          "automated-app",
+        );
+      },
+    ],
+    [
+      "ambient credential source",
+      (sources) => {
+        sources.publisher = sources.publisher.replace(
+          "process.env.CLOUDX_GATE_B_TOKEN",
+          "process.env.GH_TOKEN",
+        );
+      },
+    ],
+    [
+      "persistent credential helper",
+      (sources) => {
+        sources.publisher = sources.publisher.replace(
+          '"credential.helper="',
+          '"credential.helper=store"',
+        );
+      },
+    ],
+    [
+      "direct-object-only test",
+      (sources) => {
+        sources.publisherTests = sources.publisherTests.replaceAll(
+          "process.execPath",
+          '"node"',
+        );
+      },
+    ],
+  ])("rejects publication authorization drift: %s", (_name, mutate) => {
+    const sources = rawPublicationContractSources();
+    mutate(sources);
+
+    expect(validatePublicationContractSources(sources, [])).not.toEqual([]);
+  });
+
   it("binds the complete Gate B artifact bundle to one reviewed committed head", () => {
     const fixture = gateBBundleFixture();
 
@@ -361,6 +435,7 @@ jobs:
 
     expect(result).toEqual({
       headSha: gitSha("b"),
+      planningHeadSha: GATE_B_PLANNING_HEAD_SHA,
       localChangeBaseSha: GATE_B_LOCAL_CHANGE_BASE_SHA,
       planSha256: fileDigest(fixture.directory, "plan.json"),
       implementationSha256: fileDigest(
@@ -372,6 +447,27 @@ jobs:
 
   it("rejects every Gate B artifact-binding bypass", () => {
     const cases = [
+      [
+        "plan review bound to candidate head",
+        (fixture) =>
+          fixture.mutate("plan-review.json", (review) => {
+            review.head_sha = gitSha("b");
+          }),
+      ],
+      [
+        "implementation bound to planning head",
+        (fixture) =>
+          fixture.mutate("implementation.json", (implementation) => {
+            implementation.head_sha = GATE_B_PLANNING_HEAD_SHA;
+          }),
+      ],
+      [
+        "area review bound to planning head",
+        (fixture) =>
+          fixture.mutate("review-web.json", (review) => {
+            review.head_sha = GATE_B_PLANNING_HEAD_SHA;
+          }),
+      ],
       [
         "malformed schema",
         (fixture) => fixture.mutate("plan.json", (plan) => delete plan.task),
@@ -528,7 +624,15 @@ function rawPublicationContractSources() {
     review: fs.readFileSync(".agents/skills/review-pr/SKILL.md", "utf8"),
     verifier: fs.readFileSync(".agents/skills/verify-change/SKILL.md", "utf8"),
     process: fs.readFileSync("docs/AI_CHANGE_PROCESS.md", "utf8"),
+    authorizationSchema: fs.readFileSync(
+      ".agents/schemas/publication-authorization.schema.json",
+      "utf8",
+    ),
     publisher: fs.readFileSync("scripts/ai-change/publish-gate-b.mjs", "utf8"),
+    publisherTests: fs.readFileSync(
+      "scripts/ai-change/publish-gate-b.test.mjs",
+      "utf8",
+    ),
   };
 }
 
@@ -537,12 +641,14 @@ const gitSha = (character) => character.repeat(40);
 
 function gateBBundleFixture() {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-gate-b-"));
+  const planningHead = GATE_B_PLANNING_HEAD_SHA;
+  const candidateHead = gitSha("b");
   const plan = {
     schema_version: 1,
     kind: "change-plan",
     run_id: "gate-b",
     base_sha: GATE_B_LOCAL_CHANGE_BASE_SHA,
-    head_sha: gitSha("b"),
+    head_sha: planningHead,
     policy_sha256: GATE_B_POLICY_SHA256,
     skill_versions: { "plan-change": sha("2") },
     task: "Bind one committed candidate artifact set.",
@@ -573,7 +679,7 @@ function gateBBundleFixture() {
       },
       { path: "apps/web/src/ui/App.tsx", line: 1, reason: "Web owner." },
     ],
-    claims: Array.from({ length: 71 }, (_, index) => ({
+    claims: Array.from({ length: 73 }, (_, index) => ({
       id: `CLAIM-${index + 1}`,
       behavior: `Behavior ${index + 1}.`,
       production_seam: `production ${index + 1}`,
@@ -581,7 +687,7 @@ function gateBBundleFixture() {
       negative_cases: [`negative ${index + 1}`],
     })),
     allowed_paths: Array.from(
-      { length: 112 },
+      { length: 113 },
       (_, index) => `apps/server/src/gate-b-${index + 1}.ts`,
     ),
     forbidden_paths: [".github/**"],
@@ -594,7 +700,7 @@ function gateBBundleFixture() {
     kind: "change-implementation",
     run_id: "gate-b-implementation",
     base_sha: plan.base_sha,
-    head_sha: plan.head_sha,
+    head_sha: candidateHead,
     policy_sha256: plan.policy_sha256,
     plan_sha256: planDigest,
     changed_files: [...plan.allowed_paths],
@@ -612,13 +718,19 @@ function gateBBundleFixture() {
   writeJson(
     directory,
     "plan-review.json",
-    reviewArtifact(plan, "review-plan", "plan", planDigest),
+    reviewArtifact(plan, "review-plan", "plan", planDigest, planningHead),
   );
   for (const role of plan.classification.skills) {
     writeJson(
       directory,
       `${role}.json`,
-      reviewArtifact(plan, role, "implementation", implementationDigest),
+      reviewArtifact(
+        plan,
+        role,
+        "implementation",
+        implementationDigest,
+        candidateHead,
+      ),
     );
   }
   writeJson(
@@ -629,9 +741,14 @@ function gateBBundleFixture() {
       "review-change",
       "implementation",
       implementationDigest,
+      candidateHead,
     ),
   );
-  writeJson(directory, "verification.json", verificationArtifact(plan));
+  writeJson(
+    directory,
+    "verification.json",
+    verificationArtifact(plan, candidateHead),
+  );
 
   return {
     directory,
@@ -659,7 +776,7 @@ function artifactSnapshot(directory) {
   };
 }
 
-function reviewArtifact(plan, reviewerRole, subject, subjectSha256) {
+function reviewArtifact(plan, reviewerRole, subject, subjectSha256, headSha) {
   return {
     schema_version: 1,
     kind: "change-review",
@@ -667,7 +784,7 @@ function reviewArtifact(plan, reviewerRole, subject, subjectSha256) {
     subject,
     subject_sha256: subjectSha256,
     base_sha: plan.base_sha,
-    head_sha: plan.head_sha,
+    head_sha: headSha,
     policy_sha256: plan.policy_sha256,
     reviewer_role: reviewerRole,
     verdict: "clean",
@@ -676,13 +793,13 @@ function reviewArtifact(plan, reviewerRole, subject, subjectSha256) {
   };
 }
 
-function verificationArtifact(plan) {
+function verificationArtifact(plan, candidateHead) {
   return {
     schema_version: 1,
     kind: "change-verification",
     run_id: "gate-b",
     base_sha: plan.base_sha,
-    head_sha: plan.head_sha,
+    head_sha: candidateHead,
     policy_sha256: plan.policy_sha256,
     tree_sha256_before: sha("3"),
     tree_sha256_after: sha("3"),

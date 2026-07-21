@@ -3,6 +3,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -12,11 +13,13 @@ import {
   GATE_B_EXPECTED_OLD_CANDIDATE_SHA,
   GATE_B_EXPECTED_TARGET_BASE_SHA,
   GATE_B_LOCAL_CHANGE_BASE_SHA,
+  GATE_B_POLICY_SHA256,
   GATE_B_PULL_REQUEST,
   GATE_B_REPOSITORY,
   GATE_B_TARGET_BASE_REF,
   validateGateBArtifactBundle,
 } from "./validate-process.mjs";
+import { validateSchema } from "./schema-validator.mjs";
 
 const originPushUrl = "https://github.com/davidomil/cloudx";
 const candidateBranch = GATE_B_CANDIDATE_REF.slice("refs/heads/".length);
@@ -33,6 +36,8 @@ const pullRequestFields = [
 ].join(",");
 const gitSha = /^[a-f0-9]{40}$/u;
 const sha256Pattern = /^[a-f0-9]{64}$/u;
+const publicationAuthorizationMaxBytes = 32 * 1024;
+const publicationGrantLifetimeMs = 15 * 60 * 1000;
 
 export function readGateBArtifactSnapshot(artifactDir) {
   const directory = path.resolve(artifactDir);
@@ -56,10 +61,107 @@ export function readGateBArtifactSnapshot(artifactDir) {
   };
 }
 
+export function canonicalPublicationAuthorization(value) {
+  return `${JSON.stringify(sortObjectKeys(value), null, 2)}\n`;
+}
+
+export function readPublicationAuthorizationSnapshot({
+  authorizationFile,
+  artifactDir,
+  authorizedPublicationSha256,
+}) {
+  if (!sha256Pattern.test(authorizedPublicationSha256)) {
+    throw new Error(
+      "Gate B authorized publication digest must be a SHA-256 digest.",
+    );
+  }
+  if (typeof authorizationFile !== "string" || authorizationFile.length === 0) {
+    throw new Error("Gate B publication authorization file is required.");
+  }
+
+  const artifactDirectory = fs.realpathSync(path.resolve(artifactDir));
+  const authorizationPath = path.resolve(authorizationFile);
+  const initialStat = fs.lstatSync(authorizationPath);
+  if (
+    initialStat.isSymbolicLink() ||
+    !initialStat.isFile() ||
+    initialStat.size > publicationAuthorizationMaxBytes
+  ) {
+    throw new Error(
+      "Gate B publication authorization must be a regular nonsymlink file no larger than 32 KiB.",
+    );
+  }
+
+  const realAuthorizationPath = fs.realpathSync(authorizationPath);
+  if (isPathInside(artifactDirectory, realAuthorizationPath)) {
+    throw new Error(
+      "Gate B publication authorization must be outside the artifact directory.",
+    );
+  }
+
+  const handle = fs.openSync(
+    authorizationPath,
+    fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW,
+  );
+  let bytes;
+  try {
+    const openedStat = fs.fstatSync(handle);
+    if (
+      !openedStat.isFile() ||
+      openedStat.size > publicationAuthorizationMaxBytes ||
+      openedStat.dev !== initialStat.dev ||
+      openedStat.ino !== initialStat.ino
+    ) {
+      throw new Error(
+        "Gate B publication authorization identity changed while opening.",
+      );
+    }
+    bytes = fs.readFileSync(handle);
+  } finally {
+    fs.closeSync(handle);
+  }
+  if (bytes.length > publicationAuthorizationMaxBytes) {
+    throw new Error(
+      "Gate B publication authorization must be no larger than 32 KiB.",
+    );
+  }
+
+  const publicationSha256 = sha256(bytes);
+  if (publicationSha256 !== authorizedPublicationSha256) {
+    throw new Error(
+      "Gate B authorized publication digest does not match the authorization file.",
+    );
+  }
+  const authorization = parseJsonObject(
+    bytes.toString("utf8"),
+    "publication authorization",
+  );
+  const canonicalBytes = Buffer.from(
+    canonicalPublicationAuthorization(authorization),
+  );
+  if (!bytes.equals(canonicalBytes)) {
+    throw new Error(
+      "Gate B publication authorization must use exact canonical JSON bytes.",
+    );
+  }
+  validateSchema("publication-authorization", authorization);
+  return {
+    path: realAuthorizationPath,
+    bytes,
+    publicationSha256,
+    authorization,
+  };
+}
+
 export async function publishGateBCandidate({
   artifactDir,
   authorizedManifestSha256,
+  authorizationFile,
+  authorizedPublicationSha256,
+  credentialMode,
   expectedOldHead,
+  now = Date.now,
+  readToken = defaultTokenReader,
   runCommand = defaultCommandRunner,
 }) {
   if (!sha256Pattern.test(authorizedManifestSha256)) {
@@ -77,6 +179,11 @@ export async function publishGateBCandidate({
     GATE_B_EXPECTED_OLD_CANDIDATE_SHA,
     "Gate B expected old candidate head",
   );
+  if (!new Set(["automated-app", "attended-user"]).has(credentialMode)) {
+    throw new Error(
+      "Gate B publication authorization requires one explicit credential mode.",
+    );
+  }
 
   const snapshot = readGateBArtifactSnapshot(artifactDir);
   const bundle = validateGateBArtifactBundle({ snapshot });
@@ -86,6 +193,50 @@ export async function publishGateBCandidate({
     );
   }
 
+  const authorizationSnapshot = readPublicationAuthorizationSnapshot({
+    authorizationFile,
+    artifactDir: snapshot.directory,
+    authorizedPublicationSha256,
+  });
+  requirePublicationAuthorization({
+    authorization: authorizationSnapshot.authorization,
+    authorizedManifestSha256,
+    bundle,
+    credentialMode,
+    expectedOldHead,
+    nowMs: currentTime(now),
+  });
+
+  const token = requireGateBToken(readToken());
+  const commandContext = createAuthenticatedCommandContext(runCommand, token);
+  try {
+    return await publishAuthorizedCandidate({
+      artifactDir: snapshot.directory,
+      authorizedManifestSha256,
+      authorizationSnapshot,
+      bundle,
+      credentialMode,
+      expectedOldHead,
+      now,
+      runCommand: commandContext.run,
+      snapshot,
+    });
+  } finally {
+    commandContext.dispose();
+  }
+}
+
+async function publishAuthorizedCandidate({
+  artifactDir,
+  authorizedManifestSha256,
+  authorizationSnapshot,
+  bundle,
+  credentialMode,
+  expectedOldHead,
+  now,
+  runCommand,
+  snapshot,
+}) {
   const localHead = output(
     await checked(runCommand, "git", ["rev-parse", "HEAD"]),
   );
@@ -126,25 +277,21 @@ export async function publishGateBCandidate({
     ).stdout,
   );
   requireExactList(pushUrls, [originPushUrl], "Gate B origin push URL");
+  const fetchUrls = lines(
+    (await checked(runCommand, "git", ["remote", "get-url", "--all", "origin"]))
+      .stdout,
+  );
+  requireExactList(fetchUrls, [originPushUrl], "Gate B origin fetch URL");
 
   const ghVersion = output(await checked(runCommand, "gh", ["--version"]));
   if (!/^gh version \d+\.\d+\.\d+/u.test(ghVersion)) {
     throw new Error("Gate B GitHub CLI version output is malformed.");
   }
-  const authentication = await checked(runCommand, "gh", [
-    "auth",
-    "status",
-    "--active",
-    "--hostname",
-    "github.com",
-  ]);
-  if (
-    !/logged in to github\.com/iu.test(
-      `${authentication.stdout}\n${authentication.stderr}`,
-    )
-  ) {
-    throw new Error("Gate B GitHub authentication output is malformed.");
-  }
+  await requireCredentialPrincipal(
+    runCommand,
+    credentialMode,
+    authorizationSnapshot.authorization.principal,
+  );
   const repositoryIdentity = parseJsonObject(
     (
       await checked(runCommand, "gh", [
@@ -152,7 +299,7 @@ export async function publishGateBCandidate({
         "view",
         GATE_B_REPOSITORY,
         "--json",
-        "nameWithOwner,viewerPermission",
+        "nameWithOwner",
       ])
     ).stdout,
     "repository",
@@ -161,11 +308,6 @@ export async function publishGateBCandidate({
     repositoryIdentity.nameWithOwner,
     GATE_B_REPOSITORY,
     "Gate B repository identity",
-  );
-  requireEqual(
-    repositoryIdentity.viewerPermission,
-    "ADMIN",
-    "Gate B repository permission",
   );
 
   const remoteTargetBase = parseRemoteHead(
@@ -219,7 +361,7 @@ export async function publishGateBCandidate({
     ).stdout,
   );
   requirePullRequest(beforePushPr, expectedOldHead, "pre-push");
-  await requireUnprotectedBranch(runCommand);
+  await requireUnprotectedCandidateBranch(runCommand, expectedOldHead);
   const rules = parseJson(
     (
       await checked(runCommand, "gh", [
@@ -243,12 +385,39 @@ export async function publishGateBCandidate({
   if (freshSnapshot.manifestSha256 !== authorizedManifestSha256) {
     throw new Error("Gate B authorized manifest changed before publication.");
   }
+  const freshAuthorization = readPublicationAuthorizationSnapshot({
+    authorizationFile: authorizationSnapshot.path,
+    artifactDir,
+    authorizedPublicationSha256: authorizationSnapshot.publicationSha256,
+  });
+  if (
+    freshAuthorization.path !== authorizationSnapshot.path ||
+    !freshAuthorization.bytes.equals(authorizationSnapshot.bytes)
+  ) {
+    throw new Error(
+      "Gate B publication authorization changed before publication.",
+    );
+  }
+  requirePublicationAuthorization({
+    authorization: freshAuthorization.authorization,
+    authorizedManifestSha256,
+    bundle,
+    credentialMode,
+    expectedOldHead,
+    nowMs: currentTime(now),
+  });
 
   let pushResult;
   try {
     pushResult = await runCommand(
       "git",
-      ["push", "--porcelain", "origin", `HEAD:${GATE_B_CANDIDATE_REF}`],
+      [
+        "push",
+        "--porcelain",
+        `--force-with-lease=${GATE_B_CANDIDATE_REF}:${expectedOldHead}`,
+        "origin",
+        `HEAD:${GATE_B_CANDIDATE_REF}`,
+      ],
       { timeoutMs: 300_000 },
     );
   } catch (error) {
@@ -312,6 +481,7 @@ export async function publishGateBCandidate({
     status: "published",
     headSha: localHead,
     manifestSha256: snapshot.manifestSha256,
+    publicationAuthorizationSha256: authorizationSnapshot.publicationSha256,
     repository: GATE_B_REPOSITORY,
     targetBaseRef: GATE_B_TARGET_BASE_REF,
     targetBaseSha: GATE_B_EXPECTED_TARGET_BASE_SHA,
@@ -320,6 +490,227 @@ export async function publishGateBCandidate({
     pullRequest: GATE_B_PULL_REQUEST,
     reviewPrHandoffAuthorized: true,
   };
+}
+
+function requirePublicationAuthorization({
+  authorization,
+  authorizedManifestSha256,
+  bundle,
+  credentialMode,
+  expectedOldHead,
+  nowMs,
+}) {
+  const expected = {
+    artifact_manifest_sha256: authorizedManifestSha256,
+    policy_sha256: GATE_B_POLICY_SHA256,
+    credential_mode: credentialMode,
+    local_change_base_sha: bundle.localChangeBaseSha,
+    planning_head_sha: bundle.planningHeadSha,
+    candidate_head_sha: bundle.headSha,
+    expected_old_candidate_sha: expectedOldHead,
+    candidate_ref: GATE_B_CANDIDATE_REF,
+    target_base_ref: GATE_B_TARGET_BASE_REF,
+    expected_target_base_sha: GATE_B_EXPECTED_TARGET_BASE_SHA,
+    repository: GATE_B_REPOSITORY,
+    pull_request: GATE_B_PULL_REQUEST,
+    pr_state: "OPEN",
+    pr_base_ref_name: targetBaseBranch,
+    pr_base_ref_oid: GATE_B_EXPECTED_TARGET_BASE_SHA,
+    pr_head_ref_name: candidateBranch,
+    pr_head_ref_oid: expectedOldHead,
+    same_repository: true,
+  };
+  for (const [name, value] of Object.entries(expected)) {
+    requireEqual(
+      authorization[name],
+      value,
+      `Gate B publication authorization ${name}`,
+    );
+  }
+
+  const issuedAt = Date.parse(authorization.issued_at);
+  const expiresAt = Date.parse(authorization.expires_at);
+  if (
+    !Number.isFinite(issuedAt) ||
+    !Number.isFinite(expiresAt) ||
+    issuedAt > nowMs ||
+    expiresAt <= nowMs ||
+    expiresAt <= issuedAt ||
+    expiresAt - issuedAt > publicationGrantLifetimeMs
+  ) {
+    throw new Error(
+      "Gate B publication authorization grant must be current and no longer than 15 minutes.",
+    );
+  }
+}
+
+async function requireCredentialPrincipal(
+  runCommand,
+  credentialMode,
+  principal,
+) {
+  if (credentialMode === "automated-app") {
+    const installation = parseJsonObject(
+      (
+        await checked(runCommand, "gh", [
+          "api",
+          "--method",
+          "GET",
+          "/installation/repositories",
+        ])
+      ).stdout,
+      "installation repositories",
+    );
+    if (
+      installation.total_count !== 1 ||
+      !Array.isArray(installation.repositories) ||
+      installation.repositories.length !== 1
+    ) {
+      throw new Error(
+        "Gate B automated-app token must access exactly one repository.",
+      );
+    }
+    requireEqual(
+      installation.repositories[0]?.full_name,
+      GATE_B_REPOSITORY,
+      "Gate B automated-app repository",
+    );
+    requireEqual(
+      principal.kind,
+      "github-app-installation",
+      "Gate B automated-app principal",
+    );
+    return;
+  }
+
+  const user = parseJsonObject(
+    (await checked(runCommand, "gh", ["api", "--method", "GET", "/user"]))
+      .stdout,
+    "attended user",
+  );
+  requireEqual(user.id, principal.user_id, "Gate B attended user ID");
+  requireEqual(user.login, principal.login, "Gate B attended user login");
+}
+
+function requireGateBToken(value) {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    /[\0\r\n]/u.test(value)
+  ) {
+    throw new Error("Gate B requires one valid CLOUDX_GATE_B_TOKEN value.");
+  }
+  return value;
+}
+
+function createAuthenticatedCommandContext(runCommand, token) {
+  const ghConfigDirectory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "cloudx-gate-b-gh-"),
+  );
+  fs.chmodSync(ghConfigDirectory, 0o700);
+  const baseEnvironment = commandEnvironment();
+  const ghEnvironment = {
+    ...baseEnvironment,
+    GH_CONFIG_DIR: ghConfigDirectory,
+    GH_HOST: "github.com",
+    GH_NO_UPDATE_NOTIFIER: "1",
+    GH_PROMPT_DISABLED: "1",
+    GH_REPO: GATE_B_REPOSITORY,
+    GH_TOKEN: token,
+  };
+  const gitEnvironment = {
+    ...baseEnvironment,
+    GH_TOKEN: token,
+    GCM_INTERACTIVE: "Never",
+    GIT_ASKPASS: "/bin/false",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_TERMINAL_PROMPT: "0",
+    SSH_ASKPASS: "/bin/false",
+  };
+  const localGitEnvironment = { ...gitEnvironment };
+  delete localGitEnvironment.GH_TOKEN;
+
+  return {
+    run(command, args, options = {}) {
+      const remoteGit =
+        command === "git" && new Set(["ls-remote", "push"]).has(args[0]);
+      const childArgs = remoteGit
+        ? [...gitCredentialArguments(), ...args]
+        : args;
+      const env =
+        command === "gh"
+          ? ghEnvironment
+          : command === "git"
+            ? remoteGit
+              ? gitEnvironment
+              : localGitEnvironment
+            : baseEnvironment;
+      return runCommand(command, childArgs, { ...options, env });
+    },
+    dispose() {
+      fs.rmSync(ghConfigDirectory, { recursive: true, force: true });
+    },
+  };
+}
+
+function commandEnvironment() {
+  return {
+    LANG: "C",
+    LC_ALL: "C",
+    NO_COLOR: "1",
+    PATH: process.env.PATH ?? "/usr/bin:/bin",
+    ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}),
+  };
+}
+
+function gitCredentialArguments() {
+  return [
+    "-c",
+    "credential.helper=",
+    "-c",
+    `credential.helper=${oneShotGitCredentialHelper()}`,
+    "-c",
+    "credential.useHttpPath=true",
+    "-c",
+    "core.askPass=/bin/false",
+  ];
+}
+
+function oneShotGitCredentialHelper() {
+  return '!f() { test "$1" = get || exit 0; protocol=; host=; path=; while IFS=\'=\' read -r key value; do case "$key" in protocol) protocol=$value ;; host) host=$value ;; path) path=$value ;; esac; done; test "$protocol" = https && test "$host" = github.com && { test "$path" = davidomil/cloudx || test "$path" = davidomil/cloudx.git; } || { printf \'quit=true\\n\'; exit 0; }; printf \'username=x-access-token\\npassword=%s\\nquit=true\\n\' "$GH_TOKEN"; }; f';
+}
+
+function defaultTokenReader() {
+  return process.env.CLOUDX_GATE_B_TOKEN;
+}
+
+function currentTime(now) {
+  const value = now();
+  const milliseconds = value instanceof Date ? value.getTime() : value;
+  if (!Number.isFinite(milliseconds)) {
+    throw new Error("Gate B publication clock must return a finite time.");
+  }
+  return milliseconds;
+}
+
+function sortObjectKeys(value) {
+  if (Array.isArray(value)) return value.map(sortObjectKeys);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .map((key) => [key, sortObjectKeys(value[key])]),
+  );
+}
+
+function isPathInside(directory, filePath) {
+  const relative = path.relative(directory, filePath);
+  return (
+    relative === "" ||
+    (!relative.startsWith("..") && !path.isAbsolute(relative))
+  );
 }
 
 function manualReconciliation(snapshot, localHead, error) {
@@ -345,29 +736,25 @@ async function requireQuiet(runCommand, args, label) {
   }
 }
 
-async function requireUnprotectedBranch(runCommand) {
-  const result = requireCommandResult(
-    await runCommand(
-      "gh",
-      [
+async function requireUnprotectedCandidateBranch(runCommand, expectedHead) {
+  const branch = parseJsonObject(
+    (
+      await checked(runCommand, "gh", [
         "api",
-        "--include",
-        `repos/${GATE_B_REPOSITORY}/branches/${candidateBranch}/protection`,
-      ],
-      { allowFailure: true },
-    ),
-    "gh api branch protection",
+        "--method",
+        "GET",
+        `repos/${GATE_B_REPOSITORY}/branches/${candidateBranch}`,
+      ])
+    ).stdout,
+    "candidate branch",
   );
-  const statuses = lines(`${result.stdout}\n${result.stderr}`).filter((line) =>
-    /^HTTP\/\S+\s+\d{3}\b/u.test(line),
+  requireEqual(branch.name, candidateBranch, "Gate B candidate branch name");
+  requireEqual(branch.commit?.sha, expectedHead, "Gate B candidate branch OID");
+  requireEqual(
+    branch.protected,
+    false,
+    "Gate B candidate branch protected state",
   );
-  if (
-    result.exitCode === 0 ||
-    !/^HTTP\/\S+\s+404\b/u.test(statuses[0] ?? "") ||
-    statuses.length !== 1
-  ) {
-    throw new Error("Gate B candidate branch must be confirmed non-protected.");
-  }
 }
 
 async function checked(runCommand, command, args, options = {}) {
@@ -520,6 +907,7 @@ function defaultCommandRunner(command, args, options = {}) {
       args,
       {
         encoding: "utf8",
+        env: options.env,
         maxBuffer: 2 * 1024 * 1024,
         timeout: options.timeoutMs ?? 60_000,
       },
@@ -552,6 +940,9 @@ function parseCliArguments(argv) {
   const allowed = new Set([
     "artifact-dir",
     "authorized-manifest-sha256",
+    "authorization-file",
+    "authorized-publication-sha256",
+    "credential-mode",
     "expected-old-head",
   ]);
   if (Object.keys(values).some((key) => !allowed.has(key))) {
@@ -571,6 +962,9 @@ if (isMain) {
   publishGateBCandidate({
     artifactDir: args["artifact-dir"],
     authorizedManifestSha256: args["authorized-manifest-sha256"],
+    authorizationFile: args["authorization-file"],
+    authorizedPublicationSha256: args["authorized-publication-sha256"],
+    credentialMode: args["credential-mode"],
     expectedOldHead: args["expected-old-head"],
   })
     .then((result) => {

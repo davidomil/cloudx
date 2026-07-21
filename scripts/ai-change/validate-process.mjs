@@ -36,9 +36,12 @@ export const GATE_B_COMMIT_SUBJECTS = [
   "INSTALLER: unify reproducible local service setup",
   "DOCS: align operator and scoped-agent contracts",
   "POLICY: separate candidate publication from live-head review",
+  "POLICY: bind publication authorization and candidate lease",
 ];
 export const GATE_B_LOCAL_CHANGE_BASE_SHA =
   "7f5693b568f38c207227a5473f14648fd10d4816";
+export const GATE_B_PLANNING_HEAD_SHA =
+  "3a5c05272bd4a30bc7646aa710a0807ca85a088b";
 export const GATE_B_EXPECTED_OLD_CANDIDATE_SHA =
   "7f5693b568f38c207227a5473f14648fd10d4816";
 export const GATE_B_TARGET_BASE_REF = "refs/heads/main";
@@ -99,11 +102,15 @@ const publicationContractPaths = {
   review: ".agents/skills/review-pr/SKILL.md",
   verifier: ".agents/skills/verify-change/SKILL.md",
   process: "docs/AI_CHANGE_PROCESS.md",
+  authorizationSchema: ".agents/schemas/publication-authorization.schema.json",
   publisher: "scripts/ai-change/publish-gate-b.mjs",
+  publisherTests: "scripts/ai-change/publish-gate-b.test.mjs",
 };
 
 const publicationIdentityClauses = [
   `localChangeBaseSha=${GATE_B_LOCAL_CHANGE_BASE_SHA}`,
+  `planningHeadSha=${GATE_B_PLANNING_HEAD_SHA}`,
+  "candidateHeadSha=validatedImplementationHeadSha",
   `expectedOldCandidateSha=${GATE_B_EXPECTED_OLD_CANDIDATE_SHA}`,
   `targetBaseRef=${GATE_B_TARGET_BASE_REF}`,
   `expectedTargetBaseSha=${GATE_B_EXPECTED_TARGET_BASE_SHA}`,
@@ -121,6 +128,22 @@ const terminalPublicationClauses = [
   "pushAttempts=1",
   "retry=false",
   "reviewPrHandoff=false",
+];
+const publicationAuthorizationClauses = [
+  ".agents/schemas/publication-authorization.schema.json",
+  "recursively sorted",
+  "outside the artifact directory",
+  "--authorization-file",
+  "--authorized-publication-sha256",
+  "--authorized-manifest-sha256",
+  "15 minutes",
+  "automated-app",
+  "attended-user",
+  "CLOUDX_GATE_B_TOKEN",
+  "GH_TOKEN",
+  "--force-with-lease=refs/heads/architecture-and-new-codex:<expectedOldCandidateSha>",
+  "human-required",
+  "automerge",
 ];
 
 export function validatePublicationContract(repoRoot, issues = []) {
@@ -152,7 +175,7 @@ export function validatePublicationContractSources(sources, issues = []) {
       "complete identity tuple above",
       "node scripts/ai-change/publish-gate-b.mjs",
       "No prose or role has an alternate raw push path",
-      "$review-pr evaluates the pushed live head only after that readback",
+      "$review-pr evaluates the pushed live head only after successful readback",
       "Every later GitHub mutation requires a current clean $review-pr",
     ],
     orchestrator: [
@@ -166,7 +189,7 @@ export function validatePublicationContractSources(sources, issues = []) {
       "complete identity tuple above",
       "node scripts/ai-change/publish-gate-b.mjs",
       "Do not run a raw push",
-      "single pinned non-force update",
+      "exactly one expected-old",
       "Every later GitHub mutation requires",
       "Never reuse initial-publication authority",
     ],
@@ -188,7 +211,7 @@ export function validatePublicationContractSources(sources, issues = []) {
       "complete identity tuple above",
       "node scripts/ai-change/publish-gate-b.mjs",
       "No alternate raw push",
-      "$review-pr evaluates only the pushed live head after readback",
+      "$review-pr evaluates only the pushed live head after successful readback",
       "Every later GitHub mutation requires a current clean $review-pr",
     ],
   };
@@ -199,6 +222,7 @@ export function validatePublicationContractSources(sources, issues = []) {
       [
         ...publicationIdentityClauses,
         ...terminalPublicationClauses,
+        ...publicationAuthorizationClauses,
         ...clauses,
       ],
       contractBegin,
@@ -206,10 +230,25 @@ export function validatePublicationContractSources(sources, issues = []) {
       issues,
     );
   }
+  validatePublicationAuthorizationSchema(
+    String(sources.authorizationSchema ?? ""),
+    issues,
+  );
   const publisher = String(sources.publisher ?? "").replace(/\s+/gu, " ");
   for (const clause of [
     "validateGateBArtifactBundle({ snapshot })",
     "freshSnapshot.manifestSha256 !== snapshot.manifestSha256",
+    'validateSchema("publication-authorization", authorization)',
+    "readPublicationAuthorizationSnapshot",
+    "authorizedPublicationSha256",
+    "authorization-file",
+    "credentialMode",
+    "process.env.CLOUDX_GATE_B_TOKEN",
+    '"automated-app"',
+    '"attended-user"',
+    "GH_TOKEN: token",
+    '"credential.helper="',
+    "freshAuthorization",
     'const originPushUrl = "https://github.com/davidomil/cloudx"',
     "GATE_B_EXPECTED_TARGET_BASE_SHA",
     "GATE_B_EXPECTED_OLD_CANDIDATE_SHA",
@@ -224,19 +263,151 @@ export function validatePublicationContractSources(sources, issues = []) {
       );
     }
   }
+  for (const option of [
+    "artifact-dir",
+    "authorized-manifest-sha256",
+    "authorization-file",
+    "authorized-publication-sha256",
+    "credential-mode",
+    "expected-old-head",
+  ]) {
+    if (!new RegExp(`["']${option}["']`, "u").test(publisher)) {
+      issues.push(`Gate B publisher must require exact CLI option: ${option}`);
+    }
+  }
+  const exactLease =
+    "`--force-with-lease=${GATE_B_CANDIDATE_REF}:${expectedOldHead}`";
   const exactPushes = String(sources.publisher ?? "").match(
-    /["']push["']\s*,\s*["']--porcelain["']\s*,\s*["']origin["']\s*,\s*`HEAD:\$\{GATE_B_CANDIDATE_REF\}`/gu,
+    /["']push["']\s*,\s*["']--porcelain["']\s*,\s*`--force-with-lease=\$\{GATE_B_CANDIDATE_REF\}:\$\{expectedOldHead\}`\s*,\s*["']origin["']\s*,\s*`HEAD:\$\{GATE_B_CANDIDATE_REF\}`/gu,
   );
-  if (exactPushes?.length !== 1) {
+  const pushCommands = String(sources.publisher ?? "").match(
+    /["']push["']\s*,/gu,
+  );
+  if (exactPushes?.length !== 1 || pushCommands?.length !== 1) {
     issues.push(
       "Gate B publisher must contain exactly one canonical push call.",
     );
   }
-  if (/--force(?:-with-lease|-if-includes)?|["'`]\+HEAD:/u.test(publisher)) {
-    issues.push("Gate B publisher cannot contain force-update syntax.");
+  const nonCanonicalPublisher = String(sources.publisher ?? "").replace(
+    exactLease,
+    "",
+  );
+  if (
+    /--force(?:-with-lease|-if-includes)?|["'`]\+HEAD:/u.test(
+      nonCanonicalPublisher,
+    )
+  ) {
+    issues.push(
+      "Gate B publisher permits only the canonical expected-old force-with-lease update.",
+    );
+  }
+
+  const publisherTests = String(sources.publisherTests ?? "");
+  for (const clause of [
+    "spawnSync",
+    "process.execPath",
+    "CLOUDX_GATE_B_TOKEN",
+    "automated-app",
+    "attended-user",
+  ]) {
+    if (!publisherTests.includes(clause)) {
+      issues.push(
+        `Gate B publisher tests must contain real CLI evidence: ${clause}`,
+      );
+    }
   }
 
   return issues;
+}
+
+function validatePublicationAuthorizationSchema(source, issues) {
+  let schema;
+  try {
+    schema = JSON.parse(source);
+  } catch {
+    issues.push("Publication authorization schema must be valid JSON.");
+    return;
+  }
+  const expectedProperties = [
+    "schema_version",
+    "kind",
+    "grant_scope",
+    "authorization_nonce",
+    "issued_at",
+    "expires_at",
+    "repository",
+    "pull_request",
+    "artifact_manifest_sha256",
+    "policy_sha256",
+    "credential_mode",
+    "local_change_base_sha",
+    "planning_head_sha",
+    "candidate_head_sha",
+    "expected_old_candidate_sha",
+    "candidate_ref",
+    "target_base_ref",
+    "expected_target_base_sha",
+    "pr_state",
+    "pr_base_ref_name",
+    "pr_base_ref_oid",
+    "pr_head_ref_name",
+    "pr_head_ref_oid",
+    "same_repository",
+    "principal",
+  ].sort();
+  const actualProperties = Object.keys(schema?.properties ?? {}).sort();
+  const required = [...(schema?.required ?? [])].sort();
+  if (
+    schema?.type !== "object" ||
+    schema?.additionalProperties !== false ||
+    JSON.stringify(actualProperties) !== JSON.stringify(expectedProperties) ||
+    JSON.stringify(required) !== JSON.stringify(expectedProperties)
+  ) {
+    issues.push(
+      "Publication authorization schema must expose exactly the closed non-secret authority fields.",
+    );
+  }
+  const modes = schema?.properties?.credential_mode?.enum;
+  if (
+    JSON.stringify(modes) !== JSON.stringify(["automated-app", "attended-user"])
+  ) {
+    issues.push(
+      "Publication authorization schema must expose exactly the automated-app and attended-user modes.",
+    );
+  }
+  for (const name of ["automatedAppPrincipal", "attendedUserPrincipal"]) {
+    if (schema?.$defs?.[name]?.additionalProperties !== false) {
+      issues.push(`Publication authorization ${name} must be closed.`);
+    }
+  }
+  const serializedNames = collectSchemaPropertyNames(schema);
+  const secretNames = serializedNames.filter(
+    (name) =>
+      name !== "credential_mode" &&
+      /(?:^|_)(?:token|secret|password|private_key|credential)(?:_|$)/iu.test(
+        name,
+      ),
+  );
+  if (secretNames.length > 0) {
+    issues.push(
+      `Publication authorization schema cannot serialize secrets: ${secretNames.sort().join(", ")}`,
+    );
+  }
+}
+
+function collectSchemaPropertyNames(value, names = []) {
+  if (Array.isArray(value)) {
+    for (const item of value) collectSchemaPropertyNames(item, names);
+    return names;
+  }
+  if (!value || typeof value !== "object") return names;
+  if (value.properties && typeof value.properties === "object") {
+    names.push(...Object.keys(value.properties));
+  }
+  for (const child of Object.values(value)) {
+    collectSchemaPropertyNames(child, names);
+  }
+  return names;
 }
 
 export function validateVerificationCommands(commands, issues = []) {
@@ -270,10 +441,10 @@ export function validateGateBArtifactBundle({ snapshot }) {
   requireExactSet(roles, GATE_B_REVIEW_ROLES, "Gate B plan review roles");
   requireEqual(
     plan.allowed_paths.length,
-    112,
+    113,
     "Gate B plan allowed path count",
   );
-  requireEqual(plan.claims.length, 71, "Gate B plan claim count");
+  requireEqual(plan.claims.length, 73, "Gate B plan claim count");
   const areaReviewNames = roles.map((role) => `${role}.json`);
   const expectedNames = [
     planName,
@@ -318,16 +489,13 @@ export function validateGateBArtifactBundle({ snapshot }) {
     GATE_B_LOCAL_CHANGE_BASE_SHA,
     "Gate B local change base",
   );
-  if (!/^[a-f0-9]{40}$/u.test(plan.head_sha)) {
-    throw new Error("Gate B plan head must be a full Git SHA.");
-  }
+  requireEqual(plan.head_sha, GATE_B_PLANNING_HEAD_SHA, "Gate B planning head");
   requireEqual(
     plan.policy_sha256,
     GATE_B_POLICY_SHA256,
     "Gate B plan policy digest",
   );
   for (const [name, artifact] of [
-    [planReviewName, planReview],
     [implementationName, implementation],
     [verificationName, verification],
     ...areaReviewNames.map((name, index) => [name, areaReviews[index]]),
@@ -338,11 +506,35 @@ export function validateGateBArtifactBundle({ snapshot }) {
       GATE_B_LOCAL_CHANGE_BASE_SHA,
       `${name} local change base`,
     );
-    requireEqual(artifact.head_sha, plan.head_sha, `${name} head`);
+    requireEqual(artifact.head_sha, implementation.head_sha, `${name} head`);
     requireEqual(
       artifact.policy_sha256,
       GATE_B_POLICY_SHA256,
       `${name} policy digest`,
+    );
+  }
+
+  requireEqual(
+    planReview.base_sha,
+    GATE_B_LOCAL_CHANGE_BASE_SHA,
+    `${planReviewName} local change base`,
+  );
+  requireEqual(
+    planReview.head_sha,
+    plan.head_sha,
+    `${planReviewName} planning head`,
+  );
+  requireEqual(
+    planReview.policy_sha256,
+    GATE_B_POLICY_SHA256,
+    `${planReviewName} policy digest`,
+  );
+  if (
+    !/^[a-f0-9]{40}$/u.test(implementation.head_sha) ||
+    implementation.head_sha === plan.head_sha
+  ) {
+    throw new Error(
+      "Gate B implementation head must be a distinct candidate Git SHA.",
     );
   }
 
@@ -432,7 +624,8 @@ export function validateGateBArtifactBundle({ snapshot }) {
     subjectSha256: implementationSha256,
   });
   return {
-    headSha: plan.head_sha,
+    headSha: implementation.head_sha,
+    planningHeadSha: plan.head_sha,
     localChangeBaseSha: plan.base_sha,
     planSha256,
     implementationSha256,

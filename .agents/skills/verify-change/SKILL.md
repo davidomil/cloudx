@@ -20,10 +20,23 @@ code, reinterpret a failure, review quality, or mutate GitHub.
 
 <!-- CLOUDX-PUBLICATION-CONTRACT-V1:BEGIN -->
 
-Publication Contract V1 keeps verification deterministic, local, and read-only:
+Publication Contract V1 keeps verification deterministic, local, and read-only.
 
-The immutable publication identities remain distinct: `localChangeBaseSha=7f5693b568f38c207227a5473f14648fd10d4816`, `expectedOldCandidateSha=7f5693b568f38c207227a5473f14648fd10d4816`, `targetBaseRef=refs/heads/main`, `expectedTargetBaseSha=02d05f798096431f23acd1e5594a6bee21f3149f`, `repository=davidomil/cloudx`, `pullRequest=1`, `prState=OPEN`, `prBaseRefName=main`, `prBaseRefOid=02d05f798096431f23acd1e5594a6bee21f3149f`, `prHeadRefName=architecture-and-new-codex`, `prHeadRefOid=expectedOldCandidateSha`, and `sameRepository=true`; verification grants none of their mutation authority.
-After the sole push starts, `outcome=manual-reconciliation-required`, `pushAttempts=1`, `retry=false`, and `reviewPrHandoff=false`; verification cannot alter that outcome.
+The immutable publication identities remain distinct: `localChangeBaseSha=7f5693b568f38c207227a5473f14648fd10d4816`, `planningHeadSha=3a5c05272bd4a30bc7646aa710a0807ca85a088b`, `candidateHeadSha=validatedImplementationHeadSha`, `expectedOldCandidateSha=7f5693b568f38c207227a5473f14648fd10d4816`, `targetBaseRef=refs/heads/main`, `expectedTargetBaseSha=02d05f798096431f23acd1e5594a6bee21f3149f`, `repository=davidomil/cloudx`, `pullRequest=1`, `prState=OPEN`, `prBaseRefName=main`, `prBaseRefOid=02d05f798096431f23acd1e5594a6bee21f3149f`, `prHeadRefName=architecture-and-new-codex`, `prHeadRefOid=expectedOldCandidateSha`, and `sameRepository=true`; verification grants none of their mutation authority.
+
+Later initial-publication handoff uses a nonsecret
+`.agents/schemas/publication-authorization.schema.json` object. Its recursively
+sorted, two-space-indented, final-LF bytes form a regular nonsymlink file of at
+most 32 KiB outside the artifact directory. `--authorization-file` and
+`--authorized-publication-sha256` bind it independently from
+`--authorized-manifest-sha256`. Its grant lasts at most 15 minutes and binds identity,
+policy, bundle, nonce, and exactly one `automated-app` or `attended-user`
+principal. The sole secret is `CLOUDX_GATE_B_TOKEN`, pinned to child `GH_TOKEN`
+and never available to verification. `$ship-change` alone may invoke
+`node scripts/ai-change/publish-gate-b.mjs --artifact-dir <bundle> --authorized-manifest-sha256 <sha256> --authorization-file <path> --authorized-publication-sha256 <sha256> --credential-mode <automated-app|attended-user> --expected-old-head <sha>`
+for at most one exact expected-old
+`--force-with-lease=refs/heads/architecture-and-new-codex:<expectedOldCandidateSha>`
+update.
 
 1. Validate the accepted plan with `validateArtifact("plan", plan)` from
    `scripts/ai-change/artifact-validation.mjs` before invoking any command runner.
@@ -35,6 +48,11 @@ After the sole push starts, `outcome=manual-reconciliation-required`, `pushAttem
    digest, and validate the result with `validateArtifact("verification", result)`.
 4. Any command failure, tree change, incomplete command set, or semantic
    rejection fails verification. This role grants no publication authority.
+5. Before the push, publisher rejection starts zero publication commands. After
+   the sole push starts, `outcome=manual-reconciliation-required`,
+   `pushAttempts=1`, `retry=false`, and `reviewPrHandoff=false`; verification
+   cannot alter that outcome. Human-required paths remain human reviewed and no
+   automerge is authorized.
 
 <!-- CLOUDX-PUBLICATION-CONTRACT-V1:END -->
 

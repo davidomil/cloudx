@@ -57,29 +57,52 @@ change:
 
 <!-- CLOUDX-PUBLICATION-CONTRACT-V1:BEGIN -->
 
-Publication Contract V1 is the only public authority for this transition:
+Publication Contract V1 is the only public authority for this transition.
 
-The immutable identities remain distinct: `localChangeBaseSha=7f5693b568f38c207227a5473f14648fd10d4816`, `expectedOldCandidateSha=7f5693b568f38c207227a5473f14648fd10d4816`, `targetBaseRef=refs/heads/main`, `expectedTargetBaseSha=02d05f798096431f23acd1e5594a6bee21f3149f`, `repository=davidomil/cloudx`, `pullRequest=1`, `prState=OPEN`, `prBaseRefName=main`, `prBaseRefOid=02d05f798096431f23acd1e5594a6bee21f3149f`, `prHeadRefName=architecture-and-new-codex`, `prHeadRefOid=expectedOldCandidateSha`, and `sameRepository=true`.
-After the sole push starts, every error or identity ambiguity produces `outcome=manual-reconciliation-required`, `pushAttempts=1`, `retry=false`, and `reviewPrHandoff=false`; no review or mutation follows before explicit reconciliation.
+The immutable identities remain distinct: `localChangeBaseSha=7f5693b568f38c207227a5473f14648fd10d4816`, `planningHeadSha=3a5c05272bd4a30bc7646aa710a0807ca85a088b`, `candidateHeadSha=validatedImplementationHeadSha`, `expectedOldCandidateSha=7f5693b568f38c207227a5473f14648fd10d4816`, `targetBaseRef=refs/heads/main`, `expectedTargetBaseSha=02d05f798096431f23acd1e5594a6bee21f3149f`, `repository=davidomil/cloudx`, `pullRequest=1`, `prState=OPEN`, `prBaseRefName=main`, `prBaseRefOid=02d05f798096431f23acd1e5594a6bee21f3149f`, `prHeadRefName=architecture-and-new-codex`, `prHeadRefOid=expectedOldCandidateSha`, and `sameRepository=true`.
+
+Initial publication requires a nonsecret
+`.agents/schemas/publication-authorization.schema.json` object. Canonical bytes
+use recursively sorted keys, two-space indentation, and one final LF. The
+regular nonsymlink file is at most 32 KiB, is outside the artifact directory,
+remains private runtime evidence rather than committed controller state, and is
+bound through `--authorization-file` and the independent
+`--authorized-publication-sha256`. `--authorized-manifest-sha256` separately
+binds the artifact bundle. The grant expires within 15 minutes and binds the
+complete identity tuple, policy, bundle, nonce, credential mode, and principal.
+Its exact modes are `automated-app` and `attended-user`. The sole secret input is
+`CLOUDX_GATE_B_TOKEN`; the publisher pins it to child `GH_TOKEN`, disables
+ambient credentials and prompts, and never serializes, logs, emits, or durably
+stores it.
 
 1. Verification validates the accepted plan through the production artifact
    boundary before command dispatch and remains deterministic, local, read-only,
    and unable to mutate GitHub.
-2. Current clean exact-head implementation, verification, all selected area
-   reviews, and aggregate review plus explicit authorization bind one immutable
-   Gate-B manifest and the complete identity tuple above.
+2. Candidate-bound implementation, verification, all selected area reviews, and
+   aggregate review plus explicit authorization bind both immutable digests and
+   the complete identity tuple above.
 3. `$ship-change` invokes only
-   `node scripts/ai-change/publish-gate-b.mjs --artifact-dir <bundle> --authorized-manifest-sha256 <sha256> --expected-old-head <sha>`.
-   The executable alone may perform one pinned non-force update to the confirmed
-   unprotected candidate ref after exact local, artifact, remote, PR,
-   fast-forward, protection, and rules checks. It rechecks the manifest before
-   the update and performs authoritative remote and PR readback afterward. No
-   alternate raw push, force update, protected-ref update, retry, or second-use
+   `node scripts/ai-change/publish-gate-b.mjs --artifact-dir <bundle> --authorized-manifest-sha256 <sha256> --authorization-file <path> --authorized-publication-sha256 <sha256> --credential-mode <automated-app|attended-user> --expected-old-head <sha>`.
+   The executable validates authorization before secret read or command
+   execution, validates local, artifact, remote, and PR state, and revalidates
+   the authorization file, digest, bundle, identity, and expiry immediately
+   before publication.
+4. The executable alone may perform exactly one expected-old
+   `--force-with-lease=refs/heads/architecture-and-new-codex:<expectedOldCandidateSha>`
+   update to the confirmed unprotected, rules-free candidate ref and then
+   authoritative remote and PR readback. No alternate raw push, ordinary push,
+   general-force update, protected-ref update, retry, rollback, or second-use
    path exists.
-4. `$review-pr` evaluates only the pushed live head after readback; another push
-   stales the result.
-5. Every later GitHub mutation requires a current clean `$review-pr`; merge also
-   requires current merge intent and required checks.
+5. Before the push, every failure starts zero publication commands. After the
+   sole push starts, every error or identity ambiguity produces
+   `outcome=manual-reconciliation-required`, `pushAttempts=1`, `retry=false`, and
+   `reviewPrHandoff=false`; no review or mutation follows before explicit
+   reconciliation.
+6. `$review-pr` evaluates only the pushed live head after successful readback;
+   another push stales the result.
+7. Every later GitHub mutation requires a current clean `$review-pr`; merge also
+   requires current merge intent and required checks. Human-required paths remain
+   human reviewed and this change is not automerge eligible.
 
 <!-- CLOUDX-PUBLICATION-CONTRACT-V1:END -->
 
