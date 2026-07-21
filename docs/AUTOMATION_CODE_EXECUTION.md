@@ -5,6 +5,17 @@ needs logic that would be awkward to model with individual nodes. Use them when
 the graph still needs normal automation triggers, safety controls, visible run
 trace, and typed output ports.
 
+## Automation Graph Schema
+
+The current automation graph schema version is 2. Persisted version 1 graphs
+fail loading with a versioned error; Cloudx does not migrate or silently accept
+them.
+
+Version 2 records the breaking `workspace.tabs.create` contract. That hook now
+requires explicit `windowId` and `paneId` values and returns the persisted tab
+and window state. Recreate version 1 graphs with those targets before enabling
+them.
+
 ## Run Python
 
 `primitive:python.exec` runs the configured source through `python3 -c` in a

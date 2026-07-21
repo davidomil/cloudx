@@ -12,8 +12,9 @@ Public internet unsupported.
 
 Do not expose Cloudx to the public internet. It can spawn terminals, send text
 to shells and Codex, read and edit files under configured roots, and embed local
-dashboards with token-bearing URLs. Use localhost, a trusted LAN, or a private
-tailnet only.
+dashboards with token-bearing URLs. Keep Cloudx on localhost and put an
+authenticated reverse proxy such as Tailscale Serve in front of it for remote
+access.
 
 ## Screenshots
 
@@ -72,6 +73,9 @@ names, and dashboard tokens.
   extraction pipeline, and retrieval tests.
 - `debug_tooling/documentation-validation`: optional validation runner for the
   documentation archive.
+- `containers/ci`: credential-free no-network verifier image.
+- `docs/AI_CHANGE_PROCESS.md`: repository state, artifact, review, and merge
+  contract consumed by external AI automation.
 - `docs/MEMORY_PLUGIN_GUIDE.md`: source-grounded documentation archive guide.
 - `docs/MOTIVATION.md`: why this exists.
 - `docs/WEB_APP_PLAN.md`: product and architecture plan.
@@ -162,7 +166,8 @@ guide. It then installs Node.js 22 when needed, verifies `node -v` and
 `npm` package if npm is still missing. The wizard checks Git 2.36+ for the
 Worktree Manager and, on older Ubuntu Git packages such as 22.04's 2.34.x,
 offers to install the current stable Git package from `ppa:git-core/ppa`.
-The wizard then installs Cloudx npm dependencies, installs and checks Codex CLI,
+The wizard then installs Cloudx npm dependencies, installs and checks the pinned
+Codex CLI 0.144.6 release,
 prepares the Faster Whisper ASR environment, prepares the documentation archive
 indexer environment, downloads the local ASR model, writes Cloudx config, and
 optionally installs user-level services for Cloudx, ASR, and the documentation
@@ -173,8 +178,8 @@ question includes a short explanation of what the choice changes. The optional
 `whisper.cpp` step is not needed for CPU-only or NVIDIA CUDA installs because
 Faster Whisper handles those paths; use it only for an alternate compiled
 backend such as Intel Arc SYCL. The installer prints the local Cloudx URL when
-it finishes. Choose the LAN bind prompt, or pass `--lan`, only when you want
-Cloudx to bind to `0.0.0.0` for a trusted LAN or tailnet.
+it finishes. Cloudx always binds to loopback; remote access requires an
+authenticated reverse proxy.
 
 Preview the installer without changing the system:
 
@@ -204,31 +209,35 @@ Remove Cloudx-managed services and local install artifacts:
 ./install.sh --uninstall
 ```
 
+The default uninstall keeps `~/.config/cloudx/cloudx.env`, runtime data, the
+downloaded ASR model, and systemd linger. Active Cloudx services must stop
+successfully before the installer removes units or managed environments.
+
 Manual development startup is still available when prerequisites are already
 installed:
 
 ```bash
-npm install
+npm ci
 npm run build
 npm run dev
 ```
 
-Open `https://127.0.0.1:3001`. For phone access, prefer a private tailnet proxy
-to the localhost service. LAN binding is explicit and can be selected during
-installer prompts:
+Open `https://127.0.0.1:3001`. For phone access, proxy the localhost service
+through a private tailnet:
 
 ```bash
-./install.sh --lan
+tailscale serve --bg https+insecure://localhost:3001
 ```
 
-That writes `CLOUDX_HOST=0.0.0.0` and prints a warning because Cloudx can control
-shells and files. Use it only on a trusted LAN or tailnet.
+Use Tailscale grants or ACLs so only the intended users and devices can reach
+the node. Direct network binding is rejected because Cloudx can control shells
+and files.
 
 For voice control:
 
 ```bash
-python3 -m venv services/asr/.venv
-services/asr/.venv/bin/pip install -e services/asr
+UV_PROJECT_ENVIRONMENT="$PWD/services/asr/.venv" \
+  ~/.local/share/cloudx/uv/bin/uv sync --locked --project services/asr --extra dev
 services/asr/.venv/bin/uvicorn cloudx_asr.main:app \
   --app-dir services/asr/src --host 127.0.0.1 --port 7810
 ```
@@ -240,7 +249,8 @@ service install.
 For the local documentation archive:
 
 ```bash
-npm run documentation:setup
+~/.local/share/cloudx/uv/bin/uv sync --locked \
+  --project services/documentation-indexer --extra dev
 npm run documentation:start
 ```
 
@@ -284,7 +294,7 @@ command submission without disabling the rest of Cloudx.
 
 Common environment variables:
 
-- `CLOUDX_HOST`: bind address, default `127.0.0.1`. Set `0.0.0.0` only for a trusted LAN or tailnet.
+- `CLOUDX_HOST`: loopback bind host, default `127.0.0.1`; network-facing values are rejected.
 - `CLOUDX_PORT`: app port, default `3001`.
 - `CLOUDX_LOG_LEVEL`: server log level, one of `fatal`, `error`, `warn`, `info`, `debug`, `trace`, or `silent`; default `info`.
 - `CLOUDX_ALLOWED_ROOTS`: path-delimited allowed roots, default `~`.
@@ -293,6 +303,7 @@ Common environment variables:
 - `CLOUDX_ASR_URL`: ASR endpoint, default `http://127.0.0.1:7810`.
 - `CLOUDX_ASR_DEVICE`: Faster Whisper device, `cpu` or `cuda`.
 - `CLOUDX_ASR_COMPUTE_TYPE`: Faster Whisper compute profile, for example `int8`, `int8_float16`, or `float16`.
+- `CLOUDX_VOICE_AUDIO_UPLOAD_MAX_BYTES`: shared HTTP and WebSocket ASR audio admission limit, default `26214400` (25 MiB); must be a positive integer no greater than `536870912` (512 MiB).
 - `CLOUDX_DOCUMENTATION_URL`: documentation indexer endpoint, default `http://127.0.0.1:7820`.
 - `CLOUDX_DOCUMENTATION_HOST`: documentation indexer bind address, default `127.0.0.1`.
 - `CLOUDX_DOCUMENTATION_PORT`: documentation indexer port, default `7820`.

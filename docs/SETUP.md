@@ -15,7 +15,8 @@ to run Cloudx with voice control.
 - Quarto, Pandoc, and TeX Live XeLaTeX/LuaLaTeX engines for rendering the
   memory-plugin guide PDF. The Ubuntu installer installs these.
 - Codex CLI installed and authenticated on the backend host.
-- A trusted LAN or private tailnet for remote laptop/phone access.
+- An authenticated reverse proxy such as Tailscale Serve for remote
+  laptop/phone access.
 
 `node-pty` is optional because native builds vary by host. Terminal plugins fail
 clearly at runtime if it is unavailable.
@@ -42,23 +43,21 @@ The installer is split into two visible phases:
    `git worktree list --porcelain -z`; on older Git packages it can add
    `ppa:git-core/ppa` and install the current stable Git package after approval.
 2. `scripts/install-cloudx.mjs` is the Cloudx wizard. It prints each phase as it
-   runs: Codex CLI verification/login, install choices, `npm ci`, ASR virtualenv
-   setup, documentation-indexer virtualenv setup with table-aware extraction
-   dependencies, optional alternate `whisper.cpp` ASR setup, Hugging Face
-   model download, `npm run build`, certificate creation,
+   runs: pinned Codex CLI 0.144.6 verification/login, install choices, `npm ci`, a private
+   `uv 0.11.28` bootstrap, locked ASR and documentation-indexer environments,
+   optional alternate `whisper.cpp` ASR setup, Hugging Face model download,
+   `npm run build`, certificate creation,
    `~/.config/cloudx/cloudx.env` rendering, and optional user-level systemd
    service installation. When services are started, the wizard waits for
-   the HTTPS app, ASR, and documentation indexer health endpoints with bounded
+   the HTTPS app, ASR, and documentation indexer readiness endpoints with bounded
    retries; if any endpoint does not become healthy, it prints recent systemd
    status and journal output. When the install finishes, it prints
-   `https://127.0.0.1:<port>`. It prints detected LAN IPv4 URLs only when the
-   LAN/tailnet bind choice is selected or `--lan` is passed.
+   `https://127.0.0.1:<port>`.
 
 The wizard asks for:
 
 - Allowed workspace roots, written to `CLOUDX_ALLOWED_ROOTS`.
-- HTTPS port, localhost versus trusted LAN/tailnet bind, and optional extra
-  certificate hostnames.
+- HTTPS port and optional extra certificate hostnames.
 - ASR CPU thread count.
 - Optional alternate `whisper.cpp` ASR setup for documentation imports and
   voice control. Leave it disabled for CPU-only and NVIDIA CUDA installs because
@@ -69,9 +68,10 @@ The wizard asks for:
 - Whether to enable systemd linger so user services can survive logout.
 
 When `nvidia-smi` reports an NVIDIA GPU with Linux driver 525.60.13 or newer,
-faster-whisper ASR is configured for CUDA automatically. The installer adds the
-Python CUDA/cuDNN runtime wheels to the managed ASR and documentation virtualenvs
-instead of requiring system-wide CUDA libraries before install.
+faster-whisper ASR is configured for CUDA automatically. The installer selects
+the locked `cuda` dependency extra for both managed Python environments instead
+of mutating them with a second install command or requiring system-wide CUDA
+libraries before install.
 
 Each prompt includes a short explanation before the question so the tradeoff is
 visible during interactive installs.
@@ -83,7 +83,7 @@ Useful non-interactive planning options:
 ./install.sh --update --dry-run
 ./install.sh --uninstall --dry-run
 node scripts/install-cloudx.mjs --dry-run --yes
-node scripts/install-cloudx.mjs --dry-run --answers ./answers.json
+node scripts/install-cloudx.mjs --dry-run --answers ./answers.json --yes
 ```
 
 Add `--verbose` to install, update, or uninstall commands when debugging. In
@@ -92,18 +92,8 @@ prints command working directories, allowlisted installer environment values,
 captured stdout/stderr from probes, service unit write paths, and health-check
 failure context.
 
-Cloudx is private by default and binds to `127.0.0.1`. To expose it on a trusted
-LAN or tailnet, opt in through the installer prompt or pass:
-
-```bash
-./install.sh --lan
-```
-
-This writes `CLOUDX_HOST=0.0.0.0`, prints a warning, and advertises detected LAN
-URLs. Do not use this for direct public internet exposure.
-
-For a tailnet-authenticated path, keep Cloudx on localhost and proxy it with
-Tailscale Serve:
+Cloudx binds to `127.0.0.1` as a hard security boundary. For a
+tailnet-authenticated path, proxy the loopback service with Tailscale Serve:
 
 ```bash
 tailscale serve --bg https+insecure://localhost:3001
@@ -118,7 +108,6 @@ The answers JSON can contain:
 {
   "allowedRoots": "~",
   "port": 3001,
-  "bindLan": false,
   "certificateHosts": "",
   "cpuThreads": 6,
   "useGpu": false,
@@ -140,8 +129,9 @@ Arc SYCL path.
 Faster-whisper GPU support is installed by the Ubuntu installer when
 `nvidia-smi` reports an NVIDIA GPU with a CUDA 12-compatible driver. Linux
 driver 525.60.13 or newer is required; a 595-series driver is sufficient. The
-wizard installs the Python `nvidia-cublas-cu12` and `nvidia-cudnn-cu12` wheels
-into both managed Python environments, writes `CLOUDX_ASR_DEVICE=cuda`, and
+wizard resolves the locked Python `nvidia-cublas-cu12` and
+`nvidia-cudnn-cu12` packages through each service's `cuda` extra, writes
+`CLOUDX_ASR_DEVICE=cuda`, and
 chooses `CLOUDX_ASR_COMPUTE_TYPE=int8_float16` for smaller GPUs such as 4GB
 cards. Larger GPUs use `float16`. Set `"useGpu": false` in answers JSON to force
 CPU.
@@ -160,20 +150,21 @@ does the operational refresh:
 - Verifies Ubuntu prerequisites, Node.js, npm, and Git 2.36+ before any Codex or
   Cloudx npm commands run.
 - Pulls the current checkout with `git pull --ff-only`.
-- Updates the global Codex CLI package with npm and verifies Codex login status.
+- Updates the global Codex CLI package to 0.144.6 with npm and verifies Codex
+  login status.
 - Records the resolved assistant executable path in `CLOUDX_ASSISTANT_BIN` and
   relevant command directories in `CLOUDX_TOOL_PATH` so Cloudx services do not
   depend on systemd's minimal `PATH`.
 - Reinstalls Node dependencies with `npm ci`.
-- Updates the ASR virtualenv packages and downloads the model if it is missing.
-- Reinstalls the Python NVIDIA cuBLAS/cuDNN wheels when the saved environment
-  config uses `CLOUDX_ASR_DEVICE=cuda`.
+- Recreates the private pinned `uv` bootstrap and synchronizes both Python
+  environments from their checked-in lock files. CUDA hosts select the locked
+  `cuda` extras in the same operation.
+- Downloads the ASR model if it is missing.
 - Rebuilds Cloudx and creates the local HTTPS certificate if it is missing.
 - Rewrites user-level systemd service files when they are already installed.
 - Asks whether to restart services now; if restarted, it verifies the Cloudx,
-  ASR, and documentation indexer health endpoints and then prints the local URL.
-  Existing installs that already have `CLOUDX_HOST=0.0.0.0` still print detected
-  LAN URLs.
+  ASR, and documentation indexer readiness endpoints and then prints the local URL.
+  Updates replace an older network-facing `CLOUDX_HOST` with `127.0.0.1`.
 
 Preview update without changing the system:
 
@@ -193,13 +184,19 @@ The uninstall wizard removes Cloudx-managed local artifacts. By default it:
 
 - Stops, disables, and removes `cloudx.service`, `cloudx-asr.service`, and
   `cloudx-documentation.service` from `~/.config/systemd/user`.
-- Removes `~/.config/cloudx/cloudx.env`.
+- Keeps `~/.config/cloudx/cloudx.env` unless you explicitly select config
+  removal.
 - Removes the Cloudx-managed Python virtualenvs at `services/asr/.venv` and
   `services/documentation-indexer/.venv`.
+- Removes the Cloudx-managed `uv` bootstrap at `~/.local/share/cloudx/uv`.
 - Leaves Node.js, npm, Python, apt packages, and Codex CLI installed.
 - Leaves `.cloudx` runtime data/certificates, `node_modules`, the downloaded
   Faster Whisper model, and systemd linger unchanged unless you explicitly ask
   to remove or disable them.
+
+The installer checks each systemd unit before removal. Absent or inactive units
+need no stop; every active unit must stop successfully before the installer
+removes service files, configuration, or managed environments.
 
 Preview uninstall without changing the system:
 
@@ -210,16 +207,26 @@ Preview uninstall without changing the system:
 Manual setup remains available:
 
 ```bash
-npm install
+npm ci
 sudo apt install ripgrep jq poppler-utils libreoffice ffmpeg pandoc \
   texlive-xetex texlive-latex-recommended texlive-latex-extra \
   texlive-fonts-recommended lmodern
 curl -fL -o /tmp/quarto-1.9.38-linux-amd64.deb \
   https://github.com/quarto-dev/quarto-cli/releases/download/v1.9.38/quarto-1.9.38-linux-amd64.deb
 sudo apt install /tmp/quarto-1.9.38-linux-amd64.deb
-python3 -m venv services/asr/.venv
-services/asr/.venv/bin/pip install -e services/asr
+python3 -m venv ~/.local/share/cloudx/uv
+~/.local/share/cloudx/uv/bin/pip install uv==0.11.28
+UV_PROJECT_ENVIRONMENT="$PWD/services/asr/.venv" \
+  ~/.local/share/cloudx/uv/bin/uv sync --locked \
+  --project services/asr --extra dev
+UV_PROJECT_ENVIRONMENT="$PWD/services/documentation-indexer/.venv" \
+  ~/.local/share/cloudx/uv/bin/uv sync --locked \
+  --project services/documentation-indexer --extra dev
 ```
+
+On a CUDA host that meets the driver requirement, append `--extra cuda` to
+both `uv sync` commands. A stale lock is an error: update and review the
+relevant `uv.lock` explicitly instead of dropping `--locked`.
 
 ## Jira Cloud Integration
 
@@ -282,13 +289,15 @@ SQLite, source snapshots, and Turbovec files. Create its virtualenv and install
 the service:
 
 ```bash
-npm run documentation:setup
+~/.local/share/cloudx/uv/bin/uv sync --locked \
+  --project services/documentation-indexer --extra dev
 ```
 
-That command creates `services/documentation-indexer/.venv` and installs the
-indexer with the PDF, image, table, Docling, yt-dlp, and faster-whisper
-dependencies used for large datasheets and media sources. FFmpeg is installed by
-the main installer and is required for media and YouTube slide-frame extraction.
+That command synchronizes `services/documentation-indexer/.venv` from the
+checked-in lock file with the PDF, image, table, Docling, yt-dlp, and
+faster-whisper dependencies used for large datasheets and media sources. It
+requires `uv 0.11.28`. FFmpeg is installed by the main installer and is required
+for media and YouTube slide-frame extraction.
 
 Start it on the default localhost endpoint:
 
@@ -466,7 +475,7 @@ backend, primarily Intel Arc SYCL after oneAPI and GPU device access are
 available:
 
 ```bash
-node scripts/install-cloudx.mjs --answers ./answers.json
+node scripts/install-cloudx.mjs --answers ./answers.json --yes
 ```
 
 Use `"installWhisperCpp": true`, `"whisperCppBuild": "sycl"`, and
@@ -503,22 +512,20 @@ For a small first test, omit `CLOUDX_ASR_MODEL_PATH` and set
 
 ## Systemd User Services
 
-This command installs ripgrep on Debian/Ubuntu when missing, creates the ASR and
-documentation indexer Python virtualenvs when needed, downloads the large-v3
-model, builds Cloudx, writes user-level units, and starts all three services:
+The main installer owns dependency synchronization, model download, build,
+configuration, and user-level service installation as one tested path. Select
+service installation when prompted:
 
 ```bash
-npm run service:install
+./install.sh
 ```
 
-Useful variants:
+Useful non-interactive variants:
 
 ```bash
-npm run service:install -- --cpu
-npm run service:install -- --gpu
-npm run service:install -- --skip-model
-npm run service:install -- --lan
-npm run service:install -- --no-start
+./install.sh --dry-run --yes
+./install.sh --no-start --yes
+node scripts/install-cloudx.mjs --answers ./answers.json --yes
 ```
 
 The setup writes:
@@ -568,7 +575,8 @@ CLOUDX_HTTPS_CERT_PATH=/path/to/cert.pem \
 npm run dev
 ```
 
-For command-line checks, use `curl -k https://127.0.0.1:3001/api/health` unless
+For command-line acceptance checks, use
+`curl -k https://127.0.0.1:3001/api/ready` unless
 the certificate is trusted by the OS.
 
 ## Tailscale
@@ -584,8 +592,8 @@ authorization, and process isolation.
 
 ## Full Configuration
 
-- `CLOUDX_HOST`: server bind address, default `127.0.0.1`. Set `0.0.0.0` only
-  for a trusted LAN or tailnet.
+- `CLOUDX_HOST`: loopback bind host, default `127.0.0.1`. Network-facing values
+  are rejected; use an authenticated reverse proxy for remote access.
 - `CLOUDX_PORT`: server port, default `3001`.
 - `CLOUDX_LOG_LEVEL`: server log level, one of `fatal`, `error`, `warn`,
   `info`, `debug`, `trace`, or `silent`; default `info`. Use `debug` or
@@ -640,18 +648,33 @@ ASR options:
 - `CLOUDX_ASR_MODEL_PATH`: local Faster Whisper model directory.
 - `CLOUDX_ASR_DEVICE`: `cuda` or `cpu`, default `cpu`.
 - `CLOUDX_ASR_COMPUTE_TYPE`: for example `int8`, `int8_float16`, or `float16`.
+- `CLOUDX_VOICE_AUDIO_UPLOAD_MAX_BYTES`: shared HTTP and WebSocket audio
+  admission limit, default `26214400` (25 MiB); must be a positive integer no
+  greater than `536870912` (512 MiB).
 - `CLOUDX_ASR_WHISPER_CPP_BIN`: `whisper-cli` binary used when
   `CLOUDX_ASR_BACKEND=whisper-cpp`.
 - `CLOUDX_ASR_WHISPER_CPP_MODEL_PATH`: GGML model file used by whisper.cpp.
-- `CLOUDX_ASR_WHISPER_CPP_THREADS`: CPU helper threads for whisper.cpp.
+- `CLOUDX_ASR_WHISPER_CPP_THREADS`: CPU helper threads for whisper.cpp, from
+  `1` through `32`.
 - `CLOUDX_ASR_WHISPER_CPP_VAD`: set `true` to enable whisper.cpp VAD.
 - `CLOUDX_ASR_WHISPER_CPP_VAD_MODEL_PATH`: GGML Silero VAD model file used
   when whisper.cpp VAD is enabled.
 - `CLOUDX_ASR_WHISPER_CPP_ARGS`: optional explicit extra `whisper-cli`
   arguments.
 - `CLOUDX_ASR_LANGUAGE`: language code, default `en`; use `auto` for detection.
-- `CLOUDX_ASR_CPU_THREADS`: CPU threads.
-- `CLOUDX_ASR_NUM_WORKERS`: Faster Whisper worker count, default `1`.
+- `CLOUDX_ASR_CPU_THREADS`: CPU threads, from `0` through `32`.
+- `CLOUDX_ASR_NUM_WORKERS`: Faster Whisper worker count, default `1`; must be
+  from `1` through `32`.
+- `CLOUDX_ASR_INFERENCE_CONCURRENCY`: maximum concurrent inference jobs;
+  defaults to `CLOUDX_ASR_NUM_WORKERS` and must be from `1` through `32`.
+- `CLOUDX_ASR_INFERENCE_TIMEOUT_SECONDS`: deadline for one inference worker
+  request, default `120`; must be finite, positive, and at most `3600`.
+- `CLOUDX_ASR_INFERENCE_CANCEL_GRACE_SECONDS`: time allowed for an inference
+  worker to stop before forced termination, default `1`; must be finite,
+  positive, and at most `30`.
+- `CLOUDX_ASR_INFERENCE_WORKER_START_TIMEOUT_SECONDS`: deadline for an
+  inference worker to report ready, default `120`; must be finite, positive,
+  and at most `600`.
 - `CLOUDX_ASR_BEAM_SIZE`: final transcript beam size, default `5`.
 - `CLOUDX_ASR_MAX_NEW_TOKENS`: maximum decode tokens, default `96`; set `0` to
   let Faster Whisper decide.

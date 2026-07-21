@@ -4,8 +4,8 @@ Private by default. Tailnet recommended. Public internet unsupported.
 
 Cloudx is a local-first mobile workbench for Codex CLI. It is designed for a
 single trusted developer running Cloudx on their own Linux workstation, devbox,
-or homelab server and accessing it from localhost, a trusted LAN, or a private
-tailnet.
+or homelab server. The process listens only on loopback; remote clients reach it
+through an authenticated reverse proxy on a private network.
 
 ## What Cloudx Can Do
 
@@ -44,25 +44,10 @@ https://127.0.0.1:3001
 This is the recommended baseline because the app can control terminals and
 files as the local user running Cloudx.
 
-## Trusted LAN Or Tailnet Access
+## Authenticated Tailnet Access
 
-For direct LAN binding, opt in explicitly through the installer prompt or pass
-`--lan`:
-
-```bash
-./install.sh --lan
-```
-
-or configure:
-
-```bash
-CLOUDX_HOST=0.0.0.0
-```
-
-Cloudx prints a warning when it starts with a network-facing bind. Use this only
-on a trusted LAN or private tailnet.
-
-The preferred remote path is a tailnet proxy while Cloudx remains on localhost:
+Network-facing `CLOUDX_HOST` values are rejected. Keep Cloudx on localhost and
+use an identity-aware tailnet proxy:
 
 ```bash
 tailscale serve --bg https+insecure://localhost:3001
@@ -83,9 +68,9 @@ proxy without identity-aware access control is not enough for this threat model.
 ## Recommended Deployment
 
 - Localhost.
-- Trusted LAN.
-- Tailscale, NordVPN Meshnet, or WireGuard.
-- Reverse proxy only with external authentication.
+- Tailscale Serve with grants or ACLs.
+- Another reverse proxy only with external authentication and a private network
+  boundary.
 
 ## Operational Checks
 
