@@ -11,9 +11,7 @@ import {
   MAX_DOCUMENTATION_UPLOAD_MAX_BYTES,
   MAX_VOICE_AUDIO_UPLOAD_MAX_BYTES,
   defaultLocalHttpsPaths,
-  loadConfig,
-  networkBindWarning,
-  shouldWarnForNetworkBind
+  loadConfig
 } from "./config.js";
 import {
   DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES,
@@ -39,12 +37,15 @@ describe("loadConfig", () => {
     expect(config.voiceAudioUploadMaxBytes).toBe(DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES);
   });
 
-  it("detects network-facing bind hosts for startup warnings", () => {
-    expect(shouldWarnForNetworkBind("0.0.0.0")).toBe(true);
-    expect(shouldWarnForNetworkBind("::")).toBe(true);
-    expect(shouldWarnForNetworkBind("127.0.0.1")).toBe(false);
-    expect(networkBindWarning("0.0.0.0", 3001)).toContain("Public internet unsupported");
-    expect(networkBindWarning("0.0.0.0", 3001, "http")).toContain("Local URL: http://127.0.0.1:3001");
+  it("rejects network-facing binds without an application identity boundary", () => {
+    expect(() => loadConfig({ CLOUDX_HOST: "0.0.0.0" } as NodeJS.ProcessEnv)).toThrow(
+      /loopback.*authenticated reverse proxy/i
+    );
+    expect(() => loadConfig({ CLOUDX_HOST: "::" } as NodeJS.ProcessEnv)).toThrow(
+      /loopback.*authenticated reverse proxy/i
+    );
+    expect(loadConfig({ CLOUDX_HOST: "localhost" } as NodeJS.ProcessEnv).host).toBe("localhost");
+    expect(loadConfig({ CLOUDX_HOST: "::1" } as NodeJS.ProcessEnv).host).toBe("::1");
   });
 
   it("leaves configured allowed roots as user-facing path expressions", () => {

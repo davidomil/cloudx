@@ -25,8 +25,25 @@ describe("AudioAiPlugin", () => {
     const voice = { handleTranscript: vi.fn(async () => result) } as unknown as VoiceController;
     const plugin = new AudioAiPlugin(() => voice, () => true);
     const hook = plugin.hooks.find((candidate) => candidate.id === "audio-ai.submitTranscript");
+    const controller = new AbortController();
 
-    await expect(hook!.execute({ transcript: " open terminal ", activeTabId: "tab-1", clientContext: { activeWindowId: "window-1" } }, hookContext)).resolves.toEqual(result);
-    expect(voice.handleTranscript).toHaveBeenCalledWith("open terminal", "tab-1", { activeWindowId: "window-1" }, { source: "audio-ai-hook" });
+    await expect(hook!.execute({ transcript: " open terminal ", activeTabId: "tab-1", clientContext: { activeWindowId: "window-1" } }, { ...hookContext, signal: controller.signal })).resolves.toEqual(result);
+    expect(voice.handleTranscript).toHaveBeenCalledWith("open terminal", "tab-1", { activeWindowId: "window-1" }, { source: "audio-ai-hook", signal: controller.signal });
+  });
+
+  it("rejects when caller cancellation aborts plugin-triggered voice work", async () => {
+    const voice = {
+      handleTranscript: vi.fn((_transcript, _activeTabId, _clientContext, options: { signal?: AbortSignal }) => new Promise((_resolve, reject) => {
+        options.signal?.addEventListener("abort", () => reject(options.signal?.reason), { once: true });
+      }))
+    } as unknown as VoiceController;
+    const plugin = new AudioAiPlugin(() => voice);
+    const hook = plugin.hooks.find((candidate) => candidate.id === "audio-ai.submitTranscript")!;
+    const controller = new AbortController();
+    const execution = hook.execute({ transcript: "open terminal" }, { ...hookContext, signal: controller.signal });
+
+    controller.abort(new Error("server shutting down"));
+
+    await expect(execution).rejects.toThrow("server shutting down");
   });
 });

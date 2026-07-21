@@ -15,6 +15,7 @@ import {
 import { DEFAULT_TERMINAL_REPLAY_BYTES } from "./plugins/CodexTerminalPlugin.js";
 
 export const DEFAULT_CLOUDX_HOST = "127.0.0.1";
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
 export const DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES = 25 * 1024 * 1024;
 export const MAX_VOICE_AUDIO_UPLOAD_MAX_BYTES = 512 * 1024 * 1024;
 export const DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES = 256 * 1024 * 1024;
@@ -49,7 +50,7 @@ export interface AppConfig {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
-  const host = env.CLOUDX_HOST ?? DEFAULT_CLOUDX_HOST;
+  const host = parseLoopbackHost(env.CLOUDX_HOST ?? DEFAULT_CLOUDX_HOST);
   const port = parsePositiveInteger(env.CLOUDX_PORT ?? "3001", "CLOUDX_PORT");
   const logLevel = parseLogLevel(env.CLOUDX_LOG_LEVEL ?? "info");
   const terminalReplayBytes = parsePositiveInteger(env.CLOUDX_TERMINAL_REPLAY_BYTES ?? String(DEFAULT_TERMINAL_REPLAY_BYTES), "CLOUDX_TERMINAL_REPLAY_BYTES");
@@ -137,24 +138,14 @@ function parseVoiceModel(value: string): string {
   return trimmed;
 }
 
-export function shouldWarnForNetworkBind(host: string): boolean {
-  const normalized = host.trim().toLowerCase();
-  return normalized === "0.0.0.0" || normalized === "::" || normalized === "[::]";
-}
-
-export function networkBindWarning(host: string, port: number, protocol: "http" | "https" = "https"): string {
-  return [
-    "",
-    "======================================================================",
-    "WARNING: Cloudx is listening on a network interface.",
-    `CLOUDX_HOST=${host} exposes this shell-controlling service beyond localhost.`,
-    "Cloudx can spawn terminals, edit files, proxy dashboards, and transcribe",
-    "browser microphone audio when voice is enabled.",
-    "Use only on a trusted LAN or private tailnet. Public internet unsupported.",
-    `Local URL: ${protocol}://127.0.0.1:${port}`,
-    "======================================================================",
-    ""
-  ].join("\n");
+function parseLoopbackHost(value: string): string {
+  const host = value.trim().toLowerCase();
+  if (!LOOPBACK_HOSTS.has(host)) {
+    throw new Error(
+      "CLOUDX_HOST must be a loopback host. Put an authenticated reverse proxy in front of Cloudx for remote access."
+    );
+  }
+  return host;
 }
 
 function isTruthy(value: string | undefined): boolean {

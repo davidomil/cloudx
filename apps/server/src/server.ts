@@ -4,6 +4,7 @@ import staticPlugin from "@fastify/static";
 import fs from "node:fs";
 import type { IncomingHttpHeaders } from "node:http";
 import { randomUUID } from "node:crypto";
+import path from "node:path";
 import { Readable } from "node:stream";
 import type { RawData, WebSocket } from "ws";
 
@@ -36,6 +37,7 @@ import { AsrClient } from "./asrClient.js";
 import { DEFAULT_DOCUMENTATION_URL, DocumentationClient } from "./documentation/DocumentationClient.js";
 import { DocumentationIngestQueue } from "./documentation/DocumentationIngestQueue.js";
 import { CodexDocumentationEnrichmentRunner, DocumentationEnrichmentService } from "./documentation/DocumentationEnrichmentService.js";
+import { reapDocumentationUploadSpool, spoolDocumentationUpload, type DocumentationUploadSpool } from "./documentation/DocumentationUploadSpool.js";
 import { PathPolicy } from "./pathPolicy.js";
 import { PluginRegistry } from "./pluginRegistry.js";
 import { LOCAL_WEB_PROXY_MAX_BODY_BYTES, LocalWebProxy } from "./localWebProxy.js";
@@ -59,6 +61,7 @@ import { JiraIntegrationService } from "./jira/JiraIntegrationService.js";
 import { JiraPollingService } from "./jira/JiraPollingService.js";
 import { SessionStore } from "./sessionStore.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
+import { WorkspaceCommandService } from "./workspace/WorkspaceCommandService.js";
 import { RulesSkillsCatalogService } from "./rulesSkills/RulesSkillsCatalogService.js";
 import { NodePtyTerminalProcessFactory } from "./terminal/NodePtyTerminalProcess.js";
 import { VoiceController } from "./voice/VoiceController.js";
@@ -88,6 +91,7 @@ export interface AppServices {
   asr: AsrClient;
   config?: ConfigService;
   workspace?: WorkspaceLayoutStore;
+  workspaceCommands?: WorkspaceCommandService;
   hooks?: HookRegistry;
   triggers?: TriggerRegistry;
   automation?: AutomationService;
@@ -107,6 +111,7 @@ export interface AppServices {
 const MIN_STREAMED_AUDIO_BYTES = 128;
 const VOICE_WS_CONTROL_MESSAGE_MAX_BYTES = 64 * 1024;
 const TERMINAL_WS_CONTROL_MESSAGE_MAX_BYTES = 256 * 1024;
+export const TERMINAL_WS_MAX_BUFFERED_BYTES = 1024 * 1024;
 const MAX_TERMINAL_DIMENSION = 500;
 const FILE_UPLOAD_MAX_BYTES = 25 * 1024 * 1024 * 1024;
 const WS_CONNECTING = 0;
@@ -126,6 +131,7 @@ export type TerminalControlMessage = { type: "input"; data: string } | { type: "
 export type VoiceAudioControlMessage = { type?: string; clientContext?: unknown };
 
 export async function buildServer(config: AppConfig, services?: AppServices): Promise<FastifyInstance> {
+  await fs.promises.mkdir(config.dataDir, { recursive: true, mode: 0o700 });
   const app = Fastify({
     logger: {
       level: config.logLevel,
@@ -143,8 +149,10 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   });
   services ??= buildServices(config, app.log);
   services.documentationIngestQueue ??= new DocumentationIngestQueue();
+  await reapDocumentationUploadSpool(documentationSpoolRoot(config));
   services.config ??= new ConfigService(config.dataDir, () => services!.plugins.list(), { voiceModel: config.voiceModel });
   services.workspace ??= new WorkspaceLayoutStore(config.dataDir, services.pathPolicy);
+  services.workspaceCommands ??= new WorkspaceCommandService(services.sessions, services.workspace);
   services.pluginData ??= new PluginDataStore(config.dataDir);
   services.installedPlugins ??= new InstalledPluginService(config.dataDir, { logger: app.log });
   services.rulesSkills ??= new RulesSkillsCatalogService(config.dataDir);
@@ -178,11 +186,46 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     }
   });
 
+  const failures: unknown[] = [];
+  let producerShutdown: Promise<void> | undefined;
+  let requestOwnerShutdown: Promise<void> | undefined;
+  let shutdownStarted = false;
+  const beginShutdown = (): void => {
+    if (shutdownStarted) {
+      return;
+    }
+    shutdownStarted = true;
+    try {
+      services.automation?.beginShutdown();
+    } catch (error) {
+      failures.push(error);
+    }
+    try {
+      services.voice.beginShutdown?.();
+    } catch (error) {
+      failures.push(error);
+    }
+    requestOwnerShutdown = settleDisposers(failures, [
+      () => services.documentationIngestQueue?.dispose(),
+      () => services.voice.dispose?.()
+    ]);
+    producerShutdown = settleDisposers(failures, [
+      () => services.jiraPolling?.dispose(),
+      () => services.sessions.dispose?.()
+    ]);
+  };
+
+  app.addHook("preClose", () => {
+    beginShutdown();
+  });
   app.addHook("onClose", async () => {
-    disposePersistenceNotifications();
-    services.automation?.dispose();
-    services.jiraPolling?.dispose();
-    services.voice.dispose?.();
+    beginShutdown();
+    await Promise.all([producerShutdown, requestOwnerShutdown]);
+    await settleDisposers(failures, [() => services.automation?.dispose()]);
+    await settleDisposers(failures, [() => disposePersistenceNotifications()]);
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "One or more server services failed to stop.");
+    }
   });
 
   app.addContentTypeParser(/^audio\/.*/, { parseAs: "buffer", bodyLimit: config.voiceAudioUploadMaxBytes }, (_request, body, done) => {
@@ -198,6 +241,25 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     port: config.port,
     plugins: services.plugins.list().map((plugin) => plugin.id)
   }));
+
+  app.get("/api/ready", async (_request, reply) => {
+    try {
+      const [, documentation] = await Promise.all([
+        fs.promises.access(config.dataDir, fs.constants.R_OK | fs.constants.W_OK),
+        services.documentation?.health(),
+        services.asr.ready(),
+        services.automation?.ready(),
+        services.pluginContributionsReady
+      ]);
+      if (documentation && documentation.ready !== true) {
+        throw new Error("Documentation archive is not ready.");
+      }
+      return { status: "ready" };
+    } catch (error) {
+      app.log.warn({ dependencyError: error instanceof Error ? error.name : "unknown" }, "Cloudx readiness check failed.");
+      return reply.code(503).send({ status: "not-ready" });
+    }
+  });
 
   app.get("/api/plugins", async () => ({ plugins: services.plugins.list() }));
 
@@ -359,36 +421,9 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
 
   app.post<{ Params: { templateId: string }; Body: unknown }>("/api/layout-templates/:templateId/apply", async (request, reply) => {
     const body = applyLayoutTemplateBody(request.body);
-    const prepared = await services.workspace!.prepareTemplateWindow(request.params.templateId, body);
-    const tabIdMap = new Map<string, string>();
-    const createdTabIds: string[] = [];
-    const replacedTabIds = prepared.createdWindow ? [] : services.workspace!.tabIdsForWindow(prepared.window.id);
-    try {
-      for (const templateTab of prepared.template.tabs) {
-        const tabInput = services.workspace!.tabInputForTemplate(templateTab, prepared.projectPath);
-        const tab = await services.sessions.createTab({ pluginId: tabInput.pluginId, cwd: tabInput.cwd, title: tabInput.title, initialInput: tabInput.initialInput, windowId: prepared.window.id });
-        tabIdMap.set(templateTab.id, tab.id);
-        createdTabIds.push(tab.id);
-      }
-      const layout = services.workspace!.remapTemplateLayout(prepared.template, tabIdMap);
-      const window = await services.workspace!.finishTemplateWindow(prepared.window.id, layout, {
-        defaultCwd: prepared.projectPath,
-        ...(body.name ? { name: body.name } : {})
-      });
-      for (const tabId of replacedTabIds) {
-        services.sessions.closeTab(tabId);
-      }
-      reply.code(201);
-      return { window, workspace: await workspaceState(services) };
-    } catch (error) {
-      for (const tabId of createdTabIds) {
-        services.sessions.closeTab(tabId);
-      }
-      if (prepared.createdWindow) {
-        await services.workspace!.deleteWindow(prepared.window.id);
-      }
-      throw error;
-    }
+    const result = await services.workspaceCommands!.applyLayoutTemplate(request.params.templateId, body);
+    reply.code(201);
+    return { window: result.window, workspace: await workspaceState(services) };
   });
 
   app.patch<{ Params: { templateId: string }; Body: unknown }>("/api/layout-templates/:templateId", async (request) => {
@@ -402,9 +437,9 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   });
 
   app.post<{ Body: CreateTabRequest }>("/api/tabs", async (request, reply) => {
-    const tab = await services.sessions.createTab(createTabBody(request.body));
+    const result = await services.workspaceCommands!.createTab(createTabBody(request.body));
     reply.code(201);
-    return { tab };
+    return result;
   });
 
   app.post<{ Params: { tabId: string } }>("/api/tabs/:tabId/active", async (request) => {
@@ -449,48 +484,55 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     Querystring: { filename?: string; title?: string; sourceType?: string; collection?: string; acceptGeneratedCodeDocumentation?: string; retainRawCodeArtifacts?: string };
     Body: NodeJS.ReadableStream;
   }>("/api/documentation/upload", async (request) => {
-    const contentLength = parseContentLength(request.headers["content-length"]);
-    if (contentLength !== undefined && contentLength > config.documentationUploadMaxBytes) {
-      throw new FileUploadTooLargeError(config.documentationUploadMaxBytes);
-    }
     const filename = requiredQueryString(request.query.filename, "filename");
     const contentType = optionalHeaderString(request.headers["x-cloudx-file-content-type"]);
     const sourceType = optionalQueryString(request.query.sourceType);
     const acceptGeneratedCodeDocumentation = optionalQueryBoolean(request.query.acceptGeneratedCodeDocumentation, "acceptGeneratedCodeDocumentation");
     const retainRawCodeArtifacts = optionalQueryBoolean(request.query.retainRawCodeArtifacts, "retainRawCodeArtifacts");
-    const content = await readRequestBodyBuffer(request.body, config.documentationUploadMaxBytes);
     const title = optionalQueryString(request.query.title);
     const collection = optionalQueryString(request.query.collection);
-    return services.documentationIngestQueue!.enqueue({
-      kind: "upload",
-      label: title ?? filename,
-      detail: filename,
-      runningStage: "Forwarding uploaded file to the documentation indexer.",
-      operation: async (job) => {
-        job.update({ progress: 25, stage: "Indexer is extracting source evidence from the uploaded file." });
-        const result = await services.documentation!.ingestUpload({
-          filename,
-          content,
-          contentType,
-          title,
-          sourceType,
-          collection,
-          ...(acceptGeneratedCodeDocumentation !== undefined ? { acceptGeneratedCodeDocumentation } : {}),
-          ...(retainRawCodeArtifacts !== undefined ? { retainRawCodeArtifacts } : {})
-        });
-        job.update({ progress: 78, stage: "Running AI enrichment for the imported documentation." });
-        const enriched = await (services.documentationEnrichment?.enrichIngestResponse(result, {
-          filename,
-          content,
-          contentType,
-          sourceType,
-          ...(acceptGeneratedCodeDocumentation !== undefined ? { acceptGeneratedCodeDocumentation } : {}),
-          ...(retainRawCodeArtifacts !== undefined ? { retainRawCodeArtifacts } : {})
-        }) ?? result);
-        job.update({ progress: 92, stage: "Finalizing documentation import." });
-        return enriched;
-      }
-    });
+    const contentLength = requiredUploadContentLength(request.headers["content-length"], config.documentationUploadMaxBytes);
+    const admission = services.documentationIngestQueue!.reserve(contentLength);
+    let upload: DocumentationUploadSpool | undefined;
+    try {
+      upload = await spoolDocumentationUpload(request.body, documentationSpoolRoot(config), contentLength, config.documentationUploadMaxBytes);
+      return await services.documentationIngestQueue!.enqueueReserved({
+        kind: "upload",
+        label: title ?? filename,
+        admissionBytes: contentLength,
+        detail: filename,
+        runningStage: "Forwarding uploaded file to the documentation indexer.",
+        operation: async (job) => {
+          job.update({ progress: 25, stage: "Indexer is extracting source evidence from the uploaded file." });
+          const result = await services.documentation!.ingestUploadFile({
+            filename,
+            path: upload!.path,
+            contentType,
+            title,
+            sourceType,
+            collection,
+            ...(acceptGeneratedCodeDocumentation !== undefined ? { acceptGeneratedCodeDocumentation } : {}),
+            ...(retainRawCodeArtifacts !== undefined ? { retainRawCodeArtifacts } : {})
+          }, { signal: job.signal });
+          job.update({ progress: 78, stage: "Running AI enrichment for the imported documentation." });
+          job.signal.throwIfAborted();
+          const enriched = await (services.documentationEnrichment?.enrichIngestResponse(result, {
+            filename,
+            contentPath: upload!.path,
+            contentType,
+            sourceType,
+            ...(acceptGeneratedCodeDocumentation !== undefined ? { acceptGeneratedCodeDocumentation } : {}),
+            ...(retainRawCodeArtifacts !== undefined ? { retainRawCodeArtifacts } : {})
+          }, { signal: job.signal }) ?? result);
+          job.signal.throwIfAborted();
+          job.update({ progress: 92, stage: "Finalizing documentation import." });
+          return enriched;
+        }
+      }, admission);
+    } finally {
+      admission.release();
+      await upload?.dispose();
+    }
   });
 
   app.get("/api/documentation/archive/export", async (_request, reply) => {
@@ -519,26 +561,28 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     if (mode !== "replace" && mode !== "merge") {
       throwBadRequest("Archive import mode must be replace or merge.");
     }
-    const contentLength = parseContentLength(request.headers["content-length"]);
-    if (contentLength !== undefined && contentLength > config.documentationUploadMaxBytes) {
-      throw new FileUploadTooLargeError(config.documentationUploadMaxBytes);
-    }
     const filename = optionalQueryString(request.query.filename) ?? "documentation-archive.zip";
     const contentType = optionalHeaderString(request.headers["x-cloudx-file-content-type"]) ?? optionalHeaderString(request.headers["content-type"]);
-    const content = await readRequestBodyBuffer(request.body, config.documentationUploadMaxBytes);
-    if (mode === "replace") {
-      return services.documentation!.importArchiveReplaceUpload({
-        filename,
-        content,
-        contentType,
-        confirmation: requiredQueryString(request.query.confirmation, "confirmation")
-      });
+    const confirmation = mode === "replace" ? requiredQueryString(request.query.confirmation, "confirmation") : undefined;
+    const contentLength = requiredUploadContentLength(request.headers["content-length"], config.documentationUploadMaxBytes);
+    const admission = services.documentationIngestQueue!.reserve(contentLength);
+    let upload: DocumentationUploadSpool | undefined;
+    try {
+      upload = await spoolDocumentationUpload(request.body, documentationSpoolRoot(config), contentLength, config.documentationUploadMaxBytes);
+      return await services.documentationIngestQueue!.enqueueReserved({
+        kind: "upload",
+        label: filename,
+        admissionBytes: contentLength,
+        detail: `${mode} documentation archive`,
+        runningStage: "Forwarding documentation archive to the indexer.",
+        operation: (job) => mode === "replace"
+          ? services.documentation!.importArchiveReplaceFile({ filename, path: upload!.path, contentType, confirmation }, { signal: job.signal })
+          : services.documentation!.importArchiveMergeFile({ filename, path: upload!.path, contentType }, { signal: job.signal })
+      }, admission);
+    } finally {
+      admission.release();
+      await upload?.dispose();
     }
-    return services.documentation!.importArchiveMergeUpload({
-      filename,
-      content,
-      contentType
-    });
   });
 
   app.get<{
@@ -676,7 +720,8 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
         voiceRequestId,
         accepted: result.accepted,
         actionCount: result.plan.actions.length,
-        failedCount: result.results.filter((actionResult) => !actionResult.ok).length
+        failedCount: result.results.filter((actionResult) => actionResult.status === "failed").length,
+        skippedCount: result.results.filter((actionResult) => actionResult.status === "skipped").length
       },
       "manual voice transcript completed"
     );
@@ -838,7 +883,8 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
             durationMs: Date.now() - startedAt,
             accepted: result.accepted,
             actionCount: result.plan.actions.length,
-            failedCount: result.results.filter((actionResult) => !actionResult.ok).length
+            failedCount: result.results.filter((actionResult) => actionResult.status === "failed").length,
+            skippedCount: result.results.filter((actionResult) => actionResult.status === "skipped").length
           },
           "voice audio websocket completed"
         );
@@ -1010,10 +1056,10 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     };
     const snapshot = session.snapshot();
     if (snapshot.recentOutput) {
-      sendWebSocketJson(ws, { type: "data", data: snapshot.recentOutput }, failSend);
+      sendTerminalWebSocketJson(ws, { type: "data", data: snapshot.recentOutput }, failSend);
     }
     const dispose = session.onData?.((data) => {
-      sendWebSocketJson(ws, { type: "data", data }, failSend);
+      sendTerminalWebSocketJson(ws, { type: "data", data }, failSend);
     });
     let disposed = false;
     const cleanup = () => {
@@ -1116,7 +1162,10 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   }
   const configService = new ConfigService(config.dataDir, () => plugins.list(), { voiceModel: config.voiceModel });
   jira = new JiraIntegrationService(configService);
-  sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir), configService, workspace, rulesSkills);
+  sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir), configService, workspace, rulesSkills, (error, details) => {
+    logger?.error({ err: serializeError(error), ...details }, "session background operation failed");
+  });
+  const workspaceCommands = new WorkspaceCommandService(sessions, workspace);
   rulesSkills.onChange(() => {
     void (async () => {
       await sessions?.refreshRuntimeIndicators();
@@ -1153,7 +1202,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     { includeText: config.voiceDebugTranscripts ?? false }
   );
   const fileTransfer = new FileTransferService(pathPolicy);
-  const hooks = buildHookRegistry({ plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, fileTransfer });
+  const hooks = buildHookRegistry({ plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, fileTransfer });
   sessions.setHookRegistry(hooks);
   const automationRepository = new AutomationRepository(config.dataDir);
   const triggers = new TriggerRegistry({ recordEvent: (event) => automationRepository.appendTriggerEvent(event) });
@@ -1161,8 +1210,8 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   sessions.setTriggerRegistry(triggers);
   jiraPolling = new JiraPollingService(jira, pluginData, () => triggers);
   jiraPolling.start();
-  automation = createAutomationService(automationRepository, { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config);
-  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, pluginContributionsReady };
+  automation = createAutomationService(automationRepository, { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config);
+  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, pluginContributionsReady };
 }
 
 function isStreamingHookRequest(request: FastifyRequest<{ Querystring: { stream?: string } }>): boolean {
@@ -1296,7 +1345,8 @@ function buildHookRegistry(services: AppServices): HookRegistry {
     sessions: services.sessions,
     plugins: services.plugins,
     pathPolicy: services.pathPolicy,
-    workspace: services.workspace!
+    workspace: services.workspace!,
+    workspaceCommands: services.workspaceCommands!
   });
   const pluginValues = typeof services.plugins.values === "function" ? services.plugins.values() : [];
   for (const plugin of pluginValues) {
@@ -1555,9 +1605,22 @@ function createTabBody(body: unknown): CreateTabRequest {
     title: optionalBodyString(payload.title, "title"),
     createDirectory: optionalBodyBoolean(payload.createDirectory, "createDirectory"),
     initialInput: optionalBodyRecord(payload.initialInput, "initialInput"),
-    windowId: optionalBodyString(payload.windowId, "windowId"),
+    windowId: requiredTrimmedBodyString(payload.windowId, "windowId"),
+    paneId: requiredTrimmedBodyString(payload.paneId, "paneId"),
+    newPane: optionalBodyBoolean(payload.newPane, "newPane"),
+    splitDirection: optionalTabLayoutDirection(payload.splitDirection),
     pluginMetadata: optionalBodyRecord(payload.pluginMetadata, "pluginMetadata") as CreateTabRequest["pluginMetadata"] | undefined
   };
+}
+
+function optionalTabLayoutDirection(value: unknown): CreateTabRequest["splitDirection"] {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === "row" || value === "column") {
+    return value;
+  }
+  throwBadRequest("splitDirection must be row or column.");
 }
 
 function pluginGithubInstallBody(body: unknown): { url: string } {
@@ -1797,12 +1860,21 @@ function normalizedHost(value: string): string {
   return value.trim().toLowerCase().replace(/\.$/, "");
 }
 
-function sendWebSocketJson(ws: WebSocket, payload: unknown, onError: (error: Error) => void): boolean {
+export function sendTerminalWebSocketJson(ws: WebSocket, payload: unknown, onError: (error: Error) => void): boolean {
+  return sendWebSocketJson(ws, payload, onError, TERMINAL_WS_MAX_BUFFERED_BYTES, "Terminal websocket buffered output");
+}
+
+function sendWebSocketJson(ws: WebSocket, payload: unknown, onError: (error: Error) => void, maxBufferedBytes = Number.POSITIVE_INFINITY, label = "Websocket output"): boolean {
   if (ws.readyState !== WS_OPEN) {
     return false;
   }
   try {
-    ws.send(JSON.stringify(payload), (error) => {
+    const serialized = JSON.stringify(payload);
+    if (ws.bufferedAmount + Buffer.byteLength(serialized, "utf8") > maxBufferedBytes) {
+      onError(new Error(`${label} exceeded the ${maxBufferedBytes} byte limit.`));
+      return false;
+    }
+    ws.send(serialized, (error) => {
       if (error) {
         onError(error);
       }
@@ -1876,20 +1948,6 @@ function rawDataByteLength(raw: RawData): number {
   return raw.byteLength;
 }
 
-async function readRequestBodyBuffer(body: NodeJS.ReadableStream, maxBytes: number): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for await (const chunk of body as AsyncIterable<Buffer | Uint8Array | string>) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    total += buffer.byteLength;
-    if (total > maxBytes) {
-      throw new FileUploadTooLargeError(maxBytes);
-    }
-    chunks.push(buffer);
-  }
-  return Buffer.concat(chunks, total);
-}
-
 function parseContentLength(value: string | string[] | undefined): number | undefined {
   const rawValue = Array.isArray(value) ? value[0] : value;
   if (rawValue === undefined) {
@@ -1897,6 +1955,26 @@ function parseContentLength(value: string | string[] | undefined): number | unde
   }
   const contentLength = Number(rawValue);
   return Number.isFinite(contentLength) && contentLength >= 0 ? contentLength : undefined;
+}
+
+function requiredUploadContentLength(value: string | string[] | undefined, maxBytes: number): number {
+  const contentLength = parseContentLength(value);
+  if (contentLength === undefined) {
+    throwHttpError(411, "Documentation uploads require a valid Content-Length header.");
+  }
+  if (contentLength > maxBytes) {
+    throw new FileUploadTooLargeError(maxBytes);
+  }
+  return contentLength;
+}
+
+function documentationSpoolRoot(config: AppConfig): string {
+  return path.join(config.dataDir, "upload-spool");
+}
+
+async function settleDisposers(failures: unknown[], disposers: Array<() => unknown>): Promise<void> {
+  const results = await Promise.allSettled(disposers.map((dispose) => Promise.resolve().then(dispose)));
+  failures.push(...results.filter((result): result is PromiseRejectedResult => result.status === "rejected").map((result) => result.reason));
 }
 
 function requiredQueryString(value: unknown, field: string): string {
