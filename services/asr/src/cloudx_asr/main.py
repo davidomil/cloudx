@@ -2,18 +2,28 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import os
 import json
 import logging
+import math
+import multiprocessing
+import os
+import queue
 import re
 import shlex
+import shutil
+import signal
 import subprocess
 import tempfile
 import time
 from collections import deque
+from concurrent.futures import Future as ConcurrentFuture
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
+from multiprocessing.connection import Connection
 from pathlib import Path
+from threading import BoundedSemaphore, Event, Lock
+from typing import Callable, Generic, Protocol, TypeVar
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
@@ -37,12 +47,421 @@ class TranscriptionResponse(BaseModel):
 app = FastAPI(title="Cloudx ASR", version="0.1.0")
 logger = logging.getLogger("cloudx_asr")
 MIN_DECODABLE_AUDIO_BYTES = 128
+DEFAULT_AUDIO_UPLOAD_MAX_BYTES = 25 * 1024 * 1024
+MAX_AUDIO_UPLOAD_MAX_BYTES = 512 * 1024 * 1024
+AUDIO_UPLOAD_READ_CHUNK_BYTES = 64 * 1024
+MAX_INFERENCE_WORKERS = 32
+MAX_INFERENCE_TIMEOUT_SECONDS = 3600.0
+MAX_WORKER_START_TIMEOUT_SECONDS = 600.0
+MAX_CANCEL_GRACE_SECONDS = 30.0
 ASR_BACKEND_FASTER_WHISPER = "faster-whisper"
 ASR_BACKEND_WHISPER_CPP = "whisper-cpp"
 
 
 class InvalidAudioInput(ValueError):
     pass
+
+
+class AudioUploadTooLarge(ValueError):
+    pass
+
+
+class InferenceCapacityExceeded(RuntimeError):
+    pass
+
+
+class InferenceDeadlineExceeded(TimeoutError):
+    pass
+
+
+class InferenceBackendUnavailable(RuntimeError):
+    pass
+
+
+class InferenceBackendError(RuntimeError):
+    pass
+
+
+class InferenceCancelled(RuntimeError):
+    pass
+
+
+InferenceResult = TypeVar("InferenceResult")
+
+
+class InferenceJob(Generic[InferenceResult]):
+    def __init__(self, future: ConcurrentFuture[InferenceResult], request_cancel: Callable[[], None]):
+        self._future = future
+        self._request_cancel = request_cancel
+        self._async_future: asyncio.Future[InferenceResult] | None = None
+
+    async def result(self) -> InferenceResult:
+        return await asyncio.shield(self._result_future())
+
+    def done(self) -> bool:
+        return self._future.done()
+
+    async def cancel(self) -> None:
+        self._request_cancel()
+        try:
+            await asyncio.shield(self._result_future())
+        except InferenceCancelled:
+            pass
+
+    def _result_future(self) -> asyncio.Future[InferenceResult]:
+        if self._async_future is None:
+            self._async_future = asyncio.wrap_future(self._future)
+        return self._async_future
+
+
+class InferenceBackend(Protocol):
+    def transcribe(self, path: Path, beam_size: int | None = None, cancellation: Event | None = None) -> TranscriptionResponse: ...
+
+    def close(self) -> None: ...
+
+
+class InferenceWorkerProcess:
+    def __init__(
+        self,
+        *,
+        context=None,
+        worker_target: Callable[[Connection], None] | None = None,
+        timeout_seconds: float | None = None,
+        cancel_grace_seconds: float | None = None,
+        start_timeout_seconds: float | None = None,
+    ):
+        self._context = context or multiprocessing.get_context("spawn")
+        self._timeout_seconds = bounded_duration(
+            "CLOUDX_ASR_INFERENCE_TIMEOUT_SECONDS",
+            timeout_seconds if timeout_seconds is not None else inference_timeout_seconds(),
+            MAX_INFERENCE_TIMEOUT_SECONDS,
+        )
+        self._cancel_grace_seconds = bounded_duration(
+            "CLOUDX_ASR_INFERENCE_CANCEL_GRACE_SECONDS",
+            cancel_grace_seconds if cancel_grace_seconds is not None else inference_cancel_grace_seconds(),
+            MAX_CANCEL_GRACE_SECONDS,
+        )
+        self._start_timeout_seconds = bounded_duration(
+            "CLOUDX_ASR_INFERENCE_WORKER_START_TIMEOUT_SECONDS",
+            start_timeout_seconds if start_timeout_seconds is not None else inference_worker_start_timeout_seconds(),
+            MAX_WORKER_START_TIMEOUT_SECONDS,
+        )
+        self._stopped = Event()
+        self._terminate_lock = Lock()
+        parent_connection, child_connection = self._context.Pipe()
+        self._connection = parent_connection
+        self._process = self._context.Process(
+            target=worker_target or inference_worker_main,
+            args=(child_connection,),
+            name="cloudx-asr-backend",
+        )
+        try:
+            self._process.start()
+        except Exception:
+            child_connection.close()
+            self._connection.close()
+            self._stopped.set()
+            raise
+        child_connection.close()
+        try:
+            if not self._connection.poll(self._start_timeout_seconds):
+                raise InferenceBackendUnavailable("ASR inference worker did not become ready before its startup deadline.")
+            ready = self._connection.recv()
+            if ready != {"type": "ready"}:
+                raise InferenceBackendUnavailable("ASR inference worker returned an invalid startup response.")
+        except Exception:
+            self.terminate()
+            raise
+
+    def transcribe(self, path: Path, beam_size: int | None = None, cancellation: Event | None = None) -> TranscriptionResponse:
+        if self._stopped.is_set() or not self._process.is_alive():
+            raise InferenceBackendUnavailable("ASR inference worker stopped before accepting the request.")
+        if cancellation is not None and cancellation.is_set():
+            self.terminate()
+            raise InferenceCancelled("ASR inference was cancelled.")
+        try:
+            self._connection.send(
+                {
+                    "type": "transcribe",
+                    "path": str(path),
+                    "beam_size": beam_size,
+                }
+            )
+        except (BrokenPipeError, EOFError, OSError) as error:
+            raise InferenceBackendUnavailable("ASR inference worker stopped before accepting the request.") from error
+
+        timeout = self._timeout_seconds
+        deadline = time.monotonic() + timeout
+        while True:
+            if cancellation is not None and cancellation.is_set():
+                self.terminate()
+                raise InferenceCancelled("ASR inference was cancelled.")
+            if self._stopped.is_set():
+                raise InferenceBackendUnavailable("ASR inference worker stopped before completing the request.")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.terminate()
+                raise InferenceDeadlineExceeded(f"ASR inference exceeded its {timeout:g} second deadline.")
+            try:
+                if not self._connection.poll(min(0.05, remaining)):
+                    continue
+                response = self._connection.recv()
+            except (EOFError, OSError) as error:
+                raise InferenceBackendUnavailable("ASR inference worker stopped before completing the request.") from error
+            if response.get("type") == "result":
+                return TranscriptionResponse.model_validate(response["result"])
+            if response.get("type") == "error":
+                raise InferenceBackendError(str(response.get("error") or "ASR inference worker failed."))
+            raise InferenceBackendUnavailable("ASR inference worker returned an invalid response.")
+
+    def ready(self) -> bool:
+        return not self._stopped.is_set() and self._process.is_alive()
+
+    def terminate(self) -> None:
+        with self._terminate_lock:
+            if self._stopped.is_set():
+                return
+            self._stopped.set()
+            process_id = self._process.pid
+            grace = self._cancel_grace_seconds
+            if process_id is not None and os.name == "posix":
+                try:
+                    os.killpg(process_id, signal.SIGTERM)
+                except ProcessLookupError:
+                    if self._process.is_alive():
+                        self._process.terminate()
+                self._process.join(grace)
+                try:
+                    os.killpg(process_id, signal.SIGKILL)
+                except ProcessLookupError:
+                    if self._process.is_alive():
+                        self._process.kill()
+            elif self._process.is_alive():
+                self._process.terminate()
+                self._process.join(grace)
+                if self._process.is_alive():
+                    self._process.kill()
+            self._process.join(grace)
+            self._connection.close()
+
+
+class IsolatedInferenceBackend:
+    def __init__(
+        self,
+        capacity: int,
+        *,
+        context=None,
+        worker_target: Callable[[Connection], None] | None = None,
+    ):
+        require_bounded_int("CLOUDX_ASR_INFERENCE_CONCURRENCY", capacity, 1, MAX_INFERENCE_WORKERS)
+        self._capacity = capacity
+        self._context = context
+        self._worker_target = worker_target
+        self._timeout_seconds = inference_timeout_seconds()
+        self._cancel_grace_seconds = inference_cancel_grace_seconds()
+        self._start_timeout_seconds = inference_worker_start_timeout_seconds()
+        self._available: queue.LifoQueue[InferenceWorkerProcess] = queue.LifoQueue()
+        self._workers: set[InferenceWorkerProcess] = set()
+        self._lock = Lock()
+        self._closed = False
+        try:
+            for _ in range(capacity):
+                worker = self._create_worker()
+                self._workers.add(worker)
+                self._available.put(worker)
+        except Exception:
+            self.close()
+            raise
+
+    def transcribe(self, path: Path, beam_size: int | None = None, cancellation: Event | None = None) -> TranscriptionResponse:
+        with self._lock:
+            if self._closed:
+                raise InferenceBackendUnavailable("ASR inference backend is closed.")
+        try:
+            worker = self._available.get_nowait()
+        except queue.Empty as error:
+            raise InferenceBackendUnavailable("ASR inference backend has no available worker.") from error
+
+        replace_worker = False
+        try:
+            return worker.transcribe(path, beam_size, cancellation)
+        except (InferenceBackendUnavailable, InferenceDeadlineExceeded, InferenceCancelled):
+            replace_worker = True
+            raise
+        finally:
+            if replace_worker:
+                self._replace_worker(worker)
+            else:
+                with self._lock:
+                    if self._closed:
+                        worker.terminate()
+                    else:
+                        self._available.put(worker)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            workers = list(self._workers)
+            self._workers.clear()
+        for worker in workers:
+            worker.terminate()
+
+    def ready(self) -> bool:
+        with self._lock:
+            return (
+                not self._closed
+                and len(self._workers) == self._capacity
+                and all(worker.ready() for worker in self._workers)
+            )
+
+    def _create_worker(self) -> InferenceWorkerProcess:
+        return InferenceWorkerProcess(
+            context=self._context,
+            worker_target=self._worker_target,
+            timeout_seconds=self._timeout_seconds,
+            cancel_grace_seconds=self._cancel_grace_seconds,
+            start_timeout_seconds=self._start_timeout_seconds,
+        )
+
+    def _replace_worker(self, worker: InferenceWorkerProcess) -> None:
+        worker.terminate()
+        with self._lock:
+            self._workers.discard(worker)
+            closed = self._closed
+        if closed:
+            return
+        try:
+            replacement = self._create_worker()
+        except Exception as error:
+            logger.error("ASR inference worker replacement failed: %s", error)
+            return
+        with self._lock:
+            if self._closed:
+                replacement.terminate()
+                return
+            self._workers.add(replacement)
+            self._available.put(replacement)
+
+
+class InferenceExecutor:
+    def __init__(self, capacity: int, *, backend: InferenceBackend | None = None):
+        require_bounded_int("CLOUDX_ASR_INFERENCE_CONCURRENCY", capacity, 1, MAX_INFERENCE_WORKERS)
+        self.capacity = capacity
+        self._slots = BoundedSemaphore(capacity)
+        self._workers = ThreadPoolExecutor(max_workers=capacity, thread_name_prefix="cloudx-asr-inference")
+        self._backend = backend or create_inference_backend(capacity)
+
+    def submit(
+        self,
+        path: Path,
+        beam_size: int | None = None,
+        *,
+        cleanup: Callable[[], None] | None = None,
+    ) -> InferenceJob[TranscriptionResponse]:
+        if not self._slots.acquire(blocking=False):
+            raise InferenceCapacityExceeded("ASR inference capacity is full.")
+        cancellation = Event()
+
+        def run_with_owned_cleanup() -> TranscriptionResponse:
+            try:
+                return self._backend.transcribe(path, beam_size, cancellation)
+            finally:
+                if cleanup is not None:
+                    cleanup()
+
+        try:
+            future = self._workers.submit(run_with_owned_cleanup)
+        except Exception:
+            self._slots.release()
+            raise
+        future.add_done_callback(lambda _completed: self._slots.release())
+        return InferenceJob(future, cancellation.set)
+
+    def close(self) -> None:
+        self._backend.close()
+        self._workers.shutdown(wait=True)
+
+    def ready(self) -> bool:
+        probe = getattr(self._backend, "ready", None)
+        return True if probe is None else bool(probe())
+
+
+def create_inference_backend(capacity: int) -> InferenceBackend:
+    return IsolatedInferenceBackend(capacity)
+
+
+_inference_executor: InferenceExecutor | None = None
+_inference_executor_lock = Lock()
+
+
+def inference_concurrency() -> int:
+    return bounded_int_env("CLOUDX_ASR_INFERENCE_CONCURRENCY", asr_num_workers(), 1, MAX_INFERENCE_WORKERS)
+
+
+def inference_timeout_seconds() -> float:
+    return bounded_float_env("CLOUDX_ASR_INFERENCE_TIMEOUT_SECONDS", 120.0, MAX_INFERENCE_TIMEOUT_SECONDS)
+
+
+def inference_cancel_grace_seconds() -> float:
+    return bounded_float_env("CLOUDX_ASR_INFERENCE_CANCEL_GRACE_SECONDS", 1.0, MAX_CANCEL_GRACE_SECONDS)
+
+
+def inference_worker_start_timeout_seconds() -> float:
+    return bounded_float_env("CLOUDX_ASR_INFERENCE_WORKER_START_TIMEOUT_SECONDS", 120.0, MAX_WORKER_START_TIMEOUT_SECONDS)
+
+
+def bounded_float_env(name: str, default: float, maximum: float) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError as error:
+        raise invalid_bounded_number(name, maximum) from error
+    return bounded_duration(name, value, maximum)
+
+
+def bounded_duration(name: str, value: float, maximum: float) -> float:
+    if not math.isfinite(value) or value <= 0 or value > maximum:
+        raise invalid_bounded_number(name, maximum)
+    return value
+
+
+def invalid_bounded_number(name: str, maximum: float) -> RuntimeError:
+    return RuntimeError(f"{name} must be a finite positive number no greater than {maximum:g}.")
+
+
+def validate_resource_configuration() -> None:
+    inference_concurrency()
+    asr_num_workers()
+    asr_cpu_threads()
+    asr_whisper_cpp_threads()
+    inference_timeout_seconds()
+    inference_worker_start_timeout_seconds()
+    inference_cancel_grace_seconds()
+
+
+def get_inference_executor() -> InferenceExecutor:
+    global _inference_executor
+    with _inference_executor_lock:
+        if _inference_executor is None:
+            validate_resource_configuration()
+            _inference_executor = InferenceExecutor(inference_concurrency())
+        return _inference_executor
+
+
+def close_inference_executor() -> None:
+    global _inference_executor
+    with _inference_executor_lock:
+        executor = _inference_executor
+        _inference_executor = None
+    if executor is not None:
+        executor.close()
+
+
+app.router.add_event_handler("shutdown", close_inference_executor)
 
 
 @dataclass
@@ -82,6 +501,19 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/ready")
+async def ready() -> dict[str, str]:
+    try:
+        audio_upload_max_bytes()
+        executor = await asyncio.to_thread(get_inference_executor)
+        if not executor.ready():
+            raise InferenceBackendUnavailable("ASR inference worker is unavailable.")
+    except Exception as error:
+        logger.error("ASR readiness failed: %s", type(error).__name__)
+        raise HTTPException(status_code=503, detail="ASR inference backend is not ready.") from error
+    return {"status": "ready"}
+
+
 @lru_cache(maxsize=1)
 def get_model():
     from faster_whisper import WhisperModel
@@ -112,8 +544,51 @@ def asr_backend() -> str:
     return aliases[backend]
 
 
+def prepare_inference_backend() -> None:
+    if asr_backend() == ASR_BACKEND_FASTER_WHISPER:
+        get_model()
+        return
+    model_path = os.getenv(
+        "CLOUDX_ASR_WHISPER_CPP_MODEL_PATH",
+        os.getenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_MODEL_PATH", ""),
+    ).strip()
+    if not model_path:
+        raise RuntimeError(
+            "CLOUDX_ASR_WHISPER_CPP_MODEL_PATH is required when CLOUDX_ASR_BACKEND=whisper-cpp."
+        )
+    if not Path(model_path).is_file():
+        raise RuntimeError("CLOUDX_ASR_WHISPER_CPP_MODEL_PATH must name a readable model file.")
+    binary = os.getenv(
+        "CLOUDX_ASR_WHISPER_CPP_BIN",
+        os.getenv("CLOUDX_DOCUMENTATION_WHISPER_CPP_BIN", "whisper-cli"),
+    ).strip() or "whisper-cli"
+    binary_path = Path(binary)
+    if not (
+        (binary_path.is_file() and os.access(binary_path, os.X_OK))
+        or shutil.which(binary)
+    ):
+        raise RuntimeError("CLOUDX_ASR_WHISPER_CPP_BIN is not executable.")
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg is required when CLOUDX_ASR_BACKEND=whisper-cpp.")
+
+
 def use_vad_filter() -> bool:
     return os.getenv("CLOUDX_ASR_VAD_FILTER", "false").lower() in {"1", "true", "yes", "on"}
+
+
+def audio_upload_max_bytes() -> int:
+    name = "CLOUDX_VOICE_AUDIO_UPLOAD_MAX_BYTES"
+    raw_value = os.getenv(name, str(DEFAULT_AUDIO_UPLOAD_MAX_BYTES))
+    if re.fullmatch(r"[1-9]\d*", raw_value) is None:
+        raise RuntimeError(f"{name} must be a positive integer no greater than {MAX_AUDIO_UPLOAD_MAX_BYTES}.")
+    value = int(raw_value)
+    if value > MAX_AUDIO_UPLOAD_MAX_BYTES:
+        raise RuntimeError(f"{name} must be a positive integer no greater than {MAX_AUDIO_UPLOAD_MAX_BYTES}.")
+    return value
+
+
+def audio_upload_too_large(max_bytes: int) -> AudioUploadTooLarge:
+    return AudioUploadTooLarge(f"ASR audio upload exceeds the configured {max_bytes} byte limit.")
 
 
 def partial_interval_seconds() -> float:
@@ -137,15 +612,15 @@ def partial_window_bytes() -> int:
 
 
 def asr_cpu_threads() -> int:
-    return max(0, read_int_env("CLOUDX_ASR_CPU_THREADS", default_cpu_threads()))
+    return bounded_int_env("CLOUDX_ASR_CPU_THREADS", default_cpu_threads(), 1, MAX_INFERENCE_WORKERS)
 
 
 def default_cpu_threads() -> int:
-    return max(1, (os.cpu_count() or 4) // 2)
+    return min(MAX_INFERENCE_WORKERS, max(1, (os.cpu_count() or 4) // 2))
 
 
 def asr_num_workers() -> int:
-    return max(1, read_int_env("CLOUDX_ASR_NUM_WORKERS", 1))
+    return bounded_int_env("CLOUDX_ASR_NUM_WORKERS", 1, 1, MAX_INFERENCE_WORKERS)
 
 
 def transcription_language() -> str | None:
@@ -201,43 +676,131 @@ async def transcribe(
 ) -> TranscriptionResponse:
     started_at = time.monotonic()
     suffix = Path(audio.filename or "audio.webm").suffix or ".webm"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
-        temp_path = Path(temp_file.name)
-        audio_bytes = await audio.read()
-        temp_file.write(audio_bytes)
-
+    max_bytes = audio_upload_max_bytes()
+    temp_path: Path | None = None
+    audio_bytes = 0
+    first_bytes = b""
     try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
+            temp_path = Path(temp_file.name)
+            while chunk := await audio.read(AUDIO_UPLOAD_READ_CHUNK_BYTES):
+                attempted_bytes = audio_bytes + len(chunk)
+                if attempted_bytes > max_bytes:
+                    raise audio_upload_too_large(max_bytes)
+                if len(first_bytes) < 16:
+                    first_bytes = (first_bytes + chunk)[:16]
+                temp_file.write(chunk)
+                audio_bytes = attempted_bytes
         try:
-            validate_audio_size(len(audio_bytes))
+            validate_audio_size(audio_bytes)
+        except AudioUploadTooLarge:
+            raise
         except InvalidAudioInput as error:
             emit_asr_log(
                 "asr_http_invalid_audio",
                 filename=audio.filename or "audio.webm",
-                audio_bytes=len(audio_bytes),
+                audio_bytes=audio_bytes,
                 duration_ms=elapsed_ms(started_at),
                 error=str(error),
-                first_bytes_hex=audio_bytes[:16].hex() if audio_bytes else None,
+                first_bytes_hex=first_bytes.hex() if first_bytes else None,
             )
             raise HTTPException(status_code=400, detail=str(error)) from error
-        result = transcribe_file(temp_path)
+        try:
+            inference_path = temp_path
+            inference = get_inference_executor().submit(
+                inference_path,
+                cleanup=lambda: inference_path.unlink(missing_ok=True),
+            )
+            temp_path = None
+            try:
+                result = await inference.result()
+            except asyncio.CancelledError:
+                await inference.cancel()
+                emit_asr_log(
+                    "asr_http_cancelled",
+                    filename=audio.filename or "audio.webm",
+                    audio_bytes=audio_bytes,
+                    duration_ms=elapsed_ms(started_at),
+                    inference_finished=inference.done(),
+                )
+                raise
+        except InferenceCapacityExceeded as error:
+            emit_asr_log(
+                "asr_http_capacity_exceeded",
+                filename=audio.filename or "audio.webm",
+                audio_bytes=audio_bytes,
+                duration_ms=elapsed_ms(started_at),
+            )
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        except InferenceDeadlineExceeded as error:
+            emit_asr_log(
+                "asr_http_inference_deadline_exceeded",
+                filename=audio.filename or "audio.webm",
+                audio_bytes=audio_bytes,
+                duration_ms=elapsed_ms(started_at),
+            )
+            raise HTTPException(status_code=504, detail=str(error)) from error
+        except InferenceBackendUnavailable as error:
+            emit_asr_log(
+                "asr_http_backend_unavailable",
+                filename=audio.filename or "audio.webm",
+                audio_bytes=audio_bytes,
+                duration_ms=elapsed_ms(started_at),
+            )
+            raise HTTPException(status_code=503, detail=str(error)) from error
         emit_asr_log(
             "asr_http_transcription_completed",
             filename=audio.filename or "audio.webm",
-            audio_bytes=len(audio_bytes),
+            audio_bytes=audio_bytes,
             duration_ms=elapsed_ms(started_at),
             language=result.language,
             language_probability=result.language_probability,
             **transcript_log_fields(result.text),
         )
         return result
+    except AudioUploadTooLarge as error:
+        emit_asr_log(
+            "asr_http_audio_too_large",
+            filename=audio.filename or "audio.webm",
+            audio_bytes=audio_bytes,
+            max_audio_bytes=max_bytes,
+            duration_ms=elapsed_ms(started_at),
+        )
+        raise HTTPException(status_code=413, detail=str(error)) from error
     finally:
-        temp_path.unlink(missing_ok=True)
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+async def await_final_inference_or_disconnect(
+    websocket: WebSocket,
+    inference: InferenceJob[TranscriptionResponse],
+) -> TranscriptionResponse | None:
+    result_task = asyncio.create_task(inference.result())
+    disconnect_task = asyncio.create_task(websocket.receive())
+    tasks = (result_task, disconnect_task)
+    try:
+        completed, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        if disconnect_task in completed:
+            message = await disconnect_task
+            await inference.cancel()
+            await asyncio.gather(result_task, return_exceptions=True)
+            if message.get("type") == "websocket.disconnect":
+                return None
+            raise RuntimeError("ASR websocket received an unexpected message after end.")
+        return await result_task
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 @app.websocket("/transcribe/ws")
 async def transcribe_ws(websocket: WebSocket) -> None:
     await websocket.accept()
     started_at = time.monotonic()
+    max_bytes = audio_upload_max_bytes()
     filename = "voice.webm"
     temp_path: Path | None = None
     temp_file = None
@@ -245,6 +808,7 @@ async def transcribe_ws(websocket: WebSocket) -> None:
     last_partial_at = 0.0
     last_partial_text = ""
     partial_task: asyncio.Task | None = None
+    inference: InferenceJob | None = None
     send_lock = asyncio.Lock()
     partial_audio = PartialAudioWindow(partial_window_bytes())
 
@@ -256,14 +820,27 @@ async def transcribe_ws(websocket: WebSocket) -> None:
         nonlocal last_partial_text
         if not chunks:
             return
-        partial_path = write_partial_audio_file(filename, chunks)
+        partial_path: Path | None = write_partial_audio_file(filename, chunks)
+        partial_inference: InferenceJob | None = None
         try:
-            result = await asyncio.to_thread(transcribe_file, partial_path, partial_beam_size())
+            inference_path = partial_path
+            partial_inference = get_inference_executor().submit(
+                inference_path,
+                partial_beam_size(),
+                cleanup=lambda: inference_path.unlink(missing_ok=True),
+            )
+            partial_path = None
+            result = await partial_inference.result()
+        except asyncio.CancelledError:
+            if partial_inference is not None:
+                await partial_inference.cancel()
+            raise
         except Exception as error:
             logger.debug("ASR partial transcription skipped: %s", error)
             return
         finally:
-            partial_path.unlink(missing_ok=True)
+            if partial_path is not None:
+                partial_path.unlink(missing_ok=True)
         text = result.text.strip()
         if text and text != last_partial_text:
             last_partial_text = text
@@ -310,10 +887,24 @@ async def transcribe_ws(websocket: WebSocket) -> None:
 
             bytes_message = message.get("bytes")
             if bytes_message is not None:
+                attempted_bytes = total_bytes + len(bytes_message)
+                if attempted_bytes > max_bytes:
+                    error = audio_upload_too_large(max_bytes)
+                    emit_asr_log(
+                        "asr_websocket_audio_too_large",
+                        filename=filename,
+                        audio_bytes=total_bytes,
+                        attempted_audio_bytes=attempted_bytes,
+                        max_audio_bytes=max_bytes,
+                        duration_ms=elapsed_ms(started_at),
+                    )
+                    await send_json({"type": "error", "message": str(error)})
+                    await websocket.close(code=1009)
+                    return
                 if temp_file is None:
                     temp_file, temp_path = open_temp_audio_file(filename)
                 temp_file.write(bytes_message)
-                total_bytes += len(bytes_message)
+                total_bytes = attempted_bytes
                 partial_audio.push(bytes_message)
                 maybe_start_partial_snapshot()
 
@@ -342,7 +933,15 @@ async def transcribe_ws(websocket: WebSocket) -> None:
             )
             await send_json({"type": "error", "message": str(error)})
             return
-        result = transcribe_file(temp_path)
+        inference_path = temp_path
+        inference = get_inference_executor().submit(
+            inference_path,
+            cleanup=lambda: inference_path.unlink(missing_ok=True),
+        )
+        temp_path = None
+        result = await await_final_inference_or_disconnect(websocket, inference)
+        if result is None:
+            return
         log_fields = {
             "filename": filename,
             "audio_bytes": total_bytes,
@@ -362,6 +961,17 @@ async def transcribe_ws(websocket: WebSocket) -> None:
                 result.language,
             )
         await send_json({"type": "transcript", **result.model_dump()})
+    except asyncio.CancelledError:
+        if inference is not None:
+            await inference.cancel()
+        emit_asr_log(
+            "asr_websocket_cancelled",
+            filename=filename,
+            audio_bytes=total_bytes,
+            duration_ms=elapsed_ms(started_at),
+            inference_finished=inference.done() if inference is not None else None,
+        )
+        raise
     except WebSocketDisconnect:
         return
     except Exception as error:
@@ -375,6 +985,15 @@ async def transcribe_ws(websocket: WebSocket) -> None:
         )
         await send_json({"type": "error", "message": str(error)})
     finally:
+        if partial_task is not None:
+            if not partial_task.done():
+                partial_task.cancel()
+            try:
+                await partial_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as error:
+                logger.debug("ASR partial transcription cleanup failed: %s", error)
         if temp_file is not None:
             temp_file.close()
         if temp_path is not None:
@@ -510,8 +1129,38 @@ def transcribe_file_whisper_cpp(path: Path, beam_size: int) -> TranscriptionResp
     return TranscriptionResponse(text=text, language=transcription_language(), duration_seconds=duration, segments=segments)
 
 
+def inference_worker_main(connection: Connection) -> None:
+    if os.name == "posix":
+        os.setsid()
+    try:
+        try:
+            prepare_inference_backend()
+        except Exception as error:
+            connection.send({"type": "error", "error": f"{type(error).__name__}: {error}"})
+            return
+        connection.send({"type": "ready"})
+        while True:
+            try:
+                request = connection.recv()
+            except EOFError:
+                return
+            if request.get("type") == "close":
+                return
+            if request.get("type") != "transcribe":
+                connection.send({"type": "error", "error": "ASR inference worker received an invalid request."})
+                continue
+            try:
+                result = transcribe_file(Path(request["path"]), request.get("beam_size"))
+            except Exception as error:
+                connection.send({"type": "error", "error": f"{type(error).__name__}: {error}"})
+            else:
+                connection.send({"type": "result", "result": result.model_dump()})
+    finally:
+        connection.close()
+
+
 def asr_whisper_cpp_threads() -> int:
-    return max(1, read_int_env("CLOUDX_ASR_WHISPER_CPP_THREADS", asr_cpu_threads()))
+    return bounded_int_env("CLOUDX_ASR_WHISPER_CPP_THREADS", max(1, asr_cpu_threads()), 1, MAX_INFERENCE_WORKERS)
 
 
 def asr_whisper_cpp_stability_args() -> list[str]:
@@ -608,3 +1257,22 @@ def read_int_env(name: str, default: int) -> int:
         return int(value)
     except ValueError:
         return default
+
+
+def bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return require_bounded_int(name, default, minimum, maximum)
+    if re.fullmatch(r"-?\d+", raw_value) is None:
+        raise invalid_bounded_integer(name, minimum, maximum)
+    return require_bounded_int(name, int(raw_value), minimum, maximum)
+
+
+def require_bounded_int(name: str, value: int, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum or value > maximum:
+        raise invalid_bounded_integer(name, minimum, maximum)
+    return value
+
+
+def invalid_bounded_integer(name: str, minimum: int, maximum: int) -> RuntimeError:
+    return RuntimeError(f"{name} must be an integer from {minimum} through {maximum}.")
