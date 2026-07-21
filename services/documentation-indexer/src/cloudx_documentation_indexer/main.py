@@ -15,6 +15,7 @@ from typing import Sequence
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
@@ -102,6 +103,13 @@ def create_app(root: str | Path | None = None) -> FastAPI:
     @app.get("/health")
     def health() -> dict:
         return archive.health()
+
+    @app.get("/ready", responses={503: {"description": "The archive is not ready."}})
+    def ready() -> JSONResponse:
+        status = archive.health()
+        if status["ready"]:
+            return JSONResponse(content={"status": "ready"})
+        return JSONResponse(status_code=503, content={"status": "not-ready"})
 
     @app.get("/stats")
     def stats() -> dict:

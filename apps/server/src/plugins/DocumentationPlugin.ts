@@ -179,9 +179,9 @@ export class DocumentationPlugin implements WorkspacePlugin {
         const cwd = optionalString(input.cwd);
         const path = this.pathPolicy.resolve(requireString(input.path, "path"), cwd ? { relativeBaseDir: this.pathPolicy.resolve(cwd) } : undefined);
         const { cwd: _cwd, ...clientInput } = input;
-        return this.enqueueIngest("path", titleOrFallback(input.title, path), path, "Reading local path and extracting source evidence.", async (job) => {
+        return this.enqueueIngest("path", titleOrFallback(input.title, path), path, serializedInputBytes(input), "Reading local path and extracting source evidence.", async (job) => {
           job.update({ progress: 35, stage: "Indexer is reading the local path and extracting source evidence." });
-          return ingestResult(await this.enrichQueued(await this.client.ingestPath({ ...clientInput, path }), job), "path", path);
+          return ingestResult(await this.enrichQueued(await this.client.ingestPath({ ...clientInput, path }, { signal: job.signal }), job), "path", path);
         }, context);
       }, {
         path: { type: "string" },
@@ -193,9 +193,10 @@ export class DocumentationPlugin implements WorkspacePlugin {
         acceptGeneratedCodeDocumentation: { type: "boolean" },
         retainRawCodeArtifacts: { type: "boolean" }
       }, ["path"], documentationIngestOutputSchema()),
-      externalHook("documentation.ingest.url", "Ingest Documentation URL", "Download a URL source, ingest a YouTube video with transcript and keyframes, or ingest every video in a YouTube playlist.", async (input, context) => this.enqueueIngest("url", titleOrFallback(input.title, requireString(input.url, "url")), requireString(input.url, "url"), "Downloading URL and extracting source evidence.", async (job) => {
+      externalHook("documentation.ingest.url", "Ingest Documentation URL", "Download a URL source, ingest a YouTube video with transcript and keyframes, or ingest every video in a YouTube playlist.", async (input, context) => this.enqueueIngest("url", titleOrFallback(input.title, requireString(input.url, "url")), requireString(input.url, "url"), serializedInputBytes(input), "Downloading URL and extracting source evidence.", async (job) => {
         job.update({ progress: 30, stage: urlIngestStage(requireString(input.url, "url")) });
         return ingestResult(await this.enrichQueued(await this.client.ingestUrl(input, {
+          signal: job.signal,
           onProgress: (event) => job.update({
             progress: typeof event.progress === "number" ? Math.max(30, Math.min(76, event.progress)) : undefined,
             stage: event.stage,
@@ -214,9 +215,9 @@ export class DocumentationPlugin implements WorkspacePlugin {
         acceptGeneratedCodeDocumentation: { type: "boolean" },
         retainRawCodeArtifacts: { type: "boolean" }
       }, ["url"], documentationIngestOutputSchema()),
-      writeHook("documentation.ingest.text", "Ingest Documentation Text", "Ingest direct text, transcript, or copied source material.", async (input, context) => this.enqueueIngest("text", titleOrFallback(input.title, "Text source"), optionalString(input.uri) ?? "direct text", "Writing text into the archive.", async (job) => {
+      writeHook("documentation.ingest.text", "Ingest Documentation Text", "Ingest direct text, transcript, or copied source material.", async (input, context) => this.enqueueIngest("text", titleOrFallback(input.title, "Text source"), optionalString(input.uri) ?? "direct text", serializedInputBytes(input), "Writing text into the archive.", async (job) => {
         job.update({ progress: 35, stage: "Indexer is writing text into the archive." });
-        return ingestResult(await this.enrichQueued(await this.client.ingestText(input), job), "text", optionalString(input.uri) ?? "direct text");
+        return ingestResult(await this.enrichQueued(await this.client.ingestText(input, { signal: job.signal }), job), "text", optionalString(input.uri) ?? "direct text");
       }, context), {
         title: { type: "string" },
         text: { type: "string" },
@@ -285,14 +286,15 @@ export class DocumentationPlugin implements WorkspacePlugin {
     return this.pathPolicy.resolve(requireString(input.path, "path"), cwd ? { relativeBaseDir: this.pathPolicy.resolve(cwd) } : undefined);
   }
 
-  private enrich(response: Record<string, unknown>): Promise<Record<string, unknown>> | Record<string, unknown> {
-    return this.enrichmentProvider()?.enrichIngestResponse(response) ?? response;
+  private enrich(response: Record<string, unknown>, signal: AbortSignal): Promise<Record<string, unknown>> | Record<string, unknown> {
+    return this.enrichmentProvider()?.enrichIngestResponse(response, {}, { signal }) ?? response;
   }
 
   private enqueueIngest(
     kind: "path" | "url" | "text",
     label: string,
     detail: string,
+    admissionBytes: number,
     runningStage: string,
     operation: (context: DocumentationIngestQueueOperationContext) => Promise<Record<string, unknown>>,
     hookContext?: HookCallContext
@@ -300,6 +302,7 @@ export class DocumentationPlugin implements WorkspacePlugin {
     return this.ingestQueue.enqueue({
       kind,
       label,
+      admissionBytes,
       detail,
       runningStage,
       operation
@@ -307,8 +310,10 @@ export class DocumentationPlugin implements WorkspacePlugin {
   }
 
   private async enrichQueued(response: Record<string, unknown>, job: DocumentationIngestQueueOperationContext): Promise<Record<string, unknown>> {
+    job.signal.throwIfAborted();
     job.update({ progress: 78, stage: "Running AI enrichment for the imported documentation." });
-    const enriched = await this.enrich(response);
+    const enriched = await this.enrich(response, job.signal);
+    job.signal.throwIfAborted();
     job.update({ progress: 92, stage: "Finalizing documentation import." });
     return enriched;
   }
@@ -628,6 +633,10 @@ function optionalString(value: unknown): string | undefined {
 
 function titleOrFallback(value: unknown, fallback: string): string {
   return optionalString(value) ?? fallback;
+}
+
+function serializedInputBytes(input: Record<string, unknown>): number {
+  return Buffer.byteLength(JSON.stringify(input), "utf8");
 }
 
 async function assertFileDoesNotExist(filePath: string): Promise<void> {

@@ -1,3 +1,5 @@
+import { openAsBlob } from "node:fs";
+
 export const DEFAULT_DOCUMENTATION_URL = "http://127.0.0.1:7820";
 export const DEFAULT_DOCUMENTATION_TIMEOUT_MS = 30 * 60_000;
 export const MAX_DOCUMENTATION_TIMEOUT_MS = 12 * 60 * 60_000;
@@ -9,9 +11,9 @@ export interface DocumentationClientOptions {
   responseMaxBytes?: number;
 }
 
-export interface DocumentationUploadInput {
+export interface DocumentationUploadFileInput {
   filename: string;
-  content: Uint8Array;
+  path: string;
   contentType?: string;
   title?: string;
   sourceType?: string;
@@ -40,7 +42,11 @@ export interface DocumentationIngestProgressEvent {
   channelProgress?: number;
 }
 
-export interface DocumentationIngestRequestOptions {
+export interface DocumentationRequestOptions {
+  signal?: AbortSignal;
+}
+
+export interface DocumentationIngestRequestOptions extends DocumentationRequestOptions {
   onProgress?: (event: DocumentationIngestProgressEvent) => void;
 }
 
@@ -56,9 +62,9 @@ export interface DocumentationArtifactStreamResponse {
   body: ReadableStream<Uint8Array> | null;
 }
 
-export interface DocumentationArchiveUploadInput {
+export interface DocumentationArchiveFileInput {
   filename: string;
-  content: Uint8Array;
+  path: string;
   contentType?: string;
   confirmation?: string;
 }
@@ -75,8 +81,8 @@ export class DocumentationClient {
     this.responseMaxBytes = normalizeDocumentationResponseMaxBytes(options.responseMaxBytes);
   }
 
-  health(): Promise<Record<string, unknown>> {
-    return this.get("/health");
+  health(options: DocumentationRequestOptions = {}): Promise<Record<string, unknown>> {
+    return this.get("/health", options.signal);
   }
 
   stats(): Promise<Record<string, unknown>> {
@@ -100,7 +106,7 @@ export class DocumentationClient {
     return this.get(`/documents${query ? `?${query}` : ""}`);
   }
 
-  getDocument(input: Record<string, unknown>): Promise<Record<string, unknown>> {
+  getDocument(input: Record<string, unknown>, options: DocumentationRequestOptions = {}): Promise<Record<string, unknown>> {
     const documentId = encodeURIComponent(requireString(input.documentId, "documentId"));
     const params = new URLSearchParams();
     appendOptionalQueryNumber(params, "chunkOffset", input.chunkOffset);
@@ -113,7 +119,7 @@ export class DocumentationClient {
     appendOptionalQueryBoolean(params, "includeEnrichments", input.includeEnrichments);
     appendOptionalQueryBoolean(params, "includeEvents", input.includeEvents);
     const query = params.toString();
-    return this.get(`/documents/${documentId}${query ? `?${query}` : ""}`);
+    return this.get(`/documents/${documentId}${query ? `?${query}` : ""}`, options.signal);
   }
 
   getArtifact(input: Record<string, unknown>): Promise<DocumentationArtifactResponse> {
@@ -195,22 +201,22 @@ export class DocumentationClient {
     });
   }
 
-  importArchiveReplaceUpload(input: DocumentationArchiveUploadInput): Promise<Record<string, unknown>> {
+  async importArchiveReplaceFile(input: DocumentationArchiveFileInput, options: DocumentationIngestRequestOptions = {}): Promise<Record<string, unknown>> {
     const form = new FormData();
-    form.append("file", new Blob([arrayBufferCopy(input.content)], { type: input.contentType || "application/zip" }), input.filename);
+    form.append("file", await openAsBlob(input.path, { type: input.contentType || "application/zip" }), input.filename);
     appendOptionalFormValue(form, "confirmation", input.confirmation);
-    return this.request("/archive/import/replace", { method: "POST", body: form });
+    return this.request("/archive/import/replace", { method: "POST", body: form }, options.signal);
   }
 
-  importArchiveMergeUpload(input: DocumentationArchiveUploadInput): Promise<Record<string, unknown>> {
+  async importArchiveMergeFile(input: DocumentationArchiveFileInput, options: DocumentationIngestRequestOptions = {}): Promise<Record<string, unknown>> {
     const form = new FormData();
-    form.append("file", new Blob([arrayBufferCopy(input.content)], { type: input.contentType || "application/zip" }), input.filename);
-    return this.request("/archive/import/merge", { method: "POST", body: form });
+    form.append("file", await openAsBlob(input.path, { type: input.contentType || "application/zip" }), input.filename);
+    return this.request("/archive/import/merge", { method: "POST", body: form }, options.signal);
   }
 
-  enrichDocument(input: DocumentationEnrichInput): Promise<Record<string, unknown>> {
+  enrichDocument(input: DocumentationEnrichInput, options: DocumentationRequestOptions = {}): Promise<Record<string, unknown>> {
     const { documentId, ...body } = input;
-    return this.post(`/documents/${encodeURIComponent(requireString(documentId, "documentId"))}/enrich`, body);
+    return this.post(`/documents/${encodeURIComponent(requireString(documentId, "documentId"))}/enrich`, body, options.signal);
   }
 
   remove(input: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -221,20 +227,20 @@ export class DocumentationClient {
     return this.post("/search", input);
   }
 
-  ingestPath(input: Record<string, unknown>): Promise<Record<string, unknown>> {
-    return this.post("/ingest/path", input);
+  ingestPath(input: Record<string, unknown>, options: DocumentationIngestRequestOptions = {}): Promise<Record<string, unknown>> {
+    return this.post("/ingest/path", input, options.signal);
   }
 
   ingestUrl(input: Record<string, unknown>, options: DocumentationIngestRequestOptions = {}): Promise<Record<string, unknown>> {
     if (options.onProgress) {
-      return this.postStream("/ingest/url?stream=1", input, options.onProgress);
+      return this.postStream("/ingest/url?stream=1", input, options.onProgress, options.signal);
     }
-    return this.post("/ingest/url", input);
+    return this.post("/ingest/url", input, options.signal);
   }
 
-  ingestUpload(input: DocumentationUploadInput): Promise<Record<string, unknown>> {
+  async ingestUploadFile(input: DocumentationUploadFileInput, options: DocumentationIngestRequestOptions = {}): Promise<Record<string, unknown>> {
     const form = new FormData();
-    form.append("file", new Blob([arrayBufferCopy(input.content)], { type: input.contentType || "application/octet-stream" }), input.filename);
+    form.append("file", await openAsBlob(input.path, { type: input.contentType || "application/octet-stream" }), input.filename);
     appendOptionalFormValue(form, "title", input.title);
     appendOptionalFormValue(form, "sourceType", input.sourceType);
     appendOptionalFormValue(form, "collection", input.collection);
@@ -243,11 +249,11 @@ export class DocumentationClient {
     for (const tag of input.tags ?? []) {
       appendOptionalFormValue(form, "tags", tag);
     }
-    return this.request("/ingest/upload", { method: "POST", body: form });
+    return this.request("/ingest/upload", { method: "POST", body: form }, options.signal);
   }
 
-  ingestText(input: Record<string, unknown>): Promise<Record<string, unknown>> {
-    return this.post("/ingest/text", input);
+  ingestText(input: Record<string, unknown>, options: DocumentationIngestRequestOptions = {}): Promise<Record<string, unknown>> {
+    return this.post("/ingest/text", input, options.signal);
   }
 
   invalidate(input: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -258,22 +264,22 @@ export class DocumentationClient {
     return this.post("/rebuild-index", {});
   }
 
-  private get(pathname: string): Promise<Record<string, unknown>> {
-    return this.request(pathname, { method: "GET" });
+  private get(pathname: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    return this.request(pathname, { method: "GET" }, signal);
   }
 
-  private post(pathname: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
-    return this.request(pathname, { method: "POST", body: JSON.stringify(body), headers: { "content-type": "application/json" } });
+  private post(pathname: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    return this.request(pathname, { method: "POST", body: JSON.stringify(body), headers: { "content-type": "application/json" } }, signal);
   }
 
-  private async postStream(pathname: string, body: Record<string, unknown>, onProgress: (event: DocumentationIngestProgressEvent) => void): Promise<Record<string, unknown>> {
-    const controller = new AbortController();
+  private async postStream(pathname: string, body: Record<string, unknown>, onProgress: (event: DocumentationIngestProgressEvent) => void, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const scope = createDocumentationRequestAbortScope(signal);
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const resetTimeout = () => {
       if (timeout) {
         clearTimeout(timeout);
       }
-      timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+      timeout = setTimeout(() => scope.abortForTimeout(), this.timeoutMs);
     };
     resetTimeout();
     try {
@@ -281,14 +287,17 @@ export class DocumentationClient {
         method: "POST",
         body: JSON.stringify(body),
         headers: { "content-type": "application/json", "accept": "application/x-ndjson" },
-        signal: controller.signal
+        signal: scope.signal
       });
       if (!response.ok) {
         throw new Error(errorMessage(await readBoundedText(response, this.responseMaxBytes), response.status));
       }
       return await readDocumentationProgressStream(response, this.responseMaxBytes, onProgress, resetTimeout);
     } catch (error) {
-      if (controller.signal.aborted) {
+      if (signal?.aborted) {
+        throw abortReason(signal, "Documentation ingest was cancelled.");
+      }
+      if (scope.timedOut) {
         throw new Error(`Documentation progress stream was quiet for ${this.timeoutMs} ms.`);
       }
       throw error;
@@ -296,14 +305,15 @@ export class DocumentationClient {
       if (timeout) {
         clearTimeout(timeout);
       }
+      scope.dispose();
     }
   }
 
-  private async request(pathname: string, init: RequestInit): Promise<Record<string, unknown>> {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+  private async request(pathname: string, init: RequestInit, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const scope = createDocumentationRequestAbortScope(signal);
+    const timeout = setTimeout(() => scope.abortForTimeout(), this.timeoutMs);
     try {
-      const response = await fetch(this.serviceUrl(pathname), { ...init, signal: controller.signal });
+      const response = await fetch(this.serviceUrl(pathname), { ...init, signal: scope.signal });
       const text = await readBoundedText(response, this.responseMaxBytes);
       if (!response.ok) {
         throw new Error(errorMessage(text, response.status));
@@ -314,12 +324,16 @@ export class DocumentationClient {
       }
       return value;
     } catch (error) {
-      if (controller.signal.aborted) {
+      if (signal?.aborted) {
+        throw abortReason(signal, "Documentation ingest was cancelled.");
+      }
+      if (scope.timedOut) {
         throw new Error(`Documentation request timed out after ${this.timeoutMs} ms.`);
       }
       throw error;
     } finally {
       clearTimeout(timeout);
+      scope.dispose();
     }
   }
 
@@ -372,6 +386,39 @@ export function normalizeDocumentationResponseMaxBytes(maxBytes = DEFAULT_DOCUME
     throw new Error(`Documentation response size must be a positive integer no greater than ${MAX_DOCUMENTATION_RESPONSE_MAX_BYTES} bytes.`);
   }
   return maxBytes;
+}
+
+function createDocumentationRequestAbortScope(external?: AbortSignal): {
+  readonly signal: AbortSignal;
+  readonly timedOut: boolean;
+  abortForTimeout(): void;
+  dispose(): void;
+} {
+  const controller = new AbortController();
+  let timedOut = false;
+  const abortFromExternal = () => controller.abort(external?.reason);
+  if (external?.aborted) {
+    abortFromExternal();
+  } else {
+    external?.addEventListener("abort", abortFromExternal, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    get timedOut() {
+      return timedOut;
+    },
+    abortForTimeout() {
+      timedOut = true;
+      controller.abort();
+    },
+    dispose() {
+      external?.removeEventListener("abort", abortFromExternal);
+    }
+  };
+}
+
+function abortReason(signal: AbortSignal, message: string): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error(message);
 }
 
 async function readBoundedText(response: Response, maxBytes: number): Promise<string> {
@@ -566,12 +613,6 @@ function appendOptionalQueryString(params: URLSearchParams, name: string, value:
 
 function compactHeaders(headers: Record<string, string | undefined>): HeadersInit {
   return Object.fromEntries(Object.entries(headers).filter((entry): entry is [string, string] => Boolean(entry[1])));
-}
-
-function arrayBufferCopy(content: Uint8Array): ArrayBuffer {
-  const copy = new ArrayBuffer(content.byteLength);
-  new Uint8Array(copy).set(content);
-  return copy;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

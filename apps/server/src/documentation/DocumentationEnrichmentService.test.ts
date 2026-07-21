@@ -713,6 +713,105 @@ describe("DocumentationEnrichmentService", () => {
     });
   });
 
+  it("propagates one cancellation signal through archive, ASR, media, and Codex enrichment", async () => {
+    const controller = new AbortController();
+    const stopped = new Error("documentation enrichment stopped");
+    const runner = fakeRunner({
+      summary: "media enriched",
+      spans: [{ locator: "ai:media:section", text: "Signal propagation evidence." }],
+      metadata: [],
+      warnings: []
+    });
+    const asr = fakeAsr("Signal propagation transcript.");
+    const client = fakeDocumentationClient({ source_type: "media" });
+    vi.mocked(client.enrichDocument).mockImplementation(async (_input, options) => {
+      expect(options?.signal).toBe(controller.signal);
+      controller.abort(stopped);
+      throw stopped;
+    });
+    const service = new DocumentationEnrichmentService({
+      client,
+      config: fakeConfig(true),
+      rulesSkills: fakeRulesSkills(),
+      runner,
+      asr
+    });
+
+    await expect(service.enrichIngestResponse(
+      { document: { documentId: "doc-1" } },
+      { filename: "demo.mp3", contentType: "audio/mpeg", sourceType: "media", content: Buffer.from("fake audio") },
+      { signal: controller.signal }
+    )).rejects.toBe(stopped);
+
+    expect(client.getDocument).toHaveBeenCalledWith(expect.any(Object), { signal: controller.signal });
+    expect(client.health).toHaveBeenCalledWith({ signal: controller.signal });
+    expect(asr.transcribe).toHaveBeenCalledWith(Buffer.from("fake audio"), "demo.mp3", { signal: controller.signal });
+    expect(runner.run).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ signal: controller.signal }));
+  });
+
+  it("keeps media process-group escalation alive when the leader exits before its descendant", async () => {
+    const toolDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-fake-ffmpeg-"));
+    const fakeFfmpeg = path.join(toolDir, "ffmpeg");
+    const startedPath = path.join(toolDir, "started.json");
+    const previousPath = process.env.PATH;
+    const previousStartedPath = process.env.CLOUDX_TEST_MEDIA_STARTED;
+    await fs.writeFile(fakeFfmpeg, [
+      "#!/usr/bin/env node",
+      "import fs from 'node:fs';",
+      "import path from 'node:path';",
+      "import { spawn } from 'node:child_process';",
+      "const outputPattern = process.argv.at(-1);",
+      "const outputDir = path.dirname(outputPattern);",
+      "fs.mkdirSync(outputDir, { recursive: true });",
+      "fs.writeFileSync(path.join(outputDir, 'frame-0001.jpg'), 'partial frame');",
+      "const descendant = spawn(process.execPath, ['-e', \"process.on('SIGTERM', () => {}); process.send('ready'); setInterval(() => {}, 1000)\"], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });",
+      "descendant.once('message', () => fs.writeFileSync(process.env.CLOUDX_TEST_MEDIA_STARTED, JSON.stringify({ parent: process.pid, descendant: descendant.pid, outputDir })));",
+      "setInterval(() => {}, 1000);"
+    ].join("\n"), "utf8");
+    await fs.chmod(fakeFfmpeg, 0o755);
+    process.env.PATH = `${toolDir}${path.delimiter}${previousPath ?? ""}`;
+    process.env.CLOUDX_TEST_MEDIA_STARTED = startedPath;
+    const controller = new AbortController();
+    const stopped = new Error("media enrichment stopped");
+    const runner = fakeRunner();
+    const service = new DocumentationEnrichmentService({
+      client: fakeDocumentationClient({ source_type: "media" }),
+      config: fakeConfig(true),
+      rulesSkills: fakeRulesSkills(),
+      runner,
+      asr: fakeAsr("Video transcript.")
+    });
+
+    try {
+      const enrichment = service.enrichIngestResponse(
+        { document: { documentId: "doc-1" } },
+        { filename: "demo.mp4", contentType: "video/mp4", sourceType: "media", content: Buffer.from("fake video") },
+        { signal: controller.signal }
+      );
+      const started = JSON.parse(await waitForFile(startedPath)) as { parent: number; descendant: number; outputDir: string };
+
+      controller.abort(stopped);
+      const rejected = expect(enrichment).rejects.toBe(stopped);
+
+      await waitUntil(() => !isProcessRunning(started.parent));
+      expect(isProcessRunning(started.descendant)).toBe(true);
+
+      await rejected;
+      expect(isProcessRunning(started.parent)).toBe(false);
+      expect(isProcessRunning(started.descendant)).toBe(false);
+      await expect(fs.stat(path.dirname(started.outputDir))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(runner.run).not.toHaveBeenCalled();
+    } finally {
+      process.env.PATH = previousPath;
+      if (previousStartedPath === undefined) {
+        delete process.env.CLOUDX_TEST_MEDIA_STARTED;
+      } else {
+        process.env.CLOUDX_TEST_MEDIA_STARTED = previousStartedPath;
+      }
+      await fs.rm(toolDir, { recursive: true, force: true });
+    }
+  });
+
   it("parses ffmpeg showinfo timestamps for scene-selected media frames", () => {
     expect(parseFfmpegShowinfoPtsTimes([
       "[Parsed_showinfo_2 @ 0x1] n:   0 pts:      0 pts_time:0 pos:123",
@@ -813,6 +912,39 @@ function fakeRulesSkills(): RulesSkillsCatalogService {
       templates: []
     }))
   } as unknown as RulesSkillsCatalogService;
+}
+
+async function waitForFile(filePath: string): Promise<string> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      return await fs.readFile(filePath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  throw new Error(`Timed out waiting for ${filePath}.`);
+}
+
+async function waitUntil(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Timed out waiting for process state.");
+}
+
+function isProcessRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
 }
 
 function closedObjectSchemaIssues(value: unknown, pathParts: string[] = ["#"]): string[] {
