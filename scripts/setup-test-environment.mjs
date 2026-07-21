@@ -232,7 +232,7 @@ function automationDocument(paths) {
 
 function comparisonGroup() {
   return group("seed-comparisons", "Seed: comparisons and ranges", {
-    schemaVersion: 1,
+    schemaVersion: 2,
     nodes: [
       node("trigger", "trigger:worktree.created", 0, 0),
       node("number", "primitive:number.compare", 160, 120, { left: 7, right: 3, operator: "greaterThan" }),
@@ -261,7 +261,7 @@ function comparisonGroup() {
 
 function pythonSleepGroup(pythonFixtures) {
   return group("seed-python-sleep", "Seed: sleep and Python JSON", {
-    schemaVersion: 1,
+    schemaVersion: 2,
     allowedSafety: ["read", "write", "external"],
     nodes: [
       node("trigger", "trigger:worktree.created", 0, 0),
@@ -292,7 +292,7 @@ function pythonSleepGroup(pythonFixtures) {
 
 function workspaceCreateDirectoryGroup(createDirectoryTarget) {
   return group("seed-workspace-create-directory", "Seed: workspace createDirectory", {
-    schemaVersion: 1,
+    schemaVersion: 2,
     allowedSafety: ["read", "write"],
     nodes: [
       node("trigger", "trigger:worktree.created", 0, 0),
@@ -319,7 +319,7 @@ function workspaceCreateDirectoryGroup(createDirectoryTarget) {
 
 function codexExecShapeGroup(codexTarget) {
   return group("seed-codex-exec-shape", "Seed: Codex exec shape", {
-    schemaVersion: 1,
+    schemaVersion: 2,
     allowedSafety: ["read", "write", "external"],
     nodes: [
       node("trigger", "trigger:worktree.created", 0, 0),
@@ -353,7 +353,7 @@ function codexExecShapeGroup(codexTarget) {
 function jiraTransitionShapeGroup() {
   const payload = jiraManualPayload();
   return group("seed-jira-transition-shape", "Seed: Jira transition hooks", {
-    schemaVersion: 1,
+    schemaVersion: 2,
     allowedSafety: ["read", "write", "external"],
     nodes: [
       node("trigger", "trigger:jira.issueManualRun", 0, 0),

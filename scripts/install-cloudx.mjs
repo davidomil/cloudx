@@ -8,9 +8,13 @@ import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 
 export const ASR_MODEL_ID = "Systran/faster-whisper-large-v3";
-export const PYTORCH_CPU_WHEEL_INDEX = "https://download.pytorch.org/whl/cpu";
-export const FASTER_WHISPER_CUDA_PIP_PACKAGES = ["nvidia-cublas-cu12", "nvidia-cudnn-cu12==9.*"];
-export const SERVICE_NAMES = ["cloudx-asr.service", "cloudx-documentation.service", "cloudx.service"];
+export const CODEX_CLI_VERSION = "0.144.6";
+export const UV_VERSION = "0.11.28";
+export const SERVICE_NAMES = [
+  "cloudx-asr.service",
+  "cloudx-documentation.service",
+  "cloudx.service",
+];
 export const LEGACY_SERVICE_NAMES = ["cloudx-asr.service", "cloudx.service"];
 export const QUARTO_VERSION = "1.9.38";
 export const QUARTO_DEB_PATH = `/tmp/quarto-${QUARTO_VERSION}-linux-amd64.deb`;
@@ -21,7 +25,8 @@ export const MIN_WORKTREE_GIT_VERSION = "2.36.0";
 export const GIT_CORE_PPA = "ppa:git-core/ppa";
 export const CUDA_12_MIN_DRIVER_VERSION = "525.60.13";
 export const SMALL_GPU_MEMORY_MB = 6 * 1024;
-export const WHISPER_CPP_REPO_URL = "https://github.com/ggml-org/whisper.cpp.git";
+export const WHISPER_CPP_REPO_URL =
+  "https://github.com/ggml-org/whisper.cpp.git";
 export const WHISPER_CPP_MODEL = "large-v3-turbo";
 export const WHISPER_CPP_VAD_MODEL = "silero-v6.2.0";
 export const SAFE_VERBOSE_ENV_KEYS = [
@@ -38,7 +43,7 @@ export const SAFE_VERBOSE_ENV_KEYS = [
   "CLOUDX_DOCUMENTATION_PORT",
   "CLOUDX_DOCUMENTATION_DATA_DIR",
   "CLOUDX_DOCUMENTATION_ASR_BACKEND",
-  "ONEAPI_DEVICE_SELECTOR"
+  "ONEAPI_DEVICE_SELECTOR",
 ];
 export const UBUNTU_APT_PACKAGES = [
   "ca-certificates",
@@ -65,26 +70,28 @@ export const UBUNTU_APT_PACKAGES = [
   "python3-pip",
   "openssl",
   "jq",
-  "ripgrep"
+  "ripgrep",
 ];
 export const SERVER_RUNTIME_SCHEMA_FILES = [
   "documentation/documentation-enrichment.schema.json",
   "documentation/documentation-answer.schema.json",
-  "voice/voice-plan.schema.json"
+  "voice/voice-plan.schema.json",
 ];
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const repoRoot = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+);
 
 export function parseArgs(argv = process.argv.slice(2)) {
   const options = {
     dryRun: false,
     answersPath: undefined,
     yes: false,
-    lan: false,
     noStart: false,
     uninstall: false,
     update: false,
-    verbose: false
+    verbose: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -97,8 +104,6 @@ export function parseArgs(argv = process.argv.slice(2)) {
       }
     } else if (arg === "--yes") {
       options.yes = true;
-    } else if (arg === "--lan") {
-      options.lan = true;
     } else if (arg === "--no-start") {
       options.noStart = true;
     } else if (arg === "--uninstall") {
@@ -137,10 +142,9 @@ export function helpText() {
     "  --dry-run          Print commands and planned file writes without changing the system.",
     "  --answers <json>   Read wizard answers from a JSON file.",
     "  --yes              Use defaults for prompts not supplied by --answers.",
-    "  --lan              Bind Cloudx to 0.0.0.0 for trusted LAN/tailnet access.",
     "  --no-start         Install services without starting them.",
     "  --verbose          Print debugging details for installer commands and captured output.",
-    "  -h, --help         Show this help."
+    "  -h, --help         Show this help.",
   ].join("\n");
 }
 
@@ -158,11 +162,15 @@ export function parseOsRelease(content) {
 
 export function assertSupportedPlatform(osRelease) {
   if (osRelease.ID !== "ubuntu") {
-    throw new Error(`Cloudx installer currently supports Ubuntu first. Detected: ${osRelease.PRETTY_NAME ?? osRelease.ID ?? "unknown OS"}.`);
+    throw new Error(
+      `Cloudx installer currently supports Ubuntu first. Detected: ${osRelease.PRETTY_NAME ?? osRelease.ID ?? "unknown OS"}.`,
+    );
   }
   const major = Number.parseInt(osRelease.VERSION_ID ?? "0", 10);
   if (!Number.isInteger(major) || major < 22) {
-    throw new Error(`Cloudx installer supports Ubuntu 22.04 or newer. Detected: ${osRelease.VERSION_ID ?? "unknown version"}.`);
+    throw new Error(
+      `Cloudx installer supports Ubuntu 22.04 or newer. Detected: ${osRelease.VERSION_ID ?? "unknown version"}.`,
+    );
   }
 }
 
@@ -178,7 +186,10 @@ export function needsNodeInstall(nodeVersionText, npmVersionText) {
 export function systemNodePath(pathText = "") {
   const preferred = ["/usr/sbin", "/usr/bin", "/sbin", "/bin"];
   const entries = String(pathText).split(path.delimiter).filter(Boolean);
-  return [...preferred, ...entries.filter((entry) => !preferred.includes(entry))].join(path.delimiter);
+  return [
+    ...preferred,
+    ...entries.filter((entry) => !preferred.includes(entry)),
+  ].join(path.delimiter);
 }
 
 export function codexCliBin(paths) {
@@ -190,7 +201,12 @@ export function codexNpmEnv(paths, env = process.env) {
   return {
     NPM_CONFIG_PREFIX: paths.npmGlobalDir,
     npm_config_prefix: paths.npmGlobalDir,
-    PATH: [binDir, ...String(env.PATH ?? "").split(path.delimiter).filter(Boolean)].join(path.delimiter)
+    PATH: [
+      binDir,
+      ...String(env.PATH ?? "")
+        .split(path.delimiter)
+        .filter(Boolean),
+    ].join(path.delimiter),
   };
 }
 
@@ -200,7 +216,13 @@ export function needsQuartoInstall(versionText) {
 
 export function parseGitVersion(versionText) {
   const match = /(\d+)\.(\d+)(?:\.(\d+))?/.exec(String(versionText));
-  return match ? [Number.parseInt(match[1], 10), Number.parseInt(match[2], 10), Number.parseInt(match[3] ?? "0", 10)] : undefined;
+  return match
+    ? [
+        Number.parseInt(match[1], 10),
+        Number.parseInt(match[2], 10),
+        Number.parseInt(match[3] ?? "0", 10),
+      ]
+    : undefined;
 }
 
 export function compareVersions(left, right) {
@@ -209,7 +231,11 @@ export function compareVersions(left, right) {
   if (!leftVersion || !rightVersion) {
     return leftVersion === rightVersion ? 0 : leftVersion ? 1 : -1;
   }
-  for (let index = 0; index < Math.max(leftVersion.length, rightVersion.length); index += 1) {
+  for (
+    let index = 0;
+    index < Math.max(leftVersion.length, rightVersion.length);
+    index += 1
+  ) {
     const delta = (leftVersion[index] ?? 0) - (rightVersion[index] ?? 0);
     if (delta !== 0) {
       return delta;
@@ -218,7 +244,10 @@ export function compareVersions(left, right) {
   return 0;
 }
 
-export function needsGitUpgrade(versionText, minimumVersion = MIN_WORKTREE_GIT_VERSION) {
+export function needsGitUpgrade(
+  versionText,
+  minimumVersion = MIN_WORKTREE_GIT_VERSION,
+) {
   return compareVersions(versionText, minimumVersion) < 0;
 }
 
@@ -229,18 +258,22 @@ export function parseNvidiaGpuInfo(output) {
     .map((line) => line.trim())
     .filter(Boolean)
     .map((line) => {
-      const [name = "", driverVersion = "", memoryText = ""] = line.split(",").map((part) => part.trim());
+      const [name = "", driverVersion = "", memoryText = ""] = line
+        .split(",")
+        .map((part) => part.trim());
       const memoryMb = Number.parseInt(memoryText.replace(/[^\d]/g, ""), 10);
       return {
         name,
         driverVersion,
-        memoryMb: Number.isFinite(memoryMb) ? memoryMb : undefined
+        memoryMb: Number.isFinite(memoryMb) ? memoryMb : undefined,
       };
     });
 }
 
 export function selectNvidiaGpuInfo(gpus = []) {
-  return [...gpus].sort((left, right) => (right.memoryMb ?? 0) - (left.memoryMb ?? 0))[0];
+  return [...gpus].sort(
+    (left, right) => (right.memoryMb ?? 0) - (left.memoryMb ?? 0),
+  )[0];
 }
 
 export function supportsCuda12Driver(driverVersion) {
@@ -248,13 +281,17 @@ export function supportsCuda12Driver(driverVersion) {
 }
 
 export function gpuComputeType(memoryMb) {
-  return memoryMb === undefined || memoryMb < SMALL_GPU_MEMORY_MB ? "int8_float16" : "float16";
+  return memoryMb === undefined || memoryMb < SMALL_GPU_MEMORY_MB
+    ? "int8_float16"
+    : "float16";
 }
 
 export function assertQuartoArchitecture(architecture) {
   const normalized = String(architecture).trim();
   if (normalized !== "amd64") {
-    throw new Error(`Cloudx installs the official Quarto linux-amd64 .deb. Detected unsupported architecture: ${normalized || "unknown"}.`);
+    throw new Error(
+      `Cloudx installs the official Quarto linux-amd64 .deb. Detected unsupported architecture: ${normalized || "unknown"}.`,
+    );
   }
 }
 
@@ -270,20 +307,35 @@ export function validateCpuThreads(value, parallelism = defaultParallelism()) {
   return parsed;
 }
 
-export function resolveDeviceConfig({ gpuDetected, useGpu, cudaRuntimeReady = false, nvidiaGpuInfo }) {
-  const cudaDriverReady = nvidiaGpuInfo?.driverVersion ? supportsCuda12Driver(nvidiaGpuInfo.driverVersion) : cudaRuntimeReady;
+export function resolveDeviceConfig({
+  gpuDetected,
+  useGpu,
+  cudaRuntimeReady = false,
+  nvidiaGpuInfo,
+}) {
+  const cudaDriverReady = nvidiaGpuInfo?.driverVersion
+    ? supportsCuda12Driver(nvidiaGpuInfo.driverVersion)
+    : cudaRuntimeReady;
   const resolvedUseGpu = useGpu ?? (gpuDetected && cudaDriverReady);
   if (resolvedUseGpu && !gpuDetected) {
-    throw new Error("GPU mode was requested, but no NVIDIA GPU was detected with nvidia-smi.");
+    throw new Error(
+      "GPU mode was requested, but no NVIDIA GPU was detected with nvidia-smi.",
+    );
   }
   if (resolvedUseGpu && !cudaDriverReady) {
-    throw new Error(`GPU mode was requested, but the NVIDIA driver is missing or older than the CUDA 12 minimum driver ${CUDA_12_MIN_DRIVER_VERSION}.`);
+    throw new Error(
+      `GPU mode was requested, but the NVIDIA driver is missing or older than the CUDA 12 minimum driver ${CUDA_12_MIN_DRIVER_VERSION}.`,
+    );
   }
-  return resolvedUseGpu ? { device: "cuda", computeType: gpuComputeType(nvidiaGpuInfo?.memoryMb) } : { device: "cpu", computeType: "int8" };
+  return resolvedUseGpu
+    ? { device: "cuda", computeType: gpuComputeType(nvidiaGpuInfo?.memoryMb) }
+    : { device: "cpu", computeType: "int8" };
 }
 
 export function normalizeWhisperCppBuild(value) {
-  const build = String(value || "cpu").trim().toLowerCase();
+  const build = String(value || "cpu")
+    .trim()
+    .toLowerCase();
   if (build !== "cpu" && build !== "sycl") {
     throw new Error("whisper.cpp build must be cpu or sycl.");
   }
@@ -329,7 +381,9 @@ export function buildEnvLines(config) {
     `CLOUDX_DOCUMENTATION_DATA_DIR=${config.documentationDataDir ?? path.join(config.dataDir, "documentation")}`,
   ];
   if (config.documentationAsrBackend) {
-    lines.push(`CLOUDX_DOCUMENTATION_ASR_BACKEND=${config.documentationAsrBackend}`);
+    lines.push(
+      `CLOUDX_DOCUMENTATION_ASR_BACKEND=${config.documentationAsrBackend}`,
+    );
   }
   if (config.whisperCpp) {
     lines.push(
@@ -340,7 +394,7 @@ export function buildEnvLines(config) {
       `CLOUDX_ASR_WHISPER_CPP_BUILD=${config.whisperCpp.build}`,
       `CLOUDX_ASR_WHISPER_CPP_MODEL=${config.whisperCpp.model}`,
       `CLOUDX_ASR_WHISPER_CPP_VAD=true`,
-      `CLOUDX_ASR_WHISPER_CPP_VAD_MODEL_PATH=${config.whisperCpp.vadModelPath}`
+      `CLOUDX_ASR_WHISPER_CPP_VAD_MODEL_PATH=${config.whisperCpp.vadModelPath}`,
     );
     if (config.whisperCpp.build === "sycl") {
       lines.push("ONEAPI_DEVICE_SELECTOR=opencl:gpu");
@@ -352,7 +406,7 @@ export function buildEnvLines(config) {
       `CLOUDX_DOCUMENTATION_WHISPER_CPP_BUILD=${config.whisperCpp.build}`,
       `CLOUDX_DOCUMENTATION_WHISPER_CPP_MODEL=${config.whisperCpp.model}`,
       `CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD=true`,
-      `CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD_MODEL_PATH=${config.whisperCpp.vadModelPath}`
+      `CLOUDX_DOCUMENTATION_WHISPER_CPP_VAD_MODEL_PATH=${config.whisperCpp.vadModelPath}`,
     );
   }
   lines.push("");
@@ -368,7 +422,7 @@ export function defaultDocumentationConfig(paths) {
     documentationUrl: "http://127.0.0.1:7820",
     documentationHost: "127.0.0.1",
     documentationPort: 7820,
-    documentationDataDir: path.join(paths.dataDir, "documentation")
+    documentationDataDir: path.join(paths.dataDir, "documentation"),
   };
 }
 
@@ -378,25 +432,34 @@ function defaultDocumentationEnvVars(paths) {
     CLOUDX_DOCUMENTATION_URL: config.documentationUrl,
     CLOUDX_DOCUMENTATION_HOST: config.documentationHost,
     CLOUDX_DOCUMENTATION_PORT: String(config.documentationPort),
-    CLOUDX_DOCUMENTATION_DATA_DIR: config.documentationDataDir
+    CLOUDX_DOCUMENTATION_DATA_DIR: config.documentationDataDir,
   };
 }
 
 function missingEnvVars(existing, defaults) {
-  return Object.fromEntries(Object.entries(defaults).filter(([key]) => !Object.hasOwn(existing, key)));
+  return Object.fromEntries(
+    Object.entries(defaults).filter(([key]) => !Object.hasOwn(existing, key)),
+  );
 }
 
-const NVIDIA_LIBRARY_PATH_PYTHON = "import os, nvidia.cublas.lib, nvidia.cudnn.lib; print(os.path.dirname(nvidia.cublas.lib.__file__) + ':' + os.path.dirname(nvidia.cudnn.lib.__file__))";
+const NVIDIA_LIBRARY_PATH_PYTHON =
+  "import os, nvidia.cublas.lib, nvidia.cudnn.lib; print(os.path.dirname(nvidia.cublas.lib.__file__) + ':' + os.path.dirname(nvidia.cudnn.lib.__file__))";
 
 function cudaLibraryPathExport(pythonPath, deviceExpression) {
   return `if [ "${deviceExpression}" = "cuda" ]; then export LD_LIBRARY_PATH="$(${shellQuote(pythonPath)} -c ${shellQuote(NVIDIA_LIBRARY_PATH_PYTHON)})\${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; fi`;
 }
 
-export function renderAsrService({ repoRoot: root, envPath, pythonPath, uvicornPath, asrDir }) {
+export function renderAsrService({
+  repoRoot: root,
+  envPath,
+  pythonPath,
+  uvicornPath,
+  asrDir,
+}) {
   const startCommand = [
     cudaLibraryPathExport(pythonPath, "${CLOUDX_ASR_DEVICE:-cpu}"),
     'if [ "${CLOUDX_ASR_BACKEND:-}" = "whisper-cpp" ] && [ -r /opt/intel/oneapi/setvars.sh ]; then source /opt/intel/oneapi/setvars.sh >/dev/null; fi',
-    `exec ${shellQuote(uvicornPath)} cloudx_asr.main:app --app-dir ${shellQuote(path.join(asrDir, "src"))} --host 127.0.0.1 --port 7810`
+    `exec ${shellQuote(uvicornPath)} cloudx_asr.main:app --app-dir ${shellQuote(path.join(asrDir, "src"))} --host 127.0.0.1 --port 7810`,
   ].join("; ");
   return [
     "[Unit]",
@@ -413,11 +476,16 @@ export function renderAsrService({ repoRoot: root, envPath, pythonPath, uvicornP
     "",
     "[Install]",
     "WantedBy=default.target",
-    ""
+    "",
   ].join("\n");
 }
 
-export function renderCloudxService({ repoRoot: root, envPath, nodePath, npmPath }) {
+export function renderCloudxService({
+  repoRoot: root,
+  envPath,
+  nodePath,
+  npmPath,
+}) {
   return [
     "[Unit]",
     "Description=Cloudx web workbench",
@@ -436,14 +504,22 @@ export function renderCloudxService({ repoRoot: root, envPath, nodePath, npmPath
     "",
     "[Install]",
     "WantedBy=default.target",
-    ""
+    "",
   ].join("\n");
 }
 
-export function renderDocumentationService({ repoRoot: root, envPath, documentationPythonPath, documentationIndexerPath }) {
+export function renderDocumentationService({
+  repoRoot: root,
+  envPath,
+  documentationPythonPath,
+  documentationIndexerPath,
+}) {
   const startCommand = [
-    cudaLibraryPathExport(documentationPythonPath, "${CLOUDX_DOCUMENTATION_ASR_DEVICE:-${CLOUDX_ASR_DEVICE:-cpu}}"),
-    `exec ${shellQuote(documentationIndexerPath)}`
+    cudaLibraryPathExport(
+      documentationPythonPath,
+      "${CLOUDX_DOCUMENTATION_ASR_DEVICE:-${CLOUDX_ASR_DEVICE:-cpu}}",
+    ),
+    `exec ${shellQuote(documentationIndexerPath)}`,
   ].join("; ");
   return [
     "[Unit]",
@@ -460,23 +536,37 @@ export function renderDocumentationService({ repoRoot: root, envPath, documentat
     "",
     "[Install]",
     "WantedBy=default.target",
-    ""
+    "",
   ].join("\n");
 }
 
-export function ubuntuBootstrapPlan({ nodeVersionText = "", npmVersionText = "", quartoVersionText = "" } = {}) {
+export function ubuntuBootstrapPlan({
+  nodeVersionText = "",
+  npmVersionText = "",
+  quartoVersionText = "",
+} = {}) {
   const nodeInstallNeeded = needsNodeInstall(nodeVersionText, npmVersionText);
   const commands = [
     ["sudo", "apt-get", "update"],
-    ["sudo", "apt-get", "install", "-y", ...UBUNTU_APT_PACKAGES]
+    ["sudo", "apt-get", "install", "-y", ...UBUNTU_APT_PACKAGES],
   ];
   if (needsQuartoInstall(quartoVersionText)) {
     commands.push(["curl", "-fL", "-o", QUARTO_DEB_PATH, QUARTO_DEB_URL]);
     commands.push(["sudo", "apt-get", "install", "-y", QUARTO_DEB_PATH]);
   }
   if (nodeInstallNeeded) {
-    commands.push(["sh", "-lc", "curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -"]);
-    commands.push(["sudo", "apt-get", "remove", "-y", ...NODESOURCE_CONFLICTING_APT_PACKAGES]);
+    commands.push([
+      "sh",
+      "-lc",
+      "curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -",
+    ]);
+    commands.push([
+      "sudo",
+      "apt-get",
+      "remove",
+      "-y",
+      ...NODESOURCE_CONFLICTING_APT_PACKAGES,
+    ]);
     commands.push(["sudo", "apt-get", "install", "-y", "nodejs"]);
   }
   return commands;
@@ -489,7 +579,7 @@ export function ubuntuPrerequisiteVerificationPlan() {
     ["quarto", "--version"],
     ["pandoc", "--version"],
     ["xelatex", "--version"],
-    ["lualatex", "--version"]
+    ["lualatex", "--version"],
   ];
 }
 
@@ -502,7 +592,9 @@ function captureOptional(commands, command, args, options) {
 }
 
 function commandVersion(commands, command, args, options) {
-  return commands.exists(command) ? captureOptional(commands, command, args, options) : "";
+  return commands.exists(command)
+    ? captureOptional(commands, command, args, options)
+    : "";
 }
 
 export function preferSystemNodePath(commands, env = process.env) {
@@ -525,13 +617,19 @@ export function verifyUbuntuPrerequisites(commands) {
 
 export function installUbuntuPrerequisites(commands, env = process.env) {
   if (commands.exists("dpkg")) {
-    assertQuartoArchitecture(commands.capture("dpkg", ["--print-architecture"]));
+    assertQuartoArchitecture(
+      commands.capture("dpkg", ["--print-architecture"]),
+    );
   }
   const nodeVersionText = commandVersion(commands, "node", ["-v"]);
   const npmVersionText = commandVersion(commands, "npm", ["-v"]);
   const quartoVersionText = commandVersion(commands, "quarto", ["--version"]);
   const nodeInstallNeeded = needsNodeInstall(nodeVersionText, npmVersionText);
-  for (const [command, ...args] of ubuntuBootstrapPlan({ nodeVersionText, npmVersionText, quartoVersionText })) {
+  for (const [command, ...args] of ubuntuBootstrapPlan({
+    nodeVersionText,
+    npmVersionText,
+    quartoVersionText,
+  })) {
     commands.run(command, args);
   }
   if (nodeInstallNeeded) {
@@ -541,32 +639,54 @@ export function installUbuntuPrerequisites(commands, env = process.env) {
 }
 
 export async function ensureSupportedGit(commands, prompt) {
-  const versionText = commands.exists("git") ? commands.capture("git", ["--version"]) : "";
+  const versionText = commands.exists("git")
+    ? commands.capture("git", ["--version"])
+    : "";
   if (!needsGitUpgrade(versionText)) {
     console.log(`Using ${versionText.trim()}.`);
     return { upgraded: false, versionText: versionText.trim() };
   }
 
-  console.log(`Git ${versionText.trim() || "is missing"} is older than Cloudx Worktree Manager requires.`);
-  console.log(`Cloudx uses 'git worktree list --porcelain -z', which requires Git ${MIN_WORKTREE_GIT_VERSION} or newer.`);
-  explainQuestion("Upgrade Git", `Ubuntu 22.04 packages Git 2.34.x. Add ${GIT_CORE_PPA} and install the current stable Git package now?`);
-  const upgradeGit = await prompt.boolean("upgradeGit", `Install newer Git from ${GIT_CORE_PPA}?`, true);
+  console.log(
+    `Git ${versionText.trim() || "is missing"} is older than Cloudx Worktree Manager requires.`,
+  );
+  console.log(
+    `Cloudx uses 'git worktree list --porcelain -z', which requires Git ${MIN_WORKTREE_GIT_VERSION} or newer.`,
+  );
+  explainQuestion(
+    "Upgrade Git",
+    `Ubuntu 22.04 packages Git 2.34.x. Add ${GIT_CORE_PPA} and install the current stable Git package now?`,
+  );
+  const upgradeGit = await prompt.boolean(
+    "upgradeGit",
+    `Install newer Git from ${GIT_CORE_PPA}?`,
+    true,
+  );
   if (!upgradeGit) {
-    console.log("Continuing without upgrading Git. The Worktree Manager will fail until Git is upgraded to 2.36.0 or newer.");
+    console.log(
+      "Continuing without upgrading Git. The Worktree Manager will fail until Git is upgraded to 2.36.0 or newer.",
+    );
     return { upgraded: false, versionText: versionText.trim(), skipped: true };
   }
 
   installGitCorePpa(commands);
   const upgradedVersionText = commands.capture("git", ["--version"]);
   if (needsGitUpgrade(upgradedVersionText)) {
-    throw new Error(`Git upgrade completed but ${upgradedVersionText.trim() || "git --version"} is still older than ${MIN_WORKTREE_GIT_VERSION}.`);
+    throw new Error(
+      `Git upgrade completed but ${upgradedVersionText.trim() || "git --version"} is still older than ${MIN_WORKTREE_GIT_VERSION}.`,
+    );
   }
   console.log(`Using ${upgradedVersionText.trim()}.`);
   return { upgraded: true, versionText: upgradedVersionText.trim() };
 }
 
 export function installGitCorePpa(commands) {
-  commands.run("sudo", ["apt-get", "install", "-y", "software-properties-common"]);
+  commands.run("sudo", [
+    "apt-get",
+    "install",
+    "-y",
+    "software-properties-common",
+  ]);
   commands.run("sudo", ["add-apt-repository", GIT_CORE_PPA, "-y"]);
   commands.run("sudo", ["apt-get", "update"]);
   commands.run("sudo", ["apt-get", "install", "-y", "git"]);
@@ -577,43 +697,17 @@ export function verifyNodeAndNpm(commands) {
   commands.run("npm", ["-v"]);
 }
 
-export function shouldAdvertiseLanUrls(host) {
-  const normalized = String(host).trim().toLowerCase();
-  return normalized === "0.0.0.0" || normalized === "::" || normalized === "[::]";
-}
-
-export function networkBindWarning(host, port) {
-  return [
-    "",
-    "======================================================================",
-    "WARNING: Cloudx is configured for network access.",
-    `CLOUDX_HOST=${host} exposes this shell-controlling service beyond localhost.`,
-    "Cloudx can spawn terminals, edit files, proxy dashboards, and transcribe",
-    "browser microphone audio when voice is enabled.",
-    "Use only on a trusted LAN or private tailnet. Public internet unsupported.",
-    `Local URL: https://127.0.0.1:${port}`,
-    "======================================================================",
-    ""
-  ].join("\n");
-}
-
-export function cloudxAccessUrls(port, networkInterfaces = os.networkInterfaces(), host = "127.0.0.1") {
-  const urls = [`https://127.0.0.1:${port}`];
-  if (!shouldAdvertiseLanUrls(host)) {
-    return urls;
-  }
-  for (const addresses of Object.values(networkInterfaces)) {
-    for (const address of addresses ?? []) {
-      if (address.family === "IPv4" && !address.internal) {
-        urls.push(`https://${address.address}:${port}`);
-      }
-    }
-  }
-  return [...new Set(urls)];
+export function cloudxAccessUrls(port) {
+  return [`https://127.0.0.1:${port}`];
 }
 
 export class InstallerRunner {
-  constructor({ dryRun = false, cwd = repoRoot, log = console.log, verbose = false } = {}) {
+  constructor({
+    dryRun = false,
+    cwd = repoRoot,
+    log = console.log,
+    verbose = false,
+  } = {}) {
     this.dryRun = dryRun;
     this.cwd = cwd;
     this.log = log;
@@ -624,7 +718,12 @@ export class InstallerRunner {
 
   run(command, args = [], options = {}) {
     const display = formatCommand(command, args, options);
-    this.commands.push({ command, args, cwd: options.cwd ?? this.cwd });
+    this.commands.push({
+      command,
+      args,
+      cwd: options.cwd ?? this.cwd,
+      env: options.env,
+    });
     this.log(`$ ${display}`);
     this.logVerboseCommand(options);
     if (this.dryRun) {
@@ -646,7 +745,7 @@ export class InstallerRunner {
       execFileSync(command, args, {
         cwd: options.cwd ?? this.cwd,
         stdio: "inherit",
-        env: options.env ? { ...process.env, ...options.env } : process.env
+        env: options.env ? { ...process.env, ...options.env } : process.env,
       });
     } catch (error) {
       if (options.allowFailure) {
@@ -660,7 +759,12 @@ export class InstallerRunner {
 
   capture(command, args = [], options = {}) {
     if (this.dryRun) {
-      this.commands.push({ command, args, cwd: options.cwd ?? this.cwd, capture: true });
+      this.commands.push({
+        command,
+        args,
+        cwd: options.cwd ?? this.cwd,
+        capture: true,
+      });
       this.log(`$ ${[command, ...args].join(" ")}`);
       this.logVerboseCommand(options);
       return "";
@@ -678,7 +782,12 @@ export class InstallerRunner {
   }
 
   statusOk(command, args = [], options = {}) {
-    this.commands.push({ command, args, statusCheck: true, cwd: options.cwd ?? this.cwd });
+    this.commands.push({
+      command,
+      args,
+      statusCheck: true,
+      cwd: options.cwd ?? this.cwd,
+    });
     if (this.dryRun || this.verbose) {
       this.log(`$ ${[command, ...args].join(" ")}`);
       this.logVerboseCommand(options);
@@ -688,7 +797,11 @@ export class InstallerRunner {
     }
     const result = this.verbose
       ? this.spawnCaptured(command, args, options)
-      : spawnSync(command, args, { cwd: options.cwd ?? this.cwd, stdio: "ignore", env: options.env ? { ...process.env, ...options.env } : process.env });
+      : spawnSync(command, args, {
+          cwd: options.cwd ?? this.cwd,
+          stdio: "ignore",
+          env: options.env ? { ...process.env, ...options.env } : process.env,
+        });
     this.logVerboseProcessResult(result);
     return processSucceeded(result);
   }
@@ -712,7 +825,12 @@ export class InstallerRunner {
   }
 
   removePath(targetPath, options = {}) {
-    this.commands.push({ command: "rm", args: ["-rf", targetPath], cwd: this.cwd, remove: true });
+    this.commands.push({
+      command: "rm",
+      args: ["-rf", targetPath],
+      cwd: this.cwd,
+      remove: true,
+    });
     this.log(`remove ${targetPath}`);
     if (this.dryRun) {
       return;
@@ -725,15 +843,21 @@ export class InstallerRunner {
       cwd: options.cwd ?? this.cwd,
       stdio: ["ignore", "pipe", "pipe"],
       encoding: "utf8",
-      env: options.env ? { ...process.env, ...options.env } : process.env
+      env: options.env ? { ...process.env, ...options.env } : process.env,
     });
   }
 
   logVerboseCommand(options = {}) {
     this.logVerbose(`cwd: ${options.cwd ?? this.cwd}`);
-    const safeEnv = safeVerboseEnv(options.env ? { ...process.env, ...options.env } : process.env);
+    const safeEnv = safeVerboseEnv(
+      options.env ? { ...process.env, ...options.env } : process.env,
+    );
     if (Object.keys(safeEnv).length > 0) {
-      this.logVerbose(`env: ${Object.entries(safeEnv).map(([key, value]) => `${key}=${value}`).join(" ")}`);
+      this.logVerbose(
+        `env: ${Object.entries(safeEnv)
+          .map(([key, value]) => `${key}=${value}`)
+          .join(" ")}`,
+      );
     }
   }
 
@@ -741,7 +865,9 @@ export class InstallerRunner {
     if (!this.verbose) {
       return;
     }
-    this.logVerbose(`exit: ${result.error ? result.error.message : result.signal ? `signal ${result.signal}` : result.status ?? 0}`);
+    this.logVerbose(
+      `exit: ${result.error ? result.error.message : result.signal ? `signal ${result.signal}` : (result.status ?? 0)}`,
+    );
     logVerboseBlock(this.log, "stdout", result.stdout);
     logVerboseBlock(this.log, "stderr", result.stderr);
   }
@@ -760,13 +886,23 @@ export async function runInstaller(options = {}) {
   const answers = options.answers ?? {};
   const yes = options.yes ?? false;
   const dryRun = options.dryRun ?? false;
-  const verbose = Boolean(options.verbose) || env.CLOUDX_INSTALL_VERBOSE === "1";
-  const runner = options.runner ?? new InstallerRunner({ dryRun, cwd: root, verbose });
+  const verbose =
+    Boolean(options.verbose) || env.CLOUDX_INSTALL_VERBOSE === "1";
+  const runner =
+    options.runner ?? new InstallerRunner({ dryRun, cwd: root, verbose });
   if (verbose) {
     runner.verbose = true;
   }
-  const prompt = createPrompter({ answers, yes, dryRun, input: options.input, output: options.output });
-  const osRelease = options.osRelease ?? parseOsRelease(readText("/etc/os-release", "ID=unknown\n"));
+  const prompt = createPrompter({
+    answers,
+    yes,
+    dryRun,
+    input: options.input,
+    output: options.output,
+  });
+  const osRelease =
+    options.osRelease ??
+    parseOsRelease(readText("/etc/os-release", "ID=unknown\n"));
   assertSupportedPlatform(osRelease);
   const networkInterfaces = options.networkInterfaces ?? os.networkInterfaces();
 
@@ -777,37 +913,60 @@ export async function runInstaller(options = {}) {
   }
   section("1/10 Install and verify Ubuntu prerequisites");
   if (env.CLOUDX_INSTALL_BOOTSTRAPPED === "1") {
-    console.log("Shell bootstrap already installed Ubuntu packages. Verifying Node.js and npm.");
+    console.log(
+      "Shell bootstrap already installed Ubuntu packages. Verifying Node.js and npm.",
+    );
     verifyNodeAndNpm(commands);
   } else {
     installUbuntuPrerequisites(commands, env);
   }
   await ensureSupportedGit(commands, prompt);
   if (options.update) {
-    return await runUpdater({ paths, commands, runner, prompt, noStart: options.noStart, networkInterfaces, env });
+    return await runUpdater({
+      paths,
+      commands,
+      runner,
+      prompt,
+      noStart: options.noStart,
+      networkInterfaces,
+      env,
+    });
   }
   const gpuDetected = options.gpuDetected ?? commands.exists("nvidia-smi");
-  const nvidiaGpuInfo = options.nvidiaGpuInfo ?? (gpuDetected ? detectNvidiaGpuInfo(commands) : undefined);
-  const cudaRuntimeReady = options.cudaRuntimeReady ?? detectCudaRuntime(commands);
+  const nvidiaGpuInfo =
+    options.nvidiaGpuInfo ??
+    (gpuDetected ? detectNvidiaGpuInfo(commands) : undefined);
+  const cudaRuntimeReady =
+    options.cudaRuntimeReady ?? detectCudaRuntime(commands);
   const intelGpuDetected = options.intelGpuDetected ?? detectIntelGpu(commands);
   const parallelism = options.parallelism ?? defaultParallelism();
   const defaultThreads = defaultCpuThreads(parallelism);
 
   section("Cloudx installer wizard");
-  console.log(`Ubuntu target: ${osRelease.PRETTY_NAME ?? osRelease.VERSION_ID ?? "unknown"}`);
+  console.log(
+    `Ubuntu target: ${osRelease.PRETTY_NAME ?? osRelease.VERSION_ID ?? "unknown"}`,
+  );
   console.log(`Repository: ${root}`);
   console.log(`Configuration file: ${paths.envPath}`);
   console.log(`ASR model directory: ${paths.modelDir}`);
   if (gpuDetected && nvidiaGpuInfo) {
-    console.log(`NVIDIA GPU detected: ${nvidiaGpuInfo.name || "unknown GPU"}, driver ${nvidiaGpuInfo.driverVersion || "unknown"}, ${nvidiaGpuInfo.memoryMb ?? "unknown"} MB VRAM.`);
+    console.log(
+      `NVIDIA GPU detected: ${nvidiaGpuInfo.name || "unknown GPU"}, driver ${nvidiaGpuInfo.driverVersion || "unknown"}, ${nvidiaGpuInfo.memoryMb ?? "unknown"} MB VRAM.`,
+    );
   } else {
-    console.log("No NVIDIA GPU was detected with nvidia-smi; faster-whisper ASR will use CPU.");
+    console.log(
+      "No NVIDIA GPU was detected with nvidia-smi; faster-whisper ASR will use CPU.",
+    );
   }
   if (gpuDetected && !cudaRuntimeReady) {
-    console.log("System CUDA/cuDNN libraries were not detected; if CUDA ASR is selected, the installer will add the required Python NVIDIA runtime libraries.");
+    console.log(
+      "System CUDA/cuDNN libraries were not detected; if CUDA ASR is selected, the installer will add the required Python NVIDIA runtime libraries.",
+    );
   }
   if (intelGpuDetected) {
-    console.log("Intel GPU detected; optional whisper.cpp SYCL ASR can be installed for Intel GPU acceleration. CPU-only and NVIDIA installs do not need whisper.cpp.");
+    console.log(
+      "Intel GPU detected; optional whisper.cpp SYCL ASR can be installed for Intel GPU acceleration. CPU-only and NVIDIA installs do not need whisper.cpp.",
+    );
   }
 
   section("2/10 Verify Codex CLI");
@@ -817,52 +976,126 @@ export async function runInstaller(options = {}) {
   section("3/10 Collect install choices");
   explainQuestion(
     "Allowed workspace roots",
-    "Cloudx can open terminals and files only under these roots. Use ':' to separate multiple roots on Linux, for example '~:/srv/projects'."
+    "Cloudx can open terminals and files only under these roots. Use ':' to separate multiple roots on Linux, for example '~:/srv/projects'.",
   );
-  const allowedRoots = await prompt.text("allowedRoots", "Allowed workspace roots", "~");
-  explainQuestion("Cloudx HTTPS port", "This is the HTTPS port for the web UI. Keep 3001 unless it is already in use.");
-  const port = await prompt.integer("port", "Cloudx HTTPS port", 3001, { min: 1, max: 65_535 });
-  explainQuestion("Network access", "Cloudx binds to localhost by default. Choose network access only for a trusted LAN or private tailnet such as Tailscale.");
-  const configuredHost = env.CLOUDX_HOST?.trim() || "127.0.0.1";
-  const bindLan = options.lan || (await prompt.boolean("bindLan", "Bind Cloudx to 0.0.0.0 for trusted LAN/tailnet access?", shouldAdvertiseLanUrls(configuredHost)));
-  const host = bindLan ? "0.0.0.0" : shouldAdvertiseLanUrls(configuredHost) ? "127.0.0.1" : configuredHost;
-  if (shouldAdvertiseLanUrls(host)) {
-    console.log(networkBindWarning(host, port));
-  }
+  const allowedRoots = await prompt.text(
+    "allowedRoots",
+    "Allowed workspace roots",
+    "~",
+  );
+  explainQuestion(
+    "Cloudx HTTPS port",
+    "This is the HTTPS port for the web UI. Keep 3001 unless it is already in use.",
+  );
+  const port = await prompt.integer("port", "Cloudx HTTPS port", 3001, {
+    min: 1,
+    max: 65_535,
+  });
+  const host = "127.0.0.1";
+  console.log(
+    "Cloudx binds to loopback. Use an authenticated reverse proxy such as Tailscale Serve for remote access.",
+  );
   explainQuestion(
     "Additional certificate hostnames",
-    "Optional names or IPs to include in the generated local certificate, useful for phone or LAN access. Leave blank for localhost and detected local addresses."
+    "Optional names or IPs to include in the generated local certificate, useful for phone or LAN access. Leave blank for localhost and detected local addresses.",
   );
-  const certHosts = await prompt.text("certificateHosts", "Additional certificate hostnames (comma-separated, blank for none)", "");
-  explainQuestion("ASR CPU threads", "Controls how many CPU threads Faster Whisper may use. More threads can improve transcription speed but leaves fewer cores for Codex and builds.");
-  const cpuThreads = validateCpuThreads(await prompt.integer("cpuThreads", "ASR CPU threads", defaultThreads, { min: 1, max: parallelism }), parallelism);
+  const certHosts = await prompt.text(
+    "certificateHosts",
+    "Additional certificate hostnames (comma-separated, blank for none)",
+    "",
+  );
+  explainQuestion(
+    "ASR CPU threads",
+    "Controls how many CPU threads Faster Whisper may use. More threads can improve transcription speed but leaves fewer cores for Codex and builds.",
+  );
+  const cpuThreads = validateCpuThreads(
+    await prompt.integer("cpuThreads", "ASR CPU threads", defaultThreads, {
+      min: 1,
+      max: parallelism,
+    }),
+    parallelism,
+  );
   if (answers.useGpu !== undefined) {
-    explainQuestion("NVIDIA GPU override", "The installer automatically uses CUDA when NVIDIA and CUDA/cuDNN are ready. The useGpu answer can still force CPU or require GPU.");
+    explainQuestion(
+      "NVIDIA GPU override",
+      "The installer automatically uses CUDA when NVIDIA and CUDA/cuDNN are ready. The useGpu answer can still force CPU or require GPU.",
+    );
   }
-  const useGpu = answers.useGpu === undefined ? undefined : parseBooleanChoice("useGpu", answers.useGpu);
-  const device = resolveDeviceConfig({ gpuDetected, useGpu, cudaRuntimeReady, nvidiaGpuInfo });
+  const useGpu =
+    answers.useGpu === undefined
+      ? undefined
+      : parseBooleanChoice("useGpu", answers.useGpu);
+  const device = resolveDeviceConfig({
+    gpuDetected,
+    useGpu,
+    cudaRuntimeReady,
+    nvidiaGpuInfo,
+  });
   if (device.device === "cuda") {
     console.log(`faster-whisper ASR will use CUDA with ${device.computeType}.`);
   }
-  explainQuestion("Optional whisper.cpp ASR", "Faster Whisper is the default ASR backend and covers CPU-only and NVIDIA CUDA installs. Install whisper.cpp only when you explicitly want the alternate compiled backend, mainly SYCL for Intel Arc after oneAPI and GPU device access are available.");
-  const installWhisperCpp = await prompt.boolean("installWhisperCpp", "Install optional whisper.cpp alternate ASR backend?", false);
+  explainQuestion(
+    "Optional whisper.cpp ASR",
+    "Faster Whisper is the default ASR backend and covers CPU-only and NVIDIA CUDA installs. Install whisper.cpp only when you explicitly want the alternate compiled backend, mainly SYCL for Intel Arc after oneAPI and GPU device access are available.",
+  );
+  const installWhisperCpp = await prompt.boolean(
+    "installWhisperCpp",
+    "Install optional whisper.cpp alternate ASR backend?",
+    false,
+  );
   const whisperCpp = installWhisperCpp
     ? {
-        build: normalizeWhisperCppBuild(await prompt.text("whisperCppBuild", "whisper.cpp build backend (cpu or sycl)", intelGpuDetected ? "sycl" : "cpu")),
-        model: await prompt.text("whisperCppModel", "whisper.cpp GGML model", WHISPER_CPP_MODEL),
-        threads: cpuThreads
+        build: normalizeWhisperCppBuild(
+          await prompt.text(
+            "whisperCppBuild",
+            "whisper.cpp build backend (cpu or sycl)",
+            intelGpuDetected ? "sycl" : "cpu",
+          ),
+        ),
+        model: await prompt.text(
+          "whisperCppModel",
+          "whisper.cpp GGML model",
+          WHISPER_CPP_MODEL,
+        ),
+        threads: cpuThreads,
       }
     : undefined;
-  explainQuestion("Install systemd services", "Writes user-level services so Cloudx, ASR, and the documentation indexer can run in the background instead of being started manually.");
-  const installServices = await prompt.boolean("installServices", "Install Cloudx user-level systemd services?", true);
+  explainQuestion(
+    "Install systemd services",
+    "Writes user-level services so Cloudx, ASR, and the documentation indexer can run in the background instead of being started manually.",
+  );
+  const installServices = await prompt.boolean(
+    "installServices",
+    "Install Cloudx user-level systemd services?",
+    true,
+  );
   if (installServices) {
-    explainQuestion("Start services now", "Restarts Cloudx, ASR, and the documentation indexer immediately after writing the unit files, then verifies their health endpoints.");
+    explainQuestion(
+      "Start services now",
+      "Restarts Cloudx, ASR, and the documentation indexer immediately after writing the unit files, then verifies their readiness endpoints.",
+    );
   }
-  const startServices = installServices ? !options.noStart && (await prompt.boolean("startServices", "Start Cloudx services after install?", true)) : false;
+  const startServices = installServices
+    ? !options.noStart &&
+      (await prompt.boolean(
+        "startServices",
+        "Start Cloudx services after install?",
+        true,
+      ))
+    : false;
   if (installServices) {
-    explainQuestion("Enable linger", "Lets the user-level services keep running after logout and start before the next interactive login. This uses sudo loginctl enable-linger.");
+    explainQuestion(
+      "Enable linger",
+      "Lets the user-level services keep running after logout and start before the next interactive login. This uses sudo loginctl enable-linger.",
+    );
   }
-  const enableLinger = installServices ? await prompt.boolean("enableLinger", "Enable user lingering so services survive logout and can start before login?", true) : false;
+  const enableLinger = installServices
+    ? await prompt.boolean(
+        "enableLinger",
+        "Enable user lingering so services survive logout and can start before login?",
+        true,
+      )
+    : false;
   printChoiceSummary({
     allowedRoots,
     host,
@@ -873,30 +1106,30 @@ export async function runInstaller(options = {}) {
     whisperCpp,
     installServices,
     startServices,
-    enableLinger
+    enableLinger,
   });
 
   section("4/10 Install Cloudx npm dependencies");
   commands.run("npm", ["ci"]);
+  setupUv(commands, paths);
   section("5/10 Prepare ASR Python environment and model");
-  setupAsr(commands, paths);
+  setupAsr(commands, paths, device.device === "cuda");
   downloadModel(commands, paths);
   section("6/10 Prepare documentation archive Python environment");
-  setupDocumentationIndexer(commands, paths);
-  if (device.device === "cuda") {
-    setupFasterWhisperCuda(commands, paths);
-  }
+  setupDocumentationIndexer(commands, paths, device.device === "cuda");
   section("7/10 Prepare optional whisper.cpp alternate ASR backend");
   if (whisperCpp) {
     setupWhisperCpp(commands, paths, whisperCpp);
   } else {
-    console.log("Skipping optional whisper.cpp backend; Faster Whisper remains active.");
+    console.log(
+      "Skipping optional whisper.cpp backend; Faster Whisper remains active.",
+    );
   }
   section("8/10 Build Cloudx and create HTTPS certificate");
   commands.run("npm", ["run", "build"]);
   installServerRuntimeSchemas(runner, paths);
   commands.run("npm", ["run", "cert:create"], {
-    env: certHosts.trim() ? { CLOUDX_CERT_HOSTS: certHosts.trim() } : undefined
+    env: certHosts.trim() ? { CLOUDX_CERT_HOSTS: certHosts.trim() } : undefined,
   });
 
   const envConfig = {
@@ -912,7 +1145,7 @@ export async function runInstaller(options = {}) {
     cpuThreads,
     documentationAsrBackend: whisperCpp ? "whisper-cpp" : "faster-whisper",
     whisperCpp: whisperCpp ? whisperCppEnv(paths, whisperCpp) : undefined,
-    ...device
+    ...device,
   };
   section("9/10 Write Cloudx configuration");
   runner.writeFile(paths.envPath, renderEnvFile(envConfig));
@@ -921,7 +1154,11 @@ export async function runInstaller(options = {}) {
     section("10/10 Install user-level systemd services");
     installSystemdServices(commands, runner, paths);
     if (enableLinger) {
-      commands.run("sudo", ["loginctl", "enable-linger", os.userInfo().username]);
+      commands.run("sudo", [
+        "loginctl",
+        "enable-linger",
+        os.userInfo().username,
+      ]);
     }
     commands.run("systemctl", ["--user", "daemon-reload"]);
     commands.run("systemctl", ["--user", "enable", ...SERVICE_NAMES]);
@@ -935,42 +1172,120 @@ export async function runInstaller(options = {}) {
   }
 
   await prompt.close();
-  printInstallComplete({ paths, host, port, installServices, startServices, networkInterfaces });
-  return { runner, paths, envConfig, installServices, startServices, enableLinger, urls: cloudxAccessUrls(port, networkInterfaces, host) };
+  printInstallComplete({ paths, port, installServices, startServices });
+  return {
+    runner,
+    paths,
+    envConfig,
+    installServices,
+    startServices,
+    enableLinger,
+    urls: cloudxAccessUrls(port),
+  };
 }
 
 async function runUninstaller({ paths, commands, runner, prompt }) {
   section("Cloudx uninstall wizard");
-  console.log("This removes Cloudx-managed local artifacts. It does not remove Node.js, npm, Python, apt packages, or Codex CLI.");
+  console.log(
+    "This removes Cloudx-managed local artifacts. It does not remove Node.js, npm, Python, apt packages, or Codex CLI.",
+  );
   console.log(`Repository: ${paths.repoRoot}`);
   console.log(`Configuration file: ${paths.envPath}`);
   console.log(`ASR model directory: ${paths.modelDir}`);
 
-  explainQuestion("Remove services", "Stops, disables, and deletes the Cloudx user-level systemd units. Choose yes if Cloudx was installed as a background service.");
-  const removeServices = await prompt.boolean("removeServices", "Stop, disable, and remove Cloudx user-level systemd services?", true);
-  explainQuestion("Remove config", "Deletes ~/.config/cloudx/cloudx.env, which contains the port, roots, ASR model path, and CPU/GPU settings written by the installer.");
-  const removeConfig = await prompt.boolean("removeConfig", "Remove Cloudx environment config?", true);
-  explainQuestion("Remove Python virtualenvs", "Deletes Cloudx-managed Python virtualenvs for ASR and the documentation archive indexer.");
-  const removeVenv = await prompt.boolean("removeVenv", "Remove Cloudx Python virtualenvs?", true);
-  explainQuestion("Remove runtime data", "Deletes the repo-local .cloudx directory, including generated HTTPS certificates and workspace runtime state.");
-  const removeRuntimeData = await prompt.boolean("removeRuntimeData", "Remove local runtime data and generated HTTPS certificates in .cloudx?", false);
-  explainQuestion("Remove ASR model", "Deletes the downloaded Faster Whisper large-v3 model cache. Keeping it avoids another large download later.");
-  const removeModel = await prompt.boolean("removeModel", "Remove downloaded Faster Whisper large-v3 model?", false);
-  explainQuestion("Remove node_modules", "Deletes installed npm packages from this checkout. Keeping it makes future development starts faster.");
-  const removeNodeModules = await prompt.boolean("removeNodeModules", "Remove repo node_modules?", false);
-  explainQuestion("Disable linger", "Turns off systemd linger for this Linux user. Only choose yes if you do not rely on other user services surviving logout.");
-  const disableLinger = await prompt.boolean("disableLinger", "Disable systemd linger for this user?", false);
-  printUninstallSummary({ removeServices, removeConfig, removeVenv, removeRuntimeData, removeModel, removeNodeModules, disableLinger });
+  explainQuestion(
+    "Remove services",
+    "Stops, disables, and deletes the Cloudx user-level systemd units. Choose yes if Cloudx was installed as a background service.",
+  );
+  const removeServices = await prompt.boolean(
+    "removeServices",
+    "Stop, disable, and remove Cloudx user-level systemd services?",
+    true,
+  );
+  explainQuestion(
+    "Remove config",
+    "Deletes ~/.config/cloudx/cloudx.env, which contains the port, roots, ASR model path, and CPU/GPU settings written by the installer.",
+  );
+  const removeConfig = await prompt.boolean(
+    "removeConfig",
+    "Remove Cloudx environment config?",
+    false,
+  );
+  explainQuestion(
+    "Remove Python virtualenvs",
+    "Deletes Cloudx-managed Python virtualenvs for ASR and the documentation archive indexer.",
+  );
+  const removeVenv = await prompt.boolean(
+    "removeVenv",
+    "Remove Cloudx Python virtualenvs?",
+    true,
+  );
+  explainQuestion(
+    "Remove runtime data",
+    "Deletes the repo-local .cloudx directory, including generated HTTPS certificates and workspace runtime state.",
+  );
+  const removeRuntimeData = await prompt.boolean(
+    "removeRuntimeData",
+    "Remove local runtime data and generated HTTPS certificates in .cloudx?",
+    false,
+  );
+  explainQuestion(
+    "Remove ASR model",
+    "Deletes the downloaded Faster Whisper large-v3 model cache. Keeping it avoids another large download later.",
+  );
+  const removeModel = await prompt.boolean(
+    "removeModel",
+    "Remove downloaded Faster Whisper large-v3 model?",
+    false,
+  );
+  explainQuestion(
+    "Remove node_modules",
+    "Deletes installed npm packages from this checkout. Keeping it makes future development starts faster.",
+  );
+  const removeNodeModules = await prompt.boolean(
+    "removeNodeModules",
+    "Remove repo node_modules?",
+    false,
+  );
+  explainQuestion(
+    "Disable linger",
+    "Turns off systemd linger for this Linux user. Only choose yes if you do not rely on other user services surviving logout.",
+  );
+  const disableLinger = await prompt.boolean(
+    "disableLinger",
+    "Disable systemd linger for this user?",
+    false,
+  );
+  printUninstallSummary({
+    removeServices,
+    removeConfig,
+    removeVenv,
+    removeRuntimeData,
+    removeModel,
+    removeNodeModules,
+    disableLinger,
+  });
 
   if (removeServices) {
     section("1/6 Remove user-level systemd services");
-    commands.run("systemctl", ["--user", "stop", ...SERVICE_NAMES], { allowFailure: true });
-    commands.run("systemctl", ["--user", "disable", ...SERVICE_NAMES], { allowFailure: true });
+    const servicesToStop = uninstallServicesRequiringStop(commands, runner);
+    if (servicesToStop.length > 0) {
+      commands.run("systemctl", ["--user", "stop", ...servicesToStop]);
+    }
+    commands.run("systemctl", ["--user", "disable", ...SERVICE_NAMES], {
+      allowFailure: true,
+    });
     runner.removePath(path.join(paths.systemdDir, "cloudx.service"));
     runner.removePath(path.join(paths.systemdDir, "cloudx-asr.service"));
-    runner.removePath(path.join(paths.systemdDir, "cloudx-documentation.service"));
-    commands.run("systemctl", ["--user", "daemon-reload"], { allowFailure: true });
-    commands.run("systemctl", ["--user", "reset-failed", ...SERVICE_NAMES], { allowFailure: true });
+    runner.removePath(
+      path.join(paths.systemdDir, "cloudx-documentation.service"),
+    );
+    commands.run("systemctl", ["--user", "daemon-reload"], {
+      allowFailure: true,
+    });
+    commands.run("systemctl", ["--user", "reset-failed", ...SERVICE_NAMES], {
+      allowFailure: true,
+    });
   } else {
     section("1/6 Keep systemd services");
   }
@@ -984,6 +1299,7 @@ async function runUninstaller({ paths, commands, runner, prompt }) {
 
   section("3/6 Remove local environments and caches");
   if (removeVenv) {
+    runner.removePath(paths.uvVenvDir);
     runner.removePath(paths.venvDir);
     runner.removePath(paths.documentationVenvDir);
   } else {
@@ -999,7 +1315,9 @@ async function runUninstaller({ paths, commands, runner, prompt }) {
   if (removeRuntimeData) {
     runner.removePath(paths.dataDir);
   } else {
-    console.log("Keeping .cloudx runtime data and generated HTTPS certificates.");
+    console.log(
+      "Keeping .cloudx runtime data and generated HTTPS certificates.",
+    );
   }
   if (removeModel) {
     runner.removePath(paths.modelDir);
@@ -1009,7 +1327,11 @@ async function runUninstaller({ paths, commands, runner, prompt }) {
 
   section("5/6 Linger setting");
   if (disableLinger) {
-    commands.run("sudo", ["loginctl", "disable-linger", os.userInfo().username]);
+    commands.run("sudo", [
+      "loginctl",
+      "disable-linger",
+      os.userInfo().username,
+    ]);
   } else {
     console.log("Leaving systemd linger unchanged.");
   }
@@ -1017,22 +1339,78 @@ async function runUninstaller({ paths, commands, runner, prompt }) {
   section("6/6 Uninstall complete");
   console.log("Cloudx uninstall complete.");
   await prompt.close();
-  return { runner, paths, removed: { removeServices, removeConfig, removeVenv, removeRuntimeData, removeModel, removeNodeModules, disableLinger } };
+  return {
+    runner,
+    paths,
+    removed: {
+      removeServices,
+      removeConfig,
+      removeVenv,
+      removeRuntimeData,
+      removeModel,
+      removeNodeModules,
+      disableLinger,
+    },
+  };
 }
 
-async function runUpdater({ paths, commands, runner, prompt, noStart, networkInterfaces, env }) {
+function uninstallServicesRequiringStop(commands, runner) {
+  if (runner.dryRun) {
+    return SERVICE_NAMES;
+  }
+  return SERVICE_NAMES.filter((serviceName) => {
+    const state = Object.fromEntries(
+      commands
+        .capture("systemctl", [
+          "--user",
+          "show",
+          serviceName,
+          "--property=LoadState",
+          "--property=ActiveState",
+        ])
+        .split("\n")
+        .map((line) => line.split("=", 2))
+        .filter(([key, value]) => key && value),
+    );
+    if (state.LoadState === "not-found" || state.ActiveState === "inactive") {
+      return false;
+    }
+    if (!state.LoadState || !state.ActiveState) {
+      throw new Error(
+        `Could not determine whether ${serviceName} is active before uninstall.`,
+      );
+    }
+    return true;
+  });
+}
+
+async function runUpdater({
+  paths,
+  commands,
+  runner,
+  prompt,
+  noStart,
+  networkInterfaces,
+  env,
+}) {
   section("Cloudx update wizard");
-  console.log("This updates an existing Cloudx checkout and local install. It keeps your saved Cloudx environment config.");
+  console.log(
+    "This updates an existing Cloudx checkout and local install. It keeps your saved Cloudx environment config.",
+  );
   console.log(`Repository: ${paths.repoRoot}`);
   console.log(`Configuration file: ${paths.envPath}`);
   console.log(`ASR model directory: ${paths.modelDir}`);
 
   const envConfig = readEnvFile(paths.envPath);
   const port = Number.parseInt(envConfig.CLOUDX_PORT ?? "3001", 10);
-  const host = envConfig.CLOUDX_HOST ?? "127.0.0.1";
+  const host = "127.0.0.1";
   const servicesInstalled =
-    SERVICE_NAMES.some((serviceName) => fs.existsSync(path.join(paths.systemdDir, serviceName))) ||
-    LEGACY_SERVICE_NAMES.every((serviceName) => fs.existsSync(path.join(paths.systemdDir, serviceName)));
+    SERVICE_NAMES.some((serviceName) =>
+      fs.existsSync(path.join(paths.systemdDir, serviceName)),
+    ) ||
+    LEGACY_SERVICE_NAMES.every((serviceName) =>
+      fs.existsSync(path.join(paths.systemdDir, serviceName)),
+    );
 
   section("2/10 Pull latest Cloudx checkout");
   if (env.CLOUDX_INSTALL_ALREADY_PULLED === "1") {
@@ -1048,32 +1426,45 @@ async function runUpdater({ paths, commands, runner, prompt, noStart, networkInt
     updateEnvFileContent(readText(paths.envPath, ""), {
       CLOUDX_ASSISTANT_BIN: assistantBin,
       CLOUDX_TOOL_PATH: toolPathFor(assistantBin, paths.npmGlobalDir, env.PATH),
-      ...missingEnvVars(envConfig, defaultDocumentationEnvVars(paths))
-    })
+      CLOUDX_HOST: host,
+      ...missingEnvVars(envConfig, defaultDocumentationEnvVars(paths)),
+    }),
   );
 
   section("4/10 Update Cloudx npm dependencies");
   commands.run("npm", ["ci"]);
+  setupUv(commands, paths);
 
   section("5/10 Update ASR Python environment and model");
-  setupAsr(commands, paths);
+  setupAsr(commands, paths, (envConfig.CLOUDX_ASR_DEVICE ?? "cpu") === "cuda");
   downloadModel(commands, paths);
 
   section("6/10 Update documentation archive Python environment");
-  setupDocumentationIndexer(commands, paths);
-  if ((envConfig.CLOUDX_ASR_DEVICE ?? "cpu") === "cuda" || (envConfig.CLOUDX_DOCUMENTATION_ASR_DEVICE ?? "cpu") === "cuda") {
-    setupFasterWhisperCuda(commands, paths);
-  }
+  setupDocumentationIndexer(
+    commands,
+    paths,
+    (envConfig.CLOUDX_DOCUMENTATION_ASR_DEVICE ??
+      envConfig.CLOUDX_ASR_DEVICE ??
+      "cpu") === "cuda",
+  );
 
   section("7/10 Update optional whisper.cpp alternate ASR backend");
   if (envConfig.CLOUDX_DOCUMENTATION_ASR_BACKEND === "whisper-cpp") {
     setupWhisperCpp(commands, paths, {
       build: envConfig.CLOUDX_DOCUMENTATION_WHISPER_CPP_BUILD ?? "cpu",
-      model: envConfig.CLOUDX_DOCUMENTATION_WHISPER_CPP_MODEL ?? WHISPER_CPP_MODEL,
-      threads: Number.parseInt(envConfig.CLOUDX_DOCUMENTATION_WHISPER_CPP_THREADS ?? envConfig.CLOUDX_ASR_CPU_THREADS ?? String(defaultCpuThreads()), 10)
+      model:
+        envConfig.CLOUDX_DOCUMENTATION_WHISPER_CPP_MODEL ?? WHISPER_CPP_MODEL,
+      threads: Number.parseInt(
+        envConfig.CLOUDX_DOCUMENTATION_WHISPER_CPP_THREADS ??
+          envConfig.CLOUDX_ASR_CPU_THREADS ??
+          String(defaultCpuThreads()),
+        10,
+      ),
     });
   } else {
-    console.log("No whisper.cpp alternate ASR backend configured; Faster Whisper remains active.");
+    console.log(
+      "No whisper.cpp alternate ASR backend configured; Faster Whisper remains active.",
+    );
   }
 
   section("8/10 Rebuild Cloudx and refresh HTTPS certificate if missing");
@@ -1086,29 +1477,47 @@ async function runUpdater({ paths, commands, runner, prompt, noStart, networkInt
     installSystemdServices(commands, runner, paths);
     commands.run("systemctl", ["--user", "daemon-reload"]);
   } else {
-    console.log("Cloudx user services were not found, so service unit refresh is skipped.");
+    console.log(
+      "Cloudx user services were not found, so service unit refresh is skipped.",
+    );
   }
 
   const restartServices =
     servicesInstalled &&
     !noStart &&
-    (explainQuestion("Restart services", "Restarts Cloudx, ASR, and the documentation indexer after dependencies and service files are updated, then verifies the health endpoints."),
-    await prompt.boolean("restartServices", "Restart Cloudx services after update?", true));
+    (explainQuestion(
+      "Restart services",
+      "Restarts Cloudx, ASR, and the documentation indexer after dependencies and service files are updated, then verifies the readiness endpoints.",
+    ),
+    await prompt.boolean(
+      "restartServices",
+      "Restart Cloudx services after update?",
+      true,
+    ));
 
   section("10/10 Restart services");
   if (restartServices) {
     commands.run("systemctl", ["--user", "restart", ...SERVICE_NAMES]);
     verifyServices(commands, port);
   } else if (servicesInstalled) {
-    console.log(`Services were refreshed but not restarted. Restart later with: systemctl --user restart ${SERVICE_NAMES.join(" ")}`);
+    console.log(
+      `Services were refreshed but not restarted. Restart later with: systemctl --user restart ${SERVICE_NAMES.join(" ")}`,
+    );
   } else {
     console.log("No installed services to restart.");
   }
 
   section("Update complete");
-  printUpdateComplete({ paths, host, port, servicesInstalled, restartServices, networkInterfaces });
+  printUpdateComplete({ paths, port, servicesInstalled, restartServices });
   await prompt.close();
-  return { runner, paths, port, servicesInstalled, restartServices, urls: cloudxAccessUrls(port, networkInterfaces, host) };
+  return {
+    runner,
+    paths,
+    port,
+    servicesInstalled,
+    restartServices,
+    urls: cloudxAccessUrls(port),
+  };
 }
 
 function section(title) {
@@ -1120,15 +1529,30 @@ function explainQuestion(title, detail) {
   console.log(`  ${detail}`);
 }
 
-function printChoiceSummary({ allowedRoots, host, port, certHosts, cpuThreads, device, whisperCpp, installServices, startServices, enableLinger }) {
+function printChoiceSummary({
+  allowedRoots,
+  host,
+  port,
+  certHosts,
+  cpuThreads,
+  device,
+  whisperCpp,
+  installServices,
+  startServices,
+  enableLinger,
+}) {
   console.log("Install choices:");
   console.log(`  allowed roots: ${allowedRoots}`);
   console.log(`  bind host: ${host}`);
   console.log(`  HTTPS port: ${port}`);
-  console.log(`  certificate hosts: ${certHosts.trim() || "(default local hosts only)"}`);
+  console.log(
+    `  certificate hosts: ${certHosts.trim() || "(default local hosts only)"}`,
+  );
   console.log(`  ASR device: ${device.device} (${device.computeType})`);
   console.log(`  ASR CPU threads: ${cpuThreads}`);
-  console.log(`  ASR backend: ${whisperCpp ? `whisper.cpp (${whisperCpp.build}, ${whisperCpp.model})` : "faster-whisper"}`);
+  console.log(
+    `  ASR backend: ${whisperCpp ? `whisper.cpp (${whisperCpp.build}, ${whisperCpp.model})` : "faster-whisper"}`,
+  );
   console.log(`  install services: ${installServices ? "yes" : "no"}`);
   if (installServices) {
     console.log(`  start services now: ${startServices ? "yes" : "no"}`);
@@ -1143,15 +1567,14 @@ function printUninstallSummary(choices) {
   }
 }
 
-function printInstallComplete({ paths, host, port, installServices, startServices, networkInterfaces }) {
-  if (shouldAdvertiseLanUrls(host)) {
-    console.log(networkBindWarning(host, port));
-  }
-  const urls = cloudxAccessUrls(port, networkInterfaces, host);
+function printInstallComplete({ paths, port, installServices, startServices }) {
+  const urls = cloudxAccessUrls(port);
   console.log("Cloudx installer complete.");
   console.log(`  env: ${paths.envPath}`);
   console.log(`  ASR model: ${paths.modelDir}`);
-  console.log(startServices ? "  open Cloudx:" : "  after starting Cloudx, open:");
+  console.log(
+    startServices ? "  open Cloudx:" : "  after starting Cloudx, open:",
+  );
   for (const url of urls) {
     console.log(`    ${url}`);
   }
@@ -1162,15 +1585,21 @@ function printInstallComplete({ paths, host, port, installServices, startService
   }
 }
 
-function printUpdateComplete({ paths, host, port, servicesInstalled, restartServices, networkInterfaces }) {
-  if (shouldAdvertiseLanUrls(host)) {
-    console.log(networkBindWarning(host, port));
-  }
-  const urls = cloudxAccessUrls(port, networkInterfaces, host);
+function printUpdateComplete({
+  paths,
+  port,
+  servicesInstalled,
+  restartServices,
+}) {
+  const urls = cloudxAccessUrls(port);
   console.log("Cloudx update complete.");
   console.log(`  env: ${paths.envPath}`);
   console.log(`  ASR model: ${paths.modelDir}`);
-  console.log(restartServices ? "  open Cloudx:" : "  after starting or restarting Cloudx, open:");
+  console.log(
+    restartServices
+      ? "  open Cloudx:"
+      : "  after starting or restarting Cloudx, open:",
+  );
   for (const url of urls) {
     console.log(`    ${url}`);
   }
@@ -1181,36 +1610,55 @@ function printUpdateComplete({ paths, host, port, servicesInstalled, restartServ
   }
 }
 
-function setupAsr(commands, paths) {
-  console.log(`Creating or updating Python virtualenv: ${paths.venvDir}`);
-  commands.run("python3", ["-m", "venv", "--upgrade-deps", paths.venvDir]);
-  console.log("Installing Cloudx ASR, test dependencies, and Hugging Face CLI.");
-  commands.run(paths.pipPath, ["install", "-e", `${paths.asrDir}[dev]`, "huggingface_hub[cli]"]);
+function setupUv(commands, paths) {
+  console.log(`Installing uv ${UV_VERSION} into ${paths.uvVenvDir}.`);
+  commands.run("python3", ["-m", "venv", paths.uvVenvDir]);
+  commands.run(paths.uvPipPath, ["install", `uv==${UV_VERSION}`]);
+  commands.run(paths.uvPath, ["--version"]);
 }
 
-function setupDocumentationIndexer(commands, paths) {
-  console.log(`Creating or updating Python virtualenv: ${paths.documentationVenvDir}`);
-  commands.run("python3", ["-m", "venv", "--upgrade-deps", paths.documentationVenvDir]);
-  console.log("Installing Cloudx documentation archive indexer and extraction dependencies.");
-  commands.run(paths.documentationPipPath, [
-    "install",
-    "--extra-index-url",
-    PYTORCH_CPU_WHEEL_INDEX,
-    "-e",
-    `${paths.documentationIndexerDir}[dev]`
-  ]);
+function setupAsr(commands, paths, cuda) {
+  console.log(
+    `Synchronizing the locked Cloudx ASR environment: ${paths.venvDir}`,
+  );
+  syncPythonService(commands, paths, paths.asrDir, paths.venvDir, cuda);
 }
 
-function setupFasterWhisperCuda(commands, paths) {
-  console.log("Installing faster-whisper NVIDIA CUDA runtime libraries into Cloudx Python virtualenvs.");
-  commands.run(paths.pipPath, ["install", ...FASTER_WHISPER_CUDA_PIP_PACKAGES]);
-  commands.run(paths.documentationPipPath, ["install", ...FASTER_WHISPER_CUDA_PIP_PACKAGES]);
+function setupDocumentationIndexer(commands, paths, cuda) {
+  console.log(
+    `Synchronizing the locked documentation archive environment: ${paths.documentationVenvDir}`,
+  );
+  syncPythonService(
+    commands,
+    paths,
+    paths.documentationIndexerDir,
+    paths.documentationVenvDir,
+    cuda,
+  );
+}
+
+function syncPythonService(commands, paths, projectDir, environmentDir, cuda) {
+  commands.run(
+    paths.uvPath,
+    [
+      "sync",
+      "--locked",
+      "--project",
+      projectDir,
+      "--extra",
+      "dev",
+      ...(cuda ? ["--extra", "cuda"] : []),
+    ],
+    { env: { UV_PROJECT_ENVIRONMENT: environmentDir } },
+  );
 }
 
 function setupWhisperCpp(commands, paths, config) {
   const build = normalizeWhisperCppBuild(config.build);
   const buildDir = whisperCppBuildDir(paths, build);
-  console.log(`Preparing whisper.cpp ${build} build in ${paths.whisperCppDir}.`);
+  console.log(
+    `Preparing whisper.cpp ${build} build in ${paths.whisperCppDir}.`,
+  );
   if (build === "sycl") {
     installWhisperCppSyclPrerequisites(commands);
   }
@@ -1218,7 +1666,13 @@ function setupWhisperCpp(commands, paths, config) {
     commands.run("git", ["-C", paths.whisperCppDir, "pull", "--ff-only"]);
   } else {
     commands.mkdir(path.dirname(paths.whisperCppDir));
-    commands.run("git", ["clone", "--depth", "1", WHISPER_CPP_REPO_URL, paths.whisperCppDir]);
+    commands.run("git", [
+      "clone",
+      "--depth",
+      "1",
+      WHISPER_CPP_REPO_URL,
+      paths.whisperCppDir,
+    ]);
   }
   if (build === "sycl") {
     commands.run("bash", [
@@ -1226,27 +1680,43 @@ function setupWhisperCpp(commands, paths, config) {
       [
         "source /opt/intel/oneapi/setvars.sh >/dev/null",
         `cmake -B ${shellQuote(buildDir)} -S ${shellQuote(paths.whisperCppDir)} -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx`,
-        `cmake --build ${shellQuote(buildDir)} -j --config Release --target whisper-cli`
-      ].join(" && ")
+        `cmake --build ${shellQuote(buildDir)} -j --config Release --target whisper-cli`,
+      ].join(" && "),
     ]);
   } else {
     commands.run("cmake", ["-B", buildDir, "-S", paths.whisperCppDir]);
-    commands.run("cmake", ["--build", buildDir, "-j", "--config", "Release", "--target", "whisper-cli"]);
+    commands.run("cmake", [
+      "--build",
+      buildDir,
+      "-j",
+      "--config",
+      "Release",
+      "--target",
+      "whisper-cli",
+    ]);
   }
   commands.mkdir(paths.whisperCppModelDir);
-  commands.run("bash", [path.join(paths.whisperCppDir, "models/download-ggml-model.sh"), config.model, paths.whisperCppModelDir]);
-  commands.run("bash", [path.join(paths.whisperCppDir, "models/download-vad-model.sh"), WHISPER_CPP_VAD_MODEL, paths.whisperCppModelDir]);
+  commands.run("bash", [
+    path.join(paths.whisperCppDir, "models/download-ggml-model.sh"),
+    config.model,
+    paths.whisperCppModelDir,
+  ]);
+  commands.run("bash", [
+    path.join(paths.whisperCppDir, "models/download-vad-model.sh"),
+    WHISPER_CPP_VAD_MODEL,
+    paths.whisperCppModelDir,
+  ]);
 }
 
 function installWhisperCppSyclPrerequisites(commands) {
   console.log("Installing Intel oneAPI/SYCL prerequisites for whisper.cpp.");
   commands.run("bash", [
     "-lc",
-    "wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null"
+    "wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null",
   ]);
   commands.run("bash", [
     "-lc",
-    "echo 'deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main' | sudo tee /etc/apt/sources.list.d/oneAPI.list > /dev/null"
+    "echo 'deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main' | sudo tee /etc/apt/sources.list.d/oneAPI.list > /dev/null",
   ]);
   commands.run("sudo", ["apt-get", "update"]);
   commands.run("sudo", [
@@ -1259,12 +1729,15 @@ function installWhisperCppSyclPrerequisites(commands) {
     "libze-intel-gpu1",
     "libze1",
     "libze-dev",
-    "clinfo"
+    "clinfo",
   ]);
 }
 
 function whisperCppBuildDir(paths, build) {
-  return path.join(paths.whisperCppDir, build === "sycl" ? "build-sycl" : "build");
+  return path.join(
+    paths.whisperCppDir,
+    build === "sycl" ? "build-sycl" : "build",
+  );
 }
 
 function whisperCppEnv(paths, config) {
@@ -1273,21 +1746,31 @@ function whisperCppEnv(paths, config) {
   return {
     bin: path.join(whisperCppBuildDir(paths, build), "bin/whisper-cli"),
     modelPath: path.join(paths.whisperCppModelDir, `ggml-${model}.bin`),
-    vadModelPath: path.join(paths.whisperCppModelDir, `ggml-${WHISPER_CPP_VAD_MODEL}.bin`),
+    vadModelPath: path.join(
+      paths.whisperCppModelDir,
+      `ggml-${WHISPER_CPP_VAD_MODEL}.bin`,
+    ),
     threads: config.threads,
     build,
-    model
+    model,
   };
 }
 
 function downloadModel(commands, paths) {
   if (fs.existsSync(path.join(paths.modelDir, "config.json"))) {
-    console.log(`Faster Whisper large-v3 model already present at ${paths.modelDir}`);
+    console.log(
+      `Faster Whisper large-v3 model already present at ${paths.modelDir}`,
+    );
     return;
   }
   console.log(`Downloading ${ASR_MODEL_ID} to ${paths.modelDir}.`);
   commands.mkdir(paths.modelDir);
-  commands.run(paths.hfPath, ["download", ASR_MODEL_ID, "--local-dir", paths.modelDir]);
+  commands.run(paths.hfPath, [
+    "download",
+    ASR_MODEL_ID,
+    "--local-dir",
+    paths.modelDir,
+  ]);
 }
 
 function installSystemdServices(commands, runner, paths) {
@@ -1300,8 +1783,8 @@ function installSystemdServices(commands, runner, paths) {
       envPath: paths.envPath,
       pythonPath: paths.pythonPath,
       uvicornPath: paths.uvicornPath,
-      asrDir: paths.asrDir
-    })
+      asrDir: paths.asrDir,
+    }),
   );
   runner.writeFile(
     path.join(paths.systemdDir, "cloudx-documentation.service"),
@@ -1309,8 +1792,8 @@ function installSystemdServices(commands, runner, paths) {
       repoRoot: paths.repoRoot,
       envPath: paths.envPath,
       documentationPythonPath: paths.documentationPythonPath,
-      documentationIndexerPath: paths.documentationIndexerPath
-    })
+      documentationIndexerPath: paths.documentationIndexerPath,
+    }),
   );
   runner.writeFile(
     path.join(paths.systemdDir, "cloudx.service"),
@@ -1318,38 +1801,54 @@ function installSystemdServices(commands, runner, paths) {
       repoRoot: paths.repoRoot,
       envPath: paths.envPath,
       nodePath: commands.which("node"),
-      npmPath: commands.which("npm")
-    })
+      npmPath: commands.which("npm"),
+    }),
   );
 }
 
 function verifyServices(commands, port) {
-  console.log("Verifying service enablement and health endpoints.");
+  console.log("Verifying service enablement and readiness endpoints.");
   commands.run("systemctl", ["--user", "is-enabled", ...SERVICE_NAMES]);
   try {
     waitForHealth(commands, {
       label: "Cloudx web",
-      url: `https://127.0.0.1:${port}/api/health`,
-      insecure: true
+      url: `https://127.0.0.1:${port}/api/ready`,
+      insecure: true,
     });
     waitForHealth(commands, {
       label: "Cloudx ASR",
-      url: "http://127.0.0.1:7810/health"
+      url: "http://127.0.0.1:7810/ready",
     });
     waitForHealth(commands, {
       label: "Cloudx documentation indexer",
-      url: "http://127.0.0.1:7820/health"
+      url: "http://127.0.0.1:7820/ready",
     });
   } catch (error) {
-    console.error("Service health verification failed. Recent service state follows.");
-    commands.run("systemctl", ["--user", "status", ...SERVICE_NAMES, "--no-pager"], { allowFailure: true });
-    commands.run("journalctl", ["--user", ...SERVICE_NAMES.flatMap((serviceName) => ["-u", serviceName]), "--since", "5 minutes ago", "--no-pager"], { allowFailure: true });
+    console.error(
+      "Service health verification failed. Recent service state follows.",
+    );
+    commands.run(
+      "systemctl",
+      ["--user", "status", ...SERVICE_NAMES, "--no-pager"],
+      { allowFailure: true },
+    );
+    commands.run(
+      "journalctl",
+      [
+        "--user",
+        ...SERVICE_NAMES.flatMap((serviceName) => ["-u", serviceName]),
+        "--since",
+        "5 minutes ago",
+        "--no-pager",
+      ],
+      { allowFailure: true },
+    );
     throw error;
   }
 }
 
 function waitForHealth(commands, { label, url, insecure = false }) {
-  console.log(`Waiting for ${label} health endpoint: ${url}`);
+  console.log(`Waiting for ${label} readiness endpoint: ${url}`);
   const args = [
     "--fail",
     "--silent",
@@ -1360,21 +1859,31 @@ function waitForHealth(commands, { label, url, insecure = false }) {
     "30",
     "--retry-delay",
     "1",
-    "--retry-connrefused"
+    "--retry-connrefused",
   ];
   if (insecure) {
     args.push("--insecure");
   }
   args.push(url);
   commands.capture("curl", args);
-  console.log(`  ${label} health ok.`);
+  console.log(`  ${label} readiness ok.`);
 }
 
 function installCodexCli(commands, paths, env) {
   const assistantBin = codexCliBin(paths);
   const npmEnv = codexNpmEnv(paths, env);
   commands.mkdir(paths.npmGlobalDir);
-  commands.run("npm", ["i", "-g", "--prefix", paths.npmGlobalDir, "@openai/codex@latest"], { env: npmEnv });
+  commands.run(
+    "npm",
+    [
+      "i",
+      "-g",
+      "--prefix",
+      paths.npmGlobalDir,
+      `@openai/codex@${CODEX_CLI_VERSION}`,
+    ],
+    { env: npmEnv },
+  );
   return assistantBin;
 }
 
@@ -1382,14 +1891,22 @@ async function verifyCodex(commands, prompt, assistantBin, paths, env) {
   const npmEnv = codexNpmEnv(paths, env);
   commands.run(assistantBin, ["--version"], { env: npmEnv });
   if (!commands.statusOk(assistantBin, ["login", "status"], { env: npmEnv })) {
-    const loginNow = await prompt.boolean("runCodexLogin", "Codex is not authenticated. Run codex login now?", true);
+    const loginNow = await prompt.boolean(
+      "runCodexLogin",
+      "Codex is not authenticated. Run codex login now?",
+      true,
+    );
     if (loginNow) {
       commands.run(assistantBin, ["login"], { env: npmEnv });
-      if (!commands.statusOk(assistantBin, ["login", "status"], { env: npmEnv })) {
+      if (
+        !commands.statusOk(assistantBin, ["login", "status"], { env: npmEnv })
+      ) {
         throw new Error("Codex login did not complete successfully.");
       }
     } else {
-      throw new Error("Codex must be authenticated before Cloudx voice control and Codex tabs can work.");
+      throw new Error(
+        "Codex must be authenticated before Cloudx voice control and Codex tabs can work.",
+      );
     }
   }
 }
@@ -1411,40 +1928,63 @@ async function updateCodex(commands, prompt, paths, env) {
 function installerPaths({ repoRoot: root, home, env = process.env }) {
   const asrDir = path.join(root, "services/asr");
   const venvDir = path.join(asrDir, ".venv");
-  const documentationIndexerDir = path.join(root, "services/documentation-indexer");
+  const documentationIndexerDir = path.join(
+    root,
+    "services/documentation-indexer",
+  );
   const documentationVenvDir = path.join(documentationIndexerDir, ".venv");
-  const whisperCppDir = env.CLOUDX_WHISPER_CPP_DIR ?? path.join(home, ".local/share/cloudx/whisper.cpp");
-  const whisperCppModelDir = env.CLOUDX_WHISPER_CPP_MODEL_DIR ?? path.join(home, ".cache/cloudx/models/whisper.cpp");
-  const npmGlobalDir = env.CLOUDX_NPM_GLOBAL_DIR ?? path.join(home, CLOUDX_NPM_GLOBAL_DIR);
+  const whisperCppDir =
+    env.CLOUDX_WHISPER_CPP_DIR ??
+    path.join(home, ".local/share/cloudx/whisper.cpp");
+  const whisperCppModelDir =
+    env.CLOUDX_WHISPER_CPP_MODEL_DIR ??
+    path.join(home, ".cache/cloudx/models/whisper.cpp");
+  const npmGlobalDir =
+    env.CLOUDX_NPM_GLOBAL_DIR ?? path.join(home, CLOUDX_NPM_GLOBAL_DIR);
+  const uvVenvDir = path.join(home, ".local/share/cloudx/uv");
   const configDir = path.join(home, ".config/cloudx");
   return {
     repoRoot: root,
     asrDir,
     venvDir,
     pythonPath: path.join(venvDir, "bin/python"),
-    pipPath: path.join(venvDir, "bin/pip"),
     hfPath: path.join(venvDir, "bin/hf"),
     uvicornPath: path.join(venvDir, "bin/uvicorn"),
     documentationIndexerDir,
     documentationVenvDir,
     documentationPythonPath: path.join(documentationVenvDir, "bin/python"),
-    documentationPipPath: path.join(documentationVenvDir, "bin/pip"),
-    documentationIndexerPath: path.join(documentationVenvDir, "bin/cloudx-documentation-indexer"),
+    documentationIndexerPath: path.join(
+      documentationVenvDir,
+      "bin/cloudx-documentation-indexer",
+    ),
+    uvVenvDir,
+    uvPath: path.join(uvVenvDir, "bin/uv"),
+    uvPipPath: path.join(uvVenvDir, "bin/pip"),
     whisperCppDir,
     whisperCppModelDir,
     npmGlobalDir,
-    modelDir: env.CLOUDX_ASR_MODEL_PATH ?? path.join(home, ".cache/cloudx/models/faster-whisper-large-v3"),
+    modelDir:
+      env.CLOUDX_ASR_MODEL_PATH ??
+      path.join(home, ".cache/cloudx/models/faster-whisper-large-v3"),
     dataDir: path.join(root, ".cloudx"),
     configDir,
     envPath: path.join(configDir, "cloudx.env"),
-    systemdDir: path.join(home, ".config/systemd/user")
+    systemdDir: path.join(home, ".config/systemd/user"),
   };
 }
 
 export function installServerRuntimeSchemas(runner, paths) {
   for (const relativePath of SERVER_RUNTIME_SCHEMA_FILES) {
-    const sourcePath = path.join(paths.repoRoot, "apps/server/src", relativePath);
-    const targetPath = path.join(paths.repoRoot, "apps/server/dist", relativePath);
+    const sourcePath = path.join(
+      paths.repoRoot,
+      "apps/server/src",
+      relativePath,
+    );
+    const targetPath = path.join(
+      paths.repoRoot,
+      "apps/server/dist",
+      relativePath,
+    );
     if (!fs.existsSync(sourcePath)) {
       if (runner.dryRun) {
         runner.writeFile(targetPath, "");
@@ -1466,16 +2006,27 @@ function commandMap(runner) {
     },
     exists(command) {
       if (runner.dryRun) {
-        return command === "codex" || command === "node" || command === "npm" || command === "python3" || command === "curl" || command === "git";
+        return (
+          command === "codex" ||
+          command === "node" ||
+          command === "npm" ||
+          command === "python3" ||
+          command === "curl" ||
+          command === "git"
+        );
       }
       if (runner.verbose) {
         runner.log(`$ command -v ${command}`);
         runner.logVerboseCommand();
       }
-      const result = spawnSync("sh", ["-lc", `command -v ${shellQuote(command)}`], {
-        stdio: runner.verbose ? ["ignore", "pipe", "pipe"] : "ignore",
-        encoding: runner.verbose ? "utf8" : undefined
-      });
+      const result = spawnSync(
+        "sh",
+        ["-lc", `command -v ${shellQuote(command)}`],
+        {
+          stdio: runner.verbose ? ["ignore", "pipe", "pipe"] : "ignore",
+          encoding: runner.verbose ? "utf8" : undefined,
+        },
+      );
       runner.logVerboseProcessResult(result);
       return processSucceeded(result);
     },
@@ -1487,7 +2038,11 @@ function commandMap(runner) {
         runner.log(`$ command -v ${command}`);
         runner.logVerboseCommand();
       }
-      const result = spawnSync("sh", ["-lc", `command -v ${shellQuote(command)}`], { encoding: "utf8" });
+      const result = spawnSync(
+        "sh",
+        ["-lc", `command -v ${shellQuote(command)}`],
+        { encoding: "utf8" },
+      );
       runner.logVerboseProcessResult(result);
       if (result.status !== 0) {
         throw new Error(`Missing required command: ${command}`);
@@ -1505,7 +2060,7 @@ function commandMap(runner) {
         return `git version ${MIN_WORKTREE_GIT_VERSION}`;
       }
       return runner.capture(command, args, options);
-    }
+    },
   };
 }
 
@@ -1514,11 +2069,17 @@ function detectCudaRuntime(commands) {
     const output = commands.capture("ldconfig", ["-p"]);
     return output.includes("libcudart") && output.includes("libcudnn");
   }
-  return fs.existsSync("/usr/local/cuda/lib64/libcudart.so") && fs.existsSync("/usr/local/cuda/lib64/libcudnn.so");
+  return (
+    fs.existsSync("/usr/local/cuda/lib64/libcudart.so") &&
+    fs.existsSync("/usr/local/cuda/lib64/libcudnn.so")
+  );
 }
 
 function detectNvidiaGpuInfo(commands) {
-  const output = commands.capture("nvidia-smi", ["--query-gpu=name,driver_version,memory.total", "--format=csv,noheader,nounits"]);
+  const output = commands.capture("nvidia-smi", [
+    "--query-gpu=name,driver_version,memory.total",
+    "--format=csv,noheader,nounits",
+  ]);
   return selectNvidiaGpuInfo(parseNvidiaGpuInfo(output));
 }
 
@@ -1530,8 +2091,15 @@ function detectIntelGpu(commands) {
   return /intel.*(arc|dg2)|dg2.*intel/i.test(output);
 }
 
-function createPrompter({ answers = {}, yes = false, dryRun = false, input = process.stdin, output = process.stdout }) {
-  const rl = !yes && !dryRun ? readline.createInterface({ input, output }) : undefined;
+function createPrompter({
+  answers = {},
+  yes = false,
+  dryRun = false,
+  input = process.stdin,
+  output = process.stdout,
+}) {
+  const rl =
+    !yes && !dryRun ? readline.createInterface({ input, output }) : undefined;
   async function ask(key, label, defaultValue) {
     if (answers[key] !== undefined) {
       return answers[key];
@@ -1548,19 +2116,26 @@ function createPrompter({ answers = {}, yes = false, dryRun = false, input = pro
       return String(await ask(key, label, defaultValue));
     },
     async integer(key, label, defaultValue, { min, max }) {
-      const value = Number.parseInt(String(await ask(key, label, defaultValue)), 10);
+      const value = Number.parseInt(
+        String(await ask(key, label, defaultValue)),
+        10,
+      );
       if (!Number.isInteger(value) || value < min || value > max) {
         throw new Error(`${label} must be an integer from ${min} to ${max}.`);
       }
       return value;
     },
     async boolean(key, label, defaultValue) {
-      const raw = await ask(key, `${label} ${defaultValue ? "[Y/n]" : "[y/N]"}`, defaultValue ? "yes" : "no");
+      const raw = await ask(
+        key,
+        `${label} ${defaultValue ? "[Y/n]" : "[y/N]"}`,
+        defaultValue ? "yes" : "no",
+      );
       return parseBooleanChoice(label, raw);
     },
     async close() {
       rl?.close();
-    }
+    },
   };
 }
 
@@ -1591,7 +2166,11 @@ function readEnvFile(filePath) {
 
 export function updateEnvFileContent(content, updates) {
   const seen = new Set();
-  const lines = content.split(/\r?\n/).filter((line, index, allLines) => index < allLines.length - 1 || line !== "");
+  const lines = content
+    .split(/\r?\n/)
+    .filter(
+      (line, index, allLines) => index < allLines.length - 1 || line !== "",
+    );
   const updatedLines = lines.map((line) => {
     const separator = line.indexOf("=");
     if (separator === -1 || line.trim().startsWith("#")) {
@@ -1625,7 +2204,9 @@ export function toolPathFor(commandPath, npmPrefix, currentPath = "") {
 }
 
 function defaultParallelism() {
-  return typeof os.availableParallelism === "function" ? os.availableParallelism() : os.cpus().length || 4;
+  return typeof os.availableParallelism === "function"
+    ? os.availableParallelism()
+    : os.cpus().length || 4;
 }
 
 function shellQuote(value) {
@@ -1643,7 +2224,12 @@ function formatCommand(command, args, options = {}) {
 }
 
 function safeVerboseEnv(env) {
-  return Object.fromEntries(SAFE_VERBOSE_ENV_KEYS.filter((key) => env[key]).map((key) => [key, env[key]]));
+  return Object.fromEntries(
+    SAFE_VERBOSE_ENV_KEYS.filter((key) => env[key]).map((key) => [
+      key,
+      env[key],
+    ]),
+  );
 }
 
 function processSucceeded(result) {
@@ -1651,8 +2237,14 @@ function processSucceeded(result) {
 }
 
 function commandFailure(command, args, result) {
-  const reason = result.error?.message ?? (result.signal ? `signal ${result.signal}` : `exit code ${result.status ?? "unknown"}`);
-  const error = new Error(`Command failed (${reason}): ${[command, ...args].join(" ")}`);
+  const reason =
+    result.error?.message ??
+    (result.signal
+      ? `signal ${result.signal}`
+      : `exit code ${result.status ?? "unknown"}`);
+  const error = new Error(
+    `Command failed (${reason}): ${[command, ...args].join(" ")}`,
+  );
   error.status = result.status;
   error.signal = result.signal;
   error.stdout = result.stdout;
@@ -1677,14 +2269,24 @@ async function main() {
     console.log(helpText());
     return;
   }
-  const answers = options.answersPath ? JSON.parse(fs.readFileSync(options.answersPath, "utf8")) : {};
+  const answers = options.answersPath
+    ? JSON.parse(fs.readFileSync(options.answersPath, "utf8"))
+    : {};
   await runInstaller({ ...options, answers });
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   main().catch((error) => {
-    const verbose = process.env.CLOUDX_INSTALL_VERBOSE === "1" || process.argv.includes("--verbose");
-    console.error(verbose && error instanceof Error && error.stack ? error.stack : error instanceof Error ? error.message : error);
+    const verbose =
+      process.env.CLOUDX_INSTALL_VERBOSE === "1" ||
+      process.argv.includes("--verbose");
+    console.error(
+      verbose && error instanceof Error && error.stack
+        ? error.stack
+        : error instanceof Error
+          ? error.message
+          : error,
+    );
     process.exitCode = 1;
   });
 }
