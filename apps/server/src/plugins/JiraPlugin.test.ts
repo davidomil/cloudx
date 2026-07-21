@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import type { JiraIntegrationService } from "../jira/JiraIntegrationService.js";
 import { JiraPlugin } from "./JiraPlugin.js";
 import { JIRA_HELPER_SCRIPT_PATH } from "./jiraSkillHelpers.js";
 
@@ -36,7 +37,10 @@ describe("JiraPlugin", () => {
       "jira.issue.comment.add",
       "jira.issue.transition",
       "jira.issue.link",
-      "jira.poll.run"
+      "jira.poll.run",
+      "jira.pollingOutbox.inspect",
+      "jira.pollingOutbox.retry",
+      "jira.pollingOutbox.discard"
     ]));
     expect(descriptor.triggers?.map((trigger) => trigger.id)).toEqual([
       "jira.issueCreated",
@@ -179,6 +183,59 @@ describe("JiraPlugin", () => {
 
     expect(createHook).toMatchObject({ automationSafety: "external", exposures: expect.arrayContaining(["automation"]) });
     expect(transitionHook).toMatchObject({ automationSafety: "external", exposures: expect.arrayContaining(["automation"]) });
+    expect(plugin.hooks.find((hook) => hook.id === "jira.pollingOutbox.retry")).toMatchObject({ automationSafety: "external", exposures: expect.arrayContaining(["automation"]) });
+    expect(plugin.hooks.find((hook) => hook.id === "jira.pollingOutbox.discard")).toMatchObject({ automationSafety: "external", exposures: expect.arrayContaining(["automation"]) });
+  });
+
+  it("forwards automation cancellation through every Jira hook and poll call", async () => {
+    const calls: Array<{ method: string; args: unknown[] }> = [];
+    const service = new Proxy({}, {
+      get: (_target, property) => (...args: unknown[]) => {
+        calls.push({ method: String(property), args });
+        return Promise.resolve({});
+      }
+    }) as JiraIntegrationService;
+    const polling = {
+      runOnce: vi.fn().mockResolvedValue({}),
+      inspectOutbox: vi.fn().mockResolvedValue([]),
+      retryFailedOutbox: vi.fn().mockResolvedValue({}),
+      discardFailedOutbox: vi.fn().mockResolvedValue({})
+    };
+    const plugin = new JiraPlugin(() => service, () => polling as never);
+    const controller = new AbortController();
+    const input = {
+      filterJql: "project = ENG",
+      sortBy: "updated_desc",
+      groupBy: "none",
+      maxResults: 1,
+      jql: "project = ENG",
+      pageSize: 1,
+      issueIdOrKey: "ENG-1",
+      body: "Comment",
+      projectKey: "ENG",
+      issueType: "Task",
+      summary: "Summary",
+      transitionId: "31",
+      inwardIssueKey: "ENG-1",
+      outwardIssueKey: "ENG-2",
+      typeName: "Relates",
+      issueKey: "ENG-1",
+      commentId: "10",
+      idempotencyKey: "event-1"
+    };
+
+    for (const hook of plugin.hooks) {
+      await hook.execute(input, { caller: { kind: "automation" }, signal: controller.signal });
+    }
+
+    expect(calls).toHaveLength(plugin.hooks.length - 4);
+    for (const call of calls) {
+      expect(call.args, `${call.method} did not receive the automation signal`).toContain(controller.signal);
+    }
+    expect(polling.runOnce).toHaveBeenCalledWith(controller.signal);
+    expect(polling.inspectOutbox).toHaveBeenCalledWith(controller.signal);
+    expect(polling.retryFailedOutbox).toHaveBeenCalledWith("event-1", controller.signal);
+    expect(polling.discardFailedOutbox).toHaveBeenCalledWith("event-1", controller.signal);
   });
 });
 

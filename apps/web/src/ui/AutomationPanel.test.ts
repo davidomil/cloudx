@@ -548,7 +548,7 @@ describe("AutomationPanel helpers", () => {
       createdAt: "2026-05-22T00:00:00.000Z",
       updatedAt: "2026-05-22T00:00:00.000Z",
       graph: {
-        schemaVersion: 1,
+        schemaVersion: 2,
         nodes: [],
         edges: [],
         variables: []
@@ -903,7 +903,7 @@ describe("AutomationPanel helpers", () => {
       createdAt: now,
       updatedAt: now,
       graph: {
-        schemaVersion: 1,
+        schemaVersion: 2,
         nodes: [{ id: "format", typeId: AUTOMATION_FSTRING_TYPE_ID, position: { x: 0, y: 0 }, config: { template: "Hello {name}", inputNames: ["name", "count"] } }],
         edges: [],
         variables: []
@@ -1132,7 +1132,7 @@ function groupFixture(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test", position: { x: 0, y: 0 } },
         { id: "log", typeId: "primitive:log", position: { x: 200, y: 0 }, config: { message: "done" } }

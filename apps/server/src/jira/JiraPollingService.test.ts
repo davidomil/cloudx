@@ -10,7 +10,7 @@ import { TriggerRegistry, type TriggerRegistryOptions } from "../triggers/Trigge
 import { JiraRateLimitError } from "./JiraClient.js";
 import type { JiraIntegrationService } from "./JiraIntegrationService.js";
 import { JiraPollingService } from "./JiraPollingService.js";
-import type { JiraCommentSummary, JiraIssueSummary } from "./JiraIssue.js";
+import { jiraIssueEventPayload, type JiraCommentSummary, type JiraIssueSummary } from "./JiraIssue.js";
 
 describe("JiraPollingService", () => {
   it("bootstraps state, emits changed issue triggers once, and suppresses duplicates", async () => {
@@ -225,6 +225,252 @@ describe("JiraPollingService", () => {
     await expect(polling.runOnce()).resolves.toMatchObject({ skipped: true, reason: "rate_limited", nextAllowedPollAt: expect.any(String) });
     await expect(polling.runIfEnabled()).resolves.toMatchObject({ skipped: true, reason: "rate_limited", nextAllowedPollAt: expect.any(String) });
   });
+
+  it("resumes a crash-window outbox with stable idempotency keys and a committed checkpoint", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-jira-polling-outbox-"));
+    const pluginData = new PluginDataStore(dataDir);
+    const delivered: Array<{ triggerId: string; eventId: string }> = [];
+    const triggers = jiraTriggers((event) => {
+      delivered.push({ triggerId: event.triggerId, eventId: String(event.payload.eventId) });
+    });
+    const currentIssues = [
+      issue("ENG-1", "Done", "old", "2026-06-08T10:05:00.000+0000"),
+      issue("ENG-2", "Open", "old", "2026-06-08T10:06:00.000+0000")
+    ];
+    const integration = {
+      configured: () => true,
+      pollingConfig: () => ({ enabled: true, intervalSeconds: 300, jql: "", maxIssues: 10, commentsEnabled: false, assignmentsEnabled: false }),
+      pollingIssues: vi.fn()
+        .mockResolvedValueOnce([
+          issue("ENG-1", "Open", "old", "2026-06-08T10:00:00.000+0000"),
+          issue("ENG-2", "Open", "old", "2026-06-08T10:00:00.000+0000")
+        ])
+        .mockResolvedValue(currentIssues),
+      pollingComments: vi.fn()
+    } as unknown as JiraIntegrationService;
+    const polling = new JiraPollingService(integration, pluginData, () => triggers);
+    await polling.runOnce();
+
+    const originalWrite = pluginData.write.bind(pluginData);
+    let dispatchStarted = false;
+    let failedCheckpoint = false;
+    const write = vi.spyOn(pluginData, "write").mockImplementation(async (pluginId, value) => {
+      const outbox = isRecord(value) && Array.isArray(value.outbox) ? value.outbox : [];
+      dispatchStarted ||= outbox.some((entry) => isRecord(entry) && entry.status === "dispatching");
+      if (!failedCheckpoint && dispatchStarted && outbox.length === 1) {
+        failedCheckpoint = true;
+        throw new Error("simulated crash before outbox acknowledgement");
+      }
+      await originalWrite(pluginId, value);
+    });
+
+    await expect(polling.runOnce()).rejects.toThrow("simulated crash before outbox acknowledgement");
+    write.mockRestore();
+    const resumed = new JiraPollingService(integration, pluginData, () => triggers);
+    await expect(resumed.runOnce()).resolves.toMatchObject({
+      emitted: ["jira.issueTransitioned", "jira.issueUpdated"]
+    });
+
+    expect(delivered.map((event) => event.triggerId)).toEqual([
+      "jira.issueTransitioned",
+      "jira.issueTransitioned",
+      "jira.issueUpdated"
+    ]);
+    expect(delivered[0]!.eventId).toBe(delivered[1]!.eventId);
+    const stored = await pluginData.read("jira");
+    expect(stored).toMatchObject({
+      issues: {
+        "ENG-1": { status: "Done" },
+        "ENG-2": { status: "Open", updated: "2026-06-08T10:06:00.000+0000" }
+      },
+      outbox: []
+    });
+  });
+
+  it("persists controlled outbox failures and does not retry them", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-jira-polling-outbox-failed-"));
+    const pluginData = new PluginDataStore(dataDir);
+    let emitAttempts = 0;
+    const triggers = jiraTriggers(() => {
+      emitAttempts += 1;
+      throw new Error("automation claim store unavailable");
+    });
+    const integration = {
+      configured: () => true,
+      pollingConfig: () => ({ enabled: true, intervalSeconds: 300, jql: "", maxIssues: 10, commentsEnabled: false, assignmentsEnabled: false }),
+      pollingIssues: vi.fn()
+        .mockResolvedValueOnce([issue("ENG-1", "Open", "old", "2026-06-08T10:00:00.000+0000")])
+        .mockResolvedValue([issue("ENG-1", "Done", "old", "2026-06-08T10:05:00.000+0000")]),
+      pollingComments: vi.fn()
+    } as unknown as JiraIntegrationService;
+    const polling = new JiraPollingService(integration, pluginData, () => triggers);
+    await polling.runOnce();
+
+    await expect(polling.runOnce()).rejects.toThrow("automation claim store unavailable");
+    await expect(polling.runOnce()).rejects.toThrow(/Jira polling outbox event .* is failed and requires explicit operator resolution/);
+
+    expect(emitAttempts).toBe(1);
+    expect(integration.pollingIssues).toHaveBeenCalledTimes(2);
+    expect(await pluginData.read("jira")).toMatchObject({
+      outbox: [expect.objectContaining({ status: "failed", lastError: "automation claim store unavailable" })]
+    });
+  });
+
+  it.each([
+    ["missing idempotency key", { payload: { eventId: "event-1" } }],
+    ["blank idempotency key", { idempotencyKey: "", payload: { eventId: "event-1" } }],
+    ["whitespace idempotency key", { idempotencyKey: "   ", payload: { eventId: "event-1" } }],
+    ["missing payload event id", { idempotencyKey: "event-1", payload: {} }],
+    ["blank payload event id", { idempotencyKey: "event-1", payload: { eventId: " " } }],
+    ["mismatched identity", { idempotencyKey: "event-1", payload: { eventId: "event-2" } }]
+  ])("rejects persisted outbox state with %s before polling or mutation", async (_name, identity) => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-jira-polling-invalid-outbox-"));
+    const pluginData = new PluginDataStore(dataDir);
+    await pluginData.write("jira", {
+      initialized: true,
+      issues: { "ENG-1": { status: "Open" } },
+      outbox: [{
+        triggerId: "jira.issueUpdated",
+        status: "failed",
+        preparedAt: new Date(0).toISOString(),
+        ...identity
+      }]
+    });
+    const write = vi.spyOn(pluginData, "write");
+    const triggers = jiraTriggers();
+    const emit = vi.spyOn(triggers, "emit");
+    const integration = {
+      configured: () => true,
+      pollingConfig: () => ({ enabled: true, intervalSeconds: 300, jql: "", maxIssues: 10, commentsEnabled: false, assignmentsEnabled: false }),
+      pollingIssues: vi.fn(),
+      pollingComments: vi.fn()
+    } as unknown as JiraIntegrationService;
+    const polling = new JiraPollingService(integration, pluginData, () => triggers);
+
+    await expect(polling.runOnce()).rejects.toThrow("Jira polling outbox state is invalid");
+
+    expect(emit).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+    expect(integration.pollingIssues).not.toHaveBeenCalled();
+  });
+
+  it("inspects, retries, and discards failed outbox items only through explicit operator actions", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-jira-polling-operator-"));
+    const pluginData = new PluginDataStore(dataDir);
+    const first = failedOutboxEvent("event-1", "jira.issueUpdated", "first failure ".repeat(100));
+    const second = failedOutboxEvent("event-2", "jira.issueTransitioned", "second failure");
+    await pluginData.write("jira", {
+      initialized: true,
+      issues: { "ENG-1": { status: "Done", updated: "checkpoint" } },
+      outbox: [first, second]
+    });
+    const delivered: string[] = [];
+    const triggers = jiraTriggers((event) => {
+      delivered.push(event.id);
+    });
+    const integration = {
+      configured: () => true,
+      pollingConfig: () => ({ enabled: true, intervalSeconds: 300, jql: "", maxIssues: 10, commentsEnabled: false, assignmentsEnabled: false }),
+      pollingIssues: vi.fn().mockResolvedValue([]),
+      pollingComments: vi.fn()
+    } as unknown as JiraIntegrationService;
+    const polling = new JiraPollingService(integration, pluginData, () => triggers);
+
+    const inspected = await polling.inspectOutbox();
+    expect(inspected).toEqual([
+      expect.objectContaining({ idempotencyKey: "event-1", triggerId: "jira.issueUpdated", status: "failed" }),
+      expect.objectContaining({ idempotencyKey: "event-2", triggerId: "jira.issueTransitioned", status: "failed" })
+    ]);
+    expect(inspected[0]).not.toHaveProperty("payload");
+    expect(inspected[0]!.lastError!.length).toBeLessThanOrEqual(512);
+
+    await expect(polling.retryFailedOutbox("event-1")).resolves.toMatchObject({ idempotencyKey: "event-1", status: "prepared" });
+    expect(delivered).toEqual([]);
+    await expect(polling.retryFailedOutbox("event-2")).resolves.toMatchObject({ idempotencyKey: "event-2", status: "prepared" });
+    await expect(polling.discardFailedOutbox("event-2")).rejects.toThrow("is not failed");
+    await expect(polling.retryFailedOutbox("missing")).rejects.toThrow("Unknown Jira polling outbox event");
+
+    await pluginData.write("jira", {
+      initialized: true,
+      issues: { "ENG-1": { status: "Done", updated: "checkpoint" } },
+      outbox: [first, second]
+    });
+    await expect(polling.discardFailedOutbox("event-2")).resolves.toMatchObject({ idempotencyKey: "event-2", status: "failed" });
+    const afterDiscard = await pluginData.read("jira");
+    expect(afterDiscard).toMatchObject({
+      issues: { "ENG-1": { status: "Done", updated: "checkpoint" } },
+      outbox: [expect.objectContaining({ idempotencyKey: "event-1" })]
+    });
+    await polling.retryFailedOutbox("event-1");
+    await expect(polling.runOnce()).resolves.toMatchObject({ emitted: ["jira.issueUpdated"] });
+    expect(delivered).toEqual(["plugin:jira:jira.issueUpdated:event-1"]);
+
+    const controller = new AbortController();
+    controller.abort(new Error("operator cancelled"));
+    await expect(polling.inspectOutbox(controller.signal)).rejects.toThrow("operator cancelled");
+    await expect(polling.retryFailedOutbox("event-1", controller.signal)).rejects.toThrow("operator cancelled");
+    await expect(polling.discardFailedOutbox("event-1", controller.signal)).rejects.toThrow("operator cancelled");
+  });
+
+  it("aborts an in-flight poll from the automation execution signal", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-jira-polling-automation-abort-"));
+    let receivedSignal: AbortSignal | undefined;
+    const integration = {
+      configured: () => true,
+      pollingConfig: () => ({ enabled: true, intervalSeconds: 300, jql: "", maxIssues: 10, commentsEnabled: false, assignmentsEnabled: false }),
+      pollingIssues: vi.fn((signal?: AbortSignal) => {
+        receivedSignal = signal;
+        return new Promise<never>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      }),
+      pollingComments: vi.fn()
+    } as unknown as JiraIntegrationService;
+    const polling = new JiraPollingService(integration, new PluginDataStore(dataDir), () => jiraTriggers());
+    const controller = new AbortController();
+    const run = polling.runOnce(controller.signal);
+    await vi.waitFor(() => expect(receivedSignal).toBeDefined());
+
+    controller.abort(new Error("automation cancelled"));
+
+    await expect(run).rejects.toThrow("automation cancelled");
+    expect(receivedSignal?.aborted).toBe(true);
+  });
+
+  it("aborts and awaits an in-flight poll during disposal", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-jira-polling-dispose-"));
+    let receivedSignal: AbortSignal | undefined;
+    let releaseAbort!: () => void;
+    const aborted = new Promise<void>((resolve) => {
+      releaseAbort = resolve;
+    });
+    const integration = {
+      configured: () => true,
+      pollingConfig: () => ({ enabled: true, intervalSeconds: 300, jql: "", maxIssues: 10, commentsEnabled: false, assignmentsEnabled: false }),
+      pollingIssues: vi.fn(async (signal?: AbortSignal) => {
+        receivedSignal = signal;
+        await new Promise<never>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => {
+            releaseAbort();
+            reject(signal.reason);
+          }, { once: true });
+        });
+        return [];
+      }),
+      pollingComments: vi.fn()
+    } as unknown as JiraIntegrationService;
+    const polling = new JiraPollingService(integration, new PluginDataStore(dataDir), () => jiraTriggers());
+    const run = polling.runOnce();
+    await vi.waitFor(() => expect(receivedSignal).toBeDefined());
+
+    const disposal = polling.dispose();
+
+    await aborted;
+    expect(receivedSignal?.aborted).toBe(true);
+    await expect(disposal).resolves.toBeUndefined();
+    await expect(run).resolves.toMatchObject({ skipped: true, reason: "disposed" });
+    await expect(polling.runOnce()).resolves.toMatchObject({ skipped: true, reason: "disposed" });
+  });
 });
 
 function jiraTriggers(recordEvent?: TriggerRegistryOptions["recordEvent"]): TriggerRegistry {
@@ -233,6 +479,20 @@ function jiraTriggers(recordEvent?: TriggerRegistryOptions["recordEvent"]): Trig
     triggers.register(trigger);
   }
   return triggers;
+}
+
+function failedOutboxEvent(eventId: string, triggerId: string, lastError: string) {
+  return {
+    idempotencyKey: eventId,
+    triggerId,
+    payload: {
+      ...jiraIssueEventPayload(triggerId, issue("ENG-1", "Done", "me", "2026-06-08T10:05:00.000+0000"), new Date(0).toISOString()),
+      eventId
+    },
+    status: "failed",
+    preparedAt: new Date(0).toISOString(),
+    lastError
+  };
 }
 
 function issue(key: string, status: string, assigneeAccountId: string, updated: string, assigneeEmailAddress?: string): JiraIssueSummary {
@@ -261,6 +521,10 @@ function comment(id: string, bodyText: string): JiraCommentSummary {
     url: `https://example.atlassian.net/browse/ENG-1?focusedCommentId=${id}`,
     raw: {}
   };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function unavailableService(): never {

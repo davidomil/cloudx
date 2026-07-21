@@ -924,7 +924,7 @@ function payloadCollisionGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "capture", typeId: "hook:test.capturePayload", position: { x: 200, y: 0 } }
@@ -946,7 +946,7 @@ function execPayloadFieldGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "capture", typeId: "hook:test.captureExecField", position: { x: 200, y: 0 } }
@@ -1012,7 +1012,7 @@ function schemaOwnedTargetTabGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "plugin", typeId: "hook:test.schemaTargetTab", position: { x: 200, y: 0 }, config: { targetTabId: "payload-tab" } }
@@ -1148,7 +1148,7 @@ function group(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "echo", typeId: "hook:test.echo", position: { x: 200, y: 0 } },
@@ -1172,7 +1172,7 @@ function nestedHookGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "create", typeId: "hook:test.createWindow", position: { x: 200, y: 0 }, config: { "indicator.color": "green" } },
@@ -1217,7 +1217,7 @@ function unsafePathGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "unsafe", typeId: "hook:test.unsafe", position: { x: 200, y: 0 }, config: { "__proto__.polluted": "yes" } }
@@ -1236,7 +1236,7 @@ function variableArrayGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "array", typeId: "primitive:array.literal", position: { x: 120, y: 140 }, config: { items: "[\"a\"]" } },
@@ -1268,7 +1268,7 @@ function whileVariableMutationGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "create-flag", typeId: "primitive:variables.create", position: { x: 180, y: 0 }, config: { name: "continue", initial: true } },
@@ -1298,7 +1298,7 @@ function stringOperationGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "append", typeId: "primitive:string.append", position: { x: 120, y: 120 }, config: { text: "Hello", suffix: " world" } },
@@ -1338,7 +1338,7 @@ function regexPrimitiveGroup(typeId: "primitive:string.regex.test" | "primitive:
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "regex", typeId, position: { x: 200, y: 120 }, config },
@@ -1362,7 +1362,7 @@ function nonBooleanConditionGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "if", typeId: "primitive:if", position: { x: 200, y: 0 }, config: { condition: "false" } },
@@ -1388,7 +1388,7 @@ function nullTemplateOverrideGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "format", typeId: "primitive:stringTemplate", position: { x: 160, y: 120 }, config: { template: "Hello ${name}", name: null } },
@@ -1412,7 +1412,7 @@ function stringTemplatePayloadPathGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "format", typeId: "primitive:stringTemplate", position: { x: 160, y: 120 }, config: { template: "User ${payload.user.profile.name} / inherited=${payload.user.constructor.name}" } },
@@ -1436,7 +1436,7 @@ function fStringGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "format", typeId: "primitive:string.fstring", position: { x: 160, y: 120 }, config: { template: "Hi {name!r}, total={count:.2f}, literal {{ok}}", inputNames: ["name", "count"], count: 3.5 } },
@@ -1461,7 +1461,7 @@ function fStringInheritedPayloadGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "format", typeId: "primitive:string.fstring", position: { x: 160, y: 120 }, config: { template: "payload={payload.constructor.name}", inputNames: [] } },
@@ -1485,7 +1485,7 @@ function fStringFormatGroup(template: string, inputNames: string[] = [], extraCo
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "format", typeId: "primitive:string.fstring", position: { x: 160, y: 120 }, config: { template, inputNames, ...extraConfig } },
@@ -1509,7 +1509,7 @@ function mathOperationGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "add", typeId: "primitive:math.add", position: { x: 120, y: 120 }, config: { left: 2, right: 3 } },
@@ -1545,7 +1545,7 @@ function comparisonOperationGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "number", typeId: "primitive:number.compare", position: { x: 120, y: 120 }, config: { left: 7, right: 3, operator: "greaterThan" } },
@@ -1577,7 +1577,7 @@ function sleepGroup(durationMs: number): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "sleep", typeId: "primitive:sleep", position: { x: 160, y: 0 }, config: { durationMs } },
@@ -1607,7 +1607,7 @@ function pythonJsonGroup({
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       allowedSafety,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
@@ -1643,7 +1643,7 @@ function pythonHookGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       allowedSafety: ["read", "write", "external"],
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
@@ -1676,7 +1676,7 @@ function pythonDestructiveHookGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       allowedSafety: ["read", "write", "external"],
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
@@ -1704,7 +1704,7 @@ function pythonSpoofedHookOutputGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       allowedSafety: ["read", "write", "external"],
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
@@ -1737,7 +1737,7 @@ function pythonSecretEnvGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       allowedSafety: ["read", "write", "external"],
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
@@ -1771,7 +1771,7 @@ function bashJsonGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       allowedSafety: ["read", "write", "external"],
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
@@ -1806,7 +1806,7 @@ function bashSecretEnvGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       allowedSafety: ["read", "write", "external"],
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
@@ -1840,7 +1840,7 @@ function pythonIgnoresSigtermGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       allowedSafety: ["read", "write", "external"],
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
@@ -1929,7 +1929,7 @@ function codexExecGroup({
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       allowedSafety: ["read", "write", "external"],
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
@@ -2001,7 +2001,7 @@ function nonObjectJsonConverterGroup(value: string): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "convert", typeId: "converter:string.toObject", position: { x: 120, y: 120 }, config: { value } },
@@ -2045,7 +2045,7 @@ function defaultValueGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "defaulted", typeId: "hook:test.defaulted", position: { x: 200, y: 0 } }
@@ -2064,7 +2064,7 @@ function targetTabGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "plugin", typeId: "hook:test.pluginAction", position: { x: 200, y: 0 }, config: { targetTabId: "tab-2" } }
@@ -2086,7 +2086,7 @@ function externalHookGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
         { id: "external", typeId: "hook:test.external", position: { x: 200, y: 0 } }

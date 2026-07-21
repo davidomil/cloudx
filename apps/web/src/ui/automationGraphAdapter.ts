@@ -52,7 +52,7 @@ export function flowFromGraph(group: AutomationGroup, catalog: AutomationCatalog
 
 export function graphFromFlow(nodes: FlowNode[], edges: FlowEdge[], baseGraph?: AutomationGroup["graph"]): AutomationGroup["graph"] {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     nodes: nodes.map((node) => ({
       id: node.id,
       typeId: node.data.entry.typeId,

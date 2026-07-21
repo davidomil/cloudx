@@ -54,7 +54,7 @@ describe("AutomationCompiler", () => {
   it("rejects incompatible data edges and missing required inputs", () => {
     const compiler = new AutomationCompiler(new AutomationTypeService());
     const graph: AutomationGraphDocument = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test", position: { x: 0, y: 0 } },
         { id: "hook", typeId: "hook:needsNumber", position: { x: 200, y: 0 } }
@@ -83,7 +83,7 @@ describe("AutomationCompiler", () => {
   it("accepts required inputs supplied by node config", () => {
     const compiler = new AutomationCompiler(new AutomationTypeService());
     const graph: AutomationGraphDocument = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test", position: { x: 0, y: 0 } },
         { id: "hook", typeId: "hook:needsNumber", position: { x: 200, y: 0 }, config: { count: 3 } }
@@ -124,7 +124,7 @@ describe("AutomationCompiler", () => {
       ]
     };
     const graph: AutomationGraphDocument = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test", position: { x: 0, y: 0 } },
         { id: "hook", typeId: "hook:needsNumber", position: { x: 200, y: 0 } }
@@ -180,7 +180,7 @@ describe("AutomationCompiler", () => {
       ]
     };
     const graph: AutomationGraphDocument = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test", position: { x: 0, y: 0 } },
         { id: "hook", typeId: "hook:defaultedNumber", position: { x: 200, y: 0 } }
@@ -220,7 +220,7 @@ describe("AutomationCompiler", () => {
       ]
     };
     const graph: AutomationGraphDocument = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test", position: { x: 0, y: 0 } },
         { id: "hook", typeId: "hook:badDefault", position: { x: 200, y: 0 } }
@@ -245,7 +245,7 @@ describe("AutomationCompiler", () => {
   it("rejects configured node values that do not match input port types", () => {
     const compiler = new AutomationCompiler(new AutomationTypeService());
     const graph: AutomationGraphDocument = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test", position: { x: 0, y: 0 } },
         { id: "hook", typeId: "hook:needsNumber", position: { x: 200, y: 0 }, config: { count: "three" } }
@@ -270,7 +270,7 @@ describe("AutomationCompiler", () => {
   it("rejects edges connected to config-only object ports", () => {
     const compiler = new AutomationCompiler(new AutomationTypeService());
     const graph: AutomationGraphDocument = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test", position: { x: 0, y: 0 } },
         { id: "hook", typeId: "hook:needsNumber", position: { x: 200, y: 0 }, config: { count: 3 } }
@@ -295,7 +295,7 @@ describe("AutomationCompiler", () => {
   it("rejects multiple outgoing exec edges from the same program-flow output", () => {
     const compiler = new AutomationCompiler(new AutomationTypeService());
     const graph: AutomationGraphDocument = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test", position: { x: 0, y: 0 } },
         { id: "hook-a", typeId: "hook:needsNumber", position: { x: 200, y: 0 }, config: { count: 1 } },
@@ -315,7 +315,7 @@ describe("AutomationCompiler", () => {
   it("rejects multiple incoming data edges to the same input", () => {
     const compiler = new AutomationCompiler(new AutomationTypeService());
     const graph: AutomationGraphDocument = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test", position: { x: 0, y: 0 } },
         { id: "hook", typeId: "hook:needsNumber", position: { x: 200, y: 0 } }
@@ -334,7 +334,7 @@ describe("AutomationCompiler", () => {
   it("rejects duplicate edge ids", () => {
     const compiler = new AutomationCompiler(new AutomationTypeService());
     const graph: AutomationGraphDocument = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test", position: { x: 0, y: 0 } },
         { id: "hook-a", typeId: "hook:needsNumber", position: { x: 200, y: 0 }, config: { count: 1 } },
@@ -354,7 +354,7 @@ describe("AutomationCompiler", () => {
   it("rejects ambiguous variable definitions", () => {
     const compiler = new AutomationCompiler(new AutomationTypeService());
     const graph: AutomationGraphDocument = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [{ id: "trigger", typeId: "trigger:test", position: { x: 0, y: 0 } }],
       edges: [],
       variables: [
@@ -377,7 +377,7 @@ describe("AutomationCompiler", () => {
   it("rejects program-flow cycles", () => {
     const compiler = new AutomationCompiler(new AutomationTypeService());
     const graph: AutomationGraphDocument = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test", position: { x: 0, y: 0 } },
         { id: "hook", typeId: "hook:needsNumber", position: { x: 200, y: 0 }, config: { count: 1 } }
@@ -420,7 +420,7 @@ describe("AutomationCompiler", () => {
       ]
     };
     const graph: AutomationGraphDocument = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test", position: { x: 0, y: 0 } },
         { id: "shell", typeId: "hook:runShell", position: { x: 200, y: 0 } }
@@ -434,7 +434,7 @@ describe("AutomationCompiler", () => {
     expect(compiler.validate({ ...graph, allowedSafety: ["read", "write", "external"] }, unsafeCatalog)).toEqual({ valid: true, diagnostics: [] });
 
     const primitiveGraph: AutomationGraphDocument = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test", position: { x: 0, y: 0 } },
         { id: "python", typeId: "primitive:python.exec", position: { x: 200, y: 0 } }
@@ -449,7 +449,7 @@ describe("AutomationCompiler", () => {
   it("validates f-string dynamic input ports from node config", () => {
     const compiler = new AutomationCompiler(new AutomationTypeService());
     const graph: AutomationGraphDocument = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:test", position: { x: 0, y: 0 } },
         { id: "format", typeId: AUTOMATION_FSTRING_TYPE_ID, position: { x: 200, y: 0 }, config: { template: "Hello {name}", inputNames: ["name"] } }

@@ -1,4 +1,6 @@
-import type { CloudxAppContext, CreatePluginSessionInput, JsonSchemaLike, PluginActionDefinition, PluginSession, PluginSessionSnapshot, PluginVoiceContext, TriggerDefinition, WorkspacePlugin } from "@cloudx/plugin-api";
+import { randomUUID } from "node:crypto";
+
+import type { CloudxAppContext, CreatePluginSessionInput, JsonSchemaLike, PluginActionContext, PluginActionDefinition, PluginSession, PluginSessionSnapshot, PluginVoiceContext, TriggerDefinition, WorkspacePlugin } from "@cloudx/plugin-api";
 import type { ConfigFieldDescriptor, WorktreeCreateMode, WorktreeProjectState, WorkspaceTab } from "@cloudx/shared";
 
 import { WorktreeService } from "../git/WorktreeService.js";
@@ -236,6 +238,7 @@ export class WorktreeManagerPlugin implements WorkspacePlugin {
       payloadSchema: {
         type: "object",
         properties: {
+          eventId: { type: "string", description: "Stable identity for this completed worktree creation." },
           folderName: { type: "string", description: "Name of the linked worktree folder that was created." },
           branchName: { type: "string", description: "Local branch checked out in the new worktree." },
           mode: { type: "string", enum: ["new_branch", "existing_branch", "remote_branch"], description: "Worktree creation mode used by the Worktrees plugin." },
@@ -243,7 +246,7 @@ export class WorktreeManagerPlugin implements WorkspacePlugin {
           path: { type: "string", description: "Absolute filesystem path to the created worktree folder." },
           projectDir: { type: "string", description: "Root project directory that owns the bare repository and linked worktrees." }
         },
-        required: ["folderName", "branchName", "mode", "path", "projectDir"],
+        required: ["eventId", "folderName", "branchName", "mode", "path", "projectDir"],
         additionalProperties: false
       }
     }
@@ -321,24 +324,28 @@ class WorktreeManagerSession implements PluginSession {
     };
   }
 
-  async handleAction(action: string, input: Record<string, unknown>): Promise<Record<string, unknown>> {
+  async handleAction(action: string, input: Record<string, unknown>, context?: PluginActionContext): Promise<Record<string, unknown>> {
     if (action === "get_worktree_project") {
       this.state = await this.worktrees.getState(this.tab.cwd, this.stateOptions(input));
       return this.state as unknown as Record<string, unknown>;
     }
     if (action === "initialize_bare_repository") {
-      this.state = await this.worktrees.initializeBareRepository(this.tab.cwd, this.stateOptions());
+      context?.signal?.throwIfAborted();
+      this.state = await this.worktrees.initializeBareRepository(this.tab.cwd, this.stateOptions(undefined, context?.signal));
       return this.state as unknown as Record<string, unknown>;
     }
     if (action === "clone_bare_repository") {
-      this.state = await this.worktrees.cloneBareRepository(this.tab.cwd, requireString(input.url, "url"), this.stateOptions());
+      context?.signal?.throwIfAborted();
+      this.state = await this.worktrees.cloneBareRepository(this.tab.cwd, requireString(input.url, "url"), this.stateOptions(undefined, context?.signal));
       return this.state as unknown as Record<string, unknown>;
     }
     if (action === "fetch_refs") {
-      this.state = await this.worktrees.fetchRefs(this.tab.cwd, this.stateOptions());
+      context?.signal?.throwIfAborted();
+      this.state = await this.worktrees.fetchRefs(this.tab.cwd, this.stateOptions(undefined, context?.signal));
       return this.state as unknown as Record<string, unknown>;
     }
     if (action === "create_worktree") {
+      context?.signal?.throwIfAborted();
       const mode = requireCreateMode(input.mode);
       const folderName = requireString(input.folderName, "folderName");
       const branchName = requireString(input.branchName, "branchName");
@@ -348,10 +355,11 @@ class WorktreeManagerSession implements PluginSession {
         folderName,
         branchName,
         baseRef
-      }, this.stateOptions());
+      }, this.stateOptions(undefined, context?.signal));
       const created = this.state.worktrees.find((worktree) => worktree.folderName === folderName);
       const createdPath = created?.path ?? `${this.state.projectDir}/${folderName}`;
       await this.app?.emitTrigger("worktree.created", {
+        eventId: randomUUID(),
         folderName,
         branchName,
         mode,
@@ -369,18 +377,22 @@ class WorktreeManagerSession implements PluginSession {
       } as unknown as Record<string, unknown>;
     }
     if (action === "delete_worktree") {
+      context?.signal?.throwIfAborted();
       this.state = await this.worktrees.deleteWorktree(this.tab.cwd, {
         folderName: requireString(input.folderName, "folderName"),
         confirmation: requireString(input.confirmation, "confirmation"),
         force: optionalBoolean(input.force, "force")
-      }, this.stateOptions());
+      }, this.stateOptions(undefined, context?.signal));
       return this.state as unknown as Record<string, unknown>;
     }
     throw new Error(`Unsupported worktree manager action: ${action}`);
   }
 
-  private stateOptions(input?: Record<string, unknown>) {
-    return { includeSizes: optionalBoolean(input?.includeSizes, "includeSizes") ?? false };
+  private stateOptions(input?: Record<string, unknown>, signal?: AbortSignal) {
+    return {
+      includeSizes: optionalBoolean(input?.includeSizes, "includeSizes") ?? false,
+      ...(signal ? { signal } : {})
+    };
   }
 }
 

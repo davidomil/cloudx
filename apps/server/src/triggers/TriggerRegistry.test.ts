@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { TriggerDefinition } from "@cloudx/plugin-api";
+import type { TriggerEvent } from "@cloudx/shared";
 
 import { TriggerRegistry } from "./TriggerRegistry.js";
 
@@ -13,9 +14,10 @@ const trigger: TriggerDefinition = {
   payloadSchema: {
     type: "object",
     properties: {
+      eventId: { type: "string" },
       text: { type: "string" }
     },
-    required: ["text"],
+    required: ["eventId", "text"],
     additionalProperties: false
   }
 };
@@ -23,24 +25,45 @@ const trigger: TriggerDefinition = {
 describe("TriggerRegistry", () => {
   it("validates and records trigger events before dispatching subscribers", async () => {
     const order: string[] = [];
+    const recorded: TriggerEvent[] = [];
+    const dispatched: TriggerEvent[] = [];
     const registry = new TriggerRegistry({
-      recordEvent: () => {
+      recordEvent: (event) => {
+        recorded.push(event);
         order.push("record");
       }
     });
     registry.register(trigger);
-    registry.subscribe(() => {
+    registry.subscribe((event) => {
+      dispatched.push(event);
       order.push("subscriber");
     });
 
-    const event = await registry.emit("tester.started", { text: "hello" }, { kind: "plugin", pluginId: "tester", tabId: "tab-1" });
+    const event = await registry.emit("tester.started", { eventId: "event-1", text: "hello" }, { kind: "plugin", pluginId: "tester", tabId: "tab-1" });
 
     expect(event).toMatchObject({
+      id: "plugin:tester:tester.started:event-1",
       triggerId: "tester.started",
-      payload: { text: "hello" },
+      payload: { eventId: "event-1", text: "hello" },
       source: { kind: "plugin", pluginId: "tester", tabId: "tab-1" }
     });
+    expect(recorded).toEqual([event]);
+    expect(dispatched).toEqual([event]);
     expect(order).toEqual(["record", "subscriber"]);
+  });
+
+  it.each([undefined, "", "   "])("rejects plugin eventId %j before recording or dispatching", async (eventId) => {
+    const recordEvent = vi.fn();
+    const subscriber = vi.fn();
+    const registry = new TriggerRegistry({ recordEvent });
+    registry.register(trigger);
+    registry.subscribe(subscriber);
+    const payload = eventId === undefined ? { text: "hello" } : { eventId, text: "hello" };
+
+    await expect(registry.emit("tester.started", payload, { kind: "plugin", pluginId: "tester" })).rejects.toThrow();
+
+    expect(recordEvent).not.toHaveBeenCalled();
+    expect(subscriber).not.toHaveBeenCalled();
   });
 
   it("rejects duplicate triggers, invalid payloads, and cross-plugin emission", async () => {
@@ -48,7 +71,7 @@ describe("TriggerRegistry", () => {
     registry.register(trigger);
 
     expect(() => registry.register(trigger)).toThrow("Trigger already registered");
-    await expect(registry.emit("tester.started", {}, { kind: "plugin", pluginId: "tester" })).rejects.toThrow("missing required payload: text");
-    await expect(registry.emit("tester.started", { text: "hello" }, { kind: "plugin", pluginId: "other" })).rejects.toThrow("cannot emit trigger");
+    await expect(registry.emit("tester.started", { eventId: "event-1" }, { kind: "plugin", pluginId: "tester" })).rejects.toThrow("missing required payload: text");
+    await expect(registry.emit("tester.started", { eventId: "event-1", text: "hello" }, { kind: "plugin", pluginId: "other" })).rejects.toThrow("cannot emit trigger");
   });
 });

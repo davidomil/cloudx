@@ -1,5 +1,5 @@
 import type { AutomationCatalogResponse, AutomationEdge, AutomationGraphDocument, AutomationNode, AutomationNodeCatalogEntry, AutomationPortDescriptor, AutomationValidationDiagnostic, AutomationValidationSummary } from "@cloudx/shared";
-import { automationEntryWithDynamicPorts, automationSafetyAllowed } from "@cloudx/shared";
+import { AUTOMATION_GRAPH_SCHEMA_VERSION, automationEntryWithDynamicPorts, automationGraphVersionError, automationSafetyAllowed } from "@cloudx/shared";
 
 import { AutomationTypeService } from "./AutomationTypeService.js";
 
@@ -8,8 +8,8 @@ export class AutomationCompiler {
 
   validate(graph: AutomationGraphDocument, catalog: AutomationCatalogResponse): AutomationValidationSummary {
     const diagnostics: AutomationValidationDiagnostic[] = [];
-    if (graph.schemaVersion !== 1) {
-      diagnostics.push(error("schema-version", "Automation graph schemaVersion must be 1."));
+    if (graph.schemaVersion !== AUTOMATION_GRAPH_SCHEMA_VERSION) {
+      diagnostics.push(error("schema-version", automationGraphVersionError(graph.schemaVersion)));
     }
     const catalogByType = new Map(catalog.nodes.map((entry) => [entry.typeId, entry]));
     const entryForNode = (node: AutomationNode): AutomationNodeCatalogEntry | undefined => {

@@ -101,15 +101,16 @@ export class JiraIntegrationService {
     return { siteUrl: normalizeSiteUrl(siteUrl), email, apiToken };
   }
 
-  client(): JiraClient {
-    return new JiraClient(this.credentials(), this.fetchImpl);
+  client(signal?: AbortSignal): JiraClient {
+    return new JiraClient(this.credentials(), this.fetchImpl, signal);
   }
 
-  async status(): Promise<Record<string, unknown>> {
+  async status(signal?: AbortSignal): Promise<Record<string, unknown>> {
+    signal?.throwIfAborted();
     if (!this.configured()) {
       return { configured: false, connected: false, authMode: "api-token-basic", apiTokenConfigured: false };
     }
-    const client = this.client();
+    const client = this.client(signal);
     const myself = await client.myself();
     const values = this.configValues();
     return {
@@ -126,8 +127,8 @@ export class JiraIntegrationService {
     };
   }
 
-  async dashboard(input: JiraDashboardInput = {}): Promise<JiraDashboardResponse> {
-    const client = this.client();
+  async dashboard(input: JiraDashboardInput = {}, signal?: AbortSignal): Promise<JiraDashboardResponse> {
+    const client = this.client(signal);
     const values = this.configValues();
     const filterJql = input.filterJql ?? stringConfig(values.dashboardFilterJql) ?? "resolution = EMPTY";
     const sortBy = input.sortBy ?? stringConfig(values.dashboardSort) ?? "priority_desc_updated_desc";
@@ -146,14 +147,14 @@ export class JiraIntegrationService {
     };
   }
 
-  async search(input: JiraIssueSearchInput = {}): Promise<Record<string, unknown>> {
-    const client = this.client();
+  async search(input: JiraIssueSearchInput = {}, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const client = this.client(signal);
     const page = await this.searchNormalizedPage(client, searchJql(input.jql, this.configValues()), numberConfig(input.maxResults) ?? 50, optionalString(input.nextPageToken));
     return searchResponse(client.normalizedSiteUrl, page.jql, page.issues, page.nextPageToken, page.isLast);
   }
 
-  async searchAll(input: JiraIssueSearchInput = {}): Promise<Record<string, unknown>> {
-    const client = this.client();
+  async searchAll(input: JiraIssueSearchInput = {}, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const client = this.client(signal);
     const jql = searchJql(input.jql, this.configValues());
     const maxResults = boundedPositiveInteger(input.maxResults, 100, 1000);
     const pageSize = boundedPositiveInteger(input.pageSize, Math.min(maxResults, 100), Math.min(maxResults, 100));
@@ -172,18 +173,18 @@ export class JiraIntegrationService {
     return searchResponse(client.normalizedSiteUrl, jql, issues, nextPageToken, isLast);
   }
 
-  async currentUser(): Promise<Record<string, unknown>> {
-    return { user: await this.client().myself() };
+  async currentUser(signal?: AbortSignal): Promise<Record<string, unknown>> {
+    return { user: await this.client(signal).myself() };
   }
 
-  async getIssue(issueIdOrKey: string): Promise<Record<string, unknown>> {
-    const client = this.client();
+  async getIssue(issueIdOrKey: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const client = this.client(signal);
     const issue = normalizeJiraIssue(await client.getIssue(issueIdOrKey, JIRA_ISSUE_FIELDS), client.normalizedSiteUrl);
     return issueResult(issue);
   }
 
-  async listComments(issueIdOrKey: string): Promise<Record<string, unknown>> {
-    const client = this.client();
+  async listComments(issueIdOrKey: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const client = this.client(signal);
     const issueKey = issueIdOrKey.trim();
     const comments = (await client.listComments(issueKey)).map((comment) => normalizeJiraComment(comment, client.normalizedSiteUrl, issueKey));
     const firstComment = comments[0];
@@ -196,14 +197,14 @@ export class JiraIntegrationService {
     };
   }
 
-  async addComment(issueIdOrKey: string, bodyText: string): Promise<Record<string, unknown>> {
-    const client = this.client();
+  async addComment(issueIdOrKey: string, bodyText: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const client = this.client(signal);
     const comment = normalizeJiraComment(await client.addComment(issueIdOrKey, adfFromPlainText(bodyText)), client.normalizedSiteUrl, issueIdOrKey);
     return { comment, commentId: comment.id, issueUrl: issueUrl(client.normalizedSiteUrl, issueIdOrKey), commentUrl: comment.url };
   }
 
-  async createIssue(input: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const client = this.client();
+  async createIssue(input: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const client = this.client(signal);
     const fields = issueFieldsFromInput(input);
     const issue = await client.createIssue(fields);
     const issueKey = stringValue(issue.key);
@@ -214,16 +215,16 @@ export class JiraIntegrationService {
     };
   }
 
-  async updateIssue(issueIdOrKey: string, input: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const client = this.client();
+  async updateIssue(issueIdOrKey: string, input: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const client = this.client(signal);
     const fields = issueUpdateFieldsFromInput(input);
     const update = isRecord(input.update) ? input.update : undefined;
     const result = await client.updateIssue(issueIdOrKey, compactRecord({ fields, update }));
     return { ...result, issueUrl: issueUrl(client.normalizedSiteUrl, issueIdOrKey) };
   }
 
-  async listTransitions(issueIdOrKey: string, input: { expandFields?: boolean } = {}): Promise<Record<string, unknown>> {
-    const transitions = await this.client().listTransitions(issueIdOrKey, { expandFields: input.expandFields !== false });
+  async listTransitions(issueIdOrKey: string, input: { expandFields?: boolean } = {}, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const transitions = await this.client(signal).listTransitions(issueIdOrKey, { expandFields: input.expandFields !== false });
     const firstTransition = transitions[0];
     return {
       transitions,
@@ -234,8 +235,8 @@ export class JiraIntegrationService {
     };
   }
 
-  async transitionIssue(issueIdOrKey: string, input: JiraTransitionInput): Promise<Record<string, unknown>> {
-    const client = this.client();
+  async transitionIssue(issueIdOrKey: string, input: JiraTransitionInput, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const client = this.client(signal);
     const transitions = await client.listTransitions(issueIdOrKey, { expandFields: true });
     const transition = resolveTransition(transitions, input);
     const transitionId = requireString(transition.id, "transition.id");
@@ -257,8 +258,8 @@ export class JiraIntegrationService {
     };
   }
 
-  async linkIssues(input: { inwardIssueKey: string; outwardIssueKey: string; typeName: string; comment?: string }): Promise<Record<string, unknown>> {
-    const client = this.client();
+  async linkIssues(input: { inwardIssueKey: string; outwardIssueKey: string; typeName: string; comment?: string }, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const client = this.client(signal);
     const result = await client.linkIssues({
       inwardIssueKey: input.inwardIssueKey,
       outwardIssueKey: input.outwardIssueKey,
@@ -272,8 +273,8 @@ export class JiraIntegrationService {
     };
   }
 
-  async metadata(): Promise<Record<string, unknown>> {
-    const client = this.client();
+  async metadata(signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const client = this.client(signal);
     const [fields, projects, priorities, issueTypes, issueLinkTypes] = await Promise.all([client.fields(), client.projects(), client.priorities(), client.issueTypes(), client.issueLinkTypes()]);
     return {
       fields,
@@ -289,32 +290,33 @@ export class JiraIntegrationService {
     };
   }
 
-  async projects(): Promise<Record<string, unknown>> {
-    const projects = await this.client().projects();
+  async projects(signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const projects = await this.client(signal).projects();
     return { projects, projectCount: projects.length, firstProjectKey: firstStringValue(projects, "key"), firstProjectName: firstStringValue(projects, "name") };
   }
 
-  async issueTypes(): Promise<Record<string, unknown>> {
-    const issueTypes = await this.client().issueTypes();
+  async issueTypes(signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const issueTypes = await this.client(signal).issueTypes();
     return { issueTypes, issueTypeCount: issueTypes.length, firstIssueTypeId: firstStringValue(issueTypes, "id"), firstIssueTypeName: firstStringValue(issueTypes, "name") };
   }
 
-  async fields(): Promise<Record<string, unknown>> {
-    const fields = await this.client().fields();
+  async fields(signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const fields = await this.client(signal).fields();
     return { fields, fieldCount: fields.length, firstFieldId: firstStringValue(fields, "id"), firstFieldName: firstStringValue(fields, "name") };
   }
 
-  async priorities(): Promise<Record<string, unknown>> {
-    const priorities = await this.client().priorities();
+  async priorities(signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const priorities = await this.client(signal).priorities();
     return { priorities, priorityCount: priorities.length, firstPriorityId: firstStringValue(priorities, "id"), firstPriorityName: firstStringValue(priorities, "name") };
   }
 
-  async issueLinkTypes(): Promise<Record<string, unknown>> {
-    const issueLinkTypes = await this.client().issueLinkTypes();
+  async issueLinkTypes(signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const issueLinkTypes = await this.client(signal).issueLinkTypes();
     return { issueLinkTypes, issueLinkTypeCount: issueLinkTypes.length, firstIssueLinkTypeId: firstStringValue(issueLinkTypes, "id"), firstIssueLinkTypeName: firstStringValue(issueLinkTypes, "name") };
   }
 
-  issueUrl(issueKey: string, commentId?: string): Record<string, unknown> {
+  issueUrl(issueKey: string, commentId?: string, signal?: AbortSignal): Record<string, unknown> {
+    signal?.throwIfAborted();
     const siteUrl = this.credentials().siteUrl;
     const url = commentId ? commentUrl(siteUrl, issueKey, commentId) : issueUrl(siteUrl, issueKey);
     return { issueKey, commentId, url };
@@ -339,14 +341,14 @@ export class JiraIntegrationService {
     };
   }
 
-  async pollingIssues(): Promise<JiraIssueSummary[]> {
-    const client = this.client();
+  async pollingIssues(signal?: AbortSignal): Promise<JiraIssueSummary[]> {
+    const client = this.client(signal);
     const config = this.pollingConfig();
     return this.searchNormalized(client, config.jql, config.maxIssues);
   }
 
-  async pollingAccount(): Promise<JiraPollingAccount> {
-    const user = await this.client().myself();
+  async pollingAccount(signal?: AbortSignal): Promise<JiraPollingAccount> {
+    const user = await this.client(signal).myself();
     return {
       accountId: stringValue(user.accountId),
       displayName: stringValue(user.displayName),
@@ -355,8 +357,8 @@ export class JiraIntegrationService {
     };
   }
 
-  async pollingComments(issueKey: string): Promise<JiraCommentSummary[]> {
-    const client = this.client();
+  async pollingComments(issueKey: string, signal?: AbortSignal): Promise<JiraCommentSummary[]> {
+    const client = this.client(signal);
     return (await client.listComments(issueKey)).map((comment) => normalizeJiraComment(comment, client.normalizedSiteUrl, issueKey));
   }
 

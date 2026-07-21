@@ -11,6 +11,7 @@ import { AUTOMATION_FSTRING_TYPE_ID, automationEntryWithDynamicPorts, automation
 import { buildToolEnv, resolveAssistantCommand } from "../terminal/ShellLaunch.js";
 
 export interface AutomationExecutorOptions {
+  runId?: string;
   activeTabId?: string;
   maxSteps?: number;
   maxDurationMs?: number;
@@ -82,7 +83,7 @@ export class AutomationCancelledError extends Error {
 export class AutomationExecutor {
   async execute(group: AutomationGroup, event: TriggerEvent, catalog: AutomationCatalogResponse, hooks: HookRegistry, options: AutomationExecutorOptions = {}): Promise<AutomationRunSummary> {
     const run: AutomationRunSummary = {
-      id: randomUUID(),
+      id: options.runId ?? randomUUID(),
       groupId: group.id,
       triggerEventId: event.id,
       status: "running",

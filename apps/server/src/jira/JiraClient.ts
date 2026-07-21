@@ -58,7 +58,8 @@ export class JiraClient {
 
   constructor(
     credentials: JiraCredentials,
-    private readonly fetchImpl: FetchLike = fetch
+    private readonly fetchImpl: FetchLike = fetch,
+    private readonly signal?: AbortSignal
   ) {
     this.siteUrl = normalizeSiteUrl(credentials.siteUrl);
     this.authorization = `Basic ${Buffer.from(`${credentials.email}:${credentials.apiToken}`, "utf8").toString("base64")}`;
@@ -185,6 +186,7 @@ export class JiraClient {
         authorization: this.authorization,
         ...(body ? { "content-type": "application/json" } : {})
       },
+      ...(this.signal ? { signal: this.signal } : {}),
       ...(body ? { body: JSON.stringify(body) } : {})
     });
     if (response.status === 401 || response.status === 403) {

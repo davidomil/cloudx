@@ -73,7 +73,7 @@ function group(id: string, enabled: boolean, typeId: string): AutomationGroup {
     createdAt: new Date(0).toISOString(),
     updatedAt: new Date(0).toISOString(),
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [{ id: `${id}-trigger`, typeId, position: { x: 0, y: 0 } }],
       edges: []
     }

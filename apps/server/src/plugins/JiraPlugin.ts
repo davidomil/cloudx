@@ -44,55 +44,55 @@ export class JiraPlugin implements WorkspacePlugin {
     private readonly pollingProvider: () => JiraPollingService | undefined
   ) {
     this.hooks = [
-      readHook("jira.connection.status", "Jira Connection Status", "Return Jira configuration status and authenticated user details.", () => this.serviceProvider().status()),
-      readHook("jira.dashboard.list", "List Jira Dashboard Issues", "Return the assigned-ticket Jira dashboard grouped for the Jira panel.", (input) => this.serviceProvider().dashboard({
+      readHook("jira.connection.status", "Jira Connection Status", "Return Jira configuration status and authenticated user details.", (_input, context) => this.serviceProvider().status(context.signal)),
+      readHook("jira.dashboard.list", "List Jira Dashboard Issues", "Return the assigned-ticket Jira dashboard grouped for the Jira panel.", (input, context) => this.serviceProvider().dashboard({
         filterJql: optionalString(input.filterJql),
         sortBy: optionalString(input.sortBy),
         groupBy: optionalString(input.groupBy),
         maxResults: optionalNumber(input.maxResults)
-      }), {
+      }, context.signal), {
         filterJql: { type: "string" },
         sortBy: { type: "string", enum: ["priority_desc_updated_desc", "updated_desc", "created_desc", "status_priority", "custom_jql_order"] },
         groupBy: { type: "string", enum: ["epic", "status", "priority", "project", "none"] },
         maxResults: { type: "number", minimum: 1 }
       }),
-      readHook("jira.currentUser.get", "Get Jira Current User", "Return the authenticated Jira user.", () => this.serviceProvider().currentUser(), {}, ["automation"], jiraCurrentUserOutputSchema()),
-      readHook("jira.projects.list", "List Jira Projects", "Return Jira projects visible to the authenticated account.", () => this.serviceProvider().projects(), {}, ["automation"], jiraProjectsOutputSchema()),
-      readHook("jira.issueTypes.list", "List Jira Issue Types", "Return Jira issue types visible to the authenticated account.", () => this.serviceProvider().issueTypes(), {}, ["automation"], jiraIssueTypesOutputSchema()),
-      readHook("jira.fields.list", "List Jira Fields", "Return Jira system and custom issue fields.", () => this.serviceProvider().fields(), {}, ["automation"], jiraFieldsOutputSchema()),
-      readHook("jira.priorities.list", "List Jira Priorities", "Return Jira issue priorities.", () => this.serviceProvider().priorities(), {}, ["automation"], jiraPrioritiesOutputSchema()),
-      readHook("jira.issueLinkTypes.list", "List Jira Issue Link Types", "Return Jira issue link types.", () => this.serviceProvider().issueLinkTypes(), {}, ["automation"], jiraIssueLinkTypesOutputSchema()),
-      readHook("jira.issues.search", "Search Jira Issues", "Search Jira issues with JQL and return normalized issue summaries.", (input) => this.serviceProvider().search({
+      readHook("jira.currentUser.get", "Get Jira Current User", "Return the authenticated Jira user.", (_input, context) => this.serviceProvider().currentUser(context.signal), {}, ["automation"], jiraCurrentUserOutputSchema()),
+      readHook("jira.projects.list", "List Jira Projects", "Return Jira projects visible to the authenticated account.", (_input, context) => this.serviceProvider().projects(context.signal), {}, ["automation"], jiraProjectsOutputSchema()),
+      readHook("jira.issueTypes.list", "List Jira Issue Types", "Return Jira issue types visible to the authenticated account.", (_input, context) => this.serviceProvider().issueTypes(context.signal), {}, ["automation"], jiraIssueTypesOutputSchema()),
+      readHook("jira.fields.list", "List Jira Fields", "Return Jira system and custom issue fields.", (_input, context) => this.serviceProvider().fields(context.signal), {}, ["automation"], jiraFieldsOutputSchema()),
+      readHook("jira.priorities.list", "List Jira Priorities", "Return Jira issue priorities.", (_input, context) => this.serviceProvider().priorities(context.signal), {}, ["automation"], jiraPrioritiesOutputSchema()),
+      readHook("jira.issueLinkTypes.list", "List Jira Issue Link Types", "Return Jira issue link types.", (_input, context) => this.serviceProvider().issueLinkTypes(context.signal), {}, ["automation"], jiraIssueLinkTypesOutputSchema()),
+      readHook("jira.issues.search", "Search Jira Issues", "Search Jira issues with JQL and return normalized issue summaries.", (input, context) => this.serviceProvider().search({
         jql: optionalString(input.jql),
         maxResults: optionalNumber(input.maxResults),
         nextPageToken: optionalString(input.nextPageToken)
-      }), {
+      }, context.signal), {
         jql: { type: "string", description: "JQL query to execute." },
         maxResults: { type: "number", description: "Maximum issues to return for this page.", default: 50 },
         nextPageToken: { type: "string", description: "Token returned by the previous search page." }
       }, ["automation"], jiraSearchOutputSchema()),
-      readHook("jira.issues.searchAll", "Search All Jira Issues", "Search Jira issues with JQL and return every page up to a bounded maximum.", (input) => this.serviceProvider().searchAll({
+      readHook("jira.issues.searchAll", "Search All Jira Issues", "Search Jira issues with JQL and return every page up to a bounded maximum.", (input, context) => this.serviceProvider().searchAll({
         jql: optionalString(input.jql),
         maxResults: optionalNumber(input.maxResults),
         pageSize: optionalNumber(input.pageSize),
         nextPageToken: optionalString(input.nextPageToken)
-      }), {
+      }, context.signal), {
         jql: { type: "string", description: "JQL query to execute." },
         maxResults: { type: "number", description: "Maximum total issues to return.", default: 100 },
         pageSize: { type: "number", description: "Issues requested from Jira per page.", default: 100 },
         nextPageToken: { type: "string", description: "Optional token to resume a previous bounded scan." }
       }, ["automation"], jiraSearchOutputSchema()),
-      readHook("jira.issue.get", "Get Jira Issue", "Fetch one Jira issue and return a normalized issue summary.", (input) => this.serviceProvider().getIssue(requiredString(input.issueIdOrKey, "issueIdOrKey")), {
+      readHook("jira.issue.get", "Get Jira Issue", "Fetch one Jira issue and return a normalized issue summary.", (input, context) => this.serviceProvider().getIssue(requiredString(input.issueIdOrKey, "issueIdOrKey"), context.signal), {
         issueIdOrKey: { type: "string" }
       }, ["automation"], jiraIssueOutputSchema()),
-      readHook("jira.issue.comments.list", "List Jira Comments", "List normalized comments for a Jira issue.", (input) => this.serviceProvider().listComments(requiredString(input.issueIdOrKey, "issueIdOrKey")), {
+      readHook("jira.issue.comments.list", "List Jira Comments", "List normalized comments for a Jira issue.", (input, context) => this.serviceProvider().listComments(requiredString(input.issueIdOrKey, "issueIdOrKey"), context.signal), {
         issueIdOrKey: { type: "string" }
       }, ["automation"], jiraCommentsOutputSchema()),
-      writeHook("jira.issue.comment.add", "Add Jira Comment", "Add a plain-text comment to a Jira issue.", (input) => this.serviceProvider().addComment(requiredString(input.issueIdOrKey, "issueIdOrKey"), requiredString(input.body, "body")), {
+      writeHook("jira.issue.comment.add", "Add Jira Comment", "Add a plain-text comment to a Jira issue.", (input, context) => this.serviceProvider().addComment(requiredString(input.issueIdOrKey, "issueIdOrKey"), requiredString(input.body, "body"), context.signal), {
         issueIdOrKey: { type: "string" },
         body: { type: "string" }
       }, "external", ["issueIdOrKey", "body"], jiraCommentAddOutputSchema()),
-      writeHook("jira.issue.create", "Create Jira Issue", "Create a Jira issue, ticket, task, bug, story, or Epic child.", (input) => this.serviceProvider().createIssue(input), {
+      writeHook("jira.issue.create", "Create Jira Issue", "Create a Jira issue, ticket, task, bug, story, or Epic child.", (input, context) => this.serviceProvider().createIssue(input, context.signal), {
         projectKey: { type: "string" },
         issueType: { type: "string", default: "Task" },
         summary: { type: "string" },
@@ -104,7 +104,7 @@ export class JiraPlugin implements WorkspacePlugin {
         labels: { type: "array", items: { type: "string" } },
         customFields: { type: "object", additionalProperties: true }
       }, "external", ["projectKey", "issueType", "summary"], jiraCreateIssueOutputSchema()),
-      writeHook("jira.issue.update", "Update Jira Issue", "Update Jira issue fields using Jira REST field payloads.", (input) => this.serviceProvider().updateIssue(requiredString(input.issueIdOrKey, "issueIdOrKey"), input), {
+      writeHook("jira.issue.update", "Update Jira Issue", "Update Jira issue fields using Jira REST field payloads.", (input, context) => this.serviceProvider().updateIssue(requiredString(input.issueIdOrKey, "issueIdOrKey"), input, context.signal), {
         issueIdOrKey: { type: "string" },
         summary: { type: "string" },
         description: { type: "string" },
@@ -115,20 +115,20 @@ export class JiraPlugin implements WorkspacePlugin {
         fields: { type: "object", additionalProperties: true },
         update: { type: "object", additionalProperties: true }
       }, "external", ["issueIdOrKey"], jiraUpdateIssueOutputSchema()),
-      readHook("jira.issue.transitions.list", "List Jira Transitions", "List valid workflow transitions and transition-screen fields for a Jira issue.", (input) => this.serviceProvider().listTransitions(requiredString(input.issueIdOrKey, "issueIdOrKey"), {
+      readHook("jira.issue.transitions.list", "List Jira Transitions", "List valid workflow transitions and transition-screen fields for a Jira issue.", (input, context) => this.serviceProvider().listTransitions(requiredString(input.issueIdOrKey, "issueIdOrKey"), {
         expandFields: input.expandFields !== false
-      }), {
+      }, context.signal), {
         issueIdOrKey: { type: "string" },
         expandFields: { type: "boolean", default: true, description: "Include transition-screen fields using Jira's transitions.fields expansion." }
       }, ["automation"], jiraTransitionsOutputSchema()),
-      writeHook("jira.issue.transition", "Transition Jira Issue", "Move a Jira issue through a workflow transition by ID, transition name, or target status.", (input) => this.serviceProvider().transitionIssue(requiredString(input.issueIdOrKey, "issueIdOrKey"), {
+      writeHook("jira.issue.transition", "Transition Jira Issue", "Move a Jira issue through a workflow transition by ID, transition name, or target status.", (input, context) => this.serviceProvider().transitionIssue(requiredString(input.issueIdOrKey, "issueIdOrKey"), {
         transitionId: optionalString(input.transitionId),
         transitionName: optionalString(input.transitionName),
         targetStatus: optionalString(input.targetStatus),
         comment: optionalString(input.comment),
         fields: isRecord(input.fields) ? input.fields : undefined,
         update: isRecord(input.update) ? input.update : undefined
-      }), {
+      }, context.signal), {
         issueIdOrKey: { type: "string" },
         transitionId: { type: "string", description: "Exact Jira transition ID. Optional when transitionName or targetStatus is provided." },
         transitionName: { type: "string", description: "Exact Jira transition name, matched case-insensitively." },
@@ -137,29 +137,34 @@ export class JiraPlugin implements WorkspacePlugin {
         fields: { type: "object", additionalProperties: true },
         update: { type: "object", additionalProperties: true }
       }, "external", ["issueIdOrKey"], jiraTransitionOutputSchema()),
-      writeHook("jira.issue.link", "Link Jira Issues", "Create a relationship between two Jira issues.", (input) => this.serviceProvider().linkIssues({
+      writeHook("jira.issue.link", "Link Jira Issues", "Create a relationship between two Jira issues.", (input, context) => this.serviceProvider().linkIssues({
         inwardIssueKey: requiredString(input.inwardIssueKey, "inwardIssueKey"),
         outwardIssueKey: requiredString(input.outwardIssueKey, "outwardIssueKey"),
         typeName: requiredString(input.typeName, "typeName"),
         comment: optionalString(input.comment)
-      }), {
+      }, context.signal), {
         inwardIssueKey: { type: "string" },
         outwardIssueKey: { type: "string" },
         typeName: { type: "string", default: "Relates" },
         comment: { type: "string" }
       }, "external", ["inwardIssueKey", "outwardIssueKey", "typeName"], jiraIssueLinkOutputSchema()),
-      readHook("jira.metadata.get", "Get Jira Metadata", "Return Jira fields, projects, and priorities for issue creation and updates.", () => this.serviceProvider().metadata(), {}, ["automation"], jiraMetadataOutputSchema()),
-      readHook("jira.issue.url", "Jira Issue URL", "Generate a browser URL for a Jira issue key or issue comment.", (input) => this.serviceProvider().issueUrl(requiredString(input.issueKey, "issueKey"), optionalString(input.commentId)), {
+      readHook("jira.metadata.get", "Get Jira Metadata", "Return Jira fields, projects, and priorities for issue creation and updates.", (_input, context) => this.serviceProvider().metadata(context.signal), {}, ["automation"], jiraMetadataOutputSchema()),
+      readHook("jira.issue.url", "Jira Issue URL", "Generate a browser URL for a Jira issue key or issue comment.", (input, context) => this.serviceProvider().issueUrl(requiredString(input.issueKey, "issueKey"), optionalString(input.commentId), context.signal), {
         issueKey: { type: "string" },
         commentId: { type: "string" }
       }, ["automation"], jiraIssueUrlOutputSchema()),
-      writeHook("jira.poll.run", "Run Jira Poll", "Run Jira polling once and emit automation triggers for detected changes.", async () => {
-        const polling = this.pollingProvider();
-        if (!polling) {
-          throw new Error("Jira polling service is not available.");
-        }
-        return polling.runOnce();
-      }, {}, "external", [], jiraPollOutputSchema())
+      writeHook("jira.poll.run", "Run Jira Poll", "Run Jira polling once and emit automation triggers for detected changes.", async (_input, context) => {
+        return this.polling().runOnce(context.signal);
+      }, {}, "external", [], jiraPollOutputSchema()),
+      readHook("jira.pollingOutbox.inspect", "Inspect Jira Polling Outbox", "Return bounded metadata for Jira polling outbox items without exposing trigger payloads.", async (_input, context) => ({
+        events: await this.polling().inspectOutbox(context.signal)
+      }), {}, ["automation"], jiraPollingOutboxListSchema()),
+      writeHook("jira.pollingOutbox.retry", "Retry Failed Jira Polling Event", "Move one failed Jira polling outbox item back to prepared without dispatching it.", async (input, context) => ({ ...await this.polling().retryFailedOutbox(requiredString(input.idempotencyKey, "idempotencyKey"), context.signal) }), {
+        idempotencyKey: { type: "string", description: "Exact stable identity of the failed outbox item." }
+      }, "external", ["idempotencyKey"], jiraPollingOutboxEventSchema()),
+      writeHook("jira.pollingOutbox.discard", "Discard Failed Jira Polling Event", "Remove one failed Jira polling outbox item after explicit operator review.", async (input, context) => ({ ...await this.polling().discardFailedOutbox(requiredString(input.idempotencyKey, "idempotencyKey"), context.signal) }), {
+        idempotencyKey: { type: "string", description: "Exact stable identity of the failed outbox item." }
+      }, "external", ["idempotencyKey"], jiraPollingOutboxEventSchema())
     ];
   }
 
@@ -182,6 +187,14 @@ export class JiraPlugin implements WorkspacePlugin {
 
   createSession(input: CreatePluginSessionInput): PluginSession {
     return new JiraSession(input.tab);
+  }
+
+  private polling(): JiraPollingService {
+    const polling = this.pollingProvider();
+    if (!polling) {
+      throw new Error("Jira polling service is not available.");
+    }
+    return polling;
   }
 }
 
@@ -523,6 +536,33 @@ function jiraIssueUrlOutputSchema(): Record<string, unknown> {
     },
     required: ["issueKey", "url"],
     additionalProperties: true
+  };
+}
+
+function jiraPollingOutboxEventSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      idempotencyKey: { type: "string" },
+      triggerId: { type: "string" },
+      status: { type: "string", enum: ["prepared", "dispatching", "failed"] },
+      preparedAt: { type: "string" },
+      dispatchStartedAt: { type: "string" },
+      lastError: { type: "string" }
+    },
+    required: ["idempotencyKey", "triggerId", "status", "preparedAt"],
+    additionalProperties: false
+  };
+}
+
+function jiraPollingOutboxListSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      events: { type: "array", items: jiraPollingOutboxEventSchema() }
+    },
+    required: ["events"],
+    additionalProperties: false
   };
 }
 

@@ -4,7 +4,7 @@ import path from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
 
-import type { AutomationGroup, WorkspaceUiInstruction } from "@cloudx/shared";
+import type { AutomationGroup, AutomationRunSummary, WorkspaceUiInstruction } from "@cloudx/shared";
 
 import { HookRegistry } from "../hooks/HookRegistry.js";
 import { TriggerRegistry } from "../triggers/TriggerRegistry.js";
@@ -16,6 +16,39 @@ import { AutomationService } from "./AutomationService.js";
 import { AutomationTypeService } from "./AutomationTypeService.js";
 
 describe("AutomationService", () => {
+  it("does not report ready until interrupted-run recovery settles", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-ready-"));
+    const repository = new AutomationRepository(dataDir);
+    let release: ((runs: []) => void) | undefined;
+    vi.spyOn(repository, "listRuns").mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        })
+    );
+    const triggers = new TriggerRegistry({ recordEvent: (event) => repository.appendTriggerEvent(event) });
+    const hooks = new HookRegistry();
+    const types = new AutomationTypeService();
+    const service = new AutomationService(
+      repository,
+      triggers,
+      hooks,
+      new AutomationCatalogService(types, () => triggers.list(), () => hooks.list()),
+      new AutomationCompiler(types),
+      new AutomationExecutor()
+    );
+    let settled = false;
+    const readiness = service.ready().then(() => {
+      settled = true;
+    });
+
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    release?.([]);
+    await readiness;
+    expect(settled).toBe(true);
+  });
+
   it("fans one trigger out to enabled groups and skips disabled groups", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-service-"));
     const repository = new AutomationRepository(dataDir);
@@ -71,6 +104,128 @@ describe("AutomationService", () => {
     expect(runs).toHaveLength(2);
     expect(runs.map((run) => run.groupId).sort()).toEqual(["enabled-a", "enabled-b"]);
     expect(runs.every((run) => run.status === "succeeded")).toBe(true);
+  });
+
+  it("claims deterministic plugin events before acknowledging duplicate delivery", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-service-idempotent-"));
+    const repository = new AutomationRepository(dataDir);
+    const triggers = new TriggerRegistry({ recordEvent: (event) => repository.appendTriggerEvent(event) });
+    triggers.register({
+      id: "jira.issueUpdated",
+      owner: { kind: "plugin", pluginId: "jira" },
+      title: "Jira Issue Updated",
+      description: "Test Jira update.",
+      exposures: ["plugin"],
+      payloadSchema: {
+        type: "object",
+        properties: { eventId: { type: "string" } },
+        required: ["eventId"],
+        additionalProperties: false
+      }
+    });
+    let externalWrites = 0;
+    const hooks = new HookRegistry();
+    hooks.register({
+      id: "fake.externalWrite",
+      owner: { kind: "app" },
+      title: "External Write",
+      description: "Record one external write.",
+      exposures: ["automation"],
+      automationSafety: "external",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      outputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute: () => {
+        externalWrites += 1;
+        return {};
+      }
+    });
+    const typeService = new AutomationTypeService();
+    const service = new AutomationService(
+      repository,
+      triggers,
+      hooks,
+      new AutomationCatalogService(typeService, () => triggers.list(), () => hooks.list()),
+      new AutomationCompiler(typeService),
+      new AutomationExecutor()
+    );
+    const now = new Date(0).toISOString();
+    await service.saveGroup({
+      id: "jira-idempotent",
+      name: "Jira idempotent",
+      enabled: true,
+      createdAt: now,
+      updatedAt: now,
+      graph: {
+        schemaVersion: 2,
+        nodes: [
+          { id: "trigger", typeId: "trigger:jira.issueUpdated", position: { x: 0, y: 0 } },
+          { id: "write", typeId: "hook:fake.externalWrite", position: { x: 200, y: 0 } }
+        ],
+        edges: [
+          { id: "exec", kind: "exec", sourceNodeId: "trigger", sourcePortId: "exec", targetNodeId: "write", targetPortId: "exec" }
+        ],
+        allowedSafety: ["external"]
+      }
+    });
+
+    const payload = { eventId: "jira:site:jira.issueUpdated:ENG-1:updated-1" };
+    await triggers.emit("jira.issueUpdated", payload, { kind: "plugin", pluginId: "jira" });
+    await triggers.emit("jira.issueUpdated", payload, { kind: "plugin", pluginId: "jira" });
+    const runs = await waitForRuns(repository, 2);
+
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({
+      groupId: "jira-idempotent",
+      triggerEventId: "plugin:jira:jira.issueUpdated:jira:site:jira.issueUpdated:ENG-1:updated-1"
+    });
+    expect(externalWrites).toBe(1);
+  });
+
+  it("rejects plugin events without a stable eventId before recording or claiming", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-service-plugin-identity-"));
+    const repository = new AutomationRepository(dataDir);
+    const triggers = new TriggerRegistry({ recordEvent: (event) => repository.appendTriggerEvent(event) });
+    triggers.register({
+      id: "plugin.started",
+      owner: { kind: "plugin", pluginId: "fake-plugin" },
+      title: "Plugin Started",
+      description: "Test plugin event identity.",
+      exposures: ["plugin"],
+      payloadSchema: {
+        type: "object",
+        properties: { eventId: { type: "string" } },
+        additionalProperties: false
+      }
+    });
+    const hooks = new HookRegistry();
+    hooks.register({
+      id: "fake.record",
+      owner: { kind: "app" },
+      title: "Record",
+      description: "Record text.",
+      exposures: ["automation"],
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      outputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute: () => ({})
+    });
+    const typeService = new AutomationTypeService();
+    const service = new AutomationService(
+      repository,
+      triggers,
+      hooks,
+      new AutomationCatalogService(typeService, () => triggers.list(), () => hooks.list()),
+      new AutomationCompiler(typeService),
+      new AutomationExecutor()
+    );
+    await service.saveGroup(pluginGroup("plugin-identity", "plugin.started"));
+
+    await expect(triggers.emit("plugin.started", {}, { kind: "plugin", pluginId: "fake-plugin" })).rejects.toThrow(
+      "requires a stable non-empty payload.eventId"
+    );
+
+    const store = JSON.parse(await fs.readFile(path.join(dataDir, "automation.json"), "utf8")) as { triggerEvents: unknown[]; runs: unknown[] };
+    expect(store.triggerEvents).toEqual([]);
+    expect(store.runs).toEqual([]);
   });
 
   it("deletes saved automation groups through the service", async () => {
@@ -476,47 +631,353 @@ describe("AutomationService", () => {
     await expect(repository.listRuns()).resolves.toEqual([]);
   });
 
-  it("reports background trigger queue failures without breaking later trigger processing", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    try {
-      const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-service-queue-failure-"));
-      const repository = new AutomationRepository(dataDir);
-      const triggers = new TriggerRegistry({ recordEvent: (event) => repository.appendTriggerEvent(event) });
-      triggers.register(triggerDefinition());
-      const hooks = new HookRegistry();
-      hooks.register({
-        id: "fake.record",
-        owner: { kind: "app" },
-        title: "Record",
-        description: "Record text.",
-        exposures: ["automation"],
-        inputSchema: { type: "object", properties: {}, additionalProperties: false },
-        outputSchema: { type: "object", properties: {}, additionalProperties: false },
-        execute: () => ({})
-      });
-      const typeService = new AutomationTypeService();
-      const service = new AutomationService(
-        repository,
-        triggers,
-        hooks,
-        new AutomationCatalogService(typeService, () => triggers.list(), () => hooks.list()),
-        new AutomationCompiler(typeService),
-        new AutomationExecutor()
-      );
-      await service.saveGroup(group("enabled", true));
-      const listGroups = vi.spyOn(repository, "listGroups").mockRejectedValueOnce(new Error("store unavailable"));
+  it("aborts and awaits active automation work during disposal", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-service-dispose-active-"));
+    const repository = new AutomationRepository(dataDir);
+    const triggers = new TriggerRegistry({ recordEvent: (event) => repository.appendTriggerEvent(event) });
+    triggers.register(triggerDefinition());
+    const hooks = new HookRegistry();
+    const waitStarted = deferred<void>();
+    const abortObserved = deferred<void>();
+    const releaseCleanup = deferred<void>();
+    hooks.register({
+      id: "fake.wait",
+      owner: { kind: "app" },
+      title: "Wait",
+      description: "Wait until server shutdown.",
+      exposures: ["automation"],
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      outputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute: (_input, context) => {
+        waitStarted.resolve();
+        return new Promise<Record<string, unknown>>((_resolve, reject) => {
+          context.signal?.addEventListener("abort", () => {
+            abortObserved.resolve();
+            void releaseCleanup.promise.then(() => reject(new Error("hook stopped")));
+          }, { once: true });
+        });
+      }
+    });
+    hooks.register({
+      id: "fake.record",
+      owner: { kind: "app" },
+      title: "Record",
+      description: "Record text.",
+      exposures: ["automation"],
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      outputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute: () => ({})
+    });
+    const typeService = new AutomationTypeService();
+    const service = new AutomationService(
+      repository,
+      triggers,
+      hooks,
+      new AutomationCatalogService(typeService, () => triggers.list(), () => hooks.list()),
+      new AutomationCompiler(typeService),
+      new AutomationExecutor()
+    );
+    await service.saveGroup(cancelGroup());
+    const run = service.startTest("cancel", {});
+    await waitStarted.promise;
 
-      await triggers.emit("fake.started", {}, { kind: "test" });
-      await waitUntil(() => warn.mock.calls.some(([message]) => String(message).includes("queue failed")));
-      listGroups.mockRestore();
-      await triggers.emit("fake.started", {}, { kind: "test" });
-      const runs = await waitForRuns(repository, 1, (items) => items.every((run) => run.status === "succeeded"));
+    let disposalSettled = false;
+    const disposal = Promise.resolve(service.dispose()).then(() => {
+      disposalSettled = true;
+    });
+    await abortObserved.promise;
+    await flushPromises();
 
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining("Automation trigger fake.started queue failed."), expect.any(Error));
-      expect(runs).toHaveLength(1);
-    } finally {
-      warn.mockRestore();
-    }
+    expect(disposalSettled).toBe(false);
+
+    releaseCleanup.resolve();
+    await disposal;
+    await expect(run).resolves.toMatchObject({ sample: { status: "cancelled" } });
+  });
+
+  it("cancels durable same-trigger claims waiting behind an active run during disposal", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-service-dispose-queued-"));
+    const repository = new AutomationRepository(dataDir);
+    const triggers = new TriggerRegistry({ recordEvent: (event) => repository.appendTriggerEvent(event) });
+    triggers.register(triggerDefinition());
+    const hooks = new HookRegistry();
+    const waitStarted = deferred<void>();
+    const abortObserved = deferred<void>();
+    const releaseCleanup = deferred<void>();
+    let waitExecutions = 0;
+    let neverStartedExecutions = 0;
+    hooks.register({
+      id: "fake.wait",
+      owner: { kind: "app" },
+      title: "Wait",
+      description: "Wait until server shutdown.",
+      exposures: ["automation"],
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      outputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute: (_input, context) => {
+        waitExecutions += 1;
+        waitStarted.resolve();
+        return new Promise<Record<string, unknown>>((_resolve, reject) => {
+          context.signal?.addEventListener("abort", () => {
+            abortObserved.resolve();
+            void releaseCleanup.promise.then(() => reject(new Error("hook stopped")));
+          }, { once: true });
+        });
+      }
+    });
+    hooks.register({
+      id: "fake.neverStarted",
+      owner: { kind: "app" },
+      title: "Never started",
+      description: "Must not execute after disposal closes admission.",
+      exposures: ["automation"],
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      outputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute: () => {
+        neverStartedExecutions += 1;
+        return {};
+      }
+    });
+    const typeService = new AutomationTypeService();
+    const service = new AutomationService(
+      repository,
+      triggers,
+      hooks,
+      new AutomationCatalogService(typeService, () => triggers.list(), () => hooks.list()),
+      new AutomationCompiler(typeService),
+      new AutomationExecutor()
+    );
+    await service.saveGroup(singleHookGroup("active", "fake.wait"));
+    await service.saveGroup(singleHookGroup("remaining", "fake.neverStarted"));
+
+    await triggers.emit("fake.started", {}, { kind: "test" });
+    await waitStarted.promise;
+    await triggers.emit("fake.started", {}, { kind: "test" });
+    await waitForRuns(repository, 4);
+
+    let disposalSettled = false;
+    const disposal = service.dispose().then(() => {
+      disposalSettled = true;
+    });
+    await abortObserved.promise;
+    await flushPromises();
+
+    expect(disposalSettled).toBe(false);
+    expect(waitExecutions).toBe(1);
+    expect(neverStartedExecutions).toBe(0);
+
+    releaseCleanup.resolve();
+    await disposal;
+
+    const runs = await repository.listRuns();
+    expect(runs).toHaveLength(4);
+    expect(runs.every((run) => run.status === "cancelled")).toBe(true);
+    expect(runs.every((run) => run.error === "Automation service was stopped.")).toBe(true);
+    expect(runs.filter((run) => run.groupId === "active")).toHaveLength(2);
+    expect(runs.filter((run) => run.groupId === "remaining")).toHaveLength(2);
+    expect(waitExecutions).toBe(1);
+    expect(neverStartedExecutions).toBe(0);
+  });
+
+  it("awaits trigger admission and cancels a claim completed during disposal", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-service-dispose-admission-"));
+    const repository = new AutomationRepository(dataDir);
+    const triggers = new TriggerRegistry({ recordEvent: (event) => repository.appendTriggerEvent(event) });
+    triggers.register(triggerDefinition());
+    const hooks = new HookRegistry();
+    hooks.register({
+      id: "fake.record",
+      owner: { kind: "app" },
+      title: "Record",
+      description: "Record text.",
+      exposures: ["automation"],
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      outputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute: () => ({})
+    });
+    const typeService = new AutomationTypeService();
+    const service = new AutomationService(
+      repository,
+      triggers,
+      hooks,
+      new AutomationCatalogService(typeService, () => triggers.list(), () => hooks.list()),
+      new AutomationCompiler(typeService),
+      new AutomationExecutor()
+    );
+    await service.saveGroup(group("enabled", true));
+    const claimStarted = deferred<void>();
+    const releaseClaim = deferred<void>();
+    const claimTriggerRuns = repository.claimTriggerRuns.bind(repository);
+    vi.spyOn(repository, "claimTriggerRuns").mockImplementation(async (...args) => {
+      claimStarted.resolve();
+      await releaseClaim.promise;
+      return claimTriggerRuns(...args);
+    });
+
+    const emission = triggers.emit("fake.started", {}, { kind: "test" });
+    await claimStarted.promise;
+    let disposalSettled = false;
+    const disposal = service.dispose().then(() => {
+      disposalSettled = true;
+    });
+    await flushPromises();
+
+    expect(disposalSettled).toBe(false);
+
+    releaseClaim.resolve();
+    await emission;
+    await disposal;
+
+    await expect(repository.listRuns()).resolves.toEqual([
+      expect.objectContaining({ status: "cancelled", error: "Automation service was stopped." })
+    ]);
+  });
+
+  it("rejects disposal after attempting every admitted cancellation when durable persistence fails", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-service-dispose-persistence-"));
+    const repository = new AutomationRepository(dataDir);
+    const triggers = new TriggerRegistry({ recordEvent: (event) => repository.appendTriggerEvent(event) });
+    triggers.register(triggerDefinition());
+    const hooks = new HookRegistry();
+    hooks.register({
+      id: "fake.record",
+      owner: { kind: "app" },
+      title: "Record",
+      description: "Record text.",
+      exposures: ["automation"],
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      outputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute: () => ({})
+    });
+    const typeService = new AutomationTypeService();
+    const service = new AutomationService(
+      repository,
+      triggers,
+      hooks,
+      new AutomationCatalogService(typeService, () => triggers.list(), () => hooks.list()),
+      new AutomationCompiler(typeService),
+      new AutomationExecutor()
+    );
+    await service.saveGroup(group("first", true));
+    await service.saveGroup(group("second", true));
+    const claimStarted = deferred<void>();
+    const releaseClaim = deferred<void>();
+    const originalClaim = repository.claimTriggerRuns.bind(repository);
+    vi.spyOn(repository, "claimTriggerRuns").mockImplementation(async (...args) => {
+      claimStarted.resolve();
+      await releaseClaim.promise;
+      return originalClaim(...args);
+    });
+    const cancellationAttempts: AutomationRunSummary[][] = [];
+    vi.spyOn(repository, "cancelRuns").mockImplementation(async (runs) => {
+      cancellationAttempts.push(runs);
+      throw Object.assign(new Error("no space left on device"), { code: "ENOSPC" });
+    });
+
+    const emission = triggers.emit("fake.started", {}, { kind: "test" });
+    await claimStarted.promise;
+    const disposal = service.dispose();
+    releaseClaim.resolve();
+
+    await expect(emission).rejects.toMatchObject({ code: "ENOSPC" });
+    await expect(disposal).rejects.toMatchObject({ code: "ENOSPC" });
+    expect(cancellationAttempts).toHaveLength(1);
+    expect(cancellationAttempts[0]).toHaveLength(2);
+    await expect(repository.listRuns()).resolves.toEqual([
+      expect.objectContaining({ status: "queued" }),
+      expect.objectContaining({ status: "queued" })
+    ]);
+  });
+
+  it("rejects trigger acknowledgement when the durable claim fails and accepts a later delivery", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-service-claim-failure-"));
+    const repository = new AutomationRepository(dataDir);
+    const triggers = new TriggerRegistry({ recordEvent: (event) => repository.appendTriggerEvent(event) });
+    triggers.register(triggerDefinition());
+    const hooks = new HookRegistry();
+    hooks.register({
+      id: "fake.record",
+      owner: { kind: "app" },
+      title: "Record",
+      description: "Record text.",
+      exposures: ["automation"],
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      outputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute: () => ({})
+    });
+    const typeService = new AutomationTypeService();
+    const service = new AutomationService(
+      repository,
+      triggers,
+      hooks,
+      new AutomationCatalogService(typeService, () => triggers.list(), () => hooks.list()),
+      new AutomationCompiler(typeService),
+      new AutomationExecutor()
+    );
+    await service.saveGroup(group("enabled", true));
+    const listGroups = vi.spyOn(repository, "listGroups").mockRejectedValueOnce(new Error("store unavailable"));
+
+    await expect(triggers.emit("fake.started", {}, { kind: "test" })).rejects.toThrow("store unavailable");
+    listGroups.mockRestore();
+    await triggers.emit("fake.started", {}, { kind: "test" });
+    const runs = await waitForRuns(repository, 1, (items) => items.every((run) => run.status === "succeeded"));
+
+    expect(runs).toHaveLength(1);
+  });
+
+  it("retries an atomically failed multi-group fanout without stranding a claim", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-service-fanout-failure-"));
+    const repository = new AutomationRepository(dataDir);
+    const triggers = new TriggerRegistry({ recordEvent: (event) => repository.appendTriggerEvent(event) });
+    triggers.register({
+      id: "plugin.started",
+      owner: { kind: "plugin", pluginId: "fake-plugin" },
+      title: "Plugin Started",
+      description: "Test plugin event identity.",
+      exposures: ["plugin"],
+      payloadSchema: {
+        type: "object",
+        properties: { eventId: { type: "string" } },
+        required: ["eventId"],
+        additionalProperties: false
+      }
+    });
+    let executions = 0;
+    const hooks = new HookRegistry();
+    hooks.register({
+      id: "fake.record",
+      owner: { kind: "app" },
+      title: "Record",
+      description: "Record text.",
+      exposures: ["automation"],
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      outputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute: () => {
+        executions += 1;
+        return {};
+      }
+    });
+    const typeService = new AutomationTypeService();
+    const service = new AutomationService(
+      repository,
+      triggers,
+      hooks,
+      new AutomationCatalogService(typeService, () => triggers.list(), () => hooks.list()),
+      new AutomationCompiler(typeService),
+      new AutomationExecutor()
+    );
+    await service.saveGroup(pluginGroup("first", "plugin.started"));
+    await service.saveGroup(pluginGroup("second", "plugin.started"));
+    vi.spyOn(repository, "claimTriggerRuns").mockRejectedValueOnce(new Error("claim write failed"));
+    const payload = { eventId: "event-1" };
+
+    await expect(triggers.emit("plugin.started", payload, { kind: "plugin", pluginId: "fake-plugin" })).rejects.toThrow("claim write failed");
+    await expect(repository.listRuns()).resolves.toEqual([]);
+
+    await triggers.emit("plugin.started", payload, { kind: "plugin", pluginId: "fake-plugin" });
+    const runs = await waitForRuns(repository, 2, (items) => items.every((run) => run.status === "succeeded"));
+    expect(runs.map((run) => run.groupId).sort()).toEqual(["first", "second"]);
+    expect(executions).toBe(2);
   });
 });
 
@@ -541,6 +1002,19 @@ async function waitUntil(predicate: () => boolean): Promise<void> {
   throw new Error("Timed out waiting for condition.");
 }
 
+function deferred<T>(): { promise: Promise<T>; resolve: (value?: T | PromiseLike<T>) => void } {
+  let resolve!: (value?: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((promiseResolve) => {
+    resolve = promiseResolve as (value?: T | PromiseLike<T>) => void;
+  });
+  return { promise, resolve };
+}
+
+async function flushPromises(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
 function group(id: string, enabled: boolean): AutomationGroup {
   const now = new Date(0).toISOString();
   return {
@@ -550,7 +1024,7 @@ function group(id: string, enabled: boolean): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:fake.started", position: { x: 0, y: 0 } },
         { id: "record", typeId: "hook:fake.record", position: { x: 200, y: 0 } }
@@ -578,6 +1052,40 @@ function triggerDefinition() {
   };
 }
 
+function singleHookGroup(id: string, hookId: string): AutomationGroup {
+  const saved = group(id, true);
+  return {
+    ...saved,
+    graph: {
+      ...saved.graph,
+      nodes: [
+        { id: "trigger", typeId: "trigger:fake.started", position: { x: 0, y: 0 } },
+        { id: "hook", typeId: `hook:${hookId}`, position: { x: 200, y: 0 } }
+      ],
+      edges: [
+        { id: "exec", kind: "exec", sourceNodeId: "trigger", sourcePortId: "exec", targetNodeId: "hook", targetPortId: "exec" }
+      ]
+    }
+  };
+}
+
+function pluginGroup(id: string, triggerId: string): AutomationGroup {
+  const saved = group(id, true);
+  return {
+    ...saved,
+    graph: {
+      ...saved.graph,
+      nodes: [
+        { id: "trigger", typeId: `trigger:${triggerId}`, position: { x: 0, y: 0 } },
+        { id: "record", typeId: "hook:fake.record", position: { x: 200, y: 0 } }
+      ],
+      edges: [
+        { id: "exec", kind: "exec", sourceNodeId: "trigger", sourcePortId: "exec", targetNodeId: "record", targetPortId: "exec" }
+      ]
+    }
+  };
+}
+
 function cancelGroup(): AutomationGroup {
   const now = new Date(0).toISOString();
   return {
@@ -587,7 +1095,7 @@ function cancelGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:fake.started", position: { x: 0, y: 0 } },
         { id: "wait", typeId: "hook:fake.wait", position: { x: 200, y: 0 } },
@@ -611,7 +1119,7 @@ function recordOnlyGroup(id: string): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:fake.started", position: { x: 0, y: 0 } },
         { id: "record", typeId: "hook:fake.record", position: { x: 200, y: 0 } }
@@ -633,7 +1141,7 @@ function effectGroup(): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:fake.started", position: { x: 0, y: 0 } },
         { id: "effect", typeId: "hook:fake.effect", position: { x: 200, y: 0 } }
@@ -655,7 +1163,7 @@ function externalGroup(id: string): AutomationGroup {
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [
         { id: "trigger", typeId: "trigger:fake.started", position: { x: 0, y: 0 } },
         { id: "shell", typeId: "hook:fake.shell", position: { x: 200, y: 0 } }
