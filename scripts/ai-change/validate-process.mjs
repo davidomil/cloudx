@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { parseDocument } from "yaml";
 
 import { loadPolicy } from "./policy.mjs";
+import { validateArtifact } from "./artifact-validation.mjs";
 import { AREA_REVIEW_ROLES } from "./review-fanout.mjs";
 import { compileAllSchemas } from "./schema-validator.mjs";
 
@@ -25,6 +27,41 @@ const loggedInCodexRunnerLabels = [
   "cloudx-codex",
 ];
 
+export const GATE_B_COMMIT_SUBJECTS = [
+  "WORKSPACE: make server workspace commands atomic",
+  "AUTOMATION: persist trigger delivery and cancellation state",
+  "DOCUMENTATION: publish bounded atomic archive ingestion",
+  "ASR: bound inference workers and service readiness",
+  "SERVER: make readiness and shutdown lifecycle explicit",
+  "INSTALLER: unify reproducible local service setup",
+  "DOCS: align operator and scoped-agent contracts",
+  "POLICY: separate candidate publication from live-head review",
+];
+export const GATE_B_LOCAL_CHANGE_BASE_SHA =
+  "7f5693b568f38c207227a5473f14648fd10d4816";
+export const GATE_B_EXPECTED_OLD_CANDIDATE_SHA =
+  "7f5693b568f38c207227a5473f14648fd10d4816";
+export const GATE_B_TARGET_BASE_REF = "refs/heads/main";
+export const GATE_B_EXPECTED_TARGET_BASE_SHA =
+  "02d05f798096431f23acd1e5594a6bee21f3149f";
+export const GATE_B_CANDIDATE_REF = "refs/heads/architecture-and-new-codex";
+export const GATE_B_REPOSITORY = "davidomil/cloudx";
+export const GATE_B_PULL_REQUEST = 1;
+export const GATE_B_POLICY_SHA256 =
+  "45e15742a31052b7ff51bd565201763db8bd8e4e6e92da1259b58b802cefa0ed";
+export const GATE_B_REVIEW_ROLES = [
+  "review-agent-policy",
+  "review-architecture",
+  "review-automation",
+  "review-documentation",
+  "review-installer",
+  "review-python-services",
+  "review-security",
+  "review-server",
+  "review-shared",
+  "review-web",
+];
+
 export async function validateProcess(options = {}) {
   const repoRoot = path.resolve(options.repoRoot ?? defaultRepoRoot);
   const schemas = (options.compileSchemas ?? compileAllSchemas)();
@@ -38,6 +75,7 @@ export async function validateProcess(options = {}) {
   }
   const workflows = validateWorkflows(repoRoot, issues);
   validateVerifierBuildContext(repoRoot, issues);
+  validatePublicationContract(repoRoot, issues);
   if (issues.length > 0) {
     throw new Error(
       `Repository AI process validation failed:\n${issues
@@ -52,6 +90,490 @@ export async function validateProcess(options = {}) {
     skills,
     workflows,
   };
+}
+
+const publicationContractPaths = {
+  root: "AGENTS.md",
+  orchestrator: ".agents/skills/change-orchestrator/SKILL.md",
+  ship: ".agents/skills/ship-change/SKILL.md",
+  review: ".agents/skills/review-pr/SKILL.md",
+  verifier: ".agents/skills/verify-change/SKILL.md",
+  process: "docs/AI_CHANGE_PROCESS.md",
+  publisher: "scripts/ai-change/publish-gate-b.mjs",
+};
+
+const publicationIdentityClauses = [
+  `localChangeBaseSha=${GATE_B_LOCAL_CHANGE_BASE_SHA}`,
+  `expectedOldCandidateSha=${GATE_B_EXPECTED_OLD_CANDIDATE_SHA}`,
+  `targetBaseRef=${GATE_B_TARGET_BASE_REF}`,
+  `expectedTargetBaseSha=${GATE_B_EXPECTED_TARGET_BASE_SHA}`,
+  `repository=${GATE_B_REPOSITORY}`,
+  `pullRequest=${GATE_B_PULL_REQUEST}`,
+  "prState=OPEN",
+  "prBaseRefName=main",
+  "prBaseRefOid=02d05f798096431f23acd1e5594a6bee21f3149f",
+  "prHeadRefName=architecture-and-new-codex",
+  "prHeadRefOid=expectedOldCandidateSha",
+  "sameRepository=true",
+];
+const terminalPublicationClauses = [
+  "outcome=manual-reconciliation-required",
+  "pushAttempts=1",
+  "retry=false",
+  "reviewPrHandoff=false",
+];
+
+export function validatePublicationContract(repoRoot, issues = []) {
+  const sources = {};
+  for (const [name, relativePath] of Object.entries(publicationContractPaths)) {
+    const absolutePath = path.join(repoRoot, relativePath);
+    if (!fs.existsSync(absolutePath)) {
+      issues.push(
+        `Publication contract source '${relativePath}' does not exist.`,
+      );
+      continue;
+    }
+    sources[name] = fs.readFileSync(absolutePath, "utf8");
+  }
+  if (
+    Object.keys(sources).length === Object.keys(publicationContractPaths).length
+  ) {
+    validatePublicationContractSources(sources, issues);
+  }
+  return issues;
+}
+
+export function validatePublicationContractSources(sources, issues = []) {
+  const contractBegin = "<!-- CLOUDX-PUBLICATION-CONTRACT-V1:BEGIN -->";
+  const contractEnd = "<!-- CLOUDX-PUBLICATION-CONTRACT-V1:END -->";
+  const roleClauses = {
+    root: [
+      "validates the accepted plan",
+      "complete identity tuple above",
+      "node scripts/ai-change/publish-gate-b.mjs",
+      "No prose or role has an alternate raw push path",
+      "$review-pr evaluates the pushed live head only after that readback",
+      "Every later GitHub mutation requires a current clean $review-pr",
+    ],
+    orchestrator: [
+      "complete identity tuple above",
+      "dispatch $ship-change with the sole publish-gate-b.mjs entry point",
+      "The orchestrator never runs a publication command",
+      "before dispatching $review-pr for the pushed live head",
+      "The initial exception is never reused",
+    ],
+    ship: [
+      "complete identity tuple above",
+      "node scripts/ai-change/publish-gate-b.mjs",
+      "Do not run a raw push",
+      "single pinned non-force update",
+      "Every later GitHub mutation requires",
+      "Never reuse initial-publication authority",
+    ],
+    review: [
+      "only after the Gate-B executable has completed authoritative remote and pull-request readback",
+      "local pre-publication reviews never substitute for $review-pr",
+      "A new push immediately stales the result",
+      "grants no publication or GitHub mutation authority",
+    ],
+    verifier: [
+      'validate the accepted plan with validateArtifact("plan", plan)',
+      "before invoking any command runner",
+      "A rejected command starts no process",
+      'validate the result with validateArtifact("verification", result)',
+      "This role grants no publication authority",
+    ],
+    process: [
+      "production artifact boundary before command dispatch",
+      "complete identity tuple above",
+      "node scripts/ai-change/publish-gate-b.mjs",
+      "No alternate raw push",
+      "$review-pr evaluates only the pushed live head after readback",
+      "Every later GitHub mutation requires a current clean $review-pr",
+    ],
+  };
+  for (const [name, clauses] of Object.entries(roleClauses)) {
+    validatePublicationAuthoritySection(
+      name,
+      String(sources[name] ?? ""),
+      [
+        ...publicationIdentityClauses,
+        ...terminalPublicationClauses,
+        ...clauses,
+      ],
+      contractBegin,
+      contractEnd,
+      issues,
+    );
+  }
+  const publisher = String(sources.publisher ?? "").replace(/\s+/gu, " ");
+  for (const clause of [
+    "validateGateBArtifactBundle({ snapshot })",
+    "freshSnapshot.manifestSha256 !== snapshot.manifestSha256",
+    'const originPushUrl = "https://github.com/davidomil/cloudx"',
+    "GATE_B_EXPECTED_TARGET_BASE_SHA",
+    "GATE_B_EXPECTED_OLD_CANDIDATE_SHA",
+    "requireFastForwardPorcelain(pushResult.stdout, expectedOldHead, localHead)",
+    'status: "manual-reconciliation-required"',
+    "reviewPrHandoffAuthorized: false",
+    'requirePullRequest(afterPushPr, localHead, "post-push")',
+  ]) {
+    if (!publisher.includes(clause)) {
+      issues.push(
+        `Gate B publisher must contain canonical operation: ${clause}`,
+      );
+    }
+  }
+  const exactPushes = String(sources.publisher ?? "").match(
+    /["']push["']\s*,\s*["']--porcelain["']\s*,\s*["']origin["']\s*,\s*`HEAD:\$\{GATE_B_CANDIDATE_REF\}`/gu,
+  );
+  if (exactPushes?.length !== 1) {
+    issues.push(
+      "Gate B publisher must contain exactly one canonical push call.",
+    );
+  }
+  if (/--force(?:-with-lease|-if-includes)?|["'`]\+HEAD:/u.test(publisher)) {
+    issues.push("Gate B publisher cannot contain force-update syntax.");
+  }
+
+  return issues;
+}
+
+export function validateVerificationCommands(commands, issues = []) {
+  for (const command of commands) {
+    if (
+      /\bgit\s+push\b|\bgh\s+(?:api|pr|issue|repo|release|workflow)\b|api\.github\.com/iu.test(
+        command,
+      )
+    ) {
+      issues.push(
+        `Verification command must be read-only and local: ${command}`,
+      );
+    }
+  }
+  return issues;
+}
+
+export function validateGateBArtifactBundle({ snapshot }) {
+  if (!snapshot || typeof snapshot !== "object" || !snapshot.files) {
+    throw new Error(
+      "Gate B validation requires one immutable artifact snapshot.",
+    );
+  }
+  const planName = "plan.json";
+  const planReviewName = "plan-review.json";
+  const implementationName = "implementation.json";
+  const verificationName = "verification.json";
+  const aggregateReviewName = "review-change.json";
+  const plan = readSnapshotArtifact(snapshot, planName, "plan");
+  const roles = [...plan.classification.skills];
+  requireExactSet(roles, GATE_B_REVIEW_ROLES, "Gate B plan review roles");
+  requireEqual(
+    plan.allowed_paths.length,
+    112,
+    "Gate B plan allowed path count",
+  );
+  requireEqual(plan.claims.length, 71, "Gate B plan claim count");
+  const areaReviewNames = roles.map((role) => `${role}.json`);
+  const expectedNames = [
+    planName,
+    planReviewName,
+    implementationName,
+    verificationName,
+    ...areaReviewNames,
+    aggregateReviewName,
+  ].sort();
+  requireExactSet(
+    Object.keys(snapshot.files).sort(),
+    expectedNames,
+    "Gate B artifact filenames",
+  );
+
+  const planBytes = snapshot.files[planName];
+  const planSha256 = sha256(planBytes);
+  const planReview = readSnapshotArtifact(snapshot, planReviewName, "review");
+  const implementation = readSnapshotArtifact(
+    snapshot,
+    implementationName,
+    "implementation",
+  );
+  const implementationBytes = snapshot.files[implementationName];
+  const implementationSha256 = sha256(implementationBytes);
+  const verification = readSnapshotArtifact(
+    snapshot,
+    verificationName,
+    "verification",
+  );
+  const areaReviews = areaReviewNames.map((name) =>
+    readSnapshotArtifact(snapshot, name, "review"),
+  );
+  const aggregateReview = readSnapshotArtifact(
+    snapshot,
+    aggregateReviewName,
+    "review",
+  );
+
+  requireEqual(
+    plan.base_sha,
+    GATE_B_LOCAL_CHANGE_BASE_SHA,
+    "Gate B local change base",
+  );
+  if (!/^[a-f0-9]{40}$/u.test(plan.head_sha)) {
+    throw new Error("Gate B plan head must be a full Git SHA.");
+  }
+  requireEqual(
+    plan.policy_sha256,
+    GATE_B_POLICY_SHA256,
+    "Gate B plan policy digest",
+  );
+  for (const [name, artifact] of [
+    [planReviewName, planReview],
+    [implementationName, implementation],
+    [verificationName, verification],
+    ...areaReviewNames.map((name, index) => [name, areaReviews[index]]),
+    [aggregateReviewName, aggregateReview],
+  ]) {
+    requireEqual(
+      artifact.base_sha,
+      GATE_B_LOCAL_CHANGE_BASE_SHA,
+      `${name} local change base`,
+    );
+    requireEqual(artifact.head_sha, plan.head_sha, `${name} head`);
+    requireEqual(
+      artifact.policy_sha256,
+      GATE_B_POLICY_SHA256,
+      `${name} policy digest`,
+    );
+  }
+
+  requireReview(planReview, {
+    role: "review-plan",
+    subject: "plan",
+    subjectSha256: planSha256,
+  });
+  requireEqual(
+    implementation.plan_sha256,
+    planSha256,
+    "Gate B implementation plan digest",
+  );
+  requireExactList(
+    implementation.deviations,
+    [],
+    "Gate B implementation deviations",
+  );
+  requireExactSet(
+    implementation.changed_files,
+    plan.allowed_paths,
+    "Gate B implementation changed paths",
+  );
+  requireEqual(
+    new Set([
+      planReview.run_id,
+      ...areaReviews.map(({ run_id }) => run_id),
+      aggregateReview.run_id,
+    ]).size,
+    areaReviews.length + 2,
+    "Gate B review artifact identities",
+  );
+  const expectedClaims = plan.claims.map(({ id }) => id);
+  const actualClaims = implementation.claim_evidence.map(
+    ({ claim_id }) => claim_id,
+  );
+  requireExactSet(
+    actualClaims,
+    expectedClaims,
+    "Gate B implementation claim evidence",
+  );
+
+  requireEqual(verification.verdict, "passed", "Gate B verification verdict");
+  requireEqual(
+    verification.tree_sha256_before,
+    verification.tree_sha256_after,
+    "Gate B verification tree digest",
+  );
+  requireExactList(
+    verification.commands.map(({ command }) => command),
+    plan.verification,
+    "Gate B verification commands",
+  );
+  for (const command of verification.commands) {
+    requireEqual(
+      command.exit_code,
+      0,
+      `Gate B verification command exit code for '${command.command}'`,
+    );
+    requireEqual(
+      command.tree_sha256_before,
+      verification.tree_sha256_before,
+      `Gate B verification command tree before for '${command.command}'`,
+    );
+    requireEqual(
+      command.tree_sha256_after,
+      verification.tree_sha256_after,
+      `Gate B verification command tree after for '${command.command}'`,
+    );
+  }
+
+  requireExactSet(
+    areaReviews.map(({ reviewer_role }) => reviewer_role),
+    roles,
+    "Gate B area review roles",
+  );
+  for (const review of areaReviews) {
+    requireReview(review, {
+      role: review.reviewer_role,
+      subject: "implementation",
+      subjectSha256: implementationSha256,
+    });
+  }
+  requireReview(aggregateReview, {
+    role: "review-change",
+    subject: "implementation",
+    subjectSha256: implementationSha256,
+  });
+  return {
+    headSha: plan.head_sha,
+    localChangeBaseSha: plan.base_sha,
+    planSha256,
+    implementationSha256,
+  };
+}
+
+function readSnapshotArtifact(snapshot, name, kind) {
+  const bytes = snapshot.files[name];
+  if (!bytes) {
+    throw new Error(`Gate B artifact is missing: ${name}`);
+  }
+  let value;
+  try {
+    value = JSON.parse(Buffer.from(bytes).toString("utf8"));
+  } catch (error) {
+    throw new Error(`Gate B artifact is not valid JSON: ${name}`, {
+      cause: error,
+    });
+  }
+  try {
+    return validateArtifact(kind, value);
+  } catch (error) {
+    throw new Error(`Gate B artifact schema or semantics failed for ${name}`, {
+      cause: error,
+    });
+  }
+}
+
+function requireReview(review, { role, subject, subjectSha256 }) {
+  requireEqual(review.reviewer_role, role, `Gate B reviewer role for ${role}`);
+  requireEqual(review.subject, subject, `Gate B review subject for ${role}`);
+  requireEqual(
+    review.subject_sha256,
+    subjectSha256,
+    `Gate B review subject digest for ${role}`,
+  );
+  requireEqual(review.verdict, "clean", `Gate B review verdict for ${role}`);
+  requireExactList(review.findings, [], `Gate B review findings for ${role}`);
+  if (!review.tags.includes("manual-review")) {
+    throw new Error(`Gate B review ${role} must require manual-review.`);
+  }
+}
+
+function requireExactSet(actual, expected, label) {
+  const actualSorted = [...actual].sort();
+  const expectedSorted = [...expected].sort();
+  if (
+    new Set(actual).size !== actual.length ||
+    JSON.stringify(actualSorted) !== JSON.stringify(expectedSorted)
+  ) {
+    throw new Error(`${label} must match exactly.`);
+  }
+}
+
+function requireExactList(actual, expected, label) {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error(`${label} must match exactly.`);
+  }
+}
+
+function requireEqual(actual, expected, label) {
+  if (actual !== expected)
+    throw new Error(`${label} must equal ${String(expected)}.`);
+}
+
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function validatePublicationAuthoritySection(
+  name,
+  source,
+  clauses,
+  begin,
+  end,
+  issues,
+) {
+  const beginMatches = source.split(begin).length - 1;
+  const endMatches = source.split(end).length - 1;
+  const beginIndex = source.indexOf(begin);
+  const endIndex = source.indexOf(end);
+  if (beginMatches !== 1 || endMatches !== 1 || endIndex <= beginIndex) {
+    issues.push(
+      `${name} must contain exactly one Publication Contract V1 block.`,
+    );
+    return;
+  }
+  const section = source
+    .slice(beginIndex + begin.length, endIndex)
+    .replace(/[`*_]/gu, "")
+    .replace(/\s+/gu, " ")
+    .toLowerCase();
+  for (const clause of clauses) {
+    const normalizedClause = clause
+      .replace(/[`*_]/gu, "")
+      .replace(/\s+/gu, " ")
+      .toLowerCase();
+    if (!section.includes(normalizedClause)) {
+      issues.push(`${name} Publication Contract V1 must contain: ${clause}`);
+    }
+  }
+  const outside = `${source.slice(0, beginIndex)}\n${source.slice(endIndex + end.length)}`;
+  const authorityOutside = [
+    /\bgit\s+push\b/iu,
+    /\bpublish-gate-b\.mjs\b/iu,
+    /\binitial candidate publication\b/iu,
+    /\binitial publication\b/iu,
+    /\balternate raw push\b/iu,
+    /\bforce[- ](?:push|update)\b/iu,
+    /\bprotected[- ]branch (?:publication|authority|update)\b/iu,
+    /\b(?:target|publish to|update) (?:a )?protected branch\b/iu,
+    /\bsecond (?:initial )?exception\b/iu,
+    /\borchestrator may push\b/iu,
+    /\bverification may mutate GitHub\b/iu,
+    /\blater mutation may proceed without\b/iu,
+    /\bmerge may proceed without\b/iu,
+  ].find((pattern) => pattern.test(outside));
+  if (authorityOutside) {
+    issues.push(
+      `${name} contains publication authority outside its canonical block: ${authorityOutside.source}`,
+    );
+  }
+  const contradiction = [
+    /\b(?:force push|forced update|protected branch)[^.\n]{0,100}\b(?:permitted|allowed|authorized)\b/iu,
+    /\b(?:alternate|separate|second) raw push[^.\n]{0,80}\b(?:permitted|allowed|authorized)\b/iu,
+    /\b(?:retry|rollback|roll back) (?:is|remains|becomes) (?:permitted|allowed|authorized)\b/iu,
+    /\b(?:permitted|allowed|authorized|may|can)\b[^.\n]{0,100}\b(?:retry|rollback|roll back)\b/iu,
+    /\borchestrator may (?:push|mutate)\b/iu,
+    /\bverification may mutate GitHub\b/iu,
+    /\breview-pr may run after [^.\n]{0,80}\b(?:failure|mismatch|ambiguity)\b/iu,
+    /\blater mutation may proceed without\b/iu,
+    /\bmerge may proceed without\b/iu,
+    /\b(?:localChangeBaseSha|expectedOldCandidateSha)=02d05f798096431f23acd1e5594a6bee21f3149f\b/u,
+    /\bexpectedTargetBaseSha=7f5693b568f38c207227a5473f14648fd10d4816\b/u,
+    /\bexpected(?:OldCandidate|TargetBase)Sha (?:comes|derives|is inferred) from (?:the )?(?:readback|remote)\b/iu,
+  ].find((pattern) => pattern.test(source));
+  if (contradiction) {
+    issues.push(
+      `${name} contradicts Publication Contract V1: ${contradiction.source}`,
+    );
+  }
 }
 
 export function validatePolicyReferences(policy, skills, issues = []) {

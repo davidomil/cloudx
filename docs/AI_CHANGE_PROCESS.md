@@ -50,11 +50,38 @@ change:
 6. Issue work establishes a discriminating baseline before implementation.
 7. Implementation is limited to accepted paths and produces claim-level
    evidence.
-8. Deterministic verification runs against the exact candidate bytes.
+8. Verification runs against the exact candidate bytes.
 9. Policy-selected area reviews and a fresh aggregate review evaluate the same
    exact head.
-10. Publication and merge require current repository state, current required
-    checks, and the exact reviewed head.
+10. Complete publication and live-head review under Publication Contract V1.
+
+<!-- CLOUDX-PUBLICATION-CONTRACT-V1:BEGIN -->
+
+Publication Contract V1 is the only public authority for this transition:
+
+The immutable identities remain distinct: `localChangeBaseSha=7f5693b568f38c207227a5473f14648fd10d4816`, `expectedOldCandidateSha=7f5693b568f38c207227a5473f14648fd10d4816`, `targetBaseRef=refs/heads/main`, `expectedTargetBaseSha=02d05f798096431f23acd1e5594a6bee21f3149f`, `repository=davidomil/cloudx`, `pullRequest=1`, `prState=OPEN`, `prBaseRefName=main`, `prBaseRefOid=02d05f798096431f23acd1e5594a6bee21f3149f`, `prHeadRefName=architecture-and-new-codex`, `prHeadRefOid=expectedOldCandidateSha`, and `sameRepository=true`.
+After the sole push starts, every error or identity ambiguity produces `outcome=manual-reconciliation-required`, `pushAttempts=1`, `retry=false`, and `reviewPrHandoff=false`; no review or mutation follows before explicit reconciliation.
+
+1. Verification validates the accepted plan through the production artifact
+   boundary before command dispatch and remains deterministic, local, read-only,
+   and unable to mutate GitHub.
+2. Current clean exact-head implementation, verification, all selected area
+   reviews, and aggregate review plus explicit authorization bind one immutable
+   Gate-B manifest and the complete identity tuple above.
+3. `$ship-change` invokes only
+   `node scripts/ai-change/publish-gate-b.mjs --artifact-dir <bundle> --authorized-manifest-sha256 <sha256> --expected-old-head <sha>`.
+   The executable alone may perform one pinned non-force update to the confirmed
+   unprotected candidate ref after exact local, artifact, remote, PR,
+   fast-forward, protection, and rules checks. It rechecks the manifest before
+   the update and performs authoritative remote and PR readback afterward. No
+   alternate raw push, force update, protected-ref update, retry, or second-use
+   path exists.
+4. `$review-pr` evaluates only the pushed live head after readback; another push
+   stales the result.
+5. Every later GitHub mutation requires a current clean `$review-pr`; merge also
+   requires current merge intent and required checks.
+
+<!-- CLOUDX-PUBLICATION-CONTRACT-V1:END -->
 
 Fresh judgment roles do not inherit the context that produced the artifact they
 review. A failed review or materially changed requirement starts a new bounded
@@ -85,7 +112,8 @@ GitHub records; a later push invalidates earlier readiness.
   authorized merge controller named by the public ruleset.
 - Merge authorization re-fetches the pull request, base, head, reviews, checks,
   and ruleset-relevant state immediately before an exact-head merge request.
-- Interactive shipping remains an attended action governed by `$ship-change`.
+- Interactive shipping remains an attended action governed by the marked
+  contract and `$ship-change`.
 
 Public workflows never receive the private controller's model session, App
 private keys, publication credentials, or merge credentials.

@@ -36,15 +36,40 @@ For every non-trivial change, use `$change-orchestrator`:
    context.
 3. Review the plan in a different fresh context with `$review-plan`.
 4. Implement only a clean plan with `$implement-change`.
-5. Run deterministic, read-only verification with `$verify-change`.
+5. Run verification with `$verify-change` under the versioned contract below.
 6. Run `$review-change` and every policy-selected area reviewer in fresh
    contexts.
 7. Route findings back through implementation, verification, and review until
    clean. An iteration ceiling blocks the change; it never permits a bypass.
-8. Use `$review-pr` for current-head PR review. Only `$ship-change` may perform
-   interactive or model-directed GitHub mutations. External Publisher and Merge
-   controllers may perform only the deterministic operations granted to their
-   separate GitHub App identities.
+8. Complete publication and live-head review under the versioned contract below.
+
+<!-- CLOUDX-PUBLICATION-CONTRACT-V1:BEGIN -->
+
+Publication Contract V1 has one order and one initial-publication entry point:
+
+The immutable identities remain distinct: `localChangeBaseSha=7f5693b568f38c207227a5473f14648fd10d4816`, `expectedOldCandidateSha=7f5693b568f38c207227a5473f14648fd10d4816`, `targetBaseRef=refs/heads/main`, `expectedTargetBaseSha=02d05f798096431f23acd1e5594a6bee21f3149f`, `repository=davidomil/cloudx`, `pullRequest=1`, `prState=OPEN`, `prBaseRefName=main`, `prBaseRefOid=02d05f798096431f23acd1e5594a6bee21f3149f`, `prHeadRefName=architecture-and-new-codex`, `prHeadRefOid=expectedOldCandidateSha`, and `sameRepository=true`.
+After the sole push starts, every error or identity ambiguity produces `outcome=manual-reconciliation-required`, `pushAttempts=1`, `retry=false`, and `reviewPrHandoff=false`.
+
+1. `$verify-change` validates the accepted plan through
+   `scripts/ai-change/artifact-validation.mjs` before it dispatches any command.
+   Verification is deterministic, local, read-only, and cannot mutate GitHub.
+2. After the exact local head has current clean implementation, verification,
+   policy-selected area-review, and aggregate-review artifacts, explicit user
+   authorization binds the immutable Gate-B manifest digest and the complete
+   identity tuple above.
+3. `$ship-change` invokes only
+   `node scripts/ai-change/publish-gate-b.mjs --artifact-dir <bundle> --authorized-manifest-sha256 <sha256> --expected-old-head <sha>`.
+   That executable may perform one non-force update to the confirmed unprotected
+   `architecture-and-new-codex` candidate ref and must complete authoritative
+   remote and pull-request readback. No prose or role has an alternate raw push
+   path, force-update authority, protected-branch authority, retry, or second-use
+   exception.
+4. `$review-pr` evaluates the pushed live head only after that readback. A later
+   push makes the result stale.
+5. Every later GitHub mutation requires a current clean `$review-pr`; merge also
+   requires current merge intent and required checks.
+
+<!-- CLOUDX-PUBLICATION-CONTRACT-V1:END -->
 
 The planner, implementer, verifier, reviewer, and shipper are separate roles.
 Never let an author review its own prior conversation. Pass a reviewer only the
