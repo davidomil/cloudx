@@ -553,12 +553,11 @@ export async function deleteLayoutTemplate(templateId: string): Promise<{ templa
   return fetchJson(`/api/layout-templates/${encodeURIComponent(templateId)}`, { method: "DELETE" });
 }
 
-export async function createTab(input: CreateTabRequest): Promise<WorkspaceTab> {
-  const body = await fetchJson<CreateTabResponse>("/api/tabs", {
+export async function createTab(input: CreateTabRequest): Promise<CreateTabResponse> {
+  return fetchJson<CreateTabResponse>("/api/tabs", {
     method: "POST",
     body: JSON.stringify(input)
   });
-  return body.tab;
 }
 
 export async function setActiveTab(tabId: string): Promise<void> {
@@ -923,7 +922,14 @@ function parseVoiceExecutionResult(value: unknown): VoiceExecutionResult | undef
 }
 
 function parseVoiceActionResult(value: unknown): VoiceExecutionResult["results"][number] | undefined {
-  if (!isRecord(value) || typeof value.action !== "string" || !value.action.trim() || typeof value.ok !== "boolean") {
+  if (
+    !isRecord(value) ||
+    typeof value.actionId !== "string" ||
+    !value.actionId.trim() ||
+    typeof value.action !== "string" ||
+    !value.action.trim() ||
+    !isVoiceActionStatus(value.status)
+  ) {
     return undefined;
   }
   if ("targetTabId" in value && value.targetTabId !== undefined && typeof value.targetTabId !== "string") {
@@ -933,12 +939,17 @@ function parseVoiceActionResult(value: unknown): VoiceExecutionResult["results"]
     return undefined;
   }
   return {
+    actionId: value.actionId,
     action: value.action,
     targetTabId: typeof value.targetTabId === "string" ? value.targetTabId : undefined,
-    ok: value.ok,
+    status: value.status,
     message: typeof value.message === "string" ? value.message : undefined,
     result: value.result
   };
+}
+
+function isVoiceActionStatus(value: unknown): value is VoiceExecutionResult["results"][number]["status"] {
+  return value === "succeeded" || value === "failed" || value === "skipped";
 }
 
 function isVoiceAudioStatus(value: unknown): value is VoiceAudioStatus["status"] {

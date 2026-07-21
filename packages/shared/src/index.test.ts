@@ -25,7 +25,7 @@ describe("parseVoiceActionPlan", () => {
     const plan = parseVoiceActionPlan({
       transcript: "type hello",
       summary: "Enter text in the active tab.",
-      actions: [{ action: "enter_text", input: { text: "hello" } }]
+      actions: [{ id: "type-hello", dependsOn: [], action: "enter_text", input: { text: "hello" } }]
     });
 
     expect(plan.actions).toHaveLength(1);
@@ -38,7 +38,8 @@ describe("parseVoiceActionPlan", () => {
       summary: "List files.",
       actions: [
         {
-          id: null,
+          id: "list-folder",
+          dependsOn: [],
           targetTabId: null,
           pluginId: null,
           hookId: null,
@@ -50,6 +51,8 @@ describe("parseVoiceActionPlan", () => {
     });
 
     expect(plan.actions[0]).toEqual({
+      id: "list-folder",
+      dependsOn: [],
       action: "enter_text",
       input: { text: "ls", submit: true }
     });
@@ -61,6 +64,8 @@ describe("parseVoiceActionPlan", () => {
       summary: "Create a web tab.",
       actions: [
         {
+          id: "open-web",
+          dependsOn: [],
           hookId: "workspace.tabs.create",
           action: "workspace.tabs.create",
           input: { pluginId: "local-web", url: "http://127.0.0.1:5173" }
@@ -79,6 +84,38 @@ describe("parseVoiceActionPlan", () => {
         actions: [{ input: {} }]
       })
     ).toThrow(/action name/);
+  });
+
+  it("requires stable action ids and earlier explicit dependencies", () => {
+    expect(() =>
+      parseVoiceActionPlan({
+        transcript: "type",
+        summary: "",
+        actions: [{ dependsOn: [], action: "enter_text", input: { text: "hello" } }]
+      })
+    ).toThrow(/id/);
+
+    expect(() =>
+      parseVoiceActionPlan({
+        transcript: "open then type",
+        summary: "",
+        actions: [
+          { id: "open", dependsOn: [], action: "create_tab", input: {} },
+          { id: "type", dependsOn: ["missing"], action: "enter_text", input: { text: "hello" } }
+        ]
+      })
+    ).toThrow(/earlier action/);
+
+    expect(() =>
+      parseVoiceActionPlan({
+        transcript: "open then type",
+        summary: "",
+        actions: [
+          { id: "open", dependsOn: [], action: "create_tab", input: {} },
+          { id: "type", dependsOn: ["open", "open"], action: "enter_text", input: { text: "hello" } }
+        ]
+      })
+    ).toThrow(/duplicate/);
   });
 });
 
@@ -101,7 +138,7 @@ describe("automation document guards", () => {
   it("accepts valid automation graph documents", () => {
     expect(
       isAutomationGraphDocument({
-        schemaVersion: 1,
+        schemaVersion: 2,
         nodes: [{ id: "trigger", typeId: "trigger:worktree.created", position: { x: 0, y: 0 }, config: { mode: "new_branch" } }],
         edges: [],
         variables: [{ name: "folderName", type: { kind: "string" }, defaultValue: "feature-a" }],
@@ -111,9 +148,10 @@ describe("automation document guards", () => {
   });
 
   it("rejects malformed automation graph documents", () => {
-    expect(isAutomationGraphDocument({ schemaVersion: 1, nodes: [], edges: [], allowedSafety: ["network"] })).toBe(false);
-    expect(isAutomationGraphDocument({ schemaVersion: 1, nodes: [{ id: "node", typeId: "primitive:log", position: { x: "0", y: 0 } }], edges: [] })).toBe(false);
-    expect(isAutomationGraphDocument({ schemaVersion: 1, nodes: [], edges: [{ id: "edge", kind: "exec", sourceNodeId: "a" }] })).toBe(false);
+    expect(isAutomationGraphDocument({ schemaVersion: 1, nodes: [], edges: [] })).toBe(false);
+    expect(isAutomationGraphDocument({ schemaVersion: 2, nodes: [], edges: [], allowedSafety: ["network"] })).toBe(false);
+    expect(isAutomationGraphDocument({ schemaVersion: 2, nodes: [{ id: "node", typeId: "primitive:log", position: { x: "0", y: 0 } }], edges: [] })).toBe(false);
+    expect(isAutomationGraphDocument({ schemaVersion: 2, nodes: [], edges: [{ id: "edge", kind: "exec", sourceNodeId: "a" }] })).toBe(false);
   });
 
   it("bounds recursive automation type validation", () => {

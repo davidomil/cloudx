@@ -5,7 +5,7 @@ import path from "node:path";
 import type { CreatePluginSessionInput, PluginActionContext, PluginSession, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
 import { pluginActionHookId } from "@cloudx/plugin-api";
 import { RULES_SKILLS_PLUGIN_ID, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { TabContextService } from "./context/TabContextService.js";
 import { PathPolicy } from "./pathPolicy.js";
@@ -17,6 +17,7 @@ import { registerPluginActionHooks } from "./hooks/pluginActionHooks.js";
 import { LOCAL_WEB_PLUGIN_ID, LocalWebPlugin } from "./plugins/LocalWebPlugin.js";
 import { WorkspaceControlPlugin, WORKSPACE_CONTROL_PLUGIN_ID } from "./plugins/WorkspaceControlPlugin.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
+import { WorkspaceCommandService } from "./workspace/WorkspaceCommandService.js";
 
 class FakeSession implements PluginSession {
   private readonly dataListeners = new Set<(data: string) => void>();
@@ -46,7 +47,7 @@ class FakeSession implements PluginSession {
     };
   }
 
-  handleAction(action: string, input: Record<string, unknown>, context?: PluginActionContext) {
+  handleAction(action: string, input: Record<string, unknown>, context?: PluginActionContext): Promise<Record<string, unknown>> | Record<string, unknown> {
     this.lastActionContext = context;
     return this.nextActionResult ?? { action, input };
   }
@@ -82,6 +83,7 @@ class FakeDefaultPlugin implements WorkspacePlugin {
   readonly requiresDirectory = true;
   readonly actions;
   lastSession: FakeSession | undefined;
+  readonly sessions: FakeSession[] = [];
   lastControls: PluginTabControls | undefined;
   lastInput: CreatePluginSessionInput | undefined;
   createCount = 0;
@@ -122,6 +124,7 @@ class FakeDefaultPlugin implements WorkspacePlugin {
     this.lastInput = input;
     this.lastControls = input.controls;
     this.lastSession = new FakeSession(input.tab);
+    this.sessions.push(this.lastSession);
     return this.lastSession;
   }
 
@@ -141,6 +144,318 @@ class FakeDefaultPlugin implements WorkspacePlugin {
 }
 
 describe("SessionStore voice actions", () => {
+  it("creates and durably places a tab through one server-owned workspace command", async () => {
+    const { store, root, workspace } = await createStore({ withWorkspace: true });
+    const window = workspace!.getActiveWindow();
+    const paneId = window.layout.activePaneId;
+    const commands = new WorkspaceCommandService(store, workspace!);
+
+    const result = await commands.createTab({ pluginId: "fake-default", cwd: root, windowId: window.id, paneId });
+
+    expect(result.window.layout.root).toMatchObject({ type: "pane", pane: { id: paneId, tabIds: [result.tab.id], activeTabId: result.tab.id } });
+    expect(new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root])).findWindowForTab(result.tab.id)?.id).toBe(window.id);
+  });
+
+  it("serializes concurrent tab commands so every published session remains placed", async () => {
+    const { store, root, workspace, workspaceCommands } = await createStore({ withWorkspace: true });
+    const window = workspace!.getActiveWindow();
+    const workspaceFile = (workspace as unknown as { workspaceFile: { write(value: unknown): Promise<void> } }).workspaceFile;
+    const originalWrite = workspaceFile.write.bind(workspaceFile);
+    const originalPlaceTab = workspace!.placeTab.bind(workspace);
+    const firstWriteStarted = deferred<void>();
+    const secondPlacementStarted = deferred<void>();
+    const releaseFirstWrite = deferred<void>();
+    let writes = 0;
+    let placements = 0;
+    workspace!.placeTab = async (input) => {
+      placements += 1;
+      const placement = originalPlaceTab(input);
+      if (placements === 2) {
+        secondPlacementStarted.resolve();
+      }
+      return placement;
+    };
+    workspaceFile.write = async (value) => {
+      writes += 1;
+      if (writes === 1) {
+        firstWriteStarted.resolve();
+        await releaseFirstWrite.promise;
+      }
+      await originalWrite(value);
+    };
+
+    const first = workspaceCommands!.createTab({ pluginId: "fake-default", cwd: root, title: "First", windowId: window.id, paneId: window.layout.activePaneId });
+    await firstWriteStarted.promise;
+    const second = workspaceCommands!.createTab({ pluginId: "fake-default", cwd: root, title: "Second", windowId: window.id, paneId: window.layout.activePaneId });
+    await Promise.race([secondPlacementStarted.promise, delay(50)]);
+    releaseFirstWrite.resolve();
+    const created = await Promise.all([first, second]);
+
+    workspaceFile.write = originalWrite;
+    workspace!.placeTab = originalPlaceTab;
+    const placedTabIds = workspace!.tabIdsForWindow(window.id);
+    expect(placedTabIds).toEqual(expect.arrayContaining(created.map(({ tab }) => tab.id)));
+    expect(store.listTabs().map((tab) => tab.id)).toEqual(expect.arrayContaining(placedTabIds));
+    const reloaded = new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root]));
+    expect(created.every(({ tab }) => reloaded.findWindowForTab(tab.id)?.id === window.id)).toBe(true);
+  });
+
+  it("rolls back the session, context, and layout when durable placement fails", async () => {
+    const { store, root, workspace, plugin } = await createStore({ withWorkspace: true });
+    const window = workspace!.getActiveWindow();
+    const before = workspace!.snapshot();
+    const workspaceFile = (workspace as unknown as { workspaceFile: { write(value: unknown): Promise<void> } }).workspaceFile;
+    workspaceFile.write = vi.fn().mockRejectedValue(Object.assign(new Error("no space left on device"), { code: "ENOSPC" }));
+    const commands = new WorkspaceCommandService(store, workspace!);
+
+    await expect(commands.createTab({ pluginId: "fake-default", cwd: root, windowId: window.id, paneId: window.layout.activePaneId })).rejects.toThrow("no space left on device");
+
+    expect(store.listTabs()).toEqual([]);
+    expect(plugin.lastSession?.stopped).toBe(true);
+    expect(workspace!.snapshot().windows).toEqual(before.windows);
+    await expect(fs.readdir(path.join(root, ".cloudx", "context"))).resolves.toEqual([]);
+  });
+
+  it("rejects and cleans a prepared tab closed before placement commits", async () => {
+    const { store, root, workspace, workspaceCommands, plugin } = await createStore({ withWorkspace: true });
+    const window = workspace!.getActiveWindow();
+    const before = workspace!.snapshot();
+    const workspaceFile = (workspace as unknown as { workspaceFile: { write(value: unknown): Promise<void> } }).workspaceFile;
+    const originalWrite = workspaceFile.write.bind(workspaceFile);
+    const writeStarted = deferred<void>();
+    const releaseWrite = deferred<void>();
+    let writes = 0;
+    workspaceFile.write = async (value) => {
+      writes += 1;
+      if (writes === 1) {
+        writeStarted.resolve();
+        await releaseWrite.promise;
+      }
+      await originalWrite(value);
+    };
+
+    const creation = workspaceCommands!.createTab({
+      pluginId: "fake-default",
+      cwd: root,
+      windowId: window.id,
+      paneId: window.layout.activePaneId
+    });
+    await writeStarted.promise;
+    plugin.lastControls!.closeTab("plugin exited");
+    releaseWrite.resolve();
+
+    await expect(creation).rejects.toThrow("closed before its workspace transaction committed");
+
+    expect(store.listTabs()).toEqual([]);
+    expect(plugin.lastSession?.stopped).toBe(true);
+    expect(workspace!.snapshot()).toMatchObject({
+      activeWindowId: before.activeWindowId,
+      windows: before.windows,
+      templates: before.templates
+    });
+    expect(new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root])).findWindowForTab(plugin.lastSession!.tab.id)).toBeUndefined();
+    await expect(fs.readdir(path.join(root, ".cloudx", "context"))).resolves.toEqual([]);
+  });
+
+  it("rejects an unknown pane before starting a session", async () => {
+    const { store, root, workspace, plugin } = await createStore({ withWorkspace: true });
+    const window = workspace!.getActiveWindow();
+    const commands = new WorkspaceCommandService(store, workspace!);
+
+    await expect(commands.createTab({ pluginId: "fake-default", cwd: root, windowId: window.id, paneId: "missing-pane" })).rejects.toMatchObject({
+      code: "WORKSPACE_PANE_CONFLICT",
+      statusCode: 409
+    });
+
+    expect(plugin.createCount).toBe(0);
+    expect(store.listTabs()).toEqual([]);
+  });
+
+  it("removes startup context when a plugin session cannot start", async () => {
+    const { store, root, workspace, plugin } = await createStore({ withWorkspace: true });
+    plugin.createSession = () => {
+      throw new Error("plugin startup failed");
+    };
+    const window = workspace!.getActiveWindow();
+    const before = workspace!.snapshot();
+    const commands = new WorkspaceCommandService(store, workspace!);
+
+    await expect(commands.createTab({ pluginId: "fake-default", cwd: root, windowId: window.id, paneId: window.layout.activePaneId })).rejects.toThrow("plugin startup failed");
+
+    expect(store.listTabs()).toEqual([]);
+    expect(workspace!.snapshot().windows).toEqual(before.windows);
+    await expect(fs.readdir(path.join(root, ".cloudx", "context"))).resolves.toEqual([]);
+  });
+
+  it("rolls back every staged session and workspace change when layout-template startup partially fails", async () => {
+    const { store, root, workspace, workspaceCommands, plugin } = await createStore({ withWorkspace: true });
+    const project = path.join(root, "project");
+    await fs.mkdir(project);
+    const sourceWindow = workspace!.getActiveWindow();
+    const firstSource = await store.createTab({ pluginId: "fake-default", cwd: project, title: "First source", windowId: sourceWindow.id });
+    const secondSource = await store.createTab({ pluginId: "fake-default", cwd: project, title: "Second source", windowId: sourceWindow.id });
+    await workspace!.updateWindow(sourceWindow.id, { layout: layoutWithTabs([firstSource.id, secondSource.id]) });
+    const template = await workspace!.createTemplate(
+      { name: "Pair", basePath: project, windowId: sourceWindow.id },
+      [{ tab: firstSource }, { tab: secondSource }]
+    );
+    const beforeWorkspace = workspace!.snapshot();
+    const beforeTabs = store.listTabs().map((tab) => tab.id);
+    const beforeContextFiles = await fs.readdir(path.join(root, ".cloudx", "context"));
+    let starts = 0;
+    let stagedSession: FakeSession | undefined;
+    plugin.createSession = (input) => {
+      starts += 1;
+      if (starts === 2) {
+        throw new Error("second template tab failed");
+      }
+      stagedSession = new FakeSession(input.tab);
+      return stagedSession;
+    };
+
+    await expect(workspaceCommands!.applyLayoutTemplate(template.id, { projectPath: project })).rejects.toThrow("second template tab failed");
+
+    expect(stagedSession?.stopped).toBe(true);
+    expect(store.listTabs().map((tab) => tab.id)).toEqual(beforeTabs);
+    expect(workspace!.snapshot()).toMatchObject({
+      activeWindowId: beforeWorkspace.activeWindowId,
+      windows: beforeWorkspace.windows,
+      templates: beforeWorkspace.templates
+    });
+    await expect(fs.readdir(path.join(root, ".cloudx", "context"))).resolves.toEqual(beforeContextFiles);
+  });
+
+  it("serializes concurrent layout-template applications and commits each complete window", async () => {
+    const { store, root, workspace, workspaceCommands } = await createStore({ withWorkspace: true });
+    const project = path.join(root, "project");
+    await fs.mkdir(project);
+    const sourceWindow = workspace!.getActiveWindow();
+    const source = await store.createTab({ pluginId: "fake-default", cwd: project, title: "Template tab", windowId: sourceWindow.id });
+    await workspace!.updateWindow(sourceWindow.id, { layout: layoutWithTab(source.id) });
+    const template = await workspace!.createTemplate({ name: "One tab", basePath: project, windowId: sourceWindow.id }, [{ tab: source }]);
+    const workspaceFile = (workspace as unknown as { workspaceFile: { write(value: unknown): Promise<void> } }).workspaceFile;
+    const originalWrite = workspaceFile.write.bind(workspaceFile);
+    const firstWriteStarted = deferred<void>();
+    const releaseFirstWrite = deferred<void>();
+    let writes = 0;
+    workspaceFile.write = async (value) => {
+      writes += 1;
+      if (writes === 1) {
+        firstWriteStarted.resolve();
+        await releaseFirstWrite.promise;
+      }
+      await originalWrite(value);
+    };
+
+    const first = workspaceCommands!.applyLayoutTemplate(template.id, { projectPath: project, name: "First applied" });
+    await firstWriteStarted.promise;
+    const second = workspaceCommands!.applyLayoutTemplate(template.id, { projectPath: project, name: "Second applied" });
+    await new Promise((resolve) => setImmediate(resolve));
+    releaseFirstWrite.resolve();
+    const applied = await Promise.all([first, second]);
+
+    workspaceFile.write = originalWrite;
+    const appliedWindows = applied.map(({ window }) => window);
+    expect(appliedWindows.map((window) => window.name)).toEqual(["First applied", "Second applied"]);
+    expect(appliedWindows.every((window) => workspace!.tabIdsForWindow(window.id).length === 1)).toBe(true);
+    const referenced = new Set(workspace!.snapshot().windows.flatMap((window) => workspace!.tabIdsForWindow(window.id)));
+    expect(store.listTabs().every((tab) => referenced.has(tab.id))).toBe(true);
+  });
+
+  it("rolls back staged template sessions and contexts when the layout commit cannot persist", async () => {
+    const { store, root, workspace, workspaceCommands, plugin } = await createStore({ withWorkspace: true });
+    const project = path.join(root, "project");
+    await fs.mkdir(project);
+    const sourceWindow = workspace!.getActiveWindow();
+    const source = await store.createTab({ pluginId: "fake-default", cwd: project, title: "Template tab", windowId: sourceWindow.id });
+    await workspace!.updateWindow(sourceWindow.id, { layout: layoutWithTab(source.id) });
+    const template = await workspace!.createTemplate({ name: "Persisted", basePath: project, windowId: sourceWindow.id }, [{ tab: source }]);
+    const beforeWorkspace = workspace!.snapshot();
+    const beforeTabs = store.listTabs().map((tab) => tab.id);
+    const beforeContextFiles = await fs.readdir(path.join(root, ".cloudx", "context"));
+    const workspaceFile = (workspace as unknown as { workspaceFile: { write(value: unknown): Promise<void> } }).workspaceFile;
+    workspaceFile.write = vi.fn().mockRejectedValue(Object.assign(new Error("no space left on device"), { code: "ENOSPC" }));
+
+    await expect(workspaceCommands!.applyLayoutTemplate(template.id, { projectPath: project })).rejects.toThrow("no space left on device");
+
+    expect(plugin.lastSession?.stopped).toBe(true);
+    expect(store.listTabs().map((tab) => tab.id)).toEqual(beforeTabs);
+    expect(workspace!.snapshot()).toMatchObject({
+      activeWindowId: beforeWorkspace.activeWindowId,
+      windows: beforeWorkspace.windows,
+      templates: beforeWorkspace.templates
+    });
+    await expect(fs.readdir(path.join(root, ".cloudx", "context"))).resolves.toEqual(beforeContextFiles);
+  });
+
+  it("restores the prior template window when a prepared plugin closes during commit", async () => {
+    const { store, root, workspace, workspaceCommands, plugin } = await createStore({ withWorkspace: true });
+    const project = path.join(root, "project");
+    await fs.mkdir(project);
+    const targetWindow = workspace!.getActiveWindow();
+    const source = await store.createTab({ pluginId: "fake-default", cwd: project, title: "Template tab", windowId: targetWindow.id });
+    await workspace!.updateWindow(targetWindow.id, { layout: layoutWithTab(source.id) });
+    const template = await workspace!.createTemplate({ name: "Persisted", basePath: project, windowId: targetWindow.id }, [{ tab: source }]);
+    const beforeWorkspace = workspace!.snapshot();
+    const beforeTabs = store.listTabs().map((tab) => tab.id);
+    const beforeContextFiles = await fs.readdir(path.join(root, ".cloudx", "context"));
+    const workspaceFile = (workspace as unknown as { workspaceFile: { write(value: unknown): Promise<void> } }).workspaceFile;
+    const originalWrite = workspaceFile.write.bind(workspaceFile);
+    const writeStarted = deferred<void>();
+    const releaseWrite = deferred<void>();
+    let writes = 0;
+    workspaceFile.write = async (value) => {
+      writes += 1;
+      if (writes === 1) {
+        writeStarted.resolve();
+        await releaseWrite.promise;
+      }
+      await originalWrite(value);
+    };
+
+    const application = workspaceCommands!.applyLayoutTemplate(template.id, { projectPath: project, windowId: targetWindow.id });
+    await writeStarted.promise;
+    const stagedSession = plugin.lastSession!;
+    plugin.lastControls!.closeTab("plugin exited");
+    releaseWrite.resolve();
+
+    await expect(application).rejects.toThrow("closed before its workspace transaction committed");
+
+    expect(workspace!.snapshot()).toMatchObject({
+      activeWindowId: beforeWorkspace.activeWindowId,
+      windows: beforeWorkspace.windows,
+      templates: beforeWorkspace.templates
+    });
+    const reloaded = new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root]));
+    expect(reloaded.snapshot()).toMatchObject({
+      activeWindowId: beforeWorkspace.activeWindowId,
+      windows: beforeWorkspace.windows,
+      templates: beforeWorkspace.templates
+    });
+    expect(store.listTabs().map((tab) => tab.id)).toEqual(beforeTabs);
+    expect(store.getSession(source.id)).toBeDefined();
+    expect(stagedSession.stopped).toBe(true);
+    expect(store.listTabs()).not.toContainEqual(expect.objectContaining({ id: stagedSession.tab.id }));
+    await expect(fs.readdir(path.join(root, ".cloudx", "context"))).resolves.toEqual(beforeContextFiles);
+  });
+
+  it("owns and reports rejected background context writes", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-session-context-error-"));
+    const plugin = new FakeDefaultPlugin();
+    const registry = new PluginRegistry();
+    registry.register(plugin);
+    const context = new TabContextService(path.join(root, ".cloudx"));
+    const failure = new Error("context write failed");
+    vi.spyOn(context, "record").mockRejectedValue(failure);
+    const errors: Array<{ error: unknown; operation: string; tabId: string }> = [];
+    const store = new SessionStore(registry, new PathPolicy([root]), context, undefined, undefined, undefined, (error, details) => errors.push({ error, ...details }));
+    const tab = await store.createTab({ pluginId: "fake-default", cwd: root });
+
+    plugin.lastSession!.emitData("output");
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(errors).toEqual([{ error: failure, operation: "record terminal output", tabId: tab.id }]);
+  });
   it("creates tabs with a default green indicator", async () => {
     const { store, root } = await createStore();
 
@@ -197,14 +512,24 @@ describe("SessionStore voice actions", () => {
     const registry = new PluginRegistry();
     registry.register(new LocalWebPlugin());
     registry.register(new WorkspaceControlPlugin());
-    const store = new SessionStore(registry, new PathPolicy([root]), new TabContextService(path.join(root, ".cloudx")));
+    const pathPolicy = new PathPolicy([root]);
+    const workspace = new WorkspaceLayoutStore(path.join(root, ".cloudx"), pathPolicy);
+    const store = new SessionStore(registry, pathPolicy, new TabContextService(path.join(root, ".cloudx")), undefined, workspace);
+    const hooks = new HookRegistry();
+    registerCoreHooks(hooks, coreHookServices(store, registry, pathPolicy, workspace));
+    store.setHookRegistry(hooks);
+    const window = workspace.getActiveWindow();
 
     const result = await store.executeVoiceAction({
+      id: "open-local-web",
+      dependsOn: [],
       pluginId: WORKSPACE_CONTROL_PLUGIN_ID,
       action: "create_tab",
       input: {
         targetPluginId: "local-web",
-        url: "http://127.0.0.1:5173?token=test"
+        url: "http://127.0.0.1:5173?token=test",
+        windowId: window.id,
+        paneId: window.layout.activePaneId
       }
     });
 
@@ -373,6 +698,8 @@ describe("SessionStore voice actions", () => {
     const tab = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Shell" });
 
     const result = await store.executeVoiceAction({
+      id: "enter-text-hook",
+      dependsOn: [],
       hookId: pluginActionHookId("fake-default", "enter_text"),
       targetTabId: tab.id,
       pluginId: "fake-default",
@@ -410,6 +737,8 @@ describe("SessionStore voice actions", () => {
     plugin.lastSession!.nextActionResult = ["not", "a", "record"] as unknown as Record<string, unknown>;
     await expect(
       store.executeVoiceAction({
+        id: "invalid-output",
+        dependsOn: [],
         targetTabId: tab.id,
         pluginId: "fake-default",
         action: "enter_text",
@@ -422,17 +751,21 @@ describe("SessionStore voice actions", () => {
   it("executes workspace controls through voice hook ids", async () => {
     const { store, root, registry, pathPolicy, workspace } = await createStore({ withWorkspace: true });
     const hooks = new HookRegistry();
-    registerCoreHooks(hooks, { sessions: store, plugins: registry, pathPolicy, workspace: workspace! });
+    registerCoreHooks(hooks, coreHookServices(store, registry, pathPolicy, workspace!));
     store.setHookRegistry(hooks);
+    const window = workspace!.getActiveWindow();
 
     const result = await store.executeVoiceAction({
+      id: "create-hook-tab",
+      dependsOn: [],
       hookId: "workspace.tabs.create",
       action: "workspace.tabs.create",
       input: {
         pluginId: "fake-default",
         cwd: root,
         title: "Voice Hook",
-        paneId: "pane-2",
+        windowId: window.id,
+        paneId: window.layout.activePaneId,
         newPane: true,
         splitDirection: "row"
       }
@@ -440,7 +773,7 @@ describe("SessionStore voice actions", () => {
 
     expect(result).toMatchObject({
       tab: { pluginId: "fake-default", title: "Voice Hook", cwd: root },
-      layoutInstruction: { type: "open_tab_in_new_pane", paneId: "pane-2", splitDirection: "row" }
+      window: { id: window.id, layout: { root: { type: "split" } } }
     });
   });
 
@@ -449,19 +782,20 @@ describe("SessionStore voice actions", () => {
     const project = path.join(root, "project");
     await fs.mkdir(project);
     const hooks = new HookRegistry();
-    registerCoreHooks(hooks, { sessions: store, plugins: registry, pathPolicy, workspace: workspace! });
+    registerCoreHooks(hooks, coreHookServices(store, registry, pathPolicy, workspace!));
     await store.createTab({ pluginId: "fake-default", cwd: root, title: "Active" });
     const target = await workspace!.createWindow({ name: "Project", defaultCwd: project });
 
     const result = await hooks.call("workspace.tabs.create", {
       pluginId: "fake-default",
       title: "Window Default",
-      windowId: target.id
+      windowId: target.id,
+      paneId: target.layout.activePaneId
     }, { caller: { kind: "automation" } });
 
     expect(result).toMatchObject({
       tab: { pluginId: "fake-default", title: "Window Default", cwd: project },
-      layoutInstruction: { windowId: target.id }
+      window: { id: target.id }
     });
   });
 
@@ -469,7 +803,7 @@ describe("SessionStore voice actions", () => {
     const { store, root, registry, pathPolicy, workspace } = await createStore({ withWorkspace: true });
     const project = path.join(root, "hook-created-project");
     const hooks = new HookRegistry();
-    registerCoreHooks(hooks, { sessions: store, plugins: registry, pathPolicy, workspace: workspace! });
+    registerCoreHooks(hooks, coreHookServices(store, registry, pathPolicy, workspace!));
 
     const result = await hooks.call(
       "workspace.windows.create",
@@ -487,7 +821,7 @@ describe("SessionStore voice actions", () => {
   it("defers workspace window activation side effects for automation callers", async () => {
     const { store, root, registry, pathPolicy, workspace } = await createStore({ withWorkspace: true });
     const hooks = new HookRegistry();
-    registerCoreHooks(hooks, { sessions: store, plugins: registry, pathPolicy, workspace: workspace! });
+    registerCoreHooks(hooks, coreHookServices(store, registry, pathPolicy, workspace!));
     const original = workspace!.getActiveWindow();
     const target = await workspace!.createWindow({ name: "Backend", defaultCwd: root });
     await workspace!.selectWindow(original.id);
@@ -505,7 +839,7 @@ describe("SessionStore voice actions", () => {
   it("honors workspace.tabs.close stopSession defaults and explicit session shutdown", async () => {
     const { store, root, registry, pathPolicy, workspace, plugin } = await createStore({ withWorkspace: true });
     const hooks = new HookRegistry();
-    registerCoreHooks(hooks, { sessions: store, plugins: registry, pathPolicy, workspace: workspace! });
+    registerCoreHooks(hooks, coreHookServices(store, registry, pathPolicy, workspace!));
     const defaultCloseTab = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Default Close" });
     const defaultCloseSession = plugin.lastSession;
 
@@ -538,7 +872,7 @@ describe("SessionStore voice actions", () => {
     };
     const store = new SessionStore(registry, pathPolicy, new TabContextService(path.join(root, ".cloudx")), { getPluginConfig: () => ({}) }, workspace, resolver);
     const hooks = new HookRegistry();
-    registerCoreHooks(hooks, { sessions: store, plugins: registry, pathPolicy, workspace });
+    registerCoreHooks(hooks, coreHookServices(store, registry, pathPolicy, workspace));
     const sourceWindow = workspace.getActiveWindow();
     const sourceTab = await store.createTab({ pluginId: "fake-default", cwd: appPath, title: "Template Source", windowId: sourceWindow.id });
     await workspace.updateWindow(sourceWindow.id, { layout: layoutWithTab(sourceTab.id) });
@@ -564,7 +898,7 @@ describe("SessionStore voice actions", () => {
     }
     const { store, root, registry, pathPolicy, workspace } = await createStore({ withWorkspace: true });
     const hooks = new HookRegistry();
-    registerCoreHooks(hooks, { sessions: store, plugins: registry, pathPolicy, workspace: workspace! });
+    registerCoreHooks(hooks, coreHookServices(store, registry, pathPolicy, workspace!));
     const controller = new AbortController();
     const childPidPath = path.join(root, "shell-child.pid");
     const command = `sleep 60 & echo $! > ${shellQuote(childPidPath)}; wait`;
@@ -584,7 +918,7 @@ describe("SessionStore voice actions", () => {
   it("truncates shell command output without splitting UTF-8 characters", async () => {
     const { store, root, registry, pathPolicy, workspace } = await createStore({ withWorkspace: true });
     const hooks = new HookRegistry();
-    registerCoreHooks(hooks, { sessions: store, plugins: registry, pathPolicy, workspace: workspace! });
+    registerCoreHooks(hooks, coreHookServices(store, registry, pathPolicy, workspace!));
     const command = `${shellQuote(process.execPath)} -e ${shellQuote("process.stdout.write('🙂'.repeat(400));")}`;
 
     const result = await hooks.call(
@@ -603,7 +937,7 @@ describe("SessionStore voice actions", () => {
   it("decodes shell command output across split UTF-8 chunks", async () => {
     const { store, root, registry, pathPolicy, workspace } = await createStore({ withWorkspace: true });
     const hooks = new HookRegistry();
-    registerCoreHooks(hooks, { sessions: store, plugins: registry, pathPolicy, workspace: workspace! });
+    registerCoreHooks(hooks, coreHookServices(store, registry, pathPolicy, workspace!));
     const script = "const bytes = Buffer.from('A🙂B', 'utf8'); process.stdout.write(bytes.subarray(0, 3)); setTimeout(() => process.stdout.write(bytes.subarray(3)), 25);";
     const command = `${shellQuote(process.execPath)} -e ${shellQuote(script)}`;
 
@@ -622,7 +956,7 @@ describe("SessionStore voice actions", () => {
   it("rejects shell command inputs outside declared bounds instead of silently clamping them", async () => {
     const { store, root, registry, pathPolicy, workspace } = await createStore({ withWorkspace: true });
     const hooks = new HookRegistry();
-    registerCoreHooks(hooks, { sessions: store, plugins: registry, pathPolicy, workspace: workspace! });
+    registerCoreHooks(hooks, coreHookServices(store, registry, pathPolicy, workspace!));
 
     await expect(
       hooks.call(
@@ -666,24 +1000,28 @@ describe("SessionStore voice actions", () => {
     const alpha = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Alpha" });
     const beta = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Beta" });
 
-    const result = await store.executeVoiceAction({ pluginId: WORKSPACE_CONTROL_PLUGIN_ID, action: "switch_tab", input: { title: "Alpha" } });
+    const result = await store.executeVoiceAction({ id: "switch-tab", dependsOn: [], pluginId: WORKSPACE_CONTROL_PLUGIN_ID, action: "switch_tab", input: { title: "Alpha" } });
 
     expect(result).toMatchObject({ title: "Alpha" });
     expect(store.getActiveTabId()).toBe(alpha.id);
     expect(store.getActiveTabId()).not.toBe(beta.id);
   });
 
-  it("creates tabs through workspace-control with client pane instructions", async () => {
-    const { store, root } = await createStore();
+  it("creates and places tabs through workspace-control", async () => {
+    const { store, root, workspace } = await createStore({ withWorkspace: true });
+    const window = workspace!.getActiveWindow();
 
     const result = await store.executeVoiceAction({
+      id: "create-tab",
+      dependsOn: [],
       pluginId: WORKSPACE_CONTROL_PLUGIN_ID,
       action: "create_tab",
       input: {
         targetPluginId: "fake-default",
         cwd: root,
         title: "Voice Codex",
-        paneId: "pane-2",
+        windowId: window.id,
+        paneId: window.layout.activePaneId,
         newPane: true,
         splitDirection: "row",
         createDirectory: false
@@ -692,21 +1030,26 @@ describe("SessionStore voice actions", () => {
 
     expect(result).toMatchObject({
       tab: { pluginId: "fake-default", title: "Voice Codex", cwd: root },
-      layoutInstruction: { type: "open_tab_in_new_pane", paneId: "pane-2", splitDirection: "row" }
+      window: { id: window.id, layout: { root: { type: "split" } } }
     });
     expect(store.listTabs()).toHaveLength(1);
     expect(store.getActiveTabId()).toBe((result.tab as WorkspaceTab).id);
   });
 
   it("uses the default directory when voice creates a directory-backed tab without cwd", async () => {
-    const { store, root } = await createStore();
+    const { store, root, workspace } = await createStore({ withWorkspace: true });
+    const window = workspace!.getActiveWindow();
 
     const result = await store.executeVoiceAction({
+      id: "create-shell",
+      dependsOn: [],
       pluginId: WORKSPACE_CONTROL_PLUGIN_ID,
       action: "create_tab",
       input: {
         targetPluginId: "fake-default",
-        title: "Voice Shell"
+        title: "Voice Shell",
+        windowId: window.id,
+        paneId: window.layout.activePaneId
       }
     });
 
@@ -715,17 +1058,44 @@ describe("SessionStore voice actions", () => {
     });
   });
 
-  it("passes plugin-specific initial input from workspace-control tab creation", async () => {
-    const { store, root, plugin } = await createStore();
+  it("uses the explicit target window directory for voice-created tabs", async () => {
+    const { store, root, workspace } = await createStore({ withWorkspace: true });
+    const project = path.join(root, "voice-project");
+    await fs.mkdir(project);
+    const target = await workspace!.createWindow({ name: "Voice Project", defaultCwd: project });
 
     const result = await store.executeVoiceAction({
+      id: "create-project-shell",
+      dependsOn: [],
+      pluginId: WORKSPACE_CONTROL_PLUGIN_ID,
+      action: "create_tab",
+      input: {
+        targetPluginId: "fake-default",
+        title: "Project Shell",
+        windowId: target.id,
+        paneId: target.layout.activePaneId
+      }
+    });
+
+    expect(result).toMatchObject({ tab: { cwd: project }, window: { id: target.id } });
+  });
+
+  it("passes plugin-specific initial input from workspace-control tab creation", async () => {
+    const { store, root, plugin, workspace } = await createStore({ withWorkspace: true });
+    const window = workspace!.getActiveWindow();
+
+    const result = await store.executeVoiceAction({
+      id: "create-dashboard",
+      dependsOn: [],
       pluginId: WORKSPACE_CONTROL_PLUGIN_ID,
       action: "create_tab",
       input: {
         targetPluginId: "fake-default",
         cwd: root,
         title: "Dashboard",
-        url: "http://127.0.0.1:5173?token=test"
+        url: "http://127.0.0.1:5173?token=test",
+        windowId: window.id,
+        paneId: window.layout.activePaneId
       }
     });
 
@@ -738,6 +1108,8 @@ describe("SessionStore voice actions", () => {
 
     await expect(
       store.executeVoiceAction({
+        id: "select-pane",
+        dependsOn: [],
         pluginId: WORKSPACE_CONTROL_PLUGIN_ID,
         action: "select_pane",
         input: { paneId: "pane-right" }
@@ -746,6 +1118,8 @@ describe("SessionStore voice actions", () => {
 
     await expect(
       store.executeVoiceAction({
+        id: "split-pane",
+        dependsOn: [],
         pluginId: WORKSPACE_CONTROL_PLUGIN_ID,
         action: "split_pane",
         input: { paneId: "pane-right", splitDirection: "column" }
@@ -758,6 +1132,8 @@ describe("SessionStore voice actions", () => {
     const target = await workspace!.createWindow({ name: "Backend", defaultCwd: root });
 
     const result = await store.executeVoiceAction({
+      id: "switch-window",
+      dependsOn: [],
       pluginId: WORKSPACE_CONTROL_PLUGIN_ID,
       action: "switch_window",
       input: { title: "Backend" }
@@ -773,6 +1149,8 @@ describe("SessionStore voice actions", () => {
 
     const result = await store.executeVoiceAction(
       {
+        id: "plugin-target",
+        dependsOn: [],
         pluginId: "fake-default",
         targetTabId: "fake-default",
         action: "enter_text",
@@ -790,6 +1168,8 @@ describe("SessionStore voice actions", () => {
 
     const result = await store.executeVoiceAction(
       {
+        id: "sanitize-input",
+        dependsOn: [],
         pluginId: "fake-default",
         targetTabId: tab.id,
         action: "enter_text",
@@ -806,6 +1186,8 @@ describe("SessionStore voice actions", () => {
     const tab = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Shell" });
 
     const result = await store.executeVoiceAction({
+      id: "only-plugin-tab",
+      dependsOn: [],
       pluginId: "fake-default",
       targetTabId: "fake-default",
       action: "enter_text",
@@ -823,6 +1205,126 @@ describe("SessionStore voice actions", () => {
     store.closeTab(tab.id);
 
     expect(() => plugin.lastSession?.emitData("late output")).not.toThrow();
+  });
+
+  it("stops every live plugin session when the store is disposed", async () => {
+    const { store, root, plugin } = await createStore();
+    await store.createTab({ pluginId: "fake-default", cwd: root, title: "First" });
+    await store.createTab({ pluginId: "fake-default", cwd: root, title: "Second" });
+    const sessions = [...plugin.sessions];
+
+    const firstDispose = store.dispose();
+    const secondDispose = store.dispose();
+
+    expect(secondDispose).toBe(firstDispose);
+    await firstDispose;
+
+    expect(sessions).toHaveLength(2);
+    expect(sessions.every((session) => session.stopped)).toBe(true);
+    expect(store.listTabs()).toEqual([]);
+  });
+
+  it("drains an admitted action and its late trigger before stopping the session", async () => {
+    const { store, root, plugin } = await createStore();
+    const tab = await store.createTab({ pluginId: "fake-default", cwd: root });
+    const actionStarted = deferred<void>();
+    const releaseAction = deferred<void>();
+    const triggerStarted = deferred<void>();
+    const releaseTrigger = deferred<void>();
+    const controller = new AbortController();
+    store.setTriggerRegistry({
+      emit: async () => {
+        triggerStarted.resolve();
+        await releaseTrigger.promise;
+        return { id: "event-1" };
+      }
+    } as never);
+    const emitTrigger = plugin.lastInput!.app!.emitTrigger;
+    vi.spyOn(plugin.lastSession!, "handleAction").mockImplementation(async (_action, input, context) => {
+      expect(context?.signal).toBe(controller.signal);
+      actionStarted.resolve();
+      await releaseAction.promise;
+      await emitTrigger("fake.completed", { eventId: "event-1" });
+      return { action: "enter_text", input };
+    });
+
+    const action = store.executePluginAction(tab.id, "enter_text", { text: "drain" }, controller.signal);
+    await actionStarted.promise;
+    const disposal = store.dispose();
+
+    expect(plugin.lastSession?.stopped).toBe(false);
+    await expect(emitTrigger("fake.unscoped", { eventId: "outside" })).rejects.toThrow("Session store is disposed");
+    releaseAction.resolve();
+    await triggerStarted.promise;
+    expect(plugin.lastSession?.stopped).toBe(false);
+    releaseTrigger.resolve();
+
+    await expect(Promise.all([action, disposal])).resolves.toBeTruthy();
+    expect(plugin.lastSession?.stopped).toBe(true);
+  });
+
+  it("tracks hook and voice actions through the same shutdown admission", async () => {
+    const { store, root, plugin } = await createStore();
+    const tab = await store.createTab({ pluginId: "fake-default", cwd: root });
+    const started = deferred<void>();
+    const release = deferred<void>();
+    let calls = 0;
+    vi.spyOn(plugin.lastSession!, "handleAction").mockImplementation(async (action, input) => {
+      calls += 1;
+      if (calls === 2) started.resolve();
+      await release.promise;
+      return { action, input };
+    });
+    const hook = store.executePluginHook(
+      "fake-default",
+      pluginActionHookId("fake-default", "enter_text"),
+      "enter_text",
+      tab.id,
+      { text: "hook" },
+      { kind: "automation" }
+    );
+    const voice = store.executeVoiceAction({
+      id: "voice",
+      dependsOn: [],
+      pluginId: "fake-default",
+      targetTabId: tab.id,
+      action: "enter_text",
+      input: { text: "voice" }
+    });
+    await started.promise;
+
+    const disposal = store.dispose();
+    expect(plugin.lastSession?.stopped).toBe(false);
+    release.resolve();
+
+    await Promise.all([hook, voice, disposal]);
+    expect(plugin.lastSession?.stopped).toBe(true);
+  });
+
+  it("expires admission inherited by detached work after its action returns", async () => {
+    const { store, root, plugin } = await createStore();
+    const tab = await store.createTab({ pluginId: "fake-default", cwd: root });
+    const releaseDetached = deferred<void>();
+    const detachedResult = deferred<unknown>();
+    const emitTrigger = plugin.lastInput!.app!.emitTrigger;
+    store.setTriggerRegistry({ emit: vi.fn() } as never);
+    vi.spyOn(plugin.lastSession!, "handleAction").mockImplementation(async () => {
+      void releaseDetached.promise.then(async () => {
+        try {
+          await emitTrigger("fake.detached", { eventId: "detached" });
+          detachedResult.resolve(undefined);
+        } catch (error) {
+          detachedResult.resolve(error);
+        }
+      });
+      return { action: "enter_text", input: {} };
+    });
+
+    await store.executePluginAction(tab.id, "enter_text", { text: "detach" });
+    await store.dispose();
+    releaseDetached.resolve();
+
+    await expect(detachedResult.promise).resolves.toEqual(expect.objectContaining({ message: "Session store is disposed." }));
   });
 
   it("passes resolved runtime context and updates tab template metadata", async () => {
@@ -944,6 +1446,39 @@ describe("SessionStore voice actions", () => {
 
     expect(store.getTab(tab.id).indicator).toMatchObject({ color: "red", label: "review" });
   });
+
+  it("ignores an indicator resolved after its tab closes", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-session-indicator-close-"));
+    const plugin = new FakeDefaultPlugin();
+    const registry = new PluginRegistry();
+    registry.register(plugin);
+    const pathPolicy = new PathPolicy([root]);
+    const indicatorStarted = deferred<void>();
+    const releaseIndicator = deferred<void>();
+    let delayIndicator = false;
+    const resolver: SessionRuntimeContextResolver = {
+      runtimeContextFor: () => ({}),
+      tabIndicatorFor: async () => {
+        if (!delayIndicator) {
+          return undefined;
+        }
+        indicatorStarted.resolve();
+        await releaseIndicator.promise;
+        return { color: "red", label: "Late" };
+      }
+    };
+    const store = new SessionStore(registry, pathPolicy, new TabContextService(path.join(root, ".cloudx")), { getPluginConfig: () => ({}) }, undefined, resolver);
+    const tab = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Closable" });
+    delayIndicator = true;
+
+    const refresh = store.refreshRuntimeIndicators();
+    await indicatorStarted.promise;
+    store.closeTab(tab.id);
+    releaseIndicator.resolve();
+
+    await expect(refresh).resolves.toBeUndefined();
+    expect(store.listTabs()).toEqual([]);
+  });
 });
 
 async function createStore(pluginOptions: { handlesUnhandledVoice?: boolean; withWorkspace?: boolean } = {}) {
@@ -955,14 +1490,25 @@ async function createStore(pluginOptions: { handlesUnhandledVoice?: boolean; wit
   const pathPolicy = new PathPolicy([root]);
   const workspace = pluginOptions.withWorkspace ? new WorkspaceLayoutStore(path.join(root, ".cloudx"), pathPolicy) : undefined;
   const store = new SessionStore(registry, pathPolicy, new TabContextService(path.join(root, ".cloudx")), { getPluginConfig: () => ({}) }, workspace);
+  const workspaceCommands = workspace ? new WorkspaceCommandService(store, workspace) : undefined;
+  if (workspace && workspaceCommands) {
+    const hooks = new HookRegistry();
+    registerCoreHooks(hooks, { sessions: store, plugins: registry, pathPolicy, workspace, workspaceCommands });
+    store.setHookRegistry(hooks);
+  }
   return {
     plugin,
     registry,
     pathPolicy,
     root,
     workspace,
+    workspaceCommands,
     store
   };
+}
+
+function coreHookServices(store: SessionStore, registry: PluginRegistry, pathPolicy: PathPolicy, workspace: WorkspaceLayoutStore) {
+  return { sessions: store, plugins: registry, pathPolicy, workspace, workspaceCommands: new WorkspaceCommandService(store, workspace) };
 }
 
 async function waitForTextFile(filePath: string): Promise<string> {
@@ -1027,8 +1573,22 @@ function isNoSuchProcess(error: unknown): boolean {
 }
 
 function layoutWithTab(tabId: string) {
+  return layoutWithTabs([tabId]);
+}
+
+function layoutWithTabs(tabIds: string[]) {
   return {
-    root: { type: "pane" as const, pane: { id: "pane-test", tabIds: [tabId], activeTabId: tabId } },
+    root: { type: "pane" as const, pane: { id: "pane-test", tabIds, activeTabId: tabIds.at(-1) } },
     activePaneId: "pane-test"
   };
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T | PromiseLike<T>) => void; reject: (error: unknown) => void } {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
 }

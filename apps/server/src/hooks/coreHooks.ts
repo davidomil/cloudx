@@ -8,6 +8,7 @@ import type { PathPolicy } from "../pathPolicy.js";
 import type { PluginRegistry } from "../pluginRegistry.js";
 import type { SessionStore } from "../sessionStore.js";
 import type { WorkspaceLayoutStore } from "../workspace/WorkspaceLayoutStore.js";
+import type { WorkspaceCommandService } from "../workspace/WorkspaceCommandService.js";
 import type { HookRegistry } from "./HookRegistry.js";
 
 interface CoreHookServices {
@@ -15,6 +16,7 @@ interface CoreHookServices {
   plugins: PluginRegistry;
   pathPolicy: PathPolicy;
   workspace: WorkspaceLayoutStore;
+  workspaceCommands: WorkspaceCommandService;
 }
 
 const WORKSPACE_TAB_SCHEMA = {
@@ -75,13 +77,13 @@ export function registerCoreHooks(hooks: HookRegistry, services: CoreHookService
   }
 }
 
-function coreHooks({ sessions, plugins, pathPolicy, workspace }: CoreHookServices): HookDefinition[] {
+function coreHooks({ sessions, plugins, pathPolicy, workspace, workspaceCommands }: CoreHookServices): HookDefinition[] {
   return [
     {
       id: "workspace.tabs.create",
       owner: { kind: "app" },
       title: "Create Tab",
-      description: "Create a new plugin tab and return a client layout instruction.",
+      description: "Create, start, place, and persist a new plugin tab as one server-owned command.",
       exposures: ["app", "plugin", "voice", "ui", "http", "automation"],
       inputSchema: {
         type: "object",
@@ -91,34 +93,34 @@ function coreHooks({ sessions, plugins, pathPolicy, workspace }: CoreHookService
           title: { type: "string", description: "Optional tab title. Empty lets the plugin choose a title." },
           createDirectory: { type: "boolean", description: "Create the directory before opening the tab.", default: false },
           initialInput: { type: "object", description: "Plugin-specific startup input as JSON." },
-          windowId: { type: "string", description: "Window that should receive the tab. Empty uses the active window.", "x-cloudx-option-source": "workspace.windows" },
+          windowId: { type: "string", description: "Exact window that receives the tab.", "x-cloudx-option-source": "workspace.windows" },
           pluginMetadata: {
             type: "object",
             description: "Plugin metadata to attach to the new tab.",
             additionalProperties: { type: "object" }
           },
           templateId: { type: "string", description: "Rules/skills template for Codex tabs.", "x-cloudx-option-source": "rulesSkills.templates" },
-          paneId: { type: "string", description: "Pane to receive or split for the tab.", "x-cloudx-option-source": "workspace.panes" },
+          paneId: { type: "string", description: "Exact pane to receive or split for the tab.", "x-cloudx-option-source": "workspace.panes" },
           newPane: { type: "boolean", description: "Open the tab in a newly split pane.", default: false },
           splitDirection: { type: "string", enum: ["row", "column"], description: "Direction to split when opening a new pane.", default: "row" }
         },
-        required: ["pluginId"],
+        required: ["pluginId", "windowId", "paneId"],
         additionalProperties: false
       },
       outputSchema: {
         type: "object",
         properties: {
           tab: WORKSPACE_TAB_SCHEMA,
+          window: WORKSPACE_WINDOW_SCHEMA,
           activeTabId: { type: "string", description: "Created tab id, also selected as the active tab." },
-          layoutInstruction: LAYOUT_INSTRUCTION_SCHEMA,
-          automationEffects: AUTOMATION_EFFECTS_SCHEMA
         },
         additionalProperties: false
       },
       async execute(input) {
         const pluginId = requireString(input.pluginId, "pluginId");
         const targetPlugin = plugins.get(pluginId);
-        const windowId = optionalString(input.windowId, "windowId") ?? workspace.getActiveWindow().id;
+        const windowId = requireString(input.windowId, "windowId");
+        const paneId = requireString(input.paneId, "paneId");
         const targetWindow = workspace.getWindow(windowId);
         const cwd =
           typeof input.cwd === "string" && input.cwd.trim()
@@ -126,27 +128,19 @@ function coreHooks({ sessions, plugins, pathPolicy, workspace }: CoreHookService
             : targetPlugin.requiresDirectory
               ? defaultCreateTabCwdExpression(sessions, pathPolicy, targetWindow)
               : undefined;
-        const tab = await sessions.createTab({
+        const result = await workspaceCommands.createTab({
           pluginId,
           cwd,
           title: optionalString(input.title, "title"),
           createDirectory: optionalBoolean(input.createDirectory, "createDirectory") ?? false,
           initialInput: optionalRecord(input.initialInput, "initialInput"),
           windowId,
+          paneId,
+          newPane: optionalBoolean(input.newPane, "newPane") ?? false,
+          splitDirection: input.splitDirection === "column" ? "column" : "row",
           pluginMetadata: mergeTemplateMetadata(optionalPluginMetadata(input.pluginMetadata, "pluginMetadata"), optionalString(input.templateId, "templateId"))
         });
-        const layoutInstruction: WorkspaceLayoutInstruction = {
-          type: input.newPane === true ? "open_tab_in_new_pane" : "add_tab_to_active_pane",
-          tabId: tab.id,
-          windowId,
-          paneId: optionalString(input.paneId, "paneId"),
-          splitDirection: input.splitDirection === "column" ? "column" : "row"
-        };
-        return withLayoutAutomationEffect({
-          tab,
-          activeTabId: tab.id,
-          layoutInstruction
-        }, layoutInstruction);
+        return { ...result, activeTabId: result.tab.id };
       }
     },
     {
@@ -475,40 +469,12 @@ function coreHooks({ sessions, plugins, pathPolicy, workspace }: CoreHookService
         additionalProperties: false
       },
       async execute(input) {
-        const prepared = await workspace.prepareTemplateWindow(requireString(input.templateId, "templateId"), {
+        const result = await workspaceCommands.applyLayoutTemplate(requireString(input.templateId, "templateId"), {
           projectPath: requireString(input.projectPath, "projectPath"),
           windowId: optionalString(input.windowId, "windowId"),
           name: optionalString(input.name, "name")
         });
-        const tabIdMap = new Map<string, string>();
-        const createdTabIds: string[] = [];
-        const replacedTabIds = prepared.createdWindow ? [] : workspace.tabIdsForWindow(prepared.window.id);
-        try {
-          for (const templateTab of prepared.template.tabs) {
-            const tabInput = workspace.tabInputForTemplate(templateTab, prepared.projectPath);
-            const tab = await sessions.createTab({ pluginId: tabInput.pluginId, cwd: tabInput.cwd, title: tabInput.title, initialInput: tabInput.initialInput, windowId: prepared.window.id });
-            tabIdMap.set(templateTab.id, tab.id);
-            createdTabIds.push(tab.id);
-          }
-          const layout = workspace.remapTemplateLayout(prepared.template, tabIdMap);
-          const name = optionalString(input.name, "name");
-          const window = await workspace.finishTemplateWindow(prepared.window.id, layout, {
-            defaultCwd: prepared.projectPath,
-            ...(name ? { name } : {})
-          });
-          for (const tabId of replacedTabIds) {
-            sessions.closeTab(tabId);
-          }
-          return { window, workspace: await workspace.state(sessions.listTabs(), sessions.getActiveTabId()) };
-        } catch (error) {
-          for (const tabId of createdTabIds) {
-            sessions.closeTab(tabId);
-          }
-          if (prepared.createdWindow) {
-            await workspace.deleteWindow(prepared.window.id);
-          }
-          throw error;
-        }
+        return { window: result.window, workspace: await workspace.state(sessions.listTabs(), sessions.getActiveTabId()) };
       }
     },
     {

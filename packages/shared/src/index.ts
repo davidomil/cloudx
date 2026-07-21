@@ -343,8 +343,10 @@ export interface AutomationVariableDefinition {
   defaultValue?: unknown;
 }
 
+export const AUTOMATION_GRAPH_SCHEMA_VERSION = 2 as const;
+
 export interface AutomationGraphDocument {
-  schemaVersion: 1;
+  schemaVersion: typeof AUTOMATION_GRAPH_SCHEMA_VERSION;
   nodes: AutomationNode[];
   edges: AutomationEdge[];
   variables?: AutomationVariableDefinition[];
@@ -354,7 +356,7 @@ export interface AutomationGraphDocument {
 export function isAutomationGraphDocument(value: unknown): value is AutomationGraphDocument {
   return (
     isRecord(value) &&
-    value.schemaVersion === 1 &&
+    value.schemaVersion === AUTOMATION_GRAPH_SCHEMA_VERSION &&
     Array.isArray(value.nodes) &&
     value.nodes.every(isAutomationNode) &&
     Array.isArray(value.edges) &&
@@ -362,6 +364,10 @@ export function isAutomationGraphDocument(value: unknown): value is AutomationGr
     (value.variables === undefined || Array.isArray(value.variables) && value.variables.every(isAutomationVariableDefinition)) &&
     (value.allowedSafety === undefined || Array.isArray(value.allowedSafety) && value.allowedSafety.every(isAutomationSafety))
   );
+}
+
+export function automationGraphVersionError(schemaVersion: unknown): string {
+  return `Automation graph schemaVersion ${String(schemaVersion)} is unsupported; expected ${AUTOMATION_GRAPH_SCHEMA_VERSION}. Schema v1 predates the persisted workspace.tabs.create command contract. Recreate the graph with schemaVersion ${AUTOMATION_GRAPH_SCHEMA_VERSION}; no automatic migration is performed.`;
 }
 
 export function isAutomationNode(value: unknown): value is AutomationNode {
@@ -638,7 +644,10 @@ export interface CreateTabRequest {
   title?: string;
   createDirectory?: boolean;
   initialInput?: Record<string, unknown>;
-  windowId?: string;
+  windowId: string;
+  paneId: string;
+  newPane?: boolean;
+  splitDirection?: TabLayoutDirection;
   pluginMetadata?: PluginMetadataMap;
 }
 
@@ -655,6 +664,7 @@ export interface CodexTerminalInitialInput {
 
 export interface CreateTabResponse {
   tab: WorkspaceTab;
+  window: WorkspaceWindow;
 }
 
 export interface PathOption {
@@ -802,7 +812,8 @@ export interface WorktreeProjectState {
 }
 
 export interface VoiceAction {
-  id?: string;
+  id: string;
+  dependsOn: string[];
   targetTabId?: string;
   pluginId?: PluginId;
   hookId?: HookId;
@@ -821,9 +832,10 @@ export interface VoiceExecutionResult {
   accepted: boolean;
   plan: VoiceActionPlan;
   results: Array<{
+    actionId: string;
     action: string;
     targetTabId?: string;
-    ok: boolean;
+    status: "succeeded" | "failed" | "skipped";
     message?: string;
     result?: unknown;
   }>;
@@ -1059,10 +1071,24 @@ export function parseVoiceActionPlan(value: unknown): VoiceActionPlan {
     throw new Error("Voice plan actions must be an array.");
   }
 
+  const parsedActions = actions.map((action, index) => parseVoiceAction(action, index));
+  const seenActionIds = new Set<string>();
+  for (const [index, action] of parsedActions.entries()) {
+    if (seenActionIds.has(action.id)) {
+      throw new Error(`Voice action ${index} id must be unique: ${action.id}`);
+    }
+    for (const dependencyId of action.dependsOn) {
+      if (!seenActionIds.has(dependencyId)) {
+        throw new Error(`Voice action ${index} dependency must reference an earlier action: ${dependencyId}`);
+      }
+    }
+    seenActionIds.add(action.id);
+  }
+
   return {
     transcript,
     summary,
-    actions: actions.map((action, index) => parseVoiceAction(action, index))
+    actions: parsedActions
   };
 }
 
@@ -1076,15 +1102,26 @@ export function parseVoiceAction(value: unknown, index = 0): VoiceAction {
   if (!isRecord(value.input)) {
     throw new Error(`Voice action ${index} input must be an object.`);
   }
+  if (typeof value.id !== "string" || value.id.trim().length === 0) {
+    throw new Error(`Voice action ${index} must include a stable id.`);
+  }
+  if (!Array.isArray(value.dependsOn) || value.dependsOn.some((dependencyId) => typeof dependencyId !== "string" || !dependencyId.trim())) {
+    throw new Error(`Voice action ${index} dependsOn must be an array of action ids.`);
+  }
+  const dependsOn = value.dependsOn.map((dependencyId) => (dependencyId as string).trim());
+  if (new Set(dependsOn).size !== dependsOn.length) {
+    throw new Error(`Voice action ${index} dependsOn must not contain duplicate action ids.`);
+  }
 
   return {
-    id: typeof value.id === "string" ? value.id : undefined,
-    targetTabId: typeof value.targetTabId === "string" ? value.targetTabId : undefined,
-    pluginId: typeof value.pluginId === "string" ? value.pluginId : undefined,
-    hookId: typeof value.hookId === "string" ? value.hookId : undefined,
+    id: value.id.trim(),
+    dependsOn,
+    ...(typeof value.targetTabId === "string" ? { targetTabId: value.targetTabId } : {}),
+    ...(typeof value.pluginId === "string" ? { pluginId: value.pluginId } : {}),
+    ...(typeof value.hookId === "string" ? { hookId: value.hookId } : {}),
     action: value.action,
     input: stripNullishValues(value.input),
-    reason: typeof value.reason === "string" ? value.reason : undefined
+    ...(typeof value.reason === "string" ? { reason: value.reason } : {})
   };
 }
 

@@ -21,12 +21,13 @@ import type {
   WorkspaceTab,
   WorkspaceWindow
 } from "@cloudx/shared";
-import { applyWorkspaceLayoutInstructionToTabLayout, firstTabLayoutPaneId, isRecord, isUsableTabLayoutState, listTabLayoutPanes, removeTabFromTabLayoutPanes } from "@cloudx/shared";
+import { applyWorkspaceLayoutInstructionToTabLayout, findTabLayoutPane, firstTabLayoutPaneId, isRecord, isUsableTabLayoutState, listTabLayoutPanes, removeTabFromTabLayoutPanes } from "@cloudx/shared";
 
 import { relativeChildPath as relativePathWithin } from "../pathBoundary.js";
 import { PathPolicy } from "../pathPolicy.js";
 import { JsonStateFile } from "../jsonStateFile.js";
 import { availablePersistenceStatus, degradedPersistenceStatus, initialPersistenceStatus, isCapacityStateWriteError, persistenceStatusChanged } from "../statePersistence.js";
+import { WorkspacePaneConflictError, WorkspaceWindowConflictError, WorkspaceWindowNotFoundError } from "./WorkspaceErrors.js";
 
 interface StoredWorkspace {
   activeWindowId?: string;
@@ -34,20 +35,38 @@ interface StoredWorkspace {
   templates?: unknown[];
 }
 
+interface WorkspacePersistenceState {
+  activeWindowId: string;
+  windows: WorkspaceWindow[];
+  templates: WorkspaceLayoutTemplate[];
+}
+
+export type WorkspaceLayoutSnapshot = Pick<WorkspaceStateResponse, "activeWindowId" | "windows" | "templates">;
+
 interface TemplateTabSource {
   tab: WorkspaceTab;
   initialInput?: Record<string, unknown>;
 }
 
-interface PreparedTemplateWindow {
+export interface PreparedWorkspaceTemplateApplication {
   template: WorkspaceLayoutTemplate;
   window: WorkspaceWindow;
   projectPath: string;
   createdWindow: boolean;
+  replacedTabIds: string[];
+}
+
+export interface WorkspaceTabPlacement {
+  tabId: string;
+  windowId: string;
+  paneId: string;
+  newPane?: boolean;
+  splitDirection?: "row" | "column";
 }
 
 export class WorkspaceLayoutStore {
   private static readonly writeQueues = new Map<string, Promise<void>>();
+  private static readonly mutationQueues = new Map<string, Promise<void>>();
 
   readonly workspacePath: string;
   private readonly workspaceFile: JsonStateFile;
@@ -86,18 +105,20 @@ export class WorkspaceLayoutStore {
   }
 
   async state(tabs: WorkspaceTab[], activeTabId?: string): Promise<WorkspaceStateResponse> {
-    const changed = this.reconcileTabs(tabs);
-    if (changed) {
-      await this.persist();
-    }
-    return {
-      activeTabId,
-      tabs,
-      activeWindowId: this.activeWindowId,
-      windows: this.windows,
-      templates: this.templates,
-      persistence: [this.persistenceStatus()]
-    };
+    return this.serializeWorkspaceAccess(async () => {
+      const changed = this.reconcileTabs(tabs);
+      if (changed) {
+        await this.persist();
+      }
+      return {
+        activeTabId,
+        tabs,
+        activeWindowId: this.activeWindowId,
+        windows: this.windows,
+        templates: this.templates,
+        persistence: [this.persistenceStatus()]
+      };
+    });
   }
 
   snapshot(): Pick<WorkspaceStateResponse, "activeWindowId" | "windows" | "templates" | "persistence"> {
@@ -107,6 +128,20 @@ export class WorkspaceLayoutStore {
       templates: this.templates,
       persistence: [this.persistenceStatus()]
     };
+  }
+
+  async restore(snapshot: WorkspaceLayoutSnapshot): Promise<void> {
+    return this.serializeWorkspaceAccess(async () => {
+      const state = {
+        activeWindowId: snapshot.activeWindowId,
+        windows: snapshot.windows,
+        templates: snapshot.templates
+      };
+      await this.persist(true, state);
+      this.activeWindowId = state.activeWindowId;
+      this.windows = state.windows;
+      this.templates = state.templates;
+    });
   }
 
   getActiveWindow(): WorkspaceWindow {
@@ -120,114 +155,180 @@ export class WorkspaceLayoutStore {
   getWindow(windowId: string): WorkspaceWindow {
     const window = this.findWindow(windowId);
     if (!window) {
-      throw new Error(`Unknown workspace window: ${windowId}`);
+      throw new WorkspaceWindowNotFoundError(windowId);
+    }
+    return window;
+  }
+
+  requireTabPlacementTarget(windowId: string, paneId: string): WorkspaceWindow {
+    const window = this.getWindow(windowId);
+    if (!findTabLayoutPane(window.layout.root, paneId)) {
+      throw new WorkspacePaneConflictError(windowId, paneId);
     }
     return window;
   }
 
   async createWindow(input: CreateWorkspaceWindowRequest = {}): Promise<WorkspaceWindow> {
-    const now = new Date().toISOString();
-    const defaultCwd = await this.resolveWindowCwd(input.defaultCwd, input.createDirectory === true);
-    const window: WorkspaceWindow = {
-      id: `window-${crypto.randomUUID()}`,
-      name: cleanName(input.name) || defaultWindowName(this.windows.length),
-      defaultCwd,
-      layout: defaultLayout(),
-      pluginMetadata: readPluginMetadata(input.pluginMetadata),
-      createdAt: now,
-      updatedAt: now
-    };
-    this.windows = [...this.windows, window];
-    this.activeWindowId = window.id;
-    await this.persistAndEmit();
-    return window;
+    return this.serializeWorkspaceAccess(async () => {
+      const now = new Date().toISOString();
+      const defaultCwd = await this.resolveWindowCwd(input.defaultCwd, input.createDirectory === true);
+      const window: WorkspaceWindow = {
+        id: `window-${crypto.randomUUID()}`,
+        name: cleanName(input.name) || defaultWindowName(this.windows.length),
+        defaultCwd,
+        layout: defaultLayout(),
+        pluginMetadata: readPluginMetadata(input.pluginMetadata),
+        createdAt: now,
+        updatedAt: now
+      };
+      this.windows = [...this.windows, window];
+      this.activeWindowId = window.id;
+      await this.persistAndEmit();
+      return window;
+    });
   }
 
   async updateWindow(windowId: string, input: UpdateWorkspaceWindowRequest): Promise<WorkspaceWindow> {
-    this.getWindow(windowId);
-    const patch: Partial<WorkspaceWindow> = {};
-    if (input.name !== undefined) {
-      patch.name = requireNonEmpty(input.name, "Window name");
-    }
-    if (input.defaultCwd !== undefined) {
-      patch.defaultCwd = await this.resolveWindowCwd(input.defaultCwd);
-    }
-    if (input.layout !== undefined) {
-      if (!isUsableTabLayoutState(input.layout)) {
-        throw new Error("Invalid workspace window layout.");
+    return this.serializeWorkspaceAccess(async () => {
+      this.getWindow(windowId);
+      const patch: Partial<WorkspaceWindow> = {};
+      if (input.name !== undefined) {
+        patch.name = requireNonEmpty(input.name, "Window name");
       }
-      patch.layout = input.layout;
-    }
-    const current = this.getWindow(windowId);
-    if (input.pluginMetadata !== undefined) {
-      patch.pluginMetadata = mergePluginMetadata(current.pluginMetadata, input.pluginMetadata);
-    }
-    const updated = { ...current, ...patch, updatedAt: new Date().toISOString() };
-    this.windows = this.windows.map((candidate) => (candidate.id === windowId ? updated : candidate));
-    await this.persistAndEmit();
-    return updated;
+      if (input.defaultCwd !== undefined) {
+        patch.defaultCwd = await this.resolveWindowCwd(input.defaultCwd);
+      }
+      if (input.layout !== undefined) {
+        if (!isUsableTabLayoutState(input.layout)) {
+          throw new Error("Invalid workspace window layout.");
+        }
+        patch.layout = input.layout;
+      }
+      const current = this.getWindow(windowId);
+      if (input.pluginMetadata !== undefined) {
+        patch.pluginMetadata = mergePluginMetadata(current.pluginMetadata, input.pluginMetadata);
+      }
+      const updated = { ...current, ...patch, updatedAt: new Date().toISOString() };
+      this.windows = this.windows.map((candidate) => (candidate.id === windowId ? updated : candidate));
+      await this.persistAndEmit();
+      return updated;
+    });
   }
 
   async selectWindow(windowId: string): Promise<WorkspaceWindow> {
-    const window = this.getWindow(windowId);
-    this.activeWindowId = window.id;
-    await this.persistAndEmit();
-    return window;
+    return this.serializeWorkspaceAccess(async () => {
+      const window = this.getWindow(windowId);
+      this.activeWindowId = window.id;
+      await this.persistAndEmit();
+      return window;
+    });
   }
 
   async applyLayoutInstruction(instruction: WorkspaceLayoutInstruction): Promise<void> {
-    if (instruction.type === "select_window") {
-      const window = instruction.windowId ? this.findWindow(instruction.windowId) : undefined;
-      if (window) {
-        await this.selectWindow(window.id);
+    return this.serializeWorkspaceAccess(async () => {
+      if (instruction.type === "select_window") {
+        const window = instruction.windowId ? this.findWindow(instruction.windowId) : undefined;
+        if (window) {
+          this.activeWindowId = window.id;
+          await this.persistAndEmit();
+        }
+        return;
       }
-      return;
-    }
-    const window = this.windowForLayoutInstruction(instruction);
-    if (!window) {
-      return;
-    }
-    const now = new Date().toISOString();
-    let duplicateTabRemoved = false;
-    const tabPlacement = isTabPlacementInstruction(instruction);
-    const windowsWithoutDuplicateTab = tabPlacement
-      ? this.windows.map((candidate) => {
-          if (candidate.id === window.id) {
-            return candidate;
-          }
-          const layout = removeTabFromTabLayoutPanes(candidate.layout, instruction.tabId);
-          if (layout === candidate.layout) {
-            return candidate;
-          }
-          duplicateTabRemoved = true;
-          return { ...candidate, layout, updatedAt: now };
-        })
-      : this.windows;
-    const currentWindow = windowsWithoutDuplicateTab.find((candidate) => candidate.id === window.id) ?? window;
-    const result = applyWorkspaceLayoutInstructionToTabLayout(currentWindow.layout, instruction, {
-      createPaneId: () => `pane-${crypto.randomUUID()}`,
-      createSplitId: () => `split-${crypto.randomUUID()}`
+      const window = this.windowForLayoutInstruction(instruction);
+      if (!window) {
+        return;
+      }
+      const now = new Date().toISOString();
+      let duplicateTabRemoved = false;
+      const tabPlacement = isTabPlacementInstruction(instruction);
+      const windowsWithoutDuplicateTab = tabPlacement
+        ? this.windows.map((candidate) => {
+            if (candidate.id === window.id) {
+              return candidate;
+            }
+            const layout = removeTabFromTabLayoutPanes(candidate.layout, instruction.tabId);
+            if (layout === candidate.layout) {
+              return candidate;
+            }
+            duplicateTabRemoved = true;
+            return { ...candidate, layout, updatedAt: now };
+          })
+        : this.windows;
+      const currentWindow = windowsWithoutDuplicateTab.find((candidate) => candidate.id === window.id) ?? window;
+      const result = applyWorkspaceLayoutInstructionToTabLayout(currentWindow.layout, instruction, {
+        createPaneId: () => `pane-${crypto.randomUUID()}`,
+        createSplitId: () => `split-${crypto.randomUUID()}`
+      });
+      if (!result.applied && !duplicateTabRemoved) {
+        return;
+      }
+      const updated = { ...currentWindow, layout: result.layout, updatedAt: now };
+      this.windows = windowsWithoutDuplicateTab.map((candidate) => (candidate.id === updated.id ? updated : candidate));
+      this.activeWindowId = updated.id;
+      await this.persistAndEmit();
     });
-    if (!result.applied && !duplicateTabRemoved) {
-      return;
+  }
+
+  async placeTab(input: WorkspaceTabPlacement): Promise<WorkspaceWindow> {
+    return this.serializeWorkspaceAccess(async () => {
+      this.requireTabPlacementTarget(input.windowId, input.paneId);
+
+      const now = new Date().toISOString();
+      const windowsWithoutTab = this.windows.map((candidate) => {
+        const layout = removeTabFromTabLayoutPanes(candidate.layout, input.tabId);
+        return layout === candidate.layout ? candidate : { ...candidate, layout, updatedAt: now };
+      });
+      const currentWindow = windowsWithoutTab.find((candidate) => candidate.id === input.windowId)!;
+      const result = applyWorkspaceLayoutInstructionToTabLayout(
+        currentWindow.layout,
+        {
+          type: input.newPane ? "open_tab_in_new_pane" : "add_tab_to_active_pane",
+          tabId: input.tabId,
+          windowId: input.windowId,
+          paneId: input.paneId,
+          splitDirection: input.splitDirection ?? "row"
+        },
+        {
+          createPaneId: () => `pane-${crypto.randomUUID()}`,
+          createSplitId: () => `split-${crypto.randomUUID()}`
+        }
+      );
+      if (!result.applied) {
+        throw new Error(`Unable to place tab ${input.tabId} in pane ${input.paneId}.`);
+      }
+
+      const updatedWindow = { ...currentWindow, layout: result.layout, updatedAt: now };
+      const windows = windowsWithoutTab.map((candidate) => (candidate.id === input.windowId ? updatedWindow : candidate));
+      await this.persist(true, { activeWindowId: input.windowId, windows, templates: this.templates });
+      this.windows = windows;
+      this.activeWindowId = input.windowId;
+      return updatedWindow;
+    });
+  }
+
+  notifyChange(): void {
+    for (const listener of this.listeners) {
+      try {
+        listener();
+      } catch (error) {
+        console.error("Workspace change listener failed.", error);
+      }
     }
-    const updated = { ...currentWindow, layout: result.layout, updatedAt: now };
-    this.windows = windowsWithoutDuplicateTab.map((candidate) => (candidate.id === updated.id ? updated : candidate));
-    this.activeWindowId = updated.id;
-    await this.persistAndEmit();
   }
 
   async deleteWindow(windowId: string): Promise<WorkspaceWindow> {
-    const deleted = this.getWindow(windowId);
-    this.windows = this.windows.filter((candidate) => candidate.id !== windowId);
-    if (this.windows.length === 0) {
-      this.windows = [await this.createDefaultWindow()];
-    }
-    if (this.activeWindowId === windowId || !this.windows.some((candidate) => candidate.id === this.activeWindowId)) {
-      this.activeWindowId = this.windows[0]!.id;
-    }
-    await this.persistAndEmit();
-    return deleted;
+    return this.serializeWorkspaceAccess(async () => {
+      const deleted = this.getWindow(windowId);
+      this.windows = this.windows.filter((candidate) => candidate.id !== windowId);
+      if (this.windows.length === 0) {
+        this.windows = [await this.createDefaultWindow()];
+      }
+      if (this.activeWindowId === windowId || !this.windows.some((candidate) => candidate.id === this.activeWindowId)) {
+        this.activeWindowId = this.windows[0]!.id;
+      }
+      await this.persistAndEmit();
+      return deleted;
+    });
   }
 
   tabIdsForWindow(windowId: string): string[] {
@@ -239,31 +340,33 @@ export class WorkspaceLayoutStore {
   }
 
   async createTemplate(input: CreateWorkspaceLayoutTemplateRequest, sources: TemplateTabSource[]): Promise<WorkspaceLayoutTemplate> {
-    const windowId = input.windowId ?? this.activeWindowId;
-    this.getWindow(windowId);
-    const name = requireNonEmpty(input.name, "Template name");
-    const basePath = await this.pathPolicy.ensureDirectory(input.basePath, false);
-    const window = this.getWindow(windowId);
-    const sourcesById = new Map(sources.map((source) => [source.tab.id, source]));
-    const tabs = uniqueStrings(listPanes(window.layout.root).flatMap((pane) => pane.tabIds))
-      .map((tabId) => {
-        const source = sourcesById.get(tabId);
-        return source ? templateTabFromSource(source, basePath) : undefined;
-      })
-      .filter((tab): tab is WorkspaceLayoutTemplateTab => Boolean(tab));
-    const now = new Date().toISOString();
-    const template: WorkspaceLayoutTemplate = {
-      id: `template-${crypto.randomUUID()}`,
-      name,
-      basePath,
-      layout: window.layout,
-      tabs,
-      createdAt: now,
-      updatedAt: now
-    };
-    this.templates = [...this.templates, template];
-    await this.persistAndEmit();
-    return template;
+    return this.serializeWorkspaceAccess(async () => {
+      const windowId = input.windowId ?? this.activeWindowId;
+      this.getWindow(windowId);
+      const name = requireNonEmpty(input.name, "Template name");
+      const basePath = await this.pathPolicy.ensureDirectory(input.basePath, false);
+      const window = this.getWindow(windowId);
+      const sourcesById = new Map(sources.map((source) => [source.tab.id, source]));
+      const tabs = uniqueStrings(listPanes(window.layout.root).flatMap((pane) => pane.tabIds))
+        .map((tabId) => {
+          const source = sourcesById.get(tabId);
+          return source ? templateTabFromSource(source, basePath) : undefined;
+        })
+        .filter((tab): tab is WorkspaceLayoutTemplateTab => Boolean(tab));
+      const now = new Date().toISOString();
+      const template: WorkspaceLayoutTemplate = {
+        id: `template-${crypto.randomUUID()}`,
+        name,
+        basePath,
+        layout: window.layout,
+        tabs,
+        createdAt: now,
+        updatedAt: now
+      };
+      this.templates = [...this.templates, template];
+      await this.persistAndEmit();
+      return template;
+    });
   }
 
   getTemplate(templateId: string): WorkspaceLayoutTemplate {
@@ -275,52 +378,98 @@ export class WorkspaceLayoutStore {
   }
 
   async updateTemplate(templateId: string, input: UpdateWorkspaceLayoutTemplateRequest): Promise<WorkspaceLayoutTemplate> {
-    const current = this.getTemplate(templateId);
-    const updated: WorkspaceLayoutTemplate = {
-      ...current,
-      name: input.name === undefined ? current.name : requireNonEmpty(input.name, "Template name"),
-      updatedAt: new Date().toISOString()
-    };
-    this.templates = this.templates.map((candidate) => (candidate.id === templateId ? updated : candidate));
-    await this.persistAndEmit();
-    return updated;
+    return this.serializeWorkspaceAccess(async () => {
+      const current = this.getTemplate(templateId);
+      const updated: WorkspaceLayoutTemplate = {
+        ...current,
+        name: input.name === undefined ? current.name : requireNonEmpty(input.name, "Template name"),
+        updatedAt: new Date().toISOString()
+      };
+      this.templates = this.templates.map((candidate) => (candidate.id === templateId ? updated : candidate));
+      await this.persistAndEmit();
+      return updated;
+    });
   }
 
   async deleteTemplate(templateId: string): Promise<WorkspaceLayoutTemplate> {
-    const deleted = this.getTemplate(templateId);
-    this.templates = this.templates.filter((candidate) => candidate.id !== templateId);
-    await this.persistAndEmit();
-    return deleted;
+    return this.serializeWorkspaceAccess(async () => {
+      const deleted = this.getTemplate(templateId);
+      this.templates = this.templates.filter((candidate) => candidate.id !== templateId);
+      await this.persistAndEmit();
+      return deleted;
+    });
   }
 
-  async prepareTemplateWindow(templateId: string, input: ApplyWorkspaceLayoutTemplateRequest): Promise<PreparedTemplateWindow> {
-    this.getTemplate(templateId);
-    const projectPath = await this.pathPolicy.ensureDirectory(input.projectPath, false);
-    const template = this.getTemplate(templateId);
-    const windowId = cleanName(input.windowId);
-    if (windowId) {
-      return { template, window: this.getWindow(windowId), projectPath, createdWindow: false };
-    }
-    const window = await this.createWindow({ name: input.name?.trim() || template.name, defaultCwd: projectPath });
-    return { template, window, projectPath, createdWindow: true };
+  async prepareTemplateApplication(templateId: string, input: ApplyWorkspaceLayoutTemplateRequest): Promise<PreparedWorkspaceTemplateApplication> {
+    return this.serializeWorkspaceAccess(async () => {
+      const template = this.getTemplate(templateId);
+      const projectPath = await this.pathPolicy.ensureDirectory(input.projectPath, false);
+      const windowId = cleanName(input.windowId);
+      if (windowId) {
+        const window = this.getWindow(windowId);
+        return { template, window, projectPath, createdWindow: false, replacedTabIds: this.tabIdsForWindow(window.id) };
+      }
+      const now = new Date().toISOString();
+      const window: WorkspaceWindow = {
+        id: `window-${crypto.randomUUID()}`,
+        name: input.name?.trim() || template.name,
+        defaultCwd: projectPath,
+        layout: defaultLayout(),
+        pluginMetadata: {},
+        createdAt: now,
+        updatedAt: now
+      };
+      return { template, window, projectPath, createdWindow: true, replacedTabIds: [] };
+    });
   }
 
-  async finishTemplateWindow(windowId: string, layout: TabLayoutState, input: Pick<UpdateWorkspaceWindowRequest, "name" | "defaultCwd"> = {}): Promise<WorkspaceWindow> {
-    return this.updateWindow(windowId, { layout, ...input });
+  async commitTemplateApplication(prepared: PreparedWorkspaceTemplateApplication, layout: TabLayoutState, name?: string): Promise<WorkspaceWindow> {
+    return this.serializeWorkspaceAccess(async () => {
+      if (!isUsableTabLayoutState(layout)) {
+        throw new Error("Invalid workspace template layout.");
+      }
+      if (prepared.createdWindow) {
+        if (this.findWindow(prepared.window.id)) {
+          throw new WorkspaceWindowConflictError(prepared.window.id);
+        }
+      } else if (this.findWindow(prepared.window.id) !== prepared.window) {
+        if (!this.findWindow(prepared.window.id)) {
+          throw new WorkspaceWindowNotFoundError(prepared.window.id);
+        }
+        throw new WorkspaceWindowConflictError(prepared.window.id);
+      }
+
+      const updated: WorkspaceWindow = {
+        ...prepared.window,
+        name: name?.trim() || prepared.window.name,
+        defaultCwd: prepared.projectPath,
+        layout,
+        updatedAt: new Date().toISOString()
+      };
+      const windows = prepared.createdWindow
+        ? [...this.windows, updated]
+        : this.windows.map((candidate) => (candidate.id === updated.id ? updated : candidate));
+      await this.persist(true, { activeWindowId: updated.id, windows, templates: this.templates });
+      this.windows = windows;
+      this.activeWindowId = updated.id;
+      return updated;
+    });
   }
 
   async search(query: string, tabs: WorkspaceTab[], sessionTextByTabId: Map<string, string>): Promise<SearchWorkspaceWindowsResponse> {
-    const normalized = query.trim().toLowerCase();
-    if (!normalized) {
-      return { query, matches: this.windows.map((window) => ({ window, score: 0, reasons: [] })) };
-    }
-    const tabsById = new Map(tabs.map((tab) => [tab.id, tab]));
-    const tokens = normalized.split(/\s+/).filter(Boolean);
-    const matches = this.windows
-      .map((window) => scoreWindow(window, tokens, tabsById, sessionTextByTabId))
-      .filter((match) => match.score > 0)
-      .sort((left, right) => right.score - left.score || left.window.name.localeCompare(right.window.name));
-    return { query, matches };
+    return this.serializeWorkspaceAccess(async () => {
+      const normalized = query.trim().toLowerCase();
+      if (!normalized) {
+        return { query, matches: this.windows.map((window) => ({ window, score: 0, reasons: [] })) };
+      }
+      const tabsById = new Map(tabs.map((tab) => [tab.id, tab]));
+      const tokens = normalized.split(/\s+/).filter(Boolean);
+      const matches = this.windows
+        .map((window) => scoreWindow(window, tokens, tabsById, sessionTextByTabId))
+        .filter((match) => match.score > 0)
+        .sort((left, right) => right.score - left.score || left.window.name.localeCompare(right.window.name));
+      return { query, matches };
+    });
   }
 
   tabInputForTemplate(templateTab: WorkspaceLayoutTemplateTab, projectPath: string): { pluginId: string; cwd?: string; title?: string; initialInput?: Record<string, unknown> } {
@@ -416,9 +565,21 @@ export class WorkspaceLayoutStore {
 
   private async persistAndEmit(): Promise<void> {
     await this.persist();
-    for (const listener of this.listeners) {
-      listener();
-    }
+    this.notifyChange();
+  }
+
+  private serializeWorkspaceAccess<T>(operation: () => Promise<T>): Promise<T> {
+    const queueKey = this.workspacePath;
+    const previous = WorkspaceLayoutStore.mutationQueues.get(queueKey) ?? Promise.resolve();
+    const run = previous.then(operation);
+    const settled = run.then(() => undefined, () => undefined);
+    WorkspaceLayoutStore.mutationQueues.set(queueKey, settled);
+    void settled.then(() => {
+      if (WorkspaceLayoutStore.mutationQueues.get(queueKey) === settled) {
+        WorkspaceLayoutStore.mutationQueues.delete(queueKey);
+      }
+    });
+    return run;
   }
 
   private windowForLayoutInstruction(instruction: WorkspaceLayoutInstruction): WorkspaceWindow | undefined {
@@ -440,17 +601,20 @@ export class WorkspaceLayoutStore {
     return this.getActiveWindow();
   }
 
-  private async persist(): Promise<void> {
+  private async persist(requireDurable = false, state: WorkspacePersistenceState = this.persistenceState()): Promise<void> {
     const queueKey = this.workspacePath;
     const operation = this.writeQueue().then(async () => {
       try {
-        await this.workspaceFile.write({ activeWindowId: this.activeWindowId, windows: this.windows, templates: this.templates });
+        await this.workspaceFile.write(state);
         this.setPersistenceStatus(availablePersistenceStatus(this.persistence));
       } catch (error) {
         if (!isCapacityStateWriteError(error)) {
           throw error;
         }
         this.setPersistenceStatus(degradedPersistenceStatus("Workspace layout", this.workspacePath, error));
+        if (requireDurable) {
+          throw error;
+        }
       }
     });
     WorkspaceLayoutStore.writeQueues.set(queueKey, operation.then(() => undefined, () => undefined));
@@ -459,6 +623,10 @@ export class WorkspaceLayoutStore {
 
   private writeQueue(): Promise<void> {
     return WorkspaceLayoutStore.writeQueues.get(this.workspacePath) ?? Promise.resolve();
+  }
+
+  private persistenceState(): WorkspacePersistenceState {
+    return { activeWindowId: this.activeWindowId, windows: this.windows, templates: this.templates };
   }
 
   private setPersistenceStatus(status: StatePersistenceStatus): void {

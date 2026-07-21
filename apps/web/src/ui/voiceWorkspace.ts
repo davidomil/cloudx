@@ -2,6 +2,7 @@ import {
   applyWorkspaceLayoutInstructionToTabLayout,
   findTabLayoutPane,
   findTabLayoutPaneContainingTab,
+  isUsableTabLayoutState,
   readWorkspaceLayoutInstruction,
   removeTabFromTabLayoutPanes,
   type TabLayoutNode,
@@ -68,7 +69,7 @@ export function applyVoiceWorkspaceResults(
   let activeTabId = current.activeTabId;
 
   for (const execution of result.results) {
-    if (!execution.ok || !isRecord(execution.result)) {
+    if (execution.status !== "succeeded" || !isRecord(execution.result)) {
       continue;
     }
     const tab = readWorkspaceTab(execution.result.tab);
@@ -107,7 +108,7 @@ export function applyVoiceWorkspaceResultsToWorkspace(
   const changedLayoutWindowIds = new Set<string>();
 
   for (const execution of result.results) {
-    if (!execution.ok || !isRecord(execution.result)) {
+    if (execution.status !== "succeeded" || !isRecord(execution.result)) {
       continue;
     }
     const tab = readWorkspaceTab(execution.result.tab);
@@ -117,6 +118,15 @@ export function applyVoiceWorkspaceResultsToWorkspace(
     if (tab) {
       tabs = upsertTab(tabs, tab);
       activeTabId = tab.id;
+    }
+    const committedWindow = readWorkspaceWindow(execution.result.window);
+    if (hasOwn(execution.result, "window") && !committedWindow) {
+      continue;
+    }
+    if (committedWindow) {
+      windows = upsertWindow(windows, committedWindow);
+      activeWindowId = committedWindow.id;
+      continue;
     }
     const instruction = readWorkspaceLayoutInstruction(execution.result.layoutInstruction);
     if (!instruction || instruction.type === "select_window") {
@@ -247,6 +257,37 @@ function upsertTab(tabs: WorkspaceTab[], tab: WorkspaceTab): WorkspaceTab[] {
     return [...tabs, tab];
   }
   return [...tabs.slice(0, existingIndex), tab, ...tabs.slice(existingIndex + 1)];
+}
+
+function readWorkspaceWindow(value: unknown): WorkspaceWindow | undefined {
+  if (
+    !isRecord(value) ||
+    typeof value.id !== "string" ||
+    typeof value.name !== "string" ||
+    typeof value.defaultCwd !== "string" ||
+    !isUsableTabLayoutState(value.layout) ||
+    typeof value.createdAt !== "string" ||
+    typeof value.updatedAt !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    id: value.id,
+    name: value.name,
+    defaultCwd: value.defaultCwd,
+    layout: value.layout,
+    pluginMetadata: readPluginMetadataMap(value.pluginMetadata),
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt
+  };
+}
+
+function upsertWindow(windows: WorkspaceWindow[], window: WorkspaceWindow): WorkspaceWindow[] {
+  const existingIndex = windows.findIndex((candidate) => candidate.id === window.id);
+  if (existingIndex === -1) {
+    return [...windows, window];
+  }
+  return [...windows.slice(0, existingIndex), window, ...windows.slice(existingIndex + 1)];
 }
 
 function windowForLayoutInstruction(windows: WorkspaceWindow[], activeWindowId: string | undefined, instruction: WorkspaceLayoutInstruction): WorkspaceWindow | undefined {

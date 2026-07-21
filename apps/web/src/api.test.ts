@@ -4,6 +4,7 @@ import {
   applyLayoutTemplate,
   callHook,
   closeTab,
+  createTab,
   createWindow,
   deleteAllNotifications,
   deleteAutomationGroup,
@@ -92,6 +93,23 @@ describe("api client", () => {
     expect(fetchMock).toHaveBeenCalledWith("/api/windows", {
       method: "POST",
       body: JSON.stringify({ name: "Generated", defaultCwd: "/repo/generated", createDirectory: true }),
+      headers: { "content-type": "application/json" }
+    });
+  });
+
+  it("sends explicit server-owned tab placement coordinates", async () => {
+    const response = {
+      tab: { id: "tab-1" },
+      window: { id: "window-1", layout: { activePaneId: "pane-1" } }
+    };
+    const fetchMock = vi.fn(async () => jsonResponse(response));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(createTab({ pluginId: "file-browser", cwd: "/repo", windowId: "window-1", paneId: "pane-1" })).resolves.toEqual(response);
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/tabs", {
+      method: "POST",
+      body: JSON.stringify({ pluginId: "file-browser", cwd: "/repo", windowId: "window-1", paneId: "pane-1" }),
       headers: { "content-type": "application/json" }
     });
   });

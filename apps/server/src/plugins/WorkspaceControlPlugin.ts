@@ -27,7 +27,7 @@ export class WorkspaceControlPlugin implements WorkspacePlugin {
     {
       name: "create_tab",
       description:
-        "Create a new plugin tab. Use this for requests to open a Codex, terminal, file, local web, or worktree manager tab. To open a local web dashboard, set targetPluginId local-web and include the full local URL, including token query strings, in url. To open a new pane, set newPane true; to open into an existing pane, set paneId from client.panes.",
+        "Create a new plugin tab. Use this for requests to open a Codex, terminal, file, local web, or worktree manager tab. To open a local web dashboard, set targetPluginId local-web and include the full local URL, including token query strings, in url. Always use the exact active window and target pane ids from client workspace context.",
       voiceExposed: true,
       inputSchema: {
         type: "object",
@@ -40,7 +40,8 @@ export class WorkspaceControlPlugin implements WorkspacePlugin {
           },
           title: { type: "string", description: "Optional visible tab title." },
           url: { type: "string", description: "Optional local website URL when opening targetPluginId local-web." },
-          paneId: { type: "string", description: "Optional exact client pane id where the new tab should be placed." },
+          windowId: { type: "string", description: "Exact persisted workspace window id that receives the new tab." },
+          paneId: { type: "string", description: "Exact persisted pane id where the new tab should be placed." },
           createDirectory: { type: "boolean", description: "Whether Cloudx may create the directory if it does not exist." },
           newPane: { type: "boolean", description: "Whether the client should place the new tab in a newly split pane." },
           splitDirection: {
@@ -49,7 +50,7 @@ export class WorkspaceControlPlugin implements WorkspacePlugin {
             description: "row creates side-by-side columns with a vertical divider; column creates stacked rows with a horizontal divider."
           }
         },
-        required: ["targetPluginId"],
+        required: ["targetPluginId", "windowId", "paneId"],
         additionalProperties: false
       }
     },

@@ -9,6 +9,7 @@ import {
   buildVoicePrompt,
   CodexExecVoicePlanner,
   compactVoicePromptContext,
+  runCodexExec,
   summarizeCodexError
 } from "./VoicePlanner.js";
 
@@ -34,7 +35,9 @@ describe("buildVoicePrompt", () => {
     expect(prompt).toContain("Plugin descriptions, hook descriptions, action descriptions, input schemas, voiceContext, and history are authoritative");
     expect(prompt).toContain("standardized plugin voiceContext");
     expect(prompt).toContain("do not invent plugin capabilities");
-    expect(prompt).toContain("exact pane ids");
+    expect(prompt).toContain("unique stable id");
+    expect(prompt).toContain("dependsOn");
+    expect(prompt).toContain("exact persisted windowId and paneId");
     expect(prompt).not.toContain("For standard-terminal enter_text");
     expect(prompt).not.toContain("For codex-terminal enter_text");
     expect(prompt).not.toContain("Use workspace-control");
@@ -247,7 +250,88 @@ describe("CodexExecVoicePlanner", () => {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
   });
+
+  it("keeps Codex process-group escalation alive when the leader exits before its descendant", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-fake-codex-abort-"));
+    const fakeCodexPath = path.join(tempDir, "fake-codex.mjs");
+    const startedPath = path.join(tempDir, "started.json");
+    const previousAssistantBin = process.env.CLOUDX_ASSISTANT_BIN;
+    const previousStartedPath = process.env.CLOUDX_TEST_CODEX_STARTED;
+    await fs.writeFile(fakeCodexPath, [
+      "#!/usr/bin/env node",
+      "import fs from 'node:fs';",
+      "import { spawn } from 'node:child_process';",
+      "const descendant = spawn(process.execPath, ['-e', \"process.on('SIGTERM', () => {}); process.send('ready'); setInterval(() => {}, 1000)\"], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });",
+      "descendant.once('message', () => fs.writeFileSync(process.env.CLOUDX_TEST_CODEX_STARTED, JSON.stringify({ parent: process.pid, descendant: descendant.pid })));",
+      "process.stdin.resume();",
+      "setInterval(() => {}, 1000);"
+    ].join("\n"), "utf8");
+    await fs.chmod(fakeCodexPath, 0o755);
+    process.env.CLOUDX_ASSISTANT_BIN = fakeCodexPath;
+    process.env.CLOUDX_TEST_CODEX_STARTED = startedPath;
+    const controller = new AbortController();
+    const stopped = new Error("Codex runner stopped");
+
+    try {
+      const execution = runCodexExec("gpt-test", "prompt", { signal: controller.signal, timeoutMs: 5_000 });
+      const pids = JSON.parse(await waitForFile(startedPath)) as { parent: number; descendant: number };
+      controller.abort(stopped);
+      const rejected = expect(execution).rejects.toBe(stopped);
+
+      await waitUntil(() => !isProcessRunning(pids.parent));
+      expect(isProcessRunning(pids.descendant)).toBe(true);
+
+      await rejected;
+      expect(isProcessRunning(pids.parent)).toBe(false);
+      expect(isProcessRunning(pids.descendant)).toBe(false);
+    } finally {
+      if (previousAssistantBin === undefined) {
+        delete process.env.CLOUDX_ASSISTANT_BIN;
+      } else {
+        process.env.CLOUDX_ASSISTANT_BIN = previousAssistantBin;
+      }
+      if (previousStartedPath === undefined) {
+        delete process.env.CLOUDX_TEST_CODEX_STARTED;
+      } else {
+        process.env.CLOUDX_TEST_CODEX_STARTED = previousStartedPath;
+      }
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
 });
+
+async function waitForFile(filePath: string): Promise<string> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      return await fs.readFile(filePath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  throw new Error(`Timed out waiting for ${filePath}.`);
+}
+
+async function waitUntil(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Timed out waiting for process state.");
+}
+
+function isProcessRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
 
 function closedObjectSchemaIssues(value: unknown, pathParts: string[] = ["#"]): string[] {
   if (!isRecord(value)) {

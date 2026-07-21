@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import type { CreateTabResponse, TabLayoutNode } from "@cloudx/shared";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs/promises";
 import net from "node:net";
@@ -80,7 +81,99 @@ test.describe("CloudX shipped shell", () => {
       contentType: "image/png",
     });
   });
+
+  test("creates a tab from the committed window without duplicate layout persistence", async ({
+    page,
+  }, testInfo) => {
+    const workspaceRequests: Array<{
+      method: "PATCH" | "POST";
+      pathname: string;
+      body: unknown;
+    }> = [];
+    page.on("request", (request) => {
+      const method = request.method();
+      const pathname = new URL(request.url()).pathname;
+      if (
+        (method === "PATCH" && /^\/api\/windows\/[^/]+$/.test(pathname)) ||
+        (method === "POST" && pathname === "/api/tabs")
+      ) {
+        workspaceRequests.push({
+          method,
+          pathname,
+          body: request.postDataJSON(),
+        });
+      }
+    });
+
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    await expect(page.locator(".workspace-pane")).toHaveCount(1);
+
+    const visibleSplitButton = page.locator('button[title^="Split"]:visible');
+    if ((await visibleSplitButton.count()) === 0) {
+      await page.getByRole("button", { name: "Workspace actions" }).click();
+    }
+    await visibleSplitButton.first().click();
+    await expect(page.locator(".workspace-pane")).toHaveCount(2);
+
+    const targetPane = page.locator(".workspace-pane.active");
+    const paneId = await targetPane.getAttribute("data-pane-id");
+    expect(paneId).toBeTruthy();
+    await targetPane.getByTitle("Add tab to this pane").click();
+
+    await page.getByLabel("Plugin").selectOption("local-web");
+    await page.getByLabel("Title").fill("Browser placement");
+    const createResponsePromise = page.waitForResponse(
+      (response) =>
+        response.request().method() === "POST" &&
+        new URL(response.url()).pathname === "/api/tabs",
+    );
+    await page.getByRole("button", { name: "Create", exact: true }).click();
+    const createResponse = await createResponsePromise;
+    expect(createResponse.status()).toBe(201);
+
+    const committed = (await createResponse.json()) as CreateTabResponse;
+    const createRequest = workspaceRequests.find(
+      (request) => request.method === "POST",
+    );
+    expect(workspaceRequests.map((request) => request.method)).toEqual([
+      "PATCH",
+      "POST",
+    ]);
+    expect(createRequest?.body).toMatchObject({
+      pluginId: "local-web",
+      windowId: committed.window.id,
+      paneId,
+    });
+    const committedPane = findPane(committed.window.layout.root, paneId!);
+    expect(committedPane?.tabIds).toContain(committed.tab.id);
+    expect(committedPane?.activeTabId).toBe(committed.tab.id);
+    await expect(
+      targetPane.getByText("Browser placement", { exact: true }),
+    ).toBeVisible();
+
+    await page.waitForTimeout(500);
+    expect(
+      workspaceRequests.filter((request) => request.method === "PATCH"),
+    ).toHaveLength(1);
+
+    const screenshot = await page.screenshot({
+      path: testInfo.outputPath("tab-placement.png"),
+    });
+    await testInfo.attach("tab placement", {
+      body: screenshot,
+      contentType: "image/png",
+    });
+  });
 });
+
+function findPane(root: TabLayoutNode, paneId: string) {
+  if (root.type === "pane") {
+    return root.pane.id === paneId ? root.pane : undefined;
+  }
+  return (
+    findPane(root.children[0], paneId) ?? findPane(root.children[1], paneId)
+  );
+}
 
 async function freePort() {
   const probe = net.createServer();

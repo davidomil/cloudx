@@ -86,6 +86,7 @@ import { applyVoiceWorkspaceResultsToWorkspace, buildClientVoiceContext, voiceCo
 import { WebViewerPanel } from "./WebViewerPanel.js";
 import { WorktreeManagerPanel } from "./WorktreeManagerPanel.js";
 import { parseWorkspaceSocketUpdate } from "./workspaceSocketUpdate.js";
+import { WorkspaceWriteCoordinator } from "./workspaceWriteCoordinator.js";
 import type { AutomationPanelState, AutomationPanelStateUpdater } from "./AutomationPanel.js";
 import type { DocumentationPanelState, DocumentationPanelStateUpdater } from "./DocumentationPanel.js";
 
@@ -205,10 +206,21 @@ export function App() {
   const layoutRef = useRef<TabLayoutState>(initialLayout);
   const activeTabIdRef = useRef<string | undefined>(undefined);
   const createTargetPaneIdRef = useRef<string | undefined>(undefined);
-  const persistLayoutTimerRef = useRef<number | undefined>(undefined);
   const pendingLayoutPersistWindowIdRef = useRef<string | undefined>(undefined);
   const pendingLayoutBaseRef = useRef<TabLayoutState | undefined>(undefined);
   const pendingLayoutPersistRef = useRef<TabLayoutState | undefined>(undefined);
+  const workspaceWritesRef = useRef<WorkspaceWriteCoordinator | undefined>(undefined);
+  workspaceWritesRef.current ??= new WorkspaceWriteCoordinator(
+    async (windowId, persistedLayout) => {
+      await updateWindow(windowId, { layout: persistedLayout });
+      if (pendingLayoutPersistWindowIdRef.current === windowId && pendingLayoutPersistRef.current === persistedLayout) {
+        clearPendingLayoutPersistence();
+      }
+    },
+    200,
+    (err) => setError(err instanceof Error ? err.message : String(err))
+  );
+  const workspaceWrites = workspaceWritesRef.current;
   const audioSessionRef = useRef<VoiceAudioStreamSession | undefined>(undefined);
   const notificationToastTimersRef = useRef<Map<string, number>>(new Map());
   const topbarMicControlRef = useRef<HTMLDivElement | null>(null);
@@ -242,9 +254,7 @@ export function App() {
     return () => {
       audioSessionRef.current?.cancel();
       closeWorkspaceSocket();
-      if (persistLayoutTimerRef.current !== undefined) {
-        window.clearTimeout(persistLayoutTimerRef.current);
-      }
+      workspaceWritesRef.current?.dispose();
       clearNotificationToastTimers();
       window.clearInterval(interval);
     };
@@ -445,10 +455,7 @@ export function App() {
 
   function applyWorkspaceTabs(nextTabs: WorkspaceTab[], nextActiveTabId?: string) {
     const previousTabs = new Map(tabsRef.current.map((tab) => [tab.id, tab]));
-    let nextLayout = reconcileLayout(layoutRef.current, nextTabs, nextActiveTabId);
-    if (createTargetPaneIdRef.current && nextActiveTabId && !previousTabs.has(nextActiveTabId)) {
-      nextLayout = addTabToPane(nextLayout, resolveTabCreationPaneId(nextLayout, createTargetPaneIdRef.current), nextActiveTabId);
-    }
+    const nextLayout = reconcileLayout(layoutRef.current, nextTabs, nextActiveTabId);
     tabsRef.current = nextTabs;
     layoutRef.current = nextLayout;
     activeTabIdRef.current = nextActiveTabId;
@@ -570,26 +577,11 @@ export function App() {
     }
     pendingLayoutPersistWindowIdRef.current = windowId;
     pendingLayoutPersistRef.current = nextLayout;
-    if (persistLayoutTimerRef.current !== undefined) {
-      window.clearTimeout(persistLayoutTimerRef.current);
-    }
-    const layoutForPersistence = nextLayout;
-    persistLayoutTimerRef.current = window.setTimeout(() => {
-      void updateWindow(windowId, { layout: layoutForPersistence })
-        .then(() => {
-          if (pendingLayoutPersistWindowIdRef.current === windowId && pendingLayoutPersistRef.current === layoutForPersistence) {
-            clearPendingLayoutPersistence();
-          }
-        })
-        .catch((err) => setError(err instanceof Error ? err.message : String(err)));
-    }, 200);
+    workspaceWrites.scheduleLayout(windowId, nextLayout);
   }
 
   function clearPendingLayoutPersistence() {
-    if (persistLayoutTimerRef.current !== undefined) {
-      window.clearTimeout(persistLayoutTimerRef.current);
-      persistLayoutTimerRef.current = undefined;
-    }
+    workspaceWrites.cancelPending();
     pendingLayoutPersistWindowIdRef.current = undefined;
     pendingLayoutBaseRef.current = undefined;
     pendingLayoutPersistRef.current = undefined;
@@ -683,14 +675,25 @@ export function App() {
     setCreateTargetPaneId((current) => (current === paneId ? undefined : current));
   }
 
-  async function handleCreate(input: CreateTabRequest) {
+  async function handleCreate(input: Omit<CreateTabRequest, "windowId" | "paneId">) {
     setError(undefined);
     try {
-      const tab = await createTab({ ...input, windowId: input.windowId ?? activeWindowIdRef.current });
-      setTabs((current) => upsertTab(current, tab));
       const targetPaneId = createTargetPaneIdRef.current ?? createTargetPaneId;
-      updateLayout((current) => addTabToPane(current, resolveTabCreationPaneId(current, targetPaneId), tab.id));
+      const windowId = activeWindowIdRef.current;
+      if (!windowId) {
+        throw new Error("Select a workspace window before creating a tab.");
+      }
+      const paneId = resolveTabCreationPaneId(layoutRef.current, targetPaneId);
+      const { tab, window } = await workspaceWrites.run(() => createTab({ ...input, windowId, paneId }));
+      const nextTabs = upsertTab(tabsRef.current, tab);
+      const nextWindows = upsertWindow(windowsRef.current, window);
+      tabsRef.current = nextTabs;
+      windowsRef.current = nextWindows;
+      layoutRef.current = window.layout;
       activeTabIdRef.current = tab.id;
+      setTabs(nextTabs);
+      setWindows(nextWindows);
+      setLayout(window.layout);
       setActiveTabId(tab.id);
       setCreateOpen(false);
       createTargetPaneIdRef.current = undefined;
@@ -709,7 +712,7 @@ export function App() {
   async function handleClose(tabId: string) {
     setError(undefined);
     try {
-      const result = await closeTab(tabId);
+      const result = await workspaceWrites.run(() => closeTab(tabId));
       setTabs((current) => current.filter((tab) => tab.id !== tabId));
       updateLayout((current) => removeTabFromPanes(current, tabId));
       activeTabIdRef.current = result.activeTabId;
@@ -881,7 +884,7 @@ export function App() {
 
   function applyHookResult(result: Record<string, unknown>) {
     applyHookUiInstruction(result.uiInstruction);
-    applyWorkspaceExecutionResults([{ action: "ui-hook", ok: true, result }]);
+    applyWorkspaceExecutionResults([{ actionId: "ui-hook", action: "ui-hook", status: "succeeded", result }]);
   }
 
   function applyHookUiInstruction(instruction: unknown) {
@@ -926,7 +929,7 @@ export function App() {
         const changedWindow = next.windows.find((window) => window.id === windowId);
         if (changedWindow) {
           commitLayout(changedWindow.layout, { windowId, baseLayout: previousWindows.find((window) => window.id === windowId)?.layout, persist: false });
-          void updateWindow(windowId, { layout: changedWindow.layout }).catch((err) => setError(err instanceof Error ? err.message : String(err)));
+          void workspaceWrites.run(() => updateWindow(windowId, { layout: changedWindow.layout })).catch((err) => setError(err instanceof Error ? err.message : String(err)));
         }
       }
       layoutRef.current = next.layout;
@@ -986,22 +989,22 @@ export function App() {
   }
 
   async function handleCreateWindow(name: string, defaultCwd: string, templateId?: string, createDirectory = false) {
-    applyWorkspaceState(await createWindow({ name, defaultCwd, createDirectory, pluginMetadata: pluginMetadataForTemplate(templateId) }));
+    applyWorkspaceState(await workspaceWrites.run(() => createWindow({ name, defaultCwd, createDirectory, pluginMetadata: pluginMetadataForTemplate(templateId) })));
   }
 
   async function handleSelectWindow(windowId: string) {
-    applyWorkspaceState(await selectWindow(windowId));
+    applyWorkspaceState(await workspaceWrites.run(() => selectWindow(windowId)));
     setWindowMenuOpen(false);
   }
 
   async function handleRenameWindow(windowId: string, name: string, defaultCwd: string, templateId?: string) {
-    applyWorkspaceState(await updateWindow(windowId, { name, defaultCwd, pluginMetadata: { [RULES_SKILLS_PLUGIN_ID]: templateId ? { selectedTemplateId: templateId } : null } }));
+    applyWorkspaceState(await workspaceWrites.run(() => updateWindow(windowId, { name, defaultCwd, pluginMetadata: { [RULES_SKILLS_PLUGIN_ID]: templateId ? { selectedTemplateId: templateId } : null } })));
   }
 
   async function handleDeleteWindow(windowId: string) {
     const target = windows.find((window) => window.id === windowId);
     if (!target) return;
-    applyWorkspaceState(await deleteWindow(windowId));
+    applyWorkspaceState(await workspaceWrites.run(() => deleteWindow(windowId)));
     setWindowMenuOpen(false);
   }
 
@@ -1010,12 +1013,12 @@ export function App() {
   }, []);
 
   async function handleSaveTemplate(name: string, basePath: string) {
-    const result = await saveLayoutTemplate({ name, basePath, windowId: activeWindowId });
+    const result = await workspaceWrites.run(() => saveLayoutTemplate({ name, basePath, windowId: activeWindowId }));
     applyWorkspaceState(result.workspace);
   }
 
   async function handleRenameTemplate(templateId: string, name: string) {
-    const result = await updateLayoutTemplate(templateId, { name });
+    const result = await workspaceWrites.run(() => updateLayoutTemplate(templateId, { name }));
     applyWorkspaceState(result.workspace);
   }
 
@@ -1025,12 +1028,12 @@ export function App() {
     if (!window.confirm(`Delete layout template ${target.name}?`)) {
       return;
     }
-    const result = await deleteLayoutTemplate(templateId);
+    const result = await workspaceWrites.run(() => deleteLayoutTemplate(templateId));
     applyWorkspaceState(result.workspace);
   }
 
   async function handleApplyTemplate(templateId: string, projectPath: string, name?: string) {
-    const result = await applyLayoutTemplate(templateId, { projectPath, name });
+    const result = await workspaceWrites.run(() => applyLayoutTemplate(templateId, { projectPath, name }));
     applyWorkspaceState(result.workspace);
     setTemplateMenuOpen(false);
   }
@@ -2243,6 +2246,14 @@ function upsertTab(tabs: WorkspaceTab[], tab: WorkspaceTab): WorkspaceTab[] {
   return [...tabs.slice(0, existingIndex), tab, ...tabs.slice(existingIndex + 1)];
 }
 
+function upsertWindow(windows: WorkspaceWindow[], window: WorkspaceWindow): WorkspaceWindow[] {
+  const existingIndex = windows.findIndex((candidate) => candidate.id === window.id);
+  if (existingIndex === -1) {
+    return [...windows, window];
+  }
+  return [...windows.slice(0, existingIndex), window, ...windows.slice(existingIndex + 1)];
+}
+
 export type WorkspaceLayoutMergeDecision = "none" | "preserved-local" | "accepted-server";
 
 export interface WorkspaceLayoutMergeResult {
@@ -2553,7 +2564,7 @@ function CreateTabDialog({
   templates: PersonalityTemplate[];
   defaultCwd: string;
   onCancel: () => void;
-  onCreate: (input: CreateTabRequest) => Promise<void>;
+  onCreate: (input: Omit<CreateTabRequest, "windowId" | "paneId">) => Promise<void>;
 }) {
   const creatablePlugins = useMemo(() => plugins.filter((plugin) => plugin.creatable), [plugins]);
   const [pluginId, setPluginId] = useState<PluginId>(() => selectCreateTabPluginId(creatablePlugins));

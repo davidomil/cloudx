@@ -1,10 +1,11 @@
 import crypto from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
 
 import { pluginActionHookId } from "@cloudx/plugin-api";
 import type { CloudxAppContext, HookCaller, PluginActionDefinition, PluginSession, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
 import type { ConfigValue } from "@cloudx/shared";
-import type { CreateTabRequest, HookId, PluginMetadata, PluginMetadataMap, TabIndicator, TabIndicatorUpdate, VoiceAction, WorkspaceRuntimeContext, WorkspaceSnapshot, WorkspaceTab, WorkspaceTabsUpdate, WorkspaceWindow } from "@cloudx/shared";
+import type { HookId, PluginId, PluginMetadata, PluginMetadataMap, TabIndicator, TabIndicatorUpdate, VoiceAction, WorkspaceRuntimeContext, WorkspaceSnapshot, WorkspaceTab, WorkspaceTabsUpdate, WorkspaceWindow } from "@cloudx/shared";
 
 import { PathPolicy } from "./pathPolicy.js";
 import { PluginRegistry } from "./pluginRegistry.js";
@@ -19,14 +20,41 @@ export interface SessionRuntimeContextResolver {
   tabIndicatorFor(tab: WorkspaceTab, window?: WorkspaceWindow): Promise<TabIndicatorUpdate | undefined> | TabIndicatorUpdate | undefined;
 }
 
+export interface StartTabRequest {
+  pluginId: PluginId;
+  cwd?: string;
+  title?: string;
+  createDirectory?: boolean;
+  initialInput?: Record<string, unknown>;
+  windowId?: string;
+  pluginMetadata?: PluginMetadataMap;
+}
+
+export type SessionBackgroundErrorReporter = (error: unknown, details: { operation: string; tabId: string }) => void;
+
+interface ActionAdmission {
+  active: boolean;
+}
+
+const reportSessionBackgroundError: SessionBackgroundErrorReporter = (error, details) => {
+  console.error(`Session ${details.tabId} failed to ${details.operation}.`, error);
+};
+
 export class SessionStore {
   private readonly tabs = new Map<string, WorkspaceTab>();
   private readonly sessions = new Map<string, PluginSession>();
+  private readonly unpublishedTabIds = new Set<string>();
+  private readonly preparedTabFailures = new Map<string, Error>();
   private readonly sessionDisposers = new Map<string, Array<() => void>>();
   private readonly tabsListeners = new Set<(update: WorkspaceTabsUpdate) => void>();
   private activeTabId: string | undefined;
   private hooks: HookRegistry | undefined;
   private triggers: TriggerRegistry | undefined;
+  private readonly producerActions = new Set<Promise<unknown>>();
+  private readonly triggerEmissions = new Set<Promise<unknown>>();
+  private readonly actionAdmission = new AsyncLocalStorage<ActionAdmission>();
+  private disposed = false;
+  private disposePromise: Promise<void> | undefined;
 
   constructor(
     private readonly plugins: PluginRegistry,
@@ -34,7 +62,8 @@ export class SessionStore {
     private readonly contextService: TabContextService,
     private readonly configProvider: { getPluginConfig(pluginId: string): Record<string, ConfigValue> } = { getPluginConfig: () => ({}) },
     private readonly workspace?: WorkspaceLayoutStore,
-    private readonly runtimeContextResolver?: SessionRuntimeContextResolver
+    private readonly runtimeContextResolver?: SessionRuntimeContextResolver,
+    private readonly backgroundErrorReporter: SessionBackgroundErrorReporter = reportSessionBackgroundError
   ) {}
 
   setHookRegistry(hooks: HookRegistry): void {
@@ -45,13 +74,21 @@ export class SessionStore {
     this.triggers = triggers;
   }
 
-  async createTab(request: CreateTabRequest): Promise<WorkspaceTab> {
+  async createTab(request: StartTabRequest): Promise<WorkspaceTab> {
+    const tab = await this.prepareTab(request);
+    return this.publishPreparedTab(tab.id);
+  }
+
+  async prepareTab(request: StartTabRequest, runtimeWindow?: WorkspaceWindow): Promise<WorkspaceTab> {
+    if (this.disposed) {
+      throw new Error("Session store is disposed.");
+    }
     const plugin = this.plugins.get(request.pluginId);
     const cwdExpression = this.createTabCwdExpression(plugin, request);
     const cwd = await this.pathPolicy.ensureDirectory(cwdExpression, plugin.requiresDirectory ? (request.createDirectory ?? false) : false);
     const now = new Date().toISOString();
     const id = crypto.randomUUID();
-    const window = this.resolveRequestWindow(request);
+    const window = runtimeWindow ?? this.resolveRequestWindow(request);
     const tab: WorkspaceTab = {
       id,
       pluginId: plugin.id,
@@ -64,15 +101,15 @@ export class SessionStore {
       updatedAt: now,
       contextPath: ""
     };
-    const runtimeContext = await this.runtimeContextResolver?.runtimeContextFor(tab, window);
-    const templateIndicator = await this.runtimeContextResolver?.tabIndicatorFor(tab, window);
-    if (templateIndicator) {
-      tab.indicator = createTabIndicator(templateIndicator, now);
-    }
-    tab.contextPath = await this.contextService.create(tab);
-    this.tabs.set(id, tab);
-
     try {
+      const runtimeContext = await this.runtimeContextResolver?.runtimeContextFor(tab, window);
+      const templateIndicator = await this.runtimeContextResolver?.tabIndicatorFor(tab, window);
+      if (templateIndicator) {
+        tab.indicator = createTabIndicator(templateIndicator, now);
+      }
+      tab.contextPath = await this.contextService.create(tab);
+      this.tabs.set(id, tab);
+      this.unpublishedTabIds.add(id);
       const session = await plugin.createSession({
         tab,
         cwd,
@@ -86,24 +123,73 @@ export class SessionStore {
       this.bindSession(id, session);
       this.updateTab(id, { status: "running", indicator: templateIndicator ? createTabIndicator(templateIndicator) : createTabIndicator({ color: "green", label: "OK", message: "Running." }) });
     } catch (error) {
-      this.updateTab(id, {
-        status: "failed",
-        statusMessage: error instanceof Error ? error.message : String(error),
-        indicator: createTabIndicator({
-          color: "red",
-          label: "Failed",
-          message: error instanceof Error ? error.message : String(error)
-        })
-      });
+      await this.discardPreparedTab(id);
       throw error;
     }
-
-    this.activeTabId = id;
-    this.emitTabsChange();
     return this.getTab(id);
   }
 
-  private createTabCwdExpression(plugin: WorkspacePlugin, request: CreateTabRequest): string {
+  publishPreparedTab(tabId: string): WorkspaceTab {
+    return this.publishPreparedTabs([tabId])[0]!;
+  }
+
+  publishPreparedTabs(tabIds: string[]): WorkspaceTab[] {
+    if (new Set(tabIds).size !== tabIds.length) {
+      throw new Error("Prepared tab ids must be unique.");
+    }
+    this.assertPreparedTabsReady(tabIds);
+    const tabs = tabIds.map((tabId) => {
+      return this.getTab(tabId);
+    });
+    for (const tabId of tabIds) {
+      this.unpublishedTabIds.delete(tabId);
+      this.preparedTabFailures.delete(tabId);
+    }
+    if (tabs.length > 0) {
+      this.activeTabId = tabs.at(-1)!.id;
+      this.emitTabsChange();
+    }
+    return tabs;
+  }
+
+  assertPreparedTabsReady(tabIds: string[]): void {
+    for (const tabId of tabIds) {
+      if (!this.unpublishedTabIds.has(tabId)) {
+        throw new Error(`Tab is not awaiting workspace placement: ${tabId}`);
+      }
+      const failure = this.preparedTabFailures.get(tabId);
+      if (failure) {
+        throw failure;
+      }
+      this.getTab(tabId);
+    }
+  }
+
+  async discardPreparedTab(tabId: string): Promise<void> {
+    const tab = this.tabs.get(tabId);
+    if (!tab) {
+      return;
+    }
+    const failures: unknown[] = [];
+    try {
+      this.closeTab(tabId);
+    } catch (error) {
+      failures.push(error);
+    }
+    try {
+      await this.contextService.delete(tab);
+    } catch (error) {
+      failures.push(error);
+    }
+    if (failures.length === 1) {
+      throw failures[0];
+    }
+    if (failures.length > 1) {
+      throw new AggregateError(failures, `Failed to discard prepared tab ${tabId}.`);
+    }
+  }
+
+  private createTabCwdExpression(plugin: WorkspacePlugin, request: StartTabRequest): string {
     const requestedCwd = request.cwd?.trim();
     if (requestedCwd) {
       return requestedCwd;
@@ -115,7 +201,7 @@ export class SessionStore {
   }
 
   listTabs(): WorkspaceTab[] {
-    return Array.from(this.tabs.values());
+    return Array.from(this.tabs.values()).filter((tab) => !this.unpublishedTabIds.has(tab.id));
   }
 
   onTabsChange(listener: (update: WorkspaceTabsUpdate) => void): () => void {
@@ -216,9 +302,14 @@ export class SessionStore {
     };
   }
 
-  async executeVoiceAction(action: VoiceAction, fallbackTabId?: string): Promise<Record<string, unknown>> {
+  async executeVoiceAction(action: VoiceAction, fallbackTabId?: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    return this.admitAction(() => this.executeAdmittedVoiceAction(action, fallbackTabId, signal));
+  }
+
+  private async executeAdmittedVoiceAction(action: VoiceAction, fallbackTabId?: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    signal?.throwIfAborted();
     if (action.hookId) {
-      return this.executeVoiceHook(action, fallbackTabId);
+      return this.executeVoiceHook(action, fallbackTabId, signal);
     }
 
     if (action.pluginId === WORKSPACE_CONTROL_PLUGIN_ID) {
@@ -243,7 +334,7 @@ export class SessionStore {
     }
     const input = this.plugins.sanitizeVoiceInput(pluginId, action.action, action.input);
     this.plugins.validateVoiceInput(pluginId, action.action, input);
-    const result = this.plugins.validateOutput(pluginId, action.action, await session.handleAction(action.action, input));
+    const result = this.plugins.validateOutput(pluginId, action.action, await session.handleAction(action.action, input, { signal, caller: { kind: "voice" } }));
     await this.contextService.record(this.getTab(targetTabId), "voice-action", JSON.stringify({ action: { ...action, input }, result }, null, 2));
     this.markTabInteractedIfActionUpdatesState(pluginId, action.action, targetTabId);
     return result;
@@ -264,6 +355,8 @@ export class SessionStore {
       return undefined;
     }
     return {
+      id: "default-voice-action",
+      dependsOn: [],
       targetTabId,
       pluginId: session.tab.pluginId,
       hookId: pluginActionHookId(session.tab.pluginId, defaultAction.name),
@@ -288,6 +381,8 @@ export class SessionStore {
       return undefined;
     }
     return {
+      id: "unhandled-voice-action",
+      dependsOn: [],
       targetTabId,
       pluginId: session.tab.pluginId,
       hookId: pluginActionHookId(session.tab.pluginId, fallbackAction.name),
@@ -297,37 +392,43 @@ export class SessionStore {
     };
   }
 
-  async executePluginAction(tabId: string, action: string, input: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const session = this.getSession(tabId);
-    this.plugins.validateInput(session.tab.pluginId, action, input);
-    const result = this.plugins.validateOutput(session.tab.pluginId, action, await session.handleAction(action, input));
-    await this.contextService.record(this.getTab(tabId), "plugin-action", JSON.stringify({ action, input, result }, null, 2));
-    this.markTabInteractedIfActionUpdatesState(session.tab.pluginId, action, tabId);
-    return result;
+  async executePluginAction(tabId: string, action: string, input: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    return this.admitAction(async () => {
+      signal?.throwIfAborted();
+      const session = this.getSession(tabId);
+      this.plugins.validateInput(session.tab.pluginId, action, input);
+      const result = this.plugins.validateOutput(session.tab.pluginId, action, await session.handleAction(action, input, { signal, caller: { kind: "ui" } }));
+      await this.contextService.record(this.getTab(tabId), "plugin-action", JSON.stringify({ action, input, result }, null, 2));
+      this.markTabInteractedIfActionUpdatesState(session.tab.pluginId, action, tabId);
+      return result;
+    });
   }
 
   async executePluginHook(pluginId: string, hookId: HookId, action: string, targetTabId: string | undefined, input: Record<string, unknown>, caller: HookCaller, signal?: AbortSignal): Promise<Record<string, unknown>> {
-    const tabId = this.resolvePluginHookTargetTabId(pluginId, targetTabId, caller.tabId ?? this.activeTabId);
-    if (!tabId) {
-      throw new Error(`Hook ${hookId} requires a target tab for plugin ${pluginId}.`);
-    }
-    const session = this.getSession(tabId);
-    if (session.tab.pluginId !== pluginId) {
-      throw new Error(`Hook ${hookId} targets plugin ${pluginId}, but tab ${tabId} uses ${session.tab.pluginId}.`);
-    }
-    const actionInput = caller.kind === "voice" ? this.plugins.sanitizeVoiceInput(pluginId, action, input) : input;
-    if (caller.kind === "voice") {
-      this.plugins.validateVoiceInput(pluginId, action, actionInput);
-    } else {
-      this.plugins.validateInput(pluginId, action, actionInput);
-    }
-    const result = this.plugins.validateOutput(pluginId, action, await session.handleAction(action, actionInput, { signal, caller }));
-    await this.contextService.record(this.getTab(tabId), "plugin-hook", JSON.stringify({ hookId, action, input: actionInput, caller, result }, null, 2));
-    this.markTabInteractedIfActionUpdatesState(pluginId, action, tabId);
-    return result;
+    return this.admitAction(async () => {
+      signal?.throwIfAborted();
+      const tabId = this.resolvePluginHookTargetTabId(pluginId, targetTabId, caller.tabId ?? this.activeTabId);
+      if (!tabId) {
+        throw new Error(`Hook ${hookId} requires a target tab for plugin ${pluginId}.`);
+      }
+      const session = this.getSession(tabId);
+      if (session.tab.pluginId !== pluginId) {
+        throw new Error(`Hook ${hookId} targets plugin ${pluginId}, but tab ${tabId} uses ${session.tab.pluginId}.`);
+      }
+      const actionInput = caller.kind === "voice" ? this.plugins.sanitizeVoiceInput(pluginId, action, input) : input;
+      if (caller.kind === "voice") {
+        this.plugins.validateVoiceInput(pluginId, action, actionInput);
+      } else {
+        this.plugins.validateInput(pluginId, action, actionInput);
+      }
+      const result = this.plugins.validateOutput(pluginId, action, await session.handleAction(action, actionInput, { signal, caller }));
+      await this.contextService.record(this.getTab(tabId), "plugin-hook", JSON.stringify({ hookId, action, input: actionInput, caller, result }, null, 2));
+      this.markTabInteractedIfActionUpdatesState(pluginId, action, tabId);
+      return result;
+    });
   }
 
-  private async executeVoiceHook(action: VoiceAction, fallbackTabId?: string): Promise<Record<string, unknown>> {
+  private async executeVoiceHook(action: VoiceAction, fallbackTabId?: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
     if (!this.hooks) {
       throw new Error("Hook registry is not available.");
     }
@@ -338,7 +439,8 @@ export class SessionStore {
       caller: { kind: "voice" },
       targetTabId,
       targetTab,
-      activeTabId
+      activeTabId,
+      signal
     });
     const contextTabId = targetTab?.id ?? (activeTabId && this.tabs.has(activeTabId) ? activeTabId : undefined);
     if (contextTabId) {
@@ -348,17 +450,80 @@ export class SessionStore {
   }
 
   closeTab(tabId: string, options: { stopSession?: boolean } = {}): void {
+    const wasPublished = !this.unpublishedTabIds.delete(tabId);
+    this.preparedTabFailures.delete(tabId);
     const session = this.sessions.get(tabId);
     this.disposeSessionListeners(tabId);
+    let stopError: unknown;
     if (options.stopSession ?? true) {
-      session?.stop?.();
+      try {
+        session?.stop?.();
+      } catch (error) {
+        stopError = error;
+      }
     }
     this.sessions.delete(tabId);
     this.tabs.delete(tabId);
     if (this.activeTabId === tabId) {
       this.activeTabId = this.listTabs()[0]?.id;
     }
-    this.emitTabsChange();
+    if (wasPublished) {
+      this.emitTabsChange();
+    }
+    if (stopError !== undefined) {
+      throw stopError;
+    }
+  }
+
+  dispose(): Promise<void> {
+    if (this.disposePromise) {
+      return this.disposePromise;
+    }
+    this.disposed = true;
+    this.disposePromise = this.finishDisposal();
+    return this.disposePromise;
+  }
+
+  private stopSessions(): unknown[] {
+    const errors: unknown[] = [];
+    for (const tabId of [...this.tabs.keys()]) {
+      try {
+        this.closeTab(tabId);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    this.tabsListeners.clear();
+    return errors;
+  }
+
+  private async finishDisposal(): Promise<void> {
+    await drainPromises(this.producerActions);
+    await drainPromises(this.triggerEmissions);
+    const errors = this.stopSessions();
+    if (errors.length > 0) {
+      throw new AggregateError(errors, "One or more plugin sessions failed to stop.");
+    }
+  }
+
+  private admitAction<T>(action: () => Promise<T>): Promise<T> {
+    if (this.disposed && !this.actionAdmission.getStore()?.active) {
+      return Promise.reject(new Error("Session store is disposed."));
+    }
+    const admission = { active: true };
+    const execution = this.actionAdmission.run(admission, action);
+    this.producerActions.add(execution);
+    void execution.then(
+      () => {
+        admission.active = false;
+        this.producerActions.delete(execution);
+      },
+      () => {
+        admission.active = false;
+        this.producerActions.delete(execution);
+      }
+    );
+    return execution;
   }
 
   async restartTab(tabId: string, reason = "Restarting tab."): Promise<WorkspaceTab> {
@@ -449,7 +614,9 @@ export class SessionStore {
   private updateTab(tabId: string, patch: Partial<WorkspaceTab>): void {
     const current = this.getTab(tabId);
     this.tabs.set(tabId, { ...current, ...patch, updatedAt: new Date().toISOString() });
-    this.emitTabsChange();
+    if (!this.unpublishedTabIds.has(tabId)) {
+      this.emitTabsChange();
+    }
   }
 
   private markTabInteracted(tabId: string): void {
@@ -496,7 +663,7 @@ export class SessionStore {
       const tab = this.getTab(tabId);
       const window = this.workspace?.findWindowForTab(tabId) ?? this.workspace?.getActiveWindow();
       const templateIndicator = await this.runtimeContextResolver.tabIndicatorFor(tab, window);
-      if (templateIndicator) {
+      if (templateIndicator && this.tabs.has(tabId)) {
         this.updateTab(tabId, { indicator: createTabIndicator(templateIndicator) });
       }
     }
@@ -520,7 +687,9 @@ export class SessionStore {
     const dataDisposer = session.onData?.((data) => {
       const current = this.tabs.get(tabId);
       if (current) {
-        void this.contextService.record(current, "terminal-output", data);
+        void this.contextService.record(current, "terminal-output", data).catch((error) => {
+          this.reportBackgroundError(error, "record terminal output", tabId);
+        });
       }
     });
     if (dataDisposer) {
@@ -539,8 +708,13 @@ export class SessionStore {
   private createControls(tabId: string): PluginTabControls {
     return {
       setTabIndicator: (indicator) => this.updateTabIndicator(tabId, indicator),
-      closeTab: () => {
-        if (this.tabs.has(tabId)) {
+      closeTab: (reason) => {
+        if (this.unpublishedTabIds.has(tabId)) {
+          if (!this.preparedTabFailures.has(tabId)) {
+            const detail = reason?.trim();
+            this.preparedTabFailures.set(tabId, new Error(`Prepared tab ${tabId} closed before its workspace transaction committed${detail ? `: ${detail}` : "."}`));
+          }
+        } else if (this.tabs.has(tabId)) {
           this.closeTab(tabId, { stopSession: false });
         }
       }
@@ -554,11 +728,23 @@ export class SessionStore {
       tabs: this.listTabs()
     };
     for (const listener of this.tabsListeners) {
-      listener(update);
+      try {
+        listener(update);
+      } catch (error) {
+        this.reportBackgroundError(error, "notify tab listeners", this.activeTabId ?? "workspace");
+      }
     }
   }
 
-  private resolveRequestWindow(request: CreateTabRequest): WorkspaceWindow | undefined {
+  private reportBackgroundError(error: unknown, operation: string, tabId: string): void {
+    try {
+      this.backgroundErrorReporter(error, { operation, tabId });
+    } catch (reporterError) {
+      reportSessionBackgroundError(reporterError, { operation: `report failure to ${operation}`, tabId });
+    }
+  }
+
+  private resolveRequestWindow(request: StartTabRequest): WorkspaceWindow | undefined {
     if (!this.workspace) {
       return undefined;
     }
@@ -572,31 +758,25 @@ export class SessionStore {
       return { activeTabId: tab.id, title: tab.title };
     }
     if (action === "create_tab") {
+      if (!this.hooks) {
+        throw new Error("Workspace tab creation hook is not available.");
+      }
       const targetPluginId = requireString(input.targetPluginId, "targetPluginId");
-      const targetPlugin = this.plugins.get(targetPluginId);
-      const cwd =
-        typeof input.cwd === "string" && input.cwd.trim()
-          ? normalizeVoiceCwd(input.cwd)
-          : targetPlugin.requiresDirectory
-            ? this.defaultVoiceCreateTabCwdExpression()
-            : undefined;
+      const cwd = typeof input.cwd === "string" && input.cwd.trim() ? normalizeVoiceCwd(input.cwd) : undefined;
       const title = typeof input.title === "string" && input.title.trim() ? input.title.trim() : undefined;
-      const paneId = typeof input.paneId === "string" && input.paneId.trim() ? input.paneId.trim() : undefined;
       const createDirectory = typeof input.createDirectory === "boolean" ? input.createDirectory : false;
-      const newPane = typeof input.newPane === "boolean" ? input.newPane : false;
-      const splitDirection = input.splitDirection === "column" ? "column" : "row";
       const initialInput = typeof input.url === "string" && input.url.trim() ? { url: input.url.trim() } : undefined;
-      const tab = await this.createTab({ pluginId: targetPluginId, cwd, title, createDirectory, initialInput });
-      return {
-        tab,
-        activeTabId: tab.id,
-        layoutInstruction: {
-          type: newPane ? "open_tab_in_new_pane" : "add_tab_to_active_pane",
-          tabId: tab.id,
-          paneId,
-          splitDirection
-        }
-      };
+      return this.hooks.call("workspace.tabs.create", {
+        pluginId: targetPluginId,
+        cwd,
+        title,
+        createDirectory,
+        initialInput,
+        windowId: requireString(input.windowId, "windowId"),
+        paneId: requireString(input.paneId, "paneId"),
+        newPane: input.newPane === true,
+        splitDirection: input.splitDirection === "column" ? "column" : "row"
+      }, { caller: { kind: "voice" } });
     }
     if (action === "select_pane") {
       return {
@@ -729,24 +909,23 @@ export class SessionStore {
         }) as Promise<T>;
       },
       emitTrigger: async (triggerId, payload = {}) => {
+        if (this.disposed && !this.actionAdmission.getStore()?.active) {
+          throw new Error("Session store is disposed.");
+        }
         if (!this.triggers) {
           throw new Error("Trigger registry is not available.");
         }
-        return this.triggers.emit(triggerId, payload, { kind: "plugin", pluginId, tabId });
+        const emission = this.triggers.emit(triggerId, payload, { kind: "plugin", pluginId, tabId });
+        this.triggerEmissions.add(emission);
+        try {
+          return await emission;
+        } finally {
+          this.triggerEmissions.delete(emission);
+        }
       },
       getConfig: () => this.configProvider.getPluginConfig(pluginId),
       getTab: () => this.getTab(tabId)
     };
-  }
-
-  private defaultVoiceCreateTabCwdExpression(): string {
-    if (this.activeTabId) {
-      const activeTab = this.tabs.get(this.activeTabId);
-      if (activeTab?.cwd) {
-        return activeTab.cwd;
-      }
-    }
-    return this.pathPolicy.defaultDirectoryExpression();
   }
 
   private findTabForSwitch(input: Record<string, unknown>): WorkspaceTab {
@@ -790,6 +969,12 @@ export class SessionStore {
       }
     }
     return fallback;
+  }
+}
+
+async function drainPromises(promises: Set<Promise<unknown>>): Promise<void> {
+  while (promises.size > 0) {
+    await Promise.allSettled([...promises]);
   }
 }
 

@@ -16,9 +16,14 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "targetTabId", "pluginId", "hookId", "action", "input", "reason"],
+        "required": ["id", "dependsOn", "targetTabId", "pluginId", "hookId", "action", "input", "reason"],
         "properties": {
-          "id": { "type": ["string", "null"] },
+          "id": { "type": "string", "minLength": 1 },
+          "dependsOn": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 },
+            "uniqueItems": true
+          },
           "targetTabId": { "type": ["string", "null"] },
           "pluginId": { "type": ["string", "null"] },
           "hookId": { "type": ["string", "null"] },
