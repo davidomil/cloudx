@@ -59,7 +59,32 @@ change:
 
 Publication Contract V1 is the only public authority for this transition.
 
-The immutable identities remain distinct: `localChangeBaseSha=7f5693b568f38c207227a5473f14648fd10d4816`, `planningHeadSha=3a5c05272bd4a30bc7646aa710a0807ca85a088b`, `candidateHeadSha=validatedImplementationHeadSha`, `expectedOldCandidateSha=7f5693b568f38c207227a5473f14648fd10d4816`, `targetBaseRef=refs/heads/main`, `expectedTargetBaseSha=02d05f798096431f23acd1e5594a6bee21f3149f`, `repository=davidomil/cloudx`, `pullRequest=1`, `prState=OPEN`, `prBaseRefName=main`, `prBaseRefOid=02d05f798096431f23acd1e5594a6bee21f3149f`, `prHeadRefName=architecture-and-new-codex`, `prHeadRefOid=expectedOldCandidateSha`, and `sameRepository=true`.
+The immutable identities remain distinct: `localChangeBaseSha=7f5693b568f38c207227a5473f14648fd10d4816`, `planningHeadSha=bca78352e91bb40e5f2a46d664872a4b25890cf3`, `candidateHeadSha=validatedImplementationHeadSha`, `expectedOldCandidateSha=7f5693b568f38c207227a5473f14648fd10d4816`, `targetBaseRef=refs/heads/main`, `expectedTargetBaseSha=02d05f798096431f23acd1e5594a6bee21f3149f`, `repository=davidomil/cloudx`, `pullRequest=1`, `prState=OPEN`, `prBaseRefName=main`, `prBaseRefOid=02d05f798096431f23acd1e5594a6bee21f3149f`, `prHeadRefName=architecture-and-new-codex`, `prHeadRefOid=expectedOldCandidateSha`, and `sameRepository=true`.
+
+`credential_token_sha256` is the approved nonsecret SHA-256 commitment to the
+exact high-entropy ephemeral token. Its runtime value exists only in the private
+maximum-15-minute canonical authorization file and transient publisher memory
+for constant-time comparison with `SHA-256(CLOUDX_GATE_B_TOKEN)`. The raw token
+never enters authorization bytes. Neither value enters the Gate-B
+artifact/evidence bundle, role artifacts, logs, command logs, stdout, stderr,
+terminal results, durable configuration, or public source values.
+
+Production accepts no transport selector and is recursively frozen to
+`https://github.com/davidomil/cloudx` with its coherent path-bound credential
+scope. No CLI, environment, authorization, artifact, repository config, or
+public option can alter it. A frozen direct-test-only loopback descriptor reaches
+the same private core. The mandatory proof returns exact
+`WWW-Authenticate: Basic realm="cloudx-gate-b-test"` before authentication and
+then bridges to real `git http-backend` receive-pack.
+
+The shared core owns a 0700 parent, empty template, and audited three-key bare
+Git repository, imports the candidate without credentials, and runs
+authenticated Git only with explicit `--git-dir`, reset generic/host/exact-URL
+helpers and headers, disabled prompts and hooks, and one `--no-verify` exact-URL
+lease push. Cleanup runs exactly once. Published success and manual
+reconciliation are the two exact four-field objects; pre-push rejection emits
+only the fixed secret-safe diagnostic capped at 1024 UTF-8 bytes, while
+post-push terminal JSON has no diagnostic output.
 
 Initial publication requires a nonsecret
 `.agents/schemas/publication-authorization.schema.json` object. Canonical bytes

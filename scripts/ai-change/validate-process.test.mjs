@@ -347,8 +347,61 @@ jobs:
       "missing terminal outcome",
       (source) =>
         source.replaceAll(
-          'status: "manual-reconciliation-required"',
-          'status: "published"',
+          'outcome: "manual-reconciliation-required"',
+          'outcome: "published"',
+        ),
+    ],
+    [
+      "configurable production URL",
+      (source) =>
+        source.replace(
+          'url: "https://github.com/davidomil/cloudx"',
+          "url: process.env.CLOUDX_GATE_B_URL",
+        ),
+    ],
+    [
+      "mutable production descriptor",
+      (source) =>
+        source.replace(
+          "const productionTransport = deepFreeze",
+          "const productionTransport =",
+        ),
+    ],
+    [
+      "separate test core",
+      (source) =>
+        source.replace(
+          "publishCandidateWithTransport(options, transport)",
+          "publishTestCandidate(options, transport)",
+        ),
+    ],
+    [
+      "ambient template",
+      (source) =>
+        source.replace(
+          "`--template=${templateDirectory}`",
+          '"--template=/ambient"',
+        ),
+    ],
+    [
+      "missing header reset",
+      (source) =>
+        source.replace('"http.extraHeader="', '"http.extraHeader=hostile"'),
+    ],
+    [
+      "enabled hooks",
+      (source) =>
+        source.replace(
+          '"core.hooksPath=/dev/null"',
+          '"core.hooksPath=.git/hooks"',
+        ),
+    ],
+    [
+      "result reason field",
+      (source) =>
+        source.replace(
+          "reviewPrHandoff: false,\n});",
+          'reviewPrHandoff: false,\n  reason: "failed",\n});',
         ),
     ],
   ])("rejects publisher contract drift: %s", (_name, mutate) => {
@@ -364,6 +417,17 @@ jobs:
       (sources) => {
         const schema = JSON.parse(sources.authorizationSchema);
         schema.properties.token = { type: "string" };
+        sources.authorizationSchema = JSON.stringify(schema);
+      },
+    ],
+    [
+      "missing token commitment",
+      (sources) => {
+        const schema = JSON.parse(sources.authorizationSchema);
+        delete schema.properties.credential_token_sha256;
+        schema.required = schema.required.filter(
+          (name) => name !== "credential_token_sha256",
+        );
         sources.authorizationSchema = JSON.stringify(schema);
       },
     ],
@@ -418,6 +482,24 @@ jobs:
         sources.publisherTests = sources.publisherTests.replaceAll(
           "process.execPath",
           '"node"',
+        );
+      },
+    ],
+    [
+      "challenge-free smart HTTP test",
+      (sources) => {
+        sources.publisherTests = sources.publisherTests.replaceAll(
+          'Basic realm="cloudx-gate-b-test"',
+          "removed-challenge",
+        );
+      },
+    ],
+    [
+      "fake smart HTTP backend",
+      (sources) => {
+        sources.publisherTests = sources.publisherTests.replaceAll(
+          '"http-backend"',
+          '"fake-backend"',
         );
       },
     ],
@@ -679,7 +761,7 @@ function gateBBundleFixture() {
       },
       { path: "apps/web/src/ui/App.tsx", line: 1, reason: "Web owner." },
     ],
-    claims: Array.from({ length: 73 }, (_, index) => ({
+    claims: Array.from({ length: 75 }, (_, index) => ({
       id: `CLAIM-${index + 1}`,
       behavior: `Behavior ${index + 1}.`,
       production_seam: `production ${index + 1}`,

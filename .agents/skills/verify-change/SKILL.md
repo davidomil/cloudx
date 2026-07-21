@@ -22,7 +22,24 @@ code, reinterpret a failure, review quality, or mutate GitHub.
 
 Publication Contract V1 keeps verification deterministic, local, and read-only.
 
-The immutable publication identities remain distinct: `localChangeBaseSha=7f5693b568f38c207227a5473f14648fd10d4816`, `planningHeadSha=3a5c05272bd4a30bc7646aa710a0807ca85a088b`, `candidateHeadSha=validatedImplementationHeadSha`, `expectedOldCandidateSha=7f5693b568f38c207227a5473f14648fd10d4816`, `targetBaseRef=refs/heads/main`, `expectedTargetBaseSha=02d05f798096431f23acd1e5594a6bee21f3149f`, `repository=davidomil/cloudx`, `pullRequest=1`, `prState=OPEN`, `prBaseRefName=main`, `prBaseRefOid=02d05f798096431f23acd1e5594a6bee21f3149f`, `prHeadRefName=architecture-and-new-codex`, `prHeadRefOid=expectedOldCandidateSha`, and `sameRepository=true`; verification grants none of their mutation authority.
+The immutable publication identities remain distinct: `localChangeBaseSha=7f5693b568f38c207227a5473f14648fd10d4816`, `planningHeadSha=bca78352e91bb40e5f2a46d664872a4b25890cf3`, `candidateHeadSha=validatedImplementationHeadSha`, `expectedOldCandidateSha=7f5693b568f38c207227a5473f14648fd10d4816`, `targetBaseRef=refs/heads/main`, `expectedTargetBaseSha=02d05f798096431f23acd1e5594a6bee21f3149f`, `repository=davidomil/cloudx`, `pullRequest=1`, `prState=OPEN`, `prBaseRefName=main`, `prBaseRefOid=02d05f798096431f23acd1e5594a6bee21f3149f`, `prHeadRefName=architecture-and-new-codex`, `prHeadRefOid=expectedOldCandidateSha`, and `sameRepository=true`; verification grants none of their mutation authority.
+
+The private maximum-15-minute authorization alone carries the approved
+nonsecret `credential_token_sha256` commitment for constant-time comparison;
+the raw token never enters authorization. Neither value enters the Gate-B
+artifact/evidence bundle, verification evidence, logs, stdout, stderr, terminal
+results, durable configuration, or public source, and verification receives
+neither.
+
+Production accepts no transport selector and is recursively frozen to
+`https://github.com/davidomil/cloudx`. A frozen direct-test-only loopback
+descriptor uses the same empty-template audited bare
+Git core and proves an exact Basic challenge before real `git http-backend`
+receive-pack. Authenticated Git uses explicit `--git-dir`, reset helpers and
+headers, disabled hooks, and the sole `--no-verify` exact lease. Cleanup runs
+exactly once. Verification cannot alter the exact four-field published or
+manual-reconciliation result, the fixed bounded pre-push diagnostic, or the
+post-push no-diagnostic boundary.
 
 Later initial-publication handoff uses a nonsecret
 `.agents/schemas/publication-authorization.schema.json` object. Its recursively

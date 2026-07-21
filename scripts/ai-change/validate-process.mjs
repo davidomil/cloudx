@@ -37,11 +37,12 @@ export const GATE_B_COMMIT_SUBJECTS = [
   "DOCS: align operator and scoped-agent contracts",
   "POLICY: separate candidate publication from live-head review",
   "POLICY: bind publication authorization and candidate lease",
+  "POLICY: isolate publication credentials and outcomes",
 ];
 export const GATE_B_LOCAL_CHANGE_BASE_SHA =
   "7f5693b568f38c207227a5473f14648fd10d4816";
 export const GATE_B_PLANNING_HEAD_SHA =
-  "3a5c05272bd4a30bc7646aa710a0807ca85a088b";
+  "bca78352e91bb40e5f2a46d664872a4b25890cf3";
 export const GATE_B_EXPECTED_OLD_CANDIDATE_SHA =
   "7f5693b568f38c207227a5473f14648fd10d4816";
 export const GATE_B_TARGET_BASE_REF = "refs/heads/main";
@@ -140,6 +141,17 @@ const publicationAuthorizationClauses = [
   "automated-app",
   "attended-user",
   "CLOUDX_GATE_B_TOKEN",
+  "credential_token_sha256",
+  "maximum-15-minute",
+  "constant-time",
+  "artifact/evidence bundle",
+  "no transport selector",
+  "recursively frozen",
+  "direct-test-only",
+  "git http-backend",
+  "explicit `--git-dir`",
+  "--no-verify",
+  "Cleanup runs exactly once",
   "GH_TOKEN",
   "--force-with-lease=refs/heads/architecture-and-new-codex:<expectedOldCandidateSha>",
   "human-required",
@@ -234,7 +246,8 @@ export function validatePublicationContractSources(sources, issues = []) {
     String(sources.authorizationSchema ?? ""),
     issues,
   );
-  const publisher = String(sources.publisher ?? "").replace(/\s+/gu, " ");
+  const publisherSource = String(sources.publisher ?? "");
+  const publisher = publisherSource.replace(/\s+/gu, " ");
   for (const clause of [
     "validateGateBArtifactBundle({ snapshot })",
     "freshSnapshot.manifestSha256 !== snapshot.manifestSha256",
@@ -247,14 +260,36 @@ export function validatePublicationContractSources(sources, issues = []) {
     '"automated-app"',
     '"attended-user"',
     "GH_TOKEN: token",
+    "credential_token_sha256",
+    "timingSafeEqual",
+    "requireAuthorizedTokenFingerprint",
+    "const productionTransport = deepFreeze",
+    'url: "https://github.com/davidomil/cloudx"',
+    'protocol: "https"',
+    'host: "github.com"',
+    'path: "davidomil/cloudx"',
+    "publishGateBCandidateForLoopbackTest",
+    "requireLoopbackTestTransport",
+    "publishCandidateWithTransport(options, productionTransport)",
+    "publishCandidateWithTransport(options, transport)",
+    '"init", "--bare", `--template=${templateDirectory}`, transportGitDirectory',
+    "GIT_TEMPLATE_DIR: templateDirectory",
+    "auditBareGitConfiguration",
+    "importCandidate(sourceGitDirectory, localHead)",
+    "`--git-dir=${transportGitDirectory}`",
     '"credential.helper="',
+    '"http.extraHeader="',
+    '"core.hooksPath=/dev/null"',
+    '"--no-verify"',
+    "transport.url",
     "freshAuthorization",
-    'const originPushUrl = "https://github.com/davidomil/cloudx"',
     "GATE_B_EXPECTED_TARGET_BASE_SHA",
     "GATE_B_EXPECTED_OLD_CANDIDATE_SHA",
-    "requireFastForwardPorcelain(pushResult.stdout, expectedOldHead, localHead)",
-    'status: "manual-reconciliation-required"',
-    "reviewPrHandoffAuthorized: false",
+    'outcome: "published"',
+    'outcome: "manual-reconciliation-required"',
+    "reviewPrHandoff: false",
+    "prePushDiagnostic",
+    "context.dispose()",
     'requirePullRequest(afterPushPr, localHead, "post-push")',
   ]) {
     if (!publisher.includes(clause)) {
@@ -262,6 +297,31 @@ export function validatePublicationContractSources(sources, issues = []) {
         `Gate B publisher must contain canonical operation: ${clause}`,
       );
     }
+  }
+  for (const forbidden of [
+    /process\.env\.(?:CLOUDX_GATE_B_TRANSPORT|CLOUDX_GATE_B_URL|GIT_REMOTE_URL)/u,
+    /NODE_ENV/u,
+    /originPushUrl/u,
+    /["']origin["']/u,
+    /transport\s*=/u,
+  ]) {
+    if (forbidden.test(publisherSource)) {
+      issues.push(
+        `Gate B publisher contains forbidden transport authority: ${forbidden}`,
+      );
+    }
+  }
+  if (
+    publisherSource.match(
+      /publishCandidateWithTransport\(options, transport\)/gu,
+    )?.length !== 2 ||
+    publisherSource.match(
+      /publishCandidateWithTransport\(options, productionTransport\)/gu,
+    )?.length !== 1
+  ) {
+    issues.push(
+      "Gate B production and loopback entries must share one private publisher core.",
+    );
   }
   for (const option of [
     "artifact-dir",
@@ -277,15 +337,34 @@ export function validatePublicationContractSources(sources, issues = []) {
   }
   const exactLease =
     "`--force-with-lease=${GATE_B_CANDIDATE_REF}:${expectedOldHead}`";
-  const exactPushes = String(sources.publisher ?? "").match(
-    /["']push["']\s*,\s*["']--porcelain["']\s*,\s*`--force-with-lease=\$\{GATE_B_CANDIDATE_REF\}:\$\{expectedOldHead\}`\s*,\s*["']origin["']\s*,\s*`HEAD:\$\{GATE_B_CANDIDATE_REF\}`/gu,
+  const exactPushes = publisherSource.match(
+    /["']push["']\s*,\s*["']--no-verify["']\s*,\s*["']--porcelain["']\s*,\s*`--force-with-lease=\$\{GATE_B_CANDIDATE_REF\}:\$\{expectedOldHead\}`\s*,\s*transport\.url\s*,\s*`HEAD:\$\{GATE_B_CANDIDATE_REF\}`/gu,
   );
-  const pushCommands = String(sources.publisher ?? "").match(
-    /["']push["']\s*,/gu,
-  );
+  const pushCommands = publisherSource.match(/["']push["']\s*,/gu);
   if (exactPushes?.length !== 1 || pushCommands?.length !== 1) {
     issues.push(
       "Gate B publisher must contain exactly one canonical push call.",
+    );
+  }
+  const exactPublishedResult =
+    /const publishedResult = Object\.freeze\(\{\s*outcome: ["']published["'],\s*pushAttempts: 1,\s*retry: false,\s*reviewPrHandoff: true,\s*\}\);/u;
+  const exactManualResult =
+    /const manualReconciliationResult = Object\.freeze\(\{\s*outcome: ["']manual-reconciliation-required["'],\s*pushAttempts: 1,\s*retry: false,\s*reviewPrHandoff: false,\s*\}\);/u;
+  if (
+    !exactPublishedResult.test(publisherSource) ||
+    !exactManualResult.test(publisherSource)
+  ) {
+    issues.push(
+      "Gate B publisher terminal results must be the two exact four-field objects.",
+    );
+  }
+  if (
+    /(?:console\.|stdout|stderr|JSON\.stringify)[^.\n]{0,160}credential_token_sha256/iu.test(
+      publisherSource,
+    )
+  ) {
+    issues.push(
+      "Gate B publisher cannot serialize the credential token commitment.",
     );
   }
   const nonCanonicalPublisher = String(sources.publisher ?? "").replace(
@@ -309,6 +388,13 @@ export function validatePublicationContractSources(sources, issues = []) {
     "CLOUDX_GATE_B_TOKEN",
     "automated-app",
     "attended-user",
+    "publishGateBCandidateForLoopbackTest",
+    "createServer",
+    'Basic realm="cloudx-gate-b-test"',
+    '"http-backend"',
+    "receivePackPosts: 1",
+    "firstRequestHadAuthorization: false",
+    "tokenMatched: true",
   ]) {
     if (!publisherTests.includes(clause)) {
       issues.push(
@@ -339,6 +425,7 @@ function validatePublicationAuthorizationSchema(source, issues) {
     "pull_request",
     "artifact_manifest_sha256",
     "policy_sha256",
+    "credential_token_sha256",
     "credential_mode",
     "local_change_base_sha",
     "planning_head_sha",
@@ -383,7 +470,7 @@ function validatePublicationAuthorizationSchema(source, issues) {
   const serializedNames = collectSchemaPropertyNames(schema);
   const secretNames = serializedNames.filter(
     (name) =>
-      name !== "credential_mode" &&
+      !new Set(["credential_mode", "credential_token_sha256"]).has(name) &&
       /(?:^|_)(?:token|secret|password|private_key|credential)(?:_|$)/iu.test(
         name,
       ),
@@ -391,6 +478,14 @@ function validatePublicationAuthorizationSchema(source, issues) {
   if (secretNames.length > 0) {
     issues.push(
       `Publication authorization schema cannot serialize secrets: ${secretNames.sort().join(", ")}`,
+    );
+  }
+  if (
+    JSON.stringify(schema?.properties?.credential_token_sha256) !==
+    JSON.stringify({ $ref: "#/$defs/sha256" })
+  ) {
+    issues.push(
+      "Publication authorization credential_token_sha256 must be one lowercase SHA-256 commitment.",
     );
   }
 }
@@ -444,7 +539,7 @@ export function validateGateBArtifactBundle({ snapshot }) {
     113,
     "Gate B plan allowed path count",
   );
-  requireEqual(plan.claims.length, 73, "Gate B plan claim count");
+  requireEqual(plan.claims.length, 75, "Gate B plan claim count");
   const areaReviewNames = roles.map((role) => `${role}.json`);
   const expectedNames = [
     planName,
@@ -761,6 +856,10 @@ function validatePublicationAuthoritySection(
     /\b(?:localChangeBaseSha|expectedOldCandidateSha)=02d05f798096431f23acd1e5594a6bee21f3149f\b/u,
     /\bexpectedTargetBaseSha=7f5693b568f38c207227a5473f14648fd10d4816\b/u,
     /\bexpected(?:OldCandidate|TargetBase)Sha (?:comes|derives|is inferred) from (?:the )?(?:readback|remote)\b/iu,
+    /\btransport (?:url|binding|scope)[^.\n]{0,100}\b(?:comes|derives|is selected|may come) from (?:the )?(?:environment|authorization|artifact|repository|config)/iu,
+    /\bcredential_token_sha256[^.\n]{0,100}\b(?:forbidden|prohibited|excluded) from (?:the )?authorization/iu,
+    /\b(?:raw token|credential_token_sha256)[^.\n]{0,100}\b(?:logged|emitted|serialized|persisted)\b/iu,
+    /\b(?:manual-reconciliation|required reconciliation)[^.\n]{0,100}\b(?:review-pr handoff|review handoff) (?:is|remains) (?:allowed|authorized)\b/iu,
   ].find((pattern) => pattern.test(source));
   if (contradiction) {
     issues.push(

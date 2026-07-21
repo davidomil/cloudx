@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 
@@ -8,8 +9,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   canonicalPublicationAuthorization,
-  readGateBArtifactSnapshot,
   publishGateBCandidate,
+  publishGateBCandidateForLoopbackTest,
+  readGateBArtifactSnapshot,
 } from "./publish-gate-b.mjs";
 import {
   GATE_B_CANDIDATE_REF,
@@ -29,6 +31,184 @@ const gitSha = (character) => character.repeat(40);
 const sha = (character) => character.repeat(64);
 
 describe("Gate B candidate publisher", () => {
+  it("v18 requires the ephemeral token commitment in publication authorization", () => {
+    const schema = JSON.parse(
+      fs.readFileSync(
+        path.resolve(".agents/schemas/publication-authorization.schema.json"),
+        "utf8",
+      ),
+    );
+
+    expect(schema.required).toContain("credential_token_sha256");
+    expect(schema.properties.credential_token_sha256).toEqual({
+      $ref: "#/$defs/sha256",
+    });
+  });
+
+  it("v18 returns only the closed published terminal result", async () => {
+    const fixture = gateBFixture();
+    const runner = commandRunner(fixture);
+
+    const result = await publishGateBCandidate({
+      ...authorizationArguments(fixture),
+      artifactDir: fixture.directory,
+      authorizedManifestSha256: fixture.manifestSha256,
+      expectedOldHead: fixture.oldHead,
+      runCommand: runner.run,
+    });
+
+    expect(result).toEqual({
+      outcome: "published",
+      pushAttempts: 1,
+      retry: false,
+      reviewPrHandoff: true,
+    });
+  });
+
+  it("rejects a token fingerprint mismatch before every command", async () => {
+    const fixture = gateBFixture();
+    fixture.authorization.credential_token_sha256 = sha("9");
+    writeCanonicalAuthorization(fixture);
+    const runner = commandRunner(fixture);
+    let tokenReads = 0;
+
+    await expect(
+      publishGateBCandidate({
+        ...authorizationArguments(fixture),
+        artifactDir: fixture.directory,
+        authorizedManifestSha256: fixture.manifestSha256,
+        expectedOldHead: fixture.oldHead,
+        readToken() {
+          tokenReads += 1;
+          return fixture.token;
+        },
+        runCommand: runner.run,
+      }),
+    ).rejects.toThrow(/credential is not authorized/i);
+
+    expect(tokenReads).toBe(1);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it("keeps the token commitment only in private authorization bytes", () => {
+    const fixture = gateBFixture();
+    const authorizationBytes = fs.readFileSync(
+      fixture.authorizationFile,
+      "utf8",
+    );
+    const artifactBytes = Object.values(
+      readGateBArtifactSnapshot(fixture.directory).files,
+    ).map((bytes) => bytes.toString("utf8"));
+
+    expect(authorizationBytes).toContain(
+      `"credential_token_sha256": "${digest(fixture.token)}"`,
+    );
+    expect(authorizationBytes).not.toContain(fixture.token);
+    expect(artifactBytes.join("\n")).not.toContain(fixture.token);
+    expect(artifactBytes.join("\n")).not.toContain(digest(fixture.token));
+  });
+
+  it("rejects a public production transport selector before token or process use", () => {
+    const fixture = gateBFixture();
+    const runner = commandRunner(fixture);
+    let tokenReads = 0;
+
+    expect(() =>
+      publishGateBCandidate({
+        ...authorizationArguments(fixture),
+        artifactDir: fixture.directory,
+        authorizedManifestSha256: fixture.manifestSha256,
+        expectedOldHead: fixture.oldHead,
+        transport: Object.freeze({}),
+        readToken() {
+          tokenReads += 1;
+          return fixture.token;
+        },
+        runCommand: runner.run,
+      }),
+    ).toThrow(/closed contract/i);
+    expect(tokenReads).toBe(0);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it.each([
+    ["mutable descriptor", loopbackTransport(41000, { freeze: false })],
+    ["extra descriptor key", loopbackTransport(41001, { extra: true })],
+    ["localhost host", loopbackTransport(41002, { hostname: "localhost" })],
+    ["missing port", loopbackTransport(undefined)],
+    ["wrong path", loopbackTransport(41003, { path: "other.git" })],
+    ["query", loopbackTransport(41004, { query: "?transport=other" })],
+    ["fragment", loopbackTransport(41005, { fragment: "#other" })],
+    ["userinfo", loopbackTransport(41006, { userinfo: "operator@" })],
+    [
+      "scope host drift",
+      loopbackTransport(41007, { scopeHost: "127.0.0.1:9" }),
+    ],
+    ["scope path drift", loopbackTransport(41008, { scopePath: "other.git" })],
+  ])("rejects a %s loopback test transport", (_name, transport) => {
+    expect(() => publishGateBCandidateForLoopbackTest({}, transport)).toThrow(
+      /loopback|frozen closed/i,
+    );
+  });
+
+  it("turns post-push cleanup uncertainty into only manual reconciliation", async () => {
+    for (const pushResult of [undefined, result("", 1, "failed")]) {
+      const fixture = gateBFixture();
+      const runner = commandRunner(fixture, { pushResult });
+      let cleanupCalls = 0;
+      let contextRoot;
+
+      const terminal = await publishGateBCandidate({
+        ...authorizationArguments(fixture),
+        artifactDir: fixture.directory,
+        authorizedManifestSha256: fixture.manifestSha256,
+        expectedOldHead: fixture.oldHead,
+        removeDirectory(directory) {
+          cleanupCalls += 1;
+          contextRoot = directory;
+          throw new Error(`untrusted cleanup ${fixture.token}`);
+        },
+        runCommand: runner.run,
+      });
+
+      expect(terminal).toEqual({
+        outcome: "manual-reconciliation-required",
+        pushAttempts: 1,
+        retry: false,
+        reviewPrHandoff: false,
+      });
+      expect(cleanupCalls).toBe(1);
+      expect(runner.pushes).toHaveLength(1);
+      fs.rmSync(contextRoot, { force: true, recursive: true });
+    }
+  });
+
+  it("rejects pre-push cleanup failure without fabricating an attempt", async () => {
+    const fixture = gateBFixture();
+    const runner = commandRunner(fixture, { failOn: "gh --version" });
+    let cleanupCalls = 0;
+    let contextRoot;
+
+    await expect(
+      publishGateBCandidate({
+        ...authorizationArguments(fixture),
+        artifactDir: fixture.directory,
+        authorizedManifestSha256: fixture.manifestSha256,
+        expectedOldHead: fixture.oldHead,
+        removeDirectory(directory) {
+          cleanupCalls += 1;
+          contextRoot = directory;
+          throw new Error(`untrusted cleanup ${fixture.token}`);
+        },
+        runCommand: runner.run,
+      }),
+    ).rejects.toThrow(/^Gate B pre-push cleanup failed\.$/u);
+
+    expect(cleanupCalls).toBe(1);
+    expect(runner.pushes).toEqual([]);
+    fs.rmSync(contextRoot, { force: true, recursive: true });
+  });
+
   it("requires publication authorization before reading a token or dispatching a command", async () => {
     const fixture = gateBFixture();
     const runner = commandRunner(fixture);
@@ -116,6 +296,11 @@ describe("Gate B candidate publisher", () => {
     ["nonce", (authorization) => (authorization.authorization_nonce = "short")],
     ["secret field", (authorization) => (authorization.token = "forbidden")],
     [
+      "transport field",
+      (authorization) =>
+        (authorization.transport_url = "https://example.invalid/cloudx"),
+    ],
+    [
       "principal kind",
       (authorization) => (authorization.principal.kind = "github-user"),
     ],
@@ -165,7 +350,7 @@ describe("Gate B candidate publisher", () => {
       runCommand: runner.run,
     });
 
-    expect(result.status).toBe("published");
+    expect(result.outcome).toBe("published");
     expect(commandSignatures(runner.calls)).toContain(
       "gh api --method GET /user",
     );
@@ -213,7 +398,7 @@ describe("Gate B candidate publisher", () => {
       runCommand: runner.run,
     });
 
-    expect(result.status).toBe("published");
+    expect(result.outcome).toBe("published");
   });
 
   it.each(["automated-app", "attended-user"])(
@@ -228,10 +413,11 @@ describe("Gate B candidate publisher", () => {
       const result = spawnPublisher(fixture, spawned);
 
       expect(result.status, result.stderr).toBe(0);
-      expect(JSON.parse(result.stdout)).toMatchObject({
-        status: "published",
-        headSha: fixture.head,
-        publicationAuthorizationSha256: fixture.authorizedPublicationSha256,
+      expect(JSON.parse(result.stdout)).toEqual({
+        outcome: "published",
+        pushAttempts: 1,
+        retry: false,
+        reviewPrHandoff: true,
       });
       const calls = readShimCalls(spawned);
       const signatures = commandSignatures(
@@ -252,9 +438,7 @@ describe("Gate B candidate publisher", () => {
           command === "gh" ||
           (command === "git" && ["ls-remote", "push"].includes(operation)),
       );
-      expect(
-        new Set(networkCalls.map(({ tokenSha256 }) => tokenSha256)),
-      ).toEqual(new Set([digest(fixture.token)]));
+      expect(networkCalls.every(({ tokenPresent }) => tokenPresent)).toBe(true);
       expect(
         networkCalls.every(({ cloudxTokenPresent }) => !cloudxTokenPresent),
       ).toBe(true);
@@ -273,16 +457,20 @@ describe("Gate B candidate publisher", () => {
       ).toBe(true);
       const pushes = calls.filter(({ operation }) => operation === "push");
       expect(pushes).toHaveLength(1);
-      expect(pushes[0].args.slice(-5)).toEqual([
+      expect(pushes[0].args.slice(-6)).toEqual([
         "push",
+        "--no-verify",
         "--porcelain",
         `--force-with-lease=${GATE_B_CANDIDATE_REF}:${fixture.oldHead}`,
-        "origin",
+        "https://github.com/davidomil/cloudx",
         `HEAD:${GATE_B_CANDIDATE_REF}`,
       ]);
       expect(
         `${result.stdout}\n${result.stderr}\n${fs.readFileSync(spawned.logFile, "utf8")}`,
       ).not.toContain(fixture.token);
+      expect(
+        `${result.stdout}\n${result.stderr}\n${fs.readFileSync(spawned.logFile, "utf8")}`,
+      ).not.toContain(digest(fixture.token));
     },
   );
 
@@ -290,6 +478,12 @@ describe("Gate B candidate publisher", () => {
     ["missing authorization file argument", { omit: "authorization-file" }],
     ["duplicate credential mode argument", { duplicate: "credential-mode" }],
     ["unsupported argument", { extra: ["--retry", "true"] }],
+    [
+      "transport URL argument",
+      { extra: ["--transport-url", "http://127.0.0.1:9/cloudx.git"] },
+    ],
+    ["URL alias", { extra: ["--url", "https://example.invalid/cloudx"] }],
+    ["credential scope alias", { extra: ["--credential-scope", "other"] }],
     ["noncanonical authorization", { noncanonical: true }],
   ])("rejects %s in the real CLI before any shim command", (_name, options) => {
     const fixture = gateBFixture();
@@ -302,7 +496,13 @@ describe("Gate B candidate publisher", () => {
 
     expect(result.status).not.toBe(0);
     expect(readShimCalls(spawned)).toEqual([]);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("Gate B publication rejected before push.\n");
+    expect(Buffer.byteLength(result.stderr, "utf8")).toBeLessThanOrEqual(1024);
     expect(`${result.stdout}\n${result.stderr}`).not.toContain(fixture.token);
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain(
+      digest(fixture.token),
+    );
   });
 
   it("rejects a CLI credential-mode mismatch before reading a token", async () => {
@@ -410,7 +610,7 @@ describe("Gate B candidate publisher", () => {
       runCommand: runner.run,
     });
 
-    expect(result.status).toBe("published");
+    expect(result.outcome).toBe("published");
     expect(runner.pushes).toHaveLength(1);
   });
 
@@ -427,24 +627,18 @@ describe("Gate B candidate publisher", () => {
     });
 
     expect(result).toEqual({
-      status: "published",
-      headSha: fixture.head,
-      manifestSha256: fixture.manifestSha256,
-      publicationAuthorizationSha256: fixture.authorizedPublicationSha256,
-      repository: GATE_B_REPOSITORY,
-      targetBaseRef: GATE_B_TARGET_BASE_REF,
-      targetBaseSha: GATE_B_EXPECTED_TARGET_BASE_SHA,
-      candidateRef: GATE_B_CANDIDATE_REF,
-      remoteHeadSha: fixture.head,
-      pullRequest: GATE_B_PULL_REQUEST,
-      reviewPrHandoffAuthorized: true,
+      outcome: "published",
+      pushAttempts: 1,
+      retry: false,
+      reviewPrHandoff: true,
     });
     expect(runner.pushes).toHaveLength(1);
-    expect(runner.pushes[0][1].slice(-5)).toEqual([
+    expect(runner.pushes[0][1].slice(-6)).toEqual([
       "push",
+      "--no-verify",
       "--porcelain",
       `--force-with-lease=${GATE_B_CANDIDATE_REF}:${fixture.oldHead}`,
-      "origin",
+      "https://github.com/davidomil/cloudx",
       "HEAD:refs/heads/architecture-and-new-codex",
     ]);
     expect(runner.pushes[0][1]).toEqual(
@@ -665,7 +859,7 @@ describe("Gate B candidate publisher", () => {
         expectedOldHead: fixture.oldHead,
         runCommand: runner.run,
       }),
-    ).rejects.toThrow(/changed after validation/i);
+    ).rejects.toThrow(/changed before publication/i);
     expect(runner.pushes).toEqual([]);
   });
 
@@ -688,28 +882,6 @@ describe("Gate B candidate publisher", () => {
           repositories: [{ full_name: "other/cloudx" }],
         },
       },
-    ],
-    [
-      "wrong origin push URL",
-      { originPushUrls: ["git@github.com:davidomil/cloudx.git"] },
-    ],
-    [
-      "multiple origin push URLs",
-      {
-        originPushUrls: [
-          "https://github.com/davidomil/cloudx",
-          "https://example.invalid/cloudx",
-        ],
-      },
-    ],
-    ["missing origin push URL", { originPushUrls: [] }],
-    [
-      "wrong origin fetch URL",
-      { originFetchUrls: ["https://example.invalid/cloudx"] },
-    ],
-    [
-      "origin query failure",
-      { failOn: "git remote get-url --push --all origin" },
     ],
     [
       "repository query failure",
@@ -738,7 +910,9 @@ describe("Gate B candidate publisher", () => {
     ["wrong target ref OID", { remoteTargetBase: gitSha("c") }],
     [
       "target ref query failure",
-      { failOn: `git ls-remote origin ${GATE_B_TARGET_BASE_REF}` },
+      {
+        failOn: `git ls-remote https://github.com/davidomil/cloudx ${GATE_B_TARGET_BASE_REF}`,
+      },
     ],
     ["missing candidate ref", { candidateOutput: "" }],
     ["malformed candidate ref", { candidateOutput: "bad\n" }],
@@ -752,7 +926,9 @@ describe("Gate B candidate publisher", () => {
     ["wrong candidate ref OID", { remoteCandidate: gitSha("d") }],
     [
       "candidate ref query failure",
-      { failOn: `git ls-remote origin ${GATE_B_CANDIDATE_REF}` },
+      {
+        failOn: `git ls-remote https://github.com/davidomil/cloudx ${GATE_B_CANDIDATE_REF}`,
+      },
     ],
     ["non-ancestor candidate history", { fastForward: false }],
     [
@@ -852,12 +1028,16 @@ describe("Gate B candidate publisher", () => {
     ],
     [
       "post-push target query failure",
-      { failAfterPushOn: `git ls-remote origin ${GATE_B_TARGET_BASE_REF}` },
+      {
+        failAfterPushOn: `git ls-remote https://github.com/davidomil/cloudx ${GATE_B_TARGET_BASE_REF}`,
+      },
     ],
     ["post-push target OID mismatch", { postPushTargetBase: gitSha("c") }],
     [
       "post-push candidate query failure",
-      { failAfterPushOn: `git ls-remote origin ${GATE_B_CANDIDATE_REF}` },
+      {
+        failAfterPushOn: `git ls-remote https://github.com/davidomil/cloudx ${GATE_B_CANDIDATE_REF}`,
+      },
     ],
     ["post-push candidate OID mismatch", { postPushHead: gitSha("e") }],
     [
@@ -902,12 +1082,12 @@ describe("Gate B candidate publisher", () => {
       runCommand: runner.run,
     });
 
-    expect(outcome).toMatchObject({
-      status: "manual-reconciliation-required",
+    expect(outcome).toEqual({
+      outcome: "manual-reconciliation-required",
       pushAttempts: 1,
-      reviewPrHandoffAuthorized: false,
+      retry: false,
+      reviewPrHandoff: false,
     });
-    expect(outcome).not.toHaveProperty("remoteHeadSha");
     expect(runner.pushes).toHaveLength(1);
   });
 
@@ -923,26 +1103,495 @@ describe("Gate B candidate publisher", () => {
       runCommand: runner.run,
     });
 
-    expect(outcome).toMatchObject({
-      status: "manual-reconciliation-required",
+    expect(outcome).toEqual({
+      outcome: "manual-reconciliation-required",
       pushAttempts: 1,
-      reviewPrHandoffAuthorized: false,
+      retry: false,
+      reviewPrHandoff: false,
     });
     expect(runner.pushes).toHaveLength(1);
   });
+
+  it("publishes through an authenticated real smart-HTTP receive-pack", async () => {
+    const integration = await smartHttpIntegrationFixture();
+    const originalDirectory = process.cwd();
+    const originalTemplate = process.env.GIT_TEMPLATE_DIR;
+    const originalGlobalConfig = process.env.GIT_CONFIG_GLOBAL;
+    try {
+      process.chdir(integration.sourceDirectory);
+      process.env.GIT_TEMPLATE_DIR = integration.hostileTemplateDirectory;
+      process.env.GIT_CONFIG_GLOBAL = integration.hostileGlobalConfig;
+
+      const terminal = await publishGateBCandidateForLoopbackTest(
+        {
+          ...authorizationArguments(integration.fixture),
+          artifactDir: integration.fixture.directory,
+          authorizedManifestSha256: integration.fixture.manifestSha256,
+          expectedOldHead: integration.fixture.oldHead,
+          runCommand: integration.runCommand,
+        },
+        integration.transport,
+      );
+
+      expect(terminal).toEqual({
+        outcome: "published",
+        pushAttempts: 1,
+        retry: false,
+        reviewPrHandoff: true,
+      });
+      expect(integration.observations).toMatchObject({
+        authenticatedRequests: expect.any(Number),
+        backendProcesses: expect.any(Number),
+        backendBeforeAuthentication: false,
+        challengeWasExact: true,
+        firstRequestHadAuthorization: false,
+        receivePackPosts: 1,
+        tokenMatched: true,
+      });
+      expect(integration.observations.authenticatedRequests).toBeGreaterThan(0);
+      expect(integration.observations.backendProcesses).toBeGreaterThan(0);
+      expect(
+        execFileSync(
+          "git",
+          [
+            `--git-dir=${integration.targetGitDirectory}`,
+            "rev-parse",
+            GATE_B_CANDIDATE_REF,
+          ],
+          { encoding: "utf8" },
+        ).trim(),
+      ).toBe(integration.fixture.head);
+      expect(
+        execFileSync(
+          "git",
+          [
+            `--git-dir=${integration.targetGitDirectory}`,
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads",
+          ],
+          { encoding: "utf8" },
+        )
+          .trim()
+          .split("\n"),
+      ).toEqual([
+        `${GATE_B_CANDIDATE_REF} ${integration.fixture.head}`,
+        `${GATE_B_TARGET_BASE_REF} ${GATE_B_EXPECTED_TARGET_BASE_SHA}`,
+      ]);
+      expect(fs.existsSync(integration.hostileMarker)).toBe(false);
+      expect(integration.observations.contextRoots).toHaveLength(1);
+      expect(fs.existsSync(integration.observations.contextRoots[0])).toBe(
+        false,
+      );
+
+      const durableCapture = JSON.stringify({
+        calls: integration.observations.calls,
+        terminal,
+      });
+      expect(durableCapture).not.toContain(integration.fixture.token);
+      expect(durableCapture).not.toContain(digest(integration.fixture.token));
+      expect(
+        fs.readFileSync(integration.fixture.authorizationFile, "utf8"),
+      ).not.toContain(integration.fixture.token);
+    } finally {
+      process.chdir(originalDirectory);
+      restoreEnvironment("GIT_TEMPLATE_DIR", originalTemplate);
+      restoreEnvironment("GIT_CONFIG_GLOBAL", originalGlobalConfig);
+      await integration.dispose();
+    }
+  }, 30_000);
 });
 
-function gateBFixture() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-gate-b-v11-"));
+async function smartHttpIntegrationFixture() {
+  const root = fs.mkdtempSync(
+    path.join(os.tmpdir(), "cloudx-gate-b-http-integration-"),
+  );
+  const sourceDirectory = path.join(root, "source");
+  execFileSync(
+    "git",
+    ["clone", "--quiet", "--no-hardlinks", process.cwd(), sourceDirectory],
+    { stdio: "pipe" },
+  );
+  execFileSync("git", ["-C", sourceDirectory, "config", "user.name", "Gate B"]);
+  execFileSync("git", [
+    "-C",
+    sourceDirectory,
+    "config",
+    "user.email",
+    "gate-b@example.invalid",
+  ]);
+  execFileSync("git", [
+    "-C",
+    sourceDirectory,
+    "checkout",
+    "--quiet",
+    "--detach",
+    GATE_B_PLANNING_HEAD_SHA,
+  ]);
+  execFileSync("git", [
+    "-C",
+    sourceDirectory,
+    "checkout",
+    "--quiet",
+    "-B",
+    "architecture-and-new-codex",
+  ]);
+  execFileSync("git", [
+    "-C",
+    sourceDirectory,
+    "commit",
+    "--quiet",
+    "--allow-empty",
+    "-m",
+    "POLICY: isolate publication credentials and outcomes",
+  ]);
+  const candidateHead = execFileSync(
+    "git",
+    ["-C", sourceDirectory, "rev-parse", "HEAD"],
+    { encoding: "utf8" },
+  ).trim();
+  const fixture = gateBFixture({ head: candidateHead });
+
+  const hostileMarker = path.join(root, "hostile-hook-ran");
+  const hostileHooksDirectory = path.join(root, "hostile-hooks");
+  const hostileTemplateDirectory = path.join(root, "hostile-template");
+  fs.mkdirSync(hostileHooksDirectory);
+  fs.mkdirSync(path.join(hostileTemplateDirectory, "hooks"), {
+    recursive: true,
+  });
+  const hostileHook = `#!/bin/sh\nprintf hostile > ${JSON.stringify(hostileMarker)}\n`;
+  fs.writeFileSync(path.join(hostileHooksDirectory, "pre-push"), hostileHook, {
+    mode: 0o755,
+  });
+  fs.writeFileSync(
+    path.join(hostileTemplateDirectory, "hooks", "pre-push"),
+    hostileHook,
+    { mode: 0o755 },
+  );
+  fs.writeFileSync(
+    path.join(sourceDirectory, ".git", "hooks", "pre-push"),
+    hostileHook,
+    { mode: 0o755 },
+  );
+  execFileSync("git", [
+    "-C",
+    sourceDirectory,
+    "remote",
+    "set-url",
+    "origin",
+    "https://example.invalid/hostile.git",
+  ]);
+  const hostileGlobalConfig = path.join(root, "hostile-global-config");
+  fs.writeFileSync(
+    hostileGlobalConfig,
+    `[credential]\n\thelper = store\n[http]\n\textraHeader = X-Hostile: true\n[core]\n\thooksPath = ${hostileHooksDirectory}\n[init]\n\ttemplateDir = ${hostileTemplateDirectory}\n`,
+  );
+
+  const serverRoot = path.join(root, "server");
+  const emptyTargetTemplate = path.join(root, "empty-target-template");
+  const targetGitDirectory = path.join(serverRoot, "cloudx.git");
+  fs.mkdirSync(serverRoot);
+  fs.mkdirSync(emptyTargetTemplate);
+  execFileSync("git", [
+    "init",
+    "--quiet",
+    "--bare",
+    `--template=${emptyTargetTemplate}`,
+    targetGitDirectory,
+  ]);
+  execFileSync("git", [
+    `--git-dir=${targetGitDirectory}`,
+    "fetch",
+    "--quiet",
+    "--no-tags",
+    sourceDirectory,
+    `${GATE_B_EXPECTED_TARGET_BASE_SHA}:${GATE_B_TARGET_BASE_REF}`,
+    `${fixture.oldHead}:${GATE_B_CANDIDATE_REF}`,
+  ]);
+
+  const observations = {
+    authenticatedRequests: 0,
+    backendProcesses: 0,
+    backendBeforeAuthentication: false,
+    challengeWasExact: false,
+    contextRoots: [],
+    calls: [],
+    firstRequestHadAuthorization: undefined,
+    receivePackPosts: 0,
+    tokenMatched: true,
+  };
+  const server = await startGitHttpBackendServer({
+    observations,
+    serverRoot,
+    token: fixture.token,
+  });
+  const address = server.address();
+  const transport = loopbackTransport(address.port);
+  const runCommand = smartHttpCommandRunner({ fixture, observations });
+
+  return {
+    dispose: async () => {
+      await new Promise((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+      fs.rmSync(root, { force: true, recursive: true });
+      fs.rmSync(path.dirname(fixture.directory), {
+        force: true,
+        recursive: true,
+      });
+    },
+    fixture,
+    hostileGlobalConfig,
+    hostileMarker,
+    hostileTemplateDirectory,
+    observations,
+    runCommand,
+    sourceDirectory,
+    targetGitDirectory,
+    transport,
+  };
+}
+
+function smartHttpCommandRunner({ fixture, observations }) {
+  let pushed = false;
+  return async (command, args, options = {}) => {
+    const routed = command === "git" ? routedGitArguments(args) : args;
+    const operation = routed[0] ?? "";
+    const authenticated =
+      command === "gh" ||
+      (command === "git" && ["ls-remote", "push"].includes(operation));
+    observations.calls.push({
+      authenticated,
+      command,
+      operation,
+      tokenMatched: authenticated
+        ? options.env?.GH_TOKEN === fixture.token
+        : options.env?.GH_TOKEN === undefined,
+    });
+    if (authenticated) {
+      observations.tokenMatched &&= options.env?.GH_TOKEN === fixture.token;
+    }
+    if (command === "git" && operation === "init") {
+      observations.contextRoots.push(path.dirname(routed.at(-1)));
+    }
+    if (command === "gh") {
+      const signature = routed.join(" ");
+      if (signature === "--version") return result("gh version 2.80.0\n");
+      if (signature === "api --method GET /installation/repositories") {
+        return result(
+          `${JSON.stringify({
+            total_count: 1,
+            repositories: [{ full_name: GATE_B_REPOSITORY }],
+          })}\n`,
+        );
+      }
+      if (signature === "repo view davidomil/cloudx --json nameWithOwner") {
+        return result(
+          `${JSON.stringify({ nameWithOwner: GATE_B_REPOSITORY })}\n`,
+        );
+      }
+      if (signature.startsWith("pr view 1 --repo davidomil/cloudx")) {
+        return result(
+          `${JSON.stringify({
+            number: 1,
+            state: "OPEN",
+            baseRefName: "main",
+            baseRefOid: GATE_B_EXPECTED_TARGET_BASE_SHA,
+            headRefName: "architecture-and-new-codex",
+            headRefOid: pushed ? fixture.head : fixture.oldHead,
+            isCrossRepository: false,
+            url: "https://github.com/davidomil/cloudx/pull/1",
+          })}\n`,
+        );
+      }
+      if (
+        signature ===
+        "api --method GET repos/davidomil/cloudx/branches/architecture-and-new-codex"
+      ) {
+        return result(
+          `${JSON.stringify({
+            name: "architecture-and-new-codex",
+            commit: { sha: fixture.oldHead },
+            protected: false,
+          })}\n`,
+        );
+      }
+      if (
+        signature ===
+        "api repos/davidomil/cloudx/rules/branches/architecture-and-new-codex"
+      ) {
+        return result("[]\n");
+      }
+      return result("", 1, "unexpected gh command");
+    }
+
+    const commandResult = await runTextProcess(command, args, options);
+    if (
+      command === "git" &&
+      operation === "push" &&
+      commandResult.exitCode === 0
+    ) {
+      pushed = true;
+    }
+    return commandResult;
+  };
+}
+
+async function startGitHttpBackendServer({ observations, serverRoot, token }) {
+  const expectedAuthorization = `Basic ${Buffer.from(
+    `x-access-token:${token}`,
+  ).toString("base64")}`;
+  let requestCount = 0;
+  const server = createServer(async (request, response) => {
+    try {
+      requestCount += 1;
+      const authorization = request.headers.authorization;
+      if (requestCount === 1) {
+        observations.firstRequestHadAuthorization = authorization !== undefined;
+      }
+      if (authorization !== expectedAuthorization) {
+        request.resume();
+        observations.tokenMatched &&= authorization === undefined;
+        observations.challengeWasExact = true;
+        response.writeHead(401, {
+          "WWW-Authenticate": 'Basic realm="cloudx-gate-b-test"',
+        });
+        response.end();
+        return;
+      }
+
+      observations.authenticatedRequests += 1;
+      const requestUrl = new URL(request.url, "http://127.0.0.1");
+      if (
+        request.method === "POST" &&
+        requestUrl.pathname.endsWith("/git-receive-pack")
+      ) {
+        observations.receivePackPosts += 1;
+      }
+      const body = await readRequestBody(request);
+      observations.backendBeforeAuthentication ||=
+        observations.authenticatedRequests === 0;
+      observations.backendProcesses += 1;
+      const backend = await runBinaryProcess("git", ["http-backend"], {
+        env: {
+          CONTENT_LENGTH: String(body.length),
+          CONTENT_TYPE: request.headers["content-type"] ?? "",
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_CONFIG_NOSYSTEM: "1",
+          GIT_CONFIG_SYSTEM: "/dev/null",
+          GIT_HTTP_EXPORT_ALL: "1",
+          GIT_PROJECT_ROOT: serverRoot,
+          HTTP_GIT_PROTOCOL: request.headers["git-protocol"] ?? "",
+          LANG: "C",
+          LC_ALL: "C",
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          PATH_INFO: requestUrl.pathname,
+          QUERY_STRING: requestUrl.search.slice(1),
+          REMOTE_ADDR: "127.0.0.1",
+          REMOTE_USER: "x-access-token",
+          REQUEST_METHOD: request.method,
+        },
+        input: body,
+      });
+      if (backend.exitCode !== 0) {
+        response.writeHead(500);
+        response.end();
+        return;
+      }
+      writeCgiResponse(response, backend.stdout);
+    } catch {
+      response.writeHead(500);
+      response.end();
+    }
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  return server;
+}
+
+function readRequestBody(request) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    request.on("data", (chunk) => chunks.push(chunk));
+    request.on("end", () => resolve(Buffer.concat(chunks)));
+    request.on("error", reject);
+  });
+}
+
+function writeCgiResponse(response, bytes) {
+  const crlfBoundary = bytes.indexOf("\r\n\r\n");
+  const lfBoundary = bytes.indexOf("\n\n");
+  const boundary = crlfBoundary >= 0 ? crlfBoundary : lfBoundary;
+  const separatorLength = crlfBoundary >= 0 ? 4 : 2;
+  if (boundary < 0) throw new Error("git http-backend response is malformed");
+  const headers = bytes.subarray(0, boundary).toString("utf8").split(/\r?\n/u);
+  for (const header of headers) {
+    const separator = header.indexOf(":");
+    const name = header.slice(0, separator);
+    const value = header.slice(separator + 1).trim();
+    if (name.toLowerCase() === "status") {
+      response.statusCode = Number.parseInt(value, 10);
+    } else {
+      response.setHeader(name, value);
+    }
+  }
+  response.end(bytes.subarray(boundary + separatorLength));
+}
+
+function runTextProcess(command, args, options = {}) {
+  return runBinaryProcess(command, args, options).then((commandResult) => ({
+    exitCode: commandResult.exitCode,
+    stderr: commandResult.stderr.toString("utf8"),
+    stdout: commandResult.stdout.toString("utf8"),
+  }));
+}
+
+function runBinaryProcess(command, args, options = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      env: options.env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const stdout = [];
+    const stderr = [];
+    child.stdout.on("data", (chunk) => stdout.push(chunk));
+    child.stderr.on("data", (chunk) => stderr.push(chunk));
+    child.on("error", (error) => {
+      stderr.push(Buffer.from(error.message));
+    });
+    child.on("close", (exitCode) =>
+      resolve({
+        exitCode: Number.isInteger(exitCode) ? exitCode : 1,
+        stderr: Buffer.concat(stderr),
+        stdout: Buffer.concat(stdout),
+      }),
+    );
+    child.stdin.end(options.input);
+  });
+}
+
+function restoreEnvironment(name, value) {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}
+
+function gateBFixture(overrides = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-gate-b-v18-"));
   const directory = path.join(root, "artifacts");
   fs.mkdirSync(directory);
-  const head = gitSha("b");
+  const head = overrides.head ?? gitSha("b");
   const oldHead = GATE_B_EXPECTED_OLD_CANDIDATE_SHA;
   const nowMs = Date.now();
   const plan = {
     schema_version: 1,
     kind: "change-plan",
-    run_id: "gate-b-v11",
+    run_id: "gate-b-v18",
     base_sha: GATE_B_LOCAL_CHANGE_BASE_SHA,
     head_sha: GATE_B_PLANNING_HEAD_SHA,
     policy_sha256: GATE_B_POLICY_SHA256,
@@ -975,7 +1624,7 @@ function gateBFixture() {
         reason: "Publisher owner.",
       },
     ],
-    claims: Array.from({ length: 73 }, (_, index) => ({
+    claims: Array.from({ length: 75 }, (_, index) => ({
       id: `CLAIM-${index + 1}`,
       behavior: `Behavior ${index + 1}.`,
       production_seam: `Production seam ${index + 1}.`,
@@ -1044,7 +1693,7 @@ function gateBFixture() {
   };
   fixture.manifestSha256 = readGateBArtifactSnapshot(directory).manifestSha256;
   fixture.credentialMode = "automated-app";
-  fixture.token = "sentinel-gate-b-token";
+  fixture.token = "sentinel-gate-b-token-with-40-characters-001";
   fixture.authorizationFile = path.join(root, "publication-authorization.json");
   fixture.authorization = publicationAuthorization(fixture);
   writeCanonicalAuthorization(fixture);
@@ -1116,6 +1765,7 @@ function publicationAuthorization(fixture, overrides = {}) {
     pull_request: GATE_B_PULL_REQUEST,
     artifact_manifest_sha256: fixture.manifestSha256,
     policy_sha256: GATE_B_POLICY_SHA256,
+    credential_token_sha256: digest(fixture.token),
     credential_mode: "automated-app",
     local_change_base_sha: GATE_B_LOCAL_CHANGE_BASE_SHA,
     planning_head_sha: GATE_B_PLANNING_HEAD_SHA,
@@ -1184,10 +1834,35 @@ async function expectAuthorizationRejectedBeforeToken(fixture) {
 
 function commandSignatures(calls) {
   return calls.map(([command, args]) => {
-    const routedArgs =
-      command === "git" && args[0] === "-c" ? args.slice(8) : args;
+    const routedArgs = command === "git" ? routedGitArguments(args) : args;
     return `${command} ${routedArgs.join(" ")}`;
   });
+}
+
+function routedGitArguments(args) {
+  const routed = [...args];
+  if (routed[0]?.startsWith("--git-dir=")) routed.shift();
+  while (routed[0] === "-c") routed.splice(0, 2);
+  return routed;
+}
+
+function loopbackTransport(port, overrides = {}) {
+  const hostname = overrides.hostname ?? "127.0.0.1";
+  const portSuffix = port === undefined ? "" : `:${port}`;
+  const descriptor = {
+    credentialScope: {
+      host: overrides.scopeHost ?? `${hostname}${portSuffix}`,
+      path: overrides.scopePath ?? "cloudx.git",
+    },
+    protocol: "http",
+    url: `http://${overrides.userinfo ?? ""}${hostname}${portSuffix}/${
+      overrides.path ?? "cloudx.git"
+    }${overrides.query ?? ""}${overrides.fragment ?? ""}`,
+    ...(overrides.extra ? { fallback: "forbidden" } : {}),
+  };
+  if (overrides.freeze === false) return descriptor;
+  Object.freeze(descriptor.credentialScope);
+  return Object.freeze(descriptor);
 }
 
 function spawnedPublisherFixture(fixture) {
@@ -1199,12 +1874,12 @@ function spawnedPublisherFixture(fixture) {
   fs.writeFileSync(logFile, "");
   fs.writeFileSync(stateFile, JSON.stringify({ pushed: false }));
   const source = `#!/usr/bin/env node
-const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const command = path.basename(process.argv[1]);
 const args = process.argv.slice(2);
 const routed = [...args];
+if (command === "git" && routed[0]?.startsWith("--git-dir=")) routed.shift();
 while (command === "git" && routed[0] === "-c") routed.splice(0, 2);
 const operation = routed[0] ?? "";
 const token = process.env.GH_TOKEN ?? "";
@@ -1212,7 +1887,7 @@ fs.appendFileSync(${JSON.stringify(logFile)}, JSON.stringify({
   command,
   args,
   operation,
-  tokenSha256: token ? crypto.createHash("sha256").update(token).digest("hex") : null,
+  tokenPresent: token.length >= 32,
   cloudxTokenPresent: Boolean(process.env.CLOUDX_GATE_B_TOKEN),
   githubTokenPresent: Boolean(process.env.GITHUB_TOKEN),
   askpass: process.env.GIT_ASKPASS ?? null,
@@ -1228,8 +1903,18 @@ const target = ${JSON.stringify(GATE_B_EXPECTED_TARGET_BASE_SHA)};
 const candidateRef = ${JSON.stringify(GATE_B_CANDIDATE_REF)};
 const targetRef = ${JSON.stringify(GATE_B_TARGET_BASE_REF)};
 if (command === "git") {
-  if (operation === "rev-parse") output(head + "\\n");
-  else if (operation === "symbolic-ref") output("architecture-and-new-codex\\n");
+  if (operation === "init") {
+    const directory = routed.at(-1);
+    fs.mkdirSync(path.join(directory, "objects"), { recursive: true });
+    fs.mkdirSync(path.join(directory, "refs", "heads"), { recursive: true });
+    fs.writeFileSync(path.join(directory, "config"), "[core]\\n\\trepositoryformatversion = 0\\n\\tfilemode = true\\n\\tbare = true\\n");
+  }
+  else if (operation === "config") output("core.repositoryformatversion\\n0\\0core.filemode\\ntrue\\0core.bare\\ntrue\\0");
+  else if (operation === "fetch") {}
+  else if (operation === "rev-parse" && routed[1] === "--absolute-git-dir") output(${JSON.stringify(path.join(fixture.directory, ".git"))} + "\\n");
+  else if (operation === "rev-parse") output(head + "\\n");
+  else if (operation === "symbolic-ref" && routed[1] === "--short") output("architecture-and-new-codex\\n");
+  else if (operation === "symbolic-ref") {}
   else if (operation === "log") output(${JSON.stringify(`${GATE_B_COMMIT_SUBJECTS.join("\n")}\n`)});
   else if (operation === "diff") {}
   else if (operation === "remote") output("https://github.com/davidomil/cloudx\\n");
@@ -1284,11 +1969,14 @@ function spawnPublisher(fixture, spawned, options = {}) {
       cwd: process.cwd(),
       encoding: "utf8",
       env: {
+        CLOUDX_GATE_B_TRANSPORT: "loopback",
+        CLOUDX_GATE_B_URL: "http://127.0.0.1:9/cloudx.git",
         CLOUDX_GATE_B_TOKEN: fixture.token,
         GH_CONFIG_DIR: "/ambient/gh",
         GH_TOKEN: "ambient-gh-token",
         GIT_ASKPASS: "/ambient/askpass",
         GIT_CONFIG_GLOBAL: "/ambient/gitconfig",
+        GIT_REMOTE_URL: "https://example.invalid/cloudx",
         GITHUB_TOKEN: "ambient-github-token",
         LANG: "C",
         LC_ALL: "C",
@@ -1348,8 +2036,7 @@ function commandRunner(fixture, overrides = {}) {
   };
   const run = async (command, args, options = {}) => {
     calls.push([command, args]);
-    const routedArgs =
-      command === "git" && args[0] === "-c" ? args.slice(8) : args;
+    const routedArgs = command === "git" ? routedGitArguments(args) : args;
     const signature = `${command} ${routedArgs.join(" ")}`;
     if (overrides.throwOn === signature) throw new Error("runner failed");
     if (overrides.failOn === signature) return result("", 1, "failed");
@@ -1358,6 +2045,28 @@ function commandRunner(fixture, overrides = {}) {
       throw new Error("post-push runner failed");
     if (pushed && overrides.failAfterPushOn === signature)
       return result("", 1, "post-push failed");
+    if (signature.startsWith("git init --bare --template=")) {
+      const directory = routedArgs.at(-1);
+      fs.mkdirSync(path.join(directory, "objects"), { recursive: true });
+      fs.mkdirSync(path.join(directory, "refs", "heads"), { recursive: true });
+      fs.writeFileSync(
+        path.join(directory, "config"),
+        "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n",
+      );
+      return result();
+    }
+    if (signature === "git config --local --null --list") {
+      return result(
+        "core.repositoryformatversion\n0\0core.filemode\ntrue\0core.bare\ntrue\0",
+      );
+    }
+    if (signature.startsWith("git fetch --no-tags ")) return result();
+    if (signature === `git symbolic-ref HEAD ${GATE_B_CANDIDATE_REF}`)
+      return result();
+    if (signature === `git rev-parse ${GATE_B_CANDIDATE_REF}`)
+      return result(fixture.head);
+    if (signature === "git rev-parse --absolute-git-dir")
+      return result(path.join(fixture.directory, ".git"));
     if (signature === "git rev-parse HEAD") return result(fixture.head);
     if (signature === "git symbolic-ref --short HEAD") {
       return result("architecture-and-new-codex\n");
@@ -1404,14 +2113,20 @@ function commandRunner(fixture, overrides = {}) {
       return result(
         `${overrides.repositoryJson ?? JSON.stringify({ nameWithOwner: GATE_B_REPOSITORY })}\n`,
       );
-    if (signature === `git ls-remote origin ${GATE_B_TARGET_BASE_REF}`) {
+    if (
+      signature ===
+      `git ls-remote https://github.com/davidomil/cloudx ${GATE_B_TARGET_BASE_REF}`
+    ) {
       const head = pushed
         ? (overrides.postPushTargetBase ?? GATE_B_EXPECTED_TARGET_BASE_SHA)
         : (overrides.remoteTargetBase ?? GATE_B_EXPECTED_TARGET_BASE_SHA);
       const ref = overrides.targetBaseRef ?? GATE_B_TARGET_BASE_REF;
       return result(overrides.targetBaseOutput ?? `${head}\t${ref}\n`);
     }
-    if (signature === `git ls-remote origin ${GATE_B_CANDIDATE_REF}`) {
+    if (
+      signature ===
+      `git ls-remote https://github.com/davidomil/cloudx ${GATE_B_CANDIDATE_REF}`
+    ) {
       remoteReads += 1;
       const head = pushed
         ? (overrides.postPushHead ?? fixture.head)
@@ -1460,7 +2175,7 @@ function commandRunner(fixture, overrides = {}) {
     }
     if (
       signature ===
-      `git push --porcelain --force-with-lease=${GATE_B_CANDIDATE_REF}:${fixture.oldHead} origin HEAD:refs/heads/architecture-and-new-codex`
+      `git push --no-verify --porcelain --force-with-lease=${GATE_B_CANDIDATE_REF}:${fixture.oldHead} https://github.com/davidomil/cloudx HEAD:refs/heads/architecture-and-new-codex`
     ) {
       pushes.push([command, args]);
       pushed = true;

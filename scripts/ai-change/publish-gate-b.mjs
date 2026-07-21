@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -21,7 +21,6 @@ import {
 } from "./validate-process.mjs";
 import { validateSchema } from "./schema-validator.mjs";
 
-const originPushUrl = "https://github.com/davidomil/cloudx";
 const candidateBranch = GATE_B_CANDIDATE_REF.slice("refs/heads/".length);
 const targetBaseBranch = GATE_B_TARGET_BASE_REF.slice("refs/heads/".length);
 const pullRequestFields = [
@@ -38,6 +37,28 @@ const gitSha = /^[a-f0-9]{40}$/u;
 const sha256Pattern = /^[a-f0-9]{64}$/u;
 const publicationAuthorizationMaxBytes = 32 * 1024;
 const publicationGrantLifetimeMs = 15 * 60 * 1000;
+const prePushDiagnostic = "Gate B publication rejected before push.\n";
+const publishedResult = Object.freeze({
+  outcome: "published",
+  pushAttempts: 1,
+  retry: false,
+  reviewPrHandoff: true,
+});
+const manualReconciliationResult = Object.freeze({
+  outcome: "manual-reconciliation-required",
+  pushAttempts: 1,
+  retry: false,
+  reviewPrHandoff: false,
+});
+
+const productionTransport = deepFreeze({
+  url: "https://github.com/davidomil/cloudx",
+  protocol: "https",
+  credentialScope: {
+    host: "github.com",
+    path: "davidomil/cloudx",
+  },
+});
 
 export function readGateBArtifactSnapshot(artifactDir) {
   const directory = path.resolve(artifactDir);
@@ -153,37 +174,36 @@ export function readPublicationAuthorizationSnapshot({
   };
 }
 
-export async function publishGateBCandidate({
-  artifactDir,
-  authorizedManifestSha256,
-  authorizationFile,
-  authorizedPublicationSha256,
-  credentialMode,
-  expectedOldHead,
-  now = Date.now,
-  readToken = defaultTokenReader,
-  runCommand = defaultCommandRunner,
-}) {
-  if (!sha256Pattern.test(authorizedManifestSha256)) {
-    throw new Error(
-      "Gate B authorized manifest digest must be a SHA-256 digest.",
-    );
-  }
-  if (!gitSha.test(expectedOldHead)) {
-    throw new Error(
-      "Gate B expected old candidate head must be a full Git SHA.",
-    );
-  }
-  requireEqual(
+export function publishGateBCandidate(options) {
+  requireClosedOptions(options);
+  return publishCandidateWithTransport(options, productionTransport);
+}
+
+export function publishGateBCandidateForLoopbackTest(options, transport) {
+  requireClosedOptions(options);
+  requireLoopbackTestTransport(transport);
+  return publishCandidateWithTransport(options, transport);
+}
+
+async function publishCandidateWithTransport(options, transport) {
+  const {
+    artifactDir,
+    authorizedManifestSha256,
+    authorizationFile,
+    authorizedPublicationSha256,
+    credentialMode,
     expectedOldHead,
-    GATE_B_EXPECTED_OLD_CANDIDATE_SHA,
-    "Gate B expected old candidate head",
-  );
-  if (!new Set(["automated-app", "attended-user"]).has(credentialMode)) {
-    throw new Error(
-      "Gate B publication authorization requires one explicit credential mode.",
-    );
-  }
+    now = Date.now,
+    readToken = defaultTokenReader,
+    runCommand = defaultCommandRunner,
+    removeDirectory = defaultDirectoryRemover,
+  } = options;
+
+  requirePublicationInputs({
+    authorizedManifestSha256,
+    credentialMode,
+    expectedOldHead,
+  });
 
   const snapshot = readGateBArtifactSnapshot(artifactDir);
   const bundle = validateGateBArtifactBundle({ snapshot });
@@ -208,22 +228,54 @@ export async function publishGateBCandidate({
   });
 
   const token = requireGateBToken(readToken());
-  const commandContext = createAuthenticatedCommandContext(runCommand, token);
+  requireAuthorizedTokenFingerprint(
+    token,
+    authorizationSnapshot.authorization.credential_token_sha256,
+  );
+
+  let context;
+  let pushStarted = false;
+  let terminalResult;
+  let prePushFailure;
   try {
-    return await publishAuthorizedCandidate({
+    context = await createAuthenticatedCommandContext({
+      removeDirectory,
+      runCommand,
+      token,
+      transport,
+    });
+    terminalResult = await publishAuthorizedCandidate({
       artifactDir: snapshot.directory,
       authorizedManifestSha256,
       authorizationSnapshot,
       bundle,
       credentialMode,
       expectedOldHead,
+      markPushStarted() {
+        pushStarted = true;
+      },
       now,
-      runCommand: commandContext.run,
+      runAuthenticated: context.runAuthenticated,
+      runLocal: context.runLocal,
       snapshot,
+      transport,
     });
+  } catch (error) {
+    if (pushStarted) terminalResult = manualReconciliationResult;
+    else prePushFailure = error;
   } finally {
-    commandContext.dispose();
+    if (context) {
+      try {
+        context.dispose();
+      } catch {
+        if (pushStarted) terminalResult = manualReconciliationResult;
+        else prePushFailure = new Error("Gate B pre-push cleanup failed.");
+      }
+    }
   }
+
+  if (terminalResult) return requireTerminalResult(terminalResult);
+  throw prePushFailure;
 }
 
 async function publishAuthorizedCandidate({
@@ -233,12 +285,15 @@ async function publishAuthorizedCandidate({
   bundle,
   credentialMode,
   expectedOldHead,
+  markPushStarted,
   now,
-  runCommand,
+  runAuthenticated,
+  runLocal,
   snapshot,
+  transport,
 }) {
   const localHead = output(
-    await checked(runCommand, "git", ["rev-parse", "HEAD"]),
+    await checked(runLocal, "git", ["rev-parse", "HEAD"]),
   );
   requireEqual(localHead, bundle.headSha, "Gate B local head");
   requireEqual(
@@ -247,13 +302,12 @@ async function publishAuthorizedCandidate({
     "Gate B local change base",
   );
   const localBranch = output(
-    await checked(runCommand, "git", ["symbolic-ref", "--short", "HEAD"]),
+    await checked(runLocal, "git", ["symbolic-ref", "--short", "HEAD"]),
   );
   requireEqual(localBranch, candidateBranch, "Gate B local branch");
-
   const subjects = lines(
     (
-      await checked(runCommand, "git", [
+      await checked(runLocal, "git", [
         "log",
         "--reverse",
         "--format=%s",
@@ -262,39 +316,34 @@ async function publishAuthorizedCandidate({
     ).stdout,
   );
   requireExactList(subjects, GATE_B_COMMIT_SUBJECTS, "Gate B commit subjects");
-  await requireQuiet(runCommand, ["diff", "--cached", "--quiet"], "Git index");
-  await requireQuiet(runCommand, ["diff", "--quiet"], "tracked worktree");
-
-  const pushUrls = lines(
-    (
-      await checked(runCommand, "git", [
-        "remote",
-        "get-url",
-        "--push",
-        "--all",
-        "origin",
-      ])
-    ).stdout,
+  await requireQuiet(runLocal, ["diff", "--cached", "--quiet"], "Git index");
+  await requireQuiet(runLocal, ["diff", "--quiet"], "tracked worktree");
+  const sourceGitDirectory = output(
+    await checked(runLocal, "git", ["rev-parse", "--absolute-git-dir"]),
   );
-  requireExactList(pushUrls, [originPushUrl], "Gate B origin push URL");
-  const fetchUrls = lines(
-    (await checked(runCommand, "git", ["remote", "get-url", "--all", "origin"]))
-      .stdout,
-  );
-  requireExactList(fetchUrls, [originPushUrl], "Gate B origin fetch URL");
 
-  const ghVersion = output(await checked(runCommand, "gh", ["--version"]));
+  await runAuthenticated.importCandidate(sourceGitDirectory, localHead);
+  await checked(runAuthenticated.git, "git", [
+    "merge-base",
+    "--is-ancestor",
+    expectedOldHead,
+    localHead,
+  ]);
+
+  const ghVersion = output(
+    await checked(runAuthenticated.gh, "gh", ["--version"]),
+  );
   if (!/^gh version \d+\.\d+\.\d+/u.test(ghVersion)) {
     throw new Error("Gate B GitHub CLI version output is malformed.");
   }
   await requireCredentialPrincipal(
-    runCommand,
+    runAuthenticated.gh,
     credentialMode,
     authorizationSnapshot.authorization.principal,
   );
   const repositoryIdentity = parseJsonObject(
     (
-      await checked(runCommand, "gh", [
+      await checked(runAuthenticated.gh, "gh", [
         "repo",
         "view",
         GATE_B_REPOSITORY,
@@ -310,14 +359,9 @@ async function publishAuthorizedCandidate({
     "Gate B repository identity",
   );
 
-  const remoteTargetBase = parseRemoteHead(
-    (
-      await checked(runCommand, "git", [
-        "ls-remote",
-        "origin",
-        GATE_B_TARGET_BASE_REF,
-      ])
-    ).stdout,
+  const remoteTargetBase = await readRemoteHead(
+    runAuthenticated.git,
+    transport,
     GATE_B_TARGET_BASE_REF,
   );
   requireEqual(
@@ -325,14 +369,9 @@ async function publishAuthorizedCandidate({
     GATE_B_EXPECTED_TARGET_BASE_SHA,
     "Gate B expected target base",
   );
-  const remoteCandidate = parseRemoteHead(
-    (
-      await checked(runCommand, "git", [
-        "ls-remote",
-        "origin",
-        GATE_B_CANDIDATE_REF,
-      ])
-    ).stdout,
+  const remoteCandidate = await readRemoteHead(
+    runAuthenticated.git,
+    transport,
     GATE_B_CANDIDATE_REF,
   );
   requireEqual(
@@ -340,16 +379,10 @@ async function publishAuthorizedCandidate({
     expectedOldHead,
     "Gate B expected old candidate head",
   );
-  await checked(runCommand, "git", [
-    "merge-base",
-    "--is-ancestor",
-    expectedOldHead,
-    localHead,
-  ]);
 
   const beforePushPr = parsePullRequest(
     (
-      await checked(runCommand, "gh", [
+      await checked(runAuthenticated.gh, "gh", [
         "pr",
         "view",
         String(GATE_B_PULL_REQUEST),
@@ -361,10 +394,10 @@ async function publishAuthorizedCandidate({
     ).stdout,
   );
   requirePullRequest(beforePushPr, expectedOldHead, "pre-push");
-  await requireUnprotectedCandidateBranch(runCommand, expectedOldHead);
+  await requireUnprotectedCandidateBranch(runAuthenticated.gh, expectedOldHead);
   const rules = parseJson(
     (
-      await checked(runCommand, "gh", [
+      await checked(runAuthenticated.gh, "gh", [
         "api",
         `repos/${GATE_B_REPOSITORY}/rules/branches/${candidateBranch}`,
       ])
@@ -375,87 +408,59 @@ async function publishAuthorizedCandidate({
     throw new Error("Gate B candidate branch must have no applicable rules.");
   }
 
-  const freshSnapshot = readGateBArtifactSnapshot(snapshot.directory);
-  if (
-    freshSnapshot.manifestSha256 !== snapshot.manifestSha256 ||
-    freshSnapshot.manifest !== snapshot.manifest
-  ) {
-    throw new Error("Gate B artifact bundle changed after validation.");
-  }
-  if (freshSnapshot.manifestSha256 !== authorizedManifestSha256) {
-    throw new Error("Gate B authorized manifest changed before publication.");
-  }
-  const freshAuthorization = readPublicationAuthorizationSnapshot({
-    authorizationFile: authorizationSnapshot.path,
+  requireUnchangedPublicationInputs({
     artifactDir,
-    authorizedPublicationSha256: authorizationSnapshot.publicationSha256,
-  });
-  if (
-    freshAuthorization.path !== authorizationSnapshot.path ||
-    !freshAuthorization.bytes.equals(authorizationSnapshot.bytes)
-  ) {
-    throw new Error(
-      "Gate B publication authorization changed before publication.",
-    );
-  }
-  requirePublicationAuthorization({
-    authorization: freshAuthorization.authorization,
+    authorizationSnapshot,
     authorizedManifestSha256,
     bundle,
     credentialMode,
     expectedOldHead,
-    nowMs: currentTime(now),
+    now,
+    snapshot,
   });
 
+  markPushStarted();
   let pushResult;
   try {
-    pushResult = await runCommand(
+    pushResult = await runAuthenticated.git(
       "git",
       [
         "push",
+        "--no-verify",
         "--porcelain",
         `--force-with-lease=${GATE_B_CANDIDATE_REF}:${expectedOldHead}`,
-        "origin",
+        transport.url,
         `HEAD:${GATE_B_CANDIDATE_REF}`,
       ],
       { timeoutMs: 300_000 },
     );
-  } catch (error) {
-    return manualReconciliation(snapshot, localHead, error);
+  } catch {
+    return manualReconciliationResult;
   }
   if (!pushResult || pushResult.exitCode !== 0) {
-    return manualReconciliation(
-      snapshot,
-      localHead,
-      new Error("Gate B push command did not report success."),
-    );
+    return manualReconciliationResult;
   }
 
   try {
-    requireFastForwardPorcelain(pushResult.stdout, expectedOldHead, localHead);
-    const postPushTargetBase = parseRemoteHead(
-      (
-        await checked(runCommand, "git", [
-          "ls-remote",
-          "origin",
-          GATE_B_TARGET_BASE_REF,
-        ])
-      ).stdout,
+    requireFastForwardPorcelain(
+      pushResult.stdout,
+      expectedOldHead,
+      localHead,
+      transport.url,
+    );
+    const postPushTargetBase = await readRemoteHead(
+      runAuthenticated.git,
+      transport,
       GATE_B_TARGET_BASE_REF,
     );
-    const postPushCandidate = parseRemoteHead(
-      (
-        await checked(runCommand, "git", [
-          "ls-remote",
-          "origin",
-          GATE_B_CANDIDATE_REF,
-        ])
-      ).stdout,
+    const postPushCandidate = await readRemoteHead(
+      runAuthenticated.git,
+      transport,
       GATE_B_CANDIDATE_REF,
     );
     const afterPushPr = parsePullRequest(
       (
-        await checked(runCommand, "gh", [
+        await checked(runAuthenticated.gh, "gh", [
           "pr",
           "view",
           String(GATE_B_PULL_REQUEST),
@@ -473,23 +478,38 @@ async function publishAuthorizedCandidate({
     );
     requireEqual(postPushCandidate, localHead, "Gate B post-push candidate");
     requirePullRequest(afterPushPr, localHead, "post-push");
-  } catch (error) {
-    return manualReconciliation(snapshot, localHead, error);
+  } catch {
+    return manualReconciliationResult;
   }
 
-  return {
-    status: "published",
-    headSha: localHead,
-    manifestSha256: snapshot.manifestSha256,
-    publicationAuthorizationSha256: authorizationSnapshot.publicationSha256,
-    repository: GATE_B_REPOSITORY,
-    targetBaseRef: GATE_B_TARGET_BASE_REF,
-    targetBaseSha: GATE_B_EXPECTED_TARGET_BASE_SHA,
-    candidateRef: GATE_B_CANDIDATE_REF,
-    remoteHeadSha: localHead,
-    pullRequest: GATE_B_PULL_REQUEST,
-    reviewPrHandoffAuthorized: true,
-  };
+  return publishedResult;
+}
+
+function requirePublicationInputs({
+  authorizedManifestSha256,
+  credentialMode,
+  expectedOldHead,
+}) {
+  if (!sha256Pattern.test(authorizedManifestSha256)) {
+    throw new Error(
+      "Gate B authorized manifest digest must be a SHA-256 digest.",
+    );
+  }
+  if (!gitSha.test(expectedOldHead)) {
+    throw new Error(
+      "Gate B expected old candidate head must be a full Git SHA.",
+    );
+  }
+  requireEqual(
+    expectedOldHead,
+    GATE_B_EXPECTED_OLD_CANDIDATE_SHA,
+    "Gate B expected old candidate head",
+  );
+  if (!new Set(["automated-app", "attended-user"]).has(credentialMode)) {
+    throw new Error(
+      "Gate B publication authorization requires one explicit credential mode.",
+    );
+  }
 }
 
 function requirePublicationAuthorization({
@@ -544,6 +564,370 @@ function requirePublicationAuthorization({
   }
 }
 
+function requireAuthorizedTokenFingerprint(token, authorizedDigest) {
+  const actual = createHash("sha256").update(token).digest();
+  const expected = Buffer.from(authorizedDigest, "hex");
+  if (expected.length !== actual.length || !timingSafeEqual(actual, expected)) {
+    throw new Error("Gate B publication credential is not authorized.");
+  }
+}
+
+function requireGateBToken(value) {
+  if (
+    typeof value !== "string" ||
+    value.length < 32 ||
+    value.length > 4096 ||
+    /[^\x21-\x7e]/u.test(value)
+  ) {
+    throw new Error(
+      "Gate B requires one high-entropy CLOUDX_GATE_B_TOKEN value.",
+    );
+  }
+  return value;
+}
+
+async function createAuthenticatedCommandContext({
+  removeDirectory,
+  runCommand,
+  token,
+  transport,
+}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-gate-b-"));
+  let disposed = false;
+  const dispose = () => {
+    if (disposed) throw new Error("Gate B command context disposed twice.");
+    disposed = true;
+    removeDirectory(root);
+  };
+
+  try {
+    fs.chmodSync(root, 0o700);
+    const templateDirectory = path.join(root, "empty-template");
+    const transportGitDirectory = path.join(root, "transport.git");
+    const ghConfigDirectory = path.join(root, "gh-config");
+    fs.mkdirSync(templateDirectory, { mode: 0o700 });
+    fs.mkdirSync(transportGitDirectory, { mode: 0o700 });
+    fs.mkdirSync(ghConfigDirectory, { mode: 0o700 });
+    requirePrivateEmptyDirectory(templateDirectory, "template");
+    requirePrivateEmptyDirectory(transportGitDirectory, "bare transport");
+
+    const baseEnvironment = commandEnvironment(root);
+    const localGitEnvironment = {
+      ...baseEnvironment,
+      GCM_INTERACTIVE: "Never",
+      GIT_ASKPASS: "/bin/false",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_SYSTEM: "/dev/null",
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_TEMPLATE_DIR: templateDirectory,
+      SSH_ASKPASS: "/bin/false",
+    };
+    const authenticatedGitEnvironment = {
+      ...localGitEnvironment,
+      GH_TOKEN: token,
+    };
+    const ghEnvironment = {
+      ...baseEnvironment,
+      GH_CONFIG_DIR: ghConfigDirectory,
+      GH_HOST: "github.com",
+      GH_NO_UPDATE_NOTIFIER: "1",
+      GH_PROMPT_DISABLED: "1",
+      GH_REPO: GATE_B_REPOSITORY,
+      GH_TOKEN: token,
+    };
+    const sourceEnvironment = { ...localGitEnvironment };
+    delete sourceEnvironment.GIT_TEMPLATE_DIR;
+
+    await checked(
+      (command, args, options = {}) =>
+        runCommand(command, args, {
+          ...options,
+          cwd: root,
+          env: localGitEnvironment,
+        }),
+      "git",
+      [
+        "init",
+        "--bare",
+        `--template=${templateDirectory}`,
+        transportGitDirectory,
+      ],
+    );
+    fs.chmodSync(transportGitDirectory, 0o700);
+    requirePrivateEmptyDirectory(templateDirectory, "template");
+    requirePrivateDirectory(transportGitDirectory, "bare transport");
+
+    const localGit = (command, args, options = {}) =>
+      runCommand(command, args, {
+        ...options,
+        cwd: process.cwd(),
+        env: sourceEnvironment,
+      });
+    const bareGit = (command, args, options = {}) =>
+      runCommand(
+        command,
+        command === "git"
+          ? [`--git-dir=${transportGitDirectory}`, ...args]
+          : args,
+        {
+          ...options,
+          cwd: root,
+          env: localGitEnvironment,
+        },
+      );
+    const authenticatedGit = (command, args, options = {}) =>
+      runCommand(
+        command,
+        command === "git"
+          ? [
+              `--git-dir=${transportGitDirectory}`,
+              ...gitCredentialArguments(transport),
+              ...args,
+            ]
+          : args,
+        {
+          ...options,
+          cwd: root,
+          env: authenticatedGitEnvironment,
+        },
+      );
+    const gh = (command, args, options = {}) =>
+      runCommand(command, args, {
+        ...options,
+        cwd: root,
+        env: ghEnvironment,
+      });
+
+    await auditBareGitConfiguration(bareGit, transportGitDirectory);
+    return {
+      runLocal: localGit,
+      runAuthenticated: {
+        git: authenticatedGit,
+        gh,
+        async importCandidate(sourceGitDirectory, localHead) {
+          await checked(bareGit, "git", [
+            "fetch",
+            "--no-tags",
+            sourceGitDirectory,
+            `${localHead}:${GATE_B_CANDIDATE_REF}`,
+          ]);
+          await checked(bareGit, "git", [
+            "symbolic-ref",
+            "HEAD",
+            GATE_B_CANDIDATE_REF,
+          ]);
+          const imported = output(
+            await checked(bareGit, "git", ["rev-parse", GATE_B_CANDIDATE_REF]),
+          );
+          requireEqual(imported, localHead, "Gate B imported candidate");
+          await auditBareGitConfiguration(bareGit, transportGitDirectory);
+        },
+      },
+      dispose,
+    };
+  } catch (error) {
+    try {
+      dispose();
+    } catch {
+      throw new Error("Gate B isolated context creation and cleanup failed.");
+    }
+    throw error;
+  }
+}
+
+async function auditBareGitConfiguration(runGit, gitDirectory) {
+  const config = (
+    await checked(runGit, "git", ["config", "--local", "--null", "--list"])
+  ).stdout
+    .split("\0")
+    .filter(Boolean)
+    .map((entry) => entry.split("\n"));
+  if (
+    config.length !== 3 ||
+    config[0]?.[0] !== "core.repositoryformatversion" ||
+    config[0]?.[1] !== "0" ||
+    config[1]?.[0] !== "core.filemode" ||
+    !new Set(["true", "false"]).has(config[1]?.[1]) ||
+    config[2]?.[0] !== "core.bare" ||
+    config[2]?.[1] !== "true"
+  ) {
+    throw new Error("Gate B isolated bare Git config must have three keys.");
+  }
+  const hooks = path.join(gitDirectory, "hooks");
+  if (fs.existsSync(hooks) && fs.readdirSync(hooks).length !== 0) {
+    throw new Error("Gate B isolated bare Git repository must have no hooks.");
+  }
+}
+
+function commandEnvironment(root) {
+  return {
+    HOME: root,
+    LANG: "C",
+    LC_ALL: "C",
+    NO_COLOR: "1",
+    PATH: process.env.PATH ?? "/usr/bin:/bin",
+    XDG_CONFIG_HOME: path.join(root, "config"),
+    ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}),
+  };
+}
+
+function gitCredentialArguments(transport) {
+  const hostUrl = `${transport.protocol}://${transport.credentialScope.host}`;
+  return [
+    "-c",
+    "credential.helper=",
+    "-c",
+    `credential.${hostUrl}.helper=`,
+    "-c",
+    `credential.${transport.url}.helper=`,
+    "-c",
+    `credential.${transport.url}.helper=${oneShotGitCredentialHelper(transport)}`,
+    "-c",
+    "credential.useHttpPath=true",
+    "-c",
+    "credential.interactive=false",
+    "-c",
+    "http.extraHeader=",
+    "-c",
+    `http.${hostUrl}.extraHeader=`,
+    "-c",
+    `http.${transport.url}.extraHeader=`,
+    "-c",
+    "core.askPass=/bin/false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "push.pushOption=",
+    "-c",
+    "push.gpgSign=false",
+  ];
+}
+
+function oneShotGitCredentialHelper(transport) {
+  const { protocol } = transport;
+  const { host, path: credentialPath } = transport.credentialScope;
+  return `!f() { test "$1" = get || exit 0; protocol=; host=; path=; while IFS='=' read -r key value; do case "$key" in protocol) protocol=$value ;; host) host=$value ;; path) path=$value ;; esac; done; test "$protocol" = ${shellWord(protocol)} && test "$host" = ${shellWord(host)} && { test "$path" = ${shellWord(credentialPath)} || test "$path" = ${shellWord(`${credentialPath}.git`)}; } || { printf 'quit=true\\n'; exit 0; }; printf 'username=x-access-token\\npassword=%s\\nquit=true\\n' "$GH_TOKEN"; }; f`;
+}
+
+function shellWord(value) {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+function requireLoopbackTestTransport(transport) {
+  requireFrozenClosedObject(
+    transport,
+    ["credentialScope", "protocol", "url"],
+    "transport",
+  );
+  requireFrozenClosedObject(
+    transport.credentialScope,
+    ["host", "path"],
+    "credential scope",
+  );
+  if (transport.protocol !== "http") {
+    throw new Error("Gate B loopback test transport protocol must be http.");
+  }
+  let url;
+  try {
+    url = new URL(transport.url);
+  } catch {
+    throw new Error("Gate B loopback test transport URL is invalid.");
+  }
+  if (
+    url.protocol !== "http:" ||
+    url.hostname !== "127.0.0.1" ||
+    !url.port ||
+    url.pathname !== "/cloudx.git" ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    transport.credentialScope.host !== `127.0.0.1:${url.port}` ||
+    transport.credentialScope.path !== "cloudx.git"
+  ) {
+    throw new Error(
+      "Gate B loopback test transport must be exact and coherent.",
+    );
+  }
+}
+
+function requireFrozenClosedObject(value, keys, label) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    !Object.isFrozen(value) ||
+    JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(keys)
+  ) {
+    throw new Error(`Gate B ${label} must be a frozen closed object.`);
+  }
+}
+
+function requireClosedOptions(options) {
+  const allowed = [
+    "artifactDir",
+    "authorizationFile",
+    "authorizedManifestSha256",
+    "authorizedPublicationSha256",
+    "credentialMode",
+    "expectedOldHead",
+    "now",
+    "readToken",
+    "removeDirectory",
+    "runCommand",
+  ];
+  if (
+    !options ||
+    typeof options !== "object" ||
+    Array.isArray(options) ||
+    Object.keys(options).some((key) => !allowed.includes(key))
+  ) {
+    throw new Error("Gate B publisher options must use the closed contract.");
+  }
+}
+
+function requireUnchangedPublicationInputs({
+  artifactDir,
+  authorizationSnapshot,
+  authorizedManifestSha256,
+  bundle,
+  credentialMode,
+  expectedOldHead,
+  now,
+  snapshot,
+}) {
+  const freshSnapshot = readGateBArtifactSnapshot(snapshot.directory);
+  if (
+    freshSnapshot.manifestSha256 !== snapshot.manifestSha256 ||
+    freshSnapshot.manifest !== snapshot.manifest ||
+    freshSnapshot.manifestSha256 !== authorizedManifestSha256
+  ) {
+    throw new Error("Gate B artifact bundle changed before publication.");
+  }
+  const freshAuthorization = readPublicationAuthorizationSnapshot({
+    authorizationFile: authorizationSnapshot.path,
+    artifactDir,
+    authorizedPublicationSha256: authorizationSnapshot.publicationSha256,
+  });
+  if (
+    freshAuthorization.path !== authorizationSnapshot.path ||
+    !freshAuthorization.bytes.equals(authorizationSnapshot.bytes)
+  ) {
+    throw new Error(
+      "Gate B publication authorization changed before publication.",
+    );
+  }
+  requirePublicationAuthorization({
+    authorization: freshAuthorization.authorization,
+    authorizedManifestSha256,
+    bundle,
+    credentialMode,
+    expectedOldHead,
+    nowMs: currentTime(now),
+  });
+}
+
 async function requireCredentialPrincipal(
   runCommand,
   credentialMode,
@@ -592,138 +976,12 @@ async function requireCredentialPrincipal(
   requireEqual(user.login, principal.login, "Gate B attended user login");
 }
 
-function requireGateBToken(value) {
-  if (
-    typeof value !== "string" ||
-    value.length === 0 ||
-    /[\0\r\n]/u.test(value)
-  ) {
-    throw new Error("Gate B requires one valid CLOUDX_GATE_B_TOKEN value.");
-  }
-  return value;
-}
-
-function createAuthenticatedCommandContext(runCommand, token) {
-  const ghConfigDirectory = fs.mkdtempSync(
-    path.join(os.tmpdir(), "cloudx-gate-b-gh-"),
+async function readRemoteHead(runCommand, transport, ref) {
+  return parseRemoteHead(
+    (await checked(runCommand, "git", ["ls-remote", transport.url, ref]))
+      .stdout,
+    ref,
   );
-  fs.chmodSync(ghConfigDirectory, 0o700);
-  const baseEnvironment = commandEnvironment();
-  const ghEnvironment = {
-    ...baseEnvironment,
-    GH_CONFIG_DIR: ghConfigDirectory,
-    GH_HOST: "github.com",
-    GH_NO_UPDATE_NOTIFIER: "1",
-    GH_PROMPT_DISABLED: "1",
-    GH_REPO: GATE_B_REPOSITORY,
-    GH_TOKEN: token,
-  };
-  const gitEnvironment = {
-    ...baseEnvironment,
-    GH_TOKEN: token,
-    GCM_INTERACTIVE: "Never",
-    GIT_ASKPASS: "/bin/false",
-    GIT_CONFIG_GLOBAL: "/dev/null",
-    GIT_CONFIG_NOSYSTEM: "1",
-    GIT_CONFIG_SYSTEM: "/dev/null",
-    GIT_TERMINAL_PROMPT: "0",
-    SSH_ASKPASS: "/bin/false",
-  };
-  const localGitEnvironment = { ...gitEnvironment };
-  delete localGitEnvironment.GH_TOKEN;
-
-  return {
-    run(command, args, options = {}) {
-      const remoteGit =
-        command === "git" && new Set(["ls-remote", "push"]).has(args[0]);
-      const childArgs = remoteGit
-        ? [...gitCredentialArguments(), ...args]
-        : args;
-      const env =
-        command === "gh"
-          ? ghEnvironment
-          : command === "git"
-            ? remoteGit
-              ? gitEnvironment
-              : localGitEnvironment
-            : baseEnvironment;
-      return runCommand(command, childArgs, { ...options, env });
-    },
-    dispose() {
-      fs.rmSync(ghConfigDirectory, { recursive: true, force: true });
-    },
-  };
-}
-
-function commandEnvironment() {
-  return {
-    LANG: "C",
-    LC_ALL: "C",
-    NO_COLOR: "1",
-    PATH: process.env.PATH ?? "/usr/bin:/bin",
-    ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}),
-  };
-}
-
-function gitCredentialArguments() {
-  return [
-    "-c",
-    "credential.helper=",
-    "-c",
-    `credential.helper=${oneShotGitCredentialHelper()}`,
-    "-c",
-    "credential.useHttpPath=true",
-    "-c",
-    "core.askPass=/bin/false",
-  ];
-}
-
-function oneShotGitCredentialHelper() {
-  return '!f() { test "$1" = get || exit 0; protocol=; host=; path=; while IFS=\'=\' read -r key value; do case "$key" in protocol) protocol=$value ;; host) host=$value ;; path) path=$value ;; esac; done; test "$protocol" = https && test "$host" = github.com && { test "$path" = davidomil/cloudx || test "$path" = davidomil/cloudx.git; } || { printf \'quit=true\\n\'; exit 0; }; printf \'username=x-access-token\\npassword=%s\\nquit=true\\n\' "$GH_TOKEN"; }; f';
-}
-
-function defaultTokenReader() {
-  return process.env.CLOUDX_GATE_B_TOKEN;
-}
-
-function currentTime(now) {
-  const value = now();
-  const milliseconds = value instanceof Date ? value.getTime() : value;
-  if (!Number.isFinite(milliseconds)) {
-    throw new Error("Gate B publication clock must return a finite time.");
-  }
-  return milliseconds;
-}
-
-function sortObjectKeys(value) {
-  if (Array.isArray(value)) return value.map(sortObjectKeys);
-  if (!value || typeof value !== "object") return value;
-  return Object.fromEntries(
-    Object.keys(value)
-      .sort()
-      .map((key) => [key, sortObjectKeys(value[key])]),
-  );
-}
-
-function isPathInside(directory, filePath) {
-  const relative = path.relative(directory, filePath);
-  return (
-    relative === "" ||
-    (!relative.startsWith("..") && !path.isAbsolute(relative))
-  );
-}
-
-function manualReconciliation(snapshot, localHead, error) {
-  return {
-    status: "manual-reconciliation-required",
-    pushAttempts: 1,
-    headSha: localHead,
-    manifestSha256: snapshot.manifestSha256,
-    repository: GATE_B_REPOSITORY,
-    candidateRef: GATE_B_CANDIDATE_REF,
-    reviewPrHandoffAuthorized: false,
-    reason: error instanceof Error ? error.message : String(error),
-  };
 }
 
 async function requireQuiet(runCommand, args, label) {
@@ -763,9 +1021,7 @@ async function checked(runCommand, command, args, options = {}) {
     `${command} ${args.join(" ")}`,
   );
   if (result.exitCode !== 0) {
-    throw new Error(
-      `Gate B command failed (${result.exitCode}): ${command} ${args.join(" ")}`,
-    );
+    throw new Error(`Gate B command failed: ${command}.`);
   }
   return result;
 }
@@ -829,11 +1085,16 @@ function parseRemoteHead(stdout, expectedRef) {
   return head;
 }
 
-function requireFastForwardPorcelain(stdout, expectedOldHead, expectedNewHead) {
+function requireFastForwardPorcelain(
+  stdout,
+  expectedOldHead,
+  expectedNewHead,
+  transportUrl,
+) {
   const entries = lines(stdout);
   if (
     entries.length !== 3 ||
-    entries[0] !== `To ${originPushUrl}` ||
+    entries[0] !== `To ${transportUrl}` ||
     entries[2] !== "Done"
   ) {
     throw new Error("Gate B push must report exactly one porcelain update.");
@@ -851,6 +1112,79 @@ function requireFastForwardPorcelain(stdout, expectedOldHead, expectedNewHead) {
       "Gate B push porcelain must be one exact non-force fast-forward update.",
     );
   }
+}
+
+function requireTerminalResult(result) {
+  const expected =
+    result?.outcome === "published"
+      ? publishedResult
+      : result?.outcome === "manual-reconciliation-required"
+        ? manualReconciliationResult
+        : undefined;
+  if (!expected || JSON.stringify(result) !== JSON.stringify(expected)) {
+    throw new Error("Gate B terminal result must match the closed contract.");
+  }
+  return { ...expected };
+}
+
+function requirePrivateDirectory(directory, label) {
+  const stat = fs.lstatSync(directory);
+  if (
+    stat.isSymbolicLink() ||
+    !stat.isDirectory() ||
+    (stat.mode & 0o777) !== 0o700
+  ) {
+    throw new Error(`Gate B ${label} directory must be private.`);
+  }
+}
+
+function requirePrivateEmptyDirectory(directory, label) {
+  requirePrivateDirectory(directory, label);
+  if (fs.readdirSync(directory).length !== 0) {
+    throw new Error(`Gate B ${label} directory must be empty.`);
+  }
+}
+
+function defaultDirectoryRemover(directory) {
+  fs.rmSync(directory, { recursive: true, force: true });
+}
+
+function defaultTokenReader() {
+  return process.env.CLOUDX_GATE_B_TOKEN;
+}
+
+function currentTime(now) {
+  const value = now();
+  const milliseconds = value instanceof Date ? value.getTime() : value;
+  if (!Number.isFinite(milliseconds)) {
+    throw new Error("Gate B publication clock must return a finite time.");
+  }
+  return milliseconds;
+}
+
+function deepFreeze(value) {
+  for (const child of Object.values(value)) {
+    if (child && typeof child === "object") deepFreeze(child);
+  }
+  return Object.freeze(value);
+}
+
+function sortObjectKeys(value) {
+  if (Array.isArray(value)) return value.map(sortObjectKeys);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .map((key) => [key, sortObjectKeys(value[key])]),
+  );
+}
+
+function isPathInside(directory, filePath) {
+  const relative = path.relative(directory, filePath);
+  return (
+    relative === "" ||
+    (!relative.startsWith("..") && !path.isAbsolute(relative))
+  );
 }
 
 function parseJson(value, label) {
@@ -906,6 +1240,7 @@ function defaultCommandRunner(command, args, options = {}) {
       command,
       args,
       {
+        cwd: options.cwd,
         encoding: "utf8",
         env: options.env,
         maxBuffer: 2 * 1024 * 1024,
@@ -954,29 +1289,28 @@ function parseCliArguments(argv) {
   return values;
 }
 
+async function runMain(argv) {
+  try {
+    const args = parseCliArguments(argv);
+    const result = await publishGateBCandidate({
+      artifactDir: args["artifact-dir"],
+      authorizedManifestSha256: args["authorized-manifest-sha256"],
+      authorizationFile: args["authorization-file"],
+      authorizedPublicationSha256: args["authorized-publication-sha256"],
+      credentialMode: args["credential-mode"],
+      expectedOldHead: args["expected-old-head"],
+    });
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    if (result.outcome === "manual-reconciliation-required") {
+      process.exitCode = 2;
+    }
+  } catch {
+    process.stderr.write(prePushDiagnostic.slice(0, 1024));
+    process.exitCode = 1;
+  }
+}
+
 const isMain = process.argv[1]
   ? path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
   : false;
-if (isMain) {
-  const args = parseCliArguments(process.argv.slice(2));
-  publishGateBCandidate({
-    artifactDir: args["artifact-dir"],
-    authorizedManifestSha256: args["authorized-manifest-sha256"],
-    authorizationFile: args["authorization-file"],
-    authorizedPublicationSha256: args["authorized-publication-sha256"],
-    credentialMode: args["credential-mode"],
-    expectedOldHead: args["expected-old-head"],
-  })
-    .then((result) => {
-      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-      if (result.status === "manual-reconciliation-required") {
-        process.exitCode = 2;
-      }
-    })
-    .catch((error) => {
-      process.stderr.write(
-        `${error instanceof Error ? error.message : String(error)}\n`,
-      );
-      process.exitCode = 1;
-    });
-}
+if (isMain) void runMain(process.argv.slice(2));

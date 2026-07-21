@@ -47,7 +47,39 @@ For every non-trivial change, use `$change-orchestrator`:
 
 Publication Contract V1 has one order and one initial-publication entry point.
 
-The immutable identities remain distinct: `localChangeBaseSha=7f5693b568f38c207227a5473f14648fd10d4816`, `planningHeadSha=3a5c05272bd4a30bc7646aa710a0807ca85a088b`, `candidateHeadSha=validatedImplementationHeadSha`, `expectedOldCandidateSha=7f5693b568f38c207227a5473f14648fd10d4816`, `targetBaseRef=refs/heads/main`, `expectedTargetBaseSha=02d05f798096431f23acd1e5594a6bee21f3149f`, `repository=davidomil/cloudx`, `pullRequest=1`, `prState=OPEN`, `prBaseRefName=main`, `prBaseRefOid=02d05f798096431f23acd1e5594a6bee21f3149f`, `prHeadRefName=architecture-and-new-codex`, `prHeadRefOid=expectedOldCandidateSha`, and `sameRepository=true`.
+The immutable identities remain distinct: `localChangeBaseSha=7f5693b568f38c207227a5473f14648fd10d4816`, `planningHeadSha=bca78352e91bb40e5f2a46d664872a4b25890cf3`, `candidateHeadSha=validatedImplementationHeadSha`, `expectedOldCandidateSha=7f5693b568f38c207227a5473f14648fd10d4816`, `targetBaseRef=refs/heads/main`, `expectedTargetBaseSha=02d05f798096431f23acd1e5594a6bee21f3149f`, `repository=davidomil/cloudx`, `pullRequest=1`, `prState=OPEN`, `prBaseRefName=main`, `prBaseRefOid=02d05f798096431f23acd1e5594a6bee21f3149f`, `prHeadRefName=architecture-and-new-codex`, `prHeadRefOid=expectedOldCandidateSha`, and `sameRepository=true`.
+
+`credential_token_sha256` is the nonsecret SHA-256 commitment to the exact
+high-entropy ephemeral token. Its runtime value exists only in the private
+maximum-15-minute canonical authorization file and transient publisher memory
+for constant-time comparison with `SHA-256(CLOUDX_GATE_B_TOKEN)`. The raw token
+never enters authorization bytes. Neither value enters the Gate-B
+artifact/evidence bundle, implementation, verification, or review evidence,
+logs, command logs, stdout, stderr, terminal results, durable configuration, or
+public source values.
+
+Production `publishGateBCandidate(options)` accepts no transport selector and is
+recursively frozen to `https://github.com/davidomil/cloudx` with credential scope
+`https`, `github.com`, and `davidomil/cloudx`. CLI, environment, authorization,
+artifacts, repository configuration, and public options cannot change it. A
+direct-test-only frozen `http://127.0.0.1:<port>/cloudx.git` descriptor reaches
+the same private core; its mandatory integration returns the exact
+`WWW-Authenticate: Basic realm="cloudx-gate-b-test"` challenge before an
+authenticated real `git http-backend` receive-pack.
+
+The shared core creates one mode-0700 parent, empty template, and bare Git
+repository; runs exact `git init --bare --template=<empty>` with matching
+`GIT_TEMPLATE_DIR`; audits the three-key local config and absence of hooks; and
+imports the candidate without credentials. Authenticated Git uses explicit
+`--git-dir`, resets generic, host, and exact-URL helpers and headers, disables
+prompts, source config, and hooks, and performs the sole `--no-verify` exact-URL
+lease push. Published success is exactly
+`{"outcome":"published","pushAttempts":1,"retry":false,"reviewPrHandoff":true}`.
+Every post-push or cleanup uncertainty is exactly
+`{"outcome":"manual-reconciliation-required","pushAttempts":1,"retry":false,"reviewPrHandoff":false}`.
+Cleanup runs exactly once. A pre-push rejection exits 1 with only a fixed,
+secret-safe diagnostic of at most 1024 UTF-8 bytes; after push starts, no
+diagnostic accompanies the exact terminal JSON.
 
 Initial publication requires a nonsecret
 `.agents/schemas/publication-authorization.schema.json` object. Its exact bytes

@@ -18,7 +18,25 @@ It does not plan, implement, verify, or review code.
 
 Publication Contract V1 defines two disjoint authority paths.
 
-The immutable identities remain distinct: `localChangeBaseSha=7f5693b568f38c207227a5473f14648fd10d4816`, `planningHeadSha=3a5c05272bd4a30bc7646aa710a0807ca85a088b`, `candidateHeadSha=validatedImplementationHeadSha`, `expectedOldCandidateSha=7f5693b568f38c207227a5473f14648fd10d4816`, `targetBaseRef=refs/heads/main`, `expectedTargetBaseSha=02d05f798096431f23acd1e5594a6bee21f3149f`, `repository=davidomil/cloudx`, `pullRequest=1`, `prState=OPEN`, `prBaseRefName=main`, `prBaseRefOid=02d05f798096431f23acd1e5594a6bee21f3149f`, `prHeadRefName=architecture-and-new-codex`, `prHeadRefOid=expectedOldCandidateSha`, and `sameRepository=true`.
+The immutable identities remain distinct: `localChangeBaseSha=7f5693b568f38c207227a5473f14648fd10d4816`, `planningHeadSha=bca78352e91bb40e5f2a46d664872a4b25890cf3`, `candidateHeadSha=validatedImplementationHeadSha`, `expectedOldCandidateSha=7f5693b568f38c207227a5473f14648fd10d4816`, `targetBaseRef=refs/heads/main`, `expectedTargetBaseSha=02d05f798096431f23acd1e5594a6bee21f3149f`, `repository=davidomil/cloudx`, `pullRequest=1`, `prState=OPEN`, `prBaseRefName=main`, `prBaseRefOid=02d05f798096431f23acd1e5594a6bee21f3149f`, `prHeadRefName=architecture-and-new-codex`, `prHeadRefOid=expectedOldCandidateSha`, and `sameRepository=true`.
+
+The private maximum-15-minute authorization alone carries the approved
+nonsecret `credential_token_sha256` commitment. The publisher compares it in
+constant-time with `SHA-256(CLOUDX_GATE_B_TOKEN)` before creating an
+authenticated context. The raw token never enters authorization; neither value
+enters the artifact/evidence bundle, role evidence, logs, stdout, stderr,
+terminal results, durable configuration, or public source.
+
+This role supplies no transport selector. Production is recursively frozen to
+`https://github.com/davidomil/cloudx`; a frozen direct-test-only loopback
+descriptor traverses the same private core. That core uses
+a 0700 empty-template audited bare repository, token-free candidate import,
+explicit `--git-dir`, reset helpers and headers, disabled hooks, and one
+`--no-verify` exact-URL lease push. The required integration challenges with
+exact Basic authentication before real `git http-backend` receive-pack.
+Cleanup runs exactly once. Only the exact four-field published or
+manual-reconciliation object is emitted; pre-push rejection uses the fixed
+bounded diagnostic and post-push output contains no diagnostic beyond JSON.
 
 Initial publication requires a nonsecret
 `.agents/schemas/publication-authorization.schema.json` object with recursively

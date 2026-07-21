@@ -37,7 +37,27 @@ verify, review, or mutate GitHub in the orchestrator context.
 
 Publication Contract V1 limits this role to ordered, isolated dispatch.
 
-The immutable identities remain distinct: `localChangeBaseSha=7f5693b568f38c207227a5473f14648fd10d4816`, `planningHeadSha=3a5c05272bd4a30bc7646aa710a0807ca85a088b`, `candidateHeadSha=validatedImplementationHeadSha`, `expectedOldCandidateSha=7f5693b568f38c207227a5473f14648fd10d4816`, `targetBaseRef=refs/heads/main`, `expectedTargetBaseSha=02d05f798096431f23acd1e5594a6bee21f3149f`, `repository=davidomil/cloudx`, `pullRequest=1`, `prState=OPEN`, `prBaseRefName=main`, `prBaseRefOid=02d05f798096431f23acd1e5594a6bee21f3149f`, `prHeadRefName=architecture-and-new-codex`, `prHeadRefOid=expectedOldCandidateSha`, and `sameRepository=true`.
+The immutable identities remain distinct: `localChangeBaseSha=7f5693b568f38c207227a5473f14648fd10d4816`, `planningHeadSha=bca78352e91bb40e5f2a46d664872a4b25890cf3`, `candidateHeadSha=validatedImplementationHeadSha`, `expectedOldCandidateSha=7f5693b568f38c207227a5473f14648fd10d4816`, `targetBaseRef=refs/heads/main`, `expectedTargetBaseSha=02d05f798096431f23acd1e5594a6bee21f3149f`, `repository=davidomil/cloudx`, `pullRequest=1`, `prState=OPEN`, `prBaseRefName=main`, `prBaseRefOid=02d05f798096431f23acd1e5594a6bee21f3149f`, `prHeadRefName=architecture-and-new-codex`, `prHeadRefOid=expectedOldCandidateSha`, and `sameRepository=true`.
+
+`credential_token_sha256` is the approved nonsecret SHA-256 commitment to the
+exact high-entropy ephemeral token. Its runtime value exists only in the private
+maximum-15-minute canonical authorization file and transient publisher memory
+for constant-time comparison. The raw token never enters authorization bytes;
+neither value enters the Gate-B artifact/evidence bundle, role evidence, logs,
+stdout, stderr, terminal results, durable configuration, or public source.
+
+The orchestrator supplies no transport selector. Production is recursively frozen to
+`https://github.com/davidomil/cloudx`; no CLI, environment, authorization,
+artifact, repository config, or public option can alter it. The frozen loopback
+descriptor is direct-test-only and reaches the same private empty-template,
+audited bare Git, token-free import, explicit `--git-dir`, reset-helper/header,
+hooks-disabled, `--no-verify` exact-lease core. Its required proof challenges
+before authentication and bridges to real `git http-backend` receive-pack.
+Cleanup runs exactly once. The only results are exactly
+`{"outcome":"published","pushAttempts":1,"retry":false,"reviewPrHandoff":true}`
+or `{"outcome":"manual-reconciliation-required","pushAttempts":1,"retry":false,"reviewPrHandoff":false}`;
+pre-push rejection emits only the fixed bounded diagnostic and post-push emits
+no diagnostic beyond terminal JSON.
 
 Initial publication requires a nonsecret
 `.agents/schemas/publication-authorization.schema.json` object with recursively

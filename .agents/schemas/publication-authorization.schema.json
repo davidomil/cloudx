@@ -13,6 +13,7 @@
     "pull_request",
     "artifact_manifest_sha256",
     "policy_sha256",
+    "credential_token_sha256",
     "credential_mode",
     "local_change_base_sha",
     "planning_head_sha",
@@ -40,6 +41,7 @@
     "pull_request": { "const": 1 },
     "artifact_manifest_sha256": { "$ref": "#/$defs/sha256" },
     "policy_sha256": { "$ref": "#/$defs/sha256" },
+    "credential_token_sha256": { "$ref": "#/$defs/sha256" },
     "credential_mode": {
       "enum": ["automated-app", "attended-user"]
     },
