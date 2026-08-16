@@ -1,5 +1,9 @@
 import { expect, test } from "@playwright/test";
-import type { CreateTabResponse, TabLayoutNode } from "@cloudx/shared";
+import type {
+  CreateTabResponse,
+  TabLayoutNode,
+  WorkspaceStateResponse,
+} from "@cloudx/shared";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs/promises";
 import net from "node:net";
@@ -164,6 +168,120 @@ test.describe("CloudX shipped shell", () => {
       contentType: "image/png",
     });
   });
+
+  test("keeps a failed optimistic layout visible and persists it before a later tab command", async ({
+    page,
+  }) => {
+    const workspaceRequests: Array<"PATCH" | "POST"> = [];
+    let patchAttempts = 0;
+    let startSecondPatch!: () => void;
+    let releaseSecondPatch!: () => void;
+    const secondPatchStarted = new Promise<void>((resolve) => {
+      startSecondPatch = resolve;
+    });
+    const secondPatchRelease = new Promise<void>((resolve) => {
+      releaseSecondPatch = resolve;
+    });
+    await page.route("**/api/windows/*", async (route) => {
+      if (route.request().method() !== "PATCH") {
+        await route.fallback();
+        return;
+      }
+      workspaceRequests.push("PATCH");
+      patchAttempts += 1;
+      if (patchAttempts === 1) {
+        await route.fulfill({
+          status: 500,
+          contentType: "application/json",
+          body: JSON.stringify({ message: "layout persistence failed" }),
+        });
+        return;
+      }
+      startSecondPatch();
+      await secondPatchRelease;
+      await route.continue();
+    });
+    page.on("request", (request) => {
+      if (
+        request.method() === "POST" &&
+        new URL(request.url()).pathname === "/api/tabs"
+      ) {
+        workspaceRequests.push("POST");
+      }
+    });
+
+    try {
+      const workspaceResponse = await page.request.get(
+        `${baseUrl}/api/workspace`,
+      );
+      const workspace =
+        (await workspaceResponse.json()) as WorkspaceStateResponse;
+      const activeWindow =
+        workspace.windows.find(
+          (window) => window.id === workspace.activeWindowId,
+        ) ?? workspace.windows[0]!;
+      const initialPaneCount = countPanes(activeWindow.layout.root);
+      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+      await expect(page.locator(".workspace-pane")).toHaveCount(
+        initialPaneCount,
+      );
+      const firstPatchResponse = page.waitForResponse(
+        (response) =>
+          response.request().method() === "PATCH" &&
+          /^\/api\/windows\/[^/]+$/u.test(new URL(response.url()).pathname),
+      );
+      const splitButton = page.locator('button[title^="Split"]:visible');
+      if ((await splitButton.count()) === 0) {
+        await page.getByRole("button", { name: "Workspace actions" }).click();
+      }
+      await splitButton.first().click();
+      await expect(page.locator(".workspace-pane")).toHaveCount(
+        initialPaneCount + 1,
+      );
+      expect((await firstPatchResponse).status()).toBe(500);
+      await expect(page.locator(".error-banner")).toContainText(
+        "layout persistence failed",
+      );
+
+      const targetPane = page.locator(".workspace-pane.active");
+      await targetPane.getByTitle("Add tab to this pane").click();
+      await page.getByLabel("Plugin").selectOption("local-web");
+      await page.getByLabel("Title").fill("Recovered layout placement");
+      await page.getByRole("button", { name: "Create", exact: true }).click();
+      await Promise.race([
+        secondPatchStarted,
+        new Promise<never>((_resolve, reject) =>
+          setTimeout(
+            () =>
+              reject(
+                new Error("A later command did not retry the pending layout."),
+              ),
+            1_000,
+          ),
+        ),
+      ]);
+
+      await expect(page.locator(".error-banner")).toContainText(
+        "layout persistence failed",
+      );
+      expect(workspaceRequests).toEqual(["PATCH", "PATCH"]);
+      const createResponse = page.waitForResponse(
+        (response) =>
+          response.request().method() === "POST" &&
+          new URL(response.url()).pathname === "/api/tabs",
+      );
+      releaseSecondPatch();
+      expect((await createResponse).status()).toBe(201);
+
+      expect(workspaceRequests).toEqual(["PATCH", "PATCH", "POST"]);
+      await expect(page.locator(".error-banner")).toHaveCount(0);
+      await expect(
+        targetPane.getByText("Recovered layout placement", { exact: true }),
+      ).toBeVisible();
+    } finally {
+      releaseSecondPatch();
+    }
+  });
 });
 
 function findPane(root: TabLayoutNode, paneId: string) {
@@ -173,6 +291,12 @@ function findPane(root: TabLayoutNode, paneId: string) {
   return (
     findPane(root.children[0], paneId) ?? findPane(root.children[1], paneId)
   );
+}
+
+function countPanes(root: TabLayoutNode): number {
+  return root.type === "pane"
+    ? 1
+    : countPanes(root.children[0]) + countPanes(root.children[1]);
 }
 
 async function freePort() {

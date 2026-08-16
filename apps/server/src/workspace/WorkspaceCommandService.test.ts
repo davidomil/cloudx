@@ -34,9 +34,8 @@ describe("WorkspaceCommandService", () => {
         createdWindow: false,
         replacedTabIds: ["tab-old-a", "tab-old-b"]
       }),
-      snapshot: vi.fn().mockReturnValue({ activeWindowId: window.id, windows: [window], templates: [template] }),
       remapTemplateLayout: vi.fn().mockReturnValue(window.layout),
-      commitTemplateApplication: vi.fn().mockResolvedValue(window),
+      commitTemplateAndPublish: vi.fn(async (_prepared: unknown, _layout: unknown, _name: unknown, publish: () => unknown) => ({ published: publish(), window })),
       notifyChange
     } as unknown as WorkspaceLayoutStore;
     const service = new WorkspaceCommandService(sessions, workspace);

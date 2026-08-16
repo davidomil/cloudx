@@ -44,6 +44,22 @@ describe("DocumentationUploadSpool", () => {
     await expect(fs.readdir(root)).resolves.toEqual([]);
   });
 
+  it("removes a partial private spool before an admission-owned abort settles", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-documentation-spool-admission-abort-"));
+    const body = new PassThrough();
+    const controller = new AbortController();
+    const stopped = new Error("Documentation ingest queue was stopped.");
+    const upload = spoolDocumentationUpload(body, root, 12, 12, { signal: controller.signal });
+    body.write("partial");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    controller.abort(stopped);
+
+    await expect(upload).rejects.toBe(stopped);
+    expect(body.destroyed).toBe(true);
+    await expect(fs.readdir(root)).resolves.toEqual([]);
+  });
+
   it("reaps interrupted upload directories without deleting unrelated spool-root entries", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-documentation-spool-reap-"));
     await fs.mkdir(path.join(root, "upload-interrupted"));

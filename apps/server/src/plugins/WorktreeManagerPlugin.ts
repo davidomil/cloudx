@@ -252,7 +252,7 @@ export class WorktreeManagerPlugin implements WorkspacePlugin {
     }
   ];
 
-  constructor(private readonly worktrees = new WorktreeService()) {}
+  constructor(private readonly worktrees: WorktreeService) {}
 
   descriptor() {
     return {

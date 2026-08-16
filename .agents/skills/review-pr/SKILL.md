@@ -32,7 +32,9 @@ Production has no transport selector and is recursively frozen to
 uses the same empty-template audited bare Git core and proves an exact Basic
 challenge followed by real `git http-backend` receive-pack. Authenticated Git
 uses explicit `--git-dir`, reset helpers and headers, disabled hooks, and the
-sole `--no-verify` exact lease. Cleanup runs exactly once. Review handoff exists
+sole `--no-verify` exact lease. The direct-test entry requires an explicit frozen
+loopback descriptor before accepting injected dependencies and cannot select or
+default to the production transport. Cleanup runs exactly once. Review handoff exists
 only for the exact four-field published object; manual reconciliation is the
 exact four-field non-handoff object, pre-push diagnostics are fixed and bounded,
 and post-push terminal JSON has no diagnostic field or companion stderr.
@@ -44,11 +46,11 @@ most 32 KiB outside the artifact directory. `--authorization-file` and
 `--authorized-publication-sha256` bind it independently from the
 `--authorized-manifest-sha256` bundle digest. The grant lasts at most 15 minutes
 and binds
-the full identity, policy, bundle, nonce, and either an `automated-app` or
-`attended-user` principal. The sole secret is `CLOUDX_GATE_B_TOKEN`, pinned only
+the full identity, policy, bundle, nonce, and only an `attended-user` mode with a
+`github-user` principal. The sole secret is `CLOUDX_GATE_B_TOKEN`, pinned only
 to child `GH_TOKEN`; this review role never receives it. The sole initial command
 is
-`node scripts/ai-change/publish-gate-b.mjs --artifact-dir <bundle> --authorized-manifest-sha256 <sha256> --authorization-file <path> --authorized-publication-sha256 <sha256> --credential-mode <automated-app|attended-user> --expected-old-head <sha>`.
+`node scripts/ai-change/publish-gate-b.mjs --artifact-dir <bundle> --authorized-manifest-sha256 <sha256> --authorization-file <path> --authorized-publication-sha256 <sha256> --credential-mode attended-user --expected-old-head <sha>`.
 It performs at most one exact expected-old
 `--force-with-lease=refs/heads/architecture-and-new-codex:<expectedOldCandidateSha>`
 update with ambient credentials and prompts disabled.

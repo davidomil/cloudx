@@ -38,6 +38,7 @@ export const GATE_B_COMMIT_SUBJECTS = [
   "POLICY: separate candidate publication from live-head review",
   "POLICY: bind publication authorization and candidate lease",
   "POLICY: isolate publication credentials and outcomes",
+  "POLICY: harden Gate B publication boundary",
 ];
 export const GATE_B_LOCAL_CHANGE_BASE_SHA =
   "7f5693b568f38c207227a5473f14648fd10d4816";
@@ -65,6 +66,15 @@ export const GATE_B_REVIEW_ROLES = [
   "review-shared",
   "review-web",
 ];
+export const GATE_B_ALLOWED_PATH_COUNT = 118;
+export const GATE_B_ARTIFACT_NAMES = [
+  "plan.json",
+  "plan-review.json",
+  "implementation.json",
+  "verification.json",
+  ...GATE_B_REVIEW_ROLES.map((role) => `${role}.json`),
+  "review-change.json",
+].sort();
 
 export async function validateProcess(options = {}) {
   const repoRoot = path.resolve(options.repoRoot ?? defaultRepoRoot);
@@ -79,6 +89,7 @@ export async function validateProcess(options = {}) {
   }
   const workflows = validateWorkflows(repoRoot, issues);
   validateVerifierBuildContext(repoRoot, issues);
+  validateVerifierConsumers(repoRoot, issues);
   validatePublicationContract(repoRoot, issues);
   if (issues.length > 0) {
     throw new Error(
@@ -99,6 +110,7 @@ export async function validateProcess(options = {}) {
 const publicationContractPaths = {
   root: "AGENTS.md",
   orchestrator: ".agents/skills/change-orchestrator/SKILL.md",
+  implement: ".agents/skills/implement-change/SKILL.md",
   ship: ".agents/skills/ship-change/SKILL.md",
   review: ".agents/skills/review-pr/SKILL.md",
   verifier: ".agents/skills/verify-change/SKILL.md",
@@ -107,6 +119,13 @@ const publicationContractPaths = {
   publisher: "scripts/ai-change/publish-gate-b.mjs",
   publisherTests: "scripts/ai-change/publish-gate-b.test.mjs",
 };
+
+const gateBTransitionSourceSha256 = Object.freeze({
+  orchestrator:
+    "03025f676c652185bbf4130d71c760bb36f987ef5e9c02d76d6558986fc372c4",
+  root: "8e09cb951b1b6bc5b1519a5d6be920280d8377b8bf7dbcb410ab8bbf36305d64",
+  process: "64ffb9e03662ce1fa88db8b80d2f9db44b473843ea1a1274d10c47381322da9d",
+});
 
 const publicationIdentityClauses = [
   `localChangeBaseSha=${GATE_B_LOCAL_CHANGE_BASE_SHA}`,
@@ -138,8 +157,8 @@ const publicationAuthorizationClauses = [
   "--authorized-publication-sha256",
   "--authorized-manifest-sha256",
   "15 minutes",
-  "automated-app",
   "attended-user",
+  "github-user",
   "CLOUDX_GATE_B_TOKEN",
   "credential_token_sha256",
   "maximum-15-minute",
@@ -148,6 +167,8 @@ const publicationAuthorizationClauses = [
   "no transport selector",
   "recursively frozen",
   "direct-test-only",
+  "requires an explicit frozen loopback descriptor",
+  "cannot select or default to the production transport",
   "git http-backend",
   "explicit `--git-dir`",
   "--no-verify",
@@ -168,7 +189,10 @@ export function validatePublicationContract(repoRoot, issues = []) {
       );
       continue;
     }
-    sources[name] = fs.readFileSync(absolutePath, "utf8");
+    const bytes = fs.readFileSync(absolutePath);
+    sources[name] = Object.hasOwn(gateBTransitionSourceSha256, name)
+      ? bytes
+      : bytes.toString("utf8");
   }
   if (
     Object.keys(sources).length === Object.keys(publicationContractPaths).length
@@ -179,6 +203,7 @@ export function validatePublicationContract(repoRoot, issues = []) {
 }
 
 export function validatePublicationContractSources(sources, issues = []) {
+  validateGateBTransitionSourceCommitments(sources, issues);
   const contractBegin = "<!-- CLOUDX-PUBLICATION-CONTRACT-V1:BEGIN -->";
   const contractEnd = "<!-- CLOUDX-PUBLICATION-CONTRACT-V1:END -->";
   const roleClauses = {
@@ -242,6 +267,9 @@ export function validatePublicationContractSources(sources, issues = []) {
       issues,
     );
   }
+  validateGateBRemediationOrderSources(sources, issues);
+  validateGateBRemediationCycleSources(sources, issues);
+  validateAttendedCommitContractSources(sources, issues);
   validatePublicationAuthorizationSchema(
     String(sources.authorizationSchema ?? ""),
     issues,
@@ -257,8 +285,8 @@ export function validatePublicationContractSources(sources, issues = []) {
     "authorization-file",
     "credentialMode",
     "process.env.CLOUDX_GATE_B_TOKEN",
-    '"automated-app"',
     '"attended-user"',
+    '"github-user"',
     "GH_TOKEN: token",
     "credential_token_sha256",
     "timingSafeEqual",
@@ -268,10 +296,31 @@ export function validatePublicationContractSources(sources, issues = []) {
     'protocol: "https"',
     'host: "github.com"',
     'path: "davidomil/cloudx"',
-    "publishGateBCandidateForLoopbackTest",
+    "publishGateBCandidateForDirectTest",
     "requireLoopbackTestTransport",
-    "publishCandidateWithTransport(options, productionTransport)",
-    "publishCandidateWithTransport(options, transport)",
+    "requireLoopbackTestTransport(transport); requireDirectTestOptions(options);",
+    "publicationOptions, transport, {",
+    "validateTrustedExecutables(productionExecutables)",
+    "validateCommittedCandidateDiff",
+    'encoding: "buffer"',
+    'new TextDecoder("utf-8", { fatal: true, ignoreBOM: true, }).decode(result.stdout)',
+    'const credentialFreeGitEnvironment = deepFreeze({ GCM_INTERACTIVE: "Never", GIT_ASKPASS: "/bin/false", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_SYSTEM: "/dev/null", GIT_NO_REPLACE_OBJECTS: "1", GIT_TERMINAL_PROMPT: "0", LANG: "C", LC_ALL: "C", NO_COLOR: "1", PATH: "/usr/bin:/bin", SSH_ASKPASS: "/bin/false", });',
+    'const localGitEnvironment = { ...baseEnvironment, GCM_INTERACTIVE: "Never", GIT_ASKPASS: "/bin/false", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_SYSTEM: "/dev/null", GIT_NO_REPLACE_OBJECTS: "1", GIT_TERMINAL_PROMPT: "0", GIT_TEMPLATE_DIR: templateDirectory, SSH_ASKPASS: "/bin/false", };',
+    "bundle.allowedPaths",
+    '"diff", "--name-only", "-z", "--no-renames"',
+    'typeof result.stdout !== "string"',
+    'typeof result.stderr !== "string"',
+    "!Buffer.isBuffer(result.stdout)",
+    "!Buffer.isBuffer(result.stderr)",
+    'git: "/usr/bin/git"',
+    'gh: "/usr/bin/gh"',
+    'PATH: "/usr/bin:/bin"',
+    "GATE_B_ARTIFACT_NAMES",
+    "artifactFileMaxBytes",
+    "artifactBundleMaxBytes",
+    "O_NOFOLLOW",
+    "mtimeNs",
+    "ctimeNs",
     '"init", "--bare", `--template=${templateDirectory}`, transportGitDirectory',
     "GIT_TEMPLATE_DIR: templateDirectory",
     "auditBareGitConfiguration",
@@ -304,6 +353,8 @@ export function validatePublicationContractSources(sources, issues = []) {
     /originPushUrl/u,
     /["']origin["']/u,
     /transport\s*=/u,
+    /transport\s*\?\?\s*productionTransport/u,
+    /if\s*\(transport\s*!==\s*undefined\)\s*requireLoopbackTestTransport/u,
   ]) {
     if (forbidden.test(publisherSource)) {
       issues.push(
@@ -312,12 +363,7 @@ export function validatePublicationContractSources(sources, issues = []) {
     }
   }
   if (
-    publisherSource.match(
-      /publishCandidateWithTransport\(options, transport\)/gu,
-    )?.length !== 2 ||
-    publisherSource.match(
-      /publishCandidateWithTransport\(options, productionTransport\)/gu,
-    )?.length !== 1
+    publisherSource.match(/publishCandidateWithTransport\(/gu)?.length !== 3
   ) {
     issues.push(
       "Gate B production and loopback entries must share one private publisher core.",
@@ -386,9 +432,8 @@ export function validatePublicationContractSources(sources, issues = []) {
     "spawnSync",
     "process.execPath",
     "CLOUDX_GATE_B_TOKEN",
-    "automated-app",
     "attended-user",
-    "publishGateBCandidateForLoopbackTest",
+    "publishGateBCandidateForDirectTest",
     "createServer",
     'Basic realm="cloudx-gate-b-test"',
     '"http-backend"',
@@ -403,6 +448,350 @@ export function validatePublicationContractSources(sources, issues = []) {
     }
   }
 
+  const initialDiffCheck = publisherSource.indexOf(
+    "await validateCommittedCandidateDiff({",
+  );
+  const tokenRead = publisherSource.indexOf(
+    "const token = requireGateBToken(readToken());",
+  );
+  const freshnessCheck = publisherSource.lastIndexOf(
+    "await validateCommittedCandidateDiff({",
+  );
+  const markPushStarted = publisherSource.indexOf("markPushStarted();");
+  if (
+    initialDiffCheck < 0 ||
+    tokenRead < 0 ||
+    initialDiffCheck >= tokenRead ||
+    freshnessCheck <= initialDiffCheck ||
+    freshnessCheck >= markPushStarted
+  ) {
+    issues.push(
+      "Gate B publisher must validate the exact committed diff before token read and immediately before push.",
+    );
+  }
+  const normalResultGuard = publisherSource.slice(
+    publisherSource.indexOf("function requireCommandResult("),
+    publisherSource.indexOf("function requireBinaryCommandResult("),
+  );
+  if (/Buffer\.isBuffer/u.test(normalResultGuard)) {
+    issues.push("Gate B normal command-result guard must remain string-only.");
+  }
+
+  return issues;
+}
+
+const gateBRemediationOrderBegin =
+  "<!-- CLOUDX-GATE-B-REMEDIATION-ORDER-V1:BEGIN -->";
+const gateBRemediationOrderEnd =
+  "<!-- CLOUDX-GATE-B-REMEDIATION-ORDER-V1:END -->";
+const canonicalGateBRemediationOrder =
+  "fresh remediation plan -> independent clean plan review -> clean implementation -> attended exact same-parent amend -> invalidate every prior candidate-bound artifact -> regenerate full candidate evidence -> if a preauthorization finding exists below candidate tip 3 return to fresh remediation plan; if a finding exists against candidate tip 3 transition to blocked; otherwise final bounded 15-file bundle -> authorization and publication.";
+const gateBTransitionDeclaration = Object.freeze({
+  orchestrator:
+    "The closed block below is the sole machine transition-order authority.",
+  root: "The closed block\nbelow is the sole machine transition-order mirror of the change-orchestrator\nauthority.",
+  process:
+    "The closed block\nbelow is the sole machine transition-order mirror of the change-orchestrator\nauthority.",
+});
+
+function validateGateBTransitionSourceCommitments(sources, issues) {
+  for (const [name, expectedSha256] of Object.entries(
+    gateBTransitionSourceSha256,
+  )) {
+    const source = sources[name];
+    const bytes = Buffer.isBuffer(source)
+      ? source
+      : Buffer.from(String(source ?? ""), "utf8");
+    if (sha256(bytes) !== expectedSha256) {
+      issues.push(
+        `Gate B source-byte commitment '${name}' must match its human-reviewed SHA-256.`,
+      );
+    }
+  }
+}
+
+function exactOccurrenceCount(source, value) {
+  return source.split(value).length - 1;
+}
+
+function normalizeGateBRemediationOrder(value) {
+  return value
+    .replace(/^[ \t\r\n]+|[ \t\r\n]+$/gu, "")
+    .replace(/[ \t\r\n]+/gu, " ");
+}
+
+export function validateGateBRemediationOrderSources(sources, issues = []) {
+  const publicationBegin = "<!-- CLOUDX-PUBLICATION-CONTRACT-V1:BEGIN -->";
+  const publicationEnd = "<!-- CLOUDX-PUBLICATION-CONTRACT-V1:END -->";
+  for (const name of ["orchestrator", "root", "process"]) {
+    const source = String(sources[name] ?? "");
+    const beginCount = exactOccurrenceCount(source, gateBRemediationOrderBegin);
+    const endCount = exactOccurrenceCount(source, gateBRemediationOrderEnd);
+    if (beginCount !== 1 || endCount !== 1) {
+      issues.push(
+        `Gate B remediation-order markers '${name}' must occur exactly once each.`,
+      );
+      continue;
+    }
+
+    const begin = source.indexOf(gateBRemediationOrderBegin);
+    const end = source.indexOf(gateBRemediationOrderEnd);
+    if (begin >= end) {
+      issues.push(
+        `Gate B remediation-order markers '${name}' must place BEGIN before END.`,
+      );
+      continue;
+    }
+
+    const publicationBeginIndex = source.indexOf(publicationBegin);
+    const publicationEndIndex = source.indexOf(publicationEnd);
+    if (
+      publicationBeginIndex >= 0 &&
+      publicationEndIndex >= 0 &&
+      (begin <= publicationBeginIndex || end >= publicationEndIndex)
+    ) {
+      issues.push(
+        `Gate B remediation-order markers '${name}' must be inside Publication Contract V1.`,
+      );
+    }
+
+    const order = source.slice(begin + gateBRemediationOrderBegin.length, end);
+    if (
+      normalizeGateBRemediationOrder(order) !== canonicalGateBRemediationOrder
+    ) {
+      issues.push(
+        `Gate B canonical remediation-order block '${name}' must match exactly after documented ASCII whitespace normalization.`,
+      );
+    }
+
+    if (exactOccurrenceCount(source, gateBTransitionDeclaration[name]) !== 1) {
+      issues.push(
+        `Gate B remediation-order source '${name}' must contain its exact sole machine transition-order declaration exactly once.`,
+      );
+    }
+  }
+  return issues;
+}
+
+const gateBRemediationCycleClauses = [
+  "bounded pre-publication remediation cycle",
+  "aae5b372739919537fc7cc08fb7dac4ebe6bc980",
+  "counts as candidate tip 1",
+  "at most three candidate tips",
+  "ceiling does not reset",
+  "Before authorization or publication begins",
+  "only to a fresh remediation plan and independent clean plan review",
+  "git commit --amend --no-edit",
+  "candidate tip 3 transitions terminally to `blocked`",
+  "no candidate tip 4, bypass, exception reuse, or implicit continuation",
+  "clean tracked worktree baseline",
+  "empty index",
+  "exact nine remediation paths",
+  "fixed-parent diff is exactly the 63-path union",
+  "apps/web/src/ui/voiceWorkspace.ts",
+  "apps/web/src/ui/voiceWorkspace.test.ts",
+  "dd08cb93283abf5c1341ed3db13506da4f912423e11a51cf90ef8358404e0325",
+  "a125d814c942a913d63331d3d1d85f11c8c2740e269bd3e0f2e185c4c593d338",
+  "`plan`, `plan-review`, `implementation`, `verification`, `selected area-review`, `aggregate-review`, `final-bundle`, and `authorization` artifact",
+  "regenerated cumulative 118-path/75-claim broad plan",
+  "only the exact safe nine verification commands",
+  "fresh clean plan review",
+  "regenerated implementation artifact",
+  "full canonical verification",
+  "all fresh policy-selected area reviews",
+  "aggregate review",
+  "final bounded 15-file bundle",
+  "No remediation cycle exists after authorization creation, token read, publisher invocation, publication attempt, or any GitHub mutation",
+  "no authorization is created",
+  "No token is read",
+  "no publisher is invoked",
+  "no publication command runs",
+  "no GitHub mutation occurs",
+];
+
+const gateBTip3RemediationPaths = Object.freeze([
+  ".agents/skills/change-orchestrator/SKILL.md",
+  ".agents/skills/implement-change/SKILL.md",
+  ".agents/skills/verify-change/SKILL.md",
+  "AGENTS.md",
+  "docs/AI_CHANGE_PROCESS.md",
+  "docs/architecture/testing-map.md",
+  "scripts/ai-change/validate-process.mjs",
+  "scripts/ai-change/validate-process.test.mjs",
+  "scripts/ai-change/verify.test.mjs",
+]);
+const gateBTip3RemediationPathDeclaration = `The exact nine remediation paths for candidate tip 3 are ${gateBTip3RemediationPaths
+  .slice(0, -1)
+  .map((remediationPath) => `\`${remediationPath}\``)
+  .join(", ")}, and \`${gateBTip3RemediationPaths.at(-1)}\`.`;
+
+export function validateGateBRemediationCycleSources(sources, issues = []) {
+  for (const name of ["orchestrator", "root", "process"]) {
+    const source = String(sources[name] ?? "").replace(/\s+/gu, " ");
+    for (const clause of gateBRemediationCycleClauses) {
+      if (!source.includes(clause)) {
+        issues.push(
+          `Gate B remediation cycle '${name}' must contain: ${clause}`,
+        );
+      }
+    }
+  }
+
+  for (const name of ["orchestrator", "root", "process", "implement"]) {
+    const source = String(sources[name] ?? "").replace(/\s+/gu, " ");
+    if (
+      exactOccurrenceCount(source, gateBTip3RemediationPathDeclaration) !== 1
+    ) {
+      issues.push(
+        `Gate B candidate-tip-3 remediation paths '${name}' must declare the exact nine-path list once.`,
+      );
+    }
+    if (/\bexact eleven(?:-path)?\b/iu.test(source)) {
+      issues.push(
+        `Gate B candidate-tip-3 remediation paths '${name}' retain stale eleven-path wording.`,
+      );
+    }
+  }
+
+  const implement = String(sources.implement ?? "").replace(/\s+/gu, " ");
+  for (const clause of [
+    "counts as candidate tip 1",
+    "only candidate tips 2 and 3 may follow",
+    "candidate-tip-3 finding is blocked",
+    "clean tracked worktree baseline",
+    "empty index",
+    "exact nine remediation pathspecs",
+    "git commit --amend --no-edit",
+    "dd08cb93283abf5c1341ed3db13506da4f912423e11a51cf90ef8358404e0325",
+    "a125d814c942a913d63331d3d1d85f11c8c2740e269bd3e0f2e185c4c593d338",
+    "invalidates this implementation artifact and all other prior candidate-bound precommit evidence",
+    "regenerated against the final candidate head before authorization",
+  ]) {
+    if (!implement.includes(clause)) {
+      issues.push(
+        `Gate B remediation cycle 'implement' must contain: ${clause}`,
+      );
+    }
+  }
+  return issues;
+}
+
+export function validateAttendedCommitContractSources(sources, issues = []) {
+  const requiredBySource = {
+    root: [
+      "216e6d739155aa1dc5bab11829f56869e6f494ff",
+      "empty index",
+      "40-path untracked documentation name/content-hash manifest byte-for-byte",
+      "git add --",
+      "implementation.changed_files",
+      "plan.allowed_paths",
+      "POLICY: harden Gate B publication boundary",
+      "sole required parent",
+      "unchanged untracked-document snapshot",
+      "git commit --amend --no-edit",
+      "exact nine-path implementation delta",
+      "fixed-parent 63-path union",
+      "118-path/75-claim",
+      "exact safe nine verification commands",
+      "ten unique clean area reviews",
+      "15-file snapshot",
+      "git diff --name-only -z --no-renames",
+      "credential-free environment",
+      "bounded Buffer",
+      "fatal UTF-8 decoder",
+      "preserving leading BOM bytes as pathname identity",
+      "`GIT_NO_REPLACE_OBJECTS=1` disables replacement refs",
+      "normal command results remain string-only",
+      "immediately before push",
+    ],
+    orchestrator: [
+      "216e6d739155aa1dc5bab11829f56869e6f494ff",
+      "empty index",
+      "40-path untracked documentation name/content-hash manifest byte-for-byte",
+      "git add --",
+      "implementation.changed_files",
+      "plan.allowed_paths",
+      "POLICY: harden Gate B publication boundary",
+      "sole required parent",
+      "unchanged untracked-document snapshot",
+      "git commit --amend --no-edit",
+      "exact nine-path implementation delta",
+      "fixed-parent 63-path union",
+      "118-path/75-claim",
+      "exact safe nine verification commands",
+      "ten unique area reviews",
+      "15-file snapshot",
+      "git diff --name-only -z --no-renames",
+      "credential-free environment",
+      "bounded Buffer",
+      "fatal UTF-8 decoder",
+      "preserving leading BOM bytes as pathname identity",
+      "`GIT_NO_REPLACE_OBJECTS=1` disables replacement refs",
+      "normal command results remain string-only",
+      "immediately before push",
+    ],
+    process: [
+      "216e6d739155aa1dc5bab11829f56869e6f494ff",
+      "empty index",
+      "40-path untracked documentation name/content-hash manifest byte-for-byte",
+      "git add --",
+      "implementation.changed_files",
+      "plan.allowed_paths",
+      "POLICY: harden Gate B publication boundary",
+      "sole parent",
+      "unchanged untracked-document snapshot",
+      "git commit --amend --no-edit",
+      "exact nine-path implementation delta",
+      "fixed-parent 63-path union",
+      "118-path/75-claim",
+      "exact safe nine verification commands",
+      "ten unique clean area reviews",
+      "15-file snapshot",
+      "git diff --name-only -z --no-renames",
+      "credential-free environment",
+      "bounded Buffer",
+      "fatal UTF-8 decoder",
+      "preserving leading BOM bytes as pathname identity",
+      "`GIT_NO_REPLACE_OBJECTS=1` disables replacement refs",
+      "normal command results remain string-only",
+      "immediately before push",
+    ],
+    implement: [
+      "216e6d739155aa1dc5bab11829f56869e6f494ff",
+      "empty index",
+      "preserved pre-existing untracked-document snapshot",
+      "git add --",
+      "implementation.changed_files",
+      "plan.allowed_paths",
+      "POLICY: harden Gate B publication boundary",
+      "sole required parent",
+      "git commit --amend --no-edit",
+      "exact nine-path delta",
+      "fixed-parent 63-path union",
+      "prior candidate-bound precommit evidence",
+      "final candidate head",
+    ],
+  };
+  for (const [name, clauses] of Object.entries(requiredBySource)) {
+    const source = String(sources[name] ?? "").replace(/\s+/gu, " ");
+    for (const clause of clauses) {
+      if (!source.includes(clause)) {
+        issues.push(
+          `Attended commit contract '${name}' must contain: ${clause}`,
+        );
+      }
+    }
+    if (!/no agent role commits|agent roles do not commit/iu.test(source)) {
+      issues.push(
+        `Attended commit contract '${name}' must prohibit agent commits.`,
+      );
+    }
+    if (!/no GitHub command/iu.test(source)) {
+      issues.push(
+        `Attended commit contract '${name}' must prohibit GitHub commands.`,
+      );
+    }
+  }
   return issues;
 }
 
@@ -454,18 +843,19 @@ function validatePublicationAuthorizationSchema(source, issues) {
       "Publication authorization schema must expose exactly the closed non-secret authority fields.",
     );
   }
-  const modes = schema?.properties?.credential_mode?.enum;
-  if (
-    JSON.stringify(modes) !== JSON.stringify(["automated-app", "attended-user"])
-  ) {
+  if (schema?.properties?.credential_mode?.const !== "attended-user") {
     issues.push(
-      "Publication authorization schema must expose exactly the automated-app and attended-user modes.",
+      "Publication authorization schema must expose only attended-user mode.",
     );
   }
-  for (const name of ["automatedAppPrincipal", "attendedUserPrincipal"]) {
-    if (schema?.$defs?.[name]?.additionalProperties !== false) {
-      issues.push(`Publication authorization ${name} must be closed.`);
-    }
+  if (
+    schema?.properties?.principal?.$ref !== "#/$defs/attendedUserPrincipal" ||
+    schema?.$defs?.attendedUserPrincipal?.additionalProperties !== false ||
+    schema?.$defs?.automatedAppPrincipal !== undefined
+  ) {
+    issues.push(
+      "Publication authorization schema must expose only the closed github-user principal.",
+    );
   }
   const serializedNames = collectSchemaPropertyNames(schema);
   const secretNames = serializedNames.filter(
@@ -520,6 +910,113 @@ export function validateVerificationCommands(commands, issues = []) {
   return issues;
 }
 
+const verifierConsumerPaths = {
+  package: "package.json",
+  workflow: ".github/workflows/ci.yml",
+  root: "AGENTS.md",
+  verifierSkill: ".agents/skills/verify-change/SKILL.md",
+  process: "docs/AI_CHANGE_PROCESS.md",
+  testingMap: "docs/architecture/testing-map.md",
+  verifier: "scripts/ai-change/verify.mjs",
+};
+
+export function validateVerifierConsumers(repoRoot, issues = []) {
+  const sources = Object.fromEntries(
+    Object.entries(verifierConsumerPaths).map(([name, relativePath]) => [
+      name,
+      fs.readFileSync(path.join(repoRoot, relativePath), "utf8"),
+    ]),
+  );
+  return validateVerifierConsumerSources(sources, issues);
+}
+
+export function validateVerifierConsumerSources(sources, issues = []) {
+  const canonical =
+    "npm run --silent verify -- --plan <accepted-plan.json> --base-sha <local-change-base-sha> --head-sha <candidate-head-sha>";
+  let packageJson;
+  try {
+    packageJson = JSON.parse(sources.package);
+  } catch {
+    issues.push("Verifier package consumer must be valid JSON.");
+    return issues;
+  }
+  if (
+    packageJson.scripts?.verify !== "node scripts/ai-change/verify.mjs" ||
+    Object.hasOwn(packageJson.scripts ?? {}, "verify:policy")
+  ) {
+    issues.push(
+      "Package scripts must expose only the plan-aware full verifier entry.",
+    );
+  }
+  const workflow = String(sources.workflow ?? "");
+  for (const command of [
+    "node scripts/ai-change/validate-process.mjs",
+    "npm run format:check",
+    "npm run lint",
+  ]) {
+    if (!workflow.includes(`- run: ${command}`)) {
+      issues.push(`Public CI policy job must run directly: ${command}`);
+    }
+  }
+  if (/verify\.mjs|verify:policy/u.test(workflow)) {
+    issues.push(
+      "Public CI must not invoke the accepted-plan verifier or an alias.",
+    );
+  }
+  for (const name of ["root", "verifierSkill", "process", "testingMap"]) {
+    const source = String(sources[name] ?? "");
+    if (!source.includes(canonical)) {
+      issues.push(
+        `Verifier consumer '${name}' must document the canonical full entry.`,
+      );
+    }
+    if (
+      /npm run verify\b/u.test(source) ||
+      /npm --silent run verify\b/u.test(source) ||
+      /npm run --(?!silent\b)[^\s`]+\s+verify\b/u.test(source) ||
+      /npm run --silent verify(?! -- --plan)/u.test(source)
+    ) {
+      issues.push(
+        `Verifier consumer '${name}' contains a noncanonical invocation.`,
+      );
+    }
+    for (const clause of ["unconditionally full", "sole artifact to stdout"]) {
+      if (!source.includes(clause)) {
+        issues.push(`Verifier consumer '${name}' must state: ${clause}`);
+      }
+    }
+  }
+  const verifier = String(sources.verifier ?? "");
+  for (const clause of [
+    'validateArtifact("plan", acceptedPlan)',
+    "localBaseSha",
+    "acceptedPlan.base_sha",
+    "await readHead()",
+    "acceptedPlan.verification",
+    "plan.map(displayCommand)",
+    '"--plan"',
+    '"--base-sha"',
+    '"--head-sha"',
+    'scope: "full"',
+    "process.stdout.write(rendered);",
+    "Duplicate verification argument",
+  ]) {
+    if (!verifier.includes(clause)) {
+      issues.push(
+        `Production verifier must contain plan-aware boundary: ${clause}`,
+      );
+    }
+  }
+  for (const forbidden of [/"--scope"/u, /"--output"/u, /fs\.writeFile/u]) {
+    if (forbidden.test(verifier)) {
+      issues.push(
+        `Production verifier contains forbidden caller authority: ${forbidden}`,
+      );
+    }
+  }
+  return issues;
+}
+
 export function validateGateBArtifactBundle({ snapshot }) {
   if (!snapshot || typeof snapshot !== "object" || !snapshot.files) {
     throw new Error(
@@ -536,22 +1033,14 @@ export function validateGateBArtifactBundle({ snapshot }) {
   requireExactSet(roles, GATE_B_REVIEW_ROLES, "Gate B plan review roles");
   requireEqual(
     plan.allowed_paths.length,
-    113,
+    GATE_B_ALLOWED_PATH_COUNT,
     "Gate B plan allowed path count",
   );
   requireEqual(plan.claims.length, 75, "Gate B plan claim count");
   const areaReviewNames = roles.map((role) => `${role}.json`);
-  const expectedNames = [
-    planName,
-    planReviewName,
-    implementationName,
-    verificationName,
-    ...areaReviewNames,
-    aggregateReviewName,
-  ].sort();
   requireExactSet(
     Object.keys(snapshot.files).sort(),
-    expectedNames,
+    GATE_B_ARTIFACT_NAMES,
     "Gate B artifact filenames",
   );
 
@@ -653,6 +1142,7 @@ export function validateGateBArtifactBundle({ snapshot }) {
     plan.allowed_paths,
     "Gate B implementation changed paths",
   );
+  const allowedPaths = Object.freeze([...plan.allowed_paths].sort());
   requireEqual(
     new Set([
       planReview.run_id,
@@ -722,6 +1212,7 @@ export function validateGateBArtifactBundle({ snapshot }) {
     headSha: implementation.head_sha,
     planningHeadSha: plan.head_sha,
     localChangeBaseSha: plan.base_sha,
+    allowedPaths,
     planSha256,
     implementationSha256,
   };
@@ -2053,7 +2544,9 @@ function validateSkillReferences(
       );
     }
   }
-  for (const match of body.matchAll(/\bnpm\s+run\s+([A-Za-z0-9:_-]+)/gu)) {
+  for (const match of body.matchAll(
+    /\bnpm\s+run\s+(?:--silent\s+)?([A-Za-z0-9:_-]+)/gu,
+  )) {
     if (!packageScripts.has(match[1])) {
       issues.push(
         `Skill '${path.basename(path.dirname(skillPath))}' references missing npm script '${match[1]}'.`,

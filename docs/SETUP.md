@@ -93,9 +93,14 @@ captured stdout/stderr from probes, service unit write paths, and health-check
 failure context.
 
 Cloudx binds to `127.0.0.1` as a hard security boundary. For a
-tailnet-authenticated path, proxy the loopback service with Tailscale Serve:
+tailnet-authenticated path, add the exact externally visible origin to the
+installed environment file, restart Cloudx, and proxy the loopback service with
+Tailscale Serve:
 
 ```bash
+printf '%s\n' 'CLOUDX_TRUSTED_ORIGINS=https://build-host.example.ts.net' \
+  >> ~/.config/cloudx/cloudx.env
+systemctl --user restart cloudx.service
 tailscale serve --bg https+insecure://localhost:3001
 ```
 
@@ -327,6 +332,7 @@ default port, run the server and Vite dev server on alternate ports:
 ```bash
 CLOUDX_HOST=127.0.0.1 CLOUDX_PORT=4301 \
 CLOUDX_DOCUMENTATION_URL=http://127.0.0.1:4820 \
+CLOUDX_TRUSTED_ORIGINS=http://127.0.0.1:5178 \
   npm run dev -w @cloudx/server
 
 CLOUDX_WEB_PORT=5178 \
@@ -584,6 +590,9 @@ the certificate is trusted by the OS.
 For a private HTTPS tailnet URL:
 
 ```bash
+printf '%s\n' 'CLOUDX_TRUSTED_ORIGINS=https://build-host.example.ts.net' \
+  >> ~/.config/cloudx/cloudx.env
+systemctl --user restart cloudx.service
 tailscale serve --bg https+insecure://localhost:3001
 ```
 
@@ -595,6 +604,12 @@ authorization, and process isolation.
 - `CLOUDX_HOST`: loopback bind host, default `127.0.0.1`. Network-facing values
   are rejected; use an authenticated reverse proxy for remote access.
 - `CLOUDX_PORT`: server port, default `3001`.
+- `CLOUDX_TRUSTED_ORIGINS`: comma-separated additional canonical HTTP(S)
+  origins for Vite and authenticated reverse proxies. Do not include a trailing
+  slash or repeat the listener origin. Absence means no extras; a present empty
+  value, empty element, duplicate, or noncanonical origin fails startup. This
+  intentionally rejects unconfigured loopback aliases, alternate ports, Vite
+  origins, and reverse-proxy authorities.
 - `CLOUDX_LOG_LEVEL`: server log level, one of `fatal`, `error`, `warn`,
   `info`, `debug`, `trace`, or `silent`; default `info`. Use `debug` or
   `trace` when collecting runtime diagnostics for plugin installation, plugin
@@ -662,7 +677,7 @@ ASR options:
 - `CLOUDX_ASR_WHISPER_CPP_ARGS`: optional explicit extra `whisper-cli`
   arguments.
 - `CLOUDX_ASR_LANGUAGE`: language code, default `en`; use `auto` for detection.
-- `CLOUDX_ASR_CPU_THREADS`: CPU threads, from `0` through `32`.
+- `CLOUDX_ASR_CPU_THREADS`: CPU threads, from `1` through `32`.
 - `CLOUDX_ASR_NUM_WORKERS`: Faster Whisper worker count, default `1`; must be
   from `1` through `32`.
 - `CLOUDX_ASR_INFERENCE_CONCURRENCY`: maximum concurrent inference jobs;

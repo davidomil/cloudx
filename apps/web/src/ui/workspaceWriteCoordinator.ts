@@ -8,6 +8,7 @@ interface PendingLayoutWrite {
 export class WorkspaceWriteCoordinator {
   private tail: Promise<void> = Promise.resolve();
   private pendingLayout: PendingLayoutWrite | undefined;
+  private activeLayout: PendingLayoutWrite | undefined;
   private timer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
@@ -47,6 +48,10 @@ export class WorkspaceWriteCoordinator {
     this.cancelPending();
   }
 
+  hasUnsettledLayoutWrite(): boolean {
+    return this.pendingLayout !== undefined || this.activeLayout !== undefined;
+  }
+
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
     const run = this.tail.then(operation);
     this.tail = run.then(() => undefined, () => undefined);
@@ -58,7 +63,17 @@ export class WorkspaceWriteCoordinator {
       this.clearTimer();
       const pending = this.pendingLayout;
       this.pendingLayout = undefined;
-      await this.persistLayout(pending.windowId, pending.layout);
+      this.activeLayout = pending;
+      try {
+        await this.persistLayout(pending.windowId, pending.layout);
+      } catch (error) {
+        this.pendingLayout ??= pending;
+        throw error;
+      } finally {
+        if (this.activeLayout === pending) {
+          this.activeLayout = undefined;
+        }
+      }
     }
   }
 

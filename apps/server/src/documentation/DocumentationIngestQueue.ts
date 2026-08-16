@@ -100,6 +100,10 @@ export class DocumentationIngestQueueStoppedError extends Error {
 
 export class DocumentationIngestAdmission {
   private state: "reserved" | "consumed" | "released" = "reserved";
+  private readonly controller = new AbortController();
+  private preEnqueueStarted = false;
+  private preEnqueueSettled = false;
+  private preEnqueueSettlement: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly owner: DocumentationIngestQueue,
@@ -111,12 +115,45 @@ export class DocumentationIngestAdmission {
     return this.state === "reserved";
   }
 
+  runBeforeEnqueue<T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    if (this.state !== "reserved" || this.preEnqueueStarted) {
+      throw new Error("Documentation ingest admission was already used.");
+    }
+    this.preEnqueueStarted = true;
+    const execution = Promise.resolve().then(() => operation(this.controller.signal));
+    this.preEnqueueSettlement = execution.then(
+      () => {
+        this.preEnqueueSettled = true;
+      },
+      () => {
+        this.preEnqueueSettled = true;
+      }
+    );
+    return execution;
+  }
+
   release(): void {
     if (this.state !== "reserved") {
       return;
     }
+    if (this.preEnqueueStarted && !this.preEnqueueSettled) {
+      void this.abortAndRelease(new DocumentationIngestQueueStoppedError());
+      return;
+    }
     this.state = "released";
     this.releaseCapacity();
+  }
+
+  async abortAndRelease(reason: Error): Promise<void> {
+    if (this.state !== "reserved") {
+      return;
+    }
+    this.controller.abort(reason);
+    await this.preEnqueueSettlement;
+    if (this.state === "reserved") {
+      this.state = "released";
+      this.releaseCapacity();
+    }
   }
 
   consume(owner: DocumentationIngestQueue, bytes: number): void {
@@ -125,6 +162,9 @@ export class DocumentationIngestAdmission {
     }
     if (this.state !== "reserved") {
       throw new Error("Documentation ingest admission was already used.");
+    }
+    if (this.controller.signal.aborted || (this.preEnqueueStarted && !this.preEnqueueSettled)) {
+      throw new DocumentationIngestQueueStoppedError();
     }
     this.state = "consumed";
   }
@@ -256,13 +296,12 @@ export class DocumentationIngestQueue {
       return this.disposePromise;
     }
     this.disposed = true;
-    for (const admission of [...this.admissions]) {
-      admission.release();
-    }
+    const stopped = new DocumentationIngestQueueStoppedError();
+    const admissionShutdown = Promise.all([...this.admissions].map((admission) => admission.abortAndRelease(stopped)));
     for (const controller of this.jobControllers.values()) {
-      controller.abort(new DocumentationIngestQueueStoppedError());
+      controller.abort(stopped);
     }
-    this.disposePromise = this.tail.then(() => undefined);
+    this.disposePromise = Promise.all([admissionShutdown, this.tail]).then(() => undefined);
     return this.disposePromise;
   }
 

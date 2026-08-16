@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   CUDA_12_MIN_DRIVER_VERSION,
@@ -87,6 +87,40 @@ describe("install-cloudx helpers", () => {
     expect(setup).toContain(
       "node scripts/install-cloudx.mjs --answers ./answers.json --yes",
     );
+  });
+
+  it("documents trusted tailnet origin and restart before starting Tailscale Serve", () => {
+    const security = fs.readFileSync(
+      path.join(process.cwd(), "docs/SECURITY_MODEL.md"),
+      "utf8",
+    );
+    const section = security.slice(
+      security.indexOf("## Authenticated Tailnet Access"),
+      security.indexOf("## Reverse Proxy Guidance"),
+    );
+    const trustedOrigin = section.indexOf(
+      "CLOUDX_TRUSTED_ORIGINS=https://build-host.example.ts.net",
+    );
+    const restart = section.indexOf("systemctl --user restart cloudx.service");
+    const serve = section.indexOf(
+      "tailscale serve --bg https+insecure://localhost:3001",
+    );
+
+    expect(trustedOrigin).toBeGreaterThan(-1);
+    expect(restart).toBeGreaterThan(trustedOrigin);
+    expect(serve).toBeGreaterThan(restart);
+    expect(section).toMatch(/tailnet grants or ACLs/u);
+  });
+
+  it("documents the exact ASR CPU thread range accepted by production", () => {
+    const setup = fs.readFileSync(
+      path.join(process.cwd(), "docs/SETUP.md"),
+      "utf8",
+    );
+    const row = setup.match(/- `CLOUDX_ASR_CPU_THREADS`:[^\n]*(?:\n  [^\n]*)?/u)?.[0];
+
+    expect(row).toContain("from `1` through `32`");
+    expect(row).not.toContain("from `0`");
   });
 
   it("runs documentation setup with only the installer-owned pinned uv executable", () => {
@@ -348,6 +382,36 @@ describe("install-cloudx helpers", () => {
       ["sudo", "apt-get", "update"],
       ["sudo", "apt-get", "install", "-y", "git"],
     ]);
+  });
+
+  it("fails an unsupported Git prerequisite when the operator declines the upgrade", async () => {
+    const planned = [];
+
+    await expect(ensureSupportedGit(
+      {
+        exists: () => true,
+        capture: () => "git version 2.34.1",
+        run: (command, args) => planned.push([command, ...args]),
+      },
+      { boolean: async () => false },
+    )).rejects.toThrow(/Git .*2\.34\.1.*2\.36\.0|unsupported Git/i);
+
+    expect(planned).toEqual([]);
+  });
+
+  it("does not prompt to upgrade an already supported Git", async () => {
+    const prompt = { boolean: vi.fn() };
+
+    await expect(ensureSupportedGit(
+      {
+        exists: () => true,
+        capture: () => `git version ${MIN_WORKTREE_GIT_VERSION}`,
+        run: vi.fn(),
+      },
+      prompt,
+    )).resolves.toMatchObject({ upgraded: false });
+
+    expect(prompt.boolean).not.toHaveBeenCalled();
   });
 
   it("checks current Node and npm before building a direct wizard bootstrap plan", () => {
@@ -732,6 +796,114 @@ describe("install-cloudx helpers", () => {
     expect(shellScript).toContain("export CLOUDX_INSTALL_VERBOSE=1");
     expect(shellScript).toContain("set -x");
     expect(shellScript).toContain('exec node scripts/install-cloudx.mjs "$@"');
+  });
+});
+
+describe("runInstaller prerequisites", () => {
+  it("stops the production installer before later work when an unsupported Git upgrade is declined", async () => {
+    class RecordingInstallerRunner extends InstallerRunner {
+      constructor() {
+        super({ dryRun: false, cwd: "/repo", log: () => undefined });
+        this.trace = [];
+      }
+
+      run(command, args = [], options = {}) {
+        this.trace.push(`run ${[command, ...args].join(" ")}`);
+        this.commands.push({ command, args, cwd: options.cwd ?? this.cwd });
+        return "";
+      }
+
+      capture(command, args = [], options = {}) {
+        this.trace.push(`capture ${[command, ...args].join(" ")}`);
+        this.commands.push({ command, args, cwd: options.cwd ?? this.cwd, capture: true });
+        if (command === "git" && args.length === 1 && args[0] === "--version") {
+          return "git version 2.34.1";
+        }
+        throw new Error(`unexpected capture: ${[command, ...args].join(" ")}`);
+      }
+
+      statusOk(command, args = []) {
+        this.trace.push(`statusOk ${[command, ...args].join(" ")}`);
+        return false;
+      }
+
+      writeFile(filePath, contents) {
+        this.trace.push(`writeFile ${filePath}`);
+        this.writes.push({ path: filePath, contents });
+      }
+
+      mkdir(dirPath) {
+        this.trace.push(`mkdir ${dirPath}`);
+      }
+
+      removePath(targetPath) {
+        this.trace.push(`removePath ${targetPath}`);
+      }
+
+      spawnCaptured(command, args = []) {
+        this.trace.push(`spawnCaptured ${[command, ...args].join(" ")}`);
+        throw new Error("production reached the real subprocess primitive");
+      }
+    }
+
+    const runner = new RecordingInstallerRunner();
+    const consoleLog = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    let fulfillment = "pending";
+    const install = runInstaller({
+      repoRoot: "/repo",
+      home: "/home/me",
+      env: { ...TEST_ENV, CLOUDX_INSTALL_BOOTSTRAPPED: "1" },
+      dryRun: false,
+      yes: true,
+      runner,
+      osRelease: {
+        ID: "ubuntu",
+        VERSION_ID: "24.04",
+        PRETTY_NAME: "Ubuntu 24.04 LTS",
+      },
+      gpuDetected: false,
+      cudaRuntimeReady: false,
+      intelGpuDetected: false,
+      parallelism: 12,
+      answers: { upgradeGit: false },
+      networkInterfaces: {
+        eth0: [{ family: "IPv4", internal: false, address: "192.0.2.249" }],
+      },
+    }).then((value) => {
+      fulfillment = "fulfilled";
+      return value;
+    });
+
+    try {
+      await expect(install).rejects.toThrow(
+        `Cloudx requires Git ${MIN_WORKTREE_GIT_VERSION} or newer; the unsupported Git upgrade was declined.`,
+      );
+      expect(fulfillment).toBe("pending");
+      expect(runner.trace).toEqual([
+        "run node -v",
+        "run npm -v",
+        "capture git --version",
+      ]);
+      expect(runner.commands).toEqual([
+        { command: "node", args: ["-v"], cwd: "/repo" },
+        { command: "npm", args: ["-v"], cwd: "/repo" },
+        {
+          command: "git",
+          args: ["--version"],
+          cwd: "/repo",
+          capture: true,
+        },
+      ]);
+      expect(runner.writes).toEqual([]);
+      expect(runner.trace.join("\n")).not.toMatch(
+        /statusOk|writeFile|mkdir|removePath|spawnCaptured|npm (?:i|ci|run)|\buv\b|\bhf\b|cert|systemctl|curl|service/iu,
+      );
+      expect(consoleLog.mock.calls.flat().join("\n")).not.toMatch(
+        /Cloudx (?:installer|update) complete/u,
+      );
+    } finally {
+      consoleLog.mockRestore();
+    }
   });
 });
 

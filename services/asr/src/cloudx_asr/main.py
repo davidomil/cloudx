@@ -452,6 +452,10 @@ def get_inference_executor() -> InferenceExecutor:
         return _inference_executor
 
 
+async def acquire_inference_executor() -> InferenceExecutor:
+    return await asyncio.to_thread(get_inference_executor)
+
+
 def close_inference_executor() -> None:
     global _inference_executor
     with _inference_executor_lock:
@@ -461,7 +465,11 @@ def close_inference_executor() -> None:
         executor.close()
 
 
-app.router.add_event_handler("shutdown", close_inference_executor)
+async def shutdown_inference_executor() -> None:
+    await asyncio.to_thread(close_inference_executor)
+
+
+app.router.add_event_handler("shutdown", shutdown_inference_executor)
 
 
 @dataclass
@@ -505,7 +513,7 @@ def health() -> dict[str, str]:
 async def ready() -> dict[str, str]:
     try:
         audio_upload_max_bytes()
-        executor = await asyncio.to_thread(get_inference_executor)
+        executor = await acquire_inference_executor()
         if not executor.ready():
             raise InferenceBackendUnavailable("ASR inference worker is unavailable.")
     except Exception as error:
@@ -707,7 +715,8 @@ async def transcribe(
             raise HTTPException(status_code=400, detail=str(error)) from error
         try:
             inference_path = temp_path
-            inference = get_inference_executor().submit(
+            executor = await acquire_inference_executor()
+            inference = executor.submit(
                 inference_path,
                 cleanup=lambda: inference_path.unlink(missing_ok=True),
             )
@@ -824,7 +833,8 @@ async def transcribe_ws(websocket: WebSocket) -> None:
         partial_inference: InferenceJob | None = None
         try:
             inference_path = partial_path
-            partial_inference = get_inference_executor().submit(
+            executor = await acquire_inference_executor()
+            partial_inference = executor.submit(
                 inference_path,
                 partial_beam_size(),
                 cleanup=lambda: inference_path.unlink(missing_ok=True),
@@ -853,6 +863,27 @@ async def transcribe_ws(websocket: WebSocket) -> None:
                 **transcript_log_fields(text),
             )
             await send_json({"type": "partial", "text": text})
+
+    async def settle_partial_snapshot() -> None:
+        nonlocal partial_task
+        task = partial_task
+        partial_task = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        settlement = asyncio.gather(task, return_exceptions=True)
+        caller_cancelled = False
+        while not settlement.done():
+            try:
+                await asyncio.shield(settlement)
+            except asyncio.CancelledError:
+                caller_cancelled = True
+        child_result = settlement.result()[0]
+        if isinstance(child_result, Exception):
+            logger.debug("ASR partial transcription cleanup failed: %s", child_result)
+        if caller_cancelled:
+            raise asyncio.CancelledError()
 
     def maybe_start_partial_snapshot() -> None:
         nonlocal last_partial_at, partial_task
@@ -918,8 +949,7 @@ async def transcribe_ws(websocket: WebSocket) -> None:
         temp_file.close()
         temp_file = None
         await send_json({"type": "status", "status": "transcribing"})
-        if partial_task is not None and not partial_task.done():
-            await partial_task
+        await settle_partial_snapshot()
         try:
             validate_audio_size(total_bytes)
         except InvalidAudioInput as error:
@@ -934,7 +964,8 @@ async def transcribe_ws(websocket: WebSocket) -> None:
             await send_json({"type": "error", "message": str(error)})
             return
         inference_path = temp_path
-        inference = get_inference_executor().submit(
+        executor = await acquire_inference_executor()
+        inference = executor.submit(
             inference_path,
             cleanup=lambda: inference_path.unlink(missing_ok=True),
         )
@@ -985,15 +1016,7 @@ async def transcribe_ws(websocket: WebSocket) -> None:
         )
         await send_json({"type": "error", "message": str(error)})
     finally:
-        if partial_task is not None:
-            if not partial_task.done():
-                partial_task.cancel()
-            try:
-                await partial_task
-            except asyncio.CancelledError:
-                pass
-            except Exception as error:
-                logger.debug("ASR partial transcription cleanup failed: %s", error)
+        await settle_partial_snapshot()
         if temp_file is not None:
             temp_file.close()
         if temp_path is not None:

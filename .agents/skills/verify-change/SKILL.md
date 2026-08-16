@@ -35,7 +35,9 @@ Production accepts no transport selector and is recursively frozen to
 `https://github.com/davidomil/cloudx`. A frozen direct-test-only loopback
 descriptor uses the same empty-template audited bare
 Git core and proves an exact Basic challenge before real `git http-backend`
-receive-pack. Authenticated Git uses explicit `--git-dir`, reset helpers and
+receive-pack. The direct-test entry requires an explicit frozen loopback
+descriptor before accepting injected dependencies and cannot select or default
+to the production transport. Authenticated Git uses explicit `--git-dir`, reset helpers and
 headers, disabled hooks, and the sole `--no-verify` exact lease. Cleanup runs
 exactly once. Verification cannot alter the exact four-field published or
 manual-reconciliation result, the fixed bounded pre-push diagnostic, or the
@@ -47,10 +49,10 @@ sorted, two-space-indented, final-LF bytes form a regular nonsymlink file of at
 most 32 KiB outside the artifact directory. `--authorization-file` and
 `--authorized-publication-sha256` bind it independently from
 `--authorized-manifest-sha256`. Its grant lasts at most 15 minutes and binds identity,
-policy, bundle, nonce, and exactly one `automated-app` or `attended-user`
+policy, bundle, nonce, and only an `attended-user` mode with a `github-user`
 principal. The sole secret is `CLOUDX_GATE_B_TOKEN`, pinned to child `GH_TOKEN`
 and never available to verification. `$ship-change` alone may invoke
-`node scripts/ai-change/publish-gate-b.mjs --artifact-dir <bundle> --authorized-manifest-sha256 <sha256> --authorization-file <path> --authorized-publication-sha256 <sha256> --credential-mode <automated-app|attended-user> --expected-old-head <sha>`
+`node scripts/ai-change/publish-gate-b.mjs --artifact-dir <bundle> --authorized-manifest-sha256 <sha256> --authorization-file <path> --authorized-publication-sha256 <sha256> --credential-mode attended-user --expected-old-head <sha>`
 for at most one exact expected-old
 `--force-with-lease=refs/heads/architecture-and-new-codex:<expectedOldCandidateSha>`
 update.
@@ -59,13 +61,20 @@ update.
    `scripts/ai-change/artifact-validation.mjs` before invoking any command runner.
    A rejected command starts no process. Verification never publishes, pushes,
    or mutates GitHub.
-2. Record the worktree digest, then run each accepted command exactly as planned
+2. Require the explicit local base to equal `plan.base_sha`, require actual HEAD
+   to equal the explicit candidate head, and require the accepted verification
+   list to equal the exact nine deterministic command objects. Invoke only
+   `npm run --silent verify -- --plan <accepted-plan.json> --base-sha <local-change-base-sha> --head-sha <candidate-head-sha>`.
+   The production verifier is unconditionally full, accepts no `--scope` or
+   `--output`, rejects duplicate arguments before plan or HEAD work, and emits
+   its sole artifact to stdout.
+3. Record the worktree digest, then run each accepted command exactly as planned
    with no model substitution.
-3. Preserve each exit code and stdout/stderr digest, record the final worktree
+4. Preserve each exit code and stdout/stderr digest, record the final worktree
    digest, and validate the result with `validateArtifact("verification", result)`.
-4. Any command failure, tree change, incomplete command set, or semantic
+5. Any command failure, tree change, incomplete command set, or semantic
    rejection fails verification. This role grants no publication authority.
-5. Before the push, publisher rejection starts zero publication commands. After
+6. Before the push, publisher rejection starts zero publication commands. After
    the sole push starts, `outcome=manual-reconciliation-required`,
    `pushAttempts=1`, `retry=false`, and `reviewPrHandoff=false`; verification
    cannot alter that outcome. Human-required paths remain human reviewed and no

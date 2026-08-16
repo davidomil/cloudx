@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { TextDecoder } from "node:util";
 
 import {
   GATE_B_CANDIDATE_REF,
+  GATE_B_ARTIFACT_NAMES,
   GATE_B_COMMIT_SUBJECTS,
   GATE_B_EXPECTED_OLD_CANDIDATE_SHA,
   GATE_B_EXPECTED_TARGET_BASE_SHA,
@@ -37,6 +39,15 @@ const gitSha = /^[a-f0-9]{40}$/u;
 const sha256Pattern = /^[a-f0-9]{64}$/u;
 const publicationAuthorizationMaxBytes = 32 * 1024;
 const publicationGrantLifetimeMs = 15 * 60 * 1000;
+const artifactFileMaxBytes = 1024 * 1024;
+const artifactBundleMaxBytes = 8 * 1024 * 1024;
+const commandMaxBufferBytes = 2 * 1024 * 1024;
+const commandDefaultTimeoutMs = 60_000;
+const commandExitDrainMs = 25;
+const commandTerminationGraceMs = 250;
+const commandKillSettlementMs = 1_000;
+const commandCloseSettlementMs = 1_000;
+const commandPollMs = 10;
 const prePushDiagnostic = "Gate B publication rejected before push.\n";
 const publishedResult = Object.freeze({
   outcome: "published",
@@ -59,27 +70,160 @@ const productionTransport = deepFreeze({
     path: "davidomil/cloudx",
   },
 });
+const productionExecutables = deepFreeze({
+  git: "/usr/bin/git",
+  gh: "/usr/bin/gh",
+});
+const credentialFreeGitEnvironment = deepFreeze({
+  GCM_INTERACTIVE: "Never",
+  GIT_ASKPASS: "/bin/false",
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_CONFIG_SYSTEM: "/dev/null",
+  GIT_NO_REPLACE_OBJECTS: "1",
+  GIT_TERMINAL_PROMPT: "0",
+  LANG: "C",
+  LC_ALL: "C",
+  NO_COLOR: "1",
+  PATH: "/usr/bin:/bin",
+  SSH_ASKPASS: "/bin/false",
+});
 
 export function readGateBArtifactSnapshot(artifactDir) {
   const directory = path.resolve(artifactDir);
-  const names = fs.readdirSync(directory).sort();
-  const files = Object.fromEntries(
-    names.map((name) => {
+  const names = readCanonicalArtifactNames(directory);
+  const opened = [];
+  let aggregateBytes = 0;
+  try {
+    for (const name of names) {
       const filePath = path.join(directory, name);
-      const stat = fs.lstatSync(filePath);
-      if (!stat.isFile() || stat.isSymbolicLink()) {
-        throw new Error(`Gate B artifact must be a regular file: ${name}`);
+      let descriptor;
+      try {
+        descriptor = fs.openSync(
+          filePath,
+          fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW,
+        );
+      } catch (error) {
+        throw new Error(
+          `Gate B artifact must be a regular nonsymlink file: ${name}`,
+          {
+            cause: error,
+          },
+        );
       }
-      return [name, fs.readFileSync(filePath)];
-    }),
-  );
-  const manifest = artifactManifest(files);
-  return {
-    directory,
-    files,
-    manifest,
-    manifestSha256: sha256(manifest),
-  };
+      const openedFile = { descriptor, filePath, name };
+      opened.push(openedFile);
+      const pathStat = fs.lstatSync(filePath, { bigint: true });
+      const stat = fs.fstatSync(descriptor, { bigint: true });
+      requireStableRegularArtifact(stat, pathStat, name);
+      const size = Number(stat.size);
+      if (
+        !Number.isSafeInteger(size) ||
+        size < 0 ||
+        size > artifactFileMaxBytes
+      ) {
+        throw new Error(
+          `Gate B artifact exceeds the 1 MiB file limit: ${name}`,
+        );
+      }
+      if (!Number.isSafeInteger(aggregateBytes + size)) {
+        throw new Error(
+          "Gate B artifact aggregate size is not safely representable.",
+        );
+      }
+      aggregateBytes += size;
+      if (aggregateBytes > artifactBundleMaxBytes) {
+        throw new Error("Gate B artifacts exceed the 8 MiB aggregate limit.");
+      }
+      openedFile.stat = stat;
+      openedFile.size = size;
+    }
+
+    const files = {};
+    for (const openedFile of opened) {
+      const bytes = Buffer.alloc(openedFile.size);
+      let offset = 0;
+      while (offset < bytes.length) {
+        const read = fs.readSync(
+          openedFile.descriptor,
+          bytes,
+          offset,
+          bytes.length - offset,
+          offset,
+        );
+        if (
+          !Number.isSafeInteger(read) ||
+          read < 1 ||
+          read > bytes.length - offset
+        ) {
+          throw new Error(
+            `Gate B artifact descriptor returned a short read: ${openedFile.name}`,
+          );
+        }
+        offset += read;
+      }
+      const postStat = fs.fstatSync(openedFile.descriptor, { bigint: true });
+      const postPathStat = fs.lstatSync(openedFile.filePath, { bigint: true });
+      requireStableArtifactMetadata(openedFile.stat, postStat, openedFile.name);
+      requireStableRegularArtifact(postStat, postPathStat, openedFile.name);
+      files[openedFile.name] = bytes;
+    }
+    const manifest = artifactManifest(files);
+    return {
+      directory,
+      files,
+      manifest,
+      manifestSha256: sha256(manifest),
+    };
+  } finally {
+    for (const { descriptor } of opened) fs.closeSync(descriptor);
+  }
+}
+
+function readCanonicalArtifactNames(directory) {
+  const handle = fs.opendirSync(directory);
+  const names = [];
+  try {
+    while (names.length <= GATE_B_ARTIFACT_NAMES.length) {
+      const entry = handle.readSync();
+      if (!entry) break;
+      names.push(entry.name);
+    }
+  } finally {
+    handle.closeSync();
+  }
+  names.sort();
+  if (JSON.stringify(names) !== JSON.stringify(GATE_B_ARTIFACT_NAMES)) {
+    throw new Error(
+      "Gate B artifact directory must contain exactly the canonical 15 entries.",
+    );
+  }
+  return names;
+}
+
+function requireStableRegularArtifact(descriptorStat, pathStat, name) {
+  if (
+    !descriptorStat.isFile() ||
+    !pathStat.isFile() ||
+    pathStat.isSymbolicLink() ||
+    descriptorStat.dev !== pathStat.dev ||
+    descriptorStat.ino !== pathStat.ino
+  ) {
+    throw new Error(`Gate B artifact must be one stable regular file: ${name}`);
+  }
+}
+
+function requireStableArtifactMetadata(before, after, name) {
+  for (const property of ["dev", "ino", "size", "mtimeNs", "ctimeNs"]) {
+    if (before[property] !== after[property]) {
+      throw new Error(
+        `Gate B artifact changed during descriptor read: ${name}`,
+      );
+    }
+  }
+  if (!after.isFile()) {
+    throw new Error(`Gate B artifact must remain a regular file: ${name}`);
+  }
 }
 
 export function canonicalPublicationAuthorization(value) {
@@ -176,16 +320,37 @@ export function readPublicationAuthorizationSnapshot({
 
 export function publishGateBCandidate(options) {
   requireClosedOptions(options);
-  return publishCandidateWithTransport(options, productionTransport);
+  const executables = validateTrustedExecutables(productionExecutables);
+  return publishCandidateWithTransport(options, productionTransport, {
+    executables,
+    now: Date.now,
+    readToken: defaultTokenReader,
+    removeDirectory: defaultDirectoryRemover,
+    runCommand: defaultCommandRunner,
+  });
 }
 
-export function publishGateBCandidateForLoopbackTest(options, transport) {
-  requireClosedOptions(options);
+export function publishGateBCandidateForDirectTest(options, transport) {
   requireLoopbackTestTransport(transport);
-  return publishCandidateWithTransport(options, transport);
+  requireDirectTestOptions(options);
+  const {
+    executables = { git: "git", gh: "gh" },
+    now = Date.now,
+    readToken = defaultTokenReader,
+    removeDirectory = defaultDirectoryRemover,
+    runCommand = defaultCommandRunner,
+    ...publicationOptions
+  } = options;
+  return publishCandidateWithTransport(publicationOptions, transport, {
+    executables,
+    now,
+    readToken,
+    removeDirectory,
+    runCommand,
+  });
 }
 
-async function publishCandidateWithTransport(options, transport) {
+async function publishCandidateWithTransport(options, transport, dependencies) {
   const {
     artifactDir,
     authorizedManifestSha256,
@@ -193,11 +358,9 @@ async function publishCandidateWithTransport(options, transport) {
     authorizedPublicationSha256,
     credentialMode,
     expectedOldHead,
-    now = Date.now,
-    readToken = defaultTokenReader,
-    runCommand = defaultCommandRunner,
-    removeDirectory = defaultDirectoryRemover,
   } = options;
+  const { executables, now, readToken, removeDirectory, runCommand } =
+    dependencies;
 
   requirePublicationInputs({
     authorizedManifestSha256,
@@ -227,6 +390,12 @@ async function publishCandidateWithTransport(options, transport) {
     nowMs: currentTime(now),
   });
 
+  await validateCommittedCandidateDiff({
+    bundle,
+    gitExecutable: executables.git,
+    runCommand,
+  });
+
   const token = requireGateBToken(readToken());
   requireAuthorizedTokenFingerprint(
     token,
@@ -243,6 +412,7 @@ async function publishCandidateWithTransport(options, transport) {
       runCommand,
       token,
       transport,
+      executables,
     });
     terminalResult = await publishAuthorizedCandidate({
       artifactDir: snapshot.directory,
@@ -251,11 +421,13 @@ async function publishCandidateWithTransport(options, transport) {
       bundle,
       credentialMode,
       expectedOldHead,
+      gitExecutable: executables.git,
       markPushStarted() {
         pushStarted = true;
       },
       now,
       runAuthenticated: context.runAuthenticated,
+      runCommand,
       runLocal: context.runLocal,
       snapshot,
       transport,
@@ -285,9 +457,11 @@ async function publishAuthorizedCandidate({
   bundle,
   credentialMode,
   expectedOldHead,
+  gitExecutable,
   markPushStarted,
   now,
   runAuthenticated,
+  runCommand,
   runLocal,
   snapshot,
   transport,
@@ -338,7 +512,6 @@ async function publishAuthorizedCandidate({
   }
   await requireCredentialPrincipal(
     runAuthenticated.gh,
-    credentialMode,
     authorizationSnapshot.authorization.principal,
   );
   const repositoryIdentity = parseJsonObject(
@@ -417,6 +590,12 @@ async function publishAuthorizedCandidate({
     expectedOldHead,
     now,
     snapshot,
+  });
+
+  await validateCommittedCandidateDiff({
+    bundle,
+    gitExecutable,
+    runCommand,
   });
 
   markPushStarted();
@@ -505,9 +684,9 @@ function requirePublicationInputs({
     GATE_B_EXPECTED_OLD_CANDIDATE_SHA,
     "Gate B expected old candidate head",
   );
-  if (!new Set(["automated-app", "attended-user"]).has(credentialMode)) {
+  if (credentialMode !== "attended-user") {
     throw new Error(
-      "Gate B publication authorization requires one explicit credential mode.",
+      "Gate B publication authorization requires attended-user credential mode.",
     );
   }
 }
@@ -587,6 +766,7 @@ function requireGateBToken(value) {
 }
 
 async function createAuthenticatedCommandContext({
+  executables,
   removeDirectory,
   runCommand,
   token,
@@ -619,6 +799,7 @@ async function createAuthenticatedCommandContext({
       GIT_CONFIG_GLOBAL: "/dev/null",
       GIT_CONFIG_NOSYSTEM: "1",
       GIT_CONFIG_SYSTEM: "/dev/null",
+      GIT_NO_REPLACE_OBJECTS: "1",
       GIT_TERMINAL_PROMPT: "0",
       GIT_TEMPLATE_DIR: templateDirectory,
       SSH_ASKPASS: "/bin/false",
@@ -641,7 +822,7 @@ async function createAuthenticatedCommandContext({
 
     await checked(
       (command, args, options = {}) =>
-        runCommand(command, args, {
+        runCommand(executables.git, args, {
           ...options,
           cwd: root,
           env: localGitEnvironment,
@@ -659,14 +840,14 @@ async function createAuthenticatedCommandContext({
     requirePrivateDirectory(transportGitDirectory, "bare transport");
 
     const localGit = (command, args, options = {}) =>
-      runCommand(command, args, {
+      runCommand(executables.git, args, {
         ...options,
         cwd: process.cwd(),
         env: sourceEnvironment,
       });
     const bareGit = (command, args, options = {}) =>
       runCommand(
-        command,
+        executables.git,
         command === "git"
           ? [`--git-dir=${transportGitDirectory}`, ...args]
           : args,
@@ -678,7 +859,7 @@ async function createAuthenticatedCommandContext({
       );
     const authenticatedGit = (command, args, options = {}) =>
       runCommand(
-        command,
+        executables.git,
         command === "git"
           ? [
               `--git-dir=${transportGitDirectory}`,
@@ -693,7 +874,7 @@ async function createAuthenticatedCommandContext({
         },
       );
     const gh = (command, args, options = {}) =>
-      runCommand(command, args, {
+      runCommand(executables.gh, args, {
         ...options,
         cwd: root,
         env: ghEnvironment,
@@ -766,7 +947,7 @@ function commandEnvironment(root) {
     LANG: "C",
     LC_ALL: "C",
     NO_COLOR: "1",
-    PATH: process.env.PATH ?? "/usr/bin:/bin",
+    PATH: "/usr/bin:/bin",
     XDG_CONFIG_HOME: path.join(root, "config"),
     ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}),
   };
@@ -872,6 +1053,26 @@ function requireClosedOptions(options) {
     "authorizedPublicationSha256",
     "credentialMode",
     "expectedOldHead",
+  ];
+  if (
+    !options ||
+    typeof options !== "object" ||
+    Array.isArray(options) ||
+    Object.keys(options).some((key) => !allowed.includes(key))
+  ) {
+    throw new Error("Gate B publisher options must use the closed contract.");
+  }
+}
+
+function requireDirectTestOptions(options) {
+  const allowed = [
+    "artifactDir",
+    "authorizationFile",
+    "authorizedManifestSha256",
+    "authorizedPublicationSha256",
+    "credentialMode",
+    "expectedOldHead",
+    "executables",
     "now",
     "readToken",
     "removeDirectory",
@@ -883,7 +1084,82 @@ function requireClosedOptions(options) {
     Array.isArray(options) ||
     Object.keys(options).some((key) => !allowed.includes(key))
   ) {
-    throw new Error("Gate B publisher options must use the closed contract.");
+    throw new Error(
+      "Gate B direct-test-only options must use the closed test contract.",
+    );
+  }
+}
+
+export function validateTrustedExecutablesForDirectTest(
+  executables,
+  fileSystem = fs,
+) {
+  return validateTrustedExecutables(executables, fileSystem);
+}
+
+function validateTrustedExecutables(executables, fileSystem = fs) {
+  const expected = { git: "/usr/bin/git", gh: "/usr/bin/gh" };
+  if (
+    !executables ||
+    typeof executables !== "object" ||
+    Array.isArray(executables) ||
+    JSON.stringify(Object.keys(executables).sort()) !==
+      JSON.stringify(Object.keys(expected).sort()) ||
+    Object.entries(expected).some(
+      ([name, value]) => executables[name] !== value,
+    )
+  ) {
+    throw new Error(
+      "Gate B production executables must use the fixed absolute paths.",
+    );
+  }
+  for (const directory of ["/", "/usr", "/usr/bin"]) {
+    validateTrustedPath(directory, "directory", fileSystem);
+  }
+  validateTrustedPath(executables.git, "file", fileSystem);
+  validateTrustedPath(executables.gh, "file", fileSystem);
+  return executables;
+}
+
+function validateTrustedPath(filePath, kind, fileSystem) {
+  const before = fileSystem.lstatSync(filePath, { bigint: true });
+  requireTrustedPathMetadata(before, kind, filePath);
+  const flags =
+    fileSystem.constants.O_RDONLY |
+    fileSystem.constants.O_NOFOLLOW |
+    (kind === "directory" ? fileSystem.constants.O_DIRECTORY : 0);
+  const descriptor = fileSystem.openSync(filePath, flags);
+  try {
+    const opened = fileSystem.fstatSync(descriptor, { bigint: true });
+    const after = fileSystem.lstatSync(filePath, { bigint: true });
+    requireTrustedPathMetadata(opened, kind, filePath);
+    requireTrustedPathMetadata(after, kind, filePath);
+    for (const property of ["dev", "ino", "mode", "uid"]) {
+      if (
+        before[property] !== opened[property] ||
+        opened[property] !== after[property]
+      ) {
+        throw new Error(`Gate B trusted path identity changed: ${filePath}`);
+      }
+    }
+  } finally {
+    fileSystem.closeSync(descriptor);
+  }
+}
+
+function requireTrustedPathMetadata(stat, kind, filePath) {
+  const expectedType =
+    kind === "directory" ? stat.isDirectory() : stat.isFile();
+  if (
+    stat.isSymbolicLink() ||
+    !expectedType ||
+    stat.uid !== 0n ||
+    (stat.mode & 0o022n) !== 0n ||
+    (stat.mode & 0o111n) === 0n
+  ) {
+    throw new Error(
+      `Gate B trusted ${kind} must be root-owned, nonsymlink, nonwritable, and executable: ${filePath}`,
+    );
   }
 }
 
@@ -928,45 +1204,8 @@ function requireUnchangedPublicationInputs({
   });
 }
 
-async function requireCredentialPrincipal(
-  runCommand,
-  credentialMode,
-  principal,
-) {
-  if (credentialMode === "automated-app") {
-    const installation = parseJsonObject(
-      (
-        await checked(runCommand, "gh", [
-          "api",
-          "--method",
-          "GET",
-          "/installation/repositories",
-        ])
-      ).stdout,
-      "installation repositories",
-    );
-    if (
-      installation.total_count !== 1 ||
-      !Array.isArray(installation.repositories) ||
-      installation.repositories.length !== 1
-    ) {
-      throw new Error(
-        "Gate B automated-app token must access exactly one repository.",
-      );
-    }
-    requireEqual(
-      installation.repositories[0]?.full_name,
-      GATE_B_REPOSITORY,
-      "Gate B automated-app repository",
-    );
-    requireEqual(
-      principal.kind,
-      "github-app-installation",
-      "Gate B automated-app principal",
-    );
-    return;
-  }
-
+async function requireCredentialPrincipal(runCommand, principal) {
+  requireEqual(principal.kind, "github-user", "Gate B attended user principal");
   const user = parseJsonObject(
     (await checked(runCommand, "gh", ["api", "--method", "GET", "/user"]))
       .stdout,
@@ -1015,6 +1254,87 @@ async function requireUnprotectedCandidateBranch(runCommand, expectedHead) {
   );
 }
 
+async function validateCommittedCandidateDiff({
+  bundle,
+  gitExecutable,
+  runCommand,
+}) {
+  const runCredentialFreeGit = (_command, args, options = {}) =>
+    runCommand(gitExecutable, args, {
+      ...options,
+      cwd: process.cwd(),
+      env: credentialFreeGitEnvironment,
+    });
+  const head = output(
+    await checked(runCredentialFreeGit, "git", ["rev-parse", "HEAD"]),
+  );
+  requireEqual(head, bundle.headSha, "Gate B committed-diff local head");
+
+  const args = [
+    "diff",
+    "--name-only",
+    "-z",
+    "--no-renames",
+    `${bundle.localChangeBaseSha}..${bundle.headSha}`,
+    "--",
+  ];
+  const result = requireBinaryCommandResult(
+    await runCredentialFreeGit("git", args, { encoding: "buffer" }),
+    `git ${args.join(" ")}`,
+  );
+  if (result.exitCode !== 0) {
+    throw new Error("Gate B committed-diff command failed: git.");
+  }
+
+  let decoded;
+  try {
+    decoded = new TextDecoder("utf-8", {
+      fatal: true,
+      ignoreBOM: true,
+    }).decode(result.stdout);
+  } catch (error) {
+    throw new Error("Gate B committed diff must be valid UTF-8.", {
+      cause: error,
+    });
+  }
+  const committedPaths = parseNulDelimitedRepositoryPaths(decoded);
+  requireExactList(
+    [...committedPaths].sort(),
+    bundle.allowedPaths,
+    "Gate B committed diff paths",
+  );
+}
+
+function parseNulDelimitedRepositoryPaths(value) {
+  if (value.length === 0 || !value.endsWith("\0")) {
+    throw new Error(
+      "Gate B committed diff must be nonempty NUL-delimited output.",
+    );
+  }
+  const fields = value.slice(0, -1).split("\0");
+  if (
+    fields.some(
+      (entry) =>
+        entry.length === 0 ||
+        entry.includes("\n") ||
+        entry.includes("\r") ||
+        path.posix.isAbsolute(entry) ||
+        path.win32.isAbsolute(entry) ||
+        entry
+          .split("/")
+          .some(
+            (segment) => segment === "" || segment === "." || segment === "..",
+          ),
+    ) ||
+    new Set(fields).size !== fields.length
+  ) {
+    throw new Error(
+      "Gate B committed diff must contain unique repository-relative paths.",
+    );
+  }
+  return fields;
+}
+
 async function checked(runCommand, command, args, options = {}) {
   const result = requireCommandResult(
     await runCommand(command, args, options),
@@ -1034,6 +1354,20 @@ function requireCommandResult(result, command) {
     typeof result.stderr !== "string"
   ) {
     throw new Error(`Gate B command result is malformed: ${command}`);
+  }
+  return result;
+}
+
+function requireBinaryCommandResult(result, command) {
+  if (
+    !result ||
+    !Number.isInteger(result.exitCode) ||
+    !Buffer.isBuffer(result.stdout) ||
+    !Buffer.isBuffer(result.stderr) ||
+    result.stdout.length > commandMaxBufferBytes ||
+    result.stderr.length > commandMaxBufferBytes
+  ) {
+    throw new Error(`Gate B binary command result is malformed: ${command}`);
   }
   return result;
 }
@@ -1234,28 +1568,228 @@ function requireExactList(actual, expected, label) {
   }
 }
 
-function defaultCommandRunner(command, args, options = {}) {
-  return new Promise((resolve) => {
-    execFile(
-      command,
-      args,
-      {
-        cwd: options.cwd,
-        encoding: "utf8",
-        env: options.env,
-        maxBuffer: 2 * 1024 * 1024,
-        timeout: options.timeoutMs ?? 60_000,
-      },
-      (error, stdout, stderr) => {
-        resolve({
-          stdout,
-          stderr,
-          exitCode:
-            typeof error?.code === "number" ? error.code : error ? 1 : 0,
-        });
-      },
+export function runGateBCommandForDirectTest(command, args, options = {}) {
+  return defaultCommandRunner(command, args, options);
+}
+
+async function defaultCommandRunner(command, args, options = {}) {
+  const encoding = options.encoding ?? "utf8";
+  if (encoding !== "utf8" && encoding !== "buffer") {
+    throw new Error("Gate B command runner encoding must be utf8 or buffer.");
+  }
+  const timeoutMs = options.timeoutMs ?? commandDefaultTimeoutMs;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error(
+      "Gate B command runner timeout must be a positive integer.",
     );
+  }
+  if (process.platform !== "linux") {
+    throw new Error("Gate B command runner failed.");
+  }
+
+  let child;
+  try {
+    child = spawn(command, args, {
+      cwd: options.cwd,
+      detached: true,
+      env: options.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch {
+    return failedCommandResult(encoding);
+  }
+
+  const firstEvent = deferredGateBCommandEvent();
+  const closed = deferredGateBCommandClose();
+  let runnerFailed = false;
+  const requestStop = () => {
+    if (runnerFailed) return;
+    runnerFailed = true;
+    firstEvent.resolve({ kind: "stop" });
+  };
+  const stdout = boundedGateBCommandOutput(requestStop);
+  const stderr = boundedGateBCommandOutput(requestStop);
+  child.stdout?.on("data", stdout.write);
+  child.stderr?.on("data", stderr.write);
+  child.stdout?.once("error", requestStop);
+  child.stderr?.once("error", requestStop);
+  child.once("error", requestStop);
+  child.once("close", (code, signal) => {
+    const outcome = { code, signal };
+    closed.resolve(outcome);
+    firstEvent.resolve({ kind: "close", outcome });
   });
+
+  const processGroup = child.pid;
+  if (
+    !Number.isSafeInteger(processGroup) ||
+    processGroup < 2 ||
+    !child.stdout ||
+    !child.stderr
+  ) {
+    requestStop();
+    const outcome = await settleGateBCommandClose(
+      closed.promise,
+      commandCloseSettlementMs,
+    );
+    if (!outcome) throw new Error("Gate B command runner failed.");
+    return failedCommandResult(encoding);
+  }
+
+  const timeout = setTimeout(requestStop, timeoutMs);
+  timeout.unref();
+  try {
+    const first = await firstEvent.promise;
+    let outcome = first.kind === "close" ? first.outcome : undefined;
+    if (first.kind === "close") {
+      await gateBCommandDelay(commandExitDrainMs);
+      if (await gateBProcessGroupHasRunningMember(processGroup)) {
+        requestStop();
+        await terminateGateBProcessGroup(processGroup);
+      }
+    } else {
+      await terminateGateBProcessGroup(processGroup);
+    }
+    outcome ??= await settleGateBCommandClose(
+      closed.promise,
+      commandCloseSettlementMs,
+    );
+    if (!outcome || (await gateBProcessGroupHasRunningMember(processGroup))) {
+      throw new Error("Gate B command runner failed.");
+    }
+    if (runnerFailed) return failedCommandResult(encoding);
+    return {
+      stdout: commandOutputValue(stdout.value(), encoding),
+      stderr: commandOutputValue(stderr.value(), encoding),
+      exitCode:
+        typeof outcome.code === "number"
+          ? outcome.code
+          : outcome.signal
+            ? 128
+            : 1,
+    };
+  } catch {
+    throw new Error("Gate B command runner failed.");
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function boundedGateBCommandOutput(stop) {
+  const chunks = [];
+  let bytes = 0;
+  let exceeded = false;
+  return {
+    write(chunk) {
+      const source = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const remaining = commandMaxBufferBytes - bytes;
+      if (remaining > 0) {
+        const captured = Buffer.from(source.subarray(0, remaining));
+        chunks.push(captured);
+        bytes += captured.length;
+      }
+      if (!exceeded && source.length > remaining) {
+        exceeded = true;
+        stop();
+      }
+    },
+    value: () => Buffer.concat(chunks, bytes),
+  };
+}
+
+function commandOutputValue(value, encoding) {
+  return encoding === "buffer" ? value : value.toString("utf8");
+}
+
+function failedCommandResult(encoding) {
+  const empty = encoding === "buffer" ? Buffer.alloc(0) : "";
+  return { stdout: empty, stderr: empty, exitCode: 1 };
+}
+
+async function terminateGateBProcessGroup(processGroup) {
+  if (!(await gateBProcessGroupHasRunningMember(processGroup))) return;
+  signalGateBProcessGroup(processGroup, "SIGTERM");
+  if (await waitForGateBProcessGroup(processGroup, commandTerminationGraceMs))
+    return;
+  signalGateBProcessGroup(processGroup, "SIGKILL");
+  if (
+    !(await waitForGateBProcessGroup(processGroup, commandKillSettlementMs))
+  ) {
+    throw new Error("Gate B command runner failed.");
+  }
+}
+
+function signalGateBProcessGroup(processGroup, signal) {
+  try {
+    process.kill(-processGroup, signal);
+  } catch (error) {
+    if (error?.code !== "ESRCH")
+      throw new Error("Gate B command runner failed.");
+  }
+}
+
+async function waitForGateBProcessGroup(processGroup, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (await gateBProcessGroupHasRunningMember(processGroup)) {
+    if (Date.now() >= deadline) return false;
+    await gateBCommandDelay(commandPollMs);
+  }
+  return true;
+}
+
+async function gateBProcessGroupHasRunningMember(processGroup) {
+  const entries = await fs.promises.readdir("/proc", { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
+    const stat = await fs.promises
+      .readFile(`/proc/${entry.name}/stat`, "utf8")
+      .catch(() => undefined);
+    if (!stat) continue;
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    if (
+      Number(fields[2]) === processGroup &&
+      fields[0] !== "Z" &&
+      fields[0] !== "X"
+    )
+      return true;
+  }
+  return false;
+}
+
+function deferredGateBCommandEvent() {
+  let resolve;
+  const promise = new Promise((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
+}
+
+function deferredGateBCommandClose() {
+  let resolve;
+  const promise = new Promise((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
+}
+
+async function settleGateBCommandClose(promise, timeoutMs) {
+  const expired = Symbol("expired");
+  let timeout;
+  try {
+    const value = await Promise.race([
+      promise,
+      new Promise((resolve) => {
+        timeout = setTimeout(() => resolve(expired), timeoutMs);
+      }),
+    ]);
+    return value === expired ? undefined : value;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function gateBCommandDelay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function parseCliArguments(argv) {

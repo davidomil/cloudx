@@ -108,15 +108,38 @@ export function verificationPlan(scope, options = {}) {
 }
 
 export async function verifyChange({
+  acceptedPlan,
   runId,
   scope = "full",
+  localBaseSha,
   headSha,
-  policySha256,
+  loadCurrentPolicy = loadPolicy,
+  makeVerificationPlan = verificationPlan,
+  readHead = readHeadSha,
   runner = runCommand,
   worktreeDigest = calculateWorktreeDigest,
   planOptions = {},
 }) {
-  const plan = verificationPlan(scope, planOptions);
+  validateArtifact("plan", acceptedPlan);
+  requireEqual(localBaseSha, acceptedPlan.base_sha, "Verification local base");
+  requireEqual(await readHead(), headSha, "Verification actual HEAD");
+
+  const plan = makeVerificationPlan(scope, planOptions);
+  const acceptedCommands = plan.map(displayCommand);
+  if (
+    JSON.stringify(acceptedPlan.verification) !==
+    JSON.stringify(acceptedCommands)
+  ) {
+    throw new Error(
+      "Accepted plan verification commands must match the deterministic command objects exactly.",
+    );
+  }
+  const policy = await loadCurrentPolicy();
+  requireEqual(
+    policy.policySha256,
+    acceptedPlan.policy_sha256,
+    "Verification policy digest",
+  );
   const before = await worktreeDigest();
   const results = [];
 
@@ -148,9 +171,9 @@ export async function verifyChange({
     schema_version: 1,
     kind: "change-verification",
     run_id: runId,
-    base_sha: headSha,
+    base_sha: acceptedPlan.base_sha,
     head_sha: headSha,
-    policy_sha256: policySha256,
+    policy_sha256: acceptedPlan.policy_sha256,
     tree_sha256_before: before,
     tree_sha256_after: after,
     verdict: passed ? "passed" : "failed",
@@ -570,7 +593,7 @@ function deferred() {
 const delay = (milliseconds) =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
 
-function displayCommand(planned) {
+export function displayCommand(planned) {
   const environment = Object.entries(planned.env ?? {})
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([name, value]) => `${name}=${value}`);
@@ -585,35 +608,46 @@ function digest(value) {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
-  const policy = await loadPolicy();
+  const acceptedPlan = JSON.parse(
+    await fs.readFile(path.resolve(repoRoot, options.plan), "utf8"),
+  );
   const artifact = await verifyChange({
+    acceptedPlan,
     runId: options.runId ?? `local-${Date.now()}`,
-    scope: options.scope,
-    headSha: await readHeadSha(),
-    policySha256: policy.policySha256,
+    scope: "full",
+    localBaseSha: options.baseSha,
+    headSha: options.headSha,
   });
   const rendered = `${JSON.stringify(artifact, null, 2)}\n`;
-  if (options.output) {
-    await fs.writeFile(path.resolve(repoRoot, options.output), rendered);
-  } else {
-    process.stdout.write(rendered);
-  }
+  process.stdout.write(rendered);
   if (artifact.verdict !== "passed") {
     process.exitCode = 1;
   }
 }
 
 function parseArgs(args) {
-  const options = { scope: "full" };
+  const options = {};
+  const optionNames = {
+    "--plan": "plan",
+    "--base-sha": "baseSha",
+    "--head-sha": "headSha",
+    "--run-id": "runId",
+  };
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
-    if (argument === "--scope")
-      options.scope = requiredValue(args, ++index, argument);
-    else if (argument === "--run-id")
-      options.runId = requiredValue(args, ++index, argument);
-    else if (argument === "--output")
-      options.output = requiredValue(args, ++index, argument);
-    else throw new Error(`Unknown verification argument '${argument}'.`);
+    const optionName = optionNames[argument];
+    if (!optionName)
+      throw new Error(`Unknown verification argument '${argument}'.`);
+    if (Object.hasOwn(options, optionName))
+      throw new Error(`Duplicate verification argument '${argument}'.`);
+    options[optionName] = requiredValue(args, ++index, argument);
+  }
+  for (const [option, value] of [
+    ["--plan", options.plan],
+    ["--base-sha", options.baseSha],
+    ["--head-sha", options.headSha],
+  ]) {
+    if (!value) throw new Error(`${option} is required.`);
   }
   return options;
 }
@@ -623,6 +657,12 @@ function requiredValue(args, index, option) {
   if (!value || value.startsWith("--"))
     throw new Error(`${option} requires a value.`);
   return value;
+}
+
+function requireEqual(actual, expected, label) {
+  if (actual !== expected) {
+    throw new Error(`${label} must equal ${String(expected)}.`);
+  }
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {

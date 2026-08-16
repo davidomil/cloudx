@@ -12,6 +12,7 @@ import type {
 } from "@cloudx/shared";
 
 import { isDirectChildPath } from "../pathBoundary.js";
+import { PathPolicy } from "../pathPolicy.js";
 
 const BARE_DIRECTORY_NAME = ".bare";
 const MAX_GIT_OUTPUT_BYTES = 2_000_000;
@@ -92,12 +93,32 @@ interface ParsedWorktree {
   bare: boolean;
 }
 
+interface WorktreeReservation {
+  dev: bigint;
+  expression: string;
+  ino: bigint;
+}
+
+interface ExistingDirectoryAuthority {
+  readonly canonicalPath: string;
+  readonly dev: bigint;
+  readonly ino: bigint;
+}
+
+interface ListedWorktree {
+  readonly authority: ExistingDirectoryAuthority;
+  readonly summary: WorktreeSummary;
+}
+
 interface WorktreeProjectContext {
   cwd: string;
   projectDir: string;
   barePath: string;
   bareName: string;
   detectedFrom: WorktreeProjectDetectionSource;
+  cwdAuthority: ExistingDirectoryAuthority;
+  projectAuthority: ExistingDirectoryAuthority;
+  bareAuthority: ExistingDirectoryAuthority;
 }
 
 interface BlockedProjectContext {
@@ -127,10 +148,16 @@ type ResolvedProjectContext =
   | { kind: "empty"; context: EmptyProjectContext };
 
 export class WorktreeService {
+  private static readonly destinationQueues = new Map<string, Promise<void>>();
+  private readonly authorityExpressions = new WeakMap<
+    ExistingDirectoryAuthority,
+    string
+  >();
   private readonly sizeCache = new Map<string, WorktreeSizeCacheEntry>();
   private readonly gitLimits: GitProcessLimits;
 
   constructor(
+    private readonly pathPolicy: PathPolicy,
     private readonly gitExecutable = "git",
     limits: Partial<GitProcessLimits> = {},
   ) {
@@ -180,10 +207,10 @@ export class WorktreeService {
     }
 
     const { context } = resolved;
-    const [originUrl, refs, worktrees] = await Promise.all([
-      this.getOriginUrl(context.barePath, options),
-      this.listRefs(context.barePath, options),
-      this.listWorktrees(context.projectDir, context.barePath, options),
+    const [originUrl, refs, listedWorktrees] = await Promise.all([
+      this.getOriginUrl(context.bareAuthority, options),
+      this.listRefs(context.bareAuthority, options),
+      this.listWorktrees(context.projectAuthority, context.bareAuthority, options),
     ]);
     return {
       ...emptyStateBase(context),
@@ -191,7 +218,7 @@ export class WorktreeService {
       status: "ready",
       originUrl,
       refs,
-      worktrees,
+      worktrees: listedWorktrees.map(({ summary }) => summary),
       setup: { canInitialize: false, canClone: false },
     };
   }
@@ -201,13 +228,14 @@ export class WorktreeService {
     options: WorktreeStateOptions = {},
   ): Promise<WorktreeProjectState> {
     options.signal?.throwIfAborted();
+    const projectAuthority = await this.requireCurrentExpression(projectDir);
     await this.requireEmptyProjectWithoutBare(
-      projectDir,
+      projectAuthority,
       "Initialize bare repository",
     );
     await this.runGit(
-      projectDir,
-      ["init", "--bare", this.barePath(projectDir)],
+      await this.requireSameExpression(projectDir, projectAuthority),
+      ["init", "--bare", this.barePath(projectAuthority.canonicalPath)],
       options,
     );
     return this.getState(projectDir, options);
@@ -220,20 +248,25 @@ export class WorktreeService {
   ): Promise<WorktreeProjectState> {
     options.signal?.throwIfAborted();
     requireNonEmptyString(url, "url");
+    const projectAuthority = await this.requireCurrentExpression(projectDir);
     await this.requireEmptyProjectWithoutBare(
-      projectDir,
+      projectAuthority,
       "Clone bare repository",
     );
-    const barePath = this.barePath(projectDir);
+    const barePath = this.barePath(projectAuthority.canonicalPath);
+    let bareAuthority: ExistingDirectoryAuthority | undefined;
     try {
-      await this.runGit(projectDir, ["init", "--bare", barePath], options);
+      await this.runGit(await this.requireSameExpression(projectDir, projectAuthority), ["init", "--bare", barePath], options);
+      bareAuthority = await this.requireExistingDirectory(
+        this.expressionFor(projectAuthority, barePath),
+      );
       await this.runBareGit(
-        barePath,
+        bareAuthority,
         ["remote", "add", "--", "origin", url],
         options,
       );
       await this.runBareGit(
-        barePath,
+        bareAuthority,
         [
           "config",
           "remote.origin.fetch",
@@ -243,7 +276,9 @@ export class WorktreeService {
       );
       await this.fetchRefs(projectDir, options);
     } catch (error) {
-      await fs.rm(barePath, { recursive: true, force: true });
+      if (bareAuthority && await this.isCurrentAuthority(bareAuthority)) {
+        await fs.rm(bareAuthority.canonicalPath, { recursive: true, force: true });
+      }
       throw error;
     }
     return this.getState(projectDir, options);
@@ -256,7 +291,7 @@ export class WorktreeService {
     options.signal?.throwIfAborted();
     const context = await this.requireReadyProject(projectDir, options);
     await this.runBareGit(
-      context.barePath,
+      context.bareAuthority,
       [
         "fetch",
         "--prune",
@@ -267,7 +302,7 @@ export class WorktreeService {
       options,
     );
     await this.runBareGit(
-      context.barePath,
+      context.bareAuthority,
       ["fetch", "--no-tags", "origin", "+refs/tags/*:refs/tags/*"],
       options,
     );
@@ -280,64 +315,62 @@ export class WorktreeService {
     options: WorktreeStateOptions = {},
   ): Promise<WorktreeProjectState> {
     options.signal?.throwIfAborted();
-    const context = await this.requireReadyProject(projectDir, options);
+    const admittedContext = await this.requireReadyProject(projectDir, options);
     const folderName = requireValidFolderName(
       input.folderName,
-      context.bareName,
+      admittedContext.bareName,
     );
-    const branchName = await this.requireBranchName(
-      context.projectDir,
-      input.branchName,
-      options,
-    );
-    const worktreePath = path.join(context.projectDir, folderName);
-    await this.requireNewWorktreePath(
-      context.projectDir,
-      worktreePath,
-      folderName,
-    );
+    const destination = path.resolve(admittedContext.projectDir, folderName);
 
-    try {
-      if (input.mode === "new_branch") {
-        const baseRef = await this.worktreeStartPoint(
-          context.barePath,
-          requireNonEmptyString(input.baseRef, "baseRef"),
-          options,
-        );
-        await this.runBareGit(
-          context.barePath,
-          ["worktree", "add", "-b", branchName, worktreePath, baseRef],
-          options,
-        );
-      } else if (input.mode === "existing_branch") {
-        await this.runBareGit(
-          context.barePath,
-          ["worktree", "add", worktreePath, branchName],
-          options,
-        );
-      } else if (input.mode === "remote_branch") {
-        const baseRef = requireNonEmptyString(input.baseRef, "baseRef");
-        await this.runBareGit(
-          context.barePath,
-          [
-            "worktree",
-            "add",
-            "--track",
-            "-b",
-            branchName,
-            worktreePath,
-            baseRef,
-          ],
-          options,
-        );
-      } else {
-        throw new Error(`Unsupported worktree creation mode: ${input.mode}`);
+    return this.serializeDestination(destination, async () => {
+      options.signal?.throwIfAborted();
+      const context = await this.requireReadyProject(projectDir, options);
+      const worktreePath = path.resolve(context.projectDir, folderName);
+      if (
+        !sameDirectoryAuthority(context.cwdAuthority, admittedContext.cwdAuthority) ||
+        !sameDirectoryAuthority(context.projectAuthority, admittedContext.projectAuthority) ||
+        worktreePath !== destination
+      ) {
+        throw new Error("Worktree destination ownership changed while queued.");
       }
-    } catch (error) {
-      await this.cleanupFailedWorktree(context.barePath, worktreePath, error);
-    }
+      const branchName = await this.requireBranchName(
+        context.projectAuthority,
+        input.branchName,
+        options,
+      );
+      const args = await this.createWorktreeArgs(
+        context.bareAuthority,
+        worktreePath,
+        branchName,
+        input,
+        options,
+      );
+      const reservation = await this.reserveNewWorktreePath(
+        context.projectAuthority,
+        worktreePath,
+        folderName,
+      );
 
-    return this.getState(projectDir, options);
+      try {
+        await this.runBareGit(context.bareAuthority, args, options);
+        if (
+          !(await this.requireReservationIdentity(worktreePath, reservation))
+        ) {
+          throw new Error(
+            "Worktree destination ownership was lost; the reserved folder is missing.",
+          );
+        }
+      } catch (error) {
+        await this.cleanupFailedWorktree(
+          context.bareAuthority,
+          worktreePath,
+          reservation,
+          error,
+        );
+      }
+
+      return this.getState(projectDir, options);
+    });
   }
 
   async deleteWorktree(
@@ -346,10 +379,10 @@ export class WorktreeService {
     options: WorktreeStateOptions = {},
   ): Promise<WorktreeProjectState> {
     options.signal?.throwIfAborted();
-    const context = await this.requireReadyProject(projectDir, options);
+    const admittedContext = await this.requireReadyProject(projectDir, options);
     const folderName = requireValidFolderName(
       input.folderName,
-      context.bareName,
+      admittedContext.bareName,
     );
     if (input.confirmation !== folderName) {
       throw new Error(
@@ -357,44 +390,148 @@ export class WorktreeService {
       );
     }
 
-    const worktree = (
-      await this.listWorktrees(context.projectDir, context.barePath, options)
-    ).find((candidate) => candidate.folderName === folderName);
-    if (!worktree) {
-      throw new Error(`Unknown worktree folder: ${folderName}`);
-    }
-    if (worktree.dirty.dirty && !input.force) {
-      throw new Error(
-        "Worktree has uncommitted or untracked changes. Force confirmation is required before deleting it.",
-      );
-    }
+    const destination = path.resolve(admittedContext.projectDir, folderName);
+    return this.serializeDestination(destination, async () => {
+      options.signal?.throwIfAborted();
+      const context = await this.requireReadyProject(projectDir, options);
+      if (
+        !sameDirectoryAuthority(context.cwdAuthority, admittedContext.cwdAuthority) ||
+        !sameDirectoryAuthority(context.projectAuthority, admittedContext.projectAuthority) ||
+        path.resolve(context.projectDir, folderName) !== destination
+      ) {
+        throw new Error("Worktree destination ownership changed while queued.");
+      }
+      const worktree = (
+        await this.listWorktrees(context.projectAuthority, context.bareAuthority, options)
+      ).find((candidate) => candidate.summary.folderName === folderName);
+      if (!worktree) {
+        throw new Error(`Unknown worktree folder: ${folderName}`);
+      }
+      if (worktree.summary.dirty.dirty && !input.force) {
+        throw new Error(
+          "Worktree has uncommitted or untracked changes. Force confirmation is required before deleting it.",
+        );
+      }
 
-    await this.runBareGit(
-      context.barePath,
-      [
-        "worktree",
-        "remove",
-        ...(input.force ? ["--force"] : []),
-        worktree.path,
-      ],
-      options,
-    );
-    this.sizeCache.delete(worktree.path);
-    return this.getState(projectDir, options);
+      await this.requireCurrentAuthority(worktree.authority).catch(() => {
+        throw new Error(
+          "Worktree destination ownership changed before removal.",
+        );
+      });
+      await this.runBareGit(
+        context.bareAuthority,
+        [
+          "worktree",
+          "remove",
+          ...(input.force ? ["--force"] : []),
+          worktree.summary.path,
+        ],
+        options,
+      );
+      this.sizeCache.delete(worktree.summary.path);
+      return this.getState(projectDir, options);
+    });
   }
 
   private barePath(projectDir: string): string {
     return path.join(projectDir, BARE_DIRECTORY_NAME);
   }
 
+  private async requireCurrentExpression(candidate: string): Promise<ExistingDirectoryAuthority> {
+    return this.requireExistingDirectory(candidate);
+  }
+
+  private async requireSameExpression(candidate: string, expected: ExistingDirectoryAuthority): Promise<ExistingDirectoryAuthority> {
+    const current = await this.requireExistingDirectory(candidate);
+    if (!sameDirectoryAuthority(current, expected)) throw new Error("Directory authority changed before capability use.");
+    return current;
+  }
+
+  private async requireExistingDirectory(candidate: string): Promise<ExistingDirectoryAuthority> {
+    const observe = async () => {
+      const admittedPath = await this.pathPolicy.ensureDirectory(candidate, false);
+      const canonicalPath = await fs.realpath(admittedPath);
+      const stat = await fs.lstat(canonicalPath, { bigint: true });
+      if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        throw new Error(`Path is not a directory: ${canonicalPath}`);
+      }
+      return {
+        admittedPath,
+        authority: {
+          canonicalPath,
+          dev: stat.dev,
+          ino: stat.ino,
+        },
+      };
+    };
+    const first = await observe();
+    const second = await observe();
+    if (!sameDirectoryAuthority(first.authority, second.authority)) {
+      throw new Error(`Directory identity changed while authorizing: ${candidate}`);
+    }
+    const authority = Object.freeze(first.authority);
+    this.authorityExpressions.set(authority, first.admittedPath);
+    return authority;
+  }
+
+  private expressionFor(
+    authority: ExistingDirectoryAuthority,
+    canonicalPath = authority.canonicalPath,
+  ): string {
+    const expression = this.authorityExpressions.get(authority);
+    if (!expression) {
+      throw new Error("Directory authority has no admitted path expression.");
+    }
+    return path.resolve(
+      expression,
+      path.relative(authority.canonicalPath, canonicalPath),
+    );
+  }
+
+  private async requireCurrentAuthority(expected: ExistingDirectoryAuthority): Promise<ExistingDirectoryAuthority> {
+    return this.requireSameExpression(this.expressionFor(expected), expected);
+  }
+
+  private async isCurrentAuthority(expected: ExistingDirectoryAuthority): Promise<boolean> {
+    return this.requireCurrentAuthority(expected).then(() => true, () => false);
+  }
+
+  private async directChildExists(parent: ExistingDirectoryAuthority, childName: string): Promise<boolean> {
+    const currentParent = await this.requireCurrentAuthority(parent);
+    return fs.lstat(path.join(currentParent.canonicalPath, childName)).then(() => true).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT" || error.code === "ENOTDIR") return false;
+      throw error;
+    });
+  }
+
+  private async isDirectoryEmpty(directory: ExistingDirectoryAuthority): Promise<boolean> {
+    const current = await this.requireCurrentAuthority(directory);
+    return (await fs.readdir(current.canonicalPath)).length === 0;
+  }
+
+  private async directorySizeBytes(directory: ExistingDirectoryAuthority): Promise<number> {
+    const current = await this.requireCurrentAuthority(directory);
+    let total = 0;
+    const entries = await fs.readdir(current.canonicalPath, { withFileTypes: true });
+    for (const entry of entries) {
+      const parent = await this.requireCurrentAuthority(current);
+      const entryPath = path.join(parent.canonicalPath, entry.name);
+      const stats = await fs.lstat(entryPath);
+      if (stats.isDirectory() && !stats.isSymbolicLink()) total += await this.directorySizeBytes(await this.requireExistingDirectory(this.expressionFor(parent, entryPath)));
+      else total += stats.size;
+    }
+    return total;
+  }
+
   private async requireEmptyProjectWithoutBare(
-    projectDir: string,
+    project: ExistingDirectoryAuthority,
     action: string,
   ): Promise<void> {
-    if (await pathExists(this.barePath(projectDir))) {
+    const currentProject = await this.requireCurrentAuthority(project);
+    if (await this.directChildExists(currentProject, BARE_DIRECTORY_NAME)) {
       throw new Error(`${action} requires a project directory without .bare.`);
     }
-    if (!(await isDirectoryEmpty(projectDir))) {
+    if (!(await this.isDirectoryEmpty(currentProject))) {
       throw new Error(`${action} requires an empty project directory.`);
     }
   }
@@ -418,9 +555,12 @@ export class WorktreeService {
     inputDir: string,
     options: WorktreeStateOptions = {},
   ): Promise<ResolvedProjectContext> {
-    const cwd = path.resolve(inputDir);
+    const admittedCwd = await this.requireCurrentExpression(inputDir);
+    const cwdAuthority = await this.requireSameExpression(inputDir, admittedCwd);
+    const cwd = cwdAuthority.canonicalPath;
     const canonicalBarePath = this.barePath(cwd);
-    const selectedFolderEmpty = await isDirectoryEmpty(cwd);
+    const bareExpression = this.expressionFor(cwdAuthority, canonicalBarePath);
+    const selectedFolderEmpty = await this.isDirectoryEmpty(cwdAuthority);
     const defaultContext = {
       cwd,
       projectDir: cwd,
@@ -429,21 +569,29 @@ export class WorktreeService {
       detectedFrom: "project_dir" as const,
     };
 
-    if (await this.isBareRepository(cwd, options)) {
-      const context = projectContext(cwd, path.dirname(cwd), cwd, "bare_dir");
+    const selectedBareAuthority = await this.findBareRepository(
+      this.expressionFor(cwdAuthority),
+      options,
+    );
+    if (selectedBareAuthority) {
+      const projectAuthority = await this.requireExistingDirectory(
+        this.expressionFor(cwdAuthority, path.dirname(cwd)),
+      );
+      const context = projectContext(cwdAuthority, projectAuthority, selectedBareAuthority, "bare_dir");
       return {
         kind: "ready",
         context,
-        folderEmpty: await isDirectoryEmpty(context.projectDir),
+        folderEmpty: await this.isDirectoryEmpty(context.projectAuthority),
       };
     }
 
-    const canonicalBareExists = await pathExists(canonicalBarePath);
+    const canonicalBareExists = await this.directChildExists(cwdAuthority, BARE_DIRECTORY_NAME);
     if (canonicalBareExists) {
-      if (await this.isBareRepository(canonicalBarePath, options)) {
+      const bareAuthority = await this.findBareRepository(bareExpression, options);
+      if (bareAuthority) {
         return {
           kind: "ready",
-          context: projectContext(cwd, cwd, canonicalBarePath, "project_dir"),
+          context: projectContext(cwdAuthority, cwdAuthority, bareAuthority, "project_dir"),
           folderEmpty: false,
         };
       }
@@ -458,18 +606,16 @@ export class WorktreeService {
       };
     }
 
-    const bareChildren = await this.findBareChildren(cwd, options);
+    const bareChildren = await this.findBareChildren(cwdAuthority, options);
     if (bareChildren.length === 1) {
       return {
         kind: "ready",
-        context: projectContext(cwd, cwd, bareChildren[0]!, "project_dir"),
+        context: projectContext(cwdAuthority, cwdAuthority, bareChildren[0]!, "project_dir"),
         folderEmpty: false,
       };
     }
     if (bareChildren.length > 1) {
-      const candidateBarePaths = bareChildren.sort((left, right) =>
-        left.localeCompare(right),
-      );
+      const candidateBarePaths = bareChildren.map((candidate) => candidate.canonicalPath).sort((left, right) => left.localeCompare(right));
       return {
         kind: "blocked",
         context: {
@@ -484,7 +630,7 @@ export class WorktreeService {
       };
     }
 
-    const worktreeContext = await this.contextFromLinkedWorktree(cwd, options);
+    const worktreeContext = await this.contextFromLinkedWorktree(cwdAuthority, options);
     if (worktreeContext) {
       return { kind: "ready", context: worktreeContext, folderEmpty: false };
     }
@@ -510,25 +656,28 @@ export class WorktreeService {
   }
 
   private async findBareChildren(
-    projectDir: string,
+    project: ExistingDirectoryAuthority,
     options: WorktreeStateOptions = {},
-  ): Promise<string[]> {
-    const entries = await fs.readdir(projectDir, { withFileTypes: true });
-    const bareChildren: string[] = [];
+  ): Promise<ExistingDirectoryAuthority[]> {
+    const currentProject = await this.requireCurrentAuthority(project);
+    const entries = await fs.readdir(currentProject.canonicalPath, { withFileTypes: true });
+    const bareChildren: ExistingDirectoryAuthority[] = [];
     for (const entry of entries) {
       if (!entry.isDirectory()) {
         continue;
       }
-      const candidate = path.join(projectDir, entry.name);
-      if (await this.isBareRepository(candidate, options)) {
-        bareChildren.push(candidate);
-      }
+      const candidate = this.expressionFor(
+        currentProject,
+        path.join(currentProject.canonicalPath, entry.name),
+      );
+      const authority = await this.findBareRepository(candidate, options);
+      if (authority) bareChildren.push(authority);
     }
     return bareChildren;
   }
 
   private async contextFromLinkedWorktree(
-    cwd: string,
+    cwd: ExistingDirectoryAuthority,
     options: WorktreeStateOptions = {},
   ): Promise<WorktreeProjectContext | undefined> {
     const insideWorktree = await this.runGit(
@@ -544,48 +693,49 @@ export class WorktreeService {
       this.runGit(cwd, ["rev-parse", "--show-toplevel"], options),
       this.runGit(cwd, ["rev-parse", "--git-common-dir"], options),
     ]);
-    const topLevel = path.resolve(cwd, topLevelResult.stdout.trim());
-    const barePath = path.resolve(cwd, commonDirResult.stdout.trim());
-    if (!(await this.isBareRepository(barePath, options))) {
+    const topLevelPath = path.resolve(cwd.canonicalPath, topLevelResult.stdout.trim());
+    const topLevel = await this.requireExistingDirectory(
+      this.expressionFor(cwd, topLevelPath),
+    );
+    const barePath = path.resolve(cwd.canonicalPath, commonDirResult.stdout.trim());
+    const bareAuthority = await this.findBareRepository(
+      this.expressionFor(cwd, barePath),
+      options,
+    );
+    if (!bareAuthority) {
       return undefined;
     }
 
-    const projectDir = path.dirname(barePath);
-    if (!isDirectChildPath(projectDir, topLevel)) {
+    const projectAuthority = await this.requireExistingDirectory(
+      this.expressionFor(bareAuthority, path.dirname(barePath)),
+    );
+    if (!isDirectChildPath(projectAuthority.canonicalPath, topLevel.canonicalPath)) {
       return undefined;
     }
-    return projectContext(cwd, projectDir, barePath, "worktree_dir");
+    return projectContext(cwd, projectAuthority, bareAuthority, "worktree_dir");
   }
 
-  private async isBareRepository(
+  private async findBareRepository(
     barePath: string,
     options: WorktreeStateOptions = {},
-  ): Promise<boolean> {
-    const stat = await fs
-      .lstat(barePath)
-      .catch((error: NodeJS.ErrnoException) => {
-        if (
-          error.code === "ENOENT" ||
-          error.code === "ENOTDIR" ||
-          error.code === "EACCES"
-        ) {
-          return undefined;
-        }
-        throw error;
-      });
-    if (!stat?.isDirectory() || stat.isSymbolicLink()) {
-      return false;
-    }
+  ): Promise<ExistingDirectoryAuthority | undefined> {
+    const authority = await this.requireExistingDirectory(barePath).catch((error: unknown) => {
+      if (error instanceof Error && /Directory does not exist|Path is not a directory|resolves outside configured Cloudx roots/u.test(error.message)) return undefined;
+      throw error;
+    });
+    if (!authority) return undefined;
+    const entry = await fs.lstat(barePath);
+    if (!entry.isDirectory() || entry.isSymbolicLink()) return undefined;
     const result = await this.runBareGit(
-      barePath,
+      authority,
       ["rev-parse", "--is-bare-repository"],
       { ...options, allowExitCodes: [0, 128] },
     );
-    return result.code === 0 && result.stdout.trim() === "true";
+    return result.code === 0 && result.stdout.trim() === "true" ? authority : undefined;
   }
 
   private async getOriginUrl(
-    barePath: string,
+    barePath: ExistingDirectoryAuthority,
     options: WorktreeStateOptions = {},
   ): Promise<string | undefined> {
     const result = await this.runBareGit(
@@ -597,7 +747,7 @@ export class WorktreeService {
   }
 
   private async listRefs(
-    barePath: string,
+    barePath: ExistingDirectoryAuthority,
     options: WorktreeStateOptions = {},
   ): Promise<WorktreeRef[]> {
     const refs = await this.runBareGit(
@@ -634,10 +784,10 @@ export class WorktreeService {
   }
 
   private async listWorktrees(
-    projectDir: string,
-    barePath: string,
+    projectDir: ExistingDirectoryAuthority,
+    barePath: ExistingDirectoryAuthority,
     options: WorktreeStateOptions = {},
-  ): Promise<WorktreeSummary[]> {
+  ): Promise<ListedWorktree[]> {
     const result = await this.runBareGit(
       barePath,
       ["worktree", "list", "--porcelain", "-z"],
@@ -647,29 +797,33 @@ export class WorktreeService {
     const summaries = await Promise.all(
       parsed
         .filter((worktree) => !worktree.bare)
-        .filter((worktree) => isDirectChildPath(projectDir, worktree.path))
+        .filter((worktree) => isDirectChildPath(projectDir.canonicalPath, worktree.path))
         .map(async (worktree) => {
+          const worktreeAuthority = await this.requireExistingDirectory(
+            this.expressionFor(projectDir, worktree.path),
+          );
+          if (!isDirectChildPath(projectDir.canonicalPath, worktreeAuthority.canonicalPath)) throw new Error("Git listed a worktree outside the authorized project directory.");
           const summary: WorktreeSummary = {
             folderName: path.basename(worktree.path),
-            path: worktree.path,
+            path: worktreeAuthority.canonicalPath,
             branch: worktree.branch,
             head: worktree.head,
             detached: !worktree.branch,
-            dirty: await this.dirtyStatus(worktree.path, options),
+            dirty: await this.dirtyStatus(worktreeAuthority, options),
           };
           if (options.includeSizes) {
-            this.attachCachedSize(summary, worktree.path);
+            this.attachCachedSize(summary, worktreeAuthority);
           }
-          return summary;
+          return { authority: worktreeAuthority, summary };
         }),
     );
     return summaries.sort((left, right) =>
-      left.folderName.localeCompare(right.folderName),
+      left.summary.folderName.localeCompare(right.summary.folderName),
     );
   }
 
   private async dirtyStatus(
-    worktreePath: string,
+    worktreePath: ExistingDirectoryAuthority,
     options: WorktreeStateOptions = {},
   ): Promise<WorktreeDirtyStatus> {
     const status = await this.runGit(
@@ -705,9 +859,10 @@ export class WorktreeService {
 
   private attachCachedSize(
     summary: WorktreeSummary,
-    worktreePath: string,
+    worktreePath: ExistingDirectoryAuthority,
   ): void {
-    const cached = this.sizeCache.get(worktreePath);
+    const cacheKey = worktreePath.canonicalPath;
+    const cached = this.sizeCache.get(cacheKey);
     if (typeof cached?.sizeBytes === "number") {
       summary.sizeBytes = cached.sizeBytes;
     }
@@ -727,39 +882,93 @@ export class WorktreeService {
     }
 
     let pending: Promise<void>;
-    pending = directorySizeBytes(worktreePath)
+    pending = this.directorySizeBytes(worktreePath)
       .then((sizeBytes) => {
-        this.sizeCache.set(worktreePath, { sizeBytes, updatedAt: Date.now() });
+        this.sizeCache.set(cacheKey, { sizeBytes, updatedAt: Date.now() });
       })
       .catch((error) => {
-        this.sizeCache.set(worktreePath, {
+        this.sizeCache.set(cacheKey, {
           sizeError: error instanceof Error ? error.message : String(error),
           updatedAt: Date.now(),
         });
       })
       .finally(() => {
-        const current = this.sizeCache.get(worktreePath);
+        const current = this.sizeCache.get(cacheKey);
         if (current?.pending !== pending) {
           return;
         }
         const { pending: _pending, ...rest } = current;
         if (typeof rest.sizeBytes === "number" || rest.sizeError) {
-          this.sizeCache.set(worktreePath, rest);
+          this.sizeCache.set(cacheKey, rest);
         } else {
-          this.sizeCache.delete(worktreePath);
+          this.sizeCache.delete(cacheKey);
         }
       });
 
-    this.sizeCache.set(worktreePath, { ...cached, pending });
+    this.sizeCache.set(cacheKey, { ...cached, pending });
     summary.sizePending = true;
   }
 
-  private async cleanupFailedWorktree(
-    barePath: string,
+  private async createWorktreeArgs(
+    barePath: ExistingDirectoryAuthority,
     worktreePath: string,
+    branchName: string,
+    input: CreateWorktreeInput,
+    options: WorktreeStateOptions,
+  ): Promise<string[]> {
+    if (input.mode === "new_branch") {
+      const baseRef = await this.worktreeStartPoint(
+        barePath,
+        requireNonEmptyString(input.baseRef, "baseRef"),
+        options,
+      );
+      return ["worktree", "add", "-b", branchName, worktreePath, baseRef];
+    }
+    if (input.mode === "existing_branch") {
+      return ["worktree", "add", worktreePath, branchName];
+    }
+    if (input.mode === "remote_branch") {
+      return [
+        "worktree",
+        "add",
+        "--track",
+        "-b",
+        branchName,
+        worktreePath,
+        requireNonEmptyString(input.baseRef, "baseRef"),
+      ];
+    }
+    throw new Error(`Unsupported worktree creation mode: ${input.mode}`);
+  }
+
+  private serializeDestination<T>(
+    destination: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const queueKey = path.normalize(path.resolve(destination));
+    const previous =
+      WorktreeService.destinationQueues.get(queueKey) ?? Promise.resolve();
+    const run = previous.then(operation);
+    const settled = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    WorktreeService.destinationQueues.set(queueKey, settled);
+    void settled.then(() => {
+      if (WorktreeService.destinationQueues.get(queueKey) === settled) {
+        WorktreeService.destinationQueues.delete(queueKey);
+      }
+    });
+    return run;
+  }
+
+  private async cleanupFailedWorktree(
+    barePath: ExistingDirectoryAuthority,
+    worktreePath: string,
+    reservation: WorktreeReservation,
     originalError: unknown,
   ): Promise<never> {
-    const cleanupFailures: string[] = [];
+    const cleanupFailures: Error[] = [];
     const attempt = async (
       action: string,
       cleanup: () => Promise<void>,
@@ -767,20 +976,36 @@ export class WorktreeService {
       try {
         await cleanup();
       } catch (error) {
-        cleanupFailures.push(`${action}: ${errorMessage(error)}`);
+        cleanupFailures.push(
+          new Error(`${action}: ${errorMessage(error)}`, { cause: error }),
+        );
+      }
+    };
+    const ownsDestination = async (): Promise<boolean> => {
+      try {
+        return await this.requireReservationIdentity(worktreePath, reservation);
+      } catch (error) {
+        throw new AggregateError(
+          [originalError, error],
+          `Worktree creation failed after destination ownership was lost: ${errorMessage(error)}`,
+        );
       }
     };
 
-    await attempt("Git worktree removal", async () => {
-      await this.runBareGit(
-        barePath,
-        ["worktree", "remove", "--force", worktreePath],
-        { allowExitCodes: [0, 128] },
+    if (await ownsDestination()) {
+      await attempt("Git worktree removal", async () => {
+        await this.runBareGit(
+          barePath,
+          ["worktree", "remove", "--force", worktreePath],
+          { allowExitCodes: [0, 128] },
+        );
+      });
+    }
+    if (await ownsDestination()) {
+      await attempt("filesystem removal", () =>
+        fs.rm(worktreePath, { recursive: true, force: true }),
       );
-    });
-    await attempt("filesystem removal", async () => {
-      await fs.rm(worktreePath, { recursive: true, force: true });
-    });
+    }
     await attempt("Git worktree pruning", async () => {
       await this.runBareGit(barePath, ["worktree", "prune", "--expire", "now"]);
     });
@@ -799,37 +1024,68 @@ export class WorktreeService {
       ) {
         throw new Error("Git still registers the failed worktree.");
       }
-      if (await pathExists(worktreePath)) {
+      if (await ownsDestination()) {
         throw new Error("the failed worktree path still exists.");
       }
     });
 
     if (cleanupFailures.length > 0) {
-      throw new Error(
-        `Worktree creation failed and cleanup failed: ${cleanupFailures.join("; ")}`,
-        { cause: originalError },
+      throw new AggregateError(
+        [originalError, ...cleanupFailures],
+        `Worktree creation failed and cleanup failed: ${cleanupFailures.map((error) => error.message).join("; ")}`,
       );
     }
     throw originalError;
   }
 
-  private async requireNewWorktreePath(
-    projectDir: string,
+  private async reserveNewWorktreePath(
+    projectDir: ExistingDirectoryAuthority,
     worktreePath: string,
     folderName: string,
-  ): Promise<void> {
-    if (!isDirectChildPath(projectDir, worktreePath)) {
+  ): Promise<WorktreeReservation> {
+    const currentProject = await this.requireCurrentAuthority(projectDir);
+    if (!isDirectChildPath(currentProject.canonicalPath, worktreePath)) {
       throw new Error(
         "Worktree folder must be directly under the project directory.",
       );
     }
-    if (await pathExists(worktreePath)) {
-      throw new Error(`Worktree folder already exists: ${folderName}`);
+    try {
+      await fs.mkdir(worktreePath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new Error(`Worktree folder already exists: ${folderName}`);
+      }
+      throw error;
     }
+    const expression = this.expressionFor(currentProject, worktreePath);
+    const reserved = await this.requireExistingDirectory(expression);
+    return { dev: reserved.dev, expression, ino: reserved.ino };
+  }
+
+  private async requireReservationIdentity(
+    worktreePath: string,
+    reservation: WorktreeReservation,
+  ): Promise<boolean> {
+    const authority = await this
+      .requireExistingDirectory(reservation.expression)
+      .catch((error: NodeJS.ErrnoException) => {
+        if (error.message.startsWith("Directory does not exist:")) return undefined;
+        throw error;
+      });
+    if (!authority) return false;
+    if (
+      authority.dev !== reservation.dev ||
+      authority.ino !== reservation.ino
+    ) {
+      throw new Error(
+        "Worktree destination ownership was lost; the replacement was preserved.",
+      );
+    }
+    return true;
   }
 
   private async requireBranchName(
-    cwd: string,
+    cwd: ExistingDirectoryAuthority,
     value: string,
     options: WorktreeStateOptions = {},
   ): Promise<string> {
@@ -846,7 +1102,7 @@ export class WorktreeService {
   }
 
   private async worktreeStartPoint(
-    barePath: string,
+    barePath: ExistingDirectoryAuthority,
     baseRef: string,
     options: WorktreeStateOptions = {},
   ): Promise<string> {
@@ -871,25 +1127,26 @@ export class WorktreeService {
   }
 
   private async runBareGit(
-    barePath: string,
+    barePath: ExistingDirectoryAuthority,
     args: string[],
     options?: GitCommandOptions,
   ): Promise<GitCommandResult> {
+    const currentBarePath = await this.requireCurrentAuthority(barePath);
     return this.runGit(
-      path.dirname(barePath),
-      ["--git-dir", barePath, ...args],
+      currentBarePath,
+      ["--git-dir", currentBarePath.canonicalPath, ...args],
       options,
     );
   }
 
   private async runGit(
-    cwd: string,
+    cwd: ExistingDirectoryAuthority,
     args: string[],
     options?: GitCommandOptions,
   ): Promise<GitCommandResult> {
     const allowExitCodes = options?.allowExitCodes ?? [0];
     options?.signal?.throwIfAborted();
-    const canonicalCwd = await fs.realpath(cwd);
+    const canonicalCwd = (await this.requireCurrentAuthority(cwd)).canonicalPath;
     options?.signal?.throwIfAborted();
 
     const child = spawn(this.gitExecutable, args, {
@@ -1073,45 +1330,26 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-async function pathExists(target: string): Promise<boolean> {
-  return fs
-    .access(target)
-    .then(() => true)
-    .catch(() => false);
-}
-
-async function isDirectoryEmpty(directory: string): Promise<boolean> {
-  return (await fs.readdir(directory)).length === 0;
-}
-
-async function directorySizeBytes(directory: string): Promise<number> {
-  let total = 0;
-  const entries = await fs.readdir(directory, { withFileTypes: true });
-  for (const entry of entries) {
-    const entryPath = path.join(directory, entry.name);
-    const stats = await fs.lstat(entryPath);
-    if (stats.isDirectory()) {
-      total += await directorySizeBytes(entryPath);
-    } else {
-      total += stats.size;
-    }
-  }
-  return total;
-}
-
 function projectContext(
-  cwd: string,
-  projectDir: string,
-  barePath: string,
+  cwdAuthority: ExistingDirectoryAuthority,
+  projectAuthority: ExistingDirectoryAuthority,
+  bareAuthority: ExistingDirectoryAuthority,
   detectedFrom: WorktreeProjectDetectionSource,
 ): WorktreeProjectContext {
   return {
-    cwd,
-    projectDir,
-    barePath,
-    bareName: path.basename(barePath),
+    cwd: cwdAuthority.canonicalPath,
+    projectDir: projectAuthority.canonicalPath,
+    barePath: bareAuthority.canonicalPath,
+    bareName: path.basename(bareAuthority.canonicalPath),
     detectedFrom,
+    cwdAuthority,
+    projectAuthority,
+    bareAuthority,
   };
+}
+
+function sameDirectoryAuthority(left: ExistingDirectoryAuthority, right: ExistingDirectoryAuthority): boolean {
+  return left.canonicalPath === right.canonicalPath && left.dev === right.dev && left.ino === right.ino;
 }
 
 function emptyStateBase(

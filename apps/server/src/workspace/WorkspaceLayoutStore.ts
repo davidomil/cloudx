@@ -41,8 +41,6 @@ interface WorkspacePersistenceState {
   templates: WorkspaceLayoutTemplate[];
 }
 
-export type WorkspaceLayoutSnapshot = Pick<WorkspaceStateResponse, "activeWindowId" | "windows" | "templates">;
-
 interface TemplateTabSource {
   tab: WorkspaceTab;
   initialInput?: Record<string, unknown>;
@@ -128,20 +126,6 @@ export class WorkspaceLayoutStore {
       templates: this.templates,
       persistence: [this.persistenceStatus()]
     };
-  }
-
-  async restore(snapshot: WorkspaceLayoutSnapshot): Promise<void> {
-    return this.serializeWorkspaceAccess(async () => {
-      const state = {
-        activeWindowId: snapshot.activeWindowId,
-        windows: snapshot.windows,
-        templates: snapshot.templates
-      };
-      await this.persist(true, state);
-      this.activeWindowId = state.activeWindowId;
-      this.windows = state.windows;
-      this.templates = state.templates;
-    });
   }
 
   getActiveWindow(): WorkspaceWindow {
@@ -269,7 +253,7 @@ export class WorkspaceLayoutStore {
     });
   }
 
-  async placeTab(input: WorkspaceTabPlacement): Promise<WorkspaceWindow> {
+  async placeTabAndPublish<T>(input: WorkspaceTabPlacement, publish: () => T): Promise<{ published: T; window: WorkspaceWindow }> {
     return this.serializeWorkspaceAccess(async () => {
       this.requireTabPlacementTarget(input.windowId, input.paneId);
 
@@ -299,10 +283,8 @@ export class WorkspaceLayoutStore {
 
       const updatedWindow = { ...currentWindow, layout: result.layout, updatedAt: now };
       const windows = windowsWithoutTab.map((candidate) => (candidate.id === input.windowId ? updatedWindow : candidate));
-      await this.persist(true, { activeWindowId: input.windowId, windows, templates: this.templates });
-      this.windows = windows;
-      this.activeWindowId = input.windowId;
-      return updatedWindow;
+      const published = await this.commitWorkspaceAndPublish({ activeWindowId: input.windowId, windows, templates: this.templates }, publish);
+      return { published, window: updatedWindow };
     });
   }
 
@@ -423,7 +405,12 @@ export class WorkspaceLayoutStore {
     });
   }
 
-  async commitTemplateApplication(prepared: PreparedWorkspaceTemplateApplication, layout: TabLayoutState, name?: string): Promise<WorkspaceWindow> {
+  async commitTemplateAndPublish<T>(
+    prepared: PreparedWorkspaceTemplateApplication,
+    layout: TabLayoutState,
+    name: string | undefined,
+    publish: () => T
+  ): Promise<{ published: T; window: WorkspaceWindow }> {
     return this.serializeWorkspaceAccess(async () => {
       if (!isUsableTabLayoutState(layout)) {
         throw new Error("Invalid workspace template layout.");
@@ -449,10 +436,8 @@ export class WorkspaceLayoutStore {
       const windows = prepared.createdWindow
         ? [...this.windows, updated]
         : this.windows.map((candidate) => (candidate.id === updated.id ? updated : candidate));
-      await this.persist(true, { activeWindowId: updated.id, windows, templates: this.templates });
-      this.windows = windows;
-      this.activeWindowId = updated.id;
-      return updated;
+      const published = await this.commitWorkspaceAndPublish({ activeWindowId: updated.id, windows, templates: this.templates }, publish);
+      return { published, window: updated };
     });
   }
 
@@ -566,6 +551,29 @@ export class WorkspaceLayoutStore {
   private async persistAndEmit(): Promise<void> {
     await this.persist();
     this.notifyChange();
+  }
+
+  private async commitWorkspaceAndPublish<T>(state: WorkspacePersistenceState, publish: () => T): Promise<T> {
+    const priorState = this.persistenceState();
+    await this.persist(true, state);
+    this.replaceState(state);
+    try {
+      return publish();
+    } catch (publicationError) {
+      try {
+        await this.persist(true, priorState);
+      } catch (rollbackError) {
+        throw new AggregateError([publicationError, rollbackError], "Workspace publication failed and its layout rollback could not be persisted.");
+      }
+      this.replaceState(priorState);
+      throw publicationError;
+    }
+  }
+
+  private replaceState(state: WorkspacePersistenceState): void {
+    this.activeWindowId = state.activeWindowId;
+    this.windows = state.windows;
+    this.templates = state.templates;
   }
 
   private serializeWorkspaceAccess<T>(operation: () => Promise<T>): Promise<T> {

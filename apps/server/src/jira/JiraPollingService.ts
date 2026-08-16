@@ -51,9 +51,11 @@ const POLLING_SNAPSHOT_RETENTION_FLOOR = 1000;
 
 export class JiraPollingService {
   private timer: NodeJS.Timeout | undefined;
-  private running: Promise<Record<string, unknown>> | undefined;
+  private mutationTail: Promise<void> = Promise.resolve();
   private activeRun: AbortController | undefined;
+  private pollAdmitted = false;
   private disposed = false;
+  private disposePromise: Promise<void> | undefined;
 
   constructor(
     private readonly integration: JiraIntegrationService,
@@ -71,20 +73,24 @@ export class JiraPollingService {
   }
 
   async dispose(): Promise<void> {
+    if (this.disposePromise) {
+      return this.disposePromise;
+    }
     this.disposed = true;
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = undefined;
     }
-    const running = this.running;
     this.activeRun?.abort(new Error("CloudX is shutting down."));
-    await running;
+    this.disposePromise = this.mutationTail;
+    await this.disposePromise;
   }
 
   async runIfEnabled(): Promise<Record<string, unknown>> {
-    if (this.disposed) {
-      return disposedRun();
-    }
+    return this.admitPoll((signal) => this.runIfEnabledLocked(signal));
+  }
+
+  private async runIfEnabledLocked(signal: AbortSignal): Promise<Record<string, unknown>> {
     const config = this.integration.pollingConfig();
     if (!config.enabled) {
       return { skipped: true, reason: "disabled" };
@@ -100,14 +106,16 @@ export class JiraPollingService {
     if (state.lastRunAt && Date.parse(state.lastRunAt) + config.intervalSeconds * 1000 > now) {
       return { skipped: true, reason: "interval", lastRunAt: state.lastRunAt };
     }
-    return this.runOnce();
+    return this.runOnceLocked(signal);
   }
 
   async inspectOutbox(signal?: AbortSignal): Promise<JiraPollingOutboxSummary[]> {
-    signal?.throwIfAborted();
-    const state = await this.readState();
-    signal?.throwIfAborted();
-    return (state.outbox ?? []).map(outboxSummary);
+    return this.admitMutation(async () => {
+      signal?.throwIfAborted();
+      const state = await this.readState();
+      signal?.throwIfAborted();
+      return (state.outbox ?? []).map(outboxSummary);
+    });
   }
 
   async retryFailedOutbox(idempotencyKey: string, signal?: AbortSignal): Promise<JiraPollingOutboxSummary> {
@@ -119,13 +127,35 @@ export class JiraPollingService {
   }
 
   async runOnce(externalSignal?: AbortSignal): Promise<Record<string, unknown>> {
+    return this.admitPoll((signal) => this.runOnceLocked(signal), externalSignal);
+  }
+
+  private admitPoll(
+    operation: (signal: AbortSignal) => Promise<Record<string, unknown>>,
+    externalSignal?: AbortSignal,
+  ): Promise<Record<string, unknown>> {
     if (this.disposed) {
-      return disposedRun();
+      return Promise.resolve(disposedRun());
     }
     externalSignal?.throwIfAborted();
-    if (this.running) {
-      return { skipped: true, reason: "already_running" };
+    if (this.pollAdmitted) {
+      return Promise.resolve({ skipped: true, reason: "already_running" });
     }
+    this.pollAdmitted = true;
+    return this.admitMutation(async () => {
+      if (this.disposed) {
+        return disposedRun();
+      }
+      return this.runAdmittedPoll(operation, externalSignal);
+    }, true).finally(() => {
+      this.pollAdmitted = false;
+    });
+  }
+
+  private async runAdmittedPoll(
+    operation: (signal: AbortSignal) => Promise<Record<string, unknown>>,
+    externalSignal?: AbortSignal,
+  ): Promise<Record<string, unknown>> {
     const controller = new AbortController();
     const forwardAbort = () => controller.abort(externalSignal?.reason);
     externalSignal?.addEventListener("abort", forwardAbort, { once: true });
@@ -133,21 +163,28 @@ export class JiraPollingService {
       forwardAbort();
     }
     this.activeRun = controller;
-    this.running = this.runOnceLocked(controller.signal)
-      .catch((error: unknown) => {
-        if (this.disposed && controller.signal.aborted) {
-          return disposedRun();
-        }
-        throw error;
-      })
-      .finally(() => {
-        externalSignal?.removeEventListener("abort", forwardAbort);
-        if (this.activeRun === controller) {
-          this.activeRun = undefined;
-        }
-        this.running = undefined;
-      });
-    return this.running;
+    try {
+      return await operation(controller.signal);
+    } catch (error) {
+      if (this.disposed && controller.signal.aborted) {
+        return disposedRun();
+      }
+      throw error;
+    } finally {
+      externalSignal?.removeEventListener("abort", forwardAbort);
+      if (this.activeRun === controller) {
+        this.activeRun = undefined;
+      }
+    }
+  }
+
+  private admitMutation<T>(operation: () => Promise<T>, admittedPoll = false): Promise<T> {
+    if (this.disposed && !admittedPoll) {
+      return Promise.reject(new Error("Jira polling service is disposed."));
+    }
+    const run = this.mutationTail.then(operation);
+    this.mutationTail = run.then(() => undefined, () => undefined);
+    return run;
   }
 
   private async runOnceLocked(signal: AbortSignal): Promise<Record<string, unknown>> {
@@ -288,36 +325,38 @@ export class JiraPollingService {
     action: "retry" | "discard",
     signal?: AbortSignal
   ): Promise<JiraPollingOutboxSummary> {
-    signal?.throwIfAborted();
-    if (!idempotencyKey.trim()) {
-      throw new Error("Jira polling outbox idempotencyKey must be a non-empty string.");
-    }
-    const state = await this.readState();
-    signal?.throwIfAborted();
-    const outbox = state.outbox ?? [];
-    const index = outbox.findIndex((event) => event.idempotencyKey === idempotencyKey);
-    if (index === -1) {
-      throw new Error(`Unknown Jira polling outbox event: ${idempotencyKey}`);
-    }
-    const event = outbox[index]!;
-    if (event.status !== "failed") {
-      throw new Error(`Jira polling outbox event ${idempotencyKey} is not failed.`);
-    }
-    const nextOutbox = [...outbox];
-    if (action === "retry") {
-      nextOutbox[index] = {
-        idempotencyKey: event.idempotencyKey,
-        triggerId: event.triggerId,
-        payload: event.payload,
-        status: "prepared",
-        preparedAt: event.preparedAt
-      };
-    } else {
-      nextOutbox.splice(index, 1);
-    }
-    signal?.throwIfAborted();
-    await this.pluginData.write(JIRA_PLUGIN_ID, { ...state, outbox: nextOutbox });
-    return outboxSummary(action === "retry" ? nextOutbox[index]! : event);
+    return this.admitMutation(async () => {
+      signal?.throwIfAborted();
+      if (!idempotencyKey.trim()) {
+        throw new Error("Jira polling outbox idempotencyKey must be a non-empty string.");
+      }
+      const state = await this.readState();
+      signal?.throwIfAborted();
+      const outbox = state.outbox ?? [];
+      const index = outbox.findIndex((event) => event.idempotencyKey === idempotencyKey);
+      if (index === -1) {
+        throw new Error(`Unknown Jira polling outbox event: ${idempotencyKey}`);
+      }
+      const event = outbox[index]!;
+      if (event.status !== "failed") {
+        throw new Error(`Jira polling outbox event ${idempotencyKey} is not failed.`);
+      }
+      const nextOutbox = [...outbox];
+      if (action === "retry") {
+        nextOutbox[index] = {
+          idempotencyKey: event.idempotencyKey,
+          triggerId: event.triggerId,
+          payload: event.payload,
+          status: "prepared",
+          preparedAt: event.preparedAt
+        };
+      } else {
+        nextOutbox.splice(index, 1);
+      }
+      signal?.throwIfAborted();
+      await this.pluginData.write(JIRA_PLUGIN_ID, { ...state, outbox: nextOutbox });
+      return outboxSummary(action === "retry" ? nextOutbox[index]! : event);
+    });
   }
 
   private async storeRateLimit(state: JiraPollingState, startedAt: string, error: JiraRateLimitError): Promise<Record<string, unknown>> {

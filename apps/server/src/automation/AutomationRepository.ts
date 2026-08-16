@@ -237,7 +237,7 @@ export class AutomationRepository {
       return [];
     }
     const cancelled = await this.withStore(
-      (store) => {
+      async (store) => {
         const finishedAt = new Date().toISOString();
         const terminal = runs
           .filter((run) => run.status === "queued" || run.status === "running")
@@ -248,6 +248,7 @@ export class AutomationRepository {
             error: reason,
           }));
         if (terminal.length === 0) return storeMutation([], false);
+        await terminalizeBatch(this.claimLedger, terminal);
         const replacements = new Map(terminal.map((run) => [run.id, run]));
         const retained = store.runs.filter((run) => !replacements.has(run.id));
         store.runs = trimRunHistory([...terminal, ...retained]);
@@ -255,16 +256,16 @@ export class AutomationRepository {
       },
       { requireDurableWrite: true },
     );
-    await Promise.all(
-      cancelled.map((run) => this.claimLedger.terminalize(run)),
-    );
     for (const run of cancelled) this.admittedRuns().delete(run.id);
     return cancelled;
   }
 
   async saveRun(run: AutomationRunSummary): Promise<AutomationRunSummary> {
     const saved = await this.withStore(
-      (store) => {
+      async (store) => {
+        if (isTerminalTriggerRun(run)) {
+          await this.claimLedger.terminalize(run);
+        }
         const index = store.runs.findIndex(
           (candidate) => candidate.id === run.id,
         );
@@ -278,7 +279,6 @@ export class AutomationRepository {
       },
       { requireDurableWrite: true },
     );
-    await this.claimLedger.terminalize(saved);
     if (saved.status !== "queued" && saved.status !== "running")
       this.admittedRuns().delete(saved.id);
     return saved;
@@ -506,6 +506,32 @@ function trimRunHistory(runs: AutomationRunSummary[]): AutomationRunSummary[] {
     terminalRuns += 1;
     return terminalRuns <= RUN_HISTORY_LIMIT;
   });
+}
+
+function isTerminalTriggerRun(run: AutomationRunSummary): boolean {
+  return Boolean(
+    run.triggerEventId && run.status !== "queued" && run.status !== "running",
+  );
+}
+
+async function terminalizeBatch(
+  ledger: AutomationClaimLedger,
+  runs: AutomationRunSummary[],
+): Promise<void> {
+  const results = await Promise.allSettled(
+    runs.map((run) => ledger.terminalize(run)),
+  );
+  const failures = results
+    .filter(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    )
+    .map((result) => result.reason);
+  if (failures.length) {
+    throw new AggregateError(
+      failures,
+      "Automation cancellation could not durably terminalize every claim.",
+    );
+  }
 }
 
 function normalizeTriggerEvents(value: unknown): TriggerEvent[] {

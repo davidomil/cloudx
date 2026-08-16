@@ -1,7 +1,7 @@
 import type { ApplyWorkspaceLayoutTemplateRequest, CreateTabRequest, CreateTabResponse, WorkspaceWindow } from "@cloudx/shared";
 
 import type { SessionStore } from "../sessionStore.js";
-import type { WorkspaceLayoutSnapshot, WorkspaceLayoutStore } from "./WorkspaceLayoutStore.js";
+import type { WorkspaceLayoutStore } from "./WorkspaceLayoutStore.js";
 
 export class WorkspaceCommandService {
   private commandQueue: Promise<void> = Promise.resolve();
@@ -33,24 +33,22 @@ export class WorkspaceCommandService {
       pluginMetadata: request.pluginMetadata
     });
 
-    const priorWorkspace = this.workspace.snapshot();
-    let workspaceCommitted = false;
     try {
       this.sessions.assertPreparedTabsReady([tab.id]);
-      const window = await this.workspace.placeTab({
-        tabId: tab.id,
-        windowId: targetWindow.id,
-        paneId,
-        newPane: request.newPane,
-        splitDirection: request.splitDirection
-      });
-      workspaceCommitted = true;
-      this.sessions.assertPreparedTabsReady([tab.id]);
-      const publishedTab = this.sessions.publishPreparedTab(tab.id);
+      const { published: publishedTab, window } = await this.workspace.placeTabAndPublish(
+        {
+          tabId: tab.id,
+          windowId: targetWindow.id,
+          paneId,
+          newPane: request.newPane,
+          splitDirection: request.splitDirection
+        },
+        () => this.sessions.publishPreparedTab(tab.id)
+      );
       this.workspace.notifyChange();
       return { tab: publishedTab, window };
     } catch (error) {
-      await this.rollbackPreparedTabs([tab.id], workspaceCommitted ? priorWorkspace : undefined, error);
+      await this.rollbackPreparedTabs([tab.id], error);
       throw error;
     }
   }
@@ -59,8 +57,6 @@ export class WorkspaceCommandService {
     const prepared = await this.workspace.prepareTemplateApplication(requireId(templateId, "templateId"), input);
     const tabIdMap = new Map<string, string>();
     const stagedTabIds: string[] = [];
-    let workspaceCommitted = false;
-    let priorWorkspace: WorkspaceLayoutSnapshot | undefined;
     let window: WorkspaceWindow;
     try {
       for (const templateTab of prepared.template.tabs) {
@@ -79,13 +75,14 @@ export class WorkspaceCommandService {
         stagedTabIds.push(tab.id);
       }
       this.sessions.assertPreparedTabsReady(stagedTabIds);
-      priorWorkspace = this.workspace.snapshot();
-      window = await this.workspace.commitTemplateApplication(prepared, this.workspace.remapTemplateLayout(prepared.template, tabIdMap), input.name);
-      workspaceCommitted = true;
-      this.sessions.assertPreparedTabsReady(stagedTabIds);
-      this.sessions.publishPreparedTabs(stagedTabIds);
+      ({ window } = await this.workspace.commitTemplateAndPublish(
+        prepared,
+        this.workspace.remapTemplateLayout(prepared.template, tabIdMap),
+        input.name,
+        () => this.sessions.publishPreparedTabs(stagedTabIds)
+      ));
     } catch (error) {
-      await this.rollbackPreparedTabs(stagedTabIds, workspaceCommitted ? priorWorkspace : undefined, error);
+      await this.rollbackPreparedTabs(stagedTabIds, error);
       throw error;
     }
 
@@ -110,15 +107,8 @@ export class WorkspaceCommandService {
     return run;
   }
 
-  private async rollbackPreparedTabs(tabIds: string[], priorWorkspace: WorkspaceLayoutSnapshot | undefined, cause: unknown): Promise<void> {
+  private async rollbackPreparedTabs(tabIds: string[], cause: unknown): Promise<void> {
     const failures: unknown[] = [];
-    if (priorWorkspace) {
-      try {
-        await this.workspace.restore(priorWorkspace);
-      } catch (error) {
-        failures.push(error);
-      }
-    }
     for (const tabId of [...tabIds].reverse()) {
       try {
         await this.sessions.discardPreparedTab(tabId);

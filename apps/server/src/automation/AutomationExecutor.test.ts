@@ -13,7 +13,10 @@ import { AutomationExecutor } from "./AutomationExecutor.js";
 import { AutomationTypeService } from "./AutomationTypeService.js";
 
 describe("AutomationExecutor", () => {
-  afterEach(() => {
+  const ownedProcessGroups = new Set<number>();
+
+  afterEach(async () => {
+    await terminateRecordedProcessGroups(ownedProcessGroups);
     vi.useRealTimers();
     vi.unstubAllEnvs();
   });
@@ -674,6 +677,54 @@ describe("AutomationExecutor", () => {
     expect(Date.now() - startedAt).toBeLessThan(3000);
   });
 
+  it("fails a Python primitive only after its leader-exit descendant group is empty", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-python-descendant-"));
+    const pidFile = path.join(dataDir, "descendant.pid");
+    const runPromise = new AutomationExecutor().execute(
+      processPrimitiveGroup("primitive:python.exec", {
+        code: [
+          "import subprocess, sys",
+          `body = ${JSON.stringify(`import os, signal, time\nsignal.signal(signal.SIGTERM, lambda *_: None)\nopen(${JSON.stringify(pidFile)}, 'w').write(str(os.getpid()))\nwhile True: time.sleep(1)`)}`,
+          "subprocess.Popen([sys.executable, '-c', body], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)",
+        ].join("\n"),
+        timeoutMs: 5_000,
+      }),
+      event(),
+      await primitiveCatalog(),
+      new HookRegistry(),
+      { allowedRoots: [dataDir] },
+    );
+    const processGroup = await recordedProcessGroup(pidFile, ownedProcessGroups);
+    const run = await runPromise;
+
+    expect(run.status).toBe("failed");
+    expect(run.error).toContain("left descendant processes running");
+    expect(await processGroupHasRunningMember(processGroup)).toBe(false);
+    expect(run.trace.map((entry) => entry.message)).not.toContain("after process");
+  });
+
+  it("awaits SIGKILL of a TERM-resistant Bash descendant after timeout", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-bash-descendant-"));
+    const pidFile = path.join(dataDir, "descendant.pid");
+    const runPromise = new AutomationExecutor().execute(
+      processPrimitiveGroup("primitive:bash.exec", {
+        script: `bash --noprofile --norc -c 'trap "" TERM; printf "%s" "$$" > "$1"; exec </dev/null >/dev/null 2>&1; while :; do :; done' bash ${shellWord(pidFile)} &\nwhile :; do :; done`,
+        timeoutMs: 30,
+      }),
+      event(),
+      await primitiveCatalog(),
+      new HookRegistry(),
+      { allowedRoots: [dataDir] },
+    );
+    const processGroup = await recordedProcessGroup(pidFile, ownedProcessGroups);
+    const run = await runPromise;
+
+    expect(run.status).toBe("failed");
+    expect(run.error).toContain("Bash process timed out after 30 ms");
+    expect(await processGroupHasRunningMember(processGroup)).toBe(false);
+    expect(run.trace.map((entry) => entry.message)).not.toContain("after process");
+  });
+
   it("rejects Python working directories outside allowed roots", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-python-root-"));
     const outside = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-python-outside-"));
@@ -788,6 +839,75 @@ console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_messag
     const run = await runPromise;
 
     expect(run.status).toBe("cancelled");
+    expect(run.trace.map((entry) => entry.message)).not.toContain("after codex");
+  });
+
+  it.each([
+    { name: "missing executable", prepare: async (root: string) => path.join(root, "missing-codex") },
+    {
+      name: "non-executable file",
+      prepare: async (root: string) => {
+        const executable = path.join(root, "non-executable-codex");
+        await fs.writeFile(executable, "#!/usr/bin/env node\n", { mode: 0o600 });
+        return executable;
+      },
+    },
+  ])("settles a Codex $name spawn error once and keeps later automations usable", async ({ prepare }) => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-spawn-error-"));
+    const uncaught: unknown[] = [];
+    const recordUncaught = (error: unknown) => uncaught.push(error);
+    process.prependListener("uncaughtException", recordUncaught);
+    try {
+      vi.stubEnv("CLOUDX_ASSISTANT_BIN", await prepare(dataDir));
+      const failed = await new AutomationExecutor().execute(
+        codexExecGroup({ json: false }),
+        event(),
+        await primitiveCatalog(),
+        new HookRegistry(),
+        { allowedRoots: [dataDir] },
+      );
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(failed.status).toBe("failed");
+      expect(failed.error).toMatch(/ENOENT|EACCES/u);
+      expect(failed.trace.map((entry) => entry.message)).not.toContain("after codex");
+      expect(uncaught).toEqual([]);
+
+      const subsequent = await new AutomationExecutor().execute(
+        stringOperationGroup(),
+        event(),
+        await primitiveCatalog(),
+        new HookRegistry(),
+      );
+      expect(subsequent.status).toBe("succeeded");
+    } finally {
+      process.removeListener("uncaughtException", recordUncaught);
+    }
+  });
+
+  it("does not settle Codex cancellation before its TERM-resistant descendant is gone", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-descendant-"));
+    const pidFile = path.join(dataDir, "descendant.pid");
+    const fakeCodex = await fakeCodexExecutable(dataDir, `
+import { spawn } from "node:child_process";
+spawn(process.execPath, ["-e", ${JSON.stringify(`const fs = require('node:fs'); fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);`)}], { stdio: "ignore" });
+setInterval(() => undefined, 1000);
+`);
+    vi.stubEnv("CLOUDX_ASSISTANT_BIN", fakeCodex);
+    const controller = new AbortController();
+    const runPromise = new AutomationExecutor().execute(
+      codexExecGroup({ json: false }),
+      event(),
+      await primitiveCatalog(),
+      new HookRegistry(),
+      { allowedRoots: [dataDir], signal: controller.signal },
+    );
+    const processGroup = await recordedProcessGroup(pidFile, ownedProcessGroups);
+    controller.abort();
+    const run = await runPromise;
+
+    expect(run.status).toBe("cancelled");
+    expect(await processGroupHasRunningMember(processGroup)).toBe(false);
     expect(run.trace.map((entry) => entry.message)).not.toContain("after codex");
   });
 
@@ -1990,6 +2110,87 @@ async function fakeCodexExecutable(directory: string, body: string): Promise<str
   await fs.writeFile(file, `#!/usr/bin/env node\n${body}\n`, "utf8");
   await fs.chmod(file, 0o755);
   return file;
+}
+
+function processPrimitiveGroup(
+  typeId: "primitive:python.exec" | "primitive:bash.exec",
+  config: Record<string, unknown>,
+): AutomationGroup {
+  const now = new Date(0).toISOString();
+  return {
+    id: `group-${typeId}`,
+    name: "Owned process group",
+    enabled: true,
+    createdAt: now,
+    updatedAt: now,
+    graph: {
+      schemaVersion: 2,
+      allowedSafety: ["read", "write", "external"],
+      nodes: [
+        { id: "trigger", typeId: "trigger:test.started", position: { x: 0, y: 0 } },
+        { id: "process", typeId, position: { x: 160, y: 0 }, config },
+        { id: "after", typeId: "primitive:log", position: { x: 360, y: 0 }, config: { message: "after process" } },
+      ],
+      edges: [
+        { id: "exec-1", kind: "exec", sourceNodeId: "trigger", sourcePortId: "exec", targetNodeId: "process", targetPortId: "exec" },
+        { id: "exec-2", kind: "exec", sourceNodeId: "process", sourcePortId: "exec", targetNodeId: "after", targetPortId: "exec" },
+      ],
+      variables: [],
+    },
+  };
+}
+
+async function recordedProcessGroup(file: string, groups: Set<number>): Promise<number> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const value = await fs.readFile(file, "utf8").catch(() => "");
+    const pid = Number(value);
+    if (Number.isSafeInteger(pid) && pid > 1) {
+      const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      const processGroup = Number(fields[2]);
+      if (Number.isSafeInteger(processGroup) && processGroup > 1) {
+        groups.add(processGroup);
+        return processGroup;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for descendant PID file ${file}.`);
+}
+
+async function processGroupHasRunningMember(processGroup: number): Promise<boolean> {
+  const entries = await fs.readdir("/proc", { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
+    const stat = await fs.readFile(`/proc/${entry.name}/stat`, "utf8").catch(() => undefined);
+    if (!stat) continue;
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    if (Number(fields[2]) === processGroup && fields[0] !== "Z" && fields[0] !== "X") return true;
+  }
+  return false;
+}
+
+async function terminateRecordedProcessGroups(groups: Set<number>): Promise<void> {
+  for (const processGroup of groups) {
+    try {
+      process.kill(-processGroup, "SIGKILL");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    }
+  }
+  for (const processGroup of groups) {
+    const deadline = Date.now() + 2_000;
+    while (await processGroupHasRunningMember(processGroup)) {
+      if (Date.now() >= deadline) throw new Error(`Process group ${processGroup} survived emergency cleanup.`);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  groups.clear();
+}
+
+function shellWord(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
 function nonObjectJsonConverterGroup(value: string): AutomationGroup {

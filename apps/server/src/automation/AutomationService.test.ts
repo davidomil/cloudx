@@ -16,6 +16,71 @@ import { AutomationService } from "./AutomationService.js";
 import { AutomationTypeService } from "./AutomationTypeService.js";
 
 describe("AutomationService", () => {
+  it("observes current and later run snapshots and cleans up failed waits", async () => {
+    vi.useFakeTimers();
+    try {
+      const succeededRun = {
+        id: "run-1",
+        groupId: "group-1",
+        status: "succeeded",
+        startedAt: new Date(0).toISOString(),
+        trace: []
+      } satisfies AutomationRunSummary;
+      let runs: AutomationRunSummary[] = [succeededRun];
+      const listeners = new Set<(items: AutomationRunSummary[]) => void>();
+      const unsubscribe = vi.fn();
+      const observationOrder: string[] = [];
+      const service = {
+        onRunsChange(listener: (items: AutomationRunSummary[]) => void) {
+          observationOrder.push("subscribe");
+          listeners.add(listener);
+          return () => {
+            listeners.delete(listener);
+            unsubscribe();
+          };
+        }
+      } as unknown as AutomationService;
+      const repository = {
+        listRuns: vi.fn(async () => {
+          observationOrder.push("read");
+          return runs;
+        })
+      } as unknown as AutomationRepository;
+
+      await expect(waitForRuns(service, repository, 1)).resolves.toEqual([succeededRun]);
+      expect(observationOrder.slice(0, 2)).toEqual(["subscribe", "read"]);
+      expect(listeners.size).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+
+      runs = [];
+      const later = waitForRuns(service, repository, 1);
+      await Promise.resolve();
+      expect(listeners.size).toBe(1);
+      runs = [succeededRun];
+      for (const listener of listeners) listener(runs);
+      await expect(later).resolves.toEqual([succeededRun]);
+      expect(listeners.size).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+
+      runs = [];
+      const never = expect(waitForRuns(service, repository, 1)).rejects.toThrow(
+        "Timed out waiting for 1 automation runs; observed none."
+      );
+      await vi.advanceTimersByTimeAsync(4_000);
+      await never;
+      expect(listeners.size).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+
+      vi.mocked(repository.listRuns).mockRejectedValueOnce(new Error("run store unavailable"));
+      await expect(waitForRuns(service, repository, 1)).rejects.toThrow("run store unavailable");
+      expect(listeners.size).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(unsubscribe).toHaveBeenCalledTimes(4);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not report ready until interrupted-run recovery settles", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-ready-"));
     const repository = new AutomationRepository(dataDir);
@@ -99,7 +164,7 @@ describe("AutomationService", () => {
     await service.saveGroup(group("disabled", false));
 
     await triggers.emit("fake.started", { text: "go" }, { kind: "test" });
-    const runs = await waitForRuns(repository, 2, (runs) => runs.every((run) => run.status === "succeeded"));
+    const runs = await waitForRuns(service, repository, 2, (runs) => runs.every((run) => run.status === "succeeded"));
 
     expect(runs).toHaveLength(2);
     expect(runs.map((run) => run.groupId).sort()).toEqual(["enabled-a", "enabled-b"]);
@@ -171,7 +236,7 @@ describe("AutomationService", () => {
     const payload = { eventId: "jira:site:jira.issueUpdated:ENG-1:updated-1" };
     await triggers.emit("jira.issueUpdated", payload, { kind: "plugin", pluginId: "jira" });
     await triggers.emit("jira.issueUpdated", payload, { kind: "plugin", pluginId: "jira" });
-    const runs = await waitForRuns(repository, 2);
+    const runs = await waitForRuns(service, repository, 1, (items) => items.every((run) => run.status === "succeeded"));
 
     expect(runs).toHaveLength(1);
     expect(runs[0]).toMatchObject({
@@ -300,7 +365,7 @@ describe("AutomationService", () => {
 
     const runPromise = service.startTest("cancel", {});
     await waitStarted;
-    const [running] = await waitForRuns(repository, 1);
+    const [running] = await waitForRuns(service, repository, 1);
     expect(running?.status).toBe("running");
 
     await service.cancelRun(running!.id);
@@ -695,6 +760,37 @@ describe("AutomationService", () => {
     await expect(run).resolves.toMatchObject({ sample: { status: "cancelled" } });
   });
 
+  it("does not finish disposal before a real automation process group is empty", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-service-process-dispose-"));
+    const pidFile = path.join(dataDir, "descendant.pid");
+    const repository = new AutomationRepository(dataDir);
+    const triggers = new TriggerRegistry({ recordEvent: (event) => repository.appendTriggerEvent(event) });
+    triggers.register(triggerDefinition());
+    const hooks = new HookRegistry();
+    const typeService = new AutomationTypeService();
+    const service = new AutomationService(
+      repository,
+      triggers,
+      hooks,
+      new AutomationCatalogService(typeService, () => triggers.list(), () => hooks.list()),
+      new AutomationCompiler(typeService),
+      new AutomationExecutor(),
+      { executorOptions: { allowedRoots: [dataDir] } },
+    );
+    await service.saveGroup(processDisposalGroup(pidFile));
+    const run = service.startTest("process-dispose", {});
+    const processGroup = await recordedProcessGroup(pidFile);
+    try {
+      const disposal = service.dispose();
+      await disposal;
+
+      expect(await processGroupHasRunningMember(processGroup)).toBe(false);
+      await expect(run).resolves.toMatchObject({ sample: { status: "cancelled" } });
+    } finally {
+      await terminateProcessGroup(processGroup);
+    }
+  });
+
   it("cancels durable same-trigger claims waiting behind an active run during disposal", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-service-dispose-queued-"));
     const repository = new AutomationRepository(dataDir);
@@ -753,7 +849,7 @@ describe("AutomationService", () => {
     await triggers.emit("fake.started", {}, { kind: "test" });
     await waitStarted.promise;
     await triggers.emit("fake.started", {}, { kind: "test" });
-    await waitForRuns(repository, 4);
+    await waitForRuns(service, repository, 4);
 
     let disposalSettled = false;
     const disposal = service.dispose().then(() => {
@@ -914,15 +1010,16 @@ describe("AutomationService", () => {
       new AutomationCompiler(typeService),
       new AutomationExecutor()
     );
-    await service.saveGroup(group("enabled", true));
+    await service.saveGroup({ ...recordOnlyGroup("enabled"), enabled: true });
     const listGroups = vi.spyOn(repository, "listGroups").mockRejectedValueOnce(new Error("store unavailable"));
 
     await expect(triggers.emit("fake.started", {}, { kind: "test" })).rejects.toThrow("store unavailable");
     listGroups.mockRestore();
     await triggers.emit("fake.started", {}, { kind: "test" });
-    const runs = await waitForRuns(repository, 1, (items) => items.every((run) => run.status === "succeeded"));
+    const runs = await waitForRuns(service, repository, 1, (items) => items.every((run) => run.status === "succeeded"));
 
     expect(runs).toHaveLength(1);
+    expect(runs[0]?.status).toBe("succeeded");
   });
 
   it("retries an atomically failed multi-group fanout without stranding a claim", async () => {
@@ -975,21 +1072,47 @@ describe("AutomationService", () => {
     await expect(repository.listRuns()).resolves.toEqual([]);
 
     await triggers.emit("plugin.started", payload, { kind: "plugin", pluginId: "fake-plugin" });
-    const runs = await waitForRuns(repository, 2, (items) => items.every((run) => run.status === "succeeded"));
+    const runs = await waitForRuns(service, repository, 2, (items) => items.every((run) => run.status === "succeeded"));
     expect(runs.map((run) => run.groupId).sort()).toEqual(["first", "second"]);
     expect(executions).toBe(2);
   });
 });
 
-async function waitForRuns(repository: AutomationRepository, count: number, ready: (runs: Awaited<ReturnType<AutomationRepository["listRuns"]>>) => boolean = () => true) {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    const runs = await repository.listRuns();
-    if (runs.length >= count && ready(runs)) {
-      return runs;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  return repository.listRuns();
+function waitForRuns(
+  service: AutomationService,
+  repository: AutomationRepository,
+  count: number,
+  ready: (runs: Awaited<ReturnType<AutomationRepository["listRuns"]>>) => boolean = () => true
+): Promise<Awaited<ReturnType<AutomationRepository["listRuns"]>>> {
+  return new Promise((resolve, reject) => {
+    let lastRuns: Awaited<ReturnType<AutomationRepository["listRuns"]>> = [];
+    let settled = false;
+    let watchdog: ReturnType<typeof setTimeout>;
+    const finish = (complete: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(watchdog);
+      unsubscribe();
+      complete();
+    };
+    const rejectWait = (error: unknown) => finish(() => reject(error));
+    const accept = (runs: Awaited<ReturnType<AutomationRepository["listRuns"]>>) => {
+      lastRuns = runs;
+      try {
+        if (runs.length >= count && ready(runs)) {
+          finish(() => resolve(runs));
+        }
+      } catch (error) {
+        rejectWait(error);
+      }
+    };
+    const unsubscribe = service.onRunsChange(accept);
+    watchdog = setTimeout(
+      () => rejectWait(new Error(`Timed out waiting for ${count} automation runs; observed ${lastRuns.map((run) => run.status).join(", ") || "none"}.`)),
+      4_000
+    );
+    void repository.listRuns().then(accept, rejectWait);
+  });
 }
 
 async function waitUntil(predicate: () => boolean): Promise<void> {
@@ -1108,6 +1231,78 @@ function cancelGroup(): AutomationGroup {
       variables: []
     }
   };
+}
+
+function processDisposalGroup(pidFile: string): AutomationGroup {
+  const now = new Date(0).toISOString();
+  return {
+    id: "process-dispose",
+    name: "process-dispose",
+    enabled: false,
+    createdAt: now,
+    updatedAt: now,
+    graph: {
+      schemaVersion: 2,
+      allowedSafety: ["read", "write", "external"],
+      nodes: [
+        { id: "trigger", typeId: "trigger:fake.started", position: { x: 0, y: 0 } },
+        {
+          id: "bash",
+          typeId: "primitive:bash.exec",
+          position: { x: 200, y: 0 },
+          config: {
+            script: `bash --noprofile --norc -c 'trap "" TERM; printf "%s" "$$" > "$1"; exec </dev/null >/dev/null 2>&1; while :; do :; done' bash '${pidFile.replaceAll("'", `'"'"'`)}' &\nwhile :; do :; done`,
+            timeoutMs: 10_000,
+          },
+        },
+      ],
+      edges: [
+        { id: "exec", kind: "exec", sourceNodeId: "trigger", sourcePortId: "exec", targetNodeId: "bash", targetPortId: "exec" },
+      ],
+      variables: [],
+    },
+  };
+}
+
+async function recordedProcessGroup(file: string): Promise<number> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const value = await fs.readFile(file, "utf8").catch(() => "");
+    const pid = Number(value);
+    if (Number.isSafeInteger(pid) && pid > 1) {
+      const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      const processGroup = Number(fields[2]);
+      if (Number.isSafeInteger(processGroup) && processGroup > 1) return processGroup;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for descendant PID file ${file}.`);
+}
+
+async function processGroupHasRunningMember(processGroup: number): Promise<boolean> {
+  const entries = await fs.readdir("/proc", { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
+    const stat = await fs.readFile(`/proc/${entry.name}/stat`, "utf8").catch(() => undefined);
+    if (!stat) continue;
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    if (Number(fields[2]) === processGroup && fields[0] !== "Z" && fields[0] !== "X") return true;
+  }
+  return false;
+}
+
+async function terminateProcessGroup(processGroup: number): Promise<void> {
+  try {
+    process.kill(-processGroup, "SIGKILL");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  }
+  const deadline = Date.now() + 2_000;
+  while (await processGroupHasRunningMember(processGroup)) {
+    if (Date.now() >= deadline) throw new Error(`Process group ${processGroup} survived emergency cleanup.`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 function recordOnlyGroup(id: string): AutomationGroup {

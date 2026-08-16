@@ -2,7 +2,6 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest, 
 import websocket from "@fastify/websocket";
 import staticPlugin from "@fastify/static";
 import fs from "node:fs";
-import type { IncomingHttpHeaders } from "node:http";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -39,6 +38,7 @@ import { DocumentationIngestQueue } from "./documentation/DocumentationIngestQue
 import { CodexDocumentationEnrichmentRunner, DocumentationEnrichmentService } from "./documentation/DocumentationEnrichmentService.js";
 import { reapDocumentationUploadSpool, spoolDocumentationUpload, type DocumentationUploadSpool } from "./documentation/DocumentationUploadSpool.js";
 import { PathPolicy } from "./pathPolicy.js";
+import { WorktreeService } from "./git/WorktreeService.js";
 import { PluginRegistry } from "./pluginRegistry.js";
 import { LOCAL_WEB_PROXY_MAX_BODY_BYTES, LocalWebProxy } from "./localWebProxy.js";
 import { contentDispositionAttachment, FileTransferService, FileUploadTooLargeError } from "./fileTransfer.js";
@@ -181,52 +181,62 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   await app.register(websocket, {
     options: {
       maxPayload: Math.max(config.voiceAudioUploadMaxBytes, VOICE_WS_CONTROL_MESSAGE_MAX_BYTES),
-      perMessageDeflate: false,
-      verifyClient: verifyWebSocketClient
+      perMessageDeflate: false
+    }
+  });
+  const trustedOrigins = new Set(config.trustedOrigins);
+  const trustedAuthorities = new Set(config.trustedOrigins.flatMap((origin) => trustedOriginAuthorities(origin)));
+  app.addHook("onRequest", async (request, reply) => {
+    if (!isTrustedRequest(request.raw.rawHeaders, trustedOrigins, trustedAuthorities)) {
+      return reply.code(403).send({ error: "Forbidden" });
     }
   });
 
-  const failures: unknown[] = [];
-  let producerShutdown: Promise<void> | undefined;
-  let requestOwnerShutdown: Promise<void> | undefined;
-  let shutdownStarted = false;
-  const beginShutdown = (): void => {
-    if (shutdownStarted) {
-      return;
+  let shutdownPromise: Promise<void> | undefined;
+  const shutdown = (): Promise<void> => {
+    if (shutdownPromise) {
+      return shutdownPromise;
     }
-    shutdownStarted = true;
-    try {
-      services.automation?.beginShutdown();
-    } catch (error) {
-      failures.push(error);
-    }
+    let voiceAdmissionFailure: unknown;
     try {
       services.voice.beginShutdown?.();
     } catch (error) {
-      failures.push(error);
+      voiceAdmissionFailure = error;
     }
-    requestOwnerShutdown = settleDisposers(failures, [
+    const requestOwnerShutdown = settleDisposers([
       () => services.documentationIngestQueue?.dispose(),
       () => services.voice.dispose?.()
     ]);
-    producerShutdown = settleDisposers(failures, [
+    const producerShutdown = settleDisposers([
       () => services.jiraPolling?.dispose(),
       () => services.sessions.dispose?.()
     ]);
+    shutdownPromise = (async () => {
+      const [requestOwnerFailures, producerFailures] = await Promise.all([requestOwnerShutdown, producerShutdown]);
+      const failures: unknown[] = ([
+        requestOwnerFailures[0],
+        voiceAdmissionFailure,
+        ...requestOwnerFailures.slice(1),
+        ...producerFailures
+      ] as unknown[]).filter((failure) => failure !== undefined);
+      const automationFailures: unknown[] = [];
+      try {
+        services.automation?.beginShutdown();
+      } catch (error) {
+        automationFailures.push(error);
+      }
+      automationFailures.push(...await settleDisposers([() => services.automation?.dispose()]));
+      failures.push(...automationFailures);
+      failures.push(...await settleDisposers([() => disposePersistenceNotifications()]));
+      if (failures.length > 0) {
+        throw new AggregateError(failures, "One or more server services failed to stop.");
+      }
+    })();
+    return shutdownPromise;
   };
 
-  app.addHook("preClose", () => {
-    beginShutdown();
-  });
-  app.addHook("onClose", async () => {
-    beginShutdown();
-    await Promise.all([producerShutdown, requestOwnerShutdown]);
-    await settleDisposers(failures, [() => services.automation?.dispose()]);
-    await settleDisposers(failures, [() => disposePersistenceNotifications()]);
-    if (failures.length > 0) {
-      throw new AggregateError(failures, "One or more server services failed to stop.");
-    }
-  });
+  app.addHook("preClose", shutdown);
+  app.addHook("onClose", shutdown);
 
   app.addContentTypeParser(/^audio\/.*/, { parseAs: "buffer", bodyLimit: config.voiceAudioUploadMaxBytes }, (_request, body, done) => {
     done(null, body);
@@ -495,7 +505,13 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     const admission = services.documentationIngestQueue!.reserve(contentLength);
     let upload: DocumentationUploadSpool | undefined;
     try {
-      upload = await spoolDocumentationUpload(request.body, documentationSpoolRoot(config), contentLength, config.documentationUploadMaxBytes);
+      upload = await admission.runBeforeEnqueue((signal) => spoolDocumentationUpload(
+        request.body,
+        documentationSpoolRoot(config),
+        contentLength,
+        config.documentationUploadMaxBytes,
+        { signal }
+      ));
       return await services.documentationIngestQueue!.enqueueReserved({
         kind: "upload",
         label: title ?? filename,
@@ -568,7 +584,13 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     const admission = services.documentationIngestQueue!.reserve(contentLength);
     let upload: DocumentationUploadSpool | undefined;
     try {
-      upload = await spoolDocumentationUpload(request.body, documentationSpoolRoot(config), contentLength, config.documentationUploadMaxBytes);
+      upload = await admission.runBeforeEnqueue((signal) => spoolDocumentationUpload(
+        request.body,
+        documentationSpoolRoot(config),
+        contentLength,
+        config.documentationUploadMaxBytes,
+        { signal }
+      ));
       return await services.documentationIngestQueue!.enqueueReserved({
         kind: "upload",
         label: filename,
@@ -1129,7 +1151,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   plugins.register(new FileBrowserPlugin(pathPolicy));
   plugins.register(new LocalWebPlugin());
   plugins.register(new DocumentationPlugin(documentation, pathPolicy, documentationIngestQueue, () => documentationEnrichment));
-  plugins.register(new WorktreeManagerPlugin());
+  plugins.register(new WorktreeManagerPlugin(new WorktreeService(pathPolicy)));
   plugins.register(new WorkspaceControlPlugin());
   let jira: JiraIntegrationService | undefined;
   let jiraPolling: JiraPollingService | undefined;
@@ -1316,27 +1338,27 @@ export function serializeRequestForLog(request: Pick<FastifyRequest, "method" | 
   };
 }
 
-export function isAllowedWebSocketOrigin(originHeader: string | string[] | undefined, hostHeader: string | string[] | undefined): boolean {
-  const originValue = singleHeaderValue(originHeader);
-  if (originHeader !== undefined && !originValue) {
-    return false;
+function isTrustedRequest(rawHeaders: string[], trustedOrigins: Set<string>, trustedAuthorities: Set<string>): boolean {
+  const hosts = rawHeaderValues(rawHeaders, "host");
+  const origins = rawHeaderValues(rawHeaders, "origin");
+  return hosts.length === 1
+    && trustedAuthorities.has(hosts[0]!)
+    && origins.length <= 1
+    && (origins.length === 0 || trustedOrigins.has(origins[0]!));
+}
+
+function rawHeaderValues(rawHeaders: string[], name: string): string[] {
+  const values: string[] = [];
+  for (let index = 0; index < rawHeaders.length; index += 2) {
+    if (rawHeaders[index]?.toLowerCase() === name) values.push(rawHeaders[index + 1] ?? "");
   }
-  if (!originValue) {
-    return true;
-  }
-  const hostValue = singleHeaderValue(hostHeader);
-  if (!hostValue) {
-    return false;
-  }
-  try {
-    const origin = new URL(originValue.trim());
-    if (origin.protocol !== "http:" && origin.protocol !== "https:") {
-      return false;
-    }
-    return normalizedHost(origin.host) === normalizedHost(hostValue);
-  } catch {
-    return false;
-  }
+  return values;
+}
+
+function trustedOriginAuthorities(origin: string): string[] {
+  const parsed = new URL(origin);
+  const explicitDefaultPort = parsed.protocol === "https:" ? "443" : "80";
+  return parsed.port ? [parsed.host] : [parsed.host, `${parsed.hostname}:${explicitDefaultPort}`];
 }
 
 function buildHookRegistry(services: AppServices): HookRegistry {
@@ -1396,8 +1418,19 @@ function bindPersistenceNotifications(services: AppServices): () => void {
     services.automation?.onPersistenceStatusChange((status) => notifyPersistenceStatus(services, status))
   ].filter((dispose): dispose is () => void => Boolean(dispose));
   return () => {
+    const failures: unknown[] = [];
     for (const dispose of disposers) {
-      dispose();
+      try {
+        dispose();
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length === 1) {
+      throw failures[0];
+    }
+    if (failures.length > 1) {
+      throw new AggregateError(failures, "One or more persistence notification listeners failed to unsubscribe.");
     }
   };
 }
@@ -1841,25 +1874,6 @@ function parseWebSocketProtocols(value: string | string[] | undefined): string[]
   return protocols?.length ? protocols : undefined;
 }
 
-function verifyWebSocketClient(info: { req: { headers: IncomingHttpHeaders } }, done: (verified: boolean, code?: number, message?: string) => void): void {
-  if (isAllowedWebSocketOrigin(info.req.headers.origin, info.req.headers.host)) {
-    done(true);
-    return;
-  }
-  done(false, 403, "Forbidden");
-}
-
-function singleHeaderValue(value: string | string[] | undefined): string | undefined {
-  if (Array.isArray(value)) {
-    return value.length === 1 ? value[0] : undefined;
-  }
-  return value;
-}
-
-function normalizedHost(value: string): string {
-  return value.trim().toLowerCase().replace(/\.$/, "");
-}
-
 export function sendTerminalWebSocketJson(ws: WebSocket, payload: unknown, onError: (error: Error) => void): boolean {
   return sendWebSocketJson(ws, payload, onError, TERMINAL_WS_MAX_BUFFERED_BYTES, "Terminal websocket buffered output");
 }
@@ -1972,9 +1986,16 @@ function documentationSpoolRoot(config: AppConfig): string {
   return path.join(config.dataDir, "upload-spool");
 }
 
-async function settleDisposers(failures: unknown[], disposers: Array<() => unknown>): Promise<void> {
-  const results = await Promise.allSettled(disposers.map((dispose) => Promise.resolve().then(dispose)));
-  failures.push(...results.filter((result): result is PromiseRejectedResult => result.status === "rejected").map((result) => result.reason));
+async function settleDisposers(disposers: Array<() => unknown>): Promise<unknown[]> {
+  const executions = disposers.map((dispose) => {
+    try {
+      return Promise.resolve(dispose());
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  });
+  const results = await Promise.allSettled(executions);
+  return results.filter((result): result is PromiseRejectedResult => result.status === "rejected").map((result) => result.reason);
 }
 
 function requiredQueryString(value: unknown, field: string): string {

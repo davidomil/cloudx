@@ -222,10 +222,25 @@ npm run build
 npm run dev
 ```
 
-Open `https://127.0.0.1:3001`. For phone access, proxy the localhost service
-through a private tailnet:
+To run the Vite frontend separately, admit its exact origin on the backend:
 
 ```bash
+CLOUDX_TRUSTED_ORIGINS=http://127.0.0.1:5173 npm run dev
+```
+
+Then start Vite in another terminal:
+
+```bash
+npm run dev:web
+```
+
+Open `https://127.0.0.1:3001`. For phone access, proxy the localhost service
+through a private tailnet. Add the proxy's exact public origin (without a
+trailing slash) to `~/.config/cloudx/cloudx.env` before starting Cloudx:
+
+```bash
+printf '%s\n' 'CLOUDX_TRUSTED_ORIGINS=https://build-host.example.ts.net' \
+  >> ~/.config/cloudx/cloudx.env
 tailscale serve --bg https+insecure://localhost:3001
 ```
 
@@ -296,6 +311,11 @@ Common environment variables:
 
 - `CLOUDX_HOST`: loopback bind host, default `127.0.0.1`; network-facing values are rejected.
 - `CLOUDX_PORT`: app port, default `3001`.
+- `CLOUDX_TRUSTED_ORIGINS`: comma-separated additional canonical HTTP(S)
+  origins for Vite or an authenticated reverse proxy. The configured listener
+  origin is always trusted and must not be repeated. An absent variable adds no
+  extra origin; an empty value, duplicate, path, query, fragment, credential,
+  trailing slash, or noncanonical origin fails startup.
 - `CLOUDX_LOG_LEVEL`: server log level, one of `fatal`, `error`, `warn`, `info`, `debug`, `trace`, or `silent`; default `info`.
 - `CLOUDX_ALLOWED_ROOTS`: path-delimited allowed roots, default `~`.
 - `CLOUDX_ASSISTANT_BIN`: resolved coding-assistant CLI executable for assistant-backed terminals and tools.

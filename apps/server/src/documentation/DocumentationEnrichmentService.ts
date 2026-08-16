@@ -71,12 +71,19 @@ export interface DocumentationEnrichmentSource {
   sourceType?: string;
 }
 
+type MediaProcessLauncher = (
+  command: string,
+  args: readonly string[],
+  options: { detached: boolean; stdio: ["ignore", "pipe", "pipe"] }
+) => ReturnType<typeof spawn>;
+
 export interface DocumentationEnrichmentOptions {
   client: DocumentationClient;
   config: ConfigService;
   rulesSkills: RulesSkillsCatalogService;
   runner: DocumentationEnrichmentRunner;
   asr?: AsrClient;
+  mediaProcessLauncher?: MediaProcessLauncher;
   pluginContributionsReady?: () => Promise<RulesSkillsStore> | undefined;
 }
 
@@ -429,7 +436,9 @@ export class DocumentationEnrichmentService {
     const transcript = source.contentPath
       ? signal ? await this.options.asr.transcribeFile(mediaPath, filename, { signal }) : await this.options.asr.transcribeFile(mediaPath, filename)
       : signal ? await this.options.asr.transcribe(source.content!, filename, { signal }) : await this.options.asr.transcribe(source.content!, filename);
-    const keyframes = isVideoSource(source) ? await captureSceneKeyframes(mediaPath, path.join(mediaWorkDir!, "frames"), signal) : [];
+    const keyframes = isVideoSource(source)
+      ? await captureSceneKeyframes(mediaPath, path.join(mediaWorkDir!, "frames"), signal, this.options.mediaProcessLauncher)
+      : [];
     return {
       filename: source.filename,
       contentType: source.contentType,
@@ -1167,7 +1176,12 @@ async function listFiles(root: string, signal?: AbortSignal): Promise<string[]> 
   return files;
 }
 
-async function captureSceneKeyframes(inputPath: string, outputDir: string, signal?: AbortSignal): Promise<Array<{ path: string; offsetSeconds?: number }>> {
+async function captureSceneKeyframes(
+  inputPath: string,
+  outputDir: string,
+  signal?: AbortSignal,
+  mediaProcessLauncher: MediaProcessLauncher = spawn
+): Promise<Array<{ path: string; offsetSeconds?: number }>> {
   await fsp.mkdir(outputDir, { recursive: true });
   const result = await runMediaTool("ffmpeg", [
     "-hide_banner",
@@ -1180,7 +1194,7 @@ async function captureSceneKeyframes(inputPath: string, outputDir: string, signa
     "-fps_mode",
     "vfr",
     path.join(outputDir, "frame-%04d.jpg")
-  ], signal);
+  ], signal, mediaProcessLauncher);
   if (result.status !== 0) {
     throw new Error(`ffmpeg keyframe extraction failed: ${result.stderr || result.stdout || `exit ${result.status}`}`);
   }
@@ -1194,28 +1208,36 @@ async function captureSceneKeyframes(inputPath: string, outputDir: string, signa
   return frameNames.map((name, index) => ({ path: path.join(outputDir, name), offsetSeconds: Math.max(0, Math.round(offsets[index] ?? 0)) }));
 }
 
-function runMediaTool(command: string, args: string[], signal?: AbortSignal): Promise<{ status: number; stdout: string; stderr: string }> {
+function runMediaTool(
+  command: string,
+  args: string[],
+  signal?: AbortSignal,
+  mediaProcessLauncher: MediaProcessLauncher = spawn
+): Promise<{ status: number; stdout: string; stderr: string }> {
   if (signal?.aborted) {
     return Promise.reject(documentationAbortReason(signal));
   }
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
+    const child = mediaProcessLauncher(command, args, {
       detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"]
     });
-    const processGroupId = child.pid;
+    let processGroupId: number | undefined;
     let stdout = "";
     let stderr = "";
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let stoppingError: Error | undefined;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     let killTimeout: ReturnType<typeof setTimeout> | undefined;
     let processGroupPoll: ReturnType<typeof setTimeout> | undefined;
     let settled = false;
     let childClosed = false;
     let processGroupStopped = false;
     const cleanup = () => {
-      clearTimeout(timeout);
+      if (timeout) {
+        clearTimeout(timeout);
+      }
       if (killTimeout) {
         clearTimeout(killTimeout);
       }
@@ -1223,6 +1245,20 @@ function runMediaTool(command: string, args: string[], signal?: AbortSignal): Pr
         clearTimeout(processGroupPoll);
       }
       signal?.removeEventListener("abort", abort);
+      child.off("error", onChildError);
+      child.off("close", onChildClose);
+      child.stdout?.off("data", onStdoutData);
+      child.stdout?.off("error", onStdoutError);
+      child.stderr?.off("data", onStderrData);
+      child.stderr?.off("error", onStderrError);
+    };
+    const rejectAfterCleanup = () => {
+      if (settled || !stoppingError || !childClosed || !processGroupStopped) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(stoppingError);
     };
     const terminate = (processSignal: NodeJS.Signals) => {
       stopMediaProcess(child, processSignal, processGroupId);
@@ -1234,20 +1270,12 @@ function runMediaTool(command: string, args: string[], signal?: AbortSignal): Pr
           }).then(
             () => {
               processGroupStopped = true;
-              if (childClosed && stoppingError) {
-                settled = true;
-                cleanup();
-                reject(stoppingError);
-              }
+              rejectAfterCleanup();
             },
             (error) => {
               stoppingError = error instanceof Error ? error : new Error(String(error));
               processGroupStopped = true;
-              if (childClosed) {
-                settled = true;
-                cleanup();
-                reject(stoppingError);
-              }
+              rejectAfterCleanup();
             }
           );
         }, MEDIA_TOOL_TERMINATION_GRACE_MS);
@@ -1279,39 +1307,56 @@ function runMediaTool(command: string, args: string[], signal?: AbortSignal): Pr
       }
       stderr += chunk;
     };
-    const timeout = setTimeout(() => stopWithError(new Error(`ffmpeg keyframe extraction timed out after ${MEDIA_TOOL_TIMEOUT_MS} ms.`)), MEDIA_TOOL_TIMEOUT_MS);
-    timeout.unref();
-    signal?.addEventListener("abort", abort, { once: true });
-    child.on("error", (error) => {
+    function onChildError(error: Error): void {
       stoppingError ??= error;
-    });
-    child.on("close", (code) => {
+      if (!processGroupId) {
+        processGroupStopped = true;
+        rejectAfterCleanup();
+        return;
+      }
+      terminate("SIGTERM");
+    }
+    function onChildClose(code: number | null): void {
       if (settled) {
         return;
       }
       childClosed = true;
       if (stoppingError) {
-        if (processGroupStopped) {
-          settled = true;
-          cleanup();
-          reject(stoppingError);
-        }
+        rejectAfterCleanup();
         return;
       }
       settled = true;
       cleanup();
       resolve({ status: code ?? 1, stdout, stderr });
-    });
+    }
+    function onStdoutData(chunk: string): void {
+      appendOutput("stdout", chunk);
+    }
+    function onStderrData(chunk: string): void {
+      appendOutput("stderr", chunk);
+    }
+    function onStdoutError(error: Error): void {
+      stopWithError(error);
+    }
+    function onStderrError(error: Error): void {
+      stopWithError(error);
+    }
+    child.on("error", onChildError);
+    child.on("close", onChildClose);
+    processGroupId = child.pid;
+    timeout = setTimeout(() => stopWithError(new Error(`ffmpeg keyframe extraction timed out after ${MEDIA_TOOL_TIMEOUT_MS} ms.`)), MEDIA_TOOL_TIMEOUT_MS);
+    timeout.unref();
+    signal?.addEventListener("abort", abort, { once: true });
     if (!child.stdout || !child.stderr) {
       stopWithError(new Error("ffmpeg keyframe extraction did not expose piped output streams."));
       return;
     }
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => appendOutput("stdout", chunk));
-    child.stderr.on("data", (chunk) => appendOutput("stderr", chunk));
-    child.stdout.on("error", (error) => stopWithError(error));
-    child.stderr.on("error", (error) => stopWithError(error));
+    child.stdout.on("data", onStdoutData);
+    child.stderr.on("data", onStderrData);
+    child.stdout.on("error", onStdoutError);
+    child.stderr.on("error", onStderrError);
   });
 }
 

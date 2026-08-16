@@ -48,6 +48,54 @@ describe("loadConfig", () => {
     expect(loadConfig({ CLOUDX_HOST: "::1" } as NodeJS.ProcessEnv).host).toBe("::1");
   });
 
+  it("builds one exact browser origin allowlist from the direct listener and configured extras", () => {
+    expect(loadConfig({} as NodeJS.ProcessEnv).trustedOrigins).toEqual(["http://127.0.0.1:3001"]);
+    expect(loadConfig({ CLOUDX_HOST: "localhost", CLOUDX_PORT: "80" } as NodeJS.ProcessEnv).trustedOrigins).toEqual([
+      "http://localhost"
+    ]);
+    expect(loadConfig({ CLOUDX_HOST: "::1", CLOUDX_PORT: "8443", CLOUDX_HTTPS_KEY_PATH: "key.pem", CLOUDX_HTTPS_CERT_PATH: "cert.pem" } as NodeJS.ProcessEnv).trustedOrigins).toEqual([
+      "https://[::1]:8443"
+    ]);
+
+    expect(loadConfig({
+      CLOUDX_TRUSTED_ORIGINS: "\thttps://cloudx.example.com\t, http://localhost:5173 "
+    } as NodeJS.ProcessEnv).trustedOrigins).toEqual([
+      "http://127.0.0.1:3001",
+      "https://cloudx.example.com",
+      "http://localhost:5173"
+    ]);
+  });
+
+  it.each([
+    ["empty value", ""],
+    ["ASCII-space-only value", " \t "],
+    ["leading comma", ",https://cloudx.example.com"],
+    ["trailing comma", "https://cloudx.example.com,"],
+    ["doubled comma", "https://cloudx.example.com,,http://localhost:5173"],
+    ["internal ASCII-space-only element", "https://cloudx.example.com, \t ,http://localhost:5173"]
+  ])("rejects a present CLOUDX_TRUSTED_ORIGINS %s", (_label, trustedOrigins) => {
+    expect(() => loadConfig({ CLOUDX_TRUSTED_ORIGINS: trustedOrigins } as NodeJS.ProcessEnv)).toThrow(
+      /CLOUDX_TRUSTED_ORIGINS/
+    );
+  });
+
+  it.each([
+    ["duplicate", "https://cloudx.example.com,https://cloudx.example.com"],
+    ["direct-origin duplicate", "http://127.0.0.1:3001"],
+    ["userinfo", "https://user@cloudx.example.com"],
+    ["non-HTTP scheme", "file://cloudx.example.com"],
+    ["path", "https://cloudx.example.com/"],
+    ["query", "https://cloudx.example.com?mode=trusted"],
+    ["fragment", "https://cloudx.example.com#trusted"],
+    ["noncanonical host", "https://CLOUDX.example.com"],
+    ["other whitespace", "\nhttps://cloudx.example.com"],
+    ["opaque origin", "null"]
+  ])("rejects a %s trusted origin", (_label, trustedOrigins) => {
+    expect(() => loadConfig({ CLOUDX_TRUSTED_ORIGINS: trustedOrigins } as NodeJS.ProcessEnv)).toThrow(
+      /CLOUDX_TRUSTED_ORIGINS/
+    );
+  });
+
   it("leaves configured allowed roots as user-facing path expressions", () => {
     const config = loadConfig({ CLOUDX_ALLOWED_ROOTS: "~:/tmp/cloudx" } as NodeJS.ProcessEnv);
 

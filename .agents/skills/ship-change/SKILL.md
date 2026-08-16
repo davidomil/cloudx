@@ -33,7 +33,10 @@ descriptor traverses the same private core. That core uses
 a 0700 empty-template audited bare repository, token-free candidate import,
 explicit `--git-dir`, reset helpers and headers, disabled hooks, and one
 `--no-verify` exact-URL lease push. The required integration challenges with
-exact Basic authentication before real `git http-backend` receive-pack.
+exact Basic authentication before real `git http-backend` receive-pack. The
+direct-test entry requires an explicit frozen loopback descriptor before
+accepting injected dependencies and cannot select or default to the production
+transport.
 Cleanup runs exactly once. Only the exact four-field published or
 manual-reconciliation object is emitted; pre-push rejection uses the fixed
 bounded diagnostic and post-push output contains no diagnostic beyond JSON.
@@ -46,7 +49,7 @@ runtime evidence, and not committed controller state. `--authorization-file`
 and `--authorized-publication-sha256` bind its bytes independently from the
 `--authorized-manifest-sha256` bundle digest. The grant expires within 15
 minutes, binds the complete identity tuple, policy, bundle, credential mode,
-principal, and nonce, and selects only `automated-app` or `attended-user`. The
+principal, and nonce, and selects only `attended-user` with a `github-user` principal. The
 sole secret input is `CLOUDX_GATE_B_TOKEN`; it is pinned to child `GH_TOKEN` and
 never serialized, passed in argv, logged, emitted, or stored by a credential
 helper.
@@ -58,7 +61,7 @@ helper.
    live `$review-pr`, labels, merge intent, or required checks because the new
    candidate head is not live yet.
 2. Invoke exactly
-   `node scripts/ai-change/publish-gate-b.mjs --artifact-dir <bundle> --authorized-manifest-sha256 <sha256> --authorization-file <path> --authorized-publication-sha256 <sha256> --credential-mode <automated-app|attended-user> --expected-old-head <sha>`.
+   `node scripts/ai-change/publish-gate-b.mjs --artifact-dir <bundle> --authorized-manifest-sha256 <sha256> --authorization-file <path> --authorized-publication-sha256 <sha256> --credential-mode attended-user --expected-old-head <sha>`.
    Do not run a raw push. The executable validates authorization before reading
    the secret or running a command, validates the artifact snapshot and remote
    identity, disables ambient credentials and prompts, and revalidates the file,

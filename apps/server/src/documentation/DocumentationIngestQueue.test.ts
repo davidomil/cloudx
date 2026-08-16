@@ -105,6 +105,44 @@ describe("DocumentationIngestQueue admission", () => {
     expect(queue.list().capacity).toMatchObject({ admittedJobs: 0, admittedBytes: 0, reservedJobs: 0 });
     expect(() => queue.reserve(1)).toThrow(/stopped/i);
   });
+
+  it("owns and settles reserved pre-enqueue work before releasing capacity during disposal", async () => {
+    const queue = new DocumentationIngestQueue({ maxJobs: 1, maxBytes: 5 });
+    const admission = queue.reserve(5);
+    const started = deferred<void>();
+    const cleanup = deferred<void>();
+    let admissionSignal: AbortSignal | undefined;
+    const preEnqueue = admission.runBeforeEnqueue(async (signal) => {
+      admissionSignal = signal;
+      started.resolve();
+      await new Promise<void>((_resolve, reject) => {
+        signal.addEventListener("abort", async () => {
+          await cleanup.promise;
+          reject(signal.reason);
+        }, { once: true });
+      });
+      return "unreachable";
+    });
+    const preEnqueueRejection = expect(preEnqueue).rejects.toThrow("stopped");
+    await started.promise;
+
+    let disposalSettled = false;
+    const disposal = queue.dispose().then(() => {
+      disposalSettled = true;
+    });
+    await Promise.resolve();
+
+    expect(admissionSignal?.aborted).toBe(true);
+    expect(disposalSettled).toBe(false);
+    expect(queue.list().capacity).toMatchObject({ admittedJobs: 1, admittedBytes: 5, reservedJobs: 1 });
+
+    cleanup.resolve();
+    await Promise.all([preEnqueueRejection, disposal]);
+    expect(queue.list().capacity).toMatchObject({ admittedJobs: 0, admittedBytes: 0, reservedJobs: 0 });
+    admission.release();
+    expect(queue.list().capacity).toMatchObject({ admittedJobs: 0, admittedBytes: 0, reservedJobs: 0 });
+    expect(() => queue.enqueueReserved(job(5), admission)).toThrow(/already used|stopped/i);
+  });
 });
 
 function job(admissionBytes: number, operation: () => Promise<Record<string, unknown>> = async () => ({ ok: true })) {

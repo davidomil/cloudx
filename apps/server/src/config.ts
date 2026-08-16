@@ -27,6 +27,7 @@ export type CloudxLogLevel = typeof CLOUDX_LOG_LEVELS[number];
 export interface AppConfig {
   host: string;
   port: number;
+  trustedOrigins: string[];
   logLevel: CloudxLogLevel;
   allowedRoots: string[];
   asrUrl: string;
@@ -64,6 +65,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const dataDir = path.resolve(env.CLOUDX_DATA_DIR ?? path.join(repoRoot, ".cloudx"));
   const https = resolveHttpsConfig(env, dataDir);
+  const directOrigin = canonicalDirectOrigin(host, port, Boolean(https));
+  const trustedOrigins = parseTrustedOrigins(env.CLOUDX_TRUSTED_ORIGINS, directOrigin);
   const allowedRoots = (env.CLOUDX_ALLOWED_ROOTS ?? home)
     .split(path.delimiter)
     .map((root) => root.trim())
@@ -91,6 +94,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   return {
     host,
     port,
+    trustedOrigins,
     logLevel,
     allowedRoots,
     asrUrl: env.CLOUDX_ASR_URL ?? "http://127.0.0.1:7810",
@@ -109,6 +113,39 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     voiceDebugTranscripts: isTruthy(env.CLOUDX_VOICE_DEBUG_TRANSCRIPTS),
     https
   };
+}
+
+function canonicalDirectOrigin(host: string, port: number, secure: boolean): string {
+  const authority = host.includes(":") ? `[${host}]` : host;
+  return new URL(`${secure ? "https" : "http"}://${authority}:${port}`).origin;
+}
+
+function parseTrustedOrigins(value: string | undefined, directOrigin: string): string[] {
+  if (value === undefined) return [directOrigin];
+  const configured = value.split(",").map((element) => parseTrustedOrigin(element));
+  const unique = new Set(configured);
+  if (unique.size !== configured.length) {
+    throw new Error("CLOUDX_TRUSTED_ORIGINS must not contain duplicate origins.");
+  }
+  if (unique.has(directOrigin)) {
+    throw new Error("CLOUDX_TRUSTED_ORIGINS must not repeat the configured CloudX listener origin.");
+  }
+  return [directOrigin, ...configured];
+}
+
+function parseTrustedOrigin(value: string): string {
+  const origin = value.replace(/^[\u0020\u0009]+|[\u0020\u0009]+$/gu, "");
+  if (!origin) throw new Error("CLOUDX_TRUSTED_ORIGINS must not contain empty origins.");
+  let parsed: URL;
+  try {
+    parsed = new URL(origin);
+  } catch (error) {
+    throw new Error("CLOUDX_TRUSTED_ORIGINS must contain canonical absolute HTTP(S) origins.", { cause: error });
+  }
+  if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || parsed.origin !== origin) {
+    throw new Error("CLOUDX_TRUSTED_ORIGINS must contain canonical absolute HTTP(S) origins.");
+  }
+  return parsed.origin;
 }
 
 function parseLogLevel(value: string): CloudxLogLevel {

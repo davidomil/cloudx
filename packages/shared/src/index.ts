@@ -1,3 +1,5 @@
+import { isUsableTabLayoutState, listTabLayoutPanes } from "./workspaceLayout.js";
+
 export const DEFAULT_VOICE_MODEL = "gpt-5.3-codex-spark";
 
 export type PluginId = "codex-terminal" | "standard-terminal" | "file-browser" | "local-web" | string;
@@ -1052,6 +1054,92 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+export function parseCreateTabResponse(value: unknown): CreateTabResponse {
+  if (!isRecord(value)) {
+    throw new Error("Create tab response must be an object.");
+  }
+  const tab = value.tab;
+  const window = value.window;
+  if (!isCompleteWorkspaceTab(tab)) {
+    throw new Error("Create tab response tab must be a complete WorkspaceTab.");
+  }
+  if (!hasCompleteWorkspaceWindowFields(window)) {
+    throw new Error("Create tab response window must be a complete WorkspaceWindow.");
+  }
+  if (!isUsableTabLayoutState(window.layout)) {
+    throw new Error("Create tab response window layout must be usable.");
+  }
+  if (!listTabLayoutPanes(window.layout.root).some((pane) => pane.tabIds.includes(tab.id))) {
+    throw new Error("Create tab response tab must occur in the returned window layout.");
+  }
+
+  return {
+    tab,
+    window: {
+      id: window.id,
+      name: window.name,
+      defaultCwd: window.defaultCwd,
+      layout: window.layout,
+      ...(window.pluginMetadata === undefined ? {} : { pluginMetadata: window.pluginMetadata }),
+      createdAt: window.createdAt,
+      updatedAt: window.updatedAt
+    }
+  };
+}
+
+function isCompleteWorkspaceTab(value: unknown): value is WorkspaceTab {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.pluginId === "string" &&
+    typeof value.title === "string" &&
+    typeof value.cwd === "string" &&
+    isTabStatus(value.status) &&
+    isTabIndicator(value.indicator) &&
+    (value.pluginMetadata === undefined || isPluginMetadataMap(value.pluginMetadata)) &&
+    typeof value.createdAt === "string" &&
+    typeof value.updatedAt === "string" &&
+    (value.contextPath === undefined || typeof value.contextPath === "string") &&
+    (value.statusMessage === undefined || typeof value.statusMessage === "string")
+  );
+}
+
+function isTabIndicator(value: unknown): value is TabIndicator {
+  return (
+    isRecord(value) &&
+    isTabIndicatorColor(value.color) &&
+    typeof value.label === "string" &&
+    (value.message === undefined || typeof value.message === "string") &&
+    typeof value.updatedAt === "string"
+  );
+}
+
+function hasCompleteWorkspaceWindowFields(
+  value: unknown
+): value is Record<string, unknown> & Pick<WorkspaceWindow, "id" | "name" | "defaultCwd" | "createdAt" | "updatedAt"> & { pluginMetadata?: PluginMetadataMap } {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.name === "string" &&
+    typeof value.defaultCwd === "string" &&
+    (value.pluginMetadata === undefined || isPluginMetadataMap(value.pluginMetadata)) &&
+    typeof value.createdAt === "string" &&
+    typeof value.updatedAt === "string"
+  );
+}
+
+function isPluginMetadataMap(value: unknown): value is PluginMetadataMap {
+  return isRecord(value) && Object.values(value).every((metadata) => isRecord(metadata));
+}
+
+function isTabStatus(value: unknown): value is TabStatus {
+  return value === "idle" || value === "starting" || value === "running" || value === "waiting_approval" || value === "failed" || value === "completed" || value === "stopped";
+}
+
+function isTabIndicatorColor(value: unknown): value is TabIndicatorColor {
+  return value === "green" || value === "yellow" || value === "red";
+}
+
 export function parseVoiceActionPlan(value: unknown): VoiceActionPlan {
   if (!isRecord(value)) {
     throw new Error("Voice plan must be an object.");
@@ -1090,6 +1178,75 @@ export function parseVoiceActionPlan(value: unknown): VoiceActionPlan {
     summary,
     actions: parsedActions
   };
+}
+
+export function parseVoiceExecutionResult(value: unknown): VoiceExecutionResult {
+  if (!isRecord(value)) {
+    throw new Error("Voice execution result must be an object.");
+  }
+  if (typeof value.accepted !== "boolean") {
+    throw new Error("Voice execution result accepted must be a boolean.");
+  }
+  const plan = parseVoiceActionPlan(value.plan);
+  if (!Array.isArray(value.results)) {
+    throw new Error("Voice execution results must be an array.");
+  }
+  const results = value.results.map((result, index) => parseVoiceActionResult(result, index));
+  if (results.length !== plan.actions.length) {
+    throw new Error("Voice execution result count must match plan action count.");
+  }
+  for (const [index, result] of results.entries()) {
+    const action = plan.actions[index]!;
+    if (result.actionId !== action.id) {
+      throw new Error(`Voice execution result ${index} actionId must match plan action id: ${action.id}`);
+    }
+    if (result.action !== action.action) {
+      throw new Error(`Voice execution result ${index} action must match plan action: ${action.action}`);
+    }
+  }
+  if (value.accepted !== results.every((result) => result.status === "succeeded")) {
+    throw new Error("Voice execution result accepted must match whether every result succeeded.");
+  }
+
+  return {
+    accepted: value.accepted,
+    plan,
+    results
+  };
+}
+
+function parseVoiceActionResult(value: unknown, index: number): VoiceExecutionResult["results"][number] {
+  if (!isRecord(value)) {
+    throw new Error(`Voice execution result ${index} must be an object.`);
+  }
+  if (typeof value.actionId !== "string" || value.actionId.trim().length === 0) {
+    throw new Error(`Voice execution result ${index} actionId must be a non-empty string.`);
+  }
+  if (typeof value.action !== "string" || value.action.trim().length === 0) {
+    throw new Error(`Voice execution result ${index} action must be a non-empty string.`);
+  }
+  if (!isVoiceActionResultStatus(value.status)) {
+    throw new Error(`Voice execution result ${index} status is invalid.`);
+  }
+  if (value.targetTabId !== undefined && typeof value.targetTabId !== "string") {
+    throw new Error(`Voice execution result ${index} targetTabId must be a string.`);
+  }
+  if (value.message !== undefined && typeof value.message !== "string") {
+    throw new Error(`Voice execution result ${index} message must be a string.`);
+  }
+
+  return {
+    actionId: value.actionId,
+    action: value.action,
+    ...(value.targetTabId === undefined ? {} : { targetTabId: value.targetTabId }),
+    status: value.status,
+    ...(value.message === undefined ? {} : { message: value.message }),
+    ...("result" in value ? { result: value.result } : {})
+  };
+}
+
+function isVoiceActionResultStatus(value: unknown): value is VoiceExecutionResult["results"][number]["status"] {
+  return value === "succeeded" || value === "failed" || value === "skipped";
 }
 
 export function parseVoiceAction(value: unknown, index = 0): VoiceAction {

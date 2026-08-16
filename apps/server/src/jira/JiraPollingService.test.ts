@@ -412,6 +412,157 @@ describe("JiraPollingService", () => {
     await expect(polling.discardFailedOutbox("event-1", controller.signal)).rejects.toThrow("operator cancelled");
   });
 
+  it("serializes concurrent retry and discard against the latest durable Jira state", async () => {
+    const first = failedOutboxEvent("event-1", "jira.issueUpdated", "first failure");
+    const second = failedOutboxEvent("event-2", "jira.issueTransitioned", "second failure");
+    let durable: Record<string, unknown> = {
+      initialized: true,
+      issues: { "ENG-1": { status: "Done", updated: "checkpoint" } },
+      lastSuccessfulPollAt: "2026-08-16T00:00:00.000Z",
+      outbox: [first, second],
+    };
+    const firstWriteStarted = deferred<void>();
+    const releaseFirstWrite = deferred<void>();
+    let writeCount = 0;
+    const pluginData = {
+      read: vi.fn(async () => structuredClone(durable)),
+      write: vi.fn(async (_pluginId: string, value: Record<string, unknown>) => {
+        writeCount += 1;
+        if (writeCount === 1) {
+          firstWriteStarted.resolve();
+          await releaseFirstWrite.promise;
+        }
+        durable = structuredClone(value);
+      }),
+    } as unknown as PluginDataStore;
+    const polling = new JiraPollingService({} as JiraIntegrationService, pluginData, () => jiraTriggers());
+
+    const retry = polling.retryFailedOutbox("event-1");
+    const discard = polling.discardFailedOutbox("event-2");
+    await firstWriteStarted.promise;
+    await Promise.resolve();
+    const secondWriteStartedBeforeFirstSettled = writeCount > 1;
+    releaseFirstWrite.resolve();
+    await Promise.all([retry, discard]);
+
+    expect(secondWriteStartedBeforeFirstSettled).toBe(false);
+    expect(durable).toMatchObject({
+      issues: { "ENG-1": { status: "Done", updated: "checkpoint" } },
+      lastSuccessfulPollAt: "2026-08-16T00:00:00.000Z",
+      outbox: [expect.objectContaining({ idempotencyKey: "event-1", status: "prepared" })],
+    });
+  });
+
+  it("serializes a failed poll dispatch before a concurrent operator retry", async () => {
+    const target = { ...failedOutboxEvent("event-1", "jira.issueUpdated", "target failure"), status: "prepared" };
+    const unrelated = { ...failedOutboxEvent("event-2", "jira.issueTransitioned", "unrelated failure"), status: "prepared" };
+    Reflect.deleteProperty(target, "lastError");
+    Reflect.deleteProperty(unrelated, "lastError");
+    const issues = {
+      "ENG-1": {
+        updated: "2026-08-16T00:00:00.000Z",
+        status: "Done",
+        assigneeAccountId: "me",
+        commentIds: ["comment-1"],
+        lastSeenAt: "2026-08-16T00:01:00.000Z",
+      },
+    };
+    const lastSuccessfulPollAt = "2026-08-16T00:02:00.000Z";
+    let durable: Record<string, unknown> = {
+      initialized: true,
+      issues,
+      lastSuccessfulPollAt,
+      outbox: [target, unrelated],
+    };
+    const pluginData = {
+      read: vi.fn(async () => structuredClone(durable)),
+      write: vi.fn(async (_pluginId: string, value: Record<string, unknown>) => {
+        durable = structuredClone(value);
+      }),
+    } as unknown as PluginDataStore;
+    const dispatchStarted = deferred<void>();
+    const releaseDispatch = deferred<void>();
+    const triggers = jiraTriggers(async () => {
+      dispatchStarted.resolve();
+      await releaseDispatch.promise;
+      throw new Error("controlled outbox delivery failure");
+    });
+    const integration = { pollingIssues: vi.fn() } as unknown as JiraIntegrationService;
+    const polling = new JiraPollingService(integration, pluginData, () => triggers);
+
+    const pollFailure = expect(polling.runOnce()).rejects.toThrow("controlled outbox delivery failure");
+    await dispatchStarted.promise;
+    expect(durable).toMatchObject({
+      outbox: [expect.objectContaining({ idempotencyKey: "event-1", status: "dispatching" }), expect.objectContaining({ idempotencyKey: "event-2", status: "prepared" })],
+    });
+
+    let retrySettled = false;
+    const retryOutcome = polling.retryFailedOutbox("event-1").then(
+      (value) => {
+        retrySettled = true;
+        return { state: "resolved", value } as const;
+      },
+      (error: unknown) => {
+        retrySettled = true;
+        return { state: "rejected", error } as const;
+      },
+    );
+    await Promise.resolve();
+    expect(retrySettled).toBe(false);
+    expect(pluginData.read).toHaveBeenCalledTimes(1);
+
+    releaseDispatch.resolve();
+    await pollFailure;
+    await expect(retryOutcome).resolves.toMatchObject({
+      state: "resolved",
+      value: { idempotencyKey: "event-1", status: "prepared" },
+    });
+
+    expect(durable).toMatchObject({ initialized: true, issues, lastSuccessfulPollAt });
+    expect(durable.outbox).toEqual([
+      {
+        idempotencyKey: target.idempotencyKey,
+        triggerId: target.triggerId,
+        payload: target.payload,
+        status: "prepared",
+        preparedAt: target.preparedAt,
+      },
+      { ...unrelated, dispatchStartedAt: undefined, lastError: undefined },
+    ]);
+    expect(pluginData.read).toHaveBeenCalledTimes(2);
+    expect(integration.pollingIssues).not.toHaveBeenCalled();
+  });
+
+  it("closes Jira mutation admission and awaits an already admitted operator write", async () => {
+    const first = failedOutboxEvent("event-1", "jira.issueUpdated", "first failure");
+    let durable: Record<string, unknown> = { initialized: true, outbox: [first] };
+    const writeStarted = deferred<void>();
+    const releaseWrite = deferred<void>();
+    const pluginData = {
+      read: vi.fn(async () => structuredClone(durable)),
+      write: vi.fn(async (_pluginId: string, value: Record<string, unknown>) => {
+        writeStarted.resolve();
+        await releaseWrite.promise;
+        durable = structuredClone(value);
+      }),
+    } as unknown as PluginDataStore;
+    const polling = new JiraPollingService({} as JiraIntegrationService, pluginData, () => jiraTriggers());
+    const mutation = polling.retryFailedOutbox("event-1");
+    await writeStarted.promise;
+
+    let disposed = false;
+    const disposal = polling.dispose().then(() => {
+      disposed = true;
+    });
+    await Promise.resolve();
+    expect(disposed).toBe(false);
+
+    releaseWrite.resolve();
+    await Promise.all([mutation, disposal]);
+    await expect(polling.retryFailedOutbox("event-1")).rejects.toThrow(/disposed/i);
+    await expect(polling.discardFailedOutbox("event-1")).rejects.toThrow(/disposed/i);
+  });
+
   it("aborts an in-flight poll from the automation execution signal", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-jira-polling-automation-abort-"));
     let receivedSignal: AbortSignal | undefined;
@@ -525,6 +676,14 @@ function comment(id: string, bodyText: string): JiraCommentSummary {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value?: T) => void } {
+  let resolve!: (value?: T) => void;
+  const promise = new Promise<T>((promiseResolve) => {
+    resolve = promiseResolve as (value?: T) => void;
+  });
+  return { promise, resolve };
 }
 
 function unavailableService(): never {

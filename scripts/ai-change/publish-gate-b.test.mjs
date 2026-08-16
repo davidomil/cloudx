@@ -5,15 +5,18 @@ import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   canonicalPublicationAuthorization,
   publishGateBCandidate,
-  publishGateBCandidateForLoopbackTest,
+  publishGateBCandidateForDirectTest as publishCandidateForDirectTest,
   readGateBArtifactSnapshot,
+  validateTrustedExecutablesForDirectTest,
 } from "./publish-gate-b.mjs";
+import * as gateBPublisher from "./publish-gate-b.mjs";
 import {
+  GATE_B_ALLOWED_PATH_COUNT,
   GATE_B_CANDIDATE_REF,
   GATE_B_COMMIT_SUBJECTS,
   GATE_B_EXPECTED_OLD_CANDIDATE_SHA,
@@ -26,11 +29,179 @@ import {
   GATE_B_REVIEW_ROLES,
   GATE_B_TARGET_BASE_REF,
 } from "./validate-process.mjs";
+import { displayCommand, verificationPlan } from "./verify.mjs";
 
 const gitSha = (character) => character.repeat(40);
 const sha = (character) => character.repeat(64);
+const directTestTransport = loopbackTransport(41_099);
+const expectedCredentialFreeGitEnvironment = {
+  GCM_INTERACTIVE: "Never",
+  GIT_ASKPASS: "/bin/false",
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_CONFIG_SYSTEM: "/dev/null",
+  GIT_NO_REPLACE_OBJECTS: "1",
+  GIT_TERMINAL_PROMPT: "0",
+  LANG: "C",
+  LC_ALL: "C",
+  NO_COLOR: "1",
+  PATH: "/usr/bin:/bin",
+  SSH_ASKPASS: "/bin/false",
+};
+const publishGateBCandidateForDirectTest = (
+  options,
+  transport = directTestTransport,
+) => publishCandidateForDirectTest(options, transport);
 
 describe("Gate B candidate publisher", () => {
+  it("awaits private runner process-group exhaustion without exposing a token", async () => {
+    const directory = fs.mkdtempSync(
+      path.join(os.tmpdir(), "cloudx-gate-b-runner-"),
+    );
+    const pidFile = path.join(directory, "descendant.pid");
+    const secret = "gate-b-test-token-that-must-never-appear-0123456789";
+    const childSource = `
+const fs = require("node:fs");
+fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+process.on("SIGTERM", () => {});
+setInterval(() => {}, 1000);
+`;
+    const leaderSource = `
+const { spawn } = require("node:child_process");
+spawn(process.execPath, ["-e", ${JSON.stringify(childSource)}], { stdio: "ignore" });
+setInterval(() => {}, 1000);
+`;
+    let processGroup;
+    try {
+      const run = gateBPublisher.runGateBCommandForDirectTest(
+        process.execPath,
+        ["-e", leaderSource],
+        { env: { ...process.env, GH_TOKEN: secret }, timeoutMs: 2_000 },
+      );
+      processGroup = await recordedProcessGroup(pidFile);
+      const result = await run;
+
+      expect(result.exitCode).toBe(1);
+      expect(typeof result.stdout).toBe("string");
+      expect(typeof result.stderr).toBe("string");
+      expect(JSON.stringify(result)).not.toContain(secret);
+      expect(await processGroupHasRunningMember(processGroup)).toBe(false);
+    } finally {
+      if (processGroup) await terminateProcessGroup(processGroup);
+      fs.rmSync(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("fails closed after a leader exits with a live descendant or spawn fails", async () => {
+    const directory = fs.mkdtempSync(
+      path.join(os.tmpdir(), "cloudx-gate-b-leader-exit-"),
+    );
+    const pidFile = path.join(directory, "descendant.pid");
+    const secret = "gate-b-leader-exit-token-that-must-not-appear-0123456789";
+    const descendantSource = `
+const fs = require("node:fs");
+fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+process.on("SIGTERM", () => {});
+setInterval(() => {}, 1000);
+`;
+    const leaderSource = `
+const { spawn } = require("node:child_process");
+spawn(process.execPath, ["-e", ${JSON.stringify(descendantSource)}], { stdio: "ignore" });
+setTimeout(() => process.exit(0), 100);
+`;
+    let processGroup;
+    try {
+      const run = gateBPublisher.runGateBCommandForDirectTest(
+        process.execPath,
+        ["-e", leaderSource],
+        { env: { ...process.env, GH_TOKEN: secret } },
+      );
+      processGroup = await recordedProcessGroup(pidFile);
+      await expect(run).resolves.toEqual({
+        stdout: "",
+        stderr: "",
+        exitCode: 1,
+      });
+      expect(await processGroupHasRunningMember(processGroup)).toBe(false);
+
+      const spawnFailure = await gateBPublisher.runGateBCommandForDirectTest(
+        path.join(directory, "missing-executable"),
+        [secret],
+        { env: { ...process.env, GH_TOKEN: secret } },
+      );
+      expect(spawnFailure).toEqual({ stdout: "", stderr: "", exitCode: 1 });
+      expect(JSON.stringify(spawnFailure)).not.toContain(secret);
+    } finally {
+      if (processGroup) await terminateProcessGroup(processGroup);
+      fs.rmSync(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("keeps the private runner's output type and independent two-MiB stream bounds", async () => {
+    const limit = 2 * 1024 * 1024;
+    const exact = await gateBPublisher.runGateBCommandForDirectTest(
+      process.execPath,
+      [
+        "-e",
+        `process.stdout.write(Buffer.alloc(${limit}, 0x61)); process.stderr.write(Buffer.alloc(${limit}, 0x62));`,
+      ],
+    );
+    expect(exact).toEqual({
+      stdout: "a".repeat(limit),
+      stderr: "b".repeat(limit),
+      exitCode: 0,
+    });
+
+    const binary = await gateBPublisher.runGateBCommandForDirectTest(
+      process.execPath,
+      ["-e", "process.stdout.write(Buffer.from([0xff, 0x00, 0x61]));"],
+      { encoding: "buffer" },
+    );
+    expect(binary).toEqual({
+      stdout: Buffer.from([0xff, 0x00, 0x61]),
+      stderr: Buffer.alloc(0),
+      exitCode: 0,
+    });
+
+    const multibyte = await gateBPublisher.runGateBCommandForDirectTest(
+      process.execPath,
+      [
+        "-e",
+        `process.stdout.write(Buffer.alloc(${limit - 3}, 0x61), () => { process.stdout.write(Buffer.from([0xe2])); setImmediate(() => process.stdout.write(Buffer.from([0x82, 0xac]))); });`,
+      ],
+    );
+    expect(multibyte.exitCode).toBe(0);
+    expect(Buffer.byteLength(multibyte.stdout)).toBe(limit);
+    expect(multibyte.stdout.endsWith("€")).toBe(true);
+
+    for (const stream of ["stdout", "stderr"]) {
+      const overflow = await gateBPublisher.runGateBCommandForDirectTest(
+        process.execPath,
+        [
+          "-e",
+          `process.${stream}.write(Buffer.alloc(${limit + 1}, 0x63)); setInterval(() => {}, 1000);`,
+        ],
+      );
+      expect(overflow).toEqual({ stdout: "", stderr: "", exitCode: 1 });
+    }
+  }, 15_000);
+
+  it("requires the complete ordered eleven-subject candidate history", () => {
+    expect(GATE_B_COMMIT_SUBJECTS).toEqual([
+      "WORKSPACE: make server workspace commands atomic",
+      "AUTOMATION: persist trigger delivery and cancellation state",
+      "DOCUMENTATION: publish bounded atomic archive ingestion",
+      "ASR: bound inference workers and service readiness",
+      "SERVER: make readiness and shutdown lifecycle explicit",
+      "INSTALLER: unify reproducible local service setup",
+      "DOCS: align operator and scoped-agent contracts",
+      "POLICY: separate candidate publication from live-head review",
+      "POLICY: bind publication authorization and candidate lease",
+      "POLICY: isolate publication credentials and outcomes",
+      "POLICY: harden Gate B publication boundary",
+    ]);
+  });
+
   it("v18 requires the ephemeral token commitment in publication authorization", () => {
     const schema = JSON.parse(
       fs.readFileSync(
@@ -43,13 +214,20 @@ describe("Gate B candidate publisher", () => {
     expect(schema.properties.credential_token_sha256).toEqual({
       $ref: "#/$defs/sha256",
     });
+    expect(schema.properties.credential_mode).toEqual({
+      const: "attended-user",
+    });
+    expect(schema.properties.principal).toEqual({
+      $ref: "#/$defs/attendedUserPrincipal",
+    });
+    expect(schema.$defs.automatedAppPrincipal).toBeUndefined();
   });
 
   it("v18 returns only the closed published terminal result", async () => {
     const fixture = gateBFixture();
     const runner = commandRunner(fixture);
 
-    const result = await publishGateBCandidate({
+    const result = await publishGateBCandidateForDirectTest({
       ...authorizationArguments(fixture),
       artifactDir: fixture.directory,
       authorizedManifestSha256: fixture.manifestSha256,
@@ -63,9 +241,339 @@ describe("Gate B candidate publisher", () => {
       retry: false,
       reviewPrHandoff: true,
     });
+    expect(runner.committedHeadReads).toBe(2);
+    expect(runner.committedDiffReads).toBe(2);
+
+    const committedDiffCalls = runner.calls.filter(
+      ([, args]) => args[0] === "diff" && args[1] === "--name-only",
+    );
+    const committedHeadCalls = runner.calls.filter(
+      ([, args, options]) =>
+        args.join(" ") === "rev-parse HEAD" &&
+        options.env &&
+        !Object.hasOwn(options.env, "HOME"),
+    );
+    expect(committedHeadCalls).toHaveLength(2);
+    for (const [command, args, options] of committedHeadCalls) {
+      expect(command).toBe("git");
+      expect(args).toEqual(["rev-parse", "HEAD"]);
+      expect(options).toEqual({
+        cwd: process.cwd(),
+        env: expectedCredentialFreeGitEnvironment,
+      });
+    }
+    expect(committedDiffCalls).toHaveLength(2);
+    for (const [command, args, options] of committedDiffCalls) {
+      expect(command).toBe("git");
+      expect(args).toEqual([
+        "diff",
+        "--name-only",
+        "-z",
+        "--no-renames",
+        `${GATE_B_LOCAL_CHANGE_BASE_SHA}..${fixture.head}`,
+        "--",
+      ]);
+      expect(options).toEqual({
+        cwd: process.cwd(),
+        encoding: "buffer",
+        env: expectedCredentialFreeGitEnvironment,
+      });
+    }
+    for (const [, args, options] of runner.calls) {
+      if (args[0] !== "diff" || args[1] !== "--name-only") {
+        expect(options.encoding).toBeUndefined();
+      }
+    }
   });
 
-  it("rejects a token fingerprint mismatch before every command", async () => {
+  it("rejects the obsolete 113-path bundle before token or process use", async () => {
+    const fixture = gateBFixture();
+    fixture.mutate("plan.json", (plan) => {
+      plan.allowed_paths = plan.allowed_paths.slice(0, 113);
+    });
+    const runner = commandRunner(fixture);
+    const readToken = vi.fn(() => fixture.token);
+
+    await expect(
+      publishGateBCandidateForDirectTest({
+        ...authorizationArguments(fixture),
+        artifactDir: fixture.directory,
+        authorizedManifestSha256: readableManifestOrOriginal(fixture),
+        expectedOldHead: fixture.oldHead,
+        readToken,
+        runCommand: runner.run,
+      }),
+    ).rejects.toThrow(
+      `Gate B plan allowed path count must equal ${GATE_B_ALLOWED_PATH_COUNT}.`,
+    );
+
+    expect(readToken).not.toHaveBeenCalled();
+    expect(runner.calls).toEqual([]);
+    expect(runner.pushes).toEqual([]);
+  });
+
+  it.each([
+    [
+      "missing",
+      (fixture) => committedDiffOutput(fixture, fixture.allowedPaths.slice(1)),
+    ],
+    [
+      "extra",
+      (fixture) =>
+        committedDiffOutput(fixture, [
+          ...fixture.allowedPaths,
+          "apps/server/src/unreviewed.ts",
+        ]),
+    ],
+    [
+      "duplicate",
+      (fixture) =>
+        committedDiffOutput(fixture, [
+          ...fixture.allowedPaths,
+          fixture.allowedPaths[0],
+        ]),
+    ],
+    [
+      "renamed as one endpoint",
+      (fixture) =>
+        committedDiffOutput(fixture, fixture.allowedPaths.slice(0, -1)),
+    ],
+    [
+      "newline-containing",
+      (fixture) =>
+        committedDiffOutput(fixture, [
+          `${fixture.allowedPaths[0]}\nother`,
+          ...fixture.allowedPaths.slice(1),
+        ]),
+    ],
+    [
+      "absolute",
+      (fixture) =>
+        committedDiffOutput(fixture, [
+          "/apps/server/src/gate-b-1.ts",
+          ...fixture.allowedPaths.slice(1),
+        ]),
+    ],
+    [
+      "traversal",
+      (fixture) =>
+        committedDiffOutput(fixture, [
+          "apps/server/../gate-b-1.ts",
+          ...fixture.allowedPaths.slice(1),
+        ]),
+    ],
+    [
+      "unterminated NUL",
+      (fixture) => Buffer.from(fixture.allowedPaths.join("\0")),
+    ],
+    [
+      "empty NUL field",
+      (fixture) =>
+        Buffer.from(
+          `${fixture.allowedPaths[0]}\0\0${fixture.allowedPaths.slice(1).join("\0")}\0`,
+        ),
+    ],
+    ["invalid UTF-8", () => Buffer.from([0xff, 0x00])],
+    ["oversized", () => Buffer.alloc(2 * 1024 * 1024 + 1, 0x61)],
+  ])(
+    "rejects a %s initial committed diff before token or authenticated work",
+    async (_name, committedDiff) => {
+      const fixture = gateBFixture();
+      const runner = commandRunner(fixture, {
+        initialCommittedDiff: committedDiff(fixture),
+      });
+      const readToken = vi.fn(() => fixture.token);
+
+      await expect(
+        publishGateBCandidateForDirectTest({
+          ...authorizationArguments(fixture),
+          artifactDir: fixture.directory,
+          authorizedManifestSha256: fixture.manifestSha256,
+          expectedOldHead: fixture.oldHead,
+          readToken,
+          runCommand: runner.run,
+        }),
+      ).rejects.toThrow();
+
+      expect(readToken).not.toHaveBeenCalled();
+      expect(runner.committedDiffReads).toBe(1);
+      expect(commandSignatures(runner.calls)).not.toContainEqual(
+        expect.stringMatching(/^(?:gh|git init) /u),
+      );
+      expect(runner.pushes).toEqual([]);
+    },
+  );
+
+  it("preserves a leading UTF-8 BOM as committed pathname identity", async () => {
+    const fixture = gateBFixture();
+    const runner = commandRunner(fixture, {
+      initialCommittedDiff: committedDiffOutput(fixture, [
+        `\uFEFF${fixture.allowedPaths[0]}`,
+        ...fixture.allowedPaths.slice(1),
+      ]),
+    });
+    const readToken = vi.fn(() => fixture.token);
+
+    await expect(
+      publishGateBCandidateForDirectTest({
+        ...authorizationArguments(fixture),
+        artifactDir: fixture.directory,
+        authorizedManifestSha256: fixture.manifestSha256,
+        expectedOldHead: fixture.oldHead,
+        readToken,
+        runCommand: runner.run,
+      }),
+    ).rejects.toThrow(/committed diff paths/i);
+
+    expect(readToken).not.toHaveBeenCalled();
+    expect(runner.committedDiffReads).toBe(1);
+    expect(runner.pushes).toEqual([]);
+  });
+
+  it("admits an exactly declared leading-BOM committed pathname", async () => {
+    const allowedPaths = Array.from(
+      { length: GATE_B_ALLOWED_PATH_COUNT },
+      (_, index) =>
+        index === 0
+          ? "\uFEFFapps/server/src/gate-b-1.ts"
+          : `apps/server/src/gate-b-${index + 1}.ts`,
+    );
+    const fixture = gateBFixture({ allowedPaths });
+    const runner = commandRunner(fixture);
+
+    await expect(
+      publishGateBCandidateForDirectTest({
+        ...authorizationArguments(fixture),
+        artifactDir: fixture.directory,
+        authorizedManifestSha256: fixture.manifestSha256,
+        expectedOldHead: fixture.oldHead,
+        runCommand: runner.run,
+      }),
+    ).resolves.toEqual({
+      outcome: "published",
+      pushAttempts: 1,
+      retry: false,
+      reviewPrHandoff: true,
+    });
+
+    expect(runner.committedDiffReads).toBe(2);
+    expect(runner.pushes).toHaveLength(1);
+  });
+
+  it("rejects a wrong committed HEAD before token or authenticated work", async () => {
+    const fixture = gateBFixture();
+    const runner = commandRunner(fixture, {
+      initialCommittedHead: gitSha("c"),
+    });
+    const readToken = vi.fn(() => fixture.token);
+
+    await expect(
+      publishGateBCandidateForDirectTest({
+        ...authorizationArguments(fixture),
+        artifactDir: fixture.directory,
+        authorizedManifestSha256: fixture.manifestSha256,
+        expectedOldHead: fixture.oldHead,
+        readToken,
+        runCommand: runner.run,
+      }),
+    ).rejects.toThrow(/committed-diff local head/i);
+
+    expect(readToken).not.toHaveBeenCalled();
+    expect(runner.committedDiffReads).toBe(0);
+    expect(runner.pushes).toEqual([]);
+  });
+
+  it("rejects a committed-diff command failure before token", async () => {
+    const fixture = gateBFixture();
+    const runner = commandRunner(fixture, { committedDiffExitCode: 1 });
+    const readToken = vi.fn(() => fixture.token);
+
+    await expect(
+      publishGateBCandidateForDirectTest({
+        ...authorizationArguments(fixture),
+        artifactDir: fixture.directory,
+        authorizedManifestSha256: fixture.manifestSha256,
+        expectedOldHead: fixture.oldHead,
+        readToken,
+        runCommand: runner.run,
+      }),
+    ).rejects.toThrow(/committed-diff command failed/i);
+
+    expect(readToken).not.toHaveBeenCalled();
+    expect(runner.pushes).toEqual([]);
+  });
+
+  it("uses the actual default runner Buffer path and fatal UTF-8 decoder", async () => {
+    const fixture = gateBFixture();
+    const executable = committedDiffExecutable(fixture, Buffer.from([0xff, 0]));
+    const readToken = vi.fn(() => fixture.token);
+
+    await expect(
+      publishGateBCandidateForDirectTest({
+        ...authorizationArguments(fixture),
+        artifactDir: fixture.directory,
+        authorizedManifestSha256: fixture.manifestSha256,
+        executables: { git: executable, gh: executable },
+        expectedOldHead: fixture.oldHead,
+        readToken,
+      }),
+    ).rejects.toThrow(/valid UTF-8/i);
+
+    expect(readToken).not.toHaveBeenCalled();
+  });
+
+  it("keeps actual default-runner normal commands string-only", async () => {
+    const fixture = gateBFixture();
+    const executable = committedDiffExecutable(
+      fixture,
+      committedDiffOutput(fixture),
+    );
+    const readToken = vi.fn(() => "short");
+
+    await expect(
+      publishGateBCandidateForDirectTest({
+        ...authorizationArguments(fixture),
+        artifactDir: fixture.directory,
+        authorizedManifestSha256: fixture.manifestSha256,
+        executables: { git: executable, gh: executable },
+        expectedOldHead: fixture.oldHead,
+        readToken,
+      }),
+    ).rejects.toThrow(/high-entropy CLOUDX_GATE_B_TOKEN/i);
+
+    expect(readToken).toHaveBeenCalledOnce();
+  });
+
+  it("rechecks the committed diff immediately before push", async () => {
+    const fixture = gateBFixture();
+    const runner = commandRunner(fixture, {
+      freshCommittedDiff: committedDiffOutput(
+        fixture,
+        fixture.allowedPaths.slice(1),
+      ),
+    });
+    const readToken = vi.fn(() => fixture.token);
+
+    await expect(
+      publishGateBCandidateForDirectTest({
+        ...authorizationArguments(fixture),
+        artifactDir: fixture.directory,
+        authorizedManifestSha256: fixture.manifestSha256,
+        expectedOldHead: fixture.oldHead,
+        readToken,
+        runCommand: runner.run,
+      }),
+    ).rejects.toThrow(/committed diff paths/i);
+
+    expect(readToken).toHaveBeenCalledOnce();
+    expect(runner.committedDiffReads).toBe(2);
+    expect(commandSignatures(runner.calls)).toContain(
+      "gh api repos/davidomil/cloudx/rules/branches/architecture-and-new-codex",
+    );
+    expect(runner.pushes).toEqual([]);
+  });
+
+  it("rejects a token fingerprint mismatch after credential-free candidate admission", async () => {
     const fixture = gateBFixture();
     fixture.authorization.credential_token_sha256 = sha("9");
     writeCanonicalAuthorization(fixture);
@@ -73,7 +581,7 @@ describe("Gate B candidate publisher", () => {
     let tokenReads = 0;
 
     await expect(
-      publishGateBCandidate({
+      publishGateBCandidateForDirectTest({
         ...authorizationArguments(fixture),
         artifactDir: fixture.directory,
         authorizedManifestSha256: fixture.manifestSha256,
@@ -87,7 +595,11 @@ describe("Gate B candidate publisher", () => {
     ).rejects.toThrow(/credential is not authorized/i);
 
     expect(tokenReads).toBe(1);
-    expect(runner.calls).toEqual([]);
+    expect(runner.committedDiffReads).toBe(1);
+    expect(commandSignatures(runner.calls)).toEqual([
+      "git rev-parse HEAD",
+      committedDiffSignature(fixture),
+    ]);
   });
 
   it("keeps the token commitment only in private authorization bytes", () => {
@@ -131,6 +643,62 @@ describe("Gate B candidate publisher", () => {
     expect(runner.calls).toEqual([]);
   });
 
+  it("requires an explicit loopback transport before accepting direct-test dependencies", () => {
+    const readToken = vi.fn();
+    const runCommand = vi.fn();
+
+    expect(() =>
+      publishCandidateForDirectTest({ readToken, runCommand }),
+    ).toThrow(/transport|loopback/i);
+    expect(readToken).not.toHaveBeenCalled();
+    expect(runCommand).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["runner", { runCommand: () => undefined }],
+    ["Git executable", { gitExecutable: "/tmp/git" }],
+    ["GitHub executable", { ghExecutable: "/tmp/gh" }],
+    ["clock", { now: () => Date.now() }],
+    ["token reader", { readToken: () => "x".repeat(40) }],
+    ["cleanup", { removeDirectory: () => undefined }],
+  ])(
+    "rejects a production %s selector before token or process use",
+    (_name, selector) => {
+      const fixture = gateBFixture();
+      expect(() =>
+        publishGateBCandidate({
+          artifactDir: fixture.directory,
+          authorizedManifestSha256: fixture.manifestSha256,
+          authorizationFile: fixture.authorizationFile,
+          authorizedPublicationSha256: fixture.authorizedPublicationSha256,
+          credentialMode: fixture.credentialMode,
+          expectedOldHead: fixture.oldHead,
+          ...selector,
+        }),
+      ).toThrow(/closed contract/i);
+    },
+  );
+
+  it.each([
+    ["missing", { missing: "/usr/bin/git" }],
+    ["linked", { mutate: ["/usr/bin/git", { symbolicLink: true }] }],
+    ["nonregular", { mutate: ["/usr/bin/git", { kind: "directory" }] }],
+    ["non-root-owned", { mutate: ["/usr/bin/git", { uid: 1000n }] }],
+    ["group-writable", { mutate: ["/usr/bin/git", { mode: 0o100775n }] }],
+    ["nonexecutable", { mutate: ["/usr/bin/git", { mode: 0o100644n }] }],
+    ["identity-drifted", { drift: "/usr/bin/git" }],
+  ])("rejects a %s fixed executable path", (_name, behavior) => {
+    const fileSystem = trustedExecutableFileSystem(behavior);
+    expect(() =>
+      validateTrustedExecutablesForDirectTest(
+        { git: "/usr/bin/git", gh: "/usr/bin/gh" },
+        fileSystem,
+      ),
+    ).toThrow();
+    expect(fileSystem.tokenReads).toBe(0);
+    expect(fileSystem.processes).toBe(0);
+  });
+
   it.each([
     ["mutable descriptor", loopbackTransport(41000, { freeze: false })],
     ["extra descriptor key", loopbackTransport(41001, { extra: true })],
@@ -145,8 +713,19 @@ describe("Gate B candidate publisher", () => {
       loopbackTransport(41007, { scopeHost: "127.0.0.1:9" }),
     ],
     ["scope path drift", loopbackTransport(41008, { scopePath: "other.git" })],
+    [
+      "production GitHub descriptor",
+      Object.freeze({
+        credentialScope: Object.freeze({
+          host: "github.com",
+          path: "davidomil/cloudx",
+        }),
+        protocol: "https",
+        url: "https://github.com/davidomil/cloudx",
+      }),
+    ],
   ])("rejects a %s loopback test transport", (_name, transport) => {
-    expect(() => publishGateBCandidateForLoopbackTest({}, transport)).toThrow(
+    expect(() => publishGateBCandidateForDirectTest({}, transport)).toThrow(
       /loopback|frozen closed/i,
     );
   });
@@ -158,7 +737,7 @@ describe("Gate B candidate publisher", () => {
       let cleanupCalls = 0;
       let contextRoot;
 
-      const terminal = await publishGateBCandidate({
+      const terminal = await publishGateBCandidateForDirectTest({
         ...authorizationArguments(fixture),
         artifactDir: fixture.directory,
         authorizedManifestSha256: fixture.manifestSha256,
@@ -190,7 +769,7 @@ describe("Gate B candidate publisher", () => {
     let contextRoot;
 
     await expect(
-      publishGateBCandidate({
+      publishGateBCandidateForDirectTest({
         ...authorizationArguments(fixture),
         artifactDir: fixture.directory,
         authorizedManifestSha256: fixture.manifestSha256,
@@ -215,7 +794,7 @@ describe("Gate B candidate publisher", () => {
     let tokenReads = 0;
 
     await expect(
-      publishGateBCandidate({
+      publishGateBCandidateForDirectTest({
         artifactDir: fixture.directory,
         authorizedManifestSha256: fixture.manifestSha256,
         expectedOldHead: fixture.oldHead,
@@ -302,7 +881,11 @@ describe("Gate B candidate publisher", () => {
     ],
     [
       "principal kind",
-      (authorization) => (authorization.principal.kind = "github-user"),
+      (authorization) =>
+        (authorization.principal = {
+          kind: "github-app-installation",
+          app_id: 1001,
+        }),
     ],
   ])(
     "rejects a substituted %s authorization before reading a token or dispatching a command",
@@ -342,7 +925,7 @@ describe("Gate B candidate publisher", () => {
     useAttendedUserAuthorization(fixture);
     const runner = commandRunner(fixture);
 
-    const result = await publishGateBCandidate({
+    const result = await publishGateBCandidateForDirectTest({
       ...authorizationArguments(fixture),
       artifactDir: fixture.directory,
       authorizedManifestSha256: fixture.manifestSha256,
@@ -368,7 +951,7 @@ describe("Gate B candidate publisher", () => {
     const runner = commandRunner(fixture, { user });
 
     await expect(
-      publishGateBCandidate({
+      publishGateBCandidateForDirectTest({
         ...authorizationArguments(fixture),
         artifactDir: fixture.directory,
         authorizedManifestSha256: fixture.manifestSha256,
@@ -390,7 +973,7 @@ describe("Gate B candidate publisher", () => {
     writeCanonicalAuthorization(fixture);
     const runner = commandRunner(fixture);
 
-    const result = await publishGateBCandidate({
+    const result = await publishGateBCandidateForDirectTest({
       ...authorizationArguments(fixture),
       artifactDir: fixture.directory,
       authorizedManifestSha256: fixture.manifestSha256,
@@ -401,78 +984,21 @@ describe("Gate B candidate publisher", () => {
     expect(result.outcome).toBe("published");
   });
 
-  it.each(["automated-app", "attended-user"])(
-    "publishes through the real spawned CLI in %s mode",
-    (credentialMode) => {
-      const fixture = gateBFixture();
-      if (credentialMode === "attended-user") {
-        useAttendedUserAuthorization(fixture);
-      }
-      const spawned = spawnedPublisherFixture(fixture);
+  it("rejects automated-app in the spawned CLI without consulting hostile PATH shims", () => {
+    const fixture = gateBFixture();
+    fixture.credentialMode = "automated-app";
+    const spawned = spawnedPublisherFixture(fixture);
 
-      const result = spawnPublisher(fixture, spawned);
+    const result = spawnPublisher(fixture, spawned);
 
-      expect(result.status, result.stderr).toBe(0);
-      expect(JSON.parse(result.stdout)).toEqual({
-        outcome: "published",
-        pushAttempts: 1,
-        retry: false,
-        reviewPrHandoff: true,
-      });
-      const calls = readShimCalls(spawned);
-      const signatures = commandSignatures(
-        calls.map(({ command, args }) => [command, args]),
-      );
-      expect(signatures).toContain(
-        credentialMode === "automated-app"
-          ? "gh api --method GET /installation/repositories"
-          : "gh api --method GET /user",
-      );
-      expect(signatures).not.toContain(
-        credentialMode === "automated-app"
-          ? "gh api --method GET /user"
-          : "gh api --method GET /installation/repositories",
-      );
-      const networkCalls = calls.filter(
-        ({ command, operation }) =>
-          command === "gh" ||
-          (command === "git" && ["ls-remote", "push"].includes(operation)),
-      );
-      expect(networkCalls.every(({ tokenPresent }) => tokenPresent)).toBe(true);
-      expect(
-        networkCalls.every(({ cloudxTokenPresent }) => !cloudxTokenPresent),
-      ).toBe(true);
-      expect(
-        networkCalls.every(({ githubTokenPresent }) => !githubTokenPresent),
-      ).toBe(true);
-      expect(
-        networkCalls
-          .filter(({ command }) => command === "git")
-          .every(
-            ({ askpass, configGlobal, terminalPrompt }) =>
-              askpass === "/bin/false" &&
-              configGlobal === "/dev/null" &&
-              terminalPrompt === "0",
-          ),
-      ).toBe(true);
-      const pushes = calls.filter(({ operation }) => operation === "push");
-      expect(pushes).toHaveLength(1);
-      expect(pushes[0].args.slice(-6)).toEqual([
-        "push",
-        "--no-verify",
-        "--porcelain",
-        `--force-with-lease=${GATE_B_CANDIDATE_REF}:${fixture.oldHead}`,
-        "https://github.com/davidomil/cloudx",
-        `HEAD:${GATE_B_CANDIDATE_REF}`,
-      ]);
-      expect(
-        `${result.stdout}\n${result.stderr}\n${fs.readFileSync(spawned.logFile, "utf8")}`,
-      ).not.toContain(fixture.token);
-      expect(
-        `${result.stdout}\n${result.stderr}\n${fs.readFileSync(spawned.logFile, "utf8")}`,
-      ).not.toContain(digest(fixture.token));
-    },
-  );
+    expect(result.status).not.toBe(0);
+    expect(readShimCalls(spawned)).toEqual([]);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("Gate B publication rejected before push.\n");
+    expect(fs.readFileSync(spawned.logFile, "utf8")).not.toContain(
+      fixture.token,
+    );
+  });
 
   it.each([
     ["missing authorization file argument", { omit: "authorization-file" }],
@@ -507,7 +1033,7 @@ describe("Gate B candidate publisher", () => {
 
   it("rejects a CLI credential-mode mismatch before reading a token", async () => {
     const fixture = gateBFixture();
-    fixture.credentialMode = "attended-user";
+    fixture.credentialMode = "automated-app";
 
     await expectAuthorizationRejectedBeforeToken(fixture);
   });
@@ -582,7 +1108,7 @@ describe("Gate B candidate publisher", () => {
       });
 
       await expect(
-        publishGateBCandidate({
+        publishGateBCandidateForDirectTest({
           ...authorizationArguments(fixture),
           artifactDir: fixture.directory,
           authorizedManifestSha256: fixture.manifestSha256,
@@ -602,7 +1128,7 @@ describe("Gate B candidate publisher", () => {
       },
     });
 
-    const result = await publishGateBCandidate({
+    const result = await publishGateBCandidateForDirectTest({
       ...authorizationArguments(fixture),
       artifactDir: fixture.directory,
       authorizedManifestSha256: fixture.manifestSha256,
@@ -618,7 +1144,7 @@ describe("Gate B candidate publisher", () => {
     const fixture = gateBFixture();
     const runner = commandRunner(fixture);
 
-    const result = await publishGateBCandidate({
+    const result = await publishGateBCandidateForDirectTest({
       ...authorizationArguments(fixture),
       artifactDir: fixture.directory,
       authorizedManifestSha256: fixture.manifestSha256,
@@ -638,7 +1164,7 @@ describe("Gate B candidate publisher", () => {
       "--no-verify",
       "--porcelain",
       `--force-with-lease=${GATE_B_CANDIDATE_REF}:${fixture.oldHead}`,
-      "https://github.com/davidomil/cloudx",
+      directTestTransport.url,
       "HEAD:refs/heads/architecture-and-new-codex",
     ]);
     expect(runner.pushes[0][1]).toEqual(
@@ -649,6 +1175,113 @@ describe("Gate B candidate publisher", () => {
       ]),
     );
     expect(runner.pushes[0][1].join(" ")).not.toContain(fixture.token);
+  });
+
+  it("enumerates exactly the canonical 15 names before any artifact content read", () => {
+    const fixture = gateBFixture();
+    fs.writeFileSync(path.join(fixture.directory, "sixteenth.json"), "{}\n");
+    const read = vi.spyOn(fs, "readSync");
+    try {
+      expect(() => readGateBArtifactSnapshot(fixture.directory)).toThrow(
+        /filenames|entries|15/i,
+      );
+      expect(read).not.toHaveBeenCalled();
+    } finally {
+      read.mockRestore();
+    }
+  });
+
+  it.each([
+    [
+      "same-size in-place rewrite",
+      (filePath, bytes) =>
+        fs.writeFileSync(filePath, Buffer.alloc(bytes.length, 65)),
+    ],
+    ["growth", (filePath) => fs.appendFileSync(filePath, "growth")],
+    [
+      "replacement",
+      (filePath, bytes) => {
+        const replacement = `${filePath}.replacement`;
+        fs.writeFileSync(replacement, bytes);
+        fs.renameSync(replacement, filePath);
+      },
+    ],
+  ])("rejects a %s during a stable descriptor read", (_name, mutate) => {
+    const fixture = gateBFixture();
+    const filePath = path.join(fixture.directory, "implementation.json");
+    const bytes = fs.readFileSync(filePath);
+    const originalRead = fs.readSync;
+    let changed = false;
+    const read = vi.spyOn(fs, "readSync").mockImplementation((...args) => {
+      const count = originalRead(...args);
+      if (!changed && count > 0) {
+        changed = true;
+        mutate(filePath, bytes);
+      }
+      return count;
+    });
+    try {
+      expect(() => readGateBArtifactSnapshot(fixture.directory)).toThrow(
+        /changed|stable|size|identity/i,
+      );
+    } finally {
+      read.mockRestore();
+    }
+  });
+
+  it("rejects a short descriptor read and closes every opened file exactly once", () => {
+    const fixture = gateBFixture();
+    const read = vi.spyOn(fs, "readSync").mockReturnValue(0);
+    const close = vi.spyOn(fs, "closeSync");
+    try {
+      expect(() => readGateBArtifactSnapshot(fixture.directory)).toThrow(
+        /short read|EOF/i,
+      );
+      expect(
+        new Set(close.mock.calls.map(([descriptor]) => descriptor)).size,
+      ).toBe(close.mock.calls.length);
+      expect(close).toHaveBeenCalledTimes(15);
+    } finally {
+      close.mockRestore();
+      read.mockRestore();
+    }
+  });
+
+  it.each([
+    ["per-file", 0, 1024 * 1024 + 1],
+    ["aggregate", 9, 1024 * 1024],
+  ])(
+    "rejects %s artifact byte overflow before allocation or read",
+    (_name, count, size) => {
+      const fixture = gateBFixture();
+      const names = fs.readdirSync(fixture.directory).sort();
+      for (const name of names.slice(0, count || 1)) {
+        fs.truncateSync(path.join(fixture.directory, name), size);
+      }
+      const read = vi.spyOn(fs, "readSync");
+      const allocate = vi.spyOn(Buffer, "alloc");
+      try {
+        expect(() => readGateBArtifactSnapshot(fixture.directory)).toThrow(
+          /1 MiB|8 MiB|size|aggregate/i,
+        );
+        expect(read).not.toHaveBeenCalled();
+        expect(allocate).not.toHaveBeenCalled();
+      } finally {
+        allocate.mockRestore();
+        read.mockRestore();
+      }
+    },
+  );
+
+  it.each(["symlink", "directory"])("rejects a %s artifact entry", (kind) => {
+    const fixture = gateBFixture();
+    const filePath = path.join(fixture.directory, "implementation.json");
+    fs.rmSync(filePath);
+    if (kind === "symlink") fs.symlinkSync("plan.json", filePath);
+    else fs.mkdirSync(filePath);
+    expect(() => readGateBArtifactSnapshot(fixture.directory)).toThrow(
+      /regular file|nonsymlink/i,
+    );
   });
 
   it.each([
@@ -778,11 +1411,10 @@ describe("Gate B candidate publisher", () => {
       const runner = commandRunner(fixture);
 
       await expect(
-        publishGateBCandidate({
+        publishGateBCandidateForDirectTest({
           ...authorizationArguments(fixture),
           artifactDir: fixture.directory,
-          authorizedManifestSha256: readGateBArtifactSnapshot(fixture.directory)
-            .manifestSha256,
+          authorizedManifestSha256: readableManifestOrOriginal(fixture),
           expectedOldHead: fixture.oldHead,
           runCommand: runner.run,
         }),
@@ -796,7 +1428,7 @@ describe("Gate B candidate publisher", () => {
     const runner = commandRunner(fixture);
 
     await expect(
-      publishGateBCandidate({
+      publishGateBCandidateForDirectTest({
         ...authorizationArguments(fixture),
         artifactDir: fixture.directory,
         authorizedManifestSha256: sha("9"),
@@ -830,7 +1462,7 @@ describe("Gate B candidate publisher", () => {
     const runner = commandRunner(fixture, overrides);
 
     await expect(
-      publishGateBCandidate({
+      publishGateBCandidateForDirectTest({
         ...authorizationArguments(fixture),
         artifactDir: fixture.directory,
         authorizedManifestSha256: fixture.manifestSha256,
@@ -852,7 +1484,7 @@ describe("Gate B candidate publisher", () => {
     });
 
     await expect(
-      publishGateBCandidate({
+      publishGateBCandidateForDirectTest({
         ...authorizationArguments(fixture),
         artifactDir: fixture.directory,
         authorizedManifestSha256: fixture.manifestSha256,
@@ -866,23 +1498,6 @@ describe("Gate B candidate publisher", () => {
   it.each([
     ["missing GitHub CLI", { throwOn: "gh --version" }],
     ["malformed GitHub CLI version", { ghVersion: "unknown\n" }],
-    [
-      "failed automated-app identity query",
-      { failOn: "gh api --method GET /installation/repositories" },
-    ],
-    [
-      "malformed automated-app identity",
-      { installationRepositories: { total_count: 1, repositories: [] } },
-    ],
-    [
-      "wrong automated-app repository",
-      {
-        installationRepositories: {
-          total_count: 1,
-          repositories: [{ full_name: "other/cloudx" }],
-        },
-      },
-    ],
     [
       "repository query failure",
       {
@@ -911,7 +1526,7 @@ describe("Gate B candidate publisher", () => {
     [
       "target ref query failure",
       {
-        failOn: `git ls-remote https://github.com/davidomil/cloudx ${GATE_B_TARGET_BASE_REF}`,
+        failOn: `git ls-remote ${directTestTransport.url} ${GATE_B_TARGET_BASE_REF}`,
       },
     ],
     ["missing candidate ref", { candidateOutput: "" }],
@@ -927,7 +1542,7 @@ describe("Gate B candidate publisher", () => {
     [
       "candidate ref query failure",
       {
-        failOn: `git ls-remote https://github.com/davidomil/cloudx ${GATE_B_CANDIDATE_REF}`,
+        failOn: `git ls-remote ${directTestTransport.url} ${GATE_B_CANDIDATE_REF}`,
       },
     ],
     ["non-ancestor candidate history", { fastForward: false }],
@@ -985,7 +1600,7 @@ describe("Gate B candidate publisher", () => {
     const runner = commandRunner(fixture, overrides);
 
     await expect(
-      publishGateBCandidate({
+      publishGateBCandidateForDirectTest({
         ...authorizationArguments(fixture),
         artifactDir: fixture.directory,
         authorizedManifestSha256: fixture.manifestSha256,
@@ -1001,7 +1616,7 @@ describe("Gate B candidate publisher", () => {
     const runner = commandRunner(fixture);
 
     await expect(
-      publishGateBCandidate({
+      publishGateBCandidateForDirectTest({
         ...authorizationArguments(fixture),
         artifactDir: fixture.directory,
         authorizedManifestSha256: fixture.manifestSha256,
@@ -1029,14 +1644,14 @@ describe("Gate B candidate publisher", () => {
     [
       "post-push target query failure",
       {
-        failAfterPushOn: `git ls-remote https://github.com/davidomil/cloudx ${GATE_B_TARGET_BASE_REF}`,
+        failAfterPushOn: `git ls-remote ${directTestTransport.url} ${GATE_B_TARGET_BASE_REF}`,
       },
     ],
     ["post-push target OID mismatch", { postPushTargetBase: gitSha("c") }],
     [
       "post-push candidate query failure",
       {
-        failAfterPushOn: `git ls-remote https://github.com/davidomil/cloudx ${GATE_B_CANDIDATE_REF}`,
+        failAfterPushOn: `git ls-remote ${directTestTransport.url} ${GATE_B_CANDIDATE_REF}`,
       },
     ],
     ["post-push candidate OID mismatch", { postPushHead: gitSha("e") }],
@@ -1074,7 +1689,7 @@ describe("Gate B candidate publisher", () => {
     const fixture = gateBFixture();
     const runner = commandRunner(fixture, overrides);
 
-    const outcome = await publishGateBCandidate({
+    const outcome = await publishGateBCandidateForDirectTest({
       ...authorizationArguments(fixture),
       artifactDir: fixture.directory,
       authorizedManifestSha256: fixture.manifestSha256,
@@ -1095,7 +1710,7 @@ describe("Gate B candidate publisher", () => {
     const fixture = gateBFixture();
     const runner = commandRunner(fixture, { postPushHead: gitSha("e") });
 
-    const outcome = await publishGateBCandidate({
+    const outcome = await publishGateBCandidateForDirectTest({
       ...authorizationArguments(fixture),
       artifactDir: fixture.directory,
       authorizedManifestSha256: fixture.manifestSha256,
@@ -1112,7 +1727,7 @@ describe("Gate B candidate publisher", () => {
     expect(runner.pushes).toHaveLength(1);
   });
 
-  it("publishes through an authenticated real smart-HTTP receive-pack", async () => {
+  it("publishes the unreplaced object graph through authenticated smart HTTP", async () => {
     const integration = await smartHttpIntegrationFixture();
     const originalDirectory = process.cwd();
     const originalTemplate = process.env.GIT_TEMPLATE_DIR;
@@ -1122,7 +1737,39 @@ describe("Gate B candidate publisher", () => {
       process.env.GIT_TEMPLATE_DIR = integration.hostileTemplateDirectory;
       process.env.GIT_CONFIG_GLOBAL = integration.hostileGlobalConfig;
 
-      const terminal = await publishGateBCandidateForLoopbackTest(
+      expect(
+        execFileSync(
+          "git",
+          [
+            "-C",
+            integration.sourceDirectory,
+            "show",
+            "-s",
+            "--format=%s",
+            "HEAD",
+          ],
+          { encoding: "utf8" },
+        ).trim(),
+      ).toBe("HOSTILE REPLACEMENT");
+      expect(
+        execFileSync(
+          "git",
+          [
+            "-C",
+            integration.sourceDirectory,
+            "show",
+            "-s",
+            "--format=%s",
+            "HEAD",
+          ],
+          {
+            encoding: "utf8",
+            env: { ...process.env, GIT_NO_REPLACE_OBJECTS: "1" },
+          },
+        ).trim(),
+      ).toBe(GATE_B_COMMIT_SUBJECTS.at(-1));
+
+      const terminal = await publishGateBCandidateForDirectTest(
         {
           ...authorizationArguments(integration.fixture),
           artifactDir: integration.fixture.directory,
@@ -1166,6 +1813,19 @@ describe("Gate B candidate publisher", () => {
           "git",
           [
             `--git-dir=${integration.targetGitDirectory}`,
+            "show",
+            "-s",
+            "--format=%s",
+            GATE_B_CANDIDATE_REF,
+          ],
+          { encoding: "utf8" },
+        ).trim(),
+      ).toBe(GATE_B_COMMIT_SUBJECTS.at(-1));
+      expect(
+        execFileSync(
+          "git",
+          [
+            `--git-dir=${integration.targetGitDirectory}`,
             "for-each-ref",
             "--format=%(refname) %(objectname)",
             "refs/heads",
@@ -1183,6 +1843,22 @@ describe("Gate B candidate publisher", () => {
       expect(fs.existsSync(integration.observations.contextRoots[0])).toBe(
         false,
       );
+      const sourceReadsAndImport = integration.observations.calls.filter(
+        ({ command, operation, sourceRepository }) =>
+          command === "git" && (sourceRepository || operation === "fetch"),
+      );
+      expect(sourceReadsAndImport.length).toBeGreaterThan(0);
+      expect(sourceReadsAndImport).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ operation: "diff" }),
+          expect.objectContaining({ operation: "fetch" }),
+          expect.objectContaining({ operation: "log" }),
+          expect.objectContaining({ operation: "rev-parse" }),
+        ]),
+      );
+      for (const call of sourceReadsAndImport) {
+        expect(call.noReplaceObjects).toBe(true);
+      }
 
       const durableCapture = JSON.stringify({
         calls: integration.observations.calls,
@@ -1220,37 +1896,55 @@ async function smartHttpIntegrationFixture() {
     "user.email",
     "gate-b@example.invalid",
   ]);
-  execFileSync("git", [
-    "-C",
-    sourceDirectory,
-    "checkout",
-    "--quiet",
-    "--detach",
-    GATE_B_PLANNING_HEAD_SHA,
-  ]);
-  execFileSync("git", [
-    "-C",
-    sourceDirectory,
-    "checkout",
-    "--quiet",
-    "-B",
-    "architecture-and-new-codex",
-  ]);
-  execFileSync("git", [
-    "-C",
-    sourceDirectory,
-    "commit",
-    "--quiet",
-    "--allow-empty",
-    "-m",
-    "POLICY: isolate publication credentials and outcomes",
-  ]);
   const candidateHead = execFileSync(
     "git",
     ["-C", sourceDirectory, "rev-parse", "HEAD"],
     { encoding: "utf8" },
   ).trim();
-  const fixture = gateBFixture({ head: candidateHead });
+  const allowedPaths = execFileSync("git", [
+    "-C",
+    sourceDirectory,
+    "diff",
+    "--name-only",
+    "-z",
+    "--no-renames",
+    `${GATE_B_LOCAL_CHANGE_BASE_SHA}..${candidateHead}`,
+    "--",
+  ])
+    .toString("utf8")
+    .split("\0")
+    .filter(Boolean);
+  expect(allowedPaths).toHaveLength(GATE_B_ALLOWED_PATH_COUNT);
+  const fixture = gateBFixture({ allowedPaths, head: candidateHead });
+  const replacementTree = execFileSync(
+    "git",
+    [
+      "-C",
+      sourceDirectory,
+      "rev-parse",
+      `${GATE_B_LOCAL_CHANGE_BASE_SHA}^{tree}`,
+    ],
+    { encoding: "utf8" },
+  ).trim();
+  const replacementCommit = execFileSync(
+    "git",
+    [
+      "-C",
+      sourceDirectory,
+      "commit-tree",
+      replacementTree,
+      "-p",
+      GATE_B_LOCAL_CHANGE_BASE_SHA,
+    ],
+    { encoding: "utf8", input: "HOSTILE REPLACEMENT\n" },
+  ).trim();
+  execFileSync("git", [
+    "-C",
+    sourceDirectory,
+    "replace",
+    candidateHead,
+    replacementCommit,
+  ]);
 
   const hostileMarker = path.join(root, "hostile-hook-ran");
   const hostileHooksDirectory = path.join(root, "hostile-hooks");
@@ -1363,7 +2057,9 @@ function smartHttpCommandRunner({ fixture, observations }) {
     observations.calls.push({
       authenticated,
       command,
+      noReplaceObjects: options.env?.GIT_NO_REPLACE_OBJECTS === "1",
       operation,
+      sourceRepository: options.cwd === process.cwd(),
       tokenMatched: authenticated
         ? options.env?.GH_TOKEN === fixture.token
         : options.env?.GH_TOKEN === undefined,
@@ -1377,6 +2073,11 @@ function smartHttpCommandRunner({ fixture, observations }) {
     if (command === "gh") {
       const signature = routed.join(" ");
       if (signature === "--version") return result("gh version 2.80.0\n");
+      if (signature === "api --method GET /user") {
+        return result(
+          `${JSON.stringify({ id: 3003, login: "cloudx-operator" })}\n`,
+        );
+      }
       if (signature === "api --method GET /installation/repositories") {
         return result(
           `${JSON.stringify({
@@ -1425,7 +2126,10 @@ function smartHttpCommandRunner({ fixture, observations }) {
       return result("", 1, "unexpected gh command");
     }
 
-    const commandResult = await runTextProcess(command, args, options);
+    const commandResult =
+      options.encoding === "buffer"
+        ? await runBinaryProcess(command, args, options)
+        : await runTextProcess(command, args, options);
     if (
       command === "git" &&
       operation === "push" &&
@@ -1588,6 +2292,12 @@ function gateBFixture(overrides = {}) {
   const head = overrides.head ?? gitSha("b");
   const oldHead = GATE_B_EXPECTED_OLD_CANDIDATE_SHA;
   const nowMs = Date.now();
+  const allowedPaths =
+    overrides.allowedPaths ??
+    Array.from(
+      { length: GATE_B_ALLOWED_PATH_COUNT },
+      (_, index) => `apps/server/src/gate-b-${index + 1}.ts`,
+    );
   const plan = {
     schema_version: 1,
     kind: "change-plan",
@@ -1631,12 +2341,9 @@ function gateBFixture(overrides = {}) {
       test: `Revert-failing test ${index + 1}.`,
       negative_cases: [`Negative ${index + 1}.`],
     })),
-    allowed_paths: Array.from(
-      { length: 113 },
-      (_, index) => `apps/server/src/gate-b-${index + 1}.ts`,
-    ),
+    allowed_paths: [...allowedPaths],
     forbidden_paths: [".github/**"],
-    verification: ["npm run typecheck", "npm test"],
+    verification: verificationPlan("full").map(displayCommand),
   };
   writeJson(directory, "plan.json", plan);
   const planDigest = fileDigest(directory, "plan.json");
@@ -1680,6 +2387,7 @@ function gateBFixture(overrides = {}) {
   writeJson(directory, "verification.json", verification(plan, head));
 
   const fixture = {
+    allowedPaths: Object.freeze([...plan.allowed_paths].sort()),
     directory,
     head,
     nowMs,
@@ -1692,7 +2400,7 @@ function gateBFixture(overrides = {}) {
     },
   };
   fixture.manifestSha256 = readGateBArtifactSnapshot(directory).manifestSha256;
-  fixture.credentialMode = "automated-app";
+  fixture.credentialMode = "attended-user";
   fixture.token = "sentinel-gate-b-token-with-40-characters-001";
   fixture.authorizationFile = path.join(root, "publication-authorization.json");
   fixture.authorization = publicationAuthorization(fixture);
@@ -1740,20 +2448,6 @@ function verification(plan, candidateHead) {
 }
 
 function publicationAuthorization(fixture, overrides = {}) {
-  const automatedPrincipal = {
-    kind: "github-app-installation",
-    app_id: 1001,
-    installation_id: 2002,
-    app_slug: "cloudx-publisher",
-    repository_selection: "selected",
-    repositories: [GATE_B_REPOSITORY],
-    permissions: {
-      contents: "write",
-      pull_requests: "read",
-      metadata: "read",
-    },
-    private_controller_grant_id: "controller-grant-1",
-  };
   return {
     schema_version: 1,
     kind: "publication-authorization",
@@ -1766,7 +2460,7 @@ function publicationAuthorization(fixture, overrides = {}) {
     artifact_manifest_sha256: fixture.manifestSha256,
     policy_sha256: GATE_B_POLICY_SHA256,
     credential_token_sha256: digest(fixture.token),
-    credential_mode: "automated-app",
+    credential_mode: "attended-user",
     local_change_base_sha: GATE_B_LOCAL_CHANGE_BASE_SHA,
     planning_head_sha: GATE_B_PLANNING_HEAD_SHA,
     candidate_head_sha: fixture.head,
@@ -1780,7 +2474,12 @@ function publicationAuthorization(fixture, overrides = {}) {
     pr_head_ref_name: "architecture-and-new-codex",
     pr_head_ref_oid: fixture.oldHead,
     same_repository: true,
-    principal: automatedPrincipal,
+    principal: {
+      kind: "github-user",
+      user_id: 3003,
+      login: "cloudx-operator",
+      attended_authorization_id: "attended-grant-1",
+    },
     ...overrides,
   };
 }
@@ -1816,7 +2515,7 @@ async function expectAuthorizationRejectedBeforeToken(fixture) {
   const runner = commandRunner(fixture);
   let tokenReads = 0;
   await expect(
-    publishGateBCandidate({
+    publishGateBCandidateForDirectTest({
       ...authorizationArguments(fixture),
       artifactDir: fixture.directory,
       authorizedManifestSha256: fixture.manifestSha256,
@@ -2022,6 +2721,8 @@ function commandRunner(fixture, overrides = {}) {
   const calls = [];
   const pushes = [];
   let pushed = false;
+  let committedHeadReads = 0;
+  let committedDiffReads = 0;
   let remoteReads = 0;
   const subjects = overrides.subjects ?? GATE_B_COMMIT_SUBJECTS;
   const expectedPr = {
@@ -2035,7 +2736,7 @@ function commandRunner(fixture, overrides = {}) {
     url: `https://github.com/${GATE_B_REPOSITORY}/pull/${GATE_B_PULL_REQUEST}`,
   };
   const run = async (command, args, options = {}) => {
-    calls.push([command, args]);
+    calls.push([command, args, options]);
     const routedArgs = command === "git" ? routedGitArguments(args) : args;
     const signature = `${command} ${routedArgs.join(" ")}`;
     if (overrides.throwOn === signature) throw new Error("runner failed");
@@ -2067,7 +2768,37 @@ function commandRunner(fixture, overrides = {}) {
       return result(fixture.head);
     if (signature === "git rev-parse --absolute-git-dir")
       return result(path.join(fixture.directory, ".git"));
-    if (signature === "git rev-parse HEAD") return result(fixture.head);
+    if (signature === "git rev-parse HEAD") {
+      if (options.env && !Object.hasOwn(options.env, "HOME")) {
+        committedHeadReads += 1;
+        return result(
+          committedHeadReads === 1
+            ? (overrides.initialCommittedHead ?? fixture.head)
+            : (overrides.freshCommittedHead ?? fixture.head),
+        );
+      }
+      return result(fixture.head);
+    }
+    if (signature === committedDiffSignature(fixture)) {
+      committedDiffReads += 1;
+      if (options.encoding !== "buffer") {
+        throw new Error("Committed diff must request Buffer output.");
+      }
+      const value =
+        committedDiffReads === 1
+          ? (overrides.initialCommittedDiff ?? committedDiffOutput(fixture))
+          : (overrides.freshCommittedDiff ?? committedDiffOutput(fixture));
+      return binaryResult(
+        value,
+        overrides.committedDiffExitCode ?? 0,
+        overrides.committedDiffStderr,
+      );
+    }
+    if (options.encoding === "buffer") {
+      throw new Error(
+        "Only committed-diff commands may request Buffer output.",
+      );
+    }
     if (signature === "git symbolic-ref --short HEAD") {
       return result("architecture-and-new-codex\n");
     }
@@ -2115,7 +2846,7 @@ function commandRunner(fixture, overrides = {}) {
       );
     if (
       signature ===
-      `git ls-remote https://github.com/davidomil/cloudx ${GATE_B_TARGET_BASE_REF}`
+      `git ls-remote ${directTestTransport.url} ${GATE_B_TARGET_BASE_REF}`
     ) {
       const head = pushed
         ? (overrides.postPushTargetBase ?? GATE_B_EXPECTED_TARGET_BASE_SHA)
@@ -2125,7 +2856,7 @@ function commandRunner(fixture, overrides = {}) {
     }
     if (
       signature ===
-      `git ls-remote https://github.com/davidomil/cloudx ${GATE_B_CANDIDATE_REF}`
+      `git ls-remote ${directTestTransport.url} ${GATE_B_CANDIDATE_REF}`
     ) {
       remoteReads += 1;
       const head = pushed
@@ -2175,7 +2906,7 @@ function commandRunner(fixture, overrides = {}) {
     }
     if (
       signature ===
-      `git push --no-verify --porcelain --force-with-lease=${GATE_B_CANDIDATE_REF}:${fixture.oldHead} https://github.com/davidomil/cloudx HEAD:refs/heads/architecture-and-new-codex`
+      `git push --no-verify --porcelain --force-with-lease=${GATE_B_CANDIDATE_REF}:${fixture.oldHead} ${directTestTransport.url} HEAD:refs/heads/architecture-and-new-codex`
     ) {
       pushes.push([command, args]);
       pushed = true;
@@ -2184,7 +2915,7 @@ function commandRunner(fixture, overrides = {}) {
       const pushFlag = overrides.pushOutput ?? " ";
       const pushSummary =
         overrides.pushSummary ?? `${fixture.oldHead}..${fixture.head}`;
-      const pushStdout = `To https://github.com/davidomil/cloudx\n${pushFlag}\tHEAD:${GATE_B_CANDIDATE_REF}\t${pushSummary}\n${
+      const pushStdout = `To ${directTestTransport.url}\n${pushFlag}\tHEAD:${GATE_B_CANDIDATE_REF}\t${pushSummary}\n${
         overrides.extraPushRow
           ? ` \tHEAD:refs/heads/extra\t${pushSummary}\n`
           : ""
@@ -2195,11 +2926,54 @@ function commandRunner(fixture, overrides = {}) {
       `Unexpected command: ${signature}; options=${JSON.stringify(options)}; remoteReads=${remoteReads}`,
     );
   };
-  return { calls, pushes, run };
+  return {
+    calls,
+    get committedHeadReads() {
+      return committedHeadReads;
+    },
+    get committedDiffReads() {
+      return committedDiffReads;
+    },
+    pushes,
+    run,
+  };
 }
 
 function result(stdout = "", exitCode = 0, stderr = "") {
   return { stdout, stderr, exitCode };
+}
+
+function binaryResult(stdout = Buffer.alloc(0), exitCode = 0, stderr) {
+  return {
+    stdout: Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout),
+    stderr: Buffer.isBuffer(stderr) ? stderr : Buffer.from(stderr ?? ""),
+    exitCode,
+  };
+}
+
+function committedDiffSignature(fixture) {
+  return `git diff --name-only -z --no-renames ${GATE_B_LOCAL_CHANGE_BASE_SHA}..${fixture.head} --`;
+}
+
+function committedDiffOutput(fixture, paths = fixture.allowedPaths) {
+  return Buffer.from(`${paths.join("\0")}\0`);
+}
+
+function committedDiffExecutable(fixture, diffOutput) {
+  const executable = path.join(
+    path.dirname(fixture.authorizationFile),
+    `committed-diff-${cryptoSafeName(diffOutput)}.mjs`,
+  );
+  fs.writeFileSync(
+    executable,
+    `#!${process.execPath}\nconst args = process.argv.slice(2);\nif (args.join(" ") === "rev-parse HEAD") process.stdout.write(${JSON.stringify(fixture.head)} + "\\n");\nelse if (args[0] === "diff") process.stdout.write(Buffer.from(${JSON.stringify([...diffOutput])}));\nelse process.exitCode = 1;\n`,
+    { mode: 0o755 },
+  );
+  return executable;
+}
+
+function cryptoSafeName(value) {
+  return createHash("sha256").update(value).digest("hex").slice(0, 12);
 }
 
 function writeJson(directory, name, value) {
@@ -2213,4 +2987,129 @@ function fileDigest(directory, name) {
   return createHash("sha256")
     .update(fs.readFileSync(path.join(directory, name)))
     .digest("hex");
+}
+
+function readableManifestOrOriginal(fixture) {
+  try {
+    return readGateBArtifactSnapshot(fixture.directory).manifestSha256;
+  } catch {
+    return fixture.manifestSha256;
+  }
+}
+
+async function recordedProcessGroup(file) {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const pid = Number(
+      fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "",
+    );
+    if (Number.isSafeInteger(pid) && pid > 1) {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      const processGroup = Number(fields[2]);
+      if (Number.isSafeInteger(processGroup) && processGroup > 1)
+        return processGroup;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for descendant PID file ${file}.`);
+}
+
+async function processGroupHasRunningMember(processGroup) {
+  for (const entry of fs.readdirSync("/proc", { withFileTypes: true })) {
+    if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
+    let stat;
+    try {
+      stat = fs.readFileSync(`/proc/${entry.name}/stat`, "utf8");
+    } catch {
+      continue;
+    }
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    if (
+      Number(fields[2]) === processGroup &&
+      fields[0] !== "Z" &&
+      fields[0] !== "X"
+    )
+      return true;
+  }
+  return false;
+}
+
+async function terminateProcessGroup(processGroup) {
+  try {
+    process.kill(-processGroup, "SIGKILL");
+  } catch (error) {
+    if (error?.code !== "ESRCH") throw error;
+  }
+  const deadline = Date.now() + 2_000;
+  while (await processGroupHasRunningMember(processGroup)) {
+    if (Date.now() >= deadline)
+      throw new Error(
+        `Process group ${processGroup} survived emergency cleanup.`,
+      );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function trustedExecutableFileSystem(behavior = {}) {
+  const paths = new Map([
+    ["/", trustedStat("directory", 1n)],
+    ["/usr", trustedStat("directory", 2n)],
+    ["/usr/bin", trustedStat("directory", 3n)],
+    ["/usr/bin/git", trustedStat("file", 4n)],
+    ["/usr/bin/gh", trustedStat("file", 5n)],
+  ]);
+  if (behavior.mutate) {
+    const [filePath, overrides] = behavior.mutate;
+    paths.set(
+      filePath,
+      trustedStat(overrides.kind ?? "file", paths.get(filePath).ino, overrides),
+    );
+  }
+  const descriptors = new Map();
+  const lstatCalls = new Map();
+  let nextDescriptor = 10;
+  return {
+    constants: { O_DIRECTORY: 1, O_NOFOLLOW: 2, O_RDONLY: 4 },
+    processes: 0,
+    tokenReads: 0,
+    closeSync(descriptor) {
+      descriptors.delete(descriptor);
+    },
+    fstatSync(descriptor) {
+      return descriptors.get(descriptor);
+    },
+    lstatSync(filePath) {
+      if (behavior.missing === filePath) throw new Error("missing");
+      const calls = (lstatCalls.get(filePath) ?? 0) + 1;
+      lstatCalls.set(filePath, calls);
+      const stat = paths.get(filePath);
+      if (behavior.drift === filePath && calls > 1) {
+        return { ...stat, ino: stat.ino + 100n };
+      }
+      return stat;
+    },
+    openSync(filePath) {
+      const descriptor = nextDescriptor;
+      nextDescriptor += 1;
+      descriptors.set(descriptor, paths.get(filePath));
+      return descriptor;
+    },
+  };
+}
+
+function trustedStat(kind, ino, overrides = {}) {
+  return {
+    ctimeNs: 1n,
+    dev: 1n,
+    ino,
+    mode: kind === "directory" ? 0o040755n : 0o100755n,
+    mtimeNs: 1n,
+    size: 1n,
+    uid: 0n,
+    isDirectory: () => kind === "directory",
+    isFile: () => kind === "file",
+    isSymbolicLink: () => overrides.symbolicLink === true,
+    ...overrides,
+  };
 }

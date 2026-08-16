@@ -51,6 +51,24 @@ const fStringCatalog: AutomationCatalogResponse = {
 };
 
 describe("AutomationCompiler", () => {
+  it("rejects schema v1 graphs without automatic migration", () => {
+    const compiler = new AutomationCompiler(new AutomationTypeService());
+    const graph = {
+      schemaVersion: 1,
+      nodes: [{ id: "trigger", typeId: "trigger:test", position: { x: 0, y: 0 } }],
+      edges: []
+    } as unknown as AutomationGraphDocument;
+
+    expect(compiler.validate(graph, catalog).diagnostics).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "schema-version",
+          message: expect.stringContaining("no automatic migration is performed")
+        })
+      ])
+    );
+  });
+
   it("rejects incompatible data edges and missing required inputs", () => {
     const compiler = new AutomationCompiler(new AutomationTypeService());
     const graph: AutomationGraphDocument = {

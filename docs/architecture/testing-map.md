@@ -12,16 +12,20 @@ changed branch.
 
 ## Baseline Commands
 
-| Scope                 | Command                                                                                          | Evidence                                                                             |
-| --------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------ |
-| TypeScript contracts  | `npm run typecheck`                                                                              | Project-reference and workspace type boundaries compile                              |
-| TypeScript behavior   | `npm test`                                                                                       | Vitest suite, including `scripts/ai-change` process tests                            |
-| Full repository       | `npm run verify`                                                                                 | Policy, coverage, build, both Python services, and browser smoke                     |
-| Production bundles    | `npm run build`                                                                                  | All workspaces with build scripts compile and the web bundle is produced             |
-| Public AI contract    | `npm run policy:validate && npx vitest run scripts/ai-change`                                    | Policy, schema, state, label, artifact, and merge-readiness behavior                 |
-| Isolated verifier     | `docker build -f containers/ci/Dockerfile .` followed by the documented no-network run           | Locked dependencies, unprivileged candidate execution, and supervisor-owned evidence |
-| ASR                   | `services/asr/.venv/bin/python -m pytest services/asr/tests`                                     | ASR API, validation, backend, and streaming behavior                                 |
-| Documentation indexer | `services/documentation-indexer/.venv/bin/python -m pytest services/documentation-indexer/tests` | Archive, extraction, indexing, API, import/export, and recovery behavior             |
+| Scope                 | Command                                                                                                                     | Evidence                                                                             |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| TypeScript contracts  | `npm run typecheck`                                                                                                         | Project-reference and workspace type boundaries compile                              |
+| TypeScript behavior   | `npm test`                                                                                                                  | Vitest suite, including `scripts/ai-change` process tests                            |
+| Full repository       | `npm run --silent verify -- --plan <accepted-plan.json> --base-sha <local-change-base-sha> --head-sha <candidate-head-sha>` | Plan-bound policy, coverage, build, both Python services, and browser smoke          |
+| Production bundles    | `npm run build`                                                                                                             | All workspaces with build scripts compile and the web bundle is produced             |
+| Public AI contract    | `npm run policy:validate && npx vitest run scripts/ai-change`                                                               | Policy, schema, state, label, artifact, and merge-readiness behavior                 |
+| Isolated verifier     | `docker build -f containers/ci/Dockerfile .` followed by the documented no-network run                                      | Locked dependencies, unprivileged candidate execution, and supervisor-owned evidence |
+| ASR                   | `services/asr/.venv/bin/python -m pytest services/asr/tests`                                                                | ASR API, validation, backend, and streaming behavior                                 |
+| Documentation indexer | `services/documentation-indexer/.venv/bin/python -m pytest services/documentation-indexer/tests`                            | Archive, extraction, indexing, API, import/export, and recovery behavior             |
+
+The production verifier is unconditionally full, accepts no `--scope` or
+`--output`, rejects duplicate arguments before plan or HEAD work, and emits its
+sole artifact to stdout.
 
 Python commands require their documented virtual environments. An unavailable
 environment is a reported verification gap, not a pass.

@@ -2,11 +2,13 @@ import asyncio
 import json
 import multiprocessing
 import os
+import select
 import signal
 import subprocess
 import sys
 import threading
 import time
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -109,6 +111,43 @@ def adversarial_inference_worker(connection) -> None:
         )
 
 
+def post_end_partial_inference_worker(connection, partial_started, final_started, partial_details_path) -> None:
+    os.setsid()
+    connection.send({"type": "ready"})
+    while True:
+        request = connection.recv()
+        if request.get("type") == "close":
+            return
+        path = Path(request["path"])
+        if path.read_bytes().startswith(b"HANG"):
+            if request.get("beam_size") == 1:
+                child = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+                    ]
+                )
+                partial_details_path.write_text(f"{os.getpid()}\n{child.pid}\n{path}\n", encoding="utf-8")
+                partial_started.set()
+            else:
+                final_started.set()
+            time.sleep(60)
+        connection.send(
+            {
+                "type": "result",
+                "result": {
+                    "text": "worker recovered",
+                    "language": "en",
+                    "language_probability": 1.0,
+                    "duration_seconds": 0.1,
+                    "duration_after_vad_seconds": 0.1,
+                    "segments": [],
+                },
+            }
+        )
+
+
 class FakeWebSocket:
     def __init__(self, audio: bytes = VALID_FAKE_AUDIO):
         self.messages = [
@@ -133,6 +172,139 @@ class FakeWebSocket:
 
     async def send_json(self, payload):
         self.sent.append(payload)
+
+
+class SafetyGate:
+    def __init__(self, timeout=2.0):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.watchdog_released = threading.Event()
+        self._timeout = timeout
+        self._watchdog = threading.Timer(timeout, self._release_from_watchdog)
+        self._watchdog.daemon = True
+
+    def block(self):
+        self.entered.set()
+        self._watchdog.start()
+        assert self.release.wait(timeout=self._timeout + 1)
+
+    def open(self):
+        self.release.set()
+        self._watchdog.cancel()
+
+    def _release_from_watchdog(self):
+        self.watchdog_released.set()
+        self.release.set()
+
+
+class GatedBackendFactory:
+    def __init__(self, backend_factory=DirectInferenceBackend):
+        self.gate = SafetyGate()
+        self.backend_factory = backend_factory
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def __call__(self, _capacity):
+        with self._lock:
+            self.calls += 1
+        self.gate.block()
+        return self.backend_factory()
+
+
+class AcquisitionProbe:
+    def __init__(self, monkeypatch, expected_calls):
+        self._production_getter = main.get_inference_executor
+        self._lock = threading.Lock()
+        self.calls = 0
+        self.entered = [threading.Event() for _ in range(expected_calls)]
+        monkeypatch.setattr(main, "get_inference_executor", self.get)
+
+    def get(self):
+        with self._lock:
+            call_index = self.calls
+            self.calls += 1
+        if call_index < len(self.entered):
+            self.entered[call_index].set()
+        return self._production_getter()
+
+
+class SubmissionProbe:
+    def __init__(self, monkeypatch):
+        production_submit = main.InferenceExecutor.submit
+        self.paths = []
+
+        def record_submission(executor, path, *args, **kwargs):
+            self.paths.append(Path(path))
+            return production_submit(executor, path, *args, **kwargs)
+
+        monkeypatch.setattr(main.InferenceExecutor, "submit", record_submission)
+
+
+class PartialEndGatedWebSocket(FakeWebSocket):
+    def __init__(self):
+        super().__init__()
+        self.messages = self.messages[:2]
+        self.allow_end = asyncio.Event()
+        self.partial_sent = asyncio.Event()
+        self._end_sent = False
+
+    async def receive(self):
+        if self.messages:
+            return self.messages.pop(0)
+        if not self._end_sent:
+            await self.allow_end.wait()
+            self._end_sent = True
+            return {"text": json.dumps({"type": "end"})}
+        return await super().receive()
+
+    async def send_json(self, payload):
+        await super().send_json(payload)
+        if payload.get("type") == "partial":
+            self.partial_sent.set()
+
+
+class ColdPartialDisconnectingWebSocket:
+    def __init__(self, factory_entered):
+        self.factory_entered = factory_entered
+        self.messages = [
+            {"text": json.dumps({"type": "start", "filename": "voice.webm"})},
+            {"bytes": VALID_FAKE_AUDIO},
+        ]
+        self.sent = []
+
+    async def accept(self):
+        return None
+
+    async def receive(self):
+        if self.messages:
+            return self.messages.pop(0)
+        await wait_for_thread_event(self.factory_entered)
+        return {"type": "websocket.disconnect"}
+
+    async def send_json(self, payload):
+        self.sent.append(payload)
+
+
+class CountingWebSocket(FakeWebSocket):
+    def __init__(self):
+        super().__init__()
+        self.receive_count = 0
+
+    async def receive(self):
+        self.receive_count += 1
+        return await super().receive()
+
+
+class BlockingCloseExecutor:
+    def __init__(self):
+        self.gate = SafetyGate()
+        self.close_calls = 0
+        self.close_completed = threading.Event()
+
+    def close(self):
+        self.close_calls += 1
+        self.gate.block()
+        self.close_completed.set()
 
 
 class OversizedWebSocket:
@@ -238,6 +410,45 @@ class FinalPidDisconnectingWebSocket:
 
     async def send_json(self, payload):
         self.sent.append(payload)
+
+
+class PostEndPartialDisconnectingWebSocket:
+    def __init__(self, partial_started, final_started, partial_details_path):
+        self.partial_started = partial_started
+        self.final_started = final_started
+        self.partial_details_path = partial_details_path
+        self.messages = [
+            {"text": json.dumps({"type": "start", "filename": "voice.webm"})},
+            {"bytes": b"HANG" + b"x" * len(VALID_FAKE_AUDIO)},
+        ]
+        self.receive_count = 0
+        self.sent = []
+        self.partial_snapshot_path = None
+        self.partial_pidfds = []
+
+    async def accept(self):
+        return None
+
+    async def receive(self):
+        self.receive_count += 1
+        if self.messages:
+            return self.messages.pop(0)
+        if self.receive_count == 3:
+            assert await asyncio.to_thread(self.partial_started.wait, 2)
+            worker_pid, child_pid, snapshot_path = self.partial_details_path.read_text(encoding="utf-8").splitlines()
+            self.partial_snapshot_path = Path(snapshot_path)
+            self.partial_pidfds = [os.pidfd_open(int(worker_pid)), os.pidfd_open(int(child_pid))]
+            return {"text": json.dumps({"type": "end"})}
+        assert self.receive_count == 4
+        assert await asyncio.to_thread(self.final_started.wait, 2)
+        return {"type": "websocket.disconnect"}
+
+    async def send_json(self, payload):
+        self.sent.append(payload)
+
+    def close_pidfds(self):
+        for pidfd in self.partial_pidfds:
+            os.close(pidfd)
 
 
 class ConstructionProbe:
@@ -506,6 +717,359 @@ def test_http_final_inference_does_not_block_health(monkeypatch):
     assert health.status_code == 200
     assert health_elapsed < 0.3
     assert response.status_code == 200
+
+
+def test_cold_initialization_http_ready_health_is_nonblocking_and_singleton(tmp_path, monkeypatch):
+    reset_asr_env(monkeypatch)
+    monkeypatch.setattr(main.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(main, "get_model", lambda: FakeModel())
+    factory = GatedBackendFactory()
+    monkeypatch.setattr(main, "create_inference_backend", factory)
+    acquisitions = AcquisitionProbe(monkeypatch, expected_calls=2)
+
+    async def exercise_cold_http_and_readiness():
+        tasks = []
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            transcription = asyncio.create_task(
+                client.post(
+                    "/transcribe",
+                    files={"audio": ("voice.webm", VALID_FAKE_AUDIO, "audio/webm")},
+                )
+            )
+            tasks.append(transcription)
+            try:
+                await assert_gate_entered_without_watchdog(factory.gate)
+                await wait_for_thread_event(acquisitions.entered[0])
+                readiness = asyncio.create_task(client.get("/ready"))
+                tasks.append(readiness)
+                await wait_for_thread_event(acquisitions.entered[1])
+
+                assert factory.calls == 1
+                await assert_event_loop_and_health_are_responsive(client, factory.gate, transcription, readiness)
+
+                factory.gate.open()
+                http_response, ready_response = await asyncio.wait_for(
+                    asyncio.gather(transcription, readiness),
+                    timeout=3,
+                )
+                published = main.get_inference_executor()
+                assert published is main._inference_executor
+                return http_response, ready_response
+            finally:
+                factory.gate.open()
+                await cancel_and_drain(*tasks)
+
+    try:
+        http_response, ready_response = asyncio.run(exercise_cold_http_and_readiness())
+    finally:
+        main.close_inference_executor()
+
+    assert http_response.status_code == 200
+    assert http_response.json()["text"] == "hello"
+    assert ready_response.status_code == 200
+    assert ready_response.json() == {"status": "ready"}
+    assert factory.calls == 1
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_cold_initialization_failure_allows_next_serialized_attempt(monkeypatch):
+    reset_asr_env(monkeypatch)
+    first_attempt = SafetyGate()
+    second_attempt = SafetyGate()
+    factory_calls = []
+
+    def create_backend(_capacity):
+        attempt = len(factory_calls) + 1
+        factory_calls.append(attempt)
+        gate = first_attempt if attempt == 1 else second_attempt
+        gate.block()
+        if attempt == 1:
+            raise RuntimeError("first cold initialization failed")
+        return DirectInferenceBackend()
+
+    monkeypatch.setattr(main, "create_inference_backend", create_backend)
+    acquisitions = AcquisitionProbe(monkeypatch, expected_calls=2)
+
+    async def exercise_serialized_attempts():
+        tasks = []
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            first = asyncio.create_task(client.get("/ready"))
+            tasks.append(first)
+            try:
+                await wait_for_thread_event(acquisitions.entered[0])
+                await assert_gate_entered_without_watchdog(first_attempt)
+                second = asyncio.create_task(client.get("/ready"))
+                tasks.append(second)
+                await wait_for_thread_event(acquisitions.entered[1])
+
+                assert not second_attempt.entered.is_set()
+                assert factory_calls == [1]
+                first_attempt.open()
+                first_response = await asyncio.wait_for(first, timeout=3)
+
+                await assert_gate_entered_without_watchdog(second_attempt)
+                assert main._inference_executor is None
+                assert factory_calls == [1, 2]
+                second_attempt.open()
+                second_response = await asyncio.wait_for(second, timeout=3)
+                return first_response, second_response
+            finally:
+                first_attempt.open()
+                second_attempt.open()
+                await cancel_and_drain(*tasks)
+
+    try:
+        first_response, second_response = asyncio.run(exercise_serialized_attempts())
+    finally:
+        main.close_inference_executor()
+
+    assert first_response.status_code == 503
+    assert first_response.json() == {"detail": "ASR inference backend is not ready."}
+    assert second_response.status_code == 200
+    assert second_response.json() == {"status": "ready"}
+    assert factory_calls == [1, 2]
+
+
+def test_cold_initialization_websocket_partial_is_nonblocking(tmp_path, monkeypatch):
+    reset_asr_env(monkeypatch)
+    monkeypatch.setenv("CLOUDX_ASR_PARTIAL_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("CLOUDX_ASR_PARTIAL_MIN_BYTES", "1")
+    monkeypatch.setattr(main.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(main, "get_model", lambda: PartialModel())
+    factory = GatedBackendFactory()
+    monkeypatch.setattr(main, "create_inference_backend", factory)
+
+    async def exercise_cold_partial():
+        websocket = PartialEndGatedWebSocket()
+        transcription = asyncio.create_task(main.transcribe_ws(websocket))
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            try:
+                await assert_gate_entered_without_watchdog(factory.gate)
+                await assert_event_loop_and_health_are_responsive(client, factory.gate, transcription)
+                factory.gate.open()
+                await asyncio.wait_for(websocket.partial_sent.wait(), timeout=3)
+                websocket.allow_end.set()
+                await asyncio.wait_for(transcription, timeout=3)
+                return websocket
+            finally:
+                factory.gate.open()
+                websocket.allow_end.set()
+                await cancel_and_drain(transcription)
+
+    try:
+        websocket = asyncio.run(exercise_cold_partial())
+    finally:
+        main.close_inference_executor()
+
+    assert factory.calls == 1
+    assert websocket.idle_receive_cancelled is True
+    assert websocket.sent == [
+        {"type": "status", "status": "receiving"},
+        {"type": "partial", "text": "partial text"},
+        {"type": "status", "status": "transcribing"},
+        {
+            "type": "transcript",
+            "text": "final text",
+            "language": "en",
+            "language_probability": 0.99,
+            "duration_seconds": None,
+            "duration_after_vad_seconds": None,
+            "segments": [{"start_seconds": 0.0, "end_seconds": 0.0, "text": "final text"}],
+        },
+    ]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_cold_initialization_websocket_final_is_nonblocking(tmp_path, monkeypatch):
+    reset_asr_env(monkeypatch)
+    monkeypatch.setenv("CLOUDX_ASR_PARTIAL_INTERVAL_SECONDS", "-1")
+    monkeypatch.setattr(main.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(main, "get_model", lambda: FakeModel())
+    factory = GatedBackendFactory()
+    monkeypatch.setattr(main, "create_inference_backend", factory)
+
+    async def exercise_cold_final():
+        websocket = CountingWebSocket()
+        transcription = asyncio.create_task(main.transcribe_ws(websocket))
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            try:
+                await assert_gate_entered_without_watchdog(factory.gate)
+                assert websocket.receive_count == 3
+                await assert_event_loop_and_health_are_responsive(client, factory.gate, transcription)
+                factory.gate.open()
+                await asyncio.wait_for(transcription, timeout=3)
+                return websocket
+            finally:
+                factory.gate.open()
+                await cancel_and_drain(transcription)
+
+    try:
+        websocket = asyncio.run(exercise_cold_final())
+    finally:
+        main.close_inference_executor()
+
+    assert factory.calls == 1
+    assert websocket.receive_count == 4
+    assert websocket.idle_receive_cancelled is True
+    assert websocket.sent[0:2] == [
+        {"type": "status", "status": "receiving"},
+        {"type": "status", "status": "transcribing"},
+    ]
+    assert websocket.sent[-1]["type"] == "transcript"
+    assert websocket.sent[-1]["text"] == "hello"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_cold_initialization_http_cancellation_keeps_temp_ownership(tmp_path, monkeypatch):
+    reset_asr_env(monkeypatch)
+    monkeypatch.setattr(main.tempfile, "tempdir", str(tmp_path))
+    factory = GatedBackendFactory()
+    monkeypatch.setattr(main, "create_inference_backend", factory)
+    submissions = SubmissionProbe(monkeypatch)
+
+    async def cancel_cold_http_request():
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            request = asyncio.create_task(
+                client.post(
+                    "/transcribe",
+                    files={"audio": ("cancelled.webm", VALID_FAKE_AUDIO, "audio/webm")},
+                )
+            )
+            try:
+                await assert_gate_entered_without_watchdog(factory.gate)
+                request.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(request, timeout=1)
+                assert submissions.paths == []
+                assert list(tmp_path.iterdir()) == []
+
+                factory.gate.open()
+                await wait_until(lambda: main._inference_executor is not None)
+                assert submissions.paths == []
+            finally:
+                factory.gate.open()
+                await cancel_and_drain(request)
+
+    try:
+        asyncio.run(cancel_cold_http_request())
+    finally:
+        main.close_inference_executor()
+
+    assert factory.calls == 1
+    assert submissions.paths == []
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_cold_initialization_websocket_partial_disconnect_keeps_temp_ownership(tmp_path, monkeypatch):
+    reset_asr_env(monkeypatch)
+    monkeypatch.setenv("CLOUDX_ASR_PARTIAL_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("CLOUDX_ASR_PARTIAL_MIN_BYTES", "1")
+    monkeypatch.setattr(main.tempfile, "tempdir", str(tmp_path))
+    factory = GatedBackendFactory()
+    monkeypatch.setattr(main, "create_inference_backend", factory)
+    submissions = SubmissionProbe(monkeypatch)
+
+    async def disconnect_during_cold_partial():
+        websocket = ColdPartialDisconnectingWebSocket(factory.gate.entered)
+        transcription = asyncio.create_task(main.transcribe_ws(websocket))
+        try:
+            await assert_gate_entered_without_watchdog(factory.gate)
+            await asyncio.wait_for(transcription, timeout=1)
+            assert submissions.paths == []
+            assert websocket.sent == [{"type": "status", "status": "receiving"}]
+            assert list(tmp_path.iterdir()) == []
+
+            factory.gate.open()
+            await wait_until(lambda: main._inference_executor is not None)
+            assert submissions.paths == []
+            return websocket
+        finally:
+            factory.gate.open()
+            await cancel_and_drain(transcription)
+
+    try:
+        websocket = asyncio.run(disconnect_during_cold_partial())
+    finally:
+        main.close_inference_executor()
+
+    assert websocket.sent == [{"type": "status", "status": "receiving"}]
+    assert factory.calls == 1
+    assert submissions.paths == []
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_cold_initialization_websocket_final_cancellation_keeps_temp_ownership(tmp_path, monkeypatch):
+    reset_asr_env(monkeypatch)
+    monkeypatch.setenv("CLOUDX_ASR_PARTIAL_INTERVAL_SECONDS", "-1")
+    monkeypatch.setattr(main.tempfile, "tempdir", str(tmp_path))
+    factory = GatedBackendFactory()
+    monkeypatch.setattr(main, "create_inference_backend", factory)
+    submissions = SubmissionProbe(monkeypatch)
+
+    async def cancel_during_cold_final():
+        websocket = CountingWebSocket()
+        transcription = asyncio.create_task(main.transcribe_ws(websocket))
+        try:
+            await assert_gate_entered_without_watchdog(factory.gate)
+            assert websocket.receive_count == 3
+            transcription.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(transcription, timeout=1)
+            assert submissions.paths == []
+            assert list(tmp_path.iterdir()) == []
+
+            factory.gate.open()
+            await wait_until(lambda: main._inference_executor is not None)
+            assert submissions.paths == []
+            return websocket
+        finally:
+            factory.gate.open()
+            await cancel_and_drain(transcription)
+
+    try:
+        websocket = asyncio.run(cancel_during_cold_final())
+    finally:
+        main.close_inference_executor()
+
+    assert websocket.receive_count == 3
+    assert factory.calls == 1
+    assert submissions.paths == []
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_shutdown_close_is_nonblocking_and_awaited(monkeypatch):
+    reset_asr_env(monkeypatch)
+    executor = BlockingCloseExecutor()
+    with main._inference_executor_lock:
+        main._inference_executor = executor
+
+    async def dispatch_shutdown():
+        async with main.app.router.lifespan_context(main.app):
+            pass
+
+    async def exercise_shutdown():
+        shutdown = asyncio.create_task(dispatch_shutdown())
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            try:
+                await assert_gate_entered_without_watchdog(executor.gate)
+                await assert_event_loop_and_health_are_responsive(client, executor.gate, shutdown)
+                executor.gate.open()
+                await asyncio.wait_for(shutdown, timeout=3)
+            finally:
+                executor.gate.open()
+                await cancel_and_drain(shutdown)
+
+    asyncio.run(exercise_shutdown())
+
+    assert executor.close_calls == 1
+    assert executor.close_completed.is_set()
+    assert main._inference_executor is None
 
 
 def test_http_inference_capacity_is_explicitly_bounded(monkeypatch):
@@ -935,6 +1499,187 @@ def test_websocket_disconnect_after_end_cancels_final_process_and_releases_capac
     ]
 
 
+def test_websocket_end_cancels_active_partial_before_final_disconnect(tmp_path, monkeypatch):
+    reset_asr_env(monkeypatch)
+    monkeypatch.setenv("CLOUDX_ASR_INFERENCE_CONCURRENCY", "1")
+    monkeypatch.setenv("CLOUDX_ASR_PARTIAL_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("CLOUDX_ASR_PARTIAL_MIN_BYTES", "1")
+    monkeypatch.setenv("CLOUDX_ASR_INFERENCE_TIMEOUT_SECONDS", "60")
+    monkeypatch.setenv("CLOUDX_ASR_INFERENCE_CANCEL_GRACE_SECONDS", "0.05")
+    context = multiprocessing.get_context("spawn")
+    partial_started = context.Event()
+    final_started = context.Event()
+    partial_details_path = tmp_path / "post-end-partial.pids"
+    worker_target = partial(
+        post_end_partial_inference_worker,
+        partial_started=partial_started,
+        final_started=final_started,
+        partial_details_path=partial_details_path,
+    )
+    backend = main.IsolatedInferenceBackend(1, context=context, worker_target=worker_target)
+    executor = main.InferenceExecutor(1, backend=backend)
+    websocket = PostEndPartialDisconnectingWebSocket(partial_started, final_started, partial_details_path)
+    stream_paths = []
+    production_open_temp_audio_file = main.open_temp_audio_file
+
+    def record_stream_temp_path(filename):
+        temp_file, temp_path = production_open_temp_audio_file(filename)
+        stream_paths.append(temp_path)
+        return temp_file, temp_path
+
+    monkeypatch.setattr(main, "get_inference_executor", lambda: executor)
+    monkeypatch.setattr(main, "open_temp_audio_file", record_stream_temp_path)
+
+    async def disconnect_after_partial_end_without_cancelling_endpoint():
+        await asyncio.wait_for(main.transcribe_ws(websocket), timeout=3)
+
+        poller = select.poll()
+        for pidfd in websocket.partial_pidfds:
+            poller.register(pidfd, select.POLLIN)
+        exited_pidfds = {pidfd for pidfd, _events in poller.poll(1000)}
+        assert exited_pidfds == set(websocket.partial_pidfds)
+        assert websocket.partial_snapshot_path is not None
+        assert not websocket.partial_snapshot_path.exists()
+        assert len(stream_paths) == 1
+        assert not stream_paths[0].exists()
+
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            return await client.post(
+                "/transcribe",
+                files={"audio": ("available.webm", VALID_FAKE_AUDIO, "audio/webm")},
+            )
+
+    try:
+        available = asyncio.run(disconnect_after_partial_end_without_cancelling_endpoint())
+    finally:
+        websocket.close_pidfds()
+        executor.close()
+
+    assert available.status_code == 200
+    assert available.json()["text"] == "worker recovered"
+    assert websocket.receive_count == 4
+    assert websocket.sent == [
+        {"type": "status", "status": "receiving"},
+        {"type": "status", "status": "transcribing"},
+    ]
+
+
+def test_websocket_end_repeated_cancellation_waits_for_partial_cleanup(tmp_path, monkeypatch):
+    reset_asr_env(monkeypatch)
+    monkeypatch.setenv("CLOUDX_ASR_INFERENCE_CONCURRENCY", "1")
+    monkeypatch.setenv("CLOUDX_ASR_PARTIAL_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("CLOUDX_ASR_PARTIAL_MIN_BYTES", "1")
+    monkeypatch.setenv("CLOUDX_ASR_INFERENCE_TIMEOUT_SECONDS", "60")
+    monkeypatch.setenv("CLOUDX_ASR_INFERENCE_CANCEL_GRACE_SECONDS", "0.05")
+    context = multiprocessing.get_context("spawn")
+    partial_started = context.Event()
+    final_started = context.Event()
+    partial_details_path = tmp_path / "repeated-cancellation-partial.pids"
+    worker_target = partial(
+        post_end_partial_inference_worker,
+        partial_started=partial_started,
+        final_started=final_started,
+        partial_details_path=partial_details_path,
+    )
+    backend = main.IsolatedInferenceBackend(1, context=context, worker_target=worker_target)
+    executor = main.InferenceExecutor(1, backend=backend)
+    websocket = PostEndPartialDisconnectingWebSocket(partial_started, final_started, partial_details_path)
+    stream_paths = []
+    production_open_temp_audio_file = main.open_temp_audio_file
+    production_cancel = main.InferenceJob.cancel
+
+    def record_stream_temp_path(filename):
+        temp_file, temp_path = production_open_temp_audio_file(filename)
+        stream_paths.append(temp_path)
+        return temp_file, temp_path
+
+    monkeypatch.setattr(main, "get_inference_executor", lambda: executor)
+    monkeypatch.setattr(main, "open_temp_audio_file", record_stream_temp_path)
+
+    async def cancel_endpoint_during_partial_cleanup():
+        cleanup_entered = asyncio.Event()
+        cleanup_release = asyncio.Event()
+        cleanup_interrupted = asyncio.Event()
+        cleanup_completed = asyncio.Event()
+        partial_jobs = []
+
+        async def gated_cancel(inference_job):
+            partial_jobs.append(inference_job)
+            cleanup_entered.set()
+            try:
+                await cleanup_release.wait()
+                await production_cancel(inference_job)
+            except asyncio.CancelledError:
+                cleanup_interrupted.set()
+                raise
+            else:
+                cleanup_completed.set()
+
+        monkeypatch.setattr(main.InferenceJob, "cancel", gated_cancel)
+        transcription = asyncio.create_task(main.transcribe_ws(websocket))
+        try:
+            await asyncio.wait_for(cleanup_entered.wait(), timeout=3)
+            assert len(partial_jobs) == 1
+
+            transcription.cancel()
+            await asyncio.sleep(0)
+            assert not transcription.done()
+            assert not cleanup_interrupted.is_set()
+
+            transcription.cancel()
+            await asyncio.sleep(0)
+            assert not transcription.done()
+            assert not cleanup_interrupted.is_set()
+
+            cleanup_release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(transcription), timeout=3)
+
+            assert cleanup_completed.is_set()
+            assert not cleanup_interrupted.is_set()
+            assert partial_jobs[0].done()
+
+            poller = select.poll()
+            for pidfd in websocket.partial_pidfds:
+                poller.register(pidfd, select.POLLIN)
+            exited_pidfds = {pidfd for pidfd, _events in poller.poll(1000)}
+            assert exited_pidfds == set(websocket.partial_pidfds)
+            assert websocket.partial_snapshot_path is not None
+            assert not websocket.partial_snapshot_path.exists()
+            assert len(stream_paths) == 1
+            assert not stream_paths[0].exists()
+
+            transport = httpx.ASGITransport(app=main.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                available = await client.post(
+                    "/transcribe",
+                    files={"audio": ("available.webm", VALID_FAKE_AUDIO, "audio/webm")},
+                )
+            await asyncio.sleep(0)
+            return available
+        finally:
+            cleanup_release.set()
+            if not transcription.done():
+                transcription.cancel()
+            await asyncio.gather(transcription, return_exceptions=True)
+
+    try:
+        available = asyncio.run(cancel_endpoint_during_partial_cleanup())
+    finally:
+        websocket.close_pidfds()
+        executor.close()
+
+    assert available.status_code == 200
+    assert available.json()["text"] == "worker recovered"
+    assert websocket.receive_count == 3
+    assert not final_started.is_set()
+    assert websocket.sent == [
+        {"type": "status", "status": "receiving"},
+        {"type": "status", "status": "transcribing"},
+    ]
+
+
 def test_websocket_disconnect_cancels_partial_process_and_releases_capacity(tmp_path, monkeypatch):
     reset_asr_env(monkeypatch)
     monkeypatch.setenv("CLOUDX_ASR_INFERENCE_CONCURRENCY", "1")
@@ -1155,6 +1900,38 @@ async def wait_until(predicate, timeout=1.0):
         if asyncio.get_running_loop().time() >= deadline:
             raise AssertionError("Condition was not met before timeout.")
         await asyncio.sleep(0.01)
+
+
+async def wait_for_thread_event(event, timeout=3.0):
+    event_was_set = await asyncio.wait_for(asyncio.to_thread(event.wait, timeout), timeout=timeout + 1)
+    assert event_was_set, "The thread event was not set before its timeout."
+
+
+async def assert_gate_entered_without_watchdog(gate):
+    await wait_for_thread_event(gate.entered)
+    assert not gate.watchdog_released.is_set(), "The event loop resumed only after the safety watchdog released blocking work."
+
+
+async def assert_event_loop_and_health_are_responsive(client, gate, *blocked_tasks):
+    marker = asyncio.Event()
+    asyncio.get_running_loop().call_soon(marker.set)
+    health_task = asyncio.create_task(client.get("/health"))
+
+    await asyncio.wait_for(marker.wait(), timeout=1)
+    health = await asyncio.wait_for(health_task, timeout=1)
+
+    assert health.status_code == 200
+    assert health.json() == {"status": "ok"}
+    assert not gate.watchdog_released.is_set(), "Health completed only after the safety watchdog released blocking work."
+    assert all(not task.done() for task in blocked_tasks)
+
+
+async def cancel_and_drain(*tasks):
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def wait_until_sync(predicate, timeout=1.0):

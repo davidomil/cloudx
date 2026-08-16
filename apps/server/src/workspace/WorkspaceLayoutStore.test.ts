@@ -127,7 +127,7 @@ describe("WorkspaceLayoutStore", () => {
       await originalWrite(value);
     };
 
-    const placement = store.placeTab({ tabId: "tab-1", windowId: window.id, paneId: window.layout.activePaneId });
+    const placement = store.placeTabAndPublish({ tabId: "tab-1", windowId: window.id, paneId: window.layout.activePaneId }, () => undefined);
     await placementWriteStarted.promise;
     const rename = store.updateWindow(window.id, { name: "Renamed" });
     await new Promise((resolve) => setImmediate(resolve));
@@ -162,7 +162,7 @@ describe("WorkspaceLayoutStore", () => {
       await originalWrite(value);
     };
 
-    const placement = store.placeTab({ tabId: "tab-1", windowId: window.id, paneId: window.layout.activePaneId });
+    const placement = store.placeTabAndPublish({ tabId: "tab-1", windowId: window.id, paneId: window.layout.activePaneId }, () => undefined);
     await writeStarted.promise;
 
     expect(store.snapshot().windows).toEqual(before);
@@ -170,6 +170,37 @@ describe("WorkspaceLayoutStore", () => {
     releaseWrite.resolve();
     await placement;
     expect(store.findWindowForTab("tab-1")?.id).toBe(window.id);
+  });
+
+  it("retains publication and rollback failures when compensation cannot persist", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-workspace-rollback-failure-"));
+    const store = new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root]));
+    const window = store.getActiveWindow();
+    const workspaceFile = (store as unknown as { workspaceFile: { write(value: unknown): Promise<void> } }).workspaceFile;
+    const originalWrite = workspaceFile.write.bind(workspaceFile);
+    const publicationFailure = new Error("prepared tab publication failed");
+    const rollbackFailure = new Error("workspace rollback write failed");
+    let writes = 0;
+    workspaceFile.write = async (value) => {
+      writes += 1;
+      if (writes === 2) {
+        throw rollbackFailure;
+      }
+      await originalWrite(value);
+    };
+
+    const failure = await store
+      .placeTabAndPublish({ tabId: "tab-1", windowId: window.id, paneId: window.layout.activePaneId }, () => {
+        throw publicationFailure;
+      })
+      .then(
+        () => undefined,
+        (error: unknown) => error
+      );
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect(failure).toMatchObject({ message: "Workspace publication failed and its layout rollback could not be persisted." });
+    expect((failure as AggregateError).errors).toEqual([publicationFailure, rollbackFailure]);
   });
 
   it("keeps in-memory windows reachable when workspace persistence runs out of space", async () => {
@@ -370,7 +401,7 @@ describe("WorkspaceLayoutStore", () => {
       name: "Target Applied"
     });
     const remapped = store.remapTemplateLayout(prepared.template, new Map([["tab-source", "tab-new"]]));
-    const updated = await store.commitTemplateApplication(prepared, remapped, "Target Applied");
+    const { window: updated } = await store.commitTemplateAndPublish(prepared, remapped, "Target Applied", () => undefined);
     const after = await store.state([tab("tab-old", root), tab("tab-new", path.join(nextProject, "apps", "web"))], "tab-new");
 
     expect(prepared).toMatchObject({ createdWindow: false, projectPath: nextProject, window: { id: targetWindow.id } });

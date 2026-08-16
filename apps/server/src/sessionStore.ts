@@ -34,6 +34,7 @@ export type SessionBackgroundErrorReporter = (error: unknown, details: { operati
 
 interface ActionAdmission {
   active: boolean;
+  signal: AbortSignal;
 }
 
 const reportSessionBackgroundError: SessionBackgroundErrorReporter = (error, details) => {
@@ -53,6 +54,7 @@ export class SessionStore {
   private readonly producerActions = new Set<Promise<unknown>>();
   private readonly triggerEmissions = new Set<Promise<unknown>>();
   private readonly actionAdmission = new AsyncLocalStorage<ActionAdmission>();
+  private readonly shutdownController = new AbortController();
   private disposed = false;
   private disposePromise: Promise<void> | undefined;
 
@@ -303,7 +305,7 @@ export class SessionStore {
   }
 
   async executeVoiceAction(action: VoiceAction, fallbackTabId?: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
-    return this.admitAction(() => this.executeAdmittedVoiceAction(action, fallbackTabId, signal));
+    return this.admitAction(signal, (admittedSignal) => this.executeAdmittedVoiceAction(action, fallbackTabId, admittedSignal));
   }
 
   private async executeAdmittedVoiceAction(action: VoiceAction, fallbackTabId?: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
@@ -393,11 +395,11 @@ export class SessionStore {
   }
 
   async executePluginAction(tabId: string, action: string, input: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>> {
-    return this.admitAction(async () => {
-      signal?.throwIfAborted();
+    return this.admitAction(signal, async (admittedSignal) => {
+      admittedSignal.throwIfAborted();
       const session = this.getSession(tabId);
       this.plugins.validateInput(session.tab.pluginId, action, input);
-      const result = this.plugins.validateOutput(session.tab.pluginId, action, await session.handleAction(action, input, { signal, caller: { kind: "ui" } }));
+      const result = this.plugins.validateOutput(session.tab.pluginId, action, await session.handleAction(action, input, { signal: admittedSignal, caller: { kind: "ui" } }));
       await this.contextService.record(this.getTab(tabId), "plugin-action", JSON.stringify({ action, input, result }, null, 2));
       this.markTabInteractedIfActionUpdatesState(session.tab.pluginId, action, tabId);
       return result;
@@ -405,8 +407,8 @@ export class SessionStore {
   }
 
   async executePluginHook(pluginId: string, hookId: HookId, action: string, targetTabId: string | undefined, input: Record<string, unknown>, caller: HookCaller, signal?: AbortSignal): Promise<Record<string, unknown>> {
-    return this.admitAction(async () => {
-      signal?.throwIfAborted();
+    return this.admitAction(signal, async (admittedSignal) => {
+      admittedSignal.throwIfAborted();
       const tabId = this.resolvePluginHookTargetTabId(pluginId, targetTabId, caller.tabId ?? this.activeTabId);
       if (!tabId) {
         throw new Error(`Hook ${hookId} requires a target tab for plugin ${pluginId}.`);
@@ -421,7 +423,7 @@ export class SessionStore {
       } else {
         this.plugins.validateInput(pluginId, action, actionInput);
       }
-      const result = this.plugins.validateOutput(pluginId, action, await session.handleAction(action, actionInput, { signal, caller }));
+      const result = this.plugins.validateOutput(pluginId, action, await session.handleAction(action, actionInput, { signal: admittedSignal, caller }));
       await this.contextService.record(this.getTab(tabId), "plugin-hook", JSON.stringify({ hookId, action, input: actionInput, caller, result }, null, 2));
       this.markTabInteractedIfActionUpdatesState(pluginId, action, tabId);
       return result;
@@ -480,6 +482,7 @@ export class SessionStore {
       return this.disposePromise;
     }
     this.disposed = true;
+    this.shutdownController.abort(new Error("Session store is disposed."));
     this.disposePromise = this.finishDisposal();
     return this.disposePromise;
   }
@@ -506,20 +509,23 @@ export class SessionStore {
     }
   }
 
-  private admitAction<T>(action: () => Promise<T>): Promise<T> {
+  private admitAction<T>(signal: AbortSignal | undefined, action: (signal: AbortSignal) => Promise<T>): Promise<T> {
     if (this.disposed && !this.actionAdmission.getStore()?.active) {
       return Promise.reject(new Error("Session store is disposed."));
     }
-    const admission = { active: true };
-    const execution = this.actionAdmission.run(admission, action);
+    const composed = composeAbortSignals(signal, this.shutdownController.signal);
+    const admission = { active: true, signal: composed.signal };
+    const execution = this.actionAdmission.run(admission, () => action(composed.signal));
     this.producerActions.add(execution);
     void execution.then(
       () => {
         admission.active = false;
+        composed.dispose();
         this.producerActions.delete(execution);
       },
       () => {
         admission.active = false;
+        composed.dispose();
         this.producerActions.delete(execution);
       }
     );
@@ -894,7 +900,8 @@ export class SessionStore {
         }
         return this.hooks.call(hookId, input, {
           caller: { kind: "plugin", pluginId, tabId },
-          activeTabId: this.activeTabId
+          activeTabId: this.activeTabId,
+          signal: this.actionAdmission.getStore()?.signal
         }) as Promise<T>;
       },
       callTabHook: async <T extends Record<string, unknown> = Record<string, unknown>>(targetTabId: string, hookId: HookId, input = {}) => {
@@ -905,7 +912,8 @@ export class SessionStore {
           caller: { kind: "plugin", pluginId, tabId },
           targetTabId,
           targetTab: this.tabs.get(targetTabId),
-          activeTabId: this.activeTabId
+          activeTabId: this.activeTabId,
+          signal: this.actionAdmission.getStore()?.signal
         }) as Promise<T>;
       },
       emitTrigger: async (triggerId, payload = {}) => {
@@ -970,6 +978,27 @@ export class SessionStore {
     }
     return fallback;
   }
+}
+
+function composeAbortSignals(caller: AbortSignal | undefined, shutdown: AbortSignal): { signal: AbortSignal; dispose(): void } {
+  const controller = new AbortController();
+  const abortFromCaller = () => controller.abort(caller?.reason);
+  const abortFromShutdown = () => controller.abort(shutdown.reason);
+  if (caller?.aborted) {
+    abortFromCaller();
+  } else if (shutdown.aborted) {
+    abortFromShutdown();
+  } else {
+    caller?.addEventListener("abort", abortFromCaller, { once: true });
+    shutdown.addEventListener("abort", abortFromShutdown, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    dispose() {
+      caller?.removeEventListener("abort", abortFromCaller);
+      shutdown.removeEventListener("abort", abortFromShutdown);
+    }
+  };
 }
 
 async function drainPromises(promises: Set<Promise<unknown>>): Promise<void> {

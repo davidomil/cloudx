@@ -34,7 +34,6 @@ import { PathPolicy } from "./pathPolicy.js";
 import {
   buildServer,
   buildServices,
-  isAllowedWebSocketOrigin,
   parseTerminalControlMessage,
   parseVoiceAudioControlMessage,
   sendTerminalWebSocketJson,
@@ -48,6 +47,33 @@ import type { VoicePlanner } from "./voice/VoicePlanner.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
 
 describe("buildServer", () => {
+  it("wires the worktree manager to the configured allowed roots", async () => {
+    const allowedRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-worktree-composition-"));
+    const allowedProject = path.join(allowedRoot, "project");
+    const outsideProject = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-worktree-composition-outside-"));
+    await fs.mkdir(allowedProject);
+    const services = buildServices(testConfig(allowedRoot));
+    const worktrees = services.plugins.get("worktree-manager");
+    const sessionFor = (cwd: string) => Promise.resolve(worktrees.createSession({
+      tab: {
+        id: `worktrees:${cwd}`,
+        pluginId: "worktree-manager",
+        title: "Worktrees",
+        cwd,
+        status: "running",
+        indicator: { color: "green", label: "OK", updatedAt: new Date(0).toISOString() },
+        createdAt: new Date(0).toISOString(),
+        updatedAt: new Date(0).toISOString(),
+      },
+      cwd,
+      controls: { setTabIndicator: () => undefined, closeTab: () => undefined },
+    }));
+    await expect(sessionFor(outsideProject).then((session) => session.handleAction("get_worktree_project", {}))).rejects.toThrow(/outside configured Cloudx roots/);
+    await expect(sessionFor(allowedProject).then((session) => session.handleAction("get_worktree_project", {}))).resolves.toMatchObject({ status: "empty", cwd: allowedProject });
+    await services.sessions.dispose();
+    await services.automation?.dispose();
+  });
+
   it("reports ready only after persistence and service startup owners settle", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-ready-"));
     const config = testConfig(root);
@@ -147,27 +173,127 @@ describe("buildServer", () => {
     expect(JSON.stringify(absolute)).not.toContain("access_token=abc");
   });
 
-  it("allows only same-host browser websocket origins", () => {
-    expect(
-      isAllowedWebSocketOrigin("https://127.0.0.1:3001", "127.0.0.1:3001"),
-    ).toBe(true);
-    expect(
-      isAllowedWebSocketOrigin("http://localhost:3001", "LOCALHOST:3001"),
-    ).toBe(true);
-    expect(isAllowedWebSocketOrigin(undefined, "127.0.0.1:3001")).toBe(true);
-    expect(
-      isAllowedWebSocketOrigin("https://evil.example", "127.0.0.1:3001"),
-    ).toBe(false);
-    expect(isAllowedWebSocketOrigin("null", "127.0.0.1:3001")).toBe(false);
-    expect(
-      isAllowedWebSocketOrigin("file:///tmp/cloudx.html", "127.0.0.1:3001"),
-    ).toBe(false);
-    expect(
-      isAllowedWebSocketOrigin(
-        ["https://127.0.0.1:3001", "https://evil.example"],
-        "127.0.0.1:3001",
-      ),
-    ).toBe(false);
+  it("admits HTTP and WebSocket requests only through the configured Host and Origin set", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-origin-admission-"));
+    const config = {
+      ...testConfig(root),
+      trustedOrigins: [
+        "http://127.0.0.1:3001",
+        "https://cloudx.example.com",
+        "http://localhost:5173",
+      ],
+    };
+    const app = await buildServer(config);
+    let allowedClient: WebSocket | undefined;
+    let blockedClient: WebSocket | undefined;
+    try {
+      const blockedHttp = await app.inject({
+        method: "DELETE",
+        url: "/api/notifications",
+        headers: {
+          host: "attacker.example:3001",
+          origin: "http://attacker.example:3001",
+          forwarded: "host=cloudx.example.com;proto=https",
+          "x-forwarded-host": "cloudx.example.com",
+          "x-forwarded-proto": "https",
+        },
+      });
+      expect(blockedHttp.statusCode).toBe(403);
+      expect(blockedHttp.json()).toEqual({ error: "Forbidden" });
+
+      for (const headers of [
+        { host: "127.0.0.1:3001", origin: "http://127.0.0.1:3001" },
+        { host: "cloudx.example.com", origin: "https://cloudx.example.com" },
+        { host: "127.0.0.1:3001", origin: "http://localhost:5173" },
+      ]) {
+        const response = await app.inject({ method: "DELETE", url: "/api/notifications", headers });
+        expect(response.statusCode).toBe(200);
+      }
+
+      await app.listen({ host: "127.0.0.1", port: 0 });
+      const address = app.server.address();
+      if (!address || typeof address === "string") throw new Error("Expected TCP server address.");
+      const url = `ws://127.0.0.1:${address.port}/ws/workspace`;
+
+      const blockedError = new Promise<Error>((resolve) => {
+        blockedClient = new WebSocket(url, {
+          headers: {
+            host: "attacker.example:3001",
+            origin: "http://attacker.example:3001",
+            forwarded: "host=cloudx.example.com;proto=https",
+            "x-forwarded-host": "cloudx.example.com",
+            "x-forwarded-proto": "https",
+          },
+        });
+        blockedClient.once("error", resolve);
+      });
+      await expect(blockedError).resolves.toMatchObject({
+        message: expect.stringContaining("403"),
+      });
+      blockedClient = undefined;
+
+      await new Promise<void>((resolve, reject) => {
+        allowedClient = new WebSocket(url, {
+          headers: { host: "cloudx.example.com", origin: "https://cloudx.example.com" },
+        });
+        allowedClient.once("open", resolve);
+        allowedClient.once("error", reject);
+      });
+    } finally {
+      blockedClient?.terminate();
+      allowedClient?.terminate();
+      await app.close();
+    }
+  });
+
+  it("treats explicit default-port Host authorities as equivalent without double-bracketing IPv6", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-default-port-origin-"));
+    const config = {
+      ...testConfig(root),
+      trustedOrigins: ["http://127.0.0.1", "https://cloudx.example.com", "http://[::1]"],
+    };
+    const app = await buildServer(config);
+    const clients: WebSocket[] = [];
+    try {
+      for (const { host, origin } of [
+        { host: "127.0.0.1", origin: "http://127.0.0.1" },
+        { host: "127.0.0.1:80", origin: "http://127.0.0.1" },
+        { host: "cloudx.example.com", origin: "https://cloudx.example.com" },
+        { host: "cloudx.example.com:443", origin: "https://cloudx.example.com" },
+        { host: "[::1]", origin: "http://[::1]" },
+        { host: "[::1]:80", origin: "http://[::1]" },
+      ]) {
+        const response = await app.inject({ method: "DELETE", url: "/api/notifications", headers: { host, origin } });
+        expect(response.statusCode, host).toBe(200);
+      }
+      for (const host of ["[::1]:81", "other.example.com", "127.0.0.2:80"]) {
+        const response = await app.inject({ method: "DELETE", url: "/api/notifications", headers: { host } });
+        expect(response.statusCode, host).toBe(403);
+      }
+
+      await app.listen({ host: "127.0.0.1", port: 0 });
+      const address = app.server.address() as { port: number };
+      const url = `ws://127.0.0.1:${address.port}/ws/workspace`;
+      for (const { host, origin } of [
+        { host: "127.0.0.1:80", origin: "http://127.0.0.1" },
+        { host: "cloudx.example.com:443", origin: "https://cloudx.example.com" },
+        { host: "[::1]:80", origin: "http://[::1]" },
+      ]) {
+        const client = new WebSocket(url, { headers: { host, origin } });
+        clients.push(client);
+        await expect(readWebSocketJson(client)).resolves.toMatchObject({ type: "workspace" });
+      }
+      for (const host of ["[::1]:81", "other.example.com"]) {
+        const client = new WebSocket(url, { headers: { host } });
+        clients.push(client);
+        await expect(new Promise<Error>((resolve) => client.once("error", resolve))).resolves.toMatchObject({
+          message: expect.stringContaining("403"),
+        });
+      }
+    } finally {
+      for (const client of clients) client.terminate();
+      await app.close();
+    }
   });
 
   it("parses terminal websocket control messages from all ws text RawData shapes", () => {
@@ -685,7 +811,7 @@ describe("buildServer", () => {
     try {
       await app.listen({ host: "127.0.0.1", port: 0 });
       const address = app.server.address() as { port: number };
-      client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/workspace`);
+      client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/workspace`, { headers: { host: "localhost" } });
 
       await expect(readWebSocketJson(client)).resolves.toMatchObject({
         type: "workspace",
@@ -714,25 +840,26 @@ describe("buildServer", () => {
       const url = `ws://127.0.0.1:${address.port}/ws/workspace`;
 
       allowedClient = new WebSocket(url, {
-        headers: { Origin: `http://127.0.0.1:${address.port}` },
+        headers: { host: "localhost", Origin: "http://localhost" },
       });
       await expect(readWebSocketJson(allowedClient)).resolves.toMatchObject({
         type: "workspace",
       });
 
       blockedClient = new WebSocket(url, {
-        headers: { Origin: "https://evil.example" },
+        headers: { host: "localhost", Origin: "https://evil.example" },
       });
-      const error = new Promise<Error>((resolve) => {
+      const blockedError = new Promise<Error>((resolve) => {
         blockedClient!.once("error", resolve);
       });
 
-      await expect(error).resolves.toMatchObject({
+      await expect(blockedError).resolves.toMatchObject({
         message: expect.stringContaining("403"),
       });
+      blockedClient = undefined;
     } finally {
       allowedClient?.close();
-      blockedClient?.close();
+      blockedClient?.terminate();
       await app.close();
     }
   });
@@ -754,7 +881,7 @@ describe("buildServer", () => {
     try {
       await app.listen({ host: "127.0.0.1", port: 0 });
       const address = app.server.address() as { port: number };
-      client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/workspace`);
+      client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/workspace`, { headers: { host: "localhost" } });
       await new Promise<void>((resolve, reject) => {
         client!.once("open", resolve);
         client!.once("error", reject);
@@ -803,7 +930,7 @@ describe("buildServer", () => {
     try {
       await app.listen({ host: "127.0.0.1", port: 0 });
       const address = app.server.address() as { port: number };
-      client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/workspace`);
+      client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/workspace`, { headers: { host: "localhost" } });
       await readWebSocketJson(client);
 
       const notificationMessage = readWebSocketJsonMatching(
@@ -866,7 +993,7 @@ describe("buildServer", () => {
     try {
       await app.listen({ host: "127.0.0.1", port: 0 });
       const address = app.server.address() as { port: number };
-      client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/workspace`);
+      client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/workspace`, { headers: { host: "localhost" } });
       await readWebSocketJson(client);
 
       const notificationMessage = readWebSocketJson(client);
@@ -1028,7 +1155,7 @@ describe("buildServer", () => {
     try {
       await app.listen({ host: "127.0.0.1", port: 0 });
       const address = app.server.address() as { port: number };
-      client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/workspace`);
+      client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/workspace`, { headers: { host: "localhost" } });
       await readWebSocketJson(client);
       const groups = await app.inject({
         method: "GET",
@@ -1135,8 +1262,8 @@ describe("buildServer", () => {
       closed = true;
     });
     await vi.waitFor(() => expect(events).toContain("jira:start"));
-    expect(events[0]).toBe("automation:begin");
     expect(events).toEqual(expect.arrayContaining(["jira:start", "sessions:start", "documentation:start", "voice:start"]));
+    expect(events).not.toContain("automation:begin");
     expect(events).not.toContain("automation:dispose:start");
     expect(closed).toBe(false);
 
@@ -1146,8 +1273,12 @@ describe("buildServer", () => {
     expect(events).not.toContain("automation:dispose:start");
     documentationRelease.resolve(undefined);
     voiceRelease.resolve(undefined);
+    await vi.waitFor(() => expect(events).toContain("automation:begin"));
     await vi.waitFor(() => expect(events).toContain("automation:dispose:start"));
-    expect(events.indexOf("automation:begin")).toBeLessThan(events.indexOf("jira:final-event"));
+    expect(events.indexOf("automation:begin")).toBeGreaterThan(events.indexOf("jira:final-event"));
+    expect(events.indexOf("automation:begin")).toBeGreaterThan(events.indexOf("sessions:end"));
+    expect(events.indexOf("automation:begin")).toBeGreaterThan(events.indexOf("documentation:end"));
+    expect(events.indexOf("automation:begin")).toBeGreaterThan(events.indexOf("voice:end"));
     expect(events.indexOf("automation:dispose:start")).toBeGreaterThan(events.indexOf("sessions:end"));
     expect(closed).toBe(false);
 
@@ -1332,6 +1463,12 @@ describe("buildServer", () => {
         dispose(): Promise<void>;
       }
     ).dispose = disposeDocumentationQueue;
+    const unsubscribeWorkspace = vi.fn(() => {
+      throw new Error("notification unsubscribe failed");
+    });
+    const unsubscribeAutomation = vi.fn();
+    vi.spyOn(services.workspace!, "onPersistenceStatusChange").mockReturnValue(unsubscribeWorkspace);
+    vi.spyOn(services.automation!, "onPersistenceStatusChange").mockReturnValue(unsubscribeAutomation);
     const app = await buildServer(testConfig(root), services);
 
     let failure: unknown;
@@ -1342,12 +1479,13 @@ describe("buildServer", () => {
     }
 
     expect(failure).toBeInstanceOf(AggregateError);
-    expect((failure as AggregateError).errors.map((error) => (error as Error).message).sort()).toEqual([
-      "automation shutdown failed",
+    expect((failure as AggregateError).errors.map((error) => (error as Error).message)).toEqual([
       "documentation shutdown failed",
+      "voice shutdown failed",
       "jira shutdown failed",
       "session shutdown failed",
-      "voice shutdown failed"
+      "automation shutdown failed",
+      "notification unsubscribe failed"
     ]);
 
     expect(disposeAutomation).toHaveBeenCalledTimes(1);
@@ -1355,6 +1493,8 @@ describe("buildServer", () => {
     expect(disposeVoice).toHaveBeenCalledTimes(1);
     expect(disposeSessions).toHaveBeenCalledTimes(1);
     expect(disposeDocumentationQueue).toHaveBeenCalledTimes(1);
+    expect(unsubscribeWorkspace).toHaveBeenCalledTimes(1);
+    expect(unsubscribeAutomation).toHaveBeenCalledTimes(1);
   });
 
   it.each([
@@ -2346,6 +2486,7 @@ describe("buildServer", () => {
               method: "POST",
               path: "/api/documentation/upload?filename=chunked.md",
               headers: {
+                host: "localhost",
                 "content-type": "application/octet-stream",
                 "transfer-encoding": "chunked",
               },
@@ -2375,6 +2516,60 @@ describe("buildServer", () => {
     } finally {
       await app.close();
     }
+  });
+
+  it.each([
+    ["documentation upload", "/api/documentation/upload?filename=partial.md"],
+    ["documentation archive import", "/api/documentation/archive/import/merge?filename=partial.zip"],
+  ])("aborts and cleans a reserved partial %s before server close settles", async (_name, requestPath) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-documentation-partial-close-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    const app = await buildServer(config, services);
+    let request: http.ClientRequest | undefined;
+    let close: Promise<void> | undefined;
+    let outcome = "not-started";
+    try {
+      await app.listen({ host: "127.0.0.1", port: 0 });
+      const address = app.server.address() as { port: number };
+      request = http.request({
+        host: "127.0.0.1",
+        port: address.port,
+        method: "POST",
+        path: requestPath,
+        headers: {
+          host: "localhost",
+          "content-type": "application/octet-stream",
+          "content-length": "12",
+        },
+      });
+      request.on("error", () => undefined);
+      request.write("partial");
+      await vi.waitFor(() => {
+        expect(services.documentationIngestQueue!.list().capacity).toMatchObject({
+          admittedJobs: 1,
+          admittedBytes: 12,
+          reservedJobs: 1,
+        });
+      });
+
+      close = app.close();
+      outcome = await Promise.race([
+        close.then(() => "closed"),
+        new Promise<string>((resolve) => setTimeout(() => resolve("pending"), 300)),
+      ]);
+    } finally {
+      request?.destroy();
+      await close?.catch(() => undefined);
+    }
+
+    expect(outcome).toBe("closed");
+    expect(services.documentationIngestQueue!.list().capacity).toMatchObject({
+      admittedJobs: 0,
+      admittedBytes: 0,
+      reservedJobs: 0,
+    });
+    await expect(fs.readdir(path.join(config.dataDir, "upload-spool"))).resolves.toEqual([]);
   });
 
   it("reaps interrupted documentation upload spools before accepting requests", async () => {
@@ -4266,6 +4461,7 @@ describe("buildServer", () => {
     const config: AppConfig = {
       host: "0.0.0.0",
       port: 3001,
+      trustedOrigins: ["http://127.0.0.1:3001", "http://localhost"],
       logLevel: "info",
       allowedRoots: [root],
       asrUrl: "http://127.0.0.1:7810",
@@ -4508,6 +4704,7 @@ describe("buildServer", () => {
     const config: AppConfig = {
       host: "127.0.0.1",
       port: 0,
+      trustedOrigins: ["http://localhost"],
       logLevel: "info",
       allowedRoots: [root],
       asrUrl: "http://127.0.0.1:7810",
@@ -4541,6 +4738,7 @@ describe("buildServer", () => {
       client = new WebSocket(
         `ws://127.0.0.1:${address.port}/api/local-web/${tabId}/proxy-ws/socket.io/?transport=websocket`,
         "vite-hmr",
+        { headers: { host: "localhost" } },
       );
       await new Promise<void>((resolve, reject) => {
         client?.once("open", resolve);
@@ -4590,6 +4788,7 @@ describe("buildServer", () => {
     const config: AppConfig = {
       host: "127.0.0.1",
       port: 0,
+      trustedOrigins: ["http://localhost"],
       logLevel: "info",
       allowedRoots: [root],
       asrUrl: "http://127.0.0.1:7810",
@@ -4622,6 +4821,7 @@ describe("buildServer", () => {
       const address = app.server.address() as { port: number };
       client = new WebSocket(
         `ws://127.0.0.1:${address.port}/api/local-web/${tabId}/proxy-ws/`,
+        { headers: { host: "localhost" } },
       );
       await new Promise<void>((resolve, reject) => {
         client?.once("open", resolve);
@@ -4682,6 +4882,7 @@ describe("buildServer", () => {
     const config: AppConfig = {
       host: "127.0.0.1",
       port: 0,
+      trustedOrigins: ["http://localhost"],
       logLevel: "info",
       allowedRoots: [root],
       asrUrl: "http://127.0.0.1:7810",
@@ -4714,6 +4915,7 @@ describe("buildServer", () => {
       const address = app.server.address() as { port: number };
       client = new WebSocket(
         `ws://127.0.0.1:${address.port}/api/local-web/${tabId}/proxy-ws/`,
+        { headers: { host: "localhost" } },
       );
       await new Promise<void>((resolve, reject) => {
         client?.once("open", resolve);
@@ -4765,6 +4967,7 @@ describe("buildServer", () => {
       const address = app.server.address() as { port: number };
       client = new WebSocket(
         `ws://127.0.0.1:${address.port}/ws/terminal/missing`,
+        { headers: { host: "localhost" } },
       );
       await new Promise<void>((resolve, reject) => {
         client!.once("open", resolve);
@@ -4822,6 +5025,7 @@ describe("buildServer", () => {
       const address = app.server.address() as { port: number };
       client = new WebSocket(
         `ws://127.0.0.1:${address.port}/ws/terminal/tab-1`,
+        { headers: { host: "localhost" } },
       );
       await new Promise<void>((resolve, reject) => {
         client!.once("open", resolve);
@@ -4918,6 +5122,7 @@ describe("buildServer", () => {
         const address = app.server.address() as { port: number };
         client = new WebSocket(
           `ws://127.0.0.1:${address.port}/ws/terminal/tab-1`,
+          { headers: { host: "localhost" } },
         );
         await new Promise<void>((resolve, reject) => {
           client!.once("open", resolve);
@@ -4957,6 +5162,7 @@ describe("buildServer", () => {
     const config: AppConfig = {
       host: "0.0.0.0",
       port: 3001,
+      trustedOrigins: ["http://127.0.0.1:3001", "http://localhost"],
       logLevel: "info",
       allowedRoots: [os.tmpdir()],
       asrUrl: "http://127.0.0.1:7810",
@@ -4998,6 +5204,7 @@ describe("buildServer", () => {
     const config: AppConfig = {
       host: "0.0.0.0",
       port: 3001,
+      trustedOrigins: ["http://127.0.0.1:3001", "http://localhost"],
       logLevel: "info",
       allowedRoots: [root],
       asrUrl: "http://127.0.0.1:7810",
@@ -5050,6 +5257,7 @@ describe("buildServer", () => {
     const config: AppConfig = {
       host: "0.0.0.0",
       port: 3001,
+      trustedOrigins: ["http://127.0.0.1:3001", "http://localhost"],
       logLevel: "info",
       allowedRoots: [root],
       asrUrl: "http://127.0.0.1:7810",
@@ -5198,6 +5406,7 @@ describe("buildServer", () => {
     const config: AppConfig = {
       host: "0.0.0.0",
       port: 3001,
+      trustedOrigins: ["http://127.0.0.1:3001", "http://localhost"],
       logLevel: "info",
       allowedRoots: [root],
       asrUrl: "http://127.0.0.1:7810",
@@ -5253,6 +5462,7 @@ describe("buildServer", () => {
     const config: AppConfig = {
       host: "0.0.0.0",
       port: 3001,
+      trustedOrigins: ["http://127.0.0.1:3001", "http://localhost"],
       logLevel: "info",
       allowedRoots: [root],
       asrUrl: "http://127.0.0.1:7810",
@@ -5443,6 +5653,7 @@ describe("buildServer", () => {
       const address = app.server.address() as { port: number };
       client = new WebSocket(
         `ws://127.0.0.1:${address.port}/ws/voice/audio?filename=voice.webm`,
+        { headers: { host: "localhost" } },
       );
       await new Promise<void>((resolve, reject) => {
         client!.once("open", resolve);
@@ -5490,6 +5701,7 @@ describe("buildServer", () => {
       const config: AppConfig = {
         host: "127.0.0.1",
         port: 0,
+        trustedOrigins: ["http://localhost"],
         logLevel: "info",
         allowedRoots: [root],
         asrUrl: "http://127.0.0.1:7810",
@@ -5536,6 +5748,7 @@ describe("buildServer", () => {
         const address = app.server.address() as { port: number };
         client = new WebSocket(
           `ws://127.0.0.1:${address.port}/ws/voice/audio?filename=voice.webm`,
+          { headers: { host: "localhost" } },
         );
         await new Promise<void>((resolve, reject) => {
           client!.once("open", resolve);
@@ -5569,6 +5782,7 @@ describe("buildServer", () => {
     const config: AppConfig = {
       host: "127.0.0.1",
       port: 0,
+      trustedOrigins: ["http://localhost"],
       logLevel: "info",
       allowedRoots: [root],
       asrUrl: "http://127.0.0.1:7810",
@@ -5636,6 +5850,7 @@ describe("buildServer", () => {
       const address = app.server.address() as { port: number };
       client = new WebSocket(
         `ws://127.0.0.1:${address.port}/ws/voice/audio?filename=voice.webm`,
+        { headers: { host: "localhost" } },
       );
       await new Promise<void>((resolve, reject) => {
         client!.once("open", resolve);
@@ -5676,6 +5891,7 @@ describe("buildServer", () => {
     const config: AppConfig = {
       host: "0.0.0.0",
       port: 3001,
+      trustedOrigins: ["http://127.0.0.1:3001", "http://localhost"],
       logLevel: "info",
       allowedRoots: [root],
       asrUrl: "http://127.0.0.1:7810",
@@ -5739,6 +5955,7 @@ function testConfig(root: string): AppConfig {
   return {
     host: "0.0.0.0",
     port: 3001,
+    trustedOrigins: ["http://127.0.0.1:3001", "http://localhost"],
     logLevel: "info",
     allowedRoots: [root],
     asrUrl: "http://127.0.0.1:7810",

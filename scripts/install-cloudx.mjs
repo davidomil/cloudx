@@ -663,10 +663,9 @@ export async function ensureSupportedGit(commands, prompt) {
     true,
   );
   if (!upgradeGit) {
-    console.log(
-      "Continuing without upgrading Git. The Worktree Manager will fail until Git is upgraded to 2.36.0 or newer.",
+    throw new Error(
+      `Cloudx requires Git ${MIN_WORKTREE_GIT_VERSION} or newer; the unsupported Git upgrade was declined.`,
     );
-    return { upgraded: false, versionText: versionText.trim(), skipped: true };
   }
 
   installGitCorePpa(commands);

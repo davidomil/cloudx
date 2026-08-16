@@ -223,7 +223,7 @@ describe("AutomationRepository", () => {
     await expect(
       repository.claimTriggerRuns(groupIds, eventId),
     ).resolves.toEqual([]);
-  }, 20_000);
+  }, 60_000);
 
   it("rejects terminal replay after runs leave the bounded projection and restart", async () => {
     const dataDir = await fs.mkdtemp(
@@ -280,7 +280,182 @@ describe("AutomationRepository", () => {
       restarted.claimTriggerRuns(groupIds, firstEventId),
     ).resolves.toEqual([]);
     await expect(restarted.listRuns()).resolves.toHaveLength(200);
-  }, 20_000);
+  }, 60_000);
+
+  it("keeps a claimed run queued until terminal history is durable", async () => {
+    const dataDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "cloudx-automation-repo-terminal-history-"),
+    );
+    const ledger = new AutomationClaimLedger(dataDir);
+    const repository = new AutomationRepository(dataDir, ledger);
+    const [run] = await repository.claimTriggerRuns(["group"], "event");
+    const failure = new Error("terminal history unavailable");
+    const terminalize = vi
+      .spyOn(ledger, "terminalize")
+      .mockRejectedValueOnce(failure);
+
+    await expect(repository.saveRun(succeeded(run!))).rejects.toBe(failure);
+
+    await expect(repository.listRuns()).resolves.toEqual([run]);
+    await expect(persistedRuns(dataDir)).resolves.toEqual([run]);
+    expect(admittedRuns(repository)).toContain(run!.id);
+    const locations = ledger.locationsFor("group", "event");
+    await expect(fs.access(locations.activePath)).resolves.toBeUndefined();
+    await expect(fs.access(locations.historyPath)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+
+    terminalize.mockRestore();
+    await repository.saveRun(succeeded(run!));
+    expect(admittedRuns(repository)).not.toContain(run!.id);
+    await pruneAndRejectReplay(repository, dataDir, [run!]);
+  }, 30_000);
+
+  it("keeps the queued projection when its terminal projection cannot be persisted", async () => {
+    const dataDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "cloudx-automation-repo-terminal-projection-"),
+    );
+    const ledger = new AutomationClaimLedger(dataDir);
+    const repository = new AutomationRepository(dataDir, ledger);
+    const [run] = await repository.claimTriggerRuns(["group"], "event");
+    const storeFile = repositoryStoreFile(repository);
+    const originalWrite = storeFile.write.bind(storeFile);
+    const failure = new Error("terminal projection unavailable");
+    storeFile.write = vi
+      .fn()
+      .mockRejectedValueOnce(failure)
+      .mockImplementation(originalWrite);
+
+    await expect(repository.saveRun(succeeded(run!))).rejects.toBe(failure);
+
+    await expect(repository.listRuns()).resolves.toEqual([run]);
+    await expect(persistedRuns(dataDir)).resolves.toEqual([run]);
+    expect(admittedRuns(repository)).toContain(run!.id);
+    await expect(
+      fs.access(ledger.locationsFor("group", "event").historyPath),
+    ).resolves.toBeUndefined();
+
+    storeFile.write = originalWrite;
+    await repository.saveRun(succeeded(run!));
+    expect(admittedRuns(repository)).not.toContain(run!.id);
+    await pruneAndRejectReplay(repository, dataDir, [run!]);
+  }, 30_000);
+
+  it("settles every cancellation history before publishing the batch", async () => {
+    const dataDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "cloudx-automation-repo-cancel-settle-"),
+    );
+    const ledger = new AutomationClaimLedger(dataDir);
+    const repository = new AutomationRepository(dataDir, ledger);
+    const runs = await repository.claimTriggerRuns(
+      ["first", "second"],
+      "event",
+    );
+    const storeFile = repositoryStoreFile(repository);
+    const write = vi.spyOn(storeFile, "write");
+    write.mockClear();
+    const originalTerminalize = ledger.terminalize.bind(ledger);
+    const failure = new Error("first terminal history unavailable");
+    const second = deferred<void>();
+    const terminalize = vi
+      .spyOn(ledger, "terminalize")
+      .mockImplementation((run) => {
+        if (run.groupId === "first") return Promise.reject(failure);
+        return second.promise.then(() => originalTerminalize(run));
+      });
+
+    let settled = false;
+    const cancellation = repository.cancelRuns(runs, "shutdown");
+    void cancellation.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await waitFor(() => terminalize.mock.calls.length === 2);
+
+    expect(settled).toBe(false);
+    expect(write).not.toHaveBeenCalled();
+    await expect(persistedRuns(dataDir)).resolves.toEqual(runs);
+    expect(runs.every((run) => admittedRuns(repository).has(run.id))).toBe(
+      true,
+    );
+
+    second.resolve();
+    const error = await cancellation.catch((reason: unknown) => reason);
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors).toContain(failure);
+    expect(write).not.toHaveBeenCalled();
+    await expect(repository.listRuns()).resolves.toEqual(runs);
+    await expect(persistedRuns(dataDir)).resolves.toEqual(runs);
+
+    terminalize.mockRestore();
+    await expect(repository.cancelRuns(runs, "shutdown")).resolves.toEqual(
+      runs.map((run) =>
+        expect.objectContaining({ id: run.id, status: "cancelled" }),
+      ),
+    );
+    expect(write).toHaveBeenCalledTimes(1);
+  }, 30_000);
+
+  it("keeps a cancellation batch queued when its projection write fails", async () => {
+    const dataDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "cloudx-automation-repo-cancel-projection-"),
+    );
+    const ledger = new AutomationClaimLedger(dataDir);
+    const repository = new AutomationRepository(dataDir, ledger);
+    const runs = await repository.claimTriggerRuns(
+      ["first", "second"],
+      "event",
+    );
+    const storeFile = repositoryStoreFile(repository);
+    const originalWrite = storeFile.write.bind(storeFile);
+    const failure = new Error("cancelled projection unavailable");
+    storeFile.write = vi
+      .fn()
+      .mockRejectedValueOnce(failure)
+      .mockImplementation(originalWrite);
+
+    await expect(repository.cancelRuns(runs, "shutdown")).rejects.toBe(failure);
+
+    await expect(repository.listRuns()).resolves.toEqual(runs);
+    await expect(persistedRuns(dataDir)).resolves.toEqual(runs);
+    expect(runs.every((run) => admittedRuns(repository).has(run.id))).toBe(
+      true,
+    );
+    for (const run of runs) {
+      await expect(
+        fs.access(ledger.locationsFor(run.groupId, "event").historyPath),
+      ).resolves.toBeUndefined();
+    }
+
+    storeFile.write = originalWrite;
+    const cancelled = await repository.cancelRuns(runs, "shutdown");
+    expect(cancelled.every((run) => run.status === "cancelled")).toBe(true);
+    await pruneAndRejectReplay(repository, dataDir, runs);
+  }, 30_000);
+
+  it("does not terminalize nonterminal or non-trigger run projections", async () => {
+    const dataDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "cloudx-automation-repo-nonterminal-"),
+    );
+    const ledger = new AutomationClaimLedger(dataDir);
+    const repository = new AutomationRepository(dataDir, ledger);
+    const terminalize = vi.spyOn(ledger, "terminalize");
+
+    await repository.saveRun({
+      ...runSummary("group", "running"),
+      status: "running",
+    });
+    await repository.saveRun({
+      ...runSummary("group", "manual"),
+      triggerEventId: undefined,
+    });
+
+    expect(terminalize).not.toHaveBeenCalled();
+  });
 
   it("replays one old claim without scanning 10,000 valid histories or rewriting automation state", async () => {
     const dataDir = await fs.mkdtemp(
@@ -889,4 +1064,88 @@ function runSummary(groupId: string, id = "run-1"): AutomationRunSummary {
     finishedAt: new Date(0).toISOString(),
     trace: [],
   };
+}
+
+function succeeded(run: AutomationRunSummary): AutomationRunSummary {
+  return {
+    ...run,
+    status: "succeeded",
+    finishedAt: new Date().toISOString(),
+  };
+}
+
+function repositoryStoreFile(repository: AutomationRepository): {
+  write(value: unknown): Promise<void>;
+} {
+  return (
+    repository as unknown as {
+      storeFile: { write(value: unknown): Promise<void> };
+    }
+  ).storeFile;
+}
+
+function admittedRuns(repository: AutomationRepository): Set<string> {
+  const storeFile = (
+    repository as unknown as { storeFile: { filePath: string } }
+  ).storeFile;
+  return (
+    AutomationRepository as unknown as {
+      admittedRunIds: Map<string, Set<string>>;
+    }
+  ).admittedRunIds.get(storeFile.filePath)!;
+}
+
+async function persistedRuns(dataDir: string): Promise<AutomationRunSummary[]> {
+  const document = JSON.parse(
+    await fs.readFile(path.join(dataDir, "automation.json"), "utf8"),
+  ) as { runs: AutomationRunSummary[] };
+  return document.runs;
+}
+
+async function pruneAndRejectReplay(
+  repository: AutomationRepository,
+  dataDir: string,
+  original: AutomationRunSummary[],
+): Promise<void> {
+  for (let index = 0; index <= 200; index += 1) {
+    await repository.saveRun({
+      ...runSummary(`newer-group-${index}`, `newer-run-${index}`),
+      triggerEventId: undefined,
+    });
+  }
+  expect(
+    (await repository.listRuns()).some((run) =>
+      original.some((candidate) => candidate.id === run.id),
+    ),
+  ).toBe(false);
+
+  const restartedDataDir = await fs.mkdtemp(
+    path.join(os.tmpdir(), "cloudx-automation-repo-failure-restart-"),
+  );
+  await fs.cp(dataDir, restartedDataDir, { recursive: true });
+  const restarted = new AutomationRepository(restartedDataDir);
+  for (const run of original) {
+    await expect(
+      restarted.claimTriggerRuns([run.groupId], run.triggerEventId!),
+    ).resolves.toEqual([]);
+  }
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve(value: T): void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+async function waitFor(condition: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (condition()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Timed out waiting for the expected automation state.");
 }

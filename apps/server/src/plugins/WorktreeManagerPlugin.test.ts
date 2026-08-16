@@ -18,11 +18,12 @@ import { PathPolicy } from "../pathPolicy.js";
 import { PluginRegistry } from "../pluginRegistry.js";
 import { SessionStore } from "../sessionStore.js";
 import { TriggerRegistry } from "../triggers/TriggerRegistry.js";
+import { WorktreeService } from "../git/WorktreeService.js";
 import { WorktreeManagerPlugin } from "./WorktreeManagerPlugin.js";
 
 describe("WorktreeManagerPlugin", () => {
   it("describes a creatable directory-backed worktree panel with safe voice actions", () => {
-    const plugin = new WorktreeManagerPlugin();
+    const plugin = new WorktreeManagerPlugin(new FakeWorktreeService() as never);
 
     expect(plugin.descriptor()).toMatchObject({
       id: "worktree-manager",
@@ -56,7 +57,7 @@ describe("WorktreeManagerPlugin", () => {
 
   it("returns project state and exposes it through voice context", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-wt-plugin-"));
-    const session = new WorktreeManagerPlugin().createSession({
+    const session = new WorktreeManagerPlugin(new WorktreeService(new PathPolicy([root]))).createSession({
       tab: tab(root),
       cwd: root,
       controls: { setTabIndicator: () => undefined, closeTab: () => undefined }

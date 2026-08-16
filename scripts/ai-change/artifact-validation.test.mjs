@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { validateArtifact } from "./artifact-validation.mjs";
 
@@ -202,6 +202,12 @@ describe("AI change artifacts", () => {
     'node -e \'fetch("https://"+"api.github.com/repos/davidomil/cloudx")\'',
     'node -e \'process.mainModule.require("node:child_process").execFileSync("git", ["push"])\'',
     'python -c \'subprocess.run(["gh", "pr", "merge", "1"])\'',
+    "node scripts/ai-change/github/classify-pr.mjs",
+    "npm run lint -- --fix",
+    "npx prettier --check scripts/ai-change/artifact-validation.mjs --write",
+    "npm test -- --update",
+    "npx tsc --build --clean",
+    "git diff --output=changed.patch HEAD",
   ])("rejects mutation command %s at both artifact boundaries", (command) => {
     const plan = validPlan();
     plan.verification = [command];
@@ -218,8 +224,13 @@ describe("AI change artifacts", () => {
     "git diff --check HEAD^..HEAD",
     "node scripts/install-cloudx.mjs --dry-run --yes",
     "services/asr/.venv/bin/python -m pytest services/asr/tests",
-    'node --input-type=module -e \'import {execFileSync} from "node:child_process"; execFileSync("git",["rev-parse","HEAD"]);\'',
-    'test -z "$(git diff --name-only HEAD^..HEAD -- .github)"',
+    "PYTHONPATH=services/asr/src services/asr/.venv/bin/python -m pytest services/asr/tests -q",
+    "npx vitest run scripts/ai-change/artifact-validation.test.mjs",
+    "npx vitest run apps/server/src/jira/JiraPollingService.test.ts apps/server/src/server.test.ts apps/server/src/automation/AutomationExecutor.test.ts apps/server/src/sessionStore.test.ts apps/server/src/documentation/DocumentationIngestQueue.test.ts apps/server/src/documentation/DocumentationUploadSpool.test.ts apps/server/src/documentation/DocumentationEnrichmentService.test.ts",
+    "npx vitest run scripts/install-cloudx.test.mjs apps/web/src/ui/workspaceWriteCoordinator.test.ts",
+    "npx prettier --check docs/SECURITY_MODEL.md docs/SETUP.md tests/browser/cloudx-smoke.spec.ts",
+    "npx playwright test tests/browser/cloudx-smoke.spec.ts",
+    "npm run typecheck -- --pretty false",
   ])("accepts recognized local read-only command %s", (command) => {
     const plan = validPlan();
     plan.verification = [command];
@@ -230,20 +241,80 @@ describe("AI change artifacts", () => {
     ).toEqual(validVerification(command));
   });
 
+  it.each([
+    "node scripts/ai-change/validate-process.mjs $(git status)",
+    "node scripts/ai-change/validate-process.mjs ${HOME}",
+    "node scripts/ai-change/validate-process.mjs $HOME",
+    "node scripts/ai-change/validate-process.mjs $((1+1))",
+    "node scripts/ai-change/validate-process.mjs <(git status)",
+    "node scripts/ai-change/validate-process.mjs >(git status)",
+    "node scripts/ai-change/validate-process.mjs `git status`",
+    'node scripts/ai-change/validate-process.mjs "literal"',
+    "node scripts/ai-change/validate-process.mjs 'nested\"quote'",
+    "node scripts/ai-change/validate-process.mjs *.mjs",
+    "node scripts/ai-change/validate-process.mjs file?.mjs",
+    "node scripts/ai-change/validate-process.mjs [ab].mjs",
+    "node scripts/ai-change/validate-process.mjs {a,b}.mjs",
+    "node scripts/ai-change/validate-process.mjs ~",
+    "node scripts/ai-change/validate-process.mjs; npm run lint",
+    "node scripts/ai-change/validate-process.mjs | npm run lint",
+    "node scripts/ai-change/validate-process.mjs && npm run lint",
+    "node scripts/ai-change/validate-process.mjs > output",
+    "node scripts/ai-change/validate-process.mjs\\\nnpm run lint",
+    "node scripts/ai-change/validate-process.mjs (npm run lint)",
+  ])("rejects nonliteral command syntax %s at both boundaries", (command) => {
+    const plan = validPlan();
+    plan.verification = [command];
+
+    expect(() => validateArtifact("plan", plan)).toThrow(/read-only/i);
+    expect(() =>
+      validateArtifact("verification", validVerification(command)),
+    ).toThrow(/read-only/i);
+  });
+
   it("rejects an unsafe accepted plan before dispatching a command", () => {
     const plan = validPlan();
     plan.verification = [
       "git -c credential.helper= push origin HEAD:candidate",
     ];
-    const dispatched = [];
-    const dispatchAcceptedPlan = (candidate, runner) => {
+    const dependencies = {
+      runner: vi.fn(),
+      source: vi.fn(),
+      process: vi.fn(),
+    };
+    const dispatchAcceptedPlan = (candidate) => {
       validateArtifact("plan", candidate);
-      return candidate.verification.map(runner);
+      dependencies.source();
+      dependencies.process();
+      return candidate.verification.map(dependencies.runner);
     };
 
-    expect(() =>
-      dispatchAcceptedPlan(plan, (command) => dispatched.push(command)),
-    ).toThrow(/read-only/i);
-    expect(dispatched).toEqual([]);
+    expect(() => dispatchAcceptedPlan(plan)).toThrow(/read-only/i);
+    expect(dependencies.runner).not.toHaveBeenCalled();
+    expect(dependencies.source).not.toHaveBeenCalled();
+    expect(dependencies.process).not.toHaveBeenCalled();
+  });
+
+  it("accepts the later full verification sequence without broadening its argument surface", () => {
+    const commands = [
+      "node scripts/ai-change/validate-process.mjs",
+      "npm run format:check",
+      "npm run lint",
+      "npm run typecheck -- --pretty false",
+      "npm run test:coverage",
+      "npm run build",
+      "services/asr/.venv/bin/python -m pytest services/asr/tests",
+      "services/documentation-indexer/.venv/bin/python -m pytest services/documentation-indexer/tests",
+      "npx playwright test tests/browser/cloudx-smoke.spec.ts",
+    ];
+    const plan = validPlan();
+    plan.verification = commands;
+
+    expect(validateArtifact("plan", plan)).toEqual(plan);
+    for (const command of commands) {
+      expect(
+        validateArtifact("verification", validVerification(command)),
+      ).toEqual(validVerification(command));
+    }
   });
 });

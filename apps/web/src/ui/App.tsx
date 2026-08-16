@@ -181,6 +181,7 @@ export function App() {
   const [tabSettings, setTabSettings] = useState<{ tabId: string; sectionId?: string } | undefined>();
   const [createTargetPaneId, setCreateTargetPaneId] = useState<string | undefined>();
   const [error, setError] = useState<string | undefined>();
+  const [layoutPersistenceError, setLayoutPersistenceError] = useState<string | undefined>();
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("checking");
   const [voiceState, setVoiceState] = useState<"idle" | "recording" | "processing">("idle");
   const [voiceMessage, setVoiceMessage] = useState<string | undefined>();
@@ -209,16 +210,22 @@ export function App() {
   const pendingLayoutPersistWindowIdRef = useRef<string | undefined>(undefined);
   const pendingLayoutBaseRef = useRef<TabLayoutState | undefined>(undefined);
   const pendingLayoutPersistRef = useRef<TabLayoutState | undefined>(undefined);
+  const layoutPersistenceErrorRef = useRef<string | undefined>(undefined);
   const workspaceWritesRef = useRef<WorkspaceWriteCoordinator | undefined>(undefined);
   workspaceWritesRef.current ??= new WorkspaceWriteCoordinator(
     async (windowId, persistedLayout) => {
       await updateWindow(windowId, { layout: persistedLayout });
       if (pendingLayoutPersistWindowIdRef.current === windowId && pendingLayoutPersistRef.current === persistedLayout) {
         clearPendingLayoutPersistence();
+        resolveLayoutPersistenceError();
       }
     },
     200,
-    (err) => setError(err instanceof Error ? err.message : String(err))
+    (err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      layoutPersistenceErrorRef.current = message;
+      setLayoutPersistenceError(message);
+    }
   );
   const workspaceWrites = workspaceWritesRef.current;
   const audioSessionRef = useRef<VoiceAudioStreamSession | undefined>(undefined);
@@ -433,9 +440,18 @@ export function App() {
   }, [loadRulesSkillsStore]);
 
   function applyWorkspaceState(state: WorkspaceStateResponse, options: { preservePendingLayout?: boolean } = {}) {
-    const pendingMerge = options.preservePendingLayout ? workspaceStateWithPreservedLayout(state, layoutRef.current, pendingLayoutPersistWindowIdRef.current, pendingLayoutBaseRef.current, activeTabIdRef.current) : undefined;
-    if (pendingMerge?.decision === "accepted-server") {
+    let pendingMerge = options.preservePendingLayout ? workspaceStateWithPreservedLayout(state, layoutRef.current, pendingLayoutPersistWindowIdRef.current, pendingLayoutBaseRef.current, activeTabIdRef.current) : undefined;
+    const incomingPendingWindow = state.windows.find((window) => window.id === pendingLayoutPersistWindowIdRef.current);
+    const pendingLayout = pendingLayoutPersistRef.current;
+    const serverPersistedPendingLayout = incomingPendingWindow && pendingLayout ? tabLayoutsEqual(incomingPendingWindow.layout, pendingLayout) : false;
+    if (pendingMerge?.decision === "accepted-server" && (workspaceWrites.hasUnsettledLayoutWrite() || layoutPersistenceErrorRef.current !== undefined) && !serverPersistedPendingLayout) {
+      pendingMerge = workspaceStateWithPreservedLayout(state, layoutRef.current, pendingLayoutPersistWindowIdRef.current, undefined, activeTabIdRef.current);
+    }
+    if (pendingMerge?.decision === "accepted-server" && (layoutPersistenceErrorRef.current === undefined || serverPersistedPendingLayout)) {
       clearPendingLayoutPersistence();
+      if (serverPersistedPendingLayout) {
+        resolveLayoutPersistenceError();
+      }
     }
     const effectiveState = pendingMerge?.state ?? state;
     const nextLayout = effectiveState.windows.find((window) => window.id === effectiveState.activeWindowId)?.layout ?? effectiveState.windows[0]?.layout ?? defaultLayout();
@@ -585,6 +601,11 @@ export function App() {
     pendingLayoutPersistWindowIdRef.current = undefined;
     pendingLayoutBaseRef.current = undefined;
     pendingLayoutPersistRef.current = undefined;
+  }
+
+  function resolveLayoutPersistenceError() {
+    layoutPersistenceErrorRef.current = undefined;
+    setLayoutPersistenceError(undefined);
   }
 
   function updateLayout(updater: (current: TabLayoutState) => TabLayoutState) {
@@ -1328,7 +1349,7 @@ export function App() {
         </div>
       </header>
 
-      {error ? <div className="error-banner">{error}</div> : null}
+      {layoutPersistenceError ?? error ? <div className="error-banner">{layoutPersistenceError ?? error}</div> : null}
       {notificationToastIds.size ? <NotificationStack notifications={notifications.filter((notification) => notificationToastIds.has(notification.id))} onDismiss={dismissNotificationToast} /> : null}
 
       <section className={`pane-root${maximizedPaneId ? " maximized" : ""}`}>

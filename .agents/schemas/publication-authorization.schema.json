@@ -43,7 +43,7 @@
     "policy_sha256": { "$ref": "#/$defs/sha256" },
     "credential_token_sha256": { "$ref": "#/$defs/sha256" },
     "credential_mode": {
-      "enum": ["automated-app", "attended-user"]
+      "const": "attended-user"
     },
     "local_change_base_sha": { "$ref": "#/$defs/gitSha" },
     "planning_head_sha": { "$ref": "#/$defs/gitSha" },
@@ -58,31 +58,8 @@
     "pr_head_ref_name": { "const": "architecture-and-new-codex" },
     "pr_head_ref_oid": { "$ref": "#/$defs/gitSha" },
     "same_repository": { "const": true },
-    "principal": {
-      "oneOf": [
-        { "$ref": "#/$defs/automatedAppPrincipal" },
-        { "$ref": "#/$defs/attendedUserPrincipal" }
-      ]
-    }
+    "principal": { "$ref": "#/$defs/attendedUserPrincipal" }
   },
-  "allOf": [
-    {
-      "if": {
-        "properties": { "credential_mode": { "const": "automated-app" } },
-        "required": ["credential_mode"]
-      },
-      "then": {
-        "properties": {
-          "principal": { "$ref": "#/$defs/automatedAppPrincipal" }
-        }
-      },
-      "else": {
-        "properties": {
-          "principal": { "$ref": "#/$defs/attendedUserPrincipal" }
-        }
-      }
-    }
-  ],
   "$defs": {
     "gitSha": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
     "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
@@ -97,45 +74,6 @@
       "minLength": 1,
       "maxLength": 39,
       "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$"
-    },
-    "automatedAppPrincipal": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "kind",
-        "app_id",
-        "installation_id",
-        "app_slug",
-        "repository_selection",
-        "repositories",
-        "permissions",
-        "private_controller_grant_id"
-      ],
-      "properties": {
-        "kind": { "const": "github-app-installation" },
-        "app_id": { "type": "integer", "minimum": 1 },
-        "installation_id": { "type": "integer", "minimum": 1 },
-        "app_slug": { "$ref": "#/$defs/login" },
-        "repository_selection": { "const": "selected" },
-        "repositories": {
-          "type": "array",
-          "prefixItems": [{ "const": "davidomil/cloudx" }],
-          "items": false,
-          "minItems": 1,
-          "maxItems": 1
-        },
-        "permissions": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["contents", "pull_requests", "metadata"],
-          "properties": {
-            "contents": { "const": "write" },
-            "pull_requests": { "const": "read" },
-            "metadata": { "const": "read" }
-          }
-        },
-        "private_controller_grant_id": { "$ref": "#/$defs/identifier" }
-      }
     },
     "attendedUserPrincipal": {
       "type": "object",

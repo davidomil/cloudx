@@ -7,18 +7,23 @@ import { describe, expect, it } from "vitest";
 import { parseDocument } from "yaml";
 
 import {
+  GATE_B_ALLOWED_PATH_COUNT,
   GATE_B_LOCAL_CHANGE_BASE_SHA,
   GATE_B_PLANNING_HEAD_SHA,
   GATE_B_POLICY_SHA256,
   GATE_B_REVIEW_ROLES,
+  validateAttendedCommitContractSources,
   validateGateBArtifactBundle,
+  validateGateBRemediationCycleSources,
   validatePolicyReferences,
   validateProcess,
   validatePublicationContractSources,
   validateVerificationCommands,
+  validateVerifierConsumerSources,
   validateVerifierBuildContext,
   validateWorkflow,
 } from "./validate-process.mjs";
+import { displayCommand, verificationPlan, verifyChange } from "./verify.mjs";
 
 describe("public repository AI process validation", () => {
   it("accepts the checked-in public policy, skills, schemas, and workflows", async () => {
@@ -182,6 +187,573 @@ jobs:
       "Verification command must be read-only and local: git push origin HEAD:refs/heads/candidate",
       "Verification command must be read-only and local: gh pr comment 1 --body reviewed",
     ]);
+  });
+
+  it("requires every tracked verifier consumer to use the silent plan-aware full entry", () => {
+    const sources = rawVerifierConsumerSources();
+    expect(validateVerifierConsumerSources(sources, [])).toEqual([]);
+
+    const cases = [
+      [
+        "package",
+        (value) => value.replace("verify.mjs", "verify.mjs --scope full"),
+      ],
+      [
+        "workflow",
+        (value) =>
+          value.replace(
+            "node scripts/ai-change/validate-process.mjs",
+            "npm run verify:policy",
+          ),
+      ],
+      [
+        "root",
+        (value) =>
+          value.replaceAll("npm run --silent verify", "npm run verify"),
+      ],
+      [
+        "verifierSkill",
+        (value) =>
+          value.replace("npm run --silent verify", "npm --silent run verify"),
+      ],
+      [
+        "process",
+        (value) =>
+          value.replaceAll(
+            "npm run --silent verify",
+            "npm run --slient verify",
+          ),
+      ],
+      [
+        "testingMap",
+        (value) => value.replace("npm run --silent verify", "npm run verify"),
+      ],
+      ["root", (value) => value.replace(" -- --plan", "")],
+      ["verifierSkill", (value) => value.replace(" --base-sha", " --base")],
+      ["process", (value) => value.replaceAll(" --head-sha", " --head")],
+      ["testingMap", (value) => value.replace(" -- --plan", "")],
+      [
+        "verifier",
+        (value) =>
+          value.replace(
+            'validateArtifact("plan", acceptedPlan)',
+            "acceptedPlan",
+          ),
+      ],
+      [
+        "verifier",
+        (value) => value.replace('scope: "full"', "scope: options.scope"),
+      ],
+      [
+        "verifier",
+        (value) =>
+          value.replace(
+            "process.stdout.write(rendered);",
+            "await fs.writeFile(options.output, rendered);",
+          ),
+      ],
+    ];
+    for (const [name, mutate] of cases) {
+      expect(
+        validateVerifierConsumerSources(
+          { ...sources, [name]: mutate(sources[name]) },
+          [],
+        ),
+        name,
+      ).not.toEqual([]);
+    }
+  });
+
+  it("requires every attended commit handoff to preserve the exact candidate boundary", () => {
+    const sources = rawPublicationContractSources();
+    expect(validateAttendedCommitContractSources(sources, [])).toEqual([]);
+
+    const cases = [
+      [
+        "root",
+        (value) =>
+          value.replace(
+            "216e6d739155aa1dc5bab11829f56869e6f494ff",
+            "0000000000000000000000000000000000000000",
+          ),
+      ],
+      ["orchestrator", (value) => value.replace("git add --", "git add -A")],
+      [
+        "process",
+        (value) =>
+          value.replace("implementation.changed_files", "implementation.files"),
+      ],
+      [
+        "implement",
+        (value) =>
+          value.replace(
+            "POLICY: harden Gate B publication boundary",
+            "POLICY: update Gate B",
+          ),
+      ],
+      ["root", (value) => value.replaceAll("118-path", "113-path")],
+      [
+        "orchestrator",
+        (value) =>
+          value.replace("credential-free environment", "ambient environment"),
+      ],
+      [
+        "process",
+        (value) => value.replace("fatal UTF-8 decoder", "UTF-8 decoder"),
+      ],
+      [
+        "root",
+        (value) =>
+          value.replace(
+            "`GIT_NO_REPLACE_OBJECTS=1` disables replacement refs",
+            "replacement refs may remain enabled",
+          ),
+      ],
+    ];
+    for (const [name, mutate] of cases) {
+      expect(
+        validateAttendedCommitContractSources(
+          { ...sources, [name]: mutate(sources[name]) },
+          [],
+        ),
+        name,
+      ).not.toEqual([]);
+    }
+  });
+
+  it("binds the attended candidate-tip-3 amend to exactly nine remediation paths", () => {
+    const sources = rawPublicationContractSources();
+    const paths = [
+      ".agents/skills/change-orchestrator/SKILL.md",
+      ".agents/skills/implement-change/SKILL.md",
+      ".agents/skills/verify-change/SKILL.md",
+      "AGENTS.md",
+      "docs/AI_CHANGE_PROCESS.md",
+      "docs/architecture/testing-map.md",
+      "scripts/ai-change/validate-process.mjs",
+      "scripts/ai-change/validate-process.test.mjs",
+      "scripts/ai-change/verify.test.mjs",
+    ];
+
+    expect(validateGateBRemediationCycleSources(sources, [])).toEqual([]);
+    for (const sourceName of ["root", "orchestrator", "process", "implement"]) {
+      for (const remediationPath of paths) {
+        expect(
+          sources[sourceName],
+          `${sourceName}: ${remediationPath}`,
+        ).toContain(`\`${remediationPath}\``);
+      }
+      expect(sources[sourceName], sourceName).not.toMatch(
+        /\bexact eleven(?:-path)?\b/iu,
+      );
+    }
+
+    const cases = [
+      [
+        "root",
+        (value) =>
+          value.replace("`.agents/skills/verify-change/SKILL.md`, ", ""),
+      ],
+      [
+        "orchestrator",
+        (value) =>
+          value.replace(
+            "`docs/architecture/testing-map.md`",
+            "`docs/architecture/unknown-map.md`",
+          ),
+      ],
+      [
+        "process",
+        (value) =>
+          value.replace(
+            "`scripts/ai-change/verify.test.mjs`.",
+            "`scripts/ai-change/verify.test.mjs`, `package.json`.",
+          ),
+      ],
+      [
+        "implement",
+        (value) =>
+          value.replace(
+            "`scripts/ai-change/validate-process.mjs`",
+            "`scripts/ai-change/validate-process.mjs`, `scripts/ai-change/validate-process.mjs`",
+          ),
+      ],
+      [
+        "root",
+        (value) =>
+          value.replace(
+            "exact nine remediation paths",
+            "exact eleven remediation paths",
+          ),
+      ],
+    ];
+    for (const [name, mutate] of cases) {
+      expect(
+        validateGateBRemediationCycleSources(
+          { ...sources, [name]: mutate(sources[name]) },
+          [],
+        ),
+        name,
+      ).not.toEqual([]);
+    }
+  });
+
+  it("requires a bounded pre-publication remediation cycle and attended same-parent amend", () => {
+    const sources = rawPublicationContractSources();
+    expect(validateGateBRemediationCycleSources(sources, [])).toEqual([]);
+
+    const cases = [
+      [
+        "orchestrator",
+        (value) =>
+          value.replace(
+            "at most three candidate tips",
+            "at most four candidate tips",
+          ),
+      ],
+      [
+        "root",
+        (value) =>
+          value.replace(
+            "counts as candidate tip 1",
+            "does not count toward the ceiling",
+          ),
+      ],
+      ["process", (value) => value.replace(/does not\s+reset/gu, "resets")],
+      [
+        "orchestrator",
+        (value) =>
+          value.replace(
+            "terminally to `blocked`",
+            "to another remediation cycle",
+          ),
+      ],
+      [
+        "root",
+        (value) =>
+          value.replace(
+            "Before authorization or publication begins",
+            "After authorization begins",
+          ),
+      ],
+      [
+        "process",
+        (value) =>
+          value.replaceAll("git commit --amend --no-edit", "git commit"),
+      ],
+      [
+        "orchestrator",
+        (value) =>
+          value.replace(
+            /clean tracked worktree\s+baseline/gu,
+            "tracked worktree",
+          ),
+      ],
+      [
+        "root",
+        (value) =>
+          value.replaceAll("exact nine remediation paths", "remediation paths"),
+      ],
+      ["process", (value) => value.replace("63-path", "61-path")],
+      [
+        "orchestrator",
+        (value) =>
+          value.replace(
+            "dd08cb93283abf5c1341ed3db13506da4f912423e11a51cf90ef8358404e0325",
+            "00".repeat(32),
+          ),
+      ],
+      [
+        "implement",
+        (value) =>
+          value.replace("git commit --amend --no-edit", "git commit --amend"),
+      ],
+    ];
+
+    for (const [name, mutate] of cases) {
+      expect(
+        validateGateBRemediationCycleSources(
+          { ...sources, [name]: mutate(sources[name]) },
+          [],
+        ),
+        name,
+      ).not.toEqual([]);
+    }
+  });
+
+  it("requires complete candidate-bound evidence regeneration before authorization", () => {
+    const sources = rawPublicationContractSources();
+    const invalidatedArtifacts = [
+      "plan",
+      "plan-review",
+      "implementation",
+      "verification",
+      "selected area-review",
+      "aggregate-review",
+      "final-bundle",
+      "authorization",
+    ];
+
+    for (const artifact of invalidatedArtifacts) {
+      const mutated = {
+        ...sources,
+        orchestrator: sources.orchestrator.replace(
+          `\`${artifact}\``,
+          `\`reusable-${artifact}\``,
+        ),
+      };
+      expect(
+        validateGateBRemediationCycleSources(mutated, []),
+        artifact,
+      ).not.toEqual([]);
+    }
+
+    const cases = [
+      [
+        "root",
+        (value) => value.replace("118-path/75-claim", "11-path/8-claim"),
+      ],
+      [
+        "process",
+        (value) =>
+          value.replace("full canonical verification", "focused verification"),
+      ],
+      [
+        "orchestrator",
+        (value) =>
+          value.replace(
+            "all fresh policy-selected area reviews",
+            "some area reviews",
+          ),
+      ],
+      [
+        "root",
+        (value) => value.replace(/final bounded\s+15-file bundle/gu, "bundle"),
+      ],
+      [
+        "process",
+        (value) =>
+          value.replace(
+            "No remediation cycle exists after",
+            "A remediation cycle may continue after",
+          ),
+      ],
+      [
+        "orchestrator",
+        (value) => value.replace("No token is read", "A token may be read"),
+      ],
+      [
+        "root",
+        (value) =>
+          value.replace(
+            "no publisher is invoked",
+            "the publisher may be invoked",
+          ),
+      ],
+      [
+        "process",
+        (value) =>
+          value.replace(
+            "no GitHub mutation occurs",
+            "a GitHub mutation may occur",
+          ),
+      ],
+    ];
+    for (const [name, mutate] of cases) {
+      expect(
+        validateGateBRemediationCycleSources(
+          { ...sources, [name]: mutate(sources[name]) },
+          [],
+        ),
+        name,
+      ).not.toEqual([]);
+    }
+
+    const safeCommands = verificationPlan("full").map(displayCommand);
+    expect(safeCommands).toHaveLength(9);
+    expect(validateVerificationCommands(safeCommands, [])).toEqual([]);
+    expect(
+      validateVerificationCommands(
+        [...safeCommands, "git push origin HEAD:candidate"],
+        [],
+      ),
+    ).not.toEqual([]);
+  });
+
+  it("binds each complete remediation-order source and its exact closed block", () => {
+    const sources = rawPublicationContractSources();
+    expect(validatePublicationContractSources(sources, [])).toEqual([]);
+
+    const orderBegin = "<!-- CLOUDX-GATE-B-REMEDIATION-ORDER-V1:BEGIN -->";
+    const orderEnd = "<!-- CLOUDX-GATE-B-REMEDIATION-ORDER-V1:END -->";
+    const contradictoryInstructions = [
+      "$verify-change and $review-change dispatch before attended exact local commit.",
+      "Verification and all selected area reviewers run before the attended local commit.",
+      "Before the attended local commit, run verification and selected area reviews.",
+      "All selected reviewers run before the remediation commit.",
+      "Area reviews occur before the local commit.",
+      "Before the attended commit, run AI reviews.",
+      "All required reviews run before the attended local commit.",
+      "Security and architecture reviews occur before the remediation commit.",
+      "Dispatch reviewers before the attended exact local commit.",
+      "Conduct the mandatory reviews before the remediation commit.",
+      "Run the full verifier before the attended local commit.",
+      "Despite the closed block, run the full verifier before the attended local commit.",
+    ];
+    for (const name of ["root", "orchestrator", "process"]) {
+      for (const instruction of contradictoryInstructions) {
+        const mutated = {
+          ...sources,
+          [name]: sources[name].replace(
+            orderEnd,
+            `${instruction}\n${orderEnd}`,
+          ),
+        };
+        expect(
+          validatePublicationContractSources(mutated, []),
+          `${name}: ${instruction}`,
+        ).toEqual(
+          expect.arrayContaining([
+            expect.stringMatching(/canonical remediation-order block/i),
+          ]),
+        );
+      }
+
+      for (const instruction of contradictoryInstructions) {
+        const mutated = {
+          ...sources,
+          [name]: sources[name].replace(
+            orderEnd,
+            `${orderEnd}\n${instruction}`,
+          ),
+        };
+        expect(
+          validatePublicationContractSources(mutated, []),
+          `${name}: outside block: ${instruction}`,
+        ).toEqual(
+          expect.arrayContaining([
+            expect.stringMatching(/source-byte commitment/i),
+          ]),
+        );
+      }
+
+      const outsideBlockMutations = [
+        [
+          "prohibition",
+          (value) =>
+            value.replace(
+              orderEnd,
+              `${orderEnd}\nNo verification runs before the attended local commit.`,
+            ),
+        ],
+        [
+          "authority override",
+          (value) =>
+            value.replace(
+              orderEnd,
+              `${orderEnd}\nThat declaration is nonbinding; run verification before the attended local commit.`,
+            ),
+        ],
+        [
+          "before publication contract",
+          (value) =>
+            value.replace(
+              "<!-- CLOUDX-PUBLICATION-CONTRACT-V1:BEGIN -->",
+              "Arbitrary policy byte.\n<!-- CLOUDX-PUBLICATION-CONTRACT-V1:BEGIN -->",
+            ),
+        ],
+        [
+          "after publication contract",
+          (value) =>
+            value.replace(
+              "<!-- CLOUDX-PUBLICATION-CONTRACT-V1:END -->",
+              "<!-- CLOUDX-PUBLICATION-CONTRACT-V1:END -->\nArbitrary policy byte.",
+            ),
+        ],
+      ];
+      for (const [description, mutate] of outsideBlockMutations) {
+        const mutated = { ...sources, [name]: mutate(sources[name]) };
+        expect(
+          validatePublicationContractSources(mutated, []),
+          `${name}: ${description}`,
+        ).toEqual(
+          expect.arrayContaining([
+            expect.stringMatching(/source-byte commitment/i),
+          ]),
+        );
+      }
+
+      const declaration =
+        name === "orchestrator"
+          ? "The closed block below is the sole machine transition-order authority."
+          : "The closed block\nbelow is the sole machine transition-order mirror of the change-orchestrator\nauthority.";
+      const declarationMutations = [
+        [
+          "negated declaration",
+          (value) => value.replace("the sole machine", "not the sole machine"),
+        ],
+        [
+          "duplicate declaration",
+          (value) => value.replace(orderBegin, `${declaration}\n${orderBegin}`),
+        ],
+      ];
+      for (const [description, mutate] of declarationMutations) {
+        const mutated = { ...sources, [name]: mutate(sources[name]) };
+        expect(
+          validatePublicationContractSources(mutated, []),
+          `${name}: ${description}`,
+        ).toEqual(
+          expect.arrayContaining([
+            expect.stringMatching(/sole machine transition-order/i),
+          ]),
+        );
+      }
+
+      const whitespaceOnly = {
+        ...sources,
+        [name]: sources[name].replace(orderBegin, `${orderBegin}\n \t`),
+      };
+      expect(
+        validatePublicationContractSources(whitespaceOnly, []),
+        `${name}: documented whitespace`,
+      ).toEqual(
+        expect.arrayContaining([
+          expect.stringMatching(/source-byte commitment/i),
+        ]),
+      );
+
+      const markerMutations = [
+        ["missing begin", (value) => value.replace(orderBegin, "")],
+        ["missing end", (value) => value.replace(orderEnd, "")],
+        [
+          "duplicate begin",
+          (value) => value.replace(orderBegin, `${orderBegin}\n${orderBegin}`),
+        ],
+        [
+          "duplicate end",
+          (value) => value.replace(orderEnd, `${orderEnd}\n${orderEnd}`),
+        ],
+        [
+          "reordered markers",
+          (value) =>
+            value
+              .replace(orderBegin, "CLOUDX_ORDER_MARKER_PLACEHOLDER")
+              .replace(orderEnd, orderBegin)
+              .replace("CLOUDX_ORDER_MARKER_PLACEHOLDER", orderEnd),
+        ],
+      ];
+      for (const [description, mutate] of markerMutations) {
+        const mutated = { ...sources, [name]: mutate(sources[name]) };
+        expect(
+          validatePublicationContractSources(mutated, []),
+          `${name}: ${description}`,
+        ).toEqual(
+          expect.arrayContaining([
+            expect.stringMatching(/remediation-order markers/i),
+          ]),
+        );
+      }
+    }
   });
 
   it("requires exactly one complete versioned authority block per consumer", () => {
@@ -371,8 +943,24 @@ jobs:
       "separate test core",
       (source) =>
         source.replace(
-          "publishCandidateWithTransport(options, transport)",
-          "publishTestCandidate(options, transport)",
+          "return publishCandidateWithTransport(options, productionTransport, {",
+          "return publishProductionCandidate(options, productionTransport, {",
+        ),
+    ],
+    [
+      "optional direct-test transport",
+      (source) =>
+        source.replace(
+          "requireLoopbackTestTransport(transport);",
+          "if (transport !== undefined) requireLoopbackTestTransport(transport);",
+        ),
+    ],
+    [
+      "production transport fallback from injected entry",
+      (source) =>
+        source.replace(
+          "publishCandidateWithTransport(publicationOptions, transport, {",
+          "publishCandidateWithTransport(\n    publicationOptions,\n    transport ?? productionTransport,\n    {",
         ),
     ],
     [
@@ -403,6 +991,68 @@ jobs:
           "reviewPrHandoff: false,\n});",
           'reviewPrHandoff: false,\n  reason: "failed",\n});',
         ),
+    ],
+    [
+      "lossy committed-diff decoding",
+      (source) =>
+        source.replace(
+          'new TextDecoder("utf-8", {\n      fatal: true,\n      ignoreBOM: true,\n    }).decode(result.stdout)',
+          'result.stdout.toString("utf8")',
+        ),
+    ],
+    [
+      "BOM-stripping committed-diff decoder",
+      (source) => source.replace("ignoreBOM: true", "ignoreBOM: false"),
+    ],
+    [
+      "string committed-diff output",
+      (source) =>
+        source.replace('{ encoding: "buffer" }', '{ encoding: "utf8" }'),
+    ],
+    [
+      "ambient pre-token credential",
+      (source) =>
+        source.replace(
+          'GIT_ASKPASS: "/bin/false",',
+          'GH_TOKEN: process.env.GH_TOKEN,\n  GIT_ASKPASS: "/bin/false",',
+        ),
+    ],
+    [
+      "replacement refs in credential-free admission",
+      (source) => source.replace('GIT_NO_REPLACE_OBJECTS: "1",', ""),
+    ],
+    [
+      "replacement refs in isolated source reads and import",
+      (source) => {
+        const clause = 'GIT_NO_REPLACE_OBJECTS: "1",';
+        const index = source.lastIndexOf(clause);
+        return `${source.slice(0, index)}${source.slice(index + clause.length)}`;
+      },
+    ],
+    [
+      "widened normal command result",
+      (source) =>
+        source.replace(
+          'typeof result.stdout !== "string"',
+          '!Buffer.isBuffer(result.stdout) && typeof result.stdout !== "string"',
+        ),
+    ],
+    [
+      "missing initial committed-diff check",
+      (source) =>
+        source.replace(
+          "await validateCommittedCandidateDiff({",
+          "await skipCommittedCandidateDiff({",
+        ),
+    ],
+    [
+      "missing freshness committed-diff check",
+      (source) => {
+        const index = source.lastIndexOf(
+          "await validateCommittedCandidateDiff({",
+        );
+        return `${source.slice(0, index)}await skipCommittedCandidateDiff({${source.slice(index + "await validateCommittedCandidateDiff({".length)}`;
+      },
     ],
   ])("rejects publisher contract drift: %s", (_name, mutate) => {
     const sources = rawPublicationContractSources();
@@ -510,21 +1160,75 @@ jobs:
     expect(validatePublicationContractSources(sources, [])).not.toEqual([]);
   });
 
-  it("binds the complete Gate B artifact bundle to one reviewed committed head", () => {
+  it("binds a production-verifier Gate B bundle to one reviewed committed head", async () => {
     const fixture = gateBBundleFixture();
+    const plan = JSON.parse(
+      fs.readFileSync(path.join(fixture.directory, "plan.json"), "utf8"),
+    );
+    const actualVerification = await verifyChange({
+      acceptedPlan: plan,
+      localBaseSha: GATE_B_LOCAL_CHANGE_BASE_SHA,
+      headSha: gitSha("b"),
+      loadCurrentPolicy: async () => ({ policySha256: GATE_B_POLICY_SHA256 }),
+      readHead: async () => gitSha("b"),
+      runner: async () => ({ exitCode: 0, stdout: "ok", stderr: "" }),
+      runId: "gate-b-production-verification",
+      worktreeDigest: async () => sha("7"),
+    });
+    writeJson(fixture.directory, "verification.json", actualVerification);
 
-    const result = validateGateBArtifactBundle(fixture.options);
+    const options = fixture.options;
+    const result = validateGateBArtifactBundle(options);
+    const expectedAllowedPaths = Array.from(
+      { length: GATE_B_ALLOWED_PATH_COUNT },
+      (_, index) => `apps/server/src/gate-b-${index + 1}.ts`,
+    ).sort();
 
     expect(result).toEqual({
       headSha: gitSha("b"),
       planningHeadSha: GATE_B_PLANNING_HEAD_SHA,
       localChangeBaseSha: GATE_B_LOCAL_CHANGE_BASE_SHA,
+      allowedPaths: expectedAllowedPaths,
       planSha256: fileDigest(fixture.directory, "plan.json"),
       implementationSha256: fileDigest(
         fixture.directory,
         "implementation.json",
       ),
     });
+    expect(Object.isFrozen(result.allowedPaths)).toBe(true);
+
+    options.snapshot.files["plan.json"].fill(0);
+    expect(result.allowedPaths).toEqual(expectedAllowedPaths);
+    expect(() =>
+      result.allowedPaths.push("apps/server/src/drift.ts"),
+    ).toThrow();
+  });
+
+  it.each([113, 117, 119])(
+    "rejects an otherwise complete %i-path Gate B bundle",
+    (allowedPathCount) => {
+      const fixture = gateBBundleFixture();
+      fixture.mutate("plan.json", (plan) => {
+        plan.allowed_paths = Array.from(
+          { length: allowedPathCount },
+          (_, index) => `apps/server/src/gate-b-${index + 1}.ts`,
+        );
+      });
+
+      expect(() => validateGateBArtifactBundle(fixture.options)).toThrow(
+        `Gate B plan allowed path count must equal ${GATE_B_ALLOWED_PATH_COUNT}.`,
+      );
+    },
+  );
+
+  it("builds the complete bundle fixture from the sole path-count authority", () => {
+    const fixture = gateBBundleFixture();
+    const plan = JSON.parse(
+      fs.readFileSync(path.join(fixture.directory, "plan.json"), "utf8"),
+    );
+
+    expect(plan.allowed_paths).toHaveLength(GATE_B_ALLOWED_PATH_COUNT);
+    expect(new Set(plan.allowed_paths).size).toBe(GATE_B_ALLOWED_PATH_COUNT);
   });
 
   it("rejects every Gate B artifact-binding bypass", () => {
@@ -702,6 +1406,10 @@ function rawPublicationContractSources() {
       ".agents/skills/change-orchestrator/SKILL.md",
       "utf8",
     ),
+    implement: fs.readFileSync(
+      ".agents/skills/implement-change/SKILL.md",
+      "utf8",
+    ),
     ship: fs.readFileSync(".agents/skills/ship-change/SKILL.md", "utf8"),
     review: fs.readFileSync(".agents/skills/review-pr/SKILL.md", "utf8"),
     verifier: fs.readFileSync(".agents/skills/verify-change/SKILL.md", "utf8"),
@@ -715,6 +1423,21 @@ function rawPublicationContractSources() {
       "scripts/ai-change/publish-gate-b.test.mjs",
       "utf8",
     ),
+  };
+}
+
+function rawVerifierConsumerSources() {
+  return {
+    package: fs.readFileSync("package.json", "utf8"),
+    workflow: fs.readFileSync(".github/workflows/ci.yml", "utf8"),
+    root: fs.readFileSync("AGENTS.md", "utf8"),
+    verifierSkill: fs.readFileSync(
+      ".agents/skills/verify-change/SKILL.md",
+      "utf8",
+    ),
+    process: fs.readFileSync("docs/AI_CHANGE_PROCESS.md", "utf8"),
+    testingMap: fs.readFileSync("docs/architecture/testing-map.md", "utf8"),
+    verifier: fs.readFileSync("scripts/ai-change/verify.mjs", "utf8"),
   };
 }
 
@@ -769,11 +1492,11 @@ function gateBBundleFixture() {
       negative_cases: [`negative ${index + 1}`],
     })),
     allowed_paths: Array.from(
-      { length: 113 },
+      { length: GATE_B_ALLOWED_PATH_COUNT },
       (_, index) => `apps/server/src/gate-b-${index + 1}.ts`,
     ),
     forbidden_paths: [".github/**"],
-    verification: ["npm run typecheck", "npm test"],
+    verification: verificationPlan("full").map(displayCommand),
   };
   writeJson(directory, "plan.json", plan);
   const planDigest = fileDigest(directory, "plan.json");

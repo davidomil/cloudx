@@ -161,15 +161,15 @@ describe("SessionStore voice actions", () => {
     const window = workspace!.getActiveWindow();
     const workspaceFile = (workspace as unknown as { workspaceFile: { write(value: unknown): Promise<void> } }).workspaceFile;
     const originalWrite = workspaceFile.write.bind(workspaceFile);
-    const originalPlaceTab = workspace!.placeTab.bind(workspace);
+    const originalPlaceTabAndPublish = workspace!.placeTabAndPublish.bind(workspace);
     const firstWriteStarted = deferred<void>();
     const secondPlacementStarted = deferred<void>();
     const releaseFirstWrite = deferred<void>();
     let writes = 0;
     let placements = 0;
-    workspace!.placeTab = async (input) => {
+    workspace!.placeTabAndPublish = async (input, publish) => {
       placements += 1;
-      const placement = originalPlaceTab(input);
+      const placement = originalPlaceTabAndPublish(input, publish);
       if (placements === 2) {
         secondPlacementStarted.resolve();
       }
@@ -192,7 +192,7 @@ describe("SessionStore voice actions", () => {
     const created = await Promise.all([first, second]);
 
     workspaceFile.write = originalWrite;
-    workspace!.placeTab = originalPlaceTab;
+    workspace!.placeTabAndPublish = originalPlaceTabAndPublish;
     const placedTabIds = workspace!.tabIdsForWindow(window.id);
     expect(placedTabIds).toEqual(expect.arrayContaining(created.map(({ tab }) => tab.id)));
     expect(store.listTabs().map((tab) => tab.id)).toEqual(expect.arrayContaining(placedTabIds));
@@ -255,6 +255,46 @@ describe("SessionStore voice actions", () => {
     });
     expect(new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root])).findWindowForTab(plugin.lastSession!.tab.id)).toBeUndefined();
     await expect(fs.readdir(path.join(root, ".cloudx", "context"))).resolves.toEqual([]);
+  });
+
+  it("preserves a queued window update when failed tab publication rolls back its placement", async () => {
+    const { store, root, workspace, workspaceCommands, plugin } = await createStore({ withWorkspace: true });
+    const window = workspace!.getActiveWindow();
+    const workspaceFile = (workspace as unknown as { workspaceFile: { write(value: unknown): Promise<void> } }).workspaceFile;
+    const originalWrite = workspaceFile.write.bind(workspaceFile);
+    const placementWriteStarted = deferred<void>();
+    const releasePlacementWrite = deferred<void>();
+    let writes = 0;
+    workspaceFile.write = async (value) => {
+      writes += 1;
+      if (writes === 1) {
+        placementWriteStarted.resolve();
+        await releasePlacementWrite.promise;
+      }
+      await originalWrite(value);
+    };
+
+    const creation = workspaceCommands!.createTab({
+      pluginId: "fake-default",
+      cwd: root,
+      windowId: window.id,
+      paneId: window.layout.activePaneId
+    });
+    await placementWriteStarted.promise;
+    const rename = workspace!.updateWindow(window.id, { name: "Concurrent rename" });
+    const stagedTab = plugin.lastSession!.tab;
+    plugin.lastControls!.closeTab("plugin exited");
+    releasePlacementWrite.resolve();
+
+    await expect(creation).rejects.toThrow("closed before its workspace transaction committed");
+    await rename;
+
+    expect(workspace!.getWindow(window.id).name).toBe("Concurrent rename");
+    expect(workspace!.findWindowForTab(stagedTab.id)).toBeUndefined();
+    expect(store.listTabs()).not.toContainEqual(expect.objectContaining({ id: stagedTab.id }));
+    const reloaded = new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root]));
+    expect(reloaded.getWindow(window.id).name).toBe("Concurrent rename");
+    expect(reloaded.findWindowForTab(stagedTab.id)).toBeUndefined();
   });
 
   it("rejects an unknown pane before starting a session", async () => {
@@ -437,6 +477,51 @@ describe("SessionStore voice actions", () => {
     expect(stagedSession.stopped).toBe(true);
     expect(store.listTabs()).not.toContainEqual(expect.objectContaining({ id: stagedSession.tab.id }));
     await expect(fs.readdir(path.join(root, ".cloudx", "context"))).resolves.toEqual(beforeContextFiles);
+  });
+
+  it("preserves a queued layout mutation when failed template publication rolls back staged tabs", async () => {
+    const { store, root, workspace, workspaceCommands, plugin } = await createStore({ withWorkspace: true });
+    const project = path.join(root, "project");
+    await fs.mkdir(project);
+    const targetWindow = workspace!.getActiveWindow();
+    const source = await store.createTab({ pluginId: "fake-default", cwd: project, title: "Template tab", windowId: targetWindow.id });
+    await workspace!.updateWindow(targetWindow.id, { layout: layoutWithTab(source.id) });
+    const template = await workspace!.createTemplate({ name: "Persisted", basePath: project, windowId: targetWindow.id }, [{ tab: source }]);
+    const workspaceFile = (workspace as unknown as { workspaceFile: { write(value: unknown): Promise<void> } }).workspaceFile;
+    const originalWrite = workspaceFile.write.bind(workspaceFile);
+    const templateWriteStarted = deferred<void>();
+    const releaseTemplateWrite = deferred<void>();
+    let writes = 0;
+    workspaceFile.write = async (value) => {
+      writes += 1;
+      if (writes === 1) {
+        templateWriteStarted.resolve();
+        await releaseTemplateWrite.promise;
+      }
+      await originalWrite(value);
+    };
+
+    const application = workspaceCommands!.applyLayoutTemplate(template.id, { projectPath: project, windowId: targetWindow.id });
+    await templateWriteStarted.promise;
+    const split = workspace!.applyLayoutInstruction({
+      type: "split_pane",
+      windowId: targetWindow.id,
+      paneId: targetWindow.layout.activePaneId,
+      splitDirection: "column"
+    });
+    const stagedTab = plugin.lastSession!.tab;
+    plugin.lastControls!.closeTab("plugin exited");
+    releaseTemplateWrite.resolve();
+
+    await expect(application).rejects.toThrow("closed before its workspace transaction committed");
+    await split;
+
+    expect(workspace!.getWindow(targetWindow.id).layout.root).toMatchObject({ type: "split", direction: "column" });
+    expect(workspace!.tabIdsForWindow(targetWindow.id)).toEqual([source.id]);
+    expect(store.listTabs()).not.toContainEqual(expect.objectContaining({ id: stagedTab.id }));
+    const reloaded = new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root]));
+    expect(reloaded.getWindow(targetWindow.id).layout.root).toMatchObject({ type: "split", direction: "column" });
+    expect(reloaded.tabIdsForWindow(targetWindow.id)).toEqual([source.id]);
   });
 
   it("owns and reports rejected background context writes", async () => {
@@ -1240,8 +1325,9 @@ describe("SessionStore voice actions", () => {
       }
     } as never);
     const emitTrigger = plugin.lastInput!.app!.emitTrigger;
+    let receivedSignal: AbortSignal | undefined;
     vi.spyOn(plugin.lastSession!, "handleAction").mockImplementation(async (_action, input, context) => {
-      expect(context?.signal).toBe(controller.signal);
+      receivedSignal = context?.signal;
       actionStarted.resolve();
       await releaseAction.promise;
       await emitTrigger("fake.completed", { eventId: "event-1" });
@@ -1260,7 +1346,62 @@ describe("SessionStore voice actions", () => {
     releaseTrigger.resolve();
 
     await expect(Promise.all([action, disposal])).resolves.toBeTruthy();
+    expect(receivedSignal).toBeDefined();
+    expect(receivedSignal).not.toBe(controller.signal);
     expect(plugin.lastSession?.stopped).toBe(true);
+  });
+
+  it("aborts every admitted UI, voice, and automation-hook action before stopping sessions", async () => {
+    const { store, root, plugin } = await createStore();
+    const tab = await store.createTab({ pluginId: "fake-default", cwd: root });
+    const caller = new AbortController();
+    const signals: AbortSignal[] = [];
+    const allStarted = deferred<void>();
+    const release = deferred<void>();
+    let calls = 0;
+    vi.spyOn(plugin.lastSession!, "handleAction").mockImplementation(async (_action, _input, context) => {
+      calls += 1;
+      if (context?.signal) signals.push(context.signal);
+      if (calls === 3) allStarted.resolve();
+      return new Promise<Record<string, unknown>>((resolve, reject) => {
+        const abort = () => reject(context!.signal!.reason);
+        if (context?.signal?.aborted) abort();
+        else context?.signal?.addEventListener("abort", abort, { once: true });
+        void release.promise.then(() => resolve({ action: "enter_text", input: {} }));
+      });
+    });
+    const actions = [
+      store.executePluginAction(tab.id, "enter_text", { text: "ui" }),
+      store.executeVoiceAction({
+        id: "voice-shutdown",
+        dependsOn: [],
+        pluginId: "fake-default",
+        targetTabId: tab.id,
+        action: "enter_text",
+        input: { text: "voice" },
+      }, undefined, caller.signal),
+      store.executePluginHook(
+        "fake-default",
+        pluginActionHookId("fake-default", "enter_text"),
+        "enter_text",
+        tab.id,
+        { text: "hook" },
+        { kind: "automation" },
+      ),
+    ].map((action) => action.catch((error) => error));
+    await allStarted.promise;
+
+    const disposal = store.dispose();
+    await Promise.resolve();
+    const receivedEverySignal = signals.length === 3;
+    const shutdownAbortedEverySignal = signals.every((signal) => signal.aborted);
+    release.resolve();
+    await Promise.all([...actions, disposal]);
+
+    expect(receivedEverySignal).toBe(true);
+    expect(shutdownAbortedEverySignal).toBe(true);
+    expect(plugin.lastSession?.stopped).toBe(true);
+    await expect(store.executePluginAction(tab.id, "enter_text", { text: "late" })).rejects.toThrow("Session store is disposed");
   });
 
   it("tracks hook and voice actions through the same shutdown admission", async () => {
