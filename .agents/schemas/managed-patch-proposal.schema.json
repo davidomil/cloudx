@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Untrusted model output. Trusted capture code computes patch_bytes and patch_sha256 before emitting managed-implementation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "run_id",
+    "base_sha",
+    "snapshot_sha256",
+    "policy_sha256",
+    "plan_sha256",
+    "reproduction_sha256",
+    "changed_paths",
+    "unified_patch",
+    "claim_evidence"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "const": "managed-patch-proposal" },
+    "run_id": { "$ref": "#/$defs/nonEmpty" },
+    "base_sha": { "$ref": "#/$defs/gitSha" },
+    "snapshot_sha256": { "$ref": "#/$defs/sha256" },
+    "policy_sha256": { "$ref": "#/$defs/sha256" },
+    "plan_sha256": { "$ref": "#/$defs/sha256" },
+    "reproduction_sha256": { "$ref": "#/$defs/sha256" },
+    "changed_paths": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/repoPath" }
+    },
+    "unified_patch": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 358400,
+      "pattern": "^(?![\\s\\S]*GIT binary patch)[\\s\\S]*$"
+    },
+    "claim_evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "claim_id",
+          "production_path",
+          "test_path",
+          "revert_failing_assertion",
+          "negative_cases"
+        ],
+        "properties": {
+          "claim_id": { "type": "string", "pattern": "^CLAIM-[A-Z0-9-]+$" },
+          "production_path": { "$ref": "#/$defs/repoPath" },
+          "test_path": { "$ref": "#/$defs/repoPath" },
+          "revert_failing_assertion": { "$ref": "#/$defs/nonEmpty" },
+          "negative_cases": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "$ref": "#/$defs/nonEmpty" }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "gitSha": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "repoPath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?![A-Za-z]:/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"
+    }
+  }
+}

@@ -34,6 +34,7 @@
     "apps/web"
   ],
   "scripts": {
+    "ai:classify": "node scripts/ai-change/classify.mjs",
     "build": "npm run build --workspaces --if-present",
     "cert:create": "node scripts/create-local-cert.mjs",
     "dev": "npm run cert:create && npm run dev -w @cloudx/server",
@@ -43,14 +44,23 @@
     "documentation:test": "services/documentation-indexer/.venv/bin/python -m pytest services/documentation-indexer/tests",
     "docs:memory:pdf": "quarto render docs/MEMORY_PLUGIN_GUIDE.qmd --to pdf",
     "docs:screenshots": "npm run build && node scripts/capture-readme-screenshots.mjs",
+    "format": "prettier --write AGENTS.md CONTRIBUTING.md package.json vitest.config.ts eslint.config.js playwright.config.ts docs/AI_CHANGE_PROCESS.md \".agents/**/*.{json,md}\" .github/PULL_REQUEST_TEMPLATE.md .github/workflows/ci.yml .github/workflows/classify-pr.yml \"containers/ci/**/*.mjs\" \"docs/architecture/*.md\" \"scripts/ai-change/**/*.mjs\" \"tests/browser/**/*.ts\"",
+    "format:check": "prettier --check AGENTS.md CONTRIBUTING.md package.json vitest.config.ts eslint.config.js playwright.config.ts docs/AI_CHANGE_PROCESS.md \".agents/**/*.{json,md}\" .github/PULL_REQUEST_TEMPLATE.md .github/workflows/ci.yml .github/workflows/classify-pr.yml \"containers/ci/**/*.mjs\" \"docs/architecture/*.md\" \"scripts/ai-change/**/*.mjs\" \"tests/browser/**/*.ts\"",
     "install:wizard": "node scripts/install-cloudx.mjs",
+    "lint": "eslint \"containers/ci/**/*.mjs\" \"scripts/ai-change/**/*.mjs\"",
+    "policy:validate": "node scripts/ai-change/validate-process.mjs",
     "service:install": "node scripts/setup-cloudx-whisper-service.mjs",
     "testenv:setup": "node scripts/setup-test-environment.mjs",
     "testenv:start": "npm run build -w @cloudx/web && node scripts/setup-test-environment.mjs --start",
     "testenv:start:lan": "CLOUDX_TEST_HOST=0.0.0.0 npm run testenv:start",
     "testenv:stop": "node scripts/setup-test-environment.mjs --stop",
     "test": "vitest run",
-    "typecheck": "tsc -b"
+    "test:browser": "playwright test",
+    "test:coverage": "vitest run --coverage --reporter=dot",
+    "test:policy": "vitest run scripts/ai-change",
+    "typecheck": "tsc -b",
+    "verify": "node scripts/ai-change/verify.mjs --scope full",
+    "verify:policy": "node scripts/ai-change/verify.mjs --scope policy"
   },
   "devDependencies": {
     "@playwright/test": "^1.60.0",
@@ -60,10 +70,18 @@
     "@types/ws": "^8.18.1",
     "@types/yauzl": "^2.10.3",
     "@vitejs/plugin-react": "^6.0.1",
+    "@vitest/coverage-v8": "^4.1.6",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
+    "eslint": "^10.7.0",
     "jsdom": "^29.1.1",
+    "minimatch": "^10.2.5",
+    "prettier": "^3.9.5",
+    "smol-toml": "^1.7.0",
     "tsx": "^4.21.0",
     "typescript": "^6.0.3",
     "vite": "^8.0.12",
-    "vitest": "^4.1.6"
+    "vitest": "^4.1.6",
+    "yaml": "^2.9.0"
   }
 }

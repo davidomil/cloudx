@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "run_id",
+    "base_sha",
+    "snapshot_sha256",
+    "policy_sha256",
+    "plan_sha256",
+    "status",
+    "steps",
+    "expected",
+    "observed",
+    "commands"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "const": "managed-reproduction" },
+    "run_id": { "$ref": "#/$defs/nonEmpty" },
+    "base_sha": { "$ref": "#/$defs/gitSha" },
+    "snapshot_sha256": { "$ref": "#/$defs/sha256" },
+    "policy_sha256": { "$ref": "#/$defs/sha256" },
+    "plan_sha256": { "$ref": "#/$defs/sha256" },
+    "status": { "enum": ["reproduced", "not-reproduced", "blocked"] },
+    "steps": { "$ref": "#/$defs/nonEmptyStrings" },
+    "expected": { "$ref": "#/$defs/nonEmpty" },
+    "observed": { "$ref": "#/$defs/nonEmpty" },
+    "commands": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command", "exit_code", "stdout_sha256", "stderr_sha256"],
+        "properties": {
+          "command": { "$ref": "#/$defs/nonEmpty" },
+          "exit_code": { "type": "integer", "minimum": 0 },
+          "stdout_sha256": { "$ref": "#/$defs/sha256" },
+          "stderr_sha256": { "$ref": "#/$defs/sha256" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "gitSha": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "nonEmptyStrings": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/nonEmpty" }
+    }
+  }
+}

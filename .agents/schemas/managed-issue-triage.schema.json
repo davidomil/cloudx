@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "run_id",
+    "snapshot_sha256",
+    "base_sha",
+    "policy_sha256",
+    "type",
+    "areas",
+    "risk",
+    "skills",
+    "labels",
+    "admitted",
+    "admission_reason"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "const": "managed-issue-triage" },
+    "run_id": { "$ref": "#/$defs/nonEmpty" },
+    "snapshot_sha256": { "$ref": "#/$defs/sha256" },
+    "base_sha": { "$ref": "#/$defs/gitSha" },
+    "policy_sha256": { "$ref": "#/$defs/sha256" },
+    "type": { "enum": ["bug", "feature", "refactor", "test", "docs", "chore"] },
+    "areas": { "$ref": "#/$defs/nonEmptyStrings" },
+    "risk": { "enum": ["low", "medium", "high", "human-required"] },
+    "skills": { "$ref": "#/$defs/nonEmptyStrings" },
+    "labels": { "$ref": "#/$defs/nonEmptyStrings" },
+    "admitted": { "type": "boolean" },
+    "admission_reason": {
+      "enum": ["trusted-author", "writer-approved", "writer-approval-required"]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "admitted": { "const": true } },
+        "required": ["admitted"]
+      },
+      "then": {
+        "properties": {
+          "admission_reason": { "enum": ["trusted-author", "writer-approved"] }
+        }
+      },
+      "else": {
+        "properties": {
+          "admission_reason": { "const": "writer-approval-required" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "gitSha": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "nonEmptyStrings": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/nonEmpty" }
+    }
+  }
+}

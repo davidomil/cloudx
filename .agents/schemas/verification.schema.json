@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "run_id",
+    "base_sha",
+    "head_sha",
+    "policy_sha256",
+    "tree_sha256_before",
+    "tree_sha256_after",
+    "verdict",
+    "commands"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "const": "change-verification" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "base_sha": { "$ref": "#/$defs/gitSha" },
+    "head_sha": { "$ref": "#/$defs/gitSha" },
+    "policy_sha256": { "$ref": "#/$defs/sha256" },
+    "tree_sha256_before": { "$ref": "#/$defs/sha256" },
+    "tree_sha256_after": { "$ref": "#/$defs/sha256" },
+    "verdict": { "enum": ["passed", "failed"] },
+    "commands": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "command",
+          "exit_code",
+          "stdout_sha256",
+          "stderr_sha256",
+          "tree_sha256_before",
+          "tree_sha256_after"
+        ],
+        "properties": {
+          "command": { "type": "string", "minLength": 1 },
+          "exit_code": { "type": "integer", "minimum": 0 },
+          "stdout_sha256": { "$ref": "#/$defs/sha256" },
+          "stderr_sha256": { "$ref": "#/$defs/sha256" },
+          "tree_sha256_before": { "$ref": "#/$defs/sha256" },
+          "tree_sha256_after": { "$ref": "#/$defs/sha256" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "gitSha": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "run_id",
+    "repository",
+    "issue_number",
+    "base_sha",
+    "snapshot_sha256",
+    "policy_sha256",
+    "workflow_id",
+    "workflow_ref",
+    "expected_workflow_sha"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "const": "managed-issue-workflow" },
+    "run_id": { "$ref": "#/$defs/nonEmpty" },
+    "repository": { "type": "string", "pattern": "^[^/\\s]+/[^/\\s]+$" },
+    "issue_number": { "type": "integer", "minimum": 1 },
+    "base_sha": { "$ref": "#/$defs/gitSha" },
+    "snapshot_sha256": { "$ref": "#/$defs/sha256" },
+    "policy_sha256": { "$ref": "#/$defs/sha256" },
+    "workflow_id": { "$ref": "#/$defs/nonEmpty" },
+    "workflow_ref": { "$ref": "#/$defs/gitRef" },
+    "expected_workflow_sha": { "$ref": "#/$defs/gitSha" }
+  },
+  "$defs": {
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "gitRef": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "pattern": "^(?!@?$)(?!-)(?!/)(?!.*(?:\\.\\.|//|@\\{|[~^:?*\\[\\\\]))(?!.*\\/$)(?!.*\\.$)[^\\s]+$"
+    },
+    "gitSha": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+  }
+}

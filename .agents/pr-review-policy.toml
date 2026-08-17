@@ -1,0 +1,287 @@
+version = 1
+
+[labels]
+types = ["bug", "feature", "refactor", "test", "docs", "chore"]
+areas = ["agent-policy", "asr", "automation", "ci", "documentation", "installer", "plugin-api", "repository", "security", "server", "shared", "web"]
+risks = ["low", "medium", "high", "human-required"]
+review_states = ["pending", "clean", "blocked", "stale"]
+intent = "trusted-auto-merge"
+generated = "ai:generated"
+manual_review = "manual review"
+issue_approved = "ai:issue-approved"
+pr_model_authorized = "ai:review-requested"
+
+[defaults]
+area = "repository"
+risk = "high"
+human_review = true
+automerge = false
+skills = ["review-architecture", "review-security"]
+checks = ["policy", "typescript", "python"]
+
+[cross_area]
+risk = "high"
+skills = ["review-architecture", "review-security"]
+
+[merge]
+required_checks = ["CI / merge-gate", "AI Review / head"]
+allowed_method = "squash"
+require_resolved_conversations = true
+require_protected_path_approval = true
+
+[activation]
+branch = "main"
+local_controller_protocol = 4
+update_authority_ruleset_name = "CloudX main update authority"
+integrity_ruleset_name = "CloudX main integrity"
+private_actions_required = false
+manager_app_slug = "cloudx-ai-manager"
+publisher_app_slug = "cloudx-ai-publisher"
+merge_app_slug = "cloudx-ai-merge"
+required_check_app_slug = "cloudx-ai-publisher"
+intent_check_app_slug = "cloudx-ai-merge"
+manager_permissions = ["actions:read", "checks:read", "contents:read", "issues:write", "metadata:read", "pull_requests:read"]
+publisher_permissions = ["actions:read", "checks:write", "contents:write", "issues:write", "metadata:read", "pull_requests:write"]
+merge_permissions = ["checks:read", "contents:write", "metadata:read", "pull_requests:read"]
+required_public_workflows = [".github/workflows/ci.yml", ".github/workflows/classify-pr.yml"]
+required_repository_variables = []
+required_repository_secrets = []
+allowed_action_patterns = ["astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b"]
+
+[managed_generation]
+provenance_app_slug = "cloudx-ai-publisher"
+intent_app_slug = "cloudx-ai-merge"
+author_login = "cloudx-ai-publisher[bot]"
+branch_prefix = "ai/issue-"
+publication_allowed_risks = ["low", "medium", "high", "human-required"]
+automerge_allowed_risks = ["low", "medium"]
+provenance_check = "Managed Generation / head"
+intent_check = "Automation Intent / head"
+max_files = 12
+max_additions = 400
+max_deletions = 200
+max_patch_bytes = 350000
+
+[[path_rules]]
+name = "ai-automation"
+globs = ["AGENTS.md", "**/AGENTS.md", ".agents/pr-review-policy.toml", ".agents/schemas/**", "CODEOWNERS", "CONTRIBUTING.md", "docs/AI_CHANGE_PROCESS.md", "docs/architecture/**", "docs/architecture-review/phase-inspired-repository-ai-process.md", "scripts/ai-change/**"]
+areas = ["agent-policy"]
+risk = "human-required"
+human_review = true
+automerge = false
+skills = ["review-agent-policy", "review-security"]
+checks = ["policy", "typescript"]
+
+[[path_rules]]
+name = "ai-skills"
+globs = [".agents/skills/**"]
+areas = ["agent-policy"]
+risk = "human-required"
+human_review = true
+automerge = false
+skills = ["review-agent-policy", "review-security"]
+checks = ["policy", "typescript"]
+
+[[path_rules]]
+name = "dependency-policy"
+globs = ["**/package.json", "package-lock.json", "**/pyproject.toml", "**/requirements*.txt", "**/uv.lock", "**/poetry.lock"]
+areas = ["repository"]
+risk = "human-required"
+human_review = true
+automerge = false
+skills = ["review-architecture", "review-security"]
+checks = ["typescript", "python"]
+
+[[path_rules]]
+name = "security-boundaries"
+globs = ["SECURITY.md", "docs/SECURITY_MODEL.md", "apps/server/src/pathPolicy*.ts", "apps/server/src/configSecretStore*.ts", "apps/server/src/localWebProxy*.ts", "apps/server/src/fileTransfer*.ts"]
+areas = ["security"]
+risk = "human-required"
+human_review = true
+automerge = false
+skills = ["review-security"]
+checks = ["typescript", "security"]
+
+[[path_rules]]
+name = "continuous-integration"
+globs = [".github/**", "containers/ci/**", "scripts/setup-test-environment.mjs", "package.json", "package-lock.json", "tsconfig.json", "tsconfig.base.json", "eslint.config.*", "vitest.config.*", "playwright.config.*"]
+areas = ["ci"]
+risk = "human-required"
+human_review = true
+automerge = false
+skills = ["review-agent-policy", "review-security"]
+checks = ["policy"]
+
+[[path_rules]]
+name = "automation-execution"
+globs = ["apps/server/src/automation/**", "scripts/install-cloudx.mjs", "install.sh"]
+areas = ["automation"]
+risk = "human-required"
+human_review = true
+automerge = false
+skills = ["review-automation", "review-security"]
+checks = ["typescript", "security"]
+
+[[path_rules]]
+name = "local-ai-control-plane"
+globs = ["apps/ai-manager/**", "apps/local-executor/**", "scripts/local/**", "deploy/ai-manager/**", "deploy/host/**", "deploy/systemd/**"]
+areas = ["automation", "security"]
+risk = "human-required"
+human_review = true
+automerge = false
+skills = ["review-automation", "review-security"]
+checks = ["typescript", "security"]
+
+[[path_rules]]
+name = "codex-process-launch"
+globs = ["apps/server/src/appServer/**", "apps/server/src/hooks/coreHooks.ts", "apps/server/src/voice/VoicePlanner.ts"]
+areas = ["automation", "server"]
+risk = "human-required"
+human_review = true
+automerge = false
+skills = ["review-automation", "review-server", "review-security"]
+checks = ["typescript", "security"]
+
+[[path_rules]]
+name = "terminal-process-control"
+globs = ["apps/server/src/terminal/**", "apps/server/src/plugins/CodexTerminalPlugin.ts", "apps/server/src/plugins/StandardTerminalPlugin.ts", "apps/server/src/sessionStore.ts", "apps/server/src/lifecycle/ProcessShutdownController.ts"]
+areas = ["automation", "server"]
+risk = "human-required"
+human_review = true
+automerge = false
+skills = ["review-automation", "review-server", "review-security"]
+checks = ["typescript", "security"]
+
+[[path_rules]]
+name = "git-worktree-mutation"
+globs = ["apps/server/src/git/**", "apps/server/src/plugins/WorktreeManagerPlugin.ts"]
+areas = ["automation", "server"]
+risk = "human-required"
+human_review = true
+automerge = false
+skills = ["review-automation", "review-server", "review-security"]
+checks = ["typescript", "security"]
+
+[[path_rules]]
+name = "archive-and-subprocess-control"
+globs = ["apps/server/src/archive/**", "apps/server/src/documentation/DocumentationEnrichmentService.ts", "apps/server/src/plugins/FileBrowserPlugin.ts", "apps/server/src/plugins/InstalledPluginService.ts", "services/asr/src/cloudx_asr/main.py", "services/documentation-indexer/src/cloudx_documentation_indexer/archive.py", "services/documentation-indexer/src/cloudx_documentation_indexer/extraction.py"]
+areas = ["automation", "security"]
+risk = "human-required"
+human_review = true
+automerge = false
+skills = ["review-automation", "review-python-services", "review-security"]
+checks = ["typescript", "python", "security"]
+
+[[path_rules]]
+name = "secret-persistence"
+globs = ["apps/server/src/configSecretStore.ts", "apps/server/src/configService.ts"]
+areas = ["security", "server"]
+risk = "human-required"
+human_review = true
+automerge = false
+skills = ["review-security", "review-server"]
+checks = ["typescript", "security"]
+
+[[path_rules]]
+name = "server-composition"
+globs = ["apps/server/src/server.ts", "apps/server/src/index.ts"]
+areas = ["server"]
+risk = "human-required"
+human_review = true
+automerge = false
+skills = ["review-server", "review-security"]
+checks = ["typescript", "security"]
+
+[[path_rules]]
+name = "server"
+globs = ["apps/server/**"]
+areas = ["server"]
+risk = "medium"
+human_review = false
+automerge = true
+skills = ["review-server"]
+checks = ["typescript"]
+
+[[path_rules]]
+name = "web-composition"
+globs = ["apps/web/src/ui/App.tsx", "apps/web/src/ui/AutomationPanel.tsx", "apps/web/src/ui/FileBrowserPanel.tsx"]
+areas = ["web"]
+risk = "high"
+human_review = false
+automerge = true
+skills = ["review-web", "review-security"]
+checks = ["typescript", "browser"]
+
+[[path_rules]]
+name = "web"
+globs = ["apps/web/**"]
+areas = ["web"]
+risk = "medium"
+human_review = false
+automerge = true
+skills = ["review-web"]
+checks = ["typescript", "browser"]
+
+[[path_rules]]
+name = "shared"
+globs = ["packages/shared/**"]
+areas = ["shared"]
+risk = "high"
+human_review = false
+automerge = true
+skills = ["review-shared", "review-architecture"]
+checks = ["typescript"]
+
+[[path_rules]]
+name = "plugin-api"
+globs = ["packages/plugin-api/**"]
+areas = ["plugin-api"]
+risk = "high"
+human_review = false
+automerge = true
+skills = ["review-plugin-api", "review-architecture"]
+checks = ["typescript"]
+
+[[path_rules]]
+name = "asr"
+globs = ["services/asr/**"]
+areas = ["asr"]
+risk = "medium"
+human_review = false
+automerge = true
+skills = ["review-python-services"]
+checks = ["python"]
+
+[[path_rules]]
+name = "documentation-indexer"
+globs = ["services/documentation-indexer/**"]
+areas = ["documentation"]
+risk = "high"
+human_review = false
+automerge = true
+skills = ["review-python-services", "review-security"]
+checks = ["python"]
+
+[[path_rules]]
+name = "installer"
+globs = ["setup.sh", "scripts/setup/**", "scripts/setup-*.mjs", "docs/SETUP.md"]
+areas = ["installer"]
+risk = "human-required"
+human_review = true
+automerge = false
+skills = ["review-installer", "review-security"]
+checks = ["typescript", "security"]
+
+[[path_rules]]
+name = "documentation"
+globs = ["README.md", "SECURITY.md", "docs/**"]
+areas = ["documentation"]
+risk = "low"
+human_review = false
+automerge = true
+skills = ["review-documentation"]
+checks = ["policy"]
+
+[[generated_rules]]
+name = "build-output"
+globs = ["**/dist/**", "coverage/**", "playwright-report/**", "test-results/**", "*.tsbuildinfo"]

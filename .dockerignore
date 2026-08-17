@@ -1,0 +1,15 @@
+.git
+.managed
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/*.egg-info
+**/build
+**/dist
+**/*.tsbuildinfo
+coverage
+node_modules
+playwright-report
+test-results
+deploy/ai-manager/backups
+deploy/ai-manager/secrets

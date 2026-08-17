@@ -1,0 +1,262 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "labels",
+    "defaults",
+    "cross_area",
+    "merge",
+    "activation",
+    "managed_generation",
+    "path_rules",
+    "generated_rules"
+  ],
+  "properties": {
+    "version": { "const": 1 },
+    "labels": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "types",
+        "areas",
+        "risks",
+        "review_states",
+        "intent",
+        "generated",
+        "manual_review",
+        "issue_approved",
+        "pr_model_authorized"
+      ],
+      "properties": {
+        "types": { "$ref": "#/$defs/nonEmptyUniqueStrings" },
+        "areas": { "$ref": "#/$defs/nonEmptyUniqueStrings" },
+        "risks": {
+          "type": "array",
+          "const": ["low", "medium", "high", "human-required"]
+        },
+        "review_states": {
+          "type": "array",
+          "const": ["pending", "clean", "blocked", "stale"]
+        },
+        "intent": { "const": "trusted-auto-merge" },
+        "generated": { "const": "ai:generated" },
+        "manual_review": { "const": "manual review" },
+        "issue_approved": { "const": "ai:issue-approved" },
+        "pr_model_authorized": { "const": "ai:review-requested" }
+      }
+    },
+    "defaults": { "$ref": "#/$defs/routingRule" },
+    "cross_area": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["risk", "skills"],
+      "properties": {
+        "risk": { "$ref": "#/$defs/risk" },
+        "skills": { "$ref": "#/$defs/nonEmptyUniqueStrings" }
+      }
+    },
+    "merge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required_checks",
+        "allowed_method",
+        "require_resolved_conversations",
+        "require_protected_path_approval"
+      ],
+      "properties": {
+        "required_checks": { "$ref": "#/$defs/nonEmptyUniqueStrings" },
+        "allowed_method": { "const": "squash" },
+        "require_resolved_conversations": { "const": true },
+        "require_protected_path_approval": { "const": true }
+      }
+    },
+    "activation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "branch",
+        "local_controller_protocol",
+        "update_authority_ruleset_name",
+        "integrity_ruleset_name",
+        "private_actions_required",
+        "manager_app_slug",
+        "publisher_app_slug",
+        "merge_app_slug",
+        "required_check_app_slug",
+        "intent_check_app_slug",
+        "manager_permissions",
+        "publisher_permissions",
+        "merge_permissions",
+        "required_public_workflows",
+        "required_repository_variables",
+        "required_repository_secrets",
+        "allowed_action_patterns"
+      ],
+      "properties": {
+        "branch": { "const": "main" },
+        "local_controller_protocol": { "const": 4 },
+        "update_authority_ruleset_name": {
+          "const": "CloudX main update authority"
+        },
+        "integrity_ruleset_name": { "const": "CloudX main integrity" },
+        "private_actions_required": { "const": false },
+        "manager_app_slug": { "const": "cloudx-ai-manager" },
+        "publisher_app_slug": { "const": "cloudx-ai-publisher" },
+        "merge_app_slug": { "const": "cloudx-ai-merge" },
+        "required_check_app_slug": { "const": "cloudx-ai-publisher" },
+        "intent_check_app_slug": { "const": "cloudx-ai-merge" },
+        "manager_permissions": {
+          "const": [
+            "actions:read",
+            "checks:read",
+            "contents:read",
+            "issues:write",
+            "metadata:read",
+            "pull_requests:read"
+          ]
+        },
+        "publisher_permissions": {
+          "const": [
+            "actions:read",
+            "checks:write",
+            "contents:write",
+            "issues:write",
+            "metadata:read",
+            "pull_requests:write"
+          ]
+        },
+        "merge_permissions": {
+          "const": [
+            "checks:read",
+            "contents:write",
+            "metadata:read",
+            "pull_requests:read"
+          ]
+        },
+        "required_public_workflows": {
+          "const": [
+            ".github/workflows/ci.yml",
+            ".github/workflows/classify-pr.yml"
+          ]
+        },
+        "required_repository_variables": { "type": "array", "const": [] },
+        "required_repository_secrets": { "type": "array", "const": [] },
+        "allowed_action_patterns": {
+          "const": [
+            "astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b"
+          ]
+        }
+      }
+    },
+    "managed_generation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provenance_app_slug",
+        "intent_app_slug",
+        "author_login",
+        "branch_prefix",
+        "publication_allowed_risks",
+        "automerge_allowed_risks",
+        "provenance_check",
+        "intent_check",
+        "max_files",
+        "max_additions",
+        "max_deletions",
+        "max_patch_bytes"
+      ],
+      "properties": {
+        "provenance_app_slug": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "intent_app_slug": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "author_login": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9-]+\\[bot\\]$"
+        },
+        "branch_prefix": { "type": "string", "pattern": "^[A-Za-z0-9._/-]+-$" },
+        "publication_allowed_risks": {
+          "type": "array",
+          "const": ["low", "medium", "high", "human-required"]
+        },
+        "automerge_allowed_risks": {
+          "type": "array",
+          "const": ["low", "medium"]
+        },
+        "provenance_check": { "const": "Managed Generation / head" },
+        "intent_check": { "const": "Automation Intent / head" },
+        "max_files": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "max_additions": { "type": "integer", "minimum": 1, "maximum": 5000 },
+        "max_deletions": { "type": "integer", "minimum": 1, "maximum": 5000 },
+        "max_patch_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 900000
+        }
+      }
+    },
+    "path_rules": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "allOf": [
+          { "$ref": "#/$defs/routingRule" },
+          {
+            "type": "object",
+            "required": ["name", "globs", "areas"],
+            "properties": {
+              "name": { "$ref": "#/$defs/name" },
+              "globs": { "$ref": "#/$defs/nonEmptyUniqueStrings" },
+              "areas": { "$ref": "#/$defs/nonEmptyUniqueStrings" }
+            }
+          }
+        ]
+      }
+    },
+    "generated_rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "globs"],
+        "properties": {
+          "name": { "$ref": "#/$defs/name" },
+          "globs": { "$ref": "#/$defs/nonEmptyUniqueStrings" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+    "risk": { "enum": ["low", "medium", "high", "human-required"] },
+    "nonEmptyUniqueStrings": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "routingRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["risk", "human_review", "automerge", "skills", "checks"],
+      "properties": {
+        "name": { "$ref": "#/$defs/name" },
+        "globs": { "$ref": "#/$defs/nonEmptyUniqueStrings" },
+        "area": { "type": "string", "minLength": 1 },
+        "areas": { "$ref": "#/$defs/nonEmptyUniqueStrings" },
+        "risk": { "$ref": "#/$defs/risk" },
+        "human_review": { "type": "boolean" },
+        "automerge": { "type": "boolean" },
+        "skills": { "$ref": "#/$defs/nonEmptyUniqueStrings" },
+        "checks": { "$ref": "#/$defs/nonEmptyUniqueStrings" }
+      }
+    }
+  }
+}
