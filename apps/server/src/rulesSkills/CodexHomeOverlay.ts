@@ -18,6 +18,7 @@ import type { CloudxRule, CloudxSkill } from "@cloudx/shared";
 export interface CodexHomeOverlayOptions {
   dataDir: string;
   tabId: string;
+  cwd?: string;
   resolved?: ResolvedPersonalityTemplate;
   baseEnv?: NodeJS.ProcessEnv;
   resetCodexHome?: boolean;
@@ -29,6 +30,8 @@ export interface CodexHomeOverlay {
   configPath: string;
   instructionsPath?: string;
   skillPaths: string[];
+  disabledSkillPaths: string[];
+  skillConfigOverride: string;
   systemRules: CloudxRule[];
   systemSkills: CloudxSkill[];
 }
@@ -39,27 +42,39 @@ interface SkillMaterializationSource {
 }
 
 const GENERATED_SKILL_CONFIG_MARKER = "# CloudX generated skill enablement for this Codex tab.";
+const IMAGEGEN_SKILL_ID = "imagegen";
+export const CODEX_SKILL_CONFIG_MAX_BYTES = 64 * 1024;
+const MAX_DISCOVERED_SKILL_DIRECTORIES = 512;
+const MAX_DISCOVERED_SKILL_ENTRIES = 32_768;
+const MAX_DISCOVERED_SKILLS = 512;
+const MAX_SKILL_DIRECTORY_DEPTH = 32;
 
 export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptions): Promise<CodexHomeOverlay> {
   const baseEnv = options.baseEnv ?? process.env;
   const sourceCodexHome = resolveCodexHome(baseEnv);
   const codexHome = path.join(options.dataDir, "codex-homes", safePathSegment(options.tabId));
   const rulesSkillsRoot = rulesSkillsRootPath(options.dataDir);
-  if (options.resetCodexHome ?? true) {
-    await fsp.rm(codexHome, { recursive: true, force: true });
-  }
-  await fsp.mkdir(codexHome, { recursive: true });
   await ensureCloudxSystemRules(rulesSkillsRoot);
   await ensureCloudxSystemSkills(rulesSkillsRoot);
   const systemRules = await listCloudxSystemRules(rulesSkillsRoot);
   const systemSkills = await listCloudxSystemSkills(rulesSkillsRoot);
+  const skillSources = selectedSkillSources(sourceCodexHome, codexHome, rulesSkillsRoot, options.resolved, systemSkills);
+  await validateSkillSources(skillSources);
+  const allowedSkillPaths = skillSources.map((source) => path.join(source.targetDir, "SKILL.md"));
+  const disabledSkillPaths = await discoverExternalSkillPaths(options.cwd, baseEnv, codexHome, allowedSkillPaths);
+  const skillConfigOverride = buildCodexSkillConfigOverride(allowedSkillPaths, disabledSkillPaths);
+
+  if (options.resetCodexHome ?? true) {
+    await fsp.rm(codexHome, { recursive: true, force: true });
+  }
+  await fsp.mkdir(codexHome, { recursive: true });
 
   await linkOrCopyIfExists(path.join(sourceCodexHome, "auth.json"), path.join(codexHome, "auth.json"));
   await linkOrCopyIfExists(path.join(sourceCodexHome, ".credentials.json"), path.join(codexHome, ".credentials.json"));
   await linkOrCopyIfExists(path.join(sourceCodexHome, "rules"), path.join(codexHome, "rules"));
   await linkOrCopyIfExists(path.join(sourceCodexHome, "sessions"), path.join(codexHome, "sessions"));
 
-  const skillPaths = await materializeSelectedSkills(codexHome, rulesSkillsRoot, options.resolved, systemSkills);
+  const skillPaths = await materializeSelectedSkills(codexHome, skillSources);
   const configPath = path.join(codexHome, "config.toml");
   await writeOverlayConfig(path.join(sourceCodexHome, "config.toml"), configPath, skillPaths);
   const instructionsPath = await writeOverlayInstructions(sourceCodexHome, codexHome, options.resolved, systemRules);
@@ -70,6 +85,8 @@ export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptio
     configPath,
     instructionsPath,
     skillPaths,
+    disabledSkillPaths,
+    skillConfigOverride,
     systemRules,
     systemSkills
   };
@@ -81,12 +98,26 @@ export function resolveCodexHome(env: NodeJS.ProcessEnv = process.env): string {
 
 async function materializeSelectedSkills(
   codexHome: string,
-  rulesSkillsRoot: string,
-  resolved: ResolvedPersonalityTemplate | undefined,
-  systemSkills: CloudxSkill[]
+  sources: SkillMaterializationSource[]
 ): Promise<string[]> {
   await fsp.rm(path.join(codexHome, "skills", "cloudx"), { recursive: true, force: true });
   await fsp.rm(path.join(codexHome, "skills", "cloudx-system"), { recursive: true, force: true });
+  await fsp.rm(path.join(codexHome, "skills", "cloudx-exceptions"), { recursive: true, force: true });
+  const uniqueSources = dedupeSkillSources(sources);
+  for (const source of uniqueSources) {
+    await fsp.mkdir(path.dirname(source.targetDir), { recursive: true });
+    await linkOrCopyIfExists(source.sourceDir, source.targetDir);
+  }
+  return uniqueSources.map((source) => path.join(source.targetDir, "SKILL.md"));
+}
+
+function selectedSkillSources(
+  sourceCodexHome: string,
+  codexHome: string,
+  rulesSkillsRoot: string,
+  resolved: ResolvedPersonalityTemplate | undefined,
+  systemSkills: CloudxSkill[]
+): SkillMaterializationSource[] {
   const sources = [
     ...(resolved?.skills ?? []).map((skill) => ({
       sourceDir: path.dirname(cloudxSkillFilePath(rulesSkillsRoot, skill.id)),
@@ -95,18 +126,114 @@ async function materializeSelectedSkills(
     ...systemSkills.map((skill) => ({
       sourceDir: path.dirname(cloudxSystemSkillFilePath(rulesSkillsRoot, skill.id)),
       targetDir: path.join(codexHome, "skills", "cloudx-system", safePathSegment(skill.id))
-    }))
+    })),
+    {
+      sourceDir: path.join(sourceCodexHome, "skills", ".system", IMAGEGEN_SKILL_ID),
+      targetDir: path.join(codexHome, "skills", "cloudx-exceptions", IMAGEGEN_SKILL_ID)
+    }
   ];
-  const uniqueSources = dedupeSkillSources(sources);
-  for (const source of uniqueSources) {
+  return dedupeSkillSources(sources);
+}
+
+async function validateSkillSources(sources: SkillMaterializationSource[]): Promise<void> {
+  for (const source of sources) {
     const sourceSkillPath = path.join(source.sourceDir, "SKILL.md");
     if (!fs.existsSync(sourceSkillPath)) {
       throw new Error(`Codex skill does not contain SKILL.md: ${sourceSkillPath}`);
     }
-    await fsp.mkdir(path.dirname(source.targetDir), { recursive: true });
-    await linkOrCopyIfExists(source.sourceDir, source.targetDir);
   }
-  return uniqueSources.map((source) => path.join(source.targetDir, "SKILL.md"));
+}
+
+async function discoverExternalSkillPaths(cwd: string | undefined, env: NodeJS.ProcessEnv, codexHome: string, allowedSkillPaths: string[]): Promise<string[]> {
+  const roots = new Set<string>();
+  if (cwd?.trim()) {
+    let current = path.resolve(cwd);
+    while (true) {
+      roots.add(path.join(current, ".agents", "skills"));
+      roots.add(path.join(current, ".codex", "skills"));
+      const parent = path.dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+  }
+  const home = env.HOME?.trim() || os.homedir();
+  roots.add(path.join(home, ".agents", "skills"));
+  roots.add(path.join(path.parse(home).root, "etc", "codex", "skills"));
+  roots.add(path.join(codexHome, "skills"));
+  const budget: SkillDiscoveryBudget = { directories: 0, entries: 0, skills: 0 };
+  const paths: string[] = [];
+  for (const root of roots) {
+    paths.push(...await listSkillFiles(root, budget));
+  }
+  const allowed = new Set(allowedSkillPaths);
+  return [...new Set(paths)].filter((skillPath) => !allowed.has(skillPath)).sort();
+}
+
+interface SkillDiscoveryBudget {
+  directories: number;
+  entries: number;
+  skills: number;
+}
+
+async function listSkillFiles(root: string, budget: SkillDiscoveryBudget): Promise<string[]> {
+  const skills: string[] = [];
+  const queue = [{ directory: root, depth: 0, ancestors: new Set<string>() }];
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    let canonicalDirectory: string;
+    try {
+      canonicalDirectory = await fsp.realpath(current.directory);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+    if (current.ancestors.has(canonicalDirectory)) continue;
+    const ancestors = new Set(current.ancestors).add(canonicalDirectory);
+    budget.directories += 1;
+    if (budget.directories > MAX_DISCOVERED_SKILL_DIRECTORIES) {
+      throw new Error(`Codex external skill discovery exceeds ${MAX_DISCOVERED_SKILL_DIRECTORIES} directories.`);
+    }
+    const entries = await fsp.readdir(current.directory, { withFileTypes: true });
+    budget.entries += entries.length;
+    if (budget.entries > MAX_DISCOVERED_SKILL_ENTRIES) {
+      throw new Error(`Codex external skill discovery exceeds ${MAX_DISCOVERED_SKILL_ENTRIES} directory entries.`);
+    }
+    for (const entry of entries) {
+      const entryPath = path.join(current.directory, entry.name);
+      if (entry.name === "SKILL.md" && (entry.isFile() || entry.isSymbolicLink())) {
+        skills.push(entryPath);
+        budget.skills += 1;
+        if (budget.skills > MAX_DISCOVERED_SKILLS) {
+          throw new Error(`Codex external skill discovery exceeds ${MAX_DISCOVERED_SKILLS} skills.`);
+        }
+        continue;
+      }
+      const isDirectory = entry.isDirectory() || (entry.isSymbolicLink() && (await fsp.stat(entryPath)).isDirectory());
+      if (!isDirectory) continue;
+      if (current.depth >= MAX_SKILL_DIRECTORY_DEPTH) {
+        throw new Error(`Codex external skill discovery exceeds depth ${MAX_SKILL_DIRECTORY_DEPTH}.`);
+      }
+      queue.push({ directory: entryPath, depth: current.depth + 1, ancestors });
+    }
+  }
+  return skills;
+}
+
+export function buildCodexSkillConfigOverride(allowedSkillPaths: string[], disabledSkillPaths: string[]): string {
+  const entries = [
+    ...allowedSkillPaths.map((skillPath) => `{path=${tomlString(skillPath)},enabled=true}`),
+    ...disabledSkillPaths.map((skillPath) => `{path=${tomlString(skillPath)},enabled=false}`)
+  ];
+  const override = `skills.config=[${entries.join(",")}]`;
+  const bytes = Buffer.byteLength(shellQuoteForSize(override), "utf8");
+  if (bytes > CODEX_SKILL_CONFIG_MAX_BYTES) {
+    throw new Error(`Shell-quoted Codex skill allowlist override is ${bytes} bytes; maximum is ${CODEX_SKILL_CONFIG_MAX_BYTES}.`);
+  }
+  return override;
+}
+
+function shellQuoteForSize(value: string): string {
+  return /^[A-Za-z0-9_/:=.,@%+-]+$/u.test(value) ? value : `'${value.replace(/'/gu, "'\\''")}'`;
 }
 
 async function writeOverlayConfig(sourceConfigPath: string, targetConfigPath: string, skillPaths: string[]): Promise<void> {

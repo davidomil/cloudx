@@ -24,6 +24,42 @@ export const CODEX_READY_MAX_TIMEOUT_MS = 10 * 60 * 1000;
 export const CODEX_READY_MAX_QUIET_MS = 10_000;
 const MAX_OSC_SEQUENCE_CHARS = 4096;
 
+export const CODEX_CLOUDX_DEFAULT_ARGS = [
+  "--dangerously-bypass-approvals-and-sandbox",
+  "--disable",
+  "memories",
+  "--disable",
+  "external_agent_memory_import",
+  "--disable",
+  "apps",
+  "--disable",
+  "enable_mcp_apps",
+  "--disable",
+  "plugins",
+  "--disable",
+  "remote_plugin",
+  "--disable",
+  "recommended_plugins",
+  "--disable",
+  "plugin_sharing",
+  "--disable",
+  "skill_search",
+  "--config",
+  "memories.generate_memories=false",
+  "--config",
+  "memories.use_memories=false",
+  "--config",
+  "memories.dedicated_tools=false",
+  "--config",
+  "include_apps_instructions=false",
+  "--config",
+  "apps._default.enabled=false",
+  "--config",
+  "skills.bundled.enabled=false",
+  "--config",
+  'tui.resume_cwd="current"'
+] as const;
+
 export const TERMINAL_ACTIONS: PluginActionDefinition[] = terminalActions({
   enterTextDescription:
     "Type into a standard shell terminal. For voice, translate natural-language shell requests into concise shell commands before submitting."
@@ -47,8 +83,8 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
 
   constructor(
     private readonly factory: TerminalProcessFactory,
-    private readonly replayBytes = DEFAULT_TERMINAL_REPLAY_BYTES,
-    private readonly dataDir?: string
+    private readonly dataDir: string,
+    private readonly replayBytes = DEFAULT_TERMINAL_REPLAY_BYTES
   ) {}
 
   descriptor() {
@@ -83,7 +119,8 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     const template = templateFromRuntimeContext(input.runtimeContext);
     const launchTemplate = await materializeCodexTemplate(template, process.env, {
       dataDir: this.dataDir,
-      tabId: input.tab.id
+      tabId: input.tab.id,
+      cwd: input.cwd
     });
     const command = launchTemplate.command;
     const launchArgs = buildCodexLaunchArgs(launchTemplate.args, input.initialInput);
@@ -107,6 +144,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
         const nextLaunchTemplate = await materializeCodexTemplate(nextTemplate, process.env, {
           dataDir: this.dataDir,
           tabId: input.tab.id,
+          cwd: input.cwd,
           resetOverlay: false
         });
         return {
@@ -220,35 +258,34 @@ export interface MaterializedCodexTemplate {
   command: string;
   args: string[];
   env: NodeJS.ProcessEnv;
-  overlay?: CodexHomeOverlay;
+  overlay: CodexHomeOverlay;
   voiceSummary: string;
   templateName?: string;
 }
 
 export interface MaterializeCodexTemplateOptions {
-  dataDir?: string;
-  tabId?: string;
+  dataDir: string;
+  tabId: string;
+  cwd?: string;
   resetOverlay?: boolean;
 }
 
 export async function materializeCodexTemplate(
   resolved: ResolvedPersonalityTemplate | undefined,
   baseEnv: NodeJS.ProcessEnv,
-  options: MaterializeCodexTemplateOptions = {}
+  options: MaterializeCodexTemplateOptions
 ): Promise<MaterializedCodexTemplate> {
-  const env = buildToolEnv(baseEnv);
-  const args: string[] = [];
-  const dataDir = options.dataDir;
-  const overlay = dataDir && options.tabId
-    ? await materializeCodexHomeOverlay({ dataDir, tabId: options.tabId, resolved, baseEnv: env, resetCodexHome: options.resetOverlay })
-    : undefined;
-  if (overlay) {
-    env.CODEX_HOME = overlay.codexHome;
-    env.CLOUDX_RULES_SKILLS_DIR = overlay.rulesSkillsRoot;
-    env.CLOUDX_PERSONALITY_INJECTION = "codex-home-overlay";
-    env.CLOUDX_SYSTEM_RULE_IDS = overlay.systemRules.map((rule) => rule.id).join(",");
-    args.push("--sandbox", "workspace-write", "--add-dir", overlay.rulesSkillsRoot);
+  if (!options.dataDir?.trim() || !options.tabId?.trim()) {
+    throw new Error("Cloudx Codex sessions require a data directory and tab ID for their isolated home overlay.");
   }
+  const env = buildToolEnv(baseEnv);
+  const args: string[] = [...CODEX_CLOUDX_DEFAULT_ARGS];
+  const overlay = await materializeCodexHomeOverlay({ dataDir: options.dataDir, tabId: options.tabId, cwd: options.cwd, resolved, baseEnv: env, resetCodexHome: options.resetOverlay });
+  env.CODEX_HOME = overlay.codexHome;
+  env.CLOUDX_RULES_SKILLS_DIR = overlay.rulesSkillsRoot;
+  env.CLOUDX_PERSONALITY_INJECTION = "codex-home-overlay";
+  env.CLOUDX_SYSTEM_RULE_IDS = overlay.systemRules.map((rule) => rule.id).join(",");
+  args.push("--config", overlay.skillConfigOverride);
   if (resolved) {
     env.CLOUDX_PERSONALITY_TEMPLATE_ID = resolved.template.id;
     env.CLOUDX_PERSONALITY_TEMPLATE_NAME = resolved.template.name;

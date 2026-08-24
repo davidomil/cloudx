@@ -20,7 +20,7 @@ class FakeFactory implements TerminalProcessFactory {
 describe("PluginRegistry", () => {
   it("validates voice-exposed action inputs", () => {
     const registry = new PluginRegistry();
-    registry.register(new CodexTerminalPlugin(new FakeFactory()));
+    registry.register(new CodexTerminalPlugin(new FakeFactory(), "/tmp/cloudx-test-data"));
 
     expect(() =>
       registry.validateVoiceInput("codex-terminal", "enter_text", {
@@ -32,7 +32,7 @@ describe("PluginRegistry", () => {
 
   it("rejects inputs not declared by plugin schemas", () => {
     const registry = new PluginRegistry();
-    registry.register(new CodexTerminalPlugin(new FakeFactory()));
+    registry.register(new CodexTerminalPlugin(new FakeFactory(), "/tmp/cloudx-test-data"));
 
     expect(() =>
       registry.validateVoiceInput("codex-terminal", "enter_text", {
@@ -44,7 +44,7 @@ describe("PluginRegistry", () => {
 
   it("sanitizes broad structured voice inputs down to the selected action schema", () => {
     const registry = new PluginRegistry();
-    registry.register(new CodexTerminalPlugin(new FakeFactory()));
+    registry.register(new CodexTerminalPlugin(new FakeFactory(), "/tmp/cloudx-test-data"));
 
     expect(
       registry.sanitizeVoiceInput("codex-terminal", "enter_text", {
@@ -58,7 +58,7 @@ describe("PluginRegistry", () => {
 
   it("still rejects extra inputs for direct plugin actions", () => {
     const registry = new PluginRegistry();
-    registry.register(new CodexTerminalPlugin(new FakeFactory()));
+    registry.register(new CodexTerminalPlugin(new FakeFactory(), "/tmp/cloudx-test-data"));
 
     expect(() =>
       registry.validateInput("codex-terminal", "enter_text", {
@@ -70,7 +70,7 @@ describe("PluginRegistry", () => {
 
   it("exposes the terminal default voice action", () => {
     const registry = new PluginRegistry();
-    registry.register(new CodexTerminalPlugin(new FakeFactory()));
+    registry.register(new CodexTerminalPlugin(new FakeFactory(), "/tmp/cloudx-test-data"));
 
     expect(registry.getDefaultVoiceAction("codex-terminal")?.name).toBe("enter_text");
     expect(registry.list()[0]?.actions[0]?.defaultForVoice).toBe(true);
@@ -78,7 +78,7 @@ describe("PluginRegistry", () => {
 
   it("lets plugins opt in to unresolved voice fallback", () => {
     const registry = new PluginRegistry();
-    registry.register(new CodexTerminalPlugin(new FakeFactory()));
+    registry.register(new CodexTerminalPlugin(new FakeFactory(), "/tmp/cloudx-test-data"));
     registry.register(new StandardTerminalPlugin(new FakeFactory()));
 
     expect(registry.getUnhandledVoiceAction("codex-terminal")?.name).toBe("enter_text");
@@ -88,7 +88,7 @@ describe("PluginRegistry", () => {
 
   it("exposes plugin creation metadata in descriptors", () => {
     const registry = new PluginRegistry();
-    registry.register(new CodexTerminalPlugin(new FakeFactory()));
+    registry.register(new CodexTerminalPlugin(new FakeFactory(), "/tmp/cloudx-test-data"));
 
     expect(registry.list()[0]).toMatchObject({
       id: "codex-terminal",

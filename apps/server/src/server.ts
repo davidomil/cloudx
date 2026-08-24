@@ -1078,7 +1078,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   process.env.CLOUDX_SERVER_URL ??= `${config.https ? "https" : "http"}://127.0.0.1:${config.port}`;
   let sessions: SessionStore | undefined;
   let documentationEnrichment: DocumentationEnrichmentService | undefined;
-  plugins.register(new CodexTerminalPlugin(terminalFactory, config.terminalReplayBytes, config.dataDir));
+  plugins.register(new CodexTerminalPlugin(terminalFactory, config.dataDir, config.terminalReplayBytes));
   plugins.register(new StandardTerminalPlugin(terminalFactory, config.terminalReplayBytes));
   plugins.register(new FileBrowserPlugin(pathPolicy));
   plugins.register(new LocalWebPlugin());
