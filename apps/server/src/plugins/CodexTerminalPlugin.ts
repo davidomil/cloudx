@@ -247,7 +247,7 @@ export async function materializeCodexTemplate(
     env.CLOUDX_RULES_SKILLS_DIR = overlay.rulesSkillsRoot;
     env.CLOUDX_PERSONALITY_INJECTION = "codex-home-overlay";
     env.CLOUDX_SYSTEM_RULE_IDS = overlay.systemRules.map((rule) => rule.id).join(",");
-    args.push("--add-dir", overlay.rulesSkillsRoot);
+    args.push("--sandbox", "workspace-write", "--add-dir", overlay.rulesSkillsRoot);
   }
   if (resolved) {
     env.CLOUDX_PERSONALITY_TEMPLATE_ID = resolved.template.id;

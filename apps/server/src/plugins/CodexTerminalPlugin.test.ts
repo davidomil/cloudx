@@ -186,7 +186,7 @@ describe("CodexTerminalPlugin", () => {
 
     expect(factory.args?.[0]).toBe("-lc");
     expect(factory.args?.[1]).toContain("exec /usr/bin/codex");
-    expect(factory.args?.[1]).toContain("--add-dir");
+    expect(factory.args?.[1]).toContain("--sandbox workspace-write --add-dir");
     expect(factory.args?.[1]).not.toContain("Review carefully.");
     expect(factory.args?.[1]).not.toContain("Code review skill instructions.");
     expect(factory.env).toMatchObject({
@@ -255,7 +255,7 @@ describe("CodexTerminalPlugin", () => {
     );
 
     expect(launch.command).toBe("/usr/bin/codex");
-    expect(launch.args).toEqual(["--add-dir", path.join(dataDir, "rules-skills")]);
+    expect(launch.args).toEqual(["--sandbox", "workspace-write", "--add-dir", path.join(dataDir, "rules-skills")]);
     expect(launch.overlay?.codexHome).toBe(path.join(dataDir, "codex-homes", "tab-99"));
     const overlayConfig = await fs.readFile(path.join(launch.overlay!.codexHome, "config.toml"), "utf8");
     expect(overlayConfig).toContain("model = \"gpt-5.3-codex\"");
@@ -322,7 +322,14 @@ describe("CodexTerminalPlugin", () => {
   });
 
   it("builds Codex resume args from tab initial input", () => {
-    expect(buildCodexLaunchArgs(["--add-dir", "/tmp/rules"], { resume: { mode: "picker", all: true } })).toEqual(["--add-dir", "/tmp/rules", "resume", "--all"]);
+    expect(buildCodexLaunchArgs(["--sandbox", "workspace-write", "--add-dir", "/tmp/rules"], { resume: { mode: "picker", all: true } })).toEqual([
+      "--sandbox",
+      "workspace-write",
+      "--add-dir",
+      "/tmp/rules",
+      "resume",
+      "--all"
+    ]);
     expect(buildCodexLaunchArgs([], { resume: { mode: "session", sessionId: "session-example" } })).toEqual([
       "resume",
       "session-example"
