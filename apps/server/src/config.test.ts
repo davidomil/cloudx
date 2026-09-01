@@ -37,12 +37,27 @@ describe("loadConfig", () => {
     expect(config.voiceAudioUploadMaxBytes).toBe(DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES);
   });
 
-  it("rejects network-facing binds without an application identity boundary", () => {
+  it("allows an explicit all-IPv4 bind only with an exact trusted browser origin", () => {
     expect(() => loadConfig({ CLOUDX_HOST: "0.0.0.0" } as NodeJS.ProcessEnv)).toThrow(
-      /loopback.*authenticated reverse proxy/i
+      /CLOUDX_TRUSTED_ORIGINS.*0\.0\.0\.0/i
     );
+    expect(loadConfig({
+      CLOUDX_HOST: "0.0.0.0",
+      CLOUDX_TRUSTED_ORIGINS: "https://192.168.8.250:3001",
+      CLOUDX_HTTPS_KEY_PATH: "key.pem",
+      CLOUDX_HTTPS_CERT_PATH: "cert.pem"
+    } as NodeJS.ProcessEnv)).toMatchObject({
+      host: "0.0.0.0",
+      trustedOrigins: [
+        "https://127.0.0.1:3001",
+        "https://192.168.8.250:3001"
+      ]
+    });
     expect(() => loadConfig({ CLOUDX_HOST: "::" } as NodeJS.ProcessEnv)).toThrow(
-      /loopback.*authenticated reverse proxy/i
+      /CLOUDX_HOST.*127\.0\.0\.1.*0\.0\.0\.0/i
+    );
+    expect(() => loadConfig({ CLOUDX_HOST: "192.168.8.250" } as NodeJS.ProcessEnv)).toThrow(
+      /CLOUDX_HOST.*127\.0\.0\.1.*0\.0\.0\.0/i
     );
     expect(loadConfig({ CLOUDX_HOST: "localhost" } as NodeJS.ProcessEnv).host).toBe("localhost");
     expect(loadConfig({ CLOUDX_HOST: "::1" } as NodeJS.ProcessEnv).host).toBe("::1");

@@ -15,7 +15,7 @@ import {
 import { DEFAULT_TERMINAL_REPLAY_BYTES } from "./plugins/CodexTerminalPlugin.js";
 
 export const DEFAULT_CLOUDX_HOST = "127.0.0.1";
-const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
+const ALLOWED_BIND_HOSTS = new Set(["127.0.0.1", "::1", "localhost", "0.0.0.0"]);
 export const DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES = 25 * 1024 * 1024;
 export const MAX_VOICE_AUDIO_UPLOAD_MAX_BYTES = 512 * 1024 * 1024;
 export const DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES = 256 * 1024 * 1024;
@@ -51,7 +51,7 @@ export interface AppConfig {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
-  const host = parseLoopbackHost(env.CLOUDX_HOST ?? DEFAULT_CLOUDX_HOST);
+  const host = parseBindHost(env.CLOUDX_HOST ?? DEFAULT_CLOUDX_HOST);
   const port = parsePositiveInteger(env.CLOUDX_PORT ?? "3001", "CLOUDX_PORT");
   const logLevel = parseLogLevel(env.CLOUDX_LOG_LEVEL ?? "info");
   const terminalReplayBytes = parsePositiveInteger(env.CLOUDX_TERMINAL_REPLAY_BYTES ?? String(DEFAULT_TERMINAL_REPLAY_BYTES), "CLOUDX_TERMINAL_REPLAY_BYTES");
@@ -65,8 +65,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const dataDir = path.resolve(env.CLOUDX_DATA_DIR ?? path.join(repoRoot, ".cloudx"));
   const https = resolveHttpsConfig(env, dataDir);
-  const directOrigin = canonicalDirectOrigin(host, port, Boolean(https));
-  const trustedOrigins = parseTrustedOrigins(env.CLOUDX_TRUSTED_ORIGINS, directOrigin);
+  const directOrigin = canonicalDirectOrigin(
+    host === "0.0.0.0" ? DEFAULT_CLOUDX_HOST : host,
+    port,
+    Boolean(https)
+  );
+  const trustedOrigins = parseTrustedOrigins(
+    env.CLOUDX_TRUSTED_ORIGINS,
+    directOrigin,
+    host === "0.0.0.0"
+  );
   const allowedRoots = (env.CLOUDX_ALLOWED_ROOTS ?? home)
     .split(path.delimiter)
     .map((root) => root.trim())
@@ -120,8 +128,19 @@ function canonicalDirectOrigin(host: string, port: number, secure: boolean): str
   return new URL(`${secure ? "https" : "http"}://${authority}:${port}`).origin;
 }
 
-function parseTrustedOrigins(value: string | undefined, directOrigin: string): string[] {
-  if (value === undefined) return [directOrigin];
+function parseTrustedOrigins(
+  value: string | undefined,
+  directOrigin: string,
+  requiresNetworkOrigin: boolean
+): string[] {
+  if (value === undefined) {
+    if (requiresNetworkOrigin) {
+      throw new Error(
+        "CLOUDX_TRUSTED_ORIGINS must include the exact browser origin when CLOUDX_HOST is 0.0.0.0."
+      );
+    }
+    return [directOrigin];
+  }
   const configured = value.split(",").map((element) => parseTrustedOrigin(element));
   const unique = new Set(configured);
   if (unique.size !== configured.length) {
@@ -175,11 +194,11 @@ function parseVoiceModel(value: string): string {
   return trimmed;
 }
 
-function parseLoopbackHost(value: string): string {
+function parseBindHost(value: string): string {
   const host = value.trim().toLowerCase();
-  if (!LOOPBACK_HOSTS.has(host)) {
+  if (!ALLOWED_BIND_HOSTS.has(host)) {
     throw new Error(
-      "CLOUDX_HOST must be a loopback host. Put an authenticated reverse proxy in front of Cloudx for remote access."
+      "CLOUDX_HOST must be 127.0.0.1, ::1, localhost, or the explicit trusted-LAN wildcard 0.0.0.0."
     );
   }
   return host;

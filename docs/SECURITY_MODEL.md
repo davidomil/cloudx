@@ -4,8 +4,10 @@ Private by default. Tailnet recommended. Public internet unsupported.
 
 Cloudx is a local-first mobile workbench for Codex CLI. It is designed for a
 single trusted developer running Cloudx on their own Linux workstation, devbox,
-or homelab server. The process listens only on loopback; remote clients reach it
-through an authenticated reverse proxy on a private network.
+or homelab server. The process listens on loopback by default; remote clients
+should normally reach it through an authenticated reverse proxy on a private
+network. Direct IPv4 LAN binding is an explicit, less-safe opt-in for a trusted,
+firewalled network.
 
 ## What Cloudx Can Do
 
@@ -44,10 +46,34 @@ https://127.0.0.1:3001
 This is the recommended baseline because the app can control terminals and
 files as the local user running Cloudx.
 
+## Direct Trusted-LAN Access
+
+Set the listener to the explicit IPv4 wildcard and admit the exact URL that the
+browser will use:
+
+```bash
+CLOUDX_HOST=0.0.0.0
+CLOUDX_TRUSTED_ORIGINS=https://192.168.8.250:3001
+```
+
+Restart Cloudx, then open `https://192.168.8.250:3001`. `0.0.0.0` is a listener
+wildcard, not a client URL. If the existing certificate does not include that
+IP address, regenerate it before restarting:
+
+```bash
+CLOUDX_CERT_HOSTS=192.168.8.250 npm run cert:create -- --force
+```
+
+This mode has no Cloudx authentication. The exact Host/Origin checks reduce
+browser-origin exposure but are not an authorization boundary; a raw client can
+choose its own `Host` header. Restrict port `3001` with host firewall and LAN
+controls, use it only where every network client is trusted, and never expose it
+to the public internet or an untrusted LAN.
+
 ## Authenticated Tailnet Access
 
-Network-facing `CLOUDX_HOST` values are rejected. Keep Cloudx on localhost and
-use an identity-aware tailnet proxy. First admit the exact externally visible
+Keep Cloudx on localhost and use an identity-aware tailnet proxy. First admit
+the exact externally visible
 origin, without a path or trailing slash, in the installer-owned environment
 file. Restart Cloudx so the service reads that environment before enabling the
 proxy:
@@ -74,10 +100,13 @@ proxy without identity-aware access control is not enough for this threat model.
 
 ## Request Origin Admission
 
-Cloudx derives one trusted origin from its configured loopback listener, port,
-and HTTP/HTTPS mode. `CLOUDX_TRUSTED_ORIGINS` adds exact canonical HTTP(S)
-origins for a separate Vite server or authenticated reverse proxy. The variable
-is a comma-separated list without paths or trailing slashes:
+Cloudx derives one trusted loopback origin from its configured port and
+HTTP/HTTPS mode, including when it listens on the IPv4 wildcard, so local health
+checks and internal helpers remain admitted. `CLOUDX_TRUSTED_ORIGINS` adds exact
+canonical HTTP(S) origins for the actual browser URL, a separate Vite server, or
+an authenticated reverse proxy. It is required when `CLOUDX_HOST=0.0.0.0`,
+because a browser never uses the wildcard as its destination. The variable is a
+comma-separated list without paths or trailing slashes:
 
 ```bash
 CLOUDX_TRUSTED_ORIGINS=https://build-host.example.ts.net,http://127.0.0.1:5173
@@ -102,6 +131,8 @@ browser Origin is explicitly configured.
 - Tailscale Serve with grants or ACLs.
 - Another reverse proxy only with external authentication and a private network
   boundary.
+- Direct `0.0.0.0` binding only on an entirely trusted LAN with a host firewall;
+  this is less safe because Cloudx does not authenticate direct clients.
 
 ## Operational Checks
 

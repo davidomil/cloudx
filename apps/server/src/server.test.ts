@@ -13,6 +13,7 @@ import { DEFAULT_ASR_TIMEOUT_MS } from "./asrClient.js";
 import {
   DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES,
   DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES,
+  loadConfig,
   type AppConfig,
 } from "./config.js";
 import { DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES } from "./documentation/DocumentationClient.js";
@@ -242,6 +243,48 @@ describe("buildServer", () => {
     } finally {
       blockedClient?.terminate();
       allowedClient?.terminate();
+      await app.close();
+    }
+  });
+
+  it("admits an explicit all-IPv4 listener only through its configured LAN origin", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-lan-origin-admission-"));
+    const config = {
+      ...testConfig(root),
+      ...loadConfig({
+        HOME: root,
+        CLOUDX_ALLOWED_ROOTS: root,
+        CLOUDX_DATA_DIR: path.join(root, ".cloudx"),
+        CLOUDX_HOST: "0.0.0.0",
+        CLOUDX_TRUSTED_ORIGINS: "http://192.0.2.10:3001",
+        CLOUDX_APP_SERVER_ENABLED: "false",
+      } as NodeJS.ProcessEnv),
+      webDistDir: path.join(root, "missing-web-dist"),
+    };
+    const app = await buildServer(config);
+    try {
+      await app.listen({ host: config.host, port: 0 });
+      const address = app.server.address();
+      if (!address || typeof address === "string") throw new Error("Expected TCP server address.");
+      const requestStatus = (host: string, origin?: string) => new Promise<number>((resolve, reject) => {
+        const request = http.request({
+          host: "127.0.0.1",
+          port: address.port,
+          method: "DELETE",
+          path: "/api/notifications",
+          headers: origin ? { host, origin } : { host },
+        }, (response) => {
+          response.resume();
+          response.on("end", () => resolve(response.statusCode ?? 0));
+        });
+        request.on("error", reject);
+        request.end();
+      });
+
+      await expect(requestStatus("127.0.0.1:3001")).resolves.toBe(200);
+      await expect(requestStatus("192.0.2.10:3001", "http://192.0.2.10:3001")).resolves.toBe(200);
+      await expect(requestStatus("192.0.2.11:3001", "http://192.0.2.11:3001")).resolves.toBe(403);
+    } finally {
       await app.close();
     }
   });

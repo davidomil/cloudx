@@ -53,6 +53,7 @@ import {
   ubuntuBootstrapPlan,
   ubuntuPrerequisiteVerificationPlan,
   updateEnvFileContent,
+  updateHostFromEnvConfig,
   validateCpuThreads,
 } from "./install-cloudx.mjs";
 
@@ -75,6 +76,23 @@ function expectRuntimeSchemaWrites(runner, root) {
 describe("install-cloudx helpers", () => {
   it("pins the supported Codex CLI release literally", () => {
     expect(CODEX_CLI_VERSION).toBe("0.152.0");
+  });
+
+  it.each([
+    [
+      "an explicit wildcard bind with a trusted origin",
+      {
+        CLOUDX_HOST: "0.0.0.0",
+        CLOUDX_TRUSTED_ORIGINS: "https://192.168.8.250:3001",
+      },
+      "0.0.0.0",
+    ],
+    ["a wildcard bind without trusted origins", { CLOUDX_HOST: "0.0.0.0" }, "127.0.0.1"],
+    ["an IPv6 wildcard", { CLOUDX_HOST: "::", CLOUDX_TRUSTED_ORIGINS: "https://cloudx.example" }, "127.0.0.1"],
+    ["an arbitrary address", { CLOUDX_HOST: "192.168.8.250", CLOUDX_TRUSTED_ORIGINS: "https://cloudx.example" }, "127.0.0.1"],
+    ["an arbitrary hostname", { CLOUDX_HOST: "cloudx.example", CLOUDX_TRUSTED_ORIGINS: "https://cloudx.example" }, "127.0.0.1"],
+  ])("selects the safe update host for %s", (_label, envConfig, expected) => {
+    expect(updateHostFromEnvConfig(envConfig)).toBe(expected);
   });
 
   it("documents attended defaults for noninteractive no-start and answer-file installs", () => {
@@ -1526,7 +1544,7 @@ describe("runInstaller dry-run", () => {
     fs.mkdirSync(path.join(home, ".config/systemd/user"), { recursive: true });
     fs.writeFileSync(
       path.join(home, ".config/cloudx/cloudx.env"),
-      "CLOUDX_HOST=0.0.0.0\nCLOUDX_PORT=3443\nCLOUDX_ASR_DEVICE=cuda\nCLOUDX_ASR_COMPUTE_TYPE=int8_float16\nCLOUDX_DOCUMENTATION_URL=http://127.0.0.1:9000\n",
+      "CLOUDX_HOST=0.0.0.0\nCLOUDX_PORT=3443\nCLOUDX_TRUSTED_ORIGINS=https://192.168.8.250:3443\nCLOUDX_ASR_DEVICE=cuda\nCLOUDX_ASR_COMPUTE_TYPE=int8_float16\nCLOUDX_DOCUMENTATION_URL=http://127.0.0.1:9000\n",
     );
     fs.writeFileSync(
       path.join(home, ".config/systemd/user/cloudx.service"),
@@ -1577,8 +1595,10 @@ describe("runInstaller dry-run", () => {
     expect(updatedEnv).toContain(
       `CLOUDX_TOOL_PATH=${path.join(codexPrefix, "bin")}:/usr/bin`,
     );
-    expect(updatedEnv).toContain("CLOUDX_HOST=127.0.0.1");
-    expect(updatedEnv).not.toContain("CLOUDX_HOST=0.0.0.0");
+    expect(updatedEnv).toContain("CLOUDX_HOST=0.0.0.0");
+    expect(updatedEnv).toContain(
+      "CLOUDX_TRUSTED_ORIGINS=https://192.168.8.250:3443",
+    );
     expect(updatedEnv).toContain("CLOUDX_ASR_DEVICE=cuda");
     expect(updatedEnv).toContain("CLOUDX_ASR_COMPUTE_TYPE=int8_float16");
     expect(updatedEnv).toContain(

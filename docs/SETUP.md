@@ -15,8 +15,9 @@ to run Cloudx with voice control.
 - Quarto, Pandoc, and TeX Live XeLaTeX/LuaLaTeX engines for rendering the
   memory-plugin guide PDF. The Ubuntu installer installs these.
 - Codex CLI installed and authenticated on the backend host.
-- An authenticated reverse proxy such as Tailscale Serve for remote
-  laptop/phone access.
+- An authenticated reverse proxy such as Tailscale Serve is recommended for
+  remote laptop/phone access. Direct LAN binding is supported only as an
+  explicit trusted-network opt-in.
 
 `node-pty` is optional because native builds vary by host. Terminal plugins fail
 clearly at runtime if it is unavailable.
@@ -92,10 +93,9 @@ prints command working directories, allowlisted installer environment values,
 captured stdout/stderr from probes, service unit write paths, and health-check
 failure context.
 
-Cloudx binds to `127.0.0.1` as a hard security boundary. For a
-tailnet-authenticated path, add the exact externally visible origin to the
-installed environment file, restart Cloudx, and proxy the loopback service with
-Tailscale Serve:
+Cloudx binds to `127.0.0.1` by default. For a tailnet-authenticated path, add the
+exact externally visible origin to the installed environment file, restart
+Cloudx, and proxy the loopback service with Tailscale Serve:
 
 ```bash
 printf '%s\n' 'CLOUDX_TRUSTED_ORIGINS=https://build-host.example.ts.net' \
@@ -106,6 +106,21 @@ tailscale serve --bg https+insecure://localhost:3001
 
 Use Tailscale grants or ACLs so only the intended users and devices can reach
 the Cloudx node.
+
+For a direct trusted-LAN path, set both values in the installed environment
+file, restart Cloudx, and browse to the concrete LAN URL:
+
+```bash
+CLOUDX_HOST=0.0.0.0
+CLOUDX_TRUSTED_ORIGINS=https://192.168.8.250:3001
+```
+
+Open `https://192.168.8.250:3001`, not `0.0.0.0`. If that IP is absent from the
+certificate, run `CLOUDX_CERT_HOSTS=192.168.8.250 npm run cert:create -- --force`
+before restarting. Host/Origin admission is not authentication because a raw
+client controls its headers. Permit port `3001` only from a fully trusted LAN
+with host firewall rules; never use this mode on an untrusted LAN or the public
+internet. See `docs/SECURITY_MODEL.md` for the complete boundary.
 
 The answers JSON can contain:
 
@@ -172,7 +187,9 @@ does the operational refresh:
 - Rewrites user-level systemd service files when they are already installed.
 - Asks whether to restart services now; if restarted, it verifies the Cloudx,
   ASR, and documentation indexer readiness endpoints and then prints the local URL.
-  Updates replace an older network-facing `CLOUDX_HOST` with `127.0.0.1`.
+  Updates preserve exact `CLOUDX_HOST=0.0.0.0` only when a nonempty
+  `CLOUDX_TRUSTED_ORIGINS` is also present. Other network-facing values and an
+  incomplete wildcard configuration are replaced with `127.0.0.1`.
 
 Preview update without changing the system:
 
@@ -604,12 +621,15 @@ authorization, and process isolation.
 
 ## Full Configuration
 
-- `CLOUDX_HOST`: loopback bind host, default `127.0.0.1`. Network-facing values
-  are rejected; use an authenticated reverse proxy for remote access.
+- `CLOUDX_HOST`: bind host, default `127.0.0.1`. The only supported
+  network-facing value is the explicit IPv4 wildcard `0.0.0.0`; it requires a
+  nonempty `CLOUDX_TRUSTED_ORIGINS`. Arbitrary addresses, hostnames, and the
+  IPv6 wildcard are rejected.
 - `CLOUDX_PORT`: server port, default `3001`.
 - `CLOUDX_TRUSTED_ORIGINS`: comma-separated additional canonical HTTP(S)
-  origins for Vite and authenticated reverse proxies. Do not include a trailing
-  slash or repeat the listener origin. Absence means no extras; a present empty
+  origins for the actual browser URL, Vite, and authenticated reverse proxies.
+  Do not include a trailing slash or repeat the built-in loopback origin. Absence means
+  no extras except that `0.0.0.0` requires at least one; a present empty
   value, empty element, duplicate, or noncanonical origin fails startup. This
   intentionally rejects unconfigured loopback aliases, alternate ports, Vite
   origins, and reverse-proxy authorities.

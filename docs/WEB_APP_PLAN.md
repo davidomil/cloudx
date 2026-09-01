@@ -4,7 +4,7 @@
 
 Cloudx is a private web workbench for Codex CLI sessions. It provides a responsive app that works on desktop and phone, tmux-like tabs and split panes, a plugin system for panels, and push-to-talk voice control backed by local Faster Whisper plus a restricted Codex controller.
 
-V1 is private by default. The server binds only to a loopback host; remote access uses an authenticated reverse proxy such as Tailscale Serve. Public internet exposure is not supported.
+V1 is private by default. The server binds to loopback unless a trusted operator explicitly selects the IPv4 wildcard with an exact browser origin and a firewalled LAN. An authenticated reverse proxy such as Tailscale Serve remains the recommended remote-access path. Public internet exposure is not supported.
 
 ## Source Notes
 

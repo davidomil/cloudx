@@ -413,6 +413,14 @@ export function buildEnvLines(config) {
   return lines;
 }
 
+export function updateHostFromEnvConfig(envConfig) {
+  return envConfig.CLOUDX_HOST === "0.0.0.0" &&
+    typeof envConfig.CLOUDX_TRUSTED_ORIGINS === "string" &&
+    envConfig.CLOUDX_TRUSTED_ORIGINS.trim()
+    ? "0.0.0.0"
+    : "127.0.0.1";
+}
+
 export function renderEnvFile(config) {
   return buildEnvLines(config).join("\n");
 }
@@ -1402,7 +1410,7 @@ async function runUpdater({
 
   const envConfig = readEnvFile(paths.envPath);
   const port = Number.parseInt(envConfig.CLOUDX_PORT ?? "3001", 10);
-  const host = "127.0.0.1";
+  const host = updateHostFromEnvConfig(envConfig);
   const servicesInstalled =
     SERVICE_NAMES.some((serviceName) =>
       fs.existsSync(path.join(paths.systemdDir, serviceName)),

@@ -14,7 +14,8 @@ Do not expose Cloudx to the public internet. It can spawn terminals, send text
 to shells and Codex, read and edit files under configured roots, and embed local
 dashboards with token-bearing URLs. Keep Cloudx on localhost and put an
 authenticated reverse proxy such as Tailscale Serve in front of it for remote
-access.
+access whenever possible. An explicit `0.0.0.0` bind is available for a trusted,
+firewalled LAN, but Cloudx does not authenticate direct LAN clients.
 
 ## Screenshots
 
@@ -186,8 +187,9 @@ question includes a short explanation of what the choice changes. The optional
 `whisper.cpp` step is not needed for CPU-only or NVIDIA CUDA installs because
 Faster Whisper handles those paths; use it only for an alternate compiled
 backend such as Intel Arc SYCL. The installer prints the local Cloudx URL when
-it finishes. Cloudx always binds to loopback; remote access requires an
-authenticated reverse proxy.
+it finishes. Fresh installs bind to loopback. Updates preserve an explicit
+`0.0.0.0` bind only when an exact browser origin is also configured in
+`CLOUDX_TRUSTED_ORIGINS`; otherwise they restore the loopback default.
 
 Preview the installer without changing the system:
 
@@ -253,8 +255,9 @@ tailscale serve --bg https+insecure://localhost:3001
 ```
 
 Use Tailscale grants or ACLs so only the intended users and devices can reach
-the node. Direct network binding is rejected because Cloudx can control shells
-and files.
+the node. For a direct trusted-LAN deployment, follow
+[`docs/SECURITY_MODEL.md`](docs/SECURITY_MODEL.md#direct-trusted-lan-access) and
+restrict the port with the host firewall.
 
 For voice control:
 
@@ -317,11 +320,13 @@ command submission without disabling the rest of Cloudx.
 
 Common environment variables:
 
-- `CLOUDX_HOST`: loopback bind host, default `127.0.0.1`; network-facing values are rejected.
+- `CLOUDX_HOST`: bind host, default `127.0.0.1`. The only network-facing value
+  accepted is the explicit IPv4 wildcard `0.0.0.0`, and it requires at least
+  one exact browser origin in `CLOUDX_TRUSTED_ORIGINS`.
 - `CLOUDX_PORT`: app port, default `3001`.
 - `CLOUDX_TRUSTED_ORIGINS`: comma-separated additional canonical HTTP(S)
-  origins for Vite or an authenticated reverse proxy. The configured listener
-  origin is always trusted and must not be repeated. An absent variable adds no
+  origins for Vite or an authenticated reverse proxy. The built-in loopback
+  service origin is always trusted and must not be repeated. An absent variable adds no
   extra origin; an empty value, duplicate, path, query, fragment, credential,
   trailing slash, or noncanonical origin fails startup.
 - `CLOUDX_LOG_LEVEL`: server log level, one of `fatal`, `error`, `warn`, `info`, `debug`, `trace`, or `silent`; default `info`.
