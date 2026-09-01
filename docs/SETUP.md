@@ -43,7 +43,7 @@ The installer is split into two visible phases:
    `git worktree list --porcelain -z`; on older Git packages it can add
    `ppa:git-core/ppa` and install the current stable Git package after approval.
 2. `scripts/install-cloudx.mjs` is the Cloudx wizard. It prints each phase as it
-   runs: pinned Codex CLI 0.144.6 verification/login, install choices, `npm ci`, a private
+   runs: pinned Codex CLI 0.152.0 verification/login, install choices, `npm ci`, a private
    `uv 0.11.28` bootstrap, locked ASR and documentation-indexer environments,
    optional alternate `whisper.cpp` ASR setup, Hugging Face model download,
    `npm run build`, certificate creation,
@@ -155,8 +155,11 @@ does the operational refresh:
 - Verifies Ubuntu prerequisites, Node.js, npm, and Git 2.36+ before any Codex or
   Cloudx npm commands run.
 - Pulls the current checkout with `git pull --ff-only`.
-- Updates the global Codex CLI package to 0.144.6 with npm and verifies Codex
+- Updates the global Codex CLI package to 0.152.0 with npm and verifies Codex
   login status.
+- Applies Cloudx's shared Codex terminal defaults to new and restarted tabs:
+  explicit `--yolo` execution, memories/Apps/Agent Plugins disabled, and only
+  Cloudx-provided skills plus `imagegen` enabled.
 - Records the resolved assistant executable path in `CLOUDX_ASSISTANT_BIN` and
   relevant command directories in `CLOUDX_TOOL_PATH` so Cloudx services do not
   depend on systemd's minimal `PATH`.

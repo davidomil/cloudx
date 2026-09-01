@@ -3,10 +3,11 @@ import os from "node:os";
 import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { parse } from "smol-toml";
 
 import type { TabIndicatorUpdate, WorkspaceTab } from "@cloudx/shared";
 
-import { CODEX_TERMINAL_ACTIONS, CodexTerminalPlugin, CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES, TERMINAL_ACTIONS, TerminalShellIntegrationParser, buildCodexLaunchArgs, codexResumeInput, materializeCodexTemplate } from "./CodexTerminalPlugin.js";
+import { CLOUDX_CODEX_DEFAULT_ARGS, CODEX_TERMINAL_ACTIONS, CodexTerminalPlugin, CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES, TERMINAL_ACTIONS, TerminalShellIntegrationParser, buildCodexLaunchArgs, codexResumeInput, materializeCodexTemplate } from "./CodexTerminalPlugin.js";
 import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
 
 class FakeTerminalProcess implements TerminalProcess {
@@ -92,7 +93,7 @@ describe("CodexTerminalPlugin", () => {
     await plugin.createSession({ tab, cwd: "/tmp", controls: { setTabIndicator: () => undefined, closeTab: () => undefined } });
 
     expect(factory.command).toBe("/bin/bash");
-    expect(factory.args).toEqual(["-lc", "exec /usr/bin/codex"]);
+    expect(factory.args).toEqual(["-lc", `exec /usr/bin/codex ${CLOUDX_CODEX_DEFAULT_ARGS.join(" ")}`]);
   });
 
   it("launches Codex resume for requested sessions", async () => {
@@ -108,7 +109,7 @@ describe("CodexTerminalPlugin", () => {
       initialInput: { resume: { mode: "last", all: true, includeNonInteractive: true } }
     });
 
-    expect(factory.args).toEqual(["-lc", "exec /usr/bin/codex resume --last --all --include-non-interactive"]);
+    expect(factory.args).toEqual(["-lc", `exec /usr/bin/codex ${CLOUDX_CODEX_DEFAULT_ARGS.join(" ")} resume --last --all --include-non-interactive`]);
   });
 
   it("quotes Codex resume session names through the login shell", async () => {
@@ -124,7 +125,7 @@ describe("CodexTerminalPlugin", () => {
       initialInput: { resume: { mode: "session", sessionId: "release fix thread" } }
     });
 
-    expect(factory.args).toEqual(["-lc", "exec /usr/bin/codex resume 'release fix thread'"]);
+    expect(factory.args).toEqual(["-lc", `exec /usr/bin/codex ${CLOUDX_CODEX_DEFAULT_ARGS.join(" ")} resume 'release fix thread'`]);
   });
 
   it("launches resolved template rules and skills through a Codex home overlay", async () => {
@@ -133,6 +134,7 @@ describe("CodexTerminalPlugin", () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-overlay-"));
     const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-base-codex-home-"));
     vi.stubEnv("CODEX_HOME", codexHome);
+    await seedImagegenSkill(codexHome);
     await fs.writeFile(path.join(codexHome, "AGENTS.md"), [
       "Prefer direct answers.",
       "",
@@ -203,10 +205,12 @@ describe("CodexTerminalPlugin", () => {
     expect(overlayConfig).toContain("skills/cloudx/code-review/SKILL.md");
     expect(overlayConfig).toContain("skills/cloudx-system/create-cloudx-skill/SKILL.md");
     expect(overlayConfig).toContain("skills/cloudx-system/documentation-search/SKILL.md");
+    expect(overlayConfig).toContain("skills/cloudx-exceptions/imagegen/SKILL.md");
     await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx", "code-review", "SKILL.md"), "utf8")).resolves.toContain("Code review skill instructions.");
     await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx-system", "create-cloudx-skill", "SKILL.md"), "utf8")).resolves.toContain("Create CloudX Skill");
     await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx-system", "documentation-search", "SKILL.md"), "utf8")).resolves.toContain("Documentation search skill instructions.");
     await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx-system", "documentation-search", "scripts", "cloudx-doc.mjs"), "utf8")).resolves.toContain("helper");
+    await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx-exceptions", "imagegen", "SKILL.md"), "utf8")).resolves.toContain("Image generation instructions.");
     const overlayInstructions = await fs.readFile(path.join(factory.env!.CODEX_HOME!, "AGENTS.override.md"), "utf8");
     expect(overlayInstructions).toContain("Prefer direct answers.");
     expect(overlayInstructions).toContain("Keep local notes.");
@@ -223,6 +227,7 @@ describe("CodexTerminalPlugin", () => {
   it("materializes resolved template fields into a Codex home overlay", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-materialized-overlay-"));
     const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-materialized-base-"));
+    await seedImagegenSkill(codexHome);
     await seedSkill(dataDir, "reviewer", "Reviewer", "Reviewer skill.", "Reviewer skill instructions.");
     await seedSkill(dataDir, "testing", "Testing", "Testing skill.", "Testing skill instructions.");
     await fs.writeFile(path.join(codexHome, "config.toml"), [
@@ -255,7 +260,7 @@ describe("CodexTerminalPlugin", () => {
     );
 
     expect(launch.command).toBe("/usr/bin/codex");
-    expect(launch.args).toEqual(["--add-dir", path.join(dataDir, "rules-skills")]);
+    expect(launch.args).toEqual([...CLOUDX_CODEX_DEFAULT_ARGS, "--add-dir", path.join(dataDir, "rules-skills")]);
     expect(launch.overlay?.codexHome).toBe(path.join(dataDir, "codex-homes", "tab-99"));
     const overlayConfig = await fs.readFile(path.join(launch.overlay!.codexHome, "config.toml"), "utf8");
     expect(overlayConfig).toContain("model = \"gpt-5.3-codex\"");
@@ -279,6 +284,7 @@ describe("CodexTerminalPlugin", () => {
   it("can update a materialized Codex home overlay without deleting existing runtime state", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-live-overlay-"));
     const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-live-base-"));
+    await seedImagegenSkill(codexHome);
     await seedSkill(dataDir, "reviewer", "Reviewer", "Reviewer skill.", "Reviewer skill instructions.");
     await seedSkill(dataDir, "tester", "Tester", "Tester skill.", "Tester skill instructions.");
     const first = await materializeCodexTemplate(
@@ -316,7 +322,7 @@ describe("CodexTerminalPlugin", () => {
     const launch = await materializeCodexTemplate(undefined, { CLOUDX_ASSISTANT_BIN: "/usr/bin/codex" });
 
     expect(launch.command).toBe("/usr/bin/codex");
-    expect(launch.args).toEqual([]);
+    expect(launch.args).toEqual(CLOUDX_CODEX_DEFAULT_ARGS);
     expect(launch.overlay).toBeUndefined();
     expect(launch.env.CLOUDX_PERSONALITY_TEMPLATE_ID).toBeUndefined();
   });
@@ -347,6 +353,7 @@ describe("CodexTerminalPlugin", () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-live-update-"));
     const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-live-home-"));
     vi.stubEnv("CODEX_HOME", codexHome);
+    await seedImagegenSkill(codexHome);
     await seedSkill(dataDir, "tester", "Tester", "Tester skill.", "Tester skill instructions.");
     await seedSystemRule(dataDir, "documentation-ingest-evidence", "Ingest evidence.", "Download evidence into the documentation archive.");
     await seedSystemSkill(dataDir, "documentation-search", "Documentation Search", "Search documentation.", "Documentation search skill instructions.");
@@ -384,6 +391,74 @@ describe("CodexTerminalPlugin", () => {
     expect(factory.process!.written).toContain("before answering any factual, research, recipe, recommendation, troubleshooting, summary, or source-grounded question");
     expect(factory.process!.written.endsWith("\u001b[201~\r")).toBe(true);
     await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx", "tester", "SKILL.md"), "utf8")).resolves.toContain("Tester skill instructions.");
+  });
+
+  it("shares locked-down Codex defaults and disables non-CloudX discovered skills", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-defaults-data-"));
+    const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-defaults-home-"));
+    const codexHome = path.join(homeDir, ".codex");
+    const repoRoot = path.join(homeDir, "repo");
+    const cwd = path.join(repoRoot, "packages", "app");
+    await fs.mkdir(path.join(repoRoot, ".git"), { recursive: true });
+    await fs.mkdir(cwd, { recursive: true });
+    await seedImagegenSkill(codexHome);
+    const homeSkill = await seedExternalSkill(path.join(homeDir, ".agents", "skills"), "home-skill");
+    const repoSkill = await seedExternalSkill(path.join(repoRoot, ".agents", "skills"), "repo-skill");
+    const nestedSkill = await seedExternalSkill(path.join(repoRoot, "packages", ".agents", "skills"), "nested-skill");
+    const projectConfigSkill = await seedExternalSkill(path.join(repoRoot, ".codex", "skills"), "project-config-skill");
+    await fs.writeFile(path.join(codexHome, "config.toml"), [
+      'model = "gpt-5.6"',
+      "",
+      "[features]",
+      "apps = true",
+      "memories = true",
+      "plugins = true",
+      "",
+      "[memories]",
+      "generate_memories = true",
+      "use_memories = true",
+      "",
+      "[skills.bundled]",
+      "enabled = true",
+      "",
+      "[[skills.config]]",
+      'name = "unwanted"',
+      "enabled = true"
+    ].join("\n"), "utf8");
+
+    const launch = await materializeCodexTemplate(
+      undefined,
+      { CLOUDX_ASSISTANT_BIN: "/usr/bin/codex", CODEX_HOME: codexHome, HOME: homeDir },
+      { dataDir, tabId: "locked-down", cwd }
+    );
+
+    expect(launch.args).toEqual([...CLOUDX_CODEX_DEFAULT_ARGS, "--add-dir", path.join(dataDir, "rules-skills")]);
+    const config = parse(await fs.readFile(launch.overlay!.configPath, "utf8"));
+    expect(config.model).toBe("gpt-5.6");
+    expect(config.features).toMatchObject({ apps: false, memories: false, plugins: false });
+    expect(config.memories).toMatchObject({ generate_memories: false, use_memories: false });
+    expect(config.skills).toMatchObject({ bundled: { enabled: false } });
+    const skillConfig = (config.skills as { config: Array<{ path: string; enabled: boolean }> }).config;
+    expect(skillConfig).toEqual(expect.arrayContaining([
+      { path: await fs.realpath(homeSkill), enabled: false },
+      { path: await fs.realpath(repoSkill), enabled: false },
+      { path: await fs.realpath(nestedSkill), enabled: false },
+      { path: await fs.realpath(projectConfigSkill), enabled: false },
+      { path: path.join(launch.overlay!.codexHome, "skills", "cloudx-exceptions", "imagegen", "SKILL.md"), enabled: true }
+    ]));
+    expect(skillConfig).not.toContainEqual(expect.objectContaining({ name: "unwanted" }));
+    await expect(fs.readFile(path.join(launch.overlay!.codexHome, "skills", "cloudx-exceptions", "imagegen", "scripts", "image_gen.py"), "utf8")).resolves.toContain("imagegen helper");
+  });
+
+  it("fails clearly when the required imagegen exception is unavailable", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-missing-imagegen-data-"));
+    const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-missing-imagegen-home-"));
+
+    await expect(materializeCodexTemplate(
+      undefined,
+      { CLOUDX_ASSISTANT_BIN: "/usr/bin/codex", CODEX_HOME: codexHome },
+      { dataDir, tabId: "missing-imagegen", cwd: "/tmp" }
+    )).rejects.toThrow("Required Codex imagegen skill is missing");
   });
 });
 
@@ -723,4 +798,19 @@ async function seedSystemSkill(dataDir: string, id: string, name: string, descri
     `---\nname: "${id}"\ndescription: "${description}"\ncloudx_name: "${name}"\n---\n\n${body}\n`,
     "utf8"
   );
+}
+
+async function seedImagegenSkill(codexHome: string): Promise<void> {
+  const skillDir = path.join(codexHome, "skills", ".system", "imagegen");
+  await fs.mkdir(path.join(skillDir, "scripts"), { recursive: true });
+  await fs.writeFile(path.join(skillDir, "SKILL.md"), "---\nname: imagegen\ndescription: Generate images.\n---\n\nImage generation instructions.\n", "utf8");
+  await fs.writeFile(path.join(skillDir, "scripts", "image_gen.py"), "# imagegen helper\n", "utf8");
+}
+
+async function seedExternalSkill(skillsRoot: string, id: string): Promise<string> {
+  const skillDir = path.join(skillsRoot, id);
+  await fs.mkdir(skillDir, { recursive: true });
+  const skillPath = path.join(skillDir, "SKILL.md");
+  await fs.writeFile(skillPath, `---\nname: ${id}\ndescription: External test skill.\n---\n`, "utf8");
+  return skillPath;
 }

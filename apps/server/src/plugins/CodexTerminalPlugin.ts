@@ -22,6 +22,17 @@ export const CODEX_READY_QUIET_MS = 350;
 export const CODEX_READY_TIMEOUT_MS = 30_000;
 export const CODEX_READY_MAX_TIMEOUT_MS = 10 * 60 * 1000;
 export const CODEX_READY_MAX_QUIET_MS = 10_000;
+export const CLOUDX_CODEX_DEFAULT_ARGS = [
+  "--yolo",
+  "--disable",
+  "apps",
+  "--disable",
+  "memories",
+  "--disable",
+  "plugins",
+  "--config",
+  "skills.bundled.enabled=false"
+] as const;
 const MAX_OSC_SEQUENCE_CHARS = 4096;
 
 export const TERMINAL_ACTIONS: PluginActionDefinition[] = terminalActions({
@@ -83,7 +94,8 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     const template = templateFromRuntimeContext(input.runtimeContext);
     const launchTemplate = await materializeCodexTemplate(template, process.env, {
       dataDir: this.dataDir,
-      tabId: input.tab.id
+      tabId: input.tab.id,
+      cwd: input.cwd
     });
     const command = launchTemplate.command;
     const launchArgs = buildCodexLaunchArgs(launchTemplate.args, input.initialInput);
@@ -107,6 +119,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
         const nextLaunchTemplate = await materializeCodexTemplate(nextTemplate, process.env, {
           dataDir: this.dataDir,
           tabId: input.tab.id,
+          cwd: input.cwd,
           resetOverlay: false
         });
         return {
@@ -228,6 +241,7 @@ export interface MaterializedCodexTemplate {
 export interface MaterializeCodexTemplateOptions {
   dataDir?: string;
   tabId?: string;
+  cwd?: string;
   resetOverlay?: boolean;
 }
 
@@ -237,10 +251,10 @@ export async function materializeCodexTemplate(
   options: MaterializeCodexTemplateOptions = {}
 ): Promise<MaterializedCodexTemplate> {
   const env = buildToolEnv(baseEnv);
-  const args: string[] = [];
+  const args: string[] = [...CLOUDX_CODEX_DEFAULT_ARGS];
   const dataDir = options.dataDir;
   const overlay = dataDir && options.tabId
-    ? await materializeCodexHomeOverlay({ dataDir, tabId: options.tabId, resolved, baseEnv: env, resetCodexHome: options.resetOverlay })
+    ? await materializeCodexHomeOverlay({ dataDir, tabId: options.tabId, resolved, baseEnv: env, cwd: options.cwd, resetCodexHome: options.resetOverlay })
     : undefined;
   if (overlay) {
     env.CODEX_HOME = overlay.codexHome;

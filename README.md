@@ -147,6 +147,14 @@ Cloudx saves each image under `.cloudx/pasted-images/` in the tab workspace and
 inserts an `@.cloudx/pasted-images/...` reference into the Codex prompt. Standard
 shell terminal tabs do not intercept image paste.
 
+Every Cloudx Codex terminal uses the same managed safety and capability defaults:
+Codex runs in explicit `--yolo` mode, local memories and Codex Apps are disabled,
+and Agent Plugins are disabled so their skills cannot enter the session. Cloudx
+enables only its selected and system skills plus the bundled `imagegen` skill;
+user, administrator, and repository skills discovered outside that set are
+disabled in the tab's generated Codex home. Model and display preferences still
+come from the user's base Codex config.
+
 ## Quick Start
 
 On Ubuntu 22.04 or newer, the guided installer is the easiest path:
@@ -167,7 +175,7 @@ guide. It then installs Node.js 22 when needed, verifies `node -v` and
 Worktree Manager and, on older Ubuntu Git packages such as 22.04's 2.34.x,
 offers to install the current stable Git package from `ppa:git-core/ppa`.
 The wizard then installs Cloudx npm dependencies, installs and checks the pinned
-Codex CLI 0.144.6 release,
+Codex CLI 0.152.0 release,
 prepares the Faster Whisper ASR environment, prepares the documentation archive
 indexer environment, downloads the local ASR model, writes Cloudx config, and
 optionally installs user-level services for Cloudx, ASR, and the documentation
