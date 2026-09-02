@@ -112,6 +112,8 @@ const MIN_STREAMED_AUDIO_BYTES = 128;
 const VOICE_WS_CONTROL_MESSAGE_MAX_BYTES = 64 * 1024;
 const TERMINAL_WS_CONTROL_MESSAGE_MAX_BYTES = 256 * 1024;
 export const TERMINAL_WS_MAX_BUFFERED_BYTES = 1024 * 1024;
+const TERMINAL_REPLAY_JSON_ESCAPE_MULTIPLIER = 6;
+const TERMINAL_DATA_MESSAGE_ENVELOPE_BYTES = Buffer.byteLength(JSON.stringify({ type: "data", data: "" }), "utf8");
 const MAX_TERMINAL_DIMENSION = 500;
 const FILE_UPLOAD_MAX_BYTES = 25 * 1024 * 1024 * 1024;
 const WS_CONNECTING = 0;
@@ -1072,24 +1074,57 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       closeWebSocketSafely(ws, 1008, "Unknown terminal tab.");
       return;
     }
-    const failSend = (error: Error) => {
-      request.log.debug({ tabId, err: serializeError(error) }, "terminal websocket send failed");
-      closeWebSocketSafely(ws, 1011, "Terminal websocket send failed.");
-    };
-    const snapshot = session.snapshot();
-    if (snapshot.recentOutput) {
-      sendTerminalWebSocketJson(ws, { type: "data", data: snapshot.recentOutput }, failSend);
-    }
-    const dispose = session.onData?.((data) => {
-      sendTerminalWebSocketJson(ws, { type: "data", data }, failSend);
-    });
+    let replayState: "available" | "pending" | "settled" | "invalidated" = "settled";
+    let failed = false;
     let disposed = false;
+    let disposeData: (() => void) | undefined;
     const cleanup = () => {
       if (disposed) {
         return;
       }
       disposed = true;
-      dispose?.();
+      replayState = "invalidated";
+      const currentDispose = disposeData;
+      disposeData = undefined;
+      currentDispose?.();
+    };
+    const failSend = (error: Error) => {
+      if (failed || disposed) {
+        return;
+      }
+      failed = true;
+      request.log.debug({ tabId, err: serializeError(error) }, "terminal websocket send failed");
+      cleanup();
+      closeWebSocketSafely(ws, 1011, "Terminal websocket send failed.");
+    };
+    const sendLive = (data: string): boolean => {
+      if (failed || disposed) {
+        return false;
+      }
+      const accepted = sendTerminalWebSocketJson(ws, { type: "data", data }, failSend);
+      if (!accepted) {
+        failSend(new Error("Terminal websocket is not open."));
+      }
+      return accepted;
+    };
+    const sendReplay = (data: string): boolean => {
+      if (failed || disposed || replayState !== "available") {
+        return false;
+      }
+      replayState = "pending";
+      const accepted = sendTerminalWebSocketJson(ws, { type: "data", data }, failSend, {
+        policy: "replay",
+        rawByteLimit: config.terminalReplayBytes,
+        onComplete: () => {
+          if (!failed && !disposed && replayState === "pending") {
+            replayState = "settled";
+          }
+        }
+      });
+      if (!accepted) {
+        failSend(new Error("Terminal websocket replay was not accepted."));
+      }
+      return accepted;
     };
 
     ws.on("message", (raw, isBinary) => {
@@ -1108,6 +1143,24 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     });
     ws.on("close", cleanup);
     ws.on("error", cleanup);
+
+    const snapshot = session.snapshot();
+    if (snapshot.recentOutput) {
+      replayState = "available";
+      if (!sendReplay(snapshot.recentOutput) || failed || disposed) {
+        return;
+      }
+    }
+    const registeredDispose = session.onData?.((data) => {
+      sendLive(data);
+    });
+    if (registeredDispose) {
+      if (disposed) {
+        registeredDispose();
+      } else {
+        disposeData = registeredDispose;
+      }
+    }
   });
 
   if (fs.existsSync(config.webDistDir)) {
@@ -1874,11 +1927,59 @@ function parseWebSocketProtocols(value: string | string[] | undefined): string[]
   return protocols?.length ? protocols : undefined;
 }
 
-export function sendTerminalWebSocketJson(ws: WebSocket, payload: unknown, onError: (error: Error) => void): boolean {
-  return sendWebSocketJson(ws, payload, onError, TERMINAL_WS_MAX_BUFFERED_BYTES, "Terminal websocket buffered output");
+type TerminalDataMessage = { type: "data"; data: string };
+type TerminalWebSocketSendOptions =
+  | { policy?: "live"; onComplete?: () => void }
+  | { policy: "replay"; rawByteLimit: number; onComplete?: () => void };
+
+export function terminalReplaySerializedByteLimit(rawByteLimit: number): number {
+  if (!Number.isSafeInteger(rawByteLimit) || rawByteLimit < 0) {
+    throw new Error("Terminal replay raw byte limit must be a non-negative safe integer.");
+  }
+  const escapedByteLimit = rawByteLimit * TERMINAL_REPLAY_JSON_ESCAPE_MULTIPLIER;
+  const serializedByteLimit = escapedByteLimit + TERMINAL_DATA_MESSAGE_ENVELOPE_BYTES;
+  if (!Number.isSafeInteger(escapedByteLimit) || !Number.isSafeInteger(serializedByteLimit)) {
+    throw new Error("Terminal replay serialized byte limit exceeds safe integer capacity.");
+  }
+  return serializedByteLimit;
 }
 
-function sendWebSocketJson(ws: WebSocket, payload: unknown, onError: (error: Error) => void, maxBufferedBytes = Number.POSITIVE_INFINITY, label = "Websocket output"): boolean {
+export function sendTerminalWebSocketJson(
+  ws: WebSocket,
+  payload: TerminalDataMessage,
+  onError: (error: Error) => void,
+  options: TerminalWebSocketSendOptions = {},
+): boolean {
+  if (options.policy !== "replay") {
+    return sendWebSocketJson(ws, payload, onError, TERMINAL_WS_MAX_BUFFERED_BYTES, "Terminal websocket buffered output", options.onComplete);
+  }
+  try {
+    const rawBytes = Buffer.byteLength(payload.data, "utf8");
+    if (rawBytes > options.rawByteLimit) {
+      throw new Error(`Terminal replay raw output exceeded the ${options.rawByteLimit} byte limit.`);
+    }
+    return sendWebSocketJson(
+      ws,
+      payload,
+      onError,
+      terminalReplaySerializedByteLimit(options.rawByteLimit),
+      "Terminal websocket replay output",
+      options.onComplete,
+    );
+  } catch (error) {
+    onError(error instanceof Error ? error : new Error(String(error)));
+    return false;
+  }
+}
+
+function sendWebSocketJson(
+  ws: WebSocket,
+  payload: unknown,
+  onError: (error: Error) => void,
+  maxBufferedBytes = Number.POSITIVE_INFINITY,
+  label = "Websocket output",
+  onComplete?: () => void,
+): boolean {
   if (ws.readyState !== WS_OPEN) {
     return false;
   }
@@ -1891,6 +1992,12 @@ function sendWebSocketJson(ws: WebSocket, payload: unknown, onError: (error: Err
     ws.send(serialized, (error) => {
       if (error) {
         onError(error);
+        return;
+      }
+      try {
+        onComplete?.();
+      } catch (completionError) {
+        onError(completionError instanceof Error ? completionError : new Error(String(completionError)));
       }
     });
     return true;

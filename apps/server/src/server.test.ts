@@ -39,6 +39,7 @@ import {
   parseVoiceAudioControlMessage,
   sendTerminalWebSocketJson,
   serializeRequestForLog,
+  terminalReplaySerializedByteLimit,
   TERMINAL_WS_MAX_BUFFERED_BYTES,
   type AppServices,
 } from "./server.js";
@@ -386,6 +387,74 @@ describe("buildServer", () => {
       expect.objectContaining({
         message: expect.stringContaining("buffered output exceeded"),
       }),
+    );
+  });
+
+  it("serializes replay output exactly within the raw-byte-derived ceiling", () => {
+    const cases = [
+      'quote " and backslash \\',
+      "ansi \u001b[31mred\u001b[0m",
+      "line one\nline two\r\t",
+      "\u0000\u0001\u001f",
+      "🙂漢字",
+      'mixed \u0000\u001b\\"🙂\n',
+    ];
+
+    for (const data of cases) {
+      const serializedFrames: string[] = [];
+      const onError = vi.fn();
+      const socket = {
+        readyState: WebSocket.OPEN,
+        bufferedAmount: 0,
+        send: (serialized: string, callback: (error?: Error) => void) => {
+          serializedFrames.push(serialized);
+          callback();
+        },
+      } as unknown as WebSocket;
+      const rawByteLimit = Buffer.byteLength(data, "utf8");
+
+      expect(
+        sendTerminalWebSocketJson(
+          socket,
+          { type: "data", data },
+          onError,
+          { policy: "replay", rawByteLimit },
+        ),
+      ).toBe(true);
+      expect(onError).not.toHaveBeenCalled();
+      expect(JSON.parse(serializedFrames[0]!)).toEqual({ type: "data", data });
+      expect(Buffer.byteLength(serializedFrames[0]!, "utf8")).toBeLessThanOrEqual(
+        terminalReplaySerializedByteLimit(rawByteLimit),
+      );
+    }
+  });
+
+  it("derives the exact worst-case replay ceiling and rejects unsafe arithmetic", () => {
+    expect(terminalReplaySerializedByteLimit(TERMINAL_WS_MAX_BUFFERED_BYTES)).toBe(6_291_481);
+    expect(() => terminalReplaySerializedByteLimit(-1)).toThrow(/non-negative safe integer/);
+    expect(() => terminalReplaySerializedByteLimit(Number.MAX_SAFE_INTEGER)).toThrow(/safe integer capacity/);
+  });
+
+  it("rejects replay data above its raw UTF-8 limit before websocket send", () => {
+    const send = vi.fn();
+    const onError = vi.fn();
+    const socket = {
+      readyState: WebSocket.OPEN,
+      bufferedAmount: 0,
+      send,
+    } as unknown as WebSocket;
+
+    expect(
+      sendTerminalWebSocketJson(
+        socket,
+        { type: "data", data: "🙂" },
+        onError,
+        { policy: "replay", rawByteLimit: 3 },
+      ),
+    ).toBe(false);
+    expect(send).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringContaining("raw output exceeded") }),
     );
   });
 
@@ -4984,6 +5053,344 @@ describe("buildServer", () => {
     }
   });
 
+  it("replays a raw-limit maximum-expansion terminal snapshot before live output", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-ws-replay-max-"));
+    const replayLimit = TERMINAL_WS_MAX_BUFFERED_BYTES;
+    const recentOutput = "\u0000".repeat(replayLimit);
+    let onData: ((data: string) => void) | undefined;
+    const dispose = vi.fn();
+    const session = {
+      snapshot: () => ({ recentOutput }),
+      onData: (listener: (data: string) => void) => {
+        onData = listener;
+        return dispose;
+      },
+    };
+    const app = await buildServer(
+      { ...testConfig(root), terminalReplayBytes: replayLimit },
+      terminalRouteTestServices(root, session),
+    );
+    let client: WebSocket | undefined;
+    try {
+      await app.listen({ host: "127.0.0.1", port: 0 });
+      const address = app.server.address() as { port: number };
+      client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/terminal/tab-1`, {
+        headers: { host: "localhost" },
+      });
+      const replayFrame = readWebSocketJsonFrame(client, 5_000);
+      await waitForWebSocketOpen(client);
+
+      await expect(replayFrame).resolves.toEqual({
+        bytes: 6_291_481,
+        message: { type: "data", data: recentOutput },
+      });
+      const liveFrame = readWebSocketJsonFrame(client);
+      onData!("live-after-replay");
+      await expect(liveFrame).resolves.toEqual({
+        bytes: Buffer.byteLength(JSON.stringify({ type: "data", data: "live-after-replay" }), "utf8"),
+        message: { type: "data", data: "live-after-replay" },
+      });
+      expect(client.readyState).toBe(WebSocket.OPEN);
+    } finally {
+      client?.close();
+      await app.close();
+    }
+  }, 10_000);
+
+  it("rejects a terminal replay above the configured raw UTF-8 limit before subscription", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-ws-replay-raw-limit-"));
+    const onData = vi.fn();
+    const session = {
+      snapshot: () => ({ recentOutput: "x".repeat(TERMINAL_WS_MAX_BUFFERED_BYTES + 1) }),
+      onData,
+    };
+    const app = await buildServer(
+      { ...testConfig(root), terminalReplayBytes: TERMINAL_WS_MAX_BUFFERED_BYTES },
+      terminalRouteTestServices(root, session),
+    );
+    let client: WebSocket | undefined;
+    try {
+      await app.listen({ host: "127.0.0.1", port: 0 });
+      const address = app.server.address() as { port: number };
+      client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/terminal/tab-1`, {
+        headers: { host: "localhost" },
+      });
+      const received = vi.fn();
+      client.on("message", received);
+      const closed = readWebSocketClose(client);
+
+      await expect(closed).resolves.toEqual({
+        code: 1011,
+        reason: "Terminal websocket send failed.",
+      });
+      expect(received).not.toHaveBeenCalled();
+      expect(onData).not.toHaveBeenCalled();
+    } finally {
+      client?.close();
+      await app.close();
+    }
+  });
+
+  it("emits no synthetic replay frame when the retained terminal output is empty", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-ws-empty-replay-"));
+    let onData: ((data: string) => void) | undefined;
+    const session = {
+      snapshot: () => ({ recentOutput: "" }),
+      onData: (listener: (data: string) => void) => {
+        onData = listener;
+        return () => undefined;
+      },
+    };
+    const app = await buildServer(testConfig(root), terminalRouteTestServices(root, session));
+    let client: WebSocket | undefined;
+    try {
+      await app.listen({ host: "127.0.0.1", port: 0 });
+      const address = app.server.address() as { port: number };
+      client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/terminal/tab-1`, {
+        headers: { host: "localhost" },
+      });
+      const firstFrame = readWebSocketJsonFrame(client);
+      await waitForWebSocketOpen(client);
+      onData!("first-live-frame");
+
+      await expect(firstFrame).resolves.toEqual({
+        bytes: Buffer.byteLength(JSON.stringify({ type: "data", data: "first-live-frame" }), "utf8"),
+        message: { type: "data", data: "first-live-frame" },
+      });
+    } finally {
+      client?.close();
+      await app.close();
+    }
+  });
+
+  it("keeps the live output budget independent while the replay callback is pending", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-ws-replay-pending-"));
+    const replay = "r".repeat(TERMINAL_WS_MAX_BUFFERED_BYTES);
+    const replaySerialized = JSON.stringify({ type: "data", data: replay });
+    const marker = "live-while-replay-pending";
+    const oversizedLive = "L".repeat(TERMINAL_WS_MAX_BUFFERED_BYTES);
+    const dispose = vi.fn();
+    let onData: ((data: string) => void) | undefined;
+    const session = {
+      snapshot: () => ({ recentOutput: replay }),
+      onData: (listener: (data: string) => void) => {
+        onData = listener;
+        return dispose;
+      },
+    };
+    const heldSend = holdWebSocketSendCallback(replaySerialized);
+    const app = await buildServer(
+      { ...testConfig(root), terminalReplayBytes: TERMINAL_WS_MAX_BUFFERED_BYTES },
+      terminalRouteTestServices(root, session),
+    );
+    let client: WebSocket | undefined;
+    let closeCount = 0;
+    try {
+      await app.listen({ host: "127.0.0.1", port: 0 });
+      const address = app.server.address() as { port: number };
+      client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/terminal/tab-1`, {
+        headers: { host: "localhost" },
+      });
+      client.on("close", () => {
+        closeCount += 1;
+      });
+      const replayFrame = readWebSocketJsonFrame(client, 5_000);
+      const closed = readWebSocketClose(client);
+      await waitForWebSocketOpen(client);
+      await expect(replayFrame).resolves.toEqual({
+        bytes: 1_048_601,
+        message: { type: "data", data: replay },
+      });
+      expect(heldSend.callback()).toBeTypeOf("function");
+
+      const markerFrame = readWebSocketJsonFrame(client);
+      onData!(marker);
+      onData!(oversizedLive);
+
+      await expect(markerFrame).resolves.toEqual({
+        bytes: Buffer.byteLength(JSON.stringify({ type: "data", data: marker }), "utf8"),
+        message: { type: "data", data: marker },
+      });
+      await expect(closed).resolves.toEqual({
+        code: 1011,
+        reason: "Terminal websocket send failed.",
+      });
+      expect(dispose).toHaveBeenCalledTimes(1);
+      expect(heldSend.sentFrames()).not.toContain(JSON.stringify({ type: "data", data: oversizedLive }));
+
+      heldSend.callback()!();
+      heldSend.callback()!();
+      onData!("late-output");
+      await flushPromises();
+      expect(closeCount).toBe(1);
+      expect(dispose).toHaveBeenCalledTimes(1);
+      expect(heldSend.sentFrames()).not.toContain(JSON.stringify({ type: "data", data: "late-output" }));
+    } finally {
+      heldSend.restore();
+      client?.close();
+      await app.close();
+    }
+  }, 10_000);
+
+  it("keeps the live output budget after the replay callback settles successfully", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-ws-replay-settled-"));
+    const replay = "settled replay";
+    const oversizedLive = "L".repeat(TERMINAL_WS_MAX_BUFFERED_BYTES);
+    const dispose = vi.fn();
+    let onData: ((data: string) => void) | undefined;
+    const session = {
+      snapshot: () => ({ recentOutput: replay }),
+      onData: (listener: (data: string) => void) => {
+        onData = listener;
+        return dispose;
+      },
+    };
+    const app = await buildServer(testConfig(root), terminalRouteTestServices(root, session));
+    let client: WebSocket | undefined;
+    try {
+      await app.listen({ host: "127.0.0.1", port: 0 });
+      const address = app.server.address() as { port: number };
+      client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/terminal/tab-1`, {
+        headers: { host: "localhost" },
+      });
+      const replayFrame = readWebSocketJsonFrame(client);
+      const closed = readWebSocketClose(client);
+      await waitForWebSocketOpen(client);
+      await expect(replayFrame).resolves.toMatchObject({
+        message: { type: "data", data: replay },
+      });
+      await flushPromises();
+
+      onData!(oversizedLive);
+      await expect(closed).resolves.toEqual({
+        code: 1011,
+        reason: "Terminal websocket send failed.",
+      });
+      expect(dispose).toHaveBeenCalledTimes(1);
+    } finally {
+      client?.close();
+      await app.close();
+    }
+  });
+
+  it("invalidates forwarding once a pending replay callback reports an error", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-ws-replay-callback-error-"));
+    const replay = "pending replay";
+    const dispose = vi.fn();
+    let onData: ((data: string) => void) | undefined;
+    const session = {
+      snapshot: () => ({ recentOutput: replay }),
+      onData: (listener: (data: string) => void) => {
+        onData = listener;
+        return dispose;
+      },
+    };
+    const heldSend = holdWebSocketSendCallback(JSON.stringify({ type: "data", data: replay }));
+    const app = await buildServer(testConfig(root), terminalRouteTestServices(root, session));
+    let client: WebSocket | undefined;
+    try {
+      await app.listen({ host: "127.0.0.1", port: 0 });
+      const address = app.server.address() as { port: number };
+      client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/terminal/tab-1`, {
+        headers: { host: "localhost" },
+      });
+      const replayFrame = readWebSocketJsonFrame(client);
+      const closed = readWebSocketClose(client);
+      await waitForWebSocketOpen(client);
+      await replayFrame;
+      expect(onData).toBeTypeOf("function");
+
+      heldSend.callback()!(new Error("write callback failed"));
+      await expect(closed).resolves.toEqual({
+        code: 1011,
+        reason: "Terminal websocket send failed.",
+      });
+      onData!("after-callback-error");
+      heldSend.callback()!(new Error("repeated callback"));
+      await flushPromises();
+      expect(dispose).toHaveBeenCalledTimes(1);
+      expect(heldSend.sentFrames()).not.toContain(JSON.stringify({ type: "data", data: "after-callback-error" }));
+    } finally {
+      heldSend.restore();
+      client?.close();
+      await app.close();
+    }
+  });
+
+  it("disposes a synchronously registered terminal listener when its first send throws", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-ws-sync-registration-"));
+    const dispose = vi.fn();
+    const session = {
+      snapshot: () => ({ recentOutput: "" }),
+      onData: (listener: (data: string) => void) => {
+        listener("synchronous-output");
+        return dispose;
+      },
+    };
+    const originalSend = WebSocket.prototype.send;
+    const serialized = JSON.stringify({ type: "data", data: "synchronous-output" });
+    const sendSpy = vi.spyOn(WebSocket.prototype, "send").mockImplementation(function (this: WebSocket, data: unknown, ...args: unknown[]) {
+      if (data === serialized) {
+        throw new Error("synchronous ws.send failure");
+      }
+      Reflect.apply(originalSend, this, [data, ...args]);
+    });
+    const app = await buildServer(testConfig(root), terminalRouteTestServices(root, session));
+    let client: WebSocket | undefined;
+    try {
+      await app.listen({ host: "127.0.0.1", port: 0 });
+      const address = app.server.address() as { port: number };
+      client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/terminal/tab-1`, {
+        headers: { host: "localhost" },
+      });
+      await expect(readWebSocketClose(client)).resolves.toEqual({
+        code: 1011,
+        reason: "Terminal websocket send failed.",
+      });
+      expect(dispose).toHaveBeenCalledTimes(1);
+    } finally {
+      sendSpy.mockRestore();
+      client?.close();
+      await app.close();
+    }
+  });
+
+  it("does not subscribe when the initial replay send throws synchronously", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-ws-sync-replay-"));
+    const replay = "replay-that-throws";
+    const onData = vi.fn();
+    const session = {
+      snapshot: () => ({ recentOutput: replay }),
+      onData,
+    };
+    const originalSend = WebSocket.prototype.send;
+    const serialized = JSON.stringify({ type: "data", data: replay });
+    const sendSpy = vi.spyOn(WebSocket.prototype, "send").mockImplementation(function (this: WebSocket, data: unknown, ...args: unknown[]) {
+      if (data === serialized) {
+        throw new Error("synchronous replay send failure");
+      }
+      Reflect.apply(originalSend, this, [data, ...args]);
+    });
+    const app = await buildServer(testConfig(root), terminalRouteTestServices(root, session));
+    let client: WebSocket | undefined;
+    try {
+      await app.listen({ host: "127.0.0.1", port: 0 });
+      const address = app.server.address() as { port: number };
+      client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/terminal/tab-1`, {
+        headers: { host: "localhost" },
+      });
+      await expect(readWebSocketClose(client)).resolves.toEqual({
+        code: 1011,
+        reason: "Terminal websocket send failed.",
+      });
+      expect(onData).not.toHaveBeenCalled();
+    } finally {
+      sendSpy.mockRestore();
+      client?.close();
+      await app.close();
+    }
+  });
+
   it("closes terminal websocket connections for missing sessions without throwing from the route", async () => {
     const root = await fs.mkdtemp(
       path.join(os.tmpdir(), "cloudx-terminal-ws-missing-"),
@@ -6012,6 +6419,107 @@ function testConfig(root: string): AppConfig {
     voiceAudioUploadMaxBytes: DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES,
     documentationResponseMaxBytes: DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES,
     documentationUploadMaxBytes: DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES,
+  };
+}
+
+function terminalRouteTestServices(
+  root: string,
+  session: {
+    snapshot(): { recentOutput?: string };
+    onData?(listener: (data: string) => void): () => void;
+  },
+): AppServices {
+  return {
+    plugins: { list: () => [] },
+    sessions: {
+      getSession: () => session,
+      listTabs: () => [],
+      getActiveTabId: () => undefined,
+    },
+    pathPolicy: new PathPolicy([root]),
+    voice: {},
+    asr: {},
+  } as unknown as AppServices;
+}
+
+function waitForWebSocketOpen(client: WebSocket): Promise<void> {
+  if (client.readyState === WebSocket.OPEN) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    client.once("open", resolve);
+    client.once("error", reject);
+  });
+}
+
+function readWebSocketJsonFrame(
+  client: WebSocket,
+  timeoutMs = 1_000,
+): Promise<{ bytes: number; message: Record<string, unknown> }> {
+  return new Promise((resolve, reject) => {
+    let timeout: ReturnType<typeof setTimeout>;
+    const cleanup = () => {
+      clearTimeout(timeout);
+      client.off("message", onMessage);
+      client.off("error", onError);
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onMessage = (raw: RawData) => {
+      cleanup();
+      const serialized = raw.toString();
+      try {
+        resolve({
+          bytes: Buffer.byteLength(serialized, "utf8"),
+          message: JSON.parse(serialized) as Record<string, unknown>,
+        });
+      } catch (error) {
+        reject(error);
+      }
+    };
+    client.once("message", onMessage);
+    client.once("error", onError);
+    timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error("Timed out waiting for websocket JSON frame."));
+    }, timeoutMs);
+  });
+}
+
+function readWebSocketClose(client: WebSocket): Promise<{ code: number; reason: string }> {
+  return new Promise((resolve) => {
+    client.once("close", (code, reason) => {
+      resolve({ code, reason: reason.toString() });
+    });
+  });
+}
+
+function holdWebSocketSendCallback(serializedToHold: string): {
+  callback(): ((error?: Error) => void) | undefined;
+  sentFrames(): string[];
+  restore(): void;
+} {
+  const originalSend = WebSocket.prototype.send;
+  const sentFrames: string[] = [];
+  let heldCallback: ((error?: Error) => void) | undefined;
+  const spy = vi.spyOn(WebSocket.prototype, "send").mockImplementation(function (this: WebSocket, data: unknown, ...args: unknown[]) {
+    if (typeof data === "string") {
+      sentFrames.push(data);
+    }
+    const callback = args.at(-1);
+    if (data === serializedToHold && !heldCallback && typeof callback === "function") {
+      heldCallback = callback as (error?: Error) => void;
+      Reflect.apply(originalSend, this, [data]);
+      return;
+    }
+    Reflect.apply(originalSend, this, [data, ...args]);
+  });
+  return {
+    callback: () => heldCallback,
+    sentFrames: () => [...sentFrames],
+    restore: () => spy.mockRestore(),
   };
 }
 
