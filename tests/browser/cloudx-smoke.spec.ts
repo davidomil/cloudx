@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type WebSocket } from "@playwright/test";
 import type {
   CreateTabResponse,
   TabLayoutNode,
@@ -29,6 +29,14 @@ test.describe("CloudX shipped shell", () => {
       path.join(workspace, "README.md"),
       "# Browser smoke workspace\n",
     );
+    const codexHome = path.join(testRoot, "codex-home");
+    const imagegen = path.join(codexHome, "skills", ".system", "imagegen");
+    await fs.mkdir(imagegen, { recursive: true });
+    await fs.writeFile(
+      path.join(imagegen, "SKILL.md"),
+      "---\nname: imagegen\ndescription: Browser fixture only.\n---\nFixture data only.\n",
+    );
+    const assistant = await writeTerminalFixture(testRoot);
 
     const port = await freePort();
     baseUrl = `http://127.0.0.1:${port}`;
@@ -38,6 +46,7 @@ test.describe("CloudX shipped shell", () => {
         ...process.env,
         CLOUDX_ALLOWED_ROOTS: workspace,
         CLOUDX_APP_SERVER_ENABLED: "false",
+        CLOUDX_ASSISTANT_BIN: assistant,
         CLOUDX_ASR_URL: "http://127.0.0.1:9",
         CLOUDX_AUTOMATION_START_DISABLED: "true",
         CLOUDX_DATA_DIR: data,
@@ -45,6 +54,8 @@ test.describe("CloudX shipped shell", () => {
         CLOUDX_HOST: "127.0.0.1",
         CLOUDX_LOG_LEVEL: "warn",
         CLOUDX_PORT: String(port),
+        CODEX_HOME: codexHome,
+        SHELL: "/bin/bash",
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -84,6 +95,171 @@ test.describe("CloudX shipped shell", () => {
       body: screenshot,
       contentType: "image/png",
     });
+  });
+
+  test("restores the same running Codex terminal across two full page reloads", async ({
+    page,
+  }, testInfo) => {
+    const sockets: Array<{
+      socket: WebSocket;
+      frames: Array<{ bytes: number; data: string }>;
+      errors: string[];
+      closes: number;
+    }> = [];
+    const tabPosts: unknown[] = [];
+    page.on("request", (request) => {
+      if (
+        request.method() === "POST" &&
+        new URL(request.url()).pathname === "/api/tabs"
+      ) {
+        tabPosts.push(request.postDataJSON());
+      }
+    });
+    page.on("websocket", (socket) => {
+      if (!new URL(socket.url()).pathname.startsWith("/ws/terminal/")) return;
+      const observed = {
+        socket,
+        frames: [] as Array<{ bytes: number; data: string }>,
+        errors: [] as string[],
+        closes: 0,
+      };
+      sockets.push(observed);
+      socket.on("framereceived", ({ payload }) => {
+        const text =
+          typeof payload === "string" ? payload : payload.toString("utf8");
+        const message = JSON.parse(text) as { type: string; data: string };
+        if (message.type === "data")
+          observed.frames.push({
+            bytes: Buffer.byteLength(text),
+            data: message.data,
+          });
+      });
+      socket.on("socketerror", (error) => observed.errors.push(error));
+      socket.on("close", () => {
+        observed.closes += 1;
+      });
+    });
+
+    let tabId: string | undefined;
+    try {
+      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+      await page
+        .locator(".workspace-pane.active")
+        .getByTitle("Add tab to this pane")
+        .click();
+      await page.getByLabel("Plugin").selectOption("codex-terminal");
+      await page.getByLabel("Title").fill("Reload fixture");
+      const creation = page.waitForResponse(
+        (response) =>
+          response.request().method() === "POST" &&
+          new URL(response.url()).pathname === "/api/tabs",
+      );
+      await page.getByRole("button", { name: "Create", exact: true }).click();
+      const created = await creation;
+      expect(created.status()).toBe(201);
+      const committed = (await created.json()) as CreateTabResponse;
+      tabId = committed.tab.id;
+      expect(tabPosts).toHaveLength(1);
+      expect(tabPosts[0]).toMatchObject({
+        pluginId: "codex-terminal",
+        windowId: committed.window.id,
+        paneId: committed.window.layout.activePaneId,
+      });
+      await expect.poll(() => sockets.length).toBe(1);
+      await expect
+        .poll(() =>
+          sockets[0]!.frames.some((frame) => frame.data.includes("READY")),
+        )
+        .toBe(true);
+      const startsPath = path.join(testRoot, "fixture-starts.jsonl");
+      const initialStarts = await fs.readFile(startsPath, "utf8");
+      const starts = initialStarts
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { pid: number; start: number });
+      expect(starts).toHaveLength(1);
+      const identity = starts[0]!;
+      const pidMarker = "PID:" + identity.pid;
+      const startMarker = "START:" + identity.start;
+      await page.locator(".xterm-helper-textarea").focus();
+      await page.keyboard.type("fill");
+      await page.keyboard.press("Enter");
+      await expect
+        .poll(() =>
+          sockets[0]!.frames.some((frame) => frame.data.includes("FILLED")),
+        )
+        .toBe(true);
+      await expect(page.locator(".xterm-rows")).toContainText(pidMarker);
+
+      for (const reload of [1, 2]) {
+        await page.reload({ waitUntil: "domcontentloaded" });
+        await expect.poll(() => sockets.length).toBe(reload + 1);
+        await expect.poll(() => sockets[reload - 1]!.closes).toBe(1);
+        const current = sockets[reload]!;
+        expect(new URL(current.socket.url()).pathname).toBe(
+          "/ws/terminal/" + tabId,
+        );
+        await expect
+          .poll(() =>
+            current.frames.some(
+              (frame) =>
+                frame.bytes > 1_048_576 && frame.data.includes(pidMarker),
+            ),
+          )
+          .toBe(true);
+        const replay = current.frames.find((frame) => frame.bytes > 1_048_576)!;
+        expect(Buffer.byteLength(replay.data)).toBe(1_048_576);
+        expect(replay.data).toContain(startMarker);
+        expect(replay.data).toContain("FILLED");
+        if (reload === 2) expect(replay.data).toContain("ECHO:after-reload-1");
+        await expect(page.locator(".xterm-rows")).toContainText(pidMarker);
+        expect(current.socket.isClosed()).toBe(false);
+        expect(current.closes).toBe(0);
+        expect(current.errors).toEqual([]);
+        const input = "after-reload-" + reload;
+        await page.locator(".xterm-helper-textarea").focus();
+        await page.keyboard.type(input);
+        await page.keyboard.press("Enter");
+        await expect
+          .poll(() =>
+            current.frames.some((frame) =>
+              frame.data.includes("ECHO:" + input),
+            ),
+          )
+          .toBe(true);
+        await expect(page.locator(".xterm-rows")).toContainText(
+          "ECHO:" + input,
+        );
+        await expect(page.locator(".xterm-rows")).toContainText(pidMarker);
+        expect(current.socket.isClosed()).toBe(false);
+        const workspace = (await (
+          await page.request.get(baseUrl + "/api/workspace")
+        ).json()) as WorkspaceStateResponse;
+        expect(
+          workspace.tabs
+            .filter((tab) => tab.pluginId === "codex-terminal")
+            .map((tab) => ({ id: tab.id, status: tab.status })),
+        ).toEqual([{ id: tabId, status: "running" }]);
+        expect(tabPosts).toHaveLength(1);
+        await expect(fs.readFile(startsPath, "utf8")).resolves.toBe(
+          initialStarts,
+        );
+        const screenshot = await page.screenshot({
+          path: testInfo.outputPath("reload-" + reload + ".png"),
+        });
+        await testInfo.attach("terminal reload " + reload, {
+          body: screenshot,
+          contentType: "image/png",
+        });
+      }
+    } finally {
+      if (tabId) {
+        const deleted = await page.request.delete(
+          baseUrl + "/api/tabs/" + tabId,
+        );
+        expect(deleted.ok()).toBe(true);
+      }
+    }
   });
 
   test("creates a tab from the committed window without duplicate layout persistence", async ({
@@ -283,6 +459,55 @@ test.describe("CloudX shipped shell", () => {
     }
   });
 });
+
+async function writeTerminalFixture(root: string): Promise<string> {
+  const executable = path.join(root, "codex-fixture.cjs");
+  await fs.writeFile(
+    executable,
+    [
+      "#!" + process.execPath,
+      'const fs = require("node:fs");',
+      'const { once } = require("node:events");',
+      "const startLog = " +
+        JSON.stringify(path.join(root, "fixture-starts.jsonl")) +
+        ";",
+      "const identity = { pid: process.pid, start: Date.now() };",
+      'fs.appendFileSync(startLog, JSON.stringify(identity) + "\\n");',
+      'const marker = "PID:" + identity.pid + "\\r\\nSTART:" + identity.start;',
+      'async function output(text) { if (!process.stdout.write(text)) await once(process.stdout, "drain"); }',
+      "let filled = false;",
+      "async function command(input) {",
+      '  if (input === "fill" && !filled) {',
+      "    filled = true;",
+      "    for (let remaining = 1100000; remaining > 0; remaining -= 4096) {",
+      '      await output("h".repeat(Math.min(4096, remaining)) + "\\r\\n");',
+      "    }",
+      '    await output("\\r\\nFILLED\\r\\n" + marker + "\\r\\nREADY\\r\\n");',
+      "  } else {",
+      '    await output("ECHO:" + input + "\\r\\n" + marker + "\\r\\nREADY\\r\\n");',
+      "  }",
+      "}",
+      "process.stdin.setRawMode(true);",
+      'process.stdin.setEncoding("utf8");',
+      'let input = "";',
+      'process.stdin.on("data", (data) => {',
+      "  for (const character of data) {",
+      '    if (character === "\\r" || character === "\\n") {',
+      '      const complete = input; input = "";',
+      "      if (complete) void command(complete).catch(() => process.exit(1));",
+      "    } else if (/^[a-z0-9-]$/.test(character)) {",
+      "      input += character;",
+      "      if (input.length > 128) process.exit(2);",
+      "    }",
+      "  }",
+      "});",
+      'void output(marker + "\\r\\nREADY\\r\\n");',
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  return executable;
+}
 
 function findPane(root: TabLayoutNode, paneId: string) {
   if (root.type === "pane") {

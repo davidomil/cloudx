@@ -132,6 +132,9 @@ async function writeOverlayConfig(
 ): Promise<void> {
   const sourceConfig = await readOptionalText(sourceConfigPath);
   const config = sourceConfig?.trim() ? parse(sourceConfig) : {};
+  if (config.model === undefined) {
+    config.model = "gpt-6-astra";
+  }
   const features = tomlTable(config.features, "features");
   features.apps = false;
   features.memories = false;

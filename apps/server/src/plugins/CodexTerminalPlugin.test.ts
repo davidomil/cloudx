@@ -224,6 +224,82 @@ describe("CodexTerminalPlugin", () => {
     await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "sessions", "2026", "05", "15", "rollout-session.jsonl"), "utf8")).resolves.toBe("session\n");
   });
 
+  it("launches the default model from the generated home and preserves base preferences", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-default-model-"));
+    const codexHome = path.join(root, "base");
+    await seedImagegenSkill(codexHome);
+    const sourceConfig = [
+      'model_reasoning_effort = "xhigh"',
+      'model_provider = "openai"',
+      'profile = "project"',
+      '[profiles.project]',
+      'model = "gpt-5.3-codex"',
+      '[tui]',
+      'animations = false',
+    ].join("\n");
+    await fs.writeFile(path.join(codexHome, "config.toml"), sourceConfig);
+    vi.stubEnv("CODEX_HOME", codexHome);
+    vi.stubEnv("SHELL", "/bin/bash");
+    vi.stubEnv("CLOUDX_ASSISTANT_BIN", "/usr/bin/codex");
+    const factory = new CapturingFactory();
+    const plugin = new CodexTerminalPlugin(factory, DEFAULT_TERMINAL_REPLAY_BYTES, path.join(root, "data"));
+    try {
+      await plugin.createSession({ tab, cwd: root, controls: { setTabIndicator: () => undefined, closeTab: () => undefined } });
+      const generated = parse(await fs.readFile(path.join(factory.env!.CODEX_HOME!, "config.toml"), "utf8"));
+      expect(generated).toMatchObject({
+        ...parse(sourceConfig),
+        model: "gpt-6-astra",
+        model_reasoning_effort: "xhigh",
+        features: { apps: false, memories: false, plugins: false },
+      });
+      expect(factory.args?.join(" ")).not.toMatch(/--model|(?:^| )-m(?: |$)/u);
+      await expect(fs.readFile(path.join(codexHome, "config.toml"), "utf8")).resolves.toBe(sourceConfig);
+      expect(factory.process?.killed).toBe(false);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([undefined, "", " \n"])("defaults the model with missing or empty source config %j", async (source) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-empty-model-"));
+    const codexHome = path.join(root, "base");
+    await seedImagegenSkill(codexHome);
+    if (source !== undefined) {
+      await fs.writeFile(path.join(codexHome, "config.toml"), source);
+    }
+    try {
+      const launch = await materializeCodexTemplate(undefined, { CODEX_HOME: codexHome }, { dataDir: path.join(root, "data"), tabId: "empty" });
+      const config = parse(await fs.readFile(path.join(launch.overlay!.codexHome, "config.toml"), "utf8"));
+      expect(config.model).toBe("gpt-6-astra");
+      expect(config.model_reasoning_effort).toBeUndefined();
+      if (source === undefined) {
+        await expect(fs.stat(path.join(codexHome, "config.toml"))).rejects.toMatchObject({ code: "ENOENT" });
+      } else {
+        await expect(fs.readFile(path.join(codexHome, "config.toml"), "utf8")).resolves.toBe(source);
+      }
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects invalid source TOML before spawning the terminal", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-invalid-model-"));
+    const codexHome = path.join(root, "base");
+    await seedImagegenSkill(codexHome);
+    const source = 'model = "unterminated';
+    await fs.writeFile(path.join(codexHome, "config.toml"), source);
+    vi.stubEnv("CODEX_HOME", codexHome);
+    const factory = new CapturingFactory();
+    const plugin = new CodexTerminalPlugin(factory, DEFAULT_TERMINAL_REPLAY_BYTES, path.join(root, "data"));
+    try {
+      await expect(plugin.createSession({ tab, cwd: root, controls: { setTabIndicator: () => undefined, closeTab: () => undefined } })).rejects.toThrow();
+      expect(factory.process).toBeUndefined();
+      await expect(fs.readFile(path.join(codexHome, "config.toml"), "utf8")).resolves.toBe(source);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("materializes resolved template fields into a Codex home overlay", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-materialized-overlay-"));
     const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-materialized-base-"));
@@ -232,6 +308,7 @@ describe("CodexTerminalPlugin", () => {
     await seedSkill(dataDir, "testing", "Testing", "Testing skill.", "Testing skill instructions.");
     await fs.writeFile(path.join(codexHome, "config.toml"), [
       "model = \"gpt-5.3-codex\"",
+      'model_reasoning_effort = "high"',
       "",
       "# CloudX generated skill enablement for this Codex tab.",
       "",
@@ -264,6 +341,7 @@ describe("CodexTerminalPlugin", () => {
     expect(launch.overlay?.codexHome).toBe(path.join(dataDir, "codex-homes", "tab-99"));
     const overlayConfig = await fs.readFile(path.join(launch.overlay!.codexHome, "config.toml"), "utf8");
     expect(overlayConfig).toContain("model = \"gpt-5.3-codex\"");
+    expect(parse(overlayConfig).model_reasoning_effort).toBe("high");
     expect(overlayConfig).toContain("skills/cloudx/reviewer/SKILL.md");
     expect(overlayConfig).toContain("skills/cloudx/testing/SKILL.md");
     expect(overlayConfig).not.toContain("documentation-answer");
@@ -298,8 +376,12 @@ describe("CodexTerminalPlugin", () => {
       { dataDir, tabId: "tab-live" }
     );
     const sessionState = path.join(first.overlay!.codexHome, "sessions", "current.jsonl");
+    const firstConfig = parse(await fs.readFile(path.join(first.overlay!.codexHome, "config.toml"), "utf8"));
+    expect(firstConfig.model).toBe("gpt-6-astra");
+    expect(firstConfig.model_reasoning_effort).toBeUndefined();
     await fs.mkdir(path.dirname(sessionState), { recursive: true });
     await fs.writeFile(sessionState, "keep me\n", "utf8");
+    await fs.writeFile(path.join(codexHome, "config.toml"), 'model = "gpt-5.3-codex"\nmodel_reasoning_effort = "xhigh"\n');
 
     const second = await materializeCodexTemplate(
       {
@@ -313,6 +395,11 @@ describe("CodexTerminalPlugin", () => {
     );
 
     await expect(fs.readFile(sessionState, "utf8")).resolves.toBe("keep me\n");
+    expect(parse(await fs.readFile(path.join(second.overlay!.codexHome, "config.toml"), "utf8"))).toMatchObject({
+      model: "gpt-5.3-codex",
+      model_reasoning_effort: "xhigh",
+      features: { apps: false, memories: false, plugins: false },
+    });
     await expect(fs.readFile(path.join(second.overlay!.codexHome, "skills", "cloudx", "tester", "SKILL.md"), "utf8")).resolves.toContain("Tester skill instructions.");
     await expect(fs.stat(path.join(second.overlay!.codexHome, "skills", "cloudx", "reviewer", "SKILL.md"))).rejects.toThrow();
     await expect(fs.readFile(path.join(second.overlay!.codexHome, "config.toml"), "utf8")).resolves.not.toContain("skills/cloudx/reviewer/SKILL.md");

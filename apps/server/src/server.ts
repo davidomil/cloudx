@@ -1074,8 +1074,6 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       closeWebSocketSafely(ws, 1008, "Unknown terminal tab.");
       return;
     }
-    let replayState: "available" | "pending" | "settled" | "invalidated" = "settled";
-    let failed = false;
     let disposed = false;
     let disposeData: (() => void) | undefined;
     const cleanup = () => {
@@ -1083,49 +1081,20 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
         return;
       }
       disposed = true;
-      replayState = "invalidated";
+      sender.invalidate();
       const currentDispose = disposeData;
       disposeData = undefined;
       currentDispose?.();
     };
     const failSend = (error: Error) => {
-      if (failed || disposed) {
+      if (disposed) {
         return;
       }
-      failed = true;
       request.log.debug({ tabId, err: serializeError(error) }, "terminal websocket send failed");
       cleanup();
       closeWebSocketSafely(ws, 1011, "Terminal websocket send failed.");
     };
-    const sendLive = (data: string): boolean => {
-      if (failed || disposed) {
-        return false;
-      }
-      const accepted = sendTerminalWebSocketJson(ws, { type: "data", data }, failSend);
-      if (!accepted) {
-        failSend(new Error("Terminal websocket is not open."));
-      }
-      return accepted;
-    };
-    const sendReplay = (data: string): boolean => {
-      if (failed || disposed || replayState !== "available") {
-        return false;
-      }
-      replayState = "pending";
-      const accepted = sendTerminalWebSocketJson(ws, { type: "data", data }, failSend, {
-        policy: "replay",
-        rawByteLimit: config.terminalReplayBytes,
-        onComplete: () => {
-          if (!failed && !disposed && replayState === "pending") {
-            replayState = "settled";
-          }
-        }
-      });
-      if (!accepted) {
-        failSend(new Error("Terminal websocket replay was not accepted."));
-      }
-      return accepted;
-    };
+    const sender = new TerminalWebSocketSender(ws, config.terminalReplayBytes, failSend);
 
     ws.on("message", (raw, isBinary) => {
       const message = parseTerminalControlMessage(raw, isBinary);
@@ -1145,14 +1114,11 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     ws.on("error", cleanup);
 
     const snapshot = session.snapshot();
-    if (snapshot.recentOutput) {
-      replayState = "available";
-      if (!sendReplay(snapshot.recentOutput) || failed || disposed) {
-        return;
-      }
+    if (!sender.sendReplay(snapshot.recentOutput ?? "") || disposed) {
+      return;
     }
     const registeredDispose = session.onData?.((data) => {
-      sendLive(data);
+      sender.sendLive(data);
     });
     if (registeredDispose) {
       if (disposed) {
@@ -1927,11 +1893,6 @@ function parseWebSocketProtocols(value: string | string[] | undefined): string[]
   return protocols?.length ? protocols : undefined;
 }
 
-type TerminalDataMessage = { type: "data"; data: string };
-type TerminalWebSocketSendOptions =
-  | { policy?: "live"; onComplete?: () => void }
-  | { policy: "replay"; rawByteLimit: number; onComplete?: () => void };
-
 export function terminalReplaySerializedByteLimit(rawByteLimit: number): number {
   if (!Number.isSafeInteger(rawByteLimit) || rawByteLimit < 0) {
     throw new Error("Terminal replay raw byte limit must be a non-negative safe integer.");
@@ -1941,34 +1902,123 @@ export function terminalReplaySerializedByteLimit(rawByteLimit: number): number 
   if (!Number.isSafeInteger(escapedByteLimit) || !Number.isSafeInteger(serializedByteLimit)) {
     throw new Error("Terminal replay serialized byte limit exceeds safe integer capacity.");
   }
+  terminalFrameWireBytes(serializedByteLimit);
   return serializedByteLimit;
 }
 
-export function sendTerminalWebSocketJson(
-  ws: WebSocket,
-  payload: TerminalDataMessage,
-  onError: (error: Error) => void,
-  options: TerminalWebSocketSendOptions = {},
-): boolean {
-  if (options.policy !== "replay") {
-    return sendWebSocketJson(ws, payload, onError, TERMINAL_WS_MAX_BUFFERED_BYTES, "Terminal websocket buffered output", options.onComplete);
+function terminalFrameWireBytes(payloadBytes: number): number {
+  // The terminal route sends single, unmasked text frames with compression disabled.
+  const headerBytes = payloadBytes <= 125 ? 2 : payloadBytes <= 65_535 ? 4 : 10;
+  const wireBytes = payloadBytes + headerBytes;
+  if (!Number.isSafeInteger(wireBytes)) {
+    throw new Error("Terminal websocket frame exceeds safe integer capacity.");
   }
-  try {
-    const rawBytes = Buffer.byteLength(payload.data, "utf8");
-    if (rawBytes > options.rawByteLimit) {
-      throw new Error(`Terminal replay raw output exceeded the ${options.rawByteLimit} byte limit.`);
+  return wireBytes;
+}
+
+export class TerminalWebSocketSender {
+  private replayState: "available" | "pending" | "settled" | "invalidated" = "available";
+  private replayDebt = 0;
+  private pendingLiveBytes = 0;
+
+  constructor(
+    private readonly ws: WebSocket,
+    private readonly rawReplayByteLimit: number,
+    private readonly onError: (error: Error) => void,
+  ) {}
+
+  invalidate(): void {
+    this.replayState = "invalidated";
+    this.replayDebt = 0;
+    this.pendingLiveBytes = 0;
+  }
+
+  sendReplay(data: string): boolean {
+    if (this.replayState !== "available") {
+      return false;
     }
-    return sendWebSocketJson(
-      ws,
-      payload,
-      onError,
-      terminalReplaySerializedByteLimit(options.rawByteLimit),
-      "Terminal websocket replay output",
-      options.onComplete,
-    );
-  } catch (error) {
-    onError(error instanceof Error ? error : new Error(String(error)));
-    return false;
+    this.replayState = "pending";
+    return this.send(data, true);
+  }
+
+  sendLive(data: string): boolean {
+    return this.send(data, false);
+  }
+
+  private isInvalidated(): boolean {
+    return this.replayState === "invalidated";
+  }
+
+  private fail(error: unknown): void {
+    if (this.replayState === "invalidated") {
+      return;
+    }
+    this.invalidate();
+    this.onError(error instanceof Error ? error : new Error(String(error)));
+  }
+
+  private send(data: string, replay: boolean): boolean {
+    if (this.replayState === "invalidated") {
+      return false;
+    }
+    // Each completion owns only its reservation. Duplicate or late callbacks
+    // cannot settle another send or revive a disconnected connection.
+    let pending = true;
+    let wireBytes = 0;
+    const complete = (error?: Error) => {
+      if (!pending || this.replayState === "invalidated") {
+        return;
+      }
+      pending = false;
+      if (error) {
+        this.fail(error);
+      } else if (replay) {
+        this.replayState = "settled";
+        this.replayDebt = 0;
+      } else {
+        this.pendingLiveBytes -= wireBytes;
+      }
+    };
+    try {
+      if (this.ws.readyState !== WS_OPEN) {
+        throw new Error("Terminal websocket is not open.");
+      }
+      const limit = replay ? terminalReplaySerializedByteLimit(this.rawReplayByteLimit) : TERMINAL_WS_MAX_BUFFERED_BYTES;
+      if (replay && Buffer.byteLength(data, "utf8") > this.rawReplayByteLimit) {
+        throw new Error(`Terminal replay raw output exceeded the ${this.rawReplayByteLimit} byte limit.`);
+      }
+      if (replay && !data) {
+        complete();
+        return true;
+      }
+      const serialized = JSON.stringify({ type: "data", data });
+      const payloadBytes = Buffer.byteLength(serialized, "utf8");
+      wireBytes = terminalFrameWireBytes(payloadBytes);
+      const bufferedBefore = this.ws.bufferedAmount;
+      this.replayDebt = Math.min(this.replayDebt, bufferedBefore);
+      // Live reservations include frame headers and remain until completion,
+      // so a delayed replay callback cannot conceal drained replay/live bytes.
+      const pendingBytes = replay ? bufferedBefore : Math.max(this.pendingLiveBytes, bufferedBefore - this.replayDebt);
+      if (payloadBytes > limit || pendingBytes + payloadBytes > limit) {
+        throw new Error(`Terminal websocket ${replay ? "replay" : "buffered"} output exceeded the ${limit} byte limit.`);
+      }
+      if (!replay) {
+        this.pendingLiveBytes += wireBytes;
+      }
+      this.ws.send(serialized, complete);
+      if (replay && pending && this.replayState === "pending") {
+        // Credit only bytes observed from this actual replay send, never its
+        // configured ceiling. A synchronous completion installs no debt.
+        this.replayDebt = Math.min(wireBytes, Math.max(0, this.ws.bufferedAmount - bufferedBefore));
+      }
+      return !this.isInvalidated();
+    } catch (error) {
+      if (pending) {
+        pending = false;
+        this.fail(error);
+      }
+      return false;
+    }
   }
 }
 

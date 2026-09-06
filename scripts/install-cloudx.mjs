@@ -8,7 +8,7 @@ import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 
 export const ASR_MODEL_ID = "Systran/faster-whisper-large-v3";
-export const CODEX_CLI_VERSION = "0.152.0";
+export const CODEX_CLI_VERSION = "0.153.4";
 export const UV_VERSION = "0.11.28";
 export const SERVICE_NAMES = [
   "cloudx-asr.service",

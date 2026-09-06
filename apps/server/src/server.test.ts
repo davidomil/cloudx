@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import http from "node:http";
+import type { Socket } from "node:net";
 import os from "node:os";
 import path from "node:path";
 
@@ -37,7 +38,7 @@ import {
   buildServices,
   parseTerminalControlMessage,
   parseVoiceAudioControlMessage,
-  sendTerminalWebSocketJson,
+  TerminalWebSocketSender,
   serializeRequestForLog,
   terminalReplaySerializedByteLimit,
   TERMINAL_WS_MAX_BUFFERED_BYTES,
@@ -375,11 +376,7 @@ describe("buildServer", () => {
     } as unknown as WebSocket;
 
     expect(
-      sendTerminalWebSocketJson(
-        socket,
-        { type: "data", data: "more output" },
-        onError,
-      ),
+      new TerminalWebSocketSender(socket, 0, onError).sendLive("more output"),
     ).toBe(false);
 
     expect(send).not.toHaveBeenCalled();
@@ -414,12 +411,7 @@ describe("buildServer", () => {
       const rawByteLimit = Buffer.byteLength(data, "utf8");
 
       expect(
-        sendTerminalWebSocketJson(
-          socket,
-          { type: "data", data },
-          onError,
-          { policy: "replay", rawByteLimit },
-        ),
+        new TerminalWebSocketSender(socket, rawByteLimit, onError).sendReplay(data),
       ).toBe(true);
       expect(onError).not.toHaveBeenCalled();
       expect(JSON.parse(serializedFrames[0]!)).toEqual({ type: "data", data });
@@ -429,10 +421,34 @@ describe("buildServer", () => {
     }
   });
 
+  it.each(["pending", "settled", "invalidated"] as const)("never reuses a %s replay token", (state) => {
+    const callbacks: Array<(error?: Error) => void> = [];
+    const send = vi.fn((_serialized: string, callback: (error?: Error) => void) => callbacks.push(callback));
+    const error = vi.fn();
+    const socket = { readyState: WebSocket.OPEN, bufferedAmount: 0, send } as unknown as WebSocket;
+    const sender = new TerminalWebSocketSender(socket, 100, error);
+    expect(sender.sendReplay("retained")).toBe(true);
+    if (state === "settled") callbacks[0]!();
+    if (state === "invalidated") sender.invalidate();
+    expect(sender.sendReplay("retained")).toBe(false);
+    expect(send).toHaveBeenCalledTimes(1);
+    callbacks[0]!();
+    callbacks[0]!(new Error("duplicate completion"));
+    expect(sender.sendReplay("retained")).toBe(false);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(error).not.toHaveBeenCalled();
+  });
+
   it("derives the exact worst-case replay ceiling and rejects unsafe arithmetic", () => {
     expect(terminalReplaySerializedByteLimit(TERMINAL_WS_MAX_BUFFERED_BYTES)).toBe(6_291_481);
     expect(() => terminalReplaySerializedByteLimit(-1)).toThrow(/non-negative safe integer/);
     expect(() => terminalReplaySerializedByteLimit(Number.MAX_SAFE_INTEGER)).toThrow(/safe integer capacity/);
+    for (const limit of [0.5, NaN, Infinity, -Infinity]) {
+      expect(() => terminalReplaySerializedByteLimit(limit)).toThrow(/non-negative safe integer/);
+    }
+    const largestSerializedRawLimit = Math.floor((Number.MAX_SAFE_INTEGER - 25) / 6);
+    expect(() => terminalReplaySerializedByteLimit(largestSerializedRawLimit)).toThrow(/frame exceeds safe integer capacity/);
+    expect(terminalReplaySerializedByteLimit(largestSerializedRawLimit - 2)).toBeLessThan(Number.MAX_SAFE_INTEGER - 10);
   });
 
   it("rejects replay data above its raw UTF-8 limit before websocket send", () => {
@@ -445,12 +461,7 @@ describe("buildServer", () => {
     } as unknown as WebSocket;
 
     expect(
-      sendTerminalWebSocketJson(
-        socket,
-        { type: "data", data: "🙂" },
-        onError,
-        { policy: "replay", rawByteLimit: 3 },
-      ),
+      new TerminalWebSocketSender(socket, 3, onError).sendReplay("🙂"),
     ).toBe(false);
     expect(send).not.toHaveBeenCalled();
     expect(onError).toHaveBeenCalledWith(
@@ -5053,6 +5064,94 @@ describe("buildServer", () => {
     }
   });
 
+  it.each([
+    ["ASCII", "r", 1_048_601],
+    ["maximum JSON expansion", "\u0000", 6_291_481],
+  ])("queues live output behind an actually buffered %s replay", async (_label, character, payloadBytes) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-ws-corked-replay-"));
+    const replay = String(character).repeat(TERMINAL_WS_MAX_BUFFERED_BYTES);
+    const serializedReplay = JSON.stringify({ type: "data", data: replay });
+    const dispose = vi.fn();
+    const write = vi.fn();
+    const stop = vi.fn();
+    let onData: ((data: string) => void) | undefined;
+    const session = {
+      snapshot: () => ({ recentOutput: replay }),
+      onData: (listener: (data: string) => void) => {
+        onData = listener;
+        return dispose;
+      },
+      write,
+      stop,
+    };
+    let serverSocket: WebSocket | undefined;
+    let corkedSocket: Socket | undefined;
+    const replayComplete = vi.fn();
+    const originalSend = WebSocket.prototype.send;
+    const sendSpy = vi.spyOn(WebSocket.prototype, "send").mockImplementation(function (this: WebSocket, data: unknown, ...args: unknown[]) {
+      if (data === serializedReplay && !serverSocket) {
+        serverSocket = this;
+        corkedSocket = (this as WebSocket & { _socket: Socket })._socket;
+        corkedSocket.cork();
+        const complete = args.at(-1) as (error?: Error) => void;
+        Reflect.apply(originalSend, this, [data, (error?: Error) => {
+          replayComplete(error);
+          complete(error);
+        }]);
+        return;
+      }
+      Reflect.apply(originalSend, this, [data, ...args]);
+    });
+    const services = terminalRouteTestServices(root, session);
+    const getSession = vi.spyOn(services.sessions, "getSession");
+    const app = await buildServer(
+      { ...testConfig(root), terminalReplayBytes: TERMINAL_WS_MAX_BUFFERED_BYTES },
+      services,
+    );
+    let client: WebSocket | undefined;
+    const received: Array<{ type: string; data: string }> = [];
+    try {
+      await app.listen({ host: "127.0.0.1", port: 0 });
+      const address = app.server.address() as { port: number };
+      client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/terminal/tab-1`, {
+        headers: { host: "localhost" },
+      });
+      client.on("message", (raw) => received.push(JSON.parse(raw.toString())));
+      await waitForWebSocketOpen(client);
+      expect(Buffer.byteLength(serializedReplay)).toBe(payloadBytes);
+      expect(serverSocket!.bufferedAmount).toBe(Number(payloadBytes) + 10);
+      expect(replayComplete).not.toHaveBeenCalled();
+      expect(received).toEqual([]);
+      expect(onData).toBeTypeOf("function");
+      const close = vi.spyOn(serverSocket!, "close");
+
+      onData!("tick");
+
+      expect({ state: serverSocket!.readyState, closes: close.mock.calls, disposals: dispose.mock.calls.length })
+        .toEqual({ state: WebSocket.OPEN, closes: [], disposals: 0 });
+      expect(serverSocket!.bufferedAmount).toBe(Number(payloadBytes) + 10 + 31);
+      expect(replayComplete).not.toHaveBeenCalled();
+      expect(received).toEqual([]);
+      corkedSocket!.uncork();
+      await vi.waitFor(() => expect(received).toEqual([
+        { type: "data", data: replay },
+        { type: "data", data: "tick" },
+      ]), { timeout: 5_000 });
+      expect(replayComplete).toHaveBeenCalledTimes(1);
+      client.send(JSON.stringify({ type: "input", data: "same-session-input" }));
+      await vi.waitFor(() => expect(write).toHaveBeenCalledWith("same-session-input"));
+      expect(getSession).toHaveBeenCalledExactlyOnceWith("tab-1");
+      expect(getSession.mock.results[0]?.value).toBe(session);
+      expect(stop).not.toHaveBeenCalled();
+    } finally {
+      corkedSocket?.uncork();
+      sendSpy.mockRestore();
+      client?.close();
+      await app.close();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }, 10_000);
+
   it("replays a raw-limit maximum-expansion terminal snapshot before live output", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-ws-replay-max-"));
     const replayLimit = TERMINAL_WS_MAX_BUFFERED_BYTES;
@@ -5160,6 +5259,283 @@ describe("buildServer", () => {
     } finally {
       client?.close();
       await app.close();
+    }
+  });
+
+  describe.each(["pending", "drained", "settled", "empty"] as const)("terminal live reservations with %s replay", (phase) => {
+    it.each([
+      [125, 2], [126, 4], [65_535, 4], [65_536, 10],
+    ])("counts the real %i-byte payload header at the exact admission boundary", async (payloadBytes, headerBytes) => {
+      for (const excess of [0, 1]) {
+        const fixture = await terminalSocketFixture(phase);
+        try {
+          const connection = fixture.connection;
+          const start = fixture.sends.length;
+          const pendingBefore = connection.server.bufferedAmount;
+          fixture.emit("a".repeat(payloadBytes - 25));
+          expect(connection.server.bufferedAmount - pendingBefore).toBe(payloadBytes + headerBytes);
+          const nextPayload = TERMINAL_WS_MAX_BUFFERED_BYTES - payloadBytes - headerBytes + excess;
+          const next = "b".repeat(nextPayload - 25);
+          fixture.emit(next);
+          expect(fixture.sends.length - start).toBe(excess ? 1 : 2);
+          if (excess) {
+            expect(connection.server.readyState).toBe(WebSocket.CLOSING);
+            fixture.uncork(connection.server);
+            await expect(connection.closed).resolves.toMatchObject({ code: 1011 });
+            expect(connection.frames.some((frame) => frame.message.data === next)).toBe(false);
+            expect(fixture.disposers[0]).toHaveBeenCalledTimes(1);
+          } else {
+            expect(connection.server.readyState).toBe(WebSocket.OPEN);
+            expect(connection.server.bufferedAmount - pendingBefore).toBe(TERMINAL_WS_MAX_BUFFERED_BYTES + 10);
+            fixture.uncork(connection.server);
+            await vi.waitFor(() => expect(fixture.sends.every((send) => send.completed)).toBe(true));
+            fixture.sends.forEach((send) => send.callback());
+            const beforeFresh = fixture.sends.length;
+            fixture.emit("after-release");
+            await vi.waitFor(() => expect(connection.frames.at(-1)?.message.data).toBe("after-release"));
+            expect(fixture.sends).toHaveLength(beforeFresh + 1);
+          }
+          expect(fixture.stop).not.toHaveBeenCalled();
+        } finally {
+          await fixture.dispose();
+        }
+      }
+    }, 10_000);
+
+    it("rejects accumulated individually permitted live output before the next send", async () => {
+      const fixture = await terminalSocketFixture(phase);
+      try {
+        const start = fixture.sends.length;
+        const pendingBefore = fixture.connection.server.bufferedAmount;
+        fixture.emit("tick");
+        fixture.emit("a".repeat(400_000 - 25));
+        fixture.emit("b".repeat(400_000 - 25));
+        expect(fixture.connection.server.bufferedAmount - pendingBefore).toBe(800_051);
+        fixture.emit("rejected:" + "c".repeat(400_000));
+        expect(fixture.sends.length - start).toBe(3);
+        fixture.uncork(fixture.connection.server);
+        await expect(fixture.connection.closed).resolves.toMatchObject({ code: 1011 });
+        expect(fixture.connection.frames.some((frame) => frame.message.data.startsWith("rejected:"))).toBe(false);
+        expect(fixture.disposers[0]).toHaveBeenCalledTimes(1);
+        expect(fixture.stop).not.toHaveBeenCalled();
+      } finally {
+        await fixture.dispose();
+      }
+    });
+
+    it("rejects a single oversized live frame even when it equals the replay", async () => {
+      const fixture = await terminalSocketFixture(phase);
+      try {
+        fixture.emit("tick");
+        const before = fixture.sends.length;
+        fixture.emit("r".repeat(TERMINAL_WS_MAX_BUFFERED_BYTES));
+        expect(fixture.sends).toHaveLength(before);
+        fixture.uncork(fixture.connection.server);
+        await expect(fixture.connection.closed).resolves.toMatchObject({ code: 1011 });
+        expect(fixture.disposers[0]).toHaveBeenCalledTimes(1);
+        expect(fixture.stop).not.toHaveBeenCalled();
+      } finally {
+        await fixture.dispose();
+      }
+    });
+  });
+
+  it("does not lend replay credit when the original replay drains immediately", async () => {
+    const fixture = await terminalSocketFixture("empty", { replay: "short replay" });
+    try {
+      const replay = fixture.sends[0]!;
+      expect(replay.bufferedAfter).toBe(0);
+      expect(replay.completed).toBe(true);
+      fixture.emit("a".repeat(600_000 - 25));
+      fixture.emit("b".repeat(600_000 - 25));
+      expect(fixture.sends).toHaveLength(2);
+      fixture.uncork(fixture.connection.server);
+      await expect(fixture.connection.closed).resolves.toMatchObject({ code: 1011 });
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it("settles each live reservation once while a different live frame remains queued", async () => {
+    const fixture = await terminalSocketFixture("empty");
+    try {
+      fixture.emit("a".repeat(100_000 - 25));
+      fixture.uncork(fixture.connection.server);
+      await vi.waitFor(() => expect(fixture.sends[0]?.completed).toBe(true));
+      const first = fixture.sends[0]!;
+      first.callback();
+      fixture.emit("b".repeat(600_000 - 25));
+      await vi.waitFor(() => expect(fixture.sends[1]?.completed).toBe(true));
+      fixture.cork(fixture.connection.server);
+      fixture.emit("c".repeat(100_000 - 25));
+      expect(fixture.connection.server.bufferedAmount).toBe(100_010);
+      first.callback();
+      first.callback(new Error("error after successful completion"));
+      expect(fixture.connection.server.readyState).toBe(WebSocket.OPEN);
+      expect(fixture.disposers[0]).not.toHaveBeenCalled();
+      fixture.emit("d".repeat(400_000 - 25));
+      expect(fixture.sends).toHaveLength(3);
+      fixture.uncork(fixture.connection.server);
+      await expect(fixture.connection.closed).resolves.toMatchObject({ code: 1011 });
+      first.callback(new Error("late error"));
+      fixture.sends[2]!.callback();
+      expect(fixture.disposers[0]).toHaveBeenCalledTimes(1);
+      expect(fixture.stop).not.toHaveBeenCalled();
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it("replay settlement preserves outstanding live reservations and cannot rearm replay", async () => {
+    const fixture = await terminalSocketFixture("pending");
+    try {
+      fixture.emit("a".repeat(600_000 - 25));
+      fixture.uncork(fixture.connection.server);
+      await vi.waitFor(() => expect(fixture.sends.every((send) => send.completed)).toBe(true));
+      fixture.sends[0]!.callback();
+      fixture.sends[0]!.callback(new Error("duplicate replay error"));
+      fixture.cork(fixture.connection.server);
+      fixture.emit("tick");
+      expect(fixture.connection.server.readyState).toBe(WebSocket.OPEN);
+      fixture.emit("b".repeat(500_000 - 25));
+      expect(fixture.sends).toHaveLength(3);
+      fixture.uncork(fixture.connection.server);
+      await expect(fixture.connection.closed).resolves.toMatchObject({ code: 1011 });
+      expect(fixture.disposers[0]).toHaveBeenCalledTimes(1);
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it.each(["success", "error"] as const)("handles synchronous live callback %s during registration", async (completion) => {
+    const fixture = await terminalSocketFixture("empty", {
+      registrationOutput: "registration-output",
+      synchronousCompletion: completion,
+    });
+    try {
+      if (completion === "error") {
+        await expect(fixture.connection.closed).resolves.toMatchObject({ code: 1011 });
+        expect(fixture.disposers[0]).toHaveBeenCalledTimes(1);
+      } else {
+        expect(fixture.disposers[0]).not.toHaveBeenCalled();
+        fixture.emit("a".repeat(TERMINAL_WS_MAX_BUFFERED_BYTES - 25));
+        expect(fixture.sends).toHaveLength(2);
+        expect(fixture.connection.server.readyState).toBe(WebSocket.OPEN);
+        fixture.sends[0]!.callback(new Error("duplicate synchronous callback"));
+        expect(fixture.disposers[0]).not.toHaveBeenCalled();
+      }
+      expect(fixture.stop).not.toHaveBeenCalled();
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it.each(["success", "error"] as const)("handles synchronous replay callback %s before send returns", async (completion) => {
+    const fixture = await terminalSocketFixture("pending", { synchronousCompletion: completion });
+    try {
+      if (completion === "error") {
+        fixture.uncork(fixture.connection.server);
+        await expect(fixture.connection.closed).resolves.toMatchObject({ code: 1011 });
+        expect(fixture.disposers).toHaveLength(0);
+      } else {
+        // Although the callback says success, the deliberately corked wire is
+        // still full. Synchronous completion must not install replay credit.
+        fixture.emit("tick");
+        expect(fixture.sends).toHaveLength(1);
+        fixture.uncork(fixture.connection.server);
+        await expect(fixture.connection.closed).resolves.toMatchObject({ code: 1011 });
+        expect(fixture.disposers[0]).toHaveBeenCalledTimes(1);
+      }
+      fixture.sends[0]!.callback(new Error("late replay callback"));
+      expect(fixture.stop).not.toHaveBeenCalled();
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it("invalidates an asynchronous live send error once", async () => {
+    const fixture = await terminalSocketFixture("empty");
+    try {
+      fixture.emit("pending-live");
+      const callback = fixture.sends[0]!.callback;
+      callback(new Error("asynchronous live write failure"));
+      fixture.emit("after-error");
+      callback();
+      callback(new Error("duplicate error"));
+      fixture.connection.server.emit("error", new Error("socket error after failure"));
+      fixture.uncork(fixture.connection.server);
+      await expect(fixture.connection.closed).resolves.toMatchObject({ code: 1011 });
+      expect(fixture.sends).toHaveLength(1);
+      expect(fixture.disposers[0]).toHaveBeenCalledTimes(1);
+      expect(fixture.stop).not.toHaveBeenCalled();
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it.each(["close", "error"] as const)("ignores late callbacks after socket %s and reattaches the same terminal", async (event) => {
+    const fixture = await terminalSocketFixture("pending");
+    try {
+      const first = fixture.connection;
+      fixture.emit("old-live");
+      const oldCallbacks = fixture.sends.map((send) => send.callback);
+      fixture.uncork(first.server);
+      await vi.waitFor(() => expect(fixture.sends.every((send) => send.completed)).toBe(true));
+      if (event === "error") {
+        first.server.emit("error", new Error("connection failed"));
+        first.server.close();
+      } else {
+        first.client.close();
+      }
+      await first.closed;
+      await vi.waitFor(() => expect(fixture.disposers[0]).toHaveBeenCalledTimes(1));
+      const replacement = await fixture.connect();
+      fixture.emit("a".repeat(600_000 - 25));
+      const count = fixture.sends.length;
+      oldCallbacks.forEach((callback) => {
+        callback();
+        callback(new Error("old connection callback"));
+      });
+      expect(replacement.server.readyState).toBe(WebSocket.OPEN);
+      expect(fixture.disposers[1]).not.toHaveBeenCalled();
+      expect(fixture.sends).toHaveLength(count);
+      fixture.uncork(replacement.server);
+      await vi.waitFor(() => expect(fixture.sends.every((send) => send.completed)).toBe(true));
+      fixture.sends.filter((send) => send.socket === replacement.server).forEach((send) => send.callback());
+      replacement.client.send(JSON.stringify({ type: "input", data: "reattached" }));
+      replacement.client.send(JSON.stringify({ type: "resize", cols: 120, rows: 32 }));
+      await vi.waitFor(() => {
+        expect(replacement.frames.some((frame) => frame.message.data === "echo:reattached")).toBe(true);
+        expect(replacement.frames.some((frame) => frame.message.data === "resize:120x32")).toBe(true);
+      });
+      expect(fixture.getSession).toHaveBeenCalledTimes(2);
+      expect(fixture.getSession.mock.calls).toEqual([["tab-1"], ["tab-1"]]);
+      expect(fixture.getSession.mock.results.every((result) => result.value === fixture.session)).toBe(true);
+      expect(fixture.stop).not.toHaveBeenCalled();
+      fixture.sends.filter((send) => send.socket === replacement.server).forEach((send) => send.callback());
+      fixture.cork(replacement.server);
+      fixture.emit("b".repeat(600_000 - 25));
+      const beforeRejected = fixture.sends.length;
+      oldCallbacks.forEach((callback) => callback());
+      fixture.emit("c".repeat(500_000 - 25));
+      expect(fixture.sends).toHaveLength(beforeRejected);
+      fixture.uncork(replacement.server);
+      await expect(replacement.closed).resolves.toMatchObject({ code: 1011 });
+      expect(fixture.disposers[1]).toHaveBeenCalledTimes(1);
+    } finally {
+      await fixture.dispose();
+    }
+    expect(fixture.disposers.every((dispose) => dispose.mock.calls.length === 1)).toBe(true);
+  });
+
+  it.each([-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER])("rejects unsafe raw replay limit %s before subscription", async (rawByteLimit) => {
+    const fixture = await terminalSocketFixture("empty", { replay: "x", rawByteLimit });
+    try {
+      await expect(fixture.connection.closed).resolves.toMatchObject({ code: 1011 });
+      expect(fixture.sends).toHaveLength(0);
+      expect(fixture.disposers).toHaveLength(0);
+    } finally {
+      await fixture.dispose();
     }
   });
 
@@ -6521,6 +6897,127 @@ function holdWebSocketSendCallback(serializedToHold: string): {
     sentFrames: () => [...sentFrames],
     restore: () => spy.mockRestore(),
   };
+}
+
+type TerminalSendRecord = {
+  socket: WebSocket;
+  data: string;
+  callback: (error?: Error) => void;
+  completed: boolean;
+  bufferedAfter: number;
+};
+
+async function terminalSocketFixture(
+  phase: "pending" | "drained" | "settled" | "empty",
+  options: {
+    replay?: string;
+    rawByteLimit?: number;
+    registrationOutput?: string;
+    synchronousCompletion?: "success" | "error";
+  } = {},
+) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-reservations-"));
+  const replay = options.replay ?? (phase === "empty" ? "" : "r".repeat(TERMINAL_WS_MAX_BUFFERED_BYTES));
+  const listeners = new Set<(data: string) => void>();
+  const disposers: ReturnType<typeof vi.fn>[] = [];
+  const sends: TerminalSendRecord[] = [];
+  const corked = new Map<WebSocket, Socket>();
+  const serverSockets: WebSocket[] = [];
+  const clients: WebSocket[] = [];
+  const emit = (data: string) => listeners.forEach((listener) => listener(data));
+  const stop = vi.fn();
+  const session = {
+    snapshot: () => ({ recentOutput: replay }),
+    onData: (listener: (data: string) => void) => {
+      listeners.add(listener);
+      const dispose = vi.fn(() => listeners.delete(listener));
+      disposers.push(dispose);
+      if (options.registrationOutput) listener(options.registrationOutput);
+      return dispose;
+    },
+    write: vi.fn((data: string) => emit("echo:" + data)),
+    resize: vi.fn((cols: number, rows: number) => emit("resize:" + cols + "x" + rows)),
+    stop,
+  };
+  const services = terminalRouteTestServices(root, session);
+  const getSession = vi.spyOn(services.sessions, "getSession");
+  const app = await buildServer({
+    ...testConfig(root),
+    terminalReplayBytes: options.rawByteLimit ?? TERMINAL_WS_MAX_BUFFERED_BYTES,
+  }, services);
+  app.websocketServer.on("connection", (socket) => serverSockets.push(socket));
+  const cork = (socket: WebSocket) => {
+    if (!corked.has(socket)) {
+      // Test-only outer cork: leave ws.send, its framing, and bufferedAmount real.
+      const stream = (socket as WebSocket & { _socket: Socket })._socket;
+      stream.cork();
+      corked.set(socket, stream);
+    }
+  };
+  const uncork = (socket: WebSocket) => {
+    corked.get(socket)?.uncork();
+    corked.delete(socket);
+  };
+  const originalSend = WebSocket.prototype.send;
+  const sendSpy = vi.spyOn(WebSocket.prototype, "send").mockImplementation(function (this: WebSocket, data: unknown, ...args: unknown[]) {
+    if (typeof data !== "string" || !data.startsWith('{"type":"data",')) {
+      Reflect.apply(originalSend, this, [data, ...args]);
+      return;
+    }
+    const message = JSON.parse(data) as { data: string };
+    if (phase !== "empty" && !sends.some((send) => send.socket === this)) cork(this);
+    const record: TerminalSendRecord = {
+      socket: this,
+      data: message.data,
+      callback: args.at(-1) as (error?: Error) => void,
+      completed: false,
+      bufferedAfter: 0,
+    };
+    sends.push(record);
+    Reflect.apply(originalSend, this, [data, (error?: Error) => {
+      record.completed = true;
+      if (error) record.callback(error);
+    }]);
+    record.bufferedAfter = this.bufferedAmount;
+    if (options.synchronousCompletion) {
+      record.callback(options.synchronousCompletion === "error" ? new Error("synchronous completion error") : undefined);
+    }
+  });
+  const connect = async () => {
+    const address = app.server.address() as { port: number };
+    const client = new WebSocket("ws://127.0.0.1:" + address.port + "/ws/terminal/tab-1", { headers: { host: "localhost" } });
+    clients.push(client);
+    const frames: Array<{ bytes: number; message: { type: string; data: string } }> = [];
+    const closed = readWebSocketClose(client);
+    client.on("message", (raw) => frames.push({ bytes: Buffer.byteLength(raw.toString()), message: JSON.parse(raw.toString()) }));
+    await waitForWebSocketOpen(client);
+    return { client, server: serverSockets.at(-1)!, frames, closed };
+  };
+  const dispose = async () => {
+    for (const socket of corked.keys()) uncork(socket);
+    sendSpy.mockRestore();
+    clients.forEach((client) => client.terminate());
+    await app.close();
+    await fs.rm(root, { recursive: true, force: true });
+  };
+  try {
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const connection = await connect();
+    if (phase !== "pending" && connection.server.readyState === WebSocket.OPEN) {
+      uncork(connection.server);
+      if (replay) {
+        await vi.waitFor(() => expect(sends[0]?.completed).toBe(true));
+        await vi.waitFor(() => expect(connection.frames[0]?.message.data).toBe(replay));
+        if (phase === "settled") sends[0]!.callback();
+      }
+      // Hold subsequent live frames in the original socket.
+      cork(connection.server);
+    }
+    return { connection, connect, sends, emit, stop, session, getSession, disposers, cork, uncork, dispose };
+  } catch (error) {
+    await dispose();
+    throw error;
+  }
 }
 
 function ndjsonEvents(body: string): Record<string, unknown>[] {
