@@ -33,6 +33,14 @@ import { displayCommand, verificationPlan } from "./verify.mjs";
 
 const gitSha = (character) => character.repeat(40);
 const sha = (character) => character.repeat(64);
+// Immutable historical test data, never a production candidate selector.
+const smartHttpFixtureCandidate = Object.freeze({
+  head: "465896c9ec4da70af5f312db3a35d2c137a5513c",
+  tree: "58f00e1134a4aefd34bd712f623ad3743846a695",
+  parent: "216e6d739155aa1dc5bab11829f56869e6f494ff",
+  pathsSha256:
+    "a125d814c942a913d63331d3d1d85f11c8c2740e269bd3e0f2e185c4c593d338",
+});
 const directTestTransport = loopbackTransport(41_099);
 const expectedCredentialFreeGitEnvironment = {
   GCM_INTERACTIVE: "Never",
@@ -1727,283 +1735,379 @@ setTimeout(() => process.exit(0), 100);
     expect(runner.pushes).toHaveLength(1);
   });
 
-  it("publishes the unreplaced object graph through authenticated smart HTTP", async () => {
-    const integration = await smartHttpIntegrationFixture();
-    const originalDirectory = process.cwd();
-    const originalTemplate = process.env.GIT_TEMPLATE_DIR;
-    const originalGlobalConfig = process.env.GIT_CONFIG_GLOBAL;
-    try {
-      process.chdir(integration.sourceDirectory);
-      process.env.GIT_TEMPLATE_DIR = integration.hostileTemplateDirectory;
-      process.env.GIT_CONFIG_GLOBAL = integration.hostileGlobalConfig;
+  it.each([
+    { name: "ordinary source", growSource: false },
+    { name: "committed branch growth", growSource: true },
+  ])(
+    "publishes the unreplaced object graph through authenticated smart HTTP ($name)",
+    async ({ growSource }) => {
+      const originalDirectory = process.cwd();
+      const originalSource = smartHttpSourceSnapshot(originalDirectory);
+      const originalTemplate = process.env.GIT_TEMPLATE_DIR;
+      const originalGlobalConfig = process.env.GIT_CONFIG_GLOBAL;
+      let integration;
+      try {
+        integration = await smartHttpIntegrationFixture({ growSource });
+        process.chdir(integration.sourceDirectory);
+        process.env.GIT_TEMPLATE_DIR = integration.hostileTemplateDirectory;
+        process.env.GIT_CONFIG_GLOBAL = integration.hostileGlobalConfig;
 
-      expect(
-        execFileSync(
-          "git",
-          [
-            "-C",
-            integration.sourceDirectory,
-            "show",
-            "-s",
-            "--format=%s",
-            "HEAD",
-          ],
-          { encoding: "utf8" },
-        ).trim(),
-      ).toBe("HOSTILE REPLACEMENT");
-      expect(
-        execFileSync(
-          "git",
-          [
-            "-C",
-            integration.sourceDirectory,
-            "show",
-            "-s",
-            "--format=%s",
-            "HEAD",
-          ],
+        expect(
+          execFileSync(
+            "git",
+            [
+              "-C",
+              integration.sourceDirectory,
+              "show",
+              "-s",
+              "--format=%s",
+              "HEAD",
+            ],
+            { encoding: "utf8" },
+          ).trim(),
+        ).toBe("HOSTILE REPLACEMENT");
+        expect(
+          execFileSync(
+            "git",
+            [
+              "-C",
+              integration.sourceDirectory,
+              "show",
+              "-s",
+              "--format=%s",
+              "HEAD",
+            ],
+            {
+              encoding: "utf8",
+              env: { ...process.env, GIT_NO_REPLACE_OBJECTS: "1" },
+            },
+          ).trim(),
+        ).toBe(GATE_B_COMMIT_SUBJECTS.at(-1));
+
+        const terminal = await publishGateBCandidateForDirectTest(
           {
-            encoding: "utf8",
-            env: { ...process.env, GIT_NO_REPLACE_OBJECTS: "1" },
+            ...authorizationArguments(integration.fixture),
+            artifactDir: integration.fixture.directory,
+            authorizedManifestSha256: integration.fixture.manifestSha256,
+            expectedOldHead: integration.fixture.oldHead,
+            runCommand: integration.runCommand,
           },
-        ).trim(),
-      ).toBe(GATE_B_COMMIT_SUBJECTS.at(-1));
+          integration.transport,
+        );
 
-      const terminal = await publishGateBCandidateForDirectTest(
-        {
-          ...authorizationArguments(integration.fixture),
-          artifactDir: integration.fixture.directory,
-          authorizedManifestSha256: integration.fixture.manifestSha256,
-          expectedOldHead: integration.fixture.oldHead,
-          runCommand: integration.runCommand,
-        },
-        integration.transport,
-      );
+        expect(terminal).toEqual({
+          outcome: "published",
+          pushAttempts: 1,
+          retry: false,
+          reviewPrHandoff: true,
+        });
+        expect(integration.observations).toMatchObject({
+          authenticatedRequests: expect.any(Number),
+          backendProcesses: expect.any(Number),
+          backendBeforeAuthentication: false,
+          challengeWasExact: true,
+          firstRequestHadAuthorization: false,
+          receivePackPosts: 1,
+          serverStarts: 1,
+          setupFetches: 1,
+          tokenMatched: true,
+          transportCreations: 1,
+        });
+        expect(integration.observations.authenticatedRequests).toBeGreaterThan(
+          0,
+        );
+        expect(integration.observations.backendProcesses).toBeGreaterThan(0);
+        expect(
+          execFileSync(
+            "git",
+            [
+              `--git-dir=${integration.targetGitDirectory}`,
+              "rev-parse",
+              GATE_B_CANDIDATE_REF,
+            ],
+            { encoding: "utf8" },
+          ).trim(),
+        ).toBe(integration.fixture.head);
+        expect(
+          execFileSync(
+            "git",
+            [
+              `--git-dir=${integration.targetGitDirectory}`,
+              "show",
+              "-s",
+              "--format=%s",
+              GATE_B_CANDIDATE_REF,
+            ],
+            { encoding: "utf8" },
+          ).trim(),
+        ).toBe(GATE_B_COMMIT_SUBJECTS.at(-1));
+        expect(
+          execFileSync(
+            "git",
+            [
+              `--git-dir=${integration.targetGitDirectory}`,
+              "for-each-ref",
+              "--format=%(refname) %(objectname)",
+              "refs/heads",
+            ],
+            { encoding: "utf8" },
+          )
+            .trim()
+            .split("\n"),
+        ).toEqual([
+          `${GATE_B_CANDIDATE_REF} ${integration.fixture.head}`,
+          `${GATE_B_TARGET_BASE_REF} ${GATE_B_EXPECTED_TARGET_BASE_SHA}`,
+        ]);
+        expect(fs.existsSync(integration.hostileMarker)).toBe(false);
+        expect(integration.observations.contextRoots).toHaveLength(1);
+        expect(fs.existsSync(integration.observations.contextRoots[0])).toBe(
+          false,
+        );
+        const sourceReadsAndImport = integration.observations.calls.filter(
+          ({ command, operation, sourceRepository }) =>
+            command === "git" && (sourceRepository || operation === "fetch"),
+        );
+        expect(sourceReadsAndImport.length).toBeGreaterThan(0);
+        expect(sourceReadsAndImport).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ operation: "diff" }),
+            expect.objectContaining({ operation: "fetch" }),
+            expect.objectContaining({ operation: "log" }),
+            expect.objectContaining({ operation: "rev-parse" }),
+          ]),
+        );
+        for (const call of sourceReadsAndImport) {
+          expect(call.noReplaceObjects).toBe(true);
+        }
 
-      expect(terminal).toEqual({
-        outcome: "published",
-        pushAttempts: 1,
-        retry: false,
-        reviewPrHandoff: true,
-      });
-      expect(integration.observations).toMatchObject({
-        authenticatedRequests: expect.any(Number),
-        backendProcesses: expect.any(Number),
-        backendBeforeAuthentication: false,
-        challengeWasExact: true,
-        firstRequestHadAuthorization: false,
-        receivePackPosts: 1,
-        tokenMatched: true,
-      });
-      expect(integration.observations.authenticatedRequests).toBeGreaterThan(0);
-      expect(integration.observations.backendProcesses).toBeGreaterThan(0);
-      expect(
-        execFileSync(
-          "git",
-          [
-            `--git-dir=${integration.targetGitDirectory}`,
-            "rev-parse",
-            GATE_B_CANDIDATE_REF,
-          ],
-          { encoding: "utf8" },
-        ).trim(),
-      ).toBe(integration.fixture.head);
-      expect(
-        execFileSync(
-          "git",
-          [
-            `--git-dir=${integration.targetGitDirectory}`,
-            "show",
-            "-s",
-            "--format=%s",
-            GATE_B_CANDIDATE_REF,
-          ],
-          { encoding: "utf8" },
-        ).trim(),
-      ).toBe(GATE_B_COMMIT_SUBJECTS.at(-1));
-      expect(
-        execFileSync(
-          "git",
-          [
-            `--git-dir=${integration.targetGitDirectory}`,
-            "for-each-ref",
-            "--format=%(refname) %(objectname)",
-            "refs/heads",
-          ],
-          { encoding: "utf8" },
-        )
-          .trim()
-          .split("\n"),
-      ).toEqual([
-        `${GATE_B_CANDIDATE_REF} ${integration.fixture.head}`,
-        `${GATE_B_TARGET_BASE_REF} ${GATE_B_EXPECTED_TARGET_BASE_SHA}`,
-      ]);
-      expect(fs.existsSync(integration.hostileMarker)).toBe(false);
-      expect(integration.observations.contextRoots).toHaveLength(1);
-      expect(fs.existsSync(integration.observations.contextRoots[0])).toBe(
-        false,
-      );
-      const sourceReadsAndImport = integration.observations.calls.filter(
-        ({ command, operation, sourceRepository }) =>
-          command === "git" && (sourceRepository || operation === "fetch"),
-      );
-      expect(sourceReadsAndImport.length).toBeGreaterThan(0);
-      expect(sourceReadsAndImport).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({ operation: "diff" }),
-          expect.objectContaining({ operation: "fetch" }),
-          expect.objectContaining({ operation: "log" }),
-          expect.objectContaining({ operation: "rev-parse" }),
-        ]),
-      );
-      for (const call of sourceReadsAndImport) {
-        expect(call.noReplaceObjects).toBe(true);
+        const durableCapture = JSON.stringify({
+          calls: integration.observations.calls,
+          terminal,
+        });
+        expect(durableCapture).not.toContain(integration.fixture.token);
+        expect(durableCapture).not.toContain(digest(integration.fixture.token));
+        expect(
+          fs.readFileSync(integration.fixture.authorizationFile, "utf8"),
+        ).not.toContain(integration.fixture.token);
+      } finally {
+        process.chdir(originalDirectory);
+        restoreEnvironment("GIT_TEMPLATE_DIR", originalTemplate);
+        restoreEnvironment("GIT_CONFIG_GLOBAL", originalGlobalConfig);
+        await integration?.dispose();
+        expect(smartHttpSourceSnapshot(originalDirectory)).toEqual(
+          originalSource,
+        );
       }
+    },
+    30_000,
+  );
 
-      const durableCapture = JSON.stringify({
-        calls: integration.observations.calls,
-        terminal,
+  it("rejects missing smart HTTP fixture history before transport startup and cleans allocations", async () => {
+    const root = fs.mkdtempSync(
+      path.join(os.tmpdir(), "cloudx-gate-b-missing-history-"),
+    );
+    const repositoryDirectory = path.join(root, "empty-source.git");
+    const fixtureParent = path.join(root, "fixtures");
+    const emptyTemplate = path.join(root, "empty-template");
+    const observations = {};
+    try {
+      fs.mkdirSync(fixtureParent);
+      fs.mkdirSync(emptyTemplate);
+      execFileSync("git", [
+        "init",
+        "--quiet",
+        "--bare",
+        `--template=${emptyTemplate}`,
+        repositoryDirectory,
+      ]);
+      await expect(
+        smartHttpIntegrationFixture({
+          repositoryDirectory,
+          fixtureParent,
+          observations,
+        }),
+      ).rejects.toThrow(
+        `Gate B smart HTTP fixture requires historical candidate commit ${smartHttpFixtureCandidate.head} (CI-HISTORY-PREREQUISITE-001).`,
+      );
+      expect(observations).toMatchObject({
+        authenticatedRequests: 0,
+        backendProcesses: 0,
+        calls: [],
+        contextRoots: [],
+        receivePackPosts: 0,
+        serverStarts: 0,
+        setupFetches: 0,
+        transportCreations: 0,
       });
-      expect(durableCapture).not.toContain(integration.fixture.token);
-      expect(durableCapture).not.toContain(digest(integration.fixture.token));
-      expect(
-        fs.readFileSync(integration.fixture.authorizationFile, "utf8"),
-      ).not.toContain(integration.fixture.token);
+      expect(observations.fixtureRoots).toHaveLength(1);
+      expect(fs.existsSync(observations.fixtureRoots[0])).toBe(false);
+      expect(fs.readdirSync(fixtureParent)).toEqual([]);
     } finally {
-      process.chdir(originalDirectory);
-      restoreEnvironment("GIT_TEMPLATE_DIR", originalTemplate);
-      restoreEnvironment("GIT_CONFIG_GLOBAL", originalGlobalConfig);
-      await integration.dispose();
+      fs.rmSync(root, { force: true, recursive: true });
     }
-  }, 30_000);
+  });
 });
 
-async function smartHttpIntegrationFixture() {
-  const root = fs.mkdtempSync(
-    path.join(os.tmpdir(), "cloudx-gate-b-http-integration-"),
-  );
-  const sourceDirectory = path.join(root, "source");
-  execFileSync(
-    "git",
-    ["clone", "--quiet", "--no-hardlinks", process.cwd(), sourceDirectory],
-    { stdio: "pipe" },
-  );
-  execFileSync("git", ["-C", sourceDirectory, "config", "user.name", "Gate B"]);
-  execFileSync("git", [
-    "-C",
-    sourceDirectory,
-    "config",
-    "user.email",
-    "gate-b@example.invalid",
+function smartHttpSourceSnapshot(directory) {
+  const git = (args) =>
+    execFileSync("git", ["--no-optional-locks", "-C", directory, ...args], {
+      env: expectedCredentialFreeGitEnvironment,
+    });
+  const gitDirectory = git(["rev-parse", "--absolute-git-dir"])
+    .toString("utf8")
+    .trim();
+  return {
+    head: git(["rev-parse", "HEAD"]).toString("utf8"),
+    branch: git(["rev-parse", "--symbolic-full-name", "HEAD"]).toString("utf8"),
+    index: digest(fs.readFileSync(path.join(gitDirectory, "index"))),
+    status: git([
+      "status",
+      "--porcelain=v1",
+      "-z",
+      "--untracked-files=all",
+    ]).toString("utf8"),
+    files: git(["ls-files", "--cached", "--others", "--exclude-standard", "-z"])
+      .toString("utf8")
+      .split("\0")
+      .filter(Boolean)
+      .map((file) => {
+        const filePath = path.join(directory, file);
+        const stat = fs.lstatSync(filePath, { throwIfNoEntry: false });
+        return [
+          file,
+          stat?.mode,
+          stat?.isSymbolicLink()
+            ? fs.readlinkSync(filePath)
+            : stat?.isFile()
+              ? digest(fs.readFileSync(filePath))
+              : null,
+        ];
+      }),
+  };
+}
+
+function prepareSmartHttpSource(sourceDirectory, { growSource }) {
+  const git = (args) =>
+    execFileSync("git", ["-C", sourceDirectory, ...args], {
+      encoding: "utf8",
+      env: expectedCredentialFreeGitEnvironment,
+    });
+  for (const [name, oid] of [
+    ["candidate", smartHttpFixtureCandidate.head],
+    ["local change base", GATE_B_LOCAL_CHANGE_BASE_SHA],
+    ["expected old candidate", GATE_B_EXPECTED_OLD_CANDIDATE_SHA],
+    ["target base", GATE_B_EXPECTED_TARGET_BASE_SHA],
+  ]) {
+    const prerequisite = spawnSync(
+      "git",
+      ["-C", sourceDirectory, "cat-file", "-e", `${oid}^{commit}`],
+      { env: expectedCredentialFreeGitEnvironment, stdio: "pipe" },
+    );
+    if (prerequisite.status !== 0) {
+      throw new Error(
+        `Gate B smart HTTP fixture requires historical ${name} commit ${oid} (CI-HISTORY-PREREQUISITE-001).`,
+      );
+    }
+  }
+
+  const unrelatedPath = "cloudx-gate-b-unrelated-sentinel.txt";
+  if (growSource) {
+    const inheritedHead = git(["rev-parse", "HEAD"]).trim();
+    const growthBranch = "fixture-unrelated-growth";
+    const growthSubject = "TEST: append unrelated fixture source history";
+    const unrelatedContents = "unrelated committed fixture path\n";
+    expect(fs.existsSync(path.join(sourceDirectory, unrelatedPath))).toBe(
+      false,
+    );
+    git(["checkout", "--quiet", "-b", growthBranch]);
+    fs.writeFileSync(
+      path.join(sourceDirectory, unrelatedPath),
+      unrelatedContents,
+    );
+    git(["add", "--", unrelatedPath]);
+    git(["commit", "--quiet", "-m", growthSubject]);
+    expect(git(["symbolic-ref", "HEAD"]).trim()).toBe(
+      `refs/heads/${growthBranch}`,
+    );
+    expect(git(["rev-parse", "HEAD"]).trim()).not.toBe(inheritedHead);
+    expect(git(["rev-parse", "HEAD^"]).trim()).toBe(inheritedHead);
+    expect(git(["rev-list", "--count", `${inheritedHead}..HEAD`]).trim()).toBe(
+      "1",
+    );
+    expect(git(["show", "-s", "--format=%s", "HEAD"]).trim()).toBe(
+      growthSubject,
+    );
+    expect(git(["show", `HEAD:${unrelatedPath}`])).toBe(unrelatedContents);
+    expect(
+      git(["diff", "--name-only", "-z", `${inheritedHead}..HEAD`, "--"]),
+    ).toBe(`${unrelatedPath}\0`);
+    expect(
+      git([
+        "diff",
+        "--name-only",
+        "-z",
+        `${GATE_B_LOCAL_CHANGE_BASE_SHA}..HEAD`,
+        "--",
+      ]).split("\0"),
+    ).toContain(unrelatedPath);
+  }
+
+  git([
+    "checkout",
+    "--quiet",
+    "-B",
+    GATE_B_CANDIDATE_REF.slice("refs/heads/".length),
+    smartHttpFixtureCandidate.head,
   ]);
-  const candidateHead = execFileSync(
-    "git",
-    ["-C", sourceDirectory, "rev-parse", "HEAD"],
-    { encoding: "utf8" },
-  ).trim();
-  const allowedPaths = execFileSync("git", [
-    "-C",
-    sourceDirectory,
+  const candidateHead = git(["rev-parse", "HEAD"]).trim();
+  expect(candidateHead).toBe(smartHttpFixtureCandidate.head);
+  expect(git(["symbolic-ref", "HEAD"]).trim()).toBe(GATE_B_CANDIDATE_REF);
+  expect(git(["rev-parse", "HEAD^{tree}"]).trim()).toBe(
+    smartHttpFixtureCandidate.tree,
+  );
+  expect(git(["show", "-s", "--format=%P", "HEAD"]).trim()).toBe(
+    smartHttpFixtureCandidate.parent,
+  );
+  expect(
+    git([
+      "log",
+      "--reverse",
+      "--format=%s",
+      `${GATE_B_LOCAL_CHANGE_BASE_SHA}..${candidateHead}`,
+    ])
+      .trim()
+      .split("\n"),
+  ).toEqual(GATE_B_COMMIT_SUBJECTS);
+  const allowedPaths = git([
     "diff",
     "--name-only",
     "-z",
     "--no-renames",
     `${GATE_B_LOCAL_CHANGE_BASE_SHA}..${candidateHead}`,
     "--",
-  ])
-    .toString("utf8")
-    .split("\0")
-    .filter(Boolean);
+  ]).split("\0");
+  expect(allowedPaths.pop()).toBe("");
+  expect(allowedPaths).not.toContain("");
   expect(allowedPaths).toHaveLength(GATE_B_ALLOWED_PATH_COUNT);
-  const fixture = gateBFixture({ allowedPaths, head: candidateHead });
-  const replacementTree = execFileSync(
-    "git",
-    [
-      "-C",
-      sourceDirectory,
-      "rev-parse",
-      `${GATE_B_LOCAL_CHANGE_BASE_SHA}^{tree}`,
-    ],
-    { encoding: "utf8" },
-  ).trim();
-  const replacementCommit = execFileSync(
-    "git",
-    [
-      "-C",
-      sourceDirectory,
-      "commit-tree",
-      replacementTree,
-      "-p",
-      GATE_B_LOCAL_CHANGE_BASE_SHA,
-    ],
-    { encoding: "utf8", input: "HOSTILE REPLACEMENT\n" },
-  ).trim();
-  execFileSync("git", [
-    "-C",
-    sourceDirectory,
-    "replace",
-    candidateHead,
-    replacementCommit,
-  ]);
-
-  const hostileMarker = path.join(root, "hostile-hook-ran");
-  const hostileHooksDirectory = path.join(root, "hostile-hooks");
-  const hostileTemplateDirectory = path.join(root, "hostile-template");
-  fs.mkdirSync(hostileHooksDirectory);
-  fs.mkdirSync(path.join(hostileTemplateDirectory, "hooks"), {
-    recursive: true,
-  });
-  const hostileHook = `#!/bin/sh\nprintf hostile > ${JSON.stringify(hostileMarker)}\n`;
-  fs.writeFileSync(path.join(hostileHooksDirectory, "pre-push"), hostileHook, {
-    mode: 0o755,
-  });
-  fs.writeFileSync(
-    path.join(hostileTemplateDirectory, "hooks", "pre-push"),
-    hostileHook,
-    { mode: 0o755 },
+  expect(new Set(allowedPaths).size).toBe(GATE_B_ALLOWED_PATH_COUNT);
+  expect(digest(`${[...allowedPaths].sort().join("\n")}\n`)).toBe(
+    smartHttpFixtureCandidate.pathsSha256,
   );
-  fs.writeFileSync(
-    path.join(sourceDirectory, ".git", "hooks", "pre-push"),
-    hostileHook,
-    { mode: 0o755 },
-  );
-  execFileSync("git", [
-    "-C",
-    sourceDirectory,
-    "remote",
-    "set-url",
-    "origin",
-    "https://example.invalid/hostile.git",
-  ]);
-  const hostileGlobalConfig = path.join(root, "hostile-global-config");
-  fs.writeFileSync(
-    hostileGlobalConfig,
-    `[credential]\n\thelper = store\n[http]\n\textraHeader = X-Hostile: true\n[core]\n\thooksPath = ${hostileHooksDirectory}\n[init]\n\ttemplateDir = ${hostileTemplateDirectory}\n`,
-  );
+  expect(allowedPaths).not.toContain(unrelatedPath);
+  expect(fs.existsSync(path.join(sourceDirectory, unrelatedPath))).toBe(false);
+  return { allowedPaths, candidateHead };
+}
 
-  const serverRoot = path.join(root, "server");
-  const emptyTargetTemplate = path.join(root, "empty-target-template");
-  const targetGitDirectory = path.join(serverRoot, "cloudx.git");
-  fs.mkdirSync(serverRoot);
-  fs.mkdirSync(emptyTargetTemplate);
-  execFileSync("git", [
-    "init",
-    "--quiet",
-    "--bare",
-    `--template=${emptyTargetTemplate}`,
-    targetGitDirectory,
-  ]);
-  execFileSync("git", [
-    `--git-dir=${targetGitDirectory}`,
-    "fetch",
-    "--quiet",
-    "--no-tags",
-    sourceDirectory,
-    `${GATE_B_EXPECTED_TARGET_BASE_SHA}:${GATE_B_TARGET_BASE_REF}`,
-    `${fixture.oldHead}:${GATE_B_CANDIDATE_REF}`,
-  ]);
-
-  const observations = {
+async function smartHttpIntegrationFixture({
+  repositoryDirectory = process.cwd(),
+  growSource = false,
+  fixtureParent = os.tmpdir(),
+  observations = {},
+} = {}) {
+  const root = fs.mkdtempSync(
+    path.join(fixtureParent, "cloudx-gate-b-http-integration-"),
+  );
+  Object.assign(observations, {
     authenticatedRequests: 0,
     backendProcesses: 0,
     backendBeforeAuthentication: false,
@@ -2011,39 +2115,183 @@ async function smartHttpIntegrationFixture() {
     contextRoots: [],
     calls: [],
     firstRequestHadAuthorization: undefined,
+    fixtureRoots: [root],
     receivePackPosts: 0,
+    serverStarts: 0,
+    setupFetches: 0,
     tokenMatched: true,
-  };
-  const server = await startGitHttpBackendServer({
-    observations,
-    serverRoot,
-    token: fixture.token,
+    transportCreations: 0,
   });
-  const address = server.address();
-  const transport = loopbackTransport(address.port);
-  const runCommand = smartHttpCommandRunner({ fixture, observations });
-
-  return {
-    dispose: async () => {
-      await new Promise((resolve, reject) =>
-        server.close((error) => (error ? reject(error) : resolve())),
-      );
+  let fixture;
+  let server;
+  const dispose = async () => {
+    try {
+      if (server?.listening) {
+        await new Promise((resolve, reject) =>
+          server.close((error) => (error ? reject(error) : resolve())),
+        );
+      }
+    } finally {
       fs.rmSync(root, { force: true, recursive: true });
-      fs.rmSync(path.dirname(fixture.directory), {
-        force: true,
-        recursive: true,
-      });
-    },
-    fixture,
-    hostileGlobalConfig,
-    hostileMarker,
-    hostileTemplateDirectory,
-    observations,
-    runCommand,
-    sourceDirectory,
-    targetGitDirectory,
-    transport,
+      if (fixture) {
+        fs.rmSync(path.dirname(fixture.directory), {
+          force: true,
+          recursive: true,
+        });
+      }
+    }
   };
+  try {
+    const sourceDirectory = path.join(root, "source");
+    execFileSync(
+      "git",
+      [
+        "clone",
+        "--quiet",
+        "--no-hardlinks",
+        repositoryDirectory,
+        sourceDirectory,
+      ],
+      { stdio: "pipe" },
+    );
+    execFileSync("git", [
+      "-C",
+      sourceDirectory,
+      "config",
+      "user.name",
+      "Gate B",
+    ]);
+    execFileSync("git", [
+      "-C",
+      sourceDirectory,
+      "config",
+      "user.email",
+      "gate-b@example.invalid",
+    ]);
+    const { allowedPaths, candidateHead } = prepareSmartHttpSource(
+      sourceDirectory,
+      { growSource },
+    );
+    fixture = gateBFixture({ allowedPaths, head: candidateHead });
+    const replacementTree = execFileSync(
+      "git",
+      [
+        "-C",
+        sourceDirectory,
+        "rev-parse",
+        `${GATE_B_LOCAL_CHANGE_BASE_SHA}^{tree}`,
+      ],
+      { encoding: "utf8" },
+    ).trim();
+    const replacementCommit = execFileSync(
+      "git",
+      [
+        "-C",
+        sourceDirectory,
+        "commit-tree",
+        replacementTree,
+        "-p",
+        GATE_B_LOCAL_CHANGE_BASE_SHA,
+      ],
+      { encoding: "utf8", input: "HOSTILE REPLACEMENT\n" },
+    ).trim();
+    execFileSync("git", [
+      "-C",
+      sourceDirectory,
+      "replace",
+      candidateHead,
+      replacementCommit,
+    ]);
+
+    const hostileMarker = path.join(root, "hostile-hook-ran");
+    const hostileHooksDirectory = path.join(root, "hostile-hooks");
+    const hostileTemplateDirectory = path.join(root, "hostile-template");
+    fs.mkdirSync(hostileHooksDirectory);
+    fs.mkdirSync(path.join(hostileTemplateDirectory, "hooks"), {
+      recursive: true,
+    });
+    const hostileHook = `#!/bin/sh\nprintf hostile > ${JSON.stringify(hostileMarker)}\n`;
+    fs.writeFileSync(
+      path.join(hostileHooksDirectory, "pre-push"),
+      hostileHook,
+      {
+        mode: 0o755,
+      },
+    );
+    fs.writeFileSync(
+      path.join(hostileTemplateDirectory, "hooks", "pre-push"),
+      hostileHook,
+      { mode: 0o755 },
+    );
+    fs.writeFileSync(
+      path.join(sourceDirectory, ".git", "hooks", "pre-push"),
+      hostileHook,
+      { mode: 0o755 },
+    );
+    execFileSync("git", [
+      "-C",
+      sourceDirectory,
+      "remote",
+      "set-url",
+      "origin",
+      "https://example.invalid/hostile.git",
+    ]);
+    const hostileGlobalConfig = path.join(root, "hostile-global-config");
+    fs.writeFileSync(
+      hostileGlobalConfig,
+      `[credential]\n\thelper = store\n[http]\n\textraHeader = X-Hostile: true\n[core]\n\thooksPath = ${hostileHooksDirectory}\n[init]\n\ttemplateDir = ${hostileTemplateDirectory}\n`,
+    );
+
+    const serverRoot = path.join(root, "server");
+    const emptyTargetTemplate = path.join(root, "empty-target-template");
+    const targetGitDirectory = path.join(serverRoot, "cloudx.git");
+    fs.mkdirSync(serverRoot);
+    fs.mkdirSync(emptyTargetTemplate);
+    execFileSync("git", [
+      "init",
+      "--quiet",
+      "--bare",
+      `--template=${emptyTargetTemplate}`,
+      targetGitDirectory,
+    ]);
+    observations.setupFetches += 1;
+    execFileSync("git", [
+      `--git-dir=${targetGitDirectory}`,
+      "fetch",
+      "--quiet",
+      "--no-tags",
+      sourceDirectory,
+      `${GATE_B_EXPECTED_TARGET_BASE_SHA}:${GATE_B_TARGET_BASE_REF}`,
+      `${fixture.oldHead}:${GATE_B_CANDIDATE_REF}`,
+    ]);
+
+    observations.serverStarts += 1;
+    server = await startGitHttpBackendServer({
+      observations,
+      serverRoot,
+      token: fixture.token,
+    });
+    const address = server.address();
+    observations.transportCreations += 1;
+    const transport = loopbackTransport(address.port);
+    const runCommand = smartHttpCommandRunner({ fixture, observations });
+
+    return {
+      dispose,
+      fixture,
+      hostileGlobalConfig,
+      hostileMarker,
+      hostileTemplateDirectory,
+      observations,
+      runCommand,
+      sourceDirectory,
+      targetGitDirectory,
+      transport,
+    };
+  } catch (error) {
+    await dispose();
+    throw error;
+  }
 }
 
 function smartHttpCommandRunner({ fixture, observations }) {
