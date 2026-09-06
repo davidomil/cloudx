@@ -28,6 +28,8 @@ import { TabContextService } from "./context/TabContextService.js";
 import { HookRegistry } from "./hooks/HookRegistry.js";
 import { PluginRegistry } from "./pluginRegistry.js";
 import { LocalWebPlugin } from "./plugins/LocalWebPlugin.js";
+import { CodexStateSources, legacySourceId } from "./plugins/CodexStateSources.js";
+import { parseCodexStateSourcesResponse } from "@cloudx/shared";
 import {
   InstalledPluginService,
   type PluginGitClient,
@@ -50,6 +52,63 @@ import type { VoicePlanner } from "./voice/VoicePlanner.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
 
 describe("buildServer", () => {
+  it("serves source metadata through the real parser and sanitizes filesystem failures", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-source-route-"));
+    const config = testConfig(root);
+    const home = path.join(root, "codex-source");
+    await fs.mkdir(home);
+    await fs.mkdir(path.join(config.dataDir, "codex-homes", "duplicate-a"), { recursive: true });
+    const services = buildServices(config);
+    services.codexStateSources = new CodexStateSources(config.dataDir, { CODEX_HOME: home });
+    await services.pluginContributionsReady;
+    const app = await buildServer(config, services);
+    try {
+      const response = await app.inject({ method: "GET", url: "/api/codex/state-sources" });
+      expect(response.statusCode).toBe(200);
+      expect(parseCodexStateSourcesResponse(response.json()).sources.map((source) => source.sourceId)).toEqual(["shared", legacySourceId("duplicate-a")]);
+      expect(response.body).not.toContain(root);
+      const list = vi.spyOn(services.codexStateSources, "list").mockRejectedValueOnce(new Error("private-content-secret"));
+      const failure = await app.inject({ method: "GET", url: "/api/codex/state-sources" });
+      expect(failure.statusCode).toBe(503);
+      expect(failure.body).not.toContain("private-content-secret");
+      expect(list.mock.calls[0]?.[0]).toBeInstanceOf(AbortSignal);
+    } finally { await app.close(); await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  it("cancels pending source inventory during server shutdown and closes its opened handle once", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-source-shutdown-"));
+    const config = testConfig(root);
+    const home = path.join(root, "home");
+    await fs.mkdir(home);
+    await fs.mkdir(path.join(config.dataDir, "codex-homes"), { recursive: true });
+    let opened!: () => void;
+    let release!: () => void;
+    const entered = new Promise<void>((resolve) => { opened = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let closes = 0;
+    const sources = new CodexStateSources(config.dataDir, { CODEX_HOME: home }, { fs: { ...fs, opendir: async (...args: Parameters<typeof fs.opendir>) => {
+      const directory = await fs.opendir(...args);
+      const originalRead = directory.read.bind(directory);
+      const originalClose = directory.close.bind(directory);
+      directory.read = (async () => { opened(); await gate; return originalRead(); }) as typeof directory.read;
+      directory.close = (async () => { closes += 1; return originalClose(); }) as typeof directory.close;
+      return directory;
+    } } });
+    const services = buildServices(config);
+    services.codexStateSources = sources;
+    await services.pluginContributionsReady;
+    const app = await buildServer(config, services);
+    const response = app.inject({ method: "GET", url: "/api/codex/state-sources" });
+    try {
+      await entered;
+      const closing = app.close();
+      release();
+      await closing;
+      expect((await response).statusCode).toBe(503);
+      expect(closes).toBe(1);
+      await expect(sources.list()).rejects.toThrow(/cancelled/);
+    } finally { release(); await app.close(); await fs.rm(root, { recursive: true, force: true }); }
+  });
   it("wires the worktree manager to the configured allowed roots", async () => {
     const allowedRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-worktree-composition-"));
     const allowedProject = path.join(allowedRoot, "project");

@@ -163,6 +163,22 @@ owned by the running Cloudx server. Restarting the Cloudx service ends those
 processes; changing a config file does not change the model inside an already
 running Codex process.
 
+New tabs keep isolated configuration and skills in
+`<data-dir>/codex-launches/<tab-id>` and use the original Codex home's shared
+SQLite state and complete sessions corpus. Cloudx sets `CODEX_SQLITE_HOME` only
+when it is absent or blank; explicit environment and native configuration
+precedence remain intact. Cloudx does not open or copy SQLite databases during
+tab creation. Initial native indexing or reconciliation is a separate operation;
+steady-state startup performance still requires native measurement.
+
+To resume, choose a **Session source** in the New tab dialog before using the
+picker, last session, or an exact ID. Search by template, date, or full source key.
+Each retained `codex-homes` directory is a separate source, preserving its own
+goals, pages and saved variants. Native `/resume` stays within that chosen source.
+The shared picker does not combine SQLite-only data from retained sources.
+Old unbound tabs require explicit source selection in a new tab; bound launch
+views retain their source when restarted. Cloudx does not delete old homes.
+
 ## Quick Start
 
 On Ubuntu 22.04 or newer, the guided installer is the easiest path:

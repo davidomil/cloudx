@@ -306,6 +306,72 @@ can call automation-exposed Cloudx hooks with `cloudx.call_hook(...)`; see
 `docs/AUTOMATION_CODE_EXECUTION.md` for the exact hook ID format, examples,
 outputs, and runtime limits.
 
+## Codex Session Sources And Startup
+
+New Codex tabs generate configuration, instructions and skills under
+`CLOUDX_DATA_DIR/codex-launches/<tab-id>`. The original `CODEX_HOME` (or
+`HOME/.codex`) remains the default SQLite owner with its complete history corpus.
+An absent or whitespace-only `CODEX_SQLITE_HOME` receives that absolute source
+home; a nonblank value is passed through unchanged, including native relative
+environment semantics based on the process cwd. Explicit native `sqlite_home`
+configuration and requirements keep their higher priority. In the generated
+config copy, an ordinary relative `sqlite_home` is normalized against its source
+config parent; absolute and home-relative values retain native handling. Source
+configuration is never rewritten.
+
+Resume picker, Resume last and Resume ID require an explicit **Session source**.
+The chooser fetches only when opened for resume, lists Shared sessions followed
+by retained homes newest first, and searches template label, date and source key.
+Identical labels remain separate owners; select the full key to distinguish them.
+Changing the source retains the selected mode and typed ID. New session clears
+both, and closing the dialog cancels its inventory request. Older API callers
+must supply `initialInput.resume.sourceId`; unqualified resume requests fail.
+`GET /api/codex/state-sources` returns only `sourceId`, `kind`, `label` and
+`updatedAt`, with no filesystem paths or conversation content.
+
+Retained `codex-homes` directories and their databases, goals, paginated history,
+names, queues and attachments stay in place. Selecting a retained source opens
+its original state; shared history scanning does not import its SQLite-only
+goals or pages. Native `/resume` cannot switch owners after launch. New launch
+views persist a private canonical source binding, use the selected sessions and
+archive roots, and share the original home's native writer and maintenance locks.
+Only the maintenance lock file is shared inside `.tmp`; other temporary/native
+output stays private. Native name-index replacement is preserved on restart.
+An old persisted tab with no binding needs explicit source selection in a new
+tab. Missing, conflicting or changed bindings fail before launch.
+
+The inventory is metadata-only: at most 512 direct real retained directories,
+four concurrent reads, a 16 KiB generated-heading prefix and a 30-second deadline.
+Selected config reads are capped at 1 MiB. Existing owned readable/writable modes
+remain unchanged. Ordinary New launches do not enumerate the inventory, open
+SQLite, scan transcripts, or walk ordinary project descendants. Existing ancestor
+instruction and skill discovery remains enabled.
+
+Before operational activation, existing direct old-home native writers must be
+quiescent. One-time native initialization/reconciliation requires reviewed
+read-only health checks and recoverable consistent backups of affected database
+families. An existing complete marker alone does not establish a complete index.
+The prepared native operation must enumerate all history sources/providers and
+archives through paginated `thread/list` scan-and-repair, with no filters that
+hide histories, no SQL edits and no background migration. Cloudx never starts
+that operation automatically for a new tab.
+
+Native preservation and timing acceptance remain required separately from unit
+and browser transport tests. Targets after genuine initialization are median
+startup at most 5 seconds and p95 at most 10 seconds for ten fresh processes per
+project size, with at least 90% reduction from the paired repeated-index baseline;
+these are acceptance targets, not published measurements. Actual model/effort,
+full session UUID and a benign fresh response confirm native readiness; network
+response time is recorded separately. Desktop and mobile reload acceptance must
+each retain the same process and session across two page reloads. The previous
+native desktop evidence does not establish completed mobile acceptance.
+
+Native `/goal edit` auto-expands an objective-file reference only when its lexical
+home matches the expected attachment path. An alias can leave that reference
+verbatim; goal text and its absolute file remain accessible. The inspected
+existing objectives contained no such references. This startup change does not
+introduce a profile or instruction-role redesign for that editor convenience.
+
 ## Codex Terminal Image Paste
 
 Built-in Codex terminal tabs accept pasted PNG, JPEG, WebP, and GIF clipboard

@@ -9,6 +9,7 @@ import type { TabIndicatorUpdate, WorkspaceTab } from "@cloudx/shared";
 
 import { CLOUDX_CODEX_DEFAULT_ARGS, CODEX_TERMINAL_ACTIONS, CodexTerminalPlugin, CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES, TERMINAL_ACTIONS, TerminalShellIntegrationParser, buildCodexLaunchArgs, codexResumeInput, materializeCodexTemplate } from "./CodexTerminalPlugin.js";
 import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
+import { CodexStateSources, legacySourceId } from "./CodexStateSources.js";
 
 class FakeTerminalProcess implements TerminalProcess {
   written = "";
@@ -54,12 +55,14 @@ class FakeTerminalProcess implements TerminalProcess {
 }
 
 class CapturingFactory implements TerminalProcessFactory {
+  spawns = 0;
   command: string | undefined;
   args: string[] | undefined;
   env: NodeJS.ProcessEnv | undefined;
   process: FakeTerminalProcess | undefined;
 
   async spawn(command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; cols: number; rows: number }): Promise<TerminalProcess> {
+    this.spawns += 1;
     this.command = command;
     this.args = args;
     this.env = options.env;
@@ -82,7 +85,199 @@ const tab: WorkspaceTab = {
 describe("CodexTerminalPlugin", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
+    vi.restoreAllMocks();
   });
+
+  it.each([undefined, "", " \t", "/explicit/state", " relative/state "])("defaults SQLite state only for absent/blank environment %j at the real factory", async (override) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-shared-factory-"));
+    const home = path.join(root, "home", ".codex");
+    await seedImagegenSkill(home);
+    vi.stubEnv("HOME", path.dirname(home));
+    vi.stubEnv("CODEX_HOME", "");
+    vi.stubEnv("CODEX_SQLITE_HOME", override);
+    const factory = new CapturingFactory();
+    const data = path.join(root, "data");
+    const sources = new CodexStateSources(data, process.env);
+    const list = vi.spyOn(sources, "list");
+    const open = vi.spyOn(fs, "open");
+    try {
+      const plugin = new CodexTerminalPlugin(factory, DEFAULT_TERMINAL_REPLAY_BYTES, data, sources);
+      await plugin.createSession({ tab, cwd: root, controls: { setTabIndicator: () => undefined, closeTab: () => undefined } });
+      expect(factory.env?.CODEX_SQLITE_HOME).toBe(override?.trim() ? override : await fs.realpath(home));
+      expect(factory.env?.CODEX_HOME).toBe(path.join(data, "codex-launches", tab.id));
+      expect(list).not.toHaveBeenCalled();
+      expect(open.mock.calls.some(([file]) => /\.sqlite(?:$|[-_])/u.test(String(file)))).toBe(false);
+      expect(await fs.readdir(factory.env!.CODEX_HOME!)).not.toContain("state_5.sqlite");
+      for (const name of ["sessions", "archived_sessions", "session_index.jsonl", "thread-writer-locks", ".tmp/rollout-maintenance.lock"]) {
+        expect(await fs.realpath(path.join(factory.env!.CODEX_HOME!, name))).toBe(await fs.realpath(path.join(home, name)));
+      }
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  it("keeps legacy owners and native index replacement across factory restart and isolated runtime updates", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-selected-factory-"));
+    const home = path.join(root, "home");
+    const data = path.join(root, "data");
+    const legacy = path.join(data, "codex-homes", "old-a");
+    await seedImagegenSkill(home);
+    await fs.mkdir(path.join(legacy, "sessions"), { recursive: true });
+    await fs.writeFile(path.join(legacy, "sessions", "private.jsonl"), "private synthetic history\n");
+    await fs.writeFile(path.join(legacy, "state_5.sqlite"), "opaque synthetic bytes: never opened\n");
+    await fs.writeFile(path.join(legacy, "session_index.jsonl"), "legacy index\n");
+    await fs.writeFile(path.join(legacy, "config.toml"), 'model = "explicit-legacy-model"\n');
+    vi.stubEnv("CODEX_HOME", home);
+    vi.stubEnv("CODEX_SQLITE_HOME", "");
+    const factory = new CapturingFactory();
+    const sources = new CodexStateSources(data, process.env);
+    const plugin = new CodexTerminalPlugin(factory, DEFAULT_TERMINAL_REPLAY_BYTES, data, sources);
+    const controls = { setTabIndicator: () => undefined, closeTab: () => undefined };
+    try {
+      const first = await plugin.createSession({ tab, cwd: root, controls, initialInput: { resume: { mode: "session", sessionId: "synthetic-stable-thread", sourceId: legacySourceId("old-a") } } });
+      const selectedProcess = factory.process;
+      const view = factory.env!.CODEX_HOME!;
+      expect(factory.env?.CODEX_SQLITE_HOME).toBe(await fs.realpath(legacy));
+      expect(parse(await fs.readFile(path.join(view, "config.toml"), "utf8")).model).toBe("explicit-legacy-model");
+      const binding = await fs.readFile(path.join(view, ".cloudx-source.json"), "utf8");
+      const writer = await fs.stat(path.join(view, "thread-writer-locks"));
+      const nativeIndex = path.join(view, "native-index.tmp");
+      await fs.writeFile(nativeIndex, "native renamed index\n");
+      await fs.rename(nativeIndex, path.join(view, "session_index.jsonl"));
+      await fs.writeFile(path.join(view, "native.log"), "retain native output\n");
+      await plugin.createSession({ tab: { ...tab, id: "tab-2" }, cwd: root, controls });
+      const otherView = factory.env!.CODEX_HOME!;
+      const otherConfig = await fs.readFile(path.join(otherView, "config.toml"), "utf8");
+      expect((await fs.stat(path.join(otherView, "thread-writer-locks"))).ino).toBe(writer.ino);
+      const strictLinks = vi.spyOn(fs, "symlink");
+      await first.applyRuntimeContext?.({ pluginRuntime: { "rules-skills": { personalityTemplate: { source: "tab", template: { id: "changed", name: "Changed", color: "green", ruleIds: ["one"], skillIds: [] }, rules: [{ id: "one", description: "One", text: "Apply this synthetic rule." }], skills: [] } } } });
+      expect(factory.spawns).toBe(2);
+      expect(selectedProcess?.killed).toBe(false);
+      expect(strictLinks.mock.calls.some(([, destination]) => /(?:sessions|thread-writer-locks|session_index|maintenance)/u.test(String(destination)))).toBe(false);
+      expect(await fs.readFile(path.join(otherView, "config.toml"), "utf8")).toBe(otherConfig);
+      await plugin.createSession({ tab, cwd: root, controls });
+      expect(factory.env?.CODEX_SQLITE_HOME).toBe(await fs.realpath(legacy));
+      expect(await fs.readFile(path.join(view, ".cloudx-source.json"), "utf8")).toBe(binding);
+      expect(await fs.readFile(path.join(view, "session_index.jsonl"), "utf8")).toBe("native renamed index\n");
+      expect(await fs.readFile(path.join(legacy, "session_index.jsonl"), "utf8")).toBe("legacy index\n");
+      expect(await fs.readFile(path.join(legacy, "state_5.sqlite"), "utf8")).toBe("opaque synthetic bytes: never opened\n");
+      expect(await fs.readFile(path.join(view, "native.log"), "utf8")).toBe("retain native output\n");
+      expect((await fs.stat(path.join(view, "thread-writer-locks"))).ino).toBe(writer.ino);
+      await expect(plugin.createSession({ tab, cwd: root, controls, initialInput: { resume: { mode: "last", sourceId: "shared" } } })).rejects.toThrow(/conflict/);
+      expect(factory.spawns).toBe(3);
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["../state/./db", "state", "/absolute/state", "~", "~/state"])("normalizes only ordinary relative source sqlite_home %s", async (sqliteHome) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-sqlite-config-"));
+    const home = path.join(root, "home");
+    const legacy = path.join(root, "data", "codex-homes", "variant");
+    await seedImagegenSkill(home);
+    await fs.mkdir(legacy, { recursive: true });
+    const original = `sqlite_home = ${JSON.stringify(sqliteHome)}\n`;
+    await fs.writeFile(path.join(legacy, "config.toml"), original);
+    try {
+      const launch = await materializeCodexTemplate(undefined, { CODEX_HOME: home, CODEX_SQLITE_HOME: " caller-relative " }, { dataDir: path.join(root, "data"), tabId: "selected", sourceId: legacySourceId("variant") });
+      expect(launch.env.CODEX_SQLITE_HOME).toBe(" caller-relative ");
+      const expected = path.isAbsolute(sqliteHome) || sqliteHome.startsWith("~") ? sqliteHome : path.resolve(await fs.realpath(legacy), sqliteHome);
+      expect(parse(await fs.readFile(path.join(launch.overlay!.codexHome, "config.toml"), "utf8")).sqlite_home).toBe(expected);
+      expect(await fs.readFile(path.join(legacy, "config.toml"), "utf8")).toBe(original);
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  it("keeps the diagnosed binding on spawn failure and rejects wrong durable links before another spawn", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-spawn-failure-"));
+    const home = path.join(root, "home");
+    const data = path.join(root, "data");
+    await seedImagegenSkill(home);
+    vi.stubEnv("CODEX_HOME", home);
+    const factory = new CapturingFactory();
+    const spawn = vi.spyOn(factory, "spawn").mockRejectedValue(new Error("synthetic spawn failure"));
+    const plugin = new CodexTerminalPlugin(factory, DEFAULT_TERMINAL_REPLAY_BYTES, data);
+    const input = { tab, cwd: root, controls: { setTabIndicator: () => undefined, closeTab: () => undefined } };
+    try {
+      await expect(plugin.createSession(input)).rejects.toThrow("synthetic spawn failure");
+      const view = path.join(data, "codex-launches", tab.id);
+      expect(JSON.parse(await fs.readFile(path.join(view, ".cloudx-source.json"), "utf8"))).toMatchObject({ version: 1, sourceId: "shared", home: await fs.realpath(home) });
+      expect((await fs.readdir(view)).filter((name) => name.startsWith(".cloudx-generated-"))).toEqual([]);
+      await fs.unlink(path.join(view, "sessions"));
+      await fs.mkdir(path.join(view, "sessions"));
+      await expect(plugin.createSession(input)).rejects.toThrow(/durable view/);
+      expect(spawn).toHaveBeenCalledTimes(1);
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  it("creates simultaneous first views with the same state and coordination inodes", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-concurrent-views-"));
+    const home = path.join(root, "home");
+    await seedImagegenSkill(home);
+    const dataDir = path.join(root, "data");
+    try {
+      const launches = await Promise.all(["one", "two"].map((tabId) => materializeCodexTemplate(undefined, { CODEX_HOME: home }, { dataDir, tabId })));
+      for (const name of ["sessions", "archived_sessions", "session_index.jsonl", "thread-writer-locks", ".tmp/rollout-maintenance.lock"]) {
+        const stats = await Promise.all(launches.map((launch) => fs.stat(path.join(launch.overlay!.codexHome, name))));
+        expect(stats.map((stat) => [stat.dev, stat.ino])).toEqual([[stats[0]!.dev, stats[0]!.ino], [stats[0]!.dev, stats[0]!.ino]]);
+      }
+      const privateTmp = await Promise.all(launches.map((launch) => fs.stat(path.join(launch.overlay!.codexHome, ".tmp"))));
+      expect(privateTmp[0]!.ino).not.toBe(privateTmp[1]!.ino);
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["EPERM", "ENOSPC"])("fails strict durable-link creation without copying after %s", async (code) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-link-failure-"));
+    const home = path.join(root, "home");
+    const dataDir = path.join(root, "data");
+    await seedImagegenSkill(home);
+    const originalSymlink = fs.symlink.bind(fs);
+    const link = vi.spyOn(fs, "symlink").mockImplementation(async (...args) => {
+      if (String(args[1]).endsWith("/sessions")) throw Object.assign(new Error("synthetic strict link failure"), { code });
+      return originalSymlink(...args);
+    });
+    const copy = vi.spyOn(fs, "cp");
+    try {
+      await expect(materializeCodexTemplate(undefined, { CODEX_HOME: home }, { dataDir, tabId: "failure" })).rejects.toMatchObject({ code });
+      expect(link).toHaveBeenCalled();
+      expect(copy).not.toHaveBeenCalled();
+      expect(await fs.readdir(path.join(dataDir, "codex-launches", "failure"))).toEqual([".cloudx-source.json"]);
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  it("keeps real New launch discovery outside 100 and 100000 ordinary-file project trees", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-project-discovery-"));
+    const home = path.join(root, "home", ".codex");
+    const data = path.join(root, "data");
+    await seedImagegenSkill(home);
+    vi.stubEnv("CODEX_HOME", home);
+    vi.stubEnv("HOME", path.dirname(home));
+    vi.stubEnv("CODEX_SQLITE_HOME", "");
+    const sources = new CodexStateSources(data, process.env);
+    const list = vi.spyOn(sources, "list");
+    const factory = new CapturingFactory();
+    const plugin = new CodexTerminalPlugin(factory, DEFAULT_TERMINAL_REPLAY_BYTES, data, sources);
+    try {
+      for (const count of [100, 100_000]) {
+        const project = path.join(root, `project-${count}`);
+        const ordinary = path.join(project, "ordinary");
+        await fs.mkdir(ordinary, { recursive: true });
+        await fs.mkdir(path.join(project, ".git"));
+        const skill = path.join(project, ".agents", "skills", "visible");
+        await fs.mkdir(skill, { recursive: true });
+        await fs.writeFile(path.join(skill, "SKILL.md"), "---\nname: visible\ndescription: Same skill topology.\n---\nSynthetic skill.\n");
+        let next = 0;
+        await Promise.all(Array.from({ length: 32 }, async () => {
+          while (next < count) await fs.writeFile(path.join(ordinary, `file-${next++}`), "");
+        }));
+        expect(await fs.readdir(ordinary)).toHaveLength(count);
+        const readdir = vi.spyOn(fs, "readdir");
+        const opendir = vi.spyOn(fs, "opendir");
+        await plugin.createSession({ tab: { ...tab, id: `project-${count}` }, cwd: project, controls: { setTabIndicator: () => undefined, closeTab: () => undefined } });
+        expect([...readdir.mock.calls, ...opendir.mock.calls].some(([directory]) => String(directory).includes("/ordinary") || String(directory).endsWith("/codex-homes"))).toBe(false);
+        expect(await fs.readFile(path.join(factory.env!.CODEX_HOME!, "config.toml"), "utf8")).toContain(await fs.realpath(path.join(skill, "SKILL.md")));
+        readdir.mockRestore();
+        opendir.mockRestore();
+      }
+      expect(list).not.toHaveBeenCalled();
+      expect(factory.spawns).toBe(2);
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  }, 120_000);
 
   it("launches Codex through the user's login shell", async () => {
     vi.stubEnv("SHELL", "/bin/bash");
@@ -106,7 +301,7 @@ describe("CodexTerminalPlugin", () => {
       tab,
       cwd: "/tmp",
       controls: { setTabIndicator: () => undefined, closeTab: () => undefined },
-      initialInput: { resume: { mode: "last", all: true, includeNonInteractive: true } }
+      initialInput: { resume: { mode: "last", sourceId: "shared", all: true, includeNonInteractive: true } }
     });
 
     expect(factory.args).toEqual(["-lc", `exec /usr/bin/codex ${CLOUDX_CODEX_DEFAULT_ARGS.join(" ")} resume --last --all --include-non-interactive`]);
@@ -122,7 +317,7 @@ describe("CodexTerminalPlugin", () => {
       tab,
       cwd: "/tmp",
       controls: { setTabIndicator: () => undefined, closeTab: () => undefined },
-      initialInput: { resume: { mode: "session", sessionId: "release fix thread" } }
+      initialInput: { resume: { mode: "session", sourceId: "shared", sessionId: "release fix thread" } }
     });
 
     expect(factory.args).toEqual(["-lc", `exec /usr/bin/codex ${CLOUDX_CODEX_DEFAULT_ARGS.join(" ")} resume 'release fix thread'`]);
@@ -199,7 +394,7 @@ describe("CodexTerminalPlugin", () => {
       CLOUDX_ENABLED_RULE_IDS: "review-carefully",
       CLOUDX_ENABLED_SKILL_IDS: "code-review"
     });
-    expect(factory.env?.CODEX_HOME).toContain(path.join(dataDir, "codex-homes", "tab-1"));
+    expect(factory.env?.CODEX_HOME).toContain(path.join(dataDir, "codex-launches", "tab-1"));
     expect(factory.env?.CLOUDX_RULES_SKILLS_DIR).toBe(path.join(dataDir, "rules-skills"));
     const overlayConfig = await fs.readFile(path.join(factory.env!.CODEX_HOME!, "config.toml"), "utf8");
     expect(overlayConfig).toContain("skills/cloudx/code-review/SKILL.md");
@@ -338,7 +533,7 @@ describe("CodexTerminalPlugin", () => {
 
     expect(launch.command).toBe("/usr/bin/codex");
     expect(launch.args).toEqual([...CLOUDX_CODEX_DEFAULT_ARGS, "--add-dir", path.join(dataDir, "rules-skills")]);
-    expect(launch.overlay?.codexHome).toBe(path.join(dataDir, "codex-homes", "tab-99"));
+    expect(launch.overlay?.codexHome).toBe(path.join(dataDir, "codex-launches", "tab-99"));
     const overlayConfig = await fs.readFile(path.join(launch.overlay!.codexHome, "config.toml"), "utf8");
     expect(overlayConfig).toContain("model = \"gpt-5.3-codex\"");
     expect(parse(overlayConfig).model_reasoning_effort).toBe("high");
@@ -415,15 +610,16 @@ describe("CodexTerminalPlugin", () => {
   });
 
   it("builds Codex resume args from tab initial input", () => {
-    expect(buildCodexLaunchArgs(["--add-dir", "/tmp/rules"], { resume: { mode: "picker", all: true } })).toEqual(["--add-dir", "/tmp/rules", "resume", "--all"]);
-    expect(buildCodexLaunchArgs([], { resume: { mode: "session", sessionId: "session-example" } })).toEqual([
+    expect(buildCodexLaunchArgs(["--add-dir", "/tmp/rules"], { resume: { mode: "picker", sourceId: "shared", all: true } })).toEqual(["--add-dir", "/tmp/rules", "resume", "--all"]);
+    expect(buildCodexLaunchArgs([], { resume: { mode: "session", sourceId: "shared", sessionId: "session-example" } })).toEqual([
       "resume",
       "session-example"
     ]);
     expect(codexResumeInput({ resume: { mode: "new" } })).toBeUndefined();
     expect(() => codexResumeInput({ resume: { mode: "session", sessionId: " " } })).toThrow("Codex resume session id is required.");
-    expect(() => codexResumeInput({ resume: { mode: "picker", all: "true" } })).toThrow("Codex resume all must be a boolean.");
-    expect(() => codexResumeInput({ resume: { mode: "last", includeNonInteractive: "true" } })).toThrow("Codex resume includeNonInteractive must be a boolean.");
+    expect(() => codexResumeInput({ resume: { mode: "picker", sourceId: "shared", all: "true" } })).toThrow("Codex resume all must be a boolean.");
+    expect(() => codexResumeInput({ resume: { mode: "last", sourceId: "shared", includeNonInteractive: "true" } })).toThrow("Codex resume includeNonInteractive must be a boolean.");
+    expect(() => codexResumeInput({ resume: { mode: "picker" } })).toThrow(/source selection/);
   });
 
   it("exposes Codex readiness waiting only on Codex terminal actions", () => {

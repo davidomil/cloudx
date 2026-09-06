@@ -43,6 +43,7 @@ import { PluginRegistry } from "./pluginRegistry.js";
 import { LOCAL_WEB_PROXY_MAX_BODY_BYTES, LocalWebProxy } from "./localWebProxy.js";
 import { contentDispositionAttachment, FileTransferService, FileUploadTooLargeError } from "./fileTransfer.js";
 import { CodexTerminalPlugin } from "./plugins/CodexTerminalPlugin.js";
+import { CodexStateSources } from "./plugins/CodexStateSources.js";
 import { FileBrowserPlugin } from "./plugins/FileBrowserPlugin.js";
 import { LocalWebPlugin } from "./plugins/LocalWebPlugin.js";
 import { StandardTerminalPlugin } from "./plugins/StandardTerminalPlugin.js";
@@ -106,6 +107,7 @@ export interface AppServices {
   jira?: JiraIntegrationService;
   jiraPolling?: JiraPollingService;
   pluginContributionsReady?: Promise<RulesSkillsStore>;
+  codexStateSources?: CodexStateSources;
 }
 
 const MIN_STREAMED_AUDIO_BYTES = 128;
@@ -150,6 +152,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       : null
   });
   services ??= buildServices(config, app.log);
+  services.codexStateSources ??= new CodexStateSources(config.dataDir);
   services.documentationIngestQueue ??= new DocumentationIngestQueue();
   await reapDocumentationUploadSpool(documentationSpoolRoot(config));
   services.config ??= new ConfigService(config.dataDir, () => services!.plugins.list(), { voiceModel: config.voiceModel });
@@ -207,7 +210,8 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     }
     const requestOwnerShutdown = settleDisposers([
       () => services.documentationIngestQueue?.dispose(),
-      () => services.voice.dispose?.()
+      () => services.voice.dispose?.(),
+      () => services.codexStateSources?.dispose()
     ]);
     const producerShutdown = settleDisposers([
       () => services.jiraPolling?.dispose(),
@@ -452,6 +456,21 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     const result = await services.workspaceCommands!.createTab(createTabBody(request.body));
     reply.code(201);
     return result;
+  });
+
+  app.get("/api/codex/state-sources", async (request, reply) => {
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    request.raw.once("aborted", abort);
+    reply.raw.once("close", abort);
+    try {
+      return await services.codexStateSources!.list(controller.signal);
+    } catch {
+      return reply.code(503).send({ error: "Codex session source inventory is unavailable." });
+    } finally {
+      request.raw.off("aborted", abort);
+      reply.raw.off("close", abort);
+    }
   });
 
   app.post<{ Params: { tabId: string } }>("/api/tabs/:tabId/active", async (request) => {
@@ -1152,6 +1171,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   const pathPolicy = new PathPolicy(config.allowedRoots);
   const workspace = new WorkspaceLayoutStore(config.dataDir, pathPolicy);
   const terminalFactory = new NodePtyTerminalProcessFactory();
+  const codexStateSources = new CodexStateSources(config.dataDir);
   const pluginData = new PluginDataStore(config.dataDir);
   const installedPlugins = new InstalledPluginService(config.dataDir, { logger });
   const rulesSkills = new RulesSkillsCatalogService(config.dataDir);
@@ -1165,7 +1185,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   process.env.CLOUDX_SERVER_URL ??= `${config.https ? "https" : "http"}://127.0.0.1:${config.port}`;
   let sessions: SessionStore | undefined;
   let documentationEnrichment: DocumentationEnrichmentService | undefined;
-  plugins.register(new CodexTerminalPlugin(terminalFactory, config.terminalReplayBytes, config.dataDir));
+  plugins.register(new CodexTerminalPlugin(terminalFactory, config.terminalReplayBytes, config.dataDir, codexStateSources));
   plugins.register(new StandardTerminalPlugin(terminalFactory, config.terminalReplayBytes));
   plugins.register(new FileBrowserPlugin(pathPolicy));
   plugins.register(new LocalWebPlugin());
@@ -1252,7 +1272,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   jiraPolling = new JiraPollingService(jira, pluginData, () => triggers);
   jiraPolling.start();
   automation = createAutomationService(automationRepository, { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config);
-  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, pluginContributionsReady };
+  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, pluginContributionsReady, codexStateSources };
 }
 
 function isStreamingHookRequest(request: FastifyRequest<{ Querystring: { stream?: string } }>): boolean {

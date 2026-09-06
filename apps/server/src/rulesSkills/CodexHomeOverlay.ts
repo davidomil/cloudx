@@ -16,6 +16,7 @@ import {
   type ResolvedPersonalityTemplate
 } from "./RulesSkillsCatalogService.js";
 import type { CloudxRule, CloudxSkill } from "@cloudx/shared";
+import type { CodexStateSources, ResolvedCodexStateSource } from "../plugins/CodexStateSources.js";
 
 export interface CodexHomeOverlayOptions {
   dataDir: string;
@@ -24,6 +25,8 @@ export interface CodexHomeOverlayOptions {
   baseEnv?: NodeJS.ProcessEnv;
   cwd?: string;
   resetCodexHome?: boolean;
+  sources: CodexStateSources;
+  source: ResolvedCodexStateSource;
 }
 
 export interface CodexHomeOverlay {
@@ -47,13 +50,19 @@ const IMAGEGEN_SKILL_RELATIVE_PATH = path.join("skills", ".system", "imagegen");
 
 export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptions): Promise<CodexHomeOverlay> {
   const baseEnv = options.baseEnv ?? process.env;
-  const sourceCodexHome = resolveCodexHome(baseEnv);
-  const codexHome = path.join(options.dataDir, "codex-homes", safePathSegment(options.tabId));
+  const sourceCodexHome = options.sources.originalHome;
+  const sourceConfig = await options.sources.readConfig(options.source);
+  const config = prepareOverlayConfig(sourceConfig, options.source.home);
+  const imagegen = await optionalLstat(path.join(sourceCodexHome, IMAGEGEN_SKILL_RELATIVE_PATH, "SKILL.md"));
+  if (!imagegen?.isFile()) throw new Error("Required Codex imagegen skill is missing.");
+  const codexHome = await options.sources.bind(options.tabId, options.source);
   const rulesSkillsRoot = rulesSkillsRootPath(options.dataDir);
-  if (options.resetCodexHome ?? true) {
-    await fsp.rm(codexHome, { recursive: true, force: true });
+  if (options.resetCodexHome !== false) {
+    await prepareDurableView(codexHome, options.source.home, (await options.sources.resolve("shared")).home);
   }
-  await fsp.mkdir(codexHome, { recursive: true });
+  // Only attempt-owned generated material is disposable. The bound view persists.
+  const staging = await fsp.mkdtemp(path.join(codexHome, ".cloudx-generated-"));
+  try {
   await ensureCloudxSystemRules(rulesSkillsRoot);
   await ensureCloudxSystemSkills(rulesSkillsRoot);
   const systemRules = await listCloudxSystemRules(rulesSkillsRoot);
@@ -62,13 +71,15 @@ export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptio
   await linkOrCopyIfExists(path.join(sourceCodexHome, "auth.json"), path.join(codexHome, "auth.json"));
   await linkOrCopyIfExists(path.join(sourceCodexHome, ".credentials.json"), path.join(codexHome, ".credentials.json"));
   await linkOrCopyIfExists(path.join(sourceCodexHome, "rules"), path.join(codexHome, "rules"));
-  await linkOrCopyIfExists(path.join(sourceCodexHome, "sessions"), path.join(codexHome, "sessions"));
-
-  const skillPaths = await materializeSelectedSkills(sourceCodexHome, codexHome, rulesSkillsRoot, options.resolved, systemSkills);
+  const stagedSkillPaths = await materializeSelectedSkills(sourceCodexHome, staging, rulesSkillsRoot, options.resolved, systemSkills);
+  const skillPaths = stagedSkillPaths.map((skillPath) => path.join(codexHome, path.relative(staging, skillPath)));
   const disabledSkillPaths = await discoverDisabledSkillPaths(options.cwd, baseEnv.HOME?.trim() || os.homedir());
   const configPath = path.join(codexHome, "config.toml");
-  await writeOverlayConfig(path.join(sourceCodexHome, "config.toml"), configPath, skillPaths, disabledSkillPaths);
-  const instructionsPath = await writeOverlayInstructions(sourceCodexHome, codexHome, options.resolved, systemRules);
+  await writeOverlayConfig(config, path.join(staging, "config.toml"), skillPaths, disabledSkillPaths);
+  const stagedInstructions = await writeOverlayInstructions(sourceCodexHome, staging, options.resolved, systemRules);
+  await options.sources.assertCurrent(options.source);
+  await publishGenerated(staging, codexHome, Boolean(stagedInstructions));
+  const instructionsPath = stagedInstructions ? path.join(codexHome, "AGENTS.override.md") : undefined;
 
   return {
     codexHome,
@@ -80,6 +91,108 @@ export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptio
     systemRules,
     systemSkills
   };
+  } finally { await fsp.rm(staging, { recursive: true, force: true }); }
+}
+
+async function publishGenerated(staging: string, home: string, hasInstructions: boolean): Promise<void> {
+  for (const name of ["config.toml", "AGENTS.override.md"]) {
+    const target = path.join(home, name);
+    const existing = await optionalLstat(target);
+    if (existing && (!existing.isFile() || existing.isSymbolicLink())) throw new Error("Unexpected generated Codex file type.");
+    if (name === "AGENTS.override.md" && !hasInstructions) {
+      if (existing) await fsp.unlink(target);
+    } else {
+      await fsp.rename(path.join(staging, name), target);
+    }
+  }
+  const skills = path.join(home, "skills");
+  await ensureStateObject(skills, "directory");
+  for (const name of ["cloudx", "cloudx-system", "cloudx-exceptions"]) {
+    const target = path.join(skills, name);
+    const existing = await optionalLstat(target);
+    if (existing && (!existing.isDirectory() || existing.isSymbolicLink())) throw new Error("Unexpected generated Codex skills type.");
+    if (existing) await fsp.rm(target, { recursive: true });
+    const staged = path.join(staging, "skills", name);
+    if (await optionalLstat(staged)) await fsp.rename(staged, target);
+  }
+}
+
+async function prepareDurableView(home: string, selected: string, shared: string): Promise<void> {
+  // Validate every existing view path before creating any missing source objects.
+  for (const name of ["config.toml", "AGENTS.override.md", "skills", ".tmp"]) {
+    const existing = await optionalLstat(path.join(home, name));
+    if (existing && (existing.isSymbolicLink() || ((name === "skills" || name === ".tmp") ? !existing.isDirectory() : !existing.isFile()))) throw new Error("Unexpected generated Codex view type.");
+  }
+  const links: Array<[string, string]> = [["sessions", selected], ["archived_sessions", selected], ["session_index.jsonl", selected], ["thread-writer-locks", shared], [".tmp/rollout-maintenance.lock", shared]];
+  for (const [name, owner] of links) {
+    const target = path.join(home, name);
+    const existing = await optionalLstat(target);
+    if (!existing) continue;
+    if (name === "session_index.jsonl" && existing.isFile() && !existing.isSymbolicLink()) { await validateStateObject(target, "file"); continue; }
+    if (!existing.isSymbolicLink() || await fsp.realpath(target) !== await fsp.realpath(path.join(owner, name))) throw new Error("Unexpected Codex durable view link.");
+  }
+  for (const name of ["sessions", "archived_sessions", "session_index.jsonl"]) {
+    const kind = name.endsWith(".jsonl") ? "file" : "directory";
+    const source = path.join(selected, name);
+    const existing = await optionalLstat(source);
+    if (existing?.isSymbolicLink()) {
+      if (await fsp.realpath(source) !== path.join(shared, name)) throw new Error("Unexpected Codex state link target.");
+      await validateStateObject(await fsp.realpath(source), kind);
+    } else {
+      await ensureStateObject(source, kind);
+    }
+    await strictStateLink(source, path.join(home, name), kind, name === "session_index.jsonl");
+  }
+  const writers = path.join(shared, "thread-writer-locks");
+  await ensureStateObject(writers, "directory");
+  await strictStateLink(writers, path.join(home, "thread-writer-locks"), "directory");
+  await ensureStateObject(path.join(shared, ".tmp"), "directory");
+  await ensureStateObject(path.join(home, ".tmp"), "directory");
+  const maintenance = path.join(shared, ".tmp", "rollout-maintenance.lock");
+  await ensureStateObject(maintenance, "file");
+  await strictStateLink(maintenance, path.join(home, ".tmp", "rollout-maintenance.lock"), "file");
+}
+
+async function optionalLstat(target: string) {
+  try { return await fsp.lstat(target); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+async function validateStateObject(target: string, kind: "file" | "directory"): Promise<void> {
+  const stat = await fsp.lstat(target);
+  if (stat.isSymbolicLink() || (kind === "file" ? !stat.isFile() : !stat.isDirectory()) || stat.uid !== process.getuid!()) throw new Error("Unexpected Codex state type or owner.");
+  await fsp.access(target, fs.constants.R_OK | fs.constants.W_OK | (kind === "directory" ? fs.constants.X_OK : 0));
+}
+
+async function ensureStateObject(target: string, kind: "file" | "directory"): Promise<void> {
+  try {
+    if (kind === "directory") await fsp.mkdir(target, { mode: 0o700 });
+    else { const handle = await fsp.open(target, "wx", 0o600); await handle.close(); }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  await validateStateObject(target, kind);
+}
+
+async function strictStateLink(source: string, target: string, kind: "file" | "directory", nativeIndex = false): Promise<void> {
+  const canonical = await fsp.realpath(source);
+  let existing = await optionalLstat(target);
+  if (!existing) {
+    try { await fsp.symlink(canonical, target, kind === "directory" ? "dir" : "file"); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    existing = await fsp.lstat(target);
+  }
+  // Native name removal atomically renames a regular file over this one link.
+  if (nativeIndex && existing.isFile() && !existing.isSymbolicLink()) {
+    await validateStateObject(target, "file");
+    return;
+  }
+  if (!existing.isSymbolicLink() || await fsp.realpath(target) !== canonical) throw new Error("Unexpected Codex durable view link.");
+  const [left, right] = await Promise.all([fsp.stat(source), fsp.stat(target)]);
+  if (left.dev !== right.dev || left.ino !== right.ino) throw new Error("Codex durable view identity changed.");
 }
 
 export function resolveCodexHome(env: NodeJS.ProcessEnv = process.env): string {
@@ -124,14 +237,23 @@ async function materializeSelectedSkills(
   ];
 }
 
+function prepareOverlayConfig(sourceConfig: string | undefined, sourceHome: string): TomlTable {
+  let config: TomlTable;
+  try { config = sourceConfig?.trim() ? parse(sourceConfig) : {}; } catch { throw new Error("Codex source config contains invalid TOML."); }
+  if (config.sqlite_home !== undefined && typeof config.sqlite_home !== "string") throw new Error("Codex config sqlite_home must be a string.");
+  if (typeof config.sqlite_home === "string" && !path.isAbsolute(config.sqlite_home) && config.sqlite_home !== "~" && !config.sqlite_home.startsWith("~/")) {
+    config.sqlite_home = path.resolve(sourceHome, config.sqlite_home);
+  }
+  for (const name of ["features", "memories", "skills"]) tomlTable(config[name], name);
+  return config;
+}
+
 async function writeOverlayConfig(
-  sourceConfigPath: string,
+  config: TomlTable,
   targetConfigPath: string,
   skillPaths: string[],
   disabledSkillPaths: string[]
 ): Promise<void> {
-  const sourceConfig = await readOptionalText(sourceConfigPath);
-  const config = sourceConfig?.trim() ? parse(sourceConfig) : {};
   if (config.model === undefined) {
     config.model = "gpt-6-astra";
   }
@@ -155,7 +277,7 @@ async function writeOverlayConfig(
   config.skills = skills;
 
   const rendered = stringify(config);
-  await fsp.writeFile(targetConfigPath, `${GENERATED_CONFIG_MARKER}\n${rendered.trimEnd()}\n`, "utf8");
+  await fsp.writeFile(targetConfigPath, `${GENERATED_CONFIG_MARKER}\n${rendered.trimEnd()}\n`, { encoding: "utf8", mode: 0o600 });
 }
 
 function tomlTable(value: TomlValue | undefined, name: string): TomlTable {
@@ -278,7 +400,7 @@ async function writeOverlayInstructions(
   if (resolved && cloudxRules.length > 0) {
     sections.push("", `## CloudX Template: ${resolved.template.name}`, "", ...cloudxRules.map((rule) => `- ${rule.text}`));
   }
-  await fsp.writeFile(instructionsPath, `${sections.join("\n").trimEnd()}\n`, "utf8");
+  await fsp.writeFile(instructionsPath, `${sections.join("\n").trimEnd()}\n`, { encoding: "utf8", mode: 0o600 });
   return instructionsPath;
 }
 

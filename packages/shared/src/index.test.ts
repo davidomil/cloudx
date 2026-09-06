@@ -12,6 +12,7 @@ import {
   isUsableTabLayoutState,
   listTabLayoutPanes,
   parseCreateTabResponse,
+  parseCodexStateSourcesResponse,
   parseVoiceActionPlan,
   parseVoiceExecutionResult,
   readWorkspaceLayoutInstruction,
@@ -22,6 +23,20 @@ import {
   type CreateTabResponse,
   type TabLayoutState
 } from "./index.js";
+
+describe("parseCodexStateSourcesResponse", () => {
+  const shared = { sourceId: "shared", kind: "shared", label: "Shared sessions", updatedAt: null };
+  it("accepts complete descriptors and preserves duplicate labels as distinct owners", () => {
+    const sources = [shared, ...["YQ", "Yg"].map((key) => ({ sourceId: `legacy:${key}`, kind: "legacy", label: "Review", updatedAt: new Date(0).toISOString() }))];
+    expect(parseCodexStateSourcesResponse({ sources })).toEqual({ sources });
+    expect(parseCodexStateSourcesResponse({ sources: [] })).toEqual({ sources: [] });
+  });
+  it("rejects malformed, extra, duplicate and over-cap descriptors", () => {
+    for (const value of [null, {}, { sources: [], home: "/secret" }, { sources: [shared, shared] }, { sources: [{ ...shared, home: "/secret" }] }, { sources: [{ ...shared, label: "x".repeat(257) }] }, { sources: [{ ...shared, updatedAt: "yesterday" }] }, { sources: [{ ...shared, updatedAt: "2026-02-31T00:00:00.000Z" }] }, { sources: [{ ...shared, kind: "legacy" }] }, { sources: [{ ...shared, sourceId: "legacy:Li4" }] }, { sources: Array(514).fill(shared) }]) {
+      expect(() => parseCodexStateSourcesResponse(value)).toThrow();
+    }
+  });
+});
 
 describe("parseCreateTabResponse", () => {
   it("accepts a complete tab and window whose layout contains the created tab", () => {
