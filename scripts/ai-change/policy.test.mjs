@@ -5,10 +5,126 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { classifyChange, loadPolicy, reconcileLabels } from "./policy.mjs";
+import { validateSchema } from "./schema-validator.mjs";
 
 const policy = await loadPolicy();
 
 describe("AI change policy", () => {
+  it.each([
+    ["apps/server/src/asrClient.ts", "review-server"],
+    ["apps/web/src/api.ts", "review-web"],
+  ])(
+    "keeps supporting README review without cross-owner escalation for %s",
+    (file, role) => {
+      const leaf = classifyChange(policy, { type: "refactor", paths: [file] });
+      const documented = classifyChange(policy, {
+        type: "refactor",
+        paths: [file, "README.md"],
+      });
+      expect(leaf.skills).toEqual([role]);
+      expect(documented.skills).toEqual(["review-documentation", role].sort());
+      expect(documented.risk).toBe(leaf.risk);
+      expect(documented.checks).toEqual(
+        [...new Set([...leaf.checks, "policy"])].sort(),
+      );
+      expect(documented.areas).toContain("documentation");
+    },
+  );
+
+  it("limits nonparticipation to the generic prose route", () => {
+    expect(
+      policy.path_rules
+        .filter((rule) => rule.cross_area === false)
+        .map((rule) => rule.name),
+    ).toEqual(["documentation"]);
+    const docs = classifyChange(policy, {
+      type: "docs",
+      paths: ["README.md", "docs/usage.md"],
+    });
+    expect(docs).toMatchObject({
+      areas: ["documentation"],
+      skills: ["review-documentation"],
+      risk: "low",
+    });
+    const service =
+      "services/documentation-indexer/src/cloudx_documentation_indexer/search.py";
+    const alone = classifyChange(policy, {
+      type: "refactor",
+      paths: [service],
+    });
+    const withReadme = classifyChange(policy, {
+      type: "refactor",
+      paths: [service, "README.md"],
+    });
+    expect(withReadme.skills).toEqual(
+      [...new Set([...alone.skills, "review-documentation"])].sort(),
+    );
+    const owners = classifyChange(policy, {
+      type: "refactor",
+      paths: [service, "apps/web/src/api.ts", "README.md"],
+    });
+    expect(owners.skills).toContain("review-architecture");
+    expect(owners.skills).toContain("review-security");
+    expect(
+      classifyChange(policy, {
+        type: "refactor",
+        paths: ["packages/shared/src/index.ts", "apps/server/src/asrClient.ts"],
+      }).skills,
+    ).toContain("review-architecture");
+  });
+
+  it.each([
+    "docs/AI_CHANGE_PROCESS.md",
+    "docs/architecture/system-context.md",
+    "docs/SETUP.md",
+    "SECURITY.md",
+    "apps/server/src/pathPolicy.ts",
+    "apps/server/src/automation/AutomationExecutor.ts",
+    "scripts/setup/SetupOrchestrator.mjs",
+    ".github/workflows/ci.yml",
+    "new-root-tool.conf",
+  ])(
+    "preserves every direct gate when supporting README accompanies %s",
+    (file) => {
+      const before = classifyChange(policy, { type: "chore", paths: [file] });
+      const after = classifyChange(policy, {
+        type: "chore",
+        paths: [file, "README.md"],
+      });
+      expect(after).toMatchObject({
+        humanReviewRequired: true,
+        automergeEligible: false,
+      });
+      expect(after.skills).toEqual(expect.arrayContaining(before.skills));
+      expect(after.checks).toEqual(expect.arrayContaining(before.checks));
+      expect(after.risk).toBe(before.risk);
+    },
+  );
+
+  it("validates cross_area as an optional boolean and rejects unknown fields", () => {
+    const { policySha256: _digest, ...value } = structuredClone(policy);
+    value.path_rules[0].cross_area = true;
+    expect(() => validateSchema("policy", value)).not.toThrow();
+    value.path_rules[0].cross_area = "false";
+    expect(() => validateSchema("policy", value)).toThrow(/boolean/);
+    delete value.path_rules[0].cross_area;
+    value.path_rules[0].crossArea = false;
+    expect(() => validateSchema("policy", value)).toThrow(/crossArea/);
+  });
+
+  it.each([
+    null,
+    "",
+    " ",
+    "/etc/passwd",
+    "../secret",
+    "apps/../secret",
+    "name\0suffix",
+  ])("rejects malformed changed path %j", (file) => {
+    expect(() =>
+      classifyChange(policy, { type: "chore", paths: [file] }),
+    ).toThrow();
+  });
   it("defines public rulesets and three local-controller App authorities", () => {
     expect(policy.activation).toMatchObject({
       branch: "main",

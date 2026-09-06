@@ -91,6 +91,7 @@ export async function validateProcess(options = {}) {
   validateVerifierBuildContext(repoRoot, issues);
   validateVerifierConsumers(repoRoot, issues);
   validatePublicationContract(repoRoot, issues);
+  validateNormalReviewConsumers(repoRoot, issues);
   if (issues.length > 0) {
     throw new Error(
       `Repository AI process validation failed:\n${issues
@@ -107,14 +108,27 @@ export async function validateProcess(options = {}) {
   };
 }
 
-const publicationContractPaths = {
+const gateBActiveSourcePaths = Object.freeze({
   root: "AGENTS.md",
   orchestrator: ".agents/skills/change-orchestrator/SKILL.md",
   implement: ".agents/skills/implement-change/SKILL.md",
-  ship: ".agents/skills/ship-change/SKILL.md",
-  review: ".agents/skills/review-pr/SKILL.md",
   verifier: ".agents/skills/verify-change/SKILL.md",
   process: "docs/AI_CHANGE_PROCESS.md",
+});
+const gateBReferencePaths = Object.freeze({
+  root: ".agents/skills/change-orchestrator/references/gate-b/root.md",
+  orchestrator:
+    ".agents/skills/change-orchestrator/references/gate-b/orchestrator.md",
+  implement:
+    ".agents/skills/change-orchestrator/references/gate-b/implementation.md",
+  verifier:
+    ".agents/skills/change-orchestrator/references/gate-b/verification.md",
+  process: ".agents/skills/change-orchestrator/references/gate-b/process.md",
+});
+const publicationContractPaths = {
+  ...gateBReferencePaths,
+  ship: ".agents/skills/ship-change/SKILL.md",
+  review: ".agents/skills/review-pr/SKILL.md",
   authorizationSchema: ".agents/schemas/publication-authorization.schema.json",
   publisher: "scripts/ai-change/publish-gate-b.mjs",
   publisherTests: "scripts/ai-change/publish-gate-b.test.mjs",
@@ -126,6 +140,73 @@ const gateBTransitionSourceSha256 = Object.freeze({
   root: "8e09cb951b1b6bc5b1519a5d6be920280d8377b8bf7dbcb410ab8bbf36305d64",
   process: "64ffb9e03662ce1fa88db8b80d2f9db44b473843ea1a1274d10c47381322da9d",
 });
+
+// The original three commitments above still bind the complete frozen sources.
+// The two remaining original sources and all five active routers are also bound
+// as raw bytes: preserving a pointer cannot conceal an additive authority edit.
+const gateBReferenceSourceSha256 = Object.freeze({
+  ...gateBTransitionSourceSha256,
+  implement: "defc313a989765ef8dac86071e18992299289db65678c1876a88e1712a56f320",
+  verifier: "23f87ea64ae4a3a670f9483cd4a5b9dae41ef2443813f590f46575425f7e53d9",
+});
+const gateBActiveSourceSha256 = Object.freeze({
+  root: "e7fe2834664aa0543c98f29e5c2552fab0d6edad58198e32333579d6418136e3",
+  orchestrator:
+    "9d88fb9ad327a1a5c99067342215b2839adcc0bdeb2ee4c79dbdb52726cc0d3a",
+  implement: "e553a6199621800fcd0a9517fa34e046527623eab46185385b3d1273839ed0db",
+  verifier: "c9d53c3b68dbba3d93040ad4433a2052673e10f70ce2bdaa6a24582162815f42",
+  process: "5d85290146a2b003d203b17fc0bdf1fd55da6694cad93c41afd5d3a9f9faadb2",
+});
+const gateBRoutingBegin = "<!-- CLOUDX-GATE-B-ROUTING-V1:BEGIN -->";
+const gateBRoutingEnd = "<!-- CLOUDX-GATE-B-ROUTING-V1:END -->";
+
+export function validateGateBRoutingSources(sources, issues = []) {
+  for (const [name, reference] of Object.entries(gateBReferencePaths)) {
+    const bytes = Buffer.isBuffer(sources[name])
+      ? sources[name]
+      : Buffer.from(String(sources[name] ?? ""), "utf8");
+    if (sha256(bytes) !== gateBActiveSourceSha256[name]) {
+      issues.push(
+        `Gate B active source-byte commitment '${name}' must match its human-reviewed SHA-256.`,
+      );
+    }
+    const source = bytes.toString("utf8");
+    const expected = `${gateBRoutingBegin}
+
+Only when the accepted task explicitly enters the bounded Gate-B remediation
+or publication flow, read the complete repository-relative source
+\`${reference}\` before acting.
+It is operative only within that flow. Require its exact identities, ordered
+gates, independent reviews and explicit authorization. If the source is absent,
+unreadable or inconsistent with this routing, stop. Ordinary local or managed
+work does not enter that flow or gain its authority; never use local clean
+aggregation for Gate-B. This reference grants no new authorization.
+
+${gateBRoutingEnd}`;
+    if (
+      exactOccurrenceCount(source, gateBRoutingBegin) !== 1 ||
+      exactOccurrenceCount(source, gateBRoutingEnd) !== 1 ||
+      exactOccurrenceCount(source, reference) !== 1 ||
+      !source.includes(expected) ||
+      /CLOUDX-PUBLICATION-CONTRACT-V1|CLOUDX-GATE-B-REMEDIATION-ORDER-V1/u.test(
+        source,
+      )
+    ) {
+      issues.push(
+        `Gate B active routing '${name}' must contain exactly its bounded fail-closed reference contract.`,
+      );
+    }
+  }
+  const ordinaryBytes =
+    Buffer.byteLength(sources.root ?? "") +
+    Buffer.byteLength(sources.orchestrator ?? "");
+  if (ordinaryBytes > 16503) {
+    issues.push(
+      "Root and orchestrator ordinary sources must total at most 16503 bytes.",
+    );
+  }
+  return issues;
+}
 
 const publicationIdentityClauses = [
   `localChangeBaseSha=${GATE_B_LOCAL_CHANGE_BASE_SHA}`,
@@ -180,24 +261,207 @@ const publicationAuthorizationClauses = [
 ];
 
 export function validatePublicationContract(repoRoot, issues = []) {
-  const sources = {};
-  for (const [name, relativePath] of Object.entries(publicationContractPaths)) {
-    const absolutePath = path.join(repoRoot, relativePath);
-    if (!fs.existsSync(absolutePath)) {
-      issues.push(
-        `Publication contract source '${relativePath}' does not exist.`,
-      );
-      continue;
-    }
-    const bytes = fs.readFileSync(absolutePath);
-    sources[name] = Object.hasOwn(gateBTransitionSourceSha256, name)
-      ? bytes
-      : bytes.toString("utf8");
-  }
+  const activeSources = readPublicationSources(
+    repoRoot,
+    gateBActiveSourcePaths,
+    issues,
+  );
+  validateGateBRoutingSources(activeSources, issues);
+  const sources = readPublicationSources(
+    repoRoot,
+    publicationContractPaths,
+    issues,
+  );
   if (
     Object.keys(sources).length === Object.keys(publicationContractPaths).length
   ) {
     validatePublicationContractSources(sources, issues);
+  }
+  return issues;
+}
+
+function readPublicationSources(repoRoot, paths, issues) {
+  const canonicalRoot = fs.realpathSync(repoRoot);
+  const sources = {};
+  for (const [name, relativePath] of Object.entries(paths)) {
+    const absolutePath = path.join(canonicalRoot, relativePath);
+    try {
+      if (
+        !fs.lstatSync(absolutePath).isFile() ||
+        fs.realpathSync(absolutePath) !== absolutePath
+      ) {
+        issues.push(
+          `Publication contract source '${relativePath}' must be a regular unredirected file.`,
+        );
+        continue;
+      }
+      sources[name] = fs.readFileSync(absolutePath);
+    } catch {
+      issues.push(
+        `Publication contract source '${relativePath}' is missing or unreadable.`,
+      );
+    }
+  }
+  return sources;
+}
+
+const normalReviewRoutingBegin =
+  "<!-- CLOUDX-NORMAL-REVIEW-ROUTING-V1:BEGIN -->";
+const normalReviewRoutingEnd = "<!-- CLOUDX-NORMAL-REVIEW-ROUTING-V1:END -->";
+// Exact bounded routing mirrors keep ordinary staged admission independent of
+// optional CLI success. Complete clauses and ordering matter, not keyword presence.
+const normalReviewRoutingContract = [
+  "<!-- CLOUDX-NORMAL-REVIEW-ROUTING-V1:BEGIN -->",
+  "Before local review dispatch, the orchestrator explicitly selects ordinary independent review or the optional local shortcut. Ordinary independent review does not invoke or require successful `--print-subject` or clean aggregation. It directly validates the complete evidence and scope contract in `docs/AI_CHANGE_PROCESS.md`.",
+  "Use `readLocalReviewScope` with guarded Git reads to observe the verified HEAD/worktree and preserve normal staged entries. Capture the index snapshot before verification/handoff and compare it at aggregate acceptance; different index-only bytes remain an explicit verification gap.",
+  "The orchestrator independently computes SHA-256 of UTF-8 `cloudx-local-review-v1\\n<sha256(raw implementation)>\\n<sha256(raw verification)>\\n` from exact raw implementation and passed full verification bytes. Area and aggregate outputs use `subject: implementation`, `run_id: verification.run_id`, that composite digest and candidate base/head/current policy. Require exact observed/declaration/literal allowed scope and the union of current observed-path policy roles and accepted plan roles.",
+  "Start every selected area reviewer in a fresh context, then a different fresh `$review-change` context for ordinary aggregate judgment. Recheck candidate, scope/index, effective Git config/attributes and raw evidence before acceptance. The optional shortcut requires explicit selection and index equal to HEAD; rejection neither retries nor automatically switches routes. Both routes retain full verification, raw evidence joins, human review and freshness. Managed and Gate-B contracts remain separate.",
+  "<!-- CLOUDX-NORMAL-REVIEW-ROUTING-V1:END -->",
+].join(" ");
+
+const normalReviewConsumerClauses = Object.freeze({
+  root: [
+    "For every non-trivial change, use `$change-orchestrator`",
+    "union of current observed-path policy roles and accepted plan roles",
+    "Never let an author review its own prior conversation",
+    "Findings require fresh `$review-change` judgment",
+    "Managed changes keep their existing aggregate dispatch",
+    "New verification bytes require fresh area judgments",
+    "fresh independent review of the new plan bytes",
+  ],
+  orchestrator: [
+    "Start a fresh context for every selected area reviewer",
+    "union of current observed-path policy roles and accepted plan roles",
+    "exact implementation/verification bytes",
+    "Never supply an author's conversation or retrofit old review JSON",
+    "Findings require fresh `$review-change` judgment",
+    "Managed changes retain their existing fresh aggregate dispatch",
+    "independent aggregate review",
+    "utility does not approve its own introduction",
+  ],
+  process: [
+    "Never let an author review its own conversation",
+    "union of current observed-path policy roles and accepted plan roles",
+    "Findings require fresh `$review-change` judgment",
+    "Managed changes continue to dispatch their fresh aggregate role",
+    "New verification bytes require fresh area judgments",
+    "Both omitted paths and extra declarations reject",
+    "fresh independent review of those bytes",
+  ],
+  reviewChange: [
+    "Do not receive the implementation conversation or review your own prior work",
+    "union of current observed-path policy roles and accepted plan roles",
+    "Never substitute the raw implementation digest or retrofit old review JSON",
+    "new verification bytes require fresh area judgments",
+    "Findings require this fresh judgment role",
+    "manual-review",
+    "current classification or the accepted plan is human-required",
+  ],
+});
+
+const ordinaryLocalEvidenceClauses = Object.freeze([
+  "Normal stage-0 staged entries may remain present without index clearing, resetting, staging, committing or rewriting.",
+  "A worktree-only verifier result cannot attest different staged/index-only bytes.",
+  "An index snapshot change invalidates the handoff even if HEAD/worktree match.",
+  "Directly validate raw plan, plan-review, implementation and verification with `validateArtifact` and the existing schemas.",
+  "`subject_sha256 = SHA256(raw plan)`",
+  "`implementation.plan_sha256 = SHA256(raw plan)`",
+  "zero deviations and exactly one nonduplicate claim-evidence entry for every plan claim",
+  "Require actual HEAD to equal implementation and verification heads",
+  "every policy digest to equal the loaded current policy",
+  "Validate every declared skill digest against current bytes and require coverage of every selected area role",
+  '`verificationPlan("full").map(displayCommand)`: all unchanged nine commands, in order',
+  "successful commands, stable per-command/tree digest chains and the current worktree digest equal to the full verification's attested tree",
+  "`implementation.changed_files` exactly, with each an explicit literal `plan.allowed_paths` entry and not forbidden",
+  "the sorted unique union of current classification skills and accepted-plan classification skills",
+  "dispatch a different fresh `$review-change` context with the exact evidence and area outputs for ordinary aggregate judgment",
+  "`validateAreaReviewFanout({ outputs, selectedRoles, identity })`",
+  '`validateAggregateReview({ raw, jobResult, manifest, manifestSha256, identity, reviewerRole: "review-change", selectedRoles })`',
+  "Preserve exact role coverage, findings and the union of durable tags",
+  "Before aggregate acceptance, recheck HEAD, current worktree digest, complete observed paths/index snapshot, effective Git config/attributes, current policy/skill bytes and every supplied raw evidence byte",
+]);
+
+function validateNormalReviewConsumers(repoRoot, issues) {
+  const sources = readPublicationSources(
+    repoRoot,
+    {
+      root: gateBActiveSourcePaths.root,
+      orchestrator: gateBActiveSourcePaths.orchestrator,
+      process: gateBActiveSourcePaths.process,
+      reviewChange: ".agents/skills/review-change/SKILL.md",
+    },
+    issues,
+  );
+  return validateNormalReviewConsumerSources(sources, issues);
+}
+
+export function validateNormalReviewConsumerSources(sources, issues = []) {
+  for (const [name, clauses] of Object.entries(normalReviewConsumerClauses)) {
+    const raw = String(sources[name] ?? "");
+    const source = raw.replace(/\s+/gu, " ");
+    const start = source.indexOf(normalReviewRoutingBegin);
+    const end = source.indexOf(normalReviewRoutingEnd, start);
+    if (
+      exactOccurrenceCount(raw, normalReviewRoutingBegin) !== 1 ||
+      exactOccurrenceCount(raw, normalReviewRoutingEnd) !== 1 ||
+      source.slice(start, end + normalReviewRoutingEnd.length) !==
+        normalReviewRoutingContract
+    ) {
+      issues.push(
+        `Normal review routing '${name}' must preserve its complete ordered ordinary-independent and optional-shortcut contract.`,
+      );
+    }
+    for (const clause of [
+      ...clauses,
+      "claims, production seams, callers and discriminating tests",
+      "trusted/scoped instructions",
+      "conditional references",
+      "verification.run_id",
+      "subject: implementation",
+    ]) {
+      if (!source.includes(clause)) {
+        issues.push(`Normal review consumer '${name}' must state: ${clause}`);
+      }
+    }
+    if (name === "orchestrator" || name === "process") {
+      const command =
+        "node scripts/ai-change/review-local.mjs --mode local --plan <plan> --plan-review <plan-review> --implementation <implementation> --verification <verification>";
+      for (const suffix of [
+        " --print-subject",
+        " --subject-sha256 <digest> --review <area-review>",
+      ]) {
+        if (!source.includes(command + suffix)) {
+          issues.push(
+            `Normal review consumer '${name}' must document the exact local CLI: ${command + suffix}`,
+          );
+        }
+      }
+      if (
+        !source.includes(
+          "cloudx-local-review-v1\\n<sha256(raw implementation)>\\n<sha256(raw verification)>\\n",
+        )
+      ) {
+        issues.push(
+          `Normal review consumer '${name}' must bind the composite implementation and verification subject.`,
+        );
+      }
+    }
+    if (name === "process") {
+      const begin = "## Ordinary Independent Local Review";
+      const end = "## Optional Local Shortcut";
+      const ordinary = source.slice(source.indexOf(begin), source.indexOf(end));
+      let previous = -1;
+      for (const clause of ordinaryLocalEvidenceClauses) {
+        const current = ordinary.indexOf(clause, previous + 1);
+        if (current < 0) {
+          issues.push(
+            `Normal review routing 'process' must preserve ordered ordinary evidence: ${clause}`,
+          );
+        } else {
+          previous = current;
+        }
+      }
+    }
   }
   return issues;
 }
@@ -496,7 +760,7 @@ const gateBTransitionDeclaration = Object.freeze({
 
 function validateGateBTransitionSourceCommitments(sources, issues) {
   for (const [name, expectedSha256] of Object.entries(
-    gateBTransitionSourceSha256,
+    gateBReferenceSourceSha256,
   )) {
     const source = sources[name];
     const bytes = Buffer.isBuffer(source)

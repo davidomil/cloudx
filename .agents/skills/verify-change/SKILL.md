@@ -18,69 +18,39 @@ code, reinterpret a failure, review quality, or mutate GitHub.
 
 ## Procedure
 
-<!-- CLOUDX-PUBLICATION-CONTRACT-V1:BEGIN -->
+<!-- CLOUDX-GATE-B-ROUTING-V1:BEGIN -->
 
-Publication Contract V1 keeps verification deterministic, local, and read-only.
+Only when the accepted task explicitly enters the bounded Gate-B remediation
+or publication flow, read the complete repository-relative source
+`.agents/skills/change-orchestrator/references/gate-b/verification.md` before acting.
+It is operative only within that flow. Require its exact identities, ordered
+gates, independent reviews and explicit authorization. If the source is absent,
+unreadable or inconsistent with this routing, stop. Ordinary local or managed
+work does not enter that flow or gain its authority; never use local clean
+aggregation for Gate-B. This reference grants no new authorization.
 
-The immutable publication identities remain distinct: `localChangeBaseSha=7f5693b568f38c207227a5473f14648fd10d4816`, `planningHeadSha=bca78352e91bb40e5f2a46d664872a4b25890cf3`, `candidateHeadSha=validatedImplementationHeadSha`, `expectedOldCandidateSha=7f5693b568f38c207227a5473f14648fd10d4816`, `targetBaseRef=refs/heads/main`, `expectedTargetBaseSha=02d05f798096431f23acd1e5594a6bee21f3149f`, `repository=davidomil/cloudx`, `pullRequest=1`, `prState=OPEN`, `prBaseRefName=main`, `prBaseRefOid=02d05f798096431f23acd1e5594a6bee21f3149f`, `prHeadRefName=architecture-and-new-codex`, `prHeadRefOid=expectedOldCandidateSha`, and `sameRepository=true`; verification grants none of their mutation authority.
+<!-- CLOUDX-GATE-B-ROUTING-V1:END -->
 
-The private maximum-15-minute authorization alone carries the approved
-nonsecret `credential_token_sha256` commitment for constant-time comparison;
-the raw token never enters authorization. Neither value enters the Gate-B
-artifact/evidence bundle, verification evidence, logs, stdout, stderr, terminal
-results, durable configuration, or public source, and verification receives
-neither.
-
-Production accepts no transport selector and is recursively frozen to
-`https://github.com/davidomil/cloudx`. A frozen direct-test-only loopback
-descriptor uses the same empty-template audited bare
-Git core and proves an exact Basic challenge before real `git http-backend`
-receive-pack. The direct-test entry requires an explicit frozen loopback
-descriptor before accepting injected dependencies and cannot select or default
-to the production transport. Authenticated Git uses explicit `--git-dir`, reset helpers and
-headers, disabled hooks, and the sole `--no-verify` exact lease. Cleanup runs
-exactly once. Verification cannot alter the exact four-field published or
-manual-reconciliation result, the fixed bounded pre-push diagnostic, or the
-post-push no-diagnostic boundary.
-
-Later initial-publication handoff uses a nonsecret
-`.agents/schemas/publication-authorization.schema.json` object. Its recursively
-sorted, two-space-indented, final-LF bytes form a regular nonsymlink file of at
-most 32 KiB outside the artifact directory. `--authorization-file` and
-`--authorized-publication-sha256` bind it independently from
-`--authorized-manifest-sha256`. Its grant lasts at most 15 minutes and binds identity,
-policy, bundle, nonce, and only an `attended-user` mode with a `github-user`
-principal. The sole secret is `CLOUDX_GATE_B_TOKEN`, pinned to child `GH_TOKEN`
-and never available to verification. `$ship-change` alone may invoke
-`node scripts/ai-change/publish-gate-b.mjs --artifact-dir <bundle> --authorized-manifest-sha256 <sha256> --authorization-file <path> --authorized-publication-sha256 <sha256> --credential-mode attended-user --expected-old-head <sha>`
-for at most one exact expected-old
-`--force-with-lease=refs/heads/architecture-and-new-codex:<expectedOldCandidateSha>`
-update.
-
-1. Validate the accepted plan with `validateArtifact("plan", plan)` from
-   `scripts/ai-change/artifact-validation.mjs` before invoking any command runner.
-   A rejected command starts no process. Verification never publishes, pushes,
-   or mutates GitHub.
-2. Require the explicit local base to equal `plan.base_sha`, require actual HEAD
-   to equal the explicit candidate head, and require the accepted verification
-   list to equal the exact nine deterministic command objects. Invoke only
+1. Validate the accepted plan using `validateArtifact("plan", plan)` from
+   `scripts/ai-change/artifact-validation.mjs`. Require the explicit local base
+   to equal `plan.base_sha`, actual HEAD to equal the candidate head, current
+   policy and the exact nine full verification command objects.
+2. Invoke only
    `npm run --silent verify -- --plan <accepted-plan.json> --base-sha <local-change-base-sha> --head-sha <candidate-head-sha>`.
    The production verifier is unconditionally full, accepts no `--scope` or
    `--output`, rejects duplicate arguments before plan or HEAD work, and emits
    its sole artifact to stdout.
-3. Record the worktree digest, then run each accepted command exactly as planned
-   with no model substitution.
-4. Preserve each exit code and stdout/stderr digest, record the final worktree
-   digest, and validate the result with `validateArtifact("verification", result)`.
-5. Any command failure, tree change, incomplete command set, or semantic
-   rejection fails verification. This role grants no publication authority.
-6. Before the push, publisher rejection starts zero publication commands. After
-   the sole push starts, `outcome=manual-reconciliation-required`,
-   `pushAttempts=1`, `retry=false`, and `reviewPrHandoff=false`; verification
-   cannot alter that outcome. Human-required paths remain human reviewed and no
-   automerge is authorized.
+3. Preserve the exact output bytes outside the repository, including execution
+   `run_id`, command exit codes/output digests and before/after worktree digests.
+   Validate the verification schema. Do not replace a command or soften a failure.
 
-<!-- CLOUDX-PUBLICATION-CONTRACT-V1:END -->
+For explicit local review, the verification execution ID may differ from the
+plan, plan-review and implementation producer IDs. Every fresh local area and
+aggregate review uses `verification.run_id` and the composite subject binding
+the raw implementation and these exact verification bytes. The orchestrator
+obtains that subject after full verification; new verification bytes invalidate
+older local reviews even at the same HEAD. Managed and Gate-B identities retain
+their existing contracts.
 
 A pass requires every command to succeed and identical before/after tree
 digests. An unavailable environment, skipped required command, timeout, changed

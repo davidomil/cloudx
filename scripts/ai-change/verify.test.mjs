@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -7,6 +8,7 @@ import { PassThrough } from "node:stream";
 
 import { describe, expect, it, vi } from "vitest";
 
+import { validateArtifact } from "./artifact-validation.mjs";
 import {
   calculateWorktreeDigest,
   displayCommand,
@@ -619,6 +621,11 @@ describe("deterministic change verification", () => {
       }
 
       const trackedBytes = fs.readFileSync("package.json");
+      const policySource = new URL(
+        "../../.agents/pr-review-policy.toml",
+        import.meta.url,
+      );
+      const policyBytes = fs.readFileSync(policySource);
       const result = fixture.run([
         "--plan",
         fixture.plan,
@@ -629,11 +636,58 @@ describe("deterministic change verification", () => {
       ]);
       expect(result.status, result.stderr).toBe(0);
       const artifact = JSON.parse(result.stdout);
+      expect(artifact.verdict).toBe("passed");
+      expect(artifact.policy_sha256).toBe(fixture.policySha256);
+      expect(artifact.commands).toHaveLength(9);
       expect(artifact.tree_sha256_after).toBe(artifact.tree_sha256_before);
       expect(fs.readFileSync("package.json")).toEqual(trackedBytes);
+      expect(fs.readFileSync(policySource)).toEqual(policyBytes);
       expect(fs.readFileSync(fixture.log, "utf8").trim().split("\n")).toEqual(
         acceptedPlanFor("full", fixture.planOptions).verification,
       );
+    } finally {
+      fs.rmSync(fixture.root, { force: true, recursive: true });
+    }
+  });
+
+  it("rejects a schema-valid mismatched policy digest through the real npm entry before child dispatch", () => {
+    const fixture = spawnedVerifierFixture();
+    try {
+      const accepted = JSON.parse(fs.readFileSync(fixture.plan, "utf8"));
+      const mismatched = structuredClone(accepted);
+      mismatched.policy_sha256 =
+        (accepted.policy_sha256[0] === "0" ? "1" : "0") +
+        accepted.policy_sha256.slice(1);
+      expect(mismatched.policy_sha256).not.toBe(accepted.policy_sha256);
+      expect(() => validateArtifact("plan", mismatched)).not.toThrow();
+      const mismatchedPlan = path.join(fixture.root, "mismatched-policy.json");
+      const planBytes = `${JSON.stringify(mismatched)}\n`;
+      fs.writeFileSync(mismatchedPlan, planBytes);
+      const sources = [
+        new URL("../../package.json", import.meta.url),
+        new URL("../../.agents/pr-review-policy.toml", import.meta.url),
+        new URL("./verify.mjs", import.meta.url),
+        new URL(import.meta.url),
+      ].map((source) => [source, fs.readFileSync(source)]);
+
+      const result = fixture.run([
+        "--plan",
+        mismatchedPlan,
+        "--base-sha",
+        gitSha,
+        "--head-sha",
+        gitSha,
+      ]);
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/Verification policy digest/u);
+      expect(result.stdout).toBe("");
+      expect(fs.readFileSync(fixture.log, "utf8")).toBe("");
+      expect(fs.existsSync(fixture.output)).toBe(false);
+      expect(fs.readFileSync(mismatchedPlan, "utf8")).toBe(planBytes);
+      for (const [source, bytes] of sources) {
+        expect(fs.readFileSync(source)).toEqual(bytes);
+      }
     } finally {
       fs.rmSync(fixture.root, { force: true, recursive: true });
     }
@@ -747,8 +801,13 @@ function spawnedVerifierFixture() {
   const invalidPlan = path.join(root, "invalid-plan.json");
   const output = path.join(root, "output.json");
   const accepted = acceptedPlanFor("full", planOptions);
-  accepted.policy_sha256 =
-    "45e15742a31052b7ff51bd565201763db8bd8e4e6e92da1259b58b802cefa0ed";
+  accepted.policy_sha256 = createHash("sha256")
+    .update(
+      fs.readFileSync(
+        new URL("../../.agents/pr-review-policy.toml", import.meta.url),
+      ),
+    )
+    .digest("hex");
   fs.writeFileSync(plan, `${JSON.stringify(accepted)}\n`);
   const subset = acceptedPlanFor("policy", planOptions);
   subset.policy_sha256 = accepted.policy_sha256;
@@ -764,6 +823,7 @@ function spawnedVerifierFixture() {
     output,
     plan,
     planOptions,
+    policySha256: accepted.policy_sha256,
     root,
     subsetPlan,
     run(args) {

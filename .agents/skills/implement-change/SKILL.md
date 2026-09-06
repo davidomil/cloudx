@@ -43,34 +43,19 @@ review. It is not a self-review or a pass verdict.
 ## Prohibitions
 
 No GitHub reads or writes needed for implementation, no `git add -A`, no commit,
-and no claim that tests passed before `$verify-change` records them.
+and no final verification-pass claim before `$verify-change` records it.
+Report focused author-test commands and actual results as implementation evidence;
+they do not constitute independent verification or review.
 
-For the Gate-B remediation handoff, return the exact changed tracked paths and
-the preserved pre-existing untracked-document snapshot to the orchestrator.
-Existing `aae5b372739919537fc7cc08fb7dac4ebe6bc980` counts as candidate tip 1;
-only candidate tips 2 and 3 may follow, and a candidate-tip-3 finding is blocked.
-Only the attended operator may require the current candidate as the clean tracked
-worktree baseline, assert sole required parent
-`216e6d739155aa1dc5bab11829f56869e6f494ff`, require an empty index, preserve the
-40-path untracked name/content-hash manifest byte-for-byte, require the exact
-staged set to equal `implementation.changed_files` within `plan.allowed_paths`,
-stage those exact nine remediation pathspecs with `git add --`, and run only
-`git commit --amend --no-edit` while preserving exact subject
-`POLICY: harden Gate B publication boundary`. No agent role commits and no
-GitHub command runs. The operator proves the replacement has the sole required
-parent, exact subject, exact nine-path delta, exact fixed-parent 63-path union
-with LF-sorted newline SHA-256
-`dd08cb93283abf5c1341ed3db13506da4f912423e11a51cf90ef8358404e0325`, and
-the cumulative 118-path boundary remains unchanged with LF-sorted newline
-SHA-256 `a125d814c942a913d63331d3d1d85f11c8c2740e269bd3e0f2e185c4c593d338`.
-The exact nine remediation paths for candidate tip 3 are
-`.agents/skills/change-orchestrator/SKILL.md`,
-`.agents/skills/implement-change/SKILL.md`,
-`.agents/skills/verify-change/SKILL.md`, `AGENTS.md`,
-`docs/AI_CHANGE_PROCESS.md`, `docs/architecture/testing-map.md`,
-`scripts/ai-change/validate-process.mjs`,
-`scripts/ai-change/validate-process.test.mjs`, and
-`scripts/ai-change/verify.test.mjs`. The operator also proves the unchanged
-snapshot. The amend invalidates this implementation artifact and all
-other prior candidate-bound precommit evidence; every artifact and review must
-be regenerated against the final candidate head before authorization.
+<!-- CLOUDX-GATE-B-ROUTING-V1:BEGIN -->
+
+Only when the accepted task explicitly enters the bounded Gate-B remediation
+or publication flow, read the complete repository-relative source
+`.agents/skills/change-orchestrator/references/gate-b/implementation.md` before acting.
+It is operative only within that flow. Require its exact identities, ordered
+gates, independent reviews and explicit authorization. If the source is absent,
+unreadable or inconsistent with this routing, stop. Ordinary local or managed
+work does not enter that flow or gain its authority; never use local clean
+aggregation for Gate-B. This reference grants no new authorization.
+
+<!-- CLOUDX-GATE-B-ROUTING-V1:END -->

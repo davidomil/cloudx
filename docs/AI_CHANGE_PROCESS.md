@@ -50,207 +50,254 @@ change:
 6. Issue work establishes a discriminating baseline before implementation.
 7. Implementation is limited to accepted paths and produces claim-level
    evidence.
-8. The bounded Gate-B remediation enters Publication Contract V1 immediately
-   after implementation, without an intervening verification or review dispatch.
-9. Every other change uses the Normal Non-Publication Change Process after the
-   contract block.
+8. Enter Gate-B only under the conditional routing below. Other changes follow
+   the normal process. Managed aggregate dispatch and subject semantics remain
+   unchanged.
 
-<!-- CLOUDX-PUBLICATION-CONTRACT-V1:BEGIN -->
+<!-- CLOUDX-GATE-B-ROUTING-V1:BEGIN -->
 
-Publication Contract V1 is the only public authority for this transition. The
-document is an exact mirror, not a second transition owner. The closed block
-below is the sole machine transition-order mirror of the change-orchestrator
-authority. Validation removes only leading/trailing ASCII space, tab, CR, and LF
-and folds internal runs of those bytes to one space; all other bytes are exact.
-The complete raw bytes of this operative instruction source are
-policy-digest-bound; any edit requires a human-reviewed commitment update.
+Only when the accepted task explicitly enters the bounded Gate-B remediation
+or publication flow, read the complete repository-relative source
+`.agents/skills/change-orchestrator/references/gate-b/process.md` before acting.
+It is operative only within that flow. Require its exact identities, ordered
+gates, independent reviews and explicit authorization. If the source is absent,
+unreadable or inconsistent with this routing, stop. Ordinary local or managed
+work does not enter that flow or gain its authority; never use local clean
+aggregation for Gate-B. This reference grants no new authorization.
 
-<!-- CLOUDX-GATE-B-REMEDIATION-ORDER-V1:BEGIN -->
-
-fresh remediation plan -> independent clean plan review -> clean implementation -> attended exact same-parent amend -> invalidate every prior candidate-bound artifact -> regenerate full candidate evidence -> if a preauthorization finding exists below candidate tip 3 return to fresh remediation plan; if a finding exists against candidate tip 3 transition to blocked; otherwise final bounded 15-file bundle -> authorization and publication.
-<!-- CLOUDX-GATE-B-REMEDIATION-ORDER-V1:END -->
-
-This correction admits only a bounded pre-publication remediation cycle.
-Existing `aae5b372739919537fc7cc08fb7dac4ebe6bc980` counts as candidate tip 1.
-The cycle permits at most three candidate tips total, and the ceiling does not
-reset after a fresh plan. Before authorization or publication begins, a finding
-may return only to a fresh remediation plan and independent clean plan review.
-After each clean implementation, only the attended operator may create candidate
-tip 2 or tip 3 with `git commit --amend --no-edit`. A finding against candidate
-tip 3 transitions terminally to `blocked`; there is no candidate tip 4, bypass,
-exception reuse, or implicit continuation.
-
-The current candidate is the clean tracked worktree baseline for each cycle. At
-operator handoff the index is empty, and the only tracked worktree changes are
-the exact nine remediation paths. The exact nine remediation paths for candidate
-tip 3 are `.agents/skills/change-orchestrator/SKILL.md`,
-`.agents/skills/implement-change/SKILL.md`,
-`.agents/skills/verify-change/SKILL.md`, `AGENTS.md`,
-`docs/AI_CHANGE_PROCESS.md`, `docs/architecture/testing-map.md`,
-`scripts/ai-change/validate-process.mjs`,
-`scripts/ai-change/validate-process.test.mjs`, and
-`scripts/ai-change/verify.test.mjs`. The attended amend retains sole parent
-`216e6d739155aa1dc5bab11829f56869e6f494ff`, exact subject
-`POLICY: harden Gate B publication boundary`, and every other path mode and blob
-OID. Its fixed-parent diff is exactly the 63-path union, includes
-`apps/web/src/ui/voiceWorkspace.ts` and
-`apps/web/src/ui/voiceWorkspace.test.ts`, and has LF-sorted newline SHA-256
-`dd08cb93283abf5c1341ed3db13506da4f912423e11a51cf90ef8358404e0325`.
-The cumulative 118-path boundary remains unchanged with LF-sorted newline
-SHA-256 `a125d814c942a913d63331d3d1d85f11c8c2740e269bd3e0f2e185c4c593d338`.
-
-Every replacement invalidates every prior candidate-bound `plan`, `plan-review`,
-`implementation`, `verification`, `selected area-review`, `aggregate-review`,
-`final-bundle`, and `authorization` artifact. It then requires, in order, a
-regenerated cumulative 118-path/75-claim broad plan with updated contract and
-voice claims and only the exact safe nine verification commands, a fresh clean
-plan review, a regenerated implementation artifact, full canonical verification,
-all fresh policy-selected area reviews, aggregate review, and a final bounded
-15-file bundle. No remediation cycle exists after authorization creation, token
-read, publisher invocation, publication attempt, or any GitHub mutation. During
-a cycle, no authorization is created. No token is read, no publisher is invoked,
-no publication command runs, and no GitHub mutation occurs.
-
-The immutable identities remain distinct: `localChangeBaseSha=7f5693b568f38c207227a5473f14648fd10d4816`, `planningHeadSha=bca78352e91bb40e5f2a46d664872a4b25890cf3`, `candidateHeadSha=validatedImplementationHeadSha`, `expectedOldCandidateSha=7f5693b568f38c207227a5473f14648fd10d4816`, `targetBaseRef=refs/heads/main`, `expectedTargetBaseSha=02d05f798096431f23acd1e5594a6bee21f3149f`, `repository=davidomil/cloudx`, `pullRequest=1`, `prState=OPEN`, `prBaseRefName=main`, `prBaseRefOid=02d05f798096431f23acd1e5594a6bee21f3149f`, `prHeadRefName=architecture-and-new-codex`, `prHeadRefOid=expectedOldCandidateSha`, and `sameRepository=true`.
-
-`credential_token_sha256` is the approved nonsecret SHA-256 commitment to the
-exact high-entropy ephemeral token. Its runtime value exists only in the private
-maximum-15-minute canonical authorization file and transient publisher memory
-for constant-time comparison with `SHA-256(CLOUDX_GATE_B_TOKEN)`. The raw token
-never enters authorization bytes. Neither value enters the Gate-B
-artifact/evidence bundle, role artifacts, logs, command logs, stdout, stderr,
-terminal results, durable configuration, or public source values.
-
-Production accepts no transport selector and is recursively frozen to
-`https://github.com/davidomil/cloudx` with its coherent path-bound credential
-scope. No CLI, environment, authorization, artifact, repository config, or
-public option can alter it. A frozen direct-test-only loopback descriptor reaches
-the same private core. The mandatory proof returns exact
-`WWW-Authenticate: Basic realm="cloudx-gate-b-test"` before authentication and
-then bridges to real `git http-backend` receive-pack.
-
-Production accepts only six nonsecret inputs. Before token access it validates
-`/`, `/usr`, `/usr/bin`, `/usr/bin/git`, and `/usr/bin/gh` as root-owned,
-nonsymlink, non-group/world-writable executable objects, invokes the two
-absolute binaries only, and fixes `PATH=/usr/bin:/bin`. Dependency injection is
-confined to the named direct-test-only private-core entry. That entry requires an
-explicit frozen loopback descriptor before accepting injected dependencies and
-cannot select or default to the production transport.
-
-The final broad bundle declares exactly 118 paths and 75 claims. Before token
-read, the publisher uses the admitted Git executable with an exact
-credential-free environment to match local HEAD and the NUL-delimited output of
-`git diff --name-only -z --no-renames <local-base>..<candidate-head> --` to that
-validated path set. Only this diff command returns a bounded Buffer and uses a
-fatal UTF-8 decoder with `ignoreBOM: true`, preserving leading BOM bytes as
-pathname identity; normal command results remain string-only.
-`GIT_NO_REPLACE_OBJECTS=1` disables replacement refs in that environment and
-the isolated local/source Git environment used for HEAD, history, diff, and
-source-path import. The same HEAD and diff validation repeats after artifact and
-authorization freshness checks, immediately before push.
-
-The shared core owns a 0700 parent, empty template, and audited three-key bare
-Git repository, imports the candidate without credentials, and runs
-authenticated Git only with explicit `--git-dir`, reset generic/host/exact-URL
-helpers and headers, disabled prompts and hooks, and one `--no-verify` exact-URL
-lease push. Cleanup runs exactly once. Published success and manual
-reconciliation are the two exact four-field objects; pre-push rejection emits
-only the fixed secret-safe diagnostic capped at 1024 UTF-8 bytes, while
-post-push terminal JSON has no diagnostic output.
-
-Artifact acquisition enumerates exactly 15 canonical names through one bounded
-directory handle before reading content. Each regular nonsymlink descriptor is
-capped at 1 MiB, the safe-integer aggregate is capped at 8 MiB, and stable
-`O_RDONLY|O_NOFOLLOW` pre/post metadata includes device, inode, size,
-modification time, and change time. The freshness read repeats the same operation.
-
-Initial publication requires a nonsecret
-`.agents/schemas/publication-authorization.schema.json` object. Canonical bytes
-use recursively sorted keys, two-space indentation, and one final LF. The
-regular nonsymlink file is at most 32 KiB, is outside the artifact directory,
-remains private runtime evidence rather than committed controller state, and is
-bound through `--authorization-file` and the independent
-`--authorized-publication-sha256`. `--authorized-manifest-sha256` separately
-binds the artifact bundle. The grant expires within 15 minutes and binds the
-complete identity tuple, policy, bundle, nonce, credential mode, and principal.
-Its only mode is `attended-user` with a `github-user` principal. The sole secret input is
-`CLOUDX_GATE_B_TOKEN`; the publisher pins it to child `GH_TOKEN`, disables
-ambient credentials and prompts, and never serializes, logs, emits, or durably
-stores it.
-
-1. A clean plan review is required before implementation starts.
-2. A clean implementation must remain within the accepted plan.
-3. After clean implementation, the orchestrator stops for the attended exact
-   same-parent amend. The operator requires the current candidate as the clean
-   tracked worktree baseline and an empty index, preserves the pre-existing
-   40-path untracked documentation name/content-hash manifest byte-for-byte,
-   stages only exact tracked implementation pathspecs through `git add --`, and
-   requires the staged set to equal `implementation.changed_files` within
-   `plan.allowed_paths`. The operator runs only `git commit --amend --no-edit`,
-   then proves the sole parent, exact subject and exact nine-path implementation
-   delta, exact fixed-parent 63-path union, and unchanged untracked-document
-   snapshot. Agent roles do not commit and no GitHub command runs.
-4. The amend invalidates every prior candidate-bound artifact named above.
-   Regenerate the cumulative 118-path/75-claim broad plan and its independent clean
-   review, implementation artifact, full verification, all fresh reviews,
-   aggregate review, and bundle. A preauthorization finding below candidate tip 3
-   returns only to a fresh remediation plan; a candidate-tip-3 finding is blocked.
-5. Full verification runs only through `$verify-change` and
-   `npm run --silent verify -- --plan <accepted-plan.json> --base-sha <local-change-base-sha> --head-sha <candidate-head-sha>`.
-   It validates the plan at the production artifact boundary before command
-   dispatch, then validates the explicit plan base, actual final head, policy,
-   and exact nine command objects before dispatch. The production verifier is
-   unconditionally full, accepts no `--scope` or `--output`, rejects duplicate
-   arguments before plan or HEAD work, and emits its sole artifact to stdout.
-6. Run all fresh selected area reviews against the verified candidate, including
-   all ten unique clean area reviews required by policy.
-7. Run `$review-change` for the fresh aggregate review against that same
-   candidate and its current evidence.
-8. Assemble the final 15-file bundle from the candidate-bound implementation,
-   verification, selected area reviews, and aggregate review, then validate the
-   complete bounded 15-file snapshot.
-9. Explicit authorization binds both immutable digests and the complete identity
-   tuple above. Authorization and publication then proceed only when
-   `$ship-change` invokes
-   `node scripts/ai-change/publish-gate-b.mjs --artifact-dir <bundle> --authorized-manifest-sha256 <sha256> --authorization-file <path> --authorized-publication-sha256 <sha256> --credential-mode attended-user --expected-old-head <sha>`.
-   The executable validates authorization before secret read or command
-   execution, validates local, artifact, remote, and PR state, and revalidates
-   the authorization file, digest, bundle, identity, and expiry immediately
-   before publication.
-10. The executable alone may perform exactly one expected-old
-    `--force-with-lease=refs/heads/architecture-and-new-codex:<expectedOldCandidateSha>`
-    update to the confirmed unprotected, rules-free candidate ref and then
-    authoritative remote and PR readback. No alternate raw push, ordinary push,
-    general-force update, protected-ref update, retry, rollback, or second-use
-    path exists.
-11. Before the push, every failure starts zero publication commands. After the
-    sole push starts, every error or identity ambiguity produces
-    `outcome=manual-reconciliation-required`, `pushAttempts=1`, `retry=false`, and
-    `reviewPrHandoff=false`; no review or mutation follows before explicit
-    reconciliation.
-12. `$review-pr` evaluates only the pushed live head after successful readback;
-    another push stales the result.
-13. Every later GitHub mutation requires a current clean `$review-pr`; merge also
-    requires current merge intent and required checks. Human-required paths
-    remain human reviewed and this change is not automerge eligible.
-
-<!-- CLOUDX-PUBLICATION-CONTRACT-V1:END -->
+<!-- CLOUDX-GATE-B-ROUTING-V1:END -->
 
 ## Normal Non-Publication Change Process
 
-This process applies only when Managed Change Contract step 8 did not enter the
-one-time Gate-B remediation contract.
+The change-orchestrator owns route selection. Freeze source and accepted evidence
+outside the repository, select the local route and capture its scope/index
+snapshot, then run the unchanged full verifier through `$verify-change`.
+Required local roles are the union of current observed-path policy roles and
+accepted plan roles. Managed changes continue to dispatch their fresh aggregate
+role under the existing contract.
 
-1. Run `$verify-change` against the exact candidate bytes.
-2. Run every policy-selected area review in fresh contexts against that exact
-   head and its current verification evidence.
-3. Run `$review-change` in a fresh context to aggregate those reviews.
-4. Route findings back through implementation, full verification, all selected
-   area reviews, and aggregate review until clean.
+<!-- CLOUDX-NORMAL-REVIEW-ROUTING-V1:BEGIN -->
 
-Fresh judgment roles do not inherit the context that produced the artifact they
-review. A failed review or materially changed requirement starts a new bounded
-iteration; it does not silently mutate previously accepted evidence.
+Before local review dispatch, the orchestrator explicitly selects ordinary
+independent review or the optional local shortcut. Ordinary independent review
+does not invoke or require successful `--print-subject` or clean aggregation.
+It directly validates the complete evidence and scope contract in
+`docs/AI_CHANGE_PROCESS.md`.
+
+Use `readLocalReviewScope` with guarded Git reads to observe the verified
+HEAD/worktree and preserve normal staged entries. Capture the index snapshot
+before verification/handoff and compare it at aggregate acceptance; different
+index-only bytes remain an explicit verification gap.
+
+The orchestrator independently computes SHA-256 of UTF-8
+`cloudx-local-review-v1\n<sha256(raw implementation)>\n<sha256(raw verification)>\n`
+from exact raw implementation and passed full verification bytes. Area and
+aggregate outputs use `subject: implementation`,
+`run_id: verification.run_id`, that composite digest and candidate
+base/head/current policy. Require exact observed/declaration/literal allowed
+scope and the union of current observed-path policy roles and accepted plan roles.
+
+Start every selected area reviewer in a fresh context, then a different fresh
+`$review-change` context for ordinary aggregate judgment. Recheck candidate,
+scope/index, effective Git config/attributes and raw evidence before acceptance.
+The optional shortcut requires explicit selection and index equal to HEAD;
+rejection neither retries nor automatically switches routes. Both routes retain
+full verification, raw evidence joins, human review and freshness. Managed and
+Gate-B contracts remain separate.
+
+<!-- CLOUDX-NORMAL-REVIEW-ROUTING-V1:END -->
+
+Never let an author review its own conversation. Every fresh area context gets
+only the original task, trusted/scoped instructions and conditional references,
+accepted plan/review, exact implementation/verification bytes, independently
+validated subject, observed diff and selected-role list. Each reviewer traces
+relevant claims, production seams, callers and discriminating tests within its
+lens. Findings require fresh `$review-change` judgment; remediation repeats
+implementation, full verification and all selected reviews. An iteration ceiling
+blocks the change. No local review grants publication or merge authority.
+
+## Ordinary Independent Local Review
+
+This route remains available when the optional shortcut is not selected or its
+index-equals-HEAD precondition is ineligible. It is the required route for this
+workflow's own introduction and remediation. Explicitly select this complete
+route; never transfer stale or unsupported approval from a rejected shortcut.
+A failed shortcut does not automatically retry or switch routes.
+
+The ordinary candidate is the verified HEAD plus current worktree. Normal
+stage-0 staged entries may remain present without index clearing, resetting,
+staging, committing or rewriting. A worktree-only verifier result cannot attest
+different staged/index-only bytes. A request to approve those different bytes is
+an explicit verification gap, not authorization to change the index.
+
+Before verification/handoff, create one `createLocalGitReadContext({
+repositoryRoot })` from `scripts/ai-change/review-local.mjs`. Use its guarded
+`gitRunner` for `readLocalReviewScope({ repositoryRoot, baseSha, headSha,
+gitRunner: context.gitRunner })`, unchanged current HEAD/worktree digest reads,
+and later observations. The shared scope result is
+`{ paths, committed, staged, unstaged, untracked, indexSha256 }`.
+It observes ordinary stage-0 staged entries; it does not produce approval or
+relax either strict CLI mode. Capture the complete scope/index result before
+verification/handoff and require the same snapshot at aggregate acceptance.
+Use `context.assertCurrent()` for effective Git config/attribute freshness.
+An index snapshot change invalidates the handoff even if HEAD/worktree match.
+Load `review-local.mjs` and `verify.mjs` from the same candidate repository:
+the unchanged verifier resolves untracked file reads relative to its module's
+repository root. Pass `context.gitRunner` directly as `processRunner` to
+`readHeadSha` and `calculateWorktreeDigest`; a different injected root alone
+cannot retarget those verifier file reads.
+
+Directly validate raw plan, plan-review, implementation and verification with
+`validateArtifact` and the existing schemas. Require the plan-review role
+`review-plan`, subject `plan`, `subject_sha256 = SHA256(raw plan)`, planning
+base/head/policy, clean verdict and zero findings. Require
+`implementation.plan_sha256 = SHA256(raw plan)`, matching plan base, actual
+candidate HEAD and current policy, zero deviations and exactly one nonduplicate
+claim-evidence entry for every plan claim. Plan, plan-review and implementation
+producer run IDs may differ from each other and from verification.
+
+Require actual HEAD to equal implementation and verification heads, the accepted
+plan base to equal implementation and verification bases, and every policy digest
+to equal the loaded current policy. Validate every declared skill digest against
+current bytes and require coverage of every selected area role. Require both
+the plan's verification list and the passed verification commands to equal
+`verificationPlan("full").map(displayCommand)`: all unchanged nine commands,
+in order, honoring only the existing explicit Python interpreter overrides.
+Require successful commands, stable per-command/tree digest chains and the
+current worktree digest equal to the full verification's attested tree.
+Focused author tests or a passed label cannot replace this complete evidence.
+
+Require the sorted unique observed paths to equal
+`implementation.changed_files` exactly, with each an explicit literal
+`plan.allowed_paths` entry and not forbidden. Both omitted paths and extra
+declarations reject. Classify observed paths with `policy.mjs`; select the sorted
+unique union of current classification skills and accepted-plan classification
+skills. No caller override can reduce this set. Preserve human review whenever
+either classification requires it, including a stricter accepted role.
+
+Independently compute the composite subject with standard SHA-256 over these
+exact UTF-8 bytes, including every displayed LF:
+
+```text
+cloudx-local-review-v1\n<sha256(raw implementation)>\n<sha256(raw verification)>\n
+```
+
+The displayed `\n` sequences denote LF bytes. Every area and aggregate review uses
+`subject: implementation`, that exact lowercase `subject_sha256`,
+`run_id: verification.run_id`, accepted base, candidate head, current policy and
+its actual role. Never use the raw implementation digest or retrofit old review
+JSON. New verification bytes require fresh area judgments, including unchanged
+HEAD/tree or a reused execution ID.
+
+After all fresh area outputs exist, dispatch a different fresh `$review-change`
+context with the exact evidence and area outputs for ordinary aggregate judgment.
+Use unchanged `validateAreaReviewFanout({ outputs, selectedRoles, identity })`
+and `validateAggregateReview({ raw, jobResult, manifest, manifestSha256, identity,
+reviewerRole: "review-change", selectedRoles })`. The identity uses
+`{ runId: verification.run_id, subject: "implementation", subjectSha256,
+baseSha, headSha, policySha256 }`. Preserve exact role coverage, findings and the
+union of durable tags; require `manual-review` when either classification
+requires human review. Clean acceptance requires zero findings.
+
+Before aggregate acceptance, recheck HEAD, current worktree digest, complete
+observed paths/index snapshot, effective Git config/attributes, current
+policy/skill bytes and every supplied raw evidence byte, including area and
+aggregate outputs. Any unsafe-read, stale, scope, index or evidence gap blocks
+acceptance. These are repeated observations of frozen state, not an atomic
+filesystem transaction against arbitrary concurrent local writers.
+
+## Optional Local Shortcut
+
+Only after explicitly selecting the eligible shortcut, use its single read-only
+CLI for subject admission:
+
+```bash
+node scripts/ai-change/review-local.mjs --mode local --plan <plan> --plan-review <plan-review> --implementation <implementation> --verification <verification> --print-subject
+```
+
+It performs the same complete evidence/scope/freshness requirements plus strict
+index-equals-HEAD and helper-free config/attribute admission. It emits only the
+composite lowercase digest plus LF and creates no artifact. It accepts no
+`--review` or `--subject-sha256` inputs. Both shortcut CLI modes and
+`discoverLocalPaths` reject every staged difference; the shared
+`readLocalReviewScope` observer does not impose that shortcut-only restriction.
+
+After all required independent area reviews are current and clean, aggregate
+with the same CLI:
+
+```bash
+node scripts/ai-change/review-local.mjs --mode local --plan <plan> --plan-review <plan-review> --implementation <implementation> --verification <verification> --subject-sha256 <digest> --review <area-review>
+```
+
+Repeat `--review <path>` once per required role. The digest must equal the freshly
+recomputed value; validated artifacts must exactly cover the current-plus-accepted
+role union. Durable tags and human review survive. Missing, duplicate, extra,
+blocked or finding-bearing reviews reject. Findings require fresh independent
+judgment; the utility cannot dismiss them.
+
+Success emits canonical existing-schema aggregate JSON with
+`reviewer_role: review-change`. Failure exits nonzero with bounded stderr and no
+artifact. Unknown/duplicate singleton options, duplicate paths/roles, incomplete
+inputs and every mode other than `local` reject before I/O or artifact output.
+No path exclusions, reviewer overrides, output-file or run-ID options exist.
+Managed artifacts and the reserved Gate-B base cannot enter this shortcut.
+It performs no source/index writes, commit, credential read, hosting call,
+verification rerun or model dispatch.
+
+## Shared Local Observations
+
+The shared reader observes four bounded NUL-delimited path sets from the exact
+repository root without caller exclusions or pathspecs:
+
+```text
+git diff --name-only -z --no-renames <plan.base_sha>..<implementation.head_sha> --
+git diff --cached --ita-visible-in-index --name-only -z --no-renames HEAD --
+git diff --name-only -z --no-renames --
+git ls-files --others --exclude-standard -z
+```
+
+Validate exact 40-hex commit inputs, root and commit types. Fatal UTF-8 preserves
+a leading BOM; malformed/noncanonical paths and failed or incomplete reads reject.
+Unmerged, sparse/skip-worktree, assume-unchanged, gitlink and malformed index
+entries, or nonregular untracked objects remain observation gaps in both routes.
+Never hide, subtract, reset, stage or otherwise modify pre-existing work.
+Git-ignored dependency/generated outputs retain the verifier's existing
+exclusions; generated labels never shrink observed scope.
+
+Before every converting diff/digest read, the guarded context admits effective
+Git config under the identical fixed child environment, cwd and controls used
+for execution. Its nonconverting query is
+`git --no-pager config --null --list --show-origin --show-scope --includes`.
+Reject every configured `filter.<driver>.clean` or `filter.<driver>.process`
+key, including empty or overridden definitions, regardless of attribute matches.
+System, selected HOME/XDG globals, repository/common-dir, enabled worktree config
+and active include/includeIf sources are covered. Do not execute, replace,
+sanitize or suppress a helper to make a candidate eligible. Raw configuration,
+attribute bytes and helper values remain private bounded memory, never output
+or durable evidence; only snapshot hashes leave that reader.
+
+After config admission, query the complete tracked plus nonignored-untracked
+universe using bounded nonconverting `ls-files`. Let Git resolve effective
+`filter`, `text`, `eol`, `crlf`, `ident` and `working-tree-encoding` via
+`check-attr -z`, explicit attribute names and literal path batches capped at
+32 KiB. Preserve the 10,000-path, 4 MiB-output and 30-second query limits and
+require complete valid NUL triples. Git resolves nested attributes, index
+fallback, info/attributes, configured/default globals, macros and system sources.
+External diff/textconv, replacement refs, fsmonitor, prompts and optional index
+locks remain disabled. Compare effective config/attribute snapshots immediately
+before and after every converting read and at final acceptance. New helpers or
+any persistent config/include/source-selection/attribute change reject before
+another converting read or clean output.
+
+For policy/skill self-changes, final digest updates are metadata rebinding only.
+Preserve task, claims, scope and verification commands; produce new plan bytes
+with current digests, obtain a fresh independent review of those bytes, regenerate
+`implementation.plan_sha256`, then run full verification and all new area and
+aggregate judgments. Behavior, scope or proof changes return to fresh planning.
+This workflow optimization retains `review-agent-policy`,
+`review-architecture`, `review-documentation` and `review-security`, human
+review and an independent aggregate review. The utility cannot approve its own
+introduction or remediation.
 
 ## Public Checks
 
@@ -270,15 +317,16 @@ GitHub records; a later push invalidates earlier readiness.
 
 - Protected policy, instruction, skill, schema, workflow, installer, security,
   and host-execution changes require human review.
-- Selected area reviewers must cover every policy-selected area. A fresh
-  aggregate review reconciles their findings.
+- Selected area reviewers cover all policy roles and any stricter accepted local
+  plan roles. Findings require a fresh aggregate judgment; only eligible clean
+  local evidence uses deterministic aggregation.
 - No label or model verdict grants a branch-protection bypass.
 - Normal automated updates to `main` occur only through the separately
   authorized merge controller named by the public ruleset.
 - Merge authorization re-fetches the pull request, base, head, reviews, checks,
   and ruleset-relevant state immediately before an exact-head merge request.
-- Interactive shipping remains an attended action governed by the marked
-  contract and `$ship-change`.
+- Interactive shipping remains an attended action governed by `$ship-change`
+  and, only when explicitly in scope, the conditional Gate-B contract.
 
 Public workflows never receive the private controller's model session, App
 private keys, publication credentials, or merge credentials.
@@ -295,7 +343,11 @@ npm run format:check
 
 Run
 `npm run --silent verify -- --plan <accepted-plan.json> --base-sha <local-change-base-sha> --head-sha <candidate-head-sha>`
-before merging repository-wide changes. Required evidence
+before merging repository-wide changes. The production verifier is
+unconditionally full, accepts no `--scope` or `--output`, rejects duplicate
+arguments before plan or HEAD work, and emits its sole artifact to stdout.
+Focused author tests, unavailable environments or reviewer completeness cannot
+replace full verification. Required evidence
 must identify the tested head and the exact commands that produced it. Missing
 or stale evidence is a block, not an implicit pass.
 

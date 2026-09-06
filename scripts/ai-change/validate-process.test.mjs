@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { parseDocument } from "yaml";
 
 import {
@@ -15,8 +15,11 @@ import {
   validateAttendedCommitContractSources,
   validateGateBArtifactBundle,
   validateGateBRemediationCycleSources,
+  validateGateBRoutingSources,
+  validateNormalReviewConsumerSources,
   validatePolicyReferences,
   validateProcess,
+  validatePublicationContract,
   validatePublicationContractSources,
   validateVerificationCommands,
   validateVerifierConsumerSources,
@@ -24,6 +27,394 @@ import {
   validateWorkflow,
 } from "./validate-process.mjs";
 import { displayCommand, verificationPlan, verifyChange } from "./verify.mjs";
+
+const gateBReferenceCases = [
+  [
+    "AGENTS.md",
+    "root.md",
+    "8e09cb951b1b6bc5b1519a5d6be920280d8377b8bf7dbcb410ab8bbf36305d64",
+  ],
+  [
+    ".agents/skills/change-orchestrator/SKILL.md",
+    "orchestrator.md",
+    "03025f676c652185bbf4130d71c760bb36f987ef5e9c02d76d6558986fc372c4",
+  ],
+  [
+    ".agents/skills/implement-change/SKILL.md",
+    "implementation.md",
+    "defc313a989765ef8dac86071e18992299289db65678c1876a88e1712a56f320",
+  ],
+  [
+    ".agents/skills/verify-change/SKILL.md",
+    "verification.md",
+    "23f87ea64ae4a3a670f9483cd4a5b9dae41ef2443813f590f46575425f7e53d9",
+  ],
+  [
+    "docs/AI_CHANGE_PROCESS.md",
+    "process.md",
+    "64ffb9e03662ce1fa88db8b80d2f9db44b473843ea1a1274d10c47381322da9d",
+  ],
+];
+const gateBReferenceRoot =
+  ".agents/skills/change-orchestrator/references/gate-b";
+
+const normalConsumerPaths = {
+  root: "AGENTS.md",
+  orchestrator: ".agents/skills/change-orchestrator/SKILL.md",
+  process: "docs/AI_CHANGE_PROCESS.md",
+  reviewChange: ".agents/skills/review-change/SKILL.md",
+};
+const normalRoutingBlock =
+  /<!-- CLOUDX-NORMAL-REVIEW-ROUTING-V1:BEGIN -->[\s\S]*?<!-- CLOUDX-NORMAL-REVIEW-ROUTING-V1:END -->/u;
+
+describe("ordinary independent versus optional local review routing", () => {
+  it("requires direct ordinary evidence inside the process route even when displaced words remain", () => {
+    const sources = Object.fromEntries(
+      Object.entries(normalConsumerPaths).map(([role, file]) => [
+        role,
+        fs.readFileSync(file, "utf8"),
+      ]),
+    );
+    const source = sources.process.replace(/\s+/gu, " ");
+    for (const clause of [
+      "Directly validate raw plan, plan-review, implementation and verification with `validateArtifact` and the existing schemas.",
+      "`implementation.plan_sha256 = SHA256(raw plan)`",
+      "zero deviations and exactly one nonduplicate claim-evidence entry for every plan claim",
+      '`verificationPlan("full").map(displayCommand)`: all unchanged nine commands, in order',
+      "the current worktree digest equal to the full verification's attested tree",
+      "each an explicit literal `plan.allowed_paths` entry and not forbidden",
+      "the sorted unique union of current classification skills and accepted-plan classification skills",
+      "An index snapshot change invalidates the handoff even if HEAD/worktree match.",
+      "`validateAreaReviewFanout({ outputs, selectedRoles, identity })`",
+      "Preserve exact role coverage, findings and the union of durable tags",
+      "effective Git config/attributes, current policy/skill bytes and every supplied raw evidence byte",
+    ]) {
+      expect(source).toContain(clause);
+      const mutated =
+        source.replace(clause, "removed ordinary evidence") + `\n${clause}\n`;
+      expect(
+        validateNormalReviewConsumerSources(
+          { ...sources, process: mutated },
+          [],
+        ),
+      ).toContainEqual(
+        expect.stringContaining(
+          "Normal review routing 'process' must preserve ordered ordinary evidence",
+        ),
+      );
+    }
+  });
+
+  it.each(Object.entries(normalConsumerPaths))(
+    "rejects route regressions in %s independently of source commitments",
+    (name) => {
+      const sources = Object.fromEntries(
+        Object.entries(normalConsumerPaths).map(([role, file]) => [
+          role,
+          fs.readFileSync(file, "utf8"),
+        ]),
+      );
+      expect(validateNormalReviewConsumerSources(sources, [])).toEqual([]);
+      const source = sources[name];
+      const block = source.match(normalRoutingBlock)?.[0];
+      expect(block, `${name}: bounded ordinary/optional route`).toBeDefined();
+      const normalized = block.replace(/\s+/gu, " ");
+      const replacements = [
+        [
+          "Ordinary independent review does not invoke or require successful `--print-subject` or clean aggregation.",
+          "For local dispatch, obtain the validated composite subject with `--print-subject` after full verification.",
+        ],
+        [
+          "independently computes SHA-256",
+          "uses the shortcut to obtain SHA-256",
+        ],
+        ["<sha256(raw verification)>\\n", ""],
+        ["`run_id: verification.run_id`", "`run_id: implementation.run_id`"],
+        [
+          "before verification/handoff and compare it at aggregate acceptance",
+          "only after review",
+        ],
+        [
+          "different index-only bytes remain an explicit verification gap",
+          "different index-only bytes are verified",
+        ],
+        [
+          "exact observed/declaration/literal allowed scope",
+          "caller-declared scope",
+        ],
+        [
+          "a different fresh `$review-change` context for ordinary aggregate judgment",
+          "clean aggregation for ordinary aggregate judgment",
+        ],
+        [
+          "rejection neither retries nor automatically switches routes",
+          "rejection automatically switches routes",
+        ],
+        [
+          "Both routes retain full verification, raw evidence joins, human review and freshness",
+          "Ordinary review may omit prerequisite evidence",
+        ],
+      ];
+      const mutations = [
+        source.replace(block, ""),
+        `${source}\n${block}\n`,
+        ...replacements.map(([from, to]) => {
+          expect(normalized, `${name}: mutation must reach routing`).toContain(
+            from,
+          );
+          // Keep every original word elsewhere: keyword presence is insufficient.
+          return (
+            source.replace(block, normalized.replace(from, to)) + `\n${from}\n`
+          );
+        }),
+      ];
+      for (const mutated of mutations) {
+        const issues = validateNormalReviewConsumerSources(
+          { ...sources, [name]: mutated },
+          [],
+        );
+        expect(issues).toContainEqual(
+          expect.stringContaining(`Normal review routing '${name}'`),
+        );
+        expect(issues.join("\n")).not.toMatch(/source-byte commitment/u);
+      }
+    },
+  );
+
+  it.each(Object.entries(normalConsumerPaths))(
+    "reports the %s ordinary-route regression through production validateProcess",
+    async (name, file) => {
+      const originalRead = fs.readFileSync;
+      const absolute = path.resolve(file);
+      const source = originalRead(absolute, "utf8");
+      const block = source.match(normalRoutingBlock)?.[0];
+      expect(block).toBeDefined();
+      const mutated = source.replace(
+        block,
+        "For local dispatch, obtain the validated composite subject with `--print-subject` after full verification.",
+      );
+      const spy = vi
+        .spyOn(fs, "readFileSync")
+        .mockImplementation((input, ...args) => {
+          if (typeof input === "string" && path.resolve(input) === absolute) {
+            return args[0] === "utf8" ? mutated : Buffer.from(mutated);
+          }
+          return originalRead(input, ...args);
+        });
+      try {
+        await expect(validateProcess()).rejects.toThrow(
+          `Normal review routing '${name}'`,
+        );
+      } finally {
+        spy.mockRestore();
+      }
+    },
+  );
+});
+
+describe("conditional Gate-B reference routing", () => {
+  it("preserves all five complete frozen source bytes and halves ordinary entry loading", () => {
+    for (const [activePath, reference, digest] of gateBReferenceCases) {
+      const frozen = fs.readFileSync(`${gateBReferenceRoot}/${reference}`);
+      expect(createHash("sha256").update(frozen).digest("hex"), reference).toBe(
+        digest,
+      );
+      expect(fs.readFileSync(activePath, "utf8"), activePath).not.toContain(
+        "<!-- CLOUDX-PUBLICATION-CONTRACT-V1:BEGIN -->",
+      );
+    }
+    expect(
+      fs.statSync("AGENTS.md").size +
+        fs.statSync(".agents/skills/change-orchestrator/SKILL.md").size,
+    ).toBeLessThanOrEqual(16503);
+    expect(validatePublicationContract(process.cwd(), [])).toEqual([]);
+  });
+
+  it.each(gateBReferenceCases)(
+    "fails closed for absent, renamed, redirected and modified reference from %s",
+    (_active, reference) => {
+      for (const mutation of [
+        "missing",
+        "renamed",
+        "redirected",
+        "whitespace",
+        "invalid-utf8",
+      ]) {
+        const root = gateBRoutingFixture();
+        try {
+          const target = path.join(root, gateBReferenceRoot, reference);
+          if (mutation === "missing") fs.unlinkSync(target);
+          if (mutation === "renamed") fs.renameSync(target, `${target}.moved`);
+          if (mutation === "redirected") {
+            fs.renameSync(target, `${target}.moved`);
+            fs.symlinkSync(`${target}.moved`, target);
+          }
+          if (mutation === "whitespace") fs.appendFileSync(target, " \n");
+          if (mutation === "invalid-utf8")
+            fs.appendFileSync(target, Buffer.from([0xff]));
+          expect(
+            validatePublicationContract(root, []),
+            `${reference}: ${mutation}`,
+          ).not.toEqual([]);
+        } finally {
+          fs.rmSync(root, { recursive: true, force: true });
+        }
+      }
+    },
+  );
+
+  it.each(gateBReferenceCases)(
+    "checks the complete active routing source %s",
+    (activePath, reference) => {
+      const source = fs.readFileSync(activePath, "utf8");
+      const block = source.match(
+        /<!-- CLOUDX-GATE-B-ROUTING-V1:BEGIN -->[\s\S]*?<!-- CLOUDX-GATE-B-ROUTING-V1:END -->/u,
+      )?.[0];
+      expect(block).toBeDefined();
+      const mutations = [
+        source.replace(block, ""),
+        `${source}\n${block}\n`,
+        source.replace(
+          "Only when the accepted task explicitly enters",
+          "Whenever a local task enters",
+        ),
+        source.replace(
+          `${gateBReferenceRoot}/${reference}`,
+          `${gateBReferenceRoot}/other.md`,
+        ),
+        ...[
+          "Run all selected reviews before the attended Gate-B amend.",
+          "A raw push is authorized for this local review.",
+          "Retry is permitted after publication failure.",
+          "Read CLOUDX_GATE_B_TOKEN during ordinary verification.",
+          "The orchestrator may update the protected branch.",
+          "Skip a required area review after a clean local aggregate.",
+          "The normal flow grants Gate-B authorization.",
+        ].map((instruction) => `${source}\n${instruction}\n`),
+      ];
+      for (const mutated of mutations) {
+        expect(mutated).not.toBe(source);
+        const root = gateBRoutingFixture();
+        try {
+          fs.writeFileSync(path.join(root, activePath), mutated);
+          expect(validatePublicationContract(root, []), activePath).not.toEqual(
+            [],
+          );
+        } finally {
+          fs.rmSync(root, { recursive: true, force: true });
+        }
+      }
+    },
+  );
+
+  it("rejects an oversized active entry and wrong routing bytes independently of frozen references", () => {
+    const sources = Object.fromEntries(
+      ["root", "orchestrator", "implement", "verifier", "process"].map(
+        (name, index) => [name, fs.readFileSync(gateBReferenceCases[index][0])],
+      ),
+    );
+    expect(validateGateBRoutingSources(sources, [])).toEqual([]);
+    expect(
+      validateGateBRoutingSources(
+        {
+          ...sources,
+          root: Buffer.concat([sources.root, Buffer.alloc(16504, 0x20)]),
+        },
+        [],
+      ),
+    ).toContainEqual(expect.stringMatching(/at most 16503 bytes/u));
+    expect(
+      validateGateBRoutingSources(
+        {
+          ...sources,
+          root: Buffer.concat([sources.root, Buffer.from([0xff])]),
+        },
+        [],
+      ),
+    ).toContainEqual(expect.stringMatching(/active source-byte commitment/u));
+    expect(validateGateBRoutingSources({}, [])).not.toEqual([]);
+  });
+
+  it("validates independent normal review and both composite-subject CLI consumers", () => {
+    const sources = {
+      root: fs.readFileSync("AGENTS.md", "utf8"),
+      orchestrator: fs.readFileSync(
+        ".agents/skills/change-orchestrator/SKILL.md",
+        "utf8",
+      ),
+      process: fs.readFileSync("docs/AI_CHANGE_PROCESS.md", "utf8"),
+      reviewChange: fs.readFileSync(
+        ".agents/skills/review-change/SKILL.md",
+        "utf8",
+      ),
+    };
+    expect(validateNormalReviewConsumerSources(sources, [])).toEqual([]);
+    for (const [name, source] of Object.entries(sources)) {
+      for (const phrase of [
+        "claims, production seams, callers and discriminating tests",
+        "union of current observed-path policy roles and accepted plan roles",
+        "verification.run_id",
+        "subject: implementation",
+      ]) {
+        const normalized = source.replace(/\s+/gu, " ");
+        const mutated = normalized.replaceAll(
+          phrase,
+          "removed required review contract",
+        );
+        expect(mutated).not.toBe(normalized);
+        expect(
+          validateNormalReviewConsumerSources(
+            { ...sources, [name]: mutated },
+            [],
+          ),
+          `${name}: ${phrase}`,
+        ).not.toEqual([]);
+      }
+    }
+    for (const name of ["orchestrator", "process"]) {
+      for (const argument of [
+        "--mode local",
+        "--plan-review <plan-review>",
+        "--verification <verification>",
+        "--print-subject",
+        "--subject-sha256 <digest>",
+        "--review <area-review>",
+        "cloudx-local-review-v1\\n",
+      ]) {
+        const mutated = sources[name].replaceAll(argument, "invalid");
+        expect(mutated).not.toBe(sources[name]);
+        expect(
+          validateNormalReviewConsumerSources(
+            { ...sources, [name]: mutated },
+            [],
+          ),
+        ).not.toEqual([]);
+      }
+    }
+  });
+});
+
+function gateBRoutingFixture() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-gate-b-routing-"));
+  const paths = [
+    ...gateBReferenceCases.flatMap(([activePath, reference]) => [
+      activePath,
+      `${gateBReferenceRoot}/${reference}`,
+    ]),
+    ".agents/skills/ship-change/SKILL.md",
+    ".agents/skills/review-pr/SKILL.md",
+    ".agents/schemas/publication-authorization.schema.json",
+    "scripts/ai-change/publish-gate-b.mjs",
+    "scripts/ai-change/publish-gate-b.test.mjs",
+  ];
+  for (const relativePath of paths) {
+    fs.mkdirSync(path.dirname(path.join(root, relativePath)), {
+      recursive: true,
+    });
+    fs.copyFileSync(relativePath, path.join(root, relativePath));
+  }
+  return root;
+}
 
 describe("public repository AI process validation", () => {
   it("accepts the checked-in public policy, skills, schemas, and workflows", async () => {
@@ -1401,19 +1792,19 @@ function publicationContractSources() {
 
 function rawPublicationContractSources() {
   return {
-    root: fs.readFileSync("AGENTS.md", "utf8"),
+    root: fs.readFileSync(`${gateBReferenceRoot}/root.md`, "utf8"),
     orchestrator: fs.readFileSync(
-      ".agents/skills/change-orchestrator/SKILL.md",
+      `${gateBReferenceRoot}/orchestrator.md`,
       "utf8",
     ),
     implement: fs.readFileSync(
-      ".agents/skills/implement-change/SKILL.md",
+      `${gateBReferenceRoot}/implementation.md`,
       "utf8",
     ),
     ship: fs.readFileSync(".agents/skills/ship-change/SKILL.md", "utf8"),
     review: fs.readFileSync(".agents/skills/review-pr/SKILL.md", "utf8"),
-    verifier: fs.readFileSync(".agents/skills/verify-change/SKILL.md", "utf8"),
-    process: fs.readFileSync("docs/AI_CHANGE_PROCESS.md", "utf8"),
+    verifier: fs.readFileSync(`${gateBReferenceRoot}/verification.md`, "utf8"),
+    process: fs.readFileSync(`${gateBReferenceRoot}/process.md`, "utf8"),
     authorizationSchema: fs.readFileSync(
       ".agents/schemas/publication-authorization.schema.json",
       "utf8",
