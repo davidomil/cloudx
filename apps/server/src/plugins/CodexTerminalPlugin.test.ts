@@ -43,6 +43,8 @@ class FakeTerminalProcess implements TerminalProcess {
     this.exitListener?.({ exitCode: 130 });
   }
 
+  async terminate(): Promise<void> { this.kill(); }
+
   emitData(data: string): void {
     for (const listener of this.dataListeners) {
       listener(data);
@@ -699,6 +701,29 @@ describe("CodexTerminalPlugin", () => {
     expect(() => codexResumeInput({ resume: { mode: "picker", sourceId: "shared", all: "true" } })).toThrow("Codex resume all must be a boolean.");
     expect(() => codexResumeInput({ resume: { mode: "last", sourceId: "shared", includeNonInteractive: "true" } })).toThrow("Codex resume includeNonInteractive must be a boolean.");
     expect(() => codexResumeInput({ resume: { mode: "picker" } })).toThrow(/source selection/);
+  });
+
+  it("passes an initial prompt as one positional argument without interpreting control text", () => {
+    const prompt = "Review this change\nKeep `literal` and $(text) intact.";
+    expect(buildCodexLaunchArgs(["--yolo"], { prompt })).toEqual(["--yolo", "--", prompt]);
+    expect(buildCodexLaunchArgs([], { prompt, resume: { mode: "session", sourceId: "shared", sessionId: "owned-session" } })).toEqual(["resume", "owned-session", "--", prompt]);
+    expect(() => buildCodexLaunchArgs([], { prompt: "\0bad" })).toThrow("without null bytes");
+    expect(() => buildCodexLaunchArgs([], { prompt: 123 })).toThrow("non-empty string");
+    expect(() => buildCodexLaunchArgs([], { prompt, resume: { mode: "last", sourceId: "shared" } })).toThrow("exact session id");
+  });
+
+  it("does not acknowledge stop until the terminal process tree is quiescent", async () => {
+    const process = new FakeTerminalProcess();
+    let finish!: () => void;
+    process.terminate = () => new Promise<void>((resolve) => { finish = resolve; });
+    const session = new CodexTerminalSession(tab, process);
+    let completed = false;
+    const stopped = Promise.resolve(session.handleAction("stop", {})).then((result) => { completed = true; return result; });
+    await Promise.resolve();
+    expect(completed).toBe(false);
+    finish();
+    await expect(stopped).resolves.toEqual({ stopped: true });
+    expect(session.snapshot().status).toBe("stopped");
   });
 
   it("exposes Codex readiness waiting only on Codex terminal actions", () => {

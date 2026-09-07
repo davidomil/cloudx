@@ -1,0 +1,19 @@
+Source-grounded guide validation, 2026-09-07 UTC
+
+Executed with the source-grounded-writing skill toolchain on PATH:
+python3 "$CLOUDX_RULES_SKILLS_DIR/skills/source-grounded-writing/scripts/validate_evidence.py" docs/implementation/forge-workers-audit/forge-workers.ir.json
+OK: validated evidence for docs/implementation/forge-workers-audit/forge-workers.ir.json
+python3 "$CLOUDX_RULES_SKILLS_DIR/skills/source-grounded-writing/scripts/validate_presentation.py" docs/implementation/forge-workers-audit/forge-workers.ir.json
+OK: presentation validated for docs/implementation/forge-workers-audit/forge-workers.ir.json
+python3 "$CLOUDX_RULES_SKILLS_DIR/skills/source-grounded-writing/scripts/compile_doc.py" docs/implementation/forge-workers-audit/forge-workers.ir.json --out docs/implementation/forge-workers-audit/forge-workers.qmd
+Wrote docs/implementation/forge-workers-audit/forge-workers.qmd
+python3 "$CLOUDX_RULES_SKILLS_DIR/skills/source-grounded-writing/scripts/render_doc.py" docs/implementation/forge-workers-audit/forge-workers.qmd --to gfm --out-dir docs/implementation
+Rendered gfm into docs/implementation
+python3 docs/implementation/forge-workers-audit/package_markdown.py
+Packaged docs/implementation/forge-workers.md
+
+Final artifact checks passed: single Markdown title; latest 114-file/2137-test result;
+Linux scope and file-import guidance; no old template-ID or pre-follow-up caveat;
+no host paths or internal source markers; one existing figure link; no duplicate figure;
+all local source SHA256 revisions match current files.
+The regenerated issue-flow figure was visually inspected for legibility and lifecycle order.

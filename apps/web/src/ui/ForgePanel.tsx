@@ -1,0 +1,320 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Check, ExternalLink, GitPullRequest, MessageSquare, Pause, Play, RefreshCw, Settings, Square, Terminal, Trash2 } from "lucide-react";
+import type { ForgeChangeRequest, ForgeComment, ForgeDashboard, ForgeIssue, ForgeIssueDetail, ForgePage, ForgePlacement, ForgeReviewComment, ForgeReviewDraft, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
+
+import { ControlButton } from "./Control.js";
+import type { UiContributionRenderContext } from "./uiContributions.js";
+
+type CallHook = NonNullable<UiContributionRenderContext["callHook"]>;
+type Request = <T>(hook: string, input?: Record<string, unknown>) => Promise<T>;
+type RunAction = (work: () => Promise<unknown>, interrupt?: boolean) => Promise<boolean>;
+type View = "issues" | "changes" | "workers";
+type ReviewEdit = Pick<ForgeReviewDraft, "body" | "event" | "comments">;
+
+export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, onOpenWorkerTab }: {
+  callHook: CallHook;
+  tab: WorkspaceTab;
+  windowId: string;
+  paneId: string;
+  onOpenSettings?: () => void;
+  onOpenWorkerTab?: (tabId: string) => Promise<void> | void;
+}) {
+  const bridge = useRef(callHook);
+  useEffect(() => { bridge.current = callHook; }, [callHook]);
+  const request: Request = useCallback(async <T,>(hook: string, input?: Record<string, unknown>) => {
+    return await bridge.current<T & Record<string, unknown>>(hook, input, tab.id);
+  }, [tab.id]);
+  const [view, setView] = useState<View>("issues");
+  const [revision, setRevision] = useState(0);
+  const [dashboard, setDashboard] = useState<ForgeDashboard>();
+  const [loadError, setLoadError] = useState<string>();
+  const [actionError, setActionError] = useState<string>();
+  const [busy, setBusy] = useState(false);
+  const actionRunning = useRef(false);
+  const mounted = useRef(false);
+  const refresh = useCallback(() => setRevision((value) => value + 1), []);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    setLoadError(undefined);
+    async function loadDashboard() {
+      try {
+        const next = await request<ForgeDashboard>("forge.dashboard");
+        if (cancelled) return;
+        setDashboard(next);
+        timer = setTimeout(() => void loadDashboard(), 5000);
+      } catch (error) {
+        if (!cancelled) setLoadError(errorMessage(error));
+      }
+    }
+    void loadDashboard();
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [request, revision]);
+
+  const runAction: RunAction = async (work, interrupt = false) => {
+    if (!interrupt && actionRunning.current) return false;
+    if (!interrupt) { actionRunning.current = true; setBusy(true); }
+    setActionError(undefined);
+    try {
+      await work();
+      return true;
+    } catch (error) {
+      if (mounted.current) setActionError(errorMessage(error));
+      return false;
+    } finally {
+      if (!interrupt) actionRunning.current = false;
+      if (mounted.current) { if (!interrupt) setBusy(false); refresh(); }
+    }
+  };
+
+  const placement = { windowId, paneId };
+  const repository = dashboard?.repository;
+  const workers = dashboard?.workers ?? [];
+  const changeLabel = repository?.provider === "gitlab" ? "Merge requests" : "Pull requests";
+  const awaitingReview = workers.filter((worker) => worker.status === "awaiting_review").length;
+
+  return <section className="forge-panel" aria-label="Forge">
+    <header className="forge-header">
+      <div><h2><GitPullRequest size={18} /> Forge</h2><p>{repository ? `${repository.provider === "github" ? "GitHub" : "GitLab"} · ${repository.projectPath}` : "Issue workers and reviews"}</p></div>
+      <div className="forge-actions">
+        {onOpenSettings ? <ControlButton size="compact" onClick={onOpenSettings}><Settings size={14} /> Settings</ControlButton> : null}
+        <ControlButton size="compact" iconOnly aria-label="Refresh Forge" title="Refresh Forge" onClick={refresh}><RefreshCw size={14} /></ControlButton>
+      </div>
+    </header>
+    {loadError || actionError ? <div role="alert" className="forge-notice">{actionError ?? loadError}</div> : null}
+    {!dashboard && !loadError ? <p role="status" className="forge-empty">Loading Forge…</p> : null}
+    {dashboard && !dashboard.configured ? <div className="forge-empty">
+      <p>{dashboard.configurationError ?? "Configure a GitHub or GitLab repository to start work."}</p>
+      <p>Set the local checkout, worker and review templates, and worker and reviewer credentials in Forge settings.</p>
+      {onOpenSettings ? <ControlButton onClick={onOpenSettings}>Configure Forge</ControlButton> : null}
+    </div> : null}
+    {dashboard ? <>
+      <nav className="forge-tabs" aria-label="Forge sections">
+        {(["issues", "changes", "workers"] as const).map((item) => <ControlButton key={item} size="compact" pressed={view === item} onClick={() => setView(item)}>
+          {item === "issues" ? "Issues" : item === "changes" ? changeLabel : `Workers (${workers.length})`}
+          {item === "workers" && awaitingReview ? <span className="forge-badge">{awaitingReview} awaiting review</span> : null}
+        </ControlButton>)}
+      </nav>
+      {view === "workers" ? <div className="forge-workers" aria-label="Workers">
+        {workers.map((worker) => <WorkerCard key={worker.id} worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onOpenWorkerTab={onOpenWorkerTab} />)}
+        {!workers.length ? <p className="forge-empty">Start an issue or review to create a Codex worker.</p> : null}
+      </div> : dashboard.configured && repository ? <ForgeItems key={`${repository.provider}:${repository.apiUrl}:${repository.projectPath}:${view}`} kind={view} provider={repository.provider} request={request} revision={revision} workers={workers.filter((worker) => worker.repository.provider === repository.provider && worker.repository.apiUrl === repository.apiUrl && worker.repository.projectPath === repository.projectPath)} placement={placement} runAction={runAction} busy={busy} onOpenWorkerTab={onOpenWorkerTab} /> : null}
+    </> : null}
+  </section>;
+}
+
+function ForgeItems({ kind, provider, request, revision, workers, placement, runAction, busy, onOpenWorkerTab }: {
+  kind: "issues" | "changes";
+  provider: "github" | "gitlab";
+  request: Request;
+  revision: number;
+  workers: ForgeWorker[];
+  placement: ForgePlacement;
+  runAction: RunAction;
+  busy: boolean;
+  onOpenWorkerTab?: (tabId: string) => Promise<void> | void;
+}) {
+  const [filterText, setFilterText] = useState("");
+  const [query, setQuery] = useState({ filter: "", page: 1 });
+  const [page, setPage] = useState<ForgePage<ForgeIssue>>();
+  const [selected, setSelected] = useState<ForgeIssue>();
+  const [detail, setDetail] = useState<ForgeIssueDetail | ForgeChangeRequest>();
+  const [listBusy, setListBusy] = useState(true);
+  const [detailBusy, setDetailBusy] = useState(false);
+  const [listError, setListError] = useState<string>();
+  const [detailError, setDetailError] = useState<string>();
+  const [reviewBody, setReviewBody] = useState("");
+  const singular = kind === "issues" ? "issue" : provider === "gitlab" ? "merge request" : "pull request";
+  const selectedNumber = selected?.number;
+
+  useEffect(() => {
+    let cancelled = false;
+    setListBusy(true);
+    setListError(undefined);
+    setPage(undefined);
+    void request<ForgePage<ForgeIssue>>(`forge.${kind}.list`, { ...query, perPage: 25 }).then((result) => {
+      if (cancelled) return;
+      setPage(result);
+      setSelected((current) => result.items.find((item) => item.number === current?.number) ?? result.items[0]);
+    }).catch((error) => { if (!cancelled) setListError(errorMessage(error)); }).finally(() => { if (!cancelled) setListBusy(false); });
+    return () => { cancelled = true; };
+  }, [request, kind, query, revision]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setDetail(undefined);
+    setDetailError(undefined);
+    if (selectedNumber === undefined) { setDetailBusy(false); return; }
+    setDetailBusy(true);
+    const hook = kind === "issues" ? "forge.issue.get" : "forge.change.get";
+    void request<{ issue?: ForgeIssueDetail; change?: ForgeChangeRequest }>(hook, { number: selectedNumber }).then((result) => {
+      if (!cancelled) setDetail(kind === "issues" ? result.issue : result.change);
+    }).catch((error) => { if (!cancelled) setDetailError(errorMessage(error)); }).finally(() => { if (!cancelled) setDetailBusy(false); });
+    return () => { cancelled = true; };
+  }, [request, kind, selectedNumber, revision]);
+
+  useEffect(() => { setReviewBody(""); }, [selectedNumber]);
+  const selectedWorkers = workers.filter((worker) => kind === "issues" ? worker.kind === "issue" && worker.number === selectedNumber : worker.kind === "review" && worker.number === selectedNumber);
+  const activeWorker = selectedWorkers.find((worker) => worker.status !== "completed");
+  const currentDetail = detail?.number === selectedNumber ? detail : undefined;
+  const item = currentDetail ?? selected;
+
+  return <div className="forge-items">
+    <form className="forge-filter" onSubmit={(event) => { event.preventDefault(); setSelected(undefined); setQuery({ filter: filterText.trim(), page: 1 }); }}>
+      <label>Filter {kind === "issues" ? "issues" : provider === "gitlab" ? "merge requests" : "pull requests"}
+        <input value={filterText} onChange={(event) => setFilterText(event.target.value)} placeholder={provider === "github" ? "is:open label:bug assignee:@me" : "state=opened&labels=bug&scope=assigned_to_me"} />
+      </label>
+      <ControlButton type="submit" size="compact">Apply filter</ControlButton>
+      <small>{provider === "github" ? "GitHub search qualifiers" : "GitLab URL query parameters"}</small>
+    </form>
+    <div className="forge-browser">
+      <div className="forge-list" aria-label={`${kind === "issues" ? "Issue" : "Change request"} list`} aria-busy={listBusy}>
+        {listError ? <p className="forge-notice" role="alert">{listError}</p> : null}
+        {listBusy ? <p role="status" className="forge-empty">Loading {kind === "issues" ? "issues" : "requests"}…</p> : null}
+        {page?.items.map((entry) => {
+          const drafts = workers.filter((worker) => worker.kind === "review" && worker.number === entry.number && worker.draft && worker.draft.status !== "posted");
+          const comments = drafts.reduce((count, worker) => count + (worker.draft?.comments.length ?? 0), 0);
+          return <button type="button" key={entry.number} className={`forge-item${selectedNumber === entry.number ? " selected" : ""}`} onClick={() => setSelected(entry)} aria-pressed={selectedNumber === entry.number}>
+            <span className="forge-item-title">#{entry.number} {entry.title}</span>
+            <span className="forge-muted">{entry.state} · {entry.author}{entry.labels.length ? ` · ${entry.labels.join(", ")}` : ""}</span>
+            {kind === "changes" && drafts.length ? <span className="forge-badge"><MessageSquare size={13} /> {comments} suggested {comments === 1 ? "comment" : "comments"} · {drafts.length} review {drafts.length === 1 ? "draft" : "drafts"}</span> : null}
+          </button>;
+        })}
+        {page && !page.items.length ? <p className="forge-empty">No {kind === "issues" ? "issues" : "requests"} match this filter.</p> : null}
+        <div className="forge-pagination">
+          <ControlButton size="compact" disabled={listBusy || query.page === 1} onClick={() => { setSelected(undefined); setQuery({ ...query, page: query.page - 1 }); }}>Previous</ControlButton>
+          <span>Page {query.page}</span>
+          <ControlButton size="compact" disabled={listBusy || !page?.nextPage} onClick={() => { if (page?.nextPage) { setSelected(undefined); setQuery({ ...query, page: page.nextPage }); } }}>Next</ControlButton>
+        </div>
+      </div>
+      <div className="forge-detail" aria-label={`${singular} detail`} aria-busy={detailBusy}>
+        {item ? <>
+          <div className="forge-detail-heading"><h3>#{item.number} {item.title}</h3><a href={item.url} target="_blank" rel="noreferrer" aria-label={`Open ${singular} #${item.number}`}><ExternalLink size={16} /></a></div>
+          <p className="forge-muted">{item.state} · {item.author}</p>
+          {detailBusy ? <p role="status">Loading latest details…</p> : null}
+          {detailError ? <p role="alert" className="forge-notice">{detailError}</p> : null}
+          <p className="forge-prose">{item.body}</p>
+          {kind === "issues" ? <>
+            <div className="forge-actions"><ControlButton tone="primary" size="compact" disabled={busy || !!activeWorker || item.state !== "open"} onClick={() => void runAction(() => request("forge.issue.start", { number: item.number, ...placement }))}><Play size={14} /> Start work</ControlButton></div>
+            <p className="forge-muted">The worker opens a PR/MR and waits for review. Resume after review to address comments, merge when approved, and clean up.</p>
+          </> : <>
+            {currentDetail && isChangeRequest(currentDetail) ? <p className="forge-muted">{currentDetail.draft ? "Draft" : currentDetail.approved ? "Approved" : "Awaiting approval"} · {currentDetail.unresolvedDiscussions} unresolved discussions{currentDetail.merged ? " · Merged" : ""}</p> : null}
+            <div className="forge-actions">
+              <ControlButton size="compact" disabled={busy || !!activeWorker || item.state !== "open"} onClick={() => void runAction(() => request("forge.review.start", { number: item.number, autoPost: false, ...placement }))}>Review</ControlButton>
+              <ControlButton size="compact" disabled={busy || !!activeWorker || item.state !== "open"} onClick={() => void runAction(() => request("forge.review.start", { number: item.number, autoPost: true, ...placement }))}>Review and post</ControlButton>
+            </div>
+            <label className="forge-field">Review message<textarea value={reviewBody} onChange={(event) => setReviewBody(event.target.value)} placeholder="Message for approval or requested changes" rows={2} /></label>
+            <div className="forge-actions">
+              <ControlButton size="compact" disabled={busy || item.state !== "open" || !reviewBody.trim()} onClick={() => void runAction(() => request("forge.change.review", { number: item.number, event: "request_changes", body: reviewBody }))}>Mark as request changes</ControlButton>
+              <ControlButton size="compact" disabled={busy || item.state !== "open"} onClick={() => void runAction(() => request("forge.change.review", { number: item.number, event: "approve", body: reviewBody }))}><Check size={14} /> Mark as approved</ControlButton>
+            </div>
+            <p className="forge-muted">Reviews are submitted using the configured reviewer identity. A message is required when requesting changes.</p>
+          </>}
+          {selectedWorkers.map((worker) => <WorkerCard key={worker.id} worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onOpenWorkerTab={onOpenWorkerTab} />)}
+          <ForgeComments comments={currentDetail?.comments ?? []} />
+        </> : <p className="forge-empty">Select {kind === "issues" ? "an issue" : `a ${singular}`}.</p>}
+      </div>
+    </div>
+  </div>;
+}
+
+function WorkerCard({ worker, request, placement, runAction, busy, onOpenWorkerTab }: {
+  worker: ForgeWorker;
+  request: Request;
+  placement: ForgePlacement;
+  runAction: RunAction;
+  busy: boolean;
+  onOpenWorkerTab?: (tabId: string) => Promise<void> | void;
+}) {
+  const [controlling, setControlling] = useState(false);
+  const controlRunning = useRef(false);
+  async function interruptWorker(action: "pause" | "stop") {
+    if (controlRunning.current) return;
+    controlRunning.current = true; setControlling(true);
+    try { await runAction(() => request(`forge.worker.${action}`, { id: worker.id }), true); }
+    finally { controlRunning.current = false; setControlling(false); }
+  }
+  const canPause = ["starting", "running"].includes(worker.status);
+  const canResume = ["paused", "awaiting_review", "failed", "stopped", "cleanup_failed"].includes(worker.status);
+  const canStop = ["starting", "running", "paused", "awaiting_review", "failed"].includes(worker.status);
+  return <article className="forge-worker" aria-label={`${worker.kind} worker #${worker.number}`}>
+    <div className="forge-worker-heading"><strong>{worker.kind === "issue" ? "Issue" : "Review"} #{worker.number} · {worker.title}</strong><span className={`forge-status forge-status-${worker.status}`}>{worker.status.replaceAll("_", " ")}</span></div>
+    <p className="forge-muted">{worker.repository.projectPath}{worker.branch ? ` · ${worker.branch}` : ""}</p>
+    {worker.error ? <p role="alert" className="forge-notice">{worker.error}</p> : null}
+    {worker.status === "awaiting_review" ? <p role="status">Ready for review. Resume after feedback to address comments and check approval.</p> : null}
+    <div className="forge-actions">
+      {canPause ? <ControlButton size="compact" disabled={controlling} onClick={() => void interruptWorker("pause")}><Pause size={14} /> Pause</ControlButton> : null}
+      {canResume ? <ControlButton size="compact" disabled={busy} onClick={() => void runAction(() => request("forge.worker.resume", { id: worker.id, ...placement }))}><Play size={14} /> {worker.status === "cleanup_failed" ? "Clean up" : "Resume"}</ControlButton> : null}
+      {canStop ? <ControlButton size="compact" disabled={controlling} onClick={() => void interruptWorker("stop")}><Square size={13} /> Stop</ControlButton> : null}
+      {worker.tabId && onOpenWorkerTab ? <ControlButton size="compact" disabled={busy} onClick={() => void runAction(async () => onOpenWorkerTab(worker.tabId!))}><Terminal size={14} /> Open Codex tab</ControlButton> : null}
+      {worker.changeUrl ? <a href={worker.changeUrl} target="_blank" rel="noreferrer">Open PR/MR <ExternalLink size={12} /></a> : null}
+    </div>
+    {worker.draft ? <ReviewEditor key={`${worker.id}:${worker.draft.headSha}`} worker={worker} draft={worker.draft} request={request} runAction={runAction} busy={busy} /> : null}
+  </article>;
+}
+
+function ReviewEditor({ worker, draft, request, runAction, busy }: {
+  worker: ForgeWorker;
+  draft: ForgeReviewDraft;
+  request: Request;
+  runAction: RunAction;
+  busy: boolean;
+}) {
+  const [edit, setEdit] = useState<ReviewEdit>(() => ({ body: draft.body, event: draft.event, comments: draft.comments.map((comment) => ({ ...comment })) }));
+  const [saved, setSaved] = useState(false);
+  const locked = busy || draft.status !== "draft";
+  const valid = edit.comments.every((comment) => comment.body.trim() && (!comment.path || (Number.isSafeInteger(comment.line) && Number(comment.line) > 0))) && (edit.event !== "request_changes" || !!edit.body.trim()) && (!!edit.body.trim() || edit.comments.length > 0);
+  function updateEdit(next: ReviewEdit) { setEdit(next); setSaved(false); }
+  function updateComment(index: number, change: Partial<ForgeReviewComment>) {
+    updateEdit({ ...edit, comments: edit.comments.map((comment, position) => position === index ? { ...comment, ...change } : comment) });
+  }
+  async function saveReview(submit: boolean) {
+    const successful = await runAction(async () => {
+      await request("forge.review.save", { id: worker.id, ...edit });
+      if (submit) await request("forge.review.submit", { id: worker.id });
+    });
+    if (successful) setSaved(true);
+  }
+  return <details className="forge-review" open>
+    <summary><MessageSquare size={14} /> {draft.status === "posted" ? "Posted review" : "Suggested review"} · {edit.comments.length} {edit.comments.length === 1 ? "comment" : "comments"}</summary>
+    <fieldset disabled={locked}>
+      <label className="forge-field">Review outcome<select value={edit.event} onChange={(event) => updateEdit({ ...edit, event: event.target.value as ReviewEdit["event"] })}><option value="comment">Comment</option><option value="request_changes">Request changes</option><option value="approve">Approve</option></select></label>
+      <label className="forge-field">Review summary<textarea rows={3} maxLength={100_000} value={edit.body} onChange={(event) => updateEdit({ ...edit, body: event.target.value })} /></label>
+      {edit.comments.map((comment, index) => <div className="forge-draft-comment" key={index}>
+        <div className="forge-comment-location">
+          <label>File<input maxLength={4096} aria-label={`Comment ${index + 1} file`} value={comment.path ?? ""} onChange={(event) => updateComment(index, event.target.value ? { path: event.target.value } : { path: undefined, oldPath: undefined, line: undefined, side: undefined })} placeholder="General comment" /></label>
+          <label>Line<input type="number" min={1} step={1} disabled={!comment.path} aria-label={`Comment ${index + 1} line`} value={comment.line ?? ""} onChange={(event) => updateComment(index, { line: event.target.value ? Number(event.target.value) : undefined })} /></label>
+          <label>Side<select disabled={!comment.path} aria-label={`Comment ${index + 1} side`} value={comment.side ?? "RIGHT"} onChange={(event) => updateComment(index, { side: event.target.value as "LEFT" | "RIGHT" })}><option value="RIGHT">New</option><option value="LEFT">Old</option></select></label>
+          <ControlButton size="compact" iconOnly aria-label={`Remove comment ${index + 1}`} title="Remove comment" onClick={() => updateEdit({ ...edit, comments: edit.comments.filter((_, position) => position !== index) })}><Trash2 size={14} /></ControlButton>
+        </div>
+        <label className="forge-field">Comment {index + 1}<textarea rows={3} maxLength={20_000} value={comment.body} onChange={(event) => updateComment(index, { body: event.target.value })} /></label>
+      </div>)}
+      <div className="forge-actions">
+        <ControlButton size="compact" disabled={edit.comments.length >= 100} onClick={() => updateEdit({ ...edit, comments: [...edit.comments, { body: "" }] })}>Add comment</ControlButton>
+        <ControlButton size="compact" disabled={!valid} onClick={() => void saveReview(false)}>Save draft</ControlButton>
+        <ControlButton tone="primary" size="compact" disabled={!valid} onClick={() => void saveReview(true)}>Submit review</ControlButton>
+      </div>
+    </fieldset>
+    {!valid && !locked ? <p className="forge-muted">Add a summary or comment, fill every comment body, and provide a positive whole line number for each file comment. Requested changes need a summary.</p> : null}
+    {draft.status === "posted" ? <p role="status">Review posted.</p> : draft.status === "posting" ? <p role="status">Posting review…</p> : saved ? <p role="status">Draft saved.</p> : null}
+    {draft.status === "post_failed" ? <p role="alert" className="forge-notice">Submission could be incomplete. Inspect the PR/MR for published comments before starting another review.</p> : null}
+  </details>;
+}
+
+function ForgeComments({ comments }: { comments: ForgeComment[] }) {
+  return <section className="forge-comments"><h4>Comments ({comments.length})</h4>{comments.map((comment) => <article key={comment.id}>
+    <strong>{comment.author}</strong>{comment.path ? <span className="forge-muted"> · {comment.path}{comment.line ? `:${comment.line}` : ""}</span> : null}
+    {comment.resolved !== undefined ? <span className="forge-muted"> · {comment.resolved ? "Resolved" : "Unresolved"}</span> : null}
+    <p className="forge-prose">{comment.body}</p>
+  </article>)}</section>;
+}
+
+function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+
+function isChangeRequest(item: ForgeIssueDetail | ForgeChangeRequest): item is ForgeChangeRequest { return "headSha" in item; }

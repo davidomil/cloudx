@@ -1,0 +1,465 @@
+import type {
+  ForgeChangeRequest,
+  ForgeChangeRequestSummary,
+  ForgeComment,
+  ForgeCreateChangeRequest,
+  ForgeIssue,
+  ForgeIssueDetail,
+  ForgeListQuery,
+  ForgeMergeResult,
+  ForgePage,
+  ForgeReviewSubmission,
+} from "@cloudx/shared";
+import { ForgeHttpClient, hasNextPage, pagination } from "./ForgeHttpClient.js";
+import {
+  ForgeProviderError,
+  requireDiscussion,
+  requireMergeReady,
+  type ForgeProvider,
+} from "./ForgeProvider.js";
+import {
+  boolean,
+  integer,
+  invalid,
+  issueNumber,
+  list,
+  optionalText,
+  record,
+  string,
+  webUrl,
+} from "./validation.js";
+import { validateCreateRequest, validateReview } from "./reviewValidation.js";
+
+interface GitHubReadiness {
+  reviewDecision: string | null;
+  mergeable: string;
+  mergeStateStatus: string;
+  unresolved: number;
+  threads: Map<string, { discussionId: string; resolved: boolean }>;
+}
+
+export class GitHubProvider implements ForgeProvider {
+  private readonly path: string;
+
+  constructor(private readonly http: ForgeHttpClient) {
+    this.path = `/repos/${http.repository.projectPath.split("/").map(encodeURIComponent).join("/")}`;
+  }
+
+  async listIssues(query: ForgeListQuery = {}): Promise<ForgePage<ForgeIssue>> {
+    return this.search("issue", query, githubIssue);
+  }
+
+  async listChangeRequests(
+    query: ForgeListQuery = {},
+  ): Promise<ForgePage<ForgeChangeRequestSummary>> {
+    return this.search("pr", query, (value) => ({
+      ...githubIssue(value),
+      draft: boolean(record(value).draft),
+    }));
+  }
+
+  async getIssue(number: number): Promise<ForgeIssueDetail> {
+    const path = `${this.path}/issues/${issueNumber(number)}`;
+    const [response, comments] = await Promise.all([
+      this.http.request(path),
+      this.http.all(`${path}/comments`),
+    ]);
+    if (record(response.body).pull_request)
+      throw new ForgeProviderError(
+        "Select an issue, rather than a pull request.",
+      );
+    return {
+      ...githubIssue(response.body),
+      comments: comments.map(githubComment),
+    };
+  }
+
+  async getChangeRequest(number: number): Promise<ForgeChangeRequest> {
+    const path = this.pullPath(number);
+    const [response, discussion, inline, reviews, diff] = await Promise.all([
+      this.http.request(path),
+      this.http.all(`${this.path}/issues/${number}/comments`),
+      this.http.all(`${path}/comments`),
+      this.http.all(`${path}/reviews`),
+      this.http.request(path, { text: true }),
+    ]);
+    const raw = record(response.body);
+    const head = record(raw.head);
+    const headSha = string(head.sha);
+    const readiness = await this.readiness(number, headSha);
+    const latestReviews = new Map<string, Record<string, unknown>>();
+    for (const value of reviews) {
+      const review = record(value);
+      const state = string(review.state);
+      if (state !== "PENDING" && state !== "COMMENTED")
+        latestReviews.set(githubAuthor(review.user), review);
+    }
+    const decisions = [...latestReviews.values()];
+    const approved =
+      decisions.some(
+        (review) => review.state === "APPROVED" && review.commit_id === headSha,
+      ) &&
+      !decisions.some((review) => review.state === "CHANGES_REQUESTED") &&
+      (readiness.reviewDecision === null ||
+        readiness.reviewDecision === "APPROVED");
+    return {
+      ...githubIssue(raw),
+      draft: boolean(raw.draft),
+      headSha,
+      headBranch: string(head.ref),
+      baseBranch: string(record(raw.base).ref),
+      merged: boolean(raw.merged),
+      mergeable:
+        readiness.mergeable === "MERGEABLE" &&
+        readiness.mergeStateStatus === "CLEAN",
+      approved,
+      unresolvedDiscussions: readiness.unresolved,
+      comments: [
+        ...discussion.map(githubComment),
+        ...inline.map((value) => ({
+          ...githubComment(value),
+          ...readiness.threads.get(string(record(value).node_id)),
+        })),
+        ...reviews.map(githubReviewComment),
+      ],
+      diff: string(diff.body),
+    };
+  }
+
+  async createChangeRequest(
+    input: ForgeCreateChangeRequest,
+  ): Promise<ForgeChangeRequestSummary> {
+    validateCreateRequest(input);
+    const response = await this.http.request(`${this.path}/pulls`, {
+      method: "POST",
+      role: "worker",
+      body: {
+        title: input.title,
+        body: input.body,
+        head: input.headBranch,
+        base: input.baseBranch,
+        draft: false,
+      },
+    });
+    return {
+      ...githubIssue(response.body),
+      draft: boolean(record(response.body).draft),
+    };
+  }
+
+  async findChangeRequestByBranch(
+    headBranch: string,
+    baseBranch: string,
+  ): Promise<ForgeChangeRequestSummary | undefined> {
+    validateCreateRequest({
+      title: "Find existing request",
+      body: "",
+      headBranch,
+      baseBranch,
+    });
+    const params = new URLSearchParams({
+      state: "all",
+      head: `${this.http.repository.projectPath.split("/")[0]}:${headBranch}`,
+      base: baseBranch,
+    });
+    const requests = (await this.http.all(`${this.path}/pulls?${params}`))
+      .map(record)
+      .filter((request) => {
+        const head = record(request.head);
+        return (
+          string(head.ref) === headBranch &&
+          string(record(request.base).ref) === baseBranch &&
+          string(record(head.repo).full_name).toLowerCase() ===
+            this.http.repository.projectPath.toLowerCase()
+        );
+      });
+    if (requests.length > 1)
+      throw new ForgeProviderError(
+        "Multiple pull requests use this worker branch. Reconcile them before continuing.",
+        409,
+      );
+    return requests.length
+      ? { ...githubIssue(requests[0]), draft: boolean(requests[0].draft) }
+      : undefined;
+  }
+
+  async postReview(
+    number: number,
+    input: ForgeReviewSubmission,
+  ): Promise<void> {
+    validateReview(input);
+    const path = this.pullPath(number);
+    const current = record((await this.http.request(path)).body);
+    if (string(record(current.head).sha) !== input.headSha)
+      throw new ForgeProviderError(
+        "The request head changed. Run a fresh review before posting.",
+        409,
+      );
+    if (current.state !== "open")
+      throw new ForgeProviderError("Reviews require an open request.", 409);
+    const body = [
+      input.body,
+      ...input.comments
+        .filter((comment) => !comment.path)
+        .map((comment) => comment.body),
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+    const response = await this.http.request(`${path}/reviews`, {
+      method: "POST",
+      role: "reviewer",
+      body: {
+        commit_id: input.headSha,
+        event: {
+          comment: "COMMENT",
+          approve: "APPROVE",
+          request_changes: "REQUEST_CHANGES",
+        }[input.event],
+        body:
+          body || (input.comments.length ? "Review comments attached." : ""),
+        comments: input.comments
+          .filter((comment) => comment.path)
+          .map((comment) => ({
+            path: comment.path,
+            line: comment.line,
+            side: comment.side ?? "RIGHT",
+            body: comment.body,
+          })),
+      },
+    });
+    integer(record(response.body).id);
+  }
+
+  async merge(
+    number: number,
+    expectedHeadSha: string,
+  ): Promise<ForgeMergeResult> {
+    const request = await this.getChangeRequest(number);
+    requireMergeReady(request, expectedHeadSha);
+    const response = record(
+      (
+        await this.http.request(`${this.pullPath(number)}/merge`, {
+          method: "PUT",
+          role: "worker",
+          body: { sha: expectedHeadSha },
+        })
+      ).body,
+    );
+    if (!boolean(response.merged))
+      throw new ForgeProviderError("GitHub did not confirm the merge.", 409);
+    return { merged: true, sha: string(response.sha) };
+  }
+
+  async resolveDiscussion(
+    number: number,
+    discussionId: string,
+    expectedHeadSha: string,
+  ): Promise<void> {
+    requireDiscussion(
+      await this.getChangeRequest(number),
+      discussionId,
+      expectedHeadSha,
+    );
+    const response = record(
+      (
+        await this.http.request("/graphql", {
+          method: "POST",
+          role: "worker",
+          graphql: true,
+          body: {
+            query:
+              "mutation($threadId:ID!){resolveReviewThread(input:{threadId:$threadId}){thread{id isResolved}}}",
+            variables: { threadId: discussionId },
+          },
+        })
+      ).body,
+    );
+    if (response.errors !== undefined)
+      throw new ForgeProviderError(
+        "GitHub refused to resolve this review thread.",
+        422,
+      );
+    const thread = record(
+      record(record(response.data).resolveReviewThread).thread,
+    );
+    if (string(thread.id) !== discussionId || !boolean(thread.isResolved))
+      return invalid();
+  }
+
+  private pullPath(number: number): string {
+    return `${this.path}/pulls/${issueNumber(number)}`;
+  }
+
+  private async search<T>(
+    kind: "issue" | "pr",
+    query: ForgeListQuery,
+    map: (value: unknown) => T,
+  ): Promise<ForgePage<T>> {
+    const { page, perPage } = pagination(query);
+    if (page * perPage > 1000)
+      throw new ForgeProviderError(
+        "GitHub search returns at most 1,000 matches. Narrow the filter.",
+      );
+    const filter = query.filter?.trim() || "is:open";
+    if (
+      /(?:^|\s|\()[+-]?(?:repo|org|user|type):|(?:^|\s|\()is:(?:issue|pr)\b/i.test(
+        filter,
+      )
+    ) {
+      throw new ForgeProviderError(
+        "Repository and issue/request type are fixed by this panel; remove scope qualifiers.",
+      );
+    }
+    const params = new URLSearchParams({
+      q: `repo:${this.http.repository.projectPath} is:${kind} (${filter})`,
+      advanced_search: "true",
+      per_page: String(perPage),
+      page: String(page),
+    });
+    const response = await this.http.request(`/search/issues?${params}`);
+    const result = record(response.body);
+    if (boolean(result.incomplete_results))
+      throw new ForgeProviderError(
+        "GitHub returned incomplete search results. Narrow the filter.",
+        422,
+      );
+    const items = list(result.items);
+    for (const value of items) {
+      const item = record(value);
+      const repository = string(item.repository_url);
+      if (
+        repository.toLowerCase() !==
+          `${this.http.repository.apiUrl.replace(/\/$/, "")}${this.path}`.toLowerCase() ||
+        Boolean(item.pull_request) !== (kind === "pr")
+      )
+        return invalid();
+    }
+    return {
+      items: items.map(map),
+      ...(hasNextPage(response.headers) ? { nextPage: page + 1 } : {}),
+    };
+  }
+
+  private async readiness(
+    number: number,
+    headSha: string,
+  ): Promise<GitHubReadiness> {
+    const [owner, name] = this.http.repository.projectPath.split("/");
+    let cursor: string | null = null;
+    let unresolved = 0;
+    const threadsByComment = new Map<
+      string,
+      { discussionId: string; resolved: boolean }
+    >();
+    for (let page = 0; page < 20; page++) {
+      const response = record(
+        (
+          await this.http.request("/graphql", {
+            method: "POST",
+            graphql: true,
+            body: {
+              query:
+                "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid reviewDecision mergeable mergeStateStatus reviewThreads(first:100,after:$cursor){nodes{id isResolved comments(first:1){nodes{id}}} pageInfo{hasNextPage endCursor}}}}}",
+              variables: { owner, name, number, cursor },
+            },
+          })
+        ).body,
+      );
+      if (response.errors !== undefined)
+        throw new ForgeProviderError(
+          "GitHub could not verify review and merge readiness.",
+          502,
+        );
+      const request = record(
+        record(record(response.data).repository).pullRequest,
+      );
+      if (string(request.headRefOid) !== headSha)
+        throw new ForgeProviderError(
+          "The request changed while loading. Refresh before proceeding.",
+          409,
+        );
+      const threads = record(request.reviewThreads);
+      for (const value of list(threads.nodes)) {
+        const thread = record(value);
+        const resolved = boolean(thread.isResolved);
+        if (!resolved) unresolved++;
+        for (const comment of list(record(thread.comments).nodes)) {
+          threadsByComment.set(string(record(comment).id), {
+            discussionId: string(thread.id),
+            resolved,
+          });
+        }
+      }
+      const pageInfo = record(threads.pageInfo);
+      if (!boolean(pageInfo.hasNextPage))
+        return {
+          unresolved,
+          threads: threadsByComment,
+          reviewDecision:
+            request.reviewDecision === null
+              ? null
+              : string(request.reviewDecision),
+          mergeable: string(request.mergeable),
+          mergeStateStatus: string(request.mergeStateStatus),
+        };
+      const next = string(pageInfo.endCursor);
+      if (!next || next === cursor) return invalid();
+      cursor = next;
+    }
+    throw new ForgeProviderError(
+      "This pull request exceeds 2,000 review threads.",
+      422,
+    );
+  }
+}
+
+function githubAuthor(value: unknown): string {
+  return value === null ? "[deleted]" : string(record(value).login);
+}
+
+function githubIssue(value: unknown): ForgeIssue {
+  const item = record(value);
+  const state = string(item.state);
+  if (state !== "open" && state !== "closed") return invalid();
+  return {
+    number: issueNumber(integer(item.number)),
+    title: string(item.title),
+    body: optionalText(item.body),
+    url: webUrl(item.html_url),
+    state:
+      item.merged === true || recordOrUndefined(item.pull_request)?.merged_at
+        ? "merged"
+        : state,
+    labels: list(item.labels).map((value) => string(record(value).name)),
+    author: githubAuthor(item.user),
+    updatedAt: string(item.updated_at),
+  };
+}
+
+function recordOrUndefined(
+  value: unknown,
+): Record<string, unknown> | undefined {
+  return value === undefined ? undefined : record(value);
+}
+
+function githubComment(value: unknown): ForgeComment {
+  const comment = record(value);
+  return {
+    id: String(integer(comment.id)),
+    body: string(comment.body),
+    author: githubAuthor(comment.user),
+    url: webUrl(comment.html_url),
+    ...(comment.path === undefined ? {} : { path: string(comment.path) }),
+    ...(comment.line == null ? {} : { line: integer(comment.line) }),
+  };
+}
+
+function githubReviewComment(value: unknown): ForgeComment {
+  const review = record(value);
+  return {
+    id: `review-${integer(review.id)}`,
+    body: `[${string(review.state)}] ${optionalText(review.body)}`,
+    author: githubAuthor(review.user),
+    url: webUrl(review.html_url),
+  };
+}

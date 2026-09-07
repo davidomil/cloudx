@@ -1,0 +1,781 @@
+{
+  "title": "Forge Workers",
+  "doc_kind": "technical_doc",
+  "audience": "CloudX users and engineers configuring and validating Forge Workers",
+  "style_profile": "compact_evidence_first",
+  "targets": [
+    "gfm"
+  ],
+  "source_inventory": [
+    {
+      "id": "src_forge_settings",
+      "title": "Forge settings",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/forge/ForgeSettingsService.ts",
+      "revision": "sha256:db51be2ac9ca4db566766db7ce8cad44af105e66e39ab75f51042c404a956cfe",
+      "notes": "Implementation behavior and constraints only."
+    },
+    {
+      "id": "src_forge_credentials",
+      "title": "Credential adapters",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/forge/providers/ForgeCredentials.ts",
+      "revision": "sha256:cc5cf6eab9716ca1b3368fd65b7bc9bbc9647d05adee1ae507454297a9e3d765",
+      "notes": "Implementation behavior and constraints only."
+    },
+    {
+      "id": "src_forge_runtime",
+      "title": "Owned Git and Codex runtime",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/forge/ForgeRuntime.ts",
+      "revision": "sha256:8719e70865b5a2b794790e22f84ed19fa9bf153b7328a554b4373e0494983ebf",
+      "notes": "Implementation behavior and constraints only."
+    },
+    {
+      "id": "src_forge_workflow",
+      "title": "Issue and review lifecycle",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/forge/ForgeWorkflowService.ts",
+      "revision": "sha256:9f4a4cd893f09d8730aab464d08158a4494246a580063b554be677dff10ac714",
+      "notes": "Implementation behavior and constraints only."
+    },
+    {
+      "id": "src_forge_panel",
+      "title": "Forge controls and review editor",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/web/src/ui/ForgePanel.tsx",
+      "revision": "sha256:fb7b64b5ea7ebdad27cdaa5e7fd521a7b38d6fab9b787da2aa3b33090ef2175f",
+      "notes": "Implementation behavior and constraints only."
+    },
+    {
+      "id": "src_forge_boundaries",
+      "title": "Plugin settings and hook boundary tests",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/plugins/ForgePlugin.test.ts",
+      "revision": "sha256:715bf0cdc14c7525371678105f71c6d078e6e04de23d0ec0872e25291f3b2100",
+      "notes": "Tests demonstrate input validation and public secret redaction with local fixtures."
+    },
+    {
+      "id": "src_forge_runtime_tests",
+      "title": "Runtime verification scenarios",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/forge/ForgeRuntime.test.ts",
+      "revision": "sha256:0da83972a12a51ec388e0476dd804da3a3306d2ff43bf29bc68dd8ef57fb493d",
+      "notes": "Real temporary Git repositories with fake terminal sessions; no live Codex process."
+    },
+    {
+      "id": "src_forge_validation_run",
+      "title": "Focused validation run, 2026-09-07 21:14 UTC",
+      "source_type": "other",
+      "authority": "primary",
+      "locator": "docs/implementation/forge-workers-audit/focused-tests.txt",
+      "revision": "sha256:d05bf5fb7f40bd13dc2c0d0faad778dfb389a2a4c44e3ebd29f304aba259e7e4",
+      "notes": "49 tests passed in four files; workspace prefix normalized to <worktree> and excess final blank line removed."
+    },
+    {
+      "id": "src_forge_github_auth",
+      "title": "GitHub installation access tokens",
+      "source_type": "web",
+      "authority": "primary",
+      "locator": "https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app",
+      "revision": "2026-09-07",
+      "notes": "Official primary documentation. Active archive doc_364e97338c2e1f972d2bb8a7, html chunks 193018 and surrounding text; content SHA256 3948a701f678e77e10699a337fa564506c45ae1816bbadd34a4614f459ec0fe2. Supports installation-token authentication only."
+    },
+    {
+      "id": "src_forge_gitlab_auth",
+      "title": "GitLab project access tokens",
+      "source_type": "web",
+      "authority": "primary",
+      "locator": "https://docs.gitlab.com/user/project/settings/project_access_tokens/",
+      "revision": "2026-09-07",
+      "notes": "Official primary documentation. Active archive doc_e4015bd455dc838673329048, html chunks 193029-193038; content SHA256 58a29f73f68f08a1487ff827583eb3f0a1d3dd8fb46b5d1ee3cb42ad7d6f05ca. Supports token creation and associated bot identity."
+    },
+    {
+      "id": "src_forge_settings_ui",
+      "title": "Settings template choices and secret file import",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/web/src/ui/SettingsDialog.tsx",
+      "notes": "Production settings behavior; file import stages the exact text until Save.",
+      "revision": "sha256:ac733e962813d4990cc822929579bca4fb4c260fec9eb5a35cf4fd64fabf5b35"
+    },
+    {
+      "id": "src_forge_settings_tests",
+      "title": "Settings credential and template interaction tests",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/web/src/ui/SettingsDialog.import.test.ts",
+      "notes": "Mounted production settings; named templates, exact PEM newlines, size/read errors, pending Save and clear behavior.",
+      "revision": "sha256:3e024a841cc012fb806ee3038b12a64471eb44f86dc98e2ff807848e3ac2ed4b"
+    },
+    {
+      "id": "src_forge_browser_tests",
+      "title": "Shipped shell desktop and mobile smoke tests",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "tests/browser/cloudx-smoke.spec.ts",
+      "notes": "Built server with a deterministic terminal fixture; these tests exercise the shipped shell, not a live model or hosted Forge provider.",
+      "revision": "sha256:ec941ebe6cb25da40fad6233eb7b2fed96e0143681388ea9f0f94bb8f2f68c9e"
+    },
+    {
+      "id": "src_forge_verification_runs",
+      "title": "Recorded repository, settings and lifecycle checks, 2026-09-07 UTC",
+      "source_type": "other",
+      "authority": "primary",
+      "locator": "docs/implementation/forge-workers-audit/verification-runs.txt",
+      "notes": "Exact commands, selected output, original log hashes and agent-confirmed completion. Final full suite/build/typecheck include all production additions; initial and focused records remain separately labeled.",
+      "revision": "sha256:bd2b81484f993cc2d70e980e0e5316970f2647fa5223e5e878e46a629036419d"
+    },
+    {
+      "id": "src_forge_settings_contracts",
+      "title": "Forge settings descriptor contracts",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/forge/ForgeSettingsService.test.ts",
+      "notes": "Tests the actual server descriptors separately from the mounted web settings fixture.",
+      "revision": "sha256:2633c278c7c206959115f6893ab78b2659b5093f8ade6dedc5225bc43d7f5089"
+    },
+    {
+      "id": "src_forge_lifecycle_tests",
+      "title": "Production PTY issue and review lifecycle integration",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/forge/ForgeLifecycle.integration.test.ts",
+      "notes": "Linux production PTY, CodexTerminalPlugin, SessionStore and Forge workflow/store/runtime with temporary Git repositories, a deterministic assistant executable and local Forge provider fixture.",
+      "revision": "sha256:891538905e67d5226d9c976b140a1f17323eb98200380ec3b8f78cd1b0d92941"
+    },
+    {
+      "id": "src_forge_host_scope",
+      "title": "CloudX Linux host product boundary",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "docs/architecture/system-context.md",
+      "revision": "sha256:ef62fa4bbbfbe4e503f3387fde54c0aab22b781251d8f73c38f03a2dd6acf15b",
+      "notes": "Confirms the existing Linux host boundary used by Forge."
+    },
+    {
+      "id": "src_forge_process_tree",
+      "title": "Awaited terminal process termination",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/terminal/TerminalProcessTree.ts",
+      "revision": "sha256:13277a98245cddda62496887d56efdf20549895365fab5be947f638032278394",
+      "notes": "Confirms the existing Linux host boundary used by Forge."
+    }
+  ],
+  "source_gaps": [],
+  "sections": [
+    {
+      "title": "Configure",
+      "blocks": [
+        {
+          "kind": "paragraph",
+          "text": "Forge Workers runs on CloudX’s Linux host and tracks one configured GitHub or GitLab repository. Create a Forge Workers tab, then open Settings and complete the Forge fields.",
+          "claim_ids": [
+            "scope",
+            "linux-host"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "Set the provider, repository path, local checkout and issue target branch. Use `https://api.github.com` for GitHub, an enterprise endpoint ending in `/api/v3`, or a GitLab endpoint ending in `/api/v4`. Both fetch and push origins must identify that repository.",
+          "claim_ids": [
+            "repository"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "The checkout’s parent must be an allowed CloudX root because workers create sibling worktrees. Configure Git authentication for fetch/push separately from the plugin’s API credentials.",
+          "claim_ids": [
+            "repository"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "Create templates in Rules / Skills, then choose **Issue worker template** and **Review template** by name in Settings. Set the worker time limit in minutes.",
+          "claim_ids": [
+            "templates"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "Configure both worker and reviewer credentials. Use distinct application or bot identities when review comments should appear under a different account; public configuration omits stored secrets.",
+          "claim_ids": [
+            "scope",
+            "secret"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "For GitHub, choose **GitHub App installation** and enter that role’s client ID and numeric installation ID. Use **Import from file** for its RSA private-key PEM file (up to 64 KB), then **Save** to apply it. Install the app on the repository and grant the operations that role needs; Forge exchanges the signed JWT for installation tokens. See [GitHub installation authentication](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app).",
+          "claim_ids": [
+            "github",
+            "pem-import"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "For GitLab, create separate bot/access tokens with `api` scope and the project permissions needed by each role, then choose **Bot / access token**. [GitLab project access tokens](https://docs.gitlab.com/user/project/settings/project_access_tokens/) create associated bot users. **GitLab OAuth application token** accepts an already issued token; this plugin has no OAuth sign-in or refresh flow.",
+          "claim_ids": [
+            "gitlab"
+          ]
+        }
+      ],
+      "claims": [
+        {
+          "id": "scope",
+          "text": "Forge provides issue workers, change-request reviews, and separate configurable worker/reviewer identities.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_panel",
+              "locator": "ForgePanel; ForgeItems; WorkerCard",
+              "excerpt": "Issues, Pull requests/Merge requests, Workers, Settings, and task action controls."
+            },
+            {
+              "source_id": "src_forge_settings",
+              "locator": "forgeConfigFields",
+              "excerpt": "Separate worker and reviewer credential fields."
+            }
+          ]
+        },
+        {
+          "id": "repository",
+          "text": "Configure a provider, HTTPS API endpoint, repository, local checkout and issue target branch. Both origin URLs must match the configured repository.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_settings",
+              "locator": "settings; forgeConfigFields",
+              "excerpt": "API URL, Repository, Local repository path, Target branch; checkout parent must be allowed and Git fetch/push authenticated."
+            },
+            {
+              "source_id": "src_forge_credentials",
+              "locator": "validateRepository",
+              "excerpt": "HTTPS endpoints; GitHub owner/repo, GitLab subgroups; /api/v3 for enterprise and /api/v4 for GitLab."
+            },
+            {
+              "source_id": "src_forge_runtime",
+              "locator": "prepareWorkspace; assertForgeOrigin",
+              "excerpt": "Resolves allowed sibling worktree path and checks fetch and push origins against expectedRepository."
+            }
+          ]
+        },
+        {
+          "id": "templates",
+          "text": "Named Rules / Skills template choices separately configure issue and review Codex tabs; the worker time limit is expressed in minutes.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_settings",
+              "locator": "forgeConfigFields workerTemplateId/reviewTemplateId",
+              "excerpt": "workerTemplateId and reviewTemplateId use optionSource rulesSkills.templates; maxRunMinutes configures the worker time limit in minutes."
+            },
+            {
+              "source_id": "src_forge_runtime",
+              "locator": "launch",
+              "excerpt": "Rejects unknown template ID and attaches selectedTemplateId to the Codex tab."
+            },
+            {
+              "source_id": "src_forge_settings_ui",
+              "locator": "ConfigField optionSource rulesSkills.templates",
+              "excerpt": "Select options show template names and retain IDs; an empty catalog disables the control and says to create a template first."
+            },
+            {
+              "source_id": "src_forge_settings_tests",
+              "locator": "selects template names and saves their IDs through descriptor-driven fields; explains missing templates",
+              "excerpt": "Mounted fields show names and persist chosen IDs; empty catalog shows instructions."
+            },
+            {
+              "source_id": "src_forge_settings_contracts",
+              "locator": "offers Rules / Skills template choices while persisting string identifiers",
+              "excerpt": "Both production template fields use string storage and the rulesSkills.templates option source."
+            }
+          ]
+        },
+        {
+          "id": "github",
+          "text": "GitHub App authentication accepts client ID, installation ID and private key and exchanges a signed JWT for a repository-scoped installation token.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_credentials",
+              "locator": "ForgeCredentials.installationToken",
+              "excerpt": "Signs RS256 JWT with appId as issuer and POSTs to app/installations/installationId/access_tokens with selected repository."
+            },
+            {
+              "source_id": "src_forge_settings",
+              "locator": "credential; forgeConfigFields",
+              "excerpt": "Client ID, numeric installation ID, private-key secret fields for each role."
+            },
+            {
+              "source_id": "src_forge_github_auth",
+              "locator": "https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app#generating-an-installation-access-token",
+              "excerpt": "Installation token uses JWT and installation ID; access is constrained by installation permissions."
+            }
+          ]
+        },
+        {
+          "id": "gitlab",
+          "text": "GitLab supports access tokens and supplied OAuth tokens; project access tokens create bot identities.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_settings",
+              "locator": "credential; forgeConfigFields",
+              "excerpt": "Token and gitlab-oauth credential types; description specifies api scope."
+            },
+            {
+              "source_id": "src_forge_credentials",
+              "locator": "ForgeCredentials.headers",
+              "excerpt": "Token uses PRIVATE-TOKEN; gitlab-oauth uses Bearer; no OAuth authorization or refresh grant implementation."
+            },
+            {
+              "source_id": "src_forge_gitlab_auth",
+              "locator": "https://docs.gitlab.com/user/project/settings/project_access_tokens/#create-a-project-access-token",
+              "excerpt": "Create token through project Settings > Access tokens with role and scope."
+            },
+            {
+              "source_id": "src_forge_gitlab_auth",
+              "locator": "https://docs.gitlab.com/user/project/settings/project_access_tokens/#bot-users-for-projects",
+              "excerpt": "Creating a project access token creates an associated bot user."
+            }
+          ]
+        },
+        {
+          "id": "secret",
+          "text": "The public configuration response omits stored worker and reviewer secrets.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_boundaries",
+              "locator": "asks for credentials through settings and keeps stored values out of public config",
+              "excerpt": "Public config serialization excludes both private-worker-secret and private-reviewer-secret."
+            }
+          ]
+        },
+        {
+          "id": "pem-import",
+          "text": "Private-key fields import a file up to 64 KB, preserve its text and stage it until Save.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_settings",
+              "locator": "forgeConfigFields role PrivateKey fields",
+              "excerpt": "RSA private key fields accept .pem,.key and describe a 64 KB limit."
+            },
+            {
+              "source_id": "src_forge_settings_ui",
+              "locator": "importSecretFile; secret field file input; save",
+              "excerpt": "Rejects over 64 * 1024 bytes; stages File.text output; Save is disabled while reading and applies the staged value."
+            },
+            {
+              "source_id": "src_forge_settings_tests",
+              "locator": "imports a real PEM file and saves its exact newlines while keeping the input masked",
+              "excerpt": "CRLF PEM text remains exact in onSave; file picker is reset and secret text is masked."
+            }
+          ]
+        },
+        {
+          "id": "linux-host",
+          "text": "Forge targets the existing CloudX Linux host boundary; awaited terminal process-tree termination requires Linux.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_host_scope",
+              "locator": "Product Boundary",
+              "excerpt": "CloudX runs on the developer Linux machine."
+            },
+            {
+              "source_id": "src_forge_process_tree",
+              "locator": "terminate",
+              "excerpt": "Non-Linux platforms throw an explicit awaited process-tree termination requires Linux error."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "Work on an issue",
+      "blocks": [
+        {
+          "kind": "paragraph",
+          "text": "Filter Issues with GitHub qualifiers such as `is:open label:bug`, or GitLab parameters such as `state=opened&labels=bug`. Select an issue and click **Start work**. Use Workers to inspect status, open the Codex tab, pause, stop or resume.",
+          "claim_ids": [
+            "filters",
+            "issue-loop"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "The agent implements and commits the change. Forge publishes the branch, opens the PR/MR, pauses and sends a ready-for-review notification. Pause and Stop retain unfinished issue work.",
+          "claim_ids": [
+            "issue-loop",
+            "cleanup"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "After review, click **Resume**. Codex assesses the latest issue and PR/MR comments. Completion merges only when the current head is approved and mergeable, discussions are resolved, and feedback still matches the agent’s input. New feedback or missing approval causes another review pause.",
+          "claim_ids": [
+            "resume"
+          ]
+        },
+        {
+          "kind": "visual_ref",
+          "visual_id": "issue-flow"
+        },
+        {
+          "kind": "paragraph",
+          "text": "After merge, Forge removes its owned checkout, local branch and worker artifacts. Ownership changes, dirty files or a local commit different from the published head block cleanup and preserve the resources.",
+          "claim_ids": [
+            "cleanup"
+          ]
+        }
+      ],
+      "claims": [
+        {
+          "id": "filters",
+          "text": "Issue and request lists accept native GitHub search qualifiers or GitLab URL query parameters with pagination.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_panel",
+              "locator": "ForgeItems filter form and pagination",
+              "excerpt": "GitHub placeholder is:open label:bug assignee:@me; GitLab state=opened&labels=bug&scope=assigned_to_me; Previous/Next controls."
+            }
+          ]
+        },
+        {
+          "id": "issue-loop",
+          "text": "Starting issue work opens an isolated Codex checkout; completion publishes a PR/MR, pauses the worker and notifies the user.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_workflow",
+              "locator": "startWorker; launch; issueReady",
+              "excerpt": "Issue worker prepares workspace, launches with template/context, publishes branch and request, sets awaiting_review, sends Ready for review notification."
+            }
+          ]
+        },
+        {
+          "id": "resume",
+          "text": "Resume gives Codex fresh issue and PR/MR feedback before merge eligibility is checked.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_workflow",
+              "locator": "resume; launch; issueReady; feedbackDigest",
+              "excerpt": "Resumes with current item/change; stores feedback digest; completion requires matching feedback, approved current head, mergeable state and no unresolved discussions before merge."
+            }
+          ]
+        },
+        {
+          "id": "cleanup",
+          "text": "Issue work remains after pause/stop; after merge, cleanup verifies ownership, a clean checkout and the published commit before removing resources.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_workflow",
+              "locator": "control; cleanup",
+              "excerpt": "Stopping an issue retains its workspace; completed merge invokes cleanup."
+            },
+            {
+              "source_id": "src_forge_runtime",
+              "locator": "close; cleanup; verifyCleanHead; cleanupOwned",
+              "excerpt": "Checks owned identities, expectedHeadSha and git status; removes owned worktree, branch, launch/context artifacts."
+            }
+          ]
+        }
+      ],
+      "visuals": [
+        {
+          "id": "issue-flow",
+          "kind": "mermaid",
+          "purpose": "Show the supervised issue lifecycle and merge gate.",
+          "alt_text": "Issue work publishes a request and pauses. Resume assesses current feedback, then either pauses again or merges and cleans owned resources.",
+          "caption": "Resume assesses current feedback before merge eligibility.",
+          "source_ids": [
+            "src_forge_workflow",
+            "src_forge_runtime"
+          ],
+          "spec": "flowchart TB\n  A[Start Codex issue work] --> B[Publish PR/MR and pause]\n  B --> C[Review and Resume: assess current feedback]\n  C -->|Needs review| B\n  C -->|Approved head and unchanged feedback| D[Merge and clean owned resources]"
+        }
+      ]
+    },
+    {
+      "title": "Review PRs and MRs",
+      "blocks": [
+        {
+          "kind": "paragraph",
+          "text": "Select a request and click **Review** to retain a draft, or **Review and post** to publish automatically. Reviewers use the selected request’s exact head and actual target branch. Their temporary Codex tab and checkout are removed when the review finishes.",
+          "claim_ids": [
+            "review",
+            "review-actions"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "The request badge shows suggested comments. Open the request, edit the review summary, outcome and comments, then **Save draft** or **Submit review**. Inline comments also expose file, line and diff side. **Mark as approved** and **Mark as request changes** submit directly through the reviewer identity.",
+          "claim_ids": [
+            "review-actions"
+          ]
+        }
+      ],
+      "claims": [
+        {
+          "id": "review",
+          "text": "Review workers inspect the selected exact head and actual target branch; completion removes temporary resources but retains the review draft.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_workflow",
+              "locator": "startWorker; poll; resume",
+              "excerpt": "Review baseBranch uses selected change baseBranch; exact head saved; report head validated; cleanup runs before completed draft posting."
+            }
+          ]
+        },
+        {
+          "id": "review-actions",
+          "text": "Users can edit suggested comments and review outcome, save/submit manually, automatically post, approve or request changes with reviewer credentials.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_panel",
+              "locator": "ForgeItems; ReviewEditor",
+              "excerpt": "Review, Review and post, Mark as approved, Mark as request changes; editable summary/event/body/path/line/side; save before submit."
+            },
+            {
+              "source_id": "src_forge_workflow",
+              "locator": "postDraft; markReview",
+              "excerpt": "Review publications use reviewer provider role."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "Recovery and limits",
+      "blocks": [
+        {
+          "kind": "table_ref",
+          "table_id": "states"
+        },
+        {
+          "kind": "paragraph",
+          "text": "Restart recovery consults persisted workspace and tab ownership. If a terminal disappeared without verified process quiescence, Forge preserves its resources and reports `cleanup_failed`. Inspect the process and ownership state; automatic cleanup is unavailable until those checks can succeed.",
+          "claim_ids": [
+            "crash"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "A changed request head invalidates an old review draft. An ambiguous review submission remains read-only: inspect already published comments before starting another review. Uncertain PR/MR creation checks for an existing request on the worker branch and refuses to repeat an unconfirmed creation.",
+          "claim_ids": [
+            "failure"
+          ]
+        }
+      ],
+      "claims": [
+        {
+          "id": "failure",
+          "text": "Failed or ambiguous publication remains visible; failed review submissions are locked and uncertain create requests reconcile by branch.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_workflow",
+              "locator": "postDraft; reconcilePublication; fail",
+              "excerpt": "post_failed refuses resubmission; findChangeRequestByBranch attaches matching request and refuses uncertain creation when no match appears."
+            },
+            {
+              "source_id": "src_forge_panel",
+              "locator": "ReviewEditor; WorkerCard",
+              "excerpt": "Shows errors, explicit Resume/Clean up, and post_failed read-only notice."
+            }
+          ]
+        },
+        {
+          "id": "crash",
+          "text": "Restart recovery uses ownership records, but an absent terminal without verified process quiescence preserves resources and reports cleanup_failed.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_runtime",
+              "locator": "close; recover",
+              "excerpt": "Missing live terminal with owned !closed and !quiescent throws ownership unresolved; ownership records recover workspace/tab IDs."
+            },
+            {
+              "source_id": "src_forge_workflow",
+              "locator": "exclusive initialization; recoverResources",
+              "excerpt": "Interrupted recovery catches cleanup failure and persists cleanup_failed with attention error."
+            }
+          ]
+        }
+      ],
+      "tables": [
+        {
+          "id": "states",
+          "caption": "Visible states require explicit action.",
+          "columns": [
+            "State",
+            "Action"
+          ],
+          "rows": [
+            [
+              "awaiting_review",
+              "Review the PR/MR, then Resume."
+            ],
+            [
+              "paused / stopped",
+              "Resume when ready to continue."
+            ],
+            [
+              "failed",
+              "Inspect the error and retained work before resuming."
+            ],
+            [
+              "cleanup_failed",
+              "Resolve the ownership or process error before Clean up."
+            ],
+            [
+              "post_failed",
+              "Inspect the provider; the saved submission cannot be posted again."
+            ]
+          ],
+          "source_ids": [
+            "src_forge_workflow",
+            "src_forge_panel"
+          ]
+        }
+      ]
+    },
+    {
+      "title": "Verification",
+      "blocks": [
+        {
+          "kind": "paragraph",
+          "text": "Recorded checks on 2026-09-07 passed the following; the full suite, typecheck and build include all production additions.",
+          "claim_ids": [
+            "verification"
+          ]
+        },
+        {
+          "kind": "table_ref",
+          "table_id": "checks"
+        },
+        {
+          "kind": "paragraph",
+          "text": "The initial `npm test -- --reporter=dot` run had two failures in existing tests. The later full pass used `--maxWorkers=2`; the runs did not use identical concurrency.",
+          "claim_ids": [
+            "verification"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "The settings follow-up passed **14 tests in 3 files**. Production PTY integration passed **2 lifecycle scenarios**: issue work through fresh feedback, approval, merge and cleanup; and review cleanup followed by edited draft submission.",
+          "claim_ids": [
+            "followup-verification",
+            "verification-scope"
+          ]
+        },
+        {
+          "kind": "code",
+          "language": "bash",
+          "text": "npx vitest run apps/web/src/ui/SettingsDialog.test.ts apps/web/src/ui/SettingsDialog.import.test.ts apps/server/src/forge/ForgeSettingsService.test.ts\nnpx vitest run apps/server/src/forge/ForgeLifecycle.integration.test.ts",
+          "claim_ids": [
+            "followup-verification"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "The lifecycle tests use real Git worktrees and terminal processes with a deterministic assistant and local provider fixture. Live GitHub/GitLab authentication, actual Codex model execution and issue-to-merge operation against a hosted provider have not been tested.",
+          "claim_ids": [
+            "verification-scope"
+          ]
+        }
+      ],
+      "claims": [
+        {
+          "id": "verification",
+          "text": "The initial default-concurrency suite failed two tests; the final full suite with maxWorkers=2 passed 2137 tests in 114 files after all production additions. Final build/typecheck and shipped-shell browser checks passed.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_verification_runs",
+              "locator": "initial-default; final-full; final-build; final-typecheck; shipped-shell-browser",
+              "excerpt": "Initial 2 failed / 2123 passed; final bounded 114 files / 2137 tests passed; final npm build and typecheck success; shipped-shell browser 12 passed."
+            }
+          ]
+        },
+        {
+          "id": "followup-verification",
+          "text": "The settings follow-up passed 14 tests in 3 files and production PTY lifecycle integration passed 2 tests.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_verification_runs",
+              "locator": "settings-followup; lifecycle-integration",
+              "excerpt": "Settings: Test Files 3 passed; Tests 14 passed. Lifecycle: Test Files 1 passed; Tests 2 passed."
+            }
+          ]
+        },
+        {
+          "id": "verification-scope",
+          "text": "Two Linux integration scenarios exercise actual PTY/Git issue and review lifecycles with deterministic assistant/provider fixtures; this evidence does not demonstrate live provider authentication or model execution.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_lifecycle_tests",
+              "locator": "Forge lifecycle through real Codex tabs; LifecycleFixture; LocalForgeProvider; fakeAssistant; processIsRunning",
+              "excerpt": "Actual NodePtyTerminalProcessFactory, CodexTerminalPlugin, SessionStore and Forge workflow/runtime/store. Fixture assistant reports completion across feedback/approval turns and review edits; local provider handles publication. Owned assistant /proc states verify termination."
+            },
+            {
+              "source_id": "src_forge_browser_tests",
+              "locator": "test.beforeAll; writeTerminalFixture",
+              "excerpt": "Shipped server receives CLOUDX_ASSISTANT_BIN pointing to a deterministic executable; six shell scenarios run on desktop and mobile."
+            }
+          ]
+        }
+      ],
+      "tables": [
+        {
+          "id": "checks",
+          "caption": "Recorded repository checks.",
+          "columns": [
+            "Command",
+            "Result"
+          ],
+          "rows": [
+            [
+              "`npx vitest run --maxWorkers=2 --reporter=dot`",
+              "114 files, 2,137 tests passed"
+            ],
+            [
+              "`npm run build`",
+              "Passed"
+            ],
+            [
+              "`npm run typecheck`",
+              "Passed"
+            ],
+            [
+              "`npx playwright test --reporter=line`",
+              "12 shipped-shell desktop/mobile checks passed"
+            ]
+          ],
+          "source_ids": [
+            "src_forge_verification_runs",
+            "src_forge_browser_tests"
+          ]
+        }
+      ]
+    }
+  ]
+}

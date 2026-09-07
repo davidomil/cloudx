@@ -47,6 +47,7 @@ import {
   addTabToPane,
   defaultLayout,
   findPane,
+  findPaneContainingTab,
   isPaneTabActive,
   listPanes,
   paneCount,
@@ -101,6 +102,7 @@ const AutomationPanel = lazy(() => import("./AutomationPanel.js").then((module) 
 const DocumentationPanel = lazy(() => import("./DocumentationPanel.js").then((module) => ({ default: module.DocumentationPanel })));
 const FileBrowserPanel = lazy(() => import("./FileBrowserPanel.js").then((module) => ({ default: module.FileBrowserPanel })));
 const JiraPanel = lazy(() => import("./JiraPanel.js").then((module) => ({ default: module.JiraPanel })));
+const ForgePanel = lazy(() => import("./ForgePanel.js").then((module) => ({ default: module.ForgePanel })));
 const TerminalPanel = lazy(() => import("./TerminalPanel.js").then((module) => ({ default: module.TerminalPanel })));
 
 function useMediaQuery(query: string): boolean {
@@ -1172,6 +1174,21 @@ export function App() {
         <JiraPanel callHook={context.callHook} activeTriggerIds={activeAutomationTriggerIds} emitTrigger={handleEmitTrigger} />
       </Suspense>
     ) : <div className="empty-pane">Jira hooks are unavailable.</div>,
+    "forge.panel": (_contribution, context) => {
+      const pane = context.tab ? findPaneContainingTab(layout.root, context.tab.id) : undefined;
+      if (!context.callHook || !context.tab || !activeWindowId || !pane) return <div className="empty-pane">Forge workspace is unavailable.</div>;
+      return <Suspense fallback={<div className="empty-pane">Loading Forge...</div>}>
+        <ForgePanel key={context.tab.id} callHook={context.callHook} tab={context.tab} windowId={activeWindowId} paneId={pane.id} onOpenSettings={() => setSettingsOpen(true)} onOpenWorkerTab={async (tabId) => {
+          const currentPane = findPaneContainingTab(layoutRef.current.root, tabId);
+          if (currentPane) { await activateTab(tabId, currentPane.id); return; }
+          const targetWindow = windowsRef.current.find((window) => findPaneContainingTab(window.layout.root, tabId));
+          const targetPane = targetWindow && findPaneContainingTab(targetWindow.layout.root, tabId);
+          if (!targetWindow || !targetPane) throw new Error("The worker's Codex tab is no longer open.");
+          await handleSelectWindow(targetWindow.id);
+          await activateTab(tabId, targetPane.id);
+        }} />
+      </Suspense>;
+    },
     [UI_RENDERER_STATUS_DOT]: (_contribution, context) => (context.tab ? <TabIndicatorDot tab={context.tab} attention={context.attention} /> : null),
     "audio-ai.voice-control": () => renderMicControl("topbar-mic-control", topbarMicControlRef, 17),
     "audio-ai.voice-console": () => {

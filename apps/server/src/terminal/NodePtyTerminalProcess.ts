@@ -1,9 +1,16 @@
 import type { IPty } from "node-pty";
 
 import type { TerminalProcess, TerminalProcessFactory } from "./TerminalProcess.js";
+import { TerminalProcessTree } from "./TerminalProcessTree.js";
 
 class NodePtyTerminalProcess implements TerminalProcess {
-  constructor(private readonly process: IPty) {}
+  private readonly tree: TerminalProcessTree;
+  private exited = false;
+
+  constructor(private readonly process: IPty) {
+    this.tree = new TerminalProcessTree(process.pid);
+    process.onExit(() => { this.exited = true; });
+  }
 
   onData(listener: (data: string) => void): () => void {
     const disposable = this.process.onData(listener);
@@ -24,7 +31,11 @@ class NodePtyTerminalProcess implements TerminalProcess {
   }
 
   kill(): void {
-    this.process.kill();
+    if (!this.exited) this.process.kill();
+  }
+
+  terminate(): Promise<void> {
+    return this.tree.terminate().then(() => { this.exited = true; });
   }
 }
 

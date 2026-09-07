@@ -1,5 +1,8 @@
 import { isUsableTabLayoutState, listTabLayoutPanes } from "./workspaceLayout.js";
 
+export * from "./forge.js";
+export * from "./forgeWorkers.js";
+
 export const DEFAULT_VOICE_MODEL = "gpt-5.3-codex-spark";
 
 export type PluginId = "codex-terminal" | "standard-terminal" | "file-browser" | "local-web" | string;
@@ -584,6 +587,8 @@ export interface ConfigFieldDescriptor {
   visibility?: "user" | "internal";
   defaultValue: ConfigValue;
   secretConfigured?: boolean;
+  acceptFile?: string;
+  optionSource?: "rulesSkills.templates";
   options?: ConfigFieldOption[];
   min?: number;
   max?: number;
@@ -656,6 +661,7 @@ export interface CreateTabRequest {
 export type CodexSessionResumeMode = "new" | "picker" | "last" | "session";
 
 export interface CodexTerminalInitialInput {
+  prompt?: string;
   resume?: {
     mode: Exclude<CodexSessionResumeMode, "new">;
     sourceId: string;

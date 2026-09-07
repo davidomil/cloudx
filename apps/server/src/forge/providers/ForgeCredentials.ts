@@ -1,0 +1,208 @@
+import { sign } from "node:crypto";
+import type { ForgeCredentialRole, ForgeRepository } from "@cloudx/shared";
+import { ForgeProviderError } from "./ForgeProvider.js";
+import { record, string } from "./validation.js";
+import { readBoundedBody } from "./responseBody.js";
+
+export type ForgeCredential =
+  | { kind: "token"; token: string }
+  | { kind: "gitlab-oauth"; token: string }
+  | {
+      kind: "github-app";
+      appId: string;
+      installationId: string;
+      privateKey: string;
+    };
+
+export type ReadForgeCredential = (
+  role: ForgeCredentialRole,
+) => Promise<ForgeCredential | undefined>;
+
+export function validateRepository(repository: ForgeRepository): URL {
+  let url: URL;
+  try {
+    url = new URL(repository.apiUrl);
+  } catch {
+    throw new ForgeProviderError("Set a valid forge API URL.");
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash
+  ) {
+    throw new ForgeProviderError(
+      "Forge API URLs must use HTTPS and contain no credentials, query, or fragment.",
+    );
+  }
+  if (!["github", "gitlab"].includes(repository.provider))
+    throw new ForgeProviderError("Choose GitHub or GitLab.");
+  const parts = repository.projectPath.split("/");
+  if (
+    parts.length < 2 ||
+    parts.some(
+      (part) =>
+        !/^[a-zA-Z0-9_.-]+$/.test(part) || part === "." || part === "..",
+    ) ||
+    (repository.provider === "github" && parts.length !== 2)
+  ) {
+    throw new ForgeProviderError(
+      "Set the repository path to owner/repository (GitLab may include subgroups).",
+    );
+  }
+  const expectedPath =
+    repository.provider === "gitlab"
+      ? "/api/v4"
+      : url.hostname === "api.github.com"
+        ? ""
+        : "/api/v3";
+  if (url.pathname.replace(/\/$/, "") !== expectedPath) {
+    throw new ForgeProviderError(
+      `The API URL must end with ${expectedPath || "the api.github.com hostname"}.`,
+    );
+  }
+  return url;
+}
+
+export class ForgeCredentials {
+  private readonly installationTokens = new Map<
+    ForgeCredentialRole,
+    { credential: string; token: string; expires: number }
+  >();
+
+  constructor(
+    private readonly repository: ForgeRepository,
+    private readonly read: ReadForgeCredential,
+    private readonly fetcher: typeof fetch = fetch,
+  ) {
+    validateRepository(repository);
+  }
+
+  async headers(
+    role: ForgeCredentialRole,
+    signal?: AbortSignal,
+  ): Promise<Record<string, string>> {
+    signal?.throwIfAborted();
+    const credential = await this.read(role);
+    signal?.throwIfAborted();
+    if (!credential)
+      throw new ForgeProviderError(
+        `Configure ${role} application credentials in Forge Workers settings.`,
+        401,
+      );
+    if (credential.kind === "github-app") {
+      if (this.repository.provider !== "github")
+        throw new ForgeProviderError(
+          "GitHub application credentials require a GitHub repository.",
+        );
+      return {
+        Authorization: `Bearer ${await this.installationToken(role, credential, signal)}`,
+      };
+    }
+    if (!credential.token.trim())
+      throw new ForgeProviderError(
+        `Configure a nonempty ${role} access token.`,
+        401,
+      );
+    if (
+      credential.kind === "gitlab-oauth" &&
+      this.repository.provider !== "gitlab"
+    )
+      throw new ForgeProviderError(
+        "GitLab OAuth credentials require a GitLab repository.",
+      );
+    return this.repository.provider === "gitlab" && credential.kind === "token"
+      ? { "PRIVATE-TOKEN": credential.token }
+      : { Authorization: `Bearer ${credential.token}` };
+  }
+
+  private async installationToken(
+    role: ForgeCredentialRole,
+    credential: Extract<ForgeCredential, { kind: "github-app" }>,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    if (
+      !/^[A-Za-z0-9_]+$/.test(credential.appId) ||
+      !/^\d+$/.test(credential.installationId)
+    )
+      throw new ForgeProviderError(
+        "Set the GitHub App client ID and numeric installation ID.",
+      );
+    const identity = JSON.stringify(credential);
+    const cached = this.installationTokens.get(role);
+    if (cached?.credential === identity && cached.expires > Date.now() + 60_000)
+      return cached.token;
+    const now = Math.floor(Date.now() / 1000);
+    const encode = (value: unknown) =>
+      Buffer.from(JSON.stringify(value)).toString("base64url");
+    const payload = `${encode({ alg: "RS256", typ: "JWT" })}.${encode({ iat: now - 60, exp: now + 540, iss: credential.appId })}`;
+    let signature: string;
+    try {
+      signature = sign(
+        "RSA-SHA256",
+        Buffer.from(payload),
+        credential.privateKey,
+      ).toString("base64url");
+    } catch {
+      throw new ForgeProviderError(
+        "The GitHub App private key is not a valid RSA signing key.",
+      );
+    }
+    let response: Response;
+    signal?.throwIfAborted();
+    try {
+      response = await this.fetcher(
+        `${this.repository.apiUrl.replace(/\/$/, "")}/app/installations/${credential.installationId}/access_tokens`,
+        {
+          method: "POST",
+          redirect: "error",
+          signal: AbortSignal.any([
+            AbortSignal.timeout(30_000),
+            ...(signal ? [signal] : []),
+          ]),
+          headers: {
+            Authorization: `Bearer ${payload}.${signature}`,
+            Accept: "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2026-03-10",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            repositories: [this.repository.projectPath.split("/")[1]],
+          }),
+        },
+      );
+    } catch {
+      throw new ForgeProviderError(
+        "GitHub App authentication could not reach the configured API.",
+        502,
+      );
+    }
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new ForgeProviderError(
+        `GitHub App authentication failed (HTTP ${response.status}).`,
+        response.status,
+      );
+    }
+    let body: Record<string, unknown>;
+    try {
+      body = record(JSON.parse(await readBoundedBody(response, 100_000)));
+    } catch {
+      throw new ForgeProviderError(
+        "GitHub App authentication returned invalid credentials.",
+        502,
+      );
+    }
+    signal?.throwIfAborted();
+    const token = string(body.token);
+    const expires = Date.parse(string(body.expires_at));
+    if (!token || !Number.isFinite(expires) || expires <= Date.now())
+      throw new ForgeProviderError(
+        "GitHub App returned an expired or invalid installation token.",
+        502,
+      );
+    this.installationTokens.set(role, { credential: identity, token, expires });
+    return token;
+  }
+}

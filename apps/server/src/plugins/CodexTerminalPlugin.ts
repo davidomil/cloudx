@@ -143,8 +143,11 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
 
 export function buildCodexLaunchArgs(baseArgs: string[], initialInput?: Record<string, unknown>): string[] {
   const resume = codexResumeInput(initialInput);
+  const prompt = initialInput?.prompt;
+  if (prompt !== undefined && (typeof prompt !== "string" || !prompt.trim() || prompt.includes("\0"))) throw new Error("Codex initial prompt must be a non-empty string without null bytes.");
+  if (prompt !== undefined && resume && resume.mode !== "session") throw new Error("An initial prompt with resume requires an exact session id.");
   if (!resume) {
-    return baseArgs;
+    return prompt === undefined ? baseArgs : [...baseArgs, "--", prompt as string];
   }
   const args = [...baseArgs, "resume"];
   if (resume.mode === "last") {
@@ -159,6 +162,7 @@ export function buildCodexLaunchArgs(baseArgs: string[], initialInput?: Record<s
   if (resume.mode === "session") {
     args.push(resume.sessionId!);
   }
+  if (prompt !== undefined) args.push("--", prompt as string);
   return args;
 }
 
@@ -716,8 +720,15 @@ export class CodexTerminalSession implements PluginSession {
       return { cols, rows };
     }
     if (action === "stop") {
-      this.stop();
-      return { stopped: true };
+      this.stopped = true;
+      this.terminalClosed = true;
+      this.clearPendingSubmitTimers();
+      this.clearReadyQuietTimer();
+      this.setReadiness("closed", "Terminal is stopping.");
+      return this.terminalProcess.terminate().then(() => {
+        this.setStatus("stopped", "Terminal was stopped.");
+        return { stopped: true };
+      });
     }
     throw new Error(`Unsupported Codex terminal action: ${action}`);
   }

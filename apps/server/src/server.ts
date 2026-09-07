@@ -54,6 +54,11 @@ import { AutomationPlugin } from "./plugins/AutomationPlugin.js";
 import { NotificationsPlugin } from "./plugins/NotificationsPlugin.js";
 import { PluginDataStore } from "./plugins/PluginDataStore.js";
 import { InstalledPluginInstallError, InstalledPluginService } from "./plugins/InstalledPluginService.js";
+import { ForgePlugin } from "./plugins/ForgePlugin.js";
+import { ForgeSettingsService } from "./forge/ForgeSettingsService.js";
+import { ForgeWorkflowService } from "./forge/ForgeWorkflowService.js";
+import { ForgeRuntime } from "./forge/ForgeRuntime.js";
+import { ForgeWorkflowStore, ForgeWorkerReports } from "./forge/ForgeWorkflowStore.js";
 import { JiraPlugin } from "./plugins/JiraPlugin.js";
 import { RulesSkillsPlugin } from "./plugins/RulesSkillsPlugin.js";
 import { DocumentationPlugin } from "./plugins/DocumentationPlugin.js";
@@ -106,6 +111,7 @@ export interface AppServices {
   documentationEnrichment?: DocumentationEnrichmentService;
   jira?: JiraIntegrationService;
   jiraPolling?: JiraPollingService;
+  forge?: ForgeWorkflowService;
   pluginContributionsReady?: Promise<RulesSkillsStore>;
   codexStateSources?: CodexStateSources;
 }
@@ -215,7 +221,12 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     const sourceShutdown = settleDisposers([() => services.codexStateSources?.dispose()]);
     const producerShutdown = settleDisposers([
       () => services.jiraPolling?.dispose(),
-      () => services.sessions.dispose?.()
+      async () => {
+        const failures = await settleDisposers([() => services.forge?.dispose()]);
+        failures.push(...await settleDisposers([() => services.sessions.dispose?.()]));
+        if (failures.length === 1) throw failures[0];
+        if (failures.length > 1) throw new AggregateError(failures, "Forge workers or sessions failed to stop.");
+      }
     ]);
     shutdownPromise = (async () => {
       const [requestOwnerFailures, producerFailures] = await Promise.all([requestOwnerShutdown, producerShutdown]);
@@ -1193,6 +1204,12 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   plugins.register(new DocumentationPlugin(documentation, pathPolicy, documentationIngestQueue, () => documentationEnrichment));
   plugins.register(new WorktreeManagerPlugin(new WorktreeService(pathPolicy)));
   plugins.register(new WorkspaceControlPlugin());
+  let forge: ForgeWorkflowService | undefined;
+  let forgeSettings: ForgeSettingsService | undefined;
+  plugins.register(new ForgePlugin(() => {
+    if (!forge || !forgeSettings) throw new Error("Forge Workers service is not available.");
+    return { settings: forgeSettings, workflow: forge };
+  }));
   let jira: JiraIntegrationService | undefined;
   let jiraPolling: JiraPollingService | undefined;
   plugins.register(new JiraPlugin(() => {
@@ -1228,6 +1245,16 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     logger?.error({ err: serializeError(error), ...details }, "session background operation failed");
   });
   const workspaceCommands = new WorkspaceCommandService(sessions, workspace);
+  forgeSettings = new ForgeSettingsService(configService);
+  const settingsForForge = forgeSettings;
+  forge = new ForgeWorkflowService({
+    settings: () => settingsForForge.settings(),
+    provider: (repository, role, signal) => settingsForForge.provider(repository, role, signal),
+    runtime: new ForgeRuntime({ sessions, workspaceCommands, workspace, rulesSkills, pathPolicy, dataDir: config.dataDir }),
+    store: new ForgeWorkflowStore(pluginData),
+    reports: new ForgeWorkerReports(config.dataDir),
+    notify: (title, body) => { notifications.send({ title, body }); }
+  });
   rulesSkills.onChange(() => {
     void (async () => {
       await sessions?.refreshRuntimeIndicators();
@@ -1272,8 +1299,9 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   sessions.setTriggerRegistry(triggers);
   jiraPolling = new JiraPollingService(jira, pluginData, () => triggers);
   jiraPolling.start();
+  forge.start();
   automation = createAutomationService(automationRepository, { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config);
-  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, pluginContributionsReady, codexStateSources };
+  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, pluginContributionsReady, codexStateSources };
 }
 
 function isStreamingHookRequest(request: FastifyRequest<{ Querystring: { stream?: string } }>): boolean {
