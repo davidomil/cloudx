@@ -210,9 +210,9 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     }
     const requestOwnerShutdown = settleDisposers([
       () => services.documentationIngestQueue?.dispose(),
-      () => services.voice.dispose?.(),
-      () => services.codexStateSources?.dispose()
+      () => services.voice.dispose?.()
     ]);
+    const sourceShutdown = settleDisposers([() => services.codexStateSources?.dispose()]);
     const producerShutdown = settleDisposers([
       () => services.jiraPolling?.dispose(),
       () => services.sessions.dispose?.()
@@ -234,6 +234,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       automationFailures.push(...await settleDisposers([() => services.automation?.dispose()]));
       failures.push(...automationFailures);
       failures.push(...await settleDisposers([() => disposePersistenceNotifications()]));
+      failures.push(...await sourceShutdown);
       if (failures.length > 0) {
         throw new AggregateError(failures, "One or more server services failed to stop.");
       }

@@ -75,7 +75,7 @@ describe("buildServer", () => {
     } finally { await app.close(); await fs.rm(root, { recursive: true, force: true }); }
   });
 
-  it("cancels pending source inventory during server shutdown and closes its opened handle once", async () => {
+  it("cancels automation before held source cleanup and aggregates its bounded failure once", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-source-shutdown-"));
     const config = testConfig(root);
     const home = path.join(root, "home");
@@ -97,17 +97,47 @@ describe("buildServer", () => {
     const services = buildServices(config);
     services.codexStateSources = sources;
     await services.pluginContributionsReady;
+    const begin = vi.spyOn(services.automation!, "beginShutdown");
+    const disposeAutomation = vi.spyOn(services.automation!, "dispose");
+    const disposeSources = vi.spyOn(sources, "dispose");
+    const notifications = vi.fn();
+    vi.spyOn(services.workspace!, "onPersistenceStatusChange").mockReturnValue(notifications);
     const app = await buildServer(config, services);
     const response = app.inject({ method: "GET", url: "/api/codex/state-sources" });
+    let closeResult: unknown;
+    let closing: Promise<void> | undefined;
     try {
       await entered;
-      const closing = app.close();
-      release();
-      await closing;
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      closing = app.close().catch((error: unknown) => { closeResult = error; });
+      const repeated = app.close().catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(0);
       expect((await response).statusCode).toBe(503);
-      expect(closes).toBe(1);
+      await vi.waitFor(() => expect(disposeAutomation).toHaveBeenCalledTimes(1));
+      // Composition begins once; the real dispose also calls its idempotent begin.
+      expect(begin.mock.invocationCallOrder.filter((order) => order < disposeAutomation.mock.invocationCallOrder[0]!)).toHaveLength(1);
+      expect(begin).toHaveBeenCalledTimes(2);
+      expect(disposeSources).toHaveBeenCalledTimes(1);
+      expect(closes).toBe(0);
+      expect(closeResult).toBeUndefined();
+      expect(notifications).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(30_000);
+      await closing;
+      await repeated;
+      expect(closeResult).toBeInstanceOf(AggregateError);
+      expect((closeResult as AggregateError).errors).toEqual([expect.objectContaining({ message: expect.stringMatching(/source cleanup incomplete/i) })]);
+      expect(closes).toBe(0);
+      release();
+      await vi.waitFor(() => expect(closes).toBe(1));
       await expect(sources.list()).rejects.toThrow(/cancelled/);
-    } finally { release(); await app.close(); await fs.rm(root, { recursive: true, force: true }); }
+    } finally {
+      release();
+      vi.useRealTimers();
+      await closing;
+      await app.close().catch(() => undefined);
+      await sources.dispose().catch(() => undefined);
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
   it("wires the worktree manager to the configured allowed roots", async () => {
     const allowedRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-worktree-composition-"));

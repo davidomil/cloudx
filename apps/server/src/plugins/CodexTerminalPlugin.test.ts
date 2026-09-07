@@ -83,6 +83,71 @@ const tab: WorkspaceTab = {
 };
 
 describe("CodexTerminalPlugin", () => {
+  it.each(["config", "binding"])("settles a launch deadline while %s open is held, without later writes or spawn", async (stage) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-held-launch-"));
+    const home = path.join(root, "home");
+    const data = path.join(root, "data");
+    await seedImagegenSkill(home);
+    const configPath = path.join(await fs.realpath(home), "config.toml");
+    const sourceConfig = 'model_provider = "openai"\nmodel_reasoning_effort = "xhigh"\n';
+    await fs.writeFile(configPath, sourceConfig);
+    vi.stubEnv("CODEX_HOME", home);
+    let enter!: () => void;
+    const entered = new Promise<void>((resolve) => { enter = resolve; });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let held = false;
+    let closed = 0;
+    const write = vi.fn();
+    const rename = vi.fn(fs.rename);
+    const mkdir = vi.fn(fs.mkdir);
+    const sources = new CodexStateSources(data, { CODEX_HOME: home }, { fs: { ...fs, rename, mkdir: mkdir as typeof fs.mkdir, open: async (...args: Parameters<typeof fs.open>) => {
+      const handle = await fs.open(...args);
+      if ((stage === "config" && args[0] === configPath) || (stage === "binding" && String(args[0]).includes(".cloudx-binding-"))) {
+        const close = handle.close.bind(handle);
+        const writeFile = handle.writeFile.bind(handle);
+        handle.close = async () => { closed += 1; await close(); };
+        handle.writeFile = async (...values: Parameters<typeof handle.writeFile>) => { write(); return writeFile(...values); };
+        held = true;
+        enter();
+        await gate;
+        held = false;
+      }
+      return handle;
+    } } });
+    const factory = new CapturingFactory();
+    const plugin = new CodexTerminalPlugin(factory, DEFAULT_TERMINAL_REPLAY_BYTES, data, sources);
+    vi.useFakeTimers();
+    let outcome: string | undefined;
+    const creation = plugin.createSession({ tab, cwd: root, controls: { setTabIndicator: () => undefined, closeTab: () => undefined } }).then(() => { outcome = "accepted"; }, (error: Error) => { outcome = error.message; });
+    try {
+      await entered;
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(outcome).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(outcome).toMatch(/cancelled or timed out/);
+      expect(held).toBe(true);
+      const directories = mkdir.mock.calls.length;
+      release();
+      await creation;
+      await sources.dispose();
+      expect(closed).toBe(1);
+      expect(write).not.toHaveBeenCalled();
+      expect(rename).not.toHaveBeenCalled();
+      expect(mkdir).toHaveBeenCalledTimes(directories);
+      expect(factory.spawns).toBe(0);
+      expect(await fs.readFile(configPath, "utf8")).toBe(sourceConfig);
+      if (stage === "binding") expect(await fs.readdir(sources.viewPath(tab.id))).toEqual([]);
+      else await expect(fs.stat(sources.viewPath(tab.id))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      release();
+      await creation;
+      await sources.dispose().catch(() => undefined);
+      vi.useRealTimers();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   afterEach(() => {
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
@@ -419,16 +484,14 @@ describe("CodexTerminalPlugin", () => {
     await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "sessions", "2026", "05", "15", "rollout-session.jsonl"), "utf8")).resolves.toBe("session\n");
   });
 
-  it("launches the default model from the generated home and preserves base preferences", async () => {
+  it.each([undefined, "gpt-5.3-codex"])("projects the default or explicit model %j and valid provider/effort preferences through the factory", async (model) => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-default-model-"));
     const codexHome = path.join(root, "base");
     await seedImagegenSkill(codexHome);
     const sourceConfig = [
+      ...(model ? [`model = "${model}"`] : []),
       'model_reasoning_effort = "xhigh"',
       'model_provider = "openai"',
-      'profile = "project"',
-      '[profiles.project]',
-      'model = "gpt-5.3-codex"',
       '[tui]',
       'animations = false',
     ].join("\n");
@@ -443,13 +506,29 @@ describe("CodexTerminalPlugin", () => {
       const generated = parse(await fs.readFile(path.join(factory.env!.CODEX_HOME!, "config.toml"), "utf8"));
       expect(generated).toMatchObject({
         ...parse(sourceConfig),
-        model: "gpt-6-astra",
+        model: model ?? "gpt-6-astra",
         model_reasoning_effort: "xhigh",
         features: { apps: false, memories: false, plugins: false },
       });
-      expect(factory.args?.join(" ")).not.toMatch(/--model|(?:^| )-m(?: |$)/u);
+      // CapturingFactory proves projection, not native loading or model availability.
+      expect(factory.args?.join(" ")).not.toMatch(/--profile|--model|(?:^| )-m(?: |$)/u);
       await expect(fs.readFile(path.join(codexHome, "config.toml"), "utf8")).resolves.toBe(sourceConfig);
-      expect(factory.process?.killed).toBe(false);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves a legacy profile selector in projection only, without claiming native acceptance", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-profile-projection-"));
+    const codexHome = path.join(root, "base");
+    await seedImagegenSkill(codexHome);
+    const source = 'profile = "project"\n[profiles.project]\nmodel = "gpt-5.3-codex"\n';
+    await fs.writeFile(path.join(codexHome, "config.toml"), source);
+    try {
+      const launch = await materializeCodexTemplate(undefined, { CODEX_HOME: codexHome }, { dataDir: path.join(root, "data"), tabId: "legacy-selector" });
+      expect(parse(await fs.readFile(path.join(launch.overlay!.codexHome, "config.toml"), "utf8"))).toMatchObject(parse(source));
+      expect(launch.args.join(" ")).not.toContain("--profile");
+      expect(await fs.readFile(path.join(codexHome, "config.toml"), "utf8")).toBe(source);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }

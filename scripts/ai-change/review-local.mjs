@@ -650,6 +650,8 @@ class LocalGitReadContext {
         for (const attribute of conversionAttributes) {
           if (fields[offset] !== filename || fields[offset + 1] !== attribute)
             throw new Error("Malformed Git conversion attribute coverage.");
+          if (attribute === "ident" && fields[offset + 2] === "set")
+            throw new Error("Active Git ident conversion is unsupported.");
           offset += 3;
         }
       }

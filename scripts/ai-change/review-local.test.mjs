@@ -286,11 +286,13 @@ async function realFixture({
   paths = ["README.md"],
   extraRoles = [],
   attributes = "worktree",
+  ident = false,
 } = {}) {
   const f = await fixture(paths, extraRoles);
   const home = path.join(f.directory, "home");
   const bin = path.join(f.directory, "bin");
   const system = path.join(f.directory, "system.gitconfig");
+  const convertingMarker = path.join(f.directory, "converting-read");
   await fs.mkdir(path.join(home, ".config/git"), { recursive: true });
   await fs.mkdir(bin);
   await fs.writeFile(system, "");
@@ -299,7 +301,7 @@ async function realFixture({
   }).stdout.trim();
   await fs.writeFile(
     path.join(bin, "git"),
-    `#!/bin/sh\nexport GIT_CONFIG_SYSTEM=${shellQuote(system)}\nexec ${shellQuote(executable)} "$@"\n`,
+    `#!/bin/sh\nexport GIT_CONFIG_SYSTEM=${shellQuote(system)}\nfor argument do\n if [ "$argument" = diff ]; then printf 'diff\\n' >> ${shellQuote(convertingMarker)}; fi\ndone\nexec ${shellQuote(executable)} "$@"\n`,
     { mode: 0o700 },
   );
   const env = {
@@ -393,6 +395,13 @@ async function realFixture({
   if (["worktree", "nested", "index"].includes(attributes))
     await fs.writeFile(path.join(f.root, attrFile), rule);
   git(["init", "--quiet"]);
+  if (ident) {
+    await fs.writeFile(
+      path.join(f.root, ".git/info/attributes"),
+      "AGENTS.md ident\n",
+    );
+    await fs.writeFile(path.join(f.root, "AGENTS.md"), "$Id: baseline $\n");
+  }
   git(["config", "user.name", "Local review fixture"]);
   git(["config", "user.email", "fixture@example.invalid"]);
   git([
@@ -463,6 +472,9 @@ async function realFixture({
   // Command outcomes are controlled fixture evidence; digest acquisition is real
   // production Git and filesystem work. This is not canonical verification.
   await refresh();
+  await fs.unlink(convertingMarker).catch((error) => {
+    if (error.code !== "ENOENT") throw error;
+  });
   const runCli = (printSubject = true, environmentOverrides = {}) =>
     spawnSync(
       process.execPath,
@@ -504,6 +516,7 @@ async function realFixture({
     dependencies,
     home,
     system,
+    convertingMarker,
     env,
     refresh,
     runCli,
@@ -826,6 +839,80 @@ describe("real conversion admission and ordinary handoff", () => {
 });
 
 describe("conversion snapshot bounds and persistent freshness", () => {
+  it("rejects stable active ident before converting ordinary and both real CLI reads", async () => {
+    const f = await realFixture({ ident: true });
+    const target = path.join(f.root, "AGENTS.md");
+    const bytes = await fs.readFile(target);
+    const normalized = f.git(["hash-object", "--path=AGENTS.md", "AGENTS.md"]);
+    const evidenceFiles = [
+      f.options.plan,
+      f.options.planReview,
+      f.options.implementation,
+      f.options.verification,
+      ...f.options.reviews,
+    ];
+    const snapshot = async () => ({
+      head: f.git(["rev-parse", "HEAD"]),
+      index: sha(await fs.readFile(path.join(f.root, ".git/index"))),
+      config: sha(
+        f.git([
+          "config",
+          "--null",
+          "--list",
+          "--show-origin",
+          "--show-scope",
+          "--includes",
+        ]),
+      ),
+      attributes: sha(f.git(["check-attr", "-z", "--all", "--", "AGENTS.md"])),
+      evidence: await Promise.all(
+        evidenceFiles.map(async (filename) => sha(await fs.readFile(filename))),
+      ),
+    });
+    const before = await snapshot();
+    await fs.writeFile(target, "$Id: protected expansion changed $\n");
+    const changed = await fs.readFile(target);
+    expect(sha(changed)).not.toBe(sha(bytes));
+    expect(f.git(["hash-object", "--path=AGENTS.md", "AGENTS.md"])).toBe(
+      normalized,
+    );
+    expect(f.git(["diff", "--", "AGENTS.md"])).toBe("");
+    expect(
+      await f.verifier.calculateWorktreeDigest({ processRunner: f.gitRunner }),
+    ).toBe(f.verification.tree_sha256_after);
+    expect(await snapshot()).toEqual(before);
+    await fs.unlink(f.convertingMarker);
+    f.gitRunner.mockClear();
+    await expect(
+      (async () => {
+        const context = await f.production.createLocalGitReadContext(
+          f.dependencies,
+        );
+        return f.production.readLocalReviewScope({
+          repositoryRoot: f.root,
+          baseSha: f.plan.base_sha,
+          headSha: f.head,
+          gitRunner: context.gitRunner,
+        });
+      })(),
+    ).rejects.toThrow(/ident/i);
+    expect(
+      f.gitRunner.mock.calls.some(([planned]) => planned.args[0] === "diff"),
+    ).toBe(false);
+    for (const print of [true, false]) {
+      const result = f.runCli(print);
+      expect(result.status).not.toBe(0);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toMatch(/ident/i);
+      expect(result.stderr).not.toMatch(/protected expansion|baseline|Id:/);
+      await expect(fs.stat(f.convertingMarker)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    }
+    expect(await fs.readFile(target)).toEqual(changed);
+    expect(await snapshot()).toEqual(before);
+  });
+
   it.each(["worktree", "nested", "index", "info", "global", "default-global"])(
     "captures Git-resolved %s conversion attributes and detects changed values",
     async (attributes) => {
@@ -858,7 +945,7 @@ describe("conversion snapshot bounds and persistent freshness", () => {
                     ? "apps/server/src/.gitattributes"
                     : ".gitattributes",
                 );
-      await fs.writeFile(source, "* ident\n");
+      await fs.writeFile(source, "* text=auto\n");
       await expect(context.assertCurrent()).rejects.toThrow(
         /config.*attributes/i,
       );
@@ -875,20 +962,30 @@ describe("conversion snapshot bounds and persistent freshness", () => {
       "[attr]conversion ident -text\n*.md conversion\nREADME.md !ident text=auto\n",
     );
     const outputs = [];
-    const context = await f.production.createLocalGitReadContext({
+    const inputs = {
       repositoryRoot: f.root,
       gitRunner: async (planned) => {
         const result = await f.gitRunner(planned);
         if (planned.args[0] === "check-attr") outputs.push(result.stdout);
         return result;
       },
-    });
+    };
+    await expect(
+      f.production.createLocalGitReadContext(inputs),
+    ).rejects.toThrow(/ident/i);
     const records = Buffer.concat(outputs).toString();
     expect(records).toContain("README.md\0ident\0unspecified\0");
     expect(records).toContain("README.md\0text\0auto\0");
     expect(records).toContain("AGENTS.md\0ident\0set\0");
     expect(records).toContain("AGENTS.md\0text\0unset\0");
+    await fs.appendFile(
+      path.join(f.root, ".git/info/attributes"),
+      "*.md -ident\nREADME.md !ident text=auto\n",
+    );
+    const context = await f.production.createLocalGitReadContext(inputs);
     await context.assertCurrent();
+    const result = f.runCli();
+    expect(result.status, result.stderr).toBe(0);
   });
 
   it("excludes ambient config and XDG selectors identically in real CLI audit and reads", async () => {
@@ -1185,7 +1282,7 @@ describe("conversion snapshot bounds and persistent freshness", () => {
       if (variant === "attributes")
         await fs.appendFile(
           path.join(f.root, ".git/info/attributes"),
-          "*.md ident\n",
+          "*.md text=auto\n",
         );
     };
     if (moment === "before-read") {
@@ -1256,7 +1353,7 @@ describe("conversion snapshot bounds and persistent freshness", () => {
         if (planned.args[0] === "diff" && ++diffs === 1)
           await fs.appendFile(
             path.join(f.root, ".git/info/attributes"),
-            "*.md ident\n",
+            "*.md text=auto\n",
           );
         return result;
       },

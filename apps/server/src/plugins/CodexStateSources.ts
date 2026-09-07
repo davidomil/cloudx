@@ -42,7 +42,9 @@ export class CodexStateSources {
   readonly originalHome: string;
   private readonly dependencies: SourceDependencies;
   private readonly shutdown = new AbortController();
-  private readonly active = new Set<Promise<unknown>>();
+  private readonly active = new Set<Promise<void>>();
+  private disposal: Promise<void> | undefined;
+  private cleanupFailed = false;
 
   constructor(
     readonly dataDir: string,
@@ -78,30 +80,70 @@ export class CodexStateSources {
       if (combined.aborted || this.dependencies.now() - started >= DEADLINE_MS)
         throw new Error("Codex source operation cancelled or timed out.");
     };
+    let interrupt!: () => void;
+    const interrupted = new Promise<never>((_resolve, reject) => {
+      interrupt = () =>
+        reject(new Error("Codex source operation cancelled or timed out."));
+      combined.addEventListener("abort", interrupt, { once: true });
+      if (combined.aborted) interrupt();
+    });
     const operation = (async () => {
       check();
       const result = await task(check);
       check();
       return result;
     })();
-    this.active.add(operation);
+    // Caller settlement does not relinquish eventual handles or late failures.
+    const supervised = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.active.add(supervised);
+    void supervised.then(() => this.active.delete(supervised));
     try {
-      return await operation;
+      return await Promise.race([operation, interrupted]);
     } finally {
       clearTimeout(timer);
-      this.active.delete(operation);
+      combined.removeEventListener("abort", interrupt);
     }
   }
 
-  async dispose(): Promise<void> {
+  dispose(): Promise<void> {
+    if (this.disposal) return this.disposal;
     this.shutdown.abort();
-    await Promise.allSettled([...this.active]);
+    let timer: NodeJS.Timeout;
+    const incomplete = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(
+        () =>
+          reject(new Error("Codex source cleanup incomplete after deadline.")),
+        DEADLINE_MS,
+      );
+      timer.unref();
+    });
+    const quiescent = Promise.all([...this.active]).then(() => {
+      if (this.cleanupFailed) throw new Error("Codex source cleanup failed.");
+    });
+    this.disposal = Promise.race([quiescent, incomplete]).finally(() =>
+      clearTimeout(timer),
+    );
+    return this.disposal;
+  }
+
+  private async cleanup(task: () => Promise<unknown>): Promise<void> {
+    try {
+      await task();
+    } catch {
+      this.cleanupFailed = true;
+      throw new Error("Codex source cleanup failed.");
+    }
   }
 
   async list(signal?: AbortSignal): Promise<CodexStateSourcesResponse> {
     return this.work(signal, async (check) => {
       const shared = await this.resolveChecked("shared", check);
+      check();
       const root = await this.legacyRoot(check, true);
+      check();
       const sources: CodexStateSource[] = [
         {
           sourceId: "shared",
@@ -128,8 +170,9 @@ export class CodexStateSources {
             );
         }
       } finally {
-        await directory.close();
+        await this.cleanup(() => directory.close());
       }
+      check();
       let next = 0;
       let failure: unknown;
       await Promise.all(
@@ -151,6 +194,7 @@ export class CodexStateSources {
               );
               check();
               const stat = await this.directory(source.home, check);
+              check();
               if (!sameSource(source, stat))
                 throw new Error("Codex source changed during inventory.");
               const match = heading?.startsWith(
@@ -159,6 +203,9 @@ export class CodexStateSources {
                 ? /^## CloudX Template: ([^\r\n]{1,256})\r?\n/mu.exec(heading)
                 : null;
               const label = match?.[1]?.trim();
+              check();
+              const updated = await this.dependencies.fs.stat(source.home);
+              check();
               sources.push({
                 sourceId: source.sourceId,
                 kind: "legacy",
@@ -166,9 +213,7 @@ export class CodexStateSources {
                   label && !/[\p{Cc}]/u.test(label)
                     ? label
                     : "Retained session source",
-                updatedAt: new Date(
-                  (await this.dependencies.fs.stat(source.home)).mtimeMs,
-                ).toISOString(),
+                updatedAt: new Date(updated.mtimeMs).toISOString(),
               });
             }
           } catch (error) {
@@ -176,9 +221,11 @@ export class CodexStateSources {
           }
         }),
       );
+      check();
       if (failure) throw failure;
       await this.requireIdentity(root, check);
       await this.requireIdentity(shared, check);
+      check();
       sources.sort((a, b) =>
         a.kind === "shared"
           ? -1
@@ -204,6 +251,7 @@ export class CodexStateSources {
   ): Promise<string | undefined> {
     return this.work(signal, async (check) => {
       await this.requireIdentity(source, check);
+      check();
       const config = await this.readText(
         path.join(source.home, "config.toml"),
         1_048_576,
@@ -211,6 +259,7 @@ export class CodexStateSources {
         true,
       );
       await this.requireIdentity(source, check);
+      check();
       return config;
     });
   }
@@ -246,6 +295,7 @@ export class CodexStateSources {
       const view = this.viewPath(tabId);
       await this.requireIdentity(source, check);
       const existing = await this.bindingChecked(tabId, check);
+      check();
       if (existing) {
         if (!sameSource(existing, source))
           throw new Error(
@@ -274,16 +324,19 @@ export class CodexStateSources {
           await handle.writeFile(
             `${JSON.stringify({ version: 1, ...source })}\n`,
           );
+          check();
         } finally {
-          await handle.close();
+          await this.cleanup(() => handle.close());
         }
         check();
         await this.requireIdentity(source, check);
         check();
         await this.dependencies.fs.rename(staging, path.join(view, BINDING));
         owned = false;
+        check();
       } finally {
-        if (owned) await this.dependencies.fs.unlink(staging);
+        if (owned)
+          await this.cleanup(() => this.dependencies.fs.unlink(staging));
       }
       return view;
     });
@@ -315,6 +368,7 @@ export class CodexStateSources {
         (await this.readText(path.join(view, BINDING), 4096, check))!,
       );
     } catch {
+      check();
       throw new Error("Codex launch source binding is missing or invalid.");
     }
     if (!value || typeof value !== "object" || Array.isArray(value))
@@ -366,6 +420,7 @@ export class CodexStateSources {
       if (!stat) continue;
       check();
       const target = await this.dependencies.fs.realpath(candidate);
+      check();
       const targetStat = await this.dependencies.fs.stat(candidate);
       check();
       if (
@@ -409,6 +464,7 @@ export class CodexStateSources {
     );
     check();
     const after = await this.dependencies.fs.lstat(directory);
+    check();
     if (
       before.dev !== after.dev ||
       before.ino !== after.ino ||
@@ -441,6 +497,7 @@ export class CodexStateSources {
       check();
       return stat;
     } catch (error) {
+      check();
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
       throw error;
     }
@@ -454,6 +511,7 @@ export class CodexStateSources {
     try {
       await this.dependencies.fs.mkdir(target, { mode: 0o700 });
     } catch (error) {
+      check();
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
     await this.directory(target, check);
@@ -474,6 +532,7 @@ export class CodexStateSources {
         constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
       );
     } catch (error) {
+      check();
       if (optional && (error as NodeJS.ErrnoException).code === "ENOENT")
         return undefined;
       throw error;
@@ -481,6 +540,7 @@ export class CodexStateSources {
     try {
       check();
       const before = await handle.stat();
+      check();
       if (!before.isFile() || before.uid !== this.dependencies.uid())
         throw new Error("Invalid Codex source metadata owner or type.");
       if (!prefix && before.size > cap)
@@ -495,12 +555,15 @@ export class CodexStateSources {
           buffer.length - offset,
           offset,
         );
+        check();
         if (!bytesRead) break;
         offset += bytesRead;
       }
       check();
       const after = await handle.stat();
+      check();
       const named = await this.dependencies.fs.lstat(target);
+      check();
       if (
         before.dev !== named.dev ||
         before.ino !== named.ino ||
@@ -515,7 +578,7 @@ export class CodexStateSources {
         { stream: prefix && before.size > cap },
       );
     } finally {
-      await handle.close();
+      await this.cleanup(() => handle.close());
     }
   }
 }

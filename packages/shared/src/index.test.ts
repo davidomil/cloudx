@@ -31,8 +31,15 @@ describe("parseCodexStateSourcesResponse", () => {
     expect(parseCodexStateSourcesResponse({ sources })).toEqual({ sources });
     expect(parseCodexStateSourcesResponse({ sources: [] })).toEqual({ sources: [] });
   });
-  it("rejects malformed, extra, duplicate and over-cap descriptors", () => {
-    for (const value of [null, {}, { sources: [], home: "/secret" }, { sources: [shared, shared] }, { sources: [{ ...shared, home: "/secret" }] }, { sources: [{ ...shared, label: "x".repeat(257) }] }, { sources: [{ ...shared, updatedAt: "yesterday" }] }, { sources: [{ ...shared, updatedAt: "2026-02-31T00:00:00.000Z" }] }, { sources: [{ ...shared, kind: "legacy" }] }, { sources: [{ ...shared, sourceId: "legacy:Li4" }] }, { sources: Array(514).fill(shared) }]) {
+  it("accepts exactly 513 distinct owners and rejects only the 514th at the cap", () => {
+    const legacy = Array.from({ length: 513 }, (_, index) => ({ sourceId: `legacy:${btoa(`owner-${index}`).replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/u, "")}`, kind: "legacy", label: "Retained source", updatedAt: new Date(0).toISOString() }));
+    const sources = [shared, ...legacy.slice(0, 512)];
+    expect(new Set([...sources, legacy[512]!].map((source) => source.sourceId)).size).toBe(514);
+    expect(parseCodexStateSourcesResponse({ sources })).toEqual({ sources });
+    expect(() => parseCodexStateSourcesResponse({ sources: [...sources, legacy[512]!] })).toThrow();
+  });
+  it("rejects malformed, extra and duplicate descriptors independently of the cap", () => {
+    for (const value of [null, {}, { sources: [], home: "/secret" }, { sources: [shared, shared] }, { sources: [{ ...shared, home: "/secret" }] }, { sources: [{ ...shared, label: "x".repeat(257) }] }, { sources: [{ ...shared, updatedAt: "yesterday" }] }, { sources: [{ ...shared, updatedAt: "2026-02-31T00:00:00.000Z" }] }, { sources: [{ ...shared, kind: "legacy" }] }, { sources: [{ ...shared, sourceId: "legacy:Li4" }] }]) {
       expect(() => parseCodexStateSourcesResponse(value)).toThrow();
     }
   });
