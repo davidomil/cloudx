@@ -75,8 +75,8 @@ names, and dashboard tokens.
 - `debug_tooling/documentation-validation`: optional validation runner for the
   documentation archive.
 - `containers/ci`: credential-free no-network verifier image.
-- `docs/AI_CHANGE_PROCESS.md`: repository state, artifact, review, and merge
-  contract consumed by external AI automation.
+- `docs/AI_CHANGE_PROCESS.md`: AI-assisted contribution guidance and optional
+  machine-managed automation interfaces.
 - `docs/MEMORY_PLUGIN_GUIDE.md`: source-grounded documentation archive guide.
 - `docs/MOTIVATION.md`: why this exists.
 - `docs/WEB_APP_PLAN.md`: product and architecture plan.

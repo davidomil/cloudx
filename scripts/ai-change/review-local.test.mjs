@@ -69,7 +69,7 @@ async function fixture(paths = ["README.md"], extraRoles = []) {
   const classification = classifyChange(policy, { type: "refactor", paths });
   const roles = [...new Set([...classification.skills, ...extraRoles])].sort();
   const skillVersions = {};
-  for (const role of ["plan-change", ...roles]) {
+  for (const role of roles) {
     const filename = path.join(root, ".agents/skills", role, "SKILL.md");
     await fs.mkdir(path.dirname(filename), { recursive: true });
     await fs.writeFile(filename, `Trusted fixture skill ${role}\n`);
@@ -1393,6 +1393,43 @@ describe("conversion snapshot bounds and persistent freshness", () => {
 });
 
 describe("local clean review admission", () => {
+  it("uses protocol review roles without requiring generic workflow skills", async () => {
+    const f = await fixture();
+    expect(await fs.readdir(path.join(f.root, ".agents/skills"))).toEqual(
+      f.roles,
+    );
+    expect(Object.keys(f.plan.skill_versions)).toEqual(f.roles);
+    expect(f.planReview.reviewer_role).toBe("review-plan");
+
+    const result = validateArtifact(
+      "review",
+      JSON.parse(await reviewLocal(f.options, f.dependencies)),
+    );
+
+    expect(result).toMatchObject({
+      reviewer_role: "review-change",
+      verdict: "clean",
+      subject_sha256: f.options.subjectSha256,
+    });
+  });
+
+  it("rejects evidence that still declares a removed workflow skill", async () => {
+    const f = await fixture();
+    f.plan.skill_versions["plan-change"] = sha("removed skill");
+    const planDigest = sha(json(f.plan));
+    f.planReview.subject_sha256 = planDigest;
+    f.implementation.plan_sha256 = planDigest;
+    await f.write("plan", f.plan);
+    await f.write("planReview", f.planReview);
+    await f.write("implementation", f.implementation);
+    await f.refreshReviews();
+
+    await expect(reviewLocal(f.options, f.dependencies)).rejects.toMatchObject({
+      code: "ENOENT",
+      path: path.join(f.root, ".agents/skills/plan-change/SKILL.md"),
+    });
+  });
+
   it("LOCAL-REVIEW-GIT-FILTER-001 rejects a configured helper before any diff", async () => {
     const f = await fixture();
     const runner = f.dependencies.gitRunner;

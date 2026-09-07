@@ -1,37 +1,13 @@
-## Change Contract
+## Summary
 
-Change-Type: <!-- bug | feature | refactor | test | docs | chore -->
+Describe the behavior changed and why.
 
-AI-Run-ID: <!-- run id, or "human" -->
+## Verification
 
-Base-SHA: <!-- 40-character base commit -->
+List tests or checks actually run, their outcomes, and any gaps.
+Include browser or supported-platform evidence when relevant.
 
-## Behavior
+## Notes
 
-Describe the user-visible or operational behavior changed by this pull request.
-
-## Architecture
-
-- Owner and production seam:
-- Existing anchors followed:
-- Cross-boundary contracts affected:
-
-## Proof
-
-- Revert-failing test:
-- Negative and failure cases:
-- Commands executed:
-- Browser screenshots or artifacts, when visible behavior changed:
-
-## Independent Review
-
-- Plan review artifact:
-- Implementation review artifact:
-- Unresolved findings: none
-
-## Checklist
-
-- [ ] The changed paths match the declared type and architecture owner.
-- [ ] Verification ran without modifying the worktree.
-- [ ] Review evidence is bound to this exact head SHA.
-- [ ] Governance or security-sensitive changes have maintainer approval.
+Mention significant design decisions, contract breaks, operational impact,
+or unresolved risks. Omit this section when it adds nothing.

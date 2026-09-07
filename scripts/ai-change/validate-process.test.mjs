@@ -12,15 +12,12 @@ import {
   GATE_B_PLANNING_HEAD_SHA,
   GATE_B_POLICY_SHA256,
   GATE_B_REVIEW_ROLES,
-  validateAttendedCommitContractSources,
   validateGateBArtifactBundle,
-  validateGateBRemediationCycleSources,
-  validateGateBRoutingSources,
-  validateNormalReviewConsumerSources,
   validatePolicyReferences,
   validateProcess,
   validatePublicationContract,
   validatePublicationContractSources,
+  validateSkills,
   validateVerificationCommands,
   validateVerifierConsumerSources,
   validateVerifierBuildContext,
@@ -28,393 +25,121 @@ import {
 } from "./validate-process.mjs";
 import { displayCommand, verificationPlan, verifyChange } from "./verify.mjs";
 
-const gateBReferenceCases = [
-  [
-    "AGENTS.md",
-    "root.md",
-    "8e09cb951b1b6bc5b1519a5d6be920280d8377b8bf7dbcb410ab8bbf36305d64",
-  ],
-  [
-    ".agents/skills/change-orchestrator/SKILL.md",
-    "orchestrator.md",
-    "03025f676c652185bbf4130d71c760bb36f987ef5e9c02d76d6558986fc372c4",
-  ],
-  [
-    ".agents/skills/implement-change/SKILL.md",
-    "implementation.md",
-    "defc313a989765ef8dac86071e18992299289db65678c1876a88e1712a56f320",
-  ],
-  [
-    ".agents/skills/verify-change/SKILL.md",
-    "verification.md",
-    "23f87ea64ae4a3a670f9483cd4a5b9dae41ef2443813f590f46575425f7e53d9",
-  ],
-  [
-    "docs/AI_CHANGE_PROCESS.md",
-    "process.md",
-    "64ffb9e03662ce1fa88db8b80d2f9db44b473843ea1a1274d10c47381322da9d",
-  ],
-];
-const gateBReferenceRoot =
-  ".agents/skills/change-orchestrator/references/gate-b";
-
-const normalConsumerPaths = {
-  root: "AGENTS.md",
-  orchestrator: ".agents/skills/change-orchestrator/SKILL.md",
-  process: "docs/AI_CHANGE_PROCESS.md",
-  reviewChange: ".agents/skills/review-change/SKILL.md",
-};
-const normalRoutingBlock =
-  /<!-- CLOUDX-NORMAL-REVIEW-ROUTING-V1:BEGIN -->[\s\S]*?<!-- CLOUDX-NORMAL-REVIEW-ROUTING-V1:END -->/u;
-
-describe("ordinary independent versus optional local review routing", () => {
-  it("requires direct ordinary evidence inside the process route even when displaced words remain", () => {
-    const sources = Object.fromEntries(
-      Object.entries(normalConsumerPaths).map(([role, file]) => [
-        role,
-        fs.readFileSync(file, "utf8"),
-      ]),
+describe("repository guidance structure", () => {
+  it("accepts concise guidance without prescribed routing or frozen references", async () => {
+    const originalRead = fs.readFileSync;
+    const skillsRoot = `${path.resolve(".agents/skills")}${path.sep}`;
+    const processDocuments = new Set(
+      ["docs/AI_CHANGE_PROCESS.md", "docs/architecture/testing-map.md"].map(
+        (file) => path.resolve(file),
+      ),
     );
-    const source = sources.process.replace(/\s+/gu, " ");
-    for (const clause of [
-      "Directly validate raw plan, plan-review, implementation and verification with `validateArtifact` and the existing schemas.",
-      "`implementation.plan_sha256 = SHA256(raw plan)`",
-      "zero deviations and exactly one nonduplicate claim-evidence entry for every plan claim",
-      '`verificationPlan("full").map(displayCommand)`: all unchanged nine commands, in order',
-      "the current worktree digest equal to the full verification's attested tree",
-      "each an explicit literal `plan.allowed_paths` entry and not forbidden",
-      "the sorted unique union of current classification skills and accepted-plan classification skills",
-      "An index snapshot change invalidates the handoff even if HEAD/worktree match.",
-      "`validateAreaReviewFanout({ outputs, selectedRoles, identity })`",
-      "Preserve exact role coverage, findings and the union of durable tags",
-      "effective Git config/attributes, current policy/skill bytes and every supplied raw evidence byte",
-    ]) {
-      expect(source).toContain(clause);
-      const mutated =
-        source.replace(clause, "removed ordinary evidence") + `\n${clause}\n`;
+    const readSpy = vi
+      .spyOn(fs, "readFileSync")
+      .mockImplementation((input, ...args) => {
+        const file = typeof input === "string" ? path.resolve(input) : "";
+        let replacement;
+        if (file.includes("/references/gate-b/")) {
+          throw new Error("Retired guidance references are unavailable.");
+        }
+        if (file.startsWith(skillsRoot) && path.basename(file) === "SKILL.md") {
+          const name = path.basename(path.dirname(file));
+          replacement = `---\nname: ${name}\ndescription: Repository context and coding standards.\n---\n\n# Context\n\nPreserve module boundaries and support behavior claims with evidence.\n`;
+        } else if (
+          path.basename(file) === "AGENTS.md" ||
+          processDocuments.has(file)
+        ) {
+          replacement = "# CloudX\n\nLocal-first workstation software.\n";
+        }
+        if (replacement !== undefined) {
+          return args[0] === "utf8" ? replacement : Buffer.from(replacement);
+        }
+        return originalRead(input, ...args);
+      });
+    try {
+      const result = await validateProcess();
+
+      expect(result.skills).toContain("review-agent-policy");
       expect(
-        validateNormalReviewConsumerSources(
-          { ...sources, process: mutated },
-          [],
+        readSpy.mock.calls.some(([file]) =>
+          String(file).includes("/references/gate-b/"),
         ),
-      ).toContainEqual(
-        expect.stringContaining(
-          "Normal review routing 'process' must preserve ordered ordinary evidence",
-        ),
-      );
+      ).toBe(false);
+    } finally {
+      readSpy.mockRestore();
     }
   });
 
-  it.each(Object.entries(normalConsumerPaths))(
-    "rejects route regressions in %s independently of source commitments",
-    (name) => {
-      const sources = Object.fromEntries(
-        Object.entries(normalConsumerPaths).map(([role, file]) => [
-          role,
-          fs.readFileSync(file, "utf8"),
-        ]),
-      );
-      expect(validateNormalReviewConsumerSources(sources, [])).toEqual([]);
-      const source = sources[name];
-      const block = source.match(normalRoutingBlock)?.[0];
-      expect(block, `${name}: bounded ordinary/optional route`).toBeDefined();
-      const normalized = block.replace(/\s+/gu, " ");
-      const replacements = [
-        [
-          "Ordinary independent review does not invoke or require successful `--print-subject` or clean aggregation.",
-          "For local dispatch, obtain the validated composite subject with `--print-subject` after full verification.",
-        ],
-        [
-          "independently computes SHA-256",
-          "uses the shortcut to obtain SHA-256",
-        ],
-        ["<sha256(raw verification)>\\n", ""],
-        ["`run_id: verification.run_id`", "`run_id: implementation.run_id`"],
-        [
-          "before verification/handoff and compare it at aggregate acceptance",
-          "only after review",
-        ],
-        [
-          "different index-only bytes remain an explicit verification gap",
-          "different index-only bytes are verified",
-        ],
-        [
-          "exact observed/declaration/literal allowed scope",
-          "caller-declared scope",
-        ],
-        [
-          "a different fresh `$review-change` context for ordinary aggregate judgment",
-          "clean aggregation for ordinary aggregate judgment",
-        ],
-        [
-          "rejection neither retries nor automatically switches routes",
-          "rejection automatically switches routes",
-        ],
-        [
-          "Both routes retain full verification, raw evidence joins, human review and freshness",
-          "Ordinary review may omit prerequisite evidence",
-        ],
-      ];
-      const mutations = [
-        source.replace(block, ""),
-        `${source}\n${block}\n`,
-        ...replacements.map(([from, to]) => {
-          expect(normalized, `${name}: mutation must reach routing`).toContain(
-            from,
-          );
-          // Keep every original word elsewhere: keyword presence is insufficient.
-          return (
-            source.replace(block, normalized.replace(from, to)) + `\n${from}\n`
-          );
-        }),
-      ];
-      for (const mutated of mutations) {
-        const issues = validateNormalReviewConsumerSources(
-          { ...sources, [name]: mutated },
-          [],
-        );
-        expect(issues).toContainEqual(
-          expect.stringContaining(`Normal review routing '${name}'`),
-        );
-        expect(issues.join("\n")).not.toMatch(/source-byte commitment/u);
-      }
-    },
-  );
+  it.each([
+    ["concise context", "Preserve the module's state invariants.", []],
+    [
+      "valid local reference and command",
+      "Read [context](../../../docs/context.md) and run `npm run test`.",
+      [],
+    ],
+    [
+      "missing repository path",
+      "Read `docs/missing.md`.",
+      ["Skill 'example' references missing repository path 'docs/missing.md'."],
+    ],
+    [
+      "missing Markdown link",
+      "Read [context](../../../docs/missing.md).",
+      ["Skill 'example' references missing repository path 'docs/missing.md'."],
+    ],
+    [
+      "link outside the repository",
+      "Read [context](../../../../outside.md).",
+      [
+        "Skill 'example' link '../../../../outside.md' must resolve inside the repository.",
+      ],
+    ],
+    [
+      "missing npm command",
+      "Run `npm run missing`.",
+      ["Skill 'example' references missing npm script 'missing'."],
+    ],
+  ])("checks %s", (_name, body, expectedIssues) => {
+    const root = guidanceFixture(body);
+    try {
+      const issues = [];
 
-  it.each(Object.entries(normalConsumerPaths))(
-    "reports the %s ordinary-route regression through production validateProcess",
-    async (name, file) => {
-      const originalRead = fs.readFileSync;
-      const absolute = path.resolve(file);
-      const source = originalRead(absolute, "utf8");
-      const block = source.match(normalRoutingBlock)?.[0];
-      expect(block).toBeDefined();
-      const mutated = source.replace(
-        block,
-        "For local dispatch, obtain the validated composite subject with `--print-subject` after full verification.",
-      );
-      const spy = vi
-        .spyOn(fs, "readFileSync")
-        .mockImplementation((input, ...args) => {
-          if (typeof input === "string" && path.resolve(input) === absolute) {
-            return args[0] === "utf8" ? mutated : Buffer.from(mutated);
-          }
-          return originalRead(input, ...args);
-        });
-      try {
-        await expect(validateProcess()).rejects.toThrow(
-          `Normal review routing '${name}'`,
-        );
-      } finally {
-        spy.mockRestore();
-      }
-    },
-  );
-});
-
-describe("conditional Gate-B reference routing", () => {
-  it("preserves all five complete frozen source bytes and halves ordinary entry loading", () => {
-    for (const [activePath, reference, digest] of gateBReferenceCases) {
-      const frozen = fs.readFileSync(`${gateBReferenceRoot}/${reference}`);
-      expect(createHash("sha256").update(frozen).digest("hex"), reference).toBe(
-        digest,
-      );
-      expect(fs.readFileSync(activePath, "utf8"), activePath).not.toContain(
-        "<!-- CLOUDX-PUBLICATION-CONTRACT-V1:BEGIN -->",
-      );
+      expect(validateSkills(root, issues)).toEqual(["example"]);
+      expect(issues).toEqual(expectedIssues);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
     }
-    expect(
-      fs.statSync("AGENTS.md").size +
-        fs.statSync(".agents/skills/change-orchestrator/SKILL.md").size,
-    ).toBeLessThanOrEqual(16503);
-    expect(validatePublicationContract(process.cwd(), [])).toEqual([]);
   });
 
-  it.each(gateBReferenceCases)(
-    "fails closed for absent, renamed, redirected and modified reference from %s",
-    (_active, reference) => {
-      for (const mutation of [
-        "missing",
-        "renamed",
-        "redirected",
-        "whitespace",
-        "invalid-utf8",
-      ]) {
-        const root = gateBRoutingFixture();
-        try {
-          const target = path.join(root, gateBReferenceRoot, reference);
-          if (mutation === "missing") fs.unlinkSync(target);
-          if (mutation === "renamed") fs.renameSync(target, `${target}.moved`);
-          if (mutation === "redirected") {
-            fs.renameSync(target, `${target}.moved`);
-            fs.symlinkSync(`${target}.moved`, target);
-          }
-          if (mutation === "whitespace") fs.appendFileSync(target, " \n");
-          if (mutation === "invalid-utf8")
-            fs.appendFileSync(target, Buffer.from([0xff]));
-          expect(
-            validatePublicationContract(root, []),
-            `${reference}: ${mutation}`,
-          ).not.toEqual([]);
-        } finally {
-          fs.rmSync(root, { recursive: true, force: true });
-        }
-      }
-    },
-  );
+  it.each([
+    ["missing frontmatter", "# Context\n", /must begin with YAML frontmatter/u],
+    [
+      "mismatched name",
+      "---\nname: other\ndescription: Module context.\n---\n",
+      /disagrees with frontmatter name/u,
+    ],
+    [
+      "empty description",
+      '---\nname: example\ndescription: ""\n---\n',
+      /non-empty frontmatter description/u,
+    ],
+  ])("rejects %s", (_name, source, expectedIssue) => {
+    const root = guidanceFixture("Module context.");
+    try {
+      fs.writeFileSync(
+        path.join(root, ".agents/skills/example/SKILL.md"),
+        source,
+      );
+      const issues = [];
 
-  it.each(gateBReferenceCases)(
-    "checks the complete active routing source %s",
-    (activePath, reference) => {
-      const source = fs.readFileSync(activePath, "utf8");
-      const block = source.match(
-        /<!-- CLOUDX-GATE-B-ROUTING-V1:BEGIN -->[\s\S]*?<!-- CLOUDX-GATE-B-ROUTING-V1:END -->/u,
-      )?.[0];
-      expect(block).toBeDefined();
-      const mutations = [
-        source.replace(block, ""),
-        `${source}\n${block}\n`,
-        source.replace(
-          "Only when the accepted task explicitly enters",
-          "Whenever a local task enters",
-        ),
-        source.replace(
-          `${gateBReferenceRoot}/${reference}`,
-          `${gateBReferenceRoot}/other.md`,
-        ),
-        ...[
-          "Run all selected reviews before the attended Gate-B amend.",
-          "A raw push is authorized for this local review.",
-          "Retry is permitted after publication failure.",
-          "Read CLOUDX_GATE_B_TOKEN during ordinary verification.",
-          "The orchestrator may update the protected branch.",
-          "Skip a required area review after a clean local aggregate.",
-          "The normal flow grants Gate-B authorization.",
-        ].map((instruction) => `${source}\n${instruction}\n`),
-      ];
-      for (const mutated of mutations) {
-        expect(mutated).not.toBe(source);
-        const root = gateBRoutingFixture();
-        try {
-          fs.writeFileSync(path.join(root, activePath), mutated);
-          expect(validatePublicationContract(root, []), activePath).not.toEqual(
-            [],
-          );
-        } finally {
-          fs.rmSync(root, { recursive: true, force: true });
-        }
-      }
-    },
-  );
+      validateSkills(root, issues);
 
-  it("rejects an oversized active entry and wrong routing bytes independently of frozen references", () => {
-    const sources = Object.fromEntries(
-      ["root", "orchestrator", "implement", "verifier", "process"].map(
-        (name, index) => [name, fs.readFileSync(gateBReferenceCases[index][0])],
-      ),
-    );
-    expect(validateGateBRoutingSources(sources, [])).toEqual([]);
-    expect(
-      validateGateBRoutingSources(
-        {
-          ...sources,
-          root: Buffer.concat([sources.root, Buffer.alloc(16504, 0x20)]),
-        },
-        [],
-      ),
-    ).toContainEqual(expect.stringMatching(/at most 16503 bytes/u));
-    expect(
-      validateGateBRoutingSources(
-        {
-          ...sources,
-          root: Buffer.concat([sources.root, Buffer.from([0xff])]),
-        },
-        [],
-      ),
-    ).toContainEqual(expect.stringMatching(/active source-byte commitment/u));
-    expect(validateGateBRoutingSources({}, [])).not.toEqual([]);
-  });
-
-  it("validates independent normal review and both composite-subject CLI consumers", () => {
-    const sources = {
-      root: fs.readFileSync("AGENTS.md", "utf8"),
-      orchestrator: fs.readFileSync(
-        ".agents/skills/change-orchestrator/SKILL.md",
-        "utf8",
-      ),
-      process: fs.readFileSync("docs/AI_CHANGE_PROCESS.md", "utf8"),
-      reviewChange: fs.readFileSync(
-        ".agents/skills/review-change/SKILL.md",
-        "utf8",
-      ),
-    };
-    expect(validateNormalReviewConsumerSources(sources, [])).toEqual([]);
-    for (const [name, source] of Object.entries(sources)) {
-      for (const phrase of [
-        "claims, production seams, callers and discriminating tests",
-        "union of current observed-path policy roles and accepted plan roles",
-        "verification.run_id",
-        "subject: implementation",
-      ]) {
-        const normalized = source.replace(/\s+/gu, " ");
-        const mutated = normalized.replaceAll(
-          phrase,
-          "removed required review contract",
-        );
-        expect(mutated).not.toBe(normalized);
-        expect(
-          validateNormalReviewConsumerSources(
-            { ...sources, [name]: mutated },
-            [],
-          ),
-          `${name}: ${phrase}`,
-        ).not.toEqual([]);
-      }
-    }
-    for (const name of ["orchestrator", "process"]) {
-      for (const argument of [
-        "--mode local",
-        "--plan-review <plan-review>",
-        "--verification <verification>",
-        "--print-subject",
-        "--subject-sha256 <digest>",
-        "--review <area-review>",
-        "cloudx-local-review-v1\\n",
-      ]) {
-        const mutated = sources[name].replaceAll(argument, "invalid");
-        expect(mutated).not.toBe(sources[name]);
-        expect(
-          validateNormalReviewConsumerSources(
-            { ...sources, [name]: mutated },
-            [],
-          ),
-        ).not.toEqual([]);
-      }
+      expect(issues).toContainEqual(expect.stringMatching(expectedIssue));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });
-
-function gateBRoutingFixture() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-gate-b-routing-"));
-  const paths = [
-    ...gateBReferenceCases.flatMap(([activePath, reference]) => [
-      activePath,
-      `${gateBReferenceRoot}/${reference}`,
-    ]),
-    ".agents/skills/ship-change/SKILL.md",
-    ".agents/skills/review-pr/SKILL.md",
-    ".agents/schemas/publication-authorization.schema.json",
-    "scripts/ai-change/publish-gate-b.mjs",
-    "scripts/ai-change/publish-gate-b.test.mjs",
-  ];
-  for (const relativePath of paths) {
-    fs.mkdirSync(path.dirname(path.join(root, relativePath)), {
-      recursive: true,
-    });
-    fs.copyFileSync(relativePath, path.join(root, relativePath));
-  }
-  return root;
-}
 
 describe("public repository AI process validation", () => {
   it("accepts the checked-in public policy, skills, schemas, and workflows", async () => {
@@ -425,6 +150,40 @@ describe("public repository AI process validation", () => {
     expect(result.schemas).toContain("review.schema.json");
     expect(result.policy_sha256).toMatch(/^[a-f0-9]{64}$/u);
   });
+
+  it("validates the publisher and authorization schema independently of guidance", () => {
+    expect(validatePublicationContract(process.cwd(), [])).toEqual([]);
+  });
+
+  it.each([
+    ".agents/schemas/publication-authorization.schema.json",
+    "scripts/ai-change/publish-gate-b.mjs",
+    "scripts/ai-change/publish-gate-b.test.mjs",
+  ])(
+    "rejects an absent or redirected publication source %s",
+    (relativePath) => {
+      for (const mutation of ["missing", "redirected"]) {
+        const root = publicationContractFixture();
+        try {
+          const target = path.join(root, relativePath);
+          if (mutation === "missing") {
+            fs.unlinkSync(target);
+          } else {
+            fs.renameSync(target, `${target}.moved`);
+            fs.symlinkSync(`${target}.moved`, target);
+          }
+
+          expect(validatePublicationContract(root, [])).toContainEqual(
+            expect.stringContaining(
+              `Publication contract source '${relativePath}'`,
+            ),
+          );
+        } finally {
+          fs.rmSync(root, { recursive: true, force: true });
+        }
+      }
+    },
+  );
 
   it("keeps every self-hosted model job out of the public workflows", () => {
     for (const name of ["ci.yml", "classify-pr.yml"]) {
@@ -580,7 +339,7 @@ jobs:
     ]);
   });
 
-  it("requires every tracked verifier consumer to use the silent plan-aware full entry", () => {
+  it("preserves package, public CI, and executable verifier contracts", () => {
     const sources = rawVerifierConsumerSources();
     expect(validateVerifierConsumerSources(sources, [])).toEqual([]);
 
@@ -597,32 +356,6 @@ jobs:
             "npm run verify:policy",
           ),
       ],
-      [
-        "root",
-        (value) =>
-          value.replaceAll("npm run --silent verify", "npm run verify"),
-      ],
-      [
-        "verifierSkill",
-        (value) =>
-          value.replace("npm run --silent verify", "npm --silent run verify"),
-      ],
-      [
-        "process",
-        (value) =>
-          value.replaceAll(
-            "npm run --silent verify",
-            "npm run --slient verify",
-          ),
-      ],
-      [
-        "testingMap",
-        (value) => value.replace("npm run --silent verify", "npm run verify"),
-      ],
-      ["root", (value) => value.replace(" -- --plan", "")],
-      ["verifierSkill", (value) => value.replace(" --base-sha", " --base")],
-      ["process", (value) => value.replaceAll(" --head-sha", " --head")],
-      ["testingMap", (value) => value.replace(" -- --plan", "")],
       [
         "verifier",
         (value) =>
@@ -654,605 +387,6 @@ jobs:
       ).not.toEqual([]);
     }
   });
-
-  it("requires every attended commit handoff to preserve the exact candidate boundary", () => {
-    const sources = rawPublicationContractSources();
-    expect(validateAttendedCommitContractSources(sources, [])).toEqual([]);
-
-    const cases = [
-      [
-        "root",
-        (value) =>
-          value.replace(
-            "216e6d739155aa1dc5bab11829f56869e6f494ff",
-            "0000000000000000000000000000000000000000",
-          ),
-      ],
-      ["orchestrator", (value) => value.replace("git add --", "git add -A")],
-      [
-        "process",
-        (value) =>
-          value.replace("implementation.changed_files", "implementation.files"),
-      ],
-      [
-        "implement",
-        (value) =>
-          value.replace(
-            "POLICY: harden Gate B publication boundary",
-            "POLICY: update Gate B",
-          ),
-      ],
-      ["root", (value) => value.replaceAll("118-path", "113-path")],
-      [
-        "orchestrator",
-        (value) =>
-          value.replace("credential-free environment", "ambient environment"),
-      ],
-      [
-        "process",
-        (value) => value.replace("fatal UTF-8 decoder", "UTF-8 decoder"),
-      ],
-      [
-        "root",
-        (value) =>
-          value.replace(
-            "`GIT_NO_REPLACE_OBJECTS=1` disables replacement refs",
-            "replacement refs may remain enabled",
-          ),
-      ],
-    ];
-    for (const [name, mutate] of cases) {
-      expect(
-        validateAttendedCommitContractSources(
-          { ...sources, [name]: mutate(sources[name]) },
-          [],
-        ),
-        name,
-      ).not.toEqual([]);
-    }
-  });
-
-  it("binds the attended candidate-tip-3 amend to exactly nine remediation paths", () => {
-    const sources = rawPublicationContractSources();
-    const paths = [
-      ".agents/skills/change-orchestrator/SKILL.md",
-      ".agents/skills/implement-change/SKILL.md",
-      ".agents/skills/verify-change/SKILL.md",
-      "AGENTS.md",
-      "docs/AI_CHANGE_PROCESS.md",
-      "docs/architecture/testing-map.md",
-      "scripts/ai-change/validate-process.mjs",
-      "scripts/ai-change/validate-process.test.mjs",
-      "scripts/ai-change/verify.test.mjs",
-    ];
-
-    expect(validateGateBRemediationCycleSources(sources, [])).toEqual([]);
-    for (const sourceName of ["root", "orchestrator", "process", "implement"]) {
-      for (const remediationPath of paths) {
-        expect(
-          sources[sourceName],
-          `${sourceName}: ${remediationPath}`,
-        ).toContain(`\`${remediationPath}\``);
-      }
-      expect(sources[sourceName], sourceName).not.toMatch(
-        /\bexact eleven(?:-path)?\b/iu,
-      );
-    }
-
-    const cases = [
-      [
-        "root",
-        (value) =>
-          value.replace("`.agents/skills/verify-change/SKILL.md`, ", ""),
-      ],
-      [
-        "orchestrator",
-        (value) =>
-          value.replace(
-            "`docs/architecture/testing-map.md`",
-            "`docs/architecture/unknown-map.md`",
-          ),
-      ],
-      [
-        "process",
-        (value) =>
-          value.replace(
-            "`scripts/ai-change/verify.test.mjs`.",
-            "`scripts/ai-change/verify.test.mjs`, `package.json`.",
-          ),
-      ],
-      [
-        "implement",
-        (value) =>
-          value.replace(
-            "`scripts/ai-change/validate-process.mjs`",
-            "`scripts/ai-change/validate-process.mjs`, `scripts/ai-change/validate-process.mjs`",
-          ),
-      ],
-      [
-        "root",
-        (value) =>
-          value.replace(
-            "exact nine remediation paths",
-            "exact eleven remediation paths",
-          ),
-      ],
-    ];
-    for (const [name, mutate] of cases) {
-      expect(
-        validateGateBRemediationCycleSources(
-          { ...sources, [name]: mutate(sources[name]) },
-          [],
-        ),
-        name,
-      ).not.toEqual([]);
-    }
-  });
-
-  it("requires a bounded pre-publication remediation cycle and attended same-parent amend", () => {
-    const sources = rawPublicationContractSources();
-    expect(validateGateBRemediationCycleSources(sources, [])).toEqual([]);
-
-    const cases = [
-      [
-        "orchestrator",
-        (value) =>
-          value.replace(
-            "at most three candidate tips",
-            "at most four candidate tips",
-          ),
-      ],
-      [
-        "root",
-        (value) =>
-          value.replace(
-            "counts as candidate tip 1",
-            "does not count toward the ceiling",
-          ),
-      ],
-      ["process", (value) => value.replace(/does not\s+reset/gu, "resets")],
-      [
-        "orchestrator",
-        (value) =>
-          value.replace(
-            "terminally to `blocked`",
-            "to another remediation cycle",
-          ),
-      ],
-      [
-        "root",
-        (value) =>
-          value.replace(
-            "Before authorization or publication begins",
-            "After authorization begins",
-          ),
-      ],
-      [
-        "process",
-        (value) =>
-          value.replaceAll("git commit --amend --no-edit", "git commit"),
-      ],
-      [
-        "orchestrator",
-        (value) =>
-          value.replace(
-            /clean tracked worktree\s+baseline/gu,
-            "tracked worktree",
-          ),
-      ],
-      [
-        "root",
-        (value) =>
-          value.replaceAll("exact nine remediation paths", "remediation paths"),
-      ],
-      ["process", (value) => value.replace("63-path", "61-path")],
-      [
-        "orchestrator",
-        (value) =>
-          value.replace(
-            "dd08cb93283abf5c1341ed3db13506da4f912423e11a51cf90ef8358404e0325",
-            "00".repeat(32),
-          ),
-      ],
-      [
-        "implement",
-        (value) =>
-          value.replace("git commit --amend --no-edit", "git commit --amend"),
-      ],
-    ];
-
-    for (const [name, mutate] of cases) {
-      expect(
-        validateGateBRemediationCycleSources(
-          { ...sources, [name]: mutate(sources[name]) },
-          [],
-        ),
-        name,
-      ).not.toEqual([]);
-    }
-  });
-
-  it("requires complete candidate-bound evidence regeneration before authorization", () => {
-    const sources = rawPublicationContractSources();
-    const invalidatedArtifacts = [
-      "plan",
-      "plan-review",
-      "implementation",
-      "verification",
-      "selected area-review",
-      "aggregate-review",
-      "final-bundle",
-      "authorization",
-    ];
-
-    for (const artifact of invalidatedArtifacts) {
-      const mutated = {
-        ...sources,
-        orchestrator: sources.orchestrator.replace(
-          `\`${artifact}\``,
-          `\`reusable-${artifact}\``,
-        ),
-      };
-      expect(
-        validateGateBRemediationCycleSources(mutated, []),
-        artifact,
-      ).not.toEqual([]);
-    }
-
-    const cases = [
-      [
-        "root",
-        (value) => value.replace("118-path/75-claim", "11-path/8-claim"),
-      ],
-      [
-        "process",
-        (value) =>
-          value.replace("full canonical verification", "focused verification"),
-      ],
-      [
-        "orchestrator",
-        (value) =>
-          value.replace(
-            "all fresh policy-selected area reviews",
-            "some area reviews",
-          ),
-      ],
-      [
-        "root",
-        (value) => value.replace(/final bounded\s+15-file bundle/gu, "bundle"),
-      ],
-      [
-        "process",
-        (value) =>
-          value.replace(
-            "No remediation cycle exists after",
-            "A remediation cycle may continue after",
-          ),
-      ],
-      [
-        "orchestrator",
-        (value) => value.replace("No token is read", "A token may be read"),
-      ],
-      [
-        "root",
-        (value) =>
-          value.replace(
-            "no publisher is invoked",
-            "the publisher may be invoked",
-          ),
-      ],
-      [
-        "process",
-        (value) =>
-          value.replace(
-            "no GitHub mutation occurs",
-            "a GitHub mutation may occur",
-          ),
-      ],
-    ];
-    for (const [name, mutate] of cases) {
-      expect(
-        validateGateBRemediationCycleSources(
-          { ...sources, [name]: mutate(sources[name]) },
-          [],
-        ),
-        name,
-      ).not.toEqual([]);
-    }
-
-    const safeCommands = verificationPlan("full").map(displayCommand);
-    expect(safeCommands).toHaveLength(9);
-    expect(validateVerificationCommands(safeCommands, [])).toEqual([]);
-    expect(
-      validateVerificationCommands(
-        [...safeCommands, "git push origin HEAD:candidate"],
-        [],
-      ),
-    ).not.toEqual([]);
-  });
-
-  it("binds each complete remediation-order source and its exact closed block", () => {
-    const sources = rawPublicationContractSources();
-    expect(validatePublicationContractSources(sources, [])).toEqual([]);
-
-    const orderBegin = "<!-- CLOUDX-GATE-B-REMEDIATION-ORDER-V1:BEGIN -->";
-    const orderEnd = "<!-- CLOUDX-GATE-B-REMEDIATION-ORDER-V1:END -->";
-    const contradictoryInstructions = [
-      "$verify-change and $review-change dispatch before attended exact local commit.",
-      "Verification and all selected area reviewers run before the attended local commit.",
-      "Before the attended local commit, run verification and selected area reviews.",
-      "All selected reviewers run before the remediation commit.",
-      "Area reviews occur before the local commit.",
-      "Before the attended commit, run AI reviews.",
-      "All required reviews run before the attended local commit.",
-      "Security and architecture reviews occur before the remediation commit.",
-      "Dispatch reviewers before the attended exact local commit.",
-      "Conduct the mandatory reviews before the remediation commit.",
-      "Run the full verifier before the attended local commit.",
-      "Despite the closed block, run the full verifier before the attended local commit.",
-    ];
-    for (const name of ["root", "orchestrator", "process"]) {
-      for (const instruction of contradictoryInstructions) {
-        const mutated = {
-          ...sources,
-          [name]: sources[name].replace(
-            orderEnd,
-            `${instruction}\n${orderEnd}`,
-          ),
-        };
-        expect(
-          validatePublicationContractSources(mutated, []),
-          `${name}: ${instruction}`,
-        ).toEqual(
-          expect.arrayContaining([
-            expect.stringMatching(/canonical remediation-order block/i),
-          ]),
-        );
-      }
-
-      for (const instruction of contradictoryInstructions) {
-        const mutated = {
-          ...sources,
-          [name]: sources[name].replace(
-            orderEnd,
-            `${orderEnd}\n${instruction}`,
-          ),
-        };
-        expect(
-          validatePublicationContractSources(mutated, []),
-          `${name}: outside block: ${instruction}`,
-        ).toEqual(
-          expect.arrayContaining([
-            expect.stringMatching(/source-byte commitment/i),
-          ]),
-        );
-      }
-
-      const outsideBlockMutations = [
-        [
-          "prohibition",
-          (value) =>
-            value.replace(
-              orderEnd,
-              `${orderEnd}\nNo verification runs before the attended local commit.`,
-            ),
-        ],
-        [
-          "authority override",
-          (value) =>
-            value.replace(
-              orderEnd,
-              `${orderEnd}\nThat declaration is nonbinding; run verification before the attended local commit.`,
-            ),
-        ],
-        [
-          "before publication contract",
-          (value) =>
-            value.replace(
-              "<!-- CLOUDX-PUBLICATION-CONTRACT-V1:BEGIN -->",
-              "Arbitrary policy byte.\n<!-- CLOUDX-PUBLICATION-CONTRACT-V1:BEGIN -->",
-            ),
-        ],
-        [
-          "after publication contract",
-          (value) =>
-            value.replace(
-              "<!-- CLOUDX-PUBLICATION-CONTRACT-V1:END -->",
-              "<!-- CLOUDX-PUBLICATION-CONTRACT-V1:END -->\nArbitrary policy byte.",
-            ),
-        ],
-      ];
-      for (const [description, mutate] of outsideBlockMutations) {
-        const mutated = { ...sources, [name]: mutate(sources[name]) };
-        expect(
-          validatePublicationContractSources(mutated, []),
-          `${name}: ${description}`,
-        ).toEqual(
-          expect.arrayContaining([
-            expect.stringMatching(/source-byte commitment/i),
-          ]),
-        );
-      }
-
-      const declaration =
-        name === "orchestrator"
-          ? "The closed block below is the sole machine transition-order authority."
-          : "The closed block\nbelow is the sole machine transition-order mirror of the change-orchestrator\nauthority.";
-      const declarationMutations = [
-        [
-          "negated declaration",
-          (value) => value.replace("the sole machine", "not the sole machine"),
-        ],
-        [
-          "duplicate declaration",
-          (value) => value.replace(orderBegin, `${declaration}\n${orderBegin}`),
-        ],
-      ];
-      for (const [description, mutate] of declarationMutations) {
-        const mutated = { ...sources, [name]: mutate(sources[name]) };
-        expect(
-          validatePublicationContractSources(mutated, []),
-          `${name}: ${description}`,
-        ).toEqual(
-          expect.arrayContaining([
-            expect.stringMatching(/sole machine transition-order/i),
-          ]),
-        );
-      }
-
-      const whitespaceOnly = {
-        ...sources,
-        [name]: sources[name].replace(orderBegin, `${orderBegin}\n \t`),
-      };
-      expect(
-        validatePublicationContractSources(whitespaceOnly, []),
-        `${name}: documented whitespace`,
-      ).toEqual(
-        expect.arrayContaining([
-          expect.stringMatching(/source-byte commitment/i),
-        ]),
-      );
-
-      const markerMutations = [
-        ["missing begin", (value) => value.replace(orderBegin, "")],
-        ["missing end", (value) => value.replace(orderEnd, "")],
-        [
-          "duplicate begin",
-          (value) => value.replace(orderBegin, `${orderBegin}\n${orderBegin}`),
-        ],
-        [
-          "duplicate end",
-          (value) => value.replace(orderEnd, `${orderEnd}\n${orderEnd}`),
-        ],
-        [
-          "reordered markers",
-          (value) =>
-            value
-              .replace(orderBegin, "CLOUDX_ORDER_MARKER_PLACEHOLDER")
-              .replace(orderEnd, orderBegin)
-              .replace("CLOUDX_ORDER_MARKER_PLACEHOLDER", orderEnd),
-        ],
-      ];
-      for (const [description, mutate] of markerMutations) {
-        const mutated = { ...sources, [name]: mutate(sources[name]) };
-        expect(
-          validatePublicationContractSources(mutated, []),
-          `${name}: ${description}`,
-        ).toEqual(
-          expect.arrayContaining([
-            expect.stringMatching(/remediation-order markers/i),
-          ]),
-        );
-      }
-    }
-  });
-
-  it("requires exactly one complete versioned authority block per consumer", () => {
-    const sources = rawPublicationContractSources();
-
-    expect(validatePublicationContractSources(sources, [])).toEqual([]);
-    for (const sourceName of [
-      "root",
-      "orchestrator",
-      "ship",
-      "review",
-      "verifier",
-      "process",
-    ]) {
-      const mutated = {
-        ...sources,
-        [sourceName]: sources[sourceName].replace(
-          "<!-- CLOUDX-PUBLICATION-CONTRACT-V1:BEGIN -->",
-          "",
-        ),
-      };
-      expect(
-        validatePublicationContractSources(mutated, []),
-        sourceName,
-      ).toEqual(
-        expect.arrayContaining([
-          expect.stringMatching(/exactly one Publication Contract V1 block/i),
-        ]),
-      );
-    }
-  });
-  it("rejects additive or duplicated publication authority instead of accepting positive substrings", () => {
-    const sources = rawPublicationContractSources();
-    const begin = "<!-- CLOUDX-PUBLICATION-CONTRACT-V1:BEGIN -->";
-    const end = "<!-- CLOUDX-PUBLICATION-CONTRACT-V1:END -->";
-    const rootBlock = sources.root.slice(
-      sources.root.indexOf(begin),
-      sources.root.indexOf(end) + end.length,
-    );
-    const cases = [
-      [
-        "root",
-        "\nInitial candidate publication may also run `git push origin HEAD:candidate`.\n",
-      ],
-      [
-        "ship",
-        "\nA force push is permitted when the candidate branch diverges.\n",
-      ],
-      ["ship", "\nThe initial publisher may target a protected branch.\n"],
-      ["ship", "\nA second initial exception may publish a later update.\n"],
-      ["orchestrator", "\nThe orchestrator may push the candidate directly.\n"],
-      ["verifier", "\nVerification may mutate GitHub after tests pass.\n"],
-      [
-        "ship",
-        "\nLater mutation may proceed without a current clean review-pr.\n",
-      ],
-      [
-        "ship",
-        "\nMerge may proceed without merge intent or required checks.\n",
-      ],
-      ["root", `\n${rootBlock}\n`],
-    ];
-    for (const [sourceName, addition] of cases) {
-      const issues = validatePublicationContractSources(
-        { ...sources, [sourceName]: `${sources[sourceName]}${addition}` },
-        [],
-      );
-      expect(issues, `${sourceName}: ${addition}`).not.toEqual([]);
-    }
-
-    const changedPublisher = {
-      ...sources,
-      ship: sources.ship.replace(
-        "node scripts/ai-change/publish-gate-b.mjs",
-        "git push origin architecture-and-new-codex",
-      ),
-    };
-    expect(
-      validatePublicationContractSources(changedPublisher, []),
-    ).not.toEqual([]);
-  });
-
-  it.each([
-    [
-      "root",
-      "The localChangeBaseSha=02d05f798096431f23acd1e5594a6bee21f3149f may stand in for the target base.",
-    ],
-    ["ship", "An alternate raw push is permitted after the publisher returns."],
-    ["ship", "A force push is permitted when the candidate diverges."],
-    ["ship", "A protected branch update is authorized for administrators."],
-    ["ship", "Retry is permitted after a push transport error."],
-    ["ship", "The operator may roll back the push automatically."],
-    ["orchestrator", "The orchestrator may push the candidate directly."],
-    ["orchestrator", "Review-pr may run after a post-push identity mismatch."],
-    ["verifier", "Verification may mutate GitHub after local checks pass."],
-    ["process", "expectedTargetBaseSha derives from the remote readback."],
-    ["root", "Later mutation may proceed without a current clean review-pr."],
-    ["root", "Merge may proceed without current intent or checks."],
-  ])(
-    "rejects a contradiction inside the %s authority block",
-    (name, addition) => {
-      const sources = rawPublicationContractSources();
-      const end = "<!-- CLOUDX-PUBLICATION-CONTRACT-V1:END -->";
-      sources[name] = sources[name].replace(end, `${addition}\n${end}`);
-
-      expect(validatePublicationContractSources(sources, [])).not.toEqual([]);
-    },
-  );
 
   it.each([
     [
@@ -1781,30 +915,39 @@ jobs:
   });
 });
 
-function publicationContractSources() {
-  return Object.fromEntries(
-    Object.entries(rawPublicationContractSources()).map(([name, source]) => [
-      name,
-      source.replace(/\s+/gu, " "),
-    ]),
+function guidanceFixture(body) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-guidance-"));
+  fs.mkdirSync(path.join(root, ".agents/skills/example"), { recursive: true });
+  fs.mkdirSync(path.join(root, "docs"));
+  fs.writeFileSync(
+    path.join(root, "package.json"),
+    JSON.stringify({ scripts: { test: "vitest run" } }),
   );
+  fs.writeFileSync(path.join(root, "docs/context.md"), "# Module context\n");
+  fs.writeFileSync(
+    path.join(root, ".agents/skills/example/SKILL.md"),
+    `---\nname: example\ndescription: Module context and coding standards.\n---\n\n${body}\n`,
+  );
+  return root;
+}
+
+function publicationContractFixture() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-publication-"));
+  for (const relativePath of [
+    ".agents/schemas/publication-authorization.schema.json",
+    "scripts/ai-change/publish-gate-b.mjs",
+    "scripts/ai-change/publish-gate-b.test.mjs",
+  ]) {
+    fs.mkdirSync(path.dirname(path.join(root, relativePath)), {
+      recursive: true,
+    });
+    fs.copyFileSync(relativePath, path.join(root, relativePath));
+  }
+  return root;
 }
 
 function rawPublicationContractSources() {
   return {
-    root: fs.readFileSync(`${gateBReferenceRoot}/root.md`, "utf8"),
-    orchestrator: fs.readFileSync(
-      `${gateBReferenceRoot}/orchestrator.md`,
-      "utf8",
-    ),
-    implement: fs.readFileSync(
-      `${gateBReferenceRoot}/implementation.md`,
-      "utf8",
-    ),
-    ship: fs.readFileSync(".agents/skills/ship-change/SKILL.md", "utf8"),
-    review: fs.readFileSync(".agents/skills/review-pr/SKILL.md", "utf8"),
-    verifier: fs.readFileSync(`${gateBReferenceRoot}/verification.md`, "utf8"),
-    process: fs.readFileSync(`${gateBReferenceRoot}/process.md`, "utf8"),
     authorizationSchema: fs.readFileSync(
       ".agents/schemas/publication-authorization.schema.json",
       "utf8",
@@ -1821,13 +964,6 @@ function rawVerifierConsumerSources() {
   return {
     package: fs.readFileSync("package.json", "utf8"),
     workflow: fs.readFileSync(".github/workflows/ci.yml", "utf8"),
-    root: fs.readFileSync("AGENTS.md", "utf8"),
-    verifierSkill: fs.readFileSync(
-      ".agents/skills/verify-change/SKILL.md",
-      "utf8",
-    ),
-    process: fs.readFileSync("docs/AI_CHANGE_PROCESS.md", "utf8"),
-    testingMap: fs.readFileSync("docs/architecture/testing-map.md", "utf8"),
     verifier: fs.readFileSync("scripts/ai-change/verify.mjs", "utf8"),
   };
 }

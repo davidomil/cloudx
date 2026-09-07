@@ -1,36 +1,17 @@
-# Server Scope Instructions
+# Server Context
 
-This file applies under `apps/server/` and extends the root `AGENTS.md`.
+`src/server.ts` composes Fastify, routes, WebSockets, plugins, services, and
+shutdown. Feature state and behavior belong in their focused service, not in
+transport handlers. The ownership map is in `docs/architecture/module-ownership.md`.
 
-## Ownership
-
-The server is the host capability and composition boundary. `src/server.ts`
-wires Fastify, routes, WebSockets, plugins, services, and shutdown. Put feature
-state and behavior in the focused owner named in
-`docs/architecture/module-ownership.md`, not in route handlers.
-
-## Rules
-
-- Keep route and WebSocket adapters thin. Validate external input and map
-  service errors at the boundary.
+- Validate external input and map service errors at HTTP/WebSocket boundaries.
 - Preserve allowed-root checks for files, Git, worktrees, uploads, extraction,
-  and process cwd.
-- Give every terminal, session, queue, poller, socket, timer, and child process
-  one lifecycle owner and explicit cancellation/shutdown behavior.
-- Keep plugin contracts in `packages/plugin-api` and shared serializable data in
-  `packages/shared`; do not create server-local parallel DTOs without cause.
-- Do not expose secrets through public config, errors, logs, or notifications.
+  and process cwd. Keep secrets out of public config, errors, and notifications.
+- Give sessions, terminals, queues, pollers, sockets, timers, and child processes
+  a clear owner, including cancellation and shutdown cleanup.
+- Use `packages/plugin-api` for plugin contracts and `packages/shared` for
+  serializable browser/server data rather than parallel local definitions.
 
-## Tests
-
-Add or update the colocated `*.test.ts` for the changed owner. Run focused tests,
-then:
-
-```bash
-npm run typecheck
-npm test
-npm run build
-```
-
-Composition, route, WebSocket, lifecycle, cancellation, and path-policy changes
-need integration or adversarial tests, not helper-only assertions.
+Colocated `*.test.ts` files cover feature owners. For route, composition,
+WebSocket, lifecycle, or path-policy changes, exercise the real boundary as well
+as any helpers. The root testing map lists broader TypeScript checks.

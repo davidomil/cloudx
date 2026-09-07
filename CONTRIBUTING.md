@@ -1,47 +1,25 @@
 # Contributing To CloudX
 
-CloudX is a local-first workstation-control application. A change can affect
-terminal processes, host files, credentials, automation code, microphone data,
-or the documentation archive. Review scope and evidence must match that impact.
+CloudX controls local terminals, files, automation, microphone data, and a
+documentation archive. Review and testing effort should match the change's
+effect on the developer's machine.
 
-## Before Editing
+## Working On A Change
 
-1. Read root `AGENTS.md` and each scoped `AGENTS.md` in the paths you will touch.
-2. Read the ownership, invariant, and testing documents under
-   `docs/architecture/`.
-3. Classify the proposed paths using `.agents/pr-review-policy.toml`.
-4. Use `$change-orchestrator` for every non-trivial change.
-5. If the change breaks an existing contract, state the break. Ask before adding
-   backward compatibility.
+Use `AGENTS.md` and relevant scoped guidance for repository context. The maps in
+`docs/architecture/` help locate owners and important invariants; verify details
+against current source and nearby tests.
 
-The policy, not the contributor or model, determines area labels, risk, required
-review skills, checks, human review, and automerge eligibility.
+Keep the change focused, preserve unrelated work, and explain significant
+contract breaks. Ask before adding backward compatibility. Choose the amount
+of planning and review that helps the task; separate agents and typed artifacts
+are not prerequisites for contributing.
 
-## Plan, Implement, Verify, Review
+## Testing
 
-The repository uses typed handoffs under `.agents/schemas/`:
-
-- `$plan-change` produces a change plan.
-- A fresh `$review-plan` context must return a clean plan review.
-- `$implement-change` implements only the accepted plan and records claim-level
-  evidence and deviations.
-- `$verify-change` runs deterministic checks without editing the worktree.
-- Fresh policy-selected reviewers and `$review-change` review the exact verified
-  head.
-- Review findings return to implementation. The resulting change is verified
-  and reviewed again.
-
-An iteration cap is a safety stop. Reaching it blocks the change; it does not
-allow a partial PR, skipped review, or merge.
-
-## Tests
-
-Every behavior change needs a production-path test with an assertion that would
-fail on the old behavior. Include sibling, negative, cancellation, cleanup, and
-error cases appropriate to the changed seam. Use the commands and evidence map
-in `docs/architecture/testing-map.md`.
-
-Run at least the root TypeScript baseline when TypeScript is affected:
+For behavior changes, add regression coverage through the affected production
+path, including failure or cleanup cases where relevant. Choose focused and
+broader checks from `docs/architecture/testing-map.md`. Common commands are:
 
 ```bash
 npm run typecheck
@@ -49,25 +27,19 @@ npm test
 npm run build
 ```
 
-Run the service-specific pytest command for each changed Python service. UI
-changes also require browser behavior evidence; responsive or visible changes
-require desktop and mobile screenshots.
+Python services have their own pytest suites. Use browser evidence when a UI
+claim depends on real interaction or layout. Report unavailable environments
+and checks not run; do not present them as passing.
 
 ## Commits And Pull Requests
 
-- Stage only owned paths. Do not use `git add -A`.
-- Commit subjects use `<THEME> (JIRA): <summary>` or `<THEME>: <summary>`.
-- Keep generated output out of the change unless the policy and plan require it.
-- The PR description must identify the task, classified areas and risk, exact
-  head SHA, plan and review artifacts, verification commands, and remaining
-  risks.
-- A new push makes previous verification, AI review, and merge intent stale.
+Stage owned paths explicitly and keep generated output out unless it belongs
+in the deliverable. Commit subjects use `<THEME>: <summary>` or
+`<THEME> (JIRA): <summary>`.
 
-`$review-pr` is advisory and does not mutate GitHub. `$ship-change` is the only
-interactive skill allowed to push, open or update a PR, change labels or
-reviews, authorize a merge, or merge. Trusted workflow controllers implement
-the same ship authority for deterministic label, check, intent, and exact-head
-merge operations. Human-required paths always need explicit protected-path
-approval.
+Describe the behavior changed, relevant design decisions, tests actually run,
+and remaining risks. Current CI and GitHub protections govern merging; a skill
+or model verdict does not authorize a remote mutation or override them.
 
-See `docs/AI_CHANGE_PROCESS.md` for the complete state and artifact protocol.
+`docs/AI_CHANGE_PROCESS.md` describes optional machine-managed automation.
+Its schemas and checks apply to consumers of those tools, not every contributor.
