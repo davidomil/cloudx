@@ -1161,23 +1161,36 @@ def test_hung_inference_expires_kills_process_tree_and_releases_capacity(tmp_pat
     hanging_path = tmp_path / "hang.webm"
     hanging_path.write_bytes(VALID_FAKE_AUDIO)
 
-    started_at = time.monotonic()
-    timed_out = executor.submit(hanging_path)
-    with pytest.raises(main.InferenceDeadlineExceeded, match="exceeded its 0.1 second deadline"):
-        asyncio.run(timed_out.result())
-    elapsed = time.monotonic() - started_at
+    replace_worker = backend._replace_worker
+    replacement_started_at = None
 
-    worker_pid, child_pid = [int(value) for value in hanging_path.with_suffix(".pids").read_text(encoding="utf-8").splitlines()[:2]]
-    assert elapsed < 1
-    assert wait_for_process_exit(worker_pid)
-    assert wait_for_process_exit(child_pid)
+    def record_replacement_start(worker):
+        nonlocal replacement_started_at
+        replacement_started_at = time.monotonic()
+        return replace_worker(worker)
 
-    available_path = tmp_path / "available.webm"
-    available_path.write_bytes(VALID_FAKE_AUDIO)
-    recovered = asyncio.run(executor.submit(available_path).result())
-    executor.close()
+    monkeypatch.setattr(backend, "_replace_worker", record_replacement_start)
+    try:
+        started_at = time.monotonic()
+        timed_out = executor.submit(hanging_path)
+        with pytest.raises(main.InferenceDeadlineExceeded, match="exceeded its 0.1 second deadline"):
+            asyncio.run(timed_out.result())
 
-    assert recovered.text == "worker recovered"
+        worker_pid, child_pid = [int(value) for value in hanging_path.with_suffix(".pids").read_text(encoding="utf-8").splitlines()[:2]]
+        # The failed worker is terminated before replacement starts. New worker
+        # startup has its own deadline and is not part of inference cancellation.
+        assert replacement_started_at is not None
+        assert replacement_started_at - started_at < 1
+        assert wait_for_process_exit(worker_pid)
+        assert wait_for_process_exit(child_pid)
+
+        available_path = tmp_path / "available.webm"
+        available_path.write_bytes(VALID_FAKE_AUDIO)
+        recovered = asyncio.run(executor.submit(available_path).result())
+
+        assert recovered.text == "worker recovered"
+    finally:
+        executor.close()
 
 
 def test_executor_shutdown_terminates_hung_backend_process_tree(tmp_path, monkeypatch):

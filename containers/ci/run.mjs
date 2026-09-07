@@ -385,12 +385,40 @@ export async function prepareWorkspace({
   npmCacheSource = "/opt/npm-cache",
 } = {}) {
   const workspaceRoot = path.dirname(root);
-  await fs.mkdir(root, { recursive: true });
+  await fs.mkdir(workspaceRoot, { recursive: true });
+  await fs.chmod(workspaceRoot, 0o1777);
+  // Create disposable Git ownership directly: the sandbox has no CAP_CHOWN.
+  const candidateOptions = {
+    uid: candidateIdentity.uid,
+    gid: candidateIdentity.gid,
+    maxBuffer: maximumOutputBytes,
+    env: {
+      PATH: process.env.PATH,
+      HOME: path.join(workspaceRoot, "home"),
+      USER: candidateIdentity.username,
+      LOGNAME: candidateIdentity.username,
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_SYSTEM: "/dev/null",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_NO_REPLACE_OBJECTS: "1",
+      GIT_TERMINAL_PROMPT: "0",
+      LANG: "C",
+      LC_ALL: "C",
+    },
+  };
   await fs.mkdir(path.join(workspaceRoot, "home"), { recursive: true });
   await fs.mkdir(path.join(workspaceRoot, "tmp"), { recursive: true });
   await fs.cp(npmCacheSource, path.join(workspaceRoot, "npm-cache"), {
     recursive: true,
   });
+  await execFileAsync("chmod", ["--recursive", "a+rwX", workspaceRoot], {
+    maxBuffer: maximumOutputBytes,
+  });
+  await execFileAsync(
+    process.execPath,
+    ["-e", "require('node:fs').mkdirSync(process.argv[1])", root],
+    candidateOptions,
+  );
   await execFileAsync(
     "tar",
     [
@@ -411,21 +439,27 @@ export async function prepareWorkspace({
     ],
     { maxBuffer: maximumOutputBytes },
   );
+  await fs.chmod(archive, 0o444);
   await execFileAsync("tar", ["--no-same-owner", "-C", root, "-xf", archive], {
-    maxBuffer: maximumOutputBytes,
+    ...candidateOptions,
   });
   await fs.rm(archive, { force: true });
+  await execFileAsync(
+    "chmod",
+    ["--recursive", "a+rwX", root],
+    candidateOptions,
+  );
   await execFileAsync("git", ["init", "--initial-branch=verification"], {
+    ...candidateOptions,
     cwd: root,
-    maxBuffer: maximumOutputBytes,
   });
   await execFileAsync("git", ["add", "--all"], {
+    ...candidateOptions,
     cwd: root,
-    maxBuffer: maximumOutputBytes,
   });
   await execFileAsync("git", ["clean", "-dffX"], {
+    ...candidateOptions,
     cwd: root,
-    maxBuffer: maximumOutputBytes,
   });
   await execFileAsync(
     "git",
@@ -442,13 +476,121 @@ export async function prepareWorkspace({
       "--no-verify",
       "--message=verification source snapshot",
     ],
-    { cwd: root, maxBuffer: maximumOutputBytes },
+    { ...candidateOptions, cwd: root },
   );
-  await execFileAsync("chmod", ["--recursive", "a+rwX", workspaceRoot], {
-    maxBuffer: maximumOutputBytes,
-  });
+  await copyGitObjectData(source, root);
   await fs.chmod(path.join(workspaceRoot, "tmp"), 0o1777);
   return root;
+}
+
+export async function copyGitObjectData(
+  source,
+  root,
+  { maximumFiles = 10_000, maximumBytes = 256 * 1024 * 1024 } = {},
+) {
+  const sourceGit = path.join(source, ".git");
+  const sourceObjects = path.join(sourceGit, "objects");
+  const targetObjects = path.join(root, ".git", "objects");
+  const files = [];
+  let bytes = 0;
+  let entries = 0;
+  const directoryEntries = async (directory) => {
+    if (!(await fs.lstat(directory)).isDirectory()) {
+      throw new Error("Git object input must use non-symlink directories.");
+    }
+    const names = await fs.readdir(directory);
+    entries += names.length;
+    if (entries > maximumFiles + 258) {
+      throw new Error("Git object input exceeds its file-count bound.");
+    }
+    return names;
+  };
+  await directoryEntries(sourceGit);
+  for (const directory of await directoryEntries(sourceObjects)) {
+    if (directory !== "pack" && !/^[0-9a-f]{2}$/u.test(directory)) continue;
+    const names = await directoryEntries(path.join(sourceObjects, directory));
+    for (const name of names) {
+      const pack = /^pack-([0-9a-f]{40})\.(pack|idx)$/u.exec(name);
+      if (directory === "pack") {
+        if (!pack) continue;
+        const counterpart = `pack-${pack[1]}.${pack[2] === "pack" ? "idx" : "pack"}`;
+        if (!names.includes(counterpart)) {
+          throw new Error(
+            "Git object input requires matched pack/index files.",
+          );
+        }
+      } else if (!/^[0-9a-f]{38}$/u.test(name)) continue;
+      const relative = path.join(directory, name);
+      const input = path.join(sourceObjects, relative);
+      const stat = await fs.lstat(input);
+      if (!stat.isFile() || stat.size > 64 * 1024 * 1024) {
+        throw new Error("Git object input must be bounded regular files.");
+      }
+      bytes += stat.size;
+      files.push({ relative, input, stat });
+      if (files.length > maximumFiles || bytes > maximumBytes) {
+        throw new Error("Git object input exceeds its size/count bounds.");
+      }
+    }
+  }
+  // Copy only immutable object bytes, never source configuration or references.
+  // No source Git command or Git object parser runs in the supervisor.
+  for (const { relative, input, stat } of files) {
+    const handle = await fs.open(
+      input,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+    );
+    try {
+      const opened = await handle.stat();
+      if (
+        !opened.isFile() ||
+        opened.dev !== stat.dev ||
+        opened.ino !== stat.ino ||
+        opened.size !== stat.size
+      ) {
+        throw new Error("Git object input changed before copying.");
+      }
+      const output = path.join(targetObjects, relative);
+      const createdDirectory = await fs.mkdir(path.dirname(output), {
+        recursive: true,
+      });
+      if (createdDirectory !== undefined)
+        await fs.chmod(createdDirectory, 0o777);
+      const buffer = Buffer.alloc(stat.size + 1);
+      let length = 0;
+      while (length < buffer.length) {
+        const { bytesRead } = await handle.read(
+          buffer,
+          length,
+          buffer.length - length,
+          null,
+        );
+        if (bytesRead === 0) break;
+        length += bytesRead;
+      }
+      if (length !== stat.size)
+        throw new Error("Git object input changed size.");
+      const data = buffer.subarray(0, length);
+      try {
+        await fs.writeFile(output, data, { flag: "wx", mode: 0o444 });
+      } catch (error) {
+        if (error.code !== "EEXIST") throw error;
+        const existing = await fs.lstat(output);
+        if (
+          !existing.isFile() ||
+          existing.size !== data.length ||
+          !(await fs.readFile(output)).equals(data)
+        ) {
+          throw new Error(
+            "Git object input conflicts with the fresh snapshot.",
+          );
+        }
+      }
+    } finally {
+      await handle.close();
+    }
+  }
+  return { files: files.length, bytes };
 }
 
 export function prepareSupervisor() {

@@ -162,6 +162,13 @@ function useMobileZoomSuppression() {
   }, []);
 }
 
+export function commitPaneForTabCreation(current: TabLayoutState, paneId: string, commitLayout: (layout: TabLayoutState) => void): void {
+  const nextLayout = activatePane(current, paneId);
+  if (nextLayout !== current) {
+    commitLayout(nextLayout);
+  }
+}
+
 export function App() {
   const initialLayout = useMemo(() => defaultLayout(), []);
   const [plugins, setPlugins] = useState<PluginDescriptor[]>([]);
@@ -654,9 +661,7 @@ export function App() {
   function selectPaneForCreation(paneId: string) {
     createTargetPaneIdRef.current = paneId;
     setCreateTargetPaneId(paneId);
-    const nextLayout = activatePane(layoutRef.current, paneId);
-    layoutRef.current = nextLayout;
-    commitLayout(nextLayout);
+    commitPaneForTabCreation(layoutRef.current, paneId, commitLayout);
   }
 
   function openCreateDialogForPane(paneId: string) {

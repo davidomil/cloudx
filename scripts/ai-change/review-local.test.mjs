@@ -282,13 +282,7 @@ async function fixture(paths = ["README.md"], extraRoles = []) {
 
 // A private launcher selects private system configuration for both audit and
 // execution. Neither fixture setup nor production probes touch user Git config.
-async function realFixture({
-  paths = ["README.md"],
-  extraRoles = [],
-  attributes = "worktree",
-  ident = false,
-} = {}) {
-  const f = await fixture(paths, extraRoles);
+async function privateGitFixture(f) {
   const home = path.join(f.directory, "home");
   const bin = path.join(f.directory, "bin");
   const system = path.join(f.directory, "system.gitconfig");
@@ -351,6 +345,18 @@ async function realFixture({
       stderr: result.stderr ?? Buffer.alloc(0),
     };
   });
+  return { home, system, convertingMarker, env, git, gitRunner };
+}
+
+async function realFixture({
+  paths = ["README.md"],
+  extraRoles = [],
+  attributes = "worktree",
+  ident = false,
+} = {}) {
+  const f = await fixture(paths, extraRoles);
+  const { home, system, convertingMarker, env, git, gitRunner } =
+    await privateGitFixture(f);
   await fs.mkdir(path.join(f.root, "scripts/ai-change"), { recursive: true });
   await fs.cp(
     path.join(repository, ".agents/schemas"),
@@ -1953,15 +1959,7 @@ describe("local CLI and bounded inputs", () => {
 describe("real read-only Git discovery", () => {
   it("observes committed, unstaged, deleted, renamed and untracked paths without index writes", async () => {
     const f = await fixture();
-    const git = (args) => {
-      const result = spawnSync(
-        "git",
-        ["-c", "core.hooksPath=/dev/null", ...args],
-        { cwd: f.root, encoding: "utf8", timeout: 10000 },
-      );
-      if (result.status !== 0) throw new Error(result.stderr);
-      return result.stdout.trim();
-    };
+    const { git, gitRunner } = await privateGitFixture(f);
     git(["init", "--quiet"]);
     git(["config", "user.name", "Local review fixture"]);
     git(["config", "user.email", "fixture@example.invalid"]);
@@ -1990,6 +1988,7 @@ describe("real read-only Git discovery", () => {
       repositoryRoot: f.root,
       baseSha,
       headSha,
+      gitRunner,
     });
     expect(result.paths).toEqual([
       "README.md",
@@ -2008,12 +2007,18 @@ describe("real read-only Git discovery", () => {
       repositoryRoot: f.root,
       baseSha,
       headSha,
+      gitRunner,
     });
     expect(ordinary.staged).toEqual(["README.md"]);
     expect(ordinary.paths).toEqual(result.paths);
     expect(ordinary.indexSha256).not.toBe(result.indexSha256);
     await expect(
-      discoverLocalPaths({ repositoryRoot: f.root, baseSha, headSha }),
+      discoverLocalPaths({
+        repositoryRoot: f.root,
+        baseSha,
+        headSha,
+        gitRunner,
+      }),
     ).rejects.toThrow(/staged|index/);
     expect(await fs.readFile(path.join(f.root, ".git/index"))).toEqual(
       stagedIndex,
@@ -2025,15 +2030,7 @@ describe("real read-only Git discovery", () => {
 
   it("runs the real print-subject and aggregate CLI with committed plus unstaged and untracked evidence", async () => {
     const f = await fixture(["README.md", "docs/usage.md", "docs/new.md"]);
-    const git = (args) => {
-      const result = spawnSync(
-        "git",
-        ["-c", "core.hooksPath=/dev/null", ...args],
-        { cwd: f.root, encoding: "utf8", timeout: 10000 },
-      );
-      if (result.status !== 0) throw new Error(result.stderr);
-      return result.stdout.trim();
-    };
+    const { git, gitRunner, env } = await privateGitFixture(f);
     await fs.mkdir(path.join(f.root, "scripts/ai-change"), { recursive: true });
     await fs.cp(
       path.join(repository, ".agents/schemas"),
@@ -2119,7 +2116,7 @@ describe("real read-only Git discovery", () => {
         f.options.plan,
         head,
       ],
-      { cwd: f.root, encoding: "utf8", timeout: 10000 },
+      { cwd: f.root, env, encoding: "utf8", timeout: 10000 },
     );
     expect(probe.status, probe.stderr).toBe(0);
     const verification = validateArtifact(
@@ -2144,6 +2141,7 @@ describe("real read-only Git discovery", () => {
     const run = (tail) =>
       spawnSync(process.execPath, [...args, ...tail], {
         cwd: f.root,
+        env,
         encoding: "utf8",
         timeout: 10000,
       });
@@ -2196,6 +2194,7 @@ describe("real read-only Git discovery", () => {
           repositoryRoot: f.root,
           baseSha: f.plan.base_sha,
           headSha: head,
+          gitRunner,
         }),
       ).rejects.toThrow(/index/);
       expect(await fs.readFile(path.join(f.root, ".git/index"))).toEqual(
@@ -2209,6 +2208,7 @@ describe("real read-only Git discovery", () => {
         repositoryRoot: f.root,
         baseSha: f.plan.base_sha,
         headSha: head,
+        gitRunner,
       }),
     ).rejects.toThrow(/staged|index/);
   }, 30_000);

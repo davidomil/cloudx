@@ -526,8 +526,14 @@ test.describe("CloudX shipped shell", () => {
     if ((await visibleSplitButton.count()) === 0) {
       await page.getByRole("button", { name: "Workspace actions" }).click();
     }
+    const splitResponsePromise = page.waitForResponse(
+      (response) =>
+        response.request().method() === "PATCH" &&
+        /^\/api\/windows\/[^/]+$/.test(new URL(response.url()).pathname),
+    );
     await visibleSplitButton.first().click();
     await expect(page.locator(".workspace-pane")).toHaveCount(2);
+    expect((await splitResponsePromise).status()).toBe(200);
 
     const targetPane = page.locator(".workspace-pane.active");
     const paneId = await targetPane.getAttribute("data-pane-id");

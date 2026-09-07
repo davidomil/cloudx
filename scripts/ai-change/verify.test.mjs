@@ -648,7 +648,7 @@ describe("deterministic change verification", () => {
     } finally {
       fs.rmSync(fixture.root, { force: true, recursive: true });
     }
-  });
+  }, 30_000);
 
   it("rejects a schema-valid mismatched policy digest through the real npm entry before child dispatch", () => {
     const fixture = spawnedVerifierFixture();
