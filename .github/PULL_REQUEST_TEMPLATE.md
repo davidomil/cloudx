@@ -1,3 +1,7 @@
+<!-- Replace <type> with bug, feature, refactor, test, docs, or chore. -->
+
+Change-Type: <type>
+
 ## Summary
 
 Describe the behavior changed and why.

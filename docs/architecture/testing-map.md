@@ -29,6 +29,14 @@ Browser setup is defined in `playwright.config.ts`; service setup is described
 in `docs/SETUP.md`. Missing environments and skipped checks are verification gaps,
 not passes. Actual supported-host checks are needed for platform-specific claims.
 
+The legacy Gate-B smart HTTP publisher tests use immutable historical Git data
+retained by `test-fixtures/gate-b-smart-http-v1`, pointing to
+`465896c9ec4da70af5f312db3a35d2c137a5513c`. Keep this test-fixture tag when deleting
+merged branches. Full CI checkouts include tags; shallow or tag-free checkouts
+must fetch this tag and its history before running the publisher tests. The
+tests validate exact commit, tree, parent, and changed-path identities and fail
+clearly when their history prerequisite is missing.
+
 ## Useful Area Coverage
 
 | Area                      | Likely evidence                                                                                                                   |

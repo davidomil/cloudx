@@ -37,6 +37,8 @@ Stage owned paths explicitly and keep generated output out unless it belongs
 in the deliverable. Commit subjects use `<THEME>: <summary>` or
 `<THEME> (JIRA): <summary>`.
 
+Set the PR template's `Change-Type` to `bug`, `feature`, `refactor`, `test`,
+`docs`, or `chore` so the classifier can apply the correct labels.
 Describe the behavior changed, relevant design decisions, tests actually run,
 and remaining risks. Current CI and GitHub protections govern merging; a skill
 or model verdict does not authorize a remote mutation or override them.
