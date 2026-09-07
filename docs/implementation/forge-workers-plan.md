@@ -2,6 +2,33 @@
 
 Goal: a CloudX plugin for configurable GitHub/GitLab issue workers and editable PR/MR reviews using Codex tabs and rules/skills templates, separate application identities, approval pauses, feedback/resume, guarded merge, and owned-resource cleanup.
 
+## Current revision: managed repositories and connected applications
+
+This revision replaces the local-checkout and manual-credential setup
+described in the earlier delivery history below. Configure a remote
+repository; Forge creates private owned checkouts and authenticates Git
+with the connected worker or reviewer identity.
+
+GitHub uses a separate generated app manifest for each role, followed by
+registration and installation consent. GitLab uses one temporary
+personal access token to provision two project service accounts, their
+memberships and bot tokens. Read-only token and project API checks
+precede writes. Expired access renews tokens for the existing bot
+accounts while preserving active connections; uncertain mutations remain
+blocked for inspection. The setup token is not retained.
+
+Earlier ownership manifests are not migrated. The current runtime
+requires its managed-checkout ownership fields and layout before
+cleanup.
+
+Current revision verification:
+`npx vitest run --maxWorkers=2 --reporter=dot` passed 2,305 tests in 120
+files; `npm run typecheck` and `npm run build` passed.
+`npx playwright test --reporter=line` passed 12 shipped-shell browser
+checks. Actual PTY/Git lifecycle tests use deterministic
+assistant/provider fixtures. Live provider registration, credentials and
+Codex model execution remain unverified.
+
 ## Research and evidence
 - [x] Inspect git worktrees and create feature/forge-workers in a separate checkout.
 - [x] Read root/server/web AGENTS, plugin API, architecture ownership/state/testing maps, Jira plugin/config/secret patterns, Codex actions and workspace creation.

@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -6,6 +7,7 @@ import path from "node:path";
 import {
   RULES_SKILLS_PLUGIN_ID,
   type ForgeRepository,
+  type ForgeCredentialRole,
   type WorkspaceTab,
 } from "@cloudx/shared";
 
@@ -15,6 +17,7 @@ import type { RulesSkillsCatalogService } from "../rulesSkills/RulesSkillsCatalo
 import type { SessionStore } from "../sessionStore.js";
 import type { WorkspaceCommandService } from "../workspace/WorkspaceCommandService.js";
 import type { WorkspaceLayoutStore } from "../workspace/WorkspaceLayoutStore.js";
+import { validateRepository } from "./providers/ForgeCredentials.js";
 
 export interface ForgeWorkspace {
   id: string;
@@ -38,7 +41,17 @@ export interface ForgeRuntimeDependencies {
   rulesSkills: Pick<RulesSkillsCatalogService, "list">;
   pathPolicy: PathPolicy;
   dataDir: string;
-  git?: (cwd: string, args: string[], signal?: AbortSignal) => Promise<string>;
+  gitAccess: (
+    repository: ForgeRepository,
+    role: ForgeCredentialRole,
+    signal?: AbortSignal,
+  ) => Promise<{ cloneUrl: string; authorization: string }>;
+  git?: (
+    cwd: string,
+    args: string[],
+    signal?: AbortSignal,
+    environment?: NodeJS.ProcessEnv,
+  ) => Promise<string>;
 }
 
 interface DirectoryIdentity {
@@ -51,7 +64,11 @@ interface OwnedWorkspace extends ForgeWorkspace {
   repository: DirectoryIdentity;
   worktree: DirectoryIdentity;
   origin: string;
-  pushOrigin: string;
+  expectedRepository: ForgeRepository;
+  role: ForgeCredentialRole;
+  gitDirectory?: DirectoryIdentity;
+  gitConfigHash?: string;
+  gitPending: boolean;
   branchOwned: boolean;
   cleaned: boolean;
   cleanupHeadSha?: string;
@@ -88,7 +105,6 @@ export class ForgeRuntime {
   async prepareWorkspace(
     input: {
       id: string;
-      repositoryPath: string;
       expectedRepository: ForgeRepository;
       baseBranch: string;
       headSha?: string;
@@ -101,102 +117,121 @@ export class ForgeRuntime {
       const existing = await this.manifest(input.id).read<OwnedWorkspace>();
       if (existing && !(await this.readOwned(input.id)).cleaned)
         throw new Error("This worker already owns a workspace.");
-      const repository = await this.directory(input.repositoryPath);
-      const worktreePath = this.dependencies.pathPolicy.resolve(
-        path.join(
-          path.dirname(repository.path),
-          `cloudx-forge-${safeId(input.id)}`,
-        ),
-      );
-      await this.directory(path.dirname(worktreePath));
-      const origin = (
-        await this.runGit(
-          repository.path,
-          ["remote", "get-url", "origin"],
-          signal,
-        )
-      ).trim();
-      if (!origin)
-        throw new Error("The repository must have a configured origin.");
-      const pushOrigin = (
-        await this.runGit(
-          repository.path,
-          ["remote", "get-url", "--push", "--all", "origin"],
-          signal,
-        )
-      ).trim();
-      assertForgeOrigin(origin, input.expectedRepository);
-      assertForgeOrigin(pushOrigin, input.expectedRepository);
       if (input.review && !input.headSha)
         throw new Error("A review requires an exact head commit.");
       if (input.headSha && !/^[a-f0-9]{40,64}$/iu.test(input.headSha))
         throw new Error("Invalid review head commit.");
       const baseBranch = input.baseBranch.trim();
-      if (!baseBranch || baseBranch.startsWith("-"))
+      if (
+        !baseBranch ||
+        baseBranch.startsWith("-") ||
+        /[\r\n\0]/u.test(baseBranch)
+      )
         throw new Error("A valid base branch is required.");
+      const role = input.review ? "reviewer" : "worker";
+      const access = await this.access(input.expectedRepository, role, signal);
+      const worktreePath = this.checkoutPath(input.id);
+      await requireSafeDirectory(
+        this.dependencies.dataDir,
+        path.dirname(worktreePath),
+        {
+          create: true,
+          label: "Forge checkout directory",
+        },
+      );
       await this.runGit(
-        repository.path,
+        path.dirname(worktreePath),
         ["check-ref-format", "--branch", baseBranch],
         signal,
       );
-      await this.runGit(
-        repository.path,
-        [
-          "fetch",
-          "--no-tags",
-          "origin",
-          input.headSha ?? `refs/heads/${baseBranch}`,
-        ],
-        signal,
-      );
-      const commit = (
-        await this.runGit(
-          repository.path,
-          ["rev-parse", "--verify", "FETCH_HEAD^{commit}"],
-          signal,
-        )
-      ).trim();
-      if (input.headSha && commit.toLowerCase() !== input.headSha.toLowerCase())
-        throw new Error(
-          "Fetched review commit does not match the requested head.",
-        );
-      await fs.mkdir(worktreePath);
+      signal?.throwIfAborted();
+      await fs.mkdir(worktreePath, { mode: 0o700 });
+      const checkout = await this.directory(worktreePath);
       const owned: OwnedWorkspace = {
         id: input.id,
-        repositoryPath: repository.path,
+        repositoryPath: worktreePath,
         worktreePath,
         branch: input.review ? "" : `cloudx/forge/${input.id}`,
-        repository,
-        worktree: await this.directory(worktreePath),
-        origin,
-        pushOrigin,
+        repository: checkout,
+        worktree: checkout,
+        origin: access.cloneUrl,
+        expectedRepository: input.expectedRepository,
+        role,
         branchOwned: false,
         cleaned: false,
-        baseCommit: commit,
+        baseCommit: "",
         prepared: false,
         launchPending: false,
+        gitPending: false,
       };
       try {
         await this.manifest(input.id).write(owned);
-        await this.assertIdentity(repository);
-        await this.assertIdentity(owned.worktree);
-        await this.runGit(
-          repository.path,
-          ["worktree", "add", "--detach", worktreePath, commit],
+        await this.runOwnedGit(
+          owned,
+          ["init", "--template=", "--initial-branch=cloudx-preparing"],
           signal,
         );
-        if (owned.branch) {
+        owned.gitDirectory = await this.directory(
+          path.join(worktreePath, ".git"),
+        );
+        await this.manifest(input.id).write(owned);
+        await this.runOwnedGit(
+          owned,
+          [
+            "config",
+            "user.name",
+            `CloudX ${input.review ? "reviewer" : "issue worker"}`,
+          ],
+          signal,
+        );
+        await this.runOwnedGit(
+          owned,
+          ["config", "user.email", `forge-${role}@cloudx.local`],
+          signal,
+        );
+        await this.runOwnedGit(
+          owned,
+          ["remote", "add", "origin", access.cloneUrl],
+          signal,
+        );
+        await this.runOwnedGit(
+          owned,
+          [
+            "fetch",
+            "--no-tags",
+            "--no-recurse-submodules",
+            access.cloneUrl,
+            input.headSha ?? `refs/heads/${baseBranch}`,
+          ],
+          signal,
+          access.authorization,
+        );
+        const commit = (
           await this.runGit(
             worktreePath,
-            ["switch", "-c", owned.branch],
+            ["rev-parse", "--verify", "FETCH_HEAD^{commit}"],
             signal,
+          )
+        ).trim();
+        if (
+          input.headSha &&
+          commit.toLowerCase() !== input.headSha.toLowerCase()
+        )
+          throw new Error(
+            "Fetched review commit does not match the requested head.",
           );
+        owned.baseCommit = commit;
+        await this.manifest(input.id).write(owned);
+        await this.runOwnedGit(owned, ["checkout", "--detach", commit], signal);
+        if (owned.branch) {
+          await this.runOwnedGit(owned, ["switch", "-c", owned.branch], signal);
           owned.branchOwned = true;
         }
+        owned.gitConfigHash = await this.configHash(owned);
         owned.prepared = true;
         await this.manifest(input.id).write(owned);
         return {
-          repositoryPath: owned.repositoryPath,
+          repositoryPath: worktreePath,
           worktreePath,
           branch: owned.branch,
         };
@@ -230,6 +265,7 @@ export class ForgeRuntime {
     if (
       owned.cleaned ||
       !owned.prepared ||
+      owned.gitPending ||
       owned.launchPending ||
       input.worktreePath !== owned.worktreePath
     )
@@ -237,6 +273,7 @@ export class ForgeRuntime {
         "Worker workspace ownership does not match or a previous launch is unresolved.",
       );
     await this.assertIdentity(owned.worktree);
+    this.dependencies.pathPolicy.resolve(owned.worktreePath);
     const catalog = await this.dependencies.rulesSkills.list();
     if (!catalog.templates.some((template) => template.id === input.templateId))
       throw new Error(
@@ -333,6 +370,10 @@ export class ForgeRuntime {
     return this.serialize(id, async () => {
       const stored = await this.manifest(id).read<OwnedWorkspace>();
       const owned = stored ? await this.readOwned(id) : undefined;
+      if (owned && !owned.cleaned && owned.gitPending)
+        throw new Error(
+          "A worker Git operation was interrupted before process exit was recorded. Its checkout was preserved.",
+        );
       if (owned && !owned.cleaned && !owned.prepared)
         await this.recoverPreparation(owned);
       const tabIds = new Set<string>();
@@ -405,32 +446,24 @@ export class ForgeRuntime {
       const owned = await this.matchOwned(workspace);
       if (!owned.branchOwned || !owned.branch || owned.cleaned)
         throw new Error("Only an owned issue branch can be published.");
-      await this.assertIdentity(owned.repository);
-      await this.assertIdentity(owned.worktree);
-      const origin = (
-        await this.runGit(
-          owned.repositoryPath,
-          ["remote", "get-url", "origin"],
-          signal,
-        )
-      ).trim();
-      const pushOrigin = (
-        await this.runGit(
-          owned.repositoryPath,
-          ["remote", "get-url", "--push", "--all", "origin"],
-          signal,
-        )
-      ).trim();
-      if (origin !== owned.origin || pushOrigin !== owned.pushOrigin)
+      await this.assertQuiescent(owned);
+      await this.assertCheckout(owned);
+      const headSha = await this.requireBranchHead(owned, signal);
+      await this.verifyCleanHead(owned, headSha, signal);
+      const access = await this.access(
+        owned.expectedRepository,
+        "worker",
+        signal,
+      );
+      if (access.cloneUrl !== owned.origin)
         throw new Error(
           "Repository origin changed while the worker was running.",
         );
-      const headSha = await this.requireBranchHead(owned, signal);
-      await this.verifyCleanHead(owned, headSha, signal);
-      await this.runGit(
-        owned.worktreePath,
-        ["push", "origin", `${headSha}:refs/heads/${owned.branch}`],
+      await this.runOwnedGit(
+        owned,
+        ["push", access.cloneUrl, `${headSha}:refs/heads/${owned.branch}`],
         signal,
+        access.authorization,
       );
       await this.verifyCleanHead(owned, headSha, signal);
       return headSha;
@@ -442,6 +475,7 @@ export class ForgeRuntime {
       const owned = await this.matchOwned(workspace);
       if (owned.launchPending)
         throw new Error("A worker launch is unresolved; cleanup is blocked.");
+      if (!owned.cleaned) await this.assertQuiescent(owned);
       if (owned.branchOwned && !owned.cleaned) {
         if (!workspace.expectedHeadSha)
           throw new Error("Issue cleanup requires the published head commit.");
@@ -449,7 +483,7 @@ export class ForgeRuntime {
           await this.verifyCleanHead(owned, workspace.expectedHeadSha, signal);
         else if (owned.cleanupHeadSha !== workspace.expectedHeadSha)
           throw new Error(
-            "Owned worktree disappeared before branch cleanup; branch preserved.",
+            "Owned checkout disappeared before cleanup; ownership was preserved.",
           );
       }
       await this.cleanupOwned(owned, signal, workspace.expectedHeadSha);
@@ -476,8 +510,7 @@ export class ForgeRuntime {
     expectedHeadSha: string,
     signal?: AbortSignal,
   ): Promise<void> {
-    await this.assertIdentity(owned.repository);
-    await this.assertIdentity(owned.worktree);
+    await this.assertCheckout(owned);
     if (
       !/^[a-f0-9]{40,64}$/iu.test(expectedHeadSha) ||
       (await this.requireBranchHead(owned, signal)) !== expectedHeadSha
@@ -505,99 +538,60 @@ export class ForgeRuntime {
     expectedHeadSha?: string,
   ): Promise<void> {
     if (owned.cleaned) return;
-    await this.assertIdentity(owned.repository);
+    if (owned.gitPending)
+      throw new Error(
+        "A worker Git operation is unresolved; its checkout was preserved.",
+      );
     const current = await optionalIdentity(owned.worktreePath);
-    let branchHead = owned.cleanupHeadSha;
     if (current) {
       await this.assertIdentity(owned.worktree);
-      const registered = await this.runGit(
-        owned.repositoryPath,
-        ["worktree", "list", "--porcelain", "-z"],
-        signal,
-      );
-      const isRegistered = registered
-        .split("\0")
-        .includes(`worktree ${owned.worktreePath}`);
-      if (owned.branchOwned) {
-        branchHead = await this.requireBranchHead(owned, signal);
-        if (expectedHeadSha && branchHead !== expectedHeadSha)
-          throw new Error(
-            "Worker head differs from the published commit; local changes were preserved.",
-          );
-        const others = registered
-          .split("\0\0")
-          .filter(
-            (record) =>
-              !record.split("\0").includes(`worktree ${owned.worktreePath}`),
-          );
-        if (
-          others.some((record) =>
-            record.split("\0").includes(`branch refs/heads/${owned.branch}`),
-          )
-        )
-          throw new Error(
-            "Another checkout is using the worker branch; cleanup is blocked.",
-          );
-        owned.cleanupHeadSha = branchHead;
-        await this.manifest(owned.id).write(owned);
-      }
-      if (isRegistered) {
-        await this.assertIdentity(owned.worktree);
-        await this.runGit(
-          owned.repositoryPath,
-          [
-            "worktree",
-            "remove",
-            ...(owned.branchOwned && expectedHeadSha ? [] : ["--force"]),
-            owned.worktreePath,
-          ],
+      if (owned.gitDirectory) {
+        await this.assertCheckout(owned);
+        const registered = await this.runGit(
+          owned.worktreePath,
+          ["worktree", "list", "--porcelain", "-z"],
           signal,
         );
-      } else {
-        await this.assertIdentity(owned.worktree);
-        await fs.rmdir(owned.worktreePath);
+        if (
+          registered
+            .split("\0")
+            .some(
+              (field) =>
+                field.startsWith("worktree ") &&
+                field !== `worktree ${owned.worktreePath}`,
+            )
+        )
+          throw new Error(
+            "Another checkout is using the worker repository; cleanup is blocked.",
+          );
       }
+      if (expectedHeadSha && owned.branchOwned)
+        await this.verifyCleanHead(owned, expectedHeadSha, signal);
+      owned.cleanupHeadSha = expectedHeadSha;
+      await this.manifest(owned.id).write(owned);
+      signal?.throwIfAborted();
+      await this.assertIdentity(owned.worktree);
+      await fs.rm(owned.worktreePath, { recursive: true });
     } else if (owned.branchOwned && !owned.cleanupHeadSha) {
       throw new Error(
-        "Owned worktree disappeared before branch cleanup; branch preserved.",
+        "Owned checkout disappeared before cleanup; ownership was preserved.",
       );
-    }
-    if (owned.branchOwned && branchHead) {
-      const remaining = (
-        await this.runGit(
-          owned.repositoryPath,
-          [
-            "for-each-ref",
-            "--format=%(objectname)",
-            `refs/heads/${owned.branch}`,
-          ],
-          signal,
-        )
-      ).trim();
-      if (remaining)
-        await this.runGit(
-          owned.repositoryPath,
-          ["update-ref", "-d", `refs/heads/${owned.branch}`, branchHead],
-          signal,
-        );
     }
     owned.cleaned = true;
     await this.manifest(owned.id).write(owned);
   }
 
   private async recoverPreparation(owned: OwnedWorkspace): Promise<void> {
-    await this.assertIdentity(owned.repository);
-    const registered = await this.runGit(owned.repositoryPath, [
-      "worktree",
-      "list",
-      "--porcelain",
-      "-z",
-    ]);
-    if (!registered.split("\0").includes(`worktree ${owned.worktreePath}`)) {
+    if (owned.gitPending)
+      throw new Error(
+        "A worker Git operation was interrupted before process exit was recorded. Its checkout was preserved.",
+      );
+    await this.assertIdentity(owned.worktree);
+    if (!owned.baseCommit || !owned.gitDirectory) {
       await this.cleanupOwned(owned);
       return;
     }
-    await this.assertIdentity(owned.worktree);
+    await this.assertCheckout(owned);
     const head = (
       await this.runGit(owned.worktreePath, ["rev-parse", "HEAD"])
     ).trim();
@@ -620,6 +614,7 @@ export class ForgeRuntime {
       return;
     }
     owned.branchOwned = Boolean(owned.branch);
+    owned.gitConfigHash = await this.configHash(owned);
     owned.prepared = true;
     await this.manifest(owned.id).write(owned);
   }
@@ -682,27 +677,47 @@ export class ForgeRuntime {
       typeof value.worktreePath !== "string" ||
       typeof value.branch !== "string" ||
       typeof value.origin !== "string" ||
-      typeof value.pushOrigin !== "string" ||
+      !value.expectedRepository ||
+      !["worker", "reviewer"].includes(value.role) ||
+      typeof value.gitPending !== "boolean" ||
       typeof value.branchOwned !== "boolean" ||
       typeof value.cleaned !== "boolean" ||
       typeof value.prepared !== "boolean" ||
       typeof value.launchPending !== "boolean" ||
       typeof value.baseCommit !== "string" ||
+      (value.role === "reviewer") !== (value.branch === "") ||
+      (value.role === "reviewer" && value.branchOwned) ||
+      (value.prepared &&
+        (!value.gitDirectory ||
+          !value.gitConfigHash ||
+          !/^[a-f0-9]{40,64}$/iu.test(value.baseCommit))) ||
       !isIdentity(value.repository) ||
       !isIdentity(value.worktree) ||
       value.repository.path !== value.repositoryPath ||
       value.worktree.path !== value.worktreePath ||
-      value.worktreePath !==
-        path.join(
-          path.dirname(value.repositoryPath),
-          `cloudx-forge-${safeId(id)}`,
-        ) ||
+      value.repositoryPath !== this.checkoutPath(id) ||
+      value.worktreePath !== value.repositoryPath ||
+      (value.gitDirectory !== undefined &&
+        (!isIdentity(value.gitDirectory) ||
+          value.gitDirectory.path !== path.join(value.worktreePath, ".git"))) ||
+      (value.gitConfigHash !== undefined &&
+        !/^[a-f0-9]{64}$/u.test(value.gitConfigHash)) ||
       (value.branch !== "" && value.branch !== `cloudx/forge/${id}`)
     )
       throw new Error(
         "Worker workspace ownership record is missing or invalid.",
       );
+    assertForgeOrigin(value.origin, value.expectedRepository);
     return value;
+  }
+
+  private checkoutPath(id: string): string {
+    return path.join(
+      path.resolve(this.dependencies.dataDir),
+      "forge-workers",
+      "checkouts",
+      safeId(id),
+    );
   }
 
   private manifest(id: string): JsonStateFile {
@@ -717,8 +732,122 @@ export class ForgeRuntime {
     cwd: string,
     args: string[],
     signal?: AbortSignal,
+    environment?: NodeJS.ProcessEnv,
   ): Promise<string> {
-    return (this.dependencies.git ?? git)(cwd, args, signal);
+    return (this.dependencies.git ?? git)(cwd, args, signal, environment);
+  }
+
+  private async access(
+    repository: ForgeRepository,
+    role: ForgeCredentialRole,
+    signal?: AbortSignal,
+  ) {
+    signal?.throwIfAborted();
+    const access = await this.dependencies.gitAccess(repository, role, signal);
+    signal?.throwIfAborted();
+    assertForgeOrigin(access.cloneUrl, repository);
+    if (
+      !access.authorization ||
+      /[\r\n\0]/u.test(access.authorization) ||
+      access.authorization.length > 64_000
+    )
+      throw new Error("Forge Git authorization is invalid.");
+    return access;
+  }
+
+  private async runOwnedGit(
+    owned: OwnedWorkspace,
+    args: string[],
+    signal?: AbortSignal,
+    authorization?: string,
+  ): Promise<string> {
+    owned.gitPending = true;
+    await this.manifest(owned.id).write(owned);
+    try {
+      return await this.runGit(
+        owned.worktreePath,
+        args,
+        signal,
+        authorization
+          ? {
+              GIT_CONFIG_COUNT: "2",
+              GIT_CONFIG_KEY_0: "http.extraHeader",
+              GIT_CONFIG_VALUE_0: "",
+              GIT_CONFIG_KEY_1: `http.${owned.origin}.extraHeader`,
+              GIT_CONFIG_VALUE_1: `Authorization: ${authorization}`,
+            }
+          : undefined,
+      );
+    } finally {
+      owned.gitPending = false;
+      await this.manifest(owned.id).write(owned);
+    }
+  }
+
+  private async configHash(owned: OwnedWorkspace): Promise<string> {
+    const handle = await fs.open(
+      path.join(owned.worktreePath, ".git", "config"),
+      constants.O_RDONLY | constants.O_NOFOLLOW,
+    );
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile() || stat.size > 64_000)
+        throw new Error("Worker Git configuration is invalid.");
+      const content = Buffer.alloc(64_001);
+      const { bytesRead } = await handle.read(content, 0, content.length, 0);
+      if (bytesRead > 64_000 || bytesRead !== stat.size)
+        throw new Error("Worker Git configuration changed while reading.");
+      return createHash("sha256")
+        .update(content.subarray(0, bytesRead))
+        .digest("hex");
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private async assertCheckout(owned: OwnedWorkspace): Promise<void> {
+    if (owned.gitPending)
+      throw new Error(
+        "A worker Git operation is unresolved; its checkout was preserved.",
+      );
+    await this.assertIdentity(owned.worktree);
+    if (!owned.gitDirectory)
+      throw new Error("Worker Git directory ownership is missing.");
+    await this.assertIdentity(owned.gitDirectory);
+    if (
+      owned.gitConfigHash &&
+      (await this.configHash(owned)) !== owned.gitConfigHash
+    )
+      throw new Error(
+        "Worker Git configuration or origin changed; its checkout was preserved.",
+      );
+  }
+
+  private async assertQuiescent(owned: OwnedWorkspace): Promise<void> {
+    if (owned.launchPending)
+      throw new Error(
+        "A worker launch is unresolved; its checkout was preserved.",
+      );
+    const directory = path.join(
+      this.dependencies.dataDir,
+      "forge-workers",
+      "tabs",
+    );
+    if (
+      !(await requireSafeDirectory(this.dependencies.dataDir, directory, {
+        create: false,
+        label: "Forge tab ownership directory",
+      }))
+    )
+      return;
+    for (const name of await fs.readdir(directory)) {
+      if (!name.endsWith(".json")) continue;
+      const tab = await this.tabManifest(name.slice(0, -5)).read<OwnedTab>();
+      if (tab?.workerId === owned.id && !tab.closed && !tab.quiescent)
+        throw new Error(
+          "Stop the worker process before publishing or removing its checkout.",
+        );
+    }
   }
 
   private tabManifest(tabId: string): JsonStateFile {
@@ -833,11 +962,14 @@ export class ForgeRuntime {
   }
 
   private async directory(candidate: string): Promise<DirectoryIdentity> {
-    const directory = await this.dependencies.pathPolicy.ensureDirectory(
-      candidate,
-      false,
-    );
-    return identity(await fs.realpath(directory));
+    if (
+      !(await requireSafeDirectory(this.dependencies.dataDir, candidate, {
+        create: false,
+        label: "Forge owned directory",
+      }))
+    )
+      throw new Error("Worker directory disappeared.");
+    return identity(candidate);
   }
 
   private async assertIdentity(expected: DirectoryIdentity): Promise<void> {
@@ -880,40 +1012,30 @@ export function assertForgeOrigin(
   origin: string,
   repository: ForgeRepository,
 ): void {
-  const api = new URL(repository.apiUrl);
+  const api = validateRepository(repository);
   const hostname =
     repository.provider === "github" && api.hostname === "api.github.com"
       ? "github.com"
       : api.hostname;
-  const scp = /^(?:[^/@:\s]+@)?([^/:\s]+):\/?([^\s]+)$/u.exec(origin);
-  let remoteHost: string;
-  let remotePath: string;
-  if (scp && !origin.includes("://")) {
-    remoteHost = scp[1]!;
-    remotePath = scp[2]!;
-  } else {
-    let remote: URL;
-    try {
-      remote = new URL(origin);
-    } catch {
-      throw new Error(
-        "Origin must be the configured forge repository's HTTPS or SSH clone URL.",
-      );
-    }
-    if (
-      !["https:", "ssh:"].includes(remote.protocol) ||
-      remote.search ||
-      remote.hash ||
-      remote.password ||
-      (remote.protocol === "https:" &&
-        (remote.username || remote.port !== api.port))
-    )
-      throw new Error(
-        "Origin must use HTTPS credentials from a helper or SSH, without embedded secrets.",
-      );
-    remoteHost = remote.hostname;
-    remotePath = remote.pathname.replace(/^\//u, "");
+  let remote: URL;
+  try {
+    remote = new URL(origin);
+  } catch {
+    throw new Error(
+      "Origin must be the configured forge repository's HTTPS clone URL.",
+    );
   }
+  if (
+    remote.protocol !== "https:" ||
+    remote.search ||
+    remote.hash ||
+    remote.username ||
+    remote.password ||
+    remote.port !== api.port
+  )
+    throw new Error("Origin must use HTTPS without embedded secrets.");
+  const remoteHost = remote.hostname;
+  let remotePath = remote.pathname.replace(/^\//u, "");
   remotePath = remotePath.replace(/\.git$/u, "");
   const expectedPath = repository.projectPath;
   const matchesPath =
@@ -925,9 +1047,7 @@ export function assertForgeOrigin(
     !matchesPath ||
     /[\r\n]/u.test(origin)
   )
-    throw new Error(
-      "Local origin does not match the configured forge repository.",
-    );
+    throw new Error("Origin does not match the configured forge repository.");
 }
 
 function isIdentity(value: unknown): value is DirectoryIdentity {
@@ -984,23 +1104,21 @@ async function git(
   cwd: string,
   args: string[],
   signal?: AbortSignal,
+  environment?: NodeJS.ProcessEnv,
 ): Promise<string> {
   signal?.throwIfAborted();
   const env: NodeJS.ProcessEnv = {
+    ...environment,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_ALLOW_PROTOCOL: "https",
+    GIT_ASKPASS: "/bin/false",
     GIT_TERMINAL_PROMPT: "0",
     LANG: "C",
     LC_ALL: "C",
   };
   for (const key of [
     "PATH",
-    "HOME",
-    "XDG_CONFIG_HOME",
-    "SSH_AUTH_SOCK",
-    "GIT_SSH",
-    "GIT_SSH_COMMAND",
-    "GIT_ASKPASS",
-    "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_SYSTEM",
     "HTTPS_PROXY",
     "HTTP_PROXY",
     "NO_PROXY",
@@ -1013,14 +1131,36 @@ async function git(
   ]) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
   }
-  const child = spawn("git", args, {
-    cwd,
-    env,
-    shell: false,
-    detached: process.platform !== "win32",
-    windowsHide: true,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  const child = spawn(
+    "git",
+    [
+      "-c",
+      "core.hooksPath=/dev/null",
+      "-c",
+      "core.fsmonitor=false",
+      "-c",
+      "credential.helper=",
+      "-c",
+      "credential.interactive=false",
+      "-c",
+      "http.followRedirects=false",
+      "-c",
+      "http.sslVerify=true",
+      "-c",
+      "maintenance.auto=false",
+      "-c",
+      "gc.auto=0",
+      ...args,
+    ],
+    {
+      cwd,
+      env,
+      shell: false,
+      detached: process.platform !== "win32",
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
   const output: Buffer[] = [];
   let bytes = 0;
   let failure: unknown;

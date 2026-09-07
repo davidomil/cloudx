@@ -6243,6 +6243,16 @@ a:hover svg {
   align-items: center;
 }
 
+.forge-connections, .forge-gitlab-setup { display: grid; gap: 10px; min-width: 0; }
+.forge-connections { padding-top: 10px; border-top: 1px solid var(--color-border); }
+.forge-connection-heading, .forge-connection-role > div { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+.forge-connection-heading h5 { margin: 0; font-size: var(--font-size-md); }
+.forge-connections p { margin: 0; font-size: var(--font-size-sm); overflow-wrap: anywhere; }
+.forge-connections [role="alert"] { color: var(--color-warning); }
+.forge-connection-roles { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr)); gap: 10px; }
+.forge-connection-role { display: grid; align-content: start; gap: 8px; padding: 10px; border: 1px solid var(--color-border); min-width: 0; }
+.forge-connection-role .cx-button, .forge-gitlab-setup > .cx-button { justify-self: start; }
+
 .settings-dialog small {
   color: var(--color-muted-foreground);
   font-family: var(--font-body);

@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
-import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, ConfigValue, RulesSkillsStore } from "@cloudx/shared";
+import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, ConfigValue, ForgeRepository, RulesSkillsStore } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
+import { ForgeConnections } from "./ForgeConnections.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
 import { TemplateSelect } from "./RulesSkillsPanel.js";
 import type { BrowserNotificationPermissionState } from "./notifications.js";
@@ -31,7 +32,6 @@ export function SettingsDialog({
   const [values, setValues] = useState<CloudxConfigValues>(() => structuredClone(config.values));
   const [defaultTemplateId, setDefaultTemplateId] = useState(rulesSkillsStore?.defaultTemplateId ?? "");
   const [busy, setBusy] = useState(false);
-  const [pendingSecretImports, setPendingSecretImports] = useState(0);
   const dialogRef = useRef<HTMLDivElement | null>(null);
 
   useOutsidePointerDismiss(true, dialogRef, onCancel);
@@ -41,7 +41,6 @@ export function SettingsDialog({
   }, [rulesSkillsStore?.defaultTemplateId]);
 
   async function save() {
-    if (pendingSecretImports) return;
     setBusy(true);
     try {
       if (rulesSkillsStore && onSaveDefaultTemplate && defaultTemplateId !== (rulesSkillsStore.defaultTemplateId ?? "")) {
@@ -51,16 +50,6 @@ export function SettingsDialog({
     } finally {
       setBusy(false);
     }
-  }
-
-  function beginSecretImport(): () => void {
-    setPendingSecretImports(count => count + 1);
-    let finished = false;
-    return () => {
-      if (finished) return;
-      finished = true;
-      setPendingSecretImports(count => count - 1);
-    };
   }
 
   function setGlobalValue(key: string, value: ConfigValue) {
@@ -74,6 +63,7 @@ export function SettingsDialog({
         ...current.plugins,
         [pluginId]: {
           ...(current.plugins[pluginId] ?? {}),
+          ...(pluginId === "forge" && key === "provider" ? { apiUrl: value === "gitlab" ? "https://gitlab.com/api/v4" : "https://api.github.com" } : {}),
           [key]: value
         }
       }
@@ -83,7 +73,7 @@ export function SettingsDialog({
   const globalFields = config.globalFields.filter(isUserVisibleConfigField);
   const pluginSections = config.plugins
     .map((plugin) => ({ ...plugin, fields: plugin.fields.filter(isUserVisibleConfigField) }))
-    .filter((plugin) => plugin.fields.length > 0);
+    .filter((plugin) => plugin.fields.length > 0 || plugin.pluginId === "forge");
 
   return (
     <div className="dialog-backdrop">
@@ -92,7 +82,7 @@ export function SettingsDialog({
         <section className="settings-section">
           <h3>Global</h3>
           {globalFields.map((field) => (
-            <ConfigField key={field.key} field={field} templates={rulesSkillsStore?.templates} beginSecretImport={beginSecretImport} value={values.global[field.key] ?? field.defaultValue} onChange={(value) => setGlobalValue(field.key, value)} />
+            <ConfigField key={field.key} field={field} templates={rulesSkillsStore?.templates} value={values.global[field.key] ?? field.defaultValue} onChange={(value) => setGlobalValue(field.key, value)} />
           ))}
           {rulesSkillsStore ? (
             <TemplateSelect
@@ -119,12 +109,12 @@ export function SettingsDialog({
                     key={`${plugin.pluginId}:${field.key}`}
                     field={field}
                     templates={rulesSkillsStore?.templates}
-                    beginSecretImport={beginSecretImport}
                     value={values.plugins[plugin.pluginId]?.[field.key] ?? field.defaultValue}
                     onChange={(value) => setPluginValue(plugin.pluginId, field.key, value)}
                     onClearSecret={field.type === "secret" && field.secretConfigured && onClearPluginSecret ? () => onClearPluginSecret(plugin.pluginId, field.key) : undefined}
                   />
                 ))}
+                {plugin.pluginId === "forge" ? <ForgeConnections repository={forgeRepository(values.plugins.forge, plugin.fields)} savedRepository={forgeRepository(config.values.plugins.forge, plugin.fields)} /> : null}
               </div>
             ))
           ) : (
@@ -133,7 +123,7 @@ export function SettingsDialog({
         </section>
         <div className="dialog-actions">
           <ControlButton onClick={onCancel} disabled={busy}>Cancel</ControlButton>
-          <ControlButton className="primary-button" tone="primary" onClick={() => void save()} disabled={busy || pendingSecretImports > 0}>Save</ControlButton>
+          <ControlButton className="primary-button" tone="primary" onClick={() => void save()} disabled={busy}>Save</ControlButton>
         </div>
       </div>
     </div>
@@ -189,41 +179,8 @@ function browserNotificationMessage(state: BrowserNotificationPermissionState): 
   return "Allow Cloudx to mirror in-app notifications through the browser notification system.";
 }
 
-function ConfigField({ field, value, onChange, onClearSecret, templates, beginSecretImport }: { field: ConfigFieldDescriptor; value: ConfigValue; onChange: (value: ConfigValue) => void; onClearSecret?: () => Promise<void>; templates?: RulesSkillsStore["templates"]; beginSecretImport: () => () => void }) {
+function ConfigField({ field, value, onChange, onClearSecret, templates }: { field: ConfigFieldDescriptor; value: ConfigValue; onChange: (value: ConfigValue) => void; onClearSecret?: () => Promise<void>; templates?: RulesSkillsStore["templates"] }) {
   const [clearing, setClearing] = useState(false);
-  const [importing, setImporting] = useState(false);
-  const [importMessage, setImportMessage] = useState("");
-  const activeImport = useRef<(() => void) | undefined>(undefined);
-
-  useEffect(() => () => {
-    activeImport.current?.();
-    activeImport.current = undefined;
-  }, []);
-
-  async function importSecretFile(file: File) {
-    setImportMessage("");
-    if (file.size > 64 * 1024) {
-      setImportMessage("Choose a file no larger than 64 KB.");
-      return;
-    }
-    const finish = beginSecretImport();
-    activeImport.current = finish;
-    setImporting(true);
-    try {
-      const text = await file.text();
-      if (activeImport.current !== finish) return;
-      onChange(text);
-      setImportMessage("File imported. Save to apply.");
-    } catch {
-      if (activeImport.current === finish) setImportMessage("Could not read the selected file.");
-    } finally {
-      finish();
-      if (activeImport.current === finish) {
-        activeImport.current = undefined;
-        setImporting(false);
-      }
-    }
-  }
 
   async function clearSecret() {
     if (!onClearSecret) {
@@ -233,7 +190,6 @@ function ConfigField({ field, value, onChange, onClearSecret, templates, beginSe
     try {
       await onClearSecret();
       onChange("");
-      setImportMessage("");
     } finally {
       setClearing(false);
     }
@@ -270,7 +226,7 @@ function ConfigField({ field, value, onChange, onClearSecret, templates, beginSe
     return (
       <label>
         {field.label}
-        <select value={String(value)} onChange={(event) => onChange(parseSelectValue(event.target.value, field))}>
+        <select aria-label={field.label} value={String(value)} onChange={(event) => onChange(parseSelectValue(event.target.value, field))}>
           {(field.options ?? []).map((option) => (
             <option key={`${field.key}:${String(option.value)}`} value={String(option.value)}>
               {selectOptionLabel(option)}
@@ -284,7 +240,6 @@ function ConfigField({ field, value, onChange, onClearSecret, templates, beginSe
 
   if (field.type === "secret") {
     return (
-      <div>
       <label>
         {field.label}
         <span className="settings-secret-control">
@@ -294,26 +249,14 @@ function ConfigField({ field, value, onChange, onClearSecret, templates, beginSe
             placeholder={field.secretConfigured ? "Configured" : ""}
             autoComplete="off"
             aria-label={field.label}
-            disabled={importing || clearing}
-            onChange={(event) => { onChange(event.target.value); setImportMessage(""); }}
+            disabled={clearing}
+            onChange={(event) => onChange(event.target.value)}
           />
-          {onClearSecret ? <ControlButton size="compact" onClick={() => void clearSecret()} disabled={clearing || importing}>Clear</ControlButton> : null}
+          {onClearSecret ? <ControlButton size="compact" onClick={() => void clearSecret()} disabled={clearing}>Clear</ControlButton> : null}
         </span>
         {field.description ? <small>{field.description}</small> : null}
         {field.secretConfigured ? <small>Configured. Leave blank to keep the current value.</small> : null}
       </label>
-      {field.acceptFile ? (
-        <label>
-          Import from file
-          <input type="file" accept={field.acceptFile} aria-label={`Import ${field.label} from file`} disabled={importing || clearing} onChange={event => {
-            const file = event.currentTarget.files?.[0];
-            event.currentTarget.value = "";
-            if (file) void importSecretFile(file);
-          }} />
-          <small role="status">{importing ? "Reading file…" : importMessage}</small>
-        </label>
-      ) : null}
-      </div>
     );
   }
 
@@ -321,6 +264,7 @@ function ConfigField({ field, value, onChange, onClearSecret, templates, beginSe
     <label>
       {field.label}
       <input
+        aria-label={field.label}
         type={field.type === "number" ? "number" : "text"}
         value={String(value)}
         min={field.type === "number" ? field.min : undefined}
@@ -331,6 +275,15 @@ function ConfigField({ field, value, onChange, onClearSecret, templates, beginSe
       {field.description ? <small>{field.description}</small> : null}
     </label>
   );
+}
+
+function forgeRepository(values: Record<string, ConfigValue> | undefined, fields: ConfigFieldDescriptor[]): ForgeRepository | undefined {
+  const value = (key: string) => values?.[key] ?? fields.find(field => field.key === key)?.defaultValue;
+  const provider = value("provider");
+  const apiUrl = value("apiUrl");
+  const projectPath = value("projectPath");
+  if ((provider !== "github" && provider !== "gitlab") || typeof apiUrl !== "string" || typeof projectPath !== "string" || !projectPath.trim()) return undefined;
+  return { provider, apiUrl: apiUrl.trim().replace(/\/$/, ""), projectPath: projectPath.trim() };
 }
 
 function parseSelectValue(raw: string, field: ConfigFieldDescriptor): ConfigValue {

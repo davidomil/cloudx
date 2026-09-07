@@ -62,7 +62,7 @@ function fixture() {
     prepareWorkspace: vi.fn(async (_input: unknown, _signal?: AbortSignal) => ({
       worktreePath: "/repo/work",
       branch: "cloudx/forge/test",
-      repositoryPath: "/repo",
+      repositoryPath: "/repo/work",
     })),
     launch: vi.fn(async () => "tab-1"),
     pause: vi.fn(async () => {}),
@@ -86,7 +86,6 @@ function fixture() {
         apiUrl: "https://api.github.com",
         projectPath: "a/b",
       },
-      repositoryPath: "/repo",
       baseBranch: "main",
       workerTemplateId: "worker",
       reviewTemplateId: "review",
@@ -120,6 +119,16 @@ describe("Forge issue and review workflows", () => {
     const f = fixture();
     const worker = await f.service.startIssue(1, placement);
     expect(worker.status).toBe("running");
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledWith(
+      {
+        id: worker.id,
+        expectedRepository: worker.repository,
+        baseBranch: "main",
+        review: false,
+        headSha: undefined,
+      },
+      expect.any(AbortSignal),
+    );
     f.reports.read.mockResolvedValue({
       kind: "issue",
       title: "Fix issue",
@@ -549,7 +558,7 @@ describe("Forge ownership recovery", () => {
       workspace: orphanId
         ? {
             id: orphanId,
-            repositoryPath: "/repo",
+            repositoryPath: "/repo/orphan",
             worktreePath: "/repo/orphan",
             branch: "cloudx/forge/test",
           }

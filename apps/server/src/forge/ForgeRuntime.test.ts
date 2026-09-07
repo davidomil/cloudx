@@ -31,7 +31,11 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   return (
     await execute("git", args, {
       cwd,
-      env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" },
+      env: {
+        ...process.env,
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: "/dev/null",
+      },
       timeout: 10_000,
     })
   ).stdout.trim();
@@ -39,12 +43,20 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
 
 function dependencies(): ForgeRuntimeDependencies {
   return {
-    git: async (cwd, args) => {
-      const output = await git(cwd, ...args);
-      return args[0] === "remote" && args[1] === "get-url" && output === origin
-        ? "https://github.com/cloudx/test.git"
-        : output;
-    },
+    gitAccess: vi.fn(async () => ({
+      cloneUrl: "https://github.com/cloudx/test.git",
+      authorization: "Basic fixture-secret",
+    })),
+    git: async (cwd, args) =>
+      git(
+        cwd,
+        ...args.map((argument) =>
+          argument === "https://github.com/cloudx/test.git" &&
+          ["fetch", "push"].includes(args[0]!)
+            ? origin
+            : argument,
+        ),
+      ),
     dataDir: path.join(root, "data"),
     pathPolicy: new PathPolicy([root]),
     sessions: {
@@ -82,7 +94,6 @@ async function prepare(
 ): Promise<ForgeWorkspace> {
   const workspace = await runtime.prepareWorkspace({
     id,
-    repositoryPath,
     expectedRepository,
     baseBranch: "main",
     review,
@@ -136,48 +147,78 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await fs.rm(root, { recursive: true, force: true });
 });
 
-describe("ForgeRuntime workspaces", () => {
-  it("validates HTTPS and SSH clone origins against the selected provider and project", () => {
-    for (const remote of [
-      "https://github.com/cloudx/test.git",
-      "git@github.com:cloudx/test.git",
-      "ssh://git@github.com/cloudx/test.git",
-    ])
-      expect(() => assertForgeOrigin(remote, expectedRepository)).not.toThrow();
+describe("ForgeRuntime remote checkouts", () => {
+  it("accepts only the selected repository's credential-free HTTPS clone URL", () => {
     expect(() =>
-      assertForgeOrigin("git@gitlab.example:group/subgroup/project.git", {
+      assertForgeOrigin(
+        "https://github.com/cloudx/test.git",
+        expectedRepository,
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertForgeOrigin("https://gitlab.example/group/subgroup/project.git", {
         provider: "gitlab",
         apiUrl: "https://gitlab.example/api/v4",
         projectPath: "group/subgroup/project",
       }),
     ).not.toThrow();
-    expect(() =>
-      assertForgeOrigin(
-        "https://github.com/cloudx/other.git",
-        expectedRepository,
-      ),
-    ).toThrow("does not match");
-    expect(() =>
-      assertForgeOrigin(
-        "https://unrelated.example/cloudx/test.git",
-        expectedRepository,
-      ),
-    ).toThrow("does not match");
-    expect(() =>
-      assertForgeOrigin(
-        "https://token@github.com/cloudx/test.git",
-        expectedRepository,
-      ),
-    ).toThrow("embedded secrets");
+    for (const remote of [
+      "https://github.com/cloudx/other.git",
+      "https://unrelated.example/cloudx/test.git",
+    ])
+      expect(() => assertForgeOrigin(remote, expectedRepository)).toThrow(
+        "does not match",
+      );
+    for (const remote of [
+      "https://token@github.com/cloudx/test.git",
+      "ssh://git@github.com/cloudx/test.git",
+      "http://github.com/cloudx/test.git",
+    ])
+      expect(() => assertForgeOrigin(remote, expectedRepository)).toThrow(
+        "HTTPS without embedded secrets",
+      );
     expect(() =>
       assertForgeOrigin("/local/repository", expectedRepository),
-    ).toThrow("HTTPS or SSH clone URL");
+    ).toThrow("HTTPS clone URL");
   });
 
-  it("isolates issue changes, publishes the exact committed head, and removes its checkout and branch", async () => {
+  it("creates independent private clones with no source checkout or user Git configuration", async () => {
+    await fs.rm(repositoryPath, { recursive: true });
+    const issue = await prepare();
+    const review = await prepare("review-1", true);
+    expect(issue.repositoryPath).toBe(issue.worktreePath);
+    expect(issue.worktreePath).toBe(
+      path.join(root, "data", "forge-workers", "checkouts", "issue-1"),
+    );
+    expect((await fs.stat(issue.worktreePath)).mode & 0o777).toBe(0o700);
+    expect(await git(issue.worktreePath, "rev-parse", "--git-common-dir")).toBe(
+      ".git",
+    );
+    expect(
+      await git(review.worktreePath, "rev-parse", "--git-common-dir"),
+    ).toBe(".git");
+    expect(await git(issue.worktreePath, "config", "user.name")).toBe(
+      "CloudX issue worker",
+    );
+    expect(await git(issue.worktreePath, "config", "user.email")).toBe(
+      "forge-worker@cloudx.local",
+    );
+    expect(await git(review.worktreePath, "config", "user.email")).toBe(
+      "forge-reviewer@cloudx.local",
+    );
+    await runtime.cleanup(review);
+    expect(await git(issue.worktreePath, "rev-parse", "HEAD")).toBe(headSha);
+    await runtime.cleanup({ ...issue, expectedHeadSha: headSha });
+    await expect(fs.stat(issue.worktreePath)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("publishes the exact committed issue head and removes only the owned clone", async () => {
     const workspace = await prepare();
     expect(await git(workspace.worktreePath, "branch", "--show-current")).toBe(
       "cloudx/forge/issue-1",
@@ -192,33 +233,32 @@ describe("ForgeRuntime workspaces", () => {
     await git(workspace.worktreePath, "add", "change.txt");
     await git(workspace.worktreePath, "commit", "-m", "FIX: resolve issue");
     const published = await runtime.publishBranch(workspace);
-    headSha = published;
     expect(
       await git(origin, "rev-parse", `refs/heads/${workspace.branch}`),
     ).toBe(published);
     expect(await git(repositoryPath, "status", "--porcelain")).toBe("");
-    expect(await git(repositoryPath, "rev-parse", "HEAD")).not.toBe(published);
-    await runtime.cleanup({ ...workspace, expectedHeadSha: headSha });
+    expect(await git(repositoryPath, "rev-parse", "HEAD")).toBe(headSha);
+    await runtime.cleanup({ ...workspace, expectedHeadSha: published });
     await expect(fs.stat(workspace.worktreePath)).rejects.toMatchObject({
       code: "ENOENT",
     });
     expect(
-      await git(
-        repositoryPath,
-        "for-each-ref",
-        `refs/heads/${workspace.branch}`,
-      ),
-    ).toBe("");
-    expect(
       await git(origin, "rev-parse", `refs/heads/${workspace.branch}`),
     ).toBe(published);
     await expect(
-      runtime.cleanup({ ...workspace, expectedHeadSha: headSha }),
+      runtime.cleanup({ ...workspace, expectedHeadSha: published }),
     ).resolves.toBeUndefined();
   });
 
-  it("checks out the exact review head detached and removes generated review files", async () => {
+  it("uses reviewer access for the exact detached head and removes generated review files", async () => {
+    const deps = dependencies();
+    runtime = new ForgeRuntime(deps);
     const workspace = await prepare("review-1", true);
+    expect(deps.gitAccess).toHaveBeenCalledWith(
+      expectedRepository,
+      "reviewer",
+      undefined,
+    );
     expect(workspace.branch).toBe("");
     expect(await git(workspace.worktreePath, "branch", "--show-current")).toBe(
       "",
@@ -233,16 +273,15 @@ describe("ForgeRuntime workspaces", () => {
     await expect(runtime.publishBranch(workspace)).rejects.toThrow(
       "Only an owned issue branch",
     );
-    await runtime.cleanup({ ...workspace, expectedHeadSha: headSha });
+    await runtime.cleanup(workspace);
     await expect(fs.stat(workspace.worktreePath)).rejects.toMatchObject({
       code: "ENOENT",
     });
-    expect(await git(repositoryPath, "branch", "--list")).toBe("* main");
     const nextReview = await prepare("review-1", true);
     await runtime.cleanup(nextReview);
   });
 
-  it("preserves a checkout directory replaced after the worker started", async () => {
+  it("preserves replacements of either the clone directory or its Git directory", async () => {
     const workspace = await prepare();
     await fs.rename(
       workspace.worktreePath,
@@ -259,20 +298,34 @@ describe("ForgeRuntime workspaces", () => {
     expect(
       await fs.readFile(path.join(workspace.worktreePath, "keep.txt"), "utf8"),
     ).toBe("unrelated");
-    expect(
-      await git(repositoryPath, "rev-parse", `refs/heads/${workspace.branch}`),
-    ).toBe(headSha);
+    const review = await prepare("review-1", true);
+    await fs.rename(
+      path.join(review.worktreePath, ".git"),
+      path.join(root, "displaced-git"),
+    );
+    await fs.symlink(
+      path.join(repositoryPath, ".git"),
+      path.join(review.worktreePath, ".git"),
+    );
+    await expect(runtime.cleanup(review)).rejects.toThrow("symbolic link");
+    expect(await git(repositoryPath, "rev-parse", "HEAD")).toBe(headSha);
   });
 
-  it("rejects mismatched ownership records and preserves existing directories", async () => {
-    const existing = path.join(root, "cloudx-forge-issue-1");
-    await fs.mkdir(existing);
+  it("preserves existing directories and rejects mismatched ownership records", async () => {
+    const existing = path.join(
+      root,
+      "data",
+      "forge-workers",
+      "checkouts",
+      "issue-1",
+    );
+    await fs.mkdir(existing, { recursive: true });
     await fs.writeFile(path.join(existing, "keep.txt"), "unrelated");
     await expect(prepare()).rejects.toMatchObject({ code: "EEXIST" });
     await expect(
       runtime.cleanup({
         id: "issue-1",
-        repositoryPath,
+        repositoryPath: existing,
         worktreePath: existing,
         branch: "main",
       }),
@@ -282,35 +335,59 @@ describe("ForgeRuntime workspaces", () => {
     );
   });
 
-  it("rejects duplicate workers and changed branches or remotes", async () => {
+  it("refuses a checkout root redirected outside the private runtime directory", async () => {
+    const outside = path.join(root, "unrelated");
+    const forge = path.join(root, "data", "forge-workers");
+    await fs.mkdir(outside);
+    await fs.mkdir(forge, { recursive: true });
+    await fs.writeFile(path.join(outside, "keep.txt"), "Unrelated data");
+    await fs.symlink(outside, path.join(forge, "checkouts"));
+    await expect(prepare()).rejects.toThrow("symbolic link");
+    expect(await fs.readdir(outside)).toEqual(["keep.txt"]);
+  });
+
+  it("rejects malformed Git credentials before reserving a checkout", async () => {
+    const deps = dependencies();
+    vi.mocked(deps.gitAccess).mockResolvedValue({
+      cloneUrl: "https://github.com/cloudx/test.git",
+      authorization: "Basic token\r\nInjected: header",
+    });
+    runtime = new ForgeRuntime(deps);
+    await expect(prepare()).rejects.toThrow("Git authorization is invalid");
+    await expect(
+      fs.stat(path.join(root, "data", "forge-workers", "checkouts")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("blocks publication when the checkout branch, origin, or Git configuration changes", async () => {
     const workspace = await prepare();
     await expect(prepare()).rejects.toThrow("already owns");
     await expect(
       runtime.cleanup({ ...workspace, branch: "main" }),
     ).rejects.toThrow("ownership does not match");
     await git(workspace.worktreePath, "switch", "--detach");
-    await expect(
-      runtime.cleanup({ ...workspace, expectedHeadSha: headSha }),
-    ).rejects.toThrow("symbolic-ref");
+    await expect(runtime.publishBranch(workspace)).rejects.toThrow(
+      "symbolic-ref",
+    );
     await git(workspace.worktreePath, "switch", workspace.branch);
     await git(
-      repositoryPath,
-      "remote",
-      "set-url",
-      "origin",
-      path.join(root, "changed.git"),
+      workspace.worktreePath,
+      "config",
+      "url.https://unrelated.example/.insteadOf",
+      "https://github.com/",
     );
     await expect(runtime.publishBranch(workspace)).rejects.toThrow(
-      "origin changed",
+      "configuration or origin changed",
     );
-    await runtime.cleanup({ ...workspace, expectedHeadSha: headSha });
+    await expect(
+      runtime.cleanup({ ...workspace, expectedHeadSha: headSha }),
+    ).rejects.toThrow("configuration or origin changed");
   });
 
-  it("requires a valid exact review commit and allowed worktree parent before mutation", async () => {
+  it("validates review commits and ids before creating a private checkout", async () => {
     await expect(
       runtime.prepareWorkspace({
         id: "review",
-        repositoryPath,
         expectedRepository,
         baseBranch: "main",
         review: true,
@@ -319,7 +396,6 @@ describe("ForgeRuntime workspaces", () => {
     await expect(
       runtime.prepareWorkspace({
         id: "../escape",
-        repositoryPath,
         expectedRepository,
         baseBranch: "main",
         review: false,
@@ -329,25 +405,25 @@ describe("ForgeRuntime workspaces", () => {
       ...dependencies(),
       pathPolicy: new PathPolicy([repositoryPath]),
     });
-    await expect(prepare()).rejects.toThrow("outside configured Cloudx roots");
-    expect(await git(repositoryPath, "branch", "--list")).toBe("* main");
+    const workspace = await prepare();
+    expect(workspace.worktreePath.startsWith(path.join(root, "data"))).toBe(
+      true,
+    );
+    await runtime.cleanup({ ...workspace, expectedHeadSha: headSha });
   });
 
-  it("cancels before creating resources and serializes concurrent ownership requests", async () => {
+  it("cancels before reading credentials and serializes concurrent ownership requests", async () => {
+    const deps = dependencies();
+    runtime = new ForgeRuntime(deps);
     const controller = new AbortController();
     controller.abort(new Error("cancelled by user"));
     await expect(
       runtime.prepareWorkspace(
-        {
-          id: "cancel",
-          repositoryPath,
-          expectedRepository,
-          baseBranch: "main",
-          review: false,
-        },
+        { id: "cancel", expectedRepository, baseBranch: "main", review: false },
         controller.signal,
       ),
     ).rejects.toThrow("cancelled by user");
+    expect(deps.gitAccess).not.toHaveBeenCalled();
     const attempts = await Promise.allSettled([prepare(), prepare()]);
     expect(attempts.map((attempt) => attempt.status).sort()).toEqual([
       "fulfilled",
@@ -359,44 +435,38 @@ describe("ForgeRuntime workspaces", () => {
     await runtime.cleanup({ ...created.value, expectedHeadSha: headSha });
   });
 
-  it("removes its reservation after a conflicting branch prevents worker setup", async () => {
-    await git(repositoryPath, "branch", "cloudx/forge/issue-1");
-    await expect(prepare()).rejects.toThrow("switch");
+  it("cleans a failed fetch reservation so the same worker can be prepared again", async () => {
+    const deps = dependencies();
+    const run = deps.git!;
+    deps.git = async (cwd, args, signal, env) => {
+      if (args[0] === "fetch") throw new Error("fetch rejected");
+      return run(cwd, args, signal, env);
+    };
+    runtime = new ForgeRuntime(deps);
+    await expect(prepare()).rejects.toThrow("fetch rejected");
     await expect(
-      fs.stat(path.join(root, "cloudx-forge-issue-1")),
+      fs.stat(path.join(root, "data", "forge-workers", "checkouts", "issue-1")),
     ).rejects.toMatchObject({ code: "ENOENT" });
-    expect(await git(repositoryPath, "rev-parse", "cloudx/forge/issue-1")).toBe(
-      headSha,
-    );
+    runtime = new ForgeRuntime(dependencies());
+    await runtime.cleanup({ ...(await prepare()), expectedHeadSha: headSha });
   });
 
-  it("preserves the issue branch if its checkout disappeared outside owned cleanup", async () => {
-    const workspace = await prepare();
-    await git(repositoryPath, "worktree", "remove", workspace.worktreePath);
-    await expect(
-      runtime.cleanup({ ...workspace, expectedHeadSha: headSha }),
-    ).rejects.toThrow("disappeared before branch cleanup");
-    expect(await git(repositoryPath, "rev-parse", workspace.branch)).toBe(
-      headSha,
-    );
-  });
-
-  it("preserves the branch and checkout when another worktree uses the issue branch", async () => {
+  it("preserves a clone when an additional worktree depends on its Git objects", async () => {
     const workspace = await prepare();
     const other = path.join(root, "other-checkout");
     await git(
-      repositoryPath,
+      workspace.worktreePath,
       "worktree",
       "add",
-      "--force",
+      "--detach",
       other,
-      workspace.branch,
+      "HEAD",
     );
     await expect(
       runtime.cleanup({ ...workspace, expectedHeadSha: headSha }),
     ).rejects.toThrow("Another checkout is using");
     expect(await git(other, "rev-parse", "HEAD")).toBe(headSha);
-    await git(repositoryPath, "worktree", "remove", other);
+    await git(workspace.worktreePath, "worktree", "remove", other);
     await runtime.cleanup({ ...workspace, expectedHeadSha: headSha });
   });
 
@@ -434,7 +504,7 @@ describe("ForgeRuntime workspaces", () => {
     ).toBe("Unreviewed changes");
   });
 
-  it("recovers a checkout created before the workflow saved its returned paths", async () => {
+  it("recovers a completed checkout when the workflow did not save its returned paths", async () => {
     const workspace = await prepare();
     runtime = new ForgeRuntime(dependencies());
     expect(await runtime.recover(workspace.id)).toEqual({
@@ -448,7 +518,7 @@ describe("ForgeRuntime workspaces", () => {
     });
   });
 
-  it("recovers branch ownership if a crash interrupted the final preparation ledger write", async () => {
+  it("recovers the final preparation write but preserves a checkout with unresolved Git process ownership", async () => {
     const workspace = await prepare();
     const manifest = path.join(
       root,
@@ -465,9 +535,190 @@ describe("ForgeRuntime workspaces", () => {
     runtime = new ForgeRuntime(dependencies());
     expect((await runtime.recover(workspace.id)).workspace).toEqual(workspace);
     await runtime.verifyPublishedWorkspace(workspace, headSha);
-    await runtime.cleanup({ ...workspace, expectedHeadSha: headSha });
+    await fs.writeFile(
+      manifest,
+      JSON.stringify({ ...record, prepared: false, gitPending: true }),
+    );
+    await expect(runtime.recover(workspace.id)).rejects.toThrow(
+      "before process exit was recorded",
+    );
+    await expect(
+      runtime.cleanup({ ...workspace, expectedHeadSha: headSha }),
+    ).rejects.toThrow("Git operation is unresolved");
+    await fs.writeFile(
+      manifest,
+      JSON.stringify({ ...record, gitPending: true }),
+    );
+    await expect(runtime.recover(workspace.id)).rejects.toThrow(
+      "before process exit was recorded",
+    );
+    await expect(runtime.publishBranch(workspace)).rejects.toThrow(
+      "Git operation is unresolved",
+    );
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(
+      headSha,
+    );
   });
 });
+
+describe.skipIf(process.platform !== "linux")(
+  "ForgeRuntime Git subprocesses",
+  () => {
+    it("passes refreshed application authorization only to bounded fetch and push processes", async () => {
+      const fixture = await installGitFixture();
+      const deps = dependencies();
+      let token = 0;
+      deps.gitAccess = vi.fn(async () => ({
+        cloneUrl: "https://github.com/cloudx/test.git",
+        authorization: `Basic private-${++token}`,
+      }));
+      delete deps.git;
+      runtime = new ForgeRuntime(deps);
+      const workspace = await prepare();
+      await runtime.publishBranch(workspace);
+      const records = (await fs.readFile(fixture.records, "utf8"))
+        .trim()
+        .split("\n")
+        .map(
+          (line) =>
+            JSON.parse(line) as { args: string[]; env: Record<string, string> },
+        );
+      const authenticated = records.filter(
+        (record) => record.env.GIT_CONFIG_COUNT === "2",
+      );
+      expect(
+        authenticated.map((record) =>
+          record.args.find((arg) => ["fetch", "push"].includes(arg)),
+        ),
+      ).toEqual(["fetch", "push"]);
+      expect(
+        authenticated.map((record) => record.env.GIT_CONFIG_VALUE_1),
+      ).toEqual([
+        "Authorization: Basic private-1",
+        "Authorization: Basic private-2",
+      ]);
+      for (const record of authenticated) {
+        expect(record.env).toMatchObject({
+          GIT_CONFIG_NOSYSTEM: "1",
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_ALLOW_PROTOCOL: "https",
+          GIT_ASKPASS: "/bin/false",
+          GIT_CONFIG_KEY_1:
+            "http.https://github.com/cloudx/test.git.extraHeader",
+        });
+        expect(record.args).toContain("credential.helper=");
+        expect(record.args).toContain("http.followRedirects=false");
+        expect(record.args).toContain("core.hooksPath=/dev/null");
+        expect(record.args.join(" ")).not.toContain("private-");
+      }
+      expect(deps.gitAccess).toHaveBeenNthCalledWith(
+        1,
+        expectedRepository,
+        "worker",
+        undefined,
+      );
+      expect(deps.gitAccess).toHaveBeenNthCalledWith(
+        2,
+        expectedRepository,
+        "worker",
+        undefined,
+      );
+      const config = await fs.readFile(
+        path.join(workspace.worktreePath, ".git", "config"),
+        "utf8",
+      );
+      const manifest = await fs.readFile(
+        path.join(root, "data", "forge-workers", "workspaces", "issue-1.json"),
+        "utf8",
+      );
+      expect(config + manifest).not.toContain("private-");
+      expect(config).toContain("https://github.com/cloudx/test.git");
+      await runtime.cleanup({ ...workspace, expectedHeadSha: headSha });
+    });
+
+    it("awaits cancellation of a fetch and its child process before removing the owned checkout", async () => {
+      const fixture = await installGitFixture(true);
+      const deps = dependencies();
+      delete deps.git;
+      runtime = new ForgeRuntime(deps);
+      const controller = new AbortController();
+      const pending = runtime.prepareWorkspace(
+        {
+          id: "cancelled-fetch",
+          expectedRepository,
+          baseBranch: "main",
+          review: false,
+        },
+        controller.signal,
+      );
+      void pending.catch(() => undefined);
+      try {
+        let pids: number[] = [];
+        await vi.waitFor(
+          async () => {
+            pids = JSON.parse(await fs.readFile(fixture.children, "utf8"));
+          },
+          { timeout: 3_000 },
+        );
+        controller.abort(new Error("fetch cancelled"));
+        await expect(pending).rejects.toThrow("fetch cancelled");
+        for (const pid of pids) {
+          const stat = await fs
+            .readFile(`/proc/${pid}/stat`, "utf8")
+            .catch(() => undefined);
+          expect(
+            stat === undefined ||
+              stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z "),
+          ).toBe(true);
+        }
+        await expect(
+          fs.stat(
+            path.join(
+              root,
+              "data",
+              "forge-workers",
+              "checkouts",
+              "cancelled-fetch",
+            ),
+          ),
+        ).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        controller.abort();
+        await pending.catch(() => undefined);
+      }
+    });
+  },
+);
+
+async function installGitFixture(hangFetch = false) {
+  const actualGit = (await execute("which", ["git"])).stdout.trim();
+  const bin = path.join(root, "bin");
+  const records = path.join(root, "git-processes.jsonl");
+  const children = path.join(root, "git-children.json");
+  await fs.mkdir(bin);
+  await fs.writeFile(
+    path.join(bin, "git"),
+    `#!${process.execPath}
+const fs = require("node:fs");
+const { spawn, spawnSync } = require("node:child_process");
+const args = process.argv.slice(2);
+const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("GIT_")));
+fs.appendFileSync(${JSON.stringify(records)}, JSON.stringify({ args, env }) + "\\n");
+if (${hangFetch} && args.includes("fetch")) {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  fs.writeFileSync(${JSON.stringify(children)}, JSON.stringify([process.pid, child.pid]));
+  setInterval(() => {}, 1000);
+} else {
+  const mapped = args.map((arg) => arg === "https://github.com/cloudx/test.git" && args.some((item) => item === "fetch" || item === "push") ? ${JSON.stringify(origin)} : arg);
+  const result = spawnSync(${JSON.stringify(actualGit)}, mapped, { env: { ...process.env, GIT_ALLOW_PROTOCOL: "file" }, stdio: "inherit" });
+  process.exit(result.status ?? 1);
+}
+`,
+    { mode: 0o700 },
+  );
+  vi.stubEnv("PATH", `${bin}:${process.env.PATH}`);
+  return { records, children };
+}
 
 describe("ForgeRuntime Codex tabs", () => {
   it("launches the configured template and prompt as startup input, then stops before closing placement", async () => {
@@ -501,6 +752,12 @@ describe("ForgeRuntime Codex tabs", () => {
       }),
     );
     expect(deps.sessions.executePluginAction).not.toHaveBeenCalled();
+    await expect(runtime.publishBranch(workspace)).rejects.toThrow(
+      "Stop the worker process",
+    );
+    await expect(
+      runtime.cleanup({ ...workspace, expectedHeadSha: headSha }),
+    ).rejects.toThrow("Stop the worker process");
     await runtime.pause(tab.id);
     expect(deps.sessions.executePluginAction).toHaveBeenLastCalledWith(
       tab.id,

@@ -2,6 +2,7 @@ import { isUsableTabLayoutState, listTabLayoutPanes } from "./workspaceLayout.js
 
 export * from "./forge.js";
 export * from "./forgeWorkers.js";
+export * from "./forgeConnections.js";
 
 export const DEFAULT_VOICE_MODEL = "gpt-5.3-codex-spark";
 
@@ -587,7 +588,6 @@ export interface ConfigFieldDescriptor {
   visibility?: "user" | "internal";
   defaultValue: ConfigValue;
   secretConfigured?: boolean;
-  acceptFile?: string;
   optionSource?: "rulesSkills.templates";
   options?: ConfigFieldOption[];
   min?: number;

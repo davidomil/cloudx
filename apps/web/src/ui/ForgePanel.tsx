@@ -91,7 +91,7 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, on
     {!dashboard && !loadError ? <p role="status" className="forge-empty">Loading Forge…</p> : null}
     {dashboard && !dashboard.configured ? <div className="forge-empty">
       <p>{dashboard.configurationError ?? "Configure a GitHub or GitLab repository to start work."}</p>
-      <p>Set the local checkout, worker and review templates, and worker and reviewer credentials in Forge settings.</p>
+      <p>Choose the repository and templates, then connect the issue worker and reviewer in Forge settings.</p>
       {onOpenSettings ? <ControlButton onClick={onOpenSettings}>Configure Forge</ControlButton> : null}
     </div> : null}
     {dashboard ? <>

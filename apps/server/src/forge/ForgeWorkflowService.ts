@@ -14,7 +14,6 @@ import { parseReview, parseWorkerReport } from "./ForgeWorkflowValidation.js";
 
 export interface ForgeSettings {
   repository: ForgeRepository;
-  repositoryPath: string;
   baseBranch: string;
   workerTemplateId: string;
   reviewTemplateId: string;
@@ -36,7 +35,6 @@ interface Runtime {
   prepareWorkspace(
     input: {
       id: string;
-      repositoryPath: string;
       baseBranch: string;
       headSha?: string;
       review: boolean;
@@ -218,7 +216,6 @@ export class ForgeWorkflowService {
         number,
         title: item.title,
         repository: settings.repository,
-        repositoryPath: settings.repositoryPath,
         baseBranch:
           kind === "review"
             ? (item as ForgeChangeRequest).baseBranch
@@ -246,7 +243,6 @@ export class ForgeWorkflowService {
         const workspace = await this.deps.runtime.prepareWorkspace(
           {
             id: worker.id,
-            repositoryPath: worker.repositoryPath,
             baseBranch: worker.baseBranch,
             headSha: worker.headSha,
             review: kind === "review",
@@ -376,7 +372,6 @@ export class ForgeWorkflowService {
             await this.deps.runtime.prepareWorkspace(
               {
                 id: worker.id,
-                repositoryPath: worker.repositoryPath,
                 baseBranch: worker.baseBranch,
                 headSha: worker.headSha,
                 review: worker.kind === "review",
@@ -481,7 +476,7 @@ export class ForgeWorkflowService {
     worker: ForgeWorker,
     report: { title: string; body: string; resolvedDiscussionIds: string[] },
   ): Promise<void> {
-    if (!worker.worktreePath || !worker.branch)
+    if (!worker.worktreePath || !worker.branch || !worker.repositoryPath)
       throw new Error("Issue workspace is missing.");
     const provider = this.providerFor(worker);
     if (!worker.changeNumber) await this.reconcilePublication(worker, provider);
@@ -679,7 +674,8 @@ export class ForgeWorkflowService {
   private async cleanup(worker: ForgeWorker): Promise<void> {
     try {
       await this.quiesce(worker);
-      if (worker.worktreePath)
+      if (worker.worktreePath) {
+        if (!worker.repositoryPath) throw new Error("Worker checkout ownership is missing.");
         await this.deps.runtime.cleanup({
           id: worker.id,
           repositoryPath: worker.repositoryPath,
@@ -687,6 +683,7 @@ export class ForgeWorkflowService {
           branch: worker.branch ?? "",
           expectedHeadSha: worker.kind === "issue" ? worker.headSha : undefined,
         });
+      }
       worker.worktreePath = undefined;
       worker.branch = undefined;
     } catch (error) {

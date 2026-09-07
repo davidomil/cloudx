@@ -1,4 +1,4 @@
-import { sign } from "node:crypto";
+import { createPrivateKey, sign } from "node:crypto";
 import type { ForgeCredentialRole, ForgeRepository } from "@cloudx/shared";
 import { ForgeProviderError } from "./ForgeProvider.js";
 import { record, string } from "./validation.js";
@@ -65,6 +65,34 @@ export function validateRepository(repository: ForgeRepository): URL {
   return url;
 }
 
+export function forgeWebOrigin(repository: ForgeRepository): string {
+  const api = validateRepository(repository);
+  if (repository.provider === "github" && api.hostname === "api.github.com")
+    return "https://github.com";
+  return api.origin;
+}
+
+export function githubAppJwt(app: {
+  appId: string;
+  privateKey: string;
+}): string {
+  if (!/^[A-Za-z0-9_]+$/.test(app.appId))
+    throw new ForgeProviderError("Set a valid GitHub App ID or client ID.");
+  const now = Math.floor(Date.now() / 1000);
+  const encode = (value: unknown) =>
+    Buffer.from(JSON.stringify(value)).toString("base64url");
+  const payload = `${encode({ alg: "RS256", typ: "JWT" })}.${encode({ iat: now - 60, exp: now + 540, iss: app.appId })}`;
+  try {
+    const key = createPrivateKey(app.privateKey);
+    if (key.asymmetricKeyType !== "rsa") throw new Error("RSA key required");
+    return `${payload}.${sign("RSA-SHA256", Buffer.from(payload), key).toString("base64url")}`;
+  } catch {
+    throw new ForgeProviderError(
+      "The GitHub App private key is not a valid RSA signing key.",
+    );
+  }
+}
+
 export class ForgeCredentials {
   private readonly installationTokens = new Map<
     ForgeCredentialRole,
@@ -117,6 +145,23 @@ export class ForgeCredentials {
       : { Authorization: `Bearer ${credential.token}` };
   }
 
+  async gitAccess(
+    role: ForgeCredentialRole,
+    signal?: AbortSignal,
+  ): Promise<{ cloneUrl: string; authorization: string }> {
+    const headers = await this.headers(role, signal);
+    const token =
+      "PRIVATE-TOKEN" in headers
+        ? headers["PRIVATE-TOKEN"]
+        : headers.Authorization.slice("Bearer ".length);
+    const username =
+      this.repository.provider === "github" ? "x-access-token" : "oauth2";
+    return {
+      cloneUrl: `${forgeWebOrigin(this.repository)}/${this.repository.projectPath}.git`,
+      authorization: `Basic ${Buffer.from(`${username}:${token}`).toString("base64")}`,
+    };
+  }
+
   private async installationToken(
     role: ForgeCredentialRole,
     credential: Extract<ForgeCredential, { kind: "github-app" }>,
@@ -133,22 +178,7 @@ export class ForgeCredentials {
     const cached = this.installationTokens.get(role);
     if (cached?.credential === identity && cached.expires > Date.now() + 60_000)
       return cached.token;
-    const now = Math.floor(Date.now() / 1000);
-    const encode = (value: unknown) =>
-      Buffer.from(JSON.stringify(value)).toString("base64url");
-    const payload = `${encode({ alg: "RS256", typ: "JWT" })}.${encode({ iat: now - 60, exp: now + 540, iss: credential.appId })}`;
-    let signature: string;
-    try {
-      signature = sign(
-        "RSA-SHA256",
-        Buffer.from(payload),
-        credential.privateKey,
-      ).toString("base64url");
-    } catch {
-      throw new ForgeProviderError(
-        "The GitHub App private key is not a valid RSA signing key.",
-      );
-    }
+    const jwt = githubAppJwt(credential);
     let response: Response;
     signal?.throwIfAborted();
     try {
@@ -162,7 +192,7 @@ export class ForgeCredentials {
             ...(signal ? [signal] : []),
           ]),
           headers: {
-            Authorization: `Bearer ${payload}.${signature}`,
+            Authorization: `Bearer ${jwt}`,
             Accept: "application/vnd.github+json",
             "X-GitHub-Api-Version": "2026-03-10",
             "Content-Type": "application/json",

@@ -115,7 +115,6 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
     for (const key of [
       "id",
       "title",
-      "repositoryPath",
       "baseBranch",
       "templateId",
       "startedAt",
@@ -159,6 +158,7 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
     text(repository.apiUrl, "repository URL", 4096);
     text(repository.projectPath, "repository path", 4096);
     for (const key of [
+      "repositoryPath",
       "worktreePath",
       "branch",
       "tabId",

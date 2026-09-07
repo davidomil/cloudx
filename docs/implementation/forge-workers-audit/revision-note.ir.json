@@ -1,0 +1,344 @@
+{
+  "title": "Forge Workers current revision",
+  "doc_kind": "technical_doc",
+  "audience": "CloudX implementers reviewing the replacement revision",
+  "style_profile": "compact_evidence_first",
+  "targets": [
+    "gfm"
+  ],
+  "source_inventory": [
+    {
+      "id": "src_forge_settings",
+      "title": "Forge settings",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/forge/ForgeSettingsService.ts",
+      "revision": "sha256:7562f60a76c464e841ab2585f9f8c07d12d17dc9dff80c096c35ad22ba7ed684",
+      "notes": "Implementation behavior and constraints only."
+    },
+    {
+      "id": "src_forge_credentials",
+      "title": "Credential adapters",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/forge/providers/ForgeCredentials.ts",
+      "revision": "sha256:cc2d2813ebf7d151857096273dd16c9f3dbc19dad3aedbd8ca8f9a049c557be0",
+      "notes": "Implementation behavior and constraints only."
+    },
+    {
+      "id": "src_forge_runtime",
+      "title": "Owned Git and Codex runtime",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/forge/ForgeRuntime.ts",
+      "revision": "sha256:865fbeb6a996621552d45acb7517107c722768f4afbaf0194e93610073b2eea2",
+      "notes": "Implementation behavior and constraints only."
+    },
+    {
+      "id": "src_forge_settings_ui",
+      "title": "Settings connection and template choices",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/web/src/ui/SettingsDialog.tsx",
+      "notes": "Production ordinary Settings access, canonical repository matching and named templates.",
+      "revision": "sha256:6107311ca2bf2cf9f753a7ad74cf06ef467dff09020cb33b3cd9effb7c2cbb99"
+    },
+    {
+      "id": "src_forge_lifecycle_tests",
+      "title": "Production PTY issue and review lifecycle integration",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/forge/ForgeLifecycle.integration.test.ts",
+      "notes": "Linux production PTY, CodexTerminalPlugin, SessionStore and Forge workflow/store/runtime with temporary Git repositories, a deterministic assistant executable and local Forge provider fixture.",
+      "revision": "sha256:e52a0b7e7c8bcf5f41f1fabf17606f6f285453972a19a01d29648b3d5be18707"
+    },
+    {
+      "id": "src_forge_connection_service",
+      "title": "Application connection lifecycle",
+      "locator": "apps/server/src/forge/connections/ForgeConnectionService.ts",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "notes": "Primary implementation of registration, installation verification, public status and one-time GitLab provisioning.",
+      "revision": "sha256:a71fff319b7eb462df12d4d61e4a31afb44ba3670f6ad72e7cab84cbdfb2fa49"
+    },
+    {
+      "id": "src_forge_connection_store",
+      "title": "Private connection persistence",
+      "locator": "apps/server/src/forge/connections/ForgeConnectionStore.ts",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "notes": "Persists generated application/bot credentials and explicit operation phases; setup token is not part of its record.",
+      "revision": "sha256:6c2a0b5ad04704336754e3021ee63e72ed18ffa17ec064d7d1f5488ef875969d"
+    },
+    {
+      "id": "src_forge_registration",
+      "title": "Provider registration operations",
+      "locator": "apps/server/src/forge/connections/ForgeRegistrationClient.ts",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "notes": "Provider manifest, project service-account membership and token operations.",
+      "revision": "sha256:c7bfe7d54b64b42708f2866fb600802b169674a4b2dc72ebdd75b500aa426f31"
+    },
+    {
+      "id": "src_forge_connection_ui",
+      "title": "Connection controls in Settings",
+      "locator": "apps/web/src/ui/ForgeConnections.tsx",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "notes": "Per-role connection progress, consent popup, temporary GitLab setup token and expired-token renewal.",
+      "revision": "sha256:f56ad40ecf64369964554b15b59cc2eb8bf4ff39aee25bdf835f40c2ad06f330"
+    },
+    {
+      "id": "src_forge_github_manifest",
+      "title": "GitHub App registration from manifests",
+      "locator": "https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest",
+      "source_type": "web",
+      "authority": "primary",
+      "notes": "Official primary documentation; active archive doc_503af7c23be86ff6ed739973. Manifest registration creates app credentials through a provider consent flow.",
+      "revision": "2026-09-07"
+    },
+    {
+      "id": "src_forge_gitlab_accounts",
+      "title": "GitLab project service accounts",
+      "locator": "https://docs.gitlab.com/user/profile/service_accounts/",
+      "source_type": "web",
+      "authority": "primary",
+      "notes": "Official primary documentation; active archive doc_5615aa0c8d8ce0ad55b54c00, HTML chunks193405–193409. Project service accounts became generally available in18.11; project Maintainer/Owner prerequisite.",
+      "revision": "2026-09-07"
+    },
+    {
+      "id": "src_forge_gitlab_account_api",
+      "title": "GitLab service account API",
+      "locator": "https://docs.gitlab.com/api/service_accounts/",
+      "source_type": "web",
+      "authority": "primary",
+      "notes": "Official primary documentation; active archive doc_d34d70dda722f123f3025161. Project service account and bot token endpoints.",
+      "revision": "2026-09-07"
+    },
+    {
+      "id": "src_forge_remote_verification",
+      "title": "Managed repository and connection revision validation",
+      "source_type": "other",
+      "authority": "primary",
+      "locator": "docs/implementation/forge-workers-audit/remote-verification-runs.txt",
+      "notes": "Exact executed commands, selected original output, raw log hashes and production-component browser observations. Earlier delivery evidence is separately labeled.",
+      "revision": "sha256:0e1071fe8658b9d019d6c2c995be7c92d6f3b2812ea9281b118069b63e2aa70c"
+    }
+  ],
+  "source_gaps": [],
+  "sections": [
+    {
+      "title": "Current revision: managed repositories and connected applications",
+      "claims": [
+        {
+          "id": "repository",
+          "text": "Settings select the remote provider, API endpoint, repository and target branch; switching provider sets its standard API endpoint.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_settings",
+              "locator": "repository; forgeConfigFields",
+              "excerpt": "Requires provider/apiUrl/projectPath/baseBranch; no local repository or manual credential fields."
+            },
+            {
+              "source_id": "src_forge_credentials",
+              "locator": "validateRepository",
+              "excerpt": "HTTPS endpoints; GitHub owner/repository or enterprise /api/v3; GitLab subgroup paths and /api/v4."
+            },
+            {
+              "source_id": "src_forge_settings_ui",
+              "locator": "setPluginValue; forgeRepository",
+              "excerpt": "Provider changes select the corresponding standard API URL; repository comparison strips the same trailing slash as the server."
+            }
+          ]
+        },
+        {
+          "id": "managed-checkout",
+          "text": "Forge automatically prepares private managed checkouts and authenticates Git using connected identities without local checkout configuration.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_runtime",
+              "locator": "prepareWorkspace; checkoutPath; access; runOwnedGit",
+              "excerpt": "Creates a private checkout under dataDir/forge-workers/checkouts, initializes its Git repository, fetches the exact base/head using an authorization header and excludes credentials from origin URL."
+            },
+            {
+              "source_id": "src_forge_settings",
+              "locator": "settings; gitAccess",
+              "excerpt": "Runtime settings require remote repository/templates rather than a local repositoryPath; Git access resolves the connected role credentials."
+            }
+          ]
+        },
+        {
+          "id": "github",
+          "text": "GitHub setup registers one app per role, receives generated app credentials, verifies repository installation and resumes existing attempts on the same CloudX origin.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_github_manifest",
+              "locator": "Implementing the GitHub App Manifest flow",
+              "excerpt": "Manifest POST initiates registration; callback code exchanges for generated app credentials."
+            },
+            {
+              "source_id": "src_forge_connection_service",
+              "locator": "beginGitHub; completeGitHubManifest; completeGitHubInstallation",
+              "excerpt": "Existing registering/installing phases reuse state/app; changed callback origin is rejected; connected follows installation verification."
+            },
+            {
+              "source_id": "src_forge_connection_ui",
+              "locator": "connectGitHub; openConsent",
+              "excerpt": "Opens consent synchronously, submits returned GET or POST, and observes server status."
+            }
+          ]
+        },
+        {
+          "id": "gitlab",
+          "text": "GitLab project service accounts became generally available in 18.11; a one-time personal access token with api scope and project access is checked before provisioning both bot accounts, memberships and tokens.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_connection_service",
+              "locator": "provisionGitLab",
+              "excerpt": "Loops worker/reviewer roles, keeps active records, creates accounts/membership/tokens and persists bot credentials."
+            },
+            {
+              "source_id": "src_forge_registration",
+              "locator": "gitlabCheckSetup; gitlabCreateAccount; gitlabGrantAccess; gitlabCreateToken",
+              "excerpt": "Checks active, nonrevoked personal access token with api scope and lists project service accounts before writes; then creates accounts, role memberships and personal access tokens."
+            },
+            {
+              "source_id": "src_forge_gitlab_accounts",
+              "locator": "Project service accounts",
+              "excerpt": "Project service accounts became generally available in GitLab 18.11. Project Maintainer/Owner or supported instance administrator can create project service accounts."
+            },
+            {
+              "source_id": "src_forge_gitlab_account_api",
+              "locator": "Create a project service account; Create a personal access token for a project service account",
+              "excerpt": "Documents project service-account and personal-access-token endpoints."
+            }
+          ]
+        },
+        {
+          "id": "secret",
+          "text": "The one-time GitLab setup token is cleared from the input after submission and is not part of persistent connection records.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_connection_ui",
+              "locator": "connectGitLab",
+              "excerpt": "Copies the current token only into the request call and clears local input state before awaiting."
+            },
+            {
+              "source_id": "src_forge_connection_store",
+              "locator": "StoredForgeConnection; read validation",
+              "excerpt": "Persistent records contain generated bot/app credentials and phases; no setupToken field."
+            },
+            {
+              "source_id": "src_forge_connection_service",
+              "locator": "provisionGitLab; status; publicConnection",
+              "excerpt": "Setup token is only passed into registration operations; public connection status omits all credentials."
+            }
+          ]
+        },
+        {
+          "id": "connection-recovery",
+          "text": "Expired GitLab access can be renewed for the existing accounts without replacing active roles; failed setup remains explicit attention.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_connection_service",
+              "locator": "provisionGitLab; tokenExpired; publicConnection",
+              "excerpt": "Expired connected records reuse existing account IDs; active roles are skipped. Failed records block further provisioning. Read-only preflight runs before creating any record."
+            },
+            {
+              "source_id": "src_forge_connection_ui",
+              "locator": "renewTokens; role rendering",
+              "excerpt": "Shows token expiry/renewal; hides GitHub failed-role actions and hides GitLab setup submission if either role failed."
+            }
+          ]
+        },
+        {
+          "id": "manifest-replacement",
+          "text": "The managed-checkout runtime rejects ownership manifests that lack its required current fields and private checkout layout; no earlier-manifest compatibility is implemented.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_runtime",
+              "locator": "readOwned",
+              "excerpt": "Requires role, gitPending, prepared, launchPending, repository identity and checkoutPath(id); missing or mismatched ownership record throws."
+            }
+          ]
+        },
+        {
+          "id": "verification",
+          "text": "The replacement revision full suite passed 2305 tests in 120 files with maxWorkers=2; typecheck and build passed.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_remote_verification",
+              "locator": "remote-full; remote-typecheck; remote-build",
+              "excerpt": "120 files and 2305 tests passed in 45.68s; typecheck passed; build completed with existing chunk-size warning."
+            },
+            {
+              "source_id": "src_forge_remote_verification",
+              "locator": "shipped-shell-browser",
+              "excerpt": "12 shipped-shell desktop/mobile checks passed in 10.1s."
+            }
+          ]
+        },
+        {
+          "id": "verification-scope",
+          "text": "Linux integration scenarios exercise actual PTY/Git issue and review lifecycles with deterministic assistant/provider fixtures; this evidence does not demonstrate live provider registration/authentication or model execution.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_lifecycle_tests",
+              "locator": "Forge lifecycle through real Codex tabs; LifecycleFixture; LocalForgeProvider; fakeAssistant; processIsRunning",
+              "excerpt": "Actual NodePtyTerminalProcessFactory, CodexTerminalPlugin, SessionStore and Forge workflow/runtime/store. Fixture assistant reports completion across feedback/approval turns and review edits; local provider handles publication. Owned assistant /proc states verify termination."
+            },
+            {
+              "source_id": "src_forge_remote_verification",
+              "locator": "connection-browser",
+              "excerpt": "Provider registration browser interaction uses intercepted fixture endpoints, not live GitHub/GitLab."
+            }
+          ]
+        }
+      ],
+      "blocks": [
+        {
+          "kind": "paragraph",
+          "text": "This revision replaces the local-checkout and manual-credential setup described in the earlier delivery history below. Configure a remote repository; Forge creates private owned checkouts and authenticates Git with the connected worker or reviewer identity.",
+          "claim_ids": [
+            "repository",
+            "managed-checkout"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "GitHub uses a separate generated app manifest for each role, followed by registration and installation consent. GitLab uses one temporary personal access token to provision two project service accounts, their memberships and bot tokens. Read-only token and project API checks precede writes. Expired access renews tokens for the existing bot accounts while preserving active connections; uncertain mutations remain blocked for inspection. The setup token is not retained.",
+          "claim_ids": [
+            "github",
+            "gitlab",
+            "secret",
+            "connection-recovery"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "Earlier ownership manifests are not migrated. The current runtime requires its managed-checkout ownership fields and layout before cleanup.",
+          "claim_ids": [
+            "manifest-replacement"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "Current revision verification: `npx vitest run --maxWorkers=2 --reporter=dot` passed 2,305 tests in 120 files; `npm run typecheck` and `npm run build` passed. `npx playwright test --reporter=line` passed 12 shipped-shell browser checks. Actual PTY/Git lifecycle tests use deterministic assistant/provider fixtures. Live provider registration, credentials and Codex model execution remain unverified.",
+          "claim_ids": [
+            "verification",
+            "verification-scope"
+          ]
+        }
+      ]
+    }
+  ]
+}

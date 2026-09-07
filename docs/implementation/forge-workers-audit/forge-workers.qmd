@@ -12,19 +12,19 @@ format:
 
 ## Configure
 
-Forge Workers runs on CloudX’s Linux host and tracks one configured GitHub or GitLab repository. Create a Forge Workers tab, then open Settings and complete the Forge fields.
+Forge Workers runs on CloudX’s Linux host and tracks one configured GitHub or GitLab repository. Open **Settings → Plugins → Forge Workers**; a Forge tab is not required for setup.
 
-Set the provider, repository path, local checkout and issue target branch. Use `https://api.github.com` for GitHub, an enterprise endpoint ending in `/api/v3`, or a GitLab endpoint ending in `/api/v4`. Both fetch and push origins must identify that repository.
+Set the provider, repository and issue target branch. GitHub uses `https://api.github.com`; enterprise endpoints end in `/api/v3`, and GitLab endpoints end in `/api/v4`. Selecting a provider sets its standard API URL. Create templates in Rules / Skills, then choose **Issue worker template** and **Review template** by name. Set the worker time limit in minutes.
 
-The checkout’s parent must be an allowed CloudX root because workers create sibling worktrees. Configure Git authentication for fetch/push separately from the plugin’s API credentials.
+Forge creates isolated checkouts in its private data directory and authenticates Git through the connected app or bot. You do not select a local checkout or configure separate Git credentials.
 
-Create templates in Rules / Skills, then choose **Issue worker template** and **Review template** by name in Settings. Set the worker time limit in minutes.
+Save the repository settings, then reopen Settings to connect. The **Issue worker** and **Reviewer** cards show separate identities and progress; unsaved destination changes disable connection actions.
 
-Configure both worker and reviewer credentials. Use distinct application or bot identities when review comments should appear under a different account; public configuration omits stored secrets.
+For GitHub, click **Connect issue worker** and **Connect reviewer** separately. Complete each app registration and repository installation in the GitHub window. CloudX receives the generated credentials and verifies access. The **Continue** actions resume that app’s setup. Use the same CloudX address throughout the flow. GitHub documents the [manifest registration process](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest).
 
-For GitHub, choose **GitHub App installation** and enter that role’s client ID and numeric installation ID. Use **Import from file** for its RSA private-key PEM file (up to 64 KB), then **Save** to apply it. Install the app on the repository and grant the operations that role needs; Forge exchanges the signed JWT for installation tokens. See [GitHub installation authentication](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app).
+For GitLab, use version 18.11 or later and a one-time personal access token with `api` scope and project Maintainer/Owner access. Click **Create GitLab bot connections**. Forge checks token and project access before creating separate service accounts, project memberships and bot tokens. It stores the bot credentials; the setup token is cleared and is not stored. See GitLab’s [service accounts API](https://docs.gitlab.com/api/service_accounts/) and [account prerequisites](https://docs.gitlab.com/user/profile/service_accounts/).
 
-For GitLab, create separate bot/access tokens with `api` scope and the project permissions needed by each role, then choose **Bot / access token**. [GitLab project access tokens](https://docs.gitlab.com/user/project/settings/project_access_tokens/) create associated bot users. **GitLab OAuth application token** accepts an already issued token; this plugin has no OAuth sign-in or refresh flow.
+GitLab cards show token expiry dates. **Renew expired GitLab tokens** uses another one-time setup token for the existing bot accounts and keeps active connections. A failed preflight can be corrected before any account creation. An uncertain setup result blocks another submission; inspect the recorded provider error and project service accounts.
 
 ## Work on an issue
 
@@ -36,7 +36,7 @@ After review, click **Resume**. Codex assesses the latest issue and PR/MR commen
 
 ![Resume assesses current feedback before merge eligibility.](assets/generated/issue-flow.png){fig-alt="Issue work publishes a request and pauses. Resume assesses current feedback, then either pauses again or merges and cleans owned resources." width="100%"}
 
-After merge, Forge removes its owned checkout, local branch and worker artifacts. Ownership changes, dirty files or a local commit different from the published head block cleanup and preserve the resources.
+After merge, Forge removes its owned checkout and worker artifacts. Ownership changes, dirty files or a local commit different from the published head block cleanup and preserve the resources.
 
 ## Review PRs and MRs
 
@@ -60,26 +60,23 @@ Restart recovery consults persisted workspace and tab ownership. If a terminal d
 
 A changed request head invalidates an old review draft. An ambiguous review submission remains read-only: inspect already published comments before starting another review. Uncertain PR/MR creation checks for an existing request on the worker branch and refuses to repeat an unconfirmed creation.
 
+This revision replaces the earlier local-checkout setup. Ownership manifests from that implementation are not migrated; invalid records preserve the resources for inspection.
+
 ## Verification
 
-Recorded checks on 2026-09-07 passed the following; the full suite, typecheck and build include all production additions.
+Checks for the managed-repository and connection revision on 2026-09-07 passed:
 
 Table: Recorded repository checks.
 
 | Command | Result |
 | --- | --- |
-| `npx vitest run --maxWorkers=2 --reporter=dot` | 114 files, 2,137 tests passed |
-| `npm run build` | Passed |
+| `npx vitest run --maxWorkers=2 --reporter=dot` | 120 files, 2,305 tests passed |
 | `npm run typecheck` | Passed |
+| `npm run build` | Passed |
 | `npx playwright test --reporter=line` | 12 shipped-shell desktop/mobile checks passed |
 
-The initial `npm test -- --reporter=dot` run had two failures in existing tests. The later full pass used `--maxWorkers=2`; the runs did not use identical concurrency.
+The focused UI and transport run passed 128 tests in 7 files. A later connection test run passed 19 tests after adding the GitLab version prerequisite. Desktop and mobile browser fixtures verified the consent window, status refresh, provider switching and one-time token flow without page errors or horizontal overflow.
 
-The settings follow-up passed **14 tests in 3 files**. Production PTY integration passed **2 lifecycle scenarios**: issue work through fresh feedback, approval, merge and cleanup; and review cleanup followed by edited draft submission.
+The built preview also passed desktop and mobile settings checks: the removed local-path and credential fields were absent, the setup token was masked, unsaved repository changes blocked connection, and Cancel preserved the saved configuration.
 
-```bash
-npx vitest run apps/web/src/ui/SettingsDialog.test.ts apps/web/src/ui/SettingsDialog.import.test.ts apps/server/src/forge/ForgeSettingsService.test.ts
-npx vitest run apps/server/src/forge/ForgeLifecycle.integration.test.ts
-```
-
-The lifecycle tests use real Git worktrees and terminal processes with a deterministic assistant and local provider fixture. Live GitHub/GitLab authentication, actual Codex model execution and issue-to-merge operation against a hosted provider have not been tested.
+Lifecycle integration exercises real Git checkouts and terminal processes with a deterministic assistant and local provider fixture. Live GitHub/GitLab registration, authentication, actual Codex model execution and issue-to-merge operation against a hosted provider have not been tested.

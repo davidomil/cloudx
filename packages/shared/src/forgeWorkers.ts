@@ -16,7 +16,7 @@ export interface ForgeWorker {
   number: number;
   title: string;
   repository: ForgeRepository;
-  repositoryPath: string;
+  repositoryPath?: string;
   baseBranch: string;
   templateId: string;
   status: ForgeWorkerStatus;

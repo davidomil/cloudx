@@ -59,6 +59,10 @@ import { ForgeSettingsService } from "./forge/ForgeSettingsService.js";
 import { ForgeWorkflowService } from "./forge/ForgeWorkflowService.js";
 import { ForgeRuntime } from "./forge/ForgeRuntime.js";
 import { ForgeWorkflowStore, ForgeWorkerReports } from "./forge/ForgeWorkflowStore.js";
+import { ForgeConnectionService } from "./forge/connections/ForgeConnectionService.js";
+import { ForgeConnectionStore } from "./forge/connections/ForgeConnectionStore.js";
+import { ForgeRegistrationClient } from "./forge/connections/ForgeRegistrationClient.js";
+import { registerForgeConnectionRoutes } from "./forge/connections/ForgeConnectionRoutes.js";
 import { JiraPlugin } from "./plugins/JiraPlugin.js";
 import { RulesSkillsPlugin } from "./plugins/RulesSkillsPlugin.js";
 import { DocumentationPlugin } from "./plugins/DocumentationPlugin.js";
@@ -112,6 +116,7 @@ export interface AppServices {
   jira?: JiraIntegrationService;
   jiraPolling?: JiraPollingService;
   forge?: ForgeWorkflowService;
+  forgeConnections?: ForgeConnectionService;
   pluginContributionsReady?: Promise<RulesSkillsStore>;
   codexStateSources?: CodexStateSources;
 }
@@ -216,7 +221,8 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     }
     const requestOwnerShutdown = settleDisposers([
       () => services.documentationIngestQueue?.dispose(),
-      () => services.voice.dispose?.()
+      () => services.voice.dispose?.(),
+      () => services.forgeConnections?.dispose()
     ]);
     const sourceShutdown = settleDisposers([() => services.codexStateSources?.dispose()]);
     const producerShutdown = settleDisposers([
@@ -290,6 +296,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   });
 
   app.get("/api/plugins", async () => ({ plugins: services.plugins.list() }));
+  if (services.forgeConnections) registerForgeConnectionRoutes(app, services.forgeConnections, config.trustedOrigins);
 
   app.get("/api/plugins/installed", async () => ({ plugins: services.installedPlugins!.listPublicRecordsSync() }));
 
@@ -1180,7 +1187,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
 
 export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger): AppServices {
   const plugins = new PluginRegistry();
-  const pathPolicy = new PathPolicy(config.allowedRoots);
+  const pathPolicy = new PathPolicy([...config.allowedRoots, path.join(config.dataDir, "forge-workers", "checkouts")]);
   const workspace = new WorkspaceLayoutStore(config.dataDir, pathPolicy);
   const terminalFactory = new NodePtyTerminalProcessFactory();
   const codexStateSources = new CodexStateSources(config.dataDir);
@@ -1245,12 +1252,17 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     logger?.error({ err: serializeError(error), ...details }, "session background operation failed");
   });
   const workspaceCommands = new WorkspaceCommandService(sessions, workspace);
-  forgeSettings = new ForgeSettingsService(configService);
-  const settingsForForge = forgeSettings;
+  const forgeConnections: ForgeConnectionService = new ForgeConnectionService({
+    repository: () => settingsForForge.repository(),
+    store: new ForgeConnectionStore(config.dataDir),
+    registration: new ForgeRegistrationClient()
+  });
+  forgeSettings = new ForgeSettingsService(configService, forgeConnections);
+  const settingsForForge: ForgeSettingsService = forgeSettings;
   forge = new ForgeWorkflowService({
     settings: () => settingsForForge.settings(),
     provider: (repository, role, signal) => settingsForForge.provider(repository, role, signal),
-    runtime: new ForgeRuntime({ sessions, workspaceCommands, workspace, rulesSkills, pathPolicy, dataDir: config.dataDir }),
+    runtime: new ForgeRuntime({ sessions, workspaceCommands, workspace, rulesSkills, pathPolicy, dataDir: config.dataDir, gitAccess: (repository, role, signal) => settingsForForge.gitAccess(repository, role, signal) }),
     store: new ForgeWorkflowStore(pluginData),
     reports: new ForgeWorkerReports(config.dataDir),
     notify: (title, body) => { notifications.send({ title, body }); }
@@ -1301,7 +1313,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   jiraPolling.start();
   forge.start();
   automation = createAutomationService(automationRepository, { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config);
-  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, pluginContributionsReady, codexStateSources };
+  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, forgeConnections, pluginContributionsReady, codexStateSources };
 }
 
 function isStreamingHookRequest(request: FastifyRequest<{ Querystring: { stream?: string } }>): boolean {

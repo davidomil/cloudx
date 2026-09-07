@@ -1,19 +1,40 @@
-Source-grounded guide validation, 2026-09-07 UTC
+Source-grounded guide and current revision validation, 2026-09-07 UTC
 
-Executed with the source-grounded-writing skill toolchain on PATH:
+The full skill dependency check passed earlier in this workspace. Final commands
+ran with the source-grounded-writing skill-local toolchain on PATH:
+
 python3 "$CLOUDX_RULES_SKILLS_DIR/skills/source-grounded-writing/scripts/validate_evidence.py" docs/implementation/forge-workers-audit/forge-workers.ir.json
-OK: validated evidence for docs/implementation/forge-workers-audit/forge-workers.ir.json
+OK: validated evidence
 python3 "$CLOUDX_RULES_SKILLS_DIR/skills/source-grounded-writing/scripts/validate_presentation.py" docs/implementation/forge-workers-audit/forge-workers.ir.json
-OK: presentation validated for docs/implementation/forge-workers-audit/forge-workers.ir.json
+OK: presentation validated
+python3 "$CLOUDX_RULES_SKILLS_DIR/skills/source-grounded-writing/scripts/validate_evidence.py" docs/implementation/forge-workers-audit/revision-note.ir.json
+OK: validated evidence
+python3 "$CLOUDX_RULES_SKILLS_DIR/skills/source-grounded-writing/scripts/validate_presentation.py" docs/implementation/forge-workers-audit/revision-note.ir.json
+OK: presentation validated
 python3 "$CLOUDX_RULES_SKILLS_DIR/skills/source-grounded-writing/scripts/compile_doc.py" docs/implementation/forge-workers-audit/forge-workers.ir.json --out docs/implementation/forge-workers-audit/forge-workers.qmd
-Wrote docs/implementation/forge-workers-audit/forge-workers.qmd
+Wrote guide Quarto
 python3 "$CLOUDX_RULES_SKILLS_DIR/skills/source-grounded-writing/scripts/render_doc.py" docs/implementation/forge-workers-audit/forge-workers.qmd --to gfm --out-dir docs/implementation
-Rendered gfm into docs/implementation
+Rendered guide Markdown
 python3 docs/implementation/forge-workers-audit/package_markdown.py
-Packaged docs/implementation/forge-workers.md
+Packaged guide heading and audited figure link
+python3 "$CLOUDX_RULES_SKILLS_DIR/skills/source-grounded-writing/scripts/compile_doc.py" docs/implementation/forge-workers-audit/revision-note.ir.json --out docs/implementation/forge-workers-audit/revision-note.qmd
+Wrote revision note Quarto
+python3 "$CLOUDX_RULES_SKILLS_DIR/skills/source-grounded-writing/scripts/render_doc.py" docs/implementation/forge-workers-audit/revision-note.qmd --to gfm --out-dir /tmp/forge-revision-render
+Rendered revision note Markdown
+python3 docs/implementation/forge-workers-audit/package_revision_note.py /tmp/forge-revision-render/revision-note.md
+Inserted current revision before earlier delivery history
 
-Final artifact checks passed: single Markdown title; latest 114-file/2137-test result;
-Linux scope and file-import guidance; no old template-ID or pre-follow-up caveat;
-no host paths or internal source markers; one existing figure link; no duplicate figure;
-all local source SHA256 revisions match current files.
-The regenerated issue-flow figure was visually inspected for legibility and lifecycle order.
+git diff --check
+Passed without whitespace diagnostics.
+
+Final artifact assertions passed: every local source SHA256 matches current files;
+120-file/2305-test and 12 shipped-shell browser results; single Markdown title;
+removed local-checkout, manual-key and OAuth-token setup guidance; no host paths or
+internal source markers in guide prose; one existing figure and no duplicate copy;
+one current revision section before earlier plan history; temporary browser
+fixture removed. The unchanged lifecycle figure was previously visually checked.
+
+Current evidence is remote-verification-runs.txt. Earlier focused-tests.txt and
+verification-runs.txt remain historical records, not the current revision result.
+Live hosted-provider registration/authentication and Codex model execution remain
+unverified; fixture and production-preview scopes are stated separately.

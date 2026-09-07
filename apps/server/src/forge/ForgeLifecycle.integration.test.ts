@@ -56,6 +56,10 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     const first = await fixture.completedAssistantTurn(started);
     expect(await processIsRunning(first.pid)).toBe(true);
     expect(first.templateId).toBe("fixture-worker");
+    expect(first.gitAuthorizationPresent).toBe(false);
+    expect(started.repositoryPath).toBe(started.worktreePath);
+    expect(started.worktreePath).toBe(path.join(fixture.dataDir, "forge-workers", "checkouts", started.id));
+    await expectMissing(fixture.repositoryPath);
     expect(first.skillIds).toBe("fixture-implementation");
     expect(first.args.at(-2)).toBe("--");
     expect(first.args.at(-1)).toContain("Read the complete current task");
@@ -102,8 +106,8 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(fixture.provider.merges).toEqual([revised.headSha]);
     expect(await processIsRunning(third.pid)).toBe(false);
     expect(await git(fixture.origin, "rev-parse", "main")).toBe(revised.headSha);
-    expect(await git(fixture.repositoryPath, "status", "--porcelain")).toBe("");
-    expect(await git(fixture.repositoryPath, "for-each-ref", `refs/heads/${revised.branch}`)).toBe("");
+    await expectMissing(fixture.repositoryPath);
+    expect(fixture.gitAccessRoles.every((role) => role === "worker")).toBe(true);
     await expectMissing(revised.worktreePath!, first.codexHome, second.codexHome, third.codexHome, third.reportPath, third.contextPath, third.tabContextPath);
     expect(fixture.sessions.listTabs()).toEqual([]);
     expect(fixture.workspace.getActiveWindow().layout.root).toMatchObject({ type: "pane", pane: { tabIds: [] } });
@@ -118,6 +122,8 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     const started = await fixture.workflow.startReview(7, false, fixture.placement);
     const receipt = await fixture.completedAssistantTurn(started);
     expect(receipt.templateId).toBe("fixture-review");
+    expect(receipt.gitAuthorizationPresent).toBe(false);
+    await expectMissing(fixture.repositoryPath);
     expect(receipt.skillIds).toBe("fixture-reviewing");
     expect(receipt.headSha).toBe(reviewHead);
     expect(receipt.context.item.headSha).toBe(reviewHead);
@@ -146,12 +152,14 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
       comments: [{ body: "Document the result for an empty input.", path: "review.txt", line: 1, side: "RIGHT" }],
     }]);
     expect(fixture.providerRoles.every((role) => role === "reviewer")).toBe(true);
+    expect(fixture.gitAccessRoles).toEqual(["reviewer"]);
     expect((await fixture.store.read())[0]?.draft?.status).toBe("posted");
   }, 20_000);
 });
 
 interface AssistantReceipt {
   pid: number;
+  gitAuthorizationPresent: boolean;
   args: string[];
   templateId: string;
   skillIds: string;
@@ -181,6 +189,7 @@ class LifecycleFixture {
   readonly factory = new RecordingTerminalFactory();
   readonly notifications = new NotificationsPlugin();
   readonly providerRoles: ForgeCredentialRole[] = [];
+  readonly gitAccessRoles: ForgeCredentialRole[] = [];
   readonly sources: CodexStateSources;
   readonly workspace: WorkspaceLayoutStore;
   readonly sessions: SessionStore;
@@ -208,10 +217,11 @@ class LifecycleFixture {
       rulesSkills: this.catalog,
       dataDir: this.dataDir,
       pathPolicy,
-      git: async (cwd, args) => {
-        const output = await git(cwd, ...args);
-        return args[0] === "remote" && args[1] === "get-url" && output === this.origin ? "https://github.com/fixture/cloudx.git" : output;
+      gitAccess: async (_repository, role) => {
+        this.gitAccessRoles.push(role);
+        return { cloneUrl: "https://github.com/fixture/cloudx.git", authorization: `Basic fixture-${role}-secret` };
       },
+      git: async (cwd, args) => git(cwd, ...args.map((argument) => argument === "https://github.com/fixture/cloudx.git" && ["fetch", "push"].includes(args[0]!) ? this.origin : argument)),
     });
     this.provider = new LocalForgeProvider(this.origin);
     this.store = new ForgeWorkflowStore(new PluginDataStore(this.dataDir));
@@ -221,7 +231,7 @@ class LifecycleFixture {
       store: this.store,
       reports: this.reports,
       provider: (_repository, role) => { this.providerRoles.push(role); return this.provider; },
-      settings: () => ({ repository, repositoryPath: this.repositoryPath, baseBranch: "main", workerTemplateId: "fixture-worker", reviewTemplateId: "fixture-review", maxRunMinutes: 1 }),
+      settings: () => ({ repository, baseBranch: "main", workerTemplateId: "fixture-worker", reviewTemplateId: "fixture-review", maxRunMinutes: 1 }),
       notify: (title, body) => { this.notifications.send({ title, body }); },
     });
   }
@@ -257,6 +267,7 @@ class LifecycleFixture {
       await fixture.catalog.saveSkill({ id: skillId, name: skillId, description: "Fixture skill", instructions: "Complete only the fixture task." });
       await fixture.catalog.saveTemplate({ id, name: id, color: "green", ruleIds: [], skillIds: [skillId] });
     }
+    await fs.rm(fixture.repositoryPath, { recursive: true });
     return fixture;
   }
 
@@ -289,12 +300,15 @@ class LifecycleFixture {
   }
 
   async seedReview(): Promise<string> {
-    await git(this.repositoryPath, "switch", "-c", "review-target");
+    await git(this.root, "clone", "--no-checkout", this.origin, this.repositoryPath);
+    await git(this.repositoryPath, "config", "user.name", "Forge Fixture");
+    await git(this.repositoryPath, "config", "user.email", "forge-fixture@example.invalid");
+    await git(this.repositoryPath, "switch", "-c", "review-target", "origin/main");
     await fs.writeFile(path.join(this.repositoryPath, "review.txt"), "A public return value\n");
     await git(this.repositoryPath, "add", "review.txt");
     await git(this.repositoryPath, "commit", "-m", "TEST: review target");
     await git(this.repositoryPath, "push", "origin", "review-target");
-    await git(this.repositoryPath, "switch", "main");
+    await fs.rm(this.repositoryPath, { recursive: true });
     await this.provider.createChangeRequest({ title: "Review the return value", body: "Document the contract", headBranch: "review-target", baseBranch: "main" });
     return (await this.provider.getChangeRequest(7)).headSha;
   }
@@ -391,7 +405,7 @@ const headSha = git("rev-parse", "HEAD");
 const report = isReview
   ? { kind: "review", headSha, event: "comment", body: "The return value needs documentation.", comments: [{ body: "Explain the public return value.", path: "review.txt", line: 1, side: "RIGHT" }] }
   : { kind: "issue", title: "Handle empty input", body: "Implemented and verified the fixture changes.", resolvedDiscussionIds: (context.change?.comments ?? []).filter(comment => comment.discussionId && comment.resolved === false).map(comment => comment.discussionId) };
-const receipt = { pid: process.pid, args, templateId: process.env.CLOUDX_PERSONALITY_TEMPLATE_ID, skillIds: process.env.CLOUDX_ENABLED_SKILL_IDS, codexHome: process.env.CODEX_HOME, reportPath, contextPath, context, headSha };
+const receipt = { pid: process.pid, gitAuthorizationPresent: Object.entries(process.env).some(([key, value]) => key.startsWith("GIT_CONFIG_VALUE_") && value?.includes("Authorization:")), args, templateId: process.env.CLOUDX_PERSONALITY_TEMPLATE_ID, skillIds: process.env.CLOUDX_ENABLED_SKILL_IDS, codexHome: process.env.CODEX_HOME, reportPath, contextPath, context, headSha };
 fs.writeFileSync(path.join(process.env.FORGE_FIXTURE_RECEIPTS, path.basename(reportPath)), JSON.stringify(receipt));
 fs.writeFileSync(reportPath + ".tmp", JSON.stringify(report));
 fs.renameSync(reportPath + ".tmp", reportPath);
