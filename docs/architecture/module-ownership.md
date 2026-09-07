@@ -39,69 +39,33 @@ in-memory state with the Node server.
 
 ## Repository Automation Owners
 
-| Surface                     | Authority                                                                                             | Must not own                                                            |
-| --------------------------- | ----------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| `.agents/`                  | Public policy, schemas, and planning, implementation, verification, review, and shipping contracts    | Runtime state, model credentials, or GitHub mutation                    |
-| `scripts/ai-change/`        | Deterministic artifact validation, policy classification, state transitions, and exact-head readiness | Model judgment, durable controller state, or credentials                |
-| `.github/workflows/`        | Public classification and credential-free candidate verification                                      | Model sessions, privileged publication, or durable run authority        |
-| `containers/ci`             | Trusted verification supervision and unprivileged candidate command execution                         | GitHub credentials, model judgment, or issue state                      |
-| External private controller | Durable orchestration and separately authorized GitHub App operations                                 | CloudX product behavior or authority to weaken this repository's policy |
+These interfaces support optional machine-managed workflows; they are not a
+required sequence for ordinary development.
 
-## Composition Rules
+| Surface                                                             | Responsibility                                                                         |
+| ------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `.agents/skills/` and `AGENTS.md`                                   | Task guidance and repository context                                                   |
+| `.agents/pr-review-policy.toml` and `.agents/schemas/`              | Managed classification/admission and typed evidence                                    |
+| `scripts/ai-change/policy.mjs`                                      | Path classification and route-owned gates                                              |
+| `scripts/ai-change/artifact-validation.mjs` and `review-fanout.mjs` | Artifact identity, validity, and review completeness                                   |
+| `scripts/ai-change/review-local.mjs`                                | Guarded Git scope observation and optional local evidence aggregation                  |
+| `scripts/ai-change/validate-process.mjs`                            | Skill/reference structure and executable publication, verifier, and workflow contracts |
+| `.github/workflows/` and `containers/ci/`                           | Public classification and credential-isolated candidate verification                   |
+| External private controller                                         | Durable orchestration and separately authorized GitHub operations                      |
 
-The AI review workflow has focused owners within `scripts/ai-change/`:
+`review-local.mjs` separates shared scope observation from stricter CLI admission.
+Shared observation can preserve normal staged entries; CLI modes require index
+equal to HEAD. Neither worktree verification nor aggregation attests different
+index-only bytes or grants hosting authority. See `docs/AI_CHANGE_PROCESS.md`
+and the tools' colocated tests for their machine contracts.
 
-- `policy.mjs` classifies paths and unions route-owned gates. Only participating
-  owner routes cause cross-area escalation; supporting documentation still adds
-  its direct review, checks and risk, and protected overlapping routes retain
-  their complete gates.
-- `review-local.mjs` owns shared `readLocalReviewScope` observation and
-  `createLocalGitReadContext` guarded reads, separately from optional local
-  admission, composite subject binding and clean aggregation. Shared observation
-  accepts normal staged entries; `discoverLocalPaths` and both CLI modes require
-  index equal to HEAD. Neither shared observation nor worktree verification
-  attests different index-only bytes. The same guarded reader protects scope and
-  unchanged verifier digest acquisition before and after converting Git reads.
-  It delegates classification to policy and area/aggregate validation to
-  `review-fanout.mjs`. It cannot judge findings, change source/index state,
-  execute verification, access credentials or invoke hosting operations.
-- `review-fanout.mjs` retains the existing managed fanout and aggregate contract.
-  Local dispatch supplies its explicit composite subject and verification run ID
-  at the existing identity seam; managed and Gate-B semantics remain distinct.
-- `validate-process.mjs` owns the five active Gate-B routing contracts and their
-  complete source-byte commitments, as well as all five frozen source references
-  under `.agents/skills/change-orchestrator/references/gate-b/`. The three original
-  frozen commitments remain unchanged. A routing/source edit requires an explicit
-  reviewed code-owned commitment update; a link alone cannot admit authority.
+## Composition
 
-The orchestrator explicitly selects ordinary independent review or the eligible
-optional shortcut before dispatch. Ordinary review directly validates the complete
-evidence contract in `docs/AI_CHANGE_PROCESS.md`, independently computes the exact
-implementation-plus-verification subject and does not require successful
-`--print-subject` or aggregation. It captures the shared scope/index snapshot
-before verification/handoff and compares it at aggregate acceptance while
-preserving normal staged entries. It freezes candidate and metadata before full
-verification, then passes exact evidence to independent review contexts. Required local reviewers
-are the union of observed-path policy roles and independently accepted plan
-roles. Human review and any stricter accepted role survive policy self-changes.
-Ordinary dispatch always uses all fresh area contexts followed by a different
-fresh `review-change` context. Both use the composite subject and
-`verification.run_id` with the existing fanout/aggregate validators. Recheck
-candidate, scope/index, config/attributes and raw evidence before acceptance.
-Fresh `review-change` judgment resolves findings; only an explicitly selected
-eligible current clean local set can use deterministic aggregation. Shortcut
-rejection never retries or automatically switches routes. Neither path changes controller
-protocol, the non-trivial-change threshold, the full verifier or hosting authority.
-
-- Composition roots construct complete dependencies and own shutdown ordering.
-- A feature service owns its state transitions; routes and components call it.
+- Composition roots construct dependencies and own shutdown ordering.
+- Feature services own state transitions; routes and components call them.
 - Shared contracts stay side-effect free and serializable.
-- The web app may format and project state but must not reproduce server
-  authorization, path, automation-safety, or lifecycle decisions.
-- Node/Python boundary changes update and test both provider and consumer.
-- Cross-owner changes use `$review-architecture` in addition to area reviewers,
-  as selected by policy's participating owner routes. Supporting prose does not
-  create another owner merely because its area label is documentation.
-- Public automation emits typed requests and evidence. Only the external
-  controller identity allowed by the public ruleset may perform its designated
-  mutation, and no controller may manufacture its own public CI evidence.
+- The web app projects state rather than reproducing server authorization, path,
+  automation-safety, or process-lifecycle decisions.
+- Node/Python boundary changes affect both provider and consumer.
+- Public automation emits typed requests and evidence. The authorized external
+  controller cannot manufacture trusted candidate-verification evidence.

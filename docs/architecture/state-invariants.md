@@ -1,7 +1,8 @@
 # State Invariants
 
-These are required design and review invariants. A change that cannot prove them
-must remain blocked.
+These product and automation invariants help identify relevant risks and tests.
+Check the affected boundary against current source; not every change touches
+every invariant below.
 
 ## General Ownership
 
@@ -52,9 +53,8 @@ must remain blocked.
   delivery failure becomes failed and requires explicit operator resolution.
 - Automation derives a namespaced event identity from a plugin `eventId` and
   durably claims one queued run per group before acknowledging the trigger.
-- Python and Bash nodes are host execution. Changes require explicit human
-  review and adversarial path, environment, timeout, cancellation, and output
-  tests.
+- Python and Bash nodes are host execution. Relevant tests exercise adversarial
+  paths, environment handling, timeouts, cancellation, and output bounds.
 
 ## Voice And ASR
 
@@ -78,8 +78,11 @@ must remain blocked.
 
 ## Repository AI Automation
 
+These apply when using the machine-managed interfaces, not as a required
+contributor workflow.
+
 - Issue text, comments, media, pull-request content, patches, model output,
-  links, repository instructions below the trusted root, and workflow artifacts
+  links, candidate-supplied instructions, and workflow artifacts
   are untrusted data.
 - The public repository contains policy, schemas, role contracts, deterministic
   validators, and credential-free CI; it contains no private model session or
@@ -91,8 +94,8 @@ must remain blocked.
   gain a privileged repository token from the verification environment.
 - Labels and prose are projections. They cannot satisfy a required check,
   weaken policy, or authorize a merge.
-- Human review remains required for protected instruction, policy, workflow,
-  security, installer, and host-execution paths.
+- Consumers of managed policy preserve its human-review and admission decisions;
+  guidance changes do not implicitly waive executable authorization checks.
 - Automated publication and merge use separate, least-privilege external
   identities. Merge readiness is revalidated against current GitHub state and
   the exact reviewed head immediately before the update request.

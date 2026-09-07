@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+
 import { describe, expect, it, vi } from "vitest";
 
 import { loadPolicy } from "../policy.mjs";
@@ -11,6 +13,21 @@ import {
 const policy = await loadPolicy();
 
 describe("public pull request classification", () => {
+  it("accepts every supported change type in the pull request template", async () => {
+    const template = await readFile(
+      new URL("../../../.github/PULL_REQUEST_TEMPLATE.md", import.meta.url),
+      "utf8",
+    );
+    for (const type of policy.labels.types) {
+      const body = template.replace(
+        "Change-Type: <type>",
+        `Change-Type: ${type}`,
+      );
+      expect(declaredChangeType(body, policy.labels.types)).toBe(type);
+    }
+    expect(declaredChangeType(template, policy.labels.types)).toBeNull();
+  });
+
   it("requires exactly one explicit supported Change-Type trailer", () => {
     expect(declaredChangeType("Change-Type: docs", policy.labels.types)).toBe(
       "docs",

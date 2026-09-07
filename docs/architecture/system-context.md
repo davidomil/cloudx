@@ -33,7 +33,7 @@ local HTTP boundaries and require consumer/provider tests.
 
 | Surface                     | Public responsibility                                                                  | Explicit exclusion                                           |
 | --------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
-| Policy and skills           | Classify changes, select finite reviewers, and define typed role behavior              | Durable orchestration or GitHub credentials                  |
+| Policy and skills           | Provide task guidance and optional managed classification/artifact contracts           | Durable orchestration or GitHub credentials                  |
 | Public classifier           | Project deterministic labels from changed paths and policy                             | Admission or merge authority                                 |
 | Public CI verifier          | Execute exact candidates with pinned tooling and no privileged repository credential   | Model judgment or GitHub mutation                            |
 | External private controller | Consume the public contract and submit schema-bound checks or allowed GitHub mutations | Changing public policy or self-attesting candidate execution |
@@ -42,7 +42,7 @@ local HTTP boundaries and require consumer/provider tests.
 The external controller is intentionally opaque at this boundary. Its model
 authentication, service layout, persistent state, recovery, and credential
 handling belong to its private repository. See `docs/AI_CHANGE_PROCESS.md` for
-the public protocol.
+the optional machine interfaces and their trust boundary.
 
 ## External Systems
 
@@ -71,6 +71,6 @@ constraints:
 - Untrusted plugin repositories contribute validated metadata only; they do not
   execute third-party code through the install path.
 - Automation code is explicit host execution and requires bounded resources,
-  safety classification, cancellation, and human review for execution changes.
+  safety classification, and cancellation.
 
 See `docs/SECURITY_MODEL.md` for deployment guidance and known exclusions.

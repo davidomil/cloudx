@@ -1,36 +1,22 @@
 ---
 name: "review-shared"
-description: "Review CloudX shared domain contracts, reducers, validators, defaults, and serialization across server and web consumers."
+description: "Review CloudX shared domain types, validators, defaults, reducers, and browser/server serialization contracts."
 ---
 
-# Review Shared
+# Review Shared Contracts
 
-## Responsibility
+Trace the changed contract in `packages/shared` through its server, web, and
+plugin API consumers. Compile-time agreement alone does not validate stored or
+external data.
 
-Review changes under `packages/shared` and every affected consumer. Findings
-only; no edits or GitHub mutation.
+- Keep shared contracts serializable and free of host I/O or UI lifecycle ownership.
+- Check runtime guards, defaults, optional fields, stable IDs, and reducers agree
+  with the intended semantics.
+- Examine persisted-state and wire-format implications, including malformed or
+  partially populated data.
+- Identify breaking changes explicitly; do not prescribe backward compatibility
+  without a product requirement.
+- Look for provider/consumer tests that distinguish the changed behavior.
 
-Run in a fresh context with shared source/tests, server and web consumers,
-accepted plan, exact diff and verification evidence.
-
-## Lenses
-
-- The concept is truly shared and serializable; host-only or UI-only behavior
-  stays with its owner.
-- Runtime guards, defaults, reducers and TypeScript types describe the same valid
-  states.
-- Discriminated unions are exhaustive and invalid combinations are
-  unrepresentable or rejected at a boundary.
-- Workspace/layout and automation transitions preserve IDs, references and
-  invariants for every operation order.
-- Wire-shape changes update producers, consumers, fixtures and runtime
-  validation together.
-- Compatibility impact is explicit and no compatibility layer appears without
-  user approval.
-- Tests include valid round trips, malformed serialized data, sibling variants
-  and revert-failing state transitions.
-
-## Output
-
-Produce `.agents/schemas/review.schema.json` with
-`subject: "implementation"` and `reviewer_role: "review-shared"`.
+Return evidence-backed findings and material uncertainty. Machine output, when
+requested, follows `docs/AI_CHANGE_PROCESS.md`.
