@@ -2,32 +2,62 @@
 
 Goal: a CloudX plugin for configurable GitHub/GitLab issue workers and editable PR/MR reviews using Codex tabs and rules/skills templates, separate application identities, approval pauses, feedback/resume, guarded merge, and owned-resource cleanup.
 
-## Current revision: managed repositories and connected applications
+## Current revision: verified directory trust and worker terminals inside Forge
 
-This revision replaces the local-checkout and manual-credential setup
-described in the earlier delivery history below. Configure a remote
-repository; Forge creates private owned checkouts and authenticates Git
-with the connected worker or reviewer identity.
+Forge prepares managed remote checkouts and shows each issue or review
+worker as a tab inside Forge. **View worker** selects its controls and
+terminal. Worker selection survives Resume replacing the terminal
+session; server-owned worker sessions stay outside workspace pane
+layouts.
 
-GitHub uses a separate generated app manifest for each role, followed by
-registration and installation consent. GitLab uses one temporary
-personal access token to provision two project service accounts, their
-memberships and bot tokens. Read-only token and project API checks
-precede writes. Expired access renews tokens for the existing bot
-accounts while preserving active connections; uncertain mutations remain
-blocked for inspection. The setup token is not retained.
+Explicit repository approval matches the provider, API URL and current
+repository settings. Before granting trust, Forge checks both the
+current ownership record and the captured checkout identity. Changed
+ownership, Git configuration or approval prevents the grant.
 
-Earlier ownership manifests are not migrated. The current runtime
-requires its managed-checkout ownership fields and layout before
-cleanup.
+The worker’s private Codex overlay receives the exact canonical checkout
+trust entry. Source configuration and other project trust decisions
+remain unchanged; an explicit untrusted checkout decision is preserved.
+Confirmed failures before process startup leave the checkout
+recoverable. Uncertain launches retain their ownership records.
 
-Current revision verification:
-`npx vitest run --maxWorkers=2 --reporter=dot` passed 2,305 tests in 120
-files; `npm run typecheck` and `npm run build` passed.
-`npx playwright test --reporter=line` passed 12 shipped-shell browser
-checks. Actual PTY/Git lifecycle tests use deterministic
-assistant/provider fixtures. Live provider registration, credentials and
-Codex model execution remain unverified.
+Worker context logs now rotate inside a private directory whose identity
+comes from the session service. Forge records that directory identity
+and verifies it during recovery and cleanup. The real PTY regression
+rotates the log, stops the worker, recreates the runtime and removes the
+old terminal artifacts while retaining the checkout.
+
+Embedded worker context storage changes from a flat file to an owned
+directory. Earlier context-file records are not adopted or converted
+automatically.
+
+Once ownership and process checks succeed, an unfinished issue can
+resume in its preserved checkout with fresh context. Merged issues and
+review workers only finish cleanup; they do not launch another terminal.
+Failed checks continue to preserve resources.
+
+Installed Codex 0.153.4 passed seven native PTY startup scenarios. Exact
+overlay trust loaded project configuration and reached the initialized
+composer; parent-only trust still showed the trust dialog. The checks
+made no model requests.
+
+Nested worker UI checks passed 77 tests in four files. Desktop and
+mobile browser fixtures verified terminal input, worker switching,
+paused output retention and resumed-session replacement. They used the
+production terminal component and reported no page errors or horizontal
+overflow.
+
+The current revision passed `npm test -- --reporter=dot --maxWorkers=4`:
+2,359 tests in 120 files. `npm run typecheck`, `npm run build` and all
+12 shipped-shell browser tests also passed. The audit retains earlier
+timing failures and a snapshot failure caused by concurrent
+documentation editing, together with their passing reruns.
+
+A live GitHub issue worker resumed in its retained checkout after
+resource recovery. Codex worked without the trust prompt, and the source
+configuration and production service stayed unchanged. Desktop and
+mobile checks showed its terminal inside Forge, with no page errors or
+horizontal overflow.
 
 ## Research and evidence
 - [x] Inspect git worktrees and create feature/forge-workers in a separate checkout.

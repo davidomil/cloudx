@@ -11,6 +11,83 @@ import {
 import type { ForgeRepository } from "@cloudx/shared";
 
 describe("Forge in the composed CloudX server", () => {
+  it("keeps trust and embedded placement grants outside public tab and layout requests", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "forge-http-tab-ownership-"));
+    const config = loadConfig({
+      CLOUDX_DATA_DIR: path.join(root, "data"),
+      CLOUDX_ALLOWED_ROOTS: root,
+      CLOUDX_LOG_LEVEL: "silent",
+      CLOUDX_APP_SERVER_ENABLED: "false",
+      CLOUDX_AUTOMATION_START_DISABLED: "true",
+      CLOUDX_WEB_DIST_DIR: path.join(root, "web"),
+    });
+    const services = buildServices(config);
+    await services.pluginContributionsReady;
+    const app = await buildServer(config, services);
+    const createTab = vi.spyOn(services.workspaceCommands!, "createTab");
+    const createSession = vi.spyOn(services.plugins.get("forge"), "createSession");
+    const headers = { host: "127.0.0.1:3001" };
+    const window = services.workspace!.getActiveWindow();
+    const placement = { pluginId: "forge", cwd: root, windowId: window.id, paneId: window.layout.activePaneId };
+    try {
+      const forgedOptions = { ownerPluginId: "forge", authorizeProjectTrust: root };
+      const created = await app.inject({
+        method: "POST", url: "/api/tabs", headers,
+        payload: {
+          ...placement,
+          ...forgedOptions,
+          launchOptions: forgedOptions,
+          initialInput: forgedOptions,
+          pluginMetadata: { "forge-workers": { workerId: "spoofed", ...forgedOptions } },
+        },
+      });
+      expect(created.statusCode).toBe(201);
+      expect(createTab).toHaveBeenCalledTimes(1);
+      expect(createTab.mock.calls[0]).toHaveLength(1);
+      expect(createTab.mock.calls[0]![0]).not.toHaveProperty("ownerPluginId");
+      expect(createTab.mock.calls[0]![0]).not.toHaveProperty("authorizeProjectTrust");
+      expect(createTab.mock.calls[0]![0]).not.toHaveProperty("launchOptions");
+      expect(createSession.mock.calls[0]![0].authorizeProjectTrust).toBeUndefined();
+      const publicTab = created.json().tab;
+      expect(publicTab.ownerPluginId).toBeUndefined();
+      expect(services.workspace!.tabIdsForWindow(window.id)).toEqual([publicTab.id]);
+      expect(services.sessions.getActiveTabId()).toBe(publicTab.id);
+
+      const embedded = await services.workspaceCommands!.createTab(placement, { ownerPluginId: "forge" });
+      expect(embedded.tab.ownerPluginId).toBe("forge");
+      const selected = await app.inject({ method: "POST", url: `/api/tabs/${publicTab.id}/active`, headers });
+      expect(selected.statusCode).toBe(200);
+      const activated = await app.inject({ method: "POST", url: `/api/tabs/${embedded.tab.id}/active`, headers });
+      expect(activated.statusCode).toBeGreaterThanOrEqual(400);
+      expect(activated.json().message).toMatch(/embedded/);
+      const moved = await app.inject({
+        method: "PATCH", url: `/api/windows/${window.id}`, headers,
+        payload: {
+          layout: {
+            root: { type: "pane", pane: { id: placement.paneId, tabIds: [publicTab.id, embedded.tab.id], activeTabId: embedded.tab.id } },
+            activePaneId: placement.paneId,
+          },
+        },
+      });
+      expect(moved.statusCode).toBeGreaterThanOrEqual(400);
+      expect(moved.json().message).toMatch(/embedded/);
+      const workspace = await app.inject({ method: "GET", url: "/api/workspace", headers });
+      expect(workspace.statusCode).toBe(200);
+      expect(workspace.json().activeTabId).toBe(publicTab.id);
+      expect(workspace.json().tabs).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: publicTab.id }),
+        expect.objectContaining({ id: embedded.tab.id, ownerPluginId: "forge" }),
+      ]));
+      expect(services.workspace!.tabIdsForWindow(window.id)).toEqual([publicTab.id]);
+      await expect(fs.stat(path.join(config.dataDir, "codex-launches"))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      createTab.mockRestore();
+      createSession.mockRestore();
+      await app.close();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("registers the panel and connected application settings, and stops workers before sessions", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "forge-server-"));
     const userRoot = path.join(root, "user-work");

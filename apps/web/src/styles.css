@@ -3554,7 +3554,17 @@ a:hover svg {
 .forge-empty { padding: 16px; color: var(--color-muted-foreground); }
 .forge-notice { padding: 10px 12px; margin: 8px; border: 1px solid var(--color-warning); color: var(--color-warning); overflow-wrap: anywhere; }
 .forge-badge { display: inline-flex; align-items: center; gap: 5px; width: fit-content; border: 1px solid var(--color-accent); border-radius: 4px; padding: 3px 6px; font-size: var(--font-size-xs); color: var(--color-accent); }
-.forge-workers { min-height: 0; overflow: auto; padding: 0 12px 12px; }
+.forge-workers { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
+.forge-worker-tabs { display: flex; flex-shrink: 0; gap: 6px; padding: 8px 12px; overflow-x: auto; border-bottom: 1px solid var(--color-border); }
+.forge-worker-tab { display: flex; flex-direction: column; gap: 3px; flex: 0 0 auto; max-width: 240px; padding: 8px 12px; border: 1px solid var(--color-border); border-radius: 4px; color: inherit; background: var(--color-background); text-align: left; cursor: pointer; }
+.forge-worker-tab > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.forge-worker-tab > small { color: var(--color-muted-foreground); }
+.forge-worker-tab[aria-selected="true"] { border-color: var(--color-accent); background: color-mix(in srgb, var(--color-accent) 10%, transparent); }
+.forge-worker-view { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: auto; }
+.forge-worker-view[hidden] { display: none; }
+.forge-worker-controls { flex-shrink: 0; max-height: 45%; overflow: auto; padding: 0 12px 12px; }
+.forge-worker-terminal { display: flex; flex-direction: column; flex: 1; min-height: 180px; margin: 0 12px 12px; overflow: hidden; border: 1px solid var(--color-border); border-radius: 4px; }
+.forge-worker-terminal > .terminal-panel { flex: 1; height: auto; }
 .forge-worker { margin-top: 12px; padding: 12px; border: 1px solid var(--color-border); border-radius: 5px; overflow-wrap: anywhere; }
 .forge-worker-heading { justify-content: space-between; }
 .forge-status { padding: 4px 7px; border-radius: 4px; background: var(--color-background); font-size: var(--font-size-xs); }

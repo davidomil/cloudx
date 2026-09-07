@@ -5,6 +5,14 @@ import type { WorkspaceTab } from "@cloudx/shared";
 import { activatePane, addTabToPane, defaultLayout, isPaneTabActive, isStoredLayout, listPanes, placeTabInPane, reconcileLayout, removePane, resolveTabCreationPaneId, resizeSplit, splitPane } from "./layout.js";
 
 describe("layout helpers", () => {
+  it("keeps plugin-owned terminal sessions out of workspace panes and activation", () => {
+    const tabs = [tab("forge"), { ...tab("worker"), ownerPluginId: "forge" }];
+    const reconciled = reconcileLayout(layoutWithTabs(["forge", "worker"]), tabs, "worker");
+    expect(listPanes(reconciled.root)).toMatchObject([{ tabIds: ["forge"], activeTabId: "forge" }]);
+    expect(tabs.map(tab => tab.id)).toEqual(["forge", "worker"]);
+    expect(listPanes(reconcileLayout(defaultLayout(), tabs).root)[0].tabIds).toEqual(["forge"]);
+  });
+
   it("splits only the active pane and preserves nested split directions", () => {
     const firstSplit = splitPane(layoutWithTabs(["tab-1"]), "row", sequence("pane-2"), sequence("split-1"));
     const secondSplit = splitPane(firstSplit, "column", sequence("pane-3"), sequence("split-2"));

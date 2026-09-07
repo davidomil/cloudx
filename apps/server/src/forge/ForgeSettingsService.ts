@@ -33,6 +33,11 @@ export class ForgeSettingsService {
     };
   }
 
+  isRepositoryTrusted(repository: ForgeRepository): boolean {
+    const approved = this.config.getPluginConfig("forge").trustedRepository;
+    return approved === repositoryTrustKey(repository) && approved === repositoryTrustKey(this.repository());
+  }
+
   provider(repository: ForgeRepository, role: ForgeCredentialRole, signal?: AbortSignal): ForgeProvider {
     return createForgeProvider(repository, this.credentials(repository), { role, signal });
   }
@@ -82,6 +87,13 @@ export function forgeConfigFields(): ConfigFieldDescriptor[] {
       description: "GitHub owner/repository or GitLab group/subgroup/project.",
     },
     {
+      key: "trustedRepository",
+      label: "Approved repository trust",
+      type: "string",
+      visibility: "internal",
+      defaultValue: "",
+    },
+    {
       key: "baseBranch",
       label: "Target branch",
       type: "string",
@@ -116,4 +128,8 @@ export function forgeConfigFields(): ConfigFieldDescriptor[] {
     },
   ];
   return fields;
+}
+
+function repositoryTrustKey(repository: ForgeRepository): string {
+  return JSON.stringify([repository.provider, repository.apiUrl, repository.projectPath]);
 }

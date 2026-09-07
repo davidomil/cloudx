@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 import type { CreatePluginSessionInput, PluginActionContext, PluginSession, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
-import { pluginActionHookId } from "@cloudx/plugin-api";
+import { PluginSessionNotStartedError, pluginActionHookId } from "@cloudx/plugin-api";
 import { RULES_SKILLS_PLUGIN_ID, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
 import { describe, expect, it, vi } from "vitest";
 
@@ -119,7 +119,7 @@ class FakeDefaultPlugin implements WorkspacePlugin {
     ];
   }
 
-  createSession(input: CreatePluginSessionInput) {
+  createSession(input: CreatePluginSessionInput): FakeSession | Promise<FakeSession> {
     this.createCount += 1;
     this.lastInput = input;
     this.lastControls = input.controls;
@@ -144,6 +144,153 @@ class FakeDefaultPlugin implements WorkspacePlugin {
 }
 
 describe("SessionStore voice actions", () => {
+  it("keeps a pre-start cleanup failure distinct from a safe session rejection", async () => {
+    const { store, root, plugin } = await createStore();
+    const rejected = new PluginSessionNotStartedError(new Error("Repository consent is required."));
+    const cleanup = new Error("Context cleanup failed.");
+    plugin.createSession = () => { throw rejected; };
+    const removeContext = vi.spyOn(TabContextService.prototype, "delete").mockRejectedValue(cleanup);
+    try {
+      await expect(store.createTab({ pluginId: plugin.id, cwd: root })).rejects.toMatchObject({ name: "AggregateError", errors: [rejected, cleanup] });
+      expect(store.listTabs()).toEqual([]);
+    } finally {
+      removeContext.mockRestore();
+      await store.dispose();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("cleans an embedded session when its parent window disappears during startup", async () => {
+    const { store, root, workspace, workspaceCommands, plugin } = await createStore({ withWorkspace: true });
+    const window = workspace!.getActiveWindow();
+    const started = deferred<void>();
+    const release = deferred<void>();
+    const createSession = plugin.createSession.bind(plugin);
+    plugin.createSession = async (input) => {
+      const session = await createSession(input);
+      started.resolve();
+      await release.promise;
+      return session;
+    };
+    try {
+      const creation = workspaceCommands!.createTab({ pluginId: plugin.id, cwd: root, windowId: window.id, paneId: window.layout.activePaneId }, { ownerPluginId: plugin.id });
+      await started.promise;
+      await workspace!.deleteWindow(window.id);
+      release.resolve();
+      await expect(creation).rejects.toThrow(/window/i);
+      expect(plugin.lastSession?.stopped).toBe(true);
+      expect(store.listTabs()).toEqual([]);
+      await expect(fs.readdir(path.join(root, ".cloudx", "context"))).resolves.toEqual([]);
+    } finally {
+      release.resolve();
+      await store.dispose();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps embedded worker sessions visible without changing workspace placement or selection", async () => {
+    const { store, root, workspace, workspaceCommands, plugin } = await createStore({ withWorkspace: true });
+    const original = workspace!.getActiveWindow();
+    const placement = { pluginId: plugin.id, cwd: root, windowId: original.id, paneId: original.layout.activePaneId };
+    try {
+      const parent = await workspaceCommands!.createTab(placement);
+      const other = await workspace!.createWindow({ name: "Other" });
+      await workspace!.selectWindow(original.id);
+      const authorizeProjectTrust = vi.fn(async () => root);
+      const worker = await workspaceCommands!.createTab({ ...placement, windowId: other.id, paneId: other.layout.activePaneId }, { ownerPluginId: plugin.id, authorizeProjectTrust });
+      expect(worker.tab.ownerPluginId).toBe(plugin.id);
+      const contextDirectory = store.getContextDirectory(worker.tab.id)!;
+      expect(contextDirectory.path).toBe(path.dirname(worker.tab.contextPath!));
+      expect(path.basename(worker.tab.contextPath!)).toBe("context.md");
+      const directoryStat = await fs.stat(contextDirectory.path, { bigint: true });
+      expect(contextDirectory).toMatchObject({ dev: directoryStat.dev.toString(), ino: directoryStat.ino.toString() });
+      contextDirectory.ino = "caller mutation";
+      expect(store.getContextDirectory(worker.tab.id)?.ino).toBe(directoryStat.ino.toString());
+      expect(store.getContextDirectory(parent.tab.id)).toBeUndefined();
+      expect(plugin.lastInput?.authorizeProjectTrust).toBe(authorizeProjectTrust);
+      expect(store.getActiveTabId()).toBe(parent.tab.id);
+      expect(workspace!.getActiveWindow().id).toBe(original.id);
+      const state = await workspace!.state(store.listTabs(), store.getActiveTabId());
+      expect(state.tabs.map(tab => tab.id)).toEqual([parent.tab.id, worker.tab.id]);
+      expect(workspace!.findWindowForTab(worker.tab.id)).toBeUndefined();
+      expect(() => store.setActiveTab(worker.tab.id)).toThrow(/embedded/);
+      await store.restartTab(worker.tab.id);
+      expect(store.getTab(worker.tab.id).ownerPluginId).toBe(plugin.id);
+      expect(store.getContextDirectory(worker.tab.id)?.ino).toBe(directoryStat.ino.toString());
+      expect(plugin.lastInput?.authorizeProjectTrust).toBe(authorizeProjectTrust);
+      store.closeTab(parent.tab.id);
+      expect(store.getActiveTabId()).toBeUndefined();
+      await store.discardPreparedTab(worker.tab.id);
+      expect(store.listTabs()).toEqual([]);
+    } finally {
+      await store.dispose();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores requested embedding outside server launch options", async () => {
+    const { store, root, workspace, workspaceCommands, plugin } = await createStore({ withWorkspace: true });
+    const window = workspace!.getActiveWindow();
+    try {
+      const request = { pluginId: plugin.id, cwd: root, windowId: window.id, paneId: window.layout.activePaneId, ownerPluginId: plugin.id, initialInput: { ownerPluginId: plugin.id }, pluginMetadata: { "forge-workers": { ownerPluginId: plugin.id } } };
+      const { tab } = await workspaceCommands!.createTab(request);
+      expect(tab.ownerPluginId).toBeUndefined();
+      expect(workspace!.findWindowForTab(tab.id)?.id).toBe(window.id);
+      expect(store.getActiveTabId()).toBe(tab.id);
+    } finally {
+      await store.dispose();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an unknown embedded session owner before starting the child", async () => {
+    const { store, root, workspace, workspaceCommands, plugin } = await createStore({ withWorkspace: true });
+    const window = workspace!.getActiveWindow();
+    try {
+      await expect(workspaceCommands!.createTab({ pluginId: plugin.id, cwd: root, windowId: window.id, paneId: window.layout.activePaneId }, { ownerPluginId: "unknown-owner" })).rejects.toThrow(/Unknown plugin/);
+      expect(plugin.createCount).toBe(0);
+      expect(store.listTabs()).toEqual([]);
+    } finally {
+      await store.dispose();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("retains server-only project trust authorization for restart without exposing it in tab state", async () => {
+    const { store, root, workspace, workspaceCommands, plugin } = await createStore({ withWorkspace: true });
+    const window = workspace!.getActiveWindow();
+    const authorizeProjectTrust = vi.fn(async () => root);
+    try {
+      const { tab } = await workspaceCommands!.createTab({ pluginId: plugin.id, cwd: root, windowId: window.id, paneId: window.layout.activePaneId }, { authorizeProjectTrust });
+      expect(plugin.lastInput?.authorizeProjectTrust).toBe(authorizeProjectTrust);
+      expect(JSON.stringify(tab)).not.toContain("authorizeProjectTrust");
+      await store.restartTab(tab.id);
+      expect(plugin.lastInput?.authorizeProjectTrust).toBe(authorizeProjectTrust);
+      await store.discardPreparedTab(tab.id);
+      await store.createTab({ pluginId: plugin.id, cwd: root });
+      expect(plugin.lastInput?.authorizeProjectTrust).toBeUndefined();
+    } finally {
+      await store.dispose();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("cannot authorize project trust through serialized tab input or metadata", async () => {
+    const { store, root, workspace, workspaceCommands, plugin } = await createStore({ withWorkspace: true });
+    const window = workspace!.getActiveWindow();
+    try {
+      await workspaceCommands!.createTab({
+        pluginId: plugin.id, cwd: root, windowId: window.id, paneId: window.layout.activePaneId,
+        initialInput: { authorizeProjectTrust: root, trustedProjectPath: root },
+        pluginMetadata: { "forge-workers": { workerId: "spoofed", trustedProjectPath: root } }
+      });
+      expect(plugin.lastInput?.authorizeProjectTrust).toBeUndefined();
+    } finally {
+      await store.dispose();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("creates and durably places a tab through one server-owned workspace command", async () => {
     const { store, root, workspace } = await createStore({ withWorkspace: true });
     const window = workspace!.getActiveWindow();

@@ -62,6 +62,74 @@ export interface OwnedRegularFile {
   close(): Promise<void>;
 }
 
+export interface OwnedDirectoryIdentity {
+  path: string;
+  dev: string;
+  ino: string;
+}
+
+export interface OwnedDirectory {
+  readonly identity: OwnedDirectoryIdentity;
+  childPath(name: string): string;
+  assertCurrent(): Promise<void>;
+  remove(): Promise<void>;
+  close(): Promise<void>;
+}
+
+export async function openOwnedDirectoryNoFollow(rootPath: string, directoryPath: string, label: string, expected?: OwnedDirectoryIdentity): Promise<OwnedDirectory> {
+  if (process.platform !== "linux") throw new Error(`${label} descriptor-relative ownership requires Linux.`);
+  const resolvedRoot = path.resolve(rootPath);
+  const resolvedDirectory = path.resolve(directoryPath);
+  if (!isDirectChildPath(resolvedRoot, resolvedDirectory) || (expected && expected.path !== resolvedDirectory)) throw new Error(`${label} must be a direct child of its owned parent.`);
+  const parent = await openDirectoryNoFollow(resolvedRoot, `${label} parent`);
+  const anchoredDirectory = descriptorChildPath(parent.fd, path.basename(resolvedDirectory));
+  let directory: Awaited<ReturnType<typeof fsp.open>> | undefined;
+  try {
+    if (!expected) await fsp.mkdir(anchoredDirectory, { mode: 0o700 });
+    directory = await openDirectoryNoFollow(anchoredDirectory, label);
+    const stat = await directory.stat({ bigint: true });
+    const identity = { path: resolvedDirectory, dev: stat.dev.toString(), ino: stat.ino.toString() };
+    if (expected && (identity.dev !== expected.dev || identity.ino !== expected.ino)) throw new Error(`${label} ownership changed; the replacement was preserved.`);
+    const handle = directory;
+    let closed = false;
+    const assertOpen = () => { if (closed) throw new Error(`${label} ownership handles are closed.`); };
+    const assertCurrent = async () => {
+      assertOpen();
+      const current = await fsp.lstat(anchoredDirectory, { bigint: true });
+      if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino) throw new Error(`${label} ownership changed; the replacement was preserved.`);
+    };
+    const childPath = (name: string) => {
+      assertOpen();
+      if (!name || name === "." || name === ".." || path.basename(name) !== name) throw new Error(`${label} child must be a direct file name.`);
+      return descriptorChildPath(handle.fd, name);
+    };
+    await assertCurrent();
+    return {
+      identity,
+      childPath,
+      assertCurrent,
+      async remove() {
+        await assertCurrent();
+        const entries = await fsp.readdir(`/proc/self/fd/${handle.fd}`, { withFileTypes: true });
+        if (entries.some(entry => entry.isDirectory())) throw new Error(`${label} contains an unexpected nested directory.`);
+        for (const entry of entries) await fsp.unlink(childPath(entry.name));
+        await assertCurrent();
+        await fsp.rmdir(anchoredDirectory);
+      },
+      async close() {
+        if (closed) return;
+        closed = true;
+        const results = await Promise.allSettled([handle.close(), parent.close()]);
+        const errors = results.filter((result): result is PromiseRejectedResult => result.status === "rejected").map(result => result.reason);
+        if (errors.length) throw new AggregateError(errors, `${label} ownership handles failed to close.`);
+      }
+    };
+  } catch (error) {
+    await Promise.allSettled([directory?.close(), parent.close()]);
+    throw error;
+  }
+}
+
 export function stringifyJsonDocument(value: unknown, label: string): string {
   const content = JSON.stringify(value, null, 2);
   if (content === undefined) {

@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
 
 import {
   RULES_SKILLS_PLUGIN_ID,
@@ -11,7 +12,7 @@ import {
   type WorkspaceTab,
 } from "@cloudx/shared";
 
-import { JsonStateFile, requireSafeDirectory } from "../jsonStateFile.js";
+import { JsonStateFile, openOwnedDirectoryNoFollow, requireSafeDirectory } from "../jsonStateFile.js";
 import type { PathPolicy } from "../pathPolicy.js";
 import type { RulesSkillsCatalogService } from "../rulesSkills/RulesSkillsCatalogService.js";
 import type { SessionStore } from "../sessionStore.js";
@@ -31,6 +32,7 @@ export interface ForgeRuntimeDependencies {
   sessions: Pick<
     SessionStore,
     | "getTab"
+    | "getContextDirectory"
     | "listTabs"
     | "executePluginAction"
     | "discardPreparedTab"
@@ -41,6 +43,7 @@ export interface ForgeRuntimeDependencies {
   rulesSkills: Pick<RulesSkillsCatalogService, "list">;
   pathPolicy: PathPolicy;
   dataDir: string;
+  isRepositoryTrusted?: (repository: ForgeRepository) => boolean;
   gitAccess: (
     repository: ForgeRepository,
     role: ForgeCredentialRole,
@@ -279,6 +282,9 @@ export class ForgeRuntime {
       throw new Error(
         `Unknown worker personality template: ${input.templateId}`,
       );
+    const authorizeProjectTrust = this.dependencies.isRepositoryTrusted?.(owned.expectedRepository)
+      ? () => this.authorizeProjectTrust(owned)
+      : undefined;
     owned.launchPending = true;
     await this.manifest(owned.id).write(owned);
     const { tab } = await this.dependencies.workspaceCommands.createTab({
@@ -292,6 +298,15 @@ export class ForgeRuntime {
         [RULES_SKILLS_PLUGIN_ID]: { selectedTemplateId: input.templateId },
         "forge-workers": { workerId: input.id },
       },
+    }, {
+      ownerPluginId: "forge",
+      authorizeProjectTrust,
+    }).catch(async error => {
+      if (error instanceof PluginSessionNotStartedError) {
+        owned.launchPending = false;
+        await this.manifest(owned.id).write(owned);
+      }
+      throw error;
     });
     const ownedTab: OwnedTab = {
       tabId: tab.id,
@@ -345,6 +360,7 @@ export class ForgeRuntime {
         owned.quiescent = true;
         await this.tabManifest(tabId).write(owned);
       }
+      if (owned?.context) await this.assertContextIdentity(owned.context);
       await this.dependencies.sessions.discardPreparedTab(tabId);
     } else if (owned && !owned.closed && !owned.quiescent) {
       throw new Error(
@@ -398,6 +414,7 @@ export class ForgeRuntime {
       for (const tab of this.dependencies.sessions.listTabs()) {
         if (
           tab.pluginId !== "codex-terminal" ||
+          tab.ownerPluginId !== "forge" ||
           tab.pluginMetadata?.["forge-workers"]?.workerId !== id
         )
           continue;
@@ -650,11 +667,27 @@ export class ForgeRuntime {
       (await this.tabManifest(tabId).read<OwnedTab>());
     if (
       tab.pluginId !== "codex-terminal" ||
+      tab.ownerPluginId !== "forge" ||
       !owned ||
       owned.closed ||
       tab.pluginMetadata?.["forge-workers"]?.workerId !== owned.workerId
     )
       throw new Error("The tab is not an owned Forge worker.");
+  }
+
+  private async authorizeProjectTrust(owned: OwnedWorkspace): Promise<string> {
+    const current = await this.readOwned(owned.id);
+    if (
+      current.cleaned || !current.prepared ||
+      current.expectedRepository.provider !== owned.expectedRepository.provider ||
+      current.expectedRepository.apiUrl !== owned.expectedRepository.apiUrl ||
+      current.expectedRepository.projectPath !== owned.expectedRepository.projectPath ||
+      !this.dependencies.isRepositoryTrusted?.(owned.expectedRepository)
+    ) throw new Error("Forge repository trust is no longer approved for this checkout.");
+    await this.assertCheckout(current);
+    await this.assertCheckout(owned);
+    this.dependencies.pathPolicy.resolve(owned.worktreePath);
+    return fs.realpath(owned.worktreePath);
   }
 
   private async matchOwned(input: ForgeWorkspace): Promise<OwnedWorkspace> {
@@ -871,10 +904,10 @@ export class ForgeRuntime {
     const contextPath = tab.contextPath
       ? path.resolve(tab.contextPath)
       : undefined;
+    const context = contextPath ? this.dependencies.sessions.getContextDirectory(tab.id) : undefined;
     if (
       contextPath &&
-      path.dirname(contextPath) !==
-        path.join(path.resolve(this.dependencies.dataDir), "context")
+      (!context || path.dirname(contextPath) !== context.path)
     )
       throw new Error(
         "Worker tab context is outside its owned context directory.",
@@ -884,7 +917,10 @@ export class ForgeRuntime {
       "codex-launches",
       safeId(tab.id),
     );
-    if (contextPath) owned.context = await optionalFileIdentity(contextPath);
+    if (context) {
+      if (!(await this.assertContextIdentity(context))) throw new Error("Worker context directory disappeared.");
+      owned.context = { ...context };
+    }
     if (
       await requireSafeDirectory(
         this.dependencies.dataDir,
@@ -897,6 +933,19 @@ export class ForgeRuntime {
   }
 
   private async removeContext(expected: DirectoryIdentity): Promise<void> {
+    const context = await this.openContext(expected);
+    if (!context) return;
+    try { await context.remove(); } finally { await context.close(); }
+  }
+
+  private async assertContextIdentity(expected: DirectoryIdentity): Promise<boolean> {
+    const context = await this.openContext(expected);
+    if (!context) return false;
+    await context.close();
+    return true;
+  }
+
+  private async openContext(expected: DirectoryIdentity) {
     const contextDirectory = path.join(
       path.resolve(this.dependencies.dataDir),
       "context",
@@ -910,30 +959,10 @@ export class ForgeRuntime {
       create: false,
       label: "Worker context directory",
     });
-    const handle = await fs
-      .open(expected.path, constants.O_RDONLY | constants.O_NOFOLLOW)
-      .catch((error: NodeJS.ErrnoException) => {
-        if (error.code === "ENOENT") return undefined;
-        throw error;
-      });
-    if (!handle) return;
-    try {
-      const stat = await handle.stat({ bigint: true });
-      const current = await fs.lstat(expected.path, { bigint: true });
-      if (
-        !stat.isFile() ||
-        stat.ino.toString() !== expected.ino ||
-        stat.dev.toString() !== expected.dev ||
-        current.ino !== stat.ino ||
-        current.dev !== stat.dev
-      )
-        throw new Error(
-          "Worker context ownership changed; the replacement was preserved.",
-        );
-      await fs.unlink(expected.path);
-    } finally {
-      await handle.close();
-    }
+    return openOwnedDirectoryNoFollow(contextDirectory, expected.path, "Worker context", expected).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return undefined;
+      throw error;
+    });
   }
 
   private async removeLaunch(
@@ -1076,24 +1105,6 @@ async function optionalIdentity(
 ): Promise<DirectoryIdentity | undefined> {
   try {
     return await identity(directory);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw error;
-  }
-}
-
-async function optionalFileIdentity(
-  filePath: string,
-): Promise<DirectoryIdentity | undefined> {
-  try {
-    const stat = await fs.lstat(filePath, { bigint: true });
-    if (!stat.isFile())
-      throw new Error("Worker context must be a regular file.");
-    return {
-      path: filePath,
-      dev: stat.dev.toString(),
-      ino: stat.ino.toString(),
-    };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;

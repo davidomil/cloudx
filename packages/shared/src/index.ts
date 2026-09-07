@@ -81,6 +81,7 @@ export interface TabIndicatorUpdate {
 export interface WorkspaceTab {
   id: string;
   pluginId: PluginId;
+  ownerPluginId?: PluginId;
   title: string;
   cwd: string;
   status: TabStatus;

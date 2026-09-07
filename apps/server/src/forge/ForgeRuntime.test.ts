@@ -5,6 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
 import type { WorkspaceTab } from "@cloudx/shared";
 
 import { PathPolicy } from "../pathPolicy.js";
@@ -61,6 +62,7 @@ function dependencies(): ForgeRuntimeDependencies {
     pathPolicy: new PathPolicy([root]),
     sessions: {
       getTab: vi.fn(),
+      getContextDirectory: vi.fn(),
       listTabs: vi.fn(() => []),
       executePluginAction: vi.fn(async () => ({})),
       discardPreparedTab: vi.fn(async () => undefined),
@@ -106,6 +108,7 @@ function workerTab(workspace: ForgeWorkspace): WorkspaceTab {
   return {
     id: "codex-1",
     pluginId: "codex-terminal",
+    ownerPluginId: "forge",
     title: "Worker",
     cwd: workspace.worktreePath,
     status: "running",
@@ -118,6 +121,16 @@ function workerTab(workspace: ForgeWorkspace): WorkspaceTab {
     updatedAt: new Date().toISOString(),
     pluginMetadata: { "forge-workers": { workerId: workspace.id } },
   };
+}
+
+async function createWorkerContext(deps: ForgeRuntimeDependencies, tab: WorkspaceTab): Promise<string> {
+  const directory = path.join(deps.dataDir, "context", tab.id);
+  await fs.mkdir(directory, { recursive: true });
+  tab.contextPath = path.join(directory, "context.md");
+  await fs.writeFile(tab.contextPath, "Worker context");
+  const stat = await fs.stat(directory, { bigint: true });
+  vi.mocked(deps.sessions.getContextDirectory).mockReturnValue({ path: directory, ino: stat.ino.toString(), dev: stat.dev.toString() });
+  return directory;
 }
 
 beforeEach(async () => {
@@ -721,6 +734,124 @@ if (${hangFetch} && args.includes("fetch")) {
 }
 
 describe("ForgeRuntime Codex tabs", () => {
+  it("preserves a replaced context directory before discarding a live worker tab", async () => {
+    const deps = dependencies();
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare();
+    const tab = workerTab(workspace);
+    const context = await createWorkerContext(deps, tab);
+    vi.mocked(deps.workspaceCommands.createTab).mockResolvedValue({ tab } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>);
+    vi.mocked(deps.sessions.getTab).mockReturnValue(tab);
+    vi.mocked(deps.sessions.listTabs).mockReturnValue([tab]);
+    await runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", prompt: "Resolve", windowId: "window", paneId: "pane" });
+    await fs.rename(context, `${context}-displaced`);
+    await fs.mkdir(context);
+    await fs.writeFile(tab.contextPath!, "Unrelated replacement");
+    await expect(runtime.close(tab.id)).rejects.toThrow("context ownership changed");
+    expect(deps.sessions.discardPreparedTab).not.toHaveBeenCalled();
+    expect(await fs.readFile(tab.contextPath!, "utf8")).toBe("Unrelated replacement");
+    vi.mocked(deps.sessions.listTabs).mockReturnValue([]);
+    runtime = new ForgeRuntime(deps);
+    await expect(runtime.close(tab.id)).rejects.toThrow("context ownership changed");
+    expect(await fs.readFile(tab.contextPath!, "utf8")).toBe("Unrelated replacement");
+  });
+
+  it("requires server-owned embedding before adopting or controlling a tab with Forge metadata", async () => {
+    const deps = dependencies();
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare();
+    const tab = { ...workerTab(workspace), ownerPluginId: undefined };
+    vi.mocked(deps.sessions.listTabs).mockReturnValue([tab]);
+    vi.mocked(deps.sessions.getTab).mockReturnValue(tab);
+    expect(await runtime.recover(workspace.id)).toEqual({ workspace, tabIds: [] });
+    await expect(runtime.pause(tab.id)).rejects.toThrow("not an owned Forge worker");
+    await expect(runtime.close(tab.id)).rejects.toThrow("not an owned Forge worker");
+    expect(deps.sessions.executePluginAction).not.toHaveBeenCalled();
+    const embedded = { ...tab, ownerPluginId: "forge" };
+    vi.mocked(deps.sessions.listTabs).mockReturnValue([embedded]);
+    vi.mocked(deps.sessions.getTab).mockReturnValue(embedded);
+    expect((await runtime.recover(workspace.id)).tabIds).toEqual([embedded.id]);
+    vi.mocked(deps.sessions.getTab).mockReturnValue(tab);
+    await expect(runtime.pause(tab.id)).rejects.toThrow("not an owned Forge worker");
+    vi.mocked(deps.sessions.getTab).mockReturnValue(embedded);
+    await runtime.pause(embedded.id);
+  });
+
+  it("does not record a pending launch when repository trust settings are invalid", async () => {
+    const deps = dependencies();
+    runtime = new ForgeRuntime({ ...deps, isRepositoryTrusted: () => { throw new Error("Invalid repository settings."); } });
+    const workspace = await prepare();
+    await expect(runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", prompt: "Resolve", windowId: "window", paneId: "pane" })).rejects.toThrow("Invalid repository settings.");
+    expect(deps.workspaceCommands.createTab).not.toHaveBeenCalled();
+    expect(await runtime.recover(workspace.id)).toEqual({ workspace, tabIds: [] });
+  });
+
+  it("can recover and launch after a verified pre-process trust rejection", async () => {
+    const deps = dependencies();
+    runtime = new ForgeRuntime({ ...deps, isRepositoryTrusted: () => true });
+    const workspace = await prepare();
+    const request = { id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", prompt: "Resolve", windowId: "window", paneId: "pane" };
+    vi.mocked(deps.workspaceCommands.createTab).mockRejectedValueOnce(new PluginSessionNotStartedError(new Error("Project trust was revoked.")));
+    await expect(runtime.launch(request)).rejects.toThrow("Project trust was revoked.");
+    expect(await runtime.recover(workspace.id)).toEqual({ workspace, tabIds: [] });
+    vi.mocked(deps.workspaceCommands.createTab).mockResolvedValue({ tab: workerTab(workspace) } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>);
+    expect(await runtime.launch(request)).toBe("codex-1");
+  });
+
+  it("grants exact-checkout trust only with repository consent and revalidates before every use", async () => {
+    const deps = dependencies();
+    const isRepositoryTrusted = vi.fn(() => true);
+    runtime = new ForgeRuntime({ ...deps, isRepositoryTrusted });
+    const workspace = await prepare();
+    const tab = workerTab(workspace);
+    vi.mocked(deps.workspaceCommands.createTab).mockImplementation(async (_request, options) => {
+      expect(await options?.authorizeProjectTrust?.()).toBe(await fs.realpath(workspace.worktreePath));
+      return { tab } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>;
+    });
+    await runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", prompt: "Resolve", windowId: "window", paneId: "pane" });
+    expect(isRepositoryTrusted).toHaveBeenCalledWith(expectedRepository);
+    const authorize = vi.mocked(deps.workspaceCommands.createTab).mock.calls[0]![1]!.authorizeProjectTrust!;
+    expect(await authorize()).toBe(await fs.realpath(workspace.worktreePath));
+    const manifest = path.join(deps.dataDir, "forge-workers", "workspaces", `${workspace.id}.json`);
+    const record = JSON.parse(await fs.readFile(manifest, "utf8"));
+    for (const invalid of [
+      { cleaned: true },
+      { prepared: false },
+      { expectedRepository: { ...expectedRepository, projectPath: "cloudx/other" }, origin: "https://github.com/cloudx/other.git" },
+    ]) {
+      await fs.writeFile(manifest, JSON.stringify({ ...record, ...invalid }));
+      await expect(authorize()).rejects.toThrow("repository trust");
+    }
+    await fs.writeFile(manifest, JSON.stringify({ ...record, gitPending: true }));
+    await expect(authorize()).rejects.toThrow("Git operation is unresolved");
+    await fs.writeFile(manifest, JSON.stringify(record));
+    isRepositoryTrusted.mockReturnValue(false);
+    await expect(authorize()).rejects.toThrow("repository trust");
+    isRepositoryTrusted.mockReturnValue(true);
+    await git(workspace.worktreePath, "remote", "set-url", "origin", "https://github.com/cloudx/other.git");
+    await expect(authorize()).rejects.toThrow("Git configuration or origin changed");
+  });
+
+  it("rejects a replaced checkout even when its ownership manifest was replaced too", async () => {
+    const deps = dependencies();
+    runtime = new ForgeRuntime({ ...deps, isRepositoryTrusted: () => true });
+    const workspace = await prepare();
+    vi.mocked(deps.workspaceCommands.createTab).mockResolvedValue({ tab: workerTab(workspace) } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>);
+    await runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", prompt: "Resolve", windowId: "window", paneId: "pane" });
+    const authorize = vi.mocked(deps.workspaceCommands.createTab).mock.calls[0]![1]!.authorizeProjectTrust!;
+    await fs.rename(workspace.worktreePath, `${workspace.worktreePath}-displaced`);
+    await fs.mkdir(workspace.worktreePath);
+    await fs.cp(path.join(`${workspace.worktreePath}-displaced`, ".git"), path.join(workspace.worktreePath, ".git"), { recursive: true });
+    const manifest = path.join(deps.dataDir, "forge-workers", "workspaces", `${workspace.id}.json`);
+    const record = JSON.parse(await fs.readFile(manifest, "utf8"));
+    for (const key of ["worktree", "repository", "gitDirectory"]) {
+      const stat = await fs.stat(record[key].path, { bigint: true });
+      Object.assign(record[key], { ino: stat.ino.toString(), dev: stat.dev.toString() });
+    }
+    await fs.writeFile(manifest, JSON.stringify(record));
+    await expect(authorize()).rejects.toThrow("directory ownership changed");
+  });
+
   it("launches the configured template and prompt as startup input, then stops before closing placement", async () => {
     const deps = dependencies();
     runtime = new ForgeRuntime(deps);
@@ -750,6 +881,7 @@ describe("ForgeRuntime Codex tabs", () => {
         windowId: "window-1",
         paneId: "pane-1",
       }),
+      { ownerPluginId: "forge", authorizeProjectTrust: undefined },
     );
     expect(deps.sessions.executePluginAction).not.toHaveBeenCalled();
     await expect(runtime.publishBranch(workspace)).rejects.toThrow(
@@ -833,9 +965,7 @@ describe("ForgeRuntime Codex tabs", () => {
     const tab = workerTab(workspace);
     const launch = path.join(deps.dataDir, "codex-launches", tab.id);
     const shared = path.join(deps.dataDir, "shared-codex-state");
-    tab.contextPath = path.join(deps.dataDir, "context", `${tab.id}.md`);
-    await fs.mkdir(path.dirname(tab.contextPath), { recursive: true });
-    await fs.writeFile(tab.contextPath, "Worker context");
+    await createWorkerContext(deps, tab);
     await fs.mkdir(launch, { recursive: true });
     await fs.mkdir(shared);
     await fs.writeFile(path.join(shared, "keep.txt"), "Shared history");
@@ -856,7 +986,7 @@ describe("ForgeRuntime Codex tabs", () => {
     runtime = new ForgeRuntime(deps);
     expect((await runtime.recover(workspace.id)).tabIds).toEqual([tab.id]);
     await runtime.close(tab.id);
-    await expect(fs.lstat(tab.contextPath)).rejects.toMatchObject({
+    await expect(fs.lstat(tab.contextPath!)).rejects.toMatchObject({
       code: "ENOENT",
     });
     await expect(fs.lstat(launch)).rejects.toMatchObject({ code: "ENOENT" });

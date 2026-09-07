@@ -1178,15 +1178,7 @@ export function App() {
       const pane = context.tab ? findPaneContainingTab(layout.root, context.tab.id) : undefined;
       if (!context.callHook || !context.tab || !activeWindowId || !pane) return <div className="empty-pane">Forge workspace is unavailable.</div>;
       return <Suspense fallback={<div className="empty-pane">Loading Forge...</div>}>
-        <ForgePanel key={context.tab.id} callHook={context.callHook} tab={context.tab} windowId={activeWindowId} paneId={pane.id} onOpenSettings={() => setSettingsOpen(true)} onOpenWorkerTab={async (tabId) => {
-          const currentPane = findPaneContainingTab(layoutRef.current.root, tabId);
-          if (currentPane) { await activateTab(tabId, currentPane.id); return; }
-          const targetWindow = windowsRef.current.find((window) => findPaneContainingTab(window.layout.root, tabId));
-          const targetPane = targetWindow && findPaneContainingTab(targetWindow.layout.root, tabId);
-          if (!targetWindow || !targetPane) throw new Error("The worker's Codex tab is no longer open.");
-          await handleSelectWindow(targetWindow.id);
-          await activateTab(tabId, targetPane.id);
-        }} />
+        <ForgePanel key={context.tab.id} callHook={context.callHook} tab={context.tab} windowId={activeWindowId} paneId={pane.id} workerTabs={tabs} active={context.active === true} uiScale={uiScale} onOpenSettings={() => setSettingsOpen(true)} />
       </Suspense>;
     },
     [UI_RENDERER_STATUS_DOT]: (_contribution, context) => (context.tab ? <TabIndicatorDot tab={context.tab} attention={context.attention} /> : null),

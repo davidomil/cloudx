@@ -3,6 +3,7 @@ import { Check, ExternalLink, GitPullRequest, MessageSquare, Pause, Play, Refres
 import type { ForgeChangeRequest, ForgeComment, ForgeDashboard, ForgeIssue, ForgeIssueDetail, ForgePage, ForgePlacement, ForgeReviewComment, ForgeReviewDraft, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
+import { ForgeWorkerTabs } from "./ForgeWorkerTabs.js";
 import type { UiContributionRenderContext } from "./uiContributions.js";
 
 type CallHook = NonNullable<UiContributionRenderContext["callHook"]>;
@@ -11,13 +12,15 @@ type RunAction = (work: () => Promise<unknown>, interrupt?: boolean) => Promise<
 type View = "issues" | "changes" | "workers";
 type ReviewEdit = Pick<ForgeReviewDraft, "body" | "event" | "comments">;
 
-export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, onOpenWorkerTab }: {
+export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, workerTabs, active, uiScale }: {
   callHook: CallHook;
   tab: WorkspaceTab;
   windowId: string;
   paneId: string;
   onOpenSettings?: () => void;
-  onOpenWorkerTab?: (tabId: string) => Promise<void> | void;
+  workerTabs: WorkspaceTab[];
+  active: boolean;
+  uiScale: number;
 }) {
   const bridge = useRef(callHook);
   useEffect(() => { bridge.current = callHook; }, [callHook]);
@@ -25,6 +28,8 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, on
     return await bridge.current<T & Record<string, unknown>>(hook, input, tab.id);
   }, [tab.id]);
   const [view, setView] = useState<View>("issues");
+  const [selectedWorkerId, setSelectedWorkerId] = useState<string>();
+  const onViewWorker = (workerId: string) => { setSelectedWorkerId(workerId); setView("workers"); };
   const [revision, setRevision] = useState(0);
   const [dashboard, setDashboard] = useState<ForgeDashboard>();
   const [loadError, setLoadError] = useState<string>();
@@ -101,15 +106,14 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, on
           {item === "workers" && awaitingReview ? <span className="forge-badge">{awaitingReview} awaiting review</span> : null}
         </ControlButton>)}
       </nav>
-      {view === "workers" ? <div className="forge-workers" aria-label="Workers">
-        {workers.map((worker) => <WorkerCard key={worker.id} worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onOpenWorkerTab={onOpenWorkerTab} />)}
-        {!workers.length ? <p className="forge-empty">Start an issue or review to create a Codex worker.</p> : null}
-      </div> : dashboard.configured && repository ? <ForgeItems key={`${repository.provider}:${repository.apiUrl}:${repository.projectPath}:${view}`} kind={view} provider={repository.provider} request={request} revision={revision} workers={workers.filter((worker) => worker.repository.provider === repository.provider && worker.repository.apiUrl === repository.apiUrl && worker.repository.projectPath === repository.projectPath)} placement={placement} runAction={runAction} busy={busy} onOpenWorkerTab={onOpenWorkerTab} /> : null}
+      {view === "workers" ? <ForgeWorkerTabs workers={workers} workerTabs={workerTabs} selectedWorkerId={selectedWorkerId} onSelectWorker={setSelectedWorkerId} active={active} uiScale={uiScale}>
+        {(worker) => <WorkerCard worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} />}
+      </ForgeWorkerTabs> : dashboard.configured && repository ? <ForgeItems key={`${repository.provider}:${repository.apiUrl}:${repository.projectPath}:${view}`} kind={view} provider={repository.provider} request={request} revision={revision} workers={workers.filter((worker) => worker.repository.provider === repository.provider && worker.repository.apiUrl === repository.apiUrl && worker.repository.projectPath === repository.projectPath)} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} /> : null}
     </> : null}
   </section>;
 }
 
-function ForgeItems({ kind, provider, request, revision, workers, placement, runAction, busy, onOpenWorkerTab }: {
+function ForgeItems({ kind, provider, request, revision, workers, placement, runAction, busy, onViewWorker }: {
   kind: "issues" | "changes";
   provider: "github" | "gitlab";
   request: Request;
@@ -118,7 +122,7 @@ function ForgeItems({ kind, provider, request, revision, workers, placement, run
   placement: ForgePlacement;
   runAction: RunAction;
   busy: boolean;
-  onOpenWorkerTab?: (tabId: string) => Promise<void> | void;
+  onViewWorker?: (workerId: string) => void;
 }) {
   const [filterText, setFilterText] = useState("");
   const [query, setQuery] = useState({ filter: "", page: 1 });
@@ -216,7 +220,7 @@ function ForgeItems({ kind, provider, request, revision, workers, placement, run
             </div>
             <p className="forge-muted">Reviews are submitted using the configured reviewer identity. A message is required when requesting changes.</p>
           </>}
-          {selectedWorkers.map((worker) => <WorkerCard key={worker.id} worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onOpenWorkerTab={onOpenWorkerTab} />)}
+          {selectedWorkers.map((worker) => <WorkerCard key={worker.id} worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} />)}
           <ForgeComments comments={currentDetail?.comments ?? []} />
         </> : <p className="forge-empty">Select {kind === "issues" ? "an issue" : `a ${singular}`}.</p>}
       </div>
@@ -224,13 +228,13 @@ function ForgeItems({ kind, provider, request, revision, workers, placement, run
   </div>;
 }
 
-function WorkerCard({ worker, request, placement, runAction, busy, onOpenWorkerTab }: {
+function WorkerCard({ worker, request, placement, runAction, busy, onViewWorker }: {
   worker: ForgeWorker;
   request: Request;
   placement: ForgePlacement;
   runAction: RunAction;
   busy: boolean;
-  onOpenWorkerTab?: (tabId: string) => Promise<void> | void;
+  onViewWorker?: (workerId: string) => void;
 }) {
   const [controlling, setControlling] = useState(false);
   const controlRunning = useRef(false);
@@ -250,9 +254,9 @@ function WorkerCard({ worker, request, placement, runAction, busy, onOpenWorkerT
     {worker.status === "awaiting_review" ? <p role="status">Ready for review. Resume after feedback to address comments and check approval.</p> : null}
     <div className="forge-actions">
       {canPause ? <ControlButton size="compact" disabled={controlling} onClick={() => void interruptWorker("pause")}><Pause size={14} /> Pause</ControlButton> : null}
-      {canResume ? <ControlButton size="compact" disabled={busy} onClick={() => void runAction(() => request("forge.worker.resume", { id: worker.id, ...placement }))}><Play size={14} /> {worker.status === "cleanup_failed" ? "Clean up" : "Resume"}</ControlButton> : null}
+      {canResume ? <ControlButton size="compact" disabled={busy} onClick={() => void runAction(() => request("forge.worker.resume", { id: worker.id, ...placement }))}><Play size={14} /> {worker.status === "cleanup_failed" && worker.kind === "review" ? "Clean up" : "Resume"}</ControlButton> : null}
       {canStop ? <ControlButton size="compact" disabled={controlling} onClick={() => void interruptWorker("stop")}><Square size={13} /> Stop</ControlButton> : null}
-      {worker.tabId && onOpenWorkerTab ? <ControlButton size="compact" disabled={busy} onClick={() => void runAction(async () => onOpenWorkerTab(worker.tabId!))}><Terminal size={14} /> Open Codex tab</ControlButton> : null}
+      {onViewWorker ? <ControlButton size="compact" onClick={() => onViewWorker(worker.id)}><Terminal size={14} /> View worker</ControlButton> : null}
       {worker.changeUrl ? <a href={worker.changeUrl} target="_blank" rel="noreferrer">Open PR/MR <ExternalLink size={12} /></a> : null}
     </div>
     {worker.draft ? <ReviewEditor key={`${worker.id}:${worker.draft.headSha}`} worker={worker} draft={worker.draft} request={request} runAction={runAction} busy={busy} /> : null}

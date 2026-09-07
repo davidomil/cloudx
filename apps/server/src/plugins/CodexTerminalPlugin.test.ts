@@ -3,9 +3,10 @@ import os from "node:os";
 import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { parse } from "smol-toml";
+import { parse, stringify } from "smol-toml";
 
 import type { TabIndicatorUpdate, WorkspaceTab } from "@cloudx/shared";
+import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
 
 import { CLOUDX_CODEX_DEFAULT_ARGS, CODEX_TERMINAL_ACTIONS, CodexTerminalPlugin, CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES, TERMINAL_ACTIONS, TerminalShellIntegrationParser, buildCodexLaunchArgs, codexResumeInput, materializeCodexTemplate } from "./CodexTerminalPlugin.js";
 import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
@@ -85,6 +86,73 @@ const tab: WorkspaceTab = {
 };
 
 describe("CodexTerminalPlugin", () => {
+  it("trusts only the authorized project in its overlay and reauthorizes template updates", async () => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      const authorizeProjectTrust = vi.fn(async () => root);
+      const original = stringify({ projects: { "/other-project": { trust_level: "untrusted" } } });
+      await fs.writeFile(path.join(home, "config.toml"), original);
+      const session = await plugin.createSession({ tab, cwd: root, authorizeProjectTrust, controls: { setTabIndicator: () => undefined, closeTab: () => undefined } });
+      const configPath = path.join(factory.env!.CODEX_HOME!, "config.toml");
+      const expectedProjects = { "/other-project": { trust_level: "untrusted" }, [root]: { trust_level: "trusted" } };
+      expect(parse(await fs.readFile(configPath, "utf8")).projects).toEqual(expectedProjects);
+      await session.applyRuntimeContext!({});
+      expect(authorizeProjectTrust).toHaveBeenCalledTimes(2);
+      expect(parse(await fs.readFile(configPath, "utf8")).projects).toEqual(expectedProjects);
+      expect(await fs.readFile(path.join(home, "config.toml"), "utf8")).toBe(original);
+      expect(factory.spawns).toBe(1);
+      expect(factory.args?.join(" ")).toContain("--yolo");
+      authorizeProjectTrust.mockRejectedValueOnce(new Error("Repository consent was revoked."));
+      await expect(session.applyRuntimeContext!({})).rejects.toThrow("Repository consent was revoked.");
+      session.stop?.();
+    });
+  });
+
+  it.each(["untrusted", "invalid-table", "invalid-project", "invalid-trust"])("refuses project trust when source policy is %s", async (policy) => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      const project = policy === "invalid-project" ? "invalid" : { trust_level: policy === "invalid-trust" ? "invalid" : "untrusted" };
+      const original = stringify({ projects: policy === "invalid-table" ? "invalid" : { [root]: project } });
+      await fs.writeFile(path.join(home, "config.toml"), original);
+      const creation = plugin.createSession({ tab, cwd: root, authorizeProjectTrust: async () => root, controls: { setTabIndicator: () => undefined, closeTab: () => undefined } });
+      await expect(creation).rejects.toThrow(policy === "untrusted" || policy === "invalid-trust" ? /untrusted/ : /TOML table/);
+      await expect(creation).rejects.toBeInstanceOf(PluginSessionNotStartedError);
+      expect(factory.spawns).toBe(0);
+      expect(await fs.readFile(path.join(home, "config.toml"), "utf8")).toBe(original);
+    });
+  });
+
+  it("identifies a rejected trust grant as a session that never started", async () => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const cause = new Error("Repository consent is required.");
+      const creation = plugin.createSession({ tab, cwd: root, authorizeProjectTrust: async () => { throw cause; }, controls: { setTabIndicator: () => undefined, closeTab: () => undefined } });
+      await expect(creation).rejects.toBeInstanceOf(PluginSessionNotStartedError);
+      await expect(creation).rejects.toMatchObject({ message: cause.message, cause });
+      expect(factory.spawns).toBe(0);
+    });
+  });
+
+  it("rejects a trust grant for a different directory before starting Codex", async () => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      await expect(plugin.createSession({ tab, cwd: root, authorizeProjectTrust: async () => path.dirname(root), controls: { setTabIndicator: () => undefined, closeTab: () => undefined } })).rejects.toThrow(/working directory/);
+      expect(factory.spawns).toBe(0);
+    });
+  });
+
+  it("leaves ordinary and spoofed Codex launches without a project trust grant", async () => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const session = await plugin.createSession({
+        tab: { ...tab, pluginMetadata: { "forge-workers": { workerId: "spoofed", trustedProjectPath: root } } },
+        cwd: root, initialInput: { trustedProjectPath: root, authorizeProjectTrust: root },
+        controls: { setTabIndicator: () => undefined, closeTab: () => undefined }
+      });
+      expect(parse(await fs.readFile(path.join(factory.env!.CODEX_HOME!, "config.toml"), "utf8")).projects).toBeUndefined();
+      session.stop?.();
+    });
+  });
+
+  it("requires an isolated Codex overlay to authorize project trust", async () => {
+    await expect(materializeCodexTemplate(undefined, {}, { cwd: "/tmp", authorizeProjectTrust: async () => "/tmp" })).rejects.toThrow(/overlay/);
+  });
+
   it.each(["config", "binding"])("settles a launch deadline while %s open is held, without later writes or spawn", async (stage) => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-held-launch-"));
     const home = path.join(root, "home");
@@ -1192,6 +1260,23 @@ async function seedImagegenSkill(codexHome: string): Promise<void> {
   await fs.mkdir(path.join(skillDir, "scripts"), { recursive: true });
   await fs.writeFile(path.join(skillDir, "SKILL.md"), "---\nname: imagegen\ndescription: Generate images.\n---\n\nImage generation instructions.\n", "utf8");
   await fs.writeFile(path.join(skillDir, "scripts", "image_gen.py"), "# imagegen helper\n", "utf8");
+}
+
+async function withProjectTrustFixture(run: (fixture: { root: string; home: string; factory: CapturingFactory; plugin: CodexTerminalPlugin }) => Promise<void>): Promise<void> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cloudx-project."trust-'));
+  const home = path.join(root, "codex-home");
+  const data = path.join(root, "data");
+  await seedImagegenSkill(home);
+  vi.stubEnv("CODEX_HOME", home);
+  const sources = new CodexStateSources(data, { CODEX_HOME: home });
+  const factory = new CapturingFactory();
+  try {
+    await run({ root, home, factory, plugin: new CodexTerminalPlugin(factory, undefined, data, sources) });
+  } finally {
+    factory.process?.kill();
+    await sources.dispose();
+    await fs.rm(root, { recursive: true, force: true });
+  }
 }
 
 async function seedExternalSkill(skillsRoot: string, id: string): Promise<string> {

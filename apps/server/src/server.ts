@@ -1262,7 +1262,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   forge = new ForgeWorkflowService({
     settings: () => settingsForForge.settings(),
     provider: (repository, role, signal) => settingsForForge.provider(repository, role, signal),
-    runtime: new ForgeRuntime({ sessions, workspaceCommands, workspace, rulesSkills, pathPolicy, dataDir: config.dataDir, gitAccess: (repository, role, signal) => settingsForForge.gitAccess(repository, role, signal) }),
+    runtime: new ForgeRuntime({ sessions, workspaceCommands, workspace, rulesSkills, pathPolicy, dataDir: config.dataDir, gitAccess: (repository, role, signal) => settingsForForge.gitAccess(repository, role, signal), isRepositoryTrusted: repository => settingsForForge.isRepositoryTrusted(repository) }),
     store: new ForgeWorkflowStore(pluginData),
     reports: new ForgeWorkerReports(config.dataDir),
     notify: (title, body) => { notifications.send({ title, body }); }

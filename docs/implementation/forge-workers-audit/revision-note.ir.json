@@ -1,7 +1,5 @@
 {
-  "title": "Forge Workers current revision",
   "doc_kind": "technical_doc",
-  "audience": "CloudX implementers reviewing the replacement revision",
   "style_profile": "compact_evidence_first",
   "targets": [
     "gfm"
@@ -13,7 +11,7 @@
       "source_type": "repo_code",
       "authority": "primary",
       "locator": "apps/server/src/forge/ForgeSettingsService.ts",
-      "revision": "sha256:7562f60a76c464e841ab2585f9f8c07d12d17dc9dff80c096c35ad22ba7ed684",
+      "revision": "sha256:7b9baa17bbfe196fea78c3197055131144e8683a349b6251c08e61bf98db45fb",
       "notes": "Implementation behavior and constraints only."
     },
     {
@@ -31,7 +29,25 @@
       "source_type": "repo_code",
       "authority": "primary",
       "locator": "apps/server/src/forge/ForgeRuntime.ts",
-      "revision": "sha256:865fbeb6a996621552d45acb7517107c722768f4afbaf0194e93610073b2eea2",
+      "revision": "sha256:c48a5f39cffd34f10b99bfee1a0ff63be89bf751ca397e1396453573191f6aaa",
+      "notes": "Implementation behavior and constraints only."
+    },
+    {
+      "id": "src_forge_workflow",
+      "title": "Issue and review lifecycle",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/forge/ForgeWorkflowService.ts",
+      "revision": "sha256:3faef53fee60c279b0dc7c88baa4c4aa6b666f649f2cff4d143bcf4fbe60f70f",
+      "notes": "Implementation behavior and constraints only."
+    },
+    {
+      "id": "src_forge_panel",
+      "title": "Forge controls and review editor",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/web/src/ui/ForgePanel.tsx",
+      "revision": "sha256:7cef67aeb27de10397780ad9fd4b0cb6b80045d87ae885d52dc479dbd391867e",
       "notes": "Implementation behavior and constraints only."
     },
     {
@@ -44,13 +60,40 @@
       "revision": "sha256:6107311ca2bf2cf9f753a7ad74cf06ef467dff09020cb33b3cd9effb7c2cbb99"
     },
     {
+      "id": "src_forge_settings_tests",
+      "title": "Forge setup and template settings interaction tests",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/web/src/ui/SettingsDialog.forge.test.ts",
+      "notes": "Ordinary Settings access, provider defaults, canonical saved repository matching and named templates.",
+      "revision": "sha256:bdb1d5e7e33a73ef2e1d0330e1d2f4f03c9f083ec3f1f4cc73550ecb5583d391"
+    },
+    {
       "id": "src_forge_lifecycle_tests",
       "title": "Production PTY issue and review lifecycle integration",
       "source_type": "repo_code",
       "authority": "primary",
       "locator": "apps/server/src/forge/ForgeLifecycle.integration.test.ts",
       "notes": "Linux production PTY, CodexTerminalPlugin, SessionStore and Forge workflow/store/runtime with temporary Git repositories, a deterministic assistant executable and local Forge provider fixture.",
-      "revision": "sha256:e52a0b7e7c8bcf5f41f1fabf17606f6f285453972a19a01d29648b3d5be18707"
+      "revision": "sha256:2d15d72c46a41b19539fdfb995d95f6b460c76fbf968cd118ed263f6f06a06b2"
+    },
+    {
+      "id": "src_forge_host_scope",
+      "title": "CloudX Linux host product boundary",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "docs/architecture/system-context.md",
+      "revision": "sha256:ef62fa4bbbfbe4e503f3387fde54c0aab22b781251d8f73c38f03a2dd6acf15b",
+      "notes": "Confirms the existing Linux host boundary used by Forge."
+    },
+    {
+      "id": "src_forge_process_tree",
+      "title": "Awaited terminal process termination",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/terminal/TerminalProcessTree.ts",
+      "revision": "sha256:13277a98245cddda62496887d56efdf20549895365fab5be947f638032278394",
+      "notes": "Confirms the existing Linux host boundary used by Forge."
     },
     {
       "id": "src_forge_connection_service",
@@ -89,6 +132,15 @@
       "revision": "sha256:f56ad40ecf64369964554b15b59cc2eb8bf4ff39aee25bdf835f40c2ad06f330"
     },
     {
+      "id": "src_forge_connection_tests",
+      "title": "Connection controls interaction tests",
+      "locator": "apps/web/src/ui/ForgeConnections.test.ts",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "notes": "Mounted production component, real client transport against fixture responses, delayed/stale responses, consent form and role states.",
+      "revision": "sha256:46900da6e77fabe807b70875cd5f1c2760930afc89e67db197f85fd065779b7c"
+    },
+    {
       "id": "src_forge_github_manifest",
       "title": "GitHub App registration from manifests",
       "locator": "https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest",
@@ -123,35 +175,159 @@
       "locator": "docs/implementation/forge-workers-audit/remote-verification-runs.txt",
       "notes": "Exact executed commands, selected original output, raw log hashes and production-component browser observations. Earlier delivery evidence is separately labeled.",
       "revision": "sha256:0e1071fe8658b9d019d6c2c995be7c92d6f3b2812ea9281b118069b63e2aa70c"
+    },
+    {
+      "id": "src_codex_overlay",
+      "title": "Per-worker Codex configuration",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/rulesSkills/CodexHomeOverlay.ts",
+      "notes": "Primary implementation: canonical exact-cwd trust, explicit untrusted rejection, source configuration preservation.",
+      "revision": "sha256:98d333aa7ccdc51a1b0458ae3b6ac1d8af9caadf42230d666ff40b29ce4ab404"
+    },
+    {
+      "id": "src_codex_plugin",
+      "title": "Codex terminal launch and refresh",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/plugins/CodexTerminalPlugin.ts",
+      "notes": "Primary implementation of authorization callback at initial materialization and runtime-context refresh.",
+      "revision": "sha256:b6c00d8686efe019dfa3eedc34b7edda79d1d6ace29bbc97e32e7e8dffb0f926"
+    },
+    {
+      "id": "src_codex_plugin_tests",
+      "title": "Trust handoff and source preservation tests",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/plugins/CodexTerminalPlugin.test.ts",
+      "notes": "Production materialization, source policy rejection and public-metadata spoofing tests.",
+      "revision": "sha256:0f4e1b6ee4ef76dfb86589f89805974f4fea7a7df1a3488c74e1c767f249cac8"
+    },
+    {
+      "id": "src_forge_runtime_tests",
+      "title": "Repository-scoped grant tests",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/forge/ForgeRuntime.test.ts",
+      "notes": "Captured/current checkout ownership, repository approval and revocation tests.",
+      "revision": "sha256:96aaa1f65cf08cfcabfc63d204c0d76e7c0c004f2ba4beaf94335e1ffdfa9ce1"
+    },
+    {
+      "id": "src_forge_trust_verification",
+      "title": "Native trust and runtime verification",
+      "source_type": "other",
+      "authority": "primary",
+      "locator": "docs/implementation/forge-workers-audit/trust-verification-runs.txt",
+      "notes": "Executed commands and normalized observations with original evidence hashes.",
+      "revision": "sha256:5015ee1ac569179478615e3d8c2ed0b3c0b9150cbf4764f4d1e8f98fb6c08603"
+    },
+    {
+      "id": "src_codex_native_lookup",
+      "title": "Codex 0.153.4 project trust lookup",
+      "source_type": "web",
+      "authority": "primary",
+      "locator": "https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/config/src/config_toml.rs",
+      "notes": "Primary official tagged source; exact normalized cwd then Git-root lookup. Archive doc_3289f8f4b3664f7e7ba76c7e contains generated source documentation.",
+      "revision": "rust-v0.153.4"
+    },
+    {
+      "id": "src_codex_native_overrides",
+      "title": "Codex 0.153.4 command-line overrides",
+      "source_type": "web",
+      "authority": "primary",
+      "locator": "https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/config/src/overrides.rs",
+      "notes": "Primary official tagged source; dotted override keys split on each dot. Archive doc_fad4d0ec28dffee401747aeb retains source artifact.",
+      "revision": "rust-v0.153.4"
+    },
+    {
+      "id": "src_forge_worker_tabs",
+      "title": "Worker terminals inside Forge",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/web/src/ui/ForgeWorkerTabs.tsx",
+      "notes": "Worker identity selection, server-owned session matching, pane-focus attachment and keyboard-accessible subtabs.",
+      "revision": "sha256:78285f71115849ae992ef95bb449d5e1bde326c7fb4836f3eeb9147d98f9539f"
+    },
+    {
+      "id": "src_workspace_commands",
+      "title": "Embedded session publication",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/workspace/WorkspaceCommandService.ts",
+      "notes": "Server-only owner option bypasses pane placement while publishing the session for lifecycle ownership.",
+      "revision": "sha256:41510445e99b1313e7a613de1b5a35fa9e2faf530c42c4f7c05a6750922352f4"
+    },
+    {
+      "id": "src_session_store",
+      "title": "Session ownership and activation",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/sessionStore.ts",
+      "notes": "Server-owned embedded identities remain sessions, preserve authorization on restart and cannot become active workspace tabs.",
+      "revision": "sha256:4b86d6e932c0887ff046c1916dead24e37ce353abc7472ab0e7464788ef37edd"
+    },
+    {
+      "id": "src_forge_panel_tests",
+      "title": "Forge worker terminal interaction tests",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/web/src/ui/ForgePanel.test.ts",
+      "notes": "Selection, ownership mismatch rejection, resumed terminal replacement and focused-pane behavior.",
+      "revision": "sha256:095ebff21e56a8790b116274786132eb7e99cc7360eef491eab81e98b66db5be"
+    },
+    {
+      "id": "src_forge_workflow_tests",
+      "title": "Forge ownership recovery workflow tests",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/forge/ForgeWorkflowService.test.ts",
+      "notes": "Resource recovery gate and preserved issue resume; cleanup only for merged issue/review workers.",
+      "revision": "sha256:0fd6f3f066a68dfdc99bd049b4768730963f602b8ca544dc3ec68b1a3d094397"
+    },
+    {
+      "id": "src_tab_context",
+      "title": "Owned worker context logging",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/context/TabContextService.ts",
+      "notes": "Bounded atomic log rotation inside a private minted directory.",
+      "revision": "sha256:24834d6e9a3e5e6ce38a132fff37c61c9930a2d9c9b82a908f700574768144f5"
+    },
+    {
+      "id": "src_owned_directory",
+      "title": "Descriptor-based private directory operations",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/jsonStateFile.ts",
+      "notes": "Expected device/inode and no-follow opens bind child operations to the opened directory.",
+      "revision": "sha256:82b83e264f75b24113a827ab7fc01a162a4b93790e1356acccd163f65ab58ddd"
+    },
+    {
+      "id": "src_tab_context_tests",
+      "title": "Owned context lifecycle tests",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/context/TabContextService.test.ts",
+      "notes": "Rotation, replacement rejection, concurrent deletion, bounded content and creation failure.",
+      "revision": "sha256:0a6ec713da6ed4ded74ca523e3afc0f19a4826c709694a46429f4626413b203c"
+    },
+    {
+      "id": "src_owned_directory_tests",
+      "title": "Owned directory boundary tests",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "locator": "apps/server/src/jsonStateFile.test.ts",
+      "notes": "Direct-child and identity boundary verification.",
+      "revision": "sha256:7dfc5fa9784a84c0041b225aeba875e1c721e13b527f3ed7eaaa152a40b9a508"
     }
   ],
   "source_gaps": [],
+  "title": "Forge Workers current revision",
+  "audience": "CloudX implementers reviewing directory trust and embedded worker terminals",
   "sections": [
     {
-      "title": "Current revision: managed repositories and connected applications",
+      "title": "Current revision: verified directory trust and worker terminals inside Forge",
       "claims": [
-        {
-          "id": "repository",
-          "text": "Settings select the remote provider, API endpoint, repository and target branch; switching provider sets its standard API endpoint.",
-          "support_status": "supported",
-          "evidence": [
-            {
-              "source_id": "src_forge_settings",
-              "locator": "repository; forgeConfigFields",
-              "excerpt": "Requires provider/apiUrl/projectPath/baseBranch; no local repository or manual credential fields."
-            },
-            {
-              "source_id": "src_forge_credentials",
-              "locator": "validateRepository",
-              "excerpt": "HTTPS endpoints; GitHub owner/repository or enterprise /api/v3; GitLab subgroup paths and /api/v4."
-            },
-            {
-              "source_id": "src_forge_settings_ui",
-              "locator": "setPluginValue; forgeRepository",
-              "excerpt": "Provider changes select the corresponding standard API URL; repository comparison strips the same trailing slash as the server."
-            }
-          ]
-        },
         {
           "id": "managed-checkout",
           "text": "Forge automatically prepares private managed checkouts and authenticates Git using connected identities without local checkout configuration.",
@@ -170,136 +346,234 @@
           ]
         },
         {
-          "id": "github",
-          "text": "GitHub setup registers one app per role, receives generated app credentials, verifies repository installation and resumes existing attempts on the same CloudX origin.",
+          "id": "repository-trust",
+          "text": "Explicit repository approval grants trust only to canonical Forge-owned checkouts for the matching provider, API URL and configured repository; authorization checks current and captured checkout ownership on each materialization.",
           "support_status": "supported",
           "evidence": [
             {
-              "source_id": "src_forge_github_manifest",
-              "locator": "Implementing the GitHub App Manifest flow",
-              "excerpt": "Manifest POST initiates registration; callback code exchanges for generated app credentials."
+              "source_id": "src_forge_settings",
+              "locator": "isRepositoryTrusted; repositoryTrustKey",
+              "excerpt": "Saved approval must equal the supplied repository and the currently configured repository."
             },
             {
-              "source_id": "src_forge_connection_service",
-              "locator": "beginGitHub; completeGitHubManifest; completeGitHubInstallation",
-              "excerpt": "Existing registering/installing phases reuse state/app; changed callback origin is rejected; connected follows installation verification."
+              "source_id": "src_forge_runtime",
+              "locator": "launch; authorizeProjectTrust",
+              "excerpt": "Server-only callback checks approval, current ownership record and captured checkout/.git identities and Git configuration hash."
             },
             {
-              "source_id": "src_forge_connection_ui",
-              "locator": "connectGitHub; openConsent",
-              "excerpt": "Opens consent synchronously, submits returned GET or POST, and observes server status."
+              "source_id": "src_codex_plugin",
+              "locator": "materializeCodexTemplate; updateRuntimeContext",
+              "excerpt": "Authorization callback is evaluated before overlay creation, including context refresh."
             }
           ]
         },
         {
-          "id": "gitlab",
-          "text": "GitLab project service accounts became generally available in 18.11; a one-time personal access token with api scope and project access is checked before provisioning both bot accounts, memberships and tokens.",
+          "id": "trust-source-policy",
+          "text": "The exact checkout trust entry is written only in the worker Codex overlay; source configuration and unrelated project decisions are preserved, and an explicit untrusted decision for the checkout rejects the grant.",
           "support_status": "supported",
           "evidence": [
             {
-              "source_id": "src_forge_connection_service",
-              "locator": "provisionGitLab",
-              "excerpt": "Loops worker/reviewer roles, keeps active records, creates accounts/membership/tokens and persists bot credentials."
+              "source_id": "src_codex_overlay",
+              "locator": "materializeCodexHomeOverlay; trustProject; prepareOverlayConfig",
+              "excerpt": "Parses source config into an isolated overlay, checks canonical cwd, rejects untrusted exact key, and adds trust_level=trusted only at that key."
             },
             {
-              "source_id": "src_forge_registration",
-              "locator": "gitlabCheckSetup; gitlabCreateAccount; gitlabGrantAccess; gitlabCreateToken",
-              "excerpt": "Checks active, nonrevoked personal access token with api scope and lists project service accounts before writes; then creates accounts, role memberships and personal access tokens."
-            },
-            {
-              "source_id": "src_forge_gitlab_accounts",
-              "locator": "Project service accounts",
-              "excerpt": "Project service accounts became generally available in GitLab 18.11. Project Maintainer/Owner or supported instance administrator can create project service accounts."
-            },
-            {
-              "source_id": "src_forge_gitlab_account_api",
-              "locator": "Create a project service account; Create a personal access token for a project service account",
-              "excerpt": "Documents project service-account and personal-access-token endpoints."
+              "source_id": "src_codex_plugin_tests",
+              "locator": "exact worker cwd trust and source policy tests",
+              "excerpt": "Tests preserve source text, reject explicit untrusted policy and prevent public metadata from authorizing trust."
             }
           ]
         },
         {
-          "id": "secret",
-          "text": "The one-time GitLab setup token is cleared from the input after submission and is not part of persistent connection records.",
+          "id": "embedded-workers",
+          "text": "Workers appear as selectable subtabs inside Forge; View worker selects the worker there, selection uses the stable worker identity across resumed terminal replacement, and server-owned sessions are excluded from top-level workspace placement.",
           "support_status": "supported",
           "evidence": [
             {
-              "source_id": "src_forge_connection_ui",
-              "locator": "connectGitLab",
-              "excerpt": "Copies the current token only into the request call and clears local input state before awaiting."
+              "source_id": "src_forge_worker_tabs",
+              "locator": "ForgeWorkerTabs",
+              "excerpt": "Selects by worker ID, validates Forge owner plus matching session/worker metadata, renders the terminal only in the focused Forge pane."
             },
             {
-              "source_id": "src_forge_connection_store",
-              "locator": "StoredForgeConnection; read validation",
-              "excerpt": "Persistent records contain generated bot/app credentials and phases; no setupToken field."
+              "source_id": "src_forge_panel",
+              "locator": "onViewWorker; Workers view",
+              "excerpt": "View worker sets the selected worker ID and opens the Workers section."
             },
             {
-              "source_id": "src_forge_connection_service",
-              "locator": "provisionGitLab; status; publicConnection",
-              "excerpt": "Setup token is only passed into registration operations; public connection status omits all credentials."
+              "source_id": "src_forge_runtime",
+              "locator": "launch",
+              "excerpt": "createTab receives server-only ownerPluginId=forge independently of repository trust."
+            },
+            {
+              "source_id": "src_workspace_commands",
+              "locator": "createTabNow",
+              "excerpt": "Owned embedded sessions publish without pane placement."
+            },
+            {
+              "source_id": "src_session_store",
+              "locator": "prepareTab; publishPreparedTabs; setActiveTab",
+              "excerpt": "Owner comes from server launch options; embedded sessions remain in session snapshots but cannot become active top-level tabs."
+            },
+            {
+              "source_id": "src_forge_runtime",
+              "locator": "recover; requireWorkerTab",
+              "excerpt": "Worker recovery and lifecycle control require server-assigned ownerPluginId=forge as well as matching worker metadata and cwd."
             }
           ]
         },
         {
-          "id": "connection-recovery",
-          "text": "Expired GitLab access can be renewed for the existing accounts without replacing active roles; failed setup remains explicit attention.",
+          "id": "native-trust-verification",
+          "text": "Installed Codex 0.153.4 passed seven native PTY trust scenarios without model requests. Exact overlay trust loads project configuration. Parent trust and quoted dotted CLI keys do not grant checkout trust.",
           "support_status": "supported",
           "evidence": [
             {
-              "source_id": "src_forge_connection_service",
-              "locator": "provisionGitLab; tokenExpired; publicConnection",
-              "excerpt": "Expired connected records reuse existing account IDs; active roles are skipped. Failed records block further provisioning. Read-only preflight runs before creating any record."
+              "source_id": "src_forge_trust_verification",
+              "locator": "native-codex-trust",
+              "excerpt": "Seven passing scenarios, clean process exits, zero local model requests; initialized composer confirmed by model marker and unsent input."
             },
             {
-              "source_id": "src_forge_connection_ui",
-              "locator": "renewTokens; role rendering",
-              "excerpt": "Shows token expiry/renewal; hides GitHub failed-role actions and hides GitLab setup submission if either role failed."
+              "source_id": "src_codex_native_lookup",
+              "locator": "get_active_project",
+              "excerpt": "Selects exact cwd before Git root; no arbitrary ancestor project lookup."
+            },
+            {
+              "source_id": "src_codex_native_overrides",
+              "locator": "apply_toml_override",
+              "excerpt": "Splits key path on every dot; does not interpret quoted TOML key segments."
             }
           ]
         },
         {
-          "id": "manifest-replacement",
-          "text": "The managed-checkout runtime rejects ownership manifests that lack its required current fields and private checkout layout; no earlier-manifest compatibility is implemented.",
+          "id": "prelaunch-recovery",
+          "text": "A confirmed failure before Codex process startup clears the pending-launch record so the existing checkout can be recovered. Ambiguous launch outcomes remain blocked.",
           "support_status": "supported",
           "evidence": [
             {
               "source_id": "src_forge_runtime",
-              "locator": "readOwned",
-              "excerpt": "Requires role, gitPending, prepared, launchPending, repository identity and checkoutPath(id); missing or mismatched ownership record throws."
-            }
-          ]
-        },
-        {
-          "id": "verification",
-          "text": "The replacement revision full suite passed 2305 tests in 120 files with maxWorkers=2; typecheck and build passed.",
-          "support_status": "supported",
-          "evidence": [
-            {
-              "source_id": "src_forge_remote_verification",
-              "locator": "remote-full; remote-typecheck; remote-build",
-              "excerpt": "120 files and 2305 tests passed in 45.68s; typecheck passed; build completed with existing chunk-size warning."
+              "locator": "launch: PluginSessionNotStartedError handling",
+              "excerpt": "Clears launchPending only for the typed confirmed pre-process failure."
             },
             {
-              "source_id": "src_forge_remote_verification",
-              "locator": "shipped-shell-browser",
-              "excerpt": "12 shipped-shell desktop/mobile checks passed in 10.1s."
+              "source_id": "src_codex_plugin",
+              "locator": "createSession materialization catch before factory.spawn",
+              "excerpt": "Only pre-spawn materialization failure is wrapped as PluginSessionNotStartedError."
+            },
+            {
+              "source_id": "src_forge_runtime_tests",
+              "locator": "can recover and launch after a verified pre-process trust rejection",
+              "excerpt": "After the typed error, recover returns the existing workspace and a subsequent launch succeeds."
             }
           ]
         },
         {
-          "id": "verification-scope",
-          "text": "Linux integration scenarios exercise actual PTY/Git issue and review lifecycles with deterministic assistant/provider fixtures; this evidence does not demonstrate live provider registration/authentication or model execution.",
+          "id": "nested-ui-verification",
+          "text": "Nested worker UI checks passed 77 tests in four files. Desktop and mobile browser fixtures verified input, switching, paused output and resumed-session replacement with actual xterm and no page errors or overflow.",
           "support_status": "supported",
           "evidence": [
+            {
+              "source_id": "src_forge_trust_verification",
+              "locator": "nested-worker-ui; nested-worker-browser",
+              "excerpt": "Exact commands and original log/script/screenshot hashes; production UI with deterministic socket/hook transport at 1320x1000 and 390x844."
+            }
+          ]
+        },
+        {
+          "id": "revision-verification",
+          "text": "The revision passed 2359 tests in 120 files with four test workers. Typecheck, all workspace builds and 12 shipped-shell browser tests passed.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_trust_verification",
+              "locator": "context-final-full; context-final-typecheck; context-final-build; context-final-browser",
+              "excerpt": "Exact commands, original log hashes and selected output. Two earlier timing failures and a passing 195-test focused rerun are recorded separately."
+            }
+          ]
+        },
+        {
+          "id": "repaired-ownership-resume",
+          "text": "After ownership recovery succeeds, unfinished issues resume their preserved checkouts with fresh context. Merged issues and review workers finish cleanup without relaunching. Failed resource checks still block resumption.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_workflow",
+              "locator": "resume: recoveringResources",
+              "excerpt": "Performs recoverResources before branching to cleanup for merged issue/review; unfinished issue continues normal launch without preparing a replacement checkout."
+            },
+            {
+              "source_id": "src_forge_workflow_tests",
+              "locator": "Forge ownership recovery",
+              "excerpt": "Unpublished and published issue recovery failures remain blocked; repaired ownership resumes retained checkout with latest feedback. Review/merged issue cleanup never relaunches."
+            },
+            {
+              "source_id": "src_forge_trust_verification",
+              "locator": "repaired-ownership-workflow",
+              "excerpt": "Focused workflow and plugin tests: 31 passed."
+            },
+            {
+              "source_id": "src_forge_panel",
+              "locator": "WorkerCard canResume control",
+              "excerpt": "Issue cleanup_failed uses Resume; review cleanup_failed uses Clean up."
+            }
+          ]
+        },
+        {
+          "id": "rotated-context-recovery",
+          "text": "Worker context ownership uses a private directory identity, so atomic log rotation does not invalidate recovery. Cleanup rechecks that identity and preserves replacement directories.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_tab_context",
+              "locator": "createOwned; directory; record; writeOwnedContextAtomic",
+              "excerpt": "Context service mints a private per-tab directory and atomically rotates context.md inside it; returns a copy of its recorded directory identity."
+            },
+            {
+              "source_id": "src_session_store",
+              "locator": "prepareTab; getContextDirectory",
+              "excerpt": "Embedded sessions request owned context directories; Forge obtains the minted identity through the server session service."
+            },
+            {
+              "source_id": "src_forge_runtime",
+              "locator": "captureTab; assertContextIdentity; openContext; removeContext",
+              "excerpt": "Persists the minted directory identity, verifies before close, and reopens/removes only with the expected device/inode."
+            },
+            {
+              "source_id": "src_owned_directory",
+              "locator": "openOwnedDirectoryNoFollow",
+              "excerpt": "Opens parent and child directories with no-follow flags; checks expected identity and uses directory descriptors for child operations."
+            },
             {
               "source_id": "src_forge_lifecycle_tests",
-              "locator": "Forge lifecycle through real Codex tabs; LifecycleFixture; LocalForgeProvider; fakeAssistant; processIsRunning",
-              "excerpt": "Actual NodePtyTerminalProcessFactory, CodexTerminalPlugin, SessionStore and Forge workflow/runtime/store. Fixture assistant reports completion across feedback/approval turns and review edits; local provider handles publication. Owned assistant /proc states verify termination."
+              "locator": "cleans a paused worker after log rotation and a server restart",
+              "excerpt": "Real PTY output rotates context-file inode; pause and SessionStore disposal precede runtime recovery/cleanup; owned checkout remains."
+            }
+          ]
+        },
+        {
+          "id": "context-directory-contract",
+          "text": "Embedded worker context storage uses owned directories. Earlier flat context-file records are not converted or adopted as directory ownership.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_tab_context",
+              "locator": "createOwned",
+              "excerpt": "Creates a new private per-tab directory exclusively and retains only the identity minted during creation."
             },
             {
-              "source_id": "src_forge_remote_verification",
-              "locator": "connection-browser",
-              "excerpt": "Provider registration browser interaction uses intercepted fixture endpoints, not live GitHub/GitLab."
+              "source_id": "src_forge_runtime",
+              "locator": "captureTab; openContext",
+              "excerpt": "Requires the session-minted context directory identity, then reopens the recorded path as a directory with expected device/inode."
+            }
+          ]
+        },
+        {
+          "id": "live-github-verification",
+          "text": "A live GitHub issue worker resumed its retained checkout after resource recovery. Native Codex worked without a trust prompt; source configuration stayed unchanged and desktop/mobile terminals remained inside Forge.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_trust_verification",
+              "locator": "final-live-github-recovery",
+              "excerpt": "Exact browser command and artifact hashes, selected finalRefresh/finalBrowser booleans, visually inspected desktop/mobile screenshots of actual gpt-6-astra activity."
             }
           ]
         }
@@ -307,35 +581,74 @@
       "blocks": [
         {
           "kind": "paragraph",
-          "text": "This revision replaces the local-checkout and manual-credential setup described in the earlier delivery history below. Configure a remote repository; Forge creates private owned checkouts and authenticates Git with the connected worker or reviewer identity.",
+          "text": "Forge prepares managed remote checkouts and shows each issue or review worker as a tab inside Forge. **View worker** selects its controls and terminal. Worker selection survives Resume replacing the terminal session; server-owned worker sessions stay outside workspace pane layouts.",
           "claim_ids": [
-            "repository",
-            "managed-checkout"
+            "managed-checkout",
+            "embedded-workers"
           ]
         },
         {
           "kind": "paragraph",
-          "text": "GitHub uses a separate generated app manifest for each role, followed by registration and installation consent. GitLab uses one temporary personal access token to provision two project service accounts, their memberships and bot tokens. Read-only token and project API checks precede writes. Expired access renews tokens for the existing bot accounts while preserving active connections; uncertain mutations remain blocked for inspection. The setup token is not retained.",
+          "text": "Explicit repository approval matches the provider, API URL and current repository settings. Before granting trust, Forge checks both the current ownership record and the captured checkout identity. Changed ownership, Git configuration or approval prevents the grant.",
           "claim_ids": [
-            "github",
-            "gitlab",
-            "secret",
-            "connection-recovery"
+            "repository-trust"
           ]
         },
         {
           "kind": "paragraph",
-          "text": "Earlier ownership manifests are not migrated. The current runtime requires its managed-checkout ownership fields and layout before cleanup.",
+          "text": "The worker’s private Codex overlay receives the exact canonical checkout trust entry. Source configuration and other project trust decisions remain unchanged; an explicit untrusted checkout decision is preserved. Confirmed failures before process startup leave the checkout recoverable. Uncertain launches retain their ownership records.",
           "claim_ids": [
-            "manifest-replacement"
+            "trust-source-policy",
+            "prelaunch-recovery"
           ]
         },
         {
           "kind": "paragraph",
-          "text": "Current revision verification: `npx vitest run --maxWorkers=2 --reporter=dot` passed 2,305 tests in 120 files; `npm run typecheck` and `npm run build` passed. `npx playwright test --reporter=line` passed 12 shipped-shell browser checks. Actual PTY/Git lifecycle tests use deterministic assistant/provider fixtures. Live provider registration, credentials and Codex model execution remain unverified.",
+          "text": "Worker context logs now rotate inside a private directory whose identity comes from the session service. Forge records that directory identity and verifies it during recovery and cleanup. The real PTY regression rotates the log, stops the worker, recreates the runtime and removes the old terminal artifacts while retaining the checkout.",
           "claim_ids": [
-            "verification",
-            "verification-scope"
+            "rotated-context-recovery"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "Embedded worker context storage changes from a flat file to an owned directory. Earlier context-file records are not adopted or converted automatically.",
+          "claim_ids": [
+            "context-directory-contract"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "Once ownership and process checks succeed, an unfinished issue can resume in its preserved checkout with fresh context. Merged issues and review workers only finish cleanup; they do not launch another terminal. Failed checks continue to preserve resources.",
+          "claim_ids": [
+            "repaired-ownership-resume"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "Installed Codex 0.153.4 passed seven native PTY startup scenarios. Exact overlay trust loaded project configuration and reached the initialized composer; parent-only trust still showed the trust dialog. The checks made no model requests.",
+          "claim_ids": [
+            "native-trust-verification"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "Nested worker UI checks passed 77 tests in four files. Desktop and mobile browser fixtures verified terminal input, worker switching, paused output retention and resumed-session replacement. They used the production terminal component and reported no page errors or horizontal overflow.",
+          "claim_ids": [
+            "nested-ui-verification"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "The current revision passed `npm test -- --reporter=dot --maxWorkers=4`: 2,359 tests in 120 files. `npm run typecheck`, `npm run build` and all 12 shipped-shell browser tests also passed. The audit retains earlier timing failures and a snapshot failure caused by concurrent documentation editing, together with their passing reruns.",
+          "claim_ids": [
+            "revision-verification"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "A live GitHub issue worker resumed in its retained checkout after resource recovery. Codex worked without the trust prompt, and the source configuration and production service stayed unchanged. Desktop and mobile checks showed its terminal inside Forge, with no page errors or horizontal overflow.",
+          "claim_ids": [
+            "live-github-verification"
           ]
         }
       ]

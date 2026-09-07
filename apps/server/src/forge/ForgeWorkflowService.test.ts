@@ -547,6 +547,62 @@ describe("Forge worker controls during startup", () => {
 });
 
 describe("Forge ownership recovery", () => {
+  it.each([false, true])("resumes preserved issue work after ownership recovery succeeds (published request: %s)", async (published) => {
+    const f = fixture();
+    const worker = await f.service.startIssue(1, placement);
+    if (published) {
+      f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Ready" });
+      await f.service.poll();
+    } else await f.service.pause(worker.id);
+    f.runtime.recover.mockResolvedValue({
+      workspace: { id: worker.id, repositoryPath: "/repo/work", worktreePath: "/repo/work", branch: worker.branch! },
+      tabIds: ["tab-1"],
+    });
+    f.runtime.close.mockRejectedValue(new Error("Owned context file changed"));
+    await f.service.resume(worker.id, placement);
+    expect((await f.service.dashboard()).workers[0]?.status).toBe("cleanup_failed");
+
+    f.runtime.recover.mockClear();
+    await expect(f.service.resume(worker.id, placement)).rejects.toThrow("Owned context file changed");
+    expect(f.runtime.recover).toHaveBeenCalledTimes(1);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(1);
+    expect(f.stored()[0]?.status).toBe("cleanup_failed");
+
+    f.runtime.close.mockResolvedValue(undefined);
+    f.runtime.recover.mockClear();
+    f.change.approved = true;
+    f.change.comments = [{ id: "latest", author: "reviewer", body: "Handle the timeout" }];
+    const resumed = await f.service.resume(worker.id, placement);
+    expect(resumed).toMatchObject({ status: "running", worktreePath: "/repo/work", branch: worker.branch, tabId: "tab-1" });
+    expect(resumed.error).toBeUndefined();
+    expect(f.runtime.recover).toHaveBeenCalledTimes(1);
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledTimes(1);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.launch).toHaveBeenLastCalledWith(expect.objectContaining({ id: worker.id, worktreePath: "/repo/work", ...placement }), expect.any(AbortSignal));
+    expect(f.reports.prepare).toHaveBeenLastCalledWith(expect.any(String), expect.objectContaining({
+      item: expect.objectContaining({ number: 1 }),
+      change: published ? expect.objectContaining({ comments: f.change.comments }) : undefined,
+    }));
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("finishes recovered review cleanup without relaunching (automatic posting: %s)", async (autoPost) => {
+    const f = fixture();
+    const worker = await f.service.startReview(7, autoPost, placement);
+    f.runtime.cleanup.mockRejectedValue(new Error("Owned checkout changed"));
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "comment", body: "Review", comments: [] });
+    await f.service.poll();
+    expect((await f.service.dashboard()).workers[0]?.status).toBe("cleanup_failed");
+
+    f.runtime.cleanup.mockResolvedValue(undefined);
+    const completed = await f.service.resume(worker.id, placement);
+    expect(completed).toMatchObject({ status: "completed", worktreePath: undefined, draft: { status: autoPost ? "posted" : "draft" } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(1);
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledTimes(1);
+    expect(f.provider.postReview).toHaveBeenCalledTimes(autoPost ? 1 : 0);
+  });
+
   it("recovers a checkout and tab created before workflow state could record their IDs", async () => {
     const f = fixture();
     let orphanId = "";
@@ -594,5 +650,12 @@ describe("Forge ownership recovery", () => {
     expect(f.runtime.cleanup).toHaveBeenCalledWith(
       expect.objectContaining({ expectedHeadSha: f.change.headSha }),
     );
+    f.runtime.cleanup.mockResolvedValue(undefined);
+    const completed = await f.service.resume(worker.id, placement);
+    expect(completed).toMatchObject({ status: "completed", worktreePath: undefined });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(1);
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledTimes(1);
+    expect(f.runtime.cleanup).toHaveBeenCalledTimes(2);
+    expect(f.runtime.cleanup).toHaveBeenLastCalledWith(expect.objectContaining({ expectedHeadSha: f.change.headSha }));
   });
 });

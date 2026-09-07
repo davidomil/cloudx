@@ -7,6 +7,10 @@ import type { ForgeChangeRequest, ForgeDashboard, ForgeIssueDetail, ForgeWorker,
 import { ForgePanel } from "./ForgePanel.js";
 import type { UiContributionRenderContext } from "./uiContributions.js";
 
+vi.mock("./TerminalPanel.js", () => ({
+  TerminalPanel: ({ tab, active, uiScale }: { tab: WorkspaceTab; active: boolean; uiScale: number }) => createElement("div", { "data-terminal-tab": tab.id, "data-active": String(active), "data-scale": uiScale })
+}));
+
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const roots: Root[] = [];
@@ -22,6 +26,7 @@ const change: ForgeChangeRequest = { ...issue, number: 12, title: "Repair deploy
 const worker: ForgeWorker = { id: "work-1", kind: "issue", number: 7, title: issue.title, repository, repositoryPath: "/repo", baseBranch: "main", templateId: "worker-template", status: "running", tabId: "codex-worker", autoPost: false, startedAt: "2026-09-07", updatedAt: "2026-09-07" };
 const reviewWorker: ForgeWorker = { ...worker, id: "review-1", kind: "review", number: 12, title: change.title, status: "completed", draft: { headSha: "abcdef", body: "Add a timeout.", event: "request_changes", comments: [{ path: "deploy.ts", line: 8, side: "RIGHT", body: "This can wait forever." }], status: "draft" } };
 const tab: WorkspaceTab = { id: "forge-tab", pluginId: "forge", title: "Forge", cwd: "/repo", status: "idle", indicator: { color: "green", label: "Ready", updatedAt: "2026-09-07" }, createdAt: "2026-09-07", updatedAt: "2026-09-07" };
+const workerTab: WorkspaceTab = { ...tab, id: "codex-worker", pluginId: "codex-terminal", ownerPluginId: "forge", pluginMetadata: { "forge-workers": { workerId: worker.id } } };
 
 type HookHandler = (hook: string, input: Record<string, unknown>) => unknown | Promise<unknown>;
 function fixture(overrides: Partial<ForgeDashboard> = {}, handler?: HookHandler) {
@@ -57,7 +62,7 @@ async function renderPanel(testFixture: ReturnType<typeof fixture>, extra: Parti
   document.body.append(container);
   const root = createRoot(container);
   roots.push(root);
-  await act(async () => { root.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", ...extra })); });
+  await act(async () => { root.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [], active: true, uiScale: 100, ...extra })); });
   return container;
 }
 
@@ -243,7 +248,8 @@ describe("ForgePanel", () => {
     { status: "paused" as const, kind: "review" as const, action: "Resume", hook: "forge.worker.resume" },
     { status: "awaiting_review" as const, kind: "issue" as const, action: "Resume", hook: "forge.worker.resume" },
     { status: "running" as const, kind: "review" as const, action: "Stop", hook: "forge.worker.stop" },
-    { status: "cleanup_failed" as const, kind: "issue" as const, action: "Clean up", hook: "forge.worker.resume" }
+    { status: "cleanup_failed" as const, kind: "issue" as const, action: "Resume", hook: "forge.worker.resume" },
+    { status: "cleanup_failed" as const, kind: "review" as const, action: "Clean up", hook: "forge.worker.resume" }
   ])("$action dispatches the $kind worker's $status lifecycle command", async ({ status, kind, action, hook }) => {
     const testFixture = fixture({ workers: [{ ...worker, kind, status }] });
     const panel = await renderPanel(testFixture);
@@ -269,12 +275,86 @@ describe("ForgePanel", () => {
     await act(async () => { pending.resolve({ worker: { ...worker, status: "stopped" } }); });
   });
 
-  it("opens the worker's existing Codex tab", async () => {
-    const onOpenWorkerTab = vi.fn();
-    const panel = await renderPanel(fixture({ workers: [worker] }), { onOpenWorkerTab });
-    await click(panel, "Open Codex tab");
-    expect(onOpenWorkerTab).toHaveBeenCalledWith("codex-worker");
-    expect(button(panel, "Start work").disabled).toBe(true);
+  it("opens the worker terminal inside Forge without a workspace navigation action", async () => {
+    const testFixture = fixture({ workers: [worker] });
+    const panel = await renderPanel(testFixture, { workerTabs: [workerTab], uiScale: 125 });
+    await click(panel, "View worker");
+    expect(panel.querySelector('[role="tablist"][aria-label="Worker tabs"]')).not.toBeNull();
+    expect(panel.querySelector('[data-terminal-tab="codex-worker"]')?.getAttribute("data-scale")).toBe("125");
+    expect(panel.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Issue #7");
+    expect(testFixture.calls.every(call => !call.hook.startsWith("forge.worker."))).toBe(true);
+    expect(panel.textContent).not.toContain("Open Codex tab");
+  });
+
+  it.each([
+    { ...workerTab, ownerPluginId: undefined },
+    { ...workerTab, pluginId: "standard-terminal" },
+    { ...workerTab, pluginMetadata: { "forge-workers": { workerId: "another-worker" } } }
+  ])("does not attach a terminal without the worker's complete ownership match", async candidate => {
+    const panel = await renderPanel(fixture({ workers: [worker] }), { workerTabs: [candidate] });
+    await click(panel, "View worker");
+    expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
+    expect(panel.textContent).toContain("The worker terminal is unavailable.");
+  });
+
+  it("keeps paused worker output available and only attaches it in the focused Forge pane", async () => {
+    const testFixture = fixture({ workers: [{ ...worker, status: "paused" }] });
+    const panel = await renderPanel(testFixture, { workerTabs: [workerTab], active: false });
+    await click(panel, "View worker");
+    expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
+    expect(panel.textContent).toContain("Select this pane to view the worker terminal.");
+    await act(async () => roots.at(-1)!.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab], active: true, uiScale: 100 })));
+    expect(panel.querySelector('[data-terminal-tab="codex-worker"]')?.getAttribute("data-active")).toBe("true");
+    expect(button(panel, "Resume")).toBeDefined();
+  });
+
+  it("selects internal workers with keyboard navigation and retains review edits", async () => {
+    const panel = await renderPanel(fixture({ workers: [worker, reviewWorker] }), { workerTabs: [workerTab] });
+    await click(panel, "Workers (2)");
+    const tabs = panel.querySelectorAll<HTMLButtonElement>('[role="tab"]');
+    tabs[0].focus();
+    await act(async () => tabs[0].dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true })));
+    expect(document.activeElement).toBe(tabs[1]);
+    expect(tabs[0].getAttribute("aria-selected")).toBe("true");
+    await act(async () => tabs[1].click());
+    const editor = panel.querySelector<HTMLTextAreaElement>('[role="tabpanel"]:not([hidden]) .forge-review textarea')!;
+    await fill(editor, "Retain my edits while I inspect issue work.");
+    await act(async () => tabs[0].click());
+    await act(async () => tabs[1].click());
+    expect(editor.value).toBe("Retain my edits while I inspect issue work.");
+    await act(async () => tabs[1].dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true })));
+    expect(document.activeElement).toBe(tabs[0]);
+    await act(async () => tabs[0].dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true })));
+    expect(document.activeElement).toBe(tabs[1]);
+  });
+
+  it("keeps the selected worker through Resume replacing its terminal and cleanup removing it", async () => {
+    const second = { ...worker, id: "work-2", number: 8, title: "Fix uploads", tabId: "second-terminal", status: "paused" as const };
+    const secondTab = { ...workerTab, id: second.tabId, pluginMetadata: { "forge-workers": { workerId: second.id } } };
+    let testFixture: ReturnType<typeof fixture>;
+    testFixture = fixture({ workers: [worker, second] }, hook => {
+      if (hook === "forge.dashboard") return structuredClone(testFixture.dashboard);
+      if (hook === "forge.worker.resume") {
+        testFixture.dashboard.workers[1] = { ...second, status: "running", tabId: "resumed-terminal" };
+        return { worker: testFixture.dashboard.workers[1] };
+      }
+    });
+    const panel = await renderPanel(testFixture, { workerTabs: [workerTab, secondTab] });
+    await click(panel, "Workers (2)");
+    await act(async () => panel.querySelectorAll<HTMLButtonElement>('[role="tab"]')[1].click());
+    await click(panel.querySelector('[role="tabpanel"]:not([hidden])')!, "Resume");
+    await act(async () => roots.at(-1)!.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab, { ...secondTab, id: "resumed-terminal" }], active: true, uiScale: 100 })));
+    expect(panel.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Issue #8");
+    expect(panel.querySelector('[data-terminal-tab="resumed-terminal"]')).not.toBeNull();
+    expect(panel.querySelector('[data-terminal-tab="second-terminal"]')).toBeNull();
+    testFixture.dashboard.workers[1] = { ...second, status: "completed", tabId: undefined };
+    await click(panel, "Refresh Forge");
+    expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
+    expect(panel.querySelector('[role="tabpanel"]:not([hidden])')?.textContent).toContain("No worker terminal is open.");
+    testFixture.dashboard.workers = [worker];
+    await click(panel, "Refresh Forge");
+    expect(panel.querySelectorAll('[role="tab"]')).toHaveLength(1);
+    expect(panel.querySelector('[data-terminal-tab="codex-worker"]')).not.toBeNull();
   });
 
   it("surfaces action failures without automatically repeating publication", async () => {

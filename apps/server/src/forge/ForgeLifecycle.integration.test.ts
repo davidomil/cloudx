@@ -20,6 +20,7 @@ import { PathPolicy } from "../pathPolicy.js";
 import { PluginRegistry } from "../pluginRegistry.js";
 import { CodexStateSources } from "../plugins/CodexStateSources.js";
 import { CodexTerminalPlugin } from "../plugins/CodexTerminalPlugin.js";
+import { ForgePlugin } from "../plugins/ForgePlugin.js";
 import { NotificationsPlugin } from "../plugins/NotificationsPlugin.js";
 import { PluginDataStore } from "../plugins/PluginDataStore.js";
 import { RulesSkillsCatalogService } from "../rulesSkills/RulesSkillsCatalogService.js";
@@ -28,7 +29,7 @@ import { NodePtyTerminalProcessFactory } from "../terminal/NodePtyTerminalProces
 import type { TerminalProcess } from "../terminal/TerminalProcess.js";
 import { WorkspaceCommandService } from "../workspace/WorkspaceCommandService.js";
 import { WorkspaceLayoutStore } from "../workspace/WorkspaceLayoutStore.js";
-import { ForgeRuntime } from "./ForgeRuntime.js";
+import { ForgeRuntime, type ForgeRuntimeDependencies } from "./ForgeRuntime.js";
 import { ForgeWorkflowService } from "./ForgeWorkflowService.js";
 import { ForgeWorkerReports, ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
 import type { ForgeProvider } from "./providers/ForgeProvider.js";
@@ -50,6 +51,39 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Codex tabs", () => {
+  it("cleans a paused worker after log rotation and a server restart", async () => {
+    const fixture = await LifecycleFixture.create({ largeOutput: true });
+    const started = await fixture.workflow.startIssue(1, fixture.placement);
+    expect(started.status, started.error).toBe("running");
+    const contextPath = fixture.sessions.getTab(started.tabId!).contextPath!;
+    const original = await fs.stat(contextPath, { bigint: true });
+    const receipt = await fixture.completedAssistantTurn(started);
+    await fixture.workflow.pause(started.id);
+    const rotated = await fs.stat(contextPath, { bigint: true });
+    expect(rotated.ino).not.toBe(original.ino);
+    expect(rotated.size).toBeLessThanOrEqual(64_000n);
+    expect(await fs.readFile(contextPath, "utf8")).toContain("Trimmed to the latest 64000 bytes");
+    await fixture.workflow.dispose();
+    await fixture.sessions.dispose();
+    const restarted = new ForgeRuntime(fixture.runtimeDependencies);
+    expect((await restarted.recover(started.id)).tabIds).toEqual([started.tabId]);
+    await restarted.close(started.tabId!);
+    await expectMissing(path.dirname(contextPath), receipt.codexHome);
+    expect((await fs.stat(started.worktreePath!)).isDirectory()).toBe(true);
+  }, 20_000);
+
+  it("keeps the Codex trust decision pending when repository trust has not been approved", async () => {
+    const fixture = await LifecycleFixture.create({ trustRepository: false });
+    const started = await fixture.workflow.startIssue(1, fixture.placement);
+    expect(started.status, started.error).toBe("running");
+    await vi.waitFor(() => {
+      expect(fixture.sessions.getSession(started.tabId!).snapshot().recentOutput).toContain("Do you trust the contents of this directory?");
+    }, { timeout: 8_000, interval: 20 });
+    expect(await fixture.reports.read(started.attemptId!)).toBeUndefined();
+    await expectMissing(path.join(started.worktreePath!, "solution.txt"));
+    await fixture.workflow.pause(started.id);
+  }, 15_000);
+
   it("implements an issue, reads fresh feedback on resume, then merges the approved result and cleans its resources", async () => {
     const fixture = await LifecycleFixture.create();
     const started = await fixture.workflow.startIssue(1, fixture.placement);
@@ -113,7 +147,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(fixture.workspace.getActiveWindow().layout.root).toMatchObject({ type: "pane", pane: { tabIds: [] } });
     expect((await fixture.store.read())[0]).toMatchObject({ status: "completed", changeNumber: 7 });
     expect(fixture.notifications.list().some((notification) => notification.title === "Issue merged")).toBe(true);
-    expect(await fs.readFile(path.join(fixture.codexHome, "config.toml"), "utf8")).toContain('model_provider = "openai"');
+    expect(await fs.readFile(path.join(fixture.codexHome, "config.toml"), "utf8")).toBe(sourceConfig);
   }, 20_000);
 
   it("reviews the exact commit, immediately cleans the agent, and submits the manually edited draft", async () => {
@@ -159,6 +193,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
 
 interface AssistantReceipt {
   pid: number;
+  trustedProjectPath: string;
   gitAuthorizationPresent: boolean;
   args: string[];
   templateId: string;
@@ -197,8 +232,9 @@ class LifecycleFixture {
   readonly store: ForgeWorkflowStore;
   readonly workflow: ForgeWorkflowService;
   readonly catalog: RulesSkillsCatalogService;
+  readonly runtimeDependencies: ForgeRuntimeDependencies;
 
-  private constructor(readonly root: string) {
+  private constructor(readonly root: string, trustRepository: boolean) {
     this.origin = path.join(root, "origin.git");
     this.repositoryPath = path.join(root, "repository");
     this.dataDir = path.join(root, "data");
@@ -209,20 +245,23 @@ class LifecycleFixture {
     this.sources = new CodexStateSources(this.dataDir);
     const plugins = new PluginRegistry();
     plugins.register(new CodexTerminalPlugin(this.factory, undefined, this.dataDir, this.sources));
+    plugins.register(new ForgePlugin(() => { throw new Error("Forge hooks are outside this runtime fixture."); }));
     this.sessions = new SessionStore(plugins, pathPolicy, new TabContextService(this.dataDir), undefined, this.workspace, this.catalog);
-    const runtime = new ForgeRuntime({
+    this.runtimeDependencies = {
       sessions: this.sessions,
       workspace: this.workspace,
       workspaceCommands: new WorkspaceCommandService(this.sessions, this.workspace),
       rulesSkills: this.catalog,
       dataDir: this.dataDir,
       pathPolicy,
+      isRepositoryTrusted: candidate => trustRepository && candidate.provider === repository.provider && candidate.apiUrl === repository.apiUrl && candidate.projectPath === repository.projectPath,
       gitAccess: async (_repository, role) => {
         this.gitAccessRoles.push(role);
         return { cloneUrl: "https://github.com/fixture/cloudx.git", authorization: `Basic fixture-${role}-secret` };
       },
       git: async (cwd, args) => git(cwd, ...args.map((argument) => argument === "https://github.com/fixture/cloudx.git" && ["fetch", "push"].includes(args[0]!) ? this.origin : argument)),
-    });
+    };
+    const runtime = new ForgeRuntime(this.runtimeDependencies);
     this.provider = new LocalForgeProvider(this.origin);
     this.store = new ForgeWorkflowStore(new PluginDataStore(this.dataDir));
     this.reports = new ForgeWorkerReports(this.dataDir);
@@ -236,13 +275,13 @@ class LifecycleFixture {
     });
   }
 
-  static async create(): Promise<LifecycleFixture> {
+  static async create({ trustRepository = true, largeOutput = false } = {}): Promise<LifecycleFixture> {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-forge-lifecycle-"));
     const codexHome = path.join(root, "codex-home");
     const imagegen = path.join(codexHome, "skills", ".system", "imagegen");
     await fs.mkdir(imagegen, { recursive: true });
     await fs.writeFile(path.join(imagegen, "SKILL.md"), "---\nname: imagegen\ndescription: Fixture image skill\n---\nFixture only.\n");
-    await fs.writeFile(path.join(codexHome, "config.toml"), 'model_provider = "openai"\n');
+    await fs.writeFile(path.join(codexHome, "config.toml"), sourceConfig);
     const assistant = path.join(root, "fixture-assistant.mjs");
     await fs.writeFile(assistant, fakeAssistant, { mode: 0o700 });
     await fs.mkdir(path.join(root, "receipts"));
@@ -251,7 +290,8 @@ class LifecycleFixture {
     vi.stubEnv("CLOUDX_ASSISTANT_BIN", assistant);
     vi.stubEnv("SHELL", "/bin/sh");
     vi.stubEnv("FORGE_FIXTURE_RECEIPTS", path.join(root, "receipts"));
-    const fixture = new LifecycleFixture(root);
+    vi.stubEnv("FORGE_FIXTURE_LARGE_OUTPUT", String(largeOutput));
+    const fixture = new LifecycleFixture(root, trustRepository);
     fixtures.push(fixture);
     await fs.mkdir(fixture.repositoryPath);
     await git(root, "init", "--bare", fixture.origin);
@@ -296,6 +336,12 @@ class LifecycleFixture {
     receipt.tabContextPath = this.sessions.getTab(worker.tabId!).contextPath!;
     expect(this.sessions.getTab(worker.tabId!).pluginMetadata?.["rules-skills"]?.selectedTemplateId).toBe(receipt.templateId);
     expect(receipt.args.filter((argument) => argument.includes("Write only valid JSON"))).toHaveLength(1);
+    expect(receipt.trustedProjectPath).toBe(await fs.realpath(worker.worktreePath!));
+    expect(await fs.readFile(path.join(this.codexHome, "config.toml"), "utf8")).toBe(sourceConfig);
+    const state = await this.workspace.state(this.sessions.listTabs(), this.sessions.getActiveTabId());
+    expect(state.tabs.find(tab => tab.id === worker.tabId)).toMatchObject({ ownerPluginId: "forge" });
+    expect(state.windows[0]!.layout.root).toMatchObject({ type: "pane", pane: { tabIds: [] } });
+    expect(this.sessions.getActiveTabId()).toBeUndefined();
     return receipt;
   }
 
@@ -386,15 +432,30 @@ async function processIsRunning(pid: number): Promise<boolean> {
   }
 }
 
+const sourceConfig = 'model_provider = "openai"\n[projects."/unrelated/project"]\ntrust_level = "untrusted"\n';
+
 const fakeAssistant = `#!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { parse } from ${JSON.stringify(import.meta.resolve("smol-toml"))};
+const trustedProjectPath = fs.realpathSync(process.cwd());
+const config = parse(fs.readFileSync(path.join(process.env.CODEX_HOME, "config.toml"), "utf8"));
+if (config.projects?.[trustedProjectPath]?.trust_level !== "trusted") {
+  console.log("Do you trust the contents of this directory?");
+  await new Promise(() => setInterval(() => {}, 1000));
+}
 const args = process.argv.slice(2);
 const prompt = args.at(-1);
 const reportPath = JSON.parse(prompt.split("Write only valid JSON to ")[1].split(" by writing ")[0]);
 const contextPath = JSON.parse(prompt.split("Read the complete current task, feedback and diff from ")[1].split(" before beginning.")[0]);
 const context = JSON.parse(fs.readFileSync(contextPath, "utf8"));
+if (process.env.FORGE_FIXTURE_LARGE_OUTPUT === "true") {
+  for (let entry = 0; entry < 12; entry++) {
+    console.log("Fixture terminal output ".repeat(450));
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+}
 const isReview = prompt.startsWith("Review the exact checked-out commit");
 const git = (...command) => execFileSync("git", command, { encoding: "utf8", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } }).trim();
 const changed = [];
@@ -405,7 +466,7 @@ const headSha = git("rev-parse", "HEAD");
 const report = isReview
   ? { kind: "review", headSha, event: "comment", body: "The return value needs documentation.", comments: [{ body: "Explain the public return value.", path: "review.txt", line: 1, side: "RIGHT" }] }
   : { kind: "issue", title: "Handle empty input", body: "Implemented and verified the fixture changes.", resolvedDiscussionIds: (context.change?.comments ?? []).filter(comment => comment.discussionId && comment.resolved === false).map(comment => comment.discussionId) };
-const receipt = { pid: process.pid, gitAuthorizationPresent: Object.entries(process.env).some(([key, value]) => key.startsWith("GIT_CONFIG_VALUE_") && value?.includes("Authorization:")), args, templateId: process.env.CLOUDX_PERSONALITY_TEMPLATE_ID, skillIds: process.env.CLOUDX_ENABLED_SKILL_IDS, codexHome: process.env.CODEX_HOME, reportPath, contextPath, context, headSha };
+const receipt = { pid: process.pid, trustedProjectPath, gitAuthorizationPresent: Object.entries(process.env).some(([key, value]) => key.startsWith("GIT_CONFIG_VALUE_") && value?.includes("Authorization:")), args, templateId: process.env.CLOUDX_PERSONALITY_TEMPLATE_ID, skillIds: process.env.CLOUDX_ENABLED_SKILL_IDS, codexHome: process.env.CODEX_HOME, reportPath, contextPath, context, headSha };
 fs.writeFileSync(path.join(process.env.FORGE_FIXTURE_RECEIPTS, path.basename(reportPath)), JSON.stringify(receipt));
 fs.writeFileSync(reportPath + ".tmp", JSON.stringify(report));
 fs.renameSync(reportPath + ".tmp", reportPath);

@@ -10,6 +10,43 @@ import { PathPolicy } from "../pathPolicy.js";
 import { WorkspaceLayoutStore } from "./WorkspaceLayoutStore.js";
 
 describe("WorkspaceLayoutStore", () => {
+  it("retains embedded sessions in state while removing them from every pane", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-embedded-state-"));
+    try {
+      const store = new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root]));
+      const window = store.getActiveWindow();
+      await store.updateWindow(window.id, { layout: layoutWithTab("worker") });
+      const worker = { ...tab("worker", root), ownerPluginId: "forge" };
+      const state = await store.state([worker], worker.id);
+      expect(state.tabs).toEqual([worker]);
+      expect(state.activeTabId).toBeUndefined();
+      expect(store.tabIdsForWindow(window.id)).toEqual([]);
+      expect(new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root])).tabIdsForWindow(window.id)).toEqual([]);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses to insert registered embedded sessions through workspace layout mutations", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-embedded-placement-"));
+    try {
+      const store = new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root]));
+      const window = store.getActiveWindow();
+      store.registerEmbeddedTab("worker");
+      await expect(store.updateWindow(window.id, { layout: layoutWithTab("worker") })).rejects.toThrow(/embedded/);
+      await expect(store.applyLayoutInstruction({ type: "add_tab_to_active_pane", windowId: window.id, tabId: "worker" })).rejects.toThrow(/embedded/);
+      const publish = vi.fn();
+      await expect(store.placeTabAndPublish({ tabId: "worker", windowId: window.id, paneId: window.layout.activePaneId }, publish)).rejects.toThrow(/embedded/);
+      expect(publish).not.toHaveBeenCalled();
+      expect(store.tabIdsForWindow(window.id)).toEqual([]);
+      store.unregisterEmbeddedTab("worker");
+      await store.placeTabAndPublish({ tabId: "worker", windowId: window.id, paneId: window.layout.activePaneId }, publish);
+      expect(publish).toHaveBeenCalledOnce();
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("creates, persists, updates, selects, and deletes windows", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-workspace-"));
     const store = new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root]));

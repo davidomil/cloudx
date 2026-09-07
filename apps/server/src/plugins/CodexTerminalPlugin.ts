@@ -3,11 +3,13 @@ import type {
   PluginActionDefinition,
   PluginActionContext,
   PluginSession,
+  PluginSessionLaunchOptions,
   PluginSessionSnapshot,
   PluginTabControls,
   PluginVoiceContext,
   WorkspacePlugin
 } from "@cloudx/plugin-api";
+import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
 import { RULES_SKILLS_PLUGIN_ID, codexStateSourceBasename, isRecord, type CodexTerminalInitialInput, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
 
 import { materializeCodexHomeOverlay, resolveCodexHome, type CodexHomeOverlay } from "../rulesSkills/CodexHomeOverlay.js";
@@ -97,13 +99,19 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     const template = templateFromRuntimeContext(input.runtimeContext);
     const baseEnv = { ...process.env };
     const resume = codexResumeInput(input.initialInput);
-    const launchTemplate = await materializeCodexTemplate(template, baseEnv, {
-      dataDir: this.dataDir,
-      tabId: input.tab.id,
-      cwd: input.cwd,
-      sources: this.sources,
-      sourceId: resume?.sourceId
-    });
+    let launchTemplate: MaterializedCodexTemplate;
+    try {
+      launchTemplate = await materializeCodexTemplate(template, baseEnv, {
+        dataDir: this.dataDir,
+        tabId: input.tab.id,
+        cwd: input.cwd,
+        authorizeProjectTrust: input.authorizeProjectTrust,
+        sources: this.sources,
+        sourceId: resume?.sourceId
+      });
+    } catch (error) {
+      throw new PluginSessionNotStartedError(error);
+    }
     const command = launchTemplate.command;
     const launchArgs = buildCodexLaunchArgs(launchTemplate.args, input.initialInput);
     const launch = buildLoginShellCommandLaunch(command, launchArgs, launchTemplate.env);
@@ -127,6 +135,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
           dataDir: this.dataDir,
           tabId: input.tab.id,
           cwd: input.cwd,
+          authorizeProjectTrust: input.authorizeProjectTrust,
           resetOverlay: false,
           sources: this.sources
         });
@@ -254,7 +263,7 @@ export interface MaterializedCodexTemplate {
   templateName?: string;
 }
 
-export interface MaterializeCodexTemplateOptions {
+export interface MaterializeCodexTemplateOptions extends PluginSessionLaunchOptions {
   dataDir?: string;
   tabId?: string;
   cwd?: string;
@@ -271,6 +280,8 @@ export async function materializeCodexTemplate(
   const env = buildToolEnv(baseEnv);
   const args: string[] = [...CLOUDX_CODEX_DEFAULT_ARGS];
   const dataDir = options.dataDir;
+  if (options.authorizeProjectTrust && (!dataDir || !options.tabId)) throw new Error("Project trust requires an isolated Codex overlay.");
+  const trustedProjectPath = await options.authorizeProjectTrust?.();
   const sources = options.sources ?? (dataDir ? new CodexStateSources(dataDir, baseEnv) : undefined);
   const bound = sources && options.tabId ? await sources.readBinding(options.tabId) : undefined;
   if (bound && options.sourceId !== undefined && options.sourceId !== bound.sourceId) throw new Error("Codex source selection conflicts with existing binding.");
@@ -279,7 +290,7 @@ export async function materializeCodexTemplate(
   if (!sources && options.sourceId && options.sourceId !== "shared") throw new Error("Codex retained sources require a configured data directory.");
   if (!env.CODEX_SQLITE_HOME?.trim()) env.CODEX_SQLITE_HOME = source?.home ?? path.resolve(resolveCodexHome(baseEnv));
   const overlay = dataDir && options.tabId
-    ? await materializeCodexHomeOverlay({ dataDir, tabId: options.tabId, resolved, baseEnv: env, cwd: options.cwd, resetCodexHome: options.resetOverlay, sources: sources!, source: source! })
+    ? await materializeCodexHomeOverlay({ dataDir, tabId: options.tabId, resolved, baseEnv: env, cwd: options.cwd, trustedProjectPath, resetCodexHome: options.resetOverlay, sources: sources!, source: source! })
     : undefined;
   if (overlay) {
     env.CODEX_HOME = overlay.codexHome;

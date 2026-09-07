@@ -304,36 +304,31 @@ export class ForgeWorkflowService {
         ].includes(worker.status)
       )
         throw new Error("This worker is not waiting to resume.");
-      if (worker.status === "cleanup_failed") {
+      const recoveringResources = worker.status === "cleanup_failed";
+      if (recoveringResources) {
         await this.recoverResources(worker);
-        if (worker.kind === "issue") {
-          const change = worker.changeNumber
-            ? await this.providerFor(worker).getChangeRequest(
-                worker.changeNumber,
-              )
-            : undefined;
-          if (!change?.merged)
-            throw new Error(
-              "Issue work has not merged. Resolve the resource ownership error before cleanup.",
-            );
+        const mergedIssue = worker.kind === "issue" && worker.changeNumber
+          ? (await this.providerFor(worker).getChangeRequest(worker.changeNumber)).merged
+          : false;
+        if (worker.kind === "review" || mergedIssue) {
+          await this.cleanup(worker);
+          worker.status = "completed";
+          await this.persist();
+          if (
+            worker.kind === "review" &&
+            worker.autoPost &&
+            worker.draft?.status === "draft"
+          )
+            await this.postDraft(worker);
+          return structuredClone(worker);
         }
-        await this.cleanup(worker);
-        worker.status = "completed";
-        await this.persist();
-        if (
-          worker.kind === "review" &&
-          worker.autoPost &&
-          worker.draft?.status === "draft"
-        )
-          await this.postDraft(worker);
-        return structuredClone(worker);
       }
       this.operations.set(worker.id, new AbortController());
       worker.status = "starting";
       await this.persist();
       try {
         const provider = this.providerFor(worker);
-        await this.recoverResources(worker);
+        if (!recoveringResources) await this.recoverResources(worker);
         const item =
           worker.kind === "issue"
             ? await provider.getIssue(worker.number)

@@ -96,6 +96,25 @@ describe("Forge settings field contracts", () => {
 });
 
 describe("Forge connected application settings", () => {
+  it("persists trust only for the explicitly approved repository and current provider settings", async () => {
+    const { config, settings } = await fixture();
+    expect(settings.isRepositoryTrusted(repository)).toBe(false);
+    const trustedRepository = JSON.stringify([repository.provider, repository.apiUrl, repository.projectPath]);
+    await config.update({ plugins: { forge: { trustedRepository } } });
+    expect(settings.isRepositoryTrusted(repository)).toBe(true);
+    for (const other of [
+      { ...repository, provider: "gitlab" as const },
+      { ...repository, apiUrl: "https://github.example/api/v3" },
+      { ...repository, projectPath: "org/other" },
+    ]) expect(settings.isRepositoryTrusted(other)).toBe(false);
+    await config.update({ plugins: { forge: { projectPath: "org/other" } } });
+    expect(settings.isRepositoryTrusted(repository)).toBe(false);
+    await config.update({ plugins: { forge: { projectPath: repository.projectPath } } });
+    expect(settings.isRepositoryTrusted(repository)).toBe(true);
+    await config.update({ plugins: { forge: { trustedRepository: "" } } });
+    expect(settings.isRepositoryTrusted(repository)).toBe(false);
+  });
+
   it("allows repository setup before connecting and requires both identities before starting work", async () => {
     const { settings, connections, credentials } = await fixture();
     expect(settings.repository()).toEqual(repository);

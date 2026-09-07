@@ -1,4 +1,5 @@
 import type { ApplyWorkspaceLayoutTemplateRequest, CreateTabRequest, CreateTabResponse, WorkspaceWindow } from "@cloudx/shared";
+import type { PluginSessionLaunchOptions } from "@cloudx/plugin-api";
 
 import type { SessionStore } from "../sessionStore.js";
 import type { WorkspaceLayoutStore } from "./WorkspaceLayoutStore.js";
@@ -11,18 +12,18 @@ export class WorkspaceCommandService {
     private readonly workspace: WorkspaceLayoutStore
   ) {}
 
-  createTab(request: CreateTabRequest): Promise<CreateTabResponse> {
-    return this.serialize(() => this.createTabNow(request));
+  createTab(request: CreateTabRequest, launchOptions?: PluginSessionLaunchOptions): Promise<CreateTabResponse> {
+    return this.serialize(() => this.createTabNow(request, launchOptions));
   }
 
   applyLayoutTemplate(templateId: string, input: ApplyWorkspaceLayoutTemplateRequest): Promise<{ window: WorkspaceWindow }> {
     return this.serialize(() => this.applyLayoutTemplateNow(templateId, input));
   }
 
-  private async createTabNow(request: CreateTabRequest): Promise<CreateTabResponse> {
+  private async createTabNow(request: CreateTabRequest, launchOptions?: PluginSessionLaunchOptions): Promise<CreateTabResponse> {
     const windowId = requireId(request.windowId, "windowId");
-    const paneId = requireId(request.paneId, "paneId");
-    const targetWindow = this.workspace.requireTabPlacementTarget(windowId, paneId);
+    const paneId = launchOptions?.ownerPluginId ? request.paneId : requireId(request.paneId, "paneId");
+    const targetWindow = launchOptions?.ownerPluginId ? this.workspace.getWindow(windowId) : this.workspace.requireTabPlacementTarget(windowId, paneId);
     const tab = await this.sessions.prepareTab({
       pluginId: request.pluginId,
       cwd: request.cwd,
@@ -31,10 +32,16 @@ export class WorkspaceCommandService {
       initialInput: request.initialInput,
       windowId: targetWindow.id,
       pluginMetadata: request.pluginMetadata
-    });
+    }, undefined, launchOptions);
 
     try {
       this.sessions.assertPreparedTabsReady([tab.id]);
+      if (tab.ownerPluginId) {
+        const window = this.workspace.getWindow(targetWindow.id);
+        const publishedTab = this.sessions.publishPreparedTab(tab.id);
+        this.workspace.notifyChange();
+        return { tab: publishedTab, window };
+      }
       const { published: publishedTab, window } = await this.workspace.placeTabAndPublish(
         {
           tabId: tab.id,
