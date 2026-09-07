@@ -35,6 +35,7 @@ interface VoicePromptContextProfile {
 export interface VoicePlannerInput extends VoiceTrace {
   transcript: string;
   context: Record<string, unknown>;
+  signal?: AbortSignal;
 }
 
 export interface VoicePlanner {
@@ -48,6 +49,7 @@ export interface CodexExecRunOptions {
   maxOutputBytes?: number;
   taskLabel?: string;
   imagePaths?: string[];
+  signal?: AbortSignal;
 }
 
 type ModelProvider = string | (() => string);
@@ -80,7 +82,8 @@ export class CodexExecVoicePlanner implements VoicePlanner {
       const output = await runCodexExec(model, prompt, {
         schemaPath: resolveVoiceSchemaPath(),
         outputPrefix: "cloudx-voice-plan-",
-        taskLabel: "voice planner"
+        taskLabel: "voice planner",
+        signal: input.signal
       });
       const plan = parseVoiceActionPlan(JSON.parse(output));
       this.logger?.info(
@@ -116,6 +119,7 @@ export class CodexExecVoicePlanner implements VoicePlanner {
 const MAX_VOICE_CONTEXT_JSON_CHARS = 80_000;
 export const CODEX_EXEC_TIMEOUT_MS = 30_000;
 export const CODEX_EXEC_MAX_OUTPUT_BYTES = 1_000_000;
+const CODEX_EXEC_TERMINATION_GRACE_MS = 250;
 const VOICE_PROMPT_CONTEXT_PROFILES: VoicePromptContextProfile[] = [
   {
     name: "normal",
@@ -157,7 +161,7 @@ export function buildVoicePrompt(transcript: string, context: Record<string, unk
   return [
     "You are the Cloudx voice controller.",
     "Return only JSON matching this shape:",
-    "{\"transcript\":\"string\",\"summary\":\"string\",\"actions\":[{\"targetTabId\":\"string optional\",\"pluginId\":\"string optional\",\"hookId\":\"string optional\",\"action\":\"string\",\"input\":{},\"reason\":\"string optional\"}]}",
+    "{\"transcript\":\"string\",\"summary\":\"string\",\"actions\":[{\"id\":\"unique stable string\",\"dependsOn\":[\"earlier action id\"],\"targetTabId\":\"string optional\",\"pluginId\":\"string optional\",\"hookId\":\"string optional\",\"action\":\"string\",\"input\":{},\"reason\":\"string optional\"}]}",
     "For unused optional structured fields, use null or omit them when the schema allows omission.",
     "You may only select hooks exposed to voice in the provided hook descriptors, or legacy actions listed as voiceExposed in plugin descriptors.",
     "When a matching voice hook exists, set hookId to that exact hook id and set action to the same id for readability. Use legacy pluginId/action only when no hook descriptor covers the needed command.",
@@ -172,11 +176,11 @@ export function buildVoicePrompt(transcript: string, context: Record<string, unk
     "Some long context fields may be truncated and marked with Cloudx voice context truncation notes. Treat exact ids, action names, hook ids, schemas, cwd values, and visible untruncated text as authoritative; do not infer omitted text.",
     "Use exact hook ids, plugin ids, tab ids, pane ids, action names, and input fields from the provided context; do not invent plugin capabilities.",
     "For paths, use workspace paths context, the active session cwd, or path guidance exposed by the chosen plugin action schema.",
-    "For pane placement, follow the descriptions and enums exposed by the workspace hook schemas and the exact pane ids in client.panes.",
+    "For pane placement, follow the workspace hook schemas and provide the exact persisted windowId and paneId from client.windows and client.panes.",
     "For window switching, use a workspace window activation hook with an exact windowId/name from client.windows when possible, or a context phrase when matching by context.",
     "When targeting a tab, targetTabId must be an exact tab id from workspace context. For the active tab, you may omit targetTabId and let Cloudx use activeTabId.",
     "Only type the user's words exactly when they clearly ask to dictate, type, or enter exact text.",
-    "For multi-step requests, return actions in execution order.",
+    "Give every action a unique stable id and an explicit dependsOn array. For multi-step requests, return actions in execution order and make each action depend on every earlier result it requires. An action that uses a newly created tab must depend on that creation action.",
     "Never invent shell access. Never ask to run commands directly.",
     "",
     `Transcript: ${transcript}`,
@@ -219,6 +223,9 @@ export function compactVoicePromptContext(context: Record<string, unknown>): Rec
 }
 
 export function runCodexExec(model: string, prompt: string, options: CodexExecRunOptions = {}): Promise<string> {
+  if (options.signal?.aborted) {
+    return Promise.reject(codexAbortReason(options.signal));
+  }
   return new Promise((resolve, reject) => {
     const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), options.outputPrefix ?? "cloudx-codex-structured-"));
     const outputPath = path.join(outputDir, "last-message.json");
@@ -229,6 +236,7 @@ export function runCodexExec(model: string, prompt: string, options: CodexExecRu
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn(launch.command, launch.args, {
+        detached: process.platform !== "win32",
         stdio: ["pipe", "pipe", "pipe"],
         env: buildToolEnv(process.env)
       });
@@ -237,26 +245,30 @@ export function runCodexExec(model: string, prompt: string, options: CodexExecRu
       reject(error);
       return;
     }
-    const childStdout = child.stdout;
-    const childStderr = child.stderr;
-    const childStdin = child.stdin;
-    if (!childStdout || !childStderr || !childStdin) {
-      child.kill("SIGTERM");
-      fs.rmSync(outputDir, { recursive: true, force: true });
-      reject(new Error(`codex exec ${taskLabel} did not expose piped stdio streams.`));
-      return;
-    }
+    const processGroupId = child.pid;
     let stdout = "";
     let stderr = "";
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let settled = false;
     let timeout: ReturnType<typeof setTimeout> | undefined;
+    let killTimeout: ReturnType<typeof setTimeout> | undefined;
+    let processGroupPoll: ReturnType<typeof setTimeout> | undefined;
+    let stoppingError: Error | undefined;
+    let childClosed = false;
+    let processGroupStopped = false;
 
     const cleanup = () => {
       if (timeout) {
         clearTimeout(timeout);
       }
+      if (killTimeout) {
+        clearTimeout(killTimeout);
+      }
+      if (processGroupPoll) {
+        clearTimeout(processGroupPoll);
+      }
+      options.signal?.removeEventListener("abort", abort);
       fs.rmSync(outputDir, { recursive: true, force: true });
     };
     const settleResolve = (value: string) => {
@@ -275,19 +287,45 @@ export function runCodexExec(model: string, prompt: string, options: CodexExecRu
       cleanup();
       reject(error);
     };
-    const stopAndReject = (error: Error) => {
-      child.kill("SIGTERM");
-      settleReject(error);
+    const terminate = (signal: NodeJS.Signals) => {
+      stopCodexProcess(child, signal, processGroupId);
+      if (signal === "SIGTERM" && !killTimeout) {
+        killTimeout = setTimeout(() => {
+          stopCodexProcess(child, "SIGKILL", processGroupId);
+          waitForCodexProcessGroupExit(processGroupId, (timer) => {
+            processGroupPoll = timer;
+          }).then(
+            () => {
+              processGroupStopped = true;
+              if (childClosed && stoppingError) {
+                settleReject(stoppingError);
+              }
+            },
+            (error) => {
+              stoppingError = error instanceof Error ? error : new Error(String(error));
+              processGroupStopped = true;
+              if (childClosed) {
+                settleReject(stoppingError);
+              }
+            }
+          );
+        }, CODEX_EXEC_TERMINATION_GRACE_MS);
+      }
     };
+    const stopWithError = (error: Error) => {
+      stoppingError ??= error;
+      terminate("SIGTERM");
+    };
+    const abort = () => stopWithError(codexAbortReason(options.signal!));
     const appendOutput = (streamName: "stdout" | "stderr", chunk: string) => {
-      if (settled) {
+      if (settled || stoppingError) {
         return;
       }
       const chunkBytes = Buffer.byteLength(chunk, "utf8");
       if (streamName === "stdout") {
         stdoutBytes += chunkBytes;
         if (stdoutBytes > maxOutputBytes) {
-          stopAndReject(new Error(`codex exec ${taskLabel} stdout exceeded the ${maxOutputBytes} byte output limit.`));
+          stopWithError(new Error(`codex exec ${taskLabel} stdout exceeded the ${maxOutputBytes} byte output limit.`));
           return;
         }
         stdout += chunk;
@@ -295,37 +333,33 @@ export function runCodexExec(model: string, prompt: string, options: CodexExecRu
       }
       stderrBytes += chunkBytes;
       if (stderrBytes > maxOutputBytes) {
-        stopAndReject(new Error(`codex exec ${taskLabel} stderr exceeded the ${maxOutputBytes} byte output limit.`));
+        stopWithError(new Error(`codex exec ${taskLabel} stderr exceeded the ${maxOutputBytes} byte output limit.`));
         return;
       }
       stderr += chunk;
     };
 
     timeout = setTimeout(() => {
-      stopAndReject(new Error(`codex exec ${taskLabel} timed out after ${timeoutMs} ms.`));
+      stopWithError(new Error(`codex exec ${taskLabel} timed out after ${timeoutMs} ms.`));
     }, timeoutMs);
     timeout.unref();
+    options.signal?.addEventListener("abort", abort, { once: true });
 
-    childStdout.setEncoding("utf8");
-    childStderr.setEncoding("utf8");
-    childStdout.on("data", (chunk) => {
-      appendOutput("stdout", chunk);
+    const childStdout = child.stdout;
+    const childStderr = child.stderr;
+    const childStdin = child.stdin;
+    child.on("error", (error) => {
+      stopWithError(error);
     });
-    childStderr.on("data", (chunk) => {
-      appendOutput("stderr", chunk);
-    });
-    childStdout.on("error", (error) => {
-      stopAndReject(error);
-    });
-    childStderr.on("error", (error) => {
-      stopAndReject(error);
-    });
-    childStdin.on("error", (error) => {
-      stopAndReject(error);
-    });
-    child.on("error", settleReject);
     child.on("close", (code) => {
       if (settled) {
+        return;
+      }
+      childClosed = true;
+      if (stoppingError) {
+        if (processGroupStopped) {
+          settleReject(stoppingError);
+        }
         return;
       }
       if (code === 0) {
@@ -338,12 +372,80 @@ export function runCodexExec(model: string, prompt: string, options: CodexExecRu
         settleReject(new Error(`codex exec ${taskLabel} failed with code ${code}: ${summarizeCodexError(stderr || stdout, model)}`));
       }
     });
+    if (!childStdout || !childStderr || !childStdin) {
+      stopWithError(new Error(`codex exec ${taskLabel} did not expose piped stdio streams.`));
+      return;
+    }
+
+    childStdout.setEncoding("utf8");
+    childStderr.setEncoding("utf8");
+    childStdout.on("data", (chunk) => {
+      appendOutput("stdout", chunk);
+    });
+    childStderr.on("data", (chunk) => {
+      appendOutput("stderr", chunk);
+    });
+    childStdout.on("error", (error) => {
+      stopWithError(error);
+    });
+    childStderr.on("error", (error) => {
+      stopWithError(error);
+    });
+    childStdin.on("error", (error) => {
+      if (!stoppingError) {
+        stopWithError(error);
+      }
+    });
     try {
       childStdin.end(prompt);
     } catch (error) {
-      stopAndReject(error instanceof Error ? error : new Error(String(error)));
+      stopWithError(error instanceof Error ? error : new Error(String(error)));
     }
   });
+}
+
+function stopCodexProcess(child: ReturnType<typeof spawn>, signal: NodeJS.Signals, processGroupId = child.pid): void {
+  if (!processGroupId) {
+    child.kill(signal);
+    return;
+  }
+  if (process.platform !== "win32") {
+    try {
+      process.kill(-processGroupId, signal);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+        child.kill(signal);
+      }
+      return;
+    }
+  }
+  child.kill(signal);
+}
+
+async function waitForCodexProcessGroupExit(processGroupId: number | undefined, observeTimer: (timer: ReturnType<typeof setTimeout>) => void): Promise<void> {
+  if (process.platform === "win32" || !processGroupId) {
+    return;
+  }
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      process.kill(-processGroupId, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+        return;
+      }
+      throw error;
+    }
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 10);
+      observeTimer(timer);
+    });
+  }
+  throw new Error("Codex exec process group did not stop after SIGKILL.");
+}
+
+function codexAbortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error("Codex exec was cancelled.");
 }
 
 export function buildCodexExecLaunch(model: string, schemaPath: string, outputPath: string, env: NodeJS.ProcessEnv = process.env, imagePaths: string[] = []): ProcessLaunch {

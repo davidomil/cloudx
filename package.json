@@ -39,7 +39,7 @@
     "cert:create": "node scripts/create-local-cert.mjs",
     "dev": "npm run cert:create && npm run dev -w @cloudx/server",
     "dev:web": "npm run dev -w @cloudx/web",
-    "documentation:setup": "python3 -m venv --upgrade-deps services/documentation-indexer/.venv && services/documentation-indexer/.venv/bin/pip install --extra-index-url https://download.pytorch.org/whl/cpu -e \"services/documentation-indexer[dev]\"",
+    "documentation:setup": "~/.local/share/cloudx/uv/bin/uv sync --locked --project services/documentation-indexer --extra dev",
     "documentation:start": "services/documentation-indexer/.venv/bin/cloudx-documentation-indexer",
     "documentation:test": "services/documentation-indexer/.venv/bin/python -m pytest services/documentation-indexer/tests",
     "docs:memory:pdf": "quarto render docs/MEMORY_PLUGIN_GUIDE.qmd --to pdf",
@@ -49,7 +49,6 @@
     "install:wizard": "node scripts/install-cloudx.mjs",
     "lint": "eslint \"containers/ci/**/*.mjs\" \"scripts/ai-change/**/*.mjs\"",
     "policy:validate": "node scripts/ai-change/validate-process.mjs",
-    "service:install": "node scripts/setup-cloudx-whisper-service.mjs",
     "testenv:setup": "node scripts/setup-test-environment.mjs",
     "testenv:start": "npm run build -w @cloudx/web && node scripts/setup-test-environment.mjs --start",
     "testenv:start:lan": "CLOUDX_TEST_HOST=0.0.0.0 npm run testenv:start",
@@ -59,8 +58,7 @@
     "test:coverage": "vitest run --coverage --reporter=dot",
     "test:policy": "vitest run scripts/ai-change",
     "typecheck": "tsc -b",
-    "verify": "node scripts/ai-change/verify.mjs --scope full",
-    "verify:policy": "node scripts/ai-change/verify.mjs --scope policy"
+    "verify": "node scripts/ai-change/verify.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.60.0",

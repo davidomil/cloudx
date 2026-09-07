@@ -276,6 +276,7 @@ checks = ["typescript", "security"]
 name = "documentation"
 globs = ["README.md", "SECURITY.md", "docs/**"]
 areas = ["documentation"]
+cross_area = false
 risk = "low"
 human_review = false
 automerge = true

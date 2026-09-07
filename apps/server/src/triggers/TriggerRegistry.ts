@@ -48,7 +48,7 @@ export class TriggerRegistry {
     assertSourceOwnsTrigger(trigger, source);
     validateObjectSchema(trigger.payloadSchema, payload, trigger.id, "payload");
     const event: TriggerEvent = {
-      id: randomUUID(),
+      id: eventId(trigger, payload, source),
       triggerId,
       source,
       payload,
@@ -60,6 +60,17 @@ export class TriggerRegistry {
     }
     return event;
   }
+}
+
+function eventId(trigger: TriggerDefinition, payload: Record<string, unknown>, source: TriggerEventSource): string {
+  if (source.kind !== "plugin") {
+    return randomUUID();
+  }
+  const id = payload.eventId;
+  if (typeof id !== "string" || !id.trim()) {
+    throw new Error(`Plugin trigger ${trigger.id} requires a stable non-empty payload.eventId.`);
+  }
+  return `plugin:${source.pluginId}:${trigger.id}:${id}`;
 }
 
 export function registerPluginTriggers(registry: TriggerRegistry, plugins: PluginRegistry): void {

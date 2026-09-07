@@ -36,20 +36,78 @@ For every non-trivial change, use `$change-orchestrator`:
    context.
 3. Review the plan in a different fresh context with `$review-plan`.
 4. Implement only a clean plan with `$implement-change`.
-5. Run deterministic, read-only verification with `$verify-change`.
-6. Run `$review-change` and every policy-selected area reviewer in fresh
-   contexts.
-7. Route findings back through implementation, verification, and review until
-   clean. An iteration ceiling blocks the change; it never permits a bypass.
-8. Use `$review-pr` for current-head PR review. Only `$ship-change` may perform
-   interactive or model-directed GitHub mutations. External Publisher and Merge
-   controllers may perform only the deterministic operations granted to their
-   separate GitHub App identities.
+5. Select the bounded Gate-B flow only under the conditional routing below;
+   every other change uses the Normal Non-Publication Change Process.
 
-The planner, implementer, verifier, reviewer, and shipper are separate roles.
-Never let an author review its own prior conversation. Pass a reviewer only the
-original task, trusted instructions, typed artifacts, current diff, and relevant
-test evidence.
+<!-- CLOUDX-GATE-B-ROUTING-V1:BEGIN -->
+
+Only when the accepted task explicitly enters the bounded Gate-B remediation
+or publication flow, read the complete repository-relative source
+`.agents/skills/change-orchestrator/references/gate-b/root.md` before acting.
+It is operative only within that flow. Require its exact identities, ordered
+gates, independent reviews and explicit authorization. If the source is absent,
+unreadable or inconsistent with this routing, stop. Ordinary local or managed
+work does not enter that flow or gain its authority; never use local clean
+aggregation for Gate-B. This reference grants no new authorization.
+
+<!-- CLOUDX-GATE-B-ROUTING-V1:END -->
+
+## Normal Non-Publication Change Process
+
+Freeze final source and typed evidence, then run the unchanged full verifier
+through `$verify-change`. Local route selection and acceptance follow this contract:
+
+<!-- CLOUDX-NORMAL-REVIEW-ROUTING-V1:BEGIN -->
+
+Before local review dispatch, the orchestrator explicitly selects ordinary
+independent review or the optional local shortcut. Ordinary independent review
+does not invoke or require successful `--print-subject` or clean aggregation.
+It directly validates the complete evidence and scope contract in
+`docs/AI_CHANGE_PROCESS.md`.
+
+Use `readLocalReviewScope` with guarded Git reads to observe the verified
+HEAD/worktree and preserve normal staged entries. Capture the index snapshot
+before verification/handoff and compare it at aggregate acceptance; different
+index-only bytes remain an explicit verification gap.
+
+The orchestrator independently computes SHA-256 of UTF-8
+`cloudx-local-review-v1\n<sha256(raw implementation)>\n<sha256(raw verification)>\n`
+from exact raw implementation and passed full verification bytes. Area and
+aggregate outputs use `subject: implementation`,
+`run_id: verification.run_id`, that composite digest and candidate
+base/head/current policy. Require exact observed/declaration/literal allowed
+scope and the union of current observed-path policy roles and accepted plan roles.
+
+Start every selected area reviewer in a fresh context, then a different fresh
+`$review-change` context for ordinary aggregate judgment. Recheck candidate,
+scope/index, effective Git config/attributes and raw evidence before acceptance.
+The optional shortcut requires explicit selection and index equal to HEAD;
+rejection neither retries nor automatically switches routes. Both routes retain
+full verification, raw evidence joins, human review and freshness. Managed and
+Gate-B contracts remain separate.
+
+<!-- CLOUDX-NORMAL-REVIEW-ROUTING-V1:END -->
+
+Give each fresh reviewer the original task, accepted plan/review, exact
+implementation/verification bytes, validated subject, observed diff and selected
+roles. Reviewers read trusted/scoped instructions and conditional references,
+then trace relevant claims, production seams, callers and discriminating tests.
+Findings require fresh `$review-change` judgment; route them through fresh
+implementation, full verification and all selected reviews. An iteration ceiling
+blocks the change. Managed changes keep their existing aggregate dispatch.
+
+The planner, implementer, verifier, reviewer and shipper remain separate roles.
+Never let an author review its own prior conversation. New verification bytes
+require fresh area judgments. Focused author tests, missing environments or
+reviewer completeness cannot replace full verification. Keep evidence outside
+the repository; no local aggregate grants hosting authority.
+
+For policy/skill self-changes, preserve originally accepted roles, human review
+and independent aggregate judgment. Final digest updates are metadata rebinding
+only: preserve task, claims, scope and verification commands, obtain a fresh
+independent review of the new plan bytes, regenerate the implementation's plan
+digest, then run full verification and all new area and aggregate judgments.
+Any behavior, scope or proof change returns to fresh planning.
 
 ## Engineering Rules
 
@@ -92,8 +150,9 @@ are:
 | Shared contracts               | `$review-shared`          |
 | Web                            | `$review-web`             |
 
-Do not select fewer reviewers than the policy requires. Cross-area changes also
-receive the policy's cross-area risk and reviewers.
+Do not select fewer reviewers than the policy requires. Cross-area escalation follows participating owner routes in policy. Supporting
+prose still receives its direct documentation review; protected routes retain
+their required reviewers and human-review gates.
 
 ## Verification Baseline
 
@@ -101,10 +160,13 @@ Run focused tests while implementing, then the broadest applicable checks from
 `docs/architecture/testing-map.md`. The canonical repository baseline is:
 
 ```bash
-npm run verify
+npm run --silent verify -- --plan <accepted-plan.json> --base-sha <local-change-base-sha> --head-sha <candidate-head-sha>
 ```
 
-`npm run verify` runs policy, formatting, lint, coverage, build, both Python
+The production verifier is unconditionally full, accepts no `--scope` or
+`--output`, rejects duplicate arguments before plan or HEAD work, and emits its
+sole artifact to stdout. It runs policy, formatting, lint, coverage,
+build, both Python
 services, and desktop/mobile browser smoke checks without editing source. Python
 commands require the documented virtual environments; alternate interpreters
 must be supplied explicitly with `CLOUDX_ASR_PYTHON` and

@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -11,6 +11,7 @@ import { AUTOMATION_FSTRING_TYPE_ID, automationEntryWithDynamicPorts, automation
 import { buildToolEnv, resolveAssistantCommand } from "../terminal/ShellLaunch.js";
 
 export interface AutomationExecutorOptions {
+  runId?: string;
   activeTabId?: string;
   maxSteps?: number;
   maxDurationMs?: number;
@@ -51,6 +52,10 @@ const AUTOMATION_CODEX_OUTPUT_MAX_BYTES = 2 * 1024 * 1024;
 const AUTOMATION_CODEX_TIMEOUT_MAX_MS = 60 * 60 * 1000;
 const AUTOMATION_CODEX_DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
 const AUTOMATION_PROCESS_TERMINATION_GRACE_MS = 250;
+const AUTOMATION_PROCESS_EXIT_DRAIN_MS = 25;
+const AUTOMATION_PROCESS_KILL_SETTLEMENT_MS = 1_000;
+const AUTOMATION_PROCESS_CLOSE_SETTLEMENT_MS = 1_000;
+const AUTOMATION_PROCESS_POLL_MS = 10;
 const AUTOMATION_PROCESS_ENV_KEYS = ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"] as const;
 const CLOUDX_HOOK_STDOUT_PREFIX = "__CLOUDX_HOOK_CALL__:";
 function cloudxPythonHookPrelude(hookToken: string): string {
@@ -82,7 +87,7 @@ export class AutomationCancelledError extends Error {
 export class AutomationExecutor {
   async execute(group: AutomationGroup, event: TriggerEvent, catalog: AutomationCatalogResponse, hooks: HookRegistry, options: AutomationExecutorOptions = {}): Promise<AutomationRunSummary> {
     const run: AutomationRunSummary = {
-      id: randomUUID(),
+      id: options.runId ?? randomUUID(),
       groupId: group.id,
       triggerEventId: event.id,
       status: "running",
@@ -1199,6 +1204,7 @@ interface ProcessRunInput {
   timeoutMs: number;
   processName: string;
   outputMaxBytes: number;
+  env?: NodeJS.ProcessEnv;
   signal?: AbortSignal;
 }
 
@@ -1290,127 +1296,209 @@ function runBashScript(input: BashRunInput): Promise<BashRunResult> {
   });
 }
 
-function runBoundedProcess(input: ProcessRunInput): Promise<ProcessRunResult> {
+async function runBoundedProcess(input: ProcessRunInput): Promise<ProcessRunResult> {
   if (input.signal?.aborted) {
-    return Promise.reject(new AutomationCancelledError());
+    throw new AutomationCancelledError();
   }
-  return new Promise((resolve, reject) => {
-    const child = spawn(input.command, input.args, {
-      cwd: input.cwd,
-      detached: process.platform !== "win32",
-      env: automationProcessEnv(process.env),
-      stdio: ["pipe", "pipe", "pipe"]
-    });
-    let killTimeout: ReturnType<typeof setTimeout> | undefined;
-    const terminate = (signal: NodeJS.Signals) => {
-      stopChildProcess(child, signal);
-      if (signal === "SIGTERM" && !killTimeout) {
-        killTimeout = setTimeout(() => stopChildProcess(child, "SIGKILL"), AUTOMATION_PROCESS_TERMINATION_GRACE_MS);
-        killTimeout.unref();
-      }
-    };
-    const childStdout = child.stdout;
-    const childStderr = child.stderr;
-    const childStdin = child.stdin;
-    if (!childStdout || !childStderr || !childStdin) {
-      terminate("SIGTERM");
-      reject(new Error(`${input.processName} process did not expose piped stdio streams.`));
-      return;
-    }
-
-    let stdout = "";
-    let stderr = "";
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-    let stoppingError: Error | undefined;
-    let cancelled = false;
-    let settled = false;
-
-    const cleanup = () => {
-      clearTimeout(timeout);
-      if (killTimeout) {
-        clearTimeout(killTimeout);
-      }
-      input.signal?.removeEventListener("abort", abort);
-    };
-    const settleReject = (error: Error) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      cleanup();
-      reject(error);
-    };
-    const stopWithError = (error: Error) => {
-      if (!stoppingError) {
-        stoppingError = error;
-      }
-      terminate("SIGTERM");
-    };
-    const abort = () => {
-      cancelled = true;
-      terminate("SIGTERM");
-    };
-    const timeout = setTimeout(() => {
-      stopWithError(new Error(`${input.processName} process timed out after ${input.timeoutMs} ms.`));
-    }, input.timeoutMs);
-    timeout.unref();
-    input.signal?.addEventListener("abort", abort, { once: true });
-
-    const appendOutput = (streamName: "stdout" | "stderr", chunk: string) => {
-      if (stoppingError || cancelled) {
-        return;
-      }
-      const chunkBytes = Buffer.byteLength(chunk, "utf8");
-      if (streamName === "stdout") {
-        stdoutBytes += chunkBytes;
-        if (stdoutBytes > input.outputMaxBytes) {
-          stopWithError(new Error(`${input.processName} stdout exceeded the ${input.outputMaxBytes} byte output limit.`));
-          return;
-        }
-        stdout += chunk;
-        return;
-      }
-      stderrBytes += chunkBytes;
-      if (stderrBytes > input.outputMaxBytes) {
-        stopWithError(new Error(`${input.processName} stderr exceeded the ${input.outputMaxBytes} byte output limit.`));
-        return;
-      }
-      stderr += chunk;
-    };
-
-    childStdout.setEncoding("utf8");
-    childStderr.setEncoding("utf8");
-    childStdout.on("data", (chunk) => appendOutput("stdout", chunk));
-    childStderr.on("data", (chunk) => appendOutput("stderr", chunk));
-    childStdout.on("error", (error) => stopWithError(error));
-    childStderr.on("error", (error) => stopWithError(error));
-    childStdin.on("error", (error) => {
-      if (!stoppingError && !cancelled) {
-        stopWithError(error);
-      }
-    });
-    child.on("error", (error) => {
-      settleReject(error);
-    });
-    child.on("close", (code) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      cleanup();
-      if (cancelled) {
-        reject(new AutomationCancelledError());
-        return;
-      }
-      if (stoppingError) {
-        reject(stoppingError);
-        return;
-      }
-      resolve({ stdout, stderr, exitCode: code ?? 1 });
-    });
-    childStdin.end(input.stdin);
+  if (process.platform !== "linux") {
+    throw new Error(`${input.processName} process groups require Linux.`);
+  }
+  const child = spawn(input.command, input.args, {
+    cwd: input.cwd,
+    detached: true,
+    env: input.env ?? automationProcessEnv(process.env),
+    stdio: ["pipe", "pipe", "pipe"]
   });
+  const firstEvent = deferredProcessEvent();
+  const closed = deferredProcessClose();
+  let stopReason: { kind: "cancelled" } | { kind: "error"; error: Error } | undefined;
+
+  function requestStop(reason: { kind: "cancelled" } | { kind: "error"; error: Error }): void {
+    if (stopReason) return;
+    stopReason = reason;
+    firstEvent.resolve({ kind: "stop" });
+  }
+  child.once("error", (error) => requestStop({ kind: "error", error }));
+  child.once("close", (code, signal) => {
+    const outcome = { code, signal };
+    closed.resolve(outcome);
+    firstEvent.resolve({ kind: "close", outcome });
+  });
+
+  const processGroup = child.pid;
+  if (!Number.isSafeInteger(processGroup) || processGroup! < 1) {
+    await firstEvent.promise;
+    if (stopReason?.kind === "cancelled") throw new AutomationCancelledError();
+    if (stopReason?.kind === "error") throw stopReason.error;
+    throw new Error(`${input.processName} process did not establish an owned process group.`);
+  }
+  const childStdout = child.stdout;
+  const childStderr = child.stderr;
+  const childStdin = child.stdin;
+  if (!childStdout || !childStderr || !childStdin) {
+    await terminateOwnedProcessGroup(processGroup!);
+    throw new Error(`${input.processName} process did not expose piped stdio streams.`);
+  }
+
+  const stdout = boundedProcessOutput("stdout", input, requestStop);
+  const stderr = boundedProcessOutput("stderr", input, requestStop);
+  const abort = (): void => requestStop({ kind: "cancelled" });
+  const timeout = setTimeout(
+    () => requestStop({ kind: "error", error: new Error(`${input.processName} process timed out after ${input.timeoutMs} ms.`) }),
+    input.timeoutMs
+  );
+  timeout.unref();
+  input.signal?.addEventListener("abort", abort, { once: true });
+  childStdout.on("data", stdout.write);
+  childStderr.on("data", stderr.write);
+  childStdout.once("error", (error) => requestStop({ kind: "error", error }));
+  childStderr.once("error", (error) => requestStop({ kind: "error", error }));
+  childStdin.once("error", (error) => requestStop({ kind: "error", error }));
+  childStdin.end(input.stdin);
+
+  try {
+    const first = await firstEvent.promise;
+    let outcome = first.kind === "close" ? first.outcome : undefined;
+    if (first.kind === "close") {
+      await delay(AUTOMATION_PROCESS_EXIT_DRAIN_MS);
+      if (await linuxProcessGroupHasRunningMember(processGroup!)) {
+        requestStop({
+          kind: "error",
+          error: new Error(`${input.processName} process left descendant processes running.`)
+        });
+        await terminateOwnedProcessGroup(processGroup!);
+      }
+    } else {
+      await terminateOwnedProcessGroup(processGroup!);
+    }
+    outcome ??= await settleProcessClose(closed.promise, AUTOMATION_PROCESS_CLOSE_SETTLEMENT_MS);
+    if (!outcome) {
+      throw new Error(`${input.processName} process cleanup did not reach the child close event.`);
+    }
+    if (await linuxProcessGroupHasRunningMember(processGroup!)) {
+      throw new Error(`${input.processName} process group remained alive after cleanup.`);
+    }
+    if (stopReason?.kind === "cancelled") throw new AutomationCancelledError();
+    if (stopReason?.kind === "error") throw stopReason.error;
+    return {
+      stdout: stdout.value().toString("utf8"),
+      stderr: stderr.value().toString("utf8"),
+      exitCode: typeof outcome.code === "number" ? outcome.code : outcome.signal ? 128 : 1
+    };
+  } finally {
+    clearTimeout(timeout);
+    input.signal?.removeEventListener("abort", abort);
+  }
+}
+
+function boundedProcessOutput(
+  stream: "stdout" | "stderr",
+  input: ProcessRunInput,
+  stop: (reason: { kind: "error"; error: Error }) => void
+): { write(chunk: Buffer | string): void; value(): Buffer } {
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  let exceeded = false;
+  return {
+    write(chunk) {
+      const source = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const remaining = input.outputMaxBytes - bytes;
+      if (remaining > 0) {
+        const captured = Buffer.from(source.subarray(0, remaining));
+        chunks.push(captured);
+        bytes += captured.length;
+      }
+      if (!exceeded && source.length > remaining) {
+        exceeded = true;
+        stop({
+          kind: "error",
+          error: new Error(`${input.processName} ${stream} exceeded the ${input.outputMaxBytes} byte output limit.`)
+        });
+      }
+    },
+    value: () => Buffer.concat(chunks, bytes)
+  };
+}
+
+async function terminateOwnedProcessGroup(processGroup: number): Promise<void> {
+  if (!(await linuxProcessGroupHasRunningMember(processGroup))) return;
+  signalOwnedProcessGroup(processGroup, "SIGTERM");
+  if (await waitForOwnedProcessGroup(processGroup, AUTOMATION_PROCESS_TERMINATION_GRACE_MS)) return;
+  signalOwnedProcessGroup(processGroup, "SIGKILL");
+  if (!(await waitForOwnedProcessGroup(processGroup, AUTOMATION_PROCESS_KILL_SETTLEMENT_MS))) {
+    throw new Error(`Automation process group ${processGroup} did not exit after SIGKILL.`);
+  }
+}
+
+function signalOwnedProcessGroup(processGroup: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-processGroup, signal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  }
+}
+
+async function waitForOwnedProcessGroup(processGroup: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (await linuxProcessGroupHasRunningMember(processGroup)) {
+    if (Date.now() >= deadline) return false;
+    await delay(AUTOMATION_PROCESS_POLL_MS);
+  }
+  return true;
+}
+
+async function linuxProcessGroupHasRunningMember(processGroup: number): Promise<boolean> {
+  const entries = await fs.readdir("/proc", { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
+    const stat = await fs.readFile(`/proc/${entry.name}/stat`, "utf8").catch(() => undefined);
+    if (!stat) continue;
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    if (Number(fields[2]) === processGroup && fields[0] !== "Z" && fields[0] !== "X") return true;
+  }
+  return false;
+}
+
+function deferredProcessEvent(): {
+  promise: Promise<{ kind: "stop" } | { kind: "close"; outcome: { code: number | null; signal: NodeJS.Signals | null } }>;
+  resolve(value: { kind: "stop" } | { kind: "close"; outcome: { code: number | null; signal: NodeJS.Signals | null } }): void;
+} {
+  let resolve!: (value: { kind: "stop" } | { kind: "close"; outcome: { code: number | null; signal: NodeJS.Signals | null } }) => void;
+  const promise = new Promise<Parameters<typeof resolve>[0]>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
+}
+
+function deferredProcessClose(): {
+  promise: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  resolve(value: { code: number | null; signal: NodeJS.Signals | null }): void;
+} {
+  let resolve!: (value: { code: number | null; signal: NodeJS.Signals | null }) => void;
+  const promise = new Promise<Parameters<typeof resolve>[0]>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
+}
+
+async function settleProcessClose<T>(promise: Promise<T>, timeoutMs: number): Promise<T | undefined> {
+  const expired = Symbol("expired");
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const value = await Promise.race([
+      promise,
+      new Promise<typeof expired>((resolve) => {
+        timeout = setTimeout(() => resolve(expired), timeoutMs);
+      })
+    ]);
+    return value === expired ? undefined : value;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function extractCloudxHookCalls(stdout: string, node: AutomationNode, hookToken: string): { stdout: string; calls: CloudxHookCallRequest[] } {
@@ -1469,25 +1557,6 @@ function automationProcessEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return env;
 }
 
-function stopChildProcess(child: ChildProcess, signal: NodeJS.Signals): void {
-  if (!child.pid) {
-    child.kill(signal);
-    return;
-  }
-  if (process.platform !== "win32") {
-    try {
-      process.kill(-child.pid, signal);
-      return;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
-        child.kill(signal);
-      }
-      return;
-    }
-  }
-  child.kill(signal);
-}
-
 function runCodexExec(input: CodexExecInput): Promise<CodexExecResult> {
   const args = [
     "exec",
@@ -1514,127 +1583,16 @@ function runCodexExec(input: CodexExecInput): Promise<CodexExecResult> {
     args.push("--skip-git-repo-check");
   }
   args.push(input.prompt);
-  return runCodexProcess({
+  return runBoundedProcess({
     command: resolveAssistantCommand(process.env, "codex"),
     args,
     cwd: input.cwd,
     stdin: input.stdin,
     timeoutMs: input.timeoutMs,
+    processName: "Codex exec",
+    outputMaxBytes: AUTOMATION_CODEX_OUTPUT_MAX_BYTES,
+    env: buildToolEnv(process.env),
     signal: input.signal
-  });
-}
-
-function runCodexProcess(input: { command: string; args: string[]; cwd: string; stdin: string; timeoutMs: number; signal?: AbortSignal }): Promise<CodexExecResult> {
-  if (input.signal?.aborted) {
-    return Promise.reject(new AutomationCancelledError());
-  }
-  return new Promise((resolve, reject) => {
-    const child = spawn(input.command, input.args, {
-      cwd: input.cwd,
-      detached: process.platform !== "win32",
-      env: buildToolEnv(process.env),
-      stdio: ["pipe", "pipe", "pipe"]
-    });
-    let killTimeout: ReturnType<typeof setTimeout> | undefined;
-    const terminate = (signal: NodeJS.Signals) => {
-      stopChildProcess(child, signal);
-      if (signal === "SIGTERM" && !killTimeout) {
-        killTimeout = setTimeout(() => stopChildProcess(child, "SIGKILL"), AUTOMATION_PROCESS_TERMINATION_GRACE_MS);
-        killTimeout.unref();
-      }
-    };
-    const childStdout = child.stdout;
-    const childStderr = child.stderr;
-    const childStdin = child.stdin;
-    if (!childStdout || !childStderr || !childStdin) {
-      terminate("SIGTERM");
-      reject(new Error("Codex exec process did not expose piped stdio streams."));
-      return;
-    }
-
-    let stdout = "";
-    let stderr = "";
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-    let stoppingError: Error | undefined;
-    let cancelled = false;
-    let settled = false;
-
-    const cleanup = () => {
-      clearTimeout(timeout);
-      if (killTimeout) {
-        clearTimeout(killTimeout);
-      }
-      input.signal?.removeEventListener("abort", abort);
-    };
-    const settleReject = (error: Error) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      cleanup();
-      reject(error);
-    };
-    const stopWithError = (error: Error) => {
-      if (!stoppingError) {
-        stoppingError = error;
-      }
-      terminate("SIGTERM");
-    };
-    const abort = () => {
-      cancelled = true;
-      terminate("SIGTERM");
-    };
-    const timeout = setTimeout(() => {
-      stopWithError(new Error(`Codex exec process timed out after ${input.timeoutMs} ms.`));
-    }, input.timeoutMs);
-    timeout.unref();
-    input.signal?.addEventListener("abort", abort, { once: true });
-
-    const appendOutput = (streamName: "stdout" | "stderr", chunk: string) => {
-      if (stoppingError || cancelled) {
-        return;
-      }
-      const bytes = Buffer.byteLength(chunk, "utf8");
-      if (streamName === "stdout") {
-        stdoutBytes += bytes;
-        if (stdoutBytes > AUTOMATION_CODEX_OUTPUT_MAX_BYTES) {
-          stopWithError(new Error(`Codex exec stdout exceeded ${AUTOMATION_CODEX_OUTPUT_MAX_BYTES} bytes.`));
-          return;
-        }
-        stdout += chunk;
-        return;
-      }
-      stderrBytes += bytes;
-      if (stderrBytes > AUTOMATION_CODEX_OUTPUT_MAX_BYTES) {
-        stopWithError(new Error(`Codex exec stderr exceeded ${AUTOMATION_CODEX_OUTPUT_MAX_BYTES} bytes.`));
-        return;
-      }
-      stderr += chunk;
-    };
-
-    child.once("error", (error) => settleReject(error));
-    child.once("close", (code, signal) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      cleanup();
-      if (cancelled) {
-        reject(new AutomationCancelledError());
-        return;
-      }
-      if (stoppingError) {
-        reject(stoppingError);
-        return;
-      }
-      resolve({ stdout, stderr, exitCode: typeof code === "number" ? code : signal ? 128 : 1 });
-    });
-    childStdout.setEncoding("utf8");
-    childStderr.setEncoding("utf8");
-    childStdout.on("data", (chunk: string) => appendOutput("stdout", chunk));
-    childStderr.on("data", (chunk: string) => appendOutput("stderr", chunk));
-    childStdin.end(input.stdin);
   });
 }
 

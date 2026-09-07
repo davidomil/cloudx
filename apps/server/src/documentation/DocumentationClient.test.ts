@@ -1,4 +1,7 @@
 import http from "node:http";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -202,9 +205,12 @@ describe("DocumentationClient", () => {
     });
     const client = new DocumentationClient(`${url}/docs`);
 
-    const result = await client.importArchiveReplaceUpload({
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-client-archive-"));
+    const filePath = path.join(directory, "archive.zip");
+    await fs.writeFile(filePath, new Uint8Array([7, 8, 9]));
+    const result = await client.importArchiveReplaceFile({
       filename: "archive.zip",
-      content: new Uint8Array([7, 8, 9]),
+      path: filePath,
       contentType: "application/zip",
       confirmation: "REPLACE_DOCUMENTATION_ARCHIVE"
     });
@@ -282,9 +288,12 @@ describe("DocumentationClient", () => {
     });
     const client = new DocumentationClient(`${url}/docs`);
 
-    const result = await client.ingestUpload({
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-client-upload-"));
+    const filePath = path.join(directory, "note.md");
+    await fs.writeFile(filePath, "UPLOAD-CLIENT-7");
+    const result = await client.ingestUploadFile({
       filename: "note.md",
-      content: new TextEncoder().encode("UPLOAD-CLIENT-7"),
+      path: filePath,
       contentType: "text/markdown",
       sourceType: "readme",
       collection: "client-test",
@@ -347,6 +356,67 @@ describe("DocumentationClient", () => {
       { stage: "Scanning video.", progress: 60, etaSeconds: undefined, metrics: undefined }
     ]);
     expect(result).toEqual({ document: { documentId: "long-video-doc" } });
+  });
+
+  it("aborts an in-flight ingest request when its queue owner stops", async () => {
+    let markRequestStarted!: () => void;
+    const requestStarted = new Promise<void>((resolve) => {
+      markRequestStarted = resolve;
+    });
+    const url = await startServer(() => {
+      markRequestStarted();
+    });
+    const client = new DocumentationClient(`${url}/docs`);
+    const controller = new AbortController();
+    const request = client.ingestText({ title: "Queued", text: "pending" }, { signal: controller.signal });
+    const rejection = expect(request).rejects.toThrow("Documentation ingest queue was stopped.");
+    await requestStarted;
+
+    controller.abort(new Error("Documentation ingest queue was stopped."));
+
+    await rejection;
+  });
+
+  it("aborts externally cancelled enrichment reads and writes and closes their transports", async () => {
+    let startedCount = 0;
+    let closedCount = 0;
+    let markStarted!: () => void;
+    let markClosed!: () => void;
+    const requestsStarted = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const transportsClosed = new Promise<void>((resolve) => {
+      markClosed = resolve;
+    });
+    const url = await startServer((request) => {
+      startedCount += 1;
+      if (startedCount === 2) {
+        markStarted();
+      }
+      request.socket.once("close", () => {
+        closedCount += 1;
+        if (closedCount === 2) {
+          markClosed();
+        }
+      });
+    });
+    const client = new DocumentationClient(`${url}/docs`);
+    const controller = new AbortController();
+    const stopped = new Error("documentation enrichment stopped");
+    const read = client.getDocument({ documentId: "doc-1" }, { signal: controller.signal });
+    const write = client.enrichDocument({
+      documentId: "doc-1",
+      spans: [{ locator: "ai:test", text: "test" }],
+      model: "gpt-test",
+      skillIds: ["documentation-enrich-metadata"]
+    }, { signal: controller.signal });
+    await requestsStarted;
+
+    controller.abort(stopped);
+
+    await expect(read).rejects.toBe(stopped);
+    await expect(write).rejects.toBe(stopped);
+    await transportsClosed;
   });
 
   it("rejects oversized documentation service responses with the configured response limit", async () => {

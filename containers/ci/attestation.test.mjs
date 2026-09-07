@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -8,6 +10,7 @@ import {
   calculateWorktreeDigest,
   candidateIdentity,
   captureSourceManifest,
+  copyGitObjectData,
   executeVerification,
   prepareAttestation,
   prepareSupervisor,
@@ -30,6 +33,179 @@ test("dependency installation runs lifecycle scripts only inside the candidate s
   assert.deepEqual(install.args, ["ci", "--offline"]);
   assert.equal(install.command, "npm");
 });
+
+test("object-data copy preserves history without importing source Git metadata", async () => {
+  const sandbox = await fs.mkdtemp(
+    path.join(os.tmpdir(), "cloudx-object-history-"),
+  );
+  const source = path.join(sandbox, "source");
+  const root = path.join(sandbox, "target");
+  const git = (directory, ...args) =>
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@invalid.local",
+        "-c",
+        "commit.gpgSign=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-C",
+        directory,
+        ...args,
+      ],
+      { encoding: "utf8" },
+    ).trim();
+  try {
+    await fs.mkdir(source);
+    await fs.mkdir(root);
+    git(source, "init", "--quiet");
+    await fs.writeFile(path.join(source, "tracked.txt"), "historical\n");
+    git(source, "add", ".");
+    git(source, "commit", "--quiet", "-m", "historical fixture");
+    const historical = git(source, "rev-parse", "HEAD");
+    git(source, "repack", "-ad");
+    await fs.writeFile(path.join(source, "tracked.txt"), "current\n");
+    git(source, "commit", "--quiet", "-am", "current fixture");
+    const current = git(source, "rev-parse", "HEAD");
+    git(root, "init", "--quiet", "--initial-branch=verification");
+    await fs.writeFile(path.join(root, "tracked.txt"), "fresh snapshot\n");
+    git(root, "add", ".");
+    git(root, "commit", "--quiet", "-m", "fresh snapshot");
+    const head = git(root, "rev-parse", "HEAD");
+    const config = await fs.readFile(path.join(root, ".git", "config"));
+    await fs.writeFile(
+      path.join(source, ".git", "hooks", "hostile-hook"),
+      "not copied",
+    );
+    await fs.writeFile(
+      path.join(source, ".git", "objects", "info", "alternates"),
+      "/host/private/objects\n",
+    );
+    await fs.writeFile(path.join(source, ".git", "shallow"), `${historical}\n`);
+    const before = await objectFixtureSnapshot(source);
+
+    const result = await copyGitObjectData(source, root);
+    assert.ok(result.files > 2);
+    assert.equal(git(root, "cat-file", "-t", historical), "commit");
+    assert.equal(git(root, "show", `${historical}:tracked.txt`), "historical");
+    assert.equal(git(root, "show", `${current}:tracked.txt`), "current");
+    assert.equal(git(root, "rev-parse", "HEAD"), head);
+    assert.equal(git(root, "branch", "--show-current"), "verification");
+    assert.equal(
+      await fs.readFile(path.join(root, "tracked.txt"), "utf8"),
+      "fresh snapshot\n",
+    );
+    assert.deepEqual(
+      await fs.readFile(path.join(root, ".git", "config")),
+      config,
+    );
+    for (const excluded of [
+      "shallow",
+      "hooks/hostile-hook",
+      "objects/info/alternates",
+      "refs/heads/master",
+      "refs/heads/main",
+    ]) {
+      await assert.rejects(fs.lstat(path.join(root, ".git", excluded)), {
+        code: "ENOENT",
+      });
+    }
+    assert.deepEqual(await objectFixtureSnapshot(source), before);
+    // Identical objects already present in a fresh snapshot are not overwritten.
+    assert.deepEqual(await copyGitObjectData(source, root), result);
+    assert.deepEqual(await objectFixtureSnapshot(source), before);
+  } finally {
+    await fs.rm(sandbox, { recursive: true, force: true });
+  }
+});
+
+test("object-data copy rejects symlinks, unpaired packs, and size/count overruns", async (t) => {
+  const loose = `ab/${"c".repeat(38)}`;
+  const pack = `pack/pack-${"d".repeat(40)}.pack`;
+  for (const kind of [
+    "git-link",
+    "objects-link",
+    "directory-link",
+    "file-link",
+    "unpaired",
+    "file-size",
+    "total-size",
+    "count",
+    "conflict",
+  ]) {
+    await t.test(kind, async () => {
+      const sandbox = await fs.mkdtemp(
+        path.join(os.tmpdir(), "cloudx-object-reject-"),
+      );
+      const source = path.join(sandbox, "source");
+      const root = path.join(sandbox, "target");
+      const objects = path.join(source, ".git", "objects");
+      try {
+        await fs.mkdir(path.join(objects, "ab"), { recursive: true });
+        await fs.mkdir(path.join(objects, "pack"));
+        await fs.mkdir(path.join(root, ".git", "objects"), { recursive: true });
+        await fs.writeFile(path.join(objects, loose), "object");
+        let options;
+        if (kind.endsWith("-link")) {
+          const input =
+            kind === "git-link"
+              ? path.join(source, ".git")
+              : kind === "objects-link"
+                ? objects
+                : kind === "directory-link"
+                  ? path.join(objects, "ab")
+                  : path.join(objects, loose);
+          await fs.rename(input, `${input}-original`);
+          await fs.symlink(`${input}-original`, input);
+        } else if (kind === "unpaired") {
+          await fs.writeFile(path.join(objects, pack), "pack");
+        } else if (kind === "file-size") {
+          await fs.truncate(path.join(objects, loose), 64 * 1024 * 1024 + 1);
+        } else if (kind === "total-size") {
+          options = { maximumBytes: 1 };
+        } else if (kind === "count") {
+          await fs.writeFile(
+            path.join(objects, `ab/${"e".repeat(38)}`),
+            "second",
+          );
+          options = { maximumFiles: 1 };
+        } else {
+          await fs.mkdir(path.join(root, ".git", "objects", "ab"));
+          await fs.writeFile(
+            path.join(root, ".git", "objects", loose),
+            "conflicting",
+          );
+        }
+        await assert.rejects(
+          copyGitObjectData(source, root, options),
+          /Git object input/u,
+        );
+      } finally {
+        await fs.rm(sandbox, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+async function objectFixtureSnapshot(directory) {
+  const snapshot = [];
+  for (const name of (
+    await fs.readdir(directory, { recursive: true })
+  ).sort()) {
+    const target = path.join(directory, name);
+    const stat = await fs.lstat(target);
+    if (stat.isFile())
+      snapshot.push([
+        name,
+        stat.mode,
+        (await fs.readFile(target)).toString("hex"),
+      ]);
+  }
+  return snapshot;
+}
 
 test("candidate commands receive an identity-consistent login environment", async () => {
   assert.equal(process.getuid?.(), 0, "test must run as root");
@@ -187,6 +363,7 @@ test("candidate cannot hide source mutation with writable Git metadata", async (
   await fs.mkdir(source);
   await fs.mkdir(cache);
   await fs.writeFile(path.join(source, "tracked.txt"), "trusted\n");
+  execFileSync("git", ["init", "--quiet", source]);
 
   try {
     await prepareWorkspace({
@@ -195,6 +372,77 @@ test("candidate cannot hide source mutation with writable Git metadata", async (
       archive: path.join(sandbox, "source.tar"),
       npmCacheSource: cache,
     });
+    for (const owned of [
+      root,
+      path.join(root, ".git"),
+      path.join(root, ".git", "config"),
+    ]) {
+      assert.equal((await fs.stat(owned)).uid, candidateIdentity.uid);
+    }
+    assert.equal((await fs.stat(source)).uid, 0);
+    assert.equal((await fs.stat(path.join(source, ".git"))).uid, 0);
+    const ownershipProbe = await runCommand(
+      {
+        command: "git",
+        args: ["rev-parse", "--absolute-git-dir"],
+        env: {
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_CONFIG_SYSTEM: "/dev/null",
+          GIT_CONFIG_NOSYSTEM: "1",
+        },
+        timeoutMs: 1_000,
+      },
+      root,
+    );
+    assert.equal(ownershipProbe.exitCode, 0);
+    assert.equal(
+      ownershipProbe.stdoutSha256,
+      createHash("sha256")
+        .update(`${path.join(root, ".git")}\n`)
+        .digest("hex"),
+    );
+    const objects = path.join(root, ".git", "objects");
+    const existingPrefixes = new Set(await fs.readdir(objects));
+    const payloads = new Map();
+    let pair;
+    for (let index = 0; index < 10_000 && !pair; index += 1) {
+      const body = `candidate object ${index}`;
+      const oid = createHash("sha1")
+        .update(`blob ${Buffer.byteLength(body)}\0${body}`)
+        .digest("hex");
+      const prefix = oid.slice(0, 2);
+      if (existingPrefixes.has(prefix)) continue;
+      const previous = payloads.get(prefix);
+      if (previous) pair = [previous, { body, oid, prefix }];
+      else payloads.set(prefix, { body, oid, prefix });
+    }
+    assert.ok(pair, "bounded fixture must find a new shared object prefix");
+    execFileSync("git", ["-C", source, "hash-object", "-w", "--stdin"], {
+      input: pair[0].body,
+    });
+    const immutableSource = await objectFixtureSnapshot(source);
+    await copyGitObjectData(source, root);
+    const objectWrite = await runCommand(
+      {
+        command: "sh",
+        args: ["-c", 'printf %s "$OBJECT_BODY" | git hash-object -w --stdin'],
+        env: {
+          OBJECT_BODY: pair[1].body,
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_CONFIG_SYSTEM: "/dev/null",
+          GIT_CONFIG_NOSYSTEM: "1",
+        },
+        timeoutMs: 1_000,
+      },
+      root,
+    );
+    assert.equal(objectWrite.exitCode, 0);
+    assert.equal(
+      (await fs.stat(path.join(objects, pair[1].prefix, pair[1].oid.slice(2))))
+        .uid,
+      candidateIdentity.uid,
+    );
+    assert.deepEqual(await objectFixtureSnapshot(source), immutableSource);
     const sourceManifest = await captureSourceManifest(root);
     const listing = path.join(root, "listing.txt");
     const evidence = await executeVerification({

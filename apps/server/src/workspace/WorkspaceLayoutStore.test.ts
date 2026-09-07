@@ -63,9 +63,14 @@ describe("WorkspaceLayoutStore", () => {
 
     const defaultCwdUpdate = store.updateWindow(created.id, { defaultCwd: next });
     await enteredDirectoryResolution.promise;
-    await store.updateWindow(created.id, { name: "Renamed" });
+    let renameSettled = false;
+    const rename = store.updateWindow(created.id, { name: "Renamed" }).then(() => {
+      renameSettled = true;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(renameSettled).toBe(false);
     resumeDirectoryResolution.resolve();
-    await defaultCwdUpdate;
+    await Promise.all([defaultCwdUpdate, rename]);
     ensureDirectory.mockRestore();
 
     const state = await store.state([], undefined);
@@ -101,6 +106,101 @@ describe("WorkspaceLayoutStore", () => {
     const reloaded = new WorkspaceLayoutStore(dataDir, new PathPolicy([root]));
     const names = (await reloaded.state([], undefined)).windows.map((window) => window.name);
     expect(names).toEqual(expect.arrayContaining(["First", "Second"]));
+  });
+
+  it("serializes tab placement with every other workspace mutation", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-workspace-global-mutation-"));
+    const dataDir = path.join(root, ".cloudx");
+    const store = new WorkspaceLayoutStore(dataDir, new PathPolicy([root]));
+    const window = await store.createWindow({ name: "Original", defaultCwd: root });
+    const workspaceFile = (store as unknown as { workspaceFile: { write(value: unknown): Promise<void> } }).workspaceFile;
+    const originalWrite = workspaceFile.write.bind(workspaceFile);
+    const placementWriteStarted = deferred<void>();
+    const releasePlacementWrite = deferred<void>();
+    let holdNextWrite = true;
+    workspaceFile.write = async (value) => {
+      if (holdNextWrite) {
+        holdNextWrite = false;
+        placementWriteStarted.resolve();
+        await releasePlacementWrite.promise;
+      }
+      await originalWrite(value);
+    };
+
+    const placement = store.placeTabAndPublish({ tabId: "tab-1", windowId: window.id, paneId: window.layout.activePaneId }, () => undefined);
+    await placementWriteStarted.promise;
+    const rename = store.updateWindow(window.id, { name: "Renamed" });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(store.snapshot().windows.find((candidate) => candidate.id === window.id)).toMatchObject({ name: "Original" });
+
+    releasePlacementWrite.resolve();
+    await Promise.all([placement, rename]);
+    workspaceFile.write = originalWrite;
+
+    const memoryWindow = store.getWindow(window.id);
+    expect(memoryWindow).toMatchObject({ name: "Renamed" });
+    expect(memoryWindow.layout.root).toMatchObject({ type: "pane", pane: { tabIds: ["tab-1"] } });
+
+    const reloaded = new WorkspaceLayoutStore(dataDir, new PathPolicy([root]));
+    const persistedWindow = (await reloaded.state([tab("tab-1", root)], "tab-1")).windows.find((candidate) => candidate.id === window.id);
+    expect(persistedWindow).toMatchObject({ name: "Renamed", layout: { root: { type: "pane", pane: { tabIds: ["tab-1"] } } } });
+  });
+
+  it("keeps a tab placement private until its durable write commits", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-workspace-tab-commit-"));
+    const store = new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root]));
+    const window = store.getActiveWindow();
+    const before = store.snapshot().windows;
+    const workspaceFile = (store as unknown as { workspaceFile: { write(value: unknown): Promise<void> } }).workspaceFile;
+    const originalWrite = workspaceFile.write.bind(workspaceFile);
+    const writeStarted = deferred<void>();
+    const releaseWrite = deferred<void>();
+    workspaceFile.write = async (value) => {
+      writeStarted.resolve();
+      await releaseWrite.promise;
+      await originalWrite(value);
+    };
+
+    const placement = store.placeTabAndPublish({ tabId: "tab-1", windowId: window.id, paneId: window.layout.activePaneId }, () => undefined);
+    await writeStarted.promise;
+
+    expect(store.snapshot().windows).toEqual(before);
+
+    releaseWrite.resolve();
+    await placement;
+    expect(store.findWindowForTab("tab-1")?.id).toBe(window.id);
+  });
+
+  it("retains publication and rollback failures when compensation cannot persist", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-workspace-rollback-failure-"));
+    const store = new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root]));
+    const window = store.getActiveWindow();
+    const workspaceFile = (store as unknown as { workspaceFile: { write(value: unknown): Promise<void> } }).workspaceFile;
+    const originalWrite = workspaceFile.write.bind(workspaceFile);
+    const publicationFailure = new Error("prepared tab publication failed");
+    const rollbackFailure = new Error("workspace rollback write failed");
+    let writes = 0;
+    workspaceFile.write = async (value) => {
+      writes += 1;
+      if (writes === 2) {
+        throw rollbackFailure;
+      }
+      await originalWrite(value);
+    };
+
+    const failure = await store
+      .placeTabAndPublish({ tabId: "tab-1", windowId: window.id, paneId: window.layout.activePaneId }, () => {
+        throw publicationFailure;
+      })
+      .then(
+        () => undefined,
+        (error: unknown) => error
+      );
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect(failure).toMatchObject({ message: "Workspace publication failed and its layout rollback could not be persisted." });
+    expect((failure as AggregateError).errors).toEqual([publicationFailure, rollbackFailure]);
   });
 
   it("keeps in-memory windows reachable when workspace persistence runs out of space", async () => {
@@ -295,16 +395,13 @@ describe("WorkspaceLayoutStore", () => {
     await store.updateWindow(targetWindow.id, { layout: layoutWithTab("tab-old") });
     const before = await store.state([tab("tab-old", root)], "tab-old");
 
-    const prepared = await store.prepareTemplateWindow(template.id, {
+    const prepared = await store.prepareTemplateApplication(template.id, {
       projectPath: nextProject,
       windowId: targetWindow.id,
       name: "Target Applied"
     });
     const remapped = store.remapTemplateLayout(prepared.template, new Map([["tab-source", "tab-new"]]));
-    const updated = await store.finishTemplateWindow(prepared.window.id, remapped, {
-      name: "Target Applied",
-      defaultCwd: prepared.projectPath
-    });
+    const { window: updated } = await store.commitTemplateAndPublish(prepared, remapped, "Target Applied", () => undefined);
     const after = await store.state([tab("tab-old", root), tab("tab-new", path.join(nextProject, "apps", "web"))], "tab-new");
 
     expect(prepared).toMatchObject({ createdWindow: false, projectPath: nextProject, window: { id: targetWindow.id } });

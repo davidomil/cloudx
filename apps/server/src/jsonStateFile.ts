@@ -4,7 +4,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 
-import { isSameOrChildPath } from "./pathBoundary.js";
+import { isDirectChildPath, isSameOrChildPath } from "./pathBoundary.js";
 
 interface DirectoryOptions {
   create: boolean;
@@ -47,6 +47,19 @@ export class JsonStateFile {
   async write(value: unknown): Promise<void> {
     await writeTextFileAtomic(this.rootPath, this.filePath, stringifyJsonDocument(value, `${this.label} file`), `${this.label} file`);
   }
+}
+
+export interface OwnedTextFile {
+  readonly path: string;
+  write(content: string): Promise<void>;
+  unlink(): Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface OwnedRegularFile {
+  readonly path: string;
+  unlink(): Promise<void>;
+  close(): Promise<void>;
 }
 
 export function stringifyJsonDocument(value: unknown, label: string): string {
@@ -92,6 +105,160 @@ export async function writeNewTextFileNoFollow(rootPath: string, filePath: strin
   } finally {
     await file.close();
   }
+}
+
+export async function openOwnedTextFileNoFollow(rootPath: string, directoryPath: string, fileName: string, label: string): Promise<OwnedTextFile> {
+  if (process.platform !== "linux") {
+    throw new Error(`${label} descriptor-relative creation requires Linux.`);
+  }
+  const resolvedRoot = path.resolve(rootPath);
+  const resolvedDirectory = path.resolve(directoryPath);
+  if (!isDirectChildPath(resolvedRoot, resolvedDirectory)) {
+    throw new Error(`${label} directory must stay directly within the configured data directory: ${resolvedDirectory}`);
+  }
+  if (!fileName || path.basename(fileName) !== fileName) {
+    throw new Error(`${label} name must be a direct child name.`);
+  }
+
+  await fsp.mkdir(resolvedRoot, { recursive: true });
+  const root = await openDirectoryNoFollow(resolvedRoot, `${label} data directory`);
+  let directory: Awaited<ReturnType<typeof fsp.open>> | undefined;
+  try {
+    const anchoredDirectory = descriptorChildPath(root.fd, path.basename(resolvedDirectory));
+    await fsp.mkdir(anchoredDirectory, { recursive: true });
+    directory = await openDirectoryNoFollow(anchoredDirectory, `${label} directory`);
+  } finally {
+    await root.close();
+  }
+
+  const anchoredFile = descriptorChildPath(directory.fd, fileName);
+  let file: Awaited<ReturnType<typeof fsp.open>>;
+  try {
+    file = await fsp.open(anchoredFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    await directory.close();
+    const stat = await lstatOptional(anchoredFile);
+    if (stat?.isSymbolicLink()) {
+      throw new Error(`${label} must not be a symbolic link: ${path.join(resolvedDirectory, fileName)}`);
+    }
+    if (isAlreadyExists(error)) {
+      throw new Error(`${label} already exists: ${path.join(resolvedDirectory, fileName)}`);
+    }
+    throw error;
+  }
+
+  let fileClosed = false;
+  let directoryClosed = false;
+  return {
+    path: path.join(resolvedDirectory, fileName),
+    write: (content) => file.writeFile(content, "utf8"),
+    async unlink() {
+      if (directoryClosed) {
+        throw new Error(`${label} ownership directory is closed.`);
+      }
+      await fsp.unlink(anchoredFile).catch((error) => {
+        if (!isNotFound(error)) {
+          throw error;
+        }
+      });
+    },
+    async close() {
+      const failures: unknown[] = [];
+      if (!fileClosed) {
+        fileClosed = true;
+        try {
+          await file.close();
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      if (!directoryClosed) {
+        directoryClosed = true;
+        try {
+          await directory.close();
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      if (failures.length === 1) {
+        throw failures[0];
+      }
+      if (failures.length > 1) {
+        throw new AggregateError(failures, `Failed to close ${label} ownership handles.`);
+      }
+    }
+  };
+}
+
+export async function openOwnedRegularFileNoFollow(rootPath: string, directoryPath: string, fileName: string, label: string): Promise<OwnedRegularFile> {
+  if (process.platform !== "linux") {
+    throw new Error(`${label} descriptor-relative deletion requires Linux.`);
+  }
+  const resolvedRoot = path.resolve(rootPath);
+  const resolvedDirectory = path.resolve(directoryPath);
+  if (!isDirectChildPath(resolvedRoot, resolvedDirectory)) {
+    throw new Error(`${label} directory must stay directly within the configured data directory: ${resolvedDirectory}`);
+  }
+  if (!fileName || path.basename(fileName) !== fileName) {
+    throw new Error(`${label} name must be a direct child name.`);
+  }
+
+  const root = await openDirectoryNoFollow(resolvedRoot, `${label} data directory`);
+  let directory: Awaited<ReturnType<typeof fsp.open>> | undefined;
+  try {
+    directory = await openDirectoryNoFollow(descriptorChildPath(root.fd, path.basename(resolvedDirectory)), `${label} directory`);
+  } finally {
+    await root.close();
+  }
+
+  const anchoredFile = descriptorChildPath(directory.fd, fileName);
+  let file: Awaited<ReturnType<typeof fsp.open>>;
+  try {
+    file = await fsp.open(anchoredFile, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    await directory.close();
+    if (isSymbolicLinkOpenError(error)) {
+      throw new Error(`${label} must not be a symbolic link: ${path.join(resolvedDirectory, fileName)}`);
+    }
+    throw error;
+  }
+  const ownedStat = await file.stat().catch(async (error) => {
+    await Promise.allSettled([file.close(), directory.close()]);
+    throw error;
+  });
+  if (!ownedStat.isFile()) {
+    await Promise.allSettled([file.close(), directory.close()]);
+    throw new Error(`${label} must be a regular file: ${path.join(resolvedDirectory, fileName)}`);
+  }
+
+  let closed = false;
+  return {
+    path: path.join(resolvedDirectory, fileName),
+    async unlink() {
+      if (closed) {
+        throw new Error(`${label} ownership handles are closed.`);
+      }
+      const current = await fsp.lstat(anchoredFile);
+      if (!current.isFile() || current.dev !== ownedStat.dev || current.ino !== ownedStat.ino) {
+        throw new Error(`${label} changed before descriptor-relative deletion: ${path.join(resolvedDirectory, fileName)}`);
+      }
+      await fsp.unlink(anchoredFile);
+    },
+    async close() {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      const results = await Promise.allSettled([file.close(), directory.close()]);
+      const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected").map((result) => result.reason);
+      if (failures.length === 1) {
+        throw failures[0];
+      }
+      if (failures.length > 1) {
+        throw new AggregateError(failures, `Failed to close ${label} ownership handles.`);
+      }
+    }
+  };
 }
 
 export async function appendTextFileNoFollow(filePath: string, content: string, label: string): Promise<void> {
@@ -240,4 +407,23 @@ function isNotFound(error: unknown): boolean {
 
 function isSymbolicLinkOpenError(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ELOOP";
+}
+
+async function openDirectoryNoFollow(directoryPath: string, label: string) {
+  try {
+    return await fsp.open(directoryPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if ((await lstatOptional(directoryPath))?.isSymbolicLink()) {
+      throw new Error(`${label} must not be a symbolic link: ${directoryPath}`);
+    }
+    throw error;
+  }
+}
+
+function descriptorChildPath(directoryFd: number, childName: string): string {
+  return `/proc/self/fd/${directoryFd}/${childName}`;
+}
+
+function isAlreadyExists(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
 }

@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
@@ -39,6 +39,8 @@ const ANSWER_EVIDENCE_TARGET_CHARS = 90_000;
 const ANSWER_CHUNK_CONTEXT = 1;
 const ANSWER_CHUNK_TEXT_MAX_CHARS = 4_000;
 const MEDIA_TOOL_TIMEOUT_MS = 30 * 60 * 1000;
+const MEDIA_TOOL_OUTPUT_MAX_BYTES = 8 * 1024 * 1024;
+const MEDIA_TOOL_TERMINATION_GRACE_MS = 250;
 const TRANSCRIPT_SEGMENT_TARGET_CHARS = 12_000;
 const MEDIA_SCENE_KEYFRAME_FILTER = "fps=1,select='eq(n,0)+gt(scene,0.08)',showinfo,scale=960:-2:flags=fast_bilinear";
 
@@ -54,14 +56,26 @@ export interface DocumentationRunnerOptions {
   taskLabel?: string;
   model?: string;
   imagePaths?: string[];
+  signal?: AbortSignal;
+}
+
+export interface DocumentationEnrichmentRequestOptions {
+  signal?: AbortSignal;
 }
 
 export interface DocumentationEnrichmentSource {
   filename?: string;
   content?: Buffer;
+  contentPath?: string;
   contentType?: string;
   sourceType?: string;
 }
+
+type MediaProcessLauncher = (
+  command: string,
+  args: readonly string[],
+  options: { detached: boolean; stdio: ["ignore", "pipe", "pipe"] }
+) => ReturnType<typeof spawn>;
 
 export interface DocumentationEnrichmentOptions {
   client: DocumentationClient;
@@ -69,6 +83,7 @@ export interface DocumentationEnrichmentOptions {
   rulesSkills: RulesSkillsCatalogService;
   runner: DocumentationEnrichmentRunner;
   asr?: AsrClient;
+  mediaProcessLauncher?: MediaProcessLauncher;
   pluginContributionsReady?: () => Promise<RulesSkillsStore> | undefined;
 }
 
@@ -86,7 +101,8 @@ export class CodexDocumentationEnrichmentRunner implements DocumentationEnrichme
         outputPrefix: options.outputPrefix ?? "cloudx-doc-enrich-",
         timeoutMs: options.timeoutMs ?? this.timeoutMs,
         taskLabel: options.taskLabel ?? "documentation enrichment",
-        imagePaths: options.imagePaths
+        imagePaths: options.imagePaths,
+        signal: options.signal
       })
     );
   }
@@ -102,7 +118,12 @@ export class DocumentationEnrichmentService {
     return this.options.config.getPluginConfig(DOCUMENTATION_PLUGIN_ID)[DOCUMENTATION_AI_ENRICHMENT_ENABLED_KEY] === true;
   }
 
-  async enrichIngestResponse(response: Record<string, unknown>, source: DocumentationEnrichmentSource = {}): Promise<Record<string, unknown>> {
+  async enrichIngestResponse(
+    response: Record<string, unknown>,
+    source: DocumentationEnrichmentSource = {},
+    options: DocumentationEnrichmentRequestOptions = {}
+  ): Promise<Record<string, unknown>> {
+    options.signal?.throwIfAborted();
     if (!this.isEnabled()) {
       return response;
     }
@@ -113,8 +134,11 @@ export class DocumentationEnrichmentService {
     const results = [];
     for (const document of documents) {
       try {
-        results.push(await this.enrichDocument(document, source));
+        results.push(await this.enrichDocument(document, source, options.signal));
       } catch (error) {
+        if (options.signal?.aborted) {
+          throw documentationAbortReason(options.signal);
+        }
         results.push({
           documentId: document.documentId,
           status: "failed",
@@ -156,25 +180,30 @@ export class DocumentationEnrichmentService {
     return { ...output, results, model };
   }
 
-  private async enrichDocument(document: IngestedDocumentRef, source: DocumentationEnrichmentSource): Promise<Record<string, unknown>> {
+  private async enrichDocument(document: IngestedDocumentRef, source: DocumentationEnrichmentSource, signal?: AbortSignal): Promise<Record<string, unknown>> {
     const skillIds = configuredSkillIds(this.options.config.getPluginConfig(DOCUMENTATION_PLUGIN_ID)[DOCUMENTATION_AI_ENRICHMENT_SKILLS_KEY]);
-    const skills = await this.resolveSkills(skillIds);
-    const fullDocument = await this.enrichmentDocument(document.documentId);
+    const skills = await this.resolveSkills(skillIds, signal);
+    const fullDocument = await this.enrichmentDocument(document.documentId, signal);
     const cleanup: Array<() => Promise<void>> = [];
     try {
-      const mediaEvidence = await this.prepareMediaEvidence(source, cleanup);
+      const mediaEvidence = await this.prepareMediaEvidence(source, cleanup, signal);
       const evidence = {
         document: documentSummary(fullDocument),
         chunks: documentChunks(fullDocument),
-        artifacts: await this.documentArtifacts(fullDocument),
+        artifacts: await this.documentArtifacts(fullDocument, signal),
         media: mediaEvidence
       };
       const model = this.enrichmentModel(skillIds, evidence);
       const batches = buildEvidenceBatches(evidence);
       const outputs = [];
       for (const batch of batches) {
+        signal?.throwIfAborted();
         const imagePaths = batchImagePaths(batch);
-        outputs.push(normalizeEnrichmentOutput(await this.options.runner.run(buildEnrichmentPrompt(skills, batch), imagePaths.length > 0 ? { model, imagePaths } : { model })));
+        const runnerOptions = imagePaths.length > 0 ? { model, imagePaths } : { model };
+        outputs.push(normalizeEnrichmentOutput(await this.options.runner.run(
+          buildEnrichmentPrompt(skills, batch),
+          signal ? { ...runnerOptions, signal } : runnerOptions
+        )));
       }
       const output = mergeEnrichmentOutputs(outputs);
       if (output.spans.length === 0) {
@@ -185,7 +214,7 @@ export class DocumentationEnrichmentService {
           warnings: output.warnings
         };
       }
-      await this.options.client.enrichDocument({
+      const enrichment = {
         documentId: document.documentId,
         spans: output.spans,
         model,
@@ -196,7 +225,12 @@ export class DocumentationEnrichmentService {
           warnings: output.warnings,
           evidence: evidenceSummary(evidence, batches)
         }
-      });
+      };
+      if (signal) {
+        await this.options.client.enrichDocument(enrichment, { signal });
+      } else {
+        await this.options.client.enrichDocument(enrichment);
+      }
       return {
         documentId: document.documentId,
         status: "written",
@@ -208,7 +242,7 @@ export class DocumentationEnrichmentService {
     }
   }
 
-  private async enrichmentDocument(documentId: string): Promise<Record<string, unknown>> {
+  private async enrichmentDocument(documentId: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
     let chunkOffset = 0;
     let artifactOffset = 0;
     let needsChunks = true;
@@ -217,9 +251,10 @@ export class DocumentationEnrichmentService {
     const chunks: Record<string, unknown>[] = [];
     const artifacts: Record<string, unknown>[] = [];
     while (!document || needsChunks || needsArtifacts) {
+      signal?.throwIfAborted();
       const loadChunks = !document || needsChunks;
       const loadArtifacts = !document || needsArtifacts;
-      const nextDocument = getRecord((await this.options.client.getDocument({
+      const input = {
         documentId,
         chunkOffset: loadChunks ? chunkOffset : 0,
         chunkLimit: loadChunks ? ENRICHMENT_DOCUMENT_CHUNK_PAGE_SIZE : 0,
@@ -228,7 +263,11 @@ export class DocumentationEnrichmentService {
         artifactLimit: loadArtifacts ? ENRICHMENT_DOCUMENT_ARTIFACT_PAGE_SIZE : 0,
         includeEnrichments: false,
         includeEvents: false
-      })).document, "document");
+      };
+      const response = signal
+        ? await this.options.client.getDocument(input, { signal })
+        : await this.options.client.getDocument(input);
+      const nextDocument = getRecord(response.document, "document");
       document ??= nextDocument;
       if (loadChunks) {
         const nextChunks = recordsArray(nextDocument.chunks);
@@ -255,8 +294,9 @@ export class DocumentationEnrichmentService {
     return { ...document, chunks, artifacts, enrichments: [], events: [] };
   }
 
-  private async resolveSkills(skillIds: string[]): Promise<CloudxSkill[]> {
+  private async resolveSkills(skillIds: string[], signal?: AbortSignal): Promise<CloudxSkill[]> {
     const store = await (this.options.pluginContributionsReady?.() ?? this.options.rulesSkills.list());
+    signal?.throwIfAborted();
     const skills = new Map([...store.systemSkills, ...store.skills].map((skill) => [skill.id, skill]));
     return skillIds.map((skillId) => {
       const skill = skills.get(skillId);
@@ -313,9 +353,9 @@ export class DocumentationEnrichmentService {
     return evidence.filter((item) => item.text.trim());
   }
 
-  private async documentArtifacts(document: Record<string, unknown>): Promise<ArtifactEvidence[]> {
+  private async documentArtifacts(document: Record<string, unknown>, signal?: AbortSignal): Promise<ArtifactEvidence[]> {
     const availableArtifacts = availableArtifactRecords(document);
-    const archiveRoot = await this.archiveRoot();
+    const archiveRoot = await this.archiveRoot(signal);
     const snapshotPath = typeof document.snapshot_path === "string" ? document.snapshot_path : undefined;
     if (!archiveRoot || !snapshotPath) {
       if (availableArtifacts.length > 0) {
@@ -333,6 +373,7 @@ export class DocumentationEnrichmentService {
     }
     const extracted = path.join(path.dirname(snapshot), "extracted");
     const structuredArtifacts = await documentArtifactEvidence(document, root, extracted);
+    signal?.throwIfAborted();
     if (structuredArtifacts.length > 0) {
       return structuredArtifacts;
     }
@@ -342,9 +383,10 @@ export class DocumentationEnrichmentService {
       }
       return [];
     }
-    const paths = await listFiles(extracted);
+    const paths = await listFiles(extracted, signal);
     const artifacts: ArtifactEvidence[] = [];
     for (const artifactPath of paths) {
+      signal?.throwIfAborted();
       const relativePath = path.relative(root, artifactPath);
       const stat = await fsp.stat(artifactPath);
       artifacts.push({
@@ -357,24 +399,46 @@ export class DocumentationEnrichmentService {
     return artifacts;
   }
 
-  private async archiveRoot(): Promise<string | undefined> {
-    const health = await this.options.client.health();
+  private async archiveRoot(signal?: AbortSignal): Promise<string | undefined> {
+    const health = signal ? await this.options.client.health({ signal }) : await this.options.client.health();
     return typeof health.archiveRoot === "string" ? health.archiveRoot : undefined;
   }
 
-  private async prepareMediaEvidence(source: DocumentationEnrichmentSource, cleanup: Array<() => Promise<void>>): Promise<MediaEvidence | undefined> {
-    if (!source.content || !isMediaSource(source)) {
+  private async prepareMediaEvidence(source: DocumentationEnrichmentSource, cleanup: Array<() => Promise<void>>, signal?: AbortSignal): Promise<MediaEvidence | undefined> {
+    signal?.throwIfAborted();
+    if ((!source.content && !source.contentPath) || !isMediaSource(source)) {
       return undefined;
     }
-    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-media-"));
-    cleanup.push(() => fsp.rm(tempDir, { recursive: true, force: true }));
-    const mediaPath = path.join(tempDir, safeMediaFilename(source.filename));
-    await fsp.writeFile(mediaPath, source.content);
+    let mediaPath: string;
+    let mediaWorkDir: string | undefined;
+    if (source.contentPath) {
+      mediaPath = path.resolve(source.contentPath);
+      const stat = await fsp.lstat(mediaPath);
+      signal?.throwIfAborted();
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw new Error("Documentation media source must be a regular spool file.");
+      }
+      if (isVideoSource(source)) {
+        mediaWorkDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-media-"));
+        cleanup.push(() => fsp.rm(mediaWorkDir!, { recursive: true, force: true }));
+      }
+    } else {
+      mediaWorkDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-media-"));
+      cleanup.push(() => fsp.rm(mediaWorkDir!, { recursive: true, force: true }));
+      mediaPath = path.join(mediaWorkDir, safeMediaFilename(source.filename));
+      await fsp.writeFile(mediaPath, source.content!);
+      signal?.throwIfAborted();
+    }
     if (!this.options.asr) {
       throw new Error("Documentation media enrichment requires the ASR service so uploaded audio/video is not indexed without transcript evidence.");
     }
-    const transcript = await this.options.asr.transcribe(source.content, source.filename || "upload.media");
-    const keyframes = isVideoSource(source) ? captureSceneKeyframes(mediaPath, path.join(tempDir, "frames")) : [];
+    const filename = source.filename || "upload.media";
+    const transcript = source.contentPath
+      ? signal ? await this.options.asr.transcribeFile(mediaPath, filename, { signal }) : await this.options.asr.transcribeFile(mediaPath, filename)
+      : signal ? await this.options.asr.transcribe(source.content!, filename, { signal }) : await this.options.asr.transcribe(source.content!, filename);
+    const keyframes = isVideoSource(source)
+      ? await captureSceneKeyframes(mediaPath, path.join(mediaWorkDir!, "frames"), signal, this.options.mediaProcessLauncher)
+      : [];
     return {
       filename: source.filename,
       contentType: source.contentType,
@@ -1093,11 +1157,13 @@ function evidenceSummary(evidence: EnrichmentEvidence, batches: EnrichmentEviden
   };
 }
 
-async function listFiles(root: string): Promise<string[]> {
+async function listFiles(root: string, signal?: AbortSignal): Promise<string[]> {
   const files: string[] = [];
   async function walk(directory: string): Promise<void> {
+    signal?.throwIfAborted();
     const entries = await fsp.readdir(directory, { withFileTypes: true });
     for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      signal?.throwIfAborted();
       const entryPath = path.join(directory, entry.name);
       if (entry.isDirectory()) {
         await walk(entryPath);
@@ -1110,38 +1176,232 @@ async function listFiles(root: string): Promise<string[]> {
   return files;
 }
 
-function captureSceneKeyframes(inputPath: string, outputDir: string): Array<{ path: string; offsetSeconds?: number }> {
-  fs.mkdirSync(outputDir, { recursive: true });
-  const result = spawnSync(
-    "ffmpeg",
-    [
-      "-hide_banner",
-      "-loglevel",
-      "info",
-      "-i",
-      inputPath,
-      "-vf",
-      MEDIA_SCENE_KEYFRAME_FILTER,
-      "-fps_mode",
-      "vfr",
-      path.join(outputDir, "frame-%04d.jpg")
-    ],
-    { encoding: "utf8", timeout: MEDIA_TOOL_TIMEOUT_MS }
-  );
-  if (result.error) {
-    throw result.error;
-  }
+async function captureSceneKeyframes(
+  inputPath: string,
+  outputDir: string,
+  signal?: AbortSignal,
+  mediaProcessLauncher: MediaProcessLauncher = spawn
+): Promise<Array<{ path: string; offsetSeconds?: number }>> {
+  await fsp.mkdir(outputDir, { recursive: true });
+  const result = await runMediaTool("ffmpeg", [
+    "-hide_banner",
+    "-loglevel",
+    "info",
+    "-i",
+    inputPath,
+    "-vf",
+    MEDIA_SCENE_KEYFRAME_FILTER,
+    "-fps_mode",
+    "vfr",
+    path.join(outputDir, "frame-%04d.jpg")
+  ], signal, mediaProcessLauncher);
   if (result.status !== 0) {
     throw new Error(`ffmpeg keyframe extraction failed: ${result.stderr || result.stdout || `exit ${result.status}`}`);
   }
-  const frameNames = fs.readdirSync(outputDir)
+  const frameNames = (await fsp.readdir(outputDir))
     .filter((name) => name.endsWith(".jpg"))
     .sort();
-  const offsets = parseFfmpegShowinfoPtsTimes(result.stderr ?? "");
+  const offsets = parseFfmpegShowinfoPtsTimes(result.stderr);
   if (frameNames.length !== offsets.length) {
     throw new Error(`ffmpeg keyframe extraction produced ${frameNames.length} frame files but ${offsets.length} frame timestamps.`);
   }
   return frameNames.map((name, index) => ({ path: path.join(outputDir, name), offsetSeconds: Math.max(0, Math.round(offsets[index] ?? 0)) }));
+}
+
+function runMediaTool(
+  command: string,
+  args: string[],
+  signal?: AbortSignal,
+  mediaProcessLauncher: MediaProcessLauncher = spawn
+): Promise<{ status: number; stdout: string; stderr: string }> {
+  if (signal?.aborted) {
+    return Promise.reject(documentationAbortReason(signal));
+  }
+  return new Promise((resolve, reject) => {
+    const child = mediaProcessLauncher(command, args, {
+      detached: process.platform !== "win32",
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let processGroupId: number | undefined;
+    let stdout = "";
+    let stderr = "";
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let stoppingError: Error | undefined;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let killTimeout: ReturnType<typeof setTimeout> | undefined;
+    let processGroupPoll: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+    let childClosed = false;
+    let processGroupStopped = false;
+    const cleanup = () => {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      if (killTimeout) {
+        clearTimeout(killTimeout);
+      }
+      if (processGroupPoll) {
+        clearTimeout(processGroupPoll);
+      }
+      signal?.removeEventListener("abort", abort);
+      child.off("error", onChildError);
+      child.off("close", onChildClose);
+      child.stdout?.off("data", onStdoutData);
+      child.stdout?.off("error", onStdoutError);
+      child.stderr?.off("data", onStderrData);
+      child.stderr?.off("error", onStderrError);
+    };
+    const rejectAfterCleanup = () => {
+      if (settled || !stoppingError || !childClosed || !processGroupStopped) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(stoppingError);
+    };
+    const terminate = (processSignal: NodeJS.Signals) => {
+      stopMediaProcess(child, processSignal, processGroupId);
+      if (processSignal === "SIGTERM" && !killTimeout) {
+        killTimeout = setTimeout(() => {
+          stopMediaProcess(child, "SIGKILL", processGroupId);
+          waitForMediaProcessGroupExit(processGroupId, (timer) => {
+            processGroupPoll = timer;
+          }).then(
+            () => {
+              processGroupStopped = true;
+              rejectAfterCleanup();
+            },
+            (error) => {
+              stoppingError = error instanceof Error ? error : new Error(String(error));
+              processGroupStopped = true;
+              rejectAfterCleanup();
+            }
+          );
+        }, MEDIA_TOOL_TERMINATION_GRACE_MS);
+      }
+    };
+    const stopWithError = (error: Error) => {
+      stoppingError ??= error;
+      terminate("SIGTERM");
+    };
+    const abort = () => stopWithError(documentationAbortReason(signal!));
+    const appendOutput = (stream: "stdout" | "stderr", chunk: string) => {
+      if (stoppingError) {
+        return;
+      }
+      const bytes = Buffer.byteLength(chunk, "utf8");
+      if (stream === "stdout") {
+        stdoutBytes += bytes;
+        if (stdoutBytes > MEDIA_TOOL_OUTPUT_MAX_BYTES) {
+          stopWithError(new Error(`ffmpeg stdout exceeded the ${MEDIA_TOOL_OUTPUT_MAX_BYTES} byte output limit.`));
+          return;
+        }
+        stdout += chunk;
+        return;
+      }
+      stderrBytes += bytes;
+      if (stderrBytes > MEDIA_TOOL_OUTPUT_MAX_BYTES) {
+        stopWithError(new Error(`ffmpeg stderr exceeded the ${MEDIA_TOOL_OUTPUT_MAX_BYTES} byte output limit.`));
+        return;
+      }
+      stderr += chunk;
+    };
+    function onChildError(error: Error): void {
+      stoppingError ??= error;
+      if (!processGroupId) {
+        processGroupStopped = true;
+        rejectAfterCleanup();
+        return;
+      }
+      terminate("SIGTERM");
+    }
+    function onChildClose(code: number | null): void {
+      if (settled) {
+        return;
+      }
+      childClosed = true;
+      if (stoppingError) {
+        rejectAfterCleanup();
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve({ status: code ?? 1, stdout, stderr });
+    }
+    function onStdoutData(chunk: string): void {
+      appendOutput("stdout", chunk);
+    }
+    function onStderrData(chunk: string): void {
+      appendOutput("stderr", chunk);
+    }
+    function onStdoutError(error: Error): void {
+      stopWithError(error);
+    }
+    function onStderrError(error: Error): void {
+      stopWithError(error);
+    }
+    child.on("error", onChildError);
+    child.on("close", onChildClose);
+    processGroupId = child.pid;
+    timeout = setTimeout(() => stopWithError(new Error(`ffmpeg keyframe extraction timed out after ${MEDIA_TOOL_TIMEOUT_MS} ms.`)), MEDIA_TOOL_TIMEOUT_MS);
+    timeout.unref();
+    signal?.addEventListener("abort", abort, { once: true });
+    if (!child.stdout || !child.stderr) {
+      stopWithError(new Error("ffmpeg keyframe extraction did not expose piped output streams."));
+      return;
+    }
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", onStdoutData);
+    child.stderr.on("data", onStderrData);
+    child.stdout.on("error", onStdoutError);
+    child.stderr.on("error", onStderrError);
+  });
+}
+
+async function waitForMediaProcessGroupExit(processGroupId: number | undefined, observeTimer: (timer: ReturnType<typeof setTimeout>) => void): Promise<void> {
+  if (process.platform === "win32" || !processGroupId) {
+    return;
+  }
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      process.kill(-processGroupId, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+        return;
+      }
+      throw error;
+    }
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 10);
+      observeTimer(timer);
+    });
+  }
+  throw new Error("Media process group did not stop after SIGKILL.");
+}
+
+function stopMediaProcess(child: ReturnType<typeof spawn>, signal: NodeJS.Signals, processGroupId = child.pid): void {
+  if (!processGroupId) {
+    child.kill(signal);
+    return;
+  }
+  if (process.platform !== "win32") {
+    try {
+      process.kill(-processGroupId, signal);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+        child.kill(signal);
+      }
+      return;
+    }
+  }
+  child.kill(signal);
+}
+
+function documentationAbortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error("Documentation enrichment was cancelled.");
 }
 
 export function parseFfmpegShowinfoPtsTimes(output: string): number[] {

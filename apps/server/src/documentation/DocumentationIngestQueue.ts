@@ -34,6 +34,7 @@ export interface DocumentationIngestProgressChannel {
 export interface DocumentationIngestQueueJobInput {
   kind: DocumentationIngestKind;
   label: string;
+  admissionBytes: number;
   detail?: string;
   queuedStage?: string;
   runningStage?: string;
@@ -41,13 +42,13 @@ export interface DocumentationIngestQueueJobInput {
 }
 
 export interface DocumentationIngestQueueOperationContext {
+  readonly signal: AbortSignal;
   update(patch: DocumentationIngestQueueUpdate): void;
 }
 
 export type DocumentationIngestProgressReporter = (snapshot: DocumentationIngestJobSnapshot) => void;
 
 interface DocumentationIngestJobState extends DocumentationIngestJobSnapshot {
-  result?: Record<string, unknown>;
   progressChannelsById?: Map<string, DocumentationIngestProgressChannel>;
 }
 
@@ -60,13 +61,169 @@ export type DocumentationIngestQueueUpdate = Pick<Partial<DocumentationIngestJob
 
 const MAX_RETAINED_JOBS = 30;
 const PROGRESS_HEARTBEAT_MS = 5_000;
+export const DEFAULT_DOCUMENTATION_INGEST_QUEUE_MAX_JOBS = 8;
+export const DEFAULT_DOCUMENTATION_INGEST_QUEUE_MAX_BYTES = 512 * 1024 * 1024;
+
+export interface DocumentationIngestQueueOptions {
+  maxJobs: number;
+  maxBytes: number;
+}
+
+export interface DocumentationIngestQueueCapacitySnapshot {
+  admittedJobs: number;
+  admittedBytes: number;
+  reservedJobs: number;
+  maxJobs: number;
+  maxBytes: number;
+}
+
+export class DocumentationIngestQueueCapacityError extends Error {
+  constructor(
+    readonly code: "DOCUMENTATION_INGEST_JOB_CAPACITY" | "DOCUMENTATION_INGEST_BYTE_CAPACITY",
+    readonly statusCode: 429 | 503,
+    message: string
+  ) {
+    super(message);
+    this.name = "DocumentationIngestQueueCapacityError";
+  }
+}
+
+export class DocumentationIngestQueueStoppedError extends Error {
+  readonly code = "DOCUMENTATION_INGEST_QUEUE_STOPPED";
+  readonly statusCode = 503;
+
+  constructor() {
+    super("Documentation ingest queue was stopped.");
+    this.name = "DocumentationIngestQueueStoppedError";
+  }
+}
+
+export class DocumentationIngestAdmission {
+  private state: "reserved" | "consumed" | "released" = "reserved";
+  private readonly controller = new AbortController();
+  private preEnqueueStarted = false;
+  private preEnqueueSettled = false;
+  private preEnqueueSettlement: Promise<void> = Promise.resolve();
+
+  constructor(
+    private readonly owner: DocumentationIngestQueue,
+    readonly bytes: number,
+    private readonly releaseCapacity: () => void
+  ) {}
+
+  get reserved(): boolean {
+    return this.state === "reserved";
+  }
+
+  runBeforeEnqueue<T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    if (this.state !== "reserved" || this.preEnqueueStarted) {
+      throw new Error("Documentation ingest admission was already used.");
+    }
+    this.preEnqueueStarted = true;
+    const execution = Promise.resolve().then(() => operation(this.controller.signal));
+    this.preEnqueueSettlement = execution.then(
+      () => {
+        this.preEnqueueSettled = true;
+      },
+      () => {
+        this.preEnqueueSettled = true;
+      }
+    );
+    return execution;
+  }
+
+  release(): void {
+    if (this.state !== "reserved") {
+      return;
+    }
+    if (this.preEnqueueStarted && !this.preEnqueueSettled) {
+      void this.abortAndRelease(new DocumentationIngestQueueStoppedError());
+      return;
+    }
+    this.state = "released";
+    this.releaseCapacity();
+  }
+
+  async abortAndRelease(reason: Error): Promise<void> {
+    if (this.state !== "reserved") {
+      return;
+    }
+    this.controller.abort(reason);
+    await this.preEnqueueSettlement;
+    if (this.state === "reserved") {
+      this.state = "released";
+      this.releaseCapacity();
+    }
+  }
+
+  consume(owner: DocumentationIngestQueue, bytes: number): void {
+    if (owner !== this.owner || bytes !== this.bytes) {
+      throw new Error("Documentation ingest admission does not match this queue operation.");
+    }
+    if (this.state !== "reserved") {
+      throw new Error("Documentation ingest admission was already used.");
+    }
+    if (this.controller.signal.aborted || (this.preEnqueueStarted && !this.preEnqueueSettled)) {
+      throw new DocumentationIngestQueueStoppedError();
+    }
+    this.state = "consumed";
+  }
+
+  settle(owner: DocumentationIngestQueue): void {
+    if (owner !== this.owner || this.state !== "consumed") {
+      return;
+    }
+    this.state = "released";
+    this.releaseCapacity();
+  }
+}
 
 export class DocumentationIngestQueue {
   private readonly jobs = new Map<string, DocumentationIngestJobState>();
   private readonly order: string[] = [];
   private tail: Promise<void> = Promise.resolve();
+  private readonly admissions = new Set<DocumentationIngestAdmission>();
+  private readonly jobControllers = new Map<string, AbortController>();
+  private admittedJobs = 0;
+  private admittedBytes = 0;
+  private disposed = false;
+  private disposePromise: Promise<void> | undefined;
+
+  constructor(private readonly options: DocumentationIngestQueueOptions = {
+    maxJobs: DEFAULT_DOCUMENTATION_INGEST_QUEUE_MAX_JOBS,
+    maxBytes: DEFAULT_DOCUMENTATION_INGEST_QUEUE_MAX_BYTES
+  }) {
+    requirePositiveCapacity(options.maxJobs, "maxJobs");
+    requirePositiveCapacity(options.maxBytes, "maxBytes");
+  }
 
   enqueue(input: DocumentationIngestQueueJobInput, reportProgress?: DocumentationIngestProgressReporter): Promise<Record<string, unknown>> {
+    const admission = this.reserve(input.admissionBytes);
+    try {
+      return this.enqueueReserved(input, admission, reportProgress);
+    } catch (error) {
+      admission.release();
+      throw error;
+    }
+  }
+
+  reserve(requestedBytes: number): DocumentationIngestAdmission {
+    this.requireRunning();
+    const admissionBytes = requireAdmissionBytes(requestedBytes);
+    this.admit(admissionBytes);
+    let admission!: DocumentationIngestAdmission;
+    admission = new DocumentationIngestAdmission(this, admissionBytes, () => {
+      this.admissions.delete(admission);
+      this.release(admissionBytes);
+    });
+    this.admissions.add(admission);
+    return admission;
+  }
+
+  enqueueReserved(input: DocumentationIngestQueueJobInput, admission: DocumentationIngestAdmission, reportProgress?: DocumentationIngestProgressReporter): Promise<Record<string, unknown>> {
+    this.requireRunning();
+    const admissionBytes = requireAdmissionBytes(input.admissionBytes);
+    admission.consume(this, admissionBytes);
     const job: DocumentationIngestJobState = {
       id: randomUUID(),
       kind: input.kind,
@@ -78,31 +235,52 @@ export class DocumentationIngestQueue {
       position: 0,
       createdAt: new Date().toISOString()
     };
-    this.jobs.set(job.id, job);
-    this.order.push(job.id);
-    this.trimRetainedJobs();
-    this.report(job, reportProgress);
+    try {
+      this.jobs.set(job.id, job);
+      this.order.push(job.id);
+      this.trimRetainedJobs();
+      this.report(job, reportProgress);
+    } catch (error) {
+      this.jobs.delete(job.id);
+      this.order.splice(this.order.indexOf(job.id), 1);
+      admission.settle(this);
+      throw error;
+    }
 
     let heartbeat: NodeJS.Timeout | undefined;
+    const controller = new AbortController();
+    this.jobControllers.set(job.id, controller);
     if (reportProgress) {
       heartbeat = setInterval(() => this.report(job, reportProgress), PROGRESS_HEARTBEAT_MS);
       heartbeat.unref?.();
     }
 
-    const run = this.tail.then(() => this.runJob(job, input, reportProgress));
-    this.tail = run.then(() => undefined, () => undefined);
-    return run.finally(() => {
+    const run = this.tail.then(() => this.runJob(job, input, controller.signal, reportProgress));
+    const settled = run.finally(() => {
       if (heartbeat) {
         clearInterval(heartbeat);
       }
+      this.jobControllers.delete(job.id);
+      admission.settle(this);
     });
+    this.tail = settled.then(() => undefined, () => undefined);
+    return settled;
   }
 
-  list(): { jobs: DocumentationIngestJobSnapshot[] } {
-    return { jobs: this.snapshots() };
+  list(): { jobs: DocumentationIngestJobSnapshot[]; capacity: DocumentationIngestQueueCapacitySnapshot } {
+    return {
+      jobs: this.snapshots(),
+      capacity: {
+        admittedJobs: this.admittedJobs,
+        admittedBytes: this.admittedBytes,
+        reservedJobs: Array.from(this.admissions).filter((admission) => admission.reserved).length,
+        maxJobs: this.options.maxJobs,
+        maxBytes: this.options.maxBytes
+      }
+    };
   }
 
-  clearFinished(): { jobs: DocumentationIngestJobSnapshot[] } {
+  clearFinished(): { jobs: DocumentationIngestJobSnapshot[]; capacity: DocumentationIngestQueueCapacitySnapshot } {
     for (const id of [...this.order]) {
       const job = this.jobs.get(id);
       if (job?.status === "complete" || job?.status === "failed") {
@@ -113,7 +291,21 @@ export class DocumentationIngestQueue {
     return this.list();
   }
 
-  private async runJob(job: DocumentationIngestJobState, input: DocumentationIngestQueueJobInput, reportProgress?: DocumentationIngestProgressReporter): Promise<Record<string, unknown>> {
+  dispose(): Promise<void> {
+    if (this.disposePromise) {
+      return this.disposePromise;
+    }
+    this.disposed = true;
+    const stopped = new DocumentationIngestQueueStoppedError();
+    const admissionShutdown = Promise.all([...this.admissions].map((admission) => admission.abortAndRelease(stopped)));
+    for (const controller of this.jobControllers.values()) {
+      controller.abort(stopped);
+    }
+    this.disposePromise = Promise.all([admissionShutdown, this.tail]).then(() => undefined);
+    return this.disposePromise;
+  }
+
+  private async runJob(job: DocumentationIngestJobState, input: DocumentationIngestQueueJobInput, signal: AbortSignal, reportProgress?: DocumentationIngestProgressReporter): Promise<Record<string, unknown>> {
     Object.assign(job, {
       status: "running" satisfies DocumentationIngestJobStatus,
       progress: Math.max(job.progress, 5),
@@ -122,7 +314,11 @@ export class DocumentationIngestQueue {
     });
     this.report(job, reportProgress);
     try {
+      if (signal.aborted) {
+        throw signal.reason;
+      }
       const result = await input.operation({
+        signal,
         update: (patch) => {
           if (patch.progress !== undefined) {
             job.progress = boundedProgress(patch.progress);
@@ -144,8 +340,7 @@ export class DocumentationIngestQueue {
         status: "complete" satisfies DocumentationIngestJobStatus,
         progress: 100,
         stage: "Import complete.",
-        finishedAt: new Date().toISOString(),
-        result
+        finishedAt: new Date().toISOString()
       });
       this.report(job, reportProgress);
       return result;
@@ -234,6 +429,36 @@ export class DocumentationIngestQueue {
       this.order.splice(this.order.indexOf(firstRetainedFinished), 1);
     }
   }
+
+  private admit(bytes: number): void {
+    if (this.admittedJobs >= this.options.maxJobs) {
+      throw new DocumentationIngestQueueCapacityError(
+        "DOCUMENTATION_INGEST_JOB_CAPACITY",
+        429,
+        `Documentation ingest capacity is full (${this.options.maxJobs} admitted jobs).`
+      );
+    }
+    if (bytes > this.options.maxBytes - this.admittedBytes) {
+      throw new DocumentationIngestQueueCapacityError(
+        "DOCUMENTATION_INGEST_BYTE_CAPACITY",
+        503,
+        `Documentation ingest byte capacity is unavailable (${this.options.maxBytes} bytes).`
+      );
+    }
+    this.admittedJobs += 1;
+    this.admittedBytes += bytes;
+  }
+
+  private release(bytes: number): void {
+    this.admittedJobs -= 1;
+    this.admittedBytes -= bytes;
+  }
+
+  private requireRunning(): void {
+    if (this.disposed) {
+      throw new DocumentationIngestQueueStoppedError();
+    }
+  }
 }
 
 function boundedProgress(value: number): number {
@@ -256,4 +481,17 @@ function normalizeProgressChannelId(value: string): string {
 
 function isJob(value: DocumentationIngestJobState | undefined): value is DocumentationIngestJobState {
   return Boolean(value);
+}
+
+function requirePositiveCapacity(value: number, name: string): void {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`Documentation ingest queue ${name} must be a positive safe integer.`);
+  }
+}
+
+function requireAdmissionBytes(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error("Documentation ingest admissionBytes must be a non-negative safe integer.");
+  }
+  return value;
 }

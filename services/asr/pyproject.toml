@@ -8,7 +8,8 @@ dependencies = [
   "fastapi>=0.115",
   "uvicorn[standard]>=0.30",
   "python-multipart>=0.0.9",
-  "faster-whisper>=1.1"
+  "faster-whisper>=1.1",
+  "huggingface-hub>=1.0"
 ]
 
 [project.optional-dependencies]
@@ -16,6 +17,17 @@ dev = [
   "pytest>=8.0",
   "httpx>=0.27"
 ]
+cuda = [
+  "nvidia-cublas-cu12; sys_platform == 'linux'",
+  "nvidia-cudnn-cu12==9.*; sys_platform == 'linux'"
+]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv]
+required-version = "==0.11.28"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -70,13 +70,14 @@ export class AudioAiPlugin implements WorkspacePlugin {
           },
           additionalProperties: true
         },
-        execute: async (input) => {
+        execute: async (input, context) => {
           if (!this.voiceCommandsEnabled()) {
             throw new Error("Voice commands are disabled in Cloudx settings.");
           }
           const clientContext = typeof input.clientContext === "object" && input.clientContext !== null && !Array.isArray(input.clientContext) ? (input.clientContext as Record<string, unknown>) : undefined;
           const result = await this.voiceProvider().handleTranscript(requireString(input.transcript, "transcript"), optionalString(input.activeTabId, "activeTabId"), clientContext, {
-            source: "audio-ai-hook"
+            source: "audio-ai-hook",
+            signal: context.signal
           });
           return result as unknown as Record<string, unknown>;
         }

@@ -2,8 +2,8 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest, 
 import websocket from "@fastify/websocket";
 import staticPlugin from "@fastify/static";
 import fs from "node:fs";
-import type { IncomingHttpHeaders } from "node:http";
 import { randomUUID } from "node:crypto";
+import path from "node:path";
 import { Readable } from "node:stream";
 import type { RawData, WebSocket } from "ws";
 
@@ -36,11 +36,14 @@ import { AsrClient } from "./asrClient.js";
 import { DEFAULT_DOCUMENTATION_URL, DocumentationClient } from "./documentation/DocumentationClient.js";
 import { DocumentationIngestQueue } from "./documentation/DocumentationIngestQueue.js";
 import { CodexDocumentationEnrichmentRunner, DocumentationEnrichmentService } from "./documentation/DocumentationEnrichmentService.js";
+import { reapDocumentationUploadSpool, spoolDocumentationUpload, type DocumentationUploadSpool } from "./documentation/DocumentationUploadSpool.js";
 import { PathPolicy } from "./pathPolicy.js";
+import { WorktreeService } from "./git/WorktreeService.js";
 import { PluginRegistry } from "./pluginRegistry.js";
 import { LOCAL_WEB_PROXY_MAX_BODY_BYTES, LocalWebProxy } from "./localWebProxy.js";
 import { contentDispositionAttachment, FileTransferService, FileUploadTooLargeError } from "./fileTransfer.js";
 import { CodexTerminalPlugin } from "./plugins/CodexTerminalPlugin.js";
+import { CodexStateSources } from "./plugins/CodexStateSources.js";
 import { FileBrowserPlugin } from "./plugins/FileBrowserPlugin.js";
 import { LocalWebPlugin } from "./plugins/LocalWebPlugin.js";
 import { StandardTerminalPlugin } from "./plugins/StandardTerminalPlugin.js";
@@ -59,6 +62,7 @@ import { JiraIntegrationService } from "./jira/JiraIntegrationService.js";
 import { JiraPollingService } from "./jira/JiraPollingService.js";
 import { SessionStore } from "./sessionStore.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
+import { WorkspaceCommandService } from "./workspace/WorkspaceCommandService.js";
 import { RulesSkillsCatalogService } from "./rulesSkills/RulesSkillsCatalogService.js";
 import { NodePtyTerminalProcessFactory } from "./terminal/NodePtyTerminalProcess.js";
 import { VoiceController } from "./voice/VoiceController.js";
@@ -88,6 +92,7 @@ export interface AppServices {
   asr: AsrClient;
   config?: ConfigService;
   workspace?: WorkspaceLayoutStore;
+  workspaceCommands?: WorkspaceCommandService;
   hooks?: HookRegistry;
   triggers?: TriggerRegistry;
   automation?: AutomationService;
@@ -102,11 +107,15 @@ export interface AppServices {
   jira?: JiraIntegrationService;
   jiraPolling?: JiraPollingService;
   pluginContributionsReady?: Promise<RulesSkillsStore>;
+  codexStateSources?: CodexStateSources;
 }
 
 const MIN_STREAMED_AUDIO_BYTES = 128;
 const VOICE_WS_CONTROL_MESSAGE_MAX_BYTES = 64 * 1024;
 const TERMINAL_WS_CONTROL_MESSAGE_MAX_BYTES = 256 * 1024;
+export const TERMINAL_WS_MAX_BUFFERED_BYTES = 1024 * 1024;
+const TERMINAL_REPLAY_JSON_ESCAPE_MULTIPLIER = 6;
+const TERMINAL_DATA_MESSAGE_ENVELOPE_BYTES = Buffer.byteLength(JSON.stringify({ type: "data", data: "" }), "utf8");
 const MAX_TERMINAL_DIMENSION = 500;
 const FILE_UPLOAD_MAX_BYTES = 25 * 1024 * 1024 * 1024;
 const WS_CONNECTING = 0;
@@ -126,6 +135,7 @@ export type TerminalControlMessage = { type: "input"; data: string } | { type: "
 export type VoiceAudioControlMessage = { type?: string; clientContext?: unknown };
 
 export async function buildServer(config: AppConfig, services?: AppServices): Promise<FastifyInstance> {
+  await fs.promises.mkdir(config.dataDir, { recursive: true, mode: 0o700 });
   const app = Fastify({
     logger: {
       level: config.logLevel,
@@ -142,9 +152,12 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       : null
   });
   services ??= buildServices(config, app.log);
+  services.codexStateSources ??= new CodexStateSources(config.dataDir);
   services.documentationIngestQueue ??= new DocumentationIngestQueue();
+  await reapDocumentationUploadSpool(documentationSpoolRoot(config));
   services.config ??= new ConfigService(config.dataDir, () => services!.plugins.list(), { voiceModel: config.voiceModel });
   services.workspace ??= new WorkspaceLayoutStore(config.dataDir, services.pathPolicy);
+  services.workspaceCommands ??= new WorkspaceCommandService(services.sessions, services.workspace);
   services.pluginData ??= new PluginDataStore(config.dataDir);
   services.installedPlugins ??= new InstalledPluginService(config.dataDir, { logger: app.log });
   services.rulesSkills ??= new RulesSkillsCatalogService(config.dataDir);
@@ -173,17 +186,64 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   await app.register(websocket, {
     options: {
       maxPayload: Math.max(config.voiceAudioUploadMaxBytes, VOICE_WS_CONTROL_MESSAGE_MAX_BYTES),
-      perMessageDeflate: false,
-      verifyClient: verifyWebSocketClient
+      perMessageDeflate: false
+    }
+  });
+  const trustedOrigins = new Set(config.trustedOrigins);
+  const trustedAuthorities = new Set(config.trustedOrigins.flatMap((origin) => trustedOriginAuthorities(origin)));
+  app.addHook("onRequest", async (request, reply) => {
+    if (!isTrustedRequest(request.raw.rawHeaders, trustedOrigins, trustedAuthorities)) {
+      return reply.code(403).send({ error: "Forbidden" });
     }
   });
 
-  app.addHook("onClose", async () => {
-    disposePersistenceNotifications();
-    services.automation?.dispose();
-    services.jiraPolling?.dispose();
-    services.voice.dispose?.();
-  });
+  let shutdownPromise: Promise<void> | undefined;
+  const shutdown = (): Promise<void> => {
+    if (shutdownPromise) {
+      return shutdownPromise;
+    }
+    let voiceAdmissionFailure: unknown;
+    try {
+      services.voice.beginShutdown?.();
+    } catch (error) {
+      voiceAdmissionFailure = error;
+    }
+    const requestOwnerShutdown = settleDisposers([
+      () => services.documentationIngestQueue?.dispose(),
+      () => services.voice.dispose?.()
+    ]);
+    const sourceShutdown = settleDisposers([() => services.codexStateSources?.dispose()]);
+    const producerShutdown = settleDisposers([
+      () => services.jiraPolling?.dispose(),
+      () => services.sessions.dispose?.()
+    ]);
+    shutdownPromise = (async () => {
+      const [requestOwnerFailures, producerFailures] = await Promise.all([requestOwnerShutdown, producerShutdown]);
+      const failures: unknown[] = ([
+        requestOwnerFailures[0],
+        voiceAdmissionFailure,
+        ...requestOwnerFailures.slice(1),
+        ...producerFailures
+      ] as unknown[]).filter((failure) => failure !== undefined);
+      const automationFailures: unknown[] = [];
+      try {
+        services.automation?.beginShutdown();
+      } catch (error) {
+        automationFailures.push(error);
+      }
+      automationFailures.push(...await settleDisposers([() => services.automation?.dispose()]));
+      failures.push(...automationFailures);
+      failures.push(...await settleDisposers([() => disposePersistenceNotifications()]));
+      failures.push(...await sourceShutdown);
+      if (failures.length > 0) {
+        throw new AggregateError(failures, "One or more server services failed to stop.");
+      }
+    })();
+    return shutdownPromise;
+  };
+
+  app.addHook("preClose", shutdown);
+  app.addHook("onClose", shutdown);
 
   app.addContentTypeParser(/^audio\/.*/, { parseAs: "buffer", bodyLimit: config.voiceAudioUploadMaxBytes }, (_request, body, done) => {
     done(null, body);
@@ -198,6 +258,25 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     port: config.port,
     plugins: services.plugins.list().map((plugin) => plugin.id)
   }));
+
+  app.get("/api/ready", async (_request, reply) => {
+    try {
+      const [, documentation] = await Promise.all([
+        fs.promises.access(config.dataDir, fs.constants.R_OK | fs.constants.W_OK),
+        services.documentation?.health(),
+        services.asr.ready(),
+        services.automation?.ready(),
+        services.pluginContributionsReady
+      ]);
+      if (documentation && documentation.ready !== true) {
+        throw new Error("Documentation archive is not ready.");
+      }
+      return { status: "ready" };
+    } catch (error) {
+      app.log.warn({ dependencyError: error instanceof Error ? error.name : "unknown" }, "Cloudx readiness check failed.");
+      return reply.code(503).send({ status: "not-ready" });
+    }
+  });
 
   app.get("/api/plugins", async () => ({ plugins: services.plugins.list() }));
 
@@ -359,36 +438,9 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
 
   app.post<{ Params: { templateId: string }; Body: unknown }>("/api/layout-templates/:templateId/apply", async (request, reply) => {
     const body = applyLayoutTemplateBody(request.body);
-    const prepared = await services.workspace!.prepareTemplateWindow(request.params.templateId, body);
-    const tabIdMap = new Map<string, string>();
-    const createdTabIds: string[] = [];
-    const replacedTabIds = prepared.createdWindow ? [] : services.workspace!.tabIdsForWindow(prepared.window.id);
-    try {
-      for (const templateTab of prepared.template.tabs) {
-        const tabInput = services.workspace!.tabInputForTemplate(templateTab, prepared.projectPath);
-        const tab = await services.sessions.createTab({ pluginId: tabInput.pluginId, cwd: tabInput.cwd, title: tabInput.title, initialInput: tabInput.initialInput, windowId: prepared.window.id });
-        tabIdMap.set(templateTab.id, tab.id);
-        createdTabIds.push(tab.id);
-      }
-      const layout = services.workspace!.remapTemplateLayout(prepared.template, tabIdMap);
-      const window = await services.workspace!.finishTemplateWindow(prepared.window.id, layout, {
-        defaultCwd: prepared.projectPath,
-        ...(body.name ? { name: body.name } : {})
-      });
-      for (const tabId of replacedTabIds) {
-        services.sessions.closeTab(tabId);
-      }
-      reply.code(201);
-      return { window, workspace: await workspaceState(services) };
-    } catch (error) {
-      for (const tabId of createdTabIds) {
-        services.sessions.closeTab(tabId);
-      }
-      if (prepared.createdWindow) {
-        await services.workspace!.deleteWindow(prepared.window.id);
-      }
-      throw error;
-    }
+    const result = await services.workspaceCommands!.applyLayoutTemplate(request.params.templateId, body);
+    reply.code(201);
+    return { window: result.window, workspace: await workspaceState(services) };
   });
 
   app.patch<{ Params: { templateId: string }; Body: unknown }>("/api/layout-templates/:templateId", async (request) => {
@@ -402,9 +454,24 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   });
 
   app.post<{ Body: CreateTabRequest }>("/api/tabs", async (request, reply) => {
-    const tab = await services.sessions.createTab(createTabBody(request.body));
+    const result = await services.workspaceCommands!.createTab(createTabBody(request.body));
     reply.code(201);
-    return { tab };
+    return result;
+  });
+
+  app.get("/api/codex/state-sources", async (request, reply) => {
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    request.raw.once("aborted", abort);
+    reply.raw.once("close", abort);
+    try {
+      return await services.codexStateSources!.list(controller.signal);
+    } catch {
+      return reply.code(503).send({ error: "Codex session source inventory is unavailable." });
+    } finally {
+      request.raw.off("aborted", abort);
+      reply.raw.off("close", abort);
+    }
   });
 
   app.post<{ Params: { tabId: string } }>("/api/tabs/:tabId/active", async (request) => {
@@ -449,48 +516,61 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     Querystring: { filename?: string; title?: string; sourceType?: string; collection?: string; acceptGeneratedCodeDocumentation?: string; retainRawCodeArtifacts?: string };
     Body: NodeJS.ReadableStream;
   }>("/api/documentation/upload", async (request) => {
-    const contentLength = parseContentLength(request.headers["content-length"]);
-    if (contentLength !== undefined && contentLength > config.documentationUploadMaxBytes) {
-      throw new FileUploadTooLargeError(config.documentationUploadMaxBytes);
-    }
     const filename = requiredQueryString(request.query.filename, "filename");
     const contentType = optionalHeaderString(request.headers["x-cloudx-file-content-type"]);
     const sourceType = optionalQueryString(request.query.sourceType);
     const acceptGeneratedCodeDocumentation = optionalQueryBoolean(request.query.acceptGeneratedCodeDocumentation, "acceptGeneratedCodeDocumentation");
     const retainRawCodeArtifacts = optionalQueryBoolean(request.query.retainRawCodeArtifacts, "retainRawCodeArtifacts");
-    const content = await readRequestBodyBuffer(request.body, config.documentationUploadMaxBytes);
     const title = optionalQueryString(request.query.title);
     const collection = optionalQueryString(request.query.collection);
-    return services.documentationIngestQueue!.enqueue({
-      kind: "upload",
-      label: title ?? filename,
-      detail: filename,
-      runningStage: "Forwarding uploaded file to the documentation indexer.",
-      operation: async (job) => {
-        job.update({ progress: 25, stage: "Indexer is extracting source evidence from the uploaded file." });
-        const result = await services.documentation!.ingestUpload({
-          filename,
-          content,
-          contentType,
-          title,
-          sourceType,
-          collection,
-          ...(acceptGeneratedCodeDocumentation !== undefined ? { acceptGeneratedCodeDocumentation } : {}),
-          ...(retainRawCodeArtifacts !== undefined ? { retainRawCodeArtifacts } : {})
-        });
-        job.update({ progress: 78, stage: "Running AI enrichment for the imported documentation." });
-        const enriched = await (services.documentationEnrichment?.enrichIngestResponse(result, {
-          filename,
-          content,
-          contentType,
-          sourceType,
-          ...(acceptGeneratedCodeDocumentation !== undefined ? { acceptGeneratedCodeDocumentation } : {}),
-          ...(retainRawCodeArtifacts !== undefined ? { retainRawCodeArtifacts } : {})
-        }) ?? result);
-        job.update({ progress: 92, stage: "Finalizing documentation import." });
-        return enriched;
-      }
-    });
+    const contentLength = requiredUploadContentLength(request.headers["content-length"], config.documentationUploadMaxBytes);
+    const admission = services.documentationIngestQueue!.reserve(contentLength);
+    let upload: DocumentationUploadSpool | undefined;
+    try {
+      upload = await admission.runBeforeEnqueue((signal) => spoolDocumentationUpload(
+        request.body,
+        documentationSpoolRoot(config),
+        contentLength,
+        config.documentationUploadMaxBytes,
+        { signal }
+      ));
+      return await services.documentationIngestQueue!.enqueueReserved({
+        kind: "upload",
+        label: title ?? filename,
+        admissionBytes: contentLength,
+        detail: filename,
+        runningStage: "Forwarding uploaded file to the documentation indexer.",
+        operation: async (job) => {
+          job.update({ progress: 25, stage: "Indexer is extracting source evidence from the uploaded file." });
+          const result = await services.documentation!.ingestUploadFile({
+            filename,
+            path: upload!.path,
+            contentType,
+            title,
+            sourceType,
+            collection,
+            ...(acceptGeneratedCodeDocumentation !== undefined ? { acceptGeneratedCodeDocumentation } : {}),
+            ...(retainRawCodeArtifacts !== undefined ? { retainRawCodeArtifacts } : {})
+          }, { signal: job.signal });
+          job.update({ progress: 78, stage: "Running AI enrichment for the imported documentation." });
+          job.signal.throwIfAborted();
+          const enriched = await (services.documentationEnrichment?.enrichIngestResponse(result, {
+            filename,
+            contentPath: upload!.path,
+            contentType,
+            sourceType,
+            ...(acceptGeneratedCodeDocumentation !== undefined ? { acceptGeneratedCodeDocumentation } : {}),
+            ...(retainRawCodeArtifacts !== undefined ? { retainRawCodeArtifacts } : {})
+          }, { signal: job.signal }) ?? result);
+          job.signal.throwIfAborted();
+          job.update({ progress: 92, stage: "Finalizing documentation import." });
+          return enriched;
+        }
+      }, admission);
+    } finally {
+      admission.release();
+      await upload?.dispose();
+    }
   });
 
   app.get("/api/documentation/archive/export", async (_request, reply) => {
@@ -519,26 +599,34 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     if (mode !== "replace" && mode !== "merge") {
       throwBadRequest("Archive import mode must be replace or merge.");
     }
-    const contentLength = parseContentLength(request.headers["content-length"]);
-    if (contentLength !== undefined && contentLength > config.documentationUploadMaxBytes) {
-      throw new FileUploadTooLargeError(config.documentationUploadMaxBytes);
-    }
     const filename = optionalQueryString(request.query.filename) ?? "documentation-archive.zip";
     const contentType = optionalHeaderString(request.headers["x-cloudx-file-content-type"]) ?? optionalHeaderString(request.headers["content-type"]);
-    const content = await readRequestBodyBuffer(request.body, config.documentationUploadMaxBytes);
-    if (mode === "replace") {
-      return services.documentation!.importArchiveReplaceUpload({
-        filename,
-        content,
-        contentType,
-        confirmation: requiredQueryString(request.query.confirmation, "confirmation")
-      });
+    const confirmation = mode === "replace" ? requiredQueryString(request.query.confirmation, "confirmation") : undefined;
+    const contentLength = requiredUploadContentLength(request.headers["content-length"], config.documentationUploadMaxBytes);
+    const admission = services.documentationIngestQueue!.reserve(contentLength);
+    let upload: DocumentationUploadSpool | undefined;
+    try {
+      upload = await admission.runBeforeEnqueue((signal) => spoolDocumentationUpload(
+        request.body,
+        documentationSpoolRoot(config),
+        contentLength,
+        config.documentationUploadMaxBytes,
+        { signal }
+      ));
+      return await services.documentationIngestQueue!.enqueueReserved({
+        kind: "upload",
+        label: filename,
+        admissionBytes: contentLength,
+        detail: `${mode} documentation archive`,
+        runningStage: "Forwarding documentation archive to the indexer.",
+        operation: (job) => mode === "replace"
+          ? services.documentation!.importArchiveReplaceFile({ filename, path: upload!.path, contentType, confirmation }, { signal: job.signal })
+          : services.documentation!.importArchiveMergeFile({ filename, path: upload!.path, contentType }, { signal: job.signal })
+      }, admission);
+    } finally {
+      admission.release();
+      await upload?.dispose();
     }
-    return services.documentation!.importArchiveMergeUpload({
-      filename,
-      content,
-      contentType
-    });
   });
 
   app.get<{
@@ -676,7 +764,8 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
         voiceRequestId,
         accepted: result.accepted,
         actionCount: result.plan.actions.length,
-        failedCount: result.results.filter((actionResult) => !actionResult.ok).length
+        failedCount: result.results.filter((actionResult) => actionResult.status === "failed").length,
+        skippedCount: result.results.filter((actionResult) => actionResult.status === "skipped").length
       },
       "manual voice transcript completed"
     );
@@ -838,7 +927,8 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
             durationMs: Date.now() - startedAt,
             accepted: result.accepted,
             actionCount: result.plan.actions.length,
-            failedCount: result.results.filter((actionResult) => !actionResult.ok).length
+            failedCount: result.results.filter((actionResult) => actionResult.status === "failed").length,
+            skippedCount: result.results.filter((actionResult) => actionResult.status === "skipped").length
           },
           "voice audio websocket completed"
         );
@@ -1004,25 +1094,27 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       closeWebSocketSafely(ws, 1008, "Unknown terminal tab.");
       return;
     }
-    const failSend = (error: Error) => {
-      request.log.debug({ tabId, err: serializeError(error) }, "terminal websocket send failed");
-      closeWebSocketSafely(ws, 1011, "Terminal websocket send failed.");
-    };
-    const snapshot = session.snapshot();
-    if (snapshot.recentOutput) {
-      sendWebSocketJson(ws, { type: "data", data: snapshot.recentOutput }, failSend);
-    }
-    const dispose = session.onData?.((data) => {
-      sendWebSocketJson(ws, { type: "data", data }, failSend);
-    });
     let disposed = false;
+    let disposeData: (() => void) | undefined;
     const cleanup = () => {
       if (disposed) {
         return;
       }
       disposed = true;
-      dispose?.();
+      sender.invalidate();
+      const currentDispose = disposeData;
+      disposeData = undefined;
+      currentDispose?.();
     };
+    const failSend = (error: Error) => {
+      if (disposed) {
+        return;
+      }
+      request.log.debug({ tabId, err: serializeError(error) }, "terminal websocket send failed");
+      cleanup();
+      closeWebSocketSafely(ws, 1011, "Terminal websocket send failed.");
+    };
+    const sender = new TerminalWebSocketSender(ws, config.terminalReplayBytes, failSend);
 
     ws.on("message", (raw, isBinary) => {
       const message = parseTerminalControlMessage(raw, isBinary);
@@ -1040,6 +1132,21 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     });
     ws.on("close", cleanup);
     ws.on("error", cleanup);
+
+    const snapshot = session.snapshot();
+    if (!sender.sendReplay(snapshot.recentOutput ?? "") || disposed) {
+      return;
+    }
+    const registeredDispose = session.onData?.((data) => {
+      sender.sendLive(data);
+    });
+    if (registeredDispose) {
+      if (disposed) {
+        registeredDispose();
+      } else {
+        disposeData = registeredDispose;
+      }
+    }
   });
 
   if (fs.existsSync(config.webDistDir)) {
@@ -1065,6 +1172,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   const pathPolicy = new PathPolicy(config.allowedRoots);
   const workspace = new WorkspaceLayoutStore(config.dataDir, pathPolicy);
   const terminalFactory = new NodePtyTerminalProcessFactory();
+  const codexStateSources = new CodexStateSources(config.dataDir);
   const pluginData = new PluginDataStore(config.dataDir);
   const installedPlugins = new InstalledPluginService(config.dataDir, { logger });
   const rulesSkills = new RulesSkillsCatalogService(config.dataDir);
@@ -1078,12 +1186,12 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   process.env.CLOUDX_SERVER_URL ??= `${config.https ? "https" : "http"}://127.0.0.1:${config.port}`;
   let sessions: SessionStore | undefined;
   let documentationEnrichment: DocumentationEnrichmentService | undefined;
-  plugins.register(new CodexTerminalPlugin(terminalFactory, config.terminalReplayBytes, config.dataDir));
+  plugins.register(new CodexTerminalPlugin(terminalFactory, config.terminalReplayBytes, config.dataDir, codexStateSources));
   plugins.register(new StandardTerminalPlugin(terminalFactory, config.terminalReplayBytes));
   plugins.register(new FileBrowserPlugin(pathPolicy));
   plugins.register(new LocalWebPlugin());
   plugins.register(new DocumentationPlugin(documentation, pathPolicy, documentationIngestQueue, () => documentationEnrichment));
-  plugins.register(new WorktreeManagerPlugin());
+  plugins.register(new WorktreeManagerPlugin(new WorktreeService(pathPolicy)));
   plugins.register(new WorkspaceControlPlugin());
   let jira: JiraIntegrationService | undefined;
   let jiraPolling: JiraPollingService | undefined;
@@ -1116,7 +1224,10 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   }
   const configService = new ConfigService(config.dataDir, () => plugins.list(), { voiceModel: config.voiceModel });
   jira = new JiraIntegrationService(configService);
-  sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir), configService, workspace, rulesSkills);
+  sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir), configService, workspace, rulesSkills, (error, details) => {
+    logger?.error({ err: serializeError(error), ...details }, "session background operation failed");
+  });
+  const workspaceCommands = new WorkspaceCommandService(sessions, workspace);
   rulesSkills.onChange(() => {
     void (async () => {
       await sessions?.refreshRuntimeIndicators();
@@ -1153,7 +1264,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     { includeText: config.voiceDebugTranscripts ?? false }
   );
   const fileTransfer = new FileTransferService(pathPolicy);
-  const hooks = buildHookRegistry({ plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, fileTransfer });
+  const hooks = buildHookRegistry({ plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, fileTransfer });
   sessions.setHookRegistry(hooks);
   const automationRepository = new AutomationRepository(config.dataDir);
   const triggers = new TriggerRegistry({ recordEvent: (event) => automationRepository.appendTriggerEvent(event) });
@@ -1161,8 +1272,8 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   sessions.setTriggerRegistry(triggers);
   jiraPolling = new JiraPollingService(jira, pluginData, () => triggers);
   jiraPolling.start();
-  automation = createAutomationService(automationRepository, { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config);
-  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, pluginContributionsReady };
+  automation = createAutomationService(automationRepository, { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config);
+  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, pluginContributionsReady, codexStateSources };
 }
 
 function isStreamingHookRequest(request: FastifyRequest<{ Querystring: { stream?: string } }>): boolean {
@@ -1267,27 +1378,27 @@ export function serializeRequestForLog(request: Pick<FastifyRequest, "method" | 
   };
 }
 
-export function isAllowedWebSocketOrigin(originHeader: string | string[] | undefined, hostHeader: string | string[] | undefined): boolean {
-  const originValue = singleHeaderValue(originHeader);
-  if (originHeader !== undefined && !originValue) {
-    return false;
+function isTrustedRequest(rawHeaders: string[], trustedOrigins: Set<string>, trustedAuthorities: Set<string>): boolean {
+  const hosts = rawHeaderValues(rawHeaders, "host");
+  const origins = rawHeaderValues(rawHeaders, "origin");
+  return hosts.length === 1
+    && trustedAuthorities.has(hosts[0]!)
+    && origins.length <= 1
+    && (origins.length === 0 || trustedOrigins.has(origins[0]!));
+}
+
+function rawHeaderValues(rawHeaders: string[], name: string): string[] {
+  const values: string[] = [];
+  for (let index = 0; index < rawHeaders.length; index += 2) {
+    if (rawHeaders[index]?.toLowerCase() === name) values.push(rawHeaders[index + 1] ?? "");
   }
-  if (!originValue) {
-    return true;
-  }
-  const hostValue = singleHeaderValue(hostHeader);
-  if (!hostValue) {
-    return false;
-  }
-  try {
-    const origin = new URL(originValue.trim());
-    if (origin.protocol !== "http:" && origin.protocol !== "https:") {
-      return false;
-    }
-    return normalizedHost(origin.host) === normalizedHost(hostValue);
-  } catch {
-    return false;
-  }
+  return values;
+}
+
+function trustedOriginAuthorities(origin: string): string[] {
+  const parsed = new URL(origin);
+  const explicitDefaultPort = parsed.protocol === "https:" ? "443" : "80";
+  return parsed.port ? [parsed.host] : [parsed.host, `${parsed.hostname}:${explicitDefaultPort}`];
 }
 
 function buildHookRegistry(services: AppServices): HookRegistry {
@@ -1296,7 +1407,8 @@ function buildHookRegistry(services: AppServices): HookRegistry {
     sessions: services.sessions,
     plugins: services.plugins,
     pathPolicy: services.pathPolicy,
-    workspace: services.workspace!
+    workspace: services.workspace!,
+    workspaceCommands: services.workspaceCommands!
   });
   const pluginValues = typeof services.plugins.values === "function" ? services.plugins.values() : [];
   for (const plugin of pluginValues) {
@@ -1346,8 +1458,19 @@ function bindPersistenceNotifications(services: AppServices): () => void {
     services.automation?.onPersistenceStatusChange((status) => notifyPersistenceStatus(services, status))
   ].filter((dispose): dispose is () => void => Boolean(dispose));
   return () => {
+    const failures: unknown[] = [];
     for (const dispose of disposers) {
-      dispose();
+      try {
+        dispose();
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length === 1) {
+      throw failures[0];
+    }
+    if (failures.length > 1) {
+      throw new AggregateError(failures, "One or more persistence notification listeners failed to unsubscribe.");
     }
   };
 }
@@ -1555,9 +1678,22 @@ function createTabBody(body: unknown): CreateTabRequest {
     title: optionalBodyString(payload.title, "title"),
     createDirectory: optionalBodyBoolean(payload.createDirectory, "createDirectory"),
     initialInput: optionalBodyRecord(payload.initialInput, "initialInput"),
-    windowId: optionalBodyString(payload.windowId, "windowId"),
+    windowId: requiredTrimmedBodyString(payload.windowId, "windowId"),
+    paneId: requiredTrimmedBodyString(payload.paneId, "paneId"),
+    newPane: optionalBodyBoolean(payload.newPane, "newPane"),
+    splitDirection: optionalTabLayoutDirection(payload.splitDirection),
     pluginMetadata: optionalBodyRecord(payload.pluginMetadata, "pluginMetadata") as CreateTabRequest["pluginMetadata"] | undefined
   };
+}
+
+function optionalTabLayoutDirection(value: unknown): CreateTabRequest["splitDirection"] {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === "row" || value === "column") {
+    return value;
+  }
+  throwBadRequest("splitDirection must be row or column.");
 }
 
 function pluginGithubInstallBody(body: unknown): { url: string } {
@@ -1778,33 +1914,161 @@ function parseWebSocketProtocols(value: string | string[] | undefined): string[]
   return protocols?.length ? protocols : undefined;
 }
 
-function verifyWebSocketClient(info: { req: { headers: IncomingHttpHeaders } }, done: (verified: boolean, code?: number, message?: string) => void): void {
-  if (isAllowedWebSocketOrigin(info.req.headers.origin, info.req.headers.host)) {
-    done(true);
-    return;
+export function terminalReplaySerializedByteLimit(rawByteLimit: number): number {
+  if (!Number.isSafeInteger(rawByteLimit) || rawByteLimit < 0) {
+    throw new Error("Terminal replay raw byte limit must be a non-negative safe integer.");
   }
-  done(false, 403, "Forbidden");
-}
-
-function singleHeaderValue(value: string | string[] | undefined): string | undefined {
-  if (Array.isArray(value)) {
-    return value.length === 1 ? value[0] : undefined;
+  const escapedByteLimit = rawByteLimit * TERMINAL_REPLAY_JSON_ESCAPE_MULTIPLIER;
+  const serializedByteLimit = escapedByteLimit + TERMINAL_DATA_MESSAGE_ENVELOPE_BYTES;
+  if (!Number.isSafeInteger(escapedByteLimit) || !Number.isSafeInteger(serializedByteLimit)) {
+    throw new Error("Terminal replay serialized byte limit exceeds safe integer capacity.");
   }
-  return value;
+  terminalFrameWireBytes(serializedByteLimit);
+  return serializedByteLimit;
 }
 
-function normalizedHost(value: string): string {
-  return value.trim().toLowerCase().replace(/\.$/, "");
+function terminalFrameWireBytes(payloadBytes: number): number {
+  // The terminal route sends single, unmasked text frames with compression disabled.
+  const headerBytes = payloadBytes <= 125 ? 2 : payloadBytes <= 65_535 ? 4 : 10;
+  const wireBytes = payloadBytes + headerBytes;
+  if (!Number.isSafeInteger(wireBytes)) {
+    throw new Error("Terminal websocket frame exceeds safe integer capacity.");
+  }
+  return wireBytes;
 }
 
-function sendWebSocketJson(ws: WebSocket, payload: unknown, onError: (error: Error) => void): boolean {
+export class TerminalWebSocketSender {
+  private replayState: "available" | "pending" | "settled" | "invalidated" = "available";
+  private replayDebt = 0;
+  private pendingLiveBytes = 0;
+
+  constructor(
+    private readonly ws: WebSocket,
+    private readonly rawReplayByteLimit: number,
+    private readonly onError: (error: Error) => void,
+  ) {}
+
+  invalidate(): void {
+    this.replayState = "invalidated";
+    this.replayDebt = 0;
+    this.pendingLiveBytes = 0;
+  }
+
+  sendReplay(data: string): boolean {
+    if (this.replayState !== "available") {
+      return false;
+    }
+    this.replayState = "pending";
+    return this.send(data, true);
+  }
+
+  sendLive(data: string): boolean {
+    return this.send(data, false);
+  }
+
+  private isInvalidated(): boolean {
+    return this.replayState === "invalidated";
+  }
+
+  private fail(error: unknown): void {
+    if (this.replayState === "invalidated") {
+      return;
+    }
+    this.invalidate();
+    this.onError(error instanceof Error ? error : new Error(String(error)));
+  }
+
+  private send(data: string, replay: boolean): boolean {
+    if (this.replayState === "invalidated") {
+      return false;
+    }
+    // Each completion owns only its reservation. Duplicate or late callbacks
+    // cannot settle another send or revive a disconnected connection.
+    let pending = true;
+    let wireBytes = 0;
+    const complete = (error?: Error) => {
+      if (!pending || this.replayState === "invalidated") {
+        return;
+      }
+      pending = false;
+      if (error) {
+        this.fail(error);
+      } else if (replay) {
+        this.replayState = "settled";
+        this.replayDebt = 0;
+      } else {
+        this.pendingLiveBytes -= wireBytes;
+      }
+    };
+    try {
+      if (this.ws.readyState !== WS_OPEN) {
+        throw new Error("Terminal websocket is not open.");
+      }
+      const limit = replay ? terminalReplaySerializedByteLimit(this.rawReplayByteLimit) : TERMINAL_WS_MAX_BUFFERED_BYTES;
+      if (replay && Buffer.byteLength(data, "utf8") > this.rawReplayByteLimit) {
+        throw new Error(`Terminal replay raw output exceeded the ${this.rawReplayByteLimit} byte limit.`);
+      }
+      if (replay && !data) {
+        complete();
+        return true;
+      }
+      const serialized = JSON.stringify({ type: "data", data });
+      const payloadBytes = Buffer.byteLength(serialized, "utf8");
+      wireBytes = terminalFrameWireBytes(payloadBytes);
+      const bufferedBefore = this.ws.bufferedAmount;
+      this.replayDebt = Math.min(this.replayDebt, bufferedBefore);
+      // Live reservations include frame headers and remain until completion,
+      // so a delayed replay callback cannot conceal drained replay/live bytes.
+      const pendingBytes = replay ? bufferedBefore : Math.max(this.pendingLiveBytes, bufferedBefore - this.replayDebt);
+      if (payloadBytes > limit || pendingBytes + payloadBytes > limit) {
+        throw new Error(`Terminal websocket ${replay ? "replay" : "buffered"} output exceeded the ${limit} byte limit.`);
+      }
+      if (!replay) {
+        this.pendingLiveBytes += wireBytes;
+      }
+      this.ws.send(serialized, complete);
+      if (replay && pending && this.replayState === "pending") {
+        // Credit only bytes observed from this actual replay send, never its
+        // configured ceiling. A synchronous completion installs no debt.
+        this.replayDebt = Math.min(wireBytes, Math.max(0, this.ws.bufferedAmount - bufferedBefore));
+      }
+      return !this.isInvalidated();
+    } catch (error) {
+      if (pending) {
+        pending = false;
+        this.fail(error);
+      }
+      return false;
+    }
+  }
+}
+
+function sendWebSocketJson(
+  ws: WebSocket,
+  payload: unknown,
+  onError: (error: Error) => void,
+  maxBufferedBytes = Number.POSITIVE_INFINITY,
+  label = "Websocket output",
+  onComplete?: () => void,
+): boolean {
   if (ws.readyState !== WS_OPEN) {
     return false;
   }
   try {
-    ws.send(JSON.stringify(payload), (error) => {
+    const serialized = JSON.stringify(payload);
+    if (ws.bufferedAmount + Buffer.byteLength(serialized, "utf8") > maxBufferedBytes) {
+      onError(new Error(`${label} exceeded the ${maxBufferedBytes} byte limit.`));
+      return false;
+    }
+    ws.send(serialized, (error) => {
       if (error) {
         onError(error);
+        return;
+      }
+      try {
+        onComplete?.();
+      } catch (completionError) {
+        onError(completionError instanceof Error ? completionError : new Error(String(completionError)));
       }
     });
     return true;
@@ -1876,20 +2140,6 @@ function rawDataByteLength(raw: RawData): number {
   return raw.byteLength;
 }
 
-async function readRequestBodyBuffer(body: NodeJS.ReadableStream, maxBytes: number): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for await (const chunk of body as AsyncIterable<Buffer | Uint8Array | string>) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    total += buffer.byteLength;
-    if (total > maxBytes) {
-      throw new FileUploadTooLargeError(maxBytes);
-    }
-    chunks.push(buffer);
-  }
-  return Buffer.concat(chunks, total);
-}
-
 function parseContentLength(value: string | string[] | undefined): number | undefined {
   const rawValue = Array.isArray(value) ? value[0] : value;
   if (rawValue === undefined) {
@@ -1897,6 +2147,33 @@ function parseContentLength(value: string | string[] | undefined): number | unde
   }
   const contentLength = Number(rawValue);
   return Number.isFinite(contentLength) && contentLength >= 0 ? contentLength : undefined;
+}
+
+function requiredUploadContentLength(value: string | string[] | undefined, maxBytes: number): number {
+  const contentLength = parseContentLength(value);
+  if (contentLength === undefined) {
+    throwHttpError(411, "Documentation uploads require a valid Content-Length header.");
+  }
+  if (contentLength > maxBytes) {
+    throw new FileUploadTooLargeError(maxBytes);
+  }
+  return contentLength;
+}
+
+function documentationSpoolRoot(config: AppConfig): string {
+  return path.join(config.dataDir, "upload-spool");
+}
+
+async function settleDisposers(disposers: Array<() => unknown>): Promise<unknown[]> {
+  const executions = disposers.map((dispose) => {
+    try {
+      return Promise.resolve(dispose());
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  });
+  const results = await Promise.allSettled(executions);
+  return results.filter((result): result is PromiseRejectedResult => result.status === "rejected").map((result) => result.reason);
 }
 
 function requiredQueryString(value: unknown, field: string): string {

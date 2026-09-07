@@ -1,10 +1,49 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RULES_SKILLS_PLUGIN_ID, type PluginDescriptor, type WorkspaceStateResponse } from "@cloudx/shared";
 
-import { codexTabInitialInput, degradedPersistenceStatuses, loadAudioInputId, notificationToastIdsAfterDismiss, persistAudioInputId, persistenceWarningLabel, persistenceWarningTitle, requestAudioInputEnumerationAccess, selectCreateTabPluginId, subscribeWorkspaceUpdates, voiceControlSettings, workspaceStateWithPreservedLayout } from "./App.js";
+import { codexTabInitialInput, commitPaneForTabCreation, degradedPersistenceStatuses, loadAudioInputId, notificationToastIdsAfterDismiss, persistAudioInputId, persistenceWarningLabel, persistenceWarningTitle, requestAudioInputEnumerationAccess, selectCreateTabPluginId, subscribeWorkspaceUpdates, voiceControlSettings, workspaceStateWithPreservedLayout } from "./App.js";
+import { defaultLayout, splitPane } from "./layout.js";
 import { pluginMetadataForTemplate, selectedTemplateId } from "./RulesSkillsPanel.js";
 import { collectUiContributions, selectTabIndicatorContribution } from "./uiContributions.js";
 import { parseWorkspaceSocketUpdate } from "./workspaceSocketUpdate.js";
+import { WorkspaceWriteCoordinator } from "./workspaceWriteCoordinator.js";
+
+describe("commitPaneForTabCreation", () => {
+  it.each([
+    { paneId: "pane-2", expectedMethods: ["PATCH", "POST"], expectedCommits: 0 },
+    { paneId: "pane-1", expectedMethods: ["PATCH", "PATCH", "POST"], expectedCommits: 1 }
+  ])("commits only a changed creation-pane selection for $paneId after the split is persisted", async ({ paneId, expectedMethods, expectedCommits }) => {
+    let current = splitPane(defaultLayout(), "row", () => "pane-2", () => "split-1");
+    const methods: string[] = [];
+    const persistedPaneIds: string[] = [];
+    const coordinator = new WorkspaceWriteCoordinator(async (_windowId, layout) => {
+      methods.push("PATCH");
+      persistedPaneIds.push(layout.activePaneId);
+    }, 60_000);
+    const commitLayout = vi.fn((layout: typeof current) => {
+      current = layout;
+      coordinator.scheduleLayout("window-1", layout);
+    });
+
+    try {
+      coordinator.scheduleLayout("window-1", current);
+      await coordinator.flush();
+      expect(methods).toEqual(["PATCH"]);
+
+      // Add's pointer-down and click both capture the pane after the split write finished.
+      commitPaneForTabCreation(current, paneId, commitLayout);
+      commitPaneForTabCreation(current, paneId, commitLayout);
+      await coordinator.run(async () => { methods.push("POST"); });
+
+      expect(methods).toEqual(expectedMethods);
+      expect(commitLayout).toHaveBeenCalledTimes(expectedCommits);
+      expect(current.activePaneId).toBe(paneId);
+      expect(persistedPaneIds.at(-1)).toBe(paneId);
+    } finally {
+      coordinator.dispose();
+    }
+  });
+});
 
 describe("requestAudioInputEnumerationAccess", () => {
   afterEach(() => {
@@ -489,16 +528,18 @@ describe("template metadata helpers", () => {
 
 describe("codexTabInitialInput", () => {
   it("omits resume input for fresh Codex tabs", () => {
-    expect(codexTabInitialInput("new", "", false, false)).toBeUndefined();
+    expect(codexTabInitialInput("new", "old-id", false, false, "legacy:YQ")).toBeUndefined();
   });
 
   it("builds resume input for last and exact Codex sessions", () => {
-    expect(codexTabInitialInput("last", "", true, true)).toEqual({
-      resume: { mode: "last", all: true, includeNonInteractive: true }
+    expect(codexTabInitialInput("last", "", true, true, "shared")).toEqual({
+      resume: { mode: "last", sourceId: "shared", all: true, includeNonInteractive: true }
     });
-    expect(codexTabInitialInput("session", " session-example ", false, false)).toEqual({
-      resume: { mode: "session", sessionId: "session-example" }
+    expect(codexTabInitialInput("session", " session-example ", false, false, "legacy:YQ")).toEqual({
+      resume: { mode: "session", sourceId: "legacy:YQ", sessionId: "session-example" }
     });
+    expect(codexTabInitialInput("picker", "ignored", false, false, "shared")).toEqual({ resume: { mode: "picker", sourceId: "shared", all: false, includeNonInteractive: false } });
+    expect(() => codexTabInitialInput("last", "", false, false, "")).toThrow(/source selection/);
   });
 });
 

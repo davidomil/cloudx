@@ -1770,7 +1770,7 @@ export function newAutomationGroup(name: string, id: string, now: string): Autom
     createdAt: now,
     updatedAt: now,
     graph: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodes: [],
       edges: [],
       variables: []

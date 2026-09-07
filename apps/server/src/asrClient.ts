@@ -1,3 +1,4 @@
+import { openAsBlob } from "node:fs";
 import WebSocket from "ws";
 
 export const DEFAULT_ASR_TIMEOUT_MS = 30_000;
@@ -39,6 +40,10 @@ export interface AsrClientOptions {
   responseMaxBytes?: number;
 }
 
+export interface AsrRequestOptions {
+  signal?: AbortSignal;
+}
+
 export class AsrClient {
   private readonly timeoutMs: number;
   private readonly responseMaxBytes: number;
@@ -51,18 +56,48 @@ export class AsrClient {
     this.responseMaxBytes = normalizePositiveByteLimit(options.responseMaxBytes ?? DEFAULT_ASR_RESPONSE_MAX_BYTES, "ASR response byte limit");
   }
 
-  async transcribe(audio: Buffer, filename: string): Promise<TranscriptionResult> {
-    const form = new FormData();
-    const audioBytes = audio.buffer.slice(audio.byteOffset, audio.byteOffset + audio.byteLength) as ArrayBuffer;
-    form.set("audio", new Blob([audioBytes]), filename);
-
+  async ready(): Promise<void> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const response = await fetch(this.httpUrl("/ready"), { signal: controller.signal });
+      if (!response.ok) {
+        throw new Error(`ASR readiness request failed with ${response.status}.`);
+      }
+      const body = await readAsrResponseJson(response, this.responseMaxBytes);
+      if (!body || typeof body !== "object" || Array.isArray(body) || (body as { status?: unknown }).status !== "ready") {
+        throw new Error("ASR readiness response is invalid.");
+      }
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new Error(`ASR readiness request timed out after ${this.timeoutMs} ms.`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async transcribe(audio: Buffer, filename: string, options: AsrRequestOptions = {}): Promise<TranscriptionResult> {
+    const audioBytes = audio.buffer.slice(audio.byteOffset, audio.byteOffset + audio.byteLength) as ArrayBuffer;
+    return this.transcribeBlob(new Blob([audioBytes]), filename, options.signal);
+  }
+
+  async transcribeFile(filePath: string, filename: string, options: AsrRequestOptions = {}): Promise<TranscriptionResult> {
+    options.signal?.throwIfAborted();
+    return this.transcribeBlob(await openAsBlob(filePath), filename, options.signal);
+  }
+
+  private async transcribeBlob(audio: Blob, filename: string, signal?: AbortSignal): Promise<TranscriptionResult> {
+    const form = new FormData();
+    form.set("audio", audio, filename);
+    const scope = createAsrRequestAbortScope(signal);
+    const timeout = setTimeout(() => scope.abortForTimeout(), this.timeoutMs);
     try {
       const response = await fetch(this.httpUrl("/transcribe"), {
         method: "POST",
         body: form,
-        signal: controller.signal
+        signal: scope.signal
       });
 
       if (!response.ok) {
@@ -72,12 +107,16 @@ export class AsrClient {
       const body = parseAsrHttpResponse(await readAsrResponseJson(response, this.responseMaxBytes));
       return body;
     } catch (error) {
-      if (controller.signal.aborted) {
+      if (signal?.aborted) {
+        throw asrAbortReason(signal, "ASR request was cancelled.");
+      }
+      if (scope.timedOut) {
         throw new Error(`ASR request timed out after ${this.timeoutMs} ms.`);
       }
       throw error;
     } finally {
       clearTimeout(timeout);
+      scope.dispose();
     }
   }
 
@@ -415,6 +454,39 @@ function appendUrlPath(basePathname: string, pathname: string): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function createAsrRequestAbortScope(external?: AbortSignal): {
+  readonly signal: AbortSignal;
+  readonly timedOut: boolean;
+  abortForTimeout(): void;
+  dispose(): void;
+} {
+  const controller = new AbortController();
+  let timedOut = false;
+  const abortFromExternal = () => controller.abort(external?.reason);
+  if (external?.aborted) {
+    abortFromExternal();
+  } else {
+    external?.addEventListener("abort", abortFromExternal, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    get timedOut() {
+      return timedOut;
+    },
+    abortForTimeout() {
+      timedOut = true;
+      controller.abort();
+    },
+    dispose() {
+      external?.removeEventListener("abort", abortFromExternal);
+    }
+  };
+}
+
+function asrAbortReason(signal: AbortSignal, message: string): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error(message);
 }
 
 function normalizeTimeoutMs(timeoutMs = DEFAULT_ASR_TIMEOUT_MS): number {

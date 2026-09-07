@@ -3,9 +3,11 @@
 ## Product Boundary
 
 CloudX is a local-first, single-developer workbench. It runs on the developer's
-Linux machine and exposes workstation capabilities to a browser over loopback.
-Remote access requires an authenticated reverse proxy whose backend connection
-also terminates on loopback. Direct LAN, tailnet, and public binds are
+Linux machine and exposes workstation capabilities to a browser over loopback
+by default. Remote access should use an authenticated reverse proxy whose
+backend connection also terminates on loopback. An explicit IPv4 wildcard bind
+is supported only with an exact trusted browser origin and a private, firewalled
+LAN; arbitrary interface, hostname, IPv6 wildcard, and public binds remain
 unsupported.
 
 Repository AI automation is outside the CloudX runtime. It consumes tracked
@@ -62,7 +64,8 @@ microphone data, credentials, and arbitrary developer commands. Maintain these
 constraints:
 
 - Loopback remains the default server bind.
-- Non-loopback product binds fail configuration validation.
+- The only accepted non-loopback bind is explicit `0.0.0.0`, which requires a
+  configured trusted browser origin and a private, firewalled LAN.
 - Allowed roots constrain file, Git, worktree, process cwd, and upload paths.
 - Secrets stay outside public configuration responses and logs.
 - Untrusted plugin repositories contribute validated metadata only; they do not

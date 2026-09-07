@@ -31,7 +31,11 @@ import type {
   WorkspaceStateResponse,
   WorkspaceTab
 } from "@cloudx/shared";
-import { parseVoiceActionPlan } from "@cloudx/shared";
+import { parseCodexStateSourcesResponse, parseCreateTabResponse, parseVoiceExecutionResult, type CodexStateSourcesResponse } from "@cloudx/shared";
+
+export async function getCodexStateSources(signal?: AbortSignal): Promise<CodexStateSourcesResponse> {
+  return parseCodexStateSourcesResponse(await fetchJson<unknown>("/api/codex/state-sources", { signal }));
+}
 
 export interface HealthResponse {
   status: string;
@@ -553,12 +557,13 @@ export async function deleteLayoutTemplate(templateId: string): Promise<{ templa
   return fetchJson(`/api/layout-templates/${encodeURIComponent(templateId)}`, { method: "DELETE" });
 }
 
-export async function createTab(input: CreateTabRequest): Promise<WorkspaceTab> {
-  const body = await fetchJson<CreateTabResponse>("/api/tabs", {
-    method: "POST",
-    body: JSON.stringify(input)
-  });
-  return body.tab;
+export async function createTab(input: CreateTabRequest): Promise<CreateTabResponse> {
+  return parseCreateTabResponse(
+    await fetchJson<unknown>("/api/tabs", {
+      method: "POST",
+      body: JSON.stringify(input)
+    })
+  );
 }
 
 export async function setActiveTab(tabId: string): Promise<void> {
@@ -588,10 +593,12 @@ export async function callHook<T extends Record<string, unknown> = Record<string
 export type VoiceClientContext = Record<string, unknown>;
 
 export async function submitTranscript(transcript: string, activeTabId?: string, clientContext?: VoiceClientContext): Promise<VoiceExecutionResult> {
-  return fetchJson("/api/voice/transcript", {
-    method: "POST",
-    body: JSON.stringify({ transcript, activeTabId, clientContext })
-  });
+  return parseVoiceExecutionResult(
+    await fetchJson<unknown>("/api/voice/transcript", {
+      method: "POST",
+      body: JSON.stringify({ transcript, activeTabId, clientContext })
+    })
+  );
 }
 
 export async function submitAudio(audio: Blob, activeTabId?: string): Promise<VoiceExecutionResult> {
@@ -610,7 +617,7 @@ export async function submitAudio(audio: Blob, activeTabId?: string): Promise<Vo
   if (!response.ok) {
     throw new Error(errorMessageFromResponse(await response.text(), response.status));
   }
-  return (await response.json()) as VoiceExecutionResult;
+  return parseVoiceExecutionResult(await response.json());
 }
 
 export interface VoiceAudioStatus {
@@ -883,8 +890,7 @@ function parseVoiceAudioStreamMessage(data: unknown):
     }
     const type = typeof parsed.type === "string" ? parsed.type : undefined;
     if (type === "result") {
-      const result = parseVoiceExecutionResult(parsed.result);
-      return result ? { type, result } : undefined;
+      return { type, result: parseVoiceExecutionResult(parsed.result) };
     }
     return {
       type,
@@ -896,49 +902,6 @@ function parseVoiceAudioStreamMessage(data: unknown):
   } catch {
     return undefined;
   }
-}
-
-function parseVoiceExecutionResult(value: unknown): VoiceExecutionResult | undefined {
-  if (!isRecord(value) || typeof value.accepted !== "boolean" || !Array.isArray(value.results)) {
-    return undefined;
-  }
-  try {
-    const plan = parseVoiceActionPlan(value.plan);
-    const results: VoiceExecutionResult["results"] = [];
-    for (const item of value.results) {
-      const result = parseVoiceActionResult(item);
-      if (!result) {
-        return undefined;
-      }
-      results.push(result);
-    }
-    return {
-      accepted: value.accepted,
-      plan,
-      results
-    };
-  } catch {
-    return undefined;
-  }
-}
-
-function parseVoiceActionResult(value: unknown): VoiceExecutionResult["results"][number] | undefined {
-  if (!isRecord(value) || typeof value.action !== "string" || !value.action.trim() || typeof value.ok !== "boolean") {
-    return undefined;
-  }
-  if ("targetTabId" in value && value.targetTabId !== undefined && typeof value.targetTabId !== "string") {
-    return undefined;
-  }
-  if ("message" in value && value.message !== undefined && typeof value.message !== "string") {
-    return undefined;
-  }
-  return {
-    action: value.action,
-    targetTabId: typeof value.targetTabId === "string" ? value.targetTabId : undefined,
-    ok: value.ok,
-    message: typeof value.message === "string" ? value.message : undefined,
-    result: value.result
-  };
 }
 
 function isVoiceAudioStatus(value: unknown): value is VoiceAudioStatus["status"] {

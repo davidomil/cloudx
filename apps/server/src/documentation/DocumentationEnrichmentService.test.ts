@@ -1,6 +1,9 @@
 import fs from "node:fs/promises";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { EventEmitter } from "node:events";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 
 import { describe, expect, it, vi } from "vitest";
 
@@ -8,6 +11,7 @@ import type { AsrClient } from "../asrClient.js";
 import type { ConfigService } from "../configService.js";
 import type { RulesSkillsCatalogService } from "../rulesSkills/RulesSkillsCatalogService.js";
 import type { DocumentationClient } from "./DocumentationClient.js";
+import { DocumentationIngestQueue } from "./DocumentationIngestQueue.js";
 import {
   DEFAULT_DOCUMENTATION_ENRICHMENT_SKILL_IDS,
   DEFAULT_DOCUMENTATION_IMAGE_ANALYSIS_MODEL,
@@ -713,6 +717,269 @@ describe("DocumentationEnrichmentService", () => {
     });
   });
 
+  it("propagates one cancellation signal through archive, ASR, media, and Codex enrichment", async () => {
+    const controller = new AbortController();
+    const stopped = new Error("documentation enrichment stopped");
+    const runner = fakeRunner({
+      summary: "media enriched",
+      spans: [{ locator: "ai:media:section", text: "Signal propagation evidence." }],
+      metadata: [],
+      warnings: []
+    });
+    const asr = fakeAsr("Signal propagation transcript.");
+    const client = fakeDocumentationClient({ source_type: "media" });
+    vi.mocked(client.enrichDocument).mockImplementation(async (_input, options) => {
+      expect(options?.signal).toBe(controller.signal);
+      controller.abort(stopped);
+      throw stopped;
+    });
+    const service = new DocumentationEnrichmentService({
+      client,
+      config: fakeConfig(true),
+      rulesSkills: fakeRulesSkills(),
+      runner,
+      asr
+    });
+
+    await expect(service.enrichIngestResponse(
+      { document: { documentId: "doc-1" } },
+      { filename: "demo.mp3", contentType: "audio/mpeg", sourceType: "media", content: Buffer.from("fake audio") },
+      { signal: controller.signal }
+    )).rejects.toBe(stopped);
+
+    expect(client.getDocument).toHaveBeenCalledWith(expect.any(Object), { signal: controller.signal });
+    expect(client.health).toHaveBeenCalledWith({ signal: controller.signal });
+    expect(asr.transcribe).toHaveBeenCalledWith(Buffer.from("fake audio"), "demo.mp3", { signal: controller.signal });
+    expect(runner.run).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ signal: controller.signal }));
+  });
+
+  it("keeps media process-group escalation alive when the leader exits before its descendant", async () => {
+    const toolDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-fake-ffmpeg-"));
+    const fakeFfmpeg = path.join(toolDir, "ffmpeg");
+    const startedPath = path.join(toolDir, "started.json");
+    const previousPath = process.env.PATH;
+    const previousStartedPath = process.env.CLOUDX_TEST_MEDIA_STARTED;
+    await fs.writeFile(fakeFfmpeg, [
+      "#!/usr/bin/env node",
+      "import fs from 'node:fs';",
+      "import path from 'node:path';",
+      "import { spawn } from 'node:child_process';",
+      "const outputPattern = process.argv.at(-1);",
+      "const outputDir = path.dirname(outputPattern);",
+      "fs.mkdirSync(outputDir, { recursive: true });",
+      "fs.writeFileSync(path.join(outputDir, 'frame-0001.jpg'), 'partial frame');",
+      "const descendant = spawn(process.execPath, ['-e', \"process.on('SIGTERM', () => {}); process.send('ready'); setInterval(() => {}, 1000)\"], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });",
+      "descendant.once('message', () => fs.writeFileSync(process.env.CLOUDX_TEST_MEDIA_STARTED, JSON.stringify({ parent: process.pid, descendant: descendant.pid, outputDir })));",
+      "setInterval(() => {}, 1000);"
+    ].join("\n"), "utf8");
+    await fs.chmod(fakeFfmpeg, 0o755);
+    process.env.PATH = `${toolDir}${path.delimiter}${previousPath ?? ""}`;
+    process.env.CLOUDX_TEST_MEDIA_STARTED = startedPath;
+    const controller = new AbortController();
+    const stopped = new Error("media enrichment stopped");
+    const runner = fakeRunner();
+    const service = new DocumentationEnrichmentService({
+      client: fakeDocumentationClient({ source_type: "media" }),
+      config: fakeConfig(true),
+      rulesSkills: fakeRulesSkills(),
+      runner,
+      asr: fakeAsr("Video transcript.")
+    });
+
+    try {
+      const enrichment = service.enrichIngestResponse(
+        { document: { documentId: "doc-1" } },
+        { filename: "demo.mp4", contentType: "video/mp4", sourceType: "media", content: Buffer.from("fake video") },
+        { signal: controller.signal }
+      );
+      const started = JSON.parse(await waitForFile(startedPath)) as { parent: number; descendant: number; outputDir: string };
+
+      controller.abort(stopped);
+      const rejected = expect(enrichment).rejects.toBe(stopped);
+
+      await waitUntil(() => !isProcessRunning(started.parent));
+      expect(isProcessRunning(started.descendant)).toBe(true);
+
+      await rejected;
+      expect(isProcessRunning(started.parent)).toBe(false);
+      expect(isProcessRunning(started.descendant)).toBe(false);
+      await expect(fs.stat(path.dirname(started.outputDir))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(runner.run).not.toHaveBeenCalled();
+    } finally {
+      process.env.PATH = previousPath;
+      if (previousStartedPath === undefined) {
+        delete process.env.CLOUDX_TEST_MEDIA_STARTED;
+      } else {
+        process.env.CLOUDX_TEST_MEDIA_STARTED = previousStartedPath;
+      }
+      await fs.rm(toolDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    {
+      name: "missing ffmpeg",
+      prepare: async (_directory: string) => undefined,
+    },
+    {
+      name: "non-executable ffmpeg",
+      prepare: async (directory: string) => {
+        await fs.writeFile(path.join(directory, "ffmpeg"), "#!/usr/bin/env node\n", { mode: 0o600 });
+      },
+    },
+  ])("settles $name promptly and releases queue capacity before the next job", async ({ prepare }) => {
+    const toolDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-ffmpeg-spawn-error-"));
+    const previousPath = process.env.PATH;
+    await prepare(toolDir);
+    process.env.PATH = toolDir;
+    const queue = new DocumentationIngestQueue({ maxJobs: 1, maxBytes: 16 });
+    const service = new DocumentationEnrichmentService({
+      client: fakeDocumentationClient({ source_type: "media" }),
+      config: fakeConfig(true),
+      rulesSkills: fakeRulesSkills(),
+      runner: fakeRunner(),
+      asr: fakeAsr("Video transcript."),
+    });
+    const job = queue.enqueue({
+      kind: "upload",
+      label: "Spawn-error media",
+      admissionBytes: 4,
+      operation: ({ signal }) => service.enrichIngestResponse(
+        { document: { documentId: "doc-1" } },
+        { filename: "demo.mp4", contentType: "video/mp4", sourceType: "media", content: Buffer.from("fake") },
+        { signal },
+      ),
+    });
+    const settled = job.then(
+      (value) => ({ status: "fulfilled" as const, value }),
+      (error) => ({ status: "rejected" as const, error }),
+    );
+
+    try {
+      const promptOutcome = await Promise.race([
+        settled,
+        new Promise<{ status: "pending" }>((resolve) => setTimeout(() => resolve({ status: "pending" }), 300)),
+      ]);
+      if (promptOutcome.status === "pending") {
+        await Promise.allSettled([settled, queue.dispose()]);
+      }
+
+      expect(promptOutcome.status).toBe("fulfilled");
+      if (promptOutcome.status === "fulfilled") {
+        expect(promptOutcome.value).toMatchObject({
+          enrichment: {
+            results: [expect.objectContaining({ status: "failed", error: expect.stringMatching(/ENOENT|EACCES/u) })],
+          },
+        });
+      }
+      expect(queue.list().capacity).toMatchObject({ admittedJobs: 0, admittedBytes: 0, reservedJobs: 0 });
+      await expect(queue.enqueue({
+        kind: "text",
+        label: "Subsequent valid job",
+        admissionBytes: 1,
+        operation: async () => ({ ok: true }),
+      })).resolves.toEqual({ ok: true });
+    } finally {
+      process.env.PATH = previousPath;
+      await queue.dispose().catch(() => undefined);
+      await fs.rm(toolDir, { recursive: true, force: true });
+    }
+  });
+
+  it("settles repeated pidless ffmpeg failures once and releases the next queue admission", async () => {
+    vi.useFakeTimers();
+    const processKill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill: vi.fn(() => true)
+    });
+    let outputFramePath = "";
+    let mediaStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      mediaStarted = resolve;
+    });
+    const mediaProcessLauncher = vi.fn((_command, args: readonly string[], _options) => {
+      outputFramePath = args.at(-1) ?? "";
+      mediaStarted();
+      return child as unknown as ChildProcessWithoutNullStreams;
+    });
+    const runner = fakeRunner();
+    const queue = new DocumentationIngestQueue({ maxJobs: 1, maxBytes: 16 });
+    const service = new DocumentationEnrichmentService({
+      client: fakeDocumentationClient({ source_type: "media" }),
+      config: fakeConfig(true),
+      rulesSkills: fakeRulesSkills(),
+      runner,
+      asr: fakeAsr("Video transcript."),
+      mediaProcessLauncher
+    });
+    const jobSettled = vi.fn();
+    const job = queue.enqueue({
+      kind: "upload",
+      label: "Repeated spawn-error media",
+      admissionBytes: 4,
+      operation: ({ signal }) => service.enrichIngestResponse(
+        { document: { documentId: "doc-1" } },
+        { filename: "demo.mp4", contentType: "video/mp4", sourceType: "media", content: Buffer.from("fake") },
+        { signal }
+      )
+    }).finally(jobSettled);
+
+    try {
+      await started;
+      expect(mediaProcessLauncher).toHaveBeenCalledWith(
+        "ffmpeg",
+        expect.arrayContaining(["-fps_mode", "vfr"]),
+        { detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] }
+      );
+      expect(outputFramePath).toMatch(/cloudx-doc-media-.*frames[/\\]frame-%04d\.jpg$/u);
+
+      const primaryError = new Error("ffmpeg primary spawn failure");
+      expect(child.listenerCount("error")).toBe(1);
+      expect(child.listenerCount("close")).toBe(1);
+      expect(() => child.emit("error", primaryError)).not.toThrow();
+      expect(child.listenerCount("error")).toBe(1);
+      expect(child.listenerCount("close")).toBe(1);
+      expect(() => child.emit("error", new Error("ffmpeg repeated spawn failure"))).not.toThrow();
+      expect(() => child.emit("close", null)).not.toThrow();
+      expect(child.listenerCount("close")).toBe(0);
+      expect(() => child.emit("close", null)).not.toThrow();
+
+      await expect(job).resolves.toMatchObject({
+        enrichment: {
+          results: [{ status: "failed", error: primaryError.message }]
+        }
+      });
+      expect(jobSettled).toHaveBeenCalledTimes(1);
+      expect(runner.run).not.toHaveBeenCalled();
+      expect(child.kill).not.toHaveBeenCalled();
+      expect(processKill).not.toHaveBeenCalled();
+      expect(child.listenerCount("error")).toBe(0);
+      expect(child.listenerCount("close")).toBe(0);
+      expect(child.stdout.listenerCount("data")).toBe(0);
+      expect(child.stdout.listenerCount("error")).toBe(0);
+      expect(child.stderr.listenerCount("data")).toBe(0);
+      expect(child.stderr.listenerCount("error")).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+      await expect(fs.stat(path.dirname(path.dirname(outputFramePath)))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(queue.list().capacity).toMatchObject({ admittedJobs: 0, admittedBytes: 0, reservedJobs: 0 });
+      await expect(queue.enqueue({
+        kind: "text",
+        label: "Subsequent valid job",
+        admissionBytes: 1,
+        operation: async () => ({ ok: true })
+      })).resolves.toEqual({ ok: true });
+    } finally {
+      if (child.listenerCount("close") > 0) {
+        child.emit("close", null);
+      }
+      await queue.dispose().catch(() => undefined);
+      processKill.mockRestore();
+      vi.useRealTimers();
+    }
+  }, 1_000);
+
   it("parses ffmpeg showinfo timestamps for scene-selected media frames", () => {
     expect(parseFfmpegShowinfoPtsTimes([
       "[Parsed_showinfo_2 @ 0x1] n:   0 pts:      0 pts_time:0 pos:123",
@@ -813,6 +1080,39 @@ function fakeRulesSkills(): RulesSkillsCatalogService {
       templates: []
     }))
   } as unknown as RulesSkillsCatalogService;
+}
+
+async function waitForFile(filePath: string): Promise<string> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      return await fs.readFile(filePath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  throw new Error(`Timed out waiting for ${filePath}.`);
+}
+
+async function waitUntil(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Timed out waiting for process state.");
+}
+
+function isProcessRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
 }
 
 function closedObjectSchemaIssues(value: unknown, pathParts: string[] = ["#"]): string[] {

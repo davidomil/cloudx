@@ -47,6 +47,22 @@ describe("JiraClient", () => {
     expect(authFetch).toHaveBeenCalledTimes(1);
     expect(rateLimitFetch).toHaveBeenCalledTimes(1);
   });
+
+  it("forwards the caller abort signal to Jira requests", async () => {
+    const controller = new AbortController();
+    const fetchImpl = vi.fn(async (_url: string, init?: RequestInit) => {
+      await new Promise<never>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+      });
+      return jsonResponse({});
+    });
+    const request = new JiraClient(validCredentials(), fetchImpl, controller.signal).myself();
+
+    controller.abort(new Error("CloudX is shutting down."));
+
+    await expect(request).rejects.toThrow("CloudX is shutting down.");
+    expect(fetchImpl).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ signal: controller.signal }));
+  });
 });
 
 function validCredentials() {

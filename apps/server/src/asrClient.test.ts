@@ -1,4 +1,7 @@
 import http from "node:http";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 import { WebSocketServer, type WebSocket } from "ws";
@@ -24,6 +27,27 @@ describe("AsrClient", () => {
           })
       )
     );
+  });
+
+  it("requires the ASR readiness endpoint to report ready", async () => {
+    const requests: string[] = [];
+    const { url } = await startAsrHttpServer((request, response) => {
+      requests.push(request.url ?? "");
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ status: "ready" }));
+    });
+
+    await expect(new AsrClient(`${url}/speech`).ready()).resolves.toBeUndefined();
+    expect(requests).toEqual(["/speech/ready"]);
+  });
+
+  it("fails readiness when the ASR backend is unavailable", async () => {
+    const { url } = await startAsrHttpServer((_request, response) => {
+      response.writeHead(503, { "content-type": "application/json" });
+      response.end(JSON.stringify({ detail: "backend path" }));
+    });
+
+    await expect(new AsrClient(url).ready()).rejects.toThrow("ASR readiness request failed with 503.");
   });
 
   it("times out slow HTTP transcription requests", async () => {
@@ -58,6 +82,57 @@ describe("AsrClient", () => {
 
     expect(result).toEqual({ text: "list directory", duration_seconds: 1.5, segments: [{ start_seconds: 0, end_seconds: 1.5, text: "list directory" }] });
     expect(requestUrl).toBe("/speech/transcribe?token=local");
+  });
+
+  it("streams a file-backed transcription upload", async () => {
+    let requestBody = Buffer.alloc(0);
+    const { url } = await startAsrHttpServer((request, response) => {
+      const chunks: Buffer[] = [];
+      request.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      request.on("end", () => {
+        requestBody = Buffer.concat(chunks);
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ text: "from file" }));
+      });
+    });
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-asr-file-"));
+    const filePath = path.join(directory, "voice.webm");
+    await fs.writeFile(filePath, "FILE-BACKED-AUDIO");
+
+    await expect(new AsrClient(url).transcribeFile(filePath, "voice.webm")).resolves.toMatchObject({ text: "from file" });
+    expect(requestBody.toString("utf8")).toContain("FILE-BACKED-AUDIO");
+  });
+
+  it("aborts an external file transcription and closes its request transport", async () => {
+    let markStarted!: () => void;
+    let markClosed!: () => void;
+    const requestStarted = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const transportClosed = new Promise<void>((resolve) => {
+      markClosed = resolve;
+    });
+    const { url } = await startAsrHttpServer((request, response) => {
+      response.once("close", markClosed);
+      request.resume();
+      request.once("end", () => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.write('{"text":');
+        markStarted();
+      });
+    });
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-asr-abort-file-"));
+    const filePath = path.join(directory, "voice.webm");
+    await fs.writeFile(filePath, Buffer.alloc(1024 * 1024, 7));
+    const controller = new AbortController();
+    const stopped = new Error("transcription stopped");
+    const transcription = new AsrClient(url).transcribeFile(filePath, "voice.webm", { signal: controller.signal });
+    await requestStarted;
+
+    controller.abort(stopped);
+
+    await expect(transcription).rejects.toBe(stopped);
+    await transportClosed;
   });
 
   it("rejects oversized HTTP transcription responses before JSON parsing", async () => {

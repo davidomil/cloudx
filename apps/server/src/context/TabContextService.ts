@@ -4,7 +4,7 @@ import { stripVTControlCharacters } from "node:util";
 
 import type { WorkspaceTab } from "@cloudx/shared";
 
-import { appendTextFileNoFollow, readTextFileNoFollow, requireRegularFile, requireSafeDirectory, writeNewTextFileNoFollow, writeTextFileAtomic } from "../jsonStateFile.js";
+import { appendTextFileNoFollow, openOwnedRegularFileNoFollow, openOwnedTextFileNoFollow, readTextFileNoFollow, requireRegularFile, requireSafeDirectory, writeTextFileAtomic } from "../jsonStateFile.js";
 import { isDirectChildPath } from "../pathBoundary.js";
 import { isCapacityStateWriteError } from "../statePersistence.js";
 
@@ -33,19 +33,21 @@ const SENSITIVE_URL_PARAM_NAMES = new Set([
 
 export interface TabContextFileOperations {
   appendTextFileNoFollow: typeof appendTextFileNoFollow;
+  openOwnedRegularFileNoFollow: typeof openOwnedRegularFileNoFollow;
+  openOwnedTextFileNoFollow: typeof openOwnedTextFileNoFollow;
   readTextFileNoFollow: typeof readTextFileNoFollow;
   requireRegularFile: typeof requireRegularFile;
   requireSafeDirectory: typeof requireSafeDirectory;
-  writeNewTextFileNoFollow: typeof writeNewTextFileNoFollow;
   writeTextFileAtomic: typeof writeTextFileAtomic;
 }
 
 const defaultFileOperations: TabContextFileOperations = {
   appendTextFileNoFollow,
+  openOwnedRegularFileNoFollow,
+  openOwnedTextFileNoFollow,
   readTextFileNoFollow,
   requireRegularFile,
   requireSafeDirectory,
-  writeNewTextFileNoFollow,
   writeTextFileAtomic
 };
 
@@ -60,12 +62,11 @@ export class TabContextService {
   }
 
   async create(tab: Pick<WorkspaceTab, "id" | "pluginId" | "title" | "cwd" | "status">): Promise<string | undefined> {
-    const contextPath = path.join(this.contextDir, `${tabContextFileStem(tab.id)}.md`);
+    const fileName = `${tabContextFileStem(tab.id)}.md`;
     return this.ignoreCapacityError(async () => {
-      await this.files.writeNewTextFileNoFollow(
-        this.dataRoot,
-        contextPath,
-        [
+      const owned = await this.files.openOwnedTextFileNoFollow(this.dataRoot, this.contextDir, fileName, "Tab context file");
+      try {
+        await owned.write([
           "# Cloudx Tab Context",
           "",
           `- tabId: ${tab.id}`,
@@ -76,10 +77,14 @@ export class TabContextService {
           "",
           "## Events",
           ""
-        ].join("\n"),
-        "Tab context file"
-      );
-      return contextPath;
+        ].join("\n"));
+        return owned.path;
+      } catch (error) {
+        await owned.unlink();
+        throw error;
+      } finally {
+        await owned.close();
+      }
     });
   }
 
@@ -111,6 +116,31 @@ export class TabContextService {
       }
       throw error;
     });
+  }
+
+  async delete(tab: Pick<WorkspaceTab, "contextPath">): Promise<void> {
+    if (!tab.contextPath) {
+      return;
+    }
+    const contextPath = path.resolve(tab.contextPath);
+    if (!isDirectChildPath(this.contextDir, contextPath)) {
+      throw new Error(`Tab context file must stay directly within the CloudX context directory: ${contextPath}`);
+    }
+    await this.writeQueues.get(contextPath);
+    const owned = await this.files.openOwnedRegularFileNoFollow(this.dataRoot, this.contextDir, path.basename(contextPath), "Tab context file").catch((error) => {
+      if (isNotFound(error)) {
+        return undefined;
+      }
+      throw error;
+    });
+    if (!owned) {
+      return;
+    }
+    try {
+      await owned.unlink();
+    } finally {
+      await owned.close();
+    }
   }
 
   private async truncate(contextPath: string): Promise<void> {

@@ -2,12 +2,12 @@ import {
   applyWorkspaceLayoutInstructionToTabLayout,
   findTabLayoutPane,
   findTabLayoutPaneContainingTab,
+  parseCreateTabResponse,
   readWorkspaceLayoutInstruction,
   removeTabFromTabLayoutPanes,
   type TabLayoutNode,
   type TabLayoutState,
   type TabPaneState,
-  type PluginMetadataMap,
   type VoiceExecutionResult,
   type WorkspaceLayoutInstruction,
   type WorkspaceTab,
@@ -16,13 +16,10 @@ import {
 
 type VoiceState = "idle" | "recording" | "processing";
 
-interface VoiceWorkspaceState {
+interface VoiceWorkspaceDocumentState {
   layout: TabLayoutState;
   tabs: WorkspaceTab[];
   activeTabId?: string;
-}
-
-interface VoiceWorkspaceDocumentState extends VoiceWorkspaceState {
   windows: WorkspaceWindow[];
   activeWindowId?: string;
 }
@@ -58,42 +55,6 @@ export function voiceConsoleValue(voiceState: VoiceState, manualTranscript: stri
   return manualTranscript;
 }
 
-export function applyVoiceWorkspaceResults(
-  current: VoiceWorkspaceState,
-  result: VoiceExecutionResult,
-  factories: VoiceWorkspaceIdFactories
-): VoiceWorkspaceState {
-  let layout = current.layout;
-  let tabs = current.tabs;
-  let activeTabId = current.activeTabId;
-
-  for (const execution of result.results) {
-    if (!execution.ok || !isRecord(execution.result)) {
-      continue;
-    }
-    const tab = readWorkspaceTab(execution.result.tab);
-    if (hasOwn(execution.result, "tab") && !tab) {
-      continue;
-    }
-    if (tab) {
-      tabs = upsertTab(tabs, tab);
-      activeTabId = tab.id;
-    }
-    const instruction = readWorkspaceLayoutInstruction(execution.result.layoutInstruction);
-    if (!instruction) {
-      continue;
-    }
-    if (instruction.type === "select_window") {
-      continue;
-    }
-    const applied = applyWorkspaceLayoutInstructionToTabLayout(layout, instruction, factories);
-    layout = applied.layout;
-    activeTabId = applied.activeTabId ?? activeTabId;
-  }
-
-  return { layout, tabs, activeTabId };
-}
-
 export function applyVoiceWorkspaceResultsToWorkspace(
   current: VoiceWorkspaceDocumentState,
   result: VoiceExecutionResult,
@@ -107,16 +68,20 @@ export function applyVoiceWorkspaceResultsToWorkspace(
   const changedLayoutWindowIds = new Set<string>();
 
   for (const execution of result.results) {
-    if (!execution.ok || !isRecord(execution.result)) {
+    if (execution.status !== "succeeded" || !isRecord(execution.result)) {
       continue;
     }
-    const tab = readWorkspaceTab(execution.result.tab);
-    if (hasOwn(execution.result, "tab") && !tab) {
+    if (hasOwn(execution.result, "tab") || hasOwn(execution.result, "window")) {
+      try {
+        const committed = parseCreateTabResponse(execution.result);
+        tabs = upsertTab(tabs, committed.tab);
+        windows = upsertWindow(windows, committed.window);
+        activeTabId = committed.tab.id;
+        activeWindowId = committed.window.id;
+      } catch {
+        continue;
+      }
       continue;
-    }
-    if (tab) {
-      tabs = upsertTab(tabs, tab);
-      activeTabId = tab.id;
     }
     const instruction = readWorkspaceLayoutInstruction(execution.result.layoutInstruction);
     if (!instruction || instruction.type === "select_window") {
@@ -196,57 +161,20 @@ export function buildClientVoiceContext(layout: TabLayoutState, tabs: WorkspaceT
   };
 }
 
-function readWorkspaceTab(value: unknown): WorkspaceTab | undefined {
-  if (
-    !isRecord(value) ||
-    typeof value.id !== "string" ||
-    typeof value.pluginId !== "string" ||
-    typeof value.title !== "string" ||
-    typeof value.cwd !== "string" ||
-    !isTabStatus(value.status) ||
-    !isTabIndicator(value.indicator) ||
-    typeof value.createdAt !== "string" ||
-    typeof value.updatedAt !== "string" ||
-    (value.contextPath !== undefined && typeof value.contextPath !== "string") ||
-    (value.statusMessage !== undefined && typeof value.statusMessage !== "string")
-  ) {
-    return undefined;
-  }
-  return {
-    id: value.id,
-    pluginId: value.pluginId,
-    title: value.title,
-    cwd: value.cwd,
-    status: value.status,
-    indicator: value.indicator,
-    pluginMetadata: readPluginMetadataMap(value.pluginMetadata),
-    createdAt: value.createdAt,
-    updatedAt: value.updatedAt,
-    contextPath: value.contextPath,
-    statusMessage: value.statusMessage
-  };
-}
-
-function isTabStatus(value: unknown): value is WorkspaceTab["status"] {
-  return value === "idle" || value === "starting" || value === "running" || value === "waiting_approval" || value === "failed" || value === "completed" || value === "stopped";
-}
-
-function isTabIndicator(value: unknown): value is WorkspaceTab["indicator"] {
-  return (
-    isRecord(value) &&
-    (value.color === "green" || value.color === "yellow" || value.color === "red") &&
-    typeof value.label === "string" &&
-    (value.message === undefined || typeof value.message === "string") &&
-    typeof value.updatedAt === "string"
-  );
-}
-
 function upsertTab(tabs: WorkspaceTab[], tab: WorkspaceTab): WorkspaceTab[] {
   const existingIndex = tabs.findIndex((candidate) => candidate.id === tab.id);
   if (existingIndex === -1) {
     return [...tabs, tab];
   }
   return [...tabs.slice(0, existingIndex), tab, ...tabs.slice(existingIndex + 1)];
+}
+
+function upsertWindow(windows: WorkspaceWindow[], window: WorkspaceWindow): WorkspaceWindow[] {
+  const existingIndex = windows.findIndex((candidate) => candidate.id === window.id);
+  if (existingIndex === -1) {
+    return [...windows, window];
+  }
+  return [...windows.slice(0, existingIndex), window, ...windows.slice(existingIndex + 1)];
 }
 
 function windowForLayoutInstruction(windows: WorkspaceWindow[], activeWindowId: string | undefined, instruction: WorkspaceLayoutInstruction): WorkspaceWindow | undefined {
@@ -274,14 +202,6 @@ function isTabPlacementInstruction(instruction: WorkspaceLayoutInstruction): ins
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function readPluginMetadataMap(value: unknown): PluginMetadataMap | undefined {
-  if (!isRecord(value)) {
-    return undefined;
-  }
-  const entries = Object.entries(value).filter((entry): entry is [string, Record<string, unknown>] => isRecord(entry[1]));
-  return Object.fromEntries(entries);
 }
 
 function hasOwn(value: Record<string, unknown>, key: string): boolean {

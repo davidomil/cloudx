@@ -4,6 +4,7 @@ import {
   applyLayoutTemplate,
   callHook,
   closeTab,
+  createTab,
   createWindow,
   deleteAllNotifications,
   deleteAutomationGroup,
@@ -17,6 +18,7 @@ import {
   fileBrowserRawFileUrl,
   filenameFromContentDisposition,
   getConfig,
+  getCodexStateSources,
   getHooks,
   importDocumentationArchive,
   runTabAction,
@@ -34,6 +36,15 @@ import {
 } from "./api.js";
 
 describe("api client", () => {
+  it("fetches and validates the Codex source catalog with cancellation", async () => {
+    const signal = new AbortController().signal;
+    const body = { sources: [{ sourceId: "shared", kind: "shared", label: "Shared sessions", updatedAt: null }] };
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(body)).mockResolvedValueOnce(jsonResponse({ sources: [], extra: true }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(getCodexStateSources(signal)).resolves.toEqual(body);
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/codex/state-sources", { signal, headers: undefined });
+    await expect(getCodexStateSources()).rejects.toThrow("Invalid Codex session sources response.");
+  });
   afterEach(() => {
     vi.unstubAllGlobals();
   });
@@ -94,6 +105,38 @@ describe("api client", () => {
       body: JSON.stringify({ name: "Generated", defaultCwd: "/repo/generated", createDirectory: true }),
       headers: { "content-type": "application/json" }
     });
+  });
+
+  it("sends explicit server-owned tab placement coordinates", async () => {
+    const response = completeCreateTabResponse();
+    const fetchMock = vi.fn(async () => jsonResponse(response));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(createTab({ pluginId: "file-browser", cwd: "/repo", windowId: "window-1", paneId: "pane-1" })).resolves.toEqual(response);
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/tabs", {
+      method: "POST",
+      body: JSON.stringify({ pluginId: "file-browser", cwd: "/repo", windowId: "window-1", paneId: "pane-1" }),
+      headers: { "content-type": "application/json" }
+    });
+  });
+
+  it("rejects incomplete and unusable create-tab responses", async () => {
+    const mismatched = completeCreateTabResponse();
+    mismatched.tab.id = "tab-missing";
+    const unusable = completeCreateTabResponse();
+    unusable.window.layout.activePaneId = "pane-missing";
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ tab: { id: "tab-1" }, window: { id: "window-1", layout: { activePaneId: "pane-1" } } }))
+      .mockResolvedValueOnce(jsonResponse(unusable))
+      .mockResolvedValueOnce(jsonResponse(mismatched));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const input = { pluginId: "file-browser", cwd: "/repo", windowId: "window-1", paneId: "pane-1" };
+    await expect(createTab(input)).rejects.toThrow("Create tab response tab must be a complete WorkspaceTab.");
+    await expect(createTab(input)).rejects.toThrow("Create tab response window layout must be usable.");
+    await expect(createTab(input)).rejects.toThrow("Create tab response tab must occur in the returned window layout.");
   });
 
   it("emits automation triggers through the trigger endpoint", async () => {
@@ -287,16 +330,90 @@ describe("api client", () => {
   });
 
   it("sends client voice context with manual transcripts", async () => {
-    const fetchMock = vi.fn(async () => jsonResponse({ accepted: true, plan: { transcript: "open terminal", summary: "", actions: [] }, results: [] }));
+    const response = { accepted: true, plan: { transcript: "open terminal", summary: "", actions: [] }, results: [] };
+    const fetchMock = vi.fn(async () => jsonResponse(response));
     vi.stubGlobal("fetch", fetchMock);
 
-    await submitTranscript("open terminal", "tab-1", { activePaneId: "pane-2" });
+    await expect(submitTranscript("open terminal", "tab-1", { activePaneId: "pane-2" })).resolves.toEqual(response);
 
     expect(fetchMock).toHaveBeenCalledWith("/api/voice/transcript", {
       method: "POST",
       body: JSON.stringify({ transcript: "open terminal", activeTabId: "tab-1", clientContext: { activePaneId: "pane-2" } }),
       headers: { "content-type": "application/json" }
     });
+  });
+
+  it("rejects malformed successful transcript responses", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({ accepted: "yes", plan: { transcript: "open terminal", summary: "", actions: [] }, results: [] })));
+
+    await expect(submitTranscript("open terminal")).rejects.toThrow("Voice execution result accepted must be a boolean.");
+  });
+
+  it("rejects transcript responses with a foreign result outside the plan", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse({
+          accepted: true,
+          plan: { transcript: "open terminal", summary: "", actions: [] },
+          results: [{ actionId: "foreign", action: "create_tab", status: "succeeded" }]
+        })
+      )
+    );
+
+    await expect(submitTranscript("open terminal")).rejects.toThrow("Voice execution result count must match plan action count.");
+  });
+
+  it("parses successful uploaded audio responses", async () => {
+    const response = {
+      accepted: true,
+      plan: { transcript: "open terminal", summary: "", actions: [{ id: "open", dependsOn: [], action: "open_terminal", input: {} }] },
+      results: [{ actionId: "open", action: "open_terminal", status: "succeeded", result: { tabId: "tab-2" } }]
+    };
+    const fetchMock = vi.fn(async () => jsonResponse(response));
+    vi.stubGlobal("window", { location: { origin: "http://localhost:3001" } });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(submitAudio(new Blob(["audio"], { type: "audio/webm" }), "tab-1")).resolves.toEqual(response);
+    expect(fetchMock).toHaveBeenCalledWith(new URL("http://localhost:3001/api/voice/audio?activeTabId=tab-1&filename=voice.webm"), {
+      method: "POST",
+      headers: { "content-type": "audio/webm" },
+      body: expect.any(Blob)
+    });
+  });
+
+  it("rejects malformed successful uploaded audio responses", async () => {
+    vi.stubGlobal("window", { location: { origin: "http://localhost:3001" } });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse({
+          accepted: true,
+          plan: { transcript: "open terminal", summary: "", actions: [] },
+          results: [{ actionId: "open", action: "open_terminal", status: "pending" }]
+        })
+      )
+    );
+
+    await expect(submitAudio(new Blob(["audio"], { type: "audio/webm" }))).rejects.toThrow("Voice execution result 0 status is invalid.");
+  });
+
+  it("rejects uploaded audio responses whose result action differs from the plan", async () => {
+    vi.stubGlobal("window", { location: { origin: "http://localhost:3001" } });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse({
+          accepted: true,
+          plan: { transcript: "open terminal", summary: "", actions: [{ id: "open", dependsOn: [], action: "create_tab", input: {} }] },
+          results: [{ actionId: "open", action: "enter_text", status: "succeeded" }]
+        })
+      )
+    );
+
+    await expect(submitAudio(new Blob(["audio"], { type: "audio/webm" }))).rejects.toThrow(
+      "Voice execution result 0 action must match plan action: create_tab"
+    );
   });
 
   it("uses JSON error messages from uploaded audio responses", async () => {
@@ -521,7 +638,7 @@ describe("api client", () => {
     expect(stoppedTrack).toHaveBeenCalled();
   });
 
-  it("rejects malformed streamed voice results instead of trusting object-shaped payloads", async () => {
+  it("rejects relationally inconsistent streamed voice results and cleans up media", async () => {
     const stoppedTrack = vi.fn();
     const stream = { getTracks: () => [{ kind: "audio", stop: stoppedTrack }], getAudioTracks: () => [] } as unknown as MediaStream;
     const sockets: FakeWebSocket[] = [];
@@ -542,7 +659,24 @@ describe("api client", () => {
 
     const session = await startAudioStream(stream);
     const resultPromise = session.stop();
-    sockets[0]!.serverMessage({ type: "result", result: { accepted: true, plan: {}, results: [] } });
+    sockets[0]!.serverMessage({
+      type: "result",
+      result: {
+        accepted: true,
+        plan: {
+          transcript: "open then type",
+          summary: "",
+          actions: [
+            { id: "open", dependsOn: [], action: "create_tab", input: {} },
+            { id: "type", dependsOn: ["open"], action: "enter_text", input: { text: "hello" } }
+          ]
+        },
+        results: [
+          { actionId: "type", action: "enter_text", status: "succeeded" },
+          { actionId: "open", action: "create_tab", status: "succeeded" }
+        ]
+      }
+    });
 
     await expect(resultPromise).rejects.toThrow("Voice audio stream returned an invalid message.");
     expect(stoppedTrack).toHaveBeenCalled();
@@ -672,6 +806,37 @@ function jsonResponse(value: unknown): Response {
 
 function tick(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function completeCreateTabResponse() {
+  const timestamp = "2026-08-16T00:00:00.000Z";
+  return {
+    tab: {
+      id: "tab-1",
+      pluginId: "file-browser",
+      title: "Files",
+      cwd: "/repo",
+      status: "running" as const,
+      indicator: { color: "green" as const, label: "Ready", message: "Running.", updatedAt: timestamp },
+      pluginMetadata: { "rules-skills": { selectedTemplateId: "focused" } },
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      contextPath: "/repo/.cloudx/context.md",
+      statusMessage: "Available"
+    },
+    window: {
+      id: "window-1",
+      name: "Main",
+      defaultCwd: "/repo",
+      layout: {
+        root: { type: "pane" as const, pane: { id: "pane-1", tabIds: ["tab-1"], activeTabId: "tab-1" } },
+        activePaneId: "pane-1"
+      },
+      pluginMetadata: { "rules-skills": { selectedTemplateId: "focused" } },
+      createdAt: timestamp,
+      updatedAt: timestamp
+    }
+  };
 }
 
 type TestXhrListener = (event: ProgressEvent) => void;

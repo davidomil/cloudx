@@ -15,6 +15,7 @@ import {
 import { DEFAULT_TERMINAL_REPLAY_BYTES } from "./plugins/CodexTerminalPlugin.js";
 
 export const DEFAULT_CLOUDX_HOST = "127.0.0.1";
+const ALLOWED_BIND_HOSTS = new Set(["127.0.0.1", "::1", "localhost", "0.0.0.0"]);
 export const DEFAULT_VOICE_AUDIO_UPLOAD_MAX_BYTES = 25 * 1024 * 1024;
 export const MAX_VOICE_AUDIO_UPLOAD_MAX_BYTES = 512 * 1024 * 1024;
 export const DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES = 256 * 1024 * 1024;
@@ -26,6 +27,7 @@ export type CloudxLogLevel = typeof CLOUDX_LOG_LEVELS[number];
 export interface AppConfig {
   host: string;
   port: number;
+  trustedOrigins: string[];
   logLevel: CloudxLogLevel;
   allowedRoots: string[];
   asrUrl: string;
@@ -49,7 +51,7 @@ export interface AppConfig {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
-  const host = env.CLOUDX_HOST ?? DEFAULT_CLOUDX_HOST;
+  const host = parseBindHost(env.CLOUDX_HOST ?? DEFAULT_CLOUDX_HOST);
   const port = parsePositiveInteger(env.CLOUDX_PORT ?? "3001", "CLOUDX_PORT");
   const logLevel = parseLogLevel(env.CLOUDX_LOG_LEVEL ?? "info");
   const terminalReplayBytes = parsePositiveInteger(env.CLOUDX_TERMINAL_REPLAY_BYTES ?? String(DEFAULT_TERMINAL_REPLAY_BYTES), "CLOUDX_TERMINAL_REPLAY_BYTES");
@@ -63,6 +65,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const dataDir = path.resolve(env.CLOUDX_DATA_DIR ?? path.join(repoRoot, ".cloudx"));
   const https = resolveHttpsConfig(env, dataDir);
+  const directOrigin = canonicalDirectOrigin(
+    host === "0.0.0.0" ? DEFAULT_CLOUDX_HOST : host,
+    port,
+    Boolean(https)
+  );
+  const trustedOrigins = parseTrustedOrigins(
+    env.CLOUDX_TRUSTED_ORIGINS,
+    directOrigin,
+    host === "0.0.0.0"
+  );
   const allowedRoots = (env.CLOUDX_ALLOWED_ROOTS ?? home)
     .split(path.delimiter)
     .map((root) => root.trim())
@@ -90,6 +102,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   return {
     host,
     port,
+    trustedOrigins,
     logLevel,
     allowedRoots,
     asrUrl: env.CLOUDX_ASR_URL ?? "http://127.0.0.1:7810",
@@ -108,6 +121,50 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     voiceDebugTranscripts: isTruthy(env.CLOUDX_VOICE_DEBUG_TRANSCRIPTS),
     https
   };
+}
+
+function canonicalDirectOrigin(host: string, port: number, secure: boolean): string {
+  const authority = host.includes(":") ? `[${host}]` : host;
+  return new URL(`${secure ? "https" : "http"}://${authority}:${port}`).origin;
+}
+
+function parseTrustedOrigins(
+  value: string | undefined,
+  directOrigin: string,
+  requiresNetworkOrigin: boolean
+): string[] {
+  if (value === undefined) {
+    if (requiresNetworkOrigin) {
+      throw new Error(
+        "CLOUDX_TRUSTED_ORIGINS must include the exact browser origin when CLOUDX_HOST is 0.0.0.0."
+      );
+    }
+    return [directOrigin];
+  }
+  const configured = value.split(",").map((element) => parseTrustedOrigin(element));
+  const unique = new Set(configured);
+  if (unique.size !== configured.length) {
+    throw new Error("CLOUDX_TRUSTED_ORIGINS must not contain duplicate origins.");
+  }
+  if (unique.has(directOrigin)) {
+    throw new Error("CLOUDX_TRUSTED_ORIGINS must not repeat the configured CloudX listener origin.");
+  }
+  return [directOrigin, ...configured];
+}
+
+function parseTrustedOrigin(value: string): string {
+  const origin = value.replace(/^[\u0020\u0009]+|[\u0020\u0009]+$/gu, "");
+  if (!origin) throw new Error("CLOUDX_TRUSTED_ORIGINS must not contain empty origins.");
+  let parsed: URL;
+  try {
+    parsed = new URL(origin);
+  } catch (error) {
+    throw new Error("CLOUDX_TRUSTED_ORIGINS must contain canonical absolute HTTP(S) origins.", { cause: error });
+  }
+  if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || parsed.origin !== origin) {
+    throw new Error("CLOUDX_TRUSTED_ORIGINS must contain canonical absolute HTTP(S) origins.");
+  }
+  return parsed.origin;
 }
 
 function parseLogLevel(value: string): CloudxLogLevel {
@@ -137,24 +194,14 @@ function parseVoiceModel(value: string): string {
   return trimmed;
 }
 
-export function shouldWarnForNetworkBind(host: string): boolean {
-  const normalized = host.trim().toLowerCase();
-  return normalized === "0.0.0.0" || normalized === "::" || normalized === "[::]";
-}
-
-export function networkBindWarning(host: string, port: number, protocol: "http" | "https" = "https"): string {
-  return [
-    "",
-    "======================================================================",
-    "WARNING: Cloudx is listening on a network interface.",
-    `CLOUDX_HOST=${host} exposes this shell-controlling service beyond localhost.`,
-    "Cloudx can spawn terminals, edit files, proxy dashboards, and transcribe",
-    "browser microphone audio when voice is enabled.",
-    "Use only on a trusted LAN or private tailnet. Public internet unsupported.",
-    `Local URL: ${protocol}://127.0.0.1:${port}`,
-    "======================================================================",
-    ""
-  ].join("\n");
+function parseBindHost(value: string): string {
+  const host = value.trim().toLowerCase();
+  if (!ALLOWED_BIND_HOSTS.has(host)) {
+    throw new Error(
+      "CLOUDX_HOST must be 127.0.0.1, ::1, localhost, or the explicit trusted-LAN wildcard 0.0.0.0."
+    );
+  }
+  return host;
 }
 
 function isTruthy(value: string | undefined): boolean {

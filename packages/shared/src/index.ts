@@ -1,3 +1,5 @@
+import { isUsableTabLayoutState, listTabLayoutPanes } from "./workspaceLayout.js";
+
 export const DEFAULT_VOICE_MODEL = "gpt-5.3-codex-spark";
 
 export type PluginId = "codex-terminal" | "standard-terminal" | "file-browser" | "local-web" | string;
@@ -343,8 +345,10 @@ export interface AutomationVariableDefinition {
   defaultValue?: unknown;
 }
 
+export const AUTOMATION_GRAPH_SCHEMA_VERSION = 2 as const;
+
 export interface AutomationGraphDocument {
-  schemaVersion: 1;
+  schemaVersion: typeof AUTOMATION_GRAPH_SCHEMA_VERSION;
   nodes: AutomationNode[];
   edges: AutomationEdge[];
   variables?: AutomationVariableDefinition[];
@@ -354,7 +358,7 @@ export interface AutomationGraphDocument {
 export function isAutomationGraphDocument(value: unknown): value is AutomationGraphDocument {
   return (
     isRecord(value) &&
-    value.schemaVersion === 1 &&
+    value.schemaVersion === AUTOMATION_GRAPH_SCHEMA_VERSION &&
     Array.isArray(value.nodes) &&
     value.nodes.every(isAutomationNode) &&
     Array.isArray(value.edges) &&
@@ -362,6 +366,10 @@ export function isAutomationGraphDocument(value: unknown): value is AutomationGr
     (value.variables === undefined || Array.isArray(value.variables) && value.variables.every(isAutomationVariableDefinition)) &&
     (value.allowedSafety === undefined || Array.isArray(value.allowedSafety) && value.allowedSafety.every(isAutomationSafety))
   );
+}
+
+export function automationGraphVersionError(schemaVersion: unknown): string {
+  return `Automation graph schemaVersion ${String(schemaVersion)} is unsupported; expected ${AUTOMATION_GRAPH_SCHEMA_VERSION}. Schema v1 predates the persisted workspace.tabs.create command contract. Recreate the graph with schemaVersion ${AUTOMATION_GRAPH_SCHEMA_VERSION}; no automatic migration is performed.`;
 }
 
 export function isAutomationNode(value: unknown): value is AutomationNode {
@@ -638,7 +646,10 @@ export interface CreateTabRequest {
   title?: string;
   createDirectory?: boolean;
   initialInput?: Record<string, unknown>;
-  windowId?: string;
+  windowId: string;
+  paneId: string;
+  newPane?: boolean;
+  splitDirection?: TabLayoutDirection;
   pluginMetadata?: PluginMetadataMap;
 }
 
@@ -647,14 +658,62 @@ export type CodexSessionResumeMode = "new" | "picker" | "last" | "session";
 export interface CodexTerminalInitialInput {
   resume?: {
     mode: Exclude<CodexSessionResumeMode, "new">;
+    sourceId: string;
     sessionId?: string;
     all?: boolean;
     includeNonInteractive?: boolean;
   };
 }
 
+export interface CodexStateSource {
+  sourceId: string;
+  kind: "shared" | "legacy";
+  label: string;
+  updatedAt: string | null;
+}
+
+export interface CodexStateSourcesResponse {
+  sources: CodexStateSource[];
+}
+
+/** Decode only canonical keys for one direct retained-home basename. */
+export function codexStateSourceBasename(sourceId: string): string | undefined {
+  if (sourceId === "shared") return undefined;
+  if (!/^legacy:[A-Za-z0-9_-]{2,171}$/u.test(sourceId)) throw new Error("Invalid Codex session source key.");
+  const encoded = sourceId.slice(7);
+  let basename: string;
+  let bytes: Uint8Array;
+  try {
+    bytes = Uint8Array.from(atob(encoded.replace(/-/gu, "+").replace(/_/gu, "/")), (char) => char.charCodeAt(0));
+    basename = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    throw new Error("Invalid Codex session source key.");
+  }
+  const canonical = btoa(String.fromCharCode(...bytes)).replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/u, "");
+  if (bytes.length < 1 || bytes.length > 128 || canonical !== encoded || basename === "." || basename === ".." || /[\/\\\p{Cc}]/u.test(basename)) {
+    throw new Error("Invalid Codex session source key.");
+  }
+  return basename;
+}
+
+export function parseCodexStateSourcesResponse(value: unknown): CodexStateSourcesResponse {
+  const fail = (): never => { throw new Error("Invalid Codex session sources response."); };
+  if (!isRecord(value) || Object.keys(value).length !== 1 || !Array.isArray(value.sources) || value.sources.length > 513) return fail();
+  const keys = new Set<string>();
+  const sources = value.sources.map((source): CodexStateSource => {
+    if (!isRecord(source) || Object.keys(source).sort().join(",") !== "kind,label,sourceId,updatedAt" || typeof source.sourceId !== "string" || typeof source.label !== "string" || !source.label.trim() || source.label.length > 256 || /[\p{Cc}]/u.test(source.label)) return fail();
+    codexStateSourceBasename(source.sourceId);
+    if ((source.kind !== "shared" && source.kind !== "legacy") || source.kind !== (source.sourceId === "shared" ? "shared" : "legacy") || keys.has(source.sourceId)) return fail();
+    if (source.updatedAt !== null && (typeof source.updatedAt !== "string" || !Number.isFinite(Date.parse(source.updatedAt)) || new Date(source.updatedAt).toISOString() !== source.updatedAt)) return fail();
+    keys.add(source.sourceId);
+    return { sourceId: source.sourceId, kind: source.kind, label: source.label, updatedAt: source.updatedAt as string | null };
+  });
+  return { sources };
+}
+
 export interface CreateTabResponse {
   tab: WorkspaceTab;
+  window: WorkspaceWindow;
 }
 
 export interface PathOption {
@@ -802,7 +861,8 @@ export interface WorktreeProjectState {
 }
 
 export interface VoiceAction {
-  id?: string;
+  id: string;
+  dependsOn: string[];
   targetTabId?: string;
   pluginId?: PluginId;
   hookId?: HookId;
@@ -821,9 +881,10 @@ export interface VoiceExecutionResult {
   accepted: boolean;
   plan: VoiceActionPlan;
   results: Array<{
+    actionId: string;
     action: string;
     targetTabId?: string;
-    ok: boolean;
+    status: "succeeded" | "failed" | "skipped";
     message?: string;
     result?: unknown;
   }>;
@@ -1040,6 +1101,92 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+export function parseCreateTabResponse(value: unknown): CreateTabResponse {
+  if (!isRecord(value)) {
+    throw new Error("Create tab response must be an object.");
+  }
+  const tab = value.tab;
+  const window = value.window;
+  if (!isCompleteWorkspaceTab(tab)) {
+    throw new Error("Create tab response tab must be a complete WorkspaceTab.");
+  }
+  if (!hasCompleteWorkspaceWindowFields(window)) {
+    throw new Error("Create tab response window must be a complete WorkspaceWindow.");
+  }
+  if (!isUsableTabLayoutState(window.layout)) {
+    throw new Error("Create tab response window layout must be usable.");
+  }
+  if (!listTabLayoutPanes(window.layout.root).some((pane) => pane.tabIds.includes(tab.id))) {
+    throw new Error("Create tab response tab must occur in the returned window layout.");
+  }
+
+  return {
+    tab,
+    window: {
+      id: window.id,
+      name: window.name,
+      defaultCwd: window.defaultCwd,
+      layout: window.layout,
+      ...(window.pluginMetadata === undefined ? {} : { pluginMetadata: window.pluginMetadata }),
+      createdAt: window.createdAt,
+      updatedAt: window.updatedAt
+    }
+  };
+}
+
+function isCompleteWorkspaceTab(value: unknown): value is WorkspaceTab {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.pluginId === "string" &&
+    typeof value.title === "string" &&
+    typeof value.cwd === "string" &&
+    isTabStatus(value.status) &&
+    isTabIndicator(value.indicator) &&
+    (value.pluginMetadata === undefined || isPluginMetadataMap(value.pluginMetadata)) &&
+    typeof value.createdAt === "string" &&
+    typeof value.updatedAt === "string" &&
+    (value.contextPath === undefined || typeof value.contextPath === "string") &&
+    (value.statusMessage === undefined || typeof value.statusMessage === "string")
+  );
+}
+
+function isTabIndicator(value: unknown): value is TabIndicator {
+  return (
+    isRecord(value) &&
+    isTabIndicatorColor(value.color) &&
+    typeof value.label === "string" &&
+    (value.message === undefined || typeof value.message === "string") &&
+    typeof value.updatedAt === "string"
+  );
+}
+
+function hasCompleteWorkspaceWindowFields(
+  value: unknown
+): value is Record<string, unknown> & Pick<WorkspaceWindow, "id" | "name" | "defaultCwd" | "createdAt" | "updatedAt"> & { pluginMetadata?: PluginMetadataMap } {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.name === "string" &&
+    typeof value.defaultCwd === "string" &&
+    (value.pluginMetadata === undefined || isPluginMetadataMap(value.pluginMetadata)) &&
+    typeof value.createdAt === "string" &&
+    typeof value.updatedAt === "string"
+  );
+}
+
+function isPluginMetadataMap(value: unknown): value is PluginMetadataMap {
+  return isRecord(value) && Object.values(value).every((metadata) => isRecord(metadata));
+}
+
+function isTabStatus(value: unknown): value is TabStatus {
+  return value === "idle" || value === "starting" || value === "running" || value === "waiting_approval" || value === "failed" || value === "completed" || value === "stopped";
+}
+
+function isTabIndicatorColor(value: unknown): value is TabIndicatorColor {
+  return value === "green" || value === "yellow" || value === "red";
+}
+
 export function parseVoiceActionPlan(value: unknown): VoiceActionPlan {
   if (!isRecord(value)) {
     throw new Error("Voice plan must be an object.");
@@ -1059,11 +1206,94 @@ export function parseVoiceActionPlan(value: unknown): VoiceActionPlan {
     throw new Error("Voice plan actions must be an array.");
   }
 
+  const parsedActions = actions.map((action, index) => parseVoiceAction(action, index));
+  const seenActionIds = new Set<string>();
+  for (const [index, action] of parsedActions.entries()) {
+    if (seenActionIds.has(action.id)) {
+      throw new Error(`Voice action ${index} id must be unique: ${action.id}`);
+    }
+    for (const dependencyId of action.dependsOn) {
+      if (!seenActionIds.has(dependencyId)) {
+        throw new Error(`Voice action ${index} dependency must reference an earlier action: ${dependencyId}`);
+      }
+    }
+    seenActionIds.add(action.id);
+  }
+
   return {
     transcript,
     summary,
-    actions: actions.map((action, index) => parseVoiceAction(action, index))
+    actions: parsedActions
   };
+}
+
+export function parseVoiceExecutionResult(value: unknown): VoiceExecutionResult {
+  if (!isRecord(value)) {
+    throw new Error("Voice execution result must be an object.");
+  }
+  if (typeof value.accepted !== "boolean") {
+    throw new Error("Voice execution result accepted must be a boolean.");
+  }
+  const plan = parseVoiceActionPlan(value.plan);
+  if (!Array.isArray(value.results)) {
+    throw new Error("Voice execution results must be an array.");
+  }
+  const results = value.results.map((result, index) => parseVoiceActionResult(result, index));
+  if (results.length !== plan.actions.length) {
+    throw new Error("Voice execution result count must match plan action count.");
+  }
+  for (const [index, result] of results.entries()) {
+    const action = plan.actions[index]!;
+    if (result.actionId !== action.id) {
+      throw new Error(`Voice execution result ${index} actionId must match plan action id: ${action.id}`);
+    }
+    if (result.action !== action.action) {
+      throw new Error(`Voice execution result ${index} action must match plan action: ${action.action}`);
+    }
+  }
+  if (value.accepted !== results.every((result) => result.status === "succeeded")) {
+    throw new Error("Voice execution result accepted must match whether every result succeeded.");
+  }
+
+  return {
+    accepted: value.accepted,
+    plan,
+    results
+  };
+}
+
+function parseVoiceActionResult(value: unknown, index: number): VoiceExecutionResult["results"][number] {
+  if (!isRecord(value)) {
+    throw new Error(`Voice execution result ${index} must be an object.`);
+  }
+  if (typeof value.actionId !== "string" || value.actionId.trim().length === 0) {
+    throw new Error(`Voice execution result ${index} actionId must be a non-empty string.`);
+  }
+  if (typeof value.action !== "string" || value.action.trim().length === 0) {
+    throw new Error(`Voice execution result ${index} action must be a non-empty string.`);
+  }
+  if (!isVoiceActionResultStatus(value.status)) {
+    throw new Error(`Voice execution result ${index} status is invalid.`);
+  }
+  if (value.targetTabId !== undefined && typeof value.targetTabId !== "string") {
+    throw new Error(`Voice execution result ${index} targetTabId must be a string.`);
+  }
+  if (value.message !== undefined && typeof value.message !== "string") {
+    throw new Error(`Voice execution result ${index} message must be a string.`);
+  }
+
+  return {
+    actionId: value.actionId,
+    action: value.action,
+    ...(value.targetTabId === undefined ? {} : { targetTabId: value.targetTabId }),
+    status: value.status,
+    ...(value.message === undefined ? {} : { message: value.message }),
+    ...("result" in value ? { result: value.result } : {})
+  };
+}
+
+function isVoiceActionResultStatus(value: unknown): value is VoiceExecutionResult["results"][number]["status"] {
+  return value === "succeeded" || value === "failed" || value === "skipped";
 }
 
 export function parseVoiceAction(value: unknown, index = 0): VoiceAction {
@@ -1076,15 +1306,26 @@ export function parseVoiceAction(value: unknown, index = 0): VoiceAction {
   if (!isRecord(value.input)) {
     throw new Error(`Voice action ${index} input must be an object.`);
   }
+  if (typeof value.id !== "string" || value.id.trim().length === 0) {
+    throw new Error(`Voice action ${index} must include a stable id.`);
+  }
+  if (!Array.isArray(value.dependsOn) || value.dependsOn.some((dependencyId) => typeof dependencyId !== "string" || !dependencyId.trim())) {
+    throw new Error(`Voice action ${index} dependsOn must be an array of action ids.`);
+  }
+  const dependsOn = value.dependsOn.map((dependencyId) => (dependencyId as string).trim());
+  if (new Set(dependsOn).size !== dependsOn.length) {
+    throw new Error(`Voice action ${index} dependsOn must not contain duplicate action ids.`);
+  }
 
   return {
-    id: typeof value.id === "string" ? value.id : undefined,
-    targetTabId: typeof value.targetTabId === "string" ? value.targetTabId : undefined,
-    pluginId: typeof value.pluginId === "string" ? value.pluginId : undefined,
-    hookId: typeof value.hookId === "string" ? value.hookId : undefined,
+    id: value.id.trim(),
+    dependsOn,
+    ...(typeof value.targetTabId === "string" ? { targetTabId: value.targetTabId } : {}),
+    ...(typeof value.pluginId === "string" ? { pluginId: value.pluginId } : {}),
+    ...(typeof value.hookId === "string" ? { hookId: value.hookId } : {}),
     action: value.action,
     input: stripNullishValues(value.input),
-    reason: typeof value.reason === "string" ? value.reason : undefined
+    ...(typeof value.reason === "string" ? { reason: value.reason } : {})
   };
 }
 

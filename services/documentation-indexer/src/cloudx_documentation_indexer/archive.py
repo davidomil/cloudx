@@ -4,6 +4,7 @@ import csv
 import hashlib
 import ipaddress
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -17,10 +18,11 @@ import tempfile
 import threading
 import time
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable, Iterator, Mapping
-from importlib.metadata import version
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from dataclasses import dataclass
+from importlib.metadata import version
 from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -101,9 +103,12 @@ ASR_BACKEND_FASTER_WHISPER = "faster-whisper"
 ASR_BACKEND_WHISPER_CPP = "whisper-cpp"
 WHISPER_CPP_CHUNK_SECONDS = 30 * 60
 WHISPER_CPP_CHUNK_OVERLAP_SECONDS = 5
+INDEX_GENERATIONS_DIRECTORY = "generations"
+ARCHIVE_STATE_ROW_ID = 1
 
 
 ProgressReporter = Callable[[dict[str, Any]], None]
+logger = logging.getLogger("cloudx_documentation_indexer.archive")
 
 
 @dataclass(frozen=True)
@@ -246,6 +251,15 @@ class ArchiveLocalityViolation:
         return record
 
 
+@dataclass(frozen=True)
+class IndexGeneration:
+    generation: str
+    index_path: Path
+    manifest_path: Path
+    manifest: dict[str, Any]
+    created: bool
+
+
 class DocumentationArchive:
     def __init__(self, root: Path | str):
         self.root = Path(root).resolve()
@@ -254,25 +268,50 @@ class DocumentationArchive:
         self.db_path = self.root / "catalog.sqlite"
         self.index_path = self.index_dir / "chunks.tvim"
         self.manifest_path = self.index_dir / "manifest.json"
+        self.index_projection_path = self.index_dir / "current"
+        self.index_generations_dir = self.index_dir / INDEX_GENERATIONS_DIRECTORY
         self._write_lock = threading.RLock()
         self.root.mkdir(parents=True, exist_ok=True)
         self.snapshots_dir.mkdir(parents=True, exist_ok=True)
         self.index_dir.mkdir(parents=True, exist_ok=True)
+        self.index_generations_dir.mkdir(parents=True, exist_ok=True)
         self._init_db()
+        self._recover_index_publication()
 
     def health(self) -> dict:
-        return {
-            "status": "ok",
-            "archiveRoot": str(self.root),
-            "schemaVersion": ARCHIVE_SCHEMA_VERSION,
-            "embeddingProfileId": EMBEDDING_PROFILE_ID,
-            "embeddingDimension": EMBEDDING_DIM,
-            "turbovecIndexPath": str(self.index_path),
-            "portable": True,
-            "archiveLocality": self.locality_report(),
-        }
+        with self._write_lock:
+            active_generation_id = self._active_index_generation()
+            projected_generation_id = self._projected_index_generation()
+            active_generation = self._load_index_generation(active_generation_id)
+            projection_ready = (
+                active_generation is not None
+                and active_generation_id == projected_generation_id
+                and self._index_projection_matches(active_generation)
+            )
+            archive_locality = self.locality_report()
+            ready = projection_ready and archive_locality["ok"]
+            return {
+                "status": "ok" if ready else "degraded",
+                "ready": ready,
+                "archiveRoot": str(self.root),
+                "schemaVersion": ARCHIVE_SCHEMA_VERSION,
+                "embeddingProfileId": EMBEDDING_PROFILE_ID,
+                "embeddingDimension": EMBEDDING_DIM,
+                "turbovecIndexPath": str(self.index_path),
+                "portable": True,
+                "indexProjection": {
+                    "ready": projection_ready,
+                    "activeGeneration": active_generation_id,
+                    "projectedGeneration": projected_generation_id,
+                },
+                "archiveLocality": archive_locality,
+            }
 
     def stats(self) -> dict:
+        with self._write_lock:
+            return self._stats()
+
+    def _stats(self) -> dict:
         with self._connect() as db:
             document_count = db.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
             active_document_count = db.execute("SELECT COUNT(*) FROM documents WHERE state = ?", (ACTIVE_STATE,)).fetchone()[0]
@@ -293,11 +332,16 @@ class DocumentationArchive:
         }
 
     def portable_manifest(self) -> dict:
-        files = self._archive_files()
+        with self._write_lock:
+            return self._portable_manifest()
+
+    def _portable_manifest(self) -> dict:
+        generation = self._active_index_generation_record()
+        files = self._archive_files(generation)
         file_entries = [
             {
                 **file.as_dict(),
-                "sha256": sha256_file(self.root / file.relative_path),
+                "sha256": sha256_file(self._archive_file_source(file.relative_path, generation)),
             }
             for file in files
         ]
@@ -351,18 +395,25 @@ class DocumentationArchive:
             with self._write_lock:
                 install_root = Path(tempfile.mkdtemp(prefix=f".{self.root.name}-import-", dir=self.root.parent))
                 shutil.rmtree(install_root)
-                shutil.copytree(package.archive_root, install_root)
-                backup_path = self._install_replacement_archive(install_root)
-                self.index_dir.mkdir(parents=True, exist_ok=True)
-                rebuild_manifest = self.rebuild_index()
-                return {
-                    "mode": "replace",
-                    "status": "imported",
-                    "backupPath": str(backup_path),
-                    "manifest": package.manifest,
-                    "rebuildManifest": rebuild_manifest,
-                    "archiveSize": self.portable_manifest()["archiveSize"],
-                }
+                installed = False
+                try:
+                    shutil.copytree(package.archive_root, install_root)
+                    candidate = DocumentationArchive(install_root)
+                    rebuild_manifest = json.loads(candidate.manifest_path.read_text(encoding="utf-8"))
+                    archive_size = candidate.portable_manifest()["archiveSize"]
+                    backup_path = self._install_replacement_archive(install_root)
+                    installed = True
+                    return {
+                        "mode": "replace",
+                        "status": "imported",
+                        "backupPath": str(backup_path),
+                        "manifest": package.manifest,
+                        "rebuildManifest": rebuild_manifest,
+                        "archiveSize": archive_size,
+                    }
+                finally:
+                    if not installed:
+                        shutil.rmtree(install_root, ignore_errors=True)
         finally:
             shutil.rmtree(package.temp_dir, ignore_errors=True)
 
@@ -370,9 +421,17 @@ class DocumentationArchive:
         package = self._validated_archive_package(Path(package_path))
         try:
             with self._write_lock:
-                summary = self._merge_archive_root(package.archive_root)
+                imported_snapshot_paths = self._imported_snapshot_paths(package.archive_root)
+                try:
+                    summary, generation = self._publish_catalog_change(
+                        lambda db: self._merge_archive_root(package.archive_root, db)
+                    )
+                except Exception:
+                    for snapshot_path in imported_snapshot_paths:
+                        self._discard_unreferenced_snapshot(snapshot_path)
+                    raise
                 summary["manifest"] = package.manifest
-                summary["rebuildManifest"] = self.rebuild_index()
+                summary["rebuildManifest"] = generation.manifest
                 summary["archiveSize"] = self.portable_manifest()["archiveSize"]
                 return summary
         finally:
@@ -1001,6 +1060,26 @@ class DocumentationArchive:
         collection: str | None = None,
         mode: str = "hybrid",
     ) -> list[dict]:
+        with self._write_lock:
+            return self._search(
+                query,
+                limit=limit,
+                states=states,
+                source_types=source_types,
+                collection=collection,
+                mode=mode,
+            )
+
+    def _search(
+        self,
+        query: str,
+        *,
+        limit: int,
+        states: list[str] | None,
+        source_types: list[str] | None,
+        collection: str | None,
+        mode: str,
+    ) -> list[dict]:
         normalized_query = query.strip()
         if not normalized_query:
             raise ArchiveError("Search query is required.")
@@ -1037,24 +1116,25 @@ class DocumentationArchive:
         if not reason.strip():
             raise ArchiveError("Invalidation reason is required.")
         now = timestamp()
-        with self._write_lock:
-            with self._connect() as db:
-                document = db.execute("SELECT state FROM documents WHERE document_id = ?", (document_id,)).fetchone()
-                if not document:
-                    raise ArchiveError(f"Unknown document: {document_id}")
-                db.execute(
-                    "UPDATE documents SET state = ?, updated_at = ? WHERE document_id = ?",
-                    (state, now, document_id),
-                )
-                db.execute("UPDATE chunks SET state = ? WHERE document_id = ?", (state, document_id))
-                db.execute(
-                    """
-                    INSERT INTO invalidation_events (document_id, previous_state, next_state, reason, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (document_id, document["state"], state, reason.strip(), now),
-                )
-            self.rebuild_index()
+
+        def invalidate(db: sqlite3.Connection) -> None:
+            document = db.execute("SELECT state FROM documents WHERE document_id = ?", (document_id,)).fetchone()
+            if not document:
+                raise ArchiveError(f"Unknown document: {document_id}")
+            db.execute(
+                "UPDATE documents SET state = ?, updated_at = ? WHERE document_id = ?",
+                (state, now, document_id),
+            )
+            db.execute("UPDATE chunks SET state = ? WHERE document_id = ?", (state, document_id))
+            db.execute(
+                """
+                INSERT INTO invalidation_events (document_id, previous_state, next_state, reason, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (document_id, document["state"], state, reason.strip(), now),
+            )
+
+        self._publish_catalog_change(invalidate)
         return self.get_document(document_id)
 
     def enrich_document(
@@ -1074,59 +1154,101 @@ class DocumentationArchive:
         if not normalized_model:
             raise ArchiveError("Enrichment model is required.")
         now = timestamp()
-        with self._write_lock:
-            with self._connect() as db:
-                document = db.execute("SELECT state FROM documents WHERE document_id = ?", (document_id,)).fetchone()
-                if not document:
-                    raise ArchiveError(f"Unknown document: {document_id}")
-                if document["state"] != ACTIVE_STATE:
-                    raise ArchiveError("Only active documents can be enriched.")
-                db.execute("DELETE FROM chunks WHERE document_id = ? AND chunk_origin = ?", (document_id, "ai"))
-                cursor = db.execute(
+
+        def enrich(db: sqlite3.Connection) -> None:
+            document = db.execute("SELECT state FROM documents WHERE document_id = ?", (document_id,)).fetchone()
+            if not document:
+                raise ArchiveError(f"Unknown document: {document_id}")
+            if document["state"] != ACTIVE_STATE:
+                raise ArchiveError("Only active documents can be enriched.")
+            db.execute("DELETE FROM chunks WHERE document_id = ? AND chunk_origin = ?", (document_id, "ai"))
+            cursor = db.execute(
+                """
+                INSERT INTO document_enrichments (document_id, model, skill_ids_json, summary, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    document_id,
+                    normalized_model,
+                    json.dumps([skill_id for skill_id in skill_ids if optional_text(skill_id)]),
+                    summary.strip(),
+                    json.dumps(payload or {}, sort_keys=True),
+                    now,
+                ),
+            )
+            enrichment_id = int(cursor.lastrowid)
+            for locator, text in chunks:
+                db.execute(
                     """
-                    INSERT INTO document_enrichments (document_id, model, skill_ids_json, summary, payload_json, created_at)
+                    INSERT INTO chunks (document_id, locator, text, state, chunk_origin, enrichment_id)
                     VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (
-                        document_id,
-                        normalized_model,
-                        json.dumps([skill_id for skill_id in skill_ids if optional_text(skill_id)]),
-                        summary.strip(),
-                        json.dumps(payload or {}, sort_keys=True),
-                        now,
-                    ),
+                    (document_id, locator, text, ACTIVE_STATE, "ai", enrichment_id),
                 )
-                enrichment_id = int(cursor.lastrowid)
-                for locator, text in chunks:
-                    db.execute(
-                        """
-                        INSERT INTO chunks (document_id, locator, text, state, chunk_origin, enrichment_id)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        """,
-                        (document_id, locator, text, ACTIVE_STATE, "ai", enrichment_id),
-                    )
-                db.execute("UPDATE documents SET updated_at = ? WHERE document_id = ?", (now, document_id))
-            self.rebuild_index()
+            db.execute("UPDATE documents SET updated_at = ? WHERE document_id = ?", (now, document_id))
+
+        self._publish_catalog_change(enrich)
         return self.get_document(document_id)
 
     def remove_document(self, document_id: str, *, reason: str = "Removed by user.") -> dict:
         return self.invalidate_document(document_id, state="deleted", reason=reason)
 
     def rebuild_index(self) -> dict:
+        _, generation = self._publish_catalog_change(lambda _db: None)
+        return generation.manifest
+
+    def _publish_catalog_change(
+        self,
+        mutation: Callable[[sqlite3.Connection], Any],
+        *,
+        project: bool = True,
+    ) -> tuple[Any, IndexGeneration]:
         with self._write_lock:
-            with self._connect() as db:
-                rows = db.execute(
-                    "SELECT chunk_id, text FROM chunks WHERE state = ? ORDER BY chunk_id",
-                    (ACTIVE_STATE,),
-                ).fetchall()
+            previous_generation_id = self._active_index_generation()
+            db = self._connect()
+            generation: IndexGeneration | None = None
+            try:
+                db.execute("BEGIN IMMEDIATE")
+                result = mutation(db)
+                generation = self._build_index_generation(db)
+                db.execute(
+                    "UPDATE archive_state SET active_index_generation = ?, updated_at = ? WHERE state_id = ?",
+                    (generation.generation, timestamp(), ARCHIVE_STATE_ROW_ID),
+                )
+                db.commit()
+            except Exception:
+                if db.in_transaction:
+                    db.rollback()
+                if generation is not None and generation.created and generation.generation != previous_generation_id:
+                    shutil.rmtree(generation.index_path.parent, ignore_errors=True)
+                raise
+            finally:
+                db.close()
+            assert generation is not None
+            if project:
+                self._reconcile_index_projection(generation, strict=False)
+            return result, generation
+
+    def _build_index_generation(self, db: sqlite3.Connection) -> IndexGeneration:
+        rows = db.execute(
+            "SELECT chunk_id, text FROM chunks WHERE state = ? ORDER BY chunk_id",
+            (ACTIVE_STATE,),
+        ).fetchall()
+        generation_id = catalog_index_generation(rows)
+        existing = self._load_index_generation(generation_id)
+        if existing is not None:
+            return existing
+
+        generation_dir = self.index_generations_dir / generation_id
+        staging_dir = Path(tempfile.mkdtemp(prefix=".generation-", dir=self.index_generations_dir))
+        try:
             index = IdMapIndex(dim=EMBEDDING_DIM, bit_width=TURBOVEC_BIT_WIDTH)
             if rows:
                 vectors = np.vstack([embed_text(row["text"]) for row in rows]).astype(np.float32)
                 ids = np.array([row["chunk_id"] for row in rows], dtype=np.uint64)
                 index.add_with_ids(vectors, ids)
-            tmp_path = self.index_path.with_suffix(".tvim.tmp")
-            index.write(str(tmp_path))
-            os.replace(tmp_path, self.index_path)
+            staged_index_path = staging_dir / "chunks.tvim"
+            index.write(str(staged_index_path))
             manifest = {
                 "schemaVersion": ARCHIVE_SCHEMA_VERSION,
                 "embeddingProfileId": EMBEDDING_PROFILE_ID,
@@ -1137,10 +1259,162 @@ class DocumentationArchive:
                 "turbovecIndexFormat": TURBOVEC_INDEX_FORMAT,
                 "denseOnlyMinScore": DENSE_ONLY_MIN_SCORE,
                 "activeChunkCount": len(rows),
+                "catalogGeneration": generation_id,
+                "indexSha256": sha256_file(staged_index_path),
                 "rebuiltAt": timestamp(),
             }
-            self.manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-            return manifest
+            staged_manifest_path = staging_dir / "manifest.json"
+            staged_manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            if generation_dir.exists():
+                shutil.rmtree(generation_dir)
+            os.replace(staging_dir, generation_dir)
+            return IndexGeneration(
+                generation=generation_id,
+                index_path=generation_dir / "chunks.tvim",
+                manifest_path=generation_dir / "manifest.json",
+                manifest=manifest,
+                created=True,
+            )
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+    def _load_index_generation(self, generation_id: str | None) -> IndexGeneration | None:
+        if generation_id is None or not re.fullmatch(r"[0-9a-f]{64}", generation_id):
+            return None
+        generation_dir = self.index_generations_dir / generation_id
+        index_path = generation_dir / "chunks.tvim"
+        manifest_path = generation_dir / "manifest.json"
+        if not index_path.is_file() or not manifest_path.is_file():
+            return None
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if (
+            manifest.get("catalogGeneration") != generation_id
+            or manifest.get("embeddingProfileId") != EMBEDDING_PROFILE_ID
+            or manifest.get("indexSha256") != sha256_file(index_path)
+        ):
+            return None
+        return IndexGeneration(
+            generation=generation_id,
+            index_path=index_path,
+            manifest_path=manifest_path,
+            manifest=manifest,
+            created=False,
+        )
+
+    def _active_index_generation(self) -> str | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT active_index_generation FROM archive_state WHERE state_id = ?",
+                (ARCHIVE_STATE_ROW_ID,),
+            ).fetchone()
+        return str(row["active_index_generation"]) if row and row["active_index_generation"] else None
+
+    def _projected_index_generation(self) -> str | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT projected_index_generation FROM archive_state WHERE state_id = ?",
+                (ARCHIVE_STATE_ROW_ID,),
+            ).fetchone()
+        return str(row["projected_index_generation"]) if row and row["projected_index_generation"] else None
+
+    def _active_index_generation_record(self) -> IndexGeneration:
+        generation = self._load_index_generation(self._active_index_generation())
+        if generation is None:
+            raise ArchiveError("The active documentation index generation is unavailable; restart the indexer or rebuild the index.")
+        return generation
+
+    def _active_index_path(self) -> Path:
+        return self._active_index_generation_record().index_path
+
+    def _activate_index_generation(self, generation: IndexGeneration) -> None:
+        if not self._index_projection_aliases_are_canonical():
+            raise ArchiveError("Documentation index projection aliases require startup reconciliation.")
+        self._replace_with_relative_symlink(generation.index_path.parent, self.index_projection_path)
+
+    def _prune_inactive_index_generations(self, active_generation_id: str) -> None:
+        for path in self.index_generations_dir.iterdir():
+            if path.name != active_generation_id and path.is_dir() and re.fullmatch(r"[0-9a-f]{64}", path.name):
+                shutil.rmtree(path)
+
+    def _replace_with_relative_symlink(self, target: Path, link: Path) -> None:
+        temporary_link = link.with_name(f".{link.name}.tmp")
+        temporary_link.unlink(missing_ok=True)
+        try:
+            temporary_link.symlink_to(os.path.relpath(target, link.parent))
+            os.replace(temporary_link, link)
+        finally:
+            temporary_link.unlink(missing_ok=True)
+
+    def _reconcile_index_projection(self, generation: IndexGeneration, *, strict: bool) -> bool:
+        if self._projected_index_generation() == generation.generation and self._index_projection_matches(generation):
+            return True
+        try:
+            self._activate_index_generation(generation)
+            self._prune_inactive_index_generations(generation.generation)
+            with self._connect() as db:
+                db.execute(
+                    "UPDATE archive_state SET projected_index_generation = ? WHERE state_id = ?",
+                    (generation.generation, ARCHIVE_STATE_ROW_ID),
+                )
+            return True
+        except Exception as error:
+            if strict:
+                raise
+            logger.warning(
+                "Documentation index projection remains pending for generation %s: %s",
+                generation.generation,
+                error,
+            )
+            return False
+
+    def _index_projection_matches(self, generation: IndexGeneration) -> bool:
+        try:
+            return (
+                self._index_projection_aliases_are_canonical()
+                and self.index_projection_path.resolve(strict=True) == generation.index_path.parent.resolve(strict=True)
+                and self.index_path.is_file()
+                and self.manifest_path.is_file()
+                and sha256_file(self.index_path) == sha256_file(generation.index_path)
+                and sha256_file(self.manifest_path) == sha256_file(generation.manifest_path)
+            )
+        except OSError:
+            return False
+
+    def _index_projection_aliases_are_canonical(self) -> bool:
+        expected_index_target = os.path.relpath(self.index_projection_path / self.index_path.name, self.index_path.parent)
+        expected_manifest_target = os.path.relpath(self.index_projection_path / self.manifest_path.name, self.manifest_path.parent)
+        try:
+            return (
+                self.index_projection_path.is_symlink()
+                and self.index_path.is_symlink()
+                and self.manifest_path.is_symlink()
+                and os.readlink(self.index_path) == expected_index_target
+                and os.readlink(self.manifest_path) == expected_manifest_target
+            )
+        except OSError:
+            return False
+
+    def _prepare_index_projection_aliases(self, active_generation: IndexGeneration) -> None:
+        if self._index_projection_aliases_are_canonical():
+            return
+        projected_generation = self._load_index_generation(self._projected_index_generation())
+        baseline_generation = projected_generation or active_generation
+        if self.index_projection_path.is_dir() and not self.index_projection_path.is_symlink():
+            shutil.rmtree(self.index_projection_path)
+        self._replace_with_relative_symlink(baseline_generation.index_path.parent, self.index_projection_path)
+        self._replace_with_relative_symlink(self.index_projection_path / self.index_path.name, self.index_path)
+        self._replace_with_relative_symlink(self.index_projection_path / self.manifest_path.name, self.manifest_path)
+
+    def _recover_index_publication(self) -> None:
+        with self._write_lock:
+            generation = self._load_index_generation(self._active_index_generation())
+            if generation is None:
+                _, generation = self._publish_catalog_change(lambda _db: None, project=False)
+            self._prepare_index_projection_aliases(generation)
+            self._reconcile_index_projection(generation, strict=True)
 
     def _write_document(
         self,
@@ -1154,82 +1428,87 @@ class DocumentationArchive:
         collection: str | None,
         tags: list[str] | None,
     ) -> IngestedDocument:
-        with self._write_lock:
-            chunks = chunk_spans(spans)
-            if not chunks:
-                raise ArchiveError("No extractable text was found.")
-            content_sha256 = sha256_bytes(content_bytes)
-            document_id = "doc_" + sha256_bytes(f"{uri}\0{content_sha256}".encode("utf-8"))[:24]
-            now = timestamp()
-            with self._connect() as db:
-                existing = db.execute("SELECT document_id FROM documents WHERE document_id = ?", (document_id,)).fetchone()
-                superseded_documents = db.execute(
-                    "SELECT document_id, state FROM documents WHERE uri = ? AND document_id != ? AND state = ?",
-                    (uri, document_id, ACTIVE_STATE),
-                ).fetchall()
-                for superseded in superseded_documents:
-                    db.execute(
-                        "UPDATE documents SET state = ?, updated_at = ? WHERE document_id = ?",
-                        ("superseded", now, superseded["document_id"]),
-                    )
-                    db.execute("UPDATE chunks SET state = ? WHERE document_id = ?", ("superseded", superseded["document_id"]))
-                    db.execute(
-                        """
-                        INSERT INTO invalidation_events (document_id, previous_state, next_state, reason, created_at)
-                        VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (
-                            superseded["document_id"],
-                            superseded["state"],
-                            "superseded",
-                            "Superseded by a newer revision from the same source URI.",
-                            now,
-                        ),
-                    )
-                if existing:
-                    db.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
+        chunks = chunk_spans(spans)
+        if not chunks:
+            raise ArchiveError("No extractable text was found.")
+        content_sha256 = sha256_bytes(content_bytes)
+        document_id = "doc_" + sha256_bytes(f"{uri}\0{content_sha256}".encode("utf-8"))[:24]
+        now = timestamp()
+
+        def write_document(db: sqlite3.Connection) -> None:
+            existing = db.execute("SELECT document_id FROM documents WHERE document_id = ?", (document_id,)).fetchone()
+            superseded_documents = db.execute(
+                "SELECT document_id, state FROM documents WHERE uri = ? AND document_id != ? AND state = ?",
+                (uri, document_id, ACTIVE_STATE),
+            ).fetchall()
+            for superseded in superseded_documents:
+                db.execute(
+                    "UPDATE documents SET state = ?, updated_at = ? WHERE document_id = ?",
+                    ("superseded", now, superseded["document_id"]),
+                )
+                db.execute("UPDATE chunks SET state = ? WHERE document_id = ?", ("superseded", superseded["document_id"]))
                 db.execute(
                     """
-                    INSERT INTO documents (
-                      document_id, title, source_type, uri, snapshot_path, content_sha256, state, collection,
-                      tags_json, created_at, updated_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(document_id) DO UPDATE SET
-                      title = excluded.title,
-                      source_type = excluded.source_type,
-                      uri = excluded.uri,
-                      snapshot_path = excluded.snapshot_path,
-                      content_sha256 = excluded.content_sha256,
-                      state = excluded.state,
-                      collection = excluded.collection,
-                      tags_json = excluded.tags_json,
-                      updated_at = excluded.updated_at
+                    INSERT INTO invalidation_events (document_id, previous_state, next_state, reason, created_at)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
                     (
-                        document_id,
-                        title.strip() or uri,
-                        source_type,
-                        uri,
-                        snapshot_path.relative_to(self.root).as_posix(),
-                        content_sha256,
-                        ACTIVE_STATE,
-                        collection,
-                        json.dumps(tags or []),
-                        now,
+                        superseded["document_id"],
+                        superseded["state"],
+                        "superseded",
+                        "Superseded by a newer revision from the same source URI.",
                         now,
                     ),
                 )
-                for locator, text in chunks:
-                    db.execute(
-                        """
-                        INSERT INTO chunks (document_id, locator, text, state, chunk_origin, enrichment_id)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        """,
-                        (document_id, locator, text, ACTIVE_STATE, "source", None),
-                    )
-            self.rebuild_index()
-            return IngestedDocument(document_id, title.strip() or uri, source_type, ACTIVE_STATE, len(chunks), content_sha256)
+            if existing:
+                db.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
+            db.execute(
+                """
+                INSERT INTO documents (
+                  document_id, title, source_type, uri, snapshot_path, content_sha256, state, collection,
+                  tags_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(document_id) DO UPDATE SET
+                  title = excluded.title,
+                  source_type = excluded.source_type,
+                  uri = excluded.uri,
+                  snapshot_path = excluded.snapshot_path,
+                  content_sha256 = excluded.content_sha256,
+                  state = excluded.state,
+                  collection = excluded.collection,
+                  tags_json = excluded.tags_json,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    document_id,
+                    title.strip() or uri,
+                    source_type,
+                    uri,
+                    snapshot_path.relative_to(self.root).as_posix(),
+                    content_sha256,
+                    ACTIVE_STATE,
+                    collection,
+                    json.dumps(tags or []),
+                    now,
+                    now,
+                ),
+            )
+            for locator, text in chunks:
+                db.execute(
+                    """
+                    INSERT INTO chunks (document_id, locator, text, state, chunk_origin, enrichment_id)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (document_id, locator, text, ACTIVE_STATE, "source", None),
+                )
+
+        try:
+            self._publish_catalog_change(write_document)
+        except Exception:
+            self._discard_unreferenced_snapshot(snapshot_path)
+            raise
+        return IngestedDocument(document_id, title.strip() or uri, source_type, ACTIVE_STATE, len(chunks), content_sha256)
 
     def _allowed_chunk_ids(self, *, states: list[str], source_types: list[str] | None, collection: str | None) -> list[int]:
         where = ["c.state IN ({})".format(", ".join("?" for _ in states))]
@@ -1251,9 +1530,7 @@ class DocumentationArchive:
             return [int(row["chunk_id"]) for row in db.execute(sql, params)]
 
     def _dense_scores(self, query: str, allowed_ids: list[int], limit: int) -> dict[int, float]:
-        if not self.index_path.exists():
-            return {}
-        index = IdMapIndex.load(str(self.index_path))
+        index = IdMapIndex.load(str(self._active_index_path()))
         query_vector = embed_text(query).reshape(1, EMBEDDING_DIM)
         allowed = np.array(allowed_ids, dtype=np.uint64)
         scores, ids = index.search(query_vector, k=min(max(limit * 4, limit), len(allowed_ids)), allowlist=allowed)
@@ -1358,6 +1635,30 @@ class DocumentationArchive:
             (directory / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return artifact
 
+    def _discard_unreferenced_snapshot(self, snapshot_path: Path) -> None:
+        relative_path = snapshot_path.relative_to(self.root).as_posix()
+        relative_directory = snapshot_path.parent.relative_to(self.root).as_posix() + "/"
+        with self._connect() as db:
+            reference_count = int(
+                db.execute(
+                    "SELECT COUNT(*) FROM documents WHERE snapshot_path = ? OR substr(snapshot_path, 1, ?) = ?",
+                    (relative_path, len(relative_directory), relative_directory),
+                ).fetchone()[0]
+            )
+        if reference_count == 0 and snapshot_path.parent.exists():
+            shutil.rmtree(snapshot_path.parent)
+
+    def _imported_snapshot_paths(self, source_root: Path) -> list[Path]:
+        source = sqlite3.connect(source_root / "catalog.sqlite")
+        try:
+            stored_paths = [
+                str(row[0])
+                for row in source.execute("SELECT snapshot_path FROM documents ORDER BY document_id").fetchall()
+            ]
+        finally:
+            source.close()
+        return [self.root / safe_archive_relative_path(stored_path) for stored_path in stored_paths]
+
     def _document_row(self, document_id: str) -> sqlite3.Row:
         with self._connect() as db:
             document = db.execute("SELECT * FROM documents WHERE document_id = ?", (document_id,)).fetchone()
@@ -1378,11 +1679,39 @@ class DocumentationArchive:
             totals["databaseBytes"] = sqlite_database_bytes(db)
         return totals
 
-    def _archive_files(self) -> list[ArchiveFileSize]:
-        return [archive_file_size(self.root, path) for path in sorted(self.root.rglob("*")) if path.is_file()]
+    def _archive_files(self, generation: IndexGeneration | None = None) -> list[ArchiveFileSize]:
+        stable_index_paths = {self.index_path, self.manifest_path}
+        files = [
+            archive_file_size(self.root, path)
+            for path in sorted(self.root.rglob("*"))
+            if path.is_file()
+            and path not in stable_index_paths
+            and not is_relative_to(path, self.index_projection_path)
+            and not is_relative_to(path, self.index_generations_dir)
+        ]
+        generation = generation or self._active_index_generation_record()
+        files.extend(
+            (
+                archive_file_size_at(generation.index_path, self.index_path.relative_to(self.root).as_posix()),
+                archive_file_size_at(generation.manifest_path, self.manifest_path.relative_to(self.root).as_posix()),
+            )
+        )
+        return sorted(files, key=lambda file: file.relative_path)
+
+    def _archive_file_source(self, relative_path: str, generation: IndexGeneration) -> Path:
+        if relative_path == self.index_path.relative_to(self.root).as_posix():
+            return generation.index_path
+        if relative_path == self.manifest_path.relative_to(self.root).as_posix():
+            return generation.manifest_path
+        return self.root / relative_path
 
     def _copy_archive_root_for_export(self, staged_root: Path) -> None:
+        stable_index_paths = {self.index_path, self.manifest_path}
         for path in sorted(self.root.rglob("*")):
+            if is_relative_to(path, self.index_generations_dir) or is_relative_to(path, self.index_projection_path):
+                continue
+            if path in stable_index_paths:
+                continue
             relative_path = path.relative_to(self.root)
             if is_catalog_database_relative_path(relative_path):
                 continue
@@ -1392,6 +1721,13 @@ class DocumentationArchive:
             elif path.is_file():
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, target)
+        generation = self._active_index_generation_record()
+        for source, destination in (
+            (generation.index_path, staged_root / self.index_path.relative_to(self.root)),
+            (generation.manifest_path, staged_root / self.manifest_path.relative_to(self.root)),
+        ):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
 
     def _backup_catalog_to(self, target_path: Path) -> None:
         target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1616,7 +1952,7 @@ class DocumentationArchive:
                 return candidate
         raise ArchiveError("Could not allocate archive import backup path.")
 
-    def _merge_archive_root(self, source_root: Path) -> dict[str, Any]:
+    def _merge_archive_root(self, source_root: Path, target: sqlite3.Connection | None = None) -> dict[str, Any]:
         summary: dict[str, Any] = {
             "mode": "merge",
             "status": "imported",
@@ -1631,7 +1967,8 @@ class DocumentationArchive:
         source = sqlite3.connect(source_root / "catalog.sqlite")
         source.row_factory = sqlite3.Row
         try:
-            with self._connect() as target:
+            target_context = self._connect() if target is None else nullcontext(target)
+            with target_context as target:
                 documents = source.execute("SELECT * FROM documents ORDER BY created_at, document_id").fetchall()
                 for document in documents:
                     document_id = str(document["document_id"])
@@ -1857,6 +2194,16 @@ class DocumentationArchive:
                   reason TEXT NOT NULL,
                   created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS archive_state (
+                  state_id INTEGER PRIMARY KEY CHECK (state_id = 1),
+                  active_index_generation TEXT,
+                  projected_index_generation TEXT,
+                  updated_at TEXT NOT NULL
+                );
+
+                INSERT OR IGNORE INTO archive_state (state_id, active_index_generation, updated_at)
+                VALUES (1, NULL, '');
                 """
             )
             columns = {row["name"] for row in db.execute("PRAGMA table_info(chunks)").fetchall()}
@@ -1864,6 +2211,9 @@ class DocumentationArchive:
                 db.execute("ALTER TABLE chunks ADD COLUMN chunk_origin TEXT NOT NULL DEFAULT 'source'")
             if "enrichment_id" not in columns:
                 db.execute("ALTER TABLE chunks ADD COLUMN enrichment_id INTEGER")
+            archive_state_columns = {row["name"] for row in db.execute("PRAGMA table_info(archive_state)").fetchall()}
+            if "projected_index_generation" not in archive_state_columns:
+                db.execute("ALTER TABLE archive_state ADD COLUMN projected_index_generation TEXT")
 
 
 class ArchiveError(ValueError):
@@ -1906,8 +2256,11 @@ def safe_zip_member_name(name: str) -> str:
 
 
 def archive_file_size(root: Path, path: Path) -> ArchiveFileSize:
+    return archive_file_size_at(path, path.relative_to(root).as_posix())
+
+
+def archive_file_size_at(path: Path, relative_path: str) -> ArchiveFileSize:
     stat_result = path.stat()
-    relative_path = path.relative_to(root).as_posix()
     return ArchiveFileSize(
         relative_path=relative_path,
         logical_bytes=stat_result.st_size,
@@ -4394,6 +4747,29 @@ def sha256_file(path: Path) -> str:
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def catalog_index_generation(rows: list[sqlite3.Row]) -> str:
+    digest = hashlib.sha256()
+    digest.update(
+        json.dumps(
+            {
+                "schemaVersion": ARCHIVE_SCHEMA_VERSION,
+                "embeddingProfileId": EMBEDDING_PROFILE_ID,
+                "embeddingDimension": EMBEDDING_DIM,
+                "turbovecBitWidth": TURBOVEC_BIT_WIDTH,
+                "turbovecVersion": TURBOVEC_VERSION,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    for row in rows:
+        text = str(row["text"]).encode("utf-8")
+        digest.update(int(row["chunk_id"]).to_bytes(8, "big", signed=False))
+        digest.update(len(text).to_bytes(8, "big", signed=False))
+        digest.update(text)
     return digest.hexdigest()
 
 

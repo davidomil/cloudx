@@ -1,4 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement, type RefObject } from "react";
+import { CodexStateSourceSelect } from "./CodexStateSourceSelect.js";
 import { AlertTriangle, Bell, BellRing, Bot, CheckCheck, ChevronDown, Columns2, GitBranch, LayoutTemplate, Maximize2, Mic, MicOff, Minimize2, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
 
 import { DEFAULT_WORKSPACE_MAX_PANES, RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsStore, type StatePersistenceStatus, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
@@ -86,6 +87,7 @@ import { applyVoiceWorkspaceResultsToWorkspace, buildClientVoiceContext, voiceCo
 import { WebViewerPanel } from "./WebViewerPanel.js";
 import { WorktreeManagerPanel } from "./WorktreeManagerPanel.js";
 import { parseWorkspaceSocketUpdate } from "./workspaceSocketUpdate.js";
+import { WorkspaceWriteCoordinator } from "./workspaceWriteCoordinator.js";
 import type { AutomationPanelState, AutomationPanelStateUpdater } from "./AutomationPanel.js";
 import type { DocumentationPanelState, DocumentationPanelStateUpdater } from "./DocumentationPanel.js";
 
@@ -160,6 +162,13 @@ function useMobileZoomSuppression() {
   }, []);
 }
 
+export function commitPaneForTabCreation(current: TabLayoutState, paneId: string, commitLayout: (layout: TabLayoutState) => void): void {
+  const nextLayout = activatePane(current, paneId);
+  if (nextLayout !== current) {
+    commitLayout(nextLayout);
+  }
+}
+
 export function App() {
   const initialLayout = useMemo(() => defaultLayout(), []);
   const [plugins, setPlugins] = useState<PluginDescriptor[]>([]);
@@ -180,6 +189,7 @@ export function App() {
   const [tabSettings, setTabSettings] = useState<{ tabId: string; sectionId?: string } | undefined>();
   const [createTargetPaneId, setCreateTargetPaneId] = useState<string | undefined>();
   const [error, setError] = useState<string | undefined>();
+  const [layoutPersistenceError, setLayoutPersistenceError] = useState<string | undefined>();
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("checking");
   const [voiceState, setVoiceState] = useState<"idle" | "recording" | "processing">("idle");
   const [voiceMessage, setVoiceMessage] = useState<string | undefined>();
@@ -205,10 +215,27 @@ export function App() {
   const layoutRef = useRef<TabLayoutState>(initialLayout);
   const activeTabIdRef = useRef<string | undefined>(undefined);
   const createTargetPaneIdRef = useRef<string | undefined>(undefined);
-  const persistLayoutTimerRef = useRef<number | undefined>(undefined);
   const pendingLayoutPersistWindowIdRef = useRef<string | undefined>(undefined);
   const pendingLayoutBaseRef = useRef<TabLayoutState | undefined>(undefined);
   const pendingLayoutPersistRef = useRef<TabLayoutState | undefined>(undefined);
+  const layoutPersistenceErrorRef = useRef<string | undefined>(undefined);
+  const workspaceWritesRef = useRef<WorkspaceWriteCoordinator | undefined>(undefined);
+  workspaceWritesRef.current ??= new WorkspaceWriteCoordinator(
+    async (windowId, persistedLayout) => {
+      await updateWindow(windowId, { layout: persistedLayout });
+      if (pendingLayoutPersistWindowIdRef.current === windowId && pendingLayoutPersistRef.current === persistedLayout) {
+        clearPendingLayoutPersistence();
+        resolveLayoutPersistenceError();
+      }
+    },
+    200,
+    (err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      layoutPersistenceErrorRef.current = message;
+      setLayoutPersistenceError(message);
+    }
+  );
+  const workspaceWrites = workspaceWritesRef.current;
   const audioSessionRef = useRef<VoiceAudioStreamSession | undefined>(undefined);
   const notificationToastTimersRef = useRef<Map<string, number>>(new Map());
   const topbarMicControlRef = useRef<HTMLDivElement | null>(null);
@@ -242,9 +269,7 @@ export function App() {
     return () => {
       audioSessionRef.current?.cancel();
       closeWorkspaceSocket();
-      if (persistLayoutTimerRef.current !== undefined) {
-        window.clearTimeout(persistLayoutTimerRef.current);
-      }
+      workspaceWritesRef.current?.dispose();
       clearNotificationToastTimers();
       window.clearInterval(interval);
     };
@@ -423,9 +448,18 @@ export function App() {
   }, [loadRulesSkillsStore]);
 
   function applyWorkspaceState(state: WorkspaceStateResponse, options: { preservePendingLayout?: boolean } = {}) {
-    const pendingMerge = options.preservePendingLayout ? workspaceStateWithPreservedLayout(state, layoutRef.current, pendingLayoutPersistWindowIdRef.current, pendingLayoutBaseRef.current, activeTabIdRef.current) : undefined;
-    if (pendingMerge?.decision === "accepted-server") {
+    let pendingMerge = options.preservePendingLayout ? workspaceStateWithPreservedLayout(state, layoutRef.current, pendingLayoutPersistWindowIdRef.current, pendingLayoutBaseRef.current, activeTabIdRef.current) : undefined;
+    const incomingPendingWindow = state.windows.find((window) => window.id === pendingLayoutPersistWindowIdRef.current);
+    const pendingLayout = pendingLayoutPersistRef.current;
+    const serverPersistedPendingLayout = incomingPendingWindow && pendingLayout ? tabLayoutsEqual(incomingPendingWindow.layout, pendingLayout) : false;
+    if (pendingMerge?.decision === "accepted-server" && (workspaceWrites.hasUnsettledLayoutWrite() || layoutPersistenceErrorRef.current !== undefined) && !serverPersistedPendingLayout) {
+      pendingMerge = workspaceStateWithPreservedLayout(state, layoutRef.current, pendingLayoutPersistWindowIdRef.current, undefined, activeTabIdRef.current);
+    }
+    if (pendingMerge?.decision === "accepted-server" && (layoutPersistenceErrorRef.current === undefined || serverPersistedPendingLayout)) {
       clearPendingLayoutPersistence();
+      if (serverPersistedPendingLayout) {
+        resolveLayoutPersistenceError();
+      }
     }
     const effectiveState = pendingMerge?.state ?? state;
     const nextLayout = effectiveState.windows.find((window) => window.id === effectiveState.activeWindowId)?.layout ?? effectiveState.windows[0]?.layout ?? defaultLayout();
@@ -445,10 +479,7 @@ export function App() {
 
   function applyWorkspaceTabs(nextTabs: WorkspaceTab[], nextActiveTabId?: string) {
     const previousTabs = new Map(tabsRef.current.map((tab) => [tab.id, tab]));
-    let nextLayout = reconcileLayout(layoutRef.current, nextTabs, nextActiveTabId);
-    if (createTargetPaneIdRef.current && nextActiveTabId && !previousTabs.has(nextActiveTabId)) {
-      nextLayout = addTabToPane(nextLayout, resolveTabCreationPaneId(nextLayout, createTargetPaneIdRef.current), nextActiveTabId);
-    }
+    const nextLayout = reconcileLayout(layoutRef.current, nextTabs, nextActiveTabId);
     tabsRef.current = nextTabs;
     layoutRef.current = nextLayout;
     activeTabIdRef.current = nextActiveTabId;
@@ -570,29 +601,19 @@ export function App() {
     }
     pendingLayoutPersistWindowIdRef.current = windowId;
     pendingLayoutPersistRef.current = nextLayout;
-    if (persistLayoutTimerRef.current !== undefined) {
-      window.clearTimeout(persistLayoutTimerRef.current);
-    }
-    const layoutForPersistence = nextLayout;
-    persistLayoutTimerRef.current = window.setTimeout(() => {
-      void updateWindow(windowId, { layout: layoutForPersistence })
-        .then(() => {
-          if (pendingLayoutPersistWindowIdRef.current === windowId && pendingLayoutPersistRef.current === layoutForPersistence) {
-            clearPendingLayoutPersistence();
-          }
-        })
-        .catch((err) => setError(err instanceof Error ? err.message : String(err)));
-    }, 200);
+    workspaceWrites.scheduleLayout(windowId, nextLayout);
   }
 
   function clearPendingLayoutPersistence() {
-    if (persistLayoutTimerRef.current !== undefined) {
-      window.clearTimeout(persistLayoutTimerRef.current);
-      persistLayoutTimerRef.current = undefined;
-    }
+    workspaceWrites.cancelPending();
     pendingLayoutPersistWindowIdRef.current = undefined;
     pendingLayoutBaseRef.current = undefined;
     pendingLayoutPersistRef.current = undefined;
+  }
+
+  function resolveLayoutPersistenceError() {
+    layoutPersistenceErrorRef.current = undefined;
+    setLayoutPersistenceError(undefined);
   }
 
   function updateLayout(updater: (current: TabLayoutState) => TabLayoutState) {
@@ -640,9 +661,7 @@ export function App() {
   function selectPaneForCreation(paneId: string) {
     createTargetPaneIdRef.current = paneId;
     setCreateTargetPaneId(paneId);
-    const nextLayout = activatePane(layoutRef.current, paneId);
-    layoutRef.current = nextLayout;
-    commitLayout(nextLayout);
+    commitPaneForTabCreation(layoutRef.current, paneId, commitLayout);
   }
 
   function openCreateDialogForPane(paneId: string) {
@@ -683,14 +702,25 @@ export function App() {
     setCreateTargetPaneId((current) => (current === paneId ? undefined : current));
   }
 
-  async function handleCreate(input: CreateTabRequest) {
+  async function handleCreate(input: Omit<CreateTabRequest, "windowId" | "paneId">) {
     setError(undefined);
     try {
-      const tab = await createTab({ ...input, windowId: input.windowId ?? activeWindowIdRef.current });
-      setTabs((current) => upsertTab(current, tab));
       const targetPaneId = createTargetPaneIdRef.current ?? createTargetPaneId;
-      updateLayout((current) => addTabToPane(current, resolveTabCreationPaneId(current, targetPaneId), tab.id));
+      const windowId = activeWindowIdRef.current;
+      if (!windowId) {
+        throw new Error("Select a workspace window before creating a tab.");
+      }
+      const paneId = resolveTabCreationPaneId(layoutRef.current, targetPaneId);
+      const { tab, window } = await workspaceWrites.run(() => createTab({ ...input, windowId, paneId }));
+      const nextTabs = upsertTab(tabsRef.current, tab);
+      const nextWindows = upsertWindow(windowsRef.current, window);
+      tabsRef.current = nextTabs;
+      windowsRef.current = nextWindows;
+      layoutRef.current = window.layout;
       activeTabIdRef.current = tab.id;
+      setTabs(nextTabs);
+      setWindows(nextWindows);
+      setLayout(window.layout);
       setActiveTabId(tab.id);
       setCreateOpen(false);
       createTargetPaneIdRef.current = undefined;
@@ -709,7 +739,7 @@ export function App() {
   async function handleClose(tabId: string) {
     setError(undefined);
     try {
-      const result = await closeTab(tabId);
+      const result = await workspaceWrites.run(() => closeTab(tabId));
       setTabs((current) => current.filter((tab) => tab.id !== tabId));
       updateLayout((current) => removeTabFromPanes(current, tabId));
       activeTabIdRef.current = result.activeTabId;
@@ -881,7 +911,7 @@ export function App() {
 
   function applyHookResult(result: Record<string, unknown>) {
     applyHookUiInstruction(result.uiInstruction);
-    applyWorkspaceExecutionResults([{ action: "ui-hook", ok: true, result }]);
+    applyWorkspaceExecutionResults([{ actionId: "ui-hook", action: "ui-hook", status: "succeeded", result }]);
   }
 
   function applyHookUiInstruction(instruction: unknown) {
@@ -926,7 +956,7 @@ export function App() {
         const changedWindow = next.windows.find((window) => window.id === windowId);
         if (changedWindow) {
           commitLayout(changedWindow.layout, { windowId, baseLayout: previousWindows.find((window) => window.id === windowId)?.layout, persist: false });
-          void updateWindow(windowId, { layout: changedWindow.layout }).catch((err) => setError(err instanceof Error ? err.message : String(err)));
+          void workspaceWrites.run(() => updateWindow(windowId, { layout: changedWindow.layout })).catch((err) => setError(err instanceof Error ? err.message : String(err)));
         }
       }
       layoutRef.current = next.layout;
@@ -986,22 +1016,22 @@ export function App() {
   }
 
   async function handleCreateWindow(name: string, defaultCwd: string, templateId?: string, createDirectory = false) {
-    applyWorkspaceState(await createWindow({ name, defaultCwd, createDirectory, pluginMetadata: pluginMetadataForTemplate(templateId) }));
+    applyWorkspaceState(await workspaceWrites.run(() => createWindow({ name, defaultCwd, createDirectory, pluginMetadata: pluginMetadataForTemplate(templateId) })));
   }
 
   async function handleSelectWindow(windowId: string) {
-    applyWorkspaceState(await selectWindow(windowId));
+    applyWorkspaceState(await workspaceWrites.run(() => selectWindow(windowId)));
     setWindowMenuOpen(false);
   }
 
   async function handleRenameWindow(windowId: string, name: string, defaultCwd: string, templateId?: string) {
-    applyWorkspaceState(await updateWindow(windowId, { name, defaultCwd, pluginMetadata: { [RULES_SKILLS_PLUGIN_ID]: templateId ? { selectedTemplateId: templateId } : null } }));
+    applyWorkspaceState(await workspaceWrites.run(() => updateWindow(windowId, { name, defaultCwd, pluginMetadata: { [RULES_SKILLS_PLUGIN_ID]: templateId ? { selectedTemplateId: templateId } : null } })));
   }
 
   async function handleDeleteWindow(windowId: string) {
     const target = windows.find((window) => window.id === windowId);
     if (!target) return;
-    applyWorkspaceState(await deleteWindow(windowId));
+    applyWorkspaceState(await workspaceWrites.run(() => deleteWindow(windowId)));
     setWindowMenuOpen(false);
   }
 
@@ -1010,12 +1040,12 @@ export function App() {
   }, []);
 
   async function handleSaveTemplate(name: string, basePath: string) {
-    const result = await saveLayoutTemplate({ name, basePath, windowId: activeWindowId });
+    const result = await workspaceWrites.run(() => saveLayoutTemplate({ name, basePath, windowId: activeWindowId }));
     applyWorkspaceState(result.workspace);
   }
 
   async function handleRenameTemplate(templateId: string, name: string) {
-    const result = await updateLayoutTemplate(templateId, { name });
+    const result = await workspaceWrites.run(() => updateLayoutTemplate(templateId, { name }));
     applyWorkspaceState(result.workspace);
   }
 
@@ -1025,12 +1055,12 @@ export function App() {
     if (!window.confirm(`Delete layout template ${target.name}?`)) {
       return;
     }
-    const result = await deleteLayoutTemplate(templateId);
+    const result = await workspaceWrites.run(() => deleteLayoutTemplate(templateId));
     applyWorkspaceState(result.workspace);
   }
 
   async function handleApplyTemplate(templateId: string, projectPath: string, name?: string) {
-    const result = await applyLayoutTemplate(templateId, { projectPath, name });
+    const result = await workspaceWrites.run(() => applyLayoutTemplate(templateId, { projectPath, name }));
     applyWorkspaceState(result.workspace);
     setTemplateMenuOpen(false);
   }
@@ -1325,7 +1355,7 @@ export function App() {
         </div>
       </header>
 
-      {error ? <div className="error-banner">{error}</div> : null}
+      {layoutPersistenceError ?? error ? <div className="error-banner">{layoutPersistenceError ?? error}</div> : null}
       {notificationToastIds.size ? <NotificationStack notifications={notifications.filter((notification) => notificationToastIds.has(notification.id))} onDismiss={dismissNotificationToast} /> : null}
 
       <section className={`pane-root${maximizedPaneId ? " maximized" : ""}`}>
@@ -2243,6 +2273,14 @@ function upsertTab(tabs: WorkspaceTab[], tab: WorkspaceTab): WorkspaceTab[] {
   return [...tabs.slice(0, existingIndex), tab, ...tabs.slice(existingIndex + 1)];
 }
 
+function upsertWindow(windows: WorkspaceWindow[], window: WorkspaceWindow): WorkspaceWindow[] {
+  const existingIndex = windows.findIndex((candidate) => candidate.id === window.id);
+  if (existingIndex === -1) {
+    return [...windows, window];
+  }
+  return [...windows.slice(0, existingIndex), window, ...windows.slice(existingIndex + 1)];
+}
+
 export type WorkspaceLayoutMergeDecision = "none" | "preserved-local" | "accepted-server";
 
 export interface WorkspaceLayoutMergeResult {
@@ -2553,7 +2591,7 @@ function CreateTabDialog({
   templates: PersonalityTemplate[];
   defaultCwd: string;
   onCancel: () => void;
-  onCreate: (input: CreateTabRequest) => Promise<void>;
+  onCreate: (input: Omit<CreateTabRequest, "windowId" | "paneId">) => Promise<void>;
 }) {
   const creatablePlugins = useMemo(() => plugins.filter((plugin) => plugin.creatable), [plugins]);
   const [pluginId, setPluginId] = useState<PluginId>(() => selectCreateTabPluginId(creatablePlugins));
@@ -2563,6 +2601,7 @@ function CreateTabDialog({
   const [templateId, setTemplateId] = useState("");
   const [codexResumeMode, setCodexResumeMode] = useState<CodexSessionResumeMode>("new");
   const [codexResumeSessionId, setCodexResumeSessionId] = useState("");
+  const [codexSourceId, setCodexSourceId] = useState("");
   const [codexResumeAll, setCodexResumeAll] = useState(false);
   const [codexResumeIncludeNonInteractive, setCodexResumeIncludeNonInteractive] = useState(false);
   const [createDirectory, setCreateDirectory] = useState(false);
@@ -2590,6 +2629,7 @@ function CreateTabDialog({
       setTemplateId("");
       setCodexResumeMode("new");
       setCodexResumeSessionId("");
+      setCodexSourceId("");
       setCodexResumeAll(false);
       setCodexResumeIncludeNonInteractive(false);
     }
@@ -2601,7 +2641,7 @@ function CreateTabDialog({
       const initialInput = isLocalWeb && localWebUrl.trim()
         ? { url: localWebUrl.trim() }
         : isCodex
-          ? codexTabInitialInput(codexResumeMode, codexResumeSessionId, codexResumeAll, codexResumeIncludeNonInteractive)
+          ? codexTabInitialInput(codexResumeMode, codexResumeSessionId, codexResumeAll, codexResumeIncludeNonInteractive, codexSourceId)
           : undefined;
       await onCreate({
         pluginId,
@@ -2655,7 +2695,16 @@ function CreateTabDialog({
         {isCodex ? (
           <label>
             Session
-            <select value={codexResumeMode} onChange={(event) => setCodexResumeMode(event.target.value as CodexSessionResumeMode)}>
+            <select aria-label="Session" value={codexResumeMode} onChange={(event) => {
+              const mode = event.target.value as CodexSessionResumeMode;
+              setCodexResumeMode(mode);
+              if (mode === "new") {
+                setCodexSourceId("");
+                setCodexResumeSessionId("");
+                setCodexResumeAll(false);
+                setCodexResumeIncludeNonInteractive(false);
+              }
+            }}>
               <option value="new">New session</option>
               <option value="picker">Resume picker</option>
               <option value="last">Resume last</option>
@@ -2663,6 +2712,7 @@ function CreateTabDialog({
             </select>
           </label>
         ) : null}
+        {isCodex && codexResumeMode !== "new" ? <CodexStateSourceSelect value={codexSourceId} onChange={setCodexSourceId} /> : null}
         {isCodex && codexResumeMode === "session" ? (
           <label>
             Session ID
@@ -2693,7 +2743,7 @@ function CreateTabDialog({
         ) : null}
         <div className="dialog-actions">
           <ControlButton onClick={onCancel}>Cancel</ControlButton>
-          <ControlButton className="primary-button" tone="primary" onClick={() => void submit()} disabled={!selectedPlugin || (requiresDirectory && !cwd.trim()) || (isCodex && codexResumeMode === "session" && !codexResumeSessionId.trim()) || busy}>
+          <ControlButton className="primary-button" tone="primary" onClick={() => void submit()} disabled={!selectedPlugin || (requiresDirectory && !cwd.trim()) || (isCodex && codexResumeMode !== "new" && !codexSourceId) || (isCodex && codexResumeMode === "session" && !codexResumeSessionId.trim()) || busy}>
             Create
           </ControlButton>
         </div>
@@ -2710,18 +2760,21 @@ export function codexTabInitialInput(
   resumeMode: CodexSessionResumeMode,
   sessionId: string,
   all: boolean,
-  includeNonInteractive: boolean
+  includeNonInteractive: boolean,
+  sourceId: string
 ): CreateTabRequest["initialInput"] {
   if (resumeMode === "new") {
     return undefined;
   }
+  if (!sourceId) throw new Error("Codex resume session source selection is required.");
   if (resumeMode === "session") {
     const trimmedSessionId = sessionId.trim();
-    return trimmedSessionId ? { resume: { mode: "session", sessionId: trimmedSessionId } } : undefined;
+    return trimmedSessionId ? { resume: { mode: "session", sourceId, sessionId: trimmedSessionId } } : undefined;
   }
   return {
     resume: {
       mode: resumeMode,
+      sourceId,
       all,
       includeNonInteractive
     }

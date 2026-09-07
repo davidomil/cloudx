@@ -1,10 +1,22 @@
-import { loadConfig, networkBindWarning, shouldWarnForNetworkBind } from "./config.js";
+import { loadConfig } from "./config.js";
+import { ProcessShutdownController } from "./lifecycle/ProcessShutdownController.js";
 import { buildServer } from "./server.js";
 
 const config = loadConfig();
-if (shouldWarnForNetworkBind(config.host)) {
-  console.warn(networkBindWarning(config.host, config.port, config.https ? "https" : "http"));
-}
 const app = await buildServer(config);
+const shutdown = new ProcessShutdownController(
+  () => app.close(),
+  process,
+  (error) => {
+    console.error("CloudX shutdown failed.", error);
+    process.exitCode = 1;
+  }
+);
+shutdown.start();
 
-await app.listen({ host: config.host, port: config.port });
+try {
+  await app.listen({ host: config.host, port: config.port });
+} catch (error) {
+  shutdown.dispose();
+  throw error;
+}

@@ -22,6 +22,8 @@ describe("voice debug log helpers", () => {
 
   it("redacts action text by default but can include full action input for debugging", () => {
     const action = {
+      id: "enter-text",
+      dependsOn: [],
       pluginId: "standard-terminal",
       action: "enter_text",
       input: { text: "rg; git; gh", submit: true },

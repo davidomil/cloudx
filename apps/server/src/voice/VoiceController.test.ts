@@ -6,7 +6,36 @@ import { VoiceController } from "./VoiceController.js";
 import type { VoicePlanner } from "./VoicePlanner.js";
 
 describe("VoiceController", () => {
-  it("disposes the app-server context provider when the controller is disposed", () => {
+  it("propagates caller cancellation through planning and action execution", async () => {
+    const controller = new AbortController();
+    const planner: VoicePlanner = {
+      async plan(input) {
+        expect(input.signal).not.toBe(controller.signal);
+        return {
+          transcript: input.transcript,
+          summary: "Run one action.",
+          actions: [{ id: "run", dependsOn: [], action: "run", input: {} }]
+        };
+      }
+    };
+    const sessions = {
+      async buildVoiceContext() {
+        return {};
+      },
+      async executeVoiceAction(_action: unknown, _fallbackTabId: unknown, signal: AbortSignal) {
+        expect(signal).not.toBe(controller.signal);
+        throw signal.reason;
+      }
+    };
+    const voice = new VoiceController(sessions as never, planner);
+    const execution = voice.handleTranscript("run", undefined, undefined, { signal: controller.signal });
+
+    controller.abort(new Error("caller cancelled"));
+
+    await expect(execution).rejects.toThrow("caller cancelled");
+  });
+
+  it("disposes the app-server context provider when the controller is disposed", async () => {
     const planner: VoicePlanner = {
       async plan() {
         return { transcript: "noop", summary: "", actions: [] };
@@ -26,16 +55,102 @@ describe("VoiceController", () => {
     const dispose = vi.spyOn(provider, "dispose");
     const controller = new VoiceController(sessions as never, planner, provider);
 
-    controller.dispose();
+    await controller.dispose();
 
     expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("aborts and joins active planning before disposing context resources", async () => {
+    const events: string[] = [];
+    let plannerSignal: AbortSignal | undefined;
+    const planner: VoicePlanner = {
+      async plan(input) {
+        events.push("planner:start");
+        plannerSignal = input.signal;
+        await new Promise<void>((_resolve, reject) => input.signal?.addEventListener("abort", () => reject(input.signal?.reason), { once: true }));
+        throw new Error("unreachable");
+      }
+    };
+    const sessions = {
+      async buildVoiceContext() {
+        events.push("context");
+        return {};
+      }
+    };
+    const provider = {
+      async context() {
+        events.push("context");
+        return {};
+      },
+      dispose() {
+        events.push("context:dispose");
+      }
+    };
+    const controller = new VoiceController(sessions as never, planner, provider);
+    const execution = controller.handleTranscript("run");
+    await vi.waitFor(() => expect(plannerSignal).toBeDefined());
+
+    controller.beginShutdown();
+    const disposal = controller.dispose();
+
+    await expect(execution).rejects.toThrow("Voice controller is shutting down.");
+    await disposal;
+    expect(plannerSignal?.aborted).toBe(true);
+    expect(events).toEqual(["context", "planner:start", "context:dispose"]);
+  });
+
+  it("aborts and joins active action execution and rejects later requests before context work", async () => {
+    const events: string[] = [];
+    let actionSignal: AbortSignal | undefined;
+    const planner: VoicePlanner = {
+      async plan(input) {
+        return {
+          transcript: input.transcript,
+          summary: "Run one action.",
+          actions: [{ id: "run", dependsOn: [], action: "run", input: {} }]
+        };
+      }
+    };
+    const sessions = {
+      async buildVoiceContext() {
+        events.push("context");
+        return {};
+      },
+      async executeVoiceAction(_action: unknown, _fallbackTabId: unknown, signal: AbortSignal) {
+        events.push("action:start");
+        actionSignal = signal;
+        await new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+        events.push("action:late");
+        return {};
+      }
+    };
+    const provider = {
+      async context() {
+        events.push("context");
+        return {};
+      },
+      dispose() {
+        events.push("context:dispose");
+      }
+    };
+    const controller = new VoiceController(sessions as never, planner, provider);
+    const execution = controller.handleTranscript("run");
+    await vi.waitFor(() => expect(actionSignal).toBeDefined());
+
+    const disposal = controller.dispose();
+
+    await expect(controller.handleTranscript("too late")).rejects.toThrow("Voice controller is shutting down.");
+    await expect(execution).rejects.toThrow("Voice controller is shutting down.");
+    await disposal;
+    expect(actionSignal?.aborted).toBe(true);
+    expect(events).toEqual(["context", "action:start", "context:dispose"]);
   });
 
   it("executes planner actions through the session store", async () => {
     const plan: VoiceActionPlan = {
       transcript: "type hello",
       summary: "type into active tab",
-      actions: [{ action: "enter_text", targetTabId: "tab-1", input: { text: "hello" } }]
+      actions: [{ id: "type-hello", dependsOn: [], action: "enter_text", targetTabId: "tab-1", input: { text: "hello" } }]
     };
     const planner: VoicePlanner = {
       async plan() {
@@ -68,7 +183,7 @@ describe("VoiceController", () => {
     const plan: VoiceActionPlan = {
       transcript: "list directory",
       summary: "List the active terminal directory.",
-      actions: [{ action: "enter_text", targetTabId: "tab-1", input: { text: "ls", submit: true } }]
+      actions: [{ id: "list-directory", dependsOn: [], action: "enter_text", targetTabId: "tab-1", input: { text: "ls", submit: true } }]
     };
     let plannerInput: { transcript: string; context: Record<string, unknown> } | undefined;
     const planner: VoicePlanner = {
@@ -97,7 +212,7 @@ describe("VoiceController", () => {
     expect(result.accepted).toBe(true);
     expect(plannerInput?.transcript).toBe("list directory");
     expect(plannerInput?.context).toMatchObject({ client: { activePaneId: "pane-2" } });
-    expect(result.plan.actions).toEqual([{ action: "enter_text", targetTabId: "tab-1", input: { text: "ls", submit: true } }]);
+    expect(result.plan.actions).toEqual([{ id: "list-directory", dependsOn: [], action: "enter_text", targetTabId: "tab-1", input: { text: "ls", submit: true } }]);
     expect(executed).toEqual(result.plan.actions);
   });
 
@@ -198,7 +313,7 @@ describe("VoiceController", () => {
     const plan: VoiceActionPlan = {
       transcript: "switch to tab build",
       summary: "Switch tabs.",
-      actions: [{ pluginId: "workspace-control", action: "switch_tab", input: { title: "build" } }]
+      actions: [{ id: "switch-tab", dependsOn: [], pluginId: "workspace-control", action: "switch_tab", input: { title: "build" } }]
     };
     let plannerCalled = false;
     const planner: VoicePlanner = {
@@ -244,6 +359,8 @@ describe("VoiceController", () => {
       },
       createUnhandledVoiceAction(transcript: string, activeTabId?: string) {
         return {
+          id: "unhandled-voice-action",
+          dependsOn: [],
           targetTabId: activeTabId,
           pluginId: "assistant-plugin",
           action: "accept_voice_text",
@@ -262,6 +379,8 @@ describe("VoiceController", () => {
     expect(result.accepted).toBe(true);
     expect(result.plan.actions).toEqual([
       {
+        id: "unhandled-voice-action",
+        dependsOn: [],
         targetTabId: "plugin-tab",
         pluginId: "assistant-plugin",
         action: "accept_voice_text",
@@ -311,8 +430,8 @@ describe("VoiceController", () => {
       transcript: "open a terminal and ping google",
       summary: "Create a terminal then run ping.",
       actions: [
-        { pluginId: "workspace-control", action: "create_tab", input: { targetPluginId: "standard-terminal" } },
-        { pluginId: "standard-terminal", action: "enter_text", input: { text: "ping google.com", submit: true } }
+        { id: "create-terminal", dependsOn: [], pluginId: "workspace-control", action: "create_tab", input: { targetPluginId: "standard-terminal", windowId: "window-1", paneId: "pane-1" } },
+        { id: "run-ping", dependsOn: ["create-terminal"], pluginId: "standard-terminal", action: "enter_text", input: { text: "ping google.com", submit: true } }
       ]
     };
     const planner: VoicePlanner = {
@@ -339,14 +458,42 @@ describe("VoiceController", () => {
 
     expect(result.accepted).toBe(true);
     expect(fallbacks).toEqual([undefined, "new-terminal"]);
-    expect(result.results[1]).toMatchObject({ action: "enter_text", targetTabId: "new-terminal", ok: true });
+    expect(result.results[1]).toMatchObject({ actionId: "run-ping", action: "enter_text", targetTabId: "new-terminal", status: "succeeded" });
+  });
+
+  it("skips dependent actions when their prerequisite fails without targeting the stale active tab", async () => {
+    const plan: VoiceActionPlan = {
+      transcript: "open a terminal and run tests",
+      summary: "Create a terminal, then run tests in it.",
+      actions: [
+        { id: "create-terminal", dependsOn: [], pluginId: "workspace-control", action: "create_tab", input: { targetPluginId: "standard-terminal", windowId: "window-1", paneId: "pane-1" } },
+        { id: "run-tests", dependsOn: ["create-terminal"], pluginId: "standard-terminal", action: "enter_text", input: { text: "npm test", submit: true } }
+      ]
+    };
+    const planner: VoicePlanner = { plan: async () => plan };
+    const executeVoiceAction = vi.fn(async () => {
+      throw new Error("terminal failed to start");
+    });
+    const sessions = {
+      buildVoiceContext: async () => ({ activeTabId: "stale-terminal" }),
+      executeVoiceAction
+    };
+
+    const result = await new VoiceController(sessions as never, planner).handleTranscript(plan.transcript, "stale-terminal");
+
+    expect(executeVoiceAction).toHaveBeenCalledTimes(1);
+    expect(result.accepted).toBe(false);
+    expect(result.results).toEqual([
+      expect.objectContaining({ actionId: "create-terminal", status: "failed", targetTabId: undefined }),
+      expect.objectContaining({ actionId: "run-tests", status: "skipped", targetTabId: undefined, message: expect.stringContaining("create-terminal") })
+    ]);
   });
 
   it("logs transcript, planner, and action events with request correlation", async () => {
     const plan: VoiceActionPlan = {
       transcript: "list directory",
       summary: "List files.",
-      actions: [{ pluginId: "standard-terminal", action: "enter_text", targetTabId: "tab-1", input: { text: "ls", submit: true } }]
+      actions: [{ id: "list-directory", dependsOn: [], pluginId: "standard-terminal", action: "enter_text", targetTabId: "tab-1", input: { text: "ls", submit: true } }]
     };
     const entries: Array<{ fields: Record<string, unknown>; message?: string }> = [];
     const planner: VoicePlanner = {

@@ -8,9 +8,11 @@ import type {
   PluginVoiceContext,
   WorkspacePlugin
 } from "@cloudx/plugin-api";
-import { RULES_SKILLS_PLUGIN_ID, isRecord, type CodexTerminalInitialInput, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
+import { RULES_SKILLS_PLUGIN_ID, codexStateSourceBasename, isRecord, type CodexTerminalInitialInput, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
 
-import { materializeCodexHomeOverlay, type CodexHomeOverlay } from "../rulesSkills/CodexHomeOverlay.js";
+import { materializeCodexHomeOverlay, resolveCodexHome, type CodexHomeOverlay } from "../rulesSkills/CodexHomeOverlay.js";
+import { CodexStateSources } from "./CodexStateSources.js";
+import path from "node:path";
 import { CLOUDX_SYSTEM_RULES, CLOUDX_SYSTEM_SKILLS, cloudxSkillFilePath, cloudxSystemSkillFilePath, type ResolvedPersonalityTemplate } from "../rulesSkills/RulesSkillsCatalogService.js";
 import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
 import { buildLoginShellCommandLaunch, buildToolEnv, resolveAssistantCommand } from "../terminal/ShellLaunch.js";
@@ -22,6 +24,17 @@ export const CODEX_READY_QUIET_MS = 350;
 export const CODEX_READY_TIMEOUT_MS = 30_000;
 export const CODEX_READY_MAX_TIMEOUT_MS = 10 * 60 * 1000;
 export const CODEX_READY_MAX_QUIET_MS = 10_000;
+export const CLOUDX_CODEX_DEFAULT_ARGS = [
+  "--yolo",
+  "--disable",
+  "apps",
+  "--disable",
+  "memories",
+  "--disable",
+  "plugins",
+  "--config",
+  "skills.bundled.enabled=false"
+] as const;
 const MAX_OSC_SEQUENCE_CHARS = 4096;
 
 export const TERMINAL_ACTIONS: PluginActionDefinition[] = terminalActions({
@@ -48,7 +61,8 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
   constructor(
     private readonly factory: TerminalProcessFactory,
     private readonly replayBytes = DEFAULT_TERMINAL_REPLAY_BYTES,
-    private readonly dataDir?: string
+    private readonly dataDir?: string,
+    private readonly sources = dataDir ? new CodexStateSources(dataDir) : undefined
   ) {}
 
   descriptor() {
@@ -81,9 +95,14 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
 
   async createSession(input: CreatePluginSessionInput): Promise<PluginSession> {
     const template = templateFromRuntimeContext(input.runtimeContext);
-    const launchTemplate = await materializeCodexTemplate(template, process.env, {
+    const baseEnv = { ...process.env };
+    const resume = codexResumeInput(input.initialInput);
+    const launchTemplate = await materializeCodexTemplate(template, baseEnv, {
       dataDir: this.dataDir,
-      tabId: input.tab.id
+      tabId: input.tab.id,
+      cwd: input.cwd,
+      sources: this.sources,
+      sourceId: resume?.sourceId
     });
     const command = launchTemplate.command;
     const launchArgs = buildCodexLaunchArgs(launchTemplate.args, input.initialInput);
@@ -104,10 +123,12 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       templateName: launchTemplate.templateName,
       applyRuntimeContext: async (runtimeContext) => {
         const nextTemplate = templateFromRuntimeContext(runtimeContext);
-        const nextLaunchTemplate = await materializeCodexTemplate(nextTemplate, process.env, {
+        const nextLaunchTemplate = await materializeCodexTemplate(nextTemplate, baseEnv, {
           dataDir: this.dataDir,
           tabId: input.tab.id,
-          resetOverlay: false
+          cwd: input.cwd,
+          resetOverlay: false,
+          sources: this.sources
         });
         return {
           prompt: buildCodexRuntimeUpdatePrompt(nextTemplate, nextLaunchTemplate.overlay),
@@ -153,8 +174,12 @@ export function codexResumeInput(initialInput: Record<string, unknown> | undefin
   if (mode === "session" && !sessionId) {
     throw new Error("Codex resume session id is required.");
   }
+  const sourceId = initialInput.resume.sourceId;
+  if (typeof sourceId !== "string" || !sourceId) throw new Error("Codex resume session source selection is required.");
+  codexStateSourceBasename(sourceId);
   return {
     mode,
+    sourceId,
     sessionId: mode === "session" ? sessionId : undefined,
     all: optionalResumeBoolean(initialInput.resume.all, "all") ?? false,
     includeNonInteractive: optionalResumeBoolean(initialInput.resume.includeNonInteractive, "includeNonInteractive") ?? false
@@ -228,7 +253,10 @@ export interface MaterializedCodexTemplate {
 export interface MaterializeCodexTemplateOptions {
   dataDir?: string;
   tabId?: string;
+  cwd?: string;
   resetOverlay?: boolean;
+  sources?: CodexStateSources;
+  sourceId?: string;
 }
 
 export async function materializeCodexTemplate(
@@ -237,10 +265,17 @@ export async function materializeCodexTemplate(
   options: MaterializeCodexTemplateOptions = {}
 ): Promise<MaterializedCodexTemplate> {
   const env = buildToolEnv(baseEnv);
-  const args: string[] = [];
+  const args: string[] = [...CLOUDX_CODEX_DEFAULT_ARGS];
   const dataDir = options.dataDir;
+  const sources = options.sources ?? (dataDir ? new CodexStateSources(dataDir, baseEnv) : undefined);
+  const bound = sources && options.tabId ? await sources.readBinding(options.tabId) : undefined;
+  if (bound && options.sourceId !== undefined && options.sourceId !== bound.sourceId) throw new Error("Codex source selection conflicts with existing binding.");
+  if (options.resetOverlay === false && sources && !bound) throw new Error("Codex launch source binding is missing.");
+  const source = sources ? bound ?? await sources.resolve(options.sourceId ?? "shared") : undefined;
+  if (!sources && options.sourceId && options.sourceId !== "shared") throw new Error("Codex retained sources require a configured data directory.");
+  if (!env.CODEX_SQLITE_HOME?.trim()) env.CODEX_SQLITE_HOME = source?.home ?? path.resolve(resolveCodexHome(baseEnv));
   const overlay = dataDir && options.tabId
-    ? await materializeCodexHomeOverlay({ dataDir, tabId: options.tabId, resolved, baseEnv: env, resetCodexHome: options.resetOverlay })
+    ? await materializeCodexHomeOverlay({ dataDir, tabId: options.tabId, resolved, baseEnv: env, cwd: options.cwd, resetCodexHome: options.resetOverlay, sources: sources!, source: source! })
     : undefined;
   if (overlay) {
     env.CODEX_HOME = overlay.codexHome;
@@ -255,6 +290,7 @@ export async function materializeCodexTemplate(
     env.CLOUDX_ENABLED_RULE_IDS = resolved.template.ruleIds.join(",");
     env.CLOUDX_ENABLED_SKILL_IDS = resolved.template.skillIds.join(",");
   }
+  if (sources && source) await sources.assertCurrent(source);
   return {
     command: resolveAssistantCommand(env, "codex"),
     args,

@@ -24,8 +24,11 @@ const riskOrder = new Map([
   ["human-required", 3],
 ]);
 
-export async function loadPolicy(policyPath = defaultPolicyPath) {
-  const source = await fs.readFile(policyPath, "utf8");
+export async function loadPolicy(
+  policyPath = defaultPolicyPath,
+  { readSource = (filename) => fs.readFile(filename, "utf8") } = {},
+) {
+  const source = await readSource(policyPath);
   const policy = validateSchema("policy", parse(source));
   const appSlugs = [
     policy.activation.manager_app_slug,
@@ -70,11 +73,16 @@ export function classifyChange(policy, { paths, type }) {
   const areas = sortedUnique(
     routes.flatMap((route) => route.areas ?? [route.area]),
   );
+  const crossAreas = sortedUnique(
+    routes
+      .filter((route) => route.cross_area !== false)
+      .flatMap((route) => route.areas ?? [route.area]),
+  );
   const skills = new Set(routes.flatMap((route) => route.skills));
   const checks = new Set(routes.flatMap((route) => route.checks));
   let risk = strongestRisk(routes.map((route) => route.risk));
 
-  if (areas.length > 1) {
+  if (crossAreas.length > 1) {
     risk = strongestRisk([risk, policy.cross_area.risk]);
     policy.cross_area.skills.forEach((skill) => skills.add(skill));
   }

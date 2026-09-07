@@ -12,8 +12,10 @@ Public internet unsupported.
 
 Do not expose Cloudx to the public internet. It can spawn terminals, send text
 to shells and Codex, read and edit files under configured roots, and embed local
-dashboards with token-bearing URLs. Use localhost, a trusted LAN, or a private
-tailnet only.
+dashboards with token-bearing URLs. Keep Cloudx on localhost and put an
+authenticated reverse proxy such as Tailscale Serve in front of it for remote
+access whenever possible. An explicit `0.0.0.0` bind is available for a trusted,
+firewalled LAN, but Cloudx does not authenticate direct LAN clients.
 
 ## Screenshots
 
@@ -72,6 +74,9 @@ names, and dashboard tokens.
   extraction pipeline, and retrieval tests.
 - `debug_tooling/documentation-validation`: optional validation runner for the
   documentation archive.
+- `containers/ci`: credential-free no-network verifier image.
+- `docs/AI_CHANGE_PROCESS.md`: repository state, artifact, review, and merge
+  contract consumed by external AI automation.
 - `docs/MEMORY_PLUGIN_GUIDE.md`: source-grounded documentation archive guide.
 - `docs/MOTIVATION.md`: why this exists.
 - `docs/WEB_APP_PLAN.md`: product and architecture plan.
@@ -143,6 +148,37 @@ Cloudx saves each image under `.cloudx/pasted-images/` in the tab workspace and
 inserts an `@.cloudx/pasted-images/...` reference into the Codex prompt. Standard
 shell terminal tabs do not intercept image paste.
 
+Every Cloudx Codex terminal uses the same managed safety and capability defaults:
+Codex runs in explicit `--yolo` mode, local memories and Codex Apps are disabled,
+and Agent Plugins are disabled so their skills cannot enter the session. Cloudx
+enables only its selected and system skills plus the bundled `imagegen` skill;
+user, administrator, and repository skills discovered outside that set are
+disabled in the tab's generated Codex home. When the user's base Codex config
+omits a model, Cloudx defaults to `gpt-6-astra`. Explicit model, reasoning-effort,
+and display preferences are preserved.
+
+Reloading the browser page reattaches the same running terminal tab and restores
+its retained output, including a full replay buffer. The terminal process stays
+owned by the running Cloudx server. Restarting the Cloudx service ends those
+processes; changing a config file does not change the model inside an already
+running Codex process.
+
+New tabs keep isolated configuration and skills in
+`<data-dir>/codex-launches/<tab-id>` and use the original Codex home's shared
+SQLite state and complete sessions corpus. Cloudx sets `CODEX_SQLITE_HOME` only
+when it is absent or blank; explicit environment and native configuration
+precedence remain intact. Cloudx does not open or copy SQLite databases during
+tab creation. Initial native indexing or reconciliation is a separate operation;
+steady-state startup performance still requires native measurement.
+
+To resume, choose a **Session source** in the New tab dialog before using the
+picker, last session, or an exact ID. Search by template, date, or full source key.
+Each retained `codex-homes` directory is a separate source, preserving its own
+goals, pages and saved variants. Native `/resume` stays within that chosen source.
+The shared picker does not combine SQLite-only data from retained sources.
+Old unbound tabs require explicit source selection in a new tab; bound launch
+views retain their source when restarted. Cloudx does not delete old homes.
+
 ## Quick Start
 
 On Ubuntu 22.04 or newer, the guided installer is the easiest path:
@@ -162,7 +198,8 @@ guide. It then installs Node.js 22 when needed, verifies `node -v` and
 `npm` package if npm is still missing. The wizard checks Git 2.36+ for the
 Worktree Manager and, on older Ubuntu Git packages such as 22.04's 2.34.x,
 offers to install the current stable Git package from `ppa:git-core/ppa`.
-The wizard then installs Cloudx npm dependencies, installs and checks Codex CLI,
+The wizard then installs Cloudx npm dependencies, installs and checks the pinned
+Codex CLI 0.153.4 release,
 prepares the Faster Whisper ASR environment, prepares the documentation archive
 indexer environment, downloads the local ASR model, writes Cloudx config, and
 optionally installs user-level services for Cloudx, ASR, and the documentation
@@ -173,8 +210,9 @@ question includes a short explanation of what the choice changes. The optional
 `whisper.cpp` step is not needed for CPU-only or NVIDIA CUDA installs because
 Faster Whisper handles those paths; use it only for an alternate compiled
 backend such as Intel Arc SYCL. The installer prints the local Cloudx URL when
-it finishes. Choose the LAN bind prompt, or pass `--lan`, only when you want
-Cloudx to bind to `0.0.0.0` for a trusted LAN or tailnet.
+it finishes. Fresh installs bind to loopback. Updates preserve an explicit
+`0.0.0.0` bind only when an exact browser origin is also configured in
+`CLOUDX_TRUSTED_ORIGINS`; otherwise they restore the loopback default.
 
 Preview the installer without changing the system:
 
@@ -204,31 +242,51 @@ Remove Cloudx-managed services and local install artifacts:
 ./install.sh --uninstall
 ```
 
+The default uninstall keeps `~/.config/cloudx/cloudx.env`, runtime data, the
+downloaded ASR model, and systemd linger. Active Cloudx services must stop
+successfully before the installer removes units or managed environments.
+
 Manual development startup is still available when prerequisites are already
 installed:
 
 ```bash
-npm install
+npm ci
 npm run build
 npm run dev
 ```
 
-Open `https://127.0.0.1:3001`. For phone access, prefer a private tailnet proxy
-to the localhost service. LAN binding is explicit and can be selected during
-installer prompts:
+To run the Vite frontend separately, admit its exact origin on the backend:
 
 ```bash
-./install.sh --lan
+CLOUDX_TRUSTED_ORIGINS=http://127.0.0.1:5173 npm run dev
 ```
 
-That writes `CLOUDX_HOST=0.0.0.0` and prints a warning because Cloudx can control
-shells and files. Use it only on a trusted LAN or tailnet.
+Then start Vite in another terminal:
+
+```bash
+npm run dev:web
+```
+
+Open `https://127.0.0.1:3001`. For phone access, proxy the localhost service
+through a private tailnet. Add the proxy's exact public origin (without a
+trailing slash) to `~/.config/cloudx/cloudx.env` before starting Cloudx:
+
+```bash
+printf '%s\n' 'CLOUDX_TRUSTED_ORIGINS=https://build-host.example.ts.net' \
+  >> ~/.config/cloudx/cloudx.env
+tailscale serve --bg https+insecure://localhost:3001
+```
+
+Use Tailscale grants or ACLs so only the intended users and devices can reach
+the node. For a direct trusted-LAN deployment, follow
+[`docs/SECURITY_MODEL.md`](docs/SECURITY_MODEL.md#direct-trusted-lan-access) and
+restrict the port with the host firewall.
 
 For voice control:
 
 ```bash
-python3 -m venv services/asr/.venv
-services/asr/.venv/bin/pip install -e services/asr
+UV_PROJECT_ENVIRONMENT="$PWD/services/asr/.venv" \
+  ~/.local/share/cloudx/uv/bin/uv sync --locked --project services/asr --extra dev
 services/asr/.venv/bin/uvicorn cloudx_asr.main:app \
   --app-dir services/asr/src --host 127.0.0.1 --port 7810
 ```
@@ -240,7 +298,8 @@ service install.
 For the local documentation archive:
 
 ```bash
-npm run documentation:setup
+~/.local/share/cloudx/uv/bin/uv sync --locked \
+  --project services/documentation-indexer --extra dev
 npm run documentation:start
 ```
 
@@ -284,8 +343,15 @@ command submission without disabling the rest of Cloudx.
 
 Common environment variables:
 
-- `CLOUDX_HOST`: bind address, default `127.0.0.1`. Set `0.0.0.0` only for a trusted LAN or tailnet.
+- `CLOUDX_HOST`: bind host, default `127.0.0.1`. The only network-facing value
+  accepted is the explicit IPv4 wildcard `0.0.0.0`, and it requires at least
+  one exact browser origin in `CLOUDX_TRUSTED_ORIGINS`.
 - `CLOUDX_PORT`: app port, default `3001`.
+- `CLOUDX_TRUSTED_ORIGINS`: comma-separated additional canonical HTTP(S)
+  origins for Vite or an authenticated reverse proxy. The built-in loopback
+  service origin is always trusted and must not be repeated. An absent variable adds no
+  extra origin; an empty value, duplicate, path, query, fragment, credential,
+  trailing slash, or noncanonical origin fails startup.
 - `CLOUDX_LOG_LEVEL`: server log level, one of `fatal`, `error`, `warn`, `info`, `debug`, `trace`, or `silent`; default `info`.
 - `CLOUDX_ALLOWED_ROOTS`: path-delimited allowed roots, default `~`.
 - `CLOUDX_ASSISTANT_BIN`: resolved coding-assistant CLI executable for assistant-backed terminals and tools.
@@ -293,6 +359,7 @@ Common environment variables:
 - `CLOUDX_ASR_URL`: ASR endpoint, default `http://127.0.0.1:7810`.
 - `CLOUDX_ASR_DEVICE`: Faster Whisper device, `cpu` or `cuda`.
 - `CLOUDX_ASR_COMPUTE_TYPE`: Faster Whisper compute profile, for example `int8`, `int8_float16`, or `float16`.
+- `CLOUDX_VOICE_AUDIO_UPLOAD_MAX_BYTES`: shared HTTP and WebSocket ASR audio admission limit, default `26214400` (25 MiB); must be a positive integer no greater than `536870912` (512 MiB).
 - `CLOUDX_DOCUMENTATION_URL`: documentation indexer endpoint, default `http://127.0.0.1:7820`.
 - `CLOUDX_DOCUMENTATION_HOST`: documentation indexer bind address, default `127.0.0.1`.
 - `CLOUDX_DOCUMENTATION_PORT`: documentation indexer port, default `7820`.

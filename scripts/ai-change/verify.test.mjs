@@ -1,10 +1,17 @@
 import { EventEmitter } from "node:events";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { PassThrough } from "node:stream";
 
 import { describe, expect, it, vi } from "vitest";
 
+import { validateArtifact } from "./artifact-validation.mjs";
 import {
   calculateWorktreeDigest,
+  displayCommand,
   readHeadSha,
   runCommand,
   verificationPlan,
@@ -65,10 +72,9 @@ describe("deterministic change verification", () => {
     const digest = vi.fn(async () => "2".repeat(64));
 
     const artifact = await verifyChange({
+      ...acceptedVerificationInputs("policy"),
       runId: "run-1",
       scope: "policy",
-      headSha: gitSha,
-      policySha256: policySha,
       runner,
       worktreeDigest: digest,
     });
@@ -101,10 +107,9 @@ describe("deterministic change verification", () => {
       });
 
     const artifact = await verifyChange({
+      ...acceptedVerificationInputs("policy"),
       runId: "run-2",
       scope: "policy",
-      headSha: gitSha,
-      policySha256: policySha,
       runner,
       worktreeDigest: async () => "3".repeat(64),
     });
@@ -119,10 +124,9 @@ describe("deterministic change verification", () => {
     const digests = ["4".repeat(64), "5".repeat(64), "5".repeat(64)];
 
     const artifact = await verifyChange({
+      ...acceptedVerificationInputs("policy"),
       runId: "run-3",
       scope: "policy",
-      headSha: gitSha,
-      policySha256: policySha,
       runner: async () => ({ exitCode: 0, stdout: "ok", stderr: "" }),
       worktreeDigest: async () => digests.shift(),
     });
@@ -138,17 +142,18 @@ describe("deterministic change verification", () => {
 
   it("records the Python source path used by a service verification", async () => {
     const artifact = await verifyChange({
+      ...acceptedVerificationInputs("python-asr", {
+        asrPython: "services/asr/.venv/bin/python",
+      }),
       runId: "run-4",
       scope: "python-asr",
-      headSha: gitSha,
-      policySha256: policySha,
-      planOptions: { asrPython: "asr-python" },
+      planOptions: { asrPython: "services/asr/.venv/bin/python" },
       runner: async () => ({ exitCode: 0, stdout: "ok", stderr: "" }),
       worktreeDigest: async () => "6".repeat(64),
     });
 
     expect(artifact.commands[0].command).toBe(
-      "PYTHONPATH=services/asr/src asr-python -m pytest services/asr/tests -q",
+      "PYTHONPATH=services/asr/src services/asr/.venv/bin/python -m pytest services/asr/tests -q",
     );
   });
 
@@ -312,11 +317,12 @@ describe("deterministic change verification", () => {
       return "7".repeat(64);
     });
     const verification = verifyChange({
+      ...acceptedVerificationInputs("python-asr", {
+        asrPython: "services/asr/.venv/bin/python",
+      }),
       runId: "run-cleanup-order",
       scope: "python-asr",
-      headSha: gitSha,
-      policySha256: policySha,
-      planOptions: { asrPython: "fake-command" },
+      planOptions: { asrPython: "services/asr/.venv/bin/python" },
       runner: (planned) =>
         runCommand(
           { ...planned, timeoutMs: 5 },
@@ -370,7 +376,478 @@ describe("deterministic change verification", () => {
       runCommand({ command: "fake-command", args: [] }),
     ).rejects.toThrow(/timeout/i);
   });
+
+  it.each([
+    [
+      "missing command",
+      (plan) => plan.verification.pop(),
+      /verification commands/i,
+    ],
+    [
+      "extra command",
+      (plan) => plan.verification.push("npm run documentation:test"),
+      /verification commands/i,
+    ],
+    [
+      "reordered commands",
+      (plan) => plan.verification.reverse(),
+      /verification commands/i,
+    ],
+    [
+      "altered executable",
+      (plan) =>
+        (plan.verification[0] = "python -m pytest services/asr/tests -q"),
+      /verification commands/i,
+    ],
+    [
+      "altered arguments",
+      (plan) =>
+        (plan.verification[0] =
+          "node scripts/ai-change/artifact-validation.mjs"),
+      /Verification command must be recognized, local, and read-only/u,
+    ],
+    [
+      "altered environment",
+      (plan) =>
+        (plan.verification[6] =
+          "PYTHONPATH=services/asr/other services/asr/.venv/bin/python -m pytest services/asr/tests -q"),
+      /Verification command must be recognized, local, and read-only/u,
+    ],
+  ])(
+    "rejects %s before digest or dispatch",
+    async (_name, mutate, expectedError) => {
+      const acceptedPlan = acceptedPlanFor("full");
+      mutate(acceptedPlan);
+      const worktreeDigest = vi.fn();
+      const runner = vi.fn();
+
+      await expect(
+        verifyChange({
+          ...acceptedVerificationInputs("full"),
+          acceptedPlan,
+          runId: "command-parity",
+          worktreeDigest,
+          runner,
+        }),
+      ).rejects.toThrow(expectedError);
+      expect(worktreeDigest).not.toHaveBeenCalled();
+      expect(runner).not.toHaveBeenCalled();
+    },
+  );
+
+  it("validates the accepted plan before every source or process dependency", async () => {
+    const acceptedPlan = acceptedPlanFor("full");
+    acceptedPlan.verification[0] =
+      "node scripts/ai-change/validate-process.mjs $(git status)";
+    const dependencies = verifierSpies();
+
+    await expect(
+      verifyChange({
+        acceptedPlan,
+        localBaseSha: gitSha,
+        headSha: gitSha,
+        runId: "invalid-plan",
+        ...dependencies,
+      }),
+    ).rejects.toThrow(/read-only/i);
+    expectNoVerifierWork(dependencies);
+  });
+
+  it("rejects an explicit local base mismatch before head lookup or construction", async () => {
+    const dependencies = verifierSpies();
+
+    await expect(
+      verifyChange({
+        acceptedPlan: acceptedPlanFor("full"),
+        localBaseSha: "b".repeat(40),
+        headSha: gitSha,
+        runId: "wrong-base",
+        ...dependencies,
+      }),
+    ).rejects.toThrow(/local base/i);
+    expectNoVerifierWork(dependencies);
+  });
+
+  it("rejects an actual HEAD mismatch before construction, digest, or dispatch", async () => {
+    const dependencies = verifierSpies();
+    dependencies.readHead.mockResolvedValue("b".repeat(40));
+
+    await expect(
+      verifyChange({
+        acceptedPlan: acceptedPlanFor("full"),
+        localBaseSha: gitSha,
+        headSha: gitSha,
+        runId: "wrong-head",
+        ...dependencies,
+      }),
+    ).rejects.toThrow(/head/i);
+    expect(dependencies.readHead).toHaveBeenCalledOnce();
+    expect(dependencies.makeVerificationPlan).not.toHaveBeenCalled();
+    expect(dependencies.worktreeDigest).not.toHaveBeenCalled();
+    expect(dependencies.runner).not.toHaveBeenCalled();
+  });
+
+  it("makes the documented silent npm entry require a valid plan, base, and exact head before child dispatch", () => {
+    const fixture = spawnedVerifierFixture();
+    try {
+      for (const args of [
+        [],
+        ["--plan", fixture.invalidPlan],
+        [
+          "--plan",
+          fixture.plan,
+          "--base-sha",
+          "b".repeat(40),
+          "--head-sha",
+          gitSha,
+        ],
+        [
+          "--plan",
+          fixture.plan,
+          "--base-sha",
+          gitSha,
+          "--head-sha",
+          "b".repeat(40),
+        ],
+        [
+          "--scope",
+          "full",
+          "--plan",
+          fixture.plan,
+          "--base-sha",
+          gitSha,
+          "--head-sha",
+          gitSha,
+        ],
+        [
+          "--scope",
+          "policy",
+          "--plan",
+          fixture.plan,
+          "--base-sha",
+          gitSha,
+          "--head-sha",
+          gitSha,
+        ],
+        [
+          "--output",
+          fixture.output,
+          "--plan",
+          fixture.plan,
+          "--base-sha",
+          gitSha,
+          "--head-sha",
+          gitSha,
+        ],
+        [
+          "--output-path",
+          fixture.output,
+          "--plan",
+          fixture.plan,
+          "--base-sha",
+          gitSha,
+          "--head-sha",
+          gitSha,
+        ],
+        [
+          "--path",
+          fixture.output,
+          "--plan",
+          fixture.plan,
+          "--base-sha",
+          gitSha,
+          "--head-sha",
+          gitSha,
+        ],
+        [
+          "--plan",
+          fixture.plan,
+          "--plan",
+          fixture.plan,
+          "--base-sha",
+          gitSha,
+          "--head-sha",
+          gitSha,
+        ],
+        [
+          "--plan",
+          fixture.plan,
+          "--base-sha",
+          gitSha,
+          "--base-sha",
+          gitSha,
+          "--head-sha",
+          gitSha,
+        ],
+        [
+          "--plan",
+          fixture.plan,
+          "--base-sha",
+          gitSha,
+          "--head-sha",
+          gitSha,
+          "--head-sha",
+          gitSha,
+        ],
+        [
+          "--plan",
+          fixture.plan,
+          "--base-sha",
+          gitSha,
+          "--head-sha",
+          gitSha,
+          "--run-id",
+          "one",
+          "--run-id",
+          "two",
+        ],
+        [
+          "--plan",
+          fixture.subsetPlan,
+          "--base-sha",
+          gitSha,
+          "--head-sha",
+          gitSha,
+        ],
+      ]) {
+        fs.writeFileSync(fixture.log, "");
+        fs.rmSync(fixture.output, { force: true });
+        const trackedBytes = fs.readFileSync("package.json");
+        const result = fixture.run(args);
+        expect(result.status).not.toBe(0);
+        expect(fs.readFileSync(fixture.log, "utf8")).toBe("");
+        expect(fs.existsSync(fixture.output)).toBe(false);
+        expect(fs.readFileSync("package.json")).toEqual(trackedBytes);
+      }
+
+      const trackedBytes = fs.readFileSync("package.json");
+      const policySource = new URL(
+        "../../.agents/pr-review-policy.toml",
+        import.meta.url,
+      );
+      const policyBytes = fs.readFileSync(policySource);
+      const result = fixture.run([
+        "--plan",
+        fixture.plan,
+        "--base-sha",
+        gitSha,
+        "--head-sha",
+        gitSha,
+      ]);
+      expect(result.status, result.stderr).toBe(0);
+      const artifact = JSON.parse(result.stdout);
+      expect(artifact.verdict).toBe("passed");
+      expect(artifact.policy_sha256).toBe(fixture.policySha256);
+      expect(artifact.commands).toHaveLength(9);
+      expect(artifact.tree_sha256_after).toBe(artifact.tree_sha256_before);
+      expect(fs.readFileSync("package.json")).toEqual(trackedBytes);
+      expect(fs.readFileSync(policySource)).toEqual(policyBytes);
+      expect(fs.readFileSync(fixture.log, "utf8").trim().split("\n")).toEqual(
+        acceptedPlanFor("full", fixture.planOptions).verification,
+      );
+    } finally {
+      fs.rmSync(fixture.root, { force: true, recursive: true });
+    }
+  }, 30_000);
+
+  it("rejects a schema-valid mismatched policy digest through the real npm entry before child dispatch", () => {
+    const fixture = spawnedVerifierFixture();
+    try {
+      const accepted = JSON.parse(fs.readFileSync(fixture.plan, "utf8"));
+      const mismatched = structuredClone(accepted);
+      mismatched.policy_sha256 =
+        (accepted.policy_sha256[0] === "0" ? "1" : "0") +
+        accepted.policy_sha256.slice(1);
+      expect(mismatched.policy_sha256).not.toBe(accepted.policy_sha256);
+      expect(() => validateArtifact("plan", mismatched)).not.toThrow();
+      const mismatchedPlan = path.join(fixture.root, "mismatched-policy.json");
+      const planBytes = `${JSON.stringify(mismatched)}\n`;
+      fs.writeFileSync(mismatchedPlan, planBytes);
+      const sources = [
+        new URL("../../package.json", import.meta.url),
+        new URL("../../.agents/pr-review-policy.toml", import.meta.url),
+        new URL("./verify.mjs", import.meta.url),
+        new URL(import.meta.url),
+      ].map((source) => [source, fs.readFileSync(source)]);
+
+      const result = fixture.run([
+        "--plan",
+        mismatchedPlan,
+        "--base-sha",
+        gitSha,
+        "--head-sha",
+        gitSha,
+      ]);
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/Verification policy digest/u);
+      expect(result.stdout).toBe("");
+      expect(fs.readFileSync(fixture.log, "utf8")).toBe("");
+      expect(fs.existsSync(fixture.output)).toBe(false);
+      expect(fs.readFileSync(mismatchedPlan, "utf8")).toBe(planBytes);
+      for (const [source, bytes] of sources) {
+        expect(fs.readFileSync(source)).toEqual(bytes);
+      }
+    } finally {
+      fs.rmSync(fixture.root, { force: true, recursive: true });
+    }
+  });
 });
+
+function acceptedPlanFor(scope, planOptions = {}) {
+  return {
+    schema_version: 1,
+    kind: "change-plan",
+    run_id: "accepted-plan",
+    base_sha: gitSha,
+    head_sha: gitSha,
+    policy_sha256: policySha,
+    skill_versions: { "plan-change": "2".repeat(64) },
+    task: "Run one exact deterministic verification plan.",
+    classification: {
+      type: "bug",
+      areas: ["agent-policy"],
+      risk: "human-required",
+      skills: ["review-agent-policy"],
+      human_review_required: true,
+      automerge_eligible: false,
+    },
+    anchors: [
+      {
+        path: "scripts/ai-change/verify.mjs",
+        line: 1,
+        reason: "Owns deterministic verification.",
+      },
+      {
+        path: "scripts/ai-change/verify.test.mjs",
+        line: 1,
+        reason: "Exercises deterministic verification.",
+      },
+    ],
+    claims: [
+      {
+        id: "CLAIM-VERIFY",
+        behavior: "Dispatch the accepted verification commands.",
+        production_seam: "verifyChange",
+        test: "Verifier production-path tests.",
+        negative_cases: ["A command drifts."],
+      },
+    ],
+    allowed_paths: ["scripts/ai-change/verify.mjs"],
+    forbidden_paths: [".github/**"],
+    verification: verificationPlan(scope, planOptions).map(displayCommand),
+  };
+}
+
+function acceptedVerificationInputs(scope, planOptions = {}) {
+  return {
+    acceptedPlan: acceptedPlanFor(scope, planOptions),
+    headSha: gitSha,
+    localBaseSha: gitSha,
+    loadCurrentPolicy: async () => ({ policySha256: policySha }),
+    readHead: async () => gitSha,
+  };
+}
+
+function verifierSpies() {
+  return {
+    loadCurrentPolicy: vi.fn(),
+    makeVerificationPlan: vi.fn(),
+    readHead: vi.fn(),
+    runner: vi.fn(),
+    worktreeDigest: vi.fn(),
+  };
+}
+
+function expectNoVerifierWork(dependencies) {
+  expect(dependencies.readHead).not.toHaveBeenCalled();
+  expect(dependencies.worktreeDigest).not.toHaveBeenCalled();
+  expect(dependencies.makeVerificationPlan).not.toHaveBeenCalled();
+  expect(dependencies.loadCurrentPolicy).not.toHaveBeenCalled();
+  expect(dependencies.runner).not.toHaveBeenCalled();
+}
+
+function spawnedVerifierFixture() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-verifier-"));
+  const bin = path.join(root, "bin");
+  const log = path.join(root, "commands.log");
+  const asrPython = path.join(root, "asr", "python");
+  const documentationPython = path.join(root, "documentation", "python");
+  fs.mkdirSync(bin);
+  fs.mkdirSync(path.dirname(asrPython));
+  fs.mkdirSync(path.dirname(documentationPython));
+  fs.writeFileSync(log, "");
+  const logger = `#!${process.execPath}\nconst fs = require("node:fs");\nconst path = require("node:path");\nconst executable = path.basename(process.argv[1]) === "npm" ? "npm" : process.argv[1];\nconst environment = process.env.PYTHONPATH ? ["PYTHONPATH=" + process.env.PYTHONPATH] : [];\nfs.appendFileSync(${JSON.stringify(log)}, [...environment, executable, ...process.argv.slice(2)].join(" ") + "\\n");\n`;
+  for (const executable of ["npm", asrPython, documentationPython]) {
+    fs.writeFileSync(
+      path.isAbsolute(executable) ? executable : path.join(bin, executable),
+      logger,
+      { mode: 0o755 },
+    );
+  }
+  fs.writeFileSync(
+    path.join(bin, "node"),
+    `#!${process.execPath}\nconst { spawnSync } = require("node:child_process");\nconst fs = require("node:fs");\nconst path = require("node:path");\nconst args = process.argv.slice(2);\nif (args[0] === "scripts/ai-change/verify.mjs") { const result = spawnSync(${JSON.stringify(process.execPath)}, args, { env: process.env, stdio: "inherit" }); process.exit(result.status ?? 1); }\nfs.appendFileSync(${JSON.stringify(log)}, ["node", ...args].join(" ") + "\\n");\n`,
+    { mode: 0o755 },
+  );
+  fs.writeFileSync(
+    path.join(bin, "git"),
+    `#!${process.execPath}\nconst args = process.argv.slice(2);\nif (args[0] === "rev-parse" && args[1] === "HEAD") process.stdout.write(${JSON.stringify(`${gitSha}\n`)});\n`,
+    { mode: 0o755 },
+  );
+  const planOptions = { asrPython, documentationPython };
+  const plan = path.join(root, "plan.json");
+  const subsetPlan = path.join(root, "subset-plan.json");
+  const invalidPlan = path.join(root, "invalid-plan.json");
+  const output = path.join(root, "output.json");
+  const accepted = acceptedPlanFor("full", planOptions);
+  accepted.policy_sha256 = createHash("sha256")
+    .update(
+      fs.readFileSync(
+        new URL("../../.agents/pr-review-policy.toml", import.meta.url),
+      ),
+    )
+    .digest("hex");
+  fs.writeFileSync(plan, `${JSON.stringify(accepted)}\n`);
+  const subset = acceptedPlanFor("policy", planOptions);
+  subset.policy_sha256 = accepted.policy_sha256;
+  fs.writeFileSync(subsetPlan, `${JSON.stringify(subset)}\n`);
+  const unsafe = structuredClone(accepted);
+  unsafe.verification[0] += " $(git status)";
+  fs.writeFileSync(invalidPlan, `${JSON.stringify(unsafe)}\n`);
+  return {
+    asrPython,
+    documentationPython,
+    invalidPlan,
+    log,
+    output,
+    plan,
+    planOptions,
+    policySha256: accepted.policy_sha256,
+    root,
+    subsetPlan,
+    run(args) {
+      return spawnSync(
+        process.execPath,
+        [npmCliPath(), "run", "--silent", "verify", "--", ...args],
+        {
+          cwd: process.cwd(),
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            CLOUDX_ASR_PYTHON: asrPython,
+            CLOUDX_DOCUMENTATION_PYTHON: documentationPython,
+            PATH: `${bin}:/usr/bin:/bin`,
+          },
+        },
+      );
+    },
+  };
+}
+
+function npmCliPath() {
+  return process.env.npm_execpath ?? fs.realpathSync("/usr/bin/npm");
+}
 
 function boundedCommand(overrides = {}) {
   return {

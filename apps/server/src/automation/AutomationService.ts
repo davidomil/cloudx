@@ -33,12 +33,15 @@ type AutomationListenerKind = "runs" | "ui-instruction";
 export class AutomationService {
   private readonly queues = new Map<string, Promise<void>>();
   private readonly activeRuns = new Map<string, ActiveAutomationRun>();
+  private readonly inFlightWork = new Set<Promise<unknown>>();
+  private readonly ownedBatches = new Set<Promise<void>>();
   private readonly runsListeners = new Set<RunsListener>();
   private readonly uiInstructionListeners = new Set<UiInstructionListener>();
   private readonly effectSink: AutomationEffectSink;
   private readonly startupPolicy: Promise<void>;
   private readonly disposeTriggerSubscription: () => void;
   private disposed = false;
+  private disposePromise: Promise<void> | undefined;
 
   constructor(
     private readonly repository: AutomationRepository,
@@ -65,22 +68,36 @@ export class AutomationService {
       startupTasks.push(this.repository.disableAllGroups());
     }
     this.startupPolicy = Promise.all(startupTasks).then(() => undefined);
-    this.disposeTriggerSubscription = this.triggers.subscribe((event) => this.handleTriggerEvent(event));
+    this.disposeTriggerSubscription = this.triggers.subscribe((event) => this.trackInFlight(this.handleTriggerEvent(event)));
   }
 
-  dispose(): void {
+  beginShutdown(): void {
     if (this.disposed) {
       return;
     }
     this.disposed = true;
-    this.disposeTriggerSubscription();
-    this.runsListeners.clear();
-    this.uiInstructionListeners.clear();
     for (const activeRun of this.activeRuns.values()) {
       activeRun.cancelled = true;
       activeRun.cancellationReason = "Automation service was stopped.";
       activeRun.controller.abort();
     }
+  }
+
+  dispose(): Promise<void> {
+    if (this.disposePromise) {
+      return this.disposePromise;
+    }
+    this.beginShutdown();
+    this.disposeTriggerSubscription();
+    this.runsListeners.clear();
+    this.uiInstructionListeners.clear();
+    const pending = Array.from(new Set<Promise<unknown>>([this.startupPolicy, ...this.ownedBatches, ...this.inFlightWork]));
+    this.disposePromise = settleOwnedWork(pending);
+    return this.disposePromise;
+  }
+
+  async ready(): Promise<void> {
+    await this.ensureStartupPolicy();
   }
 
   onRunsChange(listener: RunsListener): () => void {
@@ -205,38 +222,95 @@ export class AutomationService {
     return this.listRuns();
   }
 
-  private handleTriggerEvent(event: TriggerEvent): void {
+  private async handleTriggerEvent(event: TriggerEvent): Promise<void> {
+    await this.startupPolicy;
+    const catalog = await this.catalogService.catalog();
+    const groups = (await this.repository.listGroups()).filter((group) => group.enabled && this.groupHandlesTrigger(group, event.triggerId, catalog));
+    const groupsById = new Map(groups.map((group) => [group.id, group]));
+    const claimed = (await this.repository.claimTriggerRuns(groups.map((group) => group.id), event.id)).map((run) => ({
+      group: groupsById.get(run.groupId)!,
+      run
+    }));
+    if (claimed.length === 0) {
+      return;
+    }
     if (this.disposed) {
+      await this.cancelClaimedRuns(claimed);
       return;
     }
     const current = this.queues.get(event.triggerId) ?? Promise.resolve();
-    const next = current.then(async () => {
-      if (this.disposed) {
-        return;
-      }
-      await this.ensureStartupPolicy();
-      const catalog = await this.catalog();
-      const groups = (await this.repository.listGroups()).filter((group) => group.enabled && this.groupHandlesTrigger(group, event.triggerId, catalog));
-      for (const group of groups) {
-        if (this.disposed) {
-          return;
-        }
-        await this.runGroup(group, event, catalog);
-      }
-    });
+    const next = current.then(() => this.runClaimedBatch(claimed, event, catalog));
     this.queues.set(event.triggerId, next.catch(() => undefined));
-    void next.catch((error) => console.warn(`Automation trigger ${event.triggerId} queue failed.`, error));
+    this.trackBatch(next, event.triggerId);
   }
 
-  private async runGroup(group: AutomationGroup, event: TriggerEvent, catalog: AutomationCatalogResponse) {
+  private async runClaimedBatch(
+    claimed: Array<{ group: AutomationGroup; run: AutomationRunSummary }>,
+    event: TriggerEvent,
+    catalog: AutomationCatalogResponse
+  ): Promise<void> {
+    let index = 0;
+    try {
+      for (; index < claimed.length; index += 1) {
+        if (this.disposed) {
+          await this.cancelClaimedRuns(claimed.slice(index));
+          return;
+        }
+        const current = claimed[index]!;
+        await this.runGroup(current.group, event, catalog, current.run);
+      }
+    } catch (error) {
+      if (!this.disposed) {
+        throw error;
+      }
+      const failures = [error];
+      try {
+        await this.cancelClaimedRuns(claimed.slice(index));
+      } catch (cancellationError) {
+        failures.push(cancellationError);
+      }
+      throw combinedFailure(failures, "Automation batch cancellation failed.");
+    }
+  }
+
+  private trackBatch(batch: Promise<void>, triggerId: string): void {
+    this.ownedBatches.add(batch);
+    void batch.then(
+      () => this.ownedBatches.delete(batch),
+      (error) => {
+        this.ownedBatches.delete(batch);
+        console.warn(`Automation trigger ${triggerId} queue failed.`, error);
+      }
+    );
+  }
+
+  private async cancelClaimedRuns(claimed: Array<{ run: AutomationRunSummary }>): Promise<void> {
+    await this.repository.cancelRuns(claimed.map(({ run }) => run), "Automation service was stopped.");
+    await this.emitRuns();
+  }
+
+  private runGroup(group: AutomationGroup, event: TriggerEvent, catalog: AutomationCatalogResponse, claimedRun?: AutomationRunSummary): Promise<AutomationRunSummary> {
+    return this.trackInFlight(this.runGroupNow(group, event, catalog, claimedRun));
+  }
+
+  private trackInFlight<T>(work: Promise<T>): Promise<T> {
+    this.inFlightWork.add(work);
+    void work.then(
+      () => this.inFlightWork.delete(work),
+      () => this.inFlightWork.delete(work)
+    );
+    return work;
+  }
+
+  private async runGroupNow(group: AutomationGroup, event: TriggerEvent, catalog: AutomationCatalogResponse, claimedRun?: AutomationRunSummary): Promise<AutomationRunSummary> {
     const validation = this.compiler.validate(group.graph, catalog);
     if (!validation.valid) {
       const run = {
-        id: randomUUID(),
+        id: claimedRun?.id ?? randomUUID(),
         groupId: group.id,
         triggerEventId: event.id,
         status: "failed" as const,
-        startedAt: new Date().toISOString(),
+        startedAt: claimedRun?.startedAt ?? new Date().toISOString(),
         finishedAt: new Date().toISOString(),
         error: validation.diagnostics.find((diagnostic) => diagnostic.severity === "error")?.message ?? "Automation graph is invalid.",
         trace: validation.diagnostics.map((diagnostic) => ({
@@ -256,6 +330,7 @@ export class AutomationService {
     try {
       const run = await this.executor.execute(group, event, catalog, this.hooks, {
         ...this.options.executorOptions,
+        runId: claimedRun?.id,
         signal: controller.signal,
         effectSink: this.effectSink,
         onRunStarted: async (startedRun) => {
@@ -316,6 +391,9 @@ export class AutomationService {
 
   private async ensureStartupPolicy(): Promise<void> {
     await this.startupPolicy;
+    if (this.disposed) {
+      throw new Error("Automation service was stopped.");
+    }
   }
 
   private async saveRunAndEmit(run: AutomationRunSummary): Promise<AutomationRunSummary> {
@@ -446,4 +524,20 @@ function recordOfRecords(value: unknown): Record<string, Record<string, unknown>
   return Object.fromEntries(
     Object.entries(value as Record<string, unknown>).filter((entry): entry is [string, Record<string, unknown>] => typeof entry[1] === "object" && entry[1] !== null && !Array.isArray(entry[1]))
   );
+}
+
+async function settleOwnedWork(work: Promise<unknown>[]): Promise<void> {
+  const settled = await Promise.allSettled(work);
+  const failures = Array.from(new Set(settled.flatMap((result) => result.status === "rejected" ? [result.reason] : [])));
+  if (failures.length > 0) {
+    throw combinedFailure(failures, "Automation service shutdown failed.");
+  }
+}
+
+function combinedFailure(failures: unknown[], message: string): Error {
+  const unique = Array.from(new Set(failures));
+  if (unique.length === 1) {
+    return unique[0] instanceof Error ? unique[0] : new Error(String(unique[0]));
+  }
+  return new AggregateError(unique, message);
 }

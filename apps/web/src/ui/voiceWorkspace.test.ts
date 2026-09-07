@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { TabLayoutState, VoiceExecutionResult, WorkspaceTab } from "@cloudx/shared";
 
 import { listPanes } from "./layout.js";
-import { applyVoiceWorkspaceResults, applyVoiceWorkspaceResultsToWorkspace, buildClientVoiceContext, voiceConsoleValue } from "./voiceWorkspace.js";
+import { applyVoiceWorkspaceResultsToWorkspace, buildClientVoiceContext, voiceConsoleValue } from "./voiceWorkspace.js";
 
 describe("voice workspace helpers", () => {
   it("shows clear voice console status while recording and thinking", () => {
@@ -13,125 +13,6 @@ describe("voice workspace helpers", () => {
     expect(voiceConsoleValue("processing", "")).toBe("AI is thinking and controlling Cloudx...");
     expect(voiceConsoleValue("recording", "", "Listening...", "list directory")).toBe("list directory");
     expect(voiceConsoleValue("processing", "", "AI is thinking...", "open files")).toBe("open files");
-  });
-
-  it("places voice-created tabs into a newly split pane", () => {
-    const result: VoiceExecutionResult = {
-      accepted: true,
-      plan: { transcript: "open a new codex pane in home", summary: "Open Codex.", actions: [] },
-      results: [
-        {
-          action: "create_tab",
-          ok: true,
-          result: {
-            tab: tab("tab-2"),
-            layoutInstruction: { type: "open_tab_in_new_pane", tabId: "tab-2", splitDirection: "row" }
-          }
-        }
-      ]
-    };
-
-    const applied = applyVoiceWorkspaceResults(
-      { layout: layoutWithTabs([tab("tab-1")]), tabs: [tab("tab-1")], activeTabId: "tab-1" },
-      result,
-      { createPaneId: () => "pane-2", createSplitId: () => "split-1" }
-    );
-
-    expect(applied.tabs.map((candidate) => candidate.id)).toEqual(["tab-1", "tab-2"]);
-    expect(applied.activeTabId).toBe("tab-2");
-    expect(listPanes(applied.layout.root)).toMatchObject([
-      { id: "pane-1", tabIds: ["tab-1"] },
-      { id: "pane-2", tabIds: ["tab-2"], activeTabId: "tab-2" }
-    ]);
-  });
-
-  it("moves a voice-created tab out of the first pane after server refresh reconciliation", () => {
-    const result: VoiceExecutionResult = {
-      accepted: true,
-      plan: { transcript: "open a new terminal pane", summary: "Open terminal.", actions: [] },
-      results: [
-        {
-          action: "create_tab",
-          ok: true,
-          result: {
-            tab: tab("tab-2", "standard-terminal"),
-            layoutInstruction: { type: "open_tab_in_new_pane", tabId: "tab-2", splitDirection: "row" }
-          }
-        }
-      ]
-    };
-
-    const applied = applyVoiceWorkspaceResults(
-      { layout: layoutWithTabs([tab("tab-1"), tab("tab-2", "standard-terminal")]), tabs: [tab("tab-1"), tab("tab-2", "standard-terminal")], activeTabId: "tab-2" },
-      result,
-      { createPaneId: () => "pane-2", createSplitId: () => "split-1" }
-    );
-
-    expect(listPanes(applied.layout.root)).toMatchObject([
-      { id: "pane-1", tabIds: ["tab-1"] },
-      { id: "pane-2", tabIds: ["tab-2"], activeTabId: "tab-2" }
-    ]);
-  });
-
-  it("ignores malformed voice tab results without creating ghost layout entries", () => {
-    const current = { layout: layoutWithTabs([tab("tab-1")]), tabs: [tab("tab-1")], activeTabId: "tab-1" };
-    const result: VoiceExecutionResult = {
-      accepted: true,
-      plan: { transcript: "open tab", summary: "Open malformed tab.", actions: [] },
-      results: [
-        {
-          action: "create_tab",
-          ok: true,
-          result: {
-            tab: { id: "tab-2", pluginId: "standard-terminal", cwd: "/tmp" },
-            layoutInstruction: { type: "open_tab_in_new_pane", tabId: "tab-2", splitDirection: "row" }
-          }
-        }
-      ]
-    };
-
-    expect(applyVoiceWorkspaceResults(current, result, { createPaneId: () => "pane-2", createSplitId: () => "split-1" })).toEqual(current);
-  });
-
-  it("applies multi-step pane control before opening a tab in the new active pane", () => {
-    const result: VoiceExecutionResult = {
-      accepted: true,
-      plan: { transcript: "select right pane, split it horizontally, and open files there", summary: "Open files.", actions: [] },
-      results: [
-        {
-          action: "select_pane",
-          ok: true,
-          result: { layoutInstruction: { type: "select_pane", paneId: "pane-2" } }
-        },
-        {
-          action: "split_pane",
-          ok: true,
-          result: { layoutInstruction: { type: "split_pane", paneId: "pane-2", splitDirection: "column" } }
-        },
-        {
-          action: "create_tab",
-          ok: true,
-          result: {
-            tab: tab("tab-3", "file-browser"),
-            layoutInstruction: { type: "add_tab_to_active_pane", tabId: "tab-3" }
-          }
-        }
-      ]
-    };
-
-    const applied = applyVoiceWorkspaceResults(
-      { layout: splitLayout(), tabs: [tab("tab-1"), tab("tab-2")], activeTabId: "tab-2" },
-      result,
-      { createPaneId: () => "pane-3", createSplitId: () => "split-2" }
-    );
-
-    expect(applied.activeTabId).toBe("tab-3");
-    expect(applied.layout.activePaneId).toBe("pane-3");
-    expect(listPanes(applied.layout.root)).toMatchObject([
-      { id: "pane-1", tabIds: ["tab-1"] },
-      { id: "pane-2", tabIds: ["tab-2"] },
-      { id: "pane-3", tabIds: ["tab-3"], activeTabId: "tab-3" }
-    ]);
   });
 
   it("describes client pane positions for voice planning", () => {
@@ -148,25 +29,7 @@ describe("voice workspace helpers", () => {
     });
   });
 
-  it("ignores select-window instructions because server workspace state owns active windows", () => {
-    const result: VoiceExecutionResult = {
-      accepted: true,
-      plan: { transcript: "switch window", summary: "Switch.", actions: [] },
-      results: [
-        {
-          action: "switch_window",
-          ok: true,
-          result: { layoutInstruction: { type: "select_window", windowId: "window-2" } }
-        }
-      ]
-    };
-
-    const current = { layout: splitLayout(), tabs: [tab("tab-1"), tab("tab-2")], activeTabId: "tab-2" };
-
-    expect(applyVoiceWorkspaceResults(current, result, { createPaneId: () => "pane-3", createSplitId: () => "split-2" })).toEqual(current);
-  });
-
-  it("applies layout instructions to the targeted non-active window", () => {
+  it("applies layout-instruction-only results to the targeted non-active window", () => {
     const mainWindow = window("window-1", "Main", layoutWithTabs([tab("tab-1"), tab("tab-3", "file-browser")]));
     const backendWindow = window("window-2", "Backend", layoutWithTabs([tab("tab-2")]));
     const result: VoiceExecutionResult = {
@@ -174,10 +37,10 @@ describe("voice workspace helpers", () => {
       plan: { transcript: "move files to backend", summary: "Move files.", actions: [] },
       results: [
         {
-          action: "create_tab",
-          ok: true,
+          actionId: "move-tab",
+          action: "move_tab",
+          status: "succeeded",
           result: {
-            tab: tab("tab-3", "file-browser"),
             layoutInstruction: { type: "add_tab_to_active_pane", tabId: "tab-3", windowId: "window-2" }
           }
         }
@@ -203,7 +66,67 @@ describe("voice workspace helpers", () => {
     expect(listPanes(applied.windows.find((candidate) => candidate.id === "window-2")!.layout.root)).toMatchObject([{ tabIds: ["tab-2", "tab-3"], activeTabId: "tab-3" }]);
     expect(listPanes(applied.layout.root)).toMatchObject([{ tabIds: ["tab-2", "tab-3"], activeTabId: "tab-3" }]);
   });
+
+  it("projects a server-committed tab window without scheduling client layout persistence", () => {
+    const currentWindow = window("window-1", "Main", layoutWithTabs([tab("tab-1")]));
+    const committedWindow = window("window-1", "Main", layoutWithTabs([tab("tab-1"), tab("tab-2", "standard-terminal")]));
+    const result: VoiceExecutionResult = {
+      accepted: true,
+      plan: { transcript: "open terminal", summary: "Open terminal.", actions: [] },
+      results: [
+        {
+          actionId: "create-terminal",
+          action: "create_tab",
+          status: "succeeded",
+          result: { tab: tab("tab-2", "standard-terminal"), window: committedWindow }
+        }
+      ]
+    };
+
+    const applied = applyVoiceWorkspaceResultsToWorkspace(
+      { layout: currentWindow.layout, windows: [currentWindow], activeWindowId: currentWindow.id, tabs: [tab("tab-1")], activeTabId: "tab-1" },
+      result,
+      { createPaneId: () => "unused-pane", createSplitId: () => "unused-split" }
+    );
+
+    expect(applied.layout).toEqual(committedWindow.layout);
+    expect(applied.tabs.map((candidate) => candidate.id)).toEqual(["tab-1", "tab-2"]);
+    expect(applied.changedLayoutWindowIds).toEqual([]);
+  });
+
+  it.each([
+    ["invalid window", () => ({ tab: tab("tab-2"), window: { id: "window-1" } })],
+    ["missing window", () => ({ tab: tab("tab-2") })],
+    ["missing tab", () => ({ window: window("window-1", "Main", layoutWithTabs([tab("tab-2")])) })],
+    ["tab absent from layout", () => ({ tab: tab("tab-2"), window: window("window-1", "Main", layoutWithTabs([tab("tab-other")])) })],
+    ["malformed tab metadata", () => ({ tab: { ...tab("tab-2"), pluginMetadata: { plugin: "invalid" } }, window: window("window-1", "Main", layoutWithTabs([tab("tab-2")])) })],
+    ["malformed window metadata", () => ({ tab: tab("tab-2"), window: { ...window("window-1", "Main", layoutWithTabs([tab("tab-2")])), pluginMetadata: { plugin: "invalid" } } })]
+  ])("leaves the complete workspace projection unchanged for %s create output", (_case, output) => {
+    const currentWindow = window("window-1", "Main", layoutWithTabs([tab("tab-1")]));
+    const current = {
+      layout: currentWindow.layout,
+      windows: [currentWindow],
+      activeWindowId: currentWindow.id,
+      tabs: [tab("tab-1")],
+      activeTabId: "tab-1"
+    };
+
+    expect(
+      applyVoiceWorkspaceResultsToWorkspace(current, voiceResult(output()), {
+        createPaneId: () => "unused-pane",
+        createSplitId: () => "unused-split"
+      })
+    ).toEqual({ ...current, appliedLayoutWindowId: undefined, changedLayoutWindowIds: [] });
+  });
 });
+
+function voiceResult(output: Record<string, unknown>): VoiceExecutionResult {
+  return {
+    accepted: true,
+    plan: { transcript: "open terminal", summary: "Open terminal.", actions: [] },
+    results: [{ actionId: "create-terminal", action: "create_tab", status: "succeeded", result: output }]
+  };
+}
 
 function layoutWithTabs(tabs: WorkspaceTab[]): TabLayoutState {
   return {

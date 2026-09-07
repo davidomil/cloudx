@@ -6,15 +6,16 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { WorkspaceTab } from "@cloudx/shared";
 
-import { appendTextFileNoFollow, readTextFileNoFollow, requireRegularFile, requireSafeDirectory, writeNewTextFileNoFollow, writeTextFileAtomic } from "../jsonStateFile.js";
+import { appendTextFileNoFollow, openOwnedRegularFileNoFollow, openOwnedTextFileNoFollow, readTextFileNoFollow, requireRegularFile, requireSafeDirectory, writeTextFileAtomic } from "../jsonStateFile.js";
 import { TabContextService, type TabContextFileOperations } from "./TabContextService.js";
 
 const fileOperations: TabContextFileOperations = {
   appendTextFileNoFollow,
+  openOwnedRegularFileNoFollow,
+  openOwnedTextFileNoFollow,
   readTextFileNoFollow,
   requireRegularFile,
   requireSafeDirectory,
-  writeNewTextFileNoFollow,
   writeTextFileAtomic
 };
 
@@ -87,12 +88,74 @@ describe("TabContextService", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-tab-context-create-enospc-"));
     const service = new TabContextService(path.join(root, ".cloudx"), {
       ...fileOperations,
-      writeNewTextFileNoFollow: vi.fn(async () => {
-        throw capacityError();
+      openOwnedTextFileNoFollow: vi.fn(async (dataRoot, directoryPath, fileName, label) => {
+        const owned = await openOwnedTextFileNoFollow(dataRoot, directoryPath, fileName, label);
+        return {
+          ...owned,
+          write: async () => {
+            await owned.write("partial");
+            throw capacityError();
+          }
+        };
       })
     });
 
     await expect(service.create(tabFixture(root))).resolves.toBeUndefined();
+    await expect(fs.readdir(path.join(root, ".cloudx", "context"))).resolves.toEqual([]);
+  });
+
+  it("removes a partially created context file when creation fails", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-tab-context-create-partial-"));
+    const service = new TabContextService(path.join(root, ".cloudx"), {
+      ...fileOperations,
+      openOwnedTextFileNoFollow: vi.fn(async (dataRoot, directoryPath, fileName, label) => {
+        const owned = await openOwnedTextFileNoFollow(dataRoot, directoryPath, fileName, label);
+        return {
+          ...owned,
+          write: async () => {
+            await owned.write("partial");
+            throw new Error("context write failed");
+          }
+        };
+      })
+    });
+
+    await expect(service.create(tabFixture(root))).rejects.toThrow("context write failed");
+    await expect(fs.readdir(path.join(root, ".cloudx", "context"))).resolves.toEqual([]);
+  });
+
+  it("cleans a failed create through its owned directory after the context parent is swapped", async () => {
+    if (process.platform !== "linux") {
+      return;
+    }
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-tab-context-create-swap-"));
+    const dataDir = path.join(root, ".cloudx");
+    const contextDir = path.join(dataDir, "context");
+    const renamedContextDir = path.join(dataDir, "context-owned");
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-tab-context-create-swap-outside-"));
+    let outsideFile = "";
+    const service = new TabContextService(dataDir, {
+      ...fileOperations,
+      openOwnedTextFileNoFollow: vi.fn(async (dataRoot, directoryPath, fileName, label) => {
+        const owned = await openOwnedTextFileNoFollow(dataRoot, directoryPath, fileName, label);
+        return {
+          ...owned,
+          write: async () => {
+            await owned.write("partial");
+            await fs.rename(contextDir, renamedContextDir);
+            await fs.symlink(outside, contextDir, "dir");
+            outsideFile = path.join(outside, path.basename(owned.path));
+            await fs.writeFile(outsideFile, "outside must survive", "utf8");
+            throw new Error("context write failed after parent swap");
+          }
+        };
+      })
+    });
+
+    await expect(service.create(tabFixture(root))).rejects.toThrow("context write failed after parent swap");
+
+    await expect(fs.readFile(outsideFile, "utf8")).resolves.toBe("outside must survive");
+    await expect(fs.readdir(renamedContextDir)).resolves.toEqual([]);
   });
 
   it("drops context history writes instead of crashing when the disk is full", async () => {
@@ -161,6 +224,33 @@ describe("TabContextService", () => {
 
     await expect(service.record(tab, "plugin-action", "outside")).rejects.toThrow("symbolic link");
     await expect(fs.readFile(outsideFile, "utf8")).resolves.toBe("outside\n");
+  });
+
+  it("deletes through an owned directory descriptor when the context parent is swapped", async () => {
+    if (process.platform !== "linux") {
+      return;
+    }
+    const { tab } = await createContext();
+    const dataDir = path.dirname(path.dirname(tab.contextPath!));
+    const contextDir = path.dirname(tab.contextPath!);
+    const ownedContextDir = path.join(dataDir, "context-owned");
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-tab-context-delete-outside-"));
+    const outsideFile = path.join(outside, path.basename(tab.contextPath!));
+    const service = new TabContextService(dataDir, {
+      ...fileOperations,
+      openOwnedRegularFileNoFollow: vi.fn(async (rootPath, directoryPath, fileName, label) => {
+        const owned = await openOwnedRegularFileNoFollow(rootPath, directoryPath, fileName, label);
+        await fs.rename(contextDir, ownedContextDir);
+        await fs.symlink(outside, contextDir, "dir");
+        await fs.writeFile(outsideFile, "outside must survive", "utf8");
+        return owned;
+      })
+    });
+
+    await service.delete(tab);
+
+    await expect(fs.readFile(outsideFile, "utf8")).resolves.toBe("outside must survive");
+    await expect(fs.stat(path.join(ownedContextDir, path.basename(tab.contextPath!)))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("keeps path-like tab ids inside the context directory", async () => {

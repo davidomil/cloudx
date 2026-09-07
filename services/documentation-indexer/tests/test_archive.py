@@ -166,6 +166,257 @@ def test_archive_stats_omits_full_file_manifest_for_large_archives(tmp_path: Pat
     assert len(json.dumps(manifest)) > len(json.dumps(stats))
 
 
+def test_ingest_does_not_publish_catalog_rows_when_index_generation_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    archive_root = tmp_path / "archive"
+    archive = DocumentationArchive(archive_root)
+    preserved = archive.ingest_text(
+        title="Preserved generation",
+        text="The prior generation contains PRESERVED-GENERATION-41.",
+        uri="manual://preserved-generation",
+    )
+    published_manifest = json.loads(archive.manifest_path.read_text(encoding="utf-8"))
+    published_files = {
+        entry["path"]: entry["sha256"]
+        for entry in archive.portable_manifest()["files"]
+    }
+
+    def fail_index_write(_index, _path: str) -> None:
+        raise RuntimeError("forced index generation failure")
+
+    monkeypatch.setattr(archive_module.IdMapIndex, "write", fail_index_write)
+
+    with pytest.raises(RuntimeError, match="forced index generation failure"):
+        archive.ingest_text(
+            title="Unpublished generation",
+            text="A failed rebuild must not expose UNPUBLISHED-GENERATION-41.",
+            uri="manual://unpublished-generation",
+        )
+
+    assert [document["document_id"] for document in archive.list_documents()] == [preserved.document_id]
+    assert archive.search("PRESERVED-GENERATION-41", limit=1)[0]["documentId"] == preserved.document_id
+    assert archive.search("UNPUBLISHED-GENERATION-41", limit=10) == []
+    assert json.loads(archive.manifest_path.read_text(encoding="utf-8")) == published_manifest
+    assert {
+        entry["path"]: entry["sha256"]
+        for entry in archive.portable_manifest()["files"]
+    } == published_files
+
+    reopened = DocumentationArchive(archive_root)
+    assert [document["document_id"] for document in reopened.list_documents()] == [preserved.document_id]
+    assert reopened.search("PRESERVED-GENERATION-41", limit=1)[0]["documentId"] == preserved.document_id
+
+
+def test_invalidation_does_not_publish_without_its_index_generation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+    document = archive.ingest_text(
+        title="Still active after failure",
+        text="The active generation contains ACTIVE-AFTER-FAILURE-42.",
+        uri="manual://active-after-failure",
+    )
+    archive.ingest_text(
+        title="Generation peer",
+        text="A second active document forces a distinct post-invalidation generation.",
+        uri="manual://generation-peer",
+    )
+
+    def fail_index_write(_index, _path: str) -> None:
+        raise RuntimeError("forced invalidation index failure")
+
+    monkeypatch.setattr(archive_module.IdMapIndex, "write", fail_index_write)
+
+    with pytest.raises(RuntimeError, match="forced invalidation index failure"):
+        archive.invalidate_document(document.document_id, state="stale", reason="test failure boundary")
+
+    assert archive.get_document(document.document_id)["state"] == "active"
+    assert archive.search("ACTIVE-AFTER-FAILURE-42", limit=1)[0]["documentId"] == document.document_id
+
+
+def test_enrichment_does_not_publish_without_its_index_generation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+    document = archive.ingest_text(
+        title="Enrichment generation",
+        text="The source remains available during enrichment publication.",
+        uri="manual://enrichment-generation",
+    )
+    archive.enrich_document(
+        document.document_id,
+        spans=[archive_module.ExtractedSpan("The published enrichment contains PUBLISHED-ENRICHMENT-42.", "ai:published")],
+        model="gpt-test",
+        skill_ids=["documentation-enrich-metadata"],
+    )
+
+    def fail_index_write(_index, _path: str) -> None:
+        raise RuntimeError("forced enrichment index failure")
+
+    monkeypatch.setattr(archive_module.IdMapIndex, "write", fail_index_write)
+
+    with pytest.raises(RuntimeError, match="forced enrichment index failure"):
+        archive.enrich_document(
+            document.document_id,
+            spans=[archive_module.ExtractedSpan("The failed enrichment contains UNPUBLISHED-ENRICHMENT-42.", "ai:unpublished")],
+            model="gpt-test",
+            skill_ids=["documentation-enrich-metadata"],
+        )
+
+    assert archive.search("PUBLISHED-ENRICHMENT-42", limit=1)[0]["documentId"] == document.document_id
+    assert archive.search("UNPUBLISHED-ENRICHMENT-42", limit=10) == []
+    assert {chunk["locator"] for chunk in archive.get_document(document.document_id)["chunks"] if chunk["chunk_origin"] == "ai"} == {"ai:published"}
+
+
+def test_startup_rebuilds_a_missing_active_index_generation(tmp_path: Path) -> None:
+    archive_root = tmp_path / "archive"
+    archive = DocumentationArchive(archive_root)
+    document = archive.ingest_text(
+        title="Recoverable generation",
+        text="Startup recovery restores RECOVERABLE-GENERATION-43.",
+        uri="manual://recoverable-generation",
+    )
+    manifest = json.loads(archive.manifest_path.read_text(encoding="utf-8"))
+    generation = manifest["catalogGeneration"]
+    generation_dir = archive.index_dir / "generations" / generation
+
+    shutil.rmtree(generation_dir)
+    archive.index_path.unlink()
+    archive.manifest_path.unlink()
+
+    recovered = DocumentationArchive(archive_root)
+    recovered_manifest = json.loads(recovered.manifest_path.read_text(encoding="utf-8"))
+
+    assert recovered_manifest["catalogGeneration"] == generation
+    assert recovered.index_path.is_file()
+    assert recovered.search("RECOVERABLE-GENERATION-43", limit=1)[0]["documentId"] == document.document_id
+
+
+def test_archive_retains_only_the_active_complete_index_generation(tmp_path: Path) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+
+    for revision in range(3):
+        archive.ingest_text(
+            title=f"Generation {revision}",
+            text=f"Generation retention fixture {revision}.",
+            uri=f"manual://generation-{revision}",
+        )
+
+    manifest = json.loads(archive.manifest_path.read_text(encoding="utf-8"))
+    complete_generations = sorted(
+        path.name
+        for path in archive.index_generations_dir.iterdir()
+        if path.is_dir() and not path.name.startswith(".")
+    )
+
+    assert complete_generations == [manifest["catalogGeneration"]]
+
+
+def test_committed_ingest_survives_index_symlink_projection_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    archive_root = tmp_path / "archive"
+    archive = DocumentationArchive(archive_root)
+    archive.ingest_text(
+        title="Prior projection",
+        text="The prior projection contains PRIOR-PROJECTION-46.",
+        uri="manual://prior-projection",
+    )
+    prior_generation = json.loads(archive.manifest_path.read_text(encoding="utf-8"))["catalogGeneration"]
+    prior_index_sha256 = archive_module.sha256_file(archive.index_path)
+    prior_manifest_sha256 = archive_module.sha256_file(archive.manifest_path)
+    projection_links: list[Path] = []
+    real_replace = archive_module.os.replace
+
+    assert archive.index_projection_path.is_symlink()
+    assert archive.index_path.readlink() == Path("current/chunks.tvim")
+    assert archive.manifest_path.readlink() == Path("current/manifest.json")
+
+    def fail_symlink_projection(source: Path | str, destination: Path | str) -> None:
+        if Path(destination) == archive.index_projection_path:
+            projection_links.append(Path(destination))
+            raise OSError("forced symlink projection failure")
+        real_replace(source, destination)
+
+    with monkeypatch.context() as projection_failure:
+        projection_failure.setattr(archive_module.os, "replace", fail_symlink_projection)
+        committed = archive.ingest_text(
+            title="Committed projection",
+            text="The committed catalog contains COMMITTED-PROJECTION-46.",
+            uri="manual://committed-projection",
+        )
+
+    active_generation, projected_generation = archive_generation_state(archive)
+    active = archive._load_index_generation(active_generation)
+    portable_files = {entry["path"]: entry for entry in archive.portable_manifest()["files"]}
+    stable_manifest_path = archive.manifest_path.relative_to(archive.root).as_posix()
+
+    assert committed.state == "active"
+    assert archive.search("COMMITTED-PROJECTION-46", limit=1)[0]["documentId"] == committed.document_id
+    assert active is not None
+    assert active_generation != projected_generation
+    assert json.loads(archive.manifest_path.read_text(encoding="utf-8"))["catalogGeneration"] == prior_generation
+    assert archive_module.sha256_file(archive.index_path) == prior_index_sha256
+    assert archive_module.sha256_file(archive.manifest_path) == prior_manifest_sha256
+    assert projection_links == [archive.index_projection_path]
+    assert not archive.index_projection_path.with_name(".current.tmp").exists()
+    assert portable_files[stable_manifest_path]["sha256"] == archive_module.sha256_file(active.manifest_path)
+    assert archive.health()["status"] == "degraded"
+    assert archive.health()["ready"] is False
+    assert archive.health()["indexProjection"] == {
+        "ready": False,
+        "activeGeneration": active_generation,
+        "projectedGeneration": projected_generation,
+    }
+
+    recovered = DocumentationArchive(archive_root)
+    recovered_active, recovered_projected = archive_generation_state(recovered)
+
+    assert recovered_active == recovered_projected == active_generation
+    assert json.loads(recovered.manifest_path.read_text(encoding="utf-8"))["catalogGeneration"] == active_generation
+    assert recovered.health()["status"] == "ok"
+    assert recovered.health()["ready"] is True
+
+
+def test_committed_ingest_survives_generation_prune_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    archive_root = tmp_path / "archive"
+    archive = DocumentationArchive(archive_root)
+    archive.ingest_text(
+        title="Prior prune projection",
+        text="The prior catalog contains PRIOR-PRUNE-47.",
+        uri="manual://prior-prune",
+    )
+
+    def fail_generation_prune(_active_generation_id: str) -> None:
+        raise OSError("forced generation prune failure")
+
+    with monkeypatch.context() as projection_failure:
+        projection_failure.setattr(archive, "_prune_inactive_index_generations", fail_generation_prune)
+        committed = archive.ingest_text(
+            title="Committed prune projection",
+            text="The committed catalog contains COMMITTED-PRUNE-47.",
+            uri="manual://committed-prune",
+        )
+
+    active_generation, projected_generation = archive_generation_state(archive)
+    complete_generations = [
+        path.name
+        for path in archive.index_generations_dir.iterdir()
+        if path.is_dir() and not path.name.startswith(".")
+    ]
+
+    assert committed.state == "active"
+    assert archive.search("COMMITTED-PRUNE-47", limit=1)[0]["documentId"] == committed.document_id
+    assert active_generation != projected_generation
+    assert len(complete_generations) == 2
+    assert archive.health()["status"] == "degraded"
+    assert archive.health()["ready"] is False
+
+    recovered = DocumentationArchive(archive_root)
+    recovered_active, recovered_projected = archive_generation_state(recovered)
+    recovered_generations = [
+        path.name
+        for path in recovered.index_generations_dir.iterdir()
+        if path.is_dir() and not path.name.startswith(".")
+    ]
+
+    assert recovered_active == recovered_projected == active_generation
+    assert recovered_generations == [active_generation]
+
+
 def test_archive_export_package_contains_manifest_hashes_and_live_catalog_backup(tmp_path: Path) -> None:
     archive = DocumentationArchive(tmp_path / "archive")
     document = archive.ingest_text(
@@ -224,6 +475,37 @@ def test_archive_replace_import_requires_confirmation_and_rebuilds_search(tmp_pa
         assert target.search("REPLACE-IMPORT-21", limit=1)[0]["documentId"] == imported.document_id
         assert target.search("OLD-REPLACE-21", limit=10) == []
         assert result["rebuildManifest"]["activeChunkCount"] == 1
+    finally:
+        exported.path.unlink(missing_ok=True)
+
+
+def test_archive_replace_preserves_prior_archive_when_candidate_index_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = DocumentationArchive(tmp_path / "source")
+    source.ingest_text(
+        title="Replacement candidate",
+        text="The candidate contains FAILED-REPLACEMENT-44.",
+        uri="manual://failed-replacement",
+    )
+    exported = source.export_archive()
+    target = DocumentationArchive(tmp_path / "target")
+    preserved = target.ingest_text(
+        title="Preserved target",
+        text="The target must retain PRESERVED-REPLACEMENT-44.",
+        uri="manual://preserved-replacement",
+    )
+
+    def fail_index_write(_index, _path: str) -> None:
+        raise RuntimeError("forced replacement index failure")
+
+    monkeypatch.setattr(archive_module.IdMapIndex, "write", fail_index_write)
+    try:
+        with pytest.raises(RuntimeError, match="forced replacement index failure"):
+            target.import_archive_replace(exported.path, confirmation=ARCHIVE_IMPORT_REPLACE_CONFIRMATION)
+
+        assert target.search("PRESERVED-REPLACEMENT-44", limit=1)[0]["documentId"] == preserved.document_id
+        assert target.search("FAILED-REPLACEMENT-44", limit=10) == []
+        reopened = DocumentationArchive(tmp_path / "target")
+        assert reopened.search("PRESERVED-REPLACEMENT-44", limit=1)[0]["documentId"] == preserved.document_id
     finally:
         exported.path.unlink(missing_ok=True)
 
@@ -291,6 +573,43 @@ def test_archive_merge_skips_duplicates_imports_new_documents_and_reports_uri_co
         assert target.search("MERGE-DUP-31", limit=10)[0]["documentId"] == duplicate_target.document_id
         duplicate_record = target.get_document(duplicate_target.document_id)
         assert any(event["reason"] == "Imported archive marked the duplicate stale." for event in duplicate_record["events"])
+    finally:
+        exported.path.unlink(missing_ok=True)
+
+
+def test_archive_merge_preserves_prior_archive_when_index_generation_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = DocumentationArchive(tmp_path / "source")
+    source.ingest_text(
+        title="Merge candidate",
+        text="The merge candidate contains FAILED-MERGE-45.",
+        uri="manual://failed-merge",
+    )
+    exported = source.export_archive()
+    target = DocumentationArchive(tmp_path / "target")
+    preserved = target.ingest_text(
+        title="Preserved merge target",
+        text="The target retains PRESERVED-MERGE-45.",
+        uri="manual://preserved-merge",
+    )
+    published_files = {
+        entry["path"]: entry["sha256"]
+        for entry in target.portable_manifest()["files"]
+    }
+
+    def fail_index_write(_index, _path: str) -> None:
+        raise RuntimeError("forced merge index failure")
+
+    monkeypatch.setattr(archive_module.IdMapIndex, "write", fail_index_write)
+    try:
+        with pytest.raises(RuntimeError, match="forced merge index failure"):
+            target.import_archive_merge(exported.path)
+
+        assert target.search("PRESERVED-MERGE-45", limit=1)[0]["documentId"] == preserved.document_id
+        assert target.search("FAILED-MERGE-45", limit=10) == []
+        assert {
+            entry["path"]: entry["sha256"]
+            for entry in target.portable_manifest()["files"]
+        } == published_files
     finally:
         exported.path.unlink(missing_ok=True)
 
@@ -398,6 +717,21 @@ def test_archive_lists_documents_with_pagination_filters_and_order(tmp_path: Pat
         archive.list_document_page(sort_direction="sideways")
 
 
+def test_fastapi_readiness_fails_closed_without_health_details(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app = create_app(tmp_path / "archive")
+    monkeypatch.setattr(
+        app.state.archive,
+        "health",
+        lambda: {"status": "degraded", "ready": False, "privatePath": "/private/archive"},
+    )
+
+    response = TestClient(app).get("/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "not-ready"}
+    assert "/private/archive" not in response.text
+
+
 def test_fastapi_surface_controls_archive(tmp_path: Path) -> None:
     app = create_app(tmp_path / "archive")
     client = TestClient(app)
@@ -406,6 +740,10 @@ def test_fastapi_surface_controls_archive(tmp_path: Path) -> None:
     assert health.status_code == 200
     assert health.json()["portable"] is True
     assert health.json()["archiveLocality"]["ok"] is True
+
+    ready = client.get("/ready")
+    assert ready.status_code == 200
+    assert ready.json() == {"status": "ready"}
 
     ingested = client.post(
         "/ingest/text",
@@ -2161,6 +2499,14 @@ def stub_youtube_media(monkeypatch: pytest.MonkeyPatch, transcripts: dict[str, s
 
 def dense_collision_query(reference_tokens: list[str]) -> str:
     return " ".join(dense_collision_token(token) for token in reference_tokens)
+
+
+def archive_generation_state(archive: DocumentationArchive) -> tuple[str | None, str | None]:
+    with archive._connect() as db:
+        state = db.execute(
+            "SELECT active_index_generation, projected_index_generation FROM archive_state WHERE state_id = 1"
+        ).fetchone()
+    return state["active_index_generation"], state["projected_index_generation"]
 
 
 def dense_collision_token(reference_token: str) -> str:

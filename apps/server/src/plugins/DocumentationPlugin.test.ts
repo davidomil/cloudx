@@ -142,7 +142,7 @@ describe("DocumentationPlugin", () => {
 
     await hook.execute({ path: allowedFile, sourceType: "datasheet" }, { caller: { kind: "http" } });
 
-    expect(client.ingestPath).toHaveBeenCalledWith({ path: allowedFile, sourceType: "datasheet" });
+    expect(client.ingestPath).toHaveBeenCalledWith({ path: allowedFile, sourceType: "datasheet" }, { signal: expect.any(AbortSignal) });
     await expect(hook.execute({ path: "/etc/passwd" }, { caller: { kind: "http" } })).rejects.toThrow("Path is outside configured Cloudx roots");
   });
 
@@ -158,7 +158,7 @@ describe("DocumentationPlugin", () => {
 
     await hook.execute({ path: "docs/datasheet.pdf", cwd: workspace, sourceType: "datasheet" }, { caller: { kind: "http" } });
 
-    expect(client.ingestPath).toHaveBeenCalledWith({ path: allowedFile, sourceType: "datasheet" });
+    expect(client.ingestPath).toHaveBeenCalledWith({ path: allowedFile, sourceType: "datasheet" }, { signal: expect.any(AbortSignal) });
     await expect(hook.execute({ path: "docs/datasheet.pdf", cwd: "/etc" }, { caller: { kind: "http" } })).rejects.toThrow("Path is outside configured Cloudx roots");
   });
 
@@ -174,7 +174,11 @@ describe("DocumentationPlugin", () => {
     const result = await hook.execute({ path: allowedFile, sourceType: "datasheet" }, { caller: { kind: "http" } });
 
     expect(result).toMatchObject({ documents: [], documentCount: 0, kind: "path", source: allowedFile, enrichment: { enabled: true } });
-    expect(enrichIngestResponse).toHaveBeenCalledWith({ documents: [] });
+    expect(enrichIngestResponse).toHaveBeenCalledWith(
+      { documents: [] },
+      {},
+      { signal: expect.any(AbortSignal) }
+    );
   });
 
   it("queues blocking ingest hooks and reports progress before completion", async () => {
