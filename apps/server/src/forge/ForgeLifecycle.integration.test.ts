@@ -31,7 +31,7 @@ import type { TerminalProcess } from "../terminal/TerminalProcess.js";
 import { WorkspaceCommandService } from "../workspace/WorkspaceCommandService.js";
 import { WorkspaceLayoutStore } from "../workspace/WorkspaceLayoutStore.js";
 import { ForgeRuntime, type ForgeRuntimeDependencies } from "./ForgeRuntime.js";
-import { ForgeWorkflowService, type ForgeSettings } from "./ForgeWorkflowService.js";
+import { ForgeWorkflowService, type ForgeSettings, type ForgeWorkflowDependencies } from "./ForgeWorkflowService.js";
 import { ForgeWorkerReports, ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
 import type { ForgeProvider } from "./providers/ForgeProvider.js";
 
@@ -130,17 +130,27 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     vi.spyOn(fixture.provider, "getChangeRequest").mockResolvedValueOnce(previousHead);
     await fixture.workflow.poll();
     const waitingForPublication = await fixture.worker(started.id);
-    expect(waitingForPublication.status).toBe("failed");
+    expect(waitingForPublication.status).toBe("awaiting_publication");
     expect(waitingForPublication.pendingPublication?.headSha).toBe(second.headSha);
+    expect(waitingForPublication.pendingPublication?.previousHeadSha).toBe(previousHead.headSha);
+    expect(waitingForPublication.pendingPublication?.confirmationStartedAt).toEqual(expect.any(String));
     expect(waitingForPublication.pendingPublication?.report.resolvedDiscussionIds).toEqual(["empty-input"]);
     expect(await git(fixture.origin, "rev-parse", waitingForPublication.branch!)).toBe(second.headSha);
     expect(fixture.provider.discussionReplies).toEqual([]);
     expect(fixture.provider.resolvedDiscussions).toEqual([]);
+    expect(await processIsRunning(second.pid)).toBe(false);
+    expect(fixture.factory.processes).toHaveLength(2);
+    expect(fixture.gitPushes).toHaveLength(2);
     await expectMissing(second.reportPath, second.contextPath);
-    const revised = await fixture.workflow.resume(started.id, fixture.placement);
+    await fixture.workflow.poll();
+    expect((await fixture.worker(started.id)).status).toBe("awaiting_publication");
+    fixture.advanceTime(5_001);
+    await fixture.workflow.poll();
+    const revised = await fixture.worker(started.id);
     expect(revised.status).toBe("awaiting_review");
-    expect(revised.tabId).toBeUndefined();
     expect(revised.pendingPublication).toBeUndefined();
+    expect(fixture.factory.processes).toHaveLength(2);
+    expect(fixture.gitPushes).toHaveLength(2);
     expect(revised.headSha).not.toBe(awaiting.headSha);
     expect(await fs.readFile(path.join(revised.worktreePath!, "regression.txt"), "utf8")).toBe("Empty input is covered\n");
     expect(fixture.provider.resolvedDiscussions).toEqual(["empty-input"]);
@@ -165,6 +175,60 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(await fixture.store.read()).toEqual([]);
     expect(fixture.notifications.list().some((notification) => notification.title === "Issue merged")).toBe(true);
     expect(await fs.readFile(path.join(fixture.codexHome, "config.toml"), "utf8")).toBe(sourceConfig);
+  }, 20_000);
+
+  it("pauses publication confirmation without losing its report or launching another worker on resume", async () => {
+    const fixture = await LifecycleFixture.create();
+    const { worker, receipt, showCurrentHead } = await fixture.startAwaitingPublication();
+    const checkpoint = worker.pendingPublication;
+    const reads = vi.spyOn(fixture.provider, "getChangeRequestStatus");
+    await fixture.workflow.pause(worker.id);
+    reads.mockClear();
+    showCurrentHead();
+    fixture.advanceTime(5_001);
+    await fixture.workflow.poll();
+
+    expect(await fixture.worker(worker.id)).toMatchObject({ status: "paused", pendingPublication: checkpoint });
+    expect(reads).not.toHaveBeenCalled();
+    expect(fixture.provider.discussionReplies).toEqual([]);
+    expect(fixture.factory.processes).toHaveLength(2);
+    expect(fixture.gitPushes).toHaveLength(2);
+    expect(await processIsRunning(receipt.pid)).toBe(false);
+
+    const confirmed = await fixture.workflow.resume(worker.id, fixture.placement);
+    expect(confirmed.status).toBe("awaiting_review");
+    expect(confirmed.pendingPublication).toBeUndefined();
+    expect(fixture.provider.discussionReplies).toHaveLength(1);
+    expect(fixture.provider.resolvedDiscussions).toEqual(["empty-input"]);
+    expect(fixture.factory.processes).toHaveLength(2);
+    expect(fixture.gitPushes).toHaveLength(2);
+    await expectMissing(receipt.codexHome, receipt.tabContextPath);
+  }, 20_000);
+
+  it("keeps the original confirmation deadline across restart and preserves the publication when it expires", async () => {
+    const fixture = await LifecycleFixture.create();
+    const { worker, receipt } = await fixture.startAwaitingPublication();
+    const checkpoint = worker.pendingPublication;
+    const confirmationStartedAt = checkpoint!.confirmationStartedAt;
+    fixture.advanceTime(90_000);
+    await fixture.workflow.poll();
+    expect(await fixture.worker(worker.id)).toMatchObject({ status: "awaiting_publication", pendingPublication: checkpoint });
+
+    await fixture.restartWorkflow();
+    expect(await fixture.worker(worker.id)).toMatchObject({ status: "awaiting_publication", pendingPublication: { confirmationStartedAt } });
+    fixture.advanceTime(30_001);
+    await fixture.workflow.poll();
+
+    expect(await fixture.worker(worker.id)).toMatchObject({ status: "failed", error: expect.stringMatching(/confirm|publication/i), pendingPublication: checkpoint, worktreePath: worker.worktreePath });
+    expect((await fixture.store.read())[0]?.pendingPublication).toEqual(checkpoint);
+    expect(await git(worker.worktreePath!, "rev-parse", "HEAD")).toBe(checkpoint!.headSha);
+    expect(await git(fixture.origin, "rev-parse", worker.branch!)).toBe(checkpoint!.headSha);
+    expect(fixture.provider.discussionReplies).toEqual([]);
+    expect(fixture.provider.resolvedDiscussions).toEqual([]);
+    expect(fixture.factory.processes).toHaveLength(2);
+    expect(fixture.gitPushes).toHaveLength(2);
+    expect(await processIsRunning(receipt.pid)).toBe(false);
+    await expectMissing(receipt.codexHome, receipt.tabContextPath);
   }, 20_000);
 
   it("removes coding and running review workers after an external merge closes their issue and deletes the branch", async () => {
@@ -317,12 +381,14 @@ class LifecycleFixture {
   readonly notifications = new NotificationsPlugin();
   readonly providerRoles: ForgeCredentialRole[] = [];
   readonly gitAccessRoles: ForgeCredentialRole[] = [];
+  readonly gitPushes: string[][] = [];
   readonly sources: CodexStateSources;
   readonly workspace: WorkspaceLayoutStore;
   readonly sessions: SessionStore;
   readonly reports: ForgeWorkerReports;
   readonly store: ForgeWorkflowStore;
-  readonly workflow: ForgeWorkflowService;
+  workflow: ForgeWorkflowService;
+  readonly workflowDependencies: ForgeWorkflowDependencies;
   readonly catalog: RulesSkillsCatalogService;
   readonly runtimeDependencies: ForgeRuntimeDependencies;
   readonly models: Pick<ForgeSettings, "workerModel" | "workerReasoningEffort" | "reviewModel" | "reviewReasoningEffort"> = {
@@ -354,20 +420,24 @@ class LifecycleFixture {
         this.gitAccessRoles.push(role);
         return { cloneUrl: "https://github.com/fixture/cloudx.git", authorization: `Basic fixture-${role}-secret` };
       },
-      git: async (cwd, args) => git(cwd, ...args.map((argument) => argument === "https://github.com/fixture/cloudx.git" && ["fetch", "push"].includes(args[0]!) ? this.origin : argument)),
+      git: async (cwd, args) => {
+        if (args[0] === "push") this.gitPushes.push([...args]);
+        return git(cwd, ...args.map((argument) => argument === "https://github.com/fixture/cloudx.git" && ["fetch", "push"].includes(args[0]!) ? this.origin : argument));
+      },
     };
     const runtime = new ForgeRuntime(this.runtimeDependencies);
     this.provider = new LocalForgeProvider(this.origin);
     this.store = new ForgeWorkflowStore(new PluginDataStore(this.dataDir));
     this.reports = new ForgeWorkerReports(this.dataDir);
-    this.workflow = new ForgeWorkflowService({
+    this.workflowDependencies = {
       runtime,
       store: this.store,
       reports: this.reports,
       provider: (_repository, role) => { this.providerRoles.push(role); return this.provider; },
       settings: () => ({ repository, baseBranch: "main", workerTemplateId: "fixture-worker", reviewTemplateId: "fixture-review", ...this.models, maxRunMinutes: 1 }),
       notify: (title, body) => { this.notifications.send({ title, body }); },
-    });
+    };
+    this.workflow = new ForgeWorkflowService(this.workflowDependencies);
   }
 
   static async create({ trustRepository = true, largeOutput = false } = {}): Promise<LifecycleFixture> {
@@ -417,8 +487,37 @@ class LifecycleFixture {
   }
 
   advanceCleanupInterval(): void {
-    const elapsed = Date.now() - wallClockNow() + 30_001;
+    this.advanceTime(30_001);
+  }
+
+  advanceTime(milliseconds: number): void {
+    const elapsed = Date.now() - wallClockNow() + milliseconds;
     vi.spyOn(Date, "now").mockImplementation(() => wallClockNow() + elapsed);
+  }
+
+  async restartWorkflow(): Promise<void> {
+    await this.workflow.dispose();
+    await this.sessions.dispose();
+    this.workflow = new ForgeWorkflowService({ ...this.workflowDependencies, runtime: new ForgeRuntime(this.runtimeDependencies) });
+    await this.workflow.dashboard();
+  }
+
+  async startAwaitingPublication() {
+    const started = await this.workflow.startIssue(1, this.placement);
+    await this.completedAssistantTurn(started);
+    await this.workflow.poll();
+    const change = this.provider.changes.get(7)!;
+    change.comments.push({ id: "review-feedback", body: "Cover empty input.", author: "reviewer", discussionId: "empty-input", resolved: false });
+    change.unresolvedDiscussions = 1;
+    const previous = await this.provider.getChangeRequest(7);
+    const resumed = await this.workflow.resume(started.id, this.placement);
+    const receipt = await this.completedAssistantTurn(resumed);
+    const stale = vi.spyOn(this.provider, "getChangeRequest").mockResolvedValue(previous);
+    await this.workflow.poll();
+    const worker = await this.worker(started.id);
+    expect(worker.status, worker.error).toBe("awaiting_publication");
+    expect(worker.pendingPublication).toMatchObject({ headSha: receipt.headSha, previousHeadSha: previous.headSha, confirmationStartedAt: expect.any(String) });
+    return { worker, receipt, showCurrentHead: () => stale.mockRestore() };
   }
 
   async completedAssistantTurn(worker: ForgeWorker): Promise<AssistantReceipt> {

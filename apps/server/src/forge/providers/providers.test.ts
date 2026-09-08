@@ -4,6 +4,8 @@ import type { ForgeListScope, ForgeRepository, ForgeReviewSubmission } from "@cl
 import {
   createForgeProvider,
   ForgeCredentials,
+  ForgeHeadChangedError,
+  ForgeProviderError,
   validateRepository,
   type ForgeListIdentity,
 } from "./index.js";
@@ -749,6 +751,130 @@ describe("change request lifecycle and linked closing issues", () => {
   it("rejects GitHub GraphQL errors even when partial closing-issue data is present", async () => {
     const { provider } = harness(github, async () => response({ errors: [{ message: "forbidden" }], ...await githubStatusResponse().json() }));
     await expect(provider.getChangeRequestStatus(7)).rejects.toThrow();
+  });
+});
+
+describe("inconsistent provider head snapshots", () => {
+  function githubSnapshot({ statusHead = headSha, readinessHead = headSha, statusBranch = "fix-race", statusBase = "main", statusState = "OPEN" }: { statusHead?: unknown; readinessHead?: unknown; statusBranch?: string; statusBase?: string; statusState?: string } = {}) {
+    const base = hubFixture();
+    return harness(github, async (url, options) => {
+      if (url.pathname !== "/graphql") return base.fetcher(url, options);
+      const value = await (await base.fetcher(url, options)).json();
+      const status = JSON.parse(String(options.body)).query.includes("closingIssuesReferences");
+      Object.assign(value.data.repository.pullRequest, {
+        headRefOid: status ? statusHead : readinessHead,
+        ...(status ? { headRefName: statusBranch, baseRefName: statusBase, state: statusState } : {}),
+      });
+      return response(value);
+    });
+  }
+
+  it("preserves observed head evidence independently of the caller's array", () => {
+    const observed = [headSha, previousSha, headSha];
+    const error = new ForgeHeadChangedError(observed);
+    observed.push("c".repeat(40));
+    expect(error).toBeInstanceOf(ForgeProviderError);
+    expect(error).toMatchObject({ statusCode: 409, observedHeadShas: [headSha, previousSha] });
+    expect(Object.isFrozen(error.observedHeadShas)).toBe(true);
+  });
+
+  it.each([
+    { statusHead: previousSha },
+    { readinessHead: previousSha },
+    { statusHead: previousSha, readinessHead: previousSha },
+    { statusHead: previousSha, readinessHead: "c".repeat(40) },
+  ])("reports every observed GitHub snapshot head %j", async heads => {
+    const { provider, calls } = githubSnapshot(heads);
+    const error = await provider.getChangeRequest(7).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeHeadChangedError);
+    expect(new Set(error.observedHeadShas)).toEqual(new Set([headSha, ...Object.values(heads)]));
+    expect(error.statusCode).toBe(409);
+    expect(calls.filter(call => call.url.pathname === "/graphql")).toHaveLength(2);
+  });
+
+  it.each([{ statusBranch: "other" }, { statusBase: "release" }, { statusState: "CLOSED" }])("does not classify GitHub branch or state changes as head lag %j", async branch => {
+    const { provider } = githubSnapshot({ ...branch, statusHead: previousSha, readinessHead: previousSha });
+    const error = await provider.getChangeRequest(7).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeProviderError);
+    expect(error).not.toBeInstanceOf(ForgeHeadChangedError);
+    expect(error.statusCode).toBe(409);
+  });
+
+  it("does not hide branch changes behind a head change while paginating GitHub status", async () => {
+    const base = githubSnapshot({ statusBranch: "other" });
+    const { provider } = harness(github, async (url, options) => {
+      if (url.pathname !== "/graphql" || !JSON.parse(String(options.body)).query.includes("closingIssuesReferences")) return base.fetcher(url, options);
+      const value = await (await base.fetcher(url, options)).json();
+      const { cursor } = JSON.parse(String(options.body)).variables;
+      Object.assign(value.data.repository.pullRequest, {
+        headRefOid: cursor ? previousSha : headSha,
+        closingIssuesReferences: { nodes: [], pageInfo: { hasNextPage: !cursor, endCursor: "next" } },
+      });
+      return response(value);
+    });
+    const error = await provider.getChangeRequest(7).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeProviderError);
+    expect(error).not.toBeInstanceOf(ForgeHeadChangedError);
+    expect(error.statusCode).toBe(409);
+  });
+
+  it.each([
+    { statusHead: "not-a-sha", readinessHead: previousSha },
+    { statusHead: previousSha, readinessHead: "not-a-sha" },
+    { statusHead: previousSha, readinessHead: null },
+  ])("keeps malformed GitHub heads distinct from valid head changes %j", async heads => {
+    const { provider } = githubSnapshot(heads);
+    const error = await provider.getChangeRequest(7).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeProviderError);
+    expect(error).not.toBeInstanceOf(ForgeHeadChangedError);
+    expect(error.statusCode).toBe(502);
+  });
+
+  it("preserves a GitHub transport conflict when a parallel read sees another head", async () => {
+    const base = githubSnapshot({ readinessHead: previousSha });
+    const { provider } = harness(github, (url, options) => url.pathname === "/graphql" && JSON.parse(String(options.body)).query.includes("closingIssuesReferences")
+      ? new Response(null, { status: 409 }) : base.fetcher(url, options));
+    const error = await provider.getChangeRequest(7).catch(error => error);
+    expect(error).not.toBeInstanceOf(ForgeHeadChangedError);
+    expect(error).toMatchObject({ statusCode: 409, message: expect.stringContaining("HTTP 409") });
+  });
+
+  it.each(["version", "current"])("reports the inconsistent GitLab %s head", async source => {
+    const base = labFixture({ version: source === "version" ? { head_commit_sha: previousSha } : {} });
+    let requestReads = 0;
+    const { provider } = harness(gitlab, (url, options) => {
+      if (source === "current" && url.pathname.endsWith("/merge_requests/7") && ++requestReads === 2)
+        return response({ ...labRequest, sha: previousSha });
+      return base.fetcher(url, options);
+    });
+    const error = await provider.getChangeRequest(7).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeHeadChangedError);
+    expect(error).toMatchObject({ observedHeadShas: [headSha, previousSha], statusCode: 409 });
+  });
+
+  it.each(["initial", "version", "current"])("does not classify malformed GitLab %s heads as lag", async source => {
+    const base = labFixture({ version: source === "version" ? { head_commit_sha: "invalid" } : {} });
+    let requestReads = 0;
+    const { provider } = harness(gitlab, (url, options) => {
+      if (url.pathname.endsWith("/merge_requests/7") && ++requestReads === (source === "initial" ? 1 : 2) && source !== "version")
+        return response({ ...labRequest, sha: "invalid" });
+      return base.fetcher(url, options);
+    });
+    const error = await provider.getChangeRequest(7).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeProviderError);
+    expect(error).not.toBeInstanceOf(ForgeHeadChangedError);
+    expect(error.statusCode).toBe(502);
+  });
+
+  it.each([{ source_branch: "other" }, { target_branch: "release" }, { state: "closed" }])("keeps GitLab branch/state changes generic even when the head differs %j", async change => {
+    const base = labFixture();
+    let requestReads = 0;
+    const { provider } = harness(gitlab, (url, options) => url.pathname.endsWith("/merge_requests/7") && ++requestReads === 2
+      ? response({ ...labRequest, sha: previousSha, ...change }) : base.fetcher(url, options));
+    const error = await provider.getChangeRequest(7).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeProviderError);
+    expect(error).not.toBeInstanceOf(ForgeHeadChangedError);
+    expect(error.statusCode).toBe(409);
   });
 });
 

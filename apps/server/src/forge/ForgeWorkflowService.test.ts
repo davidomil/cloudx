@@ -1,9 +1,10 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ForgeChangeRequest, ForgeWorker } from "@cloudx/shared";
 import {
   ForgeWorkflowService,
   type ForgeWorkflowDependencies,
 } from "./ForgeWorkflowService.js";
+import { ForgeHeadChangedError, ForgeProviderError } from "./providers/ForgeProvider.js";
 
 function fixture() {
   const issue = { number: 1, title: "Fix issue", body: "Task", state: "open", comments: [] };
@@ -427,7 +428,7 @@ describe("Forge review discussion resolution", () => {
 });
 
 describe("Forge publication and feedback reconciliation", () => {
-  it("preserves a successful push and replies on explicit Resume after the request head catches up", async () => {
+  it("preserves a successful push through Pause and replies on explicit Resume after the request head catches up", async () => {
     const f = fixture();
     const worker = await f.service.startIssue(1, placement);
     f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Ready" });
@@ -440,14 +441,15 @@ describe("Forge publication and feedback reconciliation", () => {
     f.reports.read.mockResolvedValue(report);
     f.runtime.publishBranch.mockResolvedValue(publishedHead);
     await f.service.poll();
-    expect(f.stored()[0]).toMatchObject({ status: "failed", headSha: previousHead, pendingPublication: { headSha: publishedHead, report, repliedDiscussionIds: [] } });
-    expect(f.stored()[0].error).toContain("Resume");
+    expect(f.stored()[0]).toMatchObject({ status: "awaiting_publication", headSha: previousHead, pendingPublication: { headSha: publishedHead, previousHeadSha: previousHead, report, repliedDiscussionIds: [] } });
+    expect(f.stored()[0].error).toBeUndefined();
     expect(f.provider.replyToDiscussion).not.toHaveBeenCalled();
     expect(f.provider.resolveDiscussion).not.toHaveBeenCalled();
     expect(f.provider.merge).not.toHaveBeenCalled();
     expect(f.runtime.cleanup).not.toHaveBeenCalled();
     await f.service.poll();
     expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+    await f.service.pause(worker.id);
 
     f.change.headSha = publishedHead;
     const restarted = new ForgeWorkflowService(f.deps);
@@ -507,7 +509,10 @@ describe("Forge publication and feedback reconciliation", () => {
     await f.service.poll();
     await f.service.resume(worker.id, placement);
     const publishedHead = "b".repeat(40);
-    f.runtime.publishBranch.mockResolvedValue(publishedHead);
+    f.runtime.publishBranch.mockImplementation(async () => {
+      f.provider.getChangeRequestStatus.mockRejectedValueOnce(new Error("Could not load publication status"));
+      return publishedHead;
+    });
     f.runtime.recover.mockRejectedValueOnce(new Error("Could not close the worker tab"));
     await f.service.poll();
     expect(f.stored()[0]).toMatchObject({ status: "cleanup_failed", headSha: "a".repeat(40), pendingPublication: { headSha: publishedHead } });
@@ -1118,4 +1123,317 @@ describe("Forge merged request cleanup", () => {
     expect(f.provider.postReview).not.toHaveBeenCalled();
   });
 
+});
+
+describe("Forge publication confirmation", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  async function feedbackPublication() {
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const f = fixture();
+    const worker = await f.service.startIssue(1, placement);
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Ready" });
+    await f.service.poll();
+    const previousHead = f.change.headSha;
+    const publishedHead = "b".repeat(40);
+    f.change.comments = [{ id: "comment-1", discussionId: "thread-1", body: "Cover null input", author: "reviewer", resolved: false }];
+    await f.service.resume(worker.id, placement);
+    const report = { kind: "issue", title: "Address review", body: "Null handling tested", discussionReplies: [{ discussionId: "thread-1", body: "Added and verified the regression." }], resolvedDiscussionIds: ["thread-1"] };
+    f.reports.read.mockResolvedValue(report);
+    f.runtime.publishBranch.mockResolvedValue(publishedHead);
+    return { ...f, worker, previousHead, publishedHead, report, advance: (ms: number) => { now += ms; } };
+  }
+
+  it("automatically continues confirmed publication without another push, worker run, or reply", async () => {
+    const f = await feedbackPublication();
+    await f.service.poll();
+    const checkpoint = f.stored()[0].pendingPublication;
+    expect(f.stored()[0]).toMatchObject({ status: "awaiting_publication", pendingPublication: { previousHeadSha: f.previousHead, headSha: f.publishedHead, confirmationStartedAt: new Date(Date.now()).toISOString() } });
+    expect(f.stored()[0].error).toBeUndefined();
+    const statusReads = f.provider.getChangeRequestStatus.mock.calls.length;
+    const fullReads = f.provider.getChangeRequest.mock.calls.length;
+    f.change.headSha = f.publishedHead;
+    f.advance(4_999);
+    await f.service.poll();
+    expect(f.provider.getChangeRequestStatus).toHaveBeenCalledTimes(statusReads);
+    expect(f.provider.getChangeRequest).toHaveBeenCalledTimes(fullReads);
+    expect(f.stored()[0].pendingPublication).toEqual(checkpoint);
+    f.advance(1);
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "awaiting_review", headSha: f.publishedHead });
+    expect(f.stored()[0].pendingPublication).toBeUndefined();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+    expect(f.provider.createChangeRequest).toHaveBeenCalledOnce();
+    expect(f.provider.replyToDiscussion).toHaveBeenCalledExactlyOnceWith(7, "thread-1", f.report.discussionReplies[0].body, f.publishedHead);
+    expect(f.provider.resolveDiscussion).toHaveBeenCalledExactlyOnceWith(7, "thread-1", f.publishedHead);
+    await f.service.poll();
+    expect(f.provider.replyToDiscussion).toHaveBeenCalledOnce();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("records the actual request head before pushing even when the last completed head differs", async () => {
+    const f = await feedbackPublication();
+    const currentHead = "c".repeat(40);
+    f.change.headSha = currentHead;
+    f.runtime.publishBranch.mockImplementation(async () => {
+      expect(f.stored()[0].pendingPublication?.previousHeadSha).toBe(currentHead);
+      expect(f.stored()[0].headSha).toBe(f.previousHead);
+      return f.publishedHead;
+    });
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "awaiting_publication", pendingPublication: { previousHeadSha: currentHead, headSha: f.publishedHead } });
+  });
+
+  it("waits when lightweight status pages mix only the previous and published heads", async () => {
+    const f = await feedbackPublication();
+    f.runtime.publishBranch.mockImplementation(async () => {
+      f.provider.getChangeRequestStatus.mockRejectedValueOnce(new ForgeHeadChangedError([f.previousHead, f.publishedHead]));
+      return f.publishedHead;
+    });
+    await f.service.poll();
+    expect(f.stored()[0].status).toBe("awaiting_publication");
+    expect(f.provider.replyToDiscussion).not.toHaveBeenCalled();
+    f.change.headSha = f.publishedHead;
+    f.advance(5_000);
+    await f.service.poll();
+    expect(f.stored()[0].status).toBe("awaiting_review");
+  });
+
+  it("waits for a full consistent snapshot when provider reads mix the prior and pushed heads", async () => {
+    const f = await feedbackPublication();
+    f.runtime.publishBranch.mockImplementation(async () => {
+      f.change.headSha = f.publishedHead;
+      return f.publishedHead;
+    });
+    f.provider.getChangeRequest.mockRejectedValueOnce(new ForgeHeadChangedError([f.previousHead, f.publishedHead]));
+    await f.service.poll();
+    expect(f.stored()[0].status).toBe("awaiting_publication");
+    expect(f.provider.replyToDiscussion).not.toHaveBeenCalled();
+    f.advance(5_000);
+    await f.service.poll();
+    expect(f.stored()[0].status).toBe("awaiting_review");
+    expect(f.provider.replyToDiscussion).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["unrelated snapshot head", () => new ForgeHeadChangedError(["a".repeat(40), "b".repeat(40), "c".repeat(40)])],
+    ["generic conflict", () => new ForgeProviderError("Branches changed", 409)],
+    ["transport failure", () => new Error("Disconnected")],
+  ])("stops instead of polling after %s", async (_name, error) => {
+    const f = await feedbackPublication();
+    f.runtime.publishBranch.mockImplementation(async () => {
+      f.change.headSha = f.publishedHead;
+      return f.publishedHead;
+    });
+    f.provider.getChangeRequest.mockRejectedValueOnce(error());
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", pendingPublication: { headSha: f.publishedHead } });
+    const reads = f.provider.getChangeRequest.mock.calls.length;
+    f.advance(5_000);
+    await f.service.poll();
+    expect(f.provider.getChangeRequest).toHaveBeenCalledTimes(reads);
+    expect(f.provider.replyToDiscussion).not.toHaveBeenCalled();
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops at an unrelated request head and preserves the completed work", async () => {
+    const f = await feedbackPublication();
+    f.runtime.publishBranch.mockImplementation(async () => {
+      f.change.headSha = "c".repeat(40);
+      return f.publishedHead;
+    });
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", pendingPublication: { previousHeadSha: f.previousHead, headSha: f.publishedHead }, worktreePath: "/repo/work" });
+    expect(f.stored()[0].error).toMatch(/unexpected commit/i);
+    expect(f.provider.replyToDiscussion).not.toHaveBeenCalled();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { headBranch: "other" }, { baseBranch: "other" }, { state: "closed" },
+  ])("validates request identity and open state before pushing %#", async changed => {
+    const f = await feedbackPublication();
+    Object.assign(f.change, changed);
+    await f.service.poll();
+    expect(f.stored()[0].status).toBe("failed");
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    expect(f.provider.replyToDiscussion).not.toHaveBeenCalled();
+  });
+
+  it.each(["pause", "stop"] as const)("%s halts publication confirmation while retaining its checkpoint", async action => {
+    const f = await feedbackPublication();
+    await f.service.poll();
+    await f.service[action](f.worker.id);
+    const reads = f.provider.getChangeRequestStatus.mock.calls.length;
+    f.change.headSha = f.publishedHead;
+    f.advance(5_000);
+    await f.service.poll();
+    expect(f.provider.getChangeRequestStatus).toHaveBeenCalledTimes(reads);
+    expect(f.stored()[0].status).toBe(action === "pause" ? "paused" : "stopped");
+    expect(f.stored()[0].pendingPublication?.headSha).toBe(f.publishedHead);
+    expect(f.provider.replyToDiscussion).not.toHaveBeenCalled();
+  });
+
+  it("aborts the individual worker's in-flight confirmation on Pause", async () => {
+    const f = await feedbackPublication();
+    await f.service.poll();
+    let started!: () => void;
+    const checking = new Promise<void>(resolve => { started = resolve; });
+    const provider = f.deps.provider(f.worker.repository, "worker");
+    f.deps.provider = (_repository, _role, signal) => ({ ...provider,
+      getChangeRequestStatus: async () => {
+        started();
+        return new Promise((_, reject) => {
+          signal!.addEventListener("abort", () => reject(signal!.reason), { once: true });
+        });
+      },
+    });
+    f.advance(5_000);
+    const polling = f.service.poll();
+    await checking;
+    await f.service.pause(f.worker.id);
+    await polling;
+    expect(f.stored()[0].status).toBe("paused");
+    expect(f.provider.replyToDiscussion).not.toHaveBeenCalled();
+  });
+
+  it("keeps post-merge confirmation cancellable by the worker's Pause control", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(1, placement);
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Ready" });
+    await f.service.poll();
+    f.change.approved = true;
+    await f.service.resume(worker.id, placement);
+    let started!: () => void;
+    const checking = new Promise<void>(resolve => { started = resolve; });
+    const provider = f.deps.provider(worker.repository, "worker");
+    f.deps.provider = (_repository, _role, signal) => ({ ...provider,
+      getChangeRequestStatus: async () => {
+        if (!f.change.merged) return { ...f.change };
+        started();
+        return new Promise((_, reject) => {
+          signal!.addEventListener("abort", () => reject(signal!.reason), { once: true });
+        });
+      },
+    });
+    const polling = f.service.poll();
+    await checking;
+    await f.service.pause(worker.id);
+    await polling;
+    expect(f.stored()[0].status).toBe("paused");
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+  });
+
+  it("preserves the observation deadline across unrelated persistence and restart", async () => {
+    const f = await feedbackPublication();
+    await f.service.poll();
+    const checkpoint = f.stored()[0].pendingPublication;
+    f.advance(90_000);
+    await f.service.dispose();
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.dashboard();
+    expect(f.stored()[0]).toMatchObject({ status: "awaiting_publication", pendingPublication: checkpoint });
+    f.advance(30_000);
+    await restarted.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", pendingPublication: checkpoint, worktreePath: "/repo/work" });
+    expect(f.stored()[0].error).toMatch(/not confirmed.*Resume/i);
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    f.change.headSha = f.publishedHead;
+    const resumed = await restarted.resume(f.worker.id, placement);
+    expect(resumed.status).toBe("awaiting_review");
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops when a successful confirmation read outlasts the observation deadline", async () => {
+    const f = await feedbackPublication();
+    await f.service.poll();
+    f.change.headSha = f.publishedHead;
+    f.advance(119_000);
+    f.provider.getChangeRequest.mockImplementation(async () => {
+      f.advance(2_000);
+      return { ...f.change };
+    });
+    await f.service.poll();
+    expect(f.stored()[0].status).toBe("failed");
+    expect(f.stored()[0].error).toMatch(/not confirmed/);
+    expect(f.stored()[0].pendingPublication?.confirmed).toBeUndefined();
+    expect(f.provider.replyToDiscussion).not.toHaveBeenCalled();
+  });
+
+  it.each(["pause", "stop", "timeout"] as const)("keeps reviews blocked after %s leaves publication unconfirmed", async action => {
+    const f = await feedbackPublication();
+    await f.service.poll();
+    if (action === "timeout") {
+      f.advance(120_000);
+      await f.service.poll();
+    } else await f.service[action](f.worker.id);
+    await expect(f.service.startReview(7, false, placement)).rejects.toThrow(/publication/);
+    await expect(f.service.markReview(7, "approve", "Approved")).rejects.toThrow(/publication/);
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["open", "closed"])("honors merge completion with a linked issue still %s", async state => {
+    const f = await feedbackPublication();
+    await f.service.poll();
+    f.change.headSha = f.publishedHead;
+    f.change.merged = true;
+    f.change.state = "merged";
+    f.issue.state = state;
+    f.advance(5_000);
+    await f.service.poll();
+    if (state === "closed") {
+      expect(f.stored()).toEqual([]);
+      expect(f.runtime.cleanup).toHaveBeenCalledWith(expect.objectContaining({ expectedHeadSha: f.publishedHead }));
+    } else {
+      expect(f.stored()[0]).toMatchObject({ status: "paused", pendingPublication: { headSha: f.publishedHead } });
+      expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    }
+    expect(f.provider.replyToDiscussion).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("blocks review actions while a published request revision is still unconfirmed", async () => {
+    const f = await feedbackPublication();
+    const review = await f.service.startReview(7, false, placement);
+    await f.service.pause(review.id);
+    await f.service.poll();
+    expect(f.stored()[0].status).toBe("awaiting_publication");
+    await expect(f.service.startReview(7, false, placement)).rejects.toThrow(/publication/);
+    await expect(f.service.resume(review.id, placement)).rejects.toThrow(/publication/);
+    const saved = f.stored();
+    saved[1].draft = { headSha: f.previousHead, body: "Review", comments: [], event: "comment", status: "draft" };
+    await f.deps.store.write(saved);
+    const restarted = new ForgeWorkflowService(f.deps);
+    await expect(restarted.markReview(7, "approve", "Approved")).rejects.toThrow(/publication/);
+    await expect(restarted.submitReview(review.id)).rejects.toThrow(/publication/);
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+  });
+
+  it("durably leaves automatic confirmation before discussion mutations and never retries an ambiguous reply", async () => {
+    const f = await feedbackPublication();
+    await f.service.poll();
+    f.change.headSha = f.publishedHead;
+    f.provider.replyToDiscussion.mockImplementation(async () => {
+      expect(f.stored()[0].status).toBe("starting");
+      throw new Error("Reply response lost");
+    });
+    f.advance(5_000);
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", pendingPublication: { headSha: f.publishedHead, replyingToDiscussionId: "thread-1" } });
+    f.advance(5_000);
+    await f.service.poll();
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.poll();
+    await restarted.resume(f.worker.id, placement);
+    expect(f.provider.replyToDiscussion).toHaveBeenCalledOnce();
+    expect(f.provider.resolveDiscussion).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+  });
 });

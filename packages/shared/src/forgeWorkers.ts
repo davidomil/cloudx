@@ -5,6 +5,7 @@ export type ForgeWorkerStatus =
   | "starting"
   | "running"
   | "paused"
+  | "awaiting_publication"
   | "awaiting_review"
   | "stopped"
   | "completed"
@@ -35,6 +36,9 @@ export interface ForgeWorker {
   pendingPublication?: {
     report: ForgeIssueCompletionReport;
     headSha?: string;
+    previousHeadSha?: string;
+    confirmationStartedAt?: string;
+    confirmed?: true;
     repliedDiscussionIds: string[];
     replyingToDiscussionId?: string;
   };
@@ -64,4 +68,9 @@ export interface ForgeDashboard {
 export interface ForgePlacement {
   windowId: string;
   paneId: string;
+}
+
+export function hasUnconfirmedPublication(worker: ForgeWorker): boolean {
+  return worker.kind === "issue" && Boolean(worker.pendingPublication?.headSha) &&
+    worker.pendingPublication!.confirmed !== true;
 }

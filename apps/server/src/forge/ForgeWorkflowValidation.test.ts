@@ -68,7 +68,10 @@ describe("Issue completion reports", () => {
 describe("Saved issue publication checkpoints", () => {
   it.each([
     { report, repliedDiscussionIds: [] },
+    { report, previousHeadSha: headSha, repliedDiscussionIds: [] },
     { report, headSha, repliedDiscussionIds: [] },
+    { report, headSha, previousHeadSha: "b".repeat(40), confirmationStartedAt: worker.startedAt, repliedDiscussionIds: [] },
+    { report, headSha, confirmed: true, repliedDiscussionIds: [] },
     { report, headSha: "F".repeat(64), repliedDiscussionIds: ["reply-one"] },
     { report, headSha, repliedDiscussionIds: [], replyingToDiscussionId: "reply-one" },
     { report, headSha, repliedDiscussionIds: ["reply-one"], replyingToDiscussionId: "reply-two" },
@@ -112,8 +115,35 @@ describe("Saved issue publication checkpoints", () => {
     ["oversized SHA", { report, headSha: "a".repeat(65), repliedDiscussionIds: [] }],
     ["nonhex SHA", { report, headSha: "z".repeat(40), repliedDiscussionIds: [] }],
     ["null SHA", { report, headSha: null, repliedDiscussionIds: [] }],
-    ["numeric SHA", { report, headSha: 1, repliedDiscussionIds: [] }]
+    ["numeric SHA", { report, headSha: 1, repliedDiscussionIds: [] }],
+    ["invalid previous head", { report, previousHeadSha: "wrong", repliedDiscussionIds: [] }],
+    ["invalid confirmation timestamp", { report, headSha, confirmationStartedAt: "yesterday", repliedDiscussionIds: [] }],
+    ["confirmation before push", { report, confirmationStartedAt: worker.startedAt, repliedDiscussionIds: [] }],
+    ["confirmed before push", { report, confirmed: true, repliedDiscussionIds: [] }],
+    ["invalid confirmation flag", { report, headSha, confirmed: "true", repliedDiscussionIds: [] }]
   ])("rejects %s", (_name, pendingPublication) => {
     expect(() => parseWorkers([{ ...worker, pendingPublication }])).toThrow();
+  });
+
+  const waiting: ForgeWorker = {
+    ...worker, status: "awaiting_publication", changeNumber: 7,
+    repositoryPath: "/owned", worktreePath: "/owned", branch: "cloudx/forge/worker",
+    pendingPublication: { report, headSha, previousHeadSha: "b".repeat(40), confirmationStartedAt: worker.startedAt, repliedDiscussionIds: [] },
+  };
+
+  it("preserves a publication confirmation checkpoint across storage", () => {
+    expect(parseWorkers([waiting])).toEqual([waiting]);
+  });
+
+  it.each([
+    { kind: "review" }, { changeNumber: undefined }, { repositoryPath: undefined },
+    { worktreePath: undefined }, { branch: "" }, { pendingPublication: undefined },
+    { pendingPublication: { ...waiting.pendingPublication, headSha: undefined } },
+    { pendingPublication: { ...waiting.pendingPublication, confirmationStartedAt: undefined } },
+    { pendingPublication: { ...waiting.pendingPublication, replyingToDiscussionId: "reply-one" } },
+    { pendingPublication: { ...waiting.pendingPublication, repliedDiscussionIds: ["reply-one"] } },
+    { pendingPublication: { ...waiting.pendingPublication, confirmed: true } },
+  ])("rejects an incomplete or already mutating automatic confirmation state %#", invalid => {
+    expect(() => parseWorkers([{ ...waiting, ...invalid }])).toThrow();
   });
 });

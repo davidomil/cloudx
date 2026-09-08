@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, ExternalLink, GitPullRequest, MessageSquare, Pause, Play, RefreshCw, Settings, Square, Terminal, Trash2 } from "lucide-react";
+import { hasUnconfirmedPublication } from "@cloudx/shared";
 import type { ForgeChangeRequest, ForgeComment, ForgeDashboard, ForgeIssue, ForgeIssueDetail, ForgeListScope, ForgePage, ForgePlacement, ForgeReviewComment, ForgeReviewDraft, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
@@ -171,9 +172,10 @@ function ForgeItems({ kind, provider, request, revision, workers, placement, run
   useEffect(() => { setReviewBody(""); }, [selectedNumber]);
   const selectedWorkers = workersForItem(workers, kind, selectedNumber);
   const activeWorker = selectedWorkers.find((worker) => worker.kind === (kind === "issues" ? "issue" : "review") && worker.status !== "completed");
+  const unconfirmedPublication = selectedWorkers.some(hasUnconfirmedPublication);
   const currentDetail = detail?.number === selectedNumber ? detail : undefined;
   const changeDetail = kind === "changes" && currentDetail && isChangeRequest(currentDetail) ? currentDetail : undefined;
-  const reviewDisabled = busy || !changeDetail || changeDetail.state !== "open" || changeDetail.merged;
+  const reviewDisabled = busy || unconfirmedPublication || !changeDetail || changeDetail.state !== "open" || changeDetail.merged;
   const item = currentDetail ?? selected;
   const applyScope = (scope?: ForgeListScope) => {
     if (!scope) setFilterText(defaultFilter);
@@ -290,13 +292,14 @@ function WorkerCard({ worker, request, placement, runAction, busy, onViewWorker,
     try { await runAction(() => request(`forge.worker.${action}`, { id: worker.id }), true); }
     finally { controlRunning.current = false; setControlling(false); }
   }
-  const canPause = ["starting", "running"].includes(worker.status);
+  const canPause = ["starting", "running", "awaiting_publication"].includes(worker.status);
   const canResume = ["paused", "awaiting_review", "failed", "stopped", "cleanup_failed"].includes(worker.status);
-  const canStop = ["starting", "running", "paused", "awaiting_review", "failed"].includes(worker.status);
+  const canStop = ["starting", "running", "awaiting_publication", "paused", "awaiting_review", "failed"].includes(worker.status);
   return <article className="forge-worker" aria-label={`${worker.kind} worker #${worker.number}`}>
     <div className="forge-worker-heading"><strong>{worker.kind === "issue" ? "Issue" : "Review"} #{worker.number} · {worker.title}</strong><span className={`forge-status forge-status-${worker.status}`}>{worker.status.replaceAll("_", " ")}</span></div>
     <p className="forge-muted">{worker.repository.projectPath}{worker.branch ? ` · ${worker.branch}` : ""}</p>
     {worker.error ? <p role="alert" className="forge-notice">{worker.error}</p> : null}
+    {worker.status === "awaiting_publication" ? <p role="status">The commit was pushed. Waiting for {worker.repository.provider === "github" ? "GitHub to confirm the pull" : "GitLab to confirm the merge"} request update; work continues automatically.</p> : null}
     {worker.status === "awaiting_review" ? <p role="status">Ready for review. Resume after feedback to address comments and check approval.</p> : null}
     <div className="forge-actions">
       {canPause ? <ControlButton size="compact" disabled={controlling} onClick={() => void interruptWorker("pause")}><Pause size={14} /> Pause</ControlButton> : null}

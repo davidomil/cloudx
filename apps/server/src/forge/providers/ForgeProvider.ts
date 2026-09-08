@@ -87,6 +87,16 @@ export class ForgeProviderError extends Error {
   }
 }
 
+export class ForgeHeadChangedError extends ForgeProviderError {
+  readonly observedHeadShas: readonly string[];
+
+  constructor(observedHeadShas: readonly string[]) {
+    super("The request changed while loading. Refresh before proceeding.", 409);
+    this.name = "ForgeHeadChangedError";
+    this.observedHeadShas = Object.freeze([...new Set(observedHeadShas)]);
+  }
+}
+
 export function requireMergeReady(
   request: ForgeChangeRequest,
   expectedHeadSha: string,

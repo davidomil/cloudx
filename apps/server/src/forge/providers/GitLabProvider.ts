@@ -14,6 +14,7 @@ import type {
 } from "@cloudx/shared";
 import { ForgeHttpClient, hasNextPage, pagination } from "./ForgeHttpClient.js";
 import {
+  ForgeHeadChangedError,
   ForgeProviderError,
   requireDiscussion,
   requireMergeReady,
@@ -124,7 +125,8 @@ export class GitLabProvider implements ForgeProvider {
         this.linkedIssues(number),
       ]);
     const request = record(response.body);
-    const headSha = string(request.sha);
+    const initial = gitlabStatus(request, number);
+    const headSha = initial.headSha;
     const approvals = record(approvalsResponse.body);
     const versions = list(versionsResponse.body);
     if (!versions.length)
@@ -133,11 +135,9 @@ export class GitLabProvider implements ForgeProvider {
         409,
       );
     const version = record(versions[0]);
-    if (string(version.head_commit_sha) !== headSha)
-      throw new ForgeProviderError(
-        "The request changed while loading. Refresh before proceeding.",
-        409,
-      );
+    const versionHeadSha = gitlabHeadSha(version.head_commit_sha);
+    if (versionHeadSha !== headSha)
+      throw new ForgeHeadChangedError([headSha, versionHeadSha]);
     const createdAt = Date.parse(string(version.created_at));
     if (!Number.isFinite(createdAt)) return invalid();
     const approvers = list(approvals.approved_by).map(record);
@@ -183,14 +183,17 @@ export class GitLabProvider implements ForgeProvider {
         422,
       );
     const current = record((await this.http.request(path)).body);
-    if (string(current.sha) !== headSha)
+    const status = gitlabStatus(current, number);
+    if (status.headBranch !== initial.headBranch || status.baseBranch !== initial.baseBranch || status.state !== initial.state)
       throw new ForgeProviderError(
         "The request changed while loading. Refresh before proceeding.",
         409,
       );
+    if (status.headSha !== headSha)
+      throw new ForgeHeadChangedError([headSha, status.headSha]);
     return {
       ...gitlabRequestSummary(current),
-      ...gitlabStatus(current, number),
+      ...status,
       linkedIssues,
       mergeable: string(current.detailed_merge_status) === "mergeable",
       approved,
@@ -531,13 +534,19 @@ export class GitLabProvider implements ForgeProvider {
   }
 }
 
+function gitlabHeadSha(value: unknown): string {
+  const sha = string(value);
+  if (!/^[a-fA-F0-9]{40,64}$/.test(sha)) return invalid();
+  return sha;
+}
+
 function gitlabStatus(request: Record<string, unknown>, expectedNumber: number): Omit<ForgeChangeRequestStatus, "linkedIssues"> {
   const number = integer(request.iid);
   const state = string(request.state);
-  const headSha = string(request.sha);
+  const headSha = gitlabHeadSha(request.sha);
   const headBranch = string(request.source_branch);
   const baseBranch = string(request.target_branch);
-  if (number !== expectedNumber || !["opened", "closed", "merged"].includes(state) || !/^[a-fA-F0-9]{40,64}$/.test(headSha) || !headBranch || !baseBranch) return invalid();
+  if (number !== expectedNumber || !["opened", "closed", "merged"].includes(state) || !headBranch || !baseBranch) return invalid();
   return { number, state: state === "opened" ? "open" : state as "closed" | "merged", merged: state === "merged", headSha, headBranch, baseBranch };
 }
 

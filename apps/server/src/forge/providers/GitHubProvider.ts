@@ -14,6 +14,7 @@ import type {
 } from "@cloudx/shared";
 import { ForgeHttpClient, hasNextPage, pagination } from "./ForgeHttpClient.js";
 import {
+  ForgeHeadChangedError,
   ForgeProviderError,
   requireDiscussion,
   requireMergeReady,
@@ -42,6 +43,7 @@ interface GitHubReadiness {
   unresolved: number;
   threads: Map<string, { discussionId: string; resolved: boolean }>;
 }
+type GitHubSnapshot = Pick<ForgeChangeRequestStatus, "headSha" | "headBranch" | "baseBranch" | "state">;
 
 export class GitHubProvider implements ForgeProvider {
   private readonly path: string;
@@ -89,14 +91,12 @@ export class GitHubProvider implements ForgeProvider {
       this.http.request(path, { text: true }),
     ]);
     const raw = record(response.body);
+    const issue = githubIssue(raw);
     const head = record(raw.head);
-    const headSha = string(head.sha);
-    const [status, readiness] = await Promise.all([
-      this.getChangeRequestStatus(number),
-      this.readiness(number, headSha),
-    ]);
-    if (status.headSha !== headSha || status.headBranch !== string(head.ref) || status.baseBranch !== string(record(raw.base).ref))
-      throw new ForgeProviderError("The request changed while loading. Refresh before proceeding.", 409);
+    const headSha = githubHeadSha(head.sha);
+    const { status, readiness } = await this.readSnapshot(number, {
+      headSha, headBranch: string(head.ref), baseBranch: string(record(raw.base).ref), state: issue.state,
+    });
     const latestReviews = new Map<string, Record<string, unknown>>();
     for (const value of reviews) {
       const review = record(value);
@@ -113,7 +113,7 @@ export class GitHubProvider implements ForgeProvider {
       (readiness.reviewDecision === null ||
         readiness.reviewDecision === "APPROVED");
     return {
-      ...githubIssue(raw),
+      ...issue,
       ...status,
       draft: boolean(raw.draft),
       mergeable:
@@ -131,6 +131,10 @@ export class GitHubProvider implements ForgeProvider {
   }
 
   async getChangeRequestStatus(number: number): Promise<ForgeChangeRequestStatus> {
+    return this.readStatus(number);
+  }
+
+  private async readStatus(number: number, expected?: GitHubSnapshot): Promise<ForgeChangeRequestStatus> {
     issueNumber(number);
     const [owner, name] = this.http.repository.projectPath.split("/");
     const linkedIssues: ForgeLinkedIssue[] = [];
@@ -151,8 +155,12 @@ export class GitHubProvider implements ForgeProvider {
         throw new ForgeProviderError("GitHub could not verify the request status and linked issues.", 502);
       const request = record(record(record(response.data).repository).pullRequest);
       const current = githubStatus(request, number);
-      if (status && (current.state !== status.state || current.headSha !== status.headSha || current.headBranch !== status.headBranch || current.baseBranch !== status.baseBranch))
+      if (expected && (current.headBranch !== expected.headBranch || current.baseBranch !== expected.baseBranch || current.state !== expected.state))
         throw new ForgeProviderError("The request changed while loading. Refresh before proceeding.", 409);
+      if (status && (current.state !== status.state || current.headBranch !== status.headBranch || current.baseBranch !== status.baseBranch))
+        throw new ForgeProviderError("The request changed while loading. Refresh before proceeding.", 409);
+      if (status && current.headSha !== status.headSha)
+        throw new ForgeHeadChangedError([status.headSha, current.headSha]);
       status = current;
       const connection = record(request.closingIssuesReferences);
       const nodes = list(connection.nodes);
@@ -421,6 +429,24 @@ export class GitHubProvider implements ForgeProvider {
     };
   }
 
+  private async readSnapshot(number: number, expected: GitHubSnapshot): Promise<{ status: ForgeChangeRequestStatus; readiness: GitHubReadiness }> {
+    const results = await Promise.allSettled([
+      this.readStatus(number, expected),
+      this.readiness(number, expected.headSha),
+    ]);
+    for (const result of results)
+      if (result.status === "rejected" && !(result.reason instanceof ForgeHeadChangedError)) throw result.reason;
+    const [status, readiness] = results;
+    const observedHeadShas = [expected.headSha];
+    if (status.status === "fulfilled") observedHeadShas.push(status.value.headSha);
+    for (const result of results)
+      if (result.status === "rejected" && result.reason instanceof ForgeHeadChangedError) observedHeadShas.push(...result.reason.observedHeadShas);
+    if (new Set(observedHeadShas).size > 1) throw new ForgeHeadChangedError(observedHeadShas);
+    if (status.status === "rejected") throw status.reason;
+    if (readiness.status === "rejected") throw readiness.reason;
+    return { status: status.value, readiness: readiness.value };
+  }
+
   private async readiness(
     number: number,
     headSha: string,
@@ -454,11 +480,9 @@ export class GitHubProvider implements ForgeProvider {
       const request = record(
         record(record(response.data).repository).pullRequest,
       );
-      if (string(request.headRefOid) !== headSha)
-        throw new ForgeProviderError(
-          "The request changed while loading. Refresh before proceeding.",
-          409,
-        );
+      const observedHeadSha = githubHeadSha(request.headRefOid);
+      if (observedHeadSha !== headSha)
+        throw new ForgeHeadChangedError([headSha, observedHeadSha]);
       const threads = record(request.reviewThreads);
       for (const value of list(threads.nodes)) {
         const thread = record(value);
@@ -494,14 +518,20 @@ export class GitHubProvider implements ForgeProvider {
   }
 }
 
+function githubHeadSha(value: unknown): string {
+  const sha = string(value);
+  if (!/^[a-fA-F0-9]{40,64}$/.test(sha)) return invalid();
+  return sha;
+}
+
 function githubStatus(request: Record<string, unknown>, expectedNumber: number): Omit<ForgeChangeRequestStatus, "linkedIssues"> {
   const number = integer(request.number);
   const state = string(request.state);
   const merged = boolean(request.merged);
-  const headSha = string(request.headRefOid);
+  const headSha = githubHeadSha(request.headRefOid);
   const headBranch = string(request.headRefName);
   const baseBranch = string(request.baseRefName);
-  if (number !== expectedNumber || !["OPEN", "CLOSED", "MERGED"].includes(state) || merged !== (state === "MERGED") || !/^[a-fA-F0-9]{40,64}$/.test(headSha) || !headBranch || !baseBranch)
+  if (number !== expectedNumber || !["OPEN", "CLOSED", "MERGED"].includes(state) || merged !== (state === "MERGED") || !headBranch || !baseBranch)
     return invalid();
   return { number, state: state.toLowerCase() as ForgeChangeRequestStatus["state"], merged, headSha, headBranch, baseBranch };
 }

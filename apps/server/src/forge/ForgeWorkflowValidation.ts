@@ -131,6 +131,20 @@ function parsePendingPublication(
     : text(input.headSha, "published head", 64);
   if (headSha !== undefined && !/^[a-f0-9]{40,64}$/i.test(headSha))
     throw new Error("Invalid published head.");
+  const previousHeadSha = input.previousHeadSha === undefined
+    ? undefined
+    : text(input.previousHeadSha, "previous request head", 64);
+  if (previousHeadSha !== undefined && !/^[a-f0-9]{40,64}$/i.test(previousHeadSha))
+    throw new Error("Invalid previous request head.");
+  const confirmationStartedAt = input.confirmationStartedAt === undefined
+    ? undefined
+    : text(input.confirmationStartedAt, "publication confirmation timestamp", 24);
+  if (confirmationStartedAt !== undefined && (!headSha ||
+      !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(confirmationStartedAt) ||
+      !Number.isFinite(Date.parse(confirmationStartedAt))))
+    throw new Error("Publication confirmation requires a pushed head and a valid timestamp.");
+  if (input.confirmed !== undefined && (input.confirmed !== true || !headSha))
+    throw new Error("Publication confirmation requires a published head.");
   const replyIds = new Set(report.discussionReplies.map(reply => reply.discussionId));
   const replied = input.repliedDiscussionIds;
   if (
@@ -151,6 +165,9 @@ function parsePendingPublication(
   return {
     report,
     ...(headSha !== undefined ? { headSha } : {}),
+    ...(previousHeadSha !== undefined ? { previousHeadSha } : {}),
+    ...(confirmationStartedAt !== undefined ? { confirmationStartedAt } : {}),
+    ...(input.confirmed === true ? { confirmed: true as const } : {}),
     repliedDiscussionIds: [...replied] as string[],
     ...(replyingTo !== undefined ? { replyingToDiscussionId: replyingTo as string } : {}),
   };
@@ -183,6 +200,7 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
         "starting",
         "running",
         "paused",
+        "awaiting_publication",
         "awaiting_review",
         "stopped",
         "completed",
@@ -250,6 +268,14 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
         throw new Error("Only issue workers can have pending publication.");
       parsed.pendingPublication = parsePendingPublication(worker.pendingPublication);
     }
+    if (parsed.status === "awaiting_publication" && (
+      parsed.kind !== "issue" || !parsed.changeNumber || !parsed.repositoryPath ||
+      !parsed.worktreePath || !parsed.branch || !parsed.pendingPublication?.headSha ||
+      !parsed.pendingPublication.confirmationStartedAt ||
+      parsed.pendingPublication.confirmed ||
+      parsed.pendingPublication.replyingToDiscussionId || parsed.pendingPublication.repliedDiscussionIds.length
+    ))
+      throw new Error("Automatic publication confirmation requires an owned issue checkout and a pushed checkpoint without discussion mutations.");
     return parsed;
   });
 }
