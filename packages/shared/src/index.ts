@@ -661,8 +661,13 @@ export interface CreateTabRequest {
 
 export type CodexSessionResumeMode = "new" | "picker" | "last" | "session";
 
+export const CODEX_REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"] as const;
+export type CodexReasoningEffort = typeof CODEX_REASONING_EFFORTS[number];
+
 export interface CodexTerminalInitialInput {
   prompt?: string;
+  model?: string;
+  reasoningEffort?: CodexReasoningEffort;
   resume?: {
     mode: Exclude<CodexSessionResumeMode, "new">;
     sourceId: string;

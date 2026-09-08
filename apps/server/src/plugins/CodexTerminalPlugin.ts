@@ -10,7 +10,7 @@ import type {
   WorkspacePlugin
 } from "@cloudx/plugin-api";
 import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
-import { RULES_SKILLS_PLUGIN_ID, codexStateSourceBasename, isRecord, type CodexTerminalInitialInput, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
+import { CODEX_REASONING_EFFORTS, RULES_SKILLS_PLUGIN_ID, codexStateSourceBasename, isRecord, type CodexTerminalInitialInput, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
 
 import { materializeCodexHomeOverlay, resolveCodexHome, type CodexHomeOverlay } from "../rulesSkills/CodexHomeOverlay.js";
 import { CodexStateSources } from "./CodexStateSources.js";
@@ -98,9 +98,11 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
   async createSession(input: CreatePluginSessionInput): Promise<PluginSession> {
     const template = templateFromRuntimeContext(input.runtimeContext);
     const baseEnv = { ...process.env };
-    const resume = codexResumeInput(input.initialInput);
     let launchTemplate: MaterializedCodexTemplate;
+    let initialArgs: string[];
     try {
+      initialArgs = buildCodexLaunchArgs([], input.initialInput);
+      const resume = codexResumeInput(input.initialInput);
       launchTemplate = await materializeCodexTemplate(template, baseEnv, {
         dataDir: this.dataDir,
         tabId: input.tab.id,
@@ -113,7 +115,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       throw new PluginSessionNotStartedError(error);
     }
     const command = launchTemplate.command;
-    const launchArgs = buildCodexLaunchArgs(launchTemplate.args, input.initialInput);
+    const launchArgs = [...launchTemplate.args, ...initialArgs];
     const launch = buildLoginShellCommandLaunch(command, launchArgs, launchTemplate.env);
     const terminalProcess = await this.factory.spawn(launch.command, launch.args, {
       cwd: input.cwd,
@@ -153,12 +155,19 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
 export function buildCodexLaunchArgs(baseArgs: string[], initialInput?: Record<string, unknown>): string[] {
   const resume = codexResumeInput(initialInput);
   const prompt = initialInput?.prompt;
+  const model = initialInput?.model;
+  const reasoningEffort = initialInput?.reasoningEffort;
+  if (model !== undefined && (typeof model !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(model))) throw new Error("Codex model must be a nonempty model identifier of at most 128 characters.");
+  if (reasoningEffort !== undefined && !CODEX_REASONING_EFFORTS.some(effort => effort === reasoningEffort)) throw new Error(`Codex reasoning effort must be one of: ${CODEX_REASONING_EFFORTS.join(", ")}.`);
   if (prompt !== undefined && (typeof prompt !== "string" || !prompt.trim() || prompt.includes("\0"))) throw new Error("Codex initial prompt must be a non-empty string without null bytes.");
   if (prompt !== undefined && resume && resume.mode !== "session") throw new Error("An initial prompt with resume requires an exact session id.");
+  const args = [...baseArgs];
+  if (model !== undefined) args.push("--model", model as string);
+  if (reasoningEffort !== undefined) args.push("--config", `model_reasoning_effort="${reasoningEffort}"`);
   if (!resume) {
-    return prompt === undefined ? baseArgs : [...baseArgs, "--", prompt as string];
+    return prompt === undefined ? args : [...args, "--", prompt as string];
   }
-  const args = [...baseArgs, "resume"];
+  args.push("resume");
   if (resume.mode === "last") {
     args.push("--last");
   }

@@ -7,6 +7,7 @@ import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
 
 import {
   RULES_SKILLS_PLUGIN_ID,
+  type CodexReasoningEffort,
   type ForgeRepository,
   type ForgeCredentialRole,
   type WorkspaceTab,
@@ -257,6 +258,8 @@ export class ForgeRuntime {
       id: string;
       worktreePath: string;
       templateId: string;
+      model: string;
+      reasoningEffort: CodexReasoningEffort;
       prompt: string;
       windowId: string;
       paneId: string;
@@ -293,7 +296,7 @@ export class ForgeRuntime {
       title: `Forge ${input.id}`,
       windowId: input.windowId,
       paneId: input.paneId,
-      initialInput: { prompt: input.prompt },
+      initialInput: { prompt: input.prompt, model: input.model, reasoningEffort: input.reasoningEffort },
       pluginMetadata: {
         [RULES_SKILLS_PLUGIN_ID]: { selectedTemplateId: input.templateId },
         "forge-workers": { workerId: input.id },

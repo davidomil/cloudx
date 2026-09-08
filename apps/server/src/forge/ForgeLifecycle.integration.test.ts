@@ -30,7 +30,7 @@ import type { TerminalProcess } from "../terminal/TerminalProcess.js";
 import { WorkspaceCommandService } from "../workspace/WorkspaceCommandService.js";
 import { WorkspaceLayoutStore } from "../workspace/WorkspaceLayoutStore.js";
 import { ForgeRuntime, type ForgeRuntimeDependencies } from "./ForgeRuntime.js";
-import { ForgeWorkflowService } from "./ForgeWorkflowService.js";
+import { ForgeWorkflowService, type ForgeSettings } from "./ForgeWorkflowService.js";
 import { ForgeWorkerReports, ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
 import type { ForgeProvider } from "./providers/ForgeProvider.js";
 
@@ -90,6 +90,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     const first = await fixture.completedAssistantTurn(started);
     expect(await processIsRunning(first.pid)).toBe(true);
     expect(first.templateId).toBe("fixture-worker");
+    expect(first.args.slice(first.args.indexOf("--model"), first.args.indexOf("--model") + 4)).toEqual(["--model", "gpt-6-astra", "--config", 'model_reasoning_effort="xhigh"']);
     expect(first.gitAuthorizationPresent).toBe(false);
     expect(started.repositoryPath).toBe(started.worktreePath);
     expect(started.worktreePath).toBe(path.join(fixture.dataDir, "forge-workers", "checkouts", started.id));
@@ -113,10 +114,13 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     const change = fixture.provider.changes.get(7)!;
     change.comments.push({ id: "review-feedback", body: "Add an empty-input regression test.", author: "reviewer", discussionId: "empty-input", resolved: false });
     change.unresolvedDiscussions = 1;
+    fixture.models.workerModel = "gpt-5.6-sol";
+    fixture.models.workerReasoningEffort = "high";
     const resumed = await fixture.workflow.resume(started.id, fixture.placement);
     expect(resumed.tabId).not.toBe(started.tabId);
     await expectMissing(first.codexHome, first.tabContextPath);
     const second = await fixture.completedAssistantTurn(resumed);
+    expect(second.args.slice(second.args.indexOf("--model"), second.args.indexOf("--model") + 4)).toEqual(["--model", "gpt-5.6-sol", "--config", 'model_reasoning_effort="high"']);
     expect(second.context.item.comments.map((comment) => comment.id)).toContain("issue-feedback");
     expect(second.context.change?.comments.map((comment) => comment.id)).toContain("review-feedback");
     await fixture.workflow.poll();
@@ -156,6 +160,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     const started = await fixture.workflow.startReview(7, false, fixture.placement);
     const receipt = await fixture.completedAssistantTurn(started);
     expect(receipt.templateId).toBe("fixture-review");
+    expect(receipt.args.slice(receipt.args.indexOf("--model"), receipt.args.indexOf("--model") + 4)).toEqual(["--model", "gpt-6-astra", "--config", 'model_reasoning_effort="max"']);
     expect(receipt.gitAuthorizationPresent).toBe(false);
     await expectMissing(fixture.repositoryPath);
     expect(receipt.skillIds).toBe("fixture-reviewing");
@@ -233,6 +238,9 @@ class LifecycleFixture {
   readonly workflow: ForgeWorkflowService;
   readonly catalog: RulesSkillsCatalogService;
   readonly runtimeDependencies: ForgeRuntimeDependencies;
+  readonly models: Pick<ForgeSettings, "workerModel" | "workerReasoningEffort" | "reviewModel" | "reviewReasoningEffort"> = {
+    workerModel: "gpt-6-astra", workerReasoningEffort: "xhigh", reviewModel: "gpt-6-astra", reviewReasoningEffort: "max",
+  };
 
   private constructor(readonly root: string, trustRepository: boolean) {
     this.origin = path.join(root, "origin.git");
@@ -270,7 +278,7 @@ class LifecycleFixture {
       store: this.store,
       reports: this.reports,
       provider: (_repository, role) => { this.providerRoles.push(role); return this.provider; },
-      settings: () => ({ repository, baseBranch: "main", workerTemplateId: "fixture-worker", reviewTemplateId: "fixture-review", maxRunMinutes: 1 }),
+      settings: () => ({ repository, baseBranch: "main", workerTemplateId: "fixture-worker", reviewTemplateId: "fixture-review", ...this.models, maxRunMinutes: 1 }),
       notify: (title, body) => { this.notifications.send({ title, body }); },
     });
   }
@@ -432,7 +440,7 @@ async function processIsRunning(pid: number): Promise<boolean> {
   }
 }
 
-const sourceConfig = 'model_provider = "openai"\n[projects."/unrelated/project"]\ntrust_level = "untrusted"\n';
+const sourceConfig = 'model_provider = "openai"\nmodel = "gpt-5.5"\nmodel_reasoning_effort = "low"\n[projects."/unrelated/project"]\ntrust_level = "untrusted"\n';
 
 const fakeAssistant = `#!/usr/bin/env node
 import fs from "node:fs";

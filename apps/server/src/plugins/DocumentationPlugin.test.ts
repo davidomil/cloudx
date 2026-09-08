@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { HookProgressEvent } from "@cloudx/plugin-api";
 
+import { ConfigService } from "../configService.js";
+import { DOCUMENTATION_AI_USE_VOICE_MODEL } from "../aiModelOptions.js";
 import type { DocumentationClient } from "../documentation/DocumentationClient.js";
 import { DocumentationIngestQueue } from "../documentation/DocumentationIngestQueue.js";
 import { PathPolicy } from "../pathPolicy.js";
@@ -16,6 +18,30 @@ describe("DocumentationPlugin", () => {
 
   afterEach(async () => {
     await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
+  });
+
+  it("saves GPT-6 for every documentation model and preserves voice inheritance", async () => {
+    const root = await tempRoot();
+    const plugin = new DocumentationPlugin(fakeClient(), new PathPolicy([root]), new DocumentationIngestQueue());
+    const config = new ConfigService(root, () => [plugin.descriptor()]);
+    expect(config.getPluginConfig("documentation")).toMatchObject({
+      aiImageAnalysisModel: "gpt-5.4-mini",
+      aiTextAnalysisModel: DOCUMENTATION_AI_USE_VOICE_MODEL,
+      aiAnswerModel: DOCUMENTATION_AI_USE_VOICE_MODEL
+    });
+
+    const models = {
+      aiImageAnalysisModel: "gpt-6-astra",
+      aiTextAnalysisModel: "gpt-6-astra",
+      aiAnswerModel: "gpt-6-astra"
+    };
+    await config.update({ plugins: { documentation: models } });
+    const reloaded = new ConfigService(root, () => [plugin.descriptor()]);
+    expect(reloaded.getPluginConfig("documentation")).toMatchObject(models);
+
+    const inherited = Object.fromEntries(Object.keys(models).map((key) => [key, DOCUMENTATION_AI_USE_VOICE_MODEL]));
+    await reloaded.update({ plugins: { documentation: inherited } });
+    expect(new ConfigService(root, () => [plugin.descriptor()]).getPluginConfig("documentation")).toMatchObject(inherited);
   });
 
   it("exposes documentation hooks with conservative safety labels", () => {

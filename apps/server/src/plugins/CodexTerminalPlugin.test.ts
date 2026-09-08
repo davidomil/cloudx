@@ -5,7 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { parse, stringify } from "smol-toml";
 
-import type { TabIndicatorUpdate, WorkspaceTab } from "@cloudx/shared";
+import { CODEX_REASONING_EFFORTS, type TabIndicatorUpdate, type WorkspaceTab } from "@cloudx/shared";
 import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
 
 import { CLOUDX_CODEX_DEFAULT_ARGS, CODEX_TERMINAL_ACTIONS, CodexTerminalPlugin, CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES, TERMINAL_ACTIONS, TerminalShellIntegrationParser, buildCodexLaunchArgs, codexResumeInput, materializeCodexTemplate } from "./CodexTerminalPlugin.js";
@@ -588,6 +588,48 @@ describe("CodexTerminalPlugin", () => {
     }
   });
 
+  it.each(["xhigh", "max"])("launches the selected model with %s effort above inherited Codex preferences", async (reasoningEffort) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-model-selection-"));
+    const home = path.join(root, "home");
+    await seedImagegenSkill(home);
+    const inherited = 'model = "gpt-5.3-codex"\nmodel_reasoning_effort = "medium"\n';
+    await fs.writeFile(path.join(home, "config.toml"), inherited);
+    vi.stubEnv("CODEX_HOME", home);
+    vi.stubEnv("SHELL", "/bin/bash");
+    vi.stubEnv("CLOUDX_ASSISTANT_BIN", "/usr/bin/codex");
+    const factory = new CapturingFactory();
+    const plugin = new CodexTerminalPlugin(factory, DEFAULT_TERMINAL_REPLAY_BYTES, path.join(root, "data"));
+    try {
+      const session = await plugin.createSession({ tab, cwd: root, controls: { setTabIndicator: () => undefined, closeTab: () => undefined }, initialInput: { model: "gpt-6-astra", reasoningEffort, prompt: "Inspect the assigned work." } });
+      expect(factory.spawns).toBe(1);
+      expect(factory.command).toBe("/bin/bash");
+      expect(factory.args?.[1]).toContain(`--model gpt-6-astra --config 'model_reasoning_effort="${reasoningEffort}"' -- 'Inspect the assigned work.'`);
+      expect(parse(await fs.readFile(path.join(factory.env!.CODEX_HOME!, "config.toml"), "utf8"))).toMatchObject({ model: "gpt-5.3-codex", model_reasoning_effort: "medium" });
+      expect(await fs.readFile(path.join(home, "config.toml"), "utf8")).toBe(inherited);
+      session.stop?.();
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    { model: "" }, { model: "bad model" }, { model: "-model" }, { model: "a".repeat(129) }, { model: "bad\0model" }, { model: "x;command" }, { model: 42 }, { model: null },
+    { reasoningEffort: "" }, { reasoningEffort: "MAX" }, { reasoningEffort: "none" }, { reasoningEffort: "bad\0effort" }, { reasoningEffort: 42 }, { reasoningEffort: null }
+  ])("rejects invalid model preferences %j before overlay work or spawning", async (initialInput) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-invalid-model-selection-"));
+    const data = path.join(root, "data");
+    const factory = new CapturingFactory();
+    const plugin = new CodexTerminalPlugin(factory, DEFAULT_TERMINAL_REPLAY_BYTES, data);
+    const authorizeProjectTrust = vi.fn(async () => { throw new Error("Unexpected overlay work"); });
+    try {
+      const creation = plugin.createSession({ tab, cwd: root, authorizeProjectTrust, controls: { setTabIndicator: () => undefined, closeTab: () => undefined }, initialInput });
+      await expect(creation).rejects.toBeInstanceOf(PluginSessionNotStartedError);
+      await expect(creation).rejects.toThrow(/Codex (model|reasoning effort)/);
+      await expect(creation).rejects.toMatchObject({ cause: expect.any(Error) });
+      expect(authorizeProjectTrust).not.toHaveBeenCalled();
+      expect(factory.spawns).toBe(0);
+      await expect(fs.stat(data)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
   it("preserves a legacy profile selector in projection only, without claiming native acceptance", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-profile-projection-"));
     const codexHome = path.join(root, "base");
@@ -778,6 +820,24 @@ describe("CodexTerminalPlugin", () => {
     expect(() => buildCodexLaunchArgs([], { prompt: "\0bad" })).toThrow("without null bytes");
     expect(() => buildCodexLaunchArgs([], { prompt: 123 })).toThrow("non-empty string");
     expect(() => buildCodexLaunchArgs([], { prompt, resume: { mode: "last", sourceId: "shared" } })).toThrow("exact session id");
+  });
+
+  it.each(CODEX_REASONING_EFFORTS)("puts explicit %s effort and model before resume and prompt arguments", (reasoningEffort) => {
+    const base = ["--add-dir", "/tmp/rules"];
+    const options = { model: "gpt-6-astra", reasoningEffort };
+    const flags = ["--model", "gpt-6-astra", "--config", `model_reasoning_effort="${reasoningEffort}"`];
+    expect(buildCodexLaunchArgs(base, options)).toEqual([...base, ...flags]);
+    expect(buildCodexLaunchArgs(base, { ...options, prompt: "Do the work" })).toEqual([...base, ...flags, "--", "Do the work"]);
+    expect(buildCodexLaunchArgs(base, { ...options, resume: { mode: "last", sourceId: "shared" } })).toEqual([...base, ...flags, "resume", "--last"]);
+    expect(buildCodexLaunchArgs(base, { ...options, resume: { mode: "session", sourceId: "shared", sessionId: "owned-session" }, prompt: "Continue" })).toEqual([...base, ...flags, "resume", "owned-session", "--", "Continue"]);
+    expect(base).toEqual(["--add-dir", "/tmp/rules"]);
+  });
+
+  it("leaves omitted preferences inherited and supports independent model or effort choices", () => {
+    expect(buildCodexLaunchArgs(["--yolo"])).toEqual(["--yolo"]);
+    expect(buildCodexLaunchArgs([], { model: "provider/model:version-1.0" })).toEqual(["--model", "provider/model:version-1.0"]);
+    expect(buildCodexLaunchArgs([], { model: "a".repeat(128) })).toEqual(["--model", "a".repeat(128)]);
+    expect(buildCodexLaunchArgs([], { reasoningEffort: "max" })).toEqual(["--config", 'model_reasoning_effort="max"']);
   });
 
   it("does not acknowledge stop until the terminal process tree is quiescent", async () => {

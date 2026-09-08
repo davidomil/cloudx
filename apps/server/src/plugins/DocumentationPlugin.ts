@@ -8,16 +8,14 @@ import type { CreatePluginSessionInput, HookCallContext, HookDefinition, JsonSch
 import type { ConfigFieldDescriptor, WorkspaceTab } from "@cloudx/shared";
 
 import type { DocumentationClient } from "../documentation/DocumentationClient.js";
+import { DEFAULT_DOCUMENTATION_IMAGE_ANALYSIS_MODEL, DOCUMENTATION_AI_MODEL_OPTIONS, DOCUMENTATION_AI_USE_VOICE_MODEL } from "../aiModelOptions.js";
 import { DocumentationIngestQueue, type DocumentationIngestJobSnapshot, type DocumentationIngestQueueOperationContext } from "../documentation/DocumentationIngestQueue.js";
 import {
   DEFAULT_DOCUMENTATION_ENRICHMENT_SKILL_IDS,
-  DEFAULT_DOCUMENTATION_IMAGE_ANALYSIS_MODEL,
   DOCUMENTATION_AI_ENRICHMENT_ENABLED_KEY,
   DOCUMENTATION_AI_ANSWER_MODEL_KEY,
   DOCUMENTATION_AI_IMAGE_ANALYSIS_MODEL_KEY,
-  DOCUMENTATION_AI_MODEL_OPTIONS,
   DOCUMENTATION_AI_TEXT_ANALYSIS_MODEL_KEY,
-  DOCUMENTATION_AI_USE_VOICE_MODEL,
   DOCUMENTATION_AI_ENRICHMENT_SKILLS_KEY,
   DOCUMENTATION_PLUGIN_ID,
   type DocumentationEnrichmentService

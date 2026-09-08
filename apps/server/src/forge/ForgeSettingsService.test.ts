@@ -97,6 +97,20 @@ describe("Forge settings field contracts", () => {
 });
 
 describe("Forge connected application settings", () => {
+  it("saves independent coding and review model choices and rejects invalid selections", async () => {
+    const { config, settings, credentials } = await fixture();
+    credentials.set("worker", { kind: "token", token: "worker-private" });
+    credentials.set("reviewer", { kind: "token", token: "reviewer-private" });
+    expect(settings.settings()).toMatchObject({ workerModel: "gpt-6-astra", workerReasoningEffort: "xhigh", reviewModel: "gpt-6-astra", reviewReasoningEffort: "max" });
+    const selected = { workerModel: "gpt-5.6-sol", workerReasoningEffort: "high", reviewModel: "gpt-5.6-terra", reviewReasoningEffort: "ultra" };
+    await config.update({ plugins: { forge: selected } });
+    expect(settings.settings()).toMatchObject(selected);
+    for (const field of ["workerModel", "reviewModel", "workerReasoningEffort", "reviewReasoningEffort"]) {
+      await expect(config.update({ plugins: { forge: { [field]: "unknown" } } })).rejects.toThrow(/configured options/);
+      expect(settings.settings()).toMatchObject(selected);
+    }
+  });
+
   it("uses the saved human username and registered bot authors in provider searches", async () => {
     const { config, settings, credentials, connections } = await fixture();
     credentials.set("worker", { kind: "token", token: "worker-private" });
@@ -159,6 +173,10 @@ describe("Forge connected application settings", () => {
       baseBranch: "main",
       workerTemplateId: "worker",
       reviewTemplateId: "review",
+      workerModel: "gpt-6-astra",
+      workerReasoningEffort: "xhigh",
+      reviewModel: "gpt-6-astra",
+      reviewReasoningEffort: "max",
       maxRunMinutes: 180,
     });
     expect(connections.credential).toHaveBeenCalledWith(repository, "worker");

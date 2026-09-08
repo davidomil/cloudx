@@ -22,6 +22,7 @@ let repositoryPath: string;
 let origin: string;
 let headSha: string;
 let runtime: ForgeRuntime;
+const codingModel = { model: "gpt-6-astra", reasoningEffort: "xhigh" as const };
 const expectedRepository = {
   provider: "github" as const,
   apiUrl: "https://api.github.com",
@@ -743,7 +744,7 @@ describe("ForgeRuntime Codex tabs", () => {
     vi.mocked(deps.workspaceCommands.createTab).mockResolvedValue({ tab } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>);
     vi.mocked(deps.sessions.getTab).mockReturnValue(tab);
     vi.mocked(deps.sessions.listTabs).mockReturnValue([tab]);
-    await runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", prompt: "Resolve", windowId: "window", paneId: "pane" });
+    await runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, prompt: "Resolve", windowId: "window", paneId: "pane" });
     await fs.rename(context, `${context}-displaced`);
     await fs.mkdir(context);
     await fs.writeFile(tab.contextPath!, "Unrelated replacement");
@@ -781,7 +782,7 @@ describe("ForgeRuntime Codex tabs", () => {
     const deps = dependencies();
     runtime = new ForgeRuntime({ ...deps, isRepositoryTrusted: () => { throw new Error("Invalid repository settings."); } });
     const workspace = await prepare();
-    await expect(runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", prompt: "Resolve", windowId: "window", paneId: "pane" })).rejects.toThrow("Invalid repository settings.");
+    await expect(runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, prompt: "Resolve", windowId: "window", paneId: "pane" })).rejects.toThrow("Invalid repository settings.");
     expect(deps.workspaceCommands.createTab).not.toHaveBeenCalled();
     expect(await runtime.recover(workspace.id)).toEqual({ workspace, tabIds: [] });
   });
@@ -790,7 +791,7 @@ describe("ForgeRuntime Codex tabs", () => {
     const deps = dependencies();
     runtime = new ForgeRuntime({ ...deps, isRepositoryTrusted: () => true });
     const workspace = await prepare();
-    const request = { id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", prompt: "Resolve", windowId: "window", paneId: "pane" };
+    const request = { id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, prompt: "Resolve", windowId: "window", paneId: "pane" };
     vi.mocked(deps.workspaceCommands.createTab).mockRejectedValueOnce(new PluginSessionNotStartedError(new Error("Project trust was revoked.")));
     await expect(runtime.launch(request)).rejects.toThrow("Project trust was revoked.");
     expect(await runtime.recover(workspace.id)).toEqual({ workspace, tabIds: [] });
@@ -808,7 +809,7 @@ describe("ForgeRuntime Codex tabs", () => {
       expect(await options?.authorizeProjectTrust?.()).toBe(await fs.realpath(workspace.worktreePath));
       return { tab } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>;
     });
-    await runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", prompt: "Resolve", windowId: "window", paneId: "pane" });
+    await runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, prompt: "Resolve", windowId: "window", paneId: "pane" });
     expect(isRepositoryTrusted).toHaveBeenCalledWith(expectedRepository);
     const authorize = vi.mocked(deps.workspaceCommands.createTab).mock.calls[0]![1]!.authorizeProjectTrust!;
     expect(await authorize()).toBe(await fs.realpath(workspace.worktreePath));
@@ -837,7 +838,7 @@ describe("ForgeRuntime Codex tabs", () => {
     runtime = new ForgeRuntime({ ...deps, isRepositoryTrusted: () => true });
     const workspace = await prepare();
     vi.mocked(deps.workspaceCommands.createTab).mockResolvedValue({ tab: workerTab(workspace) } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>);
-    await runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", prompt: "Resolve", windowId: "window", paneId: "pane" });
+    await runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, prompt: "Resolve", windowId: "window", paneId: "pane" });
     const authorize = vi.mocked(deps.workspaceCommands.createTab).mock.calls[0]![1]!.authorizeProjectTrust!;
     await fs.rename(workspace.worktreePath, `${workspace.worktreePath}-displaced`);
     await fs.mkdir(workspace.worktreePath);
@@ -865,7 +866,7 @@ describe("ForgeRuntime Codex tabs", () => {
     const request = {
       id: workspace.id,
       worktreePath: workspace.worktreePath,
-      templateId: "worker",
+      templateId: "worker", ...codingModel,
       prompt: "Resolve the issue using this context.",
       windowId: "window-1",
       paneId: "pane-1",
@@ -873,7 +874,7 @@ describe("ForgeRuntime Codex tabs", () => {
     expect(await runtime.launch(request)).toBe("codex-1");
     expect(deps.workspaceCommands.createTab).toHaveBeenCalledWith(
       expect.objectContaining({
-        initialInput: { prompt: request.prompt },
+        initialInput: { prompt: request.prompt, ...codingModel },
         pluginMetadata: {
           "rules-skills": { selectedTemplateId: "worker" },
           "forge-workers": { workerId: workspace.id },
@@ -909,7 +910,7 @@ describe("ForgeRuntime Codex tabs", () => {
     const request = {
       id: workspace.id,
       worktreePath: workspace.worktreePath,
-      templateId: "missing",
+      templateId: "missing", ...codingModel,
       prompt: "Resolve",
       windowId: "window-1",
       paneId: "pane-1",
@@ -976,7 +977,7 @@ describe("ForgeRuntime Codex tabs", () => {
     await runtime.launch({
       id: workspace.id,
       worktreePath: workspace.worktreePath,
-      templateId: "worker",
+      templateId: "worker", ...codingModel,
       prompt: "Review context",
       windowId: "window",
       paneId: "pane",
@@ -1010,7 +1011,7 @@ describe("ForgeRuntime Codex tabs", () => {
     await runtime.launch({
       id: workspace.id,
       worktreePath: workspace.worktreePath,
-      templateId: "worker",
+      templateId: "worker", ...codingModel,
       prompt: "Review context",
       windowId: "window",
       paneId: "pane",
@@ -1043,7 +1044,7 @@ describe("ForgeRuntime Codex tabs", () => {
     await runtime.launch({
       id: workspace.id,
       worktreePath: workspace.worktreePath,
-      templateId: "worker",
+      templateId: "worker", ...codingModel,
       prompt: "Review context",
       windowId: "window",
       paneId: "pane",
@@ -1071,7 +1072,7 @@ describe("ForgeRuntime Codex tabs", () => {
       runtime.launch({
         id: workspace.id,
         worktreePath: workspace.worktreePath,
-        templateId: "worker",
+        templateId: "worker", ...codingModel,
         prompt: "Review context",
         windowId: "window",
         paneId: "pane",

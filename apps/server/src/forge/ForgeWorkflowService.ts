@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type {
+  CodexReasoningEffort,
   ForgeChangeRequest,
   ForgeCredentialRole,
   ForgeDashboard,
@@ -17,6 +18,10 @@ export interface ForgeSettings {
   baseBranch: string;
   workerTemplateId: string;
   reviewTemplateId: string;
+  workerModel: string;
+  workerReasoningEffort: CodexReasoningEffort;
+  reviewModel: string;
+  reviewReasoningEffort: CodexReasoningEffort;
   maxRunMinutes: number;
 }
 interface Runtime {
@@ -47,6 +52,8 @@ interface Runtime {
       id: string;
       worktreePath: string;
       templateId: string;
+      model: string;
+      reasoningEffort: CodexReasoningEffort;
       prompt: string;
       windowId: string;
       paneId: string;
@@ -591,6 +598,7 @@ export class ForgeWorkflowService {
     context: { item: unknown; change?: ForgeChangeRequest },
   ): Promise<void> {
     if (!worker.worktreePath) throw new Error("Worker checkout is missing.");
+    const settings = this.deps.settings();
     if (worker.kind === "issue")
       worker.feedbackDigest = feedbackDigest(context);
     worker.attemptId = randomUUID();
@@ -639,6 +647,8 @@ export class ForgeWorkflowService {
         id: worker.id,
         worktreePath: worker.worktreePath,
         templateId: worker.templateId,
+        model: worker.kind === "issue" ? settings.workerModel : settings.reviewModel,
+        reasoningEffort: worker.kind === "issue" ? settings.workerReasoningEffort : settings.reviewReasoningEffort,
         prompt,
         ...placement,
       },

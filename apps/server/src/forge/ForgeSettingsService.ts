@@ -1,5 +1,6 @@
-import type { ConfigFieldDescriptor, ForgeCredentialRole, ForgeRepository } from "@cloudx/shared";
+import { CODEX_REASONING_EFFORTS, type CodexReasoningEffort, type ConfigFieldDescriptor, type ForgeCredentialRole, type ForgeRepository } from "@cloudx/shared";
 import type { ConfigService } from "../configService.js";
+import { CODEX_MODEL_OPTIONS } from "../aiModelOptions.js";
 import type { ForgeConnectionService } from "./connections/ForgeConnectionService.js";
 import { ForgeCredentials, validateRepository } from "./providers/ForgeCredentials.js";
 import { createForgeProvider } from "./providers/index.js";
@@ -29,6 +30,10 @@ export class ForgeSettingsService {
       baseBranch: this.required("baseBranch"),
       workerTemplateId: this.required("workerTemplateId"),
       reviewTemplateId: this.required("reviewTemplateId"),
+      workerModel: this.required("workerModel"),
+      workerReasoningEffort: this.required("workerReasoningEffort") as CodexReasoningEffort,
+      reviewModel: this.required("reviewModel"),
+      reviewReasoningEffort: this.required("reviewReasoningEffort") as CodexReasoningEffort,
       maxRunMinutes: Number(this.config.getPluginConfig("forge").maxRunMinutes),
     };
   }
@@ -67,6 +72,7 @@ export class ForgeSettingsService {
   }
 }
 export function forgeConfigFields(): ConfigFieldDescriptor[] {
+  const reasoningOptions = CODEX_REASONING_EFFORTS.map(value => ({ value, label: value === "xhigh" ? "X-high" : value[0].toUpperCase() + value.slice(1) }));
   const fields: ConfigFieldDescriptor[] = [
     {
       key: "provider",
@@ -123,6 +129,22 @@ export function forgeConfigFields(): ConfigFieldDescriptor[] {
         "Choose a Rules / Skills template for implementation agents.",
     },
     {
+      key: "workerModel",
+      label: "Coding model",
+      type: "select",
+      defaultValue: "gpt-6-astra",
+      options: CODEX_MODEL_OPTIONS,
+      description: "Codex model for new coding runs and resumes.",
+    },
+    {
+      key: "workerReasoningEffort",
+      label: "Coding reasoning effort",
+      type: "select",
+      defaultValue: "xhigh",
+      options: reasoningOptions,
+      description: "Choose a reasoning level supported by the coding model.",
+    },
+    {
       key: "reviewTemplateId",
       label: "Review template",
       type: "string",
@@ -130,6 +152,22 @@ export function forgeConfigFields(): ConfigFieldDescriptor[] {
       defaultValue: "",
       description:
         "Choose a Rules / Skills template for review agents.",
+    },
+    {
+      key: "reviewModel",
+      label: "Review model",
+      type: "select",
+      defaultValue: "gpt-6-astra",
+      options: CODEX_MODEL_OPTIONS,
+      description: "Codex model for new review runs and resumes.",
+    },
+    {
+      key: "reviewReasoningEffort",
+      label: "Review reasoning effort",
+      type: "select",
+      defaultValue: "max",
+      options: reasoningOptions,
+      description: "Choose a reasoning level supported by the review model.",
     },
     {
       key: "maxRunMinutes",

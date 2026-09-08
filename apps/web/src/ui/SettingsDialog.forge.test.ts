@@ -23,6 +23,15 @@ const templates: RulesSkillsStore = { rules: [], skills: [], systemRules: [], sy
   { id: "worker-template", name: "Implement carefully", color: "green", ruleIds: [], skillIds: [] },
   { id: "review-template", name: "Review changes", color: "yellow", ruleIds: [], skillIds: [] }
 ] };
+const modelOptions = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"].map(value => ({ label: value, value }));
+const reasoningOptions = [
+  { label: "Low", value: "low" },
+  { label: "Medium", value: "medium" },
+  { label: "High", value: "high" },
+  { label: "X-high", value: "xhigh" },
+  { label: "Max", value: "max" },
+  { label: "Ultra", value: "ultra" }
+];
 
 function config(): CloudxConfigResponse {
   return { globalFields: [], plugins: [{ pluginId: "forge", displayName: "Forge Workers", fields: [
@@ -30,7 +39,11 @@ function config(): CloudxConfigResponse {
     { key: "apiUrl", label: "API URL", type: "string", defaultValue: "https://api.github.com" },
     { key: "projectPath", label: "Repository", type: "string", defaultValue: "" },
     { key: "workerTemplateId", label: "Issue worker template", type: "string", defaultValue: "", optionSource: "rulesSkills.templates" },
-    { key: "reviewTemplateId", label: "Review template", type: "string", defaultValue: "", optionSource: "rulesSkills.templates" }
+    { key: "workerModel", label: "Coding model", type: "select", defaultValue: "gpt-6-astra", options: modelOptions },
+    { key: "workerReasoningEffort", label: "Coding reasoning effort", type: "select", defaultValue: "xhigh", options: reasoningOptions },
+    { key: "reviewTemplateId", label: "Review template", type: "string", defaultValue: "", optionSource: "rulesSkills.templates" },
+    { key: "reviewModel", label: "Review model", type: "select", defaultValue: "gpt-6-astra", options: modelOptions },
+    { key: "reviewReasoningEffort", label: "Review reasoning effort", type: "select", defaultValue: "max", options: reasoningOptions }
   ] }], values: { global: {}, plugins: { forge: { provider: "github", apiUrl: "https://api.github.com", projectPath: "cloudx/example" } } } };
 }
 
@@ -99,6 +112,42 @@ describe("Forge setup in ordinary Settings", () => {
     await select(field(container, "Review template"), "review-template");
     await act(async () => [...container.querySelectorAll("button")].find(item => item.textContent === "Save")!.click());
     expect(save.mock.calls[0][0].plugins.forge).toMatchObject({ workerTemplateId: "worker-template", reviewTemplateId: "review-template" });
+  });
+
+  it("shows model defaults and saves independent coding and review dropdown choices", async () => {
+    const { container, save } = await mount();
+    const codingModel = field(container, "Coding model");
+    const reviewModel = field(container, "Review model");
+    const codingEffort = field(container, "Coding reasoning effort") as HTMLSelectElement;
+    const reviewEffort = field(container, "Review reasoning effort") as HTMLSelectElement;
+    expect(codingModel.value).toBe("gpt-6-astra");
+    expect(reviewModel.value).toBe("gpt-6-astra");
+    expect(codingEffort.value).toBe("xhigh");
+    expect(reviewEffort.value).toBe("max");
+    for (const model of [codingModel, reviewModel]) {
+      expect(model).toBeInstanceOf(HTMLSelectElement);
+      expect([...(model as HTMLSelectElement).options].map(option => option.value)).toEqual(modelOptions.map(option => option.value));
+    }
+    for (const effort of [codingEffort, reviewEffort]) {
+      expect([...effort.options].map(option => ({ label: option.textContent, value: option.value }))).toEqual(reasoningOptions);
+    }
+
+    await select(codingModel, "gpt-5.6-sol");
+    await select(codingEffort, "high");
+    expect(reviewModel.value).toBe("gpt-6-astra");
+    expect(reviewEffort.value).toBe("max");
+    await select(reviewModel, "gpt-5.6-terra");
+    await select(reviewEffort, "ultra");
+    expect(codingModel.value).toBe("gpt-5.6-sol");
+    expect(codingEffort.value).toBe("high");
+    await act(async () => [...container.querySelectorAll("button")].find(item => item.textContent === "Save")!.click());
+    expect(save).toHaveBeenCalledOnce();
+    expect(save.mock.calls[0][0].plugins.forge).toMatchObject({
+      workerModel: "gpt-5.6-sol",
+      workerReasoningEffort: "high",
+      reviewModel: "gpt-5.6-terra",
+      reviewReasoningEffort: "ultra"
+    });
   });
 
   it("explains the missing template prerequisite", async () => {

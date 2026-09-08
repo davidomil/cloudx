@@ -89,6 +89,10 @@ function fixture() {
       baseBranch: "main",
       workerTemplateId: "worker",
       reviewTemplateId: "review",
+      workerModel: "gpt-6-astra",
+      workerReasoningEffort: "xhigh",
+      reviewModel: "gpt-6-astra",
+      reviewReasoningEffort: "max",
       maxRunMinutes: 60,
     }),
     provider: () => provider,
@@ -115,6 +119,18 @@ function fixture() {
 const placement = { windowId: "window", paneId: "pane" };
 
 describe("Forge issue and review workflows", () => {
+  it.each(["issue", "review"] as const)("uses the %s model defaults and current settings on resume", async kind => {
+    const f = fixture();
+    const worker = kind === "issue" ? await f.service.startIssue(1, placement) : await f.service.startReview(7, false, placement);
+    expect(f.runtime.launch).toHaveBeenLastCalledWith(expect.objectContaining({ model: "gpt-6-astra", reasoningEffort: kind === "issue" ? "xhigh" : "max" }), expect.any(AbortSignal));
+    await f.service.pause(worker.id);
+    const previous = f.deps.settings();
+    f.deps.settings = () => ({ ...previous, workerModel: "gpt-5.6-sol", workerReasoningEffort: "high", reviewModel: "gpt-5.6-terra", reviewReasoningEffort: "ultra" });
+    await f.service.resume(worker.id, placement);
+    expect(f.runtime.launch).toHaveBeenLastCalledWith(expect.objectContaining({ model: kind === "issue" ? "gpt-5.6-sol" : "gpt-5.6-terra", reasoningEffort: kind === "issue" ? "high" : "ultra" }), expect.any(AbortSignal));
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
   it("publishes finished issue work, pauses for review, then merges the approved head and cleans owned resources", async () => {
     const f = fixture();
     const worker = await f.service.startIssue(1, placement);
