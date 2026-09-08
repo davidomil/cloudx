@@ -109,7 +109,7 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
           {item === "workers" && awaitingReview ? <span className="forge-badge">{awaitingReview} awaiting review</span> : null}
         </ControlButton>)}
       </nav>
-      {view === "workers" ? <ForgeWorkerTabs workers={workers} selectedWorkerId={selectedWorkerId} onSelectWorker={onViewWorker}>
+      {view === "workers" ? <ForgeWorkerTabs workers={workers} selectedWorkerId={selectedWorkerId} onSelectWorker={setSelectedWorkerId}>
         {(worker) => <WorkerCard worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} />}
       </ForgeWorkerTabs> : dashboard.configured && repository ? <ForgeItems key={`${repository.provider}:${repository.apiUrl}:${repository.projectPath}:${view}`} kind={view} provider={repository.provider} request={request} revision={revision} workers={workers.filter((worker) => worker.repository.provider === repository.provider && worker.repository.apiUrl === repository.apiUrl && worker.repository.projectPath === repository.projectPath)} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} /> : null}
       {active && terminalWorker ? <ForgeWorkerTerminalOverlay key={terminalWorker.id} worker={terminalWorker} workerTabs={workerTabs} uiScale={uiScale} onClose={() => setTerminalWorkerId(undefined)} /> : null}

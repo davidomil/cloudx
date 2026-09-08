@@ -473,8 +473,9 @@ describe("ForgePanel", () => {
     expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
   });
 
-  it("selects internal workers with keyboard navigation and retains review edits", async () => {
-    const panel = await renderPanel(fixture({ workers: [worker, reviewWorker] }), { workerTabs: [workerTab] });
+  it("selects workers without opening a terminal and retains review edits", async () => {
+    const testFixture = fixture({ workers: [worker, reviewWorker] });
+    const panel = await renderPanel(testFixture, { workerTabs: [workerTab] });
     await click(panel, "Workers (2)");
     expect(panel.querySelector("dialog")).toBeNull();
     expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
@@ -484,15 +485,21 @@ describe("ForgePanel", () => {
     expect(document.activeElement).toBe(tabs[1]);
     expect(tabs[0].getAttribute("aria-selected")).toBe("true");
     await act(async () => tabs[1].click());
-    expect(panel.querySelector("dialog h2")?.textContent).toContain("Review #12");
-    await click(panel, "Close worker terminal");
+    expect(tabs[1].getAttribute("aria-selected")).toBe("true");
+    expect(panel.querySelector("dialog")).toBeNull();
     const editor = panel.querySelector<HTMLTextAreaElement>('[role="tabpanel"]:not([hidden]) .forge-review textarea')!;
     await fill(editor, "Retain my edits while I inspect issue work.");
     await act(async () => tabs[0].click());
+    expect(tabs[0].getAttribute("aria-selected")).toBe("true");
+    expect(panel.querySelector("dialog")).toBeNull();
+    expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
+    await click(panel.querySelector('[role="tabpanel"]:not([hidden])')!, "View worker");
     expect(panel.querySelector('[data-terminal-tab="codex-worker"]')).not.toBeNull();
     await click(panel, "Close worker terminal");
+    await act(async () => tabs[0].click());
+    expect(panel.querySelector("dialog")).toBeNull();
     await act(async () => tabs[1].click());
-    await click(panel, "Close worker terminal");
+    expect(panel.querySelector("dialog")).toBeNull();
     expect(editor.value).toBe("Retain my edits while I inspect issue work.");
     await click(panel.querySelector('[role="tabpanel"]:not([hidden])')!, "View worker");
     expect(panel.querySelector("dialog h2")?.textContent).toContain("Review #12");
@@ -501,6 +508,8 @@ describe("ForgePanel", () => {
     expect(document.activeElement).toBe(tabs[0]);
     await act(async () => tabs[0].dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true })));
     expect(document.activeElement).toBe(tabs[1]);
+    expect(panel.querySelector("dialog")).toBeNull();
+    expect(testFixture.calls.every(call => !call.hook.startsWith("forge.worker."))).toBe(true);
   });
 
   it("keeps the selected worker through Resume replacing its terminal and cleanup removing it", async () => {
@@ -518,9 +527,12 @@ describe("ForgePanel", () => {
     const panel = await renderPanel(testFixture, { workerTabs: [workerTab, secondTab] });
     await click(panel, "Workers (2)");
     await act(async () => panel.querySelectorAll<HTMLButtonElement>('[role="tab"]')[1].click());
+    expect(panel.querySelector("dialog")).toBeNull();
+    await click(panel.querySelector('[role="tabpanel"]:not([hidden])')!, "View worker");
     expect(panel.querySelector('[data-terminal-tab="second-terminal"]')).not.toBeNull();
     await click(panel, "Close worker terminal");
     await click(panel.querySelector('[role="tabpanel"]:not([hidden])')!, "Resume");
+    expect(panel.querySelector("dialog")).toBeNull();
     await click(panel.querySelector('[role="tabpanel"]:not([hidden])')!, "View worker");
     expect(panel.querySelector("dialog")?.textContent).toContain("The worker terminal is unavailable.");
     await act(async () => roots.at(-1)!.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab, { ...secondTab, id: "resumed-terminal" }], active: true, uiScale: 100 })));
