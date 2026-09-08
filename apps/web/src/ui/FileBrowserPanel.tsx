@@ -104,7 +104,7 @@ interface FileClipboardPaths {
   absolutePath: string;
 }
 
-export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; config?: Record<string, ConfigValue> }) {
+export function FileBrowserPanel({ tab, selected, config = {} }: { tab: WorkspaceTab; selected: boolean; config?: Record<string, ConfigValue> }) {
   const [initialState] = useState(() => readFileBrowserPanelState(tab));
   const [relativePath, setRelativePath] = useState(() => initialState?.relativePath ?? "");
   const [entries, setEntries] = useState<DirectoryEntry[]>(() => initialState?.entries ?? []);
@@ -146,6 +146,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
   const contextMenuRef = useRef<HTMLDivElement | null>(null);
+  const wasSelected = useRef(selected);
   const showGitDiff = config.showGitDiff !== false;
   const canViewGitDiff = showGitDiff;
   const gitAutoRefresh = config.gitAutoRefresh !== false;
@@ -170,6 +171,22 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
       setCompareRef("");
     }
   }, [tab.id, tab.cwd, showGitDiff]);
+
+  useEffect(() => {
+    const reselected = selected && !wasSelected.current;
+    wasSelected.current = selected;
+    if (!reselected) return;
+
+    let current = true;
+    void runTabAction<DirectoryResult>(tab.id, "list_directory", { relativePath })
+      .then((result) => {
+        if (current) setEntries(result.entries);
+      })
+      .catch((err) => {
+        if (current) setError(err instanceof Error ? err.message : String(err));
+      });
+    return () => { current = false; };
+  }, [selected, tab.id, tab.cwd, relativePath]);
 
   useEffect(() => {
     rememberFileBrowserPanelState(tab, {

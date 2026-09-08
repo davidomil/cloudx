@@ -6,6 +6,7 @@ import {
   type WebSocket,
 } from "@playwright/test";
 import type {
+  CloudxConfigResponse,
   CreateTabResponse,
   PluginDescriptor,
   TabLayoutNode,
@@ -706,7 +707,7 @@ test.describe("CloudX shipped shell", () => {
     }
   });
 
-  test("keeps file uploads and downloads running across tab switches", async ({
+  test("refreshes reselected file listings while uploads and downloads keep running", async ({
     page,
   }) => {
     const files = await createTransferTestTab(
@@ -729,6 +730,12 @@ test.describe("CloudX shipped shell", () => {
     });
     const uploads: string[] = [];
     let downloads = 0;
+    await page.route("**/api/config", async (route) => {
+      const response = await route.fetch();
+      const config = (await response.json()) as CloudxConfigResponse;
+      config.values.plugins["file-browser"].showGitDiff = false;
+      await route.fulfill({ response, json: config });
+    });
     await page.route(
       `**/api/tabs/${files.tab.id}/files/upload?*`,
       async (route) => {
@@ -784,7 +791,14 @@ test.describe("CloudX shipped shell", () => {
       await expect(
         visibleFiles.getByRole("status", { name: "Upload progress" }),
       ).toHaveCount(0);
+      await fs.writeFile(
+        path.join(testRoot, "workspace", "created-while-hidden.txt"),
+        "Created outside the retained Files tab\n",
+      );
       await selectFiles();
+      await expect(visibleFiles.locator(".file-list")).toContainText(
+        "created-while-hidden.txt",
+      );
       await expect(
         visibleFiles.getByRole("status", { name: "Upload progress" }),
       ).toContainText("Uploading 1/2");

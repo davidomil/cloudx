@@ -1549,6 +1549,7 @@ export function App() {
                   tab={tab}
                   plugin={plugin}
                   plugins={plugins}
+                  selected={selected}
                   active={paneActive && selected}
                   config={pluginConfig(tab.pluginId)}
                   uiScale={uiScale}
@@ -2039,6 +2040,7 @@ function PluginPanel({
   tab,
   plugin,
   plugins,
+  selected,
   active,
   config,
   uiScale,
@@ -2054,6 +2056,7 @@ function PluginPanel({
   tab: WorkspaceTab;
   plugin: PluginDescriptor | undefined;
   plugins: PluginDescriptor[];
+  selected: boolean;
   active: boolean;
   config: Record<string, ConfigValue>;
   uiScale: number;
@@ -2076,7 +2079,7 @@ function PluginPanel({
   if (plugin?.panelKind === "file-browser") {
     return (
       <Suspense fallback={<div className="empty-pane">Loading files...</div>}>
-        <FileBrowserPanel key={`${tab.id}:${tab.cwd}`} tab={tab} config={config} />
+        <FileBrowserPanel key={`${tab.id}:${tab.cwd}`} tab={tab} selected={selected} config={config} />
       </Suspense>
     );
   }

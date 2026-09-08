@@ -196,7 +196,7 @@ describe("file transfer path helpers", () => {
   });
 
   it("keeps file upload available while folder upload is absent", () => {
-    const html = renderToStaticMarkup(createElement(FileBrowserPanel, { tab: workspaceTab("tab-files", "/repo"), config: { showGitDiff: false } }));
+    const html = renderToStaticMarkup(createElement(FileBrowserPanel, { selected: true, tab: workspaceTab("tab-files", "/repo"), config: { showGitDiff: false } }));
     const container = document.createElement("div");
     container.innerHTML = html;
 
@@ -249,7 +249,7 @@ describe("file browser panel state cache", () => {
       searchVisible: true
     }));
 
-    const html = renderToStaticMarkup(createElement(FileBrowserPanel, { tab, config: { showGitDiff: false } }));
+    const html = renderToStaticMarkup(createElement(FileBrowserPanel, { selected: true, tab, config: { showGitDiff: false } }));
     const normalizedHtml = html.toLowerCase();
 
     expect(html).toContain(">src<");
@@ -276,7 +276,7 @@ describe("file browser panel state cache", () => {
       markdownPreviewMode: "source"
     }));
 
-    const html = renderToStaticMarkup(createElement(FileBrowserPanel, { tab, config: { showGitDiff: false } }));
+    const html = renderToStaticMarkup(createElement(FileBrowserPanel, { selected: true, tab, config: { showGitDiff: false } }));
 
     expect(html).toContain("Markdown source");
     expect(html).toContain("language-markdown");
@@ -298,7 +298,7 @@ describe("file browser panel state cache", () => {
       openFileViewMode: "diff"
     }));
 
-    const html = renderToStaticMarkup(createElement(FileBrowserPanel, { tab }));
+    const html = renderToStaticMarkup(createElement(FileBrowserPanel, { selected: true, tab }));
     const container = document.createElement("div");
     container.innerHTML = html;
     const toolbar = container.querySelector(".file-browser-toolbar");
@@ -322,7 +322,7 @@ describe("file browser panel state cache", () => {
       openFileViewMode: "diff"
     }));
 
-    const hiddenHtml = renderToStaticMarkup(createElement(FileBrowserPanel, { tab }));
+    const hiddenHtml = renderToStaticMarkup(createElement(FileBrowserPanel, { selected: true, tab }));
     const hiddenContainer = document.createElement("div");
     hiddenContainer.innerHTML = hiddenHtml;
     const hiddenToolbar = hiddenContainer.querySelector(".file-browser-toolbar");
@@ -343,7 +343,7 @@ describe("file browser panel state cache", () => {
       gitBarVisible: false
     }));
 
-    const html = renderToStaticMarkup(createElement(FileBrowserPanel, { tab }));
+    const html = renderToStaticMarkup(createElement(FileBrowserPanel, { selected: true, tab }));
 
     expect(html).toContain("git-diff-workspace");
     expect(html).not.toContain("git-bar repository");
@@ -372,7 +372,7 @@ describe("file browser panel state cache", () => {
 
     try {
       await act(async () => {
-        root.render(createElement(FileBrowserPanel, { tab }));
+        root.render(createElement(FileBrowserPanel, { selected: true, tab }));
       });
       await flushEffects();
 
@@ -422,7 +422,7 @@ describe("file browser panel state cache", () => {
 
     try {
       await act(async () => {
-        root.render(createElement(FileBrowserPanel, { tab }));
+        root.render(createElement(FileBrowserPanel, { selected: true, tab }));
       });
       await flushEffects();
 
@@ -458,7 +458,7 @@ describe("file browser panel state cache", () => {
 
     try {
       await act(async () => {
-        root.render(createElement(FileBrowserPanel, { tab, config: { showGitDiff: false } }));
+        root.render(createElement(FileBrowserPanel, { selected: true, tab, config: { showGitDiff: false } }));
       });
       await flushEffects();
 
@@ -503,7 +503,7 @@ describe("file browser panel state cache", () => {
       }
     }));
 
-    const html = renderToStaticMarkup(createElement(FileBrowserPanel, { tab, config: { showGitDiff: false } }));
+    const html = renderToStaticMarkup(createElement(FileBrowserPanel, { selected: true, tab, config: { showGitDiff: false } }));
 
     expect(html).not.toContain("src/old.ts");
     expect(html).toContain("Select a file to preview it.");
@@ -675,7 +675,7 @@ describe("file browser visibility class names", () => {
     const tab = workspaceTab("tab-files", "/repo");
     rememberFileBrowserPanelState(tab, fileBrowserState({ fileTreeSize: 320 }));
 
-    const html = renderToStaticMarkup(createElement(FileBrowserPanel, { tab, config: { showGitDiff: false } }));
+    const html = renderToStaticMarkup(createElement(FileBrowserPanel, { selected: true, tab, config: { showGitDiff: false } }));
     const container = document.createElement("div");
     container.innerHTML = html;
     const splitter = container.querySelector('[role="separator"]');
