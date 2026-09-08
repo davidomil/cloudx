@@ -222,13 +222,21 @@ export class ForgePlugin implements WorkspacePlugin {
         "external",
         {
           number,
+          headSha: {
+            type: "string",
+            anyOf: [
+              { pattern: "^[a-fA-F0-9]{40}$", maxLength: 40 },
+              { pattern: "^[a-fA-F0-9]{64}$", maxLength: 64 },
+            ],
+          },
           event: { type: "string", enum: ["approve", "request_changes"] },
           body: { type: "string", maxLength: 100_000 },
         },
-        ["number", "event"],
+        ["number", "headSha", "event"],
         async (input) => {
           await this.service().workflow.markReview(
             Number(input.number),
+            String(input.headSha),
             input.event as "approve" | "request_changes",
             typeof input.body === "string"
               ? input.body

@@ -289,14 +289,9 @@ export class GitLabProvider implements ForgeProvider {
       rejectQuickActions,
     );
     const path = this.requestPath(number);
-    const current = record((await this.http.request(path)).body);
-    if (string(current.sha) !== input.headSha)
-      throw new ForgeProviderError(
-        "The request head changed. Run a fresh review before posting.",
-        409,
-      );
-    if (current.state !== "opened")
-      throw new ForgeProviderError("Reviews require an open request.", 409);
+    let current = await this.readReviewRequest(number, input.headSha);
+    if (input.event === "request_changes")
+      current = await this.ensureReviewerAssigned(number, input.headSha, current);
     let posted = 0;
     const commentIds: string[] = [];
     try {
@@ -390,6 +385,45 @@ export class GitLabProvider implements ForgeProvider {
         );
       throw error;
     }
+  }
+
+  private async readReviewRequest(number: number, headSha: string): Promise<Record<string, unknown>> {
+    const current = record((await this.http.request(this.requestPath(number))).body);
+    if (integer(current.iid) !== number) return invalid();
+    if (string(current.sha) !== headSha)
+      throw new ForgeProviderError("The request head changed. Run a fresh review before posting.", 409);
+    if (current.state !== "opened")
+      throw new ForgeProviderError("Reviews require an open request.", 409);
+    return current;
+  }
+
+  private async ensureReviewerAssigned(number: number, headSha: string, current: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const reviewer = record((await this.http.request("/user", { role: "reviewer" })).body);
+    const id = integer(reviewer.id);
+    const username = string(reviewer.username);
+    if (!id || !username || /\s/.test(username)) return invalid();
+    const originalReviewers = gitlabReviewerIds(current.reviewers);
+    if (originalReviewers.includes(id)) return current;
+    const result = record((await this.http.request("/graphql", {
+      method: "POST",
+      role: "worker",
+      graphql: true,
+      body: {
+        query: "mutation($input:MergeRequestSetReviewersInput!){mergeRequestSetReviewers(input:$input){errors mergeRequest{iid}}}",
+        variables: { input: { projectPath: this.http.repository.projectPath, iid: String(number), reviewerUsernames: [username], operationMode: "APPEND" } },
+      },
+    })).body);
+    if (result.errors !== undefined)
+      throw new ForgeProviderError("GitLab could not assign the reviewer. Check project permissions and reviewer limits before posting.", 422);
+    const mutation = record(record(result.data).mergeRequestSetReviewers);
+    if (list(mutation.errors).length)
+      throw new ForgeProviderError("GitLab refused to assign the reviewer. Check project permissions and reviewer limits before posting.", 422);
+    if (string(record(mutation.mergeRequest).iid) !== String(number)) return invalid();
+    const assigned = await this.readReviewRequest(number, headSha);
+    const reviewers = gitlabReviewerIds(assigned.reviewers);
+    if (!reviewers.includes(id) || originalReviewers.some(id => !reviewers.includes(id)))
+      throw new ForgeProviderError("GitLab did not confirm the reviewer assignment while preserving existing reviewers. Inspect the MR and reviewer limits before posting.", 409);
+    return assigned;
   }
 
   async merge(
@@ -537,6 +571,12 @@ export class GitLabProvider implements ForgeProvider {
     const offset = (page - 1) * perPage;
     return { items: items.slice(offset, offset + perPage), ...(offset + perPage < items.length ? { nextPage: page + 1 } : {}) };
   }
+}
+
+function gitlabReviewerIds(value: unknown): number[] {
+  const ids = list(value).map(reviewer => integer(record(reviewer).id));
+  if (ids.some(id => !id) || new Set(ids).size !== ids.length) return invalid();
+  return ids;
 }
 
 function gitlabHeadSha(value: unknown): string {

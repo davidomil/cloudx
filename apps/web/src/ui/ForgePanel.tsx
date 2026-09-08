@@ -235,8 +235,8 @@ function ForgeItems({ kind, provider, request, revision, workers, placement, run
             <div className="forge-review-decision">
               <label className="forge-field">Review message<textarea value={reviewBody} onChange={(event) => setReviewBody(event.target.value)} placeholder="Message for approval or requested changes" rows={2} /></label>
               <div className="forge-actions">
-                <ControlButton size="compact" disabled={reviewDisabled || !reviewBody.trim()} onClick={() => void runAction(() => request("forge.change.review", { number: item.number, event: "request_changes", body: reviewBody }))}>Mark as request changes</ControlButton>
-                <ControlButton size="compact" disabled={reviewDisabled} onClick={() => void runAction(() => request("forge.change.review", { number: item.number, event: "approve", body: reviewBody }))}><Check size={14} /> Mark as approved</ControlButton>
+                <ControlButton size="compact" disabled={reviewDisabled || !reviewBody.trim()} onClick={() => void runAction(() => request("forge.change.review", { number: item.number, headSha: changeDetail!.headSha, event: "request_changes", body: reviewBody }))}>Mark as request changes</ControlButton>
+                <ControlButton size="compact" disabled={reviewDisabled} onClick={() => void runAction(() => request("forge.change.review", { number: item.number, headSha: changeDetail!.headSha, event: "approve", body: reviewBody }))}><Check size={14} /> Mark as approved</ControlButton>
               </div>
             </div>
             <p className="forge-muted">Reviews are submitted using the configured reviewer identity. A message is required when requesting changes.</p>

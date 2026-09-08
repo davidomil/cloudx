@@ -51,6 +51,7 @@ export interface ForgeWorker {
   changeNumber?: number;
   changeUrl?: string;
   headSha?: string;
+  mergeAttempted?: true;
   feedbackDigest?: string;
   autoPost: boolean;
   autoReview?: ForgeAutoReview;
@@ -75,7 +76,6 @@ export interface ForgeAutoReview {
   placement: ForgePlacement;
   reviewWorkerId?: string;
   waitingSince?: string;
-  mergeAttempted?: true;
 }
 export interface ForgeDashboard {
   configured: boolean;

@@ -39,9 +39,9 @@ afterEach(async () => {
 
 const repository = { provider: "github" as const, apiUrl: "https://api.github.com", projectPath: "cloudx/example" };
 const issue: ForgeIssueDetail = { number: 7, title: "Fix deployment", body: "The deployment fails.", url: "https://github.com/cloudx/example/issues/7", state: "open", author: "ari", labels: ["bug"], updatedAt: "2026-09-07", comments: [{ id: "note-1", author: "nia", body: "Reproduced in staging." }] };
-const change: ForgeChangeRequest = { ...issue, number: 12, title: "Repair deployment", url: "https://github.com/cloudx/example/pull/12", draft: false, headSha: "abcdef", headBranch: "fix/deploy", baseBranch: "main", merged: false, mergeable: true, requiresBaseUpdate: false, reviewReady: true, approved: false, unresolvedDiscussions: 1, baseSha: "123456", linkedIssues: [], comments: [{ id: "note-2", author: "nia", body: "Needs a timeout.", path: "deploy.ts", line: 8, resolved: false }] };
+const change: ForgeChangeRequest = { ...issue, number: 12, title: "Repair deployment", url: "https://github.com/cloudx/example/pull/12", draft: false, headSha: "a".repeat(40), headBranch: "fix/deploy", baseBranch: "main", merged: false, mergeable: true, requiresBaseUpdate: false, reviewReady: true, approved: false, unresolvedDiscussions: 1, baseSha: "b".repeat(40), linkedIssues: [], comments: [{ id: "note-2", author: "nia", body: "Needs a timeout.", path: "deploy.ts", line: 8, resolved: false }] };
 const worker: ForgeWorker = { id: "work-1", kind: "issue", number: 7, title: issue.title, repository, repositoryPath: "/repo", baseBranch: "main", templateId: "worker-template", status: "running", tabId: "codex-worker", autoPost: false, startedAt: "2026-09-07", updatedAt: "2026-09-07" };
-const reviewWorker: ForgeWorker = { ...worker, id: "review-1", kind: "review", number: 12, title: change.title, status: "completed", draft: { headSha: "abcdef", body: "Add a timeout.", event: "request_changes", comments: [{ path: "deploy.ts", line: 8, side: "RIGHT", body: "This can wait forever." }], status: "draft" } };
+const reviewWorker: ForgeWorker = { ...worker, id: "review-1", kind: "review", number: 12, title: change.title, status: "completed", draft: { headSha: change.headSha, body: "Add a timeout.", event: "request_changes", comments: [{ path: "deploy.ts", line: 8, side: "RIGHT", body: "This can wait forever." }], status: "draft" } };
 const publishingWorker: ForgeWorker = {
   ...worker, status: "awaiting_publication", changeNumber: change.number, headSha: "a".repeat(40),
   pendingPublication: {
@@ -469,9 +469,44 @@ describe("ForgePanel", () => {
       { number: 12, autoPost: true, windowId: "window-1", paneId: "pane-2" }
     ]);
     expect(testFixture.calls.filter((call) => call.hook === "forge.change.review").map((call) => call.input)).toEqual([
-      { number: 12, event: "approve", body: "" },
-      { number: 12, event: "request_changes", body: "Please add a timeout." }
+      { number: 12, headSha: change.headSha, event: "approve", body: "" },
+      { number: 12, headSha: change.headSha, event: "request_changes", body: "Please add a timeout." }
     ]);
+  });
+
+  it.each([
+    { provider: "github", event: "approve", label: "Mark as approved" },
+    { provider: "github", event: "request_changes", label: "Mark as request changes" },
+    { provider: "gitlab", event: "approve", label: "Mark as approved" },
+    { provider: "gitlab", event: "request_changes", label: "Mark as request changes" },
+  ] as const)("pins $provider $event to the displayed revision and requires a new decision after a head change", async ({ provider, event, label }) => {
+    let current = { ...change };
+    const published: Record<string, unknown>[] = [];
+    const testFixture = fixture({ repository: { ...repository, provider } }, (hook, input) => {
+      if (hook === "forge.change.get") return { change: { ...current } };
+      if (hook === "forge.change.review") {
+        if (input.headSha !== current.headSha) throw new Error("The request head changed. Review the latest details before submitting a decision.");
+        published.push(input);
+        return { change: { ...current } };
+      }
+    });
+    const panel = await renderPanel(testFixture);
+    await click(panel, provider === "github" ? "Pull requests" : "Merge requests");
+    const body = "Decision based on the displayed revision.";
+    await fill(panel.querySelector(".forge-change-actions .forge-field textarea")!, body);
+    current = { ...change, headSha: "c".repeat(40), body: "New revision to inspect." };
+    expect(panel.textContent).not.toContain(current.body);
+
+    await click(panel, label);
+
+    expect(testFixture.calls.filter(call => call.hook === "forge.change.review")).toEqual([
+      { hook: "forge.change.review", input: { number: change.number, headSha: change.headSha, event, body }, tabId: tab.id },
+    ]);
+    expect(published).toEqual([]);
+    expect(panel.querySelector('[role="alert"]')?.textContent).toContain("The request head changed");
+    expect(panel.textContent).toContain(current.body);
+    await click(panel, label);
+    expect(published).toEqual([{ number: change.number, headSha: current.headSha, event, body }]);
   });
 
   it.each(["github", "gitlab"] as const)("keeps the %s issue worker beside review actions above a long description without losing draft edits", async provider => {

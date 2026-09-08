@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ForgeCredentialRole, ForgeRepository } from "@cloudx/shared";
+import type { ForgeChangeRequest, ForgeCredentialRole, ForgeRepository } from "@cloudx/shared";
 import type { ForgeCredential } from "../forge/providers/ForgeCredentials.js";
 import { ForgePlugin } from "./ForgePlugin.js";
 import { HookRegistry } from "../hooks/HookRegistry.js";
@@ -24,6 +24,7 @@ async function fixture() {
     startIssue: vi.fn(async () => ({ id: "worker" })),
     setAutoReview: vi.fn(async () => ({ id: "worker" })),
     dashboard: vi.fn(async () => ({ workers: [] })),
+    markReview: vi.fn(async () => {}),
   };
   let settings: ForgeSettingsService;
   const plugin = new ForgePlugin(() => ({
@@ -48,6 +49,33 @@ async function fixture() {
   return { plugin, config, settings, hooks, workflow, connections };
 }
 describe("Forge plugin boundary", () => {
+  it.each([
+    { provider: "github", event: "approve", headSha: "a".repeat(40) },
+    { provider: "github", event: "request_changes", headSha: "b".repeat(64) },
+    { provider: "gitlab", event: "approve", headSha: "a".repeat(40) },
+    { provider: "gitlab", event: "request_changes", headSha: "b".repeat(64) },
+  ] as const)("dispatches the displayed $provider head for $event", async ({ provider, event, headSha }) => {
+    const { config, settings, connections, hooks, workflow } = await fixture();
+    await config.update({ plugins: { forge: { provider, apiUrl: provider === "github" ? "https://api.github.com" : "https://gitlab.com/api/v4", projectPath: "org/repo", workerTemplateId: "worker", reviewTemplateId: "review" } } });
+    connections.credential.mockImplementation(() => ({ kind: "token", token: "private" }));
+    const remote = settings.provider(settings.repository(), "worker");
+    const change = { number: 7, headSha } as ForgeChangeRequest;
+    vi.spyOn(remote, "getChangeRequest").mockResolvedValue(change);
+    vi.spyOn(settings, "provider").mockReturnValue(remote);
+    const body = "Decision on the displayed revision.";
+
+    await expect(hooks.call("forge.change.review", { number: 7, headSha, event, body }, { caller: { kind: "ui" } })).resolves.toEqual({ change });
+
+    expect(workflow.markReview).toHaveBeenCalledExactlyOnceWith(7, headSha, event, body);
+  });
+
+  it.each([undefined, null, 42, "", "a".repeat(39), "a".repeat(41), "a".repeat(63), "a".repeat(65), "g".repeat(40), `${"a".repeat(40)}\n`])("rejects a missing or invalid direct decision head before dispatch: %j", async headSha => {
+    const { hooks, workflow } = await fixture();
+    const input = { number: 7, event: "approve", ...(headSha === undefined ? {} : { headSha }) };
+    await expect(hooks.call("forge.change.review", input, { caller: { kind: "ui" } })).rejects.toThrow(/invalid input.*headSha/);
+    expect(workflow.markReview).not.toHaveBeenCalled();
+  });
+
   it.each(["forge.issues.list", "forge.changes.list"])("validates and dispatches quick scopes through %s", async hook => {
     const { config, settings, connections, hooks } = await fixture();
     await config.update({ plugins: { forge: { projectPath: "org/repo", workerTemplateId: "worker", reviewTemplateId: "review" } } });

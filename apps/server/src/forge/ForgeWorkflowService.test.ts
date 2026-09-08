@@ -127,6 +127,131 @@ function fixture() {
 }
 const placement = { windowId: "window", paneId: "pane" };
 
+describe("Issue merge attempts", () => {
+  async function approvedManualIssue() {
+    const f = fixture();
+    const read = f.deps.store.read;
+    f.deps.store.read = async () => parseWorkers(await read());
+    const worker = await f.service.startIssue(1, placement);
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Ready" });
+    await f.service.poll();
+    f.change.approved = true;
+    await f.service.resume(worker.id, placement);
+    return { ...f, worker };
+  }
+
+  it("records a manual merge before submission and refuses to repeat an uncertain outcome across restart", async () => {
+    const f = await approvedManualIssue();
+    let savedAttempt: unknown;
+    f.provider.merge.mockImplementation(async () => {
+      savedAttempt = structuredClone(f.stored()[0]);
+      throw new Error("Merge response lost");
+    });
+    await f.service.poll();
+    expect(savedAttempt).toMatchObject({ changeNumber: 7, headSha: f.change.headSha, mergeAttempted: true });
+    expect(f.stored()[0]).toMatchObject({ status: "failed", mergeAttempted: true });
+    const restarted = new ForgeWorkflowService(f.deps);
+    await expect(restarted.resume(f.worker.id, placement)).rejects.toThrow(/previous merge/);
+    await restarted.poll();
+    expect(f.provider.merge).toHaveBeenCalledExactlyOnceWith(7, f.change.headSha);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([false, true])("retains an uncertain manual merge when Auto review is set to %s", async enabled => {
+    const f = await approvedManualIssue();
+    f.provider.merge.mockRejectedValue(new Error("Merge response lost"));
+    await f.service.poll();
+    await f.service.setAutoReview(f.worker.id, enabled, placement);
+    const restarted = new ForgeWorkflowService(f.deps);
+    await expect(restarted.resume(f.worker.id, placement)).rejects.toThrow(/previous merge/);
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it("reconciles a confirmed manual merge after a lost response without submitting again", async () => {
+    const f = await approvedManualIssue();
+    f.provider.merge.mockRejectedValue(new Error("Merge response lost"));
+    await f.service.poll();
+    f.change.merged = true;
+    f.change.state = "merged";
+    f.issue.state = "closed";
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.resume(f.worker.id, placement);
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+    expect((await restarted.dashboard()).workers).toEqual([]);
+    expect(f.runtime.cleanup).toHaveBeenCalled();
+  });
+
+  it("retains a successful manual merge attempt while its result is not yet visible", async () => {
+    const f = await approvedManualIssue();
+    f.provider.merge.mockResolvedValue({ merged: true, sha: "b".repeat(40) });
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "paused", mergeAttempted: true });
+    const restarted = new ForgeWorkflowService(f.deps);
+    await expect(restarted.resume(f.worker.id, placement)).rejects.toThrow(/previous merge/);
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+  });
+
+  it("does not submit a merge when its attempt cannot be saved", async () => {
+    const f = await approvedManualIssue();
+    const save = f.deps.store.write;
+    let rejected = false;
+    f.deps.store.write = async workers => {
+      if (!rejected && workers.some(worker => worker.mergeAttempted)) {
+        rejected = true;
+        throw new Error("Attempt storage unavailable");
+      }
+      await save(workers);
+    };
+    await f.service.poll();
+    expect(rejected).toBe(true);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", error: "Attempt storage unavailable" });
+    expect(f.stored()[0].mergeAttempted).toBeUndefined();
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.resume(f.worker.id, placement);
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+  });
+
+  it("allows explicit Resume when provider preflight proves a manual merge never started", async () => {
+    const f = await approvedManualIssue();
+    f.provider.merge.mockRejectedValueOnce(new ForgeMergeNotStartedError(new Error("Merge checks changed")));
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", error: "Merge checks changed" });
+    expect(f.stored()[0].mergeAttempted).toBeUndefined();
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.resume(f.worker.id, placement);
+    expect(f.provider.merge).toHaveBeenCalledTimes(2);
+    expect((await restarted.dashboard()).workers).toEqual([]);
+  });
+
+  it("honors Stop after saving a manual merge attempt and before submission", async () => {
+    const f = await approvedManualIssue();
+    const save = f.deps.store.write;
+    let release!: () => void;
+    let saved!: () => void;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    const handoff = new Promise<void>(resolve => { saved = resolve; });
+    let held = false;
+    f.deps.store.write = async workers => {
+      await save(workers);
+      if (!held && workers.some(worker => worker.mergeAttempted)) {
+        held = true;
+        saved();
+        await blocked;
+      }
+    };
+    const polling = f.service.poll();
+    await handoff;
+    const stopping = f.service.stop(f.worker.id);
+    release();
+    await Promise.all([polling, stopping]);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(f.stored()[0].mergeAttempted).toBeUndefined();
+    expect(f.stored()[0].status).toBe("stopped");
+  });
+});
+
 describe("Forge issue and review workflows", () => {
   it("prepares both pinned review commits and supplies a local comparison for every attempt", async () => {
     const f = fixture();
@@ -1146,10 +1271,38 @@ describe("Forge merged request cleanup", () => {
     f.change.state = state;
     f.change.merged = state === "merged";
     await expect(f.service.submitReview(worker.id)).rejects.toThrow("Only open change requests");
-    await expect(f.service.markReview(7, "approve", "Reviewed")).rejects.toThrow("Only open change requests");
+    await expect(f.service.markReview(7, f.change.headSha, "approve", "Reviewed")).rejects.toThrow("Only open change requests");
     expect(f.provider.postReview).not.toHaveBeenCalled();
   });
 
+});
+
+describe.each(["github", "gitlab"] as const)("Forge %s direct review decisions", provider => {
+  it.each(["approve", "request_changes"] as const)("rejects %s for an unseen head and accepts a new decision on the current head", async event => {
+    const f = fixture();
+    const settings = f.deps.settings();
+    f.deps.settings = () => ({ ...settings, repository: { ...settings.repository, provider, apiUrl: provider === "github" ? "https://api.github.com" : "https://gitlab.com/api/v4" } });
+    const displayedHead = f.change.headSha;
+    f.change.headSha = "c".repeat(40);
+
+    await expect(f.service.markReview(7, displayedHead, event, "Decision on the displayed revision.")).rejects.toThrow(/head changed/);
+
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    await f.service.markReview(7, f.change.headSha, event, "Decision on the refreshed revision.");
+    expect(f.provider.postReview).toHaveBeenCalledExactlyOnceWith(7, {
+      headSha: f.change.headSha, event, body: "Decision on the refreshed revision.", comments: [],
+    });
+    expect(f.runtime.launch).not.toHaveBeenCalled();
+  });
+});
+
+describe("Forge direct decision validation", () => {
+  it.each([undefined, null, 42, "", "a".repeat(39), "a".repeat(41), "a".repeat(63), "a".repeat(65), "g".repeat(40), `${"a".repeat(40)}\n`])("rejects an invalid head before contacting the provider: %j", async headSha => {
+    const f = fixture();
+    await expect(f.service.markReview(7, headSha as string, "approve", "Reviewed")).rejects.toThrow(/valid commit SHA/);
+    expect(f.provider.getChangeRequest).not.toHaveBeenCalled();
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+  });
 });
 
 describe("Forge publication confirmation", () => {
@@ -1399,7 +1552,7 @@ describe("Forge publication confirmation", () => {
       await f.service.poll();
     } else await f.service[action](f.worker.id);
     await expect(f.service.startReview(7, false, placement)).rejects.toThrow(/publication/);
-    await expect(f.service.markReview(7, "approve", "Approved")).rejects.toThrow(/publication/);
+    await expect(f.service.markReview(7, f.change.headSha, "approve", "Approved")).rejects.toThrow(/publication/);
     expect(f.provider.postReview).not.toHaveBeenCalled();
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
   });
@@ -1436,7 +1589,7 @@ describe("Forge publication confirmation", () => {
     saved[1].draft = { headSha: f.previousHead, body: "Review", comments: [], event: "comment", status: "draft" };
     await f.deps.store.write(saved);
     const restarted = new ForgeWorkflowService(f.deps);
-    await expect(restarted.markReview(7, "approve", "Approved")).rejects.toThrow(/publication/);
+    await expect(restarted.markReview(7, f.change.headSha, "approve", "Approved")).rejects.toThrow(/publication/);
     await expect(restarted.submitReview(review.id)).rejects.toThrow(/publication/);
     expect(f.provider.postReview).not.toHaveBeenCalled();
     expect(f.runtime.launch).toHaveBeenCalledTimes(3);
@@ -1843,7 +1996,7 @@ describe("Forge issue auto review", () => {
     f.provider.merge.mockRejectedValue(new Error("Merge response lost"));
     f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
     await f.poll();
-    expect(f.currentIssue()).toMatchObject({ status: "failed", autoReview: { mergeAttempted: true } });
+    expect(f.currentIssue()).toMatchObject({ status: "failed", mergeAttempted: true });
     await f.poll();
     await expect(f.service.resume(f.issue.id, placement)).rejects.toThrow(/previous merge/);
     await f.service.setAutoReview(f.issue.id, false, placement);
@@ -1896,7 +2049,7 @@ describe("Forge issue auto review", () => {
     f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
     await f.poll();
     expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge" });
-    expect(f.currentIssue().autoReview?.mergeAttempted).toBeUndefined();
+    expect(f.currentIssue().mergeAttempted).toBeUndefined();
     await f.poll();
     expect(f.stored()).toEqual([]);
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
@@ -1912,7 +2065,7 @@ describe("Forge issue auto review", () => {
     f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
     await f.poll();
     expect(f.currentIssue()).toMatchObject({ status: "failed", error: expect.stringContaining("No permitted merge method") });
-    expect(f.currentIssue().autoReview?.mergeAttempted).toBeUndefined();
+    expect(f.currentIssue().mergeAttempted).toBeUndefined();
     await f.poll();
     expect(f.provider.merge).toHaveBeenCalledOnce();
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);

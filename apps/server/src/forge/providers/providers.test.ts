@@ -1544,7 +1544,9 @@ describe("GitLab review and exact-commit merge", () => {
   it("uses GitLab’s request-changes mutation rather than treating a comment as a review decision", async () => {
     const { provider, calls } = harness(gitlab, (url, options) =>
       response(
-        url.pathname === "/api/graphql"
+        url.pathname === "/api/v4/user"
+          ? { id: 22, username: "reviewer" }
+          : url.pathname === "/api/graphql"
           ? {
               data: {
                 mergeRequestRequestChanges: {
@@ -1555,7 +1557,7 @@ describe("GitLab review and exact-commit merge", () => {
             }
           : options.method === "POST"
             ? { id: 2 }
-            : labRequest,
+            : { ...labRequest, reviewers: [{ id: 22, username: "reviewer" }] },
       ),
     );
     await expect(provider.postReview(7, { ...review, event: "request_changes" })).resolves.toEqual({ commentIds: ["2"] });
@@ -1593,6 +1595,142 @@ describe("GitLab review and exact-commit merge", () => {
     expect(
       calls.filter((call) => call.url.pathname.endsWith("/notes")),
     ).toHaveLength(1);
+  });
+});
+
+describe("GitLab reviewer assignment before requesting changes", () => {
+  const reviewer = { id: 22, username: "reviewer" };
+  const human = { id: 11, username: "human" };
+  const submission = { ...review, event: "request_changes" as const, comments: [{ body: "Fix the failing case." }] };
+  function fixture(options: {
+    request?: Record<string, unknown>;
+    identity?: unknown;
+    assignmentResponse?: unknown;
+    confirmation?: Record<string, unknown>;
+    decisionErrors?: string[];
+  } = {}) {
+    let assigned = false;
+    const initial = { ...labRequest, reviewers: [], ...options.request };
+    const current = () => assigned
+      ? { ...initial, reviewers: [...initial.reviewers as unknown[], reviewer], ...options.confirmation }
+      : initial;
+    return harness(gitlab, (url, request) => {
+      if (url.pathname === "/api/v4/user") return response(options.identity === undefined ? reviewer : options.identity);
+      if (request.method === "GET" || url.pathname.endsWith("/merge_requests")) return response(current());
+      if (url.pathname.endsWith("/discussions")) return response({ id: "finding", notes: [{ id: 31 }] });
+      if (url.pathname.endsWith("/notes")) return response({ id: 32 });
+      const body = JSON.parse(String(request.body));
+      if (body.query.includes("mergeRequestSetReviewers")) {
+        assigned = true;
+        return options.assignmentResponse instanceof Response ? options.assignmentResponse : response(options.assignmentResponse ?? {
+          data: { mergeRequestSetReviewers: { errors: [], mergeRequest: { iid: "7" } } },
+        });
+      }
+      const hasReviewer = Array.isArray(current().reviewers) && (current().reviewers as typeof reviewer[]).some(user => user.id === reviewer.id);
+      return response({ data: { mergeRequestRequestChanges: { errors: options.decisionErrors ?? (hasReviewer ? [] : ["Reviewer not found"]), mergeRequest: { iid: "7" } } } });
+    });
+  }
+  const assignments = (calls: ReturnType<typeof harness>["calls"]) => calls.filter(call => String(call.options.body).includes("mergeRequestSetReviewers"));
+  const feedback = (calls: ReturnType<typeof harness>["calls"]) => calls.filter(call => call.url.pathname.endsWith("/discussions") || call.url.pathname.endsWith("/notes") || String(call.options.body).includes("mergeRequestRequestChanges"));
+
+  it.each(["new", "existing"])("assigns the reviewer before publishing findings on a %s MR", async kind => {
+    const { provider, calls } = fixture();
+    if (kind === "new") await provider.createChangeRequest({ title: "Fix", body: "Closes #5", headBranch: "fix-race", baseBranch: "main" });
+    await expect(provider.postReview(7, submission)).resolves.toEqual({ commentIds: ["31", "32"] });
+    const assignment = assignments(calls);
+    expect(assignment).toHaveLength(1);
+    expect(JSON.parse(String(assignment[0].options.body)).variables.input).toEqual({
+      projectPath: "group/subgroup/repo", iid: "7", reviewerUsernames: ["reviewer"], operationMode: "APPEND",
+    });
+    expect(new Headers(calls.find(call => call.url.pathname === "/api/v4/user")!.options.headers).get("private-token")).toBe("reviewer-private-token");
+    expect(new Headers(assignment[0].options.headers).get("private-token")).toBe("worker-private-token");
+    expect(calls.indexOf(assignment[0])).toBeLessThan(calls.indexOf(feedback(calls)[0]));
+    expect(feedback(calls).map(call => new Headers(call.options.headers).get("private-token"))).toEqual(Array(3).fill("reviewer-private-token"));
+  });
+
+  it("skips assignment when the actual reviewer is already assigned", async () => {
+    const { provider, calls } = fixture({ request: { reviewers: [human, reviewer] } });
+    await expect(provider.postReview(7, submission)).resolves.toEqual({ commentIds: ["31", "32"] });
+    expect(assignments(calls)).toHaveLength(0);
+  });
+
+  it("keeps an existing human reviewer when appending the bot", async () => {
+    const { provider, calls } = fixture({ request: { reviewers: [human] } });
+    await expect(provider.postReview(7, submission)).resolves.toEqual({ commentIds: ["31", "32"] });
+    expect(assignments(calls)).toHaveLength(1);
+  });
+
+  it.each([
+    { reviewers: [human] }, { reviewers: [reviewer] }, { reviewers: [] },
+    { reviewers: undefined }, { reviewers: [{ username: "reviewer" }] },
+    { iid: 8 }, { sha: previousSha }, { state: "closed" }, { state: "merged" },
+  ])("stops before feedback when the assignment cannot be confirmed: %j", async confirmation => {
+    const { provider, calls } = fixture({ request: { reviewers: [human] }, confirmation });
+    await expect(provider.postReview(7, submission)).rejects.toBeInstanceOf(ForgeProviderError);
+    expect(assignments(calls)).toHaveLength(1);
+    expect(feedback(calls)).toHaveLength(0);
+  });
+
+  it.each([
+    { data: { mergeRequestSetReviewers: { errors: ["Not allowed"], mergeRequest: { iid: "7" } } } },
+    { errors: [{ message: "Not supported" }] }, {},
+    { data: { mergeRequestSetReviewers: { errors: [], mergeRequest: null } } },
+    { data: { mergeRequestSetReviewers: { errors: [], mergeRequest: { iid: "8" } } } },
+    { data: { mergeRequestSetReviewers: { mergeRequest: { iid: "7" } } } },
+  ])("stops before feedback for a rejected or malformed assignment: %j", async assignmentResponse => {
+    const { provider, calls } = fixture({ assignmentResponse });
+    await expect(provider.postReview(7, submission)).rejects.toBeInstanceOf(ForgeProviderError);
+    expect(assignments(calls)).toHaveLength(1);
+    expect(feedback(calls)).toHaveLength(0);
+  });
+
+  it.each([403, 500])("does not repeat an assignment rejected with HTTP %s", async status => {
+    const { provider, calls } = fixture({ assignmentResponse: new Response(null, { status }) });
+    await expect(provider.postReview(7, submission)).rejects.toMatchObject({ statusCode: status });
+    expect(assignments(calls)).toHaveLength(1);
+    expect(feedback(calls)).toHaveLength(0);
+  });
+
+  it("does not repeat a completed assignment whose response was lost", async () => {
+    const base = fixture();
+    const { provider, calls } = harness(gitlab, async (url, request) => {
+      const result = await base.fetcher(url, request);
+      if (String(request.body).includes("mergeRequestSetReviewers")) throw new TypeError("Connection reset");
+      return result;
+    });
+    await expect(provider.postReview(7, submission)).rejects.toBeInstanceOf(ForgeProviderError);
+    expect(assignments(calls)).toHaveLength(1);
+    expect(feedback(calls)).toHaveLength(0);
+  });
+
+  it("stops before writes when the reviewer identity cannot be read", async () => {
+    const base = fixture();
+    const { provider, calls } = harness(gitlab, (url, request) => url.pathname === "/api/v4/user"
+      ? new Response(null, { status: 401 }) : base.fetcher(url, request));
+    await expect(provider.postReview(7, submission)).rejects.toMatchObject({ statusCode: 401 });
+    expect(assignments(calls)).toHaveLength(0);
+    expect(feedback(calls)).toHaveLength(0);
+  });
+
+  it.each([null, {}, { id: 0, username: "reviewer" }, { id: "22", username: "reviewer" }, { id: 22 }, { id: 22, username: "" }, { id: 22, username: "reviewer\n" }])("requires a valid authenticated reviewer before any writes: %j", async identity => {
+    const { provider, calls } = fixture({ identity });
+    await expect(provider.postReview(7, submission)).rejects.toBeInstanceOf(ForgeProviderError);
+    expect(assignments(calls)).toHaveLength(0);
+    expect(feedback(calls)).toHaveLength(0);
+  });
+
+  it.each([undefined, null, [{ id: 0 }], [{ id: "11" }], [{ id: 11 }, { id: 11 }]].map(reviewers => ({ reviewers })))("requires complete original reviewer identities before assigning: %j", async ({ reviewers }) => {
+    const { provider, calls } = fixture({ request: { reviewers } });
+    await expect(provider.postReview(7, submission)).rejects.toBeInstanceOf(ForgeProviderError);
+    expect(assignments(calls)).toHaveLength(0);
+    expect(feedback(calls)).toHaveLength(0);
+  });
+
+  it("retains the partial publication error if request-changes fails after assignment", async () => {
+    const { provider, calls } = fixture({ decisionErrors: ["Reviewer not found"] });
+    await expect(provider.postReview(7, submission)).rejects.toThrow("posted 2 review item(s)");
+    expect(assignments(calls)).toHaveLength(1);
+    expect(feedback(calls)).toHaveLength(3);
   });
 });
 

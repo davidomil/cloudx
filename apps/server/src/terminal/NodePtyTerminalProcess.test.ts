@@ -37,9 +37,11 @@ function terminalFixture() {
   const native = {
     pid: 2_147_483_647,
     onExit: (listener: () => void) => { exit = listener; return { dispose() {} }; },
+    onData: vi.fn(),
     resize: vi.fn(),
     kill: vi.fn()
   };
-  const terminal = new NodePtyTerminalProcess(native as unknown as IPty);
+  const supervisor = { completion: new Promise<{ event: { exitCode: number } }>(() => {}), kill: () => native.kill(), terminate: async () => {} };
+  const terminal = new NodePtyTerminalProcess(native as unknown as IPty, supervisor);
   return { terminal, native, exit: () => exit() };
 }

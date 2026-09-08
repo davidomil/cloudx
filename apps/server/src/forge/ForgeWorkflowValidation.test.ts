@@ -69,6 +69,26 @@ describe("Issue completion reports", () => {
   });
 });
 
+describe("Saved issue merge attempts", () => {
+  it.each([undefined, { ...autoReview, enabled: false }, autoReview])("preserves an issue merge attempt independently of automatic review %#", loop => {
+    const saved = { ...worker, changeNumber: 12, headSha, mergeAttempted: true, autoReview: loop };
+    expect(parseWorkers([saved])).toEqual([saved]);
+  });
+
+  it.each([
+    { mergeAttempted: false }, { mergeAttempted: "true" }, { mergeAttempted: null },
+    { kind: "review" }, { changeNumber: undefined }, { headSha: undefined },
+    { headSha: "invalid" }, { headSha: "a".repeat(41) }, { headSha: `${headSha}\n` },
+    { headSha: `${"a".repeat(63)}\n` },
+  ])("rejects a merge attempt without a valid published issue head %#", invalid => {
+    expect(() => parseWorkers([{ ...worker, changeNumber: 12, headSha, mergeAttempted: true, ...invalid }])).toThrow(/merge attempt/);
+  });
+
+  it("rejects a merge attempt stored inside automatic review instead of silently dropping it", () => {
+    expect(() => parseWorkers([{ ...worker, changeNumber: 12, headSha, autoReview: { ...autoReview, phase: "merging", mergeAttempted: true } }])).toThrow(/merge attempt/);
+  });
+});
+
 describe("Saved issue publication checkpoints", () => {
   const updateReport = { ...report, discussionReplies: [], resolvedDiscussionIds: [] };
   const baseUpdate = { expectedHeadSha: headSha, baseBranch: "main" };
@@ -196,7 +216,7 @@ describe("Saved automatic review loops", () => {
   });
 
   it.each(["paused", "failed", "cleanup_failed", "stopped"] as const)("keeps a %s loop's disabled preference, review link, and merge latch", status => {
-    const saved = { ...worker, status, autoReview: { ...autoReview, enabled: false, phase: "merging", reviewWorkerId, mergeAttempted: true } };
+    const saved = { ...worker, status, changeNumber: 12, headSha, mergeAttempted: true, autoReview: { ...autoReview, enabled: false, phase: "merging", reviewWorkerId } };
     expect(parseWorkers([saved])).toEqual([saved]);
   });
 
@@ -263,7 +283,7 @@ describe("Saved automatic review loops", () => {
     autoReview: { ...autoReview, phase: "merging", reviewWorkerId, waitingSince: worker.startedAt }
   };
   it.each([{}, { mergeAttempted: true as const }])("round-trips a merge checkpoint before or after its single mutation attempt %#", checkpoint => {
-    const saved = { ...merging, autoReview: { ...merging.autoReview!, ...checkpoint } };
+    const saved = { ...merging, ...checkpoint };
     expect(parseWorkers([saved])).toEqual([saved]);
   });
 

@@ -42,8 +42,8 @@ function parseAutoReview(value: unknown, workerId: string): ForgeAutoReview {
   if (typeof input.enabled !== "boolean" || typeof input.phase !== "string" || !["implementing", "reviewing", "merging"].includes(input.phase))
     throw new Error("Invalid automatic review state.");
   const placement = object(input.placement);
-  if (input.mergeAttempted !== undefined && (input.mergeAttempted !== true || input.phase !== "merging"))
-    throw new Error("A saved merge attempt requires the merging phase.");
+  if (input.mergeAttempted !== undefined)
+    throw new Error("Saved merge attempts must belong to the issue worker, independently of automatic review. Reconcile the existing attempt before loading it.");
   return {
     enabled: input.enabled,
     phase: input.phase as ForgeAutoReview["phase"],
@@ -53,7 +53,6 @@ function parseAutoReview(value: unknown, workerId: string): ForgeAutoReview {
     },
     ...(input.reviewWorkerId !== undefined ? { reviewWorkerId: workerLink(input.reviewWorkerId, workerId) } : {}),
     ...(input.waitingSince !== undefined ? { waitingSince: isoTimestamp(input.waitingSince, "automatic review observation timestamp") } : {}),
-    ...(input.mergeAttempted === true ? { mergeAttempted: true as const } : {}),
   };
 }
 
@@ -335,6 +334,11 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
         Number(worker.changeNumber) < 1)
     )
       throw new Error("Invalid change request number.");
+    if (worker.mergeAttempted !== undefined && (
+      worker.mergeAttempted !== true || worker.kind !== "issue" || !worker.changeNumber ||
+      typeof worker.headSha !== "string" || ![40, 64].includes(worker.headSha.length) || /[^a-f0-9]/i.test(worker.headSha)
+    ))
+      throw new Error("A saved merge attempt requires an issue worker with a published request and commit.");
     const parsed = structuredClone(worker) as unknown as ForgeWorker;
     if (worker.draft !== undefined) parsed.draft = parseSavedReview(worker.draft);
     if (worker.autoReview !== undefined) {

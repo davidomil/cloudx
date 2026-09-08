@@ -371,7 +371,7 @@ export class ForgeWorkflowService {
       const worker = this.requireWorker(id);
       const parent = this.autoReviewParent(worker);
       const issue = parent ?? worker;
-      if (issue.autoReview?.mergeAttempted) {
+      if (issue.mergeAttempted) {
         if (await this.reconcileMergedChange(issue, { retryCleanupId: issue.id })) return structuredClone(issue);
         throw new Error("The previous merge must be reconciled with the provider before continuing. Forge will not repeat it.");
       }
@@ -521,18 +521,23 @@ export class ForgeWorkflowService {
   }
   async markReview(
     number: number,
+    headSha: string,
     event: "approve" | "request_changes",
     body: string,
   ): Promise<void> {
     return this.exclusive(async () => {
+      if (typeof headSha !== "string" || ![40, 64].includes(headSha.length) || /[^a-f0-9]/i.test(headSha))
+        throw new Error("A review decision requires a valid commit SHA.");
       const settings = this.deps.settings();
       this.requireConfirmedPublication(settings.repository, number);
       const provider = this.deps.provider(settings.repository, "reviewer");
       const change = await provider.getChangeRequest(number);
       if (change.state !== "open" || change.merged)
         throw new Error("Only open change requests can receive reviews.");
+      if (change.headSha !== headSha)
+        throw new Error("The request head changed. Review the latest details before submitting a decision.");
       await provider.postReview(number, {
-        headSha: change.headSha,
+        headSha,
         event,
         body,
         comments: [],
@@ -625,7 +630,7 @@ export class ForgeWorkflowService {
       throw new Error("This issue loop is not waiting to resume.");
     if (await this.reconcileMergedChange(worker, { retryCleanupId: worker.id })) return structuredClone(worker);
     const loop = worker.autoReview!;
-    if (loop.mergeAttempted)
+    if (worker.mergeAttempted)
       throw new Error("The previous merge must be reconciled with the provider before continuing. Forge will not repeat it.");
     const review = this.autoReviewer(worker);
     if (review?.draft && ["posting", "post_failed"].includes(review.draft.status))
@@ -709,7 +714,7 @@ export class ForgeWorkflowService {
     if (review && ["starting", "running"].includes(review.status)) return;
     if (review && review.status !== "completed")
       throw new Error(`The review worker needs attention. ${review.error ?? "Inspect and resume the issue loop explicitly."}`);
-    if (loop.mergeAttempted)
+    if (worker.mergeAttempted)
       throw new Error("The previous merge must be reconciled with the provider. Forge will not repeat it.");
     let context = await this.autoReviewContext(worker);
     if (!context) return;
@@ -788,27 +793,45 @@ export class ForgeWorkflowService {
       return;
     }
     if (!latest.change.reviewReady || !latest.change.approved || !latest.change.mergeable || latest.change.draft || latest.change.unresolvedDiscussions) return;
-    loop.mergeAttempted = true;
-    await this.persist();
     try {
-      if (signal?.aborted) throw new ForgeMergeNotStartedError(signal.reason);
-      await this.providerFor(worker).merge(worker.changeNumber!, worker.headSha!);
+      await this.mergePublishedIssue(worker, this.providerFor(worker));
     } catch (error) {
-      if (error instanceof ForgeMergeNotStartedError) {
-        loop.mergeAttempted = undefined;
-        await this.persist();
-        if (error.change) {
-          requirePublicationRequest(worker, error.change);
-          const change = error.change;
-          if (change.headSha === worker.headSha &&
-            (!change.reviewReady || !change.approved || !change.mergeable || change.draft || change.unresolvedDiscussions)) return;
-        }
+      if (error instanceof ForgeMergeNotStartedError && error.change) {
+        requirePublicationRequest(worker, error.change);
+        const change = error.change;
+        if (change.headSha === worker.headSha &&
+          (!change.reviewReady || !change.approved || !change.mergeable || change.draft || change.unresolvedDiscussions)) return;
       }
       throw error;
     }
     if (!(await this.reconcileMergedChange(worker, { signal })))
       await this.waitForIssueClosure(worker, "Merge succeeded. Waiting for the provider to confirm completion.");
     this.deps.notify("Issue merged", `${worker.title} has merged. Local workers are cleaned up once linked issues are closed.`);
+  }
+  private async mergePublishedIssue(worker: ForgeWorker, provider: ForgeProvider): Promise<void> {
+    if (worker.mergeAttempted)
+      throw new Error("The previous merge must be reconciled with the provider. Forge will not repeat it.");
+    if (!worker.changeNumber || !worker.headSha)
+      throw new Error("Merging requires a published issue request and commit.");
+    const signal = this.operations.get(worker.id)?.signal;
+    signal?.throwIfAborted();
+    worker.mergeAttempted = true;
+    try {
+      await this.persist();
+    } catch (error) {
+      worker.mergeAttempted = undefined;
+      throw error;
+    }
+    try {
+      if (signal?.aborted) throw new ForgeMergeNotStartedError(signal.reason);
+      await provider.merge(worker.changeNumber, worker.headSha);
+    } catch (error) {
+      if (error instanceof ForgeMergeNotStartedError) {
+        worker.mergeAttempted = undefined;
+        await this.persist();
+      }
+      throw error;
+    }
   }
   private async updateBranchForMerge(worker: ForgeWorker): Promise<void> {
     worker.pendingPublication = {
@@ -975,7 +998,7 @@ export class ForgeWorkflowService {
           })
       ) {
         await this.deps.runtime.verifyPublishedWorkspace(workspace, headSha);
-        await provider.merge(worker.changeNumber, headSha);
+        await this.mergePublishedIssue(worker, provider);
         if (!(await this.reconcileMergedChange(worker, { signal }))) {
           await this.waitForIssueClosure(worker, "Merge succeeded. Waiting for the provider to confirm completion.");
         }
@@ -995,7 +1018,6 @@ export class ForgeWorkflowService {
       worker.autoReview.phase = "reviewing";
       worker.autoReview.reviewWorkerId = undefined;
       worker.autoReview.waitingSince = undefined;
-      worker.autoReview.mergeAttempted = undefined;
       this.nextAutoReviewCheckAt.delete(worker.id);
     }
     await this.persist();
