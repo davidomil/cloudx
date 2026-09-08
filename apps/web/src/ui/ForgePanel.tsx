@@ -226,7 +226,7 @@ function ForgeItems({ kind, provider, request, revision, workers, placement, run
                 <ControlButton size="compact" disabled={reviewDisabled || !!activeWorker} onClick={() => void runAction(() => request("forge.review.start", { number: item.number, autoPost: false, ...placement }))}>Review</ControlButton>
                 <ControlButton size="compact" disabled={reviewDisabled || !!activeWorker} onClick={() => void runAction(() => request("forge.review.start", { number: item.number, autoPost: true, ...placement }))}>Review and post</ControlButton>
               </div>
-              {changeDetail ? <LinkedIssues issues={changeDetail.linkedIssues} /> : null}
+              {selectedWorkers.filter(worker => worker.kind === "issue").map(worker => <WorkerCard key={worker.id} worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} />)}
             </div>
             <div className="forge-review-decision">
               <label className="forge-field">Review message<textarea value={reviewBody} onChange={(event) => setReviewBody(event.target.value)} placeholder="Message for approval or requested changes" rows={2} /></label>
@@ -239,7 +239,7 @@ function ForgeItems({ kind, provider, request, revision, workers, placement, run
           </section> : null}
           {detailBusy ? <p role="status">Loading latest details…</p> : null}
           {detailError ? <p role="alert" className="forge-notice">{detailError}</p> : null}
-          {selectedWorkers.map((worker) => <WorkerCard key={worker.id} worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} canSubmitReview={kind === "issues" || !reviewDisabled} />)}
+          {selectedWorkers.filter(worker => worker.kind === (kind === "issues" ? "issue" : "review")).map((worker) => <WorkerCard key={worker.id} worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} canSubmitReview={kind === "issues" || !reviewDisabled} />)}
           <p className="forge-prose">{item.body}</p>
           {kind === "issues" ? <>
             <div className="forge-actions"><ControlButton tone="primary" size="compact" disabled={busy || !!activeWorker || item.state !== "open"} onClick={() => void runAction(() => request("forge.issue.start", { number: item.number, ...placement }))}><Play size={14} /> Start work</ControlButton></div>
@@ -249,21 +249,6 @@ function ForgeItems({ kind, provider, request, revision, workers, placement, run
         </> : <p className="forge-empty">Select {kind === "issues" ? "an issue" : `a ${singular}`}.</p>}
       </div>
     </div>
-  </div>;
-}
-
-function LinkedIssues({ issues }: { issues: ForgeChangeRequest["linkedIssues"] }) {
-  if (!issues.length) return null;
-  return <div className="forge-linked-issues" role="group" aria-label="Linked issues">
-    <span className="forge-muted">Linked issues</span>
-    {issues.map(issue => {
-      const reference = issue.number === undefined ? undefined : issue.projectPath ? `${issue.projectPath}#${issue.number}` : issue.projectId ? `Project ${issue.projectId} #${issue.number}` : `Issue #${issue.number}`;
-      const label = reference ? `${reference} · ${issue.title}` : issue.title;
-      return <span key={issue.id} className="forge-linked-issue">
-        {issue.url ? <a href={issue.url} target="_blank" rel="noreferrer">{label} <ExternalLink size={12} /></a> : <span>{label}</span>}
-        {issue.state !== "unknown" ? <span className="forge-muted">{issue.state}</span> : null}
-      </span>;
-    })}
   </div>;
 }
 

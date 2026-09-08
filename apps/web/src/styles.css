@@ -3556,10 +3556,7 @@ a:hover svg {
 .forge-change-actions { display: flex; flex-direction: column; gap: 8px; padding-bottom: 12px; margin-bottom: 12px; border-bottom: 1px solid var(--color-border); }
 .forge-change-actions > p, .forge-change-actions .forge-field { margin: 0; }
 .forge-change-toolbar { display: flex; flex-wrap: wrap; align-items: start; gap: 8px 12px; }
-.forge-linked-issues { display: flex; flex-wrap: wrap; align-items: baseline; flex: 1 1 280px; gap: 6px 12px; min-width: 0; font-size: var(--font-size-sm); }
-.forge-linked-issue { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 6px; min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
-.forge-linked-issue a { min-width: 0; overflow-wrap: anywhere; }
-.forge-linked-issue svg { vertical-align: middle; }
+.forge-change-toolbar > .forge-worker { flex: 1 1 320px; min-width: 0; margin: 0; }
 .forge-review-decision { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
 .forge-review-decision > .forge-field { flex: 1 1 260px; }
 .forge-panel a { color: var(--color-accent); }
