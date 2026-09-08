@@ -119,10 +119,7 @@ export class GitHubProvider implements ForgeProvider {
       unresolvedDiscussions: readiness.unresolved,
       comments: [
         ...discussion.map(githubComment),
-        ...inline.map((value) => ({
-          ...githubComment(value),
-          ...readiness.threads.get(string(record(value).node_id)),
-        })),
+        ...githubInlineComments(inline, readiness.threads),
         ...reviews.map(githubReviewComment),
       ],
       diff: string(diff.body),
@@ -489,6 +486,19 @@ function githubComment(value: unknown): ForgeComment {
     ...(comment.path === undefined ? {} : { path: string(comment.path) }),
     ...(comment.line == null ? {} : { line: integer(comment.line) }),
   };
+}
+
+function githubInlineComments(values: unknown[], threads: GitHubReadiness["threads"]): ForgeComment[] {
+  const comments = values.map(record);
+  const nodeIds = new Map(comments.map(comment => [integer(comment.id), string(comment.node_id)]));
+  return comments.map(comment => {
+    const rootId = integer(comment.in_reply_to_id === undefined ? comment.id : comment.in_reply_to_id);
+    const nodeId = nodeIds.get(rootId);
+    const thread = nodeId === undefined ? undefined : threads.get(nodeId);
+    if (!thread)
+      throw new ForgeProviderError("GitHub review comments changed while loading. Refresh before proceeding.", 409);
+    return { ...githubComment(comment), ...thread };
+  });
 }
 
 function githubReviewComment(value: unknown): ForgeComment {

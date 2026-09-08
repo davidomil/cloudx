@@ -573,6 +573,45 @@ describe("GitHub review and exact-commit merge", () => {
     });
   });
 
+  it.each([false, true])("associates paginated replies with their thread when resolved=%s", async (resolved) => {
+    const original = { ...hubComment, id: 3953479353 };
+    const other = { ...hubComment, id: 3953479354, node_id: "otherComment" };
+    const base = hubFixture({ threads: [
+      { isResolved: resolved },
+      { isResolved: !resolved, comments: { nodes: [{ id: other.node_id }] } },
+    ] });
+    const reply = { ...hubComment, id: 3953743741, node_id: "comment2", in_reply_to_id: original.id, body: "Fixed and tested." };
+    const otherReply = { ...reply, id: 3953743742, node_id: "otherReply", in_reply_to_id: other.id };
+    const { provider, calls } = harness(github, (url, options) => {
+      if (url.pathname.endsWith("/pulls/7/comments")) {
+        return url.searchParams.get("page") === "1"
+          ? response([reply, other], { link: '<https://api.github.com/next>; rel="next"' })
+          : response([original, otherReply]);
+      }
+      return base.fetcher(url, options);
+    });
+    const request = await provider.getChangeRequest(7);
+    expect(request.comments.slice(1, 5)).toMatchObject([
+      { id: String(reply.id), body: reply.body, discussionId: "thread1", resolved },
+      { id: String(other.id), discussionId: "thread2", resolved: !resolved },
+      { id: String(original.id), discussionId: "thread1", resolved },
+      { id: String(otherReply.id), discussionId: "thread2", resolved: !resolved },
+    ]);
+    expect(request.comments[0].discussionId).toBeUndefined();
+    expect(request.comments.at(-1)!.discussionId).toBeUndefined();
+    expect(request.unresolvedDiscussions).toBe(1);
+    expect(calls.filter(call => call.url.pathname.endsWith("/pulls/7/comments"))).toHaveLength(2);
+  });
+
+  it.each(["missing parent", "missing thread", "invalid parent"])("rejects incomplete GitHub reply evidence: %s", async (boundary) => {
+    const base = hubFixture({ threads: boundary === "missing thread" ? [] : [{ isResolved: false }] });
+    const reply = { ...hubComment, id: 2, node_id: "comment2", in_reply_to_id: boundary === "invalid parent" ? "1" : 1 };
+    const { provider } = harness(github, (url, options) => url.pathname.endsWith("/pulls/7/comments")
+      ? response(boundary === "missing parent" ? [reply] : [hubComment, reply])
+      : base.fetcher(url, options));
+    await expect(provider.getChangeRequest(7)).rejects.toThrow(boundary === "invalid parent" ? /invalid/i : /review comments changed while loading/i);
+  });
+
   it.each([
     { reviews: [{ ...hubReview, commit_id: previousSha }] },
     {
