@@ -1,5 +1,6 @@
 import type {
   ForgeChangeRequest,
+  ForgeChangeRequestStatus,
   ForgeChangeRequestSummary,
   ForgeCreateChangeRequest,
   ForgeIssue,
@@ -21,6 +22,7 @@ export interface ForgeProvider {
     query?: ForgeListQuery,
   ): Promise<ForgePage<ForgeChangeRequestSummary>>;
   getIssue(number: number): Promise<ForgeIssueDetail>;
+  getChangeRequestStatus(number: number): Promise<ForgeChangeRequestStatus>;
   getChangeRequest(number: number): Promise<ForgeChangeRequest>;
   findChangeRequestByBranch(
     headBranch: string,

@@ -6,6 +6,7 @@ import {
 } from "./ForgeWorkflowService.js";
 
 function fixture() {
+  const issue = { number: 1, title: "Fix issue", body: "Task", state: "open", comments: [] };
   const change: ForgeChangeRequest = {
     number: 7,
     title: "Fix issue",
@@ -23,6 +24,7 @@ function fixture() {
     mergeable: true,
     approved: false,
     unresolvedDiscussions: 0,
+    linkedIssues: [],
     comments: [],
     diff: "diff",
   };
@@ -32,24 +34,24 @@ function fixture() {
     findChangeRequestByBranch: vi.fn(
       async () => undefined as typeof change | undefined,
     ),
-    getIssue: vi.fn(async () => ({
-      number: 1,
-      title: "Fix issue",
-      body: "Task",
-      state: "open",
-      comments: [],
-    })),
+    getIssue: vi.fn(async () => ({ ...issue })),
+    getChangeRequestStatus: vi.fn(async () => ({ ...change })),
     getChangeRequest: vi.fn(async () => ({ ...change })),
     createChangeRequest: vi.fn(async () => change),
     postReview: vi.fn(async () => {}),
     replyToDiscussion: vi.fn(async (_number: number, _discussionId: string, _body: string, _headSha: string) => {}),
     resolveDiscussion: vi.fn(async () => {}),
-    merge: vi.fn(async () => ({ merged: true, sha: "b".repeat(40) })),
+    merge: vi.fn(async () => {
+      change.merged = true;
+      change.state = "merged";
+      issue.state = "closed";
+      return { merged: true, sha: "b".repeat(40) };
+    }),
   };
   let stored: ForgeWorker[] = [];
   const runtime = {
     isActive: vi.fn(() => true),
-    recover: vi.fn(async () => ({
+    recover: vi.fn(async (_id: string) => ({
       workspace: undefined as
         | {
             id: string;
@@ -114,6 +116,7 @@ function fixture() {
     runtime,
     reports,
     change,
+    issue,
     stored: () => stored,
   };
 }
@@ -168,7 +171,7 @@ describe("Forge issue and review workflows", () => {
     await f.service.poll();
     expect(f.provider.merge).toHaveBeenCalledWith(7, f.change.headSha);
     expect(f.runtime.cleanup).toHaveBeenCalled();
-    expect((await f.service.dashboard()).workers[0]?.status).toBe("completed");
+    expect((await f.service.dashboard()).workers).toEqual([]);
   });
   it("reads current issue and review comments on resume without merging an unapproved request", async () => {
     const f = fixture();
@@ -510,11 +513,11 @@ describe("Forge publication and feedback reconciliation", () => {
     expect(f.stored()[0]).toMatchObject({ status: "cleanup_failed", headSha: "a".repeat(40), pendingPublication: { headSha: publishedHead } });
     f.change.headSha = publishedHead;
     f.change.merged = true;
+    f.issue.state = "closed";
     f.change.state = "closed";
     const completed = await f.service.resume(worker.id, placement);
     expect(completed).toMatchObject({ status: "completed", headSha: publishedHead });
     expect(completed.pendingPublication).toBeUndefined();
-    expect(f.runtime.verifyPublishedWorkspace).toHaveBeenLastCalledWith(expect.objectContaining({ id: worker.id }), publishedHead);
     expect(f.runtime.cleanup).toHaveBeenLastCalledWith(expect.objectContaining({ expectedHeadSha: publishedHead }));
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
     expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
@@ -816,6 +819,7 @@ describe("Forge ownership recovery", () => {
     });
     await f.service.poll();
     f.change.merged = true;
+    f.issue.state = "closed";
     f.runtime.cleanup.mockRejectedValue(
       new Error("Local changes do not match the merged head"),
     );
@@ -834,4 +838,284 @@ describe("Forge ownership recovery", () => {
     expect(f.runtime.cleanup).toHaveBeenCalledTimes(2);
     expect(f.runtime.cleanup).toHaveBeenLastCalledWith(expect.objectContaining({ expectedHeadSha: f.change.headSha }));
   });
+});
+
+
+describe("Forge merged request cleanup", () => {
+  async function publishedIssue(f: ReturnType<typeof fixture>) {
+    const worker = await f.service.startIssue(1, placement);
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Ready" });
+    await f.service.poll();
+    f.reports.read.mockReset();
+    return worker;
+  }
+  function mergeAndClose(f: ReturnType<typeof fixture>) {
+    f.change.merged = true;
+    f.change.state = "merged";
+    f.issue.state = "closed";
+  }
+  const completionTimes = new WeakMap<ReturnType<typeof fixture>, number>();
+  async function nextCompletionCheck(f: ReturnType<typeof fixture>) {
+    const next = Math.max(Date.now(), completionTimes.get(f) ?? 0) + 30_001;
+    completionTimes.set(f, next);
+    const now = vi.spyOn(Date, "now").mockReturnValue(next);
+    try { await f.service.poll(); } finally { now.mockRestore(); }
+  }
+
+  it("removes associated coding, draft and running review workers before reading their reports", async () => {
+    const f = fixture();
+    const coding = await publishedIssue(f);
+    const draft = await f.service.startReview(7, false, placement);
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, body: "Review", event: "comment", comments: [] });
+    await f.service.poll();
+    const reviewing = await f.service.startReview(7, true, placement);
+    f.reports.read.mockClear();
+    mergeAndClose(f);
+    await nextCompletionCheck(f);
+    expect((await f.service.dashboard()).workers).toEqual([]);
+    expect(f.stored()).toEqual([]);
+    expect(f.runtime.cleanup).toHaveBeenCalledWith(expect.objectContaining({ id: coding.id, expectedHeadSha: f.change.headSha }));
+    expect(f.runtime.recover.mock.calls.map(([id]) => id)).toEqual(expect.arrayContaining([coding.id, draft.id, reviewing.id]));
+    expect(f.reports.remove).toHaveBeenCalledWith(reviewing.attemptId);
+    expect(f.reports.read).not.toHaveBeenCalled();
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("pauses merged work until its issue is closed, including explicit Resume", async () => {
+    const f = fixture();
+    const coding = await publishedIssue(f);
+    await f.service.resume(coding.id, placement);
+    f.change.merged = true;
+    await nextCompletionCheck(f);
+    expect((await f.service.dashboard()).workers[0]).toMatchObject({ status: "paused", error: expect.stringMatching(/issues.*close/i) });
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    const resumed = await f.service.resume(coding.id, placement);
+    expect(resumed.status).toBe("paused");
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    f.issue.state = "closed";
+    await nextCompletionCheck(f);
+    expect((await f.service.dashboard()).workers).toEqual([]);
+  });
+
+  it.each(["open", "unknown"] as const)("retains resources when a linked issue has %s state", async state => {
+    const f = fixture();
+    const worker = await f.service.startReview(7, true, placement);
+    mergeAndClose(f);
+    f.change.linkedIssues = [{ id: "other:2", number: 2, title: "Related issue", state }];
+    await f.service.poll();
+    expect((await f.service.dashboard()).workers[0]).toMatchObject({ id: worker.id, status: "paused", worktreePath: "/repo/work" });
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.reports.remove).not.toHaveBeenCalled();
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+  });
+
+  it("retires a merged review request with no linked issues", async () => {
+    const f = fixture();
+    await f.service.startReview(7, false, placement);
+    f.change.merged = true;
+    await f.service.poll();
+    expect((await f.service.dashboard()).workers).toEqual([]);
+    expect(f.provider.getIssue).not.toHaveBeenCalled();
+  });
+
+  it("retains a closed request that was never merged", async () => {
+    const f = fixture();
+    await publishedIssue(f);
+    f.change.state = "closed";
+    f.issue.state = "closed";
+    await nextCompletionCheck(f);
+    expect((await f.service.dashboard()).workers[0]?.status).toBe("awaiting_review");
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+  });
+
+  it.each(["provider", "apiUrl", "projectPath"] as const)("keeps requests with the same number but another repository %s independent", async key => {
+    const f = fixture();
+    const original = f.deps.settings();
+    const first = await f.service.startReview(7, false, placement);
+    f.deps.settings = () => ({ ...original, repository: { ...original.repository, [key]: key === "provider" ? "gitlab" : "other" } });
+    const second = await f.service.startReview(7, false, placement);
+    const otherProvider = { ...f.provider, getChangeRequestStatus: vi.fn(async () => ({ ...f.change, merged: false })) };
+    f.deps.provider = repository => (repository[key] === original.repository[key] ? f.provider : otherProvider) as unknown as ReturnType<ForgeWorkflowDependencies["provider"]>;
+    mergeAndClose(f);
+    await f.service.poll();
+    expect((await f.service.dashboard()).workers.map(worker => worker.id)).toEqual([second.id]);
+    expect(f.runtime.cleanup).toHaveBeenCalledWith(expect.objectContaining({ id: first.id }));
+    expect(f.runtime.cleanup).not.toHaveBeenCalledWith(expect.objectContaining({ id: second.id }));
+  });
+
+  it("preserves a failed checkout and report, never retries automatically, and recovers only on Resume", async () => {
+    const f = fixture();
+    const coding = await publishedIssue(f);
+    const running = await f.service.resume(coding.id, placement);
+    mergeAndClose(f);
+    f.runtime.cleanup.mockRejectedValue(new Error("New local work does not match the merged head"));
+    f.reports.remove.mockClear();
+    await nextCompletionCheck(f);
+    expect((await f.service.dashboard()).workers[0]).toMatchObject({ status: "cleanup_failed", attemptId: running.attemptId, worktreePath: "/repo/work", error: expect.stringContaining("New local work") });
+    expect(f.reports.remove).not.toHaveBeenCalled();
+    await nextCompletionCheck(f);
+    expect(f.runtime.cleanup).toHaveBeenCalledOnce();
+    f.runtime.cleanup.mockResolvedValue(undefined);
+    const completed = await f.service.resume(coding.id, placement);
+    expect(completed).toMatchObject({ status: "completed", worktreePath: undefined, attemptId: undefined });
+    expect((await f.service.dashboard()).workers).toEqual([]);
+    expect(f.runtime.cleanup).toHaveBeenCalledTimes(2);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.reports.remove).toHaveBeenCalledWith(running.attemptId);
+  });
+
+  it("cleans other associated runners when one checkout cannot be removed", async () => {
+    const f = fixture();
+    const coding = await publishedIssue(f);
+    const review = await f.service.startReview(7, true, placement);
+    f.runtime.cleanup.mockRejectedValueOnce(new Error("Coding checkout changed"));
+    mergeAndClose(f);
+    await nextCompletionCheck(f);
+    expect((await f.service.dashboard()).workers).toMatchObject([{ id: coding.id, status: "cleanup_failed" }]);
+    expect(f.runtime.cleanup).toHaveBeenLastCalledWith(expect.objectContaining({ id: review.id }));
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+  });
+
+  it("keeps a recoverable record when persisting its removal fails", async () => {
+    const f = fixture();
+    const coding = await publishedIssue(f);
+    const write = f.deps.store.write;
+    const persist = vi.spyOn(f.deps.store, "write").mockImplementationOnce(async workers => {
+      if (!workers.length) throw new Error("State storage unavailable");
+      await write(workers);
+    });
+    mergeAndClose(f);
+    await nextCompletionCheck(f);
+    expect((await f.service.dashboard()).workers[0]).toMatchObject({ id: coding.id, status: "cleanup_failed", error: "State storage unavailable" });
+    expect(f.stored()[0]?.id).toBe(coding.id);
+    persist.mockRestore();
+    await f.service.resume(coding.id, placement);
+    expect((await f.service.dashboard()).workers).toEqual([]);
+  });
+
+  it("keeps running work intact when completion status cannot be read", async () => {
+    const f = fixture();
+    await f.service.startReview(7, false, placement);
+    f.provider.getChangeRequestStatus.mockRejectedValue(new Error("Provider unavailable"));
+    await f.service.poll();
+    expect((await f.service.dashboard()).workers[0]?.status).toBe("running");
+    expect(f.runtime.close).not.toHaveBeenCalled();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.deps.notify).toHaveBeenCalledWith("Forge completion check failed", expect.stringContaining("Provider unavailable"));
+  });
+
+  it("waits for issue closure after a merge performed by Forge", async () => {
+    const f = fixture();
+    const coding = await publishedIssue(f);
+    f.change.approved = true;
+    f.provider.merge.mockImplementationOnce(async () => { f.change.merged = true; return { merged: true, sha: "b".repeat(40) }; });
+    await f.service.resume(coding.id, placement);
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Ready" });
+    await f.service.poll();
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect((await f.service.dashboard()).workers[0]?.status).toBe("paused");
+    f.issue.state = "closed";
+    await nextCompletionCheck(f);
+    expect((await f.service.dashboard()).workers).toEqual([]);
+  });
+
+  it("does not publish a retained report or draft after the request has merged", async () => {
+    const f = fixture();
+    const coding = await publishedIssue(f);
+    await f.service.resume(coding.id, placement);
+    f.runtime.publishBranch.mockRejectedValueOnce(new Error("Push unavailable"));
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Ready" });
+    await f.service.poll();
+    expect((await f.service.dashboard()).workers[0]?.pendingPublication).toBeDefined();
+    mergeAndClose(f);
+    const pushes = f.runtime.publishBranch.mock.calls.length;
+    await f.service.resume(coding.id, placement);
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(pushes);
+    expect((await f.service.dashboard()).workers).toEqual([]);
+  });
+
+  it.each(["merged", "closed"] as const)("does not restart a reviewer when the request becomes %s during Resume", async state => {
+    const f = fixture();
+    const worker = await f.service.startReview(7, false, placement);
+    await f.service.pause(worker.id);
+    f.provider.getChangeRequest.mockImplementation(async () => ({ ...f.change, state, merged: state === "merged" }));
+    const result = await f.service.resume(worker.id, placement);
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledOnce();
+    if (state === "merged") {
+      expect(result.status).toBe("completed");
+      expect((await f.service.dashboard()).workers).toEqual([]);
+    } else expect(result).toMatchObject({ status: "failed", error: expect.stringMatching(/closed without merging/) });
+  });
+
+  it("requires explicit recovery when stopping a merged runner fails while an issue remains open", async () => {
+    const f = fixture();
+    const worker = await f.service.startReview(7, true, placement);
+    f.change.merged = true;
+    f.change.linkedIssues = [{ id: "open-issue", title: "Not closed", state: "open" }];
+    f.runtime.close.mockRejectedValue(new Error("Worker tab ownership changed"));
+    await f.service.poll();
+    expect((await f.service.dashboard()).workers[0]).toMatchObject({ status: "cleanup_failed", attemptId: worker.attemptId });
+    await nextCompletionCheck(f);
+    await f.service.resume(worker.id, placement);
+    expect(f.runtime.close).toHaveBeenCalledOnce();
+    expect((await f.service.dashboard()).workers[0]?.status).toBe("cleanup_failed");
+    expect(f.reports.remove).not.toHaveBeenCalled();
+  });
+
+  it.each(["headBranch", "baseBranch"] as const)("preserves resources when the merged %s differs from the coding checkout", async branch => {
+    const f = fixture();
+    await publishedIssue(f);
+    mergeAndClose(f);
+    f.change[branch] = "other-branch";
+    await nextCompletionCheck(f);
+    expect((await f.service.dashboard()).workers[0]).toMatchObject({ status: "cleanup_failed", worktreePath: "/repo/work", error: expect.stringMatching(/branches/) });
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+  });
+
+  it("throttles background provider reads independently of report polling", async () => {
+    const f = fixture();
+    await f.service.startReview(7, false, placement);
+    await f.service.poll();
+    await f.service.poll();
+    expect(f.provider.getChangeRequestStatus).toHaveBeenCalledOnce();
+    expect(f.reports.read).toHaveBeenCalledTimes(2);
+    await nextCompletionCheck(f);
+    expect(f.provider.getChangeRequestStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancels an in-flight completion read before shutdown waits for the workflow queue", async () => {
+    const f = fixture();
+    await publishedIssue(f);
+    let readStarted!: () => void;
+    const waiting = new Promise<void>(resolve => { readStarted = resolve; });
+    f.deps.provider = (_repository, _role, signal) => ({
+      ...f.provider,
+      getChangeRequestStatus: () => new Promise((_resolve, reject) => {
+        signal!.addEventListener("abort", () => reject(signal!.reason), { once: true });
+        readStarted();
+      }),
+    }) as unknown as ReturnType<ForgeWorkflowDependencies["provider"]>;
+    const poll = nextCompletionCheck(f);
+    await waiting;
+    await f.service.dispose();
+    await poll;
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.deps.notify).not.toHaveBeenCalledWith("Forge completion check failed", expect.anything());
+  });
+
+  it.each(["merged", "closed"] as const)("rejects manual and saved reviews on a %s request", async state => {
+    const f = fixture();
+    const worker = await f.service.startReview(7, false, placement);
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, body: "Review", event: "comment", comments: [] });
+    await f.service.poll();
+    f.change.state = state;
+    f.change.merged = state === "merged";
+    await expect(f.service.submitReview(worker.id)).rejects.toThrow("Only open change requests");
+    await expect(f.service.markReview(7, "approve", "Reviewed")).rejects.toThrow("Only open change requests");
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+  });
+
 });

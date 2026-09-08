@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type {
   CodexReasoningEffort,
   ForgeChangeRequest,
+  ForgeChangeRequestStatus,
   ForgeCredentialRole,
   ForgeDashboard,
   ForgePlacement,
@@ -117,6 +118,8 @@ export class ForgeWorkflowService {
   private queue: Promise<unknown> = Promise.resolve();
   private timer?: ReturnType<typeof setTimeout>;
   private disposed = false;
+  private nextCompletionCheckAt = 0;
+  private readonly completionChecks = new AbortController();
   private readonly operations = new Map<string, AbortController>();
   constructor(private readonly deps: ForgeWorkflowDependencies) {}
 
@@ -142,6 +145,7 @@ export class ForgeWorkflowService {
   async dispose(): Promise<void> {
     this.disposed = true;
     clearTimeout(this.timer);
+    this.completionChecks.abort(new Error("CloudX is shutting down."));
     for (const controller of this.operations.values())
       controller.abort(new Error("CloudX is shutting down."));
     await this.exclusive(async () => {
@@ -214,7 +218,7 @@ export class ForgeWorkflowService {
           ? await provider.getIssue(number)
           : await provider.getChangeRequest(number);
       if (this.disposed) throw new Error("Forge Workers is shutting down.");
-      if (item.state !== "open")
+      if (item.state !== "open" || ("merged" in item && item.merged))
         throw new Error("Only open issues and change requests can start work.");
       const now = new Date().toISOString();
       const worker: ForgeWorker = {
@@ -312,12 +316,11 @@ export class ForgeWorkflowService {
       )
         throw new Error("This worker is not waiting to resume.");
       const recoveringResources = worker.status === "cleanup_failed";
+      if (await this.reconcileMergedChange(worker, { retryCleanupId: worker.id }))
+        return structuredClone(worker);
       if (recoveringResources) {
         await this.recoverResources(worker);
-        const mergedIssue = worker.kind === "issue" && worker.changeNumber
-          ? (await this.providerFor(worker).getChangeRequest(worker.changeNumber)).merged
-          : false;
-        if (worker.kind === "review" || (mergedIssue && !worker.pendingPublication)) {
+        if (worker.kind === "review") {
           await this.cleanup(worker);
           worker.status = "completed";
           await this.persist();
@@ -366,12 +369,9 @@ export class ForgeWorkflowService {
         const change = worker.changeNumber
           ? await provider.getChangeRequest(worker.changeNumber)
           : undefined;
-        if (worker.kind === "issue" && change) {
+        if (change) {
           if (change.merged) {
-            await this.quiesce(worker);
-            await this.cleanup(worker);
-            worker.status = "completed";
-            await this.persist();
+            await this.reconcileMergedChange(worker, { change, retryCleanupId: worker.id });
             return structuredClone(worker);
           }
           if (change.state !== "open")
@@ -437,6 +437,8 @@ export class ForgeWorkflowService {
     const settings = this.deps.settings();
     const provider = this.deps.provider(settings.repository, "reviewer");
     const change = await provider.getChangeRequest(number);
+    if (change.state !== "open" || change.merged)
+      throw new Error("Only open change requests can receive reviews.");
     await provider.postReview(number, {
       headSha: change.headSha,
       event,
@@ -446,9 +448,13 @@ export class ForgeWorkflowService {
   }
   poll(): Promise<void> {
     return this.exclusive(async () => {
+      if (this.disposed) return;
+      await this.reconcileCompletedWorkers();
       for (const worker of this.workers.filter(
         (w) => w.status === "running" && w.attemptId,
       )) {
+        if (this.disposed) return;
+        if (!this.workers.includes(worker) || worker.status !== "running") continue;
         let retainReport = false;
         try {
           const raw = await this.deps.reports.read(worker.attemptId!);
@@ -512,6 +518,7 @@ export class ForgeWorkflowService {
     };
     const provider = this.providerFor(worker);
     if (!worker.changeNumber) await this.reconcilePublication(worker, provider);
+    if (await this.reconcileMergedChange(worker)) return;
     if (!publication.headSha) {
       publication.headSha = await this.deps.runtime.publishBranch(
         workspace,
@@ -542,6 +549,10 @@ export class ForgeWorkflowService {
       await this.persist();
     }
     const change = await provider.getChangeRequest(worker.changeNumber);
+    if (change.merged) {
+      await this.reconcileMergedChange(worker, { change });
+      return;
+    }
     if (change.headBranch !== worker.branch || change.baseBranch !== worker.baseBranch)
       throw new Error("The change request no longer matches this worker's branches.");
     if (change.headSha !== headSha)
@@ -549,14 +560,6 @@ export class ForgeWorkflowService {
         `Published commit ${headSha} does not match change request #${worker.changeNumber} head ${change.headSha}. Resume to recheck publication without rerunning the worker.`,
       );
     await this.deps.runtime.verifyPublishedWorkspace(workspace, headSha);
-    if (change.merged) {
-      worker.headSha = headSha;
-      await this.cleanup(worker);
-      worker.status = "completed";
-      worker.error = undefined;
-      await this.persist();
-      return;
-    }
     if (change.state !== "open")
       throw new Error("The change request is closed without merging. Reopen it before resuming.");
     const currentIssue = await provider.getIssue(worker.number);
@@ -584,13 +587,14 @@ export class ForgeWorkflowService {
       ) {
         await this.deps.runtime.verifyPublishedWorkspace(workspace, headSha);
         await provider.merge(worker.changeNumber, headSha);
-        await this.cleanup(worker);
-        worker.status = "completed";
-        worker.error = undefined;
-        await this.persist();
+        if (!(await this.reconcileMergedChange(worker))) {
+          await this.waitForIssueClosure(worker, "Merge succeeded. Waiting for the provider to confirm completion.");
+        }
         this.deps.notify(
           "Issue merged",
-          `${worker.title} has merged and its local resources were removed.`,
+          this.workers.includes(worker)
+            ? `${worker.title} has merged. ${worker.error ?? "Local cleanup is pending."}`
+            : `${worker.title} has merged and its local resources were removed.`,
         );
         return;
       }
@@ -716,6 +720,95 @@ export class ForgeWorkflowService {
     worker.updatedAt = new Date().toISOString();
     await this.persist();
   }
+  private async reconcileCompletedWorkers(): Promise<void> {
+    if (Date.now() < this.nextCompletionCheckAt) return;
+    this.nextCompletionCheckAt = Date.now() + 30_000;
+    const checked = new Set<string>();
+    for (const worker of [...this.workers]) {
+      if (this.disposed) return;
+      const number = changeNumber(worker);
+      if (!number || worker.status === "cleanup_failed" || !this.workers.includes(worker)) continue;
+      const key = JSON.stringify([worker.repository.provider, worker.repository.apiUrl, worker.repository.projectPath, number]);
+      if (checked.has(key)) continue;
+      checked.add(key);
+      try {
+        await this.reconcileMergedChange(worker);
+      } catch (error) {
+        if (!this.disposed)
+          this.deps.notify("Forge completion check failed", `${worker.title}: ${message(error)}`);
+      }
+    }
+  }
+  private async reconcileMergedChange(
+    worker: ForgeWorker,
+    { change, retryCleanupId }: { change?: ForgeChangeRequestStatus; retryCleanupId?: string } = {},
+  ): Promise<boolean> {
+    const number = changeNumber(worker);
+    if (!number) return false;
+    const provider = this.deps.provider(worker.repository, worker.kind === "issue" ? "worker" : "reviewer", this.completionChecks.signal);
+    change ??= await provider.getChangeRequestStatus(number);
+    if (!change.merged) return false;
+    if (change.number !== number) throw new Error("Completion status does not match this change request.");
+    const associated = this.workers.filter(candidate =>
+      sameRepository(candidate.repository, worker.repository) && changeNumber(candidate) === number,
+    );
+    let issuesClosed = change.linkedIssues.every(issue => issue.state === "closed");
+    for (const issueNumber of new Set(associated.filter(candidate => candidate.kind === "issue").map(candidate => candidate.number))) {
+      const issue = await provider.getIssue(issueNumber);
+      if (issue.number !== issueNumber) throw new Error("Completion status does not match this issue.");
+      if (issue.state !== "closed") issuesClosed = false;
+    }
+    this.completionChecks.signal.throwIfAborted();
+    for (const candidate of associated) {
+      this.completionChecks.signal.throwIfAborted();
+      if (candidate.status === "cleanup_failed" && candidate.id !== retryCleanupId) continue;
+      if (issuesClosed) await this.retireMergedWorker(candidate, change);
+      else if (candidate.status !== "cleanup_failed" &&
+          (["starting", "running"].includes(candidate.status) || candidate.id === retryCleanupId))
+        await this.waitForIssueClosure(candidate, "Change request merged. Waiting for linked issues to close before cleanup.");
+    }
+    return true;
+  }
+  private async waitForIssueClosure(worker: ForgeWorker, reason: string): Promise<void> {
+    try {
+      await this.quiesce(worker, { retainReport: true });
+      worker.status = "paused";
+      worker.error = reason;
+      await this.persist();
+    } catch (error) {
+      await this.cleanupFailed(worker, error);
+    }
+  }
+  private async retireMergedWorker(worker: ForgeWorker, change: ForgeChangeRequestStatus): Promise<void> {
+    try {
+      await this.recoverResources(worker);
+      await this.quiesce(worker, { retainReport: true });
+      if (worker.kind === "issue" && worker.worktreePath &&
+          (worker.branch !== change.headBranch || worker.baseBranch !== change.baseBranch))
+        throw new Error("The merged request no longer matches this worker's branches. Inspect the checkout before cleanup.");
+      await this.cleanup(worker, change.headSha);
+      worker.status = "completed";
+      worker.error = undefined;
+      if (worker.kind === "issue") worker.headSha = change.headSha;
+      const index = this.workers.indexOf(worker);
+      this.workers.splice(index, 1);
+      try {
+        await this.persist();
+      } catch (error) {
+        this.workers.splice(index, 0, worker);
+        throw error;
+      }
+      this.operations.delete(worker.id);
+    } catch (error) {
+      await this.cleanupFailed(worker, error);
+    }
+  }
+  private async cleanupFailed(worker: ForgeWorker, error: unknown): Promise<void> {
+    worker.status = "cleanup_failed";
+    worker.error = message(error);
+    await this.persist();
+    this.deps.notify("Forge worker cleanup needs attention", `${worker.title}: ${worker.error}`);
+  }
   private async recoverResources(worker: ForgeWorker): Promise<void> {
     const recovered = await this.deps.runtime.recover(worker.id);
     if (recovered.workspace) Object.assign(worker, recovered.workspace);
@@ -734,9 +827,9 @@ export class ForgeWorkflowService {
       worker.attemptId = undefined;
     }
   }
-  private async cleanup(worker: ForgeWorker): Promise<void> {
+  private async cleanup(worker: ForgeWorker, expectedHeadSha = worker.headSha): Promise<void> {
     try {
-      await this.quiesce(worker);
+      await this.quiesce(worker, { retainReport: true });
       if (worker.worktreePath) {
         if (!worker.repositoryPath) throw new Error("Worker checkout ownership is missing.");
         await this.deps.runtime.cleanup({
@@ -744,9 +837,10 @@ export class ForgeWorkflowService {
           repositoryPath: worker.repositoryPath,
           worktreePath: worker.worktreePath,
           branch: worker.branch ?? "",
-          expectedHeadSha: worker.kind === "issue" ? worker.headSha : undefined,
+          expectedHeadSha: worker.kind === "issue" ? expectedHeadSha : undefined,
         });
       }
+      await this.quiesce(worker);
       worker.worktreePath = undefined;
       worker.branch = undefined;
       worker.pendingPublication = undefined;
@@ -763,6 +857,8 @@ export class ForgeWorkflowService {
       );
     const provider = this.providerFor(worker, "reviewer");
     const change = await provider.getChangeRequest(worker.changeNumber);
+    if (change.state !== "open" || change.merged)
+      throw new Error("Only open change requests can receive reviews.");
     if (change.headSha !== draft.headSha)
       throw new Error(
         "The request head changed. Run a new review before posting.",
@@ -781,12 +877,14 @@ export class ForgeWorkflowService {
   }
   private async fail(worker: ForgeWorker, error: unknown, { retainReport = false }: { retainReport?: boolean } = {}): Promise<void> {
     const wasCleanupFailure = worker.status === "cleanup_failed";
-    try {
-      await this.recoverResources(worker);
-      await this.quiesce(worker, { retainReport });
-      if (worker.kind === "review") await this.cleanup(worker);
-    } catch {
-      worker.status = "cleanup_failed";
+    if (!wasCleanupFailure) {
+      try {
+        await this.recoverResources(worker);
+        await this.quiesce(worker, { retainReport });
+        if (worker.kind === "review") await this.cleanup(worker);
+      } catch {
+        worker.status = "cleanup_failed";
+      }
     }
     if (!wasCleanupFailure && worker.status !== "cleanup_failed")
       worker.status = "failed";
@@ -870,6 +968,9 @@ function sameRepository(a: ForgeRepository, b: ForgeRepository): boolean {
     a.apiUrl === b.apiUrl &&
     a.projectPath === b.projectPath
   );
+}
+function changeNumber(worker: ForgeWorker): number | undefined {
+  return worker.kind === "review" ? worker.number : worker.changeNumber;
 }
 function message(error: unknown): string {
   return error instanceof Error ? error.message : "Forge operation failed.";

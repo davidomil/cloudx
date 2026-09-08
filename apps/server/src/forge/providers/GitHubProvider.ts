@@ -1,10 +1,12 @@
 import type {
   ForgeChangeRequest,
+  ForgeChangeRequestStatus,
   ForgeChangeRequestSummary,
   ForgeComment,
   ForgeCreateChangeRequest,
   ForgeIssue,
   ForgeIssueDetail,
+  ForgeLinkedIssue,
   ForgeListQuery,
   ForgeMergeResult,
   ForgePage,
@@ -89,7 +91,12 @@ export class GitHubProvider implements ForgeProvider {
     const raw = record(response.body);
     const head = record(raw.head);
     const headSha = string(head.sha);
-    const readiness = await this.readiness(number, headSha);
+    const [status, readiness] = await Promise.all([
+      this.getChangeRequestStatus(number),
+      this.readiness(number, headSha),
+    ]);
+    if (status.headSha !== headSha || status.headBranch !== string(head.ref) || status.baseBranch !== string(record(raw.base).ref))
+      throw new ForgeProviderError("The request changed while loading. Refresh before proceeding.", 409);
     const latestReviews = new Map<string, Record<string, unknown>>();
     for (const value of reviews) {
       const review = record(value);
@@ -107,11 +114,8 @@ export class GitHubProvider implements ForgeProvider {
         readiness.reviewDecision === "APPROVED");
     return {
       ...githubIssue(raw),
+      ...status,
       draft: boolean(raw.draft),
-      headSha,
-      headBranch: string(head.ref),
-      baseBranch: string(record(raw.base).ref),
-      merged: boolean(raw.merged),
       mergeable:
         readiness.mergeable === "MERGEABLE" &&
         readiness.mergeStateStatus === "CLEAN",
@@ -124,6 +128,49 @@ export class GitHubProvider implements ForgeProvider {
       ],
       diff: string(diff.body),
     };
+  }
+
+  async getChangeRequestStatus(number: number): Promise<ForgeChangeRequestStatus> {
+    issueNumber(number);
+    const [owner, name] = this.http.repository.projectPath.split("/");
+    const linkedIssues: ForgeLinkedIssue[] = [];
+    const issueIds = new Set<string>();
+    const cursors = new Set<string>();
+    let cursor: string | null = null;
+    let status: Omit<ForgeChangeRequestStatus, "linkedIssues"> | undefined;
+    for (let page = 0; page < 20; page++) {
+      const response = record((await this.http.request("/graphql", {
+        method: "POST",
+        graphql: true,
+        body: {
+          query: "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){number state merged headRefOid headRefName baseRefName closingIssuesReferences(first:100,after:$cursor){nodes{id number title url state repository{nameWithOwner}} pageInfo{hasNextPage endCursor}}}}}",
+          variables: { owner, name, number, cursor },
+        },
+      })).body);
+      if (response.errors !== undefined)
+        throw new ForgeProviderError("GitHub could not verify the request status and linked issues.", 502);
+      const request = record(record(record(response.data).repository).pullRequest);
+      const current = githubStatus(request, number);
+      if (status && (current.state !== status.state || current.headSha !== status.headSha || current.headBranch !== status.headBranch || current.baseBranch !== status.baseBranch))
+        throw new ForgeProviderError("The request changed while loading. Refresh before proceeding.", 409);
+      status = current;
+      const connection = record(request.closingIssuesReferences);
+      const nodes = list(connection.nodes);
+      if (nodes.length > 100) return invalid();
+      for (const value of nodes) {
+        const issue = githubLinkedIssue(value);
+        if (issueIds.has(issue.id)) return invalid();
+        issueIds.add(issue.id);
+        linkedIssues.push(issue);
+      }
+      const pageInfo = record(connection.pageInfo);
+      if (!boolean(pageInfo.hasNextPage)) return { ...status, linkedIssues };
+      const next = string(pageInfo.endCursor);
+      if (!next || cursors.has(next)) return invalid();
+      cursors.add(next);
+      cursor = next;
+    }
+    throw new ForgeProviderError("This pull request exceeds 2,000 linked issues.", 422);
   }
 
   async createChangeRequest(
@@ -445,6 +492,34 @@ export class GitHubProvider implements ForgeProvider {
       422,
     );
   }
+}
+
+function githubStatus(request: Record<string, unknown>, expectedNumber: number): Omit<ForgeChangeRequestStatus, "linkedIssues"> {
+  const number = integer(request.number);
+  const state = string(request.state);
+  const merged = boolean(request.merged);
+  const headSha = string(request.headRefOid);
+  const headBranch = string(request.headRefName);
+  const baseBranch = string(request.baseRefName);
+  if (number !== expectedNumber || !["OPEN", "CLOSED", "MERGED"].includes(state) || merged !== (state === "MERGED") || !/^[a-fA-F0-9]{40,64}$/.test(headSha) || !headBranch || !baseBranch)
+    return invalid();
+  return { number, state: state.toLowerCase() as ForgeChangeRequestStatus["state"], merged, headSha, headBranch, baseBranch };
+}
+
+function githubLinkedIssue(value: unknown): ForgeLinkedIssue {
+  const issue = record(value);
+  const id = string(issue.id);
+  const state = string(issue.state);
+  const projectPath = string(record(issue.repository).nameWithOwner);
+  if (!id || !["OPEN", "CLOSED"].includes(state) || !/^[^/\s]+\/[^/\s]+$/.test(projectPath)) return invalid();
+  return {
+    id,
+    number: issueNumber(integer(issue.number)),
+    title: string(issue.title),
+    url: webUrl(issue.url),
+    state: state === "OPEN" ? "open" : "closed",
+    projectPath,
+  };
 }
 
 function githubAuthor(value: unknown): string {

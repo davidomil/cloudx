@@ -172,6 +172,8 @@ function ForgeItems({ kind, provider, request, revision, workers, placement, run
   const selectedWorkers = workersForItem(workers, kind, selectedNumber);
   const activeWorker = selectedWorkers.find((worker) => worker.kind === (kind === "issues" ? "issue" : "review") && worker.status !== "completed");
   const currentDetail = detail?.number === selectedNumber ? detail : undefined;
+  const changeDetail = kind === "changes" && currentDetail && isChangeRequest(currentDetail) ? currentDetail : undefined;
+  const reviewDisabled = busy || !changeDetail || changeDetail.state !== "open" || changeDetail.merged;
   const item = currentDetail ?? selected;
   const applyScope = (scope?: ForgeListScope) => {
     if (!scope) setFilterText(defaultFilter);
@@ -217,30 +219,51 @@ function ForgeItems({ kind, provider, request, revision, workers, placement, run
         {item ? <>
           <div className="forge-detail-heading"><h3>#{item.number} {item.title}</h3><a href={item.url} target="_blank" rel="noreferrer" aria-label={`Open ${singular} #${item.number}`}><ExternalLink size={16} /></a></div>
           <p className="forge-muted">{item.state} · {item.author}</p>
+          {kind === "changes" ? <section className="forge-change-actions" aria-label={`${singular} review actions`}>
+            {changeDetail ? <p className="forge-muted">{changeDetail.merged ? "Merged" : changeDetail.draft ? "Draft" : changeDetail.approved ? "Approved" : "Awaiting approval"} · {changeDetail.unresolvedDiscussions} unresolved discussions</p> : null}
+            <div className="forge-change-toolbar">
+              <div className="forge-actions">
+                <ControlButton size="compact" disabled={reviewDisabled || !!activeWorker} onClick={() => void runAction(() => request("forge.review.start", { number: item.number, autoPost: false, ...placement }))}>Review</ControlButton>
+                <ControlButton size="compact" disabled={reviewDisabled || !!activeWorker} onClick={() => void runAction(() => request("forge.review.start", { number: item.number, autoPost: true, ...placement }))}>Review and post</ControlButton>
+              </div>
+              {changeDetail ? <LinkedIssues issues={changeDetail.linkedIssues} /> : null}
+            </div>
+            <div className="forge-review-decision">
+              <label className="forge-field">Review message<textarea value={reviewBody} onChange={(event) => setReviewBody(event.target.value)} placeholder="Message for approval or requested changes" rows={2} /></label>
+              <div className="forge-actions">
+                <ControlButton size="compact" disabled={reviewDisabled || !reviewBody.trim()} onClick={() => void runAction(() => request("forge.change.review", { number: item.number, event: "request_changes", body: reviewBody }))}>Mark as request changes</ControlButton>
+                <ControlButton size="compact" disabled={reviewDisabled} onClick={() => void runAction(() => request("forge.change.review", { number: item.number, event: "approve", body: reviewBody }))}><Check size={14} /> Mark as approved</ControlButton>
+              </div>
+            </div>
+            <p className="forge-muted">Reviews are submitted using the configured reviewer identity. A message is required when requesting changes.</p>
+          </section> : null}
           {detailBusy ? <p role="status">Loading latest details…</p> : null}
           {detailError ? <p role="alert" className="forge-notice">{detailError}</p> : null}
-          {selectedWorkers.map((worker) => <WorkerCard key={worker.id} worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} />)}
+          {selectedWorkers.map((worker) => <WorkerCard key={worker.id} worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} canSubmitReview={kind === "issues" || !reviewDisabled} />)}
           <p className="forge-prose">{item.body}</p>
           {kind === "issues" ? <>
             <div className="forge-actions"><ControlButton tone="primary" size="compact" disabled={busy || !!activeWorker || item.state !== "open"} onClick={() => void runAction(() => request("forge.issue.start", { number: item.number, ...placement }))}><Play size={14} /> Start work</ControlButton></div>
             <p className="forge-muted">The worker opens a PR/MR and waits for review. Resume after review to address comments, merge when approved, and clean up.</p>
-          </> : <>
-            {currentDetail && isChangeRequest(currentDetail) ? <p className="forge-muted">{currentDetail.draft ? "Draft" : currentDetail.approved ? "Approved" : "Awaiting approval"} · {currentDetail.unresolvedDiscussions} unresolved discussions{currentDetail.merged ? " · Merged" : ""}</p> : null}
-            <div className="forge-actions">
-              <ControlButton size="compact" disabled={busy || !!activeWorker || item.state !== "open"} onClick={() => void runAction(() => request("forge.review.start", { number: item.number, autoPost: false, ...placement }))}>Review</ControlButton>
-              <ControlButton size="compact" disabled={busy || !!activeWorker || item.state !== "open"} onClick={() => void runAction(() => request("forge.review.start", { number: item.number, autoPost: true, ...placement }))}>Review and post</ControlButton>
-            </div>
-            <label className="forge-field">Review message<textarea value={reviewBody} onChange={(event) => setReviewBody(event.target.value)} placeholder="Message for approval or requested changes" rows={2} /></label>
-            <div className="forge-actions">
-              <ControlButton size="compact" disabled={busy || item.state !== "open" || !reviewBody.trim()} onClick={() => void runAction(() => request("forge.change.review", { number: item.number, event: "request_changes", body: reviewBody }))}>Mark as request changes</ControlButton>
-              <ControlButton size="compact" disabled={busy || item.state !== "open"} onClick={() => void runAction(() => request("forge.change.review", { number: item.number, event: "approve", body: reviewBody }))}><Check size={14} /> Mark as approved</ControlButton>
-            </div>
-            <p className="forge-muted">Reviews are submitted using the configured reviewer identity. A message is required when requesting changes.</p>
-          </>}
+          </> : null}
           <ForgeComments comments={currentDetail?.comments ?? []} />
         </> : <p className="forge-empty">Select {kind === "issues" ? "an issue" : `a ${singular}`}.</p>}
       </div>
     </div>
+  </div>;
+}
+
+function LinkedIssues({ issues }: { issues: ForgeChangeRequest["linkedIssues"] }) {
+  if (!issues.length) return null;
+  return <div className="forge-linked-issues" role="group" aria-label="Linked issues">
+    <span className="forge-muted">Linked issues</span>
+    {issues.map(issue => {
+      const reference = issue.number === undefined ? undefined : issue.projectPath ? `${issue.projectPath}#${issue.number}` : issue.projectId ? `Project ${issue.projectId} #${issue.number}` : `Issue #${issue.number}`;
+      const label = reference ? `${reference} · ${issue.title}` : issue.title;
+      return <span key={issue.id} className="forge-linked-issue">
+        {issue.url ? <a href={issue.url} target="_blank" rel="noreferrer">{label} <ExternalLink size={12} /></a> : <span>{label}</span>}
+        {issue.state !== "unknown" ? <span className="forge-muted">{issue.state}</span> : null}
+      </span>;
+    })}
   </div>;
 }
 
@@ -265,13 +288,14 @@ function ItemWorkerStats({ workers }: { workers: ForgeWorker[] }) {
   </span>;
 }
 
-function WorkerCard({ worker, request, placement, runAction, busy, onViewWorker }: {
+function WorkerCard({ worker, request, placement, runAction, busy, onViewWorker, canSubmitReview = true }: {
   worker: ForgeWorker;
   request: Request;
   placement: ForgePlacement;
   runAction: RunAction;
   busy: boolean;
   onViewWorker?: (workerId: string) => void;
+  canSubmitReview?: boolean;
 }) {
   const [controlling, setControlling] = useState(false);
   const controlRunning = useRef(false);
@@ -296,16 +320,17 @@ function WorkerCard({ worker, request, placement, runAction, busy, onViewWorker 
       {onViewWorker ? <ControlButton size="compact" onClick={() => onViewWorker(worker.id)}><Terminal size={14} /> View worker</ControlButton> : null}
       {worker.changeUrl ? <a href={worker.changeUrl} target="_blank" rel="noreferrer">Open PR/MR <ExternalLink size={12} /></a> : null}
     </div>
-    {worker.draft ? <ReviewEditor key={`${worker.id}:${worker.draft.headSha}`} worker={worker} draft={worker.draft} request={request} runAction={runAction} busy={busy} /> : null}
+    {worker.draft ? <ReviewEditor key={`${worker.id}:${worker.draft.headSha}`} worker={worker} draft={worker.draft} request={request} runAction={runAction} busy={busy} canSubmitReview={canSubmitReview} /> : null}
   </article>;
 }
 
-function ReviewEditor({ worker, draft, request, runAction, busy }: {
+function ReviewEditor({ worker, draft, request, runAction, busy, canSubmitReview }: {
   worker: ForgeWorker;
   draft: ForgeReviewDraft;
   request: Request;
   runAction: RunAction;
   busy: boolean;
+  canSubmitReview: boolean;
 }) {
   const [edit, setEdit] = useState<ReviewEdit>(() => ({ body: draft.body, event: draft.event, comments: draft.comments.map((comment) => ({ ...comment })) }));
   const [saved, setSaved] = useState(false);
@@ -339,7 +364,7 @@ function ReviewEditor({ worker, draft, request, runAction, busy }: {
       <div className="forge-actions">
         <ControlButton size="compact" disabled={edit.comments.length >= 100} onClick={() => updateEdit({ ...edit, comments: [...edit.comments, { body: "" }] })}>Add comment</ControlButton>
         <ControlButton size="compact" disabled={!valid} onClick={() => void saveReview(false)}>Save draft</ControlButton>
-        <ControlButton tone="primary" size="compact" disabled={!valid} onClick={() => void saveReview(true)}>Submit review</ControlButton>
+        <ControlButton tone="primary" size="compact" disabled={!valid || !canSubmitReview} onClick={() => void saveReview(true)}>Submit review</ControlButton>
       </div>
     </fieldset>
     {!valid && !locked ? <p className="forge-muted">Add a summary or comment, fill every comment body, and provide a positive whole line number for each file comment. Requested changes need a summary.</p> : null}

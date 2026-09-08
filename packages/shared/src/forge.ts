@@ -51,11 +51,27 @@ export interface ForgeChangeRequestSummary extends ForgeIssue {
   draft: boolean;
 }
 
-export interface ForgeChangeRequest extends ForgeChangeRequestSummary {
+export interface ForgeLinkedIssue {
+  id: string;
+  number?: number;
+  title: string;
+  url?: string;
+  state: "open" | "closed" | "unknown";
+  projectPath?: string;
+  projectId?: number;
+}
+
+export interface ForgeChangeRequestStatus {
+  number: number;
+  state: ForgeIssue["state"];
   headSha: string;
   headBranch: string;
   baseBranch: string;
   merged: boolean;
+  linkedIssues: ForgeLinkedIssue[];
+}
+
+export interface ForgeChangeRequest extends ForgeChangeRequestSummary, ForgeChangeRequestStatus {
   mergeable: boolean;
   approved: boolean;
   unresolvedDiscussions: number;

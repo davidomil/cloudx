@@ -1,10 +1,12 @@
 import type {
   ForgeChangeRequest,
+  ForgeChangeRequestStatus,
   ForgeChangeRequestSummary,
   ForgeComment,
   ForgeCreateChangeRequest,
   ForgeIssue,
   ForgeIssueDetail,
+  ForgeLinkedIssue,
   ForgeListQuery,
   ForgeMergeResult,
   ForgePage,
@@ -112,13 +114,14 @@ export class GitLabProvider implements ForgeProvider {
 
   async getChangeRequest(number: number): Promise<ForgeChangeRequest> {
     const path = this.requestPath(number);
-    const [response, approvalsResponse, discussions, diffs, versionsResponse] =
+    const [response, approvalsResponse, discussions, diffs, versionsResponse, linkedIssues] =
       await Promise.all([
         this.http.request(path),
         this.http.request(`${path}/approvals`),
         this.http.all(`${path}/discussions`),
         this.http.all(`${path}/diffs`),
         this.http.request(`${path}/versions?per_page=1&page=1`),
+        this.linkedIssues(number),
       ]);
     const request = record(response.body);
     const headSha = string(request.sha);
@@ -187,16 +190,43 @@ export class GitLabProvider implements ForgeProvider {
       );
     return {
       ...gitlabRequestSummary(current),
-      headSha,
-      headBranch: string(current.source_branch),
-      baseBranch: string(current.target_branch),
-      merged: current.state === "merged",
+      ...gitlabStatus(current, number),
+      linkedIssues,
       mergeable: string(current.detailed_merge_status) === "mergeable",
       approved,
       unresolvedDiscussions,
       comments,
       diff,
     };
+  }
+
+  async getChangeRequestStatus(number: number): Promise<ForgeChangeRequestStatus> {
+    const [response, linkedIssues] = await Promise.all([
+      this.http.request(this.requestPath(number)),
+      this.linkedIssues(number),
+    ]);
+    return { ...gitlabStatus(record(response.body), number), linkedIssues };
+  }
+
+  private async linkedIssues(number: number): Promise<ForgeLinkedIssue[]> {
+    const linkedIssues: ForgeLinkedIssue[] = [];
+    const ids = new Set<string>();
+    const path = `${this.requestPath(number)}/closes_issues`;
+    for (let page = 1; page <= 20; page++) {
+      const response = await this.http.request(`${path}?per_page=100&page=${page}`);
+      const items = list(response.body);
+      if (items.length > 100) return invalid();
+      for (const value of items) {
+        const issue = gitlabLinkedIssue(value);
+        if (ids.has(issue.id)) return invalid();
+        ids.add(issue.id);
+        linkedIssues.push(issue);
+      }
+      if (!hasNextPage(response.headers)) return linkedIssues;
+      const nextPage = response.headers.get("x-next-page");
+      if (nextPage && nextPage !== String(page + 1)) return invalid();
+    }
+    throw new ForgeProviderError("This merge request exceeds 2,000 linked issues.", 422);
   }
 
   async createChangeRequest(
@@ -499,6 +529,35 @@ export class GitLabProvider implements ForgeProvider {
     const offset = (page - 1) * perPage;
     return { items: items.slice(offset, offset + perPage), ...(offset + perPage < items.length ? { nextPage: page + 1 } : {}) };
   }
+}
+
+function gitlabStatus(request: Record<string, unknown>, expectedNumber: number): Omit<ForgeChangeRequestStatus, "linkedIssues"> {
+  const number = integer(request.iid);
+  const state = string(request.state);
+  const headSha = string(request.sha);
+  const headBranch = string(request.source_branch);
+  const baseBranch = string(request.target_branch);
+  if (number !== expectedNumber || !["opened", "closed", "merged"].includes(state) || !/^[a-fA-F0-9]{40,64}$/.test(headSha) || !headBranch || !baseBranch) return invalid();
+  return { number, state: state === "opened" ? "open" : state as "closed" | "merged", merged: state === "merged", headSha, headBranch, baseBranch };
+}
+
+function gitlabLinkedIssue(value: unknown): ForgeLinkedIssue {
+  const issue = record(value);
+  if (issue.iid === undefined && issue.state === undefined && issue.project_id === undefined && issue.web_url === undefined) {
+    const id = typeof issue.id === "string" ? issue.id : String(integer(issue.id));
+    if (!id) return invalid();
+    return { id: `external:${id}`, title: string(issue.title), state: "unknown" };
+  }
+  const state = string(issue.state);
+  if (!["opened", "closed"].includes(state)) return invalid();
+  return {
+    id: String(issueNumber(integer(issue.id))),
+    number: issueNumber(integer(issue.iid)),
+    title: string(issue.title),
+    url: webUrl(issue.web_url),
+    state: state === "opened" ? "open" : "closed",
+    projectId: issueNumber(integer(issue.project_id)),
+  };
 }
 
 function gitlabIssue(value: unknown): ForgeIssue {

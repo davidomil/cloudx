@@ -45,6 +45,26 @@ const hubRequest = {
   head: { sha: headSha, ref: "fix-race" },
   base: { ref: "main" },
 };
+const hubStatus = {
+  number: 7,
+  state: "OPEN",
+  merged: false,
+  headRefOid: headSha,
+  headRefName: "fix-race",
+  baseRefName: "main",
+  closingIssuesReferences: {
+    nodes: [],
+    pageInfo: { hasNextPage: false, endCursor: null },
+  },
+};
+const hubLinkedIssue = {
+  id: "I_linked",
+  number: 42,
+  title: "Linked issue",
+  url: "https://github.com/other/project/issues/42",
+  state: "CLOSED",
+  repository: { nameWithOwner: "other/project" },
+};
 const hubComment = {
   id: 1,
   node_id: "comment1",
@@ -75,6 +95,14 @@ const labRequest = {
     start_sha: previousSha,
     head_sha: headSha,
   },
+};
+const labLinkedIssue = {
+  id: 4294967296,
+  iid: 42,
+  title: "Linked issue",
+  web_url: "https://gitlab.example/other/project/-/issues/42",
+  state: "closed",
+  project_id: 12,
 };
 const labNote = {
   id: 1,
@@ -137,7 +165,9 @@ function hubFixture(
         data: {
           repository: {
             pullRequest: {
-              headRefOid: headSha,
+              ...hubStatus,
+              state: overrides.request?.merged === true ? "MERGED" : overrides.request?.state === "closed" ? "CLOSED" : "OPEN",
+              merged: overrides.request?.merged ?? false,
               reviewDecision: "APPROVED",
               mergeable: "MERGEABLE",
               mergeStateStatus: "CLEAN",
@@ -193,6 +223,7 @@ function labFixture(
         ],
         ...overrides.approvals,
       });
+    if (path.endsWith("/closes_issues")) return response([]);
     if (path.endsWith("/discussions"))
       return response([{ id: "thread1", notes: overrides.notes ?? [labNote] }]);
     if (path.endsWith("/diffs"))
@@ -557,6 +588,167 @@ describe("Forge quick list scopes", () => {
     await provider.listIssues({ scope: "created_by_workers", page: 2 });
     expect(calls).toHaveLength(1);
     expect(calls[0].url.searchParams.get("page")).toBe("2");
+  });
+});
+
+describe("change request lifecycle and linked closing issues", () => {
+  function githubStatusResponse(overrides: Record<string, unknown> = {}) {
+    return response({ data: { repository: { pullRequest: { ...hubStatus, ...overrides } } } });
+  }
+
+  it("reads merged GitHub status and every linked issue without diff, reviews or a live source branch", async () => {
+    const { provider, calls } = harness(github, (url, options) => {
+      expect(url.pathname).toBe("/graphql");
+      const { query, variables } = JSON.parse(String(options.body));
+      expect(query).toContain("closingIssuesReferences(first:100,after:$cursor)");
+      expect(query).not.toMatch(/reviewThreads|reviewDecision|mergeStateStatus|\bdiff\b/);
+      return githubStatusResponse({
+        state: "MERGED", merged: true, headRef: null,
+        closingIssuesReferences: {
+          nodes: [{ ...hubLinkedIssue, ...(variables.cursor ? { id: "I_second", number: 43, state: "OPEN" } : {}) }],
+          pageInfo: { hasNextPage: !variables.cursor, endCursor: variables.cursor ? null : "second" },
+        },
+      });
+    });
+    expect(await provider.getChangeRequestStatus(7)).toEqual({
+      number: 7, state: "merged", merged: true, headSha, headBranch: "fix-race", baseBranch: "main",
+      linkedIssues: [
+        { id: "I_linked", number: 42, title: "Linked issue", url: hubLinkedIssue.url, state: "closed", projectPath: "other/project" },
+        { id: "I_second", number: 43, title: "Linked issue", url: hubLinkedIssue.url, state: "open", projectPath: "other/project" },
+      ],
+    });
+    expect(calls).toHaveLength(2);
+  });
+
+  it("reads GitLab native and external closing links without loading approval or diff evidence", async () => {
+    const { provider, calls } = harness(gitlab, url => {
+      if (url.pathname.endsWith("/closes_issues")) {
+        expect(url.searchParams.get("per_page")).toBe("100");
+        return url.searchParams.get("page") === "1"
+          ? response([labLinkedIssue], { "x-next-page": "2", link: '<https://attacker.example/>; rel="next"' })
+          : response([{ id: "EXT-42", title: "External issue" }, { ...labLinkedIssue, id: 55, iid: 43, state: "opened" }]);
+      }
+      expect(url.pathname).toBe("/api/v4/projects/group%2Fsubgroup%2Frepo/merge_requests/7");
+      return response({ iid: 7, state: "merged", sha: headSha, source_branch: "deleted-branch", target_branch: "main", source_project_id: null });
+    });
+    expect(await provider.getChangeRequestStatus(7)).toEqual({
+      number: 7, state: "merged", merged: true, headSha, headBranch: "deleted-branch", baseBranch: "main",
+      linkedIssues: [
+        { id: "4294967296", number: 42, title: "Linked issue", url: labLinkedIssue.web_url, state: "closed", projectId: 12 },
+        { id: "external:EXT-42", title: "External issue", state: "unknown" },
+        { id: "55", number: 43, title: "Linked issue", url: labLinkedIssue.web_url, state: "open", projectId: 12 },
+      ],
+    });
+    expect(calls).toHaveLength(3);
+    expect(calls.every(call => call.url.origin === "https://gitlab.example" && call.options.method === "GET")).toBe(true);
+  });
+
+  it.each([github, gitlab])("includes the same linked issue evidence in $provider full details", async repository => {
+    const base = repository.provider === "github" ? hubFixture({ graphql: {
+      closingIssuesReferences: { nodes: [hubLinkedIssue], pageInfo: { hasNextPage: false, endCursor: null } },
+    } }) : labFixture();
+    const { provider } = harness(repository, (url, options) => url.pathname.endsWith("/closes_issues") ? response([labLinkedIssue]) : base.fetcher(url, options));
+    expect((await provider.getChangeRequest(7)).linkedIssues).toEqual((await provider.getChangeRequestStatus(7)).linkedIssues);
+  });
+
+  it("preserves documented numeric external tracker IDs with unknown closure state", async () => {
+    const { provider } = harness(gitlab, url => response(url.pathname.endsWith("/closes_issues") ? [{ id: 123, title: "External issue" }] : labRequest));
+    expect((await provider.getChangeRequestStatus(7)).linkedIssues).toEqual([{ id: "external:123", title: "External issue", state: "unknown" }]);
+  });
+
+  it.each([github, gitlab])("keeps closed-unmerged $provider requests distinct from merges", async repository => {
+    const { provider } = harness(repository, url => repository.provider === "github"
+      ? githubStatusResponse({ state: "CLOSED", merged: false })
+      : response(url.pathname.endsWith("/closes_issues") ? [] : { ...labRequest, state: "closed" }));
+    expect(await provider.getChangeRequestStatus(7)).toMatchObject({ state: "closed", merged: false, linkedIssues: [] });
+  });
+
+  it.each([
+    { number: 8 }, { state: "UNKNOWN" }, { state: "MERGED", merged: false }, { state: "OPEN", merged: true },
+    { headRefOid: "" }, { headRefName: "" }, { baseRefName: null },
+    { closingIssuesReferences: { nodes: [null], pageInfo: { hasNextPage: false } } },
+    ...[{ state: "UNKNOWN" }, { number: 0 }, { id: "" }, { url: "javascript:alert(1)" }, { repository: null }].map(issue => ({
+      closingIssuesReferences: { nodes: [{ ...hubLinkedIssue, ...issue }], pageInfo: { hasNextPage: false, endCursor: null } },
+    })),
+  ])("rejects incomplete GitHub lifecycle evidence %j", async overrides => {
+    const { provider } = harness(github, () => githubStatusResponse(overrides));
+    await expect(provider.getChangeRequestStatus(7)).rejects.toThrow();
+  });
+
+  it.each([
+    { state: "unknown" }, { iid: 0 }, { project_id: null }, { web_url: undefined }, { id: "not-native" },
+  ])("rejects malformed native GitLab links rather than treating them as external %j", async overrides => {
+    const { provider } = harness(gitlab, url => response(url.pathname.endsWith("/closes_issues") ? [{ ...labLinkedIssue, ...overrides }] : labRequest));
+    await expect(provider.getChangeRequestStatus(7)).rejects.toThrow();
+  });
+
+  it.each([{ iid: 8 }, { state: "locked" }, { sha: null }, { target_branch: "" }])("rejects incomplete GitLab lifecycle evidence %j", async overrides => {
+    const { provider } = harness(gitlab, url => response(url.pathname.endsWith("/closes_issues") ? [] : { ...labRequest, ...overrides }));
+    await expect(provider.getChangeRequestStatus(7)).rejects.toThrow();
+  });
+
+  it.each(["changed head", "changed state", "duplicate issue", "repeated cursor"])("rejects inconsistent GitHub pagination: %s", async boundary => {
+    const { provider, calls } = harness(github, (_url, options) => {
+      const { cursor } = JSON.parse(String(options.body)).variables;
+      return githubStatusResponse({
+        ...(cursor && boundary === "changed head" ? { headRefOid: previousSha } : {}),
+        ...(cursor && boundary === "changed state" ? { state: "MERGED", merged: true } : {}),
+        closingIssuesReferences: {
+          nodes: [{ ...hubLinkedIssue, id: boundary === "duplicate issue" ? "same" : cursor ?? "first" }],
+          pageInfo: { hasNextPage: !cursor || boundary === "repeated cursor", endCursor: "next" },
+        },
+      });
+    });
+    await expect(provider.getChangeRequestStatus(7)).rejects.toThrow();
+    expect(calls).toHaveLength(2);
+  });
+
+  it.each([github, gitlab])("refuses duplicate $provider linked issue evidence", async repository => {
+    const { provider } = harness(repository, url => repository.provider === "github"
+      ? githubStatusResponse({ closingIssuesReferences: { nodes: [hubLinkedIssue, hubLinkedIssue], pageInfo: { hasNextPage: false } } })
+      : response(url.pathname.endsWith("/closes_issues") ? [labLinkedIssue, labLinkedIssue] : labRequest));
+    await expect(provider.getChangeRequestStatus(7)).rejects.toThrow();
+  });
+
+  it.each([github, gitlab])("rejects oversized $provider linked issue pages", async repository => {
+    const { provider } = harness(repository, url => repository.provider === "github"
+      ? githubStatusResponse({ closingIssuesReferences: { nodes: Array.from({ length: 101 }, (_, index) => ({ ...hubLinkedIssue, id: String(index) })), pageInfo: { hasNextPage: false } } })
+      : response(url.pathname.endsWith("/closes_issues") ? Array.from({ length: 101 }, (_, index) => ({ ...labLinkedIssue, id: index + 1 })) : labRequest));
+    await expect(provider.getChangeRequestStatus(7)).rejects.toThrow(/invalid/);
+  });
+
+  it("rejects GitLab pagination that skips linked issue pages", async () => {
+    const { provider } = harness(gitlab, url => response(url.pathname.endsWith("/closes_issues") ? [] : labRequest, url.pathname.endsWith("/closes_issues") ? { "x-next-page": "5" } : {}));
+    await expect(provider.getChangeRequestStatus(7)).rejects.toThrow(/invalid/);
+  });
+
+  it.each([github, gitlab])("rejects invalid $provider request numbers before reading credentials or making a request", async repository => {
+    const { provider, credentials, calls } = harness(repository, () => response({}));
+    const headers = vi.spyOn(credentials, "headers");
+    await expect(provider.getChangeRequestStatus(0)).rejects.toThrow(/positive integer/);
+    expect(headers).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
+  });
+
+  it.each([github, gitlab])("bounds $provider linked issue pagination instead of returning partial closure evidence", async repository => {
+    let page = 0;
+    const { provider, calls } = harness(repository, url => {
+      if (repository.provider === "gitlab") return response(url.pathname.endsWith("/closes_issues") ? [] : labRequest, url.pathname.endsWith("/closes_issues") ? { "x-next-page": String(++page + 1) } : {});
+      return githubStatusResponse({ closingIssuesReferences: { nodes: [], pageInfo: { hasNextPage: true, endCursor: String(++page) } } });
+    });
+    await expect(provider.getChangeRequestStatus(7)).rejects.toThrow(/2,000/);
+    expect(calls.length).toBeLessThanOrEqual(21);
+  });
+
+  it.each([github, gitlab])("does not retry failed $provider lifecycle reads or infer closure from errors", async repository => {
+    const { provider, calls } = harness(repository, () => new Response(null, { status: 403 }));
+    await expect(provider.getChangeRequestStatus(7)).rejects.toThrow(/403/);
+    expect(calls.length).toBeLessThanOrEqual(2);
+  });
+
+  it("rejects GitHub GraphQL errors even when partial closing-issue data is present", async () => {
+    const { provider } = harness(github, async () => response({ errors: [{ message: "forbidden" }], ...await githubStatusResponse().json() }));
+    await expect(provider.getChangeRequestStatus(7)).rejects.toThrow();
   });
 });
 

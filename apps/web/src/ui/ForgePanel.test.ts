@@ -39,7 +39,7 @@ afterEach(async () => {
 
 const repository = { provider: "github" as const, apiUrl: "https://api.github.com", projectPath: "cloudx/example" };
 const issue: ForgeIssueDetail = { number: 7, title: "Fix deployment", body: "The deployment fails.", url: "https://github.com/cloudx/example/issues/7", state: "open", author: "ari", labels: ["bug"], updatedAt: "2026-09-07", comments: [{ id: "note-1", author: "nia", body: "Reproduced in staging." }] };
-const change: ForgeChangeRequest = { ...issue, number: 12, title: "Repair deployment", url: "https://github.com/cloudx/example/pull/12", draft: false, headSha: "abcdef", headBranch: "fix/deploy", baseBranch: "main", merged: false, mergeable: true, approved: false, unresolvedDiscussions: 1, diff: "", comments: [{ id: "note-2", author: "nia", body: "Needs a timeout.", path: "deploy.ts", line: 8, resolved: false }] };
+const change: ForgeChangeRequest = { ...issue, number: 12, title: "Repair deployment", url: "https://github.com/cloudx/example/pull/12", draft: false, headSha: "abcdef", headBranch: "fix/deploy", baseBranch: "main", merged: false, mergeable: true, approved: false, unresolvedDiscussions: 1, diff: "", linkedIssues: [], comments: [{ id: "note-2", author: "nia", body: "Needs a timeout.", path: "deploy.ts", line: 8, resolved: false }] };
 const worker: ForgeWorker = { id: "work-1", kind: "issue", number: 7, title: issue.title, repository, repositoryPath: "/repo", baseBranch: "main", templateId: "worker-template", status: "running", tabId: "codex-worker", autoPost: false, startedAt: "2026-09-07", updatedAt: "2026-09-07" };
 const reviewWorker: ForgeWorker = { ...worker, id: "review-1", kind: "review", number: 12, title: change.title, status: "completed", draft: { headSha: "abcdef", body: "Add a timeout.", event: "request_changes", comments: [{ path: "deploy.ts", line: 8, side: "RIGHT", body: "This can wait forever." }], status: "draft" } };
 const tab: WorkspaceTab = { id: "forge-tab", pluginId: "forge", title: "Forge", cwd: "/repo", status: "idle", indicator: { color: "green", label: "Ready", updatedAt: "2026-09-07" }, createdAt: "2026-09-07", updatedAt: "2026-09-07" };
@@ -254,16 +254,16 @@ describe("ForgePanel", () => {
     expect(testFixture.calls.find((call) => call.hook === "forge.issue.start")?.input.number).toBe(8);
   });
 
-  it("distinguishes review, automatic posting, approval, and requested changes", async () => {
-    const testFixture = fixture();
+  it.each(["github", "gitlab"] as const)("distinguishes %s review, automatic posting, approval, and requested changes", async provider => {
+    const testFixture = fixture({ repository: { ...repository, provider } });
     const panel = await renderPanel(testFixture);
-    await click(panel, "Pull requests");
+    await click(panel, provider === "github" ? "Pull requests" : "Merge requests");
     expect(panel.textContent).toContain("Needs a timeout.");
     await click(panel, "Review");
     await click(panel, "Review and post");
     await click(panel, "Mark as approved");
     expect(button(panel, "Mark as request changes").disabled).toBe(true);
-    await fill(panel.querySelector(".forge-detail > .forge-field textarea")!, "Please add a timeout.");
+    await fill(panel.querySelector(".forge-change-actions .forge-field textarea")!, "Please add a timeout.");
     await click(panel, "Mark as request changes");
     expect(testFixture.calls.filter((call) => call.hook === "forge.review.start").map((call) => call.input)).toEqual([
       { number: 12, autoPost: false, windowId: "window-1", paneId: "pane-2" },
@@ -273,6 +273,112 @@ describe("ForgePanel", () => {
       { number: 12, event: "approve", body: "" },
       { number: 12, event: "request_changes", body: "Please add a timeout." }
     ]);
+  });
+
+  it.each(["github", "gitlab"] as const)("puts %s review actions before linked workers and a long description without losing draft edits", async provider => {
+    const currentRepository = { ...repository, provider };
+    const coding = { ...worker, repository: currentRepository, changeNumber: change.number, status: "awaiting_review" as const };
+    const reviewer = { ...reviewWorker, repository: currentRepository };
+    const testFixture = fixture({ repository: currentRepository, workers: [coding, reviewer] }, hook => hook === "forge.change.get" ? { change: { ...change, body: "Long change description.\n".repeat(100) } } : undefined);
+    const panel = await renderPanel(testFixture, { workerTabs: [workerTab] });
+    await click(panel, provider === "github" ? "Pull requests" : "Merge requests");
+    const actions = panel.querySelector(".forge-change-actions")!;
+    const cards = panel.querySelectorAll(".forge-detail .forge-worker");
+    const body = panel.querySelector(".forge-detail > .forge-prose")!;
+    for (const label of ["Review", "Review and post", "Mark as approved", "Mark as request changes"]) expect(button(actions, label)).toBeDefined();
+    expect(button(actions, "Review").disabled).toBe(false);
+    expect(actions.compareDocumentPosition(body) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    for (const card of cards) expect(actions.compareDocumentPosition(card) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    const message = actions.querySelector<HTMLTextAreaElement>("textarea")!;
+    const draft = panel.querySelector<HTMLTextAreaElement>(".forge-review textarea")!;
+    await fill(message, "Keep my approval message.");
+    await fill(draft, "Keep my draft changes.");
+    await click(cards[0], "View worker");
+    expect(panel.querySelector('[data-terminal-tab="codex-worker"]')).not.toBeNull();
+    await click(panel, "Close worker terminal");
+    await click(panel, "Refresh Forge");
+    expect(panel.querySelector(".forge-change-actions textarea")).toBe(message);
+    expect(message.value).toBe("Keep my approval message.");
+    expect(panel.querySelector(".forge-review textarea")).toBe(draft);
+    expect(draft.value).toBe("Keep my draft changes.");
+    expect(panel.querySelector("dialog")).toBeNull();
+  });
+
+  it.each([
+    { provider: "github" as const, state: "closed" as const, merged: false },
+    { provider: "github" as const, state: "merged" as const, merged: true },
+    { provider: "github" as const, state: "open" as const, merged: true },
+    { provider: "gitlab" as const, state: "closed" as const, merged: false },
+    { provider: "gitlab" as const, state: "merged" as const, merged: true },
+    { provider: "gitlab" as const, state: "open" as const, merged: true }
+  ])("disables $provider review publication for state=$state merged=$merged despite a stale open list", async ({ provider, state, merged }) => {
+    let currentChange = change;
+    const currentRepository = { ...repository, provider };
+    const testFixture = fixture({ repository: currentRepository, workers: [{ ...reviewWorker, repository: currentRepository }] }, hook => hook === "forge.change.get" ? { change: currentChange } : undefined);
+    const panel = await renderPanel(testFixture);
+    await click(panel, provider === "github" ? "Pull requests" : "Merge requests");
+    await fill(panel.querySelector(".forge-change-actions textarea")!, "Please address the remaining issue.");
+    currentChange = { ...change, state, merged };
+    await click(panel, "Refresh Forge");
+    expect(panel.querySelector(".forge-item .forge-muted")?.textContent).toContain("open");
+    for (const label of ["Review", "Review and post", "Mark as approved", "Mark as request changes", "Submit review"]) {
+      expect(button(panel, label).disabled).toBe(true);
+      await click(panel, label);
+    }
+    expect(button(panel, "Save draft").disabled).toBe(false);
+    await click(panel, "Save draft");
+    expect(testFixture.calls.filter(call => call.hook === "forge.review.save")).toHaveLength(1);
+    expect(testFixture.calls.some(call => ["forge.review.start", "forge.change.review", "forge.review.submit"].includes(call.hook))).toBe(false);
+    expect(panel.querySelector("dialog")).toBeNull();
+  });
+
+  it("keeps top review actions visible but prevents publication before fresh details load or after they fail", async () => {
+    const pending = deferred<unknown>();
+    const testFixture = fixture({ workers: [reviewWorker] }, hook => hook === "forge.change.get" ? pending.promise : undefined);
+    const panel = await renderPanel(testFixture);
+    await click(panel, "Pull requests");
+    for (const label of ["Review", "Review and post", "Mark as approved", "Mark as request changes", "Submit review"]) expect(button(panel, label).disabled).toBe(true);
+    expect(button(panel, "Save draft").disabled).toBe(false);
+    await act(async () => pending.reject(new Error("Request details unavailable.")));
+    expect(panel.textContent).toContain("Request details unavailable.");
+    expect(button(panel, "Mark as approved").disabled).toBe(true);
+    expect(button(panel, "Submit review").disabled).toBe(true);
+    expect(testFixture.calls.some(call => ["forge.review.start", "forge.change.review", "forge.review.submit"].includes(call.hook))).toBe(false);
+  });
+
+  it.each(["github", "gitlab"] as const)("shows authoritative %s linked issues beside review actions after worker records disappear", async provider => {
+    vi.useFakeTimers();
+    const currentRepository = { ...repository, provider };
+    const nativeIssues: ForgeChangeRequest["linkedIssues"] = [
+      { id: "current:7", number: 7, title: "Fix deployment", url: `https://${provider}.com/cloudx/example/issues/7`, state: "open" as const, ...(provider === "github" ? { projectPath: "cloudx/example" } : { projectId: 41 }) },
+      { id: "other:7", number: 7, title: "Related project issue", url: `https://${provider}.com/another/project/issues/7`, state: "closed" as const, ...(provider === "github" ? { projectPath: "another/project" } : { projectId: 42 }) }
+    ];
+    const linkedIssues = [...nativeIssues, ...(provider === "gitlab" ? [{ id: "external:OPS-12", title: "External tracker item OPS-12", state: "unknown" as const }] : [])];
+    let testFixture: ReturnType<typeof fixture>;
+    testFixture = fixture({ repository: currentRepository, workers: [{ ...worker, repository: currentRepository, changeNumber: change.number }] }, hook => {
+      if (hook === "forge.dashboard") return structuredClone(testFixture.dashboard);
+      if (hook === "forge.change.get") return { change: { ...change, body: "Fixes #999 mentioned only in free-form text.", linkedIssues } };
+    });
+    const panel = await renderPanel(testFixture);
+    await click(panel, provider === "github" ? "Pull requests" : "Merge requests");
+    const references = panel.querySelector('.forge-change-actions [aria-label="Linked issues"]')!;
+    const links = references.querySelectorAll("a");
+    expect(links).toHaveLength(2);
+    for (const [index, link] of [...links].entries()) {
+      expect(link.getAttribute("href")).toBe(nativeIssues[index].url);
+      expect(link.getAttribute("target")).toBe("_blank");
+      expect(link.getAttribute("rel")).toBe("noreferrer");
+      expect(link.textContent).toContain(nativeIssues[index].title);
+      expect(link.textContent).toContain(provider === "github" ? nativeIssues[index].projectPath : `Project ${nativeIssues[index].projectId}`);
+    }
+    expect(references.textContent).not.toContain("#999");
+    if (provider === "gitlab") expect(references.textContent).toContain("External tracker item OPS-12");
+    testFixture.dashboard.workers = [];
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    expect(panel.querySelectorAll(".forge-detail .forge-worker")).toHaveLength(0);
+    expect(panel.querySelectorAll('.forge-change-actions [aria-label="Linked issues"] a')).toHaveLength(2);
+    expect(panel.querySelector("dialog")).toBeNull();
+    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
   });
 
   it("edits suggested reviews and saves the exact edits before submission", async () => {

@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   ForgeChangeRequest,
+  ForgeChangeRequestStatus,
   ForgeCreateChangeRequest,
   ForgeCredentialRole,
   ForgeIssueDetail,
@@ -35,6 +36,7 @@ import { ForgeWorkerReports, ForgeWorkflowStore } from "./ForgeWorkflowStore.js"
 import type { ForgeProvider } from "./providers/ForgeProvider.js";
 
 const execute = promisify(execFile);
+const wallClockNow = Date.now.bind(Date);
 const repository: ForgeRepository = {
   provider: "github",
   apiUrl: "https://api.github.com",
@@ -47,6 +49,7 @@ afterEach(async () => {
     for (const fixture of fixtures.splice(0)) await fixture.dispose();
   } finally {
     vi.unstubAllEnvs();
+    vi.restoreAllMocks();
   }
 });
 
@@ -150,10 +153,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(third.context.change?.approved).toBe(true);
     expect(third.headSha).toBe(revised.headSha);
     await fixture.workflow.poll();
-    const completed = await fixture.worker(started.id);
-    expect(completed).toMatchObject({ status: "completed", changeNumber: 7, headSha: revised.headSha });
-    expect(completed.worktreePath).toBeUndefined();
-    expect(completed.tabId).toBeUndefined();
+    expect((await fixture.workflow.dashboard()).workers).toEqual([]);
     expect(fixture.provider.merges).toEqual([revised.headSha]);
     expect(await processIsRunning(third.pid)).toBe(false);
     expect(await git(fixture.origin, "rev-parse", "main")).toBe(revised.headSha);
@@ -162,9 +162,83 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     await expectMissing(revised.worktreePath!, first.codexHome, second.codexHome, third.codexHome, third.reportPath, third.contextPath, third.tabContextPath);
     expect(fixture.sessions.listTabs()).toEqual([]);
     expect(fixture.workspace.getActiveWindow().layout.root).toMatchObject({ type: "pane", pane: { tabIds: [] } });
-    expect((await fixture.store.read())[0]).toMatchObject({ status: "completed", changeNumber: 7 });
+    expect(await fixture.store.read()).toEqual([]);
     expect(fixture.notifications.list().some((notification) => notification.title === "Issue merged")).toBe(true);
     expect(await fs.readFile(path.join(fixture.codexHome, "config.toml"), "utf8")).toBe(sourceConfig);
+  }, 20_000);
+
+  it("removes coding and running review workers after an external merge closes their issue and deletes the branch", async () => {
+    const fixture = await LifecycleFixture.create();
+    const started = await fixture.workflow.startIssue(1, fixture.placement);
+    const codingReceipt = await fixture.completedAssistantTurn(started);
+    await fixture.workflow.poll();
+    const coding = await fixture.worker(started.id);
+    expect(coding.status).toBe("awaiting_review");
+
+    const review = await fixture.workflow.startReview(7, false, fixture.placement);
+    const reviewReceipt = await fixture.completedAssistantTurn(review);
+    expect(await processIsRunning(reviewReceipt.pid)).toBe(true);
+    expect(await fixture.reports.read(review.attemptId!)).toBeDefined();
+    const unrelatedDirectory = path.join(fixture.root, "unrelated-work");
+    await fs.mkdir(unrelatedDirectory);
+    await fs.writeFile(path.join(unrelatedDirectory, "keep.txt"), "Unrelated work\n");
+    const unrelatedTab = await fixture.sessions.createTab({ pluginId: "forge", cwd: unrelatedDirectory, title: "Unrelated Forge tab" });
+
+    await fixture.provider.mergeExternally(7);
+    await git(fixture.origin, "update-ref", "-d", `refs/heads/${coding.branch}`);
+    const status = await fixture.provider.getChangeRequestStatus(7);
+    expect(status).toMatchObject({ merged: true, headSha: coding.headSha, linkedIssues: [{ number: 1, state: "closed" }] });
+    const details = vi.spyOn(fixture.provider, "getChangeRequest");
+    fixture.advanceCleanupInterval();
+    await fixture.workflow.poll();
+
+    expect(details).not.toHaveBeenCalled();
+    expect((await fixture.workflow.dashboard()).workers).toEqual([]);
+    expect(await fixture.store.read()).toEqual([]);
+    expect(fixture.provider.submissions).toEqual([]);
+    expect(await processIsRunning(reviewReceipt.pid)).toBe(false);
+    expect(await processIsRunning(codingReceipt.pid)).toBe(false);
+    await expectMissing(coding.worktreePath!, review.worktreePath!);
+    for (const receipt of [codingReceipt, reviewReceipt])
+      await expectMissing(receipt.codexHome, path.dirname(receipt.tabContextPath), receipt.contextPath, receipt.reportPath);
+    expect(fixture.sessions.listTabs().map(tab => tab.id)).toEqual([unrelatedTab.id]);
+    expect(await fs.readFile(path.join(unrelatedDirectory, "keep.txt"), "utf8")).toBe("Unrelated work\n");
+    expect(await git(fixture.origin, "rev-parse", "main")).toBe(coding.headSha);
+    expect(await fs.readFile(path.join(fixture.codexHome, "config.toml"), "utf8")).toBe(sourceConfig);
+  }, 20_000);
+
+  it("preserves local edits and a completed report when merged cleanup fails until an explicit resume", async () => {
+    const fixture = await LifecycleFixture.create();
+    const started = await fixture.workflow.startIssue(1, fixture.placement);
+    await fixture.completedAssistantTurn(started);
+    await fixture.workflow.poll();
+    const resumed = await fixture.workflow.resume(started.id, fixture.placement);
+    const receipt = await fixture.completedAssistantTurn(resumed);
+    const report = await fs.readFile(receipt.reportPath, "utf8");
+    const context = await fs.readFile(receipt.contextPath, "utf8");
+    const localEdit = path.join(resumed.worktreePath!, "unpublished.txt");
+    await fs.writeFile(localEdit, "Keep this local edit\n");
+    await fixture.provider.mergeExternally(7);
+    await git(fixture.origin, "update-ref", "-d", `refs/heads/${resumed.branch}`);
+
+    fixture.advanceCleanupInterval();
+    await fixture.workflow.poll();
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "cleanup_failed", error: expect.stringMatching(/commit.*changes|local changes/i), worktreePath: resumed.worktreePath, attemptId: resumed.attemptId });
+    expect(await processIsRunning(receipt.pid)).toBe(false);
+    expect(await fs.readFile(localEdit, "utf8")).toBe("Keep this local edit\n");
+    expect(await fs.readFile(receipt.reportPath, "utf8")).toBe(report);
+    expect(await fs.readFile(receipt.contextPath, "utf8")).toBe(context);
+
+    await fs.rm(localEdit);
+    fixture.advanceCleanupInterval();
+    await fixture.workflow.poll();
+    expect((await fixture.worker(started.id)).status).toBe("cleanup_failed");
+    expect(await fs.readFile(receipt.reportPath, "utf8")).toBe(report);
+    await fixture.workflow.resume(started.id, fixture.placement);
+    expect((await fixture.workflow.dashboard()).workers).toEqual([]);
+    expect(await fixture.store.read()).toEqual([]);
+    await expectMissing(resumed.worktreePath!, receipt.reportPath, receipt.contextPath, receipt.codexHome, path.dirname(receipt.tabContextPath));
+    expect(fixture.sessions.listTabs()).toEqual([]);
   }, 20_000);
 
   it("reviews the exact commit, immediately cleans the agent, and submits the manually edited draft", async () => {
@@ -342,6 +416,11 @@ class LifecycleFixture {
     return (await this.workflow.dashboard()).workers.find((worker) => worker.id === id)!;
   }
 
+  advanceCleanupInterval(): void {
+    const elapsed = Date.now() - wallClockNow() + 30_001;
+    vi.spyOn(Date, "now").mockImplementation(() => wallClockNow() + elapsed);
+  }
+
   async completedAssistantTurn(worker: ForgeWorker): Promise<AssistantReceipt> {
     expect(worker, worker.error).toMatchObject({ status: "running", tabId: expect.any(String), attemptId: expect.any(String) });
     const receiptPath = path.join(this.root, "receipts", `${worker.attemptId}.json`);
@@ -404,17 +483,24 @@ class LocalForgeProvider implements ForgeProvider {
   async listIssues() { return { items: [structuredClone(this.issue)] }; }
   async listChangeRequests() { return { items: [...this.changes.values()].map((change) => structuredClone(change)) }; }
   async getIssue() { return structuredClone(this.issue); }
+  async getChangeRequestStatus(number: number): Promise<ForgeChangeRequestStatus> {
+    const change = this.changes.get(number);
+    if (!change) throw new Error("Unknown fixture change request.");
+    const { state, merged, headBranch, baseBranch } = change;
+    const headSha = merged ? change.headSha : await git(this.origin, "rev-parse", headBranch);
+    return { number, state, merged, headSha, headBranch, baseBranch, linkedIssues: [{ id: "issue-1", number: this.issue.number, title: this.issue.title, url: this.issue.url, state: this.issue.state === "closed" ? "closed" : "open", projectPath: repository.projectPath }] };
+  }
   async getChangeRequest(number: number): Promise<ForgeChangeRequest> {
     const change = this.changes.get(number);
     if (!change) throw new Error("Unknown fixture change request.");
-    return { ...structuredClone(change), headSha: await git(this.origin, "rev-parse", change.headBranch), diff: await git(this.origin, "diff", `${change.baseBranch}...${change.headBranch}`) };
+    return { ...structuredClone(change), ...await this.getChangeRequestStatus(number), diff: await git(this.origin, "diff", `${change.baseBranch}...${change.headBranch}`) };
   }
   async findChangeRequestByBranch(headBranch: string, baseBranch: string) {
     const change = [...this.changes.values()].find((request) => request.headBranch === headBranch && request.baseBranch === baseBranch);
     return change ? this.getChangeRequest(change.number) : undefined;
   }
   async createChangeRequest(input: ForgeCreateChangeRequest) {
-    this.changes.set(7, { number: 7, title: input.title, body: input.body, url: "https://github.com/fixture/cloudx/pull/7", state: "open", labels: [], author: "worker-bot", updatedAt: new Date().toISOString(), draft: false, headSha: "", headBranch: input.headBranch, baseBranch: input.baseBranch, merged: false, mergeable: true, approved: false, unresolvedDiscussions: 0, comments: [], diff: "" });
+    this.changes.set(7, { number: 7, title: input.title, body: input.body, url: "https://github.com/fixture/cloudx/pull/7", state: "open", labels: [], author: "worker-bot", updatedAt: new Date().toISOString(), draft: false, headSha: "", headBranch: input.headBranch, baseBranch: input.baseBranch, merged: false, mergeable: true, approved: false, unresolvedDiscussions: 0, comments: [], diff: "", linkedIssues: [] });
     return this.getChangeRequest(7);
   }
   async postReview(_number: number, review: ForgeReviewSubmission) { this.submissions.push(structuredClone(review)); }
@@ -435,10 +521,15 @@ class LocalForgeProvider implements ForgeProvider {
   async merge(number: number, expectedHeadSha: string) {
     const change = await this.getChangeRequest(number);
     if (!change.approved || change.unresolvedDiscussions || change.headSha !== expectedHeadSha) throw new Error("Fixture request is not approved at this head.");
-    await git(this.origin, "update-ref", `refs/heads/${change.baseBranch}`, expectedHeadSha, await git(this.origin, "rev-parse", change.baseBranch));
-    Object.assign(this.changes.get(number)!, { merged: true, state: "merged" });
+    await this.mergeExternally(number);
     this.merges.push(expectedHeadSha);
     return { merged: true as const, sha: expectedHeadSha };
+  }
+  async mergeExternally(number: number): Promise<void> {
+    const change = await this.getChangeRequestStatus(number);
+    await git(this.origin, "update-ref", `refs/heads/${change.baseBranch}`, change.headSha, await git(this.origin, "rev-parse", change.baseBranch));
+    Object.assign(this.changes.get(number)!, { merged: true, state: "merged", headSha: change.headSha });
+    this.issue.state = "closed";
   }
 }
 
