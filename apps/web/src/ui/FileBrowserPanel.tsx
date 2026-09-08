@@ -147,6 +147,10 @@ export function FileBrowserPanel({ tab, selected, config = {} }: { tab: Workspac
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
   const contextMenuRef = useRef<HTMLDivElement | null>(null);
   const wasSelected = useRef(selected);
+  const directoryRequest = useRef(0);
+  const gitRequest = useRef(0);
+  const searchRequest = useRef(0);
+  const previousSearchInput = useRef<string | undefined>(undefined);
   const showGitDiff = config.showGitDiff !== false;
   const canViewGitDiff = showGitDiff;
   const gitAutoRefresh = config.gitAutoRefresh !== false;
@@ -159,6 +163,12 @@ export function FileBrowserPanel({ tab, selected, config = {} }: { tab: Workspac
     () => (activeSearchQuery ? searchEntriesFromResult(activeSearchResult) : mergeGitChangesIntoEntries(entries, relativePath, showGitDiff ? diffSummary : undefined)),
     [activeSearchQuery, activeSearchResult, entries, relativePath, diffSummary, showGitDiff]
   );
+
+  useEffect(() => () => {
+    directoryRequest.current += 1;
+    gitRequest.current += 1;
+    setBusyAction((current) => current === "state" || current === "diff" ? undefined : current);
+  }, [selected, tab.id, tab.cwd, showGitDiff]);
 
   useEffect(() => {
     void loadDirectory(relativePath, { preserveOpened: Boolean(initialState) });
@@ -177,15 +187,8 @@ export function FileBrowserPanel({ tab, selected, config = {} }: { tab: Workspac
     wasSelected.current = selected;
     if (!reselected) return;
 
-    let current = true;
-    void runTabAction<DirectoryResult>(tab.id, "list_directory", { relativePath })
-      .then((result) => {
-        if (current) setEntries(result.entries);
-      })
-      .catch((err) => {
-        if (current) setError(err instanceof Error ? err.message : String(err));
-      });
-    return () => { current = false; };
+    void loadDirectory(relativePath, { preserveView: true });
+    void loadGitState({ preserveCompareRef: true, silent: true });
   }, [selected, tab.id, tab.cwd, relativePath]);
 
   useEffect(() => {
@@ -257,43 +260,26 @@ export function FileBrowserPanel({ tab, selected, config = {} }: { tab: Workspac
 
   useEffect(() => {
     const input = buildSearchInput(searchQuery, searchMode, searchGlob);
+    const inputKey = JSON.stringify(input);
+    const preserveView = inputKey === previousSearchInput.current;
+    previousSearchInput.current = inputKey;
+    const request = ++searchRequest.current;
+    setSearchBusyAction(undefined);
     if (!input) {
       setSearchResult(undefined);
-      setSearchBusyAction(undefined);
-      setSelectedTransferPaths(new Set());
-      setTransferSelectionMode(false);
-      return;
+      if (!preserveView) {
+        setSelectedTransferPaths(new Set());
+        setTransferSelectionMode(false);
+      }
     }
-    let cancelled = false;
-    const timer = window.setTimeout(() => {
-      setSearchBusyAction("search");
-      setError(undefined);
-      void runTabAction<FileSearchResult>(tab.id, "search_files", input)
-        .then((result) => {
-          if (!cancelled) {
-            setSearchResult(result);
-            setOpened(undefined);
-            setOpenedDiff(undefined);
-            setSelectedTransferPaths(new Set());
-            setTransferSelectionMode(false);
-          }
-        })
-        .catch((err) => {
-          if (!cancelled) {
-            setError(err instanceof Error ? err.message : String(err));
-          }
-        })
-        .finally(() => {
-          if (!cancelled) {
-            setSearchBusyAction(undefined);
-          }
-        });
-    }, 250);
+    const timer = input && selected ? window.setTimeout(() => {
+      void runSearch({ request, preserveView, resetSelection: true });
+    }, 250) : undefined;
     return () => {
-      cancelled = true;
+      searchRequest.current += 1;
       window.clearTimeout(timer);
     };
-  }, [tab.id, searchQuery, searchMode, searchGlob]);
+  }, [selected, tab.id, tab.cwd, searchQuery, searchMode, searchGlob]);
 
   useEffect(() => {
     const visibleTransferPaths = new Set(visibleEntries.filter((entry) => !entry.virtual).map((entry) => entryTransferPath(entry, relativePath)));
@@ -365,12 +351,15 @@ export function FileBrowserPanel({ tab, selected, config = {} }: { tab: Workspac
     };
   }, [tab.id, opened?.path, opened?.relativePath, opened?.previewKind, opened?.mimeType]);
 
-  async function loadDirectory(path: string, options: { preserveOpened?: boolean } = {}) {
-    setError(undefined);
+  async function loadDirectory(path: string, options: { preserveOpened?: boolean; preserveView?: boolean } = {}) {
+    const request = ++directoryRequest.current;
+    if (!options.preserveView) setError(undefined);
     try {
       const result = await runTabAction<DirectoryResult>(tab.id, "list_directory", { relativePath: path });
-      setRelativePath(path);
+      if (request !== directoryRequest.current) return;
       setEntries(result.entries);
+      if (options.preserveView) return;
+      setRelativePath(path);
       setSelectedTransferPaths(new Set());
       setTransferSelectionMode(false);
       setContextMenu(undefined);
@@ -378,7 +367,9 @@ export function FileBrowserPanel({ tab, selected, config = {} }: { tab: Workspac
         setOpened(undefined);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (request === directoryRequest.current) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     }
   }
 
@@ -386,28 +377,32 @@ export function FileBrowserPanel({ tab, selected, config = {} }: { tab: Workspac
     if (!showGitDiff) {
       return;
     }
+    const request = ++gitRequest.current;
     if (!options.silent) {
       setBusyAction("state");
+      setError(undefined);
     }
-    setError(undefined);
     try {
       const state = await runTabAction<GitRepositoryState>(tab.id, "get_git_state", {});
+      if (request !== gitRequest.current) return;
       setGitState(state);
       setOriginUrl(state.originUrl ?? "");
       if (state.isRepository) {
         const nextCompareRef = resolveNextCompareRef(state, options.preserveCompareRef ? compareRef : undefined);
         setCompareRef(nextCompareRef);
-        await loadDiff(nextCompareRef, { silent: options.silent, preserveOpenedDiff: options.silent });
+        await loadDiff(nextCompareRef, { request, silent: options.silent, preserveOpenedDiff: options.silent });
       } else {
         setCompareRef("");
         setDiffSummary(undefined);
-        setOpenedDiff(undefined);
+        if (!options.silent) setOpenedDiff(undefined);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (request === gitRequest.current) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
-      if (!options.silent) {
-        setBusyAction(undefined);
+      if (request === gitRequest.current) {
+        setBusyAction((current) => current === "state" || current === "diff" ? undefined : current);
       }
     }
   }
@@ -464,26 +459,31 @@ export function FileBrowserPanel({ tab, selected, config = {} }: { tab: Workspac
     }
   }
 
-  async function loadDiff(ref = compareRef, options: { silent?: boolean; preserveOpenedDiff?: boolean } = {}) {
+  async function loadDiff(ref = compareRef, options: { request?: number; silent?: boolean; preserveOpenedDiff?: boolean } = {}) {
     if (!showGitDiff) {
       return;
     }
+    const request = options.request ?? ++gitRequest.current;
+    if (request !== gitRequest.current) return;
     if (!options.silent) {
       setBusyAction("diff");
+      setError(undefined);
     }
-    setError(undefined);
     try {
       const diff = await runTabAction<GitDiffSummary>(tab.id, "list_git_diff", ref ? { compareRef: ref } : {});
+      if (request !== gitRequest.current) return;
       setDiffSummary(diff);
       if (!options.preserveOpenedDiff) {
         setOpenedDiff(undefined);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      setDiffSummary(undefined);
+      if (request === gitRequest.current) {
+        setError(err instanceof Error ? err.message : String(err));
+        if (!options.silent) setDiffSummary(undefined);
+      }
     } finally {
-      if (!options.silent) {
-        setBusyAction(undefined);
+      if (request === gitRequest.current) {
+        setBusyAction((current) => current === "state" || current === "diff" ? undefined : current);
       }
     }
   }
@@ -537,22 +537,33 @@ export function FileBrowserPanel({ tab, selected, config = {} }: { tab: Workspac
     await openFilePath(openedDiff.path, { preserveOpenedDiff: true });
   }
 
-  async function runSearch() {
+  async function runSearch(options: { request?: number; preserveView?: boolean; resetSelection?: boolean } = {}) {
+    const request = options.request ?? ++searchRequest.current;
+    if (request !== searchRequest.current) return;
     const input = buildSearchInput(searchQuery, searchMode, searchGlob);
     if (!input) {
       return;
     }
     setSearchBusyAction("search");
-    setError(undefined);
+    if (!options.preserveView) setError(undefined);
     try {
       const result = await runTabAction<FileSearchResult>(tab.id, "search_files", input);
+      if (request !== searchRequest.current) return;
       setSearchResult(result);
-      setOpened(undefined);
-      setOpenedDiff(undefined);
+      if (!options.preserveView) {
+        setOpened(undefined);
+        setOpenedDiff(undefined);
+        if (options.resetSelection) {
+          setSelectedTransferPaths(new Set());
+          setTransferSelectionMode(false);
+        }
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (request === searchRequest.current) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
-      setSearchBusyAction(undefined);
+      if (request === searchRequest.current) setSearchBusyAction(undefined);
     }
   }
 

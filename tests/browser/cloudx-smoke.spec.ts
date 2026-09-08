@@ -866,6 +866,63 @@ test.describe("CloudX shipped shell", () => {
         "Transfer fixture download failed",
       );
       await expect(selectDownloads).toBeVisible();
+
+      const showSearch = visibleFiles.getByRole("button", {
+        name: "Show search bar",
+        exact: true,
+      });
+      if (await showSearch.isVisible()) {
+        await showSearch.click();
+      } else {
+        await visibleFiles.locator(".file-secondary-dock").hover();
+        await visibleFiles
+          .getByRole("button", { name: "File search", exact: true })
+          .click();
+      }
+      const searchInput = visibleFiles.getByRole("textbox", {
+        name: "Search files",
+        exact: true,
+      });
+      if (!(await searchInput.isVisible())) {
+        await visibleFiles.locator(".file-search-toggle").click();
+      }
+      await searchInput.fill("transfer-");
+      const searchFinished = page.waitForResponse(
+        (response) =>
+          response.url().endsWith(`/api/tabs/${files.tab.id}/actions`) &&
+          response.request().postDataJSON().action === "search_files" &&
+          response.request().postDataJSON().input.mode === "filename",
+      );
+      await visibleFiles
+        .getByRole("button", { name: "Names", exact: true })
+        .click();
+      expect((await searchFinished).status()).toBe(200);
+      await expect(visibleFiles.locator(".file-list")).toContainText(
+        "transfer-0.txt",
+      );
+      await showTransferTree(visibleFiles);
+      await visibleFiles
+        .locator(".file-list-entry")
+        .filter({ hasText: "transfer-0.txt" })
+        .click();
+      const preview = visibleFiles.getByLabel("transfer-0.txt preview", {
+        exact: true,
+      });
+      await expect(preview).toContainText(contents[0]);
+      const previewElement = (await preview.elementHandle())!;
+      await selectOther();
+      await fs.writeFile(
+        path.join(testRoot, "workspace", "transfer-created-while-hidden.txt"),
+        "Created during an active file search\n",
+      );
+      await selectFiles();
+      await expect(visibleFiles.locator(".file-list")).toContainText(
+        "transfer-created-while-hidden.txt",
+      );
+      expect(await previewElement.evaluate((node) => node.isConnected)).toBe(
+        true,
+      );
+      await expect(preview).toContainText(contents[0]);
     } finally {
       releaseUpload();
       releaseDownload();
@@ -1041,6 +1098,16 @@ async function selectTransferDownload(files: Locator) {
       exact: true,
     })
     .click();
+  await showTransferTree(files);
+  await files
+    .getByRole("checkbox", {
+      name: "Select transfer-0.txt for download",
+      exact: true,
+    })
+    .check();
+}
+
+async function showTransferTree(files: Locator) {
   if (
     !(await files
       .getByRole("region", { name: "File tree", exact: true })
@@ -1049,12 +1116,6 @@ async function selectTransferDownload(files: Locator) {
     await files.locator(".file-tree-dock").hover();
     await files.getByRole("button", { name: "File tree", exact: true }).click();
   }
-  await files
-    .getByRole("checkbox", {
-      name: "Select transfer-0.txt for download",
-      exact: true,
-    })
-    .check();
 }
 
 async function createTransferTestTab(
