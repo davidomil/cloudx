@@ -93,6 +93,97 @@ describe("file transfers across tab switches", () => {
     expect(api.uploadFileBrowserFile).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps both uploaded files when per-file directory refreshes finish in reverse order", async () => {
+    const firstUpload = deferred<api.FileUploadResponse>();
+    const secondUpload = deferred<api.FileUploadResponse>();
+    vi.mocked(api.uploadFileBrowserFile).mockReturnValueOnce(firstUpload.promise).mockReturnValueOnce(secondUpload.promise);
+    await showTab(tab);
+    const firstListing = deferDirectoryListing();
+    const secondListing = deferDirectoryListing();
+    await selectFiles(new File(["one"], "one.txt"), new File(["two"], "two.txt"));
+    await act(async () => firstUpload.resolve({} as api.FileUploadResponse));
+    await act(async () => secondUpload.resolve({} as api.FileUploadResponse));
+    expect(api.runTabAction).toHaveBeenCalledTimes(3);
+    await act(async () => secondListing.resolve(directoryListing("", "one.txt", "two.txt")));
+    await act(async () => firstListing.resolve(directoryListing("", "one.txt")));
+    expect(visibleFileNames()).toEqual(["one.txt", "two.txt"]);
+  });
+
+  it.each(["success", "failure"])("ignores an older upload refresh %s after folder navigation", async (outcome) => {
+    const upload = deferred<api.FileUploadResponse>();
+    vi.mocked(api.uploadFileBrowserFile).mockReturnValue(upload.promise);
+    await showTab(tab);
+    const refresh = deferDirectoryListing();
+    await selectFiles(new File(["one"], "one.txt"));
+    await act(async () => upload.resolve({} as api.FileUploadResponse));
+    const navigation = deferDirectoryListing();
+    await openEntry("docs");
+    await act(async () => navigation.resolve(directoryListing("docs", "guide.txt")));
+    await act(async () => button("Select files or folders to download").click());
+    const selected = container.querySelector<HTMLInputElement>('[aria-label="Select guide.txt for download"]')!;
+    await act(async () => selected.click());
+    await act(async () => {
+      if (outcome === "success") refresh.resolve(directoryListing("", "one.txt"));
+      else refresh.reject(new Error("Superseded refresh failed"));
+    });
+    expect(visibleFileNames()).toEqual(["guide.txt"]);
+    expect(container.querySelector('.inline-error')).toBeNull();
+    expect(button("Download 1 selected entries").disabled).toBe(false);
+    await showTab(otherTab);
+    const restored = deferDirectoryListing();
+    await showTab(tab);
+    expect(api.runTabAction).toHaveBeenLastCalledWith(tab.id, "list_directory", { relativePath: "docs" });
+    await act(async () => restored.resolve(directoryListing("docs", "guide.txt")));
+  });
+
+  it("refreshes pending navigation after an upload and clears the previous folder's preview", async () => {
+    const upload = deferred<api.FileUploadResponse>();
+    vi.mocked(api.uploadFileBrowserFile).mockReturnValue(upload.promise);
+    await showTab(tab);
+    vi.mocked(api.runTabAction).mockResolvedValueOnce({ path: "/project-a/report.txt", content: "Previous folder preview", truncated: false });
+    await openEntry("report.txt");
+    expect(container.textContent).toContain("Previous folder preview");
+    await selectFiles(new File(["one"], "one.txt"));
+    const navigation = deferDirectoryListing();
+    await openEntry("docs");
+    const refresh = deferDirectoryListing();
+    await act(async () => upload.resolve({} as api.FileUploadResponse));
+    expect(api.runTabAction).toHaveBeenLastCalledWith(tab.id, "list_directory", { relativePath: "docs" });
+    await act(async () => refresh.resolve(directoryListing("docs", "guide.txt")));
+    await act(async () => navigation.resolve(directoryListing("docs", "outdated.txt")));
+    expect(visibleFileNames()).toEqual(["guide.txt"]);
+    expect(container.textContent).not.toContain("Previous folder preview");
+  });
+
+  it("shows current navigation errors and refreshes the visible folder after a later upload", async () => {
+    const upload = deferred<api.FileUploadResponse>();
+    vi.mocked(api.uploadFileBrowserFile).mockReturnValue(upload.promise);
+    await showTab(tab);
+    await selectFiles(new File(["one"], "one.txt"));
+    const navigation = deferDirectoryListing();
+    await openEntry("docs");
+    await act(async () => navigation.reject(new Error("Cannot open docs")));
+    expect(container.textContent).toContain("Cannot open docs");
+    await act(async () => upload.resolve({} as api.FileUploadResponse));
+    expect(api.runTabAction).toHaveBeenLastCalledWith(tab.id, "list_directory", { relativePath: "" });
+    expect(container.querySelector('.inline-error')).toBeNull();
+  });
+
+  it("keeps the restored directory when a refresh from an unmounted tab finishes", async () => {
+    const upload = deferred<api.FileUploadResponse>();
+    vi.mocked(api.uploadFileBrowserFile).mockReturnValue(upload.promise);
+    await showTab(tab);
+    const refresh = deferDirectoryListing();
+    await selectFiles(new File(["one"], "one.txt"));
+    await act(async () => upload.resolve({} as api.FileUploadResponse));
+    await openEntry("docs");
+    await showTab(otherTab);
+    await act(async () => refresh.resolve(directoryListing("", "outdated.txt")));
+    await showTab(tab);
+    expect(api.runTabAction).toHaveBeenLastCalledWith(tab.id, "list_directory", { relativePath: "docs" });
+    expect(visibleFileNames()).not.toContain("outdated.txt");
+  });
+
   it.each([false, true])("retains download state and completion while hidden (failure: %s)", async (fail) => {
     const download = deferred<api.FileDownloadResponse>();
     vi.mocked(api.downloadFileBrowserEntries).mockReturnValue(download.promise);
@@ -130,6 +221,25 @@ async function selectFiles(...files: File[]) {
 
 function button(label: string): HTMLButtonElement {
   return container.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`)!;
+}
+
+function directoryListing(path: string, ...names: string[]) {
+  return { path, entries: names.map((name) => ({ name, type: "file" as const })) };
+}
+
+function deferDirectoryListing() {
+  const listing = deferred<ReturnType<typeof directoryListing>>();
+  vi.mocked(api.runTabAction).mockReturnValueOnce(listing.promise);
+  return listing;
+}
+
+function visibleFileNames() {
+  return Array.from(container.querySelectorAll(".file-list-entry")).map((entry) => entry.textContent);
+}
+
+async function openEntry(name: string) {
+  const entry = Array.from(container.querySelectorAll<HTMLButtonElement>(".file-list-entry")).find((item) => item.textContent === name)!;
+  await act(async () => entry.click());
 }
 
 function deferred<T>() {

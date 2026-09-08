@@ -100,6 +100,8 @@ interface FileClipboardPaths {
 export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; config?: Record<string, ConfigValue> }) {
   const [initialState] = useState(() => readFileBrowserPanelState(tab));
   const [relativePath, setRelativePath] = useState(() => initialState?.relativePath ?? "");
+  const requestedDirectoryPath = useRef(relativePath);
+  const directoryRequestId = useRef(0);
   const [entries, setEntries] = useState<DirectoryEntry[]>(() => initialState?.entries ?? []);
   const [opened, setOpened] = useState<OpenFileResult | undefined>(() => initialState?.opened);
   const [gitState, setGitState] = useState<GitRepositoryState | undefined>(() => initialState?.gitState);
@@ -166,12 +168,14 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
       setOpenedDiff(undefined);
       setCompareRef("");
     }
+    return () => { directoryRequestId.current += 1; };
   }, [tab.id, tab.cwd, showGitDiff]);
 
   useEffect(() => {
     if (refreshedUploadCount.current !== transferState.uploadedFiles) {
       refreshedUploadCount.current = transferState.uploadedFiles;
-      void loadDirectory(relativePath, { preserveOpened: true });
+      const path = requestedDirectoryPath.current;
+      void loadDirectory(path, { preserveOpened: path === relativePath });
     }
   }, [transfers, transferState.uploadedFiles]);
 
@@ -353,9 +357,12 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   }, [tab.id, opened?.path, opened?.relativePath, opened?.previewKind, opened?.mimeType]);
 
   async function loadDirectory(path: string, options: { preserveOpened?: boolean } = {}) {
+    const requestId = ++directoryRequestId.current;
+    requestedDirectoryPath.current = path;
     setError(undefined);
     try {
       const result = await runTabAction<DirectoryResult>(tab.id, "list_directory", { relativePath: path });
+      if (requestId !== directoryRequestId.current) return;
       setRelativePath(path);
       setEntries(result.entries);
       setSelectedTransferPaths(new Set());
@@ -365,6 +372,8 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
         setOpened(undefined);
       }
     } catch (err) {
+      if (requestId !== directoryRequestId.current) return;
+      requestedDirectoryPath.current = relativePath;
       setError(err instanceof Error ? err.message : String(err));
     }
   }
