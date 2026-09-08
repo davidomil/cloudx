@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { CodexStateSources, legacySourceId } from "./CodexStateSources.js";
+import { CodexStateSources } from "./CodexStateSources.js";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -38,9 +38,6 @@ async function fixture() {
 describe("CodexStateSources", () => {
   it.each([
     "lstat",
-    "opendir",
-    "directory.read",
-    "directory.close",
     "open",
     "file.stat",
     "file.read",
@@ -150,7 +147,7 @@ describe("CodexStateSources", () => {
     await f.sources.dispose();
   });
 
-  it.each(["file.close", "directory.close"])(
+  it.each(["file.close"])(
     "reports sanitized %s failure even after its task has settled",
     async (stage) => {
       const f = await heldSourceFixture(stage, true);
@@ -165,61 +162,35 @@ describe("CodexStateSources", () => {
     },
   );
 
-  it("lists separate owners from bounded generated headings and resolves directly without scanning", async () => {
+  it("resolves only the shared home without discovering retained sources", async () => {
     const f = await fixture();
-    await fs.writeFile(
-      path.join(f.legacy, "AGENTS.override.md"),
-      "# CloudX Codex Session Instructions\n\n## CloudX Template: Review\n\nprivate content\n",
-    );
-    await fs.mkdir(path.join(f.data, "codex-homes", "old-b"));
-    const result = await f.sources.list();
-    expect(result.sources).toHaveLength(3);
-    expect(result.sources[0]).toMatchObject({
-      sourceId: "shared",
-      kind: "shared",
-      label: "Shared sessions",
-    });
-    expect(
-      result.sources.find(
-        (source) => source.sourceId === legacySourceId("old-a"),
-      )?.label,
-    ).toBe("Review");
-    expect(JSON.stringify(result)).not.toContain("private content");
-    expect(JSON.stringify(result)).not.toContain(f.home);
     const scan = vi.spyOn(fs, "opendir");
-    expect((await f.sources.resolve(legacySourceId("old-a"))).home).toBe(
-      await fs.realpath(f.legacy),
-    );
+    const source = await f.sources.resolve();
+    expect(source).toMatchObject({ sourceId: "shared", home: await fs.realpath(f.home) });
     expect(scan).not.toHaveBeenCalled();
+    expect(await f.sources.readBinding("old-a")).toBeUndefined();
+    expect(await fs.readdir(f.legacy)).toEqual([]);
   });
 
-  it.each([
-    "",
-    "../old-a",
-    "legacy:Li4",
-    "legacy:Lw",
-    "legacy:XA",
-    "legacy:wA",
-    "legacy:b2xkLWE=",
-    "legacy:b2xkLWF",
-    "legacy:AA",
-    "legacy:Li",
-  ])("rejects noncanonical or escaped source %s", async (key) => {
+  it.each(["legacy:b2xkLWE", "../old-a", "", null])("rejects a retained or invalid persisted binding %s", async (sourceId) => {
     const f = await fixture();
-    await expect(f.sources.resolve(key)).rejects.toThrow();
+    const source = await f.sources.resolve();
+    const view = await f.sources.bind("old-binding", source);
+    await fs.writeFile(path.join(view, ".cloudx-source.json"), JSON.stringify({ version: 1, ...source, sourceId }));
+    await expect(f.sources.readBinding("old-binding")).rejects.toThrow(/binding/);
   });
 
   it("binds one canonical owner and rejects conflicting, missing, corrupt and stale bindings", async () => {
     const f = await fixture();
-    const source = await f.sources.resolve(legacySourceId("old-a"));
+    const source = await f.sources.resolve();
     const view = await f.sources.bind("tab-1", source);
     expect(view).toContain("codex-launches/tab-1");
     expect(await f.sources.readBinding("tab-1")).toEqual(source);
     await expect(
-      f.sources.bind("tab-1", await f.sources.resolve("shared")),
-    ).rejects.toThrow(/conflict/i);
-    await fs.rename(f.legacy, `${f.legacy}-retained`);
-    await fs.mkdir(f.legacy);
+      f.sources.bind("tab-1", { ...source, home: await fs.realpath(f.legacy) }),
+    ).rejects.toThrow(/shared session store/i);
+    await fs.rename(f.home, `${f.home}-retained`);
+    await fs.mkdir(f.home);
     await expect(f.sources.readBinding("tab-1")).rejects.toThrow(
       /changed|stale/i,
     );
@@ -230,53 +201,24 @@ describe("CodexStateSources", () => {
     await expect(f.sources.bind("../escape", source)).rejects.toThrow();
   });
 
-  it("preserves correct-owner wide permissions but rejects wrong UID and symlink homes or roots", async () => {
+  it("preserves owned permissions but rejects wrong UID and symlink homes", async () => {
     const f = await fixture();
-    await fs.chmod(f.legacy, 0o777);
-    await f.sources.resolve(legacySourceId("old-a"));
-    expect((await fs.stat(f.legacy)).mode & 0o777).toBe(0o777);
-    await expect(
-      new CodexStateSources(
-        f.data,
-        { CODEX_HOME: f.home },
-        { uid: () => -1 },
-      ).resolve("shared"),
-    ).rejects.toThrow(/owner/i);
-    await fs.symlink(f.home, path.join(f.data, "codex-homes", "alias"));
-    await expect(f.sources.resolve(legacySourceId("alias"))).rejects.toThrow();
-    await fs.rename(
-      path.join(f.data, "codex-homes"),
-      path.join(f.data, "saved-homes"),
-    );
-    await fs.symlink(
-      path.join(f.data, "saved-homes"),
-      path.join(f.data, "codex-homes"),
-    );
-    await expect(f.sources.list()).rejects.toThrow();
+    await fs.chmod(f.home, 0o777);
+    await f.sources.resolve();
+    expect((await fs.stat(f.home)).mode & 0o777).toBe(0o777);
+    await expect(new CodexStateSources(f.data, { CODEX_HOME: f.home }, { uid: () => -1 }).resolve()).rejects.toThrow(/owner/i);
+    const alias = path.join(f.root, "alias");
+    await fs.symlink(f.home, alias);
+    await expect(new CodexStateSources(f.data, { CODEX_HOME: alias }).resolve()).rejects.toThrow(/real directory/);
   });
 
-  it("rejects oversized config, cap overflow, and broken history without opening SQLite", async () => {
+  it("rejects oversized config and redirected history", async () => {
     const f = await fixture();
-    await fs.writeFile(
-      path.join(f.legacy, "config.toml"),
-      "x".repeat(1_048_577),
-    );
-    await expect(
-      f.sources.readConfig(await f.sources.resolve(legacySourceId("old-a"))),
-    ).rejects.toThrow(/limit/i);
-    await fs.unlink(path.join(f.legacy, "config.toml"));
-    await fs.symlink(
-      path.join(f.root, "absent"),
-      path.join(f.legacy, "sessions"),
-    );
-    await expect(f.sources.resolve(legacySourceId("old-a"))).rejects.toThrow();
-    await fs.unlink(path.join(f.legacy, "sessions"));
-    await Promise.all(
-      Array.from({ length: 512 }, (_, i) =>
-        fs.mkdir(path.join(f.data, "codex-homes", `source-${i}`)),
-      ),
-    );
-    await expect(f.sources.list()).rejects.toThrow(/512/);
+    await fs.writeFile(path.join(f.home, "config.toml"), "x".repeat(1_048_577));
+    await expect(f.sources.readConfig(await f.sources.resolve())).rejects.toThrow(/limit/i);
+    await fs.mkdir(path.join(f.legacy, "sessions"));
+    await fs.symlink(path.join(f.legacy, "sessions"), path.join(f.home, "sessions"));
+    await expect(f.sources.resolve()).rejects.toThrow(/history link/);
   });
 
   it("cancels request admission and shutdown without accepting late work", async () => {
@@ -284,64 +226,10 @@ describe("CodexStateSources", () => {
     const controller = new AbortController();
     controller.abort();
     const open = vi.spyOn(fs, "open");
-    await expect(f.sources.list(controller.signal)).rejects.toThrow();
+    await expect(f.sources.resolve(controller.signal)).rejects.toThrow();
     expect(open).not.toHaveBeenCalled();
     await f.sources.dispose();
-    await expect(f.sources.list()).rejects.toThrow();
-  });
-
-  it("bounds heading prefixes and has at most four metadata handles in flight", async () => {
-    const f = await fixture();
-    for (let index = 0; index < 8; index += 1) {
-      const home = path.join(f.data, "codex-homes", `bounded-${index}`);
-      await fs.mkdir(home);
-      await fs.writeFile(
-        path.join(home, "AGENTS.override.md"),
-        "# CloudX Codex Session Instructions\n" +
-          "x".repeat(20_000) +
-          "\n## CloudX Template: Hidden beyond cap\n",
-      );
-    }
-    let active = 0;
-    let peak = 0;
-    let closed = 0;
-    const sizes: number[] = [];
-    const sources = new CodexStateSources(
-      f.data,
-      { CODEX_HOME: f.home },
-      {
-        fs: {
-          ...fs,
-          open: async (...args: Parameters<typeof fs.open>) => {
-            const handle = await fs.open(...args);
-            active += 1;
-            peak = Math.max(peak, active);
-            const originalRead = handle.read.bind(handle);
-            const originalClose = handle.close.bind(handle);
-            handle.read = (async (
-              ...readArgs: Parameters<typeof handle.read>
-            ) => {
-              sizes.push((readArgs[0] as unknown as Buffer).byteLength);
-              return originalRead(...readArgs);
-            }) as typeof handle.read;
-            handle.close = async () => {
-              closed += 1;
-              active -= 1;
-              await originalClose();
-            };
-            return handle;
-          },
-        },
-      },
-    );
-    const result = await sources.list();
-    expect(result.sources).toHaveLength(10);
-    expect(JSON.stringify(result)).not.toContain("Hidden beyond cap");
-    expect(peak).toBeGreaterThan(1);
-    expect(peak).toBeLessThanOrEqual(4);
-    expect(closed).toBe(8);
-    expect(active).toBe(0);
-    expect(sizes).toEqual(Array(8).fill(16 * 1024));
+    await expect(f.sources.resolve()).rejects.toThrow();
   });
 
   it.each(["cancel", "replace"])(
@@ -423,18 +311,15 @@ describe("CodexStateSources", () => {
     },
   );
 
-  it("keeps unbound retained tab restarts explicit and observes request deadlines", async () => {
+  it("observes request deadlines", async () => {
     const f = await fixture();
-    await expect(f.sources.readBinding("old-a")).rejects.toThrow(
-      /explicit session source/,
-    );
     let now = 0;
     const timed = new CodexStateSources(
       f.data,
       { CODEX_HOME: f.home },
       { now: () => (now += 30_001) },
     );
-    await expect(timed.list()).rejects.toThrow(/timed out/);
+    await expect(timed.resolve()).rejects.toThrow(/timed out/);
   });
 });
 
@@ -481,26 +366,6 @@ async function heldSourceFixture(stage: string, failLate = false) {
             if (stage === "lstat" && released) finish();
           }
         }) as typeof fs.lstat,
-        opendir: async (...args: Parameters<typeof fs.opendir>) => {
-          const directory = await fs.opendir(...args);
-          const read = directory.read.bind(directory);
-          const close = directory.close.bind(directory);
-          directory.read = (async () => {
-            await hold("directory.read");
-            return read();
-          }) as typeof directory.read;
-          directory.close = (async () => {
-            closes += 1;
-            try {
-              await close();
-              await hold("directory.close");
-            } finally {
-              finish();
-            }
-          }) as typeof directory.close;
-          await hold("opendir");
-          return directory;
-        },
         open: async (...args: Parameters<typeof fs.open>) => {
           const handle = await fs.open(...args);
           const stat = handle.stat.bind(handle);
@@ -541,8 +406,6 @@ async function heldSourceFixture(stage: string, failLate = false) {
       releaseGate();
     },
     start: (signal?: AbortSignal) =>
-      ["opendir", "directory.read", "directory.close"].includes(stage)
-        ? sources.list(signal)
-        : sources.readConfig(selected, signal),
+      sources.readConfig(selected, signal),
   };
 }

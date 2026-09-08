@@ -3,12 +3,6 @@ import fs from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import {
-  codexStateSourceBasename,
-  parseCodexStateSourcesResponse,
-  type CodexStateSource,
-  type CodexStateSourcesResponse,
-} from "@cloudx/shared";
 
 export interface ResolvedCodexStateSource {
   sourceId: string;
@@ -24,7 +18,6 @@ interface SourceDependencies {
     | "stat"
     | "realpath"
     | "access"
-    | "opendir"
     | "open"
     | "mkdir"
     | "rename"
@@ -138,111 +131,8 @@ export class CodexStateSources {
     }
   }
 
-  async list(signal?: AbortSignal): Promise<CodexStateSourcesResponse> {
-    return this.work(signal, async (check) => {
-      const shared = await this.resolveChecked("shared", check);
-      check();
-      const root = await this.legacyRoot(check, true);
-      check();
-      const sources: CodexStateSource[] = [
-        {
-          sourceId: "shared",
-          kind: "shared",
-          label: "Shared sessions",
-          updatedAt: null,
-        },
-      ];
-      if (!root) return { sources };
-      const directory = await this.dependencies.fs.opendir(root.home);
-      const names: string[] = [];
-      try {
-        while (true) {
-          check();
-          const entry = await directory.read();
-          check();
-          if (!entry) break;
-          if (!entry.isDirectory()) continue;
-          legacySourceId(entry.name);
-          names.push(entry.name);
-          if (names.length > 512)
-            throw new Error(
-              "Codex source inventory exceeds 512 retained sources.",
-            );
-        }
-      } finally {
-        await this.cleanup(() => directory.close());
-      }
-      check();
-      let next = 0;
-      let failure: unknown;
-      await Promise.all(
-        Array.from({ length: Math.min(4, names.length) }, async () => {
-          try {
-            while (!failure && next < names.length) {
-              check();
-              const name = names[next++]!;
-              const source = await this.resolveChecked(
-                legacySourceId(name),
-                check,
-              );
-              const heading = await this.readText(
-                path.join(source.home, "AGENTS.override.md"),
-                16 * 1024,
-                check,
-                true,
-                true,
-              );
-              check();
-              const stat = await this.directory(source.home, check);
-              check();
-              if (!sameSource(source, stat))
-                throw new Error("Codex source changed during inventory.");
-              const match = heading?.startsWith(
-                "# CloudX Codex Session Instructions\n",
-              )
-                ? /^## CloudX Template: ([^\r\n]{1,256})\r?\n/mu.exec(heading)
-                : null;
-              const label = match?.[1]?.trim();
-              check();
-              const updated = await this.dependencies.fs.stat(source.home);
-              check();
-              sources.push({
-                sourceId: source.sourceId,
-                kind: "legacy",
-                label:
-                  label && !/[\p{Cc}]/u.test(label)
-                    ? label
-                    : "Retained session source",
-                updatedAt: new Date(updated.mtimeMs).toISOString(),
-              });
-            }
-          } catch (error) {
-            failure ??= error;
-          }
-        }),
-      );
-      check();
-      if (failure) throw failure;
-      await this.requireIdentity(root, check);
-      await this.requireIdentity(shared, check);
-      check();
-      sources.sort((a, b) =>
-        a.kind === "shared"
-          ? -1
-          : b.kind === "shared"
-            ? 1
-            : (b.updatedAt ?? "").localeCompare(a.updatedAt ?? "") ||
-              a.sourceId.localeCompare(b.sourceId),
-      );
-      return parseCodexStateSourcesResponse({ sources });
-    });
-  }
-
-  resolve(
-    sourceId = "shared",
-    signal?: AbortSignal,
-  ): Promise<ResolvedCodexStateSource> {
-    return this.work(signal, (check) => this.resolveChecked(sourceId, check));
+  resolve(signal?: AbortSignal): Promise<ResolvedCodexStateSource> {
+    return this.work(signal, (check) => this.resolveChecked(check));
   }
 
   async readConfig(
@@ -268,7 +158,7 @@ export class CodexStateSources {
     source: ResolvedCodexStateSource,
     signal?: AbortSignal,
   ): Promise<void> {
-    const current = await this.resolve(source.sourceId, signal);
+    const current = await this.resolve(signal);
     if (!sameSource(source, current))
       throw new Error("Codex source binding is stale: source changed.");
   }
@@ -293,7 +183,8 @@ export class CodexStateSources {
   ): Promise<string> {
     return this.work(signal, async (check) => {
       const view = this.viewPath(tabId);
-      await this.requireIdentity(source, check);
+      const shared = await this.resolveChecked(check);
+      if (!sameSource(source, shared)) throw new Error("Codex launch requires the shared session store.");
       const existing = await this.bindingChecked(tabId, check);
       check();
       if (existing) {
@@ -348,15 +239,6 @@ export class CodexStateSources {
   ): Promise<ResolvedCodexStateSource | undefined> {
     const view = this.viewPath(tabId);
     if (!(await this.optionalStat(view, check))) {
-      if (
-        await this.optionalStat(
-          path.join(this.dataDir, "codex-homes", tabId),
-          check,
-        )
-      )
-        throw new Error(
-          "Retained Codex tab requires explicit session source selection in a new tab.",
-        );
       return undefined;
     }
     await this.directory(this.dataDir, check);
@@ -378,42 +260,22 @@ export class CodexStateSources {
       Object.keys(record).sort().join(",") !==
         "dev,home,ino,sourceId,version" ||
       record.version !== 1 ||
+      record.sourceId !== "shared" ||
       ![record.home, record.sourceId, record.dev, record.ino].every(
         (item) => typeof item === "string",
       )
     )
       throw new Error("Invalid Codex source binding.");
-    const selected = await this.resolveChecked(
-      record.sourceId as string,
-      check,
-    );
+    const selected = await this.resolveChecked(check);
     if (!sameSource(record as unknown as ResolvedCodexStateSource, selected))
       throw new Error("Codex source binding is stale: source changed.");
     return selected;
   }
 
   private async resolveChecked(
-    sourceId: string,
     check: () => void,
   ): Promise<ResolvedCodexStateSource> {
-    const basename = codexStateSourceBasename(sourceId);
-    const shared = await this.directory(this.originalHome, check);
-    let source = { ...shared, sourceId };
-    if (basename !== undefined) {
-      const root = await this.legacyRoot(check);
-      source = {
-        ...(await this.directory(path.join(root!.home, basename), check)),
-        sourceId,
-      };
-      if (
-        path.dirname(source.home) !== root!.home ||
-        source.home === shared.home ||
-        source.home === root!.home ||
-        (source.dev === shared.dev && source.ino === shared.ino)
-      )
-        throw new Error("Invalid Codex source alias.");
-      await this.requireIdentity(root!, check);
-    }
+    const source = await this.directory(this.originalHome, check);
     for (const name of ["sessions", "archived_sessions"]) {
       const candidate = path.join(source.home, name);
       const stat = await this.optionalStat(candidate, check);
@@ -426,23 +288,12 @@ export class CodexStateSources {
       if (
         !targetStat.isDirectory() ||
         targetStat.uid !== this.dependencies.uid() ||
-        (target !== candidate && target !== path.join(shared.home, name))
+        target !== candidate
       )
         throw new Error("Invalid Codex source history link.");
     }
     await this.requireIdentity(source, check);
     return source;
-  }
-
-  private async legacyRoot(
-    check: () => void,
-    optional = false,
-  ): Promise<ResolvedCodexStateSource | undefined> {
-    const root = path.join(this.dataDir, "codex-homes");
-    if (optional && !(await this.optionalStat(root, check))) return undefined;
-    await this.directory(this.dataDir, check);
-    const identity = await this.directory(root, check);
-    return { ...identity, sourceId: "root" };
   }
 
   private async directory(
@@ -472,7 +323,7 @@ export class CodexStateSources {
     )
       throw new Error("Codex source directory changed.");
     return {
-      sourceId: "",
+      sourceId: "shared",
       home,
       dev: String(after.dev),
       ino: String(after.ino),
@@ -522,7 +373,6 @@ export class CodexStateSources {
     cap: number,
     check: () => void,
     optional = false,
-    prefix = false,
   ): Promise<string | undefined> {
     check();
     let handle;
@@ -543,7 +393,7 @@ export class CodexStateSources {
       check();
       if (!before.isFile() || before.uid !== this.dependencies.uid())
         throw new Error("Invalid Codex source metadata owner or type.");
-      if (!prefix && before.size > cap)
+      if (before.size > cap)
         throw new Error("Codex source metadata exceeds size limit.");
       const buffer = Buffer.alloc(Math.min(before.size, cap));
       let offset = 0;
@@ -573,21 +423,11 @@ export class CodexStateSources {
         offset !== buffer.length
       )
         throw new Error("Codex source metadata changed during read.");
-      return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
-        buffer,
-        { stream: prefix && before.size > cap },
-      );
+      return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(buffer);
     } finally {
       await this.cleanup(() => handle.close());
     }
   }
-}
-
-export function legacySourceId(basename: string): string {
-  const sourceId = `legacy:${Buffer.from(basename, "utf8").toString("base64url")}`;
-  if (codexStateSourceBasename(sourceId) !== basename)
-    throw new Error("Invalid Codex source basename.");
-  return sourceId;
 }
 
 function sameSource(
@@ -595,6 +435,6 @@ function sameSource(
   right: ResolvedCodexStateSource,
 ): boolean {
   return (
-    left.home === right.home && left.dev === right.dev && left.ino === right.ino
+    left.sourceId === right.sourceId && left.home === right.home && left.dev === right.dev && left.ino === right.ino
   );
 }

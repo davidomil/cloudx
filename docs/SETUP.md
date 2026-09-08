@@ -319,33 +319,27 @@ config copy, an ordinary relative `sqlite_home` is normalized against its source
 config parent; absolute and home-relative values retain native handling. Source
 configuration is never rewritten.
 
-Resume picker, Resume last and Resume ID require an explicit **Session source**.
-The chooser fetches only when opened for resume, lists Shared sessions followed
-by retained homes newest first, and searches template label, date and source key.
-Identical labels remain separate owners; select the full key to distinguish them.
-Changing the source retains the selected mode and typed ID. New session clears
-both, and closing the dialog cancels its inventory request. Older API callers
-must supply `initialInput.resume.sourceId`; unqualified resume requests fail.
-`GET /api/codex/state-sources` returns only `sourceId`, `kind`, `label` and
-`updatedAt`, with no filesystem paths or conversation content.
+New sessions, Resume picker, Resume last and Resume ID all use the shared Codex
+history automatically. There is no Session source chooser or source inventory
+request. Resume picker and Resume last can include all directories or exec
+sessions; Resume ID takes the saved session UUID or name.
 
-Retained `codex-homes` directories and their databases, goals, paginated history,
-names, queues and attachments stay in place. Selecting a retained source opens
-its original state; shared history scanning does not import its SQLite-only
-goals or pages. Native `/resume` cannot switch owners after launch. New launch
-views persist a private canonical source binding, use the selected sessions and
-archive roots, and share the original home's native writer and maintenance locks.
-Only the maintenance lock file is shared inside `.tmp`; other temporary/native
-output stays private. Native name-index replacement is preserved on restart.
-An old persisted tab with no binding needs explicit source selection in a new
-tab. Missing, conflicting or changed bindings fail before launch.
+The `initialInput.resume.sourceId` field and `GET /api/codex/state-sources`
+endpoint have been removed. Requests containing the removed field fail explicitly;
+callers must omit it. Retained `codex-homes` directories are no longer discovered
+or selectable, and old legacy-bound launch views cannot be reopened. Shared
+launch views retain their canonical binding and share the original home's
+sessions, archives, native writer locks and maintenance lock. Only the maintenance
+lock file is shared inside `.tmp`; other temporary/native output stays private.
+Native name-index replacement is preserved on restart. Missing, corrupt or changed
+bindings fail before launch.
 
-The inventory is metadata-only: at most 512 direct real retained directories,
-four concurrent reads, a 16 KiB generated-heading prefix and a 30-second deadline.
-Selected config reads are capped at 1 MiB. Existing owned readable/writable modes
-remain unchanged. Ordinary New launches do not enumerate the inventory, open
-SQLite, scan transcripts, or walk ordinary project descendants. Existing ancestor
-instruction and skill discovery remains enabled.
+Shared config reads are capped at 1 MiB with a 30-second operation deadline.
+Existing owned readable/writable modes remain unchanged. Neither new nor resumed
+launches enumerate retired homes, open SQLite, scan transcripts, or walk ordinary
+project descendants. Existing ancestor instruction and skill discovery remains
+enabled. Before removing retired homes, check that no process still uses them and
+preserve any unique history outside the active CloudX data directory.
 
 Before operational activation, existing direct old-home native writers must be
 quiescent. One-time native initialization/reconciliation requires reviewed

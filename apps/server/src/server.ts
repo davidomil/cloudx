@@ -459,21 +459,6 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     return result;
   });
 
-  app.get("/api/codex/state-sources", async (request, reply) => {
-    const controller = new AbortController();
-    const abort = () => controller.abort();
-    request.raw.once("aborted", abort);
-    reply.raw.once("close", abort);
-    try {
-      return await services.codexStateSources!.list(controller.signal);
-    } catch {
-      return reply.code(503).send({ error: "Codex session source inventory is unavailable." });
-    } finally {
-      request.raw.off("aborted", abort);
-      reply.raw.off("close", abort);
-    }
-  });
-
   app.post<{ Params: { tabId: string } }>("/api/tabs/:tabId/active", async (request) => {
     services.sessions.setActiveTab(request.params.tabId);
     return { activeTabId: request.params.tabId };

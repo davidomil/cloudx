@@ -1,5 +1,4 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement, type RefObject } from "react";
-import { CodexStateSourceSelect } from "./CodexStateSourceSelect.js";
 import { AlertTriangle, Bell, BellRing, Bot, CheckCheck, ChevronDown, Columns2, GitBranch, LayoutTemplate, Maximize2, Mic, MicOff, Minimize2, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
 
 import { DEFAULT_WORKSPACE_MAX_PANES, RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsStore, type StatePersistenceStatus, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
@@ -2603,7 +2602,6 @@ function CreateTabDialog({
   const [templateId, setTemplateId] = useState("");
   const [codexResumeMode, setCodexResumeMode] = useState<CodexSessionResumeMode>("new");
   const [codexResumeSessionId, setCodexResumeSessionId] = useState("");
-  const [codexSourceId, setCodexSourceId] = useState("");
   const [codexResumeAll, setCodexResumeAll] = useState(false);
   const [codexResumeIncludeNonInteractive, setCodexResumeIncludeNonInteractive] = useState(false);
   const [createDirectory, setCreateDirectory] = useState(false);
@@ -2631,7 +2629,6 @@ function CreateTabDialog({
       setTemplateId("");
       setCodexResumeMode("new");
       setCodexResumeSessionId("");
-      setCodexSourceId("");
       setCodexResumeAll(false);
       setCodexResumeIncludeNonInteractive(false);
     }
@@ -2643,7 +2640,7 @@ function CreateTabDialog({
       const initialInput = isLocalWeb && localWebUrl.trim()
         ? { url: localWebUrl.trim() }
         : isCodex
-          ? codexTabInitialInput(codexResumeMode, codexResumeSessionId, codexResumeAll, codexResumeIncludeNonInteractive, codexSourceId)
+          ? codexTabInitialInput(codexResumeMode, codexResumeSessionId, codexResumeAll, codexResumeIncludeNonInteractive)
           : undefined;
       await onCreate({
         pluginId,
@@ -2701,7 +2698,6 @@ function CreateTabDialog({
               const mode = event.target.value as CodexSessionResumeMode;
               setCodexResumeMode(mode);
               if (mode === "new") {
-                setCodexSourceId("");
                 setCodexResumeSessionId("");
                 setCodexResumeAll(false);
                 setCodexResumeIncludeNonInteractive(false);
@@ -2714,7 +2710,6 @@ function CreateTabDialog({
             </select>
           </label>
         ) : null}
-        {isCodex && codexResumeMode !== "new" ? <CodexStateSourceSelect value={codexSourceId} onChange={setCodexSourceId} /> : null}
         {isCodex && codexResumeMode === "session" ? (
           <label>
             Session ID
@@ -2745,7 +2740,7 @@ function CreateTabDialog({
         ) : null}
         <div className="dialog-actions">
           <ControlButton onClick={onCancel}>Cancel</ControlButton>
-          <ControlButton className="primary-button" tone="primary" onClick={() => void submit()} disabled={!selectedPlugin || (requiresDirectory && !cwd.trim()) || (isCodex && codexResumeMode !== "new" && !codexSourceId) || (isCodex && codexResumeMode === "session" && !codexResumeSessionId.trim()) || busy}>
+          <ControlButton className="primary-button" tone="primary" onClick={() => void submit()} disabled={!selectedPlugin || (requiresDirectory && !cwd.trim()) || (isCodex && codexResumeMode === "session" && !codexResumeSessionId.trim()) || busy}>
             Create
           </ControlButton>
         </div>
@@ -2762,21 +2757,18 @@ export function codexTabInitialInput(
   resumeMode: CodexSessionResumeMode,
   sessionId: string,
   all: boolean,
-  includeNonInteractive: boolean,
-  sourceId: string
+  includeNonInteractive: boolean
 ): CreateTabRequest["initialInput"] {
   if (resumeMode === "new") {
     return undefined;
   }
-  if (!sourceId) throw new Error("Codex resume session source selection is required.");
   if (resumeMode === "session") {
     const trimmedSessionId = sessionId.trim();
-    return trimmedSessionId ? { resume: { mode: "session", sourceId, sessionId: trimmedSessionId } } : undefined;
+    return trimmedSessionId ? { resume: { mode: "session", sessionId: trimmedSessionId } } : undefined;
   }
   return {
     resume: {
       mode: resumeMode,
-      sourceId,
       all,
       includeNonInteractive
     }
