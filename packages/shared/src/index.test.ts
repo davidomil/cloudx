@@ -12,7 +12,6 @@ import {
   isUsableTabLayoutState,
   listTabLayoutPanes,
   parseCreateTabResponse,
-  parseCodexStateSourcesResponse,
   parseVoiceActionPlan,
   parseVoiceExecutionResult,
   readWorkspaceLayoutInstruction,
@@ -23,27 +22,6 @@ import {
   type CreateTabResponse,
   type TabLayoutState
 } from "./index.js";
-
-describe("parseCodexStateSourcesResponse", () => {
-  const shared = { sourceId: "shared", kind: "shared", label: "Shared sessions", updatedAt: null };
-  it("accepts complete descriptors and preserves duplicate labels as distinct owners", () => {
-    const sources = [shared, ...["YQ", "Yg"].map((key) => ({ sourceId: `legacy:${key}`, kind: "legacy", label: "Review", updatedAt: new Date(0).toISOString() }))];
-    expect(parseCodexStateSourcesResponse({ sources })).toEqual({ sources });
-    expect(parseCodexStateSourcesResponse({ sources: [] })).toEqual({ sources: [] });
-  });
-  it("accepts exactly 513 distinct owners and rejects only the 514th at the cap", () => {
-    const legacy = Array.from({ length: 513 }, (_, index) => ({ sourceId: `legacy:${btoa(`owner-${index}`).replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/u, "")}`, kind: "legacy", label: "Retained source", updatedAt: new Date(0).toISOString() }));
-    const sources = [shared, ...legacy.slice(0, 512)];
-    expect(new Set([...sources, legacy[512]!].map((source) => source.sourceId)).size).toBe(514);
-    expect(parseCodexStateSourcesResponse({ sources })).toEqual({ sources });
-    expect(() => parseCodexStateSourcesResponse({ sources: [...sources, legacy[512]!] })).toThrow();
-  });
-  it("rejects malformed, extra and duplicate descriptors independently of the cap", () => {
-    for (const value of [null, {}, { sources: [], home: "/secret" }, { sources: [shared, shared] }, { sources: [{ ...shared, home: "/secret" }] }, { sources: [{ ...shared, label: "x".repeat(257) }] }, { sources: [{ ...shared, updatedAt: "yesterday" }] }, { sources: [{ ...shared, updatedAt: "2026-02-31T00:00:00.000Z" }] }, { sources: [{ ...shared, kind: "legacy" }] }, { sources: [{ ...shared, sourceId: "legacy:Li4" }] }]) {
-      expect(() => parseCodexStateSourcesResponse(value)).toThrow();
-    }
-  });
-});
 
 describe("parseCreateTabResponse", () => {
   it("accepts a complete tab and window whose layout contains the created tab", () => {

@@ -279,221 +279,158 @@ test.describe("CloudX shipped shell", () => {
     }
   });
 
-  test("selects an exact retained source through the real route and factory", async ({
-    page,
-  }, testInfo) => {
-    let sourceRequests = 0;
-    const posts: Array<Record<string, unknown>> = [];
-    page.on("request", (request) => {
-      const url = new URL(request.url());
-      if (url.pathname === "/api/codex/state-sources") sourceRequests += 1;
-      if (url.pathname === "/api/tabs" && request.method() === "POST")
-        posts.push(request.postDataJSON());
-    });
-    let tabId: string | undefined;
-    const sourceId =
-      "legacy:" + Buffer.from("retained-001").toString("base64url");
-    try {
-      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
-      await page
-        .locator(".workspace-pane.active")
-        .getByTitle("Add tab to this pane")
-        .click();
-      expect(sourceRequests).toBe(0);
-      await page.getByLabel("Session", { exact: true }).selectOption("session");
-      await expect(
-        page.getByRole("button", { name: "Create", exact: true }),
-      ).toBeDisabled();
-      await expect(
-        page.getByLabel("Session source", { exact: true }).locator("option"),
-      ).toHaveCount(186);
-      await page
-        .getByLabel("Session source", { exact: true })
-        .selectOption(
-          "legacy:" + Buffer.from("retained-183").toString("base64url"),
-        );
-      await expect(page.getByLabel("Selected session source key")).toHaveCSS(
-        "text-transform",
-        "none",
-      );
-      await expect(page.getByLabel("Selected session source key")).toHaveText(
-        "legacy:" + Buffer.from("retained-183").toString("base64url"),
-        { useInnerText: true },
-      );
-      expect(
+  for (const mode of ["picker", "last", "session"] as const) {
+    test(`resumes ${mode} from shared history without a source selector`, async ({
+      page,
+    }, testInfo) => {
+      let sourceRequests = 0;
+      const posts: Array<Record<string, unknown>> = [];
+      page.on("request", (request) => {
+        const pathname = new URL(request.url()).pathname;
+        if (pathname === "/api/codex/state-sources") sourceRequests += 1;
+        if (pathname === "/api/tabs" && request.method() === "POST")
+          posts.push(request.postDataJSON());
+      });
+      let tabId: string | undefined;
+      try {
+        await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
         await page
-          .locator(".dialog")
-          .evaluate((dialog) => dialog.scrollWidth <= dialog.clientWidth + 1),
-      ).toBe(true);
-      const longLabelScreenshot = await page.screenshot({
-        path: testInfo.outputPath("source-long-label.png"),
-      });
-      await testInfo.attach("long source label", {
-        body: longLabelScreenshot,
-        contentType: "image/png",
-      });
-      await page.getByLabel("Session source", { exact: true }).selectOption("");
-      await page
-        .getByLabel("Session ID", { exact: true })
-        .fill("same-synthetic-thread");
-      await page.getByLabel("Find session source").fill("Duplicate Review");
-      await expect(
-        page.getByLabel("Session source", { exact: true }).locator("option"),
-      ).toHaveCount(3);
-      await page
-        .getByLabel("Session source", { exact: true })
-        .selectOption(
-          "legacy:" + Buffer.from("retained-000").toString("base64url"),
+          .locator(".workspace-pane.active")
+          .getByTitle("Add tab to this pane")
+          .click();
+        await page.getByLabel("Session", { exact: true }).selectOption(mode);
+        await expect(
+          page.getByLabel("Session source", { exact: true }),
+        ).toHaveCount(0);
+        await expect(page.getByLabel("Find session source")).toHaveCount(0);
+        const create = page.getByRole("button", {
+          name: "Create",
+          exact: true,
+        });
+        if (mode === "session") {
+          await expect(create).toBeDisabled();
+          await page
+            .getByLabel("Session ID", { exact: true })
+            .fill("same-synthetic-thread");
+        } else {
+          await page.getByLabel("All directories", { exact: true }).check();
+          await page
+            .getByLabel("Include exec sessions", { exact: true })
+            .check();
+        }
+        await expect(create).toBeEnabled();
+        expect(
+          await page
+            .locator(".dialog")
+            .evaluate((dialog) => dialog.scrollWidth <= dialog.clientWidth + 1),
+        ).toBe(true);
+        await testInfo.attach("shared resume dialog", {
+          body: await page.screenshot({
+            path: testInfo.outputPath("shared-resume.png"),
+          }),
+          contentType: "image/png",
+        });
+        const creation = page.waitForResponse(
+          (response) =>
+            response.request().method() === "POST" &&
+            new URL(response.url()).pathname === "/api/tabs",
         );
-      await page
-        .getByLabel("Session source", { exact: true })
-        .selectOption(sourceId);
-      await expect(page.getByLabel("Session ID", { exact: true })).toHaveValue(
-        "same-synthetic-thread",
-      );
-      await expect(page.getByLabel("Selected session source key")).toHaveText(
-        sourceId,
-      );
-      await expect(page.getByLabel("Selected session source key")).toHaveCSS(
-        "text-transform",
-        "none",
-      );
-      await expect(page.getByLabel("Selected session source key")).toHaveText(
-        sourceId,
-        { useInnerText: true },
-      );
-      await page.getByLabel("Find session source").fill(sourceId);
-      await page.getByLabel("Session source", { exact: true }).focus();
-      await page.keyboard.press("Home");
-      await page.keyboard.press("ArrowDown");
-      await expect(
-        page.getByLabel("Session source", { exact: true }),
-      ).toHaveValue(sourceId);
-      const screenshot = await page.screenshot({
-        path: testInfo.outputPath("source-selector.png"),
-      });
-      await testInfo.attach("source selector", {
-        body: screenshot,
-        contentType: "image/png",
-      });
-      expect(
-        await page.evaluate(
-          () => document.documentElement.scrollWidth <= innerWidth + 1,
-        ),
-      ).toBe(true);
-      await page.getByLabel("Session", { exact: true }).selectOption("new");
-      await expect(
-        page.getByLabel("Session source", { exact: true }),
-      ).toHaveCount(0);
-      expect(sourceRequests).toBe(1);
-      await page.getByLabel("Session", { exact: true }).selectOption("session");
-      await expect(page.getByLabel("Session ID", { exact: true })).toHaveValue(
-        "",
-      );
-      await expect(
-        page.getByLabel("Session source", { exact: true }),
-      ).toHaveValue("");
-      await page
-        .getByLabel("Session ID", { exact: true })
-        .fill("same-synthetic-thread");
-      await page
-        .getByLabel("Session source", { exact: true })
-        .selectOption(sourceId);
-      const creation = page.waitForResponse(
-        (response) =>
-          response.request().method() === "POST" &&
-          new URL(response.url()).pathname === "/api/tabs",
-      );
-      await page.getByRole("button", { name: "Create", exact: true }).click();
-      const created = await creation;
-      expect(created.status()).toBe(201);
-      tabId = ((await created.json()) as CreateTabResponse).tab.id;
-      expect(posts).toHaveLength(1);
-      expect(posts[0]).toMatchObject({
-        initialInput: {
-          resume: {
-            mode: "session",
-            sourceId,
-            sessionId: "same-synthetic-thread",
-          },
-        },
-      });
-      await expect(page.locator(".xterm-rows")).toContainText("SOURCE:owner-1");
-      const binding = JSON.parse(
-        await fs.readFile(
-          path.join(
-            testRoot,
-            "data",
-            "codex-launches",
-            tabId,
-            ".cloudx-source.json",
+        await create.click();
+        const response = await creation;
+        expect(response.status()).toBe(201);
+        tabId = ((await response.json()) as CreateTabResponse).tab.id;
+        expect(posts).toHaveLength(1);
+        expect(posts[0]?.initialInput).toEqual({
+          resume:
+            mode === "session"
+              ? { mode, sessionId: "same-synthetic-thread" }
+              : { mode, all: true, includeNonInteractive: true },
+        });
+        await expect(page.locator(".xterm-rows")).toContainText(
+          "SOURCE:shared",
+        );
+        const binding = JSON.parse(
+          await fs.readFile(
+            path.join(
+              testRoot,
+              "data",
+              "codex-launches",
+              tabId,
+              ".cloudx-source.json",
+            ),
+            "utf8",
           ),
-          "utf8",
-        ),
-      );
-      expect(binding.sourceId).toBe(sourceId);
-      const starts = (
-        await fs.readFile(path.join(testRoot, "fixture-starts.jsonl"), "utf8")
-      )
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line));
-      expect(starts.at(-1)).toMatchObject({
-        sourceId,
-        marker: "owner-1",
-        sqliteHome: binding.home,
-      });
-    } finally {
-      if (tabId) await page.request.delete(`${baseUrl}/api/tabs/${tabId}`);
-    }
-  });
+        );
+        expect(binding).toMatchObject({
+          sourceId: "shared",
+          home: await fs.realpath(path.join(testRoot, "codex-home")),
+        });
+        const starts = (
+          await fs.readFile(path.join(testRoot, "fixture-starts.jsonl"), "utf8")
+        )
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line));
+        expect(starts.at(-1)).toMatchObject({
+          sourceId: "shared",
+          marker: "shared",
+          sqliteHome: binding.home,
+          args:
+            mode === "session"
+              ? expect.arrayContaining(["resume", "same-synthetic-thread"])
+              : expect.arrayContaining([
+                  "resume",
+                  "--all",
+                  "--include-non-interactive",
+                  ...(mode === "last" ? ["--last"] : []),
+                ]),
+        });
+        expect(sourceRequests).toBe(0);
+      } finally {
+        if (tabId) await page.request.delete(`${baseUrl}/api/tabs/${tabId}`);
+      }
+    });
+  }
 
-  test("discards a pending catalog after closing and reopening the resume dialog", async ({
+  test("reopening the resume dialog resets the mode and ID without fetching sources", async ({
     page,
   }) => {
-    let release!: () => void;
-    const held = new Promise<void>((resolve) => {
-      release = resolve;
+    let sourceRequests = 0;
+    page.on("request", (request) => {
+      if (new URL(request.url()).pathname === "/api/codex/state-sources")
+        sourceRequests += 1;
     });
-    let requests = 0;
-    await page.route("**/api/codex/state-sources", async (route) => {
-      requests += 1;
-      if (requests === 1) {
-        const response = await route.fetch();
-        await held;
-        await route.fulfill({ response }).catch(() => undefined);
-      } else await route.continue();
-    });
-    try {
-      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
-      await page
-        .locator(".workspace-pane.active")
-        .getByTitle("Add tab to this pane")
-        .click();
-      await page.getByLabel("Session", { exact: true }).selectOption("picker");
-      await expect(page.getByText("Loading session sources…")).toBeVisible();
-      await page.getByRole("button", { name: "Cancel", exact: true }).click();
-      await page
-        .locator(".workspace-pane.active")
-        .getByTitle("Add tab to this pane")
-        .click();
-      await page.getByLabel("Session", { exact: true }).selectOption("picker");
-      await expect(
-        page.getByLabel("Session source", { exact: true }).locator("option"),
-      ).toHaveCount(186);
-      release();
-      await expect(
-        page.getByLabel("Session source", { exact: true }),
-      ).toHaveValue("");
-      await expect(
-        page.getByRole("button", { name: "Create", exact: true }),
-      ).toBeDisabled();
-      expect(requests).toBe(2);
-      await page.getByRole("button", { name: "Cancel", exact: true }).click();
-    } finally {
-      release();
-      await page.unrouteAll({ behavior: "wait" });
-    }
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    await page
+      .locator(".workspace-pane.active")
+      .getByTitle("Add tab to this pane")
+      .click();
+    await page.getByLabel("Session", { exact: true }).selectOption("session");
+    await page.getByLabel("Session ID", { exact: true }).fill("discarded-id");
+    await page.getByRole("button", { name: "Cancel", exact: true }).click();
+    await page
+      .locator(".workspace-pane.active")
+      .getByTitle("Add tab to this pane")
+      .click();
+    await expect(page.getByLabel("Session", { exact: true })).toHaveValue(
+      "new",
+    );
+    await page.getByLabel("Session", { exact: true }).selectOption("session");
+    await expect(page.getByLabel("Session ID", { exact: true })).toHaveValue(
+      "",
+    );
+    await expect(
+      page.getByRole("button", { name: "Create", exact: true }),
+    ).toBeDisabled();
+    await page.getByLabel("Session", { exact: true }).selectOption("picker");
+    await expect(
+      page.getByRole("button", { name: "Create", exact: true }),
+    ).toBeEnabled();
+    await expect(
+      page.getByLabel("Session source", { exact: true }),
+    ).toHaveCount(0);
+    expect(sourceRequests).toBe(0);
+    await page.getByRole("button", { name: "Cancel", exact: true }).click();
   });
 
   test("creates a tab from the committed window without duplicate layout persistence", async ({
@@ -714,7 +651,7 @@ async function writeTerminalFixture(root: string): Promise<string> {
       'const binding = JSON.parse(fs.readFileSync(require("node:path").join(process.env.CODEX_HOME, ".cloudx-source.json"), "utf8"));',
       'const markerPath = require("node:path").join(process.env.CODEX_SQLITE_HOME, "source-marker.txt");',
       'const sourceMarker = fs.existsSync(markerPath) ? fs.readFileSync(markerPath, "utf8") : "shared";',
-      "const identity = { pid: process.pid, start: Date.now(), sourceId: binding.sourceId, sqliteHome: process.env.CODEX_SQLITE_HOME, marker: sourceMarker };",
+      "const identity = { pid: process.pid, start: Date.now(), args: process.argv.slice(2), sourceId: binding.sourceId, sqliteHome: process.env.CODEX_SQLITE_HOME, marker: sourceMarker };",
       'fs.appendFileSync(startLog, JSON.stringify(identity) + "\\n");',
       'const marker = "PID:" + identity.pid + "\\r\\nSTART:" + identity.start + "\\r\\nSOURCE:" + sourceMarker;',
       'async function output(text) { if (!process.stdout.write(text)) await once(process.stdout, "drain"); }',

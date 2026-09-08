@@ -36,11 +36,7 @@ import type {
   WorkspaceStateResponse,
   WorkspaceTab
 } from "@cloudx/shared";
-import { parseCodexStateSourcesResponse, parseCreateTabResponse, parseVoiceExecutionResult, type CodexStateSourcesResponse } from "@cloudx/shared";
-
-export async function getCodexStateSources(signal?: AbortSignal): Promise<CodexStateSourcesResponse> {
-  return parseCodexStateSourcesResponse(await fetchJson<unknown>("/api/codex/state-sources", { signal }));
-}
+import { parseCreateTabResponse, parseVoiceExecutionResult } from "@cloudx/shared";
 
 export interface HealthResponse {
   status: string;

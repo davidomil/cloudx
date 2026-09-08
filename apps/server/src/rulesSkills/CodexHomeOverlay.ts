@@ -66,7 +66,7 @@ export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptio
   const codexHome = await options.sources.bind(options.tabId, options.source);
   const rulesSkillsRoot = rulesSkillsRootPath(options.dataDir);
   if (options.resetCodexHome !== false) {
-    await prepareDurableView(codexHome, options.source.home, (await options.sources.resolve("shared")).home);
+    await prepareDurableView(codexHome, options.source.home);
   }
   // Only attempt-owned generated material is disposable. The bound view persists.
   const staging = await fsp.mkdtemp(path.join(codexHome, ".cloudx-generated-"));
@@ -125,30 +125,24 @@ async function publishGenerated(staging: string, home: string, hasInstructions: 
   }
 }
 
-async function prepareDurableView(home: string, selected: string, shared: string): Promise<void> {
+async function prepareDurableView(home: string, shared: string): Promise<void> {
   // Validate every existing view path before creating any missing source objects.
   for (const name of ["config.toml", "AGENTS.override.md", "skills", ".tmp"]) {
     const existing = await optionalLstat(path.join(home, name));
     if (existing && (existing.isSymbolicLink() || ((name === "skills" || name === ".tmp") ? !existing.isDirectory() : !existing.isFile()))) throw new Error("Unexpected generated Codex view type.");
   }
-  const links: Array<[string, string]> = [["sessions", selected], ["archived_sessions", selected], ["session_index.jsonl", selected], ["thread-writer-locks", shared], [".tmp/rollout-maintenance.lock", shared]];
-  for (const [name, owner] of links) {
+  const links = ["sessions", "archived_sessions", "session_index.jsonl", "thread-writer-locks", ".tmp/rollout-maintenance.lock"];
+  for (const name of links) {
     const target = path.join(home, name);
     const existing = await optionalLstat(target);
     if (!existing) continue;
     if (name === "session_index.jsonl" && existing.isFile() && !existing.isSymbolicLink()) { await validateStateObject(target, "file"); continue; }
-    if (!existing.isSymbolicLink() || await fsp.realpath(target) !== await fsp.realpath(path.join(owner, name))) throw new Error("Unexpected Codex durable view link.");
+    if (!existing.isSymbolicLink() || await fsp.realpath(target) !== await fsp.realpath(path.join(shared, name))) throw new Error("Unexpected Codex durable view link.");
   }
   for (const name of ["sessions", "archived_sessions", "session_index.jsonl"]) {
     const kind = name.endsWith(".jsonl") ? "file" : "directory";
-    const source = path.join(selected, name);
-    const existing = await optionalLstat(source);
-    if (existing?.isSymbolicLink()) {
-      if (await fsp.realpath(source) !== path.join(shared, name)) throw new Error("Unexpected Codex state link target.");
-      await validateStateObject(await fsp.realpath(source), kind);
-    } else {
-      await ensureStateObject(source, kind);
-    }
+    const source = path.join(shared, name);
+    await ensureStateObject(source, kind);
     await strictStateLink(source, path.join(home, name), kind, name === "session_index.jsonl");
   }
   const writers = path.join(shared, "thread-writer-locks");

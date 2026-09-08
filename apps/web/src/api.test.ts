@@ -18,7 +18,6 @@ import {
   fileBrowserRawFileUrl,
   filenameFromContentDisposition,
   getConfig,
-  getCodexStateSources,
   getHooks,
   importDocumentationArchive,
   runTabAction,
@@ -36,15 +35,6 @@ import {
 } from "./api.js";
 
 describe("api client", () => {
-  it("fetches and validates the Codex source catalog with cancellation", async () => {
-    const signal = new AbortController().signal;
-    const body = { sources: [{ sourceId: "shared", kind: "shared", label: "Shared sessions", updatedAt: null }] };
-    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(body)).mockResolvedValueOnce(jsonResponse({ sources: [], extra: true }));
-    vi.stubGlobal("fetch", fetchMock);
-    await expect(getCodexStateSources(signal)).resolves.toEqual(body);
-    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/codex/state-sources", { signal, headers: undefined });
-    await expect(getCodexStateSources()).rejects.toThrow("Invalid Codex session sources response.");
-  });
   afterEach(() => {
     vi.unstubAllGlobals();
   });

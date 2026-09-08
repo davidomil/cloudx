@@ -670,57 +670,10 @@ export interface CodexTerminalInitialInput {
   reasoningEffort?: CodexReasoningEffort;
   resume?: {
     mode: Exclude<CodexSessionResumeMode, "new">;
-    sourceId: string;
     sessionId?: string;
     all?: boolean;
     includeNonInteractive?: boolean;
   };
-}
-
-export interface CodexStateSource {
-  sourceId: string;
-  kind: "shared" | "legacy";
-  label: string;
-  updatedAt: string | null;
-}
-
-export interface CodexStateSourcesResponse {
-  sources: CodexStateSource[];
-}
-
-/** Decode only canonical keys for one direct retained-home basename. */
-export function codexStateSourceBasename(sourceId: string): string | undefined {
-  if (sourceId === "shared") return undefined;
-  if (!/^legacy:[A-Za-z0-9_-]{2,171}$/u.test(sourceId)) throw new Error("Invalid Codex session source key.");
-  const encoded = sourceId.slice(7);
-  let basename: string;
-  let bytes: Uint8Array;
-  try {
-    bytes = Uint8Array.from(atob(encoded.replace(/-/gu, "+").replace(/_/gu, "/")), (char) => char.charCodeAt(0));
-    basename = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
-  } catch {
-    throw new Error("Invalid Codex session source key.");
-  }
-  const canonical = btoa(String.fromCharCode(...bytes)).replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/u, "");
-  if (bytes.length < 1 || bytes.length > 128 || canonical !== encoded || basename === "." || basename === ".." || /[\/\\\p{Cc}]/u.test(basename)) {
-    throw new Error("Invalid Codex session source key.");
-  }
-  return basename;
-}
-
-export function parseCodexStateSourcesResponse(value: unknown): CodexStateSourcesResponse {
-  const fail = (): never => { throw new Error("Invalid Codex session sources response."); };
-  if (!isRecord(value) || Object.keys(value).length !== 1 || !Array.isArray(value.sources) || value.sources.length > 513) return fail();
-  const keys = new Set<string>();
-  const sources = value.sources.map((source): CodexStateSource => {
-    if (!isRecord(source) || Object.keys(source).sort().join(",") !== "kind,label,sourceId,updatedAt" || typeof source.sourceId !== "string" || typeof source.label !== "string" || !source.label.trim() || source.label.length > 256 || /[\p{Cc}]/u.test(source.label)) return fail();
-    codexStateSourceBasename(source.sourceId);
-    if ((source.kind !== "shared" && source.kind !== "legacy") || source.kind !== (source.sourceId === "shared" ? "shared" : "legacy") || keys.has(source.sourceId)) return fail();
-    if (source.updatedAt !== null && (typeof source.updatedAt !== "string" || !Number.isFinite(Date.parse(source.updatedAt)) || new Date(source.updatedAt).toISOString() !== source.updatedAt)) return fail();
-    keys.add(source.sourceId);
-    return { sourceId: source.sourceId, kind: source.kind, label: source.label, updatedAt: source.updatedAt as string | null };
-  });
-  return { sources };
 }
 
 export interface CreateTabResponse {

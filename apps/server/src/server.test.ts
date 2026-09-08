@@ -29,8 +29,7 @@ import { HookRegistry } from "./hooks/HookRegistry.js";
 import { PluginRegistry } from "./pluginRegistry.js";
 import { LocalWebPlugin } from "./plugins/LocalWebPlugin.js";
 import { CodexTerminalSession } from "./plugins/CodexTerminalPlugin.js";
-import { CodexStateSources, legacySourceId } from "./plugins/CodexStateSources.js";
-import { parseCodexStateSourcesResponse } from "@cloudx/shared";
+import { CodexStateSources } from "./plugins/CodexStateSources.js";
 import {
   InstalledPluginService,
   type PluginGitClient,
@@ -54,26 +53,17 @@ import type { VoicePlanner } from "./voice/VoicePlanner.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
 
 describe("buildServer", () => {
-  it("serves source metadata through the real parser and sanitizes filesystem failures", async () => {
+  it("does not expose a Codex source-selection inventory", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-source-route-"));
     const config = testConfig(root);
-    const home = path.join(root, "codex-source");
-    await fs.mkdir(home);
-    await fs.mkdir(path.join(config.dataDir, "codex-homes", "duplicate-a"), { recursive: true });
+    await fs.mkdir(path.join(config.dataDir, "codex-homes", "retired"), { recursive: true });
     const services = buildServices(config);
-    services.codexStateSources = new CodexStateSources(config.dataDir, { CODEX_HOME: home });
     await services.pluginContributionsReady;
     const app = await buildServer(config, services);
     try {
       const response = await app.inject({ method: "GET", url: "/api/codex/state-sources" });
-      expect(response.statusCode).toBe(200);
-      expect(parseCodexStateSourcesResponse(response.json()).sources.map((source) => source.sourceId)).toEqual(["shared", legacySourceId("duplicate-a")]);
+      expect(response.statusCode).toBe(404);
       expect(response.body).not.toContain(root);
-      const list = vi.spyOn(services.codexStateSources, "list").mockRejectedValueOnce(new Error("private-content-secret"));
-      const failure = await app.inject({ method: "GET", url: "/api/codex/state-sources" });
-      expect(failure.statusCode).toBe(503);
-      expect(failure.body).not.toContain("private-content-secret");
-      expect(list.mock.calls[0]?.[0]).toBeInstanceOf(AbortSignal);
     } finally { await app.close(); await fs.rm(root, { recursive: true, force: true }); }
   });
 
@@ -82,17 +72,17 @@ describe("buildServer", () => {
     const config = testConfig(root);
     const home = path.join(root, "home");
     await fs.mkdir(home);
-    await fs.mkdir(path.join(config.dataDir, "codex-homes"), { recursive: true });
+    await fs.writeFile(path.join(home, "config.toml"), "");
     let opened!: () => void;
     let release!: () => void;
     const entered = new Promise<void>((resolve) => { opened = resolve; });
     const gate = new Promise<void>((resolve) => { release = resolve; });
     let closes = 0;
-    const sources = new CodexStateSources(config.dataDir, { CODEX_HOME: home }, { fs: { ...fs, opendir: async (...args: Parameters<typeof fs.opendir>) => {
-      const directory = await fs.opendir(...args);
-      const originalRead = directory.read.bind(directory);
+    const sources = new CodexStateSources(config.dataDir, { CODEX_HOME: home }, { fs: { ...fs, open: async (...args: Parameters<typeof fs.open>) => {
+      const directory = await fs.open(...args);
+      const originalRead = directory.stat.bind(directory);
       const originalClose = directory.close.bind(directory);
-      directory.read = (async () => { opened(); await gate; return originalRead(); }) as typeof directory.read;
+      directory.stat = (async () => { opened(); await gate; return originalRead(); }) as typeof directory.stat;
       directory.close = (async () => { closes += 1; return originalClose(); }) as typeof directory.close;
       return directory;
     } } });
@@ -105,7 +95,7 @@ describe("buildServer", () => {
     const notifications = vi.fn();
     vi.spyOn(services.workspace!, "onPersistenceStatusChange").mockReturnValue(notifications);
     const app = await buildServer(config, services);
-    const response = app.inject({ method: "GET", url: "/api/codex/state-sources" });
+    const response = sources.readConfig(await sources.resolve()).catch((error: Error) => error.message);
     let closeResult: unknown;
     let closing: Promise<void> | undefined;
     try {
@@ -114,7 +104,7 @@ describe("buildServer", () => {
       closing = app.close().catch((error: unknown) => { closeResult = error; });
       const repeated = app.close().catch(() => undefined);
       await vi.advanceTimersByTimeAsync(0);
-      expect((await response).statusCode).toBe(503);
+      expect(await response).toMatch(/cancelled/);
       await vi.waitFor(() => expect(disposeAutomation).toHaveBeenCalledTimes(1));
       // Composition begins once; the real dispose also calls its idempotent begin.
       expect(begin.mock.invocationCallOrder.filter((order) => order < disposeAutomation.mock.invocationCallOrder[0]!)).toHaveLength(1);
@@ -131,7 +121,7 @@ describe("buildServer", () => {
       expect(closes).toBe(0);
       release();
       await vi.waitFor(() => expect(closes).toBe(1));
-      await expect(sources.list()).rejects.toThrow(/cancelled/);
+      await expect(sources.resolve()).rejects.toThrow(/cancelled/);
     } finally {
       release();
       vi.useRealTimers();
@@ -1425,6 +1415,7 @@ describe("buildServer", () => {
     const services = buildServices(testConfig(root));
     const events: string[] = [];
     const jiraRelease = deferred<void>();
+    const forgeRelease = deferred<void>();
     const sessionRelease = deferred<void>();
     const automationRelease = deferred<void>();
     const documentationRelease = deferred<void>();
@@ -1437,6 +1428,11 @@ describe("buildServer", () => {
         events.push("jira:end");
       })
     } as unknown as NonNullable<AppServices["jiraPolling"]>;
+    vi.spyOn(services.forge!, "dispose").mockImplementation(async () => {
+      events.push("forge:start");
+      await forgeRelease.promise;
+      events.push("forge:end");
+    });
     vi.spyOn(services.automation!, "beginShutdown").mockImplementation(() => {
       events.push("automation:begin");
     });
@@ -1475,12 +1471,15 @@ describe("buildServer", () => {
     const close = app.close().then(() => {
       closed = true;
     });
-    await vi.waitFor(() => expect(events).toContain("jira:start"));
-    expect(events).toEqual(expect.arrayContaining(["jira:start", "sessions:start", "documentation:start", "voice:start"]));
+    await vi.waitFor(() => expect(events).toEqual(expect.arrayContaining(["jira:start", "forge:start", "documentation:start", "voice:start"])));
+    expect(events).not.toContain("sessions:start");
     expect(events).not.toContain("automation:begin");
     expect(events).not.toContain("automation:dispose:start");
     expect(closed).toBe(false);
 
+    forgeRelease.resolve(undefined);
+    await vi.waitFor(() => expect(events).toContain("sessions:start"));
+    expect(events.indexOf("sessions:start")).toBeGreaterThan(events.indexOf("forge:end"));
     jiraRelease.resolve(undefined);
     sessionRelease.resolve(undefined);
     await vi.waitFor(() => expect(events).toEqual(expect.arrayContaining(["jira:end", "sessions:end"])));
