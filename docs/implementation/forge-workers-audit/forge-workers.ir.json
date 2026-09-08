@@ -49,7 +49,7 @@
       "source_type": "repo_code",
       "authority": "primary",
       "locator": "apps/web/src/ui/ForgePanel.tsx",
-      "revision": "sha256:7cef67aeb27de10397780ad9fd4b0cb6b80045d87ae885d52dc479dbd391867e",
+      "revision": "sha256:f02ae7fc7e19b1fd2d1894dc40dc9b2db9d73e73e83ad6dc3f6ff456d50c9bae",
       "notes": "Implementation behavior and constraints only."
     },
     {
@@ -194,7 +194,7 @@
       "authority": "primary",
       "locator": "apps/server/src/plugins/CodexTerminalPlugin.ts",
       "notes": "Primary implementation of authorization callback at initial materialization and runtime-context refresh.",
-      "revision": "sha256:b6c00d8686efe019dfa3eedc34b7edda79d1d6ace29bbc97e32e7e8dffb0f926"
+      "revision": "sha256:cf323bb5e9ac75a6c869c2f6ec0e19dd6a899401e21975ef3883098483dcbdfd"
     },
     {
       "id": "src_codex_plugin_tests",
@@ -203,7 +203,7 @@
       "authority": "primary",
       "locator": "apps/server/src/plugins/CodexTerminalPlugin.test.ts",
       "notes": "Production materialization, source policy rejection and public-metadata spoofing tests.",
-      "revision": "sha256:0f4e1b6ee4ef76dfb86589f89805974f4fea7a7df1a3488c74e1c767f249cac8"
+      "revision": "sha256:72584d33ab6dd9ec70dd41f813f9a49c03e055c7c9aeaf1dd843d6a6a6b5299b"
     },
     {
       "id": "src_forge_runtime_tests",
@@ -248,7 +248,7 @@
       "authority": "primary",
       "locator": "apps/web/src/ui/ForgeWorkerTabs.tsx",
       "notes": "Worker identity selection, server-owned session matching, pane-focus attachment and keyboard-accessible subtabs.",
-      "revision": "sha256:78285f71115849ae992ef95bb449d5e1bde326c7fb4836f3eeb9147d98f9539f"
+      "revision": "sha256:a753a71e647fa757dad769c13083c0774cf3a7722c28bf9e01c677bc57cba071"
     },
     {
       "id": "src_workspace_commands",
@@ -275,7 +275,7 @@
       "authority": "primary",
       "locator": "apps/web/src/ui/ForgePanel.test.ts",
       "notes": "Selection, ownership mismatch rejection, resumed terminal replacement and focused-pane behavior.",
-      "revision": "sha256:095ebff21e56a8790b116274786132eb7e99cc7360eef491eab81e98b66db5be"
+      "revision": "sha256:4149cd4c4afb8fb11f429308d08af8bc78ae2186edc752a597f8f6d16d9550b9"
     },
     {
       "id": "src_forge_workflow_tests",
@@ -321,6 +321,87 @@
       "locator": "apps/server/src/jsonStateFile.test.ts",
       "notes": "Direct-child and identity boundary verification.",
       "revision": "sha256:7dfc5fa9784a84c0041b225aeba875e1c721e13b527f3ed7eaaa152a40b9a508"
+    },
+    {
+      "id": "src_forge_overlay",
+      "title": "Closable Forge worker terminal overlay",
+      "locator": "apps/web/src/ui/ForgeWorkerTerminalOverlay.tsx",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "notes": "Native modal terminal view, matched server-owned tab, close action and focused-terminal cancellation.",
+      "revision": "sha256:fda26dc5fa52b718220d7bf9b7861a8a23272cbbacdf8d08b33ad8a5029f1c24"
+    },
+    {
+      "id": "src_forge_overlay_styles",
+      "title": "Forge terminal overlay layout",
+      "locator": "apps/web/src/styles.css",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "notes": "Viewport-sized modal and bounded terminal layout.",
+      "revision": "sha256:40e01206af7dd81217d79b00a3245f74f7518879c5e7b44113d55b9536d58ae4"
+    },
+    {
+      "id": "src_forge_overlay_verification",
+      "title": "Forge terminal overlay verification",
+      "locator": "docs/implementation/forge-workers-audit/overlay-verification-runs.txt",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "notes": "Executed command logs, native-dialog browser observations and source archive records.",
+      "revision": "sha256:8204eabe5f2744870f0047320bb19c645beae035a08ab1ccf135861502aaf0a8"
+    },
+    {
+      "id": "src_w3c_native_dialog",
+      "title": "W3C H102 native modal dialogs",
+      "locator": "https://www.w3.org/WAI/WCAG22/Techniques/html/H102",
+      "source_type": "web",
+      "authority": "primary",
+      "notes": "Primary W3C accessibility guidance; active original doc_9ebe4d3c439b36a0253d5328; content SHA256 424fbebe092900d81aa3af9424336c53d6feb8f30bc4bf110547d0c591648552. This is a technique rather than a required implementation.",
+      "revision": "2026-09-08"
+    },
+    {
+      "id": "src_mdn_dialog_cancel",
+      "title": "MDN dialog cancel event",
+      "locator": "https://developer.mozilla.org/en-US/docs/Web/API/HTMLDialogElement/cancel_event",
+      "source_type": "web",
+      "authority": "primary",
+      "notes": "Mozilla API reference; active original doc_49261c73eca47c55d43e7c17; content SHA256 e5ef21df711c31ecf607bd1b689d70dcf052a8acdb0d3b37162da570e423f932. Supports preventing default dialog cancellation.",
+      "revision": "2026-09-08"
+    },
+    {
+      "id": "src_overlay_pty",
+      "title": "PTY resize adapter",
+      "locator": "apps/server/src/terminal/NodePtyTerminalProcess.ts",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "notes": "Narrow correction for the observed preview resize failure.",
+      "revision": "sha256:d9ae6fdb3de9b011fee3b91f2769e743778069ac6621703b091dc541b787309a"
+    },
+    {
+      "id": "src_overlay_pty_tests",
+      "title": "PTY resize race tests",
+      "locator": "apps/server/src/terminal/NodePtyTerminalProcess.test.ts",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "notes": "Narrow correction for the observed preview resize failure.",
+      "revision": "sha256:e63709289382061e8530ac8385bb62a865f03ffc62fdc397679dcb498b2281e3"
+    },
+    {
+      "id": "src_overlay_server",
+      "title": "Terminal WebSocket command boundary",
+      "locator": "apps/server/src/server.ts",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "notes": "Narrow correction for the observed preview resize failure.",
+      "revision": "sha256:9426bf6d60b42454a217fec6d01b098b0f2663ce63215ccc7c5be9e8fab5243e"
+    },
+    {
+      "id": "src_overlay_server_tests",
+      "title": "Real PTY replay and socket failure tests",
+      "locator": "apps/server/src/server.test.ts",
+      "source_type": "repo_code",
+      "authority": "primary",
+      "notes": "Narrow correction for the observed preview resize failure.",
+      "revision": "sha256:5bd40fcdd393c8caefc842e6110248ac22cb2f5af62dc4395ff19cd4de9ca09e"
     }
   ],
   "source_gaps": [],
@@ -658,9 +739,10 @@
         },
         {
           "kind": "paragraph",
-          "text": "Each issue or review has a worker tab inside Forge. Select it to view its controls and Codex terminal, or use **View worker** from the issue or request. Resuming keeps the worker selected as its terminal changes. Focus the Forge pane to interact with that terminal. Worker terminals stay inside Forge instead of opening additional workspace tabs.",
+          "text": "Workers tabs and controls stay inside Forge. Choose **View worker** from an issue, request or worker to open its terminal in an overlay above the current section. Use **X** to dismiss the view; the worker keeps running. Reopen **View worker** to return to the same terminal. Escape stays with the terminal while it has focus.",
           "claim_ids": [
-            "embedded-workers"
+            "worker-terminal-overlay",
+            "overlay-keyboard"
           ]
         },
         {
@@ -746,19 +828,9 @@
         },
         {
           "id": "embedded-workers",
-          "text": "Workers appear as selectable subtabs inside Forge; View worker selects the worker there, selection uses the stable worker identity across resumed terminal replacement, and server-owned sessions are excluded from top-level workspace placement.",
+          "text": "Worker selection and controls stay inside Forge. Server-owned worker sessions remain outside top-level workspace placement.",
           "support_status": "supported",
           "evidence": [
-            {
-              "source_id": "src_forge_worker_tabs",
-              "locator": "ForgeWorkerTabs",
-              "excerpt": "Selects by worker ID, validates Forge owner plus matching session/worker metadata, renders the terminal only in the focused Forge pane."
-            },
-            {
-              "source_id": "src_forge_panel",
-              "locator": "onViewWorker; Workers view",
-              "excerpt": "View worker sets the selected worker ID and opens the Workers section."
-            },
             {
               "source_id": "src_forge_runtime",
               "locator": "launch",
@@ -778,6 +850,60 @@
               "source_id": "src_forge_runtime",
               "locator": "recover; requireWorkerTab",
               "excerpt": "Worker recovery and lifecycle control require server-assigned ownerPluginId=forge as well as matching worker metadata and cwd."
+            }
+          ]
+        },
+        {
+          "id": "worker-terminal-overlay",
+          "text": "View worker opens a terminal overlay above the current Forge section. X dismisses only the view; reopening returns to the same terminal. Worker tabs and controls remain inside Forge.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_panel",
+              "locator": "onViewWorker; terminalWorkerId; ForgeWorkerTerminalOverlay",
+              "excerpt": "Keeps the current section while selecting a terminal worker; dismissing clears only terminal view state."
+            },
+            {
+              "source_id": "src_forge_overlay",
+              "locator": "ForgeWorkerTerminalOverlay",
+              "excerpt": "Displays the matching owned terminal inside a native dialog; the close button closes the dialog without a worker lifecycle action."
+            },
+            {
+              "source_id": "src_forge_panel_tests",
+              "locator": "opens, closes, and reopens the same worker above Issues without a lifecycle action",
+              "excerpt": "Current section and worker session survive dismissal/reopening; no worker mutation hook is called."
+            },
+            {
+              "source_id": "src_forge_overlay_verification",
+              "locator": "overlay-browser-fixture",
+              "excerpt": "Real xterm and socket are reused across close/reopen; background output remains visible."
+            }
+          ]
+        },
+        {
+          "id": "overlay-keyboard",
+          "text": "The native dialog manages focus. Escape remains terminal input while the terminal has focus; Escape from the close control dismisses the dialog and restores focus.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_overlay",
+              "locator": "showModal; onCancel; onClose",
+              "excerpt": "Prevents native cancellation only when focus is inside the terminal container."
+            },
+            {
+              "source_id": "src_w3c_native_dialog",
+              "locator": "Description; Tests",
+              "excerpt": "Native modal dialog handles focus containment, outside content inertness and return to the invoking control."
+            },
+            {
+              "source_id": "src_mdn_dialog_cancel",
+              "locator": "cancel event; Examples",
+              "excerpt": "Cancel is preventable; preventing its default action keeps the dialog open."
+            },
+            {
+              "source_id": "src_forge_overlay_verification",
+              "locator": "overlay-browser-fixture",
+              "excerpt": "Native browser checks deliver Escape/Tab to xterm and close with Escape from the close control."
             }
           ]
         }
@@ -1059,28 +1185,42 @@
       "blocks": [
         {
           "kind": "paragraph",
-          "text": "Codex 0.153.4 passed seven native terminal trust checks using isolated test checkouts. Exact checkout trust loaded project configuration and reached the initialized composer; trusting only the parent still showed the trust dialog. These startup checks submitted no prompt and made no model requests.",
+          "text": "This revision passed 84 focused web tests and 231 server tests. `npm run typecheck`, `npm run build` and 12 shipped-shell browser checks also passed. Desktop and mobile browser fixtures verified close/reopen, retained output and connection, focus and Escape/Tab input, without lifecycle commands, page errors or horizontal overflow.",
+          "claim_ids": [
+            "overlay-verification"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "The restarted preview passed overlay open/close/reopen checks while the issue worker stayed awaiting review. Its earlier terminal session was unavailable, so that live check did not exercise xterm continuity or send worker input. The production-component browser fixture and real PTY regressions cover terminal continuity separately.",
+          "claim_ids": [
+            "overlay-live-scope"
+          ]
+        },
+        {
+          "kind": "paragraph",
+          "text": "In the previous revision, Codex 0.153.4 passed seven native terminal trust checks using isolated checkouts. Exact checkout trust loaded project configuration and reached the initialized composer; trusting only the parent showed the trust dialog. These startup checks submitted no prompt and made no model requests.",
           "claim_ids": [
             "native-trust-verification"
           ]
         },
         {
           "kind": "paragraph",
-          "text": "Nested worker UI checks passed 77 tests in four files. Desktop and mobile browser fixtures verified terminal input, worker switching, paused output retention and resumed-session replacement. They used the production terminal component and reported no page errors or horizontal overflow.",
+          "text": "The previous nested worker UI checks passed 77 tests in four files. Desktop and mobile browser fixtures verified terminal input, worker switching, paused output retention and resumed-session replacement. They used the production terminal component and reported no page errors or horizontal overflow.",
           "claim_ids": [
             "nested-ui-verification"
           ]
         },
         {
           "kind": "paragraph",
-          "text": "The current revision passed `npm test -- --reporter=dot --maxWorkers=4`: 2,359 tests in 120 files. `npm run typecheck`, `npm run build` and all 12 shipped-shell browser tests also passed. The audit retains earlier timing failures and a snapshot failure caused by concurrent documentation editing, together with their passing reruns.",
+          "text": "The previous directory-trust and recovery revision passed 2,359 tests in 120 files, typecheck, all workspace builds and 12 shipped-shell browser checks. Those results are retained as previous-revision evidence; this terminal-view and resize change uses focused UI, server and browser checks.",
           "claim_ids": [
             "revision-verification"
           ]
         },
         {
           "kind": "paragraph",
-          "text": "A live GitHub issue worker resumed in its retained checkout after resource recovery. Codex worked without the trust prompt, and the source configuration and production service stayed unchanged. Desktop and mobile checks showed its terminal inside Forge, with no page errors or horizontal overflow.",
+          "text": "The previous revision also verified a live GitHub issue worker resuming in its retained checkout. Codex worked without the trust prompt, and the source configuration and production service stayed unchanged.",
           "claim_ids": [
             "live-github-verification"
           ]
@@ -1152,7 +1292,7 @@
         },
         {
           "id": "revision-verification",
-          "text": "The revision passed 2359 tests in 120 files with four test workers. Typecheck, all workspace builds and 12 shipped-shell browser tests passed.",
+          "text": "The previous directory-trust and recovery revision passed 2359 tests in 120 files, typecheck, all workspace builds and 12 shipped-shell browser tests.",
           "support_status": "supported",
           "evidence": [
             {
@@ -1171,6 +1311,30 @@
               "source_id": "src_forge_trust_verification",
               "locator": "final-live-github-recovery",
               "excerpt": "Exact browser command and artifact hashes, selected finalRefresh/finalBrowser booleans, visually inspected desktop/mobile screenshots of actual gpt-6-astra activity."
+            }
+          ]
+        },
+        {
+          "id": "overlay-verification",
+          "text": "The revision passed 84 web and 231 server tests, typecheck, all workspace builds and 12 shipped-shell browser tests. Desktop/mobile fixtures verified terminal overlay behavior.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_overlay_verification",
+              "locator": "focused-web; terminal-resize-regressions; final-typecheck; final-build; shipped-browser; overlay-browser-fixture",
+              "excerpt": "Exact executed commands and hashes; separate web/server test counts and real native-dialog fixture scope."
+            }
+          ]
+        },
+        {
+          "id": "overlay-live-scope",
+          "text": "The restarted preview passed overlay open/close/reopen with the worker still awaiting review. Its earlier terminal session was unavailable; the live check sent no worker resume or input.",
+          "support_status": "supported",
+          "evidence": [
+            {
+              "source_id": "src_forge_overlay_verification",
+              "locator": "live-overlay",
+              "excerpt": "Both viewport reports show terminalAvailable=false, preserved focus/section, unchanged awaiting_review PR6 worker and production service. Actual xterm continuity is covered separately by the fixture and real PTY tests."
             }
           ]
         }

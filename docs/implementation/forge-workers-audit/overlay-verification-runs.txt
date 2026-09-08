@@ -1,0 +1,107 @@
+Forge closable worker terminal overlay verification, 2026-09-08 UTC
+
+[scope]
+Terminal overlay change with a narrow exited-PTY resize boundary correction. View worker opens the existing worker terminal above the current Forge section; X dismisses the view while the worker continues; reopening uses the same terminal. Workers tabs and controls remain inside Forge. Application behavior is established by the landed UI source and the focused/native-dialog browser checks below.
+
+[source-research]
+Archive-first exact search: Forge worker terminal closable overlay native dialog showModal cancel preventDefault Escape.
+Result: active WHATWG interactive elements doc_d6e016dc41139e326fac0857 and W3C modal dialog pattern; opened WHATWG original chunks. Targeted official pages were then opened with the built-in web tool.
+W3C H102 https://www.w3.org/WAI/WCAG22/Techniques/html/H102 is primary W3C accessibility guidance, describing native dialog focus/inert behavior; it is a technique, not a required implementation. MDN cancel-event reference https://developer.mozilla.org/en-US/docs/Web/API/HTMLDialogElement/cancel_event is authoritative Mozilla API documentation supporting cancellation handling. Actual application/browser checks establish Escape and worker-lifecycle behavior.
+Command: node "$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-ingest/scripts/cloudx-doc.mjs" ingest-url https://www.w3.org/WAI/WCAG22/Techniques/html/H102
+Result: active original HTML doc_9ebe4d3c439b36a0253d5328, 9 source chunks, content SHA256 424fbebe092900d81aa3af9424336c53d6feb8f30bc4bf110547d0c591648552.
+Command: node "$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-ingest/scripts/cloudx-doc.mjs" ingest-url https://developer.mozilla.org/en-US/docs/Web/API/HTMLDialogElement/cancel_event
+Result: active original HTML doc_49261c73eca47c55d43e7c17, 8 source chunks, content SHA256 e5ef21df711c31ecf607bd1b689d70dcf052a8acdb0d3b37162da570e423f932.
+Command: node "$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-search/scripts/cloudx-doc.mjs" search "H102 modal dialog focus invoking element" --limit 3
+Command: node "$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-search/scripts/cloudx-doc.mjs" open doc_9ebe4d3c439b36a0253d5328 --chunks 9 --chars 2400
+Result: active W3C source found; original HTML focus return and inert content description inspected.
+Command: node "$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-search/scripts/cloudx-doc.mjs" search "HTMLDialogElement cancel preventDefault Escape" --limit 3
+Command: node "$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-search/scripts/cloudx-doc.mjs" open doc_49261c73eca47c55d43e7c17 --chunks 8 --chars 2400
+Result: active MDN source found; original HTML cancellation/preventDefault behavior inspected.
+
+
+[focused-ui]
+Command: npx vitest run apps/web/src/ui/ForgePanel.test.ts --reporter=dot
+Original log: cloudx-forge-overlay-ui-tests.log
+Original SHA256: 6f205c7aa121ce0df1db904687294d1a486fb61b91c91e3eb5c269a65b9cf17e
+Result: 36 tests in 1 file passed.
+
+[focused-web]
+Command: npx vitest run apps/web/src/ui/ForgePanel.test.ts apps/web/src/ui/TerminalPanel.test.ts apps/web/src/ui/App.test.ts apps/web/src/ui/layout.test.ts --reporter=dot --maxWorkers=2
+Original log: cloudx-forge-overlay-web-tests.log
+Original SHA256: 4dc6ce18ddc60ce1d2067d5c9aa21dfaf53acf82a1df5f5b6f993841e8bc7aaf
+Result: 84 tests in 4 files passed.
+
+[web-typecheck]
+Command: npx tsc -b apps/web --pretty false
+Original log: cloudx-forge-overlay-web-typecheck.log
+Original SHA256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+Result: Passed; output log is empty.
+
+[overlay-browser-fixture]
+Command: node /tmp/cloudx-forge-overlay-browser.mjs
+Original log: cloudx-forge-overlay-browser.log
+Original SHA256: fe9b23853e38ec1935f855a7798a51c5f41263cf3c0c3b4033b258e2437ffbfb
+Result: Passed desktop 1440x1000 and Playwright Pixel 7 emulation. Production ForgePanel, ForgeWorkerTerminalOverlay and TerminalPanel/xterm used native dialog and deterministic hook/socket transport.
+Observed by browser assertions: native modal positioning above a narrow/clipped parent, focus containment/restoration and inert background, same xterm/socket after X close and reopen, background output retained, Escape/Tab input delivered to the terminal, Escape closes from the close control, original issue section preserved, worker switching, inactive-pane detach, no lifecycle commands, no page errors or horizontal overflow.
+Root and documentation reviewer visually inspected desktop/mobile open screenshots. Fixture HTML was copied to temporary evidence then removed from the repository; the Vite fixture server was stopped. This deterministic fixture is not a live worker execution claim.
+cloudx-forge-overlay-browser.mjs SHA256: d9663c323564cef4c9e94145e0d2604cd29787fdb1e613ca5116082c232c7040
+cloudx-forge-overlay-browser/desktop-closed.png SHA256: accdb370ec0092f06bf57d48731e8173eac84c9bc45da05d1e0d80304975eab9
+cloudx-forge-overlay-browser/desktop-open.png SHA256: b75da66ce19190c25387e3225ea52753da04c3b0cbf5483949b7c00eab2f2cb6
+cloudx-forge-overlay-browser/fixture.html SHA256: 78cf03db0e9c4d66446ad37c9129be5d99cb93440d71cb5973e9d16fa988b703
+cloudx-forge-overlay-browser/mobile-closed.png SHA256: 2ddff4d608e40ed205f2f6f730790deb98c77fa318275cc8df4f93bbb9f5605f
+cloudx-forge-overlay-browser/mobile-open.png SHA256: f7020daaa80cbb9f6771d1003dccd86c782d2ecffe2b14d8785e6e162c0d2e0e
+cloudx-forge-overlay-browser/result.json SHA256: fe9b23853e38ec1935f855a7798a51c5f41263cf3c0c3b4033b258e2437ffbfb
+
+[previous-revision]
+The 2359-test/120-file suite and 12 shipped-shell checks belong to the previous directory-trust/context-recovery revision. They are not a fresh broad-suite result for this overlay change. Exact evidence remains in trust-verification-runs.txt.
+
+[terminal-resize-regressions]
+Command: npx vitest run apps/server/src/terminal/NodePtyTerminalProcess.test.ts apps/server/src/plugins/CodexTerminalPlugin.test.ts apps/server/src/server.test.ts --maxWorkers=2
+Original log: cloudx-terminal-resize-tests.log
+Original SHA256: c47f31eb09f8afe98bca38f2e2a7cfa0f1bf915fba42f9d3e52e81ec2f3c49fd
+Result: 231 tests in 3 files passed. Real PTY exit and awaited stop cases reopen and resize twice with replay retained, WebSocket open and HTTP 200. ENOTTY/EBADF resize-race handling does not mark process exit or replace awaited termination; unrelated errors are rethrown.
+
+[terminal-resize-typecheck]
+Command: npx tsc -p apps/server/tsconfig.json --noEmit
+Original log: cloudx-terminal-resize-typecheck.log
+Original SHA256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+Result: Passed; output is empty.
+
+[pre-build-preview-crash]
+Inspection command: cat /tmp/cloudx-forge-overlay-resize-crash.log
+Observed journal excerpt: the preview exited at 00:09:04 UTC before the overlay build was applied or the preview restarted. Uncaught ioctl(2) failed, ENOTTY propagated through NodePtyTerminalProcess.resize, CodexTerminalSession.resize and the terminal WebSocket message callback. Production was unaffected. This was an observed failure of the prior running preview, not a passing overlay check.
+Original excerpt SHA256: 8021f91657a6d835f3d438b82bc1fd025a49db8343dfaba27a916520abbfb0a1
+
+[terminal-boundary-source-review]
+NodePtyTerminalProcess ignores resize after its recorded exit event. Exact ENOTTY/EBADF ioctl race messages are ignored only for resize and do not set exited/quiescent state; other errors rethrow. CodexTerminalSession skips resize for a known closed terminal. Unexpected WebSocket input/resize errors are logged and close only the affected socket with 1011; listener cleanup exceptions are contained. Regression cases keep the same session/replay available and prove server health after actual PTY exit/stop. These behaviors are grounded in the production source and tests rather than treating a descriptor error as proof of process-tree termination.
+
+[final-typecheck]
+Command: npm run typecheck
+Original log: cloudx-forge-overlay-typecheck.log
+Original SHA256: d6fdb8056eb56fed4465fd25d8416b553845d2700d9f61d587c4266d95595a5f
+Result: Passed.
+
+[final-build]
+Command: npm run build
+Original log: cloudx-forge-overlay-build.log
+Original SHA256: 0a137998dabfcb231026bad84fba2f7b8579c051e7d11ace120950af75959678
+Result: Passed all workspace builds; existing AutomationPanel chunk warning remains.
+
+[shipped-browser]
+Command: npm run test:browser
+Original log: cloudx-forge-overlay-shipped-browser.log
+Original SHA256: 4bfc660ff0039dd4dd934bc150dff60485aba38567c3461d2755eaad75158a88
+Result: 12 shipped-shell browser tests passed in 9.9 seconds.
+
+[live-overlay]
+Command: node /tmp/cloudx-forge-overlay-live.mjs
+Original log: cloudx-forge-overlay-live.log
+Original SHA256: f30526576d5b81fa79e6d6fad9a469f4dafd51441b68c9f6a2aae64da81c189f
+Result: Passed desktop and Pixel 7 emulation on the restarted preview. Open/close/reopen preserved the Issues section and opener focus; worker remained awaiting_review on PR6, with no worker resume/input/lifecycle mutation.
+Live scope: terminalAvailable=false on both viewports because the previous process/session ended before the crash. The live run verifies the unavailable-terminal overlay, not current xterm continuity or model execution. Actual xterm/socket continuity is established by the production-component browser fixture; ended-process replay/resize is established by real PTY regressions. Root visually inspected desktop/mobile live screenshots; documentation reviewer inspected mobile.
+Preview-only restart command: systemctl --user start cloudx-forge-test-3002.service
+Root observed preview PID898203 active after the corrected build. Production PID608793 stayed unchanged. No issue resume, model input, review submission or merge was performed for this overlay check.
+cloudx-forge-overlay-live.mjs SHA256: 1d759d299522171ab866b5ebefc8479e1c6ba620d6313d57148141ae8f6f7366
+cloudx-forge-overlay-live/desktop-open.png SHA256: a9360a68c9fc8252ed747f427e945a5a72534d24bee3d8b0bc4f51055168a315
+cloudx-forge-overlay-live/mobile-open.png SHA256: a1eac6534f9fafb81016ddd297e7133e2a77718c0a2c405f4bcb8dda8922c4b8
+cloudx-forge-overlay-live/result.json SHA256: f30526576d5b81fa79e6d6fad9a469f4dafd51441b68c9f6a2aae64da81c189f

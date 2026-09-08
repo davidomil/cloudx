@@ -1,5 +1,5 @@
 ---
-title: "Forge Workers current revision"
+title: "Forge worker terminal overlay revision"
 format:
   html:
     toc: true
@@ -10,24 +10,16 @@ format:
     variant: +yaml_metadata_block
 ---
 
-## Current revision: verified directory trust and worker terminals inside Forge
+## Current revision: closable worker terminal overlay
 
-Forge prepares managed remote checkouts and shows each issue or review worker as a tab inside Forge. **View worker** selects its controls and terminal. Worker selection survives Resume replacing the terminal session; server-owned worker sessions stay outside workspace pane layouts.
+**View worker** opens the existing worker terminal above the current Forge section. **X** dismisses only the view; reopening returns to the same terminal. Worker tabs and controls remain inside Forge.
 
-Explicit repository approval matches the provider, API URL and current repository settings. Before granting trust, Forge checks both the current ownership record and the captured checkout identity. Changed ownership, Git configuration or approval prevents the grant.
+The native modal dialog manages focus. Escape stays with the terminal while it has focus; Escape from the close control dismisses the overlay and returns focus to its opener.
 
-The worker’s private Codex overlay receives the exact canonical checkout trust entry. Source configuration and other project trust decisions remain unchanged; an explicit untrusted checkout decision is preserved. Confirmed failures before process startup leave the checkout recoverable. Uncertain launches retain their ownership records.
+A terminal resize after exit no longer stops the server. Known closed-terminal resizes are ignored; exact descriptor-race handling does not mark the process stopped. Unexpected terminal command errors close only the affected socket.
 
-Worker context logs now rotate inside a private directory whose identity comes from the session service. Forge records that directory identity and verifies it during recovery and cleanup. The real PTY regression rotates the log, stops the worker, recreates the runtime and removes the old terminal artifacts while retaining the checkout.
+This revision passed 84 focused web tests and 231 server tests. `npm run typecheck`, `npm run build` and 12 shipped-shell browser checks also passed. Desktop and mobile browser fixtures verified close/reopen, retained output and connection, focus and Escape/Tab input, without lifecycle commands, page errors or horizontal overflow.
 
-Embedded worker context storage changes from a flat file to an owned directory. Earlier context-file records are not adopted or converted automatically.
+The restarted preview passed overlay open/close/reopen checks while the issue worker stayed awaiting review. Its earlier terminal session was unavailable, so that live check did not exercise xterm continuity or send worker input. The production-component browser fixture and real PTY regressions cover terminal continuity separately.
 
-Once ownership and process checks succeed, an unfinished issue can resume in its preserved checkout with fresh context. Merged issues and review workers only finish cleanup; they do not launch another terminal. Failed checks continue to preserve resources.
-
-Installed Codex 0.153.4 passed seven native PTY startup scenarios. Exact overlay trust loaded project configuration and reached the initialized composer; parent-only trust still showed the trust dialog. The checks made no model requests.
-
-Nested worker UI checks passed 77 tests in four files. Desktop and mobile browser fixtures verified terminal input, worker switching, paused output retention and resumed-session replacement. They used the production terminal component and reported no page errors or horizontal overflow.
-
-The current revision passed `npm test -- --reporter=dot --maxWorkers=4`: 2,359 tests in 120 files. `npm run typecheck`, `npm run build` and all 12 shipped-shell browser tests also passed. The audit retains earlier timing failures and a snapshot failure caused by concurrent documentation editing, together with their passing reruns.
-
-A live GitHub issue worker resumed in its retained checkout after resource recovery. Codex worked without the trust prompt, and the source configuration and production service stayed unchanged. Desktop and mobile checks showed its terminal inside Forge, with no page errors or horizontal overflow.
+The previous directory-trust and recovery revision passed 2,359 tests in 120 files and 12 shipped-shell browser checks. These remain previous-revision evidence; the overlay uses focused UI, server and browser checks.

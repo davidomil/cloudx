@@ -628,7 +628,8 @@ export class CodexTerminalSession implements PluginSession {
   }
 
   resize(cols: number, rows: number): void {
-    this.terminalProcess.resize(requireTerminalDimension(cols, "cols"), requireTerminalDimension(rows, "rows"));
+    const dimensions = [requireTerminalDimension(cols, "cols"), requireTerminalDimension(rows, "rows")] as const;
+    if (!this.terminalClosed) this.terminalProcess.resize(...dimensions);
   }
 
   stop(): void {

@@ -4,6 +4,7 @@ import type { ForgeChangeRequest, ForgeComment, ForgeDashboard, ForgeIssue, Forg
 
 import { ControlButton } from "./Control.js";
 import { ForgeWorkerTabs } from "./ForgeWorkerTabs.js";
+import { ForgeWorkerTerminalOverlay } from "./ForgeWorkerTerminalOverlay.js";
 import type { UiContributionRenderContext } from "./uiContributions.js";
 
 type CallHook = NonNullable<UiContributionRenderContext["callHook"]>;
@@ -29,7 +30,8 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
   }, [tab.id]);
   const [view, setView] = useState<View>("issues");
   const [selectedWorkerId, setSelectedWorkerId] = useState<string>();
-  const onViewWorker = (workerId: string) => { setSelectedWorkerId(workerId); setView("workers"); };
+  const [terminalWorkerId, setTerminalWorkerId] = useState<string>();
+  const onViewWorker = (workerId: string) => { setSelectedWorkerId(workerId); setTerminalWorkerId(workerId); };
   const [revision, setRevision] = useState(0);
   const [dashboard, setDashboard] = useState<ForgeDashboard>();
   const [loadError, setLoadError] = useState<string>();
@@ -81,6 +83,7 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
   const placement = { windowId, paneId };
   const repository = dashboard?.repository;
   const workers = dashboard?.workers ?? [];
+  const terminalWorker = workers.find(worker => worker.id === terminalWorkerId);
   const changeLabel = repository?.provider === "gitlab" ? "Merge requests" : "Pull requests";
   const awaitingReview = workers.filter((worker) => worker.status === "awaiting_review").length;
 
@@ -106,9 +109,10 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
           {item === "workers" && awaitingReview ? <span className="forge-badge">{awaitingReview} awaiting review</span> : null}
         </ControlButton>)}
       </nav>
-      {view === "workers" ? <ForgeWorkerTabs workers={workers} workerTabs={workerTabs} selectedWorkerId={selectedWorkerId} onSelectWorker={setSelectedWorkerId} active={active} uiScale={uiScale}>
-        {(worker) => <WorkerCard worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} />}
+      {view === "workers" ? <ForgeWorkerTabs workers={workers} selectedWorkerId={selectedWorkerId} onSelectWorker={onViewWorker}>
+        {(worker) => <WorkerCard worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} />}
       </ForgeWorkerTabs> : dashboard.configured && repository ? <ForgeItems key={`${repository.provider}:${repository.apiUrl}:${repository.projectPath}:${view}`} kind={view} provider={repository.provider} request={request} revision={revision} workers={workers.filter((worker) => worker.repository.provider === repository.provider && worker.repository.apiUrl === repository.apiUrl && worker.repository.projectPath === repository.projectPath)} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} /> : null}
+      {active && terminalWorker ? <ForgeWorkerTerminalOverlay key={terminalWorker.id} worker={terminalWorker} workerTabs={workerTabs} uiScale={uiScale} onClose={() => setTerminalWorkerId(undefined)} /> : null}
     </> : null}
   </section>;
 }

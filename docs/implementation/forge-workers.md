@@ -64,11 +64,11 @@ GitLab parameters such as `state=opened&labels=bug`. Select an issue and
 click **Start work**. Open **Workers** to inspect status, pause, stop or
 resume.
 
-Each issue or review has a worker tab inside Forge. Select it to view
-its controls and Codex terminal, or use **View worker** from the issue
-or request. Resuming keeps the worker selected as its terminal changes.
-Focus the Forge pane to interact with that terminal. Worker terminals
-stay inside Forge instead of opening additional workspace tabs.
+Workers tabs and controls stay inside Forge. Choose **View worker** from
+an issue, request or worker to open its terminal in an overlay above the
+current section. Use **X** to dismiss the view; the worker keeps
+running. Reopen **View worker** to return to the same terminal. Escape
+stays with the terminal while it has focus.
 
 The agent implements and commits the change. Forge publishes the branch,
 opens the PR/MR, pauses and sends a ready-for-review notification. Pause
@@ -141,29 +141,39 @@ records are also not converted into directory ownership.
 
 ## Verification
 
-Codex 0.153.4 passed seven native terminal trust checks using isolated
-test checkouts. Exact checkout trust loaded project configuration and
-reached the initialized composer; trusting only the parent still showed
-the trust dialog. These startup checks submitted no prompt and made no
-model requests.
+This revision passed 84 focused web tests and 231 server tests.
+`npm run typecheck`, `npm run build` and 12 shipped-shell browser checks
+also passed. Desktop and mobile browser fixtures verified close/reopen,
+retained output and connection, focus and Escape/Tab input, without
+lifecycle commands, page errors or horizontal overflow.
 
-Nested worker UI checks passed 77 tests in four files. Desktop and
-mobile browser fixtures verified terminal input, worker switching,
-paused output retention and resumed-session replacement. They used the
-production terminal component and reported no page errors or horizontal
-overflow.
+The restarted preview passed overlay open/close/reopen checks while the
+issue worker stayed awaiting review. Its earlier terminal session was
+unavailable, so that live check did not exercise xterm continuity or
+send worker input. The production-component browser fixture and real PTY
+regressions cover terminal continuity separately.
 
-The current revision passed `npm test -- --reporter=dot --maxWorkers=4`:
-2,359 tests in 120 files. `npm run typecheck`, `npm run build` and all
-12 shipped-shell browser tests also passed. The audit retains earlier
-timing failures and a snapshot failure caused by concurrent
-documentation editing, together with their passing reruns.
+In the previous revision, Codex 0.153.4 passed seven native terminal
+trust checks using isolated checkouts. Exact checkout trust loaded
+project configuration and reached the initialized composer; trusting
+only the parent showed the trust dialog. These startup checks submitted
+no prompt and made no model requests.
 
-A live GitHub issue worker resumed in its retained checkout after
-resource recovery. Codex worked without the trust prompt, and the source
-configuration and production service stayed unchanged. Desktop and
-mobile checks showed its terminal inside Forge, with no page errors or
+The previous nested worker UI checks passed 77 tests in four files.
+Desktop and mobile browser fixtures verified terminal input, worker
+switching, paused output retention and resumed-session replacement. They
+used the production terminal component and reported no page errors or
 horizontal overflow.
+
+The previous directory-trust and recovery revision passed 2,359 tests in
+120 files, typecheck, all workspace builds and 12 shipped-shell browser
+checks. Those results are retained as previous-revision evidence; this
+terminal-view and resize change uses focused UI, server and browser
+checks.
+
+The previous revision also verified a live GitHub issue worker resuming
+in its retained checkout. Codex worked without the trust prompt, and the
+source configuration and production service stayed unchanged.
 
 Lifecycle integration exercises complete issue and review flows using
 real Git checkouts and terminal processes with a deterministic assistant

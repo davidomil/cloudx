@@ -3,7 +3,7 @@ import type { IPty } from "node-pty";
 import type { TerminalProcess, TerminalProcessFactory } from "./TerminalProcess.js";
 import { TerminalProcessTree } from "./TerminalProcessTree.js";
 
-class NodePtyTerminalProcess implements TerminalProcess {
+export class NodePtyTerminalProcess implements TerminalProcess {
   private readonly tree: TerminalProcessTree;
   private exited = false;
 
@@ -27,7 +27,15 @@ class NodePtyTerminalProcess implements TerminalProcess {
   }
 
   resize(cols: number, rows: number): void {
-    this.process.resize(cols, rows);
+    if (this.exited) return;
+    try {
+      this.process.resize(cols, rows);
+    } catch (error) {
+      // The native descriptor can close before node-pty delivers its exit event.
+      // A closed descriptor does not establish that the process tree has stopped.
+      if (error instanceof Error && (error.message === "ioctl(2) failed, ENOTTY" || error.message === "ioctl(2) failed, EBADF")) return;
+      throw error;
+    }
   }
 
   kill(): void {

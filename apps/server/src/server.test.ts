@@ -28,6 +28,7 @@ import { TabContextService } from "./context/TabContextService.js";
 import { HookRegistry } from "./hooks/HookRegistry.js";
 import { PluginRegistry } from "./pluginRegistry.js";
 import { LocalWebPlugin } from "./plugins/LocalWebPlugin.js";
+import { CodexTerminalSession } from "./plugins/CodexTerminalPlugin.js";
 import { CodexStateSources, legacySourceId } from "./plugins/CodexStateSources.js";
 import { parseCodexStateSourcesResponse } from "@cloudx/shared";
 import {
@@ -47,6 +48,7 @@ import {
   type AppServices,
 } from "./server.js";
 import { SessionStore } from "./sessionStore.js";
+import { NodePtyTerminalProcessFactory } from "./terminal/NodePtyTerminalProcess.js";
 import { VoiceController } from "./voice/VoiceController.js";
 import type { VoicePlanner } from "./voice/VoicePlanner.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
@@ -5904,6 +5906,91 @@ describe("buildServer", () => {
     } finally {
       client?.close();
       await app.close();
+    }
+  });
+
+  it.each(["input", "resize", "resize with failed listener cleanup"])("contains unexpected terminal command errors for %s and keeps the session available", async (operation) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-ws-command-"));
+    const command = vi.fn().mockImplementationOnce(() => { throw new Error("Unexpected terminal command failure"); });
+    const dispose = vi.fn(() => {
+      if (operation.includes("failed listener cleanup")) throw new Error("Listener cleanup failed");
+    });
+    const session = {
+      snapshot: () => ({ recentOutput: "Retained terminal output" }),
+      write: command,
+      resize: command,
+      stop: vi.fn(),
+      onData: () => dispose
+    };
+    const app = await buildServer(testConfig(root), terminalRouteTestServices(root, session));
+    let client: WebSocket | undefined;
+    try {
+      await app.listen({ host: "127.0.0.1", port: 0 });
+      const address = app.server.address() as { port: number };
+      const url = `ws://127.0.0.1:${address.port}/ws/terminal/tab-1`;
+      client = new WebSocket(url, { headers: { host: "localhost" } });
+      await waitForWebSocketOpen(client);
+      const closed = readWebSocketClose(client);
+      client.send(JSON.stringify(operation === "input" ? { type: "input", data: "test" } : { type: "resize", cols: 120, rows: 40 }));
+
+      await expect(closed).resolves.toEqual({ code: 1011, reason: "Terminal command failed." });
+      expect(command).toHaveBeenCalledOnce();
+      expect(dispose).toHaveBeenCalledOnce();
+      expect(session.stop).not.toHaveBeenCalled();
+      expect((await app.inject({ method: "GET", url: "/api/tabs" })).statusCode).toBe(200);
+
+      client = new WebSocket(url, { headers: { host: "localhost" } });
+      const replay = readWebSocketJsonFrame(client);
+      await waitForWebSocketOpen(client);
+      expect((await replay).message.data).toBe("Retained terminal output");
+    } finally {
+      client?.close();
+      await app.close();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["exit", "stop"])("reopens and resizes a real PTY view after %s without losing replay or stopping the server", async (end) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-ws-ended-"));
+    const terminal = await new NodePtyTerminalProcessFactory().spawn(process.execPath, ["-e", "process.stdin.on('data',()=>process.exit(0));process.stdin.resume();process.stdout.write('Retained terminal output\\n')"], {
+      cwd: root, env: process.env, cols: 80, rows: 24
+    });
+    const session = new CodexTerminalSession({ id: "tab-1", pluginId: "codex-terminal", title: "Finished worker", cwd: root, status: "running", indicator: { color: "green", label: "Running", updatedAt: new Date(0).toISOString() }, createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString() }, terminal);
+    const resize = vi.spyOn(session, "resize");
+    const app = await buildServer(testConfig(root), terminalRouteTestServices(root, session));
+    let client: WebSocket | undefined;
+    try {
+      await vi.waitFor(() => expect(session.snapshot().recentOutput).toContain("Retained terminal output"));
+      if (end === "stop") await session.handleAction("stop", {});
+      else {
+        terminal.write("\r");
+        await vi.waitFor(() => expect(session.snapshot().status).toBe("completed"));
+      }
+      expect(() => terminal.resize(100, 30)).not.toThrow();
+      await app.listen({ host: "127.0.0.1", port: 0 });
+      const address = app.server.address() as { port: number };
+      for (let view = 0; view < 2; view += 1) {
+        client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/terminal/tab-1`, { headers: { host: "localhost" } });
+        const replay = readWebSocketJsonFrame(client);
+        await waitForWebSocketOpen(client);
+        expect((await replay).message.data).toContain("Retained terminal output");
+        client.send(JSON.stringify({ type: "resize", cols: 120 + view, rows: 40 }));
+        const pong = new Promise<void>((resolve) => client!.once("pong", () => resolve()));
+        client.ping();
+        await pong;
+        expect(client.readyState).toBe(WebSocket.OPEN);
+        expect(resize).toHaveBeenCalledTimes(view + 1);
+        const closed = readWebSocketClose(client);
+        client.close();
+        await closed;
+      }
+      expect(session.snapshot().status).toBe(end === "stop" ? "stopped" : "completed");
+      expect((await app.inject({ method: "GET", url: "/api/tabs" })).statusCode).toBe(200);
+    } finally {
+      client?.close();
+      await terminal.terminate();
+      await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 

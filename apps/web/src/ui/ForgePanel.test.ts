@@ -1,21 +1,38 @@
 // @vitest-environment jsdom
 
-import { act, createElement } from "react";
+import { act, createElement, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ForgeChangeRequest, ForgeDashboard, ForgeIssueDetail, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
 import { ForgePanel } from "./ForgePanel.js";
 import type { UiContributionRenderContext } from "./uiContributions.js";
 
 vi.mock("./TerminalPanel.js", () => ({
-  TerminalPanel: ({ tab, active, uiScale }: { tab: WorkspaceTab; active: boolean; uiScale: number }) => createElement("div", { "data-terminal-tab": tab.id, "data-active": String(active), "data-scale": uiScale })
+  TerminalPanel: ({ tab, active, uiScale }: { tab: WorkspaceTab; active: boolean; uiScale: number }) => createElement("div", { "data-terminal-tab": tab.id, "data-active": String(active), "data-scale": uiScale }, createElement("textarea", { "aria-label": "Terminal input" }))
 }));
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const roots: Root[] = [];
+const dialogMethods = ["showModal", "close"] as const;
+const nativeDialogMethods = dialogMethods.map(method => Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, method));
+beforeEach(() => {
+  Object.defineProperties(HTMLDialogElement.prototype, {
+    showModal: { configurable: true, value(this: HTMLDialogElement) { this.open = true; } },
+    close: { configurable: true, value(this: HTMLDialogElement) {
+      if (!this.open) return;
+      this.open = false;
+      queueMicrotask(() => this.dispatchEvent(new Event("close")));
+    } }
+  });
+});
 afterEach(async () => {
   await act(async () => { roots.splice(0).forEach((root) => root.unmount()); });
+  dialogMethods.forEach((method, index) => {
+    const descriptor = nativeDialogMethods[index];
+    if (descriptor) Object.defineProperty(HTMLDialogElement.prototype, method, descriptor);
+    else Reflect.deleteProperty(HTMLDialogElement.prototype, method);
+  });
   vi.useRealTimers();
   document.body.replaceChildren();
 });
@@ -275,18 +292,66 @@ describe("ForgePanel", () => {
     await act(async () => { pending.resolve({ worker: { ...worker, status: "stopped" } }); });
   });
 
-  it("opens the worker terminal inside Forge without a workspace navigation action", async () => {
+  it("opens, closes, and reopens the same worker above Issues without a lifecycle action", async () => {
     const testFixture = fixture({ workers: [worker] });
     const panel = await renderPanel(testFixture, { workerTabs: [workerTab], uiScale: 125 });
+    const callsBeforeOpening = [...testFixture.calls];
     await click(panel, "View worker");
-    expect(panel.querySelector('[role="tablist"][aria-label="Worker tabs"]')).not.toBeNull();
+    expect(panel.querySelector("dialog")?.open).toBe(true);
+    expect(panel.querySelector("dialog h2")?.textContent).toBe("Issue #7 · Fix deployment");
+    expect(button(panel, "Issues").getAttribute("aria-pressed")).toBe("true");
+    expect(panel.textContent).toContain(issue.body);
+    expect(panel.querySelector('[role="tablist"][aria-label="Worker tabs"]')).toBeNull();
     expect(panel.querySelector('[data-terminal-tab="codex-worker"]')?.getAttribute("data-scale")).toBe("125");
-    expect(panel.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Issue #7");
-    expect(testFixture.calls.every(call => !call.hook.startsWith("forge.worker."))).toBe(true);
-    expect(panel.textContent).not.toContain("Open Codex tab");
+    await click(panel, "Close worker terminal");
+    expect(panel.querySelector("dialog")).toBeNull();
+    expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
+    await click(panel, "View worker");
+    expect(panel.querySelector('[data-terminal-tab="codex-worker"]')).not.toBeNull();
+    expect(testFixture.calls).toEqual(callsBeforeOpening);
+  });
+
+  it("keeps terminal Escape and Tab input intact, and dismisses Escape from an overlay control", async () => {
+    const panel = await renderPanel(fixture({ workers: [worker] }), { workerTabs: [workerTab] });
+    await click(panel, "View worker");
+    const dialog = panel.querySelector("dialog")!;
+    const input = dialog.querySelector<HTMLTextAreaElement>('[aria-label="Terminal input"]')!;
+    input.focus();
+    for (const key of ["Escape", "Tab"]) {
+      const keydown = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+      await act(async () => { input.dispatchEvent(keydown); });
+      expect(keydown.defaultPrevented).toBe(false);
+    }
+    const terminalCancel = new Event("cancel", { cancelable: true });
+    await act(async () => { dialog.dispatchEvent(terminalCancel); });
+    expect(terminalCancel.defaultPrevented).toBe(true);
+    expect(dialog.open).toBe(true);
+    button(dialog, "Close worker terminal").focus();
+    const controlCancel = new Event("cancel", { cancelable: true });
+    await act(async () => {
+      dialog.dispatchEvent(controlCancel);
+      if (!controlCancel.defaultPrevented) dialog.close();
+    });
+    expect(controlCancel.defaultPrevented).toBe(false);
+    expect(panel.querySelector("dialog")).toBeNull();
+  });
+
+  it("keeps the dialog open after StrictMode repeats its native setup and cleanup", async () => {
+    const testFixture = fixture({ workers: [worker] });
+    const panel = document.createElement("div");
+    document.body.append(panel);
+    const root = createRoot(panel);
+    roots.push(root);
+    await act(async () => root.render(createElement(StrictMode, {}, createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab], active: true, uiScale: 100 }))));
+    await click(panel, "View worker");
+    expect(panel.querySelector("dialog")?.open).toBe(true);
+    expect(panel.querySelector('[data-terminal-tab="codex-worker"]')).not.toBeNull();
+    await click(panel, "Close worker terminal");
+    expect(panel.querySelector("dialog")).toBeNull();
   });
 
   it.each([
+    { ...workerTab, id: "another-terminal" },
     { ...workerTab, ownerPluginId: undefined },
     { ...workerTab, pluginId: "standard-terminal" },
     { ...workerTab, pluginMetadata: { "forge-workers": { workerId: "another-worker" } } }
@@ -297,31 +362,56 @@ describe("ForgePanel", () => {
     expect(panel.textContent).toContain("The worker terminal is unavailable.");
   });
 
-  it("keeps paused worker output available and only attaches it in the focused Forge pane", async () => {
+  it.each([
+    { status: "starting" as const, message: "Preparing the worker terminal…" },
+    { status: "completed" as const, message: "No worker terminal is open." }
+  ])("shows $status terminal availability without launching work", async ({ status, message }) => {
+    const testFixture = fixture({ workers: [{ ...worker, status, tabId: undefined }] });
+    const panel = await renderPanel(testFixture, { workerTabs: [workerTab] });
+    await click(panel, "View worker");
+    expect(panel.querySelector("dialog")?.textContent).toContain(message);
+    expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
+    expect(testFixture.calls.every(call => !call.hook.startsWith("forge.worker."))).toBe(true);
+  });
+
+  it("shows paused worker output only while its Forge pane is active", async () => {
     const testFixture = fixture({ workers: [{ ...worker, status: "paused" }] });
     const panel = await renderPanel(testFixture, { workerTabs: [workerTab], active: false });
     await click(panel, "View worker");
     expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
-    expect(panel.textContent).toContain("Select this pane to view the worker terminal.");
+    expect(panel.querySelector("dialog")).toBeNull();
     await act(async () => roots.at(-1)!.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab], active: true, uiScale: 100 })));
     expect(panel.querySelector('[data-terminal-tab="codex-worker"]')?.getAttribute("data-active")).toBe("true");
     expect(button(panel, "Resume")).toBeDefined();
+    await act(async () => roots.at(-1)!.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab], active: false, uiScale: 100 })));
+    expect(panel.querySelector("dialog")).toBeNull();
+    expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
   });
 
   it("selects internal workers with keyboard navigation and retains review edits", async () => {
     const panel = await renderPanel(fixture({ workers: [worker, reviewWorker] }), { workerTabs: [workerTab] });
     await click(panel, "Workers (2)");
+    expect(panel.querySelector("dialog")).toBeNull();
+    expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
     const tabs = panel.querySelectorAll<HTMLButtonElement>('[role="tab"]');
     tabs[0].focus();
     await act(async () => tabs[0].dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true })));
     expect(document.activeElement).toBe(tabs[1]);
     expect(tabs[0].getAttribute("aria-selected")).toBe("true");
     await act(async () => tabs[1].click());
+    expect(panel.querySelector("dialog h2")?.textContent).toContain("Review #12");
+    await click(panel, "Close worker terminal");
     const editor = panel.querySelector<HTMLTextAreaElement>('[role="tabpanel"]:not([hidden]) .forge-review textarea')!;
     await fill(editor, "Retain my edits while I inspect issue work.");
     await act(async () => tabs[0].click());
+    expect(panel.querySelector('[data-terminal-tab="codex-worker"]')).not.toBeNull();
+    await click(panel, "Close worker terminal");
     await act(async () => tabs[1].click());
+    await click(panel, "Close worker terminal");
     expect(editor.value).toBe("Retain my edits while I inspect issue work.");
+    await click(panel.querySelector('[role="tabpanel"]:not([hidden])')!, "View worker");
+    expect(panel.querySelector("dialog h2")?.textContent).toContain("Review #12");
+    await click(panel, "Close worker terminal");
     await act(async () => tabs[1].dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true })));
     expect(document.activeElement).toBe(tabs[0]);
     await act(async () => tabs[0].dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true })));
@@ -329,6 +419,7 @@ describe("ForgePanel", () => {
   });
 
   it("keeps the selected worker through Resume replacing its terminal and cleanup removing it", async () => {
+    vi.useFakeTimers();
     const second = { ...worker, id: "work-2", number: 8, title: "Fix uploads", tabId: "second-terminal", status: "paused" as const };
     const secondTab = { ...workerTab, id: second.tabId, pluginMetadata: { "forge-workers": { workerId: second.id } } };
     let testFixture: ReturnType<typeof fixture>;
@@ -342,19 +433,39 @@ describe("ForgePanel", () => {
     const panel = await renderPanel(testFixture, { workerTabs: [workerTab, secondTab] });
     await click(panel, "Workers (2)");
     await act(async () => panel.querySelectorAll<HTMLButtonElement>('[role="tab"]')[1].click());
+    expect(panel.querySelector('[data-terminal-tab="second-terminal"]')).not.toBeNull();
+    await click(panel, "Close worker terminal");
     await click(panel.querySelector('[role="tabpanel"]:not([hidden])')!, "Resume");
+    await click(panel.querySelector('[role="tabpanel"]:not([hidden])')!, "View worker");
+    expect(panel.querySelector("dialog")?.textContent).toContain("The worker terminal is unavailable.");
     await act(async () => roots.at(-1)!.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab, { ...secondTab, id: "resumed-terminal" }], active: true, uiScale: 100 })));
     expect(panel.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Issue #8");
     expect(panel.querySelector('[data-terminal-tab="resumed-terminal"]')).not.toBeNull();
     expect(panel.querySelector('[data-terminal-tab="second-terminal"]')).toBeNull();
     testFixture.dashboard.workers[1] = { ...second, status: "completed", tabId: undefined };
-    await click(panel, "Refresh Forge");
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
     expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
-    expect(panel.querySelector('[role="tabpanel"]:not([hidden])')?.textContent).toContain("No worker terminal is open.");
+    expect(panel.querySelector("dialog")?.textContent).toContain("No worker terminal is open.");
     testFixture.dashboard.workers = [worker];
-    await click(panel, "Refresh Forge");
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
     expect(panel.querySelectorAll('[role="tab"]')).toHaveLength(1);
-    expect(panel.querySelector('[data-terminal-tab="codex-worker"]')).not.toBeNull();
+    expect(panel.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Issue #7");
+    expect(panel.querySelector("dialog")).toBeNull();
+    expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
+    expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([{ hook: "forge.worker.resume", input: { id: second.id, windowId: "window-1", paneId: "pane-2" }, tabId: "forge-tab" }]);
+  });
+
+  it("preserves the current pull request and its unsaved review while viewing its worker", async () => {
+    const panel = await renderPanel(fixture({ workers: [reviewWorker] }));
+    await click(panel, "Pull requests");
+    const editor = panel.querySelector<HTMLTextAreaElement>(".forge-review textarea")!;
+    await fill(editor, "My unsaved review.");
+    await click(panel, "View worker");
+    expect(panel.querySelector("dialog h2")?.textContent).toContain("Review #12");
+    expect(button(panel, "Pull requests").getAttribute("aria-pressed")).toBe("true");
+    await click(panel, "Close worker terminal");
+    expect(panel.querySelector(".forge-review textarea")).toBe(editor);
+    expect(editor.value).toBe("My unsaved review.");
   });
 
   it("surfaces action failures without automatically repeating publication", async () => {

@@ -1,4 +1,4 @@
-Source-grounded guide and current revision validation, 2026-09-07 UTC
+Source-grounded guide and current revision validation, 2026-09-08 UTC
 
 The skill dependency check passed in this workspace. Final commands used the
 source-grounded-writing skill-local Python, Quarto and rendering toolchain on PATH.
@@ -19,40 +19,45 @@ python3 docs/implementation/forge-workers-audit/package_markdown.py
 Packaged guide heading and audited figure link
 python3 "$CLOUDX_RULES_SKILLS_DIR/skills/source-grounded-writing/scripts/compile_doc.py" docs/implementation/forge-workers-audit/revision-note.ir.json --out docs/implementation/forge-workers-audit/revision-note.qmd
 Wrote revision note Quarto
-python3 "$CLOUDX_RULES_SKILLS_DIR/skills/source-grounded-writing/scripts/render_doc.py" docs/implementation/forge-workers-audit/revision-note.qmd --to gfm --out-dir /tmp/forge-trust-revision-render
+python3 "$CLOUDX_RULES_SKILLS_DIR/skills/source-grounded-writing/scripts/render_doc.py" docs/implementation/forge-workers-audit/revision-note.qmd --to gfm --out-dir /tmp/forge-overlay-revision-render
 Rendered revision note Markdown
-python3 docs/implementation/forge-workers-audit/package_revision_note.py /tmp/forge-trust-revision-render/revision-note.md
+python3 docs/implementation/forge-workers-audit/package_revision_note.py /tmp/forge-overlay-revision-render/revision-note.md
 Inserted current revision before earlier delivery history
-python3 /tmp/forge-trust-doc-assertions.py
-PASS: 60 local source hashes, current 2359/12 evidence, rendered guide/revision text,
-figure path and privacy assertions. Both IR files match every local source hash.
-Guide and current revision have no old test totals, host paths or internal source
-markers; one title, one current revision section and one existing figure remain.
+python3 /tmp/forge-overlay-doc-assertions.py
+PASS: 74 local source hashes; overlay/keyboard/lifecycle scope; current 84+231
+and 12 checks; previous 2359 evidence; figure/privacy/fixture cleanup. Both IR
+files match every local source hash. The guide and current revision distinguish
+previous broad-suite evidence from current focused checks. No host paths or
+internal source markers occur in guide prose. One title, current revision section
+and existing figure remain; the temporary HTML browser fixture was removed.
 
 git diff --check -- docs/implementation/forge-workers.md docs/implementation/forge-workers-plan.md docs/implementation/forge-workers-audit
 Passed without whitespace diagnostics.
 
-Current evidence is trust-verification-runs.txt. It records exact executed commands
-and original evidence hashes for these final results:
-- npm test -- --reporter=dot --maxWorkers=4: 2359 tests, 120 files passed.
+Current evidence is overlay-verification-runs.txt. It records exact executed
+commands, final log/artifact hashes and primary-source archive records for:
+- Focused web tests: 84 passed in 4 files; component-only run: 36 passed.
+- PTY/plugin/server regressions: 231 passed in 3 files, including real PTY exit,
+  awaited stop, replay/reopen/resize and unexpected socket-command failures.
 - npm run typecheck: passed.
 - npm run build: passed; existing AutomationPanel chunk warning remains.
-- npm run test:browser: 12 shipped-shell desktop/mobile tests passed.
-- node /tmp/cloudx-forge-final-browser.mjs: live GitHub issue recovery and nested
-  native Codex terminal passed on desktop and mobile. Screenshots were inspected.
-The earlier timing failures, passing focused rerun and Gate B snapshot failure
-caused by concurrent documentation editing remain in the audit; the final full
-suite passed with repository writes frozen.
+- npm run test:browser: 12 shipped-shell tests passed.
+- node /tmp/cloudx-forge-overlay-browser.mjs: native-dialog desktop/mobile fixture
+  passed with production Forge and TerminalPanel/xterm components. It verifies
+  retained xterm/socket, output while closed, focus/section restoration, terminal
+  Escape/Tab, dismissal from controls and no lifecycle calls or page errors.
+- node /tmp/cloudx-forge-overlay-live.mjs: restarted preview overlay passed on
+  desktop/mobile without resuming or sending input to the awaiting-review worker.
 
-Seven isolated native Codex 0.153.4 startup cases made zero model requests. Separate
-live evidence proves actual gpt-6-astra issue work after recovery in the retained
-checkout: exact overlay trust, no trust prompt, unchanged source configuration and
-production service, terminal inside Forge, no page errors or horizontal overflow.
-The context regression exercises real PTY log rotation, pause, server restart and
-owned artifact cleanup with checkout preservation; boundary tests reject replaced
-context directories. Prior rotated context was preserved in quarantine without
-rewriting the ownership ledger. No power-loss durability is claimed.
+The live worker remained awaiting_review on PR6 and production stayed unchanged.
+Its earlier terminal session was unavailable on both viewports; that live check
+is not evidence of current xterm continuity or model execution. The component
+browser fixture and real PTY regressions establish continuity separately. The
+pre-build ENOTTY preview crash is retained as an observed prior failure in the
+audit; exact descriptor-race handling does not claim process-tree termination.
 
-Live GitLab provisioning and complete hosted issue-to-merge operation remain
-unverified. Earlier focused-tests.txt, verification-runs.txt and
-remote-verification-runs.txt are historical records, not this revision's result.
+The previous 2359-test/120-file broad suite and previous 12 shipped-shell checks
+remain labeled previous-revision evidence in trust-verification-runs.txt. No new
+broad-suite result is claimed for this overlay and resize change. Earlier audit
+files remain historical. Live GitLab provisioning and complete hosted
+issue-to-merge operation remain unverified.

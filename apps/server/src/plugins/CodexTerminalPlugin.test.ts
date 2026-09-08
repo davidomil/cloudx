@@ -1101,6 +1101,22 @@ describe("CodexTerminalSession", () => {
     expect(process.resizes).toEqual([[120, 40]]);
   });
 
+  it.each(["exit", "stop", "awaited stop"])("retains terminal replay without resizing the process after %s", async (end) => {
+    const process = new FakeTerminalProcess();
+    const session = new CodexTerminalSession(tab, process);
+    process.emitData("Finished work.\n");
+    if (end === "exit") process.exit(0);
+    else if (end === "stop") session.stop();
+    else await session.handleAction("stop", {});
+    const resize = vi.spyOn(process, "resize").mockImplementation(() => { throw new Error("ioctl(2) failed, ENOTTY"); });
+
+    expect(() => session.resize(120, 40)).not.toThrow();
+    expect(resize).not.toHaveBeenCalled();
+    expect(session.snapshot().recentOutput).toBe("Finished work.\n");
+    expect(session.snapshot().status).toBe(end === "exit" ? "completed" : "stopped");
+    expect(() => session.resize(0, 40)).toThrow("cols must be a positive integer.");
+  });
+
   it("exposes terminal output through standardized voice context", () => {
     const process = new FakeTerminalProcess();
     const session = new CodexTerminalSession(tab, process, undefined, {

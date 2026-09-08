@@ -1122,7 +1122,11 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       sender.invalidate();
       const currentDispose = disposeData;
       disposeData = undefined;
-      currentDispose?.();
+      try {
+        currentDispose?.();
+      } catch (error) {
+        request.log.warn({ tabId, err: serializeError(error) }, "terminal websocket listener cleanup failed");
+      }
     };
     const failSend = (error: Error) => {
       if (disposed) {
@@ -1135,17 +1139,24 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     const sender = new TerminalWebSocketSender(ws, config.terminalReplayBytes, failSend);
 
     ws.on("message", (raw, isBinary) => {
+      if (disposed) return;
       const message = parseTerminalControlMessage(raw, isBinary);
       if (!message) {
         request.log.warn({ tabId }, "terminal websocket invalid control message");
         closeWebSocketSafely(ws, 1003, "Invalid terminal message.");
         return;
       }
-      if (message.type === "input") {
-        session.write?.(message.data);
-      }
-      if (message.type === "resize") {
-        session.resize?.(message.cols, message.rows);
+      try {
+        if (message.type === "input") {
+          session.write?.(message.data);
+        }
+        if (message.type === "resize") {
+          session.resize?.(message.cols, message.rows);
+        }
+      } catch (error) {
+        request.log.warn({ tabId, command: message.type, err: serializeError(error) }, "terminal websocket command failed");
+        cleanup();
+        closeWebSocketSafely(ws, 1011, "Terminal command failed.");
       }
     });
     ws.on("close", cleanup);

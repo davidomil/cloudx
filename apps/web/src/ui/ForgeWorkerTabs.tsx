@@ -1,15 +1,10 @@
-import { lazy, Suspense, useId, type KeyboardEvent, type ReactNode } from "react";
-import type { ForgeWorker, WorkspaceTab } from "@cloudx/shared";
+import { useId, type KeyboardEvent, type ReactNode } from "react";
+import type { ForgeWorker } from "@cloudx/shared";
 
-const TerminalPanel = lazy(() => import("./TerminalPanel.js").then(module => ({ default: module.TerminalPanel })));
-
-export function ForgeWorkerTabs({ workers, workerTabs, selectedWorkerId, onSelectWorker, active, uiScale, children }: {
+export function ForgeWorkerTabs({ workers, selectedWorkerId, onSelectWorker, children }: {
   workers: ForgeWorker[];
-  workerTabs: WorkspaceTab[];
   selectedWorkerId?: string;
   onSelectWorker: (workerId: string) => void;
-  active: boolean;
-  uiScale: number;
   children: (worker: ForgeWorker) => ReactNode;
 }) {
   const id = useId();
@@ -24,17 +19,9 @@ export function ForgeWorkerTabs({ workers, workerTabs, selectedWorkerId, onSelec
         <small>{worker.status.replaceAll("_", " ")}</small>
       </button>)}
     </div>
-    {workers.map(worker => {
-      const terminal = workerTabs.find(tab => tab.id === worker.tabId && tab.ownerPluginId === "forge" && tab.pluginId === "codex-terminal" && tab.pluginMetadata?.["forge-workers"]?.workerId === worker.id);
-      return <div key={worker.id} id={`${id}-panel-${worker.id}`} role="tabpanel" aria-labelledby={`${id}-tab-${worker.id}`} tabIndex={0} hidden={selected.id !== worker.id} className="forge-worker-view">
-        <div className="forge-worker-controls">{children(worker)}</div>
-        <section className="forge-worker-terminal" aria-label={`${worker.kind === "issue" ? "Issue" : "Review"} #${worker.number} terminal`}>
-          {selected.id === worker.id && terminal && active ? <Suspense fallback={<p role="status" className="forge-empty">Loading worker terminal…</p>}>
-            <TerminalPanel key={terminal.id} tab={terminal} active={active} uiScale={uiScale} />
-          </Suspense> : <p role="status" className="forge-empty">{terminal ? "Select this pane to view the worker terminal." : worker.status === "starting" ? "Preparing the worker terminal…" : worker.tabId ? "The worker terminal is unavailable." : "No worker terminal is open."}</p>}
-        </section>
-      </div>;
-    })}
+    {workers.map(worker => <div key={worker.id} id={`${id}-panel-${worker.id}`} role="tabpanel" aria-labelledby={`${id}-tab-${worker.id}`} tabIndex={0} hidden={selected.id !== worker.id} className="forge-worker-view">
+      <div className="forge-worker-controls">{children(worker)}</div>
+    </div>)}
   </div>;
 }
 
