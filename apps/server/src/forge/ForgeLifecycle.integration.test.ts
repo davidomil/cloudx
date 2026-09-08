@@ -12,6 +12,7 @@ import type {
   ForgeCredentialRole,
   ForgeIssueDetail,
   ForgeRepository,
+  ForgeReviewPublication,
   ForgeReviewSubmission,
   ForgeWorker,
 } from "@cloudx/shared";
@@ -175,6 +176,179 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(await fixture.store.read()).toEqual([]);
     expect(fixture.notifications.list().some((notification) => notification.title === "Issue merged")).toBe(true);
     expect(await fs.readFile(path.join(fixture.codexHome, "config.toml"), "utf8")).toBe(sourceConfig);
+  }, 20_000);
+
+  it("automatically implements, reviews, addresses findings, reviews again, and merges without a final coding run", async () => {
+    const fixture = await LifecycleFixture.create({ autoReview: true });
+    const started = await fixture.workflow.startIssue(1, fixture.placement, true);
+    const firstImplementation = await fixture.completedAssistantTurn(started);
+    await fixture.workflow.poll();
+
+    const firstReview = await fixture.runningWorker("review");
+    expect(firstReview).toMatchObject({ issueWorkerId: started.id, autoPost: true, headSha: firstImplementation.headSha });
+    const firstReviewReceipt = await fixture.completedAssistantTurn(firstReview);
+    await fixture.workflow.poll();
+
+    const revision = await fixture.runningWorker("issue");
+    expect(revision.id).toBe(started.id);
+    const secondImplementation = await fixture.completedAssistantTurn(revision);
+    expect(secondImplementation.context.change?.comments).toEqual(expect.arrayContaining([
+      expect.objectContaining({ discussionId: "review-1-finding-1", body: "Cover empty input before merging.", resolved: false }),
+    ]));
+    expect(secondImplementation.headSha).not.toBe(firstImplementation.headSha);
+    await fixture.workflow.poll();
+
+    const secondReview = await fixture.runningWorker("review");
+    expect(secondReview.id).not.toBe(firstReview.id);
+    expect(secondReview).toMatchObject({ issueWorkerId: started.id, autoPost: true, headSha: secondImplementation.headSha });
+    const secondReviewReceipt = await fixture.completedAssistantTurn(secondReview);
+    await fixture.workflow.poll();
+    await vi.waitFor(async () => {
+      fixture.advanceTime(5_001);
+      await fixture.workflow.poll();
+      expect((await fixture.workflow.dashboard()).workers).toEqual([]);
+    }, { timeout: 2_000, interval: 20 });
+
+    expect(fixture.provider.submissions.map(({ event, headSha }) => ({ event, headSha }))).toEqual([
+      { event: "request_changes", headSha: firstImplementation.headSha },
+      { event: "approve", headSha: secondImplementation.headSha },
+    ]);
+    expect(fixture.provider.discussionReplies).toEqual([
+      { discussionId: "review-1-finding-1", body: "Added and verified the empty-input regression.", headSha: secondImplementation.headSha },
+    ]);
+    expect(fixture.provider.resolvedDiscussions).toEqual(["review-1-finding-1"]);
+    expect(fixture.provider.merges).toEqual([secondImplementation.headSha]);
+    expect(fixture.provider.issue.state).toBe("closed");
+    expect(fixture.factory.processes).toHaveLength(4);
+    expect(fixture.gitPushes).toHaveLength(2);
+    expect(fixture.gitAccessRoles).toEqual(["worker", "worker", "reviewer", "worker", "reviewer"]);
+    expect(await git(fixture.origin, "rev-parse", "main")).toBe(secondImplementation.headSha);
+    expect(await fixture.store.read()).toEqual([]);
+    expect(fixture.sessions.listTabs()).toEqual([]);
+    for (const worker of [started, firstReview, secondReview]) await expectMissing(worker.worktreePath!);
+    for (const receipt of [firstImplementation, firstReviewReceipt, secondImplementation, secondReviewReceipt]) {
+      expect(await processIsRunning(receipt.pid)).toBe(false);
+      await expectMissing(receipt.codexHome, receipt.tabContextPath, receipt.contextPath, receipt.reportPath);
+    }
+  }, 30_000);
+
+  it("merges after the first reviewer explicitly approves with no findings and never launches another coder", async () => {
+    const fixture = await LifecycleFixture.create({ autoReview: true, approveFirst: true });
+    const started = await fixture.workflow.startIssue(1, fixture.placement, true);
+    const implementation = await fixture.completedAssistantTurn(started);
+    await fixture.workflow.poll();
+    const reviewer = await fixture.runningWorker("review");
+    const reviewed = await fixture.completedAssistantTurn(reviewer);
+    expect(reviewed.headSha).toBe(implementation.headSha);
+    await fixture.workflow.poll();
+    await vi.waitFor(async () => {
+      fixture.advanceTime(5_001);
+      await fixture.workflow.poll();
+      expect((await fixture.workflow.dashboard()).workers).toEqual([]);
+    }, { timeout: 2_000, interval: 20 });
+
+    expect(fixture.provider.submissions).toEqual([
+      expect.objectContaining({ event: "approve", headSha: implementation.headSha, comments: [] }),
+    ]);
+    expect(fixture.provider.merges).toEqual([implementation.headSha]);
+    expect(fixture.provider.discussionReplies).toEqual([]);
+    expect(fixture.provider.issue.state).toBe("closed");
+    expect(fixture.factory.processes).toHaveLength(2);
+    expect(fixture.gitPushes).toHaveLength(1);
+    expect(await git(fixture.origin, "rev-parse", "main")).toBe(implementation.headSha);
+    expect(await fixture.store.read()).toEqual([]);
+    expect(fixture.sessions.listTabs()).toEqual([]);
+    await expectMissing(started.worktreePath!, reviewer.worktreePath!);
+    for (const receipt of [implementation, reviewed]) {
+      expect(await processIsRunning(receipt.pid)).toBe(false);
+      await expectMissing(receipt.codexHome, receipt.tabContextPath, receipt.contextPath, receipt.reportPath);
+    }
+  }, 20_000);
+
+  it.each(["pause", "stop"] as const)("%s stops the issue and its automatic reviewer until the issue is resumed", async action => {
+    const fixture = await LifecycleFixture.create({ autoReview: true });
+    const started = await fixture.workflow.startIssue(1, fixture.placement, true);
+    await fixture.completedAssistantTurn(started);
+    await fixture.workflow.poll();
+    const reviewer = await fixture.runningWorker("review");
+    const receipt = await fixture.completedAssistantTurn(reviewer);
+
+    await fixture.workflow[action](action === "pause" ? started.id : reviewer.id);
+    const expectedStatus = action === "pause" ? "paused" : "stopped";
+    expect(await fixture.worker(started.id)).toMatchObject({ status: expectedStatus, autoReview: { enabled: true, phase: "reviewing", reviewWorkerId: reviewer.id } });
+    expect(await fixture.worker(reviewer.id)).toMatchObject({ status: expectedStatus });
+    expect(await processIsRunning(receipt.pid)).toBe(false);
+    fixture.advanceTime(5_001);
+    await fixture.workflow.poll();
+    expect(fixture.provider.submissions).toEqual([]);
+    expect(fixture.provider.merges).toEqual([]);
+    expect(fixture.factory.processes).toHaveLength(2);
+    expect(fixture.gitPushes).toHaveLength(1);
+
+    await fixture.workflow.resume(started.id, fixture.placement);
+    const resumed = await fixture.runningWorker("review");
+    expect(resumed).toMatchObject({ issueWorkerId: started.id, headSha: reviewer.headSha });
+    await fixture.completedAssistantTurn(resumed);
+    expect(fixture.factory.processes).toHaveLength(3);
+    expect(fixture.gitPushes).toHaveLength(1);
+    expect(fixture.provider.submissions).toEqual([]);
+  }, 25_000);
+
+  it("keeps an interrupted automatic review paused across restart and resumes from the saved review phase", async () => {
+    const fixture = await LifecycleFixture.create({ autoReview: true });
+    const started = await fixture.workflow.startIssue(1, fixture.placement, true);
+    await fixture.completedAssistantTurn(started);
+    await fixture.workflow.poll();
+    const reviewer = await fixture.runningWorker("review");
+    const receipt = await fixture.completedAssistantTurn(reviewer);
+
+    await fixture.restartWorkflow();
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "paused", autoReview: { enabled: true, phase: "reviewing", placement: fixture.placement, reviewWorkerId: reviewer.id } });
+    expect(await fixture.worker(reviewer.id)).toMatchObject({ status: "paused" });
+    expect(await processIsRunning(receipt.pid)).toBe(false);
+    await expectMissing(reviewer.worktreePath!, receipt.codexHome, receipt.tabContextPath, receipt.reportPath, receipt.contextPath);
+    fixture.advanceTime(5_001);
+    await fixture.workflow.poll();
+    expect(fixture.factory.processes).toHaveLength(2);
+    expect(fixture.provider.submissions).toEqual([]);
+
+    await fixture.workflow.resume(started.id, fixture.placement);
+    const resumed = await fixture.runningWorker("review");
+    expect(resumed).toMatchObject({ issueWorkerId: started.id, headSha: reviewer.headSha });
+    await fixture.completedAssistantTurn(resumed);
+    expect(fixture.factory.processes).toHaveLength(3);
+    expect(fixture.gitPushes).toHaveLength(1);
+    expect(fixture.provider.submissions).toEqual([]);
+  }, 25_000);
+
+  it("retains an uncertain automatic review without reposting or launching more work", async () => {
+    const fixture = await LifecycleFixture.create({ autoReview: true });
+    const started = await fixture.workflow.startIssue(1, fixture.placement, true);
+    await fixture.completedAssistantTurn(started);
+    await fixture.workflow.poll();
+    const reviewer = await fixture.runningWorker("review");
+    const receipt = await fixture.completedAssistantTurn(reviewer);
+    const postReview = vi.spyOn(fixture.provider, "postReview").mockImplementationOnce(async (number, review) => {
+      await LocalForgeProvider.prototype.postReview.call(fixture.provider, number, review);
+      throw new Error("The review was submitted but its response was lost.");
+    });
+
+    await fixture.workflow.poll();
+    expect(await fixture.worker(reviewer.id)).toMatchObject({ draft: { status: "post_failed", event: "request_changes", headSha: reviewer.headSha }, worktreePath: undefined });
+    expect(await processIsRunning(receipt.pid)).toBe(false);
+    await expectMissing(reviewer.worktreePath!, receipt.codexHome, receipt.tabContextPath, receipt.reportPath, receipt.contextPath);
+    fixture.advanceTime(5_001);
+    await fixture.workflow.poll();
+    await expect(fixture.workflow.resume(started.id, fixture.placement)).rejects.toThrow(/reconciled.*will not repost/i);
+    await fixture.workflow.poll();
+
+    expect(postReview).toHaveBeenCalledTimes(1);
+    expect(fixture.provider.submissions).toHaveLength(1);
+    expect(fixture.provider.merges).toEqual([]);
+    expect(fixture.factory.processes).toHaveLength(2);
+    expect(fixture.gitPushes).toHaveLength(1);
+    expect((await fs.stat(started.worktreePath!)).isDirectory()).toBe(true);
+    expect(await fixture.worker(reviewer.id)).toMatchObject({ draft: { status: "post_failed" } });
   }, 20_000);
 
   it("pauses publication confirmation without losing its report or launching another worker on resume", async () => {
@@ -384,13 +558,14 @@ class LifecycleFixture {
   readonly gitPushes: string[][] = [];
   readonly sources: CodexStateSources;
   readonly workspace: WorkspaceLayoutStore;
-  readonly sessions: SessionStore;
+  sessions: SessionStore;
   readonly reports: ForgeWorkerReports;
   readonly store: ForgeWorkflowStore;
   workflow: ForgeWorkflowService;
   readonly workflowDependencies: ForgeWorkflowDependencies;
   readonly catalog: RulesSkillsCatalogService;
   readonly runtimeDependencies: ForgeRuntimeDependencies;
+  private readonly plugins = new PluginRegistry();
   readonly models: Pick<ForgeSettings, "workerModel" | "workerReasoningEffort" | "reviewModel" | "reviewReasoningEffort"> = {
     workerModel: "gpt-6-astra", workerReasoningEffort: "xhigh", reviewModel: "gpt-6-astra", reviewReasoningEffort: "max",
   };
@@ -404,10 +579,9 @@ class LifecycleFixture {
     this.workspace = new WorkspaceLayoutStore(this.dataDir, pathPolicy);
     this.catalog = new RulesSkillsCatalogService(this.dataDir);
     this.sources = new CodexStateSources(this.dataDir);
-    const plugins = new PluginRegistry();
-    plugins.register(new CodexTerminalPlugin(this.factory, undefined, this.dataDir, this.sources));
-    plugins.register(new ForgePlugin(() => { throw new Error("Forge hooks are outside this runtime fixture."); }));
-    this.sessions = new SessionStore(plugins, pathPolicy, new TabContextService(this.dataDir), undefined, this.workspace, this.catalog);
+    this.plugins.register(new CodexTerminalPlugin(this.factory, undefined, this.dataDir, this.sources));
+    this.plugins.register(new ForgePlugin(() => { throw new Error("Forge hooks are outside this runtime fixture."); }));
+    this.sessions = new SessionStore(this.plugins, pathPolicy, new TabContextService(this.dataDir), undefined, this.workspace, this.catalog);
     this.runtimeDependencies = {
       sessions: this.sessions,
       workspace: this.workspace,
@@ -440,7 +614,7 @@ class LifecycleFixture {
     this.workflow = new ForgeWorkflowService(this.workflowDependencies);
   }
 
-  static async create({ trustRepository = true, largeOutput = false } = {}): Promise<LifecycleFixture> {
+  static async create({ trustRepository = true, largeOutput = false, autoReview = false, approveFirst = false } = {}): Promise<LifecycleFixture> {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-forge-lifecycle-"));
     const codexHome = path.join(root, "codex-home");
     const imagegen = path.join(codexHome, "skills", ".system", "imagegen");
@@ -456,6 +630,8 @@ class LifecycleFixture {
     vi.stubEnv("SHELL", "/bin/sh");
     vi.stubEnv("FORGE_FIXTURE_RECEIPTS", path.join(root, "receipts"));
     vi.stubEnv("FORGE_FIXTURE_LARGE_OUTPUT", String(largeOutput));
+    vi.stubEnv("FORGE_FIXTURE_AUTO_REVIEW", String(autoReview));
+    vi.stubEnv("FORGE_FIXTURE_APPROVE_FIRST", String(approveFirst));
     const fixture = new LifecycleFixture(root, trustRepository);
     fixtures.push(fixture);
     await fs.mkdir(fixture.repositoryPath);
@@ -486,6 +662,19 @@ class LifecycleFixture {
     return (await this.workflow.dashboard()).workers.find((worker) => worker.id === id)!;
   }
 
+  async runningWorker(kind: ForgeWorker["kind"]): Promise<ForgeWorker> {
+    return vi.waitFor(async () => {
+      const running = () => this.workflow.dashboard().then(({ workers }) => workers.find(worker => worker.kind === kind && worker.status === "running"));
+      const existing = await running();
+      if (existing) return existing;
+      this.advanceTime(5_001);
+      await this.workflow.poll();
+      const started = await running();
+      expect(started, JSON.stringify((await this.workflow.dashboard()).workers)).toBeDefined();
+      return started!;
+    }, { timeout: 2_000, interval: 20 });
+  }
+
   advanceCleanupInterval(): void {
     this.advanceTime(30_001);
   }
@@ -498,6 +687,9 @@ class LifecycleFixture {
   async restartWorkflow(): Promise<void> {
     await this.workflow.dispose();
     await this.sessions.dispose();
+    this.sessions = new SessionStore(this.plugins, new PathPolicy([this.root]), new TabContextService(this.dataDir), undefined, this.workspace, this.catalog);
+    this.runtimeDependencies.sessions = this.sessions;
+    this.runtimeDependencies.workspaceCommands = new WorkspaceCommandService(this.sessions, this.workspace);
     this.workflow = new ForgeWorkflowService({ ...this.workflowDependencies, runtime: new ForgeRuntime(this.runtimeDependencies) });
     await this.workflow.dashboard();
   }
@@ -599,10 +791,25 @@ class LocalForgeProvider implements ForgeProvider {
     return change ? this.getChangeRequest(change.number) : undefined;
   }
   async createChangeRequest(input: ForgeCreateChangeRequest) {
-    this.changes.set(7, { number: 7, title: input.title, body: input.body, url: "https://github.com/fixture/cloudx/pull/7", state: "open", labels: [], author: "worker-bot", updatedAt: new Date().toISOString(), draft: false, headSha: "", headBranch: input.headBranch, baseBranch: input.baseBranch, merged: false, mergeable: true, approved: false, unresolvedDiscussions: 0, comments: [], diff: "", linkedIssues: [] });
+    this.changes.set(7, { number: 7, title: input.title, body: input.body, url: "https://github.com/fixture/cloudx/pull/7", state: "open", labels: [], author: "worker-bot", updatedAt: new Date().toISOString(), draft: false, headSha: "", headBranch: input.headBranch, baseBranch: input.baseBranch, merged: false, reviewReady: true, mergeable: true, approved: false, unresolvedDiscussions: 0, comments: [], diff: "", linkedIssues: [] });
     return this.getChangeRequest(7);
   }
-  async postReview(_number: number, review: ForgeReviewSubmission) { this.submissions.push(structuredClone(review)); }
+  async postReview(number: number, review: ForgeReviewSubmission): Promise<ForgeReviewPublication> {
+    if ((await this.getChangeRequest(number)).headSha !== review.headSha) throw new Error("Fixture review head changed.");
+    this.submissions.push(structuredClone(review));
+    const change = this.changes.get(number)!;
+    const reviewId = `review-${this.submissions.length}`;
+    const commentIds = [`${reviewId}-summary`];
+    change.comments.push({ id: commentIds[0]!, body: review.body, author: "reviewer-bot" });
+    for (const [index, comment] of review.comments.entries()) {
+      const id = `${reviewId}-finding-${index + 1}`;
+      change.comments.push({ ...comment, id, author: "reviewer-bot", discussionId: id, resolved: false });
+      commentIds.push(id);
+      change.unresolvedDiscussions += 1;
+    }
+    if (review.event !== "comment") change.approved = review.event === "approve";
+    return { commentIds };
+  }
   async replyToDiscussion(number: number, discussionId: string, body: string, expectedHeadSha: string) {
     if ((await this.getChangeRequest(number)).headSha !== expectedHeadSha) throw new Error("Fixture head changed.");
     const change = this.changes.get(number)!;
@@ -682,8 +889,13 @@ if (!isReview && !fs.existsSync("solution.txt")) { fs.writeFileSync("solution.tx
 if (!isReview && context.change?.comments.length && !fs.existsSync("regression.txt")) { fs.writeFileSync("regression.txt", "Empty input is covered\\n"); changed.push("regression.txt"); }
 if (changed.length) { git("add", "--", ...changed); git("commit", "-m", "FIX: deterministic fixture change"); }
 const headSha = git("rev-parse", "HEAD");
+const review = process.env.FORGE_FIXTURE_AUTO_REVIEW === "true"
+  ? process.env.FORGE_FIXTURE_APPROVE_FIRST === "true" || fs.existsSync("regression.txt")
+    ? { kind: "review", headSha, event: "approve", body: "No actionable findings. The change is ready to merge.", comments: [] }
+    : { kind: "review", headSha, event: "request_changes", body: "Add regression coverage before merging.", comments: [{ body: "Cover empty input before merging.", path: "solution.txt", line: 1, side: "RIGHT" }] }
+  : { kind: "review", headSha, event: "comment", body: "The return value needs documentation.", comments: [{ body: "Explain the public return value.", path: "review.txt", line: 1, side: "RIGHT" }] };
 const report = isReview
-  ? { kind: "review", headSha, event: "comment", body: "The return value needs documentation.", comments: [{ body: "Explain the public return value.", path: "review.txt", line: 1, side: "RIGHT" }] }
+  ? review
   : { kind: "issue", title: "Handle empty input", body: "Implemented and verified the fixture changes.", discussionReplies: (context.change?.comments ?? []).filter(comment => comment.discussionId && comment.resolved === false).map(comment => ({ discussionId: comment.discussionId, body: "Added and verified the empty-input regression." })), resolvedDiscussionIds: (context.change?.comments ?? []).filter(comment => comment.discussionId && comment.resolved === false).map(comment => comment.discussionId) };
 const receipt = { pid: process.pid, trustedProjectPath, gitAuthorizationPresent: Object.entries(process.env).some(([key, value]) => key.startsWith("GIT_CONFIG_VALUE_") && value?.includes("Authorization:")), args, templateId: process.env.CLOUDX_PERSONALITY_TEMPLATE_ID, skillIds: process.env.CLOUDX_ENABLED_SKILL_IDS, codexHome: process.env.CODEX_HOME, reportPath, contextPath, context, headSha };
 fs.writeFileSync(path.join(process.env.FORGE_FIXTURE_RECEIPTS, path.basename(reportPath)), JSON.stringify(receipt));

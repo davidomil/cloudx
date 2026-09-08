@@ -88,6 +88,14 @@ After merge, Forge removes its owned checkout and worker artifacts.
 Ownership changes, dirty files or a local commit different from the
 published head block cleanup and preserve the resources.
 
+## Auto review
+
+Enable **Auto review** beside **Start work** to run the issue through implementation, review and correction until approval. The coding worker keeps its checkout, and each revision gets a fresh reviewer. Forge merges the approved revision after the repository checks pass and removes the associated workers once the linked issues are closed.
+
+A reviewer that finds no issues explicitly approves. Actionable findings request changes and send the issue back to coding. A review that needs human clarification pauses the loop.
+
+**Pause** and **Stop** control both the issue worker and its current reviewer. Turning Auto review off prevents further automatic handoffs. After a server restart, use **Resume** to continue. Pending merge checks do not start another coding or review run; uncertain submissions require inspection before continuing.
+
 ## Review PRs and MRs
 
 Select a request and click **Review** to retain a draft, or **Review and
@@ -105,13 +113,14 @@ the reviewer identity.
 
 | State | Action |
 |----|----|
-| awaiting_review | Review the PR/MR, then Resume. |
+| awaiting_review | Auto review continues when enabled; otherwise review the PR/MR, then Resume. |
+| awaiting_merge | Wait for the repository checks, or Pause / Stop the loop. |
 | paused / stopped | Resume when ready to continue. |
 | failed | Inspect the error and retained work before resuming. |
 | cleanup_failed | Resolve the ownership or process error, then Resume the issue or Clean up the review. |
 | post_failed | Inspect the provider; the saved submission cannot be posted again. |
 
-Visible states require explicit action.
+Paused and failed states require explicit action.
 
 Restart recovery consults persisted workspace and tab ownership. If a
 terminal disappeared without verified process quiescence, Forge
@@ -141,7 +150,14 @@ records are also not converted into directory ownership.
 
 ## Verification
 
-This revision passed 84 focused web tests and 231 server tests.
+The automatic review change passed 867 Forge tests, including 14 real Git/PTY
+lifecycle tests, plus workspace typecheck, web build and desktop/mobile UI
+checks. The approval-first loop used two worker terminals and one push;
+the findings loop used four terminals and two pushes.
+
+Commands: `npx vitest run apps/server/src/forge apps/server/src/plugins/ForgePlugin.test.ts apps/web/src/ui/ForgePanel.test.ts apps/web/src/ui/ForgeConnections.test.ts apps/web/src/api.forge.test.ts apps/web/src/ui/SettingsDialog.forge.test.ts --reporter=dot` and `npx tsc -b --pretty false`.
+
+The earlier overlay revision passed 84 focused web tests and 231 server tests.
 `npm run typecheck`, `npm run build` and 12 shipped-shell browser checks
 also passed. Desktop and mobile browser fixtures verified close/reopen,
 retained output and connection, focus and Escape/Tab input, without

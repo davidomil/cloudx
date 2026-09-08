@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ForgeChangeRequest, ForgeWorker } from "@cloudx/shared";
+import type { ForgeChangeRequest, ForgeReviewPublication, ForgeReviewSubmission, ForgeWorker } from "@cloudx/shared";
 import {
   ForgeWorkflowService,
   type ForgeWorkflowDependencies,
 } from "./ForgeWorkflowService.js";
-import { ForgeHeadChangedError, ForgeProviderError } from "./providers/ForgeProvider.js";
+import { ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeProviderError } from "./providers/ForgeProvider.js";
+import { parseWorkers } from "./ForgeWorkflowValidation.js";
 
 function fixture() {
   const issue = { number: 1, title: "Fix issue", body: "Task", state: "open", comments: [] };
@@ -23,6 +24,7 @@ function fixture() {
     baseBranch: "main",
     merged: false,
     mergeable: true,
+    reviewReady: true,
     approved: false,
     unresolvedDiscussions: 0,
     linkedIssues: [],
@@ -39,9 +41,9 @@ function fixture() {
     getChangeRequestStatus: vi.fn(async () => ({ ...change })),
     getChangeRequest: vi.fn(async () => ({ ...change })),
     createChangeRequest: vi.fn(async () => change),
-    postReview: vi.fn(async () => {}),
+    postReview: vi.fn(async (_number: number, _review: ForgeReviewSubmission): Promise<ForgeReviewPublication> => ({ commentIds: [] })),
     replyToDiscussion: vi.fn(async (_number: number, _discussionId: string, _body: string, _headSha: string) => {}),
-    resolveDiscussion: vi.fn(async () => {}),
+    resolveDiscussion: vi.fn(async (_number: number, _id: string, _headSha: string) => {}),
     merge: vi.fn(async () => {
       change.merged = true;
       change.state = "merged";
@@ -68,7 +70,7 @@ function fixture() {
       branch: "cloudx/forge/test",
       repositoryPath: "/repo/work",
     })),
-    launch: vi.fn(async () => "tab-1"),
+    launch: vi.fn(async (_input: Parameters<ForgeWorkflowDependencies["runtime"]["launch"]>[0], _signal?: AbortSignal) => "tab-1"),
     pause: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
     cleanup: vi.fn(async () => {}),
@@ -1435,5 +1437,399 @@ describe("Forge publication confirmation", () => {
     expect(f.provider.resolveDiscussion).not.toHaveBeenCalled();
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
     expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("Forge issue auto review", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  async function automaticIssue() {
+    const f = fixture();
+    const save = f.deps.store.write;
+    f.deps.store.write = async workers => save(parseWorkers(workers));
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    let reviewNumber = 0;
+    f.provider.postReview.mockImplementation(async (_number, review) => {
+      const id = `review-${++reviewNumber}`;
+      f.change.comments.push({ id, body: review.body, author: "reviewer" });
+      for (const [index, comment] of review.comments.entries())
+        f.change.comments.push({ id: `${id}-${index}`, discussionId: `${id}-thread-${index}`, author: "reviewer", resolved: false, ...comment });
+      f.change.approved = review.event === "approve";
+      f.change.unresolvedDiscussions = f.change.comments.filter(c => c.resolved === false).length;
+      return { commentIds: f.change.comments.filter(c => c.id === id || c.id.startsWith(`${id}-`)).map(c => c.id) };
+    });
+    f.provider.resolveDiscussion.mockImplementation(async (_number: number, id: string) => {
+      for (const comment of f.change.comments) if (comment.discussionId === id) comment.resolved = true;
+      f.change.unresolvedDiscussions = f.change.comments.filter(c => c.resolved === false).length;
+    });
+    const issue = await f.service.startIssue(1, placement, true);
+    const poll = async () => { now += 5_000; await f.service.poll(); };
+    const report = (value: unknown) => f.reports.read.mockResolvedValue(value);
+    const codingReport = (extra = {}) => report({ kind: "issue", title: "Fix", body: "Tested", ...extra });
+    const currentIssue = () => f.stored().find(w => w.id === issue.id)!;
+    const currentReview = () => f.stored().find(w => w.id === currentIssue().autoReview?.reviewWorkerId)!;
+    return { ...f, issue, poll, report, codingReport, currentIssue, currentReview };
+  }
+
+  it("implements, reviews, addresses findings, reviews again and merges without a third coding run", async () => {
+    const f = await automaticIssue();
+    f.codingReport();
+    await f.poll();
+    const first = f.currentReview();
+    expect(first).toMatchObject({ kind: "review", status: "running", issueWorkerId: f.issue.id, headSha: f.change.headSha, autoPost: true });
+    expect(f.currentIssue().autoReview).toMatchObject({ enabled: true, phase: "reviewing", reviewWorkerId: first.id, placement });
+    f.report({ kind: "review", headSha: f.change.headSha, event: "request_changes", body: "Cover null input", comments: [{ body: "Null input must not throw" }] });
+    await f.poll();
+    expect(f.currentIssue().status).toBe("running");
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+    expect(f.runtime.launch.mock.calls.at(-1)?.[0]).toMatchObject({ id: f.issue.id, model: "gpt-6-astra", reasoningEffort: "xhigh" });
+    f.change.headSha = "b".repeat(40);
+    f.codingReport({ discussionReplies: [{ discussionId: "review-1-thread-0", body: "Added and tested null handling." }], resolvedDiscussionIds: ["review-1-thread-0"] });
+    await f.poll();
+    const second = f.currentReview();
+    expect(second.id).not.toBe(first.id);
+    expect(second.headSha).toBe(f.change.headSha);
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Null input now handled", comments: [] });
+    await f.poll();
+    expect(f.stored()).toEqual([]);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(4);
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+    expect(f.provider.postReview).toHaveBeenCalledTimes(2);
+    expect(f.provider.replyToDiscussion).toHaveBeenCalledOnce();
+    expect(f.provider.resolveDiscussion).toHaveBeenCalledOnce();
+    expect(f.provider.merge).toHaveBeenCalledExactlyOnceWith(7, "b".repeat(40));
+  });
+
+  it.each(["pause", "stop"] as const)("%s on either loop worker interrupts the group and prevents handoffs", async action => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    const reviewer = f.currentReview();
+    await f.service[action](action === "pause" ? f.issue.id : reviewer.id);
+    expect(f.currentIssue().status).toBe(action === "pause" ? "paused" : "stopped");
+    expect(f.currentReview().status).toBe(action === "pause" ? "paused" : "stopped");
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
+    await f.poll();
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it("waits for merge requirements after approval without more coding or reviews", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    f.change.mergeable = false;
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", autoReview: { phase: "merging" } });
+    await f.poll();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    f.change.mergeable = true;
+    await f.poll();
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+    expect(f.stored()).toEqual([]);
+  });
+
+  it("pauses for a comment-only review instead of treating it as approval or another coding request", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    f.report({ kind: "review", headSha: f.change.headSha, event: "comment", body: "Need a product decision", comments: [] });
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringMatching(/clarification/i) });
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it("waits for published review feedback to become visible and never reposts it", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    f.provider.postReview.mockResolvedValue({ commentIds: ["delayed-review"] });
+    f.report({ kind: "review", headSha: f.change.headSha, event: "request_changes", body: "Handle empty input", comments: [] });
+    await f.poll();
+    expect(f.currentIssue().status).toBe("awaiting_review");
+    expect(f.currentReview().draft).toMatchObject({ status: "posted", publication: { commentIds: ["delayed-review"] } });
+    await f.poll();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+    f.change.comments.push({ id: "delayed-review", body: "Handle empty input", author: "reviewer" });
+    await f.poll();
+    expect(f.currentIssue().status).toBe("running");
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+  });
+
+  it("turns off future handoffs and can opt an existing ready issue into review", async () => {
+    const f = await automaticIssue();
+    await f.service.setAutoReview(f.issue.id, false, placement);
+    f.codingReport(); await f.poll();
+    expect(f.currentIssue().status).toBe("awaiting_review");
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+    await f.service.setAutoReview(f.issue.id, true, placement);
+    await f.poll();
+    expect(f.currentReview().status).toBe("running");
+    await f.service.setAutoReview(f.issue.id, false, placement);
+    f.report({ kind: "review", headSha: f.change.headSha, event: "request_changes", body: "Fix input", comments: [] });
+    await f.poll();
+    expect(f.currentIssue().status).toBe("awaiting_review");
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("instructs an issue-free reviewer to explicitly approve and merges after only one coding run", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    expect(f.runtime.launch.mock.calls.at(-1)?.[0].prompt).toContain("an issue-free review must explicitly approve");
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "No issues found", comments: [] });
+    await f.poll();
+    expect(f.provider.postReview).toHaveBeenCalledExactlyOnceWith(7, expect.objectContaining({ event: "approve", comments: [] }));
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+  });
+
+  it("starts a fresh review when feedback changes while the reviewer is working", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    const first = f.currentReview();
+    f.change.comments.push({ id: "new-feedback", author: "human", body: "Also cover negative inputs." });
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
+    await f.poll();
+    expect(f.currentReview().id).not.toBe(first.id);
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+  });
+
+  it("reviews a human clarification after Resume instead of pausing forever on the previous comment", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    const first = f.currentReview();
+    f.report({ kind: "review", headSha: f.change.headSha, event: "comment", body: "Should negative inputs be rejected?", comments: [] });
+    await f.poll();
+    await f.service.resume(f.issue.id, placement);
+    expect(f.currentIssue().status).toBe("paused");
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    f.change.comments.push({ id: "clarification", body: "Yes; the existing rejection is correct.", author: "human" });
+    await f.service.resume(f.issue.id, placement);
+    expect(f.currentReview().id).not.toBe(first.id);
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Behavior matches the clarified requirement.", comments: [] });
+    await f.poll();
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+  });
+
+  it("pauses a contradictory approval with findings before posting it", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [{ body: "Null input throws" }] });
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringMatching(/approved with findings/) });
+    expect(f.currentReview().draft?.status).toBe("draft");
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+  });
+
+  it("waits for provider commit processing before launching review and stops if processing never finishes", async () => {
+    const f = await automaticIssue();
+    f.change.reviewReady = false;
+    f.codingReport(); await f.poll();
+    expect(f.currentIssue().status).toBe("awaiting_review");
+    expect(f.currentIssue().autoReview?.waitingSince).toBeDefined();
+    for (let i = 0; i < 24; i++) await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "failed", error: expect.stringMatching(/preparing this commit/) });
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+    f.change.reviewReady = true;
+    await f.service.resume(f.issue.id, placement);
+    expect(f.currentReview().status).toBe("running");
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+  });
+
+  it("does not count replies as missing inline findings in a review publication receipt", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    f.provider.postReview.mockImplementation(async () => {
+      f.change.comments.push({ id: "summary", body: "Two findings", author: "reviewer" },
+        { id: "first", reviewId: "10", body: "First finding", author: "reviewer" },
+        { id: "reply", reviewId: "10", replyToCommentId: "first", body: "Clarification", author: "human" });
+      return { commentIds: ["summary"], inlineReview: { id: "10", commentCount: 2 } };
+    });
+    f.report({ kind: "review", headSha: f.change.headSha, event: "request_changes", body: "Two findings", comments: [] });
+    await f.poll();
+    await f.poll();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.currentIssue().status).toBe("awaiting_review");
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+    f.change.comments.push({ id: "second", reviewId: "10", body: "Second finding", author: "reviewer" });
+    await f.poll();
+    expect(f.currentIssue().status).toBe("running");
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+  });
+
+  it("limits waiting for invisible feedback without reposting or starting coding", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    f.provider.postReview.mockResolvedValue({ commentIds: ["missing"] });
+    f.report({ kind: "review", headSha: f.change.headSha, event: "request_changes", body: "Fix", comments: [] });
+    await f.poll();
+    for (let i = 0; i < 24; i++) await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "failed", error: expect.stringMatching(/feedback to appear/) });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+  });
+
+  it("checks new feedback arriving during final checkout verification before merging", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    f.runtime.verifyPublishedWorkspace.mockImplementation(async () => {
+      f.change.comments.push({ id: "late-feedback", author: "human", body: "One more requirement." });
+    });
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
+    await f.poll();
+    expect(f.currentReview().status).toBe("running");
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+  });
+
+  it("waits for explicit Resume after a restart in merge phase without rerunning Codex or reposting approval", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    f.change.mergeable = false;
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
+    await f.poll();
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.poll();
+    expect(f.currentIssue().status).toBe("paused");
+    f.change.mergeable = true;
+    await restarted.poll();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    await restarted.resume(f.issue.id, placement);
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+  });
+
+  it("never repeats an uncertain merge, including after Auto review is turned off", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    f.provider.merge.mockRejectedValue(new Error("Merge response lost"));
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "failed", autoReview: { mergeAttempted: true } });
+    await f.poll();
+    await expect(f.service.resume(f.issue.id, placement)).rejects.toThrow(/previous merge/);
+    await f.service.setAutoReview(f.issue.id, false, placement);
+    await expect(f.service.resume(f.issue.id, placement)).rejects.toThrow(/previous merge/);
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not resume paused work when Auto review is enabled", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(1, placement);
+    await f.service.pause(worker.id);
+    await f.service.setAutoReview(worker.id, true, placement);
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "paused", autoReview: { enabled: true, phase: "implementing" } });
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+  });
+
+  it("honors Pause while the next reviewer is being registered", async () => {
+    const f = await automaticIssue();
+    const save = f.deps.store.write;
+    let release!: () => void;
+    let ready!: () => void;
+    const handoff = new Promise<void>(resolve => { ready = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let intercepted = false;
+    f.deps.store.write = async workers => {
+      await save(workers);
+      if (!intercepted && workers[0].autoReview?.phase === "reviewing") {
+        intercepted = true;
+        ready();
+        await held;
+      }
+    };
+    f.codingReport();
+    const polling = f.poll();
+    await handoff;
+    const pausing = f.service.pause(f.issue.id);
+    release();
+    await Promise.all([polling, pausing]);
+    expect(f.currentIssue().status).toBe("paused");
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+  });
+
+  it("continues observing merge requirements when the provider rejects preflight before sending a merge", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    f.provider.merge.mockRejectedValueOnce(new ForgeMergeNotStartedError(new ForgeProviderError("Checks pending", 409), { ...f.change, mergeable: false }));
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge" });
+    expect(f.currentIssue().autoReview?.mergeAttempted).toBeUndefined();
+    await f.poll();
+    expect(f.stored()).toEqual([]);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+  });
+
+  it("preserves a confirmed posted review when saving its receipt initially fails", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    const save = f.deps.store.write;
+    let failed = false;
+    f.deps.store.write = async workers => {
+      if (!failed && workers.some(w => w.draft?.status === "posted")) {
+        failed = true;
+        throw new Error("Storage unavailable");
+      }
+      await save(workers);
+    };
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
+    await f.poll();
+    expect(f.currentIssue().status).toBe("failed");
+    expect(f.currentReview().draft).toMatchObject({ status: "posted", publication: { commentIds: ["review-1"] } });
+    await f.service.resume(f.issue.id, placement);
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+  });
+
+  it("does not use another issue's review when a saved association is incorrect", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    const saved = f.stored();
+    saved[1].number = 8;
+    saved[1].changeNumber = 8;
+    await f.deps.store.write(saved);
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.dashboard();
+    await expect(restarted.resume(f.issue.id, placement)).rejects.toThrow(/does not belong/);
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("does not launch a reviewer in a newly configured repository", async () => {
+    const f = await automaticIssue();
+    const settings = f.deps.settings();
+    f.deps.settings = () => ({ ...settings, repository: { ...settings.repository, projectPath: "other/repo" } });
+    f.codingReport(); await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "failed", error: expect.stringMatching(/configured repository changed/) });
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+  });
+
+  it("does not treat GitLab's automatic approval activity as new review feedback", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    const publish = f.provider.postReview.getMockImplementation()!;
+    f.provider.postReview.mockImplementation(async (number, review) => {
+      const receipt = await publish(number, review);
+      f.change.comments.push({ id: "system-approval", body: "approved this merge request", author: "reviewer", system: true });
+      return receipt;
+    });
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "No issues found", comments: [] });
+    await f.poll();
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
   });
 });

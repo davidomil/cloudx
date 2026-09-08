@@ -10,11 +10,13 @@ import type {
   ForgeListQuery,
   ForgeMergeResult,
   ForgePage,
+  ForgeReviewPublication,
   ForgeReviewSubmission,
 } from "@cloudx/shared";
 import { ForgeHttpClient, hasNextPage, pagination } from "./ForgeHttpClient.js";
 import {
   ForgeHeadChangedError,
+  ForgeMergeNotStartedError,
   ForgeProviderError,
   requireDiscussion,
   requireMergeReady,
@@ -116,6 +118,7 @@ export class GitHubProvider implements ForgeProvider {
       ...issue,
       ...status,
       draft: boolean(raw.draft),
+      reviewReady: true,
       mergeable:
         readiness.mergeable === "MERGEABLE" &&
         readiness.mergeStateStatus === "CLEAN",
@@ -241,7 +244,7 @@ export class GitHubProvider implements ForgeProvider {
   async postReview(
     number: number,
     input: ForgeReviewSubmission,
-  ): Promise<void> {
+  ): Promise<ForgeReviewPublication> {
     validateReview(input);
     const path = this.pullPath(number);
     const current = record((await this.http.request(path)).body);
@@ -260,6 +263,7 @@ export class GitHubProvider implements ForgeProvider {
     ]
       .filter(Boolean)
       .join("\n\n");
+    const inlineComments = input.comments.filter((comment) => comment.path);
     const response = await this.http.request(`${path}/reviews`, {
       method: "POST",
       role: "reviewer",
@@ -272,25 +276,32 @@ export class GitHubProvider implements ForgeProvider {
         }[input.event],
         body:
           body || (input.comments.length ? "Review comments attached." : ""),
-        comments: input.comments
-          .filter((comment) => comment.path)
-          .map((comment) => ({
-            path: comment.path,
-            line: comment.line,
-            side: comment.side ?? "RIGHT",
-            body: comment.body,
-          })),
+        comments: inlineComments.map((comment) => ({
+          path: comment.path,
+          line: comment.line,
+          side: comment.side ?? "RIGHT",
+          body: comment.body,
+        })),
       },
     });
-    integer(record(response.body).id);
+    const id = String(integer(record(response.body).id));
+    return {
+      commentIds: [`review-${id}`],
+      ...(inlineComments.length ? { inlineReview: { id, commentCount: inlineComments.length } } : {}),
+    };
   }
 
   async merge(
     number: number,
     expectedHeadSha: string,
   ): Promise<ForgeMergeResult> {
-    const request = await this.getChangeRequest(number);
-    requireMergeReady(request, expectedHeadSha);
+    let request: ForgeChangeRequest | undefined;
+    try {
+      request = await this.getChangeRequest(number);
+      requireMergeReady(request, expectedHeadSha);
+    } catch (error) {
+      throw new ForgeMergeNotStartedError(error, request);
+    }
     const response = record(
       (
         await this.http.request(`${this.pullPath(number)}/merge`, {
@@ -602,7 +613,12 @@ function githubInlineComments(values: unknown[], threads: GitHubReadiness["threa
     const thread = nodeId === undefined ? undefined : threads.get(nodeId);
     if (!thread)
       throw new ForgeProviderError("GitHub review comments changed while loading. Refresh before proceeding.", 409);
-    return { ...githubComment(comment), ...thread };
+    return {
+      ...githubComment(comment),
+      ...thread,
+      reviewId: String(integer(comment.pull_request_review_id)),
+      ...(comment.in_reply_to_id === undefined ? {} : { replyToCommentId: String(rootId) }),
+    };
   });
 }
 

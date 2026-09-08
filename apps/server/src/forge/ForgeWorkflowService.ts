@@ -6,13 +6,14 @@ import type {
   ForgeChangeRequestStatus,
   ForgeCredentialRole,
   ForgeDashboard,
+  ForgeIssueDetail,
   ForgePlacement,
   ForgeRepository,
   ForgeReviewDraft,
   ForgeReviewSubmission,
   ForgeWorker,
 } from "@cloudx/shared";
-import { ForgeHeadChangedError, type ForgeProvider } from "./providers/ForgeProvider.js";
+import { ForgeHeadChangedError, ForgeMergeNotStartedError, type ForgeProvider } from "./providers/ForgeProvider.js";
 import { parseReview, parseWorkerReport } from "./ForgeWorkflowValidation.js";
 
 export interface ForgeSettings {
@@ -123,6 +124,7 @@ export class ForgeWorkflowService {
   private readonly completionChecks = new AbortController();
   private readonly operations = new Map<string, AbortController>();
   private readonly nextPublicationCheckAt = new Map<string, number>();
+  private readonly nextAutoReviewCheckAt = new Map<string, number>();
   constructor(private readonly deps: ForgeWorkflowDependencies) {}
 
   start(): void {
@@ -152,7 +154,8 @@ export class ForgeWorkflowService {
       controller.abort(new Error("CloudX is shutting down."));
     await this.exclusive(async () => {
       for (const worker of this.workers.filter(
-        (w) => w.status === "running" || w.status === "starting",
+        (w) => w.status === "running" || w.status === "starting" ||
+          w.autoReview?.enabled && ["awaiting_publication", "awaiting_review", "awaiting_merge"].includes(w.status),
       )) {
         await this.quiesce(worker, { retainReport: worker.kind === "issue" && !worker.pendingPublication });
         worker.status = "paused";
@@ -179,8 +182,8 @@ export class ForgeWorkflowService {
     };
     return this.loaded ? snapshot() : this.exclusive(snapshot);
   }
-  startIssue(number: number, placement: ForgePlacement): Promise<ForgeWorker> {
-    return this.startWorker("issue", number, false, placement);
+  startIssue(number: number, placement: ForgePlacement, autoReview = false): Promise<ForgeWorker> {
+    return this.exclusive(() => this.createWorker("issue", number, false, placement, autoReview));
   }
   startReview(
     number: number,
@@ -189,89 +192,125 @@ export class ForgeWorkflowService {
   ): Promise<ForgeWorker> {
     return this.startWorker("review", number, autoPost, placement);
   }
+  setAutoReview(id: string, enabled: boolean, placement: ForgePlacement): Promise<ForgeWorker> {
+    return this.exclusive(async () => {
+      const worker = this.requireWorker(id);
+      if (worker.kind !== "issue" || worker.status === "completed")
+        throw new Error("Auto review requires an existing issue worker.");
+      worker.autoReview ??= { enabled, phase: worker.changeNumber && !worker.pendingPublication ? "reviewing" : "implementing", placement };
+      worker.autoReview.enabled = enabled;
+      worker.autoReview.placement = placement;
+      if (!enabled && worker.status === "awaiting_merge") worker.status = "awaiting_review";
+      this.nextAutoReviewCheckAt.delete(worker.id);
+      await this.persist();
+      return structuredClone(worker);
+    });
+  }
   private startWorker(
     kind: ForgeWorker["kind"],
     number: number,
     autoPost: boolean,
     placement: ForgePlacement,
   ): Promise<ForgeWorker> {
-    return this.exclusive(async () => {
-      if (this.disposed) throw new Error("Forge Workers is shutting down.");
-      const settings = this.deps.settings();
-      if (kind === "review") this.requireConfirmedPublication(settings.repository, number);
-      if (
-        this.workers.some(
-          (w) =>
-            w.kind === kind &&
-            w.number === number &&
-            sameRepository(w.repository, settings.repository) &&
-            !["completed"].includes(w.status),
-        )
-      ) {
-        throw new Error(
-          "A worker already exists for this item. Resume or inspect that worker.",
-        );
-      }
-      const provider = this.deps.provider(
-        settings.repository,
-        kind === "issue" ? "worker" : "reviewer",
+    return this.exclusive(() => this.createWorker(kind, number, autoPost, placement));
+  }
+  private async createWorker(
+    kind: ForgeWorker["kind"], number: number, autoPost: boolean, placement: ForgePlacement,
+    autoReview = false, issueWorker?: ForgeWorker,
+  ): Promise<ForgeWorker> {
+    if (this.disposed) throw new Error("Forge Workers is shutting down.");
+    const settings = this.deps.settings();
+    if (issueWorker && !sameRepository(issueWorker.repository, settings.repository))
+      throw new Error("The configured repository changed. Restore the issue worker's repository before continuing auto review.");
+    const controller = issueWorker ? this.operations.get(issueWorker.id) : new AbortController();
+    if (!controller) throw new Error("The issue loop is no longer active.");
+    controller.signal.throwIfAborted();
+    if (kind === "review") this.requireConfirmedPublication(settings.repository, number);
+    if (
+      this.workers.some(
+        (w) =>
+          w.kind === kind &&
+          w.number === number &&
+          sameRepository(w.repository, settings.repository) &&
+          !["completed"].includes(w.status),
+      )
+    ) {
+      throw new Error(
+        "A worker already exists for this item. Resume or inspect that worker.",
       );
-      const item =
+    }
+    const provider = this.deps.provider(
+      settings.repository,
+      kind === "issue" ? "worker" : "reviewer",
+      controller.signal,
+    );
+    const item =
+      kind === "issue"
+        ? await provider.getIssue(number)
+        : await provider.getChangeRequest(number);
+    controller.signal.throwIfAborted();
+    if (this.disposed) throw new Error("Forge Workers is shutting down.");
+    if (item.state !== "open" || ("merged" in item && item.merged))
+      throw new Error("Only open issues and change requests can start work.");
+    if (issueWorker) {
+      requirePublicationRequest(issueWorker, item as ForgeChangeRequest);
+      if ((item as ForgeChangeRequest).headSha !== issueWorker.headSha || !(item as ForgeChangeRequest).reviewReady)
+        throw new Error("The published commit changed or is still processing. Inspect the request before resuming auto review.");
+    }
+    const now = new Date().toISOString();
+    const worker: ForgeWorker = {
+      id: randomUUID(),
+      kind,
+      number,
+      title: item.title,
+      repository: settings.repository,
+      baseBranch:
+        kind === "review"
+          ? (item as ForgeChangeRequest).baseBranch
+          : settings.baseBranch,
+      templateId:
         kind === "issue"
-          ? await provider.getIssue(number)
-          : await provider.getChangeRequest(number);
-      if (this.disposed) throw new Error("Forge Workers is shutting down.");
-      if (item.state !== "open" || ("merged" in item && item.merged))
-        throw new Error("Only open issues and change requests can start work.");
-      const now = new Date().toISOString();
-      const worker: ForgeWorker = {
-        id: randomUUID(),
-        kind,
-        number,
-        title: item.title,
-        repository: settings.repository,
-        baseBranch:
-          kind === "review"
-            ? (item as ForgeChangeRequest).baseBranch
-            : settings.baseBranch,
-        templateId:
-          kind === "issue"
-            ? settings.workerTemplateId
-            : settings.reviewTemplateId,
-        status: "starting",
-        autoPost,
-        startedAt: now,
-        updatedAt: now,
-        ...(kind === "review"
-          ? {
-              changeNumber: number,
-              changeUrl: item.url,
-              headSha: (item as ForgeChangeRequest).headSha,
-            }
-          : {}),
-      };
-      this.operations.set(worker.id, new AbortController());
-      this.workers.push(worker);
+          ? settings.workerTemplateId
+          : settings.reviewTemplateId,
+      status: "starting",
+      autoPost,
+      ...(autoReview ? { autoReview: { enabled: true, phase: "implementing" as const, placement } } : {}),
+      ...(issueWorker ? { issueWorkerId: issueWorker.id } : {}),
+      startedAt: now,
+      updatedAt: now,
+      ...(kind === "review"
+        ? {
+            changeNumber: number,
+            changeUrl: item.url,
+            headSha: (item as ForgeChangeRequest).headSha,
+          }
+        : {}),
+    };
+    this.operations.set(worker.id, controller);
+    if (issueWorker) issueWorker.autoReview!.reviewWorkerId = worker.id;
+    this.workers.push(worker);
+    await this.persist();
+    try {
+      controller.signal.throwIfAborted();
+      const workspace = await this.deps.runtime.prepareWorkspace(
+        {
+          id: worker.id,
+          baseBranch: worker.baseBranch,
+          headSha: worker.headSha,
+          review: kind === "review",
+          expectedRepository: worker.repository,
+        },
+        controller.signal,
+      );
+      Object.assign(worker, workspace);
       await this.persist();
-      try {
-        const workspace = await this.deps.runtime.prepareWorkspace(
-          {
-            id: worker.id,
-            baseBranch: worker.baseBranch,
-            headSha: worker.headSha,
-            review: kind === "review",
-            expectedRepository: worker.repository,
-          },
-          this.operations.get(worker.id)?.signal,
-        );
-        Object.assign(worker, workspace);
-        await this.persist();
-        await this.launch(worker, placement, { item });
-      } catch (error) {
-        await this.fail(worker, error);
-      }
-      return structuredClone(worker);
-    });
+      const issue = issueWorker ? await this.providerFor(issueWorker).getIssue(issueWorker.number) : undefined;
+      controller.signal.throwIfAborted();
+      await this.launch(worker, placement, { item, issue });
+    } catch (error) {
+      await this.fail(worker, error);
+    }
+    return structuredClone(worker);
   }
   pause(id: string): Promise<ForgeWorker> {
     return this.control(id, "paused");
@@ -279,138 +318,171 @@ export class ForgeWorkflowService {
   stop(id: string): Promise<ForgeWorker> {
     return this.control(id, "stopped");
   }
+  private controlGroup(id: string): ForgeWorker[] {
+    const worker = this.workers.find(candidate => candidate.id === id);
+    if (!worker) return [];
+    const parent = worker.kind === "issue" ? worker : this.workers.find(candidate =>
+      candidate.id === worker.issueWorkerId && candidate.autoReview?.reviewWorkerId === worker.id);
+    if (!parent?.autoReview) return [worker];
+    const reviewer = this.workers.find(candidate => candidate.id === parent.autoReview!.reviewWorkerId);
+    return reviewer ? [parent, reviewer] : [parent];
+  }
   private async control(
     id: string,
     status: "paused" | "stopped",
   ): Promise<ForgeWorker> {
-    this.operations.get(id)?.abort(new Error(`Worker ${status} by user.`));
-    const current = this.workers.find(worker => worker.id === id);
-    if (current?.tabId && ["running", "starting"].includes(current.status)) await this.deps.runtime.pause(current.tabId);
+    for (const current of this.controlGroup(id)) {
+      this.operations.get(current.id)?.abort(new Error(`Worker ${status} by user.`));
+      if (current.tabId && ["running", "starting"].includes(current.status)) await this.deps.runtime.pause(current.tabId);
+    }
     return this.exclusive(async () => {
-      const worker = this.requireWorker(id);
-      if (
-        !["starting", "running", "awaiting_publication", "awaiting_review", "paused", "failed", "stopped"].includes(
-          worker.status,
+      const requested = this.requireWorker(id);
+      for (const worker of this.controlGroup(id)) {
+        if (worker.status === "completed") continue;
+        if (
+          !["starting", "running", "awaiting_publication", "awaiting_review", "awaiting_merge", "paused", "failed", "stopped"].includes(
+            worker.status,
+          )
         )
-      )
-        throw new Error(
-          "This worker cannot be paused or stopped in its current state.",
-        );
-      await this.quiesce(worker, { closeTab: false });
-      worker.status = status;
-      if (worker.kind === "review" && status === "stopped")
-        await this.cleanup(worker);
-      await this.persist();
-      this.operations.delete(id);
-      return structuredClone(worker);
+          throw new Error(
+            "This worker cannot be paused or stopped in its current state.",
+          );
+        await this.quiesce(worker, { closeTab: false });
+        worker.status = status;
+        if (worker.kind === "review" && status === "stopped")
+          await this.cleanup(worker);
+        await this.persist();
+        this.operations.delete(worker.id);
+      }
+      return structuredClone(requested);
     });
   }
   resume(id: string, placement: ForgePlacement): Promise<ForgeWorker> {
     return this.exclusive(async () => {
       const worker = this.requireWorker(id);
-      if (
-        ![
-          "paused",
-          "stopped",
-          "awaiting_review",
-          "failed",
-          "cleanup_failed",
-        ].includes(worker.status)
-      )
-        throw new Error("This worker is not waiting to resume.");
-      const recoveringResources = worker.status === "cleanup_failed";
-      if (worker.kind === "review") this.requireConfirmedPublication(worker.repository, worker.number);
-      if (await this.reconcileMergedChange(worker, { retryCleanupId: worker.id }))
-        return structuredClone(worker);
-      if (recoveringResources) {
-        await this.recoverResources(worker);
-        if (worker.kind === "review") {
-          await this.cleanup(worker);
-          worker.status = "completed";
-          await this.persist();
-          if (
-            worker.kind === "review" &&
-            worker.autoPost &&
-            worker.draft?.status === "draft"
-          )
-            await this.postDraft(worker);
-          return structuredClone(worker);
-        }
+      const parent = this.autoReviewParent(worker);
+      const issue = parent ?? worker;
+      if (issue.autoReview?.mergeAttempted) {
+        if (await this.reconcileMergedChange(issue, { retryCleanupId: issue.id })) return structuredClone(issue);
+        throw new Error("The previous merge must be reconciled with the provider before continuing. Forge will not repeat it.");
       }
-      this.operations.set(worker.id, new AbortController());
-      worker.status = "starting";
-      await this.persist();
-      let retainReport = false;
-      try {
-        const provider = this.providerFor(worker);
-        if (!recoveringResources) await this.recoverResources(worker);
-        if (worker.kind === "issue" && worker.attemptId && !worker.pendingPublication) {
-          const raw = await this.deps.reports.read(worker.attemptId);
-          if (raw !== undefined) {
-            const report = parseWorkerReport(raw);
-            if (report.kind !== "issue") throw new Error("Completion report does not match this worker.");
-            retainReport = true;
-            worker.pendingPublication = { report, repliedDiscussionIds: [] };
-            await this.persist();
-            retainReport = false;
-          }
-        }
-        if (worker.kind === "issue" && worker.pendingPublication) {
-          await this.quiesce(worker);
-          if (worker.pendingPublication.confirmationStartedAt)
-            worker.pendingPublication.confirmationStartedAt = new Date(Date.now()).toISOString();
-          await this.issueReady(worker);
-          return structuredClone(worker);
-        }
-        const item =
-          worker.kind === "issue"
-            ? await provider.getIssue(worker.number)
-            : await provider.getChangeRequest(worker.number);
-        if (
-          worker.kind === "issue" &&
-          !worker.changeNumber &&
-          worker.publicationState
-        )
-          await this.reconcilePublication(worker, provider);
-        const change = worker.changeNumber
-          ? await provider.getChangeRequest(worker.changeNumber)
-          : undefined;
-        if (change) {
-          if (change.merged) {
-            await this.reconcileMergedChange(worker, { change, retryCleanupId: worker.id });
-            return structuredClone(worker);
-          }
-          if (change.state !== "open")
-            throw new Error(
-              "The change request is closed without merging. Reopen it before resuming.",
-            );
-        }
-        await this.quiesce(worker);
-        if (worker.kind === "review" && change) {
-          await this.cleanup(worker);
-          worker.headSha = change.headSha;
-          worker.baseBranch = change.baseBranch;
-        }
-        if (!worker.worktreePath)
-          Object.assign(
-            worker,
-            await this.deps.runtime.prepareWorkspace(
-              {
-                id: worker.id,
-                baseBranch: worker.baseBranch,
-                headSha: worker.headSha,
-                review: worker.kind === "review",
-                expectedRepository: worker.repository,
-              },
-              this.operations.get(worker.id)?.signal,
-            ),
-          );
-        await this.launch(worker, placement, { item, change });
-      } catch (error) {
-        await this.fail(worker, error, { retainReport });
-      }
-      return structuredClone(worker);
+      if (issue.autoReview) issue.autoReview.placement = placement;
+      if (issue.autoReview?.enabled && issue.autoReview.phase !== "implementing" && !issue.pendingPublication)
+        return this.resumeAutoReview(issue, placement);
+      return this.resumeWorker(issue.id, placement);
     });
+  }
+  private async resumeWorker(id: string, placement: ForgePlacement): Promise<ForgeWorker> {
+    const worker = this.requireWorker(id);
+    if (
+      ![
+        "paused",
+        "stopped",
+        "awaiting_review",
+        "awaiting_merge",
+        "failed",
+        "cleanup_failed",
+      ].includes(worker.status)
+    )
+      throw new Error("This worker is not waiting to resume.");
+    const recoveringResources = worker.status === "cleanup_failed";
+    if (worker.kind === "review") this.requireConfirmedPublication(worker.repository, worker.number);
+    const controller = this.operations.get(worker.id) ?? this.operations.get(this.autoReviewParent(worker)?.id ?? "") ?? new AbortController();
+    this.operations.set(worker.id, controller);
+    controller.signal.throwIfAborted();
+    if (await this.reconcileMergedChange(worker, { retryCleanupId: worker.id }))
+      return structuredClone(worker);
+    controller.signal.throwIfAborted();
+    if (recoveringResources) {
+      await this.recoverResources(worker);
+      if (worker.kind === "review") {
+        await this.cleanup(worker);
+        worker.status = "completed";
+        await this.persist();
+        if (
+          worker.kind === "review" &&
+          worker.autoPost &&
+          !this.autoReviewParent(worker) &&
+          worker.draft?.status === "draft"
+        )
+          await this.postDraft(worker);
+        return structuredClone(worker);
+      }
+    }
+    worker.status = "starting";
+    await this.persist();
+    let retainReport = false;
+    try {
+      const provider = this.providerFor(worker);
+      if (!recoveringResources) await this.recoverResources(worker);
+      if (worker.kind === "issue" && worker.attemptId && !worker.pendingPublication) {
+        const raw = await this.deps.reports.read(worker.attemptId);
+        if (raw !== undefined) {
+          const report = parseWorkerReport(raw);
+          if (report.kind !== "issue") throw new Error("Completion report does not match this worker.");
+          retainReport = true;
+          worker.pendingPublication = { report, repliedDiscussionIds: [] };
+          await this.persist();
+          retainReport = false;
+        }
+      }
+      if (worker.kind === "issue" && worker.pendingPublication) {
+        await this.quiesce(worker);
+        if (worker.pendingPublication.confirmationStartedAt)
+          worker.pendingPublication.confirmationStartedAt = new Date(Date.now()).toISOString();
+        await this.issueReady(worker);
+        return structuredClone(worker);
+      }
+      const item =
+        worker.kind === "issue"
+          ? await provider.getIssue(worker.number)
+          : await provider.getChangeRequest(worker.number);
+      if (
+        worker.kind === "issue" &&
+        !worker.changeNumber &&
+        worker.publicationState
+      )
+        await this.reconcilePublication(worker, provider);
+      const change = worker.changeNumber
+        ? await provider.getChangeRequest(worker.changeNumber)
+        : undefined;
+      if (change) {
+        if (change.merged) {
+          await this.reconcileMergedChange(worker, { change, retryCleanupId: worker.id });
+          return structuredClone(worker);
+        }
+        if (change.state !== "open")
+          throw new Error(
+            "The change request is closed without merging. Reopen it before resuming.",
+          );
+      }
+      await this.quiesce(worker);
+      if (worker.kind === "review" && change) {
+        await this.cleanup(worker);
+        worker.headSha = change.headSha;
+        worker.baseBranch = change.baseBranch;
+      }
+      if (!worker.worktreePath)
+        Object.assign(
+          worker,
+          await this.deps.runtime.prepareWorkspace(
+            {
+              id: worker.id,
+              baseBranch: worker.baseBranch,
+              headSha: worker.headSha,
+              review: worker.kind === "review",
+              expectedRepository: worker.repository,
+            },
+            this.operations.get(worker.id)?.signal,
+          ),
+        );
+      const parent = worker.issueWorkerId ? this.requireWorker(worker.issueWorkerId) : undefined;
+      const issue = parent ? await this.providerFor(parent).getIssue(parent.number) : undefined;
+      await this.launch(worker, placement, { item, change, issue });
+    } catch (error) {
+      await this.fail(worker, error, { retainReport });
+    }
+    return structuredClone(worker);
   }
   saveReview(
     id: string,
@@ -510,7 +582,8 @@ export class ForgeWorkflowService {
             await this.cleanup(worker);
             worker.status = "completed";
             await this.persist();
-            if (worker.autoPost) await this.postDraft(worker);
+            if (worker.autoPost && !this.autoReviewParent(worker)) await this.postDraft(worker);
+            if (worker.issueWorkerId) this.nextAutoReviewCheckAt.delete(worker.issueWorkerId);
             this.deps.notify(
               "Review complete",
               `${worker.title}: ${worker.draft.comments.length} suggested comments.`,
@@ -520,7 +593,203 @@ export class ForgeWorkflowService {
           await this.fail(worker, error, { retainReport });
         }
       }
+      await this.advanceAutoReviews();
     });
+  }
+  private autoReviewParent(worker: ForgeWorker): ForgeWorker | undefined {
+    return this.workers.find(parent => parent.id === worker.issueWorkerId &&
+      parent.autoReview?.enabled && parent.autoReview.reviewWorkerId === worker.id);
+  }
+  private autoReviewer(worker: ForgeWorker): ForgeWorker | undefined {
+    if (!worker.autoReview?.reviewWorkerId) return;
+    const review = this.requireWorker(worker.autoReview.reviewWorkerId);
+    if (review.kind !== "review" || review.issueWorkerId !== worker.id ||
+      !sameRepository(review.repository, worker.repository) || review.number !== worker.changeNumber || review.changeNumber !== worker.changeNumber)
+      throw new Error("The linked reviewer does not belong to this issue loop.");
+    return review;
+  }
+  private async resumeAutoReview(worker: ForgeWorker, placement: ForgePlacement): Promise<ForgeWorker> {
+    if (!["paused", "stopped", "failed", "cleanup_failed", "awaiting_review", "awaiting_merge"].includes(worker.status))
+      throw new Error("This issue loop is not waiting to resume.");
+    if (await this.reconcileMergedChange(worker, { retryCleanupId: worker.id })) return structuredClone(worker);
+    const loop = worker.autoReview!;
+    if (loop.mergeAttempted)
+      throw new Error("The previous merge must be reconciled with the provider before continuing. Forge will not repeat it.");
+    const review = this.autoReviewer(worker);
+    if (review?.draft && ["posting", "post_failed"].includes(review.draft.status))
+      throw new Error("The previous review submission must be reconciled with the provider before continuing. Forge will not repost it.");
+    this.operations.set(worker.id, new AbortController());
+    try {
+      await this.recoverResources(worker);
+      await this.quiesce(worker);
+      await this.deps.runtime.verifyPublishedWorkspace(issueWorkspace(worker), worker.headSha!);
+      loop.placement = placement;
+      loop.waitingSince = undefined;
+      worker.status = loop.phase === "merging" ? "awaiting_merge" : "awaiting_review";
+      worker.error = undefined;
+      await this.persist();
+      if (review && review.status !== "completed" && !["starting", "running"].includes(review.status))
+        await this.resumeWorker(review.id, placement);
+      this.nextAutoReviewCheckAt.delete(worker.id);
+      await this.advanceAutoReviews();
+    } catch (error) {
+      await this.fail(worker, error);
+    }
+    return structuredClone(worker);
+  }
+  private async advanceAutoReviews(): Promise<void> {
+    for (const worker of this.workers.filter(candidate => candidate.autoReview?.enabled &&
+      ["awaiting_review", "awaiting_merge"].includes(candidate.status))) {
+      if (this.disposed) return;
+      if (!this.workers.includes(worker) || Date.now() < (this.nextAutoReviewCheckAt.get(worker.id) ?? 0)) continue;
+      this.nextAutoReviewCheckAt.set(worker.id, Date.now() + 5_000);
+      if (!this.operations.has(worker.id)) this.operations.set(worker.id, new AbortController());
+      try {
+        await this.advanceAutoReview(worker);
+      } catch (error) {
+        if (!this.disposed) await this.fail(worker, error);
+      }
+    }
+  }
+  private async autoReviewContext(worker: ForgeWorker): Promise<{ issue: ForgeIssueDetail; change: ForgeChangeRequest } | undefined> {
+    if (!worker.changeNumber || !worker.headSha) throw new Error("Auto review requires confirmed published work.");
+    this.requireConfirmedPublication(worker.repository, worker.changeNumber);
+    const provider = this.providerFor(worker);
+    const signal = this.operations.get(worker.id)?.signal;
+    const change = await provider.getChangeRequest(worker.changeNumber);
+    signal?.throwIfAborted();
+    if (await this.reconcileMergedChange(worker, { change, signal })) return;
+    requirePublicationRequest(worker, change);
+    if (change.headSha !== worker.headSha)
+      throw new Error("The request head changed outside this issue loop. Inspect the published work before resuming.");
+    const issue = await provider.getIssue(worker.number);
+    signal?.throwIfAborted();
+    if (issue.number !== worker.number || issue.state !== "open")
+      throw new Error("Auto review requires the original issue to remain open.");
+    return { issue, change };
+  }
+  private async waitForAutoReview(worker: ForgeWorker, reason: string, startedAt?: string): Promise<void> {
+    const loop = worker.autoReview!;
+    loop.waitingSince ??= startedAt ?? new Date(Date.now()).toISOString();
+    if (Date.now() - Date.parse(loop.waitingSince) >= 120_000)
+      throw new Error(`${reason} Inspect the provider and resume when it is ready.`);
+    worker.error = reason;
+    await this.persist();
+  }
+  private async startAutoReview(worker: ForgeWorker): Promise<void> {
+    const loop = worker.autoReview!;
+    loop.phase = "reviewing";
+    loop.waitingSince = undefined;
+    worker.status = "awaiting_review";
+    worker.error = undefined;
+    await this.persist();
+    await this.createWorker("review", worker.changeNumber!, true, loop.placement, false, worker);
+  }
+  private async pauseAutoReview(worker: ForgeWorker, reason: string): Promise<void> {
+    worker.status = "paused";
+    worker.error = reason;
+    await this.persist();
+    this.deps.notify("Auto review needs attention", `${worker.title}: ${reason}`);
+  }
+  private async advanceAutoReview(worker: ForgeWorker): Promise<void> {
+    const loop = worker.autoReview!;
+    const review = this.autoReviewer(worker);
+    if (review && ["starting", "running"].includes(review.status)) return;
+    if (review && review.status !== "completed")
+      throw new Error(`The review worker needs attention. ${review.error ?? "Inspect and resume the issue loop explicitly."}`);
+    if (loop.mergeAttempted)
+      throw new Error("The previous merge must be reconciled with the provider. Forge will not repeat it.");
+    let context = await this.autoReviewContext(worker);
+    if (!context) return;
+    if (!context.change.reviewReady) {
+      await this.waitForAutoReview(worker, "Waiting for the provider to finish preparing this commit for review.");
+      return;
+    }
+    if (!review) {
+      await this.startAutoReview(worker);
+      return;
+    }
+    const draft = review.draft;
+    if (!draft || ["posting", "post_failed"].includes(draft.status))
+      throw new Error("The review submission needs attention. Reconcile it with the provider before continuing; Forge will not repost it.");
+    if (draft.headSha !== worker.headSha)
+      throw new Error("The review does not match the issue worker's published commit.");
+    if (draft.status === "draft") {
+      if (review.feedbackDigest !== feedbackDigest({ item: context.issue, change: context.change })) {
+        await this.startAutoReview(worker);
+        return;
+      }
+      if (draft.event === "approve" && draft.comments.length) {
+        await this.pauseAutoReview(worker, "The reviewer approved with findings. Inspect the draft: request changes for actionable findings, or remove them before approval.");
+        return;
+      }
+      await this.postDraft(review);
+      context = await this.autoReviewContext(worker);
+      if (!context) return;
+    }
+    if (!draft.publication || !draft.postedAt)
+      throw new Error("The posted review has no publication receipt. Inspect it before continuing auto review.");
+    if (!reviewFeedbackVisible(draft, context.change)) {
+      await this.waitForAutoReview(worker, "Waiting for the posted review feedback to appear in the request.", draft.postedAt);
+      return;
+    }
+    loop.waitingSince = undefined;
+    worker.error = undefined;
+    if (draft.event === "comment") {
+      if (review.feedbackDigest !== feedbackDigest({ item: context.issue, change: withoutReviewFeedback(context.change, draft) })) {
+        await this.startAutoReview(worker);
+        return;
+      }
+      await this.pauseAutoReview(worker, "The reviewer needs human clarification. Respond to the review before resuming the issue loop.");
+      return;
+    }
+    if (draft.event === "request_changes") {
+      loop.phase = "implementing";
+      await this.persist();
+      await this.resumeWorker(worker.id, loop.placement);
+      return;
+    }
+    if (review.feedbackDigest !== feedbackDigest({ item: context.issue, change: withoutReviewFeedback(context.change, draft) })) {
+      await this.startAutoReview(worker);
+      return;
+    }
+    if (context.change.unresolvedDiscussions) {
+      await this.pauseAutoReview(worker, "The review approved, but review discussions remain unresolved. Inspect the feedback before continuing.");
+      return;
+    }
+    loop.phase = "merging";
+    worker.status = "awaiting_merge";
+    await this.persist();
+    if (!context.change.reviewReady || !context.change.approved || !context.change.mergeable || context.change.draft) return;
+    const signal = this.operations.get(worker.id)?.signal;
+    await this.deps.runtime.verifyPublishedWorkspace(issueWorkspace(worker), worker.headSha!);
+    signal?.throwIfAborted();
+    const latest = await this.autoReviewContext(worker);
+    if (!latest) return;
+    if (review.feedbackDigest !== feedbackDigest({ item: latest.issue, change: withoutReviewFeedback(latest.change, draft) })) {
+      await this.startAutoReview(worker);
+      return;
+    }
+    if (!latest.change.reviewReady || !latest.change.approved || !latest.change.mergeable || latest.change.draft || latest.change.unresolvedDiscussions) return;
+    loop.mergeAttempted = true;
+    await this.persist();
+    try {
+      if (signal?.aborted) throw new ForgeMergeNotStartedError(signal.reason);
+      await this.providerFor(worker).merge(worker.changeNumber!, worker.headSha!);
+    } catch (error) {
+      if (error instanceof ForgeMergeNotStartedError) {
+        loop.mergeAttempted = undefined;
+        await this.persist();
+        if (error.change) {
+          requirePublicationRequest(worker, error.change);
+          if (error.change.headSha === worker.headSha) return;
+        }
+      }
+      throw error;
+    }
+    if (!(await this.reconcileMergedChange(worker, { signal })))
+      await this.waitForIssueClosure(worker, "Merge succeeded. Waiting for the provider to confirm completion.");
+    this.deps.notify("Issue merged", `${worker.title} has merged. Local workers are cleaned up once linked issues are closed.`);
   }
   private async issueReady(worker: ForgeWorker): Promise<void> {
     const workspace = issueWorkspace(worker);
@@ -617,7 +886,7 @@ export class ForgeWorkflowService {
       worker.feedbackDigest === feedbackDigest({ item: currentIssue, change });
     await this.respondToReview(worker, change, provider);
     if (
-      feedbackUnchanged &&
+      !worker.autoReview?.enabled && feedbackUnchanged &&
       change.approved &&
       !change.draft &&
       change.state === "open"
@@ -651,10 +920,17 @@ export class ForgeWorkflowService {
     worker.status = "awaiting_review";
     worker.pendingPublication = undefined;
     worker.error = undefined;
+    if (worker.autoReview) {
+      worker.autoReview.phase = "reviewing";
+      worker.autoReview.reviewWorkerId = undefined;
+      worker.autoReview.waitingSince = undefined;
+      worker.autoReview.mergeAttempted = undefined;
+      this.nextAutoReviewCheckAt.delete(worker.id);
+    }
     await this.persist();
     this.deps.notify(
       "Ready for review",
-      `${worker.title}: ${worker.changeUrl}. Resume after review to address feedback or merge the approved commit.`,
+      worker.autoReview?.enabled ? `${worker.title}: starting automatic review.` : `${worker.title}: ${worker.changeUrl}. Resume after review to address feedback or merge the approved commit.`,
     );
   }
   private async publicationSnapshot<T>(worker: ForgeWorker, read: () => Promise<T>): Promise<T | undefined> {
@@ -736,12 +1012,16 @@ export class ForgeWorkflowService {
   private async launch(
     worker: ForgeWorker,
     placement: ForgePlacement,
-    context: { item: unknown; change?: ForgeChangeRequest },
+    context: { item: unknown; change?: ForgeChangeRequest; issue?: ForgeIssueDetail },
   ): Promise<void> {
     if (!worker.worktreePath) throw new Error("Worker checkout is missing.");
+    const signal = this.operations.get(worker.id)?.signal;
+    signal?.throwIfAborted();
     const settings = this.deps.settings();
     if (worker.kind === "issue")
       worker.feedbackDigest = feedbackDigest(context);
+    else if (context.issue)
+      worker.feedbackDigest = feedbackDigest({ item: context.issue, change: context.item as ForgeChangeRequest });
     worker.attemptId = randomUUID();
     worker.status = "starting";
     worker.error = undefined;
@@ -750,10 +1030,13 @@ export class ForgeWorkflowService {
       worker.attemptId,
       context,
     );
-    const instructions =
+    signal?.throwIfAborted();
+    let instructions =
       worker.kind === "issue"
         ? "Resolve the issue in this checkout. Read all issue and change-request feedback below, implement the changes, and run the relevant tests. Commit your changes to the current branch. Do not push, open or merge a PR/MR, or post replies or resolve threads directly: CloudX performs those steps. Include a discussionReplies entry shaped as { discussionId, body } with the exact review discussion ID and a reply explaining the change and validation for each review thread you addressed. Use replies to ask for clarification on unresolved feedback too. Include resolvedDiscussionIds only for review discussion IDs whose feedback you actually addressed; leave unresolved questions open. CloudX posts your replies as the issue worker and then resolves the listed threads after verifying the published commit. When ready for human review, write the completion report."
-        : "Review the exact checked-out commit against the target base branch and the supplied diff. Do not alter the checkout or publish anything. Produce actionable comments, with file path and new line for inline findings. Write the completion report when finished.";
+        : "Review the exact checked-out commit against the target base branch and the supplied diff. Do not alter the checkout or publish anything. The comments array contains actionable findings only, with file path and new line for inline findings. Set event to approve when the implementation satisfies the issue and review feedback and no issues remain; an issue-free review must explicitly approve. Set event to request_changes when actionable findings remain. Use comment only when human clarification or a decision is required. Write the completion report when finished.";
+    if (worker.issueWorkerId)
+      instructions += " This review belongs to an automatic issue loop. Set event to request_changes when actionable findings remain, with specific changes and validation needed. Set event to approve only when the implementation satisfies the issue and review feedback and no actionable findings remain. Use comment only when a human clarification or decision is required; it pauses the loop. CloudX publishes the review and chooses the next step. Do not approve merely to finish the loop.";
     const shape =
       worker.kind === "issue"
         ? {
@@ -766,9 +1049,9 @@ export class ForgeWorkflowService {
         : {
             kind: "review",
             headSha: worker.headSha,
-            event: "comment",
+            event: worker.issueWorkerId ? "approve" : "comment",
             body: "Review summary",
-            comments: [
+            comments: worker.issueWorkerId ? [] : [
               {
                 body: "Finding",
                 path: "relative/file.ts",
@@ -794,8 +1077,9 @@ export class ForgeWorkflowService {
         prompt,
         ...placement,
       },
-      this.operations.get(worker.id)?.signal,
+      signal,
     );
+    signal?.throwIfAborted();
     worker.status = "running";
     worker.updatedAt = new Date().toISOString();
     await this.persist();
@@ -844,7 +1128,8 @@ export class ForgeWorkflowService {
       if (candidate.status === "cleanup_failed" && candidate.id !== retryCleanupId) continue;
       if (issuesClosed) await this.retireMergedWorker(candidate, change);
       else if (candidate.status !== "cleanup_failed" &&
-          (["starting", "running", "awaiting_publication"].includes(candidate.status) || candidate.id === retryCleanupId))
+          (["starting", "running", "awaiting_publication", "awaiting_merge"].includes(candidate.status) ||
+            candidate.autoReview?.enabled && candidate.status === "awaiting_review" || candidate.id === retryCleanupId))
         await this.waitForIssueClosure(candidate, "Change request merged. Waiting for linked issues to close before cleanup.");
     }
     return true;
@@ -944,17 +1229,31 @@ export class ForgeWorkflowService {
       throw new Error(
         "The request head changed. Run a new review before posting.",
       );
+    const parent = this.autoReviewParent(worker);
+    const signal = this.operations.get(parent?.id ?? worker.id)?.signal;
+    if (parent) {
+      const issue = await this.providerFor(parent).getIssue(parent.number);
+      if (!change.reviewReady || worker.feedbackDigest !== feedbackDigest({ item: issue, change }))
+        throw new Error("The review input changed or is still processing. Run a fresh review before posting.");
+    }
+    signal?.throwIfAborted();
     draft.status = "posting";
     await this.persist();
-    try {
-      await provider.postReview(worker.changeNumber, reviewSubmission(draft));
-      draft.status = "posted";
+    if (signal?.aborted) {
+      draft.status = "draft";
       await this.persist();
+      signal.throwIfAborted();
+    }
+    try {
+      draft.publication = await provider.postReview(worker.changeNumber, reviewSubmission(draft));
     } catch (error) {
       draft.status = "post_failed";
       await this.persist();
       throw error;
     }
+    draft.postedAt = new Date(Date.now()).toISOString();
+    draft.status = "posted";
+    await this.persist();
   }
   private async fail(worker: ForgeWorker, error: unknown, { retainReport = false }: { retainReport?: boolean } = {}): Promise<void> {
     const wasCleanupFailure = worker.status === "cleanup_failed";
@@ -970,6 +1269,18 @@ export class ForgeWorkflowService {
     if (!wasCleanupFailure && worker.status !== "cleanup_failed")
       worker.status = "failed";
     worker.error = message(error);
+    for (const member of this.controlGroup(worker.id)) {
+      if (member === worker || ["completed", "cleanup_failed"].includes(member.status)) continue;
+      this.operations.get(member.id)?.abort(error);
+      try {
+        await this.quiesce(member, { retainReport: member.kind === "issue" && !member.pendingPublication });
+        member.status = "paused";
+        member.error = `Auto review needs attention: ${worker.error}`;
+      } catch (cleanupError) {
+        member.status = "cleanup_failed";
+        member.error = message(cleanupError);
+      }
+    }
     await this.persist();
     this.deps.notify(
       "Forge worker needs attention",
@@ -983,7 +1294,7 @@ export class ForgeWorkflowService {
     return this.deps.provider(
       worker.repository,
       role,
-      this.operations.get(worker.id)?.signal,
+      (this.operations.get(worker.id) ?? this.operations.get(this.autoReviewParent(worker)?.id ?? ""))?.signal,
     );
   }
   private requireWorker(id: string): ForgeWorker {
@@ -1004,6 +1315,10 @@ export class ForgeWorkflowService {
     for (const id of this.nextPublicationCheckAt.keys())
       if (!this.workers.some(worker => worker.id === id && worker.status === "awaiting_publication"))
         this.nextPublicationCheckAt.delete(id);
+    for (const id of this.nextAutoReviewCheckAt.keys())
+      if (!this.workers.some(worker => worker.id === id && worker.autoReview?.enabled &&
+        ["awaiting_review", "awaiting_merge"].includes(worker.status)))
+        this.nextAutoReviewCheckAt.delete(id);
     for (const worker of this.workers)
       if (
         ["completed", "stopped", "paused", "failed", "cleanup_failed"].includes(
@@ -1019,7 +1334,7 @@ export class ForgeWorkflowService {
         for (const worker of this.workers) {
           if (worker.draft?.status === "posting")
             worker.draft.status = "post_failed";
-          if (worker.status === "awaiting_publication") {
+          if (worker.status === "awaiting_publication" && !worker.autoReview?.enabled) {
             try {
               await this.recoverResources(worker);
               await this.quiesce(worker);
@@ -1029,7 +1344,8 @@ export class ForgeWorkflowService {
               worker.error = "Publication resources could not be recovered. Inspect ownership before continuing.";
             }
           }
-          if (["running", "starting"].includes(worker.status)) {
+          if (["running", "starting"].includes(worker.status) || worker.autoReview?.enabled &&
+            ["awaiting_publication", "awaiting_review", "awaiting_merge"].includes(worker.status)) {
             worker.status = "paused";
             worker.error =
               "CloudX restarted. Inspect and resume this worker explicitly.";
@@ -1086,6 +1402,20 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : "Forge operation failed.";
 }
 
+function reviewFeedbackVisible(draft: ForgeReviewDraft, change: ForgeChangeRequest): boolean {
+  const receipt = draft.publication!;
+  return receipt.commentIds.every(id => change.comments.some(comment => comment.id === id)) &&
+    (!receipt.inlineReview || change.comments.filter(comment =>
+      comment.reviewId === receipt.inlineReview!.id && !comment.replyToCommentId).length >= receipt.inlineReview.commentCount);
+}
+
+function withoutReviewFeedback(change: ForgeChangeRequest, draft: ForgeReviewDraft): ForgeChangeRequest {
+  const receipt = draft.publication!;
+  return { ...change, comments: change.comments.filter(comment =>
+    !receipt.commentIds.includes(comment.id) &&
+    !(receipt.inlineReview && comment.reviewId === receipt.inlineReview.id && !comment.replyToCommentId)) };
+}
+
 function feedbackDigest(context: {
   item: unknown;
   change?: ForgeChangeRequest;
@@ -1099,10 +1429,12 @@ function feedbackDigest(context: {
       path?: string;
       line?: number;
       discussionId?: string;
+      system?: boolean;
     }>;
   };
   const comments = (items: typeof item.comments) =>
     items
+      .filter(comment => !comment.system)
       .map(({ id, body, author, path, line, discussionId }) => ({
         id,
         body,

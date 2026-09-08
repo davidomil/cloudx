@@ -26,6 +26,10 @@ const worker: ForgeWorker = {
   updatedAt: "2026-09-08T00:00:00.000Z"
 };
 const headSha = "a".repeat(40);
+const reviewWorkerId = "22222222-2222-4222-8222-222222222222";
+const autoReview: NonNullable<ForgeWorker["autoReview"]> = {
+  enabled: true, phase: "implementing", placement: { windowId: "window-1", paneId: "pane-1" }
+};
 
 describe("Issue completion reports", () => {
   it("keeps discussion replies separate from requested resolutions", () => {
@@ -145,5 +149,168 @@ describe("Saved issue publication checkpoints", () => {
     { pendingPublication: { ...waiting.pendingPublication, confirmed: true } },
   ])("rejects an incomplete or already mutating automatic confirmation state %#", invalid => {
     expect(() => parseWorkers([{ ...waiting, ...invalid }])).toThrow();
+  });
+});
+
+describe("Saved automatic review loops", () => {
+  it.each(["implementing", "reviewing", "merging"] as const)("round-trips a %s loop with its saved placement and observation time", phase => {
+    const saved = { ...worker, autoReview: { ...autoReview, phase, reviewWorkerId, waitingSince: worker.startedAt } };
+    const [parsed] = parseWorkers([saved]);
+    expect(parsed).toEqual(saved);
+    expect(parsed.autoReview).not.toBe(saved.autoReview);
+    expect(parsed.autoReview!.placement).not.toBe(saved.autoReview.placement);
+    expect(parseWorkers([parsed])[0].autoReview!.waitingSince).toBe(worker.startedAt);
+  });
+
+  it.each(["paused", "failed", "cleanup_failed", "stopped"] as const)("keeps a %s loop's disabled preference, review link, and merge latch", status => {
+    const saved = { ...worker, status, autoReview: { ...autoReview, enabled: false, phase: "merging", reviewWorkerId, mergeAttempted: true } };
+    expect(parseWorkers([saved])).toEqual([saved]);
+  });
+
+  it("accepts a persisted child review after its parent has been removed during cleanup", () => {
+    const child = { ...worker, id: reviewWorkerId, kind: "review", issueWorkerId: worker.id };
+    expect(parseWorkers([child])).toEqual([child]);
+    expect(parseWorkers([{ ...worker, autoReview: { ...autoReview, reviewWorkerId } }])[0].autoReview!.reviewWorkerId).toBe(reviewWorkerId);
+  });
+
+  it("accepts the maximum saved placement id lengths", () => {
+    const saved = { ...worker, autoReview: { ...autoReview, placement: { windowId: "w".repeat(128), paneId: "p".repeat(128) } } };
+    expect(parseWorkers([saved])).toEqual([saved]);
+  });
+
+  it.each([
+    ["null loop", null],
+    ["array loop", []],
+    ["missing opt-in", { ...autoReview, enabled: undefined }],
+    ["string opt-in", { ...autoReview, enabled: "true" }],
+    ["missing phase", { ...autoReview, phase: undefined }],
+    ["unknown phase", { ...autoReview, phase: "waiting" }],
+    ["array phase", { ...autoReview, phase: ["reviewing"] }],
+    ["missing placement", { ...autoReview, placement: undefined }],
+    ["null placement", { ...autoReview, placement: null }],
+    ["missing window", { ...autoReview, placement: { paneId: "pane-1" } }],
+    ["blank window", { ...autoReview, placement: { windowId: " \n", paneId: "pane-1" } }],
+    ["oversized window", { ...autoReview, placement: { windowId: "w".repeat(129), paneId: "pane-1" } }],
+    ["missing pane", { ...autoReview, placement: { windowId: "window-1" } }],
+    ["numeric pane", { ...autoReview, placement: { windowId: "window-1", paneId: 7 } }],
+    ["blank pane", { ...autoReview, placement: { windowId: "window-1", paneId: "\t" } }],
+    ["oversized pane", { ...autoReview, placement: { windowId: "window-1", paneId: "p".repeat(129) } }],
+    ["numeric review link", { ...autoReview, reviewWorkerId: 7 }],
+    ["malformed review UUID", { ...autoReview, reviewWorkerId: "1".repeat(36) }],
+    ["self review link", { ...autoReview, reviewWorkerId: worker.id }],
+    ["relative waiting date", { ...autoReview, waitingSince: "yesterday" }],
+    ["noncanonical waiting date", { ...autoReview, waitingSince: "2026-09-08T00:00:00Z" }],
+    ["normalized invalid waiting date", { ...autoReview, waitingSince: "2026-02-30T00:00:00.000Z" }],
+    ["numeric waiting date", { ...autoReview, waitingSince: 7 }],
+    ["false merge latch", { ...autoReview, phase: "merging", mergeAttempted: false }],
+    ["string merge latch", { ...autoReview, phase: "merging", mergeAttempted: "true" }],
+    ["merge latch during implementation", { ...autoReview, mergeAttempted: true }],
+    ["merge latch during review", { ...autoReview, phase: "reviewing", mergeAttempted: true }]
+  ])("rejects %s", (_name, invalid) => {
+    expect(() => parseWorkers([{ ...worker, autoReview: invalid }])).toThrow();
+  });
+
+  it("rejects an automatic issue loop attached to a review worker", () => {
+    expect(() => parseWorkers([{ ...worker, kind: "review", autoReview }])).toThrow(/issue/i);
+  });
+
+  it.each([
+    { kind: "issue", issueWorkerId: reviewWorkerId },
+    { kind: "review", issueWorkerId: worker.id },
+    { kind: "review", issueWorkerId: "1".repeat(36) },
+    { kind: "review", issueWorkerId: null },
+    { kind: "review", issueWorkerId: 7 }
+  ])("rejects an invalid parent issue link %#", invalid => {
+    expect(() => parseWorkers([{ ...worker, ...invalid }])).toThrow();
+  });
+
+  const merging: ForgeWorker = {
+    ...worker, status: "awaiting_merge", changeNumber: 12, headSha,
+    repositoryPath: "/owned", worktreePath: "/owned", branch: "cloudx/forge/worker",
+    autoReview: { ...autoReview, phase: "merging", reviewWorkerId, waitingSince: worker.startedAt }
+  };
+  it.each([{}, { mergeAttempted: true as const }])("round-trips a merge checkpoint before or after its single mutation attempt %#", checkpoint => {
+    const saved = { ...merging, autoReview: { ...merging.autoReview!, ...checkpoint } };
+    expect(parseWorkers([saved])).toEqual([saved]);
+  });
+
+  it.each([
+    { kind: "review" }, { autoReview: undefined },
+    { autoReview: { ...merging.autoReview, enabled: false } },
+    { autoReview: { ...merging.autoReview, phase: "reviewing" } },
+    { changeNumber: undefined }, { headSha: undefined }, { headSha: "wrong" },
+    { repositoryPath: undefined }, { repositoryPath: " " },
+    { worktreePath: undefined }, { worktreePath: "" },
+    { branch: undefined }, { branch: "\n" }
+  ])("rejects an incomplete automatic merge state %#", invalid => {
+    expect(() => parseWorkers([{ ...merging, ...invalid }])).toThrow();
+  });
+});
+
+describe("Saved review publication receipts", () => {
+  const draft = { headSha, body: "Review finished.", event: "comment", comments: [], status: "posted" };
+  const reviewer = { ...worker, id: reviewWorkerId, kind: "review", draft };
+  const publication = { commentIds: ["review-42"], inlineReview: { id: "42", commentCount: 1 } };
+
+  it("keeps existing posted manual reviews without a receipt or timestamp", () => {
+    expect(parseWorkers([reviewer])).toEqual([reviewer]);
+  });
+
+  it.each([
+    { commentIds: [] },
+    { commentIds: ["note-1"] },
+    publication,
+    { commentIds: Array.from({ length: 101 }, (_, index) => String(index)), inlineReview: { id: "r".repeat(256), commentCount: 100 } },
+    { commentIds: ["n".repeat(256)] }
+  ])("preserves published identities and their immutable timestamp %#", publication => {
+    const saved = { ...reviewer, draft: { ...draft, publication, postedAt: worker.startedAt } };
+    const [parsed] = parseWorkers([saved]);
+    expect(parsed).toEqual(saved);
+    expect(parsed.draft!.publication).not.toBe(publication);
+    expect(parseWorkers([{ ...parsed, updatedAt: "2026-09-09T00:00:00.000Z" }])[0].draft!.postedAt).toBe(worker.startedAt);
+  });
+
+  it.each(["draft", "posting", "post_failed"])("rejects a publication receipt on a %s review", status => {
+    expect(() => parseWorkers([{ ...reviewer, draft: { ...draft, status, publication, postedAt: worker.startedAt } }])).toThrow(/posted/i);
+  });
+
+  it("rejects a non-string saved review status", () => {
+    expect(() => parseWorkers([{ ...reviewer, draft: { ...draft, status: ["posted"] } }])).toThrow(/review state/i);
+  });
+
+  it.each([
+    ["null receipt", null],
+    ["missing comment list", {}],
+    ["non-array comment list", { commentIds: "note-1" }],
+    ["too many comments", { commentIds: Array.from({ length: 102 }, (_, index) => String(index)) }],
+    ["duplicate comment IDs", { commentIds: ["note-1", "note-1"] }],
+    ["numeric comment ID", { commentIds: [7] }],
+    ["blank comment ID", { commentIds: [" \n"] }],
+    ["oversized comment ID", { commentIds: ["x".repeat(257)] }],
+    ["null inline review", { commentIds: [], inlineReview: null }],
+    ["missing inline ID", { commentIds: [], inlineReview: { commentCount: 1 } }],
+    ["blank inline ID", { commentIds: [], inlineReview: { id: " ", commentCount: 1 } }],
+    ["oversized inline ID", { commentIds: [], inlineReview: { id: "x".repeat(257), commentCount: 1 } }],
+    ["numeric inline ID", { commentIds: [], inlineReview: { id: 7, commentCount: 1 } }],
+    ["missing inline count", { commentIds: [], inlineReview: { id: "42" } }],
+    ["zero inline count", { commentIds: [], inlineReview: { id: "42", commentCount: 0 } }],
+    ["negative inline count", { commentIds: [], inlineReview: { id: "42", commentCount: -1 } }],
+    ["fractional inline count", { commentIds: [], inlineReview: { id: "42", commentCount: 1.5 } }],
+    ["string inline count", { commentIds: [], inlineReview: { id: "42", commentCount: "1" } }],
+    ["oversized inline count", { commentIds: [], inlineReview: { id: "42", commentCount: 101 } }]
+  ])("rejects %s", (_name, publication) => {
+    expect(() => parseWorkers([{ ...reviewer, draft: { ...draft, publication, postedAt: worker.startedAt } }])).toThrow();
+  });
+
+  it.each([
+    { publication },
+    { postedAt: worker.startedAt },
+    { publication, postedAt: "2026-09-08" },
+    { publication, postedAt: "2026-09-08T00:00:00Z" },
+    { publication, postedAt: "2026-02-30T00:00:00.000Z" },
+    { publication, postedAt: 7 },
+    { publication, postedAt: null }
+  ])("rejects missing, unpaired, or invalid publication timestamps %#", invalid => {
+    expect(() => parseWorkers([{ ...reviewer, draft: { ...draft, ...invalid } }])).toThrow();
   });
 });

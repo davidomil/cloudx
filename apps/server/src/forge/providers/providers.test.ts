@@ -5,6 +5,7 @@ import {
   createForgeProvider,
   ForgeCredentials,
   ForgeHeadChangedError,
+  ForgeMergeNotStartedError,
   ForgeProviderError,
   validateRepository,
   type ForgeListIdentity,
@@ -70,6 +71,7 @@ const hubLinkedIssue = {
 const hubComment = {
   id: 1,
   node_id: "comment1",
+  pull_request_review_id: 12,
   body: "Add a regression test.",
   user: { login: "bob" },
   html_url: "https://github.com/owner/repo/pull/7#comment1",
@@ -244,6 +246,7 @@ function labFixture(
       return response([
         {
           head_commit_sha: headSha,
+          patch_id_sha: headSha,
           created_at: "2026-09-01T10:00:00Z",
           ...overrides.version,
         },
@@ -384,6 +387,29 @@ describe("forge listing and issue evidence", () => {
     expect((await provider.getIssue(7)).comments).toMatchObject([
       { author: "bob", body: "Add a regression test." },
     ]);
+  });
+
+  it.each(["issue", "request"] as const)("distinguishes GitLab %s system notes from user-written approval comments", async kind => {
+    const notes = [
+      { ...labNote, id: 1, body: "approved this merge request", resolvable: false, system: true },
+      { ...labNote, id: 2, body: "approved this merge request", resolvable: false, system: false },
+      { ...labNote, id: 3, body: "approved this merge request", resolvable: false },
+    ];
+    const { provider } = kind === "request" ? labFixture({ notes }) : harness(gitlab, url =>
+      response(url.pathname.endsWith("/notes") ? notes : labIssue));
+    const item = kind === "request" ? await provider.getChangeRequest(7) : await provider.getIssue(7);
+    expect(item.comments.map(({ id, body, system }) => ({ id, body, system }))).toEqual([
+      { id: "1", body: notes[0].body, system: true },
+      { id: "2", body: notes[1].body, system: false },
+      { id: "3", body: notes[2].body, system: undefined },
+    ]);
+  });
+
+  it.each([null, "true", 1])("rejects malformed GitLab system-note flags %s", async system => {
+    const notes = [{ ...labNote, system }];
+    const issueProvider = harness(gitlab, url => response(url.pathname.endsWith("/notes") ? notes : labIssue)).provider;
+    await expect(issueProvider.getIssue(7)).rejects.toThrow("invalid or incomplete");
+    await expect(labFixture({ notes }).provider.getChangeRequest(7)).rejects.toThrow("invalid or incomplete");
   });
 
   it.each([
@@ -883,12 +909,32 @@ describe("GitHub review and exact-commit merge", () => {
     const { provider } = hubFixture();
     expect(await provider.getChangeRequest(7)).toMatchObject({
       headSha,
+      reviewReady: true,
       approved: true,
       mergeable: true,
       unresolvedDiscussions: 0,
-      comments: [{ id: "1" }, { id: "1" }, { id: "review-1" }],
+      comments: [{ id: "1" }, { id: "1", reviewId: "12" }, { id: "review-1" }],
       diff: expect.stringContaining("+new"),
     });
+  });
+
+  it.each([undefined, null, "12", 1.5])("rejects invalid GitHub inline review identity %s", async reviewId => {
+    const base = hubFixture();
+    const { provider } = harness(github, (url, options) => url.pathname.endsWith("/pulls/7/comments")
+      ? response([{ ...hubComment, pull_request_review_id: reviewId }])
+      : base.fetcher(url, options));
+    await expect(provider.getChangeRequest(7)).rejects.toThrow("invalid or incomplete");
+  });
+
+  it.each([
+    { reviewDecision: undefined },
+    { reviewDecision: false },
+    { mergeable: undefined },
+    { mergeable: null },
+    { mergeStateStatus: undefined },
+    { mergeStateStatus: false },
+  ])("rejects incomplete GitHub review readiness %j", async graphql => {
+    await expect(hubFixture({ graphql }).provider.getChangeRequest(7)).rejects.toThrow("invalid or incomplete");
   });
 
   it.each([false, true])("associates paginated replies with their thread when resolved=%s", async (resolved) => {
@@ -910,11 +956,13 @@ describe("GitHub review and exact-commit merge", () => {
     });
     const request = await provider.getChangeRequest(7);
     expect(request.comments.slice(1, 5)).toMatchObject([
-      { id: String(reply.id), body: reply.body, discussionId: "thread1", resolved },
+      { id: String(reply.id), body: reply.body, discussionId: "thread1", resolved, reviewId: "12", replyToCommentId: String(original.id) },
       { id: String(other.id), discussionId: "thread2", resolved: !resolved },
       { id: String(original.id), discussionId: "thread1", resolved },
-      { id: String(otherReply.id), discussionId: "thread2", resolved: !resolved },
+      { id: String(otherReply.id), discussionId: "thread2", resolved: !resolved, reviewId: "12", replyToCommentId: String(other.id) },
     ]);
+    expect(request.comments[2].replyToCommentId).toBeUndefined();
+    expect(request.comments[3].replyToCommentId).toBeUndefined();
     expect(request.comments[0].discussionId).toBeUndefined();
     expect(request.comments.at(-1)!.discussionId).toBeUndefined();
     expect(request.unresolvedDiscussions).toBe(1);
@@ -983,7 +1031,7 @@ describe("GitHub review and exact-commit merge", () => {
       const { provider, calls } = harness(github, (_url, options) =>
         response(options.method === "POST" ? { id: 12 } : hubRequest),
       );
-      await provider.postReview(7, {
+      const publication = await provider.postReview(7, {
         ...review,
         event,
         comments: [
@@ -991,6 +1039,8 @@ describe("GitHub review and exact-commit merge", () => {
           { body: "General note." },
         ],
       });
+      expect(publication).toEqual({ commentIds: ["review-12"], inlineReview: { id: "12", commentCount: 1 } });
+      expect(calls).toHaveLength(2);
       const submitted = calls.at(-1)!;
       expect(new Headers(submitted.options.headers).get("authorization")).toBe(
         "Bearer reviewer-private-token",
@@ -1010,6 +1060,23 @@ describe("GitHub review and exact-commit merge", () => {
     },
   );
 
+  it("returns the published GitHub review summary without requiring inline comments", async () => {
+    const { provider, calls } = harness(github, (_url, options) => response(options.method === "POST" ? { id: 12 } : hubRequest));
+    await expect(provider.postReview(7, review)).resolves.toEqual({ commentIds: ["review-12"] });
+    expect(calls).toHaveLength(2);
+  });
+
+  it("explicitly approves a GitHub review with no findings at the reviewed commit", async () => {
+    const { provider, calls } = harness(github, (_url, options) => response(options.method === "POST" ? { id: 12 } : hubRequest));
+    const approval = { ...review, event: "approve" as const, body: "No issues found. The implementation and tests satisfy the request." };
+    await expect(provider.postReview(7, approval)).resolves.toEqual({ commentIds: ["review-12"] });
+    const writes = calls.filter(call => call.options.method === "POST");
+    expect(writes).toHaveLength(1);
+    expect(writes[0].url.pathname).toBe("/repos/owner/repo/pulls/7/reviews");
+    expect(JSON.parse(String(writes[0].options.body))).toEqual({ commit_id: headSha, event: "APPROVE", body: approval.body, comments: [] });
+    expect(new Headers(writes[0].options.headers).get("authorization")).toBe("Bearer reviewer-private-token");
+  });
+
   it("refuses stale review drafts before posting", async () => {
     const { provider, calls } = harness(github, () => response(hubRequest));
     await expect(
@@ -1024,12 +1091,38 @@ describe("GitLab review and exact-commit merge", () => {
     const { provider } = labFixture();
     expect(await provider.getChangeRequest(7)).toMatchObject({
       headSha,
+      reviewReady: true,
       approved: true,
       mergeable: true,
       unresolvedDiscussions: 0,
       comments: [{ id: "1", resolved: true }],
       diff: expect.stringContaining("+++ b/file.ts"),
     });
+  });
+
+  it.each(["checking", "approvals_syncing", "preparing", "unchecked"])("waits to review while GitLab is %s", async detailed_merge_status => {
+    const { provider } = labFixture({ request: { detailed_merge_status } });
+    expect((await provider.getChangeRequest(7)).reviewReady).toBe(false);
+  });
+
+  it("waits to review while the GitLab diff patch ID is null", async () => {
+    const { provider } = labFixture({ version: { patch_id_sha: null } });
+    expect((await provider.getChangeRequest(7)).reviewReady).toBe(false);
+  });
+
+  it.each(["not_approved", "requested_changes", "ci_still_running", "ci_must_pass", "conflict"])("allows review while GitLab merge is blocked by %s", async detailed_merge_status => {
+    const { provider } = labFixture({ request: { detailed_merge_status } });
+    expect(await provider.getChangeRequest(7)).toMatchObject({ reviewReady: true, mergeable: false });
+  });
+
+  it.each([undefined, "invalid", 12])("rejects a missing or malformed GitLab diff patch ID %s", async patch_id_sha => {
+    const { provider } = labFixture({ version: { patch_id_sha } });
+    await expect(provider.getChangeRequest(7)).rejects.toThrow("invalid or incomplete");
+  });
+
+  it.each([undefined, null, false])("rejects incomplete GitLab review readiness %s", async detailed_merge_status => {
+    const { provider } = labFixture({ request: { detailed_merge_status }, version: { patch_id_sha: null } });
+    await expect(provider.getChangeRequest(7)).rejects.toThrow("invalid or incomplete");
   });
 
   it.each([
@@ -1040,6 +1133,7 @@ describe("GitLab review and exact-commit merge", () => {
     { notes: [{ ...labNote, resolved: false }] },
     { request: { detailed_merge_status: "requested_changes" } },
     { request: { detailed_merge_status: "ci_still_running" } },
+    { version: { patch_id_sha: null } },
     { request: { draft: true } },
   ])(
     "refuses merge when current approval or server readiness is missing",
@@ -1084,11 +1178,11 @@ describe("GitLab review and exact-commit merge", () => {
           : url.pathname.endsWith("/approve")
             ? { approved_by: [] }
             : url.pathname.endsWith("/discussions")
-              ? { id: "thread" }
+              ? { id: "thread", notes: [{ id: 21 }] }
               : { id: 12 },
       ),
     );
-    await provider.postReview(7, {
+    const publication = await provider.postReview(7, {
       ...review,
       event: "approve",
       comments: [
@@ -1101,6 +1195,7 @@ describe("GitLab review and exact-commit merge", () => {
         },
       ],
     });
+    expect(publication).toEqual({ commentIds: ["21", "12"] });
     const writes = calls.filter((call) => call.options.method === "POST");
     expect(
       writes.map((call) =>
@@ -1128,6 +1223,21 @@ describe("GitLab review and exact-commit merge", () => {
     });
   });
 
+  it("explicitly approves a GitLab review with no findings after posting its summary", async () => {
+    const { provider, calls } = harness(gitlab, (url, options) => response(options.method !== "POST"
+      ? labRequest : url.pathname.endsWith("/approve")
+        ? { approved_by: [{ user: { username: "reviewer-bot" } }] } : { id: 12 }));
+    const approval = { ...review, event: "approve" as const, body: "No issues found. The implementation and tests satisfy the request." };
+    await expect(provider.postReview(7, approval)).resolves.toEqual({ commentIds: ["12"] });
+    const writes = calls.filter(call => call.options.method === "POST");
+    expect(writes.map(call => call.url.pathname)).toEqual([
+      "/api/v4/projects/group%2Fsubgroup%2Frepo/merge_requests/7/notes",
+      "/api/v4/projects/group%2Fsubgroup%2Frepo/merge_requests/7/approve",
+    ]);
+    expect(writes.map(call => JSON.parse(String(call.options.body)))).toEqual([{ body: approval.body }, { sha: headSha }]);
+    expect(writes.map(call => new Headers(call.options.headers).get("private-token"))).toEqual(["reviewer-private-token", "reviewer-private-token"]);
+  });
+
   it("uses GitLab’s request-changes mutation rather than treating a comment as a review decision", async () => {
     const { provider, calls } = harness(gitlab, (url, options) =>
       response(
@@ -1145,13 +1255,27 @@ describe("GitLab review and exact-commit merge", () => {
             : labRequest,
       ),
     );
-    await provider.postReview(7, { ...review, event: "request_changes" });
+    await expect(provider.postReview(7, { ...review, event: "request_changes" })).resolves.toEqual({ commentIds: ["2"] });
     const mutation = JSON.parse(String(calls.at(-1)!.options.body));
     expect(mutation.query).toContain("mergeRequestRequestChanges");
     expect(mutation.variables.input).toEqual({
       projectPath: "group/subgroup/repo",
       iid: "7",
     });
+  });
+
+  it("returns every note confirmed by the GitLab review discussion responses", async () => {
+    let discussionNumber = 0;
+    const { provider } = harness(gitlab, (url, options) => url.pathname.endsWith("/discussions") && options.method === "POST"
+      ? response({ id: `thread${++discussionNumber}`, notes: [{ id: discussionNumber * 10 }, { id: discussionNumber * 10 + 1 }] })
+      : response(labRequest));
+    await expect(provider.postReview(7, { ...review, body: "", comments: [{ body: "One finding." }, { body: "Another finding." }] })).resolves.toEqual({ commentIds: ["10", "11", "20", "21"] });
+  });
+
+  it.each([{ notes: undefined }, { notes: [] }, { notes: [{ id: "invalid" }] }])("does not confirm a GitLab review without its published note IDs: %j", async ({ notes }) => {
+    const { provider, calls } = harness(gitlab, (_url, options) => response(options.method === "POST" ? { id: "thread", notes } : labRequest));
+    await expect(provider.postReview(7, { ...review, comments: [{ body: "Finding." }] })).rejects.toThrow("Inspect the MR");
+    expect(calls.filter(call => call.options.method === "POST")).toHaveLength(1);
   });
 
   it("reports a partial review without retrying successful external writes", async () => {
@@ -1166,6 +1290,60 @@ describe("GitLab review and exact-commit merge", () => {
     expect(
       calls.filter((call) => call.url.pathname.endsWith("/notes")),
     ).toHaveLength(1);
+  });
+});
+
+describe("merge preflight and mutation boundaries", () => {
+  it.each([github, gitlab])("reports an observed readiness blocker before starting a $provider merge", async repository => {
+    const { provider, calls } = repository.provider === "github"
+      ? hubFixture({ graphql: { mergeStateStatus: "BLOCKED" } })
+      : labFixture({ request: { detailed_merge_status: "ci_still_running" } });
+    const error = await provider.merge(7, headSha).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(error).toBeInstanceOf(ForgeProviderError);
+    expect(error).toMatchObject({ statusCode: 409, message: expect.stringContaining("must be open"), change: { headSha, state: "open", mergeable: false } });
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it.each([github, gitlab])("preserves $provider read failures without recording an attempted merge", async repository => {
+    const base = repository.provider === "github" ? hubFixture() : labFixture();
+    const { provider, calls } = harness(repository, (url, options) => /\/(pulls|merge_requests)\/7$/.test(url.pathname)
+      ? new Response(null, { status: 403 }) : base.fetcher(url, options));
+    const error = await provider.merge(7, headSha).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(error).toMatchObject({ statusCode: 403, message: expect.stringContaining("HTTP 403") });
+    expect(error.change).toBeUndefined();
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it.each([github, gitlab])("retains the observed $provider commit when the expected merge head differs", async repository => {
+    const { provider, calls } = repository.provider === "github" ? hubFixture() : labFixture();
+    const error = await provider.merge(7, previousSha).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(error).toMatchObject({ statusCode: 409, message: expect.stringContaining("head changed"), change: { headSha } });
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it.each([github, gitlab])("does not classify a $provider merge HTTP failure as an unstarted mutation", async repository => {
+    const base = repository.provider === "github" ? hubFixture() : labFixture();
+    const { provider, calls } = harness(repository, (url, options) => options.method === "PUT"
+      ? new Response(null, { status: 409 }) : base.fetcher(url, options));
+    const error = await provider.merge(7, headSha).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeProviderError);
+    expect(error).not.toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(error).toMatchObject({ statusCode: 409, message: expect.stringContaining("HTTP 409") });
+    expect(calls.filter(call => call.options.method === "PUT")).toHaveLength(1);
+  });
+
+  it.each([github, gitlab])("does not classify an unconfirmed $provider merge response as an unstarted mutation", async repository => {
+    const base = repository.provider === "github" ? hubFixture() : labFixture();
+    const { provider, calls } = harness(repository, (url, options) => options.method === "PUT"
+      ? response(repository.provider === "github" ? { merged: false } : { state: "opened" }) : base.fetcher(url, options));
+    const error = await provider.merge(7, headSha).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeProviderError);
+    expect(error).not.toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(error.statusCode).toBe(409);
+    expect(calls.filter(call => call.options.method === "PUT")).toHaveLength(1);
   });
 });
 

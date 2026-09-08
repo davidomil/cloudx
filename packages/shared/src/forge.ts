@@ -41,6 +41,9 @@ export interface ForgeComment {
   line?: number;
   resolved?: boolean;
   discussionId?: string;
+  reviewId?: string;
+  replyToCommentId?: string;
+  system?: boolean;
 }
 
 export interface ForgeIssueDetail extends ForgeIssue {
@@ -72,6 +75,7 @@ export interface ForgeChangeRequestStatus {
 }
 
 export interface ForgeChangeRequest extends ForgeChangeRequestSummary, ForgeChangeRequestStatus {
+  reviewReady: boolean;
   mergeable: boolean;
   approved: boolean;
   unresolvedDiscussions: number;
@@ -99,6 +103,11 @@ export interface ForgeReviewSubmission {
   event: "comment" | "approve" | "request_changes";
   body: string;
   comments: ForgeReviewComment[];
+}
+
+export interface ForgeReviewPublication {
+  commentIds: string[];
+  inlineReview?: { id: string; commentCount: number };
 }
 
 export interface ForgeMergeResult {

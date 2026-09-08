@@ -99,12 +99,13 @@ export class ForgePlugin implements WorkspacePlugin {
         "issue.start",
         "Start issue worker",
         "external",
-        { number, ...placement },
+        { number, autoReview: { type: "boolean" }, ...placement },
         ["number", "windowId", "paneId"],
         async (input) => ({
           worker: await this.service().workflow.startIssue(
             Number(input.number),
             place(input),
+            input.autoReview === true,
           ),
         }),
       ),
@@ -120,6 +121,16 @@ export class ForgePlugin implements WorkspacePlugin {
             Boolean(input.autoPost),
             place(input),
           ),
+        }),
+      ),
+      hook(
+        "worker.autoReview",
+        "Set issue auto review",
+        "external",
+        { id, enabled: { type: "boolean" }, ...placement },
+        ["id", "enabled", "windowId", "paneId"],
+        async (input) => ({
+          worker: await this.service().workflow.setAutoReview(String(input.id), input.enabled === true, place(input)),
         }),
       ),
       hook(

@@ -39,7 +39,7 @@ afterEach(async () => {
 
 const repository = { provider: "github" as const, apiUrl: "https://api.github.com", projectPath: "cloudx/example" };
 const issue: ForgeIssueDetail = { number: 7, title: "Fix deployment", body: "The deployment fails.", url: "https://github.com/cloudx/example/issues/7", state: "open", author: "ari", labels: ["bug"], updatedAt: "2026-09-07", comments: [{ id: "note-1", author: "nia", body: "Reproduced in staging." }] };
-const change: ForgeChangeRequest = { ...issue, number: 12, title: "Repair deployment", url: "https://github.com/cloudx/example/pull/12", draft: false, headSha: "abcdef", headBranch: "fix/deploy", baseBranch: "main", merged: false, mergeable: true, approved: false, unresolvedDiscussions: 1, diff: "", linkedIssues: [], comments: [{ id: "note-2", author: "nia", body: "Needs a timeout.", path: "deploy.ts", line: 8, resolved: false }] };
+const change: ForgeChangeRequest = { ...issue, number: 12, title: "Repair deployment", url: "https://github.com/cloudx/example/pull/12", draft: false, headSha: "abcdef", headBranch: "fix/deploy", baseBranch: "main", merged: false, mergeable: true, reviewReady: true, approved: false, unresolvedDiscussions: 1, diff: "", linkedIssues: [], comments: [{ id: "note-2", author: "nia", body: "Needs a timeout.", path: "deploy.ts", line: 8, resolved: false }] };
 const worker: ForgeWorker = { id: "work-1", kind: "issue", number: 7, title: issue.title, repository, repositoryPath: "/repo", baseBranch: "main", templateId: "worker-template", status: "running", tabId: "codex-worker", autoPost: false, startedAt: "2026-09-07", updatedAt: "2026-09-07" };
 const reviewWorker: ForgeWorker = { ...worker, id: "review-1", kind: "review", number: 12, title: change.title, status: "completed", draft: { headSha: "abcdef", body: "Add a timeout.", event: "request_changes", comments: [{ path: "deploy.ts", line: 8, side: "RIGHT", body: "This can wait forever." }], status: "draft" } };
 const publishingWorker: ForgeWorker = {
@@ -73,7 +73,8 @@ function fixture(overrides: Partial<ForgeDashboard> = {}, handler?: HookHandler)
       "forge.change.review": { change },
       "forge.worker.pause": { worker: { ...worker, status: "paused" } },
       "forge.worker.stop": { worker: { ...worker, status: "stopped" } },
-      "forge.worker.resume": { worker }
+      "forge.worker.resume": { worker },
+      "forge.worker.autoReview": { worker }
     };
     if (!(hook in responses)) throw new Error(`Unexpected hook: ${hook}`);
     return responses[hook] as T;
@@ -97,6 +98,8 @@ function button(container: Element, text: string): HTMLButtonElement {
 }
 
 async function click(container: Element, text: string) { await act(async () => { button(container, text).click(); }); }
+function autoReviewToggle(container: Element) { return container.querySelector<HTMLInputElement>('input[aria-label="Auto review"]')!; }
+async function toggleAutoReview(container: Element) { await act(async () => { autoReviewToggle(container).click(); }); }
 async function fill(element: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement, value: string) {
   await act(async () => {
     const prototype = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : element instanceof HTMLSelectElement ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
@@ -130,7 +133,196 @@ describe("ForgePanel", () => {
     expect(panel.textContent).toContain("Reproduced in staging.");
     expect(panel.querySelector('[aria-label="Open issue #7"]')?.getAttribute("href")).toBe(issue.url);
     await click(panel, "Start work");
-    expect(testFixture.calls).toContainEqual({ hook: "forge.issue.start", input: { number: 7, windowId: "window-1", paneId: "pane-2" }, tabId: "forge-tab" });
+    expect(autoReviewToggle(panel).checked).toBe(false);
+    expect(testFixture.calls).toContainEqual({ hook: "forge.issue.start", input: { number: 7, autoReview: false, windowId: "window-1", paneId: "pane-2" }, tabId: "forge-tab" });
+  });
+
+  it.each(["github", "gitlab"] as const)("keeps a fresh %s issue's auto review choice beside Start work and isolated from other issues", async provider => {
+    const another = { ...issue, number: 8, title: "Fix uploads" };
+    const testFixture = fixture({ repository: { ...repository, provider } }, (hook, input) => {
+      if (hook === "forge.issues.list") return { items: [issue, another] };
+      if (hook === "forge.issue.get") return { issue: input.number === issue.number ? issue : another };
+    });
+    const panel = await renderPanel(testFixture);
+    const actions = button(panel, "Start work").parentElement!;
+    expect(autoReviewToggle(actions).checked).toBe(false);
+    await toggleAutoReview(actions);
+    expect(autoReviewToggle(actions).checked).toBe(true);
+    expect(panel.textContent).toContain("Automatically review changes, address feedback, and merge after approval.");
+    await act(async () => { panel.querySelectorAll<HTMLButtonElement>(".forge-item")[1].click(); });
+    expect(autoReviewToggle(panel).checked).toBe(false);
+    await act(async () => { panel.querySelectorAll<HTMLButtonElement>(".forge-item")[0].click(); });
+    expect(autoReviewToggle(panel).checked).toBe(true);
+    await click(panel, "Start work");
+    expect(testFixture.calls.filter(call => call.hook === "forge.issue.start")).toEqual([
+      { hook: "forge.issue.start", input: { number: issue.number, autoReview: true, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id }
+    ]);
+    expect(panel.querySelector("dialog")).toBeNull();
+  });
+
+  it.each(["github", "gitlab"] as const)("keeps a saved %s auto review setting controllable from its issue, request toolbar, and worker tab", async provider => {
+    const currentRepository = { ...repository, provider };
+    const coding: ForgeWorker = { ...worker, repository: currentRepository, changeNumber: change.number, status: "awaiting_review", autoReview: { enabled: true, phase: "reviewing", placement: { windowId: "original-window", paneId: "original-pane" } } };
+    let testFixture: ReturnType<typeof fixture>;
+    testFixture = fixture({ repository: currentRepository, workers: [coding] }, (hook, input) => {
+      if (hook === "forge.dashboard") return structuredClone(testFixture.dashboard);
+      if (hook === "forge.worker.autoReview") {
+        testFixture.dashboard.workers = [{ ...coding, autoReview: { ...coding.autoReview!, enabled: input.enabled as boolean } }];
+        return { worker: testFixture.dashboard.workers[0] };
+      }
+    });
+    const panel = await renderPanel(testFixture);
+    expect(panel.querySelectorAll('input[aria-label="Auto review"]')).toHaveLength(1);
+    expect(autoReviewToggle(button(panel, "Start work").parentElement!).checked).toBe(true);
+    await toggleAutoReview(panel);
+    expect(autoReviewToggle(panel).checked).toBe(false);
+    expect(button(panel.querySelector(".forge-worker")!, "Resume").disabled).toBe(false);
+    await click(panel, provider === "github" ? "Pull requests" : "Merge requests");
+    const toolbar = panel.querySelector(".forge-change-toolbar")!;
+    expect(autoReviewToggle(toolbar).checked).toBe(false);
+    await toggleAutoReview(toolbar);
+    expect(autoReviewToggle(toolbar).checked).toBe(true);
+    await click(panel, "Workers (1)");
+    expect(autoReviewToggle(panel.querySelector('[role="tabpanel"]')!).checked).toBe(true);
+    expect(testFixture.calls.filter(call => call.hook === "forge.worker.autoReview")).toEqual([
+      { hook: "forge.worker.autoReview", input: { id: coding.id, enabled: false, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id },
+      { hook: "forge.worker.autoReview", input: { id: coding.id, enabled: true, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id }
+    ]);
+    expect(testFixture.calls.some(call => call.hook === "forge.worker.resume" || call.hook === "forge.review.start")).toBe(false);
+    expect(panel.querySelector("dialog")).toBeNull();
+  });
+
+  it.each(["paused", "stopped", "failed", "cleanup_failed"] as const)("opts a %s issue worker into auto review without resuming it", async status => {
+    const coding: ForgeWorker = { ...worker, status };
+    let testFixture: ReturnType<typeof fixture>;
+    testFixture = fixture({ workers: [coding] }, (hook, input) => {
+      if (hook === "forge.dashboard") return structuredClone(testFixture.dashboard);
+      if (hook === "forge.worker.autoReview") {
+        testFixture.dashboard.workers = [{ ...coding, autoReview: { enabled: input.enabled as boolean, phase: "implementing", placement: { windowId: "window-1", paneId: "pane-2" } } }];
+        return { worker: testFixture.dashboard.workers[0] };
+      }
+    });
+    const panel = await renderPanel(testFixture);
+    await toggleAutoReview(panel);
+    expect(autoReviewToggle(panel).checked).toBe(true);
+    expect(button(panel, "Resume").disabled).toBe(false);
+    expect(panel.querySelector(".forge-auto-review-status")?.textContent).toContain("Resume");
+    expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker.")).map(call => call.hook)).toEqual(["forge.worker.autoReview"]);
+  });
+
+  it("keeps an in-flight auto review setting targeted to its original worker and prevents duplicate saves", async () => {
+    const saved = deferred<unknown>();
+    const another = { ...issue, number: 8, title: "Fix uploads" };
+    let testFixture: ReturnType<typeof fixture>;
+    testFixture = fixture({ workers: [worker] }, (hook, input) => {
+      if (hook === "forge.dashboard") return structuredClone(testFixture.dashboard);
+      if (hook === "forge.issues.list") return { items: [issue, another] };
+      if (hook === "forge.issue.get") return { issue: input.number === issue.number ? issue : another };
+      if (hook === "forge.worker.autoReview") return saved.promise;
+    });
+    const panel = await renderPanel(testFixture);
+    await act(async () => { autoReviewToggle(panel).click(); autoReviewToggle(panel).click(); });
+    expect(autoReviewToggle(panel).disabled).toBe(true);
+    await act(async () => { panel.querySelectorAll<HTMLButtonElement>(".forge-item")[1].click(); });
+    expect(autoReviewToggle(panel).checked).toBe(false);
+    testFixture.dashboard.workers = [{ ...worker, autoReview: { enabled: true, phase: "implementing", placement: { windowId: "window-1", paneId: "pane-2" } } }];
+    await act(async () => { saved.resolve({ worker: testFixture.dashboard.workers[0] }); });
+    expect(autoReviewToggle(panel).checked).toBe(false);
+    await act(async () => { panel.querySelectorAll<HTMLButtonElement>(".forge-item")[0].click(); });
+    expect(autoReviewToggle(panel).checked).toBe(true);
+    expect(testFixture.calls.filter(call => call.hook === "forge.worker.autoReview")).toEqual([
+      { hook: "forge.worker.autoReview", input: { id: worker.id, enabled: true, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id }
+    ]);
+  });
+
+  it("retains the saved auto review setting when changing it fails", async () => {
+    const panel = await renderPanel(fixture({ workers: [worker] }, hook => {
+      if (hook === "forge.worker.autoReview") throw new Error("Reviewer credentials are required.");
+    }));
+    await toggleAutoReview(panel);
+    expect(autoReviewToggle(panel).checked).toBe(false);
+    expect(autoReviewToggle(panel).disabled).toBe(false);
+    expect(panel.querySelector('[role="alert"]')?.textContent).toContain("Reviewer credentials are required.");
+  });
+
+  it("requires an open issue for a fresh loop while letting an existing loop be turned off", async () => {
+    let testFixture: ReturnType<typeof fixture>;
+    testFixture = fixture({}, hook => {
+      if (hook === "forge.dashboard") return structuredClone(testFixture.dashboard);
+      if (hook === "forge.issues.list") return { items: [{ ...issue, state: "closed" }] };
+      if (hook === "forge.issue.get") return { issue: { ...issue, state: "closed" } };
+    });
+    const panel = await renderPanel(testFixture);
+    expect(button(panel, "Start work").disabled).toBe(true);
+    expect(autoReviewToggle(panel).disabled).toBe(true);
+    testFixture.dashboard.workers = [{ ...worker, autoReview: { enabled: true, phase: "implementing", placement: { windowId: "window-1", paneId: "pane-2" } } }];
+    await click(panel, "Refresh Forge");
+    expect(button(panel, "Start work").disabled).toBe(true);
+    expect(autoReviewToggle(panel).disabled).toBe(false);
+    await toggleAutoReview(panel);
+    expect(testFixture.calls.find(call => call.hook === "forge.worker.autoReview")?.input).toEqual({ id: worker.id, enabled: false, windowId: "window-1", paneId: "pane-2" });
+  });
+
+  it.each(["failed", "cleanup_failed", "completed"] as const)("keeps a linked %s review's failure visible under its issue", async status => {
+    const child: ForgeWorker = { ...reviewWorker, issueWorkerId: worker.id, status, error: "Review publication needs attention.", draft: { ...reviewWorker.draft!, status: "post_failed" } };
+    const foreign = { ...child, id: "foreign-child", repository: { ...repository, projectPath: "another/project" }, error: "Foreign review failure." };
+    const panel = await renderPanel(fixture({ workers: [worker, child, foreign] }));
+    const row = panel.querySelector(".forge-item")!;
+    expect(row.querySelectorAll(".forge-item-worker")).toHaveLength(2);
+    expect(row.textContent).toContain(`Review · ${status === "completed" ? "post failed" : status.replaceAll("_", " ")}`);
+    expect(row.textContent).toContain("Review publication needs attention.");
+    expect(row.textContent).not.toContain("Foreign review failure.");
+    expect(panel.querySelector('[aria-label="review worker #12"] [role="alert"]')?.textContent).toBe("Review publication needs attention.");
+  });
+
+  it("shows the automatic loop's review worker and phase under its issue without opening a terminal", async () => {
+    vi.useFakeTimers();
+    const autoReview: NonNullable<ForgeWorker["autoReview"]> = { enabled: true, phase: "implementing", placement: { windowId: "window-1", paneId: "pane-2" } };
+    const coding: ForgeWorker = { ...worker, autoReview, changeNumber: change.number };
+    const child: ForgeWorker = { ...reviewWorker, issueWorkerId: worker.id, status: "running", draft: undefined };
+    const unrelated = { ...child, id: "unrelated-review", issueWorkerId: "another-coder" };
+    let testFixture: ReturnType<typeof fixture>;
+    testFixture = fixture({ workers: [coding, unrelated] }, hook => hook === "forge.dashboard" ? structuredClone(testFixture.dashboard) : undefined);
+    const panel = await renderPanel(testFixture);
+    expect(panel.querySelector(".forge-item-workers")?.textContent).toContain("Auto review · implementing");
+    expect(panel.querySelector(".forge-auto-review-status")?.textContent).toContain("Implementing changes");
+    expect(panel.querySelectorAll(".forge-item-worker")).toHaveLength(1);
+
+    testFixture.dashboard.workers = [{ ...coding, status: "awaiting_review", autoReview: { ...autoReview, phase: "reviewing", reviewWorkerId: child.id } }, child, unrelated];
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    const card = panel.querySelector('[aria-label="issue worker #7"]')!;
+    expect(panel.querySelector(".forge-auto-review-status")?.textContent).toContain("Reviewing changes");
+    expect(panel.querySelectorAll(".forge-item-worker")).toHaveLength(2);
+    expect(panel.querySelector(".forge-item-workers")?.textContent).toContain("Review · running");
+    expect(panel.querySelector('[aria-label="review worker #12"]')).not.toBeNull();
+    expect(button(card, "Pause").disabled).toBe(false);
+    expect(button(card, "Stop").disabled).toBe(false);
+    expect(Array.from(card.querySelectorAll("button")).some(item => item.textContent?.trim() === "Resume")).toBe(false);
+    expect(card.textContent).not.toContain("Resume after feedback");
+
+    testFixture.dashboard.workers = [{ ...coding, status: "awaiting_merge", autoReview: { ...autoReview, phase: "merging", reviewWorkerId: child.id } }, { ...child, status: "completed" }];
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    expect(panel.querySelector(".forge-auto-review-status")?.textContent).toContain("Waiting to merge");
+    expect(panel.querySelector(".forge-item .forge-status-awaiting_merge")?.textContent).toBe("Coding · awaiting merge");
+    expect(button(card, "Pause").disabled).toBe(false);
+    expect(button(card, "Stop").disabled).toBe(false);
+    expect(panel.querySelector("dialog")).toBeNull();
+    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
+  });
+
+  it.each([
+    { status: "awaiting_review" as const, phase: "reviewing" as const, action: "Pause" },
+    { status: "awaiting_review" as const, phase: "reviewing" as const, action: "Stop" },
+    { status: "awaiting_merge" as const, phase: "merging" as const, action: "Pause" },
+    { status: "awaiting_merge" as const, phase: "merging" as const, action: "Stop" }
+  ])("$action controls the whole issue loop while $status", async ({ status, phase, action }) => {
+    const coding: ForgeWorker = { ...worker, status, autoReview: { enabled: true, phase, placement: { windowId: "window-1", paneId: "pane-2" } } };
+    const testFixture = fixture({ workers: [coding] });
+    const panel = await renderPanel(testFixture);
+    await click(panel.querySelector('[aria-label="issue worker #7"]')!, action);
+    expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([
+      { hook: `forge.worker.${action.toLowerCase()}`, input: { id: coding.id }, tabId: tab.id }
+    ]);
   });
 
   it.each([

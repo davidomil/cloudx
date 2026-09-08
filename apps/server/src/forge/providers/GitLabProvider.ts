@@ -10,11 +10,13 @@ import type {
   ForgeListQuery,
   ForgeMergeResult,
   ForgePage,
+  ForgeReviewPublication,
   ForgeReviewSubmission,
 } from "@cloudx/shared";
 import { ForgeHttpClient, hasNextPage, pagination } from "./ForgeHttpClient.js";
 import {
   ForgeHeadChangedError,
+  ForgeMergeNotStartedError,
   ForgeProviderError,
   requireDiscussion,
   requireMergeReady,
@@ -138,6 +140,7 @@ export class GitLabProvider implements ForgeProvider {
     const versionHeadSha = gitlabHeadSha(version.head_commit_sha);
     if (versionHeadSha !== headSha)
       throw new ForgeHeadChangedError([headSha, versionHeadSha]);
+    const patchIdSha = version.patch_id_sha === null ? undefined : gitlabHeadSha(version.patch_id_sha);
     const createdAt = Date.parse(string(version.created_at));
     if (!Number.isFinite(createdAt)) return invalid();
     const approvers = list(approvals.approved_by).map(record);
@@ -195,6 +198,7 @@ export class GitLabProvider implements ForgeProvider {
       ...gitlabRequestSummary(current),
       ...status,
       linkedIssues,
+      reviewReady: Boolean(patchIdSha) && !["checking", "approvals_syncing", "preparing", "unchecked"].includes(string(current.detailed_merge_status)),
       mergeable: string(current.detailed_merge_status) === "mergeable",
       approved,
       unresolvedDiscussions,
@@ -289,7 +293,7 @@ export class GitLabProvider implements ForgeProvider {
   async postReview(
     number: number,
     input: ForgeReviewSubmission,
-  ): Promise<void> {
+  ): Promise<ForgeReviewPublication> {
     validateReview(input);
     [input.body, ...input.comments.map((comment) => comment.body)].forEach(
       rejectQuickActions,
@@ -304,6 +308,7 @@ export class GitLabProvider implements ForgeProvider {
     if (current.state !== "opened")
       throw new ForgeProviderError("Reviews require an open request.", 409);
     let posted = 0;
+    const commentIds: string[] = [];
     try {
       for (const comment of input.comments) {
         let position: Record<string, unknown> | undefined;
@@ -329,8 +334,12 @@ export class GitLabProvider implements ForgeProvider {
           role: "reviewer",
           body: { body: comment.body, ...(position ? { position } : {}) },
         });
-        string(record(result.body).id);
+        const discussion = record(result.body);
+        string(discussion.id);
         posted++;
+        const notes = list(discussion.notes);
+        if (!notes.length) return invalid();
+        commentIds.push(...notes.map(note => String(integer(record(note).id))));
       }
       if (input.body.trim()) {
         const result = await this.http.request(`${path}/notes`, {
@@ -338,7 +347,7 @@ export class GitLabProvider implements ForgeProvider {
           role: "reviewer",
           body: { body: input.body },
         });
-        integer(record(result.body).id);
+        commentIds.push(String(integer(record(result.body).id)));
         posted++;
       }
       if (input.event === "approve") {
@@ -382,6 +391,7 @@ export class GitLabProvider implements ForgeProvider {
         if (string(record(mutation.mergeRequest).iid) !== String(number))
           return invalid();
       }
+      return { commentIds };
     } catch (error) {
       if (posted)
         throw new ForgeProviderError(
@@ -396,8 +406,13 @@ export class GitLabProvider implements ForgeProvider {
     number: number,
     expectedHeadSha: string,
   ): Promise<ForgeMergeResult> {
-    const request = await this.getChangeRequest(number);
-    requireMergeReady(request, expectedHeadSha);
+    let request: ForgeChangeRequest | undefined;
+    try {
+      request = await this.getChangeRequest(number);
+      requireMergeReady(request, expectedHeadSha);
+    } catch (error) {
+      throw new ForgeMergeNotStartedError(error, request);
+    }
     const result = record(
       (
         await this.http.request(`${this.requestPath(number)}/merge`, {
@@ -597,6 +612,7 @@ function gitlabComment(value: unknown): ForgeComment {
     id: String(integer(note.id)),
     body: string(note.body),
     author: string(record(note.author).username),
+    ...(note.system === undefined ? {} : { system: boolean(note.system) }),
     ...(position ? { path: string(position.new_path) } : {}),
     ...(line == null ? {} : { line: integer(line) }),
     ...(note.resolvable === true ? { resolved: boolean(note.resolved) } : {}),

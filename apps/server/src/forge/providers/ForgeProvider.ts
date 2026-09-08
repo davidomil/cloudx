@@ -8,6 +8,7 @@ import type {
   ForgeListQuery,
   ForgeMergeResult,
   ForgePage,
+  ForgeReviewPublication,
   ForgeReviewSubmission,
 } from "@cloudx/shared";
 
@@ -31,7 +32,7 @@ export interface ForgeProvider {
   createChangeRequest(
     input: ForgeCreateChangeRequest,
   ): Promise<ForgeChangeRequestSummary>;
-  postReview(number: number, input: ForgeReviewSubmission): Promise<void>;
+  postReview(number: number, input: ForgeReviewSubmission): Promise<ForgeReviewPublication>;
   replyToDiscussion(
     number: number,
     discussionId: string,
@@ -97,6 +98,17 @@ export class ForgeHeadChangedError extends ForgeProviderError {
   }
 }
 
+export class ForgeMergeNotStartedError extends ForgeProviderError {
+  constructor(error: unknown, readonly change?: ForgeChangeRequest) {
+    super(
+      error instanceof Error ? error.message : "Could not verify merge readiness.",
+      error instanceof ForgeProviderError ? error.statusCode : 500,
+    );
+    this.name = "ForgeMergeNotStartedError";
+    this.cause = error;
+  }
+}
+
 export function requireMergeReady(
   request: ForgeChangeRequest,
   expectedHeadSha: string,
@@ -109,6 +121,7 @@ export function requireMergeReady(
   if (
     request.state !== "open" ||
     request.draft ||
+    !request.reviewReady ||
     !request.mergeable ||
     !request.approved ||
     request.unresolvedDiscussions !== 0

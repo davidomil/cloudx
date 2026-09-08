@@ -1,4 +1,4 @@
-import type { ForgeRepository, ForgeReviewComment } from "./forge.js";
+import type { ForgeRepository, ForgeReviewComment, ForgeReviewPublication } from "./forge.js";
 
 export const FORGE_PLUGIN_ID = "forge";
 export type ForgeWorkerStatus =
@@ -7,6 +7,7 @@ export type ForgeWorkerStatus =
   | "paused"
   | "awaiting_publication"
   | "awaiting_review"
+  | "awaiting_merge"
   | "stopped"
   | "completed"
   | "failed"
@@ -47,6 +48,8 @@ export interface ForgeWorker {
   headSha?: string;
   feedbackDigest?: string;
   autoPost: boolean;
+  autoReview?: ForgeAutoReview;
+  issueWorkerId?: string;
   draft?: ForgeReviewDraft;
   error?: string;
   startedAt: string;
@@ -58,6 +61,16 @@ export interface ForgeReviewDraft {
   comments: ForgeReviewComment[];
   event: "comment" | "approve" | "request_changes";
   status: "draft" | "posting" | "posted" | "post_failed";
+  publication?: ForgeReviewPublication;
+  postedAt?: string;
+}
+export interface ForgeAutoReview {
+  enabled: boolean;
+  phase: "implementing" | "reviewing" | "merging";
+  placement: ForgePlacement;
+  reviewWorkerId?: string;
+  waitingSince?: string;
+  mergeAttempted?: true;
 }
 export interface ForgeDashboard {
   configured: boolean;

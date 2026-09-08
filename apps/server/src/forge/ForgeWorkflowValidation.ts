@@ -1,6 +1,9 @@
 import type {
+  ForgeAutoReview,
   ForgeIssueCompletionReport,
   ForgeReviewComment,
+  ForgeReviewDraft,
+  ForgeReviewPublication,
   ForgeReviewSubmission,
   ForgeWorker,
 } from "@cloudx/shared";
@@ -15,6 +18,71 @@ function text(value: unknown, name: string, max = 100_000): string {
     throw new Error(`Invalid ${name}.`);
   return value;
 }
+function nonblankText(value: unknown, name: string, max: number): string {
+  const result = text(value, name, max);
+  if (!result.trim()) throw new Error(`Invalid ${name}.`);
+  return result;
+}
+function isoTimestamp(value: unknown, name: string): string {
+  const result = text(value, name, 24);
+  const timestamp = Date.parse(result);
+  if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== result)
+    throw new Error(`Invalid ${name}.`);
+  return result;
+}
+function workerLink(value: unknown, ownerId: string): string {
+  const id = text(value, "linked worker identity", 36);
+  if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(id) || id.toLowerCase() === ownerId.toLowerCase())
+    throw new Error("Invalid linked worker identity.");
+  return id;
+}
+
+function parseAutoReview(value: unknown, workerId: string): ForgeAutoReview {
+  const input = object(value);
+  if (typeof input.enabled !== "boolean" || typeof input.phase !== "string" || !["implementing", "reviewing", "merging"].includes(input.phase))
+    throw new Error("Invalid automatic review state.");
+  const placement = object(input.placement);
+  if (input.mergeAttempted !== undefined && (input.mergeAttempted !== true || input.phase !== "merging"))
+    throw new Error("A saved merge attempt requires the merging phase.");
+  return {
+    enabled: input.enabled,
+    phase: input.phase as ForgeAutoReview["phase"],
+    placement: {
+      windowId: nonblankText(placement.windowId, "automatic review window", 128),
+      paneId: nonblankText(placement.paneId, "automatic review pane", 128),
+    },
+    ...(input.reviewWorkerId !== undefined ? { reviewWorkerId: workerLink(input.reviewWorkerId, workerId) } : {}),
+    ...(input.waitingSince !== undefined ? { waitingSince: isoTimestamp(input.waitingSince, "automatic review observation timestamp") } : {}),
+    ...(input.mergeAttempted === true ? { mergeAttempted: true as const } : {}),
+  };
+}
+
+function parseReviewPublication(value: unknown): ForgeReviewPublication {
+  const input = object(value);
+  if (!Array.isArray(input.commentIds) || input.commentIds.length > 101)
+    throw new Error("Invalid published review comment IDs.");
+  const commentIds = input.commentIds.map(id => nonblankText(id, "published review comment ID", 256));
+  if (new Set(commentIds).size !== commentIds.length)
+    throw new Error("Published review comment IDs must be unique.");
+  if (input.inlineReview === undefined) return { commentIds };
+  const inline = object(input.inlineReview);
+  if (!Number.isSafeInteger(inline.commentCount) || Number(inline.commentCount) < 1 || Number(inline.commentCount) > 100)
+    throw new Error("Invalid published inline review comment count.");
+  return { commentIds, inlineReview: { id: nonblankText(inline.id, "published inline review ID", 256), commentCount: Number(inline.commentCount) } };
+}
+
+function parseSavedReview(value: unknown): ForgeReviewDraft {
+  const input = object(value);
+  const review = parseReview(input);
+  if (typeof input.status !== "string" || !["draft", "posting", "posted", "post_failed"].includes(input.status))
+    throw new Error("Invalid saved review state.");
+  const status = input.status as ForgeReviewDraft["status"];
+  if (input.publication === undefined && input.postedAt === undefined) return { ...review, status };
+  if (status !== "posted" || input.publication === undefined || input.postedAt === undefined)
+    throw new Error("Review publication requires a posted review, receipt, and timestamp.");
+  return { ...review, status, publication: parseReviewPublication(input.publication), postedAt: isoTimestamp(input.postedAt, "review publication timestamp") };
+}
+
 export function parseReview(value: unknown): ForgeReviewSubmission {
   const input = object(value);
   const headSha = text(input.headSha, "review head", 64);
@@ -202,6 +270,7 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
         "paused",
         "awaiting_publication",
         "awaiting_review",
+        "awaiting_merge",
         "stopped",
         "completed",
         "failed",
@@ -252,17 +321,16 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
         Number(worker.changeNumber) < 1)
     )
       throw new Error("Invalid change request number.");
-    if (worker.draft) {
-      const draft = object(worker.draft);
-      parseReview(draft);
-      if (
-        !["draft", "posting", "posted", "post_failed"].includes(
-          String(draft.status),
-        )
-      )
-        throw new Error("Invalid saved review state.");
-    }
     const parsed = structuredClone(worker) as unknown as ForgeWorker;
+    if (worker.draft !== undefined) parsed.draft = parseSavedReview(worker.draft);
+    if (worker.autoReview !== undefined) {
+      if (worker.kind !== "issue") throw new Error("Only issue workers can have an automatic review loop.");
+      parsed.autoReview = parseAutoReview(worker.autoReview, parsed.id);
+    }
+    if (worker.issueWorkerId !== undefined) {
+      if (worker.kind !== "review") throw new Error("Only review workers can link to an issue worker.");
+      parsed.issueWorkerId = workerLink(worker.issueWorkerId, parsed.id);
+    }
     if (worker.pendingPublication !== undefined) {
       if (worker.kind !== "issue")
         throw new Error("Only issue workers can have pending publication.");
@@ -276,6 +344,12 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
       parsed.pendingPublication.replyingToDiscussionId || parsed.pendingPublication.repliedDiscussionIds.length
     ))
       throw new Error("Automatic publication confirmation requires an owned issue checkout and a pushed checkpoint without discussion mutations.");
+    if (parsed.status === "awaiting_merge" && (
+      parsed.kind !== "issue" || !parsed.autoReview?.enabled || parsed.autoReview.phase !== "merging" ||
+      !parsed.changeNumber || !parsed.headSha || !/^[a-f0-9]{40,64}$/i.test(parsed.headSha) ||
+      !parsed.repositoryPath?.trim() || !parsed.worktreePath?.trim() || !parsed.branch?.trim()
+    ))
+      throw new Error("Automatic merge requires an enabled merging issue loop with a published request and an owned checkout.");
     return parsed;
   });
 }

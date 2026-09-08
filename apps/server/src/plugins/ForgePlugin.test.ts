@@ -22,6 +22,7 @@ async function fixture() {
   roots.push(root);
   const workflow = {
     startIssue: vi.fn(async () => ({ id: "worker" })),
+    setAutoReview: vi.fn(async () => ({ id: "worker" })),
     dashboard: vi.fn(async () => ({ workers: [] })),
   };
   let settings: ForgeSettingsService;
@@ -111,7 +112,16 @@ describe("Forge plugin boundary", () => {
     expect(workflow.startIssue).toHaveBeenCalledWith(1, {
       windowId: "w",
       paneId: "p",
-    });
+    }, false);
+  });
+  it("opts into the issue review loop only through validated explicit controls", async () => {
+    const { hooks, workflow } = await fixture();
+    await hooks.call("forge.issue.start", { number: 1, windowId: "w", paneId: "p", autoReview: true }, { caller: { kind: "ui" } });
+    expect(workflow.startIssue).toHaveBeenCalledWith(1, { windowId: "w", paneId: "p" }, true);
+    await hooks.call("forge.worker.autoReview", { id: "worker", enabled: false, windowId: "w", paneId: "p" }, { caller: { kind: "ui" } });
+    expect(workflow.setAutoReview).toHaveBeenCalledWith("worker", false, { windowId: "w", paneId: "p" });
+    await expect(hooks.call("forge.worker.autoReview", { id: "worker", enabled: "true", windowId: "w", paneId: "p" }, { caller: { kind: "ui" } })).rejects.toThrow();
+    await expect(hooks.call("forge.worker.autoReview", { id: "worker", enabled: true, windowId: "w", paneId: "p" }, { caller: { kind: "automation" } })).rejects.toThrow(/exposed/);
   });
   it("requires connected application identities and keeps their credentials out of public config", async () => {
     const { config, settings, connections } = await fixture();
