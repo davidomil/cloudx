@@ -49,7 +49,7 @@ async function isRunning(pid: number): Promise<boolean> {
     const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
     return !["Z", "X"].includes(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0]!);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) return false;
     throw error;
   }
 }

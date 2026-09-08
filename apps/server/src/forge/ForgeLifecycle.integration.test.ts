@@ -60,20 +60,26 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     const started = await fixture.workflow.startIssue(1, fixture.placement);
     expect(started.status, started.error).toBe("running");
     const contextPath = fixture.sessions.getTab(started.tabId!).contextPath!;
-    const original = await fs.stat(contextPath, { bigint: true });
-    const receipt = await fixture.completedAssistantTurn(started);
-    await fixture.workflow.pause(started.id);
-    const rotated = await fs.stat(contextPath, { bigint: true });
-    expect(rotated.ino).not.toBe(original.ino);
-    expect(rotated.size).toBeLessThanOrEqual(64_000n);
-    expect(await fs.readFile(contextPath, "utf8")).toContain("Trimmed to the latest 64000 bytes");
-    await fixture.workflow.dispose();
-    await fixture.sessions.dispose();
-    const restarted = new ForgeRuntime(fixture.runtimeDependencies);
-    expect((await restarted.recover(started.id)).tabIds).toEqual([started.tabId]);
-    await restarted.close(started.tabId!);
-    await expectMissing(path.dirname(contextPath), receipt.codexHome);
-    expect((await fs.stat(started.worktreePath!)).isDirectory()).toBe(true);
+    const originalFile = await fs.open(contextPath, "r");
+    try {
+      const original = await originalFile.stat({ bigint: true });
+      fixture.factory.processes[0]!.write("emit fixture output\n");
+      const receipt = await fixture.completedAssistantTurn(started);
+      await fixture.workflow.pause(started.id);
+      const rotated = await fs.stat(contextPath, { bigint: true });
+      expect(rotated.ino).not.toBe(original.ino);
+      expect(rotated.size).toBeLessThanOrEqual(64_000n);
+      expect(await fs.readFile(contextPath, "utf8")).toContain("Trimmed to the latest 64000 bytes");
+      await fixture.workflow.dispose();
+      await fixture.sessions.dispose();
+      const restarted = new ForgeRuntime(fixture.runtimeDependencies);
+      expect((await restarted.recover(started.id)).tabIds).toEqual([started.tabId]);
+      await restarted.close(started.tabId!);
+      await expectMissing(path.dirname(contextPath), receipt.codexHome);
+      expect((await fs.stat(started.worktreePath!)).isDirectory()).toBe(true);
+    } finally {
+      await originalFile.close();
+    }
   }, 20_000);
 
   it("keeps the Codex trust decision pending when repository trust has not been approved", async () => {
@@ -866,7 +872,7 @@ async function processIsRunning(pid: number): Promise<boolean> {
     const state = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
     return state !== "Z" && state !== "X";
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) return false;
     throw error;
   }
 }
@@ -890,6 +896,8 @@ const reportPath = JSON.parse(prompt.split("Write only valid JSON to ")[1].split
 const contextPath = JSON.parse(prompt.split("Read the complete current task and feedback from ")[1].split(" before beginning.")[0]);
 const context = JSON.parse(fs.readFileSync(contextPath, "utf8"));
 if (process.env.FORGE_FIXTURE_LARGE_OUTPUT === "true") {
+  await new Promise(resolve => process.stdin.once("data", resolve));
+  process.stdin.pause();
   for (let entry = 0; entry < 12; entry++) {
     console.log("Fixture terminal output ".repeat(450));
     await new Promise(resolve => setTimeout(resolve, 20));
