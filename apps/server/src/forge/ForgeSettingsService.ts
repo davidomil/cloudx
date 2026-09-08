@@ -9,7 +9,7 @@ import type { ForgeSettings } from "./ForgeWorkflowService.js";
 export class ForgeSettingsService {
   constructor(
     private readonly config: ConfigService,
-    private readonly connections: Pick<ForgeConnectionService, "credential">,
+    private readonly connections: Pick<ForgeConnectionService, "credential" | "workerAuthors">,
   ) {}
 
   repository(): ForgeRepository {
@@ -39,7 +39,14 @@ export class ForgeSettingsService {
   }
 
   provider(repository: ForgeRepository, role: ForgeCredentialRole, signal?: AbortSignal): ForgeProvider {
-    return createForgeProvider(repository, this.credentials(repository), { role, signal });
+    return createForgeProvider(repository, this.credentials(repository), {
+      role,
+      signal,
+      listIdentity: () => ({
+        username: String(this.config.getPluginConfig("forge").username ?? "").trim(),
+        workerAuthors: this.connections.workerAuthors(repository),
+      }),
+    });
   }
 
   gitAccess(repository: ForgeRepository, role: ForgeCredentialRole, signal?: AbortSignal) {
@@ -85,6 +92,13 @@ export function forgeConfigFields(): ConfigFieldDescriptor[] {
       type: "string",
       defaultValue: "",
       description: "GitHub owner/repository or GitLab group/subgroup/project.",
+    },
+    {
+      key: "username",
+      label: "Your username",
+      type: "string",
+      defaultValue: "",
+      description: "Your username on the selected GitHub or GitLab host, used by Assigned to me and Created by me filters.",
     },
     {
       key: "trustedRepository",

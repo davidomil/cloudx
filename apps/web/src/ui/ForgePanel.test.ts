@@ -127,6 +127,91 @@ describe("ForgePanel", () => {
   });
 
   it.each([
+    { provider: "github" as const, kind: "issues", defaultFilter: "is:open", filter: "is:open label:bug", changesLabel: "Pull requests" },
+    { provider: "github" as const, kind: "changes", defaultFilter: "is:open", filter: "is:open label:bug", changesLabel: "Pull requests" },
+    { provider: "gitlab" as const, kind: "issues", defaultFilter: "state=opened", filter: "state=opened&labels=bug", changesLabel: "Merge requests" },
+    { provider: "gitlab" as const, kind: "changes", defaultFilter: "state=opened", filter: "state=opened&labels=bug", changesLabel: "Merge requests" }
+  ])("applies all quick filters to $provider $kind with editable native filters and pagination", async ({ provider, kind, defaultFilter, filter, changesLabel }) => {
+    const hook = `forge.${kind}.list`;
+    const testFixture = fixture({ repository: { ...repository, provider } }, (name, input) => name === hook ? { items: [kind === "issues" ? issue : change], nextPage: input.page === 1 ? 2 : undefined } : undefined);
+    const panel = await renderPanel(testFixture);
+    if (kind === "changes") await click(panel, changesLabel);
+    const input = panel.querySelector<HTMLInputElement>(".forge-filter input")!;
+    const quickFilters = panel.querySelector('[role="group"][aria-label="Quick filters"]')!;
+    const appliedQuery = () => testFixture.calls.filter(call => call.hook === hook).at(-1)!.input;
+    expect(input.value).toBe(defaultFilter);
+    expect(appliedQuery()).toEqual({ filter: defaultFilter, page: 1, perPage: 25 });
+    expect(quickFilters.querySelectorAll("button")).toHaveLength(4);
+    expect(button(quickFilters, "All open items").getAttribute("aria-pressed")).toBe("true");
+
+    for (const [label, scope] of [["Assigned to me", "assigned_to_me"], ["Created by me", "created_by_me"], ["Created by Forge workers", "created_by_workers"]]) {
+      await click(panel, "Next");
+      await fill(input, filter);
+      await click(quickFilters, label);
+      expect(input.value).toBe(filter);
+      expect(appliedQuery()).toEqual({ filter, scope, page: 1, perPage: 25 });
+      expect(quickFilters.querySelectorAll('[aria-pressed="true"]')).toHaveLength(1);
+      expect(button(quickFilters, label).getAttribute("aria-pressed")).toBe("true");
+      expect(button(quickFilters, "All open items").getAttribute("aria-pressed")).toBe("false");
+    }
+
+    const editedFilter = provider === "github" ? "is:closed label:bug" : "state=closed&labels=bug";
+    await fill(input, editedFilter);
+    await click(panel, "Next");
+    expect(appliedQuery()).toEqual({ filter, scope: "created_by_workers", page: 2, perPage: 25 });
+    await click(panel, "Previous");
+    expect(appliedQuery()).toEqual({ filter, scope: "created_by_workers", page: 1, perPage: 25 });
+    await click(panel, "Next");
+    await click(panel, "Apply filter");
+    expect(appliedQuery()).toEqual({ filter: editedFilter, scope: "created_by_workers", page: 1, perPage: 25 });
+    expect(button(quickFilters, "Created by Forge workers").getAttribute("aria-pressed")).toBe("true");
+    await click(panel, "Next");
+    expect(appliedQuery()).toEqual({ filter: editedFilter, scope: "created_by_workers", page: 2, perPage: 25 });
+
+    await click(quickFilters, "All open items");
+    expect(input.value).toBe(defaultFilter);
+    expect(appliedQuery()).toEqual({ filter: defaultFilter, page: 1, perPage: 25 });
+    expect(button(quickFilters, "All open items").getAttribute("aria-pressed")).toBe("true");
+    await fill(input, editedFilter);
+    expect(button(quickFilters, "All open items").getAttribute("aria-pressed")).toBe("true");
+    await click(panel, "Apply filter");
+    expect(appliedQuery()).toEqual({ filter: editedFilter, page: 1, perPage: 25 });
+    expect(quickFilters.querySelectorAll('[aria-pressed="true"]')).toHaveLength(0);
+  });
+
+  it.each(["response", "error"])("ignores a stale quick-filter %s after another scope is applied", async outcome => {
+    const oldList = deferred<unknown>();
+    const testFixture = fixture({}, (hook, input) => {
+      if (hook !== "forge.issues.list") return;
+      if (input.scope === "assigned_to_me") return oldList.promise;
+      if (input.scope === "created_by_me") return { items: [] };
+    });
+    const panel = await renderPanel(testFixture);
+    await click(panel, "Assigned to me");
+    await click(panel, "Created by me");
+    await act(async () => {
+      if (outcome === "response") oldList.resolve({ items: [issue] });
+      else oldList.reject(new Error("Superseded identity error."));
+    });
+    expect(panel.textContent).toContain("No issues match this filter.");
+    expect(panel.textContent).not.toContain(issue.title);
+    expect(panel.textContent).not.toContain("Superseded identity error.");
+    expect(button(panel, "Created by me").getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("shows missing personal identity as a list error and can return to all open items", async () => {
+    const testFixture = fixture({}, (hook, input) => {
+      if (hook === "forge.issues.list" && input.scope === "assigned_to_me") throw new Error("Forge username is not configured.");
+    });
+    const panel = await renderPanel(testFixture);
+    await click(panel, "Assigned to me");
+    expect(panel.querySelector('.forge-list [role="alert"]')?.textContent).toBe("Forge username is not configured.");
+    await click(panel, "All open items");
+    expect(panel.querySelector('.forge-list [role="alert"]')).toBeNull();
+    expect(panel.querySelector(".forge-list")?.textContent).toContain(issue.title);
+  });
+
+  it.each([
     { provider: "github" as const, filter: "is:open label:bug assignee:@me", label: "GitHub search qualifiers" },
     { provider: "gitlab" as const, filter: "state=opened&labels=bug&scope=assigned_to_me", label: "GitLab URL query parameters" }
   ])("passes $provider native filters and pagination to its list hook", async ({ provider, filter, label }) => {

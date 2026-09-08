@@ -10,6 +10,11 @@ import type {
   ForgeReviewSubmission,
 } from "@cloudx/shared";
 
+export interface ForgeListIdentity {
+  username?: string;
+  workerAuthors: string[];
+}
+
 export interface ForgeProvider {
   listIssues(query?: ForgeListQuery): Promise<ForgePage<ForgeIssue>>;
   listChangeRequests(

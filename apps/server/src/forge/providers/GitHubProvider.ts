@@ -15,6 +15,7 @@ import {
   ForgeProviderError,
   requireDiscussion,
   requireMergeReady,
+  type ForgeListIdentity,
   type ForgeProvider,
 } from "./ForgeProvider.js";
 import {
@@ -29,6 +30,7 @@ import {
   webUrl,
 } from "./validation.js";
 import { validateCreateRequest, validateReview } from "./reviewValidation.js";
+import { assertGitHubScopedFilter, resolveListScope } from "./listScope.js";
 
 interface GitHubReadiness {
   reviewDecision: string | null;
@@ -41,7 +43,7 @@ interface GitHubReadiness {
 export class GitHubProvider implements ForgeProvider {
   private readonly path: string;
 
-  constructor(private readonly http: ForgeHttpClient) {
+  constructor(private readonly http: ForgeHttpClient, private readonly listIdentity?: () => ForgeListIdentity) {
     this.path = `/repos/${http.repository.projectPath.split("/").map(encodeURIComponent).join("/")}`;
   }
 
@@ -310,8 +312,15 @@ export class GitHubProvider implements ForgeProvider {
         "Repository and issue/request type are fixed by this panel; remove scope qualifiers.",
       );
     }
+    const scope = resolveListScope(query.scope, "github", this.listIdentity);
+    let qualifier = "";
+    if (scope) {
+      assertGitHubScopedFilter(filter, scope.field);
+      const users = scope.users.map(user => `${scope.field}:${user}`);
+      qualifier = ` ${users.length === 1 ? users[0] : `(${users.join(" OR ")})`}`;
+    }
     const params = new URLSearchParams({
-      q: `repo:${this.http.repository.projectPath} is:${kind} (${filter})`,
+      q: `repo:${this.http.repository.projectPath} is:${kind} (${filter})${qualifier}`,
       advanced_search: "true",
       per_page: String(perPage),
       page: String(page),

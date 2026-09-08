@@ -1,10 +1,11 @@
 import { generateKeyPairSync, verify } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
-import type { ForgeRepository, ForgeReviewSubmission } from "@cloudx/shared";
+import type { ForgeListScope, ForgeRepository, ForgeReviewSubmission } from "@cloudx/shared";
 import {
   createForgeProvider,
   ForgeCredentials,
   validateRepository,
+  type ForgeListIdentity,
 } from "./index.js";
 import { ForgeHttpClient } from "./ForgeHttpClient.js";
 
@@ -96,6 +97,7 @@ function harness(
   repository: ForgeRepository,
   handler: Handler,
   role: "worker" | "reviewer" = "worker",
+  listIdentity?: () => ForgeListIdentity,
 ) {
   const calls: { url: URL; options: RequestInit }[] = [];
   const fetcher = vi.fn<typeof fetch>(async (url, options = {}) => {
@@ -109,7 +111,7 @@ function harness(
     fetcher,
   );
   return {
-    provider: createForgeProvider(repository, credentials, { fetcher, role }),
+    provider: createForgeProvider(repository, credentials, { fetcher, role, listIdentity }),
     fetcher,
     calls,
     credentials,
@@ -374,6 +376,187 @@ describe("forge listing and issue evidence", () => {
     const { provider, calls } = harness(github, () => response([]));
     await expect(provider.listIssues(query)).rejects.toThrow();
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe("Forge quick list scopes", () => {
+  const identities = (repository: ForgeRepository): ForgeListIdentity => ({
+    username: "alice",
+    workerAuthors: repository.provider === "github" ? ["app/cloudx-worker", "app/cloudx-reviewer"] : ["cloudx_worker", "cloudx_reviewer"]
+  });
+
+  it.each(["issues", "requests"])("composes GitHub identity scopes with native %s filters", async (kind) => {
+    const identity = vi.fn(() => identities(github));
+    const item = kind === "issues" ? hubIssue : { ...hubRequest, pull_request: {} };
+    const { provider, calls } = harness(github, () => response({ incomplete_results: false, items: [item] }), "worker", identity);
+    const scopes: Array<[ForgeListScope, string]> = [
+      ["assigned_to_me", "assignee:alice"],
+      ["created_by_me", "author:alice"],
+      ["created_by_workers", "(author:app/cloudx-worker OR author:app/cloudx-reviewer)"]
+    ];
+    for (const [scope, qualifier] of scopes) {
+      await (kind === "issues" ? provider.listIssues({ scope, filter: "is:open (label:bug OR label:race)" }) : provider.listChangeRequests({ scope, filter: "is:open (label:bug OR label:race)" }));
+      expect(calls.at(-1)!.url.searchParams.get("q")).toBe(`repo:owner/repo is:${kind === "issues" ? "issue" : "pr"} (is:open (label:bug OR label:race)) ${qualifier}`);
+    }
+    expect(identity).toHaveBeenCalledTimes(3);
+    expect(calls.every(call => new Headers(call.options.headers).get("Authorization") === "Bearer worker-private-token")).toBe(true);
+    expect(calls.some(call => call.url.href.includes("%40me"))).toBe(false);
+  });
+
+  it.each([github, gitlab])("resolves no identity for ordinary $provider native lists", async (repository) => {
+    const identity = vi.fn(() => { throw new Error("Identity must not be read"); });
+    const { provider } = harness(repository, () => response(repository.provider === "github" ? { incomplete_results: false, items: [] } : []), "worker", identity);
+    await provider.listIssues();
+    expect(identity).not.toHaveBeenCalled();
+  });
+
+  it.each([github, gitlab])("fails missing or malformed $provider identities before making requests", async (repository) => {
+    for (const scope of ["assigned_to_me", "created_by_me", "created_by_workers"] as const) {
+      const { provider, calls } = harness(repository, () => response([]));
+      await expect(provider.listIssues({ scope })).rejects.toThrow(scope === "created_by_workers" ? /worker.*identit/i : /username/i);
+      expect(calls).toHaveLength(0);
+    }
+    for (const identity of [{ username: "@me", workerAuthors: [] }, { username: "alice OR author:bob", workerAuthors: [] }]) {
+      const { provider, calls } = harness(repository, () => response([]), "worker", () => identity);
+      await expect(provider.listIssues({ scope: "created_by_me" })).rejects.toThrow(/username/i);
+      expect(calls).toHaveLength(0);
+    }
+    const { provider, calls } = harness(repository, () => response([]), "worker", () => ({ workerAuthors: ["app/bot OR author:alice"] }));
+    await expect(provider.listIssues({ scope: "created_by_workers" })).rejects.toThrow(/worker.*identit/i);
+    expect(calls).toHaveLength(0);
+  });
+
+  it.each([github, gitlab])("rejects invalid $provider quick scopes without resolving identity", async (repository) => {
+    const identity = vi.fn(() => identities(repository));
+    const { provider, calls } = harness(repository, () => response([]), "worker", identity);
+    await expect(provider.listIssues({ scope: "unknown" as ForgeListScope })).rejects.toThrow(/scope/i);
+    expect(identity).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
+  });
+
+  it.each([
+    ["created_by_me", "author:bob"], ["assigned_to_me", "is:open -assignee:@me"], ["created_by_workers", "(author:bob OR label:bug)"],
+    ["assigned_to_me", "is:open) OR (is:closed"], ["assigned_to_me", 'label:"unfinished']
+  ] as const)("rejects conflicting or unbalanced GitHub %s filter %s", async (scope, filter) => {
+    const { provider, calls } = harness(github, () => response({}), "worker", () => identities(github));
+    await expect(provider.listIssues({ scope, filter })).rejects.toThrow(/filter|scope/i);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("keeps quoted GitHub filter parentheses literal", async () => {
+    const { provider, calls } = harness(github, () => response({ incomplete_results: false, items: [] }), "worker", () => identities(github));
+    await provider.listIssues({ scope: "created_by_me", filter: 'label:"needs (review mentions author:bob"' });
+    expect(calls[0].url.searchParams.get("q")).toContain('(label:"needs (review mentions author:bob") author:alice');
+  });
+
+  it("preserves orthogonal GitHub author and assignee refinements", async () => {
+    const { provider, calls } = harness(github, () => response({ incomplete_results: false, items: [] }), "worker", () => identities(github));
+    await provider.listIssues({ scope: "assigned_to_me", filter: "is:open author:bob" });
+    expect(calls.at(-1)!.url.searchParams.get("q")).toContain("(is:open author:bob) assignee:alice");
+    await provider.listIssues({ scope: "created_by_me", filter: "is:open assignee:bob" });
+    expect(calls.at(-1)!.url.searchParams.get("q")).toContain("(is:open assignee:bob) author:alice");
+    await provider.listIssues({ scope: "created_by_workers", filter: "is:open assignee:bob" });
+    expect(calls.at(-1)!.url.searchParams.get("q")).toContain("(is:open assignee:bob) (author:app/");
+  });
+
+  it.each(["issues", "requests"])("uses an explicit human username for GitLab %s", async (kind) => {
+    const { provider, calls } = harness(gitlab, () => response([], { "x-next-page": "4" }), "worker", () => identities(gitlab));
+    for (const scope of ["assigned_to_me", "created_by_me"] as const) {
+      const query = { scope, filter: "state=opened&labels=bug&scope=all", page: 3, perPage: 10 };
+      expect(await (kind === "issues" ? provider.listIssues(query) : provider.listChangeRequests(query))).toEqual({ items: [], nextPage: 4 });
+      const params = calls.at(-1)!.url.searchParams;
+      expect(params.get(scope === "assigned_to_me" ? "assignee_username[]" : "author_username")).toBe("alice");
+      expect(params.get("scope")).toBe("all");
+      expect(params.get("labels")).toBe("bug");
+      expect(params.get("page")).toBe("3");
+      expect(params.get("per_page")).toBe("10");
+    }
+  });
+
+  it.each([
+    ["created_by_me", "author_id=1"], ["created_by_workers", "author_username=bob"], ["created_by_me", "not[author_username]=bob"],
+    ["assigned_to_me", "assignee_username[]=bob"], ["assigned_to_me", "assignee_id=1"], ["assigned_to_me", "scope=assigned_to_me"],
+    ["created_by_me", "scope=all&scope=created_by_me"], ["created_by_workers", "not[scope]=all"]
+  ] as const)("rejects conflicting GitLab %s filter %s", async (scope, filter) => {
+    const { provider, calls } = harness(gitlab, () => response([]), "worker", () => identities(gitlab));
+    await expect(provider.listIssues({ scope, filter })).rejects.toThrow(/filter|scope/i);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("preserves orthogonal GitLab author and assignee refinements", async () => {
+    const { provider, calls } = harness(gitlab, () => response([]), "worker", () => identities(gitlab));
+    await provider.listIssues({ scope: "assigned_to_me", filter: "state=opened&author_username=bob" });
+    expect(calls.at(-1)!.url.searchParams.get("author_username")).toBe("bob");
+    expect(calls.at(-1)!.url.searchParams.get("assignee_username[]")).toBe("alice");
+    await provider.listIssues({ scope: "created_by_me", filter: "state=opened&assignee_username[]=bob" });
+    expect(calls.at(-1)!.url.searchParams.get("author_username")).toBe("alice");
+    expect(calls.at(-1)!.url.searchParams.get("assignee_username[]")).toBe("bob");
+    await provider.listIssues({ scope: "created_by_workers", filter: "state=opened&assignee_username[]=bob" });
+    expect(calls.slice(-2).every(call => call.url.searchParams.get("assignee_username[]") === "bob")).toBe(true);
+  });
+
+  it("paginates all matching GitLab bot authors after fetching their complete native pages", async () => {
+    const { provider, calls } = harness(gitlab, (url) => {
+      const bot = url.searchParams.get("author_username")!;
+      const first = bot === "cloudx_worker" ? 1 : 106;
+      const values = Array.from({ length: 105 }, (_, index) => ({ ...labIssue, iid: first + index, author: { username: bot }, updated_at: new Date(Date.UTC(2026, 8, 1, 0, 0, first + index)).toISOString() }));
+      const page = Number(url.searchParams.get("page"));
+      return response(values.slice((page - 1) * 100, page * 100), page === 1 ? { "x-next-page": "2" } : {});
+    }, "worker", () => identities(gitlab));
+    const result = await provider.listIssues({ scope: "created_by_workers", filter: "state=opened&labels=bug&order_by=updated_at&sort=desc", page: 2, perPage: 25 });
+    expect(result.items.map(item => item.number)).toEqual(Array.from({ length: 25 }, (_, index) => 185 - index));
+    expect(result.nextPage).toBe(3);
+    expect(calls).toHaveLength(4);
+    for (const { url, options } of calls) {
+      expect(url.searchParams.getAll("page")).toHaveLength(1);
+      expect(url.searchParams.getAll("per_page")).toEqual(["100"]);
+      expect(url.searchParams.get("labels")).toBe("bug");
+      expect(url.searchParams.get("state")).toBe("opened");
+      expect(url.searchParams.get("scope")).toBe("all");
+      expect(url.searchParams.get("order_by")).toBe("updated_at");
+      expect(url.searchParams.get("sort")).toBe("desc");
+      expect(new Headers(options.headers).get("PRIVATE-TOKEN")).toBe("worker-private-token");
+    }
+    const last = await provider.listIssues({ scope: "created_by_workers", page: 9, perPage: 25 });
+    expect(last.items.map(item => item.number)).toEqual(Array.from({ length: 10 }, (_, index) => 10 - index));
+    expect(last.nextPage).toBeUndefined();
+  });
+
+  it("deduplicates GitLab bot requests and sorts timestamp ties by request number", async () => {
+    const { provider } = harness(gitlab, (url) => response(url.searchParams.get("author_username") === "cloudx_worker" ? [
+      { ...labRequest, iid: 1, updated_at: "2026-09-01T10:00:00+02:00" },
+      { ...labRequest, iid: 7, updated_at: "2026-09-01T09:00:00Z" }
+    ] : [
+      { ...labRequest, iid: 7, updated_at: "2026-09-01T10:00:00Z", title: "Newer duplicate" },
+      { ...labRequest, iid: 9, updated_at: "2026-09-01T10:00:00Z", draft: true }
+    ]), "worker", () => identities(gitlab));
+    const result = await provider.listChangeRequests({ scope: "created_by_workers", perPage: 2 });
+    expect(result.items.map(item => item.number)).toEqual([9, 7]);
+    expect(result.items[0].draft).toBe(true);
+    expect(result.items[1].title).toBe("Newer duplicate");
+    expect(result.nextPage).toBe(2);
+  });
+
+  it.each(["order_by=title", "sort=asc", "order_by[]=updated_at", "not[sort]=asc"])("rejects incompatible GitLab bot union ordering %s", async (filter) => {
+    const { provider, calls } = harness(gitlab, () => response([]), "worker", () => identities(gitlab));
+    await expect(provider.listIssues({ scope: "created_by_workers", filter })).rejects.toThrow(/order|sort/i);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("fails oversized or invalid GitLab unions instead of returning a partial page", async () => {
+    const { provider, calls } = harness(gitlab, () => response([], { "x-next-page": "next" }), "worker", () => identities(gitlab));
+    await expect(provider.listIssues({ scope: "created_by_workers" })).rejects.toThrow(/2,000 records/);
+    expect(calls.length).toBeLessThanOrEqual(40);
+    const invalid = harness(gitlab, () => response([{ ...labIssue, updated_at: "invalid" }]), "worker", () => identities(gitlab));
+    await expect(invalid.provider.listIssues({ scope: "created_by_workers" })).rejects.toThrow(/invalid/);
+  });
+
+  it.each([github, gitlab])("deduplicates $provider worker identities before requesting", async (repository) => {
+    const author = identities(repository).workerAuthors[0];
+    const { provider, calls } = harness(repository, () => response(repository.provider === "github" ? { incomplete_results: false, items: [] } : []), "worker", () => ({ workerAuthors: [author, author] }));
+    await provider.listIssues({ scope: "created_by_workers", page: 2 });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url.searchParams.get("page")).toBe("2");
   });
 });
 

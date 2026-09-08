@@ -31,6 +31,7 @@ async function fixture() {
   }));
   const config = new ConfigService(root, () => [plugin.descriptor()]);
   const connections = {
+    workerAuthors: vi.fn(() => ["app/cloudx-worker", "app/cloudx-reviewer"]),
     credential: vi.fn(
       (
         _repository: ForgeRepository,
@@ -46,6 +47,22 @@ async function fixture() {
   return { plugin, config, settings, hooks, workflow, connections };
 }
 describe("Forge plugin boundary", () => {
+  it.each(["forge.issues.list", "forge.changes.list"])("validates and dispatches quick scopes through %s", async hook => {
+    const { config, settings, connections, hooks } = await fixture();
+    await config.update({ plugins: { forge: { projectPath: "org/repo", workerTemplateId: "worker", reviewTemplateId: "review" } } });
+    connections.credential.mockImplementation(() => ({ kind: "token", token: "private" }));
+    const provider = settings.provider(settings.repository(), "worker");
+    const list = vi.spyOn(provider, hook === "forge.issues.list" ? "listIssues" : "listChangeRequests").mockResolvedValue({ items: [] });
+    vi.spyOn(settings, "provider").mockReturnValue(provider);
+    for (const scope of ["assigned_to_me", "created_by_me", "created_by_workers"]) {
+      const input = { filter: "is:open", scope, page: 2, perPage: 25 };
+      await hooks.call(hook, input, { caller: { kind: "ui" } });
+      expect(list).toHaveBeenLastCalledWith(input);
+    }
+    await expect(hooks.call(hook, { scope: "unknown" }, { caller: { kind: "ui" } })).rejects.toThrow();
+    expect(list).toHaveBeenCalledTimes(3);
+  });
+
   it("registers a creatable panel with settings for repository and template selection", async () => {
     const { plugin } = await fixture();
     expect(plugin.descriptor()).toMatchObject({

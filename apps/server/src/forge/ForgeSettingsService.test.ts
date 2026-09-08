@@ -35,6 +35,7 @@ async function fixture() {
   const config = new ConfigService(root, () => [plugin.descriptor()]);
   const credentials = new Map<ForgeCredentialRole, ForgeCredential>();
   const connections = {
+    workerAuthors: vi.fn(() => ["app/cloudx-worker", "app/cloudx-reviewer"]),
     credential: vi.fn(
       (
         _repository: ForgeRepository,
@@ -96,6 +97,34 @@ describe("Forge settings field contracts", () => {
 });
 
 describe("Forge connected application settings", () => {
+  it("uses the saved human username and registered bot authors in provider searches", async () => {
+    const { config, settings, credentials, connections } = await fixture();
+    credentials.set("worker", { kind: "token", token: "worker-private" });
+    const requests: URL[] = [];
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async input => {
+      requests.push(new URL(String(input)));
+      return Response.json({ items: [], incomplete_results: false });
+    });
+    try {
+      const provider = settings.provider(repository, "worker");
+      await provider.listIssues();
+      expect(connections.workerAuthors).not.toHaveBeenCalled();
+      await expect(provider.listIssues({ scope: "created_by_me" })).rejects.toThrow(/username/i);
+      await config.update({ plugins: { forge: { username: "alice" } } });
+      await provider.listIssues({ scope: "assigned_to_me", filter: "is:open label:bug" });
+      expect(requests.at(-1)!.searchParams.get("q")).toContain("assignee:alice");
+      expect(requests.at(-1)!.searchParams.get("q")).toContain("is:open label:bug");
+      await provider.listChangeRequests({ scope: "created_by_me" });
+      expect(requests.at(-1)!.searchParams.get("q")).toContain("author:alice");
+      await provider.listChangeRequests({ scope: "created_by_workers" });
+      expect(requests.at(-1)!.searchParams.get("q")).toContain("author:app/cloudx-worker OR author:app/cloudx-reviewer");
+      expect(connections.workerAuthors).toHaveBeenCalledWith(repository);
+      expect(requests.some(url => url.searchParams.get("q")?.includes("@me"))).toBe(false);
+    } finally {
+      fetcher.mockRestore();
+    }
+  });
+
   it("persists trust only for the explicitly approved repository and current provider settings", async () => {
     const { config, settings } = await fixture();
     expect(settings.isRepositoryTrusted(repository)).toBe(false);

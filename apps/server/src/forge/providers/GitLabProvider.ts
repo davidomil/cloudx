@@ -15,6 +15,7 @@ import {
   ForgeProviderError,
   requireDiscussion,
   requireMergeReady,
+  type ForgeListIdentity,
   type ForgeProvider,
 } from "./ForgeProvider.js";
 import {
@@ -29,6 +30,7 @@ import {
   webUrl,
 } from "./validation.js";
 import { validateCreateRequest, validateReview } from "./reviewValidation.js";
+import { resolveListScope } from "./listScope.js";
 
 const commonFilters = new Set([
   "state",
@@ -81,7 +83,7 @@ const requestFilters = new Set([
 export class GitLabProvider implements ForgeProvider {
   private readonly path: string;
 
-  constructor(private readonly http: ForgeHttpClient) {
+  constructor(private readonly http: ForgeHttpClient, private readonly listIdentity?: () => ForgeListIdentity) {
     this.path = `/projects/${encodeURIComponent(http.repository.projectPath)}`;
   }
 
@@ -419,7 +421,7 @@ export class GitLabProvider implements ForgeProvider {
     return `${this.path}/merge_requests/${issueNumber(number)}`;
   }
 
-  private async search<T>(
+  private async search<T extends ForgeIssue>(
     kind: "issues" | "merge_requests",
     query: ForgeListQuery,
     map: (value: unknown) => T,
@@ -427,7 +429,8 @@ export class GitLabProvider implements ForgeProvider {
     const { page, perPage } = pagination(query);
     const filter = query.filter?.trim() || "state=opened";
     const params = new URLSearchParams(filter);
-    for (const key of params.keys()) {
+    const scope = resolveListScope(query.scope, "gitlab", this.listIdentity);
+    for (const [key, value] of params) {
       const name = key.replace(/^not\[([a-z_]+)\]$/, "$1").replace(/\[\]$/, "");
       if (
         !commonFilters.has(name) &&
@@ -437,8 +440,15 @@ export class GitLabProvider implements ForgeProvider {
           "Use supported GitLab issue/MR filter parameters, for example state=opened&labels=bug.",
         );
       }
+      if (scope && (name === `${scope.field}_id` || name === `${scope.field}_username` || name === "scope" && (key !== "scope" || value !== "all")))
+        throw new ForgeProviderError(`Remove ${scope.field} and conflicting scope parameters from the native filter when using this quick scope.`);
+      if (scope && scope.users.length > 1 && (name === "order_by" || name === "sort") && (key !== name || value !== (name === "order_by" ? "updated_at" : "desc")))
+        throw new ForgeProviderError("Forge worker lists require order_by=updated_at and sort=desc. Remove conflicting ordering from the native filter.");
     }
     if (!params.has("scope")) params.set("scope", "all");
+    if (scope?.users.length && scope.users.length > 1)
+      return this.listWorkerAuthors(kind, params, scope.users, page, perPage, map);
+    if (scope) params.set(scope.field === "assignee" ? "assignee_username[]" : "author_username", scope.users[0]);
     params.set("page", String(page));
     params.set("per_page", String(perPage));
     const response = await this.http.request(`${this.path}/${kind}?${params}`);
@@ -446,6 +456,27 @@ export class GitLabProvider implements ForgeProvider {
       items: list(response.body).map(map),
       ...(hasNextPage(response.headers) ? { nextPage: page + 1 } : {}),
     };
+  }
+
+  private async listWorkerAuthors<T extends ForgeIssue>(kind: "issues" | "merge_requests", filter: URLSearchParams, authors: string[], page: number, perPage: number, map: (value: unknown) => T): Promise<ForgePage<T>> {
+    filter.set("order_by", "updated_at");
+    filter.set("sort", "desc");
+    const groups = await Promise.all(authors.map(author => {
+      const params = new URLSearchParams(filter);
+      params.set("author_username", author);
+      return this.http.all(`${this.path}/${kind}?${params}`);
+    }));
+    const requests = new Map<number, { item: T; updated: number }>();
+    for (const value of groups.flat()) {
+      const item = map(value);
+      const updated = Date.parse(item.updatedAt);
+      if (!Number.isFinite(updated)) return invalid();
+      const previous = requests.get(item.number);
+      if (!previous || updated > previous.updated) requests.set(item.number, { item, updated });
+    }
+    const items = [...requests.values()].sort((a, b) => b.updated - a.updated || b.item.number - a.item.number).map(({ item }) => item);
+    const offset = (page - 1) * perPage;
+    return { items: items.slice(offset, offset + perPage), ...(offset + perPage < items.length ? { nextPage: page + 1 } : {}) };
   }
 }
 

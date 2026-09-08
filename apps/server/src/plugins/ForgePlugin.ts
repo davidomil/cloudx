@@ -50,6 +50,7 @@ export class ForgePlugin implements WorkspacePlugin {
     const placement = { windowId: id, paneId: id };
     const list = {
       filter: { type: "string", maxLength: 4096 },
+      scope: { type: "string", enum: ["assigned_to_me", "created_by_me", "created_by_workers"] },
       page: { type: "integer", minimum: 1 },
       perPage: { type: "integer", minimum: 1, maximum: 100 },
     } satisfies Record<string, JsonSchemaLike>;

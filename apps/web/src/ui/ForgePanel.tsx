@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, ExternalLink, GitPullRequest, MessageSquare, Pause, Play, RefreshCw, Settings, Square, Terminal, Trash2 } from "lucide-react";
-import type { ForgeChangeRequest, ForgeComment, ForgeDashboard, ForgeIssue, ForgeIssueDetail, ForgePage, ForgePlacement, ForgeReviewComment, ForgeReviewDraft, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
+import type { ForgeChangeRequest, ForgeComment, ForgeDashboard, ForgeIssue, ForgeIssueDetail, ForgeListScope, ForgePage, ForgePlacement, ForgeReviewComment, ForgeReviewDraft, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
 import { ForgeWorkerTabs } from "./ForgeWorkerTabs.js";
@@ -128,8 +128,9 @@ function ForgeItems({ kind, provider, request, revision, workers, placement, run
   busy: boolean;
   onViewWorker?: (workerId: string) => void;
 }) {
-  const [filterText, setFilterText] = useState("");
-  const [query, setQuery] = useState({ filter: "", page: 1 });
+  const defaultFilter = provider === "github" ? "is:open" : "state=opened";
+  const [filterText, setFilterText] = useState(defaultFilter);
+  const [query, setQuery] = useState<{ filter: string; page: number; scope?: ForgeListScope }>({ filter: defaultFilter, page: 1 });
   const [page, setPage] = useState<ForgePage<ForgeIssue>>();
   const [selected, setSelected] = useState<ForgeIssue>();
   const [detail, setDetail] = useState<ForgeIssueDetail | ForgeChangeRequest>();
@@ -172,11 +173,20 @@ function ForgeItems({ kind, provider, request, revision, workers, placement, run
   const activeWorker = selectedWorkers.find((worker) => worker.status !== "completed");
   const currentDetail = detail?.number === selectedNumber ? detail : undefined;
   const item = currentDetail ?? selected;
+  const applyScope = (scope?: ForgeListScope) => {
+    if (!scope) setFilterText(defaultFilter);
+    setSelected(undefined);
+    setQuery({ filter: scope ? filterText.trim() : defaultFilter, page: 1, ...(scope ? { scope } : {}) });
+  };
 
   return <div className="forge-items">
-    <form className="forge-filter" onSubmit={(event) => { event.preventDefault(); setSelected(undefined); setQuery({ filter: filterText.trim(), page: 1 }); }}>
+    <form className="forge-filter" onSubmit={(event) => { event.preventDefault(); setSelected(undefined); setQuery({ ...query, filter: filterText.trim(), page: 1 }); }}>
+      <div className="forge-quick-filters" role="group" aria-label="Quick filters">
+        <ControlButton size="compact" pressed={!query.scope && query.filter === defaultFilter} onClick={() => applyScope()}>All open items</ControlButton>
+        {([["assigned_to_me", "Assigned to me"], ["created_by_me", "Created by me"], ["created_by_workers", "Created by Forge workers"]] as const).map(([scope, label]) => <ControlButton key={scope} size="compact" pressed={query.scope === scope} onClick={() => applyScope(scope)}>{label}</ControlButton>)}
+      </div>
       <label>Filter {kind === "issues" ? "issues" : provider === "gitlab" ? "merge requests" : "pull requests"}
-        <input value={filterText} onChange={(event) => setFilterText(event.target.value)} placeholder={provider === "github" ? "is:open label:bug assignee:@me" : "state=opened&labels=bug&scope=assigned_to_me"} />
+        <input value={filterText} onChange={(event) => setFilterText(event.target.value)} placeholder={defaultFilter} />
       </label>
       <ControlButton type="submit" size="compact">Apply filter</ControlButton>
       <small>{provider === "github" ? "GitHub search qualifiers" : "GitLab URL query parameters"}</small>

@@ -1,5 +1,6 @@
 export type ForgeKind = "github" | "gitlab";
 export type ForgeCredentialRole = "worker" | "reviewer";
+export type ForgeListScope = "assigned_to_me" | "created_by_me" | "created_by_workers";
 
 export interface ForgeRepository {
   provider: ForgeKind;
@@ -10,6 +11,7 @@ export interface ForgeRepository {
 export interface ForgeListQuery {
   /** GitHub search syntax; GitLab URL query parameters, as used in its issue/MR lists. */
   filter?: string;
+  scope?: ForgeListScope;
   page?: number;
   perPage?: number;
 }

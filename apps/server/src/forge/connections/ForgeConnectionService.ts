@@ -49,6 +49,17 @@ export class ForgeConnectionService {
     throw new Error("Forge application credentials are incomplete.");
   }
 
+  workerAuthors(repository: ForgeRepository): string[] {
+    const records = this.deps.store.read();
+    return roles.flatMap(role => {
+      const connection = records[connectionKey(repository, role)];
+      if (connection?.phase !== "connected") return [];
+      if (repository.provider === "github" && connection.app) return [`app/${connection.app.slug}`];
+      if (repository.provider === "gitlab" && connection.account) return [connection.account.username];
+      return [];
+    });
+  }
+
   beginGitHub(repository: ForgeRepository, role: ForgeCredentialRole, origin: string): Promise<{ action: ForgeConnectionAction; cookie: string }> {
     return this.exclusive(async () => {
       this.assertRepository(repository, "github");

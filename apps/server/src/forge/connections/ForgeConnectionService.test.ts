@@ -58,6 +58,7 @@ describe("GitHub application connection lifecycle", () => {
 
   it("registers and verifies independent applications without exposing issued keys", async () => {
     const f = await fixture();
+    expect(f.connections.workerAuthors(github)).toEqual([]);
     for (const role of ["worker", "reviewer"] as const) {
       const start = await f.begin(role);
       expect(start.action.method).toBe("POST");
@@ -70,6 +71,7 @@ describe("GitHub application connection lifecycle", () => {
       });
       expect(f.connections.status().roles.find(item => item.role === role)?.state).toBe("registering");
       const installUrl = await f.connections.completeGitHubManifest(start.state, role, start.cookie, [origin]);
+      expect(f.connections.workerAuthors(github)).not.toContain(`app/cloudx-${role}`);
       expect(installUrl).toBe("https://github.com/apps/cloudx-" + role + "/installations/new?state=" + start.state);
       expect(() => f.connections.credential(github, role)).toThrow("Connect");
       await f.connections.completeGitHubInstallation(start.state, role === "worker" ? "41" : "42", start.cookie, [origin]);
@@ -79,6 +81,9 @@ describe("GitHub application connection lifecycle", () => {
       await expect(f.connections.beginGitHub(github, role, origin)).rejects.toThrow("already connected");
     }
     expect(f.connections.status().roles.map(item => item.state)).toEqual(["connected", "connected"]);
+    expect(f.connections.workerAuthors(github)).toEqual(["app/cloudx-worker", "app/cloudx-reviewer"]);
+    for (const other of [gitlab, { ...github, projectPath: "team/other" }, { ...github, apiUrl: "https://github.example/api/v3" }])
+      expect(f.connections.workerAuthors(other)).toEqual([]);
     expect(JSON.stringify(f.connections.status())).not.toMatch(/private-|cookieHash|installationId/);
     expect(f.registration.githubConvert).toHaveBeenCalledTimes(2);
     expect(f.registration.githubInstallation).toHaveBeenCalledTimes(2);
@@ -180,6 +185,10 @@ describe("GitLab automatic bot provisioning", () => {
     const result = await f.connections.provisionGitLab(gitlab, "one-time-setup-secret");
     expect(order).toEqual(["worker:create", "worker:grant", "worker:token", "reviewer:create", "reviewer:grant", "reviewer:token"]);
     expect(result.roles.map(item => item.state)).toEqual(["connected", "connected"]);
+    expect(f.connections.workerAuthors(gitlab)).toEqual(["worker", "reviewer"]);
+    f.clock.now = Date.parse("2032-01-01");
+    expect(f.connections.workerAuthors(gitlab)).toEqual(["worker", "reviewer"]);
+    f.clock.now = Date.parse("2030-01-01");
     expect(f.connections.credential(gitlab, "worker")).toEqual({ kind: "token", token: "issued-worker" });
     expect(f.connections.credential(gitlab, "reviewer")).toEqual({ kind: "token", token: "issued-reviewer" });
     expect(JSON.stringify(result)).not.toMatch(/one-time-setup-secret|issued-|tokenId/);
