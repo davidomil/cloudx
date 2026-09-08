@@ -8,7 +8,7 @@ import { parse, stringify } from "smol-toml";
 import { CODEX_REASONING_EFFORTS, type TabIndicatorUpdate, type WorkspaceTab } from "@cloudx/shared";
 import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
 
-import { CLOUDX_CODEX_DEFAULT_ARGS, CODEX_TERMINAL_ACTIONS, CodexTerminalPlugin, CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES, TERMINAL_ACTIONS, TerminalShellIntegrationParser, buildCodexLaunchArgs, codexResumeInput, materializeCodexTemplate } from "./CodexTerminalPlugin.js";
+import { CLOUDX_CODEX_DEFAULT_ARGS, CODEX_CLOSE_ON_EXIT_GRACE_MS, CODEX_TERMINAL_ACTIONS, CodexTerminalPlugin, CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES, TERMINAL_ACTIONS, TerminalShellIntegrationParser, buildCodexLaunchArgs, codexResumeInput, materializeCodexTemplate } from "./CodexTerminalPlugin.js";
 import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
 import { CodexStateSources } from "./CodexStateSources.js";
 
@@ -86,6 +86,37 @@ const tab: WorkspaceTab = {
 };
 
 describe("CodexTerminalPlugin", () => {
+  it.each([0, 1])("retains an owned session after exit code %s until its owner verifies termination", async (exitCode) => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const closeTab = vi.fn();
+      const session = await plugin.createSession({
+        tab: { ...tab, ownerPluginId: "forge" }, cwd: root,
+        controls: { setTabIndicator: () => undefined, closeTab }
+      });
+      vi.spyOn(Date, "now").mockReturnValue(Date.now() + CODEX_CLOSE_ON_EXIT_GRACE_MS + 1);
+      factory.process!.exit(exitCode);
+
+      expect(closeTab).not.toHaveBeenCalled();
+      expect(session.snapshot().status).toBe(exitCode === 0 ? "completed" : "failed");
+      const terminate = vi.spyOn(factory.process!, "terminate");
+      await expect(session.handleAction("stop", {})).resolves.toEqual({ stopped: true });
+      expect(terminate).toHaveBeenCalledOnce();
+      expect(session.snapshot().status).toBe("stopped");
+      expect(closeTab).not.toHaveBeenCalled();
+    });
+  });
+
+  it("automatically closes a public Codex session after normal exit", async () => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const closeTab = vi.fn();
+      await plugin.createSession({ tab, cwd: root, controls: { setTabIndicator: () => undefined, closeTab } });
+      vi.spyOn(Date, "now").mockReturnValue(Date.now() + CODEX_CLOSE_ON_EXIT_GRACE_MS + 1);
+      factory.process!.exit(0);
+
+      expect(closeTab).toHaveBeenCalledExactlyOnceWith("Codex exited cleanly.");
+    });
+  });
+
   it("trusts only the authorized project in its overlay and reauthorizes template updates", async () => {
     await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
       const authorizeProjectTrust = vi.fn(async () => root);

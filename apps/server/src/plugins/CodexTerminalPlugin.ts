@@ -122,7 +122,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       rows: 30
     });
     return new CodexTerminalSession(input.tab, terminalProcess, input.controls, {
-      closeOnExit: true,
+      closeOnExit: !input.tab.ownerPluginId,
       closeOnExitAfterMs: CODEX_CLOSE_ON_EXIT_GRACE_MS,
       replayBytes: this.replayBytes,
       submitDelayMs: CODEX_SUBMIT_DELAY_MS,

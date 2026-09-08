@@ -98,6 +98,10 @@ const AUDIO_INPUT_KEY = "cloudx-audio-input-v1";
 const MOBILE_ACTIONS_QUERY = "(max-width: 760px), all and (hover: none) and (pointer: coarse) and (max-width: 960px) and (max-height: 520px)";
 const WORKSPACE_SOCKET_RECONNECT_BASE_MS = 500;
 const WORKSPACE_SOCKET_RECONNECT_MAX_MS = 5_000;
+function forgeRepositorySettingsKey(values: Record<string, ConfigValue> | undefined): string {
+  return JSON.stringify([values?.provider, values?.apiUrl, values?.projectPath]);
+}
+
 const AutomationPanel = lazy(() => import("./AutomationPanel.js").then((module) => ({ default: module.AutomationPanel })));
 const DocumentationPanel = lazy(() => import("./DocumentationPanel.js").then((module) => ({ default: module.DocumentationPanel })));
 const FileBrowserPanel = lazy(() => import("./FileBrowserPanel.js").then((module) => ({ default: module.FileBrowserPanel })));
@@ -175,6 +179,7 @@ export function App() {
   const initialLayout = useMemo(() => defaultLayout(), []);
   const [plugins, setPlugins] = useState<PluginDescriptor[]>([]);
   const [config, setConfig] = useState<CloudxConfigResponse | undefined>();
+  const [forgeRepositoryChange, setForgeRepositoryChange] = useState({ version: 0, pending: false });
   const [rulesSkillsStore, setRulesSkillsStore] = useState<RulesSkillsStore | undefined>();
   const [tabs, setTabs] = useState<WorkspaceTab[]>([]);
   const [windows, setWindows] = useState<WorkspaceWindow[]>([]);
@@ -993,11 +998,20 @@ export function App() {
   }
 
   async function handleSaveConfig(values: CloudxConfigValues) {
-    const nextConfig = await updateConfig(values);
-    setConfig(nextConfig);
-    setSettingsOpen(false);
-    if (nextConfig.values.global.aiControlEnabled === false || nextConfig.values.global.voiceCommandsEnabled === false || nextConfig.values.global.microphoneEnabled === false) {
-      setAudioInputMenuOpen(false);
+    const repositoryChanged = forgeRepositorySettingsKey(values.plugins.forge) !== forgeRepositorySettingsKey(config?.values.plugins.forge);
+    if (repositoryChanged) setForgeRepositoryChange(current => ({ version: current.version + 1, pending: true }));
+    try {
+      const nextConfig = await updateConfig(values);
+      setConfig(nextConfig);
+      setSettingsOpen(false);
+      setError(undefined);
+      if (nextConfig.values.global.aiControlEnabled === false || nextConfig.values.global.voiceCommandsEnabled === false || nextConfig.values.global.microphoneEnabled === false) {
+        setAudioInputMenuOpen(false);
+      }
+    } catch (error) {
+      setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (repositoryChanged) setForgeRepositoryChange(current => ({ ...current, pending: false }));
     }
   }
 
@@ -1179,7 +1193,7 @@ export function App() {
       const pane = context.tab ? findPaneContainingTab(layout.root, context.tab.id) : undefined;
       if (!context.callHook || !context.tab || !activeWindowId || !pane) return <div className="empty-pane">Forge workspace is unavailable.</div>;
       return <Suspense fallback={<div className="empty-pane">Loading Forge...</div>}>
-        <ForgePanel key={context.tab.id} callHook={context.callHook} tab={context.tab} windowId={activeWindowId} paneId={pane.id} workerTabs={tabs} active={context.active === true} uiScale={uiScale} onOpenSettings={() => setSettingsOpen(true)} />
+        <ForgePanel key={context.tab.id} callHook={context.callHook} tab={context.tab} windowId={activeWindowId} paneId={pane.id} workerTabs={tabs} active={context.active === true} uiScale={uiScale} repositorySettingsKey={`${forgeRepositoryChange.version}:${forgeRepositorySettingsKey(config?.values.plugins.forge)}`} repositoryChangePending={forgeRepositoryChange.pending} onOpenSettings={() => setSettingsOpen(true)} />
       </Suspense>;
     },
     [UI_RENDERER_STATUS_DOT]: (_contribution, context) => (context.tab ? <TabIndicatorDot tab={context.tab} attention={context.attention} /> : null),

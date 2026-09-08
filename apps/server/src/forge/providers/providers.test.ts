@@ -1290,12 +1290,93 @@ describe("GitHub merge method selection", () => {
 
 describe("GitHub permission to merge through an update-only restriction", () => {
   const update = { type: "update", ruleset_id: 1, ruleset_source: "owner/repo", ruleset_source_type: "Repository" };
-  const checks = { type: "required_status_checks", ruleset_id: 2, ruleset_source: "owner/repo", ruleset_source_type: "Repository" };
+  const checks = { type: "required_status_checks", parameters: { required_status_checks: [{ context: "ci" }] }, ruleset_id: 2, ruleset_source: "owner/repo", ruleset_source_type: "Repository" };
   const rulesets = {
     1: { id: 1, source: "owner/repo", source_type: "Repository", enforcement: "active", target: "branch", current_user_can_bypass: "pull_requests_only", rules: [{ type: "update" }] },
     2: { id: 2, source: "owner/repo", source_type: "Repository", enforcement: "active", target: "branch", current_user_can_bypass: "never", rules: [{ type: "required_status_checks" }] },
   };
   const permitted = (overrides: Parameters<typeof hubFixture>[0] = {}) => hubFixture({ graphql: { mergeStateStatus: "BLOCKED" }, rules: [update, checks], rulesets, ...overrides });
+  const absentChecks = (overrides: Parameters<typeof hubFixture>[0] = {}) => permitted({
+    graphql: { mergeStateStatus: "BLOCKED", headRef: { target: { oid: headSha, statusCheckRollup: null } } },
+    rules: [update],
+    ...overrides,
+  });
+
+  it.each([
+    { name: "no classic protection", classicRule: null },
+    { name: "classic protection with no required checks", classicRule: { requiresLinearHistory: false, requiredStatusCheckContexts: [] } },
+  ])("merges an approved request with absent checks and $name", async ({ classicRule }) => {
+    const { provider, calls } = absentChecks({ classicRule });
+    expect(await provider.getChangeRequest(7)).toMatchObject({ mergeable: true, approved: true });
+    await expect(provider.merge(7, headSha)).resolves.toMatchObject({ merged: true });
+    const writes = calls.filter(call => call.options.method === "PUT");
+    expect(writes).toHaveLength(1);
+    expect(JSON.parse(String(writes[0].options.body))).toEqual({ sha: headSha, merge_method: "squash" });
+    expect(calls.some(call => call.url.pathname.endsWith("/rulesets/1"))).toBe(true);
+    expect(calls.some(call => String(call.options.body).includes("requiredStatusCheckContexts"))).toBe(true);
+  });
+
+  it("allows absent checks when an effective status-check rule explicitly requires no contexts", async () => {
+    const emptyChecks = { ...checks, parameters: { required_status_checks: [], strict_required_status_checks_policy: true } };
+    const { provider } = absentChecks({ rules: [update, emptyChecks], rulesets: { ...rulesets, 2: { ...rulesets[2], rules: [emptyChecks] } } });
+    expect((await provider.getChangeRequest(7)).mergeable).toBe(true);
+  });
+
+  it.each([
+    { name: "effective ruleset", rules: [update, checks] },
+    { name: "classic protection", classicRule: { requiresLinearHistory: false, requiredStatusCheckContexts: ["ci"] } },
+    { name: "a ruleset read after the effective requirements changed", rules: [update, { ...checks, parameters: { required_status_checks: [] } }], rulesets: { ...rulesets, 2: { ...rulesets[2], rules: [checks] } } },
+  ])("blocks absent checks required by $name", async ({ name: _name, ...overrides }) => {
+    const { provider, calls } = absentChecks(overrides);
+    expect((await provider.getChangeRequest(7)).mergeable).toBe(false);
+    await expect(provider.merge(7, headSha)).rejects.toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it.each([undefined, null, "ci", [null]].map(requiredStatusCheckContexts => ({ requiredStatusCheckContexts })))("rejects unverified classic check requirements before merging: %j", async ({ requiredStatusCheckContexts }) => {
+    const { provider, calls } = absentChecks({ classicRule: { requiresLinearHistory: false, requiredStatusCheckContexts } });
+    const error = await provider.merge(7, headSha).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(error).toMatchObject({ statusCode: 502 });
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it.each([undefined, null, {}, { required_status_checks: null }, { required_status_checks: "ci" }, { required_status_checks: [null] }])(
+    "rejects unverified ruleset check requirements before merging: %j", async parameters => {
+      const { provider, calls } = absentChecks({ rules: [update, { ...checks, parameters }] });
+      const error = await provider.merge(7, headSha).catch(error => error);
+      expect(error).toBeInstanceOf(ForgeMergeNotStartedError);
+      expect(error).toMatchObject({ statusCode: 502 });
+      expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+    },
+  );
+
+  it("requires the exact base branch's classic check requirements under the worker identity", async () => {
+    const base = absentChecks({ request: { base: { ref: "release/v1", sha: previousSha } }, graphql: { baseRefName: "release/v1", mergeStateStatus: "BLOCKED", headRef: { target: { oid: headSha, statusCheckRollup: null } } } });
+    const { provider, calls } = harness(github, base.fetcher, "reviewer");
+    expect((await provider.getChangeRequest(7)).mergeable).toBe(true);
+    const query = calls.find(call => String(call.options.body).includes("requiredStatusCheckContexts"))!;
+    expect(JSON.parse(String(query.options.body)).variables).toEqual({ owner: "owner", name: "repo", qualifiedName: "refs/heads/release/v1" });
+    expect(new Headers(query.options.headers).get("authorization")).toBe("Bearer worker-private-token");
+  });
+
+  it("does not treat denied classic check requirements with partial null data as absent", async () => {
+    const base = absentChecks();
+    const { provider, calls } = harness(github, (url, options) => String(options.body).includes("requiredStatusCheckContexts")
+      ? response({ errors: [{ type: "FORBIDDEN" }], data: { repository: { ref: { name: "main", prefix: "refs/heads/", refUpdateRule: null } } } })
+      : base.fetcher(url, options));
+    const error = await provider.merge(7, headSha).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(error).toMatchObject({ statusCode: 502 });
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it.each(["never", "always", "exempt"])("retains update-only permission checks when no checks exist and bypass is %s", async current_user_can_bypass => {
+    const { provider, calls } = absentChecks({ rulesets: { ...rulesets, 1: { ...rulesets[1], current_user_can_bypass } } });
+    expect((await provider.getChangeRequest(7)).mergeable).toBe(false);
+    await expect(provider.merge(7, headSha)).rejects.toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
 
   it("uses the regular SHA-pinned merge when only the update restriction is bypassable", async () => {
     const { provider, calls } = permitted();
@@ -1332,18 +1413,21 @@ describe("GitHub permission to merge through an update-only restriction", () => 
     expect(calls.some(call => call.url.pathname.includes("/rulesets/"))).toBe(false);
   });
 
-  it.each(["PENDING", "EXPECTED", "FAILURE", "ERROR", null])("does not treat checks in state %s as passing", async state => {
-    const { provider, calls } = permitted({ graphql: { mergeStateStatus: "BLOCKED", headRef: { target: { oid: headSha, statusCheckRollup: state === null ? null : { state } } } } });
+  it.each(["PENDING", "EXPECTED", "FAILURE", "ERROR"])("does not treat checks in state %s as passing", async state => {
+    const { provider, calls } = absentChecks({ graphql: { mergeStateStatus: "BLOCKED", headRef: { target: { oid: headSha, statusCheckRollup: { state } } } } });
     expect((await provider.getChangeRequest(7)).mergeable).toBe(false);
     await expect(provider.merge(7, headSha)).rejects.toThrow("must be open");
     expect(calls.some(call => call.options.method === "PUT" || call.url.pathname.includes("/rulesets/"))).toBe(false);
   });
 
   it.each([
+    undefined, {}, { target: null },
     { target: { oid: headSha } },
     { target: { oid: headSha, statusCheckRollup: { state: undefined } } },
+    { target: { oid: headSha, statusCheckRollup: { state: "unknown" } } },
     { target: { oid: "invalid", statusCheckRollup: { state: "SUCCESS" } } },
     { target: { oid: previousSha, statusCheckRollup: { state: "SUCCESS" } } },
+    { target: { oid: previousSha, statusCheckRollup: null } },
   ])("does not accept missing or mismatched check evidence: %j", async headRef => {
     const { provider, calls } = permitted({ graphql: { mergeStateStatus: "BLOCKED", headRef } });
     await expect(provider.merge(7, headSha)).rejects.toBeInstanceOf(ForgeMergeNotStartedError);

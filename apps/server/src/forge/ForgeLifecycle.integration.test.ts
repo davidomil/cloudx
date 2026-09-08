@@ -55,9 +55,43 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Codex tabs", () => {
+  it("publishes an issue after the coding process exits normally before Forge reads its report", async () => {
+    const fixture = await LifecycleFixture.create();
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement);
+    const receipt = await fixture.completedAssistantTurn(started);
+    await fixture.exitAssistantNormally(receipt, fixture.factory.processes[0]!);
+
+    expect(fixture.sessions.getTab(started.tabId!)).toMatchObject({ status: "completed", ownerPluginId: "forge" });
+    await fixture.workflow.poll();
+
+    const published = await fixture.worker(started.id);
+    expect(published).toMatchObject({ status: "awaiting_review", headSha: receipt.headSha, changeNumber: 7 });
+    expect(fixture.sessions.getTab(started.tabId!).status).toBe("stopped");
+    expect(await git(fixture.origin, "rev-parse", published.branch!)).toBe(receipt.headSha);
+    const manifest = JSON.parse(await fs.readFile(path.join(fixture.dataDir, "forge-workers", "tabs", `${started.tabId}.json`), "utf8"));
+    expect(manifest.quiescent).toBe(true);
+    await expectMissing(receipt.reportPath, receipt.contextPath);
+  }, 15_000);
+
+  it("retains a normally exited reviewer until Forge verifies termination and saves its draft", async () => {
+    const fixture = await LifecycleFixture.create();
+    const headSha = await fixture.seedReview();
+    const started = await fixture.workflow.startReview(repository, 7, false, fixture.placement);
+    const receipt = await fixture.completedAssistantTurn(started);
+    await fixture.exitAssistantNormally(receipt, fixture.factory.processes[0]!);
+
+    expect(fixture.sessions.getTab(started.tabId!)).toMatchObject({ status: "completed", ownerPluginId: "forge" });
+    await fixture.workflow.poll();
+
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "completed", draft: { status: "draft", headSha } });
+    expect(fixture.sessions.listTabs()).toEqual([]);
+    await expectMissing(started.worktreePath!, receipt.codexHome, receipt.reportPath, receipt.contextPath, receipt.tabContextPath);
+    expect(fixture.factory.processes).toHaveLength(1);
+  }, 15_000);
+
   it("cleans a paused worker after log rotation and a server restart", async () => {
     const fixture = await LifecycleFixture.create({ largeOutput: true });
-    const started = await fixture.workflow.startIssue(1, fixture.placement);
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement);
     expect(started.status, started.error).toBe("running");
     const contextPath = fixture.sessions.getTab(started.tabId!).contextPath!;
     const originalFile = await fs.open(contextPath, "r");
@@ -84,7 +118,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
 
   it("keeps the Codex trust decision pending when repository trust has not been approved", async () => {
     const fixture = await LifecycleFixture.create({ trustRepository: false });
-    const started = await fixture.workflow.startIssue(1, fixture.placement);
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement);
     expect(started.status, started.error).toBe("running");
     await vi.waitFor(() => {
       expect(fixture.sessions.getSession(started.tabId!).snapshot().recentOutput).toContain("Do you trust the contents of this directory?");
@@ -96,7 +130,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
 
   it("implements an issue, reconciles a delayed publication, replies to feedback, then merges the approved result", async () => {
     const fixture = await LifecycleFixture.create();
-    const started = await fixture.workflow.startIssue(1, fixture.placement);
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement);
     const first = await fixture.completedAssistantTurn(started);
     expect(await processIsRunning(first.pid)).toBe(true);
     expect(first.templateId).toBe("fixture-worker");
@@ -186,7 +220,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
 
   it("automatically implements, reviews, addresses findings, reviews again, and merges without a final coding run", async () => {
     const fixture = await LifecycleFixture.create({ autoReview: true });
-    const started = await fixture.workflow.startIssue(1, fixture.placement, true);
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);
     const firstImplementation = await fixture.completedAssistantTurn(started);
     await fixture.workflow.poll();
 
@@ -240,7 +274,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
 
   it("merges after the first reviewer explicitly approves with no findings and never launches another coder", async () => {
     const fixture = await LifecycleFixture.create({ autoReview: true, approveFirst: true });
-    const started = await fixture.workflow.startIssue(1, fixture.placement, true);
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);
     const implementation = await fixture.completedAssistantTurn(started);
     await fixture.workflow.poll();
     const reviewer = await fixture.runningWorker("review");
@@ -273,7 +307,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
 
   it("updates an approved branch with newer target work, confirms publication, and reviews the new merge commit before merging", async () => {
     const fixture = await LifecycleFixture.create({ autoReview: true, approveFirst: true });
-    const started = await fixture.workflow.startIssue(1, fixture.placement, true);
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);
     const implementation = await fixture.completedAssistantTurn(started);
     await fixture.workflow.poll();
     const firstReview = await fixture.runningWorker("review");
@@ -352,7 +386,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
 
   it.each(["pause", "stop"] as const)("%s stops the issue and its automatic reviewer until the issue is resumed", async action => {
     const fixture = await LifecycleFixture.create({ autoReview: true });
-    const started = await fixture.workflow.startIssue(1, fixture.placement, true);
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);
     await fixture.completedAssistantTurn(started);
     await fixture.workflow.poll();
     const reviewer = await fixture.runningWorker("review");
@@ -381,7 +415,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
 
   it("keeps an interrupted automatic review paused across restart and resumes from the saved review phase", async () => {
     const fixture = await LifecycleFixture.create({ autoReview: true });
-    const started = await fixture.workflow.startIssue(1, fixture.placement, true);
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);
     await fixture.completedAssistantTurn(started);
     await fixture.workflow.poll();
     const reviewer = await fixture.runningWorker("review");
@@ -408,7 +442,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
 
   it("retains an uncertain automatic review without reposting or launching more work", async () => {
     const fixture = await LifecycleFixture.create({ autoReview: true });
-    const started = await fixture.workflow.startIssue(1, fixture.placement, true);
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);
     await fixture.completedAssistantTurn(started);
     await fixture.workflow.poll();
     const reviewer = await fixture.runningWorker("review");
@@ -492,13 +526,13 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
 
   it("removes coding and running review workers after an external merge closes their issue and deletes the branch", async () => {
     const fixture = await LifecycleFixture.create();
-    const started = await fixture.workflow.startIssue(1, fixture.placement);
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement);
     const codingReceipt = await fixture.completedAssistantTurn(started);
     await fixture.workflow.poll();
     const coding = await fixture.worker(started.id);
     expect(coding.status).toBe("awaiting_review");
 
-    const review = await fixture.workflow.startReview(7, false, fixture.placement);
+    const review = await fixture.workflow.startReview(repository, 7, false, fixture.placement);
     const reviewReceipt = await fixture.completedAssistantTurn(review);
     expect(await processIsRunning(reviewReceipt.pid)).toBe(true);
     expect(await fixture.reports.read(review.attemptId!)).toBeDefined();
@@ -532,7 +566,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
 
   it("preserves local edits and a completed report when merged cleanup fails until an explicit resume", async () => {
     const fixture = await LifecycleFixture.create();
-    const started = await fixture.workflow.startIssue(1, fixture.placement);
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement);
     await fixture.completedAssistantTurn(started);
     await fixture.workflow.poll();
     const resumed = await fixture.workflow.resume(started.id, fixture.placement);
@@ -569,7 +603,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     const reviewContent = ["A public return value", ...Array.from({ length: 20_049 }, (_, index) => `Review line ${index + 2}`)].join("\n") + "\n";
     const reviewBase = await git(fixture.origin, "rev-parse", "main");
     const reviewHead = await fixture.seedReview(reviewContent);
-    const started = await fixture.workflow.startReview(7, false, fixture.placement);
+    const started = await fixture.workflow.startReview(repository, 7, false, fixture.placement);
     const receipt = await fixture.completedAssistantTurn(started);
     expect(receipt.templateId).toBe("fixture-review");
     expect(receipt.args.slice(receipt.args.indexOf("--model"), receipt.args.indexOf("--model") + 4)).toEqual(["--model", "gpt-6-astra", "--config", 'model_reasoning_effort="max"']);
@@ -777,6 +811,14 @@ class LifecycleFixture {
     vi.spyOn(Date, "now").mockImplementation(() => wallClockNow() + elapsed);
   }
 
+  async exitAssistantNormally(receipt: AssistantReceipt, terminal: TerminalProcess): Promise<void> {
+    this.advanceTime(3_001);
+    const exited = new Promise(resolve => terminal.onExit(resolve));
+    process.kill(receipt.pid, "SIGUSR2");
+    await expect(exited).resolves.toEqual({ exitCode: 0 });
+    expect(await processIsRunning(receipt.pid)).toBe(false);
+  }
+
   async restartWorkflow(): Promise<void> {
     await this.workflow.dispose();
     await this.sessions.dispose();
@@ -788,7 +830,7 @@ class LifecycleFixture {
   }
 
   async startAwaitingPublication() {
-    const started = await this.workflow.startIssue(1, this.placement);
+    const started = await this.workflow.startIssue(repository, 1, this.placement);
     await this.completedAssistantTurn(started);
     await this.workflow.poll();
     const change = this.provider.changes.get(7)!;
@@ -1023,6 +1065,7 @@ const receipt = { pid: process.pid, trustedProjectPath, gitAuthorizationPresent:
 fs.writeFileSync(path.join(process.env.FORGE_FIXTURE_RECEIPTS, path.basename(reportPath)), JSON.stringify(receipt));
 fs.writeFileSync(reportPath + ".tmp", JSON.stringify(report));
 fs.renameSync(reportPath + ".tmp", reportPath);
+process.on("SIGUSR2", () => process.exit(0));
 console.log("FORGE_FIXTURE_REPORT_READY");
 setInterval(() => {}, 1000);
 `;

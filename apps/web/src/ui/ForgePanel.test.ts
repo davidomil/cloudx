@@ -3,7 +3,7 @@
 import { act, createElement, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ForgeChangeRequest, ForgeDashboard, ForgeIssueDetail, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
+import type { ForgeChangeRequest, ForgeDashboard, ForgeIssueDetail, ForgeRepository, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
 import { ForgePanel } from "./ForgePanel.js";
 import type { UiContributionRenderContext } from "./uiContributions.js";
 
@@ -87,7 +87,7 @@ async function renderPanel(testFixture: ReturnType<typeof fixture>, extra: Parti
   document.body.append(container);
   const root = createRoot(container);
   roots.push(root);
-  await act(async () => { root.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [], active: true, uiScale: 100, ...extra })); });
+  await act(async () => { root.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [], active: true, uiScale: 100, repositorySettingsKey: "repository:0", repositoryChangePending: false, ...extra })); });
   return container;
 }
 
@@ -116,6 +116,149 @@ function deferred<T>() {
 }
 
 describe("ForgePanel", () => {
+  it.each(["github", "gitlab"] as const)("pins every %s item read and decision to the displayed repository", async provider => {
+    const displayed = { ...repository, provider };
+    const testFixture = fixture({ repository: displayed });
+    const panel = await renderPanel(testFixture);
+    await click(panel, "Start work");
+    await click(panel, provider === "github" ? "Pull requests" : "Merge requests");
+    await click(panel, "Review");
+    await click(panel, "Review and post");
+    await click(panel, "Mark as approved");
+    await fill(panel.querySelector(".forge-review-decision textarea")!, "Please fix the timeout.");
+    await click(panel, "Mark as request changes");
+
+    const itemCalls = testFixture.calls.filter(call => call.hook !== "forge.dashboard");
+    expect(new Set(itemCalls.map(call => call.hook))).toEqual(new Set([
+      "forge.issues.list", "forge.issue.get", "forge.issue.start", "forge.changes.list", "forge.change.get", "forge.review.start", "forge.change.review",
+    ]));
+    expect(itemCalls.every(call => JSON.stringify(call.input.repository) === JSON.stringify(displayed))).toBe(true);
+  });
+
+  it.each(["github", "gitlab"] as const)("keeps stale %s item actions bound to the displayed repository until an explicit fresh decision", async provider => {
+    const displayed = { ...repository, provider };
+    let current: ForgeRepository = displayed;
+    const published: Record<string, unknown>[] = [];
+    const testFixture = fixture({ repository: displayed }, (hook, input) => {
+      if (hook === "forge.dashboard") return { configured: true, repository: current, workers: [] };
+      if (hook === "forge.issue.start" || hook === "forge.change.review") {
+        if (JSON.stringify(input.repository) !== JSON.stringify(current)) throw new Error("The Forge repository changed. Refresh before continuing.");
+        published.push(input);
+        return {};
+      }
+    });
+    const panel = await renderPanel(testFixture);
+    current = { ...displayed, projectPath: "another/repository" };
+    expect(panel.textContent).toContain(displayed.projectPath);
+    await click(panel, "Start work");
+    expect(published).toEqual([]);
+    expect(testFixture.calls.find(call => call.hook === "forge.issue.start")?.input.repository).toEqual(displayed);
+    expect(panel.textContent).toContain(current.projectPath);
+    await click(panel, provider === "github" ? "Pull requests" : "Merge requests");
+    const displayedReview = current;
+    current = { ...current, projectPath: "third/repository" };
+    await click(panel, "Mark as approved");
+    expect(published).toEqual([]);
+    expect(testFixture.calls.find(call => call.hook === "forge.change.review")?.input.repository).toEqual(displayedReview);
+    await click(panel, "Mark as approved");
+    expect(published).toEqual([{ repository: current, number: change.number, headSha: change.headSha, event: "approve", body: "" }]);
+  });
+
+  it.each(["saved", "failed"] as const)("invalidates items from save start until a fresh dashboard after a %s repository change", async outcome => {
+    const fresh = deferred<ForgeDashboard>();
+    let refreshing = false;
+    const testFixture = fixture({ workers: [worker] }, hook => hook === "forge.dashboard" && refreshing ? fresh.promise : undefined);
+    const extra = { repositorySettingsKey: "repository-a:0", repositoryChangePending: false, workerTabs: [workerTab] };
+    const panel = await renderPanel(testFixture, extra);
+    const root = roots.at(-1)!;
+    const render = async () => { await act(async () => { root.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", active: true, uiScale: 100, ...extra })); }); };
+    await click(panel, "View worker");
+    const overlay = panel.querySelector("dialog");
+    extra.repositorySettingsKey = "repository-a:1";
+    extra.repositoryChangePending = true;
+    await render();
+    expect(panel.querySelector(".forge-items")).toBeNull();
+    expect(panel.querySelector("dialog")).toBe(overlay);
+    refreshing = true;
+    extra.repositoryChangePending = false;
+    extra.repositorySettingsKey = outcome === "saved" ? "repository-b:1" : "repository-a:1";
+    await render();
+    expect(panel.querySelector(".forge-items")).toBeNull();
+    expect(panel.querySelector("dialog")).toBe(overlay);
+    const nextRepository = outcome === "saved" ? { ...repository, projectPath: "another/repository" } : repository;
+    await act(async () => { fresh.resolve({ configured: true, repository: nextRepository, workers: [worker] }); });
+    expect(panel.querySelector(".forge-items")).not.toBeNull();
+    expect(panel.textContent).toContain(nextRepository.projectPath);
+    expect(panel.querySelector("dialog")).toBe(overlay);
+    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
+  });
+
+  it("ignores a dashboard response from before a repository settings change", async () => {
+    vi.useFakeTimers();
+    const stale = deferred<ForgeDashboard>();
+    const fresh = deferred<ForgeDashboard>();
+    let reads = 0;
+    const testFixture = fixture({}, hook => hook === "forge.dashboard" && ++reads > 1 ? reads === 2 ? stale.promise : fresh.promise : undefined);
+    const extra = { repositorySettingsKey: "repository-a:0", repositoryChangePending: false };
+    const panel = await renderPanel(testFixture, extra);
+    const root = roots.at(-1)!;
+    const render = async () => { await act(async () => { root.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [], active: true, uiScale: 100, ...extra })); }); };
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    extra.repositorySettingsKey = "repository-b:1";
+    await render();
+    expect(panel.querySelector(".forge-items")).toBeNull();
+    await act(async () => { stale.resolve(testFixture.dashboard); });
+    expect(panel.querySelector(".forge-items")).toBeNull();
+    await act(async () => { fresh.resolve({ configured: true, repository: { ...repository, projectPath: "another/repository" }, workers: [] }); });
+    expect(panel.querySelector(".forge-header")?.textContent).toContain("another/repository");
+  });
+
+  it.each([
+    { ...repository, projectPath: "another/repository" },
+    { ...repository, apiUrl: "https://github.enterprise.test/api/v3" },
+    { ...repository, provider: "gitlab" as const, apiUrl: "https://gitlab.com/api/v4" },
+  ])("discards previous items and decision drafts when polling observes repository $provider $apiUrl $projectPath", async nextRepository => {
+    vi.useFakeTimers();
+    let testFixture: ReturnType<typeof fixture>;
+    testFixture = fixture({}, hook => hook === "forge.dashboard" ? structuredClone(testFixture.dashboard) : undefined);
+    const panel = await renderPanel(testFixture);
+    await click(panel, "Pull requests");
+    const previousItems = panel.querySelector(".forge-items");
+    await fill(panel.querySelector(".forge-review-decision textarea")!, "Decision for the previous repository.");
+    testFixture.dashboard.repository = nextRepository;
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    expect(panel.querySelector(".forge-items")).not.toBe(previousItems);
+    expect(panel.querySelector<HTMLTextAreaElement>(".forge-review-decision textarea")?.value).toBe("");
+    expect(testFixture.calls.filter(call => call.hook === "forge.changes.list").at(-1)?.input.repository).toEqual(nextRepository);
+    expect(testFixture.calls.filter(call => call.hook === "forge.change.get").at(-1)?.input.repository).toEqual(nextRepository);
+    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
+  });
+
+  it("keeps a pending item action on its original repository and requires a fresh action after settings change", async () => {
+    const pending = deferred<unknown>();
+    let starts = 0;
+    let testFixture: ReturnType<typeof fixture>;
+    testFixture = fixture({}, hook => hook === "forge.dashboard" ? structuredClone(testFixture.dashboard) : hook === "forge.issue.start" ? ++starts === 1 ? pending.promise : {} : undefined);
+    const extra = { repositorySettingsKey: "repository-a:0", repositoryChangePending: false };
+    const panel = await renderPanel(testFixture, extra);
+    const root = roots.at(-1)!;
+    const render = async () => { await act(async () => { root.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [], active: true, uiScale: 100, ...extra })); }); };
+    await click(panel, "Start work");
+    const nextRepository = { ...repository, projectPath: "another/repository" };
+    testFixture.dashboard.repository = nextRepository;
+    extra.repositorySettingsKey = "repository-b:1";
+    extra.repositoryChangePending = true;
+    await render();
+    extra.repositoryChangePending = false;
+    await render();
+    expect(button(panel, "Start work").disabled).toBe(true);
+    await act(async () => { pending.resolve({}); });
+    expect(testFixture.calls.filter(call => call.hook === "forge.issue.start").map(call => call.input.repository)).toEqual([repository]);
+    expect(button(panel, "Start work").disabled).toBe(false);
+    await click(panel, "Start work");
+    expect(testFixture.calls.filter(call => call.hook === "forge.issue.start").map(call => call.input.repository)).toEqual([repository, nextRepository]);
+  });
+
   it("requests configuration before loading a repository and opens settings", async () => {
     const testFixture = fixture({ configured: false, repository: undefined, configurationError: "Worker credentials are required." });
     const openSettings = vi.fn();
@@ -134,7 +277,7 @@ describe("ForgePanel", () => {
     expect(panel.querySelector('[aria-label="Open issue #7"]')?.getAttribute("href")).toBe(issue.url);
     await click(panel, "Start work");
     expect(autoReviewToggle(panel).checked).toBe(false);
-    expect(testFixture.calls).toContainEqual({ hook: "forge.issue.start", input: { number: 7, autoReview: false, windowId: "window-1", paneId: "pane-2" }, tabId: "forge-tab" });
+    expect(testFixture.calls).toContainEqual({ hook: "forge.issue.start", input: { repository, number: 7, autoReview: false, windowId: "window-1", paneId: "pane-2" }, tabId: "forge-tab" });
   });
 
   it.each(["github", "gitlab"] as const)("keeps a fresh %s issue's auto review choice beside Start work and isolated from other issues", async provider => {
@@ -155,7 +298,7 @@ describe("ForgePanel", () => {
     expect(autoReviewToggle(panel).checked).toBe(true);
     await click(panel, "Start work");
     expect(testFixture.calls.filter(call => call.hook === "forge.issue.start")).toEqual([
-      { hook: "forge.issue.start", input: { number: issue.number, autoReview: true, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id }
+      { hook: "forge.issue.start", input: { repository: testFixture.dashboard.repository, number: issue.number, autoReview: true, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id }
     ]);
     expect(panel.querySelector("dialog")).toBeNull();
   });
@@ -339,7 +482,7 @@ describe("ForgePanel", () => {
     const quickFilters = panel.querySelector('[role="group"][aria-label="Quick filters"]')!;
     const appliedQuery = () => testFixture.calls.filter(call => call.hook === hook).at(-1)!.input;
     expect(input.value).toBe(defaultFilter);
-    expect(appliedQuery()).toEqual({ filter: defaultFilter, page: 1, perPage: 25 });
+    expect(appliedQuery()).toEqual({ repository: testFixture.dashboard.repository, filter: defaultFilter, page: 1, perPage: 25 });
     expect(quickFilters.querySelectorAll("button")).toHaveLength(4);
     expect(button(quickFilters, "All open items").getAttribute("aria-pressed")).toBe("true");
 
@@ -348,7 +491,7 @@ describe("ForgePanel", () => {
       await fill(input, filter);
       await click(quickFilters, label);
       expect(input.value).toBe(filter);
-      expect(appliedQuery()).toEqual({ filter, scope, page: 1, perPage: 25 });
+      expect(appliedQuery()).toEqual({ repository: testFixture.dashboard.repository, filter, scope, page: 1, perPage: 25 });
       expect(quickFilters.querySelectorAll('[aria-pressed="true"]')).toHaveLength(1);
       expect(button(quickFilters, label).getAttribute("aria-pressed")).toBe("true");
       expect(button(quickFilters, "All open items").getAttribute("aria-pressed")).toBe("false");
@@ -357,24 +500,24 @@ describe("ForgePanel", () => {
     const editedFilter = provider === "github" ? "is:closed label:bug" : "state=closed&labels=bug";
     await fill(input, editedFilter);
     await click(panel, "Next");
-    expect(appliedQuery()).toEqual({ filter, scope: "created_by_workers", page: 2, perPage: 25 });
+    expect(appliedQuery()).toEqual({ repository: testFixture.dashboard.repository, filter, scope: "created_by_workers", page: 2, perPage: 25 });
     await click(panel, "Previous");
-    expect(appliedQuery()).toEqual({ filter, scope: "created_by_workers", page: 1, perPage: 25 });
+    expect(appliedQuery()).toEqual({ repository: testFixture.dashboard.repository, filter, scope: "created_by_workers", page: 1, perPage: 25 });
     await click(panel, "Next");
     await click(panel, "Apply filter");
-    expect(appliedQuery()).toEqual({ filter: editedFilter, scope: "created_by_workers", page: 1, perPage: 25 });
+    expect(appliedQuery()).toEqual({ repository: testFixture.dashboard.repository, filter: editedFilter, scope: "created_by_workers", page: 1, perPage: 25 });
     expect(button(quickFilters, "Created by Forge workers").getAttribute("aria-pressed")).toBe("true");
     await click(panel, "Next");
-    expect(appliedQuery()).toEqual({ filter: editedFilter, scope: "created_by_workers", page: 2, perPage: 25 });
+    expect(appliedQuery()).toEqual({ repository: testFixture.dashboard.repository, filter: editedFilter, scope: "created_by_workers", page: 2, perPage: 25 });
 
     await click(quickFilters, "All open items");
     expect(input.value).toBe(defaultFilter);
-    expect(appliedQuery()).toEqual({ filter: defaultFilter, page: 1, perPage: 25 });
+    expect(appliedQuery()).toEqual({ repository: testFixture.dashboard.repository, filter: defaultFilter, page: 1, perPage: 25 });
     expect(button(quickFilters, "All open items").getAttribute("aria-pressed")).toBe("true");
     await fill(input, editedFilter);
     expect(button(quickFilters, "All open items").getAttribute("aria-pressed")).toBe("true");
     await click(panel, "Apply filter");
-    expect(appliedQuery()).toEqual({ filter: editedFilter, page: 1, perPage: 25 });
+    expect(appliedQuery()).toEqual({ repository: testFixture.dashboard.repository, filter: editedFilter, page: 1, perPage: 25 });
     expect(quickFilters.querySelectorAll('[aria-pressed="true"]')).toHaveLength(0);
   });
 
@@ -420,7 +563,7 @@ describe("ForgePanel", () => {
     await fill(panel.querySelector(".forge-filter input")!, filter);
     await act(async () => { panel.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
     await click(panel, "Next");
-    expect(testFixture.calls).toContainEqual({ hook: "forge.issues.list", input: { filter, page: 2, perPage: 25 }, tabId: "forge-tab" });
+    expect(testFixture.calls).toContainEqual({ hook: "forge.issues.list", input: { repository: testFixture.dashboard.repository, filter, page: 2, perPage: 25 }, tabId: "forge-tab" });
     expect(button(panel, "Next").disabled).toBe(true);
     await click(panel, "Previous");
     expect(testFixture.calls.at(-2)?.input.page ?? testFixture.calls.at(-1)?.input.page).toBe(1);
@@ -465,12 +608,12 @@ describe("ForgePanel", () => {
     await fill(panel.querySelector(".forge-change-actions .forge-field textarea")!, "Please add a timeout.");
     await click(panel, "Mark as request changes");
     expect(testFixture.calls.filter((call) => call.hook === "forge.review.start").map((call) => call.input)).toEqual([
-      { number: 12, autoPost: false, windowId: "window-1", paneId: "pane-2" },
-      { number: 12, autoPost: true, windowId: "window-1", paneId: "pane-2" }
+      { repository: testFixture.dashboard.repository, number: 12, autoPost: false, windowId: "window-1", paneId: "pane-2" },
+      { repository: testFixture.dashboard.repository, number: 12, autoPost: true, windowId: "window-1", paneId: "pane-2" }
     ]);
     expect(testFixture.calls.filter((call) => call.hook === "forge.change.review").map((call) => call.input)).toEqual([
-      { number: 12, headSha: change.headSha, event: "approve", body: "" },
-      { number: 12, headSha: change.headSha, event: "request_changes", body: "Please add a timeout." }
+      { repository: testFixture.dashboard.repository, number: 12, headSha: change.headSha, event: "approve", body: "" },
+      { repository: testFixture.dashboard.repository, number: 12, headSha: change.headSha, event: "request_changes", body: "Please add a timeout." }
     ]);
   });
 
@@ -500,13 +643,13 @@ describe("ForgePanel", () => {
     await click(panel, label);
 
     expect(testFixture.calls.filter(call => call.hook === "forge.change.review")).toEqual([
-      { hook: "forge.change.review", input: { number: change.number, headSha: change.headSha, event, body }, tabId: tab.id },
+      { hook: "forge.change.review", input: { repository: testFixture.dashboard.repository, number: change.number, headSha: change.headSha, event, body }, tabId: tab.id },
     ]);
     expect(published).toEqual([]);
     expect(panel.querySelector('[role="alert"]')?.textContent).toContain("The request head changed");
     expect(panel.textContent).toContain(current.body);
     await click(panel, label);
-    expect(published).toEqual([{ number: change.number, headSha: current.headSha, event, body }]);
+    expect(published).toEqual([{ repository: testFixture.dashboard.repository, number: change.number, headSha: current.headSha, event, body }]);
   });
 
   it.each(["github", "gitlab"] as const)("keeps the %s issue worker beside review actions above a long description without losing draft edits", async provider => {
@@ -855,8 +998,8 @@ describe("ForgePanel", () => {
       await click(actions, label);
     }
     expect(testFixture.calls.filter(call => call.hook === "forge.review.start").map(call => call.input)).toEqual([
-      { number: selected.number, autoPost: false, windowId: "window-1", paneId: "pane-2" },
-      { number: selected.number, autoPost: true, windowId: "window-1", paneId: "pane-2" }
+      { repository: currentRepository, number: selected.number, autoPost: false, windowId: "window-1", paneId: "pane-2" },
+      { repository: currentRepository, number: selected.number, autoPost: true, windowId: "window-1", paneId: "pane-2" }
     ]);
     expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker."))).toHaveLength(0);
   });
@@ -1135,7 +1278,7 @@ describe("ForgePanel", () => {
     document.body.append(panel);
     const root = createRoot(panel);
     roots.push(root);
-    await act(async () => root.render(createElement(StrictMode, {}, createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab], active: true, uiScale: 100 }))));
+    await act(async () => root.render(createElement(StrictMode, {}, createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab], active: true, uiScale: 100, repositorySettingsKey: "repository:0", repositoryChangePending: false }))));
     await click(panel, "View worker");
     expect(panel.querySelector("dialog")?.open).toBe(true);
     expect(panel.querySelector('[data-terminal-tab="codex-worker"]')).not.toBeNull();
@@ -1173,10 +1316,10 @@ describe("ForgePanel", () => {
     await click(panel, "View worker");
     expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
     expect(panel.querySelector("dialog")).toBeNull();
-    await act(async () => roots.at(-1)!.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab], active: true, uiScale: 100 })));
+    await act(async () => roots.at(-1)!.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab], active: true, uiScale: 100, repositorySettingsKey: "repository:0", repositoryChangePending: false })));
     expect(panel.querySelector('[data-terminal-tab="codex-worker"]')?.getAttribute("data-active")).toBe("true");
     expect(button(panel, "Resume")).toBeDefined();
-    await act(async () => roots.at(-1)!.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab], active: false, uiScale: 100 })));
+    await act(async () => roots.at(-1)!.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab], active: false, uiScale: 100, repositorySettingsKey: "repository:0", repositoryChangePending: false })));
     expect(panel.querySelector("dialog")).toBeNull();
     expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
   });
@@ -1243,7 +1386,7 @@ describe("ForgePanel", () => {
     expect(panel.querySelector("dialog")).toBeNull();
     await click(panel.querySelector('[role="tabpanel"]:not([hidden])')!, "View worker");
     expect(panel.querySelector("dialog")?.textContent).toContain("The worker terminal is unavailable.");
-    await act(async () => roots.at(-1)!.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab, { ...secondTab, id: "resumed-terminal" }], active: true, uiScale: 100 })));
+    await act(async () => roots.at(-1)!.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab, { ...secondTab, id: "resumed-terminal" }], active: true, uiScale: 100, repositorySettingsKey: "repository:0", repositoryChangePending: false })));
     expect(panel.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Issue #8");
     expect(panel.querySelector('[data-terminal-tab="resumed-terminal"]')).not.toBeNull();
     expect(panel.querySelector('[data-terminal-tab="second-terminal"]')).toBeNull();

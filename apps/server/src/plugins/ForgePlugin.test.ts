@@ -9,6 +9,7 @@ import { HookRegistry } from "../hooks/HookRegistry.js";
 import { ConfigService } from "../configService.js";
 import { ForgeSettingsService } from "../forge/ForgeSettingsService.js";
 import type { ForgeWorkflowService } from "../forge/ForgeWorkflowService.js";
+const repository: ForgeRepository = { provider: "github", apiUrl: "https://api.github.com", projectPath: "org/repo" };
 const roots: string[] = [];
 afterEach(async () => {
   await Promise.all(
@@ -64,14 +65,14 @@ describe("Forge plugin boundary", () => {
     vi.spyOn(settings, "provider").mockReturnValue(remote);
     const body = "Decision on the displayed revision.";
 
-    await expect(hooks.call("forge.change.review", { number: 7, headSha, event, body }, { caller: { kind: "ui" } })).resolves.toEqual({ change });
+    await expect(hooks.call("forge.change.review", { repository: settings.repository(), number: 7, headSha, event, body }, { caller: { kind: "ui" } })).resolves.toEqual({ change });
 
-    expect(workflow.markReview).toHaveBeenCalledExactlyOnceWith(7, headSha, event, body);
+    expect(workflow.markReview).toHaveBeenCalledExactlyOnceWith(settings.repository(), 7, headSha, event, body);
   });
 
   it.each([undefined, null, 42, "", "a".repeat(39), "a".repeat(41), "a".repeat(63), "a".repeat(65), "g".repeat(40), `${"a".repeat(40)}\n`])("rejects a missing or invalid direct decision head before dispatch: %j", async headSha => {
     const { hooks, workflow } = await fixture();
-    const input = { number: 7, event: "approve", ...(headSha === undefined ? {} : { headSha }) };
+    const input = { repository, number: 7, event: "approve", ...(headSha === undefined ? {} : { headSha }) };
     await expect(hooks.call("forge.change.review", input, { caller: { kind: "ui" } })).rejects.toThrow(/invalid input.*headSha/);
     expect(workflow.markReview).not.toHaveBeenCalled();
   });
@@ -85,7 +86,7 @@ describe("Forge plugin boundary", () => {
     vi.spyOn(settings, "provider").mockReturnValue(provider);
     for (const scope of ["assigned_to_me", "created_by_me", "created_by_workers"]) {
       const input = { filter: "is:open", scope, page: 2, perPage: 25 };
-      await hooks.call(hook, input, { caller: { kind: "ui" } });
+      await hooks.call(hook, { ...input, repository }, { caller: { kind: "ui" } });
       expect(list).toHaveBeenLastCalledWith(input);
     }
     await expect(hooks.call(hook, { scope: "unknown" }, { caller: { kind: "ui" } })).rejects.toThrow();
@@ -120,32 +121,32 @@ describe("Forge plugin boundary", () => {
     await expect(
       hooks.call(
         "forge.issue.start",
-        { number: 1, windowId: "w", paneId: "p", repositoryPath: "/elsewhere" },
+        { repository, number: 1, windowId: "w", paneId: "p", repositoryPath: "/elsewhere" },
         { caller: { kind: "http" } },
       ),
     ).rejects.toThrow();
     await expect(
       hooks.call(
         "forge.issue.start",
-        { number: 1, windowId: "w", paneId: "p" },
+        { repository, number: 1, windowId: "w", paneId: "p" },
         { caller: { kind: "automation" } },
       ),
     ).rejects.toThrow(/exposed/);
     expect(workflow.startIssue).not.toHaveBeenCalled();
     await hooks.call(
       "forge.issue.start",
-      { number: 1, windowId: "w", paneId: "p" },
+      { repository, number: 1, windowId: "w", paneId: "p" },
       { caller: { kind: "ui" } },
     );
-    expect(workflow.startIssue).toHaveBeenCalledWith(1, {
+    expect(workflow.startIssue).toHaveBeenCalledWith(repository, 1, {
       windowId: "w",
       paneId: "p",
     }, false);
   });
   it("opts into the issue review loop only through validated explicit controls", async () => {
     const { hooks, workflow } = await fixture();
-    await hooks.call("forge.issue.start", { number: 1, windowId: "w", paneId: "p", autoReview: true }, { caller: { kind: "ui" } });
-    expect(workflow.startIssue).toHaveBeenCalledWith(1, { windowId: "w", paneId: "p" }, true);
+    await hooks.call("forge.issue.start", { repository, number: 1, windowId: "w", paneId: "p", autoReview: true }, { caller: { kind: "ui" } });
+    expect(workflow.startIssue).toHaveBeenCalledWith(repository, 1, { windowId: "w", paneId: "p" }, true);
     await hooks.call("forge.worker.autoReview", { id: "worker", enabled: false, windowId: "w", paneId: "p" }, { caller: { kind: "ui" } });
     expect(workflow.setAutoReview).toHaveBeenCalledWith("worker", false, { windowId: "w", paneId: "p" });
     await expect(hooks.call("forge.worker.autoReview", { id: "worker", enabled: "true", windowId: "w", paneId: "p" }, { caller: { kind: "ui" } })).rejects.toThrow();

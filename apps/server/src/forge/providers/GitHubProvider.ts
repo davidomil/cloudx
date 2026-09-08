@@ -42,10 +42,11 @@ interface GitHubReadiness {
   reviewDecision: string | null;
   mergeable: string;
   mergeStateStatus: string;
-  headChecksPassed: boolean;
+  headChecks: GitHubHeadChecks;
   unresolved: number;
   threads: Map<string, { discussionId: string; resolved: boolean }>;
 }
+type GitHubHeadChecks = "passed" | "absent" | "blocked";
 type GitHubSnapshot = Pick<ForgeChangeRequestStatus, "headSha" | "headBranch" | "baseBranch" | "state">;
 const githubMergeMethods = ["squash", "merge", "rebase"] as const;
 type GitHubMergeMethod = typeof githubMergeMethods[number];
@@ -122,8 +123,8 @@ export class GitHubProvider implements ForgeProvider {
       readiness.mergeStateStatus === "BLOCKED" &&
       readiness.mergeable === "MERGEABLE" &&
       status.state === "open" && !draft && approved &&
-      readiness.unresolved === 0 && readiness.headChecksPassed &&
-      await this.canMergeThroughUpdateRestriction(status.baseBranch);
+      readiness.unresolved === 0 && readiness.headChecks !== "blocked" &&
+      await this.canMergeThroughUpdateRestriction(status.baseBranch, readiness.headChecks);
     return {
       ...issue,
       ...status,
@@ -362,13 +363,18 @@ export class GitHubProvider implements ForgeProvider {
   }
 
   private async requiresClassicLinearHistory(baseBranch: string): Promise<boolean> {
+    const rule = await this.readClassicProtection(baseBranch);
+    return rule === null ? false : boolean(rule.requiresLinearHistory);
+  }
+
+  private async readClassicProtection(baseBranch: string): Promise<Record<string, unknown> | null> {
     const [owner, name] = this.http.repository.projectPath.split("/");
     const response = record((await this.http.request("/graphql", {
       method: "POST",
       role: "worker",
       graphql: true,
       body: {
-        query: "query($owner:String!,$name:String!,$qualifiedName:String!){repository(owner:$owner,name:$name){ref(qualifiedName:$qualifiedName){name prefix refUpdateRule{requiresLinearHistory}}}}",
+        query: "query($owner:String!,$name:String!,$qualifiedName:String!){repository(owner:$owner,name:$name){ref(qualifiedName:$qualifiedName){name prefix refUpdateRule{requiresLinearHistory requiredStatusCheckContexts}}}}",
         variables: { owner, name, qualifiedName: `refs/heads/${baseBranch}` },
       },
     })).body);
@@ -376,10 +382,10 @@ export class GitHubProvider implements ForgeProvider {
       throw new ForgeProviderError("GitHub could not verify the base branch protection before merging.", 502);
     const ref = record(record(record(response.data).repository).ref);
     if (ref.name !== baseBranch || ref.prefix !== "refs/heads/") return invalid();
-    return ref.refUpdateRule === null ? false : boolean(record(ref.refUpdateRule).requiresLinearHistory);
+    return ref.refUpdateRule === null ? null : record(ref.refUpdateRule);
   }
 
-  private async canMergeThroughUpdateRestriction(baseBranch: string): Promise<boolean> {
+  private async canMergeThroughUpdateRestriction(baseBranch: string, headChecks: GitHubHeadChecks): Promise<boolean> {
     const rules = await this.http.all(`${this.path}/rules/branches/${encodeURIComponent(baseBranch)}`);
     const supported = ["update", "deletion", "non_fast_forward", "required_linear_history", "pull_request", "required_status_checks"];
     const rulesets = new Map<number, { source: string; sourceType: string; types: string[] }>();
@@ -397,16 +403,23 @@ export class GitHubProvider implements ForgeProvider {
       else rulesets.set(id, { source, sourceType, types: [type] });
     }
     if (![...rulesets.values()].some(ruleset => ruleset.types.includes("update"))) return false;
+    if (headChecks === "absent" && githubHasRequiredChecks(rules)) return false;
     for (const [id, expected] of rulesets) {
       const ruleset = record((await this.http.request(`${this.path}/rulesets/${id}`, { role: "worker" })).body);
       if (integer(ruleset.id) !== id || string(ruleset.source) !== expected.source || string(ruleset.source_type) !== expected.sourceType ||
           ruleset.enforcement !== "active" || ruleset.target !== "branch") return invalid();
-      const types = list(ruleset.rules).map(value => string(record(value).type));
+      const currentRules = list(ruleset.rules);
+      const types = currentRules.map(value => string(record(value).type));
       if (types.sort().join(",") !== expected.types.sort().join(",")) return invalid();
+      if (headChecks === "absent" && githubHasRequiredChecks(currentRules)) return false;
       const permission = string(ruleset.current_user_can_bypass);
       if (types.includes("update")) {
         if (types.some(type => type !== "update") || permission !== "pull_requests_only") return false;
       } else if (permission !== "never") return false;
+    }
+    if (headChecks === "absent") {
+      const classic = await this.readClassicProtection(baseBranch);
+      if (classic !== null && list(classic.requiredStatusCheckContexts).map(string).length) return false;
     }
     return true;
   }
@@ -612,7 +625,7 @@ export class GitHubProvider implements ForgeProvider {
               : string(request.reviewDecision),
           mergeable: string(request.mergeable),
           mergeStateStatus: string(request.mergeStateStatus),
-          headChecksPassed: request.mergeStateStatus === "BLOCKED" && githubHeadChecksPassed(request.headRef, headSha),
+          headChecks: request.mergeStateStatus === "BLOCKED" ? githubHeadChecks(request.headRef, headSha) : "blocked",
         };
       const next = string(pageInfo.endCursor);
       if (!next || next === cursor) return invalid();
@@ -625,13 +638,26 @@ export class GitHubProvider implements ForgeProvider {
   }
 }
 
-function githubHeadChecksPassed(value: unknown, expectedHeadSha: string): boolean {
-  if (value === null) return false;
+function githubHeadChecks(value: unknown, expectedHeadSha: string): GitHubHeadChecks {
+  if (value === null) return "blocked";
   const commit = record(record(value).target);
   const headSha = githubHeadSha(commit.oid);
   if (headSha !== expectedHeadSha) throw new ForgeHeadChangedError([expectedHeadSha, headSha]);
-  if (commit.statusCheckRollup === null) return false;
-  return string(record(commit.statusCheckRollup).state) === "SUCCESS";
+  if (commit.statusCheckRollup === null) return "absent";
+  const state = string(record(commit.statusCheckRollup).state);
+  if (!["SUCCESS", "PENDING", "EXPECTED", "FAILURE", "ERROR"].includes(state)) return invalid();
+  return state === "SUCCESS" ? "passed" : "blocked";
+}
+
+function githubHasRequiredChecks(rules: unknown[]): boolean {
+  return rules.some(value => {
+    const rule = record(value);
+    if (rule.type !== "required_status_checks") return false;
+    const checks = list(record(rule.parameters).required_status_checks);
+    for (const check of checks)
+      if (!string(record(check).context)) return invalid();
+    return checks.length > 0;
+  });
 }
 
 function githubHeadSha(value: unknown): string {

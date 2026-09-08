@@ -190,15 +190,16 @@ export class ForgeWorkflowService {
     };
     return this.loaded ? snapshot() : this.exclusive(snapshot);
   }
-  startIssue(number: number, placement: ForgePlacement, autoReview = false): Promise<ForgeWorker> {
-    return this.exclusive(() => this.createWorker("issue", number, false, placement, autoReview));
+  startIssue(repository: ForgeRepository, number: number, placement: ForgePlacement, autoReview = false): Promise<ForgeWorker> {
+    return this.exclusive(() => this.createWorker(repository, "issue", number, false, placement, autoReview));
   }
   startReview(
+    repository: ForgeRepository,
     number: number,
     autoPost: boolean,
     placement: ForgePlacement,
   ): Promise<ForgeWorker> {
-    return this.startWorker("review", number, autoPost, placement);
+    return this.exclusive(() => this.createWorker(repository, "review", number, autoPost, placement));
   }
   setAutoReview(id: string, enabled: boolean, placement: ForgePlacement): Promise<ForgeWorker> {
     return this.exclusive(async () => {
@@ -214,22 +215,14 @@ export class ForgeWorkflowService {
       return structuredClone(worker);
     });
   }
-  private startWorker(
-    kind: ForgeWorker["kind"],
-    number: number,
-    autoPost: boolean,
-    placement: ForgePlacement,
-  ): Promise<ForgeWorker> {
-    return this.exclusive(() => this.createWorker(kind, number, autoPost, placement));
-  }
   private async createWorker(
-    kind: ForgeWorker["kind"], number: number, autoPost: boolean, placement: ForgePlacement,
+    repository: ForgeRepository, kind: ForgeWorker["kind"], number: number, autoPost: boolean, placement: ForgePlacement,
     autoReview = false, issueWorker?: ForgeWorker,
   ): Promise<ForgeWorker> {
     if (this.disposed) throw new Error("Forge Workers is shutting down.");
     const settings = this.deps.settings();
-    if (issueWorker && !sameRepository(issueWorker.repository, settings.repository))
-      throw new Error("The configured repository changed. Restore the issue worker's repository before continuing auto review.");
+    if (!sameRepository(repository, settings.repository))
+      throw new Error("The configured repository changed. Refresh Forge before acting on this item.");
     const controller = issueWorker ? this.operations.get(issueWorker.id) : new AbortController();
     if (!controller) throw new Error("The issue loop is no longer active.");
     controller.signal.throwIfAborted();
@@ -520,6 +513,7 @@ export class ForgeWorkflowService {
     });
   }
   async markReview(
+    repository: ForgeRepository,
     number: number,
     headSha: string,
     event: "approve" | "request_changes",
@@ -529,6 +523,8 @@ export class ForgeWorkflowService {
       if (typeof headSha !== "string" || ![40, 64].includes(headSha.length) || /[^a-f0-9]/i.test(headSha))
         throw new Error("A review decision requires a valid commit SHA.");
       const settings = this.deps.settings();
+      if (!sameRepository(repository, settings.repository))
+        throw new Error("The configured repository changed. Refresh Forge before acting on this item.");
       this.requireConfirmedPublication(settings.repository, number);
       const provider = this.deps.provider(settings.repository, "reviewer");
       const change = await provider.getChangeRequest(number);
@@ -700,7 +696,7 @@ export class ForgeWorkflowService {
     worker.status = "awaiting_review";
     worker.error = undefined;
     await this.persist();
-    await this.createWorker("review", worker.changeNumber!, true, loop.placement, false, worker);
+    await this.createWorker(worker.repository, "review", worker.changeNumber!, true, loop.placement, false, worker);
   }
   private async pauseAutoReview(worker: ForgeWorker, reason: string): Promise<void> {
     worker.status = "paused";

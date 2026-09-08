@@ -5,7 +5,7 @@ import {
   type JsonSchemaLike,
   type WorkspacePlugin,
 } from "@cloudx/plugin-api";
-import type { ForgePlacement, ForgeReviewSubmission } from "@cloudx/shared";
+import type { ForgePlacement, ForgeRepository, ForgeReviewSubmission } from "@cloudx/shared";
 import {
   forgeConfigFields,
   type ForgeSettingsService,
@@ -48,7 +48,18 @@ export class ForgePlugin implements WorkspacePlugin {
       maxLength: 128,
     } satisfies JsonSchemaLike;
     const placement = { windowId: id, paneId: id };
+    const repository = {
+      type: "object",
+      properties: {
+        provider: { type: "string", enum: ["github", "gitlab"] },
+        apiUrl: { type: "string", minLength: 1, maxLength: 4096 },
+        projectPath: { type: "string", minLength: 1, maxLength: 4096 },
+      },
+      required: ["provider", "apiUrl", "projectPath"],
+      additionalProperties: false,
+    } satisfies JsonSchemaLike;
     const list = {
+      repository,
       filter: { type: "string", maxLength: 4096 },
       scope: { type: "string", enum: ["assigned_to_me", "created_by_me", "created_by_workers"] },
       page: { type: "integer", minimum: 1 },
@@ -62,47 +73,48 @@ export class ForgePlugin implements WorkspacePlugin {
       hook("dashboard", "Worker dashboard", "read", {}, [], async () => ({
         ...(await this.service().workflow.dashboard()),
       })),
-      hook("issues.list", "List issues", "read", list, [], async (input) => ({
-        ...(await this.provider().listIssues(input)),
+      hook("issues.list", "List issues", "read", list, ["repository"], async ({ repository, ...query }) => ({
+        ...(await this.provider(repository as ForgeRepository).listIssues(query)),
       })),
       hook(
         "changes.list",
         "List pull or merge requests",
         "read",
         list,
-        [],
-        async (input) => ({
-          ...(await this.provider().listChangeRequests(input)),
+        ["repository"],
+        async ({ repository, ...query }) => ({
+          ...(await this.provider(repository as ForgeRepository).listChangeRequests(query)),
         }),
       ),
       hook(
         "issue.get",
         "Read issue and comments",
         "read",
-        { number },
-        ["number"],
+        { number, repository },
+        ["number", "repository"],
         async (input) => ({
-          issue: await this.provider().getIssue(Number(input.number)),
+          issue: await this.provider(input.repository as ForgeRepository).getIssue(Number(input.number)),
         }),
       ),
       hook(
         "change.get",
         "Read change and discussions",
         "read",
-        { number },
-        ["number"],
+        { number, repository },
+        ["number", "repository"],
         async (input) => ({
-          change: await this.provider().getChangeRequest(Number(input.number)),
+          change: await this.provider(input.repository as ForgeRepository).getChangeRequest(Number(input.number)),
         }),
       ),
       hook(
         "issue.start",
         "Start issue worker",
         "external",
-        { number, autoReview: { type: "boolean" }, ...placement },
-        ["number", "windowId", "paneId"],
+        { number, repository, autoReview: { type: "boolean" }, ...placement },
+        ["number", "repository", "windowId", "paneId"],
         async (input) => ({
           worker: await this.service().workflow.startIssue(
+            input.repository as ForgeRepository,
             Number(input.number),
             place(input),
             input.autoReview === true,
@@ -113,10 +125,11 @@ export class ForgePlugin implements WorkspacePlugin {
         "review.start",
         "Start review worker",
         "external",
-        { number, autoPost: { type: "boolean" }, ...placement },
-        ["number", "autoPost", "windowId", "paneId"],
+        { number, repository, autoPost: { type: "boolean" }, ...placement },
+        ["number", "repository", "autoPost", "windowId", "paneId"],
         async (input) => ({
           worker: await this.service().workflow.startReview(
+            input.repository as ForgeRepository,
             Number(input.number),
             Boolean(input.autoPost),
             place(input),
@@ -222,6 +235,7 @@ export class ForgePlugin implements WorkspacePlugin {
         "external",
         {
           number,
+          repository,
           headSha: {
             type: "string",
             anyOf: [
@@ -232,9 +246,11 @@ export class ForgePlugin implements WorkspacePlugin {
           event: { type: "string", enum: ["approve", "request_changes"] },
           body: { type: "string", maxLength: 100_000 },
         },
-        ["number", "headSha", "event"],
+        ["number", "repository", "headSha", "event"],
         async (input) => {
+          const provider = this.provider(input.repository as ForgeRepository);
           await this.service().workflow.markReview(
+            input.repository as ForgeRepository,
             Number(input.number),
             String(input.headSha),
             input.event as "approve" | "request_changes",
@@ -245,7 +261,7 @@ export class ForgePlugin implements WorkspacePlugin {
                 : "Changes requested.",
           );
           return {
-            change: await this.provider().getChangeRequest(
+            change: await provider.getChangeRequest(
               Number(input.number),
             ),
           };
@@ -276,9 +292,8 @@ export class ForgePlugin implements WorkspacePlugin {
       },
     };
   }
-  private provider() {
-    const { settings } = this.service();
-    return settings.provider(settings.settings().repository, "worker");
+  private provider(repository: ForgeRepository) {
+    return this.service().settings.provider(repository, "worker");
   }
 }
 function place(input: Record<string, unknown>): ForgePlacement {

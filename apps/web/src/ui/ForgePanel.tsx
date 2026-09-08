@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, ExternalLink, GitPullRequest, MessageSquare, Pause, Play, RefreshCw, Settings, Square, Terminal, Trash2 } from "lucide-react";
 import { hasUnconfirmedPublication } from "@cloudx/shared";
-import type { ForgeChangeRequest, ForgeComment, ForgeDashboard, ForgeIssue, ForgeIssueDetail, ForgeListScope, ForgePage, ForgePlacement, ForgeReviewComment, ForgeReviewDraft, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
+import type { ForgeChangeRequest, ForgeComment, ForgeDashboard, ForgeIssue, ForgeIssueDetail, ForgeListScope, ForgePage, ForgePlacement, ForgeRepository, ForgeReviewComment, ForgeReviewDraft, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
 import { ForgeWorkerTabs } from "./ForgeWorkerTabs.js";
@@ -14,7 +14,7 @@ type RunAction = (work: () => Promise<unknown>, interrupt?: boolean) => Promise<
 type View = "issues" | "changes" | "workers";
 type ReviewEdit = Pick<ForgeReviewDraft, "body" | "event" | "comments">;
 
-export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, workerTabs, active, uiScale }: {
+export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, workerTabs, active, uiScale, repositorySettingsKey, repositoryChangePending }: {
   callHook: CallHook;
   tab: WorkspaceTab;
   windowId: string;
@@ -23,6 +23,8 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
   workerTabs: WorkspaceTab[];
   active: boolean;
   uiScale: number;
+  repositorySettingsKey: string;
+  repositoryChangePending: boolean;
 }) {
   const bridge = useRef(callHook);
   useEffect(() => { bridge.current = callHook; }, [callHook]);
@@ -34,7 +36,9 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
   const [terminalWorkerId, setTerminalWorkerId] = useState<string>();
   const onViewWorker = (workerId: string) => { setSelectedWorkerId(workerId); setTerminalWorkerId(workerId); };
   const [revision, setRevision] = useState(0);
-  const [dashboard, setDashboard] = useState<ForgeDashboard>();
+  const [snapshot, setSnapshot] = useState<{ key: string; dashboard: ForgeDashboard }>();
+  const dashboard = snapshot?.dashboard;
+  const repositoryReady = !repositoryChangePending && snapshot?.key === repositorySettingsKey;
   const [loadError, setLoadError] = useState<string>();
   const [actionError, setActionError] = useState<string>();
   const [busy, setBusy] = useState(false);
@@ -48,6 +52,7 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
   }, []);
 
   useEffect(() => {
+    if (repositoryChangePending) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     setLoadError(undefined);
@@ -55,7 +60,7 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
       try {
         const next = await request<ForgeDashboard>("forge.dashboard");
         if (cancelled) return;
-        setDashboard(next);
+        setSnapshot({ key: repositorySettingsKey, dashboard: next });
         timer = setTimeout(() => void loadDashboard(), 5000);
       } catch (error) {
         if (!cancelled) setLoadError(errorMessage(error));
@@ -63,7 +68,7 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
     }
     void loadDashboard();
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [request, revision]);
+  }, [request, revision, repositorySettingsKey, repositoryChangePending]);
 
   const runAction: RunAction = async (work, interrupt = false) => {
     if (!interrupt && actionRunning.current) return false;
@@ -82,7 +87,7 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
   };
 
   const placement = { windowId, paneId };
-  const repository = dashboard?.repository;
+  const repository = repositoryReady ? dashboard?.repository : undefined;
   const workers = dashboard?.workers ?? [];
   const terminalWorker = workers.find(worker => worker.id === terminalWorkerId);
   const changeLabel = repository?.provider === "gitlab" ? "Merge requests" : "Pull requests";
@@ -97,8 +102,8 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
       </div>
     </header>
     {loadError || actionError ? <div role="alert" className="forge-notice">{actionError ?? loadError}</div> : null}
-    {!dashboard && !loadError ? <p role="status" className="forge-empty">Loading Forge…</p> : null}
-    {dashboard && !dashboard.configured ? <div className="forge-empty">
+    {!repositoryReady && !loadError ? <p role="status" className="forge-empty">{repositoryChangePending ? "Updating Forge repository settings…" : "Loading Forge…"}</p> : null}
+    {repositoryReady && dashboard && !dashboard.configured ? <div className="forge-empty">
       <p>{dashboard.configurationError ?? "Configure a GitHub or GitLab repository to start work."}</p>
       <p>Choose the repository and templates, then connect the issue worker and reviewer in Forge settings.</p>
       {onOpenSettings ? <ControlButton onClick={onOpenSettings}>Configure Forge</ControlButton> : null}
@@ -112,15 +117,15 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
       </nav>
       {view === "workers" ? <ForgeWorkerTabs workers={workers} selectedWorkerId={selectedWorkerId} onSelectWorker={setSelectedWorkerId}>
         {(worker) => <WorkerCard worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} />}
-      </ForgeWorkerTabs> : dashboard.configured && repository ? <ForgeItems key={`${repository.provider}:${repository.apiUrl}:${repository.projectPath}:${view}`} kind={view} provider={repository.provider} request={request} revision={revision} workers={workers.filter((worker) => worker.repository.provider === repository.provider && worker.repository.apiUrl === repository.apiUrl && worker.repository.projectPath === repository.projectPath)} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} /> : null}
+      </ForgeWorkerTabs> : dashboard.configured && repository ? <ForgeItems key={`${repository.provider}:${repository.apiUrl}:${repository.projectPath}:${view}`} kind={view} repository={repository} request={request} revision={revision} workers={workers.filter((worker) => worker.repository.provider === repository.provider && worker.repository.apiUrl === repository.apiUrl && worker.repository.projectPath === repository.projectPath)} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} /> : null}
       {active && terminalWorker ? <ForgeWorkerTerminalOverlay key={terminalWorker.id} worker={terminalWorker} workerTabs={workerTabs} uiScale={uiScale} onClose={() => setTerminalWorkerId(undefined)} /> : null}
     </> : null}
   </section>;
 }
 
-function ForgeItems({ kind, provider, request, revision, workers, placement, runAction, busy, onViewWorker }: {
+function ForgeItems({ kind, repository, request, revision, workers, placement, runAction, busy, onViewWorker }: {
   kind: "issues" | "changes";
-  provider: "github" | "gitlab";
+  repository: ForgeRepository;
   request: Request;
   revision: number;
   workers: ForgeWorker[];
@@ -129,6 +134,7 @@ function ForgeItems({ kind, provider, request, revision, workers, placement, run
   busy: boolean;
   onViewWorker?: (workerId: string) => void;
 }) {
+  const provider = repository.provider;
   const defaultFilter = provider === "github" ? "is:open" : "state=opened";
   const [filterText, setFilterText] = useState(defaultFilter);
   const [query, setQuery] = useState<{ filter: string; page: number; scope?: ForgeListScope }>({ filter: defaultFilter, page: 1 });
@@ -149,13 +155,13 @@ function ForgeItems({ kind, provider, request, revision, workers, placement, run
     setListBusy(true);
     setListError(undefined);
     setPage(undefined);
-    void request<ForgePage<ForgeIssue>>(`forge.${kind}.list`, { ...query, perPage: 25 }).then((result) => {
+    void request<ForgePage<ForgeIssue>>(`forge.${kind}.list`, { repository, ...query, perPage: 25 }).then((result) => {
       if (cancelled) return;
       setPage(result);
       setSelected((current) => result.items.find((item) => item.number === current?.number) ?? result.items[0]);
     }).catch((error) => { if (!cancelled) setListError(errorMessage(error)); }).finally(() => { if (!cancelled) setListBusy(false); });
     return () => { cancelled = true; };
-  }, [request, kind, query, revision]);
+  }, [request, kind, query, revision, provider, repository.apiUrl, repository.projectPath]);
 
   useEffect(() => {
     let cancelled = false;
@@ -164,11 +170,11 @@ function ForgeItems({ kind, provider, request, revision, workers, placement, run
     if (selectedNumber === undefined) { setDetailBusy(false); return; }
     setDetailBusy(true);
     const hook = kind === "issues" ? "forge.issue.get" : "forge.change.get";
-    void request<{ issue?: ForgeIssueDetail; change?: ForgeChangeRequest }>(hook, { number: selectedNumber }).then((result) => {
+    void request<{ issue?: ForgeIssueDetail; change?: ForgeChangeRequest }>(hook, { repository, number: selectedNumber }).then((result) => {
       if (!cancelled) setDetail(kind === "issues" ? result.issue : result.change);
     }).catch((error) => { if (!cancelled) setDetailError(errorMessage(error)); }).finally(() => { if (!cancelled) setDetailBusy(false); });
     return () => { cancelled = true; };
-  }, [request, kind, selectedNumber, revision]);
+  }, [request, kind, selectedNumber, revision, provider, repository.apiUrl, repository.projectPath]);
 
   useEffect(() => { setReviewBody(""); }, [selectedNumber]);
   const selectedWorkers = workersForItem(workers, kind, selectedNumber);
@@ -227,16 +233,16 @@ function ForgeItems({ kind, provider, request, revision, workers, placement, run
             {changeDetail ? <p className="forge-muted">{changeDetail.merged ? "Merged" : changeDetail.draft ? "Draft" : changeDetail.approved ? "Approved" : "Awaiting approval"} · {changeDetail.unresolvedDiscussions} unresolved discussions</p> : null}
             <div className="forge-change-toolbar">
               <div className="forge-actions">
-                <ControlButton size="compact" disabled={reviewDisabled || !!activeWorker} onClick={() => void runAction(() => request("forge.review.start", { number: item.number, autoPost: false, ...placement }))}>Review</ControlButton>
-                <ControlButton size="compact" disabled={reviewDisabled || !!activeWorker} onClick={() => void runAction(() => request("forge.review.start", { number: item.number, autoPost: true, ...placement }))}>Review and post</ControlButton>
+                <ControlButton size="compact" disabled={reviewDisabled || !!activeWorker} onClick={() => void runAction(() => request("forge.review.start", { repository, number: item.number, autoPost: false, ...placement }))}>Review</ControlButton>
+                <ControlButton size="compact" disabled={reviewDisabled || !!activeWorker} onClick={() => void runAction(() => request("forge.review.start", { repository, number: item.number, autoPost: true, ...placement }))}>Review and post</ControlButton>
               </div>
               {selectedWorkers.filter(worker => worker.kind === "issue").map(worker => <WorkerCard key={worker.id} worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} />)}
             </div>
             <div className="forge-review-decision">
               <label className="forge-field">Review message<textarea value={reviewBody} onChange={(event) => setReviewBody(event.target.value)} placeholder="Message for approval or requested changes" rows={2} /></label>
               <div className="forge-actions">
-                <ControlButton size="compact" disabled={reviewDisabled || !reviewBody.trim()} onClick={() => void runAction(() => request("forge.change.review", { number: item.number, headSha: changeDetail!.headSha, event: "request_changes", body: reviewBody }))}>Mark as request changes</ControlButton>
-                <ControlButton size="compact" disabled={reviewDisabled} onClick={() => void runAction(() => request("forge.change.review", { number: item.number, headSha: changeDetail!.headSha, event: "approve", body: reviewBody }))}><Check size={14} /> Mark as approved</ControlButton>
+                <ControlButton size="compact" disabled={reviewDisabled || !reviewBody.trim()} onClick={() => void runAction(() => request("forge.change.review", { repository, number: item.number, headSha: changeDetail!.headSha, event: "request_changes", body: reviewBody }))}>Mark as request changes</ControlButton>
+                <ControlButton size="compact" disabled={reviewDisabled} onClick={() => void runAction(() => request("forge.change.review", { repository, number: item.number, headSha: changeDetail!.headSha, event: "approve", body: reviewBody }))}><Check size={14} /> Mark as approved</ControlButton>
               </div>
             </div>
             <p className="forge-muted">Reviews are submitted using the configured reviewer identity. A message is required when requesting changes.</p>
@@ -247,7 +253,7 @@ function ForgeItems({ kind, provider, request, revision, workers, placement, run
           <p className="forge-prose">{item.body}</p>
           {kind === "issues" ? <>
             <div className="forge-actions">
-              <ControlButton tone="primary" size="compact" disabled={busy || !!activeWorker || item.state !== "open"} onClick={() => void runAction(() => request("forge.issue.start", { number: item.number, autoReview, ...placement }))}><Play size={14} /> Start work</ControlButton>
+              <ControlButton tone="primary" size="compact" disabled={busy || !!activeWorker || item.state !== "open"} onClick={() => void runAction(() => request("forge.issue.start", { repository, number: item.number, autoReview, ...placement }))}><Play size={14} /> Start work</ControlButton>
               <AutoReviewToggle enabled={autoReview} disabled={busy || (!activeWorker && item.state !== "open")} onChange={enabled => {
                 if (activeWorker) void runAction(() => request("forge.worker.autoReview", { id: activeWorker.id, enabled, ...placement }));
                 else setAutoReviewDrafts(drafts => ({ ...drafts, [item.number]: enabled }));

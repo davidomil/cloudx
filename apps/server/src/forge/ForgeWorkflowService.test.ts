@@ -132,7 +132,7 @@ describe("Issue merge attempts", () => {
     const f = fixture();
     const read = f.deps.store.read;
     f.deps.store.read = async () => parseWorkers(await read());
-    const worker = await f.service.startIssue(1, placement);
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Ready" });
     await f.service.poll();
     f.change.approved = true;
@@ -255,7 +255,7 @@ describe("Issue merge attempts", () => {
 describe("Forge issue and review workflows", () => {
   it("prepares both pinned review commits and supplies a local comparison for every attempt", async () => {
     const f = fixture();
-    const worker = await f.service.startReview(7, false, placement);
+    const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     const expectPinnedReview = () => {
       expect(f.runtime.prepareWorkspace).toHaveBeenLastCalledWith(expect.objectContaining({
         review: true, headSha: f.change.headSha, baseSha: f.change.baseSha,
@@ -278,7 +278,7 @@ describe("Forge issue and review workflows", () => {
 
   it.each(["issue", "review"] as const)("uses the %s model defaults and current settings on resume", async kind => {
     const f = fixture();
-    const worker = kind === "issue" ? await f.service.startIssue(1, placement) : await f.service.startReview(7, false, placement);
+    const worker = kind === "issue" ? await f.service.startIssue(f.deps.settings().repository, 1, placement) : await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     expect(f.runtime.launch).toHaveBeenLastCalledWith(expect.objectContaining({ model: "gpt-6-astra", reasoningEffort: kind === "issue" ? "xhigh" : "max" }), expect.any(AbortSignal));
     await f.service.pause(worker.id);
     const previous = f.deps.settings();
@@ -290,7 +290,7 @@ describe("Forge issue and review workflows", () => {
 
   it("publishes finished issue work, pauses for review, then merges the approved head and cleans owned resources", async () => {
     const f = fixture();
-    const worker = await f.service.startIssue(1, placement);
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     expect(worker.status).toBe("running");
     expect(f.runtime.prepareWorkspace).toHaveBeenCalledWith(
       {
@@ -328,7 +328,7 @@ describe("Forge issue and review workflows", () => {
   });
   it("reads current issue and review comments on resume without merging an unapproved request", async () => {
     const f = fixture();
-    const worker = await f.service.startIssue(1, placement);
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     f.reports.read.mockResolvedValue({
       kind: "issue",
       title: "Fix",
@@ -350,7 +350,7 @@ describe("Forge issue and review workflows", () => {
   });
   it("retains editable review drafts after immediately removing the review tab and checkout", async () => {
     const f = fixture();
-    const worker = await f.service.startReview(7, false, placement);
+    const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     f.reports.read.mockResolvedValue({
       kind: "review",
       headSha: f.change.headSha,
@@ -378,7 +378,7 @@ describe("Forge issue and review workflows", () => {
   });
   it("automatically posts only when review-and-post was selected", async () => {
     const f = fixture();
-    await f.service.startReview(7, true, placement);
+    await f.service.startReview(f.deps.settings().repository, 7, true, placement);
     f.reports.read.mockResolvedValue({
       kind: "review",
       headSha: f.change.headSha,
@@ -391,7 +391,7 @@ describe("Forge issue and review workflows", () => {
   });
   it("rejects a draft after the request head changes", async () => {
     const f = fixture();
-    const worker = await f.service.startReview(7, false, placement);
+    const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     f.reports.read.mockResolvedValue({
       kind: "review",
       headSha: f.change.headSha,
@@ -408,7 +408,7 @@ describe("Forge issue and review workflows", () => {
   });
   it("ignores a report from a paused attempt and preserves issue work until resume", async () => {
     const f = fixture();
-    const worker = await f.service.startIssue(1, placement);
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     await f.service.pause(worker.id);
     f.reports.read.mockResolvedValue({
       kind: "issue",
@@ -422,13 +422,13 @@ describe("Forge issue and review workflows", () => {
   });
   it("prevents two active workers for the same issue", async () => {
     const f = fixture();
-    await f.service.startIssue(1, placement);
-    await expect(f.service.startIssue(1, placement)).rejects.toThrow(/already/);
+    await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    await expect(f.service.startIssue(f.deps.settings().repository, 1, placement)).rejects.toThrow(/already/);
     expect(f.runtime.prepareWorkspace).toHaveBeenCalledTimes(1);
   });
   it("does not treat cleanup failure as successful completion", async () => {
     const f = fixture();
-    await f.service.startReview(7, false, placement);
+    await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     f.runtime.cleanup.mockRejectedValue(new Error("Owned checkout changed"));
     f.reports.read.mockResolvedValue({
       kind: "review",
@@ -447,7 +447,7 @@ describe("Forge issue and review workflows", () => {
 describe("Forge interruption and stale completion boundaries", () => {
   it("rejects review reports from another commit and immediately cleans the review checkout", async () => {
     const f = fixture();
-    await f.service.startReview(7, true, placement);
+    await f.service.startReview(f.deps.settings().repository, 7, true, placement);
     f.reports.read.mockResolvedValue({
       kind: "review",
       headSha: "d".repeat(40),
@@ -462,7 +462,7 @@ describe("Forge interruption and stale completion boundaries", () => {
   });
   it("rebuilds a paused review checkout at the current request head", async () => {
     const f = fixture();
-    const worker = await f.service.startReview(7, false, placement);
+    const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     await f.service.pause(worker.id);
     f.change.headSha = "e".repeat(40);
     await f.service.resume(worker.id, placement);
@@ -474,7 +474,7 @@ describe("Forge interruption and stale completion boundaries", () => {
   });
   it("leaves a failed publication visible and never retries it during polling", async () => {
     const f = fixture();
-    await f.service.startIssue(1, placement);
+    await f.service.startIssue(f.deps.settings().repository, 1, placement);
     f.provider.createChangeRequest.mockRejectedValue(
       new Error("Create request response was lost"),
     );
@@ -494,7 +494,7 @@ describe("Forge interruption and stale completion boundaries", () => {
   });
   it("retains an ambiguous review submission for reconciliation without posting again", async () => {
     const f = fixture();
-    const worker = await f.service.startReview(7, false, placement);
+    const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     f.reports.read.mockResolvedValue({
       kind: "review",
       headSha: f.change.headSha,
@@ -517,8 +517,8 @@ describe("Forge interruption and stale completion boundaries", () => {
   });
   it("reconciles restarted issue and review workers without launching another agent", async () => {
     const f = fixture();
-    await f.service.startIssue(1, placement);
-    await f.service.startReview(7, false, placement);
+    await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     f.runtime.close.mockClear();
     f.runtime.cleanup.mockClear();
     f.runtime.launch.mockClear();
@@ -538,8 +538,8 @@ describe("Forge interruption and stale completion boundaries", () => {
   });
   it("stops active agents on shutdown while retaining unmerged issue work", async () => {
     const f = fixture();
-    await f.service.startIssue(1, placement);
-    await f.service.startReview(7, false, placement);
+    await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     await f.service.dispose();
     expect(f.runtime.close).toHaveBeenCalledTimes(2);
     expect(f.runtime.cleanup).toHaveBeenCalledTimes(1);
@@ -550,7 +550,7 @@ describe("Forge interruption and stale completion boundaries", () => {
 describe("Forge review discussion resolution", () => {
   it("resolves only explicitly addressed discussion IDs after publishing the current commit", async () => {
     const f = fixture();
-    const worker = await f.service.startIssue(1, placement);
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     f.reports.read.mockResolvedValue({
       kind: "issue",
       title: "Fix",
@@ -582,7 +582,7 @@ describe("Forge review discussion resolution", () => {
 describe("Forge publication and feedback reconciliation", () => {
   it("preserves a successful push through Pause and replies on explicit Resume after the request head catches up", async () => {
     const f = fixture();
-    const worker = await f.service.startIssue(1, placement);
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Ready" });
     await f.service.poll();
     const previousHead = f.change.headSha;
@@ -619,7 +619,7 @@ describe("Forge publication and feedback reconciliation", () => {
 
   it("saves the completion report before removing the attempt files", async () => {
     const f = fixture();
-    await f.service.startIssue(1, placement);
+    await f.service.startIssue(f.deps.settings().repository, 1, placement);
     const report = { kind: "issue", title: "Fix", body: "Validated", resolvedDiscussionIds: [], discussionReplies: [] };
     f.reports.read.mockResolvedValue(report);
     f.reports.remove.mockImplementation(async () => {
@@ -632,7 +632,7 @@ describe("Forge publication and feedback reconciliation", () => {
 
   it("keeps the original report through checkpoint write failure and restart recovery", async () => {
     const f = fixture();
-    const worker = await f.service.startIssue(1, placement);
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     const report = { kind: "issue", title: "Fix", body: "Validated", resolvedDiscussionIds: [], discussionReplies: [] };
     f.reports.read.mockResolvedValue(report);
     const write = vi.spyOn(f.deps.store, "write").mockRejectedValue(new Error("Disk unavailable"));
@@ -656,7 +656,7 @@ describe("Forge publication and feedback reconciliation", () => {
 
   it("verifies the pending published head before cleaning up a merged request after resource recovery", async () => {
     const f = fixture();
-    const worker = await f.service.startIssue(1, placement);
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Validated" });
     await f.service.poll();
     await f.service.resume(worker.id, placement);
@@ -682,7 +682,7 @@ describe("Forge publication and feedback reconciliation", () => {
 
   it("retains reply progress and never repeats an unconfirmed reply", async () => {
     const f = fixture();
-    const worker = await f.service.startIssue(1, placement);
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     f.change.comments = ["thread-1", "thread-2"].map(id => ({ id, discussionId: id, body: "Review feedback", author: "reviewer", resolved: false }));
     f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Validated", resolvedDiscussionIds: ["thread-1", "thread-2"], discussionReplies: [{ discussionId: "thread-1", body: "First fix tested." }, { discussionId: "thread-2", body: "Second fix tested." }] });
     f.provider.replyToDiscussion.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("Reply response lost"));
@@ -699,7 +699,7 @@ describe("Forge publication and feedback reconciliation", () => {
 
   it("finishes partial thread resolution without reposting replies or resolving a closed thread", async () => {
     const f = fixture();
-    const worker = await f.service.startIssue(1, placement);
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     f.change.comments = ["thread-1", "thread-2"].map(id => ({ id, discussionId: id, body: "Review feedback", author: "reviewer", resolved: false }));
     f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Validated", resolvedDiscussionIds: ["thread-1", "thread-2"], discussionReplies: [{ discussionId: "thread-1", body: "First fix tested." }, { discussionId: "thread-2", body: "Second fix tested." }] });
     f.provider.resolveDiscussion.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("Resolution response lost"));
@@ -718,7 +718,7 @@ describe("Forge publication and feedback reconciliation", () => {
 
   it("posts a worker reply without resolving a discussion left open in its report", async () => {
     const f = fixture();
-    await f.service.startIssue(1, placement);
+    await f.service.startIssue(f.deps.settings().repository, 1, placement);
     f.change.comments = [{ id: "comment", discussionId: "thread", body: "Which behavior?", author: "reviewer", resolved: false }];
     f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Validated", discussionReplies: [{ discussionId: "thread", body: "Please confirm the expected empty-input behavior." }] });
     await f.service.poll();
@@ -729,7 +729,7 @@ describe("Forge publication and feedback reconciliation", () => {
 
   it.each(["head", "branch", "checkout"])("blocks feedback actions when the published %s no longer matches", async mismatch => {
     const f = fixture();
-    await f.service.startIssue(1, placement);
+    await f.service.startIssue(f.deps.settings().repository, 1, placement);
     f.change.comments = [{ id: "comment", discussionId: "thread", body: "Fix this", author: "reviewer", resolved: false }];
     f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Validated", resolvedDiscussionIds: ["thread"], discussionReplies: [{ discussionId: "thread", body: "Fixed." }] });
     if (mismatch === "head") f.runtime.publishBranch.mockResolvedValue("b".repeat(40));
@@ -744,7 +744,7 @@ describe("Forge publication and feedback reconciliation", () => {
 
   it("attaches an existing request after a lost create response without creating another", async () => {
     const f = fixture();
-    const worker = await f.service.startIssue(1, placement);
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     f.provider.createChangeRequest.mockRejectedValue(
       new Error("Response lost"),
     );
@@ -762,7 +762,7 @@ describe("Forge publication and feedback reconciliation", () => {
   });
   it("does not repeat an uncertain create request when branch reconciliation finds nothing", async () => {
     const f = fixture();
-    const worker = await f.service.startIssue(1, placement);
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     f.provider.createChangeRequest.mockRejectedValue(
       new Error("Response lost"),
     );
@@ -780,7 +780,7 @@ describe("Forge publication and feedback reconciliation", () => {
   });
   it("has Codex assess fresh general comments even when the request is approved", async () => {
     const f = fixture();
-    const worker = await f.service.startIssue(1, placement);
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     f.reports.read.mockResolvedValue({
       kind: "issue",
       title: "Fix",
@@ -804,7 +804,7 @@ describe("Forge publication and feedback reconciliation", () => {
   });
   it("pauses again when new feedback arrives while the agent is working", async () => {
     const f = fixture();
-    const worker = await f.service.startIssue(1, placement);
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     f.reports.read.mockResolvedValue({
       kind: "issue",
       title: "Fix",
@@ -828,7 +828,7 @@ describe("Forge publication and feedback reconciliation", () => {
   });
   it("preserves review-and-post intent after explicit cleanup recovery", async () => {
     const f = fixture();
-    const worker = await f.service.startReview(7, true, placement);
+    const worker = await f.service.startReview(f.deps.settings().repository, 7, true, placement);
     f.runtime.cleanup.mockRejectedValue(new Error("Cleanup unavailable"));
     f.reports.read.mockResolvedValue({
       kind: "review",
@@ -845,7 +845,7 @@ describe("Forge publication and feedback reconciliation", () => {
   it("reviews a release request against its real target branch", async () => {
     const f = fixture();
     f.change.baseBranch = "release/2";
-    await f.service.startReview(7, false, placement);
+    await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     expect(f.runtime.launch).toHaveBeenCalledWith(
       expect.objectContaining({
         prompt: expect.stringContaining("Target branch: release/2"),
@@ -871,7 +871,7 @@ describe("Forge worker controls during startup", () => {
           ready();
         })) as never,
     );
-    const starting = f.service.startIssue(1, placement);
+    const starting = f.service.startIssue(f.deps.settings().repository, 1, placement);
     await preparing;
     const dashboard = await f.service.dashboard();
     expect(dashboard.workers[0]?.status).toBe("starting");
@@ -885,7 +885,7 @@ describe("Forge worker controls during startup", () => {
 describe("Forge ownership recovery", () => {
   it.each([false, true])("resumes preserved issue work after ownership recovery succeeds (published request: %s)", async (published) => {
     const f = fixture();
-    const worker = await f.service.startIssue(1, placement);
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     if (published) {
       f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Ready" });
       await f.service.poll();
@@ -925,7 +925,7 @@ describe("Forge ownership recovery", () => {
 
   it.each([false, true])("finishes recovered review cleanup without relaunching (automatic posting: %s)", async (autoPost) => {
     const f = fixture();
-    const worker = await f.service.startReview(7, autoPost, placement);
+    const worker = await f.service.startReview(f.deps.settings().repository, 7, autoPost, placement);
     f.runtime.cleanup.mockRejectedValue(new Error("Owned checkout changed"));
     f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "comment", body: "Review", comments: [] });
     await f.service.poll();
@@ -957,7 +957,7 @@ describe("Forge ownership recovery", () => {
         : undefined,
       tabIds: [],
     }));
-    const worker = await f.service.startIssue(1, placement);
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     expect(worker.worktreePath).toBe("/repo/orphan");
     await f.service.resume(worker.id, placement);
     expect(f.runtime.prepareWorkspace).toHaveBeenCalledTimes(1);
@@ -968,7 +968,7 @@ describe("Forge ownership recovery", () => {
   });
   it("does not report merged cleanup as completed when newer local work would be removed", async () => {
     const f = fixture();
-    const worker = await f.service.startIssue(1, placement);
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     f.reports.read.mockResolvedValue({
       kind: "issue",
       title: "Fix",
@@ -1000,7 +1000,7 @@ describe("Forge ownership recovery", () => {
 
 describe("Forge merged request cleanup", () => {
   async function publishedIssue(f: ReturnType<typeof fixture>) {
-    const worker = await f.service.startIssue(1, placement);
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Ready" });
     await f.service.poll();
     f.reports.read.mockReset();
@@ -1022,10 +1022,10 @@ describe("Forge merged request cleanup", () => {
   it("removes associated coding, draft and running review workers before reading their reports", async () => {
     const f = fixture();
     const coding = await publishedIssue(f);
-    const draft = await f.service.startReview(7, false, placement);
+    const draft = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, body: "Review", event: "comment", comments: [] });
     await f.service.poll();
-    const reviewing = await f.service.startReview(7, true, placement);
+    const reviewing = await f.service.startReview(f.deps.settings().repository, 7, true, placement);
     f.reports.read.mockClear();
     mergeAndClose(f);
     await nextCompletionCheck(f);
@@ -1057,7 +1057,7 @@ describe("Forge merged request cleanup", () => {
 
   it.each(["open", "unknown"] as const)("retains resources when a linked issue has %s state", async state => {
     const f = fixture();
-    const worker = await f.service.startReview(7, true, placement);
+    const worker = await f.service.startReview(f.deps.settings().repository, 7, true, placement);
     mergeAndClose(f);
     f.change.linkedIssues = [{ id: "other:2", number: 2, title: "Related issue", state }];
     await f.service.poll();
@@ -1069,7 +1069,7 @@ describe("Forge merged request cleanup", () => {
 
   it("retires a merged review request with no linked issues", async () => {
     const f = fixture();
-    await f.service.startReview(7, false, placement);
+    await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     f.change.merged = true;
     await f.service.poll();
     expect((await f.service.dashboard()).workers).toEqual([]);
@@ -1089,9 +1089,9 @@ describe("Forge merged request cleanup", () => {
   it.each(["provider", "apiUrl", "projectPath"] as const)("keeps requests with the same number but another repository %s independent", async key => {
     const f = fixture();
     const original = f.deps.settings();
-    const first = await f.service.startReview(7, false, placement);
+    const first = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     f.deps.settings = () => ({ ...original, repository: { ...original.repository, [key]: key === "provider" ? "gitlab" : "other" } });
-    const second = await f.service.startReview(7, false, placement);
+    const second = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     const otherProvider = { ...f.provider, getChangeRequestStatus: vi.fn(async () => ({ ...f.change, merged: false })) };
     f.deps.provider = repository => (repository[key] === original.repository[key] ? f.provider : otherProvider) as unknown as ReturnType<ForgeWorkflowDependencies["provider"]>;
     mergeAndClose(f);
@@ -1125,7 +1125,7 @@ describe("Forge merged request cleanup", () => {
   it("cleans other associated runners when one checkout cannot be removed", async () => {
     const f = fixture();
     const coding = await publishedIssue(f);
-    const review = await f.service.startReview(7, true, placement);
+    const review = await f.service.startReview(f.deps.settings().repository, 7, true, placement);
     f.runtime.cleanup.mockRejectedValueOnce(new Error("Coding checkout changed"));
     mergeAndClose(f);
     await nextCompletionCheck(f);
@@ -1153,7 +1153,7 @@ describe("Forge merged request cleanup", () => {
 
   it("keeps running work intact when completion status cannot be read", async () => {
     const f = fixture();
-    await f.service.startReview(7, false, placement);
+    await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     f.provider.getChangeRequestStatus.mockRejectedValue(new Error("Provider unavailable"));
     await f.service.poll();
     expect((await f.service.dashboard()).workers[0]?.status).toBe("running");
@@ -1195,7 +1195,7 @@ describe("Forge merged request cleanup", () => {
 
   it.each(["merged", "closed"] as const)("does not restart a reviewer when the request becomes %s during Resume", async state => {
     const f = fixture();
-    const worker = await f.service.startReview(7, false, placement);
+    const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     await f.service.pause(worker.id);
     f.provider.getChangeRequest.mockImplementation(async () => ({ ...f.change, state, merged: state === "merged" }));
     const result = await f.service.resume(worker.id, placement);
@@ -1209,7 +1209,7 @@ describe("Forge merged request cleanup", () => {
 
   it("requires explicit recovery when stopping a merged runner fails while an issue remains open", async () => {
     const f = fixture();
-    const worker = await f.service.startReview(7, true, placement);
+    const worker = await f.service.startReview(f.deps.settings().repository, 7, true, placement);
     f.change.merged = true;
     f.change.linkedIssues = [{ id: "open-issue", title: "Not closed", state: "open" }];
     f.runtime.close.mockRejectedValue(new Error("Worker tab ownership changed"));
@@ -1234,7 +1234,7 @@ describe("Forge merged request cleanup", () => {
 
   it("throttles background provider reads independently of report polling", async () => {
     const f = fixture();
-    await f.service.startReview(7, false, placement);
+    await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     await f.service.poll();
     await f.service.poll();
     expect(f.provider.getChangeRequestStatus).toHaveBeenCalledOnce();
@@ -1265,13 +1265,13 @@ describe("Forge merged request cleanup", () => {
 
   it.each(["merged", "closed"] as const)("rejects manual and saved reviews on a %s request", async state => {
     const f = fixture();
-    const worker = await f.service.startReview(7, false, placement);
+    const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, body: "Review", event: "comment", comments: [] });
     await f.service.poll();
     f.change.state = state;
     f.change.merged = state === "merged";
     await expect(f.service.submitReview(worker.id)).rejects.toThrow("Only open change requests");
-    await expect(f.service.markReview(7, f.change.headSha, "approve", "Reviewed")).rejects.toThrow("Only open change requests");
+    await expect(f.service.markReview(f.deps.settings().repository, 7, f.change.headSha, "approve", "Reviewed")).rejects.toThrow("Only open change requests");
     expect(f.provider.postReview).not.toHaveBeenCalled();
   });
 
@@ -1285,10 +1285,10 @@ describe.each(["github", "gitlab"] as const)("Forge %s direct review decisions",
     const displayedHead = f.change.headSha;
     f.change.headSha = "c".repeat(40);
 
-    await expect(f.service.markReview(7, displayedHead, event, "Decision on the displayed revision.")).rejects.toThrow(/head changed/);
+    await expect(f.service.markReview(f.deps.settings().repository, 7, displayedHead, event, "Decision on the displayed revision.")).rejects.toThrow(/head changed/);
 
     expect(f.provider.postReview).not.toHaveBeenCalled();
-    await f.service.markReview(7, f.change.headSha, event, "Decision on the refreshed revision.");
+    await f.service.markReview(f.deps.settings().repository, 7, f.change.headSha, event, "Decision on the refreshed revision.");
     expect(f.provider.postReview).toHaveBeenCalledExactlyOnceWith(7, {
       headSha: f.change.headSha, event, body: "Decision on the refreshed revision.", comments: [],
     });
@@ -1299,7 +1299,7 @@ describe.each(["github", "gitlab"] as const)("Forge %s direct review decisions",
 describe("Forge direct decision validation", () => {
   it.each([undefined, null, 42, "", "a".repeat(39), "a".repeat(41), "a".repeat(63), "a".repeat(65), "g".repeat(40), `${"a".repeat(40)}\n`])("rejects an invalid head before contacting the provider: %j", async headSha => {
     const f = fixture();
-    await expect(f.service.markReview(7, headSha as string, "approve", "Reviewed")).rejects.toThrow(/valid commit SHA/);
+    await expect(f.service.markReview(f.deps.settings().repository, 7, headSha as string, "approve", "Reviewed")).rejects.toThrow(/valid commit SHA/);
     expect(f.provider.getChangeRequest).not.toHaveBeenCalled();
     expect(f.provider.postReview).not.toHaveBeenCalled();
   });
@@ -1312,7 +1312,7 @@ describe("Forge publication confirmation", () => {
     let now = Date.now();
     vi.spyOn(Date, "now").mockImplementation(() => now);
     const f = fixture();
-    const worker = await f.service.startIssue(1, placement);
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Ready" });
     await f.service.poll();
     const previousHead = f.change.headSha;
@@ -1481,7 +1481,7 @@ describe("Forge publication confirmation", () => {
 
   it("keeps post-merge confirmation cancellable by the worker's Pause control", async () => {
     const f = fixture();
-    const worker = await f.service.startIssue(1, placement);
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Ready" });
     await f.service.poll();
     f.change.approved = true;
@@ -1551,8 +1551,8 @@ describe("Forge publication confirmation", () => {
       f.advance(120_000);
       await f.service.poll();
     } else await f.service[action](f.worker.id);
-    await expect(f.service.startReview(7, false, placement)).rejects.toThrow(/publication/);
-    await expect(f.service.markReview(7, f.change.headSha, "approve", "Approved")).rejects.toThrow(/publication/);
+    await expect(f.service.startReview(f.deps.settings().repository, 7, false, placement)).rejects.toThrow(/publication/);
+    await expect(f.service.markReview(f.deps.settings().repository, 7, f.change.headSha, "approve", "Approved")).rejects.toThrow(/publication/);
     expect(f.provider.postReview).not.toHaveBeenCalled();
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
   });
@@ -1579,17 +1579,17 @@ describe("Forge publication confirmation", () => {
 
   it("blocks review actions while a published request revision is still unconfirmed", async () => {
     const f = await feedbackPublication();
-    const review = await f.service.startReview(7, false, placement);
+    const review = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     await f.service.pause(review.id);
     await f.service.poll();
     expect(f.stored()[0].status).toBe("awaiting_publication");
-    await expect(f.service.startReview(7, false, placement)).rejects.toThrow(/publication/);
+    await expect(f.service.startReview(f.deps.settings().repository, 7, false, placement)).rejects.toThrow(/publication/);
     await expect(f.service.resume(review.id, placement)).rejects.toThrow(/publication/);
     const saved = f.stored();
     saved[1].draft = { headSha: f.previousHead, body: "Review", comments: [], event: "comment", status: "draft" };
     await f.deps.store.write(saved);
     const restarted = new ForgeWorkflowService(f.deps);
-    await expect(restarted.markReview(7, f.change.headSha, "approve", "Approved")).rejects.toThrow(/publication/);
+    await expect(restarted.markReview(f.deps.settings().repository, 7, f.change.headSha, "approve", "Approved")).rejects.toThrow(/publication/);
     await expect(restarted.submitReview(review.id)).rejects.toThrow(/publication/);
     expect(f.provider.postReview).not.toHaveBeenCalled();
     expect(f.runtime.launch).toHaveBeenCalledTimes(3);
@@ -1641,7 +1641,7 @@ describe("Forge issue auto review", () => {
       for (const comment of f.change.comments) if (comment.discussionId === id) comment.resolved = true;
       f.change.unresolvedDiscussions = f.change.comments.filter(c => c.resolved === false).length;
     });
-    const issue = await f.service.startIssue(1, placement, true);
+    const issue = await f.service.startIssue(f.deps.settings().repository, 1, placement, true);
     const poll = async () => { now += 5_000; await f.service.poll(); };
     const report = (value: unknown) => f.reports.read.mockResolvedValue(value);
     const codingReport = (extra = {}) => report({ kind: "issue", title: "Fix", body: "Tested", ...extra });
@@ -2007,7 +2007,7 @@ describe("Forge issue auto review", () => {
 
   it("does not resume paused work when Auto review is enabled", async () => {
     const f = fixture();
-    const worker = await f.service.startIssue(1, placement);
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     await f.service.pause(worker.id);
     await f.service.setAutoReview(worker.id, true, placement);
     await f.service.poll();
