@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+import { useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import DOMPurify, { type Config as DOMPurifyConfig } from "dompurify";
 import hljs from "highlight.js/lib/core";
@@ -22,10 +22,11 @@ import { AlignJustify, ArchiveRestore, Check, ChevronDown, Copy, Download, FileC
 
 import type { ConfigValue, FileSearchFileResult, FileSearchMode, FileSearchResult, GitDiffFile, GitDiffFileSummary, GitDiffSummary, GitRepositoryState, WorkspaceTab } from "@cloudx/shared";
 
-import { downloadFileBrowserEntries, fileBrowserRawFileUrl, runTabAction, saveBlobDownload, uploadFileBrowserFile } from "../api.js";
+import { downloadFileBrowserEntries, fileBrowserRawFileUrl, runTabAction } from "../api.js";
 import { copyTextToClipboard } from "./clipboard.js";
 import { ControlButton, SegmentedControl } from "./Control.js";
 import { readFileBrowserPanelState, rememberFileBrowserPanelState, type DiffViewMode, type DirectoryEntry, type FileBrowserPanelState, type FilePreviewKind, type MarkdownPreviewMode, type OpenFileResult, type OpenFileViewMode } from "./fileBrowserPanelState.js";
+import { fileBrowserTransfers, type UploadProgressState } from "./fileBrowserTransfers.js";
 import { noSystemTextAssistProps } from "./inputAssist.js";
 import { PluginPanelDock } from "./PluginPanelDock.js";
 
@@ -46,7 +47,7 @@ interface DirectoryResult {
 
 type GitBusyAction = "state" | "diff" | "file" | "initialize" | "clone" | "origin";
 type SearchBusyAction = "search";
-type FileTransferBusyAction = "download" | "upload" | "extract" | "folder";
+type FileTransferBusyAction = "extract" | "folder";
 type ArchiveExtractionDestination = "here" | "folder";
 type FileTreeResizeAxis = "x" | "y";
 const DEFAULT_GIT_AUTO_REFRESH_SECONDS = 15;
@@ -91,14 +92,6 @@ interface FileContextMenuState {
   y: number;
 }
 
-interface UploadProgressState {
-  completedFiles: number;
-  totalFiles: number;
-  uploadedBytes: number;
-  totalBytes: number;
-  activePath?: string;
-}
-
 interface FileClipboardPaths {
   relativePath?: string;
   absolutePath: string;
@@ -126,7 +119,12 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   const [searchExpanded, setSearchExpanded] = useState(() => initialState?.searchExpanded ?? false);
   const [transferSelectionMode, setTransferSelectionMode] = useState(false);
   const [selectedTransferPaths, setSelectedTransferPaths] = useState<Set<string>>(() => new Set());
-  const [transferBusyAction, setTransferBusyAction] = useState<FileTransferBusyAction | undefined>();
+  const transfers = fileBrowserTransfers(tab);
+  const transferState = useSyncExternalStore(transfers.subscribe, transfers.getSnapshot, transfers.getSnapshot);
+  const [localTransferBusyAction, setTransferBusyAction] = useState<FileTransferBusyAction | undefined>();
+  const transferBusyAction = transferState.busyAction ?? localTransferBusyAction;
+  const uploadProgress = transferState.uploadProgress;
+  const refreshedUploadCount = useRef(transferState.uploadedFiles);
   const [uploadTargetPath, setUploadTargetPath] = useState<string | undefined>();
   const [folderCreateOpen, setFolderCreateOpen] = useState(false);
   const [folderCreateName, setFolderCreateName] = useState("");
@@ -141,7 +139,6 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   const [fileTreeSize, setFileTreeSize] = useState(() => initialState?.fileTreeSize ?? DEFAULT_FILE_TREE_SIZE);
   const [fileTreeResizeAxisState, setFileTreeResizeAxisState] = useState<FileTreeResizeAxis>(() => currentFileTreeResizeAxis());
   const [fileTreeResizing, setFileTreeResizing] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState<UploadProgressState | undefined>();
   const [error, setError] = useState<string | undefined>();
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
@@ -170,6 +167,13 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
       setCompareRef("");
     }
   }, [tab.id, tab.cwd, showGitDiff]);
+
+  useEffect(() => {
+    if (refreshedUploadCount.current !== transferState.uploadedFiles) {
+      refreshedUploadCount.current = transferState.uploadedFiles;
+      void loadDirectory(relativePath, { preserveOpened: true });
+    }
+  }, [transfers, transferState.uploadedFiles]);
 
   useEffect(() => {
     rememberFileBrowserPanelState(tab, {
@@ -560,16 +564,8 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
   }
 
   async function downloadTransferPaths(relativePaths: string[]) {
-    setTransferBusyAction("download");
     setError(undefined);
-    try {
-      const download = await downloadFileBrowserEntries(tab.id, relativePaths);
-      saveBlobDownload(download.blob, download.filename);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setTransferBusyAction(undefined);
-    }
+    await transfers.download(relativePaths);
   }
 
   async function extractArchive(transferPath: string, destination: ArchiveExtractionDestination) {
@@ -586,66 +582,22 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
     }
   }
 
-  async function uploadFiles(files: FileList | null, options: { preserveDirectoryPath?: boolean } = {}) {
+  function uploadFiles(files: FileList | null, options: { preserveDirectoryPath?: boolean } = {}) {
     const selectedFiles = Array.from(files ?? []);
     if (!selectedFiles.length) {
       return;
     }
-    setTransferBusyAction("upload");
     setError(undefined);
     const targetDirectory = uploadTargetPath ?? relativePath;
     const uploads = selectedFiles.map((file) => ({
       file,
       relativePath: fileTransferUploadPath(targetDirectory, file.name, options.preserveDirectoryPath ? selectedDirectoryRelativePath(file) : undefined)
     }));
-    const totalBytes = uploads.reduce((sum, upload) => sum + upload.file.size, 0);
-    let completedBytes = 0;
-    setUploadProgress({
-      completedFiles: 0,
-      totalFiles: uploads.length,
-      uploadedBytes: 0,
-      totalBytes,
-      activePath: uploads[0]?.relativePath
-    });
-    try {
-      for (const [index, upload] of uploads.entries()) {
-        setUploadProgress({
-          completedFiles: index,
-          totalFiles: uploads.length,
-          uploadedBytes: completedBytes,
-          totalBytes,
-          activePath: upload.relativePath
-        });
-        await uploadFileBrowserFile(tab.id, upload.relativePath, upload.file, (progress) => {
-          setUploadProgress({
-            completedFiles: index,
-            totalFiles: uploads.length,
-            uploadedBytes: completedBytes + Math.min(progress.loadedBytes, upload.file.size),
-            totalBytes,
-            activePath: upload.relativePath
-          });
-        });
-        completedBytes += upload.file.size;
-        const nextUpload = uploads[index + 1];
-        setUploadProgress({
-          completedFiles: index + 1,
-          totalFiles: uploads.length,
-          uploadedBytes: completedBytes,
-          totalBytes,
-          activePath: nextUpload?.relativePath
-        });
-      }
-      await loadDirectory(relativePath, { preserveOpened: true });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      if (uploadInputRef.current) {
-        uploadInputRef.current.value = "";
-      }
-      setUploadTargetPath(undefined);
-      setUploadProgress(undefined);
-      setTransferBusyAction(undefined);
+    void transfers.upload(uploads);
+    if (uploadInputRef.current) {
+      uploadInputRef.current.value = "";
     }
+    setUploadTargetPath(undefined);
   }
 
   async function createFolder() {
@@ -765,19 +717,19 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
             <ControlButton type="button" iconOnly onClick={cancelTransferSelectionMode} aria-label="Cancel multi-select download" title="Cancel multi-select download">
               <X size={15} />
             </ControlButton>
-            <ControlButton type="button" iconOnly onClick={() => void downloadSelectedTransferPaths()} disabled={!selectedTransferCount || transferBusyAction === "download"} aria-label={`Download ${selectedTransferCount} selected entries`} title={selectedTransferCount ? `Download ${selectedTransferCount} selected` : "Select files or folders to download"}>
+            <ControlButton type="button" iconOnly onClick={() => void downloadSelectedTransferPaths()} disabled={!selectedTransferCount || transferBusy} aria-label={`Download ${selectedTransferCount} selected entries`} title={selectedTransferCount ? `Download ${selectedTransferCount} selected` : "Select files or folders to download"}>
               <Download size={15} className={transferBusyAction === "download" ? "spinning" : ""} />
             </ControlButton>
           </>
         ) : (
-          <ControlButton type="button" iconOnly onClick={startTransferSelectionMode} aria-label="Select files or folders to download" title="Select files or folders to download">
+          <ControlButton type="button" iconOnly onClick={startTransferSelectionMode} disabled={transferBusy} aria-label="Select files or folders to download" title="Select files or folders to download">
             <Download size={15} />
           </ControlButton>
         )}
-        <ControlButton type="button" iconOnly onClick={startUploadToCurrentFolder} disabled={transferBusyAction === "upload"} aria-label="Upload files" title="Upload files">
+        <ControlButton type="button" iconOnly onClick={startUploadToCurrentFolder} disabled={transferBusy} aria-label="Upload files" title="Upload files">
           <Upload size={15} />
         </ControlButton>
-        <ControlButton type="button" iconOnly pressed={folderCreateOpen} onClick={() => setFolderCreateOpen(!folderCreateOpen)} disabled={transferBusyAction === "folder"} aria-label="New folder" title="New folder">
+        <ControlButton type="button" iconOnly pressed={folderCreateOpen} onClick={() => setFolderCreateOpen(!folderCreateOpen)} disabled={transferBusy} aria-label="New folder" title="New folder">
           <FolderPlus size={15} />
         </ControlButton>
         <FileBrowserToolbarPanelControls
@@ -811,7 +763,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
           }}
         >
           <input value={folderCreateName} onChange={(event) => setFolderCreateName(event.target.value)} placeholder="Folder name" aria-label="Folder name" {...noSystemTextAssistProps} />
-          <ControlButton type="submit" iconOnly disabled={transferBusyAction === "folder" || !folderCreateName.trim()} aria-label="Create folder" title="Create folder">
+          <ControlButton type="submit" iconOnly disabled={transferBusy || !folderCreateName.trim()} aria-label="Create folder" title="Create folder">
             <Check size={15} />
           </ControlButton>
           <ControlButton type="button" iconOnly onClick={() => { setFolderCreateOpen(false); setFolderCreateName(""); }} aria-label="Cancel new folder" title="Cancel new folder">
@@ -881,7 +833,8 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
         ]}
       />
       {uploadProgress ? <UploadProgress progress={uploadProgress} /> : null}
-      {error ? <div className="inline-error">{error}</div> : null}
+      {transferState.busyAction === "download" ? <div role="status" aria-label="Download progress">Downloading files…</div> : null}
+      {error || transferState.error ? <div className="inline-error">{error || transferState.error}</div> : null}
       <div ref={bodyRef} className={fileBrowserBodyClassName(treeVisible, fileTreeResizing)} style={fileBrowserBodyStyle(fileTreeSize)}>
         <PluginPanelDock
           className="file-tree-dock"
@@ -1003,13 +956,13 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
       {contextMenu ? (
         <div ref={contextMenuRef} className="file-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} role="menu" aria-label={`Actions for ${contextMenu.entry.name}`}>
           {contextMenu.entry.type === "file" && isExtractableArchivePath(contextMenu.transferPath) ? (
-            <button type="button" role="menuitem" disabled={transferBusyAction === "extract"} onClick={() => void extractArchive(contextMenu.transferPath, "here")}>
+            <button type="button" role="menuitem" disabled={transferBusy} onClick={() => void extractArchive(contextMenu.transferPath, "here")}>
               <ArchiveRestore size={14} />
               <span>Extract here</span>
             </button>
           ) : null}
           {contextMenu.entry.type === "file" && isExtractableArchivePath(contextMenu.transferPath) ? (
-            <button type="button" role="menuitem" disabled={transferBusyAction === "extract"} onClick={() => void extractArchive(contextMenu.transferPath, "folder")}>
+            <button type="button" role="menuitem" disabled={transferBusy} onClick={() => void extractArchive(contextMenu.transferPath, "folder")}>
               <ArchiveRestore size={14} />
               <span>Extract to {archiveExtractionFolderName(contextMenu.transferPath)}/</span>
             </button>
@@ -1017,7 +970,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
           <button
             type="button"
             role="menuitem"
-            disabled={transferBusyAction === "download"}
+            disabled={transferBusy}
             onClick={() => {
               const transferPath = contextMenu.transferPath;
               setContextMenu(undefined);
@@ -1052,7 +1005,7 @@ export function FileBrowserPanel({ tab, config = {} }: { tab: WorkspaceTab; conf
             <span>Copy absolute path</span>
           </button>
           {contextMenu.entry.type === "directory" ? (
-            <button type="button" role="menuitem" disabled={transferBusyAction === "upload"} onClick={() => startUploadToFolder(contextMenu.transferPath)}>
+            <button type="button" role="menuitem" disabled={transferBusy} onClick={() => startUploadToFolder(contextMenu.transferPath)}>
               <Upload size={14} />
               <span>Upload files to</span>
             </button>

@@ -1,4 +1,4 @@
-import { expect, test, type WebSocket } from "@playwright/test";
+import { expect, test, type Page, type WebSocket } from "@playwright/test";
 import type {
   CreateTabResponse,
   TabLayoutNode,
@@ -496,6 +496,252 @@ test.describe("CloudX shipped shell", () => {
     }
   });
 
+  test("keeps queued uploads and their progress with the original tab while switching tabs", async ({
+    page,
+    isMobile,
+  }) => {
+    const tabs = await createFileTransferTabs(page, "Upload");
+    const files = [
+      {
+        name: "first.txt",
+        mimeType: "text/plain",
+        buffer: Buffer.from("first upload\n"),
+      },
+      {
+        name: "second.txt",
+        mimeType: "text/plain",
+        buffer: Buffer.from("second upload\n"),
+      },
+    ];
+    const releases: Array<() => void> = [];
+    const pendingUploads = files.map(
+      () => new Promise<void>((resolve) => releases.push(resolve)),
+    );
+    const uploadPaths: string[] = [];
+    await page.route(
+      `**/api/tabs/${tabs.source.id}/files/upload?*`,
+      async (route) => {
+        const index = uploadPaths.length;
+        uploadPaths.push(
+          new URL(route.request().url()).searchParams.get("relativePath")!,
+        );
+        const response = await route.fetch();
+        await pendingUploads[index];
+        await route.fulfill({ response });
+      },
+    );
+
+    try {
+      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+      await page
+        .locator(".tab-activation")
+        .filter({ hasText: tabs.source.title })
+        .click();
+      await page.locator(".file-upload-input").setInputFiles(files);
+      await expect.poll(() => uploadPaths.length).toBe(1);
+      await expect(
+        page.getByRole("status", { name: "Upload progress" }),
+      ).toContainText("Uploading 1/2");
+
+      await page
+        .locator(".tab-activation")
+        .filter({ hasText: tabs.other.title })
+        .click();
+      await expect(
+        page.getByRole("status", { name: "Upload progress" }),
+      ).toHaveCount(0);
+      await expect(
+        page.getByRole("button", { name: "Upload files", exact: true }),
+      ).toBeEnabled();
+      await page
+        .locator(".tab-activation")
+        .filter({ hasText: tabs.source.title })
+        .click();
+      await expect(
+        page.getByRole("button", { name: "Upload files", exact: true }),
+      ).toBeDisabled();
+      await expect(
+        page.getByRole("status", { name: "Upload progress" }),
+      ).toContainText("Uploading 1/2");
+
+      await page
+        .locator(".tab-activation")
+        .filter({ hasText: tabs.other.title })
+        .click();
+      releases[0]!();
+      await expect.poll(() => uploadPaths.length).toBe(2);
+      await page
+        .locator(".tab-activation")
+        .filter({ hasText: tabs.source.title })
+        .click();
+      await expect(
+        page.getByRole("status", { name: "Upload progress" }),
+      ).toContainText("Uploading 2/2");
+      await expect(
+        page.getByRole("button", { name: "Upload files", exact: true }),
+      ).toBeDisabled();
+
+      await page
+        .locator(".tab-activation")
+        .filter({ hasText: tabs.other.title })
+        .click();
+      const completedUpload = page.waitForResponse(
+        (response) =>
+          new URL(response.url()).searchParams.get("relativePath") ===
+          "second.txt",
+      );
+      releases[1]!();
+      expect((await completedUpload).ok()).toBe(true);
+      expect(uploadPaths).toEqual(files.map((file) => file.name));
+      for (const file of files) {
+        expect(
+          await fs.readFile(path.join(tabs.source.cwd, file.name)),
+        ).toEqual(file.buffer);
+      }
+      expect(await fs.readdir(tabs.other.cwd)).toEqual([]);
+
+      await page
+        .locator(".tab-activation")
+        .filter({ hasText: tabs.source.title })
+        .click();
+      await expect(
+        page.getByRole("status", { name: "Upload progress" }),
+      ).toHaveCount(0);
+      await expect(
+        page.getByRole("button", { name: "Upload files", exact: true }),
+      ).toBeEnabled();
+      if (isMobile)
+        await page
+          .getByRole("button", { name: "File tree", exact: true })
+          .press("Enter");
+      for (const file of files) {
+        await expect(
+          page.locator(".file-list-entry").filter({ hasText: file.name }),
+        ).toBeVisible();
+      }
+    } finally {
+      releases.forEach((release) => release());
+      await page.unrouteAll({ behavior: "wait" });
+      for (const tab of [tabs.source, tabs.other]) {
+        await page.request.delete(`${baseUrl}/api/tabs/${tab.id}`);
+      }
+    }
+  });
+
+  test("keeps a download busy across tab switches and saves it while another tab is active", async ({
+    page,
+    isMobile,
+  }, testInfo) => {
+    const tabs = await createFileTransferTabs(page, "Download");
+    const filename = "download.bin";
+    const contents = Buffer.from([0, 1, 127, 128, 254, 255]);
+    await fs.writeFile(path.join(tabs.source.cwd, filename), contents);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let downloadRequests = 0;
+    await page.route(
+      `**/api/tabs/${tabs.source.id}/files/download`,
+      async (route) => {
+        downloadRequests += 1;
+        const response = await route.fetch();
+        await held;
+        await route.fulfill({ response });
+      },
+    );
+
+    try {
+      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+      await page
+        .locator(".tab-activation")
+        .filter({ hasText: tabs.source.title })
+        .click();
+      await page
+        .getByRole("button", {
+          name: "Select files or folders to download",
+          exact: true,
+        })
+        .click();
+      if (isMobile)
+        await page
+          .getByRole("button", { name: "File tree", exact: true })
+          .press("Enter");
+      await page
+        .getByRole("checkbox", { name: `Select ${filename} for download` })
+        .check();
+      await page
+        .getByRole("button", {
+          name: "Download 1 selected entries",
+          exact: true,
+        })
+        .click();
+      await expect.poll(() => downloadRequests).toBe(1);
+
+      await page
+        .locator(".tab-activation")
+        .filter({ hasText: tabs.other.title })
+        .click();
+      await page
+        .locator(".tab-activation")
+        .filter({ hasText: tabs.source.title })
+        .click();
+      await expect(
+        page.getByRole("status", { name: "Download progress" }),
+      ).toContainText("Downloading files");
+      await expect(
+        page.getByRole("button", { name: "Upload files", exact: true }),
+      ).toBeDisabled();
+      const screenshot = await page.screenshot({
+        path: testInfo.outputPath("background-download.png"),
+      });
+      await testInfo.attach("download continues after tab switch", {
+        body: screenshot,
+        contentType: "image/png",
+      });
+
+      await page
+        .locator(".tab-activation")
+        .filter({ hasText: tabs.other.title })
+        .click();
+      const downloaded = page.waitForEvent("download");
+      release();
+      const download = await downloaded;
+      expect(download.suggestedFilename()).toBe(filename);
+      const savedPath = testInfo.outputPath(filename);
+      await download.saveAs(savedPath);
+      expect(await fs.readFile(savedPath)).toEqual(contents);
+      expect(downloadRequests).toBe(1);
+      await expect(page.locator(".tab-button.selected .tab-title")).toHaveText(
+        tabs.other.title,
+      );
+
+      await page
+        .locator(".tab-activation")
+        .filter({ hasText: tabs.source.title })
+        .click();
+      await page
+        .getByRole("button", {
+          name: "Select files or folders to download",
+          exact: true,
+        })
+        .click();
+      if (isMobile)
+        await page
+          .getByRole("button", { name: "File tree", exact: true })
+          .press("Enter");
+      await expect(
+        page.getByRole("checkbox", { name: `Select ${filename} for download` }),
+      ).toBeEnabled();
+    } finally {
+      release();
+      await page.unrouteAll({ behavior: "wait" });
+      for (const tab of [tabs.source, tabs.other]) {
+        await page.request.delete(`${baseUrl}/api/tabs/${tab.id}`);
+      }
+    }
+  });
+
   test("creates a tab from the committed window without duplicate layout persistence", async ({
     page,
   }, testInfo) => {
@@ -699,6 +945,36 @@ test.describe("CloudX shipped shell", () => {
     }
   });
 });
+
+async function createFileTransferTabs(page: Page, title: string) {
+  const workspace = (await (
+    await page.request.get(`${baseUrl}/api/workspace`)
+  ).json()) as WorkspaceStateResponse;
+  const window = workspace.windows.find(
+    (candidate) => candidate.id === workspace.activeWindowId,
+  )!;
+  const tabs: CreateTabResponse["tab"][] = [];
+  for (const role of ["source", "other"]) {
+    const cwd = path.join(
+      testRoot,
+      "workspace",
+      `${title.toLowerCase()}-${role}`,
+    );
+    await fs.mkdir(cwd);
+    const response = await page.request.post(`${baseUrl}/api/tabs`, {
+      data: {
+        pluginId: "file-browser",
+        title: `${title} ${role}`,
+        cwd,
+        windowId: window.id,
+        paneId: window.layout.activePaneId,
+      },
+    });
+    expect(response.status()).toBe(201);
+    tabs.push(((await response.json()) as CreateTabResponse).tab);
+  }
+  return { source: tabs[0]!, other: tabs[1]! };
+}
 
 async function writeTerminalFixture(root: string): Promise<string> {
   const executable = path.join(root, "codex-fixture.cjs");

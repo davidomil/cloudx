@@ -39,6 +39,7 @@ import { createBrowserId } from "./browserId.js";
 import { ControlButton } from "./Control.js";
 import { activeAutomationTriggerIds as triggerIdsFromAutomation, type TriggerEmitter } from "./automationTriggers.js";
 import { disposeFileBrowserPanelStatesExcept } from "./fileBrowserPanelState.js";
+import { disposeFileBrowserTransfersExcept } from "./fileBrowserTransfers.js";
 import { disposeDocumentationIngestController, disposeDocumentationIngestControllersExcept } from "./documentationPanelQueue.js";
 import { PathEntry } from "./PathEntry.js";
 import {
@@ -365,6 +366,7 @@ export function App() {
     const tabIds = new Set(tabs.map((tab) => tab.id));
     disposeTerminalViewsExcept(tabIds);
     disposeFileBrowserPanelStatesExcept(tabIds);
+    disposeFileBrowserTransfersExcept(tabIds);
     disposeDocumentationIngestControllersExcept(tabIds);
   }, [tabs]);
 
