@@ -528,18 +528,18 @@ describe("template metadata helpers", () => {
 
 describe("codexTabInitialInput", () => {
   it("omits resume input for fresh Codex tabs", () => {
-    expect(codexTabInitialInput("new", "old-id", false, false, "legacy:YQ")).toBeUndefined();
+    expect(codexTabInitialInput("new", "old-id", false, false)).toBeUndefined();
   });
 
   it("builds resume input for last and exact Codex sessions", () => {
-    expect(codexTabInitialInput("last", "", true, true, "shared")).toEqual({
-      resume: { mode: "last", sourceId: "shared", all: true, includeNonInteractive: true }
+    expect(codexTabInitialInput("last", "", true, true)).toEqual({
+      resume: { mode: "last", all: true, includeNonInteractive: true }
     });
-    expect(codexTabInitialInput("session", " session-example ", false, false, "legacy:YQ")).toEqual({
-      resume: { mode: "session", sourceId: "legacy:YQ", sessionId: "session-example" }
+    expect(codexTabInitialInput("session", " session-example ", false, false)).toEqual({
+      resume: { mode: "session", sessionId: "session-example" }
     });
-    expect(codexTabInitialInput("picker", "ignored", false, false, "shared")).toEqual({ resume: { mode: "picker", sourceId: "shared", all: false, includeNonInteractive: false } });
-    expect(() => codexTabInitialInput("last", "", false, false, "")).toThrow(/source selection/);
+    expect(codexTabInitialInput("picker", "ignored", false, false)).toEqual({ resume: { mode: "picker", all: false, includeNonInteractive: false } });
+    expect(codexTabInitialInput("session", "  ", false, false)).toBeUndefined();
   });
 });
 

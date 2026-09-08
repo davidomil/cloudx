@@ -8,7 +8,7 @@ import type {
   PluginVoiceContext,
   WorkspacePlugin
 } from "@cloudx/plugin-api";
-import { RULES_SKILLS_PLUGIN_ID, codexStateSourceBasename, isRecord, type CodexTerminalInitialInput, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
+import { RULES_SKILLS_PLUGIN_ID, isRecord, type CodexTerminalInitialInput, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
 
 import { materializeCodexHomeOverlay, resolveCodexHome, type CodexHomeOverlay } from "../rulesSkills/CodexHomeOverlay.js";
 import { CodexStateSources } from "./CodexStateSources.js";
@@ -96,13 +96,12 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
   async createSession(input: CreatePluginSessionInput): Promise<PluginSession> {
     const template = templateFromRuntimeContext(input.runtimeContext);
     const baseEnv = { ...process.env };
-    const resume = codexResumeInput(input.initialInput);
+    codexResumeInput(input.initialInput);
     const launchTemplate = await materializeCodexTemplate(template, baseEnv, {
       dataDir: this.dataDir,
       tabId: input.tab.id,
       cwd: input.cwd,
-      sources: this.sources,
-      sourceId: resume?.sourceId
+      sources: this.sources
     });
     const command = launchTemplate.command;
     const launchArgs = buildCodexLaunchArgs(launchTemplate.args, input.initialInput);
@@ -166,6 +165,7 @@ export function codexResumeInput(initialInput: Record<string, unknown> | undefin
   if (!isRecord(initialInput) || !isRecord(initialInput.resume)) {
     return undefined;
   }
+  if ("sourceId" in initialInput.resume) throw new Error("Codex session source selection is no longer supported; resume uses shared sessions.");
   const mode = initialInput.resume.mode;
   if (mode !== "picker" && mode !== "last" && mode !== "session") {
     return undefined;
@@ -174,12 +174,8 @@ export function codexResumeInput(initialInput: Record<string, unknown> | undefin
   if (mode === "session" && !sessionId) {
     throw new Error("Codex resume session id is required.");
   }
-  const sourceId = initialInput.resume.sourceId;
-  if (typeof sourceId !== "string" || !sourceId) throw new Error("Codex resume session source selection is required.");
-  codexStateSourceBasename(sourceId);
   return {
     mode,
-    sourceId,
     sessionId: mode === "session" ? sessionId : undefined,
     all: optionalResumeBoolean(initialInput.resume.all, "all") ?? false,
     includeNonInteractive: optionalResumeBoolean(initialInput.resume.includeNonInteractive, "includeNonInteractive") ?? false
@@ -256,7 +252,6 @@ export interface MaterializeCodexTemplateOptions {
   cwd?: string;
   resetOverlay?: boolean;
   sources?: CodexStateSources;
-  sourceId?: string;
 }
 
 export async function materializeCodexTemplate(
@@ -269,10 +264,8 @@ export async function materializeCodexTemplate(
   const dataDir = options.dataDir;
   const sources = options.sources ?? (dataDir ? new CodexStateSources(dataDir, baseEnv) : undefined);
   const bound = sources && options.tabId ? await sources.readBinding(options.tabId) : undefined;
-  if (bound && options.sourceId !== undefined && options.sourceId !== bound.sourceId) throw new Error("Codex source selection conflicts with existing binding.");
   if (options.resetOverlay === false && sources && !bound) throw new Error("Codex launch source binding is missing.");
-  const source = sources ? bound ?? await sources.resolve(options.sourceId ?? "shared") : undefined;
-  if (!sources && options.sourceId && options.sourceId !== "shared") throw new Error("Codex retained sources require a configured data directory.");
+  const source = sources ? bound ?? await sources.resolve() : undefined;
   if (!env.CODEX_SQLITE_HOME?.trim()) env.CODEX_SQLITE_HOME = source?.home ?? path.resolve(resolveCodexHome(baseEnv));
   const overlay = dataDir && options.tabId
     ? await materializeCodexHomeOverlay({ dataDir, tabId: options.tabId, resolved, baseEnv: env, cwd: options.cwd, resetCodexHome: options.resetOverlay, sources: sources!, source: source! })

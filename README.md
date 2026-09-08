@@ -171,13 +171,13 @@ precedence remain intact. Cloudx does not open or copy SQLite databases during
 tab creation. Initial native indexing or reconciliation is a separate operation;
 steady-state startup performance still requires native measurement.
 
-To resume, choose a **Session source** in the New tab dialog before using the
-picker, last session, or an exact ID. Search by template, date, or full source key.
-Each retained `codex-homes` directory is a separate source, preserving its own
-goals, pages and saved variants. Native `/resume` stays within that chosen source.
-The shared picker does not combine SQLite-only data from retained sources.
-Old unbound tabs require explicit source selection in a new tab; bound launch
-views retain their source when restarted. Cloudx does not delete old homes.
+To resume, choose **Resume picker**, **Resume last**, or **Resume ID** in the New
+tab dialog. All modes use shared sessions automatically; there is no source
+selector. Resume requests must omit the removed `sourceId` field. Retired
+`codex-homes` directories are no longer discovered or selectable, and their unique
+state is not imported automatically. Shared launch views keep their history and
+binding when restarted. Retire unused old homes separately after checking that no
+process uses them and preserving any unique history.
 
 ## Quick Start
 
