@@ -70,6 +70,39 @@ describe("Issue completion reports", () => {
 });
 
 describe("Saved issue publication checkpoints", () => {
+  const updateReport = { ...report, discussionReplies: [], resolvedDiscussionIds: [] };
+  const baseUpdate = { expectedHeadSha: headSha, baseBranch: "main" };
+  const updatedHeadSha = "b".repeat(40);
+  it.each([
+    { baseUpdate },
+    { baseUpdate: { ...baseUpdate, headSha: updatedHeadSha } },
+    { baseUpdate: { ...baseUpdate, headSha: updatedHeadSha }, headSha: updatedHeadSha },
+  ])("preserves base update intent, local commit and pushed commit separately %#", progress => {
+    const saved = { ...worker, changeNumber: 7, headSha, pendingPublication: { report: updateReport, repliedDiscussionIds: [], ...progress } };
+    expect(parseWorkers([saved])).toEqual([saved]);
+  });
+
+  it.each([
+    { baseUpdate: null },
+    { baseUpdate: { baseBranch: "main" } },
+    { baseUpdate: { ...baseUpdate, expectedHeadSha: "unverified" } },
+    { baseUpdate: { ...baseUpdate, baseBranch: "" } },
+    { baseUpdate: { ...baseUpdate, baseBranch: "different" } },
+    { baseUpdate: { ...baseUpdate, headSha: "unverified" } },
+    { baseUpdate: { ...baseUpdate, headSha } },
+    { baseUpdate, headSha: updatedHeadSha },
+    { baseUpdate: { ...baseUpdate, headSha: updatedHeadSha }, headSha: "c".repeat(40) },
+    { baseUpdate, report },
+  ])("rejects an invalid base update checkpoint %#", progress => {
+    expect(() => parseWorkers([{ ...worker, changeNumber: 7, headSha, pendingPublication: { report: updateReport, repliedDiscussionIds: [], ...progress } }])).toThrow();
+  });
+
+  it("rejects a base update that has no matching published request", () => {
+    const pendingPublication = { report: updateReport, repliedDiscussionIds: [], baseUpdate };
+    expect(() => parseWorkers([{ ...worker, headSha, pendingPublication }])).toThrow(/published request/);
+    expect(() => parseWorkers([{ ...worker, headSha: updatedHeadSha, changeNumber: 7, pendingPublication }])).toThrow(/published request/);
+  });
+
   it.each([
     { report, repliedDiscussionIds: [] },
     { report, previousHeadSha: headSha, repliedDiscussionIds: [] },

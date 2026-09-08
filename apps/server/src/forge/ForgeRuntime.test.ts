@@ -710,6 +710,210 @@ describe("ForgeRuntime remote checkouts", () => {
   });
 });
 
+describe("ForgeRuntime owned branch updates", () => {
+  async function publishedIssue(conflict = false) {
+    const workspace = await prepare();
+    const file = conflict ? "README.md" : "issue.txt";
+    await fs.writeFile(path.join(workspace.worktreePath, file), "Published issue work\n");
+    await git(workspace.worktreePath, "add", file);
+    await git(workspace.worktreePath, "commit", "-m", "TEST: issue work");
+    const publishedHead = await runtime.publishBranch(workspace);
+    return { workspace, publishedHead };
+  }
+
+  async function advanceTarget(file = "target.txt", content = "New target work\n") {
+    await fs.writeFile(path.join(repositoryPath, file), content);
+    await git(repositoryPath, "add", file);
+    await git(repositoryPath, "commit", "-m", "TEST: target advances");
+    await git(repositoryPath, "push", "origin", "main");
+    return git(repositoryPath, "rev-parse", "HEAD");
+  }
+
+  async function ownership(id: string) {
+    const file = path.join(root, "data", "forge-workers", "workspaces", `${id}.json`);
+    return { file, value: JSON.parse(await fs.readFile(file, "utf8")) };
+  }
+
+  it("updates the owned issue from the current target and publishes only the recorded result", async () => {
+    const deps = dependencies();
+    deps.git = vi.fn(deps.git!);
+    runtime = new ForgeRuntime(deps);
+    const { workspace, publishedHead } = await publishedIssue();
+    const targetHead = await advanceTarget();
+
+    const updatedHead = await runtime.updateIssueBranch(workspace, publishedHead, "main");
+
+    expect(updatedHead).not.toBe(publishedHead);
+    expect(await git(workspace.worktreePath, "rev-list", "--parents", "-n", "1", updatedHead)).toBe(`${updatedHead} ${publishedHead} ${targetHead}`);
+    expect(await git(workspace.worktreePath, "status", "--porcelain")).toBe("");
+    expect(await fs.readFile(path.join(workspace.worktreePath, "issue.txt"), "utf8")).toBe("Published issue work\n");
+    expect(await fs.readFile(path.join(workspace.worktreePath, "target.txt"), "utf8")).toBe("New target work\n");
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(publishedHead);
+    expect((await ownership(workspace.id)).value.baseUpdate).toEqual({ expectedHeadSha: publishedHead, baseBranch: "main", targetHeadSha: targetHead, headSha: updatedHead });
+    const fetch = vi.mocked(deps.git).mock.calls.filter(([, args]) => args[0] === "fetch").at(-1)!;
+    expect(fetch[1].at(-1)).toBe("refs/heads/main:refs/cloudx/update-base");
+    expect(fetch[3]?.GIT_CONFIG_VALUE_1).toBe("Authorization: Basic fixture-secret");
+    expect(deps.gitAccess).toHaveBeenLastCalledWith(expectedRepository, "worker", undefined);
+
+    vi.mocked(deps.git).mockClear();
+    expect(await runtime.updateIssueBranch(workspace, publishedHead, "main")).toBe(updatedHead);
+    expect(vi.mocked(deps.git).mock.calls.some(([, args]) => ["fetch", "merge"].includes(args[0]!))).toBe(false);
+    expect(await runtime.publishBranch(workspace, undefined, updatedHead)).toBe(updatedHead);
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(updatedHead);
+    expect(vi.mocked(deps.git).mock.calls.filter(([, args]) => args[0] === "push").map(([, args]) => args)).toEqual([
+      ["push", "https://github.com/cloudx/test.git", `${updatedHead}:refs/heads/${workspace.branch}`],
+    ]);
+    await runtime.cleanup({ ...workspace, expectedHeadSha: updatedHead });
+  });
+
+  it("allows another verified update after the target advances again", async () => {
+    const { workspace, publishedHead } = await publishedIssue();
+    await advanceTarget();
+    const firstUpdate = await runtime.updateIssueBranch(workspace, publishedHead, "main");
+    await runtime.publishBranch(workspace, undefined, firstUpdate);
+    const nextTarget = await advanceTarget("later.txt", "Later target work\n");
+
+    const nextUpdate = await runtime.updateIssueBranch(workspace, firstUpdate, "main");
+
+    expect(await git(workspace.worktreePath, "rev-list", "--parents", "-n", "1", nextUpdate)).toBe(`${nextUpdate} ${firstUpdate} ${nextTarget}`);
+    expect((await ownership(workspace.id)).value.baseUpdate).toEqual({ expectedHeadSha: firstUpdate, baseBranch: "main", targetHeadSha: nextTarget, headSha: nextUpdate });
+  });
+
+  it("reobserves the target after a no-op update instead of caching the unchanged head forever", async () => {
+    const { workspace, publishedHead } = await publishedIssue();
+    expect(await runtime.updateIssueBranch(workspace, publishedHead, "main")).toBe(publishedHead);
+    const targetHead = await advanceTarget();
+
+    const updatedHead = await runtime.updateIssueBranch(workspace, publishedHead, "main");
+
+    expect(await git(workspace.worktreePath, "rev-list", "--parents", "-n", "1", updatedHead)).toBe(`${updatedHead} ${publishedHead} ${targetHead}`);
+  });
+
+  it("aborts its conflicting merge and preserves the original published work", async () => {
+    const { workspace, publishedHead } = await publishedIssue(true);
+    await advanceTarget("README.md", "Conflicting target work\n");
+
+    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toThrow(/merge.*conflict|merge.*failed/i);
+
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(publishedHead);
+    expect(await git(workspace.worktreePath, "status", "--porcelain")).toBe("");
+    expect(await fs.readFile(path.join(workspace.worktreePath, "README.md"), "utf8")).toBe("Published issue work\n");
+    await expect(fs.lstat(path.join(workspace.worktreePath, ".git", "MERGE_HEAD"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await ownership(workspace.id)).value.baseUpdate).toBeUndefined();
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(publishedHead);
+  });
+
+  it("preserves conflicts when abort cannot restore the owned merge", async () => {
+    const deps = dependencies();
+    const run = deps.git!;
+    deps.git = async (cwd, args, signal, env) => {
+      if (args[0] === "merge" && args.includes("--abort")) throw new Error("Abort could not finish.");
+      return run(cwd, args, signal, env);
+    };
+    runtime = new ForgeRuntime(deps);
+    const { workspace, publishedHead } = await publishedIssue(true);
+    const targetHead = await advanceTarget("README.md", "Conflicting target work\n");
+
+    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toThrow(/abort|restore|incomplete/i);
+
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(publishedHead);
+    expect(await git(workspace.worktreePath, "rev-parse", "MERGE_HEAD")).toBe(targetHead);
+    expect(await git(workspace.worktreePath, "status", "--porcelain")).toContain("UU README.md");
+    expect((await ownership(workspace.id)).value.baseUpdate).toMatchObject({ expectedHeadSha: publishedHead, targetHeadSha: targetHead });
+    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toThrow(/in progress|pending|unfinished/i);
+  });
+
+  it("rejects a changed head whose update result was never recorded", async () => {
+    const { workspace, publishedHead } = await publishedIssue();
+    await advanceTarget();
+    const updatedHead = await runtime.updateIssueBranch(workspace, publishedHead, "main");
+    const manifest = await ownership(workspace.id);
+    delete manifest.value.baseUpdate.headSha;
+    await fs.writeFile(manifest.file, JSON.stringify(manifest.value));
+    runtime = new ForgeRuntime(dependencies());
+
+    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toThrow(/recorded|published commit/i);
+
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(updatedHead);
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(publishedHead);
+  });
+
+  it("keeps unresolved Git process ownership blocked during update recovery", async () => {
+    const { workspace, publishedHead } = await publishedIssue();
+    await advanceTarget();
+    const updatedHead = await runtime.updateIssueBranch(workspace, publishedHead, "main");
+    const manifest = await ownership(workspace.id);
+    manifest.value.gitPending = true;
+    await fs.writeFile(manifest.file, JSON.stringify(manifest.value));
+    runtime = new ForgeRuntime(dependencies());
+
+    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toThrow(/unresolved/i);
+    await expect(runtime.recover(workspace.id)).rejects.toThrow(/interrupted/i);
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(updatedHead);
+  });
+
+  it("refuses dirty work and foreign pending merges before fetching or aborting anything", async () => {
+    const deps = dependencies();
+    deps.git = vi.fn(deps.git!);
+    runtime = new ForgeRuntime(deps);
+    const { workspace, publishedHead } = await publishedIssue();
+    await fs.writeFile(path.join(workspace.worktreePath, "unpublished.txt"), "Keep this work\n");
+    vi.mocked(deps.git).mockClear();
+    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toThrow(/Commit all worker changes/i);
+    await fs.rm(path.join(workspace.worktreePath, "unpublished.txt"));
+    await fs.writeFile(path.join(workspace.worktreePath, ".git", "MERGE_HEAD"), `${headSha}\n`);
+    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toThrow(/in progress|pending|unfinished/i);
+    expect(vi.mocked(deps.git).mock.calls.some(([, args]) => ["fetch", "merge"].includes(args[0]!))).toBe(false);
+    expect(await fs.readFile(path.join(workspace.worktreePath, ".git", "MERGE_HEAD"), "utf8")).toBe(`${headSha}\n`);
+  });
+
+  it("checks the saved local update head again inside publication before pushing", async () => {
+    const deps = dependencies();
+    runtime = new ForgeRuntime(deps);
+    const { workspace, publishedHead } = await publishedIssue();
+    await advanceTarget();
+    const updatedHead = await runtime.updateIssueBranch(workspace, publishedHead, "main");
+    vi.mocked(deps.gitAccess).mockClear();
+
+    await expect(runtime.publishBranch(workspace, undefined, publishedHead)).rejects.toThrow(/head|published commit/i);
+
+    expect(deps.gitAccess).not.toHaveBeenCalled();
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(updatedHead);
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(publishedHead);
+  });
+
+  it("rejects a completed update receipt without its fetched target commit", async () => {
+    const { workspace, publishedHead } = await publishedIssue();
+    await advanceTarget();
+    const updatedHead = await runtime.updateIssueBranch(workspace, publishedHead, "main");
+    const manifest = await ownership(workspace.id);
+    delete manifest.value.baseUpdate.targetHeadSha;
+    await fs.writeFile(manifest.file, JSON.stringify(manifest.value));
+
+    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toThrow(/ownership record.*invalid/i);
+
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(updatedHead);
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(publishedHead);
+  });
+
+  it("rechecks an expected publication head after refreshing credentials", async () => {
+    const deps = dependencies();
+    runtime = new ForgeRuntime(deps);
+    const { workspace, publishedHead } = await publishedIssue();
+    await advanceTarget();
+    const updatedHead = await runtime.updateIssueBranch(workspace, publishedHead, "main");
+    vi.mocked(deps.gitAccess).mockImplementationOnce(async () => {
+      await git(workspace.worktreePath, "commit", "--allow-empty", "-m", "TEST: concurrent local commit");
+      return { cloneUrl: "https://github.com/cloudx/test.git", authorization: "Basic refreshed-secret" };
+    });
+
+    await expect(runtime.publishBranch(workspace, undefined, updatedHead)).rejects.toThrow(/head.*published commit/i);
+
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(publishedHead);
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).not.toBe(updatedHead);
+  });
+});
+
 describe.skipIf(process.platform !== "linux")(
   "ForgeRuntime Git subprocesses",
   () => {
@@ -814,6 +1018,53 @@ describe.skipIf(process.platform !== "linux")(
       await runtime.cleanup(workspace);
     });
 
+    it("waits for a cancelled update merge to exit before aborting its staged changes", async () => {
+      const fixture = await installGitFixture("merge");
+      const deps = dependencies();
+      delete deps.git;
+      runtime = new ForgeRuntime(deps);
+      const workspace = await prepare();
+      await fs.writeFile(path.join(workspace.worktreePath, "issue.txt"), "Published issue work\n");
+      await git(workspace.worktreePath, "add", "issue.txt");
+      await git(workspace.worktreePath, "commit", "-m", "TEST: issue work");
+      const publishedHead = await runtime.publishBranch(workspace);
+      await fs.writeFile(path.join(repositoryPath, "target.txt"), "Target work\n");
+      await git(repositoryPath, "add", "target.txt");
+      await git(repositoryPath, "commit", "-m", "TEST: target work");
+      await git(repositoryPath, "push", "origin", "main");
+      const controller = new AbortController();
+      const pending = runtime.updateIssueBranch(workspace, publishedHead, "main", controller.signal);
+      void pending.catch(() => undefined);
+      try {
+        let pids: number[] = [];
+        await vi.waitFor(async () => {
+          pids = JSON.parse(await fs.readFile(fixture.children, "utf8"));
+        }, { timeout: 3_000 });
+        expect(await fs.readFile(path.join(workspace.worktreePath, "target.txt"), "utf8")).toBe("Target work\n");
+        expect(await git(workspace.worktreePath, "status", "--porcelain")).toContain("A  target.txt");
+
+        controller.abort(new Error("Target update cancelled."));
+        await expect(pending).rejects.toThrow("Target update cancelled.");
+
+        for (const pid of pids) {
+          const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8").catch(() => undefined);
+          expect(stat === undefined || stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z ")).toBe(true);
+        }
+        expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(publishedHead);
+        expect(await git(workspace.worktreePath, "status", "--porcelain")).toBe("");
+        await expect(fs.lstat(path.join(workspace.worktreePath, ".git", "MERGE_HEAD"))).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(fs.lstat(path.join(workspace.worktreePath, "target.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+        expect(await fs.readFile(path.join(workspace.worktreePath, "issue.txt"), "utf8")).toBe("Published issue work\n");
+        expect(await git(origin, "rev-parse", workspace.branch)).toBe(publishedHead);
+        const ownership = JSON.parse(await fs.readFile(path.join(root, "data", "forge-workers", "workspaces", `${workspace.id}.json`), "utf8"));
+        expect(ownership).toMatchObject({ gitPending: false });
+        expect(ownership.baseUpdate).toBeUndefined();
+      } finally {
+        controller.abort();
+        await pending.catch(() => undefined);
+      }
+    });
+
     it.each([{ name: "issue", review: false }, { name: "review base", review: true }])("awaits cancellation of the $name fetch and its child process before removing the owned checkout", async ({ review }) => {
       const fixture = await installGitFixture(review ? "review-base" : true);
       const deps = dependencies();
@@ -869,7 +1120,7 @@ describe.skipIf(process.platform !== "linux")(
   },
 );
 
-async function installGitFixture(hangFetch: boolean | "review-base" = false) {
+async function installGitFixture(hangFetch: boolean | "review-base" | "merge" = false) {
   const actualGit = (await execute("which", ["git"])).stdout.trim();
   const bin = path.join(root, "bin");
   const records = path.join(root, "git-processes.jsonl");
@@ -883,13 +1134,20 @@ const { spawn, spawnSync } = require("node:child_process");
 const args = process.argv.slice(2);
 const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("GIT_")));
 fs.appendFileSync(${JSON.stringify(records)}, JSON.stringify({ args, env }) + "\\n");
-const shouldHang = ${JSON.stringify(hangFetch)} === true || ${JSON.stringify(hangFetch)} === "review-base" && args.some(arg => arg.endsWith(":refs/cloudx/review-base"));
-if (shouldHang && args.includes("fetch")) {
+const mapped = args.map((arg) => arg === "https://github.com/cloudx/test.git" && args.some((item) => item === "fetch" || item === "push") ? ${JSON.stringify(origin)} : arg);
+const hangMerge = ${JSON.stringify(hangFetch)} === "merge" && args.includes("merge") && !args.includes("--abort");
+const hangFetch = (${JSON.stringify(hangFetch)} === true || ${JSON.stringify(hangFetch)} === "review-base" && args.some(arg => arg.endsWith(":refs/cloudx/review-base"))) && args.includes("fetch");
+if (hangMerge || hangFetch) {
+  if (hangMerge) {
+    const staged = [...mapped];
+    staged.splice(staged.indexOf("merge") + 1, 0, "--no-commit");
+    const result = spawnSync(${JSON.stringify(actualGit)}, staged, { env: { ...process.env, GIT_ALLOW_PROTOCOL: "file" }, stdio: "inherit" });
+    if (result.status !== 0) process.exit(result.status ?? 1);
+  }
   const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
   fs.writeFileSync(${JSON.stringify(children)}, JSON.stringify([process.pid, child.pid]));
   setInterval(() => {}, 1000);
 } else {
-  const mapped = args.map((arg) => arg === "https://github.com/cloudx/test.git" && args.some((item) => item === "fetch" || item === "push") ? ${JSON.stringify(origin)} : arg);
   const result = spawnSync(${JSON.stringify(actualGit)}, mapped, { env: { ...process.env, GIT_ALLOW_PROTOCOL: "file" }, stdio: "inherit" });
   process.exit(result.status ?? 1);
 }

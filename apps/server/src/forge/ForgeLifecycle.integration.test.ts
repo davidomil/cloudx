@@ -271,6 +271,85 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     }
   }, 20_000);
 
+  it("updates an approved branch with newer target work, confirms publication, and reviews the new merge commit before merging", async () => {
+    const fixture = await LifecycleFixture.create({ autoReview: true, approveFirst: true });
+    const started = await fixture.workflow.startIssue(1, fixture.placement, true);
+    const implementation = await fixture.completedAssistantTurn(started);
+    await fixture.workflow.poll();
+    const firstReview = await fixture.runningWorker("review");
+    const firstReviewReceipt = await fixture.completedAssistantTurn(firstReview);
+    const targetHead = await fixture.advanceMain();
+    fixture.provider.changes.get(7)!.requiresBaseUpdate = true;
+    expect(await fixture.provider.getChangeRequest(7)).toMatchObject({ requiresBaseUpdate: true, mergeable: false });
+    const previousStatus = await fixture.provider.getChangeRequestStatus(7);
+    const visibility = vi.spyOn(fixture.provider, "getChangeRequestStatus").mockResolvedValue(previousStatus);
+    const merge = vi.spyOn(fixture.provider, "merge");
+
+    fixture.advanceTime(5_001);
+    await fixture.workflow.poll();
+    const publishing = await fixture.worker(started.id);
+    const updatedHead = await git(fixture.origin, "rev-parse", started.branch!);
+    expect(updatedHead).not.toBe(implementation.headSha);
+    expect(publishing, publishing.error).toMatchObject({
+      status: "awaiting_publication",
+      headSha: implementation.headSha,
+      pendingPublication: {
+        headSha: updatedHead,
+        previousHeadSha: implementation.headSha,
+        baseUpdate: { expectedHeadSha: implementation.headSha, baseBranch: "main", headSha: updatedHead },
+      },
+    });
+    expect((await fixture.store.read()).find(worker => worker.id === started.id)?.pendingPublication).toEqual(publishing.pendingPublication);
+    expect((await git(fixture.origin, "show", "-s", "--format=%P", updatedHead)).split(" ")).toEqual([implementation.headSha, targetHead]);
+    expect(await git(fixture.origin, "show", `${updatedHead}:target.txt`)).toBe("Target branch advanced");
+    expect(await git(fixture.origin, "show", `${updatedHead}:solution.txt`)).toBe("Issue resolved");
+    expect(fixture.provider.submissions).toEqual([expect.objectContaining({ event: "approve", headSha: implementation.headSha })]);
+    expect(merge).not.toHaveBeenCalled();
+    expect(fixture.factory.processes).toHaveLength(2);
+    expect(fixture.gitPushes).toHaveLength(2);
+    expect(fixture.gitPushes[1]!.some(argument => argument.startsWith("--force") || argument.startsWith("+"))).toBe(false);
+
+    visibility.mockRestore();
+    expect(await fixture.provider.getChangeRequest(7)).toMatchObject({ headSha: updatedHead, requiresBaseUpdate: false, approved: true });
+    fixture.advanceTime(5_001);
+    await fixture.workflow.poll();
+    const secondReview = await fixture.runningWorker("review");
+    expect(secondReview).toMatchObject({ issueWorkerId: started.id, headSha: updatedHead });
+    expect(secondReview.id).not.toBe(firstReview.id);
+    const secondReviewReceipt = await fixture.completedAssistantTurn(secondReview);
+    expect(secondReviewReceipt.localReview).toMatchObject({ baseSha: targetHead, mergeBaseSha: targetHead, headSha: updatedHead });
+    expect(secondReviewReceipt.localReview!.diff).toContain("diff --git a/solution.txt b/solution.txt");
+    expect(secondReviewReceipt.localReview!.diff).not.toContain("diff --git a/target.txt b/target.txt");
+    expect((await fixture.worker(started.id)).pendingPublication).toBeUndefined();
+    expect(merge).not.toHaveBeenCalled();
+    expect(await git(fixture.origin, "rev-parse", "main")).toBe(targetHead);
+
+    fixture.advanceTime(5_001);
+    await fixture.workflow.poll();
+    await vi.waitFor(async () => {
+      fixture.advanceTime(5_001);
+      await fixture.workflow.poll();
+      expect((await fixture.workflow.dashboard()).workers).toEqual([]);
+    }, { timeout: 2_000, interval: 20 });
+    expect(fixture.provider.submissions.map(({ event, headSha }) => ({ event, headSha }))).toEqual([
+      { event: "approve", headSha: implementation.headSha },
+      { event: "approve", headSha: updatedHead },
+    ]);
+    expect(merge).toHaveBeenCalledExactlyOnceWith(7, updatedHead);
+    expect(fixture.provider.merges).toEqual([updatedHead]);
+    expect(await git(fixture.origin, "rev-parse", "main")).toBe(updatedHead);
+    expect(fixture.provider.issue.state).toBe("closed");
+    expect(fixture.factory.processes).toHaveLength(3);
+    expect(fixture.gitPushes).toHaveLength(2);
+    expect(await fixture.store.read()).toEqual([]);
+    expect(fixture.sessions.listTabs()).toEqual([]);
+    for (const worker of [started, firstReview, secondReview]) await expectMissing(worker.worktreePath!);
+    for (const receipt of [implementation, firstReviewReceipt, secondReviewReceipt]) {
+      expect(await processIsRunning(receipt.pid)).toBe(false);
+      await expectMissing(receipt.codexHome, receipt.tabContextPath, receipt.contextPath, receipt.reportPath);
+    }
+  }, 30_000);
+
   it.each(["pause", "stop"] as const)("%s stops the issue and its automatic reviewer until the issue is resumed", async action => {
     const fixture = await LifecycleFixture.create({ autoReview: true });
     const started = await fixture.workflow.startIssue(1, fixture.placement, true);
@@ -769,6 +848,19 @@ class LifecycleFixture {
     return (await this.provider.getChangeRequest(7)).headSha;
   }
 
+  async advanceMain(): Promise<string> {
+    await git(this.root, "clone", "--branch", "main", this.origin, this.repositoryPath);
+    await git(this.repositoryPath, "config", "user.name", "Forge Fixture");
+    await git(this.repositoryPath, "config", "user.email", "forge-fixture@example.invalid");
+    await fs.writeFile(path.join(this.repositoryPath, "target.txt"), "Target branch advanced\n");
+    await git(this.repositoryPath, "add", "target.txt");
+    await git(this.repositoryPath, "commit", "-m", "TEST: advance target branch");
+    await git(this.repositoryPath, "push", "origin", "main");
+    const headSha = await git(this.repositoryPath, "rev-parse", "HEAD");
+    await fs.rm(this.repositoryPath, { recursive: true });
+    return headSha;
+  }
+
   async dispose(): Promise<void> {
     try {
       await this.workflow.dispose();
@@ -803,14 +895,17 @@ class LocalForgeProvider implements ForgeProvider {
   async getChangeRequest(number: number): Promise<ForgeChangeRequest> {
     const change = this.changes.get(number);
     if (!change) throw new Error("Unknown fixture change request.");
-    return { ...structuredClone(change), ...await this.getChangeRequestStatus(number), baseSha: await git(this.origin, "rev-parse", change.baseBranch) };
+    const status = await this.getChangeRequestStatus(number);
+    const baseSha = await git(this.origin, "rev-parse", change.baseBranch);
+    const requiresBaseUpdate = change.requiresBaseUpdate && await git(this.origin, "merge-base", baseSha, status.headSha) !== baseSha;
+    return { ...structuredClone(change), ...status, baseSha, requiresBaseUpdate, mergeable: change.mergeable && !requiresBaseUpdate };
   }
   async findChangeRequestByBranch(headBranch: string, baseBranch: string) {
     const change = [...this.changes.values()].find((request) => request.headBranch === headBranch && request.baseBranch === baseBranch);
     return change ? this.getChangeRequest(change.number) : undefined;
   }
   async createChangeRequest(input: ForgeCreateChangeRequest) {
-    this.changes.set(7, { number: 7, title: input.title, body: input.body, url: "https://github.com/fixture/cloudx/pull/7", state: "open", labels: [], author: "worker-bot", updatedAt: new Date().toISOString(), draft: false, headSha: "", baseSha: await git(this.origin, "rev-parse", input.baseBranch), headBranch: input.headBranch, baseBranch: input.baseBranch, merged: false, reviewReady: true, mergeable: true, approved: false, unresolvedDiscussions: 0, comments: [], linkedIssues: [] });
+    this.changes.set(7, { number: 7, title: input.title, body: input.body, url: "https://github.com/fixture/cloudx/pull/7", state: "open", labels: [], author: "worker-bot", updatedAt: new Date().toISOString(), draft: false, headSha: "", baseSha: await git(this.origin, "rev-parse", input.baseBranch), headBranch: input.headBranch, baseBranch: input.baseBranch, merged: false, reviewReady: true, mergeable: true, requiresBaseUpdate: false, approved: false, unresolvedDiscussions: 0, comments: [], linkedIssues: [] });
     return this.getChangeRequest(7);
   }
   async postReview(number: number, review: ForgeReviewSubmission): Promise<ForgeReviewPublication> {
@@ -845,7 +940,7 @@ class LocalForgeProvider implements ForgeProvider {
   }
   async merge(number: number, expectedHeadSha: string) {
     const change = await this.getChangeRequest(number);
-    if (!change.approved || change.unresolvedDiscussions || change.headSha !== expectedHeadSha) throw new Error("Fixture request is not approved at this head.");
+    if (!change.approved || change.requiresBaseUpdate || change.unresolvedDiscussions || change.headSha !== expectedHeadSha) throw new Error("Fixture request is not approved at this head.");
     await this.mergeExternally(number);
     this.merges.push(expectedHeadSha);
     return { merged: true as const, sha: expectedHeadSha };

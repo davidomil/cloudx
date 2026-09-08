@@ -156,12 +156,18 @@ function hubFixture(
     reviews?: unknown[];
     threads?: unknown[];
     graphql?: Record<string, unknown>;
+    repository?: Record<string, unknown>;
+    rules?: unknown[];
     intercept?: Handler;
   } = {},
 ) {
   return harness(github, (url, options) => {
     const path = url.pathname;
     if (overrides.intercept) return overrides.intercept(url, options);
+    if (path === "/repos/owner/repo")
+      return response({ allow_squash_merge: true, allow_merge_commit: true, allow_rebase_merge: true, ...overrides.repository });
+    if (path.startsWith("/repos/owner/repo/rules/branches/"))
+      return response(overrides.rules ?? []);
     if (options.method === "PUT" && path.endsWith("/merge"))
       return response({ merged: true, sha: "c".repeat(40) });
     if (path === "/graphql")
@@ -912,10 +918,23 @@ describe("GitHub review and exact-commit merge", () => {
       reviewReady: true,
       approved: true,
       mergeable: true,
+      requiresBaseUpdate: false,
       unresolvedDiscussions: 0,
       comments: [{ id: "1" }, { id: "1", reviewId: "12" }, { id: "review-1" }],
       baseSha: previousSha,
     });
+  });
+
+  it("requires a base update when GitHub reports the branch is behind", async () => {
+    const { provider, calls } = hubFixture({ graphql: { mergeStateStatus: "BEHIND" } });
+    expect(await provider.getChangeRequest(7)).toMatchObject({ requiresBaseUpdate: true, mergeable: false });
+    await expect(provider.merge(7, headSha)).rejects.toThrow("must be open");
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it.each(["BLOCKED", "DIRTY", "DRAFT", "HAS_HOOKS", "UNKNOWN", "UNSTABLE"])("does not request a base update for GitHub status %s", async mergeStateStatus => {
+    const { provider } = hubFixture({ graphql: { mergeStateStatus } });
+    expect((await provider.getChangeRequest(7)).requiresBaseUpdate).toBe(false);
   });
 
   it.each(["detail", "merge"])("loads GitHub %s metadata when the raw diff exceeds GitHub's limit", async operation => {
@@ -1037,7 +1056,7 @@ describe("GitHub review and exact-commit merge", () => {
     });
     const merge = calls.at(-1)!;
     expect(merge.options.method).toBe("PUT");
-    expect(JSON.parse(String(merge.options.body))).toEqual({ sha: headSha });
+    expect(JSON.parse(String(merge.options.body))).toEqual({ sha: headSha, merge_method: "squash" });
     expect(new Headers(merge.options.headers).get("authorization")).toBe(
       "Bearer worker-private-token",
     );
@@ -1104,6 +1123,87 @@ describe("GitHub review and exact-commit merge", () => {
   });
 });
 
+describe("GitHub merge method selection", () => {
+  it.each([
+    { name: "prefers squash when all methods are enabled", repository: {}, rules: [], method: "squash" },
+    { name: "supports repositories that only allow merge commits", repository: { allow_squash_merge: false, allow_rebase_merge: false }, rules: [], method: "merge" },
+    { name: "supports repositories that only allow rebase", repository: { allow_squash_merge: false, allow_merge_commit: false }, rules: [], method: "rebase" },
+    { name: "respects a branch that only allows merge commits", repository: {}, rules: [{ type: "pull_request", parameters: { allowed_merge_methods: ["merge"] } }], method: "merge" },
+    { name: "respects a branch that only allows rebase", repository: {}, rules: [{ type: "pull_request", parameters: { allowed_merge_methods: ["rebase"] } }], method: "rebase" },
+    { name: "excludes merge commits when linear history is required", repository: { allow_squash_merge: false }, rules: [{ type: "required_linear_history" }], method: "rebase" },
+    { name: "intersects every applicable pull request rule", repository: {}, rules: [{ type: "pull_request", parameters: { allowed_merge_methods: ["squash", "merge"] } }, { type: "pull_request", parameters: { allowed_merge_methods: ["merge", "rebase"] } }], method: "merge" },
+    { name: "permits squash with linear history and a squash-only rule", repository: { allow_merge_commit: false, allow_rebase_merge: false }, rules: [{ type: "required_linear_history" }, { type: "pull_request", parameters: { allowed_merge_methods: ["squash"] } }], method: "squash" },
+    { name: "accepts rules with no optional method restriction", repository: {}, rules: [{ type: "pull_request", parameters: {} }, { type: "required_status_checks", parameters: {} }], method: "squash" },
+  ])("$name", async ({ repository, rules, method }) => {
+    const { provider, calls } = hubFixture({ repository, rules });
+    await expect(provider.merge(7, headSha)).resolves.toMatchObject({ merged: true });
+    const writes = calls.filter(call => call.options.method === "PUT");
+    expect(writes).toHaveLength(1);
+    expect(JSON.parse(String(writes[0].options.body))).toEqual({ sha: headSha, merge_method: method });
+  });
+
+  it.each([
+    { repository: { allow_squash_merge: false, allow_merge_commit: false, allow_rebase_merge: false }, rules: [] },
+    { repository: { allow_squash_merge: false, allow_rebase_merge: false }, rules: [{ type: "required_linear_history" }] },
+    { repository: {}, rules: [{ type: "pull_request", parameters: { allowed_merge_methods: ["squash"] } }, { type: "pull_request", parameters: { allowed_merge_methods: ["merge"] } }] },
+    { repository: { allow_merge_commit: false, allow_rebase_merge: false }, rules: [{ type: "pull_request", parameters: { allowed_merge_methods: ["merge"] } }] },
+  ])("does not start a merge when repository and branch rules have no common method: %j", async overrides => {
+    const { provider, calls } = hubFixture(overrides);
+    const error = await provider.merge(7, headSha).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(error.message).toMatch(/no permitted merge method/i);
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it.each([
+    { allow_squash_merge: undefined }, { allow_squash_merge: "true" },
+    { allow_merge_commit: undefined }, { allow_merge_commit: null },
+    { allow_rebase_merge: undefined }, { allow_rebase_merge: 1 },
+  ])("rejects incomplete repository merge settings before writing: %j", async repository => {
+    const { provider, calls } = hubFixture({ repository });
+    const error = await provider.merge(7, headSha).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(error.statusCode).toBe(502);
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it.each([
+    [null], [{}], [{ type: false }],
+    [{ type: "pull_request", parameters: null }],
+    [{ type: "pull_request", parameters: { allowed_merge_methods: null } }],
+    [{ type: "pull_request", parameters: { allowed_merge_methods: "squash" } }],
+    [{ type: "pull_request", parameters: { allowed_merge_methods: [] } }],
+    [{ type: "pull_request", parameters: { allowed_merge_methods: ["unknown"] } }],
+    [{ type: "pull_request", parameters: { allowed_merge_methods: [1] } }],
+  ])("rejects malformed branch merge rules before writing: %j", async rule => {
+    const { provider, calls } = hubFixture({ rules: [rule] });
+    const error = await provider.merge(7, headSha).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(error.statusCode).toBe(502);
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it("includes later pages when choosing a method for the encoded base branch", async () => {
+    const base = hubFixture({ request: { base: { ref: "release/v1", sha: previousSha } }, graphql: { baseRefName: "release/v1" } });
+    const { provider, calls } = harness(github, (url, options) => url.pathname.includes("/rules/branches/")
+      ? response([{ type: "pull_request", parameters: { allowed_merge_methods: url.searchParams.get("page") === "1" ? ["squash", "merge"] : ["merge"] } }], url.searchParams.get("page") === "1" ? { link: '<https://api.github.com/next>; rel="next"' } : {})
+      : base.fetcher(url, options));
+    await provider.merge(7, headSha);
+    const rules = calls.filter(call => call.url.pathname.includes("/rules/branches/"));
+    expect(rules.map(call => call.url.pathname)).toEqual(Array(2).fill("/repos/owner/repo/rules/branches/release%2Fv1"));
+    expect(JSON.parse(String(calls.at(-1)!.options.body))).toEqual({ sha: headSha, merge_method: "merge" });
+  });
+
+  it.each(["/repos/owner/repo", "/repos/owner/repo/rules/branches/main"])("keeps %s read failures inside merge preflight", async failedPath => {
+    const base = hubFixture();
+    const { provider, calls } = harness(github, (url, options) => url.pathname === failedPath ? new Response(null, { status: 403 }) : base.fetcher(url, options));
+    const error = await provider.merge(7, headSha).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(error).toMatchObject({ statusCode: 403, change: { headSha } });
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+});
+
 describe("GitLab review and exact-commit merge", () => {
   it("includes discussions and requires approvals after the current diff version", async () => {
     const { provider } = labFixture();
@@ -1112,15 +1212,28 @@ describe("GitLab review and exact-commit merge", () => {
       reviewReady: true,
       approved: true,
       mergeable: true,
+      requiresBaseUpdate: false,
       unresolvedDiscussions: 0,
       comments: [{ id: "1", resolved: true }],
       baseSha: previousSha,
     });
   });
 
+  it("requires a base update when GitLab reports the branch needs rebasing", async () => {
+    const { provider, calls } = labFixture({ request: { detailed_merge_status: "need_rebase" } });
+    expect(await provider.getChangeRequest(7)).toMatchObject({ requiresBaseUpdate: true, mergeable: false });
+    await expect(provider.merge(7, headSha)).rejects.toThrow("must be open");
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it.each(["draft_status", "discussions_not_resolved", "merge_request_blocked", "commits_status", "status_checks_must_pass", "not_open"])("does not request a base update for GitLab status %s", async detailed_merge_status => {
+    const { provider } = labFixture({ request: { detailed_merge_status } });
+    expect((await provider.getChangeRequest(7)).requiresBaseUpdate).toBe(false);
+  });
+
   it.each(["checking", "approvals_syncing", "preparing", "unchecked"])("waits to review while GitLab is %s", async detailed_merge_status => {
     const { provider } = labFixture({ request: { detailed_merge_status } });
-    expect((await provider.getChangeRequest(7)).reviewReady).toBe(false);
+    expect(await provider.getChangeRequest(7)).toMatchObject({ reviewReady: false, requiresBaseUpdate: false });
   });
 
   it("waits to review while the GitLab diff patch ID is null", async () => {
@@ -1130,7 +1243,7 @@ describe("GitLab review and exact-commit merge", () => {
 
   it.each(["not_approved", "requested_changes", "ci_still_running", "ci_must_pass", "conflict"])("allows review while GitLab merge is blocked by %s", async detailed_merge_status => {
     const { provider } = labFixture({ request: { detailed_merge_status } });
-    expect(await provider.getChangeRequest(7)).toMatchObject({ reviewReady: true, mergeable: false });
+    expect(await provider.getChangeRequest(7)).toMatchObject({ reviewReady: true, mergeable: false, requiresBaseUpdate: false });
   });
 
   it.each([undefined, "invalid", 12])("rejects a missing or malformed GitLab diff patch ID %s", async patch_id_sha => {

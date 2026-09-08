@@ -77,6 +77,7 @@ export interface ForgeChangeRequestStatus {
 export interface ForgeChangeRequest extends ForgeChangeRequestSummary, ForgeChangeRequestStatus {
   reviewReady: boolean;
   mergeable: boolean;
+  requiresBaseUpdate: boolean;
   approved: boolean;
   unresolvedDiscussions: number;
   comments: ForgeComment[];

@@ -182,12 +182,14 @@ export class GitLabProvider implements ForgeProvider {
     const baseSha = gitlabHeadSha(refs.base_sha);
     if (diffHeadSha !== headSha)
       throw new ForgeHeadChangedError([headSha, diffHeadSha]);
+    const mergeStatus = string(current.detailed_merge_status);
     return {
       ...gitlabRequestSummary(current),
       ...status,
       linkedIssues,
-      reviewReady: Boolean(patchIdSha) && !["checking", "approvals_syncing", "preparing", "unchecked"].includes(string(current.detailed_merge_status)),
-      mergeable: string(current.detailed_merge_status) === "mergeable",
+      reviewReady: Boolean(patchIdSha) && !["checking", "approvals_syncing", "preparing", "unchecked"].includes(mergeStatus),
+      mergeable: mergeStatus === "mergeable",
+      requiresBaseUpdate: mergeStatus === "need_rebase",
       approved,
       unresolvedDiscussions,
       comments,

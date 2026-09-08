@@ -199,6 +199,19 @@ function parsePendingPublication(
     : text(input.headSha, "published head", 64);
   if (headSha !== undefined && !/^[a-f0-9]{40,64}$/i.test(headSha))
     throw new Error("Invalid published head.");
+  let baseUpdate: NonNullable<ForgeWorker["pendingPublication"]>["baseUpdate"];
+  if (input.baseUpdate !== undefined) {
+    const update = object(input.baseUpdate);
+    const expectedHeadSha = text(update.expectedHeadSha, "base update source head", 64);
+    const baseBranch = text(update.baseBranch, "base update branch", 1024);
+    const updatedHeadSha = update.headSha === undefined ? undefined : text(update.headSha, "base update head", 64);
+    if (!/^[a-f0-9]{40,64}$/i.test(expectedHeadSha) ||
+      updatedHeadSha !== undefined && (!/^[a-f0-9]{40,64}$/i.test(updatedHeadSha) || updatedHeadSha === expectedHeadSha) ||
+      headSha !== undefined && headSha !== updatedHeadSha ||
+      report.discussionReplies.length || report.resolvedDiscussionIds.length)
+      throw new Error("Invalid base update publication checkpoint.");
+    baseUpdate = { expectedHeadSha, baseBranch, ...(updatedHeadSha ? { headSha: updatedHeadSha } : {}) };
+  }
   const previousHeadSha = input.previousHeadSha === undefined
     ? undefined
     : text(input.previousHeadSha, "previous request head", 64);
@@ -232,6 +245,7 @@ function parsePendingPublication(
     throw new Error("Discussion reply progress requires a published head.");
   return {
     report,
+    ...(baseUpdate ? { baseUpdate } : {}),
     ...(headSha !== undefined ? { headSha } : {}),
     ...(previousHeadSha !== undefined ? { previousHeadSha } : {}),
     ...(confirmationStartedAt !== undefined ? { confirmationStartedAt } : {}),
@@ -335,6 +349,10 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
       if (worker.kind !== "issue")
         throw new Error("Only issue workers can have pending publication.");
       parsed.pendingPublication = parsePendingPublication(worker.pendingPublication);
+      const update = parsed.pendingPublication.baseUpdate;
+      if (update && (!parsed.changeNumber || update.baseBranch !== parsed.baseBranch ||
+        parsed.headSha !== update.expectedHeadSha && parsed.headSha !== update.headSha))
+        throw new Error("Base update checkpoint must match the worker's published request and base branch.");
     }
     if (parsed.status === "awaiting_publication" && (
       parsed.kind !== "issue" || !parsed.changeNumber || !parsed.repositoryPath ||

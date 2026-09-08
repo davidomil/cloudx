@@ -90,6 +90,13 @@ interface Runtime {
       branch: string;
     },
     signal?: AbortSignal,
+    expectedHeadSha?: string,
+  ): Promise<string>;
+  updateIssueBranch(
+    workspace: { id: string; repositoryPath: string; worktreePath: string; branch: string },
+    expectedHeadSha: string,
+    baseBranch: string,
+    signal?: AbortSignal,
   ): Promise<string>;
 }
 export interface ForgeWorkflowDependencies {
@@ -765,7 +772,12 @@ export class ForgeWorkflowService {
     loop.phase = "merging";
     worker.status = "awaiting_merge";
     await this.persist();
-    if (!context.change.reviewReady || !context.change.approved || !context.change.mergeable || context.change.draft) return;
+    if (!context.change.reviewReady || !context.change.approved || context.change.draft) return;
+    if (context.change.requiresBaseUpdate) {
+      await this.updateBranchForMerge(worker);
+      return;
+    }
+    if (!context.change.mergeable) return;
     const signal = this.operations.get(worker.id)?.signal;
     await this.deps.runtime.verifyPublishedWorkspace(issueWorkspace(worker), worker.headSha!);
     signal?.throwIfAborted();
@@ -787,7 +799,9 @@ export class ForgeWorkflowService {
         await this.persist();
         if (error.change) {
           requirePublicationRequest(worker, error.change);
-          if (error.change.headSha === worker.headSha) return;
+          const change = error.change;
+          if (change.headSha === worker.headSha &&
+            (!change.reviewReady || !change.approved || !change.mergeable || change.draft || change.unresolvedDiscussions)) return;
         }
       }
       throw error;
@@ -795,6 +809,22 @@ export class ForgeWorkflowService {
     if (!(await this.reconcileMergedChange(worker, { signal })))
       await this.waitForIssueClosure(worker, "Merge succeeded. Waiting for the provider to confirm completion.");
     this.deps.notify("Issue merged", `${worker.title} has merged. Local workers are cleaned up once linked issues are closed.`);
+  }
+  private async updateBranchForMerge(worker: ForgeWorker): Promise<void> {
+    worker.pendingPublication = {
+      report: {
+        kind: "issue",
+        title: worker.title,
+        body: `Update the worker branch from ${worker.baseBranch} before a fresh review.`,
+        discussionReplies: [],
+        resolvedDiscussionIds: [],
+      },
+      baseUpdate: { expectedHeadSha: worker.headSha!, baseBranch: worker.baseBranch },
+      repliedDiscussionIds: [],
+    };
+    worker.status = "starting";
+    await this.persist();
+    await this.issueReady(worker);
   }
   private async issueReady(worker: ForgeWorker): Promise<void> {
     const workspace = issueWorkspace(worker);
@@ -810,13 +840,43 @@ export class ForgeWorkflowService {
         signal?.throwIfAborted();
         if (await this.reconcileMergedChange(worker, { change: previous, signal })) return;
         requirePublicationRequest(worker, previous);
-        publication.previousHeadSha = previous.headSha;
+        this.requireBaseUpdateSource(worker, previous);
+        publication.previousHeadSha = publication.baseUpdate?.expectedHeadSha ?? previous.headSha;
         await this.persist();
       }
-      publication.headSha = await this.deps.runtime.publishBranch(
-        workspace,
-        signal,
-      );
+      if (publication.baseUpdate) {
+        const update = publication.baseUpdate;
+        if (!update.headSha) {
+          const headSha = await this.deps.runtime.updateIssueBranch(workspace, update.expectedHeadSha, update.baseBranch, signal);
+          if (headSha === update.expectedHeadSha) {
+            const current = await provider.getChangeRequest(worker.changeNumber!);
+            signal?.throwIfAborted();
+            if (await this.reconcileMergedChange(worker, { change: current, signal })) return;
+            requirePublicationRequest(worker, current);
+            this.requireBaseUpdateSource(worker, current);
+            if (current.requiresBaseUpdate)
+              throw new Error("The worker branch already contains the current base branch, but the provider still requires an update. Inspect the request before resuming.");
+            worker.pendingPublication = undefined;
+            worker.status = worker.autoReview?.enabled ? "awaiting_merge" : "awaiting_review";
+            worker.error = undefined;
+            await this.persist();
+            return;
+          }
+          update.headSha = headSha;
+          await this.persist();
+        }
+        await this.deps.runtime.verifyPublishedWorkspace(workspace, update.headSha);
+        const latest = await provider.getChangeRequestStatus(worker.changeNumber!);
+        signal?.throwIfAborted();
+        if (await this.reconcileMergedChange(worker, { change: latest, signal })) return;
+        requirePublicationRequest(worker, latest);
+        this.requireBaseUpdateSource(worker, latest);
+        publication.headSha = await this.deps.runtime.publishBranch(workspace, signal, update.headSha);
+        if (publication.headSha !== update.headSha)
+          throw new Error("The published base update does not match its saved local commit.");
+      } else {
+        publication.headSha = await this.deps.runtime.publishBranch(workspace, signal);
+      }
       publication.confirmationStartedAt = new Date(Date.now()).toISOString();
       await this.persist();
     }
@@ -842,6 +902,12 @@ export class ForgeWorkflowService {
       await this.persist();
     }
     await this.confirmPublication(worker);
+  }
+  private requireBaseUpdateSource(worker: ForgeWorker, change: ForgeChangeRequestStatus): void {
+    const update = worker.pendingPublication?.baseUpdate;
+    if (update && (update.baseBranch !== worker.baseBranch ||
+      change.headSha !== update.expectedHeadSha && change.headSha !== update.headSha))
+      throw new Error("The change request changed during the base update. The owned checkout was preserved for inspection.");
   }
   private async confirmPublication(worker: ForgeWorker): Promise<void> {
     const workspace = issueWorkspace(worker);

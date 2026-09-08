@@ -46,6 +46,8 @@ interface GitHubReadiness {
   threads: Map<string, { discussionId: string; resolved: boolean }>;
 }
 type GitHubSnapshot = Pick<ForgeChangeRequestStatus, "headSha" | "headBranch" | "baseBranch" | "state">;
+const githubMergeMethods = ["squash", "merge", "rebase"] as const;
+type GitHubMergeMethod = typeof githubMergeMethods[number];
 
 export class GitHubProvider implements ForgeProvider {
   private readonly path: string;
@@ -122,6 +124,7 @@ export class GitHubProvider implements ForgeProvider {
       mergeable:
         readiness.mergeable === "MERGEABLE" &&
         readiness.mergeStateStatus === "CLEAN",
+      requiresBaseUpdate: readiness.mergeStateStatus === "BEHIND",
       approved,
       unresolvedDiscussions: readiness.unresolved,
       comments: [
@@ -296,9 +299,11 @@ export class GitHubProvider implements ForgeProvider {
     expectedHeadSha: string,
   ): Promise<ForgeMergeResult> {
     let request: ForgeChangeRequest | undefined;
+    let mergeMethod: GitHubMergeMethod;
     try {
       request = await this.getChangeRequest(number);
       requireMergeReady(request, expectedHeadSha);
+      mergeMethod = await this.chooseMergeMethod(request.baseBranch);
     } catch (error) {
       throw new ForgeMergeNotStartedError(error, request);
     }
@@ -307,13 +312,44 @@ export class GitHubProvider implements ForgeProvider {
         await this.http.request(`${this.pullPath(number)}/merge`, {
           method: "PUT",
           role: "worker",
-          body: { sha: expectedHeadSha },
+          body: { sha: expectedHeadSha, merge_method: mergeMethod },
         })
       ).body,
     );
     if (!boolean(response.merged))
       throw new ForgeProviderError("GitHub did not confirm the merge.", 409);
     return { merged: true, sha: string(response.sha) };
+  }
+
+  private async chooseMergeMethod(baseBranch: string): Promise<GitHubMergeMethod> {
+    const [response, rules] = await Promise.all([
+      this.http.request(this.path),
+      this.http.all(`${this.path}/rules/branches/${encodeURIComponent(baseBranch)}`),
+    ]);
+    const repository = record(response.body);
+    const enabled = {
+      squash: boolean(repository.allow_squash_merge),
+      merge: boolean(repository.allow_merge_commit),
+      rebase: boolean(repository.allow_rebase_merge),
+    };
+    let allowed = githubMergeMethods.filter(method => enabled[method]);
+    for (const value of rules) {
+      const rule = record(value);
+      const type = string(rule.type);
+      if (!type) return invalid();
+      if (type === "required_linear_history")
+        allowed = allowed.filter(method => method !== "merge");
+      if (type !== "pull_request" || rule.parameters === undefined) continue;
+      const parameters = record(rule.parameters);
+      if (parameters.allowed_merge_methods === undefined) continue;
+      const methods = list(parameters.allowed_merge_methods).map(string);
+      if (!methods.length || methods.some(method => !githubMergeMethods.some(known => known === method)))
+        return invalid();
+      allowed = allowed.filter(method => methods.includes(method));
+    }
+    if (!allowed.length)
+      throw new ForgeProviderError("The repository and branch rules have no permitted merge method in common.", 409);
+    return allowed[0];
   }
 
   async replyToDiscussion(

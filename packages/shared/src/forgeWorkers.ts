@@ -36,6 +36,11 @@ export interface ForgeWorker {
   publicationState?: "creating" | "uncertain" | "created";
   pendingPublication?: {
     report: ForgeIssueCompletionReport;
+    baseUpdate?: {
+      expectedHeadSha: string;
+      baseBranch: string;
+      headSha?: string;
+    };
     headSha?: string;
     previousHeadSha?: string;
     confirmationStartedAt?: string;

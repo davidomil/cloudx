@@ -64,6 +64,13 @@ interface DirectoryIdentity {
   ino: string;
 }
 
+interface OwnedBaseUpdate {
+  expectedHeadSha: string;
+  baseBranch: string;
+  targetHeadSha?: string;
+  headSha?: string;
+}
+
 interface OwnedWorkspace extends ForgeWorkspace {
   repository: DirectoryIdentity;
   worktree: DirectoryIdentity;
@@ -79,6 +86,7 @@ interface OwnedWorkspace extends ForgeWorkspace {
   baseCommit: string;
   prepared: boolean;
   launchPending: boolean;
+  baseUpdate?: OwnedBaseUpdate;
 }
 
 interface OwnedTab {
@@ -503,6 +511,7 @@ export class ForgeRuntime {
   async publishBranch(
     workspace: ForgeWorkspace,
     signal?: AbortSignal,
+    expectedHeadSha?: string,
   ): Promise<string> {
     return this.serialize(workspace.id, async () => {
       const owned = await this.matchOwned(workspace);
@@ -511,7 +520,9 @@ export class ForgeRuntime {
       await this.assertQuiescent(owned);
       await this.assertCheckout(owned);
       const headSha = await this.requireBranchHead(owned, signal);
-      await this.verifyCleanHead(owned, headSha, signal);
+      await this.verifyCleanHead(owned, expectedHeadSha ?? headSha, signal);
+      if (expectedHeadSha && headSha !== expectedHeadSha)
+        throw new Error("Worker head differs from the recorded branch update.");
       const access = await this.access(
         owned.expectedRepository,
         "worker",
@@ -521,6 +532,7 @@ export class ForgeRuntime {
         throw new Error(
           "Repository origin changed while the worker was running.",
         );
+      if (expectedHeadSha) await this.verifyCleanHead(owned, expectedHeadSha, signal);
       await this.runOwnedGit(
         owned,
         ["push", access.cloneUrl, `${headSha}:refs/heads/${owned.branch}`],
@@ -530,6 +542,122 @@ export class ForgeRuntime {
       await this.verifyCleanHead(owned, headSha, signal);
       return headSha;
     });
+  }
+
+  updateIssueBranch(
+    workspace: ForgeWorkspace,
+    expectedHeadSha: string,
+    baseBranch: string,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    return this.serialize(workspace.id, async () => {
+      signal?.throwIfAborted();
+      if (!isCommitSha(expectedHeadSha)) throw new Error("Branch updates require an exact published head commit.");
+      baseBranch = baseBranch.trim();
+      if (!baseBranch || baseBranch.startsWith("-") || /[\r\n\0]/u.test(baseBranch))
+        throw new Error("A valid target branch is required.");
+      const owned = await this.matchOwned(workspace);
+      if (!owned.prepared || !owned.branchOwned || !owned.branch || owned.cleaned)
+        throw new Error("Only an owned issue branch can be updated from its target.");
+      await this.assertQuiescent(owned);
+      await this.assertCheckout(owned);
+      await this.requireNoGitOperation(owned);
+      await this.runGit(owned.worktreePath, ["check-ref-format", "--branch", baseBranch], signal);
+      const previous = owned.baseUpdate;
+      const sameUpdate = previous?.expectedHeadSha === expectedHeadSha && previous.baseBranch === baseBranch;
+      if (sameUpdate && previous.headSha && previous.headSha !== expectedHeadSha) {
+        await this.verifyCleanHead(owned, previous.headSha, signal);
+        return previous.headSha;
+      }
+      if (previous && !previous.headSha && !sameUpdate)
+        throw new Error("A previous branch update is unfinished. Inspect it before starting another update.");
+      if (previous && !previous.headSha && await this.requireBranchHead(owned, signal) !== expectedHeadSha)
+        throw new Error("The local branch changed before its update result was recorded. Inspect the retained work before resuming.");
+      await this.verifyCleanHead(owned, expectedHeadSha, signal);
+      const access = await this.access(owned.expectedRepository, "worker", signal);
+      if (access.cloneUrl !== owned.origin)
+        throw new Error("Repository origin changed while the worker was running.");
+      const update: OwnedBaseUpdate = { expectedHeadSha, baseBranch };
+      owned.baseUpdate = update;
+      await this.manifest(owned.id).write(owned);
+      await this.runOwnedGit(owned, [
+        "fetch", "--no-tags", "--no-recurse-submodules", access.cloneUrl,
+        `refs/heads/${baseBranch}:refs/cloudx/update-base`,
+      ], signal, access.authorization);
+      const targetHeadSha = (await this.runGit(owned.worktreePath,
+        ["rev-parse", "--verify", "refs/cloudx/update-base^{commit}"], signal)).trim();
+      if (!isCommitSha(targetHeadSha)) throw new Error("The fetched target branch has no valid commit.");
+      update.targetHeadSha = targetHeadSha;
+      await this.manifest(owned.id).write(owned);
+      await this.requireNoGitOperation(owned);
+      await this.verifyCleanHead(owned, expectedHeadSha, signal);
+      try {
+        await this.runOwnedGit(owned, [
+          "merge", "--no-ff", "--no-edit", "--no-stat", "--no-gpg-sign", "--no-autostash", "--no-overwrite-ignore",
+          "-m", `FORGE: update from ${baseBranch}`, targetHeadSha,
+        ], signal);
+      } catch (error) {
+        try {
+          await this.abortBaseUpdate(owned, expectedHeadSha, targetHeadSha);
+          owned.baseUpdate = undefined;
+          await this.manifest(owned.id).write(owned);
+        } catch (abortError) {
+          throw new AggregateError([error, abortError], "Branch update failed and its merge could not be fully aborted. Local work was preserved.");
+        }
+        signal?.throwIfAborted();
+        throw new Error("The target branch merge failed. Its changes were aborted and the published issue work was preserved.", { cause: error });
+      }
+      const headSha = await this.requireBranchHead(owned);
+      await this.requireNoGitOperation(owned);
+      await this.verifyCleanHead(owned, headSha);
+      if (headSha === expectedHeadSha) {
+        await this.runGit(owned.worktreePath, ["merge-base", "--is-ancestor", targetHeadSha, headSha]);
+      } else {
+        const parents = (await this.runGit(owned.worktreePath, ["rev-list", "--parents", "-n", "1", headSha])).trim();
+        if (parents !== `${headSha} ${expectedHeadSha} ${targetHeadSha}`)
+          throw new Error("The branch update result does not match its recorded source and target. Local work was preserved.");
+      }
+      update.headSha = headSha;
+      await this.manifest(owned.id).write(owned);
+      signal?.throwIfAborted();
+      return headSha;
+    });
+  }
+
+  private async abortBaseUpdate(owned: OwnedWorkspace, expectedHeadSha: string, targetHeadSha: string): Promise<void> {
+    await this.assertCheckout(owned);
+    await this.requireNoGitOperation(owned, { ownedMerge: true });
+    let mergeExists = false;
+    try {
+      const stat = await fs.lstat(path.join(owned.worktreePath, ".git", "MERGE_HEAD"));
+      if (!stat.isFile()) throw new Error("Merge ownership changed. Local work was preserved.");
+      mergeExists = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (mergeExists) {
+      const mergeHead = (await this.runGit(owned.worktreePath, ["rev-parse", "--verify", "MERGE_HEAD^{commit}"])).trim();
+      const originalHead = (await this.runGit(owned.worktreePath, ["rev-parse", "--verify", "ORIG_HEAD^{commit}"])).trim();
+      if (mergeHead !== targetHeadSha || originalHead !== expectedHeadSha || await this.requireBranchHead(owned) !== expectedHeadSha)
+        throw new Error("The pending merge does not match this branch update. Local work was preserved.");
+      await this.runOwnedGit(owned, ["merge", "--abort"]);
+    }
+    await this.requireNoGitOperation(owned);
+    await this.verifyCleanHead(owned, expectedHeadSha);
+  }
+
+  private async requireNoGitOperation(owned: OwnedWorkspace, { ownedMerge = false } = {}): Promise<void> {
+    const names = ["MERGE_HEAD", "MERGE_AUTOSTASH", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "index.lock", "HEAD.lock"];
+    for (const name of names) {
+      if (ownedMerge && name === "MERGE_HEAD") continue;
+      try {
+        await fs.lstat(path.join(owned.worktreePath, ".git", name));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      throw new Error("A Git operation is already in progress. Inspect the owned checkout before updating its branch.");
+    }
   }
 
   cleanup(workspace: ForgeWorkspace, signal?: AbortSignal): Promise<void> {
@@ -780,6 +908,8 @@ export class ForgeRuntime {
           value.gitDirectory.path !== path.join(value.worktreePath, ".git"))) ||
       (value.gitConfigHash !== undefined &&
         !/^[a-f0-9]{64}$/u.test(value.gitConfigHash)) ||
+      (value.baseUpdate !== undefined &&
+        (value.role !== "worker" || !isOwnedBaseUpdate(value.baseUpdate))) ||
       (value.branch !== "" && value.branch !== `cloudx/forge/${id}`)
     )
       throw new Error(
@@ -1080,6 +1210,20 @@ function safeId(id: string): string {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,100}$/u.test(id))
     throw new Error("Invalid Forge worker id.");
   return id;
+}
+
+function isCommitSha(value: unknown): value is string {
+  return typeof value === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/iu.test(value);
+}
+
+function isOwnedBaseUpdate(value: unknown): value is OwnedBaseUpdate {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const update = value as Partial<OwnedBaseUpdate>;
+  return isCommitSha(update.expectedHeadSha) && typeof update.baseBranch === "string" &&
+    Boolean(update.baseBranch) && update.baseBranch === update.baseBranch.trim() &&
+    !update.baseBranch.startsWith("-") && !/[\r\n\0]/u.test(update.baseBranch) &&
+    (update.targetHeadSha === undefined || isCommitSha(update.targetHeadSha)) &&
+    (update.headSha === undefined || Boolean(update.targetHeadSha) && isCommitSha(update.headSha));
 }
 
 export function assertForgeOrigin(

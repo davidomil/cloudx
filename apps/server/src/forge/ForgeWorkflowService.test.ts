@@ -24,6 +24,7 @@ function fixture() {
     baseBranch: "main",
     merged: false,
     mergeable: true,
+    requiresBaseUpdate: false,
     reviewReady: true,
     approved: false,
     unresolvedDiscussions: 0,
@@ -75,6 +76,7 @@ function fixture() {
     close: vi.fn(async () => {}),
     cleanup: vi.fn(async () => {}),
     verifyPublishedWorkspace: vi.fn(async () => {}),
+    updateIssueBranch: vi.fn(async (_workspace: unknown, _head: string, _baseBranch: string, _signal?: AbortSignal) => "c".repeat(40)),
     publishBranch: vi.fn(async () => change.headSha),
   };
   const reports = {
@@ -1548,9 +1550,114 @@ describe("Forge issue auto review", () => {
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
     expect(f.provider.postReview).toHaveBeenCalledOnce();
     expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(f.runtime.updateIssueBranch).not.toHaveBeenCalled();
     f.change.mergeable = true;
     await f.poll();
     expect(f.provider.merge).toHaveBeenCalledOnce();
+    expect(f.stored()).toEqual([]);
+  });
+
+  it("updates an approved behind branch, confirms its publication and requires a fresh review", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    const previousHead = f.change.headSha;
+    const firstReview = f.currentReview();
+    const updatedHead = "c".repeat(40);
+    f.change.requiresBaseUpdate = true;
+    f.change.mergeable = false;
+    f.runtime.updateIssueBranch.mockImplementation(async () => {
+      expect(f.currentIssue().pendingPublication).toMatchObject({
+        baseUpdate: { expectedHeadSha: previousHead, baseBranch: "main" },
+        report: { discussionReplies: [], resolvedDiscussionIds: [] },
+      });
+      return updatedHead;
+    });
+    f.runtime.publishBranch.mockImplementation(async () => {
+      expect(f.currentIssue().pendingPublication).toMatchObject({ baseUpdate: { headSha: updatedHead } });
+      f.change.headSha = updatedHead;
+      f.change.requiresBaseUpdate = false;
+      return updatedHead;
+    });
+    f.report({ kind: "review", headSha: previousHead, event: "approve", body: "Ready", comments: [] });
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_review", headSha: updatedHead });
+    expect(f.currentIssue().pendingPublication).toBeUndefined();
+    expect(f.runtime.updateIssueBranch).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: f.issue.id }), previousHead, "main", expect.any(AbortSignal));
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    await f.poll();
+    expect(f.currentReview().id).not.toBe(firstReview.id);
+    expect(f.currentReview().headSha).toBe(updatedHead);
+    f.change.mergeable = true;
+    f.report({ kind: "review", headSha: updatedHead, event: "approve", body: "Updated branch is sound", comments: [] });
+    await f.poll();
+    expect(f.provider.merge).toHaveBeenCalledExactlyOnceWith(7, updatedHead);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+    expect(f.stored()).toEqual([]);
+  });
+
+  it("resumes a saved branch update after restart without launching a coding worker", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    const previousHead = f.change.headSha;
+    f.change.requiresBaseUpdate = true;
+    f.change.mergeable = false;
+    f.runtime.updateIssueBranch.mockRejectedValueOnce(new Error("Base update conflicted"));
+    f.report({ kind: "review", headSha: previousHead, event: "approve", body: "Ready", comments: [] });
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "failed", pendingPublication: { baseUpdate: { expectedHeadSha: previousHead, baseBranch: "main" } } });
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    f.runtime.publishBranch.mockImplementation(async () => {
+      f.change.headSha = "c".repeat(40);
+      f.change.requiresBaseUpdate = false;
+      return f.change.headSha;
+    });
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.resume(f.issue.id, placement);
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_review", headSha: "c".repeat(40) });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(f.runtime.updateIssueBranch).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves a local base update if another actor changes the published branch before its push", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    const previousHead = f.change.headSha;
+    f.change.requiresBaseUpdate = true;
+    f.change.mergeable = false;
+    f.runtime.updateIssueBranch.mockImplementation(async () => {
+      f.change.headSha = "d".repeat(40);
+      return "c".repeat(40);
+    });
+    f.report({ kind: "review", headSha: previousHead, event: "approve", body: "Ready", comments: [] });
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "failed", error: expect.stringMatching(/changed.*base update/i), pendingPublication: { baseUpdate: { expectedHeadSha: previousHead, headSha: "c".repeat(40) } } });
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not republish or re-review an unchanged head when the provider reports a stale behind state", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    f.change.requiresBaseUpdate = true;
+    f.change.mergeable = false;
+    f.runtime.updateIssueBranch.mockResolvedValue(f.change.headSha);
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "failed", error: expect.stringMatching(/already contains.*base branch/i) });
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    f.change.requiresBaseUpdate = false;
+    f.change.mergeable = true;
+    await f.service.resume(f.issue.id, placement);
+    await f.poll();
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).toHaveBeenCalledExactlyOnceWith(7, f.change.headSha);
     expect(f.stored()).toEqual([]);
   });
 
@@ -1794,6 +1901,21 @@ describe("Forge issue auto review", () => {
     expect(f.stored()).toEqual([]);
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
     expect(f.provider.postReview).toHaveBeenCalledOnce();
+  });
+
+  it("surfaces a merge method preflight failure instead of silently checking the ready request forever", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    f.provider.merge.mockImplementation(async () => {
+      throw new ForgeMergeNotStartedError(new ForgeProviderError("No permitted merge method", 409), { ...f.change });
+    });
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "failed", error: expect.stringContaining("No permitted merge method") });
+    expect(f.currentIssue().autoReview?.mergeAttempted).toBeUndefined();
+    await f.poll();
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
   });
 
   it("preserves a confirmed posted review when saving its receipt initially fails", async () => {
