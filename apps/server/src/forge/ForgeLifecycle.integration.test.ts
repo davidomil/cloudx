@@ -1063,9 +1063,9 @@ const report = isReview
   : { kind: "issue", title: "Handle empty input", body: "Implemented and verified the fixture changes.", discussionReplies: (context.change?.comments ?? []).filter(comment => comment.discussionId && comment.resolved === false).map(comment => ({ discussionId: comment.discussionId, body: "Added and verified the empty-input regression." })), resolvedDiscussionIds: (context.change?.comments ?? []).filter(comment => comment.discussionId && comment.resolved === false).map(comment => comment.discussionId) };
 const receipt = { pid: process.pid, trustedProjectPath, gitAuthorizationPresent: Object.entries(process.env).some(([key, value]) => key.startsWith("GIT_CONFIG_VALUE_") && value?.includes("Authorization:")), args, templateId: process.env.CLOUDX_PERSONALITY_TEMPLATE_ID, skillIds: process.env.CLOUDX_ENABLED_SKILL_IDS, codexHome: process.env.CODEX_HOME, reportPath, contextPath, context, headSha, localReview };
 fs.writeFileSync(path.join(process.env.FORGE_FIXTURE_RECEIPTS, path.basename(reportPath)), JSON.stringify(receipt));
+process.on("SIGUSR2", () => process.exit(0));
 fs.writeFileSync(reportPath + ".tmp", JSON.stringify(report));
 fs.renameSync(reportPath + ".tmp", reportPath);
-process.on("SIGUSR2", () => process.exit(0));
 console.log("FORGE_FIXTURE_REPORT_READY");
 setInterval(() => {}, 1000);
 `;
