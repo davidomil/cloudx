@@ -169,8 +169,8 @@ function ForgeItems({ kind, provider, request, revision, workers, placement, run
   }, [request, kind, selectedNumber, revision]);
 
   useEffect(() => { setReviewBody(""); }, [selectedNumber]);
-  const selectedWorkers = workers.filter((worker) => kind === "issues" ? worker.kind === "issue" && worker.number === selectedNumber : worker.kind === "review" && worker.number === selectedNumber);
-  const activeWorker = selectedWorkers.find((worker) => worker.status !== "completed");
+  const selectedWorkers = workersForItem(workers, kind, selectedNumber);
+  const activeWorker = selectedWorkers.find((worker) => worker.kind === (kind === "issues" ? "issue" : "review") && worker.status !== "completed");
   const currentDetail = detail?.number === selectedNumber ? detail : undefined;
   const item = currentDetail ?? selected;
   const applyScope = (scope?: ForgeListScope) => {
@@ -196,11 +196,13 @@ function ForgeItems({ kind, provider, request, revision, workers, placement, run
         {listError ? <p className="forge-notice" role="alert">{listError}</p> : null}
         {listBusy ? <p role="status" className="forge-empty">Loading {kind === "issues" ? "issues" : "requests"}…</p> : null}
         {page?.items.map((entry) => {
-          const drafts = workers.filter((worker) => worker.kind === "review" && worker.number === entry.number && worker.draft && worker.draft.status !== "posted");
+          const itemWorkers = workersForItem(workers, kind, entry.number);
+          const drafts = itemWorkers.filter((worker) => worker.kind === "review" && worker.draft && worker.draft.status !== "posted");
           const comments = drafts.reduce((count, worker) => count + (worker.draft?.comments.length ?? 0), 0);
           return <button type="button" key={entry.number} className={`forge-item${selectedNumber === entry.number ? " selected" : ""}`} onClick={() => setSelected(entry)} aria-pressed={selectedNumber === entry.number}>
             <span className="forge-item-title">#{entry.number} {entry.title}</span>
             <span className="forge-muted">{entry.state} · {entry.author}{entry.labels.length ? ` · ${entry.labels.join(", ")}` : ""}</span>
+            <ItemWorkerStats workers={itemWorkers} />
             {kind === "changes" && drafts.length ? <span className="forge-badge"><MessageSquare size={13} /> {comments} suggested {comments === 1 ? "comment" : "comments"} · {drafts.length} review {drafts.length === 1 ? "draft" : "drafts"}</span> : null}
           </button>;
         })}
@@ -217,6 +219,7 @@ function ForgeItems({ kind, provider, request, revision, workers, placement, run
           <p className="forge-muted">{item.state} · {item.author}</p>
           {detailBusy ? <p role="status">Loading latest details…</p> : null}
           {detailError ? <p role="alert" className="forge-notice">{detailError}</p> : null}
+          {selectedWorkers.map((worker) => <WorkerCard key={worker.id} worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} />)}
           <p className="forge-prose">{item.body}</p>
           {kind === "issues" ? <>
             <div className="forge-actions"><ControlButton tone="primary" size="compact" disabled={busy || !!activeWorker || item.state !== "open"} onClick={() => void runAction(() => request("forge.issue.start", { number: item.number, ...placement }))}><Play size={14} /> Start work</ControlButton></div>
@@ -234,12 +237,32 @@ function ForgeItems({ kind, provider, request, revision, workers, placement, run
             </div>
             <p className="forge-muted">Reviews are submitted using the configured reviewer identity. A message is required when requesting changes.</p>
           </>}
-          {selectedWorkers.map((worker) => <WorkerCard key={worker.id} worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} />)}
           <ForgeComments comments={currentDetail?.comments ?? []} />
         </> : <p className="forge-empty">Select {kind === "issues" ? "an issue" : `a ${singular}`}.</p>}
       </div>
     </div>
   </div>;
+}
+
+function workersForItem(workers: ForgeWorker[], kind: "issues" | "changes", number?: number) {
+  if (number === undefined) return [];
+  return workers.filter(worker => kind === "issues"
+    ? worker.kind === "issue" && worker.number === number
+    : (worker.kind === "issue" ? worker.changeNumber : worker.number) === number);
+}
+
+function ItemWorkerStats({ workers }: { workers: ForgeWorker[] }) {
+  const currentWorkers = workers.filter(worker => worker.status !== "completed" || (worker.kind === "review" && worker.draft?.status === "post_failed"));
+  if (!currentWorkers.length) return null;
+  return <span className="forge-item-workers">
+    {currentWorkers.map(worker => {
+      const postFailed = worker.status === "completed" && worker.draft?.status === "post_failed";
+      return <span key={worker.id} className="forge-item-worker">
+        <span className={`forge-status forge-status-${postFailed ? "failed" : worker.status}`}>{worker.kind === "issue" ? "Coding" : "Review"} · {postFailed ? "post failed" : worker.status.replaceAll("_", " ")}</span>
+        {worker.error ? <span className="forge-item-worker-error" title={worker.error}>{worker.error}</span> : null}
+      </span>;
+    })}
+  </span>;
 }
 
 function WorkerCard({ worker, request, placement, runAction, busy, onViewWorker }: {

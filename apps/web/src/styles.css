@@ -3545,6 +3545,9 @@ a:hover svg {
 .forge-item:hover, .forge-item.selected { background: color-mix(in srgb, var(--color-accent) 10%, transparent); }
 .forge-item.selected { box-shadow: inset 3px 0 var(--color-accent); }
 .forge-item-title { font-weight: 600; }
+.forge-item-workers, .forge-item-worker { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.forge-item-worker .forge-status { width: fit-content; }
+.forge-item-worker-error { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; color: var(--color-warning); font-size: var(--font-size-xs); }
 .forge-muted { color: var(--color-muted-foreground); font-size: var(--font-size-sm); overflow-wrap: anywhere; }
 .forge-pagination { justify-content: space-between; padding: 12px; font-size: var(--font-size-sm); }
 .forge-detail { padding: 16px; min-width: 0; overflow: auto; }

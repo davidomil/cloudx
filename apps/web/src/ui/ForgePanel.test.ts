@@ -329,6 +329,167 @@ describe("ForgePanel", () => {
     await act(async () => { started.resolve({ worker }); });
   });
 
+  it.each(["github", "gitlab"] as const)("shows every active or blocked coding/review status under %s items", async provider => {
+    const currentRepository = { ...repository, provider };
+    const statuses = ["starting", "running", "paused", "awaiting_review", "stopped", "failed", "cleanup_failed"] as const;
+    const codingWorkers = statuses.map(status => ({ ...worker, repository: currentRepository, id: `coding-${status}`, changeNumber: change.number, status, error: status === "failed" || status === "cleanup_failed" ? `Coding ${status} reason.` : undefined }));
+    const reviewers = statuses.map(status => ({ ...reviewWorker, repository: currentRepository, id: `review-${status}`, status, draft: undefined, error: status === "failed" || status === "cleanup_failed" ? `Review ${status} reason.` : undefined }));
+    const panel = await renderPanel(fixture({ repository: currentRepository, workers: [...codingWorkers, ...reviewers] }));
+    const issueRow = panel.querySelector(".forge-item")!;
+    expect(issueRow.querySelectorAll(".forge-item-workers .forge-item-worker")).toHaveLength(statuses.length);
+    for (const status of statuses) expect(issueRow.textContent).toContain(`Coding · ${status.replaceAll("_", " ")}`);
+    expect(issueRow.querySelectorAll(".forge-item-worker-error")).toHaveLength(2);
+    expect(issueRow.textContent).toContain("Coding failed reason.");
+    expect(issueRow.textContent).toContain("Coding cleanup_failed reason.");
+
+    await click(panel, provider === "github" ? "Pull requests" : "Merge requests");
+    const changeRow = panel.querySelector(".forge-item")!;
+    expect(changeRow.querySelectorAll(".forge-item-workers .forge-item-worker")).toHaveLength(statuses.length * 2);
+    for (const status of statuses) {
+      expect(changeRow.textContent).toContain(`Coding · ${status.replaceAll("_", " ")}`);
+      expect(changeRow.textContent).toContain(`Review · ${status.replaceAll("_", " ")}`);
+    }
+    expect(changeRow.querySelectorAll(".forge-item-worker-error")).toHaveLength(4);
+    expect(changeRow.textContent).toContain("Review failed reason.");
+    expect(changeRow.textContent).toContain("Review cleanup_failed reason.");
+    const cards = panel.querySelectorAll(".forge-detail .forge-worker");
+    expect(cards).toHaveLength(statuses.length * 2);
+    const body = panel.querySelector(".forge-detail > .forge-prose")!;
+    for (const card of cards) expect(card.compareDocumentPosition(body) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(panel.querySelector("dialog")).toBeNull();
+  });
+
+  it.each(["github", "gitlab"] as const)("keeps %s list workers isolated by repository, kind, and linked change number", async provider => {
+    const currentRepository = { ...repository, provider };
+    const coding = { ...worker, repository: currentRepository, changeNumber: change.number };
+    const reviewer = { ...reviewWorker, repository: currentRepository, status: "running" as const, draft: undefined };
+    const numberCollision = { ...coding, id: "other-issue", number: change.number, changeNumber: 99, error: "Other issue worker." };
+    const reviewCollision = { ...reviewer, id: "other-review", number: issue.number, error: "Other review worker." };
+    const foreignRepositories = [
+      { ...currentRepository, provider: provider === "github" ? "gitlab" as const : "github" as const },
+      { ...currentRepository, apiUrl: "https://another-host.example/api" },
+      { ...currentRepository, projectPath: "another/project" }
+    ];
+    const foreignWorkers = foreignRepositories.flatMap((foreignRepository, index) => [
+      { ...coding, id: `foreign-coding-${index}`, repository: foreignRepository, error: "Foreign coding worker." },
+      { ...reviewer, id: `foreign-review-${index}`, repository: foreignRepository, error: "Foreign review worker." }
+    ]);
+    const testFixture = fixture({ repository: currentRepository, workers: [coding, reviewer, numberCollision, reviewCollision, ...foreignWorkers] }, hook => {
+      if (hook === "forge.issues.list") return { items: [issue, { ...issue, number: change.number, title: "Another issue" }] };
+      if (hook === "forge.changes.list") return { items: [change, { ...change, number: issue.number, title: "Another change" }] };
+    });
+    const panel = await renderPanel(testFixture);
+    const issues = panel.querySelectorAll(".forge-item");
+    expect(issues[0].querySelectorAll(".forge-item-worker")).toHaveLength(1);
+    expect(issues[0].textContent).toContain("Coding · running");
+    expect(issues[0].textContent).not.toMatch(/Other|Foreign|Review ·/);
+    expect(issues[1].textContent).toContain("Other issue worker.");
+    expect(panel.querySelectorAll(".forge-detail .forge-worker")).toHaveLength(1);
+
+    await click(panel, provider === "github" ? "Pull requests" : "Merge requests");
+    const changes = panel.querySelectorAll(".forge-item");
+    expect(changes[0].querySelectorAll(".forge-item-worker")).toHaveLength(2);
+    expect(changes[0].textContent).toContain("Coding · running");
+    expect(changes[0].textContent).toContain("Review · running");
+    expect(changes[0].textContent).not.toMatch(/Other|Foreign/);
+    expect(changes[1].querySelectorAll(".forge-item-worker")).toHaveLength(1);
+    expect(changes[1].textContent).toContain("Other review worker.");
+    expect(panel.querySelectorAll(".forge-detail .forge-worker")).toHaveLength(2);
+    expect(panel.querySelector('.forge-detail [aria-label="issue worker #7"]')).not.toBeNull();
+    expect(panel.querySelector('.forge-detail [aria-label="review worker #12"]')).not.toBeNull();
+    expect(panel.querySelector("dialog")).toBeNull();
+  });
+
+  it.each(["issues", "changes"] as const)("only an unfinished worker of the matching kind prevents starting work from %s", async kind => {
+    const unrelated = kind === "issues"
+      ? { ...reviewWorker, number: issue.number, status: "running" as const, draft: undefined }
+      : { ...worker, changeNumber: change.number, status: "awaiting_review" as const };
+    const completed = kind === "issues" ? { ...worker, status: "completed" as const } : { ...reviewWorker, draft: undefined };
+    const started = kind === "issues" ? { ...worker, status: "starting" as const } : { ...reviewWorker, status: "starting" as const, draft: undefined };
+    const startHook = kind === "issues" ? "forge.issue.start" : "forge.review.start";
+    let testFixture: ReturnType<typeof fixture>;
+    testFixture = fixture({ workers: [unrelated, completed] }, hook => {
+      if (hook === "forge.dashboard") return structuredClone(testFixture.dashboard);
+      if (hook === startHook) { testFixture.dashboard.workers = [unrelated, started]; return { worker: started }; }
+    });
+    const panel = await renderPanel(testFixture);
+    if (kind === "changes") await click(panel, "Pull requests");
+    const action = kind === "issues" ? "Start work" : "Review";
+    expect(button(panel, action).disabled).toBe(false);
+    if (kind === "changes") expect(button(panel, "Review and post").disabled).toBe(false);
+    await click(panel, action);
+    expect(button(panel, action).disabled).toBe(true);
+    if (kind === "changes") expect(button(panel, "Review and post").disabled).toBe(true);
+    expect(panel.querySelector(".forge-item")?.textContent).toContain(`${kind === "issues" ? "Coding" : "Review"} · starting`);
+    await click(panel, action);
+    expect(testFixture.calls.filter(call => call.hook === startHook)).toHaveLength(1);
+    expect(panel.querySelector("dialog")).toBeNull();
+  });
+
+  it("shows completed review publication failures while excluding ordinary completion and retaining draft counts", async () => {
+    const failedReview = { ...reviewWorker, id: "failed-review", error: "Posting outcome is uncertain.", draft: { ...reviewWorker.draft!, status: "post_failed" as const } };
+    const postedReview = { ...reviewWorker, id: "posted-review", draft: { ...reviewWorker.draft!, status: "posted" as const } };
+    const panel = await renderPanel(fixture({ workers: [{ ...worker, status: "completed", changeNumber: change.number }, reviewWorker, postedReview, failedReview] }));
+    expect(panel.querySelectorAll(".forge-item-worker")).toHaveLength(0);
+    await click(panel, "Pull requests");
+    const row = panel.querySelector(".forge-item")!;
+    expect(row.querySelectorAll(".forge-item-worker")).toHaveLength(1);
+    expect(row.querySelector(".forge-item-worker")?.textContent).toContain("Review · post failed");
+    expect(row.querySelector(".forge-item-worker-error")?.textContent).toBe("Posting outcome is uncertain.");
+    expect(row.textContent).toContain("2 suggested comments · 2 review drafts");
+    expect(row.textContent).not.toContain("completed");
+    expect(panel.querySelector("dialog")).toBeNull();
+  });
+
+  it("keeps an unfinished review's cleanup failure visible even when its draft publication also failed", async () => {
+    const panel = await renderPanel(fixture({ workers: [{ ...reviewWorker, status: "cleanup_failed", error: "Owned worktree cleanup failed.", draft: { ...reviewWorker.draft!, status: "post_failed" } }] }));
+    await click(panel, "Pull requests");
+    const row = panel.querySelector(".forge-item")!;
+    expect(row.querySelector(".forge-item-worker .forge-status")?.textContent).toBe("Review · cleanup failed");
+    expect(row.querySelector(".forge-item-worker-error")?.textContent).toBe("Owned worktree cleanup failed.");
+    expect(button(panel.querySelector(".forge-detail")!, "Clean up").disabled).toBe(false);
+  });
+
+  it.each(["issues", "changes"] as const)("updates %s worker failures and removal through polling without changing selection or opening terminals", async kind => {
+    vi.useFakeTimers();
+    const first = kind === "issues" ? issue : change;
+    const selected = { ...first, number: first.number + 1, title: "Selected item" };
+    const liveWorker: ForgeWorker = { ...worker, id: "live-worker", kind: kind === "issues" ? "issue" : "review", number: selected.number, tabId: "live-terminal" };
+    const liveTab = { ...workerTab, id: liveWorker.tabId!, pluginMetadata: { "forge-workers": { workerId: liveWorker.id } } };
+    let testFixture: ReturnType<typeof fixture>;
+    testFixture = fixture({ workers: [liveWorker] }, (hook, input) => {
+      if (hook === "forge.dashboard") return structuredClone(testFixture.dashboard);
+      if (hook === `forge.${kind}.list`) return { items: [first, selected] };
+      if (hook === (kind === "issues" ? "forge.issue.get" : "forge.change.get")) return { [kind === "issues" ? "issue" : "change"]: input.number === selected.number ? selected : first };
+    });
+    const panel = await renderPanel(testFixture, { workerTabs: [liveTab] });
+    if (kind === "changes") await click(panel, "Pull requests");
+    const row = panel.querySelectorAll<HTMLButtonElement>(".forge-item")[1];
+    await act(async () => { row.querySelector<HTMLElement>(".forge-item-worker")!.click(); });
+    expect(row.getAttribute("aria-pressed")).toBe("true");
+    expect(panel.querySelector(".forge-detail-heading h3")?.textContent).toContain("Selected item");
+    expect(panel.querySelector("dialog")).toBeNull();
+    await click(panel.querySelector(".forge-detail")!, "View worker");
+    expect(panel.querySelector('[data-terminal-tab="live-terminal"]')).not.toBeNull();
+    await click(panel, "Close worker terminal");
+
+    for (const status of ["failed", "completed", "removed"] as const) {
+      testFixture.dashboard.workers = status === "removed" ? [] : [{ ...liveWorker, status, error: status === "failed" ? "Provider access denied." : undefined }];
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      expect(row.getAttribute("aria-pressed")).toBe("true");
+      expect(panel.querySelector(".forge-detail-heading h3")?.textContent).toContain("Selected item");
+      expect(panel.querySelector("dialog")).toBeNull();
+      expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
+      if (status === "failed") {
+        expect(row.textContent).toContain(`${kind === "issues" ? "Coding" : "Review"} · failed`);
+        expect(row.querySelector(".forge-item-worker-error")?.textContent).toBe("Provider access denied.");
+        expect(panel.querySelector('.forge-detail [role="alert"]')?.textContent).toBe("Provider access denied.");
+      } else expect(row.querySelectorAll(".forge-item-worker")).toHaveLength(0);
+    }
+    expect(panel.querySelectorAll(".forge-detail .forge-worker")).toHaveLength(0);
+    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
+  });
+
   it("allows adding and removing comments and blocks incomplete inline locations", async () => {
     const panel = await renderPanel(fixture({ workers: [reviewWorker] }));
     await click(panel, "Pull requests");
