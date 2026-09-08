@@ -46,7 +46,7 @@ const hubRequest = {
   draft: false,
   merged: false,
   head: { sha: headSha, ref: "fix-race" },
-  base: { ref: "main" },
+  base: { ref: "main", sha: previousSha },
 };
 const hubStatus = {
   number: 7,
@@ -905,7 +905,7 @@ describe("inconsistent provider head snapshots", () => {
 });
 
 describe("GitHub review and exact-commit merge", () => {
-  it("loads issue comments, inline comments, review decisions and a complete diff", async () => {
+  it("loads issue comments, inline comments, review decisions and the pinned comparison base", async () => {
     const { provider } = hubFixture();
     expect(await provider.getChangeRequest(7)).toMatchObject({
       headSha,
@@ -914,8 +914,26 @@ describe("GitHub review and exact-commit merge", () => {
       mergeable: true,
       unresolvedDiscussions: 0,
       comments: [{ id: "1" }, { id: "1", reviewId: "12" }, { id: "review-1" }],
-      diff: expect.stringContaining("+new"),
+      baseSha: previousSha,
     });
+  });
+
+  it.each(["detail", "merge"])("loads GitHub %s metadata when the raw diff exceeds GitHub's limit", async operation => {
+    const base = hubFixture();
+    const { provider, calls } = harness(github, (url, options) => new Headers(options.headers).get("accept") === "application/vnd.github.diff"
+      ? Response.json({ message: "The diff exceeded the maximum number of lines (20000).", code: "too_large" }, { status: 406 })
+      : base.fetcher(url, options));
+    if (operation === "merge") await expect(provider.merge(7, headSha)).resolves.toMatchObject({ merged: true });
+    else {
+      const detail = await provider.getChangeRequest(7);
+      expect(detail).toMatchObject({ headSha, baseSha: previousSha, approved: true });
+      expect(detail).not.toHaveProperty("diff");
+    }
+    expect(calls.some(call => new Headers(call.options.headers).get("accept") === "application/vnd.github.diff")).toBe(false);
+  });
+
+  it.each([undefined, null, "", "not-a-sha", 12])("rejects a missing or malformed GitHub comparison base %s", async sha => {
+    await expect(hubFixture({ request: { base: { ref: "main", sha } } }).provider.getChangeRequest(7)).rejects.toThrow("invalid or incomplete");
   });
 
   it.each([undefined, null, "12", 1.5])("rejects invalid GitHub inline review identity %s", async reviewId => {
@@ -1096,7 +1114,7 @@ describe("GitLab review and exact-commit merge", () => {
       mergeable: true,
       unresolvedDiscussions: 0,
       comments: [{ id: "1", resolved: true }],
-      diff: expect.stringContaining("+++ b/file.ts"),
+      baseSha: previousSha,
     });
   });
 
@@ -1144,12 +1162,31 @@ describe("GitLab review and exact-commit merge", () => {
     },
   );
 
-  it("refuses truncated provider diffs and mismatched diff versions", async () => {
-    await expect(
-      labFixture({
-        diffs: [{ old_path: "x", new_path: "x", diff: "", too_large: true }],
-      }).provider.getChangeRequest(7),
-    ).rejects.toThrow("omitted part");
+  it.each(["detail", "merge"])("loads GitLab %s metadata without downloading collapsed or oversized diffs", async operation => {
+    const { provider, calls } = labFixture({ diffs: [{ old_path: "x", new_path: "x", diff: "", too_large: true, collapsed: true }] });
+    if (operation === "merge") await expect(provider.merge(7, headSha)).resolves.toMatchObject({ merged: true });
+    else {
+      const detail = await provider.getChangeRequest(7);
+      expect(detail).toMatchObject({ headSha, baseSha: previousSha, reviewReady: true });
+      expect(detail).not.toHaveProperty("diff");
+    }
+    expect(calls.some(call => call.url.pathname.endsWith("/diffs"))).toBe(false);
+  });
+
+  it.each([undefined, null, "", "not-a-sha", 12])("rejects a missing or malformed GitLab comparison base %s", async base_sha => {
+    await expect(labFixture({ request: { diff_refs: { ...labRequest.diff_refs, base_sha } } }).provider.getChangeRequest(7)).rejects.toThrow("invalid or incomplete");
+  });
+
+  it.each([undefined, null, "not-a-sha"])("rejects a malformed GitLab comparison head %s", async head_sha => {
+    await expect(labFixture({ request: { diff_refs: { ...labRequest.diff_refs, head_sha } } }).provider.getChangeRequest(7)).rejects.toThrow("invalid or incomplete");
+  });
+
+  it("refuses a GitLab comparison prepared for another head", async () => {
+    await expect(labFixture({ request: { diff_refs: { ...labRequest.diff_refs, head_sha: previousSha } } }).provider.getChangeRequest(7))
+      .rejects.toMatchObject({ observedHeadShas: [headSha, previousSha] });
+  });
+
+  it("refuses mismatched GitLab diff versions", async () => {
     await expect(
       labFixture({
         version: { head_commit_sha: previousSha },

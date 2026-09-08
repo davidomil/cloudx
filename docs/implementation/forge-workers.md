@@ -98,10 +98,11 @@ A reviewer that finds no issues explicitly approves. Actionable findings request
 
 ## Review PRs and MRs
 
-Select a request and click **Review** to retain a draft, or **Review and
-post** to publish automatically. Reviewers use the selected request’s
-exact head and actual target branch. Their temporary worker terminal and
-checkout are removed when the review finishes.
+Select a request and click **Review** to retain a draft, or **Review and post** to publish automatically. The temporary worker terminal and checkout are removed when the review finishes.
+
+Reviewers fetch the selected request’s exact head and pinned base commit into their own checkout and inspect the complete local Git comparison.
+
+Opening a request does not download a provider diff, so large requests remain accessible.
 
 The request badge shows suggested comments. Open the request, edit the
 review summary, outcome and comments, then **Save draft** or **Submit

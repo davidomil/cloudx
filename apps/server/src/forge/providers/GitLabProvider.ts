@@ -117,12 +117,11 @@ export class GitLabProvider implements ForgeProvider {
 
   async getChangeRequest(number: number): Promise<ForgeChangeRequest> {
     const path = this.requestPath(number);
-    const [response, approvalsResponse, discussions, diffs, versionsResponse, linkedIssues] =
+    const [response, approvalsResponse, discussions, versionsResponse, linkedIssues] =
       await Promise.all([
         this.http.request(path),
         this.http.request(`${path}/approvals`),
         this.http.all(`${path}/discussions`),
-        this.http.all(`${path}/diffs`),
         this.http.request(`${path}/versions?per_page=1&page=1`),
         this.linkedIssues(number),
       ]);
@@ -169,22 +168,6 @@ export class GitLabProvider implements ForgeProvider {
         return boolean(note.resolvable) && !boolean(note.resolved);
       }),
     ).length;
-    const diff = diffs
-      .map((value) => {
-        const file = record(value);
-        if (file.too_large === true || file.collapsed === true)
-          throw new ForgeProviderError(
-            "GitLab omitted part of this diff. A complete review cannot proceed.",
-            422,
-          );
-        return `--- a/${string(file.old_path)}\n+++ b/${string(file.new_path)}\n${string(file.diff)}`;
-      })
-      .join("\n");
-    if (Buffer.byteLength(diff) > 5_000_000)
-      throw new ForgeProviderError(
-        "The request diff exceeds the 5 MB review limit.",
-        422,
-      );
     const current = record((await this.http.request(path)).body);
     const status = gitlabStatus(current, number);
     if (status.headBranch !== initial.headBranch || status.baseBranch !== initial.baseBranch || status.state !== initial.state)
@@ -194,6 +177,11 @@ export class GitLabProvider implements ForgeProvider {
       );
     if (status.headSha !== headSha)
       throw new ForgeHeadChangedError([headSha, status.headSha]);
+    const refs = record(current.diff_refs);
+    const diffHeadSha = gitlabHeadSha(refs.head_sha);
+    const baseSha = gitlabHeadSha(refs.base_sha);
+    if (diffHeadSha !== headSha)
+      throw new ForgeHeadChangedError([headSha, diffHeadSha]);
     return {
       ...gitlabRequestSummary(current),
       ...status,
@@ -203,7 +191,7 @@ export class GitLabProvider implements ForgeProvider {
       approved,
       unresolvedDiscussions,
       comments,
-      diff,
+      baseSha,
     };
   }
 

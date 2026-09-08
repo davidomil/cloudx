@@ -29,7 +29,7 @@ function fixture() {
     unresolvedDiscussions: 0,
     linkedIssues: [],
     comments: [],
-    diff: "diff",
+    baseSha: "b".repeat(40),
   };
   const provider = {
     listIssues: vi.fn(),
@@ -126,6 +126,29 @@ function fixture() {
 const placement = { windowId: "window", paneId: "pane" };
 
 describe("Forge issue and review workflows", () => {
+  it("prepares both pinned review commits and supplies a local comparison for every attempt", async () => {
+    const f = fixture();
+    const worker = await f.service.startReview(7, false, placement);
+    const expectPinnedReview = () => {
+      expect(f.runtime.prepareWorkspace).toHaveBeenLastCalledWith(expect.objectContaining({
+        review: true, headSha: f.change.headSha, baseSha: f.change.baseSha,
+      }), expect.any(AbortSignal));
+      expect(f.reports.prepare).toHaveBeenLastCalledWith(expect.any(String), expect.objectContaining({
+        item: expect.objectContaining({ headSha: f.change.headSha, baseSha: f.change.baseSha }),
+      }));
+      expect(f.runtime.launch).toHaveBeenLastCalledWith(expect.objectContaining({
+        prompt: expect.stringContaining(`git diff --no-ext-diff --no-textconv ${f.change.baseSha}...${f.change.headSha} --`),
+      }), expect.any(AbortSignal));
+    };
+    expectPinnedReview();
+    await f.service.pause(worker.id);
+    f.change.headSha = "c".repeat(40);
+    f.change.baseSha = "d".repeat(40);
+    await f.service.resume(worker.id, placement);
+    expectPinnedReview();
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledTimes(2);
+  });
+
   it.each(["issue", "review"] as const)("uses the %s model defaults and current settings on resume", async kind => {
     const f = fixture();
     const worker = kind === "issue" ? await f.service.startIssue(1, placement) : await f.service.startReview(7, false, placement);

@@ -85,17 +85,17 @@ export class GitHubProvider implements ForgeProvider {
 
   async getChangeRequest(number: number): Promise<ForgeChangeRequest> {
     const path = this.pullPath(number);
-    const [response, discussion, inline, reviews, diff] = await Promise.all([
+    const [response, discussion, inline, reviews] = await Promise.all([
       this.http.request(path),
       this.http.all(`${this.path}/issues/${number}/comments`),
       this.http.all(`${path}/comments`),
       this.http.all(`${path}/reviews`),
-      this.http.request(path, { text: true }),
     ]);
     const raw = record(response.body);
     const issue = githubIssue(raw);
     const head = record(raw.head);
     const headSha = githubHeadSha(head.sha);
+    const baseSha = githubHeadSha(record(raw.base).sha);
     const { status, readiness } = await this.readSnapshot(number, {
       headSha, headBranch: string(head.ref), baseBranch: string(record(raw.base).ref), state: issue.state,
     });
@@ -129,7 +129,7 @@ export class GitHubProvider implements ForgeProvider {
         ...githubInlineComments(inline, readiness.threads),
         ...reviews.map(githubReviewComment),
       ],
-      diff: string(diff.body),
+      baseSha,
     };
   }
 

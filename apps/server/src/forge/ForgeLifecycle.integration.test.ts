@@ -479,9 +479,11 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(fixture.sessions.listTabs()).toEqual([]);
   }, 20_000);
 
-  it("reviews the exact commit, immediately cleans the agent, and submits the manually edited draft", async () => {
+  it("reviews a complete local diff larger than the provider limit, cleans the agent, and submits the edited draft", async () => {
     const fixture = await LifecycleFixture.create();
-    const reviewHead = await fixture.seedReview();
+    const reviewContent = ["A public return value", ...Array.from({ length: 20_049 }, (_, index) => `Review line ${index + 2}`)].join("\n") + "\n";
+    const reviewBase = await git(fixture.origin, "rev-parse", "main");
+    const reviewHead = await fixture.seedReview(reviewContent);
     const started = await fixture.workflow.startReview(7, false, fixture.placement);
     const receipt = await fixture.completedAssistantTurn(started);
     expect(receipt.templateId).toBe("fixture-review");
@@ -490,8 +492,13 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     await expectMissing(fixture.repositoryPath);
     expect(receipt.skillIds).toBe("fixture-reviewing");
     expect(receipt.headSha).toBe(reviewHead);
-    expect(receipt.context.item.headSha).toBe(reviewHead);
-    expect(receipt.context.item.diff).toContain("review.txt");
+    expect(receipt.context.item).toMatchObject({ baseSha: reviewBase, headSha: reviewHead });
+    expect(receipt.context.item).not.toHaveProperty("diff");
+    expect(receipt.localReview).toMatchObject({ baseSha: reviewBase, mergeBaseSha: reviewBase, headSha: reviewHead });
+    expect(receipt.localReview!.diff).toContain("diff --git a/review.txt b/review.txt");
+    const addedLines = receipt.localReview!.diff.split("\n").filter(line => line.startsWith("+") && !line.startsWith("+++"));
+    expect(addedLines).toHaveLength(20_050);
+    expect(addedLines.map(line => line.slice(1)).join("\n")).toBe(reviewContent.trimEnd());
     expect(await git(started.worktreePath!, "status", "--porcelain")).toBe("");
     await fixture.workflow.poll();
 
@@ -533,6 +540,7 @@ interface AssistantReceipt {
   contextPath: string;
   tabContextPath: string;
   headSha: string;
+  localReview?: { baseSha: string; mergeBaseSha: string; headSha: string; diff: string };
   context: { item: ForgeIssueDetail & Partial<ForgeChangeRequest>; change?: ForgeChangeRequest };
 }
 
@@ -728,6 +736,11 @@ class LifecycleFixture {
     expect(this.sessions.getTab(worker.tabId!).pluginMetadata?.["rules-skills"]?.selectedTemplateId).toBe(receipt.templateId);
     expect(receipt.args.filter((argument) => argument.includes("Write only valid JSON"))).toHaveLength(1);
     expect(receipt.trustedProjectPath).toBe(await fs.realpath(worker.worktreePath!));
+    if (worker.kind === "review") {
+      expect(receipt.context.item).not.toHaveProperty("diff");
+      expect(receipt.localReview).toMatchObject({ baseSha: receipt.context.item.baseSha, headSha: worker.headSha });
+      expect(receipt.localReview!.mergeBaseSha).toMatch(/^[a-f0-9]{40,64}$/);
+    }
     expect(await fs.readFile(path.join(this.codexHome, "config.toml"), "utf8")).toBe(sourceConfig);
     const state = await this.workspace.state(this.sessions.listTabs(), this.sessions.getActiveTabId());
     expect(state.tabs.find(tab => tab.id === worker.tabId)).toMatchObject({ ownerPluginId: "forge" });
@@ -736,12 +749,12 @@ class LifecycleFixture {
     return receipt;
   }
 
-  async seedReview(): Promise<string> {
+  async seedReview(content = "A public return value\n"): Promise<string> {
     await git(this.root, "clone", "--no-checkout", this.origin, this.repositoryPath);
     await git(this.repositoryPath, "config", "user.name", "Forge Fixture");
     await git(this.repositoryPath, "config", "user.email", "forge-fixture@example.invalid");
     await git(this.repositoryPath, "switch", "-c", "review-target", "origin/main");
-    await fs.writeFile(path.join(this.repositoryPath, "review.txt"), "A public return value\n");
+    await fs.writeFile(path.join(this.repositoryPath, "review.txt"), content);
     await git(this.repositoryPath, "add", "review.txt");
     await git(this.repositoryPath, "commit", "-m", "TEST: review target");
     await git(this.repositoryPath, "push", "origin", "review-target");
@@ -784,14 +797,14 @@ class LocalForgeProvider implements ForgeProvider {
   async getChangeRequest(number: number): Promise<ForgeChangeRequest> {
     const change = this.changes.get(number);
     if (!change) throw new Error("Unknown fixture change request.");
-    return { ...structuredClone(change), ...await this.getChangeRequestStatus(number), diff: await git(this.origin, "diff", `${change.baseBranch}...${change.headBranch}`) };
+    return { ...structuredClone(change), ...await this.getChangeRequestStatus(number), baseSha: await git(this.origin, "rev-parse", change.baseBranch) };
   }
   async findChangeRequestByBranch(headBranch: string, baseBranch: string) {
     const change = [...this.changes.values()].find((request) => request.headBranch === headBranch && request.baseBranch === baseBranch);
     return change ? this.getChangeRequest(change.number) : undefined;
   }
   async createChangeRequest(input: ForgeCreateChangeRequest) {
-    this.changes.set(7, { number: 7, title: input.title, body: input.body, url: "https://github.com/fixture/cloudx/pull/7", state: "open", labels: [], author: "worker-bot", updatedAt: new Date().toISOString(), draft: false, headSha: "", headBranch: input.headBranch, baseBranch: input.baseBranch, merged: false, reviewReady: true, mergeable: true, approved: false, unresolvedDiscussions: 0, comments: [], diff: "", linkedIssues: [] });
+    this.changes.set(7, { number: 7, title: input.title, body: input.body, url: "https://github.com/fixture/cloudx/pull/7", state: "open", labels: [], author: "worker-bot", updatedAt: new Date().toISOString(), draft: false, headSha: "", baseSha: await git(this.origin, "rev-parse", input.baseBranch), headBranch: input.headBranch, baseBranch: input.baseBranch, merged: false, reviewReady: true, mergeable: true, approved: false, unresolvedDiscussions: 0, comments: [], linkedIssues: [] });
     return this.getChangeRequest(7);
   }
   async postReview(number: number, review: ForgeReviewSubmission): Promise<ForgeReviewPublication> {
@@ -874,7 +887,7 @@ if (config.projects?.[trustedProjectPath]?.trust_level !== "trusted") {
 const args = process.argv.slice(2);
 const prompt = args.at(-1);
 const reportPath = JSON.parse(prompt.split("Write only valid JSON to ")[1].split(" by writing ")[0]);
-const contextPath = JSON.parse(prompt.split("Read the complete current task, feedback and diff from ")[1].split(" before beginning.")[0]);
+const contextPath = JSON.parse(prompt.split("Read the complete current task and feedback from ")[1].split(" before beginning.")[0]);
 const context = JSON.parse(fs.readFileSync(contextPath, "utf8"));
 if (process.env.FORGE_FIXTURE_LARGE_OUTPUT === "true") {
   for (let entry = 0; entry < 12; entry++) {
@@ -889,6 +902,12 @@ if (!isReview && !fs.existsSync("solution.txt")) { fs.writeFileSync("solution.tx
 if (!isReview && context.change?.comments.length && !fs.existsSync("regression.txt")) { fs.writeFileSync("regression.txt", "Empty input is covered\\n"); changed.push("regression.txt"); }
 if (changed.length) { git("add", "--", ...changed); git("commit", "-m", "FIX: deterministic fixture change"); }
 const headSha = git("rev-parse", "HEAD");
+let localReview;
+if (isReview) {
+  const command = prompt.match(/git diff --no-ext-diff --no-textconv ([a-f0-9]{40,64})[.]{3}([a-f0-9]{40,64}) --/);
+  if (!command) throw new Error("The reviewer prompt must identify the complete local diff command.");
+  localReview = { baseSha: git("rev-parse", "refs/cloudx/review-base"), mergeBaseSha: git("merge-base", "--all", command[1], command[2]), headSha, diff: git("diff", "--no-ext-diff", "--no-textconv", command[1] + "..." + command[2], "--") };
+}
 const review = process.env.FORGE_FIXTURE_AUTO_REVIEW === "true"
   ? process.env.FORGE_FIXTURE_APPROVE_FIRST === "true" || fs.existsSync("regression.txt")
     ? { kind: "review", headSha, event: "approve", body: "No actionable findings. The change is ready to merge.", comments: [] }
@@ -897,7 +916,7 @@ const review = process.env.FORGE_FIXTURE_AUTO_REVIEW === "true"
 const report = isReview
   ? review
   : { kind: "issue", title: "Handle empty input", body: "Implemented and verified the fixture changes.", discussionReplies: (context.change?.comments ?? []).filter(comment => comment.discussionId && comment.resolved === false).map(comment => ({ discussionId: comment.discussionId, body: "Added and verified the empty-input regression." })), resolvedDiscussionIds: (context.change?.comments ?? []).filter(comment => comment.discussionId && comment.resolved === false).map(comment => comment.discussionId) };
-const receipt = { pid: process.pid, trustedProjectPath, gitAuthorizationPresent: Object.entries(process.env).some(([key, value]) => key.startsWith("GIT_CONFIG_VALUE_") && value?.includes("Authorization:")), args, templateId: process.env.CLOUDX_PERSONALITY_TEMPLATE_ID, skillIds: process.env.CLOUDX_ENABLED_SKILL_IDS, codexHome: process.env.CODEX_HOME, reportPath, contextPath, context, headSha };
+const receipt = { pid: process.pid, trustedProjectPath, gitAuthorizationPresent: Object.entries(process.env).some(([key, value]) => key.startsWith("GIT_CONFIG_VALUE_") && value?.includes("Authorization:")), args, templateId: process.env.CLOUDX_PERSONALITY_TEMPLATE_ID, skillIds: process.env.CLOUDX_ENABLED_SKILL_IDS, codexHome: process.env.CODEX_HOME, reportPath, contextPath, context, headSha, localReview };
 fs.writeFileSync(path.join(process.env.FORGE_FIXTURE_RECEIPTS, path.basename(reportPath)), JSON.stringify(receipt));
 fs.writeFileSync(reportPath + ".tmp", JSON.stringify(report));
 fs.renameSync(reportPath + ".tmp", reportPath);

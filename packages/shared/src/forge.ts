@@ -80,7 +80,7 @@ export interface ForgeChangeRequest extends ForgeChangeRequestSummary, ForgeChan
   approved: boolean;
   unresolvedDiscussions: number;
   comments: ForgeComment[];
-  diff: string;
+  baseSha: string;
 }
 
 export interface ForgeCreateChangeRequest {

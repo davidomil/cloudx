@@ -112,19 +112,24 @@ export class ForgeRuntime {
       expectedRepository: ForgeRepository;
       baseBranch: string;
       headSha?: string;
+      baseSha?: string;
       review: boolean;
     },
     signal?: AbortSignal,
   ): Promise<{ repositoryPath: string; worktreePath: string; branch: string }> {
     return this.serialize(input.id, async () => {
       signal?.throwIfAborted();
+      if (input.review && !input.headSha)
+        throw new Error("A review requires an exact head commit.");
+      if (input.headSha && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/iu.test(input.headSha))
+        throw new Error("Invalid review head commit.");
+      if (input.review && !input.baseSha)
+        throw new Error("A review requires an exact base commit.");
+      if (input.review && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/iu.test(input.baseSha!))
+        throw new Error("Invalid review base commit.");
       const existing = await this.manifest(input.id).read<OwnedWorkspace>();
       if (existing && !(await this.readOwned(input.id)).cleaned)
         throw new Error("This worker already owns a workspace.");
-      if (input.review && !input.headSha)
-        throw new Error("A review requires an exact head commit.");
-      if (input.headSha && !/^[a-f0-9]{40,64}$/iu.test(input.headSha))
-        throw new Error("Invalid review head commit.");
       const baseBranch = input.baseBranch.trim();
       if (
         !baseBranch ||
@@ -224,9 +229,12 @@ export class ForgeRuntime {
           throw new Error(
             "Fetched review commit does not match the requested head.",
           );
+        if (input.review)
+          await this.prepareReviewComparison(owned, commit, input.baseSha!, access, signal);
         owned.baseCommit = commit;
         await this.manifest(input.id).write(owned);
-        await this.runOwnedGit(owned, ["checkout", "--detach", commit], signal);
+        if (!input.review)
+          await this.runOwnedGit(owned, ["checkout", "--detach", commit], signal);
         if (owned.branch) {
           await this.runOwnedGit(owned, ["switch", "-c", owned.branch], signal);
           owned.branchOwned = true;
@@ -251,6 +259,40 @@ export class ForgeRuntime {
         throw error;
       }
     });
+  }
+
+  private async prepareReviewComparison(
+    owned: OwnedWorkspace,
+    headSha: string,
+    baseSha: string,
+    access: { cloneUrl: string; authorization: string },
+    signal?: AbortSignal,
+  ): Promise<void> {
+    await this.runOwnedGit(owned, ["checkout", "--detach", headSha], signal);
+    await this.runOwnedGit(owned, [
+      "fetch", "--no-tags", "--no-recurse-submodules", access.cloneUrl,
+      `${baseSha}:refs/cloudx/review-base`,
+    ], signal, access.authorization);
+    const fetchedBase = (await this.runGit(
+      owned.worktreePath,
+      ["rev-parse", "--verify", "refs/cloudx/review-base^{commit}"],
+      signal,
+    )).trim();
+    if (fetchedBase.toLowerCase() !== baseSha.toLowerCase())
+      throw new Error("Fetched review base does not match the requested base commit.");
+    let mergeBases: string[];
+    try {
+      mergeBases = (await this.runGit(
+        owned.worktreePath,
+        ["merge-base", "--all", baseSha, headSha],
+        signal,
+      )).trim().split(/\s+/u);
+    } catch (error) {
+      signal?.throwIfAborted();
+      throw new Error("The review commits have no available merge base for comparison.", { cause: error });
+    }
+    if (mergeBases.length !== 1 || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/iu.test(mergeBases[0]!))
+      throw new Error("The review commits do not have a unique merge base for comparison.");
   }
 
   async launch(

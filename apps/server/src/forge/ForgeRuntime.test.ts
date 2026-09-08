@@ -100,7 +100,7 @@ async function prepare(
     expectedRepository,
     baseBranch: "main",
     review,
-    ...(review ? { headSha } : {}),
+    ...(review ? { headSha, baseSha: headSha } : {}),
   });
   return { id, ...workspace };
 }
@@ -166,6 +166,141 @@ afterEach(async () => {
 });
 
 describe("ForgeRuntime remote checkouts", () => {
+  it("pins a divergent review base even when the target branch has advanced", async () => {
+    await git(repositoryPath, "switch", "-c", "review-target");
+    await fs.writeFile(path.join(repositoryPath, "feature.txt"), "Review this change\n");
+    await git(repositoryPath, "add", "feature.txt");
+    await git(repositoryPath, "commit", "-m", "TEST: proposed change");
+    const reviewHead = await git(repositoryPath, "rev-parse", "HEAD");
+    await git(repositoryPath, "push", "origin", "review-target");
+    await git(repositoryPath, "switch", "main");
+    await fs.writeFile(path.join(repositoryPath, "target.txt"), "Target branch change\n");
+    await git(repositoryPath, "add", "target.txt");
+    await git(repositoryPath, "commit", "-m", "TEST: pinned target");
+    const baseSha = await git(repositoryPath, "rev-parse", "HEAD");
+    await fs.writeFile(path.join(repositoryPath, "later.txt"), "After the review snapshot\n");
+    await git(repositoryPath, "add", "later.txt");
+    await git(repositoryPath, "commit", "-m", "TEST: target advances");
+    await git(repositoryPath, "push", "origin", "main");
+    const latestTarget = await git(repositoryPath, "rev-parse", "HEAD");
+    const deps = dependencies();
+    deps.git = vi.fn(deps.git!);
+    runtime = new ForgeRuntime(deps);
+
+    const workspace = await runtime.prepareWorkspace({ id: "pinned-review", expectedRepository, baseBranch: "main", review: true, headSha: reviewHead, baseSha });
+
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(reviewHead);
+    expect(await git(workspace.worktreePath, "rev-parse", "--abbrev-ref", "HEAD")).toBe("HEAD");
+    expect(await git(workspace.worktreePath, "rev-parse", "refs/cloudx/review-base")).toBe(baseSha);
+    expect(baseSha).not.toBe(latestTarget);
+    expect(await git(workspace.worktreePath, "merge-base", "--all", baseSha, reviewHead)).toBe(headSha);
+    expect(await git(workspace.worktreePath, "diff", "--no-ext-diff", "--no-textconv", "--name-only", `${baseSha}...${reviewHead}`, "--")).toBe("feature.txt");
+    expect(await git(workspace.worktreePath, "status", "--porcelain")).toBe("");
+    const fetches = vi.mocked(deps.git).mock.calls.filter(([, args]) => args[0] === "fetch");
+    expect(fetches.map(([, args]) => args.at(-1))).toEqual([reviewHead, `${baseSha}:refs/cloudx/review-base`]);
+    expect(fetches.every(([, , , env]) => env?.GIT_CONFIG_VALUE_1 === "Authorization: Basic fixture-secret")).toBe(true);
+    expect(deps.gitAccess).toHaveBeenCalledExactlyOnceWith(expectedRepository, "reviewer", undefined);
+    await runtime.cleanup({ id: "pinned-review", ...workspace });
+  });
+
+  it("makes a diff beyond 20,000 lines and its final changed file available locally", async () => {
+    const lines = Array.from({ length: 20_001 }, (_, index) => `Line ${index + 1}`).join("\n") + "\n";
+    await fs.writeFile(path.join(repositoryPath, "large.txt"), lines);
+    await fs.writeFile(path.join(repositoryPath, "zz-last.txt"), "A finding after the large file\n");
+    await git(repositoryPath, "add", "large.txt", "zz-last.txt");
+    await git(repositoryPath, "commit", "-m", "TEST: large review");
+    await git(repositoryPath, "push", "origin", "main");
+    const reviewHead = await git(repositoryPath, "rev-parse", "HEAD");
+
+    const workspace = await runtime.prepareWorkspace({ id: "large-review", expectedRepository, baseBranch: "main", review: true, headSha: reviewHead, baseSha: headSha });
+    const diff = await git(workspace.worktreePath, "diff", "--no-ext-diff", "--no-textconv", `${headSha}...${reviewHead}`, "--");
+
+    expect(diff.split("\n").length).toBeGreaterThan(20_000);
+    expect(diff).toContain("+Line 20001");
+    expect(diff).toContain("+A finding after the large file");
+    expect(await fs.readFile(path.join(workspace.worktreePath, "large.txt"), "utf8")).toBe(lines);
+    expect(await git(workspace.worktreePath, "diff", "--no-ext-diff", "--no-textconv", `${headSha}...${reviewHead}`, "--", "zz-last.txt")).toContain("+A finding after the large file");
+    await runtime.cleanup({ id: "large-review", ...workspace });
+  });
+
+  it.each([undefined, "", "main", "--all", "a".repeat(39), "a".repeat(41), "a".repeat(63), "z".repeat(40)])("rejects review base %s before credentials or checkout creation", async baseSha => {
+    const deps = dependencies();
+    deps.git = vi.fn(deps.git!);
+    runtime = new ForgeRuntime(deps);
+
+    await expect(runtime.prepareWorkspace({ id: "invalid-base", expectedRepository, baseBranch: "main", review: true, headSha, baseSha })).rejects.toThrow(/base commit/i);
+
+    expect(deps.gitAccess).not.toHaveBeenCalled();
+    expect(deps.git).not.toHaveBeenCalled();
+    await expect(fs.stat(path.join(root, "data", "forge-workers", "checkouts"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each([undefined, "", "main", "a".repeat(39), "a".repeat(41), "a".repeat(63), "z".repeat(40)])("rejects review head %s before credentials or checkout creation", async invalidHead => {
+    const deps = dependencies();
+    deps.git = vi.fn(deps.git!);
+    runtime = new ForgeRuntime(deps);
+
+    await expect(runtime.prepareWorkspace({ id: "invalid-head", expectedRepository, baseBranch: "main", review: true, headSha: invalidHead, baseSha: headSha })).rejects.toThrow(/head commit/i);
+
+    expect(deps.gitAccess).not.toHaveBeenCalled();
+    expect(deps.git).not.toHaveBeenCalled();
+    await expect(fs.stat(path.join(root, "data", "forge-workers", "checkouts"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("cleans a review reservation when the pinned base cannot be fetched", async () => {
+    const deps = dependencies();
+    const run = deps.git!;
+    deps.git = async (cwd, args, signal, env) => {
+      if (args[0] === "fetch" && args.at(-1)?.endsWith(":refs/cloudx/review-base")) throw new Error("Pinned base fetch rejected.");
+      return run(cwd, args, signal, env);
+    };
+    runtime = new ForgeRuntime(deps);
+
+    await expect(prepare("base-fetch-failure", true)).rejects.toThrow("Pinned base fetch rejected.");
+    await expect(fs.stat(path.join(root, "data", "forge-workers", "checkouts", "base-fetch-failure"))).rejects.toMatchObject({ code: "ENOENT" });
+    runtime = new ForgeRuntime(dependencies());
+    await runtime.cleanup(await prepare("base-fetch-failure", true));
+  });
+
+  it("rejects a fetched base ref that does not match the requested commit", async () => {
+    const deps = dependencies();
+    const run = deps.git!;
+    deps.git = async (cwd, args, signal, env) => args[0] === "rev-parse" && args.includes("refs/cloudx/review-base^{commit}")
+      ? "b".repeat(40)
+      : run(cwd, args, signal, env);
+    runtime = new ForgeRuntime(deps);
+
+    await expect(prepare("wrong-base", true)).rejects.toThrow(/base.*does not match/i);
+    await expect(fs.stat(path.join(root, "data", "forge-workers", "checkouts", "wrong-base"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("cleans a review whose commits have no common history", async () => {
+    await git(repositoryPath, "switch", "--orphan", "unrelated");
+    await fs.writeFile(path.join(repositoryPath, "unrelated.txt"), "Unrelated history\n");
+    await git(repositoryPath, "add", "unrelated.txt");
+    await git(repositoryPath, "commit", "-m", "TEST: unrelated root");
+    await git(repositoryPath, "push", "origin", "unrelated");
+    const baseSha = await git(repositoryPath, "rev-parse", "HEAD");
+
+    await expect(runtime.prepareWorkspace({ id: "unrelated-review", expectedRepository, baseBranch: "main", review: true, headSha, baseSha })).rejects.toThrow(/merge base/i);
+    await expect(fs.stat(path.join(root, "data", "forge-workers", "checkouts", "unrelated-review"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects ambiguous comparison history instead of choosing a merge base", async () => {
+    const tree = await git(repositoryPath, "rev-parse", "HEAD^{tree}");
+    const left = await git(repositoryPath, "commit-tree", tree, "-p", headSha, "-m", "TEST: left side");
+    const right = await git(repositoryPath, "commit-tree", tree, "-p", headSha, "-m", "TEST: right side");
+    const reviewHead = await git(repositoryPath, "commit-tree", tree, "-p", left, "-p", right, "-m", "TEST: review merge");
+    const baseSha = await git(repositoryPath, "commit-tree", tree, "-p", right, "-p", left, "-m", "TEST: target merge");
+    await git(repositoryPath, "update-ref", "refs/heads/review-target", reviewHead);
+    await git(repositoryPath, "update-ref", "refs/heads/comparison-target", baseSha);
+    await git(repositoryPath, "push", "origin", "review-target", "comparison-target");
+    expect((await git(repositoryPath, "merge-base", "--all", baseSha, reviewHead)).split("\n").sort()).toEqual([left, right].sort());
+
+    await expect(runtime.prepareWorkspace({ id: "ambiguous-review", expectedRepository, baseBranch: "main", review: true, headSha: reviewHead, baseSha })).rejects.toThrow(/unique merge base/i);
+    await expect(fs.stat(path.join(root, "data", "forge-workers", "checkouts", "ambiguous-review"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("accepts only the selected repository's credential-free HTTPS clone URL", () => {
     expect(() =>
       assertForgeOrigin(
@@ -650,8 +785,37 @@ describe.skipIf(process.platform !== "linux")(
       await runtime.cleanup({ ...workspace, expectedHeadSha: headSha });
     });
 
-    it("awaits cancellation of a fetch and its child process before removing the owned checkout", async () => {
-      const fixture = await installGitFixture(true);
+    it("uses reviewer authorization only for fetching the two exact review commits", async () => {
+      const fixture = await installGitFixture();
+      const deps = dependencies();
+      delete deps.git;
+      runtime = new ForgeRuntime(deps);
+
+      const workspace = await prepare("review-credentials", true);
+      const records = (await fs.readFile(fixture.records, "utf8")).trim().split("\n").map(line =>
+        JSON.parse(line) as { args: string[]; env: Record<string, string> });
+      const authenticated = records.filter(record => record.env.GIT_CONFIG_COUNT === "2");
+
+      expect(authenticated.map(record => record.args.at(-1))).toEqual([headSha, `${headSha}:refs/cloudx/review-base`]);
+      for (const record of authenticated) {
+        expect(record.args).toContain("fetch");
+        expect(record.args).toContain("credential.helper=");
+        expect(record.args).toContain("core.hooksPath=/dev/null");
+        expect(record.args).toContain("http.followRedirects=false");
+        expect(record.env).toMatchObject({
+          GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_ALLOW_PROTOCOL: "https", GIT_ASKPASS: "/bin/false",
+          GIT_CONFIG_KEY_1: "http.https://github.com/cloudx/test.git.extraHeader", GIT_CONFIG_VALUE_1: "Authorization: Basic fixture-secret",
+        });
+        expect(record.args.join(" ")).not.toContain("fixture-secret");
+      }
+      expect(deps.gitAccess).toHaveBeenCalledExactlyOnceWith(expectedRepository, "reviewer", undefined);
+      expect(await fs.readFile(path.join(workspace.worktreePath, ".git", "config"), "utf8")).not.toContain("fixture-secret");
+      expect(await fs.readFile(path.join(root, "data", "forge-workers", "workspaces", "review-credentials.json"), "utf8")).not.toContain("fixture-secret");
+      await runtime.cleanup(workspace);
+    });
+
+    it.each([{ name: "issue", review: false }, { name: "review base", review: true }])("awaits cancellation of the $name fetch and its child process before removing the owned checkout", async ({ review }) => {
+      const fixture = await installGitFixture(review ? "review-base" : true);
       const deps = dependencies();
       delete deps.git;
       runtime = new ForgeRuntime(deps);
@@ -661,7 +825,8 @@ describe.skipIf(process.platform !== "linux")(
           id: "cancelled-fetch",
           expectedRepository,
           baseBranch: "main",
-          review: false,
+          review,
+          ...(review ? { headSha, baseSha: headSha } : {}),
         },
         controller.signal,
       );
@@ -704,7 +869,7 @@ describe.skipIf(process.platform !== "linux")(
   },
 );
 
-async function installGitFixture(hangFetch = false) {
+async function installGitFixture(hangFetch: boolean | "review-base" = false) {
   const actualGit = (await execute("which", ["git"])).stdout.trim();
   const bin = path.join(root, "bin");
   const records = path.join(root, "git-processes.jsonl");
@@ -718,7 +883,8 @@ const { spawn, spawnSync } = require("node:child_process");
 const args = process.argv.slice(2);
 const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("GIT_")));
 fs.appendFileSync(${JSON.stringify(records)}, JSON.stringify({ args, env }) + "\\n");
-if (${hangFetch} && args.includes("fetch")) {
+const shouldHang = ${JSON.stringify(hangFetch)} === true || ${JSON.stringify(hangFetch)} === "review-base" && args.some(arg => arg.endsWith(":refs/cloudx/review-base"));
+if (shouldHang && args.includes("fetch")) {
   const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
   fs.writeFileSync(${JSON.stringify(children)}, JSON.stringify([process.pid, child.pid]));
   setInterval(() => {}, 1000);
