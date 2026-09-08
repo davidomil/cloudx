@@ -158,6 +158,7 @@ function hubFixture(
     graphql?: Record<string, unknown>;
     repository?: Record<string, unknown>;
     rules?: unknown[];
+    rulesets?: Record<number, Record<string, unknown>>;
     intercept?: Handler;
   } = {},
 ) {
@@ -168,6 +169,8 @@ function hubFixture(
       return response({ allow_squash_merge: true, allow_merge_commit: true, allow_rebase_merge: true, ...overrides.repository });
     if (path.startsWith("/repos/owner/repo/rules/branches/"))
       return response(overrides.rules ?? []);
+    if (path.startsWith("/repos/owner/repo/rulesets/"))
+      return response(overrides.rulesets?.[Number(path.split("/").at(-1))] ?? {});
     if (options.method === "PUT" && path.endsWith("/merge"))
       return response({ merged: true, sha: "c".repeat(40) });
     if (path === "/graphql")
@@ -181,6 +184,7 @@ function hubFixture(
               reviewDecision: "APPROVED",
               mergeable: "MERGEABLE",
               mergeStateStatus: "CLEAN",
+              headRef: { target: { oid: headSha, statusCheckRollup: { state: "SUCCESS" } } },
               reviewThreads: {
                 nodes: (overrides.threads ?? [{ isResolved: true }]).map(
                   (thread, index) => ({
@@ -1201,6 +1205,155 @@ describe("GitHub merge method selection", () => {
     expect(error).toBeInstanceOf(ForgeMergeNotStartedError);
     expect(error).toMatchObject({ statusCode: 403, change: { headSha } });
     expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+});
+
+describe("GitHub permission to merge through an update-only restriction", () => {
+  const update = { type: "update", ruleset_id: 1, ruleset_source: "owner/repo", ruleset_source_type: "Repository" };
+  const checks = { type: "required_status_checks", ruleset_id: 2, ruleset_source: "owner/repo", ruleset_source_type: "Repository" };
+  const rulesets = {
+    1: { id: 1, source: "owner/repo", source_type: "Repository", enforcement: "active", target: "branch", current_user_can_bypass: "pull_requests_only", rules: [{ type: "update" }] },
+    2: { id: 2, source: "owner/repo", source_type: "Repository", enforcement: "active", target: "branch", current_user_can_bypass: "never", rules: [{ type: "required_status_checks" }] },
+  };
+  const permitted = (overrides: Parameters<typeof hubFixture>[0] = {}) => hubFixture({ graphql: { mergeStateStatus: "BLOCKED" }, rules: [update, checks], rulesets, ...overrides });
+
+  it("uses the regular SHA-pinned merge when only the update restriction is bypassable", async () => {
+    const { provider, calls } = permitted();
+    expect(await provider.getChangeRequest(7)).toMatchObject({ mergeable: true, approved: true, requiresBaseUpdate: false });
+    await expect(provider.merge(7, headSha)).resolves.toMatchObject({ merged: true });
+    const writes = calls.filter(call => call.options.method === "PUT");
+    expect(writes).toHaveLength(1);
+    expect(writes[0].url.pathname).toBe("/repos/owner/repo/pulls/7/merge");
+    expect(JSON.parse(String(writes[0].options.body))).toEqual({ sha: headSha, merge_method: "squash" });
+    const readiness = calls.find(call => String(call.options.body).includes("reviewThreads"))!;
+    expect(JSON.parse(String(readiness.options.body)).query).toContain("headRef{target{... on Commit{oid statusCheckRollup{state}}}}");
+  });
+
+  it("checks effective permission with the worker identity even when loading review context", async () => {
+    const base = permitted();
+    const { provider, calls } = harness(github, base.fetcher, "reviewer");
+    expect((await provider.getChangeRequest(7)).mergeable).toBe(true);
+    expect(calls.filter(call => call.url.pathname.includes("/rulesets/")).map(call => new Headers(call.options.headers).get("authorization")))
+      .toEqual(["Bearer worker-private-token", "Bearer worker-private-token"]);
+  });
+
+  it("accepts known independent organization rules only when their effective identity matches", async () => {
+    const types = ["deletion", "non_fast_forward", "required_linear_history", "pull_request", "required_status_checks"];
+    const { provider } = permitted({
+      rules: [update, ...types.map(type => ({ ...checks, type, ruleset_source: "owner", ruleset_source_type: "Organization" }))],
+      rulesets: { ...rulesets, 2: { ...rulesets[2], source: "owner", source_type: "Organization", rules: types.map(type => ({ type })) } },
+    });
+    expect((await provider.getChangeRequest(7)).mergeable).toBe(true);
+  });
+
+  it.each([false, true])("loads metadata with a deleted source branch when merged is %s", async merged => {
+    const { provider, calls } = permitted({ request: { merged, state: merged ? "closed" : "open" }, graphql: { mergeStateStatus: "BLOCKED", headRef: null } });
+    expect(await provider.getChangeRequest(7)).toMatchObject({ merged, state: merged ? "merged" : "open", headSha, mergeable: false });
+    expect(calls.some(call => call.url.pathname.includes("/rulesets/"))).toBe(false);
+  });
+
+  it.each(["PENDING", "EXPECTED", "FAILURE", "ERROR", null])("does not treat checks in state %s as passing", async state => {
+    const { provider, calls } = permitted({ graphql: { mergeStateStatus: "BLOCKED", headRef: { target: { oid: headSha, statusCheckRollup: state === null ? null : { state } } } } });
+    expect((await provider.getChangeRequest(7)).mergeable).toBe(false);
+    await expect(provider.merge(7, headSha)).rejects.toThrow("must be open");
+    expect(calls.some(call => call.options.method === "PUT" || call.url.pathname.includes("/rulesets/"))).toBe(false);
+  });
+
+  it.each([
+    { target: { oid: headSha } },
+    { target: { oid: headSha, statusCheckRollup: { state: undefined } } },
+    { target: { oid: "invalid", statusCheckRollup: { state: "SUCCESS" } } },
+    { target: { oid: previousSha, statusCheckRollup: { state: "SUCCESS" } } },
+  ])("does not accept missing or mismatched check evidence: %j", async headRef => {
+    const { provider, calls } = permitted({ graphql: { mergeStateStatus: "BLOCKED", headRef } });
+    await expect(provider.merge(7, headSha)).rejects.toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it.each([
+    { reviews: [] },
+    { reviews: [{ ...hubReview, commit_id: previousSha }] },
+    { request: { draft: true } },
+    { request: { state: "closed" } },
+    { threads: [{ isResolved: false }] },
+    { graphql: { mergeStateStatus: "BLOCKED", reviewDecision: "REVIEW_REQUIRED" } },
+    { graphql: { mergeStateStatus: "BLOCKED", mergeable: "CONFLICTING" } },
+  ])("retains existing review and request guards: %j", async overrides => {
+    const { provider, calls } = permitted(overrides);
+    expect((await provider.getChangeRequest(7)).mergeable).toBe(false);
+    await expect(provider.merge(7, headSha)).rejects.toThrow("must be open");
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it.each([
+    [], [checks], [{ ...update, type: "required_deployments" }, checks],
+    [update, checks, { ...checks, type: "future_rule" }],
+  ])("does not infer update permission from missing or unsupported rules: %j", async (...rules) => {
+    const { provider, calls } = permitted({ rules });
+    expect((await provider.getChangeRequest(7)).mergeable).toBe(false);
+    await expect(provider.merge(7, headSha)).rejects.toThrow("must be open");
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it.each(["never", "always", "exempt", "unknown"])("rejects update bypass mode %s", async current_user_can_bypass => {
+    const { provider, calls } = permitted({ rulesets: { ...rulesets, 1: { ...rulesets[1], current_user_can_bypass } } });
+    expect((await provider.getChangeRequest(7)).mergeable).toBe(false);
+    await expect(provider.merge(7, headSha)).rejects.toThrow("must be open");
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it.each(["pull_requests_only", "always", "exempt"])("does not bypass independent checks under mode %s", async current_user_can_bypass => {
+    const { provider, calls } = permitted({ rulesets: { ...rulesets, 2: { ...rulesets[2], current_user_can_bypass } } });
+    expect((await provider.getChangeRequest(7)).mergeable).toBe(false);
+    await expect(provider.merge(7, headSha)).rejects.toThrow("must be open");
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it("does not bypass a ruleset containing both update and independent checks", async () => {
+    const { provider, calls } = permitted({ rules: [update, { ...checks, ruleset_id: 1 }], rulesets: { 1: { ...rulesets[1], rules: [{ type: "update" }, { type: "required_status_checks" }] } } });
+    expect((await provider.getChangeRequest(7)).mergeable).toBe(false);
+    await expect(provider.merge(7, headSha)).rejects.toThrow("must be open");
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it.each([
+    { current_user_can_bypass: undefined }, { current_user_can_bypass: null },
+    { id: 3 }, { source: "other/repo" }, { source_type: "Organization" },
+    { enforcement: "disabled" }, { target: "tag" },
+    { rules: [] }, { rules: [{ type: "required_status_checks" }] },
+  ])("does not trust changed or incomplete ruleset evidence: %j", async changed => {
+    const { provider, calls } = permitted({ rulesets: { ...rulesets, 1: { ...rulesets[1], ...changed } } });
+    const result = await provider.merge(7, headSha).catch(error => error);
+    expect(result).toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it("rejects conflicting effective identities for the same ruleset", async () => {
+    const { provider, calls } = permitted({ rules: [update, { ...update, ruleset_source: "other/repo" }, checks] });
+    await expect(provider.merge(7, headSha)).rejects.toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it.each([
+    { ruleset_id: undefined }, { ruleset_id: 0 }, { ruleset_id: -1 },
+    { ruleset_source: undefined }, { ruleset_source: "" },
+    { ruleset_source_type: undefined }, { ruleset_source_type: "Enterprise" },
+  ])("rejects incomplete effective ruleset identity: %j", async changed => {
+    const { provider, calls } = permitted({ rules: [{ ...update, ...changed }, checks] });
+    await expect(provider.merge(7, headSha)).rejects.toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it("preserves an actual merge rejection as a sent mutation", async () => {
+    const base = permitted();
+    const { provider, calls } = harness(github, (url, options) => options.method === "PUT"
+      ? new Response(null, { status: 405 })
+      : base.fetcher(url, options));
+    const error = await provider.merge(7, headSha).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeProviderError);
+    expect(error).not.toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(error).toMatchObject({ statusCode: 405 });
+    expect(calls.filter(call => call.options.method === "PUT")).toHaveLength(1);
   });
 });
 

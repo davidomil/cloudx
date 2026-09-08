@@ -42,6 +42,7 @@ interface GitHubReadiness {
   reviewDecision: string | null;
   mergeable: string;
   mergeStateStatus: string;
+  headChecksPassed: boolean;
   unresolved: number;
   threads: Map<string, { discussionId: string; resolved: boolean }>;
 }
@@ -116,14 +117,21 @@ export class GitHubProvider implements ForgeProvider {
       !decisions.some((review) => review.state === "CHANGES_REQUESTED") &&
       (readiness.reviewDecision === null ||
         readiness.reviewDecision === "APPROVED");
+    const draft = boolean(raw.draft);
+    const canUseUpdatePermission =
+      readiness.mergeStateStatus === "BLOCKED" &&
+      readiness.mergeable === "MERGEABLE" &&
+      status.state === "open" && !draft && approved &&
+      readiness.unresolved === 0 && readiness.headChecksPassed &&
+      await this.canMergeThroughUpdateRestriction(status.baseBranch);
     return {
       ...issue,
       ...status,
-      draft: boolean(raw.draft),
+      draft,
       reviewReady: true,
       mergeable:
         readiness.mergeable === "MERGEABLE" &&
-        readiness.mergeStateStatus === "CLEAN",
+        (readiness.mergeStateStatus === "CLEAN" || canUseUpdatePermission),
       requiresBaseUpdate: readiness.mergeStateStatus === "BEHIND",
       approved,
       unresolvedDiscussions: readiness.unresolved,
@@ -352,6 +360,38 @@ export class GitHubProvider implements ForgeProvider {
     return allowed[0];
   }
 
+  private async canMergeThroughUpdateRestriction(baseBranch: string): Promise<boolean> {
+    const rules = await this.http.all(`${this.path}/rules/branches/${encodeURIComponent(baseBranch)}`);
+    const supported = ["update", "deletion", "non_fast_forward", "required_linear_history", "pull_request", "required_status_checks"];
+    const rulesets = new Map<number, { source: string; sourceType: string; types: string[] }>();
+    for (const value of rules) {
+      const rule = record(value);
+      const type = string(rule.type);
+      if (!supported.includes(type)) return false;
+      const id = integer(rule.ruleset_id);
+      const source = string(rule.ruleset_source);
+      const sourceType = string(rule.ruleset_source_type);
+      if (!id || !source || !["Repository", "Organization"].includes(sourceType)) return invalid();
+      const existing = rulesets.get(id);
+      if (existing && (existing.source !== source || existing.sourceType !== sourceType)) return invalid();
+      if (existing) existing.types.push(type);
+      else rulesets.set(id, { source, sourceType, types: [type] });
+    }
+    if (![...rulesets.values()].some(ruleset => ruleset.types.includes("update"))) return false;
+    for (const [id, expected] of rulesets) {
+      const ruleset = record((await this.http.request(`${this.path}/rulesets/${id}`, { role: "worker" })).body);
+      if (integer(ruleset.id) !== id || string(ruleset.source) !== expected.source || string(ruleset.source_type) !== expected.sourceType ||
+          ruleset.enforcement !== "active" || ruleset.target !== "branch") return invalid();
+      const types = list(ruleset.rules).map(value => string(record(value).type));
+      if (types.sort().join(",") !== expected.types.sort().join(",")) return invalid();
+      const permission = string(ruleset.current_user_can_bypass);
+      if (types.includes("update")) {
+        if (types.some(type => type !== "update") || permission !== "pull_requests_only") return false;
+      } else if (permission !== "never") return false;
+    }
+    return true;
+  }
+
   async replyToDiscussion(
     number: number,
     discussionId: string,
@@ -513,7 +553,7 @@ export class GitHubProvider implements ForgeProvider {
             graphql: true,
             body: {
               query:
-                "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid reviewDecision mergeable mergeStateStatus reviewThreads(first:100,after:$cursor){nodes{id isResolved comments(first:1){nodes{id}}} pageInfo{hasNextPage endCursor}}}}}",
+                "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid headRef{target{... on Commit{oid statusCheckRollup{state}}}} reviewDecision mergeable mergeStateStatus reviewThreads(first:100,after:$cursor){nodes{id isResolved comments(first:1){nodes{id}}} pageInfo{hasNextPage endCursor}}}}}",
               variables: { owner, name, number, cursor },
             },
           })
@@ -553,6 +593,7 @@ export class GitHubProvider implements ForgeProvider {
               : string(request.reviewDecision),
           mergeable: string(request.mergeable),
           mergeStateStatus: string(request.mergeStateStatus),
+          headChecksPassed: request.mergeStateStatus === "BLOCKED" && githubHeadChecksPassed(request.headRef, headSha),
         };
       const next = string(pageInfo.endCursor);
       if (!next || next === cursor) return invalid();
@@ -563,6 +604,15 @@ export class GitHubProvider implements ForgeProvider {
       422,
     );
   }
+}
+
+function githubHeadChecksPassed(value: unknown, expectedHeadSha: string): boolean {
+  if (value === null) return false;
+  const commit = record(record(value).target);
+  const headSha = githubHeadSha(commit.oid);
+  if (headSha !== expectedHeadSha) throw new ForgeHeadChangedError([expectedHeadSha, headSha]);
+  if (commit.statusCheckRollup === null) return false;
+  return string(record(commit.statusCheckRollup).state) === "SUCCESS";
 }
 
 function githubHeadSha(value: unknown): string {
