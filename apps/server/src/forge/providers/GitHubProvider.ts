@@ -330,9 +330,10 @@ export class GitHubProvider implements ForgeProvider {
   }
 
   private async chooseMergeMethod(baseBranch: string): Promise<GitHubMergeMethod> {
-    const [response, rules] = await Promise.all([
+    const [response, rules, classicLinearHistory] = await Promise.all([
       this.http.request(this.path),
       this.http.all(`${this.path}/rules/branches/${encodeURIComponent(baseBranch)}`),
+      this.requiresClassicLinearHistory(baseBranch),
     ]);
     const repository = record(response.body);
     const enabled = {
@@ -340,7 +341,7 @@ export class GitHubProvider implements ForgeProvider {
       merge: boolean(repository.allow_merge_commit),
       rebase: boolean(repository.allow_rebase_merge),
     };
-    let allowed = githubMergeMethods.filter(method => enabled[method]);
+    let allowed = githubMergeMethods.filter(method => enabled[method] && !(classicLinearHistory && method === "merge"));
     for (const value of rules) {
       const rule = record(value);
       const type = string(rule.type);
@@ -358,6 +359,24 @@ export class GitHubProvider implements ForgeProvider {
     if (!allowed.length)
       throw new ForgeProviderError("The repository and branch rules have no permitted merge method in common.", 409);
     return allowed[0];
+  }
+
+  private async requiresClassicLinearHistory(baseBranch: string): Promise<boolean> {
+    const [owner, name] = this.http.repository.projectPath.split("/");
+    const response = record((await this.http.request("/graphql", {
+      method: "POST",
+      role: "worker",
+      graphql: true,
+      body: {
+        query: "query($owner:String!,$name:String!,$qualifiedName:String!){repository(owner:$owner,name:$name){ref(qualifiedName:$qualifiedName){name prefix refUpdateRule{requiresLinearHistory}}}}",
+        variables: { owner, name, qualifiedName: `refs/heads/${baseBranch}` },
+      },
+    })).body);
+    if (response.errors !== undefined)
+      throw new ForgeProviderError("GitHub could not verify the base branch protection before merging.", 502);
+    const ref = record(record(record(response.data).repository).ref);
+    if (ref.name !== baseBranch || ref.prefix !== "refs/heads/") return invalid();
+    return ref.refUpdateRule === null ? false : boolean(record(ref.refUpdateRule).requiresLinearHistory);
   }
 
   private async canMergeThroughUpdateRestriction(baseBranch: string): Promise<boolean> {

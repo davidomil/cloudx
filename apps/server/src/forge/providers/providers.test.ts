@@ -158,6 +158,7 @@ function hubFixture(
     graphql?: Record<string, unknown>;
     repository?: Record<string, unknown>;
     rules?: unknown[];
+    classicRule?: unknown;
     rulesets?: Record<number, Record<string, unknown>>;
     intercept?: Handler;
   } = {},
@@ -177,6 +178,11 @@ function hubFixture(
       return response({
         data: {
           repository: {
+            ref: {
+              name: overrides.graphql?.baseRefName ?? "main",
+              prefix: "refs/heads/",
+              refUpdateRule: overrides.classicRule ?? null,
+            },
             pullRequest: {
               ...hubStatus,
               state: overrides.request?.merged === true ? "MERGED" : overrides.request?.state === "closed" ? "CLOSED" : "OPEN",
@@ -1128,6 +1134,80 @@ describe("GitHub review and exact-commit merge", () => {
 });
 
 describe("GitHub merge method selection", () => {
+  it.each([
+    { name: "uses rebase when classic protection requires linear history and squash is disabled", repository: { allow_squash_merge: false }, classicRule: { requiresLinearHistory: true }, rules: [], method: "rebase" },
+    { name: "permits squash under classic linear-history protection", repository: {}, classicRule: { requiresLinearHistory: true }, rules: [], method: "squash" },
+    { name: "permits merge commits when the classic rule does not require linear history", repository: { allow_squash_merge: false }, classicRule: { requiresLinearHistory: false }, rules: [], method: "merge" },
+    { name: "permits merge commits when no classic rule applies", repository: { allow_squash_merge: false }, classicRule: null, rules: [], method: "merge" },
+    { name: "applies classic linear history alongside ruleset method restrictions", repository: {}, classicRule: { requiresLinearHistory: true }, rules: [{ type: "pull_request", parameters: { allowed_merge_methods: ["merge", "rebase"] } }], method: "rebase" },
+    { name: "preserves ruleset linear history when the classic rule allows merge commits", repository: { allow_squash_merge: false }, classicRule: { requiresLinearHistory: false }, rules: [{ type: "required_linear_history" }], method: "rebase" },
+  ])("$name", async ({ repository, classicRule, rules, method }) => {
+    const { provider, calls } = hubFixture({ repository, classicRule, rules });
+    await expect(provider.merge(7, headSha)).resolves.toMatchObject({ merged: true });
+    const writes = calls.filter(call => call.options.method === "PUT");
+    expect(writes).toHaveLength(1);
+    expect(JSON.parse(String(writes[0].options.body))).toEqual({ sha: headSha, merge_method: method });
+  });
+
+  it.each([
+    { repository: { allow_squash_merge: false, allow_rebase_merge: false }, rules: [] },
+    { repository: {}, rules: [{ type: "pull_request", parameters: { allowed_merge_methods: ["merge"] } }] },
+  ])("does not submit when classic protection excludes the only permitted merge method: %j", async overrides => {
+    const { provider, calls } = hubFixture({ ...overrides, classicRule: { requiresLinearHistory: true } });
+    const error = await provider.merge(7, headSha).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(error.message).toMatch(/no permitted merge method/i);
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it.each([{}, [], false, { requiresLinearHistory: null }, { requiresLinearHistory: "true" }, { requiresLinearHistory: 1 }].map(classicRule => ({ classicRule })))(
+    "rejects malformed classic protection before writing: %j", async ({ classicRule }) => {
+      const { provider, calls } = hubFixture({ classicRule });
+      const error = await provider.merge(7, headSha).catch(error => error);
+      expect(error).toBeInstanceOf(ForgeMergeNotStartedError);
+      expect(error).toMatchObject({ statusCode: 502, change: { headSha } });
+      expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+    },
+  );
+
+  it.each([
+    {}, { data: null }, { data: { repository: null } }, { data: { repository: {} } },
+    { data: { repository: { ref: null } } },
+    { data: { repository: { ref: { name: "other", prefix: "refs/heads/", refUpdateRule: null } } } },
+    { data: { repository: { ref: { name: "main", prefix: "refs/tags/", refUpdateRule: null } } } },
+    { data: { repository: { ref: { name: "main", prefix: "refs/heads/" } } } },
+    { errors: [{ type: "FORBIDDEN" }], data: { repository: { ref: { name: "main", prefix: "refs/heads/", refUpdateRule: null } } } },
+  ])("requires complete classic branch protection evidence before merging: %j", async protection => {
+    const base = hubFixture();
+    const { provider, calls } = harness(github, (url, options) => String(options.body).includes("refUpdateRule")
+      ? response(protection) : base.fetcher(url, options));
+    const error = await provider.merge(7, headSha).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(error).toMatchObject({ statusCode: 502, change: { headSha } });
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it("reads the exact classic base-branch protection using the worker identity", async () => {
+    const base = hubFixture({ request: { base: { ref: "release/v1", sha: previousSha } }, graphql: { baseRefName: "release/v1" }, classicRule: { requiresLinearHistory: true } });
+    const { provider, calls } = harness(github, base.fetcher, "reviewer");
+    await provider.merge(7, headSha);
+    const protections = calls.filter(call => String(call.options.body).includes("refUpdateRule"));
+    expect(protections).toHaveLength(1);
+    expect(protections[0].url.pathname).toBe("/graphql");
+    expect(JSON.parse(String(protections[0].options.body)).variables).toEqual({ owner: "owner", name: "repo", qualifiedName: "refs/heads/release/v1" });
+    expect(new Headers(protections[0].options.headers).get("authorization")).toBe("Bearer worker-private-token");
+  });
+
+  it.each([403, 404, 500])("keeps a failed classic protection read inside merge preflight (HTTP %s)", async status => {
+    const base = hubFixture();
+    const { provider, calls } = harness(github, (url, options) => String(options.body).includes("refUpdateRule")
+      ? new Response(null, { status }) : base.fetcher(url, options));
+    const error = await provider.merge(7, headSha).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(error).toMatchObject({ statusCode: status, change: { headSha } });
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
   it.each([
     { name: "prefers squash when all methods are enabled", repository: {}, rules: [], method: "squash" },
     { name: "supports repositories that only allow merge commits", repository: { allow_squash_merge: false, allow_rebase_merge: false }, rules: [], method: "merge" },
