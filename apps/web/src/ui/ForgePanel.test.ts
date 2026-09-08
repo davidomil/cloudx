@@ -652,6 +652,67 @@ describe("ForgePanel", () => {
     expect(published).toEqual([{ repository: testFixture.dashboard.repository, number: change.number, headSha: current.headSha, event, body }]);
   });
 
+  it.each(["github", "gitlab"] as const)("shows %s review workers collapsed and newest first by start time", async provider => {
+    const currentRepository = { ...repository, provider };
+    const oldest = { ...reviewWorker, repository: currentRepository, id: "oldest", startedAt: "2026-09-07T10:00:00Z", updatedAt: "2026-09-07T14:00:00Z", draft: { ...reviewWorker.draft!, status: "posted" as const } };
+    const failed = { ...reviewWorker, repository: currentRepository, id: "failed", startedAt: "2026-09-07T11:00:00Z", status: "failed" as const, error: "Review publication failed.", draft: { ...reviewWorker.draft!, status: "post_failed" as const } };
+    const newest = { ...reviewWorker, repository: currentRepository, id: "newest", startedAt: "2026-09-07T12:00:00Z", status: "running" as const, draft: undefined };
+    const coding = { ...worker, repository: currentRepository, changeNumber: change.number };
+    const workers = [failed, oldest, coding, newest, { ...newest, id: "unrelated", number: 13 }];
+    const testFixture = fixture({ repository: currentRepository, workers });
+    const panel = await renderPanel(testFixture);
+    await click(panel, provider === "github" ? "Pull requests" : "Merge requests");
+    const histories = Array.from(panel.querySelectorAll<HTMLDetailsElement>(".forge-worker-history"));
+    expect(histories.map(history => history.querySelector("summary time")?.getAttribute("datetime"))).toEqual([newest.startedAt, failed.startedAt, oldest.startedAt]);
+    expect(histories.every(history => !history.open)).toBe(true);
+    expect(histories[0].querySelector("summary")?.textContent).toContain("running");
+    expect(histories[2].querySelector("summary")?.textContent).toContain("Posted review · 1 comment");
+    expect(histories[1].querySelector(".forge-worker")?.textContent).toContain(failed.error);
+    expect(histories[1].textContent).toContain("Submission could be incomplete");
+    expect(histories[2].querySelectorAll(".forge-review textarea")).toHaveLength(2);
+    expect(histories[2].textContent).toContain("Review posted.");
+    expect(panel.querySelector('.forge-change-actions [aria-label="issue worker #7"]')?.closest("details")).toBeNull();
+    expect(panel.querySelector(".forge-comments")?.closest("details")).toBeNull();
+    expect(testFixture.dashboard.workers.map(worker => worker.id)).toEqual(["failed", "oldest", "work-1", "newest", "unrelated"]);
+    expect(panel.querySelector("dialog")).toBeNull();
+  });
+
+  it("preserves expanded reviews and all unsaved messages when polling adds a newer worker", async () => {
+    vi.useFakeTimers();
+    const oldest = { ...reviewWorker, id: "oldest", startedAt: "2026-09-07T10:00:00Z", draft: { ...reviewWorker.draft!, status: "posted" as const } };
+    const current = { ...reviewWorker, startedAt: "2026-09-07T11:00:00Z" };
+    let testFixture: ReturnType<typeof fixture>;
+    testFixture = fixture({ workers: [oldest, current] }, hook => hook === "forge.dashboard" ? structuredClone(testFixture.dashboard) : undefined);
+    const panel = await renderPanel(testFixture);
+    await click(panel, "Pull requests");
+    const [history, olderHistory] = Array.from(panel.querySelectorAll<HTMLDetailsElement>(".forge-worker-history"));
+    await act(async () => { history.querySelector("summary")!.click(); olderHistory.querySelector("summary")!.click(); });
+    expect(history.open && olderHistory.open).toBe(true);
+    const [summary, comment] = Array.from(history.querySelectorAll<HTMLTextAreaElement>(".forge-review textarea"));
+    await fill(summary, "Keep my unsaved summary.");
+    await fill(comment, "Keep my unsaved inline comment.");
+    await click(history, "Add comment");
+    const generalComment = history.querySelectorAll<HTMLTextAreaElement>(".forge-review textarea")[2];
+    await fill(generalComment, "Keep my new general comment.");
+    const newest = { ...current, id: "newest", startedAt: "2026-09-07T12:00:00Z", draft: undefined, status: "running" as const };
+    testFixture.dashboard.workers = [oldest, newest, { ...current, updatedAt: "2026-09-07T14:00:00Z" }];
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    const refreshed = Array.from(panel.querySelectorAll<HTMLDetailsElement>(".forge-worker-history"));
+    expect(refreshed[0].open).toBe(false);
+    expect(refreshed[1]).toBe(history);
+    expect(refreshed[2]).toBe(olderHistory);
+    expect(history.open && olderHistory.open).toBe(true);
+    await act(async () => { history.querySelector("summary")!.click(); });
+    expect(history.open).toBe(false);
+    expect(olderHistory.open).toBe(true);
+    await act(async () => { history.querySelector("summary")!.click(); });
+    expect(history.open).toBe(true);
+    expect(Array.from(history.querySelectorAll<HTMLTextAreaElement>(".forge-review textarea"), textarea => textarea.value)).toEqual(["Keep my unsaved summary.", "Keep my unsaved inline comment.", "Keep my new general comment."]);
+    expect(history.querySelector(".forge-review textarea")).toBe(summary);
+    expect(panel.querySelector("dialog")).toBeNull();
+    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
+  });
+
   it.each(["github", "gitlab"] as const)("keeps the %s issue worker beside review actions above a long description without losing draft edits", async provider => {
     const currentRepository = { ...repository, provider };
     const coding = { ...worker, repository: currentRepository, changeNumber: change.number, status: "awaiting_review" as const };

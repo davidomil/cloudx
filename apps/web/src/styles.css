@@ -3607,6 +3607,9 @@ a:hover svg {
   .forge-worker-overlay-terminal { margin: 8px; }
 }
 .forge-worker { margin-top: 12px; padding: 12px; border: 1px solid var(--color-border); border-radius: 5px; overflow-wrap: anywhere; }
+.forge-worker-history { margin-top: 12px; border: 1px solid var(--color-border); border-radius: 5px; overflow-wrap: anywhere; }
+.forge-worker-history > summary { cursor: pointer; padding: 12px; }
+.forge-worker-history > .forge-worker { margin: 0; border: 0; border-top: 1px solid var(--color-border); border-radius: 0; }
 .forge-worker-heading { justify-content: space-between; }
 .forge-status { padding: 4px 7px; border-radius: 4px; background: var(--color-background); font-size: var(--font-size-xs); }
 .forge-status-running, .forge-status-awaiting_publication, .forge-status-completed { color: var(--color-accent); }

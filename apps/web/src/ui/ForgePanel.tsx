@@ -178,6 +178,7 @@ function ForgeItems({ kind, repository, request, revision, workers, placement, r
 
   useEffect(() => { setReviewBody(""); }, [selectedNumber]);
   const selectedWorkers = workersForItem(workers, kind, selectedNumber);
+  const visibleWorkers = kind === "issues" ? selectedWorkers : selectedWorkers.filter(worker => worker.kind === "review").sort((a, b) => Date.parse(b.startedAt) - Date.parse(a.startedAt));
   const activeWorker = selectedWorkers.find((worker) => worker.kind === (kind === "issues" ? "issue" : "review") && worker.status !== "completed");
   const unconfirmedPublication = selectedWorkers.some(hasUnconfirmedPublication);
   const currentDetail = detail?.number === selectedNumber ? detail : undefined;
@@ -249,7 +250,7 @@ function ForgeItems({ kind, repository, request, revision, workers, placement, r
           </section> : null}
           {detailBusy ? <p role="status">Loading latest details…</p> : null}
           {detailError ? <p role="alert" className="forge-notice">{detailError}</p> : null}
-          {selectedWorkers.filter(worker => kind === "issues" || worker.kind === "review").map((worker) => <WorkerCard key={worker.id} worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} showAutoReview={kind !== "issues"} canSubmitReview={!unconfirmedPublication && (kind === "issues" || !reviewDisabled)} />)}
+          {visibleWorkers.map((worker) => <WorkerCard key={worker.id} worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} collapsible={kind === "changes"} showAutoReview={kind !== "issues"} canSubmitReview={!unconfirmedPublication && (kind === "issues" || !reviewDisabled)} />)}
           <p className="forge-prose">{item.body}</p>
           {kind === "issues" ? <>
             <div className="forge-actions">
@@ -302,7 +303,7 @@ function autoReviewProgress(worker: ForgeWorker) {
   return `Auto review · ${{ implementing: "Implementing changes", reviewing: "Reviewing changes", merging: "Waiting to merge" }[worker.autoReview.phase]}`;
 }
 
-function WorkerCard({ worker, request, placement, runAction, busy, onViewWorker, canSubmitReview = true, showAutoReview = true }: {
+function WorkerCard({ worker, request, placement, runAction, busy, onViewWorker, canSubmitReview = true, showAutoReview = true, collapsible = false }: {
   worker: ForgeWorker;
   request: Request;
   placement: ForgePlacement;
@@ -311,6 +312,7 @@ function WorkerCard({ worker, request, placement, runAction, busy, onViewWorker,
   onViewWorker?: (workerId: string) => void;
   canSubmitReview?: boolean;
   showAutoReview?: boolean;
+  collapsible?: boolean;
 }) {
   const [controlling, setControlling] = useState(false);
   const controlRunning = useRef(false);
@@ -325,7 +327,7 @@ function WorkerCard({ worker, request, placement, runAction, busy, onViewWorker,
   const canResume = ["paused", "failed", "stopped", "cleanup_failed"].includes(worker.status) || (["awaiting_review", "awaiting_merge"].includes(worker.status) && !automaticReview);
   const canStop = ["starting", "running", "awaiting_publication", "awaiting_merge", "paused", "awaiting_review", "failed"].includes(worker.status);
   const progress = autoReviewProgress(worker);
-  return <article className="forge-worker" aria-label={`${worker.kind} worker #${worker.number}`}>
+  const card = <article className="forge-worker" aria-label={`${worker.kind} worker #${worker.number}`}>
     <div className="forge-worker-heading"><strong>{worker.kind === "issue" ? "Issue" : "Review"} #{worker.number} · {worker.title}</strong><span className={`forge-status forge-status-${worker.status}`}>{worker.status.replaceAll("_", " ")}</span></div>
     <p className="forge-muted">{worker.repository.projectPath}{worker.branch ? ` · ${worker.branch}` : ""}</p>
     {worker.error ? <p role="alert" className="forge-notice">{worker.error}</p> : null}
@@ -341,6 +343,16 @@ function WorkerCard({ worker, request, placement, runAction, busy, onViewWorker,
     </div>
     {worker.draft ? <ReviewEditor key={`${worker.id}:${worker.draft.headSha}`} worker={worker} draft={worker.draft} request={request} runAction={runAction} busy={busy} canSubmitReview={canSubmitReview} /> : null}
   </article>;
+  if (!collapsible) return card;
+  const comments = worker.draft?.comments.length ?? 0;
+  const status = worker.draft?.status === "post_failed" ? "failed" : worker.status;
+  return <details className="forge-worker-history">
+    <summary>
+      <strong>Review #{worker.number}</strong> · <time dateTime={worker.startedAt}>{new Date(worker.startedAt).toLocaleString()}</time> · <span className={`forge-status forge-status-${status}`}>{worker.draft?.status === "post_failed" ? "post failed" : status.replaceAll("_", " ")}</span>
+      {worker.draft ? <span className="forge-muted"> · {worker.draft.status === "posted" ? "Posted review" : "Suggested review"} · {comments} {comments === 1 ? "comment" : "comments"}</span> : null}
+    </summary>
+    {card}
+  </details>;
 }
 
 function ReviewEditor({ worker, draft, request, runAction, busy, canSubmitReview }: {
