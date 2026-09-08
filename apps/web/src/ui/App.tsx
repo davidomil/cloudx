@@ -1,5 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement, type RefObject } from "react";
 import { CodexStateSourceSelect } from "./CodexStateSourceSelect.js";
+import { TabPanel, tabPanelSupportsFileTransfers } from "./TabPanel.js";
 import { AlertTriangle, Bell, BellRing, Bot, CheckCheck, ChevronDown, Columns2, GitBranch, LayoutTemplate, Maximize2, Mic, MicOff, Minimize2, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
 
 import { DEFAULT_WORKSPACE_MAX_PANES, RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsStore, type StatePersistenceStatus, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
@@ -1537,29 +1538,38 @@ export function App() {
           ) : null}
         </div>
         <div className="pane-body">
-          {activePaneTabId && activePaneTab ? (
-            <PluginPanel
-              tab={activePaneTab}
-              plugin={pluginById.get(activePaneTab.pluginId)}
-              plugins={plugins}
-              active={paneActive}
-              config={pluginConfig(activePaneTab.pluginId)}
-              uiScale={uiScale}
-              uiContributionRegistry={uiContributionRegistry}
-              callHook={callUiHook}
-              automationRuns={automationRuns}
-              automationPanelState={automationPanelStates[activePaneTabId]}
-              onAutomationPanelStateChange={(updater) => updateAutomationPanelState(activePaneTabId, updater)}
-              activeAutomationTriggerIds={activeAutomationTriggerIds}
-              emitTrigger={handleEmitTrigger}
-              onAutomationGroupsChanged={refreshActiveAutomationTriggerIds}
-            />
-          ) : (
+          {pane.tabIds.map((tabId) => {
+            const tab = tabById.get(tabId);
+            if (!tab) return null;
+            const selected = tabId === activePaneTabId;
+            const plugin = pluginById.get(tab.pluginId);
+            return (
+              <TabPanel key={tabId} selected={selected} retain={tabPanelSupportsFileTransfers(plugin, selectPluginPanelContribution(plugins, plugin))}>
+                <PluginPanel
+                  tab={tab}
+                  plugin={plugin}
+                  plugins={plugins}
+                  active={paneActive && selected}
+                  config={pluginConfig(tab.pluginId)}
+                  uiScale={uiScale}
+                  uiContributionRegistry={uiContributionRegistry}
+                  callHook={callUiHook}
+                  automationRuns={automationRuns}
+                  automationPanelState={automationPanelStates[tabId]}
+                  onAutomationPanelStateChange={(updater) => updateAutomationPanelState(tabId, updater)}
+                  activeAutomationTriggerIds={activeAutomationTriggerIds}
+                  emitTrigger={handleEmitTrigger}
+                  onAutomationGroupsChanged={refreshActiveAutomationTriggerIds}
+                />
+              </TabPanel>
+            );
+          })}
+          {!activePaneTab ? (
             <div className="empty-pane">
               <PanelTopOpen size={28} />
               <span>Drop a tab here or create a plugin tab.</span>
             </div>
-          )}
+          ) : null}
         </div>
       </div>
     );

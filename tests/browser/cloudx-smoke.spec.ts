@@ -1,6 +1,13 @@
-import { expect, test, type WebSocket } from "@playwright/test";
+import {
+  expect,
+  test,
+  type Locator,
+  type Page,
+  type WebSocket,
+} from "@playwright/test";
 import type {
   CreateTabResponse,
+  PluginDescriptor,
   TabLayoutNode,
   WorkspaceStateResponse,
 } from "@cloudx/shared";
@@ -698,7 +705,369 @@ test.describe("CloudX shipped shell", () => {
       releaseSecondPatch();
     }
   });
+
+  test("keeps file uploads and downloads running across tab switches", async ({
+    page,
+  }) => {
+    const files = await createTransferTestTab(
+      page,
+      "file-browser",
+      "Transfer files",
+    );
+    const other = await createTransferTestTab(
+      page,
+      "file-browser",
+      "Other files",
+    );
+    let releaseUpload!: () => void;
+    let releaseDownload!: () => void;
+    const uploadGate = new Promise<void>((resolve) => {
+      releaseUpload = resolve;
+    });
+    const downloadGate = new Promise<void>((resolve) => {
+      releaseDownload = resolve;
+    });
+    const uploads: string[] = [];
+    let downloads = 0;
+    await page.route(
+      `**/api/tabs/${files.tab.id}/files/upload?*`,
+      async (route) => {
+        uploads.push(
+          new URL(route.request().url()).searchParams.get("relativePath")!,
+        );
+        await uploadGate;
+        await route.continue();
+      },
+    );
+    await page.route(
+      `**/api/tabs/${files.tab.id}/files/download`,
+      async (route) => {
+        downloads += 1;
+        await downloadGate;
+        if (downloads === 1) {
+          await route.continue();
+        } else {
+          await route.fulfill({
+            status: 500,
+            json: { message: "Transfer fixture download failed" },
+          });
+        }
+      },
+    );
+    const selectFiles = () =>
+      page
+        .locator(".tab-activation")
+        .filter({ hasText: "Transfer files" })
+        .click();
+    const selectOther = () =>
+      page
+        .locator(".tab-activation")
+        .filter({ hasText: "Other files" })
+        .click();
+    const visibleFiles = page.locator(".file-browser-panel:visible");
+    try {
+      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+      await selectFiles();
+      const contents = ["first upload bytes", "second upload bytes"];
+      await visibleFiles.locator('input[type="file"]').setInputFiles(
+        contents.map((content, index) => ({
+          name: `transfer-${index}.txt`,
+          mimeType: "text/plain",
+          buffer: Buffer.from(content),
+        })),
+      );
+      await expect.poll(() => uploads.length).toBe(1);
+      await selectOther();
+      await expect(
+        visibleFiles.getByRole("button", { name: "Upload files", exact: true }),
+      ).toBeEnabled();
+      await expect(
+        visibleFiles.getByRole("status", { name: "Upload progress" }),
+      ).toHaveCount(0);
+      await selectFiles();
+      await expect(
+        visibleFiles.getByRole("status", { name: "Upload progress" }),
+      ).toContainText("Uploading 1/2");
+      await expect(
+        visibleFiles.getByRole("button", { name: "Upload files", exact: true }),
+      ).toBeDisabled();
+      await selectOther();
+      const uploadFinished = page.waitForResponse(
+        (response) =>
+          response.url().includes(`/api/tabs/${files.tab.id}/files/upload?`) &&
+          new URL(response.url()).searchParams.get("relativePath") ===
+            "transfer-1.txt",
+      );
+      releaseUpload();
+      expect((await uploadFinished).status()).toBe(200);
+      expect(uploads).toHaveLength(2);
+      for (const [index, content] of contents.entries()) {
+        expect(
+          await fs.readFile(
+            path.join(testRoot, "workspace", `transfer-${index}.txt`),
+            "utf8",
+          ),
+        ).toBe(content);
+      }
+      await selectFiles();
+      await expect(
+        visibleFiles.getByRole("status", { name: "Upload progress" }),
+      ).toHaveCount(0);
+      await expect(
+        visibleFiles.getByRole("button", { name: "Upload files", exact: true }),
+      ).toBeEnabled();
+      expect(uploads).toEqual(["transfer-0.txt", "transfer-1.txt"]);
+      await selectTransferDownload(visibleFiles);
+      const downloadButton = visibleFiles.getByRole("button", {
+        name: "Download 1 selected entries",
+        exact: true,
+      });
+      await downloadButton.click();
+      await expect.poll(() => downloads).toBe(1);
+      await selectOther();
+      await selectFiles();
+      await expect(downloadButton).toBeDisabled();
+      await selectOther();
+      const downloaded = page.waitForEvent("download");
+      releaseDownload();
+      const download = await downloaded;
+      expect(download.suggestedFilename()).toBe("transfer-0.txt");
+      expect(await fs.readFile((await download.path())!, "utf8")).toBe(
+        contents[0],
+      );
+      await selectFiles();
+      const selectDownloads = visibleFiles.getByRole("button", {
+        name: "Select files or folders to download",
+        exact: true,
+      });
+      await expect(selectDownloads).toBeVisible();
+      expect(downloads).toBe(1);
+
+      await selectTransferDownload(visibleFiles);
+      await downloadButton.click();
+      await selectOther();
+      await expect.poll(() => downloads).toBe(2);
+      await selectFiles();
+      await expect(visibleFiles.locator(".inline-error")).toContainText(
+        "Transfer fixture download failed",
+      );
+      await expect(selectDownloads).toBeVisible();
+    } finally {
+      releaseUpload();
+      releaseDownload();
+      await page.unrouteAll({ behavior: "wait" });
+      await page.request.delete(`${baseUrl}/api/tabs/${files.tab.id}`);
+      await page.request.delete(`${baseUrl}/api/tabs/${other.tab.id}`);
+    }
+  });
+
+  for (const viewer of ["local web", "plugin webview"] as const) {
+    test(`keeps ${viewer} transfers running in a hidden tab`, async ({
+      page,
+    }) => {
+      const fixtureUrl = `${baseUrl}/transfer-fixture`;
+      const view = await createTransferTestTab(
+        page,
+        "local-web",
+        "Transfer viewer",
+        { url: fixtureUrl },
+      );
+      const other = await createTransferTestTab(
+        page,
+        "local-web",
+        "Other viewer",
+      );
+      let release!: () => void;
+      const transferGate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const requests: Array<{ method: string; body: string | null }> = [];
+      const transferUrl = `${baseUrl}/transfer-fixture-bytes`;
+      await page.route(`${transferUrl}/*`, async (route) => {
+        requests.push({
+          method: route.request().method(),
+          body: route.request().postData(),
+        });
+        await transferGate;
+        await route.fulfill({
+          contentType: "text/plain",
+          headers: { "access-control-allow-origin": "*" },
+          body: "downloaded fixture bytes",
+        });
+      });
+      const fixtureHtml = `<!doctype html><html><body>
+        <input type="file" aria-label="Upload fixture">
+        <button>Start transfers</button>
+        <output id="upload">Ready</output>
+        <output id="download">Ready</output>
+        <script>
+          document.querySelector('button').onclick = () => {
+            const file = document.querySelector('input').files[0];
+            document.querySelector('#upload').textContent = 'Uploading';
+            document.querySelector('#download').textContent = 'Downloading';
+            fetch('${transferUrl}/upload', { method: 'POST', body: file }).then(() => {
+              document.querySelector('#upload').textContent = 'Upload complete';
+            });
+            fetch('${transferUrl}/download').then(response => response.blob()).then(blob => {
+              const link = document.createElement('a');
+              link.href = URL.createObjectURL(blob);
+              link.download = 'viewer-transfer.txt';
+              document.body.append(link);
+              link.click();
+              link.remove();
+              URL.revokeObjectURL(link.href);
+              document.querySelector('#download').textContent = 'Download complete';
+            });
+          };
+        </script></body></html>`;
+      await page.route(
+        viewer === "local web"
+          ? `**/api/local-web/${view.tab.id}/proxy/**`
+          : fixtureUrl,
+        (route) =>
+          route.fulfill({ contentType: "text/html", body: fixtureHtml }),
+      );
+      if (viewer === "plugin webview") {
+        await page.route("**/api/plugins", async (route) => {
+          const response = await route.fetch();
+          const body = (await response.json()) as {
+            plugins: PluginDescriptor[];
+          };
+          const plugin = body.plugins.find(
+            (plugin) => plugin.id === "local-web",
+          )!;
+          plugin.panelKind = "placeholder";
+          plugin.uiContributions = [
+            {
+              id: "transfer-fixture.panel",
+              owner: { kind: "plugin", pluginId: "local-web" },
+              slot: "plugin.panel",
+              renderer: "plugin.webview",
+              title: "Transfer fixture",
+              targetPluginId: "local-web",
+              state: {
+                url: fixtureUrl,
+                sandbox: "allow-scripts allow-forms allow-downloads",
+              },
+            },
+          ];
+          await route.fulfill({ response, json: body });
+        });
+      }
+      try {
+        await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+        await page
+          .locator(".tab-activation")
+          .filter({ hasText: "Transfer viewer" })
+          .click();
+        const iframe = page.locator(
+          ".workspace-pane.active .pane-body iframe:visible",
+        );
+        const element = (await iframe.elementHandle())!;
+        const frame = (await element.contentFrame())!;
+        await frame.getByLabel("Upload fixture").setInputFiles({
+          name: "viewer-upload.txt",
+          mimeType: "text/plain",
+          buffer: Buffer.from("uploaded fixture bytes"),
+        });
+        await frame.getByRole("button", { name: "Start transfers" }).click();
+        await expect.poll(() => requests.length).toBe(2);
+        await page
+          .locator(".tab-activation")
+          .filter({ hasText: "Other viewer" })
+          .click();
+        expect(await element.evaluate((node) => node.isConnected)).toBe(true);
+        await expect(
+          frame.getByRole("button", { name: "Start transfers" }),
+        ).toBeHidden();
+        await page
+          .locator(".tab-activation")
+          .filter({ hasText: "Transfer viewer" })
+          .click();
+        await expect(frame.locator("#upload")).toHaveText("Uploading");
+        await page
+          .locator(".tab-activation")
+          .filter({ hasText: "Other viewer" })
+          .click();
+        const downloaded = page.waitForEvent("download");
+        release();
+        const download = await downloaded;
+        expect(await fs.readFile((await download.path())!, "utf8")).toBe(
+          "downloaded fixture bytes",
+        );
+        await expect(frame.locator("#upload")).toHaveText("Upload complete");
+        await expect(frame.locator("#download")).toHaveText(
+          "Download complete",
+        );
+        expect(requests).toEqual(
+          expect.arrayContaining([
+            { method: "POST", body: "uploaded fixture bytes" },
+            { method: "GET", body: null },
+          ]),
+        );
+        expect(requests).toHaveLength(2);
+        await page
+          .getByRole("button", { name: "Close Transfer viewer", exact: true })
+          .click();
+        await expect.poll(() => frame.isDetached()).toBe(true);
+      } finally {
+        release();
+        await page.unrouteAll({ behavior: "wait" });
+        await page.request.delete(`${baseUrl}/api/tabs/${view.tab.id}`);
+        await page.request.delete(`${baseUrl}/api/tabs/${other.tab.id}`);
+      }
+    });
+  }
 });
+
+async function selectTransferDownload(files: Locator) {
+  await files
+    .getByRole("button", {
+      name: "Select files or folders to download",
+      exact: true,
+    })
+    .click();
+  if (
+    !(await files
+      .getByRole("region", { name: "File tree", exact: true })
+      .isVisible())
+  ) {
+    await files.locator(".file-tree-dock").hover();
+    await files.getByRole("button", { name: "File tree", exact: true }).click();
+  }
+  await files
+    .getByRole("checkbox", {
+      name: "Select transfer-0.txt for download",
+      exact: true,
+    })
+    .check();
+}
+
+async function createTransferTestTab(
+  page: Page,
+  pluginId: string,
+  title: string,
+  initialInput?: Record<string, string>,
+): Promise<CreateTabResponse> {
+  const workspace = (await (
+    await page.request.get(`${baseUrl}/api/workspace`)
+  ).json()) as WorkspaceStateResponse;
+  const window = workspace.windows.find(
+    (candidate) => candidate.id === workspace.activeWindowId,
+  )!;
+  const response = await page.request.post(`${baseUrl}/api/tabs`, {
+    data: {
+      pluginId,
+      title,
+      cwd: path.join(testRoot, "workspace"),
+      initialInput,
+      windowId: window.id,
+      paneId: window.layout.activePaneId,
+    },
+  });
+  expect(response.status()).toBe(201);
+  return response.json();
+}
 
 async function writeTerminalFixture(root: string): Promise<string> {
   const executable = path.join(root, "codex-fixture.cjs");
