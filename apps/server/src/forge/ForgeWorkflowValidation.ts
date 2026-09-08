@@ -1,4 +1,5 @@
 import type {
+  ForgeIssueCompletionReport,
   ForgeReviewComment,
   ForgeReviewSubmission,
   ForgeWorker,
@@ -76,12 +77,7 @@ export function parseReview(value: unknown): ForgeReviewSubmission {
 export function parseWorkerReport(
   value: unknown,
 ):
-  | {
-      kind: "issue";
-      title: string;
-      body: string;
-      resolvedDiscussionIds: string[];
-    }
+  | ForgeIssueCompletionReport
   | ({ kind: "review" } & ForgeReviewSubmission) {
   const report = object(value);
   if (report.kind === "review")
@@ -99,13 +95,67 @@ export function parseWorkerReport(
     ids.some((id) => typeof id !== "string" || !id || id.length > 256)
   )
     throw new Error("Invalid resolved discussion IDs.");
+  const replies =
+    report.discussionReplies === undefined ? [] : report.discussionReplies;
+  if (!Array.isArray(replies) || replies.length > 100)
+    throw new Error("An issue report can contain at most 100 discussion replies.");
+  const discussionIds = new Set<string>();
+  const discussionReplies = replies.map(raw => {
+    const reply = object(raw);
+    const discussionId = text(reply.discussionId, "reply discussion ID", 256);
+    if (!discussionId.trim() || discussionIds.has(discussionId))
+      throw new Error("Reply discussion IDs must be nonblank and unique.");
+    discussionIds.add(discussionId);
+    const body = text(reply.body, "discussion reply body", 20_000);
+    if (!body.trim()) throw new Error("Discussion replies must not be empty.");
+    return { discussionId, body };
+  });
   return {
     kind: "issue",
     title,
     body,
     resolvedDiscussionIds: [...new Set(ids)] as string[],
+    discussionReplies,
   };
 }
+
+function parsePendingPublication(
+  value: unknown,
+): NonNullable<ForgeWorker["pendingPublication"]> {
+  const input = object(value);
+  const report = parseWorkerReport(input.report);
+  if (report.kind !== "issue")
+    throw new Error("Pending publication requires an issue completion report.");
+  const headSha = input.headSha === undefined
+    ? undefined
+    : text(input.headSha, "published head", 64);
+  if (headSha !== undefined && !/^[a-f0-9]{40,64}$/i.test(headSha))
+    throw new Error("Invalid published head.");
+  const replyIds = new Set(report.discussionReplies.map(reply => reply.discussionId));
+  const replied = input.repliedDiscussionIds;
+  if (
+    !Array.isArray(replied) ||
+    replied.length > 100 ||
+    replied.some(id => typeof id !== "string" || !replyIds.has(id)) ||
+    new Set(replied).size !== replied.length
+  )
+    throw new Error("Published reply IDs must be unique and belong to the completion report.");
+  const replyingTo = input.replyingToDiscussionId;
+  if (
+    replyingTo !== undefined &&
+    (typeof replyingTo !== "string" || !replyIds.has(replyingTo) || replied.includes(replyingTo))
+  )
+    throw new Error("The in-flight reply must belong to the report and must not already be published.");
+  if ((replied.length || replyingTo !== undefined) && headSha === undefined)
+    throw new Error("Discussion reply progress requires a published head.");
+  return {
+    report,
+    ...(headSha !== undefined ? { headSha } : {}),
+    repliedDiscussionIds: [...replied] as string[],
+    ...(replyingTo !== undefined ? { replyingToDiscussionId: replyingTo as string } : {}),
+  };
+}
+
 export function parseWorkers(value: unknown): ForgeWorker[] {
   if (!Array.isArray(value) || value.length > 10_000)
     throw new Error("Invalid saved Forge worker list.");
@@ -194,6 +244,12 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
       )
         throw new Error("Invalid saved review state.");
     }
-    return structuredClone(worker) as unknown as ForgeWorker;
+    const parsed = structuredClone(worker) as unknown as ForgeWorker;
+    if (worker.pendingPublication !== undefined) {
+      if (worker.kind !== "issue")
+        throw new Error("Only issue workers can have pending publication.");
+      parsed.pendingPublication = parsePendingPublication(worker.pendingPublication);
+    }
+    return parsed;
   });
 }

@@ -84,7 +84,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     await fixture.workflow.pause(started.id);
   }, 15_000);
 
-  it("implements an issue, reads fresh feedback on resume, then merges the approved result and cleans its resources", async () => {
+  it("implements an issue, reconciles a delayed publication, replies to feedback, then merges the approved result", async () => {
     const fixture = await LifecycleFixture.create();
     const started = await fixture.workflow.startIssue(1, fixture.placement);
     const first = await fixture.completedAssistantTurn(started);
@@ -123,12 +123,25 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(second.args.slice(second.args.indexOf("--model"), second.args.indexOf("--model") + 4)).toEqual(["--model", "gpt-5.6-sol", "--config", 'model_reasoning_effort="high"']);
     expect(second.context.item.comments.map((comment) => comment.id)).toContain("issue-feedback");
     expect(second.context.change?.comments.map((comment) => comment.id)).toContain("review-feedback");
+    const previousHead = await fixture.provider.getChangeRequest(7);
+    vi.spyOn(fixture.provider, "getChangeRequest").mockResolvedValueOnce(previousHead);
     await fixture.workflow.poll();
-    const revised = await fixture.worker(started.id);
+    const waitingForPublication = await fixture.worker(started.id);
+    expect(waitingForPublication.status).toBe("failed");
+    expect(waitingForPublication.pendingPublication?.headSha).toBe(second.headSha);
+    expect(waitingForPublication.pendingPublication?.report.resolvedDiscussionIds).toEqual(["empty-input"]);
+    expect(await git(fixture.origin, "rev-parse", waitingForPublication.branch!)).toBe(second.headSha);
+    expect(fixture.provider.discussionReplies).toEqual([]);
+    expect(fixture.provider.resolvedDiscussions).toEqual([]);
+    await expectMissing(second.reportPath, second.contextPath);
+    const revised = await fixture.workflow.resume(started.id, fixture.placement);
     expect(revised.status).toBe("awaiting_review");
+    expect(revised.tabId).toBeUndefined();
+    expect(revised.pendingPublication).toBeUndefined();
     expect(revised.headSha).not.toBe(awaiting.headSha);
     expect(await fs.readFile(path.join(revised.worktreePath!, "regression.txt"), "utf8")).toBe("Empty input is covered\n");
     expect(fixture.provider.resolvedDiscussions).toEqual(["empty-input"]);
+    expect(fixture.provider.discussionReplies).toEqual([{ discussionId: "empty-input", body: "Added and verified the empty-input regression.", headSha: revised.headSha }]);
 
     change.approved = true;
     const approved = await fixture.workflow.resume(started.id, fixture.placement);
@@ -383,6 +396,7 @@ class LocalForgeProvider implements ForgeProvider {
   readonly issue: ForgeIssueDetail = { number: 1, title: "Handle empty input", body: "Implement the missing operation.", url: "https://github.com/fixture/cloudx/issues/1", state: "open", labels: [], author: "maintainer", updatedAt: new Date(0).toISOString(), comments: [] };
   readonly changes = new Map<number, ForgeChangeRequest>();
   readonly submissions: ForgeReviewSubmission[] = [];
+  readonly discussionReplies: Array<{ discussionId: string; body: string; headSha: string }> = [];
   readonly resolvedDiscussions: string[] = [];
   readonly merges: string[] = [];
 
@@ -404,10 +418,17 @@ class LocalForgeProvider implements ForgeProvider {
     return this.getChangeRequest(7);
   }
   async postReview(_number: number, review: ForgeReviewSubmission) { this.submissions.push(structuredClone(review)); }
+  async replyToDiscussion(number: number, discussionId: string, body: string, expectedHeadSha: string) {
+    if ((await this.getChangeRequest(number)).headSha !== expectedHeadSha) throw new Error("Fixture head changed.");
+    const change = this.changes.get(number)!;
+    if (!change.comments.some(comment => comment.discussionId === discussionId && comment.resolved === false)) throw new Error("Fixture discussion is not open.");
+    change.comments.push({ id: `reply-${this.discussionReplies.length}`, discussionId, body, author: "worker-bot", resolved: false });
+    this.discussionReplies.push({ discussionId, body, headSha: expectedHeadSha });
+  }
   async resolveDiscussion(number: number, discussionId: string, expectedHeadSha: string) {
     if ((await this.getChangeRequest(number)).headSha !== expectedHeadSha) throw new Error("Fixture head changed.");
     const change = this.changes.get(number)!;
-    change.comments.find((comment) => comment.discussionId === discussionId)!.resolved = true;
+    for (const comment of change.comments.filter(comment => comment.discussionId === discussionId)) comment.resolved = true;
     change.unresolvedDiscussions = 0;
     this.resolvedDiscussions.push(discussionId);
   }
@@ -473,7 +494,7 @@ if (changed.length) { git("add", "--", ...changed); git("commit", "-m", "FIX: de
 const headSha = git("rev-parse", "HEAD");
 const report = isReview
   ? { kind: "review", headSha, event: "comment", body: "The return value needs documentation.", comments: [{ body: "Explain the public return value.", path: "review.txt", line: 1, side: "RIGHT" }] }
-  : { kind: "issue", title: "Handle empty input", body: "Implemented and verified the fixture changes.", resolvedDiscussionIds: (context.change?.comments ?? []).filter(comment => comment.discussionId && comment.resolved === false).map(comment => comment.discussionId) };
+  : { kind: "issue", title: "Handle empty input", body: "Implemented and verified the fixture changes.", discussionReplies: (context.change?.comments ?? []).filter(comment => comment.discussionId && comment.resolved === false).map(comment => ({ discussionId: comment.discussionId, body: "Added and verified the empty-input regression." })), resolvedDiscussionIds: (context.change?.comments ?? []).filter(comment => comment.discussionId && comment.resolved === false).map(comment => comment.discussionId) };
 const receipt = { pid: process.pid, trustedProjectPath, gitAuthorizationPresent: Object.entries(process.env).some(([key, value]) => key.startsWith("GIT_CONFIG_VALUE_") && value?.includes("Authorization:")), args, templateId: process.env.CLOUDX_PERSONALITY_TEMPLATE_ID, skillIds: process.env.CLOUDX_ENABLED_SKILL_IDS, codexHome: process.env.CODEX_HOME, reportPath, contextPath, context, headSha };
 fs.writeFileSync(path.join(process.env.FORGE_FIXTURE_RECEIPTS, path.basename(reportPath)), JSON.stringify(receipt));
 fs.writeFileSync(reportPath + ".tmp", JSON.stringify(report));

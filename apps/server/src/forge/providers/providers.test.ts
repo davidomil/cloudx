@@ -947,6 +947,108 @@ describe("request creation and input boundaries", () => {
   });
 });
 
+describe("discussion replies from coding workers", () => {
+  const body = "Fixed the race in the latest commit.\nAdded the requested regression test.";
+
+  function replyFixture(kind: "github" | "gitlab", reply: Handler) {
+    const base = kind === "github"
+      ? hubFixture({ threads: [{ isResolved: false }] })
+      : labFixture({ notes: [{ ...labNote, resolved: false }] });
+    return harness(kind === "github" ? github : gitlab, (url, options) =>
+      isReply(url, options) ? reply(url, options) : base.fetcher(url, options), "reviewer");
+  }
+
+  function isReply(url: URL, options: RequestInit): boolean {
+    return options.method === "POST" && (
+      String(options.body).includes("addPullRequestReviewThreadReply") || url.pathname.endsWith("/notes")
+    );
+  }
+
+  it("posts a submitted GitHub reply to the existing thread using the worker credential", async () => {
+    const { provider, calls } = replyFixture("github", () => response({
+      data: { addPullRequestReviewThreadReply: { comment: { id: "reply1", state: "SUBMITTED", pullRequest: { number: 7 } } } }
+    }));
+
+    await provider.replyToDiscussion(7, "thread1", body, headSha);
+
+    const reply = calls.at(-1)!;
+    expect(reply.url.pathname).toBe("/graphql");
+    expect(JSON.parse(String(reply.options.body)).variables).toEqual({ threadId: "thread1", body });
+    expect(new Headers(reply.options.headers).get("authorization")).toBe("Bearer worker-private-token");
+    expect(calls.filter((call) => isReply(call.url, call.options))).toHaveLength(1);
+    expect(calls.some((call) => String(call.options.body).includes("resolveReviewThread"))).toBe(false);
+  });
+
+  it("posts a GitLab reply within the project and existing thread without resolving it", async () => {
+    const { provider, calls } = replyFixture("gitlab", () => Response.json({ ...labNote, id: 2, body, resolved: false }, { status: 201 }));
+
+    await provider.replyToDiscussion(7, "thread1", body, headSha);
+
+    const reply = calls.at(-1)!;
+    expect(reply.url.pathname).toBe("/api/v4/projects/group%2Fsubgroup%2Frepo/merge_requests/7/discussions/thread1/notes");
+    expect(JSON.parse(String(reply.options.body))).toEqual({ body });
+    expect(new Headers(reply.options.headers).get("private-token")).toBe("worker-private-token");
+    expect(calls.filter((call) => isReply(call.url, call.options))).toHaveLength(1);
+    expect(calls.some((call) => call.options.method === "PUT")).toBe(false);
+  });
+
+  it.each(["github", "gitlab"] as const)("refuses foreign, resolved, closed and stale discussions before replying (%s)", async (kind) => {
+    for (const boundary of ["foreign", "resolved", "closed", "stale"]) {
+      const unresolved = boundary !== "resolved";
+      const base = kind === "github"
+        ? hubFixture({ threads: [{ isResolved: !unresolved }], request: { state: boundary === "closed" ? "closed" : "open" } })
+        : labFixture({ notes: [{ ...labNote, resolved: !unresolved }], request: { state: boundary === "closed" ? "closed" : "opened" } });
+
+      await expect(base.provider.replyToDiscussion(7, boundary === "foreign" ? "other-thread" : "thread1", body, boundary === "stale" ? previousSha : headSha))
+        .rejects.toThrow(boundary === "stale" ? "head changed" : "unresolved discussion");
+      expect(base.calls.some((call) => isReply(call.url, call.options)), boundary).toBe(false);
+    }
+  });
+
+  it.each(["github", "gitlab"] as const)("rejects empty, oversized or invalid replies before reading the provider (%s)", async (kind) => {
+    const base = kind === "github" ? hubFixture() : labFixture();
+    for (const invalidBody of ["", " \n ", "x".repeat(65_001)]) {
+      await expect(base.provider.replyToDiscussion(7, "thread1", invalidBody, headSha)).rejects.toThrow("reply");
+    }
+    await expect(base.provider.replyToDiscussion(7, "thread1", body, "not-a-sha")).rejects.toThrow("SHA");
+    expect(base.calls).toHaveLength(0);
+  });
+
+  it("rejects GitLab quick actions before posting a discussion reply", async () => {
+    const { provider, calls } = labFixture();
+    await expect(provider.replyToDiscussion(7, "thread1", "Fixed.\n/merge", headSha)).rejects.toThrow("quick actions");
+    expect(calls).toHaveLength(0);
+  });
+
+  it.each([
+    { data: { addPullRequestReviewThreadReply: { comment: { id: "reply1", state: "PENDING", pullRequest: { number: 7 } } } } },
+    { data: { addPullRequestReviewThreadReply: { comment: { id: "reply1", state: "SUBMITTED", pullRequest: { number: 8 } } } } },
+    { errors: [{ message: "private-provider-error" }] },
+    { data: { addPullRequestReviewThreadReply: { comment: null } } }
+  ])("leaves an unconfirmed GitHub reply visible without retrying it", async (result) => {
+    const { provider, calls } = replyFixture("github", () => response(result));
+    await expect(provider.replyToDiscussion(7, "thread1", body, headSha)).rejects.toThrow("did not confirm the discussion reply");
+    expect(calls.filter((call) => isReply(call.url, call.options))).toHaveLength(1);
+  });
+
+  it("rejects an incomplete GitLab reply response without repeating the mutation", async () => {
+    const { provider, calls } = replyFixture("gitlab", () => response({ id: 2 }));
+    await expect(provider.replyToDiscussion(7, "thread1", body, headSha)).rejects.toThrow("did not confirm the discussion reply");
+    expect(calls.filter((call) => isReply(call.url, call.options))).toHaveLength(1);
+  });
+
+  it.each(["github", "gitlab"] as const)("keeps rejected and lost reply responses visible without retrying (%s)", async (kind) => {
+    for (const fail of [() => new Response("private-provider-error", { status: 403 }), () => { throw new Error("private-provider-error"); }]) {
+      const { provider, calls } = replyFixture(kind, fail);
+      await expect(provider.replyToDiscussion(7, "thread1", body, headSha)).rejects.toMatchObject({
+        message: `${kind === "github" ? "GitHub" : "GitLab"} did not confirm the discussion reply. Inspect the request before replying again.`,
+        statusCode: 409,
+      });
+      expect(calls.filter((call) => isReply(call.url, call.options))).toHaveLength(1);
+    }
+  });
+});
+
 describe("resolved discussions on resumed issue work", () => {
   it("resolves an identified GitHub thread at the inspected head using the worker credential", async () => {
     const base = hubFixture({ threads: [{ isResolved: false }] });

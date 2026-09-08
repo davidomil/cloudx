@@ -15,6 +15,7 @@ import {
   ForgeProviderError,
   requireDiscussion,
   requireMergeReady,
+  validateDiscussionReply,
   type ForgeListIdentity,
   type ForgeProvider,
 } from "./ForgeProvider.js";
@@ -250,6 +251,33 @@ export class GitHubProvider implements ForgeProvider {
     if (!boolean(response.merged))
       throw new ForgeProviderError("GitHub did not confirm the merge.", 409);
     return { merged: true, sha: string(response.sha) };
+  }
+
+  async replyToDiscussion(
+    number: number,
+    discussionId: string,
+    body: string,
+    expectedHeadSha: string,
+  ): Promise<void> {
+    validateDiscussionReply(body, expectedHeadSha);
+    requireDiscussion(await this.getChangeRequest(number), discussionId, expectedHeadSha);
+    try {
+      const response = record((await this.http.request("/graphql", {
+        method: "POST",
+        role: "worker",
+        graphql: true,
+        body: {
+          query: "mutation($threadId:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body}){comment{id state pullRequest{number}}}}",
+          variables: { threadId: discussionId, body },
+        },
+      })).body);
+      if (response.errors !== undefined) return invalid();
+      const comment = record(record(record(response.data).addPullRequestReviewThreadReply).comment);
+      if (!string(comment.id) || comment.state !== "SUBMITTED" || integer(record(comment.pullRequest).number) !== number)
+        return invalid();
+    } catch {
+      throw new ForgeProviderError("GitHub did not confirm the discussion reply. Inspect the request before replying again.", 409);
+    }
   }
 
   async resolveDiscussion(

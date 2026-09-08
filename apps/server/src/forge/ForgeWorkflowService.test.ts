@@ -42,6 +42,7 @@ function fixture() {
     getChangeRequest: vi.fn(async () => ({ ...change })),
     createChangeRequest: vi.fn(async () => change),
     postReview: vi.fn(async () => {}),
+    replyToDiscussion: vi.fn(async (_number: number, _discussionId: string, _body: string, _headSha: string) => {}),
     resolveDiscussion: vi.fn(async () => {}),
     merge: vi.fn(async () => ({ merged: true, sha: "b".repeat(40) })),
   };
@@ -401,6 +402,7 @@ describe("Forge review discussion resolution", () => {
       resolvedDiscussionIds: [],
     });
     await f.service.poll();
+    f.change.comments = [{ id: "comment-1", discussionId: "thread-1", body: "Handle the null case", author: "reviewer", resolved: false }];
     await f.service.resume(worker.id, placement);
     f.reports.read.mockResolvedValue({
       kind: "issue",
@@ -422,6 +424,164 @@ describe("Forge review discussion resolution", () => {
 });
 
 describe("Forge publication and feedback reconciliation", () => {
+  it("preserves a successful push and replies on explicit Resume after the request head catches up", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(1, placement);
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Ready" });
+    await f.service.poll();
+    const previousHead = f.change.headSha;
+    const publishedHead = "b".repeat(40);
+    f.change.comments = [{ id: "comment-1", discussionId: "thread-1", body: "Cover null input", author: "reviewer", resolved: false }];
+    await f.service.resume(worker.id, placement);
+    const report = { kind: "issue", title: "Address review", body: "Added and tested null handling", discussionReplies: [{ discussionId: "thread-1", body: "Added the null-input regression and verified the fix." }], resolvedDiscussionIds: ["thread-1"] };
+    f.reports.read.mockResolvedValue(report);
+    f.runtime.publishBranch.mockResolvedValue(publishedHead);
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", headSha: previousHead, pendingPublication: { headSha: publishedHead, report, repliedDiscussionIds: [] } });
+    expect(f.stored()[0].error).toContain("Resume");
+    expect(f.provider.replyToDiscussion).not.toHaveBeenCalled();
+    expect(f.provider.resolveDiscussion).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    await f.service.poll();
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+
+    f.change.headSha = publishedHead;
+    const restarted = new ForgeWorkflowService(f.deps);
+    const completed = await restarted.resume(worker.id, placement);
+    expect(completed).toMatchObject({ status: "awaiting_review", headSha: publishedHead });
+    expect(completed.pendingPublication).toBeUndefined();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+    expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(1);
+    expect(f.provider.replyToDiscussion).toHaveBeenCalledWith(7, "thread-1", report.discussionReplies[0].body, publishedHead);
+    expect(f.provider.resolveDiscussion).toHaveBeenCalledWith(7, "thread-1", publishedHead);
+    expect(f.provider.replyToDiscussion.mock.invocationCallOrder[0]).toBeLessThan(f.provider.resolveDiscussion.mock.invocationCallOrder[0]);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("saves the completion report before removing the attempt files", async () => {
+    const f = fixture();
+    await f.service.startIssue(1, placement);
+    const report = { kind: "issue", title: "Fix", body: "Validated", resolvedDiscussionIds: [], discussionReplies: [] };
+    f.reports.read.mockResolvedValue(report);
+    f.reports.remove.mockImplementation(async () => {
+      expect(f.stored()[0].pendingPublication?.report).toEqual(report);
+    });
+    await f.service.poll();
+    expect(f.reports.remove).toHaveBeenCalledOnce();
+    expect(f.stored()[0].status).toBe("awaiting_review");
+  });
+
+  it("keeps the original report through checkpoint write failure and restart recovery", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(1, placement);
+    const report = { kind: "issue", title: "Fix", body: "Validated", resolvedDiscussionIds: [], discussionReplies: [] };
+    f.reports.read.mockResolvedValue(report);
+    const write = vi.spyOn(f.deps.store, "write").mockRejectedValue(new Error("Disk unavailable"));
+    await expect(f.service.poll()).rejects.toThrow("Disk unavailable");
+    expect(write).toHaveBeenCalledTimes(2);
+    expect(f.reports.remove).not.toHaveBeenCalled();
+    expect(f.runtime.close).toHaveBeenCalledWith(worker.tabId);
+    expect(f.stored()[0].attemptId).toBe(worker.attemptId);
+    write.mockRestore();
+
+    const restarted = new ForgeWorkflowService(f.deps);
+    expect((await restarted.dashboard()).workers[0]).toMatchObject({ status: "paused", attemptId: worker.attemptId });
+    expect(f.reports.remove).not.toHaveBeenCalled();
+    const completed = await restarted.resume(worker.id, placement);
+    expect(completed.status).toBe("awaiting_review");
+    expect(completed.pendingPublication).toBeUndefined();
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    expect(f.reports.remove).toHaveBeenCalledOnce();
+  });
+
+  it("verifies the pending published head before cleaning up a merged request after resource recovery", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(1, placement);
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Validated" });
+    await f.service.poll();
+    await f.service.resume(worker.id, placement);
+    const publishedHead = "b".repeat(40);
+    f.runtime.publishBranch.mockResolvedValue(publishedHead);
+    f.runtime.recover.mockRejectedValueOnce(new Error("Could not close the worker tab"));
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "cleanup_failed", headSha: "a".repeat(40), pendingPublication: { headSha: publishedHead } });
+    f.change.headSha = publishedHead;
+    f.change.merged = true;
+    f.change.state = "closed";
+    const completed = await f.service.resume(worker.id, placement);
+    expect(completed).toMatchObject({ status: "completed", headSha: publishedHead });
+    expect(completed.pendingPublication).toBeUndefined();
+    expect(f.runtime.verifyPublishedWorkspace).toHaveBeenLastCalledWith(expect.objectContaining({ id: worker.id }), publishedHead);
+    expect(f.runtime.cleanup).toHaveBeenLastCalledWith(expect.objectContaining({ expectedHeadSha: publishedHead }));
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+  });
+
+  it("retains reply progress and never repeats an unconfirmed reply", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(1, placement);
+    f.change.comments = ["thread-1", "thread-2"].map(id => ({ id, discussionId: id, body: "Review feedback", author: "reviewer", resolved: false }));
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Validated", resolvedDiscussionIds: ["thread-1", "thread-2"], discussionReplies: [{ discussionId: "thread-1", body: "First fix tested." }, { discussionId: "thread-2", body: "Second fix tested." }] });
+    f.provider.replyToDiscussion.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("Reply response lost"));
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", pendingPublication: { repliedDiscussionIds: ["thread-1"], replyingToDiscussionId: "thread-2" } });
+    const restarted = new ForgeWorkflowService(f.deps);
+    const resumed = await restarted.resume(worker.id, placement);
+    expect(resumed.error).toMatch(/reply.*reconcil/i);
+    expect(f.provider.replyToDiscussion).toHaveBeenCalledTimes(2);
+    expect(f.provider.resolveDiscussion).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+  });
+
+  it("finishes partial thread resolution without reposting replies or resolving a closed thread", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(1, placement);
+    f.change.comments = ["thread-1", "thread-2"].map(id => ({ id, discussionId: id, body: "Review feedback", author: "reviewer", resolved: false }));
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Validated", resolvedDiscussionIds: ["thread-1", "thread-2"], discussionReplies: [{ discussionId: "thread-1", body: "First fix tested." }, { discussionId: "thread-2", body: "Second fix tested." }] });
+    f.provider.resolveDiscussion.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("Resolution response lost"));
+    await f.service.poll();
+    expect(f.stored()[0].pendingPublication?.repliedDiscussionIds).toEqual(["thread-1", "thread-2"]);
+    f.change.comments[0].resolved = true;
+    f.change.comments.push({ id: "non-resolvable-note", discussionId: "thread-1", body: "System note", author: "system" });
+    const restarted = new ForgeWorkflowService(f.deps);
+    const completed = await restarted.resume(worker.id, placement);
+    expect(completed.status).toBe("awaiting_review");
+    expect(f.provider.replyToDiscussion).toHaveBeenCalledTimes(2);
+    expect(f.provider.resolveDiscussion.mock.calls).toEqual([[7, "thread-1", f.change.headSha], [7, "thread-2", f.change.headSha], [7, "thread-2", f.change.headSha]]);
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+  });
+
+  it("posts a worker reply without resolving a discussion left open in its report", async () => {
+    const f = fixture();
+    await f.service.startIssue(1, placement);
+    f.change.comments = [{ id: "comment", discussionId: "thread", body: "Which behavior?", author: "reviewer", resolved: false }];
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Validated", discussionReplies: [{ discussionId: "thread", body: "Please confirm the expected empty-input behavior." }] });
+    await f.service.poll();
+    expect(f.provider.replyToDiscussion).toHaveBeenCalledOnce();
+    expect(f.provider.resolveDiscussion).not.toHaveBeenCalled();
+    expect(f.stored()[0].status).toBe("awaiting_review");
+  });
+
+  it.each(["head", "branch", "checkout"])("blocks feedback actions when the published %s no longer matches", async mismatch => {
+    const f = fixture();
+    await f.service.startIssue(1, placement);
+    f.change.comments = [{ id: "comment", discussionId: "thread", body: "Fix this", author: "reviewer", resolved: false }];
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Validated", resolvedDiscussionIds: ["thread"], discussionReplies: [{ discussionId: "thread", body: "Fixed." }] });
+    if (mismatch === "head") f.runtime.publishBranch.mockResolvedValue("b".repeat(40));
+    if (mismatch === "branch") f.change.headBranch = "another-branch";
+    if (mismatch === "checkout") f.runtime.verifyPublishedWorkspace.mockRejectedValue(new Error("The checkout changed"));
+    await f.service.poll();
+    expect(f.stored()[0].status).toBe("failed");
+    expect(f.provider.replyToDiscussion).not.toHaveBeenCalled();
+    expect(f.provider.resolveDiscussion).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
   it("attaches an existing request after a lost create response without creating another", async () => {
     const f = fixture();
     const worker = await f.service.startIssue(1, placement);

@@ -30,6 +30,12 @@ export interface ForgeProvider {
     input: ForgeCreateChangeRequest,
   ): Promise<ForgeChangeRequestSummary>;
   postReview(number: number, input: ForgeReviewSubmission): Promise<void>;
+  replyToDiscussion(
+    number: number,
+    discussionId: string,
+    body: string,
+    expectedHeadSha: string,
+  ): Promise<void>;
   resolveDiscussion(
     number: number,
     discussionId: string,
@@ -45,7 +51,7 @@ export function requireDiscussion(
 ): void {
   if (request.headSha !== expectedHeadSha)
     throw new ForgeProviderError(
-      "The request head changed. Refresh before resolving discussions.",
+      "The request head changed. Refresh before updating discussions.",
       409,
     );
   if (
@@ -60,6 +66,13 @@ export function requireDiscussion(
       409,
     );
   }
+}
+
+export function validateDiscussionReply(body: string, expectedHeadSha: string): void {
+  if (typeof body !== "string" || !body.trim() || body.length > 65_000)
+    throw new ForgeProviderError("Write a discussion reply of at most 65,000 characters.");
+  if (!/^[a-fA-F0-9]{40,64}$/.test(expectedHeadSha))
+    throw new ForgeProviderError("A discussion reply requires a valid commit SHA.");
 }
 
 export class ForgeProviderError extends Error {

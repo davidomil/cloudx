@@ -10,6 +10,13 @@ export type ForgeWorkerStatus =
   | "completed"
   | "failed"
   | "cleanup_failed";
+export interface ForgeIssueCompletionReport {
+  kind: "issue";
+  title: string;
+  body: string;
+  resolvedDiscussionIds: string[];
+  discussionReplies: Array<{ discussionId: string; body: string }>;
+}
 export interface ForgeWorker {
   id: string;
   kind: "issue" | "review";
@@ -25,6 +32,12 @@ export interface ForgeWorker {
   tabId?: string;
   attemptId?: string;
   publicationState?: "creating" | "uncertain" | "created";
+  pendingPublication?: {
+    report: ForgeIssueCompletionReport;
+    headSha?: string;
+    repliedDiscussionIds: string[];
+    replyingToDiscussionId?: string;
+  };
   changeNumber?: number;
   changeUrl?: string;
   headSha?: string;

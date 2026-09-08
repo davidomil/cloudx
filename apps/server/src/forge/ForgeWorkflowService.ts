@@ -148,7 +148,7 @@ export class ForgeWorkflowService {
       for (const worker of this.workers.filter(
         (w) => w.status === "running" || w.status === "starting",
       )) {
-        await this.quiesce(worker);
+        await this.quiesce(worker, { retainReport: worker.kind === "issue" && !worker.pendingPublication });
         worker.status = "paused";
         if (worker.kind === "review") await this.cleanup(worker);
       }
@@ -289,7 +289,7 @@ export class ForgeWorkflowService {
         throw new Error(
           "This worker cannot be paused or stopped in its current state.",
         );
-      await this.quiesce(worker, false);
+      await this.quiesce(worker, { closeTab: false });
       worker.status = status;
       if (worker.kind === "review" && status === "stopped")
         await this.cleanup(worker);
@@ -317,7 +317,7 @@ export class ForgeWorkflowService {
         const mergedIssue = worker.kind === "issue" && worker.changeNumber
           ? (await this.providerFor(worker).getChangeRequest(worker.changeNumber)).merged
           : false;
-        if (worker.kind === "review" || mergedIssue) {
+        if (worker.kind === "review" || (mergedIssue && !worker.pendingPublication)) {
           await this.cleanup(worker);
           worker.status = "completed";
           await this.persist();
@@ -333,9 +333,26 @@ export class ForgeWorkflowService {
       this.operations.set(worker.id, new AbortController());
       worker.status = "starting";
       await this.persist();
+      let retainReport = false;
       try {
         const provider = this.providerFor(worker);
         if (!recoveringResources) await this.recoverResources(worker);
+        if (worker.kind === "issue" && worker.attemptId && !worker.pendingPublication) {
+          const raw = await this.deps.reports.read(worker.attemptId);
+          if (raw !== undefined) {
+            const report = parseWorkerReport(raw);
+            if (report.kind !== "issue") throw new Error("Completion report does not match this worker.");
+            retainReport = true;
+            worker.pendingPublication = { report, repliedDiscussionIds: [] };
+            await this.persist();
+            retainReport = false;
+          }
+        }
+        if (worker.kind === "issue" && worker.pendingPublication) {
+          await this.quiesce(worker);
+          await this.issueReady(worker);
+          return structuredClone(worker);
+        }
         const item =
           worker.kind === "issue"
             ? await provider.getIssue(worker.number)
@@ -384,7 +401,7 @@ export class ForgeWorkflowService {
           );
         await this.launch(worker, placement, { item, change });
       } catch (error) {
-        await this.fail(worker, error);
+        await this.fail(worker, error, { retainReport });
       }
       return structuredClone(worker);
     });
@@ -432,6 +449,7 @@ export class ForgeWorkflowService {
       for (const worker of this.workers.filter(
         (w) => w.status === "running" && w.attemptId,
       )) {
+        let retainReport = false;
         try {
           const raw = await this.deps.reports.read(worker.attemptId!);
           if (raw === undefined) {
@@ -451,8 +469,14 @@ export class ForgeWorkflowService {
           const report = parseWorkerReport(raw);
           if (report.kind !== worker.kind)
             throw new Error("Completion report does not match this worker.");
-          await this.quiesce(worker, report.kind === "review");
-          if (report.kind === "issue") await this.issueReady(worker, report);
+          if (report.kind === "issue") {
+            retainReport = true;
+            worker.pendingPublication = { report, repliedDiscussionIds: [] };
+            await this.persist();
+            retainReport = false;
+          }
+          await this.quiesce(worker, { closeTab: report.kind === "review" });
+          if (report.kind === "issue") await this.issueReady(worker);
           else {
             if (report.headSha !== worker.headSha)
               throw new Error(
@@ -469,28 +493,33 @@ export class ForgeWorkflowService {
             );
           }
         } catch (error) {
-          await this.fail(worker, error);
+          await this.fail(worker, error, { retainReport });
         }
       }
     });
   }
-  private async issueReady(
-    worker: ForgeWorker,
-    report: { title: string; body: string; resolvedDiscussionIds: string[] },
-  ): Promise<void> {
+  private async issueReady(worker: ForgeWorker): Promise<void> {
     if (!worker.worktreePath || !worker.branch || !worker.repositoryPath)
       throw new Error("Issue workspace is missing.");
+    const publication = worker.pendingPublication;
+    if (!publication) throw new Error("Issue completion report is missing.");
+    const { report } = publication;
+    const workspace = {
+      id: worker.id,
+      repositoryPath: worker.repositoryPath,
+      worktreePath: worker.worktreePath,
+      branch: worker.branch,
+    };
     const provider = this.providerFor(worker);
     if (!worker.changeNumber) await this.reconcilePublication(worker, provider);
-    const headSha = await this.deps.runtime.publishBranch(
-      {
-        id: worker.id,
-        repositoryPath: worker.repositoryPath,
-        worktreePath: worker.worktreePath,
-        branch: worker.branch,
-      },
-      this.operations.get(worker.id)?.signal,
-    );
+    if (!publication.headSha) {
+      publication.headSha = await this.deps.runtime.publishBranch(
+        workspace,
+        this.operations.get(worker.id)?.signal,
+      );
+      await this.persist();
+    }
+    const headSha = publication.headSha;
     if (!worker.changeNumber) {
       worker.publicationState = "creating";
       await this.persist();
@@ -513,15 +542,27 @@ export class ForgeWorkflowService {
       await this.persist();
     }
     const change = await provider.getChangeRequest(worker.changeNumber);
+    if (change.headBranch !== worker.branch || change.baseBranch !== worker.baseBranch)
+      throw new Error("The change request no longer matches this worker's branches.");
     if (change.headSha !== headSha)
       throw new Error(
-        "Published commit does not match the change request head.",
+        `Published commit ${headSha} does not match change request #${worker.changeNumber} head ${change.headSha}. Resume to recheck publication without rerunning the worker.`,
       );
+    await this.deps.runtime.verifyPublishedWorkspace(workspace, headSha);
+    if (change.merged) {
+      worker.headSha = headSha;
+      await this.cleanup(worker);
+      worker.status = "completed";
+      worker.error = undefined;
+      await this.persist();
+      return;
+    }
+    if (change.state !== "open")
+      throw new Error("The change request is closed without merging. Reopen it before resuming.");
     const currentIssue = await provider.getIssue(worker.number);
     const feedbackUnchanged =
       worker.feedbackDigest === feedbackDigest({ item: currentIssue, change });
-    for (const id of report.resolvedDiscussionIds)
-      await provider.resolveDiscussion(worker.changeNumber, id, headSha);
+    await this.respondToReview(worker, change, provider);
     worker.headSha = headSha;
     if (
       feedbackUnchanged &&
@@ -541,12 +582,6 @@ export class ForgeWorkflowService {
             change: latest,
           })
       ) {
-        const workspace = {
-          id: worker.id,
-          repositoryPath: worker.repositoryPath,
-          worktreePath: worker.worktreePath,
-          branch: worker.branch,
-        };
         await this.deps.runtime.verifyPublishedWorkspace(workspace, headSha);
         await provider.merge(worker.changeNumber, headSha);
         await this.cleanup(worker);
@@ -561,12 +596,34 @@ export class ForgeWorkflowService {
       }
     }
     worker.status = "awaiting_review";
+    worker.pendingPublication = undefined;
     worker.error = undefined;
     await this.persist();
     this.deps.notify(
       "Ready for review",
       `${worker.title}: ${worker.changeUrl}. Resume after review to address feedback or merge the approved commit.`,
     );
+  }
+  private async respondToReview(worker: ForgeWorker, change: ForgeChangeRequest, provider: ForgeProvider): Promise<void> {
+    const publication = worker.pendingPublication!;
+    const headSha = publication.headSha!;
+    if (publication.replyingToDiscussionId)
+      throw new Error("A previous discussion reply must be reconciled with the provider before publication can continue.");
+    for (const reply of publication.report.discussionReplies) {
+      if (publication.repliedDiscussionIds.includes(reply.discussionId)) continue;
+      publication.replyingToDiscussionId = reply.discussionId;
+      await this.persist();
+      await provider.replyToDiscussion(change.number, reply.discussionId, reply.body, headSha);
+      publication.repliedDiscussionIds.push(reply.discussionId);
+      publication.replyingToDiscussionId = undefined;
+      await this.persist();
+    }
+    for (const id of publication.report.resolvedDiscussionIds) {
+      const comments = change.comments.filter(comment => comment.discussionId === id);
+      if (!comments.length) throw new Error("The addressed discussion does not belong to this change request.");
+      if (comments.some(comment => comment.resolved === true) && !comments.some(comment => comment.resolved === false)) continue;
+      await provider.resolveDiscussion(change.number, id, headSha);
+    }
   }
   private async reconcilePublication(
     worker: ForgeWorker,
@@ -611,7 +668,7 @@ export class ForgeWorkflowService {
     );
     const instructions =
       worker.kind === "issue"
-        ? "Resolve the issue in this checkout. Read all issue and change-request feedback below, implement the changes, and run the relevant tests. Commit your changes to the current branch. Do not push, open or merge a PR/MR: CloudX performs those steps. Include resolvedDiscussionIds only for review discussion IDs whose feedback you actually addressed. When ready for human review, write the completion report."
+        ? "Resolve the issue in this checkout. Read all issue and change-request feedback below, implement the changes, and run the relevant tests. Commit your changes to the current branch. Do not push, open or merge a PR/MR, or post replies or resolve threads directly: CloudX performs those steps. Include a discussionReplies entry shaped as { discussionId, body } with the exact review discussion ID and a reply explaining the change and validation for each review thread you addressed. Use replies to ask for clarification on unresolved feedback too. Include resolvedDiscussionIds only for review discussion IDs whose feedback you actually addressed; leave unresolved questions open. CloudX posts your replies as the issue worker and then resolves the listed threads after verifying the published commit. When ready for human review, write the completion report."
         : "Review the exact checked-out commit against the target base branch and the supplied diff. Do not alter the checkout or publish anything. Produce actionable comments, with file path and new line for inline findings. Write the completion report when finished.";
     const shape =
       worker.kind === "issue"
@@ -619,6 +676,7 @@ export class ForgeWorkflowService {
             kind: "issue",
             title: "Change title",
             body: "Summary and actual validation performed",
+            discussionReplies: [],
             resolvedDiscussionIds: [],
           }
         : {
@@ -664,14 +722,14 @@ export class ForgeWorkflowService {
     for (const tabId of recovered.tabIds) await this.deps.runtime.close(tabId);
     if (recovered.tabIds.includes(worker.tabId ?? "")) worker.tabId = undefined;
   }
-  private async quiesce(worker: ForgeWorker, close = true): Promise<void> {
+  private async quiesce(worker: ForgeWorker, { closeTab = true, retainReport = false }: { closeTab?: boolean; retainReport?: boolean } = {}): Promise<void> {
     if (worker.tabId) {
-      if (close) {
+      if (closeTab) {
         await this.deps.runtime.close(worker.tabId);
         worker.tabId = undefined;
       } else await this.deps.runtime.pause(worker.tabId);
     }
-    if (worker.attemptId) {
+    if (worker.attemptId && !retainReport) {
       await this.deps.reports.remove(worker.attemptId);
       worker.attemptId = undefined;
     }
@@ -691,6 +749,7 @@ export class ForgeWorkflowService {
       }
       worker.worktreePath = undefined;
       worker.branch = undefined;
+      worker.pendingPublication = undefined;
     } catch (error) {
       worker.status = "cleanup_failed";
       throw error;
@@ -720,11 +779,11 @@ export class ForgeWorkflowService {
       throw error;
     }
   }
-  private async fail(worker: ForgeWorker, error: unknown): Promise<void> {
+  private async fail(worker: ForgeWorker, error: unknown, { retainReport = false }: { retainReport?: boolean } = {}): Promise<void> {
     const wasCleanupFailure = worker.status === "cleanup_failed";
     try {
       await this.recoverResources(worker);
-      await this.quiesce(worker);
+      await this.quiesce(worker, { retainReport });
       if (worker.kind === "review") await this.cleanup(worker);
     } catch {
       worker.status = "cleanup_failed";
@@ -779,7 +838,7 @@ export class ForgeWorkflowService {
               "CloudX restarted. Inspect and resume this worker explicitly.";
             try {
               await this.recoverResources(worker);
-              await this.quiesce(worker);
+              await this.quiesce(worker, { retainReport: worker.kind === "issue" && !worker.pendingPublication });
               if (worker.kind === "review") await this.cleanup(worker);
             } catch {
               worker.status = "cleanup_failed";

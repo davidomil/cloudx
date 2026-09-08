@@ -15,6 +15,7 @@ import {
   ForgeProviderError,
   requireDiscussion,
   requireMergeReady,
+  validateDiscussionReply,
   type ForgeListIdentity,
   type ForgeProvider,
 } from "./ForgeProvider.js";
@@ -383,6 +384,26 @@ export class GitLabProvider implements ForgeProvider {
         409,
       );
     return { merged: true, sha: string(result.merge_commit_sha) };
+  }
+
+  async replyToDiscussion(
+    number: number,
+    discussionId: string,
+    body: string,
+    expectedHeadSha: string,
+  ): Promise<void> {
+    validateDiscussionReply(body, expectedHeadSha);
+    rejectQuickActions(body);
+    requireDiscussion(await this.getChangeRequest(number), discussionId, expectedHeadSha);
+    try {
+      const response = await this.http.request(
+        `${this.requestPath(number)}/discussions/${encodeURIComponent(discussionId)}/notes`,
+        { method: "POST", role: "worker", body: { body } },
+      );
+      gitlabComment(response.body);
+    } catch {
+      throw new ForgeProviderError("GitLab did not confirm the discussion reply. Inspect the request before replying again.", 409);
+    }
   }
 
   async resolveDiscussion(
