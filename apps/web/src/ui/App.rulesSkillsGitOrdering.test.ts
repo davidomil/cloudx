@@ -30,6 +30,7 @@ const { HookRegistry } = await vi.importActual<{ HookRegistry: new () => Hooks }
 const execute = promisify(execFile);
 const roots: Root[] = [];
 const directories: string[] = [];
+const cleanups: (() => Promise<void>)[] = [];
 
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -43,6 +44,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   await act(async () => roots.splice(0).forEach(root => root.unmount()));
+  await act(async () => { await Promise.all(cleanups.splice(0).map(cleanup => cleanup())); });
   document.body.replaceChildren();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -62,12 +64,9 @@ describe("catalog response ordering across App panes", () => {
     expect(incomingHead).not.toBe(previousHead);
 
     await editName(catalog.second, "Saved in another pane");
-    await catalog.perform(catalog.second, "Save template", "templates.save");
-    expectSavedTemplate(catalog.first, "Saved in another pane");
-    expectSavedTemplate(catalog.second, "Saved in another pane");
-
+    await catalog.queue(catalog.second, "Save template");
     await act(async () => pulling.release());
-    await catalog.finishRequest("git.pull");
+    await catalog.finishRequests();
     expectSavedTemplate(catalog.first, "Saved in another pane");
     expectSavedTemplate(catalog.second, "Saved in another pane");
 
@@ -90,9 +89,9 @@ describe("catalog response ordering across App panes", () => {
     await refreshing.ready;
 
     await editName(catalog.second, "Saved after refresh started");
-    await catalog.perform(catalog.second, "Save template", "templates.save");
+    await catalog.queue(catalog.second, "Save template");
     await act(async () => refreshing.release());
-    await catalog.finishRequest("catalog.list");
+    await catalog.finishRequests();
 
     expectSavedTemplate(catalog.first, "Saved after refresh started");
     expectSavedTemplate(catalog.second, "Saved after refresh started");
@@ -106,9 +105,9 @@ describe("catalog response ordering across App panes", () => {
     await saving.ready;
 
     await editName(catalog.second, "Saved after the rule");
-    await catalog.perform(catalog.second, "Save template", "templates.save");
+    await catalog.queue(catalog.second, "Save template");
     await act(async () => saving.release());
-    await catalog.finishRequest("rules.save");
+    await catalog.finishRequests();
 
     for (const pane of [catalog.first, catalog.second]) {
       expectSavedTemplate(pane, "Saved after the rule");
@@ -125,9 +124,9 @@ describe("catalog response ordering across App panes", () => {
     await saving.ready;
 
     await editName(catalog.second, "Saved default");
-    await catalog.perform(catalog.second, "Save template", "templates.save");
+    await catalog.queue(catalog.second, "Save template");
     await act(async () => saving.release());
-    await catalog.finishRequest("templates.save");
+    await catalog.finishRequests();
 
     expectSavedTemplate(catalog.first, "Saved alternate");
     expectSavedTemplate(catalog.second, "Saved default");
@@ -144,9 +143,9 @@ describe("catalog response ordering across App panes", () => {
     await deleting.ready;
 
     await catalog.renameOnDisk("Externally renamed template");
-    await catalog.perform(catalog.second, "Refresh rules and skills", "catalog.list");
+    await catalog.queue(catalog.second, "Refresh rules and skills");
     await act(async () => deleting.release());
-    await catalog.finishRequest("rules.delete");
+    await catalog.finishRequests();
 
     for (const pane of [catalog.first, catalog.second]) {
       expectSavedTemplate(pane, "Externally renamed template");
@@ -160,9 +159,9 @@ describe("catalog response ordering across App panes", () => {
     await click(catalog.first, "Pull");
     await pulling.ready;
     await click(catalog.second, "Alternate template");
-    await catalog.perform(catalog.second, "Delete template", "templates.delete");
+    await catalog.queue(catalog.second, "Delete template");
     await act(async () => pulling.release());
-    await catalog.finishRequest("git.pull");
+    await catalog.finishRequests();
 
     for (const pane of [catalog.first, catalog.second]) {
       expect(pane.querySelector(".rules-skills-sidebar")?.textContent).not.toContain("Alternate template");
@@ -175,16 +174,16 @@ describe("catalog response ordering across App panes", () => {
     await click(catalog.first, "Pull");
     await pulling.ready;
     await click(catalog.second, "Alternate template");
-    await catalog.perform(catalog.second, "Set default", "templates.setDefault");
+    await catalog.queue(catalog.second, "Set default");
     await act(async () => pulling.release());
-    await catalog.finishRequest("git.pull");
+    await catalog.finishRequests();
 
     expect(button(catalog.second, "Set default").disabled).toBe(true);
     await click(catalog.first, "Alternate template");
     expect(button(catalog.first, "Set default").disabled).toBe(true);
   });
 
-  it("applies an earlier successful pull after a newer save fails without discarding the dirty draft", async () => {
+  it("retains a successful pull when the queued save fails without discarding the dirty draft", async () => {
     const catalog = await twoPaneCatalog();
     await catalog.publishTemplate("Name from origin");
     const pulling = catalog.holdNextResponse("git.pull");
@@ -193,11 +192,11 @@ describe("catalog response ordering across App panes", () => {
 
     await editName(catalog.second, "Unsaved local name");
     catalog.failNextRequest("templates.save", "Template save failed.");
-    await catalog.perform(catalog.second, "Save template", "templates.save");
-    expect(catalog.second.textContent).toContain("Template save failed.");
+    await catalog.queue(catalog.second, "Save template");
     await act(async () => pulling.release());
-    await catalog.finishRequest("git.pull");
+    await catalog.finishRequests();
 
+    expect(catalog.second.textContent).toContain("Template save failed.");
     expectSavedTemplate(catalog.first, "Name from origin");
     expect(nameInput(catalog.second).value).toBe("Unsaved local name");
     expect(catalog.second.querySelector(".rules-skills-save-state")?.textContent).toBe("Unsaved");
@@ -217,6 +216,90 @@ describe("catalog response ordering across App panes", () => {
     expect(catalog.second.textContent).toContain("Catalog refresh failed.");
   });
 
+});
+
+describe("catalog request delivery across App panes", () => {
+  it("refreshes after a delayed template save and preserves its name in later edits", async () => {
+    const catalog = await twoPaneCatalog();
+    await editName(catalog.first, "Saved despite delayed delivery");
+    const saving = catalog.holdNextRequest("templates.save");
+    await click(catalog.first, "Save template");
+    await saving.ready;
+    await catalog.queue(catalog.second, "Refresh rules and skills");
+    expect(await catalog.savedTemplate()).toMatchObject({ name: catalog.originalName });
+
+    await act(async () => saving.release());
+    await catalog.finishRequests();
+    for (const pane of [catalog.first, catalog.second]) {
+      expectSavedTemplate(pane, "Saved despite delayed delivery");
+    }
+    await editColor(catalog.second, "yellow");
+    await catalog.perform(catalog.second, "Save template", "templates.save");
+    expect(await catalog.savedTemplate()).toMatchObject({ name: "Saved despite delayed delivery", color: "yellow" });
+    await catalog.perform(catalog.first, "Refresh rules and skills", "catalog.list");
+    expectSavedTemplate(catalog.first, "Saved despite delayed delivery");
+  });
+
+  it("refreshes after a delayed rule save and retains its text in later edits", async () => {
+    const catalog = await twoPaneCatalog();
+    await editRule(catalog.first, catalog.ruleId, "Saved rule after delayed delivery");
+    const saving = catalog.holdNextRequest("rules.save");
+    await click(catalog.first, `Save rule ${catalog.ruleId}`);
+    await saving.ready;
+    await catalog.queue(catalog.second, "Refresh rules and skills");
+
+    await act(async () => saving.release());
+    await catalog.finishRequests();
+    for (const pane of [catalog.first, catalog.second]) {
+      expect(pane.textContent).toContain("Saved rule after delayed delivery");
+      expect(button(pane, `Edit rule ${catalog.ruleId}`).disabled).toBe(false);
+    }
+    await editName(catalog.second, "Template after rule save");
+    await catalog.perform(catalog.second, "Save template", "templates.save");
+    expect((await catalog.savedStore()).rules).toContainEqual(expect.objectContaining({ id: catalog.ruleId, text: "Saved rule after delayed delivery" }));
+    await click(catalog.second, `Edit rule ${catalog.ruleId}`);
+    expect(catalog.second.querySelector(`[aria-label="Rule text for ${catalog.ruleId}"]`)?.textContent).toBe("Saved rule after delayed delivery");
+    await click(catalog.second, `Save rule ${catalog.ruleId}`);
+    await catalog.finishRequests();
+    expect((await catalog.savedStore()).rules).toContainEqual(expect.objectContaining({ id: catalog.ruleId, text: "Saved rule after delayed delivery" }));
+  });
+
+  it("saves after a delayed refresh without replacing the successful save", async () => {
+    const catalog = await twoPaneCatalog();
+    const refreshing = catalog.holdNextRequest("catalog.list");
+    await click(catalog.first, "Refresh rules and skills");
+    await refreshing.ready;
+    await editName(catalog.second, "Saved after delayed refresh");
+    await catalog.queue(catalog.second, "Save template");
+
+    await act(async () => refreshing.release());
+    await catalog.finishRequests();
+    for (const pane of [catalog.first, catalog.second]) expectSavedTemplate(pane, "Saved after delayed refresh");
+    await editColor(catalog.first, "yellow");
+    await catalog.perform(catalog.first, "Save template", "templates.save");
+    expect(await catalog.savedTemplate()).toMatchObject({ name: "Saved after delayed refresh", color: "yellow" });
+  });
+
+  it("continues queued refreshes after a delayed save fails and preserves its draft", async () => {
+    const catalog = await twoPaneCatalog();
+    await editName(catalog.first, "Unsaved name");
+    catalog.failNextRequest("templates.save", "Template save failed.");
+    const saving = catalog.holdNextRequest("templates.save");
+    await click(catalog.first, "Save template");
+    await saving.ready;
+    await catalog.queue(catalog.second, "Refresh rules and skills");
+    await act(async () => saving.release());
+    await catalog.finishRequests();
+
+    expect(catalog.first.textContent).toContain("Template save failed.");
+    expect(nameInput(catalog.first).value).toBe("Unsaved name");
+    expect(catalog.first.querySelector(".rules-skills-save-state")?.textContent).toBe("Unsaved");
+    expectSavedTemplate(catalog.second, catalog.originalName);
+    expect(button(catalog.second, "Refresh rules and skills").disabled).toBe(false);
+    await catalog.perform(catalog.first, "Save template", "templates.save");
+    for (const pane of [catalog.first, catalog.second]) expectSavedTemplate(pane, "Unsaved name");
+    expect(await catalog.savedTemplate()).toMatchObject({ name: "Unsaved name" });
+  });
 });
 
 async function twoPaneCatalog() {
@@ -239,8 +322,14 @@ async function twoPaneCatalog() {
   const hooks = new HookRegistry();
   plugin.hooks.forEach(hook => hooks.register(hook));
   const requests: { operation: string; input: Record<string, unknown>; response: Promise<Response> }[] = [];
+  const heldRequests = new Map<string, { ready: () => void; released: Promise<void> }>();
   const heldResponses = new Map<string, { ready: () => void; released: Promise<void> }>();
   const pending = new Set<Promise<Response>>();
+  const releases: (() => void)[] = [];
+  cleanups.push(async () => {
+    releases.forEach(release => release());
+    while (pending.size) await Promise.all([...pending]);
+  });
   const failures = new Map<string, string>();
   const tabs: WorkspaceTab[] = ["first", "second"].map(id => ({ id, pluginId: RULES_SKILLS_PLUGIN_ID, title: `Rules ${id}`, cwd: checkout, status: "idle", indicator: { color: "green", label: "Ready", updatedAt: "2026-09-09" }, createdAt: "2026-09-09", updatedAt: "2026-09-09" }));
   const workspace: WorkspaceStateResponse = {
@@ -262,7 +351,16 @@ async function twoPaneCatalog() {
       heldResponses.delete(operation);
       const failure = failures.get(operation);
       failures.delete(operation);
-      const result = failure ? Promise.reject(new Error(failure)) : hooks.call(id, input, { caller: { kind: "ui" } });
+      const delivery = heldRequests.get(operation);
+      heldRequests.delete(operation);
+      const result = (async () => {
+        if (delivery) {
+          delivery.ready();
+          await delivery.released;
+        }
+        if (failure) throw new Error(failure);
+        return hooks.call(id, input, { caller: { kind: "ui" } });
+      })();
       const response = result.then(async result => {
         held?.ready();
         if (held) await held.released;
@@ -307,7 +405,16 @@ async function twoPaneCatalog() {
   }
 
   return {
-    first, second, ruleId, originalName: initial.templates[0].name, finishRequest,
+    first, second, ruleId, originalName: initial.templates[0].name,
+    async finishRequests() {
+      while (pending.size) await act(async () => { await Promise.all([...pending]); });
+    },
+    async queue(panel: Element, label: string) {
+      const previousRequests = requests.length;
+      await click(panel, label);
+      expect(button(panel, label).disabled).toBe(true);
+      expect(requests).toHaveLength(previousRequests);
+    },
     head: () => git(checkout, "rev-parse", "HEAD"),
     savedStore: () => catalog.list(),
     failNextRequest: (operation: string, message: string) => failures.set(operation, message),
@@ -331,9 +438,17 @@ async function twoPaneCatalog() {
       expect(requests.length).toBeGreaterThan(previousRequests);
       await finishRequest(operation);
     },
+    holdNextRequest(operation: string) {
+      const ready = deferred();
+      const released = deferred();
+      releases.push(released.resolve);
+      heldRequests.set(operation, { ready: ready.resolve, released: released.promise });
+      return { ready: ready.promise, release: released.resolve };
+    },
     holdNextResponse(operation: string) {
       const ready = deferred();
       const released = deferred();
+      releases.push(released.resolve);
       heldResponses.set(operation, { ready: ready.resolve, released: released.promise });
       return { ready: ready.promise, release: released.resolve };
     }

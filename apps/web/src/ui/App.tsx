@@ -181,8 +181,7 @@ export function App() {
   const [config, setConfig] = useState<CloudxConfigResponse | undefined>();
   const [forgeRepositoryChange, setForgeRepositoryChange] = useState({ version: 0, pending: false });
   const [rulesSkillsStore, setRulesSkillsStore] = useState<RulesSkillsStore | undefined>();
-  const rulesSkillsCatalogRequest = useRef(0);
-  const appliedRulesSkillsCatalogRequest = useRef(0);
+  const rulesSkillsCatalogQueue = useRef(Promise.resolve());
   const [rulesSkillsGit, setRulesSkillsGit] = useState<RulesSkillsGitState>();
   const rulesSkillsGitRequest = useRef(0);
   const appliedRulesSkillsGitRequest = useRef(0);
@@ -446,14 +445,14 @@ export function App() {
     }
   }
 
-  const callRulesSkillsCatalog = useCallback(async <T extends { store: RulesSkillsStore } = { store: RulesSkillsStore },>(operation: string, input: Record<string, unknown> = {}) => {
-    const request = ++rulesSkillsCatalogRequest.current;
-    const result = await callHook<T>(`rules-skills.${operation}`, input);
-    if (request > appliedRulesSkillsCatalogRequest.current) {
-      appliedRulesSkillsCatalogRequest.current = request;
+  const callRulesSkillsCatalog = useCallback(<T extends { store: RulesSkillsStore } = { store: RulesSkillsStore },>(operation: string, input: Record<string, unknown> = {}) => {
+    const request = rulesSkillsCatalogQueue.current.then(async () => {
+      const result = await callHook<T>(`rules-skills.${operation}`, input);
       setRulesSkillsStore(result.store);
-    }
-    return result;
+      return result;
+    });
+    rulesSkillsCatalogQueue.current = request.then(() => undefined, () => undefined);
+    return request;
   }, []);
 
   const loadRulesSkillsStore = useCallback(async (): Promise<RulesSkillsStore | undefined> => {
