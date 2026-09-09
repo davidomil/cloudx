@@ -97,6 +97,7 @@ export interface PluginSessionSnapshot {
   title: string;
   cwd: string;
   status: WorkspaceTab["status"];
+  statusMessage?: string;
   recentOutput?: string;
   state?: Record<string, unknown>;
 }
@@ -156,7 +157,19 @@ export type PluginRuleContribution = Omit<CloudxRule, "scope"> & {
   scope?: "system";
 };
 
-export interface CreatePluginSessionInput {
+export interface PluginSessionLaunchOptions {
+  authorizeProjectTrust?: () => Promise<string>;
+  ownerPluginId?: PluginId;
+}
+
+export class PluginSessionNotStartedError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : "Plugin session could not be started.", { cause });
+    this.name = "PluginSessionNotStartedError";
+  }
+}
+
+export interface CreatePluginSessionInput extends PluginSessionLaunchOptions {
   tab: WorkspaceTab;
   cwd: string;
   runtimeContext?: WorkspaceRuntimeContext;

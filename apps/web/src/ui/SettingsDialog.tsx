@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
-import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, ConfigValue, RulesSkillsStore } from "@cloudx/shared";
+import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, ConfigValue, ForgeRepository, RulesSkillsStore } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
+import { ForgeConnections } from "./ForgeConnections.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
 import { TemplateSelect } from "./RulesSkillsPanel.js";
 import type { BrowserNotificationPermissionState } from "./notifications.js";
@@ -62,6 +63,7 @@ export function SettingsDialog({
         ...current.plugins,
         [pluginId]: {
           ...(current.plugins[pluginId] ?? {}),
+          ...(pluginId === "forge" && key === "provider" ? { apiUrl: value === "gitlab" ? "https://gitlab.com/api/v4" : "https://api.github.com" } : {}),
           [key]: value
         }
       }
@@ -71,7 +73,7 @@ export function SettingsDialog({
   const globalFields = config.globalFields.filter(isUserVisibleConfigField);
   const pluginSections = config.plugins
     .map((plugin) => ({ ...plugin, fields: plugin.fields.filter(isUserVisibleConfigField) }))
-    .filter((plugin) => plugin.fields.length > 0);
+    .filter((plugin) => plugin.fields.length > 0 || plugin.pluginId === "forge");
 
   return (
     <div className="dialog-backdrop">
@@ -80,7 +82,7 @@ export function SettingsDialog({
         <section className="settings-section">
           <h3>Global</h3>
           {globalFields.map((field) => (
-            <ConfigField key={field.key} field={field} value={values.global[field.key] ?? field.defaultValue} onChange={(value) => setGlobalValue(field.key, value)} />
+            <ConfigField key={field.key} field={field} templates={rulesSkillsStore?.templates} value={values.global[field.key] ?? field.defaultValue} onChange={(value) => setGlobalValue(field.key, value)} />
           ))}
           {rulesSkillsStore ? (
             <TemplateSelect
@@ -106,11 +108,13 @@ export function SettingsDialog({
                   <ConfigField
                     key={`${plugin.pluginId}:${field.key}`}
                     field={field}
+                    templates={rulesSkillsStore?.templates}
                     value={values.plugins[plugin.pluginId]?.[field.key] ?? field.defaultValue}
                     onChange={(value) => setPluginValue(plugin.pluginId, field.key, value)}
                     onClearSecret={field.type === "secret" && field.secretConfigured && onClearPluginSecret ? () => onClearPluginSecret(plugin.pluginId, field.key) : undefined}
                   />
                 ))}
+                {plugin.pluginId === "forge" ? <ForgeConnections repository={forgeRepository(values.plugins.forge, plugin.fields)} savedRepository={forgeRepository(config.values.plugins.forge, plugin.fields)} /> : null}
               </div>
             ))
           ) : (
@@ -175,7 +179,7 @@ function browserNotificationMessage(state: BrowserNotificationPermissionState): 
   return "Allow Cloudx to mirror in-app notifications through the browser notification system.";
 }
 
-function ConfigField({ field, value, onChange, onClearSecret }: { field: ConfigFieldDescriptor; value: ConfigValue; onChange: (value: ConfigValue) => void; onClearSecret?: () => Promise<void> }) {
+function ConfigField({ field, value, onChange, onClearSecret, templates }: { field: ConfigFieldDescriptor; value: ConfigValue; onChange: (value: ConfigValue) => void; onClearSecret?: () => Promise<void>; templates?: RulesSkillsStore["templates"] }) {
   const [clearing, setClearing] = useState(false);
 
   async function clearSecret() {
@@ -189,6 +193,21 @@ function ConfigField({ field, value, onChange, onClearSecret }: { field: ConfigF
     } finally {
       setClearing(false);
     }
+  }
+
+  if (field.type === "string" && field.optionSource === "rulesSkills.templates") {
+    return (
+      <label>
+        {field.label}
+        <select aria-label={field.label} value={String(value)} disabled={!templates?.length} onChange={event => onChange(event.target.value)}>
+          <option value="">Choose a template</option>
+          {value && !templates?.some(template => template.id === value) ? <option value={String(value)}>Saved template is unavailable</option> : null}
+          {templates?.map(template => <option key={template.id} value={template.id}>{template.name}</option>)}
+        </select>
+        {field.description ? <small>{field.description}</small> : null}
+        {!templates?.length ? <small>Create a template in Rules / Skills first.</small> : null}
+      </label>
+    );
   }
 
   if (field.type === "boolean") {
@@ -207,7 +226,7 @@ function ConfigField({ field, value, onChange, onClearSecret }: { field: ConfigF
     return (
       <label>
         {field.label}
-        <select value={String(value)} onChange={(event) => onChange(parseSelectValue(event.target.value, field))}>
+        <select aria-label={field.label} value={String(value)} onChange={(event) => onChange(parseSelectValue(event.target.value, field))}>
           {(field.options ?? []).map((option) => (
             <option key={`${field.key}:${String(option.value)}`} value={String(option.value)}>
               {selectOptionLabel(option)}
@@ -229,6 +248,8 @@ function ConfigField({ field, value, onChange, onClearSecret }: { field: ConfigF
             value={String(value)}
             placeholder={field.secretConfigured ? "Configured" : ""}
             autoComplete="off"
+            aria-label={field.label}
+            disabled={clearing}
             onChange={(event) => onChange(event.target.value)}
           />
           {onClearSecret ? <ControlButton size="compact" onClick={() => void clearSecret()} disabled={clearing}>Clear</ControlButton> : null}
@@ -243,6 +264,7 @@ function ConfigField({ field, value, onChange, onClearSecret }: { field: ConfigF
     <label>
       {field.label}
       <input
+        aria-label={field.label}
         type={field.type === "number" ? "number" : "text"}
         value={String(value)}
         min={field.type === "number" ? field.min : undefined}
@@ -253,6 +275,15 @@ function ConfigField({ field, value, onChange, onClearSecret }: { field: ConfigF
       {field.description ? <small>{field.description}</small> : null}
     </label>
   );
+}
+
+function forgeRepository(values: Record<string, ConfigValue> | undefined, fields: ConfigFieldDescriptor[]): ForgeRepository | undefined {
+  const value = (key: string) => values?.[key] ?? fields.find(field => field.key === key)?.defaultValue;
+  const provider = value("provider");
+  const apiUrl = value("apiUrl");
+  const projectPath = value("projectPath");
+  if ((provider !== "github" && provider !== "gitlab") || typeof apiUrl !== "string" || typeof projectPath !== "string" || !projectPath.trim()) return undefined;
+  return { provider, apiUrl: apiUrl.trim().replace(/\/$/, ""), projectPath: projectPath.trim() };
 }
 
 function parseSelectValue(raw: string, field: ConfigFieldDescriptor): ConfigValue {

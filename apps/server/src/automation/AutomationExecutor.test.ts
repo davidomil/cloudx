@@ -1,3 +1,5 @@
+import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -12,6 +14,11 @@ import { AutomationCatalogService } from "./AutomationCatalogService.js";
 import { AutomationExecutor } from "./AutomationExecutor.js";
 import { AutomationTypeService } from "./AutomationTypeService.js";
 
+vi.mock("node:child_process", async importOriginal => {
+  const original = await importOriginal<typeof import("node:child_process")>();
+  return { ...original, spawn: vi.fn(original.spawn) };
+});
+
 describe("AutomationExecutor", () => {
   const ownedProcessGroups = new Set<number>();
 
@@ -19,6 +26,7 @@ describe("AutomationExecutor", () => {
     await terminateRecordedProcessGroups(ownedProcessGroups);
     vi.useRealTimers();
     vi.unstubAllEnvs();
+    vi.mocked(spawn).mockReset();
   });
 
   it("runs a trigger-to-hook graph and records trace output", async () => {
@@ -661,9 +669,35 @@ describe("AutomationExecutor", () => {
     const pythonRun = await new AutomationExecutor().execute(pythonSecretEnvGroup(), event(), catalog, hooks, { allowedRoots: [dataDir] });
     const bashRun = await new AutomationExecutor().execute(bashSecretEnvGroup(), event(), catalog, hooks, { allowedRoots: [dataDir] });
 
-    expect(pythonRun.status).toBe("succeeded");
-    expect(bashRun.status).toBe("succeeded");
+    expect(pythonRun.status, pythonRun.error).toBe("succeeded");
+    expect(bashRun.status, bashRun.error).toBe("succeeded");
     expect(captured).toEqual([{ leaked: false }, { leaked: false }]);
+  });
+
+  it.each([
+    { language: "Bash", typeId: "primitive:bash.exec", config: { script: "printf '{\"ok\":true}\\n'" } },
+    { language: "Python", typeId: "primitive:python.exec", config: { code: "print('{\"ok\":true}')" } },
+  ] as const)("accepts a successful $language exit before empty stdin is closed", async ({ typeId, config }) => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-empty-stdin-"));
+    try {
+      await finishProcessBeforeStdin(ownedProcessGroups);
+      const run = await new AutomationExecutor().execute(processPrimitiveGroup(typeId, { ...config, parseJson: true }), event(), await primitiveCatalog(), new HookRegistry(), { allowedRoots: [directory] });
+
+      expect(run.status, run.error).toBe("succeeded");
+      expect(run.trace.map(entry => entry.message)).toContain("after process");
+    } finally { await fs.rm(directory, { recursive: true, force: true }); }
+  });
+
+  it("fails when real stdin cannot be delivered to an already-exited command", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-rejected-stdin-"));
+    try {
+      await finishProcessBeforeStdin(ownedProcessGroups);
+      const run = await new AutomationExecutor().execute(processPrimitiveGroup("primitive:bash.exec", { script: "exit 0", stdin: "required input" }), event(), await primitiveCatalog(), new HookRegistry(), { allowedRoots: [directory] });
+
+      expect(run.status).toBe("failed");
+      expect(run.error).toContain("EPIPE");
+      expect(run.trace.map(entry => entry.message)).not.toContain("after process");
+    } finally { await fs.rm(directory, { recursive: true, force: true }); }
   });
 
   it("terminates timed-out Python process groups that ignore SIGTERM", async () => {
@@ -1257,6 +1291,23 @@ function nestedCreateOutputSchema(): JsonSchemaLike {
     },
     additionalProperties: false
   };
+}
+
+async function finishProcessBeforeStdin(ownedProcessGroups: Set<number>): Promise<void> {
+  const native = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+  vi.mocked(spawn).mockImplementationOnce((command, args, options) => {
+    const child = native.spawn(command, args, options);
+    if (!child.pid) throw new Error("The early-exit fixture did not start.");
+    ownedProcessGroups.add(child.pid);
+    const deadline = Date.now() + 2_000;
+    const pause = new Int32Array(new SharedArrayBuffer(4));
+    while (Date.now() < deadline) {
+      const stat = readFileSync(`/proc/${child.pid}/stat`, "utf8");
+      if (["Z", "X"].includes(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0])) return child;
+      Atomics.wait(pause, 0, 0, 1);
+    }
+    throw new Error("The command did not exit before stdin delivery.");
+  });
 }
 
 function group(): AutomationGroup {

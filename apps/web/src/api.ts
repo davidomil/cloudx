@@ -10,6 +10,11 @@ import type {
   AutomationValidationSummary,
   CloudxConfigResponse,
   CloudxConfigValues,
+  ForgeConnectionAction,
+  ForgeConnections,
+  ForgeConnectionStatus,
+  ForgeCredentialRole,
+  ForgeRepository,
   CreateTabRequest,
   CreateTabResponse,
   CreateWorkspaceLayoutTemplateRequest,
@@ -447,6 +452,49 @@ export async function cancelAutomationRun(runId: string): Promise<AutomationRuns
 
 export async function getConfig(): Promise<CloudxConfigResponse> {
   return fetchJson("/api/config");
+}
+
+export async function getForgeConnections(signal?: AbortSignal): Promise<ForgeConnections> {
+  return parseForgeConnections(await fetchJson<unknown>("/api/forge/connections", { signal }));
+}
+
+export async function startForgeGitHubConnection(repository: ForgeRepository, role: ForgeCredentialRole): Promise<ForgeConnectionAction> {
+  const action = await fetchJson<unknown>("/api/forge/connections/github/start", { method: "POST", body: JSON.stringify({ repository, role }) });
+  if (!isRecord(action) || !["GET", "POST"].includes(String(action.method)) || !isHttpsUrl(action.url)
+    || action.fields !== undefined && (!isRecord(action.fields) || Object.values(action.fields).some(value => typeof value !== "string"))) {
+    throw new Error("Invalid Forge connection action.");
+  }
+  return { method: action.method as ForgeConnectionAction["method"], url: action.url as string, ...(action.fields ? { fields: action.fields as Record<string, string> } : {}) };
+}
+
+export async function connectForgeGitLab(repository: ForgeRepository, setupToken: string): Promise<ForgeConnections> {
+  return parseForgeConnections(await fetchJson<unknown>("/api/forge/connections/gitlab", { method: "POST", body: JSON.stringify({ repository, setupToken }) }));
+}
+
+function parseForgeConnections(value: unknown): ForgeConnections {
+  const invalid = () => new Error("Invalid Forge connection response.");
+  if (!isRecord(value) || !Array.isArray(value.roles) || value.roles.length !== 2
+    || value.configurationError !== undefined && typeof value.configurationError !== "string") throw invalid();
+  let repository: ForgeRepository | undefined;
+  if (value.repository !== undefined) {
+    const repo = value.repository;
+    if (!isRecord(repo) || !["github", "gitlab"].includes(String(repo.provider)) || !isHttpsUrl(repo.apiUrl) || typeof repo.projectPath !== "string" || !repo.projectPath.trim()) throw invalid();
+    repository = { provider: repo.provider as ForgeRepository["provider"], apiUrl: repo.apiUrl as string, projectPath: repo.projectPath };
+  }
+  const roles = value.roles.map((role): ForgeConnectionStatus => {
+    if (!isRecord(role) || !["worker", "reviewer"].includes(String(role.role)) || !["disconnected", "registering", "installing", "connected", "expired", "failed"].includes(String(role.state))
+      || [role.name, role.message, role.expiresAt].some(item => item !== undefined && typeof item !== "string")
+      || typeof role.expiresAt === "string" && !Number.isFinite(Date.parse(role.expiresAt))) throw invalid();
+    return { role: role.role as ForgeCredentialRole, state: role.state as ForgeConnectionStatus["state"],
+      ...(typeof role.name === "string" ? { name: role.name } : {}), ...(typeof role.message === "string" ? { message: role.message } : {}), ...(typeof role.expiresAt === "string" ? { expiresAt: role.expiresAt } : {}) };
+  });
+  if (new Set(roles.map(role => role.role)).size !== 2) throw invalid();
+  return { roles, ...(repository ? { repository } : {}), ...(typeof value.configurationError === "string" ? { configurationError: value.configurationError } : {}) };
+}
+
+function isHttpsUrl(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  try { return new URL(value).protocol === "https:"; } catch { return false; }
 }
 
 export async function updateConfig(patch: Partial<CloudxConfigValues>): Promise<CloudxConfigResponse> {

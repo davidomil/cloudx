@@ -4,6 +4,7 @@ export interface TerminalProcess {
   write(data: string): void;
   resize(cols: number, rows: number): void;
   kill(): void;
+  terminate(): Promise<void>;
 }
 
 export interface TerminalProcessFactory {

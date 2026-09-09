@@ -1,0 +1,237 @@
+Forge exact-checkout trust and embedded terminal revision verification, 2026-09-07 UTC
+
+[native-codex-trust]
+Command: node /tmp/cloudx-forge-trust-native/smoke.cjs
+Original result: cloudx-forge-trust-native/result.json
+Original result SHA256: d67b474e44b069307f2c385e222a042d1a658f723aed8137fcbc3459b0593f7e
+Executed fixture script SHA256: c0c30d6c588ca3b139d2b5185e0779652d7b9e644dc6d75600f6f99a02e8544f
+Version: codex-cli 0.153.4
+Scope: installed CloudX Codex CLI, temporary Git checkout and isolated per-scenario Codex homes; local HTTP provider; no live worker or global configuration changed.
+Results:
+- baseline: trust; project model=False; base model=False; disabled-config warning=False; clean exit=True; passed=True
+- parent_trusted: trust; project model=False; base model=False; disabled-config warning=False; clean exit=True; passed=True
+- exact_overlay: composer; project model=True; base model=False; disabled-config warning=False; clean exit=True; passed=True
+- parent_untrusted_exact_overlay: composer; project model=True; base model=False; disabled-config warning=False; clean exit=True; passed=True
+- exact_untrusted: composer; project model=False; base model=True; disabled-config warning=True; clean exit=True; passed=True
+- cli_exact_override: composer; project model=False; base model=True; disabled-config warning=True; clean exit=True; passed=True
+- cli_inline_table: composer; project model=True; base model=False; disabled-config warning=False; clean exit=True; passed=True
+All seven scenarios passed. Fixture model requests: 0. No submitted prompt or paid model execution.
+The loading composer is not accepted as readiness: trusted cases require initialized model evidence and rendering an unsent input marker. Baseline cases detect the trust dialog without accepting it.
+The fixture exercises a checkout path containing dots and a space. Quoted dotted CLI project keys are silently misapplied; whole-table TOML override and per-home TOML project entries work.
+
+[source-review]
+Reviewed: ForgeSettingsService.ts, ForgeRuntime.ts, server.ts, CodexHomeOverlay.ts, CodexTerminalPlugin.ts, sessionStore.ts, WorkspaceCommandService.ts and focused tests.
+Exact provider/API/repository approval must also match current settings. Runtime rechecks persisted and captured checkout identities plus Git configuration; private overlay adds one canonical cwd key and preserves source config.
+Official source: rust-v0.153.4 config/src/config_toml.rs get_active_project; config/src/loader/mod.rs ProjectTrustContext; tui/src/lib.rs should_show_trust_screen; config/src/overrides.rs apply_toml_override.
+Source archive: doc_3289f8f4b3664f7e7ba76c7e (config_toml.rs generated documentation), doc_00c80b5c9e1c413cfac5f6a2 (trust_directory.rs generated documentation), doc_fad4d0ec28dffee401747aeb (overrides.rs including raw artifact).
+Exact downloaded originals and SHA256 pins were checked in the temporary native evidence directory. Official tagged source is primary evidence; generated archive summaries supplement it.
+
+[focused-runtime-trust]
+Command: npx vitest run apps/server/src/forge/ForgeSettingsService.test.ts apps/server/src/forge/ForgeRuntime.test.ts
+Original log: cloudx-forge-trust-review-tests.log
+Original log SHA256: 19ea417973226891be4b79ee6744a1c73d9f422d709a050e3bdb0d1a5f8425d8
+Result: 2 files, 33 tests passed. This run precedes later launch-failure and embedded-placement changes.
+
+[nested-worker-ui]
+Command: npx vitest run apps/web/src/ui/ForgePanel.test.ts apps/web/src/ui/layout.test.ts apps/web/src/ui/App.test.ts apps/web/src/ui/TerminalPanel.test.ts --reporter=dot
+Result: 4 files, 77 tests passed.
+Original log: forge-nested-ui-tests.log
+Original SHA256: 98c76b4e1bb285ef6f3a94693142ba78163c9915583a0a0eddeddf1381150982
+Command: npx tsc -b apps/web --pretty false
+Result: passed; original forge-nested-ui-typecheck.log is empty.
+
+[nested-worker-browser]
+Command: node /tmp/forge-nested-browser.mjs
+Result: passed at desktop 1320x1000 and mobile 390x844. Production ForgePanel, ForgeWorkerTabs and TerminalPanel/xterm used deterministic hook/socket transport.
+Observed: input, worker switching and connection reuse, focus handoff, paused-output retention, Resume replacing the selected terminal and disposing the old view; no page errors or horizontal overflow.
+Original log: forge-nested-browser.log
+Original SHA256: 741aa8a2ce8d5172a1521dced1e6bc9a972e48122ff298276c85794d4e4f498a
+Executed script SHA256: 8ac3f286777fe4af37f700e58ec79095edac089e051b002934612ef0cd1da9ee
+Screenshots were visually reviewed by the UI agent. Temporary browser fixture/server were removed/stopped; this run did not change the live preview.
+resumed-desktop.png: ef710b448876ce9f2c7f00b511b392f151c6dbe27958a6d61e590bb9782a239b
+resumed-mobile.png: 99e229575e5c12131431a6b4db8b8ff4409f14f0d3afbf72e07a633dbd56f05c
+worker-desktop.png: 36864cae3a6870d1e0f63b7571343c72aed9bc3d9f4c544eda6873c8d90f4e51
+worker-mobile.png: 441618396b250157f957519c4318174d98f235c73d16504c77d3125b21b67ae0
+
+[revision-initial-full]
+Command: npm test -- --reporter=dot
+Original log: cloudx-forge-revision-test.log
+Original SHA256: 08c1f579e7aa6b2a20f89e858c44b522f686eecc6c82017e104ee50d753bdd54
+Result: Initial default-parallel full run: 2 failed, 2334 passed; 118 files passed and 2 failed. Failures were the existing ordered-shutdown assertion and the 20 ms timed-out Python process-group test. This run overlapped TypeScript/browser work; no unrelated test or production implementation was changed.
+ Test Files  2 failed | 118 passed (120)
+      Tests  2 failed | 2334 passed (2336)
+
+[revision-targeted-timing]
+Command: npx vitest run apps/server/src/server.test.ts apps/server/src/automation/AutomationExecutor.test.ts --reporter=dot --maxWorkers=2
+Original log: cloudx-forge-revision-timing-check.log
+Original SHA256: a58dd2ba45562e748d58cf12312a9f0626d689e6be33e0d2420680671aae822a
+Result: Both focused suites passed: 195 tests in 2 files.
+ Test Files  2 passed (2)
+      Tests  195 passed (195)
+
+[revision-bounded-full]
+Command: npm test -- --reporter=dot --maxWorkers=4
+Original log: cloudx-forge-revision-test-bounded.log
+Original SHA256: cb77cd8940529f0c5725c8484e4be18a06cf861454b3e5df7a4676f41398f863
+Result: Earlier bounded revision passed: 2337 tests in 120 files; superseded by the final run below.
+ Test Files  120 passed (120)
+      Tests  2337 passed (2337)
+
+[revision-typecheck]
+Command: npm run typecheck
+Original log: cloudx-forge-revision-typecheck.log
+Original SHA256: d6fdb8056eb56fed4465fd25d8416b553845d2700d9f61d587c4266d95595a5f
+Result: Passed.
+
+[revision-build]
+Command: npm run build
+Original log: cloudx-forge-revision-build.log
+Original SHA256: 10676a0e85f0530e8cc3a64907d557439b680f2da7e6b6fc8598a7666fabc286
+Result: Passed all workspace builds. Existing AutomationPanel chunk-size warning remains.
+✓ built in 387ms
+
+[prelaunch-recovery-review]
+The pre-process trust refusal finding was resolved with PluginSessionNotStartedError. CodexTerminalPlugin wraps only errors before process spawn; Forge clears launchPending only for this typed outcome. Unknown launch failures remain preserved. Runtime and SessionStore tests cover subsequent recovery and preparation cleanup.
+
+[revision-final-full]
+Command: npm test -- --reporter=dot --maxWorkers=4
+Original log: cloudx-forge-revision-test-final.log
+Original SHA256: ff099e86bc119b2e7423d3b7c0009540dd7b14cab2aa9441479b0658dc4259a9
+Result: Passed: 2339 tests in 120 files after both final review fixes.
+
+[revision-final-typecheck]
+Command: npm run typecheck
+Original log: cloudx-forge-revision-typecheck-final.log
+Original SHA256: d6fdb8056eb56fed4465fd25d8416b553845d2700d9f61d587c4266d95595a5f
+Result: Passed.
+
+[revision-final-build]
+Command: npm run build
+Original log: cloudx-forge-revision-build-final.log
+Original SHA256: 1601b7676351b3e1da48d4768e1c7b36ea564781629ca81b07e7ee667dfe68dc
+Result: Passed all workspace builds. Existing AutomationPanel chunk-size warning remains.
+
+[revision-shipped-browser]
+Command: npx playwright test --reporter=line
+Original log: cloudx-forge-revision-browser.log
+Original SHA256: 20c3ca7c1eb2e4d1218f67749951a05429c8359e488c1714a0cac4d4199db2a3
+Result: Passed: 12 desktop/mobile shipped-shell browser tests. UI unchanged by the subsequent two runtime guards.
+
+[final-runtime-review]
+Initial repository trust-policy evaluation now runs before persisting launchPending, so malformed settings do not leave a phantom launch. Runtime recover and requireWorkerTab require server-assigned ownerPluginId=forge alongside exact worker metadata/cwd. A manually created terminal cannot be adopted using public metadata. Regressions for both findings are included in the final passing suite; no compatibility fallback was added.
+
+[native-source-pins]
+Tagged OpenAI source is authoritative for installed Codex 0.153.4; each downloaded original hash was rechecked before documentation.
+https://raw.githubusercontent.com/openai/codex/rust-v0.153.4/codex-rs/config/src/config_toml.rs
+SHA256: 5ff36c12287c453d9421483c62da3377bd3fb9bc7de80defb80e215e0ccf3633
+https://raw.githubusercontent.com/openai/codex/rust-v0.153.4/codex-rs/config/src/loader/mod.rs
+SHA256: 6fc44b60c64065994c9aa18df248eb521dba6b0e9917a8cf69fc60e0035ac56a
+https://raw.githubusercontent.com/openai/codex/rust-v0.153.4/codex-rs/tui/src/lib.rs
+SHA256: dacd2ea2756a3af956803ae3dbc1c5d4fd2c22fbdeeab02f0bca57856285d6cf
+https://raw.githubusercontent.com/openai/codex/rust-v0.153.4/codex-rs/tui/src/onboarding/trust_directory.rs
+SHA256: 661edef007136d42dc4f63c79ba4d81c0e09dd00d23a7afbf341e6b72c95257a
+https://raw.githubusercontent.com/openai/codex/rust-v0.153.4/codex-rs/model-provider-info/src/lib.rs
+SHA256: 03ba8ea303b9763f7c5e25a468b7f6675c9970dfb91109205beb6d0509f574d1
+https://raw.githubusercontent.com/openai/codex/rust-v0.153.4/codex-rs/core/src/config/mod.rs
+SHA256: b3eb0a9751522f7f6f7a7bd1b21253f2fcb4e669955819bfb6d0a7425e1fed9e
+https://raw.githubusercontent.com/openai/codex/rust-v0.153.4/codex-rs/config/src/overrides.rs
+SHA256: dbac7a6f68de31e74c11e9671fe0b1f68f8783c68cff5a9ba26348e0b5f86c0a
+
+[live-restart-cleanup-observation]
+After the successful live Codex startup and nested desktop/mobile terminal observation, restarting the preview and resuming the retained issue worker reported cleanup_failed. The owned checkout was preserved and the PTYs stopped. Investigation traced this to TabContextService truncation atomically replacing the context file while Forge retained its former inode identity. This observation precedes the targeted correction and final live verification; it must not be represented as a successful final restart.
+
+[repaired-ownership-workflow]
+Command: npx vitest run apps/server/src/forge/ForgeWorkflowService.test.ts apps/server/src/plugins/ForgePlugin.test.ts --reporter=dot
+Original log: forge-recovered-workflow-tests.log
+Original SHA256: 4ce140a90eb2a0c429429179a096aef49af3d6fa0be79905b981aa2259892d3f
+Result: 31 tests in 2 files passed. Failed runtime recovery still blocks Resume. After ownership recovery succeeds, unfinished issues resume the retained checkout with fresh input; merged issues and review workers complete cleanup without relaunching. This unit evidence does not establish final native recovery.
+
+[context-recovery-integration]
+Command: npx vitest run apps/server/src/forge/ForgeRuntime.test.ts apps/server/src/forge/ForgeLifecycle.integration.test.ts apps/server/src/forge/ForgeWorkflowService.test.ts --reporter=dot
+Original log: cloudx-forge-context-recovery-tests.log
+Original SHA256: d569bf3e4a0002c9b9fecb6cb96452fc51ee3bff6123dcef1a8dc846f2384450
+Result: 63 tests in 3 files passed. Real PTY output replaces the bounded context leaf inode; after pause and SessionStore disposal, recreated runtime cleans terminal artifacts and preserves the checkout.
+
+[owned-context-boundaries]
+Command: npx vitest run apps/server/src/context/TabContextService.test.ts apps/server/src/sessionStore.test.ts apps/server/src/jsonStateFile.test.ts --reporter=dot
+Original log: cloudx-forge-owned-context-tests.log
+Original SHA256: 3e9f04faa7a13d87556ae5d1e072070c6472281cb0d3b6c57559b9fc45fcd716
+Result: 98 tests in 3 files passed. Includes exclusive creation, unchanged directory identity under rotation, copied identity receipts, rejected replacements/symlinks/hardlinks/nonregular/oversize files, queued writes before deletion and partial capacity-failure cleanup.
+
+[owned-context-typecheck]
+Command: npx tsc -b apps/server --pretty false
+Original log: cloudx-forge-owned-context-typecheck.log
+Original SHA256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+Result: Passed; output log is empty.
+
+[context-ownership-review]
+Reviewed TabContextService, SessionStore, ForgeRuntime and openOwnedDirectoryNoFollow plus the production-path regressions. The session service mints directory identity; captureTab does not infer ownership from the public context path. Runtime persists/reopens that identity across restart and checks it before closing a live tab. Atomic context.md rotation stays within the owned directory, with no compatibility adoption of the earlier flat context file. Tests concern process lifecycle and filesystem identity; no power-loss durability is claimed.
+
+[prior-context-preservation]
+Sanitized receipt: cloudx-forge-context-quarantine.json. Root preserved the observed 64000-byte rotated context in a quarantine file before proceeding with final preview verification. Recorded worker process list was empty; ownership ledger unchanged. Original log SHA256: 9d9c86c344556353121b2541c41c5b5ebe3af66e59307c7d77c2b50eab8cad87. The old context was not automatically adopted or deleted.
+
+[context-final-full-initial]
+Command: npm test -- --reporter=dot --maxWorkers=4
+Original log: cloudx-forge-context-full-test.log
+Original SHA256: 3bcff79bbdff442ecfc3302224414fe9e15b067f7ffb72cdf9daea05cd98b3f5
+Result: 1 failed, 2357 passed. Gate B publisher source snapshot changed because this documentation audit file was concurrently edited. Exact failure names trust-verification-runs.txt with changed SHA256; it was not a publisher behavior regression. Repository writes were frozen before rerunning.
+
+[context-final-full]
+Command: npm test -- --reporter=dot --maxWorkers=4
+Original log: cloudx-forge-context-full-test-final.log
+Original SHA256: 4f8be569ac5f5bbfc23c1a1826c127f52cbaf02808bdaddcc7ada7797d093b64
+Result: 120 files, 2359 tests passed after freezing source/documentation writes; includes the final issue Resume label regression.
+
+[filesystem-source-evidence]
+Command: node --version
+Result: v25.9.0.
+Archive-first command: node "$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-search/scripts/cloudx-doc.mjs" search "Node.js 25.9 file handles atomic rename directory descriptor ownership"
+Result: existing POSIX rename and Linux renameat2 references; no matching Node 25.9 entry. Opened active POSIX record doc_d3a6c51ebef4c5f03dfaa438 before official web lookup.
+Built-in web opened and inspected Node v25.9.0 fs API and Linux rename(2). Official Node versioned docs and Linux man-pages are primary authoritative references; production tests establish this application's behavior. Source guidance does not establish power-loss durability.
+Command: node "$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-ingest/scripts/cloudx-doc.mjs" ingest-url https://nodejs.org/download/release/v25.9.0/docs/api/fs.html
+Result: active original HTML record doc_b04975a74287e6b0231f0f13, 240 source chunks; content SHA256 074ce17ddfce63c6ba466a92db53b89d5afec610eb25692078d25656393a613b.
+Command: node "$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-ingest/scripts/cloudx-doc.mjs" ingest-url https://man7.org/linux/man-pages/man2/rename.2.html
+Result: active original HTML record doc_cdb7717e2f25a05937475122, 12 source chunks; content SHA256 3000f42bc38afdd0abe547544772311789a77e66825cd23f5b23d3237334d4ea.
+Command: node "$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-search/scripts/cloudx-doc.mjs" search "Node.js v25.9.0 fs FileHandle O_NOFOLLOW O_DIRECTORY"
+Result: matching active Node 25.9.0 source is the first result.
+Command: node "$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-search/scripts/cloudx-doc.mjs" open doc_b04975a74287e6b0231f0f13 --chunks 240 --chars 2400
+Result: inspected original HTML FileHandle.fd and O_DIRECTORY/O_NOFOLLOW definitions, not only generated enrichment.
+Command: node "$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-search/scripts/cloudx-doc.mjs" search "rename open file descriptors atomically replaced" --limit 3
+Command: node "$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-search/scripts/cloudx-doc.mjs" open doc_cdb7717e2f25a05937475122 --chunks 12 --chars 2400
+Result: active Linux rename source found and original HTML inspected: replacement publication is atomic and already-open descriptors remain attached to the original file.
+
+[context-final-typecheck]
+Command: npm run typecheck
+Original log: cloudx-forge-context-typecheck-final.log
+Original SHA256: d6fdb8056eb56fed4465fd25d8416b553845d2700d9f61d587c4266d95595a5f
+Result: Passed.
+
+[context-final-build]
+Command: npm run build
+Original log: cloudx-forge-context-build-final.log
+Original SHA256: dca1c9594c096469b5d2c4c34aa9a381f6efd6b0082058d4032eae0ae2800f48
+Result: Passed all workspace builds. Existing AutomationPanel chunk-size warning remains.
+
+[context-final-browser]
+Command: npm run test:browser
+Original log: cloudx-forge-context-browser-final.log
+Original SHA256: f8e409c97dbd25da75549cea9cf08291351ae2d519bbfaf58444008e0d4c244f
+Result: 12 shipped-shell desktop/mobile tests passed in 9.6 seconds, after the final recovery control label change.
+
+[final-live-github-recovery]
+Command: node /tmp/cloudx-forge-final-browser.mjs
+Result: Passed. GitHub davidomil/cloudx issue #5 resumed through the normal resource-recovery path in the same owned checkout after the preserved earlier log was quarantined. New context uses the private owned directory. Both issue-worker and reviewer connections were reported connected.
+Observed in finalRefresh: status=running, error=null, sameCheckout=true, recoveredFromCleanupFailure=true, nestedInsideForge=true, exactCheckoutTrusted=true, sourceConfigUnchanged=true, productionUnchanged=true, trustDialogDetected=false.
+Observed in both finalBrowser viewports: ownerPluginId=forge, terminalVisible=true, activeTabIsForge=true, workerInLayout=false, horizontalOverflow=false, pageErrors=[]. Desktop 1440x1000 and Playwright Pixel 7 emulation used the built preview and actual native Codex 0.153.4 terminal.
+Both screenshots were visually reviewed by root and the documentation reviewer. Actual gpt-6-astra was reading repository files, using source tools and continuing issue work without the directory-trust dialog. This is live model execution evidence, distinct from the seven no-model-request startup fixtures. Hosted end-to-end issue-to-merge and live GitLab provisioning remain unverified.
+cloudx-forge-final-browser.mjs SHA256: c373246ce1637f30f17ad76c5725ee9ca4e4744c641b9567ebcc1881fffc8fe9
+cloudx-forge-live-final-browser.log SHA256: b2798d2e5706f35d69ae148e406656ef006dc2855e92ce9deb89e2c35d26be4c
+cloudx-forge-preview-revision.json SHA256: 5019575fe6b2926a665b023e4000be0d1da161127724723d67093c86d550b4a2
+cloudx-forge-live-browser-final/desktop.png SHA256: 7f4e7555786c70e35f2665f1b059c0a1293f79bbae7b682d280218ea0125ebb6
+cloudx-forge-live-browser-final/mobile.png SHA256: 015f4abd3b4609ca773c48ac97c4b6fc5b06a1660d539bb78d9d13e60d9e222a
+
+[pre-fix-live-evidence-preserved]
+Before the context cleanup fix, successful live startup and nested browser evidence were retained separately under cloudx-forge-trust-native/live-before-context-fix. Selected observation fields exclude absolute host paths. Later successful recovery is established by final-live-github-recovery above.
+desktop.png SHA256: c9e99a3084a3c2a62b47be58093457415476eedbbc736b897d8ee7604e8b711f
+mobile.png SHA256: 34eeaa57d74fd9ef9b5288398645852b60a72c08e5426cc32ae065a8782ecf24
+observation.json SHA256: 58f84595242d9351adcafca40e61d3939a4acf4ee3b743c5a9aa11a61c6d1352

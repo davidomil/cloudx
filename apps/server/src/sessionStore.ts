@@ -3,7 +3,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
 
 import { pluginActionHookId } from "@cloudx/plugin-api";
-import type { CloudxAppContext, HookCaller, PluginActionDefinition, PluginSession, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
+import type { CloudxAppContext, HookCaller, PluginActionDefinition, PluginSession, PluginSessionLaunchOptions, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
 import type { ConfigValue } from "@cloudx/shared";
 import type { HookId, PluginId, PluginMetadata, PluginMetadataMap, TabIndicator, TabIndicatorUpdate, VoiceAction, WorkspaceRuntimeContext, WorkspaceSnapshot, WorkspaceTab, WorkspaceTabsUpdate, WorkspaceWindow } from "@cloudx/shared";
 
@@ -44,6 +44,7 @@ const reportSessionBackgroundError: SessionBackgroundErrorReporter = (error, det
 export class SessionStore {
   private readonly tabs = new Map<string, WorkspaceTab>();
   private readonly sessions = new Map<string, PluginSession>();
+  private readonly launchOptions = new Map<string, PluginSessionLaunchOptions>();
   private readonly unpublishedTabIds = new Set<string>();
   private readonly preparedTabFailures = new Map<string, Error>();
   private readonly sessionDisposers = new Map<string, Array<() => void>>();
@@ -81,11 +82,13 @@ export class SessionStore {
     return this.publishPreparedTab(tab.id);
   }
 
-  async prepareTab(request: StartTabRequest, runtimeWindow?: WorkspaceWindow): Promise<WorkspaceTab> {
+  async prepareTab(request: StartTabRequest, runtimeWindow?: WorkspaceWindow, launchOptions?: PluginSessionLaunchOptions): Promise<WorkspaceTab> {
     if (this.disposed) {
       throw new Error("Session store is disposed.");
     }
     const plugin = this.plugins.get(request.pluginId);
+    const ownerPluginId = launchOptions?.ownerPluginId;
+    if (ownerPluginId !== undefined) this.plugins.get(ownerPluginId);
     const cwdExpression = this.createTabCwdExpression(plugin, request);
     const cwd = await this.pathPolicy.ensureDirectory(cwdExpression, plugin.requiresDirectory ? (request.createDirectory ?? false) : false);
     const now = new Date().toISOString();
@@ -94,6 +97,7 @@ export class SessionStore {
     const tab: WorkspaceTab = {
       id,
       pluginId: plugin.id,
+      ...(ownerPluginId ? { ownerPluginId } : {}),
       title: request.title?.trim() || defaultTabTitle(plugin, cwd, request.initialInput),
       cwd,
       status: "starting",
@@ -109,8 +113,10 @@ export class SessionStore {
       if (templateIndicator) {
         tab.indicator = createTabIndicator(templateIndicator, now);
       }
-      tab.contextPath = await this.contextService.create(tab);
+      tab.contextPath = await this.contextService.create(tab, { ownedDirectory: Boolean(ownerPluginId) });
       this.tabs.set(id, tab);
+      if (ownerPluginId) this.workspace?.registerEmbeddedTab(id);
+      if (launchOptions) this.launchOptions.set(id, { authorizeProjectTrust: launchOptions.authorizeProjectTrust });
       this.unpublishedTabIds.add(id);
       const session = await plugin.createSession({
         tab,
@@ -119,13 +125,17 @@ export class SessionStore {
         app: this.createAppContext(plugin.id, id),
         controls: this.createControls(id),
         initialInput: request.initialInput,
+        authorizeProjectTrust: this.launchOptions.get(id)?.authorizeProjectTrust,
         config: this.configProvider.getPluginConfig(plugin.id),
         getConfig: () => this.configProvider.getPluginConfig(plugin.id)
       });
-      this.bindSession(id, session);
-      this.updateTab(id, { status: "running", indicator: templateIndicator ? createTabIndicator(templateIndicator) : createTabIndicator({ color: "green", label: "OK", message: "Running." }) });
+      this.bindSession(id, session, templateIndicator);
     } catch (error) {
-      await this.discardPreparedTab(id);
+      try {
+        await this.discardPreparedTab(id);
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], "Plugin session creation failed and its cleanup is incomplete.");
+      }
       throw error;
     }
     return this.getTab(id);
@@ -148,7 +158,8 @@ export class SessionStore {
       this.preparedTabFailures.delete(tabId);
     }
     if (tabs.length > 0) {
-      this.activeTabId = tabs.at(-1)!.id;
+      const topLevelTab = tabs.filter((tab) => !tab.ownerPluginId).at(-1);
+      if (topLevelTab) this.activeTabId = topLevelTab.id;
       this.emitTabsChange();
     }
     return tabs;
@@ -227,8 +238,12 @@ export class SessionStore {
     return session;
   }
 
+  getContextDirectory(tabId: string): { path: string; dev: string; ino: string } | undefined {
+    return this.contextService.directory(this.getTab(tabId).contextPath);
+  }
+
   setActiveTab(tabId: string): void {
-    this.getTab(tabId);
+    if (this.getTab(tabId).ownerPluginId) throw new Error("An embedded session cannot become an active workspace tab.");
     this.activeTabId = tabId;
     this.emitTabsChange();
   }
@@ -466,8 +481,10 @@ export class SessionStore {
     }
     this.sessions.delete(tabId);
     this.tabs.delete(tabId);
+    this.launchOptions.delete(tabId);
+    this.workspace?.unregisterEmbeddedTab(tabId);
     if (this.activeTabId === tabId) {
-      this.activeTabId = this.listTabs()[0]?.id;
+      this.activeTabId = this.listTabs().find((tab) => !tab.ownerPluginId)?.id;
     }
     if (wasPublished) {
       this.emitTabsChange();
@@ -554,18 +571,14 @@ export class SessionStore {
       const session = await plugin.createSession({
         tab,
         cwd: tab.cwd,
+        authorizeProjectTrust: this.launchOptions.get(tabId)?.authorizeProjectTrust,
         runtimeContext,
         app: this.createAppContext(plugin.id, tabId),
         controls: this.createControls(tabId),
         config: this.configProvider.getPluginConfig(plugin.id),
         getConfig: () => this.configProvider.getPluginConfig(plugin.id)
       });
-      this.bindSession(tabId, session);
-      this.updateTab(tabId, {
-        status: "running",
-        statusMessage: undefined,
-        indicator: templateIndicator ? createTabIndicator(templateIndicator) : createTabIndicator({ color: "green", label: "OK", message: "Running." })
-      });
+      this.bindSession(tabId, session, templateIndicator);
     } catch (error) {
       this.updateTab(tabId, {
         status: "failed",
@@ -675,7 +688,7 @@ export class SessionStore {
     }
   }
 
-  private bindSession(tabId: string, session: PluginSession): void {
+  private bindSession(tabId: string, session: PluginSession, templateIndicator?: TabIndicatorUpdate): void {
     this.sessions.set(tabId, session);
     const disposers: Array<() => void> = [];
     const statusDisposer = session.onStatusChange?.((status, statusMessage) => {
@@ -702,6 +715,16 @@ export class SessionStore {
       disposers.push(dataDisposer);
     }
     this.sessionDisposers.set(tabId, disposers);
+    const current = session.snapshot();
+    const status = current.status === "starting" ? "running" : current.status;
+    const statusMessage = current.status === "starting" ? undefined : current.statusMessage;
+    this.updateTab(tabId, {
+      status,
+      statusMessage,
+      indicator: status === "running"
+        ? createTabIndicator(templateIndicator ?? { color: "green", label: "OK", message: statusMessage ?? "Running." })
+        : indicatorForStatus(status, statusMessage)
+    });
   }
 
   private disposeSessionListeners(tabId: string): void {

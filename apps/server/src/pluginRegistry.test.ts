@@ -12,7 +12,8 @@ class FakeFactory implements TerminalProcessFactory {
       onExit: () => () => undefined,
       write: () => undefined,
       resize: () => undefined,
-      kill: () => undefined
+      kill: () => undefined,
+      terminate: async () => undefined
     };
   }
 }

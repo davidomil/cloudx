@@ -1,5 +1,9 @@
 import { isUsableTabLayoutState, listTabLayoutPanes } from "./workspaceLayout.js";
 
+export * from "./forge.js";
+export * from "./forgeWorkers.js";
+export * from "./forgeConnections.js";
+
 export const DEFAULT_VOICE_MODEL = "gpt-5.3-codex-spark";
 
 export type PluginId = "codex-terminal" | "standard-terminal" | "file-browser" | "local-web" | string;
@@ -77,6 +81,7 @@ export interface TabIndicatorUpdate {
 export interface WorkspaceTab {
   id: string;
   pluginId: PluginId;
+  ownerPluginId?: PluginId;
   title: string;
   cwd: string;
   status: TabStatus;
@@ -584,6 +589,7 @@ export interface ConfigFieldDescriptor {
   visibility?: "user" | "internal";
   defaultValue: ConfigValue;
   secretConfigured?: boolean;
+  optionSource?: "rulesSkills.templates";
   options?: ConfigFieldOption[];
   min?: number;
   max?: number;
@@ -655,7 +661,13 @@ export interface CreateTabRequest {
 
 export type CodexSessionResumeMode = "new" | "picker" | "last" | "session";
 
+export const CODEX_REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"] as const;
+export type CodexReasoningEffort = typeof CODEX_REASONING_EFFORTS[number];
+
 export interface CodexTerminalInitialInput {
+  prompt?: string;
+  model?: string;
+  reasoningEffort?: CodexReasoningEffort;
   resume?: {
     mode: Exclude<CodexSessionResumeMode, "new">;
     sessionId?: string;

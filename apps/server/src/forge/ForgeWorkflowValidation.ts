@@ -1,0 +1,377 @@
+import type {
+  ForgeAutoReview,
+  ForgeIssueCompletionReport,
+  ForgeReviewComment,
+  ForgeReviewDraft,
+  ForgeReviewPublication,
+  ForgeReviewSubmission,
+  ForgeWorker,
+} from "@cloudx/shared";
+
+function object(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("Expected a JSON object.");
+  return value as Record<string, unknown>;
+}
+function text(value: unknown, name: string, max = 100_000): string {
+  if (typeof value !== "string" || value.length > max)
+    throw new Error(`Invalid ${name}.`);
+  return value;
+}
+function nonblankText(value: unknown, name: string, max: number): string {
+  const result = text(value, name, max);
+  if (!result.trim()) throw new Error(`Invalid ${name}.`);
+  return result;
+}
+function isoTimestamp(value: unknown, name: string): string {
+  const result = text(value, name, 24);
+  const timestamp = Date.parse(result);
+  if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== result)
+    throw new Error(`Invalid ${name}.`);
+  return result;
+}
+function workerLink(value: unknown, ownerId: string): string {
+  const id = text(value, "linked worker identity", 36);
+  if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(id) || id.toLowerCase() === ownerId.toLowerCase())
+    throw new Error("Invalid linked worker identity.");
+  return id;
+}
+
+function parseAutoReview(value: unknown, workerId: string): ForgeAutoReview {
+  const input = object(value);
+  if (typeof input.enabled !== "boolean" || typeof input.phase !== "string" || !["implementing", "reviewing", "merging"].includes(input.phase))
+    throw new Error("Invalid automatic review state.");
+  const placement = object(input.placement);
+  if (input.mergeAttempted !== undefined)
+    throw new Error("Saved merge attempts must belong to the issue worker, independently of automatic review. Reconcile the existing attempt before loading it.");
+  return {
+    enabled: input.enabled,
+    phase: input.phase as ForgeAutoReview["phase"],
+    placement: {
+      windowId: nonblankText(placement.windowId, "automatic review window", 128),
+      paneId: nonblankText(placement.paneId, "automatic review pane", 128),
+    },
+    ...(input.reviewWorkerId !== undefined ? { reviewWorkerId: workerLink(input.reviewWorkerId, workerId) } : {}),
+    ...(input.waitingSince !== undefined ? { waitingSince: isoTimestamp(input.waitingSince, "automatic review observation timestamp") } : {}),
+  };
+}
+
+function parseReviewPublication(value: unknown): ForgeReviewPublication {
+  const input = object(value);
+  if (!Array.isArray(input.commentIds) || input.commentIds.length > 101)
+    throw new Error("Invalid published review comment IDs.");
+  const commentIds = input.commentIds.map(id => nonblankText(id, "published review comment ID", 256));
+  if (new Set(commentIds).size !== commentIds.length)
+    throw new Error("Published review comment IDs must be unique.");
+  if (input.inlineReview === undefined) return { commentIds };
+  const inline = object(input.inlineReview);
+  if (!Number.isSafeInteger(inline.commentCount) || Number(inline.commentCount) < 1 || Number(inline.commentCount) > 100)
+    throw new Error("Invalid published inline review comment count.");
+  return { commentIds, inlineReview: { id: nonblankText(inline.id, "published inline review ID", 256), commentCount: Number(inline.commentCount) } };
+}
+
+function parseSavedReview(value: unknown): ForgeReviewDraft {
+  const input = object(value);
+  const review = parseReview(input);
+  if (typeof input.status !== "string" || !["draft", "posting", "posted", "post_failed"].includes(input.status))
+    throw new Error("Invalid saved review state.");
+  const status = input.status as ForgeReviewDraft["status"];
+  if (input.publication === undefined && input.postedAt === undefined) return { ...review, status };
+  if (status !== "posted" || input.publication === undefined || input.postedAt === undefined)
+    throw new Error("Review publication requires a posted review, receipt, and timestamp.");
+  return { ...review, status, publication: parseReviewPublication(input.publication), postedAt: isoTimestamp(input.postedAt, "review publication timestamp") };
+}
+
+export function parseReview(value: unknown): ForgeReviewSubmission {
+  const input = object(value);
+  const headSha = text(input.headSha, "review head", 64);
+  if (!/^[a-f0-9]{40,64}$/i.test(headSha))
+    throw new Error("Invalid review head.");
+  if (!["comment", "approve", "request_changes"].includes(String(input.event)))
+    throw new Error("Invalid review event.");
+  if (!Array.isArray(input.comments) || input.comments.length > 100)
+    throw new Error("A review can contain at most 100 comments.");
+  const comments: ForgeReviewComment[] = input.comments.map((raw) => {
+    const comment = object(raw);
+    const body = text(comment.body, "comment body", 20_000);
+    if (!body.trim()) throw new Error("Review comments must not be empty.");
+    if (comment.path === undefined) {
+      if (
+        comment.line !== undefined ||
+        comment.side !== undefined ||
+        comment.oldPath !== undefined
+      )
+        throw new Error("Inline comment fields require a file path.");
+      return { body };
+    }
+    const file = text(comment.path, "comment path", 4096);
+    if (
+      !file ||
+      file.startsWith("/") ||
+      file.includes("\\") ||
+      file.split("/").some((part) => part === ".." || part === ".") ||
+      /[\x00-\x1f]/.test(file)
+    )
+      throw new Error("Review file paths must be relative.");
+    if (!Number.isSafeInteger(comment.line) || Number(comment.line) < 1)
+      throw new Error("Inline comments need a positive line number.");
+    if (
+      comment.side !== undefined &&
+      comment.side !== "LEFT" &&
+      comment.side !== "RIGHT"
+    )
+      throw new Error("Invalid comment side.");
+    return {
+      body,
+      path: file,
+      line: Number(comment.line),
+      ...(comment.side ? { side: comment.side as "LEFT" | "RIGHT" } : {}),
+      ...(comment.oldPath !== undefined
+        ? { oldPath: text(comment.oldPath, "old path", 4096) }
+        : {}),
+    };
+  });
+  const body = text(input.body, "review body");
+  if (!body.trim() && !comments.length)
+    throw new Error("A review must contain a summary or comments.");
+  return {
+    headSha,
+    event: input.event as ForgeReviewSubmission["event"],
+    body,
+    comments,
+  };
+}
+export function parseWorkerReport(
+  value: unknown,
+):
+  | ForgeIssueCompletionReport
+  | ({ kind: "review" } & ForgeReviewSubmission) {
+  const report = object(value);
+  if (report.kind === "review")
+    return { kind: "review", ...parseReview(report) };
+  if (report.kind !== "issue")
+    throw new Error("Completion report must identify issue or review work.");
+  const title = text(report.title, "change title", 256);
+  const body = text(report.body, "change body");
+  if (!title.trim() || !body.trim())
+    throw new Error("Issue completion requires a title and summary.");
+  const ids = report.resolvedDiscussionIds ?? [];
+  if (
+    !Array.isArray(ids) ||
+    ids.length > 100 ||
+    ids.some((id) => typeof id !== "string" || !id || id.length > 256)
+  )
+    throw new Error("Invalid resolved discussion IDs.");
+  const replies =
+    report.discussionReplies === undefined ? [] : report.discussionReplies;
+  if (!Array.isArray(replies) || replies.length > 100)
+    throw new Error("An issue report can contain at most 100 discussion replies.");
+  const discussionIds = new Set<string>();
+  const discussionReplies = replies.map(raw => {
+    const reply = object(raw);
+    const discussionId = text(reply.discussionId, "reply discussion ID", 256);
+    if (!discussionId.trim() || discussionIds.has(discussionId))
+      throw new Error("Reply discussion IDs must be nonblank and unique.");
+    discussionIds.add(discussionId);
+    const body = text(reply.body, "discussion reply body", 20_000);
+    if (!body.trim()) throw new Error("Discussion replies must not be empty.");
+    return { discussionId, body };
+  });
+  return {
+    kind: "issue",
+    title,
+    body,
+    resolvedDiscussionIds: [...new Set(ids)] as string[],
+    discussionReplies,
+  };
+}
+
+function parsePendingPublication(
+  value: unknown,
+): NonNullable<ForgeWorker["pendingPublication"]> {
+  const input = object(value);
+  const report = parseWorkerReport(input.report);
+  if (report.kind !== "issue")
+    throw new Error("Pending publication requires an issue completion report.");
+  const headSha = input.headSha === undefined
+    ? undefined
+    : text(input.headSha, "published head", 64);
+  if (headSha !== undefined && !/^[a-f0-9]{40,64}$/i.test(headSha))
+    throw new Error("Invalid published head.");
+  let baseUpdate: NonNullable<ForgeWorker["pendingPublication"]>["baseUpdate"];
+  if (input.baseUpdate !== undefined) {
+    const update = object(input.baseUpdate);
+    const expectedHeadSha = text(update.expectedHeadSha, "base update source head", 64);
+    const baseBranch = text(update.baseBranch, "base update branch", 1024);
+    const updatedHeadSha = update.headSha === undefined ? undefined : text(update.headSha, "base update head", 64);
+    if (!/^[a-f0-9]{40,64}$/i.test(expectedHeadSha) ||
+      updatedHeadSha !== undefined && (!/^[a-f0-9]{40,64}$/i.test(updatedHeadSha) || updatedHeadSha === expectedHeadSha) ||
+      headSha !== undefined && headSha !== updatedHeadSha ||
+      report.discussionReplies.length || report.resolvedDiscussionIds.length)
+      throw new Error("Invalid base update publication checkpoint.");
+    baseUpdate = { expectedHeadSha, baseBranch, ...(updatedHeadSha ? { headSha: updatedHeadSha } : {}) };
+  }
+  const previousHeadSha = input.previousHeadSha === undefined
+    ? undefined
+    : text(input.previousHeadSha, "previous request head", 64);
+  if (previousHeadSha !== undefined && !/^[a-f0-9]{40,64}$/i.test(previousHeadSha))
+    throw new Error("Invalid previous request head.");
+  const confirmationStartedAt = input.confirmationStartedAt === undefined
+    ? undefined
+    : text(input.confirmationStartedAt, "publication confirmation timestamp", 24);
+  if (confirmationStartedAt !== undefined && (!headSha ||
+      !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(confirmationStartedAt) ||
+      !Number.isFinite(Date.parse(confirmationStartedAt))))
+    throw new Error("Publication confirmation requires a pushed head and a valid timestamp.");
+  if (input.confirmed !== undefined && (input.confirmed !== true || !headSha))
+    throw new Error("Publication confirmation requires a published head.");
+  const replyIds = new Set(report.discussionReplies.map(reply => reply.discussionId));
+  const replied = input.repliedDiscussionIds;
+  if (
+    !Array.isArray(replied) ||
+    replied.length > 100 ||
+    replied.some(id => typeof id !== "string" || !replyIds.has(id)) ||
+    new Set(replied).size !== replied.length
+  )
+    throw new Error("Published reply IDs must be unique and belong to the completion report.");
+  const replyingTo = input.replyingToDiscussionId;
+  if (
+    replyingTo !== undefined &&
+    (typeof replyingTo !== "string" || !replyIds.has(replyingTo) || replied.includes(replyingTo))
+  )
+    throw new Error("The in-flight reply must belong to the report and must not already be published.");
+  if ((replied.length || replyingTo !== undefined) && headSha === undefined)
+    throw new Error("Discussion reply progress requires a published head.");
+  return {
+    report,
+    ...(baseUpdate ? { baseUpdate } : {}),
+    ...(headSha !== undefined ? { headSha } : {}),
+    ...(previousHeadSha !== undefined ? { previousHeadSha } : {}),
+    ...(confirmationStartedAt !== undefined ? { confirmationStartedAt } : {}),
+    ...(input.confirmed === true ? { confirmed: true as const } : {}),
+    repliedDiscussionIds: [...replied] as string[],
+    ...(replyingTo !== undefined ? { replyingToDiscussionId: replyingTo as string } : {}),
+  };
+}
+
+export function parseWorkers(value: unknown): ForgeWorker[] {
+  if (!Array.isArray(value) || value.length > 10_000)
+    throw new Error("Invalid saved Forge worker list.");
+  const ids = new Set<string>();
+  return value.map((raw) => {
+    const worker = object(raw);
+    for (const key of [
+      "id",
+      "title",
+      "baseBranch",
+      "templateId",
+      "startedAt",
+      "updatedAt",
+    ])
+      text(worker[key], `worker ${key}`);
+    if (
+      !/^[a-f0-9-]{36}$/.test(String(worker.id)) ||
+      ids.has(String(worker.id))
+    )
+      throw new Error("Invalid or duplicate worker identity.");
+    ids.add(String(worker.id));
+    if (
+      !["issue", "review"].includes(String(worker.kind)) ||
+      ![
+        "starting",
+        "running",
+        "paused",
+        "awaiting_publication",
+        "awaiting_review",
+        "awaiting_merge",
+        "stopped",
+        "completed",
+        "failed",
+        "cleanup_failed",
+      ].includes(String(worker.status))
+    )
+      throw new Error("Invalid worker state.");
+    if (
+      !Number.isSafeInteger(worker.number) ||
+      Number(worker.number) < 1 ||
+      typeof worker.autoPost !== "boolean"
+    )
+      throw new Error("Invalid worker fields.");
+    if (
+      !Number.isFinite(Date.parse(String(worker.startedAt))) ||
+      !Number.isFinite(Date.parse(String(worker.updatedAt)))
+    )
+      throw new Error("Invalid worker timestamps.");
+    const repository = object(worker.repository);
+    if (!["github", "gitlab"].includes(String(repository.provider)))
+      throw new Error("Invalid saved repository provider.");
+    text(repository.apiUrl, "repository URL", 4096);
+    text(repository.projectPath, "repository path", 4096);
+    for (const key of [
+      "repositoryPath",
+      "worktreePath",
+      "branch",
+      "tabId",
+      "attemptId",
+      "changeUrl",
+      "headSha",
+      "feedbackDigest",
+      "error",
+    ])
+      if (worker[key] !== undefined) text(worker[key], key);
+    if (worker.attemptId && !/^[a-f0-9-]{36}$/.test(String(worker.attemptId)))
+      throw new Error("Invalid report identity.");
+    if (
+      worker.publicationState !== undefined &&
+      !["creating", "uncertain", "created"].includes(
+        String(worker.publicationState),
+      )
+    )
+      throw new Error("Invalid publication state.");
+    if (
+      worker.changeNumber !== undefined &&
+      (!Number.isSafeInteger(worker.changeNumber) ||
+        Number(worker.changeNumber) < 1)
+    )
+      throw new Error("Invalid change request number.");
+    if (worker.mergeAttempted !== undefined && (
+      worker.mergeAttempted !== true || worker.kind !== "issue" || !worker.changeNumber ||
+      typeof worker.headSha !== "string" || ![40, 64].includes(worker.headSha.length) || /[^a-f0-9]/i.test(worker.headSha)
+    ))
+      throw new Error("A saved merge attempt requires an issue worker with a published request and commit.");
+    const parsed = structuredClone(worker) as unknown as ForgeWorker;
+    if (worker.draft !== undefined) parsed.draft = parseSavedReview(worker.draft);
+    if (worker.autoReview !== undefined) {
+      if (worker.kind !== "issue") throw new Error("Only issue workers can have an automatic review loop.");
+      parsed.autoReview = parseAutoReview(worker.autoReview, parsed.id);
+    }
+    if (worker.issueWorkerId !== undefined) {
+      if (worker.kind !== "review") throw new Error("Only review workers can link to an issue worker.");
+      parsed.issueWorkerId = workerLink(worker.issueWorkerId, parsed.id);
+    }
+    if (worker.pendingPublication !== undefined) {
+      if (worker.kind !== "issue")
+        throw new Error("Only issue workers can have pending publication.");
+      parsed.pendingPublication = parsePendingPublication(worker.pendingPublication);
+      const update = parsed.pendingPublication.baseUpdate;
+      if (update && (!parsed.changeNumber || update.baseBranch !== parsed.baseBranch ||
+        parsed.headSha !== update.expectedHeadSha && parsed.headSha !== update.headSha))
+        throw new Error("Base update checkpoint must match the worker's published request and base branch.");
+    }
+    if (parsed.status === "awaiting_publication" && (
+      parsed.kind !== "issue" || !parsed.changeNumber || !parsed.repositoryPath ||
+      !parsed.worktreePath || !parsed.branch || !parsed.pendingPublication?.headSha ||
+      !parsed.pendingPublication.confirmationStartedAt ||
+      parsed.pendingPublication.confirmed ||
+      parsed.pendingPublication.replyingToDiscussionId || parsed.pendingPublication.repliedDiscussionIds.length
+    ))
+      throw new Error("Automatic publication confirmation requires an owned issue checkout and a pushed checkpoint without discussion mutations.");
+    if (parsed.status === "awaiting_merge" && (
+      parsed.kind !== "issue" || !parsed.autoReview?.enabled || parsed.autoReview.phase !== "merging" ||
+      !parsed.changeNumber || !parsed.headSha || !/^[a-f0-9]{40,64}$/i.test(parsed.headSha) ||
+      !parsed.repositoryPath?.trim() || !parsed.worktreePath?.trim() || !parsed.branch?.trim()
+    ))
+      throw new Error("Automatic merge requires an enabled merging issue loop with a published request and an owned checkout.");
+    return parsed;
+  });
+}

@@ -24,6 +24,7 @@ export interface CodexHomeOverlayOptions {
   resolved?: ResolvedPersonalityTemplate;
   baseEnv?: NodeJS.ProcessEnv;
   cwd?: string;
+  trustedProjectPath?: string;
   resetCodexHome?: boolean;
   sources: CodexStateSources;
   source: ResolvedCodexStateSource;
@@ -53,6 +54,13 @@ export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptio
   const sourceCodexHome = options.sources.originalHome;
   const sourceConfig = await options.sources.readConfig(options.source);
   const config = prepareOverlayConfig(sourceConfig, options.source.home);
+  if (options.trustedProjectPath !== undefined) {
+    const projectPath = options.trustedProjectPath;
+    if (!path.isAbsolute(projectPath) || projectPath !== options.cwd || await fsp.realpath(projectPath) !== projectPath) {
+      throw new Error("Project trust authorization must match the canonical working directory.");
+    }
+    trustProject(config, projectPath);
+  }
   const imagegen = await optionalLstat(path.join(sourceCodexHome, IMAGEGEN_SKILL_RELATIVE_PATH, "SKILL.md"));
   if (!imagegen?.isFile()) throw new Error("Required Codex imagegen skill is missing.");
   const codexHome = await options.sources.bind(options.tabId, options.source);
@@ -240,6 +248,15 @@ function prepareOverlayConfig(sourceConfig: string | undefined, sourceHome: stri
   }
   for (const name of ["features", "memories", "skills"]) tomlTable(config[name], name);
   return config;
+}
+
+function trustProject(config: TomlTable, projectPath: string): void {
+  const projects = tomlTable(config.projects, "projects");
+  const project = tomlTable(projects[projectPath], `projects.${projectPath}`);
+  if (project.trust_level === "untrusted") throw new Error("Codex source config explicitly marks this project as untrusted.");
+  if (project.trust_level !== undefined && project.trust_level !== "trusted") throw new Error("Codex project trust_level must be trusted or untrusted.");
+  projects[projectPath] = { ...project, trust_level: "trusted" };
+  config.projects = projects;
 }
 
 async function writeOverlayConfig(

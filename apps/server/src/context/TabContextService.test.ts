@@ -6,13 +6,14 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { WorkspaceTab } from "@cloudx/shared";
 
-import { appendTextFileNoFollow, openOwnedRegularFileNoFollow, openOwnedTextFileNoFollow, readTextFileNoFollow, requireRegularFile, requireSafeDirectory, writeTextFileAtomic } from "../jsonStateFile.js";
+import { appendTextFileNoFollow, openOwnedDirectoryNoFollow, openOwnedRegularFileNoFollow, openOwnedTextFileNoFollow, readTextFileNoFollow, requireRegularFile, requireSafeDirectory, writeTextFileAtomic } from "../jsonStateFile.js";
 import { TabContextService, type TabContextFileOperations } from "./TabContextService.js";
 
 const fileOperations: TabContextFileOperations = {
   appendTextFileNoFollow,
   openOwnedRegularFileNoFollow,
   openOwnedTextFileNoFollow,
+  openOwnedDirectoryNoFollow,
   readTextFileNoFollow,
   requireRegularFile,
   requireSafeDirectory,
@@ -20,6 +21,114 @@ const fileOperations: TabContextFileOperations = {
 };
 
 describe("TabContextService", () => {
+  it("keeps owned directory identity stable across bounded atomic log rotation", async () => {
+    await withOwnedContext(async ({ service, tab }) => {
+      const original = service.directory(tab.contextPath)!;
+      const fileBefore = await fs.stat(tab.contextPath!, { bigint: true });
+      const copy = service.directory(tab.contextPath)!;
+      copy.ino = "changed by caller";
+      expect(service.directory(tab.contextPath)).toEqual(original);
+      for (let index = 0; index < 10; index++) await service.record(tab, "terminal-output", `${index}: ${"🙂".repeat(4000)}`);
+      const fileAfter = await fs.stat(tab.contextPath!, { bigint: true });
+      expect(fileAfter.ino).not.toBe(fileBefore.ino);
+      expect(fileAfter.size).toBeLessThanOrEqual(64_000n);
+      expect(service.directory(tab.contextPath)).toEqual(original);
+      expect(await service.read(tab)).toContain("Trimmed to the latest 64000 bytes");
+      expect(await service.read(tab)).not.toContain("\uFFFD");
+      await service.delete(tab);
+      expect(service.directory(tab.contextPath)).toBeUndefined();
+      await expect(fs.stat(original.path)).rejects.toMatchObject({ code: "ENOENT" });
+    });
+  });
+
+  it.each(["directory", "symlink"])("preserves a replacement owned context %s during reads, writes and deletion", async replacement => {
+    await withOwnedContext(async ({ service, tab, root }) => {
+      const owned = service.directory(tab.contextPath)!;
+      await fs.rename(owned.path, path.join(root, "original-context"));
+      const outside = path.join(root, "replacement");
+      await fs.mkdir(outside);
+      if (replacement === "symlink") await fs.symlink(outside, owned.path, "dir");
+      else await fs.rename(outside, owned.path);
+      await fs.writeFile(tab.contextPath!, "replacement must survive");
+      await expect(service.read(tab)).rejects.toThrow(/ownership changed|symbolic link/);
+      await expect(service.record(tab, "terminal-output", "do not append")).rejects.toThrow(/ownership changed|symbolic link/);
+      await expect(service.delete(tab)).rejects.toThrow(/ownership changed|symbolic link/);
+      expect(await fs.readFile(tab.contextPath!, "utf8")).toBe("replacement must survive");
+      expect(service.directory(tab.contextPath)).toEqual(owned);
+    });
+  });
+
+  it("drains admitted writes and refuses new records while an owned context is being deleted", async () => {
+    let entered!: () => void;
+    const writing = new Promise<void>(resolve => { entered = resolve; });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let held = false;
+    await withOwnedContext(async ({ service, tab }) => {
+      const directory = service.directory(tab.contextPath)!;
+      const first = service.record(tab, "terminal-output", "first");
+      await writing;
+      const second = service.record(tab, "terminal-output", "second");
+      const deletion = service.delete(tab);
+      const late = service.record(tab, "terminal-output", "after deletion admission");
+      const reading = service.read(tab);
+      release();
+      await Promise.all([first, second, deletion, late]);
+      expect(await reading).toBe("");
+      expect(service.directory(tab.contextPath)).toBeUndefined();
+      await expect(fs.stat(directory.path)).rejects.toMatchObject({ code: "ENOENT" });
+    }, {
+      openOwnedDirectoryNoFollow: async (...args) => {
+        const directory = await openOwnedDirectoryNoFollow(...args);
+        if (args[3] && !held) { held = true; entered(); await gate; }
+        return directory;
+      }
+    });
+  });
+
+  it("does not adopt preexisting owned directories or paths from another service", async () => {
+    await withOwnedContext(async ({ service, tab, dataDir }) => {
+      await expect(service.create(tab, { ownedDirectory: true })).rejects.toMatchObject({ code: "EEXIST" });
+      const other = new TabContextService(dataDir);
+      expect(other.directory(tab.contextPath)).toBeUndefined();
+      await expect(other.read(tab)).rejects.toThrow("directly within");
+      await expect(other.delete(tab)).rejects.toThrow("directly within");
+      expect(await service.read(tab)).toContain("Cloudx Tab Context");
+    });
+  });
+
+  it.each(["symlink", "hardlink", "directory", "oversize"])("rejects unsafe owned context file type or size: %s", async kind => {
+    await withOwnedContext(async ({ service, tab, root }) => {
+      const outside = path.join(root, "outside.txt");
+      await fs.writeFile(outside, "outside must survive");
+      await fs.unlink(tab.contextPath!);
+      if (kind === "symlink") await fs.symlink(outside, tab.contextPath!);
+      if (kind === "hardlink") await fs.link(outside, tab.contextPath!);
+      if (kind === "directory") await fs.mkdir(tab.contextPath!);
+      if (kind === "oversize") await fs.writeFile(tab.contextPath!, "x".repeat(128_001));
+      await expect(service.read(tab)).rejects.toThrow();
+      await expect(service.record(tab, "terminal-output", "must not append")).rejects.toThrow();
+      expect(await fs.readFile(outside, "utf8")).toBe("outside must survive");
+    });
+  });
+
+  it("cleans its newly owned directory when context creation runs out of space", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-owned-context-capacity-"));
+    const service = new TabContextService(root);
+    const originalWrite = fs.writeFile.bind(fs);
+    const write = vi.spyOn(fs, "writeFile").mockImplementation(async (...args) => {
+      await originalWrite(...args);
+      if (String(args[0]).endsWith("/context.md")) throw capacityError();
+    });
+    try {
+      await expect(service.create(tabFixture(root), { ownedDirectory: true })).resolves.toBeUndefined();
+      expect(await fs.readdir(path.join(root, "context"))).toEqual([]);
+    } finally {
+      write.mockRestore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("creates context files and records sanitized events", async () => {
     const { service, tab } = await createContext();
 
@@ -288,4 +397,15 @@ function tabFixture(root: string, id = "tab-1"): WorkspaceTab {
 
 function capacityError(): Error & { code: string } {
   return Object.assign(new Error("no space left on device"), { code: "ENOSPC" });
+}
+
+async function withOwnedContext(run: (fixture: { root: string; dataDir: string; service: TabContextService; tab: WorkspaceTab }) => Promise<void>, files: Partial<TabContextFileOperations> = {}): Promise<void> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-owned-context-"));
+  const dataDir = path.join(root, "data");
+  const service = new TabContextService(dataDir, { ...fileOperations, ...files });
+  const tab = tabFixture(root);
+  try {
+    tab.contextPath = await service.create(tab, { ownedDirectory: true });
+    await run({ root, dataDir, service, tab });
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
 }

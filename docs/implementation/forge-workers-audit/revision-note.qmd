@@ -1,0 +1,25 @@
+---
+title: "Forge worker terminal overlay revision"
+format:
+  html:
+    toc: true
+    number-sections: true
+  docx:
+    toc: true
+  gfm:
+    variant: +yaml_metadata_block
+---
+
+## Current revision: closable worker terminal overlay
+
+**View worker** opens the existing worker terminal above the current Forge section. **X** dismisses only the view; reopening returns to the same terminal. Worker tabs and controls remain inside Forge.
+
+The native modal dialog manages focus. Escape stays with the terminal while it has focus; Escape from the close control dismisses the overlay and returns focus to its opener.
+
+A terminal resize after exit no longer stops the server. Known closed-terminal resizes are ignored; exact descriptor-race handling does not mark the process stopped. Unexpected terminal command errors close only the affected socket.
+
+This revision passed 84 focused web tests and 231 server tests. `npm run typecheck`, `npm run build` and 12 shipped-shell browser checks also passed. Desktop and mobile browser fixtures verified close/reopen, retained output and connection, focus and Escape/Tab input, without lifecycle commands, page errors or horizontal overflow.
+
+The restarted preview passed overlay open/close/reopen checks while the issue worker stayed awaiting review. Its earlier terminal session was unavailable, so that live check did not exercise xterm continuity or send worker input. The production-component browser fixture and real PTY regressions cover terminal continuity separately.
+
+The previous directory-trust and recovery revision passed 2,359 tests in 120 files and 12 shipped-shell browser checks. These remain previous-revision evidence; the overlay uses focused UI, server and browser checks.

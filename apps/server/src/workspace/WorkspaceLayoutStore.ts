@@ -72,6 +72,7 @@ export class WorkspaceLayoutStore {
   private windows: WorkspaceWindow[];
   private templates: WorkspaceLayoutTemplate[];
   private readonly listeners = new Set<() => void>();
+  private readonly embeddedTabIds = new Set<string>();
   private readonly persistenceListeners = new Set<(status: StatePersistenceStatus) => void>();
   private persistence: StatePersistenceStatus;
 
@@ -109,7 +110,7 @@ export class WorkspaceLayoutStore {
         await this.persist();
       }
       return {
-        activeTabId,
+        activeTabId: tabs.some((tab) => tab.id === activeTabId && tab.ownerPluginId) || this.embeddedTabIds.has(activeTabId ?? "") ? undefined : activeTabId,
         tabs,
         activeWindowId: this.activeWindowId,
         windows: this.windows,
@@ -117,6 +118,14 @@ export class WorkspaceLayoutStore {
         persistence: [this.persistenceStatus()]
       };
     });
+  }
+
+  registerEmbeddedTab(tabId: string): void {
+    this.embeddedTabIds.add(tabId);
+  }
+
+  unregisterEmbeddedTab(tabId: string): void {
+    this.embeddedTabIds.delete(tabId);
   }
 
   snapshot(): Pick<WorkspaceStateResponse, "activeWindowId" | "windows" | "templates" | "persistence"> {
@@ -186,6 +195,7 @@ export class WorkspaceLayoutStore {
         if (!isUsableTabLayoutState(input.layout)) {
           throw new Error("Invalid workspace window layout.");
         }
+        this.assertTopLevelLayout(input.layout);
         patch.layout = input.layout;
       }
       const current = this.getWindow(windowId);
@@ -210,6 +220,7 @@ export class WorkspaceLayoutStore {
 
   async applyLayoutInstruction(instruction: WorkspaceLayoutInstruction): Promise<void> {
     return this.serializeWorkspaceAccess(async () => {
+      if ("tabId" in instruction) this.assertTopLevelTab(instruction.tabId);
       if (instruction.type === "select_window") {
         const window = instruction.windowId ? this.findWindow(instruction.windowId) : undefined;
         if (window) {
@@ -255,6 +266,7 @@ export class WorkspaceLayoutStore {
 
   async placeTabAndPublish<T>(input: WorkspaceTabPlacement, publish: () => T): Promise<{ published: T; window: WorkspaceWindow }> {
     return this.serializeWorkspaceAccess(async () => {
+      this.assertTopLevelTab(input.tabId);
       this.requireTabPlacementTarget(input.windowId, input.paneId);
 
       const now = new Date().toISOString();
@@ -535,7 +547,7 @@ export class WorkspaceLayoutStore {
   }
 
   private reconcileTabs(tabs: WorkspaceTab[]): boolean {
-    const known = new Set(tabs.map((tab) => tab.id));
+    const known = new Set(tabs.filter((tab) => !tab.ownerPluginId && !this.embeddedTabIds.has(tab.id)).map((tab) => tab.id));
     let changed = false;
     this.windows = this.windows.map((window) => {
       const layout = filterLayoutTabs(window.layout, known);
@@ -554,6 +566,7 @@ export class WorkspaceLayoutStore {
   }
 
   private async commitWorkspaceAndPublish<T>(state: WorkspacePersistenceState, publish: () => T): Promise<T> {
+    for (const window of state.windows) this.assertTopLevelLayout(window.layout);
     const priorState = this.persistenceState();
     await this.persist(true, state);
     this.replaceState(state);
@@ -567,6 +580,16 @@ export class WorkspaceLayoutStore {
       }
       this.replaceState(priorState);
       throw publicationError;
+    }
+  }
+
+  private assertTopLevelTab(tabId: string): void {
+    if (this.embeddedTabIds.has(tabId)) throw new Error("An embedded session cannot be placed in a workspace pane.");
+  }
+
+  private assertTopLevelLayout(layout: TabLayoutState): void {
+    for (const pane of listTabLayoutPanes(layout.root)) {
+      for (const tabId of pane.tabIds) this.assertTopLevelTab(tabId);
     }
   }
 

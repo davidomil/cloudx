@@ -3,11 +3,12 @@ import os from "node:os";
 import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { parse } from "smol-toml";
+import { parse, stringify } from "smol-toml";
 
-import type { TabIndicatorUpdate, WorkspaceTab } from "@cloudx/shared";
+import { CODEX_REASONING_EFFORTS, type TabIndicatorUpdate, type WorkspaceTab } from "@cloudx/shared";
+import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
 
-import { CLOUDX_CODEX_DEFAULT_ARGS, CODEX_TERMINAL_ACTIONS, CodexTerminalPlugin, CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES, TERMINAL_ACTIONS, TerminalShellIntegrationParser, buildCodexLaunchArgs, codexResumeInput, materializeCodexTemplate } from "./CodexTerminalPlugin.js";
+import { CLOUDX_CODEX_DEFAULT_ARGS, CODEX_CLOSE_ON_EXIT_GRACE_MS, CODEX_TERMINAL_ACTIONS, CodexTerminalPlugin, CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES, TERMINAL_ACTIONS, TerminalShellIntegrationParser, buildCodexLaunchArgs, codexResumeInput, materializeCodexTemplate } from "./CodexTerminalPlugin.js";
 import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
 import { CodexStateSources } from "./CodexStateSources.js";
 
@@ -42,6 +43,8 @@ class FakeTerminalProcess implements TerminalProcess {
     this.killed = true;
     this.exitListener?.({ exitCode: 130 });
   }
+
+  async terminate(): Promise<void> { this.kill(); }
 
   emitData(data: string): void {
     for (const listener of this.dataListeners) {
@@ -83,6 +86,120 @@ const tab: WorkspaceTab = {
 };
 
 describe("CodexTerminalPlugin", () => {
+  it.each([
+    [17, "failed", "Terminal exited with code 17."],
+    [0, "completed", "Terminal exited cleanly."]
+  ] as const)("retains exit code %s and its detail before status observers subscribe", async (exitCode, status, statusMessage) => {
+    const process = new FakeTerminalProcess();
+    const session = new CodexTerminalSession(tab, process);
+    process.exit(exitCode);
+
+    expect(session.snapshot()).toMatchObject({ status, statusMessage });
+    const observer = vi.fn();
+    session.onStatusChange(observer);
+    await session.handleAction("stop", {});
+    expect(observer).toHaveBeenCalledWith("stopped", "Terminal was stopped.");
+    expect(session.snapshot()).toMatchObject({ status: "stopped", statusMessage: "Terminal was stopped." });
+  });
+
+  it.each([0, 1])("retains an owned session after exit code %s until its owner verifies termination", async (exitCode) => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const closeTab = vi.fn();
+      const session = await plugin.createSession({
+        tab: { ...tab, ownerPluginId: "forge" }, cwd: root,
+        controls: { setTabIndicator: () => undefined, closeTab }
+      });
+      vi.spyOn(Date, "now").mockReturnValue(Date.now() + CODEX_CLOSE_ON_EXIT_GRACE_MS + 1);
+      factory.process!.exit(exitCode);
+
+      expect(closeTab).not.toHaveBeenCalled();
+      expect(session.snapshot().status).toBe(exitCode === 0 ? "completed" : "failed");
+      const terminate = vi.spyOn(factory.process!, "terminate");
+      await expect(session.handleAction("stop", {})).resolves.toEqual({ stopped: true });
+      expect(terminate).toHaveBeenCalledOnce();
+      expect(session.snapshot().status).toBe("stopped");
+      expect(closeTab).not.toHaveBeenCalled();
+    });
+  });
+
+  it("automatically closes a public Codex session after normal exit", async () => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const closeTab = vi.fn();
+      await plugin.createSession({ tab, cwd: root, controls: { setTabIndicator: () => undefined, closeTab } });
+      vi.spyOn(Date, "now").mockReturnValue(Date.now() + CODEX_CLOSE_ON_EXIT_GRACE_MS + 1);
+      factory.process!.exit(0);
+
+      expect(closeTab).toHaveBeenCalledExactlyOnceWith("Codex exited cleanly.");
+    });
+  });
+
+  it("trusts only the authorized project in its overlay and reauthorizes template updates", async () => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      const authorizeProjectTrust = vi.fn(async () => root);
+      const original = stringify({ projects: { "/other-project": { trust_level: "untrusted" } } });
+      await fs.writeFile(path.join(home, "config.toml"), original);
+      const session = await plugin.createSession({ tab, cwd: root, authorizeProjectTrust, controls: { setTabIndicator: () => undefined, closeTab: () => undefined } });
+      const configPath = path.join(factory.env!.CODEX_HOME!, "config.toml");
+      const expectedProjects = { "/other-project": { trust_level: "untrusted" }, [root]: { trust_level: "trusted" } };
+      expect(parse(await fs.readFile(configPath, "utf8")).projects).toEqual(expectedProjects);
+      await session.applyRuntimeContext!({});
+      expect(authorizeProjectTrust).toHaveBeenCalledTimes(2);
+      expect(parse(await fs.readFile(configPath, "utf8")).projects).toEqual(expectedProjects);
+      expect(await fs.readFile(path.join(home, "config.toml"), "utf8")).toBe(original);
+      expect(factory.spawns).toBe(1);
+      expect(factory.args?.join(" ")).toContain("--yolo");
+      authorizeProjectTrust.mockRejectedValueOnce(new Error("Repository consent was revoked."));
+      await expect(session.applyRuntimeContext!({})).rejects.toThrow("Repository consent was revoked.");
+      session.stop?.();
+    });
+  });
+
+  it.each(["untrusted", "invalid-table", "invalid-project", "invalid-trust"])("refuses project trust when source policy is %s", async (policy) => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      const project = policy === "invalid-project" ? "invalid" : { trust_level: policy === "invalid-trust" ? "invalid" : "untrusted" };
+      const original = stringify({ projects: policy === "invalid-table" ? "invalid" : { [root]: project } });
+      await fs.writeFile(path.join(home, "config.toml"), original);
+      const creation = plugin.createSession({ tab, cwd: root, authorizeProjectTrust: async () => root, controls: { setTabIndicator: () => undefined, closeTab: () => undefined } });
+      await expect(creation).rejects.toThrow(policy === "untrusted" || policy === "invalid-trust" ? /untrusted/ : /TOML table/);
+      await expect(creation).rejects.toBeInstanceOf(PluginSessionNotStartedError);
+      expect(factory.spawns).toBe(0);
+      expect(await fs.readFile(path.join(home, "config.toml"), "utf8")).toBe(original);
+    });
+  });
+
+  it("identifies a rejected trust grant as a session that never started", async () => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const cause = new Error("Repository consent is required.");
+      const creation = plugin.createSession({ tab, cwd: root, authorizeProjectTrust: async () => { throw cause; }, controls: { setTabIndicator: () => undefined, closeTab: () => undefined } });
+      await expect(creation).rejects.toBeInstanceOf(PluginSessionNotStartedError);
+      await expect(creation).rejects.toMatchObject({ message: cause.message, cause });
+      expect(factory.spawns).toBe(0);
+    });
+  });
+
+  it("rejects a trust grant for a different directory before starting Codex", async () => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      await expect(plugin.createSession({ tab, cwd: root, authorizeProjectTrust: async () => path.dirname(root), controls: { setTabIndicator: () => undefined, closeTab: () => undefined } })).rejects.toThrow(/working directory/);
+      expect(factory.spawns).toBe(0);
+    });
+  });
+
+  it("leaves ordinary and spoofed Codex launches without a project trust grant", async () => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const session = await plugin.createSession({
+        tab: { ...tab, pluginMetadata: { "forge-workers": { workerId: "spoofed", trustedProjectPath: root } } },
+        cwd: root, initialInput: { trustedProjectPath: root, authorizeProjectTrust: root },
+        controls: { setTabIndicator: () => undefined, closeTab: () => undefined }
+      });
+      expect(parse(await fs.readFile(path.join(factory.env!.CODEX_HOME!, "config.toml"), "utf8")).projects).toBeUndefined();
+      session.stop?.();
+    });
+  });
+
+  it("requires an isolated Codex overlay to authorize project trust", async () => {
+    await expect(materializeCodexTemplate(undefined, {}, { cwd: "/tmp", authorizeProjectTrust: async () => "/tmp" })).rejects.toThrow(/overlay/);
+  });
+
   it.each(["config", "binding"])("settles a launch deadline while %s open is held, without later writes or spawn", async (stage) => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-held-launch-"));
     const home = path.join(root, "home");
@@ -522,6 +639,48 @@ describe("CodexTerminalPlugin", () => {
     }
   });
 
+  it.each(["xhigh", "max"])("launches the selected model with %s effort above inherited Codex preferences", async (reasoningEffort) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-model-selection-"));
+    const home = path.join(root, "home");
+    await seedImagegenSkill(home);
+    const inherited = 'model = "gpt-5.3-codex"\nmodel_reasoning_effort = "medium"\n';
+    await fs.writeFile(path.join(home, "config.toml"), inherited);
+    vi.stubEnv("CODEX_HOME", home);
+    vi.stubEnv("SHELL", "/bin/bash");
+    vi.stubEnv("CLOUDX_ASSISTANT_BIN", "/usr/bin/codex");
+    const factory = new CapturingFactory();
+    const plugin = new CodexTerminalPlugin(factory, DEFAULT_TERMINAL_REPLAY_BYTES, path.join(root, "data"));
+    try {
+      const session = await plugin.createSession({ tab, cwd: root, controls: { setTabIndicator: () => undefined, closeTab: () => undefined }, initialInput: { model: "gpt-6-astra", reasoningEffort, prompt: "Inspect the assigned work." } });
+      expect(factory.spawns).toBe(1);
+      expect(factory.command).toBe("/bin/bash");
+      expect(factory.args?.[1]).toContain(`--model gpt-6-astra --config 'model_reasoning_effort="${reasoningEffort}"' -- 'Inspect the assigned work.'`);
+      expect(parse(await fs.readFile(path.join(factory.env!.CODEX_HOME!, "config.toml"), "utf8"))).toMatchObject({ model: "gpt-5.3-codex", model_reasoning_effort: "medium" });
+      expect(await fs.readFile(path.join(home, "config.toml"), "utf8")).toBe(inherited);
+      session.stop?.();
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    { model: "" }, { model: "bad model" }, { model: "-model" }, { model: "a".repeat(129) }, { model: "bad\0model" }, { model: "x;command" }, { model: 42 }, { model: null },
+    { reasoningEffort: "" }, { reasoningEffort: "MAX" }, { reasoningEffort: "none" }, { reasoningEffort: "bad\0effort" }, { reasoningEffort: 42 }, { reasoningEffort: null }
+  ])("rejects invalid model preferences %j before overlay work or spawning", async (initialInput) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-invalid-model-selection-"));
+    const data = path.join(root, "data");
+    const factory = new CapturingFactory();
+    const plugin = new CodexTerminalPlugin(factory, DEFAULT_TERMINAL_REPLAY_BYTES, data);
+    const authorizeProjectTrust = vi.fn(async () => { throw new Error("Unexpected overlay work"); });
+    try {
+      const creation = plugin.createSession({ tab, cwd: root, authorizeProjectTrust, controls: { setTabIndicator: () => undefined, closeTab: () => undefined }, initialInput });
+      await expect(creation).rejects.toBeInstanceOf(PluginSessionNotStartedError);
+      await expect(creation).rejects.toThrow(/Codex (model|reasoning effort)/);
+      await expect(creation).rejects.toMatchObject({ cause: expect.any(Error) });
+      expect(authorizeProjectTrust).not.toHaveBeenCalled();
+      expect(factory.spawns).toBe(0);
+      await expect(fs.stat(data)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
   it("preserves a legacy profile selector in projection only, without claiming native acceptance", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-profile-projection-"));
     const codexHome = path.join(root, "base");
@@ -706,6 +865,47 @@ describe("CodexTerminalPlugin", () => {
     for (const sourceId of ["shared", "legacy:b2xkLWE", "", null]) {
       expect(() => codexResumeInput({ resume: { mode: "picker", sourceId } })).toThrow(/no longer supported/);
     }
+  });
+
+  it("passes an initial prompt as one positional argument without interpreting control text", () => {
+    const prompt = "Review this change\nKeep `literal` and $(text) intact.";
+    expect(buildCodexLaunchArgs(["--yolo"], { prompt })).toEqual(["--yolo", "--", prompt]);
+    expect(buildCodexLaunchArgs([], { prompt, resume: { mode: "session", sessionId: "owned-session" } })).toEqual(["resume", "owned-session", "--", prompt]);
+    expect(() => buildCodexLaunchArgs([], { prompt: "\0bad" })).toThrow("without null bytes");
+    expect(() => buildCodexLaunchArgs([], { prompt: 123 })).toThrow("non-empty string");
+    expect(() => buildCodexLaunchArgs([], { prompt, resume: { mode: "last" } })).toThrow("exact session id");
+  });
+
+  it.each(CODEX_REASONING_EFFORTS)("puts explicit %s effort and model before resume and prompt arguments", (reasoningEffort) => {
+    const base = ["--add-dir", "/tmp/rules"];
+    const options = { model: "gpt-6-astra", reasoningEffort };
+    const flags = ["--model", "gpt-6-astra", "--config", `model_reasoning_effort="${reasoningEffort}"`];
+    expect(buildCodexLaunchArgs(base, options)).toEqual([...base, ...flags]);
+    expect(buildCodexLaunchArgs(base, { ...options, prompt: "Do the work" })).toEqual([...base, ...flags, "--", "Do the work"]);
+    expect(buildCodexLaunchArgs(base, { ...options, resume: { mode: "last" } })).toEqual([...base, ...flags, "resume", "--last"]);
+    expect(buildCodexLaunchArgs(base, { ...options, resume: { mode: "session", sessionId: "owned-session" }, prompt: "Continue" })).toEqual([...base, ...flags, "resume", "owned-session", "--", "Continue"]);
+    expect(base).toEqual(["--add-dir", "/tmp/rules"]);
+  });
+
+  it("leaves omitted preferences inherited and supports independent model or effort choices", () => {
+    expect(buildCodexLaunchArgs(["--yolo"])).toEqual(["--yolo"]);
+    expect(buildCodexLaunchArgs([], { model: "provider/model:version-1.0" })).toEqual(["--model", "provider/model:version-1.0"]);
+    expect(buildCodexLaunchArgs([], { model: "a".repeat(128) })).toEqual(["--model", "a".repeat(128)]);
+    expect(buildCodexLaunchArgs([], { reasoningEffort: "max" })).toEqual(["--config", 'model_reasoning_effort="max"']);
+  });
+
+  it("does not acknowledge stop until the terminal process tree is quiescent", async () => {
+    const process = new FakeTerminalProcess();
+    let finish!: () => void;
+    process.terminate = () => new Promise<void>((resolve) => { finish = resolve; });
+    const session = new CodexTerminalSession(tab, process);
+    let completed = false;
+    const stopped = Promise.resolve(session.handleAction("stop", {})).then((result) => { completed = true; return result; });
+    await Promise.resolve();
+    expect(completed).toBe(false);
+    finish();
+    await expect(stopped).resolves.toEqual({ stopped: true });
+    expect(session.snapshot().status).toBe("stopped");
   });
 
   it("exposes Codex readiness waiting only on Codex terminal actions", () => {
@@ -1015,6 +1215,22 @@ describe("CodexTerminalSession", () => {
     expect(process.resizes).toEqual([[120, 40]]);
   });
 
+  it.each(["exit", "stop", "awaited stop"])("retains terminal replay without resizing the process after %s", async (end) => {
+    const process = new FakeTerminalProcess();
+    const session = new CodexTerminalSession(tab, process);
+    process.emitData("Finished work.\n");
+    if (end === "exit") process.exit(0);
+    else if (end === "stop") session.stop();
+    else await session.handleAction("stop", {});
+    const resize = vi.spyOn(process, "resize").mockImplementation(() => { throw new Error("ioctl(2) failed, ENOTTY"); });
+
+    expect(() => session.resize(120, 40)).not.toThrow();
+    expect(resize).not.toHaveBeenCalled();
+    expect(session.snapshot().recentOutput).toBe("Finished work.\n");
+    expect(session.snapshot().status).toBe(end === "exit" ? "completed" : "stopped");
+    expect(() => session.resize(0, 40)).toThrow("cols must be a positive integer.");
+  });
+
   it("exposes terminal output through standardized voice context", () => {
     const process = new FakeTerminalProcess();
     const session = new CodexTerminalSession(tab, process, undefined, {
@@ -1174,6 +1390,23 @@ async function seedImagegenSkill(codexHome: string): Promise<void> {
   await fs.mkdir(path.join(skillDir, "scripts"), { recursive: true });
   await fs.writeFile(path.join(skillDir, "SKILL.md"), "---\nname: imagegen\ndescription: Generate images.\n---\n\nImage generation instructions.\n", "utf8");
   await fs.writeFile(path.join(skillDir, "scripts", "image_gen.py"), "# imagegen helper\n", "utf8");
+}
+
+async function withProjectTrustFixture(run: (fixture: { root: string; home: string; factory: CapturingFactory; plugin: CodexTerminalPlugin }) => Promise<void>): Promise<void> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cloudx-project."trust-'));
+  const home = path.join(root, "codex-home");
+  const data = path.join(root, "data");
+  await seedImagegenSkill(home);
+  vi.stubEnv("CODEX_HOME", home);
+  const sources = new CodexStateSources(data, { CODEX_HOME: home });
+  const factory = new CapturingFactory();
+  try {
+    await run({ root, home, factory, plugin: new CodexTerminalPlugin(factory, undefined, data, sources) });
+  } finally {
+    factory.process?.kill();
+    await sources.dispose();
+    await fs.rm(root, { recursive: true, force: true });
+  }
 }
 
 async function seedExternalSkill(skillsRoot: string, id: string): Promise<string> {

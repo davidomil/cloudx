@@ -1,0 +1,89 @@
+Forge managed-repository and connection revision verification, 2026-09-07 UTC
+
+These records describe the replacement of local checkout/manual credentials. Earlier verification-runs.txt records describe the preceding delivery.
+Exact commands and selected stdout/stderr follow. Workspace paths are normalized; original log SHA256 values preserve provenance.
+
+[remote-full]
+Command: npx vitest run --maxWorkers=2 --reporter=dot
+Original log: cloudx-forge-remote-full-tests.log
+Original SHA256: 91a5b0b9a67c61f63370de604e90c1297592ea6929237019cc648f4125ebac55
+Result: Passed: 120 files, 2305 tests. This full run includes the managed-checkout and connection implementation.
+L1903:  Test Files  120 passed (120)
+L1904:       Tests  2305 passed (2305)
+L1905:    Start at  22:32:54
+L1906:    Duration  45.68s (transform 2.91s, setup 0ms, import 4.99s, tests 72.94s, environment 5.14s)
+
+[remote-typecheck]
+Command: npm run typecheck
+Original log: cloudx-forge-remote-typecheck.log
+Original SHA256: d6fdb8056eb56fed4465fd25d8416b553845d2700d9f61d587c4266d95595a5f
+Result: Passed; root confirmed successful completion.
+L2: > cloudx@0.1.3 typecheck
+L3: > tsc -b
+
+[remote-build]
+Command: npm run build
+Original log: cloudx-forge-remote-build.log
+Original SHA256: e6ec2ad7bb8130504590055ed6740082eb72b2646e26b68173e07cc337b8befe
+Result: Passed; all workspace builds completed. Existing AutomationPanel chunk-size warning remains.
+L2: > cloudx@0.1.3 build
+L3: > npm run build --workspaces --if-present
+L6: > @cloudx/shared@0.1.3 build
+L7: > tsc -p tsconfig.json
+L10: > @cloudx/plugin-api@0.1.3 build
+L11: > tsc -p tsconfig.json
+L14: > @cloudx/server@0.1.3 build
+L15: > tsc -p tsconfig.json
+L18: > @cloudx/web@0.1.3 build
+L19: > tsc -b && vite build
+L50: ✓ built in 369ms
+L52: (!) Some chunks are larger than 500 kB after minification. Consider:
+
+[connection-ui]
+Command: npx vitest run apps/web/src/ui/ForgeConnections.test.ts apps/web/src/ui/SettingsDialog.forge.test.ts apps/web/src/ui/SettingsDialog.test.ts apps/web/src/api.forge.test.ts apps/web/src/ui/ForgePanel.test.ts apps/web/src/ui/App.test.ts apps/web/src/api.test.ts --reporter=dot
+Original log: forge-connections-ui-tests.log
+Original SHA256: 1ba3a505198ac447ccc95ee1f767c9ca5501d107b9189c73e826ff1a85c7143a
+Result: Passed: 7 files, 128 tests.
+L6:  Test Files  7 passed (7)
+L7:       Tests  128 passed (128)
+L8:    Start at  22:29:26
+L9:    Duration  846ms (transform 444ms, setup 0ms, import 935ms, tests 610ms, environment 1.04s)
+
+[prerequisite-copy]
+Command: npx vitest run apps/web/src/ui/ForgeConnections.test.ts --reporter=dot
+Original log: forge-connections-prerequisite-tests.log
+Original SHA256: 10ccbbab4c30fa0e6bea6d0d9470343eb6058f7726a6e8284958ff0612b49f2b
+Result: Passed: 1 file, 19 tests. This run includes the later GitLab 18.11 prerequisite text and assertion.
+L6:  Test Files  1 passed (1)
+L7:       Tests  19 passed (19)
+L8:    Start at  22:34:39
+L9:    Duration  585ms (transform 57ms, setup 0ms, import 86ms, tests 99ms, environment 331ms)
+
+[connection-browser]
+Command: node /tmp/forge-connections-browser.mjs
+Executed script SHA256: 18e0f7c8c86c6ccc10e32fe7eff301da19a5f15f627a0781601cbaf1b890a8a8
+Result: Passed in Chromium at 1280x1000 and 390x844 using production SettingsDialog and connection components with deterministic endpoint/provider fixtures.
+Observed: exactly one GitHub consent window; real form POST with manifest; popup opener null; server-status refresh; provider default API switch; save-first protection; both GitLab identities connected and setup-token input removed; no page errors or horizontal overflow.
+This browser run preceded the final prerequisite copy change. The temporary Vite fixture was removed and its server stopped; the live-provider network flow was not exercised.
+Screenshot originals and SHA256:
+github-connections-desktop.png: 2f8c1da732208d304f33493a4abcf5a8afa27ac6dd724403be496689640544e6
+github-connections-mobile.png: 9d39afdee5a5d9e5e142fde2e3e8cc70896d5ba72a6a55b1c7415bf085f63c6e
+github-desktop.png: 6f3d7c66d5454501113bd686adc55f73779e092d5ad61b9e110557e11c3cd0d5
+github-mobile.png: ae33b4a3b1e01fb792badee7364ea9af7a136e208fc6ba0a2b8bcac903830948
+gitlab-connections-desktop.png: e6d7e54918a3b9e171df1373a16b8133448bf424c3131d1bd89e638126fc6cb3
+gitlab-connections-mobile.png: 502b5cd69e0b951fbf40209c9f5b9d4d3311ff338be1426bd3606ae81cdc5b2f
+gitlab-desktop.png: 4d3791fea43d3f3e157b9184bb000af657956dea8c65c8d822f33009e256d14b
+gitlab-mobile.png: 7d095f4f5b60a9a5671780ad5b10406a487261d315d1fbecba8824f90f9f159c
+
+[shipped-shell-browser]
+Command: npx playwright test --reporter=line
+Original log: cloudx-forge-remote-browser-smoke.log
+Original SHA256: 26074dc7e5ee4d3985e41f90d867ea7065eb04782ef647569228e15415aba28c
+Result: 12 passed (10.1s)
+
+[preview-browser]
+Command: node /tmp/cloudx-forge-remote-preview-browser.mjs
+Original log: cloudx-forge-remote-preview-browser.log
+Original SHA256: 7e19d98eea5ae5e9cea945cfd2e5e3fed58a541445c144f256ffc9da13a45f3c
+Result: Built preview passed desktop/mobile settings checks; removed local-path/manual-credential inputs, GitHub connection controls, masked temporary GitLab token, GitLab 18.11 prerequisite, save-first gating, no page errors or horizontal overflow, Cancel retained the persisted configuration. No provider registration was performed.
+Executed script SHA256: 80e435d7cec8275d9ef7c64928d1f61dc36f2a11c3633e962ac9aaffce3751a4

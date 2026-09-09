@@ -61,7 +61,8 @@ export function isStoredLayout(value: unknown): value is WorkspaceLayout {
 }
 
 export function reconcileLayout(current: WorkspaceLayout, tabs: WorkspaceTab[], activeTabId?: string): WorkspaceLayout {
-  const knownTabs = new Set(tabs.map((tab) => tab.id));
+  const workspaceTabs = tabs.filter((tab) => !tab.ownerPluginId);
+  const knownTabs = new Set(workspaceTabs.map((tab) => tab.id));
   const assignedTabs = new Set<string>();
   let nextRoot = mapPanes(current.root, (pane) => {
     const tabIds = pane.tabIds.filter((tabId) => {
@@ -78,7 +79,7 @@ export function reconcileLayout(current: WorkspaceLayout, tabs: WorkspaceTab[], 
     };
   });
 
-  const unassignedTabIds = tabs.map((tab) => tab.id).filter((tabId) => !assignedTabs.has(tabId));
+  const unassignedTabIds = workspaceTabs.map((tab) => tab.id).filter((tabId) => !assignedTabs.has(tabId));
   if (unassignedTabIds.length > 0) {
     const targetPaneId = firstPaneId(nextRoot);
     nextRoot = updatePane(nextRoot, targetPaneId, (pane) => {

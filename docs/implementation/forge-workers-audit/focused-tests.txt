@@ -1,0 +1,12 @@
+
+> cloudx@0.1.3 test
+> vitest run apps/server/src/forge/ForgeRuntime.test.ts apps/server/src/forge/ForgeWorkflowStore.test.ts apps/server/src/plugins/ForgePlugin.test.ts apps/web/src/ui/ForgePanel.test.ts
+
+
+ RUN  v4.1.6 <worktree>
+
+
+ Test Files  4 passed (4)
+      Tests  49 passed (49)
+   Start at  21:14:23
+   Duration  1.54s (transform 218ms, setup 0ms, import 393ms, tests 1.74s, environment 329ms)

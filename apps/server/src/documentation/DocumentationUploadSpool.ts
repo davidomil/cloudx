@@ -125,6 +125,7 @@ async function nextUploadChunk<T>(
   signal?: AbortSignal
 ): Promise<IteratorResult<T>> {
   if (signal?.aborted) {
+    (body as NodeJS.ReadableStream & { destroy(error?: Error): void }).destroy();
     throw signal.reason;
   }
   let timeout: NodeJS.Timeout | undefined;

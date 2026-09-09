@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { reapDocumentationUploadSpool, spoolDocumentationUpload } from "./DocumentationUploadSpool.js";
 
@@ -44,20 +44,131 @@ describe("DocumentationUploadSpool", () => {
     await expect(fs.readdir(root)).resolves.toEqual([]);
   });
 
-  it("removes a partial private spool before an admission-owned abort settles", async () => {
+  it.each(["before setup", "during setup"])("closes an upload cancelled %s without emitting another error", async (when) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-documentation-spool-setup-abort-"));
+    const body = new PassThrough();
+    const controller = new AbortController();
+    const stopped = new Error("Documentation ingest queue was stopped.");
+    const emittedErrors: Error[] = [];
+    body.on("error", (error) => emittedErrors.push(error));
+    const closed = new Promise<void>((resolve) => body.once("close", resolve));
+    if (when === "before setup") controller.abort(stopped);
+    const upload = spoolDocumentationUpload(body, root, 12, 12, { signal: controller.signal });
+    if (when === "during setup") controller.abort(stopped);
+
+    try {
+      await expect(upload).rejects.toBe(stopped);
+      expect(body.destroyed).toBe(true);
+      await closed;
+      expect(body.readableDidRead).toBe(false);
+      expect(emittedErrors).toEqual([]);
+      await expect(fs.readdir(root)).resolves.toEqual([]);
+    } finally {
+      body.destroy();
+      await closed;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("removes a partial private spool when cancelled while waiting for the remaining body", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-documentation-spool-admission-abort-"));
     const body = new PassThrough();
     const controller = new AbortController();
     const stopped = new Error("Documentation ingest queue was stopped.");
+    const waitingForRemainder = deferred();
+    const iterator = body[Symbol.asyncIterator]();
+    const next = iterator.next.bind(iterator);
+    let reads = 0;
+    vi.spyOn(iterator, "next").mockImplementation((...args) => {
+      const pending = next(...args);
+      if (++reads === 2) waitingForRemainder.resolve();
+      return pending;
+    });
+    vi.spyOn(body, Symbol.asyncIterator).mockReturnValue(iterator);
     const upload = spoolDocumentationUpload(body, root, 12, 12, { signal: controller.signal });
     body.write("partial");
-    await new Promise((resolve) => setTimeout(resolve, 10));
 
-    controller.abort(stopped);
+    try {
+      await waitingForRemainder.promise;
+      const directories = await fs.readdir(root);
+      expect(directories).toHaveLength(1);
+      await expect(fs.readFile(path.join(root, directories[0]!, "payload"), "utf8")).resolves.toBe("partial");
 
-    await expect(upload).rejects.toBe(stopped);
-    expect(body.destroyed).toBe(true);
-    await expect(fs.readdir(root)).resolves.toEqual([]);
+      controller.abort(stopped);
+
+      await expect(upload).rejects.toBe(stopped);
+      expect(body.destroyed).toBe(true);
+      await expect(fs.readdir(root)).resolves.toEqual([]);
+    } finally {
+      controller.abort(stopped);
+      await upload.catch(() => undefined);
+      body.destroy();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("closes a body cancelled between reads and awaits disposal of its partial spool", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-documentation-spool-write-abort-"));
+    const body = new PassThrough();
+    const controller = new AbortController();
+    const stopped = { code: "UPLOAD_STOPPED", message: "Documentation ingest queue was stopped." };
+    const written = deferred();
+    const finishWrite = deferred();
+    const removing = deferred();
+    const finishRemoval = deferred();
+    const open = fs.open.bind(fs);
+    const remove = fs.rm.bind(fs);
+    let file: Awaited<ReturnType<typeof fs.open>>;
+    let filePath: string;
+    const openFile = vi.spyOn(fs, "open").mockImplementationOnce(async (...args) => {
+      filePath = String(args[0]);
+      file = await open(...args);
+      const writeFile = file.writeFile.bind(file);
+      vi.spyOn(file, "writeFile").mockImplementationOnce(async (...writeArgs) => {
+        await writeFile(...writeArgs);
+        written.resolve();
+        await finishWrite.promise;
+      });
+      return file;
+    });
+    const removeDirectory = vi.spyOn(fs, "rm").mockImplementationOnce(async (...args) => {
+      removing.resolve();
+      await finishRemoval.promise;
+      await remove(...args);
+    });
+    const upload = spoolDocumentationUpload(body, root, 12, 12, { signal: controller.signal });
+    let settled = false;
+    const outcome = upload.then(
+      (result) => { settled = true; return result; },
+      (error: unknown) => { settled = true; return error; }
+    );
+    body.write("partial");
+
+    try {
+      await written.promise;
+      await expect(fs.readFile(filePath!, "utf8")).resolves.toBe("partial");
+      controller.abort(stopped);
+      finishWrite.resolve();
+
+      await removing.promise;
+      expect(file!.fd).toBe(-1);
+      expect(settled).toBe(false);
+      await expect(fs.readFile(filePath!, "utf8")).resolves.toBe("partial");
+      finishRemoval.resolve();
+
+      await expect(outcome).resolves.toBe(stopped);
+      expect(body.destroyed).toBe(true);
+      await expect(fs.readdir(root)).resolves.toEqual([]);
+    } finally {
+      finishWrite.resolve();
+      finishRemoval.resolve();
+      controller.abort(stopped);
+      await outcome;
+      body.destroy();
+      openFile.mockRestore();
+      removeDirectory.mockRestore();
+      await remove(root, { recursive: true, force: true });
+    }
   });
 
   it("reaps interrupted upload directories without deleting unrelated spool-root entries", async () => {
@@ -72,3 +183,9 @@ describe("DocumentationUploadSpool", () => {
     await expect(fs.stat(path.join(root, "operator-note"))).resolves.toMatchObject({ isDirectory: expect.any(Function) });
   });
 });
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}

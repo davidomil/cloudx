@@ -1,0 +1,5 @@
+flowchart TB
+  A[Start Codex issue work] --> B[Publish PR/MR and pause]
+  B --> C[Review and Resume: assess current feedback]
+  C -->|Needs review| B
+  C -->|Approved head and unchanged feedback| D[Merge and clean owned resources]

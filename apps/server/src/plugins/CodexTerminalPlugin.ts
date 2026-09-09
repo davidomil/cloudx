@@ -3,12 +3,14 @@ import type {
   PluginActionDefinition,
   PluginActionContext,
   PluginSession,
+  PluginSessionLaunchOptions,
   PluginSessionSnapshot,
   PluginTabControls,
   PluginVoiceContext,
   WorkspacePlugin
 } from "@cloudx/plugin-api";
-import { RULES_SKILLS_PLUGIN_ID, isRecord, type CodexTerminalInitialInput, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
+import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
+import { CODEX_REASONING_EFFORTS, RULES_SKILLS_PLUGIN_ID, isRecord, type CodexTerminalInitialInput, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
 
 import { materializeCodexHomeOverlay, resolveCodexHome, type CodexHomeOverlay } from "../rulesSkills/CodexHomeOverlay.js";
 import { CodexStateSources } from "./CodexStateSources.js";
@@ -96,15 +98,22 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
   async createSession(input: CreatePluginSessionInput): Promise<PluginSession> {
     const template = templateFromRuntimeContext(input.runtimeContext);
     const baseEnv = { ...process.env };
-    codexResumeInput(input.initialInput);
-    const launchTemplate = await materializeCodexTemplate(template, baseEnv, {
-      dataDir: this.dataDir,
-      tabId: input.tab.id,
-      cwd: input.cwd,
-      sources: this.sources
-    });
+    let launchTemplate: MaterializedCodexTemplate;
+    let initialArgs: string[];
+    try {
+      initialArgs = buildCodexLaunchArgs([], input.initialInput);
+      launchTemplate = await materializeCodexTemplate(template, baseEnv, {
+        dataDir: this.dataDir,
+        tabId: input.tab.id,
+        cwd: input.cwd,
+        authorizeProjectTrust: input.authorizeProjectTrust,
+        sources: this.sources
+      });
+    } catch (error) {
+      throw new PluginSessionNotStartedError(error);
+    }
     const command = launchTemplate.command;
-    const launchArgs = buildCodexLaunchArgs(launchTemplate.args, input.initialInput);
+    const launchArgs = [...launchTemplate.args, ...initialArgs];
     const launch = buildLoginShellCommandLaunch(command, launchArgs, launchTemplate.env);
     const terminalProcess = await this.factory.spawn(launch.command, launch.args, {
       cwd: input.cwd,
@@ -113,7 +122,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       rows: 30
     });
     return new CodexTerminalSession(input.tab, terminalProcess, input.controls, {
-      closeOnExit: true,
+      closeOnExit: !input.tab.ownerPluginId,
       closeOnExitAfterMs: CODEX_CLOSE_ON_EXIT_GRACE_MS,
       replayBytes: this.replayBytes,
       submitDelayMs: CODEX_SUBMIT_DELAY_MS,
@@ -126,6 +135,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
           dataDir: this.dataDir,
           tabId: input.tab.id,
           cwd: input.cwd,
+          authorizeProjectTrust: input.authorizeProjectTrust,
           resetOverlay: false,
           sources: this.sources
         });
@@ -142,10 +152,20 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
 
 export function buildCodexLaunchArgs(baseArgs: string[], initialInput?: Record<string, unknown>): string[] {
   const resume = codexResumeInput(initialInput);
+  const prompt = initialInput?.prompt;
+  const model = initialInput?.model;
+  const reasoningEffort = initialInput?.reasoningEffort;
+  if (model !== undefined && (typeof model !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(model))) throw new Error("Codex model must be a nonempty model identifier of at most 128 characters.");
+  if (reasoningEffort !== undefined && !CODEX_REASONING_EFFORTS.some(effort => effort === reasoningEffort)) throw new Error(`Codex reasoning effort must be one of: ${CODEX_REASONING_EFFORTS.join(", ")}.`);
+  if (prompt !== undefined && (typeof prompt !== "string" || !prompt.trim() || prompt.includes("\0"))) throw new Error("Codex initial prompt must be a non-empty string without null bytes.");
+  if (prompt !== undefined && resume && resume.mode !== "session") throw new Error("An initial prompt with resume requires an exact session id.");
+  const args = [...baseArgs];
+  if (model !== undefined) args.push("--model", model as string);
+  if (reasoningEffort !== undefined) args.push("--config", `model_reasoning_effort="${reasoningEffort}"`);
   if (!resume) {
-    return baseArgs;
+    return prompt === undefined ? args : [...args, "--", prompt as string];
   }
-  const args = [...baseArgs, "resume"];
+  args.push("resume");
   if (resume.mode === "last") {
     args.push("--last");
   }
@@ -158,6 +178,7 @@ export function buildCodexLaunchArgs(baseArgs: string[], initialInput?: Record<s
   if (resume.mode === "session") {
     args.push(resume.sessionId!);
   }
+  if (prompt !== undefined) args.push("--", prompt as string);
   return args;
 }
 
@@ -246,7 +267,7 @@ export interface MaterializedCodexTemplate {
   templateName?: string;
 }
 
-export interface MaterializeCodexTemplateOptions {
+export interface MaterializeCodexTemplateOptions extends PluginSessionLaunchOptions {
   dataDir?: string;
   tabId?: string;
   cwd?: string;
@@ -262,13 +283,15 @@ export async function materializeCodexTemplate(
   const env = buildToolEnv(baseEnv);
   const args: string[] = [...CLOUDX_CODEX_DEFAULT_ARGS];
   const dataDir = options.dataDir;
+  if (options.authorizeProjectTrust && (!dataDir || !options.tabId)) throw new Error("Project trust requires an isolated Codex overlay.");
+  const trustedProjectPath = await options.authorizeProjectTrust?.();
   const sources = options.sources ?? (dataDir ? new CodexStateSources(dataDir, baseEnv) : undefined);
   const bound = sources && options.tabId ? await sources.readBinding(options.tabId) : undefined;
   if (options.resetOverlay === false && sources && !bound) throw new Error("Codex launch source binding is missing.");
   const source = sources ? bound ?? await sources.resolve() : undefined;
   if (!env.CODEX_SQLITE_HOME?.trim()) env.CODEX_SQLITE_HOME = source?.home ?? path.resolve(resolveCodexHome(baseEnv));
   const overlay = dataDir && options.tabId
-    ? await materializeCodexHomeOverlay({ dataDir, tabId: options.tabId, resolved, baseEnv: env, cwd: options.cwd, resetCodexHome: options.resetOverlay, sources: sources!, source: source! })
+    ? await materializeCodexHomeOverlay({ dataDir, tabId: options.tabId, resolved, baseEnv: env, cwd: options.cwd, trustedProjectPath, resetCodexHome: options.resetOverlay, sources: sources!, source: source! })
     : undefined;
   if (overlay) {
     env.CODEX_HOME = overlay.codexHome;
@@ -536,6 +559,7 @@ export class CodexTerminalSession implements PluginSession {
   private recentOutput = "";
   private stopped = false;
   private status: WorkspaceTab["status"];
+  private statusMessage: string | undefined;
   private readiness: TerminalReadinessSnapshot = { state: "starting", reason: "Waiting for terminal output.", changedAt: Date.now() };
   private readonly replayBytes: number;
   private readonly startedAt = Date.now();
@@ -606,7 +630,8 @@ export class CodexTerminalSession implements PluginSession {
   }
 
   resize(cols: number, rows: number): void {
-    this.terminalProcess.resize(requireTerminalDimension(cols, "cols"), requireTerminalDimension(rows, "rows"));
+    const dimensions = [requireTerminalDimension(cols, "cols"), requireTerminalDimension(rows, "rows")] as const;
+    if (!this.terminalClosed) this.terminalProcess.resize(...dimensions);
   }
 
   stop(): void {
@@ -648,6 +673,7 @@ export class CodexTerminalSession implements PluginSession {
       title: this.tab.title,
       cwd: this.tab.cwd,
       status: this.status,
+      statusMessage: this.statusMessage,
       recentOutput: this.recentOutput,
       state: { readiness: this.readinessSnapshot() }
     };
@@ -709,14 +735,22 @@ export class CodexTerminalSession implements PluginSession {
       return { cols, rows };
     }
     if (action === "stop") {
-      this.stop();
-      return { stopped: true };
+      this.stopped = true;
+      this.terminalClosed = true;
+      this.clearPendingSubmitTimers();
+      this.clearReadyQuietTimer();
+      this.setReadiness("closed", "Terminal is stopping.");
+      return this.terminalProcess.terminate().then(() => {
+        this.setStatus("stopped", "Terminal was stopped.");
+        return { stopped: true };
+      });
     }
     throw new Error(`Unsupported Codex terminal action: ${action}`);
   }
 
   private setStatus(status: WorkspaceTab["status"], message?: string): void {
     this.status = status;
+    this.statusMessage = message;
     for (const listener of this.statusListeners) {
       listener(status, message);
     }

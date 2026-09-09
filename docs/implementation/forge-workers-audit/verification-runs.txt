@@ -1,0 +1,138 @@
+Forge validation evidence — 2026-09-07 UTC
+
+Commands were executed by the root/runtime/provider agents and handed off with completion results.
+Original stdout/stderr excerpts below preserve result lines, selected failures, and build status.
+ANSI controls are removed and host workspace prefixes are normalized. Original log SHA256 hashes retain provenance.
+The initial broad checks predate follow-ups; the final-full/final-build/final-typecheck records below cover all production additions.
+
+[initial-default]
+Command: npm test -- --reporter=dot
+Original log: forge-all-tests.log
+Original SHA256: 79d89c6196ff9dbf33eb6fbb77177b0220787328c887e20201d8bfa2ec324739
+Result note: Failed: 2 tests; retain this run separately from the bounded-concurrency pass.
+L2: > cloudx@0.1.3 test
+L3: > vitest run --reporter=dot
+L1909:  FAIL  scripts/ai-change/publish-gate-b.test.mjs > Gate B candidate publisher > awaits private runner process-group exhaustion without exposing a token
+L1910: Error: ENOENT: no such file or directory, lstat '/proc/650534'
+L1922:  FAIL  apps/server/src/documentation/DocumentationUploadSpool.test.ts > DocumentationUploadSpool > removes a partial private spool before an admission-owned abort settles
+L1923: AssertionError: expected false to be true // Object.is equality
+L1942:  Test Files  2 failed | 109 passed (111)
+L1943:       Tests  2 failed | 2123 passed (2125)
+L1944:    Start at  21:17:47
+L1945:    Duration  25.98s (transform 18.93s, setup 0ms, import 25.66s, tests 131.45s, environment 6.71s)
+
+[bounded-full]
+Command: npx vitest run --maxWorkers=2 --reporter=dot
+Original log: forge-all-tests-bounded.log
+Original SHA256: 4ebe0576befd40a78803b63b9b524d2385490cec1dac1848ebd4c6c4c7354c17
+Result note: Passed; root agent supplied executed command and verified successful completion.
+L1903:  Test Files  111 passed (111)
+L1904:       Tests  2125 passed (2125)
+L1905:    Start at  21:19:55
+L1906:    Duration  45.48s (transform 3.77s, setup 0ms, import 5.85s, tests 72.04s, environment 5.00s)
+
+[build]
+Command: npm run build
+Original log: forge-build.log
+Original SHA256: 4b822038352fa1ecae869c8c614a69be3e3ae5c2e1f254f540701fa59029d2cd
+Result note: Passed; root agent verified successful command completion. Output includes the existing large-chunk warning.
+L2: > cloudx@0.1.3 build
+L3: > npm run build --workspaces --if-present
+L6: > @cloudx/shared@0.1.3 build
+L7: > tsc -p tsconfig.json
+L10: > @cloudx/plugin-api@0.1.3 build
+L11: > tsc -p tsconfig.json
+L14: > @cloudx/server@0.1.3 build
+L15: > tsc -p tsconfig.json
+L18: > @cloudx/web@0.1.3 build
+L19: > tsc -b && vite build
+L50: ✓ built in 218ms
+L52: (!) Some chunks are larger than 500 kB after minification. Consider:
+
+[typecheck-before-settings]
+Command: npm run typecheck
+Original log: forge-typecheck.log
+Original SHA256: d6fdb8056eb56fed4465fd25d8416b553845d2700d9f61d587c4266d95595a5f
+Result note: Passed; root agent verified successful command completion.
+L2: > cloudx@0.1.3 typecheck
+L3: > tsc -b
+
+[shipped-shell-browser]
+Command: npx playwright test --reporter=line
+Original log: forge-browser-smoke.log
+Original SHA256: 4404cc54b15d4829941b8573487fd8b8f49d6931e31a781094cc52fee6c9b5ad
+Result note: Passed; shipped-shell desktop/mobile checks use the deterministic terminal fixture.
+L32:   12 passed (10.7s)
+
+[lifecycle-integration]
+Command: npx vitest run apps/server/src/forge/ForgeLifecycle.integration.test.ts
+Original log: cloudx-forge-lifecycle-integration.log
+Original SHA256: 72e6ecbf72167ecdb6780e07f9b442059078ab8b0d2d1b81c52bfbc3e4dc055d
+Result note: Passed; runtime agent verified successful completion with actual PTY, deterministic assistant and local provider fixture.
+L5:  Test Files  1 passed (1)
+L6:       Tests  2 passed (2)
+L7:    Start at  21:28:55
+L8:    Duration  980ms (transform 135ms, setup 0ms, import 181ms, tests 728ms, environment 0ms)
+
+[settings-followup]
+Command: npx vitest run apps/web/src/ui/SettingsDialog.test.ts apps/web/src/ui/SettingsDialog.import.test.ts apps/server/src/forge/ForgeSettingsService.test.ts
+Original log: cloudx-forge-settings-tests.log
+Original SHA256: 382a716fba92a9c877b5310cc7aadf9664498cd7959db15e7e94839c634d651c
+Result note: Passed; provider agent verified successful completion.
+L5:  Test Files  3 passed (3)
+L6:       Tests  14 passed (14)
+L7:    Start at  21:30:06
+L8:    Duration  573ms (transform 165ms, setup 0ms, import 321ms, tests 94ms, environment 317ms)
+
+[typecheck-after-settings]
+Command: npx tsc -b --pretty false
+Original log: cloudx-forge-settings-typecheck.log
+Original SHA256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+Result note: Passed; provider agent verified successful completion with zero diagnostics.
+(No output.)
+
+[failed-files-rerun]
+Command: npx vitest run scripts/ai-change/publish-gate-b.test.mjs apps/server/src/documentation/DocumentationUploadSpool.test.ts --reporter=dot
+Original log: forge-failed-checks.log
+Original SHA256: e5214cb9f989c77407b56b10deb2b2e5aa2f62fde0a1617d53939dae94e2f2e0
+Result note: Passed; root agent confirmed the executed command. This is a focused run, distinct from the full-suite results.
+L6:  Test Files  2 passed (2)
+L7:       Tests  211 passed (211)
+L8:    Start at  21:19:08
+L9:    Duration  6.17s (transform 127ms, setup 0ms, import 203ms, tests 5.99s, environment 0ms)
+
+[final-full]
+Command: npx vitest run --maxWorkers=2 --reporter=dot
+Original log: forge-final-tests.log
+Original SHA256: ccec19e692ef6435724629a813e09ed1d2e7a675c0e6b35fa99dec7bdcaf9cf9
+Result note: Passed after all production additions; root agent verified successful completion.
+L1903:  Test Files  114 passed (114)
+L1904:       Tests  2137 passed (2137)
+L1905:    Start at  21:31:52
+L1906:    Duration  48.14s (transform 2.89s, setup 0ms, import 4.68s, tests 78.86s, environment 4.87s)
+
+[final-typecheck]
+Command: npm run typecheck
+Original log: forge-final-typecheck.log
+Original SHA256: d6fdb8056eb56fed4465fd25d8416b553845d2700d9f61d587c4266d95595a5f
+Result note: Passed after all production additions; root agent verified successful completion.
+L2: > cloudx@0.1.3 typecheck
+L3: > tsc -b
+
+[final-build]
+Command: npm run build
+Original log: forge-final-build.log
+Original SHA256: 132ba50d08ccc68b30adafd454ed0a53f8b20e0a46bbe3ea2810d870f314f67f
+Result note: Passed after all production additions; root agent verified successful completion.
+L2: > cloudx@0.1.3 build
+L3: > npm run build --workspaces --if-present
+L6: > @cloudx/shared@0.1.3 build
+L7: > tsc -p tsconfig.json
+L10: > @cloudx/plugin-api@0.1.3 build
+L11: > tsc -p tsconfig.json
+L14: > @cloudx/server@0.1.3 build
+L15: > tsc -p tsconfig.json
+L18: > @cloudx/web@0.1.3 build
+L19: > tsc -b && vite build
+L50: ✓ built in 392ms
+L52: (!) Some chunks are larger than 500 kB after minification. Consider:

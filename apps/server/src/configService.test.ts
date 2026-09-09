@@ -58,6 +58,21 @@ describe("ConfigService", () => {
     expect(new ConfigService(dataDir, () => [fileBrowserDescriptor()], { voiceModel: "gpt-5.4" }).getVoiceModel()).toBe("gpt-5.4-mini");
   });
 
+  it("saves GPT-6 for voice without changing the default model", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-config-voice-gpt6-"));
+    try {
+      const service = new ConfigService(dataDir);
+      expect(service.getVoiceModel()).toBe(DEFAULT_VOICE_MODEL);
+
+      await service.update({ global: { voiceModel: "gpt-6-astra" } });
+
+      expect(new ConfigService(dataDir).getVoiceModel()).toBe("gpt-6-astra");
+      expect(service.getResponse().globalFields.find((field) => field.key === "voiceModel")?.defaultValue).toBe(DEFAULT_VOICE_MODEL);
+    } finally {
+      await fs.rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it("serializes concurrent updates without losing earlier config patches", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-config-concurrent-"));
     const service = new ConfigService(dataDir, () => [fileBrowserDescriptor()]);
