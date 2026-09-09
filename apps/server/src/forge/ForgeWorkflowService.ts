@@ -13,7 +13,7 @@ import type {
   ForgeReviewSubmission,
   ForgeWorker,
 } from "@cloudx/shared";
-import { ForgeHeadChangedError, ForgeMergeNotStartedError, type ForgeProvider } from "./providers/ForgeProvider.js";
+import { ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeProviderUnavailableError, type ForgeProvider } from "./providers/ForgeProvider.js";
 import { parseReview, parseWorkerReport } from "./ForgeWorkflowValidation.js";
 
 export interface ForgeSettings {
@@ -703,14 +703,21 @@ export class ForgeWorkflowService {
   private async resumeAutoReview(worker: ForgeWorker, placement: ForgePlacement): Promise<ForgeWorker> {
     if (!["paused", "stopped", "failed", "cleanup_failed", "awaiting_review", "awaiting_merge"].includes(worker.status))
       throw new Error("This issue loop is not waiting to resume.");
-    if (await this.reconcileMergedChange(worker, { retryCleanupId: worker.id })) return structuredClone(worker);
+    const controller = new AbortController();
+    this.operations.set(worker.id, controller);
+    try {
+      if (await this.reconcileMergedChange(worker, { retryCleanupId: worker.id, signal: controller.signal })) return structuredClone(worker);
+      controller.signal.throwIfAborted();
+    } catch (error) {
+      if (!await this.handleProviderInterruption(worker, error)) throw error;
+      return structuredClone(worker);
+    }
     const loop = worker.autoReview!;
     if (worker.mergeAttempted)
       throw new Error("The previous merge must be reconciled with the provider before continuing. Forge will not repeat it.");
     const review = this.autoReviewer(worker);
     if (review?.draft && ["posting", "post_failed"].includes(review.draft.status))
       throw new Error("The previous review submission must be reconciled with the provider before continuing. Forge will not repost it.");
-    this.operations.set(worker.id, new AbortController());
     try {
       await this.recoverResources(worker);
       await this.quiesce(worker);
@@ -725,7 +732,7 @@ export class ForgeWorkflowService {
       this.nextAutoReviewCheckAt.delete(worker.id);
       await this.advanceAutoReviews();
     } catch (error) {
-      await this.fail(worker, error);
+      if (!await this.handleProviderInterruption(worker, error)) await this.fail(worker, error);
     }
     return structuredClone(worker);
   }
@@ -739,9 +746,24 @@ export class ForgeWorkflowService {
       try {
         await this.advanceAutoReview(worker);
       } catch (error) {
-        if (!this.disposed) await this.fail(worker, error);
+        if (!this.disposed && !await this.handleProviderInterruption(worker, error)) await this.fail(worker, error);
       }
     }
+  }
+  private async handleProviderInterruption(worker: ForgeWorker, error: unknown): Promise<boolean> {
+    const unavailable = error instanceof ForgeMergeNotStartedError ? error.cause : error;
+    const signal = this.operations.get(worker.id)?.signal;
+    if (signal?.aborted && (error === signal.reason || unavailable instanceof ForgeProviderUnavailableError)) return true;
+    if (!(unavailable instanceof ForgeProviderUnavailableError)) return false;
+    if (worker.mergeAttempted || worker.pendingPublication ||
+      !["awaiting_review", "awaiting_merge", "paused", "stopped", "failed"].includes(worker.status)) return false;
+    const review = this.autoReviewer(worker);
+    if (review && (["starting", "running"].includes(review.status) ||
+      review.draft && ["posting", "post_failed"].includes(review.draft.status))) return false;
+    this.operations.delete(worker.id);
+    this.nextAutoReviewCheckAt.delete(worker.id);
+    await this.pauseAutoReview(worker, `${unavailable.message} Resume the issue loop when provider access is restored.`);
+    return true;
   }
   private async autoReviewContext(worker: ForgeWorker): Promise<{ issue: ForgeIssueDetail; change: ForgeChangeRequest } | undefined> {
     if (!worker.changeNumber || !worker.headSha) throw new Error("Auto review requires confirmed published work.");

@@ -1,6 +1,6 @@
 import { createPrivateKey, sign } from "node:crypto";
 import type { ForgeCredentialRole, ForgeRepository } from "@cloudx/shared";
-import { ForgeProviderError } from "./ForgeProvider.js";
+import { ForgeProviderError, ForgeProviderUnavailableError, forgeRequestFailure, throwIfForgeRequestAborted } from "./ForgeProvider.js";
 import { record, string } from "./validation.js";
 import { readBoundedBody } from "./responseBody.js";
 
@@ -111,9 +111,16 @@ export class ForgeCredentials {
     role: ForgeCredentialRole,
     signal?: AbortSignal,
   ): Promise<Record<string, string>> {
-    signal?.throwIfAborted();
-    const credential = await this.read(role);
-    signal?.throwIfAborted();
+    throwIfForgeRequestAborted(signal);
+    let credential: ForgeCredential | undefined;
+    try {
+      credential = await this.read(role);
+    } catch (error) {
+      this.installationTokens.delete(role);
+      throw error;
+    }
+    throwIfForgeRequestAborted(signal);
+    if (credential?.kind !== "github-app") this.installationTokens.delete(role);
     if (!credential)
       throw new ForgeProviderError(
         `Configure ${role} application credentials in Forge Workers settings.`,
@@ -178,19 +185,21 @@ export class ForgeCredentials {
     const cached = this.installationTokens.get(role);
     if (cached?.credential === identity && cached.expires > Date.now() + 60_000)
       return cached.token;
+    this.installationTokens.delete(role);
     const jwt = githubAppJwt(credential);
     let response: Response;
-    signal?.throwIfAborted();
+    const requestSignal = AbortSignal.any([
+      AbortSignal.timeout(30_000),
+      ...(signal ? [signal] : []),
+    ]);
+    throwIfForgeRequestAborted(requestSignal, "authentication");
     try {
       response = await this.fetcher(
         `${this.repository.apiUrl.replace(/\/$/, "")}/app/installations/${credential.installationId}/access_tokens`,
         {
           method: "POST",
           redirect: "error",
-          signal: AbortSignal.any([
-            AbortSignal.timeout(30_000),
-            ...(signal ? [signal] : []),
-          ]),
+          signal: requestSignal,
           headers: {
             Authorization: `Bearer ${jwt}`,
             Accept: "application/vnd.github+json",
@@ -203,28 +212,34 @@ export class ForgeCredentials {
         },
       );
     } catch {
-      throw new ForgeProviderError(
-        "GitHub App authentication could not reach the configured API.",
-        502,
-      );
+      throw new ForgeProviderUnavailableError(forgeRequestFailure(requestSignal), "authentication");
     }
     if (!response.ok) {
-      await response.body?.cancel();
-      throw new ForgeProviderError(
-        `GitHub App authentication failed (HTTP ${response.status}).`,
-        response.status,
-      );
+      try {
+        await response.body?.cancel();
+      } finally {
+        throw new ForgeProviderError(
+          `GitHub App authentication failed (HTTP ${response.status}).`,
+          response.status,
+        );
+      }
     }
+    let value: unknown;
+    try {
+      value = JSON.parse(await readBoundedBody(response, 100_000));
+    } catch {
+      throw new ForgeProviderUnavailableError(forgeRequestFailure(requestSignal, true), "authentication");
+    }
+    throwIfForgeRequestAborted(requestSignal, "authentication");
     let body: Record<string, unknown>;
     try {
-      body = record(JSON.parse(await readBoundedBody(response, 100_000)));
+      body = record(value);
     } catch {
       throw new ForgeProviderError(
         "GitHub App authentication returned invalid credentials.",
         502,
       );
     }
-    signal?.throwIfAborted();
     const token = string(body.token);
     const expires = Date.parse(string(body.expires_at));
     if (!token || !Number.isFinite(expires) || expires <= Date.now())

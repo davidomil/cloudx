@@ -6,7 +6,7 @@ import {
   ForgeWorkflowService,
   type ForgeWorkflowDependencies,
 } from "./ForgeWorkflowService.js";
-import { ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeProviderError } from "./providers/ForgeProvider.js";
+import { ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeProviderError, ForgeProviderUnavailableError } from "./providers/ForgeProvider.js";
 import { parseWorkers } from "./ForgeWorkflowValidation.js";
 
 function fixture() {
@@ -129,6 +129,13 @@ function fixture() {
   };
 }
 const placement = { windowId: "window", paneId: "pane" };
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((accept, fail) => { resolve = accept; reject = fail; });
+  return { promise, resolve, reject };
+}
 
 describe("Reusable review workers", () => {
   afterEach(() => vi.useRealTimers());
@@ -1848,6 +1855,170 @@ describe("Forge issue auto review", () => {
     await f.poll();
     expect(f.provider.merge).toHaveBeenCalledOnce();
     expect(f.stored()).toEqual([]);
+  });
+
+  async function approvedIssue() {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    f.change.mergeable = false;
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
+    await f.poll();
+    return f;
+  }
+
+  it.each([false, true])("pauses unavailable merge checks and resumes the saved approval without worker replay (restart: %s)", async restart => {
+    const f = await approvedIssue();
+    const review = f.currentReview();
+    f.provider.getChangeRequest.mockRejectedValueOnce(new ForgeProviderUnavailableError("timeout", "authentication"));
+    f.runtime.recover.mockClear();
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringMatching(/timed out.*Resume/), autoReview: { phase: "merging" } });
+    expect(f.currentIssue().mergeAttempted).toBeUndefined();
+    expect(f.currentReview()).toEqual({ ...review, updatedAt: expect.any(String) });
+    expect(f.runtime.recover).not.toHaveBeenCalled();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    const checks = f.provider.getChangeRequest.mock.calls.length;
+    f.change.mergeable = true;
+    await f.poll();
+    expect(f.provider.getChangeRequest).toHaveBeenCalledTimes(checks);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    const service = restart ? new ForgeWorkflowService(f.deps) : f.service;
+    await service.resume(f.issue.id, placement);
+    expect(f.provider.merge).toHaveBeenCalledExactlyOnceWith(7, review.headSha);
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.stored()).toEqual([]);
+  });
+
+  it("keeps a completed draft when provider reads fail before review submission", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    f.provider.getChangeRequest.mockRejectedValueOnce(new ForgeProviderUnavailableError("connection"));
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", autoReview: { phase: "reviewing" } });
+    expect(f.currentReview()).toMatchObject({ status: "completed", draft: { status: "draft", event: "approve" } });
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    await f.service.resume(f.issue.id, placement);
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["pause", "stop"] as const)("honors user %s during a provider read without reporting an outage", async action => {
+    const f = await approvedIssue();
+    const reading = deferred<void>();
+    const response = deferred<ForgeChangeRequest>();
+    const provider = vi.fn(f.deps.provider);
+    f.deps.provider = provider;
+    f.provider.getChangeRequest.mockImplementationOnce(() => { reading.resolve(); return response.promise; });
+    vi.mocked(f.deps.notify).mockClear();
+    const polling = f.poll();
+    await reading.promise;
+    const controlling = f.service[action](f.issue.id);
+    expect(provider.mock.calls.at(-1)?.[2]?.aborted).toBe(true);
+    response.reject(new ForgeProviderUnavailableError("cancelled"));
+    await Promise.all([polling, controlling]);
+    expect(f.currentIssue()).toMatchObject({ status: action === "pause" ? "paused" : "stopped", error: undefined });
+    expect(f.currentReview()).toMatchObject({ status: "completed", draft: { status: "posted" } });
+    expect(f.deps.notify).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("keeps the loop paused when completion status is unavailable during Resume", async () => {
+    const f = await approvedIssue();
+    f.provider.getChangeRequest.mockRejectedValueOnce(new ForgeProviderUnavailableError("timeout"));
+    await f.poll();
+    f.provider.getChangeRequestStatus.mockRejectedValueOnce(new ForgeProviderUnavailableError("connection", "authentication"));
+    await expect(f.service.resume(f.issue.id, placement)).resolves.toMatchObject({ status: "paused", error: expect.stringMatching(/authentication.*could not reach.*Resume/) });
+    expect(f.currentReview()).toMatchObject({ status: "completed", draft: { status: "posted" } });
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["reject", "resolve"])("honors Stop during Resume's initial provider read when the response %ss", async responseMode => {
+    const f = await approvedIssue();
+    await f.service.pause(f.issue.id);
+    f.change.mergeable = true;
+    const reading = deferred<void>();
+    const response = deferred<ForgeChangeRequest>();
+    const provider = vi.fn(f.deps.provider);
+    f.deps.provider = provider;
+    f.provider.getChangeRequestStatus.mockImplementationOnce(() => { reading.resolve(); return response.promise; });
+    vi.mocked(f.deps.notify).mockClear();
+    f.runtime.verifyPublishedWorkspace.mockClear();
+    const resuming = f.service.resume(f.issue.id, placement);
+    await reading.promise;
+    const stopping = f.service.stop(f.issue.id);
+    const signalWasAborted = provider.mock.calls.at(-1)?.[2]?.aborted;
+    if (responseMode === "reject") response.reject(new ForgeProviderUnavailableError("cancelled"));
+    else response.resolve({ ...f.change });
+    await Promise.all([resuming, stopping]);
+    expect(signalWasAborted).toBe(true);
+    expect(f.currentIssue()).toMatchObject({ status: "stopped", error: undefined });
+    expect(f.currentReview()).toMatchObject({ status: "completed", draft: { status: "posted" } });
+    expect(f.deps.notify).not.toHaveBeenCalled();
+    expect(f.runtime.verifyPublishedWorkspace).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each(["head", "feedback"])("revalidates changed %s when resuming after a provider outage", async changed => {
+    const f = await approvedIssue();
+    f.provider.getChangeRequest.mockRejectedValueOnce(new ForgeProviderUnavailableError("connection"));
+    await f.poll();
+    f.change.mergeable = true;
+    if (changed === "head") f.change.headSha = "c".repeat(40);
+    else f.change.comments.push({ id: "new-feedback", author: "human", body: "Cover the empty case too." });
+    await f.service.resume(f.issue.id, placement);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+    if (changed === "head") {
+      expect(f.currentIssue()).toMatchObject({ status: "failed", error: expect.stringMatching(/head changed/) });
+      expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    } else {
+      expect(f.currentReview()).toMatchObject({ status: "running", reviewHistory: [expect.objectContaining({ status: "posted", event: "approve" })] });
+      expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    }
+  });
+
+  it("pauses unavailable merge preflight without retaining an unstarted merge attempt", async () => {
+    const f = await approvedIssue();
+    f.change.mergeable = true;
+    f.provider.merge.mockRejectedValueOnce(new ForgeMergeNotStartedError(new ForgeProviderUnavailableError("connection")));
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", autoReview: { phase: "merging" } });
+    expect(f.currentIssue().mergeAttempted).toBeUndefined();
+    await f.poll();
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+    await f.service.resume(f.issue.id, placement);
+    expect(f.provider.merge).toHaveBeenCalledTimes(2);
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.stored()).toEqual([]);
+  });
+
+  it("preserves an uncertain merge checkpoint even when its error is provider unavailability", async () => {
+    const f = await approvedIssue();
+    f.change.mergeable = true;
+    f.provider.merge.mockRejectedValueOnce(new ForgeProviderUnavailableError("connection"));
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "failed", mergeAttempted: true });
+    await expect(f.service.resume(f.issue.id, placement)).rejects.toThrow(/previous merge/);
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+  });
+
+  it("preserves an uncertain review checkpoint even when its error is provider unavailability", async () => {
+    const pendingReview = await automaticIssue();
+    pendingReview.codingReport(); await pendingReview.poll();
+    pendingReview.provider.postReview.mockRejectedValueOnce(new ForgeProviderUnavailableError("connection"));
+    pendingReview.report({ kind: "review", headSha: pendingReview.change.headSha, event: "approve", body: "Ready", comments: [] });
+    await pendingReview.poll();
+    expect(pendingReview.currentIssue().status).toBe("failed");
+    expect(pendingReview.currentReview().draft?.status).toBe("post_failed");
+    await expect(pendingReview.service.resume(pendingReview.issue.id, placement)).rejects.toThrow(/previous review submission/);
+    expect(pendingReview.provider.postReview).toHaveBeenCalledOnce();
+    expect(pendingReview.provider.merge).not.toHaveBeenCalled();
   });
 
   it("updates an approved behind branch, confirms its publication and requires a fresh review", async () => {

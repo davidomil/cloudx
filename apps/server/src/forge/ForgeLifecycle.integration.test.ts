@@ -35,7 +35,7 @@ import { WorkspaceLayoutStore } from "../workspace/WorkspaceLayoutStore.js";
 import { ForgeRuntime, type ForgeRuntimeDependencies } from "./ForgeRuntime.js";
 import { ForgeWorkflowService, type ForgeSettings, type ForgeWorkflowDependencies } from "./ForgeWorkflowService.js";
 import { ForgeWorkerReports, ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
-import type { ForgeProvider } from "./providers/ForgeProvider.js";
+import { ForgeProviderUnavailableError, type ForgeProvider } from "./providers/ForgeProvider.js";
 
 const execute = promisify(execFile);
 const wallClockNow = Date.now.bind(Date);
@@ -422,6 +422,41 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
       expect(await processIsRunning(receipt.pid)).toBe(false);
       await fixture.expectDisposedAttempt(receipt);
     }
+  }, 20_000);
+
+  it("retains completed work through a provider outage and restart, then resumes only the merge", async () => {
+    const fixture = await LifecycleFixture.create({ autoReview: true, approveFirst: true });
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);
+    const implementation = await fixture.completedAssistantTurn(started);
+    await fixture.workflow.poll();
+    const reviewer = await fixture.runningWorker("review");
+    const reviewed = await fixture.completedAssistantTurn(reviewer);
+    fixture.provider.changes.get(7)!.mergeable = false;
+    await fixture.workflow.poll();
+    const completedReview = await fixture.worker(reviewer.id);
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "awaiting_merge" });
+    expect(completedReview).toMatchObject({ status: "completed", draft: { status: "posted", event: "approve" } });
+
+    vi.spyOn(fixture.provider, "getChangeRequest").mockRejectedValueOnce(new ForgeProviderUnavailableError("timeout", "authentication"));
+    fixture.advanceTime(5_001);
+    await fixture.workflow.poll();
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "paused", error: expect.stringContaining("Resume"), autoReview: { phase: "merging" } });
+    expect(await fixture.worker(reviewer.id)).toEqual({ ...completedReview, updatedAt: expect.any(String) });
+    for (const worker of [started, reviewer]) expect((await fs.stat(worker.worktreePath!)).isDirectory()).toBe(true);
+    for (const receipt of [implementation, reviewed]) expect(await processIsRunning(receipt.pid)).toBe(false);
+
+    await fixture.restartWorkflow();
+    fixture.provider.changes.get(7)!.mergeable = true;
+    await fixture.workflow.poll();
+    expect(fixture.provider.merges).toEqual([]);
+    await fixture.workflow.resume(started.id, fixture.placement);
+    expect(fixture.provider.merges).toEqual([implementation.headSha]);
+    expect(fixture.provider.submissions).toHaveLength(1);
+    expect(fixture.factory.processes).toHaveLength(2);
+    expect(fixture.gitPushes).toHaveLength(1);
+    expect(await fixture.store.read()).toEqual([]);
+    expect(fixture.sessions.listTabs()).toEqual([]);
+    await expectMissing(started.worktreePath!, reviewer.worktreePath!);
   }, 20_000);
 
   it("updates an approved branch with newer target work, confirms publication, and reviews the new merge commit before merging", async () => {

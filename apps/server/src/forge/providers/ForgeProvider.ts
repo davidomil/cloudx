@@ -88,6 +88,35 @@ export class ForgeProviderError extends Error {
   }
 }
 
+export type ForgeProviderFailure = "timeout" | "cancelled" | "connection" | "unreadable_response";
+
+export class ForgeProviderUnavailableError extends ForgeProviderError {
+  constructor(
+    readonly failure: ForgeProviderFailure,
+    operation: "request" | "authentication" = "request",
+  ) {
+    const subject = operation === "authentication" ? "GitHub App authentication" : "The forge request";
+    const detail = {
+      timeout: "timed out",
+      cancelled: "was cancelled",
+      connection: "could not reach the configured API",
+      unreadable_response: "returned an unreadable response",
+    }[failure];
+    super(`${subject} ${detail}.`, failure === "timeout" ? 504 : failure === "cancelled" ? 499 : 502);
+    this.name = "ForgeProviderUnavailableError";
+  }
+}
+
+export function forgeRequestFailure(signal?: AbortSignal, responseReceived = false): ForgeProviderFailure {
+  if (signal?.aborted)
+    return signal.reason instanceof DOMException && signal.reason.name === "TimeoutError" ? "timeout" : "cancelled";
+  return responseReceived ? "unreadable_response" : "connection";
+}
+
+export function throwIfForgeRequestAborted(signal?: AbortSignal, operation?: "request" | "authentication"): void {
+  if (signal?.aborted) throw new ForgeProviderUnavailableError(forgeRequestFailure(signal), operation);
+}
+
 export class ForgeHeadChangedError extends ForgeProviderError {
   readonly observedHeadShas: readonly string[];
 
