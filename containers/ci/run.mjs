@@ -7,6 +7,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import {
+  collectBrowserDiagnostics,
+  CommandOutputTail,
+} from "./diagnostics.mjs";
 
 const execFileAsync = promisify(execFile);
 const scriptPath = fileURLToPath(import.meta.url);
@@ -97,6 +101,7 @@ export async function executeVerification({
     worktreeDigest ?? (() => calculateWorktreeDigest(root, trustedManifest));
   const before = await digestWorktree();
   const results = [];
+  const commandDiagnostics = [];
   for (const planned of commands) {
     const commandBefore = results.at(-1)?.tree_sha256_after ?? before;
     const result = await runner(planned, root, identity);
@@ -114,11 +119,20 @@ export async function executeVerification({
       tree_sha256_before: commandBefore,
       tree_sha256_after: commandAfter,
     });
+    if (
+      (result.exitCode !== 0 || commandAfter !== commandBefore) &&
+      result.outputTails
+    ) {
+      commandDiagnostics.push({
+        command_index: results.length - 1,
+        ...result.outputTails,
+      });
+    }
     if (commandAfter !== commandBefore) break;
   }
   await settleCandidates();
   const after = await digestWorktree();
-  return {
+  const evidence = {
     schema_version: 1,
     kind: "managed-container-verification",
     verdict:
@@ -135,6 +149,14 @@ export async function executeVerification({
     tree_sha256_after: after,
     commands: results,
   };
+  if (evidence.verdict === "failed") {
+    evidence.diagnostics = {
+      trust: "untrusted-candidate-output",
+      commands: commandDiagnostics,
+      browser: await collectBrowserDiagnostics(root, identity.uid),
+    };
+  }
+  return evidence;
 }
 
 export async function captureSourceManifest(root) {
@@ -203,6 +225,8 @@ export async function runCommand(planned, root, identity = candidateIdentity) {
     });
     const stdoutHash = createHash("sha256");
     const stderrHash = createHash("sha256");
+    const stdoutTail = new CommandOutputTail();
+    const stderrTail = new CommandOutputTail();
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let outputExceeded = false;
@@ -226,6 +250,10 @@ export async function runCommand(planned, root, identity = candidateIdentity) {
         exitCode: timedOut ? 124 : outputExceeded ? 125 : (code ?? 1),
         stdoutSha256: stdoutHash.digest("hex"),
         stderrSha256: stderrHash.digest("hex"),
+        outputTails: {
+          stdout: stdoutTail.snapshot(),
+          stderr: stderrTail.snapshot(),
+        },
       });
     };
     const requestStop = () => {
@@ -242,10 +270,11 @@ export async function runCommand(planned, root, identity = candidateIdentity) {
       timedOut = true;
       requestStop();
     }, planned.timeoutMs);
-    const consume = (stream, hash, write, count) => {
+    const consume = (stream, hash, tail, write, count) => {
       stream.on("data", (chunk) => {
         if (settled) return;
         hash.update(chunk);
+        tail.append(chunk);
         write(chunk);
         const total = count(chunk.length);
         if (total > maximumOutputBytes && !outputExceeded) {
@@ -257,6 +286,7 @@ export async function runCommand(planned, root, identity = candidateIdentity) {
     consume(
       child.stdout,
       stdoutHash,
+      stdoutTail,
       (chunk) => process.stdout.write(chunk),
       (bytes) => {
         stdoutBytes += bytes;
@@ -266,6 +296,7 @@ export async function runCommand(planned, root, identity = candidateIdentity) {
     consume(
       child.stderr,
       stderrHash,
+      stderrTail,
       (chunk) => process.stderr.write(chunk),
       (bytes) => {
         stderrBytes += bytes;
@@ -273,7 +304,10 @@ export async function runCommand(planned, root, identity = candidateIdentity) {
       },
     );
     child.on("error", (error) => {
-      if (!settled) stderrHash.update(error.message);
+      if (!settled) {
+        stderrHash.update(error.message);
+        stderrTail.append(Buffer.from(error.message));
+      }
     });
     child.on("close", finish);
   });

@@ -86,6 +86,47 @@ const tab: WorkspaceTab = {
 };
 
 describe("CodexTerminalPlugin", () => {
+  it("waits for the host's prepared conversation before resuming its exact thread", async () => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      vi.stubEnv("CLOUDX_ASSISTANT_BIN", "/usr/bin/codex");
+      let release!: (id: string) => void;
+      const ready = new Promise<string>(resolve => { release = resolve; });
+      const prepareCodexSession = vi.fn(async launch => {
+        expect(factory.spawns).toBe(0);
+        expect(launch).toMatchObject({ tabId: tab.id, cwd: root, command: "/usr/bin/codex" });
+        expect(await fs.realpath(path.join(launch.env.CODEX_HOME!, "sessions"))).toBe(path.join(home, "sessions"));
+        expect(launch.configurationArgs).toContain("--disable");
+        expect(launch.configurationArgs).not.toContain("--yolo");
+        expect(launch.configurationArgs).not.toContain("--add-dir");
+        return ready;
+      });
+      const creation = plugin.createSession({
+        tab, cwd: root, prepareCodexSession,
+        controls: { setTabIndicator: () => undefined, closeTab: () => undefined },
+        initialInput: { prompt: "Review the next commit.", model: "gpt-6-astra", reasoningEffort: "max" }
+      });
+      void creation.catch(() => undefined);
+      await vi.waitFor(() => expect(prepareCodexSession).toHaveBeenCalledOnce());
+      expect(factory.spawns).toBe(0);
+      release("01a08470-d118-7b72-b1df-439e72e5c744");
+      await creation;
+      expect(factory.args?.at(-1)).toContain("resume 01a08470-d118-7b72-b1df-439e72e5c744 -- 'Review the next commit.'");
+      expect(factory.args?.at(-1)).toContain("--model gpt-6-astra");
+      expect(factory.args?.at(-1)).toContain('model_reasoning_effort="max"');
+    });
+  });
+
+  it("preserves an unresolved host conversation error without starting the TUI", async () => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const failure = new Error("Conversation process ownership is unresolved.");
+      await expect(plugin.createSession({
+        tab, cwd: root, prepareCodexSession: async () => { throw failure; },
+        controls: { setTabIndicator: () => undefined, closeTab: () => undefined }
+      })).rejects.toBe(failure);
+      expect(factory.spawns).toBe(0);
+    });
+  });
+
   it.each([
     [17, "failed", "Terminal exited with code 17."],
     [0, "completed", "Terminal exited cleanly."]

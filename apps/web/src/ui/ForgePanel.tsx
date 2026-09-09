@@ -178,7 +178,7 @@ function ForgeItems({ kind, repository, request, revision, workers, placement, r
 
   useEffect(() => { setReviewBody(""); }, [selectedNumber]);
   const selectedWorkers = workersForItem(workers, kind, selectedNumber);
-  const visibleWorkers = kind === "issues" ? selectedWorkers : selectedWorkers.filter(worker => worker.kind === "review").sort((a, b) => Date.parse(b.startedAt) - Date.parse(a.startedAt));
+  const reviews = selectedWorkers.filter(worker => worker.kind === "review").flatMap(reviewRounds).sort((a, b) => Date.parse(reviewStartedAt(b)) - Date.parse(reviewStartedAt(a)));
   const activeWorker = selectedWorkers.find((worker) => worker.kind === (kind === "issues" ? "issue" : "review") && worker.status !== "completed");
   const unconfirmedPublication = selectedWorkers.some(hasUnconfirmedPublication);
   const currentDetail = detail?.number === selectedNumber ? detail : undefined;
@@ -250,7 +250,7 @@ function ForgeItems({ kind, repository, request, revision, workers, placement, r
           </section> : null}
           {detailBusy ? <p role="status">Loading latest details…</p> : null}
           {detailError ? <p role="alert" className="forge-notice">{detailError}</p> : null}
-          {visibleWorkers.map((worker) => <WorkerCard key={worker.id} worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} collapsible={kind === "changes"} showAutoReview={kind !== "issues"} canSubmitReview={!unconfirmedPublication && (kind === "issues" || !reviewDisabled)} />)}
+          {kind === "changes" ? reviews.map(({ worker, archivedDraft }) => <WorkerCard key={`${worker.id}:${archivedDraft?.id ?? worker.draft?.id ?? worker.attemptId ?? "active"}`} worker={worker} archivedDraft={archivedDraft} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} collapsible canSubmitReview={!unconfirmedPublication && !reviewDisabled} />) : selectedWorkers.map(worker => <WorkerCard key={worker.id} worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} showAutoReview={false} canSubmitReview={!unconfirmedPublication} />)}
           <p className="forge-prose">{item.body}</p>
           {kind === "issues" ? <>
             <div className="forge-actions">
@@ -275,6 +275,16 @@ function workersForItem(workers: ForgeWorker[], kind: "issues" | "changes", numb
   const issueWorkers = workers.filter(worker => worker.kind === "issue" && worker.number === number);
   const issueWorkerIds = new Set(issueWorkers.map(worker => worker.id));
   return workers.filter(worker => issueWorkerIds.has(worker.id) || (worker.kind === "review" && !!worker.issueWorkerId && issueWorkerIds.has(worker.issueWorkerId)));
+}
+
+type ReviewRound = { worker: ForgeWorker; archivedDraft?: ForgeReviewDraft };
+
+function reviewRounds(worker: ForgeWorker): ReviewRound[] {
+  return [{ worker }, ...(worker.reviewHistory ?? []).map(archivedDraft => ({ worker, archivedDraft }))];
+}
+
+function reviewStartedAt({ worker, archivedDraft }: ReviewRound): string {
+  return archivedDraft?.startedAt ?? worker.draft?.startedAt ?? worker.startedAt;
 }
 
 function ItemWorkerStats({ workers }: { workers: ForgeWorker[] }) {
@@ -303,8 +313,9 @@ function autoReviewProgress(worker: ForgeWorker) {
   return `Auto review · ${{ implementing: "Implementing changes", reviewing: "Reviewing changes", merging: "Waiting to merge" }[worker.autoReview.phase]}`;
 }
 
-function WorkerCard({ worker, request, placement, runAction, busy, onViewWorker, canSubmitReview = true, showAutoReview = true, collapsible = false }: {
+function WorkerCard({ worker, archivedDraft, request, placement, runAction, busy, onViewWorker, canSubmitReview = true, showAutoReview = true, collapsible = false }: {
   worker: ForgeWorker;
+  archivedDraft?: ForgeReviewDraft;
   request: Request;
   placement: ForgePlacement;
   runAction: RunAction;
@@ -327,37 +338,40 @@ function WorkerCard({ worker, request, placement, runAction, busy, onViewWorker,
   const canResume = ["paused", "failed", "stopped", "cleanup_failed"].includes(worker.status) || (["awaiting_review", "awaiting_merge"].includes(worker.status) && !automaticReview);
   const canStop = ["starting", "running", "awaiting_publication", "awaiting_merge", "paused", "awaiting_review", "failed"].includes(worker.status);
   const progress = autoReviewProgress(worker);
+  const draft = archivedDraft ?? worker.draft;
   const card = <article className="forge-worker" aria-label={`${worker.kind} worker #${worker.number}`}>
-    <div className="forge-worker-heading"><strong>{worker.kind === "issue" ? "Issue" : "Review"} #{worker.number} · {worker.title}</strong><span className={`forge-status forge-status-${worker.status}`}>{worker.status.replaceAll("_", " ")}</span></div>
+    <div className="forge-worker-heading"><strong>{worker.kind === "issue" ? "Issue" : "Review"} #{worker.number} · {worker.title}</strong>{!archivedDraft ? <span className={`forge-status forge-status-${worker.status}`}>{worker.status.replaceAll("_", " ")}</span> : null}</div>
     <p className="forge-muted">{worker.repository.projectPath}{worker.branch ? ` · ${worker.branch}` : ""}</p>
-    {worker.error ? <p role="alert" className="forge-notice">{worker.error}</p> : null}
-    {worker.status === "awaiting_publication" ? <p role="status">The commit was pushed. Waiting for {worker.repository.provider === "github" ? "GitHub to confirm the pull" : "GitLab to confirm the merge"} request update; work continues automatically.</p> : null}
-    {progress ? <p role="status" className="forge-auto-review-status">{progress}</p> : worker.status === "awaiting_review" ? <p role="status">Ready for review. Resume after feedback to address comments and check approval.</p> : null}
-    <div className="forge-actions">
+    {!archivedDraft && worker.error ? <p role="alert" className="forge-notice">{worker.error}</p> : null}
+    {!archivedDraft && worker.status === "awaiting_publication" ? <p role="status">The commit was pushed. Waiting for {worker.repository.provider === "github" ? "GitHub to confirm the pull" : "GitLab to confirm the merge"} request update; work continues automatically.</p> : null}
+    {!archivedDraft && progress ? <p role="status" className="forge-auto-review-status">{progress}</p> : !archivedDraft && worker.status === "awaiting_review" ? <p role="status">Ready for review. Resume after feedback to address comments and check approval.</p> : null}
+    {!archivedDraft ? <div className="forge-actions">
       {canPause ? <ControlButton size="compact" disabled={controlling} onClick={() => void interruptWorker("pause")}><Pause size={14} /> Pause</ControlButton> : null}
-      {canResume ? <ControlButton size="compact" disabled={busy} onClick={() => void runAction(() => request("forge.worker.resume", { id: worker.id, ...placement }))}><Play size={14} /> {worker.status === "cleanup_failed" && worker.kind === "review" ? "Clean up" : "Resume"}</ControlButton> : null}
+      {canResume ? <ControlButton size="compact" disabled={busy} onClick={() => void runAction(() => request("forge.worker.resume", { id: worker.id, ...placement }))}><Play size={14} /> Resume</ControlButton> : null}
       {canStop ? <ControlButton size="compact" disabled={controlling} onClick={() => void interruptWorker("stop")}><Square size={13} /> Stop</ControlButton> : null}
       {showAutoReview && worker.kind === "issue" && worker.status !== "completed" ? <AutoReviewToggle enabled={automaticReview} disabled={busy} onChange={enabled => void runAction(() => request("forge.worker.autoReview", { id: worker.id, enabled, ...placement }))} /> : null}
       {onViewWorker ? <ControlButton size="compact" onClick={() => onViewWorker(worker.id)}><Terminal size={14} /> View worker</ControlButton> : null}
       {worker.changeUrl ? <a href={worker.changeUrl} target="_blank" rel="noreferrer">Open PR/MR <ExternalLink size={12} /></a> : null}
-    </div>
-    {worker.draft ? <ReviewEditor key={`${worker.id}:${worker.draft.headSha}`} worker={worker} draft={worker.draft} request={request} runAction={runAction} busy={busy} canSubmitReview={canSubmitReview} /> : null}
+    </div> : null}
+    {draft ? <ReviewEditor key={draft.id} worker={worker} draft={draft} archived={!!archivedDraft} request={request} runAction={runAction} busy={busy} canSubmitReview={canSubmitReview} /> : null}
   </article>;
   if (!collapsible) return card;
-  const comments = worker.draft?.comments.length ?? 0;
-  const status = worker.draft?.status === "post_failed" ? "failed" : worker.status;
+  const comments = draft?.comments.length ?? 0;
+  const status = draft?.status === "post_failed" ? "failed" : worker.status;
+  const startedAt = reviewStartedAt({ worker, archivedDraft });
   return <details className="forge-worker-history">
     <summary>
-      <strong>Review #{worker.number}</strong> · <time dateTime={worker.startedAt}>{new Date(worker.startedAt).toLocaleString()}</time> · <span className={`forge-status forge-status-${status}`}>{worker.draft?.status === "post_failed" ? "post failed" : status.replaceAll("_", " ")}</span>
-      {worker.draft ? <span className="forge-muted"> · {worker.draft.status === "posted" ? "Posted review" : "Suggested review"} · {comments} {comments === 1 ? "comment" : "comments"}</span> : null}
+      <strong>Review #{worker.number}</strong> · <time dateTime={startedAt}>{new Date(startedAt).toLocaleString()}</time>{!archivedDraft ? <> · <span className={`forge-status forge-status-${status}`}>{draft?.status === "post_failed" ? "post failed" : status.replaceAll("_", " ")}</span></> : null}
+      {draft ? <span className="forge-muted"> · {draft.status === "posted" ? "Posted review" : "Suggested review"} · {comments} {comments === 1 ? "comment" : "comments"}</span> : null}
     </summary>
     {card}
   </details>;
 }
 
-function ReviewEditor({ worker, draft, request, runAction, busy, canSubmitReview }: {
+function ReviewEditor({ worker, draft, archived, request, runAction, busy, canSubmitReview }: {
   worker: ForgeWorker;
   draft: ForgeReviewDraft;
+  archived: boolean;
   request: Request;
   runAction: RunAction;
   busy: boolean;
@@ -365,7 +379,7 @@ function ReviewEditor({ worker, draft, request, runAction, busy, canSubmitReview
 }) {
   const [edit, setEdit] = useState<ReviewEdit>(() => ({ body: draft.body, event: draft.event, comments: draft.comments.map((comment) => ({ ...comment })) }));
   const [saved, setSaved] = useState(false);
-  const locked = busy || draft.status !== "draft";
+  const locked = archived || busy || draft.status !== "draft";
   const valid = edit.comments.every((comment) => comment.body.trim() && (!comment.path || (Number.isSafeInteger(comment.line) && Number(comment.line) > 0))) && (edit.event !== "request_changes" || !!edit.body.trim()) && (!!edit.body.trim() || edit.comments.length > 0);
   function updateEdit(next: ReviewEdit) { setEdit(next); setSaved(false); }
   function updateComment(index: number, change: Partial<ForgeReviewComment>) {
@@ -373,8 +387,8 @@ function ReviewEditor({ worker, draft, request, runAction, busy, canSubmitReview
   }
   async function saveReview(submit: boolean) {
     const successful = await runAction(async () => {
-      await request("forge.review.save", { id: worker.id, ...edit });
-      if (submit) await request("forge.review.submit", { id: worker.id });
+      await request("forge.review.save", { id: worker.id, draftId: draft.id, ...edit });
+      if (submit) await request("forge.review.submit", { id: worker.id, draftId: draft.id });
     });
     if (successful) setSaved(true);
   }
@@ -398,6 +412,7 @@ function ReviewEditor({ worker, draft, request, runAction, busy, canSubmitReview
         <ControlButton tone="primary" size="compact" disabled={!valid || !canSubmitReview} onClick={() => void saveReview(true)}>Submit review</ControlButton>
       </div>
     </fieldset>
+    {archived ? <p className="forge-muted">Previous review · read-only</p> : null}
     {!valid && !locked ? <p className="forge-muted">Add a summary or comment, fill every comment body, and provide a positive whole line number for each file comment. Requested changes need a summary.</p> : null}
     {draft.status === "posted" ? <p role="status">Review posted.</p> : draft.status === "posting" ? <p role="status">Posting review…</p> : saved ? <p role="status">Draft saved.</p> : null}
     {draft.status === "post_failed" ? <p role="alert" className="forge-notice">Submission could be incomplete. Inspect the PR/MR for published comments before starting another review.</p> : null}

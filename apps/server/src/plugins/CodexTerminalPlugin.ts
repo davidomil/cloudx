@@ -26,8 +26,7 @@ export const CODEX_READY_QUIET_MS = 350;
 export const CODEX_READY_TIMEOUT_MS = 30_000;
 export const CODEX_READY_MAX_TIMEOUT_MS = 10 * 60 * 1000;
 export const CODEX_READY_MAX_QUIET_MS = 10_000;
-export const CLOUDX_CODEX_DEFAULT_ARGS = [
-  "--yolo",
+export const CLOUDX_CODEX_CONFIGURATION_ARGS = [
   "--disable",
   "apps",
   "--disable",
@@ -37,6 +36,7 @@ export const CLOUDX_CODEX_DEFAULT_ARGS = [
   "--config",
   "skills.bundled.enabled=false"
 ] as const;
+export const CLOUDX_CODEX_DEFAULT_ARGS = ["--yolo", ...CLOUDX_CODEX_CONFIGURATION_ARGS] as const;
 const MAX_OSC_SEQUENCE_CHARS = 4096;
 
 export const TERMINAL_ACTIONS: PluginActionDefinition[] = terminalActions({
@@ -111,6 +111,16 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       });
     } catch (error) {
       throw new PluginSessionNotStartedError(error);
+    }
+    if (input.prepareCodexSession) {
+      const sessionId = await input.prepareCodexSession({
+        tabId: input.tab.id,
+        cwd: input.cwd,
+        command: launchTemplate.command,
+        configurationArgs: [...CLOUDX_CODEX_CONFIGURATION_ARGS],
+        env: launchTemplate.env,
+      });
+      initialArgs = buildCodexLaunchArgs([], { ...input.initialInput, resume: { mode: "session", sessionId } });
     }
     const command = launchTemplate.command;
     const launchArgs = [...launchTemplate.args, ...initialArgs];

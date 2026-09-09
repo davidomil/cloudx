@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 import type { CreatePluginSessionInput, PluginActionContext, PluginSession, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
-import { PluginSessionNotStartedError, pluginActionHookId } from "@cloudx/plugin-api";
+import { PluginSessionNotStartedError, PluginSessionOwnershipError, pluginActionHookId } from "@cloudx/plugin-api";
 import { RULES_SKILLS_PLUGIN_ID, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
 import { describe, expect, it, vi } from "vitest";
 
@@ -211,6 +211,67 @@ describe.each(["create", "restart"] as const)("SessionStore session registration
 });
 
 describe("SessionStore voice actions", () => {
+  it.each(["discard", "close", "restart", "dispose"] as const)("preserves unresolved session context through %s", async action => {
+    const { store, root, plugin } = await createStore();
+    const failure = new PluginSessionOwnershipError("Conversation process shutdown is unconfirmed.");
+    const prepareCodexSession = vi.fn(async () => { throw failure; });
+    let tab!: WorkspaceTab;
+    plugin.createSession = async input => {
+      tab = input.tab;
+      await input.prepareCodexSession!({ tabId: tab.id, cwd: input.cwd, command: "codex", configurationArgs: [], env: {} });
+      throw new Error("The unresolved conversation must not start a session.");
+    };
+    try {
+      await expect(store.prepareTab({ pluginId: plugin.id, cwd: root }, undefined, {
+        ownerPluginId: plugin.id,
+        prepareCodexSession,
+      })).rejects.toBe(failure);
+      const context = store.getContextDirectory(tab.id)!;
+      const original = await fs.readFile(tab.contextPath!, "utf8");
+      expect(context.path).toBe(path.dirname(tab.contextPath!));
+      expect(store.getTab(tab.id)).toMatchObject({ status: "failed", statusMessage: failure.message });
+      expect(store.listTabs()).toEqual([]);
+      expect(() => store.publishPreparedTab(tab.id)).toThrow(failure);
+      if (action === "discard") await expect(store.discardPreparedTab(tab.id)).rejects.toBe(failure);
+      else if (action === "close") expect(() => store.closeTab(tab.id)).toThrow(failure);
+      else if (action === "restart") await expect(store.restartTab(tab.id)).rejects.toBe(failure);
+      else await expect(store.dispose()).rejects.toMatchObject({ name: "AggregateError", errors: [failure] });
+      expect(prepareCodexSession).toHaveBeenCalledOnce();
+      expect(store.getContextDirectory(tab.id)).toEqual(context);
+      expect(await fs.readFile(tab.contextPath!, "utf8")).toBe(original);
+      expect((await fs.stat(context.path, { bigint: true })).ino.toString()).toBe(context.ino);
+      expect(store.listTabs()).toEqual([]);
+    } finally {
+      await store.dispose().catch(() => undefined);
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("discards an owned context after conversation preparation safely rejects startup", async () => {
+    const { store, root, plugin } = await createStore();
+    const failure = new PluginSessionNotStartedError(new Error("Conversation preparation was cancelled and stopped."));
+    let tab!: WorkspaceTab;
+    plugin.createSession = async input => {
+      tab = input.tab;
+      expect((await fs.stat(tab.contextPath!)).isFile()).toBe(true);
+      await input.prepareCodexSession!({ tabId: tab.id, cwd: input.cwd, command: "codex", configurationArgs: [], env: {} });
+      throw new Error("The cancelled conversation must not start a session.");
+    };
+    try {
+      await expect(store.prepareTab({ pluginId: plugin.id, cwd: root }, undefined, {
+        ownerPluginId: plugin.id,
+        prepareCodexSession: async () => { throw failure; },
+      })).rejects.toBe(failure);
+      expect(store.listTabs()).toEqual([]);
+      expect(() => store.getTab(tab.id)).toThrow(/Unknown tab/);
+      await expect(fs.stat(path.dirname(tab.contextPath!))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(store.dispose()).resolves.toBeUndefined();
+    } finally {
+      await store.dispose();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("keeps a pre-start cleanup failure distinct from a safe session rejection", async () => {
     const { store, root, plugin } = await createStore();
     const rejected = new PluginSessionNotStartedError(new Error("Repository consent is required."));
@@ -323,35 +384,41 @@ describe("SessionStore voice actions", () => {
     }
   });
 
-  it("retains server-only project trust authorization for restart without exposing it in tab state", async () => {
+  it("retains server-only launch callbacks for restart without exposing them in tab state", async () => {
     const { store, root, workspace, workspaceCommands, plugin } = await createStore({ withWorkspace: true });
     const window = workspace!.getActiveWindow();
     const authorizeProjectTrust = vi.fn(async () => root);
+    const prepareCodexSession = vi.fn(async () => "01a08470-d118-7b72-b1df-439e72e5c744");
     try {
-      const { tab } = await workspaceCommands!.createTab({ pluginId: plugin.id, cwd: root, windowId: window.id, paneId: window.layout.activePaneId }, { authorizeProjectTrust });
+      const { tab } = await workspaceCommands!.createTab({ pluginId: plugin.id, cwd: root, windowId: window.id, paneId: window.layout.activePaneId }, { authorizeProjectTrust, prepareCodexSession });
       expect(plugin.lastInput?.authorizeProjectTrust).toBe(authorizeProjectTrust);
+      expect(plugin.lastInput?.prepareCodexSession).toBe(prepareCodexSession);
       expect(JSON.stringify(tab)).not.toContain("authorizeProjectTrust");
+      expect(JSON.stringify(tab)).not.toContain("prepareCodexSession");
       await store.restartTab(tab.id);
       expect(plugin.lastInput?.authorizeProjectTrust).toBe(authorizeProjectTrust);
+      expect(plugin.lastInput?.prepareCodexSession).toBe(prepareCodexSession);
       await store.discardPreparedTab(tab.id);
       await store.createTab({ pluginId: plugin.id, cwd: root });
       expect(plugin.lastInput?.authorizeProjectTrust).toBeUndefined();
+      expect(plugin.lastInput?.prepareCodexSession).toBeUndefined();
     } finally {
       await store.dispose();
       await fs.rm(root, { recursive: true, force: true });
     }
   });
 
-  it("cannot authorize project trust through serialized tab input or metadata", async () => {
+  it("cannot select host launch callbacks through serialized tab input or metadata", async () => {
     const { store, root, workspace, workspaceCommands, plugin } = await createStore({ withWorkspace: true });
     const window = workspace!.getActiveWindow();
     try {
       await workspaceCommands!.createTab({
         pluginId: plugin.id, cwd: root, windowId: window.id, paneId: window.layout.activePaneId,
-        initialInput: { authorizeProjectTrust: root, trustedProjectPath: root },
-        pluginMetadata: { "forge-workers": { workerId: "spoofed", trustedProjectPath: root } }
+        initialInput: { authorizeProjectTrust: root, trustedProjectPath: root, prepareCodexSession: "spoofed-thread" },
+        pluginMetadata: { "forge-workers": { workerId: "spoofed", trustedProjectPath: root, prepareCodexSession: "spoofed-thread" } }
       });
       expect(plugin.lastInput?.authorizeProjectTrust).toBeUndefined();
+      expect(plugin.lastInput?.prepareCodexSession).toBeUndefined();
     } finally {
       await store.dispose();
       await fs.rm(root, { recursive: true, force: true });

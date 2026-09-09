@@ -1,11 +1,13 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { generateKeyPairSync } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ForgeCredentialRole, ForgeRepository } from "@cloudx/shared";
 import { ConfigService } from "../configService.js";
 import { ForgePlugin } from "../plugins/ForgePlugin.js";
 import type { ForgeCredential } from "./providers/ForgeCredentials.js";
+import { ForgeProviderUnavailableError } from "./providers/ForgeProvider.js";
 import {
   ForgeSettingsService,
   forgeConfigFields,
@@ -19,11 +21,132 @@ const repository: ForgeRepository = {
 };
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(
     roots
       .splice(0)
       .map((root) => fs.rm(root, { recursive: true, force: true })),
   );
+});
+
+const appKey = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+const replacementKey = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+const workerApp = { kind: "github-app" as const, appId: "app_1", installationId: "42", privateKey: appKey };
+
+async function applicationFixture() {
+  const f = await fixture();
+  f.credentials.set("worker", workerApp);
+  f.credentials.set("reviewer", { ...workerApp, appId: "app_2", installationId: "43" });
+  const exchanges: { url: string; body: unknown }[] = [];
+  const authorizations: string[] = [];
+  const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, options) => {
+    if (String(url).endsWith("/access_tokens")) {
+      exchanges.push({ url: String(url), body: JSON.parse(String(options?.body)) });
+      return Response.json({ token: "installation-" + exchanges.length, expires_at: new Date(Date.now() + 3_600_000).toISOString() });
+    }
+    authorizations.push(new Headers(options?.headers).get("authorization")!);
+    return Response.json({ items: [], incomplete_results: false });
+  });
+  return { ...f, exchanges, authorizations, fetcher };
+}
+
+describe("installation tokens across Forge provider acquisitions", () => {
+  it("reuses each role's token for fresh providers and Git access", async () => {
+    const f = await applicationFixture();
+    await f.settings.provider(repository, "worker").listIssues();
+    await f.settings.provider(repository, "worker").listChangeRequests();
+    expect(await f.settings.gitAccess(repository, "worker")).toMatchObject({ authorization: "Basic " + Buffer.from("x-access-token:installation-1").toString("base64") });
+    await f.settings.provider(repository, "reviewer").listIssues();
+    await f.settings.provider(repository, "reviewer").listChangeRequests();
+    expect(f.exchanges).toEqual([
+      { url: "https://api.github.com/app/installations/42/access_tokens", body: { repositories: ["repo"] } },
+      { url: "https://api.github.com/app/installations/43/access_tokens", body: { repositories: ["repo"] } },
+    ]);
+    expect(f.authorizations).toEqual(["Bearer installation-1", "Bearer installation-1", "Bearer installation-2", "Bearer installation-2"]);
+    expect(JSON.stringify(f.config.getResponse())).not.toContain("installation-1");
+    expect(JSON.stringify(f.config.getResponse())).not.toContain("PRIVATE KEY");
+  });
+
+  it.each([
+    { name: "application", replacement: { appId: "app_3" } },
+    { name: "installation", replacement: { installationId: "44" } },
+    { name: "signing key", replacement: { privateKey: replacementKey } },
+  ])("invalidates the token when the $name changes", async ({ replacement }) => {
+    const f = await applicationFixture();
+    await f.settings.provider(repository, "worker").listIssues();
+    f.credentials.set("worker", { ...workerApp, ...replacement });
+    await f.settings.provider(repository, "worker").listIssues();
+    await f.settings.provider(repository, "worker").listIssues();
+    expect(f.exchanges).toHaveLength(2);
+    expect(f.authorizations).toEqual(["Bearer installation-1", "Bearer installation-2", "Bearer installation-2"]);
+  });
+
+  it.each(["disconnect", "static token"])("discards prior application authorization after %s", async change => {
+    const f = await applicationFixture();
+    await f.settings.provider(repository, "worker").listIssues();
+    if (change === "disconnect") {
+      f.credentials.delete("worker");
+      await expect(f.settings.provider(repository, "worker").listIssues()).rejects.toThrow("Connect the worker");
+    } else {
+      f.credentials.set("worker", { kind: "token", token: "replacement-static-token" });
+      await f.settings.provider(repository, "worker").listIssues();
+      expect(f.authorizations.at(-1)).toBe("Bearer replacement-static-token");
+    }
+    f.credentials.set("worker", workerApp);
+    await f.settings.provider(repository, "worker").listIssues();
+    expect(f.exchanges).toHaveLength(2);
+    expect(f.authorizations.at(-1)).toBe("Bearer installation-2");
+  });
+
+  it.each([
+    { name: "project", next: { ...repository, projectPath: "org/other" } },
+    { name: "API host", next: { ...repository, apiUrl: "https://github.example/api/v3" } },
+    { name: "provider", next: { ...repository, provider: "gitlab" as const, apiUrl: "https://gitlab.example/api/v4" } },
+  ])("keeps cached authorization within the selected $name identity", async ({ next }) => {
+    const f = await applicationFixture();
+    await f.settings.provider(repository, "worker").listIssues();
+    await f.config.update({ plugins: { forge: next } });
+    if (next.provider === "gitlab") f.credentials.set("worker", { kind: "token", token: "gitlab-private" });
+    await f.settings.gitAccess(next, "worker");
+    await f.config.update({ plugins: { forge: { ...repository } } });
+    f.credentials.set("worker", workerApp);
+    await f.settings.provider(repository, "worker").listIssues();
+    expect(f.exchanges).toHaveLength(next.provider === "gitlab" ? 2 : 3);
+    expect(f.authorizations.at(-1)).toBe("Bearer installation-" + f.exchanges.length);
+  });
+
+  it("does not share a caller's cancelled token exchange with a different provider acquisition", async () => {
+    const f = await fixture();
+    f.credentials.set("worker", workerApp);
+    const paused = new AbortController();
+    let notifyBothStarted!: () => void;
+    const bothStarted = new Promise<void>(resolve => { notifyBothStarted = resolve; });
+    const exchanges: { signal: AbortSignal; resolve: (response: Response) => void }[] = [];
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, options) => {
+      if (!String(url).endsWith("/access_tokens")) return Response.json({ items: [], incomplete_results: false });
+      return new Promise<Response>((resolve, reject) => {
+        const signal = options!.signal!;
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        exchanges.push({ signal, resolve });
+        if (exchanges.length === 2) notifyBothStarted();
+        if (exchanges.length > 2) resolve(Response.json({ token: "extra-token", expires_at: new Date(Date.now() + 3_600_000).toISOString() }));
+      });
+    });
+    const first = f.settings.provider(repository, "worker", paused.signal).listIssues().catch(error => error);
+    const second = f.settings.provider(repository, "worker").listIssues();
+    await bothStarted;
+    paused.abort(new Error("private cancellation context"));
+    const error = await first;
+    exchanges[1].resolve(Response.json({ token: "surviving-token", expires_at: new Date(Date.now() + 3_600_000).toISOString() }));
+    await second;
+    expect(error).toBeInstanceOf(ForgeProviderUnavailableError);
+    expect(error).toMatchObject({ failure: "cancelled" });
+    expect(error.message).not.toContain("private cancellation context");
+    expect(exchanges[1].signal.aborted).toBe(false);
+    await f.settings.provider(repository, "worker").listIssues();
+    expect(exchanges).toHaveLength(2);
+    expect(fetcher).toHaveBeenCalledTimes(4);
+  });
 });
 
 async function fixture() {
@@ -207,7 +330,7 @@ describe("Forge connected application settings", () => {
     controller.abort(new Error("worker canceled"));
     await expect(
       settings.gitAccess(repository, "worker", controller.signal),
-    ).rejects.toThrow("worker canceled");
+    ).rejects.toMatchObject({ name: "ForgeProviderUnavailableError", failure: "cancelled" });
     const other = { ...repository, projectPath: "org/other" };
     expect(() => settings.provider(other, "worker")).toThrow(
       "different repository",

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { hasUnconfirmedPublication } from "@cloudx/shared";
+import { hasUnconfirmedPublication, MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
 import type {
   CodexReasoningEffort,
   ForgeChangeRequest,
@@ -13,7 +13,7 @@ import type {
   ForgeReviewSubmission,
   ForgeWorker,
 } from "@cloudx/shared";
-import { ForgeHeadChangedError, ForgeMergeNotStartedError, type ForgeProvider } from "./providers/ForgeProvider.js";
+import { ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeProviderUnavailableError, type ForgeProvider } from "./providers/ForgeProvider.js";
 import { parseReview, parseWorkerReport } from "./ForgeWorkflowValidation.js";
 
 export interface ForgeSettings {
@@ -51,6 +51,11 @@ interface Runtime {
     },
     signal?: AbortSignal,
   ): Promise<{ worktreePath: string; branch: string; repositoryPath: string }>;
+  refreshReviewWorkspace(
+    workspace: { id: string; repositoryPath: string; worktreePath: string; branch: string },
+    revision: { headSha: string; baseSha: string; baseBranch: string },
+    signal?: AbortSignal,
+  ): Promise<void>;
   launch(
     input: {
       id: string;
@@ -167,7 +172,6 @@ export class ForgeWorkflowService {
       )) {
         await this.quiesce(worker, { retainReport: worker.kind === "issue" && !worker.pendingPublication });
         worker.status = "paused";
-        if (worker.kind === "review") await this.cleanup(worker);
       }
       await this.persist();
     });
@@ -258,6 +262,10 @@ export class ForgeWorkflowService {
       if ((item as ForgeChangeRequest).headSha !== issueWorker.headSha || !(item as ForgeChangeRequest).reviewReady)
         throw new Error("The published commit changed or is still processing. Inspect the request before resuming auto review.");
     }
+    const reviewer = kind === "review" ? this.workers.find(worker =>
+      worker.kind === "review" && worker.number === number && sameRepository(worker.repository, repository)) : undefined;
+    if (reviewer)
+      return this.startReviewRound(reviewer, item as ForgeChangeRequest, autoPost, placement, controller, issueWorker);
     const now = new Date().toISOString();
     const worker: ForgeWorker = {
       id: randomUUID(),
@@ -314,6 +322,54 @@ export class ForgeWorkflowService {
     }
     return structuredClone(worker);
   }
+  private async startReviewRound(
+    worker: ForgeWorker,
+    change: ForgeChangeRequest,
+    autoPost: boolean,
+    placement: ForgePlacement,
+    controller: AbortController,
+    issueWorker?: ForgeWorker,
+  ): Promise<ForgeWorker> {
+    if (worker.draft && ["posting", "post_failed"].includes(worker.draft.status))
+      throw new Error("The previous review submission must be reconciled before starting another review.");
+    if (worker.draft && (worker.reviewHistory?.length ?? 0) >= MAX_FORGE_REVIEW_HISTORY)
+      throw new Error("The review history limit has been reached. Inspect this worker before starting another review.");
+    if (issueWorker && worker.issueWorkerId && worker.issueWorkerId !== issueWorker.id)
+      throw new Error("This reviewer belongs to another issue worker.");
+    this.operations.set(worker.id, controller);
+    if (worker.draft) (worker.reviewHistory ??= []).push(worker.draft);
+    worker.draft = undefined;
+    worker.autoPost = autoPost;
+    worker.templateId = this.deps.settings().reviewTemplateId;
+    worker.title = change.title;
+    worker.changeUrl = change.url;
+    worker.startedAt = new Date().toISOString();
+    if (issueWorker) {
+      worker.issueWorkerId = issueWorker.id;
+      issueWorker.autoReview!.reviewWorkerId = worker.id;
+    }
+    worker.status = "starting";
+    await this.persist();
+    try {
+      await this.recoverResources(worker);
+      await this.quiesce(worker);
+      await this.refreshReview(worker, change, controller.signal);
+      await this.persist();
+      const parent = worker.issueWorkerId ? this.requireWorker(worker.issueWorkerId) : undefined;
+      const issue = parent ? await this.providerFor(parent).getIssue(parent.number) : undefined;
+      await this.launch(worker, placement, { item: change, issue });
+    } catch (error) {
+      await this.fail(worker, error);
+    }
+    return structuredClone(worker);
+  }
+  private async refreshReview(worker: ForgeWorker, change: ForgeChangeRequest, signal?: AbortSignal): Promise<void> {
+    await this.deps.runtime.refreshReviewWorkspace(workerWorkspace(worker), {
+      headSha: change.headSha, baseSha: change.baseSha, baseBranch: change.baseBranch,
+    }, signal);
+    worker.headSha = change.headSha;
+    worker.baseBranch = change.baseBranch;
+  }
   pause(id: string): Promise<ForgeWorker> {
     return this.control(id, "paused");
   }
@@ -351,8 +407,6 @@ export class ForgeWorkflowService {
           );
         await this.quiesce(worker, { closeTab: false });
         worker.status = status;
-        if (worker.kind === "review" && status === "stopped")
-          await this.cleanup(worker);
         await this.persist();
         this.operations.delete(worker.id);
       }
@@ -395,10 +449,12 @@ export class ForgeWorkflowService {
     if (await this.reconcileMergedChange(worker, { retryCleanupId: worker.id }))
       return structuredClone(worker);
     controller.signal.throwIfAborted();
+    if (worker.kind === "review" && worker.draft && ["posting", "post_failed"].includes(worker.draft.status))
+      throw new Error("The previous review submission must be reconciled before resuming.");
     if (recoveringResources) {
       await this.recoverResources(worker);
-      if (worker.kind === "review") {
-        await this.cleanup(worker);
+      if (worker.kind === "review" && worker.draft) {
+        await this.quiesce(worker);
         worker.status = "completed";
         await this.persist();
         if (
@@ -417,6 +473,13 @@ export class ForgeWorkflowService {
     try {
       const provider = this.providerFor(worker);
       if (!recoveringResources) await this.recoverResources(worker);
+      if (worker.kind === "review" && worker.draft) {
+        await this.quiesce(worker);
+        worker.status = "completed";
+        await this.persist();
+        if (worker.autoPost && !this.autoReviewParent(worker)) await this.postDraft(worker);
+        return structuredClone(worker);
+      }
       if (worker.kind === "issue" && worker.attemptId && !worker.pendingPublication) {
         const raw = await this.deps.reports.read(worker.attemptId);
         if (raw !== undefined) {
@@ -462,9 +525,11 @@ export class ForgeWorkflowService {
       }
       await this.quiesce(worker);
       if (worker.kind === "review" && change) {
-        await this.cleanup(worker);
-        worker.headSha = change.headSha;
-        worker.baseBranch = change.baseBranch;
+        if (worker.worktreePath) await this.refreshReview(worker, change, controller.signal);
+        else {
+          worker.headSha = change.headSha;
+          worker.baseBranch = change.baseBranch;
+        }
       }
       if (!worker.worktreePath)
         Object.assign(
@@ -491,13 +556,17 @@ export class ForgeWorkflowService {
   }
   saveReview(
     id: string,
+    draftId: string,
     input: Pick<ForgeReviewSubmission, "body" | "comments" | "event">,
   ): Promise<ForgeWorker> {
     return this.exclusive(async () => {
       const worker = this.requireWorker(id);
+      this.requireCurrentReview(worker, draftId);
       if (!worker.draft || worker.draft.status !== "draft")
         throw new Error("Only an unsubmitted draft can be edited.");
       worker.draft = {
+        id: worker.draft.id,
+        startedAt: worker.draft.startedAt,
         ...parseReview({ ...input, headSha: worker.draft.headSha }),
         status: "draft",
       };
@@ -505,12 +574,17 @@ export class ForgeWorkflowService {
       return structuredClone(worker);
     });
   }
-  submitReview(id: string): Promise<ForgeWorker> {
+  submitReview(id: string, draftId: string): Promise<ForgeWorker> {
     return this.exclusive(async () => {
       const worker = this.requireWorker(id);
+      this.requireCurrentReview(worker, draftId);
       await this.postDraft(worker);
       return structuredClone(worker);
     });
+  }
+  private requireCurrentReview(worker: ForgeWorker, draftId: string): void {
+    if (!worker.draft || typeof draftId !== "string" || worker.draft.id !== draftId)
+      throw new Error("The current review changed. Refresh before editing or submitting it.");
   }
   async markReview(
     repository: ForgeRepository,
@@ -584,15 +658,20 @@ export class ForgeWorkflowService {
             await this.persist();
             retainReport = false;
           }
-          await this.quiesce(worker, { closeTab: report.kind === "review" });
-          if (report.kind === "issue") await this.issueReady(worker);
+          if (report.kind === "issue") {
+            await this.quiesce(worker, { closeTab: false });
+            await this.issueReady(worker);
+          }
           else {
             if (report.headSha !== worker.headSha)
               throw new Error(
                 "Review report does not match the checked out commit.",
               );
-            worker.draft = { ...parseReview(report), status: "draft" };
-            await this.cleanup(worker);
+            retainReport = true;
+            worker.draft = { ...parseReview(report), id: worker.attemptId!, startedAt: worker.startedAt, status: "draft" };
+            await this.persist();
+            retainReport = false;
+            await this.quiesce(worker);
             worker.status = "completed";
             await this.persist();
             if (worker.autoPost && !this.autoReviewParent(worker)) await this.postDraft(worker);
@@ -624,18 +703,25 @@ export class ForgeWorkflowService {
   private async resumeAutoReview(worker: ForgeWorker, placement: ForgePlacement): Promise<ForgeWorker> {
     if (!["paused", "stopped", "failed", "cleanup_failed", "awaiting_review", "awaiting_merge"].includes(worker.status))
       throw new Error("This issue loop is not waiting to resume.");
-    if (await this.reconcileMergedChange(worker, { retryCleanupId: worker.id })) return structuredClone(worker);
+    const controller = new AbortController();
+    this.operations.set(worker.id, controller);
+    try {
+      if (await this.reconcileMergedChange(worker, { retryCleanupId: worker.id, signal: controller.signal })) return structuredClone(worker);
+      controller.signal.throwIfAborted();
+    } catch (error) {
+      if (!await this.handleProviderInterruption(worker, error)) throw error;
+      return structuredClone(worker);
+    }
     const loop = worker.autoReview!;
     if (worker.mergeAttempted)
       throw new Error("The previous merge must be reconciled with the provider before continuing. Forge will not repeat it.");
     const review = this.autoReviewer(worker);
     if (review?.draft && ["posting", "post_failed"].includes(review.draft.status))
       throw new Error("The previous review submission must be reconciled with the provider before continuing. Forge will not repost it.");
-    this.operations.set(worker.id, new AbortController());
     try {
       await this.recoverResources(worker);
       await this.quiesce(worker);
-      await this.deps.runtime.verifyPublishedWorkspace(issueWorkspace(worker), worker.headSha!);
+      await this.deps.runtime.verifyPublishedWorkspace(workerWorkspace(worker), worker.headSha!);
       loop.placement = placement;
       loop.waitingSince = undefined;
       worker.status = loop.phase === "merging" ? "awaiting_merge" : "awaiting_review";
@@ -646,7 +732,7 @@ export class ForgeWorkflowService {
       this.nextAutoReviewCheckAt.delete(worker.id);
       await this.advanceAutoReviews();
     } catch (error) {
-      await this.fail(worker, error);
+      if (!await this.handleProviderInterruption(worker, error)) await this.fail(worker, error);
     }
     return structuredClone(worker);
   }
@@ -660,9 +746,24 @@ export class ForgeWorkflowService {
       try {
         await this.advanceAutoReview(worker);
       } catch (error) {
-        if (!this.disposed) await this.fail(worker, error);
+        if (!this.disposed && !await this.handleProviderInterruption(worker, error)) await this.fail(worker, error);
       }
     }
+  }
+  private async handleProviderInterruption(worker: ForgeWorker, error: unknown): Promise<boolean> {
+    const unavailable = error instanceof ForgeMergeNotStartedError ? error.cause : error;
+    const signal = this.operations.get(worker.id)?.signal;
+    if (signal?.aborted && (error === signal.reason || unavailable instanceof ForgeProviderUnavailableError)) return true;
+    if (!(unavailable instanceof ForgeProviderUnavailableError)) return false;
+    if (worker.mergeAttempted || worker.pendingPublication ||
+      !["awaiting_review", "awaiting_merge", "paused", "stopped", "failed"].includes(worker.status)) return false;
+    const review = this.autoReviewer(worker);
+    if (review && (["starting", "running"].includes(review.status) ||
+      review.draft && ["posting", "post_failed"].includes(review.draft.status))) return false;
+    this.operations.delete(worker.id);
+    this.nextAutoReviewCheckAt.delete(worker.id);
+    await this.pauseAutoReview(worker, `${unavailable.message} Resume the issue loop when provider access is restored.`);
+    return true;
   }
   private async autoReviewContext(worker: ForgeWorker): Promise<{ issue: ForgeIssueDetail; change: ForgeChangeRequest } | undefined> {
     if (!worker.changeNumber || !worker.headSha) throw new Error("Auto review requires confirmed published work.");
@@ -780,7 +881,7 @@ export class ForgeWorkflowService {
     }
     if (!context.change.mergeable) return;
     const signal = this.operations.get(worker.id)?.signal;
-    await this.deps.runtime.verifyPublishedWorkspace(issueWorkspace(worker), worker.headSha!);
+    await this.deps.runtime.verifyPublishedWorkspace(workerWorkspace(worker), worker.headSha!);
     signal?.throwIfAborted();
     const latest = await this.autoReviewContext(worker);
     if (!latest) return;
@@ -846,7 +947,7 @@ export class ForgeWorkflowService {
     await this.issueReady(worker);
   }
   private async issueReady(worker: ForgeWorker): Promise<void> {
-    const workspace = issueWorkspace(worker);
+    const workspace = workerWorkspace(worker);
     const publication = worker.pendingPublication;
     if (!publication) throw new Error("Issue completion report is missing.");
     const { report } = publication;
@@ -929,7 +1030,7 @@ export class ForgeWorkflowService {
       throw new Error("The change request changed during the base update. The owned checkout was preserved for inspection.");
   }
   private async confirmPublication(worker: ForgeWorker): Promise<void> {
-    const workspace = issueWorkspace(worker);
+    const workspace = workerWorkspace(worker);
     const publication = worker.pendingPublication;
     if (!publication?.headSha || !worker.changeNumber)
       throw new Error("Publication confirmation requires a pushed commit and a change request.");
@@ -1126,6 +1227,7 @@ export class ForgeWorkflowService {
         : "Review the exact checked-out commit against the pinned base commit using the local Git checkout. Do not alter the checkout or publish anything. The comments array contains actionable findings only, with file path and new line for inline findings. Set event to approve when the implementation satisfies the issue and review feedback and no issues remain; an issue-free review must explicitly approve. Set event to request_changes when actionable findings remain. Use comment only when human clarification or a decision is required. Write the completion report when finished.";
     if (worker.kind === "review") {
       const change = context.item as ForgeChangeRequest;
+      instructions += " Continue this request's review in the same conversation. Read the current task and feedback again; earlier conclusions apply only where the current code still supports them. Reassess the complete pinned comparison and verify how previous findings were addressed.";
       instructions += ` Both commits and their history are already fetched. Compare with git diff --no-ext-diff --no-textconv ${change.baseSha}...${change.headSha} --. Inspect every changed file; if command output is clipped, inspect smaller file ranges until the review is complete. Do not use the provider's downloadable diff, which may omit large changes.`;
     }
     if (worker.issueWorkerId)
@@ -1354,7 +1456,6 @@ export class ForgeWorkflowService {
       try {
         await this.recoverResources(worker);
         await this.quiesce(worker, { retainReport });
-        if (worker.kind === "review") await this.cleanup(worker);
       } catch {
         worker.status = "cleanup_failed";
       }
@@ -1445,7 +1546,6 @@ export class ForgeWorkflowService {
             try {
               await this.recoverResources(worker);
               await this.quiesce(worker, { retainReport: worker.kind === "issue" && !worker.pendingPublication });
-              if (worker.kind === "review") await this.cleanup(worker);
             } catch {
               worker.status = "cleanup_failed";
               worker.error =
@@ -1470,9 +1570,9 @@ function reviewSubmission(draft: ForgeReviewDraft): ForgeReviewSubmission {
     comments: draft.comments,
   };
 }
-function issueWorkspace(worker: ForgeWorker) {
-  if (!worker.worktreePath || !worker.branch || !worker.repositoryPath)
-    throw new Error("Issue workspace is missing.");
+function workerWorkspace(worker: ForgeWorker) {
+  if (!worker.worktreePath || worker.branch === undefined || !worker.repositoryPath)
+    throw new Error("Worker workspace is missing.");
   return { id: worker.id, repositoryPath: worker.repositoryPath, worktreePath: worker.worktreePath, branch: worker.branch };
 }
 function requirePublicationRequest(worker: ForgeWorker, change: ForgeChangeRequestStatus): void {

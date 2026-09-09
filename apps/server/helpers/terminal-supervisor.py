@@ -89,7 +89,8 @@ class TerminalSupervisor:
                     print(f"Terminal command failed to start: {error}", file=sys.stderr, flush=True)
                     os._exit(127)
             os.setpgid(self.worker, self.worker)
-            os.tcsetpgrp(0, self.worker)
+            if os.isatty(0):
+                os.tcsetpgrp(0, self.worker)
             os.write(write_gate, b"1")
         finally:
             os.close(read_gate)

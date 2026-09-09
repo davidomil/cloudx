@@ -25,9 +25,9 @@ describe("canceling provider operations", () => {
       fetcher,
       signal,
     });
-    await expect(provider.listIssues()).rejects.toThrow("Worker paused");
+    await expect(provider.listIssues()).rejects.toMatchObject({ name: "ForgeProviderUnavailableError", failure: "cancelled" });
     await expect(credentials.headers("worker", signal)).rejects.toThrow(
-      "Worker paused",
+      "The forge request was cancelled.",
     );
     expect(read).not.toHaveBeenCalled();
     expect(fetcher).not.toHaveBeenCalled();
@@ -45,7 +45,7 @@ describe("canceling provider operations", () => {
       new ForgeCredentials(repository, read, fetcher),
       { fetcher, signal: controller.signal },
     );
-    await expect(provider.listIssues()).rejects.toThrow("Worker stopped");
+    await expect(provider.listIssues()).rejects.toMatchObject({ name: "ForgeProviderUnavailableError", failure: "cancelled" });
     expect(fetcher).not.toHaveBeenCalled();
   });
 
@@ -64,7 +64,7 @@ describe("canceling provider operations", () => {
       http.request("/repos/owner/repo", {
         signal: AbortSignal.abort(new Error("Request canceled")),
       }),
-    ).rejects.toThrow("Request canceled");
+    ).rejects.toMatchObject({ name: "ForgeProviderUnavailableError", failure: "cancelled" });
     expect(read).not.toHaveBeenCalled();
     expect(fetcher).not.toHaveBeenCalled();
   });
@@ -102,7 +102,7 @@ describe("canceling provider operations", () => {
     );
     const rejected = expect(
       credentials.headers("worker", controller.signal),
-    ).rejects.toThrow("authentication could not reach");
+    ).rejects.toMatchObject({ name: "ForgeProviderUnavailableError", failure: "cancelled" });
     await exchangeStarted;
     controller.abort();
     await rejected;
@@ -154,7 +154,7 @@ describe("canceling provider operations", () => {
               });
         const rejected = expect(result).rejects.toThrow(
           operation === "read"
-            ? "request was interrupted"
+            ? "request was cancelled"
             : "remote result is unknown",
         );
         await requestStarted;
@@ -199,7 +199,7 @@ describe("canceling provider operations", () => {
     );
     await expect(
       http.all("/repos/owner/repo/issues/7/comments"),
-    ).rejects.toThrow("request was interrupted");
+    ).rejects.toMatchObject({ name: "ForgeProviderUnavailableError", failure: "cancelled" });
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 });

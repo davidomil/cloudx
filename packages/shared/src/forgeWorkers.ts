@@ -1,6 +1,7 @@
 import type { ForgeRepository, ForgeReviewComment, ForgeReviewPublication } from "./forge.js";
 
 export const FORGE_PLUGIN_ID = "forge";
+export const MAX_FORGE_REVIEW_HISTORY = 1000;
 export type ForgeWorkerStatus =
   | "starting"
   | "running"
@@ -57,11 +58,14 @@ export interface ForgeWorker {
   autoReview?: ForgeAutoReview;
   issueWorkerId?: string;
   draft?: ForgeReviewDraft;
+  reviewHistory?: ForgeReviewDraft[];
   error?: string;
   startedAt: string;
   updatedAt: string;
 }
 export interface ForgeReviewDraft {
+  id: string;
+  startedAt: string;
   headSha: string;
   body: string;
   comments: ForgeReviewComment[];
