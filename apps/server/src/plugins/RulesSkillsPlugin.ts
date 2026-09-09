@@ -79,8 +79,13 @@ export class RulesSkillsPlugin implements WorkspacePlugin {
         title: "Push Rules Skills Commits",
         description: "Push existing catalog commits to the same-named branch on origin without forcing or committing local changes.",
         exposures: ["app", "plugin", "ui", "http"],
-        inputSchema: { type: "object", properties: {}, additionalProperties: false },
-        execute: async () => ({ git: await this.catalog.pushGit() })
+        inputSchema: {
+          type: "object",
+          properties: { expectedOriginUrl: { type: "string", minLength: 1, maxLength: 4096 } },
+          required: ["expectedOriginUrl"],
+          additionalProperties: false
+        },
+        execute: async (input) => ({ git: await this.catalog.pushGit(input.expectedOriginUrl) })
       },
       {
         id: "rules-skills.catalog.list",

@@ -146,8 +146,8 @@ export class RulesSkillsCatalogService {
     });
   }
 
-  pushGit(): Promise<RulesSkillsGitState> {
-    return this.withCatalogMutation(() => this.git.push());
+  pushGit(expectedOriginUrl: unknown): Promise<RulesSkillsGitState> {
+    return this.withCatalogMutation(() => this.git.push(expectedOriginUrl));
   }
 
   async saveTemplate(input: Record<string, unknown>): Promise<RulesSkillsStore> {

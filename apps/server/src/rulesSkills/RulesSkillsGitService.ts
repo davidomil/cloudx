@@ -36,7 +36,7 @@ export class RulesSkillsGitService {
       throw new Error("The Git checkout must be rooted at the rules/skills catalog; an enclosing repository cannot be managed here.");
     }
     const [branch, origin, changes, head] = await Promise.all([
-      this.git(["symbolic-ref", "--quiet", "--short", "HEAD"], [0, 1]),
+      this.git(["symbolic-ref", "--quiet", "HEAD"], [0, 1]),
       this.git(["remote", "get-url", "origin"], [0, 2]),
       this.git(["status", "--porcelain=v1", "--untracked-files=normal"]),
       this.git(["rev-parse", "--verify", "--quiet", "HEAD"], [0, 1])
@@ -44,7 +44,7 @@ export class RulesSkillsGitService {
     return {
       isRepository: true,
       rootPath: this.rootPath,
-      branch: branch.code === 0 ? branch.stdout.trim() : undefined,
+      branch: branch.code === 0 ? branch.stdout.trim().replace(/^refs\/heads\//u, "") : undefined,
       originUrl: origin.code === 0 ? publicOriginUrl(origin.stdout.trim()) : undefined,
       hasChanges: Boolean(changes.stdout),
       hasCommits: head.code === 0
@@ -75,8 +75,14 @@ export class RulesSkillsGitService {
     ]);
   }
 
-  async push(): Promise<RulesSkillsGitState> {
+  async push(expectedOriginUrl: unknown): Promise<RulesSkillsGitState> {
     const state = await this.requireSyncState();
+    if (typeof expectedOriginUrl !== "string" || !expectedOriginUrl.trim()) {
+      throw new Error("expectedOriginUrl must be a non-empty string.");
+    }
+    if (state.originUrl !== expectedOriginUrl) {
+      throw new Error("Origin changed since it was displayed. Refresh Git status and review the destination before pushing.");
+    }
     await this.requireMatchingOriginDestinations();
     await this.git([
       "-c", "remote.origin.mirror=false", "push", "--no-force", "--no-follow-tags", "--recurse-submodules=no",
@@ -175,15 +181,20 @@ function validateOriginUrl(input: unknown): string {
 }
 
 function publicOriginUrl(url: string): string {
+  const helperPrefix = url.match(/^[\w+.-]+::/u)?.[0] ?? "";
+  const address = url.slice(helperPrefix.length);
+  const isUrl = helperPrefix || address.includes("://") || /^(?:https?|ssh|git|file):/iu.test(address);
+  if (!isUrl) return url;
   try {
-    const parsed = new URL(url);
+    const parsed = new URL(address);
+    if (!parsed.host && parsed.protocol !== "file:") throw new Error("Origin has no URL host.");
     parsed.password = "";
     if (parsed.protocol === "http:" || parsed.protocol === "https:") parsed.username = "";
     parsed.search = "";
     parsed.hash = "";
-    return parsed.toString();
+    return helperPrefix + parsed.toString();
   } catch {
-    return url;
+    throw new Error("The configured origin URL cannot be displayed safely. Update it in Git configuration.");
   }
 }
 

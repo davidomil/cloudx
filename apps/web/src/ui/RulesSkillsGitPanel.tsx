@@ -5,14 +5,14 @@ import type { RulesSkillsGitState } from "@cloudx/shared";
 import { ControlButton } from "./Control.js";
 
 export interface RulesSkillsGitActions {
+  git: RulesSkillsGitState | undefined;
   onLoadGit: () => Promise<RulesSkillsGitState>;
   onSetGitOrigin: (originUrl: string) => Promise<RulesSkillsGitState>;
   onPullGit: () => Promise<RulesSkillsGitState>;
-  onPushGit: () => Promise<RulesSkillsGitState>;
+  onPushGit: (expectedOriginUrl: string) => Promise<RulesSkillsGitState>;
 }
 
-export function RulesSkillsGitPanel({ onLoadGit, onSetGitOrigin, onPullGit, onPushGit, disabled, hasUnsavedChanges }: RulesSkillsGitActions & { disabled: boolean; hasUnsavedChanges: boolean }) {
-  const [git, setGit] = useState<RulesSkillsGitState>();
+export function RulesSkillsGitPanel({ git, onLoadGit, onSetGitOrigin, onPullGit, onPushGit, disabled, hasUnsavedChanges }: RulesSkillsGitActions & { disabled: boolean; hasUnsavedChanges: boolean }) {
   const [originDraft, setOriginDraft] = useState<string>();
   const [pending, setPending] = useState<string>();
   const [error, setError] = useState<string>();
@@ -25,9 +25,7 @@ export function RulesSkillsGitPanel({ onLoadGit, onSetGitOrigin, onPullGit, onPu
     let active = true;
     setPending("Loading Git status…");
     running.current = true;
-    onLoadGit().then((state) => {
-      if (active) setGit(state);
-    }).catch((err) => {
+    onLoadGit().catch((err) => {
       if (active) setError(err instanceof Error ? err.message : String(err));
     }).finally(() => {
       if (active) {
@@ -48,9 +46,8 @@ export function RulesSkillsGitPanel({ onLoadGit, onSetGitOrigin, onPullGit, onPu
     setError(undefined);
     setStatus("");
     try {
-      const state = await action();
+      await action();
       if (mounted.current) {
-        setGit(state);
         setStatus(success);
       }
     } catch (err) {
@@ -95,7 +92,7 @@ export function RulesSkillsGitPanel({ onLoadGit, onSetGitOrigin, onPullGit, onPu
         <p>Pull updates this catalog from origin. Push sends existing commits to the same branch on origin; it does not create commits.</p>
         <div className="rules-skills-git-actions">
           <ControlButton size="compact" onClick={() => void run("Pulling…", onPullGit, "Pulled from origin. Rules and skills refreshed.")} disabled={busy || !canSync || hasUnsavedChanges || git.hasChanges}><ArrowDown size={14} /> Pull</ControlButton>
-          <ControlButton size="compact" onClick={() => void run("Pushing commits…", onPushGit, "Commits pushed to origin.")} disabled={busy || !canSync || !git.hasCommits}><ArrowUp size={14} /> Push commits</ControlButton>
+          <ControlButton size="compact" onClick={() => void run("Pushing commits…", () => onPushGit(origin.trim()), "Commits pushed to origin.")} disabled={busy || !canSync || !git.hasCommits}><ArrowUp size={14} /> Push commits</ControlButton>
         </div>
       </> : git ? <p>This catalog is not a Git checkout. Use an existing Git checkout at this catalog root to configure origin, pull, and push.</p> : null}
       {pending || status ? <p role="status">{pending ?? status}</p> : null}

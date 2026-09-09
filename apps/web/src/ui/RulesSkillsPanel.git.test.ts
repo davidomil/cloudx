@@ -3,7 +3,7 @@
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { RulesSkillsGitState, RulesSkillsStore } from "@cloudx/shared";
+import type { CloudxRule, RulesSkillsGitState, RulesSkillsStore } from "@cloudx/shared";
 
 import { RulesSkillsPanel } from "./RulesSkillsPanel.js";
 
@@ -22,16 +22,16 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
-async function mount(onPullGit = vi.fn(async () => checkout), onRefreshStore?: () => Promise<void>) {
+async function mount(onPullGit = vi.fn(async () => checkout), onRefreshStore?: () => Promise<void>, onSaveRule: (rule: CloudxRule) => Promise<void> = async () => undefined) {
   const props = {
     store,
     onSaveTemplate: async () => undefined,
     onDeleteTemplate: async () => undefined,
     onSetDefault: async () => undefined,
-    onSaveRule: async () => undefined,
+    onSaveRule,
     onDeleteRule: async () => undefined,
     onRefreshStore,
-    gitActions: { onLoadGit: async () => checkout, onSetGitOrigin: async () => checkout, onPushGit: async () => checkout, onPullGit }
+    gitActions: { git: checkout, onLoadGit: async () => checkout, onSetGitOrigin: async () => checkout, onPushGit: async () => checkout, onPullGit }
   };
   const container = document.createElement("div");
   document.body.append(container);
@@ -55,6 +55,39 @@ async function fill(input: HTMLInputElement, value: string) {
 }
 
 describe("catalog Git and template drafts", () => {
+  it("keeps a removed rule draft accessible after saving fails and permits cancellation", async () => {
+    const onSaveRule = vi.fn(async () => { throw new Error("Could not save rule."); });
+    const { container, render } = await mount(undefined, undefined, onSaveRule);
+    await click(container, "Edit rule focused");
+    await act(async () => {
+      const editor = container.querySelector<HTMLElement>('[aria-label="Rule text for focused"]')!;
+      editor.textContent = "Keep this draft.";
+      editor.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await render({ ...store, rules: [], templates: [{ ...store.templates[0], ruleIds: [] }] });
+    await click(container, "Save rule focused");
+    expect(container.textContent).toContain("Could not save rule.");
+    expect(container.querySelector('[aria-label="Rule text for focused"]')?.textContent).toBe("Keep this draft.");
+    expect(button(container, "Save rule focused").disabled).toBe(false);
+    expect(button(container, "Pull").disabled).toBe(true);
+    await click(container, "Cancel editing focused");
+    expect(container.querySelector('[aria-label="Rule text for focused"]')).toBeNull();
+    expect(button(container, "Pull").disabled).toBe(false);
+  });
+
+  it("retains missing selections until the user deselects them or the catalog restores them", async () => {
+    const { container, render } = await mount();
+    await fill(container.querySelector<HTMLInputElement>(".rules-skills-template-fields input")!, "Keep this template name");
+    await render({ ...store, rules: [], templates: [{ ...store.templates[0], ruleIds: [] }] });
+    expect(container.querySelector<HTMLInputElement>('[aria-label="Missing rule focused"]')?.checked).toBe(true);
+    expect(button(container, "Save template").disabled).toBe(true);
+    await render(store);
+    expect(container.querySelector('[aria-label="Missing rule focused"]')).toBeNull();
+    expect(container.querySelector<HTMLInputElement>('.rule-option input[type="checkbox"]')?.checked).toBe(true);
+    expect(container.querySelector<HTMLInputElement>(".rules-skills-template-fields input")!.value).toBe("Keep this template name");
+    expect(button(container, "Save template").disabled).toBe(false);
+  });
+
   it.each(["template", "new rule", "rule edit", "new template"])("blocks pull while there is a %s draft", async (draft) => {
     const { container, onPullGit } = await mount();
     expect(button(container, "Pull").disabled).toBe(false);

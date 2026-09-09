@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import type { WorkspaceStateResponse } from "@cloudx/shared";
+import type { CreateTabResponse, WorkspaceStateResponse } from "@cloudx/shared";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import net from "node:net";
@@ -256,4 +256,220 @@ test("configures origin, pushes commits, and pulls into the visible catalog with
   await expect(
     panel.getByRole("button", { name: "Push commits" }),
   ).toBeEnabled();
+
+  await panel.getByLabel("Origin URL").fill(remote);
+  await panel.getByRole("button", { name: "Save origin" }).click();
+  await expect(panel).toContainText("Origin saved.");
+  const localTemplatePath = path.join(
+    catalog,
+    "templates",
+    "default-codex.json",
+  );
+  const localTemplate = JSON.parse(
+    await fs.readFile(localTemplatePath, "utf8"),
+  );
+  for (const id of ["draft-rule", "removed-rule"]) {
+    await fs.writeFile(
+      path.join(catalog, "rules", `${id}.md`),
+      `---\nid: ${id}\ndescription: Fixture rule.\n---\nKeep ${id} changes focused.\n`,
+    );
+  }
+  const skillDirectory = path.join(catalog, "skills", "draft-skill");
+  await fs.mkdir(skillDirectory);
+  await fs.writeFile(
+    path.join(skillDirectory, "SKILL.md"),
+    "---\nname: draft-skill\ndescription: Fixture skill.\ncloudx_name: Draft skill\n---\nReview the fixture changes.\n",
+  );
+  const selectedTemplate = {
+    ...localTemplate,
+    ruleIds: [...localTemplate.ruleIds, "draft-rule", "removed-rule"],
+    skillIds: [...localTemplate.skillIds, "draft-skill"],
+  };
+  await fs.writeFile(
+    localTemplatePath,
+    `${JSON.stringify(selectedTemplate)}\n`,
+  );
+  await git(catalog, "add", ".");
+  await git(catalog, "commit", "-m", "Seed draft recovery fixtures");
+  await git(catalog, "push", "origin", "main");
+
+  await page.goto("about:blank");
+  const { tab: firstTab } = (await created.json()) as CreateTabResponse;
+  const secondCreated = await page.request.post(`${baseUrl}/api/tabs`, {
+    data: {
+      pluginId: "rules-skills",
+      title: "Draft editor",
+      windowId: activeWindow.id,
+      paneId: activeWindow.layout.activePaneId,
+    },
+  });
+  expect(secondCreated.status()).toBe(201);
+  const { tab: secondTab } = (await secondCreated.json()) as CreateTabResponse;
+  const split = await page.request.patch(
+    `${baseUrl}/api/windows/${activeWindow.id}`,
+    {
+      data: {
+        layout: {
+          activePaneId: "draft-pane",
+          root: {
+            type: "split",
+            id: "draft-split",
+            direction: "column",
+            sizes: [50, 50],
+            children: [
+              {
+                type: "pane",
+                pane: {
+                  id: "pull-pane",
+                  tabIds: [firstTab.id],
+                  activeTabId: firstTab.id,
+                },
+              },
+              {
+                type: "pane",
+                pane: {
+                  id: "draft-pane",
+                  tabIds: [secondTab.id],
+                  activeTabId: secondTab.id,
+                },
+              },
+            ],
+          },
+        },
+      },
+    },
+  );
+  expect(split.status()).toBe(200);
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  const pullPane = page.locator(
+    '[data-pane-id="pull-pane"] .rules-skills-panel',
+  );
+  const draftPane = page.locator(
+    '[data-pane-id="draft-pane"] .rules-skills-panel',
+  );
+  await expect(draftPane.getByLabel("Name", { exact: true })).toHaveValue(
+    selectedTemplate.name,
+  );
+  await expect(
+    draftPane.getByRole("button", { name: "Pull", exact: true }),
+  ).toBeEnabled();
+  await expect(
+    draftPane.getByRole("checkbox", {
+      name: /^Keep removed-rule changes focused\./,
+    }),
+  ).toBeChecked();
+  await draftPane
+    .getByLabel("Name", { exact: true })
+    .fill("Preserved draft template");
+  await expect(draftPane.getByLabel("Name", { exact: true })).toHaveValue(
+    "Preserved draft template",
+  );
+  await draftPane
+    .getByRole("button", { name: "Edit rule draft-rule", exact: true })
+    .click();
+  const ruleDraft = draftPane.getByRole("textbox", {
+    name: "Rule text for draft-rule",
+    exact: true,
+  });
+  await ruleDraft.fill("Keep this unsaved rule draft.");
+  await expect(draftPane.getByLabel("Name", { exact: true })).toHaveValue(
+    "Preserved draft template",
+  );
+
+  await git(peer, "pull", "--ff-only");
+  await git(
+    peer,
+    "rm",
+    "rules/draft-rule.md",
+    "rules/removed-rule.md",
+    "skills/draft-skill/SKILL.md",
+  );
+  await fs.writeFile(templatePath, `${JSON.stringify(localTemplate)}\n`);
+  await git(peer, "add", ".");
+  await git(peer, "commit", "-m", "Remove selected catalog entries");
+  await git(peer, "push", "origin", "main");
+  await pullPane.getByRole("button", { name: "Pull", exact: true }).click();
+  await expect(draftPane).toContainText(
+    "Removed from catalog. Save to restore this rule or cancel to discard the draft.",
+  );
+  await expect(ruleDraft).toHaveText("Keep this unsaved rule draft.");
+  await expect(draftPane.getByLabel("Name", { exact: true })).toHaveValue(
+    "Preserved draft template",
+  );
+  await expect(
+    draftPane.getByRole("button", {
+      name: "Save rule draft-rule",
+      exact: true,
+    }),
+  ).toBeEnabled();
+  await expect(
+    draftPane.getByRole("button", {
+      name: "Cancel editing draft-rule",
+      exact: true,
+    }),
+  ).toBeEnabled();
+  await expect(
+    draftPane.getByRole("button", { name: "Save template", exact: true }),
+  ).toBeDisabled();
+  await ruleDraft.scrollIntoViewIfNeeded();
+  await testInfo.attach("removed-rule-draft", {
+    body: await page.screenshot({
+      path: testInfo.outputPath("removed-rule-draft.png"),
+      animations: "disabled",
+    }),
+    contentType: "image/png",
+  });
+  await draftPane
+    .getByRole("button", { name: "Save rule draft-rule", exact: true })
+    .click();
+  await expect(ruleDraft).toHaveCount(0);
+  expect(
+    await fs.readFile(path.join(catalog, "rules", "draft-rule.md"), "utf8"),
+  ).toContain("Keep this unsaved rule draft.");
+  const missingRule = draftPane.getByRole("checkbox", {
+    name: "Missing rule removed-rule",
+    exact: true,
+  });
+  const missingSkill = draftPane.getByRole("checkbox", {
+    name: "Missing skill draft-skill",
+    exact: true,
+  });
+  await expect(missingRule).toBeChecked();
+  await expect(missingSkill).toBeChecked();
+  await missingRule.scrollIntoViewIfNeeded();
+  await testInfo.attach("missing-rule-reference", {
+    body: await page.screenshot({
+      path: testInfo.outputPath("missing-rule-reference.png"),
+      animations: "disabled",
+    }),
+    contentType: "image/png",
+  });
+  await missingSkill.scrollIntoViewIfNeeded();
+  await testInfo.attach("missing-template-references", {
+    body: await page.screenshot({
+      path: testInfo.outputPath("missing-template-references.png"),
+      animations: "disabled",
+    }),
+    contentType: "image/png",
+  });
+  await missingRule.click();
+  await expect(missingRule).toHaveCount(0);
+  await missingSkill.click();
+  await expect(missingSkill).toHaveCount(0);
+  await draftPane
+    .getByRole("button", { name: "Save template", exact: true })
+    .click();
+  await expect(draftPane.locator(".rules-skills-save-state")).toHaveText(
+    "Saved",
+  );
+  expect(JSON.parse(await fs.readFile(localTemplatePath, "utf8"))).toEqual({
+    ...localTemplate,
+    name: "Preserved draft template",
+    ruleIds: [...localTemplate.ruleIds, "draft-rule"],
+  });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth + 1,
+    ),
+  ).toBe(true);
 });

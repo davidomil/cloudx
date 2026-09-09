@@ -181,6 +181,9 @@ export function App() {
   const [config, setConfig] = useState<CloudxConfigResponse | undefined>();
   const [forgeRepositoryChange, setForgeRepositoryChange] = useState({ version: 0, pending: false });
   const [rulesSkillsStore, setRulesSkillsStore] = useState<RulesSkillsStore | undefined>();
+  const [rulesSkillsGit, setRulesSkillsGit] = useState<RulesSkillsGitState>();
+  const rulesSkillsGitRequest = useRef(0);
+  const appliedRulesSkillsGitRequest = useRef(0);
   const [tabs, setTabs] = useState<WorkspaceTab[]>([]);
   const [windows, setWindows] = useState<WorkspaceWindow[]>([]);
   const [activeWindowId, setActiveWindowId] = useState<string | undefined>();
@@ -455,26 +458,44 @@ export function App() {
     setRulesSkillsStore(await loadRulesSkillsStore());
   }, [loadRulesSkillsStore]);
 
-  const loadRulesSkillsGit = useCallback(async () => {
-    const result = await callHook<{ git: RulesSkillsGitState }>("rules-skills.git.status");
-    return result.git;
+  const callRulesSkillsGit = useCallback(async (operation: string, input: Record<string, unknown> = {}) => {
+    const request = ++rulesSkillsGitRequest.current;
+    try {
+      const result = await callHook<{ git: RulesSkillsGitState; store?: RulesSkillsStore }>(`rules-skills.git.${operation}`, input);
+      if (request > appliedRulesSkillsGitRequest.current) {
+        appliedRulesSkillsGitRequest.current = request;
+        setRulesSkillsGit(result.git);
+      }
+      return result;
+    } catch (error) {
+      if (operation === "setOrigin" && request > appliedRulesSkillsGitRequest.current) {
+        appliedRulesSkillsGitRequest.current = request;
+        setRulesSkillsGit(undefined);
+      }
+      throw error;
+    }
   }, []);
+
+  const loadRulesSkillsGit = useCallback(async () => {
+    const result = await callRulesSkillsGit("status");
+    return result.git;
+  }, [callRulesSkillsGit]);
 
   const setRulesSkillsGitOrigin = useCallback(async (originUrl: string) => {
-    const result = await callHook<{ git: RulesSkillsGitState }>("rules-skills.git.setOrigin", { originUrl });
+    const result = await callRulesSkillsGit("setOrigin", { originUrl });
     return result.git;
-  }, []);
+  }, [callRulesSkillsGit]);
 
   const pullRulesSkillsGit = useCallback(async () => {
-    const result = await callHook<{ git: RulesSkillsGitState; store: RulesSkillsStore }>("rules-skills.git.pull");
+    const result = await callRulesSkillsGit("pull");
     setRulesSkillsStore(result.store);
     return result.git;
-  }, []);
+  }, [callRulesSkillsGit]);
 
-  const pushRulesSkillsGit = useCallback(async () => {
-    const result = await callHook<{ git: RulesSkillsGitState }>("rules-skills.git.push");
+  const pushRulesSkillsGit = useCallback(async (expectedOriginUrl: string) => {
+    const result = await callRulesSkillsGit("push", { expectedOriginUrl });
     return result.git;
-  }, []);
+  }, [callRulesSkillsGit]);
 
   function applyWorkspaceState(state: WorkspaceStateResponse, options: { preservePendingLayout?: boolean } = {}) {
     let pendingMerge = options.preservePendingLayout ? workspaceStateWithPreservedLayout(state, layoutRef.current, pendingLayoutPersistWindowIdRef.current, pendingLayoutBaseRef.current, activeTabIdRef.current) : undefined;
@@ -1254,7 +1275,7 @@ export function App() {
         onDeleteRule={handleDeleteRule}
         onInjectRuntime={handleInjectRulesSkillsRuntime}
         onRefreshStore={handleRefreshRulesSkillsStore}
-        gitActions={{ onLoadGit: loadRulesSkillsGit, onSetGitOrigin: setRulesSkillsGitOrigin, onPullGit: pullRulesSkillsGit, onPushGit: pushRulesSkillsGit }}
+        gitActions={{ git: rulesSkillsGit, onLoadGit: loadRulesSkillsGit, onSetGitOrigin: setRulesSkillsGitOrigin, onPullGit: pullRulesSkillsGit, onPushGit: pushRulesSkillsGit }}
       />
     ),
     "documentation.panel": (_contribution, context) => {

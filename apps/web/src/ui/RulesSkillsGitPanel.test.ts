@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, createElement } from "react";
+import { act, createElement, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RulesSkillsGitState } from "@cloudx/shared";
@@ -21,7 +21,7 @@ async function mount(overrides: Partial<Parameters<typeof RulesSkillsGitPanel>[0
     onLoadGit: vi.fn(async () => checkout),
     onSetGitOrigin: vi.fn(async (originUrl: string) => ({ ...checkout, originUrl })),
     onPullGit: vi.fn(async () => checkout),
-    onPushGit: vi.fn(async () => checkout),
+    onPushGit: vi.fn(async (_expectedOriginUrl: string) => checkout),
     disabled: false,
     hasUnsavedChanges: false,
     ...overrides
@@ -30,7 +30,17 @@ async function mount(overrides: Partial<Parameters<typeof RulesSkillsGitPanel>[0
   document.body.append(container);
   const root = createRoot(container);
   roots.push(root);
-  await act(async () => root.render(createElement(RulesSkillsGitPanel, props)));
+  function TestPanel() {
+    const [git, setGit] = useState<RulesSkillsGitState>();
+    const [actions] = useState(() => ({
+      onLoadGit: async () => { const state = await props.onLoadGit(); setGit(state); return state; },
+      onSetGitOrigin: async (originUrl: string) => { const state = await props.onSetGitOrigin(originUrl); setGit(state); return state; },
+      onPullGit: async () => { const state = await props.onPullGit(); setGit(state); return state; },
+      onPushGit: async (expectedOriginUrl: string) => { const state = await props.onPushGit(expectedOriginUrl); setGit(state); return state; }
+    }));
+    return createElement(RulesSkillsGitPanel, { ...props, ...actions, git });
+  }
+  await act(async () => root.render(createElement(TestPanel)));
   return { container, props };
 }
 
@@ -86,7 +96,7 @@ describe("rules and skills Git controls", () => {
     await click(container, "Save origin");
     expect(props.onSetGitOrigin).toHaveBeenCalledWith("git@example.test:other/catalog.git");
     await click(container, "Push commits");
-    expect(props.onPushGit).toHaveBeenCalledTimes(1);
+    expect(props.onPushGit).toHaveBeenCalledExactlyOnceWith("git@example.test:other/catalog.git");
     expect(container.textContent).toContain("Commits pushed to origin.");
   });
 
@@ -102,6 +112,16 @@ describe("rules and skills Git controls", () => {
     await act(async () => pulling.resolve(checkout));
     expect(container.textContent).toContain("Rules and skills refreshed.");
     expect(button(container, "Pull").disabled).toBe(false);
+  });
+
+  it("uses the same normalized origin for synchronization checks and push requests", async () => {
+    const { container, props } = await mount();
+    await setOrigin(container, `  ${checkout.originUrl}  `);
+
+    expect(button(container, "Push commits").disabled).toBe(false);
+    await click(container, "Push commits");
+
+    expect(props.onPushGit).toHaveBeenCalledExactlyOnceWith(checkout.originUrl);
   });
 
   it("reports actionable errors and allows an explicit retry", async () => {
