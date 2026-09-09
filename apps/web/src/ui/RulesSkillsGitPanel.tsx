@@ -8,7 +8,7 @@ export interface RulesSkillsGitActions {
   git: RulesSkillsGitState | undefined;
   onLoadGit: () => Promise<RulesSkillsGitState>;
   onSetGitOrigin: (originUrl: string) => Promise<RulesSkillsGitState>;
-  onPullGit: () => Promise<RulesSkillsGitState>;
+  onPullGit: (expectedOriginUrl: string) => Promise<RulesSkillsGitState>;
   onPushGit: (expectedOriginUrl: string) => Promise<RulesSkillsGitState>;
 }
 
@@ -91,7 +91,7 @@ export function RulesSkillsGitPanel({ git, onLoadGit, onSetGitOrigin, onPullGit,
         {git.hasChanges ? <p>Uncommitted catalog changes. Commit or discard them locally before pulling.</p> : null}
         <p>Pull updates this catalog from origin. Push sends existing commits to the same branch on origin; it does not create commits.</p>
         <div className="rules-skills-git-actions">
-          <ControlButton size="compact" onClick={() => void run("Pulling…", onPullGit, "Pulled from origin. Rules and skills refreshed.")} disabled={busy || !canSync || hasUnsavedChanges || git.hasChanges}><ArrowDown size={14} /> Pull</ControlButton>
+          <ControlButton size="compact" onClick={() => void run("Pulling…", () => onPullGit(origin.trim()), "Pulled from origin. Rules and skills refreshed.")} disabled={busy || !canSync || hasUnsavedChanges || git.hasChanges}><ArrowDown size={14} /> Pull</ControlButton>
           <ControlButton size="compact" onClick={() => void run("Pushing commits…", () => onPushGit(origin.trim()), "Commits pushed to origin.")} disabled={busy || !canSync || !git.hasCommits}><ArrowUp size={14} /> Push commits</ControlButton>
         </div>
       </> : git ? <p>This catalog is not a Git checkout. Use an existing Git checkout at this catalog root to configure origin, pull, and push.</p> : null}

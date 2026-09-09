@@ -23,7 +23,7 @@ describe("catalog Git branch identity", () => {
     await commit(peer, "Incoming catalog changes");
     await git(peer, "push", "origin", "HEAD:refs/heads/main");
 
-    await service.pull();
+    await service.pull(origin);
 
     await expect(service.status()).resolves.toMatchObject({ branch: "main", hasChanges: false });
     await expect(git(checkout, "rev-parse", "refs/heads/main")).resolves.toBe(await git(origin, "rev-parse", "refs/heads/main"));
@@ -73,7 +73,7 @@ describe.each(["git", "ssh", "http", "https", "file"])("catalog Git origin with 
     await commit(peer, "Incoming catalog changes");
     await git(peer, "push", "origin", "HEAD:refs/heads/main");
 
-    await service.pull();
+    await service.pull(originUrl);
 
     await expect(git(checkout, "rev-parse", "HEAD")).resolves.toBe(await git(origin, "rev-parse", "HEAD"));
     await expect(fs.readFile(path.join(checkout, "rule.md"), "utf8")).resolves.toBe("Incoming catalog changes\n");

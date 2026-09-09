@@ -20,7 +20,7 @@ async function mount(overrides: Partial<Parameters<typeof RulesSkillsGitPanel>[0
   const props = {
     onLoadGit: vi.fn(async () => checkout),
     onSetGitOrigin: vi.fn(async (originUrl: string) => ({ ...checkout, originUrl })),
-    onPullGit: vi.fn(async () => checkout),
+    onPullGit: vi.fn(async (_expectedOriginUrl: string) => checkout),
     onPushGit: vi.fn(async (_expectedOriginUrl: string) => checkout),
     disabled: false,
     hasUnsavedChanges: false,
@@ -35,7 +35,7 @@ async function mount(overrides: Partial<Parameters<typeof RulesSkillsGitPanel>[0
     const [actions] = useState(() => ({
       onLoadGit: async () => { const state = await props.onLoadGit(); setGit(state); return state; },
       onSetGitOrigin: async (originUrl: string) => { const state = await props.onSetGitOrigin(originUrl); setGit(state); return state; },
-      onPullGit: async () => { const state = await props.onPullGit(); setGit(state); return state; },
+      onPullGit: async (expectedOriginUrl: string) => { const state = await props.onPullGit(expectedOriginUrl); setGit(state); return state; },
       onPushGit: async (expectedOriginUrl: string) => { const state = await props.onPushGit(expectedOriginUrl); setGit(state); return state; }
     }));
     return createElement(RulesSkillsGitPanel, { ...props, ...actions, git });
@@ -108,16 +108,19 @@ describe("rules and skills Git controls", () => {
     expect([...container.querySelectorAll("button")].every(element => element.disabled)).toBe(true);
     expect(container.querySelector("input")!.disabled).toBe(true);
     await click(container, "Pull");
-    expect(props.onPullGit).toHaveBeenCalledTimes(1);
+    expect(props.onPullGit).toHaveBeenCalledExactlyOnceWith(checkout.originUrl);
     await act(async () => pulling.resolve(checkout));
     expect(container.textContent).toContain("Rules and skills refreshed.");
     expect(button(container, "Pull").disabled).toBe(false);
   });
 
-  it("uses the same normalized origin for synchronization checks and push requests", async () => {
+  it("uses the same normalized origin for synchronization checks and pull and push requests", async () => {
     const { container, props } = await mount();
     await setOrigin(container, `  ${checkout.originUrl}  `);
 
+    expect(button(container, "Pull").disabled).toBe(false);
+    await click(container, "Pull");
+    expect(props.onPullGit).toHaveBeenCalledExactlyOnceWith(checkout.originUrl);
     expect(button(container, "Push commits").disabled).toBe(false);
     await click(container, "Push commits");
 

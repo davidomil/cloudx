@@ -62,8 +62,8 @@ export class RulesSkillsGitService {
     return this.status();
   }
 
-  async pull(): Promise<void> {
-    const state = await this.requireSyncState();
+  async pull(expectedOriginUrl: unknown): Promise<void> {
+    const state = await this.requireDisplayedOrigin(expectedOriginUrl, "pulling");
     if (state.hasChanges) throw new Error("Commit or discard local catalog changes before pulling.");
     await this.git([
       "fetch", "--recurse-submodules=no",
@@ -76,19 +76,24 @@ export class RulesSkillsGitService {
   }
 
   async push(expectedOriginUrl: unknown): Promise<RulesSkillsGitState> {
-    const state = await this.requireSyncState();
-    if (typeof expectedOriginUrl !== "string" || !expectedOriginUrl.trim()) {
-      throw new Error("expectedOriginUrl must be a non-empty string.");
-    }
-    if (state.originUrl !== expectedOriginUrl) {
-      throw new Error("Origin changed since it was displayed. Refresh Git status and review the destination before pushing.");
-    }
+    const state = await this.requireDisplayedOrigin(expectedOriginUrl, "pushing");
     await this.requireMatchingOriginDestinations();
     await this.git([
       "-c", "remote.origin.mirror=false", "push", "--no-force", "--no-follow-tags", "--recurse-submodules=no",
       "origin", `HEAD:refs/heads/${state.branch}`
     ]);
     return this.status();
+  }
+
+  private async requireDisplayedOrigin(expectedOriginUrl: unknown, action: "pulling" | "pushing"): Promise<RulesSkillsGitState> {
+    const state = await this.requireSyncState();
+    if (typeof expectedOriginUrl !== "string" || !expectedOriginUrl.trim()) {
+      throw new Error("expectedOriginUrl must be a non-empty string.");
+    }
+    if (state.originUrl !== expectedOriginUrl) {
+      throw new Error(`Origin changed since it was displayed. Refresh Git status and review the destination before ${action}.`);
+    }
+    return state;
   }
 
   private async requireMatchingOriginDestinations(): Promise<void> {

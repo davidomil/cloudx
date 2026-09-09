@@ -486,8 +486,8 @@ export function App() {
     return result.git;
   }, [callRulesSkillsGit]);
 
-  const pullRulesSkillsGit = useCallback(async () => {
-    const result = await callRulesSkillsGit("pull");
+  const pullRulesSkillsGit = useCallback(async (expectedOriginUrl: string) => {
+    const result = await callRulesSkillsGit("pull", { expectedOriginUrl });
     return result.git;
   }, [callRulesSkillsGit]);
 

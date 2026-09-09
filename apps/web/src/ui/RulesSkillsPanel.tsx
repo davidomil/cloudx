@@ -275,13 +275,13 @@ export function RulesSkillsPanel({
     }
   }
 
-  async function pullGit() {
+  async function pullGit(expectedOriginUrl: string) {
     if (!gitActions || hasUnsavedChanges || busy) {
       throw new Error("Save or discard template and rule edits before pulling.");
     }
     setBusy(true);
     try {
-      return await gitActions.onPullGit();
+      return await gitActions.onPullGit(expectedOriginUrl);
     } finally {
       setBusy(false);
     }

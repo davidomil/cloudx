@@ -1,5 +1,9 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
-import type { CreateTabResponse, WorkspaceStateResponse } from "@cloudx/shared";
+import type {
+  CreateTabResponse,
+  RulesSkillsStore,
+  WorkspaceStateResponse,
+} from "@cloudx/shared";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import net from "node:net";
@@ -42,7 +46,8 @@ async function git(cwd: string, ...args: string[]) {
   return result.stdout.trim();
 }
 
-test.beforeAll(async () => {
+test.beforeEach(async () => {
+  serverLogs = "";
   testRoot = await fs.mkdtemp(
     path.join(os.tmpdir(), "cloudx-rules-git-origin-ordering-"),
   );
@@ -110,7 +115,7 @@ test.beforeAll(async () => {
     .toBe(true);
 });
 
-test.afterAll(async () => {
+test.afterEach(async () => {
   if (server && server.exitCode === null) {
     const exited = new Promise<void>((resolve) =>
       server.once("exit", () => resolve()),
@@ -129,19 +134,7 @@ test.afterAll(async () => {
 test("both panes retain a delayed origin save and subsequently pull and push only its replacement", async ({
   page,
 }) => {
-  const origin = path.join(testRoot, "old origin.git");
-  const replacement = path.join(testRoot, "replacement origin.git");
-  await git(catalog, "init", "--initial-branch=main");
-  await git(catalog, "add", ".");
-  await git(catalog, "commit", "-m", "Seed catalog fixture");
-  for (const remote of [origin, replacement]) {
-    await git(testRoot, "init", "--bare", "--initial-branch=main", remote);
-    await git(catalog, "push", remote, "main");
-  }
-  await git(catalog, "remote", "add", "origin", origin);
-  const oldHead = await git(origin, "rev-parse", "refs/heads/main");
-  const peer = path.join(testRoot, "peer");
-  await git(testRoot, "clone", replacement, peer);
+  const { origin, replacement, oldHead, peer } = await createOriginFixture();
   const templatePath = path.join(peer, "templates", "default-codex.json");
   const template = JSON.parse(await fs.readFile(templatePath, "utf8"));
   await fs.writeFile(
@@ -226,6 +219,166 @@ test("both panes retain a delayed origin save and subsequently pull and push onl
     ),
   ).toContain("Publish only to replacement origin.");
 });
+
+for (const heldSave of ["request", "response"] as const) {
+  test(`a pull queued while the origin save ${heldSave} is held preserves its displayed destination`, async ({
+    page,
+  }) => {
+    const { origin, replacement, oldHead, peer } = await createOriginFixture();
+    const incomingRule = "Load this rule only from the displayed replacement.";
+    await fs.writeFile(
+      path.join(peer, "rules", "replacement-only-rule.md"),
+      `---\nid: replacement-only-rule\ndescription: Verify the pull destination.\n---\n${incomingRule}\n`,
+    );
+    await git(peer, "add", ".");
+    await git(peer, "commit", "-m", "Add replacement-only rule");
+    await git(peer, "push", "origin", "main");
+    const replacementHead = await git(
+      replacement,
+      "rev-parse",
+      "refs/heads/main",
+    );
+    expect(replacementHead).not.toBe(oldHead);
+
+    const { savePane, refreshPane: pullPane } = await openCatalogPanes(page);
+    const originalStore = await readCatalog(page);
+    for (const pane of [savePane, pullPane]) {
+      await expect(pane.getByLabel("Origin URL")).toHaveValue(origin);
+      await expect(
+        pane.getByRole("checkbox", { name: incomingRule }),
+      ).toHaveCount(0);
+    }
+
+    const held = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    await page.route(
+      "**/api/hooks/rules-skills.git.setOrigin",
+      async (route) => {
+        if (heldSave === "request") {
+          held.resolve();
+          await release.promise;
+          await route.continue();
+        } else {
+          const response = await route.fetch();
+          held.resolve();
+          await release.promise;
+          await route.fulfill({ response });
+        }
+      },
+      { times: 1 },
+    );
+    const saveResponse = page.waitForResponse(
+      "**/api/hooks/rules-skills.git.setOrigin",
+    );
+    const pullRequest = page.waitForRequest(
+      "**/api/hooks/rules-skills.git.pull",
+    );
+    const pullResponse = page.waitForResponse(
+      "**/api/hooks/rules-skills.git.pull",
+    );
+    const pullButton = pullPane.getByRole("button", {
+      name: "Pull",
+      exact: true,
+    });
+    try {
+      await savePane.getByLabel("Origin URL").fill(replacement);
+      await savePane
+        .getByRole("button", { name: "Save origin", exact: true })
+        .click();
+      await held.promise;
+      expect(await git(catalog, "remote", "get-url", "origin")).toBe(
+        heldSave === "request" ? origin : replacement,
+      );
+      await expect(savePane).toContainText("Saving origin…");
+      await expect(pullPane.getByLabel("Origin URL")).toHaveValue(origin);
+      await expect(pullButton).toBeEnabled();
+      await pullButton.click();
+      await expect(pullPane).toContainText("Pulling…");
+      await expect(pullButton).toBeDisabled();
+    } finally {
+      release.resolve();
+    }
+
+    expect((await saveResponse).ok()).toBe(true);
+    expect((await pullRequest).postDataJSON()).toEqual({
+      input: { expectedOriginUrl: origin },
+    });
+    expect((await pullResponse).ok()).toBe(false);
+    await expect(pullPane.getByRole("alert")).toContainText(
+      "Origin changed since it was displayed.",
+    );
+    expect(await git(catalog, "rev-parse", "HEAD")).toBe(oldHead);
+    expect(await git(catalog, "status", "--porcelain")).toBe("");
+    expect(await readCatalog(page)).toEqual(originalStore);
+    await expect(
+      fs.stat(path.join(catalog, "rules", "replacement-only-rule.md")),
+    ).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    for (const pane of [savePane, pullPane]) {
+      await expect(pane.getByLabel("Origin URL")).toHaveValue(replacement);
+      await expect(
+        pane.getByRole("checkbox", { name: incomingRule }),
+      ).toHaveCount(0);
+    }
+
+    const freshPullRequest = page.waitForRequest(
+      "**/api/hooks/rules-skills.git.pull",
+    );
+    await pullButton.click();
+    expect((await freshPullRequest).postDataJSON()).toEqual({
+      input: { expectedOriginUrl: replacement },
+    });
+    await expect(pullPane).toContainText(
+      "Pulled from origin. Rules and skills refreshed.",
+    );
+    for (const pane of [savePane, pullPane]) {
+      await expect(
+        pane.getByRole("checkbox", { name: incomingRule }),
+      ).toBeVisible();
+    }
+    expect((await readCatalog(page)).rules).toContainEqual(
+      expect.objectContaining({
+        id: "replacement-only-rule",
+        text: incomingRule,
+      }),
+    );
+    expect(await git(catalog, "rev-parse", "HEAD")).toBe(replacementHead);
+    expect(await git(catalog, "status", "--porcelain")).toBe("");
+    expect(await git(origin, "rev-parse", "refs/heads/main")).toBe(oldHead);
+    expect(await git(replacement, "rev-parse", "refs/heads/main")).toBe(
+      replacementHead,
+    );
+  });
+}
+
+async function createOriginFixture() {
+  const origin = path.join(testRoot, "old origin.git");
+  const replacement = path.join(testRoot, "replacement origin.git");
+  await git(catalog, "init", "--initial-branch=main");
+  await git(catalog, "add", ".");
+  await git(catalog, "commit", "-m", "Seed catalog fixture");
+  for (const remote of [origin, replacement]) {
+    await git(testRoot, "init", "--bare", "--initial-branch=main", remote);
+    await git(catalog, "push", remote, "main");
+  }
+  await git(catalog, "remote", "add", "origin", origin);
+  const oldHead = await git(origin, "rev-parse", "refs/heads/main");
+  const peer = path.join(testRoot, "peer");
+  await git(testRoot, "clone", replacement, peer);
+  return { origin, replacement, oldHead, peer };
+}
+
+async function readCatalog(page: Page): Promise<RulesSkillsStore> {
+  const response = await page.request.post(
+    `${baseUrl}/api/hooks/rules-skills.catalog.list`,
+    {
+      data: { input: {} },
+    },
+  );
+  expect(response.ok()).toBe(true);
+  return (await response.json()).result.store;
+}
 
 async function openCatalogPanes(page: Page) {
   const workspace = (await (

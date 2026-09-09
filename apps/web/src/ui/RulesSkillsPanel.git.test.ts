@@ -106,6 +106,7 @@ describe("catalog Git and template drafts", () => {
     const onPullGit = vi.fn(() => new Promise<RulesSkillsGitState>(resolve => { finish = resolve; }));
     const { container, render } = await mount(onPullGit);
     await click(container, "Pull");
+    expect(onPullGit).toHaveBeenCalledExactlyOnceWith(checkout.originUrl);
     expect(container.querySelector<HTMLFieldSetElement>("fieldset")!.disabled).toBe(true);
     expect(button(container, "Create template").disabled).toBe(true);
     expect(button(container, "Default").disabled).toBe(true);

@@ -60,7 +60,7 @@ describe("Rules & Skills Git checkout", () => {
     await commit(peer, "Add shared rule");
     await git(peer, "push", "origin", "main");
 
-    await expect(catalog.pullGit()).resolves.toMatchObject({
+    await expect(catalog.pullGit(origin)).resolves.toMatchObject({
       git: { originUrl: origin, hasChanges: false },
       store: { rules: expect.arrayContaining([expect.objectContaining({ id: "shared-rule" })]) }
     });
@@ -136,6 +136,71 @@ describe("Rules & Skills Git checkout", () => {
     await expect(git(origin, "rev-parse", "refs/heads/main")).resolves.toBe(oldHead);
   });
 
+  it("rejects a stale pull queued behind another catalog's origin save before fetching", async () => {
+    const { catalog, checkout, origin, peer, root, call } = await synchronizedFixture();
+    const anotherCatalog = new RulesSkillsCatalogService(path.dirname(checkout));
+    const replacement = path.join(root, "replacement.git");
+    await git(root, "clone", "--bare", origin, replacement);
+    await fs.writeFile(path.join(peer, "rules", "replacement-only.md"), "Pull only after reviewing the replacement origin.\n");
+    await commit(peer, "Add replacement-only rule");
+    await git(peer, "push", replacement, "main");
+    await git(checkout, "fetch", "origin", "refs/heads/main");
+    await catalog.gitStatus();
+    const before = await checkoutSnapshot(catalog, checkout);
+    const listener = vi.fn();
+    catalog.onChange(listener);
+    anotherCatalog.onChange(listener);
+    const savingStarted = deferred();
+    const resumeSave = deferred();
+    const setOrigin = RulesSkillsGitService.prototype.setOrigin;
+    vi.spyOn(RulesSkillsGitService.prototype, "setOrigin").mockImplementation(async function (this: RulesSkillsGitService, originUrl) {
+      savingStarted.resolve();
+      await resumeSave.promise;
+      return setOrigin.call(this, originUrl);
+    });
+
+    const changingOrigin = anotherCatalog.setGitOrigin(replacement);
+    await savingStarted.promise;
+    const pulling = call("pull", { expectedOriginUrl: origin });
+    const operations = Promise.allSettled([changingOrigin, pulling]);
+    resumeSave.resolve();
+    const results = await operations;
+
+    expect(results[0].status).toBe("fulfilled");
+    expect(results[1]).toMatchObject({
+      status: "rejected",
+      reason: new Error("Origin changed since it was displayed. Refresh Git status and review the destination before pulling.")
+    });
+    expect(await checkoutSnapshot(catalog, checkout)).toEqual(before);
+    await expect(fs.stat(path.join(checkout, "rules", "replacement-only.md"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(listener).not.toHaveBeenCalled();
+    await expect(catalog.gitStatus()).resolves.toMatchObject({ originUrl: replacement, hasChanges: false });
+
+    await expect(call("pull", { expectedOriginUrl: replacement })).resolves.toMatchObject({
+      git: { originUrl: replacement, hasChanges: false },
+      store: { rules: expect.arrayContaining([expect.objectContaining({ id: "replacement-only" })]) }
+    });
+    await expect(git(checkout, "rev-parse", "HEAD")).resolves.toBe(await git(replacement, "rev-parse", "refs/heads/main"));
+    await expect(git(origin, "rev-parse", "refs/heads/main")).resolves.toBe(before.head);
+    expect(listener).toHaveBeenCalledOnce();
+  });
+
+  it.each([{}, { expectedOriginUrl: null }, { expectedOriginUrl: 42 }, { expectedOriginUrl: "" }, { expectedOriginUrl: "   " }])(
+    "rejects pull requests without a displayed destination: %j", async input => {
+      const { catalog, checkout, call } = await synchronizedFixture();
+      const head = await git(checkout, "rev-parse", "HEAD");
+      const listener = vi.fn();
+      catalog.onChange(listener);
+
+      await expect(call("pull", input)).rejects.toThrow(/input|expectedOriginUrl/i);
+      await expect(catalog.pullGit(input.expectedOriginUrl)).rejects.toThrow(/expectedOriginUrl/i);
+
+      await expect(git(checkout, "rev-parse", "HEAD")).resolves.toBe(head);
+      await expect(fs.stat(path.join(checkout, ".git", "FETCH_HEAD"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(listener).not.toHaveBeenCalled();
+    }
+  );
+
   it.each([{}, { expectedOriginUrl: null }, { expectedOriginUrl: 42 }, { expectedOriginUrl: "" }, { expectedOriginUrl: "   " }])(
     "rejects push requests without a displayed destination: %j", async input => {
       const { catalog, origin, call } = await synchronizedFixture();
@@ -187,14 +252,14 @@ describe("Rules & Skills Git checkout", () => {
   });
 
   it("pulls the current branch from origin, reloads the catalog, and notifies subscribers", async () => {
-    const { catalog, checkout, peer, call } = await synchronizedFixture();
+    const { catalog, checkout, origin, peer, call } = await synchronizedFixture();
     await fs.writeFile(path.join(peer, "rules", "from-origin.md"), "Use the shared review checklist.\n");
     await commit(peer, "Add shared rule");
     await git(peer, "push", "origin", "main");
     const listener = vi.fn();
     catalog.onChange(listener);
 
-    const result = await call("pull");
+    const result = await call("pull", { expectedOriginUrl: origin });
 
     expect(result).toMatchObject({
       git: { branch: "main", hasChanges: false },
@@ -221,17 +286,17 @@ describe("Rules & Skills Git checkout", () => {
   });
 
   it("fast-forwards cleanly even when the branch is configured to squash merges", async () => {
-    const { catalog, checkout, peer } = await synchronizedFixture();
+    const { catalog, checkout, origin, peer } = await synchronizedFixture();
     await fs.writeFile(path.join(peer, "rules", "remote-rule.md"), "Advance to this commit.\n");
     await commit(peer, "Add remote rule");
     await git(peer, "push", "origin", "main");
     await git(checkout, "config", "branch.main.mergeOptions", "--squash");
 
-    await expect(catalog.pullGit()).resolves.toMatchObject({ git: { hasChanges: false } });
+    await expect(catalog.pullGit(origin)).resolves.toMatchObject({ git: { hasChanges: false } });
 
     await expect(git(checkout, "rev-parse", "HEAD")).resolves.toBe(await git(peer, "rev-parse", "HEAD"));
     await expect(git(checkout, "status", "--porcelain=v1")).resolves.toBe("");
-    await expect(catalog.pullGit()).resolves.toMatchObject({ git: { hasChanges: false } });
+    await expect(catalog.pullGit(origin)).resolves.toMatchObject({ git: { hasChanges: false } });
   });
 
   it("pushes only the current branch despite repository-wide push configuration", async () => {
@@ -261,7 +326,7 @@ describe("Rules & Skills Git checkout", () => {
     await commit(peer, "Add branch rule");
     await git(peer, "push", "origin", "review");
 
-    await expect(catalog.pullGit()).resolves.toMatchObject({
+    await expect(catalog.pullGit(origin)).resolves.toMatchObject({
       git: { branch: "review" },
       store: { rules: expect.arrayContaining([expect.objectContaining({ id: "branch-rule" })]) }
     });
@@ -274,17 +339,17 @@ describe("Rules & Skills Git checkout", () => {
   });
 
   it("serializes saves and catalog reads behind a pull across catalog service instances", async () => {
-    const { catalog, checkout } = await synchronizedFixture();
+    const { catalog, checkout, origin } = await synchronizedFixture();
     const anotherCatalog = new RulesSkillsCatalogService(path.dirname(checkout));
     const entered = deferred();
     const resume = deferred();
     const originalPull = RulesSkillsGitService.prototype.pull;
-    vi.spyOn(RulesSkillsGitService.prototype, "pull").mockImplementation(async function (this: RulesSkillsGitService) {
+    vi.spyOn(RulesSkillsGitService.prototype, "pull").mockImplementation(async function (this: RulesSkillsGitService, expectedOriginUrl) {
       entered.resolve();
       await resume.promise;
-      await originalPull.call(this);
+      await originalPull.call(this, expectedOriginUrl);
     });
-    const pulling = catalog.pullGit();
+    const pulling = catalog.pullGit(origin);
     await entered.promise;
     const saving = anotherCatalog.saveRule(rule("queued-rule", "Save this after pulling."));
     const reading = catalog.list();
@@ -303,7 +368,7 @@ describe("Rules & Skills Git checkout", () => {
   });
 
   it.each(["tracked", "untracked"])("rejects pulling with %s local changes and preserves the checkout", async kind => {
-    const { catalog, checkout, peer } = await synchronizedFixture();
+    const { catalog, checkout, origin, peer } = await synchronizedFixture();
     await fs.writeFile(path.join(peer, "rules", "remote-only.md"), "Review remote changes.\n");
     await commit(peer, "Add remote change");
     await git(peer, "push", "origin", "main");
@@ -311,7 +376,7 @@ describe("Rules & Skills Git checkout", () => {
     await catalog.saveRule(rule(ruleId, "Preserve this local draft."));
     const head = await git(checkout, "rev-parse", "HEAD");
 
-    await expect(catalog.pullGit()).rejects.toThrow(/changes|clean|commit/i);
+    await expect(catalog.pullGit(origin)).rejects.toThrow(/changes|clean|commit/i);
 
     await expect(git(checkout, "rev-parse", "HEAD")).resolves.toBe(head);
     await expect(fs.readFile(path.join(checkout, "rules", `${ruleId}.md`), "utf8")).resolves.toContain("Preserve this local draft.");
@@ -320,7 +385,7 @@ describe("Rules & Skills Git checkout", () => {
 
   it.each(["rules/private.md", "skills/private-notes/SKILL.md"])(
     "rejects incoming changes that overwrite ignored %s, preserving the file and HEAD", async relativePath => {
-      const { catalog, checkout, peer } = await synchronizedFixture();
+      const { catalog, checkout, origin, peer } = await synchronizedFixture();
       await fs.appendFile(path.join(checkout, ".git", "info", "exclude"), "\nrules/private.md\nskills/private-notes/\n");
       const localFile = path.join(checkout, relativePath);
       const remoteFile = path.join(peer, relativePath);
@@ -336,7 +401,7 @@ describe("Rules & Skills Git checkout", () => {
       catalog.onChange(listener);
       await expect(catalog.gitStatus()).resolves.toMatchObject({ hasChanges: false });
 
-      await expect(catalog.pullGit()).rejects.toThrow(/overwrite|ignored/i);
+      await expect(catalog.pullGit(origin)).rejects.toThrow(/overwrite|ignored/i);
 
       await expect(fs.readFile(localFile, "utf8")).resolves.toBe("Preserve this ignored local draft.\n");
       await expect(git(checkout, "rev-parse", "HEAD")).resolves.toBe(head);
@@ -346,7 +411,7 @@ describe("Rules & Skills Git checkout", () => {
   );
 
   it("preserves unrelated ignored files while pulling a non-colliding change", async () => {
-    const { catalog, checkout, peer } = await synchronizedFixture();
+    const { catalog, checkout, origin, peer } = await synchronizedFixture();
     await fs.appendFile(path.join(checkout, ".git", "info", "exclude"), "\nrules/private.md\n");
     const localFile = path.join(checkout, "rules", "private.md");
     await fs.writeFile(localFile, "Preserve this ignored local draft.\n");
@@ -354,7 +419,7 @@ describe("Rules & Skills Git checkout", () => {
     await commit(peer, "Add non-colliding rule");
     await git(peer, "push", "origin", "main");
 
-    await expect(catalog.pullGit()).resolves.toMatchObject({ git: { hasChanges: false } });
+    await expect(catalog.pullGit(origin)).resolves.toMatchObject({ git: { hasChanges: false } });
 
     await expect(git(checkout, "rev-parse", "HEAD")).resolves.toBe(await git(peer, "rev-parse", "HEAD"));
     await expect(fs.readFile(localFile, "utf8")).resolves.toBe("Preserve this ignored local draft.\n");
@@ -367,11 +432,12 @@ describe("Rules & Skills Git checkout", () => {
     await git(peer, "push", "origin", "main");
     await git(checkout, "fetch", "origin", "main");
     const head = await git(checkout, "rev-parse", "HEAD");
-    await catalog.setGitOrigin(path.join(root, "missing.git"));
+    const origin = path.join(root, "missing.git");
+    await catalog.setGitOrigin(origin);
     const listener = vi.fn();
     catalog.onChange(listener);
 
-    await expect(catalog.pullGit()).rejects.toThrow(/Git command failed/i);
+    await expect(catalog.pullGit(origin)).rejects.toThrow(/Git command failed/i);
 
     await expect(git(checkout, "rev-parse", "HEAD")).resolves.toBe(head);
     await expect(fs.stat(path.join(checkout, "rules", "remote-rule.md"))).rejects.toMatchObject({ code: "ENOENT" });
@@ -390,7 +456,7 @@ describe("Rules & Skills Git checkout", () => {
     const listener = vi.fn();
     catalog.onChange(listener);
 
-    await expect(catalog.pullGit()).rejects.toThrow(/fast.forward|diverg/i);
+    await expect(catalog.pullGit(origin)).rejects.toThrow(/fast.forward|diverg/i);
     await expect(catalog.pushGit(origin)).rejects.toThrow(/rejected/i);
 
     await expect(git(checkout, "rev-parse", "HEAD")).resolves.toBe(head);
@@ -402,22 +468,23 @@ describe("Rules & Skills Git checkout", () => {
 
   it.each(["pull", "push"])("rejects %s without an origin", async operation => {
     const { call } = await repositoryFixture();
-    await expect(call(operation, operation === "push" ? { expectedOriginUrl: "/unused.git" } : {})).rejects.toThrow(/origin/i);
+    await expect(call(operation, { expectedOriginUrl: "/unused.git" })).rejects.toThrow(/origin/i);
   });
 
   it.each(["pull", "push"])("rejects %s on a detached checkout", async operation => {
-    const { checkout, call } = await synchronizedFixture();
+    const { checkout, origin, call } = await synchronizedFixture();
     await git(checkout, "checkout", "--detach", "HEAD");
 
-    await expect(call(operation, operation === "push" ? { expectedOriginUrl: "/unused.git" } : {})).rejects.toThrow(/branch|detach/i);
+    await expect(call(operation, { expectedOriginUrl: origin })).rejects.toThrow(/branch|detach/i);
   });
 
   it.each(["pull", "push"])("rejects %s on an unborn branch", async operation => {
     const { catalog, root, call } = await catalogFixture();
     await git(catalog.catalogRoot(), "init", "--initial-branch=main");
-    await catalog.setGitOrigin(path.join(root, "origin.git"));
+    const origin = path.join(root, "origin.git");
+    await catalog.setGitOrigin(origin);
 
-    await expect(call(operation, operation === "push" ? { expectedOriginUrl: "/unused.git" } : {})).rejects.toThrow(/commit|unborn/i);
+    await expect(call(operation, { expectedOriginUrl: origin })).rejects.toThrow(/commit|unborn/i);
   });
 
   it("rejects an enclosing Git repository before changing its origin or history", async () => {
@@ -426,7 +493,7 @@ describe("Rules & Skills Git checkout", () => {
     await git(root, "remote", "add", "origin", "/parent-origin.git");
 
     for (const operation of ["status", "pull", "push"]) {
-      await expect(call(operation, operation === "push" ? { expectedOriginUrl: "/unused.git" } : {})).rejects.toThrow(/root|catalog|enclos|parent/i);
+      await expect(call(operation, operation === "status" ? {} : { expectedOriginUrl: "/unused.git" })).rejects.toThrow(/root|catalog|enclos|parent/i);
     }
     await expect(catalog.setGitOrigin("/replacement-origin.git")).rejects.toThrow(/root|catalog|enclos|parent/i);
     await expect(git(root, "remote", "get-url", "origin")).resolves.toBe("/parent-origin.git");
@@ -442,7 +509,7 @@ describe("Rules & Skills Git checkout", () => {
     await fs.symlink(outside, catalog.catalogRoot(), "dir");
 
     for (const operation of ["status", "pull", "push"]) {
-      await expect(call(operation, operation === "push" ? { expectedOriginUrl: "/unused.git" } : {})).rejects.toThrow(/symbolic|symlink/i);
+      await expect(call(operation, operation === "status" ? {} : { expectedOriginUrl: "/unused.git" })).rejects.toThrow(/symbolic|symlink/i);
     }
     await expect(catalog.setGitOrigin("/replacement-origin.git")).rejects.toThrow(/symbolic|symlink/i);
     await expect(git(outside, "remote", "get-url", "origin")).resolves.toBe("/outside-origin.git");
@@ -499,7 +566,9 @@ describe("Rules & Skills Git checkout", () => {
 
   it.each(["status", "setOrigin", "pull", "push"])("rejects an arbitrary cwd at the %s hook boundary", async operation => {
     const { call } = await repositoryFixture();
-    const input = operation === "setOrigin" ? { originUrl: "/unused.git", cwd: "/elsewhere" } : { cwd: "/elsewhere" };
+    const input = operation === "setOrigin"
+      ? { originUrl: "/unused.git", cwd: "/elsewhere" }
+      : operation === "status" ? { cwd: "/elsewhere" } : { expectedOriginUrl: "/unused.git", cwd: "/elsewhere" };
 
     await expect(call(operation, input)).rejects.toThrow(/invalid input/i);
   });
@@ -549,6 +618,17 @@ async function git(checkout: string, ...args: string[]): Promise<string> {
 
 function rule(id: string, text: string) {
   return { id, text, description: text };
+}
+
+async function checkoutSnapshot(catalog: RulesSkillsCatalogService, checkout: string) {
+  const files = (await git(checkout, "ls-files", "-z")).split("\0").filter(Boolean);
+  return {
+    head: await git(checkout, "rev-parse", "HEAD"),
+    fetchHead: await fs.readFile(path.join(checkout, ".git", "FETCH_HEAD")),
+    index: await fs.readFile(path.join(checkout, ".git", "index")),
+    files: await Promise.all(files.map(async file => [file, await fs.readFile(path.join(checkout, file))])),
+    store: await catalog.list()
+  };
 }
 
 function deferred() {

@@ -137,9 +137,9 @@ export class RulesSkillsCatalogService {
     return this.withCatalogMutation(() => this.git.setOrigin(originUrl));
   }
 
-  pullGit(): Promise<{ git: RulesSkillsGitState; store: RulesSkillsStore }> {
+  pullGit(expectedOriginUrl: unknown): Promise<{ git: RulesSkillsGitState; store: RulesSkillsStore }> {
     return this.withCatalogMutation(async () => {
-      await this.git.pull();
+      await this.git.pull(expectedOriginUrl);
       const store = await this.readFreshStore();
       this.emitChange();
       return { git: await this.git.status(), store };

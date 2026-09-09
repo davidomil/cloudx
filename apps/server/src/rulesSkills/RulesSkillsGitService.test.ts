@@ -35,6 +35,32 @@ async function startStatus() {
 }
 
 describe("catalog Git command boundary", () => {
+  it.each([undefined, null, 42, false, {}, [], "", "   "])("rejects pull without a displayed destination before fetching: %j", async expectedOriginUrl => {
+    const service = new RulesSkillsGitService("/catalog");
+    vi.spyOn(service, "status").mockResolvedValue({
+      isRepository: true, rootPath: "/catalog", branch: "main", originUrl: "/origin.git", hasChanges: false, hasCommits: true
+    });
+    vi.mocked(spawn).mockClear();
+
+    await expect(service.pull(expectedOriginUrl)).rejects.toThrow(/expectedOriginUrl/i);
+
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("rejects pull from a stale displayed destination without exposing either URL or fetching", async () => {
+    const service = new RulesSkillsGitService("/catalog");
+    vi.spyOn(service, "status").mockResolvedValue({
+      isRepository: true, rootPath: "/catalog", branch: "main", originUrl: "https://example.test/new.git", hasChanges: false, hasCommits: true
+    });
+    vi.mocked(spawn).mockClear();
+
+    await expect(service.pull("https://private-user:private-password@example.test/old.git")).rejects.toEqual(
+      new Error("Origin changed since it was displayed. Refresh Git status and review the destination before pulling.")
+    );
+
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it("uses only the catalog cwd and a noninteractive environment without inherited Git redirection", async () => {
     vi.stubEnv("GIT_DIR", "/unrelated/repository");
     vi.stubEnv("GIT_WORK_TREE", "/unrelated/files");

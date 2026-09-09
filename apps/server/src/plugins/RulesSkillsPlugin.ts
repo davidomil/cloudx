@@ -70,8 +70,13 @@ export class RulesSkillsPlugin implements WorkspacePlugin {
         title: "Pull Rules Skills",
         description: "Fast-forward the clean catalog checkout from its same-named branch on origin and reload the catalog.",
         exposures: ["app", "plugin", "ui", "http"],
-        inputSchema: { type: "object", properties: {}, additionalProperties: false },
-        execute: async () => this.catalog.pullGit()
+        inputSchema: {
+          type: "object",
+          properties: { expectedOriginUrl: { type: "string", minLength: 1, maxLength: 4096 } },
+          required: ["expectedOriginUrl"],
+          additionalProperties: false
+        },
+        execute: async (input) => this.catalog.pullGit(input.expectedOriginUrl)
       },
       {
         id: "rules-skills.git.push",
