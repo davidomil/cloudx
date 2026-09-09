@@ -45,7 +45,7 @@ export class RulesSkillsGitService {
       isRepository: true,
       rootPath: this.rootPath,
       branch: branch.code === 0 ? branch.stdout.trim().replace(/^refs\/heads\//u, "") : undefined,
-      originUrl: origin.code === 0 ? publicOriginUrl(origin.stdout.trim()) : undefined,
+      originUrl: origin.code === 0 ? publicOriginUrl(origin.stdout.replace(/\n$/u, "")) : undefined,
       hasChanges: Boolean(changes.stdout),
       hasCommits: head.code === 0
     };
@@ -101,7 +101,7 @@ export class RulesSkillsGitService {
       this.git(["remote", "get-url", "origin"]),
       this.git(["remote", "get-url", "--push", "--all", "origin"])
     ]);
-    if (fetchUrl.stdout.trim() !== pushUrls.stdout.trim()) {
+    if (fetchUrl.stdout !== pushUrls.stdout) {
       throw new Error("Origin must use the same single URL for pull and push. Save origin to replace local URLs, or remove conflicting URLs from included or global Git configuration.");
     }
   }
@@ -190,6 +190,9 @@ function publicOriginUrl(url: string): string {
   const helperPrefix = url.match(/^[\w+.-]+::/u)?.[0] ?? "";
   const address = url.slice(helperPrefix.length);
   try {
+    if (address !== address.trim() || /[\x00-\x1f\x7f]/u.test(url)) {
+      throw new Error("Origin contains whitespace or control characters that cannot be displayed safely.");
+    }
     if (!helperPrefix && !address.includes("://")) {
       if (/^[\w+.-]+:\/*[^/]*:[^/]*@/u.test(address)) throw new Error("Origin resembles a malformed credential-bearing URL.");
       return url;

@@ -45,6 +45,56 @@ describe("catalog Git branch identity", () => {
   });
 });
 
+describe("catalog Git destination whitespace", () => {
+  it.each([" ", "\t", "\n", "\r", "\u00a0"])("rejects a push destination differing only by the suffix %j before either remote changes", async suffix => {
+    const { root, checkout, origin, service } = await synchronizedFixture();
+    const hiddenOrigin = `${origin}${suffix}`;
+    await git(root, "clone", "--bare", origin, hiddenOrigin);
+    await git(checkout, "config", "remote.origin.pushurl", hiddenOrigin);
+    const originalHead = await git(origin, "rev-parse", "HEAD");
+    await commit(checkout, "Outgoing catalog changes");
+    const state = await service.status();
+
+    expect(state.originUrl).toBe(origin);
+    await expect(service.push(state.originUrl)).rejects.toThrow(/same single URL/i);
+
+    await expect(git(origin, "rev-parse", "HEAD")).resolves.toBe(originalHead);
+    await expect(git(hiddenOrigin, "rev-parse", "HEAD")).resolves.toBe(originalHead);
+    await expect(git(checkout, "remote", "get-url", "--push", "origin")).resolves.toBe(hiddenOrigin);
+  });
+
+  describe.each(["", "file://"])("existing %s origin", prefix => {
+    it.each([" ", "\t", "\n", "\r", "\u00a0"])("rejects a fetch URL with suffix %j instead of displaying or validating a different destination", async suffix => {
+      const { root, checkout, origin, peer, service } = await synchronizedFixture();
+      const hiddenOrigin = `${origin}${suffix}`;
+      await git(root, "clone", "--bare", origin, hiddenOrigin);
+      await commit(peer, "Incoming hidden catalog");
+      await git(peer, "push", hiddenOrigin, "HEAD:refs/heads/main");
+      const originUrl = `${prefix}${hiddenOrigin}`;
+      const displayedOrigin = `${prefix}${origin}`;
+      await git(checkout, "remote", "set-url", "origin", originUrl);
+      const originalHead = await git(checkout, "rev-parse", "HEAD");
+      const hiddenHead = await git(hiddenOrigin, "rev-parse", "HEAD");
+      await expect(git(checkout, "ls-remote", "origin", "refs/heads/main")).resolves.toBe(`${hiddenHead}\trefs/heads/main`);
+
+      await expect(service.status()).rejects.toThrow(/cannot be displayed safely/i);
+      await expect(service.pull(displayedOrigin)).rejects.toThrow(/cannot be displayed safely/i);
+      await expect(service.pull(originUrl)).rejects.toThrow(/cannot be displayed safely/i);
+
+      await expect(git(checkout, "rev-parse", "HEAD")).resolves.toBe(originalHead);
+      await expect(fs.stat(path.join(checkout, ".git", "FETCH_HEAD"))).rejects.toMatchObject({ code: "ENOENT" });
+      await commit(checkout, "Outgoing hidden catalog");
+
+      await expect(service.push(displayedOrigin)).rejects.toThrow(/cannot be displayed safely/i);
+      await expect(service.push(originUrl)).rejects.toThrow(/cannot be displayed safely/i);
+
+      await expect(git(origin, "rev-parse", "HEAD")).resolves.toBe(originalHead);
+      await expect(git(hiddenOrigin, "rev-parse", "HEAD")).resolves.toBe(hiddenHead);
+      await expect(git(checkout, "remote", "get-url", "origin")).resolves.toBe(originUrl);
+    });
+  });
+});
+
 describe.each(["git", "ssh", "http", "https", "file"])("catalog Git origin with SSH host alias %s", alias => {
   it("displays the configured scp-style origin unchanged", async () => {
     const { checkout, origin, originUrl, service } = await sshAliasFixture(alias);
@@ -204,6 +254,11 @@ describe("catalog Git origin privacy", () => {
   });
 
   it.each([
+    " ../catalog.git", "\t../catalog.git", "\n../catalog.git", "\u00a0../catalog.git",
+    "https://example.test/catalog.git ", " https://example.test/catalog.git",
+    "https::https://example.test/catalog.git ", "https:: https://example.test/catalog.git",
+    "custom::https://example.test/cata\tlog.git",
+    "https://example.test/cata\nlog.git", "../cata\rlog.git",
     "https://private-user:private-password@bad host/catalog.git",
     "https://private-user:private-password@[invalid]/catalog.git",
     "https:private-user:private-password@bad host/catalog.git",
@@ -356,5 +411,5 @@ async function git(checkout: string, ...args: string[]): Promise<string> {
     timeout: 10_000,
     env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0" }
   });
-  return stdout.trim();
+  return stdout.replace(/\n$/u, "");
 }
