@@ -182,6 +182,7 @@ function validateOriginUrl(input: unknown): string {
       throw new Error("Use Git credential helpers or SSH authentication instead of credentials in the origin URL.");
     }
   }
+  publicOriginUrl(url);
   return url;
 }
 
@@ -195,8 +196,10 @@ function publicOriginUrl(url: string): string {
     }
     const parsed = new URL(address);
     if (!parsed.host && parsed.protocol !== "file:") throw new Error("Origin has no URL host.");
-    if (parsed.protocol === "file:") {
-      if (parsed.search || parsed.hash) throw new Error("Redacting the file origin would change its Git pathname.");
+    if (["file:", "ssh:", "git+ssh:", "ssh+git:", "git:"].includes(parsed.protocol)) {
+      if (/[?#]/u.test(address) || parsed.password || /%3a/iu.test(parsed.username)) {
+        throw new Error("Redacting the origin would change its Git destination.");
+      }
       return url;
     }
     parsed.password = "";

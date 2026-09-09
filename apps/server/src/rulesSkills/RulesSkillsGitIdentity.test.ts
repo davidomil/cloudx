@@ -91,15 +91,18 @@ describe.each(["git", "ssh", "http", "https", "file"])("catalog Git origin with 
   });
 });
 
-describe("catalog Git file origin identity", () => {
-  it.each(["#archive", "?archive"])("rejects a file origin whose %s suffix would be hidden before synchronization", async suffix => {
+describe.each(["file", "ssh"])("catalog Git %s origin identity", protocol => {
+  const urlPrefix = protocol === "file" ? "file://" : "ssh://catalog.test";
+
+  it.each(["#archive", "?archive"])("rejects an origin whose %s suffix would be hidden before synchronization", async suffix => {
     const { root, checkout, origin, peer, service } = await synchronizedFixture();
     const hiddenOrigin = `${origin}${suffix}`;
     await git(root, "clone", "--bare", origin, hiddenOrigin);
     await commit(peer, "Incoming hidden catalog");
     await git(peer, "push", hiddenOrigin, "HEAD:refs/heads/main");
-    const originUrl = `file://${hiddenOrigin}`;
-    const displayedOrigin = `file://${origin}`;
+    if (protocol === "ssh") await useLocalSsh(root, [origin, hiddenOrigin]);
+    const originUrl = `${urlPrefix}${hiddenOrigin}`;
+    const displayedOrigin = `${urlPrefix}${origin}`;
     await git(checkout, "remote", "set-url", "origin", originUrl);
     const initialHead = await git(checkout, "rev-parse", "HEAD");
     const hiddenHead = await git(hiddenOrigin, "rev-parse", "HEAD");
@@ -109,6 +112,8 @@ describe("catalog Git file origin identity", () => {
     await expect(service.pull(displayedOrigin)).rejects.toThrow(/cannot be displayed safely/i);
 
     await expect(git(checkout, "rev-parse", "HEAD")).resolves.toBe(initialHead);
+    await expect(fs.readFile(path.join(checkout, "rule.md"), "utf8")).resolves.toBe("Seed catalog\n");
+    await expect(git(checkout, "status", "--porcelain=v1")).resolves.toBe("");
     await expect(fs.stat(path.join(checkout, ".git", "FETCH_HEAD"))).rejects.toMatchObject({ code: "ENOENT" });
     await commit(checkout, "Outgoing hidden catalog");
 
@@ -119,12 +124,13 @@ describe("catalog Git file origin identity", () => {
     await expect(git(checkout, "remote", "get-url", "origin")).resolves.toBe(originUrl);
   });
 
-  it.each(["#archive", "?archive"])("synchronizes only the file origin with the encoded %s pathname suffix", async suffix => {
+  it.each(["#archive", "?archive"])("synchronizes only the origin with the encoded %s pathname suffix", async suffix => {
     const { root, checkout, origin, peer, service } = await synchronizedFixture();
     const encodedOrigin = `${origin}${suffix}`;
     await git(root, "clone", "--bare", origin, encodedOrigin);
     const originalHead = await git(origin, "rev-parse", "HEAD");
-    const originUrl = `file://${origin}${encodeURIComponent(suffix)}`;
+    if (protocol === "ssh") await useLocalSsh(root, [origin, encodedOrigin]);
+    const originUrl = `${urlPrefix}${origin}${encodeURIComponent(suffix)}`;
     await expect(service.setOrigin(originUrl)).resolves.toMatchObject({ originUrl });
     await commit(peer, "Incoming encoded catalog");
     await git(peer, "push", encodedOrigin, "HEAD:refs/heads/main");
@@ -142,7 +148,7 @@ describe("catalog Git file origin identity", () => {
     await expect(git(origin, "rev-parse", "HEAD")).resolves.toBe(originalHead);
   });
 
-  it("preserves symlink parent traversal when saving, displaying, pulling, and pushing a file origin", async () => {
+  it.each(["..", "%2e%2e"])("preserves symlink parent traversal using %s when saving, displaying, pulling, and pushing", async parent => {
     const { root, checkout, origin, peer, service } = await synchronizedFixture();
     const links = path.join(root, "links");
     const alias = path.join(links, "alias");
@@ -151,8 +157,9 @@ describe("catalog Git file origin identity", () => {
     const normalizedOrigin = path.join(links, "origin.git");
     await git(root, "clone", "--bare", origin, normalizedOrigin);
     const normalizedHead = await git(normalizedOrigin, "rev-parse", "HEAD");
-    const originUrl = `file://${alias}/../origin.git`;
-    const normalizedUrl = `file://${normalizedOrigin}`;
+    if (protocol === "ssh") await useLocalSsh(root, [origin, `${alias}/../origin.git`, normalizedOrigin]);
+    const originUrl = `${urlPrefix}${alias}/${parent}/origin.git`;
+    const normalizedUrl = `${urlPrefix}${normalizedOrigin}`;
 
     await expect(service.setOrigin(originUrl)).resolves.toMatchObject({ originUrl });
     await expect(service.status()).resolves.toMatchObject({ originUrl });
@@ -184,8 +191,7 @@ describe("catalog Git origin privacy", () => {
   it.each([
     ["https::https://private-user:private-password@example.test/catalog.git?token=private-token#private-fragment", "https::https://example.test/catalog.git"],
     ["http::http://private-user:private-password@127.0.0.1:12345/catalog.git?token=private-token", "http::http://127.0.0.1:12345/catalog.git"],
-    ["custom::https://private-user:private-password@example.test/catalog.git", "custom::https://example.test/catalog.git"],
-    ["ssh::ssh://git:private-password@example.test/catalog.git", "ssh::ssh://git@example.test/catalog.git"]
+    ["custom::https://private-user:private-password@example.test/catalog.git", "custom::https://example.test/catalog.git"]
   ])("redacts credentials inside existing helper origin %s", async (origin, publicOrigin) => {
     const { checkout, service } = await repositoryFixture();
     await git(checkout, "remote", "add", "origin", origin);
@@ -211,7 +217,14 @@ describe("catalog Git origin privacy", () => {
     "custom::file://private-user:private-password@localhost/catalog.git",
     "file:///catalog.git?token=private-token",
     "file:///catalog.git#private-fragment",
-    "custom::file:///catalog.git?token=private-token#private-fragment"
+    "custom::file:///catalog.git?token=private-token#private-fragment",
+    "ssh://git:private-password@example.test/catalog.git",
+    "ssh::ssh://git:private-password@example.test/catalog.git",
+    "ssh://git%3aprivate-password@example.test/catalog.git",
+    "ssh::ssh://git%3Aprivate-password@example.test/catalog.git",
+    "ssh://git@example.test/catalog.git?token=private-token",
+    "ssh://git@example.test/catalog.git#private-fragment",
+    "custom::ssh://git@example.test/catalog.git?token=private-token#private-fragment"
   ])("rejects an origin that cannot be safely displayed: %s", async origin => {
     const { checkout, service } = await repositoryFixture();
     await git(checkout, "remote", "add", "origin", origin);
@@ -224,12 +237,48 @@ describe("catalog Git origin privacy", () => {
     "git@example.test:rules/catalog.git", "git:catalog@v1.git", "https:rules/catalog@v1.git",
     "git:rules/archive:2026.git", "git@[::1]:catalog.git", "/local rules/catalog.git", "../catalog.git", "./rules:catalog.git",
     "file:///local rules/catalog.git", "file:///rules/alias/../catalog.git", "file:///rules/catalog.git%23archive",
-    "custom::file:///rules/alias/../catalog.git"
+    "custom::file:///rules/alias/../catalog.git",
+    "ssh://git@example.test/local rules/catalog.git", "ssh://git@example.test/rules/alias/../catalog.git",
+    "ssh://git@[::1]:00022/rules/alias/%2e%2e/catalog.git", "ssh://git@example.test/rules/catalog.git%23archive",
+    "ssh://git@example.test/~user/rules/../catalog.git", "ssh::ssh://git@example.test/rules/alias/../catalog.git",
+    "git+ssh://git@example.test/rules/alias/../catalog.git", "ssh+git://git@example.test/rules/alias/../catalog.git",
+    "git://example.test/rules/alias/../catalog.git"
   ])("displays a credential-free SSH or local origin: %s", async origin => {
     const { checkout, service } = await repositoryFixture();
     await git(checkout, "remote", "add", "origin", origin);
 
     await expect(service.status()).resolves.toMatchObject({ originUrl: origin });
+  });
+
+  it.each(["ssh", "git+ssh", "ssh+git", "git", "file"])("rejects literal suffixes for the native %s transport", async protocol => {
+    const { checkout, service } = await repositoryFixture();
+    const host = protocol === "file" ? "" : "example.test";
+    const origin = `${protocol}://${host}/catalog.git`;
+    await git(checkout, "remote", "add", "origin", origin);
+
+    for (const suffix of ["#archive", "?archive", "#", "?"]) {
+      await git(checkout, "remote", "set-url", "origin", origin + suffix);
+      await expect(service.status()).rejects.toThrow(/cannot be displayed safely/i);
+      await expect(service.pull(origin)).rejects.toThrow(/cannot be displayed safely/i);
+      await expect(service.push(origin)).rejects.toThrow(/cannot be displayed safely/i);
+    }
+  });
+
+  it.each([
+    "ssh://git@example.test/catalog.git#", "ssh://git@example.test/catalog.git?",
+    "ssh://git@example.test/catalog.git?token=private-token#private-fragment",
+    "ssh://git:private-password@example.test/catalog.git",
+    "ssh://git%3aprivate-password@example.test/catalog.git"
+  ])("rejects an unsafe SSH destination before changing Git configuration: %s", async origin => {
+    const { checkout, service } = await repositoryFixture();
+    const originalOrigin = "ssh://git@example.test/original.git";
+    await service.setOrigin(originalOrigin);
+
+    await expect(service.setOrigin(origin)).rejects.toThrow();
+
+    await expect(service.status()).resolves.toMatchObject({ originUrl: originalOrigin });
+    await expect(git(checkout, "remote", "get-url", "origin")).resolves.toBe(originalOrigin);
+    await expect(git(checkout, "remote", "get-url", "--push", "origin")).resolves.toBe(originalOrigin);
   });
 });
 
@@ -276,6 +325,24 @@ process.exit(result.status ?? 1);
   const originUrl = `${alias}:catalog.git`;
   await git(fixture.checkout, "remote", "set-url", "origin", originUrl);
   return { ...fixture, originUrl, replacement };
+}
+
+async function useLocalSsh(root: string, repositories: string[]) {
+  const bin = path.join(root, "ssh-bin");
+  await fs.mkdir(bin);
+  await fs.writeFile(path.join(bin, "ssh"), `#!${process.execPath}
+const { spawnSync } = require("node:child_process");
+const [host, command] = process.argv.slice(-2);
+const operations = new Map(${JSON.stringify(repositories.flatMap(repository => [
+    [`git-upload-pack '${repository}'`, ["upload-pack", repository]],
+    [`git-receive-pack '${repository}'`, ["receive-pack", repository]]
+  ]))});
+const operation = operations.get(command);
+if (host !== "catalog.test" || !operation) process.exit(1);
+const result = spawnSync("git", operation, { stdio: "inherit" });
+process.exit(result.status ?? 1);
+`, { mode: 0o755 });
+  vi.stubEnv("PATH", `${bin}${path.delimiter}${process.env.PATH}`);
 }
 
 async function commit(checkout: string, message: string) {
