@@ -30,6 +30,7 @@ const { HookRegistry } = await vi.importActual<{ HookRegistry: new () => Hooks }
 const execute = promisify(execFile);
 const roots: Root[] = [];
 const directories: string[] = [];
+const cleanups: (() => Promise<void>)[] = [];
 
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -42,6 +43,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  await act(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(); });
   await act(async () => roots.splice(0).forEach(root => root.unmount()));
   document.body.replaceChildren();
   vi.restoreAllMocks();
@@ -112,14 +114,14 @@ describe("catalog Git destination across App panes", () => {
 
     expect(originInput(catalog.second).value).toBe(catalog.origin);
     expect(button(catalog.second, "Push commits").disabled).toBe(false);
-    await catalog.perform(catalog.second, "Push commits", "push");
-
-    expect(catalog.pushDestinations()).toEqual([catalog.origin]);
-    expect(catalog.second.querySelector('[role="alert"]')?.textContent).toContain("Origin changed since it was displayed.");
+    await catalog.queue(catalog.second, "Push commits");
     await catalog.expectNeitherRemoteUpdated();
 
     await act(async () => saving.release());
-    await catalog.finishRequest("setOrigin");
+    await catalog.finishRequests();
+    expect(catalog.pushDestinations()).toEqual([catalog.origin]);
+    expect(catalog.second.querySelector('[role="alert"]')?.textContent).toContain("Origin changed since it was displayed.");
+    await catalog.expectNeitherRemoteUpdated();
     expect(originInput(catalog.first).value).toBe(catalog.replacement);
     expect(originInput(catalog.second).value).toBe(catalog.replacement);
     await catalog.perform(catalog.second, "Refresh Git status", "status");
@@ -128,22 +130,96 @@ describe("catalog Git destination across App panes", () => {
     await catalog.expectPublishedOnlyToReplacement();
   });
 
-  it("does not let a late Git status response overwrite another pane's newer origin save", async () => {
+  it.each(["request", "response"] as const)("keeps an origin save after a delayed Git status %s", async delay => {
     const catalog = await twoPaneCatalog();
-    const refreshing = catalog.holdNextResponse("status");
+    const refreshing = catalog.holdNext("status", delay);
     await click(catalog.second, "Refresh Git status");
     await refreshing.ready;
     await editOrigin(catalog.first, catalog.replacement);
-    await catalog.perform(catalog.first, "Save origin", "setOrigin");
-
-    expect(originInput(catalog.second).value).toBe(catalog.replacement);
+    await catalog.queue(catalog.first, "Save origin");
     await act(async () => refreshing.release());
-    await catalog.finishRequest("status");
+    await catalog.finishRequests();
 
     expect(originInput(catalog.first).value).toBe(catalog.replacement);
     expect(originInput(catalog.second).value).toBe(catalog.replacement);
     await catalog.perform(catalog.second, "Push commits", "push");
     expect(catalog.pushDestinations()).toEqual([catalog.replacement]);
+    await catalog.expectPublishedOnlyToReplacement();
+  });
+
+  it.each(["request", "response"] as const)("refreshes both panes after a delayed origin save %s and syncs only the displayed replacement", async delay => {
+    const catalog = await twoPaneCatalog();
+    const incomingHead = await catalog.publishReplacementRule();
+    const saving = catalog.holdNext("setOrigin", delay);
+    await editOrigin(catalog.first, catalog.replacement);
+    await click(catalog.first, "Save origin");
+    await saving.ready;
+
+    await click(catalog.second, "Refresh Git status");
+    await catalog.finishOtherRequests("setOrigin");
+    await act(async () => saving.release());
+    await catalog.finishRequests();
+
+    for (const pane of [catalog.first, catalog.second]) {
+      expect(originInput(pane).value).toBe(catalog.replacement);
+      expect(button(pane, "Pull").disabled).toBe(false);
+      expect(button(pane, "Push commits").disabled).toBe(false);
+    }
+    expect(catalog.first.textContent).toContain("Origin saved.");
+    expect(catalog.second.textContent).toContain("Git status refreshed.");
+    expect(await git(catalog.checkout, "remote", "get-url", "origin")).toBe(catalog.replacement);
+
+    await catalog.perform(catalog.second, "Pull", "pull");
+    expect(await git(catalog.checkout, "rev-parse", "HEAD")).toBe(incomingHead);
+    for (const pane of [catalog.first, catalog.second]) {
+      expect(originInput(pane).value).toBe(catalog.replacement);
+      expect(pane.textContent).toContain("Rule from the replacement remote.");
+    }
+    await fs.writeFile(path.join(catalog.checkout, "rules", "outgoing.md"), "New commit for the replacement.\n");
+    await commit(catalog.checkout, "Add outgoing rule after pull");
+    await catalog.perform(catalog.second, "Push commits", "push");
+    expect(catalog.pushDestinations()).toEqual([catalog.replacement]);
+    expect(catalog.second.textContent).toContain("Commits pushed to origin.");
+    await catalog.expectPublishedOnlyToReplacement();
+  });
+
+  it("keeps a saved origin after an older pull response and refreshes the catalog", async () => {
+    const catalog = await twoPaneCatalog();
+    const pulling = catalog.holdNextResponse("pull");
+    await click(catalog.second, "Pull");
+    await pulling.ready;
+    await editOrigin(catalog.first, catalog.replacement);
+    await catalog.queue(catalog.first, "Save origin");
+    await act(async () => pulling.release());
+    await catalog.finishRequests();
+
+    for (const pane of [catalog.first, catalog.second]) {
+      expect(originInput(pane).value).toBe(catalog.replacement);
+      expect(pane.textContent).toContain("Publish only to the displayed destination.");
+    }
+    await catalog.perform(catalog.second, "Push commits", "push");
+    await catalog.expectPublishedOnlyToReplacement();
+  });
+
+  it("refreshes after a delayed origin save fails and allows the draft to be saved again", async () => {
+    const catalog = await twoPaneCatalog();
+    catalog.failNextRequest("setOrigin", "Origin save failed.");
+    const saving = catalog.holdNext("setOrigin", "request");
+    await editOrigin(catalog.first, catalog.replacement);
+    await click(catalog.first, "Save origin");
+    await saving.ready;
+    await catalog.queue(catalog.second, "Refresh Git status");
+    await act(async () => saving.release());
+    await catalog.finishRequests();
+
+    expect(catalog.first.querySelector('[role="alert"]')?.textContent).toContain("Origin save failed.");
+    expect(originInput(catalog.first).value).toBe(catalog.replacement);
+    expect(originInput(catalog.second).value).toBe(catalog.origin);
+    expect(button(catalog.first, "Save origin").disabled).toBe(false);
+    await catalog.expectNeitherRemoteUpdated();
+    await catalog.perform(catalog.first, "Save origin", "setOrigin");
+    for (const pane of [catalog.first, catalog.second]) expect(originInput(pane).value).toBe(catalog.replacement);
+    await catalog.perform(catalog.second, "Push commits", "push");
     await catalog.expectPublishedOnlyToReplacement();
   });
 });
@@ -165,14 +241,20 @@ async function twoPaneCatalog() {
   const oldHead = await git(origin, "rev-parse", "refs/heads/main");
   await catalog.saveRule({ id: "local-rule", text: "Publish only to the displayed destination." });
   await commit(checkout, "Add local rule");
-  const localHead = await git(checkout, "rev-parse", "HEAD");
 
   const plugin = new RulesSkillsPlugin(catalog);
   const hooks = new HookRegistry();
   plugin.hooks.forEach(hook => hooks.register(hook));
   const requests: { operation: string; input: Record<string, unknown>; response: Promise<Response> }[] = [];
   const heldResponses = new Map<string, { ready: () => void; released: Promise<void> }>();
+  const heldRequests = new Map<string, { ready: () => void; released: Promise<void> }>();
+  const failures = new Map<string, string>();
   const pending = new Set<Promise<Response>>();
+  const releases: (() => void)[] = [];
+  cleanups.push(async () => {
+    releases.forEach(release => release());
+    while (pending.size) await Promise.all([...pending]);
+  });
   const tabs: WorkspaceTab[] = ["first", "second"].map(id => ({ id, pluginId: RULES_SKILLS_PLUGIN_ID, title: `Rules ${id}`, cwd: checkout, status: "idle", indicator: { color: "green", label: "Ready", updatedAt: "2026-09-09" }, createdAt: "2026-09-09", updatedAt: "2026-09-09" }));
   const workspace: WorkspaceStateResponse = {
     tabs, activeTabId: tabs[0].id, activeWindowId: "window", templates: [],
@@ -191,7 +273,19 @@ async function twoPaneCatalog() {
       const { input } = JSON.parse(String(init?.body)) as { input: Record<string, unknown> };
       const held = heldResponses.get(operation);
       heldResponses.delete(operation);
-      const response = hooks.call(id, input, { caller: { kind: "ui" } }).then(async result => {
+      const delivery = heldRequests.get(operation);
+      heldRequests.delete(operation);
+      const failure = failures.get(operation);
+      failures.delete(operation);
+      const result = (async () => {
+        if (delivery) {
+          delivery.ready();
+          await delivery.released;
+        }
+        if (failure) throw new Error(failure);
+        return hooks.call(id, input, { caller: { kind: "ui" } });
+      })();
+      const response = result.then(async result => {
         held?.ready();
         if (held) await held.released;
         return reply({ result });
@@ -234,8 +328,39 @@ async function twoPaneCatalog() {
     await act(async () => { await request!.response; });
   }
 
+  function holdNext(operation: string, delay: "request" | "response") {
+    const ready = deferred();
+    const released = deferred();
+    releases.push(released.resolve);
+    const held = delay === "request" ? heldRequests : heldResponses;
+    held.set(operation, { ready: ready.resolve, released: released.promise });
+    return { ready: ready.promise, release: released.resolve };
+  }
+
   return {
-    first, second, checkout, origin, replacement, finishRequest,
+    first, second, checkout, origin, replacement,
+    async finishOtherRequests(operation: string) {
+      await act(async () => { await Promise.all(requests.filter(request => request.operation !== operation).map(request => request.response)); });
+    },
+    async finishRequests() {
+      while (pending.size) await act(async () => { await Promise.all([...pending]); });
+    },
+    async queue(panel: Element, label: string) {
+      const previousRequests = requests.length;
+      await click(panel, label);
+      expect(button(panel, label).disabled).toBe(true);
+      expect(requests).toHaveLength(previousRequests);
+    },
+    failNextRequest: (operation: string, message: string) => failures.set(operation, message),
+    async publishReplacementRule() {
+      await git(checkout, "push", replacement, "main");
+      const publisher = path.join(directory, "publisher");
+      await git(directory, "clone", replacement, publisher);
+      await fs.writeFile(path.join(publisher, "rules", "incoming.md"), "Rule from the replacement remote.\n");
+      await commit(publisher, "Add replacement rule");
+      await git(publisher, "push", "origin", "main");
+      return git(publisher, "rev-parse", "HEAD");
+    },
     pushDestinations: () => requests.filter(request => request.operation === "push").map(request => request.input.expectedOriginUrl),
     async perform(panel: Element, label: string, operation: string) {
       const previousRequests = requests.length;
@@ -243,18 +368,14 @@ async function twoPaneCatalog() {
       expect(requests.length).toBeGreaterThan(previousRequests);
       await finishRequest(operation);
     },
-    holdNextResponse(operation: string) {
-      const ready = deferred();
-      const released = deferred();
-      heldResponses.set(operation, { ready: ready.resolve, released: released.promise });
-      return { ready: ready.promise, release: released.resolve };
-    },
+    holdNextResponse: (operation: string) => holdNext(operation, "response"),
+    holdNext,
     async expectNeitherRemoteUpdated() {
       expect(await git(origin, "rev-parse", "refs/heads/main")).toBe(oldHead);
       expect(await git(replacement, "for-each-ref", "--format=%(refname)")).toBe("");
     },
     async expectPublishedOnlyToReplacement() {
-      expect(await git(replacement, "rev-parse", "refs/heads/main")).toBe(localHead);
+      expect(await git(replacement, "rev-parse", "refs/heads/main")).toBe(await git(checkout, "rev-parse", "HEAD"));
       expect(await git(origin, "rev-parse", "refs/heads/main")).toBe(oldHead);
     }
   };

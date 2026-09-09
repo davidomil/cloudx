@@ -181,10 +181,8 @@ export function App() {
   const [config, setConfig] = useState<CloudxConfigResponse | undefined>();
   const [forgeRepositoryChange, setForgeRepositoryChange] = useState({ version: 0, pending: false });
   const [rulesSkillsStore, setRulesSkillsStore] = useState<RulesSkillsStore | undefined>();
-  const rulesSkillsCatalogQueue = useRef(Promise.resolve());
+  const rulesSkillsQueue = useRef(Promise.resolve());
   const [rulesSkillsGit, setRulesSkillsGit] = useState<RulesSkillsGitState>();
-  const rulesSkillsGitRequest = useRef(0);
-  const appliedRulesSkillsGitRequest = useRef(0);
   const [tabs, setTabs] = useState<WorkspaceTab[]>([]);
   const [windows, setWindows] = useState<WorkspaceWindow[]>([]);
   const [activeWindowId, setActiveWindowId] = useState<string | undefined>();
@@ -445,48 +443,38 @@ export function App() {
     }
   }
 
-  const callRulesSkillsCatalog = useCallback(<T extends { store: RulesSkillsStore } = { store: RulesSkillsStore },>(operation: string, input: Record<string, unknown> = {}) => {
-    const request = rulesSkillsCatalogQueue.current.then(async () => {
-      const result = await callHook<T>(`rules-skills.${operation}`, input);
-      setRulesSkillsStore(result.store);
-      return result;
+  const callRulesSkills = useCallback(<T extends { store?: RulesSkillsStore; git?: RulesSkillsGitState } = { store: RulesSkillsStore },>(operation: string, input: Record<string, unknown> = {}) => {
+    const request = rulesSkillsQueue.current.then(async () => {
+      try {
+        const result = await callHook<T>(`rules-skills.${operation}`, input);
+        if (result.store) setRulesSkillsStore(result.store);
+        if (result.git) setRulesSkillsGit(result.git);
+        return result;
+      } catch (error) {
+        if (operation === "git.setOrigin") setRulesSkillsGit(undefined);
+        throw error;
+      }
     });
-    rulesSkillsCatalogQueue.current = request.then(() => undefined, () => undefined);
+    rulesSkillsQueue.current = request.then(() => undefined, () => undefined);
     return request;
   }, []);
 
   const loadRulesSkillsStore = useCallback(async (): Promise<RulesSkillsStore | undefined> => {
     try {
-      const result = await callRulesSkillsCatalog("catalog.list");
+      const result = await callRulesSkills("catalog.list");
       return result.store;
     } catch {
       return undefined;
     }
-  }, [callRulesSkillsCatalog]);
+  }, [callRulesSkills]);
 
   const handleRefreshRulesSkillsStore = useCallback(async () => {
-    await callRulesSkillsCatalog("catalog.list");
-  }, [callRulesSkillsCatalog]);
+    await callRulesSkills("catalog.list");
+  }, [callRulesSkills]);
 
-  const callRulesSkillsGit = useCallback(async (operation: string, input: Record<string, unknown> = {}) => {
-    const request = ++rulesSkillsGitRequest.current;
-    try {
-      const result = operation === "pull"
-        ? await callRulesSkillsCatalog<{ git: RulesSkillsGitState; store: RulesSkillsStore }>("git.pull", input)
-        : await callHook<{ git: RulesSkillsGitState }>(`rules-skills.git.${operation}`, input);
-      if (request > appliedRulesSkillsGitRequest.current) {
-        appliedRulesSkillsGitRequest.current = request;
-        setRulesSkillsGit(result.git);
-      }
-      return result;
-    } catch (error) {
-      if (operation === "setOrigin" && request > appliedRulesSkillsGitRequest.current) {
-        appliedRulesSkillsGitRequest.current = request;
-        setRulesSkillsGit(undefined);
-      }
-      throw error;
-    }
-  }, [callRulesSkillsCatalog]);
+  const callRulesSkillsGit = useCallback((operation: string, input: Record<string, unknown> = {}) => {
+    return callRulesSkills<{ git: RulesSkillsGitState }>(`git.${operation}`, input);
+  }, [callRulesSkills]);
 
   const loadRulesSkillsGit = useCallback(async () => {
     const result = await callRulesSkillsGit("status");
@@ -1136,19 +1124,19 @@ export function App() {
   }
 
   async function handleSavePersonalityTemplate(template: PersonalityTemplate) {
-    await callRulesSkillsCatalog("templates.save", { template });
+    await callRulesSkills("templates.save", { template });
   }
 
   async function handleDeletePersonalityTemplate(templateId: string) {
-    await callRulesSkillsCatalog("templates.delete", { templateId });
+    await callRulesSkills("templates.delete", { templateId });
   }
 
   async function handleSetDefaultTemplate(templateId: string | undefined) {
-    await callRulesSkillsCatalog("templates.setDefault", templateId ? { templateId } : {});
+    await callRulesSkills("templates.setDefault", templateId ? { templateId } : {});
   }
 
   async function handleSaveRule(rule: CloudxRule) {
-    await callRulesSkillsCatalog("rules.save", { rule });
+    await callRulesSkills("rules.save", { rule });
   }
 
   async function handleInjectRulesSkillsRuntime(): Promise<number> {
@@ -1157,7 +1145,7 @@ export function App() {
   }
 
   async function handleDeleteRule(ruleId: string) {
-    await callRulesSkillsCatalog("rules.delete", { ruleId });
+    await callRulesSkills("rules.delete", { ruleId });
   }
 
   function renderMicControl(className: string, ref: RefObject<HTMLDivElement | null>, iconSize: number) {
