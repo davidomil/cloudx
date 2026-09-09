@@ -143,6 +143,73 @@ class FakeDefaultPlugin implements WorkspacePlugin {
   }
 }
 
+class StatusSession extends FakeSession {
+  private readonly statusListeners = new Set<(status: WorkspaceTab["status"], message?: string) => void>();
+
+  constructor(tab: WorkspaceTab, private status: WorkspaceTab["status"], private statusMessage?: string) {
+    super(tab);
+  }
+
+  override snapshot() {
+    return { ...super.snapshot(), status: this.status, statusMessage: this.statusMessage };
+  }
+
+  onStatusChange(listener: (status: WorkspaceTab["status"], message?: string) => void): () => void {
+    this.statusListeners.add(listener);
+    return () => { this.statusListeners.delete(listener); };
+  }
+
+  reportStatus(status: WorkspaceTab["status"], message?: string): void {
+    this.status = status;
+    this.statusMessage = message;
+    for (const listener of this.statusListeners) listener(status, message);
+  }
+}
+
+describe.each(["create", "restart"] as const)("SessionStore session registration on %s", (launch) => {
+  it.each([
+    ["failed", "The command exited with code 17.", "red", "Failed"],
+    ["completed", "The command finished.", "yellow", "Completed"],
+    ["stopped", "The command was stopped.", "yellow", "Stopped"],
+    ["waiting_approval", "Approval is required.", "yellow", "Needs attention"],
+    ["idle", "Ready for a task.", "green", "OK"],
+    ["running", "The command is working.", "green", "OK"]
+  ] as const)("preserves %s and its detail when creation returns", async (status, statusMessage, color, label) => {
+    const { store, root, plugin } = await createStore();
+    try {
+      const previous = launch === "restart" ? await store.createTab({ pluginId: plugin.id, cwd: root }) : undefined;
+      plugin.createSession = async ({ tab }) => new StatusSession(tab, status, statusMessage);
+
+      const tab = previous ? await store.restartTab(previous.id) : await store.createTab({ pluginId: plugin.id, cwd: root });
+
+      expect(tab).toMatchObject({ status, statusMessage, indicator: { color, label, message: statusMessage } });
+      expect(store.getSession(tab.id).snapshot()).toMatchObject({ status, statusMessage });
+    } finally {
+      await store.dispose();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("marks a continuing session running and keeps receiving later status changes", async () => {
+    const { store, root, plugin } = await createStore();
+    try {
+      const previous = launch === "restart" ? await store.createTab({ pluginId: plugin.id, cwd: root }) : undefined;
+      plugin.createSession = async ({ tab }) => new StatusSession(tab, "starting", "Opening the command.");
+      const tab = previous ? await store.restartTab(previous.id) : await store.createTab({ pluginId: plugin.id, cwd: root });
+      const session = store.getSession(tab.id) as StatusSession;
+      expect(tab).toMatchObject({ status: "running", statusMessage: undefined, indicator: { color: "green", label: "OK", message: "Running." } });
+
+      session.reportStatus("failed", "The command failed after launch.");
+      expect(store.getTab(tab.id)).toMatchObject({ status: "failed", statusMessage: "The command failed after launch.", indicator: { color: "red", message: "The command failed after launch." } });
+      session.reportStatus("stopped");
+      expect(store.getTab(tab.id)).toMatchObject({ status: "stopped", statusMessage: undefined, indicator: { label: "Stopped", message: undefined } });
+    } finally {
+      await store.dispose();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("SessionStore voice actions", () => {
   it("keeps a pre-start cleanup failure distinct from a safe session rejection", async () => {
     const { store, root, plugin } = await createStore();

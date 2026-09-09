@@ -559,6 +559,7 @@ export class CodexTerminalSession implements PluginSession {
   private recentOutput = "";
   private stopped = false;
   private status: WorkspaceTab["status"];
+  private statusMessage: string | undefined;
   private readiness: TerminalReadinessSnapshot = { state: "starting", reason: "Waiting for terminal output.", changedAt: Date.now() };
   private readonly replayBytes: number;
   private readonly startedAt = Date.now();
@@ -672,6 +673,7 @@ export class CodexTerminalSession implements PluginSession {
       title: this.tab.title,
       cwd: this.tab.cwd,
       status: this.status,
+      statusMessage: this.statusMessage,
       recentOutput: this.recentOutput,
       state: { readiness: this.readinessSnapshot() }
     };
@@ -748,6 +750,7 @@ export class CodexTerminalSession implements PluginSession {
 
   private setStatus(status: WorkspaceTab["status"], message?: string): void {
     this.status = status;
+    this.statusMessage = message;
     for (const listener of this.statusListeners) {
       listener(status, message);
     }

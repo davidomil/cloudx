@@ -29,6 +29,7 @@ import { RulesSkillsCatalogService } from "../rulesSkills/RulesSkillsCatalogServ
 import { SessionStore } from "../sessionStore.js";
 import { NodePtyTerminalProcessFactory } from "../terminal/NodePtyTerminalProcess.js";
 import type { TerminalProcess } from "../terminal/TerminalProcess.js";
+import { TerminalSupervisor } from "../terminal/TerminalSupervisor.js";
 import { WorkspaceCommandService } from "../workspace/WorkspaceCommandService.js";
 import { WorkspaceLayoutStore } from "../workspace/WorkspaceLayoutStore.js";
 import { ForgeRuntime, type ForgeRuntimeDependencies } from "./ForgeRuntime.js";
@@ -55,6 +56,29 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Codex tabs", () => {
+  it.each([
+    [17, "failed", "Terminal exited with code 17."],
+    [0, "completed", "Terminal exited cleanly."]
+  ] as const)("fails promptly when exit code %s arrives before session registration without a report", async (exitCode, status, statusMessage) => {
+    const fixture = await LifecycleFixture.create();
+    const started = await fixture.startIssueThatExitsBeforeRegistration(exitCode);
+    const terminal = fixture.factory.processes[0]!;
+    await expect(new Promise(resolve => terminal.onExit(resolve))).resolves.toEqual({ exitCode });
+
+    expect(fixture.sessions.getTab(started.tabId!)).toMatchObject({ status, statusMessage });
+    expect(fixture.sessions.getSession(started.tabId!).snapshot()).toMatchObject({ status, statusMessage });
+    expect(fixture.workflowDependencies.runtime.isActive(started.tabId!)).toBe(false);
+    expect(await fixture.reports.read(started.attemptId!)).toBeUndefined();
+    await fixture.workflow.poll();
+
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "failed", error: "The Codex tab ended without a completion report. Inspect the worker before resuming." });
+    expect(fixture.sessions.listTabs()).toEqual([]);
+    expect(fixture.factory.processes).toHaveLength(1);
+    await expect(terminal.terminate()).resolves.toBeUndefined();
+    expect((await fs.stat(started.worktreePath!)).isDirectory()).toBe(true);
+    expect(fixture.gitPushes).toEqual([]);
+  }, 15_000);
+
   it("publishes an issue after the coding process exits normally before Forge reads its report", async () => {
     const fixture = await LifecycleFixture.create();
     const started = await fixture.workflow.startIssue(repository, 1, fixture.placement);
@@ -809,6 +833,20 @@ class LifecycleFixture {
   advanceTime(milliseconds: number): void {
     const elapsed = Date.now() - wallClockNow() + milliseconds;
     vi.spyOn(Date, "now").mockImplementation(() => wallClockNow() + elapsed);
+  }
+
+  async startIssueThatExitsBeforeRegistration(exitCode: number): Promise<ForgeWorker> {
+    await fs.writeFile(path.join(this.root, "fixture-assistant.mjs"), `#!/bin/sh\nexit ${exitCode}\n`, { mode: 0o700 });
+    const ready = TerminalSupervisor.prototype.ready;
+    const readiness = vi.spyOn(TerminalSupervisor.prototype, "ready").mockImplementation(async function(this: TerminalSupervisor) {
+      await ready.call(this);
+      await this.completion;
+    });
+    try {
+      return await this.workflow.startIssue(repository, 1, this.placement);
+    } finally {
+      readiness.mockRestore();
+    }
   }
 
   async exitAssistantNormally(receipt: AssistantReceipt, terminal: TerminalProcess): Promise<void> {

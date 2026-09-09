@@ -129,8 +129,7 @@ export class SessionStore {
         config: this.configProvider.getPluginConfig(plugin.id),
         getConfig: () => this.configProvider.getPluginConfig(plugin.id)
       });
-      this.bindSession(id, session);
-      this.updateTab(id, { status: "running", indicator: templateIndicator ? createTabIndicator(templateIndicator) : createTabIndicator({ color: "green", label: "OK", message: "Running." }) });
+      this.bindSession(id, session, templateIndicator);
     } catch (error) {
       try {
         await this.discardPreparedTab(id);
@@ -579,12 +578,7 @@ export class SessionStore {
         config: this.configProvider.getPluginConfig(plugin.id),
         getConfig: () => this.configProvider.getPluginConfig(plugin.id)
       });
-      this.bindSession(tabId, session);
-      this.updateTab(tabId, {
-        status: "running",
-        statusMessage: undefined,
-        indicator: templateIndicator ? createTabIndicator(templateIndicator) : createTabIndicator({ color: "green", label: "OK", message: "Running." })
-      });
+      this.bindSession(tabId, session, templateIndicator);
     } catch (error) {
       this.updateTab(tabId, {
         status: "failed",
@@ -694,7 +688,7 @@ export class SessionStore {
     }
   }
 
-  private bindSession(tabId: string, session: PluginSession): void {
+  private bindSession(tabId: string, session: PluginSession, templateIndicator?: TabIndicatorUpdate): void {
     this.sessions.set(tabId, session);
     const disposers: Array<() => void> = [];
     const statusDisposer = session.onStatusChange?.((status, statusMessage) => {
@@ -721,6 +715,16 @@ export class SessionStore {
       disposers.push(dataDisposer);
     }
     this.sessionDisposers.set(tabId, disposers);
+    const current = session.snapshot();
+    const status = current.status === "starting" ? "running" : current.status;
+    const statusMessage = current.status === "starting" ? undefined : current.statusMessage;
+    this.updateTab(tabId, {
+      status,
+      statusMessage,
+      indicator: status === "running"
+        ? createTabIndicator(templateIndicator ?? { color: "green", label: "OK", message: statusMessage ?? "Running." })
+        : indicatorForStatus(status, statusMessage)
+    });
   }
 
   private disposeSessionListeners(tabId: string): void {

@@ -86,6 +86,22 @@ const tab: WorkspaceTab = {
 };
 
 describe("CodexTerminalPlugin", () => {
+  it.each([
+    [17, "failed", "Terminal exited with code 17."],
+    [0, "completed", "Terminal exited cleanly."]
+  ] as const)("retains exit code %s and its detail before status observers subscribe", async (exitCode, status, statusMessage) => {
+    const process = new FakeTerminalProcess();
+    const session = new CodexTerminalSession(tab, process);
+    process.exit(exitCode);
+
+    expect(session.snapshot()).toMatchObject({ status, statusMessage });
+    const observer = vi.fn();
+    session.onStatusChange(observer);
+    await session.handleAction("stop", {});
+    expect(observer).toHaveBeenCalledWith("stopped", "Terminal was stopped.");
+    expect(session.snapshot()).toMatchObject({ status: "stopped", statusMessage: "Terminal was stopped." });
+  });
+
   it.each([0, 1])("retains an owned session after exit code %s until its owner verifies termination", async (exitCode) => {
     await withProjectTrustFixture(async ({ root, factory, plugin }) => {
       const closeTab = vi.fn();

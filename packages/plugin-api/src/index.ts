@@ -97,6 +97,7 @@ export interface PluginSessionSnapshot {
   title: string;
   cwd: string;
   status: WorkspaceTab["status"];
+  statusMessage?: string;
   recentOutput?: string;
   state?: Record<string, unknown>;
 }
