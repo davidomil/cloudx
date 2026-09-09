@@ -358,6 +358,86 @@ test("configures origin, pushes commits, and pulls into the visible catalog with
       name: /^Keep removed-rule changes focused\./,
     }),
   ).toBeChecked();
+  for (const timing of ["before", "during"] as const) {
+    await test.step(`saving a rule draft started ${timing} another pane's pull preserves the pulled description`, async () => {
+      const description = `Description pulled with a draft started ${timing} pull.`;
+      const localText = `Keep local text drafted ${timing} the other pane's pull.`;
+      await git(peer, "pull", "--ff-only");
+      await fs.writeFile(
+        path.join(peer, "rules", "draft-rule.md"),
+        `---\nid: draft-rule\ndescription: ${description}\n---\nRemote rule text.\n`,
+      );
+      await git(peer, "add", "rules/draft-rule.md");
+      await git(peer, "commit", "-m", `Update rule description ${timing} pull`);
+      await git(peer, "push", "origin", "main");
+
+      const editor = draftPane.getByRole("textbox", {
+        name: "Rule text for draft-rule",
+        exact: true,
+      });
+      async function startRuleDraft() {
+        await draftPane
+          .getByRole("button", { name: "Edit rule draft-rule", exact: true })
+          .click();
+        await editor.fill(localText);
+      }
+      if (timing === "before") await startRuleDraft();
+
+      const held = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      await page.route(
+        "**/api/hooks/rules-skills.git.pull",
+        async (route) => {
+          held.resolve();
+          await release.promise;
+          await route.continue();
+        },
+        { times: 1 },
+      );
+      const pulled = page.waitForResponse("**/api/hooks/rules-skills.git.pull");
+      try {
+        await pullPane
+          .getByRole("button", { name: "Pull", exact: true })
+          .click();
+        await held.promise;
+        if (timing === "during") await startRuleDraft();
+        await expect(editor).toHaveText(localText);
+      } finally {
+        release.resolve();
+      }
+      expect((await pulled).ok()).toBe(true);
+      await expect(draftPane.locator(".rule-option-editing")).toHaveAttribute(
+        "title",
+        description,
+      );
+      await expect(editor).toHaveText(localText);
+      await draftPane
+        .getByRole("button", { name: "Save rule draft-rule", exact: true })
+        .click();
+      await expect(editor).toHaveCount(0);
+      const savedRule = await fs.readFile(
+        path.join(catalog, "rules", "draft-rule.md"),
+        "utf8",
+      );
+      expect(savedRule).toContain(localText);
+      expect(savedRule).toContain(`description: ${description}`);
+
+      await git(catalog, "add", "rules/draft-rule.md");
+      await git(
+        catalog,
+        "commit",
+        "-m",
+        `Save rule draft started ${timing} pull`,
+      );
+      await git(catalog, "push", "origin", "main");
+      await pullPane
+        .getByRole("button", { name: "Refresh Git status", exact: true })
+        .click();
+      await expect(
+        pullPane.getByRole("button", { name: "Pull", exact: true }),
+      ).toBeEnabled();
+    });
+  }
   await draftPane
     .getByLabel("Name", { exact: true })
     .fill("Preserved draft template");

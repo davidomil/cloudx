@@ -53,6 +53,38 @@ afterEach(async () => {
 });
 
 describe("catalog response ordering across App panes", () => {
+  it.each(["before", "during"])("preserves a pulled description when saving rule text drafted %s pull", async timing => {
+    const catalog = await twoPaneCatalog();
+    const description = "Description updated on origin.";
+    const text = "Keep this local rule text draft.";
+    const incomingHead = await catalog.publishRuleDescription(description);
+    if (timing === "before") await editRule(catalog.second, catalog.ruleId, text);
+
+    const pulling = catalog.holdNextResponse("git.pull");
+    await click(catalog.first, "Pull");
+    await pulling.ready;
+    expect(await catalog.head()).toBe(incomingHead);
+    if (timing === "during") await editRule(catalog.second, catalog.ruleId, text);
+    await act(async () => pulling.release());
+    await catalog.finishRequests();
+
+    const editor = catalog.second.querySelector(`[aria-label="Rule text for ${catalog.ruleId}"]`)!;
+    expect(editor.textContent).toBe(text);
+    expect(editor.closest(".rule-option")?.getAttribute("title")).toBe(description);
+    await catalog.perform(catalog.second, `Save rule ${catalog.ruleId}`, "rules.save");
+
+    expect(await catalog.savedRuleFile()).toContain(`description: ${description}\n`);
+    expect(await catalog.savedRuleFile()).toContain(`\n${text}\n`);
+    expect((await catalog.savedStore()).rules).toContainEqual(expect.objectContaining({ id: catalog.ruleId, description, text }));
+    await catalog.perform(catalog.first, "Refresh rules and skills", "catalog.list");
+    for (const pane of [catalog.first, catalog.second]) {
+      const rule = button(pane, `Edit rule ${catalog.ruleId}`).closest(".rule-option")!;
+      expect(rule.textContent).toBe(text);
+      expect(rule.getAttribute("title")).toBe(description);
+      expect(pane.querySelector(`[aria-label="Rule text for ${catalog.ruleId}"]`)).toBeNull();
+    }
+  });
+
   it("keeps a newer saved template after an older completed pull response arrives", async () => {
     const catalog = await twoPaneCatalog();
     const previousHead = await catalog.head();
@@ -417,6 +449,7 @@ async function twoPaneCatalog() {
     },
     head: () => git(checkout, "rev-parse", "HEAD"),
     savedStore: () => catalog.list(),
+    savedRuleFile: () => fs.readFile(path.join(checkout, "rules", `${ruleId}.md`), "utf8"),
     failNextRequest: (operation: string, message: string) => failures.set(operation, message),
     async renameOnDisk(name: string) {
       const saved = (await catalog.list()).templates.find(template => template.id === templateId)!;
@@ -428,6 +461,14 @@ async function twoPaneCatalog() {
       await fs.writeFile(path.join(publisher, "templates", `${templateId}.json`), JSON.stringify({ ...initial.templates[0], name }));
       await fs.writeFile(path.join(publisher, "rules", "incoming-rule.md"), "Keep the incoming rule.\n");
       await commit(publisher, "Update catalog on origin");
+      await git(publisher, "push", "origin", "main");
+      return git(publisher, "rev-parse", "HEAD");
+    },
+    async publishRuleDescription(description: string) {
+      const publisher = path.join(directory, "publisher");
+      await git(directory, "clone", origin, publisher);
+      await fs.writeFile(path.join(publisher, "rules", `${ruleId}.md`), `---\nid: ${ruleId}\ndescription: ${description}\n---\n${initial.rules[0].text}\n`);
+      await commit(publisher, "Update rule description on origin");
       await git(publisher, "push", "origin", "main");
       return git(publisher, "rev-parse", "HEAD");
     },

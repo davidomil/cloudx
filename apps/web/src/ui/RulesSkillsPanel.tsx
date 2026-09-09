@@ -380,7 +380,7 @@ export function RulesSkillsPanel({
                     {editingRuleText}
                   </div>
                 </div>
-                <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void saveEditedRule(editingRule)} disabled={busy || !editingRuleText.trim()} title={`Save rule ${rule.id}`} aria-label={`Save rule ${rule.id}`}>
+                <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void saveEditedRule(rule)} disabled={busy || !editingRuleText.trim()} title={`Save rule ${rule.id}`} aria-label={`Save rule ${rule.id}`}>
                   <Save size={13} />
                 </ControlButton>
                 <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={cancelEditingRule} disabled={busy} title={`Cancel editing ${rule.id}`} aria-label={`Cancel editing ${rule.id}`}>
