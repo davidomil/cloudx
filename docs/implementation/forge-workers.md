@@ -52,6 +52,12 @@ approval must match the provider, API URL and current repository
 settings. Changing the destination or revoking approval prevents
 subsequent trust grants.
 
+Review workers require Forge repository approval before starting or
+resuming a conversation. Approval is rechecked before native
+preparation. If it has been revoked, launch stops and the captured
+temporary files are removed. The checkout and any saved conversation
+remain available for Resume after approval is restored.
+
 Forge writes the exact checkout entry into the worker’s private Codex
 configuration. It preserves your source configuration and other project
 trust decisions. An explicit `untrusted` decision for that checkout

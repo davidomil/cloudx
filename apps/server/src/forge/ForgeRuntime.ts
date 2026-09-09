@@ -435,6 +435,8 @@ export class ForgeRuntime {
     const authorizeProjectTrust = this.dependencies.isRepositoryTrusted?.(owned.expectedRepository)
       ? () => this.authorizeProjectTrust(owned)
       : undefined;
+    if (owned.role === "reviewer" && !authorizeProjectTrust)
+      throw new Error("Forge repository trust must be approved before starting a review.");
     owned.launchPending = true;
     await this.manifest(owned.id).write(owned);
     let preparingTabId: string | undefined;
@@ -448,6 +450,7 @@ export class ForgeRuntime {
         const ownership: OwnedTab = { tabId: tab.id, workerId: owned.id, closed: false, quiescent: false };
         this.ownedTabs.set(tab.id, ownership);
         await this.captureTab(tab, ownership);
+        await this.authorizeProjectTrust(owned);
       } catch (error) { throw new PluginSessionNotStartedError(error); }
       return this.reviewConversations.prepare(launch, {
         binding: owned.reviewConversation,

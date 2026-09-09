@@ -46,8 +46,9 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   ).stdout.trim();
 }
 
-function dependencies(): ForgeRuntimeDependencies {
+function dependencies({ trustRepository = false } = {}): ForgeRuntimeDependencies {
   return {
+    isRepositoryTrusted: vi.fn(() => trustRepository),
     gitAccess: vi.fn(async () => ({
       cloneUrl: "https://github.com/cloudx/test.git",
       authorization: "Basic fixture-secret",
@@ -1337,8 +1338,41 @@ if (hangMerge || hangFetch) {
 }
 
 describe("ForgeRuntime Codex tabs", () => {
-  it("resumes the saved reviewer conversation after its tab and runtime are replaced", async () => {
+  it.each([false, undefined])("requires repository consent before preparing a reviewer when approval is %s", async approved => {
     const deps = dependencies();
+    deps.isRepositoryTrusted = approved === undefined ? undefined : () => approved;
+    deps.reviewConversations = { prepare: vi.fn() };
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare("unapproved-review", true);
+    const fixture = installReviewTabs(deps, workspace);
+
+    await expect(runtime.launch(fixture.request)).rejects.toThrow("repository trust must be approved");
+
+    expect(deps.workspaceCommands.createTab).not.toHaveBeenCalled();
+    expect(deps.reviewConversations.prepare).not.toHaveBeenCalled();
+    expect(await runtime.recover(workspace.id)).toEqual({ workspace, tabIds: [] });
+    expect(await git(workspace.worktreePath, "status", "--porcelain")).toBe("");
+  });
+
+  it("rechecks reviewer consent before native preparation and cleans a rejected prepared tab", async () => {
+    const deps = dependencies({ trustRepository: true });
+    vi.mocked(deps.isRepositoryTrusted!).mockReturnValueOnce(true).mockReturnValue(false);
+    deps.reviewConversations = { prepare: vi.fn() };
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare("revoked-review", true);
+    const fixture = installReviewTabs(deps, workspace);
+
+    await expect(runtime.launch(fixture.request)).rejects.toThrow("repository trust is no longer approved");
+
+    expect(deps.workspaceCommands.createTab).toHaveBeenCalledOnce();
+    expect(deps.reviewConversations.prepare).not.toHaveBeenCalled();
+    await expect(fs.stat(fixture.launchPath())).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.stat(path.dirname(fixture.lastTab().contextPath!))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await runtime.recover(workspace.id)).toEqual({ workspace, tabIds: [] });
+  });
+
+  it("resumes the saved reviewer conversation after its tab and runtime are replaced", async () => {
+    const deps = dependencies({ trustRepository: true });
     deps.reviewConversations = { prepare: vi.fn(async (launch, options) => {
       await options.save(options.binding ?? conversationBinding(launch.tabId));
       return (options.binding ?? conversationBinding(launch.tabId)).threadId!;
@@ -1366,7 +1400,7 @@ describe("ForgeRuntime Codex tabs", () => {
   });
 
   it("retains a created reviewer thread and removes disposable paths after verified preparation failure", async () => {
-    const deps = dependencies();
+    const deps = dependencies({ trustRepository: true });
     deps.reviewConversations = { prepare: vi.fn(async (_launch, options) => {
       await options.save(conversationBinding());
       throw new PluginSessionNotStartedError(new Error("Review paused after thread creation."));
@@ -1388,7 +1422,7 @@ describe("ForgeRuntime Codex tabs", () => {
   });
 
   it("preserves reviewer resources when preparatory process shutdown cannot be verified", async () => {
-    const deps = dependencies();
+    const deps = dependencies({ trustRepository: true });
     deps.reviewConversations = { prepare: vi.fn(async (_launch, options) => {
       await options.save(conversationBinding());
       throw new AppServerOwnershipError("Reviewer process shutdown is unconfirmed.");
@@ -1407,7 +1441,7 @@ describe("ForgeRuntime Codex tabs", () => {
   });
 
   it("does not reuse a reviewer conversation from another repository checkout", async () => {
-    const deps = dependencies();
+    const deps = dependencies({ trustRepository: true });
     const gitCommand = deps.git!;
     deps.gitAccess = vi.fn(async repository => ({ cloneUrl: `https://github.com/${repository.projectPath}.git`, authorization: "Basic fixture-secret" }));
     deps.git = (cwd, args, signal, env) => gitCommand(cwd, args.map(arg => arg === "https://github.com/cloudx/other.git" ? "https://github.com/cloudx/test.git" : arg), signal, env);

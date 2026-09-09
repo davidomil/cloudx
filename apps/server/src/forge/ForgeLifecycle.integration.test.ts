@@ -154,6 +154,87 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     await fixture.workflow.pause(started.id);
   }, 15_000);
 
+  it("does not start a reviewer before repository consent and resumes its clean checkout after consent", async () => {
+    const fixture = await LifecycleFixture.create({ trustRepository: false });
+    const headSha = await fixture.seedReview();
+    const blocked = await fixture.workflow.startReview(repository, 7, false, fixture.placement);
+
+    expect(await fixture.nativeStarts()).toEqual([]);
+    expect(fixture.factory.processes).toEqual([]);
+    expect(fixture.sessions.listTabs()).toEqual([]);
+    expect(blocked).toMatchObject({ status: "failed", error: expect.stringMatching(/trust.*approved|approv.*trust/i) });
+    expect(blocked.tabId).toBeUndefined();
+    const checkout = await fs.stat(blocked.worktreePath!);
+    expect(await git(blocked.worktreePath!, "rev-parse", "HEAD")).toBe(headSha);
+    expect(await git(blocked.worktreePath!, "status", "--porcelain")).toBe("");
+    expect(await fixture.sessionRequests("thread/start")).toEqual([]);
+    expect(await fixture.workspaceRecord(blocked.id)).toMatchObject({ launchPending: false });
+    expect((await fixture.workspaceRecord(blocked.id)).reviewConversation).toBeUndefined();
+    await expectMissing(path.join(fixture.dataDir, "codex-launches"), path.join(blocked.worktreePath!, ".codex"));
+    expect(await fs.readFile(path.join(fixture.codexHome, "config.toml"), "utf8")).toBe(sourceConfig);
+
+    fixture.repositoryTrusted = true;
+    const resumed = await fixture.workflow.resume(blocked.id, fixture.placement);
+    expect(resumed).toMatchObject({ id: blocked.id, worktreePath: blocked.worktreePath, headSha });
+    expect((await fs.stat(resumed.worktreePath!)).ino).toBe(checkout.ino);
+    const receipt = await fixture.completedAssistantTurn(resumed);
+    expect((await fixture.nativeStarts()).sort()).toEqual(["app-server", "tui"]);
+    expect(await fixture.sessionRequests("thread/start")).toHaveLength(1);
+    await fixture.workflow.poll();
+    expect(await fixture.worker(blocked.id)).toMatchObject({ status: "completed", draft: { headSha } });
+    expect(fixture.provider.submissions).toEqual([]);
+    await fixture.expectDisposedAttempt(receipt);
+  }, 20_000);
+
+  it("does not resume a reviewer after consent is revoked and preserves its conversation until consent returns", async () => {
+    const fixture = await LifecycleFixture.create();
+    await fixture.seedReview();
+    const first = await fixture.workflow.startReview(repository, 7, false, fixture.placement);
+    const firstReceipt = await fixture.completedAssistantTurn(first);
+    await fixture.workflow.poll();
+    const firstDraft = (await fixture.worker(first.id)).draft!;
+    const conversation = await fs.readFile(firstReceipt.sessionPath!, "utf8");
+    const binding = (await fixture.workspaceRecord(first.id)).reviewConversation;
+    const starts = await fixture.nativeStarts();
+    const views = await fs.readdir(path.join(fixture.dataDir, "codex-launches"));
+    const checkout = await fs.stat(first.worktreePath!);
+    const nextHead = await fixture.advanceReview("Documented after the first review.\n");
+    fixture.repositoryTrusted = false;
+
+    const blocked = await fixture.workflow.startReview(repository, 7, false, fixture.placement);
+
+    expect(await fixture.nativeStarts()).toEqual(starts);
+    expect(fixture.factory.processes).toHaveLength(1);
+    expect(fixture.sessions.listTabs()).toEqual([]);
+    expect(blocked).toMatchObject({ id: first.id, status: "failed", worktreePath: first.worktreePath, headSha: nextHead, reviewHistory: [firstDraft], error: expect.stringMatching(/trust.*approved|approv.*trust/i) });
+    expect(await git(blocked.worktreePath!, "status", "--porcelain")).toBe("");
+    expect((await fs.stat(blocked.worktreePath!)).ino).toBe(checkout.ino);
+    expect(await fs.readFile(firstReceipt.sessionPath!, "utf8")).toBe(conversation);
+    expect(await fs.readdir(path.join(fixture.dataDir, "codex-launches"))).toEqual(views);
+    expect(await fixture.workspaceRecord(first.id)).toMatchObject({ launchPending: false, reviewConversation: binding });
+    expect(await fs.readFile(path.join(fixture.codexHome, "config.toml"), "utf8")).toBe(sourceConfig);
+    await fixture.expectDisposedAttempt(firstReceipt);
+
+    fixture.repositoryTrusted = true;
+    const resumed = await fixture.workflow.resume(first.id, fixture.placement);
+    const receipt = await fixture.completedAssistantTurn(resumed);
+    expect(resumed).toMatchObject({ id: first.id, worktreePath: first.worktreePath, headSha: nextHead, reviewHistory: [firstDraft] });
+    expect(receipt.resumedSessionId).toBe(firstReceipt.sessionId);
+    expect(receipt.sessionPath).toBe(firstReceipt.sessionPath);
+    expect(receipt.previousMessages).toEqual([
+      ...firstReceipt.previousMessages!,
+      { role: "user", content: firstReceipt.args.at(-1) },
+      { role: "assistant", content: expect.stringContaining("The return value needs documentation.") },
+    ]);
+    expect(await fixture.sessionRequests("thread/start")).toHaveLength(1);
+    expect(await fixture.sessionRequests("thread/inject_items")).toHaveLength(1);
+    await fixture.workflow.poll();
+    expect(await fixture.worker(first.id)).toMatchObject({ status: "completed", reviewHistory: [firstDraft], draft: { headSha: nextHead } });
+    expect(fixture.provider.submissions).toEqual([]);
+    await fixture.expectDisposedAttempt(firstReceipt);
+    await fixture.expectDisposedAttempt(receipt);
+  }, 25_000);
+
   it("implements an issue, reconciles a delayed publication, replies to feedback, then merges the approved result", async () => {
     const fixture = await LifecycleFixture.create();
     const started = await fixture.workflow.startIssue(repository, 1, fixture.placement);
@@ -873,7 +954,7 @@ class LifecycleFixture {
     workerModel: "gpt-6-astra", workerReasoningEffort: "xhigh", reviewModel: "gpt-6-astra", reviewReasoningEffort: "max",
   };
 
-  private constructor(readonly root: string, trustRepository: boolean) {
+  private constructor(readonly root: string, public repositoryTrusted: boolean) {
     this.origin = path.join(root, "origin.git");
     this.repositoryPath = path.join(root, "repository");
     this.dataDir = path.join(root, "data");
@@ -892,7 +973,7 @@ class LifecycleFixture {
       rulesSkills: this.catalog,
       dataDir: this.dataDir,
       pathPolicy,
-      isRepositoryTrusted: candidate => trustRepository && candidate.provider === repository.provider && candidate.apiUrl === repository.apiUrl && candidate.projectPath === repository.projectPath,
+      isRepositoryTrusted: candidate => this.repositoryTrusted && candidate.provider === repository.provider && candidate.apiUrl === repository.apiUrl && candidate.projectPath === repository.projectPath,
       gitAccess: async (_repository, role) => {
         this.gitAccessRoles.push(role);
         return { cloneUrl: "https://github.com/fixture/cloudx.git", authorization: `Basic fixture-${role}-secret` };
@@ -1126,6 +1207,16 @@ class LifecycleFixture {
     return records.flatMap(record => record.trim().split("\n").map(line => JSON.parse(line))).filter(request => request.method === method).map(request => request.params);
   }
 
+  async nativeStarts(): Promise<string[]> {
+    const directory = path.join(this.root, "receipts");
+    const records = await Promise.all((await fs.readdir(directory)).filter(file => file.startsWith("native-start-")).map(file => fs.readFile(path.join(directory, file), "utf8")));
+    return records.map(record => JSON.parse(record).mode);
+  }
+
+  async workspaceRecord(id: string): Promise<Record<string, unknown>> {
+    return JSON.parse(await fs.readFile(path.join(this.dataDir, "forge-workers", "workspaces", `${id}.json`), "utf8"));
+  }
+
   async expectDisposedAttempt(receipt: AssistantReceipt): Promise<void> {
     await expectMissing(receipt.tabContextPath, receipt.reportPath, receipt.contextPath);
     if (!receipt.sessionPath?.startsWith(`${receipt.codexHome}${path.sep}`)) {
@@ -1265,6 +1356,7 @@ import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import { parse } from ${JSON.stringify(import.meta.resolve("smol-toml"))};
 const args = process.argv.slice(2);
+fs.writeFileSync(path.join(process.env.FORGE_FIXTURE_RECEIPTS, "native-start-" + process.pid + ".json"), JSON.stringify({ mode: args.includes("app-server") ? "app-server" : "tui" }));
 const sessionFile = id => path.join(process.env.CODEX_HOME, "sessions", "fixture", "rollout-" + id + ".jsonl");
 function readConversation(id) {
   if (!/^[a-f0-9-]{36}$/.test(id)) throw new Error("Fixture requires an exact session UUID.");
