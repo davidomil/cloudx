@@ -87,6 +87,7 @@ export function RulesSkillsGitPanel({ onLoadGit, onSetGitOrigin, onPullGit, onPu
           <label>Origin URL<input value={origin} onChange={(event) => setOriginDraft(event.target.value)} disabled={busy} placeholder="git@host:owner/rules-skills.git" autoComplete="off" spellCheck={false} /></label>
           <ControlButton type="submit" size="compact" disabled={busy || !origin.trim() || !originChanged}>Save origin</ControlButton>
         </form>
+        <p>Saving origin sets one URL for both pull and push.</p>
         {!git.originUrl ? <p>Set origin to pull or push this checkout.</p> : null}
         {originChanged ? <p>Save the origin change before syncing.</p> : null}
         {hasUnsavedChanges ? <p>Save or discard template and rule edits before pulling.</p> : null}

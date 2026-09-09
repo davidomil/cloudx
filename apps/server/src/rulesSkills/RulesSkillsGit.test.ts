@@ -66,6 +66,73 @@ describe("Rules & Skills Git checkout", () => {
     });
   });
 
+  it.each(["push URL", "multiple push URLs", "multiple fetch URLs", "push-only URL rewrite"])(
+    "saves a single fetch and push destination despite an existing %s", async configuration => {
+      const { catalog, checkout, origin, root, call } = await synchronizedFixture();
+      const replacement = path.join(root, "replacement.git");
+      const otherOrigin = path.join(root, "other-old.git");
+      await git(root, "init", "--bare", "--initial-branch=main", replacement);
+      await git(root, "init", "--bare", "--initial-branch=main", otherOrigin);
+      const oldHead = await git(origin, "rev-parse", "refs/heads/main");
+      if (configuration === "multiple fetch URLs") {
+        await git(checkout, "remote", "set-url", "--add", "origin", otherOrigin);
+      } else if (configuration === "push-only URL rewrite") {
+        await git(checkout, "config", `url.${origin}.pushInsteadOf`, replacement);
+      } else {
+        await git(checkout, "config", "remote.origin.pushurl", origin);
+        if (configuration === "multiple push URLs") {
+          await git(checkout, "config", "--add", "remote.origin.pushurl", otherOrigin);
+        }
+      }
+      await catalog.saveRule(rule("selected-origin", "Publish only to the selected repository."));
+      await commit(checkout, "Add selected origin rule");
+      const head = await git(checkout, "rev-parse", "HEAD");
+
+      await expect(call("setOrigin", { originUrl: replacement })).resolves.toMatchObject({ git: { originUrl: replacement } });
+      await call("push");
+
+      await expect(git(replacement, "rev-parse", "refs/heads/main")).resolves.toBe(head);
+      await expect(git(origin, "rev-parse", "refs/heads/main")).resolves.toBe(oldHead);
+      await expect(git(otherOrigin, "for-each-ref", "--format=%(refname)")).resolves.toBe("");
+      await expect(git(checkout, "remote", "get-url", "--all", "origin")).resolves.toBe(replacement);
+      await expect(git(checkout, "remote", "get-url", "--push", "--all", "origin")).resolves.toBe(replacement);
+    }
+  );
+
+  it("rejects pushing to a destination that differs from the displayed origin", async () => {
+    const { catalog, checkout, origin, root } = await synchronizedFixture();
+    const hiddenOrigin = path.join(root, "hidden.git");
+    await git(root, "init", "--bare", "--initial-branch=main", hiddenOrigin);
+    await git(checkout, "config", "remote.origin.pushurl", hiddenOrigin);
+    const oldHead = await git(origin, "rev-parse", "refs/heads/main");
+    await catalog.saveRule(rule("local-rule", "Keep this commit from hidden destinations."));
+    await commit(checkout, "Add local rule");
+
+    await expect(catalog.pushGit()).rejects.toThrow(/same single URL/i);
+
+    await expect(git(origin, "rev-parse", "refs/heads/main")).resolves.toBe(oldHead);
+    await expect(git(hiddenOrigin, "for-each-ref", "--format=%(refname)")).resolves.toBe("");
+  });
+
+  it("rejects saving and pushing an origin with additional inherited push destinations", async () => {
+    const { catalog, checkout, origin, root } = await synchronizedFixture();
+    const replacement = path.join(root, "replacement.git");
+    const includedConfig = path.join(root, "included.gitconfig");
+    await git(root, "init", "--bare", "--initial-branch=main", replacement);
+    await git(checkout, "config", "--file", includedConfig, "remote.origin.pushurl", origin);
+    await git(checkout, "config", "include.path", includedConfig);
+    const oldHead = await git(origin, "rev-parse", "refs/heads/main");
+    await catalog.saveRule(rule("local-rule", "Keep this commit from inherited destinations."));
+    await commit(checkout, "Add local rule");
+
+    await expect(catalog.setGitOrigin(replacement)).rejects.toThrow(/included or global/i);
+    await expect(catalog.pushGit()).rejects.toThrow(/same single URL/i);
+
+    await expect(git(origin, "rev-parse", "refs/heads/main")).resolves.toBe(oldHead);
+    await expect(git(replacement, "for-each-ref", "--format=%(refname)")).resolves.toBe("");
+    await expect(git(checkout, "config", "--file", includedConfig, "remote.origin.pushurl")).resolves.toBe(origin);
+  });
+
   it("stores an IPv6 SSH origin without contacting the remote", async () => {
     const { checkout, call } = await repositoryFixture();
     const originUrl = "ssh://git@[::1]/rules.git";
@@ -118,6 +185,20 @@ describe("Rules & Skills Git checkout", () => {
     await expect(git(origin, "rev-parse", "refs/heads/main")).resolves.toBe(head);
     await expect(git(origin, "show", "refs/heads/main:rules/published-rule.md")).resolves.toContain("Review the committed version.");
     await expect(fs.readFile(path.join(checkout, "rules", "published-rule.md"), "utf8")).resolves.toContain("Keep this draft local.");
+  });
+
+  it("fast-forwards cleanly even when the branch is configured to squash merges", async () => {
+    const { catalog, checkout, peer } = await synchronizedFixture();
+    await fs.writeFile(path.join(peer, "rules", "remote-rule.md"), "Advance to this commit.\n");
+    await commit(peer, "Add remote rule");
+    await git(peer, "push", "origin", "main");
+    await git(checkout, "config", "branch.main.mergeOptions", "--squash");
+
+    await expect(catalog.pullGit()).resolves.toMatchObject({ git: { hasChanges: false } });
+
+    await expect(git(checkout, "rev-parse", "HEAD")).resolves.toBe(await git(peer, "rev-parse", "HEAD"));
+    await expect(git(checkout, "status", "--porcelain=v1")).resolves.toBe("");
+    await expect(catalog.pullGit()).resolves.toMatchObject({ git: { hasChanges: false } });
   });
 
   it("pushes only the current branch despite repository-wide push configuration", async () => {
@@ -202,6 +283,67 @@ describe("Rules & Skills Git checkout", () => {
     await expect(git(checkout, "rev-parse", "HEAD")).resolves.toBe(head);
     await expect(fs.readFile(path.join(checkout, "rules", `${ruleId}.md`), "utf8")).resolves.toContain("Preserve this local draft.");
     await expect(fs.stat(path.join(checkout, "rules", "remote-only.md"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each(["rules/private.md", "skills/private-notes/SKILL.md"])(
+    "rejects incoming changes that overwrite ignored %s, preserving the file and HEAD", async relativePath => {
+      const { catalog, checkout, peer } = await synchronizedFixture();
+      await fs.appendFile(path.join(checkout, ".git", "info", "exclude"), "\nrules/private.md\nskills/private-notes/\n");
+      const localFile = path.join(checkout, relativePath);
+      const remoteFile = path.join(peer, relativePath);
+      await fs.mkdir(path.dirname(localFile), { recursive: true });
+      await fs.mkdir(path.dirname(remoteFile), { recursive: true });
+      await fs.writeFile(localFile, "Preserve this ignored local draft.\n");
+      await fs.writeFile(remoteFile, "Incoming tracked content.\n");
+      await commit(peer, "Track formerly ignored catalog content");
+      await git(peer, "push", "origin", "main");
+      await git(checkout, "config", "branch.main.mergeOptions", "--overwrite-ignore");
+      const head = await git(checkout, "rev-parse", "HEAD");
+      const listener = vi.fn();
+      catalog.onChange(listener);
+      await expect(catalog.gitStatus()).resolves.toMatchObject({ hasChanges: false });
+
+      await expect(catalog.pullGit()).rejects.toThrow(/overwrite|ignored/i);
+
+      await expect(fs.readFile(localFile, "utf8")).resolves.toBe("Preserve this ignored local draft.\n");
+      await expect(git(checkout, "rev-parse", "HEAD")).resolves.toBe(head);
+      await expect(git(checkout, "status", "--porcelain=v1")).resolves.toBe("");
+      expect(listener).not.toHaveBeenCalled();
+    }
+  );
+
+  it("preserves unrelated ignored files while pulling a non-colliding change", async () => {
+    const { catalog, checkout, peer } = await synchronizedFixture();
+    await fs.appendFile(path.join(checkout, ".git", "info", "exclude"), "\nrules/private.md\n");
+    const localFile = path.join(checkout, "rules", "private.md");
+    await fs.writeFile(localFile, "Preserve this ignored local draft.\n");
+    await fs.writeFile(path.join(peer, "rules", "remote-rule.md"), "Review the remote rule.\n");
+    await commit(peer, "Add non-colliding rule");
+    await git(peer, "push", "origin", "main");
+
+    await expect(catalog.pullGit()).resolves.toMatchObject({ git: { hasChanges: false } });
+
+    await expect(git(checkout, "rev-parse", "HEAD")).resolves.toBe(await git(peer, "rev-parse", "HEAD"));
+    await expect(fs.readFile(localFile, "utf8")).resolves.toBe("Preserve this ignored local draft.\n");
+  });
+
+  it("does not merge a stale FETCH_HEAD when fetching the selected origin fails", async () => {
+    const { catalog, checkout, peer, root } = await synchronizedFixture();
+    await fs.writeFile(path.join(peer, "rules", "remote-rule.md"), "Do not merge after a failed fetch.\n");
+    await commit(peer, "Add remote rule");
+    await git(peer, "push", "origin", "main");
+    await git(checkout, "fetch", "origin", "main");
+    const head = await git(checkout, "rev-parse", "HEAD");
+    await catalog.setGitOrigin(path.join(root, "missing.git"));
+    const listener = vi.fn();
+    catalog.onChange(listener);
+
+    await expect(catalog.pullGit()).rejects.toThrow(/Git command failed/i);
+
+    await expect(git(checkout, "rev-parse", "HEAD")).resolves.toBe(head);
+    await expect(fs.stat(path.join(checkout, "rules", "remote-rule.md"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(git(checkout, "status", "--porcelain=v1")).resolves.toBe("");
+    expect(listener).not.toHaveBeenCalled();
   });
 
   it("rejects divergent history without merging, rebasing, force pushing, or notifying catalog changes", async () => {

@@ -18,10 +18,11 @@ beforeEach(() => vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true));
 afterEach(async () => {
   await act(async () => roots.splice(0).forEach(root => root.unmount()));
   document.body.replaceChildren();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
-async function mount(onPullGit = vi.fn(async () => checkout)) {
+async function mount(onPullGit = vi.fn(async () => checkout), onRefreshStore?: () => Promise<void>) {
   const props = {
     store,
     onSaveTemplate: async () => undefined,
@@ -29,6 +30,7 @@ async function mount(onPullGit = vi.fn(async () => checkout)) {
     onSetDefault: async () => undefined,
     onSaveRule: async () => undefined,
     onDeleteRule: async () => undefined,
+    onRefreshStore,
     gitActions: { onLoadGit: async () => checkout, onSetGitOrigin: async () => checkout, onPushGit: async () => checkout, onPullGit }
   };
   const container = document.createElement("div");
@@ -89,5 +91,52 @@ describe("catalog Git and template drafts", () => {
     expect(container.querySelector('[role="alert"]')?.textContent).toBe("Branches have diverged. Resolve this locally.");
     expect(container.querySelector<HTMLFieldSetElement>("fieldset")!.disabled).toBe(false);
     expect(container.querySelector<HTMLInputElement>(".rules-skills-template-fields input")!.value).toBe("Default");
+  });
+
+  it.each(["before", "after"])("loads the explicitly refreshed template when its catalog arrives %s the refresh completes", async (timing) => {
+    let finish!: () => void;
+    const onRefreshStore = vi.fn<() => Promise<void>>()
+      .mockResolvedValueOnce(undefined)
+      .mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const { container, render } = await mount(undefined, onRefreshStore);
+    const refreshedStore = { ...store, templates: [{ ...store.templates[0], name: "Refreshed template" }] };
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    await fill(container.querySelector<HTMLInputElement>(".rules-skills-template-fields input")!, "Discard this draft");
+    await click(container, "Refresh rules and skills");
+    if (timing === "before") await render(refreshedStore);
+    await act(async () => finish());
+    if (timing === "after") await render(refreshedStore);
+    expect(container.querySelector<HTMLInputElement>(".rules-skills-template-fields input")!.value).toBe("Refreshed template");
+    expect(container.querySelector(".rules-skills-save-state")?.textContent).toBe("Saved");
+  });
+
+  it("keeps a draft if an explicitly confirmed refresh fails", async () => {
+    const onRefreshStore = vi.fn<() => Promise<void>>()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("Catalog refresh failed."));
+    const { container } = await mount(undefined, onRefreshStore);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    await fill(container.querySelector<HTMLInputElement>(".rules-skills-template-fields input")!, "Keep this draft");
+    await click(container, "Refresh rules and skills");
+    expect(container.textContent).toContain("Catalog refresh failed.");
+    expect(container.querySelector<HTMLInputElement>(".rules-skills-template-fields input")!.value).toBe("Keep this draft");
+    expect(container.querySelector<HTMLFieldSetElement>("fieldset")!.disabled).toBe(false);
+    expect(container.querySelector(".rules-skills-save-state")?.textContent).toBe("Unsaved");
+  });
+
+  it("confirms discarding a dirty selection and then adopts later updates to the selected template", async () => {
+    const { container, render } = await mount();
+    const secondTemplate = { ...store.templates[0], id: "second", name: "Second" };
+    await render({ ...store, templates: [...store.templates, secondTemplate] });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    await fill(container.querySelector<HTMLInputElement>(".rules-skills-template-fields input")!, "Unsaved template");
+    await click(container, "Second");
+    expect(container.querySelector<HTMLInputElement>(".rules-skills-template-fields input")!.value).toBe("Unsaved template");
+    confirm.mockReturnValue(true);
+    await click(container, "Second");
+    expect(container.querySelector<HTMLInputElement>(".rules-skills-template-fields input")!.value).toBe("Second");
+    await render({ ...store, templates: [...store.templates, { ...secondTemplate, name: "Updated second" }] });
+    expect(container.querySelector<HTMLInputElement>(".rules-skills-template-fields input")!.value).toBe("Updated second");
+    expect(container.querySelector(".rules-skills-save-state")?.textContent).toBe("Saved");
   });
 });

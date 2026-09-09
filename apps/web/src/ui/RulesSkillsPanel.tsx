@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Palette, Pencil, Plus, RefreshCw, Save, Square, SquareCheck, Trash2, X, Zap } from "lucide-react";
 
 import {
@@ -74,6 +74,7 @@ export function RulesSkillsPanel({
   const [selectedId, setSelectedId] = useState(templates[0]?.id ?? "");
   const selected = templates.find((template) => template.id === selectedId) ?? templates[0];
   const [draft, setDraft] = useState(() => templateDraft(selected));
+  const loadedDraft = useRef(templateDraft(selected));
   const [draftMode, setDraftMode] = useState<"existing" | "new">("existing");
   const [newRuleText, setNewRuleText] = useState("");
   const [editingRuleId, setEditingRuleId] = useState<string | undefined>();
@@ -101,12 +102,14 @@ export function RulesSkillsPanel({
   }, [onRefreshStore]);
 
   useEffect(() => {
-    if (draftMode === "new") {
+    const nextSelected = templates.find((template) => template.id === selectedId) ?? templates[0];
+    const previousSavedDraft = loadedDraft.current;
+    loadedDraft.current = templateDraft(nextSelected);
+    if (draftMode === "new" || !templateDraftsEqual(draft, previousSavedDraft)) {
       return;
     }
-    const nextSelected = templates.find((template) => template.id === selectedId) ?? templates[0];
     setSelectedId(nextSelected?.id ?? "");
-    setDraft(templateDraft(nextSelected));
+    setDraft(loadedDraft.current);
   }, [draftMode, selectedId, templates]);
 
   function updateDraft(patch: Partial<TemplateDraft>) {
@@ -154,6 +157,7 @@ export function RulesSkillsPanel({
       const template = templateFromDraft(draft);
       await onSaveTemplate(template);
       setSelectedId(template.id);
+      setDraft(templateDraft(template));
       setDraftMode("existing");
       setStatus("Template saved.");
     } catch (err) {
@@ -257,6 +261,9 @@ export function RulesSkillsPanel({
     setError(undefined);
     try {
       await onRefreshStore();
+      setSelectedId(loadedDraft.current.id);
+      setDraft(loadedDraft.current);
+      setDraftMode("existing");
       setStatus("Rules and skills refreshed.");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));

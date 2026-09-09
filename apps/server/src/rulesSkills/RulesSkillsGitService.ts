@@ -55,8 +55,10 @@ export class RulesSkillsGitService {
     const originUrl = validateOriginUrl(input);
     const state = await this.requireRepository();
     await this.git(state.originUrl
-      ? ["remote", "set-url", "origin", "--", originUrl]
+      ? ["config", "--replace-all", "remote.origin.url", originUrl]
       : ["remote", "add", "--", "origin", originUrl]);
+    await this.git(["config", "--replace-all", "remote.origin.pushurl", originUrl]);
+    await this.requireMatchingOriginDestinations();
     return this.status();
   }
 
@@ -64,18 +66,33 @@ export class RulesSkillsGitService {
     const state = await this.requireSyncState();
     if (state.hasChanges) throw new Error("Commit or discard local catalog changes before pulling.");
     await this.git([
-      "pull", "--ff-only", "--no-rebase", "--no-autostash", "--recurse-submodules=no",
+      "fetch", "--recurse-submodules=no",
       "origin", `refs/heads/${state.branch}`
+    ]);
+    await this.git([
+      "-c", "submodule.recurse=false", "merge", "--ff-only", "--no-squash", "--no-autostash",
+      "--no-overwrite-ignore", "FETCH_HEAD"
     ]);
   }
 
   async push(): Promise<RulesSkillsGitState> {
     const state = await this.requireSyncState();
+    await this.requireMatchingOriginDestinations();
     await this.git([
       "-c", "remote.origin.mirror=false", "push", "--no-force", "--no-follow-tags", "--recurse-submodules=no",
       "origin", `HEAD:refs/heads/${state.branch}`
     ]);
     return this.status();
+  }
+
+  private async requireMatchingOriginDestinations(): Promise<void> {
+    const [fetchUrl, pushUrls] = await Promise.all([
+      this.git(["remote", "get-url", "origin"]),
+      this.git(["remote", "get-url", "--push", "--all", "origin"])
+    ]);
+    if (fetchUrl.stdout.trim() !== pushUrls.stdout.trim()) {
+      throw new Error("Origin must use the same single URL for pull and push. Save origin to replace local URLs, or remove conflicting URLs from included or global Git configuration.");
+    }
   }
 
   private async requireRepository(): Promise<RulesSkillsGitState> {
@@ -171,6 +188,9 @@ function publicOriginUrl(url: string): string {
 }
 
 function gitFailure(stderr: string): Error {
+  if (/would be overwritten by merge|would be removed by merge/iu.test(stderr)) {
+    return new Error("Incoming catalog changes would overwrite local files, including ignored files. Move or commit those files before pulling.");
+  }
   if (/not possible to fast-forward|divergent branches/iu.test(stderr)) {
     return new Error("Catalog history has diverged. Reconcile the branches in Git before pulling.");
   }
