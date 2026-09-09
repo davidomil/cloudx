@@ -181,6 +181,8 @@ export function App() {
   const [config, setConfig] = useState<CloudxConfigResponse | undefined>();
   const [forgeRepositoryChange, setForgeRepositoryChange] = useState({ version: 0, pending: false });
   const [rulesSkillsStore, setRulesSkillsStore] = useState<RulesSkillsStore | undefined>();
+  const rulesSkillsCatalogRequest = useRef(0);
+  const appliedRulesSkillsCatalogRequest = useRef(0);
   const [rulesSkillsGit, setRulesSkillsGit] = useState<RulesSkillsGitState>();
   const rulesSkillsGitRequest = useRef(0);
   const appliedRulesSkillsGitRequest = useRef(0);
@@ -423,17 +425,16 @@ export function App() {
   async function refresh() {
     setConnectionStatus("checking");
     try {
-      const [pluginList, workspaceState, configState, rulesSkills, activeTriggers, notificationHistory] = await Promise.all([
+      const [pluginList, workspaceState, configState, activeTriggers, notificationHistory] = await Promise.all([
         getPlugins(),
         getWorkspace(),
         getConfig(),
-        loadRulesSkillsStore(),
         loadActiveAutomationTriggerIds(),
-        getNotifications()
+        getNotifications(),
+        loadRulesSkillsStore()
       ]);
       setPlugins(pluginList);
       setConfig(configState);
-      setRulesSkillsStore(rulesSkills);
       setActiveAutomationTriggerIds(activeTriggers);
       setNotifications(notificationHistory);
       applyWorkspaceState(workspaceState);
@@ -445,23 +446,35 @@ export function App() {
     }
   }
 
+  const callRulesSkillsCatalog = useCallback(async <T extends { store: RulesSkillsStore } = { store: RulesSkillsStore },>(operation: string, input: Record<string, unknown> = {}) => {
+    const request = ++rulesSkillsCatalogRequest.current;
+    const result = await callHook<T>(`rules-skills.${operation}`, input);
+    if (request > appliedRulesSkillsCatalogRequest.current) {
+      appliedRulesSkillsCatalogRequest.current = request;
+      setRulesSkillsStore(result.store);
+    }
+    return result;
+  }, []);
+
   const loadRulesSkillsStore = useCallback(async (): Promise<RulesSkillsStore | undefined> => {
     try {
-      const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.catalog.list");
+      const result = await callRulesSkillsCatalog("catalog.list");
       return result.store;
     } catch {
       return undefined;
     }
-  }, []);
+  }, [callRulesSkillsCatalog]);
 
   const handleRefreshRulesSkillsStore = useCallback(async () => {
-    setRulesSkillsStore(await loadRulesSkillsStore());
-  }, [loadRulesSkillsStore]);
+    await callRulesSkillsCatalog("catalog.list");
+  }, [callRulesSkillsCatalog]);
 
   const callRulesSkillsGit = useCallback(async (operation: string, input: Record<string, unknown> = {}) => {
     const request = ++rulesSkillsGitRequest.current;
     try {
-      const result = await callHook<{ git: RulesSkillsGitState; store?: RulesSkillsStore }>(`rules-skills.git.${operation}`, input);
+      const result = operation === "pull"
+        ? await callRulesSkillsCatalog<{ git: RulesSkillsGitState; store: RulesSkillsStore }>("git.pull", input)
+        : await callHook<{ git: RulesSkillsGitState }>(`rules-skills.git.${operation}`, input);
       if (request > appliedRulesSkillsGitRequest.current) {
         appliedRulesSkillsGitRequest.current = request;
         setRulesSkillsGit(result.git);
@@ -474,7 +487,7 @@ export function App() {
       }
       throw error;
     }
-  }, []);
+  }, [callRulesSkillsCatalog]);
 
   const loadRulesSkillsGit = useCallback(async () => {
     const result = await callRulesSkillsGit("status");
@@ -488,7 +501,6 @@ export function App() {
 
   const pullRulesSkillsGit = useCallback(async () => {
     const result = await callRulesSkillsGit("pull");
-    setRulesSkillsStore(result.store);
     return result.git;
   }, [callRulesSkillsGit]);
 
@@ -1125,23 +1137,19 @@ export function App() {
   }
 
   async function handleSavePersonalityTemplate(template: PersonalityTemplate) {
-    const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.templates.save", { template });
-    setRulesSkillsStore(result.store);
+    await callRulesSkillsCatalog("templates.save", { template });
   }
 
   async function handleDeletePersonalityTemplate(templateId: string) {
-    const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.templates.delete", { templateId });
-    setRulesSkillsStore(result.store);
+    await callRulesSkillsCatalog("templates.delete", { templateId });
   }
 
   async function handleSetDefaultTemplate(templateId: string | undefined) {
-    const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.templates.setDefault", templateId ? { templateId } : {});
-    setRulesSkillsStore(result.store);
+    await callRulesSkillsCatalog("templates.setDefault", templateId ? { templateId } : {});
   }
 
   async function handleSaveRule(rule: CloudxRule) {
-    const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.rules.save", { rule });
-    setRulesSkillsStore(result.store);
+    await callRulesSkillsCatalog("rules.save", { rule });
   }
 
   async function handleInjectRulesSkillsRuntime(): Promise<number> {
@@ -1150,8 +1158,7 @@ export function App() {
   }
 
   async function handleDeleteRule(ruleId: string) {
-    const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.rules.delete", { ruleId });
-    setRulesSkillsStore(result.store);
+    await callRulesSkillsCatalog("rules.delete", { ruleId });
   }
 
   function renderMicControl(className: string, ref: RefObject<HTMLDivElement | null>, iconSize: number) {

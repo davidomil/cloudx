@@ -183,9 +183,11 @@ function validateOriginUrl(input: unknown): string {
 function publicOriginUrl(url: string): string {
   const helperPrefix = url.match(/^[\w+.-]+::/u)?.[0] ?? "";
   const address = url.slice(helperPrefix.length);
-  const isUrl = helperPrefix || address.includes("://") || /^(?:https?|ssh|git|file):/iu.test(address);
-  if (!isUrl) return url;
   try {
+    if (!helperPrefix && !address.includes("://")) {
+      if (/^[\w+.-]+:\/*[^/]*:[^/]*@/u.test(address)) throw new Error("Origin resembles a malformed credential-bearing URL.");
+      return url;
+    }
     const parsed = new URL(address);
     if (!parsed.host && parsed.protocol !== "file:") throw new Error("Origin has no URL host.");
     parsed.password = "";
