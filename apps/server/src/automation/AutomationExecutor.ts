@@ -1354,7 +1354,8 @@ async function runBoundedProcess(input: ProcessRunInput): Promise<ProcessRunResu
   childStdout.once("error", (error) => requestStop({ kind: "error", error }));
   childStderr.once("error", (error) => requestStop({ kind: "error", error }));
   childStdin.once("error", (error) => requestStop({ kind: "error", error }));
-  childStdin.end(input.stdin);
+  if (input.stdin) childStdin.end(input.stdin);
+  else childStdin.end();
 
   try {
     const first = await firstEvent.promise;
