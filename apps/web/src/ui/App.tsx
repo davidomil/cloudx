@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement, type RefObject } from "react";
 import { AlertTriangle, Bell, BellRing, Bot, CheckCheck, ChevronDown, Columns2, GitBranch, LayoutTemplate, Maximize2, Mic, MicOff, Minimize2, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
 
-import { DEFAULT_WORKSPACE_MAX_PANES, RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsStore, type StatePersistenceStatus, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
+import { DEFAULT_WORKSPACE_MAX_PANES, RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsGitState, type RulesSkillsStore, type StatePersistenceStatus, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
 
 import {
   applyLayoutTemplate,
@@ -454,6 +454,27 @@ export function App() {
   const handleRefreshRulesSkillsStore = useCallback(async () => {
     setRulesSkillsStore(await loadRulesSkillsStore());
   }, [loadRulesSkillsStore]);
+
+  const loadRulesSkillsGit = useCallback(async () => {
+    const result = await callHook<{ git: RulesSkillsGitState }>("rules-skills.git.status");
+    return result.git;
+  }, []);
+
+  const setRulesSkillsGitOrigin = useCallback(async (originUrl: string) => {
+    const result = await callHook<{ git: RulesSkillsGitState }>("rules-skills.git.setOrigin", { originUrl });
+    return result.git;
+  }, []);
+
+  const pullRulesSkillsGit = useCallback(async () => {
+    const result = await callHook<{ git: RulesSkillsGitState; store: RulesSkillsStore }>("rules-skills.git.pull");
+    setRulesSkillsStore(result.store);
+    return result.git;
+  }, []);
+
+  const pushRulesSkillsGit = useCallback(async () => {
+    const result = await callHook<{ git: RulesSkillsGitState }>("rules-skills.git.push");
+    return result.git;
+  }, []);
 
   function applyWorkspaceState(state: WorkspaceStateResponse, options: { preservePendingLayout?: boolean } = {}) {
     let pendingMerge = options.preservePendingLayout ? workspaceStateWithPreservedLayout(state, layoutRef.current, pendingLayoutPersistWindowIdRef.current, pendingLayoutBaseRef.current, activeTabIdRef.current) : undefined;
@@ -1233,6 +1254,7 @@ export function App() {
         onDeleteRule={handleDeleteRule}
         onInjectRuntime={handleInjectRulesSkillsRuntime}
         onRefreshStore={handleRefreshRulesSkillsStore}
+        gitActions={{ onLoadGit: loadRulesSkillsGit, onSetGitOrigin: setRulesSkillsGitOrigin, onPullGit: pullRulesSkillsGit, onPushGit: pushRulesSkillsGit }}
       />
     ),
     "documentation.panel": (_contribution, context) => {

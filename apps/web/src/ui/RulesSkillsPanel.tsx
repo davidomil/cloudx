@@ -15,6 +15,7 @@ import {
 import { ControlButton } from "./Control.js";
 import { createBrowserId } from "./browserId.js";
 import { PluginPanelDock } from "./PluginPanelDock.js";
+import { RulesSkillsGitPanel, type RulesSkillsGitActions } from "./RulesSkillsGitPanel.js";
 
 export function TemplateSelect({
   value,
@@ -56,7 +57,8 @@ export function RulesSkillsPanel({
   onSaveRule,
   onDeleteRule,
   onInjectRuntime,
-  onRefreshStore
+  onRefreshStore,
+  gitActions
 }: {
   store?: RulesSkillsStore;
   onSaveTemplate: (template: PersonalityTemplate) => Promise<void>;
@@ -66,6 +68,7 @@ export function RulesSkillsPanel({
   onDeleteRule: (ruleId: string) => Promise<void>;
   onInjectRuntime?: () => Promise<number>;
   onRefreshStore?: () => Promise<void>;
+  gitActions?: RulesSkillsGitActions;
 }) {
   const templates = store?.templates ?? [];
   const [selectedId, setSelectedId] = useState(templates[0]?.id ?? "");
@@ -80,6 +83,7 @@ export function RulesSkillsPanel({
   const [status, setStatus] = useState("Templates loaded.");
   const savedDraft = templateDraft(selected);
   const hasUnsavedTemplateChanges = draftMode === "new" || !templateDraftsEqual(draft, savedDraft);
+  const hasUnsavedChanges = hasUnsavedTemplateChanges || Boolean(newRuleText.trim()) || editingRuleId !== undefined;
 
   useEffect(() => {
     if (!onRefreshStore) {
@@ -261,6 +265,18 @@ export function RulesSkillsPanel({
     }
   }
 
+  async function pullGit() {
+    if (!gitActions || hasUnsavedChanges || busy) {
+      throw new Error("Save or discard template and rule edits before pulling.");
+    }
+    setBusy(true);
+    try {
+      return await gitActions.onPullGit();
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function injectRuntime() {
     if (!onInjectRuntime) {
       return;
@@ -296,18 +312,19 @@ export function RulesSkillsPanel({
         children: (
           <div className="rules-skills-sidebar">
             {templates.map((template) => (
-              <button key={template.id} type="button" className={`${template.id === draft.id ? "selected" : ""} ${template.id === draft.id && hasUnsavedTemplateChanges ? "dirty" : ""}`} onClick={() => selectTemplate(template)}>
+              <button key={template.id} type="button" className={`${template.id === draft.id ? "selected" : ""} ${template.id === draft.id && hasUnsavedTemplateChanges ? "dirty" : ""}`} onClick={() => selectTemplate(template)} disabled={busy}>
                 <span className={`template-color ${template.color}`} />
                 <span>{template.name}</span>
               </button>
             ))}
-            <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={createTemplate} title="Create template" aria-label="Create template">
+            <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={createTemplate} disabled={busy} title="Create template" aria-label="Create template">
               <Plus size={15} />
             </ControlButton>
           </div>
         )
       }]} />
       <div className="rules-skills-editor">
+        <fieldset className="rules-skills-template-fields" disabled={busy}>
         <label>
           Name
           <input value={draft.name} onChange={(event) => updateDraft({ name: event.target.value })} />
@@ -343,7 +360,7 @@ export function RulesSkillsPanel({
                     className="rule-edit-text"
                     role="textbox"
                     aria-label={`Rule text for ${rule.id}`}
-                    contentEditable
+                    contentEditable={!busy}
                     suppressContentEditableWarning
                     spellCheck={false}
                     data-placeholder="Rule text"
@@ -440,6 +457,8 @@ export function RulesSkillsPanel({
           </div>
         </div>
         {error ? <div className="window-menu-error">{error}</div> : null}
+        </fieldset>
+        {gitActions ? <RulesSkillsGitPanel {...gitActions} onPullGit={pullGit} disabled={busy} hasUnsavedChanges={hasUnsavedChanges} /> : null}
       </div>
     </div>
   );

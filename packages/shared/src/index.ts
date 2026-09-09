@@ -56,6 +56,15 @@ export interface RulesSkillsStore {
   templates: PersonalityTemplate[];
 }
 
+export interface RulesSkillsGitState {
+  isRepository: boolean;
+  rootPath: string;
+  branch?: string;
+  originUrl?: string;
+  hasChanges: boolean;
+  hasCommits: boolean;
+}
+
 export type PluginRuntimeContextMap = Record<PluginId, Record<string, unknown>>;
 
 export interface WorkspaceRuntimeContext {

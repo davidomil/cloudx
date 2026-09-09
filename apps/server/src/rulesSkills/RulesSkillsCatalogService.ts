@@ -11,6 +11,7 @@ import {
   type CloudxSkill,
   type PluginMetadata,
   type RulesSkillsStore,
+  type RulesSkillsGitState,
   type TabIndicatorUpdate,
   type WorkspaceRuntimeContext,
   type WorkspaceTab,
@@ -20,6 +21,7 @@ import {
 import type { PluginSkillContributionFile } from "@cloudx/plugin-api";
 
 import { isSameOrChildPath } from "../pathBoundary.js";
+import { RulesSkillsGitService } from "./RulesSkillsGitService.js";
 
 export const DEFAULT_PERSONALITY_TEMPLATE_ID = "default-codex";
 export const TEMPLATE_METADATA_KEY = "selectedTemplateId";
@@ -104,9 +106,11 @@ export class RulesSkillsCatalogService {
 
   private readonly listeners = new Set<() => void>();
   private readonly rootPath: string;
+  private readonly git: RulesSkillsGitService;
 
   constructor(dataDir: string) {
     this.rootPath = path.resolve(rulesSkillsRootPath(dataDir));
+    this.git = new RulesSkillsGitService(this.rootPath);
   }
 
   catalogRoot(): string {
@@ -119,8 +123,31 @@ export class RulesSkillsCatalogService {
   }
 
   async list(): Promise<RulesSkillsStore> {
-    await this.mutationQueue().catch(() => undefined);
-    return this.readFreshStore();
+    return this.withCatalogMutation(() => this.readFreshStore());
+  }
+
+  gitStatus(): Promise<RulesSkillsGitState> {
+    return this.withCatalogMutation(async () => {
+      await ensureCatalogDirectory(this.rootPath, this.rootPath);
+      return this.git.status();
+    });
+  }
+
+  setGitOrigin(originUrl: unknown): Promise<RulesSkillsGitState> {
+    return this.withCatalogMutation(() => this.git.setOrigin(originUrl));
+  }
+
+  pullGit(): Promise<{ git: RulesSkillsGitState; store: RulesSkillsStore }> {
+    return this.withCatalogMutation(async () => {
+      await this.git.pull();
+      const store = await this.readFreshStore();
+      this.emitChange();
+      return { git: await this.git.status(), store };
+    });
+  }
+
+  pushGit(): Promise<RulesSkillsGitState> {
+    return this.withCatalogMutation(() => this.git.push());
   }
 
   async saveTemplate(input: Record<string, unknown>): Promise<RulesSkillsStore> {
