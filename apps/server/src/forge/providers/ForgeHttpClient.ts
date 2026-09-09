@@ -4,7 +4,8 @@ import type {
   ForgeRepository,
 } from "@cloudx/shared";
 import { ForgeCredentials, validateRepository } from "./ForgeCredentials.js";
-import { ForgeProviderError, ForgeProviderUnavailableError, forgeRequestFailure, throwIfForgeRequestAborted, type ForgeProviderFailure } from "./ForgeProvider.js";
+import { ForgeProviderError, type ForgeDiagnosticObserver } from "./ForgeProvider.js";
+import { ForgeRequestFailures, httpFailure } from "./ForgeRequestFailures.js";
 import { list } from "./validation.js";
 import { readBoundedBody } from "./responseBody.js";
 
@@ -15,6 +16,7 @@ export class ForgeHttpClient {
     private readonly fetcher: typeof fetch = fetch,
     private readonly readRole: ForgeCredentialRole = "worker",
     private readonly signal?: AbortSignal,
+    private readonly onFailure?: ForgeDiagnosticObserver,
   ) {
     validateRepository(repository);
   }
@@ -30,8 +32,11 @@ export class ForgeHttpClient {
       signal?: AbortSignal;
     } = {},
   ): Promise<{ body: unknown; headers: Headers }> {
-    throwIfForgeRequestAborted(this.signal);
-    throwIfForgeRequestAborted(options.signal);
+    const role = options.role ?? this.readRole;
+    const method = (options.method ?? "GET").toUpperCase();
+    const failures = new ForgeRequestFailures(this.repository, role, path, method, "request", this.onFailure);
+    failures.assertReady(this.signal);
+    failures.assertReady(options.signal, this.credentials.requestDelay());
     if (
       !path.startsWith("/") ||
       path.startsWith("//") ||
@@ -40,7 +45,7 @@ export class ForgeHttpClient {
         .split("/")
         .some((part) => part === "." || part === "..")
     )
-      throw new ForgeProviderError("Invalid forge API path.");
+      throw failures.prepare("Invalid forge API path.");
     const api = new URL(this.repository.apiUrl);
     const base = options.graphql
       ? `${api.origin}${this.repository.provider === "github" && api.hostname === "api.github.com" ? "" : "/api"}`
@@ -53,7 +58,7 @@ export class ForgeHttpClient {
     ]);
     const headers: Record<string, string> = {
       ...(await this.credentials.headers(
-        options.role ?? this.readRole,
+        role,
         signal,
       )),
       Accept: options.text ? "application/vnd.github.diff" : "application/json",
@@ -64,8 +69,7 @@ export class ForgeHttpClient {
         ? {}
         : { "Content-Type": "application/json" }),
     };
-    throwIfForgeRequestAborted(signal);
-    const method = options.method ?? "GET";
+    failures.assertReady(signal, this.credentials.requestDelay());
     const query = String((options.body as { query?: unknown })?.query);
     const graphqlRead = options.graphql && /^\s*query\b/.test(query) && !/\bmutation\b/.test(query);
     const changesRemoteState =
@@ -75,40 +79,40 @@ export class ForgeHttpClient {
     try {
       body = options.body === undefined ? undefined : JSON.stringify(options.body);
     } catch {
-      throw new ForgeProviderError("The forge request body could not be encoded.");
+      throw failures.prepare("The forge request body could not be encoded.");
     }
+    const url = `${base}${path}`;
+    const request: RequestInit = { method, headers, redirect: "manual", signal, ...(body === undefined ? {} : { body }) };
+    try {
+      new Request(url, request);
+    } catch {
+      throw failures.prepare();
+    }
+    failures.assertReady(signal, this.credentials.requestDelay());
     let response: Response;
     try {
-      response = await this.fetcher(`${base}${path}`, {
-        method,
-        headers,
-        redirect: "error",
-        signal,
-        ...(body === undefined ? {} : { body }),
-      });
-    } catch {
-      throw requestFailure(forgeRequestFailure(signal), changesRemoteState);
+      response = await this.fetcher(url, request);
+    } catch (error) {
+      throw failures.transport(error, signal, changesRemoteState);
     }
     if (!response.ok) {
+      const failure = httpFailure(response, this.repository.provider);
+      this.credentials.deferRequests(failure.retryAfterMs);
       try {
         await response.body?.cancel();
       } finally {
-        throw new ForgeProviderError(
-          `The ${this.repository.provider} API rejected the operation (HTTP ${response.status}).`,
-          response.status,
-        );
+        throw failures.http(failure, changesRemoteState);
       }
     }
     try {
       const text = await readBoundedBody(response);
-      throwIfForgeRequestAborted(signal);
+      if (signal.aborted) throw signal.reason;
       return {
         body: options.text ? text : text ? (JSON.parse(text) as unknown) : null,
         headers: response.headers,
       };
     } catch (error) {
-      if (!changesRemoteState && error instanceof ForgeProviderError) throw error;
-      throw requestFailure(forgeRequestFailure(signal, true), changesRemoteState);
+      throw failures.transport(error, signal, changesRemoteState, true);
     }
   }
 
@@ -127,13 +131,6 @@ export class ForgeHttpClient {
       422,
     );
   }
-}
-
-function requestFailure(failure: ForgeProviderFailure, changesRemoteState: boolean): ForgeProviderError {
-  const unavailable = new ForgeProviderUnavailableError(failure);
-  return changesRemoteState
-    ? new ForgeProviderError(`${unavailable.message} Its remote result is unknown. Refresh provider state before submitting again.`, 409)
-    : unavailable;
 }
 
 export function pagination(query: ForgeListQuery = {}): {

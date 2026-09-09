@@ -2,6 +2,7 @@ import type {
   ForgeChangeRequest,
   ForgeChangeRequestStatus,
   ForgeChangeRequestSummary,
+  ForgeCredentialRole,
   ForgeCreateChangeRequest,
   ForgeIssue,
   ForgeIssueDetail,
@@ -10,6 +11,7 @@ import type {
   ForgePage,
   ForgeReviewPublication,
   ForgeReviewSubmission,
+  ForgeRepository,
 } from "@cloudx/shared";
 
 export interface ForgeListIdentity {
@@ -88,12 +90,33 @@ export class ForgeProviderError extends Error {
   }
 }
 
-export type ForgeProviderFailure = "timeout" | "cancelled" | "connection" | "unreadable_response";
+export type ForgeProviderFailure = "timeout" | "cancelled" | "connection" | "unreadable_response" |
+  "tls" | "redirect" | "invalid_request" | "rate_limited" | "service_unavailable" | "rejected" | "unknown";
+
+export interface ForgeRequestDiagnostic {
+  readonly provider: ForgeRepository["provider"];
+  readonly role: ForgeCredentialRole;
+  readonly operation: "request" | "authentication";
+  readonly method: string;
+  readonly path: string;
+  readonly phase: "prepare" | "fetch" | "response";
+  readonly failure: ForgeProviderFailure;
+  readonly causeCodes: readonly string[];
+  readonly retryable: boolean;
+  readonly httpStatus?: number;
+  readonly retryAfterMs?: number;
+}
+
+export type ForgeDiagnosticObserver = (diagnostic: Readonly<ForgeRequestDiagnostic>) => void;
 
 export class ForgeProviderUnavailableError extends ForgeProviderError {
+  readonly retryable: boolean;
+  readonly retryAfterMs?: number;
+
   constructor(
     readonly failure: ForgeProviderFailure,
     operation: "request" | "authentication" = "request",
+    options: { retryable?: boolean; retryAfterMs?: number } = {},
   ) {
     const subject = operation === "authentication" ? "GitHub App authentication" : "The forge request";
     const detail = {
@@ -101,9 +124,18 @@ export class ForgeProviderUnavailableError extends ForgeProviderError {
       cancelled: "was cancelled",
       connection: "could not reach the configured API",
       unreadable_response: "returned an unreadable response",
+      tls: "could not establish a trusted TLS connection",
+      redirect: "was redirected; check the configured API and repository",
+      invalid_request: "could not be prepared; check its configuration",
+      rate_limited: "was rate limited",
+      service_unavailable: "reached a temporarily unavailable API",
+      rejected: "was rejected by the API",
+      unknown: "failed before receiving a response",
     }[failure];
     super(`${subject} ${detail}.`, failure === "timeout" ? 504 : failure === "cancelled" ? 499 : 502);
     this.name = "ForgeProviderUnavailableError";
+    this.retryable = options.retryable ?? false;
+    this.retryAfterMs = options.retryAfterMs;
   }
 }
 
@@ -114,7 +146,10 @@ export function forgeRequestFailure(signal?: AbortSignal, responseReceived = fal
 }
 
 export function throwIfForgeRequestAborted(signal?: AbortSignal, operation?: "request" | "authentication"): void {
-  if (signal?.aborted) throw new ForgeProviderUnavailableError(forgeRequestFailure(signal), operation);
+  if (signal?.aborted) {
+    const failure = forgeRequestFailure(signal);
+    throw new ForgeProviderUnavailableError(failure, operation, { retryable: failure === "timeout" });
+  }
 }
 
 export class ForgeHeadChangedError extends ForgeProviderError {

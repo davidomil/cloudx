@@ -424,7 +424,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     }
   }, 20_000);
 
-  it("retains completed work through a provider outage and restart, then resumes only the merge", async () => {
+  it.each(["automatic recovery", "server restart", "local edits"])("retains completed work after a provider outage during %s", async recovery => {
     const fixture = await LifecycleFixture.create({ autoReview: true, approveFirst: true });
     const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);
     const implementation = await fixture.completedAssistantTurn(started);
@@ -437,19 +437,36 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(await fixture.worker(started.id)).toMatchObject({ status: "awaiting_merge" });
     expect(completedReview).toMatchObject({ status: "completed", draft: { status: "posted", event: "approve" } });
 
-    vi.spyOn(fixture.provider, "getChangeRequest").mockRejectedValueOnce(new ForgeProviderUnavailableError("timeout", "authentication"));
+    vi.spyOn(fixture.provider, "getChangeRequest").mockRejectedValueOnce(new ForgeProviderUnavailableError("timeout", "authentication", { retryable: true }));
     fixture.advanceTime(5_001);
     await fixture.workflow.poll();
-    expect(await fixture.worker(started.id)).toMatchObject({ status: "paused", error: expect.stringContaining("Resume"), autoReview: { phase: "merging" } });
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "awaiting_merge", error: expect.stringMatching(/retry/i), autoReview: { phase: "merging" } });
     expect(await fixture.worker(reviewer.id)).toEqual({ ...completedReview, updatedAt: expect.any(String) });
     for (const worker of [started, reviewer]) expect((await fs.stat(worker.worktreePath!)).isDirectory()).toBe(true);
     for (const receipt of [implementation, reviewed]) expect(await processIsRunning(receipt.pid)).toBe(false);
 
-    await fixture.restartWorkflow();
     fixture.provider.changes.get(7)!.mergeable = true;
     await fixture.workflow.poll();
     expect(fixture.provider.merges).toEqual([]);
-    await fixture.workflow.resume(started.id, fixture.placement);
+    if (recovery === "server restart") await fixture.restartWorkflow();
+    const localEdit = path.join(started.worktreePath!, "local-edit.txt");
+    if (recovery === "local edits") await fs.writeFile(localEdit, "Keep this local change\n");
+    fixture.advanceTime(5_001);
+    await fixture.workflow.poll();
+    if (recovery === "server restart") {
+      expect(await fixture.worker(started.id)).toMatchObject({ status: "paused" });
+      expect(fixture.provider.merges).toEqual([]);
+      await fixture.workflow.resume(started.id, fixture.placement);
+    }
+    if (recovery === "local edits") {
+      expect(await fixture.worker(started.id)).toMatchObject({ status: "failed" });
+      expect(await fs.readFile(localEdit, "utf8")).toBe("Keep this local change\n");
+      expect(fixture.provider.merges).toEqual([]);
+      expect(fixture.provider.submissions).toHaveLength(1);
+      expect(fixture.factory.processes).toHaveLength(2);
+      expect(await fixture.worker(reviewer.id)).toEqual({ ...completedReview, updatedAt: expect.any(String) });
+      return;
+    }
     expect(fixture.provider.merges).toEqual([implementation.headSha]);
     expect(fixture.provider.submissions).toHaveLength(1);
     expect(fixture.factory.processes).toHaveLength(2);

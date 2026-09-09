@@ -12,6 +12,45 @@ const privateFailure = "private-token https://private.example/repository?secret=
 afterEach(() => vi.restoreAllMocks());
 
 describe("GitHub installation-token request failures", () => {
+  it("shares and extends the longest provider cooldown across credential roles", async () => {
+    let now = 2_000_000_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json({ token: "private-token", expires_at: new Date(now + 3_600_000).toISOString() }));
+    const credentials = new ForgeCredentials(repository, async () => application, fetcher);
+    credentials.deferRequests(120_000);
+    now += 30_000;
+    credentials.deferRequests(5_000);
+    expect(credentials.requestDelay()).toBe(90_000);
+    for (const role of ["worker", "reviewer"] as const)
+      await expect(credentials.headers(role)).rejects.toMatchObject({ retryable: true, retryAfterMs: 90_000 });
+    expect(fetcher).not.toHaveBeenCalled();
+    now += 90_000;
+    expect(credentials.requestDelay()).toBeUndefined();
+    expect(await credentials.headers("reviewer")).toEqual({ Authorization: "Bearer private-token" });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each([429, 502, 503, 504])("reports a recoverable HTTP %s token exchange and shares its cooldown", async status => {
+    vi.spyOn(Date, "now").mockReturnValue(2_000_000_000_000);
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(privateFailure, { status, headers: { "retry-after": "120" } }));
+    const onFailure = vi.fn();
+    const credentials = new ForgeCredentials(repository, async () => application, fetcher, onFailure);
+    await expect(credentials.headers("worker")).rejects.toMatchObject({ retryable: true, retryAfterMs: 120_000 });
+    expect(onFailure).toHaveBeenNthCalledWith(1, expect.objectContaining({ provider: "github", role: "worker", operation: "authentication", method: "POST", path: "/app/installations/{installation}/access_tokens", phase: "response", httpStatus: status, retryable: true }));
+    await expect(credentials.headers("reviewer")).rejects.toMatchObject({ retryable: true, retryAfterMs: 120_000 });
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(JSON.stringify(onFailure.mock.calls)).not.toMatch(/private-|hidden|Bearer/);
+  });
+
+  it("does not follow an installation-token redirect", async () => {
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(null, { status: 307, headers: { location: "https://private.example/?secret=hidden" } }));
+    const onFailure = vi.fn();
+    const credentials = new ForgeCredentials(repository, async () => application, fetcher, onFailure);
+    await expect(credentials.headers("worker")).rejects.toMatchObject({ failure: "redirect", retryable: false });
+    expect(fetcher).toHaveBeenCalledExactlyOnceWith("https://api.github.com/app/installations/42/access_tokens", expect.objectContaining({ redirect: "manual" }));
+    expect(onFailure).toHaveBeenCalledWith(expect.objectContaining({ failure: "redirect", httpStatus: 307, retryable: false }));
+  });
+
   it.each(["connection", "timeout", "cancelled", "unreadable_response"] as const)("classifies %s without disclosing raw authentication details", async failure => {
     const deadline = new AbortController();
     const caller = new AbortController();
@@ -20,7 +59,7 @@ describe("GitHub installation-token request failures", () => {
       if (failure === "unreadable_response") return new Response(privateFailure);
       if (failure === "timeout") deadline.abort(new DOMException(privateFailure, "TimeoutError"));
       if (failure === "cancelled") caller.abort(new Error(privateFailure));
-      throw options!.signal!.aborted ? options!.signal!.reason : new TypeError(privateFailure);
+      throw options!.signal!.aborted ? options!.signal!.reason : new TypeError(privateFailure, { cause: Object.assign(new Error(privateFailure), { code: "ECONNRESET" }) });
     });
     const credentials = new ForgeCredentials(repository, async () => application, fetcher);
     const error = await credentials.headers("worker", caller.signal).catch(error => error);
@@ -43,7 +82,7 @@ describe("GitHub installation-token request failures", () => {
     expect(error.cause).toBeUndefined();
   });
 
-  it.each([401, 403, 503])("retains a confirmed HTTP %s authentication rejection even when body disposal fails", async status => {
+  it.each([401, 403])("retains a confirmed HTTP %s authentication rejection even when body disposal fails", async status => {
     const fetcher = vi.fn<typeof fetch>(async () => new Response(new ReadableStream({ cancel() { throw new Error(privateFailure); } }), { status }));
     const error = await new ForgeCredentials(repository, async () => application, fetcher).headers("worker").catch(error => error);
     expect(error).toBeInstanceOf(ForgeProviderError);
