@@ -91,6 +91,95 @@ describe.each(["git", "ssh", "http", "https", "file"])("catalog Git origin with 
   });
 });
 
+describe("catalog Git file origin identity", () => {
+  it.each(["#archive", "?archive"])("rejects a file origin whose %s suffix would be hidden before synchronization", async suffix => {
+    const { root, checkout, origin, peer, service } = await synchronizedFixture();
+    const hiddenOrigin = `${origin}${suffix}`;
+    await git(root, "clone", "--bare", origin, hiddenOrigin);
+    await commit(peer, "Incoming hidden catalog");
+    await git(peer, "push", hiddenOrigin, "HEAD:refs/heads/main");
+    const originUrl = `file://${hiddenOrigin}`;
+    const displayedOrigin = `file://${origin}`;
+    await git(checkout, "remote", "set-url", "origin", originUrl);
+    const initialHead = await git(checkout, "rev-parse", "HEAD");
+    const hiddenHead = await git(hiddenOrigin, "rev-parse", "HEAD");
+    await expect(git(checkout, "ls-remote", "origin", "refs/heads/main")).resolves.toBe(`${hiddenHead}\trefs/heads/main`);
+
+    await expect(service.status()).rejects.toThrow(/cannot be displayed safely/i);
+    await expect(service.pull(displayedOrigin)).rejects.toThrow(/cannot be displayed safely/i);
+
+    await expect(git(checkout, "rev-parse", "HEAD")).resolves.toBe(initialHead);
+    await expect(fs.stat(path.join(checkout, ".git", "FETCH_HEAD"))).rejects.toMatchObject({ code: "ENOENT" });
+    await commit(checkout, "Outgoing hidden catalog");
+
+    await expect(service.push(displayedOrigin)).rejects.toThrow(/cannot be displayed safely/i);
+
+    await expect(git(origin, "rev-parse", "HEAD")).resolves.toBe(initialHead);
+    await expect(git(hiddenOrigin, "rev-parse", "HEAD")).resolves.toBe(hiddenHead);
+    await expect(git(checkout, "remote", "get-url", "origin")).resolves.toBe(originUrl);
+  });
+
+  it.each(["#archive", "?archive"])("synchronizes only the file origin with the encoded %s pathname suffix", async suffix => {
+    const { root, checkout, origin, peer, service } = await synchronizedFixture();
+    const encodedOrigin = `${origin}${suffix}`;
+    await git(root, "clone", "--bare", origin, encodedOrigin);
+    const originalHead = await git(origin, "rev-parse", "HEAD");
+    const originUrl = `file://${origin}${encodeURIComponent(suffix)}`;
+    await expect(service.setOrigin(originUrl)).resolves.toMatchObject({ originUrl });
+    await commit(peer, "Incoming encoded catalog");
+    await git(peer, "push", encodedOrigin, "HEAD:refs/heads/main");
+
+    await service.pull(originUrl);
+
+    await expect(git(checkout, "rev-parse", "HEAD")).resolves.toBe(await git(encodedOrigin, "rev-parse", "HEAD"));
+    await expect(fs.readFile(path.join(checkout, "rule.md"), "utf8")).resolves.toBe("Incoming encoded catalog\n");
+    await commit(checkout, "Outgoing encoded catalog");
+
+    await expect(service.push(originUrl)).resolves.toMatchObject({ originUrl, hasChanges: false });
+
+    await expect(git(encodedOrigin, "rev-parse", "HEAD")).resolves.toBe(await git(checkout, "rev-parse", "HEAD"));
+    await expect(git(encodedOrigin, "show", "HEAD:rule.md")).resolves.toBe("Outgoing encoded catalog");
+    await expect(git(origin, "rev-parse", "HEAD")).resolves.toBe(originalHead);
+  });
+
+  it("preserves symlink parent traversal when saving, displaying, pulling, and pushing a file origin", async () => {
+    const { root, checkout, origin, peer, service } = await synchronizedFixture();
+    const links = path.join(root, "links");
+    const alias = path.join(links, "alias");
+    await fs.mkdir(links);
+    await fs.symlink(checkout, alias, "dir");
+    const normalizedOrigin = path.join(links, "origin.git");
+    await git(root, "clone", "--bare", origin, normalizedOrigin);
+    const normalizedHead = await git(normalizedOrigin, "rev-parse", "HEAD");
+    const originUrl = `file://${alias}/../origin.git`;
+    const normalizedUrl = `file://${normalizedOrigin}`;
+
+    await expect(service.setOrigin(originUrl)).resolves.toMatchObject({ originUrl });
+    await expect(service.status()).resolves.toMatchObject({ originUrl });
+    await expect(git(checkout, "remote", "get-url", "origin")).resolves.toBe(originUrl);
+    await expect(git(checkout, "remote", "get-url", "--push", "origin")).resolves.toBe(originUrl);
+    await commit(peer, "Incoming symlink catalog");
+    await git(peer, "push", "origin", "HEAD:refs/heads/main");
+    await expect(service.pull(normalizedUrl)).rejects.toThrow(/Origin changed/i);
+    await expect(git(checkout, "rev-parse", "HEAD")).resolves.toBe(normalizedHead);
+
+    await service.pull(originUrl);
+
+    await expect(git(checkout, "rev-parse", "HEAD")).resolves.toBe(await git(origin, "rev-parse", "HEAD"));
+    await expect(fs.readFile(path.join(checkout, "rule.md"), "utf8")).resolves.toBe("Incoming symlink catalog\n");
+    const originHead = await git(origin, "rev-parse", "HEAD");
+    await commit(checkout, "Outgoing symlink catalog");
+    await expect(service.push(normalizedUrl)).rejects.toThrow(/Origin changed/i);
+    await expect(git(origin, "rev-parse", "HEAD")).resolves.toBe(originHead);
+
+    await expect(service.push(originUrl)).resolves.toMatchObject({ originUrl, hasChanges: false });
+
+    await expect(git(origin, "rev-parse", "HEAD")).resolves.toBe(await git(checkout, "rev-parse", "HEAD"));
+    await expect(git(origin, "show", "HEAD:rule.md")).resolves.toBe("Outgoing symlink catalog");
+    await expect(git(normalizedOrigin, "rev-parse", "HEAD")).resolves.toBe(normalizedHead);
+  });
+});
+
 describe("catalog Git origin privacy", () => {
   it.each([
     ["https::https://private-user:private-password@example.test/catalog.git?token=private-token#private-fragment", "https::https://example.test/catalog.git"],
@@ -117,7 +206,12 @@ describe("catalog Git origin privacy", () => {
     "ssh:private-user:private-password@example.test/catalog.git",
     "https::https://private-user:private-password@bad host/catalog.git",
     "custom::private-user:private-password@example.test/catalog.git",
-    "custom::custom::https://private-user:private-password@example.test/catalog.git"
+    "custom::custom::https://private-user:private-password@example.test/catalog.git",
+    "file://private-user:private-password@localhost/catalog.git",
+    "custom::file://private-user:private-password@localhost/catalog.git",
+    "file:///catalog.git?token=private-token",
+    "file:///catalog.git#private-fragment",
+    "custom::file:///catalog.git?token=private-token#private-fragment"
   ])("rejects an origin that cannot be safely displayed: %s", async origin => {
     const { checkout, service } = await repositoryFixture();
     await git(checkout, "remote", "add", "origin", origin);
@@ -128,7 +222,9 @@ describe("catalog Git origin privacy", () => {
 
   it.each([
     "git@example.test:rules/catalog.git", "git:catalog@v1.git", "https:rules/catalog@v1.git",
-    "git:rules/archive:2026.git", "git@[::1]:catalog.git", "/local rules/catalog.git", "../catalog.git", "./rules:catalog.git"
+    "git:rules/archive:2026.git", "git@[::1]:catalog.git", "/local rules/catalog.git", "../catalog.git", "./rules:catalog.git",
+    "file:///local rules/catalog.git", "file:///rules/alias/../catalog.git", "file:///rules/catalog.git%23archive",
+    "custom::file:///rules/alias/../catalog.git"
   ])("displays a credential-free SSH or local origin: %s", async origin => {
     const { checkout, service } = await repositoryFixture();
     await git(checkout, "remote", "add", "origin", origin);

@@ -53,6 +53,90 @@ afterEach(async () => {
 });
 
 describe("catalog response ordering across App panes", () => {
+  describe.each(["request", "response"] as const)("rule saves queued behind a delayed pull %s", delay => {
+    it.each(["before", "during"])("keeps pulled metadata with text drafted %s pull", async timing => {
+      const catalog = await twoPaneCatalog();
+      const description = "Description updated on origin.";
+      const text = "Keep this queued local rule text.";
+      const incomingHead = await catalog.publishRuleDescription(description);
+      if (timing === "before") await editRule(catalog.second, catalog.ruleId, text);
+      const pulling = delay === "request" ? catalog.holdNextRequest("git.pull") : catalog.holdNextResponse("git.pull");
+      await click(catalog.first, "Pull");
+      await pulling.ready;
+      if (timing === "during") await editRule(catalog.second, catalog.ruleId, text);
+      await catalog.queue(catalog.second, `Save rule ${catalog.ruleId}`);
+      await act(async () => pulling.release());
+      await catalog.finishRequests();
+
+      expect(await catalog.head()).toBe(incomingHead);
+      expect(await catalog.savedRuleFile()).toContain(`description: ${description}\n`);
+      expect(await catalog.savedRuleFile()).toContain(`\n${text}\n`);
+      await catalog.perform(catalog.first, "Refresh rules and skills", "catalog.list");
+      for (const pane of [catalog.first, catalog.second]) {
+        const rule = button(pane, `Edit rule ${catalog.ruleId}`).closest(".rule-option")!;
+        expect(rule.textContent).toBe(text);
+        expect(rule.getAttribute("title")).toBe(description);
+        expect(pane.querySelector(`[aria-label="Rule text for ${catalog.ruleId}"]`)).toBeNull();
+      }
+    });
+
+    it("retains a queued rule draft after save failure and uses pulled metadata on the next save", async () => {
+      const catalog = await twoPaneCatalog();
+      const description = "Description to preserve after save failure.";
+      const text = "Keep this draft after the failed save.";
+      await catalog.publishRuleDescription(description);
+      await editRule(catalog.second, catalog.ruleId, text);
+      const pulling = delay === "request" ? catalog.holdNextRequest("git.pull") : catalog.holdNextResponse("git.pull");
+      await click(catalog.first, "Pull");
+      await pulling.ready;
+      catalog.failNextRequest("rules.save", "Rule save failed.");
+      await catalog.queue(catalog.second, `Save rule ${catalog.ruleId}`);
+      await act(async () => pulling.release());
+      await catalog.finishRequests();
+
+      expect(catalog.second.textContent).toContain("Rule save failed.");
+      expect(catalog.second.querySelector(`[aria-label="Rule text for ${catalog.ruleId}"]`)?.textContent).toBe(text);
+      expect(await catalog.savedRuleFile()).toContain(`description: ${description}\n`);
+      expect(await catalog.savedRuleFile()).not.toContain(text);
+      await catalog.perform(catalog.second, `Save rule ${catalog.ruleId}`, "rules.save");
+      expect(await catalog.savedRuleFile()).toContain(`description: ${description}\n`);
+      expect(await catalog.savedRuleFile()).toContain(`\n${text}\n`);
+    });
+
+    it("restores a rule deleted by the pending pull with its captured metadata", async () => {
+      const catalog = await twoPaneCatalog();
+      const originalRule = (await catalog.savedStore()).rules.find(rule => rule.id === catalog.ruleId)!;
+      const text = "Restore this queued rule text.";
+      await catalog.publishRuleDeletion();
+      await editRule(catalog.second, catalog.ruleId, text);
+      const pulling = delay === "request" ? catalog.holdNextRequest("git.pull") : catalog.holdNextResponse("git.pull");
+      await click(catalog.first, "Pull");
+      await pulling.ready;
+      await catalog.queue(catalog.second, `Save rule ${catalog.ruleId}`);
+      await act(async () => pulling.release());
+      await catalog.finishRequests();
+
+      expect((await catalog.savedStore()).rules).toContainEqual(expect.objectContaining({ id: catalog.ruleId, description: originalRule.description, text }));
+      expect(await catalog.savedRuleFile()).toContain(`\n${text}\n`);
+      expect(button(catalog.second, `Edit rule ${catalog.ruleId}`).disabled).toBe(false);
+    });
+  });
+
+  it("uses the text description after pull removes a separate description before the queued save", async () => {
+    const catalog = await twoPaneCatalog();
+    await catalog.publishRuleDescription("");
+    await editRule(catalog.second, catalog.ruleId, "Text saved without the removed description.");
+    const pulling = catalog.holdNextResponse("git.pull");
+    await click(catalog.first, "Pull");
+    await pulling.ready;
+    await catalog.queue(catalog.second, `Save rule ${catalog.ruleId}`);
+    await act(async () => pulling.release());
+    await catalog.finishRequests();
+
+    expect(await catalog.savedRuleFile()).toContain("description: Text saved without the removed description.\n");
+    expect((await catalog.savedStore()).rules.find(rule => rule.id === catalog.ruleId)?.description).toBe("Text saved without the removed description.");
+  });
+
   it.each(["before", "during"])("preserves a pulled description when saving rule text drafted %s pull", async timing => {
     const catalog = await twoPaneCatalog();
     const description = "Description updated on origin.";
@@ -471,6 +555,16 @@ async function twoPaneCatalog() {
       await commit(publisher, "Update rule description on origin");
       await git(publisher, "push", "origin", "main");
       return git(publisher, "rev-parse", "HEAD");
+    },
+    async publishRuleDeletion() {
+      const publisher = path.join(directory, "publisher");
+      await git(directory, "clone", origin, publisher);
+      await fs.rm(path.join(publisher, "rules", `${ruleId}.md`));
+      for (const template of initial.templates) {
+        await fs.writeFile(path.join(publisher, "templates", `${template.id}.json`), JSON.stringify({ ...template, ruleIds: template.ruleIds.filter(id => id !== ruleId) }));
+      }
+      await commit(publisher, "Delete rule on origin");
+      await git(publisher, "push", "origin", "main");
     },
     savedTemplate: async () => JSON.parse(await fs.readFile(path.join(checkout, "templates", `${templateId}.json`), "utf8")),
     async perform(panel: Element, label: string, operation: string) {

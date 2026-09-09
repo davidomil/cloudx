@@ -195,6 +195,10 @@ function publicOriginUrl(url: string): string {
     }
     const parsed = new URL(address);
     if (!parsed.host && parsed.protocol !== "file:") throw new Error("Origin has no URL host.");
+    if (parsed.protocol === "file:") {
+      if (parsed.search || parsed.hash) throw new Error("Redacting the file origin would change its Git pathname.");
+      return url;
+    }
     parsed.password = "";
     if (parsed.protocol === "http:" || parsed.protocol === "https:") parsed.username = "";
     parsed.search = "";

@@ -72,7 +72,7 @@ import { browserNotificationPermissionState, NOTIFICATION_TOAST_MS, requestBrows
 import { noSystemTextAssistProps } from "./inputAssist.js";
 import { attemptPortraitOrientationLock } from "./orientationLock.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
-import { RulesSkillsPanel, TemplateSelect, pluginMetadataForTemplate, selectedTemplateId } from "./RulesSkillsPanel.js";
+import { RulesSkillsPanel, TemplateSelect, cloudxRuleFromEdit, pluginMetadataForTemplate, selectedTemplateId } from "./RulesSkillsPanel.js";
 import {
   PLUGIN_WEBVIEW_RENDERER,
   PluginWebviewPanel,
@@ -181,6 +181,7 @@ export function App() {
   const [config, setConfig] = useState<CloudxConfigResponse | undefined>();
   const [forgeRepositoryChange, setForgeRepositoryChange] = useState({ version: 0, pending: false });
   const [rulesSkillsStore, setRulesSkillsStore] = useState<RulesSkillsStore | undefined>();
+  const rulesSkillsStoreRef = useRef<RulesSkillsStore | undefined>(undefined);
   const rulesSkillsQueue = useRef(Promise.resolve());
   const [rulesSkillsGit, setRulesSkillsGit] = useState<RulesSkillsGitState>();
   const [tabs, setTabs] = useState<WorkspaceTab[]>([]);
@@ -443,11 +444,14 @@ export function App() {
     }
   }
 
-  const callRulesSkills = useCallback(<T extends { store?: RulesSkillsStore; git?: RulesSkillsGitState } = { store: RulesSkillsStore },>(operation: string, input: Record<string, unknown> = {}) => {
+  const callRulesSkills = useCallback(<T extends { store?: RulesSkillsStore; git?: RulesSkillsGitState } = { store: RulesSkillsStore },>(operation: string, input: Record<string, unknown> | ((store: RulesSkillsStore | undefined) => Record<string, unknown>) = {}) => {
     const request = rulesSkillsQueue.current.then(async () => {
       try {
-        const result = await callHook<T>(`rules-skills.${operation}`, input);
-        if (result.store) setRulesSkillsStore(result.store);
+        const result = await callHook<T>(`rules-skills.${operation}`, typeof input === "function" ? input(rulesSkillsStoreRef.current) : input);
+        if (result.store) {
+          rulesSkillsStoreRef.current = result.store;
+          setRulesSkillsStore(result.store);
+        }
         if (result.git) setRulesSkillsGit(result.git);
         return result;
       } catch (error) {
@@ -1136,7 +1140,10 @@ export function App() {
   }
 
   async function handleSaveRule(rule: CloudxRule) {
-    await callRulesSkills("rules.save", { rule });
+    await callRulesSkills("rules.save", store => {
+      const currentRule = store?.rules.find(current => current.id === rule.id);
+      return { rule: currentRule ? cloudxRuleFromEdit(currentRule, rule.text) : rule };
+    });
   }
 
   async function handleInjectRulesSkillsRuntime(): Promise<number> {
