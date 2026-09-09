@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
+import { PluginSessionNotStartedError, type PreparedCodexLaunch } from "@cloudx/plugin-api";
 
 import {
   RULES_SKILLS_PLUGIN_ID,
@@ -20,6 +20,7 @@ import type { SessionStore } from "../sessionStore.js";
 import type { WorkspaceCommandService } from "../workspace/WorkspaceCommandService.js";
 import type { WorkspaceLayoutStore } from "../workspace/WorkspaceLayoutStore.js";
 import { validateRepository } from "./providers/ForgeCredentials.js";
+import { ForgeReviewConversation, isReviewConversationBinding, retireReviewSessionView, type ReviewConversationBinding } from "./ForgeReviewConversation.js";
 
 export interface ForgeWorkspace {
   id: string;
@@ -56,6 +57,7 @@ export interface ForgeRuntimeDependencies {
     signal?: AbortSignal,
     environment?: NodeJS.ProcessEnv,
   ) => Promise<string>;
+  reviewConversations?: Pick<ForgeReviewConversation, "prepare">;
 }
 
 interface DirectoryIdentity {
@@ -69,6 +71,12 @@ interface OwnedBaseUpdate {
   baseBranch: string;
   targetHeadSha?: string;
   headSha?: string;
+}
+
+interface OwnedReviewRefresh {
+  headSha: string;
+  baseSha: string;
+  baseBranch: string;
 }
 
 interface OwnedWorkspace extends ForgeWorkspace {
@@ -87,6 +95,9 @@ interface OwnedWorkspace extends ForgeWorkspace {
   prepared: boolean;
   launchPending: boolean;
   baseUpdate?: OwnedBaseUpdate;
+  reviewBaseSha?: string;
+  reviewRefresh?: OwnedReviewRefresh;
+  reviewConversation?: ReviewConversationBinding;
 }
 
 interface OwnedTab {
@@ -102,8 +113,11 @@ interface OwnedTab {
 export class ForgeRuntime {
   private static readonly operations = new Map<string, Promise<void>>();
   private readonly ownedTabs = new Map<string, OwnedTab>();
+  private readonly reviewConversations: Pick<ForgeReviewConversation, "prepare">;
 
-  constructor(private readonly dependencies: ForgeRuntimeDependencies) {}
+  constructor(private readonly dependencies: ForgeRuntimeDependencies) {
+    this.reviewConversations = dependencies.reviewConversations ?? new ForgeReviewConversation(dependencies.dataDir);
+  }
 
   isActive(tabId: string): boolean {
     const tab = this.dependencies.sessions
@@ -240,6 +254,7 @@ export class ForgeRuntime {
         if (input.review)
           await this.prepareReviewComparison(owned, commit, input.baseSha!, access, signal);
         owned.baseCommit = commit;
+        if (input.review) owned.reviewBaseSha = input.baseSha!.toLowerCase();
         await this.manifest(input.id).write(owned);
         if (!input.review)
           await this.runOwnedGit(owned, ["checkout", "--detach", commit], signal);
@@ -269,6 +284,78 @@ export class ForgeRuntime {
     });
   }
 
+  refreshReviewWorkspace(
+    workspace: ForgeWorkspace,
+    comparison: { headSha: string; baseSha: string; baseBranch: string },
+    signal?: AbortSignal,
+  ): Promise<void> {
+    return this.serialize(workspace.id, async () => {
+      signal?.throwIfAborted();
+      if (!isCommitSha(comparison.headSha) || !isCommitSha(comparison.baseSha))
+        throw new Error("Refreshing a review requires exact head and base commits.");
+      const baseBranch = comparison.baseBranch.trim();
+      if (!baseBranch || baseBranch.startsWith("-") || /[\r\n\0]/u.test(baseBranch))
+        throw new Error("A valid review target branch is required.");
+      const owned = await this.matchOwned(workspace);
+      if (owned.role !== "reviewer" || owned.cleaned || !owned.prepared)
+        throw new Error("Only an owned reviewer checkout can be refreshed.");
+      await this.assertQuiescent(owned);
+      await this.assertCheckout(owned);
+      await this.requireNoGitOperation(owned);
+      const head = await this.requireCleanReviewHead(owned, signal);
+      const base = await this.reviewBase(owned, signal);
+      const requested = { headSha: comparison.headSha.toLowerCase(), baseSha: comparison.baseSha.toLowerCase(), baseBranch };
+      const pending = owned.reviewRefresh;
+      const sameRefresh = pending?.headSha === requested.headSha && pending.baseSha === requested.baseSha && pending.baseBranch === requested.baseBranch;
+      const unchanged = head === owned.baseCommit && base === owned.reviewBaseSha;
+      if (!unchanged && (!sameRefresh || ![owned.baseCommit, requested.headSha].includes(head) || ![owned.reviewBaseSha, requested.baseSha].includes(base)))
+        throw new Error("The reviewer checkout changed outside its recorded refresh. Local changes were preserved.");
+      if (head === requested.headSha && base === requested.baseSha) {
+        await this.requireReviewMergeBase(owned, requested.headSha, requested.baseSha, signal);
+        owned.baseCommit = requested.headSha;
+        owned.reviewBaseSha = requested.baseSha;
+        owned.reviewRefresh = undefined;
+        await this.manifest(owned.id).write(owned);
+        return;
+      }
+      await this.runGit(owned.worktreePath, ["check-ref-format", "--branch", baseBranch], signal);
+      const access = await this.access(owned.expectedRepository, "reviewer", signal);
+      if (access.cloneUrl !== owned.origin) throw new Error("Repository origin changed while the reviewer was running.");
+      owned.reviewRefresh = requested;
+      await this.manifest(owned.id).write(owned);
+      for (const commit of [requested.headSha, requested.baseSha]) {
+        await this.runOwnedGit(owned, ["fetch", "--no-tags", "--no-recurse-submodules", access.cloneUrl, commit], signal, access.authorization);
+        const fetched = (await this.runGit(owned.worktreePath, ["rev-parse", "--verify", "FETCH_HEAD^{commit}"], signal)).trim();
+        if (fetched.toLowerCase() !== commit) throw new Error("Fetched review commit does not match the recorded comparison.");
+      }
+      await this.requireReviewMergeBase(owned, requested.headSha, requested.baseSha, signal);
+      if (await this.requireCleanReviewHead(owned, signal) !== head || await this.reviewBase(owned, signal) !== base)
+        throw new Error("The reviewer checkout changed during its refresh. Local changes were preserved.");
+      await this.runOwnedGit(owned, ["update-ref", "--no-deref", "refs/cloudx/review-base", requested.baseSha, base], signal);
+      await this.runOwnedGit(owned, ["checkout", "--detach", "--no-overwrite-ignore", requested.headSha], signal);
+      if (await this.requireCleanReviewHead(owned) !== requested.headSha || await this.reviewBase(owned) !== requested.baseSha)
+        throw new Error("The reviewer checkout does not match its recorded refresh. Local resources were preserved.");
+      owned.baseCommit = requested.headSha;
+      owned.reviewBaseSha = requested.baseSha;
+      owned.reviewRefresh = undefined;
+      await this.manifest(owned.id).write(owned);
+      signal?.throwIfAborted();
+    });
+  }
+
+  private async requireCleanReviewHead(owned: OwnedWorkspace, signal?: AbortSignal): Promise<string> {
+    await this.assertCheckout(owned);
+    const branch = (await this.runGit(owned.worktreePath, ["rev-parse", "--abbrev-ref", "HEAD"], signal)).trim();
+    if (branch !== "HEAD") throw new Error("The reviewer checkout is no longer detached. Local changes were preserved.");
+    if ((await this.runGit(owned.worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"], signal)).trim())
+      throw new Error("The reviewer checkout must be clean before its next review. Local changes were preserved.");
+    return (await this.runGit(owned.worktreePath, ["rev-parse", "--verify", "HEAD^{commit}"], signal)).trim();
+  }
+
+  private async reviewBase(owned: OwnedWorkspace, signal?: AbortSignal): Promise<string> {
+    return (await this.runGit(owned.worktreePath, ["rev-parse", "--verify", "refs/cloudx/review-base^{commit}"], signal)).trim();
+  }
+
   private async prepareReviewComparison(
     owned: OwnedWorkspace,
     headSha: string,
@@ -288,6 +375,10 @@ export class ForgeRuntime {
     )).trim();
     if (fetchedBase.toLowerCase() !== baseSha.toLowerCase())
       throw new Error("Fetched review base does not match the requested base commit.");
+    await this.requireReviewMergeBase(owned, headSha, baseSha, signal);
+  }
+
+  private async requireReviewMergeBase(owned: OwnedWorkspace, headSha: string, baseSha: string, signal?: AbortSignal): Promise<void> {
     let mergeBases: string[];
     try {
       mergeBases = (await this.runGit(
@@ -316,6 +407,7 @@ export class ForgeRuntime {
     },
     signal?: AbortSignal,
   ): Promise<string> {
+    return this.serialize(input.id, async () => {
     signal?.throwIfAborted();
     const owned = await this.readOwned(input.id);
     if (
@@ -329,6 +421,11 @@ export class ForgeRuntime {
         "Worker workspace ownership does not match or a previous launch is unresolved.",
       );
     await this.assertIdentity(owned.worktree);
+    if (owned.role === "reviewer") {
+      await this.assertQuiescent(owned);
+      if (owned.reviewRefresh || await this.requireCleanReviewHead(owned, signal) !== owned.baseCommit || await this.reviewBase(owned, signal) !== owned.reviewBaseSha)
+        throw new Error("Refresh the reviewer checkout to its exact comparison before launching it.");
+    }
     this.dependencies.pathPolicy.resolve(owned.worktreePath);
     const catalog = await this.dependencies.rulesSkills.list();
     if (!catalog.templates.some((template) => template.id === input.templateId))
@@ -340,6 +437,28 @@ export class ForgeRuntime {
       : undefined;
     owned.launchPending = true;
     await this.manifest(owned.id).write(owned);
+    let preparingTabId: string | undefined;
+    const prepareCodexSession = owned.role === "reviewer" ? async (launch: PreparedCodexLaunch) => {
+      preparingTabId = launch.tabId;
+      try {
+        if (launch.cwd !== owned.worktreePath) throw new Error("Reviewer conversation checkout ownership does not match.");
+        const tab = this.dependencies.sessions.getTab(launch.tabId);
+        if (tab.id !== launch.tabId || tab.cwd !== owned.worktreePath || tab.ownerPluginId !== "forge" || tab.pluginMetadata?.["forge-workers"]?.workerId !== owned.id)
+          throw new Error("Reviewer conversation tab ownership does not match.");
+        const ownership: OwnedTab = { tabId: tab.id, workerId: owned.id, closed: false, quiescent: false };
+        this.ownedTabs.set(tab.id, ownership);
+        await this.captureTab(tab, ownership);
+      } catch (error) { throw new PluginSessionNotStartedError(error); }
+      return this.reviewConversations.prepare(launch, {
+        binding: owned.reviewConversation,
+        model: input.model,
+        reasoningEffort: input.reasoningEffort,
+        save: async binding => {
+          owned.reviewConversation = binding;
+          await this.manifest(owned.id).write(owned);
+        },
+      }, signal);
+    } : undefined;
     const { tab } = await this.dependencies.workspaceCommands.createTab({
       pluginId: "codex-terminal",
       cwd: owned.worktreePath,
@@ -354,8 +473,13 @@ export class ForgeRuntime {
     }, {
       ownerPluginId: "forge",
       authorizeProjectTrust,
+      ...(prepareCodexSession ? { prepareCodexSession } : {}),
     }).catch(async error => {
       if (error instanceof PluginSessionNotStartedError) {
+        if (preparingTabId && this.ownedTabs.has(preparingTabId)) {
+          await this.recordQuiescence(preparingTabId);
+          await this.close(preparingTabId);
+        }
         owned.launchPending = false;
         await this.manifest(owned.id).write(owned);
       }
@@ -370,6 +494,8 @@ export class ForgeRuntime {
     this.ownedTabs.set(tab.id, ownedTab);
     try {
       await this.captureTab(tab, ownedTab);
+      if (owned.role === "reviewer" && (preparingTabId !== tab.id || !owned.reviewConversation?.threadId))
+        throw new Error("The reviewer launch did not bind its exact Codex conversation.");
       owned.launchPending = false;
       await this.manifest(owned.id).write(owned);
       signal?.throwIfAborted();
@@ -387,6 +513,7 @@ export class ForgeRuntime {
       await this.manifest(owned.id).write(owned);
       throw error;
     }
+    });
   }
 
   async pause(tabId: string): Promise<void> {
@@ -426,7 +553,10 @@ export class ForgeRuntime {
     );
     if (owned && !owned.closed) {
       if (owned.context) await this.removeContext(owned.context);
-      if (owned.launch) await this.removeLaunch(owned.launch, tabId);
+      if (owned.launch) {
+        const worker = await this.readOwned(owned.workerId);
+        await this.removeLaunch(owned.launch, tabId, worker.role === "reviewer" ? worker.reviewConversation : undefined);
+      }
       owned.closed = true;
       await this.tabManifest(tabId).write(owned);
       this.ownedTabs.delete(tabId);
@@ -910,6 +1040,11 @@ export class ForgeRuntime {
         !/^[a-f0-9]{64}$/u.test(value.gitConfigHash)) ||
       (value.baseUpdate !== undefined &&
         (value.role !== "worker" || !isOwnedBaseUpdate(value.baseUpdate))) ||
+      (value.role === "reviewer" && value.prepared && !isCommitSha(value.reviewBaseSha)) ||
+      (value.reviewRefresh !== undefined &&
+        (value.role !== "reviewer" || !isReviewRefresh(value.reviewRefresh))) ||
+      (value.reviewConversation !== undefined &&
+        (value.role !== "reviewer" || !isReviewConversationBinding(value.reviewConversation))) ||
       (value.branch !== "" && value.branch !== `cloudx/forge/${id}`)
     )
       throw new Error(
@@ -1143,6 +1278,7 @@ export class ForgeRuntime {
   private async removeLaunch(
     expected: DirectoryIdentity,
     tabId: string,
+    conversation?: ReviewConversationBinding,
   ): Promise<void> {
     const launchPath = path.join(
       path.resolve(this.dependencies.dataDir),
@@ -1162,7 +1298,8 @@ export class ForgeRuntime {
       throw new Error(
         "Worker launch ownership changed; the replacement was preserved.",
       );
-    await fs.rm(launchPath, { recursive: true });
+    if (conversation) await retireReviewSessionView(this.dependencies.dataDir, tabId, expected, conversation);
+    else await fs.rm(launchPath, { recursive: true });
   }
 
   private async directory(candidate: string): Promise<DirectoryIdentity> {
@@ -1224,6 +1361,14 @@ function isOwnedBaseUpdate(value: unknown): value is OwnedBaseUpdate {
     !update.baseBranch.startsWith("-") && !/[\r\n\0]/u.test(update.baseBranch) &&
     (update.targetHeadSha === undefined || isCommitSha(update.targetHeadSha)) &&
     (update.headSha === undefined || Boolean(update.targetHeadSha) && isCommitSha(update.headSha));
+}
+
+function isReviewRefresh(value: unknown): value is OwnedReviewRefresh {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const refresh = value as Partial<OwnedReviewRefresh>;
+  return isCommitSha(refresh.headSha) && isCommitSha(refresh.baseSha) &&
+    typeof refresh.baseBranch === "string" && Boolean(refresh.baseBranch.trim()) &&
+    !refresh.baseBranch.startsWith("-") && !/[\r\n\0]/u.test(refresh.baseBranch);
 }
 
 export function assertForgeOrigin(

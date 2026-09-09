@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
+import { MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
 import type { ForgeChangeRequest, ForgeReviewPublication, ForgeReviewSubmission, ForgeWorker } from "@cloudx/shared";
 import {
   ForgeWorkflowService,
@@ -71,6 +73,7 @@ function fixture() {
       branch: "cloudx/forge/test",
       repositoryPath: "/repo/work",
     })),
+    refreshReviewWorkspace: vi.fn(async (_workspace: unknown, _revision: unknown, _signal?: AbortSignal) => {}),
     launch: vi.fn(async (_input: Parameters<ForgeWorkflowDependencies["runtime"]["launch"]>[0], _signal?: AbortSignal) => "tab-1"),
     pause: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
@@ -126,6 +129,134 @@ function fixture() {
   };
 }
 const placement = { windowId: "window", paneId: "pane" };
+
+describe("Reusable review workers", () => {
+  afterEach(() => vi.useRealTimers());
+
+  async function completedReview() {
+    const f = fixture();
+    const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "request_changes", body: "Handle null input", comments: [{ body: "Add the null case" }] });
+    await f.service.poll();
+    return { ...f, worker, draft: f.stored()[0].draft! };
+  }
+
+  it("reuses one reviewer and checkout for a new revision while retaining its previous review", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2026-09-09T01:00:00.000Z");
+    const f = await completedReview();
+    expect(f.draft).toMatchObject({ id: f.worker.attemptId, startedAt: f.worker.startedAt });
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    vi.setSystemTime("2026-09-09T02:00:00.000Z");
+    f.change.headSha = "c".repeat(40);
+    f.change.baseSha = "d".repeat(40);
+    const next = await f.service.startReview(f.deps.settings().repository, 7, true, placement);
+    expect(next).toMatchObject({ id: f.worker.id, worktreePath: f.worker.worktreePath, headSha: f.change.headSha, status: "running", autoPost: true, startedAt: "2026-09-09T02:00:00.000Z", reviewHistory: [f.draft] });
+    expect(next.draft).toBeUndefined();
+    expect(next.attemptId).not.toBe(f.worker.attemptId);
+    expect(f.stored()).toHaveLength(1);
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledOnce();
+    expect(f.runtime.refreshReviewWorkspace).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: f.worker.id, worktreePath: f.worker.worktreePath }), { headSha: f.change.headSha, baseSha: f.change.baseSha, baseBranch: "main" }, expect.any(AbortSignal));
+    expect(f.runtime.launch.mock.calls.map(([input]) => input.id)).toEqual([f.worker.id, f.worker.id]);
+    expect(f.runtime.launch.mock.calls[1][0].prompt).toContain("Continue this request's review in the same conversation");
+  });
+
+  it("rejects an older round's save and submit even when both reviews inspected the same commit", async () => {
+    const f = await completedReview();
+    const next = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "approve", body: "The updated feedback is addressed", comments: [] });
+    await f.service.poll();
+    const current = f.stored()[0].draft!;
+    expect(current.id).toBe(next.attemptId);
+    await expect(f.service.saveReview(next.id, f.draft.id, { body: "Delayed old edit", comments: [], event: "comment" })).rejects.toThrow(/review.*changed|current review/i);
+    await expect(f.service.submitReview(next.id, f.draft.id)).rejects.toThrow(/review.*changed|current review/i);
+    expect(f.stored()[0]).toMatchObject({ draft: current, reviewHistory: [f.draft] });
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    await f.service.submitReview(next.id, current.id);
+    expect(f.provider.postReview).toHaveBeenCalledExactlyOnceWith(7, expect.objectContaining({ headSha: current.headSha, body: current.body }));
+  });
+
+  it("retains the same reviewer after a restart and refreshes the pinned source without recreating its checkout", async () => {
+    const f = await completedReview();
+    const restarted = new ForgeWorkflowService(f.deps);
+    f.change.headSha = "c".repeat(40);
+    const next = await restarted.startReview(f.deps.settings().repository, 7, false, placement);
+    expect(next).toMatchObject({ id: f.worker.id, reviewHistory: [f.draft] });
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledOnce();
+    expect(f.runtime.refreshReviewWorkspace).toHaveBeenCalledOnce();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+  });
+
+  it("preserves the current review and checkout when another round would exceed the history limit", async () => {
+    const f = await completedReview();
+    const saved = f.stored()[0];
+    saved.reviewHistory = Array.from({ length: MAX_FORGE_REVIEW_HISTORY }, () => ({ ...f.draft, id: randomUUID() }));
+    await f.deps.store.write([saved]);
+    const restarted = new ForgeWorkflowService(f.deps);
+    await expect(restarted.startReview(f.deps.settings().repository, 7, false, placement)).rejects.toThrow("review history limit");
+    expect(f.stored()).toEqual([expect.objectContaining({ id: saved.id, status: "completed", draft: f.draft, reviewHistory: saved.reviewHistory, worktreePath: saved.worktreePath })]);
+    expect(f.runtime.refreshReviewWorkspace).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+  });
+
+  it("finishes cleanup after merge despite an uncertain earlier review submission without posting or reviewing again", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const f = await completedReview();
+    f.provider.postReview.mockRejectedValueOnce(new Error("Provider response lost"));
+    await expect(f.service.submitReview(f.worker.id, f.draft.id)).rejects.toThrow("response lost");
+    f.change.merged = true;
+    f.change.state = "merged";
+    f.runtime.cleanup.mockRejectedValueOnce(new Error("Cleanup interrupted"));
+    vi.setSystemTime(Date.now() + 30_001);
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "cleanup_failed", draft: { status: "post_failed" } });
+    await f.service.resume(f.worker.id, placement);
+    expect(f.stored()).toEqual([]);
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+  });
+
+  it("resumes the requested new round after checkout refresh fails without restoring its old draft as the current result", async () => {
+    const f = await completedReview();
+    f.change.headSha = "c".repeat(40);
+    f.runtime.refreshReviewWorkspace.mockRejectedValueOnce(new Error("Refresh interrupted"));
+    const failed = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    expect(failed).toMatchObject({ status: "failed", reviewHistory: [f.draft] });
+    expect(failed.draft).toBeUndefined();
+    const resumed = await f.service.resume(f.worker.id, placement);
+    expect(resumed).toMatchObject({ id: f.worker.id, status: "running", headSha: f.change.headSha, reviewHistory: [f.draft] });
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+  });
+
+  it("keeps a completed report when process shutdown fails and finishes it on Resume without another review run", async () => {
+    const f = fixture();
+    const worker = await f.service.startReview(f.deps.settings().repository, 7, true, placement);
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Verified", comments: [] });
+    f.runtime.close.mockRejectedValue(new Error("Process ownership is uncertain"));
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "cleanup_failed", draft: { id: worker.attemptId, status: "draft", body: "Verified" } });
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    f.runtime.close.mockResolvedValue(undefined);
+    const restarted = new ForgeWorkflowService(f.deps);
+    const completed = await restarted.resume(worker.id, placement);
+    expect(completed).toMatchObject({ status: "completed", draft: { id: worker.attemptId, status: "posted" }, worktreePath: worker.worktreePath });
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+  });
+
+  it.each(["pause", "stop"] as const)("retains review context through %s and explicit Resume", async action => {
+    const f = fixture();
+    const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    await f.service[action](worker.id);
+    const resumed = await f.service.resume(worker.id, placement);
+    expect(resumed).toMatchObject({ id: worker.id, worktreePath: worker.worktreePath, startedAt: worker.startedAt, status: "running" });
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledOnce();
+    expect(f.runtime.refreshReviewWorkspace).toHaveBeenCalledOnce();
+  });
+});
 
 describe("Issue merge attempts", () => {
   async function approvedManualIssue() {
@@ -256,10 +387,10 @@ describe("Forge issue and review workflows", () => {
   it("prepares both pinned review commits and supplies a local comparison for every attempt", async () => {
     const f = fixture();
     const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    expect(f.runtime.prepareWorkspace).toHaveBeenLastCalledWith(expect.objectContaining({
+      review: true, headSha: f.change.headSha, baseSha: f.change.baseSha,
+    }), expect.any(AbortSignal));
     const expectPinnedReview = () => {
-      expect(f.runtime.prepareWorkspace).toHaveBeenLastCalledWith(expect.objectContaining({
-        review: true, headSha: f.change.headSha, baseSha: f.change.baseSha,
-      }), expect.any(AbortSignal));
       expect(f.reports.prepare).toHaveBeenLastCalledWith(expect.any(String), expect.objectContaining({
         item: expect.objectContaining({ headSha: f.change.headSha, baseSha: f.change.baseSha }),
       }));
@@ -273,7 +404,10 @@ describe("Forge issue and review workflows", () => {
     f.change.baseSha = "d".repeat(40);
     await f.service.resume(worker.id, placement);
     expectPinnedReview();
-    expect(f.runtime.prepareWorkspace).toHaveBeenCalledTimes(2);
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledOnce();
+    expect(f.runtime.refreshReviewWorkspace).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: worker.id }), {
+      headSha: f.change.headSha, baseSha: f.change.baseSha, baseBranch: f.change.baseBranch,
+    }, expect.any(AbortSignal));
   });
 
   it.each(["issue", "review"] as const)("uses the %s model defaults and current settings on resume", async kind => {
@@ -348,7 +482,7 @@ describe("Forge issue and review workflows", () => {
     );
     expect(f.provider.merge).not.toHaveBeenCalled();
   });
-  it("retains editable review drafts after immediately removing the review tab and checkout", async () => {
+  it("retains editable review drafts and the checkout after removing the review tab", async () => {
     const f = fixture();
     const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     f.reports.read.mockResolvedValue({
@@ -360,14 +494,14 @@ describe("Forge issue and review workflows", () => {
     });
     await f.service.poll();
     expect(f.runtime.close).toHaveBeenCalledWith("tab-1");
-    expect(f.runtime.cleanup).toHaveBeenCalled();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
     expect(f.provider.postReview).not.toHaveBeenCalled();
-    await f.service.saveReview(worker.id, {
+    await f.service.saveReview(worker.id, f.stored().find(saved => saved.id === worker.id)!.draft!.id, {
       body: "Edited",
       event: "comment",
       comments: [{ body: "Edited comment" }],
     });
-    await f.service.submitReview(worker.id);
+    await f.service.submitReview(worker.id, f.stored().find(saved => saved.id === worker.id)!.draft!.id);
     expect(f.provider.postReview).toHaveBeenCalledWith(
       7,
       expect.objectContaining({
@@ -401,7 +535,7 @@ describe("Forge issue and review workflows", () => {
     });
     await f.service.poll();
     f.change.headSha = "c".repeat(40);
-    await expect(f.service.submitReview(worker.id)).rejects.toThrow(
+    await expect(f.service.submitReview(worker.id, f.stored().find(saved => saved.id === worker.id)!.draft!.id)).rejects.toThrow(
       /head changed/i,
     );
     expect(f.provider.postReview).not.toHaveBeenCalled();
@@ -429,7 +563,7 @@ describe("Forge issue and review workflows", () => {
   it("does not treat cleanup failure as successful completion", async () => {
     const f = fixture();
     await f.service.startReview(f.deps.settings().repository, 7, false, placement);
-    f.runtime.cleanup.mockRejectedValue(new Error("Owned checkout changed"));
+    f.runtime.close.mockRejectedValue(new Error("Owned checkout changed"));
     f.reports.read.mockResolvedValue({
       kind: "review",
       headSha: f.change.headSha,
@@ -445,7 +579,7 @@ describe("Forge issue and review workflows", () => {
 });
 
 describe("Forge interruption and stale completion boundaries", () => {
-  it("rejects review reports from another commit and immediately cleans the review checkout", async () => {
+  it("rejects review reports from another commit while preserving its context for recovery", async () => {
     const f = fixture();
     await f.service.startReview(f.deps.settings().repository, 7, true, placement);
     f.reports.read.mockResolvedValue({
@@ -457,18 +591,20 @@ describe("Forge interruption and stale completion boundaries", () => {
     });
     await f.service.poll();
     expect(f.provider.postReview).not.toHaveBeenCalled();
-    expect(f.runtime.cleanup).toHaveBeenCalled();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
     expect((await f.service.dashboard()).workers[0]?.status).toBe("failed");
   });
-  it("rebuilds a paused review checkout at the current request head", async () => {
+  it("refreshes a paused review checkout at the current request head", async () => {
     const f = fixture();
     const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     await f.service.pause(worker.id);
     f.change.headSha = "e".repeat(40);
     await f.service.resume(worker.id, placement);
-    expect(f.runtime.cleanup).toHaveBeenCalled();
-    expect(f.runtime.prepareWorkspace).toHaveBeenLastCalledWith(
-      expect.objectContaining({ headSha: f.change.headSha, review: true }),
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledOnce();
+    expect(f.runtime.refreshReviewWorkspace).toHaveBeenLastCalledWith(
+      expect.objectContaining({ id: worker.id }),
+      expect.objectContaining({ headSha: f.change.headSha, baseSha: f.change.baseSha }),
       expect.any(AbortSignal),
     );
   });
@@ -506,10 +642,13 @@ describe("Forge interruption and stale completion boundaries", () => {
     f.provider.postReview.mockRejectedValue(
       new Error("Provider response lost"),
     );
-    await expect(f.service.submitReview(worker.id)).rejects.toThrow(/lost/);
-    await expect(f.service.submitReview(worker.id)).rejects.toThrow(
+    await expect(f.service.submitReview(worker.id, f.stored().find(saved => saved.id === worker.id)!.draft!.id)).rejects.toThrow(/lost/);
+    await expect(f.service.submitReview(worker.id, f.stored().find(saved => saved.id === worker.id)!.draft!.id)).rejects.toThrow(
       /reconciled/,
     );
+    await expect(f.service.startReview(f.deps.settings().repository, 7, false, placement)).rejects.toThrow(/reconciled/);
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+    expect(f.stored()[0].reviewHistory).toBeUndefined();
     expect(f.provider.postReview).toHaveBeenCalledTimes(1);
     expect((await f.service.dashboard()).workers[0]?.draft?.status).toBe(
       "post_failed",
@@ -528,21 +667,21 @@ describe("Forge interruption and stale completion boundaries", () => {
       dashboard.workers.every((worker) => worker.status === "paused"),
     ).toBe(true);
     expect(f.runtime.launch).not.toHaveBeenCalled();
-    expect(f.runtime.cleanup).toHaveBeenCalledTimes(1);
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
     expect(
       dashboard.workers.find((w) => w.kind === "issue")?.worktreePath,
     ).toBe("/repo/work");
     expect(
       dashboard.workers.find((w) => w.kind === "review")?.worktreePath,
-    ).toBeUndefined();
+    ).toBe("/repo/work");
   });
-  it("stops active agents on shutdown while retaining unmerged issue work", async () => {
+  it("stops active agents on shutdown while retaining issue and review context", async () => {
     const f = fixture();
     await f.service.startIssue(f.deps.settings().repository, 1, placement);
     await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     await f.service.dispose();
     expect(f.runtime.close).toHaveBeenCalledTimes(2);
-    expect(f.runtime.cleanup).toHaveBeenCalledTimes(1);
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
     expect(f.stored().every((worker) => worker.status === "paused")).toBe(true);
   });
 });
@@ -829,7 +968,7 @@ describe("Forge publication and feedback reconciliation", () => {
   it("preserves review-and-post intent after explicit cleanup recovery", async () => {
     const f = fixture();
     const worker = await f.service.startReview(f.deps.settings().repository, 7, true, placement);
-    f.runtime.cleanup.mockRejectedValue(new Error("Cleanup unavailable"));
+    f.runtime.close.mockRejectedValue(new Error("Cleanup unavailable"));
     f.reports.read.mockResolvedValue({
       kind: "review",
       headSha: f.change.headSha,
@@ -838,7 +977,7 @@ describe("Forge publication and feedback reconciliation", () => {
       comments: [],
     });
     await f.service.poll();
-    f.runtime.cleanup.mockResolvedValue();
+    f.runtime.close.mockResolvedValue();
     await f.service.resume(worker.id, placement);
     expect(f.provider.postReview).toHaveBeenCalledTimes(1);
   });
@@ -923,17 +1062,17 @@ describe("Forge ownership recovery", () => {
     expect(f.provider.merge).not.toHaveBeenCalled();
   });
 
-  it.each([false, true])("finishes recovered review cleanup without relaunching (automatic posting: %s)", async (autoPost) => {
+  it.each([false, true])("finishes recovered review shutdown without relaunching (automatic posting: %s)", async (autoPost) => {
     const f = fixture();
     const worker = await f.service.startReview(f.deps.settings().repository, 7, autoPost, placement);
-    f.runtime.cleanup.mockRejectedValue(new Error("Owned checkout changed"));
+    f.runtime.close.mockRejectedValue(new Error("Owned checkout changed"));
     f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "comment", body: "Review", comments: [] });
     await f.service.poll();
     expect((await f.service.dashboard()).workers[0]?.status).toBe("cleanup_failed");
 
-    f.runtime.cleanup.mockResolvedValue(undefined);
+    f.runtime.close.mockResolvedValue(undefined);
     const completed = await f.service.resume(worker.id, placement);
-    expect(completed).toMatchObject({ status: "completed", worktreePath: undefined, draft: { status: autoPost ? "posted" : "draft" } });
+    expect(completed).toMatchObject({ status: "completed", worktreePath: "/repo/work", draft: { status: autoPost ? "posted" : "draft" } });
     expect(f.runtime.launch).toHaveBeenCalledTimes(1);
     expect(f.runtime.prepareWorkspace).toHaveBeenCalledTimes(1);
     expect(f.provider.postReview).toHaveBeenCalledTimes(autoPost ? 1 : 0);
@@ -1270,7 +1409,7 @@ describe("Forge merged request cleanup", () => {
     await f.service.poll();
     f.change.state = state;
     f.change.merged = state === "merged";
-    await expect(f.service.submitReview(worker.id)).rejects.toThrow("Only open change requests");
+    await expect(f.service.submitReview(worker.id, f.stored().find(saved => saved.id === worker.id)!.draft!.id)).rejects.toThrow("Only open change requests");
     await expect(f.service.markReview(f.deps.settings().repository, 7, f.change.headSha, "approve", "Reviewed")).rejects.toThrow("Only open change requests");
     expect(f.provider.postReview).not.toHaveBeenCalled();
   });
@@ -1586,11 +1725,11 @@ describe("Forge publication confirmation", () => {
     await expect(f.service.startReview(f.deps.settings().repository, 7, false, placement)).rejects.toThrow(/publication/);
     await expect(f.service.resume(review.id, placement)).rejects.toThrow(/publication/);
     const saved = f.stored();
-    saved[1].draft = { headSha: f.previousHead, body: "Review", comments: [], event: "comment", status: "draft" };
+    saved[1].draft = { id: review.id, startedAt: review.startedAt, headSha: f.previousHead, body: "Review", comments: [], event: "comment", status: "draft" };
     await f.deps.store.write(saved);
     const restarted = new ForgeWorkflowService(f.deps);
     await expect(restarted.markReview(f.deps.settings().repository, 7, f.change.headSha, "approve", "Approved")).rejects.toThrow(/publication/);
-    await expect(restarted.submitReview(review.id)).rejects.toThrow(/publication/);
+    await expect(restarted.submitReview(review.id, saved[1].draft!.id)).rejects.toThrow(/publication/);
     expect(f.provider.postReview).not.toHaveBeenCalled();
     expect(f.runtime.launch).toHaveBeenCalledTimes(3);
   });
@@ -1666,7 +1805,8 @@ describe("Forge issue auto review", () => {
     f.codingReport({ discussionReplies: [{ discussionId: "review-1-thread-0", body: "Added and tested null handling." }], resolvedDiscussionIds: ["review-1-thread-0"] });
     await f.poll();
     const second = f.currentReview();
-    expect(second.id).not.toBe(first.id);
+    expect(second.id).toBe(first.id);
+    expect(second.reviewHistory).toHaveLength(1);
     expect(second.headSha).toBe(f.change.headSha);
     f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Null input now handled", comments: [] });
     await f.poll();
@@ -1739,7 +1879,8 @@ describe("Forge issue auto review", () => {
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
     expect(f.provider.merge).not.toHaveBeenCalled();
     await f.poll();
-    expect(f.currentReview().id).not.toBe(firstReview.id);
+    expect(f.currentReview().id).toBe(firstReview.id);
+    expect(f.currentReview().reviewHistory).toHaveLength(1);
     expect(f.currentReview().headSha).toBe(updatedHead);
     f.change.mergeable = true;
     f.report({ kind: "review", headSha: updatedHead, event: "approve", body: "Updated branch is sound", comments: [] });
@@ -1877,7 +2018,8 @@ describe("Forge issue auto review", () => {
     f.change.comments.push({ id: "new-feedback", author: "human", body: "Also cover negative inputs." });
     f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
     await f.poll();
-    expect(f.currentReview().id).not.toBe(first.id);
+    expect(f.currentReview().id).toBe(first.id);
+    expect(f.currentReview().reviewHistory).toHaveLength(1);
     expect(f.provider.postReview).not.toHaveBeenCalled();
     expect(f.provider.merge).not.toHaveBeenCalled();
     expect(f.runtime.launch).toHaveBeenCalledTimes(3);
@@ -1894,7 +2036,8 @@ describe("Forge issue auto review", () => {
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
     f.change.comments.push({ id: "clarification", body: "Yes; the existing rejection is correct.", author: "human" });
     await f.service.resume(f.issue.id, placement);
-    expect(f.currentReview().id).not.toBe(first.id);
+    expect(f.currentReview().id).toBe(first.id);
+    expect(f.currentReview().reviewHistory).toHaveLength(1);
     f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Behavior matches the clarified requirement.", comments: [] });
     await f.poll();
     expect(f.provider.merge).toHaveBeenCalledOnce();

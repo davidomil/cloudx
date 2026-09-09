@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
 
-import { pluginActionHookId } from "@cloudx/plugin-api";
+import { PluginSessionOwnershipError, pluginActionHookId } from "@cloudx/plugin-api";
 import type { CloudxAppContext, HookCaller, PluginActionDefinition, PluginSession, PluginSessionLaunchOptions, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
 import type { ConfigValue } from "@cloudx/shared";
 import type { HookId, PluginId, PluginMetadata, PluginMetadataMap, TabIndicator, TabIndicatorUpdate, VoiceAction, WorkspaceRuntimeContext, WorkspaceSnapshot, WorkspaceTab, WorkspaceTabsUpdate, WorkspaceWindow } from "@cloudx/shared";
@@ -116,7 +116,7 @@ export class SessionStore {
       tab.contextPath = await this.contextService.create(tab, { ownedDirectory: Boolean(ownerPluginId) });
       this.tabs.set(id, tab);
       if (ownerPluginId) this.workspace?.registerEmbeddedTab(id);
-      if (launchOptions) this.launchOptions.set(id, { authorizeProjectTrust: launchOptions.authorizeProjectTrust });
+      if (launchOptions) this.launchOptions.set(id, { authorizeProjectTrust: launchOptions.authorizeProjectTrust, prepareCodexSession: launchOptions.prepareCodexSession });
       this.unpublishedTabIds.add(id);
       const session = await plugin.createSession({
         tab,
@@ -126,11 +126,17 @@ export class SessionStore {
         controls: this.createControls(id),
         initialInput: request.initialInput,
         authorizeProjectTrust: this.launchOptions.get(id)?.authorizeProjectTrust,
+        prepareCodexSession: this.launchOptions.get(id)?.prepareCodexSession,
         config: this.configProvider.getPluginConfig(plugin.id),
         getConfig: () => this.configProvider.getPluginConfig(plugin.id)
       });
       this.bindSession(id, session, templateIndicator);
     } catch (error) {
+      if (error instanceof PluginSessionOwnershipError && this.tabs.has(id)) {
+        this.preparedTabFailures.set(id, error);
+        this.updateTab(id, { status: "failed", statusMessage: error.message });
+        throw error;
+      }
       try {
         await this.discardPreparedTab(id);
       } catch (cleanupError) {
@@ -179,6 +185,7 @@ export class SessionStore {
   }
 
   async discardPreparedTab(tabId: string): Promise<void> {
+    this.assertSessionOwnershipResolved(tabId);
     const tab = this.tabs.get(tabId);
     if (!tab) {
       return;
@@ -467,6 +474,7 @@ export class SessionStore {
   }
 
   closeTab(tabId: string, options: { stopSession?: boolean } = {}): void {
+    this.assertSessionOwnershipResolved(tabId);
     const wasPublished = !this.unpublishedTabIds.delete(tabId);
     this.preparedTabFailures.delete(tabId);
     const session = this.sessions.get(tabId);
@@ -502,6 +510,11 @@ export class SessionStore {
     this.shutdownController.abort(new Error("Session store is disposed."));
     this.disposePromise = this.finishDisposal();
     return this.disposePromise;
+  }
+
+  private assertSessionOwnershipResolved(tabId: string): void {
+    const failure = this.preparedTabFailures.get(tabId);
+    if (failure instanceof PluginSessionOwnershipError) throw failure;
   }
 
   private stopSessions(): unknown[] {
@@ -550,6 +563,7 @@ export class SessionStore {
   }
 
   async restartTab(tabId: string, reason = "Restarting tab."): Promise<WorkspaceTab> {
+    this.assertSessionOwnershipResolved(tabId);
     const current = this.getTab(tabId);
     const plugin = this.plugins.get(current.pluginId);
     const oldSession = this.sessions.get(tabId);
@@ -572,6 +586,7 @@ export class SessionStore {
         tab,
         cwd: tab.cwd,
         authorizeProjectTrust: this.launchOptions.get(tabId)?.authorizeProjectTrust,
+        prepareCodexSession: this.launchOptions.get(tabId)?.prepareCodexSession,
         runtimeContext,
         app: this.createAppContext(plugin.id, tabId),
         controls: this.createControls(tabId),

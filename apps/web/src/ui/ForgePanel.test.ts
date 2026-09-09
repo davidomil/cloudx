@@ -41,7 +41,7 @@ const repository = { provider: "github" as const, apiUrl: "https://api.github.co
 const issue: ForgeIssueDetail = { number: 7, title: "Fix deployment", body: "The deployment fails.", url: "https://github.com/cloudx/example/issues/7", state: "open", author: "ari", labels: ["bug"], updatedAt: "2026-09-07", comments: [{ id: "note-1", author: "nia", body: "Reproduced in staging." }] };
 const change: ForgeChangeRequest = { ...issue, number: 12, title: "Repair deployment", url: "https://github.com/cloudx/example/pull/12", draft: false, headSha: "a".repeat(40), headBranch: "fix/deploy", baseBranch: "main", merged: false, mergeable: true, requiresBaseUpdate: false, reviewReady: true, approved: false, unresolvedDiscussions: 1, baseSha: "b".repeat(40), linkedIssues: [], comments: [{ id: "note-2", author: "nia", body: "Needs a timeout.", path: "deploy.ts", line: 8, resolved: false }] };
 const worker: ForgeWorker = { id: "work-1", kind: "issue", number: 7, title: issue.title, repository, repositoryPath: "/repo", baseBranch: "main", templateId: "worker-template", status: "running", tabId: "codex-worker", autoPost: false, startedAt: "2026-09-07", updatedAt: "2026-09-07" };
-const reviewWorker: ForgeWorker = { ...worker, id: "review-1", kind: "review", number: 12, title: change.title, status: "completed", draft: { headSha: change.headSha, body: "Add a timeout.", event: "request_changes", comments: [{ path: "deploy.ts", line: 8, side: "RIGHT", body: "This can wait forever." }], status: "draft" } };
+const reviewWorker: ForgeWorker = { ...worker, id: "review-1", kind: "review", number: 12, title: change.title, status: "completed", draft: { id: "33333333-3333-4333-8333-333333333333", startedAt: "2026-09-07T00:00:00.000Z", headSha: change.headSha, body: "Add a timeout.", event: "request_changes", comments: [{ path: "deploy.ts", line: 8, side: "RIGHT", body: "This can wait forever." }], status: "draft" } };
 const publishingWorker: ForgeWorker = {
   ...worker, status: "awaiting_publication", changeNumber: change.number, headSha: "a".repeat(40),
   pendingPublication: {
@@ -654,8 +654,8 @@ describe("ForgePanel", () => {
 
   it.each(["github", "gitlab"] as const)("shows %s review workers collapsed and newest first by start time", async provider => {
     const currentRepository = { ...repository, provider };
-    const oldest = { ...reviewWorker, repository: currentRepository, id: "oldest", startedAt: "2026-09-07T10:00:00Z", updatedAt: "2026-09-07T14:00:00Z", draft: { ...reviewWorker.draft!, status: "posted" as const } };
-    const failed = { ...reviewWorker, repository: currentRepository, id: "failed", startedAt: "2026-09-07T11:00:00Z", status: "failed" as const, error: "Review publication failed.", draft: { ...reviewWorker.draft!, status: "post_failed" as const } };
+    const oldest = { ...reviewWorker, repository: currentRepository, id: "oldest", startedAt: "2026-09-07T10:00:00Z", updatedAt: "2026-09-07T14:00:00Z", draft: { ...reviewWorker.draft!, startedAt: "2026-09-07T10:00:00Z", status: "posted" as const } };
+    const failed = { ...reviewWorker, repository: currentRepository, id: "failed", startedAt: "2026-09-07T11:00:00Z", status: "failed" as const, error: "Review publication failed.", draft: { ...reviewWorker.draft!, startedAt: "2026-09-07T11:00:00Z", status: "post_failed" as const } };
     const newest = { ...reviewWorker, repository: currentRepository, id: "newest", startedAt: "2026-09-07T12:00:00Z", status: "running" as const, draft: undefined };
     const coding = { ...worker, repository: currentRepository, changeNumber: change.number };
     const workers = [failed, oldest, coding, newest, { ...newest, id: "unrelated", number: 13 }];
@@ -677,10 +677,64 @@ describe("ForgePanel", () => {
     expect(panel.querySelector("dialog")).toBeNull();
   });
 
+  it.each(["github", "gitlab"] as const)("shows a reused %s reviewer's current work and archived messages as collapsed newest-first rounds", async provider => {
+    const currentRepository = { ...repository, provider };
+    const previous = { ...reviewWorker.draft!, id: "44444444-4444-4444-8444-444444444444", startedAt: "2026-09-07T11:00:00.000Z", body: "Saved previous draft." };
+    const oldest = { ...reviewWorker.draft!, id: "55555555-5555-4555-8555-555555555555", startedAt: "2026-09-07T10:00:00.000Z", body: "Posted older review.", status: "posted" as const };
+    const current = { ...reviewWorker, repository: currentRepository, status: "running" as const, startedAt: "2026-09-07T12:00:00.000Z", draft: undefined, reviewHistory: [oldest, previous] };
+    const testFixture = fixture({ repository: currentRepository, workers: [current] });
+    const panel = await renderPanel(testFixture);
+    await click(panel, provider === "github" ? "Pull requests" : "Merge requests");
+    const histories = Array.from(panel.querySelectorAll<HTMLDetailsElement>(".forge-worker-history"));
+    expect(histories.map(history => history.querySelector("summary time")?.getAttribute("datetime"))).toEqual([current.startedAt, previous.startedAt, oldest.startedAt]);
+    expect(histories.every(history => !history.open)).toBe(true);
+    expect(histories[0].querySelector("summary")?.textContent).toContain("running");
+    expect(Array.from(panel.querySelectorAll(".forge-worker button"), button => button.textContent?.trim()).filter(text => text === "Pause")).toHaveLength(1);
+    for (const [index, draft] of [previous, oldest].entries()) {
+      const history = histories[index + 1];
+      expect(history.querySelector<HTMLFieldSetElement>("fieldset")?.disabled).toBe(true);
+      expect(history.querySelector<HTMLTextAreaElement>("textarea")?.value).toBe(draft.body);
+      expect(history.querySelectorAll("textarea")).toHaveLength(2);
+      expect(history.querySelector(".forge-worker-heading .forge-status")).toBeNull();
+      expect(history.querySelector(".forge-worker > .forge-actions")).toBeNull();
+    }
+    expect(panel.querySelector(".forge-item")?.textContent).not.toContain("review draft");
+    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
+  });
+
+  it("preserves open unsaved messages as readonly history when polling replaces the same worker's draft on the same SHA", async () => {
+    vi.useFakeTimers();
+    let testFixture: ReturnType<typeof fixture>;
+    testFixture = fixture({ workers: [reviewWorker] }, hook => hook === "forge.dashboard" ? structuredClone(testFixture.dashboard) : undefined);
+    const panel = await renderPanel(testFixture);
+    await click(panel, "Pull requests");
+    const history = panel.querySelector<HTMLDetailsElement>(".forge-worker-history")!;
+    await act(async () => { history.querySelector("summary")!.click(); });
+    const summary = history.querySelector<HTMLTextAreaElement>(".forge-review textarea")!;
+    await fill(summary, "Keep my unsaved previous summary.");
+    await fill(history.querySelectorAll<HTMLTextAreaElement>(".forge-review textarea")[1], "Keep my unsaved previous finding.");
+    const nextDraft = { ...reviewWorker.draft!, id: "44444444-4444-4444-8444-444444444444", startedAt: "2026-09-07T12:00:00.000Z", body: "Fresh review of the same SHA." };
+    testFixture.dashboard.workers = [{ ...reviewWorker, startedAt: nextDraft.startedAt, draft: nextDraft, reviewHistory: [reviewWorker.draft!] }];
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+
+    const histories = Array.from(panel.querySelectorAll<HTMLDetailsElement>(".forge-worker-history"));
+    expect(histories).toHaveLength(2);
+    expect(histories[0].open).toBe(false);
+    expect(histories[1]).toBe(history);
+    expect(history.open).toBe(true);
+    expect(history.querySelector(".forge-review textarea")).toBe(summary);
+    expect(Array.from(history.querySelectorAll<HTMLTextAreaElement>(".forge-review textarea"), input => input.value)).toEqual(["Keep my unsaved previous summary.", "Keep my unsaved previous finding."]);
+    expect(history.querySelector<HTMLFieldSetElement>("fieldset")?.disabled).toBe(true);
+    expect(histories[0].querySelector<HTMLTextAreaElement>(".forge-review textarea")?.value).toBe(nextDraft.body);
+    expect(histories[0].querySelector<HTMLFieldSetElement>("fieldset")?.disabled).toBe(false);
+    expect(panel.querySelector("dialog")).toBeNull();
+    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
+  });
+
   it("preserves expanded reviews and all unsaved messages when polling adds a newer worker", async () => {
     vi.useFakeTimers();
-    const oldest = { ...reviewWorker, id: "oldest", startedAt: "2026-09-07T10:00:00Z", draft: { ...reviewWorker.draft!, status: "posted" as const } };
-    const current = { ...reviewWorker, startedAt: "2026-09-07T11:00:00Z" };
+    const oldest = { ...reviewWorker, id: "oldest", startedAt: "2026-09-07T10:00:00Z", draft: { ...reviewWorker.draft!, startedAt: "2026-09-07T10:00:00Z", status: "posted" as const } };
+    const current = { ...reviewWorker, startedAt: "2026-09-07T11:00:00Z", draft: { ...reviewWorker.draft!, startedAt: "2026-09-07T11:00:00Z" } };
     let testFixture: ReturnType<typeof fixture>;
     testFixture = fixture({ workers: [oldest, current] }, hook => hook === "forge.dashboard" ? structuredClone(testFixture.dashboard) : undefined);
     const panel = await renderPanel(testFixture);
@@ -871,7 +925,8 @@ describe("ForgePanel", () => {
     await click(editor, "Submit review");
     const publication = testFixture.calls.filter((call) => call.hook === "forge.review.save" || call.hook === "forge.review.submit");
     expect(publication.map((call) => call.hook)).toEqual(["forge.review.save", "forge.review.save", "forge.review.submit"]);
-    expect(publication[1].input).toEqual({ id: "review-1", event: "request_changes", body: "Use a bounded timeout.", comments: [{ path: "deploy.ts", line: 11, side: "LEFT", body: "Cancel after 30 seconds." }] });
+    expect(publication[1].input).toEqual({ id: "review-1", draftId: reviewWorker.draft!.id, event: "request_changes", body: "Use a bounded timeout.", comments: [{ path: "deploy.ts", line: 11, side: "LEFT", body: "Cancel after 30 seconds." }] });
+    expect(publication[2].input).toEqual({ id: "review-1", draftId: reviewWorker.draft!.id });
   });
 
   it("keeps edits during worker polling and cleans up the polling timer on unmount", async () => {
@@ -886,6 +941,24 @@ describe("ForgePanel", () => {
     expect(testFixture.calls.filter((call) => call.hook === "forge.dashboard")).toHaveLength(2);
     await act(async () => { roots.pop()!.unmount(); });
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("keeps an in-flight submission bound to the displayed draft when its worker starts a new review", async () => {
+    vi.useFakeTimers();
+    const saved = deferred<unknown>();
+    let testFixture: ReturnType<typeof fixture>;
+    testFixture = fixture({ workers: [reviewWorker] }, hook => hook === "forge.review.save" ? saved.promise : hook === "forge.dashboard" ? structuredClone(testFixture.dashboard) : undefined);
+    const panel = await renderPanel(testFixture);
+    await click(panel, "Pull requests");
+    await click(panel, "Submit review");
+    const nextDraft = { ...reviewWorker.draft!, id: "44444444-4444-4444-8444-444444444444", startedAt: "2026-09-07T12:00:00.000Z", body: "New review." };
+    testFixture.dashboard.workers = [{ ...reviewWorker, draft: nextDraft, reviewHistory: [reviewWorker.draft!] }];
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    await act(async () => { saved.resolve({ worker: reviewWorker }); });
+
+    const mutations = testFixture.calls.filter(call => call.hook === "forge.review.save" || call.hook === "forge.review.submit");
+    expect(mutations.map(call => call.input?.draftId)).toEqual([reviewWorker.draft!.id, reviewWorker.draft!.id]);
+    expect(panel.querySelector<HTMLTextAreaElement>(".forge-review textarea")?.value).toBe(nextDraft.body);
   });
 
   it.each(["posting", "posted", "post_failed"] as const)("keeps %s reviews read-only", async (status) => {
@@ -1031,7 +1104,7 @@ describe("ForgePanel", () => {
     expect(button(panel, "Save draft").disabled).toBe(false);
     await click(panel, "Save draft");
     expect(testFixture.calls.filter(call => call.hook === "forge.review.save").map(call => call.input)).toEqual([
-      { id: reviewer.id, body: "Keep my draft.", event: reviewer.draft!.event, comments: reviewer.draft!.comments }
+      { id: reviewer.id, draftId: reviewer.draft!.id, body: "Keep my draft.", event: reviewer.draft!.event, comments: reviewer.draft!.comments }
     ]);
     const refreshedRow = panel.querySelectorAll<HTMLButtonElement>(".forge-item")[1];
     expect(panel.querySelector("dialog")).toBeNull();
@@ -1192,13 +1265,14 @@ describe("ForgePanel", () => {
     expect(panel.querySelector("dialog")).toBeNull();
   });
 
-  it("keeps an unfinished review's cleanup failure visible even when its draft publication also failed", async () => {
+  it("keeps Resume and the cleanup failure visible when review publication also failed", async () => {
     const panel = await renderPanel(fixture({ workers: [{ ...reviewWorker, status: "cleanup_failed", error: "Owned worktree cleanup failed.", draft: { ...reviewWorker.draft!, status: "post_failed" } }] }));
     await click(panel, "Pull requests");
     const row = panel.querySelector(".forge-item")!;
     expect(row.querySelector(".forge-item-worker .forge-status")?.textContent).toBe("Review · cleanup failed");
     expect(row.querySelector(".forge-item-worker-error")?.textContent).toBe("Owned worktree cleanup failed.");
-    expect(button(panel.querySelector(".forge-detail")!, "Clean up").disabled).toBe(false);
+    expect(button(panel.querySelector(".forge-detail")!, "Resume").disabled).toBe(false);
+    expect(panel.textContent).toContain("Inspect the PR/MR for published comments");
   });
 
   it.each(["issues", "changes"] as const)("updates %s worker failures and removal through polling without changing selection or opening terminals", async kind => {
@@ -1263,7 +1337,7 @@ describe("ForgePanel", () => {
     { status: "awaiting_review" as const, kind: "issue" as const, action: "Resume", hook: "forge.worker.resume" },
     { status: "running" as const, kind: "review" as const, action: "Stop", hook: "forge.worker.stop" },
     { status: "cleanup_failed" as const, kind: "issue" as const, action: "Resume", hook: "forge.worker.resume" },
-    { status: "cleanup_failed" as const, kind: "review" as const, action: "Clean up", hook: "forge.worker.resume" }
+    { status: "cleanup_failed" as const, kind: "review" as const, action: "Resume", hook: "forge.worker.resume" }
   ])("$action dispatches the $kind worker's $status lifecycle command", async ({ status, kind, action, hook }) => {
     const testFixture = fixture({ workers: [{ ...worker, kind, status }] });
     const panel = await renderPanel(testFixture);

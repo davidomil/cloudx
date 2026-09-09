@@ -90,25 +90,48 @@ published head block cleanup and preserve the resources.
 
 ## Auto review
 
-Enable **Auto review** beside **Start work** to run the issue through implementation, review and correction until approval. The coding worker keeps its checkout, and each revision gets a fresh reviewer. Forge merges the approved revision after the repository checks pass and removes the associated workers once the linked issues are closed.
+Enable **Auto review** beside **Start work** to run the issue through
+implementation, review and correction until approval. The coding worker
+keeps its checkout, and each request reuses one reviewer conversation
+across revisions. Forge merges the approved revision after the
+repository checks pass and removes the associated workers once the
+linked issues are closed.
 
-A reviewer that finds no issues explicitly approves. Actionable findings request changes and send the issue back to coding. A review that needs human clarification pauses the loop.
+A reviewer that finds no issues explicitly approves. Actionable findings
+request changes and send the issue back to coding. A review that needs
+human clarification pauses the loop.
 
-**Pause** and **Stop** control both the issue worker and its current reviewer. Turning Auto review off prevents further automatic handoffs. After a server restart, use **Resume** to continue. Pending merge checks do not start another coding or review run; uncertain submissions require inspection before continuing.
+**Pause** and **Stop** control both the issue worker and its current
+reviewer. Turning Auto review off prevents further automatic handoffs.
+After a server restart, use **Resume** to continue. Pending merge checks
+do not start another coding or review run; uncertain submissions require
+inspection before continuing.
 
 ## Review PRs and MRs
 
-Select a request and click **Review** to retain a draft, or **Review and post** to publish automatically. The temporary worker terminal and checkout are removed when the review finishes.
+Select a request and click **Review** to retain a draft, or **Review and
+post** to publish automatically. Each request keeps one reviewer,
+checkout and Codex conversation. A finished review closes its terminal;
+the next review opens a new terminal that resumes the same conversation.
 
-Reviewers fetch the selected request’s exact head and pinned base commit into their own checkout and inspect the complete local Git comparison.
+Reviewers fetch the selected request’s exact head and pinned base commit
+into their retained checkout and inspect the complete local Git
+comparison. Each round receives the latest task and feedback, reassesses
+the comparison, and checks whether previous findings were addressed.
 
-Opening a request does not download a provider diff, so large requests remain accessible.
+Opening a request does not download a provider diff, so large requests
+remain accessible.
+
+Reviews appear newest first and collapsed by default. Earlier rounds
+keep their saved summaries and comments as read-only history. Only the
+current draft can be edited or submitted; an action targeting an older
+round is rejected even when both rounds reviewed the same commit.
 
 The request badge shows suggested comments. Open the request, edit the
-review summary, outcome and comments, then **Save draft** or **Submit
-review**. Inline comments also expose file, line and diff side. **Mark
-as approved** and **Mark as request changes** submit directly through
-the reviewer identity.
+current review summary, outcome and comments, then **Save draft** or
+**Submit review**. Inline comments also expose file, line and diff side.
+**Mark as approved** and **Mark as request changes** submit directly
+through the reviewer identity.
 
 ## Recovery and limits
 
@@ -118,7 +141,7 @@ the reviewer identity.
 | awaiting_merge | Wait for the repository checks, or Pause / Stop the loop. |
 | paused / stopped | Resume when ready to continue. |
 | failed | Inspect the error and retained work before resuming. |
-| cleanup_failed | Resolve the ownership or process error, then Resume the issue or Clean up the review. |
+| cleanup_failed | Resolve the ownership or process error, then Resume. |
 | post_failed | Inspect the provider; the saved submission cannot be posted again. |
 
 Paused and failed states require explicit action.
@@ -129,10 +152,23 @@ preserves its resources and reports `cleanup_failed`. Inspect the
 process and ownership state; automatic cleanup is unavailable until
 those checks can succeed.
 
-Once ownership and process checks succeed, an unfinished issue can
-resume in its preserved checkout with fresh context. Merged issues and
-review workers only finish cleanup; they do not launch another terminal.
-Failed checks continue to preserve resources.
+Once ownership and process checks succeed, unfinished work can resume in
+its preserved checkout. Reviewers also resume their exact Codex
+conversation. If a completed review was saved before shutdown failed,
+Resume finishes that result without another review run. Merged requests
+only finish cleanup once their linked issues are closed. Failed checks
+continue to preserve resources.
+
+The reviewer is bound to one Codex thread and its original session
+store. Missing context, a changed store or unresolved conversation
+initialization stops the launch for inspection. Forge does not select
+the latest conversation or silently create replacement context.
+
+Completed reviews remove their temporary terminals, reports and
+generated launch files. Forge retains the original session-directory
+links so native Codex history paths remain valid; later launch
+directories are removed. The retained links contain no generated
+instructions or credentials.
 
 Worker logs can rotate without invalidating ownership during pause and
 restart. Recovery verifies the private context directory before removing
@@ -149,9 +185,24 @@ manifests from that implementation are not migrated; invalid records
 preserve the resources for inspection. Earlier flat worker context
 records are also not converted into directory ownership.
 
+Saved reviews now require a round ID and start time, with up to 1,000
+earlier rounds per reviewer. Earlier review records and reviewer
+ownership manifests are not migrated. Start with fresh Forge worker
+state when upgrading from the previous format.
+
 ## Verification
 
-The automatic review change passed 867 Forge tests, including 14 real Git/PTY
+The reviewer context lifecycle tests use real Git checkouts and
+supervised terminal processes with a deterministic Codex protocol
+fixture. They verify prior messages, refreshed head and base commits,
+separate request conversations, restart, and immediate and final
+cleanup.
+
+``` sh
+npx vitest run apps/server/src/forge/ForgeLifecycle.integration.test.ts
+```
+
+The earlier automatic review change passed 867 Forge tests, including 14 real Git/PTY
 lifecycle tests, plus workspace typecheck, web build and desktop/mobile UI
 checks. The approval-first loop used two worker terminals and one push;
 the findings loop used four terminals and two pushes.

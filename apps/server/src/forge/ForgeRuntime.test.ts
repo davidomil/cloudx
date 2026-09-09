@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { statSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -9,6 +10,8 @@ import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
 import type { WorkspaceTab } from "@cloudx/shared";
 
 import { PathPolicy } from "../pathPolicy.js";
+import { AppServerOwnershipError } from "../appServer/OwnedAppServerTransport.js";
+import type { ReviewConversationBinding } from "./ForgeReviewConversation.js";
 import {
   ForgeRuntime,
   assertForgeOrigin,
@@ -134,6 +137,53 @@ async function createWorkerContext(deps: ForgeRuntimeDependencies, tab: Workspac
   return directory;
 }
 
+function conversationBinding(tabId = "review-tab-1"): ReviewConversationBinding {
+  const home = path.join(root, "shared-codex");
+  const stat = statSync(home, { bigint: true });
+  const view = path.join(root, "data", "codex-launches", tabId);
+  const viewStat = statSync(view, { bigint: true });
+  return {
+    source: { sourceId: "shared", home, dev: stat.dev.toString(), ino: stat.ino.toString() },
+    sqliteHome: { path: home, dev: stat.dev.toString(), ino: stat.ino.toString() },
+    originView: { path: view, dev: viewStat.dev.toString(), ino: viewStat.ino.toString() },
+    threadId: "01a08470-d118-7b72-b1df-439e72e5c744", creating: false,
+  };
+}
+
+function installReviewTabs(deps: ForgeRuntimeDependencies, workspace: ForgeWorkspace) {
+  const tabs = new Map<string, WorkspaceTab>();
+  const resumedIds: string[] = [];
+  let lastTab: WorkspaceTab;
+  vi.mocked(deps.sessions.listTabs).mockImplementation(() => [...tabs.values()]);
+  vi.mocked(deps.sessions.getTab).mockImplementation(id => tabs.get(id)!);
+  vi.mocked(deps.sessions.discardPreparedTab).mockImplementation(async id => { tabs.delete(id); });
+  vi.mocked(deps.workspaceCommands.createTab).mockImplementation(async (_request, options) => {
+    const tab = { ...workerTab(workspace), id: `review-tab-${vi.mocked(deps.workspaceCommands.createTab).mock.calls.length}` };
+    lastTab = tab;
+    tabs.set(tab.id, tab);
+    await createWorkerContext(deps, tab);
+    const launch = path.join(deps.dataDir, "codex-launches", tab.id);
+    await fs.mkdir(launch, { recursive: true });
+    const home = path.join(root, "shared-codex");
+    for (const name of ["sessions", "archived_sessions"]) {
+      await fs.mkdir(path.join(home, name), { recursive: true });
+      await fs.symlink(path.join(home, name), path.join(launch, name));
+    }
+    await fs.writeFile(path.join(launch, ".cloudx-source.json"), JSON.stringify({ version: 1, ...conversationBinding(tab.id).source }));
+    await fs.writeFile(path.join(launch, "config.toml"), "Generated worker configuration");
+    await fs.writeFile(path.join(launch, "auth.json"), "Private disposable authentication");
+    try {
+      resumedIds.push(await options!.prepareCodexSession!({ tabId: tab.id, cwd: tab.cwd, command: "/configured/codex", configurationArgs: [], env: {} }));
+      return { tab } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>;
+    } catch (error) {
+      tabs.delete(tab.id);
+      throw error;
+    }
+  });
+  const request = { id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, prompt: "Review the next commit.", windowId: "window", paneId: "pane" };
+  return { request, resumedIds, lastTab: () => lastTab!, launchPath: () => path.join(deps.dataDir, "codex-launches", lastTab.id) };
+}
+
 beforeEach(async () => {
   root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-forge-runtime-"));
   repositoryPath = path.join(root, "repository");
@@ -166,6 +216,134 @@ afterEach(async () => {
 });
 
 describe("ForgeRuntime remote checkouts", () => {
+  it("refreshes the same reviewer checkout to an exact changed head and target", async () => {
+    const deps = dependencies();
+    const runGit = deps.git!;
+    deps.git = vi.fn(runGit);
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare("reused-review", true);
+    const identity = await fs.stat(workspace.worktreePath);
+    await git(repositoryPath, "switch", "-c", "next-review");
+    await fs.writeFile(path.join(repositoryPath, "finding.txt"), "The next review round\n");
+    await git(repositoryPath, "add", "finding.txt");
+    await git(repositoryPath, "commit", "-m", "TEST: update proposed change");
+    const nextHead = await git(repositoryPath, "rev-parse", "HEAD");
+    await git(repositoryPath, "push", "origin", "next-review");
+    await git(repositoryPath, "switch", "main");
+    await fs.writeFile(path.join(repositoryPath, "target.txt"), "The target advanced\n");
+    await git(repositoryPath, "add", "target.txt");
+    await git(repositoryPath, "commit", "-m", "TEST: advance review target");
+    const nextBase = await git(repositoryPath, "rev-parse", "HEAD");
+    await git(repositoryPath, "push", "origin", "main");
+    vi.mocked(deps.gitAccess).mockClear();
+
+    await runtime.refreshReviewWorkspace(workspace, { headSha: nextHead, baseSha: nextBase, baseBranch: "main" });
+
+    expect((await fs.stat(workspace.worktreePath)).ino).toBe(identity.ino);
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(nextHead);
+    expect(await git(workspace.worktreePath, "rev-parse", "--abbrev-ref", "HEAD")).toBe("HEAD");
+    expect(await git(workspace.worktreePath, "rev-parse", "refs/cloudx/review-base")).toBe(nextBase);
+    expect(await git(workspace.worktreePath, "diff", "--name-only", `${nextBase}...${nextHead}`, "--")).toBe("finding.txt");
+    expect(deps.gitAccess).toHaveBeenCalledExactlyOnceWith(expectedRepository, "reviewer", undefined);
+    const reloaded = new ForgeRuntime(deps);
+    await reloaded.refreshReviewWorkspace(workspace, { headSha: nextHead, baseSha: nextBase, baseBranch: "main" });
+    expect(await git(workspace.worktreePath, "status", "--porcelain=v1")).toBe("");
+  });
+
+  it.each(["README.md", "untracked.txt"])("preserves reviewer changes in %s before refreshing", async filename => {
+    const deps = dependencies();
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare("dirty-review", true);
+    await fs.writeFile(path.join(workspace.worktreePath, filename), "Retain this local work\n");
+    vi.mocked(deps.gitAccess).mockClear();
+
+    await expect(runtime.refreshReviewWorkspace(workspace, { headSha, baseSha: headSha, baseBranch: "main" })).rejects.toThrow(/local changes|clean/i);
+
+    expect(await fs.readFile(path.join(workspace.worktreePath, filename), "utf8")).toBe("Retain this local work\n");
+    expect(deps.gitAccess).not.toHaveBeenCalled();
+  });
+
+  it("preserves a reviewer checkout when fetching the next comparison fails", async () => {
+    const deps = dependencies();
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare("failed-refresh", true);
+    const runGit = deps.git!;
+    deps.git = vi.fn(async (cwd, args, signal, env) => {
+      if (args[0] === "fetch") throw new Error("Next review fetch rejected.");
+      return runGit(cwd, args, signal, env);
+    });
+
+    await expect(runtime.refreshReviewWorkspace(workspace, { headSha: "a".repeat(40), baseSha: headSha, baseBranch: "main" })).rejects.toThrow("Next review fetch rejected.");
+
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(headSha);
+    expect(await fs.readFile(path.join(workspace.worktreePath, "README.md"), "utf8")).toBe("Initial content\n");
+    expect(await runtime.recover(workspace.id)).toMatchObject({ workspace });
+  });
+
+  it("recognizes a completed checkout refresh after its result was interrupted", async () => {
+    const deps = dependencies();
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare("interrupted-review-refresh", true);
+    await fs.writeFile(path.join(repositoryPath, "next.txt"), "The next commit\n");
+    await git(repositoryPath, "add", "next.txt");
+    await git(repositoryPath, "commit", "-m", "TEST: next review commit");
+    await git(repositoryPath, "push", "origin", "main");
+    const nextHead = await git(repositoryPath, "rev-parse", "HEAD");
+    const comparison = { headSha: nextHead, baseSha: headSha, baseBranch: "main" };
+    const runGit = deps.git!;
+    deps.git = vi.fn(async (cwd, args, signal, env) => {
+      const result = await runGit(cwd, args, signal, env);
+      if (args[0] === "checkout") throw new Error("Interrupted after checkout completed.");
+      return result;
+    });
+    await expect(runtime.refreshReviewWorkspace(workspace, comparison)).rejects.toThrow("Interrupted after checkout completed.");
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(nextHead);
+
+    vi.mocked(deps.git).mockClear();
+    await new ForgeRuntime(deps).refreshReviewWorkspace(workspace, comparison);
+
+    expect(vi.mocked(deps.git).mock.calls.some(([, args]) => ["fetch", "checkout", "update-ref"].includes(args[0]!))).toBe(false);
+    expect(await git(workspace.worktreePath, "status", "--porcelain=v1")).toBe("");
+  });
+
+  it("records a refreshed comparison before reporting cancellation after checkout", async () => {
+    const deps = dependencies();
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare("cancelled-review-refresh", true);
+    await git(repositoryPath, "commit", "--allow-empty", "-m", "TEST: next review commit");
+    await git(repositoryPath, "push", "origin", "main");
+    const nextHead = await git(repositoryPath, "rev-parse", "HEAD");
+    const controller = new AbortController();
+    const runGit = deps.git!;
+    deps.git = vi.fn(async (cwd, args, signal, env) => {
+      const result = await runGit(cwd, args, signal, env);
+      if (args[0] === "checkout") controller.abort(new Error("Review paused."));
+      return result;
+    });
+    const comparison = { headSha: nextHead, baseSha: headSha, baseBranch: "main" };
+    await expect(runtime.refreshReviewWorkspace(workspace, comparison, controller.signal)).rejects.toThrow("Review paused.");
+
+    await new ForgeRuntime(deps).refreshReviewWorkspace(workspace, comparison);
+
+    const saved = JSON.parse(await fs.readFile(path.join(deps.dataDir, "forge-workers", "workspaces", `${workspace.id}.json`), "utf8"));
+    expect(saved).toMatchObject({ baseCommit: nextHead, reviewBaseSha: headSha, gitPending: false });
+    expect(saved.reviewRefresh).toBeUndefined();
+  });
+
+  it("preserves unrecorded reviewer commits instead of adopting them as a new round", async () => {
+    const deps = dependencies();
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare("changed-review-head", true);
+    await git(workspace.worktreePath, "commit", "--allow-empty", "-m", "USER: retain this commit");
+    const changedHead = await git(workspace.worktreePath, "rev-parse", "HEAD");
+    vi.mocked(deps.gitAccess).mockClear();
+
+    await expect(runtime.refreshReviewWorkspace(workspace, { headSha: changedHead, baseSha: headSha, baseBranch: "main" })).rejects.toThrow("outside its recorded refresh");
+
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(changedHead);
+    expect(deps.gitAccess).not.toHaveBeenCalled();
+  });
+
   it("pins a divergent review base even when the target branch has advanced", async () => {
     await git(repositoryPath, "switch", "-c", "review-target");
     await fs.writeFile(path.join(repositoryPath, "feature.txt"), "Review this change\n");
@@ -1159,6 +1337,95 @@ if (hangMerge || hangFetch) {
 }
 
 describe("ForgeRuntime Codex tabs", () => {
+  it("resumes the saved reviewer conversation after its tab and runtime are replaced", async () => {
+    const deps = dependencies();
+    deps.reviewConversations = { prepare: vi.fn(async (launch, options) => {
+      await options.save(options.binding ?? conversationBinding(launch.tabId));
+      return (options.binding ?? conversationBinding(launch.tabId)).threadId!;
+    }) };
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare("review-restart", true);
+    const fixture = installReviewTabs(deps, workspace);
+    const first = await runtime.launch(fixture.request);
+    const firstView = fixture.launchPath();
+    const firstIdentity = await fs.stat(firstView, { bigint: true });
+    await runtime.close(first);
+    expect((await fs.stat(firstView, { bigint: true })).ino).toBe(firstIdentity.ino);
+    expect((await fs.readdir(firstView)).sort()).toEqual([".cloudx-source.json", "archived_sessions", "sessions"]);
+    runtime = new ForgeRuntime(deps);
+
+    const second = await runtime.launch(fixture.request);
+
+    expect(second).not.toBe(first);
+    expect(fixture.resumedIds).toEqual([conversationBinding().threadId, conversationBinding().threadId]);
+    expect(vi.mocked(deps.reviewConversations.prepare).mock.calls[1]![1].binding).toEqual(conversationBinding());
+    const secondView = fixture.launchPath();
+    await runtime.close(second);
+    await expect(fs.stat(secondView)).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await fs.readdir(firstView)).sort()).toEqual([".cloudx-source.json", "archived_sessions", "sessions"]);
+  });
+
+  it("retains a created reviewer thread and removes disposable paths after verified preparation failure", async () => {
+    const deps = dependencies();
+    deps.reviewConversations = { prepare: vi.fn(async (_launch, options) => {
+      await options.save(conversationBinding());
+      throw new PluginSessionNotStartedError(new Error("Review paused after thread creation."));
+    }) };
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare("review-preparation-failed", true);
+    const fixture = installReviewTabs(deps, workspace);
+
+    await expect(runtime.launch(fixture.request)).rejects.toThrow("Review paused after thread creation.");
+
+    expect((await fs.readdir(fixture.launchPath())).sort()).toEqual([".cloudx-source.json", "archived_sessions", "sessions"]);
+    await expect(fs.stat(path.dirname(fixture.lastTab().contextPath!))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await runtime.recover(workspace.id)).toEqual({ workspace, tabIds: [] });
+    vi.mocked(deps.reviewConversations.prepare).mockImplementation(async (_launch, options) => options.binding!.threadId!);
+    runtime = new ForgeRuntime(deps);
+    const resumed = await runtime.launch(fixture.request);
+    expect(fixture.resumedIds).toEqual([conversationBinding().threadId]);
+    await runtime.close(resumed);
+  });
+
+  it("preserves reviewer resources when preparatory process shutdown cannot be verified", async () => {
+    const deps = dependencies();
+    deps.reviewConversations = { prepare: vi.fn(async (_launch, options) => {
+      await options.save(conversationBinding());
+      throw new AppServerOwnershipError("Reviewer process shutdown is unconfirmed.");
+    }) };
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare("review-ownership-failed", true);
+    const fixture = installReviewTabs(deps, workspace);
+
+    await expect(runtime.launch(fixture.request)).rejects.toThrow("shutdown is unconfirmed");
+
+    expect((await fs.stat(fixture.launchPath())).isDirectory()).toBe(true);
+    expect((await fs.stat(path.dirname(fixture.lastTab().contextPath!))).isDirectory()).toBe(true);
+    await expect(runtime.launch(fixture.request)).rejects.toThrow("previous launch is unresolved");
+    await expect(runtime.cleanup(workspace)).rejects.toThrow("launch is unresolved");
+    await expect(runtime.close(fixture.lastTab().id)).rejects.toThrow("process ownership is unresolved");
+  });
+
+  it("does not reuse a reviewer conversation from another repository checkout", async () => {
+    const deps = dependencies();
+    const gitCommand = deps.git!;
+    deps.gitAccess = vi.fn(async repository => ({ cloneUrl: `https://github.com/${repository.projectPath}.git`, authorization: "Basic fixture-secret" }));
+    deps.git = (cwd, args, signal, env) => gitCommand(cwd, args.map(arg => arg === "https://github.com/cloudx/other.git" ? "https://github.com/cloudx/test.git" : arg), signal, env);
+    deps.reviewConversations = { prepare: vi.fn(async (launch, options) => {
+      await options.save(options.binding ?? conversationBinding(launch.tabId));
+      return (options.binding ?? conversationBinding(launch.tabId)).threadId!;
+    }) };
+    runtime = new ForgeRuntime(deps);
+    const first = await prepare("repository-a-review", true);
+    const firstTabs = installReviewTabs(deps, first);
+    await runtime.close(await runtime.launch(firstTabs.request));
+    const second = { id: "repository-b-review", ...await runtime.prepareWorkspace({ id: "repository-b-review", expectedRepository: { ...expectedRepository, projectPath: "cloudx/other" }, baseBranch: "main", headSha, baseSha: headSha, review: true }) };
+    await expect(runtime.launch({ ...firstTabs.request, worktreePath: second.worktreePath })).rejects.toThrow("ownership does not match");
+    const secondTabs = installReviewTabs(deps, second);
+    await runtime.close(await runtime.launch(secondTabs.request));
+    expect(vi.mocked(deps.reviewConversations.prepare).mock.calls[1]![1].binding).toBeUndefined();
+  });
+
   it("preserves a replaced context directory before discarding a live worker tab", async () => {
     const deps = dependencies();
     runtime = new ForgeRuntime(deps);

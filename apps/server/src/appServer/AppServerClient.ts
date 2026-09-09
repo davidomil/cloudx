@@ -21,9 +21,9 @@ export class StdioAppServerTransport implements AppServerTransport {
   private terminalError: Error | undefined;
   private closed = false;
 
-  constructor() {
+  constructor(private readonly owner?: { process: ChildProcessByStdio<Writable, Readable, null>; stop: () => void }) {
     const launch = buildCodexAppServerLaunch();
-    this.process = spawn(launch.command, launch.args, {
+    this.process = owner?.process ?? spawn(launch.command, launch.args, {
       stdio: ["pipe", "pipe", "ignore"],
       env: buildToolEnv(process.env)
     });
@@ -71,7 +71,8 @@ export class StdioAppServerTransport implements AppServerTransport {
     this.closed = true;
     this.messageListeners.clear();
     this.process.stdin.destroy();
-    this.process.kill();
+    if (this.owner) this.owner.stop();
+    else this.process.kill();
   }
 
   private handleStdoutChunk(chunk: string): void {

@@ -107,9 +107,11 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(fixture.sessions.getTab(started.tabId!)).toMatchObject({ status: "completed", ownerPluginId: "forge" });
     await fixture.workflow.poll();
 
-    expect(await fixture.worker(started.id)).toMatchObject({ status: "completed", draft: { status: "draft", headSha } });
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "completed", worktreePath: started.worktreePath, draft: { id: started.attemptId, status: "draft", headSha } });
     expect(fixture.sessions.listTabs()).toEqual([]);
-    await expectMissing(started.worktreePath!, receipt.codexHome, receipt.reportPath, receipt.contextPath, receipt.tabContextPath);
+    expect((await fs.stat(started.worktreePath!)).isDirectory()).toBe(true);
+    expect((await fs.stat(receipt.sessionPath!)).isFile()).toBe(true);
+    await fixture.expectDisposedAttempt(receipt);
     expect(fixture.factory.processes).toHaveLength(1);
   }, 15_000);
 
@@ -252,6 +254,12 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(firstReview).toMatchObject({ issueWorkerId: started.id, autoPost: true, headSha: firstImplementation.headSha });
     const firstReviewReceipt = await fixture.completedAssistantTurn(firstReview);
     await fixture.workflow.poll();
+    const firstDraft = (await fixture.worker(firstReview.id)).draft!;
+    expect(firstDraft).toMatchObject({ id: firstReview.attemptId, startedAt: firstReview.startedAt, status: "posted" });
+    expect((await fs.stat(firstReview.worktreePath!)).isDirectory()).toBe(true);
+    expect(await processIsRunning(firstReviewReceipt.pid)).toBe(false);
+    expect(fixture.sessions.listTabs().map(tab => tab.id)).not.toContain(firstReview.tabId);
+    await fixture.expectDisposedAttempt(firstReviewReceipt);
 
     const revision = await fixture.runningWorker("issue");
     expect(revision.id).toBe(started.id);
@@ -263,9 +271,15 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     await fixture.workflow.poll();
 
     const secondReview = await fixture.runningWorker("review");
-    expect(secondReview.id).not.toBe(firstReview.id);
-    expect(secondReview).toMatchObject({ issueWorkerId: started.id, autoPost: true, headSha: secondImplementation.headSha });
+    expect(secondReview).toMatchObject({ id: firstReview.id, worktreePath: firstReview.worktreePath, issueWorkerId: started.id, autoPost: true, headSha: secondImplementation.headSha, reviewHistory: [firstDraft] });
+    expect((await fixture.workflow.dashboard()).workers.filter(worker => worker.kind === "review")).toHaveLength(1);
     const secondReviewReceipt = await fixture.completedAssistantTurn(secondReview);
+    expect(firstReviewReceipt.sessionId).toMatch(/^[a-f0-9-]{36}$/);
+    expect(secondReviewReceipt.sessionId).toBe(firstReviewReceipt.sessionId);
+    expect(secondReviewReceipt.resumedSessionId).toBe(firstReviewReceipt.sessionId);
+    expect(secondReviewReceipt.previousMessages).toEqual(expect.arrayContaining([
+      { role: "assistant", content: expect.stringContaining("Add regression coverage before merging.") },
+    ]));
     await fixture.workflow.poll();
     await vi.waitFor(async () => {
       fixture.advanceTime(5_001);
@@ -292,7 +306,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     for (const worker of [started, firstReview, secondReview]) await expectMissing(worker.worktreePath!);
     for (const receipt of [firstImplementation, firstReviewReceipt, secondImplementation, secondReviewReceipt]) {
       expect(await processIsRunning(receipt.pid)).toBe(false);
-      await expectMissing(receipt.codexHome, receipt.tabContextPath, receipt.contextPath, receipt.reportPath);
+      await fixture.expectDisposedAttempt(receipt);
     }
   }, 30_000);
 
@@ -325,7 +339,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     await expectMissing(started.worktreePath!, reviewer.worktreePath!);
     for (const receipt of [implementation, reviewed]) {
       expect(await processIsRunning(receipt.pid)).toBe(false);
-      await expectMissing(receipt.codexHome, receipt.tabContextPath, receipt.contextPath, receipt.reportPath);
+      await fixture.expectDisposedAttempt(receipt);
     }
   }, 20_000);
 
@@ -372,9 +386,13 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     fixture.advanceTime(5_001);
     await fixture.workflow.poll();
     const secondReview = await fixture.runningWorker("review");
-    expect(secondReview).toMatchObject({ issueWorkerId: started.id, headSha: updatedHead });
-    expect(secondReview.id).not.toBe(firstReview.id);
+    expect(secondReview).toMatchObject({ id: firstReview.id, worktreePath: firstReview.worktreePath, issueWorkerId: started.id, headSha: updatedHead });
     const secondReviewReceipt = await fixture.completedAssistantTurn(secondReview);
+    expect(secondReviewReceipt.sessionId).toBe(firstReviewReceipt.sessionId);
+    expect(secondReviewReceipt.resumedSessionId).toBe(firstReviewReceipt.sessionId);
+    expect(secondReviewReceipt.previousMessages).toEqual(expect.arrayContaining([
+      { role: "assistant", content: expect.stringContaining("No actionable findings.") },
+    ]));
     expect(secondReviewReceipt.localReview).toMatchObject({ baseSha: targetHead, mergeBaseSha: targetHead, headSha: updatedHead });
     expect(secondReviewReceipt.localReview!.diff).toContain("diff --git a/solution.txt b/solution.txt");
     expect(secondReviewReceipt.localReview!.diff).not.toContain("diff --git a/target.txt b/target.txt");
@@ -404,7 +422,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     for (const worker of [started, firstReview, secondReview]) await expectMissing(worker.worktreePath!);
     for (const receipt of [implementation, firstReviewReceipt, secondReviewReceipt]) {
       expect(await processIsRunning(receipt.pid)).toBe(false);
-      await expectMissing(receipt.codexHome, receipt.tabContextPath, receipt.contextPath, receipt.reportPath);
+      await fixture.expectDisposedAttempt(receipt);
     }
   }, 30_000);
 
@@ -430,8 +448,12 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
 
     await fixture.workflow.resume(started.id, fixture.placement);
     const resumed = await fixture.runningWorker("review");
-    expect(resumed).toMatchObject({ issueWorkerId: started.id, headSha: reviewer.headSha });
-    await fixture.completedAssistantTurn(resumed);
+    expect(resumed).toMatchObject({ id: reviewer.id, worktreePath: reviewer.worktreePath, issueWorkerId: started.id, headSha: reviewer.headSha, startedAt: reviewer.startedAt });
+    const resumedReceipt = await fixture.completedAssistantTurn(resumed);
+    expect(resumedReceipt.resumedSessionId).toBe(receipt.sessionId);
+    expect(resumedReceipt.previousMessages).toEqual(expect.arrayContaining([
+      { role: "assistant", content: expect.stringContaining("Add regression coverage before merging.") },
+    ]));
     expect(fixture.factory.processes).toHaveLength(3);
     expect(fixture.gitPushes).toHaveLength(1);
     expect(fixture.provider.submissions).toEqual([]);
@@ -449,7 +471,9 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(await fixture.worker(started.id)).toMatchObject({ status: "paused", autoReview: { enabled: true, phase: "reviewing", placement: fixture.placement, reviewWorkerId: reviewer.id } });
     expect(await fixture.worker(reviewer.id)).toMatchObject({ status: "paused" });
     expect(await processIsRunning(receipt.pid)).toBe(false);
-    await expectMissing(reviewer.worktreePath!, receipt.codexHome, receipt.tabContextPath, receipt.reportPath, receipt.contextPath);
+    expect((await fs.stat(reviewer.worktreePath!)).isDirectory()).toBe(true);
+    expect((await fs.stat(receipt.sessionPath!)).isFile()).toBe(true);
+    await fixture.expectDisposedAttempt(receipt);
     fixture.advanceTime(5_001);
     await fixture.workflow.poll();
     expect(fixture.factory.processes).toHaveLength(2);
@@ -457,8 +481,12 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
 
     await fixture.workflow.resume(started.id, fixture.placement);
     const resumed = await fixture.runningWorker("review");
-    expect(resumed).toMatchObject({ issueWorkerId: started.id, headSha: reviewer.headSha });
-    await fixture.completedAssistantTurn(resumed);
+    expect(resumed).toMatchObject({ id: reviewer.id, worktreePath: reviewer.worktreePath, issueWorkerId: started.id, headSha: reviewer.headSha, startedAt: reviewer.startedAt });
+    const resumedReceipt = await fixture.completedAssistantTurn(resumed);
+    expect(resumedReceipt.resumedSessionId).toBe(receipt.sessionId);
+    expect(resumedReceipt.previousMessages).toEqual(expect.arrayContaining([
+      { role: "assistant", content: expect.stringContaining("Add regression coverage before merging.") },
+    ]));
     expect(fixture.factory.processes).toHaveLength(3);
     expect(fixture.gitPushes).toHaveLength(1);
     expect(fixture.provider.submissions).toEqual([]);
@@ -477,9 +505,12 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     });
 
     await fixture.workflow.poll();
-    expect(await fixture.worker(reviewer.id)).toMatchObject({ draft: { status: "post_failed", event: "request_changes", headSha: reviewer.headSha }, worktreePath: undefined });
+    expect(await fixture.worker(reviewer.id)).toMatchObject({ draft: { status: "post_failed", event: "request_changes", headSha: reviewer.headSha }, worktreePath: reviewer.worktreePath });
     expect(await processIsRunning(receipt.pid)).toBe(false);
-    await expectMissing(reviewer.worktreePath!, receipt.codexHome, receipt.tabContextPath, receipt.reportPath, receipt.contextPath);
+    expect(fixture.sessions.listTabs().map(tab => tab.id)).not.toContain(reviewer.tabId);
+    expect((await fs.stat(reviewer.worktreePath!)).isDirectory()).toBe(true);
+    expect((await fs.stat(receipt.sessionPath!)).isFile()).toBe(true);
+    await fixture.expectDisposedAttempt(receipt);
     fixture.advanceTime(5_001);
     await fixture.workflow.poll();
     await expect(fixture.workflow.resume(started.id, fixture.placement)).rejects.toThrow(/reconciled.*will not repost/i);
@@ -580,8 +611,10 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(await processIsRunning(reviewReceipt.pid)).toBe(false);
     expect(await processIsRunning(codingReceipt.pid)).toBe(false);
     await expectMissing(coding.worktreePath!, review.worktreePath!);
-    for (const receipt of [codingReceipt, reviewReceipt])
-      await expectMissing(receipt.codexHome, path.dirname(receipt.tabContextPath), receipt.contextPath, receipt.reportPath);
+    for (const receipt of [codingReceipt, reviewReceipt]) {
+      await fixture.expectDisposedAttempt(receipt);
+      await expectMissing(path.dirname(receipt.tabContextPath));
+    }
     expect(fixture.sessions.listTabs().map(tab => tab.id)).toEqual([unrelatedTab.id]);
     expect(await fs.readFile(path.join(unrelatedDirectory, "keep.txt"), "utf8")).toBe("Unrelated work\n");
     expect(await git(fixture.origin, "rev-parse", "main")).toBe(coding.headSha);
@@ -622,7 +655,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(fixture.sessions.listTabs()).toEqual([]);
   }, 20_000);
 
-  it("reviews a complete local diff larger than the provider limit, cleans the agent, and submits the edited draft", async () => {
+  it("reviews a complete local diff larger than the provider limit, stops the process, and submits the edited draft", async () => {
     const fixture = await LifecycleFixture.create();
     const reviewContent = ["A public return value", ...Array.from({ length: 20_049 }, (_, index) => `Review line ${index + 2}`)].join("\n") + "\n";
     const reviewBase = await git(fixture.origin, "rev-parse", "main");
@@ -650,14 +683,16 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(fixture.provider.submissions).toEqual([]);
     expect(fixture.sessions.listTabs()).toEqual([]);
     expect(await processIsRunning(receipt.pid)).toBe(false);
-    await expectMissing(started.worktreePath!, receipt.codexHome, receipt.tabContextPath, receipt.contextPath, receipt.reportPath);
+    expect((await fs.stat(started.worktreePath!)).isDirectory()).toBe(true);
+    expect((await fs.stat(receipt.sessionPath!)).isFile()).toBe(true);
+    await fixture.expectDisposedAttempt(receipt);
 
-    await fixture.workflow.saveReview(started.id, {
+    await fixture.workflow.saveReview(started.id, reviewed.draft!.id, {
       event: "request_changes",
       body: "Please clarify this contract before merging.",
       comments: [{ body: "Document the result for an empty input.", path: "review.txt", line: 1, side: "RIGHT" }],
     });
-    const submitted = await fixture.workflow.submitReview(started.id);
+    const submitted = await fixture.workflow.submitReview(started.id, reviewed.draft!.id);
     expect(submitted.draft?.status).toBe("posted");
     expect(fixture.provider.submissions).toEqual([{
       headSha: reviewHead,
@@ -669,6 +704,119 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(fixture.gitAccessRoles).toEqual(["reviewer"]);
     expect((await fixture.store.read())[0]?.draft?.status).toBe("posted");
   }, 20_000);
+
+  it("reuses the manual reviewer and its saved conversation for new head and base commits until final closure", async () => {
+    const fixture = await LifecycleFixture.create();
+    const firstHead = await fixture.seedReview();
+    const first = await fixture.workflow.startReview(repository, 7, false, fixture.placement);
+    const firstReceipt = await fixture.completedAssistantTurn(first);
+    expect(firstReceipt.sessionPath).toBe(path.join(firstReceipt.codexHome, "sessions", "fixture", `rollout-${firstReceipt.sessionId}.jsonl`));
+    expect(firstReceipt.previousMessages).toHaveLength(1);
+    const checkout = await fs.stat(first.worktreePath!);
+    await fixture.workflow.poll();
+    expect(fixture.sessions.listTabs()).toEqual([]);
+    await fixture.expectDisposedAttempt(firstReceipt);
+    const initialDraft = (await fixture.worker(first.id)).draft!;
+    await fixture.workflow.saveReview(first.id, initialDraft.id, {
+      event: "request_changes",
+      body: "Please document empty inputs.",
+      comments: [{ body: "Describe the empty-input result.", path: "review.txt", line: 1, side: "RIGHT" }],
+    });
+    const posted = await fixture.workflow.submitReview(first.id, initialDraft.id);
+    const firstDraft = posted.draft!;
+    expect(firstDraft).toMatchObject({ id: first.attemptId, startedAt: first.startedAt, headSha: firstHead, status: "posted" });
+    expect((await fs.stat(first.worktreePath!)).ino).toBe(checkout.ino);
+    expect(await processIsRunning(firstReceipt.pid)).toBe(false);
+
+    const nextBase = await fixture.advanceMain();
+    const nextHead = await fixture.advanceReview("An empty input returns no value.\n");
+    const second = await fixture.workflow.startReview(repository, 7, false, fixture.placement);
+    expect(second).toMatchObject({ id: first.id, worktreePath: first.worktreePath, autoPost: false, headSha: nextHead, reviewHistory: [firstDraft] });
+    expect(second.attemptId).not.toBe(first.attemptId);
+    expect(second.startedAt).not.toBe(first.startedAt);
+    expect((await fs.stat(second.worktreePath!)).ino).toBe(checkout.ino);
+    const secondReceipt = await fixture.completedAssistantTurn(second);
+    expect(secondReceipt.resumedSessionId).toBe(firstReceipt.sessionId);
+    expect(secondReceipt.sessionPath).toBe(firstReceipt.sessionPath);
+    expect(secondReceipt.previousMessages).toEqual([
+      ...firstReceipt.previousMessages!,
+      { role: "user", content: firstReceipt.args.at(-1) },
+      { role: "assistant", content: expect.stringContaining("The return value needs documentation.") },
+    ]);
+    expect(secondReceipt.context.item.comments).toEqual(expect.arrayContaining([
+      expect.objectContaining({ body: "Describe the empty-input result." }),
+    ]));
+    expect(secondReceipt.localReview).toMatchObject({ baseSha: nextBase, mergeBaseSha: nextBase, headSha: nextHead });
+    expect(secondReceipt.localReview!.diff).toContain("+An empty input returns no value.");
+    expect(secondReceipt.localReview!.diff).not.toContain("diff --git a/target.txt b/target.txt");
+    expect(await git(second.worktreePath!, "status", "--porcelain")).toBe("");
+    await fixture.workflow.poll();
+    expect(fixture.sessions.listTabs()).toEqual([]);
+    await fixture.expectDisposedAttempt(secondReceipt);
+
+    const completed = await fixture.worker(first.id);
+    expect(completed).toMatchObject({ status: "completed", reviewHistory: [firstDraft], draft: { id: second.attemptId, startedAt: second.startedAt, headSha: nextHead, status: "draft" } });
+    expect(fixture.provider.submissions).toHaveLength(1);
+    await fixture.restartWorkflow();
+    expect(await fixture.worker(first.id)).toMatchObject({ status: "completed", worktreePath: first.worktreePath, reviewHistory: [firstDraft], draft: completed.draft });
+    expect((await fs.stat(first.worktreePath!)).ino).toBe(checkout.ino);
+    expect(fixture.factory.processes).toHaveLength(2);
+    expect(await fixture.sessionRequests("thread/start")).toEqual([expect.objectContaining({ cwd: first.worktreePath, ephemeral: false })]);
+    expect(await fixture.sessionRequests("thread/inject_items")).toHaveLength(1);
+
+    await fixture.provider.mergeExternally(7);
+    fixture.advanceCleanupInterval();
+    await fixture.workflow.poll();
+    expect((await fixture.workflow.dashboard()).workers).toEqual([]);
+    expect(await fixture.store.read()).toEqual([]);
+    expect(fixture.sessions.listTabs()).toEqual([]);
+    await expectMissing(first.worktreePath!);
+    for (const receipt of [firstReceipt, secondReceipt]) {
+      expect(await processIsRunning(receipt.pid)).toBe(false);
+      await fixture.expectDisposedAttempt(receipt);
+    }
+    const retainedConversation = await fs.readFile(firstReceipt.sessionPath!, "utf8");
+    expect(retainedConversation).toContain(firstHead);
+    expect(retainedConversation).toContain(nextHead);
+    expect(retainedConversation).toContain("The return value needs documentation.");
+  }, 30_000);
+
+  it("keeps conversations separate for different requests at the same commit and resumes the older request explicitly", async () => {
+    const fixture = await LifecycleFixture.create();
+    const headSha = await fixture.seedReview();
+    await git(fixture.origin, "branch", "review-other", headSha);
+    fixture.provider.changes.set(8, { ...structuredClone(fixture.provider.changes.get(7)!), number: 8, title: "An independent request", url: "https://github.com/fixture/cloudx/pull/8", headBranch: "review-other" });
+    const first = await fixture.workflow.startReview(repository, 7, false, fixture.placement);
+    const firstReceipt = await fixture.completedAssistantTurn(first);
+    const other = await fixture.workflow.startReview(repository, 8, false, fixture.placement);
+    const otherReceipt = await fixture.completedAssistantTurn(other);
+    expect(other.id).not.toBe(first.id);
+    expect(other.worktreePath).not.toBe(first.worktreePath);
+    expect(otherReceipt.headSha).toBe(firstReceipt.headSha);
+    expect(otherReceipt.sessionId).not.toBe(firstReceipt.sessionId);
+    expect(otherReceipt.sessionPath).not.toBe(firstReceipt.sessionPath);
+    expect(firstReceipt.previousMessages).toHaveLength(1);
+    expect(otherReceipt.previousMessages).toHaveLength(1);
+    expect(otherReceipt.previousMessages).not.toEqual(firstReceipt.previousMessages);
+    await fixture.workflow.poll();
+
+    const resumed = await fixture.workflow.startReview(repository, 7, false, fixture.placement);
+    const resumedReceipt = await fixture.completedAssistantTurn(resumed);
+    expect(resumed.id).toBe(first.id);
+    expect(resumedReceipt.resumedSessionId).toBe(firstReceipt.sessionId);
+    expect(resumedReceipt.resumedSessionId).not.toBe(otherReceipt.sessionId);
+    expect(resumedReceipt.previousMessages).toEqual([
+      ...firstReceipt.previousMessages!,
+      { role: "user", content: firstReceipt.args.at(-1) },
+      { role: "assistant", content: expect.stringContaining("The return value needs documentation.") },
+    ]);
+    expect(await fixture.sessionRequests("thread/start")).toHaveLength(2);
+    expect(await fixture.sessionRequests("thread/inject_items")).toHaveLength(2);
+    expect((await fixture.worker(other.id)).reviewHistory ?? []).toEqual([]);
+    await fixture.workflow.poll();
+    expect(fixture.factory.processes).toHaveLength(3);
+    for (const receipt of [firstReceipt, otherReceipt, resumedReceipt]) expect(await processIsRunning(receipt.pid)).toBe(false);
+  }, 30_000);
 });
 
 interface AssistantReceipt {
@@ -683,6 +831,10 @@ interface AssistantReceipt {
   contextPath: string;
   tabContextPath: string;
   headSha: string;
+  sessionId?: string;
+  resumedSessionId?: string;
+  sessionPath?: string;
+  previousMessages?: Array<{ role: "user" | "assistant"; content: string }>;
   localReview?: { baseSha: string; mergeBaseSha: string; headSha: string; diff: string };
   context: { item: ForgeIssueDetail & Partial<ForgeChangeRequest>; change?: ForgeChangeRequest };
 }
@@ -772,6 +924,7 @@ class LifecycleFixture {
     await fs.mkdir(imagegen, { recursive: true });
     await fs.writeFile(path.join(imagegen, "SKILL.md"), "---\nname: imagegen\ndescription: Fixture image skill\n---\nFixture only.\n");
     await fs.writeFile(path.join(codexHome, "config.toml"), sourceConfig);
+    await fs.writeFile(path.join(codexHome, "auth.json"), sourceAuth, { mode: 0o600 });
     const assistant = path.join(root, "fixture-assistant.mjs");
     await fs.writeFile(assistant, fakeAssistant, { mode: 0o700 });
     await fs.mkdir(path.join(root, "receipts"));
@@ -902,10 +1055,22 @@ class LifecycleFixture {
     expect(receipt.args.filter((argument) => argument.includes("Write only valid JSON"))).toHaveLength(1);
     expect(receipt.trustedProjectPath).toBe(await fs.realpath(worker.worktreePath!));
     if (worker.kind === "review") {
+      expect(receipt.sessionId).toMatch(/^[a-f0-9-]{36}$/);
+      expect(receipt.resumedSessionId).toBe(receipt.sessionId);
+      expect(receipt.args.slice(receipt.args.indexOf("resume"), -1)).toEqual(["resume", receipt.sessionId, "--"]);
+      expect(receipt.previousMessages).toEqual(expect.any(Array));
+      const setup = receipt.previousMessages![0]!;
+      expect(setup).toEqual({ role: "user", content: expect.stringContaining(JSON.stringify(worker.worktreePath)) });
+      expect(setup.content).toContain("Wait for the review request before starting work.");
+      expect((await this.sessionRequests("thread/inject_items")).filter(request => request.threadId === receipt.sessionId)).toEqual([{
+        threadId: receipt.sessionId,
+        items: [{ type: "message", role: "user", content: [{ type: "input_text", text: setup.content }] }],
+      }]);
       expect(receipt.context.item).not.toHaveProperty("diff");
       expect(receipt.localReview).toMatchObject({ baseSha: receipt.context.item.baseSha, headSha: worker.headSha });
       expect(receipt.localReview!.mergeBaseSha).toMatch(/^[a-f0-9]{40,64}$/);
     }
+    expect(await fs.readFile(path.join(receipt.codexHome, "auth.json"), "utf8")).toBe(sourceAuth);
     expect(await fs.readFile(path.join(this.codexHome, "config.toml"), "utf8")).toBe(sourceConfig);
     const state = await this.workspace.state(this.sessions.listTabs(), this.sessions.getActiveTabId());
     expect(state.tabs.find(tab => tab.id === worker.tabId)).toMatchObject({ ownerPluginId: "forge" });
@@ -939,6 +1104,43 @@ class LifecycleFixture {
     const headSha = await git(this.repositoryPath, "rev-parse", "HEAD");
     await fs.rm(this.repositoryPath, { recursive: true });
     return headSha;
+  }
+
+  async advanceReview(content: string): Promise<string> {
+    await git(this.root, "clone", "--branch", "review-target", this.origin, this.repositoryPath);
+    await git(this.repositoryPath, "config", "user.name", "Forge Fixture");
+    await git(this.repositoryPath, "config", "user.email", "forge-fixture@example.invalid");
+    await git(this.repositoryPath, "merge", "--no-edit", "origin/main");
+    await fs.writeFile(path.join(this.repositoryPath, "review.txt"), content);
+    await git(this.repositoryPath, "add", "review.txt");
+    await git(this.repositoryPath, "commit", "-m", "TEST: address review feedback");
+    await git(this.repositoryPath, "push", "origin", "review-target");
+    const headSha = await git(this.repositoryPath, "rev-parse", "HEAD");
+    await fs.rm(this.repositoryPath, { recursive: true });
+    return headSha;
+  }
+
+  async sessionRequests(method: string): Promise<Array<Record<string, unknown>>> {
+    const directory = path.join(this.root, "receipts");
+    const records = await Promise.all((await fs.readdir(directory)).filter(file => file.startsWith("app-server-")).map(file => fs.readFile(path.join(directory, file), "utf8")));
+    return records.flatMap(record => record.trim().split("\n").map(line => JSON.parse(line))).filter(request => request.method === method).map(request => request.params);
+  }
+
+  async expectDisposedAttempt(receipt: AssistantReceipt): Promise<void> {
+    await expectMissing(receipt.tabContextPath, receipt.reportPath, receipt.contextPath);
+    if (!receipt.sessionPath?.startsWith(`${receipt.codexHome}${path.sep}`)) {
+      await expectMissing(receipt.codexHome);
+      return;
+    }
+    expect((await fs.readdir(receipt.codexHome)).sort()).toEqual([".cloudx-source.json", "archived_sessions", "sessions"]);
+    expect(JSON.parse(await fs.readFile(path.join(receipt.codexHome, ".cloudx-source.json"), "utf8"))).toMatchObject({ sourceId: "shared", home: this.codexHome });
+    for (const name of ["sessions", "archived_sessions"]) {
+      const link = path.join(receipt.codexHome, name);
+      expect((await fs.lstat(link)).isSymbolicLink()).toBe(true);
+      expect(await fs.realpath(link)).toBe(path.join(this.codexHome, name));
+    }
+    expect((await fs.stat(receipt.sessionPath)).isFile()).toBe(true);
+    expect(await fs.readFile(path.join(this.codexHome, "auth.json"), "utf8")).toBe(sourceAuth);
   }
 
   async dispose(): Promise<void> {
@@ -1053,19 +1255,74 @@ async function processIsRunning(pid: number): Promise<boolean> {
 }
 
 const sourceConfig = 'model_provider = "openai"\nmodel = "gpt-5.5"\nmodel_reasoning_effort = "low"\n[projects."/unrelated/project"]\ntrust_level = "untrusted"\n';
+const sourceAuth = '{"OPENAI_API_KEY":"fixture-only-not-a-real-key"}\n';
 
 const fakeAssistant = `#!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { createInterface } from "node:readline";
 import { parse } from ${JSON.stringify(import.meta.resolve("smol-toml"))};
+const args = process.argv.slice(2);
+const sessionFile = id => path.join(process.env.CODEX_HOME, "sessions", "fixture", "rollout-" + id + ".jsonl");
+function readConversation(id) {
+  if (!/^[a-f0-9-]{36}$/.test(id)) throw new Error("Fixture requires an exact session UUID.");
+  const file = sessionFile(id);
+  const records = fs.readFileSync(file, "utf8").trim().split("\\n").map(line => JSON.parse(line));
+  const meta = records[0];
+  if (meta.type !== "session_meta" || meta.payload.id !== id) throw new Error("Fixture session identity does not match.");
+  if (fs.readFileSync(meta.payload.fixtureOriginPath, "utf8") !== fs.readFileSync(file, "utf8")) throw new Error("Fixture conversation origin alias does not resolve to its history.");
+  const messages = records.filter(record => record.type === "response_item").map(record => ({ role: record.payload.role, content: record.payload.content.map(item => item.text).join("") }));
+  return { id, cwd: meta.payload.cwd, ephemeral: false, path: meta.payload.fixtureOriginPath, messages };
+}
+if (args.includes("app-server")) {
+  for await (const line of createInterface({ input: process.stdin })) {
+    const request = JSON.parse(line);
+    fs.appendFileSync(path.join(process.env.FORGE_FIXTURE_RECEIPTS, "app-server-" + process.pid + ".jsonl"), JSON.stringify(request) + "\\n");
+    if (request.id === undefined) continue;
+    try {
+      let result;
+      if (request.method === "initialize") result = { userAgent: "Forge native CLI fixture", codexHome: process.env.CODEX_HOME };
+      else if (request.method === "thread/start") {
+        if (request.params.ephemeral !== false) throw new Error("Forge must create a durable conversation.");
+        fs.mkdirSync(path.join(process.env.CODEX_HOME, "sessions"), { recursive: true });
+        const id = randomUUID();
+        const file = sessionFile(id);
+        fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+        const record = { timestamp: new Date().toISOString(), type: "session_meta", payload: { id, cwd: fs.realpathSync(request.params.cwd), fixtureOriginPath: file, cli_version: "0.153.4", source: "vscode" } };
+        fs.writeFileSync(file, JSON.stringify(record) + "\\n", { mode: 0o600, flag: "wx" });
+        result = { thread: readConversation(id) };
+      } else if (request.method === "thread/read") result = { thread: readConversation(request.params.threadId) };
+      else if (request.method === "thread/inject_items") {
+        const conversation = readConversation(request.params.threadId);
+        const items = request.params.items;
+        const item = items?.[0];
+        if (conversation.messages.length || items?.length !== 1 || item?.type !== "message" || item.role !== "user" || item.content?.length !== 1 || item.content[0].type !== "input_text" || typeof item.content[0].text !== "string")
+          throw new Error("The reviewer requires exactly one initial USER setup item.");
+        fs.appendFileSync(conversation.path, JSON.stringify({ timestamp: new Date().toISOString(), type: "response_item", payload: item }) + "\\n");
+        result = {};
+      }
+      else if (request.method === "thread/resume") {
+        if ("cwd" in request.params || request.params.excludeTurns !== true) throw new Error("Reviewer resume requires metadata only and the saved conversation directory.");
+        const conversation = readConversation(request.params.threadId);
+        if (!conversation.messages.length) throw new Error("The reviewer setup item must be persisted before resume.");
+        result = { thread: conversation };
+      }
+      else if (request.method === "thread/unsubscribe") result = { status: "unsubscribed" };
+      else throw new Error("Unexpected fixture app-server method: " + request.method);
+      console.log(JSON.stringify({ id: request.id, result }));
+    } catch (error) {
+      console.log(JSON.stringify({ id: request.id, error: { code: -32602, message: error.message } }));
+    }
+  }
+} else {
 const trustedProjectPath = fs.realpathSync(process.cwd());
 const config = parse(fs.readFileSync(path.join(process.env.CODEX_HOME, "config.toml"), "utf8"));
 if (config.projects?.[trustedProjectPath]?.trust_level !== "trusted") {
   console.log("Do you trust the contents of this directory?");
   await new Promise(() => setInterval(() => {}, 1000));
 }
-const args = process.argv.slice(2);
 const prompt = args.at(-1);
 const reportPath = JSON.parse(prompt.split("Write only valid JSON to ")[1].split(" by writing ")[0]);
 const contextPath = JSON.parse(prompt.split("Read the complete current task and feedback from ")[1].split(" before beginning.")[0]);
@@ -1079,6 +1336,11 @@ if (process.env.FORGE_FIXTURE_LARGE_OUTPUT === "true") {
   }
 }
 const isReview = prompt.startsWith("Review the exact checked-out commit");
+const resumedSessionId = args.includes("resume") ? args[args.indexOf("resume") + 1] : undefined;
+const conversation = resumedSessionId ? readConversation(resumedSessionId) : undefined;
+if (isReview && !conversation) throw new Error("The reviewer must resume its exact Codex conversation.");
+if (conversation && !conversation.messages.length) throw new Error("The reviewer setup item must be persisted before a TUI turn.");
+if (conversation && conversation.cwd !== trustedProjectPath) throw new Error("The resumed conversation belongs to a different checkout.");
 const git = (...command) => execFileSync("git", command, { encoding: "utf8", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } }).trim();
 const changed = [];
 if (!isReview && !fs.existsSync("solution.txt")) { fs.writeFileSync("solution.txt", "Issue resolved\\n"); changed.push("solution.txt"); }
@@ -1099,11 +1361,16 @@ const review = process.env.FORGE_FIXTURE_AUTO_REVIEW === "true"
 const report = isReview
   ? review
   : { kind: "issue", title: "Handle empty input", body: "Implemented and verified the fixture changes.", discussionReplies: (context.change?.comments ?? []).filter(comment => comment.discussionId && comment.resolved === false).map(comment => ({ discussionId: comment.discussionId, body: "Added and verified the empty-input regression." })), resolvedDiscussionIds: (context.change?.comments ?? []).filter(comment => comment.discussionId && comment.resolved === false).map(comment => comment.discussionId) };
-const receipt = { pid: process.pid, trustedProjectPath, gitAuthorizationPresent: Object.entries(process.env).some(([key, value]) => key.startsWith("GIT_CONFIG_VALUE_") && value?.includes("Authorization:")), args, templateId: process.env.CLOUDX_PERSONALITY_TEMPLATE_ID, skillIds: process.env.CLOUDX_ENABLED_SKILL_IDS, codexHome: process.env.CODEX_HOME, reportPath, contextPath, context, headSha, localReview };
+const receipt = { pid: process.pid, trustedProjectPath, gitAuthorizationPresent: Object.entries(process.env).some(([key, value]) => key.startsWith("GIT_CONFIG_VALUE_") && value?.includes("Authorization:")), args, templateId: process.env.CLOUDX_PERSONALITY_TEMPLATE_ID, skillIds: process.env.CLOUDX_ENABLED_SKILL_IDS, codexHome: process.env.CODEX_HOME, reportPath, contextPath, context, headSha, localReview, sessionId: conversation?.id, resumedSessionId, sessionPath: conversation?.path, previousMessages: conversation?.messages };
+if (conversation) {
+  const messages = [{ role: "user", content: prompt }, { role: "assistant", content: JSON.stringify(report) }];
+  for (const message of messages) fs.appendFileSync(conversation.path, JSON.stringify({ timestamp: new Date().toISOString(), type: "response_item", payload: { type: "message", role: message.role, content: [{ type: message.role === "user" ? "input_text" : "output_text", text: message.content }] } }) + "\\n");
+}
 fs.writeFileSync(path.join(process.env.FORGE_FIXTURE_RECEIPTS, path.basename(reportPath)), JSON.stringify(receipt));
 process.on("SIGUSR2", () => process.exit(0));
 fs.writeFileSync(reportPath + ".tmp", JSON.stringify(report));
 fs.renameSync(reportPath + ".tmp", reportPath);
 console.log("FORGE_FIXTURE_REPORT_READY");
 setInterval(() => {}, 1000);
+}
 `;

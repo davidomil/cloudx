@@ -301,7 +301,7 @@ describe("Saved automatic review loops", () => {
 });
 
 describe("Saved review publication receipts", () => {
-  const draft = { headSha, body: "Review finished.", event: "comment", comments: [], status: "posted" };
+  const draft = { id: "33333333-3333-4333-8333-333333333333", startedAt: worker.startedAt, headSha, body: "Review finished.", event: "comment", comments: [], status: "posted" };
   const reviewer = { ...worker, id: reviewWorkerId, kind: "review", draft };
   const publication = { commentIds: ["review-42"], inlineReview: { id: "42", commentCount: 1 } };
 
@@ -365,5 +365,57 @@ describe("Saved review publication receipts", () => {
     { publication, postedAt: null }
   ])("rejects missing, unpaired, or invalid publication timestamps %#", invalid => {
     expect(() => parseWorkers([{ ...reviewer, draft: { ...draft, ...invalid } }])).toThrow();
+  });
+});
+
+describe("Saved review rounds", () => {
+  const draft = { id: "33333333-3333-4333-8333-333333333333", startedAt: worker.startedAt, headSha, body: "Current finding.", event: "comment", comments: [], status: "draft" };
+  const previous = { ...draft, id: "44444444-4444-4444-8444-444444444444", startedAt: "2026-09-07T00:00:00.000Z", body: "Previous finding.", status: "posted", publication: { commentIds: ["posted-1"] }, postedAt: worker.startedAt };
+  const reviewer = { ...worker, id: reviewWorkerId, kind: "review", draft, reviewHistory: [previous] };
+
+  it("round-trips independent current and archived messages and publication receipts", () => {
+    const [parsed] = parseWorkers([reviewer]);
+    expect(parsed).toEqual(reviewer);
+    expect(parsed.draft).not.toBe(draft);
+    expect(parsed.reviewHistory![0]).not.toBe(previous);
+    expect(parsed.reviewHistory![0].publication).not.toBe(previous.publication);
+  });
+
+  it("keeps a running reviewer history before its next draft exists", () => {
+    const running = { ...reviewer, status: "running", draft: undefined };
+    expect(parseWorkers([running])).toEqual([running]);
+  });
+
+  it.each([
+    ["missing identity", { id: undefined }], ["non-string identity", { id: 7 }],
+    ["blank identity", { id: " " }], ["invalid identity", { id: "review" }],
+    ["trailing newline", { id: "33333333-3333-4333-8333-333333333333\n" }],
+    ["missing timestamp", { startedAt: undefined }], ["non-string timestamp", { startedAt: 7 }],
+    ["invalid timestamp", { startedAt: "2026-02-30T00:00:00.000Z" }], ["noncanonical timestamp", { startedAt: "2026-09-08" }]
+  ])("rejects %s in current and archived review rounds", (_name, invalid) => {
+    expect(() => parseWorkers([{ ...reviewer, draft: { ...draft, ...invalid } }])).toThrow(/review/i);
+    expect(() => parseWorkers([{ ...reviewer, reviewHistory: [{ ...previous, ...invalid }] }])).toThrow(/review/i);
+  });
+
+  it.each([null, {}, "reviews", Array.from({ length: 1001 }, () => previous)].map(reviewHistory => ({ reviewHistory })))("rejects an invalid or unbounded history %#", ({ reviewHistory }) => {
+    expect(() => parseWorkers([{ ...reviewer, reviewHistory }])).toThrow(/history/i);
+  });
+
+  it("accepts the full history bound without dropping saved rounds", () => {
+    const reviewHistory = Array.from({ length: 1000 }, (_, index) => ({ ...previous, id: `44444444-4444-4444-8444-${index.toString(16).padStart(12, "0")}` }));
+    expect(parseWorkers([{ ...reviewer, reviewHistory }])[0].reviewHistory).toEqual(reviewHistory);
+  });
+
+  it.each([[previous, previous], [draft], [{ ...previous, id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }, { ...previous, id: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA" }]].map(reviewHistory => ({ reviewHistory })))("rejects duplicate round identities within the worker %#", ({ reviewHistory }) => {
+    expect(() => parseWorkers([{ ...reviewer, reviewHistory }])).toThrow(/duplicate.*review/i);
+  });
+
+  it.each([{ draft }, { reviewHistory: [] }, { reviewHistory: [previous] }])("rejects review fields on an issue worker %#", fields => {
+    expect(() => parseWorkers([{ ...worker, ...fields }])).toThrow(/review worker/i);
+  });
+
+  it("validates archived review publication receipts", () => {
+    expect(() => parseWorkers([{ ...reviewer, reviewHistory: [{ ...previous, status: "draft" }] }])).toThrow(/posted/i);
+    expect(() => parseWorkers([{ ...reviewer, reviewHistory: [{ ...previous, publication: { commentIds: ["same", "same"] } }] }])).toThrow(/unique/i);
   });
 });

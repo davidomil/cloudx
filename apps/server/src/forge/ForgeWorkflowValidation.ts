@@ -1,3 +1,4 @@
+import { MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
 import type {
   ForgeAutoReview,
   ForgeIssueCompletionReport,
@@ -72,14 +73,18 @@ function parseReviewPublication(value: unknown): ForgeReviewPublication {
 
 function parseSavedReview(value: unknown): ForgeReviewDraft {
   const input = object(value);
+  const id = nonblankText(input.id, "saved review identity", 36);
+  if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(id))
+    throw new Error("Invalid saved review identity.");
+  const startedAt = isoTimestamp(input.startedAt, "review start timestamp");
   const review = parseReview(input);
   if (typeof input.status !== "string" || !["draft", "posting", "posted", "post_failed"].includes(input.status))
     throw new Error("Invalid saved review state.");
   const status = input.status as ForgeReviewDraft["status"];
-  if (input.publication === undefined && input.postedAt === undefined) return { ...review, status };
+  if (input.publication === undefined && input.postedAt === undefined) return { id, startedAt, ...review, status };
   if (status !== "posted" || input.publication === undefined || input.postedAt === undefined)
     throw new Error("Review publication requires a posted review, receipt, and timestamp.");
-  return { ...review, status, publication: parseReviewPublication(input.publication), postedAt: isoTimestamp(input.postedAt, "review publication timestamp") };
+  return { id, startedAt, ...review, status, publication: parseReviewPublication(input.publication), postedAt: isoTimestamp(input.postedAt, "review publication timestamp") };
 }
 
 export function parseReview(value: unknown): ForgeReviewSubmission {
@@ -340,7 +345,17 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
     ))
       throw new Error("A saved merge attempt requires an issue worker with a published request and commit.");
     const parsed = structuredClone(worker) as unknown as ForgeWorker;
+    if (worker.kind !== "review" && (worker.draft !== undefined || worker.reviewHistory !== undefined))
+      throw new Error("Only review workers can have review drafts or history.");
     if (worker.draft !== undefined) parsed.draft = parseSavedReview(worker.draft);
+    if (worker.reviewHistory !== undefined) {
+      if (!Array.isArray(worker.reviewHistory) || worker.reviewHistory.length > MAX_FORGE_REVIEW_HISTORY)
+        throw new Error(`Review history must contain at most ${MAX_FORGE_REVIEW_HISTORY} drafts.`);
+      parsed.reviewHistory = worker.reviewHistory.map(parseSavedReview);
+      const reviewIds = [...parsed.reviewHistory, ...(parsed.draft ? [parsed.draft] : [])].map(draft => draft.id.toLowerCase());
+      if (new Set(reviewIds).size !== reviewIds.length)
+        throw new Error("Duplicate saved review identity.");
+    }
     if (worker.autoReview !== undefined) {
       if (worker.kind !== "issue") throw new Error("Only issue workers can have an automatic review loop.");
       parsed.autoReview = parseAutoReview(worker.autoReview, parsed.id);

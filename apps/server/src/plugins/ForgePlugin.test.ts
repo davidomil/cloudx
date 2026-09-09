@@ -26,6 +26,8 @@ async function fixture() {
     setAutoReview: vi.fn(async () => ({ id: "worker" })),
     dashboard: vi.fn(async () => ({ workers: [] })),
     markReview: vi.fn(async () => {}),
+    saveReview: vi.fn(async () => ({ id: "worker" })),
+    submitReview: vi.fn(async () => ({ id: "worker" })),
   };
   let settings: ForgeSettingsService;
   const plugin = new ForgePlugin(() => ({
@@ -50,6 +52,32 @@ async function fixture() {
   return { plugin, config, settings, hooks, workflow, connections };
 }
 describe("Forge plugin boundary", () => {
+  it("binds saving and submitting a review to the displayed draft", async () => {
+    const { hooks, workflow } = await fixture();
+    const draftId = "33333333-3333-4333-8333-333333333333";
+    const edit = { body: "Review this revision.", event: "comment", comments: [] };
+    await hooks.call("forge.review.save", { id: "worker", draftId, ...edit }, { caller: { kind: "ui" } });
+    await hooks.call("forge.review.submit", { id: "worker", draftId }, { caller: { kind: "ui" } });
+    expect(workflow.saveReview).toHaveBeenCalledExactlyOnceWith("worker", draftId, edit);
+    expect(workflow.submitReview).toHaveBeenCalledExactlyOnceWith("worker", draftId);
+  });
+
+  it.each([undefined, null, 7, "", " ", "review", "33333333-3333-4333-8333-33333333333", "33333333-3333-4333-8333-333333333333\n"])("rejects a missing or invalid draft identity before either mutation: %j", async draftId => {
+    const { hooks, workflow } = await fixture();
+    for (const hook of ["forge.review.save", "forge.review.submit"]) {
+      const edit = hook === "forge.review.save" ? { body: "Finding.", event: "comment", comments: [] } : {};
+      await expect(hooks.call(hook, { id: "worker", ...edit, ...(draftId === undefined ? {} : { draftId }) }, { caller: { kind: "ui" } })).rejects.toThrow(/invalid input.*draftId/);
+    }
+    expect(workflow.saveReview).not.toHaveBeenCalled();
+    expect(workflow.submitReview).not.toHaveBeenCalled();
+  });
+
+  it("rejects client changes to the server-owned review timestamp", async () => {
+    const { hooks, workflow } = await fixture();
+    await expect(hooks.call("forge.review.save", { id: "worker", draftId: "33333333-3333-4333-8333-333333333333", startedAt: "2026-09-07T12:00:00.000Z", body: "Finding.", comments: [], event: "comment" }, { caller: { kind: "ui" } })).rejects.toThrow(/invalid input/);
+    expect(workflow.saveReview).not.toHaveBeenCalled();
+  });
+
   it.each([
     { provider: "github", event: "approve", headSha: "a".repeat(40) },
     { provider: "github", event: "request_changes", headSha: "b".repeat(64) },

@@ -15,7 +15,7 @@ export class TerminalSupervisor {
   private exited = false;
   private termination: Promise<void> | undefined;
 
-  constructor(private readonly process: IPty, private readonly directory: string) {
+  constructor(private readonly process: Pick<IPty, "pid" | "onExit" | "kill">, private readonly directory: string) {
     this.started = processStarted(process.pid);
     this.completion = new Promise((resolve) => {
       process.onExit(() => {
