@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = path.resolve(import.meta.dirname, "../..");
+const serverEntry = "tests/browser/fixtures/catalog-server.mjs";
 let testRoot: string;
 let catalog: string;
 let baseUrl: string;
@@ -64,7 +65,7 @@ test.beforeAll(async () => {
     probe.close((error) => (error ? reject(error) : resolve())),
   );
   baseUrl = `http://127.0.0.1:${address.port}`;
-  server = spawn(process.execPath, ["apps/server/dist/index.js"], {
+  server = spawn(process.execPath, [serverEntry], {
     cwd: repoRoot,
     env: {
       ...process.env,
