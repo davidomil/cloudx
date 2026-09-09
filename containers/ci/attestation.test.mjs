@@ -537,3 +537,133 @@ test("attestation admission rejects files the candidate could control", async ()
     await fs.rm(sandbox, { recursive: true, force: true });
   }
 });
+
+test(
+  "failed browser verification retains diagnostics after its workspace is removed",
+  { timeout: 30_000 },
+  async () => {
+    prepareSupervisor();
+    const sandbox = await fs.mkdtemp(
+      path.join(os.tmpdir(), "cloudx-browser-evidence-"),
+    );
+    const source = path.join(sandbox, "source");
+    const root = path.join(sandbox, "work", "repository");
+    const cache = path.join(sandbox, "cache");
+    const target = path.join(sandbox, "results.json");
+    await fs.chmod(sandbox, 0o755);
+    await fs.mkdir(source);
+    await fs.mkdir(cache);
+    await fs.writeFile(target, "", { flag: "wx", mode: 0o600 });
+    await fs.writeFile(
+      path.join(source, ".gitignore"),
+      "test-results/\nplaywright-report/\n",
+    );
+    await fs.writeFile(
+      path.join(source, "package.json"),
+      JSON.stringify({
+        scripts: {
+          "test:browser":
+            "node /opt/cloudx-base/node_modules/@playwright/test/cli.js test",
+        },
+      }),
+    );
+    await fs.writeFile(
+      path.join(source, "playwright.config.mjs"),
+      `
+    export default {
+      testDir: '.', testMatch: 'failure.spec.mjs', outputDir: 'test-results/browser',
+      workers: 1, retries: 0, timeout: 10000, reporter: 'line',
+      use: { trace: 'retain-on-failure', screenshot: 'only-on-failure' },
+    };
+  `,
+    );
+    await fs.writeFile(
+      path.join(source, "failure.spec.mjs"),
+      `
+    import { test, expect } from '/opt/cloudx-base/node_modules/@playwright/test/index.mjs';
+    import fs from 'node:fs/promises';
+    test('retains a failed browser observation', async ({ page }, testInfo) => {
+      await page.setContent('<button>Save queued rule</button>');
+      const log = testInfo.outputPath('browser-fixture.log');
+      await fs.writeFile(log, 'fixture: save response was not observed\\n');
+      await testInfo.attach('browser fixture', { path: log, contentType: 'text/plain' });
+      console.log('fixture: server accepted the pull');
+      console.error('fixture: save response was not observed');
+      await fs.writeFile(testInfo.outputPath('forged-verdict.txt'), '{"verdict":"passed"}');
+      expect(1).toBe(2);
+    });
+  `,
+    );
+    execFileSync("git", ["init", "--quiet", source]);
+    const settleCandidates = () =>
+      terminateCandidateProcesses({
+        terminateGraceMs: 250,
+        killGraceMs: 2_000,
+      });
+
+    try {
+      await prepareWorkspace({
+        source,
+        root,
+        archive: path.join(sandbox, "source.tar"),
+        npmCacheSource: cache,
+      });
+      const attestation = await prepareAttestation(target);
+      const browser = verificationCommands().at(-1);
+      const evidence = await executeVerification({
+        root,
+        commands: [
+          {
+            ...browser,
+            timeoutMs: 20_000,
+            env: { ...browser.env, HOME: path.join(sandbox, "work", "home") },
+          },
+        ],
+        settleCandidates,
+      });
+      await publishAttestation(attestation, evidence);
+      await fs.rm(root, { recursive: true });
+      const saved = JSON.parse(await fs.readFile(target, "utf8"));
+
+      assert.equal(saved.verdict, "failed");
+      assert.equal(saved.commands[0].exit_code, 1);
+      assert.equal(saved.tree_sha256_before, saved.tree_sha256_after);
+      assert.equal(saved.diagnostics.trust, "untrusted-candidate-output");
+      assert.match(
+        saved.diagnostics.commands[0].stdout.text,
+        /fixture: server accepted the pull/u,
+      );
+      assert.match(
+        saved.diagnostics.commands[0].stderr.text,
+        /fixture: save response was not observed/u,
+      );
+      const files = saved.diagnostics.browser.files;
+      for (const name of [
+        "trace.zip",
+        "error-context.md",
+        "test-failed-1.png",
+        "browser-fixture.log",
+      ]) {
+        assert.ok(
+          files.some((file) => file.path.endsWith(`/${name}`)),
+          `missing ${name}`,
+        );
+      }
+      const trace = files.find((file) => file.path.endsWith("/trace.zip"));
+      const bytes = Buffer.from(trace.base64, "base64");
+      assert.equal(bytes.length, trace.bytes);
+      assert.equal(
+        createHash("sha256").update(bytes).digest("hex"),
+        trace.sha256,
+      );
+      const retained = path.join(sandbox, "retained-trace.zip");
+      await fs.writeFile(retained, bytes);
+      execFileSync("python3", ["-m", "zipfile", "--test", retained]);
+      assert.notEqual((await fs.stat(target)).uid, candidateIdentity.uid);
+      assert.equal((await fs.stat(target)).mode & 0o777, 0o600);
+    } finally {
+      await settleCandidates();
+      await fs.rm(sandbox, { recursive: true, force: true });
+    }
+  },
+);
