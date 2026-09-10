@@ -71,7 +71,7 @@ async function fixture(selectedRepository: ForgeRepository) {
     refreshReviewWorkspace: vi.fn(async () => {}),
     launch: vi.fn(async () => "worker-tab"),
     pause: vi.fn(async () => {}), close: vi.fn(async () => {}), cleanup: vi.fn(async () => {}),
-    verifyPublishedWorkspace: vi.fn(async () => {}), updateIssueBranch: vi.fn(async () => headSha), publishBranch: vi.fn(async () => headSha),
+    verifyPublishedWorkspace: vi.fn(async () => {}), syncPublishedBranch: vi.fn(async () => {}), updateIssueBranch: vi.fn(async () => headSha), publishBranch: vi.fn(async () => headSha),
   } satisfies ForgeWorkflowDependencies["runtime"];
   const deps: ForgeWorkflowDependencies = {
     settings: () => settings.settings(), provider: (selected, role, signal) => settings.provider(selected, role, signal), runtime,

@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { generateKeyPairSync } from "node:crypto";
 import Fastify from "fastify";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ForgeCredentialRole, ForgeRepository } from "@cloudx/shared";
@@ -8,6 +9,7 @@ import { ForgeConnectionService } from "./ForgeConnectionService.js";
 import { ForgeConnectionStore, connectionKey } from "./ForgeConnectionStore.js";
 import { ForgeRegistrationClient } from "./ForgeRegistrationClient.js";
 import { registerForgeConnectionRoutes } from "./ForgeConnectionRoutes.js";
+import { ForgeProviderError } from "../providers/ForgeProvider.js";
 
 const github: ForgeRepository = { provider: "github", apiUrl: "https://api.github.com", projectPath: "team/project" };
 const gitlab: ForgeRepository = { provider: "gitlab", apiUrl: "https://gitlab.com/api/v4", projectPath: "team/project" };
@@ -26,7 +28,7 @@ async function fixture(repository = github) {
     githubManifest: vi.fn(manifest.githubManifest.bind(manifest)),
     githubConvert: vi.fn(async (_repository: ForgeRepository, code: string, _signal?: AbortSignal) =>
       ({ appId: code === "worker" ? "11" : "12", privateKey: "private-" + code, slug: "cloudx-" + code, name: "CloudX " + code })),
-    githubInstallation: vi.fn(async (_repository: ForgeRepository, _app: unknown, id: string, _role: ForgeCredentialRole, _signal?: AbortSignal) => ({ installationId: id })),
+    githubInstallation: vi.fn(async (_repository: ForgeRepository, _app: { appId: string; privateKey: string }, id: string, _role: ForgeCredentialRole, _signal?: AbortSignal) => ({ installationId: id })),
     gitlabCheckSetup: vi.fn(async (_repository: ForgeRepository, _token: string, _signal?: AbortSignal) => {}),
     gitlabCreateAccount: vi.fn(async (_repository: ForgeRepository, role: ForgeCredentialRole, _token: string, _signal?: AbortSignal) =>
       ({ id: role === "worker" ? "21" : "22", name: "CloudX " + role, username: "cloudx_" + role })),
@@ -303,6 +305,52 @@ describe("Forge connection HTTP routes", () => {
     expect(status.headers["cache-control"]).toBe("no-store");
     expect(status.json().roles[0].state).toBe("connected");
     expect(status.body).not.toMatch(/private-worker|cookieHash/);
+  });
+
+  it("shows missing workflow access in browser status and connects the same app after the grant is approved", async () => {
+    const f = await server();
+    const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    f.registration.githubConvert.mockResolvedValueOnce({ appId: "11", privateKey, slug: "cloudx-worker", name: "CloudX worker" });
+    const permissions: Record<string, string> = { contents: "write", issues: "write", pull_requests: "write" };
+    const client = new ForgeRegistrationClient(async () => Response.json({ id: 41, app_id: 11, suspended_at: null, permissions }));
+    f.registration.githubInstallation.mockImplementation(client.githubInstallation.bind(client));
+    const start = await f.app.inject({ method: "POST", url: "/api/forge/connections/github/start", headers: { origin }, payload: { repository: github, role: "worker" } });
+    const state = new URL(start.json().url).searchParams.get("state")!;
+    const cookie = String(start.headers["set-cookie"]).split(";")[0]!;
+    const converted = await f.app.inject({ url: `/api/forge/connections/github/manifest?state=${state}&code=worker`, headers: { cookie } });
+    expect(converted.statusCode).toBe(302);
+    const callback = { url: `/api/forge/connections/github/installation?state=${state}&installation_id=41`, headers: { cookie } };
+
+    const rejected = await f.app.inject(callback);
+    expect(rejected.statusCode).toBe(400);
+    expect(rejected.body).toContain("Return to CloudX Settings");
+    const status = await f.app.inject("/api/forge/connections");
+    expect(status.json().roles[0]).toMatchObject({
+      state: "installing",
+      message: "Grant the worker GitHub App Workflows: write permission, approve the updated permissions for its installation, then continue installation.",
+    });
+    expect(status.body).not.toMatch(/PRIVATE KEY|cookieHash/);
+    expect(f.service().status().roles[0]?.message).toBe(status.json().roles[0].message);
+
+    permissions.workflows = "write";
+    expect((await f.app.inject(callback)).statusCode).toBe(200);
+    const connected = await f.app.inject("/api/forge/connections");
+    expect(connected.json().roles[0].state).toBe("connected");
+    expect(connected.json().roles[0].message).toBeUndefined();
+    expect(f.registration.githubConvert).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps arbitrary provider failures out of callback HTML and connection status", async () => {
+    const f = await server();
+    const start = await f.begin();
+    const cookie = `cloudx_forge_${start.state}=${start.cookie}`;
+    await f.app.inject({ url: `/api/forge/connections/github/manifest?state=${start.state}&code=worker`, headers: { cookie } });
+    f.registration.githubInstallation.mockRejectedValueOnce(new ForgeProviderError("private-provider-response", 403));
+    const rejected = await f.app.inject({ url: `/api/forge/connections/github/installation?state=${start.state}&installation_id=41`, headers: { cookie } });
+    expect(rejected.statusCode).toBe(400);
+    const status = await f.app.inject("/api/forge/connections");
+    expect(status.json().roles[0]).toMatchObject({ state: "installing", message: "Install this app on the configured repository with its requested permissions, then continue installation." });
+    expect(rejected.body + status.body).not.toContain("private-provider-response");
   });
 
   it.each([undefined, "https://untrusted.example"])("requires a trusted browser origin for setup writes", async untrusted => {

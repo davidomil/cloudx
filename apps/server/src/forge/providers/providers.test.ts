@@ -921,6 +921,44 @@ describe("inconsistent provider head snapshots", () => {
 });
 
 describe("GitHub review and exact-commit merge", () => {
+  it.each([
+    ["SUCCESS", "passed"], ["PENDING", "pending"], ["EXPECTED", "pending"],
+    ["FAILURE", "failed"], ["ERROR", "failed"],
+  ])("reports %s checks separately from merge readiness", async (state, expected) => {
+    const { provider } = hubFixture({
+      request: { html_url: "https://github.com/owner/repo/pull/7" },
+      graphql: { mergeStateStatus: "BEHIND", headRef: { target: { oid: headSha, statusCheckRollup: { state } } } },
+    });
+    expect(await provider.getChangeRequest(7)).toMatchObject({
+      requiresBaseUpdate: true,
+      mergeable: false,
+      checks: { state: expected, url: "https://github.com/owner/repo/pull/7/checks" },
+    });
+  });
+
+  it("reports absent checks without claiming they passed", async () => {
+    const { provider } = hubFixture({ graphql: { headRef: { target: { oid: headSha, statusCheckRollup: null } } } });
+    expect(await provider.getChangeRequest(7)).toMatchObject({ checks: { state: "unknown" } });
+  });
+
+  it("rejects check evidence for another head even when the branch is behind", async () => {
+    const { provider } = hubFixture({ graphql: { mergeStateStatus: "BEHIND", headRef: { target: { oid: previousSha, statusCheckRollup: { state: "SUCCESS" } } } } });
+    await expect(provider.getChangeRequest(7)).rejects.toBeInstanceOf(ForgeHeadChangedError);
+  });
+
+  it.each([
+    ["failed", "failed"], ["canceled", "failed"], ["success", "passed"],
+    ["running", "pending"], ["pending", "pending"], ["manual", "pending"],
+  ])("reports a GitLab %s pipeline for the current revision", async (status, expected) => {
+    const { provider } = labFixture({ request: { head_pipeline: { sha: headSha, status, web_url: "https://gitlab.example/group/subgroup/repo/-/pipelines/17" } } });
+    expect(await provider.getChangeRequest(7)).toMatchObject({ checks: { state: expected, url: "https://gitlab.example/group/subgroup/repo/-/pipelines/17" } });
+  });
+
+  it("does not attribute an older GitLab pipeline failure to the current revision", async () => {
+    const { provider } = labFixture({ request: { head_pipeline: { sha: previousSha, status: "failed", web_url: "https://gitlab.example/group/subgroup/repo/-/pipelines/17" } } });
+    expect(await provider.getChangeRequest(7)).toMatchObject({ checks: { state: "unknown" } });
+  });
+
   it("loads issue comments, inline comments, review decisions and the pinned comparison base", async () => {
     const { provider } = hubFixture();
     expect(await provider.getChangeRequest(7)).toMatchObject({

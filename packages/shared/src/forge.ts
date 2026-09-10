@@ -78,6 +78,10 @@ export interface ForgeChangeRequest extends ForgeChangeRequestSummary, ForgeChan
   reviewReady: boolean;
   mergeable: boolean;
   requiresBaseUpdate: boolean;
+  checks?: {
+    state: "passed" | "pending" | "failed" | "unknown";
+    url: string;
+  };
   approved: boolean;
   unresolvedDiscussions: number;
   comments: ForgeComment[];
