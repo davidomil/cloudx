@@ -141,7 +141,7 @@ describe("install-cloudx helpers", () => {
     expect(row).not.toContain("from `0`");
   });
 
-  it("runs documentation setup with only the installer-owned pinned uv executable", () => {
+  it("runs documentation setup with the installer-owned uv and managed Python runtime", () => {
     const home = fs.mkdtempSync(
       path.join(os.tmpdir(), "cloudx-documentation-setup-home-"),
     );
@@ -150,7 +150,7 @@ describe("install-cloudx helpers", () => {
     fs.mkdirSync(path.dirname(uvPath), { recursive: true });
     fs.writeFileSync(
       uvPath,
-      '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$CLOUDX_TEST_UV_LOG"\n',
+      '#!/bin/sh\nprintf \'%s\\n\' "$UV_PYTHON_INSTALL_DIR" "$@" > "$CLOUDX_TEST_UV_LOG"\n',
     );
     fs.chmodSync(uvPath, 0o755);
     const packageJson = JSON.parse(
@@ -173,8 +173,12 @@ describe("install-cloudx helpers", () => {
       );
 
       expect(fs.readFileSync(logPath, "utf8").trim().split("\n")).toEqual([
+        path.join(home, ".local/share/cloudx/python"),
         "sync",
         "--locked",
+        "--python",
+        "3.12",
+        "--managed-python",
         "--project",
         "services/documentation-indexer",
         "--extra",
@@ -818,6 +822,69 @@ describe("install-cloudx helpers", () => {
 });
 
 describe("runInstaller prerequisites", () => {
+  it.each([
+    ["install", "asr"],
+    ["install", "documentation-indexer"],
+    ["update", "asr"],
+    ["update", "documentation-indexer"],
+  ])("stops %s when the managed %s environment cannot be synchronized", async (mode, service) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-python-failure-"));
+    const home = path.join(root, "home");
+    const project = path.join(root, "services", service);
+    const environment = path.join(project, ".venv");
+    fs.mkdirSync(environment, { recursive: true });
+    fs.writeFileSync(path.join(environment, "pyvenv.cfg"), "version = 3.10.12\n");
+    const runner = new InstallerRunner({ dryRun: true, cwd: root, log: () => undefined });
+    fs.mkdirSync(path.join(home, ".config/cloudx"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".config/cloudx/cloudx.env"), "CLOUDX_PORT=3001\n");
+    runner.inspect = (command, args) => {
+      if (command === "systemctl") return "LoadState=not-found";
+      if (args.includes("--show-toplevel")) return root;
+      if (args[0] === "status") return "";
+      if (args[0] === "remote") return "/fixture/origin.git";
+      return "a".repeat(40);
+    };
+    const run = runner.run.bind(runner);
+    runner.run = (command, args = [], options = {}) => {
+      run(command, args, options);
+      if (args[0] === "sync" && args.includes(project)) {
+        throw new Error("Managed Python could not be installed");
+      }
+    };
+
+    try {
+      await expect(runInstaller({
+        repoRoot: root,
+        home,
+        env: TEST_ENV,
+        dryRun: true,
+        yes: true,
+        update: mode === "update",
+        runner,
+        osRelease: { ID: "ubuntu", VERSION_ID: "22.04" },
+        gpuDetected: false,
+        cudaRuntimeReady: false,
+      })).rejects.toThrow("Managed Python could not be installed");
+
+      const attempts = runner.commands.filter((command) =>
+        command.args[0] === "sync" && command.args.includes(project),
+      );
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]).toMatchObject({
+        args: ["sync", "--locked", "--python", "3.12", "--managed-python", "--project", project, "--extra", "dev"],
+        env: {
+          UV_PROJECT_ENVIRONMENT: environment,
+          UV_PYTHON_INSTALL_DIR: path.join(home, ".local/share/cloudx/python"),
+        },
+      });
+      expect(runner.commands.at(-1)).toBe(attempts[0]);
+      expect(runner.commands.some((command) => command.command === "systemctl")).toBe(false);
+      expect(fs.readFileSync(path.join(environment, "pyvenv.cfg"), "utf8")).toBe("version = 3.10.12\n");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("stops the production installer before later work when an unsupported Git upgrade is declined", async () => {
     class RecordingInstallerRunner extends InstallerRunner {
       constructor() {
@@ -993,6 +1060,9 @@ describe("runInstaller dry-run", () => {
           "/home/me/.local/share/cloudx/uv/bin/uv",
           "sync",
           "--locked",
+          "--python",
+          "3.12",
+          "--managed-python",
           "--project",
           "/repo/services/asr",
           "--extra",
@@ -1002,6 +1072,9 @@ describe("runInstaller dry-run", () => {
           "/home/me/.local/share/cloudx/uv/bin/uv",
           "sync",
           "--locked",
+          "--python",
+          "3.12",
+          "--managed-python",
           "--project",
           "/repo/services/documentation-indexer",
           "--extra",
@@ -1031,7 +1104,10 @@ describe("runInstaller dry-run", () => {
           command.command.endsWith("/uv") &&
           command.args.includes("/repo/services/asr"),
       )?.env,
-    ).toEqual({ UV_PROJECT_ENVIRONMENT: "/repo/services/asr/.venv" });
+    ).toEqual({
+      UV_PROJECT_ENVIRONMENT: "/repo/services/asr/.venv",
+      UV_PYTHON_INSTALL_DIR: "/home/me/.local/share/cloudx/python",
+    });
     expect(
       runner.commands.find(
         (command) =>
@@ -1040,6 +1116,7 @@ describe("runInstaller dry-run", () => {
       )?.env,
     ).toEqual({
       UV_PROJECT_ENVIRONMENT: "/repo/services/documentation-indexer/.venv",
+      UV_PYTHON_INSTALL_DIR: "/home/me/.local/share/cloudx/python",
     });
     expectRuntimeSchemaWrites(runner, "/repo");
   });
@@ -1089,6 +1166,9 @@ describe("runInstaller dry-run", () => {
       "/home/me/.local/share/cloudx/uv/bin/uv",
       "sync",
       "--locked",
+      "--python",
+      "3.12",
+      "--managed-python",
       "--project",
       "/repo/services/asr",
       "--extra",
@@ -1100,6 +1180,9 @@ describe("runInstaller dry-run", () => {
       "/home/me/.local/share/cloudx/uv/bin/uv",
       "sync",
       "--locked",
+      "--python",
+      "3.12",
+      "--managed-python",
       "--project",
       "/repo/services/documentation-indexer",
       "--extra",
@@ -1438,6 +1521,9 @@ describe("runInstaller dry-run", () => {
       "/home/me/.config/cloudx/cloudx.env",
     ]);
     expect(planned).not.toContainEqual(["rm", "-rf", "/repo/node_modules"]);
+    expect(planned).not.toContainEqual([
+      "rm", "-rf", "/home/me/.local/share/cloudx/python",
+    ]);
   });
 
   it("plans optional uninstall removals when selected", async () => {
@@ -1638,6 +1724,9 @@ describe("runInstaller dry-run", () => {
           path.join(home, ".local/share/cloudx/uv/bin/uv"),
           "sync",
           "--locked",
+          "--python",
+          "3.12",
+          "--managed-python",
           "--project",
           path.join(root, "services/asr"),
           "--extra",
@@ -1649,6 +1738,9 @@ describe("runInstaller dry-run", () => {
           path.join(home, ".local/share/cloudx/uv/bin/uv"),
           "sync",
           "--locked",
+          "--python",
+          "3.12",
+          "--managed-python",
           "--project",
           path.join(root, "services/documentation-indexer"),
           "--extra",
