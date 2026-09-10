@@ -8,6 +8,7 @@ import { RULES_SKILLS_PLUGIN_ID, type WorkspaceRuntimeContext, type WorkspaceTab
 import { describe, expect, it, vi } from "vitest";
 
 import { TabContextService } from "./context/TabContextService.js";
+import * as contextFiles from "./jsonStateFile.js";
 import { PathPolicy } from "./pathPolicy.js";
 import { PluginRegistry } from "./pluginRegistry.js";
 import { SessionStore, type SessionRuntimeContextResolver } from "./sessionStore.js";
@@ -1588,6 +1589,59 @@ describe("SessionStore voice actions", () => {
     expect(sessions).toHaveLength(2);
     expect(sessions.every((session) => session.stopped)).toBe(true);
     expect(store.listTabs()).toEqual([]);
+  });
+
+  it.each(["written", "failed"] as const)("waits for terminal context to be %s before disposal completes", async outcome => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-session-context-close-"));
+    const writeStarted = deferred<void>();
+    const releaseWrite = deferred<void>();
+    const sessionStopped = deferred<void>();
+    const failure = new Error("context append failed");
+    const append = vi.fn(async (...args: Parameters<typeof contextFiles.appendTextFileNoFollow>) => {
+      writeStarted.resolve();
+      await releaseWrite.promise;
+      if (outcome === "failed") throw failure;
+      await contextFiles.appendTextFileNoFollow(...args);
+    });
+    const context = new TabContextService(path.join(root, ".cloudx"), { ...contextFiles, appendTextFileNoFollow: append });
+    const recording = vi.spyOn(context, "record");
+    const plugin = new FakeDefaultPlugin();
+    const registry = new PluginRegistry();
+    registry.register(plugin);
+    const reportError = vi.fn();
+    const store = new SessionStore(registry, new PathPolicy([root]), context, undefined, undefined, undefined, reportError);
+    let closed = false;
+    try {
+      const tab = await store.createTab({ pluginId: plugin.id, cwd: root });
+      vi.spyOn(plugin.lastSession!, "stop").mockImplementation(() => sessionStopped.resolve());
+      plugin.lastSession!.emitData("output before disposal");
+      await writeStarted.promise;
+
+      const closing = store.dispose().then(() => { closed = true; });
+      await sessionStopped.promise;
+      plugin.lastSession!.emitData("output after disposal");
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(closed).toBe(false);
+      expect(recording).toHaveBeenCalledOnce();
+      releaseWrite.resolve();
+      await closing;
+
+      const saved = await fs.readFile(tab.contextPath!, "utf8");
+      if (outcome === "written") {
+        expect(saved).toContain("output before disposal");
+        expect(reportError).not.toHaveBeenCalled();
+      } else {
+        expect(saved).not.toContain("output before disposal");
+        expect(reportError).toHaveBeenCalledExactlyOnceWith(failure, { operation: "record terminal output", tabId: tab.id });
+      }
+      expect(saved).not.toContain("output after disposal");
+    } finally {
+      releaseWrite.resolve();
+      await store.dispose();
+      await Promise.allSettled(recording.mock.results.map(result => result.value));
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 
   it("drains an admitted action and its late trigger before stopping the session", async () => {

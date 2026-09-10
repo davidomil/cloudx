@@ -118,6 +118,7 @@ export interface AppServices {
   forge?: ForgeWorkflowService;
   forgeConnections?: ForgeConnectionService;
   pluginContributionsReady?: Promise<RulesSkillsStore>;
+  disposeRulesSkillsUpdates?: () => Promise<void>;
   codexStateSources?: CodexStateSources;
 }
 
@@ -225,6 +226,8 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       () => services.forgeConnections?.dispose()
     ]);
     const sourceShutdown = settleDisposers([() => services.codexStateSources?.dispose()]);
+    const setupShutdown = settleDisposers([() => services.pluginContributionsReady]);
+    const rulesSkillsUpdatesShutdown = settleDisposers([() => services.disposeRulesSkillsUpdates?.()]);
     const producerShutdown = settleDisposers([
       () => services.jiraPolling?.dispose(),
       async () => {
@@ -250,6 +253,8 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       }
       automationFailures.push(...await settleDisposers([() => services.automation?.dispose()]));
       failures.push(...automationFailures);
+      failures.push(...await setupShutdown);
+      failures.push(...await rulesSkillsUpdatesShutdown);
       failures.push(...await settleDisposers([() => disposePersistenceNotifications()]));
       failures.push(...await sourceShutdown);
       if (failures.length > 0) {
@@ -1265,11 +1270,18 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     reports: new ForgeWorkerReports(config.dataDir),
     notify: (title, body) => { notifications.send({ title, body }); }
   });
-  rulesSkills.onChange(() => {
-    void (async () => {
-      await sessions?.refreshRuntimeIndicators();
-    })();
+  const pendingRulesSkillsUpdates = new Set<Promise<void>>();
+  const unsubscribeRulesSkills = rulesSkills.onChange(() => {
+    const refresh = sessions!.refreshRuntimeIndicators().catch((error) => {
+      logger?.error({ err: error }, "Failed to refresh rules/skills indicators.");
+    });
+    pendingRulesSkillsUpdates.add(refresh);
+    void refresh.then(() => pendingRulesSkillsUpdates.delete(refresh));
   });
+  const disposeRulesSkillsUpdates = async (): Promise<void> => {
+    unsubscribeRulesSkills();
+    await Promise.all(pendingRulesSkillsUpdates);
+  };
   const pluginContributionsReady = syncPluginContributions(plugins.values(), rulesSkills, logger).then(async (store) => {
     await sessions?.applyRuntimeContexts((tab) => tab.pluginId === "codex-terminal", "Injecting plugin-contributed system rules and skills.");
     return store;
@@ -1311,7 +1323,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   jiraPolling.start();
   forge.start();
   automation = createAutomationService(automationRepository, { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config);
-  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, forgeConnections, pluginContributionsReady, codexStateSources };
+  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, forgeConnections, pluginContributionsReady, disposeRulesSkillsUpdates, codexStateSources };
 }
 
 function isStreamingHookRequest(request: FastifyRequest<{ Querystring: { stream?: string } }>): boolean {
