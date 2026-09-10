@@ -1,6 +1,7 @@
 import { createPrivateKey, sign } from "node:crypto";
 import type { ForgeCredentialRole, ForgeRepository } from "@cloudx/shared";
-import { ForgeProviderError, ForgeProviderUnavailableError, forgeRequestFailure, throwIfForgeRequestAborted } from "./ForgeProvider.js";
+import { ForgeProviderError, throwIfForgeRequestAborted, type ForgeDiagnosticObserver } from "./ForgeProvider.js";
+import { ForgeRequestFailures, httpFailure } from "./ForgeRequestFailures.js";
 import { record, string } from "./validation.js";
 import { readBoundedBody } from "./responseBody.js";
 
@@ -94,6 +95,7 @@ export function githubAppJwt(app: {
 }
 
 export class ForgeCredentials {
+  private requestNotBefore = 0;
   private readonly installationTokens = new Map<
     ForgeCredentialRole,
     { credential: string; token: string; expires: number }
@@ -103,8 +105,19 @@ export class ForgeCredentials {
     private readonly repository: ForgeRepository,
     private readonly read: ReadForgeCredential,
     private readonly fetcher: typeof fetch = fetch,
+    private readonly onFailure?: ForgeDiagnosticObserver,
   ) {
     validateRepository(repository);
+  }
+
+  deferRequests(retryAfterMs: number | undefined): void {
+    if (retryAfterMs === undefined || retryAfterMs <= 0 || !Number.isFinite(retryAfterMs)) return;
+    this.requestNotBefore = Math.max(this.requestNotBefore, Date.now() + retryAfterMs);
+  }
+
+  requestDelay(): number | undefined {
+    const delay = this.requestNotBefore - Date.now();
+    return delay > 0 ? delay : undefined;
   }
 
   async headers(
@@ -174,6 +187,9 @@ export class ForgeCredentials {
     credential: Extract<ForgeCredential, { kind: "github-app" }>,
     signal?: AbortSignal,
   ): Promise<string> {
+    const path = `/app/installations/${credential.installationId}/access_tokens`;
+    const failures = new ForgeRequestFailures(this.repository, role, path, "POST", "authentication", this.onFailure);
+    failures.assertReady(signal, this.requestDelay());
     if (
       !/^[A-Za-z0-9_]+$/.test(credential.appId) ||
       !/^\d+$/.test(credential.installationId)
@@ -192,45 +208,42 @@ export class ForgeCredentials {
       AbortSignal.timeout(30_000),
       ...(signal ? [signal] : []),
     ]);
-    throwIfForgeRequestAborted(requestSignal, "authentication");
+    failures.assertReady(requestSignal, this.requestDelay());
+    const url = `${this.repository.apiUrl.replace(/\/$/, "")}${path}`;
+    const request: RequestInit = {
+      method: "POST", redirect: "manual", signal: requestSignal,
+      headers: {
+        Authorization: `Bearer ${jwt}`, Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2026-03-10", "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ repositories: [this.repository.projectPath.split("/")[1]] }),
+    };
     try {
-      response = await this.fetcher(
-        `${this.repository.apiUrl.replace(/\/$/, "")}/app/installations/${credential.installationId}/access_tokens`,
-        {
-          method: "POST",
-          redirect: "error",
-          signal: requestSignal,
-          headers: {
-            Authorization: `Bearer ${jwt}`,
-            Accept: "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2026-03-10",
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            repositories: [this.repository.projectPath.split("/")[1]],
-          }),
-        },
-      );
+      new Request(url, request);
     } catch {
-      throw new ForgeProviderUnavailableError(forgeRequestFailure(requestSignal), "authentication");
+      throw failures.prepare("GitHub App authentication could not be prepared; check its configuration.");
+    }
+    try {
+      response = await this.fetcher(url, request);
+    } catch (error) {
+      throw failures.transport(error, requestSignal, false);
     }
     if (!response.ok) {
+      const failure = httpFailure(response, this.repository.provider);
+      this.deferRequests(failure.retryAfterMs);
       try {
         await response.body?.cancel();
       } finally {
-        throw new ForgeProviderError(
-          `GitHub App authentication failed (HTTP ${response.status}).`,
-          response.status,
-        );
+        throw failures.http(failure, false);
       }
     }
     let value: unknown;
     try {
       value = JSON.parse(await readBoundedBody(response, 100_000));
-    } catch {
-      throw new ForgeProviderUnavailableError(forgeRequestFailure(requestSignal, true), "authentication");
+      if (requestSignal.aborted) throw requestSignal.reason;
+    } catch (error) {
+      throw failures.transport(error, requestSignal, false, true);
     }
-    throwIfForgeRequestAborted(requestSignal, "authentication");
     let body: Record<string, unknown>;
     try {
       body = record(value);

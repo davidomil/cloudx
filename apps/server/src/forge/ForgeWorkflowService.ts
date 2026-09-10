@@ -127,6 +127,17 @@ export interface ForgeWorkflowDependencies {
   notify(title: string, body: string): void;
 }
 
+const PROVIDER_RECOVERY_DELAYS = [5_000, 15_000, 30_000, 60_000];
+const PROVIDER_RECOVERY_WINDOW = 5 * 60_000;
+
+interface ProviderRecovery {
+  firstFailureAt: number;
+  retryCount: number;
+  resumePreparation: boolean;
+  message: string;
+  retryMessage?: string;
+}
+
 export class ForgeWorkflowService {
   private workers: ForgeWorker[] = [];
   private loaded = false;
@@ -138,6 +149,7 @@ export class ForgeWorkflowService {
   private readonly operations = new Map<string, AbortController>();
   private readonly nextPublicationCheckAt = new Map<string, number>();
   private readonly nextAutoReviewCheckAt = new Map<string, number>();
+  private readonly providerRecoveries = new Map<string, ProviderRecovery>();
   constructor(private readonly deps: ForgeWorkflowDependencies) {}
 
   start(): void {
@@ -171,9 +183,11 @@ export class ForgeWorkflowService {
           w.autoReview?.enabled && ["awaiting_publication", "awaiting_review", "awaiting_merge"].includes(w.status),
       )) {
         await this.quiesce(worker, { retainReport: worker.kind === "issue" && !worker.pendingPublication });
+        this.cancelProviderRecovery(worker);
         worker.status = "paused";
       }
       await this.persist();
+      this.providerRecoveries.clear();
     });
   }
   dashboard(): Promise<ForgeDashboard> {
@@ -206,6 +220,8 @@ export class ForgeWorkflowService {
     return this.exclusive(() => this.createWorker(repository, "review", number, autoPost, placement));
   }
   setAutoReview(id: string, enabled: boolean, placement: ForgePlacement): Promise<ForgeWorker> {
+    if (!enabled && this.providerRecoveries.has(id))
+      this.operations.get(id)?.abort(new Error("Automatic review disabled by user."));
     return this.exclusive(async () => {
       const worker = this.requireWorker(id);
       if (worker.kind !== "issue" || worker.status === "completed")
@@ -215,6 +231,10 @@ export class ForgeWorkflowService {
       worker.autoReview.placement = placement;
       if (!enabled && worker.status === "awaiting_merge") worker.status = "awaiting_review";
       this.nextAutoReviewCheckAt.delete(worker.id);
+      if (!enabled) {
+        this.cancelProviderRecovery(worker);
+        if (this.operations.get(worker.id)?.signal.aborted) this.operations.delete(worker.id);
+      }
       await this.persist();
       return structuredClone(worker);
     });
@@ -406,6 +426,7 @@ export class ForgeWorkflowService {
             "This worker cannot be paused or stopped in its current state.",
           );
         await this.quiesce(worker, { closeTab: false });
+        this.cancelProviderRecovery(worker);
         worker.status = status;
         await this.persist();
         this.operations.delete(worker.id);
@@ -418,6 +439,7 @@ export class ForgeWorkflowService {
       const worker = this.requireWorker(id);
       const parent = this.autoReviewParent(worker);
       const issue = parent ?? worker;
+      this.cancelProviderRecovery(issue);
       if (issue.mergeAttempted) {
         if (await this.reconcileMergedChange(issue, { retryCleanupId: issue.id })) return structuredClone(issue);
         throw new Error("The previous merge must be reconciled with the provider before continuing. Forge will not repeat it.");
@@ -700,7 +722,7 @@ export class ForgeWorkflowService {
       throw new Error("The linked reviewer does not belong to this issue loop.");
     return review;
   }
-  private async resumeAutoReview(worker: ForgeWorker, placement: ForgePlacement): Promise<ForgeWorker> {
+  private async resumeAutoReview(worker: ForgeWorker, placement: ForgePlacement, recovery?: ProviderRecovery): Promise<ForgeWorker> {
     if (!["paused", "stopped", "failed", "cleanup_failed", "awaiting_review", "awaiting_merge"].includes(worker.status))
       throw new Error("This issue loop is not waiting to resume.");
     const controller = new AbortController();
@@ -709,7 +731,7 @@ export class ForgeWorkflowService {
       if (await this.reconcileMergedChange(worker, { retryCleanupId: worker.id, signal: controller.signal })) return structuredClone(worker);
       controller.signal.throwIfAborted();
     } catch (error) {
-      if (!await this.handleProviderInterruption(worker, error)) throw error;
+      if (!await this.handleProviderInterruption(worker, error, true)) throw error;
       return structuredClone(worker);
     }
     const loop = worker.autoReview!;
@@ -722,6 +744,7 @@ export class ForgeWorkflowService {
       await this.recoverResources(worker);
       await this.quiesce(worker);
       await this.deps.runtime.verifyPublishedWorkspace(workerWorkspace(worker), worker.headSha!);
+      controller.signal.throwIfAborted();
       loop.placement = placement;
       loop.waitingSince = undefined;
       worker.status = loop.phase === "merging" ? "awaiting_merge" : "awaiting_review";
@@ -729,10 +752,17 @@ export class ForgeWorkflowService {
       await this.persist();
       if (review && review.status !== "completed" && !["starting", "running"].includes(review.status))
         await this.resumeWorker(review.id, placement);
-      this.nextAutoReviewCheckAt.delete(worker.id);
-      await this.advanceAutoReviews();
+      if (recovery) {
+        recovery.resumePreparation = false;
+        loop.waitingSince = new Date(Date.now()).toISOString();
+        await this.advanceAutoReview(worker);
+        this.providerRecoveries.delete(worker.id);
+      } else {
+        this.nextAutoReviewCheckAt.delete(worker.id);
+        await this.advanceAutoReviews();
+      }
     } catch (error) {
-      if (!await this.handleProviderInterruption(worker, error)) await this.fail(worker, error);
+      if (!await this.handleProviderInterruption(worker, error, recovery?.resumePreparation ?? true)) await this.fail(worker, error);
     }
     return structuredClone(worker);
   }
@@ -741,16 +771,31 @@ export class ForgeWorkflowService {
       ["awaiting_review", "awaiting_merge"].includes(candidate.status))) {
       if (this.disposed) return;
       if (!this.workers.includes(worker) || Date.now() < (this.nextAutoReviewCheckAt.get(worker.id) ?? 0)) continue;
+      const recovery = this.providerRecoveries.get(worker.id);
+      if (recovery && Date.now() >= recovery.firstFailureAt + PROVIDER_RECOVERY_WINDOW) {
+        await this.exhaustProviderRecovery(worker, recovery.message);
+        continue;
+      }
       this.nextAutoReviewCheckAt.set(worker.id, Date.now() + 5_000);
-      if (!this.operations.has(worker.id)) this.operations.set(worker.id, new AbortController());
       try {
+        if (recovery?.resumePreparation) {
+          await this.resumeAutoReview(worker, worker.autoReview!.placement, recovery);
+          continue;
+        }
+        if (!this.operations.has(worker.id)) this.operations.set(worker.id, new AbortController());
+        if (recovery) {
+          await this.deps.runtime.verifyPublishedWorkspace(workerWorkspace(worker), worker.headSha!);
+          this.operations.get(worker.id)?.signal.throwIfAborted();
+          worker.autoReview!.waitingSince = new Date(Date.now()).toISOString();
+        }
         await this.advanceAutoReview(worker);
+        this.providerRecoveries.delete(worker.id);
       } catch (error) {
         if (!this.disposed && !await this.handleProviderInterruption(worker, error)) await this.fail(worker, error);
       }
     }
   }
-  private async handleProviderInterruption(worker: ForgeWorker, error: unknown): Promise<boolean> {
+  private async handleProviderInterruption(worker: ForgeWorker, error: unknown, resumePreparation = false): Promise<boolean> {
     const unavailable = error instanceof ForgeMergeNotStartedError ? error.cause : error;
     const signal = this.operations.get(worker.id)?.signal;
     if (signal?.aborted && (error === signal.reason || unavailable instanceof ForgeProviderUnavailableError)) return true;
@@ -760,10 +805,45 @@ export class ForgeWorkflowService {
     const review = this.autoReviewer(worker);
     if (review && (["starting", "running"].includes(review.status) ||
       review.draft && ["posting", "post_failed"].includes(review.draft.status))) return false;
+    this.operations.get(worker.id)?.abort(unavailable);
     this.operations.delete(worker.id);
     this.nextAutoReviewCheckAt.delete(worker.id);
+    if (unavailable.retryable) {
+      const now = Date.now();
+      const recovery: ProviderRecovery = this.providerRecoveries.get(worker.id) ?? {
+        firstFailureAt: now, retryCount: 0, resumePreparation, message: unavailable.message,
+      };
+      recovery.resumePreparation ||= resumePreparation;
+      recovery.message = unavailable.message;
+      const delay = PROVIDER_RECOVERY_DELAYS[recovery.retryCount];
+      const retryAt = now + Math.max(delay, unavailable.retryAfterMs ?? 0);
+      if (delay === undefined || !Number.isFinite(retryAt) || retryAt >= recovery.firstFailureAt + PROVIDER_RECOVERY_WINDOW) {
+        await this.exhaustProviderRecovery(worker, unavailable.message);
+      } else {
+        recovery.retryCount++;
+        this.providerRecoveries.set(worker.id, recovery);
+        this.nextAutoReviewCheckAt.set(worker.id, retryAt);
+        worker.status = worker.autoReview!.phase === "merging" ? "awaiting_merge" : "awaiting_review";
+        worker.error = `${unavailable.message} Automatic retry ${recovery.retryCount} of ${PROVIDER_RECOVERY_DELAYS.length} in ${Math.ceil((retryAt - now) / 1000)} seconds.`;
+        recovery.retryMessage = worker.error;
+        await this.persist();
+      }
+      return true;
+    }
+    this.providerRecoveries.delete(worker.id);
     await this.pauseAutoReview(worker, `${unavailable.message} Resume the issue loop when provider access is restored.`);
     return true;
+  }
+  private async exhaustProviderRecovery(worker: ForgeWorker, reason: string): Promise<void> {
+    this.providerRecoveries.delete(worker.id);
+    await this.pauseAutoReview(worker, `${reason} Automatic recovery exhausted. Resume the issue loop when provider access is restored.`);
+  }
+  private cancelProviderRecovery(worker: ForgeWorker): void {
+    const recovery = this.providerRecoveries.get(worker.id);
+    if (!recovery) return;
+    if (worker.error === recovery.retryMessage) worker.error = undefined;
+    this.providerRecoveries.delete(worker.id);
+    this.nextAutoReviewCheckAt.delete(worker.id);
   }
   private async autoReviewContext(worker: ForgeWorker): Promise<{ issue: ForgeIssueDetail; change: ForgeChangeRequest } | undefined> {
     if (!worker.changeNumber || !worker.headSha) throw new Error("Auto review requires confirmed published work.");
@@ -1283,10 +1363,12 @@ export class ForgeWorkflowService {
     if (Date.now() < this.nextCompletionCheckAt) return;
     this.nextCompletionCheckAt = Date.now() + 30_000;
     const checked = new Set<string>();
+    const recovering = this.workers.filter(worker => this.providerRecoveries.has(worker.id));
     for (const worker of [...this.workers]) {
       if (this.disposed) return;
       const number = changeNumber(worker);
       if (!number || ["cleanup_failed", "awaiting_publication"].includes(worker.status) || !this.workers.includes(worker)) continue;
+      if (recovering.some(candidate => changeNumber(candidate) === number && sameRepository(candidate.repository, worker.repository))) continue;
       const key = JSON.stringify([worker.repository.provider, worker.repository.apiUrl, worker.repository.projectPath, number]);
       if (checked.has(key)) continue;
       checked.add(key);
@@ -1513,6 +1595,10 @@ export class ForgeWorkflowService {
       if (!this.workers.some(worker => worker.id === id && worker.autoReview?.enabled &&
         ["awaiting_review", "awaiting_merge"].includes(worker.status)))
         this.nextAutoReviewCheckAt.delete(id);
+    for (const id of this.providerRecoveries.keys())
+      if (!this.workers.some(worker => worker.id === id && worker.autoReview?.enabled &&
+        ["awaiting_review", "awaiting_merge"].includes(worker.status)))
+        this.providerRecoveries.delete(id);
     for (const worker of this.workers)
       if (
         ["completed", "stopped", "paused", "failed", "cleanup_failed"].includes(

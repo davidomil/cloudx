@@ -4,7 +4,7 @@ import { CODEX_MODEL_OPTIONS } from "../aiModelOptions.js";
 import type { ForgeConnectionService } from "./connections/ForgeConnectionService.js";
 import { ForgeCredentials, validateRepository } from "./providers/ForgeCredentials.js";
 import { createForgeProvider } from "./providers/index.js";
-import type { ForgeProvider } from "./providers/ForgeProvider.js";
+import type { ForgeDiagnosticObserver, ForgeProvider } from "./providers/ForgeProvider.js";
 import type { ForgeSettings } from "./ForgeWorkflowService.js";
 
 export class ForgeSettingsService {
@@ -13,6 +13,7 @@ export class ForgeSettingsService {
   constructor(
     private readonly config: ConfigService,
     private readonly connections: Pick<ForgeConnectionService, "credential" | "workerAuthors">,
+    private readonly onFailure?: ForgeDiagnosticObserver,
   ) {}
 
   repository(): ForgeRepository {
@@ -49,6 +50,7 @@ export class ForgeSettingsService {
     return createForgeProvider(repository, this.credentials(repository), {
       role,
       signal,
+      onFailure: this.onFailure,
       listIdentity: () => ({
         username: String(this.config.getPluginConfig("forge").username ?? "").trim(),
         workerAuthors: this.connections.workerAuthors(repository),
@@ -66,7 +68,7 @@ export class ForgeSettingsService {
       throw new Error("This worker belongs to a different repository. Restore its repository settings before continuing.");
     const key = repositoryTrustKey(repository);
     if (this.repositoryCredentials?.key !== key)
-      this.repositoryCredentials = { key, credentials: new ForgeCredentials(current, async role => this.connections.credential(current, role)) };
+      this.repositoryCredentials = { key, credentials: new ForgeCredentials(current, async role => this.connections.credential(current, role), undefined, this.onFailure) };
     return this.repositoryCredentials.credentials;
   }
 
