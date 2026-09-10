@@ -24,6 +24,10 @@ describe("JiraPlugin", () => {
     ]));
     expect(descriptor.hooks?.map((hook) => hook.id)).toEqual(expect.arrayContaining([
       "jira.connection.status",
+      "jira.filters.list",
+      "jira.filters.save",
+      "jira.filters.delete",
+      "jira.filters.select",
       "jira.dashboard.list",
       "jira.currentUser.get",
       "jira.projects.list",
@@ -189,11 +193,14 @@ describe("JiraPlugin", () => {
 
   it("forwards automation cancellation through every Jira hook and poll call", async () => {
     const calls: Array<{ method: string; args: unknown[] }> = [];
-    const service = new Proxy({}, {
+    const methods = new Proxy({}, {
       get: (_target, property) => (...args: unknown[]) => {
         calls.push({ method: String(property), args });
         return Promise.resolve({});
       }
+    });
+    const service = new Proxy({}, {
+      get: (_target, property) => property === "filters" ? methods : Reflect.get(methods, property)
     }) as JiraIntegrationService;
     const polling = {
       runOnce: vi.fn().mockResolvedValue({}),
@@ -204,6 +211,9 @@ describe("JiraPlugin", () => {
     const plugin = new JiraPlugin(() => service, () => polling as never);
     const controller = new AbortController();
     const input = {
+      id: "filter-1",
+      name: "Team issues",
+      filterId: "filter-1",
       filterJql: "project = ENG",
       sortBy: "updated_desc",
       groupBy: "none",

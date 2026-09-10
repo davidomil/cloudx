@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ExternalLink, MessageSquare, PanelLeft, Play, RefreshCw, Send } from "lucide-react";
+import type { JiraFilterState } from "@cloudx/shared";
 
 import type { UiContributionRenderContext } from "./uiContributions.js";
 import { ControlButton } from "./Control.js";
 import { JIRA_ISSUE_MANUAL_TRIGGER_ID, jiraIssueManualRunPayload, type TriggerEmitter } from "./automationTriggers.js";
 import { PluginPanelDock } from "./PluginPanelDock.js";
+import { JiraFilterBar, type JiraFilterAction } from "./JiraFilterBar.js";
 
 type JiraCallHook = NonNullable<UiContributionRenderContext["callHook"]>;
 
@@ -77,6 +79,9 @@ export function JiraPanel({
   emitTrigger?: TriggerEmitter;
 }) {
   const [dashboard, setDashboard] = useState<JiraDashboardResponse | undefined>();
+  const [filters, setFilters] = useState<JiraFilterState>();
+  const [filterBusy, setFilterBusy] = useState(true);
+  const [filterReload, setFilterReload] = useState(0);
   const [selectedKey, setSelectedKey] = useState<string | undefined>();
   const [selectedIssue, setSelectedIssue] = useState<JiraIssueSummary | undefined>();
   const [comments, setComments] = useState<JiraCommentSummary[]>([]);
@@ -89,24 +94,72 @@ export function JiraPanel({
   const issueManualTriggerActive = Boolean(activeTriggerIds?.has(JIRA_ISSUE_MANUAL_TRIGGER_ID) && emitTrigger);
   const selectedDashboardIssue = useMemo(() => dashboard?.issues.find((issue) => issue.key === selectedKey), [dashboard?.issues, selectedKey]);
   const selectedDashboardIssueRef = useRef<JiraIssueSummary | undefined>(undefined);
+  const dashboardRequest = useRef(0);
+  const lifecycle = useRef(0);
+  const selectedKeyRef = useRef(selectedKey);
+  selectedKeyRef.current = selectedKey;
 
-  const loadDashboard = useCallback(async () => {
+  const loadDashboard = useCallback(async (filterId: string | null, resetSelection = false) => {
+    const request = ++dashboardRequest.current;
     setBusy(true);
     setNotice(undefined);
+    if (resetSelection) {
+      setDashboard(undefined);
+      setSelectedKey(undefined);
+      setCommentDraft("");
+    }
     try {
-      const response = await callHook<JiraDashboardResponse>("jira.dashboard.list");
+      const response = await callHook<JiraDashboardResponse>("jira.dashboard.list", filterId ? { filterId } : {});
+      if (request !== dashboardRequest.current) return;
       setDashboard(response);
-      setSelectedKey((current) => current ?? response.issues[0]?.key);
+      setSelectedKey((current) => response.issues.some((issue) => issue.key === current) ? current : response.issues[0]?.key);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : String(error));
+      if (request === dashboardRequest.current) setNotice(error instanceof Error ? error.message : String(error));
     } finally {
-      setBusy(false);
+      if (request === dashboardRequest.current) setBusy(false);
     }
   }, [callHook]);
 
   useEffect(() => {
-    void loadDashboard();
-  }, [loadDashboard]);
+    lifecycle.current += 1;
+    let cancelled = false;
+    setFilterBusy(true);
+    void (async () => {
+      try {
+        const state = await callHook<JiraFilterState>("jira.filters.list");
+        if (cancelled) return;
+        setFilters(state);
+        void loadDashboard(state.selectedFilterId, true);
+      } catch (error) {
+        if (!cancelled) setNotice(error instanceof Error ? error.message : String(error));
+      } finally {
+        if (!cancelled) setFilterBusy(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      lifecycle.current += 1;
+      dashboardRequest.current += 1;
+    };
+  }, [callHook, filterReload, loadDashboard]);
+
+  const changeFilter = useCallback(async (action: JiraFilterAction, input: Record<string, unknown>): Promise<boolean> => {
+    const generation = lifecycle.current;
+    setFilterBusy(true);
+    setNotice(undefined);
+    try {
+      const state = await callHook<JiraFilterState>(action, input);
+      if (generation !== lifecycle.current) return false;
+      setFilters(state);
+      void loadDashboard(state.selectedFilterId, true);
+      return true;
+    } catch (error) {
+      if (generation === lifecycle.current) setNotice(error instanceof Error ? error.message : String(error));
+      return false;
+    } finally {
+      if (generation === lifecycle.current) setFilterBusy(false);
+    }
+  }, [callHook, loadDashboard]);
 
   useEffect(() => {
     selectedDashboardIssueRef.current = selectedDashboardIssue;
@@ -164,6 +217,7 @@ export function JiraPanel({
 
   const refreshSelectedIssueDetails = useCallback(async (issueKey: string) => {
     const details = await loadIssueDetails(issueKey);
+    if (selectedKeyRef.current !== issueKey) return;
     setSelectedIssue(details.issue);
     setComments(details.comments);
     setTransitions(details.transitions);
@@ -188,20 +242,20 @@ export function JiraPanel({
   }, [callHook, commentDraft, refreshSelectedIssueDetails, selectedKey]);
 
   const transitionIssue = useCallback(async (transitionId: string | undefined) => {
-    if (!selectedKey || !transitionId) {
+    if (filterBusy || !selectedKey || !transitionId) {
       return;
     }
     setActionBusy(true);
     setNotice(undefined);
     try {
       await callHook("jira.issue.transition", { issueIdOrKey: selectedKey, transitionId });
-      await Promise.all([loadDashboard(), refreshSelectedIssueDetails(selectedKey)]);
+      await Promise.all([loadDashboard(filters?.selectedFilterId ?? null), refreshSelectedIssueDetails(selectedKey)]);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
     } finally {
       setActionBusy(false);
     }
-  }, [callHook, loadDashboard, refreshSelectedIssueDetails, selectedKey]);
+  }, [callHook, filterBusy, filters?.selectedFilterId, loadDashboard, refreshSelectedIssueDetails, selectedKey]);
 
   const runIssueAutomation = useCallback(async (issue: JiraIssueSummary) => {
     if (!emitTrigger) {
@@ -258,7 +312,7 @@ export function JiraPanel({
       <header className="jira-panel-header">
         <div>
           <h2>Jira</h2>
-          <p>{dashboard?.jql ?? "Dashboard"}</p>
+          <p>{filters?.filters.find((filter) => filter.id === filters.selectedFilterId)?.jql ?? dashboard?.jql ?? "Dashboard"}</p>
         </div>
         <div className="jira-panel-header-actions">
           <PluginPanelDock className="jira-issues-dock" items={[{
@@ -267,12 +321,17 @@ export function JiraPanel({
             icon: <PanelLeft size={15} />,
             children: issueList("jira-dashboard-list jira-dashboard-list-dock")
           }]} />
-          <ControlButton size="compact" iconOnly title="Refresh Jira" aria-label="Refresh Jira" onClick={() => void loadDashboard()} disabled={busy}>
+          <ControlButton size="compact" iconOnly title="Refresh Jira" aria-label="Refresh Jira" onClick={() => {
+            if (filters) void loadDashboard(filters.selectedFilterId);
+            else setFilterReload((current) => current + 1);
+          }} disabled={busy || filterBusy}>
             <RefreshCw size={15} />
           </ControlButton>
         </div>
       </header>
+      <JiraFilterBar state={filters} busy={filterBusy || actionBusy} onChange={changeFilter} />
       {notice ? <div className="jira-notice" role="alert">{notice}</div> : null}
+      {busy || filterBusy ? <div className="jira-loading" role="status">Loading Jira view...</div> : null}
       <div className="jira-panel-body">
         {issueList("jira-dashboard-list jira-dashboard-list-inline")}
         <aside className="jira-detail" aria-label="Jira issue detail">
@@ -306,7 +365,7 @@ export function JiraPanel({
                 <h4>Transitions</h4>
                 <div>
                   {transitions.map((transition) => (
-                    <button type="button" className="jira-transition-pill" key={transition.id ?? transition.name} onClick={() => void transitionIssue(transition.id)} disabled={actionBusy || !transition.id}>
+                    <button type="button" className="jira-transition-pill" key={transition.id ?? transition.name} onClick={() => void transitionIssue(transition.id)} disabled={actionBusy || filterBusy || !transition.id}>
                       {transition.name ?? transition.to?.name ?? transition.id}
                     </button>
                   ))}

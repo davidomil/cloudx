@@ -3384,7 +3384,7 @@ describe("buildServer", () => {
         )
         .map((node: { typeId: string }) => node.typeId)
         .sort();
-      expect(catalogNodes).toHaveLength(117);
+      expect(catalogNodes).toHaveLength(120);
       expect(portsMissingDescriptions).toEqual([]);
       expect(weakPortDescriptions).toEqual([]);
       expect(execOnlyFunctionNodes).toEqual([
@@ -3397,6 +3397,9 @@ describe("buildServer", () => {
           expect.objectContaining({ typeId: "trigger:worktree.created" }),
           expect.objectContaining({ typeId: "trigger:jira.issueUpdated" }),
           expect.objectContaining({ typeId: "hook:jira.issue.create" }),
+          expect.objectContaining({ typeId: "hook:jira.filters.save" }),
+          expect.objectContaining({ typeId: "hook:jira.filters.delete" }),
+          expect.objectContaining({ typeId: "hook:jira.filters.select" }),
           expect.objectContaining({
             typeId: "hook:workspace.layoutTemplates.apply",
           }),

@@ -68,6 +68,7 @@ import { RulesSkillsPlugin } from "./plugins/RulesSkillsPlugin.js";
 import { DocumentationPlugin } from "./plugins/DocumentationPlugin.js";
 import { syncPluginContributions } from "./plugins/pluginContributions.js";
 import { JiraIntegrationService } from "./jira/JiraIntegrationService.js";
+import { JiraDashboardFilterStore } from "./jira/JiraDashboardFilterStore.js";
 import { JiraPollingService } from "./jira/JiraPollingService.js";
 import { SessionStore } from "./sessionStore.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
@@ -1248,7 +1249,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     plugins.register(plugin);
   }
   const configService = new ConfigService(config.dataDir, () => plugins.list(), { voiceModel: config.voiceModel });
-  jira = new JiraIntegrationService(configService);
+  jira = new JiraIntegrationService(configService, new JiraDashboardFilterStore(pluginData));
   sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir), configService, workspace, rulesSkills, (error, details) => {
     logger?.error({ err: serializeError(error), ...details }, "session background operation failed");
   });
