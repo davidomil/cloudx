@@ -246,7 +246,7 @@ describe("DocumentationEnrichmentService", () => {
       });
       const runner = fakeRunner({ summary: "", spans: [{ locator: "ai:media", text: "Enriched from copied transcript." }], metadata: [], warnings: [] });
       const transcribeFile = vi.fn(async () => { throw new Error("ASR cannot decode a copied transcript."); });
-      const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never });
+      const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher: fakeMediaTools(false) });
       const queue = new DocumentationIngestQueue();
       const plugin = new DocumentationPlugin(client, new PathPolicy([fixture.root]), queue, () => service);
       try {
@@ -259,6 +259,100 @@ describe("DocumentationEnrichmentService", () => {
         expect(client.enrichDocument).toHaveBeenCalledOnce();
         await expect(fs.readFile(fixture.mediaPath, "utf8")).resolves.toBe(text);
         expect(client.reanalyzeDocument).toHaveBeenCalledTimes(operation === "reanalyze" ? 1 : 0);
+      } finally {
+        await queue.dispose();
+        await fs.rm(fixture.root, { recursive: true, force: true });
+      }
+    });
+
+    it.each([
+      { filename: "recording.ogg", video: true, sharedContentType: "application/octet-stream" },
+      { filename: "recording.bin", video: true, sharedContentType: "audio/ogg" },
+      { filename: "recording.ogg", video: false, sharedContentType: "video/ogg" },
+    ])("uses retained streams for $filename after shared MIME becomes $sharedContentType", async ({ filename, video, sharedContentType }) => {
+      const fixture = await archivedMediaFixture(filename);
+      const metadataPath = path.join(path.dirname(fixture.mediaPath), "metadata.json");
+      await fs.writeFile(metadataPath, JSON.stringify({ filename, contentType: video ? "video/ogg" : "audio/ogg", upload: true }));
+      const client = Object.assign(fixture.client, {
+        reanalyzeDocument: vi.fn(async () => ({ documents: [{ documentId: "doc-1" }] })),
+      });
+      const transcribeFile = vi.fn(async () => ({ text: video ? "" : "FRESH-AUDIO-TRANSCRIPT" }));
+      const runner = fakeRunner({ summary: "", spans: [{ locator: "ai:media", text: "Fresh media evidence." }], metadata: [], warnings: [] });
+      const mediaProcessLauncher = fakeMediaTools(video);
+      const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher });
+      const queue = new DocumentationIngestQueue();
+      const plugin = new DocumentationPlugin(client, new PathPolicy([fixture.root]), queue, () => service);
+      try {
+        await fs.writeFile(metadataPath, JSON.stringify({ url: "https://example.com/shared.bin", contentType: sharedContentType }));
+        const framePaths = new Set<string>();
+        for (let rerun = 1; rerun <= 2; rerun += 1) {
+          const result = await plugin.hooks.find((hook) => hook.id === `documentation.documents.${operation}`)!.execute({ documentId: "doc-1" }, { caller: { kind: "ui" } });
+
+          expect(result).toMatchObject({ kind: operation, firstDocumentId: "doc-1", enrichment: { results: [{ status: "written" }] } });
+          expect(transcribeFile).toHaveBeenCalledTimes(rerun);
+          expect(client.enrichDocument).toHaveBeenCalledTimes(rerun);
+          expect(client.enrichDocument).toHaveBeenLastCalledWith(expect.objectContaining({
+            documentId: "doc-1",
+            payload: expect.objectContaining({ evidence: expect.objectContaining({ chunkCount: 0, keyframeCount: video ? 1 : 0 }) }),
+          }), expect.anything());
+          const [prompt, options] = runner.run.mock.lastCall!;
+          expect(prompt).not.toContain("BINARY-CHUNK");
+          expect(prompt).not.toContain("PRIOR-AI-SPAN");
+          if (video) {
+            expect(options.imagePaths).toHaveLength(1);
+            const framePath = options.imagePaths[0];
+            expect(framePaths.has(framePath)).toBe(false);
+            framePaths.add(framePath);
+            await expect(fs.stat(path.dirname(path.dirname(framePath)))).rejects.toMatchObject({ code: "ENOENT" });
+          } else {
+            expect(prompt).toContain("FRESH-AUDIO-TRANSCRIPT");
+            expect(options.imagePaths).toBeUndefined();
+            expect(mediaProcessLauncher.mock.calls.some(([command]) => command === "ffmpeg")).toBe(false);
+          }
+          await expect(fs.readFile(fixture.mediaPath)).resolves.toEqual(fixture.sourceBytes);
+        }
+        expect(client.reanalyzeDocument).toHaveBeenCalledTimes(operation === "reanalyze" ? 2 : 0);
+        expect(mediaProcessLauncher).toHaveBeenCalledWith("ffprobe", expect.arrayContaining(["-select_streams", "V", fixture.mediaPath]), expect.anything());
+      } finally {
+        await queue.dispose();
+        await fs.rm(fixture.root, { recursive: true, force: true });
+      }
+    });
+
+    it.each([
+      { name: "decoder failure", status: 1, stdout: "", stderr: "Invalid media", error: /ffprobe media inspection failed: Invalid media/u },
+      { name: "invalid JSON", status: 0, stdout: "invalid", stderr: "", error: /JSON/u },
+      { name: "missing streams", status: 0, stdout: "{}", stderr: "", error: /array of selected video streams/u },
+      { name: "invalid stream type", status: 0, stdout: '{"streams":[{"codec_type":"audio"}]}', stderr: "", error: /array of selected video streams/u },
+    ])("preserves prior enrichment when retained stream inspection returns $name", async ({ status, stdout, stderr, error }) => {
+      const fixture = await archivedMediaFixture("recording.ogg");
+      const client = Object.assign(fixture.client, { reanalyzeDocument: vi.fn(async () => ({ documents: [{ documentId: "doc-1" }] })) });
+      const runner = fakeRunner();
+      const transcribeFile = vi.fn();
+      const mediaProcessLauncher = vi.fn(() => {
+        const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn() });
+        queueMicrotask(() => {
+          child.stdout.write(stdout);
+          child.stderr.write(stderr);
+          child.emit("close", status);
+        });
+        return child as unknown as ChildProcessWithoutNullStreams;
+      });
+      const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher });
+      const queue = new DocumentationIngestQueue();
+      const plugin = new DocumentationPlugin(client, new PathPolicy([fixture.root]), queue, () => service);
+      try {
+        const result = plugin.hooks.find((hook) => hook.id === `documentation.documents.${operation}`)!.execute({ documentId: "doc-1" }, { caller: { kind: "ui" } });
+        if (operation === "reanalyze") {
+          await expect(result).resolves.toMatchObject({ enrichment: { results: [{ status: "failed", error: expect.stringMatching(error) }] } });
+        } else {
+          await expect(result).rejects.toThrow(error);
+        }
+        expect(transcribeFile).not.toHaveBeenCalled();
+        expect(runner.run).not.toHaveBeenCalled();
+        expect(client.enrichDocument).not.toHaveBeenCalled();
+        expect(mediaProcessLauncher).toHaveBeenCalledOnce();
+        await expect(fs.readFile(fixture.mediaPath)).resolves.toEqual(fixture.sourceBytes);
       } finally {
         await queue.dispose();
         await fs.rm(fixture.root, { recursive: true, force: true });
@@ -281,7 +375,7 @@ describe("DocumentationEnrichmentService", () => {
       });
       const runner = fakeRunner({ summary: "", spans: [{ locator: "ai:media", text: "Fresh recording evidence." }], metadata: [], warnings: [] });
       const transcribeFile = vi.fn(async () => ({ text: "FRESH-TRANSCRIPT" }));
-      const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never });
+      const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher: fakeMediaTools(false) });
       const queue = new DocumentationIngestQueue();
       const plugin = new DocumentationPlugin(client, new PathPolicy([fixture.root]), queue, () => service);
       try {
@@ -312,7 +406,7 @@ describe("DocumentationEnrichmentService", () => {
       const client = Object.assign(fixture.client, {
         reanalyzeDocument: vi.fn(async () => ({ documents: [{ documentId: "doc-1" }] })),
       });
-      const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never });
+      const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher: fakeMediaTools(false) });
       const queue = new DocumentationIngestQueue();
       const plugin = new DocumentationPlugin(client, new PathPolicy([fixture.root]), queue, () => service);
       try {
@@ -371,16 +465,7 @@ describe("DocumentationEnrichmentService", () => {
       const transcribeFile = vi.fn(async () => ({ text: transcript }));
       const output = { summary: "Updated media metadata.", spans: [{ locator: "ai:media", text: "Reset is active low." }], metadata: [], warnings: [] };
       const runner = fakeRunner(output);
-      let capturedFrame = "";
-      const mediaProcessLauncher = vi.fn((_command, args: readonly string[], _options) => {
-        const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn() });
-        capturedFrame = args.at(-1)!.replace("%04d", "0001");
-        void fs.writeFile(capturedFrame, "frame").then(() => {
-          child.stderr.write("pts_time:0\n");
-          child.emit("close", 0);
-        });
-        return child as unknown as ChildProcessWithoutNullStreams;
-      });
+      const mediaProcessLauncher = fakeMediaTools(video);
       const service = new DocumentationEnrichmentService({
         client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner,
         asr: { transcribeFile } as never, mediaProcessLauncher,
@@ -410,10 +495,12 @@ describe("DocumentationEnrichmentService", () => {
         }), expect.anything());
         if (video) {
           expect(mediaProcessLauncher).toHaveBeenCalledWith("ffmpeg", expect.arrayContaining(["-i", fixture.mediaPath]), expect.anything());
+          const capturedFrame = mediaProcessLauncher.mock.calls.find(([command]) => command === "ffmpeg")![1].at(-1)!.replace("%04d", "0001");
           expect(runner.run).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ imagePaths: [capturedFrame] }));
           await expect(fs.stat(capturedFrame)).rejects.toMatchObject({ code: "ENOENT" });
         } else {
-          expect(mediaProcessLauncher).not.toHaveBeenCalled();
+          expect(mediaProcessLauncher).toHaveBeenCalledOnce();
+          expect(mediaProcessLauncher.mock.calls[0]?.[0]).toBe("ffprobe");
         }
         await expect(fs.readFile(fixture.mediaPath)).resolves.toEqual(fixture.sourceBytes);
       } finally {
@@ -423,12 +510,44 @@ describe("DocumentationEnrichmentService", () => {
     });
   });
 
+  it("stops a cancelled retained-media probe before ASR or enrichment and releases its listeners", async () => {
+    const fixture = await archivedMediaFixture("recording.ogg");
+    const controller = new AbortController();
+    const error = new Error("Media inspection cancelled.");
+    const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn(() => {
+      queueMicrotask(() => child.emit("close", null));
+      return true;
+    }) });
+    const mediaProcessLauncher = vi.fn(() => {
+      queueMicrotask(() => controller.abort(error));
+      return child as unknown as ChildProcessWithoutNullStreams;
+    });
+    const transcribeFile = vi.fn();
+    const runner = fakeRunner();
+    const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher });
+    try {
+      await expect(service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] }, {}, { signal: controller.signal })).rejects.toThrow(error);
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+      expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+      expect(child.listenerCount("close")).toBe(0);
+      expect(child.listenerCount("error")).toBe(0);
+      expect(child.stdout.listenerCount("data")).toBe(0);
+      expect(child.stderr.listenerCount("data")).toBe(0);
+      expect(transcribeFile).not.toHaveBeenCalled();
+      expect(runner.run).not.toHaveBeenCalled();
+      expect(fixture.client.enrichDocument).not.toHaveBeenCalled();
+      await expect(fs.readFile(fixture.mediaPath)).resolves.toEqual(fixture.sourceBytes);
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it.each(["media", "text"])("recognizes extensionless archived audio from retained MIME metadata with source type %s", async (sourceType) => {
     const fixture = await archivedMediaFixture("recording", sourceType);
     await fs.writeFile(path.join(path.dirname(fixture.mediaPath), "metadata.json"), JSON.stringify({ contentType: "audio/wav" }));
     const transcribeFile = vi.fn(async () => ({ text: "EXTENSIONLESS-TRANSCRIPT provides source evidence." }));
     const runner = fakeRunner({ summary: "", spans: [{ locator: "ai:media", text: "Source evidence." }], metadata: [], warnings: [] });
-    const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never });
+    const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher: fakeMediaTools(false) });
     try {
       const response = await service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] });
 
@@ -458,7 +577,7 @@ describe("DocumentationEnrichmentService", () => {
     });
     const runner = fakeRunner();
     const transcribeFile = vi.fn();
-    const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never });
+    const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher: fakeMediaTools(false) });
     try {
       const enrichment = service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] }, {}, { signal: controller.signal });
       if (outcome === "cancelled") {
@@ -497,7 +616,7 @@ describe("DocumentationEnrichmentService", () => {
     }
     const runner = fakeRunner();
     const transcribeFile = vi.fn();
-    const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never });
+    const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher: fakeMediaTools(false) });
     try {
       const response = await service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] });
 
@@ -518,7 +637,7 @@ describe("DocumentationEnrichmentService", () => {
     await fs.writeFile(path.join(path.dirname(fixture.mediaPath), "metadata.json"), JSON.stringify({ contentType }));
     const runner = fakeRunner();
     const transcribeFile = vi.fn();
-    const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never });
+    const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher: fakeMediaTools(false) });
     try {
       await service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] });
 
@@ -543,7 +662,7 @@ describe("DocumentationEnrichmentService", () => {
       }
       const service = new DocumentationEnrichmentService({
         client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner,
-        asr: failure === "unavailable ASR" ? undefined : { transcribeFile } as never,
+        asr: failure === "unavailable ASR" ? undefined : { transcribeFile } as never, mediaProcessLauncher: fakeMediaTools(false),
       });
       try {
         const response = await service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] });
@@ -583,7 +702,7 @@ describe("DocumentationEnrichmentService", () => {
       const client = fakeDocumentationClient({ snapshot_path: snapshotPath }, { archiveRoot: fixture.archiveRoot });
       const runner = fakeRunner();
       const transcribeFile = vi.fn();
-      const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never });
+      const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher: fakeMediaTools(false) });
       try {
         const response = await service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] });
 
@@ -618,7 +737,7 @@ describe("DocumentationEnrichmentService", () => {
     }
     const runner = fakeRunner({ summary: "", spans: [{ locator: "ai:media", text: "Enriched from retained text." }], metadata: [], warnings: [] });
     const transcribeFile = vi.fn();
-    const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never });
+    const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher: fakeMediaTools(false) });
     const queue = new DocumentationIngestQueue();
     const plugin = new DocumentationPlugin(fixture.client, new PathPolicy([fixture.root]), queue, () => service);
     try {
@@ -642,7 +761,7 @@ describe("DocumentationEnrichmentService", () => {
     await fs.writeFile(fixture.mediaPath, JSON.stringify(source));
     const runner = fakeRunner();
     const transcribeFile = vi.fn();
-    const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never });
+    const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher: fakeMediaTools(false) });
     try {
       await service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] });
 
@@ -1506,6 +1625,25 @@ async function archivedMediaFixture(filename = "recording.wav", sourceType = "me
     ...documentOverrides,
   }, { archiveRoot });
   return { root, archiveRoot, mediaPath, sourceBytes, client };
+}
+
+function fakeMediaTools(video: boolean) {
+  return vi.fn((command: string, args: readonly string[], _options: unknown) => {
+    const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn() });
+    if (command === "ffprobe") {
+      queueMicrotask(() => {
+        child.stdout.write(JSON.stringify({ streams: video ? [{ codec_type: "video" }] : [] }));
+        child.emit("close", 0);
+      });
+    } else {
+      const framePath = args.at(-1)!.replace("%04d", "0001");
+      void fs.writeFile(framePath, "frame").then(() => {
+        child.stderr.write("pts_time:0\n");
+        child.emit("close", 0);
+      });
+    }
+    return child as unknown as ChildProcessWithoutNullStreams;
+  });
 }
 
 function fakeDocumentationClient(documentOverrides: Record<string, unknown> = {}, options: { archiveRoot?: string } = {}): DocumentationClient & {

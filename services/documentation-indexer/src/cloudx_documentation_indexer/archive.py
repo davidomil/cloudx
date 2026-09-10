@@ -1250,15 +1250,13 @@ class DocumentationArchive:
                         (document_id,),
                     )
                 }
-            retains_plain_text = snapshot_path.suffix.lower() == ".txt" and source_locators == {"text"}
-
             staging_dir = Path(tempfile.mkdtemp(prefix="reanalysis-", dir=self.snapshots_dir))
             replacement_snapshot = staging_dir / snapshot_path.name
             try:
                 replacement_snapshot.write_bytes(source_bytes)
                 if has_metadata:
                     shutil.copy2(metadata_path, staging_dir / "metadata.json")
-                if retains_plain_text:
+                if source_locators == {"text"}:
                     spans = [ExtractedSpan(decode_text(source_bytes), "text")]
                 elif source_locators == {"html"}:
                     spans = [ExtractedSpan(extract_html(source_bytes), "html")]

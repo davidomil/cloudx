@@ -21,12 +21,14 @@ from cloudx_documentation_indexer.extraction import ExtractedSpan
 
 def test_reanalysis_replaces_extraction_from_the_archived_source_without_duplicate_documents(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     archive = DocumentationArchive(tmp_path / "archive")
-    source = tmp_path / "original.md"
-    source.write_text("Archived source contains ORIGINAL-EXTRACTION-19.", encoding="utf-8")
+    source = tmp_path / "original.pdf"
+    pdf = canvas.Canvas(str(source))
+    pdf.drawString(40, 800, "Archived source contains ORIGINAL-EXTRACTION-19.")
+    pdf.save()
     ingested = archive.ingest_path(source, title="Retained note", collection="board", tags=["reference"])[0]
     archive.invalidate_document(ingested.document_id, state="stale", reason="Retained review history.")
     archive.ingest_path(source, title="Retained note", collection="board", tags=["reference"])
-    sibling = archive.ingest_upload(filename="sibling.md", content=source.read_bytes())
+    sibling = archive.ingest_upload(filename="sibling.pdf", content=source.read_bytes())
     source.unlink()
     archive.enrich_document(
         ingested.document_id,
@@ -42,11 +44,11 @@ def test_reanalysis_replaces_extraction_from_the_archived_source_without_duplica
     def updated_extractor(content, name, source_type, content_type, artifact_dir):
         assert content == original_bytes
         assert name == source.name
-        assert source_type == "text"
+        assert source_type == "book"
         assert artifact_dir.parent != archived_source.parent
         artifact_dir.mkdir()
         (artifact_dir / "analysis.txt").write_text("New extraction artifact.", encoding="utf-8")
-        return [ExtractedSpan("Updated extraction contains REANALYZED-CONTENT-19.", "text updated")]
+        return [ExtractedSpan("Updated extraction contains REANALYZED-CONTENT-19.", "page 1")]
 
     monkeypatch.setattr(archive_module, "extract_bytes", updated_extractor)
     for _ in range(2):
@@ -235,6 +237,48 @@ def test_reanalysis_preserves_copied_text_when_identical_html_shares_snapshot_me
     assert [(chunk["locator"], chunk["text"]) for chunk in sibling_after["chunks"]] == [("html", "COPIED-HTML-SIBLING-19 retains the literal\nmarker.")]
     assert (archive.root / sibling_after["snapshot_path"]).read_bytes() == text.encode("utf-8")
     assert len(archive.list_documents()) == 2
+
+
+@pytest.mark.parametrize("filename", ["note.md", "note", "note.json", "note.txt"])
+@pytest.mark.parametrize("import_sibling", [False, True], ids=["upload-only", "shared-html-metadata"])
+def test_reanalysis_preserves_plain_text_when_an_html_url_replaces_shared_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, filename: str, import_sibling: bool) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+    text = "RETAINED-PLAIN-TEXT-19 keeps <board> and <script>EXAMPLE-SCRIPT-19</script> literally."
+    source_bytes = text.encode("utf-8")
+    upload = archive.ingest_upload(filename=filename, content=source_bytes, source_type="reference", content_type="text/plain")
+    archive.enrich_document(
+        upload.document_id,
+        spans=[ExtractedSpan("Prior enrichment remains available.", "ai:metadata")],
+        model="gpt-test",
+        skill_ids=["documentation-enrich-metadata"],
+    )
+    before = archive.get_document(upload.document_id)
+    snapshot = archive.root / before["snapshot_path"]
+    assert [(chunk["locator"], chunk["text"]) for chunk in before["chunks"] if chunk["chunk_origin"] == "source"] == [("text", text)]
+    if import_sibling:
+        url = f"https://example.com/{filename}"
+        response = httpx.Response(200, request=httpx.Request("GET", url), headers={"content-type": "text/html"}, content=source_bytes)
+        monkeypatch.setattr(archive_module, "fetch_url_bytes", lambda _url, _limit: (response, source_bytes))
+        sibling = archive.ingest_url(url)
+        sibling_before = archive.get_document(sibling.document_id)
+        assert sibling_before["snapshot_path"] == before["snapshot_path"]
+        assert json.loads(snapshot.with_name("metadata.json").read_text())["contentType"] == "text/html"
+        assert [(chunk["locator"], chunk["text"]) for chunk in sibling_before["chunks"]] == [("html", "RETAINED-PLAIN-TEXT-19 keeps\nand\nliterally.")]
+
+    for _ in range(2):
+        result = archive.reanalyze_document(upload.document_id)
+        current = archive.get_document(upload.document_id)
+        assert result.document_id == upload.document_id
+        for field in ["document_id", "title", "uri", "source_type", "content_sha256", "state", "collection", "tags_json", "created_at", "enrichments", "events"]:
+            assert current[field] == before[field]
+        assert (archive.root / current["snapshot_path"]).read_bytes() == source_bytes
+        assert [(chunk["locator"], chunk["text"]) for chunk in current["chunks"] if chunk["chunk_origin"] == "source"] == [("text", text)]
+        assert [chunk for chunk in current["chunks"] if chunk["chunk_origin"] == "ai"] == [chunk for chunk in before["chunks"] if chunk["chunk_origin"] == "ai"]
+        assert {hit["documentId"] for hit in archive.search("EXAMPLE-SCRIPT-19", mode="lexical")} == {upload.document_id}
+        if import_sibling:
+            assert archive.get_document(sibling.document_id) == sibling_before
+            assert snapshot.read_bytes() == source_bytes
+    assert len(archive.list_documents()) == (2 if import_sibling else 1)
 
 
 @pytest.mark.parametrize("filename", ["scan", "scan.bin", "scan.txt"])
@@ -502,7 +546,11 @@ def test_reanalysis_preserves_mime_selected_formats_when_a_url_replaces_shared_m
 @pytest.mark.parametrize("failure", ["extraction", "empty extraction", "index publication"])
 def test_failed_reanalysis_preserves_the_complete_previous_archive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str) -> None:
     archive = DocumentationArchive(tmp_path / "archive")
-    document = archive.ingest_upload(filename="preserved.md", title="Preserved analysis", content=b"Preserved source contains PRESERVED-SOURCE-19.")
+    source = io.BytesIO()
+    pdf = canvas.Canvas(source)
+    pdf.drawString(40, 800, "Preserved source contains PRESERVED-SOURCE-19.")
+    pdf.save()
+    document = archive.ingest_upload(filename="preserved.pdf", title="Preserved analysis", content=source.getvalue())
     archive.enrich_document(
         document.document_id,
         spans=[ExtractedSpan("Previous enrichment contains PRESERVED-AI-19.", "ai:metadata")],
@@ -519,7 +567,7 @@ def test_failed_reanalysis_preserves_the_complete_previous_archive(tmp_path: Pat
             raise RuntimeError("forced extraction failure")
         if failure == "empty extraction":
             return []
-        return [ExtractedSpan("Unpublished replacement UNPUBLISHED-REANALYSIS-19.", "text updated")]
+        return [ExtractedSpan("Unpublished replacement UNPUBLISHED-REANALYSIS-19.", "page 1")]
 
     def fail_index_write(_index, _path):
         raise RuntimeError("forced index failure")

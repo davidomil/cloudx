@@ -71,6 +71,11 @@ export interface DocumentationEnrichmentSource {
   sourceType?: string;
 }
 
+interface ArchivedMediaSource extends DocumentationEnrichmentSource {
+  contentPath: string;
+  hasVideo: boolean;
+}
+
 type MediaProcessLauncher = (
   command: string,
   args: readonly string[],
@@ -408,7 +413,7 @@ export class DocumentationEnrichmentService {
     return typeof health.archiveRoot === "string" ? health.archiveRoot : undefined;
   }
 
-  private async archivedMediaSource(document: Record<string, unknown>, signal?: AbortSignal): Promise<DocumentationEnrichmentSource | undefined> {
+  private async archivedMediaSource(document: Record<string, unknown>, signal?: AbortSignal): Promise<ArchivedMediaSource | undefined> {
     const snapshotPath = optionalRecordString(document, "snapshot_path");
     const hasMediaSuffix = snapshotPath && /\.(mp3|wav|m4a|aac|ogg|webm|mp4|mov|mkv|avi)$/iu.test(snapshotPath);
     if (!snapshotPath) {
@@ -474,16 +479,18 @@ export class DocumentationEnrichmentService {
       && await isUtf8TextFile(realSnapshot, signal)) {
       return undefined;
     }
-    return { filename: path.basename(snapshotPath), contentPath: realSnapshot, contentType, sourceType: optionalRecordString(document, "source_type") };
+    const hasVideo = await containsVideoStream(realSnapshot, signal, this.options.mediaProcessLauncher);
+    return { filename: path.basename(snapshotPath), contentPath: realSnapshot, contentType, sourceType: optionalRecordString(document, "source_type"), hasVideo };
   }
 
-  private async prepareMediaEvidence(source: DocumentationEnrichmentSource, cleanup: Array<() => Promise<void>>, signal?: AbortSignal): Promise<MediaEvidence | undefined> {
+  private async prepareMediaEvidence(source: DocumentationEnrichmentSource | ArchivedMediaSource, cleanup: Array<() => Promise<void>>, signal?: AbortSignal): Promise<MediaEvidence | undefined> {
     signal?.throwIfAborted();
     if ((!source.content && !source.contentPath) || !isMediaSource(source)) {
       return undefined;
     }
     let mediaPath: string;
     let mediaWorkDir: string | undefined;
+    const hasVideo = "hasVideo" in source ? source.hasVideo : isVideoSource(source);
     if (source.contentPath) {
       mediaPath = path.resolve(source.contentPath);
       const stat = await fsp.lstat(mediaPath);
@@ -491,7 +498,7 @@ export class DocumentationEnrichmentService {
       if (!stat.isFile() || stat.isSymbolicLink()) {
         throw new Error("Documentation media source must be a regular spool file.");
       }
-      if (isVideoSource(source)) {
+      if (hasVideo) {
         mediaWorkDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-media-"));
         cleanup.push(() => fsp.rm(mediaWorkDir!, { recursive: true, force: true }));
       }
@@ -509,7 +516,7 @@ export class DocumentationEnrichmentService {
     const transcript = source.contentPath
       ? signal ? await this.options.asr.transcribeFile(mediaPath, filename, { signal }) : await this.options.asr.transcribeFile(mediaPath, filename)
       : signal ? await this.options.asr.transcribe(source.content!, filename, { signal }) : await this.options.asr.transcribe(source.content!, filename);
-    const keyframes = isVideoSource(source)
+    const keyframes = hasVideo
       ? await captureSceneKeyframes(mediaPath, path.join(mediaWorkDir!, "frames"), signal, this.options.mediaProcessLauncher)
       : [];
     return {
@@ -1249,6 +1256,25 @@ async function listFiles(root: string, signal?: AbortSignal): Promise<string[]> 
   return files;
 }
 
+async function containsVideoStream(inputPath: string, signal?: AbortSignal, mediaProcessLauncher?: MediaProcessLauncher): Promise<boolean> {
+  const result = await runMediaTool("ffprobe", [
+    "-v", "error",
+    "-protocol_whitelist", "file,pipe",
+    "-select_streams", "V",
+    "-show_entries", "stream=codec_type",
+    "-of", "json",
+    inputPath
+  ], signal, mediaProcessLauncher);
+  if (result.status !== 0) {
+    throw new Error(`ffprobe media inspection failed: ${result.stderr || result.stdout || `exit ${result.status}`}`);
+  }
+  const { streams } = getRecord(JSON.parse(result.stdout), "ffprobe output");
+  if (!Array.isArray(streams) || !streams.every((stream) => isRecord(stream) && stream.codec_type === "video")) {
+    throw new Error("ffprobe output must contain an array of selected video streams.");
+  }
+  return streams.length > 0;
+}
+
 async function captureSceneKeyframes(
   inputPath: string,
   outputDir: string,
@@ -1367,7 +1393,7 @@ function runMediaTool(
       if (stream === "stdout") {
         stdoutBytes += bytes;
         if (stdoutBytes > MEDIA_TOOL_OUTPUT_MAX_BYTES) {
-          stopWithError(new Error(`ffmpeg stdout exceeded the ${MEDIA_TOOL_OUTPUT_MAX_BYTES} byte output limit.`));
+          stopWithError(new Error(`${command} stdout exceeded the ${MEDIA_TOOL_OUTPUT_MAX_BYTES} byte output limit.`));
           return;
         }
         stdout += chunk;
@@ -1375,7 +1401,7 @@ function runMediaTool(
       }
       stderrBytes += bytes;
       if (stderrBytes > MEDIA_TOOL_OUTPUT_MAX_BYTES) {
-        stopWithError(new Error(`ffmpeg stderr exceeded the ${MEDIA_TOOL_OUTPUT_MAX_BYTES} byte output limit.`));
+        stopWithError(new Error(`${command} stderr exceeded the ${MEDIA_TOOL_OUTPUT_MAX_BYTES} byte output limit.`));
         return;
       }
       stderr += chunk;
@@ -1417,11 +1443,11 @@ function runMediaTool(
     child.on("error", onChildError);
     child.on("close", onChildClose);
     processGroupId = child.pid;
-    timeout = setTimeout(() => stopWithError(new Error(`ffmpeg keyframe extraction timed out after ${MEDIA_TOOL_TIMEOUT_MS} ms.`)), MEDIA_TOOL_TIMEOUT_MS);
+    timeout = setTimeout(() => stopWithError(new Error(`${command} media processing timed out after ${MEDIA_TOOL_TIMEOUT_MS} ms.`)), MEDIA_TOOL_TIMEOUT_MS);
     timeout.unref();
     signal?.addEventListener("abort", abort, { once: true });
     if (!child.stdout || !child.stderr) {
-      stopWithError(new Error("ffmpeg keyframe extraction did not expose piped output streams."));
+      stopWithError(new Error(`${command} did not expose piped output streams.`));
       return;
     }
     child.stdout.setEncoding("utf8");
