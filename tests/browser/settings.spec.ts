@@ -254,6 +254,69 @@ test("drafts survive tab switches and search, Save persists them, and Cancel dis
   ).toHaveValue("30");
 });
 
+for (const viewport of [
+  { width: 667, height: 375 },
+  { width: 1024, height: 375 },
+]) {
+  test(`searched settings remain editable at ${viewport.width} × ${viewport.height} and 150% UI scale`, async ({
+    page,
+    isMobile,
+  }, testInfo) => {
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    const settings = await openSettings(page, isMobile);
+    const scale = settings.getByRole("spinbutton", { name: "UI scale" });
+    const search = settings.getByRole("searchbox", { name: "Search settings" });
+    const save = settings.getByRole("button", { name: "Save", exact: true });
+    const cancel = settings.getByRole("button", {
+      name: "Cancel",
+      exact: true,
+    });
+
+    await scale.fill("150");
+    await save.click();
+    await expect(settings).toHaveCount(0);
+    await expect(page.locator("html")).toHaveCSS("font-size", "24px");
+
+    await page.setViewportSize(viewport);
+    await openSettings(page, viewport.width <= 700);
+    await search.fill("UI scale");
+    await expect(scale).toHaveValue("150");
+    await search.press("Tab");
+    await page.keyboard.press("Tab");
+    await page.keyboard.press("Tab");
+    await page.keyboard.press("Tab");
+    await expect(scale).toBeFocused();
+    await expect(scale).toBeInViewport({ ratio: 1 });
+    await scale.click({ timeout: 5_000 });
+    await expect(scale).toBeFocused();
+    await expect(scale).toBeInViewport({ ratio: 1 });
+    await expectSettingsActionsReachable(page);
+    const scaleBounds = await scale.boundingBox();
+    expect(scaleBounds!.y + scaleBounds!.height).toBeLessThanOrEqual(
+      (await settings.locator(".settings-footer").boundingBox())!.y,
+    );
+    await captureSample(page, testInfo, "settings-landscape");
+    await scale.fill("135");
+    await save.click();
+    await expect(settings).toHaveCount(0);
+
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await openSettings(page, viewport.width <= 700);
+    await search.fill("UI scale");
+    await expect(scale).toHaveValue("135");
+    await scale.click();
+    await scale.fill("125");
+    await expectSettingsActionsReachable(page);
+    await cancel.click();
+    await expect(settings).toHaveCount(0);
+
+    await openSettings(page, viewport.width <= 700);
+    await search.fill("UI scale");
+    await expect(scale).toHaveValue("135");
+    await scale.click();
+  });
+}
+
 async function openSettings(page: Page, isMobile: boolean) {
   await expect(page.locator(".workspace-pane").first()).toBeVisible();
   if (isMobile) {
@@ -297,6 +360,16 @@ async function expectSettingsFits(page: Page, isMobile: boolean) {
     "aria-orientation",
     isMobile ? "horizontal" : "vertical",
   );
+}
+
+async function expectSettingsActionsReachable(page: Page) {
+  const settings = page.getByRole("dialog", { name: "Settings", exact: true });
+  await expect(settings).toBeInViewport({ ratio: 1 });
+  for (const name of ["Cancel", "Save"]) {
+    const action = settings.getByRole("button", { name, exact: true });
+    await expect(action).toBeInViewport({ ratio: 1 });
+    await action.click({ trial: true });
+  }
 }
 
 async function captureSample(page: Page, testInfo: TestInfo, name: string) {

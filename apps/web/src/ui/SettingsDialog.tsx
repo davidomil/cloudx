@@ -224,38 +224,40 @@ export function SettingsDialog({
   return (
     <div className="dialog-backdrop settings-backdrop">
       <div className="dialog settings-dialog" role="dialog" aria-modal="true" aria-labelledby={`${id}-title`} ref={dialogRef} onKeyDown={handleDialogKeyDown}>
-        <header className="settings-header">
-          <div className="settings-title"><Settings2 size={22} aria-hidden="true" /><div><h2 id={`${id}-title`}>Settings</h2><p>Configure your workspace, tools, and integrations.</p></div></div>
-          <ControlButton iconOnly title="Close settings" aria-label="Close settings" onClick={onCancel} disabled={busy}><X size={18} /></ControlButton>
-        </header>
-        <div className="settings-search-bar">
-          <div className="settings-search-control">
-            <Search size={18} aria-hidden="true" />
-            <input ref={searchRef} type="search" aria-label="Search settings" placeholder="Search all settings…" value={query} onChange={event => changeQuery(event.target.value)} />
-            {query ? <ControlButton iconOnly size="compact" aria-label="Clear search" title="Clear search" onClick={clearSearch}><X size={16} /></ControlButton> : null}
+        <div className="settings-body">
+          <header className="settings-header">
+            <div className="settings-title"><Settings2 size={22} aria-hidden="true" /><div><h2 id={`${id}-title`}>Settings</h2><p>Configure your workspace, tools, and integrations.</p></div></div>
+            <ControlButton iconOnly title="Close settings" aria-label="Close settings" onClick={onCancel} disabled={busy}><X size={18} /></ControlButton>
+          </header>
+          <div className="settings-search-bar">
+            <div className="settings-search-control">
+              <Search size={18} aria-hidden="true" />
+              <input ref={searchRef} type="search" aria-label="Search settings" placeholder="Search all settings…" value={query} onChange={event => changeQuery(event.target.value)} />
+              {query ? <ControlButton iconOnly size="compact" aria-label="Clear search" title="Clear search" onClick={clearSearch}><X size={16} /></ControlButton> : null}
+            </div>
+            <span className="settings-result-count" role="status">{searchWords.length ? `${totalMatches} matching settings` : `${totalMatches} settings`} across all tabs</span>
           </div>
-          <span className="settings-result-count" role="status">{searchWords.length ? `${totalMatches} matching settings` : `${totalMatches} settings`} across all tabs</span>
-        </div>
-        <div className="settings-workspace">
-          <div className="settings-tabs" ref={tabsRef} role="tablist" aria-label="Settings categories" aria-orientation={horizontalTabs ? "horizontal" : "vertical"} onKeyDown={navigateTabs}>
-            {filteredCategories.map((category, index) => {
-              const Icon = category.id === "general" ? Settings2 : category.id === "browser" ? Bell : Blocks;
-              return <button key={category.id} type="button" role="tab" id={`${id}-tab-${index}`} aria-controls={`${id}-panel-${index}`} aria-label={category.label} aria-selected={category.id === activeCategory.id} tabIndex={category.id === activeCategory.id ? 0 : -1} onClick={() => setActiveCategoryId(category.id)}>
-                <Icon size={16} aria-hidden="true" /><span>{category.label}</span><small>{category.entries.filter(entry => entry.matches).length}</small>
-              </button>;
-            })}
-          </div>
-          <div className="settings-content" ref={contentRef}>
-            {filteredCategories.map((category, index) => <section key={category.id} className="settings-category" role="tabpanel" id={`${id}-panel-${index}`} aria-labelledby={`${id}-tab-${index}`} hidden={category.id !== activeCategory.id} tabIndex={0}>
-              <div className="settings-category-heading"><h3>{category.label}</h3><p>{category.description}</p></div>
-              {category.entries.map(entry => <div key={entry.id} className="settings-entry" hidden={!entry.matches}>{entry.content}</div>)}
-              {!category.entries.some(entry => entry.matches) ? <div className="settings-empty">
-                <Search size={28} aria-hidden="true" />
-                <h4>{searchWords.length ? "No matching settings" : "No settings in this tab"}</h4>
-                <p>{searchWords.length ? totalMatches ? "Try another tab with matches, or clear your search." : "Try a different name, description, or plugin." : "Settings will appear here when available."}</p>
-                {query ? <ControlButton onClick={clearSearch}>Show all settings</ControlButton> : null}
-              </div> : null}
-            </section>)}
+          <div className="settings-workspace">
+            <div className="settings-tabs" ref={tabsRef} role="tablist" aria-label="Settings categories" aria-orientation={horizontalTabs ? "horizontal" : "vertical"} onKeyDown={navigateTabs}>
+              {filteredCategories.map((category, index) => {
+                const Icon = category.id === "general" ? Settings2 : category.id === "browser" ? Bell : Blocks;
+                return <button key={category.id} type="button" role="tab" id={`${id}-tab-${index}`} aria-controls={`${id}-panel-${index}`} aria-label={category.label} aria-selected={category.id === activeCategory.id} tabIndex={category.id === activeCategory.id ? 0 : -1} onClick={() => setActiveCategoryId(category.id)}>
+                  <Icon size={16} aria-hidden="true" /><span>{category.label}</span><small>{category.entries.filter(entry => entry.matches).length}</small>
+                </button>;
+              })}
+            </div>
+            <div className="settings-content" ref={contentRef}>
+              {filteredCategories.map((category, index) => <section key={category.id} className="settings-category" role="tabpanel" id={`${id}-panel-${index}`} aria-labelledby={`${id}-tab-${index}`} hidden={category.id !== activeCategory.id} tabIndex={0}>
+                <div className="settings-category-heading"><h3>{category.label}</h3><p>{category.description}</p></div>
+                {category.entries.map(entry => <div key={entry.id} className="settings-entry" hidden={!entry.matches}>{entry.content}</div>)}
+                {!category.entries.some(entry => entry.matches) ? <div className="settings-empty">
+                  <Search size={28} aria-hidden="true" />
+                  <h4>{searchWords.length ? "No matching settings" : "No settings in this tab"}</h4>
+                  <p>{searchWords.length ? totalMatches ? "Try another tab with matches, or clear your search." : "Try a different name, description, or plugin." : "Settings will appear here when available."}</p>
+                  {query ? <ControlButton onClick={clearSearch}>Show all settings</ControlButton> : null}
+                </div> : null}
+              </section>)}
+            </div>
           </div>
         </div>
         <footer className="settings-footer">

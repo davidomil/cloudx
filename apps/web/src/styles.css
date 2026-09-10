@@ -6270,12 +6270,18 @@ a:hover svg {
   width: min(1160px, 100%);
   height: min(880px, calc(100dvh - 48px));
   min-height: 0;
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr) auto;
   gap: 0;
   padding: 0;
   overflow: hidden;
   border-color: var(--color-border);
   background: var(--color-card);
+}
+
+.settings-body {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  min-height: 0;
 }
 
 .settings-header,
@@ -6606,6 +6612,23 @@ a:hover svg {
 
   .settings-footer .dialog-actions {
     flex-shrink: 0;
+  }
+}
+
+@media (max-height: 520px) {
+  .settings-body {
+    display: block;
+    overflow: auto;
+    overscroll-behavior: contain;
+  }
+
+  .settings-workspace {
+    grid-template-rows: auto;
+    align-items: start;
+  }
+
+  .settings-content {
+    overflow: visible;
   }
 }
 
