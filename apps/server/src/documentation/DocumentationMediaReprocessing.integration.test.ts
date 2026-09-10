@@ -113,6 +113,81 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
     );
 
     describe.each(["reanalyze", "reenrich"] as const)("%s", (operation) => {
+      describe.each(["latin1", "utf8"] as const)("retained %s text", (encoding) => {
+        it.each([undefined, "text/plain", "application/octet-stream", "audio/flac", "video/ogg"])(
+          "enriches existing text twice after reopening its database (sibling MIME: %s)",
+          async (contentType) => {
+            const fixture = await startArchive();
+            try {
+              const sourceBytes = Buffer.from("RETAINED-NOTES: Release reset after power stabilizes. Café instructions.\n", encoding);
+              const sourcePath = path.join(fixture.root, "notes.txt");
+              await fs.writeFile(sourcePath, sourceBytes);
+              const imported = await fixture.client.ingestUploadFile({
+                filename: "notes.txt", path: sourcePath, contentType: "text/plain",
+                title: "Original notes", collection: "Text regression", tags: ["retain-me"],
+              });
+              const documentId = (imported.document as { documentId: string }).documentId;
+              const original = await fixture.document(documentId);
+              const sourceChunks = original.chunks.filter((chunk) => chunk.chunk_origin === "source")
+                .map(({ locator, text }) => ({ locator, text }));
+              expect(sourceChunks).toEqual([{ locator: "text", text: sourceBytes.toString("utf8").trim() }]);
+              await fixture.client.enrichDocument({
+                documentId, model: "prior-model", skillIds: [],
+                spans: [{ locator: "ai:notes", text: "PRIOR-AI-SPAN is not source evidence." }],
+              });
+
+              let sibling: ArchivedDocument | undefined;
+              if (contentType) {
+                const importedSibling = await fixture.client.ingestUploadFile({
+                  filename: "shared-notes.txt", path: sourcePath, contentType,
+                  title: "Separate notes copy",
+                });
+                sibling = await fixture.document((importedSibling.document as { documentId: string }).documentId);
+                expect(sibling.document_id).not.toBe(documentId);
+                expect(path.dirname(sibling.snapshot_path)).toBe(path.dirname(original.snapshot_path));
+                expect(JSON.parse(await fs.readFile(path.join(fixture.archiveRoot, path.dirname(original.snapshot_path), "metadata.json"), "utf8")))
+                  .toMatchObject({ contentType, upload: true });
+              }
+              await fs.unlink(sourcePath);
+              const persisted = await fixture.document(documentId);
+              await fixture.reopen();
+              await expect(fixture.document(documentId)).resolves.toEqual(persisted);
+              const enrichment = createEnrichment(fixture);
+              const hook = enrichment.plugin.hooks.find((candidate) => candidate.id === `documentation.documents.${operation}`)!;
+              for (let rerun = 1; rerun <= 2; rerun += 1) {
+                const prior = await fixture.document(documentId);
+                await expect(hook.execute({ documentId }, { caller: { kind: "ui" } }))
+                  .resolves.toMatchObject({ kind: operation, firstDocumentId: documentId, enrichment: { results: [{ status: "written" }] } });
+                expect(enrichment.run).toHaveBeenCalledTimes(rerun);
+                const prompt = enrichment.run.mock.lastCall![0];
+                expect(prompt).toContain(JSON.stringify(sourceChunks[0].text));
+                for (const chunk of prior.chunks.filter((chunk) => chunk.chunk_origin === "ai")) {
+                  expect(prompt).not.toContain(chunk.text);
+                }
+                expect(enrichment.transcribeFile).not.toHaveBeenCalled();
+                expect(enrichment.mediaProcessLauncher).not.toHaveBeenCalled();
+                const current = await fixture.document(documentId);
+                expect(identity(current)).toEqual(identity(original));
+                expect(current.chunks.filter((chunk) => chunk.chunk_origin === "source").map(({ locator, text }) => ({ locator, text })))
+                  .toEqual(sourceChunks);
+                expect(current.chunks.filter((chunk) => chunk.chunk_origin === "ai"))
+                  .toMatchObject([{ text: `REPLACEMENT-AI-${rerun}` }]);
+                expect(JSON.parse(current.enrichments[0].payload_json).evidence).toMatchObject({
+                  chunkCount: 1, mediaTranscriptChars: 0, keyframeCount: 0,
+                });
+                await expect(fs.readFile(path.join(fixture.archiveRoot, current.snapshot_path))).resolves.toEqual(sourceBytes);
+                if (sibling) {
+                  await expect(fixture.document(sibling.document_id)).resolves.toEqual(sibling);
+                  await expect(fs.readFile(path.join(fixture.archiveRoot, sibling.snapshot_path))).resolves.toEqual(sourceBytes);
+                }
+              }
+            } finally {
+              await fixture.dispose();
+            }
+          }, 30_000,
+        );
+      });
+
       describe.each(["html", "xlsx"] as const)("retained %s", (format) => {
         it.each([undefined, "text/plain", "application/octet-stream", "audio/flac", "video/ogg"])(
           "enriches structured evidence twice without decoding (sibling MIME: %s)",
@@ -375,44 +450,26 @@ async function startArchive() {
     response.writeHead(200, { "content-type": "application/octet-stream" });
     response.end(siblingBytes);
   });
-  const indexer = spawn(python, [
-    "-m", "cloudx_documentation_indexer.main", "--host", "127.0.0.1", "--port", "0", "--archive-root", archiveRoot,
-  ], {
-    cwd: repositoryRoot,
-    env: {
-      ...process.env,
-      PYTHONPATH: path.join(repositoryRoot, "services/documentation-indexer/src"),
-      PYTHONDONTWRITEBYTECODE: "1",
-      CLOUDX_DOCUMENTATION_ALLOW_PRIVATE_URL_INGEST: "1",
-    },
-    stdio: ["ignore", "ignore", "pipe"],
-  });
-  const exited = new Promise<void>((resolve) => indexer.once("close", () => resolve()));
+  let indexer = startArchiveIndexer(archiveRoot);
   async function dispose() {
     await queue.dispose();
     if (sourceServer.listening) await new Promise<void>((resolve, reject) => sourceServer.close((error) => error ? reject(error) : resolve()));
-    indexer.kill("SIGTERM");
-    await exited;
+    await indexer.stop();
     await fs.rm(root, { recursive: true, force: true });
   }
   try {
-    const serviceUrl = await new Promise<string>((resolve, reject) => {
-      let output = "";
-      const timeout = setTimeout(() => reject(new Error(`Indexer startup timed out: ${output}`)), 10_000);
-      indexer.once("error", (error) => { clearTimeout(timeout); reject(error); });
-      indexer.once("exit", () => { clearTimeout(timeout); reject(new Error(`Indexer exited during startup: ${output}`)); });
-      indexer.stderr.on("data", (chunk: Buffer) => {
-        output += chunk.toString();
-        const url = /Uvicorn running on (http:\/\/127\.0\.0\.1:\d+)/u.exec(output)?.[1];
-        if (url) { clearTimeout(timeout); resolve(url); }
-      });
-    });
+    let client = await indexer.client;
     sourceServer.listen(0, "127.0.0.1");
     await once(sourceServer, "listening");
     const sourcePort = (sourceServer.address() as { port: number }).port;
-    const client = new DocumentationClient(serviceUrl);
     return {
-      root, archiveRoot, queue, client, dispose,
+      root, archiveRoot, queue, dispose,
+      get client() { return client; },
+      async reopen() {
+        await indexer.stop();
+        indexer = startArchiveIndexer(archiveRoot);
+        client = await indexer.client;
+      },
       async document(documentId: string) {
         return (await client.getDocument({ documentId })).document as ArchivedDocument;
       },
@@ -426,4 +483,37 @@ async function startArchive() {
     await dispose();
     throw error;
   }
+}
+
+function startArchiveIndexer(archiveRoot: string) {
+  const indexer = spawn(python, [
+    "-m", "cloudx_documentation_indexer.main", "--host", "127.0.0.1", "--port", "0", "--archive-root", archiveRoot,
+  ], {
+    cwd: repositoryRoot,
+    env: {
+      ...process.env,
+      PYTHONPATH: path.join(repositoryRoot, "services/documentation-indexer/src"),
+      PYTHONDONTWRITEBYTECODE: "1",
+      CLOUDX_DOCUMENTATION_ALLOW_PRIVATE_URL_INGEST: "1",
+    },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  const exited = new Promise<void>((resolve) => indexer.once("close", () => resolve()));
+  return {
+    async stop() {
+      indexer.kill("SIGTERM");
+      await exited;
+    },
+    client: new Promise<DocumentationClient>((resolve, reject) => {
+      let output = "";
+      const timeout = setTimeout(() => reject(new Error(`Indexer startup timed out: ${output}`)), 10_000);
+      indexer.once("error", (error) => { clearTimeout(timeout); reject(error); });
+      indexer.once("exit", () => { clearTimeout(timeout); reject(new Error(`Indexer exited during startup: ${output}`)); });
+      indexer.stderr.on("data", (chunk: Buffer) => {
+        output += chunk.toString();
+        const url = /Uvicorn running on (http:\/\/127\.0\.0\.1:\d+)/u.exec(output)?.[1];
+        if (url) { clearTimeout(timeout); resolve(new DocumentationClient(url)); }
+      });
+    }),
+  };
 }

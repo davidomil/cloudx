@@ -476,7 +476,7 @@ export class DocumentationEnrichmentService {
     if (!stat.isFile() || stat.isSymbolicLink()) {
       throw new Error("Archived media source must be a regular file.");
     }
-    if (hasTextChunks && await isTextFile(realSnapshot, { requireUtf8: hasMediaHint, signal })) {
+    if (hasTextChunks && await isTextFile(realSnapshot, signal)) {
       return undefined;
     }
     const hasVideo = await containsVideoStream(realSnapshot, signal, this.options.mediaProcessLauncher);
@@ -1564,34 +1564,24 @@ function recordStringArray(record: Record<string, unknown>, key: string): string
   return strings.length > 0 ? strings : undefined;
 }
 
-async function isTextFile(filename: string, { requireUtf8, signal }: { requireUtf8: boolean; signal?: AbortSignal }): Promise<boolean> {
-  const decoder = new TextDecoder("utf-8", { fatal: requireUtf8 });
+async function isTextFile(filename: string, signal?: AbortSignal): Promise<boolean> {
   let firstChunk = true;
-  try {
-    for await (const bytes of fs.createReadStream(filename, { signal })) {
-      // Ordinary text uses the MIME Sniffing Standard's BOM and binary-byte checks.
-      if (firstChunk && !requireUtf8 && (
-        bytes[0] === 0xfe && bytes[1] === 0xff
-        || bytes[0] === 0xff && bytes[1] === 0xfe
-        || bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf
-      )) {
-        return true;
-      }
-      firstChunk = false;
-      const text = decoder.decode(bytes, { stream: true });
-      // Binary data bytes as defined by the WHATWG MIME Sniffing Standard.
-      if (/[\u0000-\u0008\u000b\u000e-\u001a\u001c-\u001f]/u.test(text)) {
-        return false;
-      }
+  for await (const bytes of fs.createReadStream(filename, { signal })) {
+    // Text uses the WHATWG MIME Sniffing Standard's BOM and binary-byte checks.
+    if (firstChunk && (
+      bytes[0] === 0xfe && bytes[1] === 0xff
+      || bytes[0] === 0xff && bytes[1] === 0xfe
+      || bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf
+    )) {
+      return true;
     }
-    decoder.decode();
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ERR_ENCODING_INVALID_ENCODED_DATA") {
+    firstChunk = false;
+    if (bytes.some((byte: number) => byte <= 0x08 || byte === 0x0b
+      || byte >= 0x0e && byte <= 0x1a || byte >= 0x1c && byte <= 0x1f)) {
       return false;
     }
-    throw error;
   }
+  return true;
 }
 
 function isMediaSource(source: DocumentationEnrichmentSource): boolean {

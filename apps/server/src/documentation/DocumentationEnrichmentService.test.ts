@@ -369,8 +369,8 @@ describe("DocumentationEnrichmentService", () => {
 
     it.each([
       { name: "late binary byte", suffix: Buffer.from([0]) },
-      { name: "late invalid UTF-8", suffix: Buffer.from([0xff]) },
-      { name: "incomplete UTF-8 at EOF", suffix: Buffer.from([0xc3]) },
+      { name: "late binary control after invalid UTF-8", suffix: Buffer.from([0xff, 0x0b]) },
+      { name: "late binary control after incomplete UTF-8", suffix: Buffer.from([0xc3, 0x1f]) },
       { name: "invalid UTF-8 followed by binary data without media hints", suffix: Buffer.concat([Buffer.from([0xff]), Buffer.alloc(70_000, 0x61), Buffer.from([0])]), sourceType: "text" },
     ])("keeps binary .txt media on ASR with $name", async ({ suffix, sourceType = "media" }) => {
       const fixture = await archivedMediaFixture("recording.txt", sourceType);
@@ -644,34 +644,39 @@ describe("DocumentationEnrichmentService", () => {
   });
 
   it.each([
-    { filename: "notes", contentType: "text/plain" },
-    { filename: "notes.md", contentType: null },
-    { filename: "notes.txt", contentType: "text/plain", bytes: Buffer.from("RETAINED-TEXT café", "latin1") },
-    { filename: "notes.txt", contentType: null, bytes: Buffer.from("\ufeffRETAINED-TEXT café", "utf16le") },
-    { filename: "notes.txt", contentType: null, bytes: Buffer.from("\ufeffRETAINED-TEXT café", "utf16le").swap16() },
-    { filename: "notes.txt", contentType: null, bytes: Buffer.from("\ufeffRETAINED-TEXT\0") },
-  ])("retains $filename source evidence when its metadata has no media MIME type", async ({ filename, contentType, bytes = Buffer.from("RETAINED-TEXT source evidence.") }) => {
-    const text = bytes.toString("utf8").trim();
-    const fixture = await archivedMediaFixture(filename, "text", {
-      chunks: [{ chunk_id: 11, locator: "text", chunk_origin: "source", text }],
-    });
-    await fs.writeFile(fixture.mediaPath, bytes);
-    await fs.writeFile(path.join(path.dirname(fixture.mediaPath), "metadata.json"), JSON.stringify({ contentType }));
-    const runner = fakeRunner();
-    const transcribeFile = vi.fn();
-    const mediaProcessLauncher = fakeMediaTools(false);
-    const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher });
-    try {
-      await service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] });
+    { name: "extensionless", filename: "notes", contentType: "text/plain" },
+    { name: "Markdown", filename: "notes.md", contentType: null },
+    { name: "Latin-1", filename: "notes.txt", contentType: "text/plain", bytes: Buffer.from("RETAINED-TEXT café", "latin1") },
+    { name: "late Latin-1 byte", filename: "notes.txt", contentType: "text/plain", bytes: Buffer.concat([Buffer.from("RETAINED-TEXT".padEnd(70_000, "a")), Buffer.from([0xff])]) },
+    { name: "incomplete UTF-8 at EOF", filename: "notes.txt", contentType: "text/plain", bytes: Buffer.concat([Buffer.from("RETAINED-TEXT".padEnd(70_000, "a")), Buffer.from([0xc3])]) },
+    { name: "whitespace and ESC", filename: "notes.txt", contentType: "text/plain", bytes: Buffer.from("RETAINED-TEXT\t\n\f\r\u001b café") },
+    { name: "UTF-16LE BOM", filename: "notes.txt", contentType: null, bytes: Buffer.from("\ufeffRETAINED-TEXT café", "utf16le") },
+    { name: "UTF-16BE BOM", filename: "notes.txt", contentType: null, bytes: Buffer.from("\ufeffRETAINED-TEXT café", "utf16le").swap16() },
+    { name: "UTF-8 BOM", filename: "notes.txt", contentType: null, bytes: Buffer.from("\ufeffRETAINED-TEXT\0") },
+  ].flatMap((fixture) => [fixture.contentType, "audio/flac", "video/ogg"].map((contentType) => ({ ...fixture, contentType }))))(
+    "retains $name text evidence independently of MIME $contentType", async ({ filename, contentType, bytes = Buffer.from("RETAINED-TEXT source evidence.") }) => {
+      const text = bytes.toString("utf8").trim().slice(0, 100);
+      const fixture = await archivedMediaFixture(filename, "text", {
+        chunks: [{ chunk_id: 11, locator: "text", chunk_origin: "source", text }],
+      });
+      await fs.writeFile(fixture.mediaPath, bytes);
+      await fs.writeFile(path.join(path.dirname(fixture.mediaPath), "metadata.json"), JSON.stringify({ contentType }));
+      const runner = fakeRunner();
+      const transcribeFile = vi.fn();
+      const mediaProcessLauncher = fakeMediaTools(false);
+      const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher });
+      try {
+        await service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] });
 
-      expect(runner.run.mock.calls[0]?.[0]).toContain(JSON.stringify(text));
-      expect(transcribeFile).not.toHaveBeenCalled();
-      expect(mediaProcessLauncher).not.toHaveBeenCalled();
-      await expect(fs.readFile(fixture.mediaPath)).resolves.toEqual(bytes);
-    } finally {
-      await fs.rm(fixture.root, { recursive: true, force: true });
-    }
-  });
+        expect(runner.run.mock.calls[0]?.[0]).toContain(JSON.stringify(text));
+        expect(transcribeFile).not.toHaveBeenCalled();
+        expect(mediaProcessLauncher).not.toHaveBeenCalled();
+        await expect(fs.readFile(fixture.mediaPath)).resolves.toEqual(bytes);
+      } finally {
+        await fs.rm(fixture.root, { recursive: true, force: true });
+      }
+    },
+  );
 
   describe.each(["application/octet-stream", "audio/flac", "video/ogg"])("structured evidence with shared MIME %s", (contentType) => {
     it.each(["html", "page 1", "page 1 table-001", "image", "sheet Parts range A1:B3", "schematic schematic-001 image frame 0"])(
