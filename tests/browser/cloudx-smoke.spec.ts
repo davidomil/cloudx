@@ -115,7 +115,7 @@ test.describe("CloudX shipped shell", () => {
     });
   });
 
-  test("saves explicit Forge repository trust and clears changed or revoked approval", async ({
+  test("saves the Forge repository without a separate trust approval", async ({
     page,
     isMobile,
   }, testInfo) => {
@@ -124,12 +124,7 @@ test.describe("CloudX shipped shell", () => {
     ).json()) as CloudxConfigResponse;
     const repository = "browser-fixture/trust";
     const apiUrl = "https://api.github.com";
-    const approval = JSON.stringify(["github", apiUrl, repository]);
     const dialog = page.locator(".settings-dialog");
-    const trust = dialog.getByRole("checkbox", {
-      name: "Trust this repository for Forge workers",
-      exact: true,
-    });
 
     async function openSettings() {
       if (isMobile) {
@@ -143,11 +138,42 @@ test.describe("CloudX shipped shell", () => {
       await dialog
         .getByRole("tab", { name: "Forge Workers", exact: true })
         .click();
-      await trust.scrollIntoViewIfNeeded();
-      await expect(trust).toBeInViewport();
+      await expect(
+        dialog.getByRole("checkbox", {
+          name: "Trust this repository for Forge workers",
+          exact: true,
+        }),
+      ).toHaveCount(0);
     }
 
-    async function saveTrust(expectedApproval: string) {
+    try {
+      const seeded = await page.request.patch(`${baseUrl}/api/config`, {
+        data: {
+          plugins: {
+            forge: { provider: "github", apiUrl, projectPath: repository },
+          },
+        },
+      });
+      expect(seeded.ok()).toBe(true);
+      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+      await openSettings();
+      await expect(
+        dialog.getByLabel("Repository", { exact: true }),
+      ).toHaveValue(repository);
+      expect(
+        await dialog.evaluate(
+          (element) => element.scrollWidth <= element.clientWidth + 1,
+        ),
+      ).toBe(true);
+      await testInfo.attach("Forge repository settings", {
+        body: await page.screenshot({
+          path: testInfo.outputPath("forge-repository-settings.png"),
+        }),
+        contentType: "image/png",
+      });
+      await dialog
+        .getByLabel("Repository", { exact: true })
+        .fill("browser-fixture/other");
       const saving = page.waitForResponse(
         (response) =>
           response.request().method() === "PATCH" &&
@@ -157,77 +183,20 @@ test.describe("CloudX shipped shell", () => {
       const saved = await saving;
       expect(saved.status()).toBe(200);
       const config = (await saved.json()) as CloudxConfigResponse;
-      expect(config.values.plugins.forge?.trustedRepository).toBe(
-        expectedApproval,
+      expect(config.values.plugins.forge).toMatchObject({
+        provider: "github",
+        apiUrl,
+        projectPath: "browser-fixture/other",
+      });
+      expect(config.values.plugins.forge).not.toHaveProperty(
+        "trustedRepository",
       );
       await expect(dialog).toHaveCount(0);
-    }
-
-    try {
-      const seeded = await page.request.patch(`${baseUrl}/api/config`, {
-        data: {
-          plugins: {
-            forge: {
-              provider: "github",
-              apiUrl,
-              projectPath: repository,
-              trustedRepository: "",
-            },
-          },
-        },
-      });
-      expect(seeded.ok()).toBe(true);
-      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
-      await openSettings();
-      await expect(trust).toBeEnabled();
-      await expect(trust).not.toBeChecked();
-      const consent = dialog.locator("label").filter({
-        has: page.getByRole("checkbox", {
-          name: "Trust this repository for Forge workers",
-          exact: true,
-        }),
-      });
-      await expect(consent).toContainText(repository);
-      await expect(consent).toContainText(apiUrl);
-      await expect(consent).toContainText("run commands on this machine");
-      expect(
-        await dialog.evaluate(
-          (element) => element.scrollWidth <= element.clientWidth + 1,
-        ),
-      ).toBe(true);
-      await testInfo.attach("Forge repository trust", {
-        body: await page.screenshot({
-          path: testInfo.outputPath("forge-repository-trust.png"),
-        }),
-        contentType: "image/png",
-      });
-
-      await trust.check();
-      await saveTrust(approval);
       await page.reload({ waitUntil: "domcontentloaded" });
       await openSettings();
-      await expect(trust).toBeChecked();
-
-      await dialog
-        .getByLabel("Repository", { exact: true })
-        .fill("browser-fixture/other");
-      await expect(trust).not.toBeChecked();
-      await dialog.getByLabel("Repository", { exact: true }).fill(repository);
-      await expect(trust).not.toBeChecked();
-      await saveTrust("");
-      await page.reload({ waitUntil: "domcontentloaded" });
-      await openSettings();
-      await expect(trust).not.toBeChecked();
-
-      await trust.check();
-      await saveTrust(approval);
-      await openSettings();
-      await expect(trust).toBeChecked();
-      await trust.uncheck();
-      await saveTrust("");
-      await page.reload({ waitUntil: "domcontentloaded" });
-      await openSettings();
-      await expect(trust).not.toBeChecked();
+      await expect(
+        dialog.getByLabel("Repository", { exact: true }),
+      ).toHaveValue("browser-fixture/other");
     } finally {
       const restored = await page.request.patch(`${baseUrl}/api/config`, {
         data: { plugins: { forge: original.values.plugins.forge } },

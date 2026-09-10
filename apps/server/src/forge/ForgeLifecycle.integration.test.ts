@@ -18,6 +18,7 @@ import type {
 } from "@cloudx/shared";
 
 import { TabContextService } from "../context/TabContextService.js";
+import { ConfigService } from "../configService.js";
 import { PathPolicy } from "../pathPolicy.js";
 import { PluginRegistry } from "../pluginRegistry.js";
 import { CodexStateSources } from "../plugins/CodexStateSources.js";
@@ -33,6 +34,7 @@ import { TerminalSupervisor } from "../terminal/TerminalSupervisor.js";
 import { WorkspaceCommandService } from "../workspace/WorkspaceCommandService.js";
 import { WorkspaceLayoutStore } from "../workspace/WorkspaceLayoutStore.js";
 import { ForgeRuntime, type ForgeRuntimeDependencies } from "./ForgeRuntime.js";
+import { ForgeSettingsService } from "./ForgeSettingsService.js";
 import { ForgeWorkflowService, type ForgeSettings, type ForgeWorkflowDependencies } from "./ForgeWorkflowService.js";
 import { ForgeWorkerReports, ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
 import { ForgeProviderUnavailableError, type ForgeProvider } from "./providers/ForgeProvider.js";
@@ -142,13 +144,14 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     }
   }, 20_000);
 
-  it("requires issue repository consent before starting Codex and resumes the retained checkout after consent", async () => {
-    const fixture = await LifecycleFixture.create({ trustRepository: false });
+  it("blocks an issue for a different configured repository and resumes the retained checkout after settings are restored", async () => {
+    const fixture = await LifecycleFixture.create();
+    await fixture.config.update({ plugins: { forge: { projectPath: "fixture/other" } } });
     const blocked = await fixture.workflow.startIssue(repository, 1, fixture.placement);
 
     expect(fixture.factory.processes).toEqual([]);
     expect(fixture.sessions.listTabs()).toEqual([]);
-    expect(blocked).toMatchObject({ status: "failed", error: expect.stringContaining("Settings") });
+    expect(blocked).toMatchObject({ status: "failed", error: expect.stringContaining("must match the current Forge settings") });
     expect(blocked.tabId).toBeUndefined();
     expect(await fixture.workspaceRecord(blocked.id)).toMatchObject({ launchPending: false });
     const checkout = await fs.stat(blocked.worktreePath!);
@@ -156,7 +159,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     await expectMissing(path.join(fixture.dataDir, "codex-launches"), path.join(blocked.worktreePath!, "solution.txt"));
     expect(await fs.readFile(path.join(fixture.codexHome, "config.toml"), "utf8")).toBe(sourceConfig);
 
-    fixture.repositoryTrusted = true;
+    await fixture.config.update({ plugins: { forge: { ...repository } } });
     const resumed = await fixture.workflow.resume(blocked.id, fixture.placement);
     expect(resumed).toMatchObject({ id: blocked.id, status: "running", worktreePath: blocked.worktreePath });
     expect((await fs.stat(resumed.worktreePath!)).ino).toBe(checkout.ino);
@@ -167,7 +170,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     await fixture.workflow.pause(resumed.id);
   }, 15_000);
 
-  it("blocks an issue resume after consent is revoked and preserves unfinished work until consent returns", async () => {
+  it("blocks an issue resume after repository settings change and preserves unfinished work until they are restored", async () => {
     const fixture = await LifecycleFixture.create();
     const started = await fixture.workflow.startIssue(repository, 1, fixture.placement);
     await fixture.completedAssistantTurn(started);
@@ -175,11 +178,11 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     const unfinished = path.join(started.worktreePath!, "unfinished.txt");
     await fs.writeFile(unfinished, "Retain unfinished issue work.\n");
     const head = await git(started.worktreePath!, "rev-parse", "HEAD");
-    fixture.repositoryTrusted = false;
+    await fixture.config.update({ plugins: { forge: { projectPath: "fixture/other" } } });
 
     const blocked = await fixture.workflow.resume(started.id, fixture.placement);
 
-    expect(blocked).toMatchObject({ id: started.id, status: "failed", worktreePath: started.worktreePath, error: expect.stringContaining("Settings") });
+    expect(blocked).toMatchObject({ id: started.id, status: "failed", worktreePath: started.worktreePath, error: expect.stringContaining("must match the current Forge settings") });
     expect(blocked.tabId).toBeUndefined();
     expect(fixture.factory.processes).toHaveLength(1);
     expect(fixture.sessions.listTabs()).toEqual([]);
@@ -187,7 +190,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(await fs.readFile(unfinished, "utf8")).toBe("Retain unfinished issue work.\n");
     expect(await git(started.worktreePath!, "rev-parse", "HEAD")).toBe(head);
 
-    fixture.repositoryTrusted = true;
+    await fixture.config.update({ plugins: { forge: { ...repository } } });
     const resumed = await fixture.workflow.resume(started.id, fixture.placement);
     expect(resumed).toMatchObject({ id: started.id, status: "running", worktreePath: started.worktreePath });
     const receipt = await fixture.completedAssistantTurn(resumed);
@@ -196,15 +199,43 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     await fixture.workflow.pause(resumed.id);
   }, 15_000);
 
-  it("does not start a reviewer before repository consent and resumes its clean checkout after consent", async () => {
-    const fixture = await LifecycleFixture.create({ trustRepository: false });
+  it("automatically trusts an issue checkout without a saved repository approval", async () => {
+    const fixture = await LifecycleFixture.create();
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement);
+    expect(started.status, started.error).toBe("running");
+    const receipt = await fixture.completedAssistantTurn(started);
+    expect(fixture.config.getPluginConfig("forge")).not.toHaveProperty("trustedRepository");
+    expect(await fs.readFile(path.join(started.worktreePath!, "solution.txt"), "utf8")).toBe("Issue resolved\n");
+    expect(fixture.sessions.getSession(started.tabId!).snapshot().recentOutput).not.toContain("Do you trust the contents of this directory?");
+    await fixture.workflow.pause(started.id);
+    expect(await processIsRunning(receipt.pid)).toBe(false);
+  }, 15_000);
+
+  it("automatically trusts a review checkout without a saved repository approval", async () => {
+    const fixture = await LifecycleFixture.create();
+    const headSha = await fixture.seedReview();
+    const started = await fixture.workflow.startReview(repository, 7, false, fixture.placement);
+    expect(started.status, started.error).toBe("running");
+    const receipt = await fixture.completedAssistantTurn(started);
+    expect(fixture.config.getPluginConfig("forge")).not.toHaveProperty("trustedRepository");
+    expect((await fixture.nativeStarts()).sort()).toEqual(["app-server", "tui"]);
+    expect(await fixture.sessionRequests("thread/start")).toHaveLength(1);
+    await fixture.workflow.poll();
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "completed", draft: { headSha } });
+    expect(fixture.provider.submissions).toEqual([]);
+    await fixture.expectDisposedAttempt(receipt);
+  }, 20_000);
+
+  it("blocks a reviewer for a different configured repository and resumes after settings are restored", async () => {
+    const fixture = await LifecycleFixture.create();
+    await fixture.config.update({ plugins: { forge: { projectPath: "fixture/other" } } });
     const headSha = await fixture.seedReview();
     const blocked = await fixture.workflow.startReview(repository, 7, false, fixture.placement);
 
     expect(await fixture.nativeStarts()).toEqual([]);
     expect(fixture.factory.processes).toEqual([]);
     expect(fixture.sessions.listTabs()).toEqual([]);
-    expect(blocked).toMatchObject({ status: "failed", error: expect.stringMatching(/trust.*approved|approv.*trust/i) });
+    expect(blocked).toMatchObject({ status: "failed", error: expect.stringContaining("must match the current Forge settings") });
     expect(blocked.tabId).toBeUndefined();
     const checkout = await fs.stat(blocked.worktreePath!);
     expect(await git(blocked.worktreePath!, "rev-parse", "HEAD")).toBe(headSha);
@@ -215,7 +246,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     await expectMissing(path.join(fixture.dataDir, "codex-launches"), path.join(blocked.worktreePath!, ".codex"));
     expect(await fs.readFile(path.join(fixture.codexHome, "config.toml"), "utf8")).toBe(sourceConfig);
 
-    fixture.repositoryTrusted = true;
+    await fixture.config.update({ plugins: { forge: { ...repository } } });
     const resumed = await fixture.workflow.resume(blocked.id, fixture.placement);
     expect(resumed).toMatchObject({ id: blocked.id, worktreePath: blocked.worktreePath, headSha });
     expect((await fs.stat(resumed.worktreePath!)).ino).toBe(checkout.ino);
@@ -228,7 +259,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     await fixture.expectDisposedAttempt(receipt);
   }, 20_000);
 
-  it("does not resume a reviewer after consent is revoked and preserves its conversation until consent returns", async () => {
+  it("preserves a reviewer conversation when repository settings change and resumes after they are restored", async () => {
     const fixture = await LifecycleFixture.create();
     await fixture.seedReview();
     const first = await fixture.workflow.startReview(repository, 7, false, fixture.placement);
@@ -241,14 +272,14 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     const views = await fs.readdir(path.join(fixture.dataDir, "codex-launches"));
     const checkout = await fs.stat(first.worktreePath!);
     const nextHead = await fixture.advanceReview("Documented after the first review.\n");
-    fixture.repositoryTrusted = false;
+    await fixture.config.update({ plugins: { forge: { projectPath: "fixture/other" } } });
 
     const blocked = await fixture.workflow.startReview(repository, 7, false, fixture.placement);
 
     expect(await fixture.nativeStarts()).toEqual(starts);
     expect(fixture.factory.processes).toHaveLength(1);
     expect(fixture.sessions.listTabs()).toEqual([]);
-    expect(blocked).toMatchObject({ id: first.id, status: "failed", worktreePath: first.worktreePath, headSha: nextHead, reviewHistory: [firstDraft], error: expect.stringMatching(/trust.*approved|approv.*trust/i) });
+    expect(blocked).toMatchObject({ id: first.id, status: "failed", worktreePath: first.worktreePath, headSha: nextHead, reviewHistory: [firstDraft], error: expect.stringContaining("must match the current Forge settings") });
     expect(await git(blocked.worktreePath!, "status", "--porcelain")).toBe("");
     expect((await fs.stat(blocked.worktreePath!)).ino).toBe(checkout.ino);
     expect(await fs.readFile(firstReceipt.sessionPath!, "utf8")).toBe(conversation);
@@ -257,7 +288,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(await fs.readFile(path.join(fixture.codexHome, "config.toml"), "utf8")).toBe(sourceConfig);
     await fixture.expectDisposedAttempt(firstReceipt);
 
-    fixture.repositoryTrusted = true;
+    await fixture.config.update({ plugins: { forge: { ...repository } } });
     const resumed = await fixture.workflow.resume(first.id, fixture.placement);
     const receipt = await fixture.completedAssistantTurn(resumed);
     expect(resumed).toMatchObject({ id: first.id, worktreePath: first.worktreePath, headSha: nextHead, reviewHistory: [firstDraft] });
@@ -1043,12 +1074,13 @@ class LifecycleFixture {
   readonly workflowDependencies: ForgeWorkflowDependencies;
   readonly catalog: RulesSkillsCatalogService;
   readonly runtimeDependencies: ForgeRuntimeDependencies;
+  readonly config: ConfigService;
   private readonly plugins = new PluginRegistry();
   readonly models: Pick<ForgeSettings, "workerModel" | "workerReasoningEffort" | "reviewModel" | "reviewReasoningEffort"> = {
     workerModel: "gpt-6-astra", workerReasoningEffort: "xhigh", reviewModel: "gpt-6-astra", reviewReasoningEffort: "max",
   };
 
-  private constructor(readonly root: string, public repositoryTrusted: boolean) {
+  private constructor(readonly root: string) {
     this.origin = path.join(root, "origin.git");
     this.repositoryPath = path.join(root, "repository");
     this.dataDir = path.join(root, "data");
@@ -1059,6 +1091,11 @@ class LifecycleFixture {
     this.sources = new CodexStateSources(this.dataDir);
     this.plugins.register(new CodexTerminalPlugin(this.factory, undefined, this.dataDir, this.sources));
     this.plugins.register(new ForgePlugin(() => { throw new Error("Forge hooks are outside this runtime fixture."); }));
+    this.config = new ConfigService(this.dataDir, () => this.plugins.list());
+    const settings = new ForgeSettingsService(this.config, {
+      credential: () => { throw new Error("Provider credentials are outside this runtime fixture."); },
+      workerAuthors: () => [],
+    });
     this.sessions = new SessionStore(this.plugins, pathPolicy, new TabContextService(this.dataDir), undefined, this.workspace, this.catalog);
     this.runtimeDependencies = {
       sessions: this.sessions,
@@ -1067,7 +1104,7 @@ class LifecycleFixture {
       rulesSkills: this.catalog,
       dataDir: this.dataDir,
       pathPolicy,
-      isRepositoryTrusted: candidate => this.repositoryTrusted && candidate.provider === repository.provider && candidate.apiUrl === repository.apiUrl && candidate.projectPath === repository.projectPath,
+      isRepositoryTrusted: candidate => settings.isRepositoryTrusted(candidate),
       gitAccess: async (_repository, role) => {
         this.gitAccessRoles.push(role);
         return { cloneUrl: "https://github.com/fixture/cloudx.git", authorization: `Basic fixture-${role}-secret` };
@@ -1092,7 +1129,7 @@ class LifecycleFixture {
     this.workflow = new ForgeWorkflowService(this.workflowDependencies);
   }
 
-  static async create({ trustRepository = true, largeOutput = false, autoReview = false, approveFirst = false } = {}): Promise<LifecycleFixture> {
+  static async create({ largeOutput = false, autoReview = false, approveFirst = false } = {}): Promise<LifecycleFixture> {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-forge-lifecycle-"));
     const codexHome = path.join(root, "codex-home");
     const imagegen = path.join(codexHome, "skills", ".system", "imagegen");
@@ -1111,8 +1148,9 @@ class LifecycleFixture {
     vi.stubEnv("FORGE_FIXTURE_LARGE_OUTPUT", String(largeOutput));
     vi.stubEnv("FORGE_FIXTURE_AUTO_REVIEW", String(autoReview));
     vi.stubEnv("FORGE_FIXTURE_APPROVE_FIRST", String(approveFirst));
-    const fixture = new LifecycleFixture(root, trustRepository);
+    const fixture = new LifecycleFixture(root);
     fixtures.push(fixture);
+    await fixture.config.update({ plugins: { forge: { ...repository } } });
     await fs.mkdir(fixture.repositoryPath);
     await git(root, "init", "--bare", fixture.origin);
     await git(fixture.repositoryPath, "init", "-b", "main");
