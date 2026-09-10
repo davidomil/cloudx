@@ -220,17 +220,24 @@ describe("DocumentationEnrichmentService", () => {
 
   describe.each(["reanalyze", "reenrich"])("%s archived media", (operation) => {
     it.each([
-      { filename: "recording.wav", contentType: undefined, video: false },
-      { filename: "recording.mp4", contentType: undefined, video: true },
-      { filename: "recording.flac", contentType: "audio/flac", video: false },
-      { filename: "recording.opus", contentType: "audio/opus", video: false },
-      { filename: "recording.asf", contentType: "video/x-ms-asf", video: true },
-    ])("uses a fresh transcript and video keyframes for $filename", async ({ filename, contentType, video }) => {
+      { filename: "recording.wav", contentType: undefined, video: false, evidence: "transcript" },
+      { filename: "recording.wav", contentType: "audio/wav", video: false, evidence: "transcript" },
+      { filename: "recording.ogg", contentType: undefined, video: false, evidence: "transcript" },
+      { filename: "recording.ogg", contentType: null, video: false, evidence: "transcript" },
+      { filename: "recording.ogg", contentType: "audio/ogg", video: false, evidence: "transcript" },
+      { filename: "recording.ogg", contentType: "video/ogg", video: true, evidence: "keyframes only" },
+      { filename: "recording.mp4", contentType: undefined, video: true, evidence: "transcript and keyframes" },
+      { filename: "recording.flac", contentType: "audio/flac", video: false, evidence: "transcript" },
+      { filename: "recording.opus", contentType: "audio/opus", video: false, evidence: "transcript" },
+      { filename: "recording.asf", contentType: "video/x-ms-asf", video: true, evidence: "transcript and keyframes" },
+      { filename: "recording.asf", contentType: "video/x-ms-asf", video: true, evidence: "keyframes only" },
+    ])("uses fresh $evidence for $filename ($contentType)", async ({ filename, contentType, video, evidence }) => {
       const fixture = await archivedMediaFixture(filename, contentType ? "text" : "media");
-      if (contentType) {
+      if (contentType !== undefined) {
         await fs.writeFile(path.join(path.dirname(fixture.mediaPath), "metadata.json"), JSON.stringify({ contentType }));
       }
-      const transcribeFile = vi.fn(async () => ({ text: "ARCHIVED-TRANSCRIPT reset is active low." }));
+      const transcript = evidence === "keyframes only" ? "" : "ARCHIVED-TRANSCRIPT reset is active low.";
+      const transcribeFile = vi.fn(async () => ({ text: transcript }));
       const output = { summary: "Updated media metadata.", spans: [{ locator: "ai:media", text: "Reset is active low." }], metadata: [], warnings: [] };
       const runner = fakeRunner(output);
       let capturedFrame = "";
@@ -257,10 +264,18 @@ describe("DocumentationEnrichmentService", () => {
         expect(result).toMatchObject({ kind: operation, firstDocumentId: "doc-1", enrichment: { results: [{ status: "written" }] } });
         expect(reanalyzeDocument).toHaveBeenCalledTimes(operation === "reanalyze" ? 1 : 0);
         expect(transcribeFile).toHaveBeenCalledWith(fixture.mediaPath, filename, { signal: expect.any(AbortSignal) });
-        expect(runner.run.mock.calls[0]?.[0]).toContain("ARCHIVED-TRANSCRIPT");
+        if (transcript) {
+          expect(runner.run.mock.calls[0]?.[0]).toContain(transcript);
+        }
+        if (contentType) {
+          expect(runner.run.mock.calls[0]?.[0]).toContain(contentType);
+        }
         expect(runner.run.mock.calls[0]?.[0]).not.toContain("BINARY-CHUNK");
         expect(runner.run.mock.calls[0]?.[0]).not.toContain("PRIOR-AI-SPAN");
         expect(fixture.client.enrichDocument).toHaveBeenCalledOnce();
+        expect(fixture.client.enrichDocument).toHaveBeenCalledWith(expect.objectContaining({
+          payload: expect.objectContaining({ evidence: expect.objectContaining({ mediaTranscriptChars: transcript.length, keyframeCount: video ? 1 : 0 }) }),
+        }), expect.anything());
         if (video) {
           expect(mediaProcessLauncher).toHaveBeenCalledWith("ffmpeg", expect.arrayContaining(["-i", fixture.mediaPath]), expect.anything());
           expect(runner.run).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ imagePaths: [capturedFrame] }));
@@ -297,6 +312,9 @@ describe("DocumentationEnrichmentService", () => {
   it.each([
     { filename: "recording", metadataState: "missing", metadata: undefined },
     { filename: "recording", metadataState: "symlink", metadata: undefined },
+    { filename: "recording.ogg", metadataState: "symlink", metadata: undefined },
+    { filename: "recording.ogg", metadataState: "array", metadata: "[]" },
+    { filename: "recording.wav", metadataState: "non-string MIME", metadata: '{"contentType": 7}' },
     { filename: "recording.flac", metadataState: "symlink", metadata: undefined },
     { filename: "recording.flac", metadataState: "array", metadata: "[]" },
     { filename: "recording.opus", metadataState: "non-string MIME", metadata: '{"contentType": 7}' },

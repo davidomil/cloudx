@@ -423,24 +423,21 @@ export class DocumentationEnrichmentService {
     if (!isSameOrChild(root, snapshot)) {
       throw new Error("Archived media source escapes the documentation archive root.");
     }
+    const metadataPath = path.join(path.dirname(snapshot), "metadata.json");
+    if (metadataPath === snapshot) {
+      return undefined;
+    }
+    const metadataStat = await fsp.lstat(metadataPath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") {
+        return undefined;
+      }
+      throw error;
+    });
+    if (!metadataStat && document.source_type === "media" && !path.extname(snapshotPath)) {
+      throw new Error("Archived media source metadata is missing.");
+    }
     let contentType: string | undefined;
-    if (!hasMediaSuffix) {
-      const metadataPath = path.join(path.dirname(snapshot), "metadata.json");
-      if (metadataPath === snapshot) {
-        return undefined;
-      }
-      const metadataStat = await fsp.lstat(metadataPath).catch((error: NodeJS.ErrnoException) => {
-        if (error.code === "ENOENT") {
-          return undefined;
-        }
-        throw error;
-      });
-      if (!metadataStat) {
-        if (document.source_type === "media" && !path.extname(snapshotPath)) {
-          throw new Error("Archived media source metadata is missing.");
-        }
-        return undefined;
-      }
+    if (metadataStat) {
       if (!metadataStat.isFile() || metadataStat.isSymbolicLink()) {
         throw new Error("Archived source metadata must be a regular file inside its snapshot directory.");
       }
@@ -453,9 +450,9 @@ export class DocumentationEnrichmentService {
         throw new Error("Archived source content type must be a string.");
       }
       contentType = optionalRecordString(metadata, "contentType");
-      if (!contentType || !/^(audio|video)\//iu.test(contentType)) {
-        return undefined;
-      }
+    }
+    if (!hasMediaSuffix && (!contentType || !/^(audio|video)\//iu.test(contentType))) {
+      return undefined;
     }
     const realRoot = await fsp.realpath(root);
     const realSnapshot = await fsp.realpath(snapshot);

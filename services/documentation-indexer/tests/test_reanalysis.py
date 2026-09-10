@@ -186,6 +186,53 @@ def test_reanalysis_extracts_copied_text_from_its_retained_format(tmp_path: Path
     assert len(archive.list_documents()) == 1
 
 
+def test_reanalysis_preserves_copied_text_that_begins_with_a_pdf_header(tmp_path: Path) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+    text = "%PDF-1.7\nCOPIED-PDF-EXPLANATION-19 explains the PDF header as plain text."
+    document = archive.ingest_text(text=text)
+    before = archive.get_document(document.document_id)
+
+    for _ in range(2):
+        result = archive.reanalyze_document(document.document_id)
+        after = archive.get_document(document.document_id)
+        assert result.document_id == document.document_id
+        for field in ["document_id", "title", "source_type", "uri", "content_sha256"]:
+            assert after[field] == before[field]
+        assert (archive.root / after["snapshot_path"]).read_bytes() == text.encode("utf-8")
+        assert [(chunk["locator"], chunk["text"]) for chunk in after["chunks"]] == [("text", text)]
+        assert archive.search("COPIED-PDF-EXPLANATION-19", mode="lexical")[0]["documentId"] == document.document_id
+    assert len(archive.list_documents()) == 1
+
+
+def test_reanalysis_preserves_copied_text_when_identical_html_shares_snapshot_metadata(tmp_path: Path) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+    text = "COPIED-HTML-SIBLING-19 retains the literal <board> marker."
+    document = archive.ingest_text(text=text, uri="https://example.com/board.html")
+    sibling = archive.ingest_upload(filename="sibling.html", content=text.encode("utf-8"), content_type="text/html")
+    before = archive.get_document(document.document_id)
+    sibling_before = archive.get_document(sibling.document_id)
+    snapshot = archive.root / before["snapshot_path"]
+    assert snapshot.parent == (archive.root / sibling_before["snapshot_path"]).parent
+    assert json.loads((snapshot.parent / "metadata.json").read_text())["contentType"] == "text/html"
+
+    for _ in range(2):
+        result = archive.reanalyze_document(document.document_id)
+        after = archive.get_document(document.document_id)
+        assert result.document_id == document.document_id
+        for field in ["document_id", "title", "source_type", "uri", "content_sha256"]:
+            assert after[field] == before[field]
+        assert (archive.root / after["snapshot_path"]).read_bytes() == text.encode("utf-8")
+        assert [(chunk["locator"], chunk["text"]) for chunk in after["chunks"]] == [("text", text)]
+        assert archive.get_document(sibling.document_id) == sibling_before
+
+    sibling_result = archive.reanalyze_document(sibling.document_id)
+    sibling_after = archive.get_document(sibling.document_id)
+    assert sibling_result.document_id == sibling.document_id
+    assert [(chunk["locator"], chunk["text"]) for chunk in sibling_after["chunks"]] == [("html", "COPIED-HTML-SIBLING-19 retains the literal\nmarker.")]
+    assert (archive.root / sibling_after["snapshot_path"]).read_bytes() == text.encode("utf-8")
+    assert len(archive.list_documents()) == 2
+
+
 @pytest.mark.parametrize("filename", ["scan", "scan.bin", "scan.txt"])
 def test_reanalysis_preserves_explicit_image_extraction_for_unrecognized_filenames(tmp_path: Path, filename: str) -> None:
     source = tmp_path / filename
@@ -273,7 +320,7 @@ def test_reanalysis_preserves_upload_metadata_for_sources_without_filename_exten
 @pytest.mark.parametrize("failure", ["extraction", "empty extraction", "index publication"])
 def test_failed_reanalysis_preserves_the_complete_previous_archive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str) -> None:
     archive = DocumentationArchive(tmp_path / "archive")
-    document = archive.ingest_text(title="Preserved analysis", text="Preserved source contains PRESERVED-SOURCE-19.")
+    document = archive.ingest_upload(filename="preserved.md", title="Preserved analysis", content=b"Preserved source contains PRESERVED-SOURCE-19.")
     archive.enrich_document(
         document.document_id,
         spans=[ExtractedSpan("Previous enrichment contains PRESERVED-AI-19.", "ai:metadata")],

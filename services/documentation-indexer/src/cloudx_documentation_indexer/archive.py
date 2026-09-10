@@ -41,6 +41,7 @@ from .extraction import (
     SPREADSHEET_CONTENT_TYPES,
     SPREADSHEET_SUFFIXES,
     SUPPORTED_FILE_SUFFIXES,
+    decode_text,
     extract_bytes,
     extract_file,
 )
@@ -1238,7 +1239,7 @@ class DocumentationArchive:
             if document["source_type"] == "repo_code" or metadata.get("generatedCodeDocumentation") or "youtube" in metadata:
                 raise ArchiveError("This document retains generated code documentation or YouTube evidence. Rerun AI enrichment to analyze its retained text and artifacts; source extraction requires the original source.")
 
-            extraction_type = document["source_type"]
+            retains_plain_text = False
             # Copied text carries the URI's category but retains plain-text source locators.
             if snapshot_path.suffix.lower() == ".txt":
                 with self._connect() as db:
@@ -1248,8 +1249,7 @@ class DocumentationArchive:
                             (document_id,),
                         )
                     }
-                if source_locators == {"text"}:
-                    extraction_type = "text"
+                retains_plain_text = source_locators == {"text"}
 
             staging_dir = Path(tempfile.mkdtemp(prefix="reanalysis-", dir=self.snapshots_dir))
             replacement_snapshot = staging_dir / snapshot_path.name
@@ -1257,13 +1257,16 @@ class DocumentationArchive:
                 replacement_snapshot.write_bytes(source_bytes)
                 if has_metadata:
                     shutil.copy2(metadata_path, staging_dir / "metadata.json")
-                spans = extract_bytes(
-                    source_bytes,
-                    snapshot_path.name,
-                    extraction_type,
-                    content_type or mimetypes.guess_type(snapshot_path.name)[0],
-                    staging_dir / "extracted",
-                )
+                if retains_plain_text:
+                    spans = [ExtractedSpan(decode_text(source_bytes), "text")]
+                else:
+                    spans = extract_bytes(
+                        source_bytes,
+                        snapshot_path.name,
+                        document["source_type"],
+                        content_type or mimetypes.guess_type(snapshot_path.name)[0],
+                        staging_dir / "extracted",
+                    )
                 chunks = chunk_spans(spans)
                 if not chunks:
                     raise ArchiveError("No extractable text was found during reanalysis.")
