@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
@@ -454,13 +455,17 @@ export class DocumentationEnrichmentService {
       if (!isSameOrChild(await fsp.realpath(root), realMetadataPath)) {
         throw new Error("Archived source metadata escapes the documentation archive root.");
       }
-      const metadata = getRecord(JSON.parse(await fsp.readFile(realMetadataPath, "utf8")), "archived source metadata");
-      if (metadata.contentType != null && typeof metadata.contentType !== "string") {
-        throw new Error("Archived source content type must be a string.");
+      const metadataBytes = await fsp.readFile(realMetadataPath);
+      const metadataIsSource = createHash("sha256").update(metadataBytes).digest("hex") === document.content_sha256;
+      if (!metadataIsSource) {
+        const metadata = getRecord(JSON.parse(metadataBytes.toString("utf8")), "archived source metadata");
+        if (metadata.contentType != null && typeof metadata.contentType !== "string") {
+          throw new Error("Archived source content type must be a string.");
+        }
+        contentType = optionalRecordString(metadata, "contentType");
+        retainsMediaUpload = document.source_type === "media"
+          && document.uri === `upload://${path.basename(snapshotPath)}`;
       }
-      contentType = optionalRecordString(metadata, "contentType");
-      retainsMediaUpload = document.source_type === "media"
-        && document.uri === `upload://${path.basename(snapshotPath)}`;
     }
     const hasMediaHint = Boolean(retainsMediaUpload || hasMediaSuffix || contentType && /^(audio|video)\//iu.test(contentType));
     if (!hasTextChunks && !hasMediaHint) {

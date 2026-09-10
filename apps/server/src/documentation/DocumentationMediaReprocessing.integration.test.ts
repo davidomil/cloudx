@@ -113,6 +113,74 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
     );
 
     describe.each(["reanalyze", "reenrich"] as const)("%s", (operation) => {
+      it.each([
+        { filename: undefined, text: '["Release reset after power stabilizes."]' },
+        { filename: "metadata.txt", text: '["Release reset after power stabilizes."]' },
+        { filename: "metadata.json", text: '["Release reset after power stabilizes."]' },
+        { filename: "metadata.json", text: '{"contentType":7,"youtube":"Ordinary source data."}' },
+        { filename: "metadata.json", text: "Release reset after power stabilizes. This is not JSON." },
+      ])("enriches copied text twice with a retained sibling named $filename ($text)", async ({ filename, text }) => {
+        const fixture = await startArchive();
+        try {
+          const sourceBytes = Buffer.from(text);
+          const imported = await fixture.client.ingestText({
+            text, title: "Copied reference", uri: "manual://reference", sourceType: "reference",
+            collection: "Source name regression", tags: ["retain-me"],
+          });
+          const documentId = (imported.document as { documentId: string }).documentId;
+          const original = await fixture.document(documentId);
+          const sourceChunks = original.chunks.filter((chunk) => chunk.chunk_origin === "source")
+            .map(({ locator, text }) => ({ locator, text }));
+          expect(sourceChunks).toEqual([{ locator: "text", text }]);
+          const initialEnrichment = createEnrichment(fixture);
+          await expect(initialEnrichment.service.enrichIngestResponse(imported))
+            .resolves.toMatchObject({ enrichment: { results: [{ status: "written" }] } });
+
+          let sibling: ArchivedDocument | undefined;
+          if (filename) {
+            const sourcePath = path.join(fixture.root, filename);
+            await fs.writeFile(sourcePath, sourceBytes);
+            const importedSibling = await fixture.client.ingestPath({ path: sourcePath });
+            sibling = await fixture.document((importedSibling.documents as Array<{ documentId: string }>)[0].documentId);
+            expect(sibling.document_id).not.toBe(documentId);
+            expect(path.dirname(sibling.snapshot_path)).toBe(path.dirname(original.snapshot_path));
+            await fs.unlink(sourcePath);
+          }
+
+          for (let rerun = 1; rerun <= 2; rerun += 1) {
+            await fixture.reopen();
+            const prior = await fixture.document(documentId);
+            const enrichment = createEnrichment(fixture);
+            const hook = enrichment.plugin.hooks.find((candidate) => candidate.id === `documentation.documents.${operation}`)!;
+            await expect(hook.execute({ documentId }, { caller: { kind: "ui" } }))
+              .resolves.toMatchObject({ kind: operation, firstDocumentId: documentId, enrichment: { results: [{ status: "written" }] } });
+            expect(enrichment.run).toHaveBeenCalledOnce();
+            const prompt = enrichment.run.mock.lastCall![0];
+            expect(prompt).toContain(JSON.stringify(text));
+            for (const chunk of prior.chunks.filter((chunk) => chunk.chunk_origin === "ai")) {
+              expect(prompt).not.toContain(chunk.text);
+            }
+            expect(enrichment.transcribeFile).not.toHaveBeenCalled();
+            expect(enrichment.mediaProcessLauncher).not.toHaveBeenCalled();
+            const current = await fixture.document(documentId);
+            expect(identity(current)).toEqual(identity(original));
+            expect(current.chunks.filter((chunk) => chunk.chunk_origin === "source").map(({ locator, text }) => ({ locator, text })))
+              .toEqual(sourceChunks);
+            expect(current.chunks.filter((chunk) => chunk.chunk_origin === "ai"))
+              .toMatchObject([{ text: "REPLACEMENT-AI-1" }]);
+            expect(JSON.parse(current.enrichments[0].payload_json).evidence)
+              .toMatchObject({ chunkCount: 1, mediaTranscriptChars: 0, keyframeCount: 0 });
+            await expect(fs.readFile(path.join(fixture.archiveRoot, current.snapshot_path))).resolves.toEqual(sourceBytes);
+            if (sibling) {
+              await expect(fixture.document(sibling.document_id)).resolves.toEqual(sibling);
+              await expect(fs.readFile(path.join(fixture.archiveRoot, sibling.snapshot_path))).resolves.toEqual(sourceBytes);
+            }
+          }
+        } finally {
+          await fixture.dispose();
+        }
+      }, 30_000);
+
       it("refreshes an MP1 recording whose header matches a UTF-16 BOM twice", async () => {
         const fixture = await startArchive();
         try {

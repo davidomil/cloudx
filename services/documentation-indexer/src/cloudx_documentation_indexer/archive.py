@@ -1232,7 +1232,10 @@ class DocumentationArchive:
                 if not is_relative_to(metadata_path.resolve(), snapshot_path.parent):
                     raise ArchiveError("Snapshot metadata must stay inside its snapshot directory.")
                 try:
-                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    metadata_bytes = metadata_path.read_bytes()
+                    has_metadata = metadata_bytes != source_bytes
+                    if has_metadata:
+                        metadata = json.loads(metadata_bytes.decode("utf-8"))
                 except (OSError, ValueError, UnicodeError) as error:
                     raise ArchiveError("The archived source metadata is invalid.") from error
                 if not isinstance(metadata, dict):

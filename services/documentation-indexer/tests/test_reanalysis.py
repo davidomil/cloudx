@@ -345,6 +345,64 @@ def test_reanalysis_does_not_interpret_a_source_named_metadata_json_as_a_sidecar
     assert len(archive.list_documents()) == 1
 
 
+@pytest.mark.parametrize("content", [
+    '["SHARED-METADATA-SOURCE-19 retains <board> literally.", 1]',
+    '{"contentType": 42, "youtube": "SHARED-METADATA-SOURCE-19"}',
+    "SHARED-METADATA-SOURCE-19 contains plain text instead of JSON.",
+])
+@pytest.mark.parametrize("sibling_state", ["absent", "shared", "reanalyzed"])
+def test_reanalysis_preserves_copied_text_when_a_sibling_source_is_named_metadata_json(tmp_path: Path, content: str, sibling_state: str) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+    document = archive.ingest_text(text=content, title="Copied JSON", collection="board", tags=["reference"])
+    archive.enrich_document(
+        document.document_id,
+        spans=[ExtractedSpan("Retained prior enrichment.", "ai:metadata")],
+        model="gpt-test",
+        skill_ids=["documentation-enrich-metadata"],
+    )
+    before = archive.get_document(document.document_id)
+    snapshot = archive.root / before["snapshot_path"]
+    if sibling_state != "absent":
+        source = tmp_path / "metadata.json"
+        source.write_bytes(content.encode("utf-8"))
+        sibling = archive.ingest_path(source)[0]
+        source.unlink()
+        assert (archive.root / archive.get_document(sibling.document_id)["snapshot_path"]).parent == snapshot.parent
+        if sibling_state == "reanalyzed":
+            archive.reanalyze_document(sibling.document_id)
+        sibling_before = archive.get_document(sibling.document_id)
+        assert snapshot.with_name("metadata.json").read_bytes() == content.encode("utf-8")
+
+    for _ in range(2):
+        archive = DocumentationArchive(archive.root)
+        result = archive.reanalyze_document(document.document_id)
+        after = archive.get_document(document.document_id)
+        assert result.document_id == document.document_id
+        for field in ["document_id", "title", "source_type", "uri", "content_sha256", "state", "collection", "tags_json", "created_at", "enrichments", "events"]:
+            assert after[field] == before[field]
+        current_snapshot = archive.root / after["snapshot_path"]
+        assert current_snapshot.read_bytes() == content.encode("utf-8")
+        assert not current_snapshot.with_name("metadata.json").exists()
+        assert [(chunk["locator"], chunk["text"]) for chunk in after["chunks"] if chunk["chunk_origin"] == "source"] == [("text", content)]
+        assert [chunk for chunk in after["chunks"] if chunk["chunk_origin"] == "ai"] == [chunk for chunk in before["chunks"] if chunk["chunk_origin"] == "ai"]
+        expected_ids = {document.document_id}
+        if sibling_state != "absent":
+            assert archive.get_document(sibling.document_id) == sibling_before
+            assert (archive.root / sibling_before["snapshot_path"]).read_bytes() == content.encode("utf-8")
+            expected_ids.add(sibling.document_id)
+        assert {hit["documentId"] for hit in archive.search("SHARED-METADATA-SOURCE-19", mode="lexical")} == expected_ids
+
+    if sibling_state != "absent":
+        for _ in range(2):
+            archive = DocumentationArchive(archive.root)
+            assert archive.reanalyze_document(sibling.document_id).document_id == sibling.document_id
+            sibling_after = archive.get_document(sibling.document_id)
+            assert (archive.root / sibling_after["snapshot_path"]).read_bytes() == content.encode("utf-8")
+            assert [(chunk["locator"], chunk["text"]) for chunk in sibling_after["chunks"]] == [("text", content)]
+            assert archive.get_document(document.document_id) == after
+    assert len(archive.list_documents()) == (1 if sibling_state == "absent" else 2)
+
+
 @pytest.mark.parametrize("filename", ["recording.bin", "recording"])
 def test_reanalysis_preserves_media_upload_identity_when_a_url_replaces_shared_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, filename: str) -> None:
     audio = io.BytesIO()
@@ -598,7 +656,7 @@ def test_reanalysis_does_not_reactivate_inactive_documents(tmp_path: Path, state
     assert archive.get_document(document.document_id) == before
 
 
-@pytest.mark.parametrize("problem", ["traversal", "absolute", "symlink", "missing", "content hash", "metadata escape", "invalid metadata", "invalid content type"])
+@pytest.mark.parametrize("problem", ["traversal", "absolute", "symlink", "missing", "content hash", "metadata escape", "invalid metadata", "invalid metadata JSON", "invalid metadata encoding", "invalid content type"])
 def test_reanalysis_rejects_invalid_archived_sources_before_extraction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, problem: str) -> None:
     archive = DocumentationArchive(tmp_path / "archive")
     document = archive.ingest_text(text="Archived source.")
@@ -619,6 +677,10 @@ def test_reanalysis_rejects_invalid_archived_sources_before_extraction(tmp_path:
         (snapshot.parent / "metadata.json").symlink_to(outside)
     elif problem == "invalid content type":
         (snapshot.parent / "metadata.json").write_text('{"contentType": 42}', encoding="utf-8")
+    elif problem == "invalid metadata JSON":
+        (snapshot.parent / "metadata.json").write_text("invalid JSON", encoding="utf-8")
+    elif problem == "invalid metadata encoding":
+        (snapshot.parent / "metadata.json").write_bytes(b'\xff')
     else:
         (snapshot.parent / "metadata.json").write_text("[]", encoding="utf-8")
 
