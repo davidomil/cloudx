@@ -6280,8 +6280,10 @@ a:hover svg {
 
 .settings-body {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(min(100%, 20rem), 1fr);
   min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
 }
 
 .settings-header,
@@ -6612,23 +6614,6 @@ a:hover svg {
 
   .settings-footer .dialog-actions {
     flex-shrink: 0;
-  }
-}
-
-@media (max-height: 520px) {
-  .settings-body {
-    display: block;
-    overflow: auto;
-    overscroll-behavior: contain;
-  }
-
-  .settings-workspace {
-    grid-template-rows: auto;
-    align-items: start;
-  }
-
-  .settings-content {
-    overflow: visible;
   }
 }
 

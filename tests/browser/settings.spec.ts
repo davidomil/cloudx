@@ -257,6 +257,8 @@ test("drafts survive tab switches and search, Save persists them, and Cancel dis
 for (const viewport of [
   { width: 667, height: 375 },
   { width: 1024, height: 375 },
+  { width: 320, height: 521 },
+  { width: 320, height: 640 },
 ]) {
   test(`searched settings remain editable at ${viewport.width} × ${viewport.height} and 150% UI scale`, async ({
     page,
