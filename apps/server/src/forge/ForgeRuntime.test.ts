@@ -1343,7 +1343,7 @@ describe("ForgeRuntime Codex tabs", () => {
     { review: false, approved: undefined },
     { review: true, approved: false },
     { review: true, approved: undefined },
-  ])("requires repository consent before preparing a worker (review: $review, approval: $approved)", async ({ review, approved }) => {
+  ])("requires a matching configured repository before preparing a worker (review: $review, trust eligibility: $approved)", async ({ review, approved }) => {
     const deps = dependencies();
     deps.isRepositoryTrusted = approved === undefined ? undefined : () => approved;
     deps.reviewConversations = { prepare: vi.fn() };
@@ -1351,7 +1351,7 @@ describe("ForgeRuntime Codex tabs", () => {
     const workspace = await prepare("unapproved-worker", review);
     vi.mocked(deps.workspaceCommands.createTab).mockResolvedValue({ tab: workerTab(workspace) } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>);
 
-    await expect(runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, prompt: "Work on the repository.", windowId: "window", paneId: "pane" })).rejects.toThrow("repository trust must be approved");
+    await expect(runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, prompt: "Work on the repository.", windowId: "window", paneId: "pane" })).rejects.toThrow("must match the current Forge settings");
 
     expect(deps.workspaceCommands.createTab).not.toHaveBeenCalled();
     expect(deps.reviewConversations.prepare).not.toHaveBeenCalled();
@@ -1359,7 +1359,7 @@ describe("ForgeRuntime Codex tabs", () => {
     expect(await git(workspace.worktreePath, "status", "--porcelain")).toBe("");
   });
 
-  it("rechecks reviewer consent before native preparation and cleans a rejected prepared tab", async () => {
+  it("rechecks the configured repository before native preparation and cleans a rejected prepared tab", async () => {
     const deps = dependencies({ trustRepository: true });
     vi.mocked(deps.isRepositoryTrusted!).mockReturnValueOnce(true).mockReturnValue(false);
     deps.reviewConversations = { prepare: vi.fn() };
@@ -1367,7 +1367,7 @@ describe("ForgeRuntime Codex tabs", () => {
     const workspace = await prepare("revoked-review", true);
     const fixture = installReviewTabs(deps, workspace);
 
-    await expect(runtime.launch(fixture.request)).rejects.toThrow("repository trust is no longer approved");
+    await expect(runtime.launch(fixture.request)).rejects.toThrow("matching the current repository settings");
 
     expect(deps.workspaceCommands.createTab).toHaveBeenCalledOnce();
     expect(deps.reviewConversations.prepare).not.toHaveBeenCalled();
@@ -1529,7 +1529,7 @@ describe("ForgeRuntime Codex tabs", () => {
     expect(await runtime.launch(request)).toBe("codex-1");
   });
 
-  it("grants exact-checkout trust only with repository consent and revalidates before every use", async () => {
+  it("grants exact-checkout trust only for the configured repository and revalidates before every use", async () => {
     const deps = dependencies();
     const isRepositoryTrusted = vi.fn(() => true);
     runtime = new ForgeRuntime({ ...deps, isRepositoryTrusted });

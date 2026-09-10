@@ -42,8 +42,7 @@ export class ForgeSettingsService {
   }
 
   isRepositoryTrusted(repository: ForgeRepository): boolean {
-    const approved = this.config.getPluginConfig("forge").trustedRepository;
-    return approved === repositoryTrustKey(repository) && approved === repositoryTrustKey(this.repository());
+    return repositoryKey(repository) === repositoryKey(this.repository());
   }
 
   provider(repository: ForgeRepository, role: ForgeCredentialRole, signal?: AbortSignal): ForgeProvider {
@@ -66,7 +65,7 @@ export class ForgeSettingsService {
     const current = this.repository();
     if (current.provider !== repository.provider || current.apiUrl !== repository.apiUrl || current.projectPath !== repository.projectPath)
       throw new Error("This worker belongs to a different repository. Restore its repository settings before continuing.");
-    const key = repositoryTrustKey(repository);
+    const key = repositoryKey(repository);
     if (this.repositoryCredentials?.key !== key)
       this.repositoryCredentials = { key, credentials: new ForgeCredentials(current, async role => this.connections.credential(current, role), undefined, this.onFailure) };
     return this.repositoryCredentials.credentials;
@@ -112,13 +111,6 @@ export function forgeConfigFields(): ConfigFieldDescriptor[] {
       type: "string",
       defaultValue: "",
       description: "Your username on the selected GitHub or GitLab host, used by Assigned to me and Created by me filters.",
-    },
-    {
-      key: "trustedRepository",
-      label: "Approved repository trust",
-      type: "string",
-      visibility: "internal",
-      defaultValue: "",
     },
     {
       key: "baseBranch",
@@ -189,6 +181,6 @@ export function forgeConfigFields(): ConfigFieldDescriptor[] {
   return fields;
 }
 
-function repositoryTrustKey(repository: ForgeRepository): string {
+function repositoryKey(repository: ForgeRepository): string {
   return JSON.stringify([repository.provider, repository.apiUrl, repository.projectPath]);
 }
