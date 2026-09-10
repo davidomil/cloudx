@@ -417,8 +417,9 @@ export class DocumentationEnrichmentService {
     const snapshotPath = optionalRecordString(document, "snapshot_path");
     const hasMediaSuffix = snapshotPath && /\.(mp3|wav|m4a|aac|ogg|webm|mp4|mov|mkv|avi)$/iu.test(snapshotPath);
     const sourceChunks = recordsArray(document.chunks).filter((chunk) => chunk.chunk_origin === "source");
+    const retainsGeneratedMedia = sourceChunks.some((chunk) => chunk.locator === "media metadata");
     const hasTextChunks = sourceChunks.length > 0 && sourceChunks.every((chunk) => chunk.locator === "text");
-    if (!snapshotPath) {
+    if (!snapshotPath || retainsGeneratedMedia) {
       return undefined;
     }
     const archiveRoot = await this.archiveRoot(signal);

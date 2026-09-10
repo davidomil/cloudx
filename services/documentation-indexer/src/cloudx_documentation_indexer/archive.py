@@ -1247,11 +1247,11 @@ class DocumentationArchive:
                         (document_id,),
                     )
                 }
+            retains_plain_text = source_locators == {"text"}
             if (
                 document["source_type"] == "repo_code"
                 or "media metadata" in source_locators
-                or metadata.get("generatedCodeDocumentation")
-                or "youtube" in metadata
+                or (not retains_plain_text and (metadata.get("generatedCodeDocumentation") or "youtube" in metadata))
             ):
                 raise ArchiveError("This document retains generated code documentation or YouTube evidence. Rerun AI enrichment to analyze its retained text and artifacts; source extraction requires the original source.")
             staging_dir = Path(tempfile.mkdtemp(prefix="reanalysis-", dir=self.snapshots_dir))
@@ -1260,7 +1260,7 @@ class DocumentationArchive:
                 replacement_snapshot.write_bytes(source_bytes)
                 if has_metadata:
                     shutil.copy2(metadata_path, staging_dir / "metadata.json")
-                if source_locators == {"text"}:
+                if retains_plain_text:
                     spans = [ExtractedSpan(decode_text(source_bytes), "text")]
                 elif source_locators == {"html"}:
                     spans = [ExtractedSpan(extract_html(source_bytes), "html")]

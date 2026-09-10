@@ -49,7 +49,7 @@ async function openSource(page: Page) {
   await page.route("**/fixture-hooks/**", async (route) => {
     const hookId = new URL(route.request().url()).pathname.split("/").pop();
     switch (hookId) {
-      case "documentation.stats":
+      case "documentation.summary":
         return route.fulfill({
           json: { activeDocumentCount: 1, activeChunkCount: 1 },
         });

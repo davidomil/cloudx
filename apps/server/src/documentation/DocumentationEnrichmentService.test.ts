@@ -997,12 +997,20 @@ describe("DocumentationEnrichmentService", () => {
     }));
   });
 
-  it.each([false, true])("re-enriches retained YouTube timestamps and keyframes twice (shared upload metadata: %s)", async (sharedMetadata) => {
+  it.each([
+    { sidecar: "original", metadata: { youtube: { title: "Recording" } } },
+    { sidecar: "missing", metadata: undefined },
+    ...["text/plain", "application/octet-stream", "audio/flac", "video/ogg"].map((contentType) => ({
+      sidecar: `sibling ${contentType}`,
+      metadata: { upload: true, filename: "retained-transcript.txt", contentType },
+    })),
+  ])("re-enriches retained YouTube timestamps and keyframes twice ($sidecar)", async ({ metadata }) => {
     const locator = "media keyframe keyframe-000012 00:12";
     const transcript = "RETAINED-TRANSCRIPT-12 reset is active low.";
     const fixture = await archivedMediaFixture("source.youtube.txt", "media", {
       uri: "https://youtube.com/watch?v=recording",
       chunks: [
+        { chunk_id: 39, locator: "media metadata", text: "Title: Recording", chunk_origin: "source" },
         { chunk_id: 40, locator: "transcript 00:10-00:20", text: transcript, chunk_origin: "source" },
         {
           chunk_id: 41, locator,
@@ -1033,9 +1041,9 @@ describe("DocumentationEnrichmentService", () => {
     await fs.mkdir(path.dirname(keyframePath), { recursive: true });
     await fs.writeFile(keyframePath, keyframeBytes);
     await fs.writeFile(fixture.mediaPath, transcript);
-    await fs.writeFile(path.join(snapshotDirectory, "metadata.json"), JSON.stringify(sharedMetadata
-      ? { upload: true, filename: "retained-transcript.txt", contentType: "text/plain" }
-      : { youtube: { title: "Recording" } }));
+    if (metadata) {
+      await fs.writeFile(path.join(snapshotDirectory, "metadata.json"), JSON.stringify(metadata));
+    }
     const replacement = { locator: "ai:visual:keyframe-000012", text: "KEYFRAME-VISUAL-12 is described from the retained frame." };
     const runner = fakeRunner({ summary: "keyframe visualized", spans: [replacement], metadata: [], warnings: [] });
     const transcribeFile = vi.fn();
@@ -1070,7 +1078,7 @@ describe("DocumentationEnrichmentService", () => {
         expect(fixture.client.enrichDocument).toHaveBeenLastCalledWith(expect.objectContaining({
           documentId: "doc-1",
           spans: [replacement],
-          payload: expect.objectContaining({ evidence: expect.objectContaining({ artifactCount: 1, chunkCount: 2 }) }),
+          payload: expect.objectContaining({ evidence: expect.objectContaining({ artifactCount: 1, chunkCount: 3 }) }),
         }), expect.anything());
         await expect(fs.readFile(fixture.mediaPath, "utf8")).resolves.toBe(transcript);
         await expect(fs.readFile(keyframePath)).resolves.toEqual(keyframeBytes);

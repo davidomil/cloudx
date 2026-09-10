@@ -631,21 +631,89 @@ def test_reanalysis_rejects_invalid_archived_sources_before_extraction(tmp_path:
     assert not list(archive.snapshots_dir.glob("reanalysis-*"))
 
 
-@pytest.mark.parametrize("source_kind", ["repo_code", "youtube"])
-def test_generated_evidence_requires_ai_reenrichment_without_replacing_its_structure(tmp_path: Path, source_kind: str) -> None:
+@pytest.fixture
+def youtube_archive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[DocumentationArchive, archive_module.IngestedDocument]:
+    metadata = archive_module.YouTubeVideoMetadata(
+        title="Retained lecture",
+        webpage_url="https://www.youtube.com/watch?v=retained-lecture",
+        stream_url="mock://retained-lecture",
+        http_headers={},
+        duration=60,
+    )
+
+    def acquire_evidence(_url, _metadata, artifact_dir, *, progress=None):
+        frames_dir = artifact_dir / "media" / "keyframes"
+        frames_dir.mkdir(parents=True)
+        Image.new("RGB", (64, 36), "white").save(frames_dir / "frame-000001.jpg")
+        return [archive_module.TranscriptSegment(12.0, 18.0, "SHARED-YOUTUBE-COPY-19 retains timed transcript evidence.")], [{
+            "offsetSeconds": 12,
+            "path": "media/keyframes/frame-000001.jpg",
+            "reason": "segment-start",
+            "transcriptStartSeconds": 12.0,
+            "transcriptEndSeconds": 18.0,
+        }]
+
+    monkeypatch.setattr(archive_module, "extract_youtube_video_metadata", lambda _url: metadata)
+    monkeypatch.setattr(archive_module, "extract_youtube_video_evidence", acquire_evidence)
     archive = DocumentationArchive(tmp_path / "archive")
-    if source_kind == "repo_code":
-        document = archive.ingest_upload(filename="driver.c", content=b"void reset(void) {}", accept_generated_code_documentation=True)
-    else:
-        document = archive.ingest_text(text="Retained video transcript.", source_type="media")
-        snapshot = archive.root / archive.get_document(document.document_id)["snapshot_path"]
-        (snapshot.parent / "metadata.json").write_text(json.dumps({"youtube": {"title": "Video"}}), encoding="utf-8")
+    document = archive.ingest_youtube_video(metadata.webpage_url)
+    archive.enrich_document(
+        document.document_id,
+        spans=[ExtractedSpan("Prior video enrichment remains available.", "ai:media")],
+        model="gpt-test",
+        skill_ids=["documentation-enrich-media"],
+    )
+    return archive, document
+
+
+def test_generated_code_requires_ai_reenrichment_without_replacing_its_structure(tmp_path: Path) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+    document = archive.ingest_upload(filename="driver.c", content=b"void reset(void) {}", accept_generated_code_documentation=True)
     before = archive.get_document(document.document_id)
 
     with pytest.raises(ArchiveError, match="Rerun AI enrichment"):
         archive.reanalyze_document(document.document_id)
 
     assert archive.get_document(document.document_id) == before
+
+
+def test_reanalysis_preserves_copied_text_when_generated_youtube_shares_snapshot_metadata(youtube_archive) -> None:
+    archive, generated = youtube_archive
+    generated_before = archive.get_document(generated.document_id)
+    generated_snapshot = archive.root / generated_before["snapshot_path"]
+    source_bytes = generated_snapshot.read_bytes()
+    copied = archive.ingest_text(title="Manual lecture reference", text=source_bytes.decode("utf-8"))
+    archive.enrich_document(
+        copied.document_id,
+        spans=[ExtractedSpan("Prior copied-text enrichment remains available.", "media metadata")],
+        model="gpt-test",
+        skill_ids=["documentation-enrich-media"],
+    )
+    before = archive.get_document(copied.document_id)
+    source_chunks = [(chunk["locator"], chunk["text"]) for chunk in before["chunks"] if chunk["chunk_origin"] == "source"]
+    assert {locator for locator, _ in source_chunks} == {"text"}
+    snapshot = archive.root / before["snapshot_path"]
+    assert snapshot.parent == generated_snapshot.parent
+    assert "youtube" in json.loads((snapshot.parent / "metadata.json").read_text())
+    assert {chunk["locator"] for chunk in generated_before["chunks"] if chunk["chunk_origin"] == "source"} == {
+        "media metadata", "transcript 00:12-00:18", "media keyframe keyframe-000012 00:12",
+    }
+    generated_files = {path: path.read_bytes() for path in generated_snapshot.parent.rglob("*") if path.is_file()}
+
+    for _ in range(2):
+        result = archive.reanalyze_document(copied.document_id)
+        archive = DocumentationArchive(archive.root)
+        after = archive.get_document(copied.document_id)
+        assert result.document_id == copied.document_id
+        for field in ["document_id", "title", "source_type", "uri", "content_sha256", "created_at", "enrichments"]:
+            assert after[field] == before[field]
+        assert (archive.root / after["snapshot_path"]).read_bytes() == source_bytes
+        assert [(chunk["locator"], chunk["text"]) for chunk in after["chunks"] if chunk["chunk_origin"] == "source"] == source_chunks
+        assert [chunk for chunk in after["chunks"] if chunk["chunk_origin"] == "ai"] == [chunk for chunk in before["chunks"] if chunk["chunk_origin"] == "ai"]
+        assert {hit["documentId"] for hit in archive.search("SHARED-YOUTUBE-COPY-19", mode="lexical")} == {copied.document_id, generated.document_id}
+        assert archive.get_document(generated.document_id) == generated_before
+        assert {path: path.read_bytes() for path in generated_files} == generated_files
+        assert len(archive.list_documents()) == 2
 
 
 def test_reanalysis_allows_copied_youtube_transcripts_with_media_locators_only_in_ai_chunks(tmp_path: Path) -> None:
