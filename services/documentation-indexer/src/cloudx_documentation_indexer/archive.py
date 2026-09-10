@@ -2018,7 +2018,7 @@ class DocumentationArchive:
             }
             if any(manifest.get(key) != value for key, value in expected.items()):
                 raise ArchiveError("Archive import dense index does not match its catalog or runtime profile.")
-            self._validate_import_index_layout(index_path, active_chunk_count)
+            self._validate_import_index(index_path, active_chunk_count)
             index = IdMapIndex.load(str(index_path))
             with sqlite3.connect(archive_root / "catalog.sqlite") as db:
                 for (chunk_id,) in db.execute("SELECT chunk_id FROM chunks WHERE state = ?", (ACTIVE_STATE,)):
@@ -2038,7 +2038,7 @@ class DocumentationArchive:
         except (OSError, ValueError, RuntimeError, sqlite3.DatabaseError) as error:
             raise ArchiveError(f"Archive import dense index validation failed: {error}") from error
 
-    def _validate_import_index_layout(self, index_path: Path, active_chunk_count: int) -> None:
+    def _validate_import_index(self, index_path: Path, active_chunk_count: int) -> None:
         # Turbovec 0.7.0 writes TVIM v3. Its loader allocates from untrusted
         # lengths and can panic before exposing the dimension or vector count.
         with index_path.open("rb") as index_file:
@@ -2065,6 +2065,20 @@ class DocumentationArchive:
             expected_size = calibration_offset + 4 + 8 * calibration_count + 8 * vector_count
             if file_size != expected_size:
                 raise ArchiveError("Archive import dense index length does not match its header.")
+
+            index_file.seek(TURBOVEC_INDEX_HEADER.size + packed_bytes)
+            for start in range(0, vector_count, 65536):
+                scales = np.fromfile(index_file, dtype="<f4", count=min(65536, vector_count - start))
+                if not np.isfinite(scales).all():
+                    raise ArchiveError("Archive import dense index vector scales must be finite.")
+
+            index_file.seek(calibration_offset + 4)
+            shifts = np.fromfile(index_file, dtype="<f4", count=calibration_count)
+            calibration_scales = np.fromfile(index_file, dtype="<f4", count=calibration_count)
+            if not np.isfinite(shifts).all():
+                raise ArchiveError("Archive import dense index calibration shifts must be finite.")
+            if not np.isfinite(calibration_scales).all() or not (calibration_scales > 0).all():
+                raise ArchiveError("Archive import dense index calibration scales must be finite and positive.")
 
     def _install_replacement_archive(self, install_root: Path) -> Path:
         backup_path = self._next_backup_path()
