@@ -1382,6 +1382,24 @@ describe("ForgePanel", () => {
     expect(testFixture.calls).toContainEqual({ hook: "forge.worker.resume", input: { id: worker.id, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id });
   });
 
+  it("offers publication retry for a workflow permission rejection before a request exists", async () => {
+    const permissionError = "GitHub rejected workflow changes. Grant the worker App Workflows: write permission and approve it for this installation, then retry publishing.";
+    const failed: ForgeWorker = { ...worker, status: "failed", tabId: undefined, error: permissionError,
+      pendingPublication: { report: publishingWorker.pendingPublication!.report, repliedDiscussionIds: [] } };
+    const testFixture = fixture({ workers: [failed] });
+    const panel = await renderPanel(testFixture);
+    const card = panel.querySelector(".forge-worker")!;
+    expect(card.querySelector('[role="alert"]')?.textContent).toBe(permissionError);
+    expect(card.textContent).not.toContain("The commit was pushed");
+    expect(card.querySelector('a[href*="/pull/"]')).toBeNull();
+    expect(button(card, "Retry publication").disabled).toBe(false);
+
+    await click(card, "Retry publication");
+    expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker.") || call.hook === "forge.issue.start")).toEqual([
+      { hook: "forge.worker.resume", input: { id: worker.id, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id },
+    ]);
+  });
+
   it("shows the scheduled provider retry and a manual publication action", async () => {
     vi.useFakeTimers();
     const providerRetryAt = "2026-09-10T18:00:00.000Z";
