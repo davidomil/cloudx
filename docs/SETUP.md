@@ -175,9 +175,18 @@ Run:
 The update path keeps the existing `~/.config/cloudx/cloudx.env` choices and
 does the operational refresh:
 
+- Checks the saved configuration and effective systemd service ownership before
+  changing packages or the checkout. Standard units must belong to this checkout
+  and use its saved environment file; custom definitions require the explicit
+  web-service mode below. Reload pending unit edits before updating.
+- Requires a clean checkout, fetches `origin/main`, and fast-forwards to that
+  commit. Detached checkouts and branches without an upstream are supported.
+  Local changes and commits absent from `origin/main` are rejected without
+  resetting or stashing them. The command no longer follows the current branch's
+  upstream, and it reloads the updated installer before installing dependencies.
 - Verifies Ubuntu prerequisites, Node.js, npm, and Git 2.36+ before any Codex or
-  Cloudx npm commands run.
-- Pulls the current checkout with `git pull --ff-only`.
+  Cloudx npm commands run. Updates require an existing Node.js executable for the
+  initial ownership checks.
 - Installs exactly `@openai/codex@0.153.4` in Cloudx's user-owned npm prefix
   (`~/.local/share/cloudx/npm-global`) and verifies the resolved executable and
   Codex login status.
@@ -197,11 +206,13 @@ does the operational refresh:
 - Recreates the private pinned `uv` bootstrap and synchronizes both Python
   environments from their checked-in lock files. CUDA hosts select the locked
   `cuda` extras in the same operation.
-- Downloads the ASR model if it is missing.
+- Downloads the ASR model into the saved `CLOUDX_ASR_MODEL_PATH` only if missing.
+  Existing model and runtime-data directories from the saved configuration are preserved.
 - Rebuilds Cloudx and creates the local HTTPS certificate if it is missing.
 - Rewrites user-level systemd service files when they are already installed.
 - Asks whether to restart services now; if restarted, it verifies the Cloudx,
   ASR, and documentation indexer readiness endpoints and then prints the local URL.
+  Documentation readiness uses the saved listener host and port.
   Updates preserve exact `CLOUDX_HOST=0.0.0.0` only when a nonempty
   `CLOUDX_TRUSTED_ORIGINS` is also present. Other network-facing values and an
   incomplete wildcard configuration are replaced with `127.0.0.1`.
@@ -211,6 +222,38 @@ Preview update without changing the system:
 ```bash
 ./install.sh --update --dry-run --yes
 ```
+
+Dry runs perform read-only checkout and service inspection. They print the
+planned fetch and build operations; remote availability and ancestry are checked
+when the real fetch runs.
+
+To update an existing custom web service, run from its checkout and identify its
+unit and HTTPS port explicitly:
+
+```bash
+./install.sh --update --service cloudx-forge-test-3002.service --port 3002
+```
+
+The readiness address defaults to `127.0.0.1`. For a service bound to IPv6
+loopback, specify its address:
+
+```bash
+./install.sh --update --service cloudx-forge-test-3002.service --port 3002 --host ::1
+```
+
+`--host` accepts an IPv4 or IPv6 address without brackets or a zone identifier.
+The wildcard bind addresses `0.0.0.0` and `::` select `127.0.0.1` and `::1` for
+readiness, respectively. The updater checks only the selected address; it does
+not change the service's bind configuration.
+
+This mode checks the service's effective working directory, updates the checkout
+from `origin/main`, installs Node dependencies, rebuilds Cloudx, and asks whether
+to restart only that unit. The address and port must match the service's HTTPS
+listener. It preserves the unit definition and environment, including transient services, and
+leaves shared Codex, ASR, documentation, model, and certificate installations in
+place. Add `--no-start` to build without restarting or `--dry-run --yes` to inspect
+the plan. The standard update mode rejects units owned by another checkout even
+with `--no-start`.
 
 ## Uninstall
 

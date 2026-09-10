@@ -47,6 +47,14 @@ if [[ "${ID:-}" != "ubuntu" ]]; then
   exit 1
 fi
 
+if [[ "$UPDATE" -eq 1 ]]; then
+  if ! command -v node >/dev/null 2>&1; then
+    echo "Node.js is required to inspect and update an existing Cloudx installation. Run the installer first." >&2
+    exit 1
+  fi
+  exec node scripts/install-cloudx.mjs "$@"
+fi
+
 if [[ "$DRY_RUN" -eq 0 && "$UNINSTALL" -eq 0 ]] && ! command -v sudo >/dev/null 2>&1; then
   echo "sudo is required for Ubuntu package installation." >&2
   exit 1
@@ -182,12 +190,6 @@ if [[ "$DRY_RUN" -eq 1 ]] && ! command -v node >/dev/null 2>&1; then
 fi
 
 export CLOUDX_INSTALL_BOOTSTRAPPED=1
-
-if [[ "$UPDATE" -eq 1 ]]; then
-  step "Pull latest Cloudx checkout"
-  run git pull --ff-only
-  export CLOUDX_INSTALL_ALREADY_PULLED=1
-fi
 
 step "Launch the Cloudx installer wizard"
 exec node scripts/install-cloudx.mjs "$@"
