@@ -16,9 +16,11 @@ const fixtures = [
   "rules-skills-queued-metadata",
   "rules-skills-request-ordering",
   "settings",
+  "jira-filters",
 ];
 const scenarios = fixtures.flatMap((fixture) =>
   (fixture === "settings" ||
+  fixture === "jira-filters" ||
   fixture === "cloudx-smoke" ||
   fixture === "rules-skills-git"
     ? ["signal", "assertion", "startup"]
