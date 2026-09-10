@@ -10,6 +10,8 @@ import { SettingsDialog } from "./SettingsDialog.js";
 let root: Root | undefined;
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  Element.prototype.scrollIntoView = vi.fn();
+  vi.stubGlobal("matchMedia", vi.fn(() => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() })));
   vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ repository: { provider: "github", apiUrl: "https://api.github.com", projectPath: "cloudx/example" }, roles: [{ role: "worker", state: "disconnected" }, { role: "reviewer", state: "disconnected" }] }))));
 });
 afterEach(async () => {
@@ -53,6 +55,7 @@ async function mount(store = templates, response = config()) {
   root = createRoot(container);
   const save = vi.fn(async (_values: CloudxConfigValues) => {});
   await act(async () => root!.render(createElement(SettingsDialog, { config: response, rulesSkillsStore: store, onSave: save, onCancel: vi.fn() })));
+  await act(async () => container.querySelector<HTMLButtonElement>('[role="tab"][aria-label="Forge Workers"]')!.click());
   return { container, save };
 }
 
