@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import ipaddress
+import io
 import json
 import logging
 import mimetypes
@@ -37,9 +38,11 @@ from turbovec import IdMapIndex
 
 from .extraction import (
     ExtractedSpan,
+    ImageExtractionPipeline,
     IMAGE_SUFFIXES,
     SPREADSHEET_CONTENT_TYPES,
     SPREADSHEET_SUFFIXES,
+    SpreadsheetExtractionPipeline,
     SUPPORTED_FILE_SUFFIXES,
     decode_text,
     extract_bytes,
@@ -1259,6 +1262,15 @@ class DocumentationArchive:
                     spans = [ExtractedSpan(decode_text(source_bytes), "text")]
                 elif source_locators == {"html"}:
                     spans = [ExtractedSpan(extract_html(source_bytes), "html")]
+                elif "image" in source_locators:
+                    spans = ImageExtractionPipeline(staging_dir / "extracted").extract(source_bytes, snapshot_path.name)
+                elif source_locators and all(locator.startswith("sheet ") for locator in source_locators):
+                    workbook_content_type = None
+                    if zipfile.is_zipfile(io.BytesIO(source_bytes)):
+                        with zipfile.ZipFile(io.BytesIO(source_bytes)) as workbook:
+                            if "xl/workbook.xml" in workbook.namelist():
+                                workbook_content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    spans = SpreadsheetExtractionPipeline(staging_dir / "extracted").extract(source_bytes, snapshot_path.name, workbook_content_type)
                 else:
                     spans = extract_bytes(
                         source_bytes,

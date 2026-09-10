@@ -1,3 +1,4 @@
+import nodeFs from "node:fs";
 import fs from "node:fs/promises";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -223,7 +224,11 @@ describe("DocumentationEnrichmentService", () => {
       { filename: "transcript.txt", uri: "upload://recording.bin", sharedMetadata: true },
       { filename: "transcript.txt", uri: "https://example.com/recording.bin", sharedMetadata: true },
       { filename: "recording.txt", uri: "upload://recording.txt", sharedMetadata: false },
-    ])("keeps a copied transcript from $uri on the text path (shared metadata: $sharedMetadata)", async ({ filename, uri, sharedMetadata }) => {
+      { filename: "recording.txt", uri: "upload://recording.txt", sharedMetadata: true },
+      { filename: "recording.txt", uri: "upload://recording.txt", sharedMetadata: true, contentType: "audio/flac" },
+      { filename: "recording.txt", uri: "upload://recording.txt", sharedMetadata: true, contentType: "video/x-ms-asf" },
+      { filename: "recording.txt", uri: "upload://recording.txt", sharedMetadata: true, text: "COPIED-TRANSCRIPT".padEnd(65_535, "a") + "🎧字幕" },
+    ])("keeps a copied transcript from $uri on the text path (shared metadata: $sharedMetadata)", async ({ filename, uri, sharedMetadata, contentType = "application/octet-stream", text = "COPIED-TRANSCRIPT is retained evidence.\n字幕 café" }) => {
       const fixture = await archivedMediaFixture(filename, "media", {
         uri,
         chunks: [
@@ -231,15 +236,16 @@ describe("DocumentationEnrichmentService", () => {
           { chunk_id: 12, locator: "ai:media", chunk_origin: "ai", text: "PRIOR-AI-SPAN" },
         ],
       });
+      await fs.writeFile(fixture.mediaPath, text);
       if (sharedMetadata) {
         const url = "https://example.com/shared-transcript.txt";
-        await fs.writeFile(path.join(path.dirname(fixture.mediaPath), "metadata.json"), JSON.stringify({ url, finalUrl: url, contentType: "application/octet-stream" }));
+        await fs.writeFile(path.join(path.dirname(fixture.mediaPath), "metadata.json"), JSON.stringify({ url, finalUrl: url, contentType }));
       }
       const client = Object.assign(fixture.client, {
         reanalyzeDocument: vi.fn(async () => ({ documents: [{ documentId: "doc-1" }] })),
       });
       const runner = fakeRunner({ summary: "", spans: [{ locator: "ai:media", text: "Enriched from copied transcript." }], metadata: [], warnings: [] });
-      const transcribeFile = vi.fn();
+      const transcribeFile = vi.fn(async () => { throw new Error("ASR cannot decode a copied transcript."); });
       const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never });
       const queue = new DocumentationIngestQueue();
       const plugin = new DocumentationPlugin(client, new PathPolicy([fixture.root]), queue, () => service);
@@ -250,7 +256,43 @@ describe("DocumentationEnrichmentService", () => {
         expect(runner.run.mock.calls[0]?.[0]).toContain("COPIED-TRANSCRIPT");
         expect(runner.run.mock.calls[0]?.[0]).not.toContain("PRIOR-AI-SPAN");
         expect(transcribeFile).not.toHaveBeenCalled();
+        expect(client.enrichDocument).toHaveBeenCalledOnce();
+        await expect(fs.readFile(fixture.mediaPath, "utf8")).resolves.toBe(text);
         expect(client.reanalyzeDocument).toHaveBeenCalledTimes(operation === "reanalyze" ? 1 : 0);
+      } finally {
+        await queue.dispose();
+        await fs.rm(fixture.root, { recursive: true, force: true });
+      }
+    });
+
+    it.each([
+      { name: "late binary byte", suffix: Buffer.from([0]) },
+      { name: "late invalid UTF-8", suffix: Buffer.from([0xff]) },
+      { name: "incomplete UTF-8 at EOF", suffix: Buffer.from([0xc3]) },
+    ])("keeps binary .txt media on ASR with $name", async ({ suffix }) => {
+      const fixture = await archivedMediaFixture("recording.txt");
+      const bytes = Buffer.concat([Buffer.alloc(70_000, 0x61), suffix]);
+      await fs.writeFile(fixture.mediaPath, bytes);
+      await fs.writeFile(path.join(path.dirname(fixture.mediaPath), "metadata.json"), JSON.stringify({
+        url: "https://example.com/shared.bin", contentType: "application/octet-stream",
+      }));
+      const client = Object.assign(fixture.client, {
+        reanalyzeDocument: vi.fn(async () => ({ documents: [{ documentId: "doc-1" }] })),
+      });
+      const runner = fakeRunner({ summary: "", spans: [{ locator: "ai:media", text: "Fresh recording evidence." }], metadata: [], warnings: [] });
+      const transcribeFile = vi.fn(async () => ({ text: "FRESH-TRANSCRIPT" }));
+      const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never });
+      const queue = new DocumentationIngestQueue();
+      const plugin = new DocumentationPlugin(client, new PathPolicy([fixture.root]), queue, () => service);
+      try {
+        const result = await plugin.hooks.find((hook) => hook.id === `documentation.documents.${operation}`)!.execute({ documentId: "doc-1" }, { caller: { kind: "ui" } });
+
+        expect(result).toMatchObject({ enrichment: { results: [{ status: "written" }] } });
+        expect(transcribeFile).toHaveBeenCalledOnce();
+        expect(runner.run.mock.calls[0]?.[0]).toContain("FRESH-TRANSCRIPT");
+        expect(runner.run.mock.calls[0]?.[0]).not.toContain("BINARY-CHUNK");
+        expect(runner.run.mock.calls[0]?.[0]).not.toContain("PRIOR-AI-SPAN");
+        await expect(fs.readFile(fixture.mediaPath)).resolves.toEqual(bytes);
       } finally {
         await queue.dispose();
         await fs.rm(fixture.root, { recursive: true, force: true });
@@ -373,7 +415,7 @@ describe("DocumentationEnrichmentService", () => {
         } else {
           expect(mediaProcessLauncher).not.toHaveBeenCalled();
         }
-        await expect(fs.readFile(fixture.mediaPath, "utf8")).resolves.toBe("archived media bytes");
+        await expect(fs.readFile(fixture.mediaPath)).resolves.toEqual(fixture.sourceBytes);
       } finally {
         await queue.dispose();
         await fs.rm(fixture.root, { recursive: true, force: true });
@@ -395,6 +437,41 @@ describe("DocumentationEnrichmentService", () => {
       expect(runner.run.mock.calls[0]?.[0]).toContain("EXTENSIONLESS-TRANSCRIPT");
       expect(runner.run.mock.calls[0]?.[0]).not.toContain("BINARY-CHUNK");
     } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["cancelled", "failed"])("closes a %s transcript read without replacing enrichment", async (outcome) => {
+    const fixture = await archivedMediaFixture("recording.txt");
+    await fs.writeFile(fixture.mediaPath, "COPIED-TRANSCRIPT ".repeat(10_000));
+    await fs.writeFile(path.join(path.dirname(fixture.mediaPath), "metadata.json"), JSON.stringify({
+      contentType: "application/octet-stream", url: "https://example.com/shared.txt",
+    }));
+    const controller = new AbortController();
+    const error = new Error(`Snapshot read ${outcome}.`);
+    const createReadStream = nodeFs.createReadStream;
+    let sourceStream: nodeFs.ReadStream | undefined;
+    const readSource = vi.spyOn(nodeFs, "createReadStream").mockImplementationOnce((filename, options) => {
+      sourceStream = createReadStream(filename, options);
+      sourceStream.once("data", () => outcome === "cancelled" ? controller.abort(error) : sourceStream!.destroy(error));
+      return sourceStream;
+    });
+    const runner = fakeRunner();
+    const transcribeFile = vi.fn();
+    const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never });
+    try {
+      const enrichment = service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] }, {}, { signal: controller.signal });
+      if (outcome === "cancelled") {
+        await expect(enrichment).rejects.toThrow(error);
+      } else {
+        await expect(enrichment).resolves.toMatchObject({ enrichment: { results: [{ status: "failed", error: error.message }] } });
+      }
+      expect(sourceStream?.destroyed).toBe(true);
+      expect(transcribeFile).not.toHaveBeenCalled();
+      expect(runner.run).not.toHaveBeenCalled();
+      expect(fixture.client.enrichDocument).not.toHaveBeenCalled();
+    } finally {
+      readSource.mockRestore();
       await fs.rm(fixture.root, { recursive: true, force: true });
     }
   });
@@ -1418,7 +1495,8 @@ async function archivedMediaFixture(filename = "recording.wav", sourceType = "me
   const snapshotPath = `snapshots/abc/${filename}`;
   const mediaPath = path.join(archiveRoot, snapshotPath);
   await fs.mkdir(path.dirname(mediaPath), { recursive: true });
-  await fs.writeFile(mediaPath, "archived media bytes");
+  const sourceBytes = Buffer.from("UklGRjQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YRAAAAAAAAAAAAAAAAAAAAAAAAAA", "base64");
+  await fs.writeFile(mediaPath, sourceBytes);
   const client = fakeDocumentationClient({
     state: "active", source_type: sourceType, snapshot_path: snapshotPath, uri: `upload://${filename}`,
     chunks: [
@@ -1427,7 +1505,7 @@ async function archivedMediaFixture(filename = "recording.wav", sourceType = "me
     ],
     ...documentOverrides,
   }, { archiveRoot });
-  return { root, archiveRoot, mediaPath, client };
+  return { root, archiveRoot, mediaPath, sourceBytes, client };
 }
 
 function fakeDocumentationClient(documentOverrides: Record<string, unknown> = {}, options: { archiveRoot?: string } = {}): DocumentationClient & {

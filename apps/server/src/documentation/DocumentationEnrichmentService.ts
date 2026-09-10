@@ -467,6 +467,13 @@ export class DocumentationEnrichmentService {
     if (!stat.isFile() || stat.isSymbolicLink()) {
       throw new Error("Archived media source must be a regular file.");
     }
+    const sourceChunks = recordsArray(document.chunks).filter((chunk) => chunk.chunk_origin === "source");
+    if (path.extname(snapshotPath).toLowerCase() === ".txt"
+      && sourceChunks.length > 0
+      && sourceChunks.every((chunk) => chunk.locator === "text")
+      && await isUtf8TextFile(realSnapshot, signal)) {
+      return undefined;
+    }
     return { filename: path.basename(snapshotPath), contentPath: realSnapshot, contentType, sourceType: optionalRecordString(document, "source_type") };
   }
 
@@ -1529,6 +1536,26 @@ function recordStringArray(record: Record<string, unknown>, key: string): string
   }
   const strings = value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean);
   return strings.length > 0 ? strings : undefined;
+}
+
+async function isUtf8TextFile(filename: string, signal?: AbortSignal): Promise<boolean> {
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  try {
+    for await (const bytes of fs.createReadStream(filename, { signal })) {
+      const text = decoder.decode(bytes, { stream: true });
+      // Binary data bytes as defined by the WHATWG MIME Sniffing Standard.
+      if (/[\u0000-\u0008\u000b\u000e-\u001a\u001c-\u001f]/u.test(text)) {
+        return false;
+      }
+    }
+    decoder.decode();
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ERR_ENCODING_INVALID_ENCODED_DATA") {
+      return false;
+    }
+    throw error;
+  }
 }
 
 function isMediaSource(source: DocumentationEnrichmentSource): boolean {

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 import httpx
+from openpyxl import Workbook
 from PIL import Image
 import pytest
 from reportlab.pdfgen import canvas
@@ -393,6 +394,105 @@ def test_reanalysis_preserves_html_format_when_a_url_replaces_shared_metadata(tm
         assert [(chunk["locator"], chunk["text"]) for chunk in source_chunks] == [("html", "RETAINED-HTML-FORMAT-19")]
         assert all("HIDDEN-SCRIPT-19" not in chunk["text"] for chunk in source_chunks)
         assert [chunk for chunk in current["chunks"] if chunk["chunk_origin"] == "ai"] == [chunk for chunk in before["chunks"] if chunk["chunk_origin"] == "ai"]
+        if import_sibling:
+            assert archive.get_document(sibling.document_id) == sibling_before
+            assert snapshot.read_bytes() == source_bytes
+    assert len(archive.list_documents()) == (2 if import_sibling else 1)
+
+
+@pytest.mark.parametrize("source_format", ["png", "xlsx", "xls", "ods"])
+@pytest.mark.parametrize("import_sibling", [False, True], ids=["upload-only", "shared-url-metadata"])
+def test_reanalysis_preserves_mime_selected_formats_when_a_url_replaces_shared_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_format: str, import_sibling: bool) -> None:
+    source = io.BytesIO()
+    if source_format == "png":
+        Image.new("RGB", (20, 10), "red").save(source, format="PNG")
+        content_type = "image/png"
+        expected_locators = {"image"}
+        expected_artifacts = {"image_metadata.json", "images/download.png"}
+    else:
+        rows = [["Component", "Current"], ["MCU", 45], ["Sensor", 12]]
+        if source_format == "xlsx":
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "Power Budget"
+            for row in rows:
+                sheet.append(row)
+            sheet.append(["Total", "=SUM(B2:B3)"])
+            sheet["A6"] = "Merged board notes"
+            sheet.merge_cells("A6:B6")
+            workbook.save(source)
+            content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        elif source_format == "xls":
+            import xlwt
+
+            workbook = xlwt.Workbook()
+            sheet = workbook.add_sheet("Power Budget")
+            for row_index, row in enumerate(rows):
+                for column_index, value in enumerate(row):
+                    sheet.write(row_index, column_index, value)
+            workbook.save(source)
+            content_type = "application/vnd.ms-excel"
+        else:
+            import pandas as pd
+
+            pd.DataFrame(rows).to_excel(source, engine="odf", sheet_name="Power Budget", header=False, index=False)
+            content_type = "application/vnd.oasis.opendocument.spreadsheet"
+        expected_locators = {f"sheet Power Budget range A1:B{6 if source_format == 'xlsx' else 3}"}
+        expected_artifacts = {
+            "spreadsheet_index.tsv",
+            "spreadsheets/sheet-001-Power_Budget.csv",
+            "spreadsheets/sheet-001-Power_Budget.md",
+            "spreadsheets/sheet-001-Power_Budget.json",
+        }
+    source_bytes = source.getvalue()
+    archive = DocumentationArchive(tmp_path / "archive")
+    filename = "download" if source_format in {"png", "xlsx"} else f"download.{source_format}"
+    upload = archive.ingest_upload(filename=filename, content=source_bytes, source_type="reference", content_type=content_type)
+    archive.enrich_document(
+        upload.document_id,
+        spans=[ExtractedSpan("Previous enrichment stays available.", "ai:metadata")],
+        model="gpt-test",
+        skill_ids=["documentation-enrich-metadata"],
+    )
+    before = archive.get_document(upload.document_id)
+    snapshot = archive.root / before["snapshot_path"]
+    source_chunks = [(chunk["locator"], chunk["text"]) for chunk in before["chunks"] if chunk["chunk_origin"] == "source"]
+    assert {locator for locator, _ in source_chunks} == expected_locators
+    artifacts = {
+        artifact.relative_to(snapshot.parent / "extracted").as_posix(): artifact.read_bytes()
+        for artifact in (snapshot.parent / "extracted").rglob("*") if artifact.is_file()
+    }
+    assert set(artifacts) == expected_artifacts
+    if source_format == "xlsx":
+        table = json.loads(artifacts["spreadsheets/sheet-001-Power_Budget.json"])
+        assert table["formulas"] == [{"cell": "B4", "formula": "=SUM(B2:B3)"}]
+        assert table["mergedRanges"] == ["A6:B6"]
+    if import_sibling:
+        url = f"https://example.com/{filename}"
+        response = httpx.Response(200, request=httpx.Request("GET", url), headers={"content-type": "application/octet-stream"}, content=source_bytes)
+        monkeypatch.setattr(archive_module, "fetch_url_bytes", lambda _url, _limit: (response, source_bytes))
+        sibling = archive.ingest_url(url)
+        sibling_before = archive.get_document(sibling.document_id)
+        assert sibling_before["snapshot_path"] == before["snapshot_path"]
+        assert json.loads(snapshot.with_name("metadata.json").read_text())["contentType"] == "application/octet-stream"
+
+    for _ in range(2):
+        previous_snapshot = archive.root / archive.get_document(upload.document_id)["snapshot_path"]
+        result = archive.reanalyze_document(upload.document_id)
+        current = archive.get_document(upload.document_id)
+        replacement_snapshot = archive.root / current["snapshot_path"]
+        assert result.document_id == upload.document_id
+        for field in ["document_id", "title", "uri", "source_type", "content_sha256", "enrichments"]:
+            assert current[field] == before[field]
+        assert replacement_snapshot != previous_snapshot
+        assert replacement_snapshot.read_bytes() == source_bytes
+        assert [(chunk["locator"], chunk["text"]) for chunk in current["chunks"] if chunk["chunk_origin"] == "source"] == source_chunks
+        assert [chunk for chunk in current["chunks"] if chunk["chunk_origin"] == "ai"] == [chunk for chunk in before["chunks"] if chunk["chunk_origin"] == "ai"]
+        regenerated_artifacts = {
+            artifact.relative_to(replacement_snapshot.parent / "extracted").as_posix(): artifact.read_bytes()
+            for artifact in (replacement_snapshot.parent / "extracted").rglob("*") if artifact.is_file()
+        }
+        assert regenerated_artifacts == artifacts
         if import_sibling:
             assert archive.get_document(sibling.document_id) == sibling_before
             assert snapshot.read_bytes() == source_bytes
