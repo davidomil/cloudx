@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import io
 import json
 import sqlite3
+import wave
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+import httpx
 from PIL import Image
 import pytest
 from reportlab.pdfgen import canvas
@@ -295,6 +298,44 @@ def test_reanalysis_does_not_interpret_a_source_named_metadata_json_as_a_sidecar
         assert after["chunks"][0]["text"] == content
         assert archive.search("LOCAL-METADATA-SOURCE-19", mode="lexical")[0]["documentId"] == document.document_id
     assert len(archive.list_documents()) == 1
+
+
+@pytest.mark.parametrize("filename", ["recording.bin", "recording"])
+def test_reanalysis_preserves_media_upload_identity_when_a_url_replaces_shared_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, filename: str) -> None:
+    audio = io.BytesIO()
+    with wave.open(audio, "wb") as recording:
+        recording.setnchannels(1)
+        recording.setsampwidth(2)
+        recording.setframerate(16000)
+        recording.writeframes(b"\x00\x00" * 160)
+    source_bytes = audio.getvalue()
+    archive = DocumentationArchive(tmp_path / "archive")
+    upload = archive.ingest_upload(filename=filename, content=source_bytes, source_type="media", content_type="application/octet-stream")
+    before = archive.get_document(upload.document_id)
+    shared_metadata = (archive.root / before["snapshot_path"]).parent / "metadata.json"
+    assert json.loads(shared_metadata.read_text())["upload"] is True
+
+    url = f"https://example.com/{filename}"
+    response = httpx.Response(200, request=httpx.Request("GET", url), headers={"content-type": "application/octet-stream"}, content=source_bytes)
+    monkeypatch.setattr(archive_module, "fetch_url_bytes", lambda _url, _limit: (response, source_bytes))
+    sibling = archive.ingest_url(url)
+    url_metadata = json.loads(shared_metadata.read_text())
+    assert url_metadata["url"] == url
+    assert "upload" not in url_metadata
+    assert archive.get_document(sibling.document_id)["snapshot_path"] == before["snapshot_path"]
+
+    for _ in range(2):
+        result = archive.reanalyze_document(upload.document_id)
+        current = archive.get_document(upload.document_id)
+        snapshot = archive.root / current["snapshot_path"]
+        assert result.document_id == upload.document_id
+        for field in ["document_id", "uri", "source_type", "content_sha256"]:
+            assert current[field] == before[field]
+        assert current["uri"] == f"upload://{filename}"
+        assert current["source_type"] == "media"
+        assert snapshot.read_bytes() == source_bytes
+        assert json.loads(snapshot.with_name("metadata.json").read_text()) == url_metadata
+    assert len(archive.list_documents()) == 2
 
 
 def test_reanalysis_preserves_upload_metadata_for_sources_without_filename_extensions(tmp_path: Path) -> None:

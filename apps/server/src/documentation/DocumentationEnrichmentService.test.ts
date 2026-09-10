@@ -220,6 +220,90 @@ describe("DocumentationEnrichmentService", () => {
 
   describe.each(["reanalyze", "reenrich"])("%s archived media", (operation) => {
     it.each([
+      { filename: "transcript.txt", uri: "upload://recording.bin", sharedMetadata: true },
+      { filename: "transcript.txt", uri: "https://example.com/recording.bin", sharedMetadata: true },
+      { filename: "recording.txt", uri: "upload://recording.txt", sharedMetadata: false },
+    ])("keeps a copied transcript from $uri on the text path (shared metadata: $sharedMetadata)", async ({ filename, uri, sharedMetadata }) => {
+      const fixture = await archivedMediaFixture(filename, "media", {
+        uri,
+        chunks: [
+          { chunk_id: 11, locator: "text", chunk_origin: "source", text: "COPIED-TRANSCRIPT is retained evidence." },
+          { chunk_id: 12, locator: "ai:media", chunk_origin: "ai", text: "PRIOR-AI-SPAN" },
+        ],
+      });
+      if (sharedMetadata) {
+        const url = "https://example.com/shared-transcript.txt";
+        await fs.writeFile(path.join(path.dirname(fixture.mediaPath), "metadata.json"), JSON.stringify({ url, finalUrl: url, contentType: "application/octet-stream" }));
+      }
+      const client = Object.assign(fixture.client, {
+        reanalyzeDocument: vi.fn(async () => ({ documents: [{ documentId: "doc-1" }] })),
+      });
+      const runner = fakeRunner({ summary: "", spans: [{ locator: "ai:media", text: "Enriched from copied transcript." }], metadata: [], warnings: [] });
+      const transcribeFile = vi.fn();
+      const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never });
+      const queue = new DocumentationIngestQueue();
+      const plugin = new DocumentationPlugin(client, new PathPolicy([fixture.root]), queue, () => service);
+      try {
+        const result = await plugin.hooks.find((hook) => hook.id === `documentation.documents.${operation}`)!.execute({ documentId: "doc-1" }, { caller: { kind: "ui" } });
+
+        expect(result).toMatchObject({ kind: operation, firstDocumentId: "doc-1", enrichment: { results: [{ status: "written" }] } });
+        expect(runner.run.mock.calls[0]?.[0]).toContain("COPIED-TRANSCRIPT");
+        expect(runner.run.mock.calls[0]?.[0]).not.toContain("PRIOR-AI-SPAN");
+        expect(transcribeFile).not.toHaveBeenCalled();
+        expect(client.reanalyzeDocument).toHaveBeenCalledTimes(operation === "reanalyze" ? 1 : 0);
+      } finally {
+        await queue.dispose();
+        await fs.rm(fixture.root, { recursive: true, force: true });
+      }
+    });
+
+    it.each(["recording", "recording.bin", "recording.txt"])("transcribes %s after an identical URL import replaces shared metadata", async (filename) => {
+      const fixture = await archivedMediaFixture(filename);
+      const metadataPath = path.join(path.dirname(fixture.mediaPath), "metadata.json");
+      const contentType = "application/octet-stream";
+      await fs.writeFile(metadataPath, JSON.stringify({ filename, contentType, upload: true }));
+      const originalBytes = await fs.readFile(fixture.mediaPath);
+      const { document: uploaded } = await fixture.client.getDocument({ documentId: "doc-1" });
+      const transcript = "FRESH-TRANSCRIPT from the original media upload.";
+      const transcribeFile = vi.fn(async () => ({ text: transcript }));
+      const runner = fakeRunner({ summary: "", spans: [{ locator: "ai:media", text: "Enriched from the fresh transcript." }], metadata: [], warnings: [] });
+      const client = Object.assign(fixture.client, {
+        reanalyzeDocument: vi.fn(async () => ({ documents: [{ documentId: "doc-1" }] })),
+      });
+      const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never });
+      const queue = new DocumentationIngestQueue();
+      const plugin = new DocumentationPlugin(client, new PathPolicy([fixture.root]), queue, () => service);
+      try {
+        const url = "https://example.com/downloaded-source.bin";
+        await fs.writeFile(metadataPath, JSON.stringify({ url, finalUrl: url, contentType, etag: null, lastModified: null }));
+
+        for (let rerun = 1; rerun <= 2; rerun += 1) {
+          const result = await plugin.hooks.find((hook) => hook.id === `documentation.documents.${operation}`)!.execute({ documentId: "doc-1" }, { caller: { kind: "ui" } });
+
+          expect(result).toMatchObject({ kind: operation, firstDocumentId: "doc-1", enrichment: { results: [{ status: "written" }] } });
+          expect(transcribeFile).toHaveBeenCalledTimes(rerun);
+          expect(transcribeFile).toHaveBeenLastCalledWith(fixture.mediaPath, filename, { signal: expect.any(AbortSignal) });
+          expect(runner.run).toHaveBeenCalledTimes(rerun);
+          const prompt = runner.run.mock.lastCall?.[0];
+          expect(prompt).toContain(transcript);
+          expect(prompt).not.toContain("BINARY-CHUNK");
+          expect(prompt).not.toContain("PRIOR-AI-SPAN");
+          expect(client.enrichDocument).toHaveBeenCalledTimes(rerun);
+          expect(client.enrichDocument).toHaveBeenLastCalledWith(expect.objectContaining({
+            documentId: "doc-1",
+            payload: expect.objectContaining({ evidence: expect.objectContaining({ mediaTranscriptChars: transcript.length }) }),
+          }), expect.anything());
+          await expect(fs.readFile(fixture.mediaPath)).resolves.toEqual(originalBytes);
+          await expect(client.getDocument({ documentId: "doc-1" })).resolves.toEqual({ document: uploaded });
+        }
+        expect(client.reanalyzeDocument).toHaveBeenCalledTimes(operation === "reanalyze" ? 2 : 0);
+      } finally {
+        await queue.dispose();
+        await fs.rm(fixture.root, { recursive: true, force: true });
+      }
+    });
+
+    it.each([
       { filename: "recording.wav", contentType: undefined, video: false, evidence: "transcript" },
       { filename: "recording.wav", contentType: "audio/wav", video: false, evidence: "transcript" },
       { filename: "recording.ogg", contentType: undefined, video: false, evidence: "transcript" },

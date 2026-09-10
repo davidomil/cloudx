@@ -452,7 +452,6 @@ export class DocumentationEnrichmentService {
       }
       contentType = optionalRecordString(metadata, "contentType");
       retainsMediaUpload = document.source_type === "media"
-        && metadata.upload === true
         && document.uri === `upload://${path.basename(snapshotPath)}`;
     }
     if (!retainsMediaUpload && !hasMediaSuffix && (!contentType || !/^(audio|video)\//iu.test(contentType))) {
