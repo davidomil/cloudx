@@ -24,6 +24,12 @@ function nonblankText(value: unknown, name: string, max: number): string {
   if (!result.trim()) throw new Error(`Invalid ${name}.`);
   return result;
 }
+function commitSha(value: unknown, name: string): string {
+  const result = text(value, name, 64);
+  if (![40, 64].includes(result.length) || /[^a-f0-9]/i.test(result))
+    throw new Error(`Invalid ${name}.`);
+  return result;
+}
 function isoTimestamp(value: unknown, name: string): string {
   const result = text(value, name, 24);
   const timestamp = Date.parse(result);
@@ -152,8 +158,11 @@ export function parseWorkerReport(
   | ForgeIssueCompletionReport
   | ({ kind: "review" } & ForgeReviewSubmission) {
   const report = object(value);
-  if (report.kind === "review")
+  if (report.kind === "review") {
+    if (report.rebase !== undefined)
+      throw new Error("Only issue reports can report a rebase resolution.");
     return { kind: "review", ...parseReview(report) };
+  }
   if (report.kind !== "issue")
     throw new Error("Completion report must identify issue or review work.");
   const title = text(report.title, "change title", 256);
@@ -188,7 +197,42 @@ export function parseWorkerReport(
     body,
     resolvedDiscussionIds: [...new Set(ids)] as string[],
     discussionReplies,
+    ...(report.rebase !== undefined ? { rebase: parseRebaseReport(report.rebase) } : {}),
   };
+}
+
+function parseRebaseReport(value: unknown): NonNullable<ForgeIssueCompletionReport["rebase"]> {
+  const input = object(value);
+  if (input.outcome !== "resolved" && input.outcome !== "blocked")
+    throw new Error("Invalid rebase outcome.");
+  if (input.validation !== "passed" && input.validation !== "failed")
+    throw new Error("Invalid rebase validation result.");
+  return {
+    outcome: input.outcome,
+    validation: input.validation,
+    details: nonblankText(input.details, "rebase details", 100_000),
+  };
+}
+
+function parseRebaseRecovery(value: unknown, worker: ForgeWorker): NonNullable<ForgeWorker["rebaseRecovery"]> {
+  const input = object(value);
+  const branch = nonblankText(input.branch, "rebase recovery branch", 1024);
+  const baseBranch = nonblankText(input.baseBranch, "rebase recovery base branch", 1024);
+  const expectedHeadSha = commitSha(input.expectedHeadSha, "rebase recovery published head");
+  const originalHeadSha = commitSha(input.originalHeadSha, "rebase recovery original head");
+  const targetHeadSha = commitSha(input.targetHeadSha, "rebase recovery target head");
+  const headSha = input.headSha === undefined ? undefined : commitSha(input.headSha, "rebase recovery result head");
+  const phase = input.phase;
+  if (phase !== "resolving" && phase !== "publishing" && phase !== "reviewing" ||
+    (phase === "resolving") !== (headSha === undefined) ||
+    headSha?.toLowerCase() === expectedHeadSha.toLowerCase())
+    throw new Error("Invalid rebase recovery phase or result head.");
+  if (worker.kind !== "issue" || !worker.changeNumber ||
+    !worker.repositoryPath?.trim() || !worker.worktreePath?.trim() ||
+    worker.branch !== branch || worker.baseBranch !== baseBranch ||
+    !worker.headSha || ![expectedHeadSha.toLowerCase(), headSha?.toLowerCase()].includes(worker.headSha.toLowerCase()))
+    throw new Error("Rebase recovery requires the matching owned issue checkout, published request, and commit.");
+  return { branch, baseBranch, expectedHeadSha, originalHeadSha, targetHeadSha, phase, ...(headSha ? { headSha } : {}) };
 }
 
 function parsePendingPublication(
@@ -375,6 +419,8 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
         parsed.headSha !== update.expectedHeadSha && parsed.headSha !== update.headSha))
         throw new Error("Base update checkpoint must match the worker's published request and base branch.");
     }
+    if (worker.rebaseRecovery !== undefined)
+      parsed.rebaseRecovery = parseRebaseRecovery(worker.rebaseRecovery, parsed);
     if (parsed.providerRetryAt && (
       parsed.kind !== "issue" || parsed.status !== "paused" || !parsed.autoReview?.enabled ||
       parsed.mergeAttempted || ["creating", "uncertain"].includes(parsed.publicationState ?? "") ||

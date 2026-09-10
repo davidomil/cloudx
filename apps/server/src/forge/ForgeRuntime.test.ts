@@ -14,6 +14,7 @@ import { AppServerOwnershipError } from "../appServer/OwnedAppServerTransport.js
 import type { ReviewConversationBinding } from "./ForgeReviewConversation.js";
 import {
   ForgeRuntime,
+  ForgeBranchConflictError,
   assertForgeOrigin,
   type ForgeRuntimeDependencies,
   type ForgeWorkspace,
@@ -58,7 +59,7 @@ function dependencies({ trustRepository = true } = {}): ForgeRuntimeDependencies
         cwd,
         ...args.map((argument) =>
           argument === "https://github.com/cloudx/test.git" &&
-          ["fetch", "push"].includes(args[0]!)
+          ["fetch", "push", "ls-remote"].includes(args[0]!)
             ? origin
             : argument,
         ),
@@ -1043,7 +1044,27 @@ describe("ForgeRuntime owned branch updates", () => {
     expect(await git(workspace.worktreePath, "rev-list", "--parents", "-n", "1", updatedHead)).toBe(`${updatedHead} ${publishedHead} ${targetHead}`);
   });
 
-  it("aborts its conflicting merge and preserves the original published work", async () => {
+  it.each([false, true])("prepares the current conflicting target after a completed no-op update with restart %s", async restart => {
+    const { workspace, publishedHead } = await publishedIssue(true);
+    expect(await runtime.updateIssueBranch(workspace, publishedHead, "main")).toBe(publishedHead);
+    const targetHead = await advanceTarget("README.md", "Conflicting target work\n");
+    await expect(git(origin, "merge-tree", "--write-tree", publishedHead, targetHead)).rejects.toMatchObject({ code: 1 });
+    if (restart) {
+      runtime = new ForgeRuntime(dependencies());
+      await runtime.recover(workspace.id);
+    }
+
+    expect(await runtime.prepareIssueRebase(workspace, publishedHead, "main")).toEqual({
+      originalHeadSha: publishedHead, targetHeadSha: targetHead,
+    });
+
+    expect((await ownership(workspace.id)).value.issueRebase.targetHeadSha).toBe(targetHead);
+    expect(await git(workspace.worktreePath, "rev-parse", `refs/cloudx/rebase-targets/${targetHead}`)).toBe(targetHead);
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(publishedHead);
+    expect(await git(workspace.worktreePath, "status", "--porcelain")).toBe("");
+  });
+
+  it("detects content conflicts without modifying the original published work", async () => {
     const { workspace, publishedHead } = await publishedIssue(true);
     await advanceTarget("README.md", "Conflicting target work\n");
 
@@ -1053,28 +1074,541 @@ describe("ForgeRuntime owned branch updates", () => {
     expect(await git(workspace.worktreePath, "status", "--porcelain")).toBe("");
     expect(await fs.readFile(path.join(workspace.worktreePath, "README.md"), "utf8")).toBe("Published issue work\n");
     await expect(fs.lstat(path.join(workspace.worktreePath, ".git", "MERGE_HEAD"))).rejects.toMatchObject({ code: "ENOENT" });
-    expect((await ownership(workspace.id)).value.baseUpdate).toBeUndefined();
+    expect((await ownership(workspace.id)).value.baseUpdate).toMatchObject({ expectedHeadSha: publishedHead });
     expect(await git(origin, "rev-parse", workspace.branch)).toBe(publishedHead);
   });
 
-  it("preserves conflicts when abort cannot restore the owned merge", async () => {
+  it("records the conflicted target without running a merge or abort", async () => {
     const deps = dependencies();
-    const run = deps.git!;
-    deps.git = async (cwd, args, signal, env) => {
-      if (args[0] === "merge" && args.includes("--abort")) throw new Error("Abort could not finish.");
-      return run(cwd, args, signal, env);
-    };
+    deps.git = vi.fn(deps.git!);
     runtime = new ForgeRuntime(deps);
     const { workspace, publishedHead } = await publishedIssue(true);
     const targetHead = await advanceTarget("README.md", "Conflicting target work\n");
+    vi.mocked(deps.git).mockClear();
 
-    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toThrow(/abort|restore|incomplete/i);
+    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toMatchObject({
+      name: "ForgeBranchConflictError", targetHeadSha: targetHead,
+    });
 
-    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(publishedHead);
-    expect(await git(workspace.worktreePath, "rev-parse", "MERGE_HEAD")).toBe(targetHead);
-    expect(await git(workspace.worktreePath, "status", "--porcelain")).toContain("UU README.md");
+    expect(vi.mocked(deps.git).mock.calls.some(([, args]) => args[0] === "merge")).toBe(false);
+    expect(await git(workspace.worktreePath, "status", "--porcelain")).toBe("");
     expect((await ownership(workspace.id)).value.baseUpdate).toMatchObject({ expectedHeadSha: publishedHead, targetHeadSha: targetHead });
-    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toThrow(/in progress|pending|unfinished/i);
+  });
+
+  it("keeps an unfinished conflicting update pinned when the target advances before recovery preparation", async () => {
+    const { workspace, publishedHead } = await publishedIssue(true);
+    const targetHead = await advanceTarget("README.md", "Conflicting target work\n");
+    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toBeInstanceOf(ForgeBranchConflictError);
+    await advanceTarget("later.txt", "Later target work\n");
+    runtime = new ForgeRuntime(dependencies());
+    await runtime.recover(workspace.id);
+
+    expect(await runtime.prepareIssueRebase(workspace, publishedHead, "main")).toEqual({
+      originalHeadSha: publishedHead, targetHeadSha: targetHead,
+    });
+  });
+
+  async function resolveContentRebase(workspace: ForgeWorkspace, targetHeadSha: string) {
+    await expect(git(workspace.worktreePath, "rebase", "--rebase-merges", targetHeadSha)).rejects.toThrow();
+    await fs.writeFile(path.join(workspace.worktreePath, "README.md"), "New target work\nPublished issue work\n");
+    await git(workspace.worktreePath, "add", "README.md");
+    await git(workspace.worktreePath, "-c", "core.editor=true", "rebase", "--continue");
+  }
+
+  async function rebasedIssue() {
+    const { workspace, publishedHead } = await publishedIssue(true);
+    const targetHead = await advanceTarget("README.md");
+    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toBeInstanceOf(ForgeBranchConflictError);
+    await runtime.prepareIssueRebase(workspace, publishedHead, "main");
+    await resolveContentRebase(workspace, targetHead);
+    const rebasedHead = await runtime.completeIssueRebase(workspace, { expectedHeadSha: publishedHead, targetHeadSha: targetHead });
+    return { workspace, publishedHead, targetHead, rebasedHead };
+  }
+
+  it("lets a coding worker resolve a content conflict and publishes only its completed result with an exact lease", async () => {
+    const deps = dependencies();
+    deps.git = vi.fn(deps.git!);
+    runtime = new ForgeRuntime(deps);
+    const { workspace, publishedHead, targetHead, rebasedHead } = await rebasedIssue();
+    expect(await git(workspace.worktreePath, "rev-parse", `refs/cloudx/before-rebase/${publishedHead}`)).toBe(publishedHead);
+    expect(await git(workspace.worktreePath, "rev-parse", `refs/cloudx/rebase-targets/${targetHead}`)).toBe(targetHead);
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(publishedHead);
+    await expect(runtime.publishBranch(workspace, undefined, rebasedHead)).rejects.toThrow("exact-head lease");
+    vi.mocked(deps.git).mockClear();
+
+    expect(await runtime.publishBranch(workspace, undefined, rebasedHead, publishedHead)).toBe(rebasedHead);
+
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(rebasedHead);
+    expect(await git(origin, "show", `${rebasedHead}:README.md`)).toBe("New target work\nPublished issue work");
+    expect(vi.mocked(deps.git).mock.calls.filter(([, args]) => args[0] === "push").map(([, args]) => args)).toEqual([
+      ["push", `--force-with-lease=refs/heads/${workspace.branch}:${publishedHead}`, "https://github.com/cloudx/test.git", `${rebasedHead}:refs/heads/${workspace.branch}`],
+    ]);
+    expect((await ownership(workspace.id)).value.issueRebase).toMatchObject({
+      expectedHeadSha: publishedHead, originalHeadSha: publishedHead, targetHeadSha: targetHead, headSha: rebasedHead,
+      publication: { headSha: rebasedHead, expectedRemoteHeadSha: publishedHead, confirmed: true },
+    });
+  });
+
+  it.each([false, true])("updates a later target after confirmed rebase publication with restart %s", async restart => {
+    const { workspace, publishedHead, rebasedHead } = await rebasedIssue();
+    await runtime.publishBranch(workspace, undefined, rebasedHead, publishedHead);
+    const confirmed = (await ownership(workspace.id)).value;
+    if (restart) {
+      runtime = new ForgeRuntime(dependencies());
+      await runtime.recover(workspace.id);
+    }
+    const targetHead = await advanceTarget("later.txt", "Later target work\n");
+
+    const updatedHead = await runtime.updateIssueBranch(workspace, rebasedHead, "main");
+    await runtime.publishBranch(workspace, undefined, updatedHead);
+
+    expect(confirmed.baseUpdate).toBeUndefined();
+    expect(await git(origin, "rev-list", "--parents", "-n", "1", updatedHead)).toBe(`${updatedHead} ${rebasedHead} ${targetHead}`);
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(updatedHead);
+    expect(await git(origin, "show", `${updatedHead}:README.md`)).toBe("New target work\nPublished issue work");
+    expect(await git(origin, "show", `${updatedHead}:later.txt`)).toBe("Later target work");
+    expect((await ownership(workspace.id)).value.baseUpdate).toEqual({
+      expectedHeadSha: rebasedHead, baseBranch: "main", targetHeadSha: targetHead, headSha: updatedHead,
+    });
+  });
+
+  it.each(["without restart", "after sync restart", "after interrupted sync"])("rebases and publishes a restored issue branch onto a new conflicting target %s", async recovery => {
+    const deps = dependencies();
+    const executeGit = deps.git!;
+    runtime = new ForgeRuntime(deps);
+    const { workspace, publishedHead, rebasedHead } = await rebasedIssue();
+    await runtime.publishBranch(workspace, undefined, rebasedHead, publishedHead);
+    await git(workspace.worktreePath, "push", `--force-with-lease=refs/heads/${workspace.branch}:${rebasedHead}`,
+      origin, `${publishedHead}:refs/heads/${workspace.branch}`);
+
+    if (recovery === "after interrupted sync") {
+      deps.git = async (...args) => {
+        const result = await executeGit(...args);
+        if (args[1][0] === "reset") throw new Error("Synchronization result was lost");
+        return result;
+      };
+      await expect(runtime.syncPublishedBranch(workspace, rebasedHead, publishedHead)).rejects.toThrow("result was lost");
+      deps.git = executeGit;
+      runtime = new ForgeRuntime(deps);
+      await runtime.recover(workspace.id);
+    }
+    await runtime.syncPublishedBranch(workspace, rebasedHead, publishedHead);
+    if (recovery === "after sync restart") {
+      runtime = new ForgeRuntime(deps);
+      await runtime.recover(workspace.id);
+    }
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(publishedHead);
+    expect(await git(workspace.worktreePath, "rev-parse", `refs/cloudx/before-sync/${rebasedHead}`)).toBe(rebasedHead);
+    const laterTarget = await advanceTarget("README.md", "Later target work\n");
+    await expect(git(origin, "merge-tree", "--write-tree", publishedHead, laterTarget)).rejects.toMatchObject({ code: 1 });
+
+    expect(await runtime.prepareIssueRebase(workspace, publishedHead, "main")).toEqual({
+      originalHeadSha: publishedHead, targetHeadSha: laterTarget,
+    });
+    expect((await ownership(workspace.id)).value.issueRebase).toEqual({
+      expectedHeadSha: publishedHead, originalHeadSha: publishedHead, targetHeadSha: laterTarget, baseBranch: "main",
+    });
+    await expect(git(workspace.worktreePath, "rebase", "--rebase-merges", laterTarget)).rejects.toMatchObject({ code: 1 });
+    await fs.writeFile(path.join(workspace.worktreePath, "README.md"), "Later target work\nPublished issue work\n");
+    await git(workspace.worktreePath, "add", "README.md");
+    await git(workspace.worktreePath, "-c", "core.editor=true", "rebase", "--continue");
+    const nextHead = await runtime.completeIssueRebase(workspace, { expectedHeadSha: publishedHead, targetHeadSha: laterTarget });
+    deps.git = vi.fn(executeGit);
+
+    expect(await runtime.publishBranch(workspace, undefined, nextHead, publishedHead)).toBe(nextHead);
+
+    expect(vi.mocked(deps.git).mock.calls.filter(([, args]) => args[0] === "push").map(([, args]) => args)).toEqual([
+      ["push", `--force-with-lease=refs/heads/${workspace.branch}:${publishedHead}`, "https://github.com/cloudx/test.git", `${nextHead}:refs/heads/${workspace.branch}`],
+    ]);
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(nextHead);
+    expect(await git(origin, "rev-list", "--parents", "-n", "1", nextHead)).toBe(`${nextHead} ${laterTarget}`);
+    expect(await git(origin, "show", `${nextHead}:README.md`)).toBe("Later target work\nPublished issue work");
+    expect((await ownership(workspace.id)).value.issueRebase.publication).toEqual({
+      headSha: nextHead, expectedRemoteHeadSha: publishedHead, confirmed: true,
+    });
+  });
+
+  it.each(["unfinished resolution", "unpublished resolution", "uncertain publication"])("preserves an %s when branch synchronization is requested after restart", async condition => {
+    const deps = dependencies();
+    const executeGit = deps.git!;
+    runtime = new ForgeRuntime(deps);
+    const { workspace, publishedHead } = await publishedIssue(true);
+    const targetHead = await advanceTarget("README.md");
+    await runtime.prepareIssueRebase(workspace, publishedHead, "main");
+    if (condition === "unfinished resolution") {
+      await expect(git(workspace.worktreePath, "rebase", "--rebase-merges", targetHead)).rejects.toMatchObject({ code: 1 });
+      await fs.writeFile(path.join(workspace.worktreePath, "notes.txt"), "Preserve resolution notes\n");
+    } else {
+      await resolveContentRebase(workspace, targetHead);
+      const rebasedHead = await runtime.completeIssueRebase(workspace, { expectedHeadSha: publishedHead, targetHeadSha: targetHead });
+      if (condition === "uncertain publication") {
+        deps.git = async (...args) => {
+          const result = await executeGit(...args);
+          if (args[1][0] === "push") throw new Error("The push response was lost");
+          return result;
+        };
+        await expect(runtime.publishBranch(workspace, undefined, rebasedHead, publishedHead)).rejects.toThrow("push response was lost");
+      }
+    }
+    const localHead = await git(workspace.worktreePath, "rev-parse", "HEAD");
+    const localStatus = await git(workspace.worktreePath, "status", "--porcelain");
+    const remoteHead = await git(origin, "rev-parse", workspace.branch);
+    const savedRecovery = (await ownership(workspace.id)).value.issueRebase;
+    deps.git = vi.fn(executeGit);
+    runtime = new ForgeRuntime(deps);
+    await runtime.recover(workspace.id);
+
+    await expect(runtime.syncPublishedBranch(workspace, localHead, remoteHead)).rejects.toThrow("Resume the unfinished rebase");
+
+    expect(vi.mocked(deps.git).mock.calls.some(([, args]) => ["fetch", "push", "reset"].includes(args[0]!))).toBe(false);
+    expect((await ownership(workspace.id)).value.issueRebase).toEqual(savedRecovery);
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(localHead);
+    expect(await git(workspace.worktreePath, "status", "--porcelain")).toBe(localStatus);
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(remoteHead);
+    if (condition === "unfinished resolution")
+      expect(await fs.readFile(path.join(workspace.worktreePath, "notes.txt"), "utf8")).toBe("Preserve resolution notes\n");
+  });
+
+  it("preserves a later conflicting update when reconfirming an already published rebase", async () => {
+    const { workspace, publishedHead, rebasedHead } = await rebasedIssue();
+    await runtime.publishBranch(workspace, undefined, rebasedHead, publishedHead);
+    const targetHead = await advanceTarget("README.md", "The target changed again\n");
+    await expect(runtime.updateIssueBranch(workspace, rebasedHead, "main")).rejects.toMatchObject({
+      name: "ForgeBranchConflictError", targetHeadSha: targetHead,
+    });
+    const savedUpdate = (await ownership(workspace.id)).value.baseUpdate;
+
+    expect(await runtime.publishBranch(workspace, undefined, rebasedHead, publishedHead)).toBe(rebasedHead);
+
+    expect((await ownership(workspace.id)).value.baseUpdate).toEqual(savedUpdate);
+  });
+
+  it("rejects stale conflicts without replacing a confirmed recovery and can prepare a later target", async () => {
+    const { workspace, publishedHead, rebasedHead } = await rebasedIssue();
+    await runtime.publishBranch(workspace, undefined, rebasedHead, publishedHead);
+    const savedRecovery = (await ownership(workspace.id)).value.issueRebase;
+
+    await expect(runtime.prepareIssueRebase(workspace, rebasedHead, "main")).rejects.toThrow("target is already included");
+    expect((await ownership(workspace.id)).value.issueRebase).toEqual(savedRecovery);
+
+    const laterTarget = await advanceTarget("README.md", "The target changed again\n");
+    expect(await runtime.prepareIssueRebase(workspace, rebasedHead, "main")).toEqual({
+      originalHeadSha: rebasedHead, targetHeadSha: laterTarget,
+    });
+    expect((await ownership(workspace.id)).value.issueRebase).toEqual({
+      expectedHeadSha: rebasedHead, originalHeadSha: rebasedHead, targetHeadSha: laterTarget, baseBranch: "main",
+    });
+  });
+
+  it("detects rename/delete conflicts and retains the worker's explicit resolution", async () => {
+    const workspace = await prepare();
+    await git(workspace.worktreePath, "mv", "README.md", "renamed.md");
+    await git(workspace.worktreePath, "commit", "-m", "TEST: rename the issue document");
+    const publishedHead = await runtime.publishBranch(workspace);
+    await git(repositoryPath, "rm", "README.md");
+    await git(repositoryPath, "commit", "-m", "TEST: remove the target document");
+    await git(repositoryPath, "push", "origin", "main");
+    const targetHead = await git(repositoryPath, "rev-parse", "HEAD");
+
+    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toMatchObject({ name: "ForgeBranchConflictError", targetHeadSha: targetHead });
+    expect(await git(workspace.worktreePath, "status", "--porcelain")).toBe("");
+    await runtime.prepareIssueRebase(workspace, publishedHead, "main");
+    await expect(git(workspace.worktreePath, "rebase", "--rebase-merges", targetHead)).rejects.toThrow();
+    await git(workspace.worktreePath, "add", "renamed.md");
+    await git(workspace.worktreePath, "-c", "core.editor=true", "rebase", "--continue");
+    const nextHead = await runtime.completeIssueRebase(workspace, { expectedHeadSha: publishedHead, targetHeadSha: targetHead });
+    await runtime.publishBranch(workspace, undefined, nextHead, publishedHead);
+
+    expect(await git(origin, "ls-tree", "--name-only", nextHead)).toContain("renamed.md");
+    expect(await git(origin, "ls-tree", "--name-only", nextHead)).not.toContain("README.md");
+  });
+
+  it("preserves issue and target work when rebasing a branch containing a previous target-update merge", async () => {
+    const { workspace, publishedHead } = await publishedIssue(true);
+    await advanceTarget("retained-target.txt", "Retained earlier target changes\n");
+    const mergeHead = await runtime.updateIssueBranch(workspace, publishedHead, "main");
+    await runtime.publishBranch(workspace, undefined, mergeHead);
+    const targetHead = await advanceTarget("README.md");
+    await expect(runtime.updateIssueBranch(workspace, mergeHead, "main")).rejects.toBeInstanceOf(ForgeBranchConflictError);
+    await runtime.prepareIssueRebase(workspace, mergeHead, "main");
+    await resolveContentRebase(workspace, targetHead);
+    const nextHead = await runtime.completeIssueRebase(workspace, { expectedHeadSha: mergeHead, targetHeadSha: targetHead });
+    await runtime.publishBranch(workspace, undefined, nextHead, mergeHead);
+
+    expect(await git(origin, "show", `${nextHead}:retained-target.txt`)).toBe("Retained earlier target changes");
+    expect(await git(origin, "show", `${nextHead}:README.md`)).toBe("New target work\nPublished issue work");
+    expect(await git(workspace.worktreePath, "rev-parse", `refs/cloudx/before-rebase/${mergeHead}`)).toBe(mergeHead);
+  });
+
+  it("keeps the prior merge resolution available for a worker to preserve while rebasing", async () => {
+    const { workspace } = await publishedIssue(true);
+    await advanceTarget("README.md", "Earlier target work\n");
+    await git(workspace.worktreePath, "fetch", origin, "main");
+    await expect(git(workspace.worktreePath, "merge", "FETCH_HEAD")).rejects.toThrow();
+    await fs.writeFile(path.join(workspace.worktreePath, "README.md"), "Earlier target work\nPublished issue work\n");
+    await fs.writeFile(path.join(workspace.worktreePath, "manual-resolution.txt"), "Necessary change made while resolving the prior merge\n");
+    await git(workspace.worktreePath, "add", ".");
+    await git(workspace.worktreePath, "commit", "-m", "TEST: preserve the manually resolved target update");
+    const mergeHead = await runtime.publishBranch(workspace);
+    const targetHead = await advanceTarget("README.md");
+    await runtime.prepareIssueRebase(workspace, mergeHead, "main");
+    const intendedResolution = await git(workspace.worktreePath, "show", `refs/cloudx/before-rebase/${mergeHead}:manual-resolution.txt`);
+
+    await resolveContentRebase(workspace, targetHead);
+    await fs.writeFile(path.join(workspace.worktreePath, "manual-resolution.txt"), `${intendedResolution}\n`);
+    await git(workspace.worktreePath, "add", "manual-resolution.txt");
+    await git(workspace.worktreePath, "commit", "--allow-empty", "-m", "TEST: preserve prior manual merge resolution after rebase");
+    const nextHead = await runtime.completeIssueRebase(workspace, { expectedHeadSha: mergeHead, targetHeadSha: targetHead });
+    await runtime.publishBranch(workspace, undefined, nextHead, mergeHead);
+
+    expect(await git(origin, "show", `${nextHead}:manual-resolution.txt`)).toBe(intendedResolution);
+    expect(await git(origin, "show", `${nextHead}:README.md`)).toBe("New target work\nPublished issue work");
+  });
+
+  it("preserves unpublished commits and dirty files while preparing the coding worker", async () => {
+    const { workspace, publishedHead } = await publishedIssue(true);
+    await git(workspace.worktreePath, "commit", "--allow-empty", "-m", "TEST: retained unpublished commit");
+    const localHead = await git(workspace.worktreePath, "rev-parse", "HEAD");
+    await fs.writeFile(path.join(workspace.worktreePath, "notes.txt"), "Retained dirty work\n");
+    const targetHead = await advanceTarget("README.md");
+    const beforeStatus = await git(workspace.worktreePath, "status", "--porcelain");
+
+    expect(await runtime.prepareIssueRebase(workspace, publishedHead, "main")).toEqual({ originalHeadSha: localHead, targetHeadSha: targetHead });
+
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(localHead);
+    expect(await git(workspace.worktreePath, "status", "--porcelain")).toBe(beforeStatus);
+    expect(await fs.readFile(path.join(workspace.worktreePath, "notes.txt"), "utf8")).toBe("Retained dirty work\n");
+    expect(await git(workspace.worktreePath, "rev-parse", `refs/cloudx/before-rebase/${localHead}`)).toBe(localHead);
+    await git(workspace.worktreePath, "add", "notes.txt");
+    await git(workspace.worktreePath, "commit", "-m", "TEST: retain dirty work before rebase");
+    await resolveContentRebase(workspace, targetHead);
+    const nextHead = await runtime.completeIssueRebase(workspace, { expectedHeadSha: publishedHead, targetHeadSha: targetHead });
+    expect(await git(workspace.worktreePath, "show", `${nextHead}:notes.txt`)).toBe("Retained dirty work");
+    expect(await git(workspace.worktreePath, "log", "--format=%s", `${targetHead}..${nextHead}`)).toContain("retained unpublished commit");
+  });
+
+  it("resumes an interrupted rebase on its detached head and original target after restart", async () => {
+    const { workspace, publishedHead } = await publishedIssue(true);
+    const targetHead = await advanceTarget("README.md");
+    await runtime.prepareIssueRebase(workspace, publishedHead, "main");
+    await expect(git(workspace.worktreePath, "rebase", "--rebase-merges", targetHead)).rejects.toThrow();
+    await fs.writeFile(path.join(workspace.worktreePath, "README.md"), "Resolution still being edited\n");
+    const beforeStatus = await git(workspace.worktreePath, "status", "--porcelain");
+    await advanceTarget("later-target.txt", "Target advanced during the resolution\n");
+    runtime = new ForgeRuntime(dependencies());
+
+    expect(await runtime.recover(workspace.id)).toEqual({ workspace, tabIds: [] });
+    expect(await runtime.prepareIssueRebase(workspace, publishedHead, "main")).toEqual({ originalHeadSha: publishedHead, targetHeadSha: targetHead });
+
+    expect(await git(workspace.worktreePath, "rev-parse", "--abbrev-ref", "HEAD")).toBe("HEAD");
+    expect(await git(workspace.worktreePath, "status", "--porcelain")).toBe(beforeStatus);
+    expect(await fs.readFile(path.join(workspace.worktreePath, "README.md"), "utf8")).toBe("Resolution still being edited\n");
+    await expect(runtime.completeIssueRebase(workspace, { expectedHeadSha: publishedHead, targetHeadSha: targetHead })).rejects.toThrow("Git operation is already in progress");
+  });
+
+  it.each([false, true])("recovers a coding-worker handoff interrupted after preparation with detached rebase %s", async detached => {
+    const { workspace, publishedHead } = await publishedIssue(true);
+    const targetHead = await advanceTarget("README.md");
+    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toBeInstanceOf(ForgeBranchConflictError);
+    await runtime.prepareIssueRebase(workspace, publishedHead, "main");
+    if (detached) await expect(git(workspace.worktreePath, "rebase", "--rebase-merges", targetHead)).rejects.toThrow();
+    await fs.writeFile(path.join(workspace.worktreePath, "notes.txt"), "Preserved interrupted work\n");
+    const beforeStatus = await git(workspace.worktreePath, "status", "--porcelain");
+    const beforeHead = await git(workspace.worktreePath, "rev-parse", "HEAD");
+    await advanceTarget("later-target.txt", "Later target work\n");
+    runtime = new ForgeRuntime(dependencies());
+
+    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toMatchObject({
+      name: "ForgeBranchConflictError", targetHeadSha: targetHead,
+    });
+    expect(await runtime.prepareIssueRebase(workspace, publishedHead, "main")).toEqual({ originalHeadSha: publishedHead, targetHeadSha: targetHead });
+
+    expect(await git(workspace.worktreePath, "status", "--porcelain")).toBe(beforeStatus);
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(beforeHead);
+    expect(await fs.readFile(path.join(workspace.worktreePath, "notes.txt"), "utf8")).toBe("Preserved interrupted work\n");
+    await expect(runtime.updateIssueBranch(workspace, headSha, "main")).rejects.toThrow("Resume the unfinished rebase");
+  });
+
+  it.each(["unrelated merge", "unrelated rebase", "cancelled"])("preserves local state when rebase preparation is %s", async condition => {
+    const { workspace, publishedHead } = await publishedIssue(true);
+    const targetHead = await advanceTarget("README.md");
+    if (condition === "unrelated merge") {
+      await git(workspace.worktreePath, "fetch", origin, "main");
+      await expect(git(workspace.worktreePath, "merge", "FETCH_HEAD")).rejects.toThrow();
+    }
+    if (condition === "unrelated rebase") {
+      await git(workspace.worktreePath, "fetch", origin, "main");
+      await expect(git(workspace.worktreePath, "rebase", targetHead)).rejects.toThrow();
+    }
+    const beforeStatus = await git(workspace.worktreePath, "status", "--porcelain");
+    const beforeHead = await git(workspace.worktreePath, "rev-parse", "HEAD");
+    const controller = new AbortController();
+    if (condition === "cancelled") controller.abort(new Error("Rebase cancelled"));
+
+    await expect(runtime.prepareIssueRebase(workspace, publishedHead, "main", controller.signal)).rejects.toThrow();
+
+    expect(await git(workspace.worktreePath, "status", "--porcelain")).toBe(beforeStatus);
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(beforeHead);
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(publishedHead);
+  });
+
+  it("requires a completed rebase instead of accepting a new merge of the old issue head", async () => {
+    const { workspace, publishedHead } = await publishedIssue(true);
+    const targetHead = await advanceTarget("README.md");
+    await runtime.prepareIssueRebase(workspace, publishedHead, "main");
+    await expect(git(workspace.worktreePath, "merge", targetHead)).rejects.toThrow();
+    await fs.writeFile(path.join(workspace.worktreePath, "README.md"), "New target work\nPublished issue work\n");
+    await git(workspace.worktreePath, "add", "README.md");
+    await git(workspace.worktreePath, "commit", "-m", "TEST: merge instead of rebase");
+
+    await expect(runtime.completeIssueRebase(workspace, { expectedHeadSha: publishedHead, targetHeadSha: targetHead }))
+      .rejects.toThrow("has not rebased the original issue commits");
+
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(publishedHead);
+    expect((await ownership(workspace.id)).value.issueRebase.headSha).toBeUndefined();
+  });
+
+  it("launches a replacement worker in the preserved detached rebase and blocks completion while it runs", async () => {
+    const deps = dependencies();
+    runtime = new ForgeRuntime(deps);
+    const { workspace, publishedHead } = await publishedIssue(true);
+    const targetHead = await advanceTarget("README.md");
+    await runtime.prepareIssueRebase(workspace, publishedHead, "main");
+    await expect(git(workspace.worktreePath, "rebase", "--rebase-merges", targetHead)).rejects.toThrow();
+    const tab = workerTab(workspace);
+    vi.mocked(deps.workspaceCommands.createTab).mockResolvedValue({ tab } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>);
+    vi.mocked(deps.sessions.getTab).mockReturnValue(tab);
+    runtime = new ForgeRuntime(deps);
+
+    expect(await runtime.launch({
+      id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel,
+      prompt: "Resume the preserved rebase", windowId: "window", paneId: "pane",
+    })).toBe(tab.id);
+    await expect(runtime.completeIssueRebase(workspace, { expectedHeadSha: publishedHead, targetHeadSha: targetHead })).rejects.toThrow("Stop the worker process");
+
+    expect(await git(workspace.worktreePath, "status", "--porcelain")).toContain("UU README.md");
+    await runtime.pause(tab.id);
+    await runtime.close(tab.id);
+  });
+
+  it.each(["dirty", "wrong target", "changed completed head"])("refuses a rebase completion with %s", async condition => {
+    const { workspace, publishedHead, targetHead, rebasedHead } = await rebasedIssue();
+    if (condition === "dirty") await fs.writeFile(path.join(workspace.worktreePath, "notes.txt"), "Retain this work");
+    if (condition === "changed completed head") await git(workspace.worktreePath, "commit", "--allow-empty", "-m", "TEST: concurrent completion");
+
+    await expect(runtime.completeIssueRebase(workspace, {
+      expectedHeadSha: publishedHead, targetHeadSha: condition === "wrong target" ? headSha : targetHead,
+    })).rejects.toThrow();
+
+    expect((await ownership(workspace.id)).value.issueRebase.headSha).toBe(rebasedHead);
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(publishedHead);
+  });
+
+  it("rejects a lease when the remote changes after the final observation", async () => {
+    const deps = dependencies();
+    const run = deps.git!;
+    runtime = new ForgeRuntime(deps);
+    const { workspace, publishedHead, rebasedHead } = await rebasedIssue();
+    const remoteHead = await advanceTarget("concurrent.txt", "Concurrent remote work\n");
+    deps.git = async (cwd, args, signal, env) => {
+      if (args[0] === "push") await git(repositoryPath, "push", "--force", "origin", `${remoteHead}:refs/heads/${workspace.branch}`);
+      return run(cwd, args, signal, env);
+    };
+
+    await expect(runtime.publishBranch(workspace, undefined, rebasedHead, publishedHead)).rejects.toThrow();
+
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(remoteHead);
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(rebasedHead);
+    expect((await ownership(workspace.id)).value.issueRebase.publication.confirmed).toBe(false);
+    deps.git = run;
+    await expect(runtime.publishBranch(workspace, undefined, rebasedHead, publishedHead)).rejects.toThrow("exact-head lease was rejected");
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(remoteHead);
+  });
+
+  it.each([false, true])("reconciles a successful uncertain push after restart with pending process ownership %s", async pending => {
+    const deps = dependencies();
+    const run = deps.git!;
+    runtime = new ForgeRuntime(deps);
+    const { workspace, publishedHead, rebasedHead } = await rebasedIssue();
+    deps.git = async (...args) => {
+      const output = await run(...args);
+      if (args[1][0] === "push") throw new Error("The push response was lost");
+      return output;
+    };
+    await expect(runtime.publishBranch(workspace, undefined, rebasedHead, publishedHead)).rejects.toThrow("push response was lost");
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(rebasedHead);
+    expect((await ownership(workspace.id)).value.issueRebase.publication.confirmed).toBe(false);
+    if (pending) {
+      const manifest = await ownership(workspace.id);
+      manifest.value.gitPending = true;
+      await fs.writeFile(manifest.file, JSON.stringify(manifest.value));
+    }
+    deps.git = vi.fn(run);
+    runtime = new ForgeRuntime(deps);
+
+    await runtime.recover(workspace.id);
+    expect(await runtime.publishBranch(workspace, undefined, rebasedHead, publishedHead)).toBe(rebasedHead);
+
+    expect(vi.mocked(deps.git).mock.calls.some(([, args]) => args[0] === "push")).toBe(false);
+    expect((await ownership(workspace.id)).value.issueRebase.publication.confirmed).toBe(true);
+    expect((await ownership(workspace.id)).value.gitPending).toBe(false);
+    const confirmed = (await ownership(workspace.id)).value;
+    runtime = new ForgeRuntime(deps);
+    await runtime.recover(workspace.id);
+    const targetHead = await advanceTarget("later.txt", "Later target work\n");
+
+    const updatedHead = await runtime.updateIssueBranch(workspace, rebasedHead, "main");
+
+    expect(confirmed.baseUpdate).toBeUndefined();
+    expect(await git(workspace.worktreePath, "rev-list", "--parents", "-n", "1", updatedHead)).toBe(`${updatedHead} ${rebasedHead} ${targetHead}`);
+  });
+
+  it("preserves an uncertain push that has no confirmed remote result and blocks another write", async () => {
+    const deps = dependencies();
+    const run = deps.git!;
+    runtime = new ForgeRuntime(deps);
+    const { workspace, publishedHead, rebasedHead } = await rebasedIssue();
+    deps.git = async (...args) => {
+      if (args[1][0] === "push") throw new Error("Push process ownership was lost");
+      return run(...args);
+    };
+    await expect(runtime.publishBranch(workspace, undefined, rebasedHead, publishedHead)).rejects.toThrow("process ownership was lost");
+    const manifest = await ownership(workspace.id);
+    manifest.value.gitPending = true;
+    await fs.writeFile(manifest.file, JSON.stringify(manifest.value));
+    deps.git = vi.fn(run);
+    runtime = new ForgeRuntime(deps);
+
+    await expect(runtime.recover(workspace.id)).rejects.toThrow("publication remains uncertain");
+    await expect(runtime.publishBranch(workspace, undefined, rebasedHead, publishedHead)).rejects.toThrow("publication remains uncertain");
+
+    expect(vi.mocked(deps.git).mock.calls.some(([, args]) => args[0] === "push")).toBe(false);
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(publishedHead);
+    expect((await ownership(workspace.id)).value.gitPending).toBe(true);
+  });
+
+  it("retains publication intent on cancellation and confirms the already published head on resume", async () => {
+    const deps = dependencies();
+    const run = deps.git!;
+    runtime = new ForgeRuntime(deps);
+    const { workspace, publishedHead, rebasedHead } = await rebasedIssue();
+    const controller = new AbortController();
+    deps.git = async (...args) => {
+      const result = await run(...args);
+      if (args[1][0] === "push") {
+        controller.abort(new Error("Publication cancelled"));
+        controller.signal.throwIfAborted();
+      }
+      return result;
+    };
+
+    await expect(runtime.publishBranch(workspace, controller.signal, rebasedHead, publishedHead)).rejects.toThrow("Publication cancelled");
+
+    expect((await ownership(workspace.id)).value.issueRebase.publication.confirmed).toBe(false);
+    deps.git = run;
+    runtime = new ForgeRuntime(deps);
+    expect(await runtime.publishBranch(workspace, undefined, rebasedHead, publishedHead)).toBe(rebasedHead);
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(rebasedHead);
   });
 
   it("rejects a changed head whose update result was never recorded", async () => {

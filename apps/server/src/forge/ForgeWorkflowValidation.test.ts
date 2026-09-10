@@ -69,6 +69,112 @@ describe("Issue completion reports", () => {
   });
 });
 
+describe("Rebase completion reports", () => {
+  const rebase = { outcome: "resolved", validation: "passed", details: "Resolved both edits and ran the affected tests." };
+
+  it.each([
+    { outcome: "resolved", validation: "passed" },
+    { outcome: "resolved", validation: "failed" },
+    { outcome: "blocked", validation: "passed" },
+    { outcome: "blocked", validation: "failed" },
+    { details: "d".repeat(100_000) },
+  ])("preserves the reported resolution and validation for the workflow decision %#", result => {
+    const completed = { ...report, rebase: { ...rebase, ...result } };
+    expect(parseWorkerReport(completed)).toEqual(completed);
+    expect(parseWorkers([{ ...worker, pendingPublication: { report: completed, repliedDiscussionIds: [] } }])[0].pendingPublication!.report).toEqual(completed);
+  });
+
+  it.each([
+    null, [], "resolved", {},
+    { ...rebase, outcome: undefined }, { ...rebase, outcome: ["resolved"] },
+    { ...rebase, outcome: "complete" }, { ...rebase, outcome: true },
+    { ...rebase, validation: undefined }, { ...rebase, validation: ["passed"] },
+    { ...rebase, validation: "unknown" }, { ...rebase, validation: true },
+    { ...rebase, details: undefined }, { ...rebase, details: 7 },
+    { ...rebase, details: " \n" }, { ...rebase, details: "d".repeat(100_001) },
+  ])("rejects malformed live and saved resolution evidence %#", rebase => {
+    const completed = { ...report, rebase };
+    expect(() => parseWorkerReport(completed)).toThrow();
+    expect(() => parseWorkers([{ ...worker, pendingPublication: { report: completed, repliedDiscussionIds: [] } }])).toThrow();
+  });
+
+  it("rejects rebase results submitted by a review worker", () => {
+    expect(() => parseWorkerReport({ kind: "review", headSha, event: "comment", body: "Review", comments: [], rebase })).toThrow(/issue/);
+  });
+});
+
+describe("Saved rebase recovery", () => {
+  const resultHeadSha = "b".repeat(40);
+  const recovery: NonNullable<ForgeWorker["rebaseRecovery"]> = {
+    branch: "cloudx/forge/worker", baseBranch: "main",
+    expectedHeadSha: headSha, originalHeadSha: "c".repeat(40), targetHeadSha: "d".repeat(40), phase: "resolving",
+  };
+  const recovering = {
+    ...worker, changeNumber: 12, headSha,
+    repositoryPath: "/owned/repository", worktreePath: "/owned/checkout", branch: recovery.branch,
+    rebaseRecovery: recovery,
+  };
+
+  it.each([
+    { phase: "resolving" },
+    { phase: "publishing", headSha: resultHeadSha },
+    { phase: "reviewing", headSha: resultHeadSha },
+  ])("round-trips the published lease, unpublished original work, target and recovery progress %#", progress => {
+    const saved = { ...recovering, rebaseRecovery: { ...recovery, ...progress } };
+    const [parsed] = parseWorkers([saved]);
+    expect(parsed).toEqual(saved);
+    expect(parsed.rebaseRecovery).not.toBe(saved.rebaseRecovery);
+  });
+
+  it.each(["publishing", "reviewing"])("accepts the confirmed result as the worker head while %s", phase => {
+    const saved = { ...recovering, headSha: resultHeadSha, rebaseRecovery: { ...recovery, phase, headSha: resultHeadSha } };
+    expect(parseWorkers([saved])).toEqual([saved]);
+  });
+
+  it("accepts exact SHA-256 commits and preserves their spelling", () => {
+    const saved = { ...recovering, headSha: "A".repeat(64), rebaseRecovery: {
+      ...recovery, expectedHeadSha: "A".repeat(64), originalHeadSha: "B".repeat(64), targetHeadSha: "C".repeat(64),
+      phase: "publishing", headSha: "D".repeat(64),
+    } };
+    expect(parseWorkers([saved])).toEqual([saved]);
+  });
+
+  it.each(["expectedHeadSha", "originalHeadSha", "targetHeadSha", "headSha"])("rejects inexact or malformed %s commits", field => {
+    for (const invalid of [null, 7, "", "a".repeat(39), "a".repeat(41), "a".repeat(63), "a".repeat(65), `${headSha}\n`, `${"a".repeat(63)}\n`, "g".repeat(40)]) {
+      expect(() => parseWorkers([{ ...recovering, rebaseRecovery: {
+        ...recovery, phase: "publishing", headSha: resultHeadSha, [field]: invalid,
+      } }]), `invalid ${field}: ${JSON.stringify(invalid)}`).toThrow(/rebase/);
+    }
+  });
+
+  it.each([
+    null, [], "resolving", {},
+    { ...recovery, expectedHeadSha: undefined }, { ...recovery, originalHeadSha: undefined },
+    { ...recovery, targetHeadSha: undefined },
+    { ...recovery, branch: undefined }, { ...recovery, branch: " " },
+    { ...recovery, branch: "different" }, { ...recovery, branch: "b".repeat(1025) },
+    { ...recovery, baseBranch: undefined }, { ...recovery, baseBranch: " " },
+    { ...recovery, baseBranch: "different" }, { ...recovery, baseBranch: "b".repeat(1025) },
+    { ...recovery, phase: undefined }, { ...recovery, phase: "complete" },
+    { ...recovery, phase: ["resolving"] }, { ...recovery, headSha: resultHeadSha },
+    { ...recovery, phase: "publishing" }, { ...recovery, phase: "reviewing" },
+    { ...recovery, phase: "publishing", headSha },
+    { ...recovery, phase: "reviewing", headSha: headSha.toUpperCase() },
+  ])("rejects a malformed recovery checkpoint %#", rebaseRecovery => {
+    expect(() => parseWorkers([{ ...recovering, rebaseRecovery }])).toThrow();
+  });
+
+  it.each([
+    { kind: "review" }, { changeNumber: undefined },
+    { repositoryPath: undefined }, { repositoryPath: " " },
+    { worktreePath: undefined }, { worktreePath: " " },
+    { branch: undefined }, { branch: "different" }, { baseBranch: "different" },
+    { headSha: undefined }, { headSha: "unverified" }, { headSha: resultHeadSha },
+  ])("rejects recovery detached from its owned issue and observed published commit %#", invalid => {
+    expect(() => parseWorkers([{ ...recovering, ...invalid }])).toThrow(/rebase recovery/i);
+  });
+});
+
 describe("Saved provider retry deadlines", () => {
   const scheduled = { ...worker, autoReview, providerRetryAt: "2026-09-10T18:00:00.000Z" };
   it("preserves a canonical provider retry deadline", () => {

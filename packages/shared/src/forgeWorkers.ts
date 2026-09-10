@@ -19,6 +19,11 @@ export interface ForgeIssueCompletionReport {
   body: string;
   resolvedDiscussionIds: string[];
   discussionReplies: Array<{ discussionId: string; body: string }>;
+  rebase?: {
+    outcome: "resolved" | "blocked";
+    validation: "passed" | "failed";
+    details: string;
+  };
 }
 export interface ForgeWorker {
   id: string;
@@ -35,6 +40,15 @@ export interface ForgeWorker {
   tabId?: string;
   attemptId?: string;
   publicationState?: "creating" | "uncertain" | "created";
+  rebaseRecovery?: {
+    branch: string;
+    baseBranch: string;
+    expectedHeadSha: string;
+    originalHeadSha: string;
+    targetHeadSha: string;
+    phase: "resolving" | "publishing" | "reviewing";
+    headSha?: string;
+  };
   pendingPublication?: {
     report: ForgeIssueCompletionReport;
     baseUpdate?: {

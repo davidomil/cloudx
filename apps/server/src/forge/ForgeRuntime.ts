@@ -77,6 +77,22 @@ interface OwnedBaseUpdate {
   headSha?: string;
 }
 
+interface OwnedIssueRebase {
+  expectedHeadSha: string;
+  originalHeadSha: string;
+  targetHeadSha: string;
+  baseBranch: string;
+  headSha?: string;
+  publication?: { headSha: string; expectedRemoteHeadSha: string; confirmed: boolean };
+}
+
+export class ForgeBranchConflictError extends Error {
+  constructor(readonly targetHeadSha: string) {
+    super("The target branch merge has conflicts. A coding worker must rebase and resolve the preserved issue work.");
+    this.name = "ForgeBranchConflictError";
+  }
+}
+
 interface OwnedReviewRefresh {
   headSha: string;
   baseSha: string;
@@ -99,6 +115,7 @@ interface OwnedWorkspace extends ForgeWorkspace {
   prepared: boolean;
   launchPending: boolean;
   baseUpdate?: OwnedBaseUpdate;
+  issueRebase?: OwnedIssueRebase;
   publishedSync?: OwnedPublishedSync;
   reviewBaseSha?: string;
   reviewRefresh?: OwnedReviewRefresh;
@@ -431,6 +448,11 @@ export class ForgeRuntime {
       if (owned.reviewRefresh || await this.requireCleanReviewHead(owned, signal) !== owned.baseCommit || await this.reviewBase(owned, signal) !== owned.reviewBaseSha)
         throw new Error("Refresh the reviewer checkout to its exact comparison before launching it.");
     }
+    if (owned.role === "worker" && owned.issueRebase) {
+      await this.assertQuiescent(owned);
+      await this.assertCheckout(owned);
+      await this.verifyRebaseRecovery(owned, owned.issueRebase, signal);
+    }
     this.dependencies.pathPolicy.resolve(owned.worktreePath);
     const catalog = await this.dependencies.rulesSkills.list();
     if (!catalog.templates.some((template) => template.id === input.templateId))
@@ -577,6 +599,8 @@ export class ForgeRuntime {
     return this.serialize(id, async () => {
       const stored = await this.manifest(id).read<OwnedWorkspace>();
       const owned = stored ? await this.readOwned(id) : undefined;
+      if (owned && !owned.cleaned && owned.gitPending && owned.issueRebase?.publication && !owned.issueRebase.publication.confirmed)
+        await this.reconcilePendingRebasePush(owned);
       if (owned && !owned.cleaned && owned.gitPending)
         throw new Error(
           "A worker Git operation was interrupted before process exit was recorded. Its checkout was preserved.",
@@ -650,11 +674,17 @@ export class ForgeRuntime {
     workspace: ForgeWorkspace,
     signal?: AbortSignal,
     expectedHeadSha?: string,
+    expectedRemoteHeadSha?: string,
   ): Promise<string> {
     return this.serialize(workspace.id, async () => {
+      signal?.throwIfAborted();
       const owned = await this.matchOwned(workspace);
+      if (expectedRemoteHeadSha !== undefined)
+        return this.publishRebasedBranch(owned, expectedHeadSha, expectedRemoteHeadSha, signal);
       if (!owned.branchOwned || !owned.branch || owned.cleaned)
         throw new Error("Only an owned issue branch can be published.");
+      if (owned.issueRebase && !owned.issueRebase.publication?.confirmed)
+        throw new Error("Publish the recorded rebase through its exact-head lease before publishing other work.");
       await this.assertQuiescent(owned);
       await this.assertCheckout(owned);
       const headSha = await this.requireBranchHead(owned, signal);
@@ -694,6 +724,8 @@ export class ForgeRuntime {
       const owned = await this.matchOwned(workspace);
       if (!owned.prepared || !owned.branchOwned || !owned.branch || owned.cleaned || owned.launchPending)
         throw new Error("Only an idle owned issue branch can be synchronized.");
+      if (owned.issueRebase && !owned.issueRebase.publication?.confirmed)
+        throw new Error("Resume the unfinished rebase before synchronizing its branch.");
       await this.assertQuiescent(owned);
       await this.assertCheckout(owned);
       await this.requireNoGitOperation(owned);
@@ -718,6 +750,7 @@ export class ForgeRuntime {
       }
       await this.verifyCleanHead(owned, expectedRemoteHeadSha);
       owned.baseUpdate = undefined;
+      owned.issueRebase = undefined;
       await this.manifest(owned.id).write(owned);
       signal?.throwIfAborted();
     });
@@ -749,6 +782,13 @@ export class ForgeRuntime {
         throw new Error("Only an owned issue branch can be updated from its target.");
       await this.assertQuiescent(owned);
       await this.assertCheckout(owned);
+      const recovery = owned.issueRebase;
+      if (recovery && !recovery.publication?.confirmed) {
+        if (recovery.expectedHeadSha !== expectedHeadSha || recovery.baseBranch !== baseBranch)
+          throw new Error("Resume the unfinished rebase before updating its branch again.");
+        await this.verifyRebaseRecovery(owned, recovery, signal);
+        throw new ForgeBranchConflictError(recovery.targetHeadSha);
+      }
       await this.requireNoGitOperation(owned);
       await this.runGit(owned.worktreePath, ["check-ref-format", "--branch", baseBranch], signal);
       const previous = owned.baseUpdate;
@@ -778,6 +818,14 @@ export class ForgeRuntime {
       update.targetHeadSha = targetHeadSha;
       await this.manifest(owned.id).write(owned);
       await this.requireNoGitOperation(owned);
+      await this.verifyCleanHead(owned, expectedHeadSha, signal);
+      try {
+        await this.runGit(owned.worktreePath, ["merge-tree", "--write-tree", expectedHeadSha, targetHeadSha], signal);
+      } catch (error) {
+        signal?.throwIfAborted();
+        if ((error as { code?: unknown }).code === 1) throw new ForgeBranchConflictError(targetHeadSha);
+        throw error;
+      }
       await this.verifyCleanHead(owned, expectedHeadSha, signal);
       try {
         await this.runOwnedGit(owned, [
@@ -812,6 +860,193 @@ export class ForgeRuntime {
     });
   }
 
+  prepareIssueRebase(
+    workspace: ForgeWorkspace,
+    expectedHeadSha: string,
+    baseBranch: string,
+    signal?: AbortSignal,
+  ): Promise<{ targetHeadSha: string; originalHeadSha: string }> {
+    return this.serialize(workspace.id, async () => {
+      signal?.throwIfAborted();
+      if (!isCommitSha(expectedHeadSha)) throw new Error("Rebase recovery requires the exact published commit.");
+      baseBranch = baseBranch.trim();
+      const owned = await this.matchOwned(workspace);
+      if (!owned.prepared || !owned.branchOwned || !owned.branch || owned.cleaned)
+        throw new Error("Only an owned issue branch can be rebased.");
+      await this.assertQuiescent(owned);
+      await this.assertCheckout(owned);
+      await this.runGit(owned.worktreePath, ["check-ref-format", "--branch", baseBranch], signal);
+      const previous = owned.issueRebase;
+      if (previous?.expectedHeadSha === expectedHeadSha && previous.baseBranch === baseBranch) {
+        await this.verifyRebaseRecovery(owned, previous, signal);
+        return { targetHeadSha: previous.targetHeadSha, originalHeadSha: previous.originalHeadSha };
+      }
+      if (previous && !previous.publication?.confirmed)
+        throw new Error("A previous rebase recovery is unfinished. Resume its preserved work before starting another.");
+      await this.requireNoGitOperation(owned);
+      const originalHeadSha = await this.requireBranchHead(owned, signal);
+      await this.runGit(owned.worktreePath, ["merge-base", "--is-ancestor", expectedHeadSha, originalHeadSha], signal);
+      const access = await this.workerAccess(owned, signal);
+      if (await this.publishedBranchHead(owned, access, signal) !== expectedHeadSha)
+        throw new Error("The published branch changed before rebase recovery. Refresh it before resuming; local work was preserved.");
+      const update = owned.baseUpdate;
+      let targetHeadSha = update?.expectedHeadSha === expectedHeadSha && update.baseBranch === baseBranch && !update.headSha
+        ? update.targetHeadSha : undefined;
+      if (!targetHeadSha) {
+        await this.runOwnedGit(owned, ["fetch", "--no-tags", "--no-recurse-submodules", access.cloneUrl,
+          `+refs/heads/${baseBranch}:refs/cloudx/rebase-target`], signal, access.authorization);
+        targetHeadSha = (await this.runGit(owned.worktreePath, ["rev-parse", "--verify", "refs/cloudx/rebase-target^{commit}"], signal)).trim();
+      }
+      if (!isCommitSha(targetHeadSha)) throw new Error("The rebase target is not an exact commit.");
+      if (await this.isAncestor(owned, targetHeadSha, originalHeadSha, signal))
+        throw new Error("The fetched target is already included in the issue branch. Refresh the stale conflict status before starting another rebase.");
+      await this.requireNoGitOperation(owned);
+      if (await this.requireBranchHead(owned, signal) !== originalHeadSha)
+        throw new Error("The local branch changed during rebase preparation. Local work was preserved.");
+      await this.runOwnedGit(owned, ["update-ref", "--no-deref", `refs/cloudx/before-rebase/${originalHeadSha}`, originalHeadSha], signal);
+      await this.runOwnedGit(owned, ["update-ref", "--no-deref", `refs/cloudx/rebase-targets/${targetHeadSha}`, targetHeadSha], signal);
+      owned.issueRebase = { expectedHeadSha, originalHeadSha, targetHeadSha, baseBranch };
+      await this.manifest(owned.id).write(owned);
+      signal?.throwIfAborted();
+      return { targetHeadSha, originalHeadSha };
+    });
+  }
+
+  completeIssueRebase(
+    workspace: ForgeWorkspace,
+    comparison: { expectedHeadSha: string; targetHeadSha: string },
+    signal?: AbortSignal,
+  ): Promise<string> {
+    return this.serialize(workspace.id, async () => {
+      signal?.throwIfAborted();
+      const owned = await this.matchOwned(workspace);
+      const rebase = owned.issueRebase;
+      if (!owned.prepared || !owned.branchOwned || owned.cleaned || !rebase ||
+        rebase.expectedHeadSha !== comparison.expectedHeadSha || rebase.targetHeadSha !== comparison.targetHeadSha)
+        throw new Error("The completed rebase does not match its owned recovery record.");
+      await this.assertQuiescent(owned);
+      await this.assertCheckout(owned);
+      await this.requireNoGitOperation(owned);
+      const headSha = await this.requireBranchHead(owned, signal);
+      await this.verifyCleanHead(owned, headSha, signal);
+      await this.runGit(owned.worktreePath, ["merge-base", "--is-ancestor", rebase.targetHeadSha, headSha], signal);
+      if (await this.isAncestor(owned, rebase.originalHeadSha, headSha, signal))
+        throw new Error("The coding worker has not rebased the original issue commits onto the target. The retained branch still contains its original head.");
+      if (rebase.headSha && rebase.headSha !== headSha)
+        throw new Error("The completed rebase head changed after it was recorded. Local work was preserved.");
+      rebase.headSha = headSha;
+      await this.manifest(owned.id).write(owned);
+      signal?.throwIfAborted();
+      return headSha;
+    });
+  }
+
+  private async isAncestor(owned: OwnedWorkspace, ancestor: string, head: string, signal?: AbortSignal): Promise<boolean> {
+    try {
+      await this.runGit(owned.worktreePath, ["merge-base", "--is-ancestor", ancestor, head], signal);
+      return true;
+    } catch (error) {
+      signal?.throwIfAborted();
+      if ((error as { code?: unknown }).code === 1) return false;
+      throw error;
+    }
+  }
+
+  private async verifyRebaseRecovery(owned: OwnedWorkspace, rebase: OwnedIssueRebase, signal?: AbortSignal): Promise<void> {
+    const directory = path.join(owned.worktreePath, ".git", "rebase-merge");
+    const running = await optionalIdentity(directory);
+    if (!running) {
+      await this.requireNoGitOperation(owned);
+      await this.requireBranchHead(owned, signal);
+      return;
+    }
+    await requireSafeDirectory(this.dependencies.dataDir, directory, { create: false, label: "Owned rebase state" });
+    const branch = await this.readRebaseValue(directory, "head-name");
+    const target = await this.readRebaseValue(directory, "onto");
+    const original = await this.readRebaseValue(directory, "orig-head");
+    if (branch !== `refs/heads/${owned.branch}` || target !== rebase.targetHeadSha || !isCommitSha(original))
+      throw new Error("The interrupted rebase does not match its owned branch and target. Local work was preserved.");
+    await this.runGit(owned.worktreePath, ["merge-base", "--is-ancestor", rebase.originalHeadSha, original], signal);
+    await this.requireNoGitOperation(owned, { ownedRebase: true });
+  }
+
+  private async readRebaseValue(directory: string, name: string): Promise<string> {
+    const handle = await fs.open(path.join(directory, name), constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile() || stat.size > 1024) throw new Error("The owned rebase metadata is invalid.");
+      const data = Buffer.alloc(1025);
+      const { bytesRead } = await handle.read(data, 0, data.length, 0);
+      if (bytesRead > 1024) throw new Error("The owned rebase metadata changed while reading.");
+      return data.subarray(0, bytesRead).toString("utf8").trim();
+    } finally { await handle.close(); }
+  }
+
+  private async workerAccess(owned: OwnedWorkspace, signal?: AbortSignal) {
+    const access = await this.access(owned.expectedRepository, "worker", signal);
+    if (access.cloneUrl !== owned.origin) throw new Error("Repository origin changed while the worker was running.");
+    return access;
+  }
+
+  private async publishedBranchHead(owned: OwnedWorkspace, access: { cloneUrl: string; authorization: string }, signal?: AbortSignal): Promise<string> {
+    const output = (await this.runGit(owned.worktreePath, ["ls-remote", "--refs", access.cloneUrl, `refs/heads/${owned.branch}`], signal,
+      this.gitAuthorization(owned, access.authorization))).trim().split(/\s+/u);
+    if (output.length !== 2 || !isCommitSha(output[0]) || output[1] !== `refs/heads/${owned.branch}`)
+      throw new Error("The published issue branch is missing or its exact head cannot be confirmed.");
+    return output[0];
+  }
+
+  private async reconcilePendingRebasePush(owned: OwnedWorkspace, signal?: AbortSignal): Promise<void> {
+    await this.assertQuiescent(owned);
+    await this.assertCheckout({ ...owned, gitPending: false });
+    const publication = owned.issueRebase?.publication;
+    if (!publication || publication.confirmed) throw new Error("The interrupted Git operation has no pending publication intent.");
+    const access = await this.workerAccess(owned, signal);
+    if (await this.publishedBranchHead(owned, access, signal) !== publication.headSha)
+      throw new Error("The interrupted rebase publication remains uncertain. Confirm the previous Git process has stopped and inspect the remote branch before resuming; local work was preserved.");
+    publication.confirmed = true;
+    owned.gitPending = false;
+    owned.baseUpdate = undefined;
+    await this.manifest(owned.id).write(owned);
+  }
+
+  private async publishRebasedBranch(owned: OwnedWorkspace, expectedHeadSha: string | undefined, expectedRemoteHeadSha: string, signal?: AbortSignal): Promise<string> {
+    const rebase = owned.issueRebase;
+    if (!owned.branchOwned || owned.cleaned || !isCommitSha(expectedHeadSha) || !isCommitSha(expectedRemoteHeadSha) ||
+      !rebase || rebase.headSha !== expectedHeadSha || rebase.expectedHeadSha !== expectedRemoteHeadSha)
+      throw new Error("Lease-protected publication requires the recorded completed rebase and exact previously published commit.");
+    if (owned.gitPending) await this.reconcilePendingRebasePush(owned, signal);
+    await this.assertQuiescent(owned);
+    await this.assertCheckout(owned);
+    await this.requireNoGitOperation(owned);
+    await this.verifyCleanHead(owned, expectedHeadSha, signal);
+    const access = await this.workerAccess(owned, signal);
+    const remoteHead = await this.publishedBranchHead(owned, access, signal);
+    const publication = rebase.publication;
+    if (publication && remoteHead === expectedHeadSha) {
+      await this.verifyCleanHead(owned, expectedHeadSha, signal);
+      if (!publication.confirmed) owned.baseUpdate = undefined;
+      publication.confirmed = true;
+      await this.manifest(owned.id).write(owned);
+      return expectedHeadSha;
+    }
+    if (remoteHead !== expectedRemoteHeadSha || publication?.confirmed)
+      throw new Error("The published branch changed during rebase recovery. The exact-head lease was rejected; concurrent remote work was preserved.");
+    await this.verifyCleanHead(owned, expectedHeadSha, signal);
+    rebase.publication = { headSha: expectedHeadSha, expectedRemoteHeadSha, confirmed: false };
+    await this.manifest(owned.id).write(owned);
+    await this.runOwnedGit(owned, ["push", `--force-with-lease=refs/heads/${owned.branch}:${expectedRemoteHeadSha}`,
+      access.cloneUrl, `${expectedHeadSha}:refs/heads/${owned.branch}`], signal, access.authorization);
+    if (await this.publishedBranchHead(owned, access, signal) !== expectedHeadSha)
+      throw new Error("The rewritten published head could not be confirmed. Its publication intent and local work were preserved.");
+    await this.verifyCleanHead(owned, expectedHeadSha, signal);
+    rebase.publication.confirmed = true;
+    owned.baseUpdate = undefined;
+    await this.manifest(owned.id).write(owned);
+    signal?.throwIfAborted();
+    return expectedHeadSha;
+  }
+
   private async abortBaseUpdate(owned: OwnedWorkspace, expectedHeadSha: string, targetHeadSha: string): Promise<void> {
     await this.assertCheckout(owned);
     await this.requireNoGitOperation(owned, { ownedMerge: true });
@@ -834,10 +1069,10 @@ export class ForgeRuntime {
     await this.verifyCleanHead(owned, expectedHeadSha);
   }
 
-  private async requireNoGitOperation(owned: OwnedWorkspace, { ownedMerge = false } = {}): Promise<void> {
+  private async requireNoGitOperation(owned: OwnedWorkspace, { ownedMerge = false, ownedRebase = false } = {}): Promise<void> {
     const names = ["MERGE_HEAD", "MERGE_AUTOSTASH", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "index.lock", "HEAD.lock"];
     for (const name of names) {
-      if (ownedMerge && name === "MERGE_HEAD") continue;
+      if (ownedMerge && name === "MERGE_HEAD" || ownedRebase && ["rebase-merge", "MERGE_HEAD", "CHERRY_PICK_HEAD"].includes(name)) continue;
       try {
         await fs.lstat(path.join(owned.worktreePath, ".git", name));
       } catch (error) {
@@ -1098,6 +1333,8 @@ export class ForgeRuntime {
         !/^[a-f0-9]{64}$/u.test(value.gitConfigHash)) ||
       (value.publishedSync !== undefined &&
         (value.role !== "worker" || !isCommitSha(value.publishedSync.expectedLocalHeadSha) || !isCommitSha(value.publishedSync.expectedRemoteHeadSha))) ||
+      (value.issueRebase !== undefined &&
+        (value.role !== "worker" || !isOwnedIssueRebase(value.issueRebase))) ||
       (value.baseUpdate !== undefined &&
         (value.role !== "worker" || !isOwnedBaseUpdate(value.baseUpdate))) ||
       (value.role === "reviewer" && value.prepared && !isCommitSha(value.reviewBaseSha)) ||
@@ -1171,20 +1408,22 @@ export class ForgeRuntime {
         owned.worktreePath,
         args,
         signal,
-        authorization
-          ? {
-              GIT_CONFIG_COUNT: "2",
-              GIT_CONFIG_KEY_0: "http.extraHeader",
-              GIT_CONFIG_VALUE_0: "",
-              GIT_CONFIG_KEY_1: `http.${owned.origin}.extraHeader`,
-              GIT_CONFIG_VALUE_1: `Authorization: ${authorization}`,
-            }
-          : undefined,
+        authorization ? this.gitAuthorization(owned, authorization) : undefined,
       );
     } finally {
       owned.gitPending = false;
       await this.manifest(owned.id).write(owned);
     }
+  }
+
+  private gitAuthorization(owned: OwnedWorkspace, authorization: string): NodeJS.ProcessEnv {
+    return {
+      GIT_CONFIG_COUNT: "2",
+      GIT_CONFIG_KEY_0: "http.extraHeader",
+      GIT_CONFIG_VALUE_0: "",
+      GIT_CONFIG_KEY_1: `http.${owned.origin}.extraHeader`,
+      GIT_CONFIG_VALUE_1: `Authorization: ${authorization}`,
+    };
   }
 
   private async configHash(owned: OwnedWorkspace): Promise<string> {
@@ -1423,6 +1662,15 @@ function isOwnedBaseUpdate(value: unknown): value is OwnedBaseUpdate {
     (update.headSha === undefined || Boolean(update.targetHeadSha) && isCommitSha(update.headSha));
 }
 
+function isOwnedIssueRebase(value: unknown): value is OwnedIssueRebase {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const rebase = value as Partial<OwnedIssueRebase>;
+  return isOwnedBaseUpdate(value) && isCommitSha(rebase.originalHeadSha) && isCommitSha(rebase.targetHeadSha) &&
+    (rebase.publication === undefined || rebase.publication !== null && typeof rebase.publication === "object" && Boolean(rebase.headSha) &&
+      rebase.publication.headSha === rebase.headSha && rebase.publication.expectedRemoteHeadSha === rebase.expectedHeadSha &&
+      typeof rebase.publication.confirmed === "boolean");
+}
+
 function isReviewRefresh(value: unknown): value is OwnedReviewRefresh {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const refresh = value as Partial<OwnedReviewRefresh>;
@@ -1610,7 +1858,7 @@ async function git(
     if (code !== 0) {
       if (args[0] === "push" && /refusing to allow a GitHub App to create or update workflow\b/iu.test(Buffer.concat(errorOutput).toString("utf8")))
         throw new Error("GitHub rejected workflow changes. Grant the worker App Workflows: write permission and approve it for this installation, then retry publishing.");
-      throw new Error(`Git ${args[0]} failed with exit code ${code}.`);
+      throw Object.assign(new Error(`Git ${args[0]} failed with exit code ${code}.`), { code });
     }
     return Buffer.concat(output).toString("utf8");
   } finally {

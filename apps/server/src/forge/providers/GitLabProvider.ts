@@ -190,6 +190,7 @@ export class GitLabProvider implements ForgeProvider {
       reviewReady: Boolean(patchIdSha) && !["checking", "approvals_syncing", "preparing", "unchecked"].includes(mergeStatus),
       mergeable: mergeStatus === "mergeable",
       requiresBaseUpdate: mergeStatus === "need_rebase",
+      hasConflicts: mergeStatus === "conflict",
       checks: gitlabHeadChecks(current, headSha),
       approved,
       unresolvedDiscussions,
