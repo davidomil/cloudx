@@ -285,23 +285,35 @@ describe("Forge connected application settings", () => {
     }
   });
 
-  it("persists trust only for the explicitly approved repository and current provider settings", async () => {
+  it.each([
+    repository,
+    { provider: "gitlab" as const, apiUrl: "https://gitlab.example/api/v4", projectPath: "group/subgroup/repo" },
+  ])("automatically trusts the configured $provider repository without a saved approval", async configured => {
     const { config, settings } = await fixture();
-    expect(settings.isRepositoryTrusted(repository)).toBe(false);
-    const trustedRepository = JSON.stringify([repository.provider, repository.apiUrl, repository.projectPath]);
-    await config.update({ plugins: { forge: { trustedRepository } } });
+    await config.update({ plugins: { forge: { ...configured } } });
+    expect(settings.isRepositoryTrusted(configured)).toBe(true);
+    expect(config.getPluginConfig("forge")).not.toHaveProperty("trustedRepository");
+  });
+
+  it("limits automatic trust to the current provider, API URL and repository", async () => {
+    const { config, settings } = await fixture();
     expect(settings.isRepositoryTrusted(repository)).toBe(true);
+    expect(settings.isRepositoryTrusted({ ...repository, provider: "gitlab" })).toBe(false);
     for (const other of [
-      { ...repository, provider: "gitlab" as const },
+      { ...repository, provider: "gitlab" as const, apiUrl: "https://gitlab.example/api/v4" },
       { ...repository, apiUrl: "https://github.example/api/v3" },
       { ...repository, projectPath: "org/other" },
-    ]) expect(settings.isRepositoryTrusted(other)).toBe(false);
-    await config.update({ plugins: { forge: { projectPath: "org/other" } } });
-    expect(settings.isRepositoryTrusted(repository)).toBe(false);
+    ]) {
+      expect(settings.isRepositoryTrusted(other)).toBe(false);
+      await config.update({ plugins: { forge: other } });
+      expect(settings.isRepositoryTrusted(repository)).toBe(false);
+      expect(settings.isRepositoryTrusted(other)).toBe(true);
+      await config.update({ plugins: { forge: { ...repository } } });
+    }
+    await config.update({ plugins: { forge: { projectPath: "" } } });
+    expect(() => settings.isRepositoryTrusted(repository)).toThrow("Configure projectPath");
     await config.update({ plugins: { forge: { projectPath: repository.projectPath } } });
     expect(settings.isRepositoryTrusted(repository)).toBe(true);
-    await config.update({ plugins: { forge: { trustedRepository: "" } } });
-    expect(settings.isRepositoryTrusted(repository)).toBe(false);
   });
 
   it("allows repository setup before connecting and requires both identities before starting work", async () => {
