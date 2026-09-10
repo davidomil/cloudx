@@ -54,6 +54,8 @@ export function SettingsDialog({
   const contentRef = useRef<HTMLDivElement | null>(null);
   const tabsRef = useRef<HTMLDivElement | null>(null);
   const id = useId();
+  const forgeFields = config.plugins.find(plugin => plugin.pluginId === "forge")?.fields ?? [];
+  const selectedRepository = forgeRepository(values.plugins.forge, forgeFields);
 
   useOutsidePointerDismiss(true, dialogRef, onCancel);
 
@@ -96,17 +98,16 @@ export function SettingsDialog({
   }
 
   function setPluginValue(pluginId: string, key: string, value: ConfigValue) {
-    setValues((current) => ({
-      ...current,
-      plugins: {
-        ...current.plugins,
-        [pluginId]: {
-          ...(current.plugins[pluginId] ?? {}),
-          ...(pluginId === "forge" && key === "provider" ? { apiUrl: value === "gitlab" ? "https://gitlab.com/api/v4" : "https://api.github.com" } : {}),
-          [key]: value
-        }
-      }
-    }));
+    setValues((current) => {
+      const previous = current.plugins[pluginId] ?? {};
+      const next: Record<string, ConfigValue> = {
+        ...previous,
+        ...(pluginId === "forge" && key === "provider" ? { apiUrl: value === "gitlab" ? "https://gitlab.com/api/v4" : "https://api.github.com" } : {}),
+        [key]: value
+      };
+      if (pluginId === "forge" && forgeRepositoryTrustKey(forgeRepository(previous, forgeFields)) !== forgeRepositoryTrustKey(forgeRepository(next, forgeFields))) next.trustedRepository = "";
+      return { ...current, plugins: { ...current.plugins, [pluginId]: next } };
+    });
   }
 
   function fieldEntry(field: ConfigFieldDescriptor, pluginId?: string): SettingsEntry {
@@ -139,9 +140,13 @@ export function SettingsDialog({
   for (const plugin of config.plugins) {
     const entries = plugin.fields.filter(isUserVisibleConfigField).map(field => fieldEntry(field, plugin.pluginId));
     if (plugin.pluginId === "forge") entries.push({
+      id: "repository-trust",
+      searchText: "Trust repository approval Codex instructions commands machine consent",
+      content: <ForgeRepositoryTrust repository={selectedRepository} trustedRepository={values.plugins.forge?.trustedRepository} disabled={busy} onChange={value => setPluginValue("forge", "trustedRepository", value)} />
+    }, {
       id: "connections",
       searchText: "Connections Connect issue worker reviewer GitHub GitLab setup token registration",
-      content: <ForgeConnections repository={forgeRepository(values.plugins.forge, plugin.fields)} savedRepository={forgeRepository(config.values.plugins.forge, plugin.fields)} />
+      content: <ForgeConnections repository={selectedRepository} savedRepository={forgeRepository(config.values.plugins.forge, forgeFields)} />
     });
     if (entries.length) categories.push({
       id: `plugin:${plugin.pluginId}`,
@@ -275,6 +280,22 @@ export function SettingsDialog({
 function matchesSettingsSearch(category: SettingsCategory, entry: SettingsEntry, query: string): boolean {
   const text = `${category.id} ${category.label} ${entry.searchText}`.toLowerCase();
   return query.trim().toLowerCase().split(/\s+/).every(word => text.includes(word));
+}
+
+function ForgeRepositoryTrust({ repository, trustedRepository, disabled, onChange }: { repository?: ForgeRepository; trustedRepository?: ConfigValue; disabled: boolean; onChange: (value: string) => void }) {
+  const trustKey = forgeRepositoryTrustKey(repository);
+  return <label className="settings-toggle">
+    <input type="checkbox" aria-label="Trust this repository for Forge workers" checked={!!trustKey && trustedRepository === trustKey} disabled={disabled || !trustKey} onChange={event => onChange(event.target.checked ? trustKey : "")} />
+    <span>
+      Trust {repository?.projectPath ?? "this repository"} for Forge workers
+      {repository?.apiUrl ? <small>{repository.apiUrl}</small> : null}
+      <small>Allow Codex to load repository instructions and run commands on this machine. Save this approval before starting or resuming workers.</small>
+    </span>
+  </label>;
+}
+
+function forgeRepositoryTrustKey(repository: ForgeRepository | undefined): string {
+  return repository?.apiUrl ? JSON.stringify([repository.provider, repository.apiUrl, repository.projectPath]) : "";
 }
 
 function BrowserNotificationSettings({ state, onRequest }: { state: BrowserNotificationPermissionState; onRequest?: () => Promise<void> }) {
