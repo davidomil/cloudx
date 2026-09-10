@@ -645,7 +645,7 @@ def youtube_archive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Do
         frames_dir = artifact_dir / "media" / "keyframes"
         frames_dir.mkdir(parents=True)
         Image.new("RGB", (64, 36), "white").save(frames_dir / "frame-000001.jpg")
-        return [archive_module.TranscriptSegment(12.0, 18.0, "SHARED-YOUTUBE-COPY-19 retains timed transcript evidence.")], [{
+        return [archive_module.TranscriptSegment(12.0, 18.0, "SHARED-YOUTUBE-COPY-19 retains <strong>timed transcript evidence.</strong>")], [{
             "offsetSeconds": 12,
             "path": "media/keyframes/frame-000001.jpg",
             "reason": "segment-start",
@@ -714,6 +714,63 @@ def test_reanalysis_preserves_copied_text_when_generated_youtube_shares_snapshot
         assert archive.get_document(generated.document_id) == generated_before
         assert {path: path.read_bytes() for path in generated_files} == generated_files
         assert len(archive.list_documents()) == 2
+
+
+@pytest.mark.parametrize("shared_archive", [False, True], ids=["separate-archive", "shared-youtube-metadata"])
+def test_reanalysis_preserves_local_html_when_generated_youtube_shares_snapshot_metadata(tmp_path: Path, youtube_archive, shared_archive: bool) -> None:
+    video_archive, generated = youtube_archive
+    generated_before = video_archive.get_document(generated.document_id)
+    generated_snapshot = video_archive.root / generated_before["snapshot_path"]
+    source_bytes = generated_snapshot.read_bytes()
+    source = tmp_path / "lecture.html"
+    source.write_bytes(source_bytes)
+    archive = video_archive if shared_archive else DocumentationArchive(tmp_path / "html-archive")
+    document = archive.ingest_path(source, collection="lectures", tags=["reference"])[0]
+    source.unlink()
+    archive.enrich_document(
+        document.document_id,
+        spans=[ExtractedSpan("Prior HTML enrichment remains available.", "media metadata")],
+        model="gpt-test",
+        skill_ids=["documentation-enrich-metadata"],
+    )
+    before = archive.get_document(document.document_id)
+    source_chunks = [(chunk["locator"], chunk["text"]) for chunk in before["chunks"] if chunk["chunk_origin"] == "source"]
+    assert before["source_type"] == "website"
+    assert {locator for locator, _ in source_chunks} == {"html"}
+    assert "<strong>" in source_bytes.decode("utf-8")
+    assert all("<strong>" not in text for _, text in source_chunks)
+    snapshot = archive.root / before["snapshot_path"]
+    if shared_archive:
+        assert snapshot.parent == generated_snapshot.parent
+        assert "youtube" in json.loads(snapshot.with_name("metadata.json").read_text())
+    else:
+        assert not snapshot.with_name("metadata.json").exists()
+    assert {chunk["locator"] for chunk in generated_before["chunks"] if chunk["chunk_origin"] == "source"} == {
+        "media metadata", "transcript 00:12-00:18", "media keyframe keyframe-000012 00:12",
+    }
+    keyframe = generated_snapshot.parent / "extracted/media/keyframes/frame-000001.jpg"
+    with Image.open(keyframe) as frame:
+        assert frame.format == "JPEG"
+        frame.verify()
+    generated_files = {path: path.read_bytes() for path in generated_snapshot.parent.rglob("*") if path.is_file()}
+
+    for _ in range(2):
+        archive = DocumentationArchive(archive.root)
+        result = archive.reanalyze_document(document.document_id)
+        archive = DocumentationArchive(archive.root)
+        after = archive.get_document(document.document_id)
+        assert result.document_id == document.document_id
+        for field in ["document_id", "title", "source_type", "uri", "content_sha256", "state", "collection", "tags_json", "created_at", "enrichments", "events"]:
+            assert after[field] == before[field]
+        assert (archive.root / after["snapshot_path"]).read_bytes() == source_bytes
+        assert [(chunk["locator"], chunk["text"]) for chunk in after["chunks"] if chunk["chunk_origin"] == "source"] == source_chunks
+        assert [chunk for chunk in after["chunks"] if chunk["chunk_origin"] == "ai"] == [chunk for chunk in before["chunks"] if chunk["chunk_origin"] == "ai"]
+        expected_ids = {document.document_id, generated.document_id} if shared_archive else {document.document_id}
+        assert {hit["documentId"] for hit in archive.search("SHARED-YOUTUBE-COPY-19", mode="lexical")} == expected_ids
+        assert len(archive.list_documents()) == len(expected_ids)
+        video_archive = DocumentationArchive(video_archive.root)
+        assert video_archive.get_document(generated.document_id) == generated_before
+        assert {path: path.read_bytes() for path in generated_files} == generated_files
 
 
 def test_reanalysis_allows_copied_youtube_transcripts_with_media_locators_only_in_ai_chunks(tmp_path: Path) -> None:

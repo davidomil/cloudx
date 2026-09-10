@@ -40,6 +40,78 @@ const recordings = [
 describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))(
   "archived media through the real indexer and media tools",
   () => {
+    it.each([undefined, "text/plain", "application/octet-stream", "audio/flac", "video/ogg"])(
+      "re-enriches generated code twice without decoding (sibling MIME: %s)",
+      async (contentType) => {
+        const fixture = await startArchive();
+        try {
+          const sourcePath = path.join(fixture.root, "reset.c");
+          await fs.writeFile(sourcePath, "// Release the reset line.\nvoid release_reset(void) { write_register(0x10, 1); }\n");
+          const imported = await fixture.client.ingestPath({ path: sourcePath, acceptGeneratedCodeDocumentation: true });
+          const documentId = (imported.documents as Array<{ documentId: string }>)[0].documentId;
+          const original = await fixture.document(documentId);
+          const snapshotPath = path.join(fixture.archiveRoot, original.snapshot_path);
+          const sourceBytes = await fs.readFile(snapshotPath);
+          const sourceChunks = original.chunks.filter((chunk) => chunk.chunk_origin === "source");
+          expect(original.source_type).toBe("repo_code");
+          expect(sourceChunks.map((chunk) => chunk.locator)).toEqual(["code-doc summary", "code-doc reset.c", "code-doc policy"]);
+          await fixture.client.enrichDocument({
+            documentId, model: "prior-model", skillIds: [],
+            spans: [{ locator: "ai:code", text: "PRIOR-AI-SPAN is not source evidence." }],
+          });
+
+          let sibling: ArchivedDocument | undefined;
+          if (contentType) {
+            const importedSibling = await fixture.client.ingestUploadFile({
+              filename: "retained-code.txt", path: snapshotPath, contentType,
+              title: "Separate code copy", sourceType: "text",
+            });
+            sibling = await fixture.document((importedSibling.document as { documentId: string }).documentId);
+            expect(sibling.document_id).not.toBe(documentId);
+            expect(path.dirname(sibling.snapshot_path)).toBe(path.dirname(original.snapshot_path));
+            expect(JSON.parse(await fs.readFile(path.join(path.dirname(snapshotPath), "metadata.json"), "utf8")))
+              .toMatchObject({ contentType, upload: true });
+          }
+          await fs.unlink(sourcePath);
+          const enrichment = createEnrichment(fixture);
+          const hook = enrichment.plugin.hooks.find((candidate) => candidate.id === "documentation.documents.reenrich")!;
+          for (let rerun = 1; rerun <= 2; rerun += 1) {
+            const prior = await fixture.document(documentId);
+            await expect(hook.execute({ documentId }, { caller: { kind: "ui" } }))
+              .resolves.toMatchObject({ kind: "reenrich", firstDocumentId: documentId, enrichment: { results: [{ status: "written" }] } });
+
+            expect(enrichment.run).toHaveBeenCalledTimes(rerun);
+            const prompt = enrichment.run.mock.lastCall![0];
+            expect(prompt).toContain("release_reset");
+            for (const chunk of sourceChunks) {
+              expect(prompt).toContain(JSON.stringify(chunk.locator));
+              expect(prompt).toContain(JSON.stringify(chunk.text));
+            }
+            for (const chunk of prior.chunks.filter((chunk) => chunk.chunk_origin === "ai")) {
+              expect(prompt).not.toContain(chunk.text);
+            }
+            expect(enrichment.transcribeFile).not.toHaveBeenCalled();
+            expect(enrichment.mediaProcessLauncher).not.toHaveBeenCalled();
+            const current = await fixture.document(documentId);
+            expect(identity(current)).toEqual(identity(original));
+            expect(current.chunks.filter((chunk) => chunk.chunk_origin === "source")).toEqual(sourceChunks);
+            expect(current.chunks.filter((chunk) => chunk.chunk_origin === "ai"))
+              .toMatchObject([{ text: `REPLACEMENT-AI-${rerun}` }]);
+            expect(JSON.parse(current.enrichments[0].payload_json).evidence).toMatchObject({
+              chunkCount: sourceChunks.length, mediaTranscriptChars: 0, keyframeCount: 0,
+            });
+            await expect(fs.readFile(snapshotPath)).resolves.toEqual(sourceBytes);
+            if (sibling) {
+              await expect(fixture.document(sibling.document_id)).resolves.toEqual(sibling);
+              await expect(fs.readFile(path.join(fixture.archiveRoot, sibling.snapshot_path))).resolves.toEqual(sourceBytes);
+            }
+          }
+        } finally {
+          await fixture.dispose();
+        }
+      }, 30_000,
+    );
+
     describe.each(["reanalyze", "reenrich"] as const)("%s", (operation) => {
       describe.each([false, true])("identical generic-MIME URL sibling: %s", (withSibling) => {
         it.each(recordings)("refreshes an ordinary $filename upload twice", async (recording) => {
@@ -161,6 +233,7 @@ function identity(document: ArchivedDocument) {
 }
 
 function createEnrichment(fixture: Awaited<ReturnType<typeof startArchive>>) {
+  const mediaProcessLauncher = vi.fn(spawn);
   const transcribeFile = vi.fn(async (sourcePath: string) => {
     await runFile("ffmpeg", ["-v", "error", "-nostdin", "-i", sourcePath, "-f", "null", "-"]);
     return { text: `FRESH-TRANSCRIPT-${transcribeFile.mock.calls.length}` };
@@ -182,9 +255,10 @@ function createEnrichment(fixture: Awaited<ReturnType<typeof startArchive>>) {
   const service = new DocumentationEnrichmentService({
     client: fixture.client, config, rulesSkills, runner: { model: "test-model", run },
     asr: { transcribeFile } as unknown as AsrClient,
+    mediaProcessLauncher,
   });
   const plugin = new DocumentationPlugin(fixture.client, new PathPolicy([fixture.root]), fixture.queue, () => service);
-  return { service, plugin, transcribeFile, run };
+  return { service, plugin, transcribeFile, run, mediaProcessLauncher };
 }
 
 async function startArchive() {
