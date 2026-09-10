@@ -27,6 +27,7 @@ export const LEGACY_SERVICE_NAMES = ["cloudx-asr.service", "cloudx.service"];
 export const QUARTO_VERSION = "1.9.38";
 export const QUARTO_DEB_PATH = `/tmp/quarto-${QUARTO_VERSION}-linux-amd64.deb`;
 export const QUARTO_DEB_URL = `https://github.com/quarto-dev/quarto-cli/releases/download/v${QUARTO_VERSION}/quarto-${QUARTO_VERSION}-linux-amd64.deb`;
+export const PYTHON_VERSION = "3.12";
 export const NODESOURCE_CONFLICTING_APT_PACKAGES = ["libnode-dev"];
 export const CLOUDX_NPM_GLOBAL_DIR = ".local/share/cloudx/npm-global";
 export const MIN_WORKTREE_GIT_VERSION = "2.36.0";
@@ -1794,13 +1795,21 @@ function syncPythonService(commands, paths, projectDir, environmentDir, cuda) {
     [
       "sync",
       "--locked",
+      "--python",
+      PYTHON_VERSION,
+      "--managed-python",
       "--project",
       projectDir,
       "--extra",
       "dev",
       ...(cuda ? ["--extra", "cuda"] : []),
     ],
-    { env: { UV_PROJECT_ENVIRONMENT: environmentDir } },
+    {
+      env: {
+        UV_PROJECT_ENVIRONMENT: environmentDir,
+        UV_PYTHON_INSTALL_DIR: paths.pythonInstallDir,
+      },
+    },
   );
 }
 
@@ -2109,6 +2118,7 @@ function installerPaths({ repoRoot: root, home, env = process.env }) {
       "bin/cloudx-documentation-indexer",
     ),
     uvVenvDir,
+    pythonInstallDir: path.join(home, ".local/share/cloudx/python"),
     uvPath: path.join(uvVenvDir, "bin/uv"),
     uvPipPath: path.join(uvVenvDir, "bin/pip"),
     whisperCppDir,

@@ -7,7 +7,8 @@ to run Cloudx with voice control.
 
 - Node.js 22 or newer.
 - OpenSSL 3.x or newer.
-- Python 3.9 or newer; Python 3.12 is tested locally.
+- Python 3.8 or newer with `venv` and `pip` for bootstrapping uv. The installer uses
+  uv-managed Python 3.12 for both services, matching CI.
 - ripgrep (`rg`) for file-browser search and jq for JSON helper scripts.
 - Poppler utilities, LibreOffice, and FFmpeg for documentation archive PDF,
   table, image, spreadsheet, and media keyframe extraction. The Ubuntu
@@ -45,7 +46,8 @@ The installer is split into two visible phases:
    `ppa:git-core/ppa` and install the current stable Git package after approval.
 2. `scripts/install-cloudx.mjs` is the Cloudx wizard. It prints each phase as it
    runs: pinned Codex CLI 0.153.4 verification/login, install choices, `npm ci`, a private
-   `uv 0.11.28` bootstrap, locked ASR and documentation-indexer environments,
+   `uv 0.11.28` bootstrap, managed Python 3.12, locked ASR and
+   documentation-indexer environments,
    optional alternate `whisper.cpp` ASR setup, Hugging Face model download,
    `npm run build`, certificate creation,
    `~/.config/cloudx/cloudx.env` rendering, and optional user-level systemd
@@ -54,6 +56,12 @@ The installer is split into two visible phases:
    retries; if any endpoint does not become healthy, it prints recent systemd
    status and journal output. When the install finishes, it prints
    `https://127.0.0.1:<port>`.
+
+Both install and update request managed Python 3.12 explicitly. uv downloads it
+into `~/.local/share/cloudx/python` when needed and recreates an older service
+virtualenv before synchronizing its locked dependencies. System Python and its
+packages remain unchanged. The managed interpreter is separate from the uv
+bootstrap and is retained on uninstall because other checkouts may use it.
 
 The wizard asks for:
 
@@ -292,10 +300,12 @@ sudo apt install /tmp/quarto-1.9.38-linux-amd64.deb
 python3 -m venv ~/.local/share/cloudx/uv
 ~/.local/share/cloudx/uv/bin/pip install uv==0.11.28
 UV_PROJECT_ENVIRONMENT="$PWD/services/asr/.venv" \
-  ~/.local/share/cloudx/uv/bin/uv sync --locked \
+  UV_PYTHON_INSTALL_DIR="$HOME/.local/share/cloudx/python" \
+  ~/.local/share/cloudx/uv/bin/uv sync --locked --python 3.12 --managed-python \
   --project services/asr --extra dev
 UV_PROJECT_ENVIRONMENT="$PWD/services/documentation-indexer/.venv" \
-  ~/.local/share/cloudx/uv/bin/uv sync --locked \
+  UV_PYTHON_INSTALL_DIR="$HOME/.local/share/cloudx/python" \
+  ~/.local/share/cloudx/uv/bin/uv sync --locked --python 3.12 --managed-python \
   --project services/documentation-indexer --extra dev
 ```
 
@@ -424,8 +434,7 @@ SQLite, source snapshots, and Turbovec files. Create its virtualenv and install
 the service:
 
 ```bash
-~/.local/share/cloudx/uv/bin/uv sync --locked \
-  --project services/documentation-indexer --extra dev
+npm run documentation:setup
 ```
 
 That command synchronizes `services/documentation-indexer/.venv` from the
