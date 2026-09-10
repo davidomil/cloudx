@@ -24,6 +24,7 @@ async function fixture() {
   const workflow = {
     startIssue: vi.fn(async () => ({ id: "worker" })),
     setAutoReview: vi.fn(async () => ({ id: "worker" })),
+    syncAndReview: vi.fn(async () => ({ id: "worker" })),
     dashboard: vi.fn(async () => ({ workers: [] })),
     markReview: vi.fn(async () => {}),
     saveReview: vi.fn(async () => ({ id: "worker" })),
@@ -52,6 +53,28 @@ async function fixture() {
   return { plugin, config, settings, hooks, workflow, connections };
 }
 describe("Forge plugin boundary", () => {
+  it("syncs the selected worker using the current pane placement", async () => {
+    const { hooks, workflow } = await fixture();
+    await expect(hooks.call("forge.worker.syncAndReview", { id: "worker", windowId: "window", paneId: "pane" }, { caller: { kind: "ui" } })).resolves.toEqual({ worker: { id: "worker" } });
+    expect(workflow.syncAndReview).toHaveBeenCalledExactlyOnceWith("worker", { windowId: "window", paneId: "pane" });
+  });
+
+  it.each([
+    { id: undefined }, { id: "" }, { id: 7 }, { id: "w".repeat(129) },
+    { windowId: undefined }, { windowId: "" }, { paneId: undefined }, { paneId: "" },
+    { repositoryPath: "/untrusted" }, { headSha: "a".repeat(40) },
+  ])("rejects invalid sync arguments before touching the worker %#", async invalid => {
+    const { hooks, workflow } = await fixture();
+    await expect(hooks.call("forge.worker.syncAndReview", { id: "worker", windowId: "window", paneId: "pane", ...invalid }, { caller: { kind: "ui" } })).rejects.toThrow(/invalid input/);
+    expect(workflow.syncAndReview).not.toHaveBeenCalled();
+  });
+
+  it("does not expose branch sync and re-review to automation", async () => {
+    const { hooks, workflow } = await fixture();
+    await expect(hooks.call("forge.worker.syncAndReview", { id: "worker", windowId: "window", paneId: "pane" }, { caller: { kind: "automation" } })).rejects.toThrow(/exposed/);
+    expect(workflow.syncAndReview).not.toHaveBeenCalled();
+  });
+
   it("binds saving and submitting a review to the displayed draft", async () => {
     const { hooks, workflow } = await fixture();
     const draftId = "33333333-3333-4333-8333-333333333333";

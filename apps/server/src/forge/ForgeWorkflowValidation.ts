@@ -345,6 +345,8 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
     ))
       throw new Error("A saved merge attempt requires an issue worker with a published request and commit.");
     const parsed = structuredClone(worker) as unknown as ForgeWorker;
+    if (worker.providerRetryAt !== undefined)
+      parsed.providerRetryAt = isoTimestamp(worker.providerRetryAt, "provider retry deadline");
     if (worker.kind !== "review" && (worker.draft !== undefined || worker.reviewHistory !== undefined))
       throw new Error("Only review workers can have review drafts or history.");
     if (worker.draft !== undefined) parsed.draft = parseSavedReview(worker.draft);
@@ -373,6 +375,12 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
         parsed.headSha !== update.expectedHeadSha && parsed.headSha !== update.headSha))
         throw new Error("Base update checkpoint must match the worker's published request and base branch.");
     }
+    if (parsed.providerRetryAt && (
+      parsed.kind !== "issue" || parsed.status !== "paused" || !parsed.autoReview?.enabled ||
+      parsed.mergeAttempted || ["creating", "uncertain"].includes(parsed.publicationState ?? "") ||
+      parsed.pendingPublication?.headSha || parsed.pendingPublication?.replyingToDiscussionId
+    ))
+      throw new Error("A provider retry deadline requires a paused automatic issue loop without an uncertain publication or merge.");
     if (parsed.status === "awaiting_publication" && (
       parsed.kind !== "issue" || !parsed.changeNumber || !parsed.repositoryPath ||
       !parsed.worktreePath || !parsed.branch || !parsed.pendingPublication?.headSha ||

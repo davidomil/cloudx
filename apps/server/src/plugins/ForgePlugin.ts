@@ -181,6 +181,16 @@ export class ForgePlugin implements WorkspacePlugin {
         }),
       ),
       hook(
+        "worker.syncAndReview",
+        "Sync worker branch and start a fresh review",
+        "external",
+        { id, ...placement },
+        ["id", "windowId", "paneId"],
+        async (input) => ({
+          worker: await this.service().workflow.syncAndReview(String(input.id), place(input)),
+        }),
+      ),
+      hook(
         "review.save",
         "Save review draft",
         "write",

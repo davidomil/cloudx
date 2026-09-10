@@ -116,7 +116,7 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
         </ControlButton>)}
       </nav>
       {view === "workers" ? <ForgeWorkerTabs workers={workers} selectedWorkerId={selectedWorkerId} onSelectWorker={setSelectedWorkerId}>
-        {(worker) => <WorkerCard worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} />}
+        {(worker) => <WorkerCard worker={worker} workers={workers} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} />}
       </ForgeWorkerTabs> : dashboard.configured && repository ? <ForgeItems key={`${repository.provider}:${repository.apiUrl}:${repository.projectPath}:${view}`} kind={view} repository={repository} request={request} revision={revision} workers={workers.filter((worker) => worker.repository.provider === repository.provider && worker.repository.apiUrl === repository.apiUrl && worker.repository.projectPath === repository.projectPath)} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} /> : null}
       {active && terminalWorker ? <ForgeWorkerTerminalOverlay key={terminalWorker.id} worker={terminalWorker} workerTabs={workerTabs} uiScale={uiScale} onClose={() => setTerminalWorkerId(undefined)} /> : null}
     </> : null}
@@ -237,7 +237,7 @@ function ForgeItems({ kind, repository, request, revision, workers, placement, r
                 <ControlButton size="compact" disabled={reviewDisabled || !!activeWorker} onClick={() => void runAction(() => request("forge.review.start", { repository, number: item.number, autoPost: false, ...placement }))}>Review</ControlButton>
                 <ControlButton size="compact" disabled={reviewDisabled || !!activeWorker} onClick={() => void runAction(() => request("forge.review.start", { repository, number: item.number, autoPost: true, ...placement }))}>Review and post</ControlButton>
               </div>
-              {selectedWorkers.filter(worker => worker.kind === "issue").map(worker => <WorkerCard key={worker.id} worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} />)}
+              {selectedWorkers.filter(worker => worker.kind === "issue").map(worker => <WorkerCard key={worker.id} worker={worker} workers={workers} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} />)}
             </div>
             <div className="forge-review-decision">
               <label className="forge-field">Review message<textarea value={reviewBody} onChange={(event) => setReviewBody(event.target.value)} placeholder="Message for approval or requested changes" rows={2} /></label>
@@ -250,7 +250,7 @@ function ForgeItems({ kind, repository, request, revision, workers, placement, r
           </section> : null}
           {detailBusy ? <p role="status">Loading latest details…</p> : null}
           {detailError ? <p role="alert" className="forge-notice">{detailError}</p> : null}
-          {kind === "changes" ? reviews.map(({ worker, archivedDraft }) => <WorkerCard key={`${worker.id}:${archivedDraft?.id ?? worker.draft?.id ?? worker.attemptId ?? "active"}`} worker={worker} archivedDraft={archivedDraft} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} collapsible canSubmitReview={!unconfirmedPublication && !reviewDisabled} />) : selectedWorkers.map(worker => <WorkerCard key={worker.id} worker={worker} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} showAutoReview={false} canSubmitReview={!unconfirmedPublication} />)}
+          {kind === "changes" ? reviews.map(({ worker, archivedDraft }) => <WorkerCard key={`${worker.id}:${archivedDraft?.id ?? worker.draft?.id ?? worker.attemptId ?? "active"}`} worker={worker} workers={workers} archivedDraft={archivedDraft} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} collapsible canSubmitReview={!unconfirmedPublication && !reviewDisabled && worker.draft?.headSha === changeDetail?.headSha} />) : selectedWorkers.map(worker => <WorkerCard key={worker.id} worker={worker} workers={workers} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} showAutoReview={false} canSubmitReview={!unconfirmedPublication} />)}
           <p className="forge-prose">{item.body}</p>
           {kind === "issues" ? <>
             <div className="forge-actions">
@@ -308,13 +308,15 @@ function AutoReviewToggle({ enabled, disabled, onChange }: { enabled: boolean; d
 
 function autoReviewProgress(worker: ForgeWorker) {
   if (!worker.autoReview?.enabled) return undefined;
-  if (["paused", "stopped"].includes(worker.status)) return "Auto review is enabled. Resume to continue the loop.";
-  if (["failed", "cleanup_failed"].includes(worker.status)) return "Auto review is waiting for attention. Resume after resolving the error.";
+  const action = worker.pendingPublication ? "Retry publication" : "Resume";
+  if (["paused", "stopped"].includes(worker.status)) return `Auto review is enabled. ${action} to continue the loop.`;
+  if (["failed", "cleanup_failed"].includes(worker.status)) return `Auto review is waiting for attention. ${action} after resolving the error.`;
   return `Auto review · ${{ implementing: "Implementing changes", reviewing: "Reviewing changes", merging: "Waiting to merge" }[worker.autoReview.phase]}`;
 }
 
-function WorkerCard({ worker, archivedDraft, request, placement, runAction, busy, onViewWorker, canSubmitReview = true, showAutoReview = true, collapsible = false }: {
+function WorkerCard({ worker, workers, archivedDraft, request, placement, runAction, busy, onViewWorker, canSubmitReview = true, showAutoReview = true, collapsible = false }: {
   worker: ForgeWorker;
+  workers: ForgeWorker[];
   archivedDraft?: ForgeReviewDraft;
   request: Request;
   placement: ForgePlacement;
@@ -334,20 +336,28 @@ function WorkerCard({ worker, archivedDraft, request, placement, runAction, busy
     finally { controlRunning.current = false; setControlling(false); }
   }
   const automaticReview = !!worker.autoReview?.enabled;
+  const reviews = workers.filter(candidate => worker.kind === "issue" && candidate.kind === "review" && candidate.number === worker.changeNumber &&
+    candidate.repository.provider === worker.repository.provider && candidate.repository.apiUrl === worker.repository.apiUrl && candidate.repository.projectPath === worker.repository.projectPath);
+  const reviewRunning = reviews.some(review => ["starting", "running"].includes(review.status));
   const canPause = ["starting", "running", "awaiting_publication", "awaiting_merge"].includes(worker.status) || (worker.status === "awaiting_review" && automaticReview);
-  const canResume = ["paused", "failed", "stopped", "cleanup_failed"].includes(worker.status) || (["awaiting_review", "awaiting_merge"].includes(worker.status) && !automaticReview);
+  const canResume = !reviewRunning && ["paused", "failed", "stopped", "cleanup_failed", "awaiting_review", "awaiting_merge"].includes(worker.status);
+  const canSync = worker.kind === "issue" && !!worker.changeNumber && !!worker.headSha && !worker.pendingPublication && !worker.mergeAttempted &&
+    ["paused", "failed", "stopped", "awaiting_review", "awaiting_merge"].includes(worker.status) && !reviewRunning &&
+    !reviews.some(review => review.draft && ["posting", "post_failed"].includes(review.draft.status));
   const canStop = ["starting", "running", "awaiting_publication", "awaiting_merge", "paused", "awaiting_review", "failed"].includes(worker.status);
-  const progress = autoReviewProgress(worker);
+  const progress = worker.providerRetryAt ? undefined : autoReviewProgress(worker);
   const draft = archivedDraft ?? worker.draft;
   const card = <article className="forge-worker" aria-label={`${worker.kind} worker #${worker.number}`}>
     <div className="forge-worker-heading"><strong>{worker.kind === "issue" ? "Issue" : "Review"} #{worker.number} · {worker.title}</strong>{!archivedDraft ? <span className={`forge-status forge-status-${worker.status}`}>{worker.status.replaceAll("_", " ")}</span> : null}</div>
     <p className="forge-muted">{worker.repository.projectPath}{worker.branch ? ` · ${worker.branch}` : ""}</p>
     {!archivedDraft && worker.error ? <p role="alert" className="forge-notice">{worker.error}</p> : null}
+    {!archivedDraft && worker.providerRetryAt ? <p role="status">Worker will retry automatically at <time dateTime={worker.providerRetryAt}>{new Date(worker.providerRetryAt).toLocaleString()}</time>.</p> : null}
     {!archivedDraft && worker.status === "awaiting_publication" ? <p role="status">The commit was pushed. Waiting for {worker.repository.provider === "github" ? "GitHub to confirm the pull" : "GitLab to confirm the merge"} request update; work continues automatically.</p> : null}
     {!archivedDraft && progress ? <p role="status" className="forge-auto-review-status">{progress}</p> : !archivedDraft && worker.status === "awaiting_review" ? <p role="status">Ready for review. Resume after feedback to address comments and check approval.</p> : null}
     {!archivedDraft ? <div className="forge-actions">
       {canPause ? <ControlButton size="compact" disabled={controlling} onClick={() => void interruptWorker("pause")}><Pause size={14} /> Pause</ControlButton> : null}
-      {canResume ? <ControlButton size="compact" disabled={busy} onClick={() => void runAction(() => request("forge.worker.resume", { id: worker.id, ...placement }))}><Play size={14} /> Resume</ControlButton> : null}
+      {canResume ? <ControlButton size="compact" disabled={busy} onClick={() => void runAction(() => request("forge.worker.resume", { id: worker.id, ...placement }))}><Play size={14} /> {worker.pendingPublication ? "Retry publication" : "Resume"}</ControlButton> : null}
+      {canSync ? <ControlButton size="compact" disabled={busy} onClick={() => void runAction(() => request("forge.worker.syncAndReview", { id: worker.id, ...placement }))}><RefreshCw size={14} /> Sync and re-review</ControlButton> : null}
       {canStop ? <ControlButton size="compact" disabled={controlling} onClick={() => void interruptWorker("stop")}><Square size={13} /> Stop</ControlButton> : null}
       {showAutoReview && worker.kind === "issue" && worker.status !== "completed" ? <AutoReviewToggle enabled={automaticReview} disabled={busy} onChange={enabled => void runAction(() => request("forge.worker.autoReview", { id: worker.id, enabled, ...placement }))} /> : null}
       {onViewWorker ? <ControlButton size="compact" onClick={() => onViewWorker(worker.id)}><Terminal size={14} /> View worker</ControlButton> : null}

@@ -69,6 +69,28 @@ describe("Issue completion reports", () => {
   });
 });
 
+describe("Saved provider retry deadlines", () => {
+  const scheduled = { ...worker, autoReview, providerRetryAt: "2026-09-10T18:00:00.000Z" };
+  it("preserves a canonical provider retry deadline", () => {
+    expect(parseWorkers([scheduled])).toEqual([scheduled]);
+  });
+
+  it.each([null, 7, "", "tomorrow", "2026-09-10T18:00:00Z", "2026-02-30T18:00:00.000Z"])("rejects an invalid provider retry deadline %j", providerRetryAt => {
+    expect(() => parseWorkers([{ ...worker, providerRetryAt }])).toThrow(/provider retry deadline/);
+  });
+
+  it.each([
+    { kind: "review", autoReview: undefined }, { status: "running" }, { status: "stopped" },
+    { autoReview: undefined }, { autoReview: { ...autoReview, enabled: false } },
+    { mergeAttempted: true, changeNumber: 12, headSha },
+    { publicationState: "creating" }, { publicationState: "uncertain" },
+    { pendingPublication: { report, headSha, repliedDiscussionIds: [] } },
+    { pendingPublication: { report, headSha, confirmed: true, repliedDiscussionIds: [], replyingToDiscussionId: "reply-one" } },
+  ])("rejects a scheduled resume without a safe paused issue loop %#", invalid => {
+    expect(() => parseWorkers([{ ...scheduled, ...invalid }])).toThrow(/provider retry deadline/);
+  });
+});
+
 describe("Saved issue merge attempts", () => {
   it.each([undefined, { ...autoReview, enabled: false }, autoReview])("preserves an issue merge attempt independently of automatic review %#", loop => {
     const saved = { ...worker, changeNumber: 12, headSha, mergeAttempted: true, autoReview: loop };

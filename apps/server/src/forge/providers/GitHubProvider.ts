@@ -46,7 +46,7 @@ interface GitHubReadiness {
   unresolved: number;
   threads: Map<string, { discussionId: string; resolved: boolean }>;
 }
-type GitHubHeadChecks = "passed" | "absent" | "blocked";
+type GitHubHeadChecks = "passed" | "absent" | "pending" | "failed" | "blocked";
 type GitHubSnapshot = Pick<ForgeChangeRequestStatus, "headSha" | "headBranch" | "baseBranch" | "state">;
 const githubMergeMethods = ["squash", "merge", "rebase"] as const;
 type GitHubMergeMethod = typeof githubMergeMethods[number];
@@ -123,7 +123,8 @@ export class GitHubProvider implements ForgeProvider {
       readiness.mergeStateStatus === "BLOCKED" &&
       readiness.mergeable === "MERGEABLE" &&
       status.state === "open" && !draft && approved &&
-      readiness.unresolved === 0 && readiness.headChecks !== "blocked" &&
+      readiness.unresolved === 0 &&
+      (readiness.headChecks === "passed" || readiness.headChecks === "absent") &&
       await this.canMergeThroughUpdateRestriction(status.baseBranch, readiness.headChecks);
     return {
       ...issue,
@@ -134,6 +135,10 @@ export class GitHubProvider implements ForgeProvider {
         readiness.mergeable === "MERGEABLE" &&
         (readiness.mergeStateStatus === "CLEAN" || canUseUpdatePermission),
       requiresBaseUpdate: readiness.mergeStateStatus === "BEHIND",
+      checks: {
+        state: readiness.headChecks === "absent" || readiness.headChecks === "blocked" ? "unknown" : readiness.headChecks,
+        url: `${issue.url}/checks`,
+      },
       approved,
       unresolvedDiscussions: readiness.unresolved,
       comments: [
@@ -625,7 +630,7 @@ export class GitHubProvider implements ForgeProvider {
               : string(request.reviewDecision),
           mergeable: string(request.mergeable),
           mergeStateStatus: string(request.mergeStateStatus),
-          headChecks: request.mergeStateStatus === "BLOCKED" ? githubHeadChecks(request.headRef, headSha) : "blocked",
+          headChecks: githubHeadChecks(request.headRef, headSha),
         };
       const next = string(pageInfo.endCursor);
       if (!next || next === cursor) return invalid();
@@ -646,7 +651,8 @@ function githubHeadChecks(value: unknown, expectedHeadSha: string): GitHubHeadCh
   if (commit.statusCheckRollup === null) return "absent";
   const state = string(record(commit.statusCheckRollup).state);
   if (!["SUCCESS", "PENDING", "EXPECTED", "FAILURE", "ERROR"].includes(state)) return invalid();
-  return state === "SUCCESS" ? "passed" : "blocked";
+  if (state === "SUCCESS") return "passed";
+  return state === "FAILURE" || state === "ERROR" ? "failed" : "pending";
 }
 
 function githubHasRequiredChecks(rules: unknown[]): boolean {

@@ -60,6 +60,7 @@ export interface ForgeWorker {
   draft?: ForgeReviewDraft;
   reviewHistory?: ForgeReviewDraft[];
   error?: string;
+  providerRetryAt?: string;
   startedAt: string;
   updatedAt: string;
 }

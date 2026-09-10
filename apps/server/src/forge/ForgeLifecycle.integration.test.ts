@@ -497,6 +497,73 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     }
   }, 20_000);
 
+  it("syncs an externally rewritten published branch and reviews its new commit before merging", async () => {
+    const fixture = await LifecycleFixture.create({ autoReview: true, approveFirst: true });
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);
+    const implementation = await fixture.completedAssistantTurn(started);
+    await fixture.workflow.poll();
+    const reviewer = await fixture.runningWorker("review");
+    await fixture.completedAssistantTurn(reviewer);
+    fixture.provider.changes.get(7)!.mergeable = false;
+    await fixture.workflow.poll();
+
+    await git(fixture.root, "clone", "--branch", started.branch!, fixture.origin, fixture.repositoryPath);
+    await git(fixture.repositoryPath, "config", "user.name", "Forge Fixture");
+    await git(fixture.repositoryPath, "config", "user.email", "forge-fixture@example.invalid");
+    await git(fixture.repositoryPath, "commit", "--amend", "--allow-empty", "-m", "TEST: externally rewritten issue");
+    const rewrittenHead = await git(fixture.repositoryPath, "rev-parse", "HEAD");
+    await git(fixture.repositoryPath, "push", "--force", "origin", started.branch!);
+    fixture.advanceTime(5_001);
+    await fixture.workflow.poll();
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "failed", headSha: implementation.headSha });
+
+    await fixture.workflow.syncAndReview(started.id, fixture.placement);
+
+    expect(await git(started.worktreePath!, "rev-parse", "HEAD")).toBe(rewrittenHead);
+    expect(await git(started.worktreePath!, "rev-parse", `refs/cloudx/before-sync/${implementation.headSha}`)).toBe(implementation.headSha);
+    const newReview = await fixture.runningWorker("review");
+    expect(newReview).toMatchObject({ id: reviewer.id, headSha: rewrittenHead, reviewHistory: [expect.objectContaining({ headSha: implementation.headSha, status: "posted" })] });
+    expect(fixture.provider.merges).toEqual([]);
+    const receipt = await fixture.completedAssistantTurn(newReview);
+    expect(receipt.headSha).toBe(rewrittenHead);
+    fixture.provider.changes.get(7)!.mergeable = true;
+    await fixture.workflow.poll();
+    expect(fixture.provider.merges).toEqual([rewrittenHead]);
+    expect(fixture.provider.submissions.map(review => review.headSha)).toEqual([implementation.headSha, rewrittenHead]);
+    expect(fixture.factory.processes).toHaveLength(3);
+    expect(fixture.gitPushes).toHaveLength(1);
+    expect(await fixture.store.read()).toEqual([]);
+  }, 20_000);
+
+  it("retains a one-hour provider reset across restart and resumes the completed approval automatically", async () => {
+    const fixture = await LifecycleFixture.create({ autoReview: true, approveFirst: true });
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);
+    const implementation = await fixture.completedAssistantTurn(started);
+    await fixture.workflow.poll();
+    const reviewer = await fixture.runningWorker("review");
+    await fixture.completedAssistantTurn(reviewer);
+    fixture.provider.changes.get(7)!.mergeable = false;
+    await fixture.workflow.poll();
+    vi.spyOn(fixture.provider, "getChangeRequest").mockRejectedValueOnce(new ForgeProviderUnavailableError("rate_limited", "request", { retryable: true, retryAfterMs: 3_600_000 }));
+    fixture.advanceTime(5_001);
+    await fixture.workflow.poll();
+    const waiting = await fixture.worker(started.id);
+    expect(waiting).toMatchObject({ status: "paused", providerRetryAt: expect.any(String) });
+    const resetAt = Date.parse(waiting.providerRetryAt!);
+    await fixture.restartWorkflow();
+    fixture.provider.changes.get(7)!.mergeable = true;
+    vi.spyOn(Date, "now").mockReturnValue(resetAt - 1);
+    await fixture.workflow.poll();
+    expect(fixture.provider.merges).toEqual([]);
+    vi.spyOn(Date, "now").mockReturnValue(resetAt);
+    await fixture.workflow.poll();
+    expect(fixture.provider.merges).toEqual([implementation.headSha]);
+    expect(fixture.provider.submissions).toHaveLength(1);
+    expect(fixture.factory.processes).toHaveLength(2);
+    expect(fixture.gitPushes).toHaveLength(1);
+    expect(await fixture.store.read()).toEqual([]);
+  }, 20_000);
+
   it.each(["automatic recovery", "server restart", "local edits"])("retains completed work after a provider outage during %s", async recovery => {
     const fixture = await LifecycleFixture.create({ autoReview: true, approveFirst: true });
     const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);

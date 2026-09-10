@@ -23,7 +23,7 @@ const installation = {
   id: 42,
   app_id: 123,
   suspended_at: null,
-  permissions: { contents: "write", issues: "write", pull_requests: "write" },
+  permissions: { contents: "write", issues: "write", pull_requests: "write", workflows: "write" },
 };
 
 describe("GitHub application registration", () => {
@@ -49,6 +49,7 @@ describe("GitHub application registration", () => {
         contents: "write",
         issues: "write",
         pull_requests: "write",
+        workflows: "write",
       },
     });
     expect(reviewer.manifest.default_permissions).toEqual({
@@ -183,7 +184,17 @@ describe("GitHub application registration", () => {
     },
   );
 
-  it("accepts read-only repository content for the reviewer", async () => {
+  it.each([undefined, "read"])("requires the worker installation to grant Workflows: write instead of %s", async workflows => {
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json({
+      ...installation,
+      permissions: { ...installation.permissions, workflows },
+    }));
+    await expect(new ForgeRegistrationClient(fetcher).githubInstallation(repository, app, "42", "worker"))
+      .rejects.toThrow("Grant the worker GitHub App Workflows: write permission, approve the updated permissions for its installation, then continue installation.");
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts read-only repository content without workflow permission for the reviewer", async () => {
     const fetcher = vi.fn<typeof fetch>(async () =>
       Response.json({
         ...installation,
