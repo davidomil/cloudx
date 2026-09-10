@@ -40,6 +40,10 @@ export interface ForgeWorker {
   tabId?: string;
   attemptId?: string;
   publicationState?: "creating" | "uncertain" | "created";
+  mergeConflict?: {
+    headSha: string;
+    targetHeadSha: string;
+  };
   rebaseRecovery?: {
     branch: string;
     baseBranch: string;

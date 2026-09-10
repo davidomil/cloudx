@@ -34,6 +34,7 @@ function fixture() {
     linkedIssues: [],
     comments: [],
     baseSha: "b".repeat(40),
+    targetHeadSha: "b".repeat(40),
   };
   const provider = {
     listIssues: vi.fn(),
@@ -1957,6 +1958,159 @@ describe("Forge issue auto review", () => {
     return f;
   }
 
+  it("detects an approved passing-checks conflict once and exposes the validated revision", async () => {
+    const f = await approvedIssue();
+    f.change.checks = { state: "passed", url: `${f.change.url}/checks` };
+    f.change.hasConflicts = true;
+    f.reports.read.mockResolvedValue(undefined);
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "running", mergeConflict: {
+      headSha: f.change.headSha, targetHeadSha: f.change.targetHeadSha,
+    }, rebaseRecovery: { phase: "resolving" } });
+    for (let poll = 0; poll < 3; poll++) await f.poll();
+    expect(f.runtime.prepareIssueRebase).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("dispatches a conflict discovered immediately after posting approval in the same poll", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    const postReview = f.provider.postReview.getMockImplementation()!;
+    f.provider.postReview.mockImplementation(async (...args) => {
+      const result = await postReview(...args);
+      f.change.hasConflicts = true;
+      f.change.mergeable = false;
+      return result;
+    });
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "running", rebaseRecovery: { phase: "resolving" } });
+    expect(f.runtime.prepareIssueRebase).toHaveBeenCalledOnce();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("records conflicts while a reviewer is active and waits for its completion", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    f.change.hasConflicts = true;
+    f.reports.read.mockResolvedValue(undefined);
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_review", mergeConflict: {
+      headSha: f.change.headSha, targetHeadSha: f.change.targetHeadSha,
+    } });
+    expect(f.runtime.prepareIssueRebase).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it("refreshes a manual worker's conflict blocker without starting recovery", async () => {
+    const f = await approvedIssue();
+    await f.service.setAutoReview(f.issue.id, false, placement);
+    f.change.hasConflicts = true;
+    f.advanceTime(30_000); await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_review", mergeConflict: {
+      headSha: f.change.headSha, targetHeadSha: f.change.targetHeadSha,
+    } });
+    expect(f.runtime.prepareIssueRebase).not.toHaveBeenCalled();
+    f.change.hasConflicts = false;
+    f.advanceTime(30_000); await f.poll();
+    expect(f.currentIssue().mergeConflict).toBeUndefined();
+    expect(f.runtime.prepareIssueRebase).not.toHaveBeenCalled();
+  });
+
+  it.each(["pause", "stop"] as const)("preserves explicit %s when conflicts appear until the manual action", async action => {
+    const f = await approvedIssue();
+    await f.service[action](f.issue.id);
+    f.change.hasConflicts = true;
+    f.reports.read.mockResolvedValue(undefined);
+    f.advanceTime(30_000); await f.poll();
+    expect(f.currentIssue().status).toBe(action === "pause" ? "paused" : "stopped");
+    expect(f.runtime.prepareIssueRebase).not.toHaveBeenCalled();
+    const recovered = await f.service.rebaseAndResolve(f.issue.id, placement);
+    expect(recovered).toMatchObject({ status: "running", rebaseRecovery: { phase: "resolving" } });
+    await expect(f.service.rebaseAndResolve(f.issue.id, placement)).rejects.toThrow(/idle/);
+    expect(f.runtime.prepareIssueRebase).toHaveBeenCalledOnce();
+  });
+
+  it("rechecks a stale conflict before launching the dashboard action", async () => {
+    const f = await approvedIssue();
+    await f.service.pause(f.issue.id);
+    await expect(f.service.rebaseAndResolve(f.issue.id, placement)).rejects.toThrow(/no longer reports.*conflict/i);
+    expect(f.runtime.prepareIssueRebase).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { publicationState: "creating" }, { publicationState: "uncertain" }, { mergeAttempted: true },
+    { pendingPublication: { report: { kind: "issue", title: "Fix", body: "Checked", discussionReplies: [], resolvedDiscussionIds: [] }, repliedDiscussionIds: [] } },
+  ])("rejects recovery while publication or merge needs reconciliation %#", async pending => {
+    const f = await approvedIssue();
+    await f.service.pause(f.issue.id);
+    const saved = f.stored();
+    Object.assign(saved[0], pending);
+    await f.deps.store.write(saved);
+    f.change.hasConflicts = true;
+    const restarted = new ForgeWorkflowService(f.deps);
+    await expect(restarted.rebaseAndResolve(f.issue.id, placement)).rejects.toThrow(/publication or merge/);
+    expect(f.runtime.prepareIssueRebase).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["headSha", "headBranch", "baseBranch"] as const)("rejects a changed %s before the recovery action", async field => {
+    const f = await approvedIssue();
+    await f.service.pause(f.issue.id);
+    f.change.hasConflicts = true;
+    f.change[field] = field === "headSha" ? "d".repeat(40) : "other-branch";
+    await expect(f.service.rebaseAndResolve(f.issue.id, placement)).rejects.toThrow(/branch|identity/);
+    expect(f.currentIssue().mergeConflict).toBeUndefined();
+    expect(f.runtime.prepareIssueRebase).not.toHaveBeenCalled();
+  });
+
+  it("dispatches recovery when the target conflicts at the last local merge check", async () => {
+    const f = await approvedIssue();
+    f.change.mergeable = true;
+    f.runtime.verifyPublishedWorkspace.mockImplementation(async () => {
+      f.change.hasConflicts = true;
+      f.change.mergeable = false;
+    });
+    f.reports.read.mockResolvedValue(undefined);
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "running", rebaseRecovery: { phase: "resolving" } });
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(f.runtime.prepareIssueRebase).toHaveBeenCalledOnce();
+  });
+
+  it.each(["pause", "stop"] as const)("honors %s during conflict preparation without launching a coding worker", async action => {
+    const f = await approvedIssue();
+    f.change.hasConflicts = true;
+    f.reports.read.mockResolvedValue(undefined);
+    const preparing = deferred<void>();
+    const prepared = deferred<{ targetHeadSha: string; originalHeadSha: string }>();
+    f.runtime.prepareIssueRebase.mockImplementation(async () => {
+      preparing.resolve();
+      return prepared.promise;
+    });
+    const polling = f.poll();
+    await preparing.promise;
+    const stopping = f.service[action](f.issue.id);
+    prepared.resolve({ targetHeadSha: f.change.targetHeadSha, originalHeadSha: f.change.headSha });
+    await Promise.all([polling, stopping]);
+    expect(f.currentIssue().status).toBe(action === "pause" ? "paused" : "stopped");
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    await f.poll();
+    expect(f.runtime.prepareIssueRebase).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a target that changes between provider observation and rebase preparation", async () => {
+    const f = await approvedIssue();
+    f.change.hasConflicts = true;
+    f.runtime.prepareIssueRebase.mockResolvedValue({ targetHeadSha: "d".repeat(40), originalHeadSha: f.change.headSha });
+    f.reports.read.mockResolvedValue(undefined);
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "failed", error: expect.stringContaining("target branch changed") });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
   async function resolvingIssue() {
     const f = await approvedIssue();
     const oldReview = f.currentReview();
@@ -1975,6 +2129,13 @@ describe("Forge issue auto review", () => {
     });
     return { ...f, oldReview, resolvedReport, publishRebase };
   }
+
+  it("prevents a new reviewer from running alongside conflict recovery", async () => {
+    const f = await resolvingIssue();
+    await expect(f.service.startReview(f.deps.settings().repository, 7, false, placement)).rejects.toThrow(/conflict recovery/);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.currentIssue().status).toBe("running");
+  });
 
   it("rebases a conflicting approved branch and requires a fresh review even when the provider retains approval", async () => {
     const f = await resolvingIssue();
@@ -2226,7 +2387,7 @@ describe("Forge issue auto review", () => {
     expect(f.provider.merge).not.toHaveBeenCalled();
   });
 
-  it.each(["manual", "automatic"])("starts recovery for an advanced target with an unchanged provider merge base through %s Resume", async mode => {
+  it.each(["manual", "automatic", "poll"])("starts recovery for an advanced target with an unchanged provider merge base through %s", async mode => {
     const f = await resolvingIssue();
     f.resolvedReport(); f.publishRebase(); await f.poll();
     f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Resolution preserves both changes", comments: [] });
@@ -2235,11 +2396,13 @@ describe("Forge issue auto review", () => {
     const completedRecovery = f.currentIssue().rebaseRecovery!;
     const previousReview = f.currentReview();
     const targetHeadSha = "d".repeat(40);
+    f.change.targetHeadSha = targetHeadSha;
     expect(f.change.baseSha).toBe(completedRecovery.targetHeadSha);
     f.change.hasConflicts = true;
     f.reports.read.mockResolvedValue(undefined);
     f.runtime.prepareIssueRebase.mockResolvedValue({ targetHeadSha, originalHeadSha: f.change.headSha });
-    await f.service.resume(f.issue.id, placement);
+    if (mode === "poll") await f.poll();
+    else await f.service.resume(f.issue.id, placement);
     expect(f.runtime.prepareIssueRebase).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), completedRecovery.headSha, "main", expect.any(AbortSignal));
     expect(f.runtime.prepareIssueRebase).toHaveBeenCalledTimes(2);
     expect(f.currentIssue()).toMatchObject({ status: "running", rebaseRecovery: {
@@ -2529,7 +2692,9 @@ describe("Forge issue auto review", () => {
     f.change.mergeable = true;
     f.advanceTime(300_001);
     await service.poll();
-    expect(f.provider.getChangeRequest).toHaveBeenCalledTimes(checks);
+    expect(f.provider.getChangeRequest).toHaveBeenCalledTimes(checks + (action === "disable" ? 1 : 0));
+    expect(f.runtime.prepareIssueRebase).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
     expect(f.provider.merge).not.toHaveBeenCalled();
     expect(f.currentReview()).toMatchObject({ status: "completed", draft: { status: "posted", event: "approve" } });
     if (action !== "disable") expect(f.currentIssue().status).toBe(action === "stop" ? "stopped" : "paused");

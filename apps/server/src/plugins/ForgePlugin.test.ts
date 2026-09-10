@@ -25,6 +25,7 @@ async function fixture() {
     startIssue: vi.fn(async () => ({ id: "worker" })),
     setAutoReview: vi.fn(async () => ({ id: "worker" })),
     syncAndReview: vi.fn(async () => ({ id: "worker" })),
+    rebaseAndResolve: vi.fn(async () => ({ id: "worker" })),
     dashboard: vi.fn(async () => ({ workers: [] })),
     markReview: vi.fn(async () => {}),
     saveReview: vi.fn(async () => ({ id: "worker" })),
@@ -53,6 +54,28 @@ async function fixture() {
   return { plugin, config, settings, hooks, workflow, connections };
 }
 describe("Forge plugin boundary", () => {
+  it.each(["ui", "http"] as const)("starts conflict recovery through %s using the selected worker and pane", async kind => {
+    const { hooks, workflow } = await fixture();
+    await expect(hooks.call("forge.worker.rebaseAndResolve", { id: "worker", windowId: "window", paneId: "pane" }, { caller: { kind } })).resolves.toEqual({ worker: { id: "worker" } });
+    expect(workflow.rebaseAndResolve).toHaveBeenCalledExactlyOnceWith("worker", { windowId: "window", paneId: "pane" });
+  });
+
+  it.each([
+    { id: undefined }, { id: "" }, { id: 7 }, { id: "w".repeat(129) },
+    { windowId: undefined }, { windowId: "" }, { paneId: undefined }, { paneId: "" },
+    { repositoryPath: "/untrusted" }, { headSha: "a".repeat(40) }, { targetHeadSha: "b".repeat(40) },
+  ])("rejects invalid conflict recovery arguments before touching the worker %#", async invalid => {
+    const { hooks, workflow } = await fixture();
+    await expect(hooks.call("forge.worker.rebaseAndResolve", { id: "worker", windowId: "window", paneId: "pane", ...invalid }, { caller: { kind: "ui" } })).rejects.toThrow(/invalid input/);
+    expect(workflow.rebaseAndResolve).not.toHaveBeenCalled();
+  });
+
+  it("does not expose conflict recovery to automation hooks", async () => {
+    const { hooks, workflow } = await fixture();
+    await expect(hooks.call("forge.worker.rebaseAndResolve", { id: "worker", windowId: "window", paneId: "pane" }, { caller: { kind: "automation" } })).rejects.toThrow(/exposed/);
+    expect(workflow.rebaseAndResolve).not.toHaveBeenCalled();
+  });
+
   it("syncs the selected worker using the current pane placement", async () => {
     const { hooks, workflow } = await fixture();
     await expect(hooks.call("forge.worker.syncAndReview", { id: "worker", windowId: "window", paneId: "pane" }, { caller: { kind: "ui" } })).resolves.toEqual({ worker: { id: "worker" } });

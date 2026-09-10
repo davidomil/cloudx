@@ -47,7 +47,7 @@ interface GitHubReadiness {
   threads: Map<string, { discussionId: string; resolved: boolean }>;
 }
 type GitHubHeadChecks = "passed" | "absent" | "pending" | "failed" | "blocked";
-type GitHubSnapshot = Pick<ForgeChangeRequestStatus, "headSha" | "headBranch" | "baseBranch" | "state">;
+type GitHubSnapshot = Pick<ForgeChangeRequest, "headSha" | "headBranch" | "baseBranch" | "state" | "targetHeadSha">;
 const githubMergeMethods = ["squash", "merge", "rebase"] as const;
 type GitHubMergeMethod = typeof githubMergeMethods[number];
 
@@ -101,7 +101,7 @@ export class GitHubProvider implements ForgeProvider {
     const headSha = githubHeadSha(head.sha);
     const baseSha = githubHeadSha(record(raw.base).sha);
     const { status, readiness } = await this.readSnapshot(number, {
-      headSha, headBranch: string(head.ref), baseBranch: string(record(raw.base).ref), state: issue.state,
+      headSha, headBranch: string(head.ref), baseBranch: string(record(raw.base).ref), state: issue.state, targetHeadSha: baseSha,
     });
     const latestReviews = new Map<string, Record<string, unknown>>();
     for (const value of reviews) {
@@ -148,6 +148,7 @@ export class GitHubProvider implements ForgeProvider {
         ...reviews.map(githubReviewComment),
       ],
       baseSha,
+      targetHeadSha: baseSha,
     };
   }
 
@@ -168,7 +169,7 @@ export class GitHubProvider implements ForgeProvider {
         method: "POST",
         graphql: true,
         body: {
-          query: "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){number state merged headRefOid headRefName baseRefName closingIssuesReferences(first:100,after:$cursor){nodes{id number title url state repository{nameWithOwner}} pageInfo{hasNextPage endCursor}}}}}",
+          query: "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){number state merged headRefOid headRefName baseRefName baseRefOid closingIssuesReferences(first:100,after:$cursor){nodes{id number title url state repository{nameWithOwner}} pageInfo{hasNextPage endCursor}}}}}",
           variables: { owner, name, number, cursor },
         },
       })).body);
@@ -176,6 +177,8 @@ export class GitHubProvider implements ForgeProvider {
         throw new ForgeProviderError("GitHub could not verify the request status and linked issues.", 502);
       const request = record(record(record(response.data).repository).pullRequest);
       const current = githubStatus(request, number);
+      if (expected && githubHeadSha(request.baseRefOid) !== expected.targetHeadSha)
+        throw new ForgeProviderError("The target branch changed while loading. Refresh before proceeding.", 409);
       if (expected && (current.headBranch !== expected.headBranch || current.baseBranch !== expected.baseBranch || current.state !== expected.state))
         throw new ForgeProviderError("The request changed while loading. Refresh before proceeding.", 409);
       if (status && (current.state !== status.state || current.headBranch !== status.headBranch || current.baseBranch !== status.baseBranch))
@@ -557,7 +560,7 @@ export class GitHubProvider implements ForgeProvider {
   private async readSnapshot(number: number, expected: GitHubSnapshot): Promise<{ status: ForgeChangeRequestStatus; readiness: GitHubReadiness }> {
     const results = await Promise.allSettled([
       this.readStatus(number, expected),
-      this.readiness(number, expected.headSha),
+      this.readiness(number, expected),
     ]);
     for (const result of results)
       if (result.status === "rejected" && !(result.reason instanceof ForgeHeadChangedError)) throw result.reason;
@@ -574,7 +577,7 @@ export class GitHubProvider implements ForgeProvider {
 
   private async readiness(
     number: number,
-    headSha: string,
+    expected: GitHubSnapshot,
   ): Promise<GitHubReadiness> {
     const [owner, name] = this.http.repository.projectPath.split("/");
     let cursor: string | null = null;
@@ -591,7 +594,7 @@ export class GitHubProvider implements ForgeProvider {
             graphql: true,
             body: {
               query:
-                "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid headRef{target{... on Commit{oid statusCheckRollup{state}}}} reviewDecision mergeable mergeStateStatus reviewThreads(first:100,after:$cursor){nodes{id isResolved comments(first:1){nodes{id}}} pageInfo{hasNextPage endCursor}}}}}",
+                "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid headRefName baseRefName baseRefOid state headRef{target{... on Commit{oid statusCheckRollup{state}}}} reviewDecision mergeable mergeStateStatus reviewThreads(first:100,after:$cursor){nodes{id isResolved comments(first:1){nodes{id}}} pageInfo{hasNextPage endCursor}}}}}",
               variables: { owner, name, number, cursor },
             },
           })
@@ -606,8 +609,12 @@ export class GitHubProvider implements ForgeProvider {
         record(record(response.data).repository).pullRequest,
       );
       const observedHeadSha = githubHeadSha(request.headRefOid);
-      if (observedHeadSha !== headSha)
-        throw new ForgeHeadChangedError([headSha, observedHeadSha]);
+      if (githubHeadSha(request.baseRefOid) !== expected.targetHeadSha)
+        throw new ForgeProviderError("The target branch changed while loading. Refresh before proceeding.", 409);
+      if (string(request.headRefName) !== expected.headBranch || string(request.baseRefName) !== expected.baseBranch || string(request.state).toLowerCase() !== expected.state)
+        throw new ForgeProviderError("The request changed while loading. Refresh before proceeding.", 409);
+      if (observedHeadSha !== expected.headSha)
+        throw new ForgeHeadChangedError([expected.headSha, observedHeadSha]);
       const threads = record(request.reviewThreads);
       for (const value of list(threads.nodes)) {
         const thread = record(value);
@@ -631,7 +638,7 @@ export class GitHubProvider implements ForgeProvider {
               : string(request.reviewDecision),
           mergeable: string(request.mergeable),
           mergeStateStatus: string(request.mergeStateStatus),
-          headChecks: githubHeadChecks(request.headRef, headSha),
+          headChecks: githubHeadChecks(request.headRef, expected.headSha),
         };
       const next = string(pageInfo.endCursor);
       if (!next || next === cursor) return invalid();

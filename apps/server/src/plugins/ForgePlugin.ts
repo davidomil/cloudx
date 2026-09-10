@@ -191,6 +191,16 @@ export class ForgePlugin implements WorkspacePlugin {
         }),
       ),
       hook(
+        "worker.rebaseAndResolve",
+        "Rebase and resolve conflicts",
+        "external",
+        { id, ...placement },
+        ["id", "windowId", "paneId"],
+        async (input) => ({
+          worker: await this.service().workflow.rebaseAndResolve(String(input.id), place(input)),
+        }),
+      ),
+      hook(
         "review.save",
         "Save review draft",
         "write",

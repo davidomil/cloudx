@@ -55,6 +55,7 @@ const hubStatus = {
   headRefOid: headSha,
   headRefName: "fix-race",
   baseRefName: "main",
+  baseRefOid: previousSha,
   closingIssuesReferences: {
     nodes: [],
     pageInfo: { hasNextPage: false, endCursor: null },
@@ -223,6 +224,7 @@ function hubFixture(
 function labFixture(
   overrides: {
     request?: Record<string, unknown>;
+    target?: Record<string, unknown>;
     approvals?: Record<string, unknown>;
     version?: Record<string, unknown>;
     notes?: unknown[];
@@ -233,6 +235,8 @@ function labFixture(
   return harness(gitlab, (url, options) => {
     const path = url.pathname;
     if (overrides.intercept) return overrides.intercept(url, options);
+    if (path.includes("/repository/branches/"))
+      return response({ name: overrides.request?.target_branch ?? "main", commit: { id: previousSha }, ...overrides.target });
     if (options.method === "PUT" && path.endsWith("/merge"))
       return response({ state: "merged", merge_commit_sha: "c".repeat(40) });
     if (path.endsWith("/approvals"))
@@ -920,6 +924,114 @@ describe("inconsistent provider head snapshots", () => {
   });
 });
 
+describe("conflict target revision snapshots", () => {
+  const targetHeadSha = "c".repeat(40);
+
+  it("reports a fresh GitHub conflict pair after the target advances without changing the source head", async () => {
+    const base = hubFixture({ graphql: { mergeStateStatus: "DIRTY", mergeable: "CONFLICTING" } });
+    let currentTarget = previousSha;
+    const { provider } = harness(github, async (url, options) => {
+      const value = await (await base.fetcher(url, options)).json();
+      if (url.pathname === "/graphql") value.data.repository.pullRequest.baseRefOid = currentTarget;
+      if (url.pathname.endsWith("/pulls/7")) value.base.sha = currentTarget;
+      return response(value);
+    });
+    expect(await provider.getChangeRequest(7)).toMatchObject({ hasConflicts: true, headSha, targetHeadSha: previousSha });
+    currentTarget = targetHeadSha;
+    expect(await provider.getChangeRequest(7)).toMatchObject({ hasConflicts: true, headSha, targetHeadSha });
+  });
+
+  it.each(["closingIssuesReferences", "reviewThreads"])("rejects GitHub target movement in %s evidence", async connection => {
+    const base = hubFixture({ graphql: { mergeStateStatus: "DIRTY", mergeable: "CONFLICTING" } });
+    const { provider } = harness(github, async (url, options) => {
+      const value = await (await base.fetcher(url, options)).json();
+      if (url.pathname === "/graphql" && JSON.parse(String(options.body)).query.includes(connection))
+        value.data.repository.pullRequest.baseRefOid = targetHeadSha;
+      return response(value);
+    });
+    const error = await provider.getChangeRequest(7).catch(error => error);
+    expect(error).not.toBeInstanceOf(ForgeHeadChangedError);
+    expect(error).toMatchObject({ statusCode: 409, message: expect.stringContaining("target branch changed") });
+  });
+
+  it.each(["closingIssuesReferences", "reviewThreads"])("rejects GitHub target movement while paginating %s", async connection => {
+    const base = hubFixture({ graphql: { mergeStateStatus: "DIRTY" } });
+    const { provider } = harness(github, async (url, options) => {
+      const value = await (await base.fetcher(url, options)).json();
+      if (url.pathname === "/graphql" && JSON.parse(String(options.body)).query.includes(connection)) {
+        const { cursor } = JSON.parse(String(options.body)).variables;
+        Object.assign(value.data.repository.pullRequest, {
+          baseRefOid: cursor ? targetHeadSha : previousSha,
+          [connection]: { nodes: [], pageInfo: { hasNextPage: !cursor, endCursor: "next" } },
+        });
+      }
+      return response(value);
+    });
+    await expect(provider.getChangeRequest(7)).rejects.toThrow("target branch changed");
+  });
+
+  it.each([undefined, null, "", "invalid", 12])("rejects malformed GitHub target revision %s", async baseRefOid => {
+    const { provider } = hubFixture({ graphql: { baseRefOid, mergeStateStatus: "DIRTY" } });
+    await expect(provider.getChangeRequest(7)).rejects.toThrow("invalid or incomplete");
+  });
+
+  it.each([{ headRefName: "other" }, { baseRefName: "release" }, { state: "CLOSED" }])("rejects changed GitHub readiness branches or state %j", async change => {
+    const base = hubFixture({ graphql: { mergeStateStatus: "DIRTY" } });
+    const { provider } = harness(github, async (url, options) => {
+      const value = await (await base.fetcher(url, options)).json();
+      if (url.pathname === "/graphql" && JSON.parse(String(options.body)).query.includes("reviewThreads"))
+        Object.assign(value.data.repository.pullRequest, change);
+      return response(value);
+    });
+    await expect(provider.getChangeRequest(7)).rejects.toThrow("request changed while loading");
+  });
+
+  it("reports the current GitLab target tip separately from the historical diff base", async () => {
+    const { provider, calls } = labFixture({
+      request: { target_branch: "release/v1", detailed_merge_status: "conflict" },
+      target: { commit: { id: targetHeadSha } },
+    });
+    expect(await provider.getChangeRequest(7)).toMatchObject({
+      hasConflicts: true, headSha, baseSha: previousSha, targetHeadSha,
+    });
+    const reads = calls.map(call => call.url.pathname);
+    const targetPath = "/api/v4/projects/group%2Fsubgroup%2Frepo/repository/branches/release%2Fv1";
+    expect(reads.slice(-3)).toEqual([
+      targetPath, "/api/v4/projects/group%2Fsubgroup%2Frepo/merge_requests/7", targetPath,
+    ]);
+  });
+
+  it("rejects GitLab target movement during the final readiness read", async () => {
+    const base = labFixture({ request: { detailed_merge_status: "conflict" } });
+    let targetReads = 0;
+    const { provider, calls } = harness(gitlab, (url, options) => {
+      if (url.pathname.includes("/repository/branches/"))
+        return response({ name: "main", commit: { id: ++targetReads === 1 ? previousSha : targetHeadSha } });
+      return base.fetcher(url, options);
+    });
+    const error = await provider.getChangeRequest(7).catch(error => error);
+    expect(error).not.toBeInstanceOf(ForgeHeadChangedError);
+    expect(error).toMatchObject({ statusCode: 409, message: expect.stringContaining("target branch changed") });
+    expect(calls.filter(call => call.url.pathname.includes("/repository/branches/"))).toHaveLength(2);
+  });
+
+  it.each([
+    { name: "other" }, { name: null }, { commit: null },
+    ...[undefined, null, "", "invalid", 12].map(id => ({ commit: { id } })),
+  ])("rejects incomplete or mismatched GitLab target evidence %j", async target => {
+    const { provider } = labFixture({ request: { detailed_merge_status: "conflict" }, target });
+    await expect(provider.getChangeRequest(7)).rejects.toThrow("invalid or incomplete");
+  });
+
+  it.each([403, 404])("does not retry or use historical GitLab diff refs after target lookup returns %s", async status => {
+    const base = labFixture({ request: { detailed_merge_status: "conflict" } });
+    const { provider, calls } = harness(gitlab, (url, options) => url.pathname.includes("/repository/branches/")
+      ? new Response(null, { status }) : base.fetcher(url, options));
+    await expect(provider.getChangeRequest(7)).rejects.toThrow(`HTTP ${status}`);
+    expect(calls.filter(call => call.url.pathname.includes("/repository/branches/"))).toHaveLength(1);
+  });
+});
+
 describe("GitHub review and exact-commit merge", () => {
   it.each([
     ["SUCCESS", "passed"], ["PENDING", "pending"], ["EXPECTED", "pending"],
@@ -991,7 +1103,7 @@ describe("GitHub review and exact-commit merge", () => {
     { mergeStateStatus: "BLOCKED", mergeable: "CONFLICTING" },
   ])("reports a definitive GitHub conflict while preserving review readiness %#", async graphql => {
     const { provider, calls } = hubFixture({ graphql });
-    expect(await provider.getChangeRequest(7)).toMatchObject({ hasConflicts: true, reviewReady: true, mergeable: false, requiresBaseUpdate: false });
+    expect(await provider.getChangeRequest(7)).toMatchObject({ hasConflicts: true, reviewReady: true, mergeable: false, requiresBaseUpdate: false, headSha, targetHeadSha: previousSha, approved: true, checks: { state: "passed" } });
     await expect(provider.merge(7, headSha)).rejects.toThrow("must be open");
     expect(calls.some(call => call.options.method === "PUT")).toBe(false);
   });
@@ -1618,8 +1730,11 @@ describe("GitLab review and exact-commit merge", () => {
   });
 
   it("reports a definitive GitLab conflict while preserving review readiness", async () => {
-    const { provider, calls } = labFixture({ request: { detailed_merge_status: "conflict" } });
-    expect(await provider.getChangeRequest(7)).toMatchObject({ hasConflicts: true, reviewReady: true, mergeable: false, requiresBaseUpdate: false });
+    const { provider, calls } = labFixture({ request: {
+      detailed_merge_status: "conflict",
+      head_pipeline: { sha: headSha, status: "success", web_url: "https://gitlab.example/group/subgroup/repo/-/pipelines/17" },
+    } });
+    expect(await provider.getChangeRequest(7)).toMatchObject({ hasConflicts: true, reviewReady: true, mergeable: false, requiresBaseUpdate: false, headSha, targetHeadSha: previousSha, approved: true, checks: { state: "passed" } });
     await expect(provider.merge(7, headSha)).rejects.toThrow("must be open");
     expect(calls.some(call => call.options.method === "PUT")).toBe(false);
   });

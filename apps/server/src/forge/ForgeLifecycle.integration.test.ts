@@ -1636,14 +1636,15 @@ class LocalForgeProvider implements ForgeProvider {
         hasConflicts = true;
       }
     }
-    return { ...structuredClone(change), ...status, baseSha, requiresBaseUpdate, hasConflicts, mergeable: change.mergeable && !requiresBaseUpdate && !hasConflicts };
+    return { ...structuredClone(change), ...status, baseSha, targetHeadSha: baseSha, requiresBaseUpdate, hasConflicts, mergeable: change.mergeable && !requiresBaseUpdate && !hasConflicts };
   }
   async findChangeRequestByBranch(headBranch: string, baseBranch: string) {
     const change = [...this.changes.values()].find((request) => request.headBranch === headBranch && request.baseBranch === baseBranch);
     return change ? this.getChangeRequest(change.number) : undefined;
   }
   async createChangeRequest(input: ForgeCreateChangeRequest) {
-    this.changes.set(7, { number: 7, title: input.title, body: input.body, url: "https://github.com/fixture/cloudx/pull/7", state: "open", labels: [], author: "worker-bot", updatedAt: new Date().toISOString(), draft: false, headSha: "", baseSha: await git(this.origin, "rev-parse", input.baseBranch), headBranch: input.headBranch, baseBranch: input.baseBranch, merged: false, reviewReady: true, mergeable: true, requiresBaseUpdate: false, approved: false, unresolvedDiscussions: 0, comments: [], linkedIssues: [] });
+    const targetHeadSha = await git(this.origin, "rev-parse", input.baseBranch);
+    this.changes.set(7, { number: 7, title: input.title, body: input.body, url: "https://github.com/fixture/cloudx/pull/7", state: "open", labels: [], author: "worker-bot", updatedAt: new Date().toISOString(), draft: false, headSha: "", baseSha: targetHeadSha, targetHeadSha, headBranch: input.headBranch, baseBranch: input.baseBranch, merged: false, reviewReady: true, mergeable: true, requiresBaseUpdate: false, approved: false, unresolvedDiscussions: 0, comments: [], linkedIssues: [] });
     return this.getChangeRequest(7);
   }
   async postReview(number: number, review: ForgeReviewSubmission): Promise<ForgeReviewPublication> {
