@@ -358,6 +358,47 @@ def test_reanalysis_preserves_upload_metadata_for_sources_without_filename_exten
     assert (archive.root / after["snapshot_path"]).parent.joinpath("metadata.json").read_bytes() == metadata_before
 
 
+@pytest.mark.parametrize("source_type", ["book", "website"])
+@pytest.mark.parametrize("import_sibling", [False, True], ids=["upload-only", "shared-url-metadata"])
+def test_reanalysis_preserves_html_format_when_a_url_replaces_shared_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_type: str, import_sibling: bool) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+    source_bytes = b"<html><body><h1>RETAINED-HTML-FORMAT-19</h1><script>HIDDEN-SCRIPT-19</script></body></html>"
+    upload = archive.ingest_upload(filename="download", content=source_bytes, source_type=source_type, content_type="text/html")
+    archive.enrich_document(
+        upload.document_id,
+        spans=[ExtractedSpan("Previous enrichment stays available.", "ai:metadata")],
+        model="gpt-test",
+        skill_ids=["documentation-enrich-metadata"],
+    )
+    before = archive.get_document(upload.document_id)
+    snapshot = archive.root / before["snapshot_path"]
+    assert [(chunk["locator"], chunk["text"]) for chunk in before["chunks"] if chunk["chunk_origin"] == "source"] == [("html", "RETAINED-HTML-FORMAT-19")]
+    if import_sibling:
+        url = "https://example.com/download"
+        response = httpx.Response(200, request=httpx.Request("GET", url), headers={"content-type": "application/octet-stream"}, content=source_bytes)
+        monkeypatch.setattr(archive_module, "fetch_url_bytes", lambda _url, _limit: (response, source_bytes))
+        sibling = archive.ingest_url(url)
+        sibling_before = archive.get_document(sibling.document_id)
+        assert sibling_before["snapshot_path"] == before["snapshot_path"]
+        assert json.loads(snapshot.with_name("metadata.json").read_text())["contentType"] == "application/octet-stream"
+
+    for _ in range(2):
+        result = archive.reanalyze_document(upload.document_id)
+        current = archive.get_document(upload.document_id)
+        assert result.document_id == upload.document_id
+        for field in ["document_id", "title", "uri", "source_type", "content_sha256", "enrichments"]:
+            assert current[field] == before[field]
+        assert (archive.root / current["snapshot_path"]).read_bytes() == source_bytes
+        source_chunks = [chunk for chunk in current["chunks"] if chunk["chunk_origin"] == "source"]
+        assert [(chunk["locator"], chunk["text"]) for chunk in source_chunks] == [("html", "RETAINED-HTML-FORMAT-19")]
+        assert all("HIDDEN-SCRIPT-19" not in chunk["text"] for chunk in source_chunks)
+        assert [chunk for chunk in current["chunks"] if chunk["chunk_origin"] == "ai"] == [chunk for chunk in before["chunks"] if chunk["chunk_origin"] == "ai"]
+        if import_sibling:
+            assert archive.get_document(sibling.document_id) == sibling_before
+            assert snapshot.read_bytes() == source_bytes
+    assert len(archive.list_documents()) == (2 if import_sibling else 1)
+
+
 @pytest.mark.parametrize("failure", ["extraction", "empty extraction", "index publication"])
 def test_failed_reanalysis_preserves_the_complete_previous_archive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str) -> None:
     archive = DocumentationArchive(tmp_path / "archive")

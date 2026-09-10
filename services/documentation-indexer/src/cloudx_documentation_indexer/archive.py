@@ -44,6 +44,7 @@ from .extraction import (
     decode_text,
     extract_bytes,
     extract_file,
+    extract_html,
 )
 from .vendor_code import (
     CODE_SOURCE_SUFFIXES,
@@ -1239,17 +1240,14 @@ class DocumentationArchive:
             if document["source_type"] == "repo_code" or metadata.get("generatedCodeDocumentation") or "youtube" in metadata:
                 raise ArchiveError("This document retains generated code documentation or YouTube evidence. Rerun AI enrichment to analyze its retained text and artifacts; source extraction requires the original source.")
 
-            retains_plain_text = False
-            # Copied text carries the URI's category but retains plain-text source locators.
-            if snapshot_path.suffix.lower() == ".txt":
-                with self._connect() as db:
-                    source_locators = {
-                        row["locator"] for row in db.execute(
-                            "SELECT DISTINCT locator FROM chunks WHERE document_id = ? AND chunk_origin = 'source'",
-                            (document_id,),
-                        )
-                    }
-                retains_plain_text = source_locators == {"text"}
+            with self._connect() as db:
+                source_locators = {
+                    row["locator"] for row in db.execute(
+                        "SELECT DISTINCT locator FROM chunks WHERE document_id = ? AND chunk_origin = 'source'",
+                        (document_id,),
+                    )
+                }
+            retains_plain_text = snapshot_path.suffix.lower() == ".txt" and source_locators == {"text"}
 
             staging_dir = Path(tempfile.mkdtemp(prefix="reanalysis-", dir=self.snapshots_dir))
             replacement_snapshot = staging_dir / snapshot_path.name
@@ -1259,6 +1257,8 @@ class DocumentationArchive:
                     shutil.copy2(metadata_path, staging_dir / "metadata.json")
                 if retains_plain_text:
                     spans = [ExtractedSpan(decode_text(source_bytes), "text")]
+                elif source_locators == {"html"}:
+                    spans = [ExtractedSpan(extract_html(source_bytes), "html")]
                 else:
                     spans = extract_bytes(
                         source_bytes,
