@@ -7,6 +7,7 @@ cd "$ROOT_DIR"
 DRY_RUN=0
 UNINSTALL=0
 UPDATE=0
+UPDATE_CODEX=0
 VERBOSE=0
 QUARTO_VERSION="1.9.38"
 QUARTO_DEB_PATH="/tmp/quarto-${QUARTO_VERSION}-linux-amd64.deb"
@@ -18,10 +19,17 @@ for arg in "$@"; do
     UNINSTALL=1
   elif [[ "$arg" == "--update" ]]; then
     UPDATE=1
+  elif [[ "$arg" == "--update-codex" ]]; then
+    UPDATE_CODEX=1
   elif [[ "$arg" == "--verbose" ]]; then
     VERBOSE=1
   fi
 done
+
+if [[ "$UPDATE_CODEX" -eq 1 && ( "$UPDATE" -eq 1 || "$UNINSTALL" -eq 1 ) ]]; then
+  echo "--update-codex cannot be combined with --update or --uninstall." >&2
+  exit 1
+fi
 
 if [[ "$UNINSTALL" -eq 1 && "$UPDATE" -eq 1 ]]; then
   echo "--update cannot be combined with --uninstall." >&2
@@ -47,7 +55,7 @@ if [[ "${ID:-}" != "ubuntu" ]]; then
   exit 1
 fi
 
-if [[ "$UPDATE" -eq 1 ]]; then
+if [[ "$UPDATE" -eq 1 || "$UPDATE_CODEX" -eq 1 ]]; then
   if ! command -v node >/dev/null 2>&1; then
     echo "Node.js is required to inspect and update an existing Cloudx installation. Run the installer first." >&2
     exit 1
