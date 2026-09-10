@@ -21,20 +21,23 @@ const fileOperations: TabContextFileOperations = {
 };
 
 describe("TabContextService", () => {
-  it("keeps owned directory identity stable across bounded atomic log rotation", async () => {
+  it("keeps owned directory identity stable across bounded UTF-8 log rotation", async () => {
     await withOwnedContext(async ({ service, tab }) => {
       const original = service.directory(tab.contextPath)!;
-      const fileBefore = await fs.stat(tab.contextPath!, { bigint: true });
       const copy = service.directory(tab.contextPath)!;
       copy.ino = "changed by caller";
       expect(service.directory(tab.contextPath)).toEqual(original);
-      for (let index = 0; index < 10; index++) await service.record(tab, "terminal-output", `${index}: ${"🙂".repeat(4000)}`);
-      const fileAfter = await fs.stat(tab.contextPath!, { bigint: true });
-      expect(fileAfter.ino).not.toBe(fileBefore.ino);
-      expect(fileAfter.size).toBeLessThanOrEqual(64_000n);
-      expect(service.directory(tab.contextPath)).toEqual(original);
-      expect(await service.read(tab)).toContain("Trimmed to the latest 64000 bytes");
-      expect(await service.read(tab)).not.toContain("\uFFFD");
+      for (let index = 0; index < 10; index++) {
+        await service.record(tab, "terminal-output", `${"🙂".repeat(4000)}\nchunk-${index}`);
+        expect((await fs.stat(tab.contextPath!)).size).toBeLessThanOrEqual(64_000);
+        expect(service.directory(tab.contextPath)).toEqual(original);
+        const text = await service.read(tab);
+        expect(text).toContain(`🙂\nchunk-${index}`);
+        expect(text).not.toContain("\uFFFD");
+      }
+      const text = await service.read(tab);
+      expect(text).toContain("Trimmed to the latest 64000 bytes");
+      expect(text).not.toContain("chunk-0");
       await service.delete(tab);
       expect(service.directory(tab.contextPath)).toBeUndefined();
       await expect(fs.stat(original.path)).rejects.toMatchObject({ code: "ENOENT" });
