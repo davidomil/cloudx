@@ -673,21 +673,55 @@ describe("DocumentationEnrichmentService", () => {
     }
   });
 
-  it.each(["page 1", "image", "sheet Parts"])("keeps structured %s evidence out of media processing", async (locator) => {
-    const fixture = await archivedMediaFixture("source.bin", "reference", {
-      chunks: [{ chunk_id: 11, locator, chunk_origin: "source", text: "STRUCTURED-SOURCE evidence." }],
+  describe.each(["application/octet-stream", "audio/flac", "video/ogg"])("structured evidence with shared MIME %s", (contentType) => {
+    it.each(["html", "page 1", "page 1 table-001", "image", "sheet Parts range A1:B3", "schematic schematic-001 image frame 0"])(
+      "keeps %s evidence out of media processing despite a media filename and category", async (locator) => {
+        const fixture = await archivedMediaFixture("recording.ogg", "media", {
+          chunks: [
+            { chunk_id: 11, locator, chunk_origin: "source", text: "STRUCTURED-SOURCE evidence." },
+            { chunk_id: 12, locator: "ai:guide", chunk_origin: "ai", text: "PRIOR-AI-SPAN is not source evidence." },
+          ],
+        });
+        await fs.writeFile(path.join(path.dirname(fixture.mediaPath), "metadata.json"), JSON.stringify({ contentType }));
+        const runner = fakeRunner({ summary: "Structured evidence.", spans: [{ locator: "ai:guide", text: "REPLACEMENT-AI" }], metadata: [], warnings: [] });
+        const transcribeFile = vi.fn();
+        const mediaProcessLauncher = fakeMediaTools(false);
+        const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher });
+        try {
+          const response = await service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] });
+
+          expect(response.enrichment).toMatchObject({ results: [{ status: "written" }] });
+          expect(runner.run.mock.calls[0]?.[0]).toContain("STRUCTURED-SOURCE");
+          expect(runner.run.mock.calls[0]?.[0]).not.toContain("PRIOR-AI-SPAN");
+          expect(transcribeFile).not.toHaveBeenCalled();
+          expect(mediaProcessLauncher).not.toHaveBeenCalled();
+          await expect(fs.readFile(fixture.mediaPath)).resolves.toEqual(fixture.sourceBytes);
+        } finally {
+          await fs.rm(fixture.root, { recursive: true, force: true });
+        }
+      },
+    );
+  });
+
+  it("does not classify a recording from structured locators in prior AI spans", async () => {
+    const fixture = await archivedMediaFixture("recording.wav", "media", {
+      chunks: [
+        { chunk_id: 11, locator: "text", chunk_origin: "source", text: "BINARY-CHUNK is not transcript evidence." },
+        { chunk_id: 12, locator: "html", chunk_origin: "ai", text: "PRIOR-AI-SPAN is not source evidence." },
+      ],
     });
-    await fs.writeFile(path.join(path.dirname(fixture.mediaPath), "metadata.json"), JSON.stringify({ contentType: "application/octet-stream" }));
-    const runner = fakeRunner();
-    const transcribeFile = vi.fn();
+    const runner = fakeRunner({ summary: "Fresh transcript.", spans: [{ locator: "ai:media", text: "REPLACEMENT-AI" }], metadata: [], warnings: [] });
+    const transcribeFile = vi.fn(async () => ({ text: "FRESH-TRANSCRIPT from the recording." }));
     const mediaProcessLauncher = fakeMediaTools(false);
     const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher });
     try {
-      await service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] });
-
-      expect(runner.run.mock.calls[0]?.[0]).toContain("STRUCTURED-SOURCE");
-      expect(transcribeFile).not.toHaveBeenCalled();
-      expect(mediaProcessLauncher).not.toHaveBeenCalled();
+      const response = await service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] });
+      expect(response.enrichment).toMatchObject({ results: [{ status: "written" }] });
+      expect(runner.run.mock.calls[0]?.[0]).toContain("FRESH-TRANSCRIPT");
+      expect(runner.run.mock.calls[0]?.[0]).not.toContain("BINARY-CHUNK");
+      expect(runner.run.mock.calls[0]?.[0]).not.toContain("PRIOR-AI-SPAN");
+      expect(transcribeFile).toHaveBeenCalledOnce();
+      expect(mediaProcessLauncher).toHaveBeenCalledOnce();
     } finally {
       await fs.rm(fixture.root, { recursive: true, force: true });
     }
@@ -744,7 +778,8 @@ describe("DocumentationEnrichmentService", () => {
           await fs.mkdir(fixture.mediaPath);
         }
       }
-      const client = fakeDocumentationClient({ snapshot_path: snapshotPath }, { archiveRoot: fixture.archiveRoot });
+      const document = (await fixture.client.getDocument({ documentId: "doc-1" })).document as Record<string, unknown>;
+      const client = fakeDocumentationClient({ ...document, snapshot_path: snapshotPath }, { archiveRoot: fixture.archiveRoot });
       const runner = fakeRunner();
       const transcribeFile = vi.fn();
       const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher: fakeMediaTools(false) });

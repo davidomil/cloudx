@@ -113,6 +113,99 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
     );
 
     describe.each(["reanalyze", "reenrich"] as const)("%s", (operation) => {
+      describe.each(["html", "xlsx"] as const)("retained %s", (format) => {
+        it.each([undefined, "text/plain", "application/octet-stream", "audio/flac", "video/ogg"])(
+          "enriches structured evidence twice without decoding (sibling MIME: %s)",
+          async (contentType) => {
+            const fixture = await startArchive();
+            try {
+              const sourcePath = path.join(fixture.root, `guide.${format}`);
+              if (format === "html") {
+                await fs.writeFile(sourcePath, "<html><body><h1>RETAINED-GUIDE</h1><p>Release reset after power stabilizes.</p><script>EXCLUDED-SCRIPT</script></body></html>");
+              } else {
+                await runFile(python, ["-c", [
+                  "from openpyxl import Workbook", "import sys", "book = Workbook()",
+                  "sheet = book.active", "sheet.title = 'Power Budget'",
+                  "sheet.append(['RETAINED-GUIDE', 'Current'])", "sheet.append(['Reset', 12])",
+                  "sheet.append(['Total', '=SUM(B2:B2)'])", "book.save(sys.argv[1])",
+                ].join("\n"), sourcePath]);
+              }
+              const sourceBytes = await fs.readFile(sourcePath);
+              const imported = await fixture.client.ingestUploadFile({
+                filename: path.basename(sourcePath), path: sourcePath,
+                contentType: format === "html" ? "text/html" : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                title: "Original guide", collection: "Structured regression", tags: ["retain-me"],
+              });
+              const documentId = (imported.document as { documentId: string }).documentId;
+              const original = await fixture.document(documentId);
+              const sourceChunks = original.chunks.filter((chunk) => chunk.chunk_origin === "source")
+                .map(({ locator, text }) => ({ locator, text }));
+              expect(sourceChunks.map((chunk) => chunk.locator))
+                .toEqual([format === "html" ? "html" : "sheet Power Budget range A1:B3"]);
+              const originalArtifacts = await extractedFiles(fixture.archiveRoot, original);
+              if (format === "xlsx") expect(Object.keys(originalArtifacts)).toContain("spreadsheets/sheet-001-Power_Budget.json");
+              await fixture.client.enrichDocument({
+                documentId, model: "prior-model", skillIds: [],
+                spans: [{ locator: "ai:guide", text: "PRIOR-AI-SPAN is not source evidence." }],
+              });
+
+              let sibling: ArchivedDocument | undefined;
+              if (contentType) {
+                const importedSibling = await fixture.client.ingestUploadFile({
+                  filename: "sibling.txt", path: sourcePath, contentType,
+                  title: "Separate guide copy", sourceType: "text",
+                });
+                sibling = await fixture.document((importedSibling.document as { documentId: string }).documentId);
+                expect(sibling.document_id).not.toBe(documentId);
+                expect(path.dirname(sibling.snapshot_path)).toBe(path.dirname(original.snapshot_path));
+                expect(JSON.parse(await fs.readFile(path.join(fixture.archiveRoot, path.dirname(original.snapshot_path), "metadata.json"), "utf8")))
+                  .toMatchObject({ contentType, upload: true });
+              }
+              const siblingArtifacts = sibling ? await extractedFiles(fixture.archiveRoot, sibling) : undefined;
+              await fs.unlink(sourcePath);
+              const enrichment = createEnrichment(fixture);
+              const hook = enrichment.plugin.hooks.find((candidate) => candidate.id === `documentation.documents.${operation}`)!;
+              for (let rerun = 1; rerun <= 2; rerun += 1) {
+                const prior = await fixture.document(documentId);
+                await expect(hook.execute({ documentId }, { caller: { kind: "ui" } }))
+                  .resolves.toMatchObject({ kind: operation, firstDocumentId: documentId, enrichment: { results: [{ status: "written" }] } });
+                expect(enrichment.run).toHaveBeenCalledTimes(rerun);
+                const prompt = enrichment.run.mock.lastCall![0];
+                for (const chunk of sourceChunks) {
+                  expect(prompt).toContain(JSON.stringify(chunk.locator));
+                  expect(prompt).toContain(JSON.stringify(chunk.text));
+                }
+                expect(prompt).toContain("RETAINED-GUIDE");
+                expect(prompt).not.toContain("EXCLUDED-SCRIPT");
+                for (const chunk of prior.chunks.filter((chunk) => chunk.chunk_origin === "ai")) {
+                  expect(prompt).not.toContain(chunk.text);
+                }
+                expect(enrichment.transcribeFile).not.toHaveBeenCalled();
+                expect(enrichment.mediaProcessLauncher).not.toHaveBeenCalled();
+                const current = await fixture.document(documentId);
+                expect(identity(current)).toEqual(identity(original));
+                expect(current.chunks.filter((chunk) => chunk.chunk_origin === "source").map(({ locator, text }) => ({ locator, text })))
+                  .toEqual(sourceChunks);
+                expect(current.chunks.filter((chunk) => chunk.chunk_origin === "ai"))
+                  .toMatchObject([{ text: `REPLACEMENT-AI-${rerun}` }]);
+                expect(JSON.parse(current.enrichments[0].payload_json).evidence).toMatchObject({
+                  chunkCount: sourceChunks.length, mediaTranscriptChars: 0, keyframeCount: 0,
+                });
+                await expect(fs.readFile(path.join(fixture.archiveRoot, current.snapshot_path))).resolves.toEqual(sourceBytes);
+                await expect(extractedFiles(fixture.archiveRoot, current)).resolves.toEqual(originalArtifacts);
+                if (sibling) {
+                  await expect(fixture.document(sibling.document_id)).resolves.toEqual(sibling);
+                  await expect(fs.readFile(path.join(fixture.archiveRoot, sibling.snapshot_path))).resolves.toEqual(sourceBytes);
+                  await expect(extractedFiles(fixture.archiveRoot, sibling)).resolves.toEqual(siblingArtifacts);
+                }
+              }
+            } finally {
+              await fixture.dispose();
+            }
+          }, 30_000,
+        );
+      });
+
       describe.each([false, true])("identical generic-MIME URL sibling: %s", (withSibling) => {
         it.each(recordings)("refreshes an ordinary $filename upload twice", async (recording) => {
           const fixture = await startArchive();
@@ -230,6 +323,18 @@ interface ArchivedDocument {
 function identity(document: ArchivedDocument) {
   const { document_id, source_type, uri, title, collection, tags_json, content_sha256 } = document;
   return { document_id, source_type, uri, title, collection, tags_json, content_sha256 };
+}
+
+async function extractedFiles(archiveRoot: string, document: ArchivedDocument) {
+  const extracted = path.join(archiveRoot, path.dirname(document.snapshot_path), "extracted");
+  const files: Record<string, Buffer> = {};
+  if (existsSync(extracted)) {
+    for (const relativePath of await fs.readdir(extracted, { recursive: true })) {
+      const filename = path.join(extracted, relativePath);
+      if ((await fs.stat(filename)).isFile()) files[relativePath] = await fs.readFile(filename);
+    }
+  }
+  return files;
 }
 
 function createEnrichment(fixture: Awaited<ReturnType<typeof startArchive>>) {
