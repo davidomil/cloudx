@@ -82,12 +82,18 @@ test.describe("CloudX shipped shell", () => {
     await waitForHealth();
   });
 
-  test.afterAll(async () => {
+  test.afterAll(async ({}, testInfo) => {
     server?.kill("SIGTERM");
     await Promise.race([
       new Promise<void>((resolve) => server?.once("exit", () => resolve())),
       new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
     ]);
+    const logPath = testInfo.outputPath("server.log");
+    await fs.writeFile(logPath, serverLogs);
+    await testInfo.attach("server.log", {
+      path: logPath,
+      contentType: "text/plain",
+    });
     await fs.rm(testRoot, { recursive: true, force: true });
   });
 
