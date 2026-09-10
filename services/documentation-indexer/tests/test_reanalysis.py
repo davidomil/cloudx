@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from PIL import Image
 import pytest
 from reportlab.pdfgen import canvas
 
@@ -110,6 +112,142 @@ def test_reanalysis_reruns_pdf_extraction_after_the_original_file_is_removed(tmp
     assert record["chunks"][0]["locator"] == "page 1"
     assert "PDF-REANALYSIS-19" in record["chunks"][0]["text"]
     assert archive.search("PDF-REANALYSIS-19", mode="lexical")[0]["documentId"] == document.document_id
+
+
+def test_reanalysis_retains_committed_source_and_artifacts_when_projection_read_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "board.pdf"
+    pdf = canvas.Canvas(str(source))
+    pdf.drawString(40, 800, "COMMITTED-SOURCE-19 survives projection read failure.")
+    pdf.rect(40, 700, 120, 40)
+    pdf.save()
+    source_bytes = source.read_bytes()
+    archive = DocumentationArchive(tmp_path / "archive")
+    document = archive.ingest_path(source)[0]
+    previous_snapshot = archive.root / archive.get_document(document.document_id)["snapshot_path"]
+    artifacts = {
+        artifact.relative_to(previous_snapshot.parent): artifact.read_bytes()
+        for artifact in (previous_snapshot.parent / "extracted").rglob("*")
+        if artifact.is_file()
+    }
+    assert artifacts
+    source.unlink()
+
+    def fail_projection_read():
+        assert archive.get_document(document.document_id)["snapshot_path"] != previous_snapshot.relative_to(archive.root).as_posix()
+        raise sqlite3.OperationalError("database is locked")
+
+    with monkeypatch.context() as projection_failure:
+        projection_failure.setattr(archive, "_projected_index_generation", fail_projection_read)
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            archive.reanalyze_document(document.document_id)
+
+    current = archive.get_document(document.document_id)
+    committed_snapshot = archive.root / current["snapshot_path"]
+    assert committed_snapshot != previous_snapshot
+    assert committed_snapshot.read_bytes() == source_bytes
+    for relative_path, content in artifacts.items():
+        assert (committed_snapshot.parent / relative_path).read_bytes() == content
+    assert archive.search("COMMITTED-SOURCE-19")[0]["documentId"] == document.document_id
+
+    reopened = DocumentationArchive(archive.root)
+    assert reopened.health()["ready"] is True
+    assert reopened.reanalyze_document(document.document_id).document_id == document.document_id
+    assert (archive.root / reopened.get_document(document.document_id)["snapshot_path"]).read_bytes() == source_bytes
+
+
+@pytest.mark.parametrize(("uri", "source_type"), [
+    ("https://example.com/board.png", "image"),
+    ("https://example.com/board.xlsx", "spreadsheet"),
+    ("https://example.com/board.html", "website"),
+])
+def test_reanalysis_extracts_copied_text_from_its_retained_format(tmp_path: Path, uri: str, source_type: str) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+    text = "COPIED-SOURCE-19 retains the literal <board> marker."
+    document = archive.ingest_text(text=text, uri=uri, collection="boards", tags=["copied"])
+    archive.enrich_document(
+        document.document_id,
+        spans=[ExtractedSpan("Prior enrichment remains available.", "ai:metadata")],
+        model="gpt-test",
+        skill_ids=["documentation-enrich-metadata"],
+    )
+    before = archive.get_document(document.document_id)
+    assert before["source_type"] == source_type
+
+    for _ in range(2):
+        result = archive.reanalyze_document(document.document_id)
+        after = archive.get_document(document.document_id)
+        assert result.document_id == document.document_id
+        for field in ["document_id", "title", "source_type", "uri", "content_sha256", "collection", "tags_json"]:
+            assert after[field] == before[field]
+        assert (archive.root / after["snapshot_path"]).read_bytes() == text.encode("utf-8")
+        assert [(chunk["locator"], chunk["text"]) for chunk in after["chunks"] if chunk["chunk_origin"] == "source"] == [("text", text)]
+        assert [chunk for chunk in after["chunks"] if chunk["chunk_origin"] == "ai"] == [chunk for chunk in before["chunks"] if chunk["chunk_origin"] == "ai"]
+        assert archive.search("COPIED-SOURCE-19", mode="lexical")[0]["documentId"] == document.document_id
+    assert len(archive.list_documents()) == 1
+
+
+@pytest.mark.parametrize("filename", ["scan", "scan.bin", "scan.txt"])
+def test_reanalysis_preserves_explicit_image_extraction_for_unrecognized_filenames(tmp_path: Path, filename: str) -> None:
+    source = tmp_path / filename
+    Image.new("RGB", (20, 10), "white").save(source, format="PNG")
+    archive = DocumentationArchive(tmp_path / "archive")
+    document = archive.ingest_path(source, source_type="image")[0]
+    before = archive.get_document(document.document_id)
+    source_bytes = source.read_bytes()
+    source.unlink()
+
+    result = archive.reanalyze_document(document.document_id)
+
+    after = archive.get_document(document.document_id)
+    assert result.document_id == document.document_id
+    assert after["source_type"] == "image"
+    assert [(chunk["locator"], chunk["text"]) for chunk in after["chunks"]] == [(chunk["locator"], chunk["text"]) for chunk in before["chunks"]]
+    snapshot = archive.root / after["snapshot_path"]
+    assert snapshot.read_bytes() == source_bytes
+    metadata = json.loads((snapshot.parent / "extracted/image_metadata.json").read_text(encoding="utf-8"))
+    assert (metadata["format"], metadata["width"], metadata["height"]) == ("PNG", 20, 10)
+    assert (snapshot.parent / "extracted" / metadata["artifact"]).is_file()
+
+
+def test_reanalysis_preserves_explicit_html_extraction_for_a_txt_original(tmp_path: Path) -> None:
+    source = tmp_path / "page.txt"
+    source.write_text("<h1>ORIGINAL-WEBSITE-19</h1><script>HIDDEN-SCRIPT-19</script>", encoding="utf-8")
+    archive = DocumentationArchive(tmp_path / "archive")
+    document = archive.ingest_path(source, source_type="website")[0]
+    before = archive.get_document(document.document_id)
+    source.unlink()
+
+    archive.reanalyze_document(document.document_id)
+
+    after = archive.get_document(document.document_id)
+    assert after["document_id"] == before["document_id"]
+    assert after["source_type"] == "website"
+    assert [(chunk["locator"], chunk["text"]) for chunk in after["chunks"]] == [("html", "ORIGINAL-WEBSITE-19")]
+
+
+@pytest.mark.parametrize("content", [
+    '["LOCAL-METADATA-SOURCE-19", 1]',
+    '{"youtube": "LOCAL-METADATA-SOURCE-19"}',
+])
+def test_reanalysis_does_not_interpret_a_source_named_metadata_json_as_a_sidecar(tmp_path: Path, content: str) -> None:
+    source = tmp_path / "metadata.json"
+    source.write_text(content, encoding="utf-8")
+    archive = DocumentationArchive(tmp_path / "archive")
+    document = archive.ingest_path(source)[0]
+    before = archive.get_document(document.document_id)
+    source.unlink()
+
+    for _ in range(2):
+        result = archive.reanalyze_document(document.document_id)
+        after = archive.get_document(document.document_id)
+        assert result.document_id == document.document_id
+        for field in ["document_id", "title", "source_type", "uri", "content_sha256"]:
+            assert after[field] == before[field]
+        assert Path(after["snapshot_path"]).name == "metadata.json"
+        assert (archive.root / after["snapshot_path"]).read_bytes() == content.encode("utf-8")
+        assert after["chunks"][0]["text"] == content
+        assert archive.search("LOCAL-METADATA-SOURCE-19", mode="lexical")[0]["documentId"] == document.document_id
+    assert len(archive.list_documents()) == 1
 
 
 def test_reanalysis_preserves_upload_metadata_for_sources_without_filename_extensions(tmp_path: Path) -> None:

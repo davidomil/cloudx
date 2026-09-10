@@ -1221,8 +1221,9 @@ class DocumentationArchive:
             if sha256_bytes(source_bytes) != document["content_sha256"]:
                 raise ArchiveError("The archived source snapshot does not match its recorded content hash.")
             metadata_path = snapshot_path.parent / "metadata.json"
+            has_metadata = metadata_path != snapshot_path and (metadata_path.exists() or metadata_path.is_symlink())
             metadata = {}
-            if metadata_path.exists() or metadata_path.is_symlink():
+            if has_metadata:
                 if not is_relative_to(metadata_path.resolve(), snapshot_path.parent):
                     raise ArchiveError("Snapshot metadata must stay inside its snapshot directory.")
                 try:
@@ -1237,16 +1238,29 @@ class DocumentationArchive:
             if document["source_type"] == "repo_code" or metadata.get("generatedCodeDocumentation") or "youtube" in metadata:
                 raise ArchiveError("This document retains generated code documentation or YouTube evidence. Rerun AI enrichment to analyze its retained text and artifacts; source extraction requires the original source.")
 
+            extraction_type = document["source_type"]
+            # Copied text carries the URI's category but retains plain-text source locators.
+            if snapshot_path.suffix.lower() == ".txt":
+                with self._connect() as db:
+                    source_locators = {
+                        row["locator"] for row in db.execute(
+                            "SELECT DISTINCT locator FROM chunks WHERE document_id = ? AND chunk_origin = 'source'",
+                            (document_id,),
+                        )
+                    }
+                if source_locators == {"text"}:
+                    extraction_type = "text"
+
             staging_dir = Path(tempfile.mkdtemp(prefix="reanalysis-", dir=self.snapshots_dir))
             replacement_snapshot = staging_dir / snapshot_path.name
             try:
                 replacement_snapshot.write_bytes(source_bytes)
-                if metadata_path.exists():
+                if has_metadata:
                     shutil.copy2(metadata_path, staging_dir / "metadata.json")
                 spans = extract_bytes(
                     source_bytes,
                     snapshot_path.name,
-                    document["source_type"],
+                    extraction_type,
                     content_type or mimetypes.guess_type(snapshot_path.name)[0],
                     staging_dir / "extracted",
                 )
@@ -1267,7 +1281,7 @@ class DocumentationArchive:
 
                 self._publish_catalog_change(replace_source_analysis)
             except Exception:
-                shutil.rmtree(staging_dir)
+                self._discard_unreferenced_snapshot(replacement_snapshot)
                 raise
             try:
                 self._discard_unreferenced_snapshot(snapshot_path)

@@ -411,7 +411,7 @@ export class DocumentationEnrichmentService {
   private async archivedMediaSource(document: Record<string, unknown>, signal?: AbortSignal): Promise<DocumentationEnrichmentSource | undefined> {
     const snapshotPath = optionalRecordString(document, "snapshot_path");
     const hasMediaSuffix = snapshotPath && /\.(mp3|wav|m4a|aac|ogg|webm|mp4|mov|mkv|avi)$/iu.test(snapshotPath);
-    if (!snapshotPath || !hasMediaSuffix && path.extname(snapshotPath)) {
+    if (!snapshotPath) {
       return undefined;
     }
     const archiveRoot = await this.archiveRoot(signal);
@@ -423,6 +423,40 @@ export class DocumentationEnrichmentService {
     if (!isSameOrChild(root, snapshot)) {
       throw new Error("Archived media source escapes the documentation archive root.");
     }
+    let contentType: string | undefined;
+    if (!hasMediaSuffix) {
+      const metadataPath = path.join(path.dirname(snapshot), "metadata.json");
+      if (metadataPath === snapshot) {
+        return undefined;
+      }
+      const metadataStat = await fsp.lstat(metadataPath).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") {
+          return undefined;
+        }
+        throw error;
+      });
+      if (!metadataStat) {
+        if (document.source_type === "media" && !path.extname(snapshotPath)) {
+          throw new Error("Archived media source metadata is missing.");
+        }
+        return undefined;
+      }
+      if (!metadataStat.isFile() || metadataStat.isSymbolicLink()) {
+        throw new Error("Archived source metadata must be a regular file inside its snapshot directory.");
+      }
+      const realMetadataPath = await fsp.realpath(metadataPath);
+      if (!isSameOrChild(await fsp.realpath(root), realMetadataPath)) {
+        throw new Error("Archived source metadata escapes the documentation archive root.");
+      }
+      const metadata = getRecord(JSON.parse(await fsp.readFile(realMetadataPath, "utf8")), "archived source metadata");
+      if (metadata.contentType != null && typeof metadata.contentType !== "string") {
+        throw new Error("Archived source content type must be a string.");
+      }
+      contentType = optionalRecordString(metadata, "contentType");
+      if (!contentType || !/^(audio|video)\//iu.test(contentType)) {
+        return undefined;
+      }
+    }
     const realRoot = await fsp.realpath(root);
     const realSnapshot = await fsp.realpath(snapshot);
     if (!isSameOrChild(realRoot, realSnapshot)) {
@@ -432,33 +466,6 @@ export class DocumentationEnrichmentService {
     signal?.throwIfAborted();
     if (!stat.isFile() || stat.isSymbolicLink()) {
       throw new Error("Archived media source must be a regular file.");
-    }
-    let contentType: string | undefined;
-    if (!hasMediaSuffix) {
-      const metadataPath = path.join(path.dirname(realSnapshot), "metadata.json");
-      const metadataStat = await fsp.lstat(metadataPath).catch((error: NodeJS.ErrnoException) => {
-        if (error.code === "ENOENT") {
-          return undefined;
-        }
-        throw error;
-      });
-      if (!metadataStat) {
-        if (document.source_type === "media") {
-          throw new Error("Archived media source metadata is missing.");
-        }
-        return undefined;
-      }
-      if (!metadataStat.isFile() || metadataStat.isSymbolicLink()) {
-        throw new Error("Archived source metadata must be a regular file inside its snapshot directory.");
-      }
-      const metadata = getRecord(JSON.parse(await fsp.readFile(metadataPath, "utf8")), "archived source metadata");
-      if (metadata.contentType !== undefined && typeof metadata.contentType !== "string") {
-        throw new Error("Archived source content type must be a string.");
-      }
-      contentType = optionalRecordString(metadata, "contentType");
-      if (!contentType || !/^(audio|video)\//iu.test(contentType)) {
-        return undefined;
-      }
     }
     return { filename: path.basename(snapshotPath), contentPath: realSnapshot, contentType, sourceType: optionalRecordString(document, "source_type") };
   }
