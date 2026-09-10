@@ -616,6 +616,101 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     await expectMissing(started.worktreePath!, reviewer.worktreePath!);
   }, 20_000);
 
+  it.each([false, true])("rebases a conflicting approved branch in a coding worker and requires fresh review and checks (previous target merge: %s)", async previousTargetMerge => {
+    const fixture = await LifecycleFixture.create({ autoReview: true, approveFirst: true });
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);
+    const implementation = await fixture.completedAssistantTurn(started);
+    if (previousTargetMerge) {
+      const previousTarget = await fixture.advanceMain();
+      await git(started.worktreePath!, "fetch", fixture.origin, "main");
+      await git(started.worktreePath!, "merge", "--no-ff", "-m", "TEST: previous target update", previousTarget);
+      expect((await git(started.worktreePath!, "show", "-s", "--format=%P", "HEAD")).split(" ")).toEqual([implementation.headSha, previousTarget]);
+    }
+    const approvedHead = await git(started.worktreePath!, "rev-parse", "HEAD");
+    await fixture.workflow.poll();
+    const firstReview = await fixture.runningWorker("review");
+    const firstReviewReceipt = await fixture.completedAssistantTurn(firstReview);
+    fixture.provider.changes.get(7)!.mergeable = false;
+    await fixture.workflow.poll();
+    expect(fixture.provider.submissions).toEqual([expect.objectContaining({ event: "approve", headSha: approvedHead })]);
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "awaiting_merge" });
+
+    const targetHead = await fixture.conflictMainWithIssue();
+    fixture.provider.detectConflicts = true;
+    expect(await fixture.provider.getChangeRequest(7)).toMatchObject({ approved: true, hasConflicts: true, requiresBaseUpdate: false });
+    fixture.advanceTime(5_001);
+    await fixture.workflow.poll();
+    const resolving = await fixture.runningWorker("issue");
+    expect(resolving).toMatchObject({
+      id: started.id,
+      worktreePath: started.worktreePath,
+      headSha: approvedHead,
+      rebaseRecovery: { branch: started.branch, baseBranch: "main", expectedHeadSha: approvedHead, originalHeadSha: approvedHead, targetHeadSha: targetHead, phase: "resolving" },
+    });
+    expect((await fixture.store.read()).find(worker => worker.id === started.id)?.rebaseRecovery).toEqual(resolving.rebaseRecovery);
+    const resolution = await fixture.completedAssistantTurn(resolving);
+    expect(resolution.context.rebaseRecovery).toEqual(resolving.rebaseRecovery);
+    expect(resolution.context.item.body).toBe(fixture.provider.issue.body);
+    expect(resolution.context.change?.comments).toEqual(expect.arrayContaining([expect.objectContaining({ body: "No actionable findings. The change is ready to merge." })]));
+    expect(await fixture.reports.read(resolving.attemptId!)).toMatchObject({
+      rebase: { outcome: "resolved", validation: "passed", details: expect.stringContaining("node --test rebase-resolution.test.mjs") },
+    });
+    expect(resolution.headSha).not.toBe(approvedHead);
+    expect(await git(started.worktreePath!, "merge-base", resolution.headSha, targetHead)).toBe(targetHead);
+    expect(await fs.readFile(path.join(started.worktreePath!, "solution.txt"), "utf8")).toBe("Target behavior preserved\nIssue resolved\n");
+    if (previousTargetMerge) expect(await fs.readFile(path.join(started.worktreePath!, "target.txt"), "utf8")).toBe("Target branch advanced\n");
+    expect(fixture.provider.merges).toEqual([]);
+
+    vi.stubEnv("FORGE_FIXTURE_HOLD_REVIEW", "true");
+    fixture.provider.changes.get(7)!.mergeable = true;
+    await fixture.workflow.poll();
+    const secondReview = await fixture.runningWorker("review");
+    expect(await git(fixture.origin, "rev-parse", started.branch!)).toBe(resolution.headSha);
+    expect(fixture.gitPushes).toHaveLength(2);
+    expect(fixture.gitPushes[1]).toContain(`--force-with-lease=refs/heads/${started.branch}:${approvedHead}`);
+    expect(secondReview).toMatchObject({
+      id: firstReview.id,
+      headSha: resolution.headSha,
+      reviewHistory: [expect.objectContaining({ headSha: approvedHead, event: "approve", status: "posted" })],
+    });
+    expect(await fixture.provider.getChangeRequest(7)).toMatchObject({ headSha: resolution.headSha, hasConflicts: false, approved: true, mergeable: true });
+    await vi.waitFor(() => expect(fixture.sessions.getSession(secondReview.tabId!).snapshot().recentOutput).toContain("FORGE_FIXTURE_REVIEW_WAITING"));
+    fixture.advanceTime(5_001);
+    await fixture.workflow.poll();
+    expect(fixture.provider.submissions).toEqual([expect.objectContaining({ event: "approve", headSha: approvedHead })]);
+    expect(fixture.provider.merges).toEqual([]);
+    expect(await git(fixture.origin, "rev-parse", "main")).toBe(targetHead);
+    fixture.provider.changes.get(7)!.mergeable = false;
+    fixture.factory.processes.at(-1)!.write("review now\n");
+    const secondReviewReceipt = await fixture.completedAssistantTurn(secondReview);
+    expect(secondReviewReceipt.sessionId).toBe(firstReviewReceipt.sessionId);
+    expect(secondReviewReceipt.localReview).toMatchObject({ baseSha: targetHead, mergeBaseSha: targetHead, headSha: resolution.headSha });
+    expect(secondReviewReceipt.previousMessages).toEqual(expect.arrayContaining([{ role: "assistant", content: expect.stringContaining("No actionable findings.") }]));
+    await fixture.workflow.poll();
+    expect(fixture.provider.submissions.map(({ event, headSha }) => ({ event, headSha }))).toEqual([
+      { event: "approve", headSha: approvedHead },
+      { event: "approve", headSha: resolution.headSha },
+    ]);
+    expect(fixture.provider.merges).toEqual([]);
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "awaiting_merge" });
+
+    fixture.provider.changes.get(7)!.mergeable = true;
+    fixture.advanceTime(5_001);
+    await fixture.workflow.poll();
+    expect(fixture.provider.merges).toEqual([resolution.headSha]);
+    expect(await git(fixture.origin, "rev-parse", "main")).toBe(resolution.headSha);
+    expect(fixture.provider.issue.state).toBe("closed");
+    expect(fixture.factory.processes).toHaveLength(4);
+    expect(fixture.gitPushes).toHaveLength(2);
+    expect(await fixture.store.read()).toEqual([]);
+    expect(fixture.sessions.listTabs()).toEqual([]);
+    for (const worker of [started, firstReview]) await expectMissing(worker.worktreePath!);
+    for (const receipt of [implementation, firstReviewReceipt, resolution, secondReviewReceipt]) {
+      expect(await processIsRunning(receipt.pid)).toBe(false);
+      await fixture.expectDisposedAttempt(receipt);
+    }
+  }, 25_000);
+
   it("updates an approved branch with newer target work, confirms publication, and reviews the new merge commit before merging", async () => {
     const fixture = await LifecycleFixture.create({ autoReview: true, approveFirst: true });
     const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);
@@ -1109,7 +1204,7 @@ interface AssistantReceipt {
   sessionPath?: string;
   previousMessages?: Array<{ role: "user" | "assistant"; content: string }>;
   localReview?: { baseSha: string; mergeBaseSha: string; headSha: string; diff: string };
-  context: { item: ForgeIssueDetail & Partial<ForgeChangeRequest>; change?: ForgeChangeRequest };
+  context: { item: ForgeIssueDetail & Partial<ForgeChangeRequest>; change?: ForgeChangeRequest; rebaseRecovery?: ForgeWorker["rebaseRecovery"] };
 }
 
 class RecordingTerminalFactory extends NodePtyTerminalProcessFactory {
@@ -1178,7 +1273,7 @@ class LifecycleFixture {
       },
       git: async (cwd, args) => {
         if (args[0] === "push") this.gitPushes.push([...args]);
-        return git(cwd, ...args.map((argument) => argument === "https://github.com/fixture/cloudx.git" && ["fetch", "push"].includes(args[0]!) ? this.origin : argument));
+        return git(cwd, ...args.map((argument) => argument === "https://github.com/fixture/cloudx.git" && ["fetch", "push", "ls-remote"].includes(args[0]!) ? this.origin : argument));
       },
     };
     const runtime = new ForgeRuntime(this.runtimeDependencies);
@@ -1386,6 +1481,26 @@ class LifecycleFixture {
     return headSha;
   }
 
+  async conflictMainWithIssue(): Promise<string> {
+    await git(this.root, "clone", "--branch", "main", this.origin, this.repositoryPath);
+    await git(this.repositoryPath, "config", "user.name", "Forge Fixture");
+    await git(this.repositoryPath, "config", "user.email", "forge-fixture@example.invalid");
+    await fs.writeFile(path.join(this.repositoryPath, "solution.txt"), "Target behavior preserved\n");
+    await fs.writeFile(path.join(this.repositoryPath, "rebase-resolution.test.mjs"), `import assert from "node:assert/strict";
+import fs from "node:fs";
+import { test } from "node:test";
+test("retains the target behavior and issue fix", () => {
+  assert.equal(fs.readFileSync("solution.txt", "utf8"), "Target behavior preserved\\nIssue resolved\\n");
+});
+`);
+    await git(this.repositoryPath, "add", "--", "solution.txt", "rebase-resolution.test.mjs");
+    await git(this.repositoryPath, "commit", "-m", "TEST: conflict with the issue fix");
+    await git(this.repositoryPath, "push", "origin", "main");
+    const headSha = await git(this.repositoryPath, "rev-parse", "HEAD");
+    await fs.rm(this.repositoryPath, { recursive: true });
+    return headSha;
+  }
+
   async advanceReview(content: string): Promise<string> {
     await git(this.root, "clone", "--branch", "review-target", this.origin, this.repositoryPath);
     await git(this.repositoryPath, "config", "user.name", "Forge Fixture");
@@ -1446,6 +1561,7 @@ class LifecycleFixture {
 }
 
 class LocalForgeProvider implements ForgeProvider {
+  detectConflicts = false;
   readonly issue: ForgeIssueDetail = { number: 1, title: "Handle empty input", body: "Implement the missing operation.", url: "https://github.com/fixture/cloudx/issues/1", state: "open", labels: [], author: "maintainer", updatedAt: new Date(0).toISOString(), comments: [] };
   readonly changes = new Map<number, ForgeChangeRequest>();
   readonly submissions: ForgeReviewSubmission[] = [];
@@ -1470,7 +1586,16 @@ class LocalForgeProvider implements ForgeProvider {
     const status = await this.getChangeRequestStatus(number);
     const baseSha = await git(this.origin, "rev-parse", change.baseBranch);
     const requiresBaseUpdate = change.requiresBaseUpdate && await git(this.origin, "merge-base", baseSha, status.headSha) !== baseSha;
-    return { ...structuredClone(change), ...status, baseSha, requiresBaseUpdate, mergeable: change.mergeable && !requiresBaseUpdate };
+    let hasConflicts = false;
+    if (this.detectConflicts) {
+      try {
+        await git(this.origin, "merge-tree", "--write-tree", baseSha, status.headSha);
+      } catch (error) {
+        if ((error as { code?: number }).code !== 1) throw error;
+        hasConflicts = true;
+      }
+    }
+    return { ...structuredClone(change), ...status, baseSha, requiresBaseUpdate, hasConflicts, mergeable: change.mergeable && !requiresBaseUpdate && !hasConflicts };
   }
   async findChangeRequestByBranch(headBranch: string, baseBranch: string) {
     const change = [...this.changes.values()].find((request) => request.headBranch === headBranch && request.baseBranch === baseBranch);
@@ -1632,10 +1757,32 @@ const conversation = resumedSessionId ? readConversation(resumedSessionId) : und
 if (isReview && !conversation) throw new Error("The reviewer must resume its exact Codex conversation.");
 if (conversation && !conversation.messages.length) throw new Error("The reviewer setup item must be persisted before a TUI turn.");
 if (conversation && conversation.cwd !== trustedProjectPath) throw new Error("The resumed conversation belongs to a different checkout.");
-const git = (...command) => execFileSync("git", command, { encoding: "utf8", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } }).trim();
+if (isReview && process.env.FORGE_FIXTURE_HOLD_REVIEW === "true") {
+  console.log("FORGE_FIXTURE_REVIEW_WAITING");
+  await new Promise(resolve => process.stdin.once("data", resolve));
+  process.stdin.pause();
+}
+const git = (...command) => execFileSync("git", command, { encoding: "utf8", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_EDITOR: "true" } }).trim();
+let rebase;
+if (!isReview && context.rebaseRecovery) {
+  const recovery = context.rebaseRecovery;
+  if (!prompt.includes(recovery.targetHeadSha)) throw new Error("The recovery prompt must name the pinned target commit.");
+  if (git("rev-parse", "HEAD") !== recovery.originalHeadSha) throw new Error("The recovery must start from the preserved issue head.");
+  try {
+    git("rebase", "--rebase-merges=rebase-cousins", "--no-autostash", "--no-update-refs", recovery.targetHeadSha);
+    throw new Error("The fixture rebase must stop at the seeded content conflict.");
+  } catch (error) {
+    if (error.status !== 1 || git("diff", "--name-only", "--diff-filter=U") !== "solution.txt") throw error;
+  }
+  fs.writeFileSync("solution.txt", "Target behavior preserved\\nIssue resolved\\n");
+  git("add", "--", "solution.txt");
+  git("rebase", "--continue");
+  const validation = execFileSync(process.execPath, ["--test", "rebase-resolution.test.mjs"], { encoding: "utf8" });
+  rebase = { outcome: "resolved", validation: "passed", details: "git rebase --rebase-merges=rebase-cousins --no-autostash --no-update-refs " + recovery.targetHeadSha + "; resolved solution.txt; git rebase --continue; node --test rebase-resolution.test.mjs:\\n" + validation };
+}
 const changed = [];
-if (!isReview && !fs.existsSync("solution.txt")) { fs.writeFileSync("solution.txt", "Issue resolved\\n"); changed.push("solution.txt"); }
-if (!isReview && context.change?.comments.length && !fs.existsSync("regression.txt")) { fs.writeFileSync("regression.txt", "Empty input is covered\\n"); changed.push("regression.txt"); }
+if (!isReview && !rebase && !fs.existsSync("solution.txt")) { fs.writeFileSync("solution.txt", "Issue resolved\\n"); changed.push("solution.txt"); }
+if (!isReview && !rebase && context.change?.comments.length && !fs.existsSync("regression.txt")) { fs.writeFileSync("regression.txt", "Empty input is covered\\n"); changed.push("regression.txt"); }
 if (changed.length) { git("add", "--", ...changed); git("commit", "-m", "FIX: deterministic fixture change"); }
 const headSha = git("rev-parse", "HEAD");
 let localReview;
@@ -1651,7 +1798,7 @@ const review = process.env.FORGE_FIXTURE_AUTO_REVIEW === "true"
   : { kind: "review", headSha, event: "comment", body: "The return value needs documentation.", comments: [{ body: "Explain the public return value.", path: "review.txt", line: 1, side: "RIGHT" }] };
 const report = isReview
   ? review
-  : { kind: "issue", title: "Handle empty input", body: "Implemented and verified the fixture changes.", discussionReplies: (context.change?.comments ?? []).filter(comment => comment.discussionId && comment.resolved === false).map(comment => ({ discussionId: comment.discussionId, body: "Added and verified the empty-input regression." })), resolvedDiscussionIds: (context.change?.comments ?? []).filter(comment => comment.discussionId && comment.resolved === false).map(comment => comment.discussionId) };
+  : { kind: "issue", title: "Handle empty input", body: "Implemented and verified the fixture changes.", rebase, discussionReplies: (context.change?.comments ?? []).filter(comment => comment.discussionId && comment.resolved === false).map(comment => ({ discussionId: comment.discussionId, body: "Added and verified the empty-input regression." })), resolvedDiscussionIds: (context.change?.comments ?? []).filter(comment => comment.discussionId && comment.resolved === false).map(comment => comment.discussionId) };
 const receipt = { pid: process.pid, trustedProjectPath, gitAuthorizationPresent: Object.entries(process.env).some(([key, value]) => key.startsWith("GIT_CONFIG_VALUE_") && value?.includes("Authorization:")), args, templateId: process.env.CLOUDX_PERSONALITY_TEMPLATE_ID, skillIds: process.env.CLOUDX_ENABLED_SKILL_IDS, codexHome: process.env.CODEX_HOME, reportPath, contextPath, context, headSha, localReview, sessionId: conversation?.id, resumedSessionId, sessionPath: conversation?.path, previousMessages: conversation?.messages };
 if (conversation) {
   const messages = [{ role: "user", content: prompt }, { role: "assistant", content: JSON.stringify(report) }];

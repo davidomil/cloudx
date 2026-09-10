@@ -985,6 +985,22 @@ describe("GitHub review and exact-commit merge", () => {
     expect((await provider.getChangeRequest(7)).requiresBaseUpdate).toBe(false);
   });
 
+  it.each([
+    { mergeStateStatus: "DIRTY" },
+    { mergeStateStatus: "UNKNOWN", mergeable: "CONFLICTING" },
+    { mergeStateStatus: "BLOCKED", mergeable: "CONFLICTING" },
+  ])("reports a definitive GitHub conflict while preserving review readiness %#", async graphql => {
+    const { provider, calls } = hubFixture({ graphql });
+    expect(await provider.getChangeRequest(7)).toMatchObject({ hasConflicts: true, reviewReady: true, mergeable: false, requiresBaseUpdate: false });
+    await expect(provider.merge(7, headSha)).rejects.toThrow("must be open");
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it.each(["CLEAN", "BEHIND", "BLOCKED", "DRAFT", "HAS_HOOKS", "UNKNOWN", "UNSTABLE"])("does not infer a GitHub conflict from %s", async mergeStateStatus => {
+    const { provider } = hubFixture({ graphql: { mergeStateStatus, mergeable: "UNKNOWN" } });
+    expect((await provider.getChangeRequest(7)).hasConflicts).toBe(false);
+  });
+
   it.each(["detail", "merge"])("loads GitHub %s metadata when the raw diff exceeds GitHub's limit", async operation => {
     const base = hubFixture();
     const { provider, calls } = harness(github, (url, options) => new Headers(options.headers).get("accept") === "application/vnd.github.diff"
@@ -1599,6 +1615,22 @@ describe("GitLab review and exact-commit merge", () => {
   it.each(["not_approved", "requested_changes", "ci_still_running", "ci_must_pass", "conflict"])("allows review while GitLab merge is blocked by %s", async detailed_merge_status => {
     const { provider } = labFixture({ request: { detailed_merge_status } });
     expect(await provider.getChangeRequest(7)).toMatchObject({ reviewReady: true, mergeable: false, requiresBaseUpdate: false });
+  });
+
+  it("reports a definitive GitLab conflict while preserving review readiness", async () => {
+    const { provider, calls } = labFixture({ request: { detailed_merge_status: "conflict" } });
+    expect(await provider.getChangeRequest(7)).toMatchObject({ hasConflicts: true, reviewReady: true, mergeable: false, requiresBaseUpdate: false });
+    await expect(provider.merge(7, headSha)).rejects.toThrow("must be open");
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
+  it.each([
+    "mergeable", "need_rebase", "checking", "approvals_syncing", "preparing", "unchecked",
+    "not_approved", "requested_changes", "ci_still_running", "ci_must_pass", "draft_status",
+    "discussions_not_resolved", "merge_request_blocked", "commits_status", "status_checks_must_pass", "not_open",
+  ])("does not infer a GitLab conflict from %s", async detailed_merge_status => {
+    const { provider } = labFixture({ request: { detailed_merge_status } });
+    expect((await provider.getChangeRequest(7)).hasConflicts).toBe(false);
   });
 
   it.each([undefined, "invalid", 12])("rejects a missing or malformed GitLab diff patch ID %s", async patch_id_sha => {

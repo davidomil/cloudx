@@ -119,6 +119,44 @@ After a server restart, use **Resume** to continue. Pending merge checks
 do not start another coding or review run; uncertain submissions require
 inspection before continuing.
 
+## Resolve target conflicts
+
+When an issue branch conflicts with its target, Auto review starts a
+coding worker to rebase it. For a manual issue worker, select
+**Resume**. Forge retains the owned checkout and saves the original
+local commit, observed published head, pinned fetched target and
+recovery progress.
+
+The worker receives the issue and review feedback. It must preserve
+unpublished work, target changes and intended resolutions from earlier
+target-update merges while resolving conflicts and running affected
+tests.
+
+A blocked or failed validation report pauses publication. Inspect the
+worker error and retained checkout, provide the missing decision or fix
+the failure, then select **Resume**. After Pause, Stop or restart,
+Resume continues the saved target and matching interrupted rebase;
+finish active reviews and reconcile uncertain review submissions first.
+
+Forge publishes with a lease tied to the saved remote head and confirms
+the new published commit before reviewing it. A concurrent remote update
+rejects publication and preserves the completed resolution.
+
+For an uncertain push, confirm the previous Git process has stopped and
+inspect the remote branch before **Resume**. Resume checks the saved
+publication; unresolved uncertainty keeps recovery blocked.
+
+Earlier reviews remain in history, but the old approval cannot merge the
+rewritten commit. Auto review reviews the new head, handles further
+findings and waits for approval and passing checks. For manual work, use
+**Review and post** on the rewritten request, then **Resume** the issue
+worker.
+
+Forge rechecks the target and head before merging. New conflicts return
+to recovery; an unchanged conflict report for a target already included
+in the branch pauses for inspection instead of starting the same rebase
+again.
+
 ## Review PRs and MRs
 
 Select a request and click **Review** to retain a draft, or **Review and

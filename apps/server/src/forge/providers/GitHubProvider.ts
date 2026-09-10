@@ -135,6 +135,7 @@ export class GitHubProvider implements ForgeProvider {
         readiness.mergeable === "MERGEABLE" &&
         (readiness.mergeStateStatus === "CLEAN" || canUseUpdatePermission),
       requiresBaseUpdate: readiness.mergeStateStatus === "BEHIND",
+      hasConflicts: readiness.mergeStateStatus === "DIRTY" || readiness.mergeable === "CONFLICTING",
       checks: {
         state: readiness.headChecks === "absent" || readiness.headChecks === "blocked" ? "unknown" : readiness.headChecks,
         url: `${issue.url}/checks`,
