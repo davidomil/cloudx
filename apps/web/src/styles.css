@@ -3701,9 +3701,8 @@ a:hover svg {
 }
 
 .jira-panel {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: auto auto minmax(0, 1fr);
+  display: flex;
+  flex-direction: column;
   width: 100%;
   min-height: 0;
   height: 100%;
@@ -3714,6 +3713,7 @@ a:hover svg {
 
 .jira-panel-header {
   display: flex;
+  flex-shrink: 0;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
@@ -3764,6 +3764,7 @@ a:hover svg {
 }
 
 .jira-notice {
+  flex-shrink: 0;
   margin: 10px 16px 0;
   padding: 9px 11px;
   border: 1px solid rgb(255 190 80 / 0.42);
@@ -3773,10 +3774,76 @@ a:hover svg {
 
 .jira-panel-body {
   display: grid;
+  flex: 1;
   grid-template-columns: minmax(300px, 38%) minmax(0, 1fr);
   width: 100%;
   min-width: 0;
   min-height: 0;
+}
+
+.jira-filter-bar {
+  flex-shrink: 0;
+  max-height: 60%;
+  overflow: auto;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.jira-filter-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.jira-filter-actions label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 200px;
+  min-width: 0;
+}
+
+.jira-filter-bar input,
+.jira-filter-bar select,
+.jira-filter-bar textarea {
+  min-width: 0;
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-background);
+  color: var(--color-foreground);
+  font: inherit;
+}
+
+.jira-filter-form {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.jira-filter-form label {
+  display: grid;
+  gap: 4px;
+}
+
+.jira-filter-form textarea {
+  resize: vertical;
+  font-family: monospace;
+}
+
+.jira-filter-form p {
+  margin: 0;
+  color: var(--color-muted-foreground);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.jira-loading {
+  flex-shrink: 0;
+  padding: 8px 16px;
+  color: var(--color-muted-foreground);
 }
 
 .jira-dashboard-list,
@@ -4008,6 +4075,10 @@ a:hover svg {
 }
 
 @container plugin-pane (width <= 640px) {
+  .jira-filter-actions > label {
+    flex-basis: 100%;
+  }
+
   .jira-panel-header {
     align-items: flex-start;
     flex-wrap: wrap;

@@ -1,6 +1,7 @@
 import type { ConfigValue } from "@cloudx/shared";
 
 import type { ConfigService } from "../configService.js";
+import type { JiraDashboardFilterStore } from "./JiraDashboardFilterStore.js";
 import { JiraClient, type FetchLike, type JiraCredentials, normalizeSiteUrl } from "./JiraClient.js";
 import {
   adfFromPlainText,
@@ -53,6 +54,7 @@ export const JIRA_ISSUE_FIELDS = [
 ];
 
 export interface JiraDashboardInput {
+  filterId?: string;
   filterJql?: string;
   sortBy?: string;
   groupBy?: string;
@@ -82,6 +84,7 @@ export interface JiraPollingAccount extends JiraUserSummary {
 export class JiraIntegrationService {
   constructor(
     private readonly config: ConfigService,
+    readonly filters: JiraDashboardFilterStore,
     private readonly fetchImpl: FetchLike = fetch
   ) {}
 
@@ -130,11 +133,12 @@ export class JiraIntegrationService {
   async dashboard(input: JiraDashboardInput = {}, signal?: AbortSignal): Promise<JiraDashboardResponse> {
     const client = this.client(signal);
     const values = this.configValues();
+    const savedFilter = input.filterId === undefined ? undefined : await this.filters.get(input.filterId, signal);
     const filterJql = input.filterJql ?? stringConfig(values.dashboardFilterJql) ?? "resolution = EMPTY";
-    const sortBy = input.sortBy ?? stringConfig(values.dashboardSort) ?? "priority_desc_updated_desc";
+    const sortBy = savedFilter ? "custom_jql_order" : input.sortBy ?? stringConfig(values.dashboardSort) ?? "priority_desc_updated_desc";
     const groupBy = input.groupBy ?? stringConfig(values.dashboardGroup) ?? "epic";
     const maxResults = numberConfig(input.maxResults) ?? numberConfig(values.maxIssuesPerPoll) ?? 100;
-    const jql = dashboardJql(filterJql, sortBy);
+    const jql = savedFilter ? savedFilter.jql : dashboardJql(filterJql, sortBy);
     const issues = await this.searchNormalized(client, jql, maxResults);
     const sorted = sortJiraIssues(issues, sortBy);
     return {

@@ -23,6 +23,9 @@ describe("JiraPanel", () => {
     const calls: string[] = [];
     const callHook: NonNullable<UiContributionRenderContext["callHook"]> = async <T extends Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}) => {
       calls.push(`${hookId}:${input.issueIdOrKey ?? ""}`);
+      if (hookId === "jira.filters.list") {
+        return Promise.resolve({ filters: [], selectedFilterId: null } as unknown as T);
+      }
       if (hookId === "jira.dashboard.list") {
         return {
           jql: "assignee = currentUser()",
@@ -116,6 +119,9 @@ describe("JiraPanel", () => {
     const pendingComments = deferred<{ comments: Record<string, unknown>[] }>();
     const pendingTransitions = deferred<{ transitions: Record<string, unknown>[] }>();
     const callHook: NonNullable<UiContributionRenderContext["callHook"]> = <T extends Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}) => {
+      if (hookId === "jira.filters.list") {
+        return Promise.resolve({ filters: [], selectedFilterId: null } as unknown as T);
+      }
       if (hookId === "jira.dashboard.list") {
         return Promise.resolve({
           jql: "assignee = currentUser()",
@@ -218,6 +224,9 @@ describe("JiraPanel", () => {
     let dashboardCalls = 0;
     const detailCalls: string[] = [];
     const callHook: NonNullable<UiContributionRenderContext["callHook"]> = async <T extends Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}) => {
+      if (hookId === "jira.filters.list") {
+        return Promise.resolve({ filters: [], selectedFilterId: null } as unknown as T);
+      }
       if (hookId === "jira.dashboard.list") {
         dashboardCalls += 1;
         return {
@@ -326,6 +335,9 @@ describe("JiraPanel", () => {
 
 function jiraCallHookFixture(): NonNullable<UiContributionRenderContext["callHook"]> {
   return async <T extends Record<string, unknown>>(hookId: string) => {
+    if (hookId === "jira.filters.list") {
+      return Promise.resolve({ filters: [], selectedFilterId: null } as unknown as T);
+    }
     if (hookId === "jira.dashboard.list") {
       return {
         jql: "assignee = currentUser()",

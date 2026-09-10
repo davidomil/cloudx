@@ -3,13 +3,60 @@ import os from "node:os";
 import path from "node:path";
 
 import type { PluginDescriptor } from "@cloudx/shared";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { ConfigService } from "../configService.js";
+import { PluginDataStore } from "../plugins/PluginDataStore.js";
+import { JiraDashboardFilterStore } from "./JiraDashboardFilterStore.js";
 import type { FetchLike } from "./JiraClient.js";
 import { JiraIntegrationService } from "./JiraIntegrationService.js";
 
 describe("JiraIntegrationService", () => {
+  it("executes a saved full JQL query without an assignee restriction and preserves Jira's ordering", async () => {
+    const config = await configuredJiraConfig({ dashboardFilterJql: "project = ENG", dashboardGroup: "none" });
+    const filters = await savedFilterStore();
+    const jql = 'project = ENG AND (assignee IS EMPTY OR assignee = "teammate") ORDER BY created ASC';
+    const saved = await filters.save({ name: "Team backlog", jql });
+    const fetchImpl = vi.fn<FetchLike>(async () => jsonResponse({ issues: [
+      jiraIssue("ENG-2", "Low", "ENG-1", "Epic One", "2026-06-07"),
+      jiraIssue("ENG-3", "Highest", "ENG-1", "Epic One", "2026-06-08")
+    ] }));
+    const service = new JiraIntegrationService(config, filters, fetchImpl);
+    const pollingBefore = service.pollingConfig();
+
+    const dashboard = await service.dashboard({ filterId: saved.selectedFilterId! });
+
+    expect(JSON.parse(String(fetchImpl.mock.calls[0]?.[1]?.body)).jql).toBe(jql);
+    expect(dashboard).toMatchObject({ jql, sortBy: "custom_jql_order", groupBy: "none" });
+    expect(dashboard.issues.map((issue) => issue.key)).toEqual(["ENG-2", "ENG-3"]);
+    expect(service.pollingConfig()).toEqual(pollingBefore);
+
+    await service.dashboard();
+    await service.search();
+    for (const call of fetchImpl.mock.calls.slice(1)) {
+      expect(JSON.parse(String(call[1]?.body)).jql).toBe("assignee = currentUser() AND (project = ENG) ORDER BY priority DESC, updated DESC");
+    }
+  });
+
+  it("rejects unknown saved filters before querying Jira", async () => {
+    const config = await configuredJiraConfig({});
+    const fetchImpl = vi.fn<FetchLike>();
+    const service = new JiraIntegrationService(config, await savedFilterStore(), fetchImpl);
+    await expect(service.dashboard({ filterId: "missing" })).rejects.toThrow("does not exist");
+    await expect(service.dashboard({ filterId: " " })).rejects.toThrow("non-empty string");
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("reports a rejected Jira query without losing the saved filter or selection", async () => {
+    const config = await configuredJiraConfig({});
+    const filters = await savedFilterStore();
+    const saved = await filters.save({ name: "Draft query", jql: "project =" });
+    const fetchImpl: FetchLike = async () => new Response(JSON.stringify({ errorMessages: ["Invalid JQL query"] }), { status: 400 });
+    const service = new JiraIntegrationService(config, filters, fetchImpl);
+    await expect(service.dashboard({ filterId: saved.selectedFilterId! })).rejects.toThrow("Invalid JQL query");
+    await expect(filters.list()).resolves.toEqual(saved);
+  });
+
   it("uses configured dashboard JQL, priority sorting, and Epic grouping", async () => {
     const config = await configuredJiraConfig({
       dashboardFilterJql: "project = ENG",
@@ -27,7 +74,7 @@ describe("JiraIntegrationService", () => {
       });
     };
 
-    const dashboard = await new JiraIntegrationService(config, fetchImpl).dashboard();
+    const dashboard = await new JiraIntegrationService(config, await savedFilterStore(), fetchImpl).dashboard();
 
     expect(JSON.parse(String(calls[0]?.[1]?.body))).toMatchObject({
       jql: "assignee = currentUser() AND (project = ENG) ORDER BY priority DESC, updated DESC",
@@ -47,7 +94,7 @@ describe("JiraIntegrationService", () => {
       return jsonResponse({ key: "ENG-9" });
     };
 
-    const result = await new JiraIntegrationService(config, fetchImpl).createIssue({
+    const result = await new JiraIntegrationService(config, await savedFilterStore(), fetchImpl).createIssue({
       projectKey: "ENG",
       issueType: "Task",
       summary: "Write tests",
@@ -92,7 +139,7 @@ describe("JiraIntegrationService", () => {
         isLast: false
       });
     };
-    const service = new JiraIntegrationService(config, fetchImpl);
+    const service = new JiraIntegrationService(config, await savedFilterStore(), fetchImpl);
 
     await expect(service.search({ jql: "project = ENG ORDER BY updated DESC", maxResults: 2 })).resolves.toMatchObject({
       issueKeys: ["ENG-1", "ENG-2"],
@@ -125,7 +172,7 @@ describe("JiraIntegrationService", () => {
       return jsonResponse({ issues: [], nextPageToken: `token-${calls.length}`, isLast: false });
     };
 
-    await expect(new JiraIntegrationService(config, fetchImpl).searchAll({ jql: "project = ENG", maxResults: 3, pageSize: 1 })).resolves.toMatchObject({
+    await expect(new JiraIntegrationService(config, await savedFilterStore(), fetchImpl).searchAll({ jql: "project = ENG", maxResults: 3, pageSize: 1 })).resolves.toMatchObject({
       issueKeys: [],
       issueCount: 0,
       isLast: false,
@@ -156,7 +203,7 @@ describe("JiraIntegrationService", () => {
       }
       return new Response(undefined, { status: 204 });
     };
-    const service = new JiraIntegrationService(config, fetchImpl);
+    const service = new JiraIntegrationService(config, await savedFilterStore(), fetchImpl);
 
     const updated = await service.updateIssue("ENG-7", { summary: "New summary", description: "Updated.", priority: "High", fields: { customfield_10010: "field value" } });
     const comment = await service.addComment("ENG-7", "Added context.");
@@ -224,8 +271,8 @@ describe("JiraIntegrationService", () => {
       throw new Error(`Unexpected URL ${url}`);
     };
 
-    await expect(new JiraIntegrationService(config, fetchImpl).transitionIssue("ENG-7", { transitionName: "review" })).rejects.toThrow("matched multiple transitions");
-    await expect(new JiraIntegrationService(config, fetchImpl).transitionIssue("ENG-7", { targetStatus: "qa" })).rejects.toThrow("matched multiple transitions");
+    await expect(new JiraIntegrationService(config, await savedFilterStore(), fetchImpl).transitionIssue("ENG-7", { transitionName: "review" })).rejects.toThrow("matched multiple transitions");
+    await expect(new JiraIntegrationService(config, await savedFilterStore(), fetchImpl).transitionIssue("ENG-7", { targetStatus: "qa" })).rejects.toThrow("matched multiple transitions");
   });
 
   it("fetches Jira metadata and builds issue and comment URLs", async () => {
@@ -248,7 +295,7 @@ describe("JiraIntegrationService", () => {
       }
       throw new Error(`Unexpected URL ${url}`);
     };
-    const service = new JiraIntegrationService(config, fetchImpl);
+    const service = new JiraIntegrationService(config, await savedFilterStore(), fetchImpl);
 
     await expect(service.metadata()).resolves.toMatchObject({
       fields: [expect.objectContaining({ id: "summary" })],
@@ -296,7 +343,7 @@ describe("JiraIntegrationService", () => {
       }
       throw new Error(`Unexpected URL ${url}`);
     };
-    const service = new JiraIntegrationService(config, fetchImpl);
+    const service = new JiraIntegrationService(config, await savedFilterStore(), fetchImpl);
 
     await expect(service.currentUser()).resolves.toMatchObject({
       user: { accountId: "abc", displayName: "Ari", emailAddress: "ari@example.com" }
@@ -328,6 +375,12 @@ describe("JiraIntegrationService", () => {
     });
   });
 });
+
+async function savedFilterStore(): Promise<JiraDashboardFilterStore> {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-jira-service-filters-"));
+  onTestFinished(() => fs.rm(dataDir, { recursive: true, force: true }));
+  return new JiraDashboardFilterStore(new PluginDataStore(dataDir));
+}
 
 async function configuredJiraConfig(values: Record<string, unknown>): Promise<ConfigService> {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-jira-service-"));
