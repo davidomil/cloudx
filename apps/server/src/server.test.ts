@@ -103,6 +103,90 @@ describe("buildServer", () => {
     }
   });
 
+  it.each([false, true])("drains the final startup catalog refresh before closing (refresh fails: %s)", async (fails) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-catalog-refresh-shutdown-"));
+    const config = testConfig(root);
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const services = buildServices(config, logger);
+    const catalog = services.rulesSkills!;
+    const listCatalog = catalog.list.bind(catalog);
+    const list = vi.spyOn(catalog, "list");
+    const finalSkill = services.plugins.values().flatMap((plugin) => plugin.skillContributions ?? []).at(-1)!;
+    const finalSaveStarted = deferred<void>();
+    const releaseFinalSave = deferred<void>();
+    const releaseSetup = deferred<void>();
+    const refreshStarted = deferred<void>();
+    const releaseRefresh = deferred<void>();
+    const refreshFailure = new Error("Catalog refresh failed.");
+    const saveSkill = catalog.saveSystemSkill.bind(catalog);
+    const save = vi.spyOn(catalog, "saveSystemSkill").mockImplementation(async (skill) => {
+      if (skill.id !== finalSkill.id) return saveSkill(skill);
+      finalSaveStarted.resolve(undefined);
+      await releaseFinalSave.promise;
+      const store = await saveSkill(skill);
+      await releaseSetup.promise;
+      return store;
+    });
+    const createSession = vi.spyOn(services.plugins.get("codex-terminal"), "createSession").mockImplementation(({ tab }) => ({
+      tab,
+      snapshot: () => ({ tabId: tab.id, pluginId: tab.pluginId, title: tab.title, cwd: tab.cwd, status: tab.status }),
+      voiceContext: () => ({ kind: "codex-terminal", cwd: tab.cwd, summary: "Fake Codex session." }),
+      handleAction: async () => ({}),
+      stop: vi.fn(),
+    }));
+    const refresh = vi.spyOn(services.sessions, "refreshRuntimeIndicators");
+    const disposeSessions = vi.spyOn(services.sessions, "dispose");
+    const disposeAutomation = vi.spyOn(services.automation!, "dispose");
+    const app = await buildServer(config, services);
+    let closing: Promise<void> | undefined;
+    let closed = false;
+    try {
+      await finalSaveStarted.promise;
+      await services.sessions.createTab({ pluginId: "codex-terminal", cwd: root });
+      list.mockImplementationOnce(async () => {
+        refreshStarted.resolve(undefined);
+        await releaseRefresh.promise;
+        if (fails) throw refreshFailure;
+        return listCatalog();
+      });
+      releaseFinalSave.resolve(undefined);
+      await refreshStarted.promise;
+      closing = app.close().then(() => { closed = true; });
+      await vi.waitFor(() => expect(disposeSessions).toHaveResolved());
+      expect(services.sessions.listTabs()).toEqual([]);
+      releaseSetup.resolve(undefined);
+      await services.pluginContributionsReady;
+      await vi.waitFor(() => expect(disposeAutomation).toHaveResolved());
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(closed).toBe(false);
+
+      releaseRefresh.resolve(undefined);
+      await closing;
+      if (fails) {
+        expect(logger.error).toHaveBeenCalledWith({ err: refreshFailure }, "Failed to refresh rules/skills indicators.");
+      } else {
+        expect(logger.error).not.toHaveBeenCalled();
+      }
+      const refreshCount = refresh.mock.calls.length;
+      await catalog.saveSystemSkill(finalSkill);
+      expect(refresh).toHaveBeenCalledTimes(refreshCount);
+      await fs.rm(root, { recursive: true, force: true });
+      await Promise.allSettled(refresh.mock.results.map((result) => result.value));
+      await expect(fs.stat(root)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      releaseFinalSave.resolve(undefined);
+      releaseSetup.resolve(undefined);
+      releaseRefresh.resolve(undefined);
+      await closing;
+      await app.close();
+      await Promise.allSettled(refresh.mock.results.map((result) => result.value));
+      list.mockRestore();
+      save.mockRestore();
+      createSession.mockRestore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("does not expose a Codex source-selection inventory", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-source-route-"));
     const config = testConfig(root);
@@ -1473,8 +1557,22 @@ describe("buildServer", () => {
 
   it("runs one ordered two-phase shutdown across preClose and onClose", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-server-dispose-order-"));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
     const services = buildServices(testConfig(root));
+    const disposeJiraOwner = services.jiraPolling!.dispose.bind(services.jiraPolling);
+    const disposeForgeOwner = vi.fn(services.forge!.dispose.bind(services.forge));
     const disposeAutomationOwner = services.automation!.dispose.bind(services.automation);
+    const poll = vi.spyOn(services.forge!, "poll");
+    const pollWriteStarted = deferred<void>();
+    const releasePollWrite = deferred<void>();
+    const writePluginData = services.pluginData!.write.bind(services.pluginData);
+    const writes = vi.spyOn(services.pluginData!, "write").mockImplementation(async (pluginId, value) => {
+      if (pluginId === "forge") {
+        pollWriteStarted.resolve(undefined);
+        await releasePollWrite.promise;
+      }
+      await writePluginData(pluginId, value);
+    });
     const events: string[] = [];
     const jiraRelease = deferred<void>();
     const forgeRelease = deferred<void>();
@@ -1528,6 +1626,14 @@ describe("buildServer", () => {
       events.push("notifications:automation");
     });
     const app = await buildServer(testConfig(root), services);
+    let cleanup: Promise<void> | undefined;
+    const cleanUpFixture = async () => {
+      await app.close();
+      await disposeJiraOwner();
+      await disposeForgeOwner();
+      await disposeAutomationOwner();
+      await fs.rm(root, { recursive: true, force: true });
+    };
     onTestFinished(async () => {
       jiraRelease.resolve(undefined);
       forgeRelease.resolve(undefined);
@@ -1535,10 +1641,19 @@ describe("buildServer", () => {
       automationRelease.resolve(undefined);
       documentationRelease.resolve(undefined);
       voiceRelease.resolve(undefined);
-      await app.close();
-      await disposeAutomationOwner();
-      await fs.rm(root, { recursive: true, force: true });
+      releasePollWrite.resolve(undefined);
+      try {
+        await (cleanup ??= cleanUpFixture());
+      } finally {
+        writes.mockRestore();
+        poll.mockRestore();
+        vi.useRealTimers();
+      }
     });
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    await pollWriteStarted.promise;
+    expect(poll).toHaveBeenCalledTimes(1);
 
     let closed = false;
     const close = app.close().then(() => {
@@ -1576,6 +1691,22 @@ describe("buildServer", () => {
 
     expect(events.indexOf("notifications:workspace")).toBeGreaterThan(events.indexOf("automation:dispose:end"));
     expect(events.indexOf("notifications:automation")).toBeGreaterThan(events.indexOf("automation:dispose:end"));
+
+    let cleaned = false;
+    cleanup = cleanUpFixture().then(() => { cleaned = true; });
+    await vi.waitFor(() => expect(disposeForgeOwner).toHaveBeenCalledTimes(1));
+    expect(cleaned).toBe(false);
+    expect((await fs.stat(root)).isDirectory()).toBe(true);
+
+    releasePollWrite.resolve(undefined);
+    await cleanup;
+    expect(cleaned).toBe(true);
+    await expect(fs.stat(root)).rejects.toMatchObject({ code: "ENOENT" });
+    const writesAfterCleanup = writes.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(poll).toHaveBeenCalledTimes(1);
+    expect(writes).toHaveBeenCalledTimes(writesAfterCleanup);
+    await expect(fs.stat(root)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("drains an admitted plugin hook through terminal automation delivery before unsubscribe", async () => {
@@ -1725,6 +1856,7 @@ describe("buildServer", () => {
       path.join(os.tmpdir(), "cloudx-server-dispose-failures-"),
     );
     const services = buildServices(testConfig(root));
+    const disposeJiraOwner = services.jiraPolling!.dispose.bind(services.jiraPolling);
     const disposeAutomationOwner = services.automation!.dispose.bind(services.automation);
     const disposeAutomation = vi
       .spyOn(services.automation!, "dispose")
@@ -1764,6 +1896,7 @@ describe("buildServer", () => {
     const app = await buildServer(testConfig(root), services);
     onTestFinished(async () => {
       await app.close().catch(() => undefined);
+      await disposeJiraOwner();
       await disposeAutomationOwner();
       await fs.rm(root, { recursive: true, force: true });
     });
