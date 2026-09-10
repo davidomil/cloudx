@@ -41,6 +41,7 @@ import { disposeFileBrowserPanelStatesExcept } from "./fileBrowserPanelState.js"
 import { disposeFileBrowserTransfersExcept } from "./fileBrowserTransfers.js";
 import { disposeDocumentationIngestController, disposeDocumentationIngestControllersExcept } from "./documentationPanelQueue.js";
 import { PathEntry } from "./PathEntry.js";
+import { TabPanel } from "./TabPanel.js";
 import {
   activatePane,
   activatePaneTab,
@@ -1503,6 +1504,8 @@ export function App() {
     const paneMaximized = maximizedPaneId === pane.id;
     const activePaneTabId = pane.activeTabId;
     const activePaneTab = activePaneTabId ? tabById.get(activePaneTabId) : undefined;
+    // Moving an iframe resets its document, so panel order must not follow tab-strip reordering.
+    const panelTabIds = [...pane.tabIds].sort();
     return (
       <div
         className={`workspace-pane ${paneActive ? "active" : ""}`}
@@ -1609,29 +1612,38 @@ export function App() {
           ) : null}
         </div>
         <div className="pane-body">
-          {activePaneTabId && activePaneTab ? (
-            <PluginPanel
-              tab={activePaneTab}
-              plugin={pluginById.get(activePaneTab.pluginId)}
-              plugins={plugins}
-              active={paneActive}
-              config={pluginConfig(activePaneTab.pluginId)}
-              uiScale={uiScale}
-              uiContributionRegistry={uiContributionRegistry}
-              callHook={callUiHook}
-              automationRuns={automationRuns}
-              automationPanelState={automationPanelStates[activePaneTabId]}
-              onAutomationPanelStateChange={(updater) => updateAutomationPanelState(activePaneTabId, updater)}
-              activeAutomationTriggerIds={activeAutomationTriggerIds}
-              emitTrigger={handleEmitTrigger}
-              onAutomationGroupsChanged={refreshActiveAutomationTriggerIds}
-            />
-          ) : (
+          {panelTabIds.map((tabId) => {
+            const tab = tabById.get(tabId);
+            if (!tab) return null;
+            const plugin = pluginById.get(tab.pluginId);
+            const selected = tabId === activePaneTabId;
+            return (
+              <TabPanel key={tabId} active={selected} keepMounted={plugin?.panelKind === "web-viewer"}>
+                <PluginPanel
+                  tab={tab}
+                  plugin={plugin}
+                  plugins={plugins}
+                  active={paneActive && selected}
+                  config={pluginConfig(tab.pluginId)}
+                  uiScale={uiScale}
+                  uiContributionRegistry={uiContributionRegistry}
+                  callHook={callUiHook}
+                  automationRuns={automationRuns}
+                  automationPanelState={automationPanelStates[tabId]}
+                  onAutomationPanelStateChange={(updater) => updateAutomationPanelState(tabId, updater)}
+                  activeAutomationTriggerIds={activeAutomationTriggerIds}
+                  emitTrigger={handleEmitTrigger}
+                  onAutomationGroupsChanged={refreshActiveAutomationTriggerIds}
+                />
+              </TabPanel>
+            );
+          })}
+          {!activePaneTab ? (
             <div className="empty-pane">
               <PanelTopOpen size={28} />
               <span>Drop a tab here or create a plugin tab.</span>
             </div>
-          )}
+          ) : null}
         </div>
       </div>
     );

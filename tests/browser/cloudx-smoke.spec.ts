@@ -807,6 +807,278 @@ test.describe("CloudX shipped shell", () => {
     }
   });
 
+  test("keeps Local Web uploads and downloads running while another CloudX tab is active", async ({
+    page,
+  }, testInfo) => {
+    const tabs = await createLocalWebTransferTabs(page);
+    const files = [
+      {
+        name: "first.txt",
+        mimeType: "text/plain",
+        buffer: Buffer.from("first embedded upload\n"),
+      },
+      {
+        name: "second.txt",
+        mimeType: "text/plain",
+        buffer: Buffer.from("second embedded upload\n"),
+      },
+    ];
+    const filename = "embedded-download.bin";
+    const contents = Buffer.from([0, 1, 127, 128, 254, 255]);
+    const uploads: Array<{ name: string; bytes: Buffer | null }> = [];
+    const failures: string[] = [];
+    const releases: Array<() => void> = [];
+    const held = Array.from(
+      { length: 3 },
+      () => new Promise<void>((resolve) => releases.push(resolve)),
+    );
+    const proxyPath = `/api/local-web/${tabs.source.id}/proxy/`;
+    let frameLoads = 0;
+    let downloadRequests = 0;
+    let savedDownloads = 0;
+    page.on("download", () => (savedDownloads += 1));
+    page.on("requestfailed", (request) => {
+      if (new URL(request.url()).pathname.startsWith(proxyPath)) {
+        failures.push(
+          `${request.method()} ${new URL(request.url()).pathname}: ${request.failure()?.errorText}`,
+        );
+      }
+    });
+    await page.route(`**${proxyPath}**`, async (route) => {
+      const url = new URL(route.request().url());
+      const headers = { "access-control-allow-origin": "*" };
+      if (url.pathname === `${proxyPath}transfers`) {
+        frameLoads += 1;
+        await route.fulfill({
+          contentType: "text/html",
+          body: localWebTransferPage(filename),
+        });
+      } else if (url.pathname === `${proxyPath}upload`) {
+        const index = uploads.length;
+        uploads.push({
+          name: url.searchParams.get("filename")!,
+          bytes: route.request().postDataBuffer(),
+        });
+        await held[index];
+        await route.fulfill({
+          headers,
+          contentType: "text/plain",
+          body: "uploaded",
+        });
+      } else if (url.pathname === `${proxyPath}download`) {
+        downloadRequests += 1;
+        await held[2];
+        await route.fulfill({
+          headers,
+          contentType: "application/octet-stream",
+          body: contents,
+        });
+      } else {
+        throw new Error(`Unexpected Local Web fixture request: ${url}`);
+      }
+    });
+
+    try {
+      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+      await expect(page.locator(".tab-button.selected .tab-title")).toHaveText(
+        tabs.other.title,
+      );
+      expect(frameLoads).toBe(0);
+      await page
+        .locator(".tab-activation")
+        .filter({ hasText: tabs.source.title })
+        .click();
+      const iframe = page.locator(".web-viewer-frame");
+      await expect(iframe).toBeVisible();
+      const frame = await (await iframe.elementHandle())!.contentFrame();
+      if (!frame)
+        throw new Error("The Local Web transfer fixture did not load.");
+      await frame.locator('input[type="file"]').setInputFiles(files);
+      await frame.getByRole("button", { name: "Download" }).click();
+      await expect
+        .poll(() => ({ uploads: uploads.length, downloads: downloadRequests }))
+        .toEqual({ uploads: 1, downloads: 1 });
+      const originalDocument = await frame.evaluateHandle(() => document);
+
+      const localTabTitles = page
+        .locator(".tab-title")
+        .filter({ hasText: "Local Web transfer" });
+      await expect(localTabTitles).toHaveText([
+        tabs.source.title,
+        tabs.other.title,
+      ]);
+      await page
+        .locator(".tab-button")
+        .filter({ hasText: tabs.other.title })
+        .dragTo(
+          page.locator(".tab-button").filter({ hasText: tabs.source.title }),
+        );
+      await expect(localTabTitles).toHaveText([
+        tabs.other.title,
+        tabs.source.title,
+      ]);
+      expect(
+        await frame.evaluate(
+          (original) => original === document,
+          originalDocument,
+        ),
+      ).toBe(true);
+      expect(frameLoads).toBe(1);
+
+      await page
+        .locator(".tab-activation")
+        .filter({ hasText: tabs.other.title })
+        .click();
+      releases[0]!();
+      await expect
+        .poll(() => ({ uploads: uploads.length, failures }))
+        .toEqual({ uploads: 2, failures: [] });
+      await expect(iframe).toBeHidden();
+      expect(frame.isDetached()).toBe(false);
+      const downloaded = page.waitForEvent("download");
+      releases[1]!();
+      releases[2]!();
+      const download = await downloaded;
+      expect(download.suggestedFilename()).toBe(filename);
+      const savedPath = testInfo.outputPath(filename);
+      await download.saveAs(savedPath);
+      expect(await fs.readFile(savedPath)).toEqual(contents);
+      await expect(frame.locator("#uploaded")).toHaveText("2");
+      await expect(frame.locator("#downloaded")).toHaveText("1");
+      expect(uploads).toEqual(
+        files.map((file) => ({ name: file.name, bytes: file.buffer })),
+      );
+      expect(savedDownloads).toBe(1);
+      expect(downloadRequests).toBe(1);
+      expect(failures).toEqual([]);
+      await expect(page.locator(".tab-button.selected .tab-title")).toHaveText(
+        tabs.other.title,
+      );
+
+      await page
+        .locator(".tab-activation")
+        .filter({ hasText: tabs.source.title })
+        .click();
+      await expect(iframe).toBeVisible();
+      expect(await (await iframe.elementHandle())!.contentFrame()).toBe(frame);
+      await expect(frame.locator("#uploaded")).toHaveText("2");
+      await expect(frame.locator("#downloaded")).toHaveText("1");
+      expect(frameLoads).toBe(1);
+      await page
+        .locator(".tab-activation")
+        .filter({ hasText: tabs.other.title })
+        .click();
+      await page
+        .getByRole("button", {
+          name: `Close ${tabs.source.title}`,
+          exact: true,
+        })
+        .click();
+      await expect(iframe).toHaveCount(0);
+      expect(frame.isDetached()).toBe(true);
+    } finally {
+      releases.forEach((release) => release());
+      await page.unrouteAll({ behavior: "wait" });
+      for (const tab of [tabs.source, tabs.other]) {
+        await page.request.delete(`${baseUrl}/api/tabs/${tab.id}`);
+      }
+    }
+  });
+
+  test("retains Local Web transfer failures received while its tab is hidden", async ({
+    page,
+  }) => {
+    const tabs = await createLocalWebTransferTabs(page);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const requests: string[] = [];
+    let frameLoads = 0;
+    let savedDownloads = 0;
+    page.on("download", () => (savedDownloads += 1));
+    await page.route(
+      `**/api/local-web/${tabs.source.id}/proxy/**`,
+      async (route) => {
+        const endpoint = new URL(route.request().url()).pathname
+          .split("/")
+          .pop()!;
+        if (endpoint === "transfers") {
+          frameLoads += 1;
+          await route.fulfill({
+            contentType: "text/html",
+            body: localWebTransferPage("failed.bin"),
+          });
+        } else {
+          requests.push(endpoint);
+          await held;
+          await route.fulfill({
+            status: 503,
+            headers: { "access-control-allow-origin": "*" },
+            contentType: "text/plain",
+            body: "Transfer service unavailable",
+          });
+        }
+      },
+    );
+    try {
+      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+      await page
+        .locator(".tab-activation")
+        .filter({ hasText: tabs.source.title })
+        .click();
+      const iframe = page.locator(".web-viewer-frame");
+      const frame = page.frameLocator(".web-viewer-frame");
+      await frame.locator('input[type="file"]').setInputFiles([
+        {
+          name: "first.txt",
+          mimeType: "text/plain",
+          buffer: Buffer.from("first"),
+        },
+        {
+          name: "second.txt",
+          mimeType: "text/plain",
+          buffer: Buffer.from("second"),
+        },
+      ]);
+      await frame.getByRole("button", { name: "Download" }).click();
+      await expect.poll(() => requests.length).toBe(2);
+      await page
+        .locator(".tab-activation")
+        .filter({ hasText: tabs.other.title })
+        .click();
+      release();
+      await expect(frame.locator("#upload-error")).toHaveText(
+        "Upload failed: 503",
+      );
+      await expect(frame.locator("#download-error")).toHaveText(
+        "Download failed: 503",
+      );
+      await expect(iframe).toBeHidden();
+      await page
+        .locator(".tab-activation")
+        .filter({ hasText: tabs.source.title })
+        .click();
+      await expect(frame.locator("#upload-error")).toHaveText(
+        "Upload failed: 503",
+      );
+      await expect(frame.locator("#download-error")).toHaveText(
+        "Download failed: 503",
+      );
+      await expect(frame.locator("#uploaded")).toHaveText("0");
+      await expect(frame.locator("#downloaded")).toHaveText("0");
+      expect(requests.sort()).toEqual(["download", "upload"]);
+      expect(savedDownloads).toBe(0);
+      expect(frameLoads).toBe(1);
+    } finally {
+      release();
+      await page.unrouteAll({ behavior: "wait" });
+      for (const tab of [tabs.source, tabs.other]) {
+        await page.request.delete(`${baseUrl}/api/tabs/${tab.id}`);
+      }
+    }
+  });
+
   test("creates a tab from the committed window without duplicate layout persistence", async ({
     page,
   }, testInfo) => {
@@ -1039,6 +1311,76 @@ async function createFileTransferTabs(page: Page, title: string) {
     tabs.push(((await response.json()) as CreateTabResponse).tab);
   }
   return { source: tabs[0]!, other: tabs[1]! };
+}
+
+async function createLocalWebTransferTabs(page: Page) {
+  const workspace = (await (
+    await page.request.get(`${baseUrl}/api/workspace`)
+  ).json()) as WorkspaceStateResponse;
+  const window = workspace.windows.find(
+    (candidate) => candidate.id === workspace.activeWindowId,
+  )!;
+  const tabs: CreateTabResponse["tab"][] = [];
+  for (const role of ["source", "other"]) {
+    const response = await page.request.post(`${baseUrl}/api/tabs`, {
+      data: {
+        pluginId: "local-web",
+        title: `Local Web transfer ${role}`,
+        windowId: window.id,
+        paneId: window.layout.activePaneId,
+        ...(role === "source"
+          ? { initialInput: { url: "http://127.0.0.1:9/transfers" } }
+          : {}),
+      },
+    });
+    expect(response.status()).toBe(201);
+    tabs.push(((await response.json()) as CreateTabResponse).tab);
+  }
+  return { source: tabs[0]!, other: tabs[1]! };
+}
+
+function localWebTransferPage(filename: string): string {
+  return `<!doctype html><html><body>
+    <input type="file" multiple>
+    <button>Download</button>
+    <output id="uploaded">0</output><output id="downloaded">0</output>
+    <output id="upload-error"></output><output id="download-error"></output>
+    <script>
+      document.querySelector('input').onchange = async (event) => {
+        try {
+          for (const file of event.target.files) {
+            await new Promise((resolve, reject) => {
+              const request = new XMLHttpRequest();
+              request.open('POST', 'upload?filename=' + encodeURIComponent(file.name));
+              request.onload = () => request.status === 200 ? resolve() : reject(new Error('Upload failed: ' + request.status));
+              request.onerror = () => reject(new Error('Upload request failed'));
+              request.send(file);
+            });
+            document.querySelector('#uploaded').textContent = Number(document.querySelector('#uploaded').textContent) + 1;
+          }
+        } catch (error) {
+          document.querySelector('#upload-error').textContent = error.message;
+        }
+      };
+      document.querySelector('button').onclick = async () => {
+        try {
+          const response = await fetch('download');
+          if (!response.ok) throw new Error('Download failed: ' + response.status);
+          const url = URL.createObjectURL(await response.blob());
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = ${JSON.stringify(filename)};
+          document.body.append(link);
+          link.click();
+          link.remove();
+          document.querySelector('#downloaded').textContent = Number(document.querySelector('#downloaded').textContent) + 1;
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        } catch (error) {
+          document.querySelector('#download-error').textContent = error.message;
+        }
+      };
+    </script>
+  </body></html>`;
 }
 
 async function writeTerminalFixture(root: string): Promise<string> {

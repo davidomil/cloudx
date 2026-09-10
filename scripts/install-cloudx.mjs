@@ -100,6 +100,7 @@ export function parseArgs(argv = process.argv.slice(2)) {
     noStart: false,
     uninstall: false,
     update: false,
+    updateCodex: false,
     verbose: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -119,6 +120,8 @@ export function parseArgs(argv = process.argv.slice(2)) {
       options.uninstall = true;
     } else if (arg === "--update") {
       options.update = true;
+    } else if (arg === "--update-codex") {
+      options.updateCodex = true;
     } else if (arg === "--service") {
       options.service = argv[++index];
       if (!options.service || options.service.startsWith("-"))
@@ -134,6 +137,11 @@ export function parseArgs(argv = process.argv.slice(2)) {
     } else {
       throw new Error(`Unknown installer option: ${arg}`);
     }
+  }
+  if (options.updateCodex && (options.update || options.uninstall)) {
+    throw new Error(
+      "--update-codex cannot be combined with --update or --uninstall.",
+    );
   }
   if (options.uninstall && options.update) {
     throw new Error("--update cannot be combined with --uninstall.");
@@ -173,6 +181,7 @@ export function helpText() {
     "",
     "Options:",
     "  --update           Fast-forward this clean checkout to origin/main and update its installation.",
+    "  --update-codex     Update only Codex CLI to the latest npm release; leave Cloudx and services unchanged.",
     "  --service <unit>   Update only an existing custom web service; preserve its definition and shared dependencies.",
     "  --port <number>    HTTPS readiness port for the selected custom web service.",
     "  --host <address>   IPv4 or IPv6 readiness address for the custom service (default: 127.0.0.1).",
@@ -959,6 +968,9 @@ export async function runInstaller(options = {}) {
 
   let paths = installerPaths({ repoRoot: root, home, env });
   const commands = commandMap(runner);
+  if (options.updateCodex) {
+    return runCodexUpdater({ paths, commands, env });
+  }
   let updateTarget;
   let savedEnv;
   if (options.update) {
@@ -2029,7 +2041,40 @@ function waitForHealth(commands, { label, url, insecure = false }) {
   console.log(`  ${label} readiness ok.`);
 }
 
-function installCodexCli(commands, paths, env) {
+function runCodexUpdater({ paths, commands, env }) {
+  const savedEnv = fs.existsSync(paths.envPath)
+    ? parseEnvironmentFile(fs.readFileSync(paths.envPath, "utf8"))
+    : {};
+  const savedBin = savedEnv.CLOUDX_ASSISTANT_BIN;
+  if (savedBin !== undefined) {
+    if (
+      !path.isAbsolute(savedBin) ||
+      path.basename(savedBin) !== "codex" ||
+      path.basename(path.dirname(savedBin)) !== "bin"
+    ) {
+      throw new Error(
+        "Codex-only updates require CLOUDX_ASSISTANT_BIN to be an absolute npm prefix/bin/codex path. Update custom assistant executables with their own installer.",
+      );
+    }
+    paths.npmGlobalDir = path.dirname(path.dirname(savedBin));
+  } else if (savedEnv.CLOUDX_NPM_GLOBAL_DIR !== undefined) {
+    paths.npmGlobalDir = savedEnv.CLOUDX_NPM_GLOBAL_DIR;
+  }
+  if (!path.isAbsolute(paths.npmGlobalDir)) {
+    throw new Error("CLOUDX_NPM_GLOBAL_DIR must be an absolute path.");
+  }
+
+  section("Update only Codex CLI");
+  verifyNodeAndNpm(commands);
+  const assistantBin = installCodexCli(commands, paths, env, "latest");
+  commands.run(assistantBin, ["--version"], { env: codexNpmEnv(paths, env) });
+  console.log(
+    "Codex CLI update complete. New Codex processes use the updated executable.",
+  );
+  return { paths, assistantBin };
+}
+
+function installCodexCli(commands, paths, env, version = CODEX_CLI_VERSION) {
   const assistantBin = codexCliBin(paths);
   const npmEnv = codexNpmEnv(paths, env);
   commands.mkdir(paths.npmGlobalDir);
@@ -2040,7 +2085,7 @@ function installCodexCli(commands, paths, env) {
       "-g",
       "--prefix",
       paths.npmGlobalDir,
-      `@openai/codex@${CODEX_CLI_VERSION}`,
+      `@openai/codex@${version}`,
     ],
     { env: npmEnv },
   );
