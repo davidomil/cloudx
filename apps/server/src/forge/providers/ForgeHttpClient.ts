@@ -4,7 +4,7 @@ import type {
   ForgeRepository,
 } from "@cloudx/shared";
 import { ForgeCredentials, validateRepository } from "./ForgeCredentials.js";
-import { ForgeProviderError } from "./ForgeProvider.js";
+import { ForgeProviderError, ForgeProviderUnavailableError, forgeRequestFailure, throwIfForgeRequestAborted, type ForgeProviderFailure } from "./ForgeProvider.js";
 import { list } from "./validation.js";
 import { readBoundedBody } from "./responseBody.js";
 
@@ -30,8 +30,8 @@ export class ForgeHttpClient {
       signal?: AbortSignal;
     } = {},
   ): Promise<{ body: unknown; headers: Headers }> {
-    this.signal?.throwIfAborted();
-    options.signal?.throwIfAborted();
+    throwIfForgeRequestAborted(this.signal);
+    throwIfForgeRequestAborted(options.signal);
     if (
       !path.startsWith("/") ||
       path.startsWith("//") ||
@@ -64,50 +64,51 @@ export class ForgeHttpClient {
         ? {}
         : { "Content-Type": "application/json" }),
     };
-    signal.throwIfAborted();
+    throwIfForgeRequestAborted(signal);
     const method = options.method ?? "GET";
+    const query = String((options.body as { query?: unknown })?.query);
+    const graphqlRead = options.graphql && /^\s*query\b/.test(query) && !/\bmutation\b/.test(query);
     const changesRemoteState =
       !["GET", "HEAD"].includes(method) &&
-      (!options.graphql ||
-        /^mutation\b/.test(
-          String((options.body as { query?: unknown })?.query),
-        ));
+      !graphqlRead;
+    let body: string | undefined;
     try {
-      const response = await this.fetcher(`${base}${path}`, {
+      body = options.body === undefined ? undefined : JSON.stringify(options.body);
+    } catch {
+      throw new ForgeProviderError("The forge request body could not be encoded.");
+    }
+    let response: Response;
+    try {
+      response = await this.fetcher(`${base}${path}`, {
         method,
         headers,
         redirect: "error",
         signal,
-        ...(options.body === undefined
-          ? {}
-          : { body: JSON.stringify(options.body) }),
+        ...(body === undefined ? {} : { body }),
       });
-      if (!response.ok) {
+    } catch {
+      throw requestFailure(forgeRequestFailure(signal), changesRemoteState);
+    }
+    if (!response.ok) {
+      try {
         await response.body?.cancel();
+      } finally {
         throw new ForgeProviderError(
           `The ${this.repository.provider} API rejected the operation (HTTP ${response.status}).`,
           response.status,
         );
       }
+    }
+    try {
       const text = await readBoundedBody(response);
-      signal.throwIfAborted();
+      throwIfForgeRequestAborted(signal);
       return {
         body: options.text ? text : text ? (JSON.parse(text) as unknown) : null,
         headers: response.headers,
       };
     } catch (error) {
-      if (error instanceof ForgeProviderError) throw error;
-      if (signal.aborted)
-        throw new ForgeProviderError(
-          changesRemoteState
-            ? "The forge operation was interrupted; its remote result is unknown. Refresh provider state before submitting again."
-            : "The forge request was interrupted.",
-          changesRemoteState ? 409 : 499,
-        );
-      throw new ForgeProviderError(
-        "The forge API request failed or returned unreadable data.",
-        502,
-      );
+      if (!changesRemoteState && error instanceof ForgeProviderError) throw error;
+      throw requestFailure(forgeRequestFailure(signal, true), changesRemoteState);
     }
   }
 
@@ -126,6 +127,13 @@ export class ForgeHttpClient {
       422,
     );
   }
+}
+
+function requestFailure(failure: ForgeProviderFailure, changesRemoteState: boolean): ForgeProviderError {
+  const unavailable = new ForgeProviderUnavailableError(failure);
+  return changesRemoteState
+    ? new ForgeProviderError(`${unavailable.message} Its remote result is unknown. Refresh provider state before submitting again.`, 409)
+    : unavailable;
 }
 
 export function pagination(query: ForgeListQuery = {}): {

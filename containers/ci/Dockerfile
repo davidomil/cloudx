@@ -38,7 +38,7 @@ RUN UV_PROJECT_ENVIRONMENT=/opt/cloudx-asr \
     && UV_PROJECT_ENVIRONMENT=/opt/cloudx-documentation \
       uv sync --project /opt/cloudx-services/documentation-indexer --locked --extra dev --no-editable
 
-COPY containers/ci/run.mjs containers/ci/attestation.test.mjs /opt/cloudx-ci/
+COPY containers/ci/run.mjs containers/ci/diagnostics.mjs containers/ci/attestation.test.mjs containers/ci/diagnostics.test.mjs /opt/cloudx-ci/
 
 RUN groupadd --gid 10001 cloudx-ci-candidate \
     && useradd --no-create-home --uid 10001 --gid 10001 \
@@ -47,8 +47,8 @@ RUN groupadd --gid 10001 cloudx-ci-candidate \
     && install --mode=000 /dev/null /results/results.json \
     && git config --system --add safe.directory /work/repository \
     && chmod 0555 /opt/cloudx-ci/run.mjs \
-    && node --test /opt/cloudx-ci/attestation.test.mjs \
-    && rm /opt/cloudx-ci/attestation.test.mjs
+    && node --test --test-concurrency=1 /opt/cloudx-ci/attestation.test.mjs /opt/cloudx-ci/diagnostics.test.mjs \
+    && rm /opt/cloudx-ci/attestation.test.mjs /opt/cloudx-ci/diagnostics.test.mjs
 
 USER root
 WORKDIR /work

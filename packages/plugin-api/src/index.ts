@@ -159,7 +159,16 @@ export type PluginRuleContribution = Omit<CloudxRule, "scope"> & {
 
 export interface PluginSessionLaunchOptions {
   authorizeProjectTrust?: () => Promise<string>;
+  prepareCodexSession?: (launch: PreparedCodexLaunch) => Promise<string>;
   ownerPluginId?: PluginId;
+}
+
+export interface PreparedCodexLaunch {
+  tabId: string;
+  cwd: string;
+  command: string;
+  configurationArgs: string[];
+  env: Record<string, string | undefined>;
 }
 
 export class PluginSessionNotStartedError extends Error {
@@ -168,6 +177,8 @@ export class PluginSessionNotStartedError extends Error {
     this.name = "PluginSessionNotStartedError";
   }
 }
+
+export class PluginSessionOwnershipError extends Error {}
 
 export interface CreatePluginSessionInput extends PluginSessionLaunchOptions {
   tab: WorkspaceTab;

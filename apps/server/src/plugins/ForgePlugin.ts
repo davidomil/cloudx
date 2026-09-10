@@ -48,6 +48,7 @@ export class ForgePlugin implements WorkspacePlugin {
       maxLength: 128,
     } satisfies JsonSchemaLike;
     const placement = { windowId: id, paneId: id };
+    const draftId = { type: "string", maxLength: 36, pattern: "^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$" } satisfies JsonSchemaLike;
     const repository = {
       type: "object",
       properties: {
@@ -185,6 +186,7 @@ export class ForgePlugin implements WorkspacePlugin {
         "write",
         {
           id,
+          draftId,
           body: { type: "string", maxLength: 100_000 },
           event,
           comments: {
@@ -204,14 +206,14 @@ export class ForgePlugin implements WorkspacePlugin {
             },
           },
         },
-        ["id", "body", "event", "comments"],
+        ["id", "draftId", "body", "event", "comments"],
         async (input) => {
           const { body, comments, event } = parseReview({
             ...input,
             headSha: "0".repeat(40),
           });
           return {
-            worker: await this.service().workflow.saveReview(String(input.id), {
+            worker: await this.service().workflow.saveReview(String(input.id), String(input.draftId), {
               body,
               comments,
               event,
@@ -223,10 +225,10 @@ export class ForgePlugin implements WorkspacePlugin {
         "review.submit",
         "Submit saved review",
         "external",
-        { id },
-        ["id"],
+        { id, draftId },
+        ["id", "draftId"],
         async (input) => ({
-          worker: await this.service().workflow.submitReview(String(input.id)),
+          worker: await this.service().workflow.submitReview(String(input.id), String(input.draftId)),
         }),
       ),
       hook(

@@ -8,6 +8,8 @@ import type { ForgeProvider } from "./providers/ForgeProvider.js";
 import type { ForgeSettings } from "./ForgeWorkflowService.js";
 
 export class ForgeSettingsService {
+  private repositoryCredentials?: { key: string; credentials: ForgeCredentials };
+
   constructor(
     private readonly config: ConfigService,
     private readonly connections: Pick<ForgeConnectionService, "credential" | "workerAuthors">,
@@ -62,7 +64,10 @@ export class ForgeSettingsService {
     const current = this.repository();
     if (current.provider !== repository.provider || current.apiUrl !== repository.apiUrl || current.projectPath !== repository.projectPath)
       throw new Error("This worker belongs to a different repository. Restore its repository settings before continuing.");
-    return new ForgeCredentials(repository, async role => this.connections.credential(repository, role));
+    const key = repositoryTrustKey(repository);
+    if (this.repositoryCredentials?.key !== key)
+      this.repositoryCredentials = { key, credentials: new ForgeCredentials(current, async role => this.connections.credential(current, role)) };
+    return this.repositoryCredentials.credentials;
   }
 
   private required(key: string): string {

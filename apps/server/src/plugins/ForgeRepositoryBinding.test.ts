@@ -68,6 +68,7 @@ async function fixture(selectedRepository: ForgeRepository) {
     isActive: vi.fn(() => true),
     recover: vi.fn(async () => ({ tabIds: [] })),
     prepareWorkspace: vi.fn(async () => ({ repositoryPath: root, worktreePath: root, branch: "feature" })),
+    refreshReviewWorkspace: vi.fn(async () => {}),
     launch: vi.fn(async () => "worker-tab"),
     pause: vi.fn(async () => {}), close: vi.fn(async () => {}), cleanup: vi.fn(async () => {}),
     verifyPublishedWorkspace: vi.fn(async () => {}), updateIssueBranch: vi.fn(async () => headSha), publishBranch: vi.fn(async () => headSha),
