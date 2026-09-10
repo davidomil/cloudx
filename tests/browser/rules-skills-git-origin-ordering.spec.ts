@@ -252,6 +252,8 @@ for (const heldSave of ["request", "response"] as const) {
 
     const held = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
+    // Keep interception enabled until page teardown: expiring this route can
+    // race the queued pull as soon as the held origin response is fulfilled.
     await page.route(
       "**/api/hooks/rules-skills.git.setOrigin",
       async (route) => {
@@ -266,7 +268,6 @@ for (const heldSave of ["request", "response"] as const) {
           await route.fulfill({ response });
         }
       },
-      { times: 1 },
     );
     const saveResponse = page.waitForResponse(
       "**/api/hooks/rules-skills.git.setOrigin",

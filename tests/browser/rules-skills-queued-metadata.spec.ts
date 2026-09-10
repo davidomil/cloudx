@@ -156,23 +156,21 @@ for (const heldPull of ["request", "response"] as const) {
 
       const held = Promise.withResolvers<void>();
       const release = Promise.withResolvers<void>();
-      await page.route(
-        "**/api/hooks/rules-skills.git.pull",
-        async (route) => {
-          if (heldPull === "request") {
-            held.resolve();
-            await release.promise;
-            await route.continue();
-          } else {
-            const response = await route.fetch();
-            expect(response.ok()).toBe(true);
-            held.resolve();
-            await release.promise;
-            await route.fulfill({ response });
-          }
-        },
-        { times: 1 },
-      );
+      // Keep interception enabled until page teardown: expiring this route can
+      // race the queued save as soon as the held pull response is fulfilled.
+      await page.route("**/api/hooks/rules-skills.git.pull", async (route) => {
+        if (heldPull === "request") {
+          held.resolve();
+          await release.promise;
+          await route.continue();
+        } else {
+          const response = await route.fetch();
+          expect(response.ok()).toBe(true);
+          held.resolve();
+          await release.promise;
+          await route.fulfill({ response });
+        }
+      });
       const pullResponse = page.waitForResponse(
         "**/api/hooks/rules-skills.git.pull",
       );
