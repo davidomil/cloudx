@@ -246,6 +246,10 @@ export class DocumentationClient {
     return this.post(`/documents/${encodeURIComponent(requireString(documentId, "documentId"))}/enrich`, body, options.signal);
   }
 
+  reanalyzeDocument(input: { documentId: string }, options: DocumentationRequestOptions = {}): Promise<Record<string, unknown>> {
+    return this.post(`/documents/${encodeURIComponent(requireString(input.documentId, "documentId"))}/reanalyze`, {}, options.signal);
+  }
+
   remove(input: Record<string, unknown>): Promise<Record<string, unknown>> {
     return this.request(`/documents/${encodeURIComponent(requireString(input.documentId, "documentId"))}`, { method: "DELETE" });
   }

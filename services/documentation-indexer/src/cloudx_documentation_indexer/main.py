@@ -276,6 +276,11 @@ def create_app(root: str | Path | None = None) -> FastAPI:
             )
         }
 
+    @app.post("/documents/{document_id}/reanalyze")
+    def reanalyze_document(document_id: str) -> dict:
+        document = handle_archive_error(lambda: archive.reanalyze_document(document_id))
+        return {"documents": [document.as_dict()]}
+
     @app.post("/ingest/path")
     def ingest_path(request: IngestPathRequest) -> dict:
         if not Path(request.path).is_absolute():

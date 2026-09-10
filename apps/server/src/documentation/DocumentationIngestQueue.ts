@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-export type DocumentationIngestKind = "path" | "url" | "text" | "upload";
+export type DocumentationIngestKind = "path" | "url" | "text" | "upload" | "reanalyze" | "reenrich";
 export type DocumentationIngestJobStatus = "queued" | "running" | "complete" | "failed";
 
 export interface DocumentationIngestJobSnapshot {
@@ -38,6 +38,8 @@ export interface DocumentationIngestQueueJobInput {
   detail?: string;
   queuedStage?: string;
   runningStage?: string;
+  completeStage?: (result: Record<string, unknown>) => string;
+  failedStage?: string;
   operation(context: DocumentationIngestQueueOperationContext): Promise<Record<string, unknown>>;
 }
 
@@ -52,7 +54,7 @@ interface DocumentationIngestJobState extends DocumentationIngestJobSnapshot {
   progressChannelsById?: Map<string, DocumentationIngestProgressChannel>;
 }
 
-export type DocumentationIngestQueueUpdate = Pick<Partial<DocumentationIngestJobSnapshot>, "progress" | "stage" | "etaSeconds" | "metrics"> & {
+export type DocumentationIngestQueueUpdate = Pick<Partial<DocumentationIngestJobSnapshot>, "label" | "progress" | "stage" | "etaSeconds" | "metrics"> & {
   channelId?: string;
   channelLabel?: string;
   channelStage?: string;
@@ -320,6 +322,9 @@ export class DocumentationIngestQueue {
       const result = await input.operation({
         signal,
         update: (patch) => {
+          if (patch.label !== undefined) {
+            job.label = patch.label;
+          }
           if (patch.progress !== undefined) {
             job.progress = boundedProgress(patch.progress);
           }
@@ -339,7 +344,7 @@ export class DocumentationIngestQueue {
       Object.assign(job, {
         status: "complete" satisfies DocumentationIngestJobStatus,
         progress: 100,
-        stage: "Import complete.",
+        stage: input.completeStage?.(result) ?? "Import complete.",
         finishedAt: new Date().toISOString()
       });
       this.report(job, reportProgress);
@@ -348,7 +353,7 @@ export class DocumentationIngestQueue {
       Object.assign(job, {
         status: "failed" satisfies DocumentationIngestJobStatus,
         progress: 100,
-        stage: "Import failed.",
+        stage: input.failedStage ?? "Import failed.",
         finishedAt: new Date().toISOString(),
         error: error instanceof Error ? error.message : String(error)
       });

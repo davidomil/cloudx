@@ -2724,6 +2724,57 @@ describe("buildServer", () => {
     await expect(fs.stat(contentPath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it.each(["reanalyze", "reenrich"])("validates and streams the documentation %s hook over HTTP", async (operation) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-reprocessing-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    await services.pluginContributionsReady;
+    const readDocument = vi.spyOn(services.documentation!, "getDocument").mockResolvedValue({
+      document: { document_id: "doc", title: "Archived guide", state: "active" },
+    });
+    const reanalyze = vi.spyOn(services.documentation!, "reanalyzeDocument").mockResolvedValue({
+      documents: [{ documentId: "doc", title: "Archived guide" }],
+    });
+    vi.spyOn(services.documentationEnrichment!, "isEnabled").mockReturnValue(true);
+    const enrich = vi.spyOn(services.documentationEnrichment!, "enrichIngestResponse").mockImplementation(async (result) => ({
+      ...result, enrichment: { enabled: true, results: [{ documentId: "doc", status: "written" }] },
+    }));
+    const app = await buildServer(config, services);
+    try {
+      const invalid = await app.inject({
+        method: "POST",
+        url: `/api/hooks/documentation.documents.${operation}`,
+        payload: { input: { documentId: 42 } },
+      });
+      expect(invalid.statusCode).toBe(500);
+      expect(invalid.json().message).toContain("/documentId must be string");
+      expect(readDocument).not.toHaveBeenCalled();
+
+      const response = await app.inject({
+        method: "POST",
+        url: `/api/hooks/documentation.documents.${operation}?stream=1`,
+        headers: { accept: "application/x-ndjson" },
+        payload: { input: { documentId: "doc" } },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const events = ndjsonEvents(response.body);
+      expect(events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "progress", status: "queued" }),
+        expect.objectContaining({ type: "progress", status: "running" }),
+        expect.objectContaining({ type: "progress", status: "complete", progress: 100 }),
+        expect.objectContaining({ type: "result", result: expect.objectContaining({
+          kind: operation, firstDocumentId: "doc", enrichment: { enabled: true, results: [{ documentId: "doc", status: "written" }] },
+        }) }),
+      ]));
+      expect(reanalyze).toHaveBeenCalledTimes(operation === "reanalyze" ? 1 : 0);
+      expect(enrich).toHaveBeenCalledOnce();
+    } finally {
+      await app.close();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("streams documentation ingest hook progress before the final blocking result", async () => {
     const root = await fs.mkdtemp(
       path.join(os.tmpdir(), "cloudx-doc-ingest-stream-"),
@@ -3434,7 +3485,7 @@ describe("buildServer", () => {
         )
         .map((node: { typeId: string }) => node.typeId)
         .sort();
-      expect(catalogNodes).toHaveLength(120);
+      expect(catalogNodes).toHaveLength(122);
       expect(portsMissingDescriptions).toEqual([]);
       expect(weakPortDescriptions).toEqual([]);
       expect(execOnlyFunctionNodes).toEqual([
@@ -3450,6 +3501,8 @@ describe("buildServer", () => {
           expect.objectContaining({ typeId: "hook:jira.filters.save" }),
           expect.objectContaining({ typeId: "hook:jira.filters.delete" }),
           expect.objectContaining({ typeId: "hook:jira.filters.select" }),
+          expect.objectContaining({ typeId: "hook:documentation.documents.reanalyze" }),
+          expect.objectContaining({ typeId: "hook:documentation.documents.reenrich" }),
           expect.objectContaining({
             typeId: "hook:workspace.layoutTemplates.apply",
           }),

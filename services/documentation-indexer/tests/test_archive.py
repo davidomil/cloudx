@@ -1142,6 +1142,58 @@ def test_youtube_video_ingest_preserves_transcript_metadata_and_keyframes(tmp_pa
     assert (extracted / "media" / "keyframes" / "frame-000002.jpg").exists()
 
 
+@pytest.mark.parametrize("metadata_state", ["original", "sibling-upload", "missing"])
+def test_reanalysis_preserves_generated_youtube_evidence_independently_of_shared_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, metadata_state: str) -> None:
+    video_url = "https://www.youtube.com/watch?v=retained-evidence"
+    stub_youtube_media(monkeypatch, {video_url: "YOUTUBE-REANALYSIS-19 explains allocator pressure."})
+    archive = DocumentationArchive(tmp_path / "archive")
+    document = archive.ingest_url(video_url, collection="lectures", tags=["retained"])
+    archive.enrich_document(
+        document.document_id,
+        spans=[archive_module.ExtractedSpan("Previous video analysis stays available.", "ai:media")],
+        model="gpt-test",
+        skill_ids=["documentation-enrich-media"],
+    )
+    before = archive.get_document(document.document_id)
+    snapshot = archive.root / before["snapshot_path"]
+    source_bytes = snapshot.read_bytes()
+    metadata_path = snapshot.with_name("metadata.json")
+    assert "youtube" in json.loads(metadata_path.read_text())
+    assert any(chunk["locator"] == "transcript 00:00-00:02" for chunk in before["chunks"])
+    assert len(before["artifacts"]) == 2
+    keyframes = {
+        artifact["path"]: archive.document_artifact_file(document.document_id, artifact["path"]).path.read_bytes()
+        for artifact in before["artifacts"]
+    }
+    sibling_before = None
+    if metadata_state == "sibling-upload":
+        sibling = archive.ingest_upload(filename="retained-transcript.txt", content=source_bytes, content_type="text/plain")
+        sibling_before = archive.get_document(sibling.document_id)
+        assert sibling.document_id != document.document_id
+        assert (archive.root / sibling_before["snapshot_path"]).parent == snapshot.parent
+        assert "youtube" not in json.loads(metadata_path.read_text())
+    elif metadata_state == "missing":
+        metadata_path.unlink()
+    published_files = {entry["path"]: entry["sha256"] for entry in archive.portable_manifest()["files"]}
+
+    for _ in range(2):
+        with pytest.raises(ArchiveError, match="Rerun AI enrichment"):
+            archive.reanalyze_document(document.document_id)
+
+        assert archive.get_document(document.document_id) == before
+        assert snapshot.read_bytes() == source_bytes
+        assert {entry["path"]: entry["sha256"] for entry in archive.portable_manifest()["files"]} == published_files
+        assert not list(archive.snapshots_dir.glob("reanalysis-*"))
+        for artifact_path, content in keyframes.items():
+            assert archive.document_artifact_file(document.document_id, artifact_path).path.read_bytes() == content
+        assert any(hit["documentId"] == document.document_id and hit["locator"] == "transcript 00:00-00:02"
+                   for hit in archive.search("YOUTUBE-REANALYSIS-19", mode="lexical"))
+        if sibling_before:
+            assert archive.get_document(sibling_before["document_id"]) == sibling_before
+            assert (archive.root / sibling_before["snapshot_path"]).read_bytes() == source_bytes
+        archive = DocumentationArchive(archive.root)
+
+
 def test_document_detail_supports_chunk_windows_and_truncation(tmp_path: Path) -> None:
     app = create_app(tmp_path / "windowed-archive")
     client = TestClient(app)

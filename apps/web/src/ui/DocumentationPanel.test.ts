@@ -20,6 +20,95 @@ afterEach(() => {
 });
 
 describe("DocumentationPanel", () => {
+  it.each([
+    ["Reanalyze and enrich", "reanalyze"],
+    ["Re-enrich", "reenrich"]
+  ])("%s reruns the selected document and refreshes its evidence", async (button, operation) => {
+    const pending = deferred<Record<string, unknown>>();
+    const panel = await reprocessingPanel(() => pending.promise);
+    await click(buttonByText(panel.container, button));
+
+    expect(panel.calls).toContainEqual({ hookId: `documentation.documents.${operation}`, input: { documentId: "doc-1" } });
+    expect(buttonByText(panel.container, button).disabled).toBe(true);
+    expect(buttonByText(panel.container, "Remove").disabled).toBe(true);
+    expect(panel.container.textContent).toContain("Processing Archived guide");
+    expect(panel.container.textContent).toContain("Previous source evidence");
+
+    await act(async () => pending.resolve({ enrichment: { results: [{ documentId: "doc-1", status: "written" }] } }));
+    await flushAsyncWork();
+
+    expect(panel.container.textContent).toContain("Updated source evidence");
+    expect(panel.container.textContent).not.toContain("Previous source evidence");
+    expect(buttonByText(panel.container, button).disabled).toBe(false);
+    expect(panel.state().results).toEqual([]);
+    expect(panel.state().answer).toBeUndefined();
+    expect(panel.calls.filter((call) => call.hookId.startsWith("documentation.ingest.") && call.hookId !== "documentation.ingest.queue")).toEqual([]);
+    await unmount(panel.root);
+  });
+
+  it.each(["select another document", "close the viewer"])("keeps a rerun tied to its original document when users %s", async (action) => {
+    const pending = deferred<Record<string, unknown>>();
+    const panel = await reprocessingPanel(() => pending.promise);
+    await click(buttonByText(panel.container, "Re-enrich"));
+    await act(async () => panel.update((state) => ({
+      ...state!,
+      selectedDocument: action === "close the viewer" ? undefined : { documentId: "doc-2", title: "Other guide", state: "active", chunks: [] }
+    })));
+
+    await act(async () => pending.resolve({}));
+    await flushAsyncWork();
+
+    expect(panel.state().selectedDocument?.documentId).toBe(action === "close the viewer" ? undefined : "doc-2");
+    expect(panel.calls).toContainEqual({ hookId: "documentation.documents.reenrich", input: { documentId: "doc-1" } });
+    expect(panel.container.textContent).not.toContain("Updated source evidence");
+    await unmount(panel.root);
+  });
+
+  it("reports rerun errors without discarding the displayed source and allows another attempt", async () => {
+    const panel = await reprocessingPanel(async () => { throw new Error("Archived source is missing. Use Re-enrich for retained evidence."); });
+    await click(buttonByText(panel.container, "Reanalyze and enrich"));
+    expect(panel.container.querySelector('[role="alert"]')?.textContent).toContain("Archived source is missing");
+    expect(panel.container.textContent).toContain("Previous source evidence");
+    expect(buttonByText(panel.container, "Reanalyze and enrich").disabled).toBe(false);
+    await unmount(panel.root);
+  });
+
+  it("shows partial AI failures while refreshing successful extraction", async () => {
+    const panel = await reprocessingPanel(async () => ({ enrichment: { results: [{ documentId: "doc-1", status: "failed", error: "AI runner unavailable" }] } }));
+    await click(buttonByText(panel.container, "Reanalyze and enrich"));
+    expect(panel.container.textContent).toContain("Updated source evidence");
+    expect(panel.container.querySelector('[role="alert"]')?.textContent).toContain("AI enrichment failed for 1 document: doc-1 AI runner unavailable");
+    await unmount(panel.root);
+  });
+
+  it.each(["plugin", "global"])("allows source reanalysis and disables re-enrichment when %s AI is disabled", async (setting) => {
+    const panel = await reprocessingPanel(async () => ({}), setting === "plugin" ? { config: { aiEnrichmentEnabled: false } } : { globalConfig: { aiControlEnabled: false } });
+    expect(buttonByText(panel.container, "Re-enrich").disabled).toBe(true);
+    expect(buttonByText(panel.container, "Reanalyze").disabled).toBe(false);
+    await click(buttonByText(panel.container, "Reanalyze"));
+    expect(panel.calls).toContainEqual({ hookId: "documentation.documents.reanalyze", input: { documentId: "doc-1" } });
+    await unmount(panel.root);
+  });
+
+  it("disables reruns for inactive records", async () => {
+    const panel = await reprocessingPanel(async () => ({}));
+    await act(async () => panel.update((state) => ({ ...state!, selectedDocument: { ...state!.selectedDocument, state: "deleted" } })));
+    expect(buttonByText(panel.container, "Reanalyze and enrich").disabled).toBe(true);
+    expect(buttonByText(panel.container, "Re-enrich").disabled).toBe(true);
+    await unmount(panel.root);
+  });
+
+  it("does not refresh a closed panel when its queued rerun completes", async () => {
+    const pending = deferred<Record<string, unknown>>();
+    const panel = await reprocessingPanel(() => pending.promise);
+    await click(buttonByText(panel.container, "Re-enrich"));
+    await unmount(panel.root);
+    const callsBeforeCompletion = panel.calls.length;
+    await act(async () => pending.resolve({}));
+    await flushAsyncWork();
+    expect(panel.calls).toHaveLength(callsBeforeCompletion);
+  });
+
   it("submits text ingest and manual search from the visible buttons", async () => {
     const container = document.createElement("div");
     document.body.append(container);
@@ -1170,6 +1259,42 @@ describe("DocumentationPanel", () => {
     expect(panelState).toBeUndefined();
   });
 });
+
+async function reprocessingPanel(
+  operation: () => Promise<Record<string, unknown>>,
+  options: { config?: Record<string, unknown>; globalConfig?: Record<string, unknown> } = {}
+) {
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const calls: Array<{ hookId: string; input: Record<string, unknown> }> = [];
+  let state: DocumentationPanelState = {
+    ...createInitialDocumentationPanelState(),
+    selectedDocument: { documentId: "doc-1", title: "Archived guide", state: "active", chunks: [{ chunkId: 1, text: "Previous source evidence" }] },
+    results: [{ documentId: "doc-1", chunkId: 1, title: "Archived guide", sourceType: "text", state: "active", locator: "text", snippet: "Previous source evidence" }],
+    answer: { answer: "Previous answer" }
+  };
+  const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}) => {
+    calls.push({ hookId, input });
+    if (hookId === "documentation.documents.reanalyze" || hookId === "documentation.documents.reenrich") {
+      return hookResult<T>(await operation());
+    }
+    if (hookId === "documentation.documents.get") {
+      return hookResult<T>({ document: { documentId: input.documentId, title: "Archived guide", state: "active", chunks: [{ chunkId: 2, text: "Updated source evidence" }] } });
+    }
+    return hookResult<T>({});
+  };
+  function update(updater: DocumentationPanelStateUpdater) {
+    state = updater(state);
+    render();
+  }
+  function render() {
+    root.render(createElement(DocumentationPanel, { callHook, state, onStateChange: update, ...options }));
+  }
+  await act(async () => render());
+  await flushAsyncWork();
+  return { container, root, calls, state: () => state, update };
+}
 
 async function click(button: HTMLButtonElement): Promise<void> {
   await act(async () => {

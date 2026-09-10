@@ -4485,9 +4485,15 @@ a:hover svg {
 }
 
 .documentation-source-header {
-  grid-template-columns: minmax(0, 1fr) auto;
+  display: flex;
+  flex-wrap: wrap;
   gap: 10px;
   align-items: start;
+}
+
+.documentation-source-header > :first-child {
+  flex: 1 1 240px;
+  min-width: 0;
 }
 
 .documentation-source-actions {

@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
@@ -69,6 +70,11 @@ export interface DocumentationEnrichmentSource {
   contentPath?: string;
   contentType?: string;
   sourceType?: string;
+}
+
+interface ArchivedMediaSource extends DocumentationEnrichmentSource {
+  contentPath: string;
+  hasVideo: boolean;
 }
 
 type MediaProcessLauncher = (
@@ -186,10 +192,14 @@ export class DocumentationEnrichmentService {
     const fullDocument = await this.enrichmentDocument(document.documentId, signal);
     const cleanup: Array<() => Promise<void>> = [];
     try {
-      const mediaEvidence = await this.prepareMediaEvidence(source, cleanup, signal);
+      const archivedMedia = source.content || source.contentPath ? undefined : await this.archivedMediaSource(fullDocument, signal);
+      const mediaEvidence = await this.prepareMediaEvidence(archivedMedia ?? source, cleanup, signal);
+      if (archivedMedia && !mediaEvidence?.transcript?.trim() && !mediaEvidence?.keyframes.length) {
+        throw new Error("Archived media enrichment produced no transcript or keyframe evidence.");
+      }
       const evidence = {
         document: documentSummary(fullDocument),
-        chunks: documentChunks(fullDocument),
+        chunks: archivedMedia ? [] : documentChunks(fullDocument),
         artifacts: await this.documentArtifacts(fullDocument, signal),
         media: mediaEvidence
       };
@@ -404,13 +414,88 @@ export class DocumentationEnrichmentService {
     return typeof health.archiveRoot === "string" ? health.archiveRoot : undefined;
   }
 
-  private async prepareMediaEvidence(source: DocumentationEnrichmentSource, cleanup: Array<() => Promise<void>>, signal?: AbortSignal): Promise<MediaEvidence | undefined> {
+  private async archivedMediaSource(document: Record<string, unknown>, signal?: AbortSignal): Promise<ArchivedMediaSource | undefined> {
+    const snapshotPath = optionalRecordString(document, "snapshot_path");
+    const hasMediaSuffix = snapshotPath && /\.(mp3|wav|m4a|aac|ogg|webm|mp4|mov|mkv|avi)$/iu.test(snapshotPath);
+    const sourceChunks = recordsArray(document.chunks).filter((chunk) => chunk.chunk_origin === "source");
+    const retainsStructuredEvidence = sourceChunks.some((chunk) => chunk.locator !== "text");
+    const hasTextChunks = sourceChunks.length > 0 && sourceChunks.every((chunk) => chunk.locator === "text");
+    if (!snapshotPath || retainsStructuredEvidence) {
+      return undefined;
+    }
+    const archiveRoot = await this.archiveRoot(signal);
+    if (!archiveRoot) {
+      throw new Error("Archived media enrichment requires a shared documentation archive root.");
+    }
+    const root = path.resolve(archiveRoot);
+    const snapshot = path.resolve(root, snapshotPath);
+    if (!isSameOrChild(root, snapshot)) {
+      throw new Error("Archived media source escapes the documentation archive root.");
+    }
+    const metadataPath = path.join(path.dirname(snapshot), "metadata.json");
+    if (metadataPath === snapshot) {
+      return undefined;
+    }
+    const metadataStat = await fsp.lstat(metadataPath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") {
+        return undefined;
+      }
+      throw error;
+    });
+    if (!metadataStat && document.source_type === "media" && !path.extname(snapshotPath)) {
+      throw new Error("Archived media source metadata is missing.");
+    }
+    let contentType: string | undefined;
+    let retainsMediaUpload = false;
+    if (metadataStat) {
+      if (!metadataStat.isFile() || metadataStat.isSymbolicLink()) {
+        throw new Error("Archived source metadata must be a regular file inside its snapshot directory.");
+      }
+      const realMetadataPath = await fsp.realpath(metadataPath);
+      if (!isSameOrChild(await fsp.realpath(root), realMetadataPath)) {
+        throw new Error("Archived source metadata escapes the documentation archive root.");
+      }
+      const metadataBytes = await fsp.readFile(realMetadataPath);
+      const metadataIsSource = createHash("sha256").update(metadataBytes).digest("hex") === document.content_sha256;
+      if (!metadataIsSource) {
+        const metadata = getRecord(JSON.parse(metadataBytes.toString("utf8")), "archived source metadata");
+        if (metadata.contentType != null && typeof metadata.contentType !== "string") {
+          throw new Error("Archived source content type must be a string.");
+        }
+        contentType = optionalRecordString(metadata, "contentType");
+        retainsMediaUpload = document.source_type === "media"
+          && document.uri === `upload://${path.basename(snapshotPath)}`;
+      }
+    }
+    const hasMediaHint = Boolean(retainsMediaUpload || hasMediaSuffix || contentType && /^(audio|video)\//iu.test(contentType));
+    if (!hasTextChunks && !hasMediaHint) {
+      return undefined;
+    }
+    const realRoot = await fsp.realpath(root);
+    const realSnapshot = await fsp.realpath(snapshot);
+    if (!isSameOrChild(realRoot, realSnapshot)) {
+      throw new Error("Archived media source escapes the documentation archive root.");
+    }
+    const stat = await fsp.lstat(snapshot);
     signal?.throwIfAborted();
-    if ((!source.content && !source.contentPath) || !isMediaSource(source)) {
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error("Archived media source must be a regular file.");
+    }
+    if (hasTextChunks && await isTextFile(realSnapshot, signal)) {
+      return undefined;
+    }
+    const hasVideo = await containsVideoStream(realSnapshot, signal, this.options.mediaProcessLauncher);
+    return { filename: path.basename(snapshotPath), contentPath: realSnapshot, contentType, sourceType: optionalRecordString(document, "source_type"), hasVideo };
+  }
+
+  private async prepareMediaEvidence(source: DocumentationEnrichmentSource | ArchivedMediaSource, cleanup: Array<() => Promise<void>>, signal?: AbortSignal): Promise<MediaEvidence | undefined> {
+    signal?.throwIfAborted();
+    if ((!source.content && !source.contentPath) || !("hasVideo" in source || isMediaSource(source))) {
       return undefined;
     }
     let mediaPath: string;
     let mediaWorkDir: string | undefined;
+    const hasVideo = "hasVideo" in source ? source.hasVideo : isVideoSource(source);
     if (source.contentPath) {
       mediaPath = path.resolve(source.contentPath);
       const stat = await fsp.lstat(mediaPath);
@@ -418,7 +503,7 @@ export class DocumentationEnrichmentService {
       if (!stat.isFile() || stat.isSymbolicLink()) {
         throw new Error("Documentation media source must be a regular spool file.");
       }
-      if (isVideoSource(source)) {
+      if (hasVideo) {
         mediaWorkDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-media-"));
         cleanup.push(() => fsp.rm(mediaWorkDir!, { recursive: true, force: true }));
       }
@@ -436,7 +521,7 @@ export class DocumentationEnrichmentService {
     const transcript = source.contentPath
       ? signal ? await this.options.asr.transcribeFile(mediaPath, filename, { signal }) : await this.options.asr.transcribeFile(mediaPath, filename)
       : signal ? await this.options.asr.transcribe(source.content!, filename, { signal }) : await this.options.asr.transcribe(source.content!, filename);
-    const keyframes = isVideoSource(source)
+    const keyframes = hasVideo
       ? await captureSceneKeyframes(mediaPath, path.join(mediaWorkDir!, "frames"), signal, this.options.mediaProcessLauncher)
       : [];
     return {
@@ -1176,6 +1261,25 @@ async function listFiles(root: string, signal?: AbortSignal): Promise<string[]> 
   return files;
 }
 
+async function containsVideoStream(inputPath: string, signal?: AbortSignal, mediaProcessLauncher?: MediaProcessLauncher): Promise<boolean> {
+  const result = await runMediaTool("ffprobe", [
+    "-v", "error",
+    "-protocol_whitelist", "file,pipe",
+    "-select_streams", "V",
+    "-show_entries", "stream=codec_type",
+    "-of", "json",
+    inputPath
+  ], signal, mediaProcessLauncher);
+  if (result.status !== 0) {
+    throw new Error(`ffprobe media inspection failed: ${result.stderr || result.stdout || `exit ${result.status}`}`);
+  }
+  const { streams } = getRecord(JSON.parse(result.stdout), "ffprobe output");
+  if (!Array.isArray(streams) || !streams.every((stream) => isRecord(stream) && stream.codec_type === "video")) {
+    throw new Error("ffprobe output must contain an array of selected video streams.");
+  }
+  return streams.length > 0;
+}
+
 async function captureSceneKeyframes(
   inputPath: string,
   outputDir: string,
@@ -1294,7 +1398,7 @@ function runMediaTool(
       if (stream === "stdout") {
         stdoutBytes += bytes;
         if (stdoutBytes > MEDIA_TOOL_OUTPUT_MAX_BYTES) {
-          stopWithError(new Error(`ffmpeg stdout exceeded the ${MEDIA_TOOL_OUTPUT_MAX_BYTES} byte output limit.`));
+          stopWithError(new Error(`${command} stdout exceeded the ${MEDIA_TOOL_OUTPUT_MAX_BYTES} byte output limit.`));
           return;
         }
         stdout += chunk;
@@ -1302,7 +1406,7 @@ function runMediaTool(
       }
       stderrBytes += bytes;
       if (stderrBytes > MEDIA_TOOL_OUTPUT_MAX_BYTES) {
-        stopWithError(new Error(`ffmpeg stderr exceeded the ${MEDIA_TOOL_OUTPUT_MAX_BYTES} byte output limit.`));
+        stopWithError(new Error(`${command} stderr exceeded the ${MEDIA_TOOL_OUTPUT_MAX_BYTES} byte output limit.`));
         return;
       }
       stderr += chunk;
@@ -1344,11 +1448,11 @@ function runMediaTool(
     child.on("error", onChildError);
     child.on("close", onChildClose);
     processGroupId = child.pid;
-    timeout = setTimeout(() => stopWithError(new Error(`ffmpeg keyframe extraction timed out after ${MEDIA_TOOL_TIMEOUT_MS} ms.`)), MEDIA_TOOL_TIMEOUT_MS);
+    timeout = setTimeout(() => stopWithError(new Error(`${command} media processing timed out after ${MEDIA_TOOL_TIMEOUT_MS} ms.`)), MEDIA_TOOL_TIMEOUT_MS);
     timeout.unref();
     signal?.addEventListener("abort", abort, { once: true });
     if (!child.stdout || !child.stderr) {
-      stopWithError(new Error("ffmpeg keyframe extraction did not expose piped output streams."));
+      stopWithError(new Error(`${command} did not expose piped output streams.`));
       return;
     }
     child.stdout.setEncoding("utf8");
@@ -1463,6 +1567,40 @@ function recordStringArray(record: Record<string, unknown>, key: string): string
   }
   const strings = value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean);
   return strings.length > 0 ? strings : undefined;
+}
+
+async function isTextFile(filename: string, signal?: AbortSignal): Promise<boolean> {
+  let decoder: TextDecoder | undefined;
+  let firstChunk = true;
+  for await (const bytes of fs.createReadStream(filename, { signal })) {
+    if (firstChunk) {
+      // A BOM selects an encoding; media such as MP1 can share the same prefix.
+      if (bytes[0] === 0xfe && bytes[1] === 0xff) {
+        decoder = new TextDecoder("utf-16be", { fatal: true });
+      } else if (bytes[0] === 0xff && bytes[1] === 0xfe) {
+        decoder = new TextDecoder("utf-16le", { fatal: true });
+      } else if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+        decoder = new TextDecoder("utf-8", { fatal: true });
+      }
+      firstChunk = false;
+    }
+    let text: string;
+    try {
+      text = decoder ? decoder.decode(bytes, { stream: true }) : bytes.toString("latin1");
+    } catch {
+      return false;
+    }
+    // Apply the existing binary-control check to decoded characters for BOM text.
+    if (/[\u0000-\u0008\u000b\u000e-\u001a\u001c-\u001f]/u.test(text)) {
+      return false;
+    }
+  }
+  try {
+    decoder?.decode();
+  } catch {
+    return false;
+  }
+  return true;
 }
 
 function isMediaSource(source: DocumentationEnrichmentSource): boolean {
