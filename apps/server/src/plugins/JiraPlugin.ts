@@ -9,7 +9,7 @@ import type {
   TriggerDefinition,
   WorkspacePlugin
 } from "@cloudx/plugin-api";
-import type { AutomationSafety, ConfigFieldDescriptor, WorkspaceTab } from "@cloudx/shared";
+import { JIRA_FILTER_JQL_MAX_LENGTH, JIRA_FILTER_NAME_MAX_LENGTH, JIRA_SAVED_FILTER_LIMIT, type AutomationSafety, type ConfigFieldDescriptor, type WorkspaceTab } from "@cloudx/shared";
 
 import { JIRA_CONFIG_KEYS, JIRA_PLUGIN_ID, type JiraIntegrationService } from "../jira/JiraIntegrationService.js";
 import type { JiraPollingService } from "../jira/JiraPollingService.js";
@@ -45,12 +45,30 @@ export class JiraPlugin implements WorkspacePlugin {
   ) {
     this.hooks = [
       readHook("jira.connection.status", "Jira Connection Status", "Return Jira configuration status and authenticated user details.", (_input, context) => this.serviceProvider().status(context.signal)),
-      readHook("jira.dashboard.list", "List Jira Dashboard Issues", "Return the assigned-ticket Jira dashboard grouped for the Jira panel.", (input, context) => this.serviceProvider().dashboard({
+      readHook("jira.filters.list", "List Saved Jira Filters", "Return locally saved Jira dashboard filters and the selected view.", (_input, context) => this.serviceProvider().filters.list(context.signal), {}, [], jiraFilterStateSchema()),
+      writeHook("jira.filters.save", "Save Jira Filter", "Create or update a named JQL filter in CloudX and select it for the Jira panel.", (input, context) => this.serviceProvider().filters.save({
+        id: input.id as string | undefined,
+        name: requiredString(input.name, "name"),
+        jql: requiredString(input.jql, "jql")
+      }, context.signal), {
+        id: { type: "string", minLength: 1, maxLength: 100 },
+        name: { type: "string", minLength: 1, maxLength: JIRA_FILTER_NAME_MAX_LENGTH },
+        jql: { type: "string", minLength: 1, maxLength: JIRA_FILTER_JQL_MAX_LENGTH }
+      }, "write", ["name", "jql"], jiraFilterStateSchema()),
+      writeHook("jira.filters.delete", "Delete Jira Filter", "Delete a locally saved Jira filter and clear its selection when selected.", (input, context) => this.serviceProvider().filters.delete(requiredString(input.id, "id"), context.signal), {
+        id: { type: "string", minLength: 1, maxLength: 100 }
+      }, "write", ["id"], jiraFilterStateSchema()),
+      writeHook("jira.filters.select", "Select Jira Filter", "Remember the selected saved Jira filter, or use null for the configured dashboard.", (input, context) => this.serviceProvider().filters.select(input.filterId as string | null, context.signal), {
+        filterId: { anyOf: [{ type: "string", minLength: 1, maxLength: 100 }, { type: "null" }] }
+      }, "write", ["filterId"], jiraFilterStateSchema()),
+      readHook("jira.dashboard.list", "List Jira Dashboard Issues", "Return the configured dashboard or a saved full-JQL view grouped for the Jira panel.", (input, context) => this.serviceProvider().dashboard({
+        filterId: input.filterId as string | undefined,
         filterJql: optionalString(input.filterJql),
         sortBy: optionalString(input.sortBy),
         groupBy: optionalString(input.groupBy),
         maxResults: optionalNumber(input.maxResults)
       }, context.signal), {
+        filterId: { type: "string", minLength: 1, maxLength: 100, description: "Saved CloudX filter ID. Its complete JQL replaces the configured assigned-user dashboard query." },
         filterJql: { type: "string" },
         sortBy: { type: "string", enum: ["priority_desc_updated_desc", "updated_desc", "created_desc", "status_priority", "custom_jql_order"] },
         groupBy: { type: "string", enum: ["epic", "status", "priority", "project", "none"] },
@@ -268,6 +286,31 @@ function jiraConfigFields(): ConfigFieldDescriptor[] {
     { key: JIRA_CONFIG_KEYS.assignmentDetectionEnabled, label: "Detect new assignments", type: "boolean", defaultValue: true },
     { key: JIRA_CONFIG_KEYS.maxIssuesPerPoll, label: "Polling issue limit", type: "number", defaultValue: 100, min: 1, max: 500, step: 1 }
   ];
+}
+
+function jiraFilterStateSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      filters: {
+        type: "array",
+        maxItems: JIRA_SAVED_FILTER_LIMIT,
+        items: {
+          type: "object",
+          properties: {
+            id: { type: "string", minLength: 1, maxLength: 100 },
+            name: { type: "string", minLength: 1, maxLength: JIRA_FILTER_NAME_MAX_LENGTH },
+            jql: { type: "string", minLength: 1, maxLength: JIRA_FILTER_JQL_MAX_LENGTH }
+          },
+          required: ["id", "name", "jql"],
+          additionalProperties: false
+        }
+      },
+      selectedFilterId: { anyOf: [{ type: "string" }, { type: "null" }] }
+    },
+    required: ["filters", "selectedFilterId"],
+    additionalProperties: false
+  };
 }
 
 function jiraTriggers(): TriggerDefinition[] {
