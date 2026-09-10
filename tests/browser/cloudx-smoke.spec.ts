@@ -1,5 +1,6 @@
 import { expect, test, type Page, type WebSocket } from "@playwright/test";
 import type {
+  CloudxConfigResponse,
   CreateTabResponse,
   TabLayoutNode,
   WorkspaceStateResponse,
@@ -112,6 +113,127 @@ test.describe("CloudX shipped shell", () => {
       body: screenshot,
       contentType: "image/png",
     });
+  });
+
+  test("saves explicit Forge repository trust and clears changed or revoked approval", async ({
+    page,
+    isMobile,
+  }, testInfo) => {
+    const original = (await (
+      await page.request.get(`${baseUrl}/api/config`)
+    ).json()) as CloudxConfigResponse;
+    const repository = "browser-fixture/trust";
+    const apiUrl = "https://api.github.com";
+    const approval = JSON.stringify(["github", apiUrl, repository]);
+    const dialog = page.locator(".settings-dialog");
+    const trust = dialog.getByRole("checkbox", {
+      name: "Trust this repository for Forge workers",
+      exact: true,
+    });
+
+    async function openSettings() {
+      if (isMobile) {
+        await page.getByRole("button", { name: "Workspace actions" }).click();
+        await page.getByRole("menuitem", { name: "Settings" }).click();
+      } else {
+        await page
+          .getByRole("button", { name: "Settings", exact: true })
+          .click();
+      }
+      await dialog
+        .getByRole("tab", { name: "Forge Workers", exact: true })
+        .click();
+      await trust.scrollIntoViewIfNeeded();
+      await expect(trust).toBeInViewport();
+    }
+
+    async function saveTrust(expectedApproval: string) {
+      const saving = page.waitForResponse(
+        (response) =>
+          response.request().method() === "PATCH" &&
+          new URL(response.url()).pathname === "/api/config",
+      );
+      await dialog.getByRole("button", { name: "Save", exact: true }).click();
+      const saved = await saving;
+      expect(saved.status()).toBe(200);
+      const config = (await saved.json()) as CloudxConfigResponse;
+      expect(config.values.plugins.forge?.trustedRepository).toBe(
+        expectedApproval,
+      );
+      await expect(dialog).toHaveCount(0);
+    }
+
+    try {
+      const seeded = await page.request.patch(`${baseUrl}/api/config`, {
+        data: {
+          plugins: {
+            forge: {
+              provider: "github",
+              apiUrl,
+              projectPath: repository,
+              trustedRepository: "",
+            },
+          },
+        },
+      });
+      expect(seeded.ok()).toBe(true);
+      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+      await openSettings();
+      await expect(trust).toBeEnabled();
+      await expect(trust).not.toBeChecked();
+      const consent = dialog.locator("label").filter({
+        has: page.getByRole("checkbox", {
+          name: "Trust this repository for Forge workers",
+          exact: true,
+        }),
+      });
+      await expect(consent).toContainText(repository);
+      await expect(consent).toContainText(apiUrl);
+      await expect(consent).toContainText("run commands on this machine");
+      expect(
+        await dialog.evaluate(
+          (element) => element.scrollWidth <= element.clientWidth + 1,
+        ),
+      ).toBe(true);
+      await testInfo.attach("Forge repository trust", {
+        body: await page.screenshot({
+          path: testInfo.outputPath("forge-repository-trust.png"),
+        }),
+        contentType: "image/png",
+      });
+
+      await trust.check();
+      await saveTrust(approval);
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await openSettings();
+      await expect(trust).toBeChecked();
+
+      await dialog
+        .getByLabel("Repository", { exact: true })
+        .fill("browser-fixture/other");
+      await expect(trust).not.toBeChecked();
+      await dialog.getByLabel("Repository", { exact: true }).fill(repository);
+      await expect(trust).not.toBeChecked();
+      await saveTrust("");
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await openSettings();
+      await expect(trust).not.toBeChecked();
+
+      await trust.check();
+      await saveTrust(approval);
+      await openSettings();
+      await expect(trust).toBeChecked();
+      await trust.uncheck();
+      await saveTrust("");
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await openSettings();
+      await expect(trust).not.toBeChecked();
+    } finally {
+      const restored = await page.request.patch(`${baseUrl}/api/config`, {
+        data: { plugins: { forge: original.values.plugins.forge } },
+      });
+      expect(restored.ok()).toBe(true);
+    }
   });
 
   test("restores the same running Codex terminal across two full page reloads", async ({
