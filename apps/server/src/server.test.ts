@@ -4,7 +4,7 @@ import type { Socket } from "node:net";
 import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 import WebSocket, { type RawData, WebSocketServer } from "ws";
 
 import { descriptorFromPlugin, pluginActionHookId, type CreatePluginSessionInput, type WorkspacePlugin } from "@cloudx/plugin-api";
@@ -53,6 +53,140 @@ import type { VoicePlanner } from "./voice/VoicePlanner.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
 
 describe("buildServer", () => {
+  it.each([false, true])("waits for plugin setup writes before closing (setup fails: %s)", async (fails) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-setup-shutdown-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    const writeStarted = deferred<void>();
+    const releaseWrite = deferred<void>();
+    const setupFailure = new Error("Plugin setup write failed.");
+    const saveSkill = services.rulesSkills!.saveSystemSkill.bind(services.rulesSkills);
+    const save = vi.spyOn(services.rulesSkills!, "saveSystemSkill").mockImplementationOnce(async (...args) => {
+      writeStarted.resolve(undefined);
+      await releaseWrite.promise;
+      if (fails) throw setupFailure;
+      return saveSkill(...args);
+    });
+    const disposeAutomation = vi.spyOn(services.automation!, "dispose");
+    const app = await buildServer(config, services);
+    let closed = false;
+    let closeFailure: unknown;
+    let closing: Promise<void> | undefined;
+    try {
+      await writeStarted.promise;
+      closing = app.close().then(() => { closed = true; }, (error: unknown) => {
+        closed = true;
+        closeFailure = error;
+      });
+      await vi.waitFor(() => expect(disposeAutomation).toHaveResolved());
+      expect(closed).toBe(false);
+
+      releaseWrite.resolve(undefined);
+      await closing;
+      expect(closed).toBe(true);
+      if (fails) {
+        expect(closeFailure).toBeInstanceOf(AggregateError);
+        expect((closeFailure as AggregateError).errors).toEqual([setupFailure]);
+      } else {
+        expect(closeFailure).toBeUndefined();
+        expect(await fs.readFile(path.join(config.dataDir, "rules-skills", "system-skills", "documentation-search", "SKILL.md"), "utf8")).toContain("Documentation Search");
+      }
+      await fs.rm(root, { recursive: true, force: true });
+      await expect(fs.stat(root)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      releaseWrite.resolve(undefined);
+      await services.pluginContributionsReady?.catch(() => undefined);
+      await closing;
+      await app.close().catch(() => undefined);
+      save.mockRestore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([false, true])("drains the final startup catalog refresh before closing (refresh fails: %s)", async (fails) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-catalog-refresh-shutdown-"));
+    const config = testConfig(root);
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const services = buildServices(config, logger);
+    const catalog = services.rulesSkills!;
+    const listCatalog = catalog.list.bind(catalog);
+    const list = vi.spyOn(catalog, "list");
+    const finalSkill = services.plugins.values().flatMap((plugin) => plugin.skillContributions ?? []).at(-1)!;
+    const finalSaveStarted = deferred<void>();
+    const releaseFinalSave = deferred<void>();
+    const releaseSetup = deferred<void>();
+    const refreshStarted = deferred<void>();
+    const releaseRefresh = deferred<void>();
+    const refreshFailure = new Error("Catalog refresh failed.");
+    const saveSkill = catalog.saveSystemSkill.bind(catalog);
+    const save = vi.spyOn(catalog, "saveSystemSkill").mockImplementation(async (skill) => {
+      if (skill.id !== finalSkill.id) return saveSkill(skill);
+      finalSaveStarted.resolve(undefined);
+      await releaseFinalSave.promise;
+      const store = await saveSkill(skill);
+      await releaseSetup.promise;
+      return store;
+    });
+    const createSession = vi.spyOn(services.plugins.get("codex-terminal"), "createSession").mockImplementation(({ tab }) => ({
+      tab,
+      snapshot: () => ({ tabId: tab.id, pluginId: tab.pluginId, title: tab.title, cwd: tab.cwd, status: tab.status }),
+      voiceContext: () => ({ kind: "codex-terminal", cwd: tab.cwd, summary: "Fake Codex session." }),
+      handleAction: async () => ({}),
+      stop: vi.fn(),
+    }));
+    const refresh = vi.spyOn(services.sessions, "refreshRuntimeIndicators");
+    const disposeSessions = vi.spyOn(services.sessions, "dispose");
+    const disposeAutomation = vi.spyOn(services.automation!, "dispose");
+    const app = await buildServer(config, services);
+    let closing: Promise<void> | undefined;
+    let closed = false;
+    try {
+      await finalSaveStarted.promise;
+      await services.sessions.createTab({ pluginId: "codex-terminal", cwd: root });
+      list.mockImplementationOnce(async () => {
+        refreshStarted.resolve(undefined);
+        await releaseRefresh.promise;
+        if (fails) throw refreshFailure;
+        return listCatalog();
+      });
+      releaseFinalSave.resolve(undefined);
+      await refreshStarted.promise;
+      closing = app.close().then(() => { closed = true; });
+      await vi.waitFor(() => expect(disposeSessions).toHaveResolved());
+      expect(services.sessions.listTabs()).toEqual([]);
+      releaseSetup.resolve(undefined);
+      await services.pluginContributionsReady;
+      await vi.waitFor(() => expect(disposeAutomation).toHaveResolved());
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(closed).toBe(false);
+
+      releaseRefresh.resolve(undefined);
+      await closing;
+      if (fails) {
+        expect(logger.error).toHaveBeenCalledWith({ err: refreshFailure }, "Failed to refresh rules/skills indicators.");
+      } else {
+        expect(logger.error).not.toHaveBeenCalled();
+      }
+      const refreshCount = refresh.mock.calls.length;
+      await catalog.saveSystemSkill(finalSkill);
+      expect(refresh).toHaveBeenCalledTimes(refreshCount);
+      await fs.rm(root, { recursive: true, force: true });
+      await Promise.allSettled(refresh.mock.results.map((result) => result.value));
+      await expect(fs.stat(root)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      releaseFinalSave.resolve(undefined);
+      releaseSetup.resolve(undefined);
+      releaseRefresh.resolve(undefined);
+      await closing;
+      await app.close();
+      await Promise.allSettled(refresh.mock.results.map((result) => result.value));
+      list.mockRestore();
+      save.mockRestore();
+      createSession.mockRestore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("does not expose a Codex source-selection inventory", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-source-route-"));
     const config = testConfig(root);
@@ -137,6 +271,12 @@ describe("buildServer", () => {
     const outsideProject = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-worktree-composition-outside-"));
     await fs.mkdir(allowedProject);
     const services = buildServices(testConfig(allowedRoot));
+    const app = await buildServer(testConfig(allowedRoot), services);
+    onTestFinished(async () => {
+      await app.close();
+      await fs.rm(allowedRoot, { recursive: true, force: true });
+      await fs.rm(outsideProject, { recursive: true, force: true });
+    });
     const worktrees = services.plugins.get("worktree-manager");
     const sessionFor = (cwd: string) => Promise.resolve(worktrees.createSession({
       tab: {
@@ -154,8 +294,6 @@ describe("buildServer", () => {
     }));
     await expect(sessionFor(outsideProject).then((session) => session.handleAction("get_worktree_project", {}))).rejects.toThrow(/outside configured Cloudx roots/);
     await expect(sessionFor(allowedProject).then((session) => session.handleAction("get_worktree_project", {}))).resolves.toMatchObject({ status: "empty", cwd: allowedProject });
-    await services.sessions.dispose();
-    await services.automation?.dispose();
   });
 
   it("reports ready only after persistence and service startup owners settle", async () => {
@@ -168,13 +306,6 @@ describe("buildServer", () => {
       ready: true,
     });
     vi.spyOn(services.automation!, "ready").mockResolvedValue();
-    services.pluginContributionsReady = Promise.resolve({
-      rules: [],
-      systemRules: [],
-      skills: [],
-      systemSkills: [],
-      templates: [],
-    });
     const app = await buildServer(config, services);
     try {
       const response = await app.inject({ method: "GET", url: "/api/ready" });
@@ -183,6 +314,7 @@ describe("buildServer", () => {
       expect(response.json()).toEqual({ status: "ready" });
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -198,13 +330,6 @@ describe("buildServer", () => {
       ready: true,
     });
     vi.spyOn(services.automation!, "ready").mockResolvedValue();
-    services.pluginContributionsReady = Promise.resolve({
-      rules: [],
-      systemRules: [],
-      skills: [],
-      systemSkills: [],
-      templates: [],
-    });
     const app = await buildServer(config, services);
     try {
       const response = await app.inject({ method: "GET", url: "/api/ready" });
@@ -214,6 +339,7 @@ describe("buildServer", () => {
       expect(response.body).not.toContain("private ASR path");
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -224,6 +350,7 @@ describe("buildServer", () => {
       expect(app.log.level).toBe("debug");
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -327,6 +454,7 @@ describe("buildServer", () => {
       blockedClient?.terminate();
       allowedClient?.terminate();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -369,6 +497,7 @@ describe("buildServer", () => {
       await expect(requestStatus("192.0.2.11:3001", "http://192.0.2.11:3001")).resolves.toBe(403);
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -419,6 +548,7 @@ describe("buildServer", () => {
     } finally {
       for (const client of clients) client.terminate();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -637,6 +767,7 @@ describe("buildServer", () => {
       ).toMatchObject({ name: "Feature A" });
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -739,6 +870,7 @@ describe("buildServer", () => {
       expect(updateSpy).not.toHaveBeenCalled();
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -820,6 +952,7 @@ describe("buildServer", () => {
       });
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -909,6 +1042,7 @@ describe("buildServer", () => {
       expect(updateSpy).not.toHaveBeenCalled();
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -956,6 +1090,7 @@ describe("buildServer", () => {
       });
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -1002,6 +1137,7 @@ describe("buildServer", () => {
       expect(malformedSearch.json().message).toBe("query must be a string.");
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -1027,6 +1163,7 @@ describe("buildServer", () => {
     } finally {
       client?.close();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -1065,6 +1202,7 @@ describe("buildServer", () => {
       allowedClient?.close();
       blockedClient?.terminate();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -1108,6 +1246,7 @@ describe("buildServer", () => {
     } finally {
       client?.close();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -1184,6 +1323,7 @@ describe("buildServer", () => {
       workspaceFile.write = originalWrite;
       client?.close();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -1240,6 +1380,7 @@ describe("buildServer", () => {
     } finally {
       client?.close();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -1308,6 +1449,7 @@ describe("buildServer", () => {
       expect(afterDismissAll.json().notifications).toEqual([]);
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -1346,6 +1488,7 @@ describe("buildServer", () => {
       );
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -1391,6 +1534,7 @@ describe("buildServer", () => {
     } finally {
       client?.close();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -1405,6 +1549,7 @@ describe("buildServer", () => {
     const app = await buildServer(config, services);
 
     await app.close();
+    await fs.rm(root, { recursive: true, force: true });
 
     expect(disposeAutomation).toHaveBeenCalledTimes(1);
     expect(disposeVoice).toHaveBeenCalledTimes(1);
@@ -1412,7 +1557,22 @@ describe("buildServer", () => {
 
   it("runs one ordered two-phase shutdown across preClose and onClose", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-server-dispose-order-"));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
     const services = buildServices(testConfig(root));
+    const disposeJiraOwner = services.jiraPolling!.dispose.bind(services.jiraPolling);
+    const disposeForgeOwner = vi.fn(services.forge!.dispose.bind(services.forge));
+    const disposeAutomationOwner = services.automation!.dispose.bind(services.automation);
+    const poll = vi.spyOn(services.forge!, "poll");
+    const pollWriteStarted = deferred<void>();
+    const releasePollWrite = deferred<void>();
+    const writePluginData = services.pluginData!.write.bind(services.pluginData);
+    const writes = vi.spyOn(services.pluginData!, "write").mockImplementation(async (pluginId, value) => {
+      if (pluginId === "forge") {
+        pollWriteStarted.resolve(undefined);
+        await releasePollWrite.promise;
+      }
+      await writePluginData(pluginId, value);
+    });
     const events: string[] = [];
     const jiraRelease = deferred<void>();
     const forgeRelease = deferred<void>();
@@ -1466,6 +1626,34 @@ describe("buildServer", () => {
       events.push("notifications:automation");
     });
     const app = await buildServer(testConfig(root), services);
+    let cleanup: Promise<void> | undefined;
+    const cleanUpFixture = async () => {
+      await app.close();
+      await disposeJiraOwner();
+      await disposeForgeOwner();
+      await disposeAutomationOwner();
+      await fs.rm(root, { recursive: true, force: true });
+    };
+    onTestFinished(async () => {
+      jiraRelease.resolve(undefined);
+      forgeRelease.resolve(undefined);
+      sessionRelease.resolve(undefined);
+      automationRelease.resolve(undefined);
+      documentationRelease.resolve(undefined);
+      voiceRelease.resolve(undefined);
+      releasePollWrite.resolve(undefined);
+      try {
+        await (cleanup ??= cleanUpFixture());
+      } finally {
+        writes.mockRestore();
+        poll.mockRestore();
+        vi.useRealTimers();
+      }
+    });
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    await pollWriteStarted.promise;
+    expect(poll).toHaveBeenCalledTimes(1);
 
     let closed = false;
     const close = app.close().then(() => {
@@ -1503,6 +1691,22 @@ describe("buildServer", () => {
 
     expect(events.indexOf("notifications:workspace")).toBeGreaterThan(events.indexOf("automation:dispose:end"));
     expect(events.indexOf("notifications:automation")).toBeGreaterThan(events.indexOf("automation:dispose:end"));
+
+    let cleaned = false;
+    cleanup = cleanUpFixture().then(() => { cleaned = true; });
+    await vi.waitFor(() => expect(disposeForgeOwner).toHaveBeenCalledTimes(1));
+    expect(cleaned).toBe(false);
+    expect((await fs.stat(root)).isDirectory()).toBe(true);
+
+    releasePollWrite.resolve(undefined);
+    await cleanup;
+    expect(cleaned).toBe(true);
+    await expect(fs.stat(root)).rejects.toMatchObject({ code: "ENOENT" });
+    const writesAfterCleanup = writes.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(poll).toHaveBeenCalledTimes(1);
+    expect(writes).toHaveBeenCalledTimes(writesAfterCleanup);
+    await expect(fs.stat(root)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("drains an admitted plugin hook through terminal automation delivery before unsubscribe", async () => {
@@ -1620,6 +1824,11 @@ describe("buildServer", () => {
       events.push("automation:dispose");
     });
     const app = await buildServer(config, services);
+    onTestFinished(async () => {
+      releaseAction.resolve();
+      await app.close();
+      await fs.rm(root, { recursive: true, force: true });
+    });
     const hook = services.hooks!.call(hookId, { eventId: "event-1" }, {
       caller: { kind: "automation" },
       targetTabId: tab.id,
@@ -1647,6 +1856,8 @@ describe("buildServer", () => {
       path.join(os.tmpdir(), "cloudx-server-dispose-failures-"),
     );
     const services = buildServices(testConfig(root));
+    const disposeJiraOwner = services.jiraPolling!.dispose.bind(services.jiraPolling);
+    const disposeAutomationOwner = services.automation!.dispose.bind(services.automation);
     const disposeAutomation = vi
       .spyOn(services.automation!, "dispose")
       .mockImplementation(() => {
@@ -1683,6 +1894,12 @@ describe("buildServer", () => {
     vi.spyOn(services.workspace!, "onPersistenceStatusChange").mockReturnValue(unsubscribeWorkspace);
     vi.spyOn(services.automation!, "onPersistenceStatusChange").mockReturnValue(unsubscribeAutomation);
     const app = await buildServer(testConfig(root), services);
+    onTestFinished(async () => {
+      await app.close().catch(() => undefined);
+      await disposeJiraOwner();
+      await disposeAutomationOwner();
+      await fs.rm(root, { recursive: true, force: true });
+    });
 
     let failure: unknown;
     try {
@@ -1739,6 +1956,7 @@ describe("buildServer", () => {
     await vi.waitFor(() => expect(plannerSignal).toBeDefined());
 
     await app.close();
+    await fs.rm(root, { recursive: true, force: true });
 
     await expect(response).resolves.toMatchObject({ statusCode: 500 });
     expect(plannerSignal?.aborted).toBe(true);
@@ -1798,6 +2016,7 @@ describe("buildServer", () => {
       );
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -1805,6 +2024,11 @@ describe("buildServer", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-rules-live-"));
     const config = testConfig(root);
     const services = buildServices(config);
+    const app = await buildServer(config, services);
+    onTestFinished(async () => {
+      await app.close();
+      await fs.rm(root, { recursive: true, force: true });
+    });
     await services.pluginContributionsReady;
     const restartTabs = vi
       .spyOn(services.sessions, "restartTabs")
@@ -1860,6 +2084,11 @@ describe("buildServer", () => {
     const applyRuntimeContexts = vi
       .spyOn(services.sessions, "applyRuntimeContexts")
       .mockResolvedValue([]);
+    const app = await buildServer(config, services);
+    onTestFinished(async () => {
+      await app.close();
+      await fs.rm(root, { recursive: true, force: true });
+    });
 
     const store = await services.pluginContributionsReady!;
 
@@ -2012,6 +2241,7 @@ describe("buildServer", () => {
       });
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -2070,6 +2300,7 @@ describe("buildServer", () => {
       );
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -2122,6 +2353,7 @@ describe("buildServer", () => {
       );
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -2163,6 +2395,7 @@ describe("buildServer", () => {
       expect(streamArchiveExport).toHaveBeenCalled();
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -2247,6 +2480,7 @@ describe("buildServer", () => {
       expect(invalidMode.json().message).toContain("replace or merge");
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -2305,6 +2539,7 @@ describe("buildServer", () => {
       });
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -2392,6 +2627,11 @@ describe("buildServer", () => {
       return DocumentationEnrichmentService.prototype.enrichIngestResponse.call(this, response, source, options);
     });
     const app = await buildServer(config, services);
+    onTestFinished(async () => {
+      releaseCleanup.resolve();
+      await app.close();
+      await fs.rm(root, { recursive: true, force: true });
+    });
     const request = app.inject({
       method: "POST",
       url: "/api/documentation/upload?filename=closing.txt&sourceType=text",
@@ -2505,6 +2745,7 @@ describe("buildServer", () => {
       ).toBeLessThan(events.findIndex((event) => event.type === "result"));
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -2558,6 +2799,7 @@ describe("buildServer", () => {
       ]);
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -2597,6 +2839,7 @@ describe("buildServer", () => {
       ]);
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -2650,6 +2893,7 @@ describe("buildServer", () => {
       occupying.resolve({ complete: true });
       await admitted.catch(() => undefined);
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -2676,6 +2920,7 @@ describe("buildServer", () => {
       expect(ingestUpload).not.toHaveBeenCalled();
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -2728,6 +2973,7 @@ describe("buildServer", () => {
       ).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -2738,7 +2984,12 @@ describe("buildServer", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-documentation-partial-close-"));
     const config = testConfig(root);
     const services = buildServices(config);
+    await services.pluginContributionsReady;
     const app = await buildServer(config, services);
+    onTestFinished(async () => {
+      await app.close();
+      await fs.rm(root, { recursive: true, force: true });
+    });
     let request: http.ClientRequest | undefined;
     let close: Promise<void> | undefined;
     let outcome = "not-started";
@@ -2805,6 +3056,7 @@ describe("buildServer", () => {
       });
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -2814,6 +3066,12 @@ describe("buildServer", () => {
     );
     const config = testConfig(root);
     const services = buildServices(config);
+    const app = await buildServer(config, services);
+    onTestFinished(async () => {
+      await app.close();
+      await fs.rm(root, { recursive: true, force: true });
+    });
+    await services.pluginContributionsReady;
     const tab = { id: "tab-1", pluginId: "codex-terminal" };
     const refreshRuntimeIndicators = vi
       .spyOn(services.sessions, "refreshRuntimeIndicators")
@@ -2851,6 +3109,11 @@ describe("buildServer", () => {
       "utf8",
     );
     const services = buildServices(config);
+    const app = await buildServer(config, services);
+    onTestFinished(async () => {
+      await app.close();
+      await fs.rm(root, { recursive: true, force: true });
+    });
 
     await expect(
       services.hooks!.call(
@@ -2967,6 +3230,7 @@ describe("buildServer", () => {
       );
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -3012,6 +3276,7 @@ describe("buildServer", () => {
       expect(listed.json().plugins).toHaveLength(1);
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -3033,6 +3298,7 @@ describe("buildServer", () => {
       );
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -3496,6 +3762,7 @@ describe("buildServer", () => {
       );
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -3588,6 +3855,7 @@ describe("buildServer", () => {
       });
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -3677,6 +3945,7 @@ describe("buildServer", () => {
       expect(runs.json().runs).toEqual([]);
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -3748,6 +4017,7 @@ describe("buildServer", () => {
       expect(saveSpy).not.toHaveBeenCalled();
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -3793,6 +4063,7 @@ describe("buildServer", () => {
       expect(saved.json().group.updatedAt).not.toBe("1900-01-01T00:00:00.000Z");
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -3948,6 +4219,7 @@ describe("buildServer", () => {
       );
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -4034,6 +4306,7 @@ describe("buildServer", () => {
       ).toBe('<svg><script>alert("x")</script></svg>');
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -4094,6 +4367,7 @@ describe("buildServer", () => {
       ).resolves.toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -4167,6 +4441,7 @@ describe("buildServer", () => {
       expect(downloadSpy).not.toHaveBeenCalled();
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -4221,6 +4496,7 @@ describe("buildServer", () => {
       expect(executeSpy).not.toHaveBeenCalled();
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -4245,6 +4521,7 @@ describe("buildServer", () => {
       expect(executeSpy).toHaveBeenCalledWith("tab-1", "open_file", {});
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -4314,6 +4591,7 @@ describe("buildServer", () => {
       expect(createSpy).not.toHaveBeenCalled();
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -4368,6 +4646,7 @@ describe("buildServer", () => {
       );
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -4430,6 +4709,7 @@ describe("buildServer", () => {
       );
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -4464,6 +4744,7 @@ describe("buildServer", () => {
       await expect(fs.readdir(root)).resolves.not.toContain("too-large.bin");
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -4490,6 +4771,7 @@ describe("buildServer", () => {
       expect(response.body).toContain("AI control is disabled");
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -4524,6 +4806,7 @@ describe("buildServer", () => {
       expect(audio.body).toContain("Voice commands are disabled");
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -4880,6 +5163,7 @@ describe("buildServer", () => {
       expect(encodedSpacePath.body).toBe("encoded space path");
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
       await new Promise<void>((resolve) => localServer.close(() => resolve()));
     }
   });
@@ -4967,6 +5251,7 @@ describe("buildServer", () => {
     } finally {
       client?.close();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
       wsServer.close();
       await new Promise<void>((resolve) => localServer.close(() => resolve()));
     }
@@ -5059,6 +5344,7 @@ describe("buildServer", () => {
     } finally {
       client?.close();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
       for (const socket of heldUpgradeSockets) {
         socket.destroy();
       }
@@ -5146,6 +5432,7 @@ describe("buildServer", () => {
     } finally {
       client?.close();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
       for (const socket of wsServer.clients) {
         socket.terminate();
       }
@@ -5283,6 +5570,7 @@ describe("buildServer", () => {
     } finally {
       client?.close();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   }, 10_000);
 
@@ -5317,6 +5605,7 @@ describe("buildServer", () => {
     } finally {
       client?.close();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -5349,6 +5638,7 @@ describe("buildServer", () => {
     } finally {
       client?.close();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -5695,6 +5985,7 @@ describe("buildServer", () => {
       heldSend.restore();
       client?.close();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   }, 10_000);
 
@@ -5736,6 +6027,7 @@ describe("buildServer", () => {
     } finally {
       client?.close();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -5780,6 +6072,7 @@ describe("buildServer", () => {
       heldSend.restore();
       client?.close();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -5818,6 +6111,7 @@ describe("buildServer", () => {
       sendSpy.mockRestore();
       client?.close();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -5854,6 +6148,7 @@ describe("buildServer", () => {
       sendSpy.mockRestore();
       client?.close();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -5905,6 +6200,7 @@ describe("buildServer", () => {
     } finally {
       client?.close();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -6053,6 +6349,7 @@ describe("buildServer", () => {
     } finally {
       client?.close();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -6150,12 +6447,15 @@ describe("buildServer", () => {
       } finally {
         client?.close();
         await app.close();
+        await fs.rm(root, { recursive: true, force: true });
       }
     }
   });
 
   it("serves built frontend index.html when configured", async () => {
-    const webDistDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-web-"));
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-web-"));
+    const webDistDir = path.join(root, "web");
+    await fs.mkdir(webDistDir);
     await fs.writeFile(
       path.join(webDistDir, "index.html"),
       "<!doctype html><title>Cloudx Test</title>",
@@ -6169,7 +6469,7 @@ describe("buildServer", () => {
       asrUrl: "http://127.0.0.1:7810",
       asrTimeoutMs: DEFAULT_ASR_TIMEOUT_MS,
       voiceModel: "gpt-5.3-codex-spark",
-      dataDir: path.join(os.tmpdir(), "cloudx-data"),
+      dataDir: path.join(root, ".cloudx"),
       webDistDir,
       appServerEnabled: false,
       automationStartDisabled: false,
@@ -6192,6 +6492,7 @@ describe("buildServer", () => {
     const app = await buildServer(config, services);
     const response = await app.inject({ method: "GET", url: "/" });
     await app.close();
+    await fs.rm(root, { recursive: true, force: true });
 
     expect(response.statusCode).toBe(200);
     expect(response.body).toContain("Cloudx Test");
@@ -6211,7 +6512,7 @@ describe("buildServer", () => {
       asrUrl: "http://127.0.0.1:7810",
       asrTimeoutMs: DEFAULT_ASR_TIMEOUT_MS,
       voiceModel: "gpt-5.3-codex-spark",
-      dataDir: path.join(os.tmpdir(), "cloudx-data"),
+      dataDir: path.join(root, ".cloudx"),
       webDistDir: path.join(root, "missing-web-dist"),
       appServerEnabled: false,
       automationStartDisabled: false,
@@ -6237,6 +6538,7 @@ describe("buildServer", () => {
       url: `/api/paths/options?query=${encodeURIComponent(`${root}/wor`)}`,
     });
     await app.close();
+    await fs.rm(root, { recursive: true, force: true });
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({
@@ -6264,7 +6566,7 @@ describe("buildServer", () => {
       asrUrl: "http://127.0.0.1:7810",
       asrTimeoutMs: DEFAULT_ASR_TIMEOUT_MS,
       voiceModel: "gpt-5.3-codex-spark",
-      dataDir: path.join(os.tmpdir(), "cloudx-data"),
+      dataDir: path.join(root, ".cloudx"),
       webDistDir: path.join(root, "missing-web-dist"),
       appServerEnabled: false,
       automationStartDisabled: false,
@@ -6309,6 +6611,7 @@ describe("buildServer", () => {
       },
     });
     await app.close();
+    await fs.rm(root, { recursive: true, force: true });
 
     expect(response.statusCode).toBe(200);
     expect(calls).toEqual([
@@ -6399,6 +6702,7 @@ describe("buildServer", () => {
       expect(voiceCalled).toBe(false);
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -6413,7 +6717,7 @@ describe("buildServer", () => {
       asrUrl: "http://127.0.0.1:7810",
       asrTimeoutMs: DEFAULT_ASR_TIMEOUT_MS,
       voiceModel: "gpt-5.3-codex-spark",
-      dataDir: path.join(os.tmpdir(), "cloudx-data"),
+      dataDir: path.join(root, ".cloudx"),
       webDistDir: path.join(root, "missing-web-dist"),
       appServerEnabled: false,
       automationStartDisabled: false,
@@ -6451,6 +6755,7 @@ describe("buildServer", () => {
       payload: Buffer.from("audio"),
     });
     await app.close();
+    await fs.rm(root, { recursive: true, force: true });
 
     expect(response.statusCode).toBe(500);
     expect(response.json().message).toContain("No speech was detected");
@@ -6469,7 +6774,7 @@ describe("buildServer", () => {
       asrUrl: "http://127.0.0.1:7810",
       asrTimeoutMs: DEFAULT_ASR_TIMEOUT_MS,
       voiceModel: "gpt-5.3-codex-spark",
-      dataDir: path.join(os.tmpdir(), "cloudx-data"),
+      dataDir: path.join(root, ".cloudx"),
       webDistDir: path.join(root, "missing-web-dist"),
       appServerEnabled: false,
       automationStartDisabled: false,
@@ -6512,6 +6817,7 @@ describe("buildServer", () => {
       payload: Buffer.from("audio"),
     });
     await app.close();
+    await fs.rm(root, { recursive: true, force: true });
 
     expect(response.statusCode).toBe(200);
     expect(handledTranscript).toBe("open a terminal pane and run pink");
@@ -6557,6 +6863,7 @@ describe("buildServer", () => {
       payload: audio,
     });
     await app.close();
+    await fs.rm(root, { recursive: true, force: true });
 
     expect(response.statusCode).toBe(200);
     expect(transcribedBytes).toBe(audio.byteLength);
@@ -6596,6 +6903,7 @@ describe("buildServer", () => {
       payload: Buffer.alloc(513, 1),
     });
     await app.close();
+    await fs.rm(root, { recursive: true, force: true });
 
     expect(response.statusCode).toBe(413);
     expect(asrCalled).toBe(false);
@@ -6691,6 +6999,7 @@ describe("buildServer", () => {
     } finally {
       client?.close();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -6708,7 +7017,7 @@ describe("buildServer", () => {
         asrUrl: "http://127.0.0.1:7810",
         asrTimeoutMs: DEFAULT_ASR_TIMEOUT_MS,
         voiceModel: "gpt-5.3-codex-spark",
-        dataDir: path.join(os.tmpdir(), "cloudx-data"),
+        dataDir: path.join(root, ".cloudx"),
         webDistDir: path.join(root, "missing-web-dist"),
         appServerEnabled: false,
         automationStartDisabled: false,
@@ -6769,6 +7078,7 @@ describe("buildServer", () => {
       } finally {
         client?.close();
         await app.close();
+        await fs.rm(root, { recursive: true, force: true });
       }
     }
 
@@ -6789,7 +7099,7 @@ describe("buildServer", () => {
       asrUrl: "http://127.0.0.1:7810",
       asrTimeoutMs: DEFAULT_ASR_TIMEOUT_MS,
       voiceModel: "gpt-5.3-codex-spark",
-      dataDir: path.join(os.tmpdir(), "cloudx-data"),
+      dataDir: path.join(root, ".cloudx"),
       webDistDir: path.join(root, "missing-web-dist"),
       appServerEnabled: false,
       automationStartDisabled: false,
@@ -6882,6 +7192,7 @@ describe("buildServer", () => {
     } finally {
       client?.close();
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
@@ -6898,7 +7209,7 @@ describe("buildServer", () => {
       asrUrl: "http://127.0.0.1:7810",
       asrTimeoutMs: DEFAULT_ASR_TIMEOUT_MS,
       voiceModel: "gpt-5.3-codex-spark",
-      dataDir: path.join(os.tmpdir(), "cloudx-data"),
+      dataDir: path.join(root, ".cloudx"),
       webDistDir: path.join(root, "missing-web-dist"),
       appServerEnabled: false,
       automationStartDisabled: false,
@@ -6945,6 +7256,7 @@ describe("buildServer", () => {
       payload: Buffer.from("audio"),
     });
     await app.close();
+    await fs.rm(root, { recursive: true, force: true });
 
     expect(response.statusCode).toBe(200);
     expect(buildVoiceContextCalled).toBe(false);
