@@ -166,7 +166,36 @@ CPU.
 
 ## Update
 
-Run:
+To update only Codex CLI to the release tagged `latest` on npm:
+
+```bash
+./install.sh --update-codex
+```
+
+Preview the commands without changing the system:
+
+```bash
+./install.sh --update-codex --dry-run
+```
+
+This mode requires existing Node.js and npm. It updates the npm prefix containing
+the saved `CLOUDX_ASSISTANT_BIN` executable, or uses `CLOUDX_NPM_GLOBAL_DIR` from
+the saved configuration or environment when no executable is saved. The default
+prefix is `~/.local/share/cloudx/npm-global`. Custom assistant wrappers and
+relative paths are rejected before installation.
+
+It verifies the updated executable with `--version`, without requiring login or
+changing authentication. It leaves the checkout, Cloudx configuration, services,
+and other dependencies unchanged; no clean Git checkout or systemd installation
+is required. New Codex processes use the updated executable; existing processes
+continue running. The Node entrypoint also accepts this option:
+`node scripts/install-cloudx.mjs --update-codex`.
+
+Use this mode on its own; it cannot be combined with `--update`, `--uninstall`,
+or custom web-service options. Full installation and full update still install
+the pinned Codex version listed below, which can replace a newer Codex-only update.
+
+To update the full Cloudx installation, run:
 
 ```bash
 ./install.sh --update
