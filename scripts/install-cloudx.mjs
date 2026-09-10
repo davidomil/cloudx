@@ -6,15 +6,18 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
+import {
+  SERVICE_NAMES,
+  documentationReadinessUrl,
+  inspectUpdateTarget,
+  updateCheckout,
+  updatePort,
+} from "./install-update.mjs";
 
 export const ASR_MODEL_ID = "Systran/faster-whisper-large-v3";
 export const CODEX_CLI_VERSION = "0.153.4";
 export const UV_VERSION = "0.11.28";
-export const SERVICE_NAMES = [
-  "cloudx-asr.service",
-  "cloudx-documentation.service",
-  "cloudx.service",
-];
+export { SERVICE_NAMES };
 export const LEGACY_SERVICE_NAMES = ["cloudx-asr.service", "cloudx.service"];
 export const QUARTO_VERSION = "1.9.38";
 export const QUARTO_DEB_PATH = `/tmp/quarto-${QUARTO_VERSION}-linux-amd64.deb`;
@@ -31,7 +34,7 @@ export const WHISPER_CPP_MODEL = "large-v3-turbo";
 export const WHISPER_CPP_VAD_MODEL = "silero-v6.2.0";
 export const SAFE_VERBOSE_ENV_KEYS = [
   "CLOUDX_INSTALL_BOOTSTRAPPED",
-  "CLOUDX_INSTALL_ALREADY_PULLED",
+  "CLOUDX_INSTALL_UPDATED_COMMIT",
   "CLOUDX_HOST",
   "CLOUDX_PORT",
   "CLOUDX_LOG_LEVEL",
@@ -110,6 +113,12 @@ export function parseArgs(argv = process.argv.slice(2)) {
       options.uninstall = true;
     } else if (arg === "--update") {
       options.update = true;
+    } else if (arg === "--service") {
+      options.service = argv[++index];
+      if (!options.service || options.service.startsWith("-"))
+        throw new Error("--service requires a user service name.");
+    } else if (arg === "--port") {
+      options.port = updatePort(argv[++index], "--port");
     } else if (arg === "--verbose") {
       options.verbose = true;
     } else if (arg === "--help" || arg === "-h") {
@@ -120,6 +129,14 @@ export function parseArgs(argv = process.argv.slice(2)) {
   }
   if (options.uninstall && options.update) {
     throw new Error("--update cannot be combined with --uninstall.");
+  }
+  if ((options.service || options.port !== undefined) && !options.update) {
+    throw new Error("--service and --port are only available with --update.");
+  }
+  if (Boolean(options.service) !== (options.port !== undefined)) {
+    throw new Error(
+      "A custom web service update requires both --service and --port.",
+    );
   }
   return options;
 }
@@ -137,7 +154,9 @@ export function helpText() {
     "       node scripts/install-cloudx.mjs [options]",
     "",
     "Options:",
-    "  --update           Pull the latest checkout and update installed dependencies/services.",
+    "  --update           Fast-forward this clean checkout to origin/main and update its installation.",
+    "  --service <unit>   Update only an existing custom web service; preserve its definition and shared dependencies.",
+    "  --port <number>    HTTPS readiness port for the selected custom web service.",
     "  --uninstall        Remove Cloudx services and selected local install artifacts.",
     "  --dry-run          Print commands and planned file writes without changing the system.",
     "  --answers <json>   Read wizard answers from a JSON file.",
@@ -764,6 +783,19 @@ export class InstallerRunner {
     return "";
   }
 
+  inspect(command, args = [], options = {}) {
+    this.commands.push({
+      command,
+      args,
+      cwd: options.cwd ?? this.cwd,
+      inspect: true,
+    });
+    this.log(`$ ${formatCommand(command, args, options)}`);
+    const result = this.spawnCaptured(command, args, options);
+    if (!processSucceeded(result)) throw commandFailure(command, args, result);
+    return result.stdout.trim();
+  }
+
   capture(command, args = [], options = {}) {
     if (this.dryRun) {
       this.commands.push({
@@ -900,6 +932,57 @@ export async function runInstaller(options = {}) {
   if (verbose) {
     runner.verbose = true;
   }
+  const osRelease =
+    options.osRelease ??
+    parseOsRelease(readText("/etc/os-release", "ID=unknown\n"));
+  assertSupportedPlatform(osRelease);
+  const networkInterfaces = options.networkInterfaces ?? os.networkInterfaces();
+
+  let paths = installerPaths({ repoRoot: root, home, env });
+  const commands = commandMap(runner);
+  let updateTarget;
+  let savedEnv;
+  if (options.update) {
+    section("Check update checkout and service ownership");
+    updateTarget = inspectUpdateTarget({
+      paths,
+      commands,
+      service: options.service,
+      port: options.port,
+    });
+    if (updateTarget.kind === "standard") {
+      savedEnv = readEnvFile(paths.envPath);
+      paths = installerPaths({
+        repoRoot: root,
+        home,
+        env: { ...env, ...savedEnv },
+      });
+      paths.dataDir = savedEnv.CLOUDX_DATA_DIR ?? paths.dataDir;
+      for (const [label, directory] of [
+        ["ASR model", paths.modelDir],
+        ["Cloudx data", paths.dataDir],
+      ]) {
+        if (!path.isAbsolute(directory))
+          throw new Error(`Saved ${label} directory must be an absolute path.`);
+      }
+      updatePort(savedEnv.CLOUDX_PORT ?? 3001, "Cloudx port");
+      documentationReadinessUrl(savedEnv);
+    }
+    const updatedCommit = updateCheckout(commands, {
+      repoRoot: root,
+      dryRun,
+      updatedCommit: env.CLOUDX_INSTALL_UPDATED_COMMIT,
+    });
+    if (options.cliArgs && !dryRun && !env.CLOUDX_INSTALL_UPDATED_COMMIT) {
+      return runner.run(
+        process.execPath,
+        [path.join(root, "scripts/install-cloudx.mjs"), ...options.cliArgs],
+        {
+          env: { CLOUDX_INSTALL_UPDATED_COMMIT: updatedCommit },
+        },
+      );
+    }
+  }
   const prompt = createPrompter({
     answers,
     yes,
@@ -907,14 +990,16 @@ export async function runInstaller(options = {}) {
     input: options.input,
     output: options.output,
   });
-  const osRelease =
-    options.osRelease ??
-    parseOsRelease(readText("/etc/os-release", "ID=unknown\n"));
-  assertSupportedPlatform(osRelease);
-  const networkInterfaces = options.networkInterfaces ?? os.networkInterfaces();
-
-  const paths = installerPaths({ repoRoot: root, home, env });
-  const commands = commandMap(runner);
+  if (updateTarget?.kind === "web") {
+    return await runWebServiceUpdater({
+      paths,
+      commands,
+      runner,
+      prompt,
+      target: updateTarget,
+      noStart: options.noStart,
+    });
+  }
   if (options.uninstall) {
     return await runUninstaller({ paths, commands, runner, prompt, dryRun });
   }
@@ -937,6 +1022,8 @@ export async function runInstaller(options = {}) {
       noStart: options.noStart,
       networkInterfaces,
       env,
+      target: updateTarget,
+      envConfig: savedEnv,
     });
   }
   const gpuDetected = options.gpuDetected ?? commands.exists("nvidia-smi");
@@ -1171,7 +1258,7 @@ export async function runInstaller(options = {}) {
     commands.run("systemctl", ["--user", "enable", ...SERVICE_NAMES]);
     if (startServices) {
       commands.run("systemctl", ["--user", "restart", ...SERVICE_NAMES]);
-      verifyServices(commands, port);
+      verifyServices(commands, port, defaultDocumentationEnvVars(paths));
     }
   } else {
     section("10/10 Skip systemd service installation");
@@ -1399,6 +1486,8 @@ async function runUpdater({
   noStart,
   networkInterfaces,
   env,
+  target,
+  envConfig,
 }) {
   section("Cloudx update wizard");
   console.log(
@@ -1408,23 +1497,9 @@ async function runUpdater({
   console.log(`Configuration file: ${paths.envPath}`);
   console.log(`ASR model directory: ${paths.modelDir}`);
 
-  const envConfig = readEnvFile(paths.envPath);
-  const port = Number.parseInt(envConfig.CLOUDX_PORT ?? "3001", 10);
+  const port = updatePort(envConfig.CLOUDX_PORT ?? 3001, "Cloudx port");
   const host = updateHostFromEnvConfig(envConfig);
-  const servicesInstalled =
-    SERVICE_NAMES.some((serviceName) =>
-      fs.existsSync(path.join(paths.systemdDir, serviceName)),
-    ) ||
-    LEGACY_SERVICE_NAMES.every((serviceName) =>
-      fs.existsSync(path.join(paths.systemdDir, serviceName)),
-    );
-
-  section("2/10 Pull latest Cloudx checkout");
-  if (env.CLOUDX_INSTALL_ALREADY_PULLED === "1") {
-    console.log("Checkout was already pulled by install.sh.");
-  } else {
-    commands.run("git", ["pull", "--ff-only"]);
-  }
+  const { servicesInstalled } = target;
 
   section("3/10 Update Codex CLI");
   const assistantBin = await updateCodex(commands, prompt, paths, env);
@@ -1477,7 +1552,13 @@ async function runUpdater({
   section("8/10 Rebuild Cloudx and refresh HTTPS certificate if missing");
   commands.run("npm", ["run", "build"]);
   installServerRuntimeSchemas(runner, paths);
-  commands.run("npm", ["run", "cert:create"]);
+  commands.run("npm", ["run", "cert:create"], {
+    env: {
+      CLOUDX_DATA_DIR: paths.dataDir,
+      CLOUDX_CERT_HOSTS: envConfig.CLOUDX_CERT_HOSTS ?? "",
+      CLOUDX_CERT_DAYS: envConfig.CLOUDX_CERT_DAYS ?? "365",
+    },
+  });
 
   section("9/10 Refresh installed systemd service files");
   if (servicesInstalled) {
@@ -1505,7 +1586,7 @@ async function runUpdater({
   section("10/10 Restart services");
   if (restartServices) {
     commands.run("systemctl", ["--user", "restart", ...SERVICE_NAMES]);
-    verifyServices(commands, port);
+    verifyServices(commands, port, envConfig);
   } else if (servicesInstalled) {
     console.log(
       `Services were refreshed but not restarted. Restart later with: systemctl --user restart ${SERVICE_NAMES.join(" ")}`,
@@ -1524,6 +1605,50 @@ async function runUpdater({
     servicesInstalled,
     restartServices,
     urls: cloudxAccessUrls(port),
+  };
+}
+
+async function runWebServiceUpdater({
+  paths,
+  commands,
+  runner,
+  prompt,
+  target,
+  noStart,
+}) {
+  const [service] = target.serviceNames;
+  section(`Update ${service}`);
+  verifyNodeAndNpm(commands);
+  commands.run("npm", ["ci"]);
+  commands.run("npm", ["run", "build"]);
+  installServerRuntimeSchemas(runner, paths);
+  const restartServices =
+    !noStart &&
+    (await prompt.boolean(
+      "restartServices",
+      `Restart ${service} after update?`,
+      true,
+    ));
+  if (restartServices) {
+    commands.run("systemctl", ["--user", "restart", service]);
+    waitForHealth(commands, {
+      label: service,
+      url: `https://127.0.0.1:${target.port}/api/ready`,
+      insecure: true,
+    });
+  }
+  await prompt.close();
+  section("Update complete");
+  console.log(
+    `${service}: checkout rebuilt${restartServices ? " and service restarted" : "; service was not restarted"}.`,
+  );
+  return {
+    runner,
+    paths,
+    port: target.port,
+    servicesInstalled: true,
+    restartServices,
+    urls: cloudxAccessUrls(target.port),
   };
 }
 
@@ -1813,7 +1938,7 @@ function installSystemdServices(commands, runner, paths) {
   );
 }
 
-function verifyServices(commands, port) {
+function verifyServices(commands, port, envConfig) {
   console.log("Verifying service enablement and readiness endpoints.");
   commands.run("systemctl", ["--user", "is-enabled", ...SERVICE_NAMES]);
   try {
@@ -1828,7 +1953,7 @@ function verifyServices(commands, port) {
     });
     waitForHealth(commands, {
       label: "Cloudx documentation indexer",
-      url: "http://127.0.0.1:7820/ready",
+      url: documentationReadinessUrl(envConfig),
     });
   } catch (error) {
     console.error(
@@ -2005,6 +2130,9 @@ export function installServerRuntimeSchemas(runner, paths) {
 
 function commandMap(runner) {
   return {
+    inspect(command, args, options) {
+      return runner.inspect(command, args, options);
+    },
     run(command, args, options) {
       return runner.run(command, args, options);
     },
@@ -2279,7 +2407,7 @@ async function main() {
   const answers = options.answersPath
     ? JSON.parse(fs.readFileSync(options.answersPath, "utf8"))
     : {};
-  await runInstaller({ ...options, answers });
+  await runInstaller({ ...options, answers, cliArgs: process.argv.slice(2) });
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

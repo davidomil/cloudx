@@ -1532,7 +1532,7 @@ describe("runInstaller dry-run", () => {
     expect(runner.commands.some((command) => command.remove)).toBe(false);
   });
 
-  it("plans an update that pulls, refreshes dependencies, services, and health checks", async () => {
+  it("plans an update from main that preserves configuration and verifies its services", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-update-repo-"));
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-update-home-"));
     const runner = new InstallerRunner({
@@ -1540,11 +1540,28 @@ describe("runInstaller dry-run", () => {
       cwd: root,
       log: () => undefined,
     });
+    runner.inspect = (command, args) => {
+      if (command === "git") {
+        if (args.includes("--show-toplevel")) return root;
+        if (args[0] === "status") return "";
+        if (args[0] === "remote") return "/fixture/origin.git";
+        return "a".repeat(40);
+      }
+      const service = args[2];
+      if (!fs.existsSync(path.join(home, ".config/systemd/user", service))) return "LoadState=not-found";
+      return [
+        "LoadState=loaded",
+        "NeedDaemonReload=no",
+        `WorkingDirectory=${root}`,
+        `FragmentPath=${path.join(home, ".config/systemd/user", service)}`,
+        `EnvironmentFiles=${path.join(home, ".config/cloudx/cloudx.env")} (ignore_errors=no)`,
+      ].join("\n");
+    };
     fs.mkdirSync(path.join(home, ".config/cloudx"), { recursive: true });
     fs.mkdirSync(path.join(home, ".config/systemd/user"), { recursive: true });
     fs.writeFileSync(
       path.join(home, ".config/cloudx/cloudx.env"),
-      "CLOUDX_HOST=0.0.0.0\nCLOUDX_PORT=3443\nCLOUDX_TRUSTED_ORIGINS=https://192.168.8.250:3443\nCLOUDX_ASR_DEVICE=cuda\nCLOUDX_ASR_COMPUTE_TYPE=int8_float16\nCLOUDX_DOCUMENTATION_URL=http://127.0.0.1:9000\n",
+      "CLOUDX_HOST=0.0.0.0\nCLOUDX_PORT=3443\nCLOUDX_TRUSTED_ORIGINS=https://192.168.8.250:3443\nCLOUDX_ASR_DEVICE=cuda\nCLOUDX_ASR_COMPUTE_TYPE=int8_float16\nCLOUDX_DOCUMENTATION_URL=http://127.0.0.1:9000\nCLOUDX_DOCUMENTATION_PORT=9000\n",
     );
     fs.writeFileSync(
       path.join(home, ".config/systemd/user/cloudx.service"),
@@ -1616,15 +1633,15 @@ describe("runInstaller dry-run", () => {
       expect.arrayContaining([
         ["node", "-v"],
         ["npm", "-v"],
-        ["git", "pull", "--ff-only"],
         [
-          "npm",
-          "i",
-          "-g",
-          "--prefix",
-          codexPrefix,
-          "@openai/codex@0.153.4",
+          "git",
+          "fetch",
+          "--no-tags",
+          "origin",
+          "+refs/heads/main:refs/remotes/origin/main",
         ],
+        ["git", "merge", "--ff-only", "--no-edit", "refs/remotes/origin/main"],
+        ["npm", "i", "-g", "--prefix", codexPrefix, "@openai/codex@0.153.4"],
         [codexBin, "--version"],
         ["npm", "ci"],
         ["python3", "-m", "venv", path.join(home, ".local/share/cloudx/uv")],
@@ -1710,7 +1727,7 @@ describe("runInstaller dry-run", () => {
       "--retry-delay",
       "1",
       "--retry-connrefused",
-      "http://127.0.0.1:7820/ready",
+      "http://127.0.0.1:9000/ready",
     ]);
     expect(
       runner.commands.find(
