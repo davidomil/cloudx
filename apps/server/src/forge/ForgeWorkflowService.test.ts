@@ -2226,20 +2226,49 @@ describe("Forge issue auto review", () => {
     expect(f.provider.merge).not.toHaveBeenCalled();
   });
 
-  it("deduplicates the unchanged target without replacing the completed runtime recovery", async () => {
+  it.each(["manual", "automatic"])("starts recovery for an advanced target with an unchanged provider merge base through %s Resume", async mode => {
     const f = await resolvingIssue();
-    await f.service.setAutoReview(f.issue.id, false, placement);
     f.resolvedReport(); f.publishRebase(); await f.poll();
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Resolution preserves both changes", comments: [] });
+    await f.poll();
+    if (mode === "manual") await f.service.setAutoReview(f.issue.id, false, placement);
+    const completedRecovery = f.currentIssue().rebaseRecovery!;
+    const previousReview = f.currentReview();
+    const targetHeadSha = "d".repeat(40);
+    expect(f.change.baseSha).toBe(completedRecovery.targetHeadSha);
     f.change.hasConflicts = true;
     f.reports.read.mockResolvedValue(undefined);
+    f.runtime.prepareIssueRebase.mockResolvedValue({ targetHeadSha, originalHeadSha: f.change.headSha });
     await f.service.resume(f.issue.id, placement);
-    expect(f.currentIssue()).toMatchObject({ status: "failed", error: expect.stringContaining("already rebased"), rebaseRecovery: { phase: "reviewing" } });
-    expect(f.runtime.prepareIssueRebase).toHaveBeenCalledOnce();
-    f.change.baseSha = "d".repeat(40);
-    f.runtime.prepareIssueRebase.mockResolvedValue({ targetHeadSha: f.change.baseSha, originalHeadSha: f.change.headSha });
-    await f.service.resume(f.issue.id, placement);
-    expect(f.currentIssue()).toMatchObject({ status: "running", rebaseRecovery: { phase: "resolving", targetHeadSha: f.change.baseSha, expectedHeadSha: f.change.headSha } });
+    expect(f.runtime.prepareIssueRebase).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), completedRecovery.headSha, "main", expect.any(AbortSignal));
     expect(f.runtime.prepareIssueRebase).toHaveBeenCalledTimes(2);
+    expect(f.currentIssue()).toMatchObject({ status: "running", rebaseRecovery: {
+      phase: "resolving", targetHeadSha, expectedHeadSha: completedRecovery.headSha, originalHeadSha: completedRecovery.headSha,
+    } });
+    expect(f.runtime.launch.mock.calls.at(-1)![0].prompt).toContain(targetHeadSha);
+    expect(f.change.baseSha).toBe(completedRecovery.targetHeadSha);
+    expect(f.currentReview()).toMatchObject({
+      id: previousReview.id, status: "completed", draft: previousReview.draft, reviewHistory: previousReview.reviewHistory,
+    });
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each(["manual", "automatic"])("deduplicates an unchanged fetched target through %s Resume and retains completed recovery", async mode => {
+    const f = await resolvingIssue();
+    f.resolvedReport(); f.publishRebase(); await f.poll();
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Resolution preserves both changes", comments: [] });
+    await f.poll();
+    if (mode === "manual") await f.service.setAutoReview(f.issue.id, false, placement);
+    const completedRecovery = f.currentIssue().rebaseRecovery;
+    f.change.hasConflicts = true;
+    f.reports.read.mockResolvedValue(undefined);
+    f.runtime.launch.mockClear();
+    await f.service.resume(f.issue.id, placement);
+    expect(f.currentIssue()).toMatchObject({ status: "failed", error: expect.stringContaining("already rebased"), rebaseRecovery: completedRecovery });
+    expect(f.runtime.prepareIssueRebase).toHaveBeenCalledTimes(2);
+    expect(f.runtime.launch).not.toHaveBeenCalled();
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
   });
 
   it.each(["running", "post_failed"])("blocks recovery while a reviewer is %s", async state => {

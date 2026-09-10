@@ -1222,8 +1222,6 @@ export class ForgeWorkflowService {
     if (change.headSha !== worker.headSha)
       throw new Error("The published branch changed before conflict recovery. Inspect the retained checkout before resuming.");
     const saved = worker.rebaseRecovery;
-    if (saved?.phase === "reviewing" && saved.headSha === worker.headSha && saved.targetHeadSha === change.baseSha)
-      throw new Error("This commit was already rebased onto the reported target. Inspect the provider's unchanged conflict status, then Resume; the work is retained.");
     const item = await provider.getIssue(worker.number);
     if (item.number !== worker.number || item.state !== "open")
       throw new Error("Conflict recovery requires the original issue to remain open.");

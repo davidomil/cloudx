@@ -750,6 +750,7 @@ export class ForgeRuntime {
       }
       await this.verifyCleanHead(owned, expectedRemoteHeadSha);
       owned.baseUpdate = undefined;
+      owned.issueRebase = undefined;
       await this.manifest(owned.id).write(owned);
       signal?.throwIfAborted();
     });
