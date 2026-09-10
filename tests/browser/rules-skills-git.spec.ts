@@ -109,7 +109,7 @@ test.beforeAll(async () => {
 });
 
 test.afterAll(async ({}, testInfo) => {
-  if (server && server.exitCode === null) {
+  if (server && server.exitCode === null && server.signalCode === null) {
     const exited = new Promise<void>((resolve) =>
       server.once("exit", () => resolve()),
     );

@@ -10,8 +10,10 @@ const repoRoot = path.resolve(import.meta.dirname, "../..");
 let testRoot: string;
 let baseUrl: string;
 let server: ChildProcess;
+let serverLogs = "";
 
 test.beforeEach(async () => {
+  serverLogs = "";
   testRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-settings-"));
   const codexHome = path.join(testRoot, "codex-home");
   const imagegen = path.join(codexHome, "skills", ".system", "imagegen");
@@ -54,7 +56,6 @@ test.beforeEach(async () => {
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
-  let serverLogs = "";
   server.stdout!.on("data", (chunk) => (serverLogs += chunk.toString()));
   server.stderr!.on("data", (chunk) => (serverLogs += chunk.toString()));
   await expect
@@ -73,8 +74,8 @@ test.beforeEach(async () => {
     .toBe(true);
 });
 
-test.afterEach(async () => {
-  if (server && server.exitCode === null) {
+test.afterEach(async ({}, testInfo) => {
+  if (server && server.exitCode === null && server.signalCode === null) {
     const exited = new Promise<void>((resolve) =>
       server.once("exit", () => resolve()),
     );
@@ -86,6 +87,12 @@ test.afterEach(async () => {
       clearTimeout(forceStop);
     }
   }
+  const logPath = testInfo.outputPath("server.log");
+  await fs.writeFile(logPath, serverLogs);
+  await testInfo.attach("server.log", {
+    path: logPath,
+    contentType: "text/plain",
+  });
   if (testRoot) await fs.rm(testRoot, { recursive: true, force: true });
 });
 
