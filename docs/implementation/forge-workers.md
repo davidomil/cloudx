@@ -46,21 +46,16 @@ inspect the recorded provider error and project service accounts.
 
 ## Worker directory trust
 
-Before starting workers, open **Settings → Plugins → Forge Workers**,
-check **Trust this repository for Forge workers**, and save. The control
-shows the selected repository and API URL. Approval allows Codex to load
-repository instructions and run commands on this machine. Changing the
-destination clears the approval; uncheck the control and save to revoke it.
+Forge automatically approves repository trust for issue workers and
+reviews, including automatic reviews. No separate trust approval is
+required. Trust is limited to Forge's own verified checkouts matching
+the provider, API URL and current repository settings.
 
-Issue and review workers require this approval before starting or
-resuming. Without it, Forge reports an error directing you to Settings
-before creating a Codex terminal. Approve the repository, then use
-**Resume** to continue with the retained checkout and any saved review
-conversation. Approval is rechecked during launch preparation.
-
-For an approved repository, Forge grants Codex trust only to its own
-verified checkouts. The approval must match the provider, API URL and
-current repository settings.
+Forge rechecks the repository and checkout before granting trust,
+including before preparing a review conversation. Changing the
+configured repository prevents further trust grants for an existing
+checkout. The checkout and any saved conversation remain available
+for Resume after its repository settings are restored.
 
 Forge writes the exact checkout entry into the worker’s private Codex
 configuration. It preserves your source configuration and other project
