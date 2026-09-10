@@ -37,7 +37,7 @@ class ArchiveImport:
         self.latest: dict[str, Any] | None = None
         self.finished = False
         self.result: dict[str, Any] | None = None
-        self.error: Exception | None = None
+        self.error: BaseException | None = None
 
     def progress(self, event: dict[str, Any]) -> None:
         with self.condition:
@@ -48,7 +48,7 @@ class ArchiveImport:
         try:
             self.result = operation(self.progress)
             return self.result
-        except Exception as error:
+        except BaseException as error:
             self.error = error
             raise
         finally:
@@ -66,7 +66,7 @@ class ArchiveImport:
                 yield json.dumps(event, ensure_ascii=False) + "\n"
             if finished:
                 break
-        if self.error:
+        if self.error is not None or self.result is None:
             event = {"type": "error", "error": str(self.error) if isinstance(self.error, ArchiveError) else "Archive import failed."}
         else:
             event = {"type": "result", "result": {"import": self.result}}

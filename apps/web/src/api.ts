@@ -46,6 +46,12 @@ export interface HealthResponse {
   plugins: string[];
 }
 
+export class HttpError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
 export async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     ...init,
@@ -53,7 +59,7 @@ export async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> 
   });
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(errorMessageFromResponse(text, response.status));
+    throw new HttpError(response.status, errorMessageFromResponse(text, response.status));
   }
   return (await response.json()) as T;
 }

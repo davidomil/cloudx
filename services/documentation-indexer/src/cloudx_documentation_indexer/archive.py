@@ -13,6 +13,7 @@ import shutil
 import socket
 import sqlite3
 import stat
+import struct
 import subprocess
 import tempfile
 import threading
@@ -78,6 +79,7 @@ TURBOVEC_BIT_WIDTH = 4
 TURBOVEC_DISTRIBUTION = "turbovec"
 TURBOVEC_VERSION = version(TURBOVEC_DISTRIBUTION)
 TURBOVEC_INDEX_FORMAT = "tvim"
+TURBOVEC_INDEX_HEADER = struct.Struct("<4sBBII")
 DENSE_ONLY_MIN_SCORE = 0.2
 LEXICAL_RELEVANCE_WEIGHT = 0.02
 STRICT_TERM_MATCH_BONUS = 4.0
@@ -2016,11 +2018,8 @@ class DocumentationArchive:
             }
             if any(manifest.get(key) != value for key, value in expected.items()):
                 raise ArchiveError("Archive import dense index does not match its catalog or runtime profile.")
+            self._validate_import_index_layout(index_path, active_chunk_count)
             index = IdMapIndex.load(str(index_path))
-            if index.dim != EMBEDDING_DIM or index.bit_width != TURBOVEC_BIT_WIDTH:
-                raise ArchiveError("Archive import dense index has an unsupported vector format.")
-            if len(index) != active_chunk_count:
-                raise ArchiveError("Archive import dense index count does not match its catalog.")
             with sqlite3.connect(archive_root / "catalog.sqlite") as db:
                 for (chunk_id,) in db.execute("SELECT chunk_id FROM chunks WHERE state = ?", (ACTIVE_STATE,)):
                     if not index.contains(chunk_id):
@@ -2038,6 +2037,34 @@ class DocumentationArchive:
             )
         except (OSError, ValueError, RuntimeError, sqlite3.DatabaseError) as error:
             raise ArchiveError(f"Archive import dense index validation failed: {error}") from error
+
+    def _validate_import_index_layout(self, index_path: Path, active_chunk_count: int) -> None:
+        # Turbovec 0.7.0 writes TVIM v3. Its loader allocates from untrusted
+        # lengths and can panic before exposing the dimension or vector count.
+        with index_path.open("rb") as index_file:
+            header = index_file.read(TURBOVEC_INDEX_HEADER.size)
+            if len(header) != TURBOVEC_INDEX_HEADER.size:
+                raise ArchiveError("Archive import dense index header is truncated.")
+            magic, format_version, bit_width, dimension, vector_count = TURBOVEC_INDEX_HEADER.unpack(header)
+            if magic != b"TVIM" or format_version != 3:
+                raise ArchiveError("Archive import dense index must use TVIM format version 3.")
+            if dimension != EMBEDDING_DIM or bit_width != TURBOVEC_BIT_WIDTH:
+                raise ArchiveError("Archive import dense index has an unsupported vector format.")
+            if vector_count != active_chunk_count:
+                raise ArchiveError("Archive import dense index count does not match its catalog.")
+
+            packed_bytes = dimension // 8 * bit_width * vector_count
+            calibration_offset = TURBOVEC_INDEX_HEADER.size + packed_bytes + 4 * vector_count
+            file_size = os.fstat(index_file.fileno()).st_size
+            if file_size < calibration_offset + 4:
+                raise ArchiveError("Archive import dense index payload is truncated.")
+            index_file.seek(calibration_offset)
+            calibration_count = int.from_bytes(index_file.read(4), "little")
+            if calibration_count not in (0, dimension):
+                raise ArchiveError("Archive import dense index calibration count is invalid.")
+            expected_size = calibration_offset + 4 + 8 * calibration_count + 8 * vector_count
+            if file_size != expected_size:
+                raise ArchiveError("Archive import dense index length does not match its header.")
 
     def _install_replacement_archive(self, install_root: Path) -> Path:
         backup_path = self._next_backup_path()

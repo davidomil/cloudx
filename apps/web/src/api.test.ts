@@ -325,9 +325,9 @@ describe("api client", () => {
     expect(documentationArchiveDownloadUrl(job.id)).toBe("/api/documentation/archive/exports/export%2Fjob/download");
   });
 
-  it("reports expired export jobs without downloading an error response", async () => {
+  it("preserves the HTTP status and message for expired export jobs", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ error: "Archive export expired." }), { status: 404 })));
-    await expect(getDocumentationArchiveExport("expired")).rejects.toThrow("Archive export expired.");
+    await expect(getDocumentationArchiveExport("expired")).rejects.toMatchObject({ status: 404, message: "Archive export expired." });
   });
 
   it("parses utf-8 and plain content disposition filenames", () => {

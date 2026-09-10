@@ -220,19 +220,30 @@ def test_import_uploads_run_off_event_loop_and_clean_the_spool(tmp_path: Path, m
     assert uploaded and all(not path.exists() for path in uploaded)
 
 
-def test_import_stream_reports_errors_and_cleans_uploaded_package(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("error_type", [ArchiveError, RuntimeError, BaseException])
+def test_import_stream_reports_errors_and_cleans_uploaded_package(tmp_path: Path, monkeypatch, error_type):
     app = create_app(tmp_path / "archive")
     uploaded = []
 
     def import_package(package_path, *, progress):
         uploaded.append(package_path)
-        raise ArchiveError("Archive checksum does not match.")
+        raise error_type("Archive checksum does not match.")
 
     monkeypatch.setattr(app.state.archive, "import_archive_merge", import_package)
     with TestClient(app) as client:
         response = client.post("/archive/import/merge", files={"file": ("archive.zip", b"package")}, headers={"accept": "application/x-ndjson"})
-    assert response.json() == {"type": "error", "error": "Archive checksum does not match."}
+    expected_error = "Archive checksum does not match." if error_type is ArchiveError else "Archive import failed."
+    assert response.json() == {"type": "error", "error": expected_error}
     assert uploaded and not uploaded[0].exists()
+
+
+def test_import_stream_does_not_report_success_without_a_result():
+    imports = ArchiveImports()
+    try:
+        transfer = imports.start(lambda progress: None)
+        assert list(transfer.events()) == [json.dumps({"type": "error", "error": "Archive import failed."}) + "\n"]
+    finally:
+        imports.close()
 
 
 def test_import_keeps_working_when_listener_leaves_and_shutdown_waits_for_cleanup():

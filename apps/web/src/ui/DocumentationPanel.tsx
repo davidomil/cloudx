@@ -5,7 +5,7 @@ import { AlertTriangle, Bot, BookOpen, Download, ExternalLink, FileImage, FilePl
 import type { UiContributionRenderContext } from "./uiContributions.js";
 import { ControlButton } from "./Control.js";
 import { PluginPanelDock } from "./PluginPanelDock.js";
-import { documentationArchiveDownloadUrl, getDocumentationArchiveExport, startDocumentationArchiveExport, importDocumentationArchive, uploadDocumentationFile, type DocumentationArchiveExport, type DocumentationUploadProgress, type DocumentationUploadResponse } from "../api.js";
+import { HttpError, documentationArchiveDownloadUrl, getDocumentationArchiveExport, startDocumentationArchiveExport, importDocumentationArchive, uploadDocumentationFile, type DocumentationArchiveExport, type DocumentationUploadProgress, type DocumentationUploadResponse } from "../api.js";
 import { documentationIngestController } from "./documentationPanelQueue.js";
 
 interface DocumentationPanelProps {
@@ -402,7 +402,13 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
         setArchiveExport(job);
         if (job.status === "running") timer = window.setTimeout(() => void poll(), 1_000);
       } catch (error) {
-        if (active && !ingestController.disposed) setArchiveExportError(error instanceof Error ? error.message : String(error));
+        if (!active || ingestController.disposed) return;
+        const message = error instanceof Error ? error.message : String(error);
+        if (error instanceof HttpError && error.status === 404) {
+          setArchiveExport({ ...archiveExport!, status: "failed", error: message });
+        } else {
+          setArchiveExportError(message);
+        }
       }
     }
     void poll();

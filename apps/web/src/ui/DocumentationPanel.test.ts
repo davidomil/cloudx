@@ -5,7 +5,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { DocumentationPanel, type DocumentationPanelState, type DocumentationPanelStateUpdater } from "./DocumentationPanel.js";
+import { createInitialDocumentationPanelState, DocumentationPanel, type DocumentationPanelState, type DocumentationPanelStateUpdater } from "./DocumentationPanel.js";
 import { disposeDocumentationIngestController, disposeDocumentationIngestControllersExcept } from "./documentationPanelQueue.js";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -770,6 +770,85 @@ describe("DocumentationPanel", () => {
     expect(container.querySelector('a[download="archive.zip"]')).not.toBeNull();
     expect(startArchiveExport).toHaveBeenCalledOnce();
     expect(getArchiveExport).toHaveBeenCalledTimes(2);
+    await unmount(root);
+  });
+
+  it.each(["", "Export status unavailable."])("allows importing when a restored export is missing, with saved polling error %j", async (archiveExportError) => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const statusResponse = deferred<Response>();
+    const fetchMock = vi.fn(() => statusResponse.promise);
+    vi.stubGlobal("fetch", fetchMock);
+    const archiveFile = new File(["zip"], "archive.zip", { type: "application/zip" });
+    const importArchive = vi.fn(async () => ({ import: { mode: "merge" } }));
+    const startArchiveExport = vi.fn();
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>() => ({} as T);
+    let panelState: DocumentationPanelState = {
+      ...createInitialDocumentationPanelState(),
+      archiveExport: { id: "expired-export", status: "running", stage: "Packaging archive.", progress: 40 },
+      archiveExportError
+    };
+    const applyState = (updater: DocumentationPanelStateUpdater) => {
+      panelState = updater(panelState);
+      root.render(panelElement());
+    };
+    const panelElement = () => createElement(DocumentationPanel, { callHook, startArchiveExport, importArchive, state: panelState, onStateChange: applyState });
+    await act(async () => root.render(panelElement()));
+    await act(async () => setFileValue(inputByLabel(container, "Archive ZIP"), archiveFile));
+    expect(buttonByText(container, "Import").disabled).toBe(true);
+    if (archiveExportError) await click(buttonByText(container, "Check export status"));
+
+    const error = "Archive export was not found or has expired. Prepare a new export.";
+    await act(async () => statusResponse.resolve(new Response(JSON.stringify({ error }), { status: 404 })));
+
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith("/api/documentation/archive/exports/expired-export", expect.any(Object));
+    expect(panelState.archiveExport).toMatchObject({ id: "expired-export", status: "failed", error });
+    expect(container.textContent).toContain(error);
+    expect(container.textContent).not.toContain("Check export status");
+    expect(container.querySelector('progress[aria-label="Archive export progress"]')).toBeNull();
+    expect(buttonByText(container, "Import").disabled).toBe(false);
+    await click(buttonByText(container, "Import"));
+    expect(importArchive).toHaveBeenCalledWith(expect.objectContaining({ file: archiveFile, mode: "merge" }));
+    expect(container.textContent).toContain("Archive merge import complete.");
+    expect(startArchiveExport).not.toHaveBeenCalled();
+    await unmount(root);
+  });
+
+  it.each(["HTTP 503", "network"])("keeps a restored export checkable after a transient %s failure", async (failure) => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const error = "Export status unavailable.";
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(async () => {
+        if (failure === "network") throw new TypeError(error);
+        return new Response(JSON.stringify({ error }), { status: 503 });
+      })
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: "restored-export", status: "complete", stage: "Archive ready.", filename: "archive.zip", progress: 100 })));
+    vi.stubGlobal("fetch", fetchMock);
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>() => ({} as T);
+    let panelState: DocumentationPanelState = {
+      ...createInitialDocumentationPanelState(),
+      archiveExport: { id: "restored-export", status: "running", stage: "Packaging archive.", progress: 40 },
+      archiveImportValue: new File(["zip"], "archive.zip", { type: "application/zip" })
+    };
+    const applyState = (updater: DocumentationPanelStateUpdater) => {
+      panelState = updater(panelState);
+      root.render(panelElement());
+    };
+    const panelElement = () => createElement(DocumentationPanel, { callHook, state: panelState, onStateChange: applyState });
+    await act(async () => root.render(panelElement()));
+
+    expect(panelState.archiveExport?.status).toBe("running");
+    expect(container.textContent).toContain(error);
+    expect(buttonByText(container, "Import").disabled).toBe(true);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    await click(buttonByText(container, "Check export status"));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(panelState.archiveExport?.status).toBe("complete");
+    expect(container.querySelector('a[download="archive.zip"]')).not.toBeNull();
+    expect(buttonByText(container, "Import").disabled).toBe(false);
     await unmount(root);
   });
 
