@@ -116,7 +116,7 @@ test.beforeEach(async () => {
     .toBe(true);
 });
 
-test.afterEach(async () => {
+test.afterEach(async ({}, testInfo) => {
   if (server && server.exitCode === null) {
     const exited = new Promise<void>((resolve) =>
       server.once("exit", () => resolve()),
@@ -129,6 +129,12 @@ test.afterEach(async () => {
       clearTimeout(forceStop);
     }
   }
+  const logPath = testInfo.outputPath("server.log");
+  await fs.writeFile(logPath, serverLogs);
+  await testInfo.attach("server.log", {
+    path: logPath,
+    contentType: "text/plain",
+  });
   if (testRoot) await fs.rm(testRoot, { recursive: true, force: true });
 });
 
