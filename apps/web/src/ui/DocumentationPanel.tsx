@@ -370,6 +370,9 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   const [documentListBusy, setDocumentListBusy] = useState(false);
   const [documentListScrollTop, setDocumentListScrollTop] = useState(0);
   const [documentListWindow, setDocumentListWindow] = useState<DocumentationWindow>({ offset: 0, limit: 0, total: 0, hasMore: false });
+  const [reprocessing, setReprocessing] = useState<{ documentId: string; label: string }>();
+  const reprocessingRef = useRef(false);
+  const mountedRef = useRef(true);
   const sourceViewerRef = useRef<HTMLElement | null>(null);
   const sourceChunkListRef = useRef<HTMLDivElement | null>(null);
   const sourceAutoLoadSentinelRef = useRef<HTMLDivElement | null>(null);
@@ -389,6 +392,8 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
 
   useEffect(() => {
     void refresh();
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
   }, []);
 
   useEffect(() => {
@@ -448,7 +453,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   useEffect(() => {
     const target = sourceAutoLoadSentinelRef.current;
     const root = sourceChunkListRef.current;
-    if (!target || !root || !selectedDocument || !sourceNeedsAutoLoad(selectedDocument) || documentBusy || !canCall || typeof window.IntersectionObserver !== "function") {
+    if (!target || !root || !selectedDocument || !sourceNeedsAutoLoad(selectedDocument) || documentBusy || reprocessing || !canCall || typeof window.IntersectionObserver !== "function") {
       return undefined;
     }
     const observer = new window.IntersectionObserver((entries) => {
@@ -458,7 +463,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
     }, { root, rootMargin: "120px 0px" });
     observer.observe(target);
     return () => observer.disconnect();
-  }, [selectedDocument, documentBusy, canCall]);
+  }, [selectedDocument, documentBusy, reprocessing, canCall]);
 
   async function call<T extends Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}): Promise<T> {
     if (!callHook) {
@@ -766,6 +771,48 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
     });
   }
 
+  async function reprocessDocument(operation: "reanalyze" | "reenrich") {
+    if (!selectedDocument || reprocessingRef.current || !canCall) {
+      return;
+    }
+    const targetDocumentId = documentId(selectedDocument);
+    const label = selectedDocument.title ?? targetDocumentId;
+    reprocessingRef.current = true;
+    setReprocessing({ documentId: targetDocumentId, label });
+    setStatus("");
+    try {
+      const response = await call<DocumentationIngestResponse>(`documentation.documents.${operation}`, { documentId: targetDocumentId });
+      if (!mountedRef.current) {
+        return;
+      }
+      const result = await call<{ document?: DocumentationDetail }>("documentation.documents.get", sourceDocumentWindowInput(targetDocumentId));
+      if (!mountedRef.current) {
+        return;
+      }
+      setSelectedDocument((current) => current && documentId(current) === targetDocumentId ? result.document : current);
+      setResults((current) => current.filter((result) => result.documentId !== targetDocumentId));
+      setAnswer(undefined);
+      await loadArchiveSummary();
+      if (documentListLoaded) {
+        await loadDocumentPage("replace");
+      }
+      await loadIngestQueue();
+      if (mountedRef.current) {
+        const notice = documentationEnrichmentNotice(response)?.notice;
+        setStatus(`${label}: ${operation === "reanalyze" ? "Reanalysis" : "Re-enrichment"} complete.${notice ? ` ${notice}` : ""}`);
+      }
+    } catch (error) {
+      if (mountedRef.current) {
+        setStatus(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      reprocessingRef.current = false;
+      if (mountedRef.current) {
+        setReprocessing(undefined);
+      }
+    }
+  }
+
   async function remove(targetDocumentId: string) {
     await run(async () => {
       await call("documentation.remove", { documentId: targetDocumentId });
@@ -866,7 +913,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   async function loadNextSourceWindow() {
     const current = selectedDocument;
     const id = current ? documentId(current) : "";
-    if (!current || !id || sourceAutoLoadInFlightRef.current) {
+    if (!current || !id || sourceAutoLoadInFlightRef.current || reprocessingRef.current) {
       return;
     }
     const currentChunks = current.chunks ?? [];
@@ -934,6 +981,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   const activeArchiveImport = archiveImportProgress?.status === "processing"
     ? serverIngestJobs.find((job) => job.label === archiveImportProgress.filename && job.detail === `${archiveImportProgress.mode} documentation archive` && (job.status === "running" || job.status === "queued"))
     : undefined;
+  const canReprocessSelectedDocument = canCall && Boolean(selectedDocumentId) && selectedDocument?.state === "active" && !busy && !documentBusy && !reprocessing;
 
   return (
     <div className="documentation-panel">
@@ -969,6 +1017,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
       </header>
 
       {status ? <div className="documentation-notice" role="alert">{status}</div> : null}
+      {reprocessing ? <p role="status">Processing {reprocessing.label}. Progress is available in the import queue.</p> : null}
 
       <form className="documentation-search" onSubmit={(event) => void search(event)}>
         <label>
@@ -1001,7 +1050,13 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
               {selectedDocument.artifacts?.length || selectedDocument.artifactWindow?.total ? <p>{sourceWindowLabel(selectedDocument.artifacts?.length ?? 0, selectedDocument.artifactWindow, "extracted artifacts")} available.</p> : null}
             </div>
             <div className="documentation-source-actions">
-              <ControlButton size="compact" tone="danger" disabled={busy || !selectedDocumentId} onClick={() => void remove(selectedDocumentId)} title="Remove document">
+              <ControlButton size="compact" disabled={!canReprocessSelectedDocument} onClick={() => void reprocessDocument("reanalyze")} title="Rerun extraction from the archived source, then AI enrichment when enabled">
+                <RefreshCw size={13} /> {aiAssistanceEnabled ? "Reanalyze and enrich" : "Reanalyze"}
+              </ControlButton>
+              <ControlButton size="compact" disabled={!canReprocessSelectedDocument || !aiAssistanceEnabled} onClick={() => void reprocessDocument("reenrich")} title={aiAssistanceEnabled ? "Rerun AI enrichment using the archived chunks and artifacts" : "Enable AI assistance to re-enrich documents"}>
+                <Bot size={13} /> Re-enrich
+              </ControlButton>
+              <ControlButton size="compact" tone="danger" disabled={busy || !selectedDocumentId || reprocessing?.documentId === selectedDocumentId} onClick={() => void remove(selectedDocumentId)} title="Remove document">
                 <Trash2 size={13} /> Remove
               </ControlButton>
               <ControlButton size="compact" onClick={() => setSelectedDocument(undefined)}>Close</ControlButton>

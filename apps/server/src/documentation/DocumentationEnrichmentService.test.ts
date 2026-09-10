@@ -189,6 +189,204 @@ describe("DocumentationEnrichmentService", () => {
     expect(runner.run).toHaveBeenCalledWith(expect.stringContaining("documentation-enrich-visuals"), { model: DEFAULT_DOCUMENTATION_IMAGE_ANALYSIS_MODEL });
   });
 
+  it.each(["written", "failed", "skipped"])("re-enriches from source evidence and preserves prior AI spans unless replacement is written (%s)", async (status) => {
+    const priorSpan = { chunk_id: 11, locator: "ai:metadata", text: "PRIOR-AI-SPAN must not be evidence.", chunk_origin: "ai" };
+    const sourceSpan = { chunk_id: 12, locator: "page 1", text: "SOURCE-EVIDENCE reset is active low.", chunk_origin: "source" };
+    const client = fakeDocumentationClient({ chunks: [priorSpan, sourceSpan] });
+    const runner = fakeRunner({
+      summary: "Updated metadata.",
+      spans: status === "skipped" ? [] : [{ locator: "ai:metadata", text: "Reset is active low." }],
+      metadata: [], warnings: []
+    });
+    if (status === "failed") {
+      runner.run.mockRejectedValueOnce(new Error("Model failed."));
+    }
+    const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner });
+
+    const response = await service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] });
+
+    expect(response.enrichment).toMatchObject({ results: [{ documentId: "doc-1", status }] });
+    expect(runner.run.mock.calls[0]?.[0]).toContain("SOURCE-EVIDENCE");
+    expect(runner.run.mock.calls[0]?.[0]).not.toContain("PRIOR-AI-SPAN");
+    if (status === "written") {
+      expect(client.enrichDocument).toHaveBeenCalledOnce();
+      expect(client.enrichDocument).toHaveBeenCalledWith(expect.objectContaining({ documentId: "doc-1", spans: [{ locator: "ai:metadata", text: "Reset is active low." }] }));
+    } else {
+      expect(client.enrichDocument).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each(["wav", "mp4"])("re-enriches archived %s files using a fresh transcript and video keyframes", async (extension) => {
+    const fixture = await archivedMediaFixture(`recording.${extension}`);
+    const transcribeFile = vi.fn(async () => ({ text: "ARCHIVED-TRANSCRIPT reset is active low." }));
+    const output = { summary: "Updated media metadata.", spans: [{ locator: "ai:media", text: "Reset is active low." }], metadata: [], warnings: [] };
+    const runner = fakeRunner(output);
+    let capturedFrame = "";
+    const mediaProcessLauncher = vi.fn((_command, args: readonly string[], _options) => {
+      const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn() });
+      capturedFrame = args.at(-1)!.replace("%04d", "0001");
+      void fs.writeFile(capturedFrame, "frame").then(() => {
+        child.stderr.write("pts_time:0\n");
+        child.emit("close", 0);
+      });
+      return child as unknown as ChildProcessWithoutNullStreams;
+    });
+    const service = new DocumentationEnrichmentService({
+      client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner,
+      asr: { transcribeFile } as never, mediaProcessLauncher,
+    });
+    const controller = new AbortController();
+    try {
+      const result = await service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] }, {}, { signal: controller.signal });
+
+      expect(result.enrichment).toMatchObject({ results: [{ status: "written" }] });
+      expect(transcribeFile).toHaveBeenCalledWith(fixture.mediaPath, `recording.${extension}`, { signal: controller.signal });
+      expect(runner.run.mock.calls[0]?.[0]).toContain("ARCHIVED-TRANSCRIPT");
+      expect(runner.run.mock.calls[0]?.[0]).not.toContain("BINARY-CHUNK");
+      expect(runner.run.mock.calls[0]?.[0]).not.toContain("PRIOR-AI-SPAN");
+      expect(fixture.client.enrichDocument).toHaveBeenCalledOnce();
+      if (extension === "mp4") {
+        expect(mediaProcessLauncher).toHaveBeenCalledWith("ffmpeg", expect.arrayContaining(["-i", fixture.mediaPath]), expect.anything());
+        expect(runner.run).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ imagePaths: [capturedFrame] }));
+        await expect(fs.stat(capturedFrame)).rejects.toMatchObject({ code: "ENOENT" });
+      } else {
+        expect(mediaProcessLauncher).not.toHaveBeenCalled();
+      }
+      await expect(fs.readFile(fixture.mediaPath, "utf8")).resolves.toBe("archived media bytes");
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["media", "text"])("recognizes extensionless archived audio from retained MIME metadata with source type %s", async (sourceType) => {
+    const fixture = await archivedMediaFixture("recording", sourceType);
+    await fs.writeFile(path.join(path.dirname(fixture.mediaPath), "metadata.json"), JSON.stringify({ contentType: "audio/wav" }));
+    const transcribeFile = vi.fn(async () => ({ text: "EXTENSIONLESS-TRANSCRIPT provides source evidence." }));
+    const runner = fakeRunner({ summary: "", spans: [{ locator: "ai:media", text: "Source evidence." }], metadata: [], warnings: [] });
+    const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never });
+    try {
+      const response = await service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] });
+
+      expect(response.enrichment).toMatchObject({ results: [{ status: "written" }] });
+      expect(transcribeFile).toHaveBeenCalledWith(fixture.mediaPath, "recording");
+      expect(runner.run.mock.calls[0]?.[0]).toContain("EXTENSIONLESS-TRANSCRIPT");
+      expect(runner.run.mock.calls[0]?.[0]).not.toContain("BINARY-CHUNK");
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["missing", "symlink"])("preserves prior spans when extensionless media metadata is %s", async (metadataState) => {
+    const fixture = await archivedMediaFixture("recording");
+    if (metadataState === "symlink") {
+      const outside = path.join(fixture.root, "outside.json");
+      await fs.writeFile(outside, JSON.stringify({ contentType: "audio/wav" }));
+      await fs.symlink(outside, path.join(path.dirname(fixture.mediaPath), "metadata.json"));
+    }
+    const runner = fakeRunner();
+    const transcribeFile = vi.fn();
+    const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never });
+    try {
+      const response = await service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] });
+
+      expect(response.enrichment).toMatchObject({ results: [{ status: "failed", error: expect.stringMatching(/metadata is missing|metadata must be a regular file/u) }] });
+      expect(transcribeFile).not.toHaveBeenCalled();
+      expect(runner.run).not.toHaveBeenCalled();
+      expect(fixture.client.enrichDocument).not.toHaveBeenCalled();
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("retains extensionless text source evidence when its metadata has a text MIME type", async () => {
+    const fixture = await archivedMediaFixture("notes", "text");
+    await fs.writeFile(path.join(path.dirname(fixture.mediaPath), "metadata.json"), JSON.stringify({ contentType: "text/plain" }));
+    const runner = fakeRunner();
+    const transcribeFile = vi.fn();
+    const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never });
+    try {
+      await service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] });
+
+      expect(runner.run.mock.calls[0]?.[0]).toContain("BINARY-CHUNK");
+      expect(transcribeFile).not.toHaveBeenCalled();
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["missing snapshot", "unavailable ASR", "failed ASR", "empty transcript"])("preserves prior AI spans when archived media has %s", async (failure) => {
+    const fixture = await archivedMediaFixture();
+    const runner = fakeRunner();
+    const transcribeFile = vi.fn(async () => ({ text: failure === "empty transcript" ? "" : "transcript" }));
+    if (failure === "failed ASR") {
+      transcribeFile.mockRejectedValueOnce(new Error("ASR failed."));
+    }
+    if (failure === "missing snapshot") {
+      await fs.rm(fixture.mediaPath);
+    }
+    const service = new DocumentationEnrichmentService({
+      client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner,
+      asr: failure === "unavailable ASR" ? undefined : { transcribeFile } as never,
+    });
+    try {
+      const response = await service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] });
+
+      expect(response.enrichment).toMatchObject({ results: [{ status: "failed", error: expect.stringMatching(/ENOENT|requires the ASR service|ASR failed|no transcript or keyframe evidence/u) }] });
+      expect(runner.run).not.toHaveBeenCalled();
+      expect(fixture.client.enrichDocument).not.toHaveBeenCalled();
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["path escape", "parent symlink escape", "file symlink", "directory"])("rejects an archived media %s before reading media or replacing AI spans", async (invalidSource) => {
+    const fixture = await archivedMediaFixture();
+    const outsidePath = path.join(fixture.root, "outside.wav");
+    await fs.writeFile(outsidePath, "outside archive");
+    let snapshotPath = "snapshots/abc/recording.wav";
+    if (invalidSource === "path escape") {
+      snapshotPath = "../outside.wav";
+    } else if (invalidSource === "parent symlink escape") {
+      await fs.symlink(fixture.root, path.join(fixture.archiveRoot, "escaped"));
+      snapshotPath = "escaped/outside.wav";
+    } else {
+      await fs.rm(fixture.mediaPath);
+      if (invalidSource === "file symlink") {
+        const target = path.join(fixture.archiveRoot, "target.wav");
+        await fs.writeFile(target, "inside archive");
+        await fs.symlink(target, fixture.mediaPath);
+      } else {
+        await fs.mkdir(fixture.mediaPath);
+      }
+    }
+    const client = fakeDocumentationClient({ snapshot_path: snapshotPath }, { archiveRoot: fixture.archiveRoot });
+    const runner = fakeRunner();
+    const transcribeFile = vi.fn();
+    const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never });
+    try {
+      const response = await service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] });
+
+      expect(response.enrichment).toMatchObject({ results: [{ status: "failed", error: expect.stringMatching(/escapes the documentation archive root|must be a regular file/u) }] });
+      expect(transcribeFile).not.toHaveBeenCalled();
+      expect(runner.run).not.toHaveBeenCalled();
+      expect(client.enrichDocument).not.toHaveBeenCalled();
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["media.txt", "youtube.json"])("keeps archived %s source evidence without attempting binary media transcription", async (filename) => {
+    const runner = fakeRunner();
+    const client = fakeDocumentationClient({ source_type: "media", snapshot_path: `snapshots/abc/${filename}` });
+    const transcribeFile = vi.fn();
+    const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never });
+
+    await service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] });
+
+    expect(runner.run.mock.calls[0]?.[0]).toContain("The source text mentions reset timing tables.");
+    expect(transcribeFile).not.toHaveBeenCalled();
+  });
+
   it("pages enrichment document detail requests without dropping later source chunks", async () => {
     const runner = fakeRunner({
       summary: "paged",
@@ -1022,6 +1220,23 @@ function fakeAsr(text: string): AsrClient & { transcribe: ReturnType<typeof vi.f
       language_probability: 0.99
     }))
   } as unknown as AsrClient & { transcribe: ReturnType<typeof vi.fn> };
+}
+
+async function archivedMediaFixture(filename = "recording.wav", sourceType = "media") {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-archived-media-"));
+  const archiveRoot = path.join(root, "archive");
+  const snapshotPath = `snapshots/abc/${filename}`;
+  const mediaPath = path.join(archiveRoot, snapshotPath);
+  await fs.mkdir(path.dirname(mediaPath), { recursive: true });
+  await fs.writeFile(mediaPath, "archived media bytes");
+  const client = fakeDocumentationClient({
+    source_type: sourceType, snapshot_path: snapshotPath,
+    chunks: [
+      { chunk_id: 11, locator: "source", chunk_origin: "source", text: "BINARY-CHUNK is not transcript evidence." },
+      { chunk_id: 12, locator: "ai:media", chunk_origin: "ai", text: "PRIOR-AI-SPAN retained until replacement succeeds." },
+    ],
+  }, { archiveRoot });
+  return { root, archiveRoot, mediaPath, client };
 }
 
 function fakeDocumentationClient(documentOverrides: Record<string, unknown> = {}, options: { archiveRoot?: string } = {}): DocumentationClient & {

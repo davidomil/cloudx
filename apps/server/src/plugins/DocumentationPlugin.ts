@@ -151,6 +151,12 @@ export class DocumentationPlugin implements WorkspacePlugin {
         includeEnrichments: { type: "boolean" },
         includeEvents: { type: "boolean" }
       }, ["documentId"]),
+      externalHook("documentation.documents.reanalyze", "Reanalyze Documentation", "Re-extract an active archived document and run configured AI enrichment without uploading it again.", (input, context) => this.reprocessDocument("reanalyze", input, context), {
+        documentId: { type: "string" }
+      }, ["documentId"], documentationIngestOutputSchema()),
+      externalHook("documentation.documents.reenrich", "Re-enrich Documentation", "Replace AI enrichment for an active archived document using its existing extracted source evidence.", (input, context) => this.reprocessDocument("reenrich", input, context), {
+        documentId: { type: "string" }
+      }, ["documentId"], documentationIngestOutputSchema()),
       readHook("documentation.search", "Search Documentation", "Search active local documentation and return source-grounded results.", (input) => this.client.search(input).then(searchResult), {
         query: { type: "string" },
         limit: { type: "number" },
@@ -285,6 +291,66 @@ export class DocumentationPlugin implements WorkspacePlugin {
     return this.pathPolicy.resolve(requireString(input.path, "path"), cwd ? { relativeBaseDir: this.pathPolicy.resolve(cwd) } : undefined);
   }
 
+  private reprocessDocument(kind: "reanalyze" | "reenrich", input: Record<string, unknown>, context?: HookCallContext): Promise<Record<string, unknown>> {
+    const documentId = requireString(input.documentId, "documentId");
+    return this.ingestQueue.enqueue({
+      kind,
+      label: documentId,
+      detail: documentId,
+      admissionBytes: serializedInputBytes({ documentId }),
+      queuedStage: "Waiting for prior documentation work.",
+      runningStage: "Loading the active archived document.",
+      completeStage: (result) => reprocessingCompleteStage(kind, result),
+      failedStage: kind === "reanalyze" ? "Reanalysis failed." : "AI re-enrichment failed.",
+      operation: async (job) => {
+        const response = await this.client.getDocument({
+          documentId,
+          chunkLimit: 0,
+          artifactLimit: 0,
+          includeEnrichments: false,
+          includeEvents: false
+        }, { signal: job.signal });
+        job.signal.throwIfAborted();
+        const document = response.document;
+        if (!isRecord(document) || document.state !== "active") {
+          throw new Error("Only active archived documents can be reanalyzed or re-enriched.");
+        }
+        job.update({ label: titleOrFallback(document.title, documentId) });
+        const extracted = kind === "reanalyze"
+          ? await this.reanalyzeDocument(documentId, job)
+          : { documents: [{ documentId, title: document.title, uri: document.uri }] };
+        job.signal.throwIfAborted();
+        const enriched = await this.enrichExistingDocument(extracted, kind, job);
+        job.signal.throwIfAborted();
+        return ingestResult(enriched, kind, documentId);
+      }
+    }, context?.reportProgress ? (snapshot) => context.reportProgress?.(hookProgress(snapshot)) : undefined);
+  }
+
+  private reanalyzeDocument(documentId: string, job: DocumentationIngestQueueOperationContext): Promise<Record<string, unknown>> {
+    job.update({ progress: 30, stage: "Re-extracting source evidence from the archived snapshot." });
+    return this.client.reanalyzeDocument({ documentId }, { signal: job.signal });
+  }
+
+  private async enrichExistingDocument(response: Record<string, unknown>, kind: "reanalyze" | "reenrich", job: DocumentationIngestQueueOperationContext): Promise<Record<string, unknown>> {
+    const service = this.enrichmentProvider();
+    if (!service || !service.isEnabled()) {
+      const unavailableReason = service ? "Documentation AI enrichment is disabled." : "Documentation AI enrichment is not available.";
+      if (kind === "reenrich") {
+        throw new Error(unavailableReason);
+      }
+      return skippedEnrichment(response, unavailableReason);
+    }
+    job.update({ progress: 78, stage: "Running AI enrichment from extracted source evidence." });
+    const enriched = await service.enrichIngestResponse(response, {}, { signal: job.signal });
+    const result = isRecord(enriched.enrichment) ? enriched : skippedEnrichment(enriched, "Documentation AI enrichment was disabled before it started.");
+    const failed = enrichmentResults(result).find((entry) => entry.status === "failed");
+    if (kind === "reenrich" && failed) {
+      throw new Error(stringValue(failed.error) ?? "Documentation AI re-enrichment failed.");
+    }
+    return result;
+  }
+
   private enrich(response: Record<string, unknown>, signal: AbortSignal): Promise<Record<string, unknown>> | Record<string, unknown> {
     return this.enrichmentProvider()?.enrichIngestResponse(response, {}, { signal }) ?? response;
   }
@@ -411,8 +477,8 @@ function documentationIngestOutputSchema(): Record<string, unknown> {
       firstDocumentId: { type: "string", description: "Document ID from the first ingested record." },
       firstTitle: { type: "string", description: "Title from the first ingested record." },
       firstUri: { type: "string", description: "Source URI from the first ingested record." },
-      kind: { type: "string", description: "Documentation ingest kind: path, url, or text." },
-      source: { type: "string", description: "Path, URL, or URI used as the ingest source." }
+      kind: { type: "string", description: "Documentation operation: path, url, text, reanalyze, or reenrich." },
+      source: { type: "string", description: "Path, URL, URI, or archived document ID used as the source." }
     },
     required: ["documents", "documentCount", "kind", "source"],
     additionalProperties: true
@@ -468,7 +534,7 @@ function queueResult(response: Record<string, unknown>): Record<string, unknown>
   };
 }
 
-function ingestResult(response: Record<string, unknown>, kind: "path" | "url" | "text", source: string): Record<string, unknown> {
+function ingestResult(response: Record<string, unknown>, kind: "path" | "url" | "text" | "reanalyze" | "reenrich", source: string): Record<string, unknown> {
   const documents = documentsFromResponse(response);
   const first = documents[0];
   return compactRecord({
@@ -481,6 +547,32 @@ function ingestResult(response: Record<string, unknown>, kind: "path" | "url" | 
     kind,
     source
   });
+}
+
+function enrichmentResults(response: Record<string, unknown>): Record<string, unknown>[] {
+  return isRecord(response.enrichment) ? recordsArray(response.enrichment.results) : [];
+}
+
+function skippedEnrichment(response: Record<string, unknown>, reason: string): Record<string, unknown> {
+  return {
+    ...response,
+    enrichment: {
+      enabled: false,
+      results: documentsFromResponse(response).map((document) => ({ documentId: document.documentId, status: "skipped", reason }))
+    }
+  };
+}
+
+function reprocessingCompleteStage(kind: "reanalyze" | "reenrich", response: Record<string, unknown>): string {
+  const results = enrichmentResults(response);
+  const prefix = kind === "reanalyze" ? "Reanalysis complete; " : "";
+  if (results.some((result) => result.status === "failed")) {
+    return `${prefix}AI enrichment failed.`;
+  }
+  const skipped = results.find((result) => result.status === "skipped");
+  return skipped
+    ? `${prefix}AI enrichment skipped: ${stringValue(skipped.reason) ?? "No new enrichment spans."}`
+    : `${prefix}AI enrichment complete.`;
 }
 
 function archiveImportResult(response: Record<string, unknown>, fallbackMode: "merge" | "replace", archivePath: string): Record<string, unknown> {

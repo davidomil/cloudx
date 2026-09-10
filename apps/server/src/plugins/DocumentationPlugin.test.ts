@@ -10,6 +10,7 @@ import { ConfigService } from "../configService.js";
 import { DOCUMENTATION_AI_USE_VOICE_MODEL } from "../aiModelOptions.js";
 import type { DocumentationClient } from "../documentation/DocumentationClient.js";
 import { DocumentationIngestQueue } from "../documentation/DocumentationIngestQueue.js";
+import { HookRegistry } from "../hooks/HookRegistry.js";
 import { PathPolicy } from "../pathPolicy.js";
 import { DocumentationPlugin } from "./DocumentationPlugin.js";
 
@@ -105,6 +106,13 @@ describe("DocumentationPlugin", () => {
       exposures: ["plugin", "ui", "http"],
       automationSafety: "read"
     });
+    for (const operation of ["reanalyze", "reenrich"]) {
+      expect(plugin.hooks.find((hook) => hook.id === `documentation.documents.${operation}`)).toMatchObject({
+        automationSafety: "external",
+        exposures: ["ui", "http", "automation"],
+        inputSchema: { required: ["documentId"], additionalProperties: false, properties: { documentId: { type: "string" } } }
+      });
+    }
     expect(plugin.hooks.find((hook) => hook.id === "documentation.ingest.url")).toMatchObject({
       exposures: ["ui", "http", "automation"],
       automationSafety: "external",
@@ -297,6 +305,215 @@ describe("DocumentationPlugin", () => {
     ]));
   });
 
+  it("reanalyzes the archived source before running configured enrichment and reports progress", async () => {
+    const queue = new DocumentationIngestQueue();
+    const client = fakeClient();
+    const extraction = deferred<Record<string, unknown>>();
+    vi.mocked(client.reanalyzeDocument).mockReturnValueOnce(extraction.promise);
+    const enrichIngestResponse = vi.fn(async (response: Record<string, unknown>) => ({
+      ...response, enrichment: { enabled: true, results: [{ documentId: "doc", status: "written" }] }
+    }));
+    const plugin = new DocumentationPlugin(client, new PathPolicy(["/tmp"]), queue, () => ({ isEnabled: () => true, enrichIngestResponse }) as never);
+    const hook = plugin.hooks.find((candidate) => candidate.id === "documentation.documents.reanalyze")!;
+    const progress: HookProgressEvent[] = [];
+
+    const run = hook.execute({ documentId: "doc" }, { caller: { kind: "ui" }, reportProgress: (event) => progress.push(event) });
+    await vi.waitFor(() => expect(client.reanalyzeDocument).toHaveBeenCalled());
+
+    expect(client.getDocument).toHaveBeenCalledWith({ documentId: "doc", chunkLimit: 0, artifactLimit: 0, includeEnrichments: false, includeEvents: false }, { signal: expect.any(AbortSignal) });
+    expect(queue.list().jobs[0]).toMatchObject({ kind: "reanalyze", label: "Archived guide", status: "running", stage: "Re-extracting source evidence from the archived snapshot." });
+    expect(enrichIngestResponse).not.toHaveBeenCalled();
+    extraction.resolve({ documents: [{ documentId: "doc", title: "Archived guide" }] });
+
+    await expect(run).resolves.toMatchObject({ kind: "reanalyze", firstDocumentId: "doc", enrichment: { results: [{ status: "written" }] } });
+    const signal = vi.mocked(client.reanalyzeDocument).mock.calls[0]?.[1]?.signal;
+    expect(enrichIngestResponse).toHaveBeenCalledWith({ documents: [{ documentId: "doc", title: "Archived guide" }] }, {}, { signal });
+    expect(progress).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: "queued" }),
+      expect.objectContaining({ status: "running", stage: "Running AI enrichment from extracted source evidence." }),
+      expect.objectContaining({ status: "complete", stage: "Reanalysis complete; AI enrichment complete." })
+    ]));
+  });
+
+  it("re-enriches existing extracted evidence without running source extraction", async () => {
+    const client = fakeClient();
+    const enrichIngestResponse = vi.fn(async (response: Record<string, unknown>) => ({
+      ...response, enrichment: { enabled: true, results: [{ documentId: "doc", status: "written" }] }
+    }));
+    const queue = new DocumentationIngestQueue();
+    const plugin = new DocumentationPlugin(client, new PathPolicy(["/tmp"]), queue, () => ({ isEnabled: () => true, enrichIngestResponse }) as never);
+
+    const result = await plugin.hooks.find((hook) => hook.id === "documentation.documents.reenrich")!.execute({ documentId: "doc" }, { caller: { kind: "ui" } });
+
+    expect(result).toMatchObject({ kind: "reenrich", firstDocumentId: "doc", enrichment: { results: [{ status: "written" }] } });
+    expect(enrichIngestResponse).toHaveBeenCalledWith({ documents: [{ documentId: "doc", title: "Archived guide", uri: "text://guide" }] }, {}, { signal: expect.any(AbortSignal) });
+    expect(client.reanalyzeDocument).not.toHaveBeenCalled();
+    expect(client.ingestPath).not.toHaveBeenCalled();
+    expect(client.ingestUrl).not.toHaveBeenCalled();
+    expect(queue.list().jobs[0]).toMatchObject({ kind: "reenrich", status: "complete", stage: "AI enrichment complete." });
+  });
+
+  it.each(["disabled", "unavailable"])("rejects re-enrichment when AI is %s while permitting reanalysis with an explicit skipped outcome", async (availability) => {
+    const client = fakeClient();
+    const enrichIngestResponse = vi.fn();
+    const service = availability === "disabled" ? { isEnabled: () => false, enrichIngestResponse } : undefined;
+    const queue = new DocumentationIngestQueue();
+    const plugin = new DocumentationPlugin(client, new PathPolicy(["/tmp"]), queue, () => service as never);
+
+    await expect(plugin.hooks.find((hook) => hook.id === "documentation.documents.reenrich")!.execute({ documentId: "doc" }, { caller: { kind: "ui" } })).rejects.toThrow(availability === "disabled" ? "AI enrichment is disabled" : "AI enrichment is not available");
+    await expect(plugin.hooks.find((hook) => hook.id === "documentation.documents.reanalyze")!.execute({ documentId: "doc" }, { caller: { kind: "ui" } })).resolves.toMatchObject({
+      enrichment: { enabled: false, results: [{ documentId: "doc", status: "skipped", reason: expect.stringContaining("AI enrichment") }] }
+    });
+
+    expect(enrichIngestResponse).not.toHaveBeenCalled();
+    expect(client.reanalyzeDocument).toHaveBeenCalledTimes(1);
+    expect(queue.list().jobs).toMatchObject([
+      { kind: "reenrich", status: "failed", stage: "AI re-enrichment failed." },
+      { kind: "reanalyze", status: "complete", stage: expect.stringContaining("AI enrichment skipped:") }
+    ]);
+  });
+
+  it.each(["stale", "revoked", "superseded", "quarantined", "deleted"])("rejects both operations for %s documents", async (state) => {
+    const client = fakeClient();
+    vi.mocked(client.getDocument).mockResolvedValue({ document: { document_id: "doc", state } });
+    const enrichIngestResponse = vi.fn();
+    const plugin = new DocumentationPlugin(client, new PathPolicy(["/tmp"]), new DocumentationIngestQueue(), () => ({ isEnabled: () => true, enrichIngestResponse }) as never);
+
+    for (const operation of ["reanalyze", "reenrich"]) {
+      await expect(plugin.hooks.find((hook) => hook.id === `documentation.documents.${operation}`)!.execute({ documentId: "doc" }, { caller: { kind: "ui" } })).rejects.toThrow("Only active archived documents");
+    }
+
+    expect(client.reanalyzeDocument).not.toHaveBeenCalled();
+    expect(enrichIngestResponse).not.toHaveBeenCalled();
+  });
+
+  it.each(["ui", "http"] as const)("validates reprocessing inputs and results through the hook registry for %s callers", async (kind) => {
+    const client = fakeClient();
+    const queue = new DocumentationIngestQueue();
+    const enrichIngestResponse = vi.fn(async (response: Record<string, unknown>) => ({ ...response, enrichment: { enabled: true, results: [{ documentId: "doc", status: "written" }] } }));
+    const plugin = new DocumentationPlugin(client, new PathPolicy(["/tmp"]), queue, () => ({ isEnabled: () => true, enrichIngestResponse }) as never);
+    const registry = new HookRegistry();
+    plugin.hooks.forEach((hook) => registry.register(hook));
+
+    for (const operation of ["reanalyze", "reenrich"]) {
+      for (const input of [{}, { documentId: 42 }, { documentId: "doc", path: "/etc/passwd" }]) {
+        await expect(registry.call(`documentation.documents.${operation}`, input, { caller: { kind } })).rejects.toThrow();
+      }
+    }
+    expect(client.getDocument).not.toHaveBeenCalled();
+    expect(queue.list().jobs).toEqual([]);
+    for (const operation of ["reanalyze", "reenrich"]) {
+      await expect(registry.call(`documentation.documents.${operation}`, { documentId: "doc" }, { caller: { kind } })).resolves.toMatchObject({ kind: operation, documentCount: 1, firstDocumentId: "doc", enrichment: { results: [{ status: "written" }] } });
+    }
+  });
+
+  it("requires a document ID before admitting either operation", () => {
+    const client = fakeClient();
+    const queue = new DocumentationIngestQueue();
+    const plugin = new DocumentationPlugin(client, new PathPolicy(["/tmp"]), queue);
+
+    for (const operation of ["reanalyze", "reenrich"]) {
+      const hook = plugin.hooks.find((candidate) => candidate.id === `documentation.documents.${operation}`)!;
+      for (const documentId of [undefined, " ", 5]) {
+        expect(() => hook.execute({ documentId }, { caller: { kind: "ui" } })).toThrow("documentId must be a non-empty string.");
+      }
+    }
+
+    expect(client.getDocument).not.toHaveBeenCalled();
+    expect(queue.list().jobs).toEqual([]);
+  });
+
+  it("serializes reprocessing with imports and enforces the same queue capacity", async () => {
+    const client = fakeClient();
+    const extraction = deferred<Record<string, unknown>>();
+    vi.mocked(client.ingestText).mockReturnValueOnce(extraction.promise);
+    const queue = new DocumentationIngestQueue({ maxJobs: 2, maxBytes: 1024 });
+    const plugin = new DocumentationPlugin(client, new PathPolicy(["/tmp"]), queue);
+    const importRun = plugin.hooks.find((hook) => hook.id === "documentation.ingest.text")!.execute({ text: "pending" }, { caller: { kind: "ui" } });
+    const reanalyze = plugin.hooks.find((hook) => hook.id === "documentation.documents.reanalyze")!;
+    const reanalyzeRun = reanalyze.execute({ documentId: "doc" }, { caller: { kind: "ui" } });
+    await flushPromises();
+
+    expect(client.getDocument).not.toHaveBeenCalled();
+    expect(queue.list().jobs[1]).toMatchObject({ kind: "reanalyze", status: "queued" });
+    expect(() => reanalyze.execute({ documentId: "doc" }, { caller: { kind: "ui" } })).toThrow("capacity is full");
+    extraction.resolve({ documents: [] });
+    await Promise.all([importRun, reanalyzeRun]);
+
+    expect(client.reanalyzeDocument).toHaveBeenCalledOnce();
+    expect(queue.list().capacity.admittedJobs).toBe(0);
+  });
+
+  it("cancels reanalysis before AI enrichment when the queue is stopped", async () => {
+    const client = fakeClient();
+    vi.mocked(client.reanalyzeDocument).mockImplementationOnce((_input, options) => new Promise((_resolve, reject) => {
+      options!.signal!.addEventListener("abort", () => reject(options!.signal!.reason), { once: true });
+    }));
+    const enrichIngestResponse = vi.fn();
+    const queue = new DocumentationIngestQueue();
+    const plugin = new DocumentationPlugin(client, new PathPolicy(["/tmp"]), queue, () => ({ isEnabled: () => true, enrichIngestResponse }) as never);
+    const run = plugin.hooks.find((hook) => hook.id === "documentation.documents.reanalyze")!.execute({ documentId: "doc" }, { caller: { kind: "ui" } });
+    const rejected = expect(run).rejects.toThrow("Documentation ingest queue was stopped.");
+    await vi.waitFor(() => expect(client.reanalyzeDocument).toHaveBeenCalled());
+
+    await queue.dispose();
+    await rejected;
+
+    expect(enrichIngestResponse).not.toHaveBeenCalled();
+    expect(queue.list().jobs[0]).toMatchObject({ status: "failed", stage: "Reanalysis failed." });
+  });
+
+  it("cancels an active re-enrichment with the same signal used to read the archived document", async () => {
+    const client = fakeClient();
+    const enrichIngestResponse = vi.fn((_response, _source, options: { signal: AbortSignal }) => new Promise((_resolve, reject) => {
+      options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true });
+    }));
+    const queue = new DocumentationIngestQueue();
+    const plugin = new DocumentationPlugin(client, new PathPolicy(["/tmp"]), queue, () => ({ isEnabled: () => true, enrichIngestResponse }) as never);
+    const run = plugin.hooks.find((hook) => hook.id === "documentation.documents.reenrich")!.execute({ documentId: "doc" }, { caller: { kind: "ui" } });
+    const rejected = expect(run).rejects.toThrow("Documentation ingest queue was stopped.");
+    await vi.waitFor(() => expect(enrichIngestResponse).toHaveBeenCalled());
+
+    await queue.dispose();
+    await rejected;
+
+    expect(enrichIngestResponse.mock.calls[0]?.[2].signal).toBe(vi.mocked(client.getDocument).mock.calls[0]?.[1]?.signal);
+    expect(queue.list().jobs[0]).toMatchObject({ status: "failed", stage: "AI re-enrichment failed." });
+  });
+
+  it.each(["getDocument", "reanalyzeDocument"] as const)("reports %s failures without starting enrichment", async (method) => {
+    const client = fakeClient();
+    vi.mocked(client[method]).mockRejectedValueOnce(new Error(method === "getDocument" ? "Unknown document." : "Archived source snapshot is missing."));
+    const enrichIngestResponse = vi.fn();
+    const queue = new DocumentationIngestQueue();
+    const plugin = new DocumentationPlugin(client, new PathPolicy(["/tmp"]), queue, () => ({ isEnabled: () => true, enrichIngestResponse }) as never);
+
+    await expect(plugin.hooks.find((hook) => hook.id === "documentation.documents.reanalyze")!.execute({ documentId: "doc" }, { caller: { kind: "ui" } })).rejects.toThrow(method === "getDocument" ? "Unknown document." : "Archived source snapshot is missing.");
+
+    expect(enrichIngestResponse).not.toHaveBeenCalled();
+    expect(queue.list().jobs[0]).toMatchObject({ status: "failed", stage: "Reanalysis failed." });
+  });
+
+  it.each(["failed", "skipped"])("reports a %s enrichment outcome without claiming AI success", async (status) => {
+    const client = fakeClient();
+    const queue = new DocumentationIngestQueue();
+    const enrichIngestResponse = vi.fn(async (response: Record<string, unknown>) => ({
+      ...response, enrichment: { enabled: true, results: [{ documentId: "doc", status, error: "Model failed.", reason: "No enrichment spans." }] }
+    }));
+    const plugin = new DocumentationPlugin(client, new PathPolicy(["/tmp"]), queue, () => ({ isEnabled: () => true, enrichIngestResponse }) as never);
+
+    await expect(plugin.hooks.find((hook) => hook.id === "documentation.documents.reanalyze")!.execute({ documentId: "doc" }, { caller: { kind: "ui" } })).resolves.toMatchObject({ enrichment: { results: [{ status }] } });
+    const reenrich = plugin.hooks.find((hook) => hook.id === "documentation.documents.reenrich")!.execute({ documentId: "doc" }, { caller: { kind: "ui" } });
+    if (status === "failed") {
+      await expect(reenrich).rejects.toThrow("Model failed.");
+      expect(queue.list().jobs[1]).toMatchObject({ status: "failed", stage: "AI re-enrichment failed." });
+    } else {
+      await expect(reenrich).resolves.toMatchObject({ enrichment: { results: [{ status: "skipped" }] } });
+      expect(queue.list().jobs[1]).toMatchObject({ status: "complete", stage: "AI enrichment skipped: No enrichment spans." });
+    }
+    expect(queue.list().jobs[0]?.stage).toContain(`AI enrichment ${status}`);
+  });
+
   it("routes assisted question answering through the enrichment provider", async () => {
     const answerQuestion = vi.fn(async () => ({ answer: "Source-grounded answer.", answerHtml: "<p>Source-grounded answer.</p>", citations: [], warnings: [] }));
     const plugin = new DocumentationPlugin(fakeClient(), new PathPolicy(["/tmp"]), new DocumentationIngestQueue(), () => ({ answerQuestion }) as never);
@@ -424,7 +641,8 @@ describe("DocumentationPlugin", () => {
       importArchiveReplacePath: vi.fn(async () => ({ import: { mode: "replace" } })),
       importArchiveMergePath: vi.fn(async () => ({ import: { mode: "merge" } })),
       listDocuments: vi.fn(async () => ({ documents: [] })),
-      getDocument: vi.fn(async () => ({ document: { documentId: "doc" } })),
+      getDocument: vi.fn(async () => ({ document: { document_id: "doc", state: "active", title: "Archived guide", uri: "text://guide" } })),
+      reanalyzeDocument: vi.fn(async () => ({ documents: [{ documentId: "doc", title: "Archived guide" }] })),
       remove: vi.fn(async () => ({ document: { documentId: "doc", state: "deleted" } })),
       search: vi.fn(async () => ({ results: [] })),
       ingestPath: vi.fn(async () => ({ documents: [] })),

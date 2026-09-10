@@ -1209,6 +1209,72 @@ class DocumentationArchive:
     def remove_document(self, document_id: str, *, reason: str = "Removed by user.") -> dict:
         return self.invalidate_document(document_id, state="deleted", reason=reason)
 
+    def reanalyze_document(self, document_id: str) -> IngestedDocument:
+        with self._write_lock:
+            document = self._document_row(document_id)
+            if document["state"] != ACTIVE_STATE:
+                raise ArchiveError("Only active documents can be reanalyzed.")
+            snapshot_path = (self.root / safe_archive_relative_path(document["snapshot_path"])).resolve()
+            if not is_relative_to(snapshot_path, self.snapshots_dir.resolve()) or not snapshot_path.is_file():
+                raise ArchiveError("The archived source snapshot is missing or outside the snapshots directory.")
+            source_bytes = snapshot_path.read_bytes()
+            if sha256_bytes(source_bytes) != document["content_sha256"]:
+                raise ArchiveError("The archived source snapshot does not match its recorded content hash.")
+            metadata_path = snapshot_path.parent / "metadata.json"
+            metadata = {}
+            if metadata_path.exists() or metadata_path.is_symlink():
+                if not is_relative_to(metadata_path.resolve(), snapshot_path.parent):
+                    raise ArchiveError("Snapshot metadata must stay inside its snapshot directory.")
+                try:
+                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, UnicodeError) as error:
+                    raise ArchiveError("The archived source metadata is invalid.") from error
+                if not isinstance(metadata, dict):
+                    raise ArchiveError("The archived source metadata must be an object.")
+            content_type = metadata.get("contentType")
+            if content_type is not None and not isinstance(content_type, str):
+                raise ArchiveError("The archived source content type must be a string.")
+            if document["source_type"] == "repo_code" or metadata.get("generatedCodeDocumentation") or "youtube" in metadata:
+                raise ArchiveError("This document retains generated code documentation or YouTube evidence. Rerun AI enrichment to analyze its retained text and artifacts; source extraction requires the original source.")
+
+            staging_dir = Path(tempfile.mkdtemp(prefix="reanalysis-", dir=self.snapshots_dir))
+            replacement_snapshot = staging_dir / snapshot_path.name
+            try:
+                replacement_snapshot.write_bytes(source_bytes)
+                if metadata_path.exists():
+                    shutil.copy2(metadata_path, staging_dir / "metadata.json")
+                spans = extract_bytes(
+                    source_bytes,
+                    snapshot_path.name,
+                    document["source_type"],
+                    content_type or mimetypes.guess_type(snapshot_path.name)[0],
+                    staging_dir / "extracted",
+                )
+                chunks = chunk_spans(spans)
+                if not chunks:
+                    raise ArchiveError("No extractable text was found during reanalysis.")
+
+                def replace_source_analysis(db: sqlite3.Connection) -> None:
+                    db.execute("DELETE FROM chunks WHERE document_id = ? AND chunk_origin = 'source'", (document_id,))
+                    db.executemany(
+                        "INSERT INTO chunks (document_id, locator, text, state, chunk_origin) VALUES (?, ?, ?, ?, 'source')",
+                        [(document_id, locator, text, ACTIVE_STATE) for locator, text in chunks],
+                    )
+                    db.execute(
+                        "UPDATE documents SET snapshot_path = ?, updated_at = ? WHERE document_id = ?",
+                        (replacement_snapshot.relative_to(self.root).as_posix(), timestamp(), document_id),
+                    )
+
+                self._publish_catalog_change(replace_source_analysis)
+            except Exception:
+                shutil.rmtree(staging_dir)
+                raise
+            try:
+                self._discard_unreferenced_snapshot(snapshot_path)
+            except Exception as error:
+                logger.warning("Reanalysis of %s was published, but the previous snapshot could not be removed: %s", document_id, error)
+            return IngestedDocument(document_id, document["title"], document["source_type"], ACTIVE_STATE, len(chunks), document["content_sha256"])
+
     def rebuild_index(self) -> dict:
         _, generation = self._publish_catalog_change(lambda _db: None)
         return generation.manifest

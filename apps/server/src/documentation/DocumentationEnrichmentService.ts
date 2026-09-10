@@ -186,10 +186,14 @@ export class DocumentationEnrichmentService {
     const fullDocument = await this.enrichmentDocument(document.documentId, signal);
     const cleanup: Array<() => Promise<void>> = [];
     try {
-      const mediaEvidence = await this.prepareMediaEvidence(source, cleanup, signal);
+      const archivedMedia = source.content || source.contentPath ? undefined : await this.archivedMediaSource(fullDocument, signal);
+      const mediaEvidence = await this.prepareMediaEvidence(archivedMedia ?? source, cleanup, signal);
+      if (archivedMedia && !mediaEvidence?.transcript?.trim() && !mediaEvidence?.keyframes.length) {
+        throw new Error("Archived media enrichment produced no transcript or keyframe evidence.");
+      }
       const evidence = {
         document: documentSummary(fullDocument),
-        chunks: documentChunks(fullDocument),
+        chunks: archivedMedia ? [] : documentChunks(fullDocument),
         artifacts: await this.documentArtifacts(fullDocument, signal),
         media: mediaEvidence
       };
@@ -402,6 +406,61 @@ export class DocumentationEnrichmentService {
   private async archiveRoot(signal?: AbortSignal): Promise<string | undefined> {
     const health = signal ? await this.options.client.health({ signal }) : await this.options.client.health();
     return typeof health.archiveRoot === "string" ? health.archiveRoot : undefined;
+  }
+
+  private async archivedMediaSource(document: Record<string, unknown>, signal?: AbortSignal): Promise<DocumentationEnrichmentSource | undefined> {
+    const snapshotPath = optionalRecordString(document, "snapshot_path");
+    const hasMediaSuffix = snapshotPath && /\.(mp3|wav|m4a|aac|ogg|webm|mp4|mov|mkv|avi)$/iu.test(snapshotPath);
+    if (!snapshotPath || !hasMediaSuffix && path.extname(snapshotPath)) {
+      return undefined;
+    }
+    const archiveRoot = await this.archiveRoot(signal);
+    if (!archiveRoot) {
+      throw new Error("Archived media enrichment requires a shared documentation archive root.");
+    }
+    const root = path.resolve(archiveRoot);
+    const snapshot = path.resolve(root, snapshotPath);
+    if (!isSameOrChild(root, snapshot)) {
+      throw new Error("Archived media source escapes the documentation archive root.");
+    }
+    const realRoot = await fsp.realpath(root);
+    const realSnapshot = await fsp.realpath(snapshot);
+    if (!isSameOrChild(realRoot, realSnapshot)) {
+      throw new Error("Archived media source escapes the documentation archive root.");
+    }
+    const stat = await fsp.lstat(snapshot);
+    signal?.throwIfAborted();
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error("Archived media source must be a regular file.");
+    }
+    let contentType: string | undefined;
+    if (!hasMediaSuffix) {
+      const metadataPath = path.join(path.dirname(realSnapshot), "metadata.json");
+      const metadataStat = await fsp.lstat(metadataPath).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") {
+          return undefined;
+        }
+        throw error;
+      });
+      if (!metadataStat) {
+        if (document.source_type === "media") {
+          throw new Error("Archived media source metadata is missing.");
+        }
+        return undefined;
+      }
+      if (!metadataStat.isFile() || metadataStat.isSymbolicLink()) {
+        throw new Error("Archived source metadata must be a regular file inside its snapshot directory.");
+      }
+      const metadata = getRecord(JSON.parse(await fsp.readFile(metadataPath, "utf8")), "archived source metadata");
+      if (metadata.contentType !== undefined && typeof metadata.contentType !== "string") {
+        throw new Error("Archived source content type must be a string.");
+      }
+      contentType = optionalRecordString(metadata, "contentType");
+      if (!contentType || !/^(audio|video)\//iu.test(contentType)) {
+        return undefined;
+      }
+    }
+    return { filename: path.basename(snapshotPath), contentPath: realSnapshot, contentType, sourceType: optionalRecordString(document, "source_type") };
   }
 
   private async prepareMediaEvidence(source: DocumentationEnrichmentSource, cleanup: Array<() => Promise<void>>, signal?: AbortSignal): Promise<MediaEvidence | undefined> {

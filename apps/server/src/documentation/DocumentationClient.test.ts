@@ -80,6 +80,53 @@ describe("DocumentationClient", () => {
     expect(requestUrl).toBe("/docs/documents/doc-1?token=local&chunkOffset=75&chunkLimit=25&chunkTextMaxChars=4000&artifactOffset=100&artifactLimit=50&includeEnrichments=false&includeEvents=false");
   });
 
+  it("reanalyzes an encoded document ID through the indexer HTTP endpoint", async () => {
+    let requestUrl = "";
+    let requestMethod = "";
+    let requestBody = "";
+    const result = { documents: [{ documentId: "doc/1", title: "Archived guide" }] };
+    const url = await startServer((request, response) => {
+      requestUrl = request.url ?? "";
+      requestMethod = request.method ?? "";
+      request.on("data", (chunk) => { requestBody += chunk.toString(); });
+      request.on("end", () => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify(result));
+      });
+    });
+    const client = new DocumentationClient(`${url}/docs/?token=local`);
+
+    await expect(client.reanalyzeDocument({ documentId: "doc/1" })).resolves.toEqual(result);
+
+    expect(requestUrl).toBe("/docs/documents/doc%2F1/reanalyze?token=local");
+    expect(requestMethod).toBe("POST");
+    expect(JSON.parse(requestBody)).toEqual({});
+    expect(() => client.reanalyzeDocument({ documentId: " " })).toThrow("documentId must be a non-empty string.");
+  });
+
+  it("reports reanalysis endpoint errors", async () => {
+    const url = await startServer((_request, response) => {
+      response.writeHead(400, { "content-type": "application/json" });
+      response.end(JSON.stringify({ detail: "Archived source snapshot is missing." }));
+    });
+
+    await expect(new DocumentationClient(url).reanalyzeDocument({ documentId: "doc-1" })).rejects.toThrow("Archived source snapshot is missing.");
+  });
+
+  it("aborts an in-flight reanalysis when its queue owner stops", async () => {
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const url = await startServer(() => { markStarted(); });
+    const controller = new AbortController();
+    const run = new DocumentationClient(url).reanalyzeDocument({ documentId: "doc-1" }, { signal: controller.signal });
+    const rejected = expect(run).rejects.toThrow("Reanalysis queue stopped.");
+    await started;
+
+    controller.abort(new Error("Reanalysis queue stopped."));
+
+    await rejected;
+  });
+
   it("forwards selected document chunk ids with context", async () => {
     let requestUrl = "";
     const url = await startServer((request, response) => {
