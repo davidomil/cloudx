@@ -228,8 +228,12 @@ describe("DocumentationEnrichmentService", () => {
       { filename: "recording.txt", uri: "upload://recording.txt", sharedMetadata: true, contentType: "audio/flac" },
       { filename: "recording.txt", uri: "upload://recording.txt", sharedMetadata: true, contentType: "video/x-ms-asf" },
       { filename: "recording.txt", uri: "upload://recording.txt", sharedMetadata: true, text: "COPIED-TRANSCRIPT".padEnd(65_535, "a") + "🎧字幕" },
-    ])("keeps a copied transcript from $uri on the text path (shared metadata: $sharedMetadata)", async ({ filename, uri, sharedMetadata, contentType = "application/octet-stream", text = "COPIED-TRANSCRIPT is retained evidence.\n字幕 café" }) => {
-      const fixture = await archivedMediaFixture(filename, "media", {
+      { filename: "recording", uri: "upload://recording", sharedMetadata: true, sourceType: "text" },
+      { filename: "recording.bin", uri: "upload://recording.bin", sharedMetadata: true, sourceType: "text" },
+      { filename: "recording.flac", uri: "upload://recording.flac", sharedMetadata: true, sourceType: "text" },
+      { filename: "recording.opus", uri: "upload://recording.opus", sharedMetadata: true, sourceType: "text" },
+    ])("keeps a copied transcript from $uri on the text path (shared metadata: $sharedMetadata)", async ({ filename, uri, sharedMetadata, sourceType = "media", contentType = "application/octet-stream", text = "COPIED-TRANSCRIPT is retained evidence.\n字幕 café" }) => {
+      const fixture = await archivedMediaFixture(filename, sourceType, {
         uri,
         chunks: [
           { chunk_id: 11, locator: "text", chunk_origin: "source", text: "COPIED-TRANSCRIPT is retained evidence." },
@@ -246,7 +250,8 @@ describe("DocumentationEnrichmentService", () => {
       });
       const runner = fakeRunner({ summary: "", spans: [{ locator: "ai:media", text: "Enriched from copied transcript." }], metadata: [], warnings: [] });
       const transcribeFile = vi.fn(async () => { throw new Error("ASR cannot decode a copied transcript."); });
-      const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher: fakeMediaTools(false) });
+      const mediaProcessLauncher = fakeMediaTools(false);
+      const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher });
       const queue = new DocumentationIngestQueue();
       const plugin = new DocumentationPlugin(client, new PathPolicy([fixture.root]), queue, () => service);
       try {
@@ -256,6 +261,7 @@ describe("DocumentationEnrichmentService", () => {
         expect(runner.run.mock.calls[0]?.[0]).toContain("COPIED-TRANSCRIPT");
         expect(runner.run.mock.calls[0]?.[0]).not.toContain("PRIOR-AI-SPAN");
         expect(transcribeFile).not.toHaveBeenCalled();
+        expect(mediaProcessLauncher).not.toHaveBeenCalled();
         expect(client.enrichDocument).toHaveBeenCalledOnce();
         await expect(fs.readFile(fixture.mediaPath, "utf8")).resolves.toBe(text);
         expect(client.reanalyzeDocument).toHaveBeenCalledTimes(operation === "reanalyze" ? 1 : 0);
@@ -269,8 +275,9 @@ describe("DocumentationEnrichmentService", () => {
       { filename: "recording.ogg", video: true, sharedContentType: "application/octet-stream" },
       { filename: "recording.bin", video: true, sharedContentType: "audio/ogg" },
       { filename: "recording.ogg", video: false, sharedContentType: "video/ogg" },
-    ])("uses retained streams for $filename after shared MIME becomes $sharedContentType", async ({ filename, video, sharedContentType }) => {
-      const fixture = await archivedMediaFixture(filename);
+      { filename: "recording.bin", video: true, sharedContentType: "application/octet-stream", sourceType: "text" },
+    ])("uses retained streams for $filename after shared MIME becomes $sharedContentType", async ({ filename, video, sharedContentType, sourceType = "media" }) => {
+      const fixture = await archivedMediaFixture(filename, sourceType);
       const metadataPath = path.join(path.dirname(fixture.mediaPath), "metadata.json");
       await fs.writeFile(metadataPath, JSON.stringify({ filename, contentType: video ? "video/ogg" : "audio/ogg", upload: true }));
       const client = Object.assign(fixture.client, {
@@ -324,8 +331,9 @@ describe("DocumentationEnrichmentService", () => {
       { name: "invalid JSON", status: 0, stdout: "invalid", stderr: "", error: /JSON/u },
       { name: "missing streams", status: 0, stdout: "{}", stderr: "", error: /array of selected video streams/u },
       { name: "invalid stream type", status: 0, stdout: '{"streams":[{"codec_type":"audio"}]}', stderr: "", error: /array of selected video streams/u },
-    ])("preserves prior enrichment when retained stream inspection returns $name", async ({ status, stdout, stderr, error }) => {
-      const fixture = await archivedMediaFixture("recording.ogg");
+      { name: "decoder failure for a recording categorized as text", status: 1, stdout: "", stderr: "Invalid media", error: /ffprobe media inspection failed: Invalid media/u, filename: "recording.bin", sourceType: "text" },
+    ])("preserves prior enrichment when retained stream inspection returns $name", async ({ status, stdout, stderr, error, filename = "recording.ogg", sourceType = "media" }) => {
+      const fixture = await archivedMediaFixture(filename, sourceType);
       const client = Object.assign(fixture.client, { reanalyzeDocument: vi.fn(async () => ({ documents: [{ documentId: "doc-1" }] })) });
       const runner = fakeRunner();
       const transcribeFile = vi.fn();
@@ -363,8 +371,9 @@ describe("DocumentationEnrichmentService", () => {
       { name: "late binary byte", suffix: Buffer.from([0]) },
       { name: "late invalid UTF-8", suffix: Buffer.from([0xff]) },
       { name: "incomplete UTF-8 at EOF", suffix: Buffer.from([0xc3]) },
-    ])("keeps binary .txt media on ASR with $name", async ({ suffix }) => {
-      const fixture = await archivedMediaFixture("recording.txt");
+      { name: "invalid UTF-8 followed by binary data without media hints", suffix: Buffer.concat([Buffer.from([0xff]), Buffer.alloc(70_000, 0x61), Buffer.from([0])]), sourceType: "text" },
+    ])("keeps binary .txt media on ASR with $name", async ({ suffix, sourceType = "media" }) => {
+      const fixture = await archivedMediaFixture("recording.txt", sourceType);
       const bytes = Buffer.concat([Buffer.alloc(70_000, 0x61), suffix]);
       await fs.writeFile(fixture.mediaPath, bytes);
       await fs.writeFile(path.join(path.dirname(fixture.mediaPath), "metadata.json"), JSON.stringify({
@@ -393,8 +402,10 @@ describe("DocumentationEnrichmentService", () => {
       }
     });
 
-    it.each(["recording", "recording.bin", "recording.txt"])("transcribes %s after an identical URL import replaces shared metadata", async (filename) => {
-      const fixture = await archivedMediaFixture(filename);
+    it.each(["media", "text"].flatMap((sourceType) =>
+      ["recording", "recording.bin", "recording.txt", "recording.flac", "recording.opus"].map((filename) => ({ filename, sourceType }))
+    ))("transcribes $filename categorized as $sourceType after an identical URL import replaces shared metadata", async ({ filename, sourceType }) => {
+      const fixture = await archivedMediaFixture(filename, sourceType);
       const metadataPath = path.join(path.dirname(fixture.mediaPath), "metadata.json");
       const contentType = "application/octet-stream";
       await fs.writeFile(metadataPath, JSON.stringify({ filename, contentType, upload: true }));
@@ -406,7 +417,8 @@ describe("DocumentationEnrichmentService", () => {
       const client = Object.assign(fixture.client, {
         reanalyzeDocument: vi.fn(async () => ({ documents: [{ documentId: "doc-1" }] })),
       });
-      const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher: fakeMediaTools(false) });
+      const mediaProcessLauncher = fakeMediaTools(false);
+      const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher });
       const queue = new DocumentationIngestQueue();
       const plugin = new DocumentationPlugin(client, new PathPolicy([fixture.root]), queue, () => service);
       try {
@@ -418,6 +430,8 @@ describe("DocumentationEnrichmentService", () => {
 
           expect(result).toMatchObject({ kind: operation, firstDocumentId: "doc-1", enrichment: { results: [{ status: "written" }] } });
           expect(transcribeFile).toHaveBeenCalledTimes(rerun);
+          expect(mediaProcessLauncher).toHaveBeenCalledTimes(rerun);
+          expect(mediaProcessLauncher).toHaveBeenLastCalledWith("ffprobe", expect.arrayContaining([fixture.mediaPath]), expect.anything());
           expect(transcribeFile).toHaveBeenLastCalledWith(fixture.mediaPath, filename, { signal: expect.any(AbortSignal) });
           expect(runner.run).toHaveBeenCalledTimes(rerun);
           const prompt = runner.run.mock.lastCall?.[0];
@@ -632,17 +646,48 @@ describe("DocumentationEnrichmentService", () => {
   it.each([
     { filename: "notes", contentType: "text/plain" },
     { filename: "notes.md", contentType: null },
-  ])("retains $filename source evidence when its metadata has no media MIME type", async ({ filename, contentType }) => {
-    const fixture = await archivedMediaFixture(filename, "text");
+    { filename: "notes.txt", contentType: "text/plain", bytes: Buffer.from("RETAINED-TEXT café", "latin1") },
+    { filename: "notes.txt", contentType: null, bytes: Buffer.from("\ufeffRETAINED-TEXT café", "utf16le") },
+    { filename: "notes.txt", contentType: null, bytes: Buffer.from("\ufeffRETAINED-TEXT café", "utf16le").swap16() },
+    { filename: "notes.txt", contentType: null, bytes: Buffer.from("\ufeffRETAINED-TEXT\0") },
+  ])("retains $filename source evidence when its metadata has no media MIME type", async ({ filename, contentType, bytes = Buffer.from("RETAINED-TEXT source evidence.") }) => {
+    const text = bytes.toString("utf8").trim();
+    const fixture = await archivedMediaFixture(filename, "text", {
+      chunks: [{ chunk_id: 11, locator: "text", chunk_origin: "source", text }],
+    });
+    await fs.writeFile(fixture.mediaPath, bytes);
     await fs.writeFile(path.join(path.dirname(fixture.mediaPath), "metadata.json"), JSON.stringify({ contentType }));
     const runner = fakeRunner();
     const transcribeFile = vi.fn();
-    const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher: fakeMediaTools(false) });
+    const mediaProcessLauncher = fakeMediaTools(false);
+    const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher });
     try {
       await service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] });
 
-      expect(runner.run.mock.calls[0]?.[0]).toContain("BINARY-CHUNK");
+      expect(runner.run.mock.calls[0]?.[0]).toContain(JSON.stringify(text));
       expect(transcribeFile).not.toHaveBeenCalled();
+      expect(mediaProcessLauncher).not.toHaveBeenCalled();
+      await expect(fs.readFile(fixture.mediaPath)).resolves.toEqual(bytes);
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["page 1", "image", "sheet Parts"])("keeps structured %s evidence out of media processing", async (locator) => {
+    const fixture = await archivedMediaFixture("source.bin", "reference", {
+      chunks: [{ chunk_id: 11, locator, chunk_origin: "source", text: "STRUCTURED-SOURCE evidence." }],
+    });
+    await fs.writeFile(path.join(path.dirname(fixture.mediaPath), "metadata.json"), JSON.stringify({ contentType: "application/octet-stream" }));
+    const runner = fakeRunner();
+    const transcribeFile = vi.fn();
+    const mediaProcessLauncher = fakeMediaTools(false);
+    const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher });
+    try {
+      await service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] });
+
+      expect(runner.run.mock.calls[0]?.[0]).toContain("STRUCTURED-SOURCE");
+      expect(transcribeFile).not.toHaveBeenCalled();
+      expect(mediaProcessLauncher).not.toHaveBeenCalled();
     } finally {
       await fs.rm(fixture.root, { recursive: true, force: true });
     }
@@ -732,6 +777,7 @@ describe("DocumentationEnrichmentService", () => {
         { chunk_id: 12, locator: "ai:media", chunk_origin: "ai", text: "PRIOR-AI-SPAN" },
       ],
     });
+    await fs.writeFile(fixture.mediaPath, "RETAINED-TEXT is transcript evidence.");
     if (metadata) {
       await fs.writeFile(path.join(path.dirname(fixture.mediaPath), "metadata.json"), JSON.stringify(metadata));
     }

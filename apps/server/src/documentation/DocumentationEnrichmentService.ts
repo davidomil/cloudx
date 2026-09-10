@@ -416,6 +416,8 @@ export class DocumentationEnrichmentService {
   private async archivedMediaSource(document: Record<string, unknown>, signal?: AbortSignal): Promise<ArchivedMediaSource | undefined> {
     const snapshotPath = optionalRecordString(document, "snapshot_path");
     const hasMediaSuffix = snapshotPath && /\.(mp3|wav|m4a|aac|ogg|webm|mp4|mov|mkv|avi)$/iu.test(snapshotPath);
+    const sourceChunks = recordsArray(document.chunks).filter((chunk) => chunk.chunk_origin === "source");
+    const hasTextChunks = sourceChunks.length > 0 && sourceChunks.every((chunk) => chunk.locator === "text");
     if (!snapshotPath) {
       return undefined;
     }
@@ -459,7 +461,8 @@ export class DocumentationEnrichmentService {
       retainsMediaUpload = document.source_type === "media"
         && document.uri === `upload://${path.basename(snapshotPath)}`;
     }
-    if (!retainsMediaUpload && !hasMediaSuffix && (!contentType || !/^(audio|video)\//iu.test(contentType))) {
+    const hasMediaHint = Boolean(retainsMediaUpload || hasMediaSuffix || contentType && /^(audio|video)\//iu.test(contentType));
+    if (!hasTextChunks && !hasMediaHint) {
       return undefined;
     }
     const realRoot = await fsp.realpath(root);
@@ -472,11 +475,7 @@ export class DocumentationEnrichmentService {
     if (!stat.isFile() || stat.isSymbolicLink()) {
       throw new Error("Archived media source must be a regular file.");
     }
-    const sourceChunks = recordsArray(document.chunks).filter((chunk) => chunk.chunk_origin === "source");
-    if (path.extname(snapshotPath).toLowerCase() === ".txt"
-      && sourceChunks.length > 0
-      && sourceChunks.every((chunk) => chunk.locator === "text")
-      && await isUtf8TextFile(realSnapshot, signal)) {
+    if (hasTextChunks && await isTextFile(realSnapshot, { requireUtf8: hasMediaHint, signal })) {
       return undefined;
     }
     const hasVideo = await containsVideoStream(realSnapshot, signal, this.options.mediaProcessLauncher);
@@ -485,7 +484,7 @@ export class DocumentationEnrichmentService {
 
   private async prepareMediaEvidence(source: DocumentationEnrichmentSource | ArchivedMediaSource, cleanup: Array<() => Promise<void>>, signal?: AbortSignal): Promise<MediaEvidence | undefined> {
     signal?.throwIfAborted();
-    if ((!source.content && !source.contentPath) || !isMediaSource(source)) {
+    if ((!source.content && !source.contentPath) || !("hasVideo" in source || isMediaSource(source))) {
       return undefined;
     }
     let mediaPath: string;
@@ -1564,10 +1563,20 @@ function recordStringArray(record: Record<string, unknown>, key: string): string
   return strings.length > 0 ? strings : undefined;
 }
 
-async function isUtf8TextFile(filename: string, signal?: AbortSignal): Promise<boolean> {
-  const decoder = new TextDecoder("utf-8", { fatal: true });
+async function isTextFile(filename: string, { requireUtf8, signal }: { requireUtf8: boolean; signal?: AbortSignal }): Promise<boolean> {
+  const decoder = new TextDecoder("utf-8", { fatal: requireUtf8 });
+  let firstChunk = true;
   try {
     for await (const bytes of fs.createReadStream(filename, { signal })) {
+      // Ordinary text uses the MIME Sniffing Standard's BOM and binary-byte checks.
+      if (firstChunk && !requireUtf8 && (
+        bytes[0] === 0xfe && bytes[1] === 0xff
+        || bytes[0] === 0xff && bytes[1] === 0xfe
+        || bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf
+      )) {
+        return true;
+      }
+      firstChunk = false;
       const text = decoder.decode(bytes, { stream: true });
       // Binary data bytes as defined by the WHATWG MIME Sniffing Standard.
       if (/[\u0000-\u0008\u000b\u000e-\u001a\u001c-\u001f]/u.test(text)) {
