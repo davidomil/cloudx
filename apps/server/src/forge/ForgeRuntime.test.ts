@@ -913,6 +913,81 @@ describe("ForgeRuntime owned branch updates", () => {
     return { file, value: JSON.parse(await fs.readFile(file, "utf8")) };
   }
 
+  it("adopts the exact externally updated branch while retaining the previous published commit", async () => {
+    const { workspace, publishedHead } = await publishedIssue();
+    const nextHead = await advanceTarget();
+    await git(repositoryPath, "push", "--force", "origin", `${nextHead}:refs/heads/${workspace.branch}`);
+
+    await runtime.syncPublishedBranch(workspace, publishedHead, nextHead);
+
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(nextHead);
+    expect(await git(workspace.worktreePath, "rev-parse", `refs/cloudx/before-sync/${publishedHead}`)).toBe(publishedHead);
+    expect(await git(workspace.worktreePath, "status", "--porcelain")).toBe("");
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(nextHead);
+    await runtime.syncPublishedBranch(workspace, publishedHead, nextHead);
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(nextHead);
+  });
+
+  it("recovers a completed synchronization whose caller lost its result", async () => {
+    const deps = dependencies();
+    const executeGit = deps.git!;
+    runtime = new ForgeRuntime(deps);
+    const { workspace, publishedHead } = await publishedIssue();
+    const nextHead = await advanceTarget();
+    await git(repositoryPath, "push", "--force", "origin", `${nextHead}:refs/heads/${workspace.branch}`);
+    deps.git = async (...args) => {
+      const result = await executeGit(...args);
+      if (args[1][0] === "reset") throw new Error("Synchronization result was lost");
+      return result;
+    };
+    await expect(runtime.syncPublishedBranch(workspace, publishedHead, nextHead)).rejects.toThrow("result was lost");
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(nextHead);
+    deps.git = executeGit;
+    runtime = new ForgeRuntime(deps);
+    await runtime.syncPublishedBranch(workspace, publishedHead, nextHead);
+    expect(await git(workspace.worktreePath, "rev-parse", `refs/cloudx/before-sync/${publishedHead}`)).toBe(publishedHead);
+  });
+
+  it("preserves ignored files that do not collide with the published update", async () => {
+    const { workspace, publishedHead } = await publishedIssue();
+    const nextHead = await advanceTarget();
+    await git(repositoryPath, "push", "--force", "origin", `${nextHead}:refs/heads/${workspace.branch}`);
+    await fs.mkdir(path.join(workspace.worktreePath, ".git", "info"), { recursive: true });
+    await fs.writeFile(path.join(workspace.worktreePath, ".git", "info", "exclude"), "local-dependencies/\n");
+    await fs.mkdir(path.join(workspace.worktreePath, "local-dependencies"));
+    await fs.writeFile(path.join(workspace.worktreePath, "local-dependencies", "keep.txt"), "Retained dependencies");
+    await runtime.syncPublishedBranch(workspace, publishedHead, nextHead);
+    expect(await fs.readFile(path.join(workspace.worktreePath, "local-dependencies", "keep.txt"), "utf8")).toBe("Retained dependencies");
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(nextHead);
+  });
+
+  it.each(["dirty", "untracked", "unpublished commit", "remote race", "pending git", "ignored collision", "ignored directory collision"])("preserves the checkout instead of syncing with %s", async condition => {
+    const { workspace, publishedHead } = await publishedIssue();
+    const nextHead = await advanceTarget();
+    await git(repositoryPath, "push", "--force", "origin", `${nextHead}:refs/heads/${workspace.branch}`);
+    if (condition === "dirty") await fs.writeFile(path.join(workspace.worktreePath, "issue.txt"), "Unpublished edits");
+    if (condition === "untracked") await fs.writeFile(path.join(workspace.worktreePath, "notes.txt"), "Unpublished notes");
+    if (condition === "unpublished commit") await git(workspace.worktreePath, "commit", "--allow-empty", "-m", "TEST: unpublished work");
+    if (condition === "pending git") await fs.writeFile(path.join(workspace.worktreePath, ".git", "CHERRY_PICK_HEAD"), publishedHead);
+    if (condition === "ignored collision" || condition === "ignored directory collision") {
+      await fs.mkdir(path.join(workspace.worktreePath, ".git", "info"), { recursive: true });
+      await fs.writeFile(path.join(workspace.worktreePath, ".git", "info", "exclude"), "target.txt\n");
+      if (condition === "ignored directory collision") {
+        await fs.mkdir(path.join(workspace.worktreePath, "target.txt"));
+        await fs.writeFile(path.join(workspace.worktreePath, "target.txt", "local.txt"), "Ignored local work");
+      } else await fs.writeFile(path.join(workspace.worktreePath, "target.txt"), "Ignored local work");
+    }
+    const localHead = await git(workspace.worktreePath, "rev-parse", "HEAD");
+    const localStatus = await git(workspace.worktreePath, "status", "--porcelain");
+
+    await expect(runtime.syncPublishedBranch(workspace, publishedHead, condition === "remote race" ? headSha : nextHead)).rejects.toThrow();
+
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(localHead);
+    expect(await git(workspace.worktreePath, "status", "--porcelain")).toBe(localStatus);
+    if (condition === "ignored collision" || condition === "ignored directory collision")
+      expect(await fs.readFile(path.join(workspace.worktreePath, "target.txt", ...(condition === "ignored directory collision" ? ["local.txt"] : [])), "utf8")).toBe("Ignored local work");
+  });
+
   it("updates the owned issue from the current target and publishes only the recorded result", async () => {
     const deps = dependencies();
     deps.git = vi.fn(deps.git!);
@@ -1168,6 +1243,24 @@ describe.skipIf(process.platform !== "linux")(
       await runtime.cleanup({ ...workspace, expectedHeadSha: headSha });
     });
 
+    it.each([true, false])("reports an actionable workflow permission error without exposing stderr when recognized=%s", async recognized => {
+      const remoteError = recognized
+        ? "remote: refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml` without `workflows` permission\nprivate-token"
+        : "remote: rejected private-token https://private.example/repository";
+      await installGitFixture(false, remoteError);
+      const deps = dependencies();
+      delete deps.git;
+      runtime = new ForgeRuntime(deps);
+      const workspace = await prepare();
+      const failure = await runtime.publishBranch(workspace).catch(error => error as Error);
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toBe(recognized
+        ? "GitHub rejected workflow changes. Grant the worker App Workflows: write permission and approve it for this installation, then retry publishing."
+        : "Git push failed with exit code 1.");
+      expect((failure as Error).message).not.toContain("private-token");
+      expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(headSha);
+    });
+
     it("uses reviewer authorization only for fetching the two exact review commits", async () => {
       const fixture = await installGitFixture();
       const deps = dependencies();
@@ -1299,7 +1392,7 @@ describe.skipIf(process.platform !== "linux")(
   },
 );
 
-async function installGitFixture(hangFetch: boolean | "review-base" | "merge" = false) {
+async function installGitFixture(hangFetch: boolean | "review-base" | "merge" = false, pushError?: string) {
   const actualGit = (await execute("which", ["git"])).stdout.trim();
   const bin = path.join(root, "bin");
   const records = path.join(root, "git-processes.jsonl");
@@ -1314,6 +1407,10 @@ const args = process.argv.slice(2);
 const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("GIT_")));
 fs.appendFileSync(${JSON.stringify(records)}, JSON.stringify({ args, env }) + "\\n");
 const mapped = args.map((arg) => arg === "https://github.com/cloudx/test.git" && args.some((item) => item === "fetch" || item === "push") ? ${JSON.stringify(origin)} : arg);
+if (args.includes("push") && ${JSON.stringify(pushError)} !== undefined) {
+  process.stderr.write(${JSON.stringify(pushError)});
+  process.exit(1);
+}
 const hangMerge = ${JSON.stringify(hangFetch)} === "merge" && args.includes("merge") && !args.includes("--abort");
 const hangFetch = (${JSON.stringify(hangFetch)} === true || ${JSON.stringify(hangFetch)} === "review-base" && args.some(arg => arg.endsWith(":refs/cloudx/review-base"))) && args.includes("fetch");
 if (hangMerge || hangFetch) {

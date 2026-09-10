@@ -4,7 +4,7 @@ import type { ForgeCredential } from "../providers/ForgeCredentials.js";
 import { validateRepository } from "../providers/ForgeCredentials.js";
 import { ForgeProviderError } from "../providers/ForgeProvider.js";
 import { connectionKey, type ForgeConnectionRecords, type ForgeConnectionStore, type StoredForgeConnection } from "./ForgeConnectionStore.js";
-import type { ForgeRegistrationClient } from "./ForgeRegistrationClient.js";
+import { GitHubInstallationPermissionError, type ForgeRegistrationClient } from "./ForgeRegistrationClient.js";
 
 const roles = ["worker", "reviewer"] as const;
 const registrationLifetime = 60 * 60_000;
@@ -122,7 +122,9 @@ export class ForgeConnectionService {
       } catch (error) {
         // Verification is read-only: retain the registered app for explicit installation continuation.
         connection.phase = "installing";
-        connection.message = "Install this app on the configured repository with its requested permissions, then continue installation.";
+        connection.message = error instanceof GitHubInstallationPermissionError
+          ? error.message
+          : "Install this app on the configured repository with its requested permissions, then continue installation.";
         await this.deps.store.write(records);
         throw error;
       }

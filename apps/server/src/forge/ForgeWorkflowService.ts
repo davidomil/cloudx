@@ -97,6 +97,12 @@ interface Runtime {
     signal?: AbortSignal,
     expectedHeadSha?: string,
   ): Promise<string>;
+  syncPublishedBranch(
+    workspace: { id: string; repositoryPath: string; worktreePath: string; branch: string },
+    expectedLocalHeadSha: string,
+    expectedRemoteHeadSha: string,
+    signal?: AbortSignal,
+  ): Promise<void>;
   updateIssueBranch(
     workspace: { id: string; repositoryPath: string; worktreePath: string; branch: string },
     expectedHeadSha: string,
@@ -450,6 +456,55 @@ export class ForgeWorkflowService {
       return this.resumeWorker(issue.id, placement);
     });
   }
+  syncAndReview(id: string, placement: ForgePlacement): Promise<ForgeWorker> {
+    return this.exclusive(async () => {
+      const worker = this.requireWorker(id);
+      if (worker.kind !== "issue" || !worker.changeNumber || !worker.headSha ||
+          !["paused", "stopped", "failed", "awaiting_review", "awaiting_merge"].includes(worker.status))
+        throw new Error("Only an idle published issue worker can sync and re-review.");
+      if (worker.pendingPublication || worker.mergeAttempted || ["creating", "uncertain"].includes(worker.publicationState ?? ""))
+        throw new Error("Reconcile the pending publication or merge before syncing this worker.");
+      const reviews = this.workers.filter(candidate => candidate.kind === "review" &&
+        candidate.number === worker.changeNumber && sameRepository(candidate.repository, worker.repository));
+      if (reviews.some(review => !["completed", "failed", "paused", "stopped"].includes(review.status) ||
+          review.draft && ["posting", "post_failed"].includes(review.draft.status)))
+        throw new Error("Stop active reviewers and reconcile uncertain review submissions before syncing.");
+      if (reviews.some(review => review.issueWorkerId && review.issueWorkerId !== worker.id))
+        throw new Error("This request's reviewer belongs to another issue worker.");
+      if (reviews.some(review => review.draft && (review.reviewHistory?.length ?? 0) >= MAX_FORGE_REVIEW_HISTORY))
+        throw new Error("The review history limit has been reached. Inspect this worker before syncing.");
+      if (!sameRepository(worker.repository, this.deps.settings().repository))
+        throw new Error("The configured repository changed. Restore it before syncing this worker.");
+      this.cancelProviderRecovery(worker);
+      const controller = new AbortController();
+      this.operations.set(worker.id, controller);
+      try {
+        const provider = this.providerFor(worker);
+        const change = await provider.getChangeRequest(worker.changeNumber);
+        requirePublicationRequest(worker, change);
+        const issue = await provider.getIssue(worker.number);
+        if (change.merged || issue.number !== worker.number || issue.state !== "open")
+          throw new Error("Syncing requires the original issue and its change request to remain open.");
+        for (const member of [worker, ...reviews]) {
+          await this.recoverResources(member);
+          await this.quiesce(member);
+        }
+        await this.deps.runtime.syncPublishedBranch(workerWorkspace(worker), worker.headSha, change.headSha, controller.signal);
+        worker.headSha = change.headSha;
+        worker.feedbackDigest = undefined;
+        worker.autoReview = { enabled: true, phase: "reviewing", placement };
+        for (const review of reviews) review.status = "completed";
+        worker.status = "awaiting_review";
+        worker.error = undefined;
+        await this.persist();
+        await this.startAutoReview(worker);
+        return structuredClone(worker);
+      } catch (error) {
+        await this.fail(worker, error);
+        throw error;
+      }
+    });
+  }
   private async resumeWorker(id: string, placement: ForgePlacement): Promise<ForgeWorker> {
     const worker = this.requireWorker(id);
     if (
@@ -639,6 +694,7 @@ export class ForgeWorkflowService {
   poll(): Promise<void> {
     return this.exclusive(async () => {
       if (this.disposed) return;
+      await this.resumeScheduledWorkers();
       await this.reconcileCompletedWorkers();
       for (const worker of this.workers.filter(w => w.status === "awaiting_publication")) {
         if (this.disposed) return;
@@ -800,6 +856,7 @@ export class ForgeWorkflowService {
     const signal = this.operations.get(worker.id)?.signal;
     if (signal?.aborted && (error === signal.reason || unavailable instanceof ForgeProviderUnavailableError)) return true;
     if (!(unavailable instanceof ForgeProviderUnavailableError)) return false;
+    if (await this.scheduleProviderReset(worker, error)) return true;
     if (worker.mergeAttempted || worker.pendingPublication ||
       !["awaiting_review", "awaiting_merge", "paused", "stopped", "failed"].includes(worker.status)) return false;
     const review = this.autoReviewer(worker);
@@ -834,11 +891,56 @@ export class ForgeWorkflowService {
     await this.pauseAutoReview(worker, `${unavailable.message} Resume the issue loop when provider access is restored.`);
     return true;
   }
+  private async scheduleProviderReset(worker: ForgeWorker, error: unknown): Promise<boolean> {
+    const unavailable = error instanceof ForgeMergeNotStartedError ? error.cause : error;
+    if (!(unavailable instanceof ForgeProviderUnavailableError) || unavailable.failure !== "rate_limited" ||
+        !unavailable.retryable || !Number.isFinite(unavailable.retryAfterMs) || unavailable.retryAfterMs! <= 0 ||
+        worker.kind !== "issue" || !worker.autoReview?.enabled || worker.mergeAttempted || ["creating", "uncertain"].includes(worker.publicationState ?? "")) return false;
+    const publication = worker.pendingPublication;
+    const safePublication = publication && !publication.headSha && !publication.replyingToDiscussionId;
+    const review = this.autoReviewer(worker);
+    const safeReview = !publication && worker.autoReview?.enabled && worker.autoReview.phase !== "implementing" &&
+      (!review || review.status === "completed" && !["posting", "post_failed"].includes(review.draft?.status ?? ""));
+    if (!safePublication && !safeReview) return false;
+    const deadline = Date.now() + unavailable.retryAfterMs!;
+    if (!Number.isFinite(deadline) || deadline > 8.64e15) return false;
+    try {
+      await this.recoverResources(worker);
+      await this.quiesce(worker);
+    } catch (cleanupError) {
+      await this.cleanupFailed(worker, cleanupError);
+      return true;
+    }
+    this.cancelProviderRecovery(worker);
+    worker.providerRetryAt = new Date(deadline).toISOString();
+    worker.status = "paused";
+    worker.error = `${unavailable.message} This worker will resume automatically at ${worker.providerRetryAt}.`;
+    await this.persist();
+    return true;
+  }
+  private async resumeScheduledWorkers(): Promise<void> {
+    for (const worker of this.workers.filter(candidate => candidate.providerRetryAt && Date.parse(candidate.providerRetryAt) <= Date.now())) {
+      if (this.disposed) return;
+      worker.providerRetryAt = undefined;
+      await this.persist();
+      try {
+        const placement = worker.autoReview?.placement;
+        if (!placement) throw new Error("The scheduled worker has no saved placement. Resume it explicitly.");
+        if (worker.autoReview?.enabled && worker.autoReview.phase !== "implementing" && !worker.pendingPublication)
+          await this.resumeAutoReview(worker, placement);
+        else await this.resumeWorker(worker.id, placement);
+      } catch (error) {
+        await this.fail(worker, error);
+      }
+    }
+  }
   private async exhaustProviderRecovery(worker: ForgeWorker, reason: string): Promise<void> {
     this.providerRecoveries.delete(worker.id);
     await this.pauseAutoReview(worker, `${reason} Automatic recovery exhausted. Resume the issue loop when provider access is restored.`);
   }
   private cancelProviderRecovery(worker: ForgeWorker): void {
+    if (worker.providerRetryAt) worker.error = undefined;
+    worker.providerRetryAt = undefined;
     const recovery = this.providerRecoveries.get(worker.id);
     if (!recovery) return;
     if (worker.error === recovery.retryMessage) worker.error = undefined;
@@ -954,12 +1056,18 @@ export class ForgeWorkflowService {
     loop.phase = "merging";
     worker.status = "awaiting_merge";
     await this.persist();
-    if (!context.change.reviewReady || !context.change.approved || context.change.draft) return;
-    if (context.change.requiresBaseUpdate) {
+    if (!context.change.reviewReady || !context.change.approved || context.change.draft) {
+      await this.waitForMergeRequirements(worker, context.change);
+      return;
+    }
+    if (context.change.requiresBaseUpdate || context.change.checks?.state === "failed") {
       await this.updateBranchForMerge(worker);
       return;
     }
-    if (!context.change.mergeable) return;
+    if (!context.change.mergeable) {
+      await this.waitForMergeRequirements(worker, context.change);
+      return;
+    }
     const signal = this.operations.get(worker.id)?.signal;
     await this.deps.runtime.verifyPublishedWorkspace(workerWorkspace(worker), worker.headSha!);
     signal?.throwIfAborted();
@@ -969,7 +1077,10 @@ export class ForgeWorkflowService {
       await this.startAutoReview(worker);
       return;
     }
-    if (!latest.change.reviewReady || !latest.change.approved || !latest.change.mergeable || latest.change.draft || latest.change.unresolvedDiscussions) return;
+    if (!latest.change.reviewReady || !latest.change.approved || !latest.change.mergeable || latest.change.draft || latest.change.unresolvedDiscussions) {
+      await this.waitForMergeRequirements(worker, latest.change);
+      return;
+    }
     try {
       await this.mergePublishedIssue(worker, this.providerFor(worker));
     } catch (error) {
@@ -984,6 +1095,14 @@ export class ForgeWorkflowService {
     if (!(await this.reconcileMergedChange(worker, { signal })))
       await this.waitForIssueClosure(worker, "Merge succeeded. Waiting for the provider to confirm completion.");
     this.deps.notify("Issue merged", `${worker.title} has merged. Local workers are cleaned up once linked issues are closed.`);
+  }
+  private async waitForMergeRequirements(worker: ForgeWorker, change: ForgeChangeRequest): Promise<void> {
+    worker.error = change.draft ? "The request is a draft. Mark it ready for review in the provider." :
+      !change.approved ? "Waiting for approval of the published commit." :
+      change.checks?.state === "pending" ? `Waiting for CI checks to finish. ${change.checks.url}` :
+      change.checks?.state === "failed" ? `CI checks failed. Inspect ${change.checks.url}, resolve the failure, then Resume the issue loop.` :
+      `Waiting for the provider's merge requirements. Inspect ${worker.changeUrl ?? change.url}.`;
+    await this.persist();
   }
   private async mergePublishedIssue(worker: ForgeWorker, provider: ForgeProvider): Promise<void> {
     if (worker.mergeAttempted)
@@ -1054,6 +1173,11 @@ export class ForgeWorkflowService {
             if (await this.reconcileMergedChange(worker, { change: current, signal })) return;
             requirePublicationRequest(worker, current);
             this.requireBaseUpdateSource(worker, current);
+            if (current.checks?.state === "failed") {
+              worker.pendingPublication = undefined;
+              await this.pauseAutoReview(worker, `CI checks failed. Inspect ${current.checks.url}, resolve the failure, then Resume the issue loop.`);
+              return;
+            }
             if (current.requiresBaseUpdate)
               throw new Error("The worker branch already contains the current base branch, but the provider still requires an update. Inspect the request before resuming.");
             worker.pendingPublication = undefined;
@@ -1363,7 +1487,7 @@ export class ForgeWorkflowService {
     if (Date.now() < this.nextCompletionCheckAt) return;
     this.nextCompletionCheckAt = Date.now() + 30_000;
     const checked = new Set<string>();
-    const recovering = this.workers.filter(worker => this.providerRecoveries.has(worker.id));
+    const recovering = this.workers.filter(worker => this.providerRecoveries.has(worker.id) || worker.providerRetryAt);
     for (const worker of [...this.workers]) {
       if (this.disposed) return;
       const number = changeNumber(worker);
@@ -1533,6 +1657,7 @@ export class ForgeWorkflowService {
     await this.persist();
   }
   private async fail(worker: ForgeWorker, error: unknown, { retainReport = false }: { retainReport?: boolean } = {}): Promise<void> {
+    if (await this.scheduleProviderReset(worker, error)) return;
     const wasCleanupFailure = worker.status === "cleanup_failed";
     if (!wasCleanupFailure) {
       try {

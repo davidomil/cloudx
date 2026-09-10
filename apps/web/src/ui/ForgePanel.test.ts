@@ -74,6 +74,7 @@ function fixture(overrides: Partial<ForgeDashboard> = {}, handler?: HookHandler)
       "forge.worker.pause": { worker: { ...worker, status: "paused" } },
       "forge.worker.stop": { worker: { ...worker, status: "stopped" } },
       "forge.worker.resume": { worker },
+      "forge.worker.syncAndReview": { worker },
       "forge.worker.autoReview": { worker }
     };
     if (!(hook in responses)) throw new Error(`Unexpected hook: ${hook}`);
@@ -1061,7 +1062,7 @@ describe("ForgePanel", () => {
     await click(panel.querySelector(".forge-worker")!, action);
     expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([{ hook, input: { id: publishing.id }, tabId: tab.id }]);
     expect(panel.querySelector(".forge-worker-heading .forge-status")?.textContent).toBe(status);
-    expect(button(panel, "Resume").disabled).toBe(false);
+    expect(button(panel, "Retry publication").disabled).toBe(false);
     expect(panel.textContent).not.toContain("work continues automatically");
     expect(panel.querySelector("dialog")).toBeNull();
   });
@@ -1165,7 +1166,7 @@ describe("ForgePanel", () => {
     }
     expect(button(panel, "Save draft").disabled).toBe(false);
     expect(draft.closest("fieldset")!.disabled).toBe(false);
-    expect(button(panel.querySelector(".forge-change-toolbar .forge-worker")!, "Resume").disabled).toBe(false);
+    expect(button(panel.querySelector(".forge-change-toolbar .forge-worker")!, "Retry publication").disabled).toBe(false);
     expect(panel.textContent).not.toContain("work continues automatically");
     expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
 
@@ -1329,6 +1330,111 @@ describe("ForgePanel", () => {
     await click(editor, "Remove comment 1");
     expect(editor.querySelectorAll("textarea")).toHaveLength(2);
     expect(editor.querySelectorAll("textarea")[1].value).toBe("Another concern.");
+  });
+
+  it.each(["failed", "paused", "stopped", "awaiting_review", "awaiting_merge"] as const)("syncs a published %s issue and starts a fresh review", async status => {
+    const published = { ...worker, status, headSha: change.headSha, changeNumber: change.number };
+    const testFixture = fixture({ workers: [published] });
+    const panel = await renderPanel(testFixture);
+    await click(panel, "Sync and re-review");
+    expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([
+      { hook: "forge.worker.syncAndReview", input: { id: worker.id, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id }
+    ]);
+  });
+
+  it.each([
+    { status: "starting" }, { status: "running" }, { status: "awaiting_publication" },
+    { status: "completed" }, { status: "cleanup_failed" }, { kind: "review" },
+    { changeNumber: undefined }, { headSha: undefined }, { mergeAttempted: true },
+    { pendingPublication: publishingWorker.pendingPublication },
+  ] satisfies Partial<ForgeWorker>[])("hides branch sync when the issue is not ready for a fresh review %#", async unavailable => {
+    const published: ForgeWorker = { ...worker, status: "failed", headSha: change.headSha, changeNumber: change.number, ...unavailable };
+    const panel = await renderPanel(fixture({ workers: [published] }));
+    await click(panel, "Workers (1)");
+    expect(Array.from(panel.querySelectorAll("button")).some(item => item.textContent?.trim() === "Sync and re-review")).toBe(false);
+  });
+
+  it.each([
+    { status: "starting", draft: undefined }, { status: "running", draft: undefined },
+    { status: "completed", draft: { ...reviewWorker.draft!, status: "posting" } },
+    { status: "completed", draft: { ...reviewWorker.draft!, status: "post_failed" } },
+  ] satisfies Partial<ForgeWorker>[])("does not sync over an active or uncertain review %#", async reviewState => {
+    const published: ForgeWorker = { ...worker, status: "awaiting_review", headSha: change.headSha, changeNumber: change.number };
+    const child: ForgeWorker = { ...reviewWorker, issueWorkerId: worker.id, ...reviewState };
+    const panel = await renderPanel(fixture({ workers: [published, child] }));
+    const card = panel.querySelector('[aria-label="issue worker #7"]')!;
+    expect(Array.from(card.querySelectorAll("button")).some(item => item.textContent?.trim() === "Sync and re-review")).toBe(false);
+  });
+
+  it("keeps recovery local to the displayed repository", async () => {
+    const published: ForgeWorker = { ...worker, status: "failed", headSha: change.headSha, changeNumber: change.number };
+    const foreign = { ...reviewWorker, status: "running" as const, repository: { ...repository, projectPath: "another/repo" } };
+    const panel = await renderPanel(fixture({ workers: [published, foreign] }));
+    await click(panel, "Workers (2)");
+    expect(button(panel.querySelector('[aria-label="issue worker #7"]')!, "Sync and re-review").disabled).toBe(false);
+  });
+
+  it.each(["awaiting_review", "awaiting_merge"] as const)("exposes Resume for an idle automatic loop in %s", async status => {
+    const published: ForgeWorker = { ...worker, status, changeNumber: change.number, headSha: change.headSha, autoReview: { enabled: true, phase: status === "awaiting_merge" ? "merging" : "reviewing", placement: { windowId: "old-window", paneId: "old-pane" } } };
+    const testFixture = fixture({ workers: [published] });
+    const panel = await renderPanel(testFixture);
+    await click(panel, "Resume");
+    expect(testFixture.calls).toContainEqual({ hook: "forge.worker.resume", input: { id: worker.id, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id });
+  });
+
+  it("shows the scheduled provider retry and a manual publication action", async () => {
+    vi.useFakeTimers();
+    const providerRetryAt = "2026-09-10T18:00:00.000Z";
+    const waiting: ForgeWorker = { ...worker, status: "paused", providerRetryAt, error: "Provider rate limit reached.",
+      pendingPublication: { report: publishingWorker.pendingPublication!.report, repliedDiscussionIds: [] },
+      autoReview: { enabled: true, phase: "implementing", placement: { windowId: "window-1", paneId: "pane-2" } } };
+    let testFixture: ReturnType<typeof fixture>;
+    testFixture = fixture({ workers: [waiting] }, hook => hook === "forge.dashboard" ? structuredClone(testFixture.dashboard) : undefined);
+    const panel = await renderPanel(testFixture);
+    const card = panel.querySelector(".forge-worker")!;
+    expect(card.querySelector("time")?.dateTime).toBe(providerRetryAt);
+    expect(card.querySelector("time")?.textContent).toBe(new Date(providerRetryAt).toLocaleString());
+    expect(card.textContent).toContain("Worker will retry automatically at");
+    expect(card.textContent).toContain("Provider rate limit reached.");
+    expect(card.textContent).not.toContain("The commit was pushed");
+    await click(card, "Retry publication");
+    expect(testFixture.calls).toContainEqual({ hook: "forge.worker.resume", input: { id: worker.id, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id });
+    testFixture.dashboard.workers = [{ ...publishingWorker, status: "awaiting_review", pendingPublication: undefined }];
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    expect(panel.querySelector(".forge-worker time")).toBeNull();
+    expect(panel.querySelector(".forge-worker [role=alert]")).toBeNull();
+    expect(panel.textContent).not.toContain("Worker will retry automatically at");
+    expect(button(panel, "Resume").disabled).toBe(false);
+  });
+
+  it("locks recovery and the obsolete review while sync is pending, then shows the fresh review", async () => {
+    const pending = deferred<unknown>();
+    const published: ForgeWorker = { ...worker, status: "failed", changeNumber: change.number, headSha: change.headSha, error: "The request head changed outside this worker.", autoReview: { enabled: true, phase: "reviewing", reviewWorkerId: reviewWorker.id, placement: { windowId: "window-1", paneId: "pane-2" } } };
+    const oldReview = { ...reviewWorker, issueWorkerId: worker.id };
+    const newHead = "c".repeat(40);
+    let testFixture: ReturnType<typeof fixture>;
+    testFixture = fixture({ workers: [published, oldReview] }, hook => {
+      if (hook === "forge.dashboard") return structuredClone(testFixture.dashboard);
+      if (hook === "forge.change.get") return { change: { ...change, headSha: newHead } };
+      if (hook === "forge.worker.syncAndReview") return pending.promise;
+    });
+    const panel = await renderPanel(testFixture);
+    await click(panel, "Pull requests");
+    expect(button(panel, "Submit review").disabled).toBe(true);
+    await click(panel, "Sync and re-review");
+    expect(button(panel, "Sync and re-review").disabled).toBe(true);
+    expect(button(panel, "Resume").disabled).toBe(true);
+    expect(button(panel, "Submit review").closest("fieldset")?.disabled).toBe(true);
+    await click(panel, "Sync and re-review");
+    await click(panel, "Submit review");
+    const freshReview: ForgeWorker = { ...oldReview, status: "running", draft: undefined, headSha: newHead };
+    testFixture.dashboard.workers = [{ ...published, status: "awaiting_review", headSha: newHead, error: undefined }, freshReview];
+    await act(async () => { pending.resolve({ worker: testFixture.dashboard.workers[0] }); });
+    expect(panel.textContent).not.toContain("The request head changed outside this worker.");
+    expect(panel.textContent).not.toContain("Add a timeout.");
+    expect(panel.querySelector('[aria-label="review worker #12"] .forge-status')?.textContent).toBe("running");
+    expect(testFixture.calls.filter(call => call.hook === "forge.worker.syncAndReview")).toHaveLength(1);
+    expect(testFixture.calls.some(call => ["forge.review.save", "forge.review.submit"].includes(call.hook))).toBe(false);
   });
 
   it.each([

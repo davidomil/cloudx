@@ -190,6 +190,7 @@ export class GitLabProvider implements ForgeProvider {
       reviewReady: Boolean(patchIdSha) && !["checking", "approvals_syncing", "preparing", "unchecked"].includes(mergeStatus),
       mergeable: mergeStatus === "mergeable",
       requiresBaseUpdate: mergeStatus === "need_rebase",
+      checks: gitlabHeadChecks(current, headSha),
       approved,
       unresolvedDiscussions,
       comments,
@@ -571,6 +572,19 @@ export class GitLabProvider implements ForgeProvider {
     const offset = (page - 1) * perPage;
     return { items: items.slice(offset, offset + perPage), ...(offset + perPage < items.length ? { nextPage: page + 1 } : {}) };
   }
+}
+
+function gitlabHeadChecks(request: Record<string, unknown>, headSha: string): NonNullable<ForgeChangeRequest["checks"]> {
+  const unknown = { state: "unknown" as const, url: webUrl(request.web_url) };
+  if (request.head_pipeline === undefined || request.head_pipeline === null) return unknown;
+  const pipeline = record(request.head_pipeline);
+  if (gitlabHeadSha(pipeline.sha) !== headSha) return unknown;
+  const status = string(pipeline.status);
+  const state = status === "success" ? "passed"
+    : status === "failed" || status === "canceled" ? "failed"
+    : ["created", "waiting_for_resource", "preparing", "pending", "running", "manual", "scheduled"].includes(status) ? "pending"
+    : "unknown";
+  return { state, url: webUrl(pipeline.web_url) };
 }
 
 function gitlabReviewerIds(value: unknown): number[] {

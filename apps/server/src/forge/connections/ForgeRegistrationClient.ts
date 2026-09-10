@@ -18,6 +18,15 @@ export interface GitHubAppManifest {
   default_permissions: Record<string, "read" | "write">;
 }
 
+export class GitHubInstallationPermissionError extends ForgeProviderError {
+  constructor(role: ForgeCredentialRole, permission: string, access: "read" | "write") {
+    super(
+      `Grant the ${role} GitHub App ${permission === "workflows" ? "Workflows" : permission}: ${access} permission, approve the updated permissions for its installation, then continue installation.`,
+      403,
+    );
+  }
+}
+
 export class ForgeRegistrationClient {
   constructor(private readonly fetcher: typeof fetch = fetch) {}
 
@@ -90,7 +99,7 @@ export class ForgeRegistrationClient {
     requireId(expectedInstallationId);
     requireId(app.appId);
     const permissions = githubPermissions(role);
-    return this.request(
+    const granted = await this.request(
       repository,
       `/repos/${repository.projectPath}/installation`,
       {
@@ -105,14 +114,14 @@ export class ForgeRegistrationClient {
           body.suspended_at !== null
         )
           throw new Error("Installation identity mismatch or suspended");
-        const granted = record(body.permissions);
-        for (const [permission, access] of Object.entries(permissions)) {
-          if (granted[permission] !== "write" && granted[permission] !== access)
-            throw new Error("Required permission missing");
-        }
-        return { installationId: expectedInstallationId };
+        return record(body.permissions);
       },
     );
+    for (const [permission, access] of Object.entries(permissions)) {
+      if (granted[permission] !== "write" && granted[permission] !== access)
+        throw new GitHubInstallationPermissionError(role, permission, access);
+    }
+    return { installationId: expectedInstallationId };
   }
 
   async gitlabCheckSetup(
@@ -341,7 +350,12 @@ function githubPermissions(
 ): Record<string, "read" | "write"> {
   requireRole(role);
   const access = role === "worker" ? "write" : "read";
-  return { contents: access, issues: access, pull_requests: "write" };
+  return {
+    contents: access,
+    issues: access,
+    pull_requests: "write",
+    ...(role === "worker" ? { workflows: "write" } : {}),
+  };
 }
 
 function requireRole(role: ForgeCredentialRole): void {

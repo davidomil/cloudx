@@ -66,6 +66,10 @@ interface DirectoryIdentity {
   ino: string;
 }
 
+interface OwnedPublishedSync {
+  expectedLocalHeadSha: string;
+  expectedRemoteHeadSha: string;
+}
 interface OwnedBaseUpdate {
   expectedHeadSha: string;
   baseBranch: string;
@@ -95,6 +99,7 @@ interface OwnedWorkspace extends ForgeWorkspace {
   prepared: boolean;
   launchPending: boolean;
   baseUpdate?: OwnedBaseUpdate;
+  publishedSync?: OwnedPublishedSync;
   reviewBaseSha?: string;
   reviewRefresh?: OwnedReviewRefresh;
   reviewConversation?: ReviewConversationBinding;
@@ -677,6 +682,56 @@ export class ForgeRuntime {
     });
   }
 
+  syncPublishedBranch(
+    workspace: ForgeWorkspace,
+    expectedLocalHeadSha: string,
+    expectedRemoteHeadSha: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    return this.serialize(workspace.id, async () => {
+      if (!isCommitSha(expectedLocalHeadSha) || !isCommitSha(expectedRemoteHeadSha))
+        throw new Error("Branch synchronization requires exact local and published commits.");
+      const owned = await this.matchOwned(workspace);
+      if (!owned.prepared || !owned.branchOwned || !owned.branch || owned.cleaned || owned.launchPending)
+        throw new Error("Only an idle owned issue branch can be synchronized.");
+      await this.assertQuiescent(owned);
+      await this.assertCheckout(owned);
+      await this.requireNoGitOperation(owned);
+      const saved = owned.publishedSync;
+      const recovering = saved?.expectedLocalHeadSha === expectedLocalHeadSha && saved.expectedRemoteHeadSha === expectedRemoteHeadSha &&
+        await this.requireBranchHead(owned, signal) === expectedRemoteHeadSha;
+      await this.verifyCleanHead(owned, recovering ? expectedRemoteHeadSha : expectedLocalHeadSha, signal);
+      const access = await this.access(owned.expectedRepository, "worker", signal);
+      if (access.cloneUrl !== owned.origin) throw new Error("Repository origin changed while the worker was running.");
+      await this.runOwnedGit(owned, ["fetch", "--no-tags", "--no-recurse-submodules", access.cloneUrl,
+        `+refs/heads/${owned.branch}:refs/cloudx/sync-published`], signal, access.authorization);
+      const fetchedHead = (await this.runGit(owned.worktreePath, ["rev-parse", "--verify", "refs/cloudx/sync-published^{commit}"], signal)).trim();
+      if (fetchedHead !== expectedRemoteHeadSha)
+        throw new Error("The published branch changed before synchronization. Refresh and sync again.");
+      await this.verifyCleanHead(owned, recovering ? expectedRemoteHeadSha : expectedLocalHeadSha, signal);
+      if (!recovering) {
+        await this.requireNoIgnoredSyncCollision(owned, expectedLocalHeadSha, expectedRemoteHeadSha, signal);
+        await this.runOwnedGit(owned, ["update-ref", "--no-deref", `refs/cloudx/before-sync/${expectedLocalHeadSha}`, expectedLocalHeadSha], signal);
+        owned.publishedSync = { expectedLocalHeadSha, expectedRemoteHeadSha };
+        await this.manifest(owned.id).write(owned);
+        await this.runOwnedGit(owned, ["reset", "--keep", expectedRemoteHeadSha], signal);
+      }
+      await this.verifyCleanHead(owned, expectedRemoteHeadSha);
+      owned.baseUpdate = undefined;
+      await this.manifest(owned.id).write(owned);
+      signal?.throwIfAborted();
+    });
+  }
+
+  private async requireNoIgnoredSyncCollision(owned: OwnedWorkspace, previousHead: string, nextHead: string, signal?: AbortSignal): Promise<void> {
+    const added = (await this.runGit(owned.worktreePath,
+      ["diff", "--name-only", "--no-renames", "--diff-filter=A", "-z", previousHead, nextHead], signal)).split("\0").filter(Boolean);
+    const ignored = (await this.runGit(owned.worktreePath,
+      ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"], signal)).split("\0").filter(Boolean).map(entry => entry.replace(/\/$/u, ""));
+    if (added.some(file => ignored.some(entry => file === entry || file.startsWith(`${entry}/`) || entry.startsWith(`${file}/`))))
+      throw new Error("Ignored local files would be overwritten by the published branch. Move them before syncing.");
+  }
+
   updateIssueBranch(
     workspace: ForgeWorkspace,
     expectedHeadSha: string,
@@ -1041,6 +1096,8 @@ export class ForgeRuntime {
           value.gitDirectory.path !== path.join(value.worktreePath, ".git"))) ||
       (value.gitConfigHash !== undefined &&
         !/^[a-f0-9]{64}$/u.test(value.gitConfigHash)) ||
+      (value.publishedSync !== undefined &&
+        (value.role !== "worker" || !isCommitSha(value.publishedSync.expectedLocalHeadSha) || !isCommitSha(value.publishedSync.expectedRemoteHeadSha))) ||
       (value.baseUpdate !== undefined &&
         (value.role !== "worker" || !isOwnedBaseUpdate(value.baseUpdate))) ||
       (value.role === "reviewer" && value.prepared && !isCommitSha(value.reviewBaseSha)) ||
@@ -1510,6 +1567,7 @@ async function git(
     },
   );
   const output: Buffer[] = [];
+  const errorOutput: Buffer[] = [];
   let bytes = 0;
   let failure: unknown;
   const stop = (reason: unknown): void => {
@@ -1530,7 +1588,7 @@ async function git(
     bytes += chunk.length;
     if (bytes > 2_000_000)
       stop(new Error("Git command exceeded its output limit."));
-    else if (retain) output.push(chunk);
+    else (retain ? output : errorOutput).push(chunk);
   };
   child.stdout.on("data", (chunk: Buffer) => collect(chunk, true));
   child.stderr.on("data", (chunk: Buffer) => collect(chunk, false));
@@ -1549,8 +1607,11 @@ async function git(
       child.once("close", resolve);
     });
     if (failure) throw failure;
-    if (code !== 0)
+    if (code !== 0) {
+      if (args[0] === "push" && /refusing to allow a GitHub App to create or update workflow\b/iu.test(Buffer.concat(errorOutput).toString("utf8")))
+        throw new Error("GitHub rejected workflow changes. Grant the worker App Workflows: write permission and approve it for this installation, then retry publishing.");
       throw new Error(`Git ${args[0]} failed with exit code ${code}.`);
+    }
     return Buffer.concat(output).toString("utf8");
   } finally {
     clearTimeout(timer);

@@ -79,6 +79,7 @@ function fixture() {
     close: vi.fn(async () => {}),
     cleanup: vi.fn(async () => {}),
     verifyPublishedWorkspace: vi.fn(async () => {}),
+    syncPublishedBranch: vi.fn(async (_workspace: unknown, _local: string, _remote: string, _signal?: AbortSignal) => {}),
     updateIssueBranch: vi.fn(async (_workspace: unknown, _head: string, _baseBranch: string, _signal?: AbortSignal) => "c".repeat(40)),
     publishBranch: vi.fn(async () => change.headSha),
   };
@@ -1858,6 +1859,48 @@ describe("Forge issue auto review", () => {
     expect(f.stored()).toEqual([]);
   });
 
+  it("pauses an approved current branch with failed CI and names the check results", async () => {
+    const f = await approvedIssue();
+    f.change.checks = { state: "failed", url: "https://github.com/a/b/pull/7/checks" };
+    f.runtime.updateIssueBranch.mockResolvedValue(f.change.headSha);
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringMatching(/CI.*failed.*https:\/\/github.com\/a\/b\/pull\/7\/checks.*Resume/) });
+    expect(f.currentIssue().pendingPublication).toBeUndefined();
+    await f.poll();
+    expect(f.runtime.updateIssueBranch).toHaveBeenCalledOnce();
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    f.change.checks.state = "passed";
+    f.change.mergeable = true;
+    await f.service.resume(f.issue.id, placement);
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it("updates a behind branch once when failed CI masks the provider behind status", async () => {
+    const f = await approvedIssue();
+    f.change.checks = { state: "failed", url: "https://github.com/a/b/pull/7/checks" };
+    f.change.requiresBaseUpdate = false;
+    f.runtime.publishBranch.mockImplementation(async () => {
+      f.change.headSha = "c".repeat(40);
+      f.change.requiresBaseUpdate = false;
+      f.change.checks!.state = "pending";
+      return f.change.headSha;
+    });
+    await f.poll();
+    expect(f.runtime.updateIssueBranch).toHaveBeenCalledOnce();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_review", headSha: "c".repeat(40) });
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("describes pending CI while preserving the completed approval", async () => {
+    const f = await approvedIssue();
+    f.change.checks = { state: "pending", url: "https://github.com/a/b/pull/7/checks" };
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", error: expect.stringContaining("Waiting for CI checks") });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+  });
+
   async function approvedIssue() {
     const f = await automaticIssue();
     f.codingReport(); await f.poll();
@@ -1866,6 +1909,118 @@ describe("Forge issue auto review", () => {
     await f.poll();
     return f;
   }
+
+  it("syncs an externally rebased issue and requires a fresh review without publishing or coding again", async () => {
+    const f = await approvedIssue();
+    const previous = f.currentIssue().headSha!;
+    const review = f.currentReview();
+    const oldDraft = review.draft!;
+    f.change.headSha = "d".repeat(40);
+    await f.poll();
+    expect(f.currentIssue().status).toBe("failed");
+
+    await f.service.syncAndReview(f.issue.id, placement);
+
+    expect(f.runtime.syncPublishedBranch).toHaveBeenCalledWith(expect.objectContaining({ id: f.issue.id }), previous, f.change.headSha, expect.any(AbortSignal));
+    expect(f.currentIssue()).toMatchObject({ headSha: f.change.headSha, status: "awaiting_review", autoReview: { phase: "reviewing", enabled: true } });
+    expect(f.currentReview()).toMatchObject({ id: review.id, headSha: f.change.headSha, status: "running", reviewHistory: [oldDraft] });
+    expect(f.currentReview().draft).toBeUndefined();
+    await expect(f.service.submitReview(review.id, oldDraft.id)).rejects.toThrow();
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each(["pending publication", "uncertain merge", "uncertain review", "changed branches", "dirty checkout"])("refuses synchronization with %s", async reason => {
+    const f = await approvedIssue();
+    f.change.headSha = "d".repeat(40);
+    await f.poll();
+    const saved = f.stored();
+    const issue = saved.find(worker => worker.id === f.issue.id)!;
+    const review = saved.find(worker => worker.kind === "review")!;
+    if (reason === "pending publication") issue.pendingPublication = { report: { kind: "issue", title: "Fix", body: "Ready", resolvedDiscussionIds: [], discussionReplies: [] }, repliedDiscussionIds: [] };
+    if (reason === "uncertain merge") issue.mergeAttempted = true;
+    if (reason === "uncertain review") { review.draft!.status = "post_failed"; delete review.draft!.publication; delete review.draft!.postedAt; }
+    if (reason === "changed branches") f.change.headBranch = "someone-else";
+    if (reason === "dirty checkout") f.runtime.syncPublishedBranch.mockRejectedValue(new Error("Local changes were preserved"));
+    await f.deps.store.write(saved);
+    const service = new ForgeWorkflowService(f.deps);
+    await service.dashboard();
+    await expect(service.syncAndReview(f.issue.id, placement)).rejects.toThrow();
+    if (reason !== "dirty checkout") expect(f.runtime.syncPublishedBranch).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+  });
+
+  it("does not sync while another reviewer is active", async () => {
+    const f = await approvedIssue();
+    f.change.headSha = "d".repeat(40);
+    await f.poll();
+    await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    await expect(f.service.syncAndReview(f.issue.id, placement)).rejects.toThrow(/active reviewers/);
+    expect(f.runtime.syncPublishedBranch).not.toHaveBeenCalled();
+  });
+
+  it.each(["pause", "stop", "disable", "resume"] as const)("clears a scheduled rate-limit reset on explicit %s", async action => {
+    const f = await approvedIssue();
+    f.provider.getChangeRequest.mockRejectedValueOnce(new ForgeProviderUnavailableError("rate_limited", "request", { retryable: true, retryAfterMs: 3_600_000 }));
+    await f.poll();
+    if (action === "disable") await f.service.setAutoReview(f.issue.id, false, placement);
+    else if (action === "resume") await f.service.resume(f.issue.id, placement);
+    else await f.service[action](f.issue.id);
+    expect(f.currentIssue().providerRetryAt).toBeUndefined();
+    expect(f.currentIssue().error ?? "").not.toContain("resume automatically");
+  });
+
+  it("waits through a one-hour rate limit and resumes the approved phase after restart", async () => {
+    const f = await approvedIssue();
+    f.provider.getChangeRequest.mockRejectedValueOnce(new ForgeProviderUnavailableError("rate_limited", "request", { retryable: true, retryAfterMs: 3_600_000 }));
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", providerRetryAt: new Date(Date.now() + 3_600_000).toISOString() });
+    const service = new ForgeWorkflowService(f.deps);
+    await service.dashboard();
+    f.provider.getChangeRequest.mockClear();
+    f.provider.getChangeRequestStatus.mockClear();
+    f.advanceTime(3_599_999);
+    await service.poll();
+    expect(f.provider.getChangeRequest).not.toHaveBeenCalled();
+    expect(f.provider.getChangeRequestStatus).not.toHaveBeenCalled();
+    f.change.mergeable = true;
+    f.advanceTime(1);
+    await service.poll();
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries publication at credential rate-limit reset using its retained completion report", async () => {
+    const f = await automaticIssue();
+    f.codingReport();
+    f.runtime.publishBranch.mockRejectedValueOnce(new ForgeProviderUnavailableError("rate_limited", "authentication", { retryable: true, retryAfterMs: 3_600_000 }));
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", providerRetryAt: expect.any(String), pendingPublication: { report: { kind: "issue" } } });
+    expect(f.provider.createChangeRequest).not.toHaveBeenCalled();
+    f.advanceTime(3_600_000);
+    await f.service.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_review" });
+    expect(f.currentIssue().providerRetryAt).toBeUndefined();
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+    expect(f.provider.createChangeRequest).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not schedule an uncertain publication write even when its error is rate limiting", async () => {
+    const f = await automaticIssue();
+    f.codingReport();
+    f.provider.createChangeRequest.mockRejectedValueOnce(new ForgeProviderUnavailableError("rate_limited", "request", { retryable: true, retryAfterMs: 3_600_000 }));
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "failed", publicationState: "uncertain" });
+    expect(f.currentIssue().providerRetryAt).toBeUndefined();
+    f.advanceTime(3_600_000);
+    await f.service.poll();
+    expect(f.provider.createChangeRequest).toHaveBeenCalledOnce();
+  });
 
   function transientProviderFailure(retryAfterMs?: number) {
     return new ForgeProviderUnavailableError("timeout", "request", { retryable: true, retryAfterMs });
@@ -2060,7 +2215,7 @@ describe("Forge issue auto review", () => {
     expect(nextSignal).not.toBe(previousSignal);
     expect(nextSignal?.aborted).toBe(false);
     expect(f.currentIssue().status).toBe("awaiting_merge");
-    expect(f.currentIssue().error).toBeUndefined();
+    expect(f.currentIssue().error).toMatch(/^Waiting for/);
   });
 
   it.each(["head", "feedback"])("rechecks changed %s on automatic recovery before using an earlier approval", async changed => {
@@ -2181,7 +2336,7 @@ describe("Forge issue auto review", () => {
     expect(provider.mock.calls.at(-1)?.[2]?.aborted).toBe(true);
     response.reject(new ForgeProviderUnavailableError("cancelled"));
     await Promise.all([polling, controlling]);
-    expect(f.currentIssue()).toMatchObject({ status: action === "pause" ? "paused" : "stopped", error: undefined });
+    expect(f.currentIssue()).toMatchObject({ status: action === "pause" ? "paused" : "stopped", error: expect.stringMatching(/^Waiting for/) });
     expect(f.currentReview()).toMatchObject({ status: "completed", draft: { status: "posted" } });
     expect(f.deps.notify).not.toHaveBeenCalled();
     expect(f.provider.merge).not.toHaveBeenCalled();
@@ -2218,7 +2373,7 @@ describe("Forge issue auto review", () => {
     else response.resolve({ ...f.change });
     await Promise.all([resuming, stopping]);
     expect(signalWasAborted).toBe(true);
-    expect(f.currentIssue()).toMatchObject({ status: "stopped", error: undefined });
+    expect(f.currentIssue()).toMatchObject({ status: "stopped", error: expect.stringMatching(/^Waiting for/) });
     expect(f.currentReview()).toMatchObject({ status: "completed", draft: { status: "posted" } });
     expect(f.deps.notify).not.toHaveBeenCalled();
     expect(f.runtime.verifyPublishedWorkspace).not.toHaveBeenCalled();
