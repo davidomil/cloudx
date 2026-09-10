@@ -801,6 +801,50 @@ describe("Forge publication and feedback reconciliation", () => {
     expect(f.reports.remove).toHaveBeenCalledOnce();
   });
 
+  it("retries a workflow permission rejection after restart without rerunning completed work", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    const report = { kind: "issue", title: "Add workflow diagnostics", body: "Workflow diagnostics validated.", resolvedDiscussionIds: [], discussionReplies: [] };
+    const permissionError = "GitHub rejected workflow changes. Grant the worker App Workflows: write permission and approve it for this installation, then retry publishing.";
+    f.reports.read.mockResolvedValue(report);
+    f.runtime.publishBranch.mockRejectedValueOnce(new Error(permissionError));
+
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({
+      status: "failed", error: permissionError, worktreePath: worker.worktreePath, branch: worker.branch,
+      pendingPublication: { report, repliedDiscussionIds: [] },
+    });
+    expect(f.stored()[0].pendingPublication?.headSha).toBeUndefined();
+    expect(f.stored()[0].changeNumber).toBeUndefined();
+    expect(f.stored()[0].providerRetryAt).toBeUndefined();
+    expect(f.provider.createChangeRequest).not.toHaveBeenCalled();
+    expect(f.reports.remove).toHaveBeenCalledOnce();
+    f.reports.read.mockResolvedValue(undefined);
+
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", pendingPublication: { report } });
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+
+    const published = await restarted.resume(worker.id, placement);
+    expect(published).toMatchObject({
+      status: "awaiting_review", headSha: f.change.headSha, changeNumber: f.change.number,
+      worktreePath: worker.worktreePath, branch: worker.branch,
+    });
+    expect(published.error).toBeUndefined();
+    expect(published.pendingPublication).toBeUndefined();
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+    expect(f.provider.createChangeRequest).toHaveBeenCalledExactlyOnceWith({
+      title: report.title, body: `${report.body}\n\nCloses #1`, headBranch: worker.branch, baseBranch: worker.baseBranch,
+    });
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledOnce();
+    expect(f.reports.prepare).toHaveBeenCalledOnce();
+    expect(f.reports.read).toHaveBeenCalledOnce();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+  });
+
   it("verifies the pending published head before cleaning up a merged request after resource recovery", async () => {
     const f = fixture();
     const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
