@@ -7,20 +7,24 @@ import queue
 import re
 import tempfile
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
 from typing import Any
 from typing import Callable
 from typing import Sequence
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 
 from .archive import ACTIVE_STATE, ArchiveError, DocumentationArchive
+from .archive_jobs import ArchiveExportJobError, ArchiveExportJobs
+from .archive_imports import ArchiveImports
 
 UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
 DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES = 256 * 1024 * 1024
@@ -97,8 +101,24 @@ class ImportArchiveMergePathRequest(BaseModel):
 def create_app(root: str | Path | None = None) -> FastAPI:
     archive_root = Path(root or os.getenv("CLOUDX_DOCUMENTATION_DATA_DIR", ".cloudx/documentation"))
     archive = DocumentationArchive(archive_root)
-    app = FastAPI(title="Cloudx Documentation Indexer", version="0.1.0")
+    exports = ArchiveExportJobs(archive)
+    imports = ArchiveImports()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        try:
+            yield
+        finally:
+            await run_in_threadpool(imports.close)
+            await run_in_threadpool(exports.close)
+
+    app = FastAPI(title="Cloudx Documentation Indexer", version="0.1.0", lifespan=lifespan)
     app.state.archive = archive
+    app.state.archive_exports = exports
+
+    @app.exception_handler(ArchiveExportJobError)
+    async def export_job_error(_request: Request, error: ArchiveExportJobError) -> JSONResponse:
+        return JSONResponse(status_code=error.status_code, content={"detail": str(error)})
 
     @app.get("/health")
     def health() -> dict:
@@ -115,9 +135,26 @@ def create_app(root: str | Path | None = None) -> FastAPI:
     def stats() -> dict:
         return archive.stats()
 
+    @app.get("/summary")
+    def summary() -> dict:
+        return archive.summary()
+
     @app.get("/portable-manifest")
     def portable_manifest() -> dict:
         return archive.portable_manifest()
+
+    @app.post("/archive/exports", status_code=202)
+    def start_archive_export() -> dict:
+        return exports.start()
+
+    @app.get("/archive/exports/{job_id}")
+    def archive_export_job(job_id: str) -> dict:
+        return exports.get(job_id)
+
+    @app.get("/archive/exports/{job_id}/download")
+    def download_archive_export(job_id: str) -> FileResponse:
+        package = exports.acquire_download(job_id)
+        return ArchiveDownloadResponse(package.path, filename=package.filename, release=lambda: exports.release_download(job_id))
 
     @app.get("/archive/export")
     def export_archive() -> FileResponse:
@@ -137,21 +174,33 @@ def create_app(root: str | Path | None = None) -> FastAPI:
     def import_archive_merge_path(request: ImportArchiveMergePathRequest) -> dict:
         return {"import": handle_archive_error(lambda: archive.import_archive_merge(request.path))}
 
-    @app.post("/archive/import/replace")
-    async def import_archive_replace_upload(file: Annotated[UploadFile, File()], confirmation: Annotated[str, Form()]) -> dict:
-        package_path = await uploaded_archive_package(file, archive.root)
-        try:
-            return {"import": handle_archive_error(lambda: archive.import_archive_replace(package_path, confirmation=confirmation))}
-        finally:
-            package_path.unlink(missing_ok=True)
+    async def import_upload(request: Request, file: UploadFile, operation):
+        package_path = await run_in_threadpool(uploaded_archive_package, file, archive.root)
+        streaming = "application/x-ndjson" in request.headers.get("accept", "")
 
-    @app.post("/archive/import/merge")
-    async def import_archive_merge_upload(file: Annotated[UploadFile, File()]) -> dict:
-        package_path = await uploaded_archive_package(file, archive.root)
+        def run(progress):
+            try:
+                result = operation(package_path, progress)
+                return compact_import_result(result) if streaming else result
+            finally:
+                package_path.unlink(missing_ok=True)
+
         try:
-            return {"import": handle_archive_error(lambda: archive.import_archive_merge(package_path))}
-        finally:
+            transfer = handle_archive_error(lambda: imports.start(run))
+        except Exception:
             package_path.unlink(missing_ok=True)
+            raise
+        if streaming:
+            return StreamingResponse(transfer.events(), media_type="application/x-ndjson")
+        return {"import": await run_in_threadpool(handle_archive_error, transfer.future.result)}
+
+    @app.post("/archive/import/replace", response_model=None)
+    async def import_archive_replace_upload(request: Request, file: Annotated[UploadFile, File()], confirmation: Annotated[str, Form()]):
+        return await import_upload(request, file, lambda path, progress: archive.import_archive_replace(path, confirmation=confirmation, progress=progress))
+
+    @app.post("/archive/import/merge", response_model=None)
+    async def import_archive_merge_upload(request: Request, file: Annotated[UploadFile, File()]):
+        return await import_upload(request, file, lambda path, progress: archive.import_archive_merge(path, progress=progress))
 
     @app.get("/documents")
     def documents(
@@ -377,13 +426,13 @@ def parse_chunk_ids(value: str | None) -> list[int] | None:
     return chunk_ids or None
 
 
-async def uploaded_archive_package(file: UploadFile, archive_root: Path) -> Path:
+def uploaded_archive_package(file: UploadFile, archive_root: Path) -> Path:
     handle = tempfile.NamedTemporaryFile(prefix="cloudx-documentation-import-upload-", suffix=".zip", dir=archive_root.parent, delete=False)
     total = 0
     max_bytes = configured_byte_limit("CLOUDX_DOCUMENTATION_IMPORT_UPLOAD_MAX_BYTES", DEFAULT_ARCHIVE_IMPORT_UPLOAD_MAX_BYTES)
     try:
         while True:
-            chunk = await file.read(min(UPLOAD_READ_CHUNK_BYTES, max_bytes - total + 1))
+            chunk = file.file.read(min(UPLOAD_READ_CHUNK_BYTES, max_bytes - total + 1))
             if not chunk:
                 break
             total += len(chunk)
@@ -398,6 +447,22 @@ async def uploaded_archive_package(file: UploadFile, archive_root: Path) -> Path
         raise
     finally:
         handle.close()
+
+
+class ArchiveDownloadResponse(FileResponse):
+    def __init__(self, path: Path, *, filename: str, release: Callable[[], None]):
+        super().__init__(path, filename=filename, media_type="application/zip", headers={"cache-control": "no-store"})
+        self.release = release
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self.release()
+
+
+def compact_import_result(result: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in result.items() if key not in {"manifest", "rebuildManifest"}}
 
 
 async def read_upload_bytes(file: UploadFile, max_bytes: int) -> bytes:

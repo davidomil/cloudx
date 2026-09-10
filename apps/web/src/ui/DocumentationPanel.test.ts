@@ -5,7 +5,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { DocumentationPanel, type DocumentationPanelState, type DocumentationPanelStateUpdater } from "./DocumentationPanel.js";
+import { createInitialDocumentationPanelState, DocumentationPanel, type DocumentationPanelState, type DocumentationPanelStateUpdater } from "./DocumentationPanel.js";
 import { disposeDocumentationIngestController, disposeDocumentationIngestControllersExcept } from "./documentationPanelQueue.js";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -27,7 +27,7 @@ describe("DocumentationPanel", () => {
     const calls: Array<{ hookId: string; input: Record<string, unknown> }> = [];
     const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}) => {
       calls.push({ hookId, input });
-      if (hookId === "documentation.stats") {
+      if (hookId === "documentation.summary") {
         return hookResult<T>({ activeDocumentCount: 0, activeChunkCount: 0 });
       }
       if (hookId === "documentation.documents.list") {
@@ -107,7 +107,7 @@ describe("DocumentationPanel", () => {
     document.body.append(container);
     const root = createRoot(container);
     const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string) => {
-      if (hookId === "documentation.stats") {
+      if (hookId === "documentation.summary") {
         return hookResult<T>({ activeDocumentCount: 0, activeChunkCount: 0 });
       }
       if (hookId === "documentation.documents.list") {
@@ -140,11 +140,12 @@ describe("DocumentationPanel", () => {
     await unmount(root);
   });
 
-  it("renders archive storage and runtime size totals", async () => {
+  it("calculates archive storage and runtime size totals only on request", async () => {
     const container = document.createElement("div");
     document.body.append(container);
     const root = createRoot(container);
     const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string) => {
+      if (hookId === "documentation.summary") return hookResult<T>({ activeDocumentCount: 2, activeChunkCount: 19 });
       if (hookId === "documentation.stats") {
         return hookResult<T>({
           activeDocumentCount: 2,
@@ -174,6 +175,9 @@ describe("DocumentationPanel", () => {
     });
     await flush();
 
+    expect(container.textContent).not.toContain("Archive 5.0 MiB");
+    await click(buttonByText(container, "Calculate storage details"));
+
     expect(container.textContent).toContain("2 active documents, 19 active chunks");
     expect(container.textContent).toContain("Archive 5.0 MiB logical, 6.0 MiB on disk, 12 files");
     expect(container.textContent).toContain("database 1.0 MiB, snapshots 2.0 MiB, artifacts 1.5 KiB, index 512.0 KiB");
@@ -196,7 +200,7 @@ describe("DocumentationPanel", () => {
     }));
     const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}) => {
       calls.push({ hookId, input });
-      if (hookId === "documentation.stats") {
+      if (hookId === "documentation.summary") {
         return hookResult<T>({ activeDocumentCount: documents.length, activeChunkCount: 42 });
       }
       if (hookId === "documentation.documents.list") {
@@ -305,7 +309,7 @@ describe("DocumentationPanel", () => {
     }));
     const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}) => {
       calls.push({ hookId, input });
-      if (hookId === "documentation.stats") {
+      if (hookId === "documentation.summary") {
         return hookResult<T>({ activeDocumentCount: documents.length, activeChunkCount: 400 });
       }
       if (hookId === "documentation.documents.list") {
@@ -367,7 +371,7 @@ describe("DocumentationPanel", () => {
     let removed = false;
     const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}) => {
       calls.push({ hookId, input });
-      if (hookId === "documentation.stats") {
+      if (hookId === "documentation.summary") {
         return hookResult<T>({ activeDocumentCount: removed ? 0 : 1, activeChunkCount: removed ? 0 : 127 });
       }
       if (hookId === "documentation.documents.list") {
@@ -432,7 +436,7 @@ describe("DocumentationPanel", () => {
     const calls: Array<{ hookId: string; input: Record<string, unknown> }> = [];
     const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}) => {
       calls.push({ hookId, input });
-      if (hookId === "documentation.stats") {
+      if (hookId === "documentation.summary") {
         return hookResult<T>({ activeDocumentCount: 1, activeChunkCount: 3 });
       }
       if (hookId === "documentation.documents.list") {
@@ -526,7 +530,7 @@ describe("DocumentationPanel", () => {
     const calls: Array<{ hookId: string; input: Record<string, unknown> }> = [];
     const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}) => {
       calls.push({ hookId, input });
-      if (hookId === "documentation.stats") {
+      if (hookId === "documentation.summary") {
         return hookResult<T>({ activeDocumentCount: 1, activeChunkCount: 3 });
       }
       if (hookId === "documentation.documents.list") {
@@ -578,7 +582,7 @@ describe("DocumentationPanel", () => {
     const root = createRoot(container);
     const answer = deferred<Record<string, unknown>>();
     const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string) => {
-      if (hookId === "documentation.stats") {
+      if (hookId === "documentation.summary") {
         return hookResult<T>({ activeDocumentCount: 1, activeChunkCount: 3 });
       }
       if (hookId === "documentation.documents.list") {
@@ -633,7 +637,7 @@ describe("DocumentationPanel", () => {
       }
     }));
     const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string) => {
-      if (hookId === "documentation.stats") {
+      if (hookId === "documentation.summary") {
         return hookResult<T>({ activeDocumentCount: 0, activeChunkCount: 0 });
       }
       if (hookId === "documentation.documents.list") {
@@ -674,55 +678,225 @@ describe("DocumentationPanel", () => {
     await unmount(root);
   });
 
-  it("exports archives and gates replace import with the confirmation token", async () => {
+  it("starts export while archive counts are pending and offers a direct download", async () => {
     const container = document.createElement("div");
     document.body.append(container);
     const root = createRoot(container);
-    const archiveFile = new File(["zip"], "archive.zip", { type: "application/zip" });
-    const downloadArchive = vi.fn(async () => ({ blob: new Blob(["zip"]), filename: "cloudx-documentation-test.zip" }));
-    const importArchive = vi.fn(async () => ({ import: { mode: "replace" } }));
-    const createObjectUrl = vi.fn(() => "blob:archive");
-    const revokeObjectUrl = vi.fn();
-    vi.stubGlobal("URL", { ...URL, createObjectURL: createObjectUrl, revokeObjectURL: revokeObjectUrl });
-    let statsCalls = 0;
-    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string) => {
-      if (hookId === "documentation.stats") {
-        statsCalls += 1;
-        return hookResult<T>({ activeDocumentCount: statsCalls > 1 ? 2 : 1, activeChunkCount: 4 });
-      }
-      if (hookId === "documentation.documents.list") {
-        return hookResult<T>({ documents: [], window: { offset: 0, limit: 50, total: 0, hasMore: false } });
-      }
-      return {} as T;
-    };
+    const summary = deferred<Record<string, unknown>>();
+    const exportStatus = deferred<import("../api.js").DocumentationArchiveExport>();
+    const startArchiveExport = vi.fn(async () => ({ id: "export-1", status: "running" as const, stage: "Writing archive files.", progress: 25 }));
+    const getArchiveExport = vi.fn(() => exportStatus.promise);
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string) => hookId === "documentation.summary" ? summary.promise as Promise<T> : {} as T;
+    await act(async () => root.render(createElement(DocumentationPanel, { callHook, startArchiveExport, getArchiveExport })));
 
-    await act(async () => {
-      root.render(createElement(DocumentationPanel, { callHook, downloadArchive, importArchive }));
-    });
-    await flush();
-
+    expect(container.textContent).toContain("Loading archive counts.");
+    expect(buttonByText(container, "Export").disabled).toBe(false);
+    await act(async () => setInputValue(inputByLabel(container, "Question"), "Archive search remains available"));
+    expect(buttonByText(container, "Search").disabled).toBe(false);
     await click(buttonByText(container, "Export"));
-    await flushAsyncWork();
+    expect(startArchiveExport).toHaveBeenCalledOnce();
+    expect(container.textContent).toContain("Writing archive files.");
+    expect(container.querySelector('progress[aria-label="Archive export progress"]')?.getAttribute("value")).toBe("25");
+    expect(container.textContent).toContain("You can switch tabs while the archive is prepared.");
 
-    expect(downloadArchive).toHaveBeenCalled();
-    expect(createObjectUrl).toHaveBeenCalled();
-    expect(container.textContent).toContain("Archive export downloaded as cloudx-documentation-test.zip.");
+    await act(async () => exportStatus.resolve({ id: "export-1", status: "complete", stage: "Archive ready.", progress: 100, filename: "cloudx-documentation.zip" }));
+    const download = container.querySelector<HTMLAnchorElement>('a[download="cloudx-documentation.zip"]');
+    expect(download?.textContent).toContain("Download archive");
+    expect(download?.getAttribute("href")).toBe("/api/documentation/archive/exports/export-1/download");
+    expect(getArchiveExport).toHaveBeenCalledOnce();
+    await unmount(root);
+  });
 
-    await click(buttonByText(container, "replace"));
-    setFileValue(inputByLabel(container, "Archive ZIP"), archiveFile);
-    expect(buttonByText(container, "Import").disabled).toBe(true);
-    setInputValue(inputByLabel(container, "Confirmation"), "REPLACE_DOCUMENTATION_ARCHIVE");
-    await click(buttonByText(container, "Import"));
-    await flushAsyncWork();
-
-    expect(importArchive).toHaveBeenCalledWith({
-      file: archiveFile,
-      mode: "replace",
-      confirmation: "REPLACE_DOCUMENTATION_ARCHIVE"
+  it.each(["merge", "replace"] as const)("reports %s upload and completion without waiting for refreshed counts", async (mode) => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const archiveFile = new File(["archive"], "archive.zip", { type: "application/zip" });
+    const response = deferred<{ import: { mode: string } }>();
+    let reportProgress!: NonNullable<Parameters<NonNullable<Parameters<typeof DocumentationPanel>[0]["importArchive"]>>[0]["onProgress"]>;
+    const importArchive = vi.fn((input: Parameters<NonNullable<Parameters<typeof DocumentationPanel>[0]["importArchive"]>>[0]) => {
+      reportProgress = input.onProgress!;
+      return response.promise;
     });
-    expect(container.textContent).toContain("Archive replace import complete.");
-    expect(statsCalls).toBeGreaterThan(1);
+    const summary = deferred<Record<string, unknown>>();
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string) => hookId === "documentation.summary" ? summary.promise as Promise<T> : {} as T;
+    await act(async () => root.render(createElement(DocumentationPanel, { callHook, importArchive })));
+    await click(buttonByText(container, mode));
+    setFileValue(inputByLabel(container, "Archive ZIP"), archiveFile);
+    if (mode === "replace") {
+      await flush();
+      expect(buttonByText(container, "Import").disabled).toBe(true);
+      setInputValue(inputByLabel(container, "Confirmation"), "REPLACE_DOCUMENTATION_ARCHIVE");
+    }
+    await click(buttonByText(container, "Import"));
+    expect(importArchive).toHaveBeenCalledWith(expect.objectContaining({ file: archiveFile, mode, confirmation: mode === "replace" ? "REPLACE_DOCUMENTATION_ARCHIVE" : undefined, onProgress: expect.any(Function) }));
+    await act(async () => reportProgress({ loadedBytes: 3, totalBytes: 7, lengthComputable: true }));
+    expect(container.textContent).toContain("Uploading archive (3 B / 7 B).");
+    expect(container.querySelector('progress[aria-label="Archive import progress"]')?.getAttribute("value")).toBe("43");
+    await act(async () => reportProgress({ loadedBytes: 7, totalBytes: 7, lengthComputable: true }));
+    expect(container.textContent).toContain("Upload complete.");
+    expect(container.querySelector('progress[aria-label="Archive import progress"]')?.hasAttribute("value")).toBe(false);
+    await act(async () => response.resolve({ import: { mode } }));
+    expect(container.textContent).toContain(`Archive ${mode} import complete.`);
+    expect(container.querySelector('progress[aria-label="Archive import progress"]')?.getAttribute("value")).toBe("100");
+    await unmount(root);
+  });
 
+  it("retains server-owned export jobs across tab unmounts and stops stale polling", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    let root = createRoot(container);
+    let mounted = true;
+    let panelState: DocumentationPanelState | undefined;
+    const staleStatus = deferred<import("../api.js").DocumentationArchiveExport>();
+    const startArchiveExport = vi.fn(async () => ({ id: "persistent-export", status: "running" as const, stage: "Packaging archive.", progress: 40 }));
+    const getArchiveExport = vi.fn().mockImplementationOnce(() => staleStatus.promise).mockResolvedValue({ id: "persistent-export", status: "complete", stage: "Archive ready.", filename: "archive.zip", progress: 100 });
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>() => ({} as T);
+    const applyState = (updater: DocumentationPanelStateUpdater) => {
+      panelState = updater(panelState);
+      if (mounted) root.render(panelElement());
+    };
+    const panelElement = () => createElement(DocumentationPanel, { callHook, startArchiveExport, getArchiveExport, stateKey: "export-tab", state: panelState, onStateChange: applyState });
+    await act(async () => root.render(panelElement()));
+    await click(buttonByText(container, "Export"));
+    mounted = false;
+    await unmount(root);
+    root = createRoot(container);
+    mounted = true;
+    await act(async () => root.render(panelElement()));
+    expect(container.textContent).toContain("Archive ready.");
+    await act(async () => staleStatus.resolve({ id: "persistent-export", status: "running", stage: "Stale packaging progress.", progress: 41 }));
+    expect(container.textContent).not.toContain("Stale packaging progress.");
+    expect(container.querySelector('a[download="archive.zip"]')).not.toBeNull();
+    expect(startArchiveExport).toHaveBeenCalledOnce();
+    expect(getArchiveExport).toHaveBeenCalledTimes(2);
+    await unmount(root);
+  });
+
+  it.each(["", "Export status unavailable."])("allows importing when a restored export is missing, with saved polling error %j", async (archiveExportError) => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const statusResponse = deferred<Response>();
+    const fetchMock = vi.fn(() => statusResponse.promise);
+    vi.stubGlobal("fetch", fetchMock);
+    const archiveFile = new File(["zip"], "archive.zip", { type: "application/zip" });
+    const importArchive = vi.fn(async () => ({ import: { mode: "merge" } }));
+    const startArchiveExport = vi.fn();
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>() => ({} as T);
+    let panelState: DocumentationPanelState = {
+      ...createInitialDocumentationPanelState(),
+      archiveExport: { id: "expired-export", status: "running", stage: "Packaging archive.", progress: 40 },
+      archiveExportError
+    };
+    const applyState = (updater: DocumentationPanelStateUpdater) => {
+      panelState = updater(panelState);
+      root.render(panelElement());
+    };
+    const panelElement = () => createElement(DocumentationPanel, { callHook, startArchiveExport, importArchive, state: panelState, onStateChange: applyState });
+    await act(async () => root.render(panelElement()));
+    await act(async () => setFileValue(inputByLabel(container, "Archive ZIP"), archiveFile));
+    expect(buttonByText(container, "Import").disabled).toBe(true);
+    if (archiveExportError) await click(buttonByText(container, "Check export status"));
+
+    const error = "Archive export was not found or has expired. Prepare a new export.";
+    await act(async () => statusResponse.resolve(new Response(JSON.stringify({ error }), { status: 404 })));
+
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith("/api/documentation/archive/exports/expired-export", expect.any(Object));
+    expect(panelState.archiveExport).toMatchObject({ id: "expired-export", status: "failed", error });
+    expect(container.textContent).toContain(error);
+    expect(container.textContent).not.toContain("Check export status");
+    expect(container.querySelector('progress[aria-label="Archive export progress"]')).toBeNull();
+    expect(buttonByText(container, "Import").disabled).toBe(false);
+    await click(buttonByText(container, "Import"));
+    expect(importArchive).toHaveBeenCalledWith(expect.objectContaining({ file: archiveFile, mode: "merge" }));
+    expect(container.textContent).toContain("Archive merge import complete.");
+    expect(startArchiveExport).not.toHaveBeenCalled();
+    await unmount(root);
+  });
+
+  it.each(["HTTP 503", "network"])("keeps a restored export checkable after a transient %s failure", async (failure) => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const error = "Export status unavailable.";
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(async () => {
+        if (failure === "network") throw new TypeError(error);
+        return new Response(JSON.stringify({ error }), { status: 503 });
+      })
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: "restored-export", status: "complete", stage: "Archive ready.", filename: "archive.zip", progress: 100 })));
+    vi.stubGlobal("fetch", fetchMock);
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>() => ({} as T);
+    let panelState: DocumentationPanelState = {
+      ...createInitialDocumentationPanelState(),
+      archiveExport: { id: "restored-export", status: "running", stage: "Packaging archive.", progress: 40 },
+      archiveImportValue: new File(["zip"], "archive.zip", { type: "application/zip" })
+    };
+    const applyState = (updater: DocumentationPanelStateUpdater) => {
+      panelState = updater(panelState);
+      root.render(panelElement());
+    };
+    const panelElement = () => createElement(DocumentationPanel, { callHook, state: panelState, onStateChange: applyState });
+    await act(async () => root.render(panelElement()));
+
+    expect(panelState.archiveExport?.status).toBe("running");
+    expect(container.textContent).toContain(error);
+    expect(buttonByText(container, "Import").disabled).toBe(true);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    await click(buttonByText(container, "Check export status"));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(panelState.archiveExport?.status).toBe("complete");
+    expect(container.querySelector('a[download="archive.zip"]')).not.toBeNull();
+    expect(buttonByText(container, "Import").disabled).toBe(false);
+    await unmount(root);
+  });
+
+  it("retains archive import completion after navigating away during upload", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    let root = createRoot(container);
+    let mounted = true;
+    let panelState: DocumentationPanelState | undefined;
+    const response = deferred<{ import: { mode: string } }>();
+    const importArchive = vi.fn(() => response.promise);
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>() => ({} as T);
+    const applyState = (updater: DocumentationPanelStateUpdater) => {
+      panelState = updater(panelState);
+      if (mounted) root.render(panelElement());
+    };
+    const panelElement = () => createElement(DocumentationPanel, { callHook, importArchive, stateKey: "archive-import-tab", state: panelState, onStateChange: applyState });
+    await act(async () => root.render(panelElement()));
+    setFileValue(inputByLabel(container, "Archive ZIP"), new File(["zip"], "archive.zip"));
+    await click(buttonByText(container, "Import"));
+    mounted = false;
+    await unmount(root);
+    await act(async () => response.resolve({ import: { mode: "merge" } }));
+    root = createRoot(container);
+    mounted = true;
+    await act(async () => root.render(panelElement()));
+    expect(container.textContent).toContain("Archive merge import complete.");
+    expect(importArchive).toHaveBeenCalledOnce();
+    await unmount(root);
+  });
+
+  it("shows export polling errors with an explicit status check and preserves import failures", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const startArchiveExport = vi.fn(async () => ({ id: "export-error", status: "running" as const, stage: "Packaging archive." }));
+    const getArchiveExport = vi.fn().mockRejectedValueOnce(new Error("Export status unavailable.")).mockResolvedValueOnce({ id: "export-error", status: "failed", stage: "Export failed.", error: "Archive disk full." });
+    const importArchive = vi.fn(async () => { throw new Error("Invalid archive ZIP."); });
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>() => ({} as T);
+    await act(async () => root.render(createElement(DocumentationPanel, { callHook, startArchiveExport, getArchiveExport, importArchive })));
+    await click(buttonByText(container, "Export"));
+    expect(container.textContent).toContain("Export status unavailable.");
+    await click(buttonByText(container, "Check export status"));
+    expect(container.textContent).toContain("Archive disk full.");
+    setFileValue(inputByLabel(container, "Archive ZIP"), new File(["invalid"], "archive.zip"));
+    await click(buttonByText(container, "Import"));
+    expect(container.textContent).toContain("Invalid archive ZIP.");
+    expect(buttonByText(container, "Import").disabled).toBe(false);
     await unmount(root);
   });
 
@@ -763,7 +937,7 @@ describe("DocumentationPanel", () => {
     }];
     const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}) => {
       calls.push({ hookId, input });
-      if (hookId === "documentation.stats") {
+      if (hookId === "documentation.summary") {
         return hookResult<T>({ activeDocumentCount: 0, activeChunkCount: 0 });
       }
       if (hookId === "documentation.documents.list") {
@@ -819,7 +993,7 @@ describe("DocumentationPanel", () => {
     const secondImport = deferred<Record<string, unknown>>();
     const ingestCalls: Record<string, unknown>[] = [];
     const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}) => {
-      if (hookId === "documentation.stats") {
+      if (hookId === "documentation.summary") {
         return hookResult<T>({ activeDocumentCount: 0, activeChunkCount: 0 });
       }
       if (hookId === "documentation.documents.list") {
@@ -879,7 +1053,7 @@ describe("DocumentationPanel", () => {
     const firstImport = deferred<Record<string, unknown>>();
     const ingestCalls: Record<string, unknown>[] = [];
     const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}) => {
-      if (hookId === "documentation.stats") {
+      if (hookId === "documentation.summary") {
         return hookResult<T>({ activeDocumentCount: 0, activeChunkCount: 0 });
       }
       if (hookId === "documentation.documents.list") {
@@ -946,7 +1120,7 @@ describe("DocumentationPanel", () => {
     const firstImport = deferred<Record<string, unknown>>();
     const ingestCalls: Record<string, unknown>[] = [];
     const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}) => {
-      if (hookId === "documentation.stats") {
+      if (hookId === "documentation.summary") {
         return hookResult<T>({ activeDocumentCount: 0, activeChunkCount: 0 });
       }
       if (hookId === "documentation.documents.list") {

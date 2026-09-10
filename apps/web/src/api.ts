@@ -17,6 +17,7 @@ import type {
   ForgeRepository,
   CreateTabRequest,
   CreateTabResponse,
+  DocumentationArchiveExportJob,
   CreateWorkspaceLayoutTemplateRequest,
   CreateWorkspaceWindowRequest,
   HookCallResponse,
@@ -45,6 +46,12 @@ export interface HealthResponse {
   plugins: string[];
 }
 
+export class HttpError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
 export async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     ...init,
@@ -52,7 +59,7 @@ export async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> 
   });
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(errorMessageFromResponse(text, response.status));
+    throw new HttpError(response.status, errorMessageFromResponse(text, response.status));
   }
   return (await response.json()) as T;
 }
@@ -103,6 +110,8 @@ export type DocumentationUploadProgress = FileUploadProgress;
 export interface DocumentationArchiveImportResponse {
   import?: Record<string, unknown>;
 }
+
+export type DocumentationArchiveExport = DocumentationArchiveExportJob;
 
 export async function downloadFileBrowserEntries(tabId: string, relativePaths: string[]): Promise<FileDownloadResponse> {
   const response = await fetch(`/api/tabs/${encodeURIComponent(tabId)}/files/download`, {
@@ -220,6 +229,18 @@ export async function downloadDocumentationArchive(): Promise<FileDownloadRespon
     blob: await response.blob(),
     filename: filenameFromContentDisposition(response.headers.get("content-disposition")) ?? "cloudx-documentation.zip"
   };
+}
+
+export function startDocumentationArchiveExport(): Promise<DocumentationArchiveExport> {
+  return fetchJson("/api/documentation/archive/exports", { method: "POST" });
+}
+
+export function getDocumentationArchiveExport(id: string): Promise<DocumentationArchiveExport> {
+  return fetchJson(`/api/documentation/archive/exports/${encodeURIComponent(id)}`);
+}
+
+export function documentationArchiveDownloadUrl(id: string): string {
+  return `/api/documentation/archive/exports/${encodeURIComponent(id)}/download`;
 }
 
 export async function importDocumentationArchive(input: {

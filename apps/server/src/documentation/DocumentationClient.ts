@@ -1,4 +1,5 @@
 import { openAsBlob } from "node:fs";
+import type { DocumentationArchiveExportJob } from "@cloudx/shared";
 
 export const DEFAULT_DOCUMENTATION_URL = "http://127.0.0.1:7820";
 export const DEFAULT_DOCUMENTATION_TIMEOUT_MS = 30 * 60_000;
@@ -89,6 +90,10 @@ export class DocumentationClient {
     return this.get("/stats");
   }
 
+  summary(): Promise<Record<string, unknown>> {
+    return this.get("/summary");
+  }
+
   portableManifest(): Promise<Record<string, unknown>> {
     return this.get("/portable-manifest");
   }
@@ -161,17 +166,33 @@ export class DocumentationClient {
     return this.requestBytes("/archive/export", { method: "GET" });
   }
 
-  async streamArchiveExport(headers: Record<string, string | undefined> = {}): Promise<DocumentationArtifactStreamResponse> {
+  async startArchiveExport(): Promise<DocumentationArchiveExportJob> {
+    return parseArchiveExportJob(await this.post("/archive/exports", {}));
+  }
+
+  async getArchiveExport(jobId: string): Promise<DocumentationArchiveExportJob> {
+    return parseArchiveExportJob(await this.get(`/archive/exports/${encodeURIComponent(jobId)}`));
+  }
+
+  streamArchiveExportDownload(jobId: string, headers: Record<string, string | undefined> = {}): Promise<DocumentationArtifactStreamResponse> {
+    return this.streamArchive(`/archive/exports/${encodeURIComponent(jobId)}/download`, headers);
+  }
+
+  streamArchiveExport(headers: Record<string, string | undefined> = {}): Promise<DocumentationArtifactStreamResponse> {
+    return this.streamArchive("/archive/export", headers);
+  }
+
+  private async streamArchive(pathname: string, headers: Record<string, string | undefined>): Promise<DocumentationArtifactStreamResponse> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
-      const response = await fetch(this.serviceUrl("/archive/export"), {
+      const response = await fetch(this.serviceUrl(pathname), {
         method: "GET",
         headers: compactHeaders(headers),
         signal: controller.signal
       });
-      if (!response.ok) {
-        throw new Error(errorMessage(await response.text(), response.status));
+      if (!response.ok && response.status !== 416) {
+        throw Object.assign(new Error(errorMessage(await readBoundedText(response, this.responseMaxBytes), response.status)), { statusCode: response.status });
       }
       return {
         statusCode: response.status,
@@ -205,12 +226,18 @@ export class DocumentationClient {
     const form = new FormData();
     form.append("file", await openAsBlob(input.path, { type: input.contentType || "application/zip" }), input.filename);
     appendOptionalFormValue(form, "confirmation", input.confirmation);
+    if (options.onProgress) {
+      return this.requestProgress("/archive/import/replace", { method: "POST", body: form }, options.onProgress, options.signal);
+    }
     return this.request("/archive/import/replace", { method: "POST", body: form }, options.signal);
   }
 
   async importArchiveMergeFile(input: DocumentationArchiveFileInput, options: DocumentationIngestRequestOptions = {}): Promise<Record<string, unknown>> {
     const form = new FormData();
     form.append("file", await openAsBlob(input.path, { type: input.contentType || "application/zip" }), input.filename);
+    if (options.onProgress) {
+      return this.requestProgress("/archive/import/merge", { method: "POST", body: form }, options.onProgress, options.signal);
+    }
     return this.request("/archive/import/merge", { method: "POST", body: form }, options.signal);
   }
 
@@ -272,7 +299,11 @@ export class DocumentationClient {
     return this.request(pathname, { method: "POST", body: JSON.stringify(body), headers: { "content-type": "application/json" } }, signal);
   }
 
-  private async postStream(pathname: string, body: Record<string, unknown>, onProgress: (event: DocumentationIngestProgressEvent) => void, signal?: AbortSignal): Promise<Record<string, unknown>> {
+  private postStream(pathname: string, body: Record<string, unknown>, onProgress: (event: DocumentationIngestProgressEvent) => void, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    return this.requestProgress(pathname, { method: "POST", body: JSON.stringify(body), headers: { "content-type": "application/json" } }, onProgress, signal);
+  }
+
+  private async requestProgress(pathname: string, init: RequestInit, onProgress: (event: DocumentationIngestProgressEvent) => void, signal?: AbortSignal): Promise<Record<string, unknown>> {
     const scope = createDocumentationRequestAbortScope(signal);
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const resetTimeout = () => {
@@ -283,10 +314,11 @@ export class DocumentationClient {
     };
     resetTimeout();
     try {
+      const headers = new Headers(init.headers);
+      headers.set("accept", "application/x-ndjson");
       const response = await fetch(this.serviceUrl(pathname), {
-        method: "POST",
-        body: JSON.stringify(body),
-        headers: { "content-type": "application/json", "accept": "application/x-ndjson" },
+        ...init,
+        headers,
         signal: scope.signal
       });
       if (!response.ok) {
@@ -316,7 +348,7 @@ export class DocumentationClient {
       const response = await fetch(this.serviceUrl(pathname), { ...init, signal: scope.signal });
       const text = await readBoundedText(response, this.responseMaxBytes);
       if (!response.ok) {
-        throw new Error(errorMessage(text, response.status));
+        throw Object.assign(new Error(errorMessage(text, response.status)), { statusCode: response.status });
       }
       const value = text ? JSON.parse(text) : {};
       if (!isRecord(value)) {
@@ -423,6 +455,17 @@ function abortReason(signal: AbortSignal, message: string): Error {
 
 async function readBoundedText(response: Response, maxBytes: number): Promise<string> {
   return new TextDecoder().decode(await readBoundedBytes(response, maxBytes));
+}
+
+function parseArchiveExportJob(value: Record<string, unknown>): DocumentationArchiveExportJob {
+  if (typeof value.id !== "string" || !value.id || typeof value.stage !== "string"
+      || typeof value.status !== "string" || !["running", "complete", "failed"].includes(value.status)
+      || (value.progress !== undefined && (typeof value.progress !== "number" || !Number.isFinite(value.progress) || value.progress < 0 || value.progress > 100))
+      || (value.filename !== undefined && typeof value.filename !== "string")
+      || (value.error !== undefined && typeof value.error !== "string")) {
+    throw new Error("Documentation archive export response was invalid.");
+  }
+  return value as unknown as DocumentationArchiveExportJob;
 }
 
 async function readDocumentationProgressStream(

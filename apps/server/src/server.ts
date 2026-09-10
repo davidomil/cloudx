@@ -582,6 +582,30 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     }
   });
 
+  app.post("/api/documentation/archive/exports", async (_request, reply) => {
+    const job = await services.documentation!.startArchiveExport();
+    return reply.code(202).header("cache-control", "no-store").send(job);
+  });
+
+  app.get<{ Params: { jobId: string } }>("/api/documentation/archive/exports/:jobId", async (request, reply) => {
+    return reply.header("cache-control", "no-store").send(await services.documentation!.getArchiveExport(request.params.jobId));
+  });
+
+  app.get<{ Params: { jobId: string } }>("/api/documentation/archive/exports/:jobId/download", async (request, reply) => {
+    const exported = await services.documentation!.streamArchiveExportDownload(request.params.jobId, {
+      range: optionalHeaderString(request.headers.range),
+      "if-range": optionalHeaderString(request.headers["if-range"])
+    });
+    reply.code(exported.statusCode);
+    for (const header of DOCUMENTATION_ARTIFACT_PROXY_HEADERS) {
+      const value = exported.headers.get(header);
+      if (value) reply.header(header, value);
+    }
+    reply.header("cache-control", "no-store");
+    reply.header("x-content-type-options", "nosniff");
+    return reply.send(exported.body ? Readable.fromWeb(exported.body as Parameters<typeof Readable.fromWeb>[0]) : undefined);
+  });
+
   app.get("/api/documentation/archive/export", async (_request, reply) => {
     const exported = await services.documentation!.streamArchiveExport();
     reply.code(exported.statusCode);
@@ -629,8 +653,8 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
         detail: `${mode} documentation archive`,
         runningStage: "Forwarding documentation archive to the indexer.",
         operation: (job) => mode === "replace"
-          ? services.documentation!.importArchiveReplaceFile({ filename, path: upload!.path, contentType, confirmation }, { signal: job.signal })
-          : services.documentation!.importArchiveMergeFile({ filename, path: upload!.path, contentType }, { signal: job.signal })
+          ? services.documentation!.importArchiveReplaceFile({ filename, path: upload!.path, contentType, confirmation }, { signal: job.signal, onProgress: (event) => job.update(event) })
+          : services.documentation!.importArchiveMergeFile({ filename, path: upload!.path, contentType }, { signal: job.signal, onProgress: (event) => job.update(event) })
       }, admission);
     } finally {
       admission.release();

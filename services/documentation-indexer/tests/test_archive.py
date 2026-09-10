@@ -494,12 +494,16 @@ def test_archive_replace_preserves_prior_archive_when_candidate_index_fails(tmp_
         uri="manual://preserved-replacement",
     )
 
-    def fail_index_write(_index, _path: str) -> None:
-        raise RuntimeError("forced replacement index failure")
+    real_load = archive_module.IdMapIndex.load
 
-    monkeypatch.setattr(archive_module.IdMapIndex, "write", fail_index_write)
+    def fail_candidate_index_load(path: str):
+        if "cloudx-documentation-import-" in path:
+            raise RuntimeError("forced replacement index failure")
+        return real_load(path)
+
+    monkeypatch.setattr(archive_module.IdMapIndex, "load", fail_candidate_index_load)
     try:
-        with pytest.raises(RuntimeError, match="forced replacement index failure"):
+        with pytest.raises(ArchiveError, match="forced replacement index failure"):
             target.import_archive_replace(exported.path, confirmation=ARCHIVE_IMPORT_REPLACE_CONFIRMATION)
 
         assert target.search("PRESERVED-REPLACEMENT-44", limit=1)[0]["documentId"] == preserved.document_id

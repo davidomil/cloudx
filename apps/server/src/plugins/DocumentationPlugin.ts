@@ -102,6 +102,7 @@ export class DocumentationPlugin implements WorkspacePlugin {
   ) {
     this.hooks = [
       readHook("documentation.health", "Documentation Health", "Return documentation indexer health.", () => this.client.health()),
+      readHook("documentation.summary", "Documentation Summary", "Return catalog counts without scanning archive files.", () => this.client.summary()),
       readHook("documentation.stats", "Documentation Stats", "Return archive counts and portable paths.", () => this.client.stats()),
       readHook("documentation.ingest.queue", "Documentation Ingest Queue", "Return queued, running, and recent documentation ingest jobs.", () => this.ingestQueue.list()),
       writeHook("documentation.ingest.queue.clearFinished", "Clear Documentation Ingest Queue", "Remove completed and failed documentation ingest jobs from the queue view.", () => queueResult(this.ingestQueue.clearFinished()), {}, [], documentationQueueOutputSchema()),

@@ -12,6 +12,9 @@ import {
   deleteLayoutTemplate,
   deleteWindow,
   downloadDocumentationArchive,
+  documentationArchiveDownloadUrl,
+  getDocumentationArchiveExport,
+  startDocumentationArchiveExport,
   downloadFileBrowserEntries,
   emitTrigger,
   fetchJson,
@@ -308,6 +311,23 @@ describe("api client", () => {
       { loadedBytes: 2, totalBytes: 7, lengthComputable: true },
       { loadedBytes: 7, totalBytes: 7, lengthComputable: true }
     ]);
+  });
+
+  it("starts and checks export jobs using JSON while downloads use a direct URL", async () => {
+    const job = { id: "export/job", status: "running", stage: "Packaging archive.", progress: 30 };
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify(job), { headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(startDocumentationArchiveExport()).resolves.toEqual(job);
+    await expect(getDocumentationArchiveExport(job.id)).resolves.toEqual(job);
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/documentation/archive/exports", expect.objectContaining({ method: "POST" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/documentation/archive/exports/export%2Fjob", expect.any(Object));
+    expect(documentationArchiveDownloadUrl(job.id)).toBe("/api/documentation/archive/exports/export%2Fjob/download");
+  });
+
+  it("preserves the HTTP status and message for expired export jobs", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ error: "Archive export expired." }), { status: 404 })));
+    await expect(getDocumentationArchiveExport("expired")).rejects.toMatchObject({ status: 404, message: "Archive export expired." });
   });
 
   it("parses utf-8 and plain content disposition filenames", () => {

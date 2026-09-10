@@ -44,6 +44,18 @@ describe("DocumentationPlugin", () => {
     expect(new ConfigService(root, () => [plugin.descriptor()]).getPluginConfig("documentation")).toMatchObject(inherited);
   });
 
+  it("loads catalog counts without requesting a storage scan", async () => {
+    const client = fakeClient();
+    const plugin = new DocumentationPlugin(client, new PathPolicy(["/tmp"]), new DocumentationIngestQueue());
+    const hook = plugin.hooks.find((candidate) => candidate.id === "documentation.summary")!;
+
+    expect(hook.automationSafety).toBe("read");
+    expect(await hook.execute({}, { caller: { kind: "ui" } })).toEqual({ activeDocumentCount: 1, activeChunkCount: 200_000 });
+    expect(client.summary).toHaveBeenCalledOnce();
+    expect(client.stats).not.toHaveBeenCalled();
+    expect(client.portableManifest).not.toHaveBeenCalled();
+  });
+
   it("exposes documentation hooks with conservative safety labels", () => {
     const plugin = new DocumentationPlugin(fakeClient(), new PathPolicy(["/tmp"]), new DocumentationIngestQueue());
 
@@ -396,6 +408,7 @@ describe("DocumentationPlugin", () => {
   function fakeClient(): DocumentationClient {
     return {
       health: vi.fn(async () => ({ status: "ok" })),
+      summary: vi.fn(async () => ({ activeDocumentCount: 1, activeChunkCount: 200_000 })),
       stats: vi.fn(async () => ({ activeDocumentCount: 1 })),
       portableManifest: vi.fn(async () => ({ files: [] })),
       streamArchiveExport: vi.fn(async () => ({

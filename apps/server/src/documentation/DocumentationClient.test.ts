@@ -164,6 +164,84 @@ describe("DocumentationClient", () => {
     expect(Array.from(new Uint8Array(await new Response(exported.body).arrayBuffer()))).toEqual([4, 5, 6]);
   });
 
+  it("fetches the lightweight archive summary", async () => {
+    const url = await startServer((request, response) => {
+      expect(request.url).toBe("/docs/summary");
+      response.end(JSON.stringify({ documentCount: 500, chunkCount: 200000 }));
+    });
+    expect(await new DocumentationClient(`${url}/docs`).summary()).toEqual({ documentCount: 500, chunkCount: 200000 });
+  });
+
+  it("starts and polls archive preparation independently from downloading the package", async () => {
+    const requests: string[] = [];
+    const url = await startServer((request, response) => {
+      requests.push(`${request.method} ${request.url}`);
+      if (request.url?.endsWith("/download")) {
+        expect(request.headers.range).toBe("bytes=0-1");
+        response.writeHead(206, { "content-type": "application/zip", "content-range": "bytes 0-1/4" });
+        response.end(Buffer.from([80, 75]));
+      } else {
+        response.end(JSON.stringify({ id: "job-1", status: "complete", stage: "Ready.", progress: 100, filename: "archive.zip" }));
+      }
+    });
+    const client = new DocumentationClient(`${url}/docs`);
+    expect((await client.startArchiveExport()).id).toBe("job-1");
+    expect((await client.getArchiveExport("job-1")).status).toBe("complete");
+    const download = await client.streamArchiveExportDownload("job-1", { range: "bytes=0-1" });
+    expect(download.statusCode).toBe(206);
+    expect(Array.from(new Uint8Array(await new Response(download.body).arrayBuffer()))).toEqual([80, 75]);
+    expect(requests).toEqual(["POST /docs/archive/exports", "GET /docs/archive/exports/job-1", "GET /docs/archive/exports/job-1/download"]);
+  });
+
+  it.each([
+    { id: 123, status: "running", stage: "Preparing." },
+    { id: "job-1", status: "unknown", stage: "Preparing." },
+    { id: "job-1", status: ["running"], stage: "Preparing." },
+    { id: "job-1", status: "running", stage: 4 },
+    { id: "job-1", status: "running", stage: "Preparing.", progress: 101 },
+    { id: "job-1", status: "complete", stage: "Ready.", filename: 4 },
+    { id: "job-1", status: "failed", stage: "Failed.", error: {} }
+  ])("rejects malformed archive job responses %j", async (job) => {
+    const url = await startServer((_request, response) => response.end(JSON.stringify(job)));
+    await expect(new DocumentationClient(url).getArchiveExport("job-1")).rejects.toThrow("export response was invalid");
+  });
+
+  it("preserves missing export and not-ready download status codes", async () => {
+    const url = await startServer((request, response) => {
+      response.writeHead(request.url?.endsWith("download") ? 409 : 404, { "content-type": "application/json" });
+      response.end(JSON.stringify({ detail: "Archive export is unavailable." }));
+    });
+    const client = new DocumentationClient(url);
+    await expect(client.getArchiveExport("expired")).rejects.toMatchObject({ statusCode: 404 });
+    await expect(client.streamArchiveExportDownload("running")).rejects.toMatchObject({ statusCode: 409 });
+  });
+
+  it.each(["replace", "merge"] as const)("reports %s archive import stages from multipart NDJSON", async (mode) => {
+    const progress: unknown[] = [];
+    const url = await startServer((request, response) => {
+      expect(request.url).toBe(`/archive/import/${mode}`);
+      expect(request.headers.accept).toBe("application/x-ndjson");
+      expect(request.headers["content-type"]).toContain("multipart/form-data");
+      request.resume();
+      request.on("end", () => {
+        response.writeHead(200, { "content-type": "application/x-ndjson" });
+        response.write(JSON.stringify({ type: "progress", stage: "validating", progress: 60 }) + "\n");
+        response.end(JSON.stringify({ type: "result", result: { import: { mode } } }) + "\n");
+      });
+    });
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-import-progress-"));
+    const filePath = path.join(directory, "archive.zip");
+    await fs.writeFile(filePath, "package");
+    try {
+      const client = new DocumentationClient(url);
+      const operation = mode === "replace" ? client.importArchiveReplaceFile.bind(client) : client.importArchiveMergeFile.bind(client);
+      expect(await operation({ filename: "archive.zip", path: filePath, confirmation: "REPLACE_DOCUMENTATION_ARCHIVE" }, { onProgress: (event) => progress.push(event) })).toEqual({ import: { mode } });
+      expect(progress).toEqual([expect.objectContaining({ stage: "validating", progress: 60 })]);
+    } finally {
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("forwards archive import path requests", async () => {
     const requests: Array<{ url: string; body: unknown }> = [];
     const url = await startServer((request, response) => {

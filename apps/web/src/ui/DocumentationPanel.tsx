@@ -5,13 +5,14 @@ import { AlertTriangle, Bot, BookOpen, Download, ExternalLink, FileImage, FilePl
 import type { UiContributionRenderContext } from "./uiContributions.js";
 import { ControlButton } from "./Control.js";
 import { PluginPanelDock } from "./PluginPanelDock.js";
-import { downloadDocumentationArchive, importDocumentationArchive, saveBlobDownload, uploadDocumentationFile, type DocumentationUploadProgress, type DocumentationUploadResponse } from "../api.js";
+import { HttpError, documentationArchiveDownloadUrl, getDocumentationArchiveExport, startDocumentationArchiveExport, importDocumentationArchive, uploadDocumentationFile, type DocumentationArchiveExport, type DocumentationUploadProgress, type DocumentationUploadResponse } from "../api.js";
 import { documentationIngestController } from "./documentationPanelQueue.js";
 
 interface DocumentationPanelProps {
   callHook: UiContributionRenderContext["callHook"];
   uploadFile?: typeof uploadDocumentationFile;
-  downloadArchive?: typeof downloadDocumentationArchive;
+  startArchiveExport?: typeof startDocumentationArchiveExport;
+  getArchiveExport?: typeof getDocumentationArchiveExport;
   importArchive?: typeof importDocumentationArchive;
   config?: Record<string, unknown>;
   globalConfig?: Record<string, unknown>;
@@ -237,8 +238,20 @@ export interface DocumentationPanelState {
   archiveImportValue: File | undefined;
   archiveImportConfirmation: string;
   archiveImportInputKey: number;
+  archiveImportProgress: ArchiveImportProgress | undefined;
+  archiveExport: DocumentationArchiveExport | undefined;
+  archiveExportStarting: boolean;
+  archiveExportError: string;
   ingestJobs: DocumentationIngestJob[];
   serverIngestJobs: DocumentationServerIngestJob[];
+}
+
+interface ArchiveImportProgress {
+  status: "uploading" | "processing" | "complete" | "failed";
+  stage: string;
+  progress?: number;
+  filename: string;
+  mode: ArchiveImportMode;
 }
 
 export type DocumentationPanelStateUpdater = (state: DocumentationPanelState | undefined) => DocumentationPanelState;
@@ -287,6 +300,10 @@ export function createInitialDocumentationPanelState(): DocumentationPanelState 
     archiveImportValue: undefined,
     archiveImportConfirmation: "",
     archiveImportInputKey: 0,
+    archiveImportProgress: undefined,
+    archiveExport: undefined,
+    archiveExportStarting: false,
+    archiveExportError: "",
     ingestJobs: [],
     serverIngestJobs: []
   };
@@ -314,7 +331,7 @@ function useDocumentationStateField<K extends keyof DocumentationPanelState>(
   return [value, setValue];
 }
 
-export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationFile, downloadArchive = downloadDocumentationArchive, importArchive = importDocumentationArchive, config = {}, globalConfig = {}, stateKey = DEFAULT_DOCUMENTATION_PANEL_STATE_KEY, state, onStateChange }: DocumentationPanelProps) {
+export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationFile, startArchiveExport = startDocumentationArchiveExport, getArchiveExport = getDocumentationArchiveExport, importArchive = importDocumentationArchive, config = {}, globalConfig = {}, stateKey = DEFAULT_DOCUMENTATION_PANEL_STATE_KEY, state, onStateChange }: DocumentationPanelProps) {
   const [query, setQuery] = useDocumentationStateField("query", state, onStateChange);
   const [results, setResults] = useDocumentationStateField("results", state, onStateChange);
   const [answer, setAnswer] = useDocumentationStateField("answer", state, onStateChange);
@@ -340,9 +357,15 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   const [archiveImportValue, setArchiveImportValue] = useDocumentationStateField("archiveImportValue", state, onStateChange);
   const [archiveImportConfirmation, setArchiveImportConfirmation] = useDocumentationStateField("archiveImportConfirmation", state, onStateChange);
   const [archiveImportInputKey, setArchiveImportInputKey] = useDocumentationStateField("archiveImportInputKey", state, onStateChange);
+  const [archiveImportProgress, setArchiveImportProgress] = useDocumentationStateField("archiveImportProgress", state, onStateChange);
+  const [archiveExport, setArchiveExport] = useDocumentationStateField("archiveExport", state, onStateChange);
+  const [archiveExportStarting, setArchiveExportStarting] = useDocumentationStateField("archiveExportStarting", state, onStateChange);
+  const [archiveExportError, setArchiveExportError] = useDocumentationStateField("archiveExportError", state, onStateChange);
   const [ingestJobs, setIngestJobs] = useDocumentationStateField("ingestJobs", state, onStateChange);
   const [serverIngestJobs, setServerIngestJobs] = useDocumentationStateField("serverIngestJobs", state, onStateChange);
   const [documentListVisible, setDocumentListVisible] = useState(false);
+  const [summaryBusy, setSummaryBusy] = useState(false);
+  const [storageBusy, setStorageBusy] = useState(false);
   const [documentListLoaded, setDocumentListLoaded] = useState(false);
   const [documentListBusy, setDocumentListBusy] = useState(false);
   const [documentListScrollTop, setDocumentListScrollTop] = useState(0);
@@ -367,6 +390,33 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   useEffect(() => {
     void refresh();
   }, []);
+
+  useEffect(() => {
+    if (!archiveExport || archiveExport.status !== "running" || archiveExportError) return;
+    let active = true;
+    let timer: number | undefined;
+    async function poll() {
+      try {
+        const job = await getArchiveExport(archiveExport!.id);
+        if (!active || ingestController.disposed) return;
+        setArchiveExport(job);
+        if (job.status === "running") timer = window.setTimeout(() => void poll(), 1_000);
+      } catch (error) {
+        if (!active || ingestController.disposed) return;
+        const message = error instanceof Error ? error.message : String(error);
+        if (error instanceof HttpError && error.status === 404) {
+          setArchiveExport({ ...archiveExport!, status: "failed", error: message });
+        } else {
+          setArchiveExportError(message);
+        }
+      }
+    }
+    void poll();
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [archiveExport?.id, archiveExport?.status, archiveExportError, getArchiveExport, ingestController]);
 
   useEffect(() => {
     if (!canCall) {
@@ -418,18 +468,35 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   }
 
   async function refresh() {
-    await run(async () => {
+    if (!canCall) return;
+    setSummaryBusy(true);
+    try {
       await Promise.all([
         loadArchiveSummary(),
         loadIngestQueue(),
         documentListLoaded ? loadDocumentPage("replace") : Promise.resolve()
       ]);
-    });
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSummaryBusy(false);
+    }
   }
 
   async function loadArchiveSummary() {
-    const statsResult = await call<Record<string, unknown>>("documentation.stats");
+    const statsResult = await call<Record<string, unknown>>("documentation.summary");
     setStats(statsResult);
+  }
+
+  async function loadStorageDetails() {
+    setStorageBusy(true);
+    try {
+      setStats(await call<Record<string, unknown>>("documentation.stats"));
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setStorageBusy(false);
+    }
   }
 
   function showDocumentList(visible: boolean) {
@@ -718,11 +785,17 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   }
 
   async function exportArchive() {
-    await run(async () => {
-      const download = await downloadArchive();
-      saveBlobDownload(download.blob, download.filename);
-      setStatus(`Archive export downloaded as ${download.filename}.`);
-    });
+    setArchiveExportStarting(true);
+    setArchiveExportError("");
+    setArchiveExport(undefined);
+    try {
+      const job = await startArchiveExport();
+      if (!ingestController.disposed) setArchiveExport(job);
+    } catch (error) {
+      if (!ingestController.disposed) setArchiveExportError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (!ingestController.disposed) setArchiveExportStarting(false);
+    }
   }
 
   async function importArchivePackage() {
@@ -735,16 +808,28 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
       setStatus(`Type ${ARCHIVE_REPLACE_CONFIRMATION} to replace the archive.`);
       return;
     }
-    await run(async () => {
+    const mode = archiveImportMode;
+    const importIdentity = { filename: file.name, mode };
+    setArchiveImportProgress({ ...importIdentity, status: "uploading", stage: "Uploading archive.", progress: 0 });
+    try {
       await importArchive({
         file,
-        mode: archiveImportMode,
-        confirmation: archiveImportMode === "replace" ? archiveImportConfirmation : undefined
+        mode,
+        confirmation: mode === "replace" ? archiveImportConfirmation : undefined,
+        onProgress: ({ loadedBytes, totalBytes, lengthComputable }) => {
+          if (ingestController.disposed) return;
+          const uploaded = lengthComputable && totalBytes ? loadedBytes / totalBytes : undefined;
+          setArchiveImportProgress(uploaded !== undefined && uploaded >= 1
+            ? { ...importIdentity, status: "processing", stage: `Upload complete. ${mode === "replace" ? "Replacing" : "Merging"} archive.` }
+            : { ...importIdentity, status: "uploading", stage: `Uploading archive (${formatUploadBytes(loadedBytes, totalBytes)}).`, progress: uploaded === undefined ? undefined : Math.round(uploaded * 100) });
+        }
       });
+      if (ingestController.disposed) return;
+      setArchiveImportProgress({ ...importIdentity, status: "complete", stage: `Archive ${mode} import complete.`, progress: 100 });
       setArchiveImportValue(undefined);
       setArchiveImportConfirmation("");
       setArchiveImportInputKey((current) => current + 1);
-      if (archiveImportMode === "replace") {
+      if (mode === "replace") {
         setSelectedDocument(undefined);
         setResults([]);
         setAnswer(undefined);
@@ -752,12 +837,10 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
         setDocumentListLoaded(false);
         setDocumentListWindow({ offset: 0, limit: 0, total: 0, hasMore: false });
       }
-      await loadArchiveSummary();
-      if (documentListLoaded || documentListVisible) {
-        await loadDocumentPage("replace");
-      }
-      setStatus(archiveImportMode === "replace" ? "Archive replace import complete." : "Archive merge import complete.");
-    });
+      void refresh();
+    } catch (error) {
+      if (!ingestController.disposed) setArchiveImportProgress({ ...importIdentity, status: "failed", stage: error instanceof Error ? error.message : String(error) });
+    }
   }
 
   async function viewDocument(id: string) {
@@ -847,13 +930,17 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   const queuedIngestCount = visibleIngestJobs.filter((job) => job.status === "queued").length;
   const finishedIngestCount = visibleIngestJobs.filter((job) => job.status === "complete" || job.status === "failed").length;
   const selectedDocumentId = selectedDocument ? documentId(selectedDocument) : "";
+  const archiveImportBusy = archiveImportProgress?.status === "uploading" || archiveImportProgress?.status === "processing";
+  const activeArchiveImport = archiveImportProgress?.status === "processing"
+    ? serverIngestJobs.find((job) => job.label === archiveImportProgress.filename && job.detail === `${archiveImportProgress.mode} documentation archive` && (job.status === "running" || job.status === "queued"))
+    : undefined;
 
   return (
     <div className="documentation-panel">
       <header className="documentation-panel-header">
         <div>
           <h2>Documentation Archive</h2>
-          <p>{activeCount} active documents, {chunkCount} active chunks</p>
+          <p>{stats.activeDocumentCount === undefined ? "Loading archive counts." : `${activeCount} active documents, ${chunkCount} active chunks`}</p>
           {archiveSizeLabel ? <p>{archiveSizeLabel}</p> : null}
         </div>
         <div className="documentation-toolbar">
@@ -863,7 +950,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
             </span>
             <span id={aiNoticeId} role="tooltip" className="documentation-ai-tooltip">{aiNotice}</span>
           </span>
-          <ControlButton size="compact" onClick={() => void refresh()} disabled={busy} title="Refresh archive">
+          <ControlButton size="compact" onClick={() => void refresh()} disabled={summaryBusy} title="Refresh archive">
             <RefreshCw size={14} /> Refresh
           </ControlButton>
           <ControlButton
@@ -1116,7 +1203,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
                 <h3>Archive Controls</h3>
                 <div className="documentation-archive-controls">
                   <div className="documentation-archive-actions">
-                    <ControlButton size="compact" disabled={busy} onClick={() => void exportArchive()}>
+                    <ControlButton size="compact" disabled={archiveExportStarting || (archiveExport?.status === "running" && !archiveExportError) || archiveImportBusy} onClick={() => void exportArchive()}>
                       <Download size={14} /> Export
                     </ControlButton>
                     <div className="documentation-mode-row" role="group" aria-label="Archive import mode">
@@ -1127,6 +1214,21 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
                       ))}
                     </div>
                   </div>
+                  {archiveExportStarting ? <p role="status">Starting archive export.</p> : null}
+                  {archiveExport ? (
+                    <div className="documentation-archive-progress" role={archiveExport.status === "failed" ? "alert" : "status"}>
+                      <p>{archiveExport.error ?? archiveExport.stage}</p>
+                      {archiveExport.status === "running" ? <>
+                        <progress max={100} value={archiveExport.progress} aria-label="Archive export progress" />
+                        <p>You can switch tabs while the archive is prepared.</p>
+                      </> : null}
+                      {archiveExport.status === "complete" ? <a href={documentationArchiveDownloadUrl(archiveExport.id)} download={archiveExport.filename}><Download size={14} /> Download archive</a> : null}
+                    </div>
+                  ) : null}
+                  {archiveExportError ? <div role="alert">
+                    <p>{archiveExportError}</p>
+                    {archiveExport?.status === "running" ? <ControlButton size="compact" onClick={() => setArchiveExportError("")}>Check export status</ControlButton> : null}
+                  </div> : null}
                   <div className="documentation-archive-import">
                     <label>
                       <span>Archive ZIP</span>
@@ -1134,12 +1236,17 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
                     </label>
                     <ControlButton
                       tone={archiveImportMode === "replace" ? "danger" : "primary"}
-                      disabled={busy || !archiveImportValue || (archiveImportMode === "replace" && archiveImportConfirmation !== ARCHIVE_REPLACE_CONFIRMATION)}
+                      disabled={archiveImportBusy || archiveExportStarting || archiveExport?.status === "running" || !archiveImportValue || (archiveImportMode === "replace" && archiveImportConfirmation !== ARCHIVE_REPLACE_CONFIRMATION)}
                       onClick={() => void importArchivePackage()}
                     >
                       <Upload size={14} /> Import
                     </ControlButton>
                   </div>
+                  {archiveImportProgress ? <div className="documentation-archive-progress" role={archiveImportProgress.status === "failed" ? "alert" : "status"}>
+                    <p>{activeArchiveImport?.stage ? `Archive queue: ${activeArchiveImport.stage}` : archiveImportProgress.stage}</p>
+                    {archiveImportProgress.status !== "failed" ? <progress max={100} value={activeArchiveImport?.progress ?? archiveImportProgress.progress} aria-label="Archive import progress" /> : null}
+                    {archiveImportBusy ? <p>You can switch tabs while the archive is imported.</p> : null}
+                  </div> : null}
                   {archiveImportValue ? <p className="documentation-selected-file">{archiveImportValue.name} · {formatBytes(archiveImportValue.size)}</p> : null}
                   {archiveImportMode === "replace" ? (
                     <label>
@@ -1147,6 +1254,9 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
                       <input value={archiveImportConfirmation} onChange={(event) => setArchiveImportConfirmation(event.target.value)} placeholder={ARCHIVE_REPLACE_CONFIRMATION} />
                     </label>
                   ) : null}
+                  <ControlButton size="compact" disabled={storageBusy || !canCall} onClick={() => void loadStorageDetails()}>
+                    {storageBusy ? "Calculating storage details" : "Calculate storage details"}
+                  </ControlButton>
                 </div>
               </section>
             )
