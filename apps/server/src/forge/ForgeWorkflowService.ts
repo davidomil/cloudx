@@ -1693,7 +1693,7 @@ export class ForgeWorkflowService {
         if (await this.reconcileMergedChange(worker)) continue;
         for (const issue of this.workers.filter(candidate => candidate.kind === "issue" && candidate.changeNumber === number &&
           sameRepository(candidate.repository, worker.repository) && candidate.headSha &&
-          (["paused", "stopped"].includes(candidate.status) || candidate.status === "awaiting_review" && !candidate.autoReview?.enabled) &&
+          (["paused", "stopped", "failed"].includes(candidate.status) || candidate.status === "awaiting_review" && !candidate.autoReview?.enabled) &&
           !candidate.pendingPublication && !candidate.mergeAttempted && !["creating", "uncertain"].includes(candidate.publicationState ?? ""))) {
           const change = await this.deps.provider(issue.repository, "worker", this.completionChecks.signal).getChangeRequest(number);
           this.observeMergeConflict(issue, change);

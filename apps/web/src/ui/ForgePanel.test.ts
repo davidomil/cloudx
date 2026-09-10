@@ -1372,7 +1372,7 @@ describe("ForgePanel", () => {
     ]);
   });
 
-  it.each(["paused", "stopped"] as const)("refreshes the conflict blocker and explicit recovery action while %s", async status => {
+  it.each(["paused", "stopped", "failed"] as const)("refreshes the conflict blocker and explicit recovery action while %s", async status => {
     vi.useFakeTimers();
     const idleWorker = { ...conflictedWorker, status, mergeConflict: undefined };
     const testFixture = fixture({ workers: [idleWorker] });
