@@ -46,7 +46,7 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   ).stdout.trim();
 }
 
-function dependencies({ trustRepository = false } = {}): ForgeRuntimeDependencies {
+function dependencies({ trustRepository = true } = {}): ForgeRuntimeDependencies {
   return {
     isRepositoryTrusted: vi.fn(() => trustRepository),
     gitAccess: vi.fn(async () => ({
@@ -1338,15 +1338,20 @@ if (hangMerge || hangFetch) {
 }
 
 describe("ForgeRuntime Codex tabs", () => {
-  it.each([false, undefined])("requires repository consent before preparing a reviewer when approval is %s", async approved => {
+  it.each([
+    { review: false, approved: false },
+    { review: false, approved: undefined },
+    { review: true, approved: false },
+    { review: true, approved: undefined },
+  ])("requires repository consent before preparing a worker (review: $review, approval: $approved)", async ({ review, approved }) => {
     const deps = dependencies();
     deps.isRepositoryTrusted = approved === undefined ? undefined : () => approved;
     deps.reviewConversations = { prepare: vi.fn() };
     runtime = new ForgeRuntime(deps);
-    const workspace = await prepare("unapproved-review", true);
-    const fixture = installReviewTabs(deps, workspace);
+    const workspace = await prepare("unapproved-worker", review);
+    vi.mocked(deps.workspaceCommands.createTab).mockResolvedValue({ tab: workerTab(workspace) } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>);
 
-    await expect(runtime.launch(fixture.request)).rejects.toThrow("repository trust must be approved");
+    await expect(runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, prompt: "Work on the repository.", windowId: "window", paneId: "pane" })).rejects.toThrow("repository trust must be approved");
 
     expect(deps.workspaceCommands.createTab).not.toHaveBeenCalled();
     expect(deps.reviewConversations.prepare).not.toHaveBeenCalled();
@@ -1607,7 +1612,7 @@ describe("ForgeRuntime Codex tabs", () => {
         windowId: "window-1",
         paneId: "pane-1",
       }),
-      { ownerPluginId: "forge", authorizeProjectTrust: undefined },
+      { ownerPluginId: "forge", authorizeProjectTrust: expect.any(Function) },
     );
     expect(deps.sessions.executePluginAction).not.toHaveBeenCalled();
     await expect(runtime.publishBranch(workspace)).rejects.toThrow(
