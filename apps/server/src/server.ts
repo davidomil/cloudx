@@ -1253,7 +1253,9 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     store: new ForgeConnectionStore(config.dataDir),
     registration: new ForgeRegistrationClient()
   });
-  forgeSettings = new ForgeSettingsService(configService, forgeConnections);
+  forgeSettings = new ForgeSettingsService(configService, forgeConnections, diagnostic => {
+    logger?.warn({ forgeRequest: diagnostic }, "Forge provider request failed");
+  });
   const settingsForForge: ForgeSettingsService = forgeSettings;
   forge = new ForgeWorkflowService({
     settings: () => settingsForForge.settings(),

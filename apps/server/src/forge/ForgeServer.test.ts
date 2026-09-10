@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { generateKeyPairSync } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../config.js";
 import { buildServer, buildServices } from "../server.js";
@@ -11,6 +12,55 @@ import {
 import type { ForgeRepository } from "@cloudx/shared";
 
 describe("Forge in the composed CloudX server", () => {
+  it.each(["request", "authentication"] as const)("records a safe %s diagnostic through the real Forge read hook", async operation => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "forge-provider-diagnostic-"));
+    const config = loadConfig({
+      CLOUDX_DATA_DIR: path.join(root, "data"),
+      CLOUDX_ALLOWED_ROOTS: root,
+      CLOUDX_LOG_LEVEL: "silent",
+      CLOUDX_APP_SERVER_ENABLED: "false",
+      CLOUDX_AUTOMATION_START_DISABLED: "true",
+      CLOUDX_WEB_DIST_DIR: path.join(root, "web"),
+    });
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const services = buildServices(config, logger);
+    await services.pluginContributionsReady;
+    const app = await buildServer(config, services);
+    const repository: ForgeRepository = { provider: "github", apiUrl: "https://api.github.com", projectPath: "fixture/project" };
+    const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+    const credential = vi.spyOn(services.forgeConnections!, "credential").mockReturnValue(operation === "authentication"
+      ? { kind: "github-app", appId: "101", installationId: "123", privateKey }
+      : { kind: "token", token: "private-credential" });
+    const fetcher = vi.spyOn(globalThis, "fetch").mockRejectedValue(new TypeError("private-credential https://private.example?secret=hidden", {
+      cause: Object.assign(new Error("private-provider-detail"), { code: "ECONNRESET" }),
+    }));
+    try {
+      await services.config!.update({ plugins: { forge: { projectPath: repository.projectPath } } });
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/hooks/forge.issues.list",
+        headers: { host: "127.0.0.1:3001" },
+        payload: { input: { repository, filter: "is:open label:private-query" } },
+      });
+      expect(response.statusCode).toBe(502);
+      expect(logger.warn).toHaveBeenCalledExactlyOnceWith({ forgeRequest: expect.objectContaining({
+        provider: "github", role: "worker", operation,
+        method: operation === "authentication" ? "POST" : "GET",
+        path: operation === "authentication" ? expect.stringContaining("access_tokens") : "/search/issues",
+        causeCodes: ["ECONNRESET"], retryable: true,
+      }) }, "Forge provider request failed");
+      expect(fetcher).toHaveBeenCalledOnce();
+      const visible = response.body + JSON.stringify(logger.warn.mock.calls);
+      for (const secret of ["private-credential", "private.example", "private-provider-detail", "private-query", "hidden", privateKey])
+        expect(visible).not.toContain(secret);
+    } finally {
+      fetcher.mockRestore();
+      credential.mockRestore();
+      await app.close();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("keeps trust and embedded placement grants outside public tab and layout requests", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "forge-http-tab-ownership-"));
     const config = loadConfig({

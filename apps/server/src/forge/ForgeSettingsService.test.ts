@@ -51,6 +51,29 @@ async function applicationFixture() {
 }
 
 describe("installation tokens across Forge provider acquisitions", () => {
+  it.each(["request", "authentication"] as const)("shares the %s cooldown across provider instances and roles", async operation => {
+    const f = await fixture();
+    f.credentials.set("worker", operation === "authentication" ? workerApp : { kind: "token", token: "worker-private" });
+    f.credentials.set("reviewer", { kind: "token", token: "reviewer-private" });
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const fetcher = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response("private-provider-body", { status: operation === "authentication" ? 503 : 429, headers: { "retry-after": "120" } }))
+      .mockImplementation(async () => Response.json({ items: [], incomplete_results: false }));
+
+    await expect(f.settings.provider(repository, "worker").listIssues()).rejects.toMatchObject({ retryable: true, retryAfterMs: 120_000 });
+    for (const role of ["worker", "reviewer"] as const)
+      await expect(f.settings.provider(repository, role).listChangeRequests()).rejects.toMatchObject({ retryable: true, retryAfterMs: 120_000 });
+    expect(fetcher).toHaveBeenCalledOnce();
+
+    now += 119_999;
+    await expect(f.settings.provider(repository, "reviewer").listIssues()).rejects.toMatchObject({ retryAfterMs: 1 });
+    expect(fetcher).toHaveBeenCalledOnce();
+    now += 1;
+    await expect(f.settings.provider(repository, "reviewer").listIssues()).resolves.toMatchObject({ items: [] });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
   it("reuses each role's token for fresh providers and Git access", async () => {
     const f = await applicationFixture();
     await f.settings.provider(repository, "worker").listIssues();

@@ -1848,9 +1848,12 @@ describe("GitLab reviewer assignment before requesting changes", () => {
     expect(feedback(calls)).toHaveLength(0);
   });
 
-  it.each([403, 500])("does not repeat an assignment rejected with HTTP %s", async status => {
+  it.each([403, 500])("does not repeat an assignment after HTTP %s", async status => {
     const { provider, calls } = fixture({ assignmentResponse: new Response(null, { status }) });
-    await expect(provider.postReview(7, submission)).rejects.toMatchObject({ statusCode: status });
+    const error = await provider.postReview(7, submission).catch(error => error);
+    expect(error).toMatchObject({ name: "ForgeProviderError", statusCode: status === 500 ? 409 : status });
+    if (status === 500) expect(error.message).toContain("remote result is unknown");
+    else expect(error.message).toContain("API rejected the operation (HTTP 403)");
     expect(assignments(calls)).toHaveLength(1);
     expect(feedback(calls)).toHaveLength(0);
   });
@@ -2362,7 +2365,7 @@ describe("private credentials and bounded transport", () => {
     );
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(fetcher.mock.calls[0][1]).toMatchObject({
-      redirect: "error",
+      redirect: "manual",
       signal: expect.any(AbortSignal),
     });
   });
