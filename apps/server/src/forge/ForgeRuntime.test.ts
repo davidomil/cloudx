@@ -1244,9 +1244,17 @@ describe.skipIf(process.platform !== "linux")(
     });
 
     it.each([true, false])("reports an actionable workflow permission error without exposing stderr when recognized=%s", async recognized => {
-      const remoteError = recognized
-        ? "remote: refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml` without `workflows` permission\nprivate-token"
-        : "remote: rejected private-token https://private.example/repository";
+      const privateDetails = [
+        "private-token",
+        "https://x-access-token:private-token@github.com/cloudx/test.git",
+        "/home/private-user/checkouts/worker",
+      ];
+      const remoteError = [
+        recognized
+          ? "remote: refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml` without `workflows` permission"
+          : "remote: permission denied while updating .github/workflows/ci.yml",
+        ...privateDetails,
+      ].join("\n");
       await installGitFixture(false, remoteError);
       const deps = dependencies();
       delete deps.git;
@@ -1257,8 +1265,12 @@ describe.skipIf(process.platform !== "linux")(
       expect((failure as Error).message).toBe(recognized
         ? "GitHub rejected workflow changes. Grant the worker App Workflows: write permission and approve it for this installation, then retry publishing."
         : "Git push failed with exit code 1.");
-      expect((failure as Error).message).not.toContain("private-token");
+      for (const detail of privateDetails) {
+        expect(String(failure)).not.toContain(detail);
+        expect(JSON.stringify(failure)).not.toContain(detail);
+      }
       expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(headSha);
+      expect(await git(workspace.worktreePath, "status", "--porcelain")).toBe("");
     });
 
     it("uses reviewer authorization only for fetching the two exact review commits", async () => {

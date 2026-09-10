@@ -29,6 +29,13 @@ the same CloudX address throughout the flow. GitHub documents the
 [manifest registration
 process](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest).
 
+The GitHub issue worker requests **Contents**, **Issues**, **Pull
+requests** and **Workflows** write access. The reviewer requests
+**Contents** and **Issues** read access plus **Pull requests** write
+access. CloudX rejects a worker installation missing **Workflows:
+write** and keeps the registered app available for **Continue** after
+approval.
+
 For GitLab, use version 18.11 or later and a one-time personal access
 token with `api` scope and project Maintainer/Owner access. Click
 **Create GitLab bot connections**. Forge checks token and project access
@@ -150,6 +157,28 @@ through the reviewer identity.
 | post_failed | Inspect the provider; the saved submission cannot be posted again. |
 
 Paused and failed states require explicit action.
+
+If GitHub rejects a completed worker’s workflow changes for missing
+Workflows permission, Forge displays the required **Workflows: write**
+permission and retains the completion report and checkout. The error
+message excludes raw Git stderr.
+
+An existing App needs its owner to update the registration; installing a
+CloudX version with the new manifest does not update that App’s grant.
+GitHub requires approval of the additional repository permission for the
+installation. See [GitHub’s permission update
+instructions](https://docs.github.com/en/apps/maintaining-github-apps/modifying-a-github-app-registration#changing-the-permissions-of-a-github-app).
+
+- The App owner opens the issue worker App’s **Permissions & events**,
+  sets **Repository permissions → Workflows** to **Read and write**, and
+  saves the change.
+- The account or organization owner approves the updated permission for
+  the repository’s App installation.
+- For an installation still in setup, select **Continue** in CloudX
+  Settings. For completed work awaiting publication, select **Retry
+  publication** on the failed worker. Forge consumes the retained report
+  and publishes the completed commit without another implementation run,
+  including after a server restart.
 
 Restart recovery consults persisted workspace and tab ownership. If a
 terminal disappeared without verified process quiescence, Forge
