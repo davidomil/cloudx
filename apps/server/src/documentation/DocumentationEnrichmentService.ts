@@ -437,6 +437,7 @@ export class DocumentationEnrichmentService {
       throw new Error("Archived media source metadata is missing.");
     }
     let contentType: string | undefined;
+    let retainsMediaUpload = false;
     if (metadataStat) {
       if (!metadataStat.isFile() || metadataStat.isSymbolicLink()) {
         throw new Error("Archived source metadata must be a regular file inside its snapshot directory.");
@@ -450,8 +451,11 @@ export class DocumentationEnrichmentService {
         throw new Error("Archived source content type must be a string.");
       }
       contentType = optionalRecordString(metadata, "contentType");
+      retainsMediaUpload = document.source_type === "media"
+        && metadata.upload === true
+        && document.uri === `upload://${path.basename(snapshotPath)}`;
     }
-    if (!hasMediaSuffix && (!contentType || !/^(audio|video)\//iu.test(contentType))) {
+    if (!retainsMediaUpload && !hasMediaSuffix && (!contentType || !/^(audio|video)\//iu.test(contentType))) {
       return undefined;
     }
     const realRoot = await fsp.realpath(root);
