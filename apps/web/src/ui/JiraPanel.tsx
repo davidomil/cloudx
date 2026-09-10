@@ -242,7 +242,7 @@ export function JiraPanel({
   }, [callHook, commentDraft, refreshSelectedIssueDetails, selectedKey]);
 
   const transitionIssue = useCallback(async (transitionId: string | undefined) => {
-    if (!selectedKey || !transitionId) {
+    if (filterBusy || !selectedKey || !transitionId) {
       return;
     }
     setActionBusy(true);
@@ -255,7 +255,7 @@ export function JiraPanel({
     } finally {
       setActionBusy(false);
     }
-  }, [callHook, filters?.selectedFilterId, loadDashboard, refreshSelectedIssueDetails, selectedKey]);
+  }, [callHook, filterBusy, filters?.selectedFilterId, loadDashboard, refreshSelectedIssueDetails, selectedKey]);
 
   const runIssueAutomation = useCallback(async (issue: JiraIssueSummary) => {
     if (!emitTrigger) {
@@ -365,7 +365,7 @@ export function JiraPanel({
                 <h4>Transitions</h4>
                 <div>
                   {transitions.map((transition) => (
-                    <button type="button" className="jira-transition-pill" key={transition.id ?? transition.name} onClick={() => void transitionIssue(transition.id)} disabled={actionBusy || !transition.id}>
+                    <button type="button" className="jira-transition-pill" key={transition.id ?? transition.name} onClick={() => void transitionIssue(transition.id)} disabled={actionBusy || filterBusy || !transition.id}>
                       {transition.name ?? transition.to?.name ?? transition.id}
                     </button>
                   ))}
