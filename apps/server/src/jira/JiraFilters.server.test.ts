@@ -6,7 +6,7 @@ import type { JiraFilterState } from "@cloudx/shared";
 import { describe, expect, it } from "vitest";
 
 import { loadConfig } from "../config.js";
-import { buildServer } from "../server.js";
+import { buildServer, buildServices } from "../server.js";
 
 describe("Jira filter HTTP hooks", () => {
   it("creates, edits, selects and deletes filters through the production hooks and restores them after restart", async () => {
@@ -19,7 +19,9 @@ describe("Jira filter HTTP hooks", () => {
       CLOUDX_AUTOMATION_START_DISABLED: "true",
       CLOUDX_LOG_LEVEL: "silent"
     });
-    let app = await buildServer(config);
+    const services = buildServices(config);
+    await services.pluginContributionsReady;
+    let app = await buildServer(config, services);
     const call = async (hookId: string, input: Record<string, unknown> = {}): Promise<JiraFilterState> => {
       const response = await app.inject({ method: "POST", url: `/api/hooks/${hookId}`, payload: { input } });
       expect(response.statusCode, response.body).toBe(200);
@@ -38,7 +40,9 @@ describe("Jira filter HTTP hooks", () => {
       ] });
 
       await app.close();
-      app = await buildServer(config);
+      const restartedServices = buildServices(config);
+      await restartedServices.pluginContributionsReady;
+      app = await buildServer(config, restartedServices);
       await expect(call("jira.filters.list")).resolves.toEqual(edited);
       await expect(call("jira.filters.select", { filterId: second.selectedFilterId })).resolves.toMatchObject({ selectedFilterId: second.selectedFilterId });
       await expect(call("jira.filters.delete", { id: firstId })).resolves.toMatchObject({ selectedFilterId: second.selectedFilterId, filters: [{ name: "Unassigned" }] });
@@ -61,7 +65,9 @@ describe("Jira filter HTTP hooks", () => {
       CLOUDX_AUTOMATION_START_DISABLED: "true",
       CLOUDX_LOG_LEVEL: "silent"
     });
-    const app = await buildServer(config);
+    const services = buildServices(config);
+    await services.pluginContributionsReady;
+    const app = await buildServer(config, services);
     try {
       const saved = await app.inject({ method: "POST", url: "/api/hooks/jira.filters.save", payload: { input: { name: "Bugs", jql: "type = Bug" } } });
       expect(saved.statusCode, saved.body).toBe(200);
