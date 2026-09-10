@@ -10,6 +10,8 @@ import { SettingsDialog } from "./SettingsDialog.js";
 let root: Root | undefined;
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  Element.prototype.scrollIntoView = vi.fn();
+  vi.stubGlobal("matchMedia", vi.fn(() => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() })));
   vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ repository: { provider: "github", apiUrl: "https://api.github.com", projectPath: "cloudx/example" }, roles: [{ role: "worker", state: "disconnected" }, { role: "reviewer", state: "disconnected" }] }))));
 });
 afterEach(async () => {
@@ -38,6 +40,7 @@ function config(): CloudxConfigResponse {
     { key: "provider", label: "Provider", type: "select", defaultValue: "github", options: [{ label: "GitHub", value: "github" }, { label: "GitLab", value: "gitlab" }] },
     { key: "apiUrl", label: "API URL", type: "string", defaultValue: "https://api.github.com" },
     { key: "projectPath", label: "Repository", type: "string", defaultValue: "" },
+    { key: "trustedRepository", label: "Approved repository trust", type: "string", visibility: "internal", defaultValue: "" },
     { key: "workerTemplateId", label: "Issue worker template", type: "string", defaultValue: "", optionSource: "rulesSkills.templates" },
     { key: "workerModel", label: "Coding model", type: "select", defaultValue: "gpt-6-astra", options: modelOptions },
     { key: "workerReasoningEffort", label: "Coding reasoning effort", type: "select", defaultValue: "xhigh", options: reasoningOptions },
@@ -53,6 +56,7 @@ async function mount(store = templates, response = config()) {
   root = createRoot(container);
   const save = vi.fn(async (_values: CloudxConfigValues) => {});
   await act(async () => root!.render(createElement(SettingsDialog, { config: response, rulesSkillsStore: store, onSave: save, onCancel: vi.fn() })));
+  await act(async () => container.querySelector<HTMLButtonElement>('[role="tab"][aria-label="Forge Workers"]')!.click());
   return { container, save };
 }
 
@@ -69,6 +73,84 @@ async function select(input: HTMLInputElement | HTMLSelectElement, value: string
 }
 
 describe("Forge setup in ordinary Settings", () => {
+  it("finds repository trust through Settings search and preserves approval across categories", async () => {
+    const { container, save } = await mount();
+    await act(async () => container.querySelector<HTMLButtonElement>('[role="tab"][aria-label="General"]')!.click());
+    await select(container.querySelector<HTMLInputElement>('[aria-label="Search settings"]')!, "repository trust");
+    const trust = container.querySelector<HTMLInputElement>('[aria-label="Trust this repository for Forge workers"]')!;
+    expect(trust.closest("[hidden]")).toBeNull();
+    expect(container.querySelector('[role="tab"][aria-label="Forge Workers"]')?.getAttribute("aria-selected")).toBe("true");
+    await act(async () => trust.click());
+    await select(container.querySelector<HTMLInputElement>('[aria-label="Search settings"]')!, "");
+    await act(async () => container.querySelector<HTMLButtonElement>('[role="tab"][aria-label="General"]')!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>('[role="tab"][aria-label="Forge Workers"]')!.click());
+    expect(trust.checked).toBe(true);
+    await act(async () => [...container.querySelectorAll("button")].find(item => item.textContent === "Save")!.click());
+    expect(save.mock.calls[0][0].plugins.forge.trustedRepository).toBe(JSON.stringify(["github", "https://api.github.com", "cloudx/example"]));
+  });
+
+  it("requires explicit repository approval and saves it with the selected destination", async () => {
+    const { container, save } = await mount();
+    const trust = container.querySelector<HTMLInputElement>('[aria-label="Trust this repository for Forge workers"]')!;
+    expect(trust.checked).toBe(false);
+    expect(trust.closest("label")!.textContent).toContain("cloudx/example");
+    expect(trust.closest("label")!.textContent).toContain("https://api.github.com");
+    expect(trust.closest("label")!.textContent).toContain("run commands on this machine");
+    expect(container.textContent).not.toContain("Approved repository trust");
+    await act(async () => trust.click());
+    expect(save).not.toHaveBeenCalled();
+    await act(async () => [...container.querySelectorAll("button")].find(item => item.textContent === "Save")!.click());
+    expect(save.mock.calls[0][0].plugins.forge.trustedRepository).toBe(JSON.stringify(["github", "https://api.github.com", "cloudx/example"]));
+  });
+
+  it("discards an unsaved repository approval when Settings is canceled", async () => {
+    const { container, save } = await mount();
+    await act(async () => container.querySelector<HTMLInputElement>('[aria-label="Trust this repository for Forge workers"]')!.click());
+    await act(async () => [...container.querySelectorAll("button")].find(item => item.textContent === "Cancel")!.click());
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it("shows saved approval for the normalized repository and allows revocation", async () => {
+    const response = config();
+    response.values.plugins.forge = { ...response.values.plugins.forge, apiUrl: " https://api.github.com/ ", projectPath: " cloudx/example ", trustedRepository: JSON.stringify(["github", "https://api.github.com", "cloudx/example"]) };
+    const { container, save } = await mount(templates, response);
+    const trust = container.querySelector<HTMLInputElement>('[aria-label="Trust this repository for Forge workers"]')!;
+    expect(trust.checked).toBe(true);
+    await select(field(container, "API URL"), "https://api.github.com");
+    expect(trust.checked).toBe(true);
+    await act(async () => trust.click());
+    await act(async () => [...container.querySelectorAll("button")].find(item => item.textContent === "Save")!.click());
+    expect(save.mock.calls[0][0].plugins.forge.trustedRepository).toBe("");
+  });
+
+  it.each([
+    { label: "Repository", value: "cloudx/other" },
+    { label: "API URL", value: "https://github.example/api/v3" },
+    { label: "Provider", value: "gitlab" }
+  ])("clears saved approval when $label changes and requires new consent", async ({ label, value }) => {
+    const response = config();
+    response.values.plugins.forge.trustedRepository = JSON.stringify(["github", "https://api.github.com", "cloudx/example"]);
+    const { container, save } = await mount(templates, response);
+    const trust = container.querySelector<HTMLInputElement>('[aria-label="Trust this repository for Forge workers"]')!;
+    expect(trust.checked).toBe(true);
+    await select(field(container, label), value);
+    expect(trust.checked).toBe(false);
+    await act(async () => [...container.querySelectorAll("button")].find(item => item.textContent === "Save")!.click());
+    expect(save.mock.calls[0][0].plugins.forge.trustedRepository).toBe("");
+    await act(async () => trust.click());
+    await act(async () => [...container.querySelectorAll("button")].find(item => item.textContent === "Save")!.click());
+    const saved = save.mock.calls[1][0].plugins.forge;
+    expect(saved.trustedRepository).toBe(JSON.stringify([saved.provider, saved.apiUrl, saved.projectPath]));
+  });
+
+  it.each(["Repository", "API URL"])("disables approval while %s is empty", async label => {
+    const { container } = await mount();
+    await select(field(container, label), " ");
+    const trust = container.querySelector<HTMLInputElement>('[aria-label="Trust this repository for Forge workers"]')!;
+    expect(trust.checked).toBe(false);
+    expect(trust.disabled).toBe(true);
+  });
+
   it("exposes connection actions without requiring a Forge tab or manual keys", async () => {
     const { container } = await mount();
     expect(container.querySelector('[aria-label="Forge connections"]')).not.toBeNull();

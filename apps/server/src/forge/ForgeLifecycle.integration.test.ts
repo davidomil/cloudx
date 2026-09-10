@@ -142,16 +142,58 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     }
   }, 20_000);
 
-  it("keeps the Codex trust decision pending when repository trust has not been approved", async () => {
+  it("requires issue repository consent before starting Codex and resumes the retained checkout after consent", async () => {
     const fixture = await LifecycleFixture.create({ trustRepository: false });
+    const blocked = await fixture.workflow.startIssue(repository, 1, fixture.placement);
+
+    expect(fixture.factory.processes).toEqual([]);
+    expect(fixture.sessions.listTabs()).toEqual([]);
+    expect(blocked).toMatchObject({ status: "failed", error: expect.stringContaining("Settings") });
+    expect(blocked.tabId).toBeUndefined();
+    expect(await fixture.workspaceRecord(blocked.id)).toMatchObject({ launchPending: false });
+    const checkout = await fs.stat(blocked.worktreePath!);
+    expect(await git(blocked.worktreePath!, "status", "--porcelain")).toBe("");
+    await expectMissing(path.join(fixture.dataDir, "codex-launches"), path.join(blocked.worktreePath!, "solution.txt"));
+    expect(await fs.readFile(path.join(fixture.codexHome, "config.toml"), "utf8")).toBe(sourceConfig);
+
+    fixture.repositoryTrusted = true;
+    const resumed = await fixture.workflow.resume(blocked.id, fixture.placement);
+    expect(resumed).toMatchObject({ id: blocked.id, status: "running", worktreePath: blocked.worktreePath });
+    expect((await fs.stat(resumed.worktreePath!)).ino).toBe(checkout.ino);
+    const receipt = await fixture.completedAssistantTurn(resumed);
+    expect(receipt.trustedProjectPath).toBe(await fs.realpath(blocked.worktreePath!));
+    expect(fixture.sessions.getSession(resumed.tabId!).snapshot().recentOutput).not.toContain("Do you trust the contents of this directory?");
+    expect(await fs.readFile(path.join(fixture.codexHome, "config.toml"), "utf8")).toBe(sourceConfig);
+    await fixture.workflow.pause(resumed.id);
+  }, 15_000);
+
+  it("blocks an issue resume after consent is revoked and preserves unfinished work until consent returns", async () => {
+    const fixture = await LifecycleFixture.create();
     const started = await fixture.workflow.startIssue(repository, 1, fixture.placement);
-    expect(started.status, started.error).toBe("running");
-    await vi.waitFor(() => {
-      expect(fixture.sessions.getSession(started.tabId!).snapshot().recentOutput).toContain("Do you trust the contents of this directory?");
-    }, { timeout: 8_000, interval: 20 });
-    expect(await fixture.reports.read(started.attemptId!)).toBeUndefined();
-    await expectMissing(path.join(started.worktreePath!, "solution.txt"));
+    await fixture.completedAssistantTurn(started);
     await fixture.workflow.pause(started.id);
+    const unfinished = path.join(started.worktreePath!, "unfinished.txt");
+    await fs.writeFile(unfinished, "Retain unfinished issue work.\n");
+    const head = await git(started.worktreePath!, "rev-parse", "HEAD");
+    fixture.repositoryTrusted = false;
+
+    const blocked = await fixture.workflow.resume(started.id, fixture.placement);
+
+    expect(blocked).toMatchObject({ id: started.id, status: "failed", worktreePath: started.worktreePath, error: expect.stringContaining("Settings") });
+    expect(blocked.tabId).toBeUndefined();
+    expect(fixture.factory.processes).toHaveLength(1);
+    expect(fixture.sessions.listTabs()).toEqual([]);
+    expect(await fixture.workspaceRecord(started.id)).toMatchObject({ launchPending: false });
+    expect(await fs.readFile(unfinished, "utf8")).toBe("Retain unfinished issue work.\n");
+    expect(await git(started.worktreePath!, "rev-parse", "HEAD")).toBe(head);
+
+    fixture.repositoryTrusted = true;
+    const resumed = await fixture.workflow.resume(started.id, fixture.placement);
+    expect(resumed).toMatchObject({ id: started.id, status: "running", worktreePath: started.worktreePath });
+    const receipt = await fixture.completedAssistantTurn(resumed);
+    expect(receipt.trustedProjectPath).toBe(await fs.realpath(started.worktreePath!));
+    expect(await fs.readFile(unfinished, "utf8")).toBe("Retain unfinished issue work.\n");
+    await fixture.workflow.pause(resumed.id);
   }, 15_000);
 
   it("does not start a reviewer before repository consent and resumes its clean checkout after consent", async () => {

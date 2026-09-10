@@ -22,6 +22,7 @@ const plugin: PluginDescriptor = {
 
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  Element.prototype.scrollIntoView = vi.fn();
   vi.stubGlobal("WebSocket", class { addEventListener() {} close() {} });
   vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener() {}, removeEventListener() {} }));
   const stored = new Map<string, string>();
@@ -114,6 +115,7 @@ describe("Forge repository settings in App", () => {
   ])("invalidates item actions before saving $label and waits for fresh context when success=$success", async ({ label, value, success }) => {
     const f = await fixture();
     await click(f.container.querySelector(".forge-panel")!, "Settings");
+    await act(async () => f.container.querySelector<HTMLButtonElement>('[role="tab"][aria-label="Forge"]')!.click());
     await changeSetting(f.container, label, value);
     await click(f.container.querySelector(".settings-dialog")!, "Save");
     expect(f.container.querySelector(".forge-items")).toBeNull();
@@ -134,6 +136,7 @@ describe("Forge repository settings in App", () => {
     const f = await fixture();
     const items = f.container.querySelector(".forge-items");
     await click(f.container.querySelector(".forge-panel")!, "Settings");
+    await act(async () => f.container.querySelector<HTMLButtonElement>('[role="tab"][aria-label="Forge"]')!.click());
     await changeSetting(f.container, "Worker model", "gpt-6-astra");
     await click(f.container.querySelector(".settings-dialog")!, "Save");
     expect(f.container.querySelector(".forge-items")).toBe(items);
