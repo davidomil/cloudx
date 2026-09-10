@@ -1270,8 +1270,6 @@ export class ForgeWorkflowService {
     await this.quiesce(worker);
     const prepared = await this.deps.runtime.prepareIssueRebase(workerWorkspace(worker), worker.headSha!, worker.baseBranch, signal);
     signal?.throwIfAborted();
-    if (saved?.phase !== "resolving" && prepared.targetHeadSha !== change.targetHeadSha)
-      throw new Error("The target branch changed during conflict detection. Resume to validate the current revision before rebasing.");
     if (saved?.phase === "reviewing" && saved.headSha === worker.headSha && saved.targetHeadSha === prepared.targetHeadSha)
       throw new Error("This commit was already rebased onto the reported target. Inspect the provider's unchanged conflict status, then Resume; the work is retained.");
     if (saved?.phase === "resolving" && (saved.targetHeadSha !== prepared.targetHeadSha || saved.originalHeadSha !== prepared.originalHeadSha))
@@ -1286,6 +1284,8 @@ export class ForgeWorkflowService {
     worker.status = "starting";
     worker.error = undefined;
     await this.persist();
+    if (saved?.phase !== "resolving" && prepared.targetHeadSha !== change.targetHeadSha)
+      throw new Error("The target branch changed during conflict detection. Resume to continue the preserved rebase on its saved target.");
     await this.launch(worker, placement, { item, change });
   }
   private async acceptRebaseReport(worker: ForgeWorker): Promise<boolean> {
@@ -1693,7 +1693,7 @@ export class ForgeWorkflowService {
         if (await this.reconcileMergedChange(worker)) continue;
         for (const issue of this.workers.filter(candidate => candidate.kind === "issue" && candidate.changeNumber === number &&
           sameRepository(candidate.repository, worker.repository) && candidate.headSha &&
-          candidate.status === "awaiting_review" && !candidate.autoReview?.enabled &&
+          (["paused", "stopped"].includes(candidate.status) || candidate.status === "awaiting_review" && !candidate.autoReview?.enabled) &&
           !candidate.pendingPublication && !candidate.mergeAttempted && !["creating", "uncertain"].includes(candidate.publicationState ?? ""))) {
           const change = await this.deps.provider(issue.repository, "worker", this.completionChecks.signal).getChangeRequest(number);
           this.observeMergeConflict(issue, change);

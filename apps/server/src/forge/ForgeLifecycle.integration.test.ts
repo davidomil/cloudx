@@ -711,6 +711,69 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     }
   }, 25_000);
 
+  it("resumes a local conflict checkpoint after the target advances and the server restarts", async () => {
+    const fixture = await LifecycleFixture.create({ autoReview: true, approveFirst: true });
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);
+    const implementation = await fixture.completedAssistantTurn(started);
+    await fixture.workflow.poll();
+    const firstReview = await fixture.runningWorker("review");
+    await fixture.completedAssistantTurn(firstReview);
+    fixture.provider.changes.get(7)!.mergeable = false;
+    await fixture.workflow.poll();
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "awaiting_merge" });
+
+    const targetHeadSha = await fixture.conflictMainWithIssue();
+    fixture.provider.changes.get(7)!.requiresBaseUpdate = true;
+    const updateBranch = fixture.workflowDependencies.runtime.updateIssueBranch.bind(fixture.workflowDependencies.runtime);
+    let advancedTargetHeadSha: string | undefined;
+    vi.spyOn(fixture.workflowDependencies.runtime, "updateIssueBranch").mockImplementation(async (...args) => {
+      try {
+        return await updateBranch(...args);
+      } catch (error) {
+        expect(error).toMatchObject({ name: "ForgeBranchConflictError", targetHeadSha });
+        advancedTargetHeadSha = await fixture.advanceMain();
+        throw error;
+      }
+    });
+    fixture.advanceTime(5_001);
+    await fixture.workflow.poll();
+
+    const blocked = await fixture.worker(started.id);
+    expect(blocked).toMatchObject({
+      status: "failed", error: expect.stringContaining("target branch changed"),
+      rebaseRecovery: { expectedHeadSha: implementation.headSha, originalHeadSha: implementation.headSha, targetHeadSha, phase: "resolving" },
+    });
+    expect(await fixture.workspaceRecord(started.id)).toMatchObject({ issueRebase: {
+      expectedHeadSha: implementation.headSha, originalHeadSha: implementation.headSha, targetHeadSha,
+    } });
+    expect(await git(started.worktreePath!, "rev-parse", "HEAD")).toBe(implementation.headSha);
+    expect(fixture.factory.processes).toHaveLength(2);
+    expect(fixture.gitPushes).toHaveLength(1);
+
+    const notesPath = path.join(started.worktreePath!, "notes.txt");
+    await fs.writeFile(notesPath, "Preserve unfinished recovery notes\n");
+    await fixture.restartWorkflow();
+    await fixture.workflow.poll();
+    expect((await fixture.worker(started.id)).rebaseRecovery).toEqual(blocked.rebaseRecovery);
+    expect(fixture.factory.processes).toHaveLength(2);
+    const resumed = await fixture.workflow.resume(started.id, fixture.placement);
+    expect(resumed).toMatchObject({ status: "running", rebaseRecovery: blocked.rebaseRecovery });
+    const resolution = await fixture.completedAssistantTurn(resumed);
+    expect(resolution.context.rebaseRecovery).toEqual(blocked.rebaseRecovery);
+    expect(await fs.readFile(notesPath, "utf8")).toBe("Preserve unfinished recovery notes\n");
+    expect(await git(started.worktreePath!, "merge-base", resolution.headSha, targetHeadSha)).toBe(targetHeadSha);
+    expect(await git(fixture.origin, "rev-parse", started.branch!)).toBe(implementation.headSha);
+    expect(await git(fixture.origin, "rev-parse", "main")).toBe(advancedTargetHeadSha);
+
+    await fixture.workflow.poll();
+    expect(await fixture.worker(started.id)).toMatchObject({
+      status: "paused", error: expect.stringContaining("Commit all worker changes"), rebaseRecovery: { phase: "resolving" },
+    });
+    expect(fixture.gitPushes).toHaveLength(1);
+    expect(fixture.provider.submissions).toHaveLength(1);
+    expect(fixture.provider.merges).toEqual([]);
+  }, 25_000);
+
   it("updates an approved branch with newer target work, confirms publication, and reviews the new merge commit before merging", async () => {
     const fixture = await LifecycleFixture.create({ autoReview: true, approveFirst: true });
     const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);

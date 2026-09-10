@@ -2018,14 +2018,25 @@ describe("Forge issue auto review", () => {
     expect(f.runtime.prepareIssueRebase).not.toHaveBeenCalled();
   });
 
-  it.each(["pause", "stop"] as const)("preserves explicit %s when conflicts appear until the manual action", async action => {
+  it.each((["pause", "stop"] as const).flatMap(action => [false, true].map(autoReview => ({ action, autoReview }))))(
+    "refreshes conflicts after $action without resuming (auto review: $autoReview)", async ({ action, autoReview }) => {
     const f = await approvedIssue();
+    await f.service.setAutoReview(f.issue.id, autoReview, placement);
     await f.service[action](f.issue.id);
-    f.change.hasConflicts = true;
     f.reports.read.mockResolvedValue(undefined);
-    f.advanceTime(30_000); await f.poll();
-    expect(f.currentIssue().status).toBe(action === "pause" ? "paused" : "stopped");
-    expect(f.runtime.prepareIssueRebase).not.toHaveBeenCalled();
+    for (const hasConflicts of [true, true, false, true]) {
+      f.change.hasConflicts = hasConflicts;
+      f.advanceTime(30_000); await f.poll();
+      const observed = (await f.service.dashboard()).workers.find(worker => worker.id === f.issue.id)!;
+      expect(observed.status).toBe(action === "pause" ? "paused" : "stopped");
+      expect(observed.autoReview?.enabled).toBe(autoReview);
+      expect(observed.mergeConflict).toEqual(hasConflicts ? {
+        headSha: f.change.headSha, targetHeadSha: f.change.targetHeadSha,
+      } : undefined);
+      expect(f.runtime.prepareIssueRebase).not.toHaveBeenCalled();
+      expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+      expect(f.provider.merge).not.toHaveBeenCalled();
+    }
     const recovered = await f.service.rebaseAndResolve(f.issue.id, placement);
     expect(recovered).toMatchObject({ status: "running", rebaseRecovery: { phase: "resolving" } });
     await expect(f.service.rebaseAndResolve(f.issue.id, placement)).rejects.toThrow(/idle/);
@@ -2050,6 +2061,11 @@ describe("Forge issue auto review", () => {
     await f.deps.store.write(saved);
     f.change.hasConflicts = true;
     const restarted = new ForgeWorkflowService(f.deps);
+    f.provider.getChangeRequest.mockClear();
+    await restarted.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "paused" });
+    expect(f.stored()[0].mergeConflict).toBeUndefined();
+    expect(f.provider.getChangeRequest).not.toHaveBeenCalled();
     await expect(restarted.rebaseAndResolve(f.issue.id, placement)).rejects.toThrow(/publication or merge/);
     expect(f.runtime.prepareIssueRebase).not.toHaveBeenCalled();
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
@@ -2108,6 +2124,40 @@ describe("Forge issue auto review", () => {
     await f.poll();
     expect(f.currentIssue()).toMatchObject({ status: "failed", error: expect.stringContaining("target branch changed") });
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("resumes the retained local conflict after target advancement (restart: %s)", async restart => {
+    const f = await approvedIssue();
+    const targetHeadSha = f.change.targetHeadSha;
+    const publishedHeadSha = f.change.headSha;
+    f.change.requiresBaseUpdate = true;
+    f.runtime.updateIssueBranch.mockImplementation(async () => {
+      f.change.targetHeadSha = "d".repeat(40);
+      throw new ForgeBranchConflictError(targetHeadSha);
+    });
+    f.reports.read.mockResolvedValue(undefined);
+
+    await f.poll();
+
+    expect(f.currentIssue()).toMatchObject({
+      status: "failed", error: expect.stringContaining("target branch changed"),
+      autoReview: { phase: "implementing" },
+      rebaseRecovery: { targetHeadSha, originalHeadSha: publishedHeadSha, expectedHeadSha: publishedHeadSha, phase: "resolving" },
+    });
+    expect(f.currentIssue().pendingPublication).toBeUndefined();
+    await f.poll(); await f.poll();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+
+    const service = restart ? new ForgeWorkflowService(f.deps) : f.service;
+    if (restart) await service.poll();
+    await service.resume(f.issue.id, placement);
+    expect(f.currentIssue()).toMatchObject({ status: "running", rebaseRecovery: { targetHeadSha, phase: "resolving" } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.runtime.launch.mock.calls.at(-1)![0].prompt).toContain(targetHeadSha);
+    expect(f.runtime.updateIssueBranch).toHaveBeenCalledOnce();
+    expect(f.runtime.completeIssueRebase).not.toHaveBeenCalled();
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
     expect(f.provider.merge).not.toHaveBeenCalled();
   });
 
@@ -2627,7 +2677,10 @@ describe("Forge issue auto review", () => {
     expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringMatching(/automatic.*exhausted.*Resume/i) });
     f.advanceTime(300_000);
     await f.service.poll();
-    expect(f.provider.getChangeRequest).toHaveBeenCalledTimes(checks);
+    expect(f.provider.getChangeRequest).toHaveBeenCalledTimes(checks + 1);
+    expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringMatching(/automatic.*exhausted.*Resume/i) });
+    expect(f.runtime.prepareIssueRebase).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
     expect(f.provider.merge).not.toHaveBeenCalled();
     await f.service.resume(f.issue.id, placement);
     expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", error: expect.stringMatching(/automatic.*retry/i) });
@@ -2673,7 +2726,11 @@ describe("Forge issue auto review", () => {
     const checks = f.provider.getChangeRequest.mock.calls.length;
     f.advanceTime(300_001);
     await f.service.poll();
-    expect(f.provider.getChangeRequest).toHaveBeenCalledTimes(checks);
+    expect(f.provider.getChangeRequest).toHaveBeenCalledTimes(checks + 1);
+    expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringMatching(/automatic.*exhausted.*Resume/i) });
+    expect(f.runtime.prepareIssueRebase).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
   });
 
   it.each(["pause", "stop", "disable", "dispose", "restart"] as const)("does not recover scheduled work after %s", async action => {
@@ -2692,7 +2749,7 @@ describe("Forge issue auto review", () => {
     f.change.mergeable = true;
     f.advanceTime(300_001);
     await service.poll();
-    expect(f.provider.getChangeRequest).toHaveBeenCalledTimes(checks + (action === "disable" ? 1 : 0));
+    expect(f.provider.getChangeRequest).toHaveBeenCalledTimes(checks + 1);
     expect(f.runtime.prepareIssueRebase).not.toHaveBeenCalled();
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
     expect(f.provider.merge).not.toHaveBeenCalled();

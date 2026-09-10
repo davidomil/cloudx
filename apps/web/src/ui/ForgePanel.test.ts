@@ -1372,6 +1372,32 @@ describe("ForgePanel", () => {
     ]);
   });
 
+  it.each(["paused", "stopped"] as const)("refreshes the conflict blocker and explicit recovery action while %s", async status => {
+    vi.useFakeTimers();
+    const idleWorker = { ...conflictedWorker, status, mergeConflict: undefined };
+    const testFixture = fixture({ workers: [idleWorker] });
+    const panel = await renderPanel(testFixture);
+    expect(panel.textContent).not.toContain("Rebase and resolve conflicts");
+    for (const hasConflicts of [true, false, true]) {
+      testFixture.dashboard.workers = [{ ...idleWorker, mergeConflict: hasConflicts ? conflictedWorker.mergeConflict : undefined }];
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      const card = panel.querySelector('[aria-label="issue worker #7"]')!;
+      expect(card.querySelector(".forge-status")?.textContent).toBe(status);
+      if (hasConflicts) {
+        expect(card.textContent).toContain("Merge conflicts block this request.");
+        expect(button(card, "Rebase and resolve conflicts").disabled).toBe(false);
+      } else {
+        expect(card.textContent).not.toContain("Merge conflicts block this request.");
+        expect(card.textContent).not.toContain("Rebase and resolve conflicts");
+      }
+      expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([]);
+    }
+    await click(panel, "Rebase and resolve conflicts");
+    expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([
+      { hook: "forge.worker.rebaseAndResolve", input: { id: worker.id, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id }
+    ]);
+  });
+
   it.each([
     { status: "starting" }, { status: "running" }, { status: "awaiting_publication" },
     { status: "completed" }, { status: "cleanup_failed" }, { kind: "review" },
