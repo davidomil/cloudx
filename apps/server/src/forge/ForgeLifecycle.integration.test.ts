@@ -860,6 +860,47 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(fixture.provider.submissions).toEqual([]);
   }, 25_000);
 
+  it.each(["pause", "stop", "restart"] as const)("resumes a reviewer after %s when the target conflicts, then rebases and reviews the new commit", async interruption => {
+    const fixture = await LifecycleFixture.create({ autoReview: true, approveFirst: true });
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);
+    const implementation = await fixture.completedAssistantTurn(started);
+    await fixture.workflow.poll();
+    const reviewer = await fixture.runningWorker("review");
+    const receipt = await fixture.completedAssistantTurn(reviewer);
+    if (interruption === "restart") await fixture.restartWorkflow();
+    else await fixture.workflow[interruption](reviewer.id);
+    expect(await processIsRunning(receipt.pid)).toBe(false);
+
+    const targetHead = await fixture.conflictMainWithIssue();
+    fixture.provider.detectConflicts = true;
+    await fixture.workflow.resume(interruption === "stop" ? started.id : reviewer.id, fixture.placement);
+    const resumed = await fixture.runningWorker("review");
+    expect(resumed).toMatchObject({ id: reviewer.id, worktreePath: reviewer.worktreePath, headSha: implementation.headSha });
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "awaiting_review" });
+    const resumedReceipt = await fixture.completedAssistantTurn(resumed);
+    expect(resumedReceipt.resumedSessionId).toBe(receipt.sessionId);
+    fixture.advanceTime(5_001);
+    await fixture.workflow.poll();
+
+    const resolving = await fixture.runningWorker("issue");
+    expect(resolving).toMatchObject({ id: started.id, rebaseRecovery: { phase: "resolving", targetHeadSha: targetHead } });
+    const resolution = await fixture.completedAssistantTurn(resolving);
+    expect(await fixture.reports.read(resolving.attemptId!)).toMatchObject({ rebase: { outcome: "resolved", validation: "passed" } });
+    await fixture.workflow.poll();
+
+    const freshReview = await fixture.runningWorker("review");
+    expect(freshReview).toMatchObject({
+      id: reviewer.id,
+      headSha: resolution.headSha,
+      reviewHistory: [expect.objectContaining({ headSha: implementation.headSha, event: "approve", status: "draft" })],
+    });
+    expect(resolution.headSha).not.toBe(implementation.headSha);
+    expect(await git(fixture.origin, "rev-parse", started.branch!)).toBe(resolution.headSha);
+    expect(fixture.gitPushes[1]).toContain(`--force-with-lease=refs/heads/${started.branch}:${implementation.headSha}`);
+    expect(fixture.provider.submissions).toEqual([]);
+    expect(fixture.provider.merges).toEqual([]);
+  }, 30_000);
+
   it("retains an uncertain automatic review without reposting or launching more work", async () => {
     const fixture = await LifecycleFixture.create({ autoReview: true });
     const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);

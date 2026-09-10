@@ -889,7 +889,8 @@ export class ForgeRuntime {
       if (await this.publishedBranchHead(owned, access, signal) !== expectedHeadSha)
         throw new Error("The published branch changed before rebase recovery. Refresh it before resuming; local work was preserved.");
       const update = owned.baseUpdate;
-      let targetHeadSha = update?.expectedHeadSha === expectedHeadSha && update.baseBranch === baseBranch ? update.targetHeadSha : undefined;
+      let targetHeadSha = update?.expectedHeadSha === expectedHeadSha && update.baseBranch === baseBranch && !update.headSha
+        ? update.targetHeadSha : undefined;
       if (!targetHeadSha) {
         await this.runOwnedGit(owned, ["fetch", "--no-tags", "--no-recurse-submodules", access.cloneUrl,
           `+refs/heads/${baseBranch}:refs/cloudx/rebase-target`], signal, access.authorization);
@@ -1004,6 +1005,7 @@ export class ForgeRuntime {
       throw new Error("The interrupted rebase publication remains uncertain. Confirm the previous Git process has stopped and inspect the remote branch before resuming; local work was preserved.");
     publication.confirmed = true;
     owned.gitPending = false;
+    owned.baseUpdate = undefined;
     await this.manifest(owned.id).write(owned);
   }
 
@@ -1022,6 +1024,7 @@ export class ForgeRuntime {
     const publication = rebase.publication;
     if (publication && remoteHead === expectedHeadSha) {
       await this.verifyCleanHead(owned, expectedHeadSha, signal);
+      if (!publication.confirmed) owned.baseUpdate = undefined;
       publication.confirmed = true;
       await this.manifest(owned.id).write(owned);
       return expectedHeadSha;
@@ -1037,6 +1040,7 @@ export class ForgeRuntime {
       throw new Error("The rewritten published head could not be confirmed. Its publication intent and local work were preserved.");
     await this.verifyCleanHead(owned, expectedHeadSha, signal);
     rebase.publication.confirmed = true;
+    owned.baseUpdate = undefined;
     await this.manifest(owned.id).write(owned);
     signal?.throwIfAborted();
     return expectedHeadSha;

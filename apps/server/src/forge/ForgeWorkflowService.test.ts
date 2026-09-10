@@ -2173,6 +2173,59 @@ describe("Forge issue auto review", () => {
     expect(f.runtime.prepareIssueRebase).toHaveBeenCalledOnce();
   });
 
+  it.each(["pause", "stop", "restart", "active"] as const)(
+    "resumes through either worker after %s and finishes the reviewer before conflict recovery",
+    async interruption => {
+      for (const resumeThrough of ["issue", "reviewer"] as const) {
+        const f = await automaticIssue();
+        f.codingReport(); await f.poll();
+        const reviewer = f.currentReview();
+        let service = f.service;
+        if (interruption === "restart") service = new ForgeWorkflowService(f.deps);
+        else if (interruption !== "active") await service[interruption](reviewer.id);
+        f.change.hasConflicts = true;
+        f.reports.read.mockResolvedValue(undefined);
+        f.runtime.verifyPublishedWorkspace.mockClear();
+        f.runtime.verifyPublishedWorkspace.mockRejectedValue(new Error("Local unpublished work exists"));
+
+        await service.resume(resumeThrough === "issue" ? f.issue.id : reviewer.id, placement);
+
+        expect(f.currentIssue()).toMatchObject({ status: "awaiting_review", headSha: f.change.headSha });
+        expect(f.currentReview()).toMatchObject({ id: reviewer.id, status: "running", headSha: f.change.headSha });
+        expect(f.runtime.prepareIssueRebase).not.toHaveBeenCalled();
+        expect(f.runtime.verifyPublishedWorkspace).not.toHaveBeenCalled();
+        expect(f.runtime.launch).toHaveBeenCalledTimes(interruption === "active" ? 2 : 3);
+
+        f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Fix reviewed", comments: [] });
+        f.advanceTime(5_000);
+        await service.poll();
+
+        expect(f.currentIssue()).toMatchObject({ status: "running", rebaseRecovery: { phase: "resolving" } });
+        expect(f.currentReview()).toMatchObject({ id: reviewer.id, status: "completed", draft: { status: "draft", body: "Fix reviewed" } });
+        expect(f.runtime.prepareIssueRebase).toHaveBeenCalledOnce();
+        expect(f.runtime.launch.mock.calls.at(-1)![0]).toMatchObject({ id: f.issue.id });
+        expect(f.provider.postReview).not.toHaveBeenCalled();
+        expect(f.provider.merge).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it.each(["posting", "post_failed"] as const)("keeps uncertain %s review submissions blocked when conflicts appear", async status => {
+    const f = await approvedIssue();
+    const saved = f.stored();
+    const reviewer = saved.find(worker => worker.kind === "review")!;
+    reviewer.draft = { ...reviewer.draft!, status, publication: undefined, postedAt: undefined };
+    f.change.hasConflicts = true;
+    await f.deps.store.write(saved);
+    const restarted = new ForgeWorkflowService(f.deps);
+    for (const id of [f.issue.id, reviewer.id])
+      await expect(restarted.resume(id, placement)).rejects.toThrow(/previous review submission must be reconciled/);
+    expect(f.runtime.prepareIssueRebase).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
   it("deduplicates the unchanged target without replacing the completed runtime recovery", async () => {
     const f = await resolvingIssue();
     await f.service.setAutoReview(f.issue.id, false, placement);

@@ -832,11 +832,12 @@ export class ForgeWorkflowService {
       await this.quiesce(worker);
       const context = await this.autoReviewContext(worker);
       if (!context) return structuredClone(worker);
-      if (context.change.hasConflicts) {
+      if (context.change.hasConflicts && (!review || review.status === "completed")) {
         await this.startRebaseRecovery(worker, placement);
         return structuredClone(worker);
       }
-      await this.deps.runtime.verifyPublishedWorkspace(workerWorkspace(worker), worker.headSha!);
+      if (!context.change.hasConflicts)
+        await this.deps.runtime.verifyPublishedWorkspace(workerWorkspace(worker), worker.headSha!);
       controller.signal.throwIfAborted();
       loop.placement = placement;
       loop.waitingSince = undefined;
