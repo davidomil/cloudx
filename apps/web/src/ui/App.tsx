@@ -1365,7 +1365,11 @@ export function App() {
                   onDismiss={dismissNotification}
                   onDismissAll={dismissAllNotifications}
                 />
-                <ControlButton className="icon-button" iconOnly onClick={() => { setSettingsOpen(true); setMobileActionsOpen(false); }} title="Settings" aria-label="Settings" role="menuitem">
+                <ControlButton className="icon-button" iconOnly onClick={() => {
+                  mobileActionsRef.current?.querySelector<HTMLButtonElement>('[aria-haspopup="menu"]')?.focus();
+                  setSettingsOpen(true);
+                  setMobileActionsOpen(false);
+                }} title="Settings" aria-label="Settings" role="menuitem">
                   <Settings size={17} />
                 </ControlButton>
                 <ControlButton className="icon-button" iconOnly onClick={() => { split("column"); setMobileActionsOpen(false); }} disabled={!canSplitWorkspace} title={splitDisabledReason ?? "Split vertically"} aria-label="Split vertically" role="menuitem">
