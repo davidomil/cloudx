@@ -367,14 +367,27 @@ describe("DocumentationEnrichmentService", () => {
       }
     });
 
-    it.each([
+    it.each<{ name: string; prefix?: Buffer; suffix: Buffer; sourceType?: string }>([
       { name: "late binary byte", suffix: Buffer.from([0]) },
       { name: "late binary control after invalid UTF-8", suffix: Buffer.from([0xff, 0x0b]) },
       { name: "late binary control after incomplete UTF-8", suffix: Buffer.from([0xc3, 0x1f]) },
       { name: "invalid UTF-8 followed by binary data without media hints", suffix: Buffer.concat([Buffer.from([0xff]), Buffer.alloc(70_000, 0x61), Buffer.from([0])]), sourceType: "text" },
-    ])("keeps binary .txt media on ASR with $name", async ({ suffix, sourceType = "media" }) => {
+      ...[false, true].flatMap((bigEndian) => {
+        const encode = (text: string) => bigEndian ? Buffer.from(text, "utf16le").swap16() : Buffer.from(text, "utf16le");
+        const prefix = encode("\ufeff" + "a".repeat(35_000));
+        return [
+          { name: `UTF-16${bigEndian ? "BE" : "LE"} BOM and late binary control`, prefix, suffix: encode("\0") },
+          { name: `UTF-16${bigEndian ? "BE" : "LE"} BOM and unpaired surrogate`, prefix, suffix: encode("\ud800x") },
+          { name: `UTF-16${bigEndian ? "BE" : "LE"} BOM and incomplete surrogate at EOF`, prefix, suffix: encode("\ud800") },
+          { name: `UTF-16${bigEndian ? "BE" : "LE"} BOM and incomplete code unit at EOF`, prefix, suffix: Buffer.from([0x61]) },
+        ];
+      }),
+      { name: "UTF-8 BOM and late binary control", prefix: Buffer.from("\ufeff" + "a".repeat(70_000)), suffix: Buffer.from([0]) },
+      { name: "UTF-8 BOM and invalid encoding", prefix: Buffer.from("\ufeff" + "a".repeat(70_000)), suffix: Buffer.from([0xff]) },
+      { name: "UTF-8 BOM and incomplete encoding at EOF", prefix: Buffer.from("\ufeff" + "a".repeat(70_000)), suffix: Buffer.from([0xc3]) },
+    ])("keeps binary .txt media on ASR with $name", async ({ suffix, prefix = Buffer.alloc(70_000, 0x61), sourceType = "media" }) => {
       const fixture = await archivedMediaFixture("recording.txt", sourceType);
-      const bytes = Buffer.concat([Buffer.alloc(70_000, 0x61), suffix]);
+      const bytes = Buffer.concat([prefix, suffix]);
       await fs.writeFile(fixture.mediaPath, bytes);
       await fs.writeFile(path.join(path.dirname(fixture.mediaPath), "metadata.json"), JSON.stringify({
         url: "https://example.com/shared.bin", contentType: "application/octet-stream",
@@ -652,7 +665,10 @@ describe("DocumentationEnrichmentService", () => {
     { name: "whitespace and ESC", filename: "notes.txt", contentType: "text/plain", bytes: Buffer.from("RETAINED-TEXT\t\n\f\r\u001b café") },
     { name: "UTF-16LE BOM", filename: "notes.txt", contentType: null, bytes: Buffer.from("\ufeffRETAINED-TEXT café", "utf16le") },
     { name: "UTF-16BE BOM", filename: "notes.txt", contentType: null, bytes: Buffer.from("\ufeffRETAINED-TEXT café", "utf16le").swap16() },
-    { name: "UTF-8 BOM", filename: "notes.txt", contentType: null, bytes: Buffer.from("\ufeffRETAINED-TEXT\0") },
+    { name: "UTF-8 BOM", filename: "notes.txt", contentType: null, bytes: Buffer.from("\ufeffRETAINED-TEXT café") },
+    { name: "UTF-16LE split surrogate", filename: "notes.txt", contentType: null, bytes: Buffer.from("\ufeff" + "RETAINED-TEXT".padEnd(32_766, "a") + "🎧字幕\t\n\f\r\u001b", "utf16le") },
+    { name: "UTF-16BE split surrogate", filename: "notes.txt", contentType: null, bytes: Buffer.from("\ufeff" + "RETAINED-TEXT".padEnd(32_766, "a") + "🎧字幕\t\n\f\r\u001b", "utf16le").swap16() },
+    { name: "UTF-8 BOM split character", filename: "notes.txt", contentType: null, bytes: Buffer.from("\ufeff" + "RETAINED-TEXT".padEnd(65_532, "a") + "🎧字幕") },
   ].flatMap((fixture) => [fixture.contentType, "audio/flac", "video/ogg"].map((contentType) => ({ ...fixture, contentType }))))(
     "retains $name text evidence independently of MIME $contentType", async ({ filename, contentType, bytes = Buffer.from("RETAINED-TEXT source evidence.") }) => {
       const text = bytes.toString("utf8").trim().slice(0, 100);

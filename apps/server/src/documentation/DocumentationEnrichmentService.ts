@@ -1565,21 +1565,35 @@ function recordStringArray(record: Record<string, unknown>, key: string): string
 }
 
 async function isTextFile(filename: string, signal?: AbortSignal): Promise<boolean> {
+  let decoder: TextDecoder | undefined;
   let firstChunk = true;
   for await (const bytes of fs.createReadStream(filename, { signal })) {
-    // Text uses the WHATWG MIME Sniffing Standard's BOM and binary-byte checks.
-    if (firstChunk && (
-      bytes[0] === 0xfe && bytes[1] === 0xff
-      || bytes[0] === 0xff && bytes[1] === 0xfe
-      || bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf
-    )) {
-      return true;
+    if (firstChunk) {
+      // A BOM selects an encoding; media such as MP1 can share the same prefix.
+      if (bytes[0] === 0xfe && bytes[1] === 0xff) {
+        decoder = new TextDecoder("utf-16be", { fatal: true });
+      } else if (bytes[0] === 0xff && bytes[1] === 0xfe) {
+        decoder = new TextDecoder("utf-16le", { fatal: true });
+      } else if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+        decoder = new TextDecoder("utf-8", { fatal: true });
+      }
+      firstChunk = false;
     }
-    firstChunk = false;
-    if (bytes.some((byte: number) => byte <= 0x08 || byte === 0x0b
-      || byte >= 0x0e && byte <= 0x1a || byte >= 0x1c && byte <= 0x1f)) {
+    let text: string;
+    try {
+      text = decoder ? decoder.decode(bytes, { stream: true }) : bytes.toString("latin1");
+    } catch {
       return false;
     }
+    // Apply the existing binary-control check to decoded characters for BOM text.
+    if (/[\u0000-\u0008\u000b\u000e-\u001a\u001c-\u001f]/u.test(text)) {
+      return false;
+    }
+  }
+  try {
+    decoder?.decode();
+  } catch {
+    return false;
   }
   return true;
 }

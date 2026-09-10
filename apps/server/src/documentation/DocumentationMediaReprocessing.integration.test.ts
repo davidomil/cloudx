@@ -113,6 +113,62 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
     );
 
     describe.each(["reanalyze", "reenrich"] as const)("%s", (operation) => {
+      it("refreshes an MP1 recording whose header matches a UTF-16 BOM twice", async () => {
+        const fixture = await startArchive();
+        try {
+          // Twenty silent MPEG-1 Layer I frames: 384 kbps, 32 kHz stereo, with CRC.
+          // The header matches https://samples.ffmpeg.org/A-codecs/mp1-sample.mp1.
+          const frame = Buffer.alloc(576);
+          frame.set([0xff, 0xfe, 0xc8, 0x04, 0x61, 0xa8]);
+          const sourceBytes = Buffer.concat(Array.from({ length: 20 }, () => frame));
+          const sourcePath = path.join(fixture.root, "recording.mp1");
+          await fs.writeFile(sourcePath, sourceBytes);
+          const probe = await runFile("ffprobe", [
+            "-v", "error", "-show_entries", "stream=codec_name,sample_rate,channels", "-of", "json", sourcePath,
+          ]);
+          expect(JSON.parse(probe.stdout).streams)
+            .toMatchObject([{ codec_name: "mp1", sample_rate: "32000", channels: 2 }]);
+          await runFile("ffmpeg", ["-v", "error", "-nostdin", "-err_detect", "crccheck+explode", "-i", sourcePath, "-f", "null", "-"]);
+          const imported = await fixture.client.ingestUploadFile({
+            filename: "recording.mp1", path: sourcePath, contentType: "audio/mpeg",
+            title: "Original MP1 recording", collection: "Media regression", tags: ["retain-me"],
+          });
+          const documentId = (imported.document as { documentId: string }).documentId;
+          const original = await fixture.document(documentId);
+          expect(original.source_type).toBe("text");
+          const enrichment = createEnrichment(fixture);
+          await expect(enrichment.service.enrichIngestResponse(imported, {
+            filename: "recording.mp1", contentPath: sourcePath, contentType: "audio/mpeg",
+          })).resolves.toMatchObject({ enrichment: { results: [{ status: "written" }] } });
+          expect(enrichment.transcribeFile).toHaveBeenCalledOnce();
+          expect(enrichment.run.mock.lastCall![0]).toContain("FRESH-TRANSCRIPT-1");
+          await fs.unlink(sourcePath);
+
+          const hook = enrichment.plugin.hooks.find((candidate) => candidate.id === `documentation.documents.${operation}`)!;
+          for (let rerun = 1; rerun <= 2; rerun += 1) {
+            const prior = await fixture.document(documentId);
+            await expect(hook.execute({ documentId }, { caller: { kind: "ui" } }))
+              .resolves.toMatchObject({ kind: operation, firstDocumentId: documentId, enrichment: { results: [{ status: "written" }] } });
+            expect(enrichment.transcribeFile).toHaveBeenCalledTimes(rerun + 1);
+            expect(enrichment.mediaProcessLauncher).toHaveBeenCalledTimes(rerun);
+            expect(enrichment.mediaProcessLauncher.mock.lastCall![0]).toBe("ffprobe");
+            const prompt = enrichment.run.mock.lastCall![0];
+            expect(prompt).toContain(`FRESH-TRANSCRIPT-${rerun + 1}`);
+            for (const chunk of prior.chunks) expect(prompt).not.toContain(JSON.stringify(chunk.text));
+            const current = await fixture.document(documentId);
+            expect(identity(current)).toEqual(identity(original));
+            expect(current.chunks.filter((chunk) => chunk.chunk_origin === "ai"))
+              .toMatchObject([{ text: `REPLACEMENT-AI-${rerun + 1}` }]);
+            expect(JSON.parse(current.enrichments[0].payload_json).evidence).toMatchObject({
+              chunkCount: 0, mediaTranscriptChars: `FRESH-TRANSCRIPT-${rerun + 1}`.length, keyframeCount: 0,
+            });
+            await expect(fs.readFile(path.join(fixture.archiveRoot, current.snapshot_path))).resolves.toEqual(sourceBytes);
+          }
+        } finally {
+          await fixture.dispose();
+        }
+      }, 30_000);
+
       describe.each(["latin1", "utf8"] as const)("retained %s text", (encoding) => {
         it.each([undefined, "text/plain", "application/octet-stream", "audio/flac", "video/ogg"])(
           "enriches existing text twice after reopening its database (sibling MIME: %s)",
