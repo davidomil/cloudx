@@ -7,10 +7,15 @@ import path from "node:path";
 import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import {
+  parseEnvironmentFile,
+  updateEnvironmentFile,
+} from "./installer-environment.mjs";
+import {
   SERVICE_NAMES,
   documentationReadinessUrl,
   inspectUpdateTarget,
   updateCheckout,
+  updateHost,
   updatePort,
 } from "./install-update.mjs";
 
@@ -119,6 +124,8 @@ export function parseArgs(argv = process.argv.slice(2)) {
         throw new Error("--service requires a user service name.");
     } else if (arg === "--port") {
       options.port = updatePort(argv[++index], "--port");
+    } else if (arg === "--host") {
+      options.host = updateHost(argv[++index]);
     } else if (arg === "--verbose") {
       options.verbose = true;
     } else if (arg === "--help" || arg === "-h") {
@@ -130,10 +137,20 @@ export function parseArgs(argv = process.argv.slice(2)) {
   if (options.uninstall && options.update) {
     throw new Error("--update cannot be combined with --uninstall.");
   }
-  if ((options.service || options.port !== undefined) && !options.update) {
-    throw new Error("--service and --port are only available with --update.");
+  if (
+    (options.service ||
+      options.port !== undefined ||
+      options.host !== undefined) &&
+    !options.update
+  ) {
+    throw new Error(
+      "--service, --port, and --host are only available with --update.",
+    );
   }
-  if (Boolean(options.service) !== (options.port !== undefined)) {
+  if (
+    Boolean(options.service) !== (options.port !== undefined) ||
+    (options.host !== undefined && !options.service)
+  ) {
     throw new Error(
       "A custom web service update requires both --service and --port.",
     );
@@ -157,6 +174,7 @@ export function helpText() {
     "  --update           Fast-forward this clean checkout to origin/main and update its installation.",
     "  --service <unit>   Update only an existing custom web service; preserve its definition and shared dependencies.",
     "  --port <number>    HTTPS readiness port for the selected custom web service.",
+    "  --host <address>   IPv4 or IPv6 readiness address for the custom service (default: 127.0.0.1).",
     "  --uninstall        Remove Cloudx services and selected local install artifacts.",
     "  --dry-run          Print commands and planned file writes without changing the system.",
     "  --answers <json>   Read wizard answers from a JSON file.",
@@ -949,6 +967,7 @@ export async function runInstaller(options = {}) {
       commands,
       service: options.service,
       port: options.port,
+      host: options.host,
     });
     if (updateTarget.kind === "standard") {
       savedEnv = readEnvFile(paths.envPath);
@@ -1633,7 +1652,7 @@ async function runWebServiceUpdater({
     commands.run("systemctl", ["--user", "restart", service]);
     waitForHealth(commands, {
       label: service,
-      url: `https://127.0.0.1:${target.port}/api/ready`,
+      url: `${target.origin}/api/ready`,
       insecure: true,
     });
   }
@@ -1648,7 +1667,7 @@ async function runWebServiceUpdater({
     port: target.port,
     servicesInstalled: true,
     restartServices,
-    urls: cloudxAccessUrls(target.port),
+    urls: [target.origin],
   };
 }
 
@@ -2283,47 +2302,11 @@ function readText(filePath, fallback) {
 }
 
 function readEnvFile(filePath) {
-  const content = readText(filePath, "");
-  const values = {};
-  for (const line of content.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) {
-      continue;
-    }
-    const separator = trimmed.indexOf("=");
-    if (separator === -1) {
-      continue;
-    }
-    values[trimmed.slice(0, separator)] = trimmed.slice(separator + 1);
-  }
-  return values;
+  return parseEnvironmentFile(readText(filePath, ""));
 }
 
 export function updateEnvFileContent(content, updates) {
-  const seen = new Set();
-  const lines = content
-    .split(/\r?\n/)
-    .filter(
-      (line, index, allLines) => index < allLines.length - 1 || line !== "",
-    );
-  const updatedLines = lines.map((line) => {
-    const separator = line.indexOf("=");
-    if (separator === -1 || line.trim().startsWith("#")) {
-      return line;
-    }
-    const key = line.slice(0, separator);
-    if (!Object.hasOwn(updates, key)) {
-      return line;
-    }
-    seen.add(key);
-    return `${key}=${updates[key]}`;
-  });
-  for (const [key, value] of Object.entries(updates)) {
-    if (!seen.has(key)) {
-      updatedLines.push(`${key}=${value}`);
-    }
-  }
-  return `${updatedLines.join("\n")}\n`;
+  return updateEnvironmentFile(content, updates);
 }
 
 export function toolPathFor(commandPath, npmPrefix, currentPath = "") {

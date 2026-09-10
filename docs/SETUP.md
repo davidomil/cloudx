@@ -226,10 +226,22 @@ unit and HTTPS port explicitly:
 ./install.sh --update --service cloudx-forge-test-3002.service --port 3002
 ```
 
+The readiness address defaults to `127.0.0.1`. For a service bound to IPv6
+loopback, specify its address:
+
+```bash
+./install.sh --update --service cloudx-forge-test-3002.service --port 3002 --host ::1
+```
+
+`--host` accepts an IPv4 or IPv6 address without brackets or a zone identifier.
+The wildcard bind addresses `0.0.0.0` and `::` select `127.0.0.1` and `::1` for
+readiness, respectively. The updater checks only the selected address; it does
+not change the service's bind configuration.
+
 This mode checks the service's effective working directory, updates the checkout
 from `origin/main`, installs Node dependencies, rebuilds Cloudx, and asks whether
-to restart only that unit. The port must match the service's HTTPS listener. It
-preserves the unit definition and environment, including transient services, and
+to restart only that unit. The address and port must match the service's HTTPS
+listener. It preserves the unit definition and environment, including transient services, and
 leaves shared Codex, ASR, documentation, model, and certificate installations in
 place. Add `--no-start` to build without restarting or `--dry-run --yes` to inspect
 the plan. The standard update mode rejects units owned by another checkout even

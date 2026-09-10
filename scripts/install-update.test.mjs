@@ -38,7 +38,11 @@ function checkout({ includeInstaller = false } = {}) {
   fs.writeFileSync(path.join(author, "version"), "one\n");
   if (includeInstaller) {
     fs.mkdirSync(path.join(author, "scripts"));
-    for (const file of ["install-cloudx.mjs", "install-update.mjs"])
+    for (const file of [
+      "install-cloudx.mjs",
+      "install-update.mjs",
+      "installer-environment.mjs",
+    ])
       fs.copyFileSync(
         path.join(process.cwd(), "scripts", file),
         path.join(author, "scripts", file),
@@ -249,6 +253,49 @@ describe("choosing the service owned by this checkout", () => {
       port: 3002,
     });
   });
+  it.each([
+    [undefined, "https://127.0.0.1:3002"],
+    ["::1", "https://[::1]:3002"],
+    ["0:0:0:0:0:0:0:1", "https://[::1]:3002"],
+    ["::", "https://[::1]:3002"],
+    ["0:0:0:0:0:0:0:0", "https://[::1]:3002"],
+    ["0.0.0.0", "https://127.0.0.1:3002"],
+    ["192.0.2.12", "https://192.0.2.12:3002"],
+    ["2001:db8::12", "https://[2001:db8::12]:3002"],
+  ])("uses the selected readiness host %s", (host, origin) => {
+    const fixture = installation();
+    expect(
+      inspectUpdateTarget({
+        ...fixture,
+        service: fixture.properties.Id,
+        port: 3002,
+        host,
+      }),
+    ).toMatchObject({ kind: "web", origin });
+  });
+  it.each([
+    "localhost",
+    "https://[::1]",
+    "127.0.0.1:3002",
+    "::1/path",
+    "[::1]",
+    "fe80::1%eth0",
+    "",
+    42,
+  ])("rejects invalid readiness host %j before service inspection", (host) => {
+    const fixture = installation();
+    fixture.commands.inspect = () => {
+      throw new Error("Service inspection must not run for an invalid host.");
+    };
+    expect(() =>
+      inspectUpdateTarget({
+        ...fixture,
+        service: fixture.properties.Id,
+        port: 3002,
+        host,
+      }),
+    ).toThrow(/--host.*IPv4 or IPv6/);
+  });
 });
 
 describe("documentation service readiness", () => {
@@ -342,9 +389,30 @@ describe("installer update entrypoints", () => {
     ["--update", "--port", "3002"],
     ["--service", "preview.service", "--port", "3002"],
     ["--update", "--service", "preview.service", "--port", "0"],
+    ["--update", "--host", "::1"],
+    ["--host", "::1"],
+    ["--update", "--service", "preview.service", "--port", "3002", "--host"],
   ])("rejects incomplete custom service options %j", (...args) =>
     expect(() => parseArgs(args)).toThrow(),
   );
+  it("accepts an explicit IPv6 host for a custom web service", () => {
+    expect(
+      parseArgs([
+        "--update",
+        "--service",
+        "preview.service",
+        "--port",
+        "3002",
+        "--host",
+        "::1",
+      ]),
+    ).toMatchObject({
+      update: true,
+      service: "preview.service",
+      port: 3002,
+      host: "::1",
+    });
+  });
 });
 
 function plannedUpdate({ service = false, modelExists = false } = {}) {
@@ -407,51 +475,75 @@ function plannedUpdate({ service = false, modelExists = false } = {}) {
 }
 
 describe("the complete updater plan", () => {
-  it("rebuilds and restarts only the selected custom web service", async () => {
-    const fixture = plannedUpdate({ service: true });
-    const result = await runInstaller(fixture.options);
-    const planned = fixture.runner.commands
-      .filter((command) => !command.inspect)
-      .map((command) => [command.command, ...command.args]);
-    expect(result).toMatchObject({ port: 3002, restartServices: true });
-    expect(planned).toContainEqual([
-      "systemctl",
-      "--user",
-      "restart",
-      "preview.service",
-    ]);
-    expect(planned.filter((command) => command[0] === "npm")).toEqual([
-      ["npm", "-v"],
-      ["npm", "ci"],
-      ["npm", "run", "build"],
-    ]);
-    expect(
-      planned.filter((command) => command[0] === "systemctl"),
-    ).toHaveLength(1);
-    expect(
-      planned.some((command) =>
-        /uv|python|codex|sudo|cert:create/.test(command.join(" ")),
-      ),
-    ).toBe(false);
-    expect(
-      fixture.runner.writes.every((write) =>
-        write.path.startsWith(path.join(fixture.root, "apps/server/dist")),
-      ),
-    ).toBe(true);
-    expect(fs.readFileSync(fixture.envPath, "utf8")).toBe(fixture.envText);
-    expect(
-      fs.readFileSync(path.join(fixture.unitDir, "cloudx.service"), "utf8"),
-    ).toBe("original production unit");
-  });
+  it.each([
+    [undefined, "https://127.0.0.1:3002"],
+    ["::1", "https://[::1]:3002"],
+    ["::", "https://[::1]:3002"],
+  ])(
+    "rebuilds and restarts only the selected custom web service on %s",
+    async (host, origin) => {
+      const fixture = plannedUpdate({ service: true });
+      const result = await runInstaller({ ...fixture.options, host });
+      const planned = fixture.runner.commands
+        .filter((command) => !command.inspect)
+        .map((command) => [command.command, ...command.args]);
+      expect(result).toMatchObject({ port: 3002, restartServices: true });
+      expect(result.urls).toEqual([origin]);
+      const readiness = planned.filter((command) => command[0] === "curl");
+      expect(readiness).toHaveLength(1);
+      expect(readiness[0].at(-1)).toBe(`${origin}/api/ready`);
+      expect(planned).toContainEqual([
+        "systemctl",
+        "--user",
+        "restart",
+        "preview.service",
+      ]);
+      expect(planned.filter((command) => command[0] === "npm")).toEqual([
+        ["npm", "-v"],
+        ["npm", "ci"],
+        ["npm", "run", "build"],
+      ]);
+      expect(
+        planned.filter((command) => command[0] === "systemctl"),
+      ).toHaveLength(1);
+      expect(
+        planned.some((command) =>
+          /uv|python|codex|sudo|cert:create/.test(command.join(" ")),
+        ),
+      ).toBe(false);
+      expect(
+        fixture.runner.writes.every((write) =>
+          write.path.startsWith(path.join(fixture.root, "apps/server/dist")),
+        ),
+      ).toBe(true);
+      expect(fs.readFileSync(fixture.envPath, "utf8")).toBe(fixture.envText);
+      expect(
+        fs.readFileSync(path.join(fixture.unitDir, "cloudx.service"), "utf8"),
+      ).toBe("original production unit");
+    },
+  );
   it("leaves the selected service running with --no-start", async () => {
     const fixture = plannedUpdate({ service: true });
-    const result = await runInstaller({ ...fixture.options, noStart: true });
+    const result = await runInstaller({
+      ...fixture.options,
+      host: "::1",
+      noStart: true,
+    });
     expect(result.restartServices).toBe(false);
+    expect(result.urls).toEqual(["https://[::1]:3002"]);
     expect(
       fixture.runner.commands.filter(
         (command) => !command.inspect && command.command === "systemctl",
       ),
     ).toEqual([]);
+  });
+  it("rejects an invalid readiness host before Git, package, or file mutations", async () => {
+    const fixture = plannedUpdate({ service: true });
+    await expect(
+      runInstaller({ ...fixture.options, host: "::1/other" }),
+    ).rejects.toThrow(/--host.*IPv4 or IPv6/);
+    expect(fixture.runner.commands).toEqual([]);
+    expect(fixture.runner.writes).toEqual([]);
   });
   it.each([true, false])(
     "uses the saved ASR model and data paths when model exists=%s",

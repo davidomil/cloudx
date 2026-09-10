@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { isIP } from "node:net";
 import path from "node:path";
 
 export const SERVICE_NAMES = [
@@ -16,6 +17,18 @@ export function updatePort(value, label = "Port") {
     throw new Error(`${label} must be an integer from 1 to 65535.`);
   }
   return Number(value);
+}
+
+export function updateHost(value) {
+  const version = typeof value === "string" ? isIP(value) : 0;
+  if (!version || value.includes("%")) {
+    throw new Error(
+      "--host requires an IPv4 or IPv6 address without brackets or a zone identifier.",
+    );
+  }
+  if (version === 4) return value === "0.0.0.0" ? "127.0.0.1" : value;
+  const host = new URL(`https://[${value}]`).hostname.slice(1, -1);
+  return host === "::" ? "::1" : host;
 }
 
 export function documentationReadinessUrl(envConfig) {
@@ -79,7 +92,7 @@ function inspectService(commands, name, root, allowMissing = false) {
   return properties;
 }
 
-export function inspectUpdateTarget({ paths, commands, service, port }) {
+export function inspectUpdateTarget({ paths, commands, service, port, host }) {
   if (service) {
     if (!/^[a-zA-Z0-9][a-zA-Z0-9_.@:-]*\.service$/.test(service)) {
       throw new Error(
@@ -87,16 +100,19 @@ export function inspectUpdateTarget({ paths, commands, service, port }) {
       );
     }
     const healthPort = updatePort(port, "--port");
+    const healthHost = updateHost(host ?? "127.0.0.1");
+    const authority = isIP(healthHost) === 6 ? `[${healthHost}]` : healthHost;
     inspectService(commands, service, paths.repoRoot);
     return {
       kind: "web",
       serviceNames: [service],
       servicesInstalled: true,
       port: healthPort,
+      origin: `https://${authority}:${healthPort}`,
     };
   }
-  if (port !== undefined)
-    throw new Error("--port requires --service for an update.");
+  if (port !== undefined || host !== undefined)
+    throw new Error("--port and --host require --service for an update.");
   if (!fs.existsSync(paths.envPath)) {
     throw new Error(
       `Saved Cloudx configuration is missing: ${paths.envPath}. Run the installer first, or use --service and --port for an existing custom web service.`,
