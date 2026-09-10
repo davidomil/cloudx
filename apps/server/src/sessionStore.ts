@@ -54,6 +54,7 @@ export class SessionStore {
   private triggers: TriggerRegistry | undefined;
   private readonly producerActions = new Set<Promise<unknown>>();
   private readonly triggerEmissions = new Set<Promise<unknown>>();
+  private readonly contextWrites = new Set<Promise<void>>();
   private readonly actionAdmission = new AsyncLocalStorage<ActionAdmission>();
   private readonly shutdownController = new AbortController();
   private disposed = false;
@@ -534,6 +535,7 @@ export class SessionStore {
     await drainPromises(this.producerActions);
     await drainPromises(this.triggerEmissions);
     const errors = this.stopSessions();
+    await drainPromises(this.contextWrites);
     if (errors.length > 0) {
       throw new AggregateError(errors, "One or more plugin sessions failed to stop.");
     }
@@ -721,9 +723,11 @@ export class SessionStore {
     const dataDisposer = session.onData?.((data) => {
       const current = this.tabs.get(tabId);
       if (current) {
-        void this.contextService.record(current, "terminal-output", data).catch((error) => {
+        const recording = this.contextService.record(current, "terminal-output", data).catch((error) => {
           this.reportBackgroundError(error, "record terminal output", tabId);
         });
+        this.contextWrites.add(recording);
+        void recording.then(() => this.contextWrites.delete(recording));
       }
     });
     if (dataDisposer) {

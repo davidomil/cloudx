@@ -225,6 +225,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       () => services.forgeConnections?.dispose()
     ]);
     const sourceShutdown = settleDisposers([() => services.codexStateSources?.dispose()]);
+    const setupShutdown = settleDisposers([() => services.pluginContributionsReady]);
     const producerShutdown = settleDisposers([
       () => services.jiraPolling?.dispose(),
       async () => {
@@ -250,6 +251,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       }
       automationFailures.push(...await settleDisposers([() => services.automation?.dispose()]));
       failures.push(...automationFailures);
+      failures.push(...await setupShutdown);
       failures.push(...await settleDisposers([() => disposePersistenceNotifications()]));
       failures.push(...await sourceShutdown);
       if (failures.length > 0) {
