@@ -1,8 +1,8 @@
 import asyncio
+import io
 import json
 import multiprocessing
 import os
-import select
 import signal
 import subprocess
 import sys
@@ -424,7 +424,7 @@ class PostEndPartialDisconnectingWebSocket:
         self.receive_count = 0
         self.sent = []
         self.partial_snapshot_path = None
-        self.partial_pidfds = []
+        self.partial_processes = []
 
     async def accept(self):
         return None
@@ -437,7 +437,8 @@ class PostEndPartialDisconnectingWebSocket:
             assert await asyncio.to_thread(self.partial_started.wait, 2)
             worker_pid, child_pid, snapshot_path = self.partial_details_path.read_text(encoding="utf-8").splitlines()
             self.partial_snapshot_path = Path(snapshot_path)
-            self.partial_pidfds = [os.pidfd_open(int(worker_pid)), os.pidfd_open(int(child_pid))]
+            for pid in (worker_pid, child_pid):
+                self.partial_processes.append(ObservedProcess(int(pid)))
             return {"text": json.dumps({"type": "end"})}
         assert self.receive_count == 4
         assert await asyncio.to_thread(self.final_started.wait, 2)
@@ -446,9 +447,38 @@ class PostEndPartialDisconnectingWebSocket:
     async def send_json(self, payload):
         self.sent.append(payload)
 
-    def close_pidfds(self):
-        for pidfd in self.partial_pidfds:
-            os.close(pidfd)
+    def close_process_observers(self):
+        for process in self.partial_processes:
+            process.close()
+
+
+class ObservedProcess:
+    def __init__(self, pid):
+        self.pid = pid
+        self.stat = Path(f"/proc/{pid}/stat").open(encoding="utf-8")
+        try:
+            assert not self.has_exited(), f"Process {pid} must be alive when observation starts"
+        except BaseException:
+            self.close()
+            raise
+
+    def has_exited(self):
+        try:
+            # A held /proc descriptor stays bound to this process across PID reuse.
+            self.stat.seek(0)
+            stat = self.stat.read()
+        except (FileNotFoundError, ProcessLookupError):
+            return True
+        process, separator, remaining = stat.rpartition(")")
+        fields = remaining.split()
+        if (not separator or not process.startswith(f"{self.pid} (")
+                or len(fields) < 20 or fields[0] not in set("RSDZTtXxKWPI")
+                or not fields[19].isdigit()):
+            raise ValueError(f"Malformed /proc/{self.pid}/stat")
+        return fields[0] in {"Z", "X", "x"}
+
+    def close(self):
+        self.stat.close()
 
 
 class ConstructionProbe:
@@ -1546,11 +1576,8 @@ def test_websocket_end_cancels_active_partial_before_final_disconnect(tmp_path, 
     async def disconnect_after_partial_end_without_cancelling_endpoint():
         await asyncio.wait_for(main.transcribe_ws(websocket), timeout=3)
 
-        poller = select.poll()
-        for pidfd in websocket.partial_pidfds:
-            poller.register(pidfd, select.POLLIN)
-        exited_pidfds = {pidfd for pidfd, _events in poller.poll(1000)}
-        assert exited_pidfds == set(websocket.partial_pidfds)
+        assert len(websocket.partial_processes) == 2
+        assert wait_until_sync(lambda: all(process.has_exited() for process in websocket.partial_processes))
         assert websocket.partial_snapshot_path is not None
         assert not websocket.partial_snapshot_path.exists()
         assert len(stream_paths) == 1
@@ -1566,7 +1593,7 @@ def test_websocket_end_cancels_active_partial_before_final_disconnect(tmp_path, 
     try:
         available = asyncio.run(disconnect_after_partial_end_without_cancelling_endpoint())
     finally:
-        websocket.close_pidfds()
+        websocket.close_process_observers()
         executor.close()
 
     assert available.status_code == 200
@@ -1653,11 +1680,8 @@ def test_websocket_end_repeated_cancellation_waits_for_partial_cleanup(tmp_path,
             assert not cleanup_interrupted.is_set()
             assert partial_jobs[0].done()
 
-            poller = select.poll()
-            for pidfd in websocket.partial_pidfds:
-                poller.register(pidfd, select.POLLIN)
-            exited_pidfds = {pidfd for pidfd, _events in poller.poll(1000)}
-            assert exited_pidfds == set(websocket.partial_pidfds)
+            assert len(websocket.partial_processes) == 2
+            assert wait_until_sync(lambda: all(process.has_exited() for process in websocket.partial_processes))
             assert websocket.partial_snapshot_path is not None
             assert not websocket.partial_snapshot_path.exists()
             assert len(stream_paths) == 1
@@ -1680,7 +1704,7 @@ def test_websocket_end_repeated_cancellation_waits_for_partial_cleanup(tmp_path,
     try:
         available = asyncio.run(cancel_endpoint_during_partial_cleanup())
     finally:
-        websocket.close_pidfds()
+        websocket.close_process_observers()
         executor.close()
 
     assert available.status_code == 200
@@ -1945,6 +1969,104 @@ async def cancel_and_drain(*tasks):
             task.cancel()
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def process_stat(state="S"):
+    return f"123 (worker ) name) {state} " + " ".join(["0"] * 19)
+
+
+def test_process_observer_tracks_a_live_child_through_exit_and_reaping(monkeypatch):
+    monkeypatch.delattr(os, "pidfd_open", raising=False)
+    child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read()"], stdin=subprocess.PIPE)
+    observer = None
+    try:
+        observer = ObservedProcess(child.pid)
+        assert not observer.has_exited()
+        child.kill()
+        assert wait_until_sync(observer.has_exited)
+        child.wait(timeout=3)
+        assert observer.has_exited()
+    finally:
+        if observer:
+            observer.close()
+            assert observer.stat.closed
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=3)
+        child.stdin.close()
+
+
+def test_process_observer_keeps_the_original_descriptor_when_the_pid_path_is_replaced(tmp_path, monkeypatch):
+    stat_path = tmp_path / "stat"
+    original_path = tmp_path / "original-stat"
+    stat_path.write_text(process_stat(), encoding="utf-8")
+    open_path = Path.open
+    monkeypatch.setattr(Path, "open", lambda _path, **kwargs: open_path(stat_path, **kwargs))
+    observer = ObservedProcess(123)
+    try:
+        stat_path.rename(original_path)
+        with open_path(stat_path, "w", encoding="utf-8") as replacement:
+            replacement.write(process_stat())
+        with open_path(original_path, "w", encoding="utf-8") as original:
+            original.write(process_stat("Z"))
+        assert observer.has_exited()
+    finally:
+        observer.close()
+
+
+@pytest.mark.parametrize("state", list("RSDTtKWPI"))
+def test_process_observer_does_not_report_a_live_process_as_exited(state, monkeypatch):
+    stat = io.StringIO(process_stat(state))
+    monkeypatch.setattr(Path, "open", lambda *_args, **_kwargs: stat)
+    observer = ObservedProcess(123)
+    try:
+        assert not observer.has_exited()
+    finally:
+        observer.close()
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError, PermissionError])
+def test_process_observer_rejects_an_unreadable_initial_process(error, monkeypatch):
+    def fail_open(*_args, **_kwargs):
+        raise error("cannot open process")
+
+    monkeypatch.setattr(Path, "open", fail_open)
+    with pytest.raises(error, match="cannot open process"):
+        ObservedProcess(123)
+
+
+@pytest.mark.parametrize("contents", ["", "123 (worker) S", process_stat("RS"), process_stat().replace("123", "456", 1)])
+def test_process_observer_rejects_malformed_initial_state_and_closes_its_descriptor(contents, monkeypatch):
+    stat = io.StringIO(contents)
+    monkeypatch.setattr(Path, "open", lambda *_args, **_kwargs: stat)
+    with pytest.raises(ValueError, match="Malformed /proc/123/stat"):
+        ObservedProcess(123)
+    assert stat.closed
+
+
+@pytest.mark.parametrize("state", ["Z", "X", "x"])
+def test_process_observer_requires_a_live_initial_process(state, monkeypatch):
+    stat = io.StringIO(process_stat(state))
+    monkeypatch.setattr(Path, "open", lambda *_args, **_kwargs: stat)
+    with pytest.raises(AssertionError, match="must be alive"):
+        ObservedProcess(123)
+    assert stat.closed
+
+
+def test_process_observer_does_not_treat_a_later_permission_error_as_exit(monkeypatch):
+    stat = io.StringIO(process_stat())
+    monkeypatch.setattr(Path, "open", lambda *_args, **_kwargs: stat)
+    observer = ObservedProcess(123)
+
+    def fail_read():
+        raise PermissionError("cannot read process")
+
+    try:
+        monkeypatch.setattr(stat, "read", fail_read)
+        with pytest.raises(PermissionError, match="cannot read process"):
+            observer.has_exited()
+    finally:
+        observer.close()
 
 
 def wait_until_sync(predicate, timeout=1.0):

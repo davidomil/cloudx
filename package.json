@@ -39,7 +39,7 @@
     "cert:create": "node scripts/create-local-cert.mjs",
     "dev": "npm run cert:create && npm run dev -w @cloudx/server",
     "dev:web": "npm run dev -w @cloudx/web",
-    "documentation:setup": "~/.local/share/cloudx/uv/bin/uv sync --locked --project services/documentation-indexer --extra dev",
+    "documentation:setup": "UV_PYTHON_INSTALL_DIR=\"$HOME/.local/share/cloudx/python\" ~/.local/share/cloudx/uv/bin/uv sync --locked --python 3.12 --managed-python --project services/documentation-indexer --extra dev",
     "documentation:start": "services/documentation-indexer/.venv/bin/cloudx-documentation-indexer",
     "documentation:test": "services/documentation-indexer/.venv/bin/python -m pytest services/documentation-indexer/tests",
     "docs:memory:pdf": "quarto render docs/MEMORY_PLUGIN_GUIDE.qmd --to pdf",
