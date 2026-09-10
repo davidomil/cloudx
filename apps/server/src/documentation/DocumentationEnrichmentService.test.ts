@@ -997,27 +997,20 @@ describe("DocumentationEnrichmentService", () => {
     }));
   });
 
-  it("keeps timestamped video keyframe artifacts next to their transcript chunk for visual enrichment", async () => {
-    const archiveRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-enrich-"));
-    const keyframePath = path.join(archiveRoot, "snapshots", "video", "extracted", "media", "keyframes", "frame-000001.jpg");
-    await fs.mkdir(path.dirname(keyframePath), { recursive: true });
-    await fs.writeFile(keyframePath, Buffer.from([1, 2, 3]));
-    const runner = fakeRunner({
-      summary: "keyframe visualized",
-      spans: [{ locator: "ai:visual:keyframe-000012", text: "Keyframe visual span says KEYFRAME-VISUAL-12 is described from the frame." }],
-      metadata: [],
-      warnings: []
-    });
+  it.each([false, true])("re-enriches retained YouTube timestamps and keyframes twice (shared upload metadata: %s)", async (sharedMetadata) => {
     const locator = "media keyframe keyframe-000012 00:12";
-    const client = fakeDocumentationClient({
-      source_type: "media",
-      snapshot_path: "snapshots/video/source.youtube.txt",
-      chunks: [{
-        chunk_id: 41,
-        locator,
-        text: "Selected YouTube slide frame keyframe-000012 at 00:12. Artifact path: media/keyframes/frame-000001.jpg. Transcript near this frame: KEYFRAME-TRANSCRIPT-12.",
-        chunk_origin: "source"
-      }],
+    const transcript = "RETAINED-TRANSCRIPT-12 reset is active low.";
+    const fixture = await archivedMediaFixture("source.youtube.txt", "media", {
+      uri: "https://youtube.com/watch?v=recording",
+      chunks: [
+        { chunk_id: 40, locator: "transcript 00:10-00:20", text: transcript, chunk_origin: "source" },
+        {
+          chunk_id: 41, locator,
+          text: `Selected YouTube slide frame keyframe-000012 at 00:12. Artifact path: media/keyframes/frame-000001.jpg. Transcript near this frame: ${transcript}`,
+          chunk_origin: "source",
+        },
+        { chunk_id: 42, locator: "ai:media", text: "PRIOR-AI-SPAN is not source evidence.", chunk_origin: "ai" },
+      ],
       artifacts: [{
         id: "keyframe-000012",
         type: "media-keyframe",
@@ -1031,29 +1024,61 @@ describe("DocumentationEnrichmentService", () => {
         transcriptStartSeconds: 10,
         transcriptEndSeconds: 20,
         reason: "visual-change",
-        changeScore: 0.42
-      }]
-    }, { archiveRoot });
+        changeScore: 0.42,
+      }],
+    });
+    const snapshotDirectory = path.dirname(fixture.mediaPath);
+    const keyframePath = path.join(snapshotDirectory, "extracted", "media", "keyframes", "frame-000001.jpg");
+    const keyframeBytes = Buffer.from([1, 2, 3]);
+    await fs.mkdir(path.dirname(keyframePath), { recursive: true });
+    await fs.writeFile(keyframePath, keyframeBytes);
+    await fs.writeFile(fixture.mediaPath, transcript);
+    await fs.writeFile(path.join(snapshotDirectory, "metadata.json"), JSON.stringify(sharedMetadata
+      ? { upload: true, filename: "retained-transcript.txt", contentType: "text/plain" }
+      : { youtube: { title: "Recording" } }));
+    const replacement = { locator: "ai:visual:keyframe-000012", text: "KEYFRAME-VISUAL-12 is described from the retained frame." };
+    const runner = fakeRunner({ summary: "keyframe visualized", spans: [replacement], metadata: [], warnings: [] });
+    const transcribeFile = vi.fn();
+    const mediaProcessLauncher = fakeMediaTools(false);
     const service = new DocumentationEnrichmentService({
-      client,
+      client: fixture.client,
       config: fakeConfig(true),
       rulesSkills: fakeRulesSkills(),
-      runner
+      runner,
+      asr: { transcribeFile } as never,
+      mediaProcessLauncher,
     });
+    const queue = new DocumentationIngestQueue();
+    const plugin = new DocumentationPlugin(fixture.client, new PathPolicy([fixture.root]), queue, () => service);
+    const hook = plugin.hooks.find((candidate) => candidate.id === "documentation.documents.reenrich")!;
+    try {
+      for (let rerun = 1; rerun <= 2; rerun += 1) {
+        await expect(hook.execute({ documentId: "doc-1" }, { caller: { kind: "ui" } }))
+          .resolves.toMatchObject({ kind: "reenrich", firstDocumentId: "doc-1", enrichment: { results: [{ status: "written" }] } });
 
-    await service.enrichIngestResponse({ document: { documentId: "doc-1" } });
-
-    const prompt = runner.run.mock.calls[0]?.[0] ?? "";
-    expect(prompt).toContain("KEYFRAME-TRANSCRIPT-12");
-    expect(prompt).toContain('"locator": "media keyframe keyframe-000012 00:12"');
-    expect(prompt).toContain('"offsetSeconds": 12');
-    expect(prompt).toContain("frame-000001.jpg");
-    expect(runner.run).toHaveBeenCalledTimes(1);
-    expect(client.enrichDocument).toHaveBeenCalledWith(expect.objectContaining({
-      payload: expect.objectContaining({
-        evidence: expect.objectContaining({ artifactCount: 1, chunkCount: 1 })
-      })
-    }));
+        const [prompt, options] = runner.run.mock.lastCall!;
+        expect(prompt).toContain(transcript);
+        expect(prompt).toContain('"locator": "transcript 00:10-00:20"');
+        expect(prompt).toContain(`"locator": "${locator}"`);
+        expect(prompt).toContain('"offsetSeconds": 12');
+        expect(prompt).not.toContain("PRIOR-AI-SPAN");
+        expect(options.imagePaths).toEqual([keyframePath]);
+        expect(runner.run).toHaveBeenCalledTimes(rerun);
+        expect(transcribeFile).not.toHaveBeenCalled();
+        expect(mediaProcessLauncher).not.toHaveBeenCalled();
+        expect(fixture.client.enrichDocument).toHaveBeenCalledTimes(rerun);
+        expect(fixture.client.enrichDocument).toHaveBeenLastCalledWith(expect.objectContaining({
+          documentId: "doc-1",
+          spans: [replacement],
+          payload: expect.objectContaining({ evidence: expect.objectContaining({ artifactCount: 1, chunkCount: 2 }) }),
+        }), expect.anything());
+        await expect(fs.readFile(fixture.mediaPath, "utf8")).resolves.toBe(transcript);
+        await expect(fs.readFile(keyframePath)).resolves.toEqual(keyframeBytes);
+      }
+    } finally {
+      await queue.dispose();
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
   });
 
   it("fails artifact enrichment explicitly when the archive filesystem is not shared with the server", async () => {

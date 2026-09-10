@@ -1240,9 +1240,6 @@ class DocumentationArchive:
             content_type = metadata.get("contentType")
             if content_type is not None and not isinstance(content_type, str):
                 raise ArchiveError("The archived source content type must be a string.")
-            if document["source_type"] == "repo_code" or metadata.get("generatedCodeDocumentation") or "youtube" in metadata:
-                raise ArchiveError("This document retains generated code documentation or YouTube evidence. Rerun AI enrichment to analyze its retained text and artifacts; source extraction requires the original source.")
-
             with self._connect() as db:
                 source_locators = {
                     row["locator"] for row in db.execute(
@@ -1250,6 +1247,13 @@ class DocumentationArchive:
                         (document_id,),
                     )
                 }
+            if (
+                document["source_type"] == "repo_code"
+                or "media metadata" in source_locators
+                or metadata.get("generatedCodeDocumentation")
+                or "youtube" in metadata
+            ):
+                raise ArchiveError("This document retains generated code documentation or YouTube evidence. Rerun AI enrichment to analyze its retained text and artifacts; source extraction requires the original source.")
             staging_dir = Path(tempfile.mkdtemp(prefix="reanalysis-", dir=self.snapshots_dir))
             replacement_snapshot = staging_dir / snapshot_path.name
             try:

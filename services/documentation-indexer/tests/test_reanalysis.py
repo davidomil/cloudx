@@ -648,6 +648,30 @@ def test_generated_evidence_requires_ai_reenrichment_without_replacing_its_struc
     assert archive.get_document(document.document_id) == before
 
 
+def test_reanalysis_allows_copied_youtube_transcripts_with_media_locators_only_in_ai_chunks(tmp_path: Path) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+    transcript = "Copied video transcript retains COPIED-YOUTUBE-19."
+    document = archive.ingest_url(
+        "https://www.youtube.com/watch?v=copied-transcript",
+        title="Lecture.youtube",
+        transcript=transcript,
+    )
+    archive.enrich_document(
+        document.document_id,
+        spans=[ExtractedSpan("An AI locator is not source provenance.", "media metadata")],
+        model="gpt-test",
+        skill_ids=["documentation-enrich-media"],
+    )
+    before = archive.get_document(document.document_id)
+
+    for _ in range(2):
+        assert archive.reanalyze_document(document.document_id).document_id == document.document_id
+        after = archive.get_document(document.document_id)
+        assert (archive.root / after["snapshot_path"]).read_text() == transcript
+        assert [(chunk["locator"], chunk["text"]) for chunk in after["chunks"] if chunk["chunk_origin"] == "source"] == [("text", transcript)]
+        assert [chunk for chunk in after["chunks"] if chunk["chunk_origin"] == "ai"] == [chunk for chunk in before["chunks"] if chunk["chunk_origin"] == "ai"]
+
+
 def test_reanalysis_endpoint_returns_existing_document_identity_and_validates_state(tmp_path: Path) -> None:
     client = TestClient(create_app(tmp_path / "archive"))
     document = client.post("/ingest/text", json={"text": "API-REANALYSIS-19 retained transcript.", "sourceType": "media"}).json()["document"]
