@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Palette, Pencil, Plus, RefreshCw, Save, Square, SquareCheck, Trash2, X, Zap } from "lucide-react";
 
 import {
@@ -15,6 +15,7 @@ import {
 import { ControlButton } from "./Control.js";
 import { createBrowserId } from "./browserId.js";
 import { PluginPanelDock } from "./PluginPanelDock.js";
+import { RulesSkillsGitPanel, type RulesSkillsGitActions } from "./RulesSkillsGitPanel.js";
 
 export function TemplateSelect({
   value,
@@ -56,7 +57,8 @@ export function RulesSkillsPanel({
   onSaveRule,
   onDeleteRule,
   onInjectRuntime,
-  onRefreshStore
+  onRefreshStore,
+  gitActions
 }: {
   store?: RulesSkillsStore;
   onSaveTemplate: (template: PersonalityTemplate) => Promise<void>;
@@ -66,20 +68,26 @@ export function RulesSkillsPanel({
   onDeleteRule: (ruleId: string) => Promise<void>;
   onInjectRuntime?: () => Promise<number>;
   onRefreshStore?: () => Promise<void>;
+  gitActions?: RulesSkillsGitActions;
 }) {
   const templates = store?.templates ?? [];
   const [selectedId, setSelectedId] = useState(templates[0]?.id ?? "");
   const selected = templates.find((template) => template.id === selectedId) ?? templates[0];
   const [draft, setDraft] = useState(() => templateDraft(selected));
+  const loadedDraft = useRef(templateDraft(selected));
   const [draftMode, setDraftMode] = useState<"existing" | "new">("existing");
   const [newRuleText, setNewRuleText] = useState("");
-  const [editingRuleId, setEditingRuleId] = useState<string | undefined>();
+  const [editingRule, setEditingRule] = useState<CloudxRule | undefined>();
   const [editingRuleText, setEditingRuleText] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | undefined>();
   const [status, setStatus] = useState("Templates loaded.");
   const savedDraft = templateDraft(selected);
   const hasUnsavedTemplateChanges = draftMode === "new" || !templateDraftsEqual(draft, savedDraft);
+  const hasUnsavedChanges = hasUnsavedTemplateChanges || Boolean(newRuleText.trim()) || editingRule !== undefined;
+  const missingRuleIds = draft.ruleIds.filter(id => !store?.rules.some(rule => rule.id === id));
+  const missingSkillIds = draft.skillIds.filter(id => !store?.skills.some(skill => skill.id === id));
+  const hasMissingTemplateReferences = missingRuleIds.length > 0 || missingSkillIds.length > 0;
 
   useEffect(() => {
     if (!onRefreshStore) {
@@ -97,12 +105,14 @@ export function RulesSkillsPanel({
   }, [onRefreshStore]);
 
   useEffect(() => {
-    if (draftMode === "new") {
+    const nextSelected = templates.find((template) => template.id === selectedId) ?? templates[0];
+    const previousSavedDraft = loadedDraft.current;
+    loadedDraft.current = templateDraft(nextSelected);
+    if (draftMode === "new" || !templateDraftsEqual(draft, previousSavedDraft)) {
       return;
     }
-    const nextSelected = templates.find((template) => template.id === selectedId) ?? templates[0];
     setSelectedId(nextSelected?.id ?? "");
-    setDraft(templateDraft(nextSelected));
+    setDraft(loadedDraft.current);
   }, [draftMode, selectedId, templates]);
 
   function updateDraft(patch: Partial<TemplateDraft>) {
@@ -150,6 +160,7 @@ export function RulesSkillsPanel({
       const template = templateFromDraft(draft);
       await onSaveTemplate(template);
       setSelectedId(template.id);
+      setDraft(templateDraft(template));
       setDraftMode("existing");
       setStatus("Template saved.");
     } catch (err) {
@@ -213,13 +224,13 @@ export function RulesSkillsPanel({
   }
 
   function startEditingRule(rule: CloudxRule) {
-    setEditingRuleId(rule.id);
+    setEditingRule(rule);
     setEditingRuleText(rule.text);
     setError(undefined);
   }
 
   function cancelEditingRule() {
-    setEditingRuleId(undefined);
+    setEditingRule(undefined);
     setEditingRuleText("");
   }
 
@@ -253,9 +264,24 @@ export function RulesSkillsPanel({
     setError(undefined);
     try {
       await onRefreshStore();
+      setSelectedId(loadedDraft.current.id);
+      setDraft(loadedDraft.current);
+      setDraftMode("existing");
       setStatus("Rules and skills refreshed.");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function pullGit(expectedOriginUrl: string) {
+    if (!gitActions || hasUnsavedChanges || busy) {
+      throw new Error("Save or discard template and rule edits before pulling.");
+    }
+    setBusy(true);
+    try {
+      return await gitActions.onPullGit(expectedOriginUrl);
     } finally {
       setBusy(false);
     }
@@ -285,7 +311,7 @@ export function RulesSkillsPanel({
     return <div className="rules-skills-panel empty-pane">Templates are not available.</div>;
   }
 
-  const visibleRules = uniqueById(store.rules);
+  const visibleRules = uniqueById([...store.rules, ...(editingRule ? [editingRule] : [])]);
 
   return (
     <div className="rules-skills-panel">
@@ -296,18 +322,19 @@ export function RulesSkillsPanel({
         children: (
           <div className="rules-skills-sidebar">
             {templates.map((template) => (
-              <button key={template.id} type="button" className={`${template.id === draft.id ? "selected" : ""} ${template.id === draft.id && hasUnsavedTemplateChanges ? "dirty" : ""}`} onClick={() => selectTemplate(template)}>
+              <button key={template.id} type="button" className={`${template.id === draft.id ? "selected" : ""} ${template.id === draft.id && hasUnsavedTemplateChanges ? "dirty" : ""}`} onClick={() => selectTemplate(template)} disabled={busy}>
                 <span className={`template-color ${template.color}`} />
                 <span>{template.name}</span>
               </button>
             ))}
-            <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={createTemplate} title="Create template" aria-label="Create template">
+            <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={createTemplate} disabled={busy} title="Create template" aria-label="Create template">
               <Plus size={15} />
             </ControlButton>
           </div>
         )
       }]} />
       <div className="rules-skills-editor">
+        <fieldset className="rules-skills-template-fields" disabled={busy}>
         <label>
           Name
           <input value={draft.name} onChange={(event) => updateDraft({ name: event.target.value })} />
@@ -324,7 +351,7 @@ export function RulesSkillsPanel({
         <section className="rules-skills-picker">
           <h3>Rules</h3>
           {visibleRules.map((rule) =>
-            editingRuleId === rule.id ? (
+            editingRule?.id === rule.id ? (
               <div key={rule.id} className="rule-option rule-option-editing" title={rule.description}>
                 <ControlButton
                   type="button"
@@ -339,11 +366,12 @@ export function RulesSkillsPanel({
                   {draft.ruleIds.includes(rule.id) ? <SquareCheck size={13} /> : <Square size={13} />}
                 </ControlButton>
                 <div className="rule-edit-fields">
+                  {!store.rules.some(saved => saved.id === rule.id) ? <small>Removed from catalog. Save to restore this rule or cancel to discard the draft.</small> : null}
                   <div
                     className="rule-edit-text"
                     role="textbox"
                     aria-label={`Rule text for ${rule.id}`}
-                    contentEditable
+                    contentEditable={!busy}
                     suppressContentEditableWarning
                     spellCheck={false}
                     data-placeholder="Rule text"
@@ -399,9 +427,15 @@ export function RulesSkillsPanel({
               </label>
             )
           )}
+          {missingRuleIds.filter(id => id !== editingRule?.id).map(id => (
+            <label key={id} className="checkbox-row rule-option">
+              <input type="checkbox" checked aria-label={`Missing rule ${id}`} onChange={() => toggleRule(id, false)} />
+              <span>Missing rule: {id}</span>
+            </label>
+          ))}
           <div className="rules-skills-inline-create">
             <input value={newRuleText} onChange={(event) => setNewRuleText(event.target.value)} placeholder="Add short rule sentence" />
-            <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void addRule()} disabled={busy || !newRuleText.trim()} title="Add rule" aria-label="Add rule">
+            <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void addRule()} disabled={busy || !newRuleText.trim() || hasMissingTemplateReferences} title="Add rule" aria-label="Add rule">
               <Plus size={15} />
             </ControlButton>
           </div>
@@ -416,8 +450,15 @@ export function RulesSkillsPanel({
               <small>{skill.description}</small>
             </label>
           )) : <p>No CloudX skills yet.</p>}
+          {missingSkillIds.map(id => (
+            <label key={id} className="checkbox-row skill-option">
+              <input type="checkbox" checked aria-label={`Missing skill ${id}`} onChange={() => toggleSkill(id, false)} />
+              <span>Missing skill: {id}</span>
+            </label>
+          ))}
         </section>
 
+        {hasMissingTemplateReferences ? <p role="status">Deselect missing rules and skills or restore them before saving this template.</p> : null}
         <div className="rules-skills-footer">
           <span className="rules-skills-status" aria-live="polite">{status}</span>
           {draft.id ? <span className={`rules-skills-save-state automation-save-state ${hasUnsavedTemplateChanges ? "dirty" : "saved"}`}>{hasUnsavedTemplateChanges ? "Unsaved" : "Saved"}</span> : null}
@@ -425,7 +466,7 @@ export function RulesSkillsPanel({
             <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void refreshStore()} disabled={busy || !onRefreshStore} title="Refresh rules and skills" aria-label="Refresh rules and skills">
               <RefreshCw size={15} />
             </ControlButton>
-            <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void submit()} disabled={busy || !draft.id.trim() || !draft.name.trim() || !hasUnsavedTemplateChanges} title={hasUnsavedTemplateChanges ? "Save template changes" : "Template is saved"} aria-label="Save template">
+            <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void submit()} disabled={busy || !draft.id.trim() || !draft.name.trim() || !hasUnsavedTemplateChanges || hasMissingTemplateReferences} title={hasUnsavedTemplateChanges ? "Save template changes" : "Template is saved"} aria-label="Save template">
               <Save size={15} />
             </ControlButton>
             <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => void injectRuntime()} disabled={busy || !onInjectRuntime || draftMode === "new" || hasUnsavedTemplateChanges} title={hasUnsavedTemplateChanges ? "Save template changes before injecting" : "Inject saved rules and skills into running Codex tabs"} aria-label="Inject saved rules and skills">
@@ -440,6 +481,8 @@ export function RulesSkillsPanel({
           </div>
         </div>
         {error ? <div className="window-menu-error">{error}</div> : null}
+        </fieldset>
+        {gitActions ? <RulesSkillsGitPanel {...gitActions} onPullGit={pullGit} disabled={busy} hasUnsavedChanges={hasUnsavedChanges} /> : null}
       </div>
     </div>
   );

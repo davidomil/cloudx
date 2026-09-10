@@ -42,6 +42,57 @@ export class RulesSkillsPlugin implements WorkspacePlugin {
   constructor(private readonly catalog: RulesSkillsCatalogService, private readonly runtimeInjector?: RulesSkillsRuntimeInjector) {
     this.hooks = [
       {
+        id: "rules-skills.git.status",
+        owner: { kind: "plugin", pluginId: this.id },
+        title: "Rules Skills Git Status",
+        description: "Read the catalog checkout branch, origin, and local change state.",
+        exposures: ["app", "plugin", "ui", "http"],
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        execute: async () => ({ git: await this.catalog.gitStatus() })
+      },
+      {
+        id: "rules-skills.git.setOrigin",
+        owner: { kind: "plugin", pluginId: this.id },
+        title: "Set Rules Skills Git Origin",
+        description: "Add or update origin in the catalog checkout's Git configuration.",
+        exposures: ["app", "plugin", "ui", "http"],
+        inputSchema: {
+          type: "object",
+          properties: { originUrl: { type: "string", minLength: 1, maxLength: 4096 } },
+          required: ["originUrl"],
+          additionalProperties: false
+        },
+        execute: async (input) => ({ git: await this.catalog.setGitOrigin(input.originUrl) })
+      },
+      {
+        id: "rules-skills.git.pull",
+        owner: { kind: "plugin", pluginId: this.id },
+        title: "Pull Rules Skills",
+        description: "Fast-forward the clean catalog checkout from its same-named branch on origin and reload the catalog.",
+        exposures: ["app", "plugin", "ui", "http"],
+        inputSchema: {
+          type: "object",
+          properties: { expectedOriginUrl: { type: "string", minLength: 1, maxLength: 4096 } },
+          required: ["expectedOriginUrl"],
+          additionalProperties: false
+        },
+        execute: async (input) => this.catalog.pullGit(input.expectedOriginUrl)
+      },
+      {
+        id: "rules-skills.git.push",
+        owner: { kind: "plugin", pluginId: this.id },
+        title: "Push Rules Skills Commits",
+        description: "Push existing catalog commits to the same-named branch on origin without forcing or committing local changes.",
+        exposures: ["app", "plugin", "ui", "http"],
+        inputSchema: {
+          type: "object",
+          properties: { expectedOriginUrl: { type: "string", minLength: 1, maxLength: 4096 } },
+          required: ["expectedOriginUrl"],
+          additionalProperties: false
+        },
+        execute: async (input) => ({ git: await this.catalog.pushGit(input.expectedOriginUrl) })
+      },
+      {
         id: "rules-skills.catalog.list",
         owner: { kind: "plugin", pluginId: this.id },
         title: "List Rules Skills Catalog",

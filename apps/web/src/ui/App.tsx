@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement, type RefObject } from "react";
 import { AlertTriangle, Bell, BellRing, Bot, CheckCheck, ChevronDown, Columns2, GitBranch, LayoutTemplate, Maximize2, Mic, MicOff, Minimize2, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
 
-import { DEFAULT_WORKSPACE_MAX_PANES, RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsStore, type StatePersistenceStatus, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
+import { DEFAULT_WORKSPACE_MAX_PANES, RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsGitState, type RulesSkillsStore, type StatePersistenceStatus, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
 
 import {
   applyLayoutTemplate,
@@ -72,7 +72,7 @@ import { browserNotificationPermissionState, NOTIFICATION_TOAST_MS, requestBrows
 import { noSystemTextAssistProps } from "./inputAssist.js";
 import { attemptPortraitOrientationLock } from "./orientationLock.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
-import { RulesSkillsPanel, TemplateSelect, pluginMetadataForTemplate, selectedTemplateId } from "./RulesSkillsPanel.js";
+import { RulesSkillsPanel, TemplateSelect, cloudxRuleFromEdit, pluginMetadataForTemplate, selectedTemplateId } from "./RulesSkillsPanel.js";
 import {
   PLUGIN_WEBVIEW_RENDERER,
   PluginWebviewPanel,
@@ -181,6 +181,9 @@ export function App() {
   const [config, setConfig] = useState<CloudxConfigResponse | undefined>();
   const [forgeRepositoryChange, setForgeRepositoryChange] = useState({ version: 0, pending: false });
   const [rulesSkillsStore, setRulesSkillsStore] = useState<RulesSkillsStore | undefined>();
+  const rulesSkillsStoreRef = useRef<RulesSkillsStore | undefined>(undefined);
+  const rulesSkillsQueue = useRef(Promise.resolve());
+  const [rulesSkillsGit, setRulesSkillsGit] = useState<RulesSkillsGitState>();
   const [tabs, setTabs] = useState<WorkspaceTab[]>([]);
   const [windows, setWindows] = useState<WorkspaceWindow[]>([]);
   const [activeWindowId, setActiveWindowId] = useState<string | undefined>();
@@ -420,17 +423,16 @@ export function App() {
   async function refresh() {
     setConnectionStatus("checking");
     try {
-      const [pluginList, workspaceState, configState, rulesSkills, activeTriggers, notificationHistory] = await Promise.all([
+      const [pluginList, workspaceState, configState, activeTriggers, notificationHistory] = await Promise.all([
         getPlugins(),
         getWorkspace(),
         getConfig(),
-        loadRulesSkillsStore(),
         loadActiveAutomationTriggerIds(),
-        getNotifications()
+        getNotifications(),
+        loadRulesSkillsStore()
       ]);
       setPlugins(pluginList);
       setConfig(configState);
-      setRulesSkillsStore(rulesSkills);
       setActiveAutomationTriggerIds(activeTriggers);
       setNotifications(notificationHistory);
       applyWorkspaceState(workspaceState);
@@ -442,18 +444,61 @@ export function App() {
     }
   }
 
+  const callRulesSkills = useCallback(<T extends { store?: RulesSkillsStore; git?: RulesSkillsGitState } = { store: RulesSkillsStore },>(operation: string, input: Record<string, unknown> | ((store: RulesSkillsStore | undefined) => Record<string, unknown>) = {}) => {
+    const request = rulesSkillsQueue.current.then(async () => {
+      try {
+        const result = await callHook<T>(`rules-skills.${operation}`, typeof input === "function" ? input(rulesSkillsStoreRef.current) : input);
+        if (result.store) {
+          rulesSkillsStoreRef.current = result.store;
+          setRulesSkillsStore(result.store);
+        }
+        if (result.git) setRulesSkillsGit(result.git);
+        return result;
+      } catch (error) {
+        if (operation === "git.setOrigin") setRulesSkillsGit(undefined);
+        throw error;
+      }
+    });
+    rulesSkillsQueue.current = request.then(() => undefined, () => undefined);
+    return request;
+  }, []);
+
   const loadRulesSkillsStore = useCallback(async (): Promise<RulesSkillsStore | undefined> => {
     try {
-      const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.catalog.list");
+      const result = await callRulesSkills("catalog.list");
       return result.store;
     } catch {
       return undefined;
     }
-  }, []);
+  }, [callRulesSkills]);
 
   const handleRefreshRulesSkillsStore = useCallback(async () => {
-    setRulesSkillsStore(await loadRulesSkillsStore());
-  }, [loadRulesSkillsStore]);
+    await callRulesSkills("catalog.list");
+  }, [callRulesSkills]);
+
+  const callRulesSkillsGit = useCallback((operation: string, input: Record<string, unknown> = {}) => {
+    return callRulesSkills<{ git: RulesSkillsGitState }>(`git.${operation}`, input);
+  }, [callRulesSkills]);
+
+  const loadRulesSkillsGit = useCallback(async () => {
+    const result = await callRulesSkillsGit("status");
+    return result.git;
+  }, [callRulesSkillsGit]);
+
+  const setRulesSkillsGitOrigin = useCallback(async (originUrl: string) => {
+    const result = await callRulesSkillsGit("setOrigin", { originUrl });
+    return result.git;
+  }, [callRulesSkillsGit]);
+
+  const pullRulesSkillsGit = useCallback(async (expectedOriginUrl: string) => {
+    const result = await callRulesSkillsGit("pull", { expectedOriginUrl });
+    return result.git;
+  }, [callRulesSkillsGit]);
+
+  const pushRulesSkillsGit = useCallback(async (expectedOriginUrl: string) => {
+    const result = await callRulesSkillsGit("push", { expectedOriginUrl });
+    return result.git;
+  }, [callRulesSkillsGit]);
 
   function applyWorkspaceState(state: WorkspaceStateResponse, options: { preservePendingLayout?: boolean } = {}) {
     let pendingMerge = options.preservePendingLayout ? workspaceStateWithPreservedLayout(state, layoutRef.current, pendingLayoutPersistWindowIdRef.current, pendingLayoutBaseRef.current, activeTabIdRef.current) : undefined;
@@ -1083,23 +1128,22 @@ export function App() {
   }
 
   async function handleSavePersonalityTemplate(template: PersonalityTemplate) {
-    const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.templates.save", { template });
-    setRulesSkillsStore(result.store);
+    await callRulesSkills("templates.save", { template });
   }
 
   async function handleDeletePersonalityTemplate(templateId: string) {
-    const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.templates.delete", { templateId });
-    setRulesSkillsStore(result.store);
+    await callRulesSkills("templates.delete", { templateId });
   }
 
   async function handleSetDefaultTemplate(templateId: string | undefined) {
-    const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.templates.setDefault", templateId ? { templateId } : {});
-    setRulesSkillsStore(result.store);
+    await callRulesSkills("templates.setDefault", templateId ? { templateId } : {});
   }
 
   async function handleSaveRule(rule: CloudxRule) {
-    const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.rules.save", { rule });
-    setRulesSkillsStore(result.store);
+    await callRulesSkills("rules.save", store => {
+      const currentRule = store?.rules.find(current => current.id === rule.id);
+      return { rule: currentRule ? cloudxRuleFromEdit(currentRule, rule.text) : rule };
+    });
   }
 
   async function handleInjectRulesSkillsRuntime(): Promise<number> {
@@ -1108,8 +1152,7 @@ export function App() {
   }
 
   async function handleDeleteRule(ruleId: string) {
-    const result = await callHook<{ store: RulesSkillsStore }>("rules-skills.rules.delete", { ruleId });
-    setRulesSkillsStore(result.store);
+    await callRulesSkills("rules.delete", { ruleId });
   }
 
   function renderMicControl(className: string, ref: RefObject<HTMLDivElement | null>, iconSize: number) {
@@ -1233,6 +1276,7 @@ export function App() {
         onDeleteRule={handleDeleteRule}
         onInjectRuntime={handleInjectRulesSkillsRuntime}
         onRefreshStore={handleRefreshRulesSkillsStore}
+        gitActions={{ git: rulesSkillsGit, onLoadGit: loadRulesSkillsGit, onSetGitOrigin: setRulesSkillsGitOrigin, onPullGit: pullRulesSkillsGit, onPushGit: pushRulesSkillsGit }}
       />
     ),
     "documentation.panel": (_contribution, context) => {

@@ -2978,10 +2978,72 @@ a:hover svg {
   background: var(--color-destructive);
 }
 
-.rules-skills-editor {
+.rules-skills-editor,
+.rules-skills-template-fields {
   display: grid;
   align-content: start;
   gap: 10px;
+}
+
+.rules-skills-template-fields {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.rules-skills-git {
+  display: grid;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-border);
+}
+
+.rules-skills-git-heading,
+.rules-skills-git-heading h3,
+.rules-skills-git-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.rules-skills-git-heading {
+  justify-content: space-between;
+}
+
+.rules-skills-git h3 {
+  margin: 0;
+  color: var(--color-accent-tertiary);
+  font-size: var(--font-size-sm);
+}
+
+.rules-skills-git p {
+  margin: 0;
+  color: var(--color-muted-foreground);
+  font-size: var(--font-size-xs);
+  overflow-wrap: anywhere;
+}
+
+.rules-skills-git-root {
+  font-family: var(--font-mono);
+}
+
+.rules-skills-git-origin {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.rules-skills-git-origin label {
+  flex: 1 1 240px;
+  min-width: 0;
+}
+
+.rules-skills-git-origin input {
+  width: 100%;
+  min-width: 0;
 }
 
 .rules-skills-editor label {
