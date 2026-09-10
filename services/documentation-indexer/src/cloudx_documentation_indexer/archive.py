@@ -18,10 +18,12 @@ import tempfile
 import threading
 import time
 import zipfile
+from collections import Counter
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from dataclasses import dataclass
+from functools import lru_cache
 from importlib.metadata import version
 from pathlib import Path, PureWindowsPath
 from typing import Any
@@ -311,13 +313,16 @@ class DocumentationArchive:
         with self._write_lock:
             return self._stats()
 
-    def _stats(self) -> dict:
+    def summary(self) -> dict:
+        with self._write_lock:
+            return self._catalog_summary()
+
+    def _catalog_summary(self) -> dict:
         with self._connect() as db:
             document_count = db.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
             active_document_count = db.execute("SELECT COUNT(*) FROM documents WHERE state = ?", (ACTIVE_STATE,)).fetchone()[0]
             chunk_count = db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
             active_chunk_count = db.execute("SELECT COUNT(*) FROM chunks WHERE state = ?", (ACTIVE_STATE,)).fetchone()[0]
-        files = self._archive_files()
         return {
             "documentCount": document_count,
             "activeDocumentCount": active_document_count,
@@ -327,7 +332,12 @@ class DocumentationArchive:
             "databasePath": str(self.db_path),
             "indexPath": str(self.index_path),
             "manifestPath": str(self.manifest_path),
-            "archiveSize": self._archive_size(files),
+        }
+
+    def _stats(self) -> dict:
+        return {
+            **self._catalog_summary(),
+            "archiveSize": self._archive_size(self._archive_files()),
             "archiveLocality": self.locality_report(),
         }
 
@@ -357,9 +367,10 @@ class DocumentationArchive:
             "files": file_entries,
         }
 
-    def export_archive(self) -> ExportedArchive:
+    def export_archive(self, *, progress: ProgressReporter | None = None) -> ExportedArchive:
         with self._write_lock:
-            self.rebuild_index()
+            report_progress(progress, stage="Validating archive.", progress=0)
+            generation = self._active_index_generation_record()
             package_fd, package_name = tempfile.mkstemp(
                 prefix="cloudx-documentation-export-",
                 suffix=".zip",
@@ -370,12 +381,11 @@ class DocumentationArchive:
             staging_dir = Path(tempfile.mkdtemp(prefix="cloudx-documentation-export-stage-", dir=self.root.parent))
             completed = False
             try:
-                staged_root = staging_dir / ARCHIVE_EXPORT_ROOT_NAME
-                staged_root.mkdir(parents=True)
-                self._copy_archive_root_for_export(staged_root)
-                self._backup_catalog_to(staged_root / "catalog.sqlite")
-                manifest = self._export_manifest(staged_root)
-                self._write_export_zip(staged_root, manifest, package_path)
+                report_progress(progress, stage="Copying catalog.", progress=5)
+                catalog_backup = staging_dir / "catalog.sqlite"
+                self._backup_catalog_to(catalog_backup)
+                manifest = self._write_export_zip(catalog_backup, generation, package_path, progress=progress)
+                report_progress(progress, stage="Archive ready.", progress=100)
                 completed = True
                 return ExportedArchive(
                     path=package_path,
@@ -387,44 +397,46 @@ class DocumentationArchive:
                 if not completed:
                     package_path.unlink(missing_ok=True)
 
-    def import_archive_replace(self, package_path: Path | str, *, confirmation: str) -> dict[str, Any]:
+    def import_archive_replace(
+        self, package_path: Path | str, *, confirmation: str, progress: ProgressReporter | None = None,
+    ) -> dict[str, Any]:
         if confirmation != ARCHIVE_IMPORT_REPLACE_CONFIRMATION:
             raise ArchiveError(f"Archive replace import requires confirmation token: {ARCHIVE_IMPORT_REPLACE_CONFIRMATION}")
-        package = self._validated_archive_package(Path(package_path))
+        package = self._validated_archive_package(Path(package_path), progress=progress)
         try:
             with self._write_lock:
-                install_root = Path(tempfile.mkdtemp(prefix=f".{self.root.name}-import-", dir=self.root.parent))
-                shutil.rmtree(install_root)
-                installed = False
-                try:
-                    shutil.copytree(package.archive_root, install_root)
-                    candidate = DocumentationArchive(install_root)
-                    rebuild_manifest = json.loads(candidate.manifest_path.read_text(encoding="utf-8"))
-                    archive_size = candidate.portable_manifest()["archiveSize"]
-                    backup_path = self._install_replacement_archive(install_root)
-                    installed = True
-                    return {
-                        "mode": "replace",
-                        "status": "imported",
-                        "backupPath": str(backup_path),
-                        "manifest": package.manifest,
-                        "rebuildManifest": rebuild_manifest,
-                        "archiveSize": archive_size,
-                    }
-                finally:
-                    if not installed:
-                        shutil.rmtree(install_root, ignore_errors=True)
+                report_progress(progress, stage="Checking imported index.", progress=65)
+                self._prepare_import_index(package.archive_root)
+                candidate = DocumentationArchive(package.archive_root)
+                rebuild_manifest = json.loads(candidate.manifest_path.read_text(encoding="utf-8"))
+                archive_size = candidate._archive_size(candidate._archive_files())
+                report_progress(progress, stage="Replacing archive.", progress=95)
+                backup_path = self._install_replacement_archive(package.archive_root)
+                report_progress(progress, stage="Archive ready.", progress=100)
+                return {
+                    "mode": "replace",
+                    "status": "imported",
+                    "backupPath": str(backup_path),
+                    "manifest": package.manifest,
+                    "rebuildManifest": rebuild_manifest,
+                    "archiveSize": archive_size,
+                }
         finally:
             shutil.rmtree(package.temp_dir, ignore_errors=True)
 
-    def import_archive_merge(self, package_path: Path | str) -> dict[str, Any]:
-        package = self._validated_archive_package(Path(package_path))
+    def import_archive_merge(self, package_path: Path | str, *, progress: ProgressReporter | None = None) -> dict[str, Any]:
+        package = self._validated_archive_package(Path(package_path), progress=progress)
         try:
             with self._write_lock:
+                with self._connect() as db:
+                    empty_catalog = catalog_is_empty(db)
+                imported_generation = self._prepare_import_index(package.archive_root) if empty_catalog else None
                 imported_snapshot_paths = self._imported_snapshot_paths(package.archive_root)
                 try:
+                    report_progress(progress, stage="Merging records.", progress=65)
                     summary, generation = self._publish_catalog_change(
-                        lambda db: self._merge_archive_root(package.archive_root, db)
+                        lambda db: self._merge_archive_root(package.archive_root, db, preserve_chunk_ids=empty_catalog),
+                        progress=progress, append_chunks_only=True, imported_generation=imported_generation,
                     )
                 except Exception:
                     for snapshot_path in imported_snapshot_paths:
@@ -432,7 +444,8 @@ class DocumentationArchive:
                     raise
                 summary["manifest"] = package.manifest
                 summary["rebuildManifest"] = generation.manifest
-                summary["archiveSize"] = self.portable_manifest()["archiveSize"]
+                summary["archiveSize"] = self._archive_size(self._archive_files(generation))
+                report_progress(progress, stage="Archive ready.", progress=100)
                 return summary
         finally:
             shutil.rmtree(package.temp_dir, ignore_errors=True)
@@ -524,12 +537,9 @@ class DocumentationArchive:
         with self._connect() as db:
             total = int(db.execute(f"SELECT COUNT(*) FROM documents d WHERE {where_sql}", params).fetchone()[0])
             document_sql = """
-                SELECT d.document_id, d.title, d.source_type, d.uri, d.state, d.collection, d.created_at, d.updated_at,
-                       COUNT(c.chunk_id) AS chunk_count
+                SELECT d.document_id, d.title, d.source_type, d.uri, d.state, d.collection, d.created_at, d.updated_at
                 FROM documents d
-                LEFT JOIN chunks c ON c.document_id = d.document_id
                 WHERE {where_sql}
-                GROUP BY d.document_id
                 ORDER BY d.updated_at {direction}, d.title COLLATE NOCASE, d.document_id
             """.format(where_sql=where_sql, direction=direction.upper())
             document_params: list[str | int] = list(params)
@@ -537,7 +547,11 @@ class DocumentationArchive:
                 document_sql += " LIMIT ? OFFSET ?"
                 document_params.extend([limit, offset])
             rows = db.execute(
-                document_sql,
+                f"""
+                SELECT d.*, (SELECT COUNT(*) FROM chunks c WHERE c.document_id = d.document_id) AS chunk_count
+                FROM ({document_sql}) d
+                ORDER BY d.updated_at {direction.upper()}, d.title COLLATE NOCASE, d.document_id
+                """,
                 document_params,
             ).fetchall()
         return {
@@ -1202,6 +1216,9 @@ class DocumentationArchive:
         mutation: Callable[[sqlite3.Connection], Any],
         *,
         project: bool = True,
+        progress: ProgressReporter | None = None,
+        append_chunks_only: bool = False,
+        imported_generation: IndexGeneration | None = None,
     ) -> tuple[Any, IndexGeneration]:
         with self._write_lock:
             previous_generation_id = self._active_index_generation()
@@ -1209,8 +1226,13 @@ class DocumentationArchive:
             generation: IndexGeneration | None = None
             try:
                 db.execute("BEGIN IMMEDIATE")
+                base_generation = self._active_index_generation_record() if append_chunks_only else None
+                last_chunk_id = int(db.execute("SELECT COALESCE(MAX(chunk_id), 0) FROM chunks").fetchone()[0]) if append_chunks_only else 0
                 result = mutation(db)
-                generation = self._build_index_generation(db)
+                report_progress(progress, stage="Installing search index." if imported_generation else "Building search index.", progress=80)
+                generation = self._build_index_generation(
+                    db, base_generation=base_generation, append_after=last_chunk_id, progress=progress, imported_generation=imported_generation,
+                )
                 db.execute(
                     "UPDATE archive_state SET active_index_generation = ?, updated_at = ? WHERE state_id = ?",
                     (generation.generation, timestamp(), ARCHIVE_STATE_ROW_ID),
@@ -1229,24 +1251,50 @@ class DocumentationArchive:
                 self._reconcile_index_projection(generation, strict=False)
             return result, generation
 
-    def _build_index_generation(self, db: sqlite3.Connection) -> IndexGeneration:
+    def _build_index_generation(
+        self, db: sqlite3.Connection, *, base_generation: IndexGeneration | None = None, append_after: int = 0,
+        progress: ProgressReporter | None = None, imported_generation: IndexGeneration | None = None,
+    ) -> IndexGeneration:
         rows = db.execute(
             "SELECT chunk_id, text FROM chunks WHERE state = ? ORDER BY chunk_id",
             (ACTIVE_STATE,),
-        ).fetchall()
+        )
         generation_id = catalog_index_generation(rows)
+        if imported_generation is not None and imported_generation.generation != generation_id:
+            raise ArchiveError("Merged catalog does not match the imported search index generation.")
         existing = self._load_index_generation(generation_id)
         if existing is not None:
             return existing
+        if imported_generation is not None:
+            return self._copy_index_generation(imported_generation)
 
         generation_dir = self.index_generations_dir / generation_id
         staging_dir = Path(tempfile.mkdtemp(prefix=".generation-", dir=self.index_generations_dir))
         try:
-            index = IdMapIndex(dim=EMBEDDING_DIM, bit_width=TURBOVEC_BIT_WIDTH)
-            if rows:
-                vectors = np.vstack([embed_text(row["text"]) for row in rows]).astype(np.float32)
-                ids = np.array([row["chunk_id"] for row in rows], dtype=np.uint64)
-                index.add_with_ids(vectors, ids)
+            has_existing_vectors = base_generation is not None and base_generation.manifest["activeChunkCount"] > 0
+            index = IdMapIndex.load(str(base_generation.index_path)) if has_existing_vectors else IdMapIndex(dim=EMBEDDING_DIM, bit_width=TURBOVEC_BIT_WIDTH)
+            rows = db.execute("SELECT chunk_id, text FROM chunks WHERE state = ? AND chunk_id > ? ORDER BY chunk_id", (ACTIVE_STATE, append_after))
+            active_chunk_count = int(db.execute("SELECT COUNT(*) FROM chunks WHERE state = ?", (ACTIVE_STATE,)).fetchone()[0])
+            chunk_count = active_chunk_count - int(base_generation.manifest["activeChunkCount"]) if base_generation else active_chunk_count
+            all_vectors = np.empty((chunk_count, EMBEDDING_DIM), dtype=np.float32) if not has_existing_vectors else None
+            all_ids = np.empty(chunk_count, dtype=np.uint64) if not has_existing_vectors else None
+            indexed = 0
+            last_progress = -1
+            while batch := rows.fetchmany(1024):
+                vectors = np.vstack([embed_text(row["text"]) for row in batch])
+                ids = np.array([row["chunk_id"] for row in batch], dtype=np.uint64)
+                if has_existing_vectors:
+                    index.add_with_ids(vectors, ids)
+                else:
+                    all_vectors[indexed:indexed + len(batch)] = vectors
+                    all_ids[indexed:indexed + len(batch)] = ids
+                indexed += len(batch)
+                current_progress = 80 + int(15 * indexed / max(1, chunk_count))
+                if current_progress != last_progress:
+                    report_progress(progress, stage="Building search index.", progress=current_progress, metrics={"chunksCompleted": indexed, "chunksTotal": chunk_count})
+                    last_progress = current_progress
+            if not has_existing_vectors and chunk_count:
+                index.add_with_ids(all_vectors, all_ids)
             staged_index_path = staging_dir / "chunks.tvim"
             index.write(str(staged_index_path))
             manifest = {
@@ -1258,7 +1306,7 @@ class DocumentationArchive:
                 "turbovecVersion": TURBOVEC_VERSION,
                 "turbovecIndexFormat": TURBOVEC_INDEX_FORMAT,
                 "denseOnlyMinScore": DENSE_ONLY_MIN_SCORE,
-                "activeChunkCount": len(rows),
+                "activeChunkCount": active_chunk_count,
                 "catalogGeneration": generation_id,
                 "indexSha256": sha256_file(staged_index_path),
                 "rebuiltAt": timestamp(),
@@ -1273,6 +1321,23 @@ class DocumentationArchive:
                 index_path=generation_dir / "chunks.tvim",
                 manifest_path=generation_dir / "manifest.json",
                 manifest=manifest,
+                created=True,
+            )
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+    def _copy_index_generation(self, source: IndexGeneration) -> IndexGeneration:
+        generation_dir = self.index_generations_dir / source.generation
+        staging_dir = Path(tempfile.mkdtemp(prefix=".generation-", dir=self.index_generations_dir))
+        try:
+            shutil.copy2(source.index_path, staging_dir / "chunks.tvim")
+            shutil.copy2(source.manifest_path, staging_dir / "manifest.json")
+            os.replace(staging_dir, generation_dir)
+            return IndexGeneration(
+                generation=source.generation,
+                index_path=generation_dir / "chunks.tvim",
+                manifest_path=generation_dir / "manifest.json",
+                manifest=source.manifest,
                 created=True,
             )
         finally:
@@ -1705,30 +1770,6 @@ class DocumentationArchive:
             return generation.manifest_path
         return self.root / relative_path
 
-    def _copy_archive_root_for_export(self, staged_root: Path) -> None:
-        stable_index_paths = {self.index_path, self.manifest_path}
-        for path in sorted(self.root.rglob("*")):
-            if is_relative_to(path, self.index_generations_dir) or is_relative_to(path, self.index_projection_path):
-                continue
-            if path in stable_index_paths:
-                continue
-            relative_path = path.relative_to(self.root)
-            if is_catalog_database_relative_path(relative_path):
-                continue
-            target = staged_root / relative_path
-            if path.is_dir():
-                target.mkdir(parents=True, exist_ok=True)
-            elif path.is_file():
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(path, target)
-        generation = self._active_index_generation_record()
-        for source, destination in (
-            (generation.index_path, staged_root / self.index_path.relative_to(self.root)),
-            (generation.manifest_path, staged_root / self.manifest_path.relative_to(self.root)),
-        ):
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, destination)
-
     def _backup_catalog_to(self, target_path: Path) -> None:
         target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.unlink(missing_ok=True)
@@ -1741,48 +1782,61 @@ class DocumentationArchive:
             target.close()
             source.close()
 
-    def _export_manifest(self, staged_root: Path) -> dict[str, Any]:
-        files = [archive_file_size(staged_root, path) for path in sorted(staged_root.rglob("*")) if path.is_file()]
-        file_entries = [
-            {
-                **file.as_dict(),
-                "sha256": sha256_file(staged_root / file.relative_path),
-            }
-            for file in files
+    def _write_export_zip(
+        self,
+        catalog_backup: Path,
+        generation: IndexGeneration,
+        package_path: Path,
+        *,
+        progress: ProgressReporter | None = None,
+    ) -> dict[str, Any]:
+        files = [
+            file for file in self._archive_files(generation)
+            if not is_catalog_database_relative_path(Path(file.relative_path))
         ]
-        dense_index_path = self.index_path.relative_to(self.root).as_posix()
-        archive_size = archive_size_totals(files, dense_index_path)
-        with sqlite3.connect(staged_root / "catalog.sqlite") as db:
-            archive_size["databaseBytes"] = sqlite_database_bytes(db)
-        return {
-            "exportSchemaVersion": ARCHIVE_EXPORT_SCHEMA_VERSION,
-            "createdAt": timestamp(),
-            "packageRoot": ARCHIVE_EXPORT_ROOT_NAME,
-            "schemaVersion": ARCHIVE_SCHEMA_VERSION,
-            "embeddingProfileId": EMBEDDING_PROFILE_ID,
-            "embeddingDimension": EMBEDDING_DIM,
-            "turbovecDistribution": TURBOVEC_DISTRIBUTION,
-            "turbovecVersion": TURBOVEC_VERSION,
-            "turbovecIndexFormat": TURBOVEC_INDEX_FORMAT,
-            "denseOnlyMinScore": DENSE_ONLY_MIN_SCORE,
-            "archiveSize": archive_size,
-            "files": file_entries,
-        }
-
-    def _write_export_zip(self, staged_root: Path, manifest: dict[str, Any], package_path: Path) -> None:
-        with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as archive_zip:
+        files.insert(0, archive_file_size_at(catalog_backup, "catalog.sqlite"))
+        transfer = ArchiveTransferProgress(progress, stage="Packaging archive.", total=sum(file.logical_bytes for file in files), start=10, end=95)
+        file_entries = []
+        with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as archive_zip:
+            for file in files:
+                source_path = catalog_backup if file.relative_path == "catalog.sqlite" else self._archive_file_source(file.relative_path, generation)
+                if not is_relative_to(source_path.resolve(), catalog_backup.parent if file.relative_path == "catalog.sqlite" else self.root):
+                    raise ArchiveError(f"Archive export file resolves outside archive root: {file.relative_path}")
+                digest = hashlib.sha256()
+                size = 0
+                with source_path.open("rb") as source, archive_zip.open(f"{ARCHIVE_EXPORT_ROOT_NAME}/{file.relative_path}", "w", force_zip64=True) as target:
+                    for block in iter(lambda: source.read(1024 * 1024), b""):
+                        target.write(block)
+                        digest.update(block)
+                        size += len(block)
+                        transfer.advance(len(block))
+                if size != file.logical_bytes:
+                    raise ArchiveError(f"Archive export file changed while packaging: {file.relative_path}")
+                file_entries.append({**file.as_dict(), "sha256": digest.hexdigest()})
+            manifest = {
+                "exportSchemaVersion": ARCHIVE_EXPORT_SCHEMA_VERSION,
+                "createdAt": timestamp(),
+                "packageRoot": ARCHIVE_EXPORT_ROOT_NAME,
+                "schemaVersion": ARCHIVE_SCHEMA_VERSION,
+                "embeddingProfileId": EMBEDDING_PROFILE_ID,
+                "embeddingDimension": EMBEDDING_DIM,
+                "turbovecDistribution": TURBOVEC_DISTRIBUTION,
+                "turbovecVersion": TURBOVEC_VERSION,
+                "turbovecIndexFormat": TURBOVEC_INDEX_FORMAT,
+                "denseOnlyMinScore": DENSE_ONLY_MIN_SCORE,
+                "archiveSize": archive_size_totals(files, self.index_path.relative_to(self.root).as_posix()),
+                "files": file_entries,
+            }
             archive_zip.writestr(ARCHIVE_EXPORT_MANIFEST_NAME, json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-            for path in sorted(staged_root.rglob("*")):
-                if path.is_file():
-                    archive_zip.write(path, f"{ARCHIVE_EXPORT_ROOT_NAME}/{path.relative_to(staged_root).as_posix()}")
+        return manifest
 
-    def _validated_archive_package(self, package_path: Path) -> ValidatedArchivePackage:
+    def _validated_archive_package(self, package_path: Path, *, progress: ProgressReporter | None = None) -> ValidatedArchivePackage:
         resolved_package_path = package_path.expanduser().resolve()
         if not resolved_package_path.is_file():
             raise ArchiveError(f"Archive import package does not exist: {package_path}")
         temp_dir = Path(tempfile.mkdtemp(prefix="cloudx-documentation-import-", dir=self.root.parent))
         try:
-            self._extract_archive_zip(resolved_package_path, temp_dir)
+            file_hashes = self._extract_archive_zip(resolved_package_path, temp_dir, progress=progress)
             manifest_path = temp_dir / ARCHIVE_EXPORT_MANIFEST_NAME
             archive_root = temp_dir / ARCHIVE_EXPORT_ROOT_NAME
             if not manifest_path.is_file():
@@ -1792,7 +1846,8 @@ class DocumentationArchive:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             if not isinstance(manifest, dict):
                 raise ArchiveError("Archive export manifest must be a JSON object.")
-            self._validate_export_manifest(manifest, archive_root)
+            report_progress(progress, stage="Validating archive.", progress=50)
+            self._validate_export_manifest(manifest, file_hashes)
             self._validate_archive_database(archive_root / "catalog.sqlite")
             self._validate_import_locality(archive_root)
             return ValidatedArchivePackage(temp_dir=temp_dir, archive_root=archive_root, manifest=manifest)
@@ -1803,12 +1858,15 @@ class DocumentationArchive:
             shutil.rmtree(temp_dir, ignore_errors=True)
             raise
 
-    def _extract_archive_zip(self, package_path: Path, target_dir: Path) -> None:
+    def _extract_archive_zip(self, package_path: Path, target_dir: Path, *, progress: ProgressReporter | None = None) -> dict[str, str]:
         target_root = target_dir.resolve()
         seen: set[str] = set()
         total_uncompressed = 0
+        file_hashes: dict[str, str] = {}
         with zipfile.ZipFile(package_path) as archive_zip:
-            for member in archive_zip.infolist():
+            members = archive_zip.infolist()
+            transfer = ArchiveTransferProgress(progress, stage="Extracting archive.", total=sum(member.file_size for member in members), start=0, end=50)
+            for member in members:
                 normalized_name = safe_zip_member_name(member.filename)
                 if normalized_name in seen:
                     raise ArchiveError(f"Archive import package contains duplicate member: {normalized_name}")
@@ -1826,10 +1884,17 @@ class DocumentationArchive:
                     destination.mkdir(parents=True, exist_ok=True)
                     continue
                 destination.parent.mkdir(parents=True, exist_ok=True)
+                digest = hashlib.sha256()
                 with archive_zip.open(member) as source, destination.open("wb") as target:
-                    shutil.copyfileobj(source, target)
+                    for block in iter(lambda: source.read(1024 * 1024), b""):
+                        target.write(block)
+                        digest.update(block)
+                        transfer.advance(len(block))
+                if normalized_name != ARCHIVE_EXPORT_MANIFEST_NAME:
+                    file_hashes[normalized_name.removeprefix(ARCHIVE_EXPORT_ROOT_NAME + "/")] = digest.hexdigest()
+        return file_hashes
 
-    def _validate_export_manifest(self, manifest: dict[str, Any], archive_root: Path) -> None:
+    def _validate_export_manifest(self, manifest: dict[str, Any], file_hashes: dict[str, str]) -> None:
         expected_values = {
             "exportSchemaVersion": ARCHIVE_EXPORT_SCHEMA_VERSION,
             "packageRoot": ARCHIVE_EXPORT_ROOT_NAME,
@@ -1845,11 +1910,6 @@ class DocumentationArchive:
         files = manifest.get("files")
         if not isinstance(files, list):
             raise ArchiveError("Archive export manifest files must be a list.")
-        actual_files = {
-            path.relative_to(archive_root).as_posix(): path
-            for path in archive_root.rglob("*")
-            if path.is_file()
-        }
         manifest_files: dict[str, dict[str, Any]] = {}
         for entry in files:
             if not isinstance(entry, dict):
@@ -1860,14 +1920,14 @@ class DocumentationArchive:
             if not isinstance(entry.get("sha256"), str) or len(str(entry["sha256"])) != 64:
                 raise ArchiveError(f"Archive export manifest file entry is missing sha256: {relative_path}")
             manifest_files[relative_path] = entry
-        if set(manifest_files) != set(actual_files):
-            missing = sorted(set(manifest_files) - set(actual_files))
-            extra = sorted(set(actual_files) - set(manifest_files))
+        if set(manifest_files) != set(file_hashes):
+            missing = sorted(set(manifest_files) - set(file_hashes))
+            extra = sorted(set(file_hashes) - set(manifest_files))
             raise ArchiveError(f"Archive export manifest does not match package files. missing={missing} extra={extra}")
-        if "catalog.sqlite" not in actual_files:
+        if "catalog.sqlite" not in file_hashes:
             raise ArchiveError("Archive import package is missing catalog.sqlite.")
         for relative_path, entry in manifest_files.items():
-            actual_hash = sha256_file(actual_files[relative_path])
+            actual_hash = file_hashes[relative_path]
             if actual_hash != entry["sha256"]:
                 raise ArchiveError(f"Archive import package hash mismatch for {relative_path}.")
 
@@ -1928,6 +1988,57 @@ class DocumentationArchive:
         if violations:
             raise ArchiveError("Archive import locality validation failed: " + "; ".join(violations))
 
+    def _prepare_import_index(self, archive_root: Path) -> IndexGeneration:
+        index_dir = archive_root / self.index_dir.relative_to(self.root)
+        manifest_path = index_dir / "manifest.json"
+        index_path = index_dir / "chunks.tvim"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                raise ArchiveError("Archive import dense index manifest must be a JSON object.")
+            with sqlite3.connect(archive_root / "catalog.sqlite") as db:
+                db.row_factory = sqlite3.Row
+                rows = db.execute("SELECT chunk_id, text FROM chunks WHERE state = ? ORDER BY chunk_id", (ACTIVE_STATE,))
+                generation = catalog_index_generation(rows)
+                active_chunk_count = db.execute("SELECT COUNT(*) FROM chunks WHERE state = ?", (ACTIVE_STATE,)).fetchone()[0]
+                state = db.execute("SELECT active_index_generation FROM archive_state WHERE state_id = ?", (ARCHIVE_STATE_ROW_ID,)).fetchone()
+                if state is None or state["active_index_generation"] != generation:
+                    raise ArchiveError("Archive import catalog does not reference its packaged index generation.")
+            expected = {
+                "catalogGeneration": generation,
+                "activeChunkCount": active_chunk_count,
+                "schemaVersion": ARCHIVE_SCHEMA_VERSION,
+                "embeddingProfileId": EMBEDDING_PROFILE_ID,
+                "embeddingDimension": EMBEDDING_DIM,
+                "turbovecBitWidth": TURBOVEC_BIT_WIDTH,
+                "turbovecVersion": TURBOVEC_VERSION,
+                "indexSha256": sha256_file(index_path),
+            }
+            if any(manifest.get(key) != value for key, value in expected.items()):
+                raise ArchiveError("Archive import dense index does not match its catalog or runtime profile.")
+            index = IdMapIndex.load(str(index_path))
+            if index.dim != EMBEDDING_DIM or index.bit_width != TURBOVEC_BIT_WIDTH:
+                raise ArchiveError("Archive import dense index has an unsupported vector format.")
+            if len(index) != active_chunk_count:
+                raise ArchiveError("Archive import dense index count does not match its catalog.")
+            with sqlite3.connect(archive_root / "catalog.sqlite") as db:
+                for (chunk_id,) in db.execute("SELECT chunk_id FROM chunks WHERE state = ?", (ACTIVE_STATE,)):
+                    if not index.contains(chunk_id):
+                        raise ArchiveError("Archive import dense index chunk IDs do not match its catalog.")
+            generation_dir = index_dir / INDEX_GENERATIONS_DIRECTORY / generation
+            generation_dir.mkdir(parents=True)
+            index_path.replace(generation_dir / index_path.name)
+            manifest_path.replace(generation_dir / manifest_path.name)
+            return IndexGeneration(
+                generation=generation,
+                index_path=generation_dir / index_path.name,
+                manifest_path=generation_dir / manifest_path.name,
+                manifest=manifest,
+                created=False,
+            )
+        except (OSError, ValueError, RuntimeError, sqlite3.DatabaseError) as error:
+            raise ArchiveError(f"Archive import dense index validation failed: {error}") from error
+
     def _install_replacement_archive(self, install_root: Path) -> Path:
         backup_path = self._next_backup_path()
         moved_current = False
@@ -1952,7 +2063,9 @@ class DocumentationArchive:
                 return candidate
         raise ArchiveError("Could not allocate archive import backup path.")
 
-    def _merge_archive_root(self, source_root: Path, target: sqlite3.Connection | None = None) -> dict[str, Any]:
+    def _merge_archive_root(
+        self, source_root: Path, target: sqlite3.Connection | None = None, *, preserve_chunk_ids: bool = False,
+    ) -> dict[str, Any]:
         summary: dict[str, Any] = {
             "mode": "merge",
             "status": "imported",
@@ -1967,9 +2080,12 @@ class DocumentationArchive:
         source = sqlite3.connect(source_root / "catalog.sqlite")
         source.row_factory = sqlite3.Row
         try:
+            create_catalog_indexes(source)
             target_context = self._connect() if target is None else nullcontext(target)
             with target_context as target:
-                documents = source.execute("SELECT * FROM documents ORDER BY created_at, document_id").fetchall()
+                if preserve_chunk_ids and not catalog_is_empty(target):
+                    raise ArchiveError("Preserving imported chunk IDs requires an empty documentation catalog.")
+                documents = source.execute("SELECT * FROM documents ORDER BY created_at, document_id")
                 for document in documents:
                     document_id = str(document["document_id"])
                     existing = target.execute("SELECT document_id, uri, content_sha256 FROM documents WHERE document_id = ?", (document_id,)).fetchone()
@@ -2046,30 +2162,15 @@ class DocumentationArchive:
                         )
                         enrichment_id_map[int(enrichment["enrichment_id"])] = int(cursor.lastrowid)
                         summary["importedEnrichments"] += 1
-                    chunks = source.execute("SELECT * FROM chunks WHERE document_id = ? ORDER BY chunk_id", (document_id,)).fetchall()
-                    for chunk in chunks:
-                        source_enrichment_id = chunk["enrichment_id"]
-                        target_enrichment_id = None
-                        if source_enrichment_id is not None:
-                            source_enrichment_id = int(source_enrichment_id)
-                            if source_enrichment_id not in enrichment_id_map:
-                                raise ArchiveError(f"Archive import chunk references unknown enrichment_id: {source_enrichment_id}")
-                            target_enrichment_id = enrichment_id_map[source_enrichment_id]
-                        target.execute(
-                            """
-                            INSERT INTO chunks (document_id, locator, text, state, chunk_origin, enrichment_id)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                chunk["document_id"],
-                                chunk["locator"],
-                                chunk["text"],
-                                chunk["state"],
-                                chunk["chunk_origin"],
-                                target_enrichment_id,
-                            ),
-                        )
-                        summary["importedChunks"] += 1
+                    chunks = source.execute("SELECT * FROM chunks WHERE document_id = ? ORDER BY chunk_id", (document_id,))
+                    cursor = target.executemany(
+                        """
+                        INSERT INTO chunks (chunk_id, document_id, locator, text, state, chunk_origin, enrichment_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (imported_chunk_values(chunk, enrichment_id_map, preserve_chunk_id=preserve_chunk_ids) for chunk in chunks),
+                    )
+                    summary["importedChunks"] += cursor.rowcount
                     summary["importedInvalidationEvents"] += self._merge_invalidation_events(source, target, document_id)
                     summary["importedDocuments"] += 1
         finally:
@@ -2204,8 +2305,10 @@ class DocumentationArchive:
 
                 INSERT OR IGNORE INTO archive_state (state_id, active_index_generation, updated_at)
                 VALUES (1, NULL, '');
+
                 """
             )
+            create_catalog_indexes(db)
             columns = {row["name"] for row in db.execute("PRAGMA table_info(chunks)").fetchall()}
             if "chunk_origin" not in columns:
                 db.execute("ALTER TABLE chunks ADD COLUMN chunk_origin TEXT NOT NULL DEFAULT 'source'")
@@ -2218,6 +2321,32 @@ class DocumentationArchive:
 
 class ArchiveError(ValueError):
     pass
+
+
+def create_catalog_indexes(db: sqlite3.Connection) -> None:
+    db.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS documents_state_updated ON documents(state, updated_at DESC, title COLLATE NOCASE, document_id);
+        CREATE INDEX IF NOT EXISTS documents_uri ON documents(uri);
+        CREATE INDEX IF NOT EXISTS chunks_document ON chunks(document_id);
+        CREATE INDEX IF NOT EXISTS chunks_state ON chunks(state);
+        CREATE INDEX IF NOT EXISTS enrichments_document ON document_enrichments(document_id);
+        CREATE INDEX IF NOT EXISTS invalidations_document ON invalidation_events(document_id);
+        """
+    )
+
+
+def catalog_is_empty(db: sqlite3.Connection) -> bool:
+    return bool(db.execute("SELECT NOT EXISTS(SELECT 1 FROM documents) AND NOT EXISTS(SELECT 1 FROM chunks)").fetchone()[0])
+
+
+def imported_chunk_values(chunk: sqlite3.Row, enrichment_id_map: dict[int, int], *, preserve_chunk_id: bool = False) -> tuple:
+    enrichment_id = chunk["enrichment_id"]
+    if enrichment_id is not None:
+        if int(enrichment_id) not in enrichment_id_map:
+            raise ArchiveError(f"Archive import chunk references unknown enrichment_id: {enrichment_id}")
+        enrichment_id = enrichment_id_map[int(enrichment_id)]
+    return (chunk["chunk_id"] if preserve_chunk_id else None, chunk["document_id"], chunk["locator"], chunk["text"], chunk["state"], chunk["chunk_origin"], enrichment_id)
 
 
 def safe_timestamp() -> str:
@@ -2373,16 +2502,20 @@ def split_long_text(text: str, max_chars: int) -> list[str]:
 
 def embed_text(text: str) -> np.ndarray:
     vector = np.zeros(EMBEDDING_DIM, dtype=np.float32)
-    for token in tokenize(text):
-        digest = hashlib.sha256(token.encode("utf-8")).digest()
-        index = int.from_bytes(digest[:4], "big") % EMBEDDING_DIM
-        sign = 1.0 if digest[4] & 1 else -1.0
-        vector[index] += sign
+    for token, count in Counter(tokenize(text)).items():
+        index, sign = embedding_token(token)
+        vector[index] += sign * count
     norm = float(np.linalg.norm(vector))
     if norm == 0:
         vector[0] = 1.0
         return vector
     return vector / norm
+
+
+@lru_cache(maxsize=65536)
+def embedding_token(token: str) -> tuple[int, float]:
+    digest = hashlib.sha256(token.encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "big") % EMBEDDING_DIM, 1.0 if digest[4] & 1 else -1.0
 
 
 def reciprocal_rank_fusion(dense_scores: dict[int, float], lexical_scores: dict[int, float], k: int = 60) -> dict[int, float]:
@@ -3984,6 +4117,25 @@ def report_progress(
     reporter(event)
 
 
+class ArchiveTransferProgress:
+    def __init__(self, reporter: ProgressReporter | None, *, stage: str, total: int, start: int, end: int):
+        self.reporter = reporter
+        self.stage = stage
+        self.total = total
+        self.start = start
+        self.end = end
+        self.completed = 0
+        self.last_progress = -1
+        self.advance(0)
+
+    def advance(self, byte_count: int) -> None:
+        self.completed += byte_count
+        progress = self.start + int((self.end - self.start) * self.completed / max(1, self.total))
+        if progress != self.last_progress:
+            report_progress(self.reporter, stage=self.stage, progress=progress, metrics={"bytesCompleted": self.completed, "bytesTotal": self.total})
+            self.last_progress = progress
+
+
 class ProgressHeartbeat:
     def __init__(
         self,
@@ -4750,7 +4902,7 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def catalog_index_generation(rows: list[sqlite3.Row]) -> str:
+def catalog_index_generation(rows: Iterator[sqlite3.Row] | list[sqlite3.Row]) -> str:
     digest = hashlib.sha256()
     digest.update(
         json.dumps(

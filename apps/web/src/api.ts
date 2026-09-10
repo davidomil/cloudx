@@ -17,6 +17,7 @@ import type {
   ForgeRepository,
   CreateTabRequest,
   CreateTabResponse,
+  DocumentationArchiveExportJob,
   CreateWorkspaceLayoutTemplateRequest,
   CreateWorkspaceWindowRequest,
   HookCallResponse,
@@ -103,6 +104,8 @@ export type DocumentationUploadProgress = FileUploadProgress;
 export interface DocumentationArchiveImportResponse {
   import?: Record<string, unknown>;
 }
+
+export type DocumentationArchiveExport = DocumentationArchiveExportJob;
 
 export async function downloadFileBrowserEntries(tabId: string, relativePaths: string[]): Promise<FileDownloadResponse> {
   const response = await fetch(`/api/tabs/${encodeURIComponent(tabId)}/files/download`, {
@@ -220,6 +223,18 @@ export async function downloadDocumentationArchive(): Promise<FileDownloadRespon
     blob: await response.blob(),
     filename: filenameFromContentDisposition(response.headers.get("content-disposition")) ?? "cloudx-documentation.zip"
   };
+}
+
+export function startDocumentationArchiveExport(): Promise<DocumentationArchiveExport> {
+  return fetchJson("/api/documentation/archive/exports", { method: "POST" });
+}
+
+export function getDocumentationArchiveExport(id: string): Promise<DocumentationArchiveExport> {
+  return fetchJson(`/api/documentation/archive/exports/${encodeURIComponent(id)}`);
+}
+
+export function documentationArchiveDownloadUrl(id: string): string {
+  return `/api/documentation/archive/exports/${encodeURIComponent(id)}/download`;
 }
 
 export async function importDocumentationArchive(input: {

@@ -3567,6 +3567,27 @@ a:hover svg {
   min-width: 0;
 }
 
+.documentation-archive-progress {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.documentation-archive-progress p {
+  margin: 0;
+}
+
+.documentation-archive-progress progress {
+  width: 100%;
+}
+
+.documentation-archive-progress a {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .documentation-ingest textarea {
   resize: vertical;
 }

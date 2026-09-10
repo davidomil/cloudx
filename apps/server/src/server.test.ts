@@ -2399,6 +2399,47 @@ describe("buildServer", () => {
     }
   });
 
+  it("proxies archive preparation status, expiry, and range downloads", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-export-jobs-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    const job = { id: "export-1", status: "running" as const, stage: "packaging", progress: 45 };
+    const start = vi.spyOn(services.documentation!, "startArchiveExport").mockResolvedValue(job);
+    const get = vi.spyOn(services.documentation!, "getArchiveExport").mockImplementation(async (jobId) => {
+      if (jobId === "expired") throw Object.assign(new Error("Archive export has expired."), { statusCode: 404 });
+      return job;
+    });
+    const upstream = new Response(new Uint8Array([80, 75]), { status: 206, headers: {
+      "content-type": "application/zip", "content-length": "2", "content-range": "bytes 0-1/4",
+      "content-disposition": 'attachment; filename="archive.zip"'
+    } });
+    const download = vi.spyOn(services.documentation!, "streamArchiveExportDownload").mockResolvedValue({
+      statusCode: upstream.status, headers: upstream.headers, body: upstream.body
+    });
+    const app = await buildServer(config, services);
+    try {
+      const started = await app.inject({ method: "POST", url: "/api/documentation/archive/exports" });
+      expect(started.statusCode).toBe(202);
+      expect(started.json()).toEqual(job);
+      expect(start).toHaveBeenCalledOnce();
+      const polled = await app.inject({ method: "GET", url: "/api/documentation/archive/exports/export-1" });
+      expect(polled.json()).toEqual(job);
+      expect(polled.headers["cache-control"]).toBe("no-store");
+      expect(get).toHaveBeenCalledWith("export-1");
+      const expired = await app.inject({ method: "GET", url: "/api/documentation/archive/exports/expired" });
+      expect(expired.statusCode).toBe(404);
+      const received = await app.inject({ method: "GET", url: "/api/documentation/archive/exports/export-1/download", headers: { range: "bytes=0-1" } });
+      expect(received.statusCode).toBe(206);
+      expect(received.headers["content-range"]).toBe("bytes 0-1/4");
+      expect(received.headers["content-disposition"]).toBe('attachment; filename="archive.zip"');
+      expect(Array.from(received.rawPayload)).toEqual([80, 75]);
+      expect(download).toHaveBeenCalledWith("export-1", { range: "bytes=0-1", "if-range": undefined });
+    } finally {
+      await app.close();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("forwards browser documentation archive imports to the indexer", async () => {
     const root = await fs.mkdtemp(
       path.join(os.tmpdir(), "cloudx-doc-archive-import-"),
@@ -2406,10 +2447,13 @@ describe("buildServer", () => {
     const config = testConfig(root);
     const services = buildServices(config);
     const importedPaths: string[] = [];
+    const progressSnapshots: unknown[] = [];
     const replaceImport = vi
       .spyOn(services.documentation!, "importArchiveReplaceFile")
-      .mockImplementation(async (input) => {
+      .mockImplementation(async (input, options) => {
         importedPaths.push(input.path);
+        options?.onProgress?.({ stage: "replacing", progress: 80 });
+        progressSnapshots.push(services.documentationIngestQueue!.list().jobs.find((job) => job.status === "running"));
         await expect(fs.readFile(input.path)).resolves.toEqual(
           Buffer.from([1, 2, 3]),
         );
@@ -2417,8 +2461,10 @@ describe("buildServer", () => {
       });
     const mergeImport = vi
       .spyOn(services.documentation!, "importArchiveMergeFile")
-      .mockImplementation(async (input) => {
+      .mockImplementation(async (input, options) => {
         importedPaths.push(input.path);
+        options?.onProgress?.({ stage: "merging", progress: 65 });
+        progressSnapshots.push(services.documentationIngestQueue!.list().jobs.find((job) => job.status === "running"));
         await expect(fs.readFile(input.path)).resolves.toEqual(
           Buffer.from([4, 5, 6]),
         );
@@ -2447,6 +2493,10 @@ describe("buildServer", () => {
 
       expect(replace.statusCode).toBe(200);
       expect(merge.statusCode).toBe(200);
+      expect(progressSnapshots).toEqual([
+        expect.objectContaining({ stage: "replacing", progress: 80 }),
+        expect.objectContaining({ stage: "merging", progress: 65 })
+      ]);
       expect(replaceImport).toHaveBeenCalledWith(
         {
           filename: "archive.zip",
@@ -2454,7 +2504,7 @@ describe("buildServer", () => {
           contentType: "application/zip",
           confirmation: "REPLACE_DOCUMENTATION_ARCHIVE",
         },
-        { signal: expect.any(AbortSignal) },
+        { signal: expect.any(AbortSignal), onProgress: expect.any(Function) },
       );
       expect(mergeImport).toHaveBeenCalledWith(
         {
@@ -2462,7 +2512,7 @@ describe("buildServer", () => {
           path: expect.any(String),
           contentType: "application/zip",
         },
-        { signal: expect.any(AbortSignal) },
+        { signal: expect.any(AbortSignal), onProgress: expect.any(Function) },
       );
       await Promise.all(
         importedPaths.map((filePath) =>

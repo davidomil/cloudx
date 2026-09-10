@@ -4,6 +4,7 @@ export * from "./forge.js";
 export * from "./forgeWorkers.js";
 export * from "./forgeConnections.js";
 export * from "./jira.js";
+export * from "./documentationArchive.js";
 
 export const DEFAULT_VOICE_MODEL = "gpt-5.3-codex-spark";
 
