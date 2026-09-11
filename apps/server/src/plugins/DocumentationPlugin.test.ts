@@ -208,23 +208,24 @@ describe("DocumentationPlugin", () => {
     await expect(hook.execute({ path: "docs/datasheet.pdf", cwd: "/etc" }, { caller: { kind: "http" } })).rejects.toThrow("Path is outside configured Cloudx roots");
   });
 
-  it("passes ingest results through the enrichment provider when configured", async () => {
+  it.each(["path", "url", "text"])("returns %s extraction results without waiting for AI enrichment", async (kind) => {
     const root = await tempRoot();
     const allowedFile = path.join(root, "datasheet.pdf");
     await fs.writeFile(allowedFile, "data");
     const client = fakeClient();
-    const enrichIngestResponse = vi.fn(async (response: Record<string, unknown>) => ({ ...response, enrichment: { enabled: true } }));
-    const plugin = new DocumentationPlugin(client, new PathPolicy([root]), new DocumentationIngestQueue(), () => ({ enrichIngestResponse }) as never);
-    const hook = plugin.hooks.find((candidate) => candidate.id === "documentation.ingest.path")!;
+    const enrichIngestResponse = vi.fn(() => new Promise(() => {}));
+    const queue = new DocumentationIngestQueue();
+    const plugin = new DocumentationPlugin(client, new PathPolicy([root]), queue, () => ({ enrichIngestResponse }) as never);
+    const hook = plugin.hooks.find((candidate) => candidate.id === `documentation.ingest.${kind}`)!;
+    const input = { path: allowedFile, url: "https://example.com/guide", text: "Guide content" };
 
-    const result = await hook.execute({ path: allowedFile, sourceType: "datasheet" }, { caller: { kind: "http" } });
+    const result = await hook.execute(input, { caller: { kind: "http" } });
 
-    expect(result).toMatchObject({ documents: [], documentCount: 0, kind: "path", source: allowedFile, enrichment: { enabled: true } });
-    expect(enrichIngestResponse).toHaveBeenCalledWith(
-      { documents: [] },
-      {},
-      { signal: expect.any(AbortSignal) }
-    );
+    expect(result).toMatchObject({ kind });
+    expect(result).not.toHaveProperty("enrichment");
+    expect(enrichIngestResponse).not.toHaveBeenCalled();
+    expect(queue.list().capacity.admittedJobs).toBe(0);
+    await queue.dispose();
   });
 
   it("queues blocking ingest hooks and reports progress before completion", async () => {
@@ -585,7 +586,7 @@ describe("DocumentationPlugin", () => {
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("instead of `documentation.answer`");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("Before answering any factual, research, recipe, recommendation, troubleshooting, summary, or source-grounded question");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("If active local results are absent, weak, stale, or do not cover the user's question, use built-in web search");
-    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("After ingesting web sources, rerun local archive search");
+    expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("After ingestion completes, rerun local archive search");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("ingest the original file, PDF, spreadsheet, image, URL, YouTube video, or playlist");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-search")?.instructions).toContain("acceptGeneratedCodeDocumentation: true");
     expect(plugin.skillContributions.find((skill) => skill.id === "documentation-ingest")?.instructions).toContain("Always ingest PDFs, spreadsheets, images, documents, YouTube videos, and YouTube playlists as original sources");

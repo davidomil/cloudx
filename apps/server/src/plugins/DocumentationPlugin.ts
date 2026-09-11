@@ -37,7 +37,7 @@ export class DocumentationPlugin implements WorkspacePlugin {
       key: DOCUMENTATION_AI_ENRICHMENT_ENABLED_KEY,
       label: "AI enrichment",
       type: "boolean",
-      description: "Use the configured CloudX AI model to improve documentation imports after the source extraction completes.",
+      description: "Automatically enrich pending documentation in the background after source extraction completes.",
       defaultValue: true
     },
     {
@@ -186,7 +186,7 @@ export class DocumentationPlugin implements WorkspacePlugin {
         const { cwd: _cwd, ...clientInput } = input;
         return this.enqueueIngest("path", titleOrFallback(input.title, path), path, serializedInputBytes(input), "Reading local path and extracting source evidence.", async (job) => {
           job.update({ progress: 35, stage: "Indexer is reading the local path and extracting source evidence." });
-          return ingestResult(await this.enrichQueued(await this.client.ingestPath({ ...clientInput, path }, { signal: job.signal }), job), "path", path);
+          return ingestResult(await this.client.ingestPath({ ...clientInput, path }, { signal: job.signal }), "path", path);
         }, context);
       }, {
         path: { type: "string" },
@@ -200,7 +200,7 @@ export class DocumentationPlugin implements WorkspacePlugin {
       }, ["path"], documentationIngestOutputSchema()),
       externalHook("documentation.ingest.url", "Ingest Documentation URL", "Download a URL source, ingest a YouTube video with transcript and keyframes, or ingest every video in a YouTube playlist.", async (input, context) => this.enqueueIngest("url", titleOrFallback(input.title, requireString(input.url, "url")), requireString(input.url, "url"), serializedInputBytes(input), "Downloading URL and extracting source evidence.", async (job) => {
         job.update({ progress: 30, stage: urlIngestStage(requireString(input.url, "url")) });
-        return ingestResult(await this.enrichQueued(await this.client.ingestUrl(input, {
+        return ingestResult(await this.client.ingestUrl(input, {
           signal: job.signal,
           onProgress: (event) => job.update({
             progress: typeof event.progress === "number" ? Math.max(30, Math.min(76, event.progress)) : undefined,
@@ -209,7 +209,7 @@ export class DocumentationPlugin implements WorkspacePlugin {
             metrics: event.metrics,
             ...progressChannelPatch(event)
           })
-        }), job), "url", requireString(input.url, "url"));
+        }), "url", requireString(input.url, "url"));
       }, context), {
         url: { type: "string" },
         title: { type: "string" },
@@ -222,7 +222,7 @@ export class DocumentationPlugin implements WorkspacePlugin {
       }, ["url"], documentationIngestOutputSchema()),
       writeHook("documentation.ingest.text", "Ingest Documentation Text", "Ingest direct text, transcript, or copied source material.", async (input, context) => this.enqueueIngest("text", titleOrFallback(input.title, "Text source"), optionalString(input.uri) ?? "direct text", serializedInputBytes(input), "Writing text into the archive.", async (job) => {
         job.update({ progress: 35, stage: "Indexer is writing text into the archive." });
-        return ingestResult(await this.enrichQueued(await this.client.ingestText(input, { signal: job.signal }), job), "text", optionalString(input.uri) ?? "direct text");
+        return ingestResult(await this.client.ingestText(input, { signal: job.signal }), "text", optionalString(input.uri) ?? "direct text");
       }, context), {
         title: { type: "string" },
         text: { type: "string" },
@@ -351,10 +351,6 @@ export class DocumentationPlugin implements WorkspacePlugin {
     return result;
   }
 
-  private enrich(response: Record<string, unknown>, signal: AbortSignal): Promise<Record<string, unknown>> | Record<string, unknown> {
-    return this.enrichmentProvider()?.enrichIngestResponse(response, {}, { signal }) ?? response;
-  }
-
   private enqueueIngest(
     kind: "path" | "url" | "text",
     label: string,
@@ -372,15 +368,6 @@ export class DocumentationPlugin implements WorkspacePlugin {
       runningStage,
       operation
     }, hookContext?.reportProgress ? (snapshot) => hookContext.reportProgress?.(hookProgress(snapshot)) : undefined);
-  }
-
-  private async enrichQueued(response: Record<string, unknown>, job: DocumentationIngestQueueOperationContext): Promise<Record<string, unknown>> {
-    job.signal.throwIfAborted();
-    job.update({ progress: 78, stage: "Running AI enrichment for the imported documentation." });
-    const enriched = await this.enrich(response, job.signal);
-    job.signal.throwIfAborted();
-    job.update({ progress: 92, stage: "Finalizing documentation import." });
-    return enriched;
   }
 }
 
@@ -810,7 +797,7 @@ function defaultDocumentationSkills(): PluginSkillContribution[] {
         "If active local results are absent, weak, stale, or do not cover the user's question, use built-in web search before answering. Prefer official product/project documentation, vendor datasheets, standards/specs, peer-reviewed or government/institutional sources for high-stakes domains, and reputable news sources for current events. Avoid forum or blog claims unless they are explicitly requested or corroborated by stronger sources.",
         "When adding evidence, ingest the original file, PDF, spreadsheet, image, URL, YouTube video, or playlist through the ingest skill so the full extractor can capture text, tables, workbook sheets, figures, screenshots, transcripts, and keyframes; use `/ingest/text` only when no original source is available. Preserve title, URI, source type, and collection metadata.",
         "For vendor source-code files or code-heavy directories, do not index raw source directly. Use path, upload, or URL ingest with `acceptGeneratedCodeDocumentation: true` only after reviewing that generated documentation is acceptable; use `retainRawCodeArtifacts: true` only when raw source retention is allowed.",
-        "After ingesting web sources, rerun local archive search and answer from the local documentation records. If no reliable source can be ingested, say so and answer only with the evidence that was actually inspected.",
+        "For long-running imports, follow the documentation-ingest skill to wait on the same command or read the original source directly while processing continues. After ingestion completes, rerun local archive search and answer from the local documentation records. If no reliable source can be ingested, say so and answer only with the evidence that was actually inspected.",
         "When writing, carry forward each result's title, source type, locator, URI, and content SHA."
       ]),
       files: DOCUMENTATION_HELPER_FILES
@@ -823,14 +810,18 @@ function defaultDocumentationSkills(): PluginSkillContribution[] {
         "Read `CLOUDX_SERVER_URL` and `CLOUDX_DOCUMENTATION_URL`. If both are missing, stop and explain that no documentation ingest endpoint is available.",
         `Use the bundled helper to keep commands short: \`DOC="$CLOUDX_RULES_SKILLS_DIR/system-skills/documentation-ingest/${DOCUMENTATION_HELPER_SCRIPT_PATH}"\`; then run \`node "$DOC" ingest-url URL\`, \`node "$DOC" ingest-path PATH\`, \`node "$DOC" ingest-text "text"\`, \`node "$DOC" search "query"\`, or \`node "$DOC" open DOCUMENT_ID\`.`,
         "Use `ingest-path` for local files or directories visible to the server, `ingest-url` for websites, URLs, YouTube videos, and YouTube playlists, and `ingest-text` only for copied text that has no retrievable original source.",
-        "The helper uses the CloudX streaming hook when `CLOUDX_SERVER_URL` is set, so keep the command running until progress ends with a final result or error.",
+        "Source extraction can take several minutes or longer. The helper uses the CloudX streaming hook when `CLOUDX_SERVER_URL` is set and waits for extraction before returning a final result. Starting an import, receiving progress, or seeing an empty search result does not establish that ingestion has finished.",
+        "Keep the ingest command running. If the execution tool yields a running session or cell ID, retain that ID and use the tool's wait/resume mechanism on the same execution, with waits of at most 60 seconds, until it returns a final result or error. Quiet intervals do not prove failure; do not cancel, restart, or submit the source again merely because processing is slow. When using `CLOUDX_DOCUMENTATION_URL` directly, also wait for the ingest response to finish before relying on archive availability.",
+        "If the task needs source content while ingestion is still running, read the original local file directly with suitable file, PDF, spreadsheet, or image tools and continue the task while the existing import processes it. For a URL source, inspect the original URL if accessible. State that the evidence came from the original source and that archive ingestion is still pending; do not claim it is indexed or enriched. Keep the running session ID so its outcome can be checked. If the original source cannot be read, continue waiting on the same import.",
+        "After a successful final response, inspect the returned document IDs and warnings for extraction failures or skipped work. Run `node \"$DOC\" search \"query\"` again and `node \"$DOC\" open DOCUMENT_ID` for the relevant returned IDs before claiming the content is available in the archive. Report errors or missing content explicitly; an empty search during processing is not evidence that the source lacks the requested information.",
         "When ingesting a relative local path, run the helper from the intended workspace with `CLOUDX_SERVER_URL` set. If only `CLOUDX_DOCUMENTATION_URL` is available, pass an absolute path.",
         "Always ingest PDFs, spreadsheets, images, documents, YouTube videos, and YouTube playlists as original sources, not pasted excerpts or transcripts, so the extractor can preserve pages, tables, workbook sheets, figures, screenshots, visual keyframes, timestamps, and source artifacts.",
         "For vendor source-code files or directories, do not use `ingest-text` and do not request raw-code indexing. Use path, upload, or URL ingest with `acceptGeneratedCodeDocumentation: true` after reviewing the generated Markdown path is acceptable; set `retainRawCodeArtifacts: true` only when raw source retention is allowed.",
         "Set `sourceType` to one of `datasheet`, `book`, `website`, `readme`, `media`, `image`, `spreadsheet`, or `text` when the user gives enough context. The indexer assigns `repo_code` to generated code documentation.",
         "Leave `title` and `collection` blank when the indexer should autodetect them from the file, folder, URL, playlist, upload, or first text line.",
         "When ingesting sources found online, prefer durable primary URLs and include the original source URL. Do not ingest search-result pages, low-trust mirrors, or unsupported summaries when a better source is available.",
-        "When AI enrichment is disabled, only source text and extracted artifact metadata are immediately searchable. Do manual follow-up by searching, opening full documents, reading transcript chunks, table artifacts, or schematic descriptions, and writing source-grounded notes yourself.",
+        "Imports return once source extraction completes. CloudX enriches pending active documents in the background when AI enrichment is enabled; continue searching the extracted evidence without waiting for AI analysis.",
+        "When AI enrichment is disabled, ingestion must still finish before you rely on the archive. Only source text and extracted artifact metadata are available without AI enrichment. After completion, do manual follow-up by searching, opening full documents, reading transcript chunks, table artifacts, or schematic descriptions, and writing source-grounded notes yourself.",
         "Do not ingest outdated or untrusted material silently. Preserve precise source URI metadata whenever the user provides it."
       ]),
       files: DOCUMENTATION_HELPER_FILES
@@ -907,7 +898,7 @@ function defaultDocumentationRules(): PluginRuleContribution[] {
     {
       id: "documentation-ingest-evidence",
       description: "Capture task evidence in the local documentation archive before relying on it.",
-      text: "Before answering source-grounded questions, search active records in the local CloudX documentation archive first. When adding evidence from a file, PDF, spreadsheet, image, URL, YouTube video, or playlist, ingest the original source through the documentation ingest hooks so the full extractor runs; use text ingest only when no original source is available, then rerun search and answer from the archive."
+      text: "Before answering source-grounded questions, search active records in the local CloudX documentation archive first. When adding evidence from a file, PDF, spreadsheet, image, URL, YouTube video, or playlist, ingest the original source through the documentation ingest hooks so the full extractor runs; use text ingest only when no original source is available. For long-running imports, follow the documentation-ingest skill to wait or read the original source while processing continues; after completion, rerun search and answer from the archive."
     }
   ];
 }

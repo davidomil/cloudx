@@ -421,6 +421,7 @@ function requestNdjson(urlString, options) {
         req.destroy();
         reject(error);
       };
+      res.on("error", fail);
       if ((res.statusCode || 0) < 200 || (res.statusCode || 0) >= 300) {
         const chunks = [];
         res.setEncoding("utf8");
@@ -458,7 +459,11 @@ function requestNdjson(urlString, options) {
             return;
           }
         }
-        resolve(finalResult || {});
+        if (finalResult === undefined) {
+          reject(new Error("Documentation progress stream ended without a result."));
+          return;
+        }
+        resolve(finalResult);
       });
     });
     req.on("error", reject);
@@ -469,6 +474,9 @@ function requestNdjson(urlString, options) {
 
 function handleNdjsonEvent(line, finalResult) {
   const event = JSON.parse(line);
+  if (!event || typeof event !== "object" || Array.isArray(event)) {
+    throw new Error("Documentation progress stream event was not a JSON object.");
+  }
   if (event.type === "progress") {
     const progress = typeof event.progress === "number" ? " " + Math.round(event.progress) + "%" : "";
     const eta = typeof event.etaSeconds === "number" ? " eta " + event.etaSeconds + "s" : "";
@@ -479,7 +487,10 @@ function handleNdjsonEvent(line, finalResult) {
     throw new Error(String(event.error || "documentation ingest failed"));
   }
   if (event.type === "result") {
-    return event.result || {};
+    if (!event.result || typeof event.result !== "object" || Array.isArray(event.result)) {
+      throw new Error("Documentation progress stream result was not a JSON object.");
+    }
+    return event.result;
   }
   return finalResult;
 }

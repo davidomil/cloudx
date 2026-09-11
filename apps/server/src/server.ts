@@ -35,6 +35,7 @@ import { ConfigService } from "./configService.js";
 import { AsrClient } from "./asrClient.js";
 import { DEFAULT_DOCUMENTATION_URL, DocumentationClient } from "./documentation/DocumentationClient.js";
 import { DocumentationIngestQueue } from "./documentation/DocumentationIngestQueue.js";
+import { DocumentationBackgroundEnrichment } from "./documentation/DocumentationBackgroundEnrichment.js";
 import { CodexDocumentationEnrichmentRunner, DocumentationEnrichmentService } from "./documentation/DocumentationEnrichmentService.js";
 import { reapDocumentationUploadSpool, spoolDocumentationUpload, type DocumentationUploadSpool } from "./documentation/DocumentationUploadSpool.js";
 import { PathPolicy } from "./pathPolicy.js";
@@ -187,6 +188,12 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       asr: services.asr
     });
   }
+  const backgroundEnrichment = services.documentation && services.documentationEnrichment
+    ? new DocumentationBackgroundEnrichment(services.documentation, services.documentationEnrichment, (error) => {
+      app.log.error({ err: error }, "Documentation background enrichment failed.");
+    })
+    : undefined;
+  app.addHook("onListen", async () => { backgroundEnrichment?.start(); });
   services.hooks ??= buildHookRegistry(services);
   if (!services.triggers) {
     const automationRepository = new AutomationRepository(config.dataDir);
@@ -229,6 +236,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     }
     const requestOwnerShutdown = settleDisposers([
       () => services.documentationIngestQueue?.dispose(),
+      () => backgroundEnrichment?.dispose(),
       () => services.voice.dispose?.(),
       () => services.forgeConnections?.dispose()
     ]);
@@ -567,19 +575,8 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
             ...(acceptGeneratedCodeDocumentation !== undefined ? { acceptGeneratedCodeDocumentation } : {}),
             ...(retainRawCodeArtifacts !== undefined ? { retainRawCodeArtifacts } : {})
           }, { signal: job.signal });
-          job.update({ progress: 78, stage: "Running AI enrichment for the imported documentation." });
           job.signal.throwIfAborted();
-          const enriched = await (services.documentationEnrichment?.enrichIngestResponse(result, {
-            filename,
-            contentPath: upload!.path,
-            contentType,
-            sourceType,
-            ...(acceptGeneratedCodeDocumentation !== undefined ? { acceptGeneratedCodeDocumentation } : {}),
-            ...(retainRawCodeArtifacts !== undefined ? { retainRawCodeArtifacts } : {})
-          }, { signal: job.signal }) ?? result);
-          job.signal.throwIfAborted();
-          job.update({ progress: 92, stage: "Finalizing documentation import." });
-          return enriched;
+          return result;
         }
       }, admission);
     } finally {
