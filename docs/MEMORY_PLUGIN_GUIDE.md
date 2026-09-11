@@ -145,6 +145,22 @@ archive directory.
 
 The plugin supports four ingest paths.
 
+Each documentation panel submits up to two imports at once. The server
+runs up to two import jobs concurrently by default and starts waiting
+jobs as slots become available.
+
+Directory files and YouTube playlist entries use two workers. The
+indexer limits ingestion extraction to two sources at once and publishes
+archive changes under its write lock.
+
+PDF extraction remains serialized because PDFium cannot be called
+concurrently from multiple threads.
+
+Enrichment runs up to two different documents concurrently across
+foreground requests and background work. Evidence batches for one
+document remain sequential, and repeated enrichment of the same document
+waits for its active run.
+
 ## Browser Upload Ingest
 
 The Documentation panel defaults to upload mode. The browser sends file
@@ -757,7 +773,7 @@ flags, enrichment routing, assisted-answer routing, automatic plugin
 system-rule and system-skill contributions, direct Codex search-skill
 guidance, generic plugin contribution validation, and Codex overlay
 injection. The web panel tests cover upload ingest, visible text ingest,
-generated-code review acceptance, queued sequential imports, progress
+generated-code review acceptance, bounded concurrent imports, progress
 channels, assisted-answer mode, assisted-search loading state, sanitized
 HTML answer rendering, disabled-AI manual mode, source-viewer removal
 controls, progressive source auto-loading, full source viewing, and search

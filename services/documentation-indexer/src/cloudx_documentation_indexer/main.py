@@ -370,7 +370,8 @@ def create_app(root: str | Path | None = None) -> FastAPI:
         retain_raw_code_artifacts: Annotated[bool, Form(alias="retainRawCodeArtifacts")] = False,
     ) -> dict:
         content = await read_upload_bytes(file, configured_byte_limit("CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES", DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES))
-        document = handle_archive_error(
+        document = await run_in_threadpool(
+            handle_archive_error,
             lambda: archive.ingest_upload(
                 filename=file.filename or title or "uploaded-source",
                 content=content,

@@ -424,10 +424,12 @@ describe("DocumentationPlugin", () => {
     expect(queue.list().jobs).toEqual([]);
   });
 
-  it("serializes reprocessing with imports and enforces the same queue capacity", async () => {
+  it("runs reprocessing alongside imports within the shared queue capacity", async () => {
     const client = fakeClient();
     const extraction = deferred<Record<string, unknown>>();
+    const reanalysis = deferred<Record<string, unknown>>();
     vi.mocked(client.ingestText).mockReturnValueOnce(extraction.promise);
+    vi.mocked(client.reanalyzeDocument).mockReturnValueOnce(reanalysis.promise);
     const queue = new DocumentationIngestQueue({ maxJobs: 2, maxBytes: 1024 });
     const plugin = new DocumentationPlugin(client, new PathPolicy(["/tmp"]), queue);
     const importRun = plugin.hooks.find((hook) => hook.id === "documentation.ingest.text")!.execute({ text: "pending" }, { caller: { kind: "ui" } });
@@ -435,10 +437,11 @@ describe("DocumentationPlugin", () => {
     const reanalyzeRun = reanalyze.execute({ documentId: "doc" }, { caller: { kind: "ui" } });
     await flushPromises();
 
-    expect(client.getDocument).not.toHaveBeenCalled();
-    expect(queue.list().jobs[1]).toMatchObject({ kind: "reanalyze", status: "queued" });
+    await vi.waitFor(() => expect(client.reanalyzeDocument).toHaveBeenCalledOnce());
+    expect(queue.list().jobs.map((job) => job.status)).toEqual(["running", "running"]);
     expect(() => reanalyze.execute({ documentId: "doc" }, { caller: { kind: "ui" } })).toThrow("capacity is full");
     extraction.resolve({ documents: [] });
+    reanalysis.resolve({ documents: [{ documentId: "doc" }] });
     await Promise.all([importRun, reanalyzeRun]);
 
     expect(client.reanalyzeDocument).toHaveBeenCalledOnce();
