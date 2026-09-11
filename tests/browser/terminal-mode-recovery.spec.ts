@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   startTerminalBroker,
   stopTestProcess,
@@ -124,6 +125,45 @@ test.afterEach(async ({}, testInfo) => {
     contentType: "text/plain",
   });
   await fs.rm(root, { recursive: true, force: true });
+});
+
+test("waits for delayed workspace bootstrap before creating the fixture terminal", async ({
+  page,
+}) => {
+  const bootstrap = Promise.withResolvers<void>();
+  await page.route("**/api/workspace", async (route) => {
+    await bootstrap.promise;
+    await route.continue();
+  });
+  await page.routeWebSocket("**/ws/workspace", async (socket) => {
+    await bootstrap.promise;
+    socket.connectToServer();
+  });
+
+  const opening = openFixtureTerminal(page);
+  try {
+    await expect(
+      page.getByTitle("Workspace windows", { exact: true }),
+    ).toHaveText("Window");
+    await expect(page.getByTitle("Add tab to this pane")).toBeEnabled();
+    // Keep bootstrap pending while the rendered controls are already actionable.
+    await delay(1_000);
+    await expect(
+      page.getByRole("heading", { name: "New tab", exact: true }),
+    ).toHaveCount(0);
+
+    bootstrap.resolve();
+    await opening;
+    await recoverTerminal(page, "socket reconnect");
+    await page.keyboard.type("s");
+    await expect(page.locator(".xterm-rows > div").first()).toHaveText(
+      "HEADER",
+    );
+  } finally {
+    bootstrap.resolve();
+    await Promise.allSettled([opening]);
+    await page.unrouteAll({ behavior: "wait" });
+  }
 });
 
 test("preserves real xterm screen and input modes after replay truncation, reconnect, server restart, and reload", async ({
@@ -276,12 +316,18 @@ async function openFixtureTerminal(page: Page) {
     };
   });
   await page.goto(baseUrl);
+  await expect(
+    page.getByTitle("Workspace windows", { exact: true }),
+  ).toHaveText("Main");
   await page
     .locator(".workspace-pane.active")
     .getByTitle("Add tab to this pane")
     .click();
   await page.getByLabel("Plugin").selectOption("codex-terminal");
   await page.getByLabel("Title").fill("Terminal mode recovery");
+  await expect(
+    page.getByLabel("New tab directory", { exact: true }),
+  ).toHaveValue(path.join(root, "workspace"));
   const creation = page.waitForResponse(
     (response) =>
       response.request().method() === "POST" &&
@@ -289,6 +335,9 @@ async function openFixtureTerminal(page: Page) {
   );
   await page.getByRole("button", { name: "Create", exact: true }).click();
   const created = await creation;
+  expect(created.request().postDataJSON()).toMatchObject({
+    cwd: path.join(root, "workspace"),
+  });
   expect(created.status(), await created.text()).toBe(201);
   await expect(page.locator(".xterm-rows")).toContainText("READY");
   await page.locator(".xterm-helper-textarea").focus();
