@@ -2,7 +2,9 @@ import type { DocumentationIngestJob } from "./DocumentationPanel.js";
 
 export interface DocumentationIngestController {
   queue: DocumentationIngestJob[];
-  processing: boolean;
+  activeJobs: number;
+  summaryRequestId: number;
+  refreshDocumentList?: () => Promise<void>;
   disposed: boolean;
 }
 
@@ -13,7 +15,7 @@ export function documentationIngestController(stateKey: string): DocumentationIn
   if (existing) {
     return existing;
   }
-  const controller = { queue: [], processing: false, disposed: false };
+  const controller = { queue: [], activeJobs: 0, summaryRequestId: 0, disposed: false };
   documentationIngestControllers.set(stateKey, controller);
   return controller;
 }

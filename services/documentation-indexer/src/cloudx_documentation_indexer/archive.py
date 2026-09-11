@@ -114,6 +114,7 @@ WHISPER_CPP_CHUNK_SECONDS = 30 * 60
 WHISPER_CPP_CHUNK_OVERLAP_SECONDS = 5
 INDEX_GENERATIONS_DIRECTORY = "generations"
 ARCHIVE_STATE_ROW_ID = 1
+INGEST_CONCURRENCY = 2
 
 
 ProgressReporter = Callable[[dict[str, Any]], None]
@@ -280,6 +281,7 @@ class DocumentationArchive:
         self.index_projection_path = self.index_dir / "current"
         self.index_generations_dir = self.index_dir / INDEX_GENERATIONS_DIRECTORY
         self._write_lock = threading.RLock()
+        self._extraction_slots = threading.BoundedSemaphore(INGEST_CONCURRENCY)
         self.root.mkdir(parents=True, exist_ok=True)
         self.snapshots_dir.mkdir(parents=True, exist_ok=True)
         self.index_dir.mkdir(parents=True, exist_ok=True)
@@ -747,17 +749,31 @@ class DocumentationArchive:
                 raise ArchiveError(code_review_required_message(str(path), len(code_files)))
             documents = []
             document_source_type = None if (source_type or "").lower() == "repo_code" else source_type
-            for file_path in sorted(path.rglob("*")):
-                if file_path.is_file() and file_path.suffix.lower() in SUPPORTED_FILE_SUFFIXES and not is_supported_code_source_name(file_path.name):
-                    documents.extend(
-                        self.ingest_path(
-                            file_path,
-                            title=None,
-                            source_type=document_source_type,
-                            collection=detected_collection,
-                            tags=tags,
-                        )
+            document_paths = [
+                file_path for file_path in sorted(path.rglob("*"))
+                if file_path.is_file() and file_path.suffix.lower() in SUPPORTED_FILE_SUFFIXES and not is_supported_code_source_name(file_path.name)
+            ]
+            with ThreadPoolExecutor(max_workers=INGEST_CONCURRENCY) as executor:
+                futures = [
+                    executor.submit(
+                        self.ingest_path,
+                        file_path,
+                        title=None,
+                        source_type=document_source_type,
+                        collection=detected_collection,
+                        tags=tags,
                     )
+                    for file_path in document_paths
+                ]
+                try:
+                    for future in as_completed(futures):
+                        future.result()
+                except Exception:
+                    for future in futures:
+                        future.cancel()
+                    raise
+                for future in futures:
+                    documents.extend(future.result())
             if code_files:
                 documents.append(
                     self._ingest_generated_vendor_code_documentation(
@@ -798,21 +814,16 @@ class DocumentationArchive:
         inferred_type = source_type or infer_source_type(path.name, None)
         document_title = autodetect_title(title, path=path)
         document_collection = autodetect_collection(collection, path=path)
-        with self._write_lock:
-            snapshot_path = self._store_snapshot(source_bytes, path.name)
-            spans = extract_file(path, source_bytes, inferred_type, snapshot_path.parent / "extracted")
-            return [
-                self._write_document(
-                    title=document_title,
-                    source_type=inferred_type,
-                    uri=str(path),
-                    snapshot_path=snapshot_path,
-                    content_bytes=source_bytes,
-                    spans=spans,
-                    collection=document_collection,
-                    tags=tags,
-                )
-            ]
+        return [self._ingest_extracted_source(
+            title=document_title,
+            source_type=inferred_type,
+            uri=str(path),
+            filename=path.name,
+            content=source_bytes,
+            extract=lambda artifact_dir: extract_file(path, source_bytes, inferred_type, artifact_dir),
+            collection=document_collection,
+            tags=tags,
+        )]
 
     def ingest_url_documents(
         self,
@@ -887,29 +898,23 @@ class DocumentationArchive:
                 tags=tags,
                 retain_raw_code_artifacts=retain_raw_code_artifacts,
             )
-        with self._write_lock:
-            snapshot_path = self._store_snapshot(
-                source_bytes,
-                final_name,
-                metadata={
-                    "url": url,
-                    "finalUrl": str(response.url),
-                    "contentType": content_type,
-                    "etag": response.headers.get("etag"),
-                    "lastModified": response.headers.get("last-modified"),
-                },
-            )
-            spans = extract_bytes(source_bytes, url, inferred_type, content_type, snapshot_path.parent / "extracted")
-            return self._write_document(
-                title=autodetect_title(title, url=url),
-                source_type=inferred_type,
-                uri=url,
-                snapshot_path=snapshot_path,
-                content_bytes=source_bytes,
-                spans=spans,
-                collection=autodetect_collection(collection, url=url, source_type=inferred_type),
-                tags=tags,
-            )
+        return self._ingest_extracted_source(
+            title=autodetect_title(title, url=url),
+            source_type=inferred_type,
+            uri=url,
+            filename=final_name,
+            content=source_bytes,
+            extract=lambda artifact_dir: extract_bytes(source_bytes, url, inferred_type, content_type, artifact_dir),
+            metadata={
+                "url": url,
+                "finalUrl": str(response.url),
+                "contentType": content_type,
+                "etag": response.headers.get("etag"),
+                "lastModified": response.headers.get("last-modified"),
+            },
+            collection=autodetect_collection(collection, url=url, source_type=inferred_type),
+            tags=tags,
+        )
 
     def ingest_youtube_playlist(
         self,
@@ -925,28 +930,39 @@ class DocumentationArchive:
         playlist = extract_youtube_playlist(url)
         playlist_title = optional_text(title) or playlist.title
         playlist_collection = autodetect_collection(collection, playlist_title=playlist_title, url=url, source_type=source_type or "media")
-        documents: list[IngestedDocument] = []
-        try:
-            for index, entry in enumerate(playlist.entries, start=1):
-                report_progress(
-                    progress,
-                    stage=f"Ingesting playlist video {index} of {len(playlist.entries)}: {entry.title}",
-                    progress=10 + int(((index - 1) / max(1, len(playlist.entries))) * 80),
-                    metrics={"playlistIndex": index, "playlistTotal": len(playlist.entries)},
-                )
-                documents.append(
-                    self.ingest_youtube_video(
-                        entry.url,
-                        title=entry.title,
-                        collection=playlist_collection,
-                        tags=tags,
-                        progress=progress,
+        def ingest_entry(entry: YouTubePlaylistEntry) -> IngestedDocument:
+            return self.ingest_youtube_video(
+                entry.url,
+                title=entry.title,
+                collection=playlist_collection,
+                tags=tags,
+                progress=progress,
+            )
+
+        futures = []
+        failure = None
+        with ThreadPoolExecutor(max_workers=INGEST_CONCURRENCY) as executor:
+            try:
+                for entry in playlist.entries:
+                    futures.append(executor.submit(ingest_entry, entry))
+                for completed, future in enumerate(as_completed(futures), start=1):
+                    future.result()
+                    report_progress(
+                        progress,
+                        stage=f"Processed playlist video {completed} of {len(playlist.entries)}.",
+                        progress=10 + int(completed / len(playlist.entries) * 80),
+                        metrics={"playlistIndex": completed, "playlistTotal": len(playlist.entries)},
                     )
-                )
-        except Exception:
+            except Exception as error:
+                failure = error
+                for pending in futures:
+                    pending.cancel()
+        finished = [future for future in futures if not future.cancelled()]
+        documents = [future.result() for future in finished if future.exception() is None]
+        if failure is not None:
             for document in documents:
                 self.invalidate_document(document.document_id, state="deleted", reason="Rolled back incomplete YouTube playlist ingest.")
-            raise
+            raise failure
         return documents
 
     def ingest_youtube_video(
@@ -962,7 +978,8 @@ class DocumentationArchive:
         metadata = extract_youtube_video_metadata(url)
         with tempfile.TemporaryDirectory(prefix="cloudx-youtube-evidence-") as temp_dir_name:
             temp_artifact_dir = Path(temp_dir_name) / "extracted"
-            transcript_segments, keyframes = extract_youtube_video_evidence(url, metadata, temp_artifact_dir, progress=progress)
+            with self._extraction_slots:
+                transcript_segments, keyframes = extract_youtube_video_evidence(url, metadata, temp_artifact_dir, progress=progress)
             transcript = transcript_segments_text(transcript_segments)
             document_title = autodetect_title(title or metadata.title, url=url, text=transcript)
             source_text = youtube_source_text(metadata, transcript)
@@ -1033,27 +1050,86 @@ class DocumentationArchive:
                 tags=tags,
                 retain_raw_code_artifacts=retain_raw_code_artifacts,
             )
-        with self._write_lock:
-            snapshot_path = self._store_snapshot(
-                content,
-                safe_name,
-                metadata={
-                    "filename": filename,
-                    "contentType": content_type,
-                    "upload": True,
-                },
-            )
-            spans = extract_bytes(content, safe_name, inferred_type, content_type, snapshot_path.parent / "extracted")
-            return self._write_document(
-                title=document_title,
-                source_type=inferred_type,
-                uri=f"upload://{safe_name}",
-                snapshot_path=snapshot_path,
-                content_bytes=content,
-                spans=spans,
-                collection=document_collection,
-                tags=tags,
-            )
+        return self._ingest_extracted_source(
+            title=document_title,
+            source_type=inferred_type,
+            uri=f"upload://{safe_name}",
+            filename=safe_name,
+            content=content,
+            extract=lambda artifact_dir: extract_bytes(content, safe_name, inferred_type, content_type, artifact_dir),
+            metadata={"filename": filename, "contentType": content_type, "upload": True},
+            collection=document_collection,
+            tags=tags,
+        )
+
+    def _ingest_extracted_source(
+        self,
+        *,
+        title: str,
+        source_type: str,
+        uri: str,
+        filename: str,
+        content: bytes,
+        extract: Callable[[Path], list[ExtractedSpan]],
+        collection: str | None,
+        tags: list[str] | None,
+        metadata: dict | None = None,
+    ) -> IngestedDocument:
+        with tempfile.TemporaryDirectory(prefix="cloudx-source-extraction-") as temp_dir:
+            artifacts = Path(temp_dir) / "extracted"
+            with self._extraction_slots:
+                spans = extract(artifacts)
+            if not chunk_spans(spans):
+                raise ArchiveError("No extractable text was found.")
+            with self._write_lock:
+                with tempfile.TemporaryDirectory(prefix="ingest-publication-", dir=self.snapshots_dir) as publication_dir:
+                    prepared = Path(publication_dir) / "extracted"
+                    previous_artifacts = Path(publication_dir) / "previous"
+                    if artifacts.exists():
+                        shutil.copytree(artifacts, prepared)
+                    snapshot_dir = self.snapshots_dir / sha256_bytes(content)
+                    metadata_path = snapshot_dir / "metadata.json"
+                    previous_metadata = metadata_path.read_bytes() if metadata_path.exists() else None
+                    artifact_dir = snapshot_dir / "extracted"
+                    artifacts_published = False
+                    catalog_committed = False
+
+                    def mark_catalog_committed() -> None:
+                        nonlocal catalog_committed
+                        catalog_committed = True
+
+                    try:
+                        snapshot_path = self._store_snapshot(content, filename, metadata)
+                        if prepared.exists():
+                            if artifact_dir.exists():
+                                artifact_dir.rename(previous_artifacts)
+                            prepared.rename(artifact_dir)
+                            artifacts_published = True
+                        return self._write_document(
+                            title=title,
+                            source_type=source_type,
+                            uri=uri,
+                            snapshot_path=snapshot_path,
+                            content_bytes=content,
+                            spans=spans,
+                            collection=collection,
+                            tags=tags,
+                            on_commit=mark_catalog_committed,
+                        )
+                    except Exception:
+                        if catalog_committed:
+                            raise
+                        if artifacts_published and artifact_dir.exists():
+                            shutil.rmtree(artifact_dir)
+                        if previous_artifacts.exists():
+                            snapshot_dir.mkdir(exist_ok=True)
+                            previous_artifacts.rename(artifact_dir)
+                        if previous_metadata is not None:
+                            snapshot_dir.mkdir(exist_ok=True)
+                            metadata_path.write_bytes(previous_metadata)
+                        else:
+                            metadata_path.unlink(missing_ok=True)
+                        raise
 
     def ingest_text(
         self,
@@ -1326,27 +1402,28 @@ class DocumentationArchive:
                 replacement_snapshot.write_bytes(source_bytes)
                 if has_metadata:
                     shutil.copy2(metadata_path, staging_dir / "metadata.json")
-                if retains_plain_text:
-                    spans = [ExtractedSpan(decode_text(source_bytes), "text")]
-                elif retains_html:
-                    spans = [ExtractedSpan(extract_html(source_bytes), "html")]
-                elif "image" in source_locators:
-                    spans = ImageExtractionPipeline(staging_dir / "extracted").extract(source_bytes, snapshot_path.name)
-                elif source_locators and all(locator.startswith("sheet ") for locator in source_locators):
-                    workbook_content_type = None
-                    if zipfile.is_zipfile(io.BytesIO(source_bytes)):
-                        with zipfile.ZipFile(io.BytesIO(source_bytes)) as workbook:
-                            if "xl/workbook.xml" in workbook.namelist():
-                                workbook_content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    spans = SpreadsheetExtractionPipeline(staging_dir / "extracted").extract(source_bytes, snapshot_path.name, workbook_content_type)
-                else:
-                    spans = extract_bytes(
-                        source_bytes,
-                        snapshot_path.name,
-                        document["source_type"],
-                        content_type or mimetypes.guess_type(snapshot_path.name)[0],
-                        staging_dir / "extracted",
-                    )
+                with self._extraction_slots:
+                    if retains_plain_text:
+                        spans = [ExtractedSpan(decode_text(source_bytes), "text")]
+                    elif retains_html:
+                        spans = [ExtractedSpan(extract_html(source_bytes), "html")]
+                    elif "image" in source_locators:
+                        spans = ImageExtractionPipeline(staging_dir / "extracted").extract(source_bytes, snapshot_path.name)
+                    elif source_locators and all(locator.startswith("sheet ") for locator in source_locators):
+                        workbook_content_type = None
+                        if zipfile.is_zipfile(io.BytesIO(source_bytes)):
+                            with zipfile.ZipFile(io.BytesIO(source_bytes)) as workbook:
+                                if "xl/workbook.xml" in workbook.namelist():
+                                    workbook_content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        spans = SpreadsheetExtractionPipeline(staging_dir / "extracted").extract(source_bytes, snapshot_path.name, workbook_content_type)
+                    else:
+                        spans = extract_bytes(
+                            source_bytes,
+                            snapshot_path.name,
+                            document["source_type"],
+                            content_type or mimetypes.guess_type(snapshot_path.name)[0],
+                            staging_dir / "extracted",
+                        )
                 chunks = chunk_spans(spans)
                 if not chunks:
                     raise ArchiveError("No extractable text was found during reanalysis.")
@@ -1385,6 +1462,7 @@ class DocumentationArchive:
         progress: ProgressReporter | None = None,
         append_chunks_only: bool = False,
         imported_generation: IndexGeneration | None = None,
+        on_commit: Callable[[], None] | None = None,
     ) -> tuple[Any, IndexGeneration]:
         with self._write_lock:
             previous_generation_id = self._active_index_generation()
@@ -1413,6 +1491,8 @@ class DocumentationArchive:
             finally:
                 db.close()
             assert generation is not None
+            if on_commit is not None:
+                on_commit()
             if project:
                 self._reconcile_index_projection(generation, strict=False)
             return result, generation
@@ -1658,6 +1738,7 @@ class DocumentationArchive:
         spans: list[ExtractedSpan],
         collection: str | None,
         tags: list[str] | None,
+        on_commit: Callable[[], None] | None = None,
     ) -> IngestedDocument:
         chunks = chunk_spans(spans)
         if not chunks:
@@ -1737,7 +1818,7 @@ class DocumentationArchive:
                 )
 
         try:
-            self._publish_catalog_change(write_document)
+            self._publish_catalog_change(write_document, on_commit=on_commit)
         except Exception:
             self._discard_unreferenced_snapshot(snapshot_path)
             raise
@@ -1857,10 +1938,12 @@ class DocumentationArchive:
         return results
 
     def _store_snapshot(self, content: bytes, filename: str, metadata: dict | None = None) -> Path:
+        safe_name = safe_file_name(filename)
+        if safe_name == "extracted":
+            raise ArchiveError("Source filename is reserved for archive artifacts: extracted.")
         digest = sha256_bytes(content)
         directory = self.snapshots_dir / digest
         directory.mkdir(parents=True, exist_ok=True)
-        safe_name = safe_file_name(filename)
         artifact = directory / safe_name
         if not artifact.exists():
             artifact.write_bytes(content)

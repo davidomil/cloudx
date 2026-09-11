@@ -9,6 +9,7 @@ import mimetypes
 import re
 import shutil
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from .vendor_code import CODE_SOURCE_SUFFIXES
 
 
 PDF_SUFFIXES = {".pdf"}
+PDFIUM_LOCK = threading.Lock()
 HTML_SUFFIXES = {".html", ".htm"}
 IMAGE_SUFFIXES = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 SPREADSHEET_SUFFIXES = {".xls", ".xlsx", ".xlsm", ".xlsb", ".ods", ".ots"}
@@ -129,7 +131,9 @@ class PdfExtractionPipeline:
             temp_file.write(content)
             temp_path = Path(temp_file.name)
         try:
-            return self._extract_from_path(temp_path, name)
+            # PDFium disallows concurrent calls even for different documents.
+            with PDFIUM_LOCK:
+                return self._extract_from_path(temp_path, name)
         finally:
             temp_path.unlink(missing_ok=True)
 

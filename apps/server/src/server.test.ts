@@ -2638,7 +2638,7 @@ describe("buildServer", () => {
         templates: [],
       } as never),
     });
-    const pending = vi.spyOn(services.documentation!, "nextPendingEnrichment").mockResolvedValue({ documentId: "closing-document", title: "Pending guide", extractionRevision: "e".repeat(32) });
+    const pending = vi.spyOn(services.documentation!, "pendingEnrichments").mockResolvedValue([{ documentId: "closing-document", title: "Pending guide", extractionRevision: "e".repeat(32) }]);
     const outcome = vi.spyOn(services.documentation!, "recordEnrichmentOutcome");
     const app = await buildServer(config, services);
     onTestFinished(async () => {
@@ -2903,6 +2903,43 @@ describe("buildServer", () => {
         }),
       ]);
     } finally {
+      await app.close();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("forwards two browser uploads concurrently and starts the next when either finishes", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-parallel-upload-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    const uploads = new Map(["first.md", "second.md", "third.md"].map((filename) => [filename, deferred<Record<string, unknown>>() ]));
+    const ingest = vi.spyOn(services.documentation!, "ingestUploadFile").mockImplementation((input) => uploads.get(input.filename)!.promise);
+    const app = await buildServer(config, services);
+    const requests: Array<Promise<unknown>> = [];
+    try {
+      for (const filename of uploads.keys()) {
+        requests.push(app.inject({
+          method: "POST",
+          url: `/api/documentation/upload?filename=${filename}`,
+          headers: { "content-type": "application/octet-stream" },
+          payload: Buffer.from(`Source for ${filename}.`)
+        }).then((response) => expect(response.statusCode).toBe(200)));
+        await vi.waitFor(() => expect(services.documentationIngestQueue!.list().jobs).toHaveLength(requests.length));
+      }
+      await vi.waitFor(() => expect(ingest).toHaveBeenCalledTimes(2));
+      expect(services.documentationIngestQueue!.list().jobs.map((job) => job.status)).toEqual(["running", "running", "queued"]);
+      expect(ingest.mock.calls.map(([input]) => input.filename)).toEqual(["first.md", "second.md"]);
+
+      uploads.get("second.md")!.resolve({ document: { documentId: "second" } });
+      await vi.waitFor(() => expect(ingest).toHaveBeenCalledTimes(3));
+      expect(services.documentationIngestQueue!.list().jobs.map((job) => job.status)).toEqual(["running", "complete", "running"]);
+      uploads.get("third.md")!.resolve({ document: { documentId: "third" } });
+      uploads.get("first.md")!.resolve({ document: { documentId: "first" } });
+      await Promise.all(requests);
+      expect(services.documentationIngestQueue!.list().capacity).toMatchObject({ admittedJobs: 0, admittedBytes: 0 });
+    } finally {
+      for (const upload of uploads.values()) upload.resolve({});
+      await Promise.allSettled(requests);
       await app.close();
       await fs.rm(root, { recursive: true, force: true });
     }
