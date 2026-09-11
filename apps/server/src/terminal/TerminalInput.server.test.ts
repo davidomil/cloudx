@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 
 import { loadConfig } from "../config.js";
@@ -13,10 +13,24 @@ import type { TerminalExit } from "./TerminalSupervisor.js";
 import { terminalInputMessages } from "@cloudx/shared";
 
 describe("large terminal input through public transports", () => {
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async () => Response.json({ documents: [] })));
+  });
+
+  afterEach(() => {
+    const requests = vi.mocked(fetch).mock.calls;
+    vi.unstubAllGlobals();
+    for (const [url, options] of requests) {
+      expect(String(url)).toBe("http://127.0.0.1:9/enrichment/pending?limit=1");
+      expect(options?.method).toBe("GET");
+    }
+  });
+
   it.each(["action", "websocket"] as const)("preserves ASCII and Unicode input at and above the IPC limit through %s", async (transport) => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-input-"));
     const config = loadConfig({
       CLOUDX_DATA_DIR: path.join(root, ".cloudx"), CLOUDX_ALLOWED_ROOTS: root,
+      CLOUDX_DOCUMENTATION_URL: "http://127.0.0.1:9",
       CLOUDX_TRUSTED_ORIGINS: "http://localhost", CLOUDX_LOG_LEVEL: "silent"
     });
     const terminal = new RecordingTerminal();
@@ -36,6 +50,7 @@ describe("large terminal input through public transports", () => {
       const { tab } = created.json<{ tab: { id: string } }>();
       if (transport === "websocket") {
         const address = await app.listen({ host: "127.0.0.1", port: 0 });
+        await vi.waitFor(() => expect(fetch).toHaveBeenCalled());
         socket = new WebSocket(`${address.replace("http:", "ws:")}/ws/terminal/${tab.id}`, { origin: "http://localhost", headers: { host: "localhost" } });
         await new Promise<void>((resolve, reject) => { socket!.once("open", resolve); socket!.once("error", reject); });
       }

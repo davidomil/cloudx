@@ -3,7 +3,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import type { FastifyInstance } from "fastify";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 
 import type { CreateTabResponse, WorkspaceStateResponse } from "@cloudx/shared";
@@ -16,10 +16,24 @@ import { NodePtyTerminalProcessFactory } from "./terminal/NodePtyTerminalProcess
 import type { TerminalProducer } from "./terminal/TerminalProcess.js";
 
 describe("workspace recovery across server updates", () => {
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async () => Response.json({ documents: [] })));
+  });
+
+  afterEach(() => {
+    const requests = vi.mocked(fetch).mock.calls;
+    vi.unstubAllGlobals();
+    for (const [url, options] of requests) {
+      expect(String(url)).toBe("http://127.0.0.1:9/enrichment/pending?limit=1");
+      expect(options?.method).toBe("GET");
+    }
+  });
+
   it.skipIf(process.platform !== "linux")("reattaches the same shell through the terminal websocket after the web server restarts", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-server-recovery-"));
     const config = loadConfig({
       CLOUDX_DATA_DIR: path.join(root, ".cloudx"),
+      CLOUDX_DOCUMENTATION_URL: "http://127.0.0.1:9",
       CLOUDX_ALLOWED_ROOTS: root,
       CLOUDX_TRUSTED_ORIGINS: "http://localhost",
       CLOUDX_LOG_LEVEL: "silent"
@@ -98,6 +112,7 @@ describe("workspace recovery across server updates", () => {
     const replayBytes = 32 * 1024 * 1024;
     const config = loadConfig({
       CLOUDX_DATA_DIR: path.join(root, ".cloudx"),
+      CLOUDX_DOCUMENTATION_URL: "http://127.0.0.1:9",
       CLOUDX_ALLOWED_ROOTS: root,
       CLOUDX_TRUSTED_ORIGINS: "http://localhost",
       CLOUDX_LOG_LEVEL: "silent",
@@ -185,6 +200,7 @@ describe("workspace recovery across server updates", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-failed-deletion-"));
     const config = loadConfig({
       CLOUDX_DATA_DIR: path.join(root, ".cloudx"),
+      CLOUDX_DOCUMENTATION_URL: "http://127.0.0.1:9",
       CLOUDX_ALLOWED_ROOTS: root,
       CLOUDX_TRUSTED_ORIGINS: "http://localhost",
       CLOUDX_LOG_LEVEL: "silent"
@@ -281,6 +297,7 @@ describe("workspace recovery across server updates", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-server-recovery-"));
     const config = loadConfig({
       CLOUDX_DATA_DIR: path.join(root, ".cloudx"),
+      CLOUDX_DOCUMENTATION_URL: "http://127.0.0.1:9",
       CLOUDX_ALLOWED_ROOTS: root,
       CLOUDX_TRUSTED_ORIGINS: "http://localhost",
       CLOUDX_LOG_LEVEL: "silent"
@@ -339,6 +356,7 @@ describe("workspace recovery across server updates", () => {
       expect(restoredServices.sessions.getSession(first.tab.id).snapshot().state).toMatchObject({ url: "http://localhost:4000/" });
 
       await restored.listen({ host: "127.0.0.1", port: 0 });
+      await vi.waitFor(() => expect(fetch).toHaveBeenCalled());
       const address = restored.server.address() as { port: number };
       client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/workspace`, { headers: { host: "localhost" } });
       const firstSnapshot = await new Promise<WorkspaceStateResponse & { type: string }>((resolve, reject) => {
@@ -364,7 +382,9 @@ describe("workspace recovery across server updates", () => {
 });
 
 async function connectTerminal(app: FastifyInstance, tabId: string, sockets: WebSocket[]) {
+  const previousRequests = vi.mocked(fetch).mock.calls.length;
   await app.listen({ host: "127.0.0.1", port: 0 });
+  await vi.waitFor(() => expect(vi.mocked(fetch).mock.calls.length).toBeGreaterThan(previousRequests));
   const address = app.server.address() as { port: number };
   const socket = new WebSocket(`ws://127.0.0.1:${address.port}/ws/terminal/${tabId}`, { headers: { host: "localhost" } });
   sockets.push(socket);
