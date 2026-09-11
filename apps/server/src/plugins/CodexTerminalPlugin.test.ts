@@ -4,12 +4,14 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { parse, stringify } from "smol-toml";
+import { Terminal } from "@xterm/headless";
 
 import { CODEX_REASONING_EFFORTS, type TabIndicatorUpdate, type WorkspaceTab } from "@cloudx/shared";
 import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
 
 import { CLOUDX_CODEX_DEFAULT_ARGS, CODEX_CLOSE_ON_EXIT_GRACE_MS, CODEX_TERMINAL_ACTIONS, CodexTerminalPlugin, CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES, TERMINAL_ACTIONS, TerminalShellIntegrationParser, buildCodexLaunchArgs, codexResumeInput, materializeCodexTemplate } from "./CodexTerminalPlugin.js";
 import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
+import type { TerminalScreenSnapshot } from "../terminal/TerminalScreen.js";
 import { CodexStateSources } from "./CodexStateSources.js";
 
 class FakeTerminalProcess implements TerminalProcess {
@@ -1459,6 +1461,47 @@ async function seedExternalSkill(skillsRoot: string, id: string): Promise<string
 }
 
 describe("Codex terminal update recovery", () => {
+  it.each([12, 32 * 1024 * 1024])("restores the authoritative screen separately from %i bytes of retained Unicode history", async (replayBytes) => {
+    const terminal = new FakeTerminalProcess();
+    const beforeSubscription = " BEFORE \x1b[31";
+    const history = "😀".repeat((replayBytes - Buffer.byteLength(beforeSubscription)) / 4) + beforeSubscription;
+    const subscribe = terminal.onData.bind(terminal);
+    vi.spyOn(terminal, "onData").mockImplementationOnce((listener) => {
+      const unsubscribe = subscribe(listener);
+      listener(history);
+      return unsubscribe;
+    });
+    Object.assign(terminal, {
+      onScreen: (listener: (screen: TerminalScreenSnapshot) => void) => {
+        listener({ data: `\x1b[?1049h\x1b[?1h\x1b[?2004hSNAPSHOT${beforeSubscription}`, cols: 80, rows: 24 });
+        return () => {};
+      }
+    });
+    const restored = new Terminal({ cols: 80, rows: 24, allowProposedApi: true });
+    let session: CodexTerminalSession | undefined;
+    try {
+      session = new CodexTerminalSession(tab, terminal, undefined, { closeOnExit: false, replayBytes });
+      expect(session.snapshot().recentOutput).toBe(history);
+      terminal.emitData("mRED");
+      const live = vi.fn();
+      const attachment = await session.attachTerminal(live);
+      expect(attachment.screen).toMatchObject({ cols: 80, rows: 24 });
+      await new Promise<void>((resolve) => restored.write(attachment.screen.data, resolve));
+      expect(restored.buffer.active.type).toBe("alternate");
+      expect(restored.buffer.active.getLine(0)?.translateToString(true)).toBe("SNAPSHOT BEFORE RED");
+      expect(restored.buffer.active.getLine(0)?.getCell(16)?.getFgColor()).toBe(1);
+      expect(restored.modes).toMatchObject({ applicationCursorKeysMode: true, bracketedPasteMode: true });
+      expect(session.snapshot().recentOutput).toBe(Buffer.from(history + "mRED").subarray(-replayBytes).toString());
+      terminal.emitData(" AFTER");
+      await vi.waitFor(() => expect(live).toHaveBeenCalledExactlyOnceWith(" AFTER"));
+      expect(session.snapshot().status).toBe("running");
+      attachment.dispose();
+    } finally {
+      await session?.terminate();
+      restored.dispose();
+    }
+  });
+
   it("reattaches the exact tab without preparing a conversation or submitting the initial prompt again", async () => {
     const terminal = new FakeTerminalProcess();
     const detach = vi.fn();

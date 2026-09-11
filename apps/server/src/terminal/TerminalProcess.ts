@@ -9,6 +9,7 @@ export interface TerminalProcess {
   terminate(): Promise<void>;
   detach?(): void;
   onDisconnect?(listener: (error: Error) => void): () => void;
+  /** Synchronously supplies the initial screen, including all output delivered before this subscription. */
   onScreen?(listener: (screen: TerminalScreenSnapshot) => void): () => void;
 }
 

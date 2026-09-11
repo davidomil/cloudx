@@ -93,6 +93,94 @@ describe("workspace recovery across server updates", () => {
     }
   }, 15_000);
 
+  it.skipIf(process.platform !== "linux")("restores a full 32 MiB replay as context with a usable screen and confirmed shell deletion", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-full-replay-"));
+    const replayBytes = 32 * 1024 * 1024;
+    const config = loadConfig({
+      CLOUDX_DATA_DIR: path.join(root, ".cloudx"),
+      CLOUDX_ALLOWED_ROOTS: root,
+      CLOUDX_TRUSTED_ORIGINS: "http://localhost",
+      CLOUDX_LOG_LEVEL: "silent",
+      CLOUDX_TERMINAL_REPLAY_BYTES: String(replayBytes)
+    });
+    const shell = path.join(root, "test-shell");
+    await fs.writeFile(shell, "#!/bin/sh\nexec /bin/bash --noprofile --norc\n", { mode: 0o700 });
+    vi.stubEnv("SHELL", shell);
+    const directFactory = new NodePtyTerminalProcessFactory();
+    let nativeOutput = "";
+    const socketPath = terminalSocketPath(config.dataDir);
+    const broker = new TerminalBroker(socketPath, {
+      async spawn(...args: Parameters<NodePtyTerminalProcessFactory["spawn"]>) {
+        const terminal = await directFactory.spawn(...args);
+        terminal.onData(data => { nativeOutput = (nativeOutput + data).slice(-4096); });
+        return terminal;
+      }
+    }, replayBytes);
+    await broker.start();
+    let original: FastifyInstance | undefined;
+    let restored: FastifyInstance | undefined;
+    const sockets: WebSocket[] = [];
+    try {
+      const originalServices = buildServices(config);
+      original = await buildServer(config, originalServices);
+      const window = originalServices.workspace!.getActiveWindow();
+      const created = await original.inject({
+        method: "POST", url: "/api/tabs", headers: { host: "localhost" },
+        payload: { pluginId: "standard-terminal", cwd: root, windowId: window.id, paneId: window.layout.activePaneId }
+      });
+      expect(created.statusCode, created.body).toBe(201);
+      const { tab } = created.json<CreateTabResponse>();
+      const terminal = await connectTerminal(original, tab.id, sockets);
+      terminal.write("stty -echo; PS1=''; printf '\\nSHELL_PID=%s\\n' \"$$\"\n");
+      await vi.waitFor(() => expect(terminal.output).toMatch(/SHELL_PID=\d+/u));
+      const pid = Number(/SHELL_PID=(\d+)/u.exec(terminal.output)![1]);
+      terminal.write("while [ ! -e server-stopped ]; do sleep 0.02; done; python3 -c \"import os; [os.write(1, b'\\r' * 65536) for _ in range(512)]\"; printf '\\nHISTORY_ONLY_MARKER\\033[2J\\033[3J\\033[HREPLAY_SCREEN_READY=%s\\n' \"$$\"\n");
+      await original.close();
+      await fs.writeFile(path.join(root, "server-stopped"), "stopped");
+      await vi.waitFor(() => expect(nativeOutput).toContain(`REPLAY_SCREEN_READY=${pid}`), { timeout: 100_000 });
+
+      const restoredServices = buildServices(config);
+      restored = await buildServer(config, restoredServices);
+      const workspace = (await restored.inject({ url: "/api/workspace", headers: { host: "localhost" } })).json<WorkspaceStateResponse>();
+      expect(workspace.tabs).toMatchObject([{ id: tab.id, status: "running" }]);
+      const session = restoredServices.sessions.getSession(tab.id);
+      const history = session.snapshot().recentOutput!;
+      expect(Buffer.byteLength(history)).toBe(replayBytes);
+      expect(history).toContain("HISTORY_ONLY_MARKER");
+      expect((await session.voiceContext!()).recentOutput).toContain("HISTORY_ONLY_MARKER");
+
+      const reconnected = await connectTerminal(restored, tab.id, sockets);
+      await vi.waitFor(() => expect(reconnected.output).toContain(`REPLAY_SCREEN_READY=${pid}`));
+      expect(reconnected.output).not.toContain("HISTORY_ONLY_MARKER");
+      reconnected.write("printf '\\nRESTORED_PID=%s\\n' \"$$\"\n");
+      await vi.waitFor(() => expect(reconnected.output).toContain(`RESTORED_PID=${pid}`));
+
+      const removedRecoveryRecord = vi.fn();
+      const save = SessionStateStore.prototype.save;
+      vi.spyOn(SessionStateStore.prototype, "save").mockImplementation(function (this: SessionStateStore, state) {
+        if (!state.sessions.some(saved => saved.tab.id === tab.id)) {
+          expect(() => process.kill(pid, 0)).toThrow();
+          removedRecoveryRecord();
+        }
+        return save.call(this, state);
+      });
+      const closed = await restored.inject({ method: "DELETE", url: `/api/tabs/${tab.id}`, headers: { host: "localhost" } });
+      expect(closed.statusCode, closed.body).toBe(200);
+      expect(removedRecoveryRecord).toHaveBeenCalled();
+      expect(() => process.kill(pid, 0)).toThrow();
+      expect((await new SessionStateStore(config.dataDir).read())?.sessions).toEqual([]);
+    } finally {
+      vi.restoreAllMocks();
+      for (const socket of sockets) socket.close();
+      await restored?.close();
+      await original?.close();
+      await broker.stop();
+      vi.unstubAllEnvs();
+      await fs.rm(path.dirname(socketPath), { recursive: true, force: true });
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }, 120_000);
+
   it.skipIf(process.platform !== "linux").each(["disconnected", "rejected", "unavailable during restoration"] as const)("retains running shell recovery when deletion is %s", async failure => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-failed-deletion-"));
     const config = loadConfig({

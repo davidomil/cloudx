@@ -627,8 +627,9 @@ export class CodexTerminalSession implements PluginSession {
       && "resumeOutput" in terminalProcess && typeof terminalProcess.resumeOutput === "function") {
       this.producer = terminalProcess as TerminalProducer;
     }
+    let screenRestored = !this.terminalProcess.onScreen;
     this.terminalSubscriptions.push(this.terminalProcess.onData((data) => {
-      this.writeScreen(data);
+      if (screenRestored) this.writeScreen(data);
       this.lastOutputAt = Date.now();
       this.recentOutput = trimRecentOutput(`${this.recentOutput}${data}`, this.replayBytes);
       let sawCommandFinish = false;
@@ -643,7 +644,10 @@ export class CodexTerminalSession implements PluginSession {
         this.scheduleReadyAfterQuietOutput();
       }
     }));
-    const screenSubscription = this.terminalProcess.onScreen?.((screen) => { this.screen.restore(screen); });
+    const screenSubscription = this.terminalProcess.onScreen?.((screen) => {
+      this.screen.restore(screen);
+      screenRestored = true;
+    });
     if (screenSubscription) this.terminalSubscriptions.push(screenSubscription);
     this.terminalSubscriptions.push(this.terminalProcess.onExit((event) => {
       this.terminalClosed = true;
