@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Annotated
 from typing import Any
 from typing import Callable
+from typing import Literal
 from typing import Sequence
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
@@ -87,6 +88,13 @@ class EnrichDocumentRequest(BaseModel):
     skill_ids: list[str] = Field(default_factory=list, alias="skillIds")
     summary: str = ""
     payload: dict = Field(default_factory=dict)
+    extraction_revision: str | None = Field(default=None, alias="extractionRevision", pattern=r"^[0-9a-f]{32}$", min_length=32, max_length=32)
+
+
+class EnrichmentOutcomeRequest(BaseModel):
+    extraction_revision: str = Field(alias="extractionRevision", pattern=r"^[0-9a-f]{32}$", min_length=32, max_length=32)
+    status: Literal["failed", "skipped"]
+    error: str = Field(min_length=1, max_length=4000)
 
 
 class ImportArchiveReplacePathRequest(BaseModel):
@@ -202,6 +210,10 @@ def create_app(root: str | Path | None = None) -> FastAPI:
     async def import_archive_merge_upload(request: Request, file: Annotated[UploadFile, File()]):
         return await import_upload(request, file, lambda path, progress: archive.import_archive_merge(path, progress=progress))
 
+    @app.get("/enrichment/pending")
+    def pending_enrichment(limit: Annotated[int, Query(ge=1, le=100)] = 1) -> dict:
+        return {"documents": handle_archive_error(lambda: archive.pending_enrichment(limit=limit))}
+
     @app.get("/documents")
     def documents(
         states: str = ACTIVE_STATE,
@@ -272,6 +284,17 @@ def create_app(root: str | Path | None = None) -> FastAPI:
                     skill_ids=request.skill_ids,
                     summary=request.summary,
                     payload=request.payload,
+                    extraction_revision=request.extraction_revision,
+                )
+            )
+        }
+
+    @app.post("/documents/{document_id}/enrichment-outcome")
+    def enrichment_outcome(document_id: str, request: EnrichmentOutcomeRequest) -> dict:
+        return {
+            "backgroundEnrichment": handle_archive_error(
+                lambda: archive.record_enrichment_outcome(
+                    document_id, extraction_revision=request.extraction_revision, status=request.status, error=request.error,
                 )
             )
         }
