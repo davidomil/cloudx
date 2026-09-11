@@ -4,6 +4,7 @@ export interface DocumentationIngestController {
   queue: DocumentationIngestJob[];
   activeJobs: number;
   summaryRequestId: number;
+  refreshDocumentList?: () => Promise<void>;
   disposed: boolean;
 }
 

@@ -1155,6 +1155,210 @@ describe("DocumentationPanel", () => {
     await unmount(root);
   });
 
+  it.each(["after refresh", "during refresh", "during failed refresh"])("refreshes both documents when a concurrent import finishes %s", async (completion) => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const firstImport = deferred<Record<string, unknown>>();
+    const secondImport = deferred<Record<string, unknown>>();
+    const firstRefresh = deferred<Record<string, unknown>>();
+    const imports = [firstImport, secondImport];
+    const documents = [
+      { documentId: "doc-a", title: "Document A", state: "active" },
+      { documentId: "doc-b", title: "Document B", state: "active" }
+    ];
+    let ingestCalls = 0;
+    let listCalls = 0;
+    let importedCount = 0;
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string) => {
+      if (hookId === "documentation.summary") {
+        return hookResult<T>({ activeDocumentCount: importedCount, activeChunkCount: importedCount });
+      }
+      if (hookId === "documentation.documents.list") {
+        listCalls += 1;
+        if (listCalls === 2) return firstRefresh.promise as Promise<T>;
+        return hookResult<T>({ documents: documents.slice(0, importedCount) });
+      }
+      if (hookId === "documentation.ingest.text") {
+        const result = await imports[ingestCalls++]!.promise;
+        importedCount += 1;
+        return result as T;
+      }
+      return {} as T;
+    };
+    await act(async () => root.render(createElement(DocumentationPanel, { callHook })));
+    await click(buttonByLabel(container, "Show active documents"));
+    await click(buttonByText(container, "text"));
+    await act(async () => setTextAreaValue(textAreaByLabel(container, "Text"), "First import."));
+    await click(buttonByText(container, "Queue"));
+    await act(async () => firstImport.resolve({}));
+    await flushAsyncWork();
+    expect(listCalls).toBe(2);
+
+    await act(async () => setTextAreaValue(textAreaByLabel(container, "Text"), "Second import."));
+    await click(buttonByText(container, "Queue"));
+    expect(ingestCalls).toBe(2);
+    if (completion !== "after refresh") {
+      await act(async () => secondImport.resolve({}));
+      await flushAsyncWork();
+      expect(listCalls).toBe(2);
+    }
+    await act(async () => {
+      if (completion === "during failed refresh") firstRefresh.reject(new Error("List refresh failed"));
+      else firstRefresh.resolve({ documents: [documents[0]] });
+    });
+    if (completion === "after refresh") {
+      await act(async () => secondImport.resolve({}));
+    }
+    await flushAsyncWork();
+
+    expect(listCalls).toBe(3);
+    expect(container.textContent).toContain("idle · 0 queued");
+    expect(container.textContent).toContain("2 active documents, 2 active chunks");
+    expect(Array.from(container.querySelectorAll(".documentation-document-row")).map((row) => row.textContent)).toEqual([
+      expect.stringContaining("Document A"), expect.stringContaining("Document B")
+    ]);
+    await unmount(root);
+  });
+
+  it.each(["loaded", "loading", "settling with import"])("refreshes a list opened after an import starts while the list is %s", async (listState) => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const imported = deferred<Record<string, unknown>>();
+    const firstPage = deferred<Record<string, unknown>>();
+    let listCalls = 0;
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string) => {
+      if (hookId === "documentation.ingest.text") return imported.promise as Promise<T>;
+      if (hookId === "documentation.documents.list") {
+        listCalls += 1;
+        return listCalls === 1 ? firstPage.promise as Promise<T> : hookResult<T>({ documents: [{ documentId: "new-doc", title: "New document", state: "active" }] });
+      }
+      return {} as T;
+    };
+    await act(async () => root.render(createElement(DocumentationPanel, { callHook })));
+    await click(buttonByText(container, "text"));
+    await act(async () => setTextAreaValue(textAreaByLabel(container, "Text"), "Import before opening the list."));
+    await click(buttonByText(container, "Queue"));
+    expect(listCalls).toBe(0);
+    await click(buttonByLabel(container, "Show active documents"));
+    if (listState === "loaded") await act(async () => firstPage.resolve({ documents: [] }));
+    await act(async () => {
+      if (listState === "settling with import") firstPage.resolve({ documents: [] });
+      imported.resolve({});
+    });
+    await flushAsyncWork();
+    if (listState === "loading") await act(async () => firstPage.resolve({ documents: [] }));
+    await flushAsyncWork();
+
+    expect(listCalls).toBe(2);
+    expect(container.querySelector(".documentation-document-row")?.textContent).toContain("New document");
+    expect(container.textContent).toContain("idle · 0 queued");
+    await unmount(root);
+  });
+
+  it("coalesces completed imports into one replacement after a pending next page", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const imported = deferred<Record<string, unknown>>();
+    const nextPage = deferred<Record<string, unknown>>();
+    const offsets: unknown[] = [];
+    const documents = Array.from({ length: 51 }, (_, index) => ({ documentId: `doc-${index}`, title: `Document ${index}`, state: "active" }));
+    let importsComplete = false;
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}) => {
+      if (hookId === "documentation.ingest.text") return imported.promise as Promise<T>;
+      if (hookId === "documentation.documents.list") {
+        offsets.push(input.offset);
+        if (input.offset === 50) return nextPage.promise as Promise<T>;
+        return hookResult<T>({
+          documents: importsComplete
+            ? [{ documentId: "new-a", title: "New document A", state: "active" }, { documentId: "new-b", title: "New document B", state: "active" }, ...documents.slice(0, 48)]
+            : documents.slice(0, 50),
+          window: { offset: 0, limit: 50, total: importsComplete ? 53 : 51, hasMore: true }
+        });
+      }
+      return {} as T;
+    };
+    await act(async () => root.render(createElement(DocumentationPanel, { callHook })));
+    await click(buttonByLabel(container, "Show active documents"));
+    await click(buttonByText(container, "text"));
+    for (const text of ["First import.", "Second import."]) {
+      await act(async () => setTextAreaValue(textAreaByLabel(container, "Text"), text));
+      await click(buttonByText(container, "Queue"));
+    }
+    await click(buttonByText(container, "Load More"));
+    await act(async () => {
+      importsComplete = true;
+      imported.resolve({});
+    });
+    await flushAsyncWork();
+    expect(offsets).toEqual([0, 50]);
+    await act(async () => nextPage.resolve({ documents: [documents[50]], window: { offset: 50, limit: 50, total: 51, hasMore: false } }));
+    await flushAsyncWork();
+
+    expect(offsets).toEqual([0, 50, 0]);
+    expect(container.textContent).toContain("New document A");
+    expect(container.textContent).toContain("New document B");
+    expect(container.textContent).toContain("50 of 53 loaded");
+    expect(buttonByText(container, "Load More").disabled).toBe(false);
+    expect(container.textContent).toContain("idle · 0 queued");
+    await unmount(root);
+  });
+
+  it("refreshes the remounted list for retained imports and ignores the old panel's pending page", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    let root = createRoot(container);
+    let mounted = true;
+    let panelState: DocumentationPanelState | undefined;
+    const imported = deferred<Record<string, unknown>>();
+    const oldPage = deferred<Record<string, unknown>>();
+    const documents = [
+      { documentId: "doc-a", title: "Document A", state: "active" },
+      { documentId: "doc-b", title: "Document B", state: "active" }
+    ];
+    let listCalls = 0;
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string) => {
+      if (hookId === "documentation.ingest.text") return imported.promise as Promise<T>;
+      if (hookId === "documentation.documents.list") {
+        listCalls += 1;
+        if (listCalls === 1) return oldPage.promise as Promise<T>;
+        return hookResult<T>({ documents: listCalls === 2 ? [documents[0]] : documents });
+      }
+      return {} as T;
+    };
+    const applyState = (updater: DocumentationPanelStateUpdater) => {
+      panelState = updater(panelState);
+      if (mounted) root.render(panelElement());
+    };
+    const panelElement = () => createElement(DocumentationPanel, { callHook, stateKey: "list-remount", state: panelState, onStateChange: applyState });
+    await act(async () => root.render(panelElement()));
+    await click(buttonByText(container, "text"));
+    await act(async () => setTextAreaValue(textAreaByLabel(container, "Text"), "Import across panel remounts."));
+    await click(buttonByText(container, "Queue"));
+    await click(buttonByLabel(container, "Show active documents"));
+    mounted = false;
+    await unmount(root);
+
+    root = createRoot(container);
+    mounted = true;
+    await act(async () => root.render(panelElement()));
+    await click(buttonByLabel(container, "Show active documents"));
+    expect(listCalls).toBe(2);
+    await act(async () => imported.resolve({}));
+    await flushAsyncWork();
+    expect(listCalls).toBe(3);
+    expect(panelState?.documents).toEqual(documents);
+    await act(async () => oldPage.resolve({ documents: [] }));
+    await flushAsyncWork();
+
+    expect(panelState?.documents).toEqual(documents);
+    expect(container.querySelectorAll(".documentation-document-row")).toHaveLength(2);
+    expect(container.textContent).toContain("idle · 0 queued");
+    await unmount(root);
+  });
+
   it("keeps the latest archive counts when concurrent imports receive summaries in reverse order", async () => {
     const container = document.createElement("div");
     document.body.append(container);
@@ -1409,6 +1613,7 @@ describe("DocumentationPanel", () => {
       expect(ingestCalls).toHaveLength(2);
     }
 
+    const refreshCallsBeforeDisposal = delayedRefreshCalls;
     mounted = false;
     await unmount(root);
     panelState = undefined;
@@ -1427,6 +1632,7 @@ describe("DocumentationPanel", () => {
 
     expect(ingestCalls).toHaveLength(2);
     expect(panelState).toBeUndefined();
+    expect(delayedRefreshCalls).toBe(refreshCallsBeforeDisposal);
   });
 });
 
