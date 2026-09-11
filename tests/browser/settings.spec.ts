@@ -309,6 +309,64 @@ test("Codex Settings saves shared defaults, keeps them after reload, and can res
   await expect(fastMode).toHaveValue("");
 });
 
+for (const delayedEndpoint of ["workspace", "plugins"]) {
+  test(`Codex Settings waits for the initial workspace before tab creation when ${delayedEndpoint} is delayed`, async ({
+    page,
+  }) => {
+    const response = await page.request.get(`${baseUrl}/api/workspace`);
+    expect(response.ok()).toBe(true);
+    const workspace = (await response.json()) as WorkspaceStateResponse;
+    const activeWindow = workspace.windows.find(
+      (window) => window.id === workspace.activeWindowId,
+    )!;
+    expect(activeWindow.layout.activePaneId).not.toBe("pane-1");
+
+    await page.addInitScript(() => {
+      document.addEventListener(
+        "pointerdown",
+        (event) => {
+          const button = (event.target as Element).closest(
+            'button[title="Add tab to this pane"]',
+          );
+          if (button) {
+            document.body.dataset.tabCreationPaneId =
+              button.closest<HTMLElement>("[data-pane-id]")!.dataset.paneId;
+          }
+        },
+        { capture: true },
+      );
+    });
+    // Keep the socket snapshot from satisfying workspace readiness first.
+    await page.routeWebSocket("**/ws/workspace", () => {});
+    await page.route(
+      `**/api/${delayedEndpoint}`,
+      async (route) => {
+        const response = await route.fetch();
+        await expect(page.locator(".workspace-pane.active")).toHaveAttribute(
+          "data-pane-id",
+          "pane-1",
+        );
+        // Inject slow startup; the opener must wait for state, not this timer.
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+        await route.fulfill({ response });
+      },
+      { times: 1 },
+    );
+
+    const settings = await openCodexSettings(page);
+    await expect(page.locator("body")).toHaveAttribute(
+      "data-tab-creation-pane-id",
+      activeWindow.layout.activePaneId,
+    );
+    await expect(
+      settings.getByRole("textbox", { name: "Default model" }),
+    ).toHaveValue("");
+    await expect(
+      settings.getByRole("button", { name: "Save", exact: true }),
+    ).toBeDisabled();
+  });
+}
+
 const workspaceNavigations = [
   "tab switches",
   "window switches",
@@ -585,7 +643,25 @@ for (const viewport of [
 }
 
 async function openCodexSettings(page: Page) {
+  const initialWorkspace = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === "/api/workspace" &&
+      response.request().method() === "GET",
+  );
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  const response = await initialWorkspace;
+  expect(response.ok()).toBe(true);
+  const workspace = (await response.json()) as WorkspaceStateResponse;
+  const activeWindow = workspace.windows.find(
+    (window) => window.id === workspace.activeWindowId,
+  )!;
+  await expect(page.locator(".workspace-pane.active")).toHaveAttribute(
+    "data-pane-id",
+    activeWindow.layout.activePaneId,
+  );
+  await expect(
+    page.getByTitle("Workspace windows", { exact: true }),
+  ).toHaveText(activeWindow.name);
   return createCodexSettingsTab(page);
 }
 
@@ -594,6 +670,9 @@ async function createWorkspaceTab(page: Page, plugin: string, title: string) {
     .locator(".workspace-pane.active")
     .getByTitle("Add tab to this pane")
     .click();
+  await expect(
+    page.getByRole("heading", { name: "New tab", exact: true }),
+  ).toBeVisible();
   await page
     .getByRole("combobox", { name: "Plugin", exact: true })
     .selectOption({
