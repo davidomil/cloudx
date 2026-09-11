@@ -9,6 +9,7 @@ import {
   startTerminalBroker,
   stopTestProcess,
 } from "../../scripts/test-terminal-broker.mjs";
+import { cleanupTerminalRecovery } from "../../scripts/test-terminal-recovery.mjs";
 
 const repoRoot = path.resolve(import.meta.dirname, "../..");
 let root: string;
@@ -118,13 +119,16 @@ while True:
 });
 
 test.afterEach(async ({}, testInfo) => {
-  await stopTestProcess(server);
-  await stopTestProcess(broker);
-  await testInfo.attach("terminal-recovery-server.log", {
-    body: logs,
-    contentType: "text/plain",
+  await cleanupTerminalRecovery({
+    server,
+    broker,
+    root,
+    attachLogs: () =>
+      testInfo.attach("terminal-recovery-server.log", {
+        body: logs,
+        contentType: "text/plain",
+      }),
   });
-  await fs.rm(root, { recursive: true, force: true });
 });
 
 test("waits for delayed workspace bootstrap before creating the fixture terminal", async ({
@@ -172,7 +176,10 @@ test("preserves real xterm screen and input modes after replay truncation, recon
   test.setTimeout(60_000);
   await openFixtureTerminal(page);
   await page.keyboard.type("f");
-  await expect(page.locator(".xterm-rows")).toContainText("MODE-RECOVERED");
+  // The verifier shares two CPUs across the browsers, web servers, and brokers.
+  await expect(page.locator(".xterm-rows")).toContainText("MODE-RECOVERED", {
+    timeout: 20_000,
+  });
 
   await recoverTerminal(page, "socket reconnect");
   await verifyInputModes(page, "socket");
