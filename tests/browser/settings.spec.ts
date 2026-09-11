@@ -306,146 +306,169 @@ test("Codex Settings saves shared defaults, keeps them after reload, and can res
   await expect(fastMode).toHaveValue("");
 });
 
-test("Codex Settings keeps drafts across workspace tab switches and discards them when the tab closes", async ({
-  page,
-}) => {
-  const configPath = path.join(testRoot, "codex-home", "config.toml");
-  await fs.writeFile(
-    configPath,
-    'model = "initial-model"\nservice_tier = "priority"\n',
-  );
-  const settings = await openCodexSettings(page);
-  await createWorkspaceTab(page, "Local Web", "Other work");
-  await activateWorkspaceTab(page, "Codex defaults");
-  const model = settings.getByRole("textbox", { name: "Default model" });
-  const fastMode = settings.getByRole("combobox", { name: "Fast mode" });
-  const save = settings.getByRole("button", { name: "Save", exact: true });
-  await model.fill("unsaved-draft-model");
-  await fastMode.selectOption({ label: "Off" });
+const workspaceNavigations = [
+  "tab switches",
+  "window switches",
+  "pane splits",
+] as const;
 
-  await activateWorkspaceTab(page, "Other work");
-  await expect(settings).toBeHidden();
-  await activateWorkspaceTab(page, "Codex defaults");
-  await expect(model).toHaveValue("unsaved-draft-model");
-  await expect(fastMode).toHaveValue("default");
-  await expect(save).toBeEnabled();
-  await save.click();
-  await expect(settings.getByRole("status")).toHaveText(
-    "Global Codex settings saved.",
-  );
-  expect(parse(await fs.readFile(configPath, "utf8"))).toEqual({
-    model: "unsaved-draft-model",
-    service_tier: "default",
-    features: { fast_mode: true },
+for (const navigation of workspaceNavigations) {
+  test(`Codex Settings keeps drafts across workspace ${navigation} and discards them when the tab closes`, async ({
+    page,
+    isMobile,
+  }) => {
+    const configPath = path.join(testRoot, "codex-home", "config.toml");
+    await fs.writeFile(
+      configPath,
+      'model = "initial-model"\nservice_tier = "priority"\n',
+    );
+    const initialRead = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === "/api/hooks/codex-settings.read",
+    );
+    const settings = await openCodexSettings(page);
+    const initialRevision = (await (await initialRead).json()).result.settings
+      .revision;
+    await createWorkspaceTab(page, "Local Web", "Other work");
+    await activateWorkspaceTab(page, "Codex defaults");
+    const model = settings.getByRole("textbox", { name: "Default model" });
+    const fastMode = settings.getByRole("combobox", { name: "Fast mode" });
+    const save = settings.getByRole("button", { name: "Save", exact: true });
+    await model.fill("unsaved-draft-model");
+    await fastMode.selectOption({ label: "Off" });
+
+    await navigateWorkspace(page, isMobile, navigation);
+    await expect(model).toHaveValue("unsaved-draft-model");
+    await expect(fastMode).toHaveValue("default");
+    await expect(save).toBeEnabled();
+    const saved = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === "/api/hooks/codex-settings.update",
+    );
+    await save.click();
+    const savedResponse = await saved;
+    expect(savedResponse.ok()).toBe(true);
+    expect(savedResponse.request().postDataJSON().input).toEqual({
+      expectedRevision: initialRevision,
+      model: "unsaved-draft-model",
+      serviceTier: "default",
+    });
+    await expect(settings.getByRole("status")).toHaveText(
+      "Global Codex settings saved.",
+    );
+    expect(parse(await fs.readFile(configPath, "utf8"))).toEqual({
+      model: "unsaved-draft-model",
+      service_tier: "default",
+      features: { fast_mode: true },
+    });
+
+    await model.fill("discarded-draft-model");
+    await fastMode.selectOption({ label: "Flex" });
+    await activateWorkspaceTab(page, "Other work");
+    await page
+      .getByRole("button", { name: "Close Codex defaults", exact: true })
+      .click();
+    await expect(page.locator(".codex-settings-panel")).toHaveCount(0);
+    await createCodexSettingsTab(page);
+    await expect(model).toHaveValue("unsaved-draft-model");
+    await expect(fastMode).toHaveValue("default");
+    await expect(save).toBeDisabled();
   });
 
-  await model.fill("discarded-draft-model");
-  await fastMode.selectOption({ label: "Flex" });
-  await activateWorkspaceTab(page, "Other work");
-  await page
-    .getByRole("button", { name: "Close Codex defaults", exact: true })
-    .click();
-  await expect(page.locator(".codex-settings-panel")).toHaveCount(0);
-  await createCodexSettingsTab(page);
-  await expect(model).toHaveValue("unsaved-draft-model");
-  await expect(fastMode).toHaveValue("default");
-  await expect(save).toBeDisabled();
-});
+  test(`Codex Settings keeps a rejected stale draft and its revision across workspace ${navigation} until Reload`, async ({
+    page,
+    isMobile,
+  }, testInfo) => {
+    const configPath = path.join(testRoot, "codex-home", "config.toml");
+    const unrelatedSettings =
+      '# Keep this profile unchanged.\n[profiles.review]\nmodel = "profile-model"\n';
+    await fs.writeFile(
+      configPath,
+      `model = "initial-model"\nservice_tier = "default"\n${unrelatedSettings}`,
+    );
+    const initialRead = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === "/api/hooks/codex-settings.read",
+    );
+    const settings = await openCodexSettings(page);
+    const initialRevision = (await (await initialRead).json()).result.settings
+      .revision;
+    await createWorkspaceTab(page, "Local Web", "Other work");
+    await activateWorkspaceTab(page, "Codex defaults");
+    const model = settings.getByRole("textbox", { name: "Default model" });
+    const fastMode = settings.getByRole("combobox", { name: "Fast mode" });
+    const save = settings.getByRole("button", { name: "Save", exact: true });
+    await expect(model).toHaveValue("initial-model");
+    await expect(fastMode).toHaveValue("default");
+    await model.fill("unsaved-draft-model");
+    await fastMode.selectOption({ label: "On" });
 
-test("Codex Settings keeps a rejected stale draft and its revision across workspace tab switches until Reload", async ({
-  page,
-}, testInfo) => {
-  const configPath = path.join(testRoot, "codex-home", "config.toml");
-  const unrelatedSettings =
-    '# Keep this profile unchanged.\n[profiles.review]\nmodel = "profile-model"\n';
-  await fs.writeFile(
-    configPath,
-    `model = "initial-model"\nservice_tier = "default"\n${unrelatedSettings}`,
-  );
-  const initialRead = page.waitForResponse(
-    (response) =>
-      new URL(response.url()).pathname === "/api/hooks/codex-settings.read",
-  );
-  const settings = await openCodexSettings(page);
-  const initialRevision = (await (await initialRead).json()).result.settings
-    .revision;
-  await createWorkspaceTab(page, "Local Web", "Other work");
-  await activateWorkspaceTab(page, "Codex defaults");
-  const model = settings.getByRole("textbox", { name: "Default model" });
-  const fastMode = settings.getByRole("combobox", { name: "Fast mode" });
-  const save = settings.getByRole("button", { name: "Save", exact: true });
-  await expect(model).toHaveValue("initial-model");
-  await expect(fastMode).toHaveValue("default");
-  await model.fill("unsaved-draft-model");
-  await fastMode.selectOption({ label: "On" });
+    const externalConfig = `model = "external-model"\nservice_tier = "flex"\n${unrelatedSettings}`;
+    await fs.writeFile(configPath, externalConfig);
+    const firstSave = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === "/api/hooks/codex-settings.update",
+    );
+    await save.click();
+    const firstRejectedSave = await firstSave;
+    expect(firstRejectedSave.ok()).toBe(false);
+    expect(firstRejectedSave.request().postDataJSON().input).toEqual({
+      expectedRevision: initialRevision,
+      model: "unsaved-draft-model",
+      serviceTier: "priority",
+    });
+    await expect(settings.getByRole("alert")).toHaveText(
+      "Shared Codex settings changed. Reload before saving again.",
+    );
+    await expect(model).toHaveValue("unsaved-draft-model");
+    await expect(fastMode).toHaveValue("priority");
+    await expect(save).toBeEnabled();
+    expect(await fs.readFile(configPath, "utf8")).toBe(externalConfig);
+    await expectCodexSettingsFits(page);
+    await settings.getByRole("alert").scrollIntoViewIfNeeded();
+    await captureSample(page, testInfo, "codex-settings-stale-draft");
 
-  const externalConfig = `model = "external-model"\nservice_tier = "flex"\n${unrelatedSettings}`;
-  await fs.writeFile(configPath, externalConfig);
-  const firstSave = page.waitForResponse(
-    (response) =>
-      new URL(response.url()).pathname === "/api/hooks/codex-settings.update",
-  );
-  await save.click();
-  const firstRejectedSave = await firstSave;
-  expect(firstRejectedSave.ok()).toBe(false);
-  expect(firstRejectedSave.request().postDataJSON().input).toEqual({
-    expectedRevision: initialRevision,
-    model: "unsaved-draft-model",
-    serviceTier: "priority",
+    await navigateWorkspace(page, isMobile, navigation);
+    await expect(model).toHaveValue("unsaved-draft-model");
+    await expect(fastMode).toHaveValue("priority");
+    await expect(settings.getByRole("alert")).toHaveText(
+      "Shared Codex settings changed. Reload before saving again.",
+    );
+    const secondSave = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === "/api/hooks/codex-settings.update",
+    );
+    await save.click();
+    const secondRejectedSave = await secondSave;
+    expect(secondRejectedSave.ok()).toBe(false);
+    expect(secondRejectedSave.request().postDataJSON().input).toEqual(
+      firstRejectedSave.request().postDataJSON().input,
+    );
+    await expect(settings.getByRole("alert")).toHaveText(
+      "Shared Codex settings changed. Reload before saving again.",
+    );
+    expect(await fs.readFile(configPath, "utf8")).toBe(externalConfig);
+
+    await settings.getByRole("button", { name: "Reload", exact: true }).click();
+    await expect(model).toHaveValue("external-model");
+    await expect(fastMode).toHaveValue("flex");
+    await expect(settings.getByRole("alert")).toHaveCount(0);
+    await expect(save).toBeDisabled();
+    await fastMode.selectOption({ label: "Off" });
+    await save.click();
+    await expect(settings.getByRole("status")).toHaveText(
+      "Global Codex settings saved.",
+    );
+    const savedConfig = await fs.readFile(configPath, "utf8");
+    expect(parse(savedConfig)).toEqual({
+      model: "external-model",
+      service_tier: "default",
+      features: { fast_mode: true },
+      profiles: { review: { model: "profile-model" } },
+    });
+    expect(savedConfig).toContain(unrelatedSettings);
   });
-  await expect(settings.getByRole("alert")).toHaveText(
-    "Shared Codex settings changed. Reload before saving again.",
-  );
-  await expect(model).toHaveValue("unsaved-draft-model");
-  await expect(fastMode).toHaveValue("priority");
-  await expect(save).toBeEnabled();
-  expect(await fs.readFile(configPath, "utf8")).toBe(externalConfig);
-  await expectCodexSettingsFits(page);
-  await settings.getByRole("alert").scrollIntoViewIfNeeded();
-  await captureSample(page, testInfo, "codex-settings-stale-draft");
-
-  await activateWorkspaceTab(page, "Other work");
-  await expect(settings).toBeHidden();
-  await activateWorkspaceTab(page, "Codex defaults");
-  await expect(model).toHaveValue("unsaved-draft-model");
-  await expect(fastMode).toHaveValue("priority");
-  await expect(settings.getByRole("alert")).toHaveText(
-    "Shared Codex settings changed. Reload before saving again.",
-  );
-  const secondSave = page.waitForResponse(
-    (response) =>
-      new URL(response.url()).pathname === "/api/hooks/codex-settings.update",
-  );
-  await save.click();
-  const secondRejectedSave = await secondSave;
-  expect(secondRejectedSave.ok()).toBe(false);
-  expect(secondRejectedSave.request().postDataJSON().input).toEqual(
-    firstRejectedSave.request().postDataJSON().input,
-  );
-  await expect(settings.getByRole("alert")).toHaveText(
-    "Shared Codex settings changed. Reload before saving again.",
-  );
-  expect(await fs.readFile(configPath, "utf8")).toBe(externalConfig);
-
-  await settings.getByRole("button", { name: "Reload", exact: true }).click();
-  await expect(model).toHaveValue("external-model");
-  await expect(fastMode).toHaveValue("flex");
-  await expect(settings.getByRole("alert")).toHaveCount(0);
-  await expect(save).toBeDisabled();
-  await fastMode.selectOption({ label: "Off" });
-  await save.click();
-  await expect(settings.getByRole("status")).toHaveText(
-    "Global Codex settings saved.",
-  );
-  const savedConfig = await fs.readFile(configPath, "utf8");
-  expect(parse(savedConfig)).toEqual({
-    model: "external-model",
-    service_tier: "default",
-    features: { fast_mode: true },
-    profiles: { review: { model: "profile-model" } },
-  });
-  expect(savedConfig).toContain(unrelatedSettings);
-});
+}
 
 for (const serviceTier of ["priority", "default", "flex"]) {
   test(`Codex Settings enables disabled fast mode support with the saved ${serviceTier} tier unchanged`, async ({
@@ -584,6 +607,63 @@ async function activateWorkspaceTab(page: Page, title: string) {
   await expect(page.locator(".tab-button.selected .tab-title")).toHaveText(
     title,
   );
+}
+
+async function navigateWorkspace(
+  page: Page,
+  isMobile: boolean,
+  navigation: (typeof workspaceNavigations)[number],
+) {
+  const settings = page.getByRole("region", {
+    name: "Global Codex settings",
+    exact: true,
+  });
+  if (navigation === "tab switches") {
+    await activateWorkspaceTab(page, "Other work");
+    await expect(settings).toBeHidden();
+    await activateWorkspaceTab(page, "Codex defaults");
+    return;
+  }
+  if (navigation === "window switches") {
+    const switcher = page.getByTitle("Workspace windows", { exact: true });
+    const originalWindow = (await switcher.textContent())!.trim();
+    await switcher.click();
+    await page
+      .getByRole("button", { name: "Create window", exact: true })
+      .click();
+    await page
+      .getByPlaceholder("Window name", { exact: true })
+      .fill("Other workspace");
+    await page
+      .getByRole("combobox", { name: "Window default directory", exact: true })
+      .fill(testRoot);
+    await page
+      .locator(".menu-form-actions")
+      .getByRole("button", { name: "Create window", exact: true })
+      .click();
+    await expect(switcher).toHaveText("Other workspace");
+    await expect(settings).toBeHidden();
+    await page
+      .locator(".window-row-main")
+      .filter({ hasText: originalWindow })
+      .click();
+    await expect(switcher).toHaveText(originalWindow);
+    return;
+  }
+  if (isMobile) {
+    await page
+      .getByRole("button", { name: "Workspace actions", exact: true })
+      .click();
+    await page
+      .getByRole("menuitem", { name: "Split vertically", exact: true })
+      .click();
+  } else {
+    await page
+      .getByRole("button", { name: "Split columns", exact: true })
+      .click();
+  }
+  await expect(page.locator(".workspace-pane")).toHaveCount(2);
+  await activateWorkspaceTab(page, "Codex defaults");
 }
 
 async function createCodexSettingsTab(page: Page) {
