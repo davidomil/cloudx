@@ -54,6 +54,92 @@ describe("DocumentationEnrichmentService", () => {
     expect(client.enrichDocument).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { state: "stale" },
+    { state: "active", chunks: [{ chunk_origin: "ai", text: "Already analyzed", locator: "ai:metadata" }] },
+  ])("rechecks pending documents before invoking the model: %j", async (document) => {
+    const runner = fakeRunner();
+    const client = fakeDocumentationClient(document);
+    const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner });
+
+    await expect(service.enrichIngestResponse({ document: { documentId: "doc-1", extractionRevision: "e".repeat(32) } }, {}, { onlyPending: true })).resolves.toMatchObject({
+      enrichment: { results: [{ documentId: "doc-1", status: "unchanged" }] }
+    });
+    expect(runner.run).not.toHaveBeenCalled();
+    expect(client.enrichDocument).not.toHaveBeenCalled();
+  });
+
+  it("publishes background enrichment for the extraction revision used as model input", async () => {
+    const runner = fakeRunner({ summary: "Reset timing.", spans: [{ locator: "ai:metadata", text: "Reset timing summary." }], metadata: [], warnings: [] });
+    const client = fakeDocumentationClient({ state: "active" });
+    const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner });
+    const extractionRevision = "e".repeat(32);
+
+    await expect(service.enrichIngestResponse({ document: { documentId: "doc-1", extractionRevision } }, {}, { onlyPending: true }))
+      .resolves.toMatchObject({ enrichment: { results: [{ status: "written" }] } });
+
+    expect(runner.run).toHaveBeenCalledOnce();
+    expect(client.enrichDocument).toHaveBeenCalledWith(expect.objectContaining({ documentId: "doc-1", extractionRevision }));
+  });
+
+  it.each([undefined, "invalid"])("requires a valid discovery revision before starting background enrichment: %s", async (extractionRevision) => {
+    const runner = fakeRunner();
+    const client = fakeDocumentationClient({ state: "active" });
+    const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner });
+
+    await expect(service.enrichIngestResponse({ document: { documentId: "doc-1", extractionRevision } }, {}, { onlyPending: true }))
+      .resolves.toMatchObject({ enrichment: { results: [{ status: "failed", error: "Background enrichment requires a valid extraction revision." }] } });
+
+    expect(client.getDocument).not.toHaveBeenCalled();
+    expect(runner.run).not.toHaveBeenCalled();
+    expect(client.enrichDocument).not.toHaveBeenCalled();
+  });
+
+  it.each(["discovery", "chunks", "artifacts"])("discards replaced extraction evidence while reading %s before invoking the model", async (stage) => {
+    const runner = fakeRunner();
+    const client = fakeDocumentationClient({ state: "active", extraction_revision: "f".repeat(32) });
+    if (stage !== "discovery") {
+      client.getDocument.mockResolvedValueOnce({ document: {
+        state: "active", extraction_revision: "e".repeat(32),
+        chunks: [{ chunk_origin: "source", locator: "page 1", text: "Original extraction." }],
+        artifacts: [{ path: "page-1.png" }],
+        chunkWindow: { offset: 0, limit: 1, total: stage === "chunks" ? 2 : 1, hasMore: stage === "chunks" },
+        artifactWindow: { offset: 0, limit: 1, total: stage === "artifacts" ? 2 : 1, hasMore: stage === "artifacts" },
+      } });
+    }
+    const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner });
+
+    await expect(service.enrichIngestResponse({ document: { documentId: "doc-1", extractionRevision: "e".repeat(32) } }, {}, { onlyPending: true }))
+      .resolves.toMatchObject({ enrichment: { results: [{ status: "failed", error: "Document extraction was replaced before enrichment could read its evidence." }] } });
+
+    expect(client.getDocument).toHaveBeenCalledTimes(stage === "discovery" ? 1 : 2);
+    expect(runner.run).not.toHaveBeenCalled();
+    expect(client.enrichDocument).not.toHaveBeenCalled();
+  });
+
+  it("waits for explicit enrichment and rechecks the pending document before starting background analysis", async () => {
+    let finishModel!: (output: unknown) => void;
+    const runner = fakeRunner();
+    runner.run.mockImplementationOnce(() => new Promise((resolve) => { finishModel = resolve; }));
+    const client = fakeDocumentationClient({ state: "active" });
+    client.getDocument
+      .mockResolvedValueOnce({ document: { state: "active", chunks: [{ chunk_origin: "source", locator: "page 1", text: "Source evidence" }] } })
+      .mockResolvedValue({ document: { state: "active", extraction_revision: "e".repeat(32), chunks: [{ chunk_origin: "ai", locator: "ai:metadata", text: "Enriched source" }] } });
+    const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner });
+    const input = { document: { documentId: "doc-1", extractionRevision: "e".repeat(32) } };
+    const explicit = service.enrichIngestResponse(input);
+    await vi.waitFor(() => expect(runner.run).toHaveBeenCalledOnce());
+    const background = service.enrichIngestResponse(input, {}, { onlyPending: true });
+    await Promise.resolve();
+    expect(client.getDocument).toHaveBeenCalledOnce();
+
+    finishModel({ summary: "Source summary", spans: [{ locator: "ai:metadata", text: "Enriched source" }], metadata: [], warnings: [] });
+    await expect(explicit).resolves.toMatchObject({ enrichment: { results: [{ status: "written" }] } });
+    await expect(background).resolves.toMatchObject({ enrichment: { results: [{ status: "unchanged" }] } });
+    expect(runner.run).toHaveBeenCalledOnce();
+    expect(client.enrichDocument).toHaveBeenCalledOnce();
+  });
+
   it("rejects assisted answers when either AI control or documentation enrichment is disabled", async () => {
     const service = new DocumentationEnrichmentService({
       client: fakeDocumentationClient(),
@@ -1796,6 +1882,7 @@ function fakeDocumentationClient(documentOverrides: Record<string, unknown> = {}
         uri: "mock://power",
         collection: "board",
         content_sha256: "abc",
+        extraction_revision: "e".repeat(32),
         snapshot_path: "snapshots/abc/power.pdf",
         chunks: [{ chunk_id: 11, locator: "page 1", text: "The source text mentions reset timing tables.", chunk_origin: "source" }],
         ...documentOverrides

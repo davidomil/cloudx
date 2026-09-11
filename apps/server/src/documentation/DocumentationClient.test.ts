@@ -57,6 +57,100 @@ describe("DocumentationClient", () => {
     expect(requestUrl).toBe("/docs/documents?token=local&states=active%2Cstale&limit=25&offset=50&query=reset+manual&collection=board&sortDirection=asc");
   });
 
+  it("discovers one pending document through the bounded enrichment endpoint", async () => {
+    const requests: string[] = [];
+    const pending = { documentId: "pending", title: "Pending guide", extractionRevision: "e".repeat(32) };
+    const url = await startServer((request, response) => {
+      requests.push(`${request.method} ${request.url}`);
+      response.end(JSON.stringify({ documents: requests.length === 1 ? [pending] : [] }));
+    });
+    const client = new DocumentationClient(`${url}/docs/?token=local`);
+
+    await expect(client.nextPendingEnrichment()).resolves.toEqual(pending);
+    await expect(client.nextPendingEnrichment()).resolves.toBeUndefined();
+
+    expect(requests).toEqual([
+      "GET /docs/enrichment/pending?token=local&limit=1",
+      "GET /docs/enrichment/pending?token=local&limit=1"
+    ]);
+  });
+
+  it.each([
+    {},
+    { documents: null },
+    { documents: {} },
+    { documents: [{ documentId: "one", title: "One" }, { documentId: "two", title: "Two" }] },
+    { documents: [null] },
+    { documents: [[]] },
+    { documents: [{ documentId: " ", title: "Empty ID" }] },
+    { documents: [{ documentId: 1, title: "Numeric ID" }] },
+    { documents: [{ documentId: "one" }] },
+    { documents: [{ documentId: "one", title: 42 }] },
+    ...[undefined, null, 1, "", " ", "e".repeat(31), "g".repeat(32), "E".repeat(32), "e".repeat(33), "e".repeat(32) + "\n"].map((extractionRevision) => ({
+      documents: [{ documentId: "one", title: "One", extractionRevision }]
+    }))
+  ])("rejects an invalid pending enrichment response: %j", async (body) => {
+    const url = await startServer((_request, response) => response.end(JSON.stringify(body)));
+
+    await expect(new DocumentationClient(url).nextPendingEnrichment()).rejects.toThrow(/Invalid pending documentation enrichment/);
+  });
+
+  it.each(["failed", "skipped"] as const)("records a %s enrichment outcome for an encoded document ID", async (status) => {
+    let requestUrl = "";
+    let requestMethod = "";
+    let requestBody = "";
+    const url = await startServer((request, response) => {
+      requestUrl = request.url ?? "";
+      requestMethod = request.method ?? "";
+      request.on("data", (chunk) => { requestBody += chunk.toString(); });
+      request.on("end", () => response.end(JSON.stringify({ recorded: true })));
+    });
+    const client = new DocumentationClient(`${url}/docs/?token=local`);
+    const outcome = { extractionRevision: "e".repeat(32), status, error: "No enrichment was written." };
+
+    await expect(client.recordEnrichmentOutcome("doc/one", outcome)).resolves.toEqual({ recorded: true });
+
+    expect(requestUrl).toBe("/docs/documents/doc%2Fone/enrichment-outcome?token=local");
+    expect(requestMethod).toBe("POST");
+    expect(JSON.parse(requestBody)).toEqual(outcome);
+    expect(() => client.recordEnrichmentOutcome(" ", outcome)).toThrow("documentId must be a non-empty string.");
+  });
+
+  it("preserves indexer errors when recording an enrichment outcome", async () => {
+    const url = await startServer((_request, response) => {
+      response.writeHead(409, { "content-type": "application/json" });
+      response.end(JSON.stringify({ detail: "Document is no longer pending." }));
+    });
+
+    await expect(new DocumentationClient(url).recordEnrichmentOutcome("doc", {
+      extractionRevision: "e".repeat(32), status: "failed", error: "Model failed."
+    })).rejects.toMatchObject({ statusCode: 409, message: "Document is no longer pending." });
+  });
+
+  it.each(["discovery", "outcome"] as const)("aborts the active background %s HTTP request on shutdown", async (operation) => {
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    let markClosed!: () => void;
+    const closed = new Promise<void>((resolve) => { markClosed = resolve; });
+    const url = await startServer((_request, response) => {
+      response.on("close", markClosed);
+      markStarted();
+    });
+    const client = new DocumentationClient(url);
+    const controller = new AbortController();
+    const stopped = new Error("Background enrichment stopped.");
+    const request = operation === "discovery"
+      ? client.nextPendingEnrichment({ signal: controller.signal })
+      : client.recordEnrichmentOutcome("doc", { extractionRevision: "e".repeat(32), status: "failed", error: "Model failed." }, { signal: controller.signal });
+    const rejected = expect(request).rejects.toBe(stopped);
+    await started;
+
+    controller.abort(stopped);
+
+    await rejected;
+    await closed;
+  });
+
   it("forwards document detail window parameters", async () => {
     let requestUrl = "";
     const url = await startServer((request, response) => {
@@ -359,7 +453,7 @@ describe("DocumentationClient", () => {
     await expect(client.search({ query: "" })).rejects.toThrow("Search query is required.");
   });
 
-  it("posts AI enrichment spans to the document enrich endpoint", async () => {
+  it.each([undefined, "e".repeat(32)])("posts AI enrichment spans with extraction revision %s", async (extractionRevision) => {
     let requestUrl = "";
     let requestBody = "";
     const url = await startServer((request, response) => {
@@ -376,6 +470,7 @@ describe("DocumentationClient", () => {
 
     const result = await client.enrichDocument({
       documentId: "doc-1",
+      extractionRevision,
       spans: [{ locator: "ai:metadata", text: "Metadata summary." }],
       model: "gpt-test",
       skillIds: ["documentation-enrich-metadata"],
@@ -386,6 +481,7 @@ describe("DocumentationClient", () => {
     expect(result).toEqual({ document: { documentId: "doc-1" } });
     expect(requestUrl).toBe("/docs/documents/doc-1/enrich");
     expect(JSON.parse(requestBody)).toEqual({
+      ...(extractionRevision ? { extractionRevision } : {}),
       spans: [{ locator: "ai:metadata", text: "Metadata summary." }],
       model: "gpt-test",
       skillIds: ["documentation-enrich-metadata"],

@@ -26,6 +26,7 @@ export interface DocumentationUploadFileInput {
 
 export interface DocumentationEnrichInput {
   documentId: string;
+  extractionRevision?: string;
   spans: Array<{ locator: string; text: string }>;
   model: string;
   skillIds: string[];
@@ -96,6 +97,26 @@ export class DocumentationClient {
 
   portableManifest(): Promise<Record<string, unknown>> {
     return this.get("/portable-manifest");
+  }
+
+  async nextPendingEnrichment(options: DocumentationRequestOptions = {}): Promise<{ documentId: string; title: string; extractionRevision: string } | undefined> {
+    const response = await this.get("/enrichment/pending?limit=1", options.signal);
+    if (!Array.isArray(response.documents) || response.documents.length > 1) {
+      throw new Error("Invalid pending documentation enrichment response.");
+    }
+    const document: unknown = response.documents[0];
+    if (document === undefined) return undefined;
+    if (!document || typeof document !== "object" || !("documentId" in document) || !("title" in document) || typeof document.documentId !== "string" || !document.documentId.trim() || typeof document.title !== "string") {
+      throw new Error("Invalid pending documentation enrichment document.");
+    }
+    if (!("extractionRevision" in document) || typeof document.extractionRevision !== "string" || document.extractionRevision.length !== 32 || !/^[0-9a-f]{32}$/.test(document.extractionRevision)) {
+      throw new Error("Invalid pending documentation enrichment extraction revision.");
+    }
+    return { documentId: document.documentId, title: document.title, extractionRevision: document.extractionRevision };
+  }
+
+  recordEnrichmentOutcome(documentId: string, outcome: { extractionRevision: string; status: "failed" | "skipped"; error: string }, options: DocumentationRequestOptions = {}): Promise<Record<string, unknown>> {
+    return this.post(`/documents/${encodeURIComponent(requireString(documentId, "documentId"))}/enrichment-outcome`, outcome, options.signal);
   }
 
   listDocuments(input: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
