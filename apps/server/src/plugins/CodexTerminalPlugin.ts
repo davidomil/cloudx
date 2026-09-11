@@ -16,7 +16,7 @@ import { materializeCodexHomeOverlay, resolveCodexHome, type CodexHomeOverlay } 
 import { CodexStateSources } from "./CodexStateSources.js";
 import path from "node:path";
 import { CLOUDX_SYSTEM_RULES, CLOUDX_SYSTEM_SKILLS, cloudxSkillFilePath, cloudxSystemSkillFilePath, type ResolvedPersonalityTemplate } from "../rulesSkills/RulesSkillsCatalogService.js";
-import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
+import type { TerminalProcess, TerminalProcessFactory, TerminalProducer } from "../terminal/TerminalProcess.js";
 import { TerminalScreen } from "../terminal/TerminalScreen.js";
 import { buildLoginShellCommandLaunch, buildToolEnv, resolveAssistantCommand } from "../terminal/ShellLaunch.js";
 
@@ -39,6 +39,8 @@ export const CLOUDX_CODEX_CONFIGURATION_ARGS = [
 ] as const;
 export const CLOUDX_CODEX_DEFAULT_ARGS = ["--yolo", ...CLOUDX_CODEX_CONFIGURATION_ARGS] as const;
 const MAX_OSC_SEQUENCE_CHARS = 4096;
+const PAUSE_SCREEN_OUTPUT_BYTES = 256 * 1024;
+const RESUME_SCREEN_OUTPUT_BYTES = 64 * 1024;
 
 export const TERMINAL_ACTIONS: PluginActionDefinition[] = terminalActions({
   enterTextDescription:
@@ -594,6 +596,9 @@ export class TerminalShellIntegrationParser {
 
 export class CodexTerminalSession implements PluginSession {
   private readonly screen = new TerminalScreen();
+  private readonly producer?: TerminalProducer;
+  private pendingScreenBytes = 0;
+  private outputPaused = false;
   private recentOutput = "";
   private stopped = false;
   private status: WorkspaceTab["status"];
@@ -618,12 +623,12 @@ export class CodexTerminalSession implements PluginSession {
   ) {
     this.status = tab.status;
     this.replayBytes = options.replayBytes ?? DEFAULT_TERMINAL_REPLAY_BYTES;
+    if ("pauseOutput" in terminalProcess && typeof terminalProcess.pauseOutput === "function"
+      && "resumeOutput" in terminalProcess && typeof terminalProcess.resumeOutput === "function") {
+      this.producer = terminalProcess as TerminalProducer;
+    }
     this.terminalSubscriptions.push(this.terminalProcess.onData((data) => {
-      try { this.screen.write(data); } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        this.setReadiness("closed", message);
-        this.setStatus("failed", message);
-      }
+      this.writeScreen(data);
       this.lastOutputAt = Date.now();
       this.recentOutput = trimRecentOutput(`${this.recentOutput}${data}`, this.replayBytes);
       let sawCommandFinish = false;
@@ -715,6 +720,11 @@ export class CodexTerminalSession implements PluginSession {
   }
 
   async terminate(): Promise<void> {
+    await this.stopTerminal();
+    await this.screen.dispose();
+  }
+
+  private async stopTerminal(): Promise<void> {
     const wasStopped = this.stopped;
     this.stopped = true;
     this.clearPendingSubmitTimers();
@@ -725,7 +735,6 @@ export class CodexTerminalSession implements PluginSession {
       this.stopped = wasStopped;
       throw error;
     }
-    this.screen.dispose();
     this.terminalClosed = true;
     this.setReadiness("closed", "Terminal was stopped.");
     this.setStatus("stopped", "Terminal was stopped.");
@@ -822,17 +831,35 @@ export class CodexTerminalSession implements PluginSession {
       return { cols, rows };
     }
     if (action === "stop") {
-      this.stopped = true;
-      this.terminalClosed = true;
-      this.clearPendingSubmitTimers();
-      this.clearReadyQuietTimer();
-      this.setReadiness("closed", "Terminal is stopping.");
-      return this.terminalProcess.terminate().then(() => {
-        this.setStatus("stopped", "Terminal was stopped.");
-        return { stopped: true };
-      });
+      return this.stopTerminal().then(() => ({ stopped: true }));
     }
     throw new Error(`Unsupported Codex terminal action: ${action}`);
+  }
+
+  private writeScreen(data: string): void {
+    try {
+      this.screen.write(data);
+      if (!this.producer) return;
+      const bytes = Buffer.byteLength(data);
+      this.pendingScreenBytes += bytes;
+      void this.screen.flush().then(() => {
+        this.pendingScreenBytes -= bytes;
+        if (this.outputPaused && !this.terminalClosed && this.pendingScreenBytes <= RESUME_SCREEN_OUTPUT_BYTES) {
+          this.outputPaused = false;
+          this.producer!.resumeOutput();
+        }
+      }).catch((error: unknown) => this.failScreen(error));
+      if (!this.outputPaused && this.pendingScreenBytes >= PAUSE_SCREEN_OUTPUT_BYTES) {
+        this.outputPaused = true;
+        this.producer.pauseOutput();
+      }
+    } catch (error) { this.failScreen(error); }
+  }
+
+  private failScreen(error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error);
+    this.setReadiness("closed", message);
+    this.setStatus("failed", message);
   }
 
   private setStatus(status: WorkspaceTab["status"], message?: string): void {

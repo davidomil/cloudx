@@ -67,6 +67,12 @@ while True:
         os.write(1, b'\\x1b[r\\x1b[2J\\x1b[HMARKER \\x1b]2;recovered')
     elif data == b'O':
         os.write(1, b'-title\\x07DONE')
+    elif data == b'm':
+        os.write(1, b'\\x1b[2J\\x1b[HMOUSE-READY\\x1b[?1000h\\x1b[?1006h')
+    elif data == b'v':
+        os.write(1, b'\\x1b[r\\x1b[0m\\x1b[2J\\x1b[HHEADER\\x1b[3;1HITEM: \\x1b[31;3m\\x1b7\\x1b[0m\\x1b[5;1HFOOTER')
+    elif data == b'V':
+        os.write(1, b'\\x1b8DONE\\x1b[0m')
 `,
     { mode: 0o755 },
   );
@@ -152,6 +158,32 @@ for (const recovery of [
   "socket reconnect",
   "web-server restoration",
 ] as const) {
+  test(`preserves SGR mouse reports after ${recovery}`, async ({ page }) => {
+    await openFixtureTerminal(page);
+    await page.keyboard.type("m");
+    await expect(page.locator(".xterm-rows")).toContainText("MOUSE-READY");
+    const reports = await clickTerminalAndReadMouseReports(page);
+
+    await recoverTerminal(page, recovery);
+
+    expect(await clickTerminalAndReadMouseReports(page)).toBe(reports);
+  });
+
+  test(`preserves saved cursor position and attributes after ${recovery}`, async ({
+    page,
+  }) => {
+    await openFixtureTerminal(page);
+    await page.keyboard.type("v");
+    await expect(page.locator(".xterm-rows > div").nth(4)).toHaveText("FOOTER");
+    await restoreCursorAndCompleteItem(page);
+
+    await page.keyboard.type("v");
+    await expect(page.locator(".xterm-rows > div").nth(2)).toHaveText("ITEM: ");
+    await recoverTerminal(page, recovery);
+
+    await restoreCursorAndCompleteItem(page);
+  });
+
   test(`preserves scroll margins after ${recovery}`, async ({ page }) => {
     await openFixtureTerminal(page);
     await page.keyboard.type("s");
@@ -276,6 +308,30 @@ async function verifyInputModes(page: Page, stage: string) {
         .toString(),
     )
     .toBe(expected);
+}
+
+async function clickTerminalAndReadMouseReports(page: Page) {
+  const start = (await fs.readFile(path.join(root, "input.bin"))).length;
+  await page.locator(".xterm-screen").click({ position: { x: 20, y: 10 } });
+  const readReports = async () =>
+    (await fs.readFile(path.join(root, "input.bin")))
+      .subarray(start)
+      .toString();
+  await expect
+    .poll(readReports)
+    .toMatch(/^\x1b\[<0;(\d+);(\d+)M\x1b\[<0;\1;\2m$/);
+  return readReports();
+}
+
+async function restoreCursorAndCompleteItem(page: Page) {
+  await page.keyboard.type("V");
+  const rows = page.locator(".xterm-rows > div");
+  await expect(rows.nth(2)).toHaveText("ITEM: DONE");
+  await expect(rows.nth(0)).toHaveText("HEADER");
+  await expect(rows.nth(4)).toHaveText("FOOTER");
+  const completed = rows.nth(2).locator(".xterm-fg-1");
+  await expect(completed).toHaveText("DONE");
+  await expect(completed).toHaveCSS("font-style", "italic");
 }
 
 async function paste(page: Page, text: string) {

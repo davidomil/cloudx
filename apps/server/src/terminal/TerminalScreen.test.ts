@@ -4,6 +4,50 @@ import { describe, expect, it } from "vitest";
 import { TerminalScreen } from "./TerminalScreen.js";
 
 describe("terminal screen recovery", () => {
+  it.each([
+    ["SGR", "\x1b[?1006h", "SGR"],
+    ["SGR pixels", "\x1b[?1016h", "SGR_PIXELS"],
+    ["disabled SGR", "\x1b[?1006h\x1b[?1006l", "DEFAULT"],
+    ["reset SGR", "\x1b[?1006h\x1bc", "DEFAULT"],
+  ])("retains %s mouse encoding through repeated screen restoration", async (_name, setup, encoding) => {
+    const screen = new TerminalScreen(20, 6);
+    const replacement = new TerminalScreen();
+    const restored = new Terminal({ cols: 20, rows: 6, allowProposedApi: true });
+    try {
+      screen.write(`\x1b[?1000h${setup}READY`);
+      replacement.restore(await screen.snapshot());
+      await writeTerminal(restored, (await replacement.snapshot()).data);
+      expect((restored as unknown as { _core: { coreMouseService: { activeEncoding: string } } })._core.coreMouseService.activeEncoding).toBe(encoding);
+    } finally {
+      await screen.dispose();
+      await replacement.dispose();
+      restored.dispose();
+    }
+  });
+
+  it.each([
+    ["normal DECSC", "", "\x1b7", "\x1b8"],
+    ["alternate DECSC", "\x1b[?1049h", "\x1b7", "\x1b8"],
+    ["ANSI cursor", "", "\x1b[s", "\x1b[u"],
+    ["private cursor", "", "\x1b[?1048h", "\x1b[?1048l"],
+  ])("retains %s position and attributes without moving the active cursor", async (_name, buffer, save, restore) => {
+    const setup = `${buffer}HEADER\x1b[3;1HITEM: \x1b[1;3;4;31;44m${save}\x1b[0;32m\x1b[5;1HFOOTER`;
+    await expectContinuedScreen(setup, `!${restore}DONE`);
+  });
+
+  it.each([
+    ["saved normal cursor after alternate switch", "HEADER\x1b[3;1HITEM: \x1b[31m\x1b7\x1b[0m\x1b[5;1HFOOTER\x1b[?47hALT", "\x1b[?1049lDONE"],
+    ["independent saved cursors in both buffers", "HEADER\x1b[3;1HITEM: \x1b[31m\x1b[?1049h\x1b[2;1HALT: \x1b[34m\x1b7\x1b[0m\x1b[5;1HFOOTER", "\x1b8DONE\x1b[?1049lDONE"],
+    ["scroll margins and origin mode", "HEADER\x1b[5;1HFOOTER\x1b[2;4r\x1b[?6h\x1b[2;1HITEM: \x1b[31m\x1b7\x1b[32m\x1b[3;1HEND", "!\x1b8DONE"],
+    ["saved cursor in scrollback", "\x1b[31m\x1b7" + "LINE\r\n".repeat(12) + "\x1b[0mFOOTER", "!\x1b8DONE"],
+    ["pending wrap", "\x1b[3;1HITEM: \x1b7\x1b[5;1H123456789012345678\x1b[31m漢\x1b[32m", "!\x1b8DONE"],
+    ["saved truecolor and indexed colors", "\x1b[3;1HITEM: \x1b[38;2;12;34;56;48;5;123;2;7;9;53m\x1b7\x1b[0m\x1b[5;1HFOOTER", "!\x1b8DONE"],
+    ["saved blinking and invisible text", "\x1b[3;1HITEM: \x1b[38;5;123;48;2;12;34;56;5;8m\x1b7\x1b[0m\x1b[5;1HFOOTER", "!\x1b8DONE"],
+    ["reset saved cursor", "\x1b[3;1H\x1b[31m\x1b7\x1bcHEADER\x1b[5;1HFOOTER", "!\x1b8DONE"],
+  ])("preserves %s while continuing after restoration", async (_name, setup, continuation) => {
+    await expectContinuedScreen(setup!, continuation!);
+  });
+
   it.each(["normal", "alternate", "origin"])("retains protected rows and the cursor in the %s scrolling region", async (mode) => {
     const screen = new TerminalScreen(20, 6);
     screen.write(`${mode === "alternate" ? "\x1b[?1049h" : ""}HEADER\r\nONE\r\nTWO\r\nTHREE\r\nFOOTER\x1b[2;4r`);
@@ -196,6 +240,40 @@ describe("terminal screen recovery", () => {
     replacement.dispose();
   });
 });
+
+async function expectContinuedScreen(setup: string, continuation: string): Promise<void> {
+  const screen = new TerminalScreen(20, 6);
+  const replacement = new TerminalScreen();
+  const expected = new Terminal({ cols: 20, rows: 6, scrollback: 1000, allowProposedApi: true });
+  const restored = new Terminal({ cols: 20, rows: 6, scrollback: 1000, allowProposedApi: true });
+  try {
+    screen.write(setup);
+    await writeTerminal(expected, setup + continuation);
+    replacement.restore(await screen.snapshot());
+    await writeTerminal(restored, (await replacement.snapshot()).data + continuation);
+    for (const kind of ["normal", "alternate"] as const) {
+      const expectedBuffer = expected.buffer[kind];
+      const actualBuffer = restored.buffer[kind];
+      for (let y = 0; y < expected.rows; y++) {
+        const expectedLine = expectedBuffer.getLine(expectedBuffer.baseY + y);
+        const actualLine = actualBuffer.getLine(actualBuffer.baseY + y);
+        expect(actualLine?.translateToString(true), `${kind} row ${y}`).toBe(expectedLine?.translateToString(true));
+        for (let x = 0; x < expected.cols; x++) {
+          const expectedCell = expectedLine?.getCell(x);
+          const actualCell = actualLine?.getCell(x);
+          for (const attribute of ["getFgColor", "getBgColor", "isBold", "isItalic", "isUnderline", "isInverse", "isDim", "isBlink", "isInvisible", "isStrikethrough", "isOverline"] as const) {
+            expect(actualCell?.[attribute](), `${kind} row ${y} col ${x} ${attribute}`).toBe(expectedCell?.[attribute]());
+          }
+        }
+      }
+    }
+  } finally {
+    await screen.dispose();
+    await replacement.dispose();
+    expected.dispose();
+    restored.dispose();
+  }
+}
 
 function writeTerminal(terminal: Terminal, data: string): Promise<void> {
   return new Promise((resolve) => terminal.write(data, resolve));
