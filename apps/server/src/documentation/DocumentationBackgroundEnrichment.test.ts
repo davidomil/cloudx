@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DocumentationBackgroundEnrichment } from "./DocumentationBackgroundEnrichment.js";
 import type { DocumentationClient } from "./DocumentationClient.js";
-import type { DocumentationEnrichmentService } from "./DocumentationEnrichmentService.js";
+import { DocumentationEnrichmentService, type DocumentationEnrichmentRunner } from "./DocumentationEnrichmentService.js";
 
 describe("DocumentationBackgroundEnrichment", () => {
   const workers: DocumentationBackgroundEnrichment[] = [];
@@ -82,6 +82,63 @@ describe("DocumentationBackgroundEnrichment", () => {
     }
   });
 
+  it("starts a newly imported document on the next poll while an earlier document remains active", async () => {
+    const { worker, client, started, importDocument, finish } = productionFixture();
+    importDocument("slow");
+    worker.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(started).toEqual(["slow"]);
+
+    importDocument("new");
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(started).toEqual(["slow"]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(started).toEqual(["slow", "new"]);
+    expect(client.enrichDocument).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+
+    finish("new");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.enrichDocument).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ documentId: "new" }), { signal: expect.any(AbortSignal) });
+    expect(vi.getTimerCount()).toBe(1);
+  });
+
+  it("starts the next document after a foreground duplicate becomes unchanged while its sibling remains active", async () => {
+    const { worker, client, enrichment, started, importDocument, finish, reportError } = productionFixture();
+    for (const id of ["duplicate", "slow", "next"]) importDocument(id);
+    const foreground = enrichment.enrichIngestResponse({ document: document("duplicate") });
+    await vi.advanceTimersByTimeAsync(0);
+    worker.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(started).toEqual(["duplicate", "slow"]);
+
+    finish("duplicate");
+    await foreground;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(started).toEqual(["duplicate", "slow", "next"]);
+    expect(client.enrichDocument).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ documentId: "duplicate" }));
+    expect(reportError).not.toHaveBeenCalled();
+  });
+
+  it("cancels the spare-capacity discovery timer and active enrichment when disposed", async () => {
+    const { worker, client, started, importDocument, reportError } = productionFixture();
+    importDocument("slow");
+    worker.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(started).toEqual(["slow"]);
+    expect(vi.getTimerCount()).toBe(1);
+
+    await worker.dispose();
+    importDocument("new");
+    worker.start();
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(started).toEqual(["slow"]);
+    expect(client.pendingEnrichments).toHaveBeenCalledTimes(1);
+    expect(client.enrichDocument).not.toHaveBeenCalled();
+    expect(reportError).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("discovers imports added after the startup drain on the next poll", async () => {
     const { worker, client, enrichment } = fixture();
     worker.start();
@@ -150,8 +207,9 @@ describe("DocumentationBackgroundEnrichment", () => {
       await vi.advanceTimersByTimeAsync(0);
       worker.start();
       await vi.advanceTimersByTimeAsync(60_000);
-      expect(client.pendingEnrichments).toHaveBeenCalledTimes(1);
+      expect(client.pendingEnrichments).toHaveBeenCalledTimes(3);
       expect(enrichment.enrichIngestResponse).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(1);
     } finally {
       first.resolve(outcome("written"));
     }
@@ -259,18 +317,69 @@ describe("DocumentationBackgroundEnrichment", () => {
   });
 
   it.each([{}, { enrichment: { results: [] } }, outcome("unchanged")])(
-    "ends the drain when a document produces no new terminal outcome: %j",
+    "does not repeat a candidate that produces no new terminal outcome in the same drain: %j",
     async (response) => {
       const { worker, client, enrichment } = fixture();
       client.pendingEnrichments.mockResolvedValue([document("pending")]);
       enrichment.enrichIngestResponse.mockResolvedValue(response);
       worker.start();
       await vi.advanceTimersByTimeAsync(0);
-      expect(client.pendingEnrichments).toHaveBeenCalledTimes(1);
+      expect(client.pendingEnrichments).toHaveBeenCalledTimes(2);
+      expect(enrichment.enrichIngestResponse).toHaveBeenCalledTimes(1);
       expect(client.recordEnrichmentOutcome).not.toHaveBeenCalled();
       expect(vi.getTimerCount()).toBe(1);
     }
   );
+
+  it("discovers siblings beyond an unchanged candidate without repeatedly enriching it", async () => {
+    const { worker, client, enrichment } = fixture();
+    const slow = deferred<Record<string, unknown>>();
+    const next = deferred<Record<string, unknown>>();
+    client.pendingEnrichments.mockImplementation(async (limit) => [document("unchanged"), document("slow"), document("next")].slice(0, limit));
+    enrichment.enrichIngestResponse
+      .mockResolvedValueOnce(outcome("unchanged"))
+      .mockReturnValueOnce(slow.promise)
+      .mockReturnValueOnce(next.promise);
+    worker.start();
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(enrichedIds(enrichment)).toEqual(["unchanged", "slow", "next"]);
+      expect(client.pendingEnrichments).toHaveBeenNthCalledWith(2, 3, { signal: expect.any(AbortSignal) });
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(client.pendingEnrichments).toHaveBeenCalledTimes(2);
+      expect(enrichedIds(enrichment)).toEqual(["unchanged", "slow", "next"]);
+    } finally {
+      client.pendingEnrichments.mockResolvedValue([]);
+      slow.resolve(outcome("written"));
+      next.resolve(outcome("written"));
+    }
+  });
+
+  it("admits a replacement extraction for an unchanged candidate while another document remains active", async () => {
+    const { worker, client, enrichment } = fixture();
+    const slow = deferred<Record<string, unknown>>();
+    let candidate = document("pending");
+    client.pendingEnrichments.mockImplementation(async () => [candidate, document("slow")]);
+    enrichment.enrichIngestResponse
+      .mockResolvedValue(outcome("unchanged"))
+      .mockResolvedValueOnce(outcome("unchanged"))
+      .mockReturnValueOnce(slow.promise);
+    worker.start();
+    try {
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(enrichedIds(enrichment)).toEqual(["pending", "slow"]);
+      expect(client.pendingEnrichments).toHaveBeenCalledTimes(5);
+
+      candidate = { ...candidate, extractionRevision: "f".repeat(32) };
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(enrichedIds(enrichment)).toEqual(["pending", "slow", "pending"]);
+      expect(enrichment.enrichIngestResponse).toHaveBeenLastCalledWith({ document: candidate }, {}, { signal: expect.any(AbortSignal), onlyPending: true });
+      expect(vi.getTimerCount()).toBe(1);
+    } finally {
+      client.pendingEnrichments.mockResolvedValue([]);
+      slow.resolve(outcome("written"));
+    }
+  });
 
   it.each(["discovery", "enrichment", "outcome"] as const)(
     "aborts all active %s work and awaits every cleanup before disposal finishes",
@@ -351,6 +460,61 @@ describe("DocumentationBackgroundEnrichment", () => {
     );
     workers.push(worker);
     return { worker, client, enrichment, reportError };
+  }
+
+  function productionFixture() {
+    const documents = new Map<string, ReturnType<typeof document>>();
+    const written = new Set<string>();
+    const completions = new Map<string, (output: unknown) => void>();
+    const started: string[] = [];
+    const client = {
+      health: vi.fn<DocumentationClient["health"]>().mockResolvedValue({}),
+      pendingEnrichments: vi.fn<DocumentationClient["pendingEnrichments"]>(async (limit) =>
+        [...documents.values()].filter(({ documentId }) => !written.has(documentId)).slice(0, limit)),
+      getDocument: vi.fn<DocumentationClient["getDocument"]>(async (input) => {
+        const documentId = String(input.documentId);
+        return { document: {
+          document_id: documentId,
+          state: "active",
+          extraction_revision: document(documentId).extractionRevision,
+          chunks: [{ chunk_origin: written.has(documentId) ? "ai" : "source", locator: "text", text: `Evidence for ${documentId}.` }]
+        } };
+      }),
+      enrichDocument: vi.fn<DocumentationClient["enrichDocument"]>(async ({ documentId }) => {
+        written.add(documentId);
+        return {};
+      })
+    };
+    const runner: DocumentationEnrichmentRunner = {
+      model: "test-model",
+      run(prompt, { signal } = {}) {
+        const id = /Evidence for (\w+)\./u.exec(prompt)?.[1];
+        if (!id) throw new Error("Missing document evidence in model prompt.");
+        started.push(id);
+        return new Promise((resolve, reject) => {
+          const abort = () => reject(signal!.reason);
+          signal?.addEventListener("abort", abort, { once: true });
+          completions.set(id, (output) => {
+            signal?.removeEventListener("abort", abort);
+            resolve(output);
+          });
+        });
+      }
+    };
+    const enrichment = new DocumentationEnrichmentService({
+      client: client as unknown as DocumentationClient,
+      config: { isAiControlEnabled: () => true, getPluginConfig: () => ({ aiEnrichmentEnabled: true, aiEnrichmentSkillIds: "test-skill" }) } as never,
+      rulesSkills: { list: async () => ({ skills: [{ id: "test-skill", instructions: "Summarize source evidence." }], systemSkills: [] }) } as never,
+      runner
+    });
+    const reportError = vi.fn();
+    const worker = new DocumentationBackgroundEnrichment(client as unknown as DocumentationClient, enrichment, reportError);
+    workers.push(worker);
+    return {
+      worker, client, enrichment, started, reportError,
+      importDocument(id: string) { documents.set(id, document(id)); },
+      finish(id: string) { completions.get(id)!({ summary: "Source summary", spans: [{ locator: "ai:metadata", text: `Enriched ${id}.` }], metadata: [], warnings: [] }); }
+    };
   }
 
   function enrichedIds(enrichment: ReturnType<typeof fixture>["enrichment"]) {

@@ -1092,6 +1092,12 @@ class DocumentationArchive:
                     previous_metadata = metadata_path.read_bytes() if metadata_path.exists() else None
                     artifact_dir = snapshot_dir / "extracted"
                     artifacts_published = False
+                    catalog_committed = False
+
+                    def mark_catalog_committed() -> None:
+                        nonlocal catalog_committed
+                        catalog_committed = True
+
                     try:
                         snapshot_path = self._store_snapshot(content, filename, metadata)
                         if prepared.exists():
@@ -1108,8 +1114,11 @@ class DocumentationArchive:
                             spans=spans,
                             collection=collection,
                             tags=tags,
+                            on_commit=mark_catalog_committed,
                         )
                     except Exception:
+                        if catalog_committed:
+                            raise
                         if artifacts_published and artifact_dir.exists():
                             shutil.rmtree(artifact_dir)
                         if previous_artifacts.exists():
@@ -1453,6 +1462,7 @@ class DocumentationArchive:
         progress: ProgressReporter | None = None,
         append_chunks_only: bool = False,
         imported_generation: IndexGeneration | None = None,
+        on_commit: Callable[[], None] | None = None,
     ) -> tuple[Any, IndexGeneration]:
         with self._write_lock:
             previous_generation_id = self._active_index_generation()
@@ -1481,6 +1491,8 @@ class DocumentationArchive:
             finally:
                 db.close()
             assert generation is not None
+            if on_commit is not None:
+                on_commit()
             if project:
                 self._reconcile_index_projection(generation, strict=False)
             return result, generation
@@ -1726,6 +1738,7 @@ class DocumentationArchive:
         spans: list[ExtractedSpan],
         collection: str | None,
         tags: list[str] | None,
+        on_commit: Callable[[], None] | None = None,
     ) -> IngestedDocument:
         chunks = chunk_spans(spans)
         if not chunks:
@@ -1805,7 +1818,7 @@ class DocumentationArchive:
                 )
 
         try:
-            self._publish_catalog_change(write_document)
+            self._publish_catalog_change(write_document, on_commit=on_commit)
         except Exception:
             self._discard_unreferenced_snapshot(snapshot_path)
             raise
@@ -1925,10 +1938,12 @@ class DocumentationArchive:
         return results
 
     def _store_snapshot(self, content: bytes, filename: str, metadata: dict | None = None) -> Path:
+        safe_name = safe_file_name(filename)
+        if safe_name == "extracted":
+            raise ArchiveError("Source filename is reserved for archive artifacts: extracted.")
         digest = sha256_bytes(content)
         directory = self.snapshots_dir / digest
         directory.mkdir(parents=True, exist_ok=True)
-        safe_name = safe_file_name(filename)
         artifact = directory / safe_name
         if not artifact.exists():
             artifact.write_bytes(content)

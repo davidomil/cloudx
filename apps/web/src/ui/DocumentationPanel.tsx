@@ -490,8 +490,9 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   }
 
   async function loadArchiveSummary() {
+    const requestId = ++ingestController.summaryRequestId;
     const statsResult = await call<Record<string, unknown>>("documentation.summary");
-    if (!ingestController.disposed) setStats(statsResult);
+    if (!ingestController.disposed && ingestController.summaryRequestId === requestId) setStats(statsResult);
   }
 
   async function loadStorageDetails() {

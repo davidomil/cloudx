@@ -1155,6 +1155,97 @@ describe("DocumentationPanel", () => {
     await unmount(root);
   });
 
+  it("keeps the latest archive counts when concurrent imports receive summaries in reverse order", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const firstImport = deferred<Record<string, unknown>>();
+    const secondImport = deferred<Record<string, unknown>>();
+    const firstSummary = deferred<Record<string, unknown>>();
+    const secondSummary = deferred<Record<string, unknown>>();
+    const imports = [firstImport, secondImport];
+    const summaries = [firstSummary, secondSummary];
+    let ingestCalls = 0;
+    let summaryCalls = 0;
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string) => {
+      if (hookId === "documentation.summary") {
+        summaryCalls += 1;
+        return summaryCalls === 1
+          ? hookResult<T>({ activeDocumentCount: 0, activeChunkCount: 0 })
+          : summaries[summaryCalls - 2]!.promise as Promise<T>;
+      }
+      if (hookId === "documentation.ingest.text") {
+        return imports[ingestCalls++]!.promise as Promise<T>;
+      }
+      return {} as T;
+    };
+    await act(async () => root.render(createElement(DocumentationPanel, { callHook })));
+    await click(buttonByText(container, "text"));
+    await act(async () => setTextAreaValue(textAreaByLabel(container, "Text"), "First imported document."));
+    await click(buttonByText(container, "Queue"));
+    await act(async () => setTextAreaValue(textAreaByLabel(container, "Text"), "Second imported document."));
+    await click(buttonByText(container, "Queue"));
+    expect(ingestCalls).toBe(2);
+    expect(container.textContent).toContain("2 running · 0 queued");
+
+    await act(async () => firstImport.resolve({}));
+    await flushAsyncWork();
+    expect(summaryCalls).toBe(2);
+    await act(async () => secondImport.resolve({}));
+    await flushAsyncWork();
+    expect(summaryCalls).toBe(3);
+
+    await act(async () => secondSummary.resolve({ activeDocumentCount: 2, activeChunkCount: 2 }));
+    await flushAsyncWork();
+    expect(container.textContent).toContain("2 active documents, 2 active chunks");
+    await act(async () => firstSummary.resolve({ activeDocumentCount: 1, activeChunkCount: 1 }));
+    await flushAsyncWork();
+
+    expect(container.textContent).toContain("idle · 0 queued");
+    expect(progressBars(container)).toHaveLength(2);
+    expect(progressBars(container).every((bar) => bar.getAttribute("aria-valuenow") === "100")).toBe(true);
+    expect(container.textContent).toContain("2 active documents, 2 active chunks");
+    await unmount(root);
+  });
+
+  it("ignores an older archive summary after the panel remounts", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    let root = createRoot(container);
+    let mounted = true;
+    let panelState: DocumentationPanelState | undefined;
+    const firstSummary = deferred<Record<string, unknown>>();
+    let summaryCalls = 0;
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string) => {
+      if (hookId === "documentation.summary") {
+        summaryCalls += 1;
+        return summaryCalls === 1
+          ? firstSummary.promise as Promise<T>
+          : hookResult<T>({ activeDocumentCount: 2, activeChunkCount: 2 });
+      }
+      return {} as T;
+    };
+    const applyState = (updater: DocumentationPanelStateUpdater) => {
+      panelState = updater(panelState);
+      if (mounted) root.render(panelElement());
+    };
+    const panelElement = () => createElement(DocumentationPanel, { callHook, stateKey: "summary-remount", state: panelState, onStateChange: applyState });
+    await act(async () => root.render(panelElement()));
+    mounted = false;
+    await unmount(root);
+    root = createRoot(container);
+    mounted = true;
+    await act(async () => root.render(panelElement()));
+    expect(summaryCalls).toBe(2);
+    expect(container.textContent).toContain("2 active documents, 2 active chunks");
+
+    await act(async () => firstSummary.resolve({ activeDocumentCount: 1, activeChunkCount: 1 }));
+    await flushAsyncWork();
+
+    expect(container.textContent).toContain("2 active documents, 2 active chunks");
+    await unmount(root);
+  });
+
   it("preserves panel and queued import state across unmounts", async () => {
     const container = document.createElement("div");
     document.body.append(container);

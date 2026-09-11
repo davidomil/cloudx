@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import json
+import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -226,6 +229,70 @@ def test_failed_publication_preserves_previous_source_analysis(tmp_path: Path, m
     assert (snapshot_dir / "metadata.json").read_bytes() == metadata
     assert archive.get_document(document.document_id) == original
     assert sorted(archive.snapshots_dir.rglob("*")) == published_files
+
+
+@pytest.mark.parametrize("duplicate", [False, True], ids=["fresh", "duplicate"])
+def test_committed_ingest_retains_source_analysis_after_projection_failure_and_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, duplicate: bool):
+    archive = DocumentationArchive(tmp_path / "archive")
+    source = io.BytesIO()
+    Image.new("RGB", (10, 10)).save(source, format="PNG")
+    content = source.getvalue()
+    extract_bytes = archive_module.extract_bytes
+    analysis = "Original analysis"
+
+    def extract(content, name, source_type, content_type, artifact_dir):
+        spans = extract_bytes(content, name, source_type, content_type, artifact_dir)
+        (artifact_dir / "analysis.txt").write_text(analysis)
+        return [*spans, ExtractedSpan(analysis, "text")]
+
+    monkeypatch.setattr(archive_module, "extract_bytes", extract)
+    if duplicate:
+        archive.ingest_upload(filename="source.png", content=content, content_type="image/png")
+    analysis = "Committed replacement analysis"
+    metadata = {"filename": "source.png", "contentType": "image/png; name=source.png", "upload": True}
+
+    def fail_projection_read():
+        documents = archive.list_documents()
+        assert len(documents) == 1
+        committed = archive.get_document(documents[0]["document_id"])
+        assert committed["chunks"][-1]["text"] == analysis
+        raise sqlite3.OperationalError("database is locked")
+
+    with monkeypatch.context() as projection_failure:
+        projection_failure.setattr(archive, "_projected_index_generation", fail_projection_read)
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            archive.ingest_upload(filename="source.png", content=content, content_type=metadata["contentType"])
+
+    for restart in [False, True]:
+        current = DocumentationArchive(archive.root) if restart else archive
+        documents = current.list_documents()
+        assert len(documents) == 1
+        document = current.get_document(documents[0]["document_id"])
+        snapshot = current.root / document["snapshot_path"]
+        assert snapshot.is_file()
+        assert snapshot.read_bytes() == content
+        assert archive_module.sha256_file(snapshot) == document["content_sha256"]
+        assert (snapshot.parent / "extracted" / "images" / "source.png").is_file()
+        assert (snapshot.parent / "extracted" / "analysis.txt").read_text() == analysis
+        assert json.loads((snapshot.parent / "metadata.json").read_text()) == metadata
+        assert document["chunks"][-1]["text"] == analysis
+        assert current.search(analysis, mode="lexical")[0]["documentId"] == document["document_id"]
+    assert not list(archive.snapshots_dir.glob("ingest-publication-*"))
+    assert current.health()["ready"] is True
+
+
+@pytest.mark.parametrize("filename", ["extracted", "..extracted.."])
+def test_upload_rejects_reserved_artifact_directory_name_before_publication(tmp_path: Path, filename: str):
+    archive = DocumentationArchive(tmp_path / "archive")
+    source = io.BytesIO()
+    Image.new("RGB", (10, 10)).save(source, format="PNG")
+
+    with pytest.raises(archive_module.ArchiveError, match="reserved.*extracted"):
+        archive.ingest_upload(filename=filename, content=source.getvalue(), content_type="image/png")
+
+    assert archive.list_documents() == []
+    assert list(archive.snapshots_dir.iterdir()) == []
+    assert archive.health()["ready"] is True
 
 
 @pytest.mark.parametrize("failure", ["video", "progress"])

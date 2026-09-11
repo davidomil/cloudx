@@ -44,28 +44,53 @@ export class DocumentationBackgroundEnrichment {
   private async drain(): Promise<void> {
     const signal = this.controller.signal;
     const active = new Map<string, Promise<void>>();
+    const unchanged = new Map<string, string>();
     let stopped = false;
     const canAdmit = () => !stopped && !this.paused && !signal.aborted && this.enrichment.isEnabled();
     try {
       while (canAdmit()) {
         const alreadyAdmitted = new Set(active.keys());
-        const documents = await this.client.pendingEnrichments(this.enrichment.concurrency, { signal });
+        const limit = Math.min(100, this.enrichment.concurrency + unchanged.size);
+        const documents = await this.client.pendingEnrichments(limit, { signal });
         for (const document of documents) {
           if (!canAdmit() || active.size >= this.enrichment.concurrency) break;
           if (alreadyAdmitted.has(document.documentId) || active.has(document.documentId)) continue;
+          if (unchanged.get(document.documentId) === document.extractionRevision) continue;
           const task = this.enrichDocument(document).then((outcome) => {
-            if (outcome === "unchanged") stopped = true;
+            if (outcome === "unchanged") unchanged.set(document.documentId, document.extractionRevision);
           }).catch((error) => {
             stopped = true;
             if (!signal.aborted) this.reportError(error);
           }).finally(() => active.delete(document.documentId));
           active.set(document.documentId, task);
         }
-        if (!active.size) return;
-        await Promise.race(active.values());
+        if (!active.size || !canAdmit()) return;
+        await this.waitForCompletionOrDiscovery(active);
       }
     } finally {
       await Promise.all(active.values());
+    }
+  }
+
+  private async waitForCompletionOrDiscovery(active: Map<string, Promise<void>>): Promise<void> {
+    if (active.size >= this.enrichment.concurrency) {
+      await Promise.race(active.values());
+      return;
+    }
+    const signal = this.controller.signal;
+    let wake!: () => void;
+    const poll = new Promise<void>((resolve) => {
+      wake = resolve;
+      this.timer = setTimeout(resolve, POLL_INTERVAL_MS);
+      this.timer.unref();
+      signal.addEventListener("abort", wake, { once: true });
+    });
+    try {
+      await Promise.race([...active.values(), poll]);
+    } finally {
+      clearTimeout(this.timer);
+      this.timer = undefined;
+      signal.removeEventListener("abort", wake);
     }
   }
 
