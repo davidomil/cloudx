@@ -73,6 +73,11 @@ while True:
         os.write(1, b'\\x1b[r\\x1b[0m\\x1b[2J\\x1b[HHEADER\\x1b[3;1HITEM: \\x1b[31;3m\\x1b7\\x1b[0m\\x1b[5;1HFOOTER')
     elif data == b'V':
         os.write(1, b'\\x1b8DONE\\x1b[0m')
+    elif data == b'g':
+        os.write(1, b'\\x1bc\\x1b[1;6H\\x1b[31;3m\\x1b7\\x1b[0m')
+        for line in range(100):
+            os.write(1, f'\\r\\nLINE-{line:03}'.encode())
+        os.write(1, b'\\r\\nSCROLLBACK-READY')
 `,
     { mode: 0o755 },
   );
@@ -182,6 +187,29 @@ for (const recovery of [
     await recoverTerminal(page, recovery);
 
     await restoreCursorAndCompleteItem(page);
+  });
+
+  test(`preserves a saved cursor in scrollback when growing after ${recovery}`, async ({
+    page,
+  }) => {
+    await openFixtureTerminal(page);
+    const viewport = page.viewportSize()!;
+    const rows = page.locator(".xterm-rows > div");
+    const originalRows = await rows.count();
+    expect(originalRows).toBeLessThan(100);
+    const grownViewport = { ...viewport, height: viewport.height + 400 };
+
+    await saveCursorBeforeScrollback(page);
+    await growTerminalAndRestoreCursor(page, grownViewport, originalRows);
+    const uninterruptedRows = await rows.allTextContents();
+
+    await page.setViewportSize(viewport);
+    await expect(rows).toHaveCount(originalRows);
+    await saveCursorBeforeScrollback(page);
+    await recoverTerminal(page, recovery);
+
+    await growTerminalAndRestoreCursor(page, grownViewport, originalRows);
+    await expect(rows).toHaveText(uninterruptedRows);
   });
 
   test(`preserves scroll margins after ${recovery}`, async ({ page }) => {
@@ -330,6 +358,28 @@ async function restoreCursorAndCompleteItem(page: Page) {
   await expect(rows.nth(0)).toHaveText("HEADER");
   await expect(rows.nth(4)).toHaveText("FOOTER");
   const completed = rows.nth(2).locator(".xterm-fg-1");
+  await expect(completed).toHaveText("DONE");
+  await expect(completed).toHaveCSS("font-style", "italic");
+}
+
+async function saveCursorBeforeScrollback(page: Page) {
+  await page.keyboard.type("g");
+  await expect(page.locator(".xterm-rows")).not.toContainText("DONE");
+  await expect(page.locator(".xterm-rows > div").last()).toHaveText(
+    "SCROLLBACK-READY",
+  );
+}
+
+async function growTerminalAndRestoreCursor(
+  page: Page,
+  viewport: { width: number; height: number },
+  originalRows: number,
+) {
+  await page.setViewportSize(viewport);
+  const rows = page.locator(".xterm-rows > div");
+  await expect.poll(() => rows.count()).toBeGreaterThan(originalRows + 10);
+  await page.keyboard.type("V");
+  const completed = rows.first().locator(".xterm-fg-1");
   await expect(completed).toHaveText("DONE");
   await expect(completed).toHaveCSS("font-style", "italic");
 }

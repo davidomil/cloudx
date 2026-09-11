@@ -98,6 +98,7 @@ export class TerminalScreen {
         + "\x1b[?47h\x1b[0m" + data.slice(normal.length + "\x1b[?1049h".length);
     }
     data += this.bufferState(this.terminal.buffer.active, this.terminal.modes.originMode) + this.mouseEncoding() + this.sequences.pending;
+    data = this.savedCursorInScrollback() + data;
     if (Buffer.byteLength(data) > MAX_TERMINAL_SCREEN_BYTES) throw new Error("Terminal screen snapshot exceeded its byte limit.");
     return { data, cols: this.terminal.cols, rows: this.terminal.rows };
   }
@@ -114,12 +115,25 @@ export class TerminalScreen {
     }
   }
 
+  private savedCursorInScrollback(): string {
+    const buffer = this.terminal.buffer.normal;
+    const { savedX, savedY, savedCurAttrData } = (buffer as unknown as {
+      _buffer: { savedX: number; savedY: number; savedCurAttrData: IBufferCell };
+    })._buffer;
+    if (savedY >= buffer.baseY) return "";
+
+    // Save the absolute row before replay creates scrollback. xterm 6's ED3
+    // clears these temporary blank rows without changing savedY. Saving after
+    // replay would clamp to the viewport and change DECRC after height growth.
+    return "\n".repeat(savedY) + `\x1b[${savedX + 1}G${cursorAttributes(savedCurAttrData)}\x1b7\x1b[H\x1b[3J\x1b[0m`;
+  }
+
   private bufferState(buffer: IBuffer, originMode: boolean): string {
     // xterm 6 keeps DECSC/SCOSC/1048 state per buffer and uses absolute savedY.
     const { savedX, savedY, savedCurAttrData } = (buffer as unknown as {
       _buffer: { savedX: number; savedY: number; savedCurAttrData: IBufferCell };
     })._buffer;
-    const hasSavedCursor = savedX !== 0 || savedY !== 0 || !savedCurAttrData.isAttributeDefault();
+    const hasSavedCursor = savedY >= buffer.baseY && (savedX !== 0 || savedY !== 0 || !savedCurAttrData.isAttributeDefault());
     let data = "";
     if (hasSavedCursor) {
       const { _curAttrData } = (this.terminal as unknown as {

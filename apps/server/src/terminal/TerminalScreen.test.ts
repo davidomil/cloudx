@@ -48,6 +48,53 @@ describe("terminal screen recovery", () => {
     await expectContinuedScreen(setup!, continuation!);
   });
 
+  it.each([
+    ["oldest saved row", 0, 100, 26, false],
+    ["saved row revealed by growth", 7, 8, 16, false],
+    ["saved row deep in history", 40, 100, 126, false],
+    ["full scrollback", 0, 1100, 26, false],
+    ["normal cursor while alternate buffer is active", 7, 8, 16, true],
+  ] as const)("preserves %s when growing after repeated restoration", async (_name, savedRow, outputRows, rows, alternate) => {
+    const screen = new TerminalScreen(20, 6);
+    const replacement = new TerminalScreen();
+    const expected = new Terminal({ cols: 20, rows: 6, scrollback: 1000, allowProposedApi: true });
+    const restored = new Terminal({ cols: 20, rows: 6, scrollback: 1000, allowProposedApi: true });
+    const setup = "BEFORE\r\n".repeat(savedRow) + "ITEM: \x1b[3;31m\x1b7\x1b[0m\r\n"
+      + Array.from({ length: outputRows }, (_, row) => `LINE ${row}\r\n`).join("") + "FOOTER"
+      + (alternate ? "\x1b[?47hALTERNATE" : "");
+    const continuation = (alternate ? "\x1b[?47l" : "") + "\x1b8DONE";
+    try {
+      screen.write(setup);
+      await writeTerminal(expected, setup);
+      replacement.restore(await screen.snapshot());
+      await writeTerminal(restored, (await replacement.snapshot()).data);
+      expected.resize(20, rows);
+      restored.resize(20, rows);
+      replacement.resize(20, rows);
+      await writeTerminal(expected, continuation);
+      await writeTerminal(restored, continuation);
+      replacement.write(continuation);
+      expect(visibleRows(restored)).toEqual(visibleRows(expected));
+      expect(restored.buffer.active.baseY).toBe(expected.buffer.active.baseY);
+      expect(restored.buffer.active.cursorY).toBe(expected.buffer.active.cursorY);
+      const doneRow = expected.buffer.active.baseY + expected.buffer.active.cursorY;
+      for (const terminal of [expected, restored]) {
+        const done = terminal.buffer.active.getLine(doneRow)?.getCell(6);
+        expect(done?.getChars()).toBe("D");
+        expect(done?.getFgColor()).toBe(1);
+        expect(done?.isItalic()).toBeTruthy();
+      }
+      restored.reset();
+      await writeTerminal(restored, (await replacement.snapshot()).data);
+      expect(visibleRows(restored)).toEqual(visibleRows(expected));
+    } finally {
+      await screen.dispose();
+      await replacement.dispose();
+      expected.dispose();
+      restored.dispose();
+    }
+  });
+
   it.each(["normal", "alternate", "origin"])("retains protected rows and the cursor in the %s scrolling region", async (mode) => {
     const screen = new TerminalScreen(20, 6);
     screen.write(`${mode === "alternate" ? "\x1b[?1049h" : ""}HEADER\r\nONE\r\nTWO\r\nTHREE\r\nFOOTER\x1b[2;4r`);
