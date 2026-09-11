@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DurableTerminalProcessFactory } from "./DurableTerminalProcess.js";
 import { TerminalBroker } from "./TerminalBroker.js";
-import { isTerminalRequest, MAX_TERMINAL_MESSAGE_BYTES, terminalReplay, terminalSocketPath } from "./TerminalBrokerProtocol.js";
+import { isTerminalRequest, MAX_TERMINAL_INPUT_BYTES, MAX_TERMINAL_MESSAGE_BYTES, readTerminalMessages, terminalReplay, terminalSocketPath } from "./TerminalBrokerProtocol.js";
 import type { TerminalProcess } from "./TerminalProcess.js";
 import type { TerminalExit } from "./TerminalSupervisor.js";
 
@@ -14,6 +14,74 @@ const cleanups: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
 describe("durable terminal broker", () => {
+  it.each([
+    "a".repeat(MAX_TERMINAL_INPUT_BYTES),
+    "b".repeat(300 * 1024),
+    "界😀".repeat(60 * 1024)
+  ])("delivers large input intact and accepts subsequent input (%#)", async (input) => {
+    const { factory, process } = await fixture();
+    const terminal = await factory.spawn("shell", [], options("large-input"));
+    const disconnected = vi.fn();
+    terminal.onDisconnect!(disconnected);
+    terminal.write(input);
+    terminal.write("\nNEXT_COMMAND\n");
+    await vi.waitFor(() => expect(process.write.mock.calls.map(([data]) => data).join("")).toBe(input + "\nNEXT_COMMAND\n"));
+    for (const [chunk] of process.write.mock.calls) {
+      expect(Buffer.byteLength(chunk)).toBeLessThanOrEqual(MAX_TERMINAL_INPUT_BYTES);
+    }
+    expect(disconnected).not.toHaveBeenCalled();
+    await terminal.terminate();
+  });
+
+  it("rejects input exceeding available send capacity without sending a prefix or disconnecting", async () => {
+    const { factory, process } = await fixture();
+    const terminal = await factory.spawn("shell", [], options("input-capacity"));
+    expect(() => terminal.write("\u0000".repeat(2 * 1024 * 1024))).toThrow("No input was sent");
+    terminal.write("still usable\n");
+    await vi.waitFor(() => expect(process.write).toHaveBeenCalledExactlyOnceWith("still usable\n"));
+    await terminal.terminate();
+  });
+
+  it.each([
+    ["large ASCII", "r".repeat(16 * 1024 * 1024)],
+    ["escaped controls", "\u0000\u001b\u0007".repeat(1024 * 1024)]
+  ])("streams complete %s replay before live output and exit while respecting backpressure", async (_name, replay) => {
+    const { factory, process, socketPath } = await fixture(Buffer.byteLength(replay));
+    const original = await factory.spawn("shell", [], options("large-replay"));
+    original.detach!();
+    process.data(replay);
+
+    const socket = net.createConnection(socketPath);
+    cleanups.push(async () => { socket.destroy(); });
+    socket.on("error", () => {});
+    let received = "";
+    let sentLive = false;
+    let exited = false;
+    readTerminalMessages(socket, (value) => {
+      const message = value as { type: string; data?: string };
+      if (message.type === "data") {
+        received += message.data!;
+        if (!sentLive) {
+          sentLive = true;
+          process.data("LIVE_AFTER_REPLAY");
+          process.exit({ exitCode: 0 });
+        }
+      }
+      if (message.type === "exit") exited = true;
+    });
+    await new Promise<void>((resolve) => socket.once("connect", resolve));
+    socket.pause();
+    socket.write(JSON.stringify({ type: "attach", sessionId: "large-replay" }) + "\n");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(socket.destroyed).toBe(false);
+    socket.resume();
+    await vi.waitFor(() => expect(exited).toBe(true), { timeout: 10_000 });
+    expect(received).toBe(replay + "LIVE_AFTER_REPLAY");
+    expect(socket.destroyed).toBe(false);
+    socket.write(JSON.stringify({ type: "write", data: "AFTER_REPLAY\n" }) + "\n");
+    await vi.waitFor(() => expect(process.write).toHaveBeenCalledWith("AFTER_REPLAY\n"));
+  }, 15_000);
+
   it("keeps the terminal alive when detached, replays bounded output, and forwards input and explicit shutdown", async () => {
     const { factory, process, spawn } = await fixture(8);
     const first = await factory.spawn("shell", [], options("tab-1"));
@@ -96,6 +164,22 @@ describe("durable terminal broker", () => {
     await expect(terminal.terminate()).rejects.toThrow("Descendants are still running");
     await expect(factory.spawn("duplicate", [], options("failed-start"))).rejects.toThrow("already exists");
     expect(spawn).toHaveBeenCalledTimes(2);
+    const recovered = await factory.attach("failed-start");
+    await recovered.terminate();
+    await expect(factory.attach("failed-start")).rejects.toThrow("not restarted");
+  });
+
+  it("delivers output produced during termination before acknowledging shutdown", async () => {
+    const { factory, process } = await fixture();
+    const terminal = await factory.spawn("shell", [], options("final-output"));
+    let output = "";
+    terminal.onData((data) => { output += data; });
+    process.terminate.mockImplementationOnce(async () => {
+      process.data("FINAL_OUTPUT");
+      process.exit({ exitCode: 0 });
+    });
+    await terminal.terminate();
+    expect(output).toBe("FINAL_OUTPUT");
   });
 
   it("does not replace a socket already owned by a running broker", async () => {
@@ -145,6 +229,32 @@ describe("durable terminal broker", () => {
     await expect(terminal.terminate()).rejects.toThrow("connection is closed");
   });
 
+  it("restores complete screen chunks and output received before the first subscription", async () => {
+    const factory = await respondingBroker([
+      { type: "data", data: "raw tail" },
+      { type: "screen", data: "screen", cols: 80, rows: 24, complete: false },
+      { type: "screen", data: " snapshot", cols: 80, rows: 24, complete: true },
+      { type: "ready" },
+      { type: "data", data: " then live" }
+    ]);
+    const terminal = await factory.attach("screen-cutoff");
+    let output = "";
+    terminal.onData((data) => { output += data; });
+    const screen = vi.fn();
+    terminal.onScreen!(screen);
+    expect(screen).toHaveBeenCalledExactlyOnceWith({ data: "screen snapshot then live", cols: 80, rows: 24 });
+    expect(output).toBe("raw tail then live");
+    terminal.detach!();
+  });
+
+  it.each([
+    [{ type: "screen", data: "partial", cols: 80, rows: 24, complete: false }, { type: "ready" }],
+    [{ type: "screen", data: "partial", cols: 80, rows: 24, complete: false }, { type: "screen", data: "rest", cols: 90, rows: 24, complete: true }]
+  ].map((messages) => ({ messages })))("rejects incomplete or inconsistent screen assembly (%#)", async ({ messages }) => {
+    const factory = await respondingBroker(messages);
+    await expect(factory.attach("invalid-screen")).rejects.toThrow("incomplete or inconsistent");
+  });
+
   it("uses a short stable socket path and retains complete Unicode characters in replay", () => {
     expect(Buffer.byteLength(terminalSocketPath(`/a/${"long-path/".repeat(40)}`))).toBeLessThan(104);
     expect(terminalSocketPath("/a/../b")).toBe(terminalSocketPath("/b"));
@@ -167,6 +277,25 @@ async function temporaryDirectory(): Promise<string> {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-broker-test-"));
   cleanups.push(() => fs.rm(directory, { recursive: true, force: true }));
   return directory;
+}
+
+async function respondingBroker(messages: unknown[]) {
+  const directory = await temporaryDirectory();
+  const socketPath = path.join(directory, "broker.sock");
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("error", () => {});
+    socket.once("close", () => sockets.delete(socket));
+    socket.once("data", () => socket.write(messages.map((message) => JSON.stringify(message) + "\n").join("")));
+  });
+  await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+  await fs.chmod(socketPath, 0o600);
+  cleanups.push(() => {
+    for (const socket of sockets) socket.destroy();
+    return new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  return new DurableTerminalProcessFactory(socketPath, { spawn: vi.fn() });
 }
 
 async function fixture(replayBytes?: number) {

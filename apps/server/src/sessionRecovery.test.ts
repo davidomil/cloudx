@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { listTabLayoutPanes } from "@cloudx/shared";
+import { PluginSessionMissingError } from "@cloudx/plugin-api";
 import { TabContextService } from "./context/TabContextService.js";
 import { JsonStateFile } from "./jsonStateFile.js";
 import { PathPolicy } from "./pathPolicy.js";
@@ -44,7 +45,7 @@ async function fixture() {
     }),
     attach: vi.fn(async (id: string) => {
       const terminal = running.get(id);
-      if (!terminal) throw new Error("The running terminal is unavailable.");
+      if (!terminal) throw new PluginSessionMissingError("The running terminal is unavailable.");
       return terminal;
     })
   };
@@ -101,9 +102,10 @@ describe("workspace recovery after server updates", () => {
     const { running, createStore } = await fixture();
     const before = createStore();
     const { tab } = await before.open("standard-terminal");
-    before.sessions.closeTab(tab.id);
+    await before.sessions.closeTab(tab.id);
     await before.sessions.dispose();
-    expect(running.get(tab.id)?.kill).toHaveBeenCalledOnce();
+    expect(running.get(tab.id)?.terminate).toHaveBeenCalledOnce();
+    expect(running.get(tab.id)?.kill).not.toHaveBeenCalled();
     const after = createStore();
     await after.sessions.restore();
     expect(after.sessions.listTabs()).toEqual([]);
@@ -116,12 +118,67 @@ describe("workspace recovery after server updates", () => {
     const { running, createStore } = await fixture();
     const store = createStore();
     const { tab } = await store.open("standard-terminal");
-    store.sessions.closeTab(tab.id, { stopSession: false });
+    await store.sessions.closeTab(tab.id, { stopSession: false });
     await store.sessions.flush();
     expect(running.get(tab.id)?.terminate).toHaveBeenCalledOnce();
     expect(running.get(tab.id)?.kill).not.toHaveBeenCalled();
     expect((await store.persistence.read())?.sessions).toEqual([]);
     await store.sessions.dispose();
+  });
+
+  it("keeps the tab, selection, and recovery record until explicit termination is confirmed", async () => {
+    const { running, createStore } = await fixture();
+    const store = createStore();
+    const { tab } = await store.open("standard-terminal");
+    await store.sessions.flush();
+    let confirmTermination!: () => void;
+    running.get(tab.id)!.terminate.mockImplementation(() => new Promise(resolve => { confirmTermination = resolve; }));
+    const closing = store.sessions.closeTab(tab.id);
+    expect(store.sessions.closeTab(tab.id)).toBe(closing);
+    expect(store.sessions.listTabs().map(tab => tab.id)).toEqual([tab.id]);
+    expect(store.sessions.getActiveTabId()).toBe(tab.id);
+    expect((await store.persistence.read())?.sessions.map(({ tab }) => tab.id)).toEqual([tab.id]);
+    confirmTermination();
+    await closing;
+    expect(store.sessions.listTabs()).toEqual([]);
+    expect((await store.persistence.read())?.sessions).toEqual([]);
+    await store.sessions.dispose();
+  });
+
+  it("finishes an in-flight explicit deletion before saving shutdown state", async () => {
+    const { running, createStore } = await fixture();
+    const store = createStore();
+    const { tab } = await store.open("standard-terminal");
+    let confirmTermination!: () => void;
+    const terminal = running.get(tab.id)!;
+    terminal.terminate.mockImplementation(() => new Promise(resolve => { confirmTermination = resolve; }));
+    const closing = store.sessions.closeTab(tab.id);
+    const shutdown = store.sessions.dispose();
+    await new Promise(resolve => setImmediate(resolve));
+    expect(terminal.detach).not.toHaveBeenCalled();
+    confirmTermination();
+    await Promise.all([closing, shutdown]);
+    expect(terminal.terminate).toHaveBeenCalledOnce();
+    expect((await store.persistence.read())?.sessions).toEqual([]);
+  });
+
+  it("retains a persisted, recoverable tab when explicit termination is rejected", async () => {
+    const { running, createStore } = await fixture();
+    const before = createStore();
+    const { tab } = await before.open("standard-terminal");
+    running.get(tab.id)!.terminate.mockRejectedValue(new Error("Shutdown was rejected."));
+    await expect(before.sessions.closeTab(tab.id)).rejects.toThrow("Shutdown was rejected.");
+    expect(before.sessions.getTab(tab.id)).toMatchObject({ status: "failed", statusMessage: expect.stringContaining("Shutdown was rejected.") });
+    expect(before.sessions.getActiveTabId()).toBe(tab.id);
+    expect((await before.persistence.read())?.sessions.map(({ tab }) => tab.id)).toEqual([tab.id]);
+    expect(running.get(tab.id)?.kill).not.toHaveBeenCalled();
+    await before.sessions.dispose();
+    const after = createStore();
+    await after.sessions.restore();
+    expect(after.sessions.getTab(tab.id).status).toBe("running");
+    const state = await after.workspace.state(after.sessions.listTabs());
+    expect(listTabLayoutPanes(state.windows[0]!.layout.root)[0]!.tabIds).toEqual([tab.id]);
+    await after.sessions.dispose();
   });
 
   it("waits for the old terminal to stop before restarting the same tab identity", async () => {
@@ -152,6 +209,32 @@ describe("workspace recovery after server updates", () => {
     const state = await after.workspace.state(after.sessions.listTabs());
     expect(listTabLayoutPanes(state.windows[0]!.layout.root)[0]!.tabIds).toEqual([tab.id]);
     expect(factory.spawn).toHaveBeenCalledOnce();
+    await after.sessions.closeTab(tab.id);
+    expect(after.sessions.listTabs()).toEqual([]);
+    expect((await after.persistence.read())?.sessions).toEqual([]);
+    await after.sessions.dispose();
+  });
+
+  it("retains an unreachable restored terminal until a later explicit close can confirm shutdown", async () => {
+    const { running, factory, createStore } = await fixture();
+    const before = createStore();
+    const { tab } = await before.open("standard-terminal");
+    await before.sessions.dispose();
+    factory.attach.mockRejectedValueOnce(new Error("Broker unavailable."));
+    const after = createStore();
+    await after.sessions.restore();
+    expect(() => after.sessions.getSession(tab.id)).toThrow("No active session");
+    factory.attach.mockRejectedValueOnce(new Error("Broker unavailable."));
+    await expect(after.sessions.closeTab(tab.id)).rejects.toThrow("Broker unavailable.");
+    expect(after.sessions.getActiveTabId()).toBe(tab.id);
+    expect((await after.persistence.read())?.sessions.map(({ tab }) => tab.id)).toEqual([tab.id]);
+    expect(running.get(tab.id)?.terminate).not.toHaveBeenCalled();
+
+    await after.sessions.closeTab(tab.id);
+    expect(running.get(tab.id)?.terminate).toHaveBeenCalledOnce();
+    expect(factory.spawn).toHaveBeenCalledOnce();
+    expect(after.sessions.listTabs()).toEqual([]);
+    expect((await after.persistence.read())?.sessions).toEqual([]);
     await after.sessions.dispose();
   });
 

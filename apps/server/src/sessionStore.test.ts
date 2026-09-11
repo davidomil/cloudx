@@ -347,7 +347,7 @@ describe("SessionStore voice actions", () => {
       expect(store.getTab(worker.tab.id).ownerPluginId).toBe(plugin.id);
       expect(store.getContextDirectory(worker.tab.id)?.ino).toBe(directoryStat.ino.toString());
       expect(plugin.lastInput?.authorizeProjectTrust).toBe(authorizeProjectTrust);
-      store.closeTab(parent.tab.id);
+      await store.closeTab(parent.tab.id);
       expect(store.getActiveTabId()).toBeUndefined();
       await store.discardPreparedTab(worker.tab.id);
       expect(store.listTabs()).toEqual([]);
@@ -1569,7 +1569,7 @@ describe("SessionStore voice actions", () => {
     const { store, root, plugin } = await createStore();
     const tab = await store.createTab({ pluginId: "fake-default", cwd: root, title: "Closable" });
 
-    store.closeTab(tab.id);
+    await store.closeTab(tab.id);
 
     expect(() => plugin.lastSession?.emitData("late output")).not.toThrow();
   });
@@ -1949,7 +1949,7 @@ describe("SessionStore voice actions", () => {
 
     const refresh = store.refreshRuntimeIndicators();
     await indicatorStarted.promise;
-    store.closeTab(tab.id);
+    await store.closeTab(tab.id);
     releaseIndicator.resolve();
 
     await expect(refresh).resolves.toBeUndefined();

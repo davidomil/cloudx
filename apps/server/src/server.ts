@@ -76,6 +76,7 @@ import { WorkspaceCommandService } from "./workspace/WorkspaceCommandService.js"
 import { RulesSkillsCatalogService } from "./rulesSkills/RulesSkillsCatalogService.js";
 import { NodePtyTerminalProcessFactory } from "./terminal/NodePtyTerminalProcess.js";
 import { DurableTerminalProcessFactory, terminalSocketPath } from "./terminal/DurableTerminalProcess.js";
+import { MAX_TERMINAL_SCREEN_BYTES } from "./terminal/TerminalScreen.js";
 import { SessionStateStore } from "./workspace/SessionStateStore.js";
 import { VoiceController } from "./voice/VoiceController.js";
 import { CodexExecVoicePlanner } from "./voice/VoicePlanner.js";
@@ -438,7 +439,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   app.delete<{ Params: { windowId: string } }>("/api/windows/:windowId", async (request) => {
     const tabIds = services.workspace!.tabIdsForWindow(request.params.windowId);
     for (const tabId of tabIds) {
-      services.sessions.closeTab(tabId);
+      await services.sessions.closeTab(tabId);
     }
     await services.workspace!.deleteWindow(request.params.windowId);
     return await workspaceState(services);
@@ -732,7 +733,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   });
 
   app.delete<{ Params: { tabId: string } }>("/api/tabs/:tabId", async (request) => {
-    services.sessions.closeTab(request.params.tabId);
+    await services.sessions.closeTab(request.params.tabId);
     return { ok: true, activeTabId: services.sessions.getActiveTabId() };
   });
 
@@ -1182,6 +1183,20 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     ws.on("close", cleanup);
     ws.on("error", cleanup);
 
+    if (session.attachTerminal) {
+      const live: string[] = [];
+      let attached = false;
+      void session.attachTerminal((data) => {
+        if (attached) sender.sendLive(data); else live.push(data);
+      }).then(({ screen, dispose }) => {
+        if (disposed) { dispose(); return; }
+        disposeData = dispose;
+        if (!sender.sendReplay(screen.data, screen) || disposed) return;
+        attached = true;
+        for (const data of live) sender.sendLive(data);
+      }, (error: unknown) => failSend(error instanceof Error ? error : new Error(String(error))));
+      return;
+    }
     const snapshot = session.snapshot();
     if (!sender.sendReplay(snapshot.recentOutput ?? "") || disposed) {
       return;
@@ -2032,12 +2047,12 @@ export class TerminalWebSocketSender {
     this.pendingLiveBytes = 0;
   }
 
-  sendReplay(data: string): boolean {
+  sendReplay(data: string, screen?: { cols: number; rows: number }): boolean {
     if (this.replayState !== "available") {
       return false;
     }
     this.replayState = "pending";
-    return this.send(data, true);
+    return this.send(data, true, screen);
   }
 
   sendLive(data: string): boolean {
@@ -2056,7 +2071,7 @@ export class TerminalWebSocketSender {
     this.onError(error instanceof Error ? error : new Error(String(error)));
   }
 
-  private send(data: string, replay: boolean): boolean {
+  private send(data: string, replay: boolean, screen?: { cols: number; rows: number }): boolean {
     if (this.replayState === "invalidated") {
       return false;
     }
@@ -2082,15 +2097,16 @@ export class TerminalWebSocketSender {
       if (this.ws.readyState !== WS_OPEN) {
         throw new Error("Terminal websocket is not open.");
       }
-      const limit = replay ? terminalReplaySerializedByteLimit(this.rawReplayByteLimit) : TERMINAL_WS_MAX_BUFFERED_BYTES;
-      if (replay && Buffer.byteLength(data, "utf8") > this.rawReplayByteLimit) {
-        throw new Error(`Terminal replay raw output exceeded the ${this.rawReplayByteLimit} byte limit.`);
+      const replayLimit = screen ? MAX_TERMINAL_SCREEN_BYTES : this.rawReplayByteLimit;
+      const limit = replay ? terminalReplaySerializedByteLimit(replayLimit) : TERMINAL_WS_MAX_BUFFERED_BYTES;
+      if (replay && Buffer.byteLength(data, "utf8") > replayLimit) {
+        throw new Error(`Terminal replay raw output exceeded the ${replayLimit} byte limit.`);
       }
-      if (replay && !data) {
+      if (replay && !data && !screen) {
         complete();
         return true;
       }
-      const serialized = JSON.stringify({ type: "data", data });
+      const serialized = JSON.stringify(screen ? { type: "screen", data, cols: screen.cols, rows: screen.rows } : { type: "data", data });
       const payloadBytes = Buffer.byteLength(serialized, "utf8");
       wireBytes = terminalFrameWireBytes(payloadBytes);
       const bufferedBefore = this.ws.bufferedAmount;

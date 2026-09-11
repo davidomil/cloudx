@@ -1,3 +1,5 @@
+import type { TerminalScreenSnapshot } from "./TerminalScreen.js";
+
 export interface TerminalProcess {
   onData(listener: (data: string) => void): () => void;
   onExit(listener: (event: { exitCode: number; signal?: number }) => void): () => void;
@@ -7,6 +9,7 @@ export interface TerminalProcess {
   terminate(): Promise<void>;
   detach?(): void;
   onDisconnect?(listener: (error: Error) => void): () => void;
+  onScreen?(listener: (screen: TerminalScreenSnapshot) => void): () => void;
 }
 
 export interface TerminalSpawnOptions {

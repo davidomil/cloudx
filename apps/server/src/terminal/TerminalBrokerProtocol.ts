@@ -7,6 +7,7 @@ import type { TerminalSpawnOptions } from "./TerminalProcess.js";
 import type { TerminalExit } from "./TerminalSupervisor.js";
 
 export const MAX_TERMINAL_MESSAGE_BYTES = 2 * 1024 * 1024;
+export const MAX_TERMINAL_INPUT_BYTES = 256 * 1024;
 export const TERMINAL_REPLAY_BYTES = 1024 * 1024;
 
 export type TerminalRequest =
@@ -17,8 +18,9 @@ export type TerminalRequest =
   | { type: "kill" | "terminate" };
 
 export type TerminalResponse =
-  | { type: "ready" | "terminated" }
+  | { type: "ready" | "terminated" | "missing" }
   | { type: "data"; data: string }
+  | { type: "screen"; data: string; cols: number; rows: number; complete: boolean }
   | { type: "exit"; event: TerminalExit }
   | { type: "error"; message: string };
 
@@ -59,14 +61,14 @@ export function readTerminalMessages(socket: Socket, receive: (value: unknown) =
   });
 }
 
-export function sendTerminalMessage(socket: Socket, message: TerminalRequest | TerminalResponse): void {
+export function sendTerminalMessage(socket: Socket, message: TerminalRequest | TerminalResponse): boolean {
   if (socket.destroyed) throw new Error("The terminal broker connection is closed.");
   const encoded = `${JSON.stringify(message)}\n`;
   if (Buffer.byteLength(encoded) > MAX_TERMINAL_MESSAGE_BYTES || socket.writableLength + Buffer.byteLength(encoded) > 4 * MAX_TERMINAL_MESSAGE_BYTES) {
     socket.destroy();
     throw new Error("The terminal broker connection exceeded its message or output limit.");
   }
-  socket.write(encoded);
+  return socket.write(encoded);
 }
 
 export function terminalReplay(output: string, bytes: number): string {
@@ -86,7 +88,7 @@ export function isTerminalRequest(value: unknown): value is TerminalRequest {
       && isRecord(value.options) && isText(value.options.cwd, 16_384) && path.isAbsolute(value.options.cwd)
       && isDimension(value.options.cols) && isDimension(value.options.rows)
       && isRecord(value.options.env) && Object.entries(value.options.env).every(([name, item]) => isText(name, 4096) && !name.includes("=") && isText(item, 128 * 1024));
-    case "write": return typeof value.data === "string" && Buffer.byteLength(value.data) <= 256 * 1024;
+    case "write": return typeof value.data === "string" && Buffer.byteLength(value.data) <= MAX_TERMINAL_INPUT_BYTES;
     case "resize": return isDimension(value.cols) && isDimension(value.rows);
     case "kill": case "terminate": return true;
     default: return false;
@@ -96,8 +98,9 @@ export function isTerminalRequest(value: unknown): value is TerminalRequest {
 export function isTerminalResponse(value: unknown): value is TerminalResponse {
   if (!isRecord(value)) return false;
   switch (value.type) {
-    case "ready": case "terminated": return true;
+    case "ready": case "terminated": case "missing": return true;
     case "data": return typeof value.data === "string";
+    case "screen": return typeof value.data === "string" && isDimension(value.cols) && isDimension(value.rows) && typeof value.complete === "boolean";
     case "error": return typeof value.message === "string";
     case "exit": return isRecord(value.event) && Number.isInteger(value.event.exitCode)
       && Number(value.event.exitCode) >= 0 && Number(value.event.exitCode) <= 255

@@ -26,3 +26,4 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     });
   });
 }
+process.send?.({ type: "ready" });

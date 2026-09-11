@@ -1,21 +1,26 @@
 import fs from "node:fs/promises";
 import net, { type Socket } from "node:net";
 import path from "node:path";
+import { PluginSessionMissingError } from "@cloudx/plugin-api";
 
 import type { TerminalProcess, TerminalProcessFactory } from "./TerminalProcess.js";
 import type { TerminalExit } from "./TerminalSupervisor.js";
 import {
-  isTerminalRequest, readTerminalMessages, sendTerminalMessage, terminalReplay,
+  isTerminalRequest, readTerminalMessages, terminalReplay,
   TERMINAL_REPLAY_BYTES, validateTerminalSocketDirectory,
-  type TerminalRequest, type TerminalResponse
+  type TerminalRequest
 } from "./TerminalBrokerProtocol.js";
+
+import { TerminalBrokerOutput } from "./TerminalBrokerOutput.js";
+import { TerminalScreen } from "./TerminalScreen.js";
 
 interface OwnedTerminal {
   process: TerminalProcess;
+  screen: TerminalScreen;
   output: string;
   exit?: TerminalExit;
   termination?: Promise<void>;
-  clients: Set<Socket>;
+  clients: Map<Socket, { output: TerminalBrokerOutput; dispose: () => void }>;
 }
 
 /** Owns terminal processes independently of web-server connections. */
@@ -55,6 +60,7 @@ export class TerminalBroker {
     const closed = new Promise<void>((resolve, reject) => this.server.close((error) => error ? reject(error) : resolve()));
     await Promise.allSettled(this.starting.values());
     const stopped = await Promise.allSettled([...this.terminals.values()].map((terminal) => terminal.process.terminate()));
+    await Promise.all([...this.terminals.values()].map((terminal) => terminal.screen.dispose()));
     for (const client of this.clients) client.destroy();
     await closed;
     const failures = stopped.filter((result): result is PromiseRejectedResult => result.status === "rejected");
@@ -64,12 +70,14 @@ export class TerminalBroker {
 
   private connect(socket: Socket): void {
     this.clients.add(socket);
+    const output = new TerminalBrokerOutput(socket);
     let terminal: OwnedTerminal | undefined;
     let sessionId: string | undefined;
     let opening = false;
     socket.on("error", () => socket.destroy());
     socket.on("close", () => {
       this.clients.delete(socket);
+      terminal?.clients.get(socket)?.dispose();
       terminal?.clients.delete(socket);
     });
     socket.setTimeout(10_000, () => { if (!terminal) socket.destroy(); });
@@ -79,28 +87,40 @@ export class TerminalBroker {
         if (opening || (value.type !== "spawn" && value.type !== "attach")) return socket.destroy();
         opening = true;
         sessionId = value.sessionId;
-        void this.open(value).then((owned) => {
+        void this.open(value).then(async (owned) => {
           if (socket.destroyed) return;
           terminal = owned;
+          const live: string[] = [];
+          let attached = false;
+          const { screen, dispose } = await owned.screen.attach((data) => {
+            if (attached) output.data(data); else live.push(data);
+          });
+          if (socket.destroyed) { dispose(); return; }
+          owned.clients.set(socket, { output, dispose });
+          output.replay(owned.output);
+          output.screen(screen);
+          output.send({ type: "ready" });
           socket.setTimeout(0);
-          owned.clients.add(socket);
-          this.send(socket, { type: "ready" });
-          this.sendOutput(socket, owned.output);
-          if (owned.exit) this.send(socket, { type: "exit", event: owned.exit });
-        }, (error: unknown) => this.fail(socket, error));
+          attached = true;
+          for (const data of live) output.data(data);
+          if (owned.exit) output.send({ type: "exit", event: owned.exit });
+        }).catch((error: unknown) => this.fail(output, error));
         return;
       }
       if (value.type === "spawn" || value.type === "attach") return socket.destroy();
       try {
         switch (value.type) {
           case "write": terminal.process.write(value.data); break;
-          case "resize": terminal.process.resize(value.cols, value.rows); break;
+          case "resize":
+            terminal.screen.resize(value.cols, value.rows);
+            terminal.process.resize(value.cols, value.rows);
+            break;
           case "kill": case "terminate": {
-            void this.closeTerminal(sessionId!, terminal).catch((error: unknown) => this.fail(socket, error));
+            void this.closeTerminal(sessionId!, terminal).catch((error: unknown) => this.fail(output, error));
             break;
           }
         }
-      } catch (error) { this.fail(socket, error); }
+      } catch (error) { this.fail(output, error); }
     });
   }
 
@@ -108,7 +128,7 @@ export class TerminalBroker {
     if (this.stopping) throw new Error("The terminal broker is stopping.");
     if (request.type === "attach") {
       const terminal = this.terminals.get(request.sessionId) ?? await this.starting.get(request.sessionId);
-      if (!terminal) throw new Error("The running terminal is unavailable in the terminal broker. It was not restarted.");
+      if (!terminal) throw new PluginSessionMissingError("The running terminal is unavailable in the terminal broker. It was not restarted.");
       return terminal;
     }
     if (this.terminals.has(request.sessionId) || this.starting.has(request.sessionId)) {
@@ -121,49 +141,49 @@ export class TerminalBroker {
   }
 
   private async spawn(request: Extract<TerminalRequest, { type: "spawn" }>): Promise<OwnedTerminal> {
-    const process = await this.factory.spawn(request.command, request.args, request.options);
-    const terminal: OwnedTerminal = { process, output: "", clients: new Set() };
+    const screen = new TerminalScreen(request.options.cols, request.options.rows);
+    let process: TerminalProcess;
+    try { process = await this.factory.spawn(request.command, request.args, request.options); }
+    catch (error) { screen.dispose(); throw error; }
+    const terminal: OwnedTerminal = { process, screen, output: "", clients: new Map() };
     this.terminals.set(request.sessionId, terminal);
-    process.onData((data) => {
+    await screen.attach((data) => {
       terminal.output = terminalReplay(terminal.output + data, this.replayBytes);
-      for (const client of terminal.clients) this.sendOutput(client, data);
+    });
+    process.onData((data) => {
+      try { screen.write(data); }
+      catch (error) { for (const { output } of terminal.clients.values()) this.fail(output, error); }
     });
     process.onExit((event) => {
-      terminal.exit = event;
-      for (const client of terminal.clients) this.send(client, { type: "exit", event });
+      const publishExit = () => {
+        terminal.exit = event;
+        for (const { output } of terminal.clients.values()) output.send({ type: "exit", event });
+      };
+      void screen.flush().then(publishExit, publishExit);
     });
     return terminal;
   }
 
-  private sendOutput(socket: Socket, output: string): void {
-    for (let start = 0; start < output.length;) {
-      let end = Math.min(start + 16_384, output.length);
-      const last = output.charCodeAt(end - 1);
-      if (end < output.length && last >= 0xd800 && last <= 0xdbff) end -= 1;
-      this.send(socket, { type: "data", data: output.slice(start, end) });
-      start = end;
-    }
-  }
-
   private closeTerminal(sessionId: string, terminal: OwnedTerminal): Promise<void> {
-    terminal.termination ??= terminal.process.terminate().then(() => {
+    terminal.termination ??= terminal.process.terminate().then(async () => {
+      await terminal.screen.dispose();
       this.terminals.delete(sessionId);
-      for (const client of terminal.clients) {
-        this.send(client, { type: "terminated" });
-        client.end();
+      for (const { output } of terminal.clients.values()) {
+        output.send({ type: "terminated" });
+        output.end();
       }
+    }).catch((error: unknown) => {
+      terminal.termination = undefined;
+      throw error;
     });
     return terminal.termination;
   }
 
-  private send(socket: Socket, response: TerminalResponse): void {
-    if (socket.destroyed) return;
-    try { sendTerminalMessage(socket, response); } catch { socket.destroy(); }
-  }
-
-  private fail(socket: Socket, error: unknown): void {
-    this.send(socket, { type: "error", message: error instanceof Error ? error.message : "Terminal broker operation failed." });
-    socket.end();
+  private fail(output: TerminalBrokerOutput, error: unknown): void {
+    output.send(error instanceof PluginSessionMissingError
+      ? { type: "missing" }
+      : { type: "error", message: error instanceof Error ? error.message : "Terminal broker operation failed." });
+    output.end();
   }
 
   private async removeStaleSocket(): Promise<void> {

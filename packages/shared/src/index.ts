@@ -1,3 +1,4 @@
+export { terminalInputMessages } from "./terminalInput.js";
 import { isUsableTabLayoutState, listTabLayoutPanes } from "./workspaceLayout.js";
 
 export * from "./forge.js";

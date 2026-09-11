@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 
-import type { WorkspaceTab } from "@cloudx/shared";
+import { terminalInputMessages, type WorkspaceTab } from "@cloudx/shared";
 import { installTerminalMobileScroller } from "./terminalMobileScroll.js";
 import { bottomRevealScrollDelta, rowsFittingTerminalViewport, shouldFocusTerminalAfterFit, visualViewportBottomInset } from "./terminalSizing.js";
 import { readTerminalColorTheme } from "./theme.js";
@@ -166,7 +166,7 @@ function createTerminalSocket(tabId: string): WebSocket {
   return new WebSocket(`${protocol}://${window.location.host}/ws/terminal/${encodeURIComponent(tabId)}`);
 }
 
-function subscribeTerminalSocket(view: TerminalView, replaceOutput = false): void {
+function subscribeTerminalSocket(view: TerminalView): void {
   const socket = view.socket;
   const isCurrentSocket = () => !view.disposed && view.socket === socket;
 
@@ -176,9 +176,13 @@ function subscribeTerminalSocket(view: TerminalView, replaceOutput = false): voi
     if (!message) {
       return;
     }
-    if (message.type === "data" && message.data) {
-      view.terminal.write(`${replaceOutput ? TERMINAL_RESET_SEQUENCE : ""}${message.data}`);
-      replaceOutput = false;
+    if (message.type === "screen" && message.data !== undefined && message.cols && message.rows) {
+      view.terminal.resize(message.cols, message.rows);
+      view.terminal.write(`${TERMINAL_RESET_SEQUENCE}${message.data}`, () => {
+        if (isCurrentSocket()) fitAndResize(view);
+      });
+    } else if (message.type === "data" && message.data) {
+      view.terminal.write(message.data);
     }
   });
   socket.addEventListener("open", () => {
@@ -193,12 +197,12 @@ function subscribeTerminalSocket(view: TerminalView, replaceOutput = false): voi
       view.reconnectTimer = undefined;
       if (!isCurrentSocket()) return;
       view.socket = createTerminalSocket(view.tabId);
-      subscribeTerminalSocket(view, true);
+      subscribeTerminalSocket(view);
     }, delay);
   });
 }
 
-function parseTerminalSocketMessage(data: unknown): { type?: string; data?: string } | undefined {
+function parseTerminalSocketMessage(data: unknown): { type?: string; data?: string; cols?: number; rows?: number } | undefined {
   if (typeof data !== "string") {
     return undefined;
   }
@@ -209,7 +213,9 @@ function parseTerminalSocketMessage(data: unknown): { type?: string; data?: stri
     }
     return {
       type: typeof parsed.type === "string" ? parsed.type : undefined,
-      data: typeof parsed.data === "string" ? parsed.data : undefined
+      data: typeof parsed.data === "string" ? parsed.data : undefined,
+      cols: Number.isInteger(parsed.cols) && Number(parsed.cols) > 0 && Number(parsed.cols) <= 10_000 ? Number(parsed.cols) : undefined,
+      rows: Number.isInteger(parsed.rows) && Number(parsed.rows) > 0 && Number(parsed.rows) <= 10_000 ? Number(parsed.rows) : undefined
     };
   } catch {
     return undefined;
@@ -348,7 +354,7 @@ function sendTerminalInput(view: TerminalView, data: string): boolean {
   if (view.socket.readyState !== WebSocket.OPEN) {
     return false;
   }
-  view.socket.send(JSON.stringify({ type: "input", data }));
+  for (const message of terminalInputMessages(data)) view.socket.send(message);
   return true;
 }
 

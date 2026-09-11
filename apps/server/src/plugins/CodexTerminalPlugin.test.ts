@@ -1508,4 +1508,15 @@ describe("Codex terminal update recovery", () => {
     await stopping;
     expect(session.snapshot().status).toBe("stopped");
   });
+
+  it("preserves terminal output and normal exit handling when termination is rejected", async () => {
+    const terminal = new FakeTerminalProcess();
+    vi.spyOn(terminal, "terminate").mockRejectedValue(new Error("Shutdown rejected."));
+    const session = new CodexTerminalSession(tab, terminal);
+    await expect(session.terminate()).rejects.toThrow("Shutdown rejected.");
+    terminal.emitData("Still running");
+    expect(session.snapshot().recentOutput).toBe("Still running");
+    terminal.exit(0);
+    expect(session.snapshot().status).toBe("completed");
+  });
 });

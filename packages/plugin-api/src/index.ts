@@ -137,6 +137,10 @@ export interface PluginSession {
   voiceContext(): Promise<PluginVoiceContext> | PluginVoiceContext;
   handleAction(action: string, input: Record<string, unknown>, context?: PluginActionContext): Promise<Record<string, unknown>> | Record<string, unknown>;
   onData?(listener: (data: string) => void): () => void;
+  attachTerminal?(listener: (data: string) => void): Promise<{
+    screen: { data: string; cols: number; rows: number };
+    dispose: () => void;
+  }>;
   onStatusChange?(listener: (status: WorkspaceTab["status"], message?: string) => void): () => void;
 }
 
@@ -182,6 +186,8 @@ export class PluginSessionNotStartedError extends Error {
 }
 
 export class PluginSessionOwnershipError extends Error {}
+
+export class PluginSessionMissingError extends Error {}
 
 export interface CreatePluginSessionInput extends PluginSessionLaunchOptions {
   tab: WorkspaceTab;

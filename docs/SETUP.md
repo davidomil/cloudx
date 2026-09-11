@@ -225,9 +225,12 @@ does the operational refresh:
   `gpt-6-astra` when the base config omits a model; explicit model and
   reasoning-effort preferences are preserved. Editing that config does not
   change an already-running Codex process.
-- Browser page reloads reattach running terminal tabs and restore retained
-  output. A Cloudx service restart ends its terminal processes; this is a
-  separate lifecycle from browser reattachment.
+- Browser page reloads and `cloudx.service` restarts reattach running terminal
+  tabs and restore retained output while `cloudx-terminal.service` stays running.
+  Restarting the terminal service or rebooting the host stops those processes.
+  The first upgrade from an installation without the terminal service cannot
+  preserve already-running terminals; terminals opened after that upgrade
+  survive subsequent web updates.
 - Records the resolved assistant executable path in `CLOUDX_ASSISTANT_BIN` and
   relevant command directories in `CLOUDX_TOOL_PATH` so Cloudx services do not
   depend on systemd's minimal `PATH`.
