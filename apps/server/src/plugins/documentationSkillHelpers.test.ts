@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { once } from "node:events";
 import fs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
@@ -51,6 +52,87 @@ describe("documentation skill helper", () => {
         retainRawCodeArtifacts: false
       }
     });
+  });
+
+  it.each(["server hook", "raw indexer"])("waits through ingest progress for the final result from the %s", async (endpoint) => {
+    const workspace = await tempRoot();
+    let stream!: http.ServerResponse;
+    const serverUrl = await startServer((request, response) => {
+      request.resume();
+      stream = response;
+      response.writeHead(200, { "content-type": "application/x-ndjson" });
+      response.write(`${JSON.stringify({ type: "progress", progress: 10, stage: "Queued for extraction" })}\n`);
+    });
+    const script = await writeHelperScript();
+    const running = execFileAsync(process.execPath, [script, "ingest-url", "https://example.test/manual.pdf"], {
+      cwd: workspace,
+      env: {
+        ...process.env,
+        CLOUDX_SERVER_URL: endpoint === "server hook" ? serverUrl : "",
+        CLOUDX_DOCUMENTATION_URL: endpoint === "raw indexer" ? serverUrl : ""
+      },
+      timeout: 3000
+    });
+    const child = running.child;
+    let output = "";
+    child.stdout!.on("data", (chunk) => { output += chunk.toString(); });
+
+    try {
+      const [queued] = await once(child.stderr!, "data");
+      expect(queued.toString()).toContain("Queued for extraction");
+      expect(output).toBe("");
+      expect(child.exitCode).toBeNull();
+
+      const enriching = once(child.stderr!, "data");
+      stream.write(`${JSON.stringify({ type: "progress", progress: 78, stage: "Running AI enrichment" })}\r\n`);
+      expect((await enriching)[0].toString()).toContain("Running AI enrichment");
+      expect(output).toBe("");
+      expect(child.exitCode).toBeNull();
+
+      const result = { documents: [{ documentId: "imported-doc" }], enrichment: { enabled: true, results: [{ status: "written" }] } };
+      stream.end(JSON.stringify({ type: "result", result }));
+      expect(JSON.parse((await running).stdout)).toEqual(result);
+    } finally {
+      child.kill();
+      await running.catch(() => undefined);
+    }
+  });
+
+  it.each([
+    ["empty stream", "", "ended without a result"],
+    ["progress-only stream", JSON.stringify({ type: "progress", progress: 100, stage: "Finalizing" }), "ended without a result"],
+    ["missing result", JSON.stringify({ type: "result" }), "result was not a JSON object"],
+    ["null result", JSON.stringify({ type: "result", result: null }), "result was not a JSON object"],
+    ["array result", JSON.stringify({ type: "result", result: [] }), "result was not a JSON object"],
+    ["scalar result", JSON.stringify({ type: "result", result: "pending" }), "result was not a JSON object"],
+    ["invalid event", "null", "event was not a JSON object"],
+    ["reported failure", JSON.stringify({ type: "error", error: "Extraction failed" }), "Extraction failed"]
+  ])("rejects an incomplete import response: %s", async (_scenario, body, error) => {
+    const workspace = await tempRoot();
+    const serverUrl = await startServer((request, response) => {
+      request.resume();
+      response.writeHead(200, { "content-type": "application/x-ndjson" });
+      response.end(body);
+    });
+
+    await expect(runHelper(["ingest-url", "https://example.test/manual.pdf"], {
+      cwd: workspace,
+      env: { CLOUDX_SERVER_URL: serverUrl }
+    })).rejects.toMatchObject({ code: 1, stdout: "", stderr: expect.stringContaining(error) });
+  });
+
+  it("reports a disconnected import stream as failure", async () => {
+    const workspace = await tempRoot();
+    const serverUrl = await startServer((request, response) => {
+      request.resume();
+      response.writeHead(200, { "content-type": "application/x-ndjson" });
+      response.write(`${JSON.stringify({ type: "progress", stage: "Extracting" })}\n`, () => response.destroy());
+    });
+
+    await expect(runHelper(["ingest-url", "https://example.test/manual.pdf"], {
+      cwd: workspace,
+      env: { CLOUDX_SERVER_URL: serverUrl }
+    })).rejects.toMatchObject({ code: 1, stdout: "", stderr: expect.stringContaining("aborted") });
   });
 
   it("rejects relative path ingest when only the raw indexer URL is available", async () => {
