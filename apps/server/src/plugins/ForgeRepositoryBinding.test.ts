@@ -48,7 +48,7 @@ async function fixture(selectedRepository: ForgeRepository) {
     state: "open", author: "author", labels: [], updatedAt: "", comments: [],
   };
   const change: ForgeChangeRequest = {
-    ...issue, draft: false, headSha, headBranch: "feature", baseBranch: "main", baseSha: "b".repeat(40),
+    ...issue, draft: false, headSha, headBranch: "feature", baseBranch: "main", baseSha: "b".repeat(40), targetHeadSha: "b".repeat(40),
     merged: false, mergeable: true, requiresBaseUpdate: false, reviewReady: true,
     approved: false, unresolvedDiscussions: 0, linkedIssues: [],
   };

@@ -168,6 +168,7 @@ export class GitLabProvider implements ForgeProvider {
         return boolean(note.resolvable) && !boolean(note.resolved);
       }),
     ).length;
+    const targetHeadSha = await this.readTargetHeadSha(initial.baseBranch);
     const current = record((await this.http.request(path)).body);
     const status = gitlabStatus(current, number);
     if (status.headBranch !== initial.headBranch || status.baseBranch !== initial.baseBranch || status.state !== initial.state)
@@ -183,6 +184,8 @@ export class GitLabProvider implements ForgeProvider {
     if (diffHeadSha !== headSha)
       throw new ForgeHeadChangedError([headSha, diffHeadSha]);
     const mergeStatus = string(current.detailed_merge_status);
+    if (await this.readTargetHeadSha(status.baseBranch) !== targetHeadSha)
+      throw new ForgeProviderError("The target branch changed while loading. Refresh before proceeding.", 409);
     return {
       ...gitlabRequestSummary(current),
       ...status,
@@ -196,6 +199,7 @@ export class GitLabProvider implements ForgeProvider {
       unresolvedDiscussions,
       comments,
       baseSha,
+      targetHeadSha,
     };
   }
 
@@ -205,6 +209,13 @@ export class GitLabProvider implements ForgeProvider {
       this.linkedIssues(number),
     ]);
     return { ...gitlabStatus(record(response.body), number), linkedIssues };
+  }
+
+  private async readTargetHeadSha(branch: string): Promise<string> {
+    const response = await this.http.request(`${this.path}/repository/branches/${encodeURIComponent(branch)}`);
+    const current = record(response.body);
+    if (string(current.name) !== branch) return invalid();
+    return gitlabHeadSha(record(current.commit).id);
   }
 
   private async linkedIssues(number: number): Promise<ForgeLinkedIssue[]> {

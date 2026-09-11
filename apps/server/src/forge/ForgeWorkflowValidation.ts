@@ -389,6 +389,14 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
     ))
       throw new Error("A saved merge attempt requires an issue worker with a published request and commit.");
     const parsed = structuredClone(worker) as unknown as ForgeWorker;
+    if (worker.mergeConflict !== undefined) {
+      const conflict = object(worker.mergeConflict);
+      const headSha = commitSha(conflict.headSha, "conflict head");
+      const targetHeadSha = commitSha(conflict.targetHeadSha, "conflict target head");
+      if (parsed.kind !== "issue" || !parsed.changeNumber || parsed.headSha !== headSha)
+        throw new Error("A merge conflict requires the matching published issue revision.");
+      parsed.mergeConflict = { headSha, targetHeadSha };
+    }
     if (worker.providerRetryAt !== undefined)
       parsed.providerRetryAt = isoTimestamp(worker.providerRetryAt, "provider retry deadline");
     if (worker.kind !== "review" && (worker.draft !== undefined || worker.reviewHistory !== undefined))

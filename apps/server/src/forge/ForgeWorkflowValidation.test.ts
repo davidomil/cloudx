@@ -103,6 +103,26 @@ describe("Rebase completion reports", () => {
   });
 });
 
+describe("Saved merge conflicts", () => {
+  const conflict = { headSha, targetHeadSha: "b".repeat(40) };
+  const conflicted = { ...worker, headSha, changeNumber: 7, mergeConflict: conflict };
+
+  it("retains the exact published and target revision across persistence", () => {
+    const parsed = parseWorkers([conflicted])[0];
+    expect(parsed.mergeConflict).toEqual(conflict);
+    expect(parsed.mergeConflict).not.toBe(conflict);
+  });
+
+  it.each([null, [], {}, { ...conflict, headSha: "bad" }, { ...conflict, targetHeadSha: "b".repeat(41) },
+    { ...conflict, headSha: "c".repeat(40) }, { ...conflict, targetHeadSha: null }])("rejects invalid conflict evidence %#", mergeConflict => {
+    expect(() => parseWorkers([{ ...conflicted, mergeConflict }])).toThrow();
+  });
+
+  it.each([{ kind: "review" }, { changeNumber: undefined }, { headSha: undefined }])("requires an issue with the matching published head %#", fields => {
+    expect(() => parseWorkers([{ ...conflicted, ...fields }])).toThrow(/matching published issue/);
+  });
+});
+
 describe("Saved rebase recovery", () => {
   const resultHeadSha = "b".repeat(40);
   const recovery: NonNullable<ForgeWorker["rebaseRecovery"]> = {

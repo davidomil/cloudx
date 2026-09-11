@@ -87,6 +87,7 @@ export interface ForgeChangeRequest extends ForgeChangeRequestSummary, ForgeChan
   unresolvedDiscussions: number;
   comments: ForgeComment[];
   baseSha: string;
+  targetHeadSha: string;
 }
 
 export interface ForgeCreateChangeRequest {
