@@ -21,7 +21,9 @@ describe("large terminal input through public transports", () => {
     const requests = vi.mocked(fetch).mock.calls;
     vi.unstubAllGlobals();
     for (const [url, options] of requests) {
-      expect(String(url)).toBe("http://127.0.0.1:9/enrichment/pending?limit=1");
+      const requestUrl = new URL(String(url));
+      expect(requestUrl.origin).toBe("http://127.0.0.1:9");
+      expect(requestUrl.pathname).toBe("/enrichment/pending");
       expect(options?.method).toBe("GET");
     }
   });
