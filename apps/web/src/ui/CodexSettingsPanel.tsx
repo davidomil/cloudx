@@ -105,7 +105,12 @@ export function CodexSettingsPanel({ callHook }: { callHook: NonNullable<UiContr
         </select>
         <small>On uses priority service; Off uses standard service. Flex selects flexible service. Model default removes the global service tier override.</small>
       </label>
-      {settings.fastModeEnabled === false ? <p className="codex-settings-notice">Fast mode support is disabled in Codex settings. Select On, Off, or Flex and save to enable it.</p> : null}
+      {settings.fastModeEnabled === false ? <div className="codex-settings-notice">
+        {modeSelected && selectedTier ? <p>Fast mode support will be enabled when you save.</p> : <>
+          <p>Fast mode support is disabled in Codex settings. Select On, Off, or Flex and save to enable it.</p>
+          {selectedTier ? <ControlButton disabled={busy !== null} onClick={() => { setModeSelected(true); setSaved(false); }}>Enable fast mode support</ControlButton> : null}
+        </>}
+      </div> : null}
       {saved ? <p role="status">Global Codex settings saved.</p> : null}
       <div className="codex-settings-actions">
         <ControlButton type="submit" tone="primary" disabled={busy !== null || !validModel || (!modelChanged && !modeChanged)}><Save size={16} aria-hidden="true" /> {busy === "saving" ? "Saving…" : "Save"}</ControlButton>

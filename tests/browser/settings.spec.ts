@@ -306,7 +306,53 @@ test("Codex Settings saves shared defaults, keeps them after reload, and can res
   await expect(fastMode).toHaveValue("");
 });
 
-test("Codex Settings preserves a stale draft and external edits until Reload reads the latest settings", async ({
+test("Codex Settings keeps drafts across workspace tab switches and discards them when the tab closes", async ({
+  page,
+}) => {
+  const configPath = path.join(testRoot, "codex-home", "config.toml");
+  await fs.writeFile(
+    configPath,
+    'model = "initial-model"\nservice_tier = "priority"\n',
+  );
+  const settings = await openCodexSettings(page);
+  await createWorkspaceTab(page, "Local Web", "Other work");
+  await activateWorkspaceTab(page, "Codex defaults");
+  const model = settings.getByRole("textbox", { name: "Default model" });
+  const fastMode = settings.getByRole("combobox", { name: "Fast mode" });
+  const save = settings.getByRole("button", { name: "Save", exact: true });
+  await model.fill("unsaved-draft-model");
+  await fastMode.selectOption({ label: "Off" });
+
+  await activateWorkspaceTab(page, "Other work");
+  await expect(settings).toBeHidden();
+  await activateWorkspaceTab(page, "Codex defaults");
+  await expect(model).toHaveValue("unsaved-draft-model");
+  await expect(fastMode).toHaveValue("default");
+  await expect(save).toBeEnabled();
+  await save.click();
+  await expect(settings.getByRole("status")).toHaveText(
+    "Global Codex settings saved.",
+  );
+  expect(parse(await fs.readFile(configPath, "utf8"))).toEqual({
+    model: "unsaved-draft-model",
+    service_tier: "default",
+    features: { fast_mode: true },
+  });
+
+  await model.fill("discarded-draft-model");
+  await fastMode.selectOption({ label: "Flex" });
+  await activateWorkspaceTab(page, "Other work");
+  await page
+    .getByRole("button", { name: "Close Codex defaults", exact: true })
+    .click();
+  await expect(page.locator(".codex-settings-panel")).toHaveCount(0);
+  await createCodexSettingsTab(page);
+  await expect(model).toHaveValue("unsaved-draft-model");
+  await expect(fastMode).toHaveValue("default");
+  await expect(save).toBeDisabled();
+});
+
+test("Codex Settings keeps a rejected stale draft and its revision across workspace tab switches until Reload", async ({
   page,
 }, testInfo) => {
   const configPath = path.join(testRoot, "codex-home", "config.toml");
@@ -316,7 +362,15 @@ test("Codex Settings preserves a stale draft and external edits until Reload rea
     configPath,
     `model = "initial-model"\nservice_tier = "default"\n${unrelatedSettings}`,
   );
+  const initialRead = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === "/api/hooks/codex-settings.read",
+  );
   const settings = await openCodexSettings(page);
+  const initialRevision = (await (await initialRead).json()).result.settings
+    .revision;
+  await createWorkspaceTab(page, "Local Web", "Other work");
+  await activateWorkspaceTab(page, "Codex defaults");
   const model = settings.getByRole("textbox", { name: "Default model" });
   const fastMode = settings.getByRole("combobox", { name: "Fast mode" });
   const save = settings.getByRole("button", { name: "Save", exact: true });
@@ -327,7 +381,18 @@ test("Codex Settings preserves a stale draft and external edits until Reload rea
 
   const externalConfig = `model = "external-model"\nservice_tier = "flex"\n${unrelatedSettings}`;
   await fs.writeFile(configPath, externalConfig);
+  const firstSave = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === "/api/hooks/codex-settings.update",
+  );
   await save.click();
+  const firstRejectedSave = await firstSave;
+  expect(firstRejectedSave.ok()).toBe(false);
+  expect(firstRejectedSave.request().postDataJSON().input).toEqual({
+    expectedRevision: initialRevision,
+    model: "unsaved-draft-model",
+    serviceTier: "priority",
+  });
   await expect(settings.getByRole("alert")).toHaveText(
     "Shared Codex settings changed. Reload before saving again.",
   );
@@ -338,6 +403,29 @@ test("Codex Settings preserves a stale draft and external edits until Reload rea
   await expectCodexSettingsFits(page);
   await settings.getByRole("alert").scrollIntoViewIfNeeded();
   await captureSample(page, testInfo, "codex-settings-stale-draft");
+
+  await activateWorkspaceTab(page, "Other work");
+  await expect(settings).toBeHidden();
+  await activateWorkspaceTab(page, "Codex defaults");
+  await expect(model).toHaveValue("unsaved-draft-model");
+  await expect(fastMode).toHaveValue("priority");
+  await expect(settings.getByRole("alert")).toHaveText(
+    "Shared Codex settings changed. Reload before saving again.",
+  );
+  const secondSave = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === "/api/hooks/codex-settings.update",
+  );
+  await save.click();
+  const secondRejectedSave = await secondSave;
+  expect(secondRejectedSave.ok()).toBe(false);
+  expect(secondRejectedSave.request().postDataJSON().input).toEqual(
+    firstRejectedSave.request().postDataJSON().input,
+  );
+  await expect(settings.getByRole("alert")).toHaveText(
+    "Shared Codex settings changed. Reload before saving again.",
+  );
+  expect(await fs.readFile(configPath, "utf8")).toBe(externalConfig);
 
   await settings.getByRole("button", { name: "Reload", exact: true }).click();
   await expect(model).toHaveValue("external-model");
@@ -358,6 +446,50 @@ test("Codex Settings preserves a stale draft and external edits until Reload rea
   });
   expect(savedConfig).toContain(unrelatedSettings);
 });
+
+for (const serviceTier of ["priority", "default", "flex"]) {
+  test(`Codex Settings enables disabled fast mode support with the saved ${serviceTier} tier unchanged`, async ({
+    page,
+  }, testInfo) => {
+    const configPath = path.join(testRoot, "codex-home", "config.toml");
+    const initialConfig = `model = "initial-model"\nservice_tier = "${serviceTier}"\n[features]\nfast_mode = false\n`;
+    await fs.writeFile(configPath, initialConfig);
+    const settings = await openCodexSettings(page);
+    const fastMode = settings.getByRole("combobox", { name: "Fast mode" });
+    const save = settings.getByRole("button", { name: "Save", exact: true });
+    const enable = settings.getByRole("button", {
+      name: "Enable fast mode support",
+      exact: true,
+    });
+    await expect(fastMode).toHaveValue(serviceTier);
+    await expect(save).toBeDisabled();
+    await expect(enable).toBeVisible();
+    await enable.scrollIntoViewIfNeeded();
+    await captureSample(page, testInfo, "codex-settings-disabled-support");
+
+    await enable.click();
+    await expect(fastMode).toHaveValue(serviceTier);
+    await expect(save).toBeEnabled();
+    expect(await fs.readFile(configPath, "utf8")).toBe(initialConfig);
+    await save.click();
+    await expect(settings.getByRole("status")).toHaveText(
+      "Global Codex settings saved.",
+    );
+    await expect(fastMode).toHaveValue(serviceTier);
+    await expect(save).toBeDisabled();
+    await expect(
+      settings.getByRole("button", {
+        name: "Enable fast mode support",
+        exact: true,
+      }),
+    ).toHaveCount(0);
+    expect(parse(await fs.readFile(configPath, "utf8"))).toEqual({
+      model: "initial-model",
+      service_tier: serviceTier,
+      features: { fast_mode: true },
+    });
+  });
+}
 
 for (const viewport of [
   { width: 667, height: 375 },
@@ -426,6 +558,10 @@ for (const viewport of [
 
 async function openCodexSettings(page: Page) {
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  return createCodexSettingsTab(page);
+}
+
+async function createWorkspaceTab(page: Page, plugin: string, title: string) {
   await page
     .locator(".workspace-pane.active")
     .getByTitle("Add tab to this pane")
@@ -433,10 +569,25 @@ async function openCodexSettings(page: Page) {
   await page
     .getByRole("combobox", { name: "Plugin", exact: true })
     .selectOption({
-      label: "Codex Settings",
+      label: plugin,
     });
   await expect(page.getByLabel("New tab directory")).toHaveCount(0);
+  await page.getByRole("textbox", { name: "Title", exact: true }).fill(title);
   await page.getByRole("button", { name: "Create", exact: true }).click();
+  await expect(page.locator(".tab-button.selected .tab-title")).toHaveText(
+    title,
+  );
+}
+
+async function activateWorkspaceTab(page: Page, title: string) {
+  await page.locator(".tab-activation").filter({ hasText: title }).click();
+  await expect(page.locator(".tab-button.selected .tab-title")).toHaveText(
+    title,
+  );
+}
+
+async function createCodexSettingsTab(page: Page) {
+  await createWorkspaceTab(page, "Codex Settings", "Codex defaults");
   const settings = page.getByRole("region", {
     name: "Global Codex settings",
     exact: true,

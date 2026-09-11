@@ -1620,7 +1620,7 @@ export function App() {
             const plugin = pluginById.get(tab.pluginId);
             const selected = tabId === activePaneTabId;
             return (
-              <TabPanel key={tabId} active={selected} keepMounted={plugin?.panelKind === "web-viewer"}>
+              <TabPanel key={tabId} active={selected} keepMounted={plugin?.panelKind === "web-viewer" || plugin?.id === "codex-settings"}>
                 <PluginPanel
                   tab={tab}
                   plugin={plugin}

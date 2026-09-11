@@ -104,9 +104,54 @@ describe("global Codex settings editor", () => {
     await fill(model(container), "new-model");
     await click(container, "Save");
     expect(calls.at(-1)?.input).toEqual({ expectedRevision: "first", model: "new-model" });
-    await fill(mode(container), "priority");
+    await fill(mode(container), "default");
     await click(container, "Save");
-    expect(calls.at(-1)?.input).toEqual({ expectedRevision: "first", serviceTier: "priority" });
+    expect(calls.at(-1)?.input).toEqual({ expectedRevision: "first", serviceTier: "default" });
+  });
+
+  it.each(["priority", "default", "flex"])("enables disabled support for the saved %s tier without changing the selection", async serviceTier => {
+    const settings = { ...initial, serviceTier, fastModeEnabled: false };
+    const { container, calls } = await mount(settings, hook => hook === "codex-settings.read" ? settings : { ...settings, fastModeEnabled: true });
+    expect(mode(container).value).toBe(serviceTier);
+    expect(button(container, "Save").disabled).toBe(true);
+    await click(container, "Enable fast mode support");
+    expect(mode(container).value).toBe(serviceTier);
+    expect(button(container, "Save").disabled).toBe(false);
+    expect(container.textContent).toContain("Fast mode support will be enabled when you save.");
+    expect(calls).toHaveLength(1);
+    await click(container, "Save");
+    expect(calls.at(-1)?.input).toEqual({ expectedRevision: "first", serviceTier });
+    expect(container.textContent).not.toContain("Enable fast mode support");
+    expect(button(container, "Save").disabled).toBe(true);
+  });
+
+  it("discards a pending enable on Reload and preserves disabled support for model-only saves", async () => {
+    const settings = { ...initial, fastModeEnabled: false };
+    const { container, calls } = await mount(settings);
+    await click(container, "Enable fast mode support");
+    await click(container, "Reload");
+    expect(button(container, "Save").disabled).toBe(true);
+    expect(button(container, "Enable fast mode support").disabled).toBe(false);
+    await fill(model(container), "new-model");
+    await click(container, "Save");
+    expect(calls.at(-1)?.input).toEqual({ expectedRevision: "first", model: "new-model" });
+  });
+
+  it.each([null, "custom-tier"])("requires a supported tier before enabling support for %s", async serviceTier => {
+    const { container } = await mount({ ...initial, serviceTier, fastModeEnabled: false });
+    expect(container.textContent).not.toContain("Enable fast mode support");
+    expect(button(container, "Save").disabled).toBe(true);
+  });
+
+  it("disables the enable action while a model-only save is pending", async () => {
+    const pending = deferred<CodexGlobalSettings>();
+    const settings = { ...initial, fastModeEnabled: false };
+    const { container } = await mount(settings, hook => hook === "codex-settings.read" ? settings : pending.promise);
+    await fill(model(container), "new-model");
+    await click(container, "Save");
+    expect(button(container, "Enable fast mode support").disabled).toBe(true);
+    await act(async () => { pending.resolve({ ...settings, model: "new-model" }); });
+    expect(button(container, "Enable fast mode support").disabled).toBe(false);
   });
 
   it.each(["not a model", "-starts-with-hyphen", "x".repeat(129)])("rejects an invalid model identifier %s", async value => {
