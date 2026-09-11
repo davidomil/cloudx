@@ -41,6 +41,59 @@ const recordings = [
 describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))(
   "archived media through the real indexer and media tools",
   () => {
+    it.each(["failed", "skipped"] as const)("enriches corrected extraction after an older model attempt is %s", async (outcome) => {
+      const fixture = await startArchive();
+      let worker: DocumentationBackgroundEnrichment | undefined;
+      let releaseModel!: () => void;
+      const modelGate = new Promise<void>((resolve) => { releaseModel = resolve; });
+      try {
+        const sourcePath = path.join(fixture.root, "retained-source.txt");
+        const html = "<html><body><h1>CORRECTED-GUIDE</h1><p>Release reset after power stabilizes.</p><script>EXCLUDED-SCRIPT</script></body></html>";
+        await fs.writeFile(sourcePath, html);
+        const enrichment = createEnrichment(fixture);
+        enrichment.run.mockImplementationOnce(async () => {
+          await modelGate;
+          if (outcome === "failed") throw new Error("The older model attempt failed.");
+          return { summary: "No enrichment from the older attempt.", metadata: [], warnings: [], spans: [] };
+        });
+        const hook = enrichment.plugin.hooks.find((candidate) => candidate.id === "documentation.ingest.path")!;
+        const imported = await hook.execute({ path: sourcePath, sourceType: "text" }, { caller: { kind: "http" } });
+        const documentId = imported.firstDocumentId as string;
+        const original = await fixture.document(documentId);
+        expect(original.chunks).toMatchObject([{ chunk_origin: "source", locator: "text", text: html }]);
+        worker = new DocumentationBackgroundEnrichment(fixture.client, enrichment.service, vi.fn());
+        worker.start();
+        await vi.waitFor(() => expect(enrichment.run).toHaveBeenCalledOnce(), { timeout: 10_000 });
+        expect(enrichment.run.mock.calls[0][0]).toContain("EXCLUDED-SCRIPT");
+
+        await expect(hook.execute({ path: sourcePath, sourceType: "website" }, { caller: { kind: "http" } }))
+          .resolves.toMatchObject({ kind: "path", firstDocumentId: documentId, documentCount: 1 });
+        const corrected = await fixture.document(documentId);
+        expect(corrected.content_sha256).toBe(original.content_sha256);
+        expect(corrected.source_type).toBe("website");
+        expect(corrected.chunks).toMatchObject([{ chunk_origin: "source", locator: "html", text: expect.stringContaining("CORRECTED-GUIDE") }]);
+        expect(corrected.chunks[0].text).not.toContain("EXCLUDED-SCRIPT");
+        expect(enrichment.run).toHaveBeenCalledOnce();
+        expect(fixture.queue.list().capacity.admittedJobs).toBe(0);
+
+        releaseModel();
+        await vi.waitFor(() => expect(enrichment.run).toHaveBeenCalledTimes(2), { timeout: 10_000 });
+        const prompt = enrichment.run.mock.calls[1][0];
+        expect(prompt).toContain(JSON.stringify(corrected.chunks[0].text));
+        expect(prompt).not.toContain("EXCLUDED-SCRIPT");
+        await vi.waitFor(async () => expect((await fixture.document(documentId)).chunks).toEqual(expect.arrayContaining([
+          expect.objectContaining({ chunk_origin: "ai", text: "REPLACEMENT-AI-2" }),
+        ])), { timeout: 10_000 });
+        await expect(fixture.client.nextPendingEnrichment()).resolves.toBeUndefined();
+        expect(enrichment.transcribeFile).not.toHaveBeenCalled();
+        expect(enrichment.mediaProcessLauncher).not.toHaveBeenCalled();
+      } finally {
+        releaseModel();
+        await worker?.dispose();
+        await fixture.dispose();
+      }
+    }, 30_000);
+
     it("automatically enriches archived uploads after restart while new imports can finish", async () => {
       const fixture = await startArchive();
       let worker: DocumentationBackgroundEnrichment | undefined;

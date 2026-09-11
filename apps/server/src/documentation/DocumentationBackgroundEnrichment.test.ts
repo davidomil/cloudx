@@ -81,7 +81,7 @@ describe("DocumentationBackgroundEnrichment", () => {
 
   it("checks whether enrichment was disabled while discovery was running", async () => {
     const { worker, client, enrichment } = fixture();
-    const pending = deferred<{ documentId: string; title: string }>();
+    const pending = deferred<Awaited<ReturnType<DocumentationClient["nextPendingEnrichment"]>>>();
     client.nextPendingEnrichment.mockReturnValueOnce(pending.promise);
     worker.start();
     await vi.advanceTimersByTimeAsync(0);
@@ -131,7 +131,7 @@ describe("DocumentationBackgroundEnrichment", () => {
     await vi.advanceTimersByTimeAsync(0);
 
     expect(client.recordEnrichmentOutcome).toHaveBeenCalledExactlyOnceWith(
-      "unavailable", { status, error }, { signal: expect.any(AbortSignal) }
+      "unavailable", { extractionRevision: document("unavailable").extractionRevision, status, error }, { signal: expect.any(AbortSignal) }
     );
     expect(client.nextPendingEnrichment).toHaveBeenCalledTimes(1);
     expect(reportError).not.toHaveBeenCalled();
@@ -158,7 +158,7 @@ describe("DocumentationBackgroundEnrichment", () => {
     await vi.advanceTimersByTimeAsync(90_000);
 
     expect(client.recordEnrichmentOutcome).toHaveBeenCalledExactlyOnceWith(
-      "pending", { status: "failed", error: "x".repeat(4_000) }, { signal: expect.any(AbortSignal) }
+      "pending", { extractionRevision: document("pending").extractionRevision, status: "failed", error: "x".repeat(4_000) }, { signal: expect.any(AbortSignal) }
     );
     expect(reportError).toHaveBeenCalledExactlyOnceWith(failure);
     expect(enrichment.enrichIngestResponse).toHaveBeenCalledTimes(1);
@@ -275,7 +275,7 @@ describe("DocumentationBackgroundEnrichment", () => {
 });
 
 function document(documentId: string) {
-  return { documentId, title: `${documentId} source` };
+  return { documentId, title: `${documentId} source`, extractionRevision: "e".repeat(32) };
 }
 
 function outcome(status: string, details: Record<string, unknown> = {}) {

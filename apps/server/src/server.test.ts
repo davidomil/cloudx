@@ -2637,7 +2637,7 @@ describe("buildServer", () => {
         templates: [],
       } as never),
     });
-    const pending = vi.spyOn(services.documentation!, "nextPendingEnrichment").mockResolvedValue({ documentId: "closing-document", title: "Pending guide" });
+    const pending = vi.spyOn(services.documentation!, "nextPendingEnrichment").mockResolvedValue({ documentId: "closing-document", title: "Pending guide", extractionRevision: "e".repeat(32) });
     const outcome = vi.spyOn(services.documentation!, "recordEnrichmentOutcome");
     const app = await buildServer(config, services);
     onTestFinished(async () => {

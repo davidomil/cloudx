@@ -98,7 +98,7 @@ export class DocumentationClient {
     return this.get("/portable-manifest");
   }
 
-  async nextPendingEnrichment(options: DocumentationRequestOptions = {}): Promise<{ documentId: string; title: string } | undefined> {
+  async nextPendingEnrichment(options: DocumentationRequestOptions = {}): Promise<{ documentId: string; title: string; extractionRevision: string } | undefined> {
     const response = await this.get("/enrichment/pending?limit=1", options.signal);
     if (!Array.isArray(response.documents) || response.documents.length > 1) {
       throw new Error("Invalid pending documentation enrichment response.");
@@ -108,10 +108,13 @@ export class DocumentationClient {
     if (!document || typeof document !== "object" || !("documentId" in document) || !("title" in document) || typeof document.documentId !== "string" || !document.documentId.trim() || typeof document.title !== "string") {
       throw new Error("Invalid pending documentation enrichment document.");
     }
-    return { documentId: document.documentId, title: document.title };
+    if (!("extractionRevision" in document) || typeof document.extractionRevision !== "string" || document.extractionRevision.length !== 32 || !/^[0-9a-f]{32}$/.test(document.extractionRevision)) {
+      throw new Error("Invalid pending documentation enrichment extraction revision.");
+    }
+    return { documentId: document.documentId, title: document.title, extractionRevision: document.extractionRevision };
   }
 
-  recordEnrichmentOutcome(documentId: string, outcome: { status: "failed" | "skipped"; error: string }, options: DocumentationRequestOptions = {}): Promise<Record<string, unknown>> {
+  recordEnrichmentOutcome(documentId: string, outcome: { extractionRevision: string; status: "failed" | "skipped"; error: string }, options: DocumentationRequestOptions = {}): Promise<Record<string, unknown>> {
     return this.post(`/documents/${encodeURIComponent(requireString(documentId, "documentId"))}/enrichment-outcome`, outcome, options.signal);
   }
 

@@ -527,7 +527,7 @@ class DocumentationArchive:
         with self._connect() as db:
             documents = db.execute(
                 """
-                SELECT d.document_id AS documentId, d.title
+                SELECT d.document_id AS documentId, d.title, d.extraction_revision AS extractionRevision
                 FROM documents d
                 WHERE d.state = ?
                   AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.document_id = d.document_id AND c.chunk_origin = 'ai')
@@ -539,7 +539,9 @@ class DocumentationArchive:
             ).fetchall()
         return [dict(document) for document in documents]
 
-    def record_enrichment_outcome(self, document_id: str, *, status: str, error: str) -> dict | None:
+    def record_enrichment_outcome(self, document_id: str, *, extraction_revision: str, status: str, error: str) -> dict | None:
+        if not isinstance(extraction_revision, str) or not re.fullmatch(r"[0-9a-f]{32}", extraction_revision):
+            raise ArchiveError("Background enrichment requires a valid extraction revision.")
         if status not in {"failed", "skipped"}:
             raise ArchiveError("Background enrichment outcome must be failed or skipped.")
         error = error.strip()
@@ -547,13 +549,14 @@ class DocumentationArchive:
             raise ArchiveError("Background enrichment error must contain between 1 and 4000 characters.")
         outcome = {"status": status, "error": error, "updatedAt": timestamp()}
         with self._write_lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             document = db.execute(
                 """
                 SELECT document_id FROM documents d
-                WHERE d.document_id = ? AND d.state = ?
+                WHERE d.document_id = ? AND d.state = ? AND d.extraction_revision = ?
                   AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.document_id = d.document_id AND c.chunk_origin = 'ai')
                 """,
-                (document_id, ACTIVE_STATE),
+                (document_id, ACTIVE_STATE, extraction_revision),
             ).fetchone()
             if not document:
                 return None
@@ -1350,7 +1353,7 @@ class DocumentationArchive:
                         [(document_id, locator, text, ACTIVE_STATE) for locator, text in chunks],
                     )
                     db.execute(
-                        "UPDATE documents SET snapshot_path = ?, updated_at = ? WHERE document_id = ?",
+                        "UPDATE documents SET snapshot_path = ?, updated_at = ?, extraction_revision = lower(hex(randomblob(16))) WHERE document_id = ?",
                         (replacement_snapshot.relative_to(self.root).as_posix(), timestamp(), document_id),
                     )
 
@@ -1689,9 +1692,9 @@ class DocumentationArchive:
                 """
                 INSERT INTO documents (
                   document_id, title, source_type, uri, snapshot_path, content_sha256, state, collection,
-                  tags_json, created_at, updated_at
+                  tags_json, created_at, updated_at, extraction_revision
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, lower(hex(randomblob(16))))
                 ON CONFLICT(document_id) DO UPDATE SET
                   title = excluded.title,
                   source_type = excluded.source_type,
@@ -1701,7 +1704,8 @@ class DocumentationArchive:
                   state = excluded.state,
                   collection = excluded.collection,
                   tags_json = excluded.tags_json,
-                  updated_at = excluded.updated_at
+                  updated_at = excluded.updated_at,
+                  extraction_revision = excluded.extraction_revision
                 """,
                 (
                     document_id,
@@ -2114,6 +2118,12 @@ class DocumentationArchive:
                 missing_columns = sorted(columns - present)
                 if missing_columns:
                     raise ArchiveError(f"Archive import catalog table {table} is missing columns: {', '.join(missing_columns)}")
+            document_columns = {row["name"] for row in db.execute("PRAGMA table_info(documents)")}
+            if "extraction_revision" in document_columns and any(
+                not isinstance(row["extraction_revision"], str) or not re.fullmatch(r"[0-9a-f]{32}", row["extraction_revision"])
+                for row in db.execute("SELECT extraction_revision FROM documents")
+            ):
+                raise ArchiveError("Archive import contains invalid extraction revisions.")
             if "document_enrichment_outcomes" in tables:
                 invalid_outcome = db.execute(
                     """
@@ -2343,9 +2353,9 @@ class DocumentationArchive:
                         """
                         INSERT INTO documents (
                           document_id, title, source_type, uri, snapshot_path, content_sha256, state, collection,
-                          tags_json, created_at, updated_at
+                          tags_json, created_at, updated_at, extraction_revision
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, lower(hex(randomblob(16))))
                         """,
                         (
                             document["document_id"],
@@ -2544,6 +2554,11 @@ class DocumentationArchive:
             archive_state_columns = {row["name"] for row in db.execute("PRAGMA table_info(archive_state)").fetchall()}
             if "projected_index_generation" not in archive_state_columns:
                 db.execute("ALTER TABLE archive_state ADD COLUMN projected_index_generation TEXT")
+            document_columns = {row["name"] for row in db.execute("PRAGMA table_info(documents)")}
+            if "extraction_revision" not in document_columns:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("ALTER TABLE documents ADD COLUMN extraction_revision TEXT NOT NULL DEFAULT ''")
+                db.execute("UPDATE documents SET extraction_revision = lower(hex(randomblob(16)))")
             create_catalog_indexes(db)
 
 

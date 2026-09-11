@@ -24,7 +24,7 @@ def test_catalog_summary_and_document_page_do_not_scan_other_documents_chunks(tm
     with archive._connect() as db:
         db.executemany(
             """
-            INSERT INTO documents VALUES (?, ?, 'text', ?, 'snapshots/source.txt', 'hash', 'active', NULL, '[]', '2026', ?)
+            INSERT INTO documents VALUES (?, ?, 'text', ?, 'snapshots/source.txt', 'hash', 'active', NULL, '[]', '2026', ?, lower(hex(randomblob(16))))
             """,
             [(f"doc-{number}", f"Document {number}", f"manual://{number}", str(number)) for number in range(3)],
         )
@@ -67,7 +67,9 @@ def test_catalog_summary_and_document_page_do_not_scan_other_documents_chunks(tm
     assert page["window"]["total"] == 3
     page = archive.list_document_page(limit=1, offset=1, sort_direction="asc")
     assert page["documents"][0]["document_id"] == "doc-1"
-    assert archive.pending_enrichment() == [{"documentId": "doc-0", "title": "Document 0"}]
+    pending = archive.pending_enrichment()
+    assert pending == [{"documentId": "doc-0", "title": "Document 0", "extractionRevision": pending[0]["extractionRevision"]}]
+    assert len(pending[0]["extractionRevision"]) == 32
     assert instruction_steps < 20000
 
 

@@ -59,7 +59,7 @@ describe("DocumentationClient", () => {
 
   it("discovers one pending document through the bounded enrichment endpoint", async () => {
     const requests: string[] = [];
-    const pending = { documentId: "pending", title: "Pending guide" };
+    const pending = { documentId: "pending", title: "Pending guide", extractionRevision: "e".repeat(32) };
     const url = await startServer((request, response) => {
       requests.push(`${request.method} ${request.url}`);
       response.end(JSON.stringify({ documents: requests.length === 1 ? [pending] : [] }));
@@ -85,7 +85,10 @@ describe("DocumentationClient", () => {
     { documents: [{ documentId: " ", title: "Empty ID" }] },
     { documents: [{ documentId: 1, title: "Numeric ID" }] },
     { documents: [{ documentId: "one" }] },
-    { documents: [{ documentId: "one", title: 42 }] }
+    { documents: [{ documentId: "one", title: 42 }] },
+    ...[undefined, null, 1, "", " ", "e".repeat(31), "g".repeat(32), "E".repeat(32), "e".repeat(33), "e".repeat(32) + "\n"].map((extractionRevision) => ({
+      documents: [{ documentId: "one", title: "One", extractionRevision }]
+    }))
   ])("rejects an invalid pending enrichment response: %j", async (body) => {
     const url = await startServer((_request, response) => response.end(JSON.stringify(body)));
 
@@ -103,7 +106,7 @@ describe("DocumentationClient", () => {
       request.on("end", () => response.end(JSON.stringify({ recorded: true })));
     });
     const client = new DocumentationClient(`${url}/docs/?token=local`);
-    const outcome = { status, error: "No enrichment was written." };
+    const outcome = { extractionRevision: "e".repeat(32), status, error: "No enrichment was written." };
 
     await expect(client.recordEnrichmentOutcome("doc/one", outcome)).resolves.toEqual({ recorded: true });
 
@@ -120,7 +123,7 @@ describe("DocumentationClient", () => {
     });
 
     await expect(new DocumentationClient(url).recordEnrichmentOutcome("doc", {
-      status: "failed", error: "Model failed."
+      extractionRevision: "e".repeat(32), status: "failed", error: "Model failed."
     })).rejects.toMatchObject({ statusCode: 409, message: "Document is no longer pending." });
   });
 
@@ -138,7 +141,7 @@ describe("DocumentationClient", () => {
     const stopped = new Error("Background enrichment stopped.");
     const request = operation === "discovery"
       ? client.nextPendingEnrichment({ signal: controller.signal })
-      : client.recordEnrichmentOutcome("doc", { status: "failed", error: "Model failed." }, { signal: controller.signal });
+      : client.recordEnrichmentOutcome("doc", { extractionRevision: "e".repeat(32), status: "failed", error: "Model failed." }, { signal: controller.signal });
     const rejected = expect(request).rejects.toBe(stopped);
     await started;
 

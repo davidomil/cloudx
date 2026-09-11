@@ -58,7 +58,9 @@ export class DocumentationBackgroundEnrichment {
       const error = String(result.error ?? result.reason ?? "No enrichment was written.").slice(0, 4_000);
       // If recording fails, stop admission so the model is not run again without a durable outcome.
       this.paused = true;
-      await this.client.recordEnrichmentOutcome(document.documentId, { status: result.status, error }, { signal });
+      await this.client.recordEnrichmentOutcome(document.documentId, {
+        extractionRevision: document.extractionRevision, status: result.status, error
+      }, { signal });
       this.paused = false;
       this.reportError(new Error(`Background enrichment ${result.status} for ${document.documentId}: ${error}`));
     }

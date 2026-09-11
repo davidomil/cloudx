@@ -91,6 +91,7 @@ class EnrichDocumentRequest(BaseModel):
 
 
 class EnrichmentOutcomeRequest(BaseModel):
+    extraction_revision: str = Field(alias="extractionRevision", pattern=r"^[0-9a-f]{32}$", min_length=32, max_length=32)
     status: Literal["failed", "skipped"]
     error: str = Field(min_length=1, max_length=4000)
 
@@ -290,7 +291,9 @@ def create_app(root: str | Path | None = None) -> FastAPI:
     def enrichment_outcome(document_id: str, request: EnrichmentOutcomeRequest) -> dict:
         return {
             "backgroundEnrichment": handle_archive_error(
-                lambda: archive.record_enrichment_outcome(document_id, status=request.status, error=request.error)
+                lambda: archive.record_enrichment_outcome(
+                    document_id, extraction_revision=request.extraction_revision, status=request.status, error=request.error,
+                )
             )
         }
 
