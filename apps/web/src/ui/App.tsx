@@ -36,6 +36,8 @@ import {
 } from "../api.js";
 import { createBrowserId } from "./browserId.js";
 import { ControlButton } from "./Control.js";
+import { CodexSettingsPanel } from "./CodexSettingsPanel.js";
+import { CodexSettingsEditor } from "./CodexSettingsEditor.js";
 import { activeAutomationTriggerIds as triggerIdsFromAutomation, type TriggerEmitter } from "./automationTriggers.js";
 import { disposeFileBrowserPanelStatesExcept } from "./fileBrowserPanelState.js";
 import { disposeFileBrowserTransfersExcept } from "./fileBrowserTransfers.js";
@@ -215,6 +217,7 @@ export function App() {
   const [automationRuns, setAutomationRuns] = useState<AutomationRunSummary[]>([]);
   const [attentionTabIds, setAttentionTabIds] = useState<Set<string>>(() => new Set());
   const [documentationPanelStates, setDocumentationPanelStates] = useState<Record<string, DocumentationPanelState>>({});
+  const [codexSettingsEditors] = useState(() => new Map<string, CodexSettingsEditor>());
   const [automationPanelStates, setAutomationPanelStates] = useState<Record<string, AutomationPanelState>>({});
   const [selectedAudioInputId, setSelectedAudioInputId] = useState<string | undefined>(() => loadAudioInputId());
   const [audioInputs, setAudioInputs] = useState<MediaDeviceInfo[]>([]);
@@ -374,11 +377,21 @@ export function App() {
 
   useEffect(() => {
     const tabIds = new Set(tabs.map((tab) => tab.id));
+    for (const [tabId, editor] of codexSettingsEditors) {
+      if (!tabIds.has(tabId)) {
+        editor.dispose();
+        codexSettingsEditors.delete(tabId);
+      }
+    }
     disposeTerminalViewsExcept(tabIds);
     disposeFileBrowserPanelStatesExcept(tabIds);
     disposeFileBrowserTransfersExcept(tabIds);
     disposeDocumentationIngestControllersExcept(tabIds);
-  }, [tabs]);
+  }, [tabs, codexSettingsEditors]);
+
+  useEffect(() => () => {
+    codexSettingsEditors.forEach(editor => editor.dispose());
+  }, [codexSettingsEditors]);
 
   useEffect(() => {
     setAttentionTabIds((current) => clearFocusedAttention(current, layout));
@@ -1228,6 +1241,15 @@ export function App() {
       );
     },
     [PLUGIN_WEBVIEW_RENDERER]: (contribution, context) => <PluginWebviewPanel contribution={contribution} context={context} />,
+    "codex-settings.panel": (_contribution, context) => {
+      if (!context.callHook || !context.tab) return <div className="empty-pane">Codex settings tab is unavailable.</div>;
+      let editor = codexSettingsEditors.get(context.tab.id);
+      if (!editor) {
+        editor = new CodexSettingsEditor();
+        codexSettingsEditors.set(context.tab.id, editor);
+      }
+      return <CodexSettingsPanel editor={editor} callHook={context.callHook} />;
+    },
     "jira.panel": (_contribution, context) => context.callHook ? (
       <Suspense fallback={<div className="empty-pane">Loading Jira...</div>}>
         <JiraPanel callHook={context.callHook} activeTriggerIds={activeAutomationTriggerIds} emitTrigger={handleEmitTrigger} />

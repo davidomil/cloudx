@@ -23,6 +23,7 @@
     "safe-regex2": "^5.1.1",
     "smol-toml": "^1.7.1",
     "tar": "^7.5.15",
+    "toml-eslint-parser": "^1.0.3",
     "ws": "^8.21.0",
     "yauzl": "^2.10.0"
   },

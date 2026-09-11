@@ -30,7 +30,7 @@ interface SourceDependencies {
 const BINDING = ".cloudx-source.json";
 const DEADLINE_MS = 30_000;
 
-/** Metadata and durable source binding only; never opens databases or owns a child. */
+/** Shared configuration and durable source binding; never opens databases or owns a child. */
 export class CodexStateSources {
   readonly originalHome: string;
   private readonly dependencies: SourceDependencies;
@@ -161,6 +161,61 @@ export class CodexStateSources {
     const current = await this.resolve(signal);
     if (!sameSource(source, current))
       throw new Error("Codex source binding is stale: source changed.");
+  }
+
+  replaceConfig(
+    source: ResolvedCodexStateSource,
+    expected: string | undefined,
+    replacement: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (Buffer.byteLength(replacement) > 1_048_576)
+      return Promise.reject(new Error("Codex configuration exceeds size limit."));
+    return this.work(signal, async (check) => {
+      await this.requireIdentity(source, check);
+      const lockPath = path.join(source.home, ".cloudx-config.lock");
+      let lock;
+      try {
+        check();
+        lock = await this.dependencies.fs.open(lockPath, "wx", 0o600);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST")
+          throw new Error("Shared Codex settings are being edited. Reload before saving again. If a previous writer stopped unexpectedly, remove .cloudx-config.lock from the Codex home after confirming no save is running.");
+        throw error;
+      }
+      const target = path.join(source.home, "config.toml");
+      const staging = path.join(source.home, `.cloudx-config-${randomUUID()}.tmp`);
+      let staged = false;
+      try {
+        check();
+        if (await this.readText(target, 1_048_576, check, true) !== expected)
+          throw new Error("Shared Codex settings changed. Reload before saving again.");
+        const file = await this.dependencies.fs.open(staging, "wx", 0o600);
+        staged = true;
+        try {
+          check();
+          await file.writeFile(replacement, "utf8");
+          check();
+          await file.sync();
+        } finally {
+          await this.cleanup(() => file.close());
+        }
+        if (!sameSource(source, await this.resolveChecked(check)))
+          throw new Error("Codex source changed.");
+        if (await this.readText(target, 1_048_576, check, true) !== expected)
+          throw new Error("Shared Codex settings changed. Reload before saving again.");
+        check();
+        await this.dependencies.fs.rename(staging, target);
+        staged = false;
+      } finally {
+        try {
+          if (staged) await this.cleanup(() => this.dependencies.fs.unlink(staging));
+        } finally {
+          try { await this.cleanup(() => lock.close()); }
+          finally { await this.cleanup(() => this.dependencies.fs.unlink(lockPath)); }
+        }
+      }
+    });
   }
 
   viewPath(tabId: string): string {
