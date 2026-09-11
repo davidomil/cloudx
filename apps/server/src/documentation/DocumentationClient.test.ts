@@ -57,21 +57,24 @@ describe("DocumentationClient", () => {
     expect(requestUrl).toBe("/docs/documents?token=local&states=active%2Cstale&limit=25&offset=50&query=reset+manual&collection=board&sortDirection=asc");
   });
 
-  it("discovers one pending document through the bounded enrichment endpoint", async () => {
+  it("discovers pending document batches through the bounded enrichment endpoint", async () => {
     const requests: string[] = [];
-    const pending = { documentId: "pending", title: "Pending guide", extractionRevision: "e".repeat(32) };
+    const pending = [
+      { documentId: "first", title: "First guide", extractionRevision: "e".repeat(32) },
+      { documentId: "second", title: "Second guide", extractionRevision: "f".repeat(32) }
+    ];
     const url = await startServer((request, response) => {
       requests.push(`${request.method} ${request.url}`);
-      response.end(JSON.stringify({ documents: requests.length === 1 ? [pending] : [] }));
+      response.end(JSON.stringify({ documents: requests.length === 1 ? pending : [] }));
     });
     const client = new DocumentationClient(`${url}/docs/?token=local`);
 
-    await expect(client.nextPendingEnrichment()).resolves.toEqual(pending);
-    await expect(client.nextPendingEnrichment()).resolves.toBeUndefined();
+    await expect(client.pendingEnrichments(2)).resolves.toEqual(pending);
+    await expect(client.pendingEnrichments(2)).resolves.toEqual([]);
 
     expect(requests).toEqual([
-      "GET /docs/enrichment/pending?token=local&limit=1",
-      "GET /docs/enrichment/pending?token=local&limit=1"
+      "GET /docs/enrichment/pending?token=local&limit=2",
+      "GET /docs/enrichment/pending?token=local&limit=2"
     ]);
   });
 
@@ -81,6 +84,9 @@ describe("DocumentationClient", () => {
     { documents: {} },
     { documents: [{ documentId: "one", title: "One" }, { documentId: "two", title: "Two" }] },
     { documents: [null] },
+    { documents: [{ documentId: "one", title: "One", extractionRevision: "e".repeat(32) }, null] },
+    { documents: Array.from({ length: 3 }, (_, index) => ({ documentId: String(index), title: "Guide", extractionRevision: "e".repeat(32) })) },
+    { documents: Array.from({ length: 2 }, () => ({ documentId: "duplicate", title: "Guide", extractionRevision: "e".repeat(32) })) },
     { documents: [[]] },
     { documents: [{ documentId: " ", title: "Empty ID" }] },
     { documents: [{ documentId: 1, title: "Numeric ID" }] },
@@ -92,7 +98,18 @@ describe("DocumentationClient", () => {
   ])("rejects an invalid pending enrichment response: %j", async (body) => {
     const url = await startServer((_request, response) => response.end(JSON.stringify(body)));
 
-    await expect(new DocumentationClient(url).nextPendingEnrichment()).rejects.toThrow(/Invalid pending documentation enrichment/);
+    await expect(new DocumentationClient(url).pendingEnrichments(2)).rejects.toThrow(/Invalid pending documentation enrichment/);
+  });
+
+  it.each([0, -1, 1.5, 101, NaN, Infinity])("rejects an invalid pending document batch limit: %s", async (limit) => {
+    let requests = 0;
+    const url = await startServer((_request, response) => {
+      requests += 1;
+      response.end(JSON.stringify({ documents: [] }));
+    });
+
+    await expect(new DocumentationClient(url).pendingEnrichments(limit)).rejects.toThrow("limit must be an integer between 1 and 100.");
+    expect(requests).toBe(0);
   });
 
   it.each(["failed", "skipped"] as const)("records a %s enrichment outcome for an encoded document ID", async (status) => {
@@ -140,7 +157,7 @@ describe("DocumentationClient", () => {
     const controller = new AbortController();
     const stopped = new Error("Background enrichment stopped.");
     const request = operation === "discovery"
-      ? client.nextPendingEnrichment({ signal: controller.signal })
+      ? client.pendingEnrichments(2, { signal: controller.signal })
       : client.recordEnrichmentOutcome("doc", { extractionRevision: "e".repeat(32), status: "failed", error: "Model failed." }, { signal: controller.signal });
     const rejected = expect(request).rejects.toBe(stopped);
     await started;

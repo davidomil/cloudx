@@ -69,13 +69,13 @@ describe("DocumentationEnrichmentService", () => {
     expect(client.enrichDocument).not.toHaveBeenCalled();
   });
 
-  it("publishes background enrichment for the extraction revision used as model input", async () => {
+  it.each([false, true])("publishes enrichment for the extraction revision used as model input (background: %s)", async (onlyPending) => {
     const runner = fakeRunner({ summary: "Reset timing.", spans: [{ locator: "ai:metadata", text: "Reset timing summary." }], metadata: [], warnings: [] });
     const client = fakeDocumentationClient({ state: "active" });
     const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner });
     const extractionRevision = "e".repeat(32);
 
-    await expect(service.enrichIngestResponse({ document: { documentId: "doc-1", extractionRevision } }, {}, { onlyPending: true }))
+    await expect(service.enrichIngestResponse({ document: { documentId: "doc-1", extractionRevision: onlyPending ? extractionRevision : "f".repeat(32) } }, {}, { onlyPending }))
       .resolves.toMatchObject({ enrichment: { results: [{ status: "written" }] } });
 
     expect(runner.run).toHaveBeenCalledOnce();
@@ -117,13 +117,65 @@ describe("DocumentationEnrichmentService", () => {
     expect(client.enrichDocument).not.toHaveBeenCalled();
   });
 
+  it.each(["chunks", "artifacts"])("discards explicit enrichment evidence replaced between %s pages", async (stage) => {
+    const runner = fakeRunner();
+    const client = fakeDocumentationClient({ extraction_revision: "f".repeat(32) });
+    client.getDocument.mockResolvedValueOnce({ document: {
+      extraction_revision: "e".repeat(32),
+      chunks: [{ chunk_origin: "source", locator: "page 1", text: "Original extraction." }],
+      artifacts: [{ path: "page-1.png" }],
+      chunkWindow: { offset: 0, limit: 1, total: stage === "chunks" ? 2 : 1, hasMore: stage === "chunks" },
+      artifactWindow: { offset: 0, limit: 1, total: stage === "artifacts" ? 2 : 1, hasMore: stage === "artifacts" }
+    } });
+    const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner });
+
+    await expect(service.enrichIngestResponse({ document: { documentId: "doc-1" } }))
+      .resolves.toMatchObject({ enrichment: { results: [{ status: "failed", error: "Document extraction was replaced before enrichment could read its evidence." }] } });
+
+    expect(client.getDocument).toHaveBeenCalledTimes(2);
+    expect(runner.run).not.toHaveBeenCalled();
+    expect(client.enrichDocument).not.toHaveBeenCalled();
+  });
+
+  it("prevents explicit enrichment from writing obsolete evidence when reanalysis finishes during the model run", async () => {
+    let currentRevision = "e".repeat(32);
+    const client = fakeDocumentationClient({ extraction_revision: currentRevision });
+    client.enrichDocument.mockImplementation(async ({ extractionRevision }) => {
+      if (extractionRevision !== undefined && extractionRevision !== currentRevision) {
+        throw new Error("Enrichment extraction revision no longer matches the document.");
+      }
+      return {};
+    });
+    const runner = fakeRunner();
+    runner.run.mockImplementation(async () => {
+      currentRevision = "f".repeat(32);
+      return { summary: "Obsolete summary", spans: [{ locator: "ai:metadata", text: "Obsolete evidence." }], metadata: [], warnings: [] };
+    });
+    const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner });
+
+    await expect(service.enrichIngestResponse({ document: { documentId: "doc-1" } }))
+      .resolves.toMatchObject({ enrichment: { results: [{ status: "failed", error: "Enrichment extraction revision no longer matches the document." }] } });
+    expect(client.enrichDocument).toHaveBeenCalledWith(expect.objectContaining({ extractionRevision: "e".repeat(32) }));
+  });
+
+  it.each([undefined, null, "invalid"])("rejects explicit enrichment without a valid evidence revision: %s", async (extraction_revision) => {
+    const client = fakeDocumentationClient({ extraction_revision });
+    const runner = fakeRunner();
+    const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner });
+
+    await expect(service.enrichIngestResponse({ document: { documentId: "doc-1" } }))
+      .resolves.toMatchObject({ enrichment: { results: [{ status: "failed", error: "Documentation enrichment evidence requires a valid extraction revision." }] } });
+    expect(runner.run).not.toHaveBeenCalled();
+    expect(client.enrichDocument).not.toHaveBeenCalled();
+  });
+
   it("waits for explicit enrichment and rechecks the pending document before starting background analysis", async () => {
     let finishModel!: (output: unknown) => void;
     const runner = fakeRunner();
     runner.run.mockImplementationOnce(() => new Promise((resolve) => { finishModel = resolve; }));
     const client = fakeDocumentationClient({ state: "active" });
     client.getDocument
-      .mockResolvedValueOnce({ document: { state: "active", chunks: [{ chunk_origin: "source", locator: "page 1", text: "Source evidence" }] } })
+      .mockResolvedValueOnce({ document: { state: "active", extraction_revision: "e".repeat(32), chunks: [{ chunk_origin: "source", locator: "page 1", text: "Source evidence" }] } })
       .mockResolvedValue({ document: { state: "active", extraction_revision: "e".repeat(32), chunks: [{ chunk_origin: "ai", locator: "ai:metadata", text: "Enriched source" }] } });
     const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner });
     const input = { document: { documentId: "doc-1", extractionRevision: "e".repeat(32) } };
@@ -149,6 +201,111 @@ describe("DocumentationEnrichmentService", () => {
     });
 
     await expect(service.answerQuestion({ question: "How do I use the source?" })).rejects.toThrow("Manual search can inspect source text only");
+  });
+
+  describe("document concurrency", () => {
+    it("enriches two documents at once and refills the free slot while preserving result order", async () => {
+      const { service, client, runner, finish } = parallelEnrichmentFixture();
+      const response = service.enrichIngestResponse({ documents: ["first", "second", "third"].map((documentId) => ({ documentId })) });
+      await vi.waitFor(() => expect(runner.run).toHaveBeenCalledTimes(2));
+      expect(client.getDocument.mock.calls.map(([input]) => input.documentId)).toEqual(["first", "second"]);
+
+      finish("second");
+      await vi.waitFor(() => expect(runner.run).toHaveBeenCalledTimes(3));
+      expect(client.enrichDocument).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ documentId: "second" }));
+      finish("third");
+      finish("first");
+      await expect(response).resolves.toMatchObject({ enrichment: { results: [
+        { documentId: "first", status: "written" },
+        { documentId: "second", status: "written" },
+        { documentId: "third", status: "written" }
+      ] } });
+    });
+
+    it("shares the document limit across foreground and background calls without blocking unrelated documents", async () => {
+      const { service, client, runner, finish } = parallelEnrichmentFixture();
+      const first = service.enrichIngestResponse({ document: { documentId: "first" } });
+      await vi.waitFor(() => expect(runner.run).toHaveBeenCalledOnce());
+      const duplicate = service.enrichIngestResponse({ document: { documentId: "first", extractionRevision: "e".repeat(32) } }, {}, { onlyPending: true });
+      const second = service.enrichIngestResponse({ document: { documentId: "second" } });
+      const third = service.enrichIngestResponse({ document: { documentId: "third" } });
+      await vi.waitFor(() => expect(runner.run).toHaveBeenCalledTimes(2));
+      expect(client.getDocument.mock.calls.map(([input]) => input.documentId)).toEqual(["first", "second"]);
+
+      finish("first");
+      await expect(duplicate).resolves.toMatchObject({ enrichment: { results: [{ status: "unchanged" }] } });
+      await vi.waitFor(() => expect(runner.run).toHaveBeenCalledTimes(3));
+      finish("second");
+      finish("third");
+      await Promise.all([first, second, third]);
+      expect(client.enrichDocument).toHaveBeenCalledTimes(3);
+    });
+
+    it("continues waiting and sibling documents when one model run fails", async () => {
+      const { service, runner, finish, fail } = parallelEnrichmentFixture();
+      const response = service.enrichIngestResponse({ documents: ["first", "second", "third"].map((documentId) => ({ documentId })) });
+      await vi.waitFor(() => expect(runner.run).toHaveBeenCalledTimes(2));
+      fail("second", new Error("Model failed for second."));
+      await vi.waitFor(() => expect(runner.run).toHaveBeenCalledTimes(3));
+      finish("third");
+      finish("first");
+      await expect(response).resolves.toMatchObject({ enrichment: { results: [
+        { documentId: "first", status: "written" },
+        { documentId: "second", status: "failed", error: "Model failed for second." },
+        { documentId: "third", status: "written" }
+      ] } });
+    });
+
+    it("cancels waiting documents without waiting for an unrelated active document", async () => {
+      const { service, runner, finish } = parallelEnrichmentFixture(1);
+      const active = service.enrichIngestResponse({ document: { documentId: "active" } });
+      await vi.waitFor(() => expect(runner.run).toHaveBeenCalledOnce());
+      const controller = new AbortController();
+      const waiting = service.enrichIngestResponse({ documents: [{ documentId: "waiting" }, { documentId: "active" }] }, {}, { signal: controller.signal });
+      const rejected = expect(waiting).rejects.toThrow("Cancelled waiting enrichment.");
+      controller.abort(new Error("Cancelled waiting enrichment."));
+      await rejected;
+      expect(runner.run).toHaveBeenCalledOnce();
+      finish("active");
+      await active;
+      expect(runner.run).toHaveBeenCalledOnce();
+    });
+
+    it("waits for every active document to clean up on cancellation and never starts waiting documents", async () => {
+      const { service, client, runner, fail } = parallelEnrichmentFixture();
+      const controller = new AbortController();
+      const response = service.enrichIngestResponse({ documents: ["first", "second", "third"].map((documentId) => ({ documentId })) }, {}, { signal: controller.signal });
+      const settled = vi.fn();
+      const settlement = response.then(settled, settled);
+      await vi.waitFor(() => expect(runner.run).toHaveBeenCalledTimes(2));
+      const reason = new Error("Stopped document enrichment.");
+      controller.abort(reason);
+      fail("first", reason);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(settled).not.toHaveBeenCalled();
+      expect(runner.run.mock.calls.every(([, options]) => options.signal.aborted)).toBe(true);
+      fail("second", reason);
+      await settlement;
+      expect(settled).toHaveBeenCalledExactlyOnceWith(reason);
+      expect(runner.run).toHaveBeenCalledTimes(2);
+      expect(client.enrichDocument).not.toHaveBeenCalled();
+    });
+
+    it("rechecks the enabled setting before starting waiting document work", async () => {
+      const { service, runner, finish, config } = parallelEnrichmentFixture(1);
+      const response = service.enrichIngestResponse({ documents: [{ documentId: "first" }, { documentId: "second" }] });
+      await vi.waitFor(() => expect(runner.run).toHaveBeenCalledOnce());
+      vi.spyOn(config, "isAiControlEnabled").mockReturnValue(false);
+      finish("first");
+      await expect(response).resolves.toMatchObject({ enrichment: { results: [
+        { documentId: "first", status: "written" }, { documentId: "second", status: "unchanged" }
+      ] } });
+      expect(runner.run).toHaveBeenCalledOnce();
+    });
+
+    it.each([0, -1, 1.5, NaN, Infinity, 101])("rejects invalid document concurrency %s", (concurrency) => {
+      expect(() => parallelEnrichmentFixture(concurrency)).toThrow("Documentation enrichment concurrency must be an integer between 1 and 100.");
+    });
   });
 
   it("returns formatted no-result answers without running Codex", async () => {
@@ -255,6 +412,7 @@ describe("DocumentationEnrichmentService", () => {
     });
     expect(client.enrichDocument).toHaveBeenCalledWith({
       documentId: "doc-1",
+      extractionRevision: "e".repeat(32),
       spans: [{ locator: "ai:visual:table", text: "AI visual summary says ENRICHED-TABLE-44 contains reset timing rows." }],
       model: DEFAULT_DOCUMENTATION_IMAGE_ANALYSIS_MODEL,
       skillIds: DEFAULT_DOCUMENTATION_ENRICHMENT_SKILL_IDS,
@@ -981,6 +1139,7 @@ describe("DocumentationEnrichmentService", () => {
       const chunkPage = chunks.slice(chunkOffset, chunkOffset + chunkLimit);
       return {
         document: {
+          extraction_revision: "e".repeat(32),
           document_id: "doc-1",
           title: "Power datasheet",
           source_type: "datasheet",
@@ -1793,6 +1952,39 @@ describe("DocumentationEnrichmentService", () => {
     ].join("\n"))).toEqual([0, 120.042, 3599.5]);
   });
 });
+
+function parallelEnrichmentFixture(concurrency?: number) {
+  const completions = new Map<string, { resolve(value: unknown): void; reject(error: Error): void }>();
+  const written = new Set<string>();
+  const client = fakeDocumentationClient();
+  client.getDocument.mockImplementation(async ({ documentId }) => ({ document: {
+    document_id: documentId,
+    state: "active",
+    extraction_revision: "e".repeat(32),
+    chunks: [{ chunk_origin: written.has(documentId) ? "ai" : "source", locator: "page 1", text: `Evidence for ${documentId}.` }]
+  } }));
+  client.enrichDocument.mockImplementation(async ({ documentId }) => {
+    written.add(documentId);
+    return {};
+  });
+  const runner = fakeRunner();
+  runner.run.mockImplementation((prompt) => {
+    const documentId = /Evidence for (\w+)\./u.exec(prompt)?.[1];
+    if (!documentId) throw new Error("Missing document evidence in model prompt.");
+    return new Promise((resolve, reject) => completions.set(documentId, { resolve, reject }));
+  });
+  const config = fakeConfig(true);
+  const service = new DocumentationEnrichmentService({ client, config, rulesSkills: fakeRulesSkills(), runner, concurrency });
+  return {
+    service, client, runner, config,
+    finish(documentId: string) {
+      completions.get(documentId)!.resolve({ summary: "Source summary", spans: [{ locator: "ai:metadata", text: `Enriched ${documentId}.` }], metadata: [], warnings: [] });
+    },
+    fail(documentId: string, error: Error) {
+      completions.get(documentId)!.reject(error);
+    }
+  };
+}
 
 function fakeConfig(enabled: boolean, options: {
   skillIds?: string[];

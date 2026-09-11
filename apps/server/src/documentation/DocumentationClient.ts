@@ -48,6 +48,12 @@ export interface DocumentationRequestOptions {
   signal?: AbortSignal;
 }
 
+export interface DocumentationPendingEnrichment {
+  documentId: string;
+  title: string;
+  extractionRevision: string;
+}
+
 export interface DocumentationIngestRequestOptions extends DocumentationRequestOptions {
   onProgress?: (event: DocumentationIngestProgressEvent) => void;
 }
@@ -99,20 +105,25 @@ export class DocumentationClient {
     return this.get("/portable-manifest");
   }
 
-  async nextPendingEnrichment(options: DocumentationRequestOptions = {}): Promise<{ documentId: string; title: string; extractionRevision: string } | undefined> {
-    const response = await this.get("/enrichment/pending?limit=1", options.signal);
-    if (!Array.isArray(response.documents) || response.documents.length > 1) {
+  async pendingEnrichments(limit: number, options: DocumentationRequestOptions = {}): Promise<DocumentationPendingEnrichment[]> {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new Error("limit must be an integer between 1 and 100.");
+    }
+    const response = await this.get(`/enrichment/pending?limit=${limit}`, options.signal);
+    if (!Array.isArray(response.documents) || response.documents.length > limit) {
       throw new Error("Invalid pending documentation enrichment response.");
     }
-    const document: unknown = response.documents[0];
-    if (document === undefined) return undefined;
-    if (!document || typeof document !== "object" || !("documentId" in document) || !("title" in document) || typeof document.documentId !== "string" || !document.documentId.trim() || typeof document.title !== "string") {
-      throw new Error("Invalid pending documentation enrichment document.");
-    }
-    if (!("extractionRevision" in document) || typeof document.extractionRevision !== "string" || document.extractionRevision.length !== 32 || !/^[0-9a-f]{32}$/.test(document.extractionRevision)) {
-      throw new Error("Invalid pending documentation enrichment extraction revision.");
-    }
-    return { documentId: document.documentId, title: document.title, extractionRevision: document.extractionRevision };
+    const documentIds = new Set<string>();
+    return response.documents.map((document: unknown) => {
+      if (!document || typeof document !== "object" || !("documentId" in document) || !("title" in document) || typeof document.documentId !== "string" || !document.documentId.trim() || typeof document.title !== "string" || documentIds.has(document.documentId)) {
+        throw new Error("Invalid pending documentation enrichment document.");
+      }
+      if (!("extractionRevision" in document) || typeof document.extractionRevision !== "string" || document.extractionRevision.length !== 32 || !/^[0-9a-f]{32}$/.test(document.extractionRevision)) {
+        throw new Error("Invalid pending documentation enrichment extraction revision.");
+      }
+      documentIds.add(document.documentId);
+      return { documentId: document.documentId, title: document.title, extractionRevision: document.extractionRevision };
+    });
   }
 
   recordEnrichmentOutcome(documentId: string, outcome: { extractionRevision: string; status: "failed" | "skipped"; error: string }, options: DocumentationRequestOptions = {}): Promise<Record<string, unknown>> {

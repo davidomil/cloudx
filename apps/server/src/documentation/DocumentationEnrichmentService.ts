@@ -92,6 +92,12 @@ export interface DocumentationEnrichmentOptions {
   asr?: AsrClient;
   mediaProcessLauncher?: MediaProcessLauncher;
   pluginContributionsReady?: () => Promise<RulesSkillsStore> | undefined;
+  concurrency?: number;
+}
+
+interface PendingDocumentEnrichment {
+  documentId: string;
+  start(): void;
 }
 
 export class CodexDocumentationEnrichmentRunner implements DocumentationEnrichmentRunner {
@@ -116,9 +122,16 @@ export class CodexDocumentationEnrichmentRunner implements DocumentationEnrichme
 }
 
 export class DocumentationEnrichmentService {
-  private enrichmentTail: Promise<void> = Promise.resolve();
+  readonly concurrency: number;
+  private readonly activeDocuments = new Set<string>();
+  private readonly pendingDocuments: PendingDocumentEnrichment[] = [];
 
-  constructor(private readonly options: DocumentationEnrichmentOptions) {}
+  constructor(private readonly options: DocumentationEnrichmentOptions) {
+    this.concurrency = options.concurrency ?? 2;
+    if (!Number.isSafeInteger(this.concurrency) || this.concurrency < 1 || this.concurrency > 100) {
+      throw new Error("Documentation enrichment concurrency must be an integer between 1 and 100.");
+    }
+  }
 
   isEnabled(): boolean {
     if (!this.options.config.isAiControlEnabled()) {
@@ -127,17 +140,11 @@ export class DocumentationEnrichmentService {
     return this.options.config.getPluginConfig(DOCUMENTATION_PLUGIN_ID)[DOCUMENTATION_AI_ENRICHMENT_ENABLED_KEY] === true;
   }
 
-  enrichIngestResponse(
+  async enrichIngestResponse(
     response: Record<string, unknown>,
     source: DocumentationEnrichmentSource = {},
     options: DocumentationEnrichmentRequestOptions = {}
   ): Promise<Record<string, unknown>> {
-    const run = this.enrichmentTail.then(() => this.enrichResponse(response, source, options));
-    this.enrichmentTail = run.then(() => undefined, () => undefined);
-    return run;
-  }
-
-  private async enrichResponse(response: Record<string, unknown>, source: DocumentationEnrichmentSource, options: DocumentationEnrichmentRequestOptions): Promise<Record<string, unknown>> {
     options.signal?.throwIfAborted();
     if (!this.isEnabled()) {
       return response;
@@ -146,22 +153,50 @@ export class DocumentationEnrichmentService {
     if (documents.length === 0) {
       return response;
     }
-    const results = [];
-    for (const document of documents) {
-      try {
-        results.push(await this.enrichDocument(document, source, options.signal, options.onlyPending));
-      } catch (error) {
-        if (options.signal?.aborted) {
-          throw documentationAbortReason(options.signal);
-        }
-        results.push({
-          documentId: document.documentId,
-          status: "failed",
-          error: error instanceof Error ? error.message : String(error)
-        });
-      }
-    }
+    const outcomes = await Promise.allSettled(documents.map((document) => this.scheduleDocument(document, source, options)));
+    options.signal?.throwIfAborted();
+    const results = outcomes.map((outcome, index) => outcome.status === "fulfilled" ? outcome.value : {
+      documentId: documents[index]!.documentId,
+      status: "failed",
+      error: outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)
+    });
     return { ...response, enrichment: { enabled: true, results } };
+  }
+
+  private scheduleDocument(document: IngestedDocumentRef, source: DocumentationEnrichmentSource, options: DocumentationEnrichmentRequestOptions): Promise<Record<string, unknown>> {
+    return new Promise((resolve, reject) => {
+      const signal = options.signal;
+      signal?.throwIfAborted();
+      const pending: PendingDocumentEnrichment = {
+        documentId: document.documentId,
+        start: () => {
+          signal?.removeEventListener("abort", cancel);
+          this.activeDocuments.add(document.documentId);
+          const run = this.isEnabled()
+            ? this.enrichDocument(document, source, signal, options.onlyPending)
+            : Promise.resolve({ documentId: document.documentId, status: "unchanged" });
+          void run.then(resolve, reject).finally(() => {
+            this.activeDocuments.delete(document.documentId);
+            this.startPendingDocuments();
+          });
+        }
+      };
+      const cancel = () => {
+        this.pendingDocuments.splice(this.pendingDocuments.indexOf(pending), 1);
+        reject(documentationAbortReason(signal!));
+      };
+      signal?.addEventListener("abort", cancel, { once: true });
+      this.pendingDocuments.push(pending);
+      this.startPendingDocuments();
+    });
+  }
+
+  private startPendingDocuments(): void {
+    while (this.activeDocuments.size < this.concurrency) {
+      const index = this.pendingDocuments.findIndex((document) => !this.activeDocuments.has(document.documentId));
+      if (index < 0) return;
+      this.pendingDocuments.splice(index, 1)[0]!.start();
+    }
   }
 
   async answerQuestion(input: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -242,7 +277,7 @@ export class DocumentationEnrichmentService {
       }
       const enrichment = {
         documentId: document.documentId,
-        ...(extractionRevision ? { extractionRevision } : {}),
+        extractionRevision: fullDocument.extraction_revision,
         spans: output.spans,
         model,
         skillIds,
@@ -269,7 +304,7 @@ export class DocumentationEnrichmentService {
     }
   }
 
-  private async enrichmentDocument(documentId: string, signal?: AbortSignal, extractionRevision?: string): Promise<Record<string, unknown>> {
+  private async enrichmentDocument(documentId: string, signal?: AbortSignal, extractionRevision?: string): Promise<Record<string, unknown> & { extraction_revision: string }> {
     let chunkOffset = 0;
     let artifactOffset = 0;
     let needsChunks = true;
@@ -295,7 +330,12 @@ export class DocumentationEnrichmentService {
         ? await this.options.client.getDocument(input, { signal })
         : await this.options.client.getDocument(input);
       const nextDocument = getRecord(response.document, "document");
-      if (extractionRevision && nextDocument.extraction_revision !== extractionRevision) {
+      const nextRevision = nextDocument.extraction_revision;
+      if (typeof nextRevision !== "string" || nextRevision.length !== 32 || !/^[0-9a-f]{32}$/.test(nextRevision)) {
+        throw new Error("Documentation enrichment evidence requires a valid extraction revision.");
+      }
+      extractionRevision ??= nextRevision;
+      if (nextRevision !== extractionRevision) {
         throw new Error("Document extraction was replaced before enrichment could read its evidence.");
       }
       document ??= nextDocument;
@@ -318,10 +358,10 @@ export class DocumentationEnrichmentService {
         artifactOffset = nextWindowOffset(nextDocument.artifactWindow, artifactOffset, nextArtifacts.length);
       }
     }
-    if (!document) {
+    if (!document || !extractionRevision) {
       throw new Error("Documentation enrichment could not load document details.");
     }
-    return { ...document, chunks, artifacts, enrichments: [], events: [] };
+    return { ...document, extraction_revision: extractionRevision, chunks, artifacts, enrichments: [], events: [] };
   }
 
   private async resolveSkills(skillIds: string[], signal?: AbortSignal): Promise<CloudxSkill[]> {

@@ -92,12 +92,49 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
         const enriched = await fixture.document(documentId);
         expect(JSON.stringify(enriched.chunks)).not.toContain("EXCLUDED-SCRIPT");
         expect(enriched.enrichments).toHaveLength(1);
-        await expect(fixture.client.nextPendingEnrichment()).resolves.toBeUndefined();
+        await expect(fixture.client.pendingEnrichments(2)).resolves.toEqual([]);
         expect(enrichment.transcribeFile).not.toHaveBeenCalled();
         expect(enrichment.mediaProcessLauncher).not.toHaveBeenCalled();
       } finally {
         releaseModel();
         await worker?.dispose();
+        await fixture.dispose();
+      }
+    }, 30_000);
+
+    it("rejects explicit enrichment when a parallel import replaces its extraction", async () => {
+      const fixture = await startArchive();
+      let releaseModel!: () => void;
+      const modelGate = new Promise<void>((resolve) => { releaseModel = resolve; });
+      let pending: Promise<Record<string, unknown>> | undefined;
+      try {
+        const sourcePath = path.join(fixture.root, "replaced-source.txt");
+        await fs.writeFile(sourcePath, "<html><body><p>Current source.</p><script>OBSOLETE-EVIDENCE</script></body></html>");
+        const imported = await fixture.client.ingestPath({ path: sourcePath, sourceType: "text" });
+        const documentId = (imported.documents as Array<{ documentId: string }>)[0].documentId;
+        const original = await fixture.document(documentId);
+        const enrichment = createEnrichment(fixture);
+        enrichment.run.mockImplementationOnce(async () => {
+          await modelGate;
+          return { summary: "Obsolete extraction", metadata: [], warnings: [], spans: [{ locator: "ai:metadata", text: "OBSOLETE-EVIDENCE" }] };
+        });
+        pending = enrichment.service.enrichIngestResponse({ document: { documentId } });
+        await vi.waitFor(() => expect(enrichment.run).toHaveBeenCalledOnce(), { timeout: 10_000 });
+        await fixture.client.ingestPath({ path: sourcePath, sourceType: "website" });
+        const corrected = await fixture.document(documentId);
+        expect(corrected.extraction_revision).not.toBe(original.extraction_revision);
+
+        releaseModel();
+        await expect(pending).resolves.toMatchObject({ enrichment: { results: [{
+          documentId, status: "failed", error: expect.stringContaining("Enrichment extraction revision no longer matches")
+        }] } });
+        const document = await fixture.document(documentId);
+        expect(document.extraction_revision).toBe(corrected.extraction_revision);
+        expect(document.chunks.every((chunk: { chunk_origin: string }) => chunk.chunk_origin === "source")).toBe(true);
+        expect(JSON.stringify(document.chunks)).not.toContain("OBSOLETE-EVIDENCE");
+      } finally {
+        releaseModel();
+        await pending;
         await fixture.dispose();
       }
     }, 30_000);
@@ -133,7 +170,7 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
         expect(fixture.queue.list().capacity.admittedJobs).toBe(0);
 
         releaseModel();
-        await vi.waitFor(async () => expect(await fixture.client.nextPendingEnrichment()).toBeUndefined(), { timeout: 10_000 });
+        await vi.waitFor(async () => expect(await fixture.client.pendingEnrichments(2)).toEqual([]), { timeout: 10_000 });
         expect((await fixture.document(documentId)).chunks).toEqual(expect.arrayContaining([
           expect.objectContaining({ chunk_origin: "ai", text: "BACKGROUND-EVIDENCE" }),
         ]));
