@@ -1,5 +1,8 @@
 import { expect, test, type Page, type TestInfo } from "@playwright/test";
-import type { CloudxConfigResponse } from "@cloudx/shared";
+import type {
+  CloudxConfigResponse,
+  WorkspaceStateResponse,
+} from "@cloudx/shared";
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import net from "node:net";
@@ -322,6 +325,7 @@ for (const navigation of workspaceNavigations) {
       configPath,
       'model = "initial-model"\nservice_tier = "priority"\n',
     );
+    if (navigation === "window switches") await prepareWindowSwitch(page);
     const initialRead = page.waitForResponse(
       (response) =>
         new URL(response.url()).pathname === "/api/hooks/codex-settings.read",
@@ -386,6 +390,7 @@ for (const navigation of workspaceNavigations) {
       configPath,
       `model = "initial-model"\nservice_tier = "default"\n${unrelatedSettings}`,
     );
+    if (navigation === "window switches") await prepareWindowSwitch(page);
     const initialRead = page.waitForResponse(
       (response) =>
         new URL(response.url()).pathname === "/api/hooks/codex-settings.read",
@@ -609,6 +614,26 @@ async function activateWorkspaceTab(page: Page, title: string) {
   );
 }
 
+async function prepareWindowSwitch(page: Page) {
+  const response = await page.request.get(`${baseUrl}/api/workspace`);
+  expect(response.ok()).toBe(true);
+  const workspace = (await response.json()) as WorkspaceStateResponse;
+  const created = await page.request.post(`${baseUrl}/api/windows`, {
+    data: { name: "Other workspace", defaultCwd: testRoot },
+  });
+  expect(created.status()).toBe(201);
+  const restored = await page.request.post(
+    `${baseUrl}/api/windows/${workspace.activeWindowId}/active`,
+    { data: {} },
+  );
+  expect(restored.ok()).toBe(true);
+  const settled = (await restored.json()) as WorkspaceStateResponse;
+  expect(settled.activeWindowId).toBe(workspace.activeWindowId);
+  expect(settled.windows).toContainEqual(
+    expect.objectContaining({ name: "Other workspace", defaultCwd: testRoot }),
+  );
+}
+
 async function navigateWorkspace(
   page: Page,
   isMobile: boolean,
@@ -629,25 +654,19 @@ async function navigateWorkspace(
     const originalWindow = (await switcher.textContent())!.trim();
     await switcher.click();
     await page
-      .getByRole("button", { name: "Create window", exact: true })
-      .click();
-    await page
-      .getByPlaceholder("Window name", { exact: true })
-      .fill("Other workspace");
-    await page
-      .getByRole("combobox", { name: "Window default directory", exact: true })
-      .fill(testRoot);
-    await page
-      .locator(".menu-form-actions")
-      .getByRole("button", { name: "Create window", exact: true })
+      .locator(".window-row-main")
+      .filter({ hasText: "Other workspace" })
       .click();
     await expect(switcher).toHaveText("Other workspace");
     await expect(settings).toBeHidden();
+    await expect(page.locator(".window-menu")).toBeHidden();
+    await switcher.click();
     await page
       .locator(".window-row-main")
       .filter({ hasText: originalWindow })
       .click();
     await expect(switcher).toHaveText(originalWindow);
+    await expect(page.locator(".window-menu")).toBeHidden();
     return;
   }
   if (isMobile) {
