@@ -262,6 +262,7 @@ const DOCUMENTATION_ANSWER_SANITIZE_CONFIG = {
   ALLOWED_ATTR: []
 } satisfies DOMPurifyConfig;
 const DEFAULT_DOCUMENTATION_PANEL_STATE_KEY = "documentation-panel-default";
+const DOCUMENTATION_PANEL_INGEST_CONCURRENCY = 2;
 const DOCUMENT_LIST_PAGE_SIZE = 50;
 const DOCUMENT_LIST_ROW_HEIGHT = 70;
 const DOCUMENT_LIST_VISIBLE_ROWS = 18;
@@ -490,7 +491,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
 
   async function loadArchiveSummary() {
     const statsResult = await call<Record<string, unknown>>("documentation.summary");
-    setStats(statsResult);
+    if (!ingestController.disposed) setStats(statsResult);
   }
 
   async function loadStorageDetails() {
@@ -544,7 +545,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
         offset,
         sortDirection: "desc"
       });
-      if (documentListRequestIdRef.current !== requestId) {
+      if (ingestController.disposed || documentListRequestIdRef.current !== requestId) {
         return;
       }
       const nextDocuments = result.documents ?? [];
@@ -558,11 +559,11 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
         }
       }
     } catch (error) {
-      if (documentListRequestIdRef.current === requestId) {
+      if (!ingestController.disposed && documentListRequestIdRef.current === requestId) {
         setStatus(error instanceof Error ? error.message : String(error));
       }
     } finally {
-      if (documentListRequestIdRef.current === requestId) {
+      if (!ingestController.disposed && documentListRequestIdRef.current === requestId) {
         setDocumentListBusy(false);
       }
     }
@@ -574,9 +575,9 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
     }
     try {
       const result = await call<{ jobs?: DocumentationServerIngestJob[] }>("documentation.ingest.queue");
-      setServerIngestJobs(result.jobs ?? []);
+      if (!ingestController.disposed) setServerIngestJobs(result.jobs ?? []);
     } catch {
-      setServerIngestJobs([]);
+      if (!ingestController.disposed) setServerIngestJobs([]);
     }
   }
 
@@ -642,7 +643,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
       setIngestJobs((current) => [...current, job]);
       resetIngestForm();
       setStatus("");
-      void processIngestQueue();
+      processIngestQueue();
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     }
@@ -658,18 +659,14 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
     setUploadInputKey((current) => current + 1);
   }
 
-  async function processIngestQueue() {
-    if (ingestController.processing || ingestController.disposed) {
-      return;
-    }
-    ingestController.processing = true;
-    try {
-      while (!ingestController.disposed && ingestController.queue.length > 0) {
-        const job = ingestController.queue.shift()!;
-        await processIngestJob(job);
-      }
-    } finally {
-      ingestController.processing = false;
+  function processIngestQueue() {
+    while (!ingestController.disposed && ingestController.activeJobs < DOCUMENTATION_PANEL_INGEST_CONCURRENCY && ingestController.queue.length > 0) {
+      const job = ingestController.queue.shift()!;
+      ingestController.activeJobs += 1;
+      void processIngestJob(job).finally(() => {
+        ingestController.activeJobs -= 1;
+        processIngestQueue();
+      });
     }
   }
 
@@ -683,6 +680,9 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
       const enrichmentNotice = documentationEnrichmentNotice(ingestResponse);
       updateIngestJob(job.id, { progress: 90, stage: "Refreshing archive stats." });
       await loadArchiveSummary();
+      if (ingestController.disposed) {
+        return;
+      }
       if (documentListLoaded) {
         await loadDocumentPage("replace");
       }
@@ -696,7 +696,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
         notice: enrichmentNotice?.notice
       });
       await loadIngestQueue();
-      setStatus("");
+      if (!ingestController.disposed) setStatus("");
     } catch (error) {
       if (ingestController.disposed) {
         return;
@@ -708,7 +708,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
         error: error instanceof Error ? error.message : String(error)
       });
       await loadIngestQueue();
-      setStatus(error instanceof Error ? error.message : String(error));
+      if (!ingestController.disposed) setStatus(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -1186,7 +1186,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
                     <div className="documentation-ingest-queue-header">
                       <div>
                         <h4>Import Queue</h4>
-                        <span>{runningIngestCount ? "1 running" : "idle"} · {queuedIngestCount} queued</span>
+                        <span>{runningIngestCount ? `${runningIngestCount} running` : "idle"} · {queuedIngestCount} queued</span>
                       </div>
                       {finishedIngestCount > 0 ? (
                         <ControlButton size="compact" onClick={clearFinishedIngestJobs}>Clear Finished</ControlButton>

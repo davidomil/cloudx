@@ -65,10 +65,17 @@ const MAX_RETAINED_JOBS = 30;
 const PROGRESS_HEARTBEAT_MS = 5_000;
 export const DEFAULT_DOCUMENTATION_INGEST_QUEUE_MAX_JOBS = 8;
 export const DEFAULT_DOCUMENTATION_INGEST_QUEUE_MAX_BYTES = 512 * 1024 * 1024;
+export const DEFAULT_DOCUMENTATION_INGEST_CONCURRENCY = 2;
 
 export interface DocumentationIngestQueueOptions {
   maxJobs: number;
   maxBytes: number;
+  concurrency?: number;
+}
+
+interface WaitingIngestJob {
+  start(): void;
+  cancel(reason: Error): void;
 }
 
 export interface DocumentationIngestQueueCapacitySnapshot {
@@ -183,7 +190,10 @@ export class DocumentationIngestAdmission {
 export class DocumentationIngestQueue {
   private readonly jobs = new Map<string, DocumentationIngestJobState>();
   private readonly order: string[] = [];
-  private tail: Promise<void> = Promise.resolve();
+  private readonly waitingJobs: WaitingIngestJob[] = [];
+  private readonly executions = new Set<Promise<void>>();
+  private readonly concurrency: number;
+  private activeJobs = 0;
   private readonly admissions = new Set<DocumentationIngestAdmission>();
   private readonly jobControllers = new Map<string, AbortController>();
   private admittedJobs = 0;
@@ -197,6 +207,8 @@ export class DocumentationIngestQueue {
   }) {
     requirePositiveCapacity(options.maxJobs, "maxJobs");
     requirePositiveCapacity(options.maxBytes, "maxBytes");
+    this.concurrency = options.concurrency ?? DEFAULT_DOCUMENTATION_INGEST_CONCURRENCY;
+    requirePositiveCapacity(this.concurrency, "concurrency");
   }
 
   enqueue(input: DocumentationIngestQueueJobInput, reportProgress?: DocumentationIngestProgressReporter): Promise<Record<string, unknown>> {
@@ -233,7 +245,7 @@ export class DocumentationIngestQueue {
       detail: input.detail ?? input.kind,
       status: "queued",
       progress: 0,
-      stage: input.queuedStage ?? "Waiting for prior documentation imports.",
+      stage: input.queuedStage ?? "Waiting for an available documentation import slot.",
       position: 0,
       createdAt: new Date().toISOString()
     };
@@ -257,15 +269,39 @@ export class DocumentationIngestQueue {
       heartbeat.unref?.();
     }
 
-    const run = this.tail.then(() => this.runJob(job, input, controller.signal, reportProgress));
+    let started = false;
+    const ready = new Promise<void>((resolve, reject) => {
+      this.waitingJobs.push({
+        start: () => {
+          started = true;
+          this.activeJobs += 1;
+          resolve();
+        },
+        cancel: reject
+      });
+    });
+    const run = ready.then(
+      () => this.runJob(job, input, controller.signal, reportProgress),
+      (error) => {
+        this.failJob(job, input, error, reportProgress);
+        throw error;
+      }
+    );
     const settled = run.finally(() => {
       if (heartbeat) {
         clearInterval(heartbeat);
       }
       this.jobControllers.delete(job.id);
       admission.settle(this);
+      if (started) {
+        this.activeJobs -= 1;
+      }
+      this.startWaitingJobs();
     });
-    this.tail = settled.then(() => undefined, () => undefined);
+    const execution = settled.then(() => undefined, () => undefined);
+    this.executions.add(execution);
+    void execution.then(() => this.executions.delete(execution));
+    this.startWaitingJobs();
     return settled;
   }
 
@@ -303,8 +339,17 @@ export class DocumentationIngestQueue {
     for (const controller of this.jobControllers.values()) {
       controller.abort(stopped);
     }
-    this.disposePromise = Promise.all([admissionShutdown, this.tail]).then(() => undefined);
+    for (const waiting of this.waitingJobs.splice(0)) {
+      waiting.cancel(stopped);
+    }
+    this.disposePromise = Promise.all([admissionShutdown, ...this.executions]).then(() => undefined);
     return this.disposePromise;
+  }
+
+  private startWaitingJobs(): void {
+    while (!this.disposed && this.activeJobs < this.concurrency && this.waitingJobs.length > 0) {
+      this.waitingJobs.shift()!.start();
+    }
   }
 
   private async runJob(job: DocumentationIngestJobState, input: DocumentationIngestQueueJobInput, signal: AbortSignal, reportProgress?: DocumentationIngestProgressReporter): Promise<Record<string, unknown>> {
@@ -350,16 +395,20 @@ export class DocumentationIngestQueue {
       this.report(job, reportProgress);
       return result;
     } catch (error) {
-      Object.assign(job, {
-        status: "failed" satisfies DocumentationIngestJobStatus,
-        progress: 100,
-        stage: input.failedStage ?? "Import failed.",
-        finishedAt: new Date().toISOString(),
-        error: error instanceof Error ? error.message : String(error)
-      });
-      this.report(job, reportProgress);
+      this.failJob(job, input, error, reportProgress);
       throw error;
     }
+  }
+
+  private failJob(job: DocumentationIngestJobState, input: DocumentationIngestQueueJobInput, error: unknown, reportProgress?: DocumentationIngestProgressReporter): void {
+    Object.assign(job, {
+      status: "failed" satisfies DocumentationIngestJobStatus,
+      progress: 100,
+      stage: input.failedStage ?? "Import failed.",
+      finishedAt: new Date().toISOString(),
+      error: error instanceof Error ? error.message : String(error)
+    });
+    this.report(job, reportProgress);
   }
 
   private snapshots(): DocumentationIngestJobSnapshot[] {

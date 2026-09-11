@@ -92,6 +92,14 @@ The portable manifest endpoint walks the archive root and returns each file path
 
 The plugin supports four ingest paths.
 
+Each documentation panel submits up to two imports at once. The server runs up to two import jobs concurrently by default and starts waiting jobs as slots become available.
+
+Directory files and YouTube playlist entries use two workers. The indexer limits ingestion extraction to two sources at once and publishes archive changes under its write lock.
+
+PDF extraction remains serialized because PDFium cannot be called concurrently from multiple threads.
+
+Enrichment runs up to two different documents concurrently across foreground requests and background work. Evidence batches for one document remain sequential, and repeated enrichment of the same document waits for its active run.
+
 ## Browser Upload Ingest
 
 The Documentation panel defaults to upload mode. The browser sends file bytes to `POST /api/documentation/upload`; the CloudX server enforces the configured upload cap and forwards the bytes to the indexer's multipart `POST /ingest/upload` route.
@@ -372,7 +380,7 @@ The indexer tests cover:
 - Searching with hybrid retrieval, lexical-only behavior, strict identifier recall, and dense-only fallback above the configured threshold.
 - Invalidation, deletion, portable manifest generation, archive export/import, archive reopen/restore behavior, FastAPI controls, and CLI help.
 
-The server plugin tests cover hook registration, safety classes, local path policy enforcement, browser upload forwarding including generated-code flags, enrichment routing, assisted-answer routing, automatic plugin system-rule and system-skill contributions, direct Codex search-skill guidance, generic plugin contribution validation, and Codex overlay injection. The web panel tests cover upload ingest, visible text ingest, generated-code review acceptance, queued sequential imports, progress channels, assisted-answer mode, assisted-search loading state, sanitized HTML answer rendering, disabled-AI manual mode, source-viewer removal controls, progressive source auto-loading, full source viewing, and search hook calls. The client tests cover JSON POST behavior, multipart upload behavior, documentation upload progress events, enrichment POST behavior, browser upload request construction, and propagation of service error messages.
+The server plugin tests cover hook registration, safety classes, local path policy enforcement, browser upload forwarding including generated-code flags, enrichment routing, assisted-answer routing, automatic plugin system-rule and system-skill contributions, direct Codex search-skill guidance, generic plugin contribution validation, and Codex overlay injection. The web panel tests cover upload ingest, visible text ingest, generated-code review acceptance, bounded concurrent imports, progress channels, assisted-answer mode, assisted-search loading state, sanitized HTML answer rendering, disabled-AI manual mode, source-viewer removal controls, progressive source auto-loading, full source viewing, and search hook calls. The client tests cover JSON POST behavior, multipart upload behavior, documentation upload progress events, enrichment POST behavior, browser upload request construction, and propagation of service error messages.
 
 A realistic validation runner in `debug_tooling/documentation-validation/run_validation.py` downloads or reuses public Wikipedia pages, the TurboQuant arXiv PDF, the kernel.org Linux virtual memory manager book, GMSL2 datasheet PDFs, optional live YouTube videos with transcripts and keyframes, and a generated 2500-record mock corpus with planted facts. The latest required validation run used `--include-youtube`, ingested 9 documents into 5324 active chunks, produced 1885 table CSV files, 1885 table Markdown files, 596 rendered figure PNGs, 3134 YouTube keyframe artifacts, 2 YouTube keyframe indexes, and 2 YouTube metadata JSON files, then passed required hybrid, lexical, rebuild, stale-state, YouTube transcript recall, and YouTube artifact checks. Dense-only checks are retained as diagnostics because the current dense profile is a deterministic local hash embedding, not a semantic embedding model. See `debug_tooling/documentation-validation/README.md` before running it; generated corpus, archive, and summary files stay under the selected `--root` and should not be committed.
 

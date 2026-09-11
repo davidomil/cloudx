@@ -1,4 +1,4 @@
-import type { DocumentationClient } from "./DocumentationClient.js";
+import type { DocumentationClient, DocumentationPendingEnrichment } from "./DocumentationClient.js";
 import type { DocumentationEnrichmentService } from "./DocumentationEnrichmentService.js";
 
 const POLL_INTERVAL_MS = 30_000;
@@ -43,27 +43,53 @@ export class DocumentationBackgroundEnrichment {
 
   private async drain(): Promise<void> {
     const signal = this.controller.signal;
-    while (!signal.aborted && this.enrichment.isEnabled()) {
-      const document = await this.client.nextPendingEnrichment({ signal });
-      if (!document || !this.enrichment.isEnabled()) return;
-      signal.throwIfAborted();
-      const response = await this.enrichment.enrichIngestResponse({ document }, {}, { signal, onlyPending: true });
-      signal.throwIfAborted();
-      const result = enrichmentResult(response);
-      if (!result || result.status === "unchanged") return;
-      if (result.status === "written") continue;
-      if (result.status !== "failed" && result.status !== "skipped") {
-        throw new Error("Unexpected background enrichment outcome.");
+    const active = new Map<string, Promise<void>>();
+    let stopped = false;
+    const canAdmit = () => !stopped && !this.paused && !signal.aborted && this.enrichment.isEnabled();
+    try {
+      while (canAdmit()) {
+        const alreadyAdmitted = new Set(active.keys());
+        const documents = await this.client.pendingEnrichments(this.enrichment.concurrency, { signal });
+        for (const document of documents) {
+          if (!canAdmit() || active.size >= this.enrichment.concurrency) break;
+          if (alreadyAdmitted.has(document.documentId) || active.has(document.documentId)) continue;
+          const task = this.enrichDocument(document).then((outcome) => {
+            if (outcome === "unchanged") stopped = true;
+          }).catch((error) => {
+            stopped = true;
+            if (!signal.aborted) this.reportError(error);
+          }).finally(() => active.delete(document.documentId));
+          active.set(document.documentId, task);
+        }
+        if (!active.size) return;
+        await Promise.race(active.values());
       }
-      const error = String(result.error ?? result.reason ?? "No enrichment was written.").slice(0, 4_000);
-      // If recording fails, stop admission so the model is not run again without a durable outcome.
-      this.paused = true;
+    } finally {
+      await Promise.all(active.values());
+    }
+  }
+
+  private async enrichDocument(document: DocumentationPendingEnrichment): Promise<"terminal" | "unchanged"> {
+    const signal = this.controller.signal;
+    const response = await this.enrichment.enrichIngestResponse({ document }, {}, { signal, onlyPending: true });
+    signal.throwIfAborted();
+    const result = enrichmentResult(response);
+    if (!result || result.status === "unchanged") return "unchanged";
+    if (result.status === "written") return "terminal";
+    if (result.status !== "failed" && result.status !== "skipped") {
+      throw new Error("Unexpected background enrichment outcome.");
+    }
+    const error = String(result.error ?? result.reason ?? "No enrichment was written.").slice(0, 4_000);
+    try {
       await this.client.recordEnrichmentOutcome(document.documentId, {
         extractionRevision: document.extractionRevision, status: result.status, error
       }, { signal });
-      this.paused = false;
-      this.reportError(new Error(`Background enrichment ${result.status} for ${document.documentId}: ${error}`));
+    } catch (failure) {
+      this.paused = true;
+      throw failure;
     }
+    this.reportError(new Error(`Background enrichment ${result.status} for ${document.documentId}: ${error}`));
+    return "terminal";
   }
 }
 
