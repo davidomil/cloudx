@@ -24,3 +24,12 @@ export interface TerminalProcessFactory {
   spawn(command: string, args: string[], options: TerminalSpawnOptions): Promise<TerminalProcess>;
   attach?(sessionId: string): Promise<TerminalProcess>;
 }
+
+export interface TerminalProducer extends TerminalProcess {
+  pauseOutput(): void;
+  resumeOutput(): void;
+}
+
+export interface TerminalProducerFactory extends TerminalProcessFactory {
+  spawn(command: string, args: string[], options: TerminalSpawnOptions): Promise<TerminalProducer>;
+}

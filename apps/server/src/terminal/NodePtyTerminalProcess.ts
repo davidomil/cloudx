@@ -4,10 +4,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { IPty } from "node-pty";
 
-import type { TerminalProcess, TerminalProcessFactory } from "./TerminalProcess.js";
+import type { TerminalProducer, TerminalProducerFactory } from "./TerminalProcess.js";
 import { TerminalSupervisor, type TerminalExit } from "./TerminalSupervisor.js";
 
-export class NodePtyTerminalProcess implements TerminalProcess {
+export class NodePtyTerminalProcess implements TerminalProducer {
   private exited = false;
   private exitEvent: TerminalExit | undefined;
   private readonly exitListeners = new Set<(event: TerminalExit) => void>();
@@ -48,6 +48,14 @@ export class NodePtyTerminalProcess implements TerminalProcess {
     this.process.write(data);
   }
 
+  pauseOutput(): void {
+    if (!this.exited) this.process.pause();
+  }
+
+  resumeOutput(): void {
+    if (!this.exited) this.process.resume();
+  }
+
   resize(cols: number, rows: number): void {
     if (this.exited) return;
     try {
@@ -69,8 +77,8 @@ export class NodePtyTerminalProcess implements TerminalProcess {
   }
 }
 
-export class NodePtyTerminalProcessFactory implements TerminalProcessFactory {
-  async spawn(command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; cols: number; rows: number }): Promise<TerminalProcess> {
+export class NodePtyTerminalProcessFactory implements TerminalProducerFactory {
+  async spawn(command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; cols: number; rows: number }): Promise<TerminalProducer> {
     if (process.platform !== "linux") throw new Error("Owned terminal processes currently require Linux subreaper support.");
     let pty: typeof import("node-pty");
     try {

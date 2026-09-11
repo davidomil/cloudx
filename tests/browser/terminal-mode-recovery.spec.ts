@@ -17,7 +17,8 @@ let broker: ChildProcess;
 let server: ChildProcess;
 let logs = "";
 
-test.beforeAll(async () => {
+test.beforeEach(async () => {
+  logs = "";
   root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-modes-"));
   const workspace = path.join(root, "workspace");
   await fs.mkdir(workspace);
@@ -54,6 +55,18 @@ while True:
         os.write(1, b'\\x1b[2J\\x1b[HMODE-RECOVERED')
     elif data == b'n':
         os.write(1, b'\\x1b[?1049l')
+    elif data == b's':
+        os.write(1, b'\\x1b[2J\\x1b[HHEADER\\x1b[2;1Hone\\x1b[3;1Htwo\\x1b[4;1Hthree\\x1b[5;1HFOOTER\\x1b[2;4r\\x1b[4;1H')
+    elif data == b't':
+        os.write(1, b'\\r\\nNEXT')
+    elif data == b'c':
+        os.write(1, b'\\x1b[r\\x1b[0m\\x1b[2J\\x1b[HMARKER \\x1b[31')
+    elif data == b'C':
+        os.write(1, b'mRED\\x1b[0m')
+    elif data == b'o':
+        os.write(1, b'\\x1b[r\\x1b[2J\\x1b[HMARKER \\x1b]2;recovered')
+    elif data == b'O':
+        os.write(1, b'-title\\x07DONE')
 `,
     { mode: 0o755 },
   );
@@ -92,7 +105,7 @@ while True:
   await startServer();
 });
 
-test.afterAll(async ({}, testInfo) => {
+test.afterEach(async ({}, testInfo) => {
   await stopTestProcess(server);
   await stopTestProcess(broker);
   await testInfo.attach("terminal-recovery-server.log", {
@@ -106,65 +119,14 @@ test("preserves real xterm screen and input modes after replay truncation, recon
   page,
 }) => {
   test.setTimeout(60_000);
-  await page.addInitScript(() => {
-    const OriginalWebSocket = window.WebSocket;
-    const sockets: WebSocket[] = [];
-    Object.assign(window, { terminalTestSockets: sockets });
-    window.WebSocket = class extends OriginalWebSocket {
-      constructor(url: string | URL, protocols?: string | string[]) {
-        super(url, protocols);
-        if (String(url).includes("/ws/terminal/")) sockets.push(this);
-      }
-    };
-  });
-  await page.goto(baseUrl);
-  await page
-    .locator(".workspace-pane.active")
-    .getByTitle("Add tab to this pane")
-    .click();
-  await page.getByLabel("Plugin").selectOption("codex-terminal");
-  await page.getByLabel("Title").fill("Terminal mode recovery");
-  const creation = page.waitForResponse(
-    (response) =>
-      response.request().method() === "POST" &&
-      new URL(response.url()).pathname === "/api/tabs",
-  );
-  await page.getByRole("button", { name: "Create", exact: true }).click();
-  const created = await creation;
-  expect(created.status(), await created.text()).toBe(201);
-  await expect(page.locator(".xterm-rows")).toContainText("READY");
-  await page.locator(".xterm-helper-textarea").focus();
+  await openFixtureTerminal(page);
   await page.keyboard.type("f");
   await expect(page.locator(".xterm-rows")).toContainText("MODE-RECOVERED");
 
-  await page.evaluate(() => {
-    const sockets = (window as unknown as { terminalTestSockets: WebSocket[] })
-      .terminalTestSockets;
-    sockets.at(-1)!.close(4000, "Test transport interruption");
-  });
-  await expect
-    .poll(() =>
-      page.evaluate(
-        () =>
-          (window as unknown as { terminalTestSockets: WebSocket[] })
-            .terminalTestSockets.length,
-      ),
-    )
-    .toBe(2);
+  await recoverTerminal(page, "socket reconnect");
   await verifyInputModes(page, "socket");
 
-  await stopTestProcess(server);
-  await startServer();
-  await expect
-    .poll(() =>
-      page.evaluate(
-        () =>
-          (
-            window as unknown as { terminalTestSockets: WebSocket[] }
-          ).terminalTestSockets.at(-1)?.readyState,
-      ),
-    )
-    .toBe(1);
+  await recoverTerminal(page, "web-server restoration");
   await verifyInputModes(page, "server");
 
   await page.reload();
@@ -185,6 +147,120 @@ test("preserves real xterm screen and input modes after replay truncation, recon
   await expect(page.locator(".xterm-rows")).toContainText("NORMAL-BUFFER");
   await expect(page.locator(".xterm-rows")).not.toContainText("MODE-RECOVERED");
 });
+
+for (const recovery of [
+  "socket reconnect",
+  "web-server restoration",
+] as const) {
+  test(`preserves scroll margins after ${recovery}`, async ({ page }) => {
+    await openFixtureTerminal(page);
+    await page.keyboard.type("s");
+    const rows = page.locator(".xterm-rows > div");
+    await expect(rows.nth(0)).toHaveText("HEADER");
+    await expect(rows.nth(4)).toHaveText("FOOTER");
+
+    await recoverTerminal(page, recovery);
+    await page.keyboard.type("t");
+
+    await expect(rows.nth(3)).toHaveText("NEXT");
+    await expect(rows.nth(0)).toHaveText("HEADER");
+    await expect(rows.nth(1)).toHaveText("two");
+    await expect(rows.nth(2)).toHaveText("three");
+    await expect(rows.nth(4)).toHaveText("FOOTER");
+  });
+
+  test(`completes a split CSI sequence after ${recovery}`, async ({ page }) => {
+    await openFixtureTerminal(page);
+    const firstRow = page.locator(".xterm-rows > div").first();
+    await page.keyboard.type("c");
+    await expect(firstRow).toHaveText("MARKER ");
+
+    await recoverTerminal(page, recovery);
+    await page.keyboard.type("C");
+
+    await expect(firstRow).toHaveText("MARKER RED");
+    await expect(firstRow.locator(".xterm-fg-1")).toHaveText("RED");
+  });
+
+  test(`completes a split OSC sequence after ${recovery}`, async ({ page }) => {
+    await openFixtureTerminal(page);
+    const firstRow = page.locator(".xterm-rows > div").first();
+    await page.keyboard.type("o");
+    await expect(firstRow).toHaveText("MARKER ");
+
+    await recoverTerminal(page, recovery);
+    await page.keyboard.type("O");
+
+    await expect(firstRow).toHaveText("MARKER DONE");
+  });
+}
+
+async function openFixtureTerminal(page: Page) {
+  await page.addInitScript(() => {
+    const OriginalWebSocket = window.WebSocket;
+    const sockets: WebSocket[] = [];
+    const recovery = { screens: 0 };
+    Object.assign(window, {
+      terminalTestSockets: sockets,
+      terminalTestRecovery: recovery,
+    });
+    window.WebSocket = class extends OriginalWebSocket {
+      constructor(url: string | URL, protocols?: string | string[]) {
+        super(url, protocols);
+        if (!String(url).includes("/ws/terminal/")) return;
+        sockets.push(this);
+        this.addEventListener("message", (event) => {
+          if (JSON.parse(event.data).type === "screen") recovery.screens++;
+        });
+      }
+    };
+  });
+  await page.goto(baseUrl);
+  await page
+    .locator(".workspace-pane.active")
+    .getByTitle("Add tab to this pane")
+    .click();
+  await page.getByLabel("Plugin").selectOption("codex-terminal");
+  await page.getByLabel("Title").fill("Terminal mode recovery");
+  const creation = page.waitForResponse(
+    (response) =>
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname === "/api/tabs",
+  );
+  await page.getByRole("button", { name: "Create", exact: true }).click();
+  const created = await creation;
+  expect(created.status(), await created.text()).toBe(201);
+  await expect(page.locator(".xterm-rows")).toContainText("READY");
+  await page.locator(".xterm-helper-textarea").focus();
+}
+
+async function recoverTerminal(
+  page: Page,
+  recovery: "socket reconnect" | "web-server restoration",
+) {
+  const screens = await screenCount(page);
+  if (recovery === "socket reconnect") {
+    await page.evaluate(() => {
+      const sockets = (
+        window as unknown as { terminalTestSockets: WebSocket[] }
+      ).terminalTestSockets;
+      sockets.at(-1)!.close(4000, "Test transport interruption");
+    });
+  } else {
+    await stopTestProcess(server);
+    await startServer();
+  }
+  await expect.poll(() => screenCount(page)).toBeGreaterThan(screens);
+  await page.locator(".xterm-helper-textarea").focus();
+}
+
+async function screenCount(page: Page) {
+  return page.evaluate(
+    () =>
+      (window as unknown as { terminalTestRecovery: { screens: number } })
+        .terminalTestRecovery.screens,
+  );
+}
 
 async function verifyInputModes(page: Page, stage: string) {
   await expect(page.locator(".xterm-rows")).toContainText("MODE-RECOVERED");

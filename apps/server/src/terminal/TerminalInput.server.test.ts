@@ -8,7 +8,7 @@ import { loadConfig } from "../config.js";
 import { buildServer, buildServices } from "../server.js";
 import { TerminalBroker } from "./TerminalBroker.js";
 import { MAX_TERMINAL_INPUT_BYTES, terminalSocketPath } from "./TerminalBrokerProtocol.js";
-import type { TerminalProcess } from "./TerminalProcess.js";
+import type { TerminalProducer } from "./TerminalProcess.js";
 import type { TerminalExit } from "./TerminalSupervisor.js";
 import { terminalInputMessages } from "@cloudx/shared";
 
@@ -75,11 +75,13 @@ describe("large terminal input through public transports", () => {
   }, 15_000);
 });
 
-class RecordingTerminal implements TerminalProcess {
+class RecordingTerminal implements TerminalProducer {
   private exit = (_event: TerminalExit) => {};
   onData() { return () => {}; }
   onExit(listener: (event: TerminalExit) => void) { this.exit = listener; return () => {}; }
   write = vi.fn((_data: string) => {});
+  pauseOutput() {}
+  resumeOutput() {}
   resize() {}
   kill() {}
   terminate = vi.fn(async () => { this.exit({ exitCode: 0 }); });

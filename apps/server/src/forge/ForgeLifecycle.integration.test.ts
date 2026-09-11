@@ -1313,7 +1313,7 @@ interface AssistantReceipt {
 
 class RecordingTerminalFactory extends NodePtyTerminalProcessFactory {
   readonly processes: TerminalProcess[] = [];
-  override async spawn(...args: Parameters<NodePtyTerminalProcessFactory["spawn"]>): Promise<TerminalProcess> {
+  override async spawn(...args: Parameters<NodePtyTerminalProcessFactory["spawn"]>) {
     const terminal = await super.spawn(...args);
     this.processes.push(terminal);
     return terminal;

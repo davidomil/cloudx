@@ -13,7 +13,7 @@ import { SessionStateStore } from "./workspace/SessionStateStore.js";
 import { TerminalBroker } from "./terminal/TerminalBroker.js";
 import { terminalSocketPath } from "./terminal/TerminalBrokerProtocol.js";
 import { NodePtyTerminalProcessFactory } from "./terminal/NodePtyTerminalProcess.js";
-import type { TerminalProcess } from "./terminal/TerminalProcess.js";
+import type { TerminalProducer } from "./terminal/TerminalProcess.js";
 
 describe("workspace recovery across server updates", () => {
   it.skipIf(process.platform !== "linux")("reattaches the same shell through the terminal websocket after the web server restarts", async () => {
@@ -105,7 +105,7 @@ describe("workspace recovery across server updates", () => {
     await fs.writeFile(shell, "#!/bin/sh\nexec /bin/bash --noprofile --norc\n", { mode: 0o700 });
     vi.stubEnv("SHELL", shell);
     const directFactory = new NodePtyTerminalProcessFactory();
-    let runningTerminal!: TerminalProcess;
+    let runningTerminal!: TerminalProducer;
     const socketPath = terminalSocketPath(config.dataDir);
     const broker = new TerminalBroker(socketPath, {
       async spawn(...args: Parameters<NodePtyTerminalProcessFactory["spawn"]>) {

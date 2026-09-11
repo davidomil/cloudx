@@ -3,7 +3,7 @@ import net, { type Socket } from "node:net";
 import path from "node:path";
 import { PluginSessionMissingError } from "@cloudx/plugin-api";
 
-import type { TerminalProcess, TerminalProcessFactory } from "./TerminalProcess.js";
+import type { TerminalProducer, TerminalProducerFactory } from "./TerminalProcess.js";
 import type { TerminalExit } from "./TerminalSupervisor.js";
 import {
   isTerminalRequest, readTerminalMessages, terminalReplay,
@@ -14,8 +14,11 @@ import {
 import { TerminalBrokerOutput } from "./TerminalBrokerOutput.js";
 import { TerminalScreen } from "./TerminalScreen.js";
 
+const PAUSE_OUTPUT_BYTES = 256 * 1024;
+const RESUME_OUTPUT_BYTES = 64 * 1024;
+
 interface OwnedTerminal {
-  process: TerminalProcess;
+  process: TerminalProducer;
   screen: TerminalScreen;
   output: string;
   exit?: TerminalExit;
@@ -33,7 +36,7 @@ export class TerminalBroker {
 
   constructor(
     private readonly socketPath: string,
-    private readonly factory: TerminalProcessFactory,
+    private readonly factory: TerminalProducerFactory,
     private readonly replayBytes = TERMINAL_REPLAY_BYTES
   ) {
     if (!Number.isSafeInteger(replayBytes) || replayBytes <= 0) {
@@ -142,19 +145,35 @@ export class TerminalBroker {
 
   private async spawn(request: Extract<TerminalRequest, { type: "spawn" }>): Promise<OwnedTerminal> {
     const screen = new TerminalScreen(request.options.cols, request.options.rows);
-    let process: TerminalProcess;
+    let process: TerminalProducer;
     try { process = await this.factory.spawn(request.command, request.args, request.options); }
     catch (error) { screen.dispose(); throw error; }
     const terminal: OwnedTerminal = { process, screen, output: "", clients: new Map() };
     this.terminals.set(request.sessionId, terminal);
+    let pendingBytes = 0;
+    let paused = false;
+    let exited = false;
     await screen.attach((data) => {
+      pendingBytes -= Buffer.byteLength(data);
       terminal.output = terminalReplay(terminal.output + data, this.replayBytes);
+      if (paused && !exited && pendingBytes <= RESUME_OUTPUT_BYTES) {
+        paused = false;
+        process.resumeOutput();
+      }
     });
     process.onData((data) => {
-      try { screen.write(data); }
+      try {
+        pendingBytes += Buffer.byteLength(data);
+        screen.write(data);
+        if (!paused && pendingBytes >= PAUSE_OUTPUT_BYTES) {
+          paused = true;
+          process.pauseOutput();
+        }
+      }
       catch (error) { for (const { output } of terminal.clients.values()) this.fail(output, error); }
     });
     process.onExit((event) => {
+      exited = true;
       const publishExit = () => {
         terminal.exit = event;
         for (const { output } of terminal.clients.values()) output.send({ type: "exit", event });

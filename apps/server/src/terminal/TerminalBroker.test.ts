@@ -7,13 +7,67 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { DurableTerminalProcessFactory } from "./DurableTerminalProcess.js";
 import { TerminalBroker } from "./TerminalBroker.js";
 import { isTerminalRequest, MAX_TERMINAL_INPUT_BYTES, MAX_TERMINAL_MESSAGE_BYTES, readTerminalMessages, terminalReplay, terminalSocketPath } from "./TerminalBrokerProtocol.js";
-import type { TerminalProcess } from "./TerminalProcess.js";
+import type { TerminalProducer } from "./TerminalProcess.js";
 import type { TerminalExit } from "./TerminalSupervisor.js";
 
 const cleanups: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
 describe("durable terminal broker", () => {
+  it("pauses unparsed UTF-8 output and resumes after parsing even when its client detached", async () => {
+    const { factory, process } = await fixture();
+    const original = await factory.spawn("shell", [], options("output-pressure"));
+    const chunk = "😀".repeat(16 * 1024);
+    for (let index = 0; index < 3; index++) process.data(chunk);
+    expect(process.pauseOutput).not.toHaveBeenCalled();
+    process.data(chunk);
+    expect(process.pauseOutput).toHaveBeenCalledOnce();
+    expect(process.resumeOutput).not.toHaveBeenCalled();
+    original.detach!();
+
+    const restored = await factory.attach("output-pressure");
+    expect(process.resumeOutput).toHaveBeenCalledOnce();
+    let replay = "";
+    restored.onData((data) => { replay += data; });
+    expect(replay).toBe(chunk.repeat(4));
+    process.data("x".repeat(256 * 1024));
+    expect(process.pauseOutput).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(process.resumeOutput).toHaveBeenCalledTimes(2));
+    await restored.terminate();
+  });
+
+  it.each(["terminate", "stop broker"] as const)("drains parsed output without resuming an exited producer during %s", async (close) => {
+    const { factory, process, broker } = await fixture();
+    const terminal = await factory.spawn("shell", [], options("paused-close"));
+    const data = "x".repeat(256 * 1024);
+    let received = "";
+    terminal.onData((chunk) => { received += chunk; });
+    process.data(data);
+    expect(process.pauseOutput).toHaveBeenCalledOnce();
+    if (close === "terminate") await terminal.terminate();
+    else {
+      await broker.stop();
+      cleanups.pop();
+    }
+    expect(process.terminate).toHaveBeenCalledOnce();
+    expect(process.resumeOutput).not.toHaveBeenCalled();
+    if (close === "terminate") expect(received).toBe(data);
+  });
+
+  it("resumes parsing after rejected termination and retains a recoverable session", async () => {
+    const { factory, process } = await fixture();
+    const terminal = await factory.spawn("shell", [], options("paused-rejected-close"));
+    process.terminate.mockRejectedValueOnce(new Error("Descendants are still running."));
+    process.data("x".repeat(256 * 1024));
+    expect(process.pauseOutput).toHaveBeenCalledOnce();
+    await expect(terminal.terminate()).rejects.toThrow("Descendants are still running");
+    const restored = await factory.attach("paused-rejected-close");
+    expect(process.resumeOutput).toHaveBeenCalledOnce();
+    restored.write("AFTER_REJECTED_CLOSE\n");
+    await vi.waitFor(() => expect(process.write).toHaveBeenCalledWith("AFTER_REJECTED_CLOSE\n"));
+    await restored.terminate();
+  });
+
   it.each([
     "a".repeat(MAX_TERMINAL_INPUT_BYTES),
     "b".repeat(300 * 1024),
@@ -306,17 +360,19 @@ async function fixture(replayBytes?: number) {
   const broker = new TerminalBroker(socketPath, { spawn }, replayBytes);
   await broker.start();
   cleanups.push(() => broker.stop());
-  return { socketPath, factory: new DurableTerminalProcessFactory(socketPath, { spawn }), process, spawn };
+  return { socketPath, factory: new DurableTerminalProcessFactory(socketPath, { spawn }), process, spawn, broker };
 }
 
 function options(sessionId: string) { return { cwd: os.tmpdir(), env: { PATH: "/usr/bin" }, cols: 100, rows: 30, sessionId }; }
 
-class FakeTerminal implements TerminalProcess {
+class FakeTerminal implements TerminalProducer {
   data = (_data: string) => {};
   exit = (_event: TerminalExit) => {};
   onData(listener: (data: string) => void) { this.data = listener; return () => {}; }
   onExit(listener: (event: TerminalExit) => void) { this.exit = listener; return () => {}; }
   write = vi.fn();
+  pauseOutput = vi.fn();
+  resumeOutput = vi.fn();
   resize = vi.fn();
   kill = vi.fn();
   terminate = vi.fn(async () => { this.exit({ exitCode: 0 }); });

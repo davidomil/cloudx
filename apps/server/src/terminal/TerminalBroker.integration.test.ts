@@ -12,6 +12,48 @@ const cleanups: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
 describe.skipIf(process.platform !== "linux")("broker-owned terminal processes", () => {
+  it("keeps a 64 MiB printable burst recoverable with subsequent input and the same shell PID", async () => {
+    const directory = await temporaryDirectory();
+    const socketPath = path.join(directory, "broker.sock");
+    const nativeFactory = new NodePtyTerminalProcessFactory();
+    const broker = new TerminalBroker(socketPath, nativeFactory);
+    await broker.start();
+    cleanups.push(() => broker.stop());
+    const factory = new DurableTerminalProcessFactory(socketPath, nativeFactory);
+    const original = await factory.spawn("/bin/bash", ["--noprofile", "--norc"], {
+      cwd: directory, env: process.env, cols: 100, rows: 30, sessionId: "printable-burst"
+    });
+    original.onScreen!(() => {});
+    const disconnected = vi.fn();
+    original.onDisconnect!(disconnected);
+    let output = "";
+    let printableBytes = 0;
+    original.onData((data) => {
+      printableBytes += data.length - data.replaceAll("@", "").length;
+      output = (output + data).slice(-4096);
+    });
+    original.write("stty -echo; PS1=''; printf '\\nREADY_PID=%s\\n' \"$$\"\n");
+    await vi.waitFor(() => expect(output).toMatch(/READY_PID=\d+/u));
+    const pid = Number(/READY_PID=(\d+)/u.exec(output)![1]);
+    original.write("python3 -c \"import os; [os.write(1, b'@' * 65536) for _ in range(1024)]\"; printf '\\nBURST_DONE=%s\\n' \"$$\"\n");
+    await vi.waitFor(() => expect(output).toContain(`BURST_DONE=${pid}`), { timeout: 75_000 });
+    expect(printableBytes).toBe(64 * 1024 * 1024);
+    expect(disconnected).not.toHaveBeenCalled();
+    original.write("printf '\\nAFTER_BURST=%s\\n' \"$$\"\n");
+    await vi.waitFor(() => expect(output).toContain(`AFTER_BURST=${pid}`));
+    original.detach!();
+
+    const restored = await factory.attach("printable-burst");
+    restored.onScreen!(() => {});
+    let restoredOutput = "";
+    restored.onData((data) => { restoredOutput += data; });
+    expect(restoredOutput).toContain(`BURST_DONE=${pid}`);
+    restored.write("printf '\\nRESTORED_PID=%s\\n' \"$$\"\n");
+    await vi.waitFor(() => expect(restoredOutput).toContain(`RESTORED_PID=${pid}`));
+    await restored.terminate();
+    expect(await running(pid)).toBe(false);
+  }, 90_000);
+
   it("restores the same shell, working directory, and output produced while the web client was detached", async () => {
     const directory = await temporaryDirectory();
     const socketPath = path.join(directory, "broker.sock");

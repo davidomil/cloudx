@@ -1,6 +1,7 @@
 import headless from "@xterm/headless";
-import type { Terminal, ITerminalAddon } from "@xterm/headless";
+import type { Terminal, ITerminalAddon, IBuffer } from "@xterm/headless";
 import { SerializeAddon } from "@xterm/addon-serialize";
+import { TerminalSequenceBoundary } from "./TerminalSequenceBoundary.js";
 
 export interface TerminalScreenSnapshot {
   data: string;
@@ -17,6 +18,7 @@ const TERMINAL_SCROLLBACK_ROWS = 1000;
 export class TerminalScreen {
   private readonly terminal: Terminal;
   private readonly serializer = new SerializeAddon();
+  private readonly sequences: TerminalSequenceBoundary;
   private readonly listeners = new Set<(data: string) => void>();
   private pending = Promise.resolve();
   private pendingBytes = 0;
@@ -27,6 +29,7 @@ export class TerminalScreen {
     validateScreenDimensions(cols, rows);
     this.terminal = new headless.Terminal({ cols, rows, scrollback: TERMINAL_SCROLLBACK_ROWS, allowProposedApi: true });
     this.terminal.loadAddon(this.serializer as unknown as ITerminalAddon);
+    this.sequences = new TerminalSequenceBoundary(this.terminal, MAX_TERMINAL_SCREEN_BYTES);
   }
 
   write(data: string): void {
@@ -39,7 +42,7 @@ export class TerminalScreen {
     }
     this.pendingBytes += bytes;
     this.enqueue(() => new Promise<void>((resolve, reject) => {
-      this.terminal.write(data, () => {
+      this.terminal.write(this.sequences.takeComplete(data), () => {
         this.pendingBytes -= bytes;
         try {
           for (const listener of this.listeners) listener(data);
@@ -86,9 +89,37 @@ export class TerminalScreen {
   private serialize(): TerminalScreenSnapshot {
     if (this.disposed) throw new Error("The terminal screen is disposed.");
     if (this.failure) throw this.failure;
-    const data = this.serializer.serialize();
+    let data = this.serializer.serialize();
+    if (this.terminal.buffer.active.type === "alternate") {
+      const normalRegion = this.scrollRegion(this.terminal.buffer.normal, false);
+      if (normalRegion) {
+        const normal = this.serializer.serialize({ excludeAltBuffer: true, excludeModes: true });
+        data = normal + normalRegion + data.slice(normal.length);
+      }
+    }
+    data += this.scrollRegion(this.terminal.buffer.active, this.terminal.modes.originMode) + this.sequences.pending;
     if (Buffer.byteLength(data) > MAX_TERMINAL_SCREEN_BYTES) throw new Error("Terminal screen snapshot exceeded its byte limit.");
     return { data, cols: this.terminal.cols, rows: this.terminal.rows };
+  }
+
+  private scrollRegion(buffer: IBuffer, originMode: boolean): string {
+    // SerializeAddon 0.14 omits DECSTBM; these are the actual xterm 6 margins
+    // after buffer switches, resizes, and resets, rather than a second model.
+    const { scrollTop, scrollBottom } = (buffer as unknown as {
+      _buffer: { scrollTop: number; scrollBottom: number };
+    })._buffer;
+    if (scrollTop === 0 && scrollBottom === this.terminal.rows - 1 && !originMode) return "";
+    const cursorRow = buffer.cursorY - (originMode ? scrollTop : 0) + 1;
+    const region = `\x1b[${scrollTop + 1};${scrollBottom + 1}r`;
+    if (buffer.cursorX < this.terminal.cols) return `${region}\x1b[${cursorRow};${buffer.cursorX + 1}H`;
+
+    // CUP and DECRC clamp pending wrap to the last column. Repainting this row
+    // restores wrap, wide cells, and attributes using the addon's own renderer.
+    const row = buffer.baseY + buffer.cursorY;
+    const serializer = this.serializer as unknown as {
+      _serializeBufferByRange(terminal: Terminal, buffer: IBuffer, range: { start: number; end: number }, excludeFinalCursorPosition: boolean): string;
+    };
+    return `${region}\x1b[${cursorRow};1H\x1b[0m${serializer._serializeBufferByRange(this.terminal, buffer, { start: row, end: row }, true)}`;
   }
 
   private enqueue(operation: () => void | Promise<void>): void {
