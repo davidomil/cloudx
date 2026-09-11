@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 
-import type { WorkspaceTab } from "@cloudx/shared";
+import { terminalInputMessages, type WorkspaceTab } from "@cloudx/shared";
 import { installTerminalMobileScroller } from "./terminalMobileScroll.js";
 import { bottomRevealScrollDelta, rowsFittingTerminalViewport, shouldFocusTerminalAfterFit, visualViewportBottomInset } from "./terminalSizing.js";
 import { readTerminalColorTheme } from "./theme.js";
@@ -16,6 +16,9 @@ interface TerminalView {
   terminal: Terminal;
   fit: FitAddon;
   socket: WebSocket;
+  reconnectTimer?: number;
+  reconnectAttempt: number;
+  disposed: boolean;
   container?: HTMLDivElement;
   fitFrame?: number;
   keyboardInsetFrame?: number;
@@ -33,6 +36,9 @@ interface PastedTerminalImage {
 }
 
 const terminalViews = new Map<string, TerminalView>();
+const TERMINAL_SOCKET_RECONNECT_BASE_MS = 500;
+const TERMINAL_SOCKET_RECONNECT_MAX_MS = 5_000;
+const TERMINAL_RESET_SEQUENCE = "\x1bc";
 const TERMINAL_KEYBOARD_INSET_PROPERTY = "--terminal-mobile-keyboard-inset";
 const TERMINAL_VISIBILITY_MARGIN_PX = 14;
 const CODEX_TERMINAL_PLUGIN_ID = "codex-terminal";
@@ -96,6 +102,8 @@ export function TerminalPanel({ tab, active, uiScale }: { tab: WorkspaceTab; act
 function disposeTerminalViewInternal(tabId: string): void {
   const view = terminalViews.get(tabId);
   if (!view) return;
+  view.disposed = true;
+  window.clearTimeout(view.reconnectTimer);
   cancelScheduledFit(view);
   cancelTerminalKeyboardInsetUpdate(view);
   cancelTerminalInputReveal(view);
@@ -127,9 +135,8 @@ function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement, uiScale: 
   const fit = new FitAddon();
   terminal.loadAddon(fit);
 
-  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  const socket = new WebSocket(`${protocol}://${window.location.host}/ws/terminal/${encodeURIComponent(tab.id)}`);
-  const view = { tabId: tab.id, pluginId: tab.pluginId, terminal, fit, socket, uiScale };
+  const socket = createTerminalSocket(tab.id);
+  const view: TerminalView = { tabId: tab.id, pluginId: tab.pluginId, terminal, fit, socket, uiScale, reconnectAttempt: 0, disposed: false };
   terminalViews.set(tab.id, view);
   registerTerminalView(tab.id, {
     dispose: () => disposeTerminalViewInternal(tab.id),
@@ -146,16 +153,7 @@ function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement, uiScale: 
   terminal.writeln(`cwd: ${tab.cwd}`);
   terminal.writeln("");
 
-  socket.addEventListener("message", (event) => {
-    const message = parseTerminalSocketMessage(event.data);
-    if (!message) {
-      return;
-    }
-    if (message.type === "data" && message.data) {
-      terminal.write(message.data);
-    }
-  });
-  socket.addEventListener("open", () => fitAndResize(view));
+  subscribeTerminalSocket(view);
   terminal.onData((data) => {
     sendTerminalInput(view, data);
   });
@@ -163,7 +161,48 @@ function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement, uiScale: 
   return view;
 }
 
-function parseTerminalSocketMessage(data: unknown): { type?: string; data?: string } | undefined {
+function createTerminalSocket(tabId: string): WebSocket {
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  return new WebSocket(`${protocol}://${window.location.host}/ws/terminal/${encodeURIComponent(tabId)}`);
+}
+
+function subscribeTerminalSocket(view: TerminalView): void {
+  const socket = view.socket;
+  const isCurrentSocket = () => !view.disposed && view.socket === socket;
+
+  socket.addEventListener("message", (event) => {
+    if (!isCurrentSocket() || socket.readyState !== WebSocket.OPEN) return;
+    const message = parseTerminalSocketMessage(event.data);
+    if (!message) {
+      return;
+    }
+    if (message.type === "screen" && message.data !== undefined && message.cols && message.rows) {
+      view.terminal.resize(message.cols, message.rows);
+      view.terminal.write(`${TERMINAL_RESET_SEQUENCE}${message.data}`, () => {
+        if (isCurrentSocket()) fitAndResize(view);
+      });
+    } else if (message.type === "data" && message.data) {
+      view.terminal.write(message.data);
+    }
+  });
+  socket.addEventListener("open", () => {
+    if (!isCurrentSocket()) return;
+    view.reconnectAttempt = 0;
+    fitAndResize(view);
+  });
+  socket.addEventListener("close", (event) => {
+    if (!isCurrentSocket() || view.reconnectTimer !== undefined || event.code === 1003 || event.code === 1008) return;
+    const delay = Math.min(TERMINAL_SOCKET_RECONNECT_BASE_MS * 2 ** view.reconnectAttempt++, TERMINAL_SOCKET_RECONNECT_MAX_MS);
+    view.reconnectTimer = window.setTimeout(() => {
+      view.reconnectTimer = undefined;
+      if (!isCurrentSocket()) return;
+      view.socket = createTerminalSocket(view.tabId);
+      subscribeTerminalSocket(view);
+    }, delay);
+  });
+}
+
+function parseTerminalSocketMessage(data: unknown): { type?: string; data?: string; cols?: number; rows?: number } | undefined {
   if (typeof data !== "string") {
     return undefined;
   }
@@ -174,7 +213,9 @@ function parseTerminalSocketMessage(data: unknown): { type?: string; data?: stri
     }
     return {
       type: typeof parsed.type === "string" ? parsed.type : undefined,
-      data: typeof parsed.data === "string" ? parsed.data : undefined
+      data: typeof parsed.data === "string" ? parsed.data : undefined,
+      cols: Number.isInteger(parsed.cols) && Number(parsed.cols) > 0 && Number(parsed.cols) <= 10_000 ? Number(parsed.cols) : undefined,
+      rows: Number.isInteger(parsed.rows) && Number(parsed.rows) > 0 && Number(parsed.rows) <= 10_000 ? Number(parsed.rows) : undefined
     };
   } catch {
     return undefined;
@@ -313,7 +354,7 @@ function sendTerminalInput(view: TerminalView, data: string): boolean {
   if (view.socket.readyState !== WebSocket.OPEN) {
     return false;
   }
-  view.socket.send(JSON.stringify({ type: "input", data }));
+  for (const message of terminalInputMessages(data)) view.socket.send(message);
   return true;
 }
 

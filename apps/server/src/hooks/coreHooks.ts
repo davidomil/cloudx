@@ -197,8 +197,8 @@ function coreHooks({ sessions, plugins, pathPolicy, workspace, workspaceCommands
         },
         additionalProperties: false
       },
-      execute(input) {
-        sessions.closeTab(requireString(input.tabId, "tabId"), { stopSession: optionalBoolean(input.stopSession, "stopSession") ?? false });
+      async execute(input) {
+        await sessions.closeTab(requireString(input.tabId, "tabId"), { stopSession: optionalBoolean(input.stopSession, "stopSession") ?? false });
         return { ok: true, activeTabId: sessions.getActiveTabId(), reason: optionalString(input.reason, "reason") };
       }
     },

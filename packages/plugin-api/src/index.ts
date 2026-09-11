@@ -129,11 +129,18 @@ export interface PluginSession {
   write?(data: string): void;
   resize?(cols: number, rows: number): void;
   stop?(): void;
+  terminate?(): Promise<void>;
+  detach?(): void;
+  restoreInput?(): Record<string, unknown>;
   applyRuntimeContext?(runtimeContext?: WorkspaceRuntimeContext): Promise<Record<string, unknown>> | Record<string, unknown>;
   snapshot(): PluginSessionSnapshot;
   voiceContext(): Promise<PluginVoiceContext> | PluginVoiceContext;
   handleAction(action: string, input: Record<string, unknown>, context?: PluginActionContext): Promise<Record<string, unknown>> | Record<string, unknown>;
   onData?(listener: (data: string) => void): () => void;
+  attachTerminal?(listener: (data: string) => void): Promise<{
+    screen: { data: string; cols: number; rows: number };
+    dispose: () => void;
+  }>;
   onStatusChange?(listener: (status: WorkspaceTab["status"], message?: string) => void): () => void;
 }
 
@@ -179,6 +186,8 @@ export class PluginSessionNotStartedError extends Error {
 }
 
 export class PluginSessionOwnershipError extends Error {}
+
+export class PluginSessionMissingError extends Error {}
 
 export interface CreatePluginSessionInput extends PluginSessionLaunchOptions {
   tab: WorkspaceTab;
@@ -231,6 +240,7 @@ export interface WorkspacePlugin {
   configFields?: ConfigFieldDescriptor[];
   defaultTitleContext?(input: { cwd: string; initialInput?: Record<string, unknown> }): string | undefined;
   createSession(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;
+  restoreSession?(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;
   descriptor(): PluginDescriptor;
 }
 

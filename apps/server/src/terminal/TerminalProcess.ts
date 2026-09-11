@@ -1,3 +1,5 @@
+import type { TerminalScreenSnapshot } from "./TerminalScreen.js";
+
 export interface TerminalProcess {
   onData(listener: (data: string) => void): () => void;
   onExit(listener: (event: { exitCode: number; signal?: number }) => void): () => void;
@@ -5,8 +7,30 @@ export interface TerminalProcess {
   resize(cols: number, rows: number): void;
   kill(): void;
   terminate(): Promise<void>;
+  detach?(): void;
+  onDisconnect?(listener: (error: Error) => void): () => void;
+  /** Synchronously supplies the initial screen, including all output delivered before this subscription. */
+  onScreen?(listener: (screen: TerminalScreenSnapshot) => void): () => void;
+}
+
+export interface TerminalSpawnOptions {
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  cols: number;
+  rows: number;
+  sessionId?: string;
 }
 
 export interface TerminalProcessFactory {
-  spawn(command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; cols: number; rows: number }): Promise<TerminalProcess>;
+  spawn(command: string, args: string[], options: TerminalSpawnOptions): Promise<TerminalProcess>;
+  attach?(sessionId: string): Promise<TerminalProcess>;
+}
+
+export interface TerminalProducer extends TerminalProcess {
+  pauseOutput(): void;
+  resumeOutput(): void;
+}
+
+export interface TerminalProducerFactory extends TerminalProcessFactory {
+  spawn(command: string, args: string[], options: TerminalSpawnOptions): Promise<TerminalProducer>;
 }

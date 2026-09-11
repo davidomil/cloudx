@@ -4,6 +4,20 @@ import { describe, expect, it, vi } from "vitest";
 import { NodePtyTerminalProcess } from "./NodePtyTerminalProcess.js";
 
 describe("NodePtyTerminalProcess", () => {
+  it("pauses and resumes native output until the terminal exits", () => {
+    const { terminal, native, exit } = terminalFixture();
+    terminal.pauseOutput();
+    terminal.resumeOutput();
+    expect(native.pause).toHaveBeenCalledOnce();
+    expect(native.resume).toHaveBeenCalledOnce();
+
+    exit();
+    terminal.pauseOutput();
+    terminal.resumeOutput();
+    expect(native.pause).toHaveBeenCalledOnce();
+    expect(native.resume).toHaveBeenCalledOnce();
+  });
+
   it("does not resize a terminal after its exit event", () => {
     const { terminal, native, exit } = terminalFixture();
     terminal.resize(100, 30);
@@ -38,6 +52,8 @@ function terminalFixture() {
     pid: 2_147_483_647,
     onExit: (listener: () => void) => { exit = listener; return { dispose() {} }; },
     onData: vi.fn(),
+    pause: vi.fn(),
+    resume: vi.fn(),
     resize: vi.fn(),
     kill: vi.fn()
   };

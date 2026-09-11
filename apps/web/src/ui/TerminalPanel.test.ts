@@ -9,7 +9,7 @@ const terminalPanelMocks = vi.hoisted(() => ({
   fitCalls: [] as unknown[],
   installMobileScroller: vi.fn(),
   releaseMobileScroller: vi.fn(),
-  terminals: [] as Array<{ disposed: boolean; element?: HTMLElement; writelnCalls: string[] }>,
+  terminals: [] as Array<{ disposed: boolean; element?: HTMLElement; writelnCalls: string[]; writeCalls: string[]; inputHandlers: Array<(data: string) => void> }>,
   uploadFileBrowserFile: vi.fn()
 }));
 
@@ -29,6 +29,8 @@ vi.mock("@xterm/xterm", () => ({
     element?: HTMLElement;
     readonly options: Record<string, unknown>;
     readonly writelnCalls: string[] = [];
+    readonly writeCalls: string[] = [];
+    readonly inputHandlers: Array<(data: string) => void> = [];
 
     constructor(options: Record<string, unknown>) {
       this.options = options;
@@ -54,11 +56,18 @@ vi.mock("@xterm/xterm", () => ({
       this.writelnCalls.push(data);
     }
 
-    write(): void {
-      return undefined;
+    write(data: string, callback?: () => void): void {
+      this.writeCalls.push(data);
+      callback?.();
     }
 
-    onData(): { dispose: () => void } {
+    resize(cols: number, rows: number): void {
+      this.cols = cols;
+      this.rows = rows;
+    }
+
+    onData(handler: (data: string) => void): { dispose: () => void } {
+      this.inputHandlers.push(handler);
       return { dispose: () => undefined };
     }
 
@@ -116,6 +125,7 @@ describe("TerminalPanel", () => {
       uploaded: true
     }));
     TestWebSocket.latest = undefined;
+    TestWebSocket.instances.length = 0;
     vi.stubGlobal("ResizeObserver", TestResizeObserver);
     vi.stubGlobal("WebSocket", TestWebSocket);
     window.requestAnimationFrame = (callback: FrameRequestCallback) => {
@@ -138,6 +148,7 @@ describe("TerminalPanel", () => {
     host?.remove();
     host = undefined;
     vi.unstubAllGlobals();
+    vi.useRealTimers();
   });
 
   it("releases DOM-bound mobile scroll handlers when a cached terminal panel unmounts", () => {
@@ -175,6 +186,120 @@ describe("TerminalPanel", () => {
     });
 
     expect(new URL(TestWebSocket.latest!.url).pathname).toBe("/ws/terminal/tab%2Fa%20b");
+  });
+
+  it("reconnects the same terminal after an update and replaces old output only when replay arrives", () => {
+    vi.useFakeTimers();
+    act(() => {
+      root!.render(createElement(TerminalPanel, { tab, active: true, uiScale: 1 }));
+    });
+    const originalSocket = TestWebSocket.latest!;
+    const terminal = terminalPanelMocks.terminals[0]!;
+    originalSocket.open();
+    originalSocket.output("work before update");
+    originalSocket.close(1001);
+    terminal.inputHandlers.forEach((handler) => handler("during downtime"));
+
+    vi.advanceTimersByTime(500);
+    const replacementSocket = TestWebSocket.latest!;
+    expect(replacementSocket).not.toBe(originalSocket);
+    expect(replacementSocket.url).toBe(originalSocket.url);
+    expect(terminalPanelMocks.terminals).toHaveLength(1);
+    expect(terminal.disposed).toBe(false);
+    expect(terminal.writeCalls).toEqual(["work before update"]);
+
+    replacementSocket.open();
+    expect(terminal.writeCalls).toEqual(["work before update"]);
+    originalSocket.output("stale output");
+    replacementSocket.screen("work before update\nwork during update");
+    replacementSocket.output("\nwork after update");
+    terminal.inputHandlers.forEach((handler) => handler("next command\r"));
+
+    expect(terminal.writeCalls).toEqual([
+      "work before update",
+      "\x1bcwork before update\nwork during update",
+      "\nwork after update"
+    ]);
+    expect(terminal.inputHandlers).toHaveLength(1);
+    expect(inputMessages(originalSocket)).toEqual([]);
+    expect(inputMessages(replacementSocket)).toEqual([{ type: "input", data: "next command\r" }]);
+    expect(replacementSocket.sent.map((data) => JSON.parse(data))).toContainEqual({ type: "resize", cols: 80, rows: 24 });
+  });
+
+  it("backs off unavailable terminal connections up to five seconds and resets after reconnecting", () => {
+    vi.useFakeTimers();
+    act(() => {
+      root!.render(createElement(TerminalPanel, { tab, active: true, uiScale: 1 }));
+    });
+    for (const delay of [500, 1000, 2000, 4000, 5000, 5000]) {
+      const socket = TestWebSocket.latest!;
+      socket.close(1006);
+      vi.advanceTimersByTime(delay - 1);
+      expect(TestWebSocket.latest).toBe(socket);
+      vi.advanceTimersByTime(1);
+      expect(TestWebSocket.latest).not.toBe(socket);
+    }
+    const restoredSocket = TestWebSocket.latest!;
+    restoredSocket.open();
+    restoredSocket.close(1001);
+    vi.advanceTimersByTime(500);
+    expect(TestWebSocket.latest).not.toBe(restoredSocket);
+  });
+
+  it("restores an empty authoritative screen at its recorded dimensions", () => {
+    act(() => {
+      root!.render(createElement(TerminalPanel, { tab, active: true, uiScale: 1 }));
+    });
+    const socket = TestWebSocket.latest!;
+    socket.open();
+    socket.output("stale screen");
+    socket.screen("", 120, 40);
+
+    expect(terminalPanelMocks.terminals[0]!.writeCalls).toEqual(["stale screen", "\x1bc"]);
+    expect(socket.sent.map((message) => JSON.parse(message))).toContainEqual({ type: "resize", cols: 120, rows: 40 });
+  });
+
+  it("ignores screen snapshots with invalid dimensions", () => {
+    act(() => {
+      root!.render(createElement(TerminalPanel, { tab, active: true, uiScale: 1 }));
+    });
+    const socket = TestWebSocket.latest!;
+    socket.open();
+    for (const [cols, rows] of [[0, 24], [80, -1], [1.5, 24], [80, 10_001]]) socket.screen("invalid", cols, rows);
+
+    expect(terminalPanelMocks.terminals[0]!.writeCalls).toEqual([]);
+  });
+
+  it.each(["waiting", "connecting", "connected"])("cancels reconnection when a tab closes while %s and ignores late socket events", (state) => {
+    vi.useFakeTimers();
+    act(() => {
+      root!.render(createElement(TerminalPanel, { tab, active: true, uiScale: 1 }));
+    });
+    TestWebSocket.latest!.open();
+    TestWebSocket.latest!.close(1001);
+    if (state !== "waiting") vi.advanceTimersByTime(500);
+    const socket = TestWebSocket.latest!;
+    if (state === "connected") socket.open();
+    disposeTerminalView(tab.id);
+    terminalPanelMocks.fitCalls.length = 0;
+    socket.open();
+    socket.output("late output");
+    vi.advanceTimersByTime(10_000);
+
+    expect(TestWebSocket.instances).toHaveLength(state === "waiting" ? 1 : 2);
+    expect(terminalPanelMocks.terminals[0]!.disposed).toBe(true);
+    expect(terminalPanelMocks.terminals[0]!.writeCalls).toEqual([]);
+    expect(terminalPanelMocks.fitCalls).toEqual([]);
+  });
+
+  it.each([1003, 1008])("does not reconnect a terminal rejected with close code %s", (code) => {
+    vi.useFakeTimers();
+    act(() => {
+      root!.render(createElement(TerminalPanel, { tab, active: true, uiScale: 1 }));
+    });
+    TestWebSocket.latest!.close(code);
+    vi.advanceTimersByTime(10_000);
+    expect(TestWebSocket.instances).toHaveLength(1);
   });
 
   it("uploads pasted images into Codex terminal tabs and inserts workspace image references", async () => {
@@ -256,12 +381,14 @@ class TestWebSocket extends EventTarget {
   static readonly OPEN = 1;
   static readonly CLOSED = 3;
   static latest: TestWebSocket | undefined;
+  static readonly instances: TestWebSocket[] = [];
   readyState = TestWebSocket.CONNECTING;
   readonly sent: string[] = [];
 
   constructor(readonly url: string) {
     super();
     TestWebSocket.latest = this;
+    TestWebSocket.instances.push(this);
   }
 
   open(): void {
@@ -273,8 +400,16 @@ class TestWebSocket extends EventTarget {
     this.sent.push(data);
   }
 
-  close(): void {
+  output(data: string): void {
+    this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "data", data }) }));
+  }
+
+  screen(data: string, cols = 80, rows = 24): void {
+    this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "screen", data, cols, rows }) }));
+  }
+
+  close(code = 1000): void {
     this.readyState = TestWebSocket.CLOSED;
-    this.dispatchEvent(new Event("close"));
+    this.dispatchEvent(new CloseEvent("close", { code }));
   }
 }

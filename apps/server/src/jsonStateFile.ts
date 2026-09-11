@@ -18,7 +18,8 @@ export class JsonStateFile {
   constructor(
     rootDir: string,
     fileName: string,
-    private readonly label: string
+    private readonly label: string,
+    private readonly mode?: number
   ) {
     this.rootPath = path.resolve(rootDir);
     this.filePath = path.join(this.rootPath, fileName);
@@ -45,7 +46,7 @@ export class JsonStateFile {
   }
 
   async write(value: unknown): Promise<void> {
-    await writeTextFileAtomic(this.rootPath, this.filePath, stringifyJsonDocument(value, `${this.label} file`), `${this.label} file`);
+    await writeTextFileAtomic(this.rootPath, this.filePath, stringifyJsonDocument(value, `${this.label} file`), `${this.label} file`, this.mode);
   }
 }
 
@@ -138,7 +139,7 @@ export function stringifyJsonDocument(value: unknown, label: string): string {
   return `${content}\n`;
 }
 
-export async function writeTextFileAtomic(rootPath: string, filePath: string, content: string, label: string): Promise<void> {
+export async function writeTextFileAtomic(rootPath: string, filePath: string, content: string, label: string, mode?: number): Promise<void> {
   const resolvedRoot = path.resolve(rootPath);
   const resolvedFile = path.resolve(filePath);
   const directory = path.dirname(resolvedFile);
@@ -146,7 +147,7 @@ export async function writeTextFileAtomic(rootPath: string, filePath: string, co
   await requireRegularFile(resolvedFile, label);
   const tempPath = path.join(directory, `${path.basename(resolvedFile)}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`);
   try {
-    await fsp.writeFile(tempPath, content, { encoding: "utf8", flag: "wx" });
+    await fsp.writeFile(tempPath, content, { encoding: "utf8", flag: "wx", mode });
     await fsp.rename(tempPath, resolvedFile);
   } catch (error) {
     await fsp.rm(tempPath, { force: true }).catch(() => undefined);

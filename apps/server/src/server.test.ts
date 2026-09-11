@@ -632,6 +632,20 @@ describe("buildServer", () => {
     }
   });
 
+  it("sends an independently bounded screen snapshot with its dimensions even when empty", () => {
+    for (const data of ["", "\x1b[?1049h\x1b[?1h\x1b[?2004hretained application"]) {
+      const send = vi.fn((_message: string, complete: () => void) => complete());
+      const onError = vi.fn();
+      const socket = { readyState: WebSocket.OPEN, bufferedAmount: 0, send } as unknown as WebSocket;
+      const sender = new TerminalWebSocketSender(socket, 0, onError);
+
+      expect(sender.sendReplay(data, { cols: 100, rows: 30 })).toBe(true);
+      expect(JSON.parse(send.mock.calls[0]![0])).toEqual({ type: "screen", data, cols: 100, rows: 30 });
+      expect(onError).not.toHaveBeenCalled();
+      expect(sender.sendLive("continuation")).toBe(true);
+    }
+  });
+
   it.each(["pending", "settled", "invalidated"] as const)("never reuses a %s replay token", (state) => {
     const callbacks: Array<(error?: Error) => void> = [];
     const send = vi.fn((_serialized: string, callback: (error?: Error) => void) => callbacks.push(callback));

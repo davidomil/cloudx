@@ -47,7 +47,10 @@ export class TerminalSupervisor {
 
   terminate(): Promise<void> {
     if (this.exited) return this.completion.then(({ error }) => { if (error) throw error; });
-    this.termination ??= this.stopAndWait();
+    this.termination ??= this.stopAndWait().catch(error => {
+      this.termination = undefined;
+      throw error;
+    });
     return this.termination;
   }
 

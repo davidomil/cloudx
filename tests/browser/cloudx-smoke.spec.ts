@@ -5,18 +5,28 @@ import type {
   TabLayoutNode,
   WorkspaceStateResponse,
 } from "@cloudx/shared";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import {
+  spawn,
+  type ChildProcess,
+  type ChildProcessWithoutNullStreams,
+} from "node:child_process";
 import fs from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import {
+  startTerminalBroker,
+  stopTestProcess,
+} from "../../scripts/test-terminal-broker.mjs";
 
 const repoRoot = path.resolve(import.meta.dirname, "../..");
 
 let baseUrl: string;
 let server: ChildProcessWithoutNullStreams;
+let broker: ChildProcess;
 let testRoot: string;
 let serverLogs = "";
+let brokerLogs = "";
 
 test.describe("CloudX shipped shell", () => {
   test.beforeAll(async () => {
@@ -57,24 +67,35 @@ test.describe("CloudX shipped shell", () => {
 
     const port = await freePort();
     baseUrl = `http://127.0.0.1:${port}`;
+    const env = {
+      ...process.env,
+      CLOUDX_ALLOWED_ROOTS: workspace,
+      CLOUDX_APP_SERVER_ENABLED: "false",
+      CLOUDX_ASSISTANT_BIN: assistant,
+      CLOUDX_ASR_URL: "http://127.0.0.1:9",
+      CLOUDX_AUTOMATION_START_DISABLED: "true",
+      CLOUDX_DATA_DIR: data,
+      CLOUDX_DOCUMENTATION_URL: "http://127.0.0.1:9",
+      CLOUDX_HOST: "127.0.0.1",
+      CLOUDX_LOG_LEVEL: "warn",
+      CLOUDX_PORT: String(port),
+      CODEX_HOME: codexHome,
+      CODEX_SQLITE_HOME: "",
+      SHELL: "/bin/bash",
+    };
+    broker = await startTerminalBroker("apps/server/dist/terminal/broker.js", {
+      cwd: repoRoot,
+      env,
+      execArgv: [],
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+      onSpawn(child: ChildProcess) {
+        child.stdout!.on("data", (chunk) => (brokerLogs += chunk.toString()));
+        child.stderr!.on("data", (chunk) => (brokerLogs += chunk.toString()));
+      },
+    });
     server = spawn(process.execPath, ["apps/server/dist/index.js"], {
       cwd: repoRoot,
-      env: {
-        ...process.env,
-        CLOUDX_ALLOWED_ROOTS: workspace,
-        CLOUDX_APP_SERVER_ENABLED: "false",
-        CLOUDX_ASSISTANT_BIN: assistant,
-        CLOUDX_ASR_URL: "http://127.0.0.1:9",
-        CLOUDX_AUTOMATION_START_DISABLED: "true",
-        CLOUDX_DATA_DIR: data,
-        CLOUDX_DOCUMENTATION_URL: "http://127.0.0.1:9",
-        CLOUDX_HOST: "127.0.0.1",
-        CLOUDX_LOG_LEVEL: "warn",
-        CLOUDX_PORT: String(port),
-        CODEX_HOME: codexHome,
-        CODEX_SQLITE_HOME: "",
-        SHELL: "/bin/bash",
-      },
+      env,
       stdio: ["ignore", "pipe", "pipe"],
     });
     server.stdout.on("data", (chunk) => (serverLogs += chunk.toString()));
@@ -83,17 +104,19 @@ test.describe("CloudX shipped shell", () => {
   });
 
   test.afterAll(async ({}, testInfo) => {
-    server?.kill("SIGTERM");
-    await Promise.race([
-      new Promise<void>((resolve) => server?.once("exit", () => resolve())),
-      new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
-    ]);
-    const logPath = testInfo.outputPath("server.log");
-    await fs.writeFile(logPath, serverLogs);
-    await testInfo.attach("server.log", {
-      path: logPath,
-      contentType: "text/plain",
-    });
+    try {
+      await stopTestProcess(server);
+    } finally {
+      await stopTestProcess(broker);
+    }
+    for (const [name, contents] of [
+      ["server.log", serverLogs],
+      ["broker.log", brokerLogs],
+    ] as const) {
+      const logPath = testInfo.outputPath(name);
+      await fs.writeFile(logPath, contents);
+      await testInfo.attach(name, { path: logPath, contentType: "text/plain" });
+    }
     await fs.rm(testRoot, { recursive: true, force: true });
   });
 
@@ -216,7 +239,7 @@ test.describe("CloudX shipped shell", () => {
   }, testInfo) => {
     const sockets: Array<{
       socket: WebSocket;
-      frames: Array<{ bytes: number; data: string }>;
+      frames: Array<{ type: string; data: string }>;
       errors: string[];
       closes: number;
     }> = [];
@@ -233,7 +256,7 @@ test.describe("CloudX shipped shell", () => {
       if (!new URL(socket.url()).pathname.startsWith("/ws/terminal/")) return;
       const observed = {
         socket,
-        frames: [] as Array<{ bytes: number; data: string }>,
+        frames: [] as Array<{ type: string; data: string }>,
         errors: [] as string[],
         closes: 0,
       };
@@ -242,9 +265,9 @@ test.describe("CloudX shipped shell", () => {
         const text =
           typeof payload === "string" ? payload : payload.toString("utf8");
         const message = JSON.parse(text) as { type: string; data: string };
-        if (message.type === "data")
+        if (message.type === "data" || message.type === "screen")
           observed.frames.push({
-            bytes: Buffer.byteLength(text),
+            type: message.type,
             data: message.data,
           });
       });
@@ -317,12 +340,15 @@ test.describe("CloudX shipped shell", () => {
           .poll(() =>
             current.frames.some(
               (frame) =>
-                frame.bytes > 1_048_576 && frame.data.includes(pidMarker),
+                frame.type === "screen" && frame.data.includes(pidMarker),
             ),
           )
           .toBe(true);
-        const replay = current.frames.find((frame) => frame.bytes > 1_048_576)!;
-        expect(Buffer.byteLength(replay.data)).toBe(1_048_576);
+        const screens = current.frames.filter(
+          (frame) => frame.type === "screen",
+        );
+        expect(screens).toHaveLength(1);
+        const replay = screens[0]!;
         expect(replay.data).toContain(startMarker);
         expect(replay.data).toContain("FILLED");
         if (reload === 2) expect(replay.data).toContain("ECHO:after-reload-1");

@@ -72,8 +72,8 @@ The wizard asks for:
   voice control. Leave it disabled for CPU-only and NVIDIA CUDA installs because
   Faster Whisper already covers those paths. Choose `sycl` only after the Intel
   GPU runtime, oneAPI, and device access are available.
-- Whether to write/start `cloudx.service`, `cloudx-asr.service`, and
-  `cloudx-documentation.service`.
+- Whether to write/start `cloudx.service`, `cloudx-terminal.service`,
+  `cloudx-asr.service`, and `cloudx-documentation.service`.
 - Whether to enable systemd linger so user services can survive logout.
 
 When `nvidia-smi` reports an NVIDIA GPU with Linux driver 525.60.13 or newer,
@@ -225,9 +225,12 @@ does the operational refresh:
   `gpt-6-astra` when the base config omits a model; explicit model and
   reasoning-effort preferences are preserved. Editing that config does not
   change an already-running Codex process.
-- Browser page reloads reattach running terminal tabs and restore retained
-  output. A Cloudx service restart ends its terminal processes; this is a
-  separate lifecycle from browser reattachment.
+- Browser page reloads and `cloudx.service` restarts reattach running terminal
+  tabs and restore retained output while `cloudx-terminal.service` stays running.
+  Restarting the terminal service or rebooting the host stops those processes.
+  The first upgrade from an installation without the terminal service cannot
+  preserve already-running terminals; terminals opened after that upgrade
+  survive subsequent web updates.
 - Records the resolved assistant executable path in `CLOUDX_ASSISTANT_BIN` and
   relevant command directories in `CLOUDX_TOOL_PATH` so Cloudx services do not
   depend on systemd's minimal `PATH`.
@@ -294,8 +297,8 @@ Run:
 
 The uninstall wizard removes Cloudx-managed local artifacts. By default it:
 
-- Stops, disables, and removes `cloudx.service`, `cloudx-asr.service`, and
-  `cloudx-documentation.service` from `~/.config/systemd/user`.
+- Stops, disables, and removes `cloudx.service`, `cloudx-terminal.service`,
+  `cloudx-asr.service`, and `cloudx-documentation.service` from `~/.config/systemd/user`.
 - Keeps `~/.config/cloudx/cloudx.env` unless you explicitly select config
   removal.
 - Removes the Cloudx-managed Python virtualenvs at `services/asr/.venv` and
@@ -493,6 +496,11 @@ indexer elsewhere, start Cloudx with:
 ```bash
 CLOUDX_DOCUMENTATION_URL=http://127.0.0.1:7820 npm run dev
 ```
+
+Interactive terminal tabs also require the independent terminal broker. For
+development, run `npm run terminals -w @cloudx/server` in a separate terminal
+before starting the web server. Keep it running through web-server restarts.
+Both processes must use the same `CLOUDX_DATA_DIR` and allowed-root configuration.
 
 For isolated frontend QA when another Cloudx server is already using the
 default port, run the server and Vite dev server on alternate ports:
@@ -707,15 +715,38 @@ The setup writes:
 - `~/.config/cloudx/cloudx.env`
 - `~/.config/systemd/user/cloudx-asr.service`
 - `~/.config/systemd/user/cloudx-documentation.service`
+- `~/.config/systemd/user/cloudx-terminal.service`
 - `~/.config/systemd/user/cloudx.service`
 
 Service commands:
 
 ```bash
-systemctl --user status cloudx.service cloudx-asr.service cloudx-documentation.service
+systemctl --user status cloudx.service cloudx-terminal.service cloudx-asr.service cloudx-documentation.service
 systemctl --user restart cloudx-asr.service cloudx-documentation.service cloudx.service
 journalctl --user -u cloudx.service -u cloudx-asr.service -u cloudx-documentation.service -f
 ```
+
+The updater keeps `cloudx-terminal.service` running while it restarts the web
+server. Open interactive terminal and Codex tabs reconnect to their existing
+processes, with their tab IDs and pane positions preserved. Other open plugin
+tabs are recreated with the same IDs; local web viewers retain their current URL.
+The browser reconnects automatically when the web server returns.
+
+Close a terminal tab to stop its process. Stopping the terminal service,
+uninstalling Cloudx, or rebooting the host stops all of its processes. Saved tabs
+whose processes are unavailable remain visible with a failure message; Cloudx
+does not rerun their commands. Managed Forge worker sessions retain their own
+shutdown and recovery lifecycle.
+
+The first upgrade from an installation without the terminal service cannot move
+already-running terminals into the new owner. Sessions launched after that
+upgrade survive subsequent web updates. To update the broker itself, finish or
+close its terminal tabs, then run `systemctl --user restart cloudx-terminal.service`.
+
+Custom `--service` updates preserve the selected service definition. Configure
+an independent broker with the same `CLOUDX_DATA_DIR` before using interactive
+tabs; custom updates do not create or start that broker. Its production command
+is `node apps/server/dist/terminal/broker.js`, run from the checkout root.
 
 Enable lingering only if you want services to start before login:
 

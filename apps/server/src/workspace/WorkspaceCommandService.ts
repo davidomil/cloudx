@@ -96,7 +96,7 @@ export class WorkspaceCommandService {
     const cleanupFailures: unknown[] = [];
     for (const tabId of prepared.replacedTabIds) {
       try {
-        this.sessions.closeTab(tabId);
+        await this.sessions.closeTab(tabId);
       } catch (error) {
         cleanupFailures.push(error);
       }

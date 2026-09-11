@@ -2,11 +2,13 @@ import fs from "node:fs";
 import { isIP } from "node:net";
 import path from "node:path";
 
-export const SERVICE_NAMES = [
+export const UPDATE_SERVICE_NAMES = [
   "cloudx-asr.service",
   "cloudx-documentation.service",
   "cloudx.service",
 ];
+export const TERMINAL_SERVICE_NAME = "cloudx-terminal.service";
+export const SERVICE_NAMES = [...UPDATE_SERVICE_NAMES, TERMINAL_SERVICE_NAME];
 
 export function updatePort(value, label = "Port") {
   if (

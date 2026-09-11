@@ -1,3 +1,4 @@
+export { terminalInputMessages } from "./terminalInput.js";
 import { isUsableTabLayoutState, listTabLayoutPanes } from "./workspaceLayout.js";
 
 export * from "./forge.js";
@@ -1111,7 +1112,7 @@ export function parseCreateTabResponse(value: unknown): CreateTabResponse {
   };
 }
 
-function isCompleteWorkspaceTab(value: unknown): value is WorkspaceTab {
+export function isCompleteWorkspaceTab(value: unknown): value is WorkspaceTab {
   return (
     isRecord(value) &&
     typeof value.id === "string" &&

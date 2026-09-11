@@ -87,6 +87,23 @@ describe("TerminalSupervisor ownership receipts", () => {
     await expect(fixture.supervisor.terminate()).resolves.toBeUndefined();
     expect(fixture.native.kill).toHaveBeenCalledExactlyOnceWith("SIGTERM");
   });
+
+  it("allows a later explicit shutdown request after a deadline while the supervisor remains alive", async () => {
+    const fixture = await supervisorFixture();
+    vi.useFakeTimers();
+    const first = expect(fixture.supervisor.terminate()).rejects.toThrow("shutdown deadline");
+    await vi.advanceTimersByTimeAsync(5_000);
+    await first;
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(fixture.native.kill).toHaveBeenCalledTimes(1);
+
+    const second = fixture.supervisor.terminate();
+    expect(fixture.supervisor.terminate()).toBe(second);
+    expect(fixture.native.kill).toHaveBeenCalledTimes(2);
+    await fixture.receipt("complete", { pid: process.pid, exitCode: 0 });
+    fixture.exit();
+    await expect(second).resolves.toBeUndefined();
+  });
 });
 
 async function supervisorFixture() {
