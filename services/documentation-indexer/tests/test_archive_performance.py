@@ -67,6 +67,7 @@ def test_catalog_summary_and_document_page_do_not_scan_other_documents_chunks(tm
     assert page["window"]["total"] == 3
     page = archive.list_document_page(limit=1, offset=1, sort_direction="asc")
     assert page["documents"][0]["document_id"] == "doc-1"
+    assert archive.pending_enrichment() == [{"documentId": "doc-0", "title": "Document 0"}]
     assert instruction_steps < 20000
 
 

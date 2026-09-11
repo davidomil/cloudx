@@ -16,6 +16,7 @@ import { PathPolicy } from "../pathPolicy.js";
 import { DocumentationPlugin } from "../plugins/DocumentationPlugin.js";
 import type { RulesSkillsCatalogService } from "../rulesSkills/RulesSkillsCatalogService.js";
 import { DocumentationClient } from "./DocumentationClient.js";
+import { DocumentationBackgroundEnrichment } from "./DocumentationBackgroundEnrichment.js";
 import {
   DEFAULT_DOCUMENTATION_ENRICHMENT_SKILL_IDS,
   DOCUMENTATION_AI_ENRICHMENT_ENABLED_KEY,
@@ -40,6 +41,52 @@ const recordings = [
 describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))(
   "archived media through the real indexer and media tools",
   () => {
+    it("automatically enriches archived uploads after restart while new imports can finish", async () => {
+      const fixture = await startArchive();
+      let worker: DocumentationBackgroundEnrichment | undefined;
+      let releaseModel!: () => void;
+      const modelGate = new Promise<void>((resolve) => { releaseModel = resolve; });
+      try {
+        const sourcePath = path.join(fixture.root, "recording.wav");
+        await runFile("ffmpeg", [
+          "-v", "error", "-nostdin", "-f", "lavfi", "-i", "sine=frequency=440:duration=0.2", sourcePath,
+        ]);
+        const imported = await fixture.client.ingestUploadFile({ filename: "recording.wav", path: sourcePath, contentType: "audio/wav" });
+        const documentId = (imported.document as { documentId: string }).documentId;
+        await fs.unlink(sourcePath);
+        await fixture.reopen();
+        const enrichment = createEnrichment(fixture);
+        enrichment.run.mockImplementation(async () => {
+          await modelGate;
+          return { summary: "Archived evidence", metadata: [], warnings: [], spans: [{ locator: "ai:media", text: "BACKGROUND-EVIDENCE" }] };
+        });
+        const reportError = vi.fn();
+        worker = new DocumentationBackgroundEnrichment(fixture.client, enrichment.service, reportError);
+        worker.start();
+        await vi.waitFor(() => expect(enrichment.run).toHaveBeenCalledOnce(), { timeout: 10_000 });
+
+        const hook = enrichment.plugin.hooks.find((candidate) => candidate.id === "documentation.ingest.text")!;
+        await expect(hook.execute({ text: "A new source while the model is busy." }, { caller: { kind: "http" } }))
+          .resolves.toMatchObject({ kind: "text", documentCount: 1 });
+        expect(enrichment.run).toHaveBeenCalledOnce();
+        expect(fixture.queue.list().capacity.admittedJobs).toBe(0);
+
+        releaseModel();
+        await vi.waitFor(async () => expect(await fixture.client.nextPendingEnrichment()).toBeUndefined(), { timeout: 10_000 });
+        expect((await fixture.document(documentId)).chunks).toEqual(expect.arrayContaining([
+          expect.objectContaining({ chunk_origin: "ai", text: "BACKGROUND-EVIDENCE" }),
+        ]));
+        expect(enrichment.transcribeFile).toHaveBeenCalledOnce();
+        expect(enrichment.run.mock.calls[0][0]).toContain("FRESH-TRANSCRIPT-1");
+        expect(enrichment.run).toHaveBeenCalledTimes(2);
+        expect(reportError).not.toHaveBeenCalled();
+      } finally {
+        releaseModel();
+        await worker?.dispose();
+        await fixture.dispose();
+      }
+    }, 30_000);
+
     it.each([undefined, "text/plain", "application/octet-stream", "audio/flac", "video/ogg"])(
       "re-enriches generated code twice without decoding (sibling MIME: %s)",
       async (contentType) => {

@@ -2534,59 +2534,29 @@ describe("buildServer", () => {
     }
   });
 
-  it("passes the browser documentation spool file to the enrichment service", async () => {
-    const root = await fs.mkdtemp(
-      path.join(os.tmpdir(), "cloudx-doc-upload-enrich-"),
-    );
-    const config = testConfig(root);
-    const services = buildServices(config);
-    vi.spyOn(services.documentation!, "ingestUploadFile").mockResolvedValue({
-      document: { documentId: "uploaded-media", sourceType: "media" },
+  it("returns uploaded source evidence and removes the spool before background enrichment", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-upload-enrich-"));
+    const services = buildServices(testConfig(root));
+    let uploadPath = "";
+    vi.spyOn(services.documentation!, "ingestUploadFile").mockImplementation(async (input) => {
+      uploadPath = input.path;
+      await expect(fs.readFile(uploadPath)).resolves.toEqual(Buffer.from("fake video bytes"));
+      return { document: { documentId: "uploaded-media", sourceType: "media" } };
     });
-    let enrichmentPath = "";
-    const enrichIngestResponse = vi
-      .spyOn(services.documentationEnrichment!, "enrichIngestResponse")
-      .mockImplementation(async (_result, source) => {
-        enrichmentPath = source?.contentPath ?? "";
-        await expect(fs.readFile(enrichmentPath)).resolves.toEqual(
-          Buffer.from("fake video bytes"),
-        );
-        return {
-          document: { documentId: "uploaded-media", sourceType: "media" },
-          enrichment: { enabled: true },
-        };
-      });
-    const app = await buildServer(config, services);
+    const enrich = vi.spyOn(services.documentationEnrichment!, "enrichIngestResponse").mockImplementation(() => new Promise(() => {}));
+    const app = await buildServer(testConfig(root), services);
     try {
-      const payload = Buffer.from("fake video bytes");
       const response = await app.inject({
         method: "POST",
         url: "/api/documentation/upload?filename=lecture.mp4&sourceType=media",
-        headers: {
-          "content-type": "application/octet-stream",
-          "x-cloudx-file-content-type": "video/mp4",
-        },
-        payload,
+        headers: { "content-type": "application/octet-stream", "x-cloudx-file-content-type": "video/mp4" },
+        payload: Buffer.from("fake video bytes"),
       });
-
       expect(response.statusCode).toBe(200);
-      expect(response.json()).toEqual({
-        document: { documentId: "uploaded-media", sourceType: "media" },
-        enrichment: { enabled: true },
-      });
-      expect(enrichIngestResponse).toHaveBeenCalledWith(
-        { document: { documentId: "uploaded-media", sourceType: "media" } },
-        {
-          filename: "lecture.mp4",
-          contentPath: expect.any(String),
-          contentType: "video/mp4",
-          sourceType: "media",
-        },
-        { signal: expect.any(AbortSignal) },
-      );
-      await expect(fs.stat(enrichmentPath)).rejects.toMatchObject({
-        code: "ENOENT",
-      });
+      expect(response.json()).toEqual({ document: { documentId: "uploaded-media", sourceType: "media" } });
+      expect(enrich).not.toHaveBeenCalled();
+      expect(services.documentationIngestQueue!.list().capacity.admittedJobs).toBe(0);
+      await expect(fs.stat(uploadPath)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await app.close();
       await fs.rm(root, { recursive: true, force: true });
@@ -2605,6 +2575,7 @@ describe("buildServer", () => {
     vi.spyOn(services.documentation!, "getDocument").mockResolvedValue({
       document: {
         documentId: "closing-document",
+        state: "active",
         chunks: [],
         artifacts: [],
         chunkWindow: { hasMore: false },
@@ -2612,7 +2583,7 @@ describe("buildServer", () => {
       },
     });
     vi.spyOn(services.documentation!, "health").mockResolvedValue({});
-    const enrichmentStarted = deferred<{ signal: AbortSignal; contentPath: string }>();
+    const enrichmentStarted = deferred<AbortSignal>();
     const abortObserved = deferred<void>();
     const releaseCleanup = deferred<void>();
     let activeEnrichments = 0;
@@ -2624,7 +2595,7 @@ describe("buildServer", () => {
           throw new Error("documentation enrichment signal was not provided");
         }
         activeEnrichments += 1;
-        enrichmentStarted.resolve({ signal, contentPath: currentSpoolPath });
+        enrichmentStarted.resolve(signal);
         try {
           return await new Promise<Record<string, unknown>>((_resolve, reject) => {
             const abort = () => {
@@ -2642,7 +2613,6 @@ describe("buildServer", () => {
         }
       }),
     };
-    let currentSpoolPath = "";
     services.documentationEnrichment = new DocumentationEnrichmentService({
       client: services.documentation!,
       config: {
@@ -2667,22 +2637,17 @@ describe("buildServer", () => {
         templates: [],
       } as never),
     });
-    vi.spyOn(services.documentationEnrichment, "enrichIngestResponse").mockImplementation(async function (
-      this: DocumentationEnrichmentService,
-      response,
-      source = {},
-      options,
-    ) {
-      currentSpoolPath = source.contentPath ?? "";
-      return DocumentationEnrichmentService.prototype.enrichIngestResponse.call(this, response, source, options);
-    });
+    const pending = vi.spyOn(services.documentation!, "nextPendingEnrichment").mockResolvedValue({ documentId: "closing-document", title: "Pending guide" });
+    const outcome = vi.spyOn(services.documentation!, "recordEnrichmentOutcome");
     const app = await buildServer(config, services);
     onTestFinished(async () => {
       releaseCleanup.resolve();
       await app.close();
       await fs.rm(root, { recursive: true, force: true });
     });
-    const request = app.inject({
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    const signal = await enrichmentStarted.promise;
+    const response = await app.inject({
       method: "POST",
       url: "/api/documentation/upload?filename=closing.txt&sourceType=text",
       headers: {
@@ -2691,8 +2656,9 @@ describe("buildServer", () => {
       },
       payload: Buffer.from("closing documentation bytes"),
     });
-    const { signal, contentPath } = await enrichmentStarted.promise;
-    await expect(fs.stat(contentPath)).resolves.toBeDefined();
+    expect(response.statusCode).toBe(200);
+    expect(activeEnrichments).toBe(1);
+    expect(pending).toHaveBeenCalledOnce();
 
     let closeSettled = false;
     const close = app.close().then(() => {
@@ -2704,13 +2670,11 @@ describe("buildServer", () => {
     expect(signal.aborted).toBe(true);
     expect(closeSettled).toBe(false);
     expect(activeEnrichments).toBe(1);
-    await expect(fs.stat(contentPath)).resolves.toBeDefined();
 
     releaseCleanup.resolve();
-    const response = await request;
     await close;
 
-    expect(response.statusCode).toBe(503);
+    expect(outcome).not.toHaveBeenCalled();
     expect(activeEnrichments).toBe(0);
     expect(runner.run).toHaveBeenCalledWith(
       expect.any(String),
@@ -2721,7 +2685,6 @@ describe("buildServer", () => {
       admittedBytes: 0,
       reservedJobs: 0,
     });
-    await expect(fs.stat(contentPath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it.each(["reanalyze", "reenrich"])("validates and streams the documentation %s hook over HTTP", async (operation) => {
@@ -7380,6 +7343,7 @@ function testConfig(root: string): AppConfig {
     asrUrl: "http://127.0.0.1:7810",
     asrTimeoutMs: DEFAULT_ASR_TIMEOUT_MS,
     voiceModel: "gpt-5.3-codex-spark",
+    documentationUrl: "http://127.0.0.1:1",
     dataDir: path.join(root, ".cloudx"),
     webDistDir: path.join(root, "missing-web-dist"),
     appServerEnabled: false,

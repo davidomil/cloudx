@@ -98,6 +98,23 @@ export class DocumentationClient {
     return this.get("/portable-manifest");
   }
 
+  async nextPendingEnrichment(options: DocumentationRequestOptions = {}): Promise<{ documentId: string; title: string } | undefined> {
+    const response = await this.get("/enrichment/pending?limit=1", options.signal);
+    if (!Array.isArray(response.documents) || response.documents.length > 1) {
+      throw new Error("Invalid pending documentation enrichment response.");
+    }
+    const document: unknown = response.documents[0];
+    if (document === undefined) return undefined;
+    if (!document || typeof document !== "object" || !("documentId" in document) || !("title" in document) || typeof document.documentId !== "string" || !document.documentId.trim() || typeof document.title !== "string") {
+      throw new Error("Invalid pending documentation enrichment document.");
+    }
+    return { documentId: document.documentId, title: document.title };
+  }
+
+  recordEnrichmentOutcome(documentId: string, outcome: { status: "failed" | "skipped"; error: string }, options: DocumentationRequestOptions = {}): Promise<Record<string, unknown>> {
+    return this.post(`/documents/${encodeURIComponent(requireString(documentId, "documentId"))}/enrichment-outcome`, outcome, options.signal);
+  }
+
   listDocuments(input: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
     const states = Array.isArray(input.states) ? input.states.filter((state): state is string => typeof state === "string" && state.trim().length > 0).join(",") : undefined;
     const params = new URLSearchParams();

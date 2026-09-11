@@ -62,6 +62,7 @@ export interface DocumentationRunnerOptions {
 
 export interface DocumentationEnrichmentRequestOptions {
   signal?: AbortSignal;
+  onlyPending?: boolean;
 }
 
 export interface DocumentationEnrichmentSource {
@@ -115,6 +116,8 @@ export class CodexDocumentationEnrichmentRunner implements DocumentationEnrichme
 }
 
 export class DocumentationEnrichmentService {
+  private enrichmentTail: Promise<void> = Promise.resolve();
+
   constructor(private readonly options: DocumentationEnrichmentOptions) {}
 
   isEnabled(): boolean {
@@ -124,11 +127,17 @@ export class DocumentationEnrichmentService {
     return this.options.config.getPluginConfig(DOCUMENTATION_PLUGIN_ID)[DOCUMENTATION_AI_ENRICHMENT_ENABLED_KEY] === true;
   }
 
-  async enrichIngestResponse(
+  enrichIngestResponse(
     response: Record<string, unknown>,
     source: DocumentationEnrichmentSource = {},
     options: DocumentationEnrichmentRequestOptions = {}
   ): Promise<Record<string, unknown>> {
+    const run = this.enrichmentTail.then(() => this.enrichResponse(response, source, options));
+    this.enrichmentTail = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private async enrichResponse(response: Record<string, unknown>, source: DocumentationEnrichmentSource, options: DocumentationEnrichmentRequestOptions): Promise<Record<string, unknown>> {
     options.signal?.throwIfAborted();
     if (!this.isEnabled()) {
       return response;
@@ -140,7 +149,7 @@ export class DocumentationEnrichmentService {
     const results = [];
     for (const document of documents) {
       try {
-        results.push(await this.enrichDocument(document, source, options.signal));
+        results.push(await this.enrichDocument(document, source, options.signal, options.onlyPending));
       } catch (error) {
         if (options.signal?.aborted) {
           throw documentationAbortReason(options.signal);
@@ -186,10 +195,13 @@ export class DocumentationEnrichmentService {
     return { ...output, results, model };
   }
 
-  private async enrichDocument(document: IngestedDocumentRef, source: DocumentationEnrichmentSource, signal?: AbortSignal): Promise<Record<string, unknown>> {
+  private async enrichDocument(document: IngestedDocumentRef, source: DocumentationEnrichmentSource, signal?: AbortSignal, onlyPending = false): Promise<Record<string, unknown>> {
     const skillIds = configuredSkillIds(this.options.config.getPluginConfig(DOCUMENTATION_PLUGIN_ID)[DOCUMENTATION_AI_ENRICHMENT_SKILLS_KEY]);
     const skills = await this.resolveSkills(skillIds, signal);
     const fullDocument = await this.enrichmentDocument(document.documentId, signal);
+    if (onlyPending && (fullDocument.state !== "active" || recordsArray(fullDocument.chunks).some((chunk) => chunk.chunk_origin === "ai"))) {
+      return { documentId: document.documentId, status: "unchanged" };
+    }
     const cleanup: Array<() => Promise<void>> = [];
     try {
       const archivedMedia = source.content || source.contentPath ? undefined : await this.archivedMediaSource(fullDocument, signal);

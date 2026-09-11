@@ -520,6 +520,53 @@ class DocumentationArchive:
     def list_documents(self, states: list[str] | None = None) -> list[dict]:
         return self.list_document_page(states=states, limit=None)["documents"]
 
+    def pending_enrichment(self, *, limit: int = 1) -> list[dict]:
+        limit = normalized_window_value(limit, "limit")
+        if not 1 <= limit <= 100:
+            raise ArchiveError("limit must be between 1 and 100.")
+        with self._connect() as db:
+            documents = db.execute(
+                """
+                SELECT d.document_id AS documentId, d.title
+                FROM documents d
+                WHERE d.state = ?
+                  AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.document_id = d.document_id AND c.chunk_origin = 'ai')
+                  AND NOT EXISTS (SELECT 1 FROM document_enrichment_outcomes o WHERE o.document_id = d.document_id)
+                ORDER BY d.created_at, d.document_id
+                LIMIT ?
+                """,
+                (ACTIVE_STATE, limit),
+            ).fetchall()
+        return [dict(document) for document in documents]
+
+    def record_enrichment_outcome(self, document_id: str, *, status: str, error: str) -> dict | None:
+        if status not in {"failed", "skipped"}:
+            raise ArchiveError("Background enrichment outcome must be failed or skipped.")
+        error = error.strip()
+        if not error or len(error) > 4000:
+            raise ArchiveError("Background enrichment error must contain between 1 and 4000 characters.")
+        outcome = {"status": status, "error": error, "updatedAt": timestamp()}
+        with self._write_lock, self._connect() as db:
+            document = db.execute(
+                """
+                SELECT document_id FROM documents d
+                WHERE d.document_id = ? AND d.state = ?
+                  AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.document_id = d.document_id AND c.chunk_origin = 'ai')
+                """,
+                (document_id, ACTIVE_STATE),
+            ).fetchone()
+            if not document:
+                return None
+            db.execute(
+                """
+                INSERT INTO document_enrichment_outcomes (document_id, status, error, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(document_id) DO UPDATE SET status = excluded.status, error = excluded.error, updated_at = excluded.updated_at
+                """,
+                (document_id, status, error, outcome["updatedAt"]),
+            )
+        return outcome
+
     def list_document_page(
         self,
         states: list[str] | None = None,
@@ -631,11 +678,16 @@ class DocumentationArchive:
                 "SELECT * FROM invalidation_events WHERE document_id = ? ORDER BY created_at DESC",
                 (document_id,),
             ).fetchall() if include_events else []
+            background_enrichment = db.execute(
+                "SELECT status, error, updated_at AS updatedAt FROM document_enrichment_outcomes WHERE document_id = ?",
+                (document_id,),
+            ).fetchone()
         result = dict(document)
         result["chunks"] = [document_chunk_dict(row, chunk_text_max_chars) for row in chunks]
         result["chunkWindow"] = chunk_window
         result["enrichments"] = [dict(row) for row in enrichments]
         result["events"] = [dict(row) for row in events]
+        result["backgroundEnrichment"] = dict(background_enrichment) if background_enrichment else None
         artifact_window = self.document_artifact_window(document_id, offset=artifact_offset, limit=artifact_limit)
         result["artifacts"] = artifact_window.artifacts
         result["artifactWindow"] = window_metadata(artifact_offset, artifact_limit, artifact_window.total)
@@ -1182,6 +1234,7 @@ class DocumentationArchive:
                 raise ArchiveError(f"Unknown document: {document_id}")
             if document["state"] != ACTIVE_STATE:
                 raise ArchiveError("Only active documents can be enriched.")
+            db.execute("DELETE FROM document_enrichment_outcomes WHERE document_id = ?", (document_id,))
             db.execute("DELETE FROM chunks WHERE document_id = ? AND chunk_origin = ?", (document_id, "ai"))
             cursor = db.execute(
                 """
@@ -1290,6 +1343,7 @@ class DocumentationArchive:
                     raise ArchiveError("No extractable text was found during reanalysis.")
 
                 def replace_source_analysis(db: sqlite3.Connection) -> None:
+                    db.execute("DELETE FROM document_enrichment_outcomes WHERE document_id = ?", (document_id,))
                     db.execute("DELETE FROM chunks WHERE document_id = ? AND chunk_origin = 'source'", (document_id,))
                     db.executemany(
                         "INSERT INTO chunks (document_id, locator, text, state, chunk_origin) VALUES (?, ?, ?, ?, 'source')",
@@ -1630,6 +1684,7 @@ class DocumentationArchive:
                 )
             if existing:
                 db.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
+                db.execute("DELETE FROM document_enrichment_outcomes WHERE document_id = ?", (document_id,))
             db.execute(
                 """
                 INSERT INTO documents (
@@ -2052,11 +2107,35 @@ class DocumentationArchive:
                 raise ArchiveError(f"Archive import catalog is missing required tables: {', '.join(missing_tables)}")
             if "chunks_fts" not in tables:
                 raise ArchiveError("Archive import catalog is missing chunks_fts search table.")
+            if "document_enrichment_outcomes" in tables:
+                required_columns["document_enrichment_outcomes"] = {"document_id", "status", "error", "updated_at"}
             for table, columns in required_columns.items():
                 present = {row["name"] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
                 missing_columns = sorted(columns - present)
                 if missing_columns:
                     raise ArchiveError(f"Archive import catalog table {table} is missing columns: {', '.join(missing_columns)}")
+            if "document_enrichment_outcomes" in tables:
+                invalid_outcome = db.execute(
+                    """
+                    SELECT 1 FROM document_enrichment_outcomes o
+                    LEFT JOIN documents d ON d.document_id = o.document_id
+                    WHERE d.document_id IS NULL
+                       OR typeof(o.status) != 'text' OR o.status NOT IN ('failed', 'skipped')
+                       OR typeof(o.error) != 'text' OR length(o.error) NOT BETWEEN 1 AND 4000
+                       OR typeof(o.updated_at) != 'text'
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if invalid_outcome or any(
+                    not row["error"].strip() or len(row["error"]) > 4000
+                    for row in db.execute("SELECT error FROM document_enrichment_outcomes")
+                ):
+                    raise ArchiveError("Archive import contains invalid background enrichment outcomes.")
+                outcome_primary_key = [
+                    column["name"] for column in db.execute("PRAGMA table_info(document_enrichment_outcomes)") if column["pk"]
+                ]
+                if outcome_primary_key != ["document_id"]:
+                    raise ArchiveError("Archive import background enrichment outcomes require a document_id primary key.")
 
     def _validate_import_locality(self, archive_root: Path) -> None:
         violations: list[str] = []
@@ -2409,6 +2488,13 @@ class DocumentationArchive:
                   created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS document_enrichment_outcomes (
+                  document_id TEXT PRIMARY KEY REFERENCES documents(document_id) ON DELETE CASCADE,
+                  status TEXT NOT NULL CHECK (status IN ('failed', 'skipped')),
+                  error TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+
                 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
                   text,
                   locator,
@@ -2450,7 +2536,6 @@ class DocumentationArchive:
 
                 """
             )
-            create_catalog_indexes(db)
             columns = {row["name"] for row in db.execute("PRAGMA table_info(chunks)").fetchall()}
             if "chunk_origin" not in columns:
                 db.execute("ALTER TABLE chunks ADD COLUMN chunk_origin TEXT NOT NULL DEFAULT 'source'")
@@ -2459,6 +2544,7 @@ class DocumentationArchive:
             archive_state_columns = {row["name"] for row in db.execute("PRAGMA table_info(archive_state)").fetchall()}
             if "projected_index_generation" not in archive_state_columns:
                 db.execute("ALTER TABLE archive_state ADD COLUMN projected_index_generation TEXT")
+            create_catalog_indexes(db)
 
 
 class ArchiveError(ValueError):
@@ -2469,8 +2555,10 @@ def create_catalog_indexes(db: sqlite3.Connection) -> None:
     db.executescript(
         """
         CREATE INDEX IF NOT EXISTS documents_state_updated ON documents(state, updated_at DESC, title COLLATE NOCASE, document_id);
+        CREATE INDEX IF NOT EXISTS documents_state_created ON documents(state, created_at, document_id);
         CREATE INDEX IF NOT EXISTS documents_uri ON documents(uri);
         CREATE INDEX IF NOT EXISTS chunks_document ON chunks(document_id);
+        CREATE INDEX IF NOT EXISTS chunks_document_origin ON chunks(document_id, chunk_origin);
         CREATE INDEX IF NOT EXISTS chunks_state ON chunks(state);
         CREATE INDEX IF NOT EXISTS enrichments_document ON document_enrichments(document_id);
         CREATE INDEX IF NOT EXISTS invalidations_document ON invalidation_events(document_id);
