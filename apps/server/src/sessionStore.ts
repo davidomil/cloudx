@@ -12,6 +12,7 @@ import { PluginRegistry } from "./pluginRegistry.js";
 import { TabContextService } from "./context/TabContextService.js";
 import { WORKSPACE_CONTROL_PLUGIN_ID } from "./plugins/WorkspaceControlPlugin.js";
 import type { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
+import type { SessionStateStore } from "./workspace/SessionStateStore.js";
 import type { HookRegistry } from "./hooks/HookRegistry.js";
 import type { TriggerRegistry } from "./triggers/TriggerRegistry.js";
 
@@ -55,10 +56,14 @@ export class SessionStore {
   private readonly producerActions = new Set<Promise<unknown>>();
   private readonly triggerEmissions = new Set<Promise<unknown>>();
   private readonly contextWrites = new Set<Promise<void>>();
+  private readonly sessionReleases = new Set<Promise<void>>();
   private readonly actionAdmission = new AsyncLocalStorage<ActionAdmission>();
   private readonly shutdownController = new AbortController();
   private disposed = false;
   private disposePromise: Promise<void> | undefined;
+  private readonly initialInputs = new Map<string, Record<string, unknown> | undefined>();
+  private restoring = false;
+  private preservingSessions = false;
 
   constructor(
     private readonly plugins: PluginRegistry,
@@ -67,8 +72,55 @@ export class SessionStore {
     private readonly configProvider: { getPluginConfig(pluginId: string): Record<string, ConfigValue> } = { getPluginConfig: () => ({}) },
     private readonly workspace?: WorkspaceLayoutStore,
     private readonly runtimeContextResolver?: SessionRuntimeContextResolver,
-    private readonly backgroundErrorReporter: SessionBackgroundErrorReporter = reportSessionBackgroundError
+    private readonly backgroundErrorReporter: SessionBackgroundErrorReporter = reportSessionBackgroundError,
+    private readonly savedSessions?: SessionStateStore
   ) {}
+
+  async restore(afterSetup?: Promise<unknown>): Promise<void> {
+    if (this.tabs.size > 0) return;
+    const saved = await this.savedSessions?.read();
+    if (!saved) return;
+    await afterSetup;
+    this.restoring = true;
+    try {
+      for (const { tab, initialInput } of saved.sessions) {
+        this.tabs.set(tab.id, { ...tab, status: "starting" });
+        this.initialInputs.set(tab.id, initialInput);
+      }
+      this.activeTabId = saved.activeTabId;
+      for (const { tab, initialInput } of saved.sessions) {
+        try {
+          const plugin = this.plugins.get(tab.pluginId);
+          const cwd = await this.pathPolicy.ensureDirectory(tab.cwd, false);
+          const window = this.workspace?.findWindowForTab(tab.id);
+          const input = {
+            tab: this.getTab(tab.id), cwd, initialInput,
+            runtimeContext: await this.runtimeContextResolver?.runtimeContextFor(tab, window),
+            app: this.createAppContext(plugin.id, tab.id), controls: this.createControls(tab.id),
+            config: this.configProvider.getPluginConfig(plugin.id),
+            getConfig: () => this.configProvider.getPluginConfig(plugin.id)
+          };
+          if (plugin.panelKind === "terminal" && !plugin.restoreSession) {
+            throw new Error(`${plugin.displayName} does not support reconnecting an existing session.`);
+          }
+          const session = await (plugin.restoreSession ? plugin.restoreSession(input) : plugin.createSession(input));
+          this.bindSession(tab.id, session);
+        } catch (error) {
+          const message = `Could not restore tab: ${error instanceof Error ? error.message : String(error)}`;
+          this.updateTab(tab.id, { status: "failed", statusMessage: message, indicator: indicatorForStatus("failed", message) });
+        }
+      }
+    } finally {
+      this.restoring = false;
+    }
+    this.emitTabsChange();
+    await this.savedSessions?.flush();
+  }
+
+  async flush(): Promise<void> {
+    await this.savedSessions?.flush();
+    await drainPromises(this.sessionReleases);
+  }
 
   setHookRegistry(hooks: HookRegistry): void {
     this.hooks = hooks;
@@ -116,6 +168,7 @@ export class SessionStore {
       }
       tab.contextPath = await this.contextService.create(tab, { ownedDirectory: Boolean(ownerPluginId) });
       this.tabs.set(id, tab);
+      this.initialInputs.set(id, request.initialInput);
       if (ownerPluginId) this.workspace?.registerEmbeddedTab(id);
       if (launchOptions) this.launchOptions.set(id, { authorizeProjectTrust: launchOptions.authorizeProjectTrust, prepareCodexSession: launchOptions.prepareCodexSession });
       this.unpublishedTabIds.add(id);
@@ -487,10 +540,15 @@ export class SessionStore {
       } catch (error) {
         stopError = error;
       }
+    } else if (session?.terminate) {
+      const release = session.terminate().catch(error => this.reportBackgroundError(error, "release exited terminal", tabId));
+      this.sessionReleases.add(release);
+      void release.then(() => this.sessionReleases.delete(release));
     }
     this.sessions.delete(tabId);
     this.tabs.delete(tabId);
     this.launchOptions.delete(tabId);
+    this.initialInputs.delete(tabId);
     this.workspace?.unregisterEmbeddedTab(tabId);
     if (this.activeTabId === tabId) {
       this.activeTabId = this.listTabs().find((tab) => !tab.ownerPluginId)?.id;
@@ -534,8 +592,30 @@ export class SessionStore {
   private async finishDisposal(): Promise<void> {
     await drainPromises(this.producerActions);
     await drainPromises(this.triggerEmissions);
-    const errors = this.stopSessions();
+    const errors: unknown[] = [];
+    if (this.savedSessions) {
+      this.persistSessions();
+      try { await this.savedSessions.flush(); } catch (error) { errors.push(error); }
+      this.preservingSessions = true;
+      for (const tab of [...this.tabs.values()]) {
+        try {
+          this.disposeSessionListeners(tab.id);
+          const session = this.sessions.get(tab.id);
+          if (!tab.ownerPluginId && !this.unpublishedTabIds.has(tab.id) && session?.detach) session.detach();
+          else session?.stop?.();
+        } catch (error) { errors.push(error); }
+      }
+      this.tabsListeners.clear();
+      this.sessions.clear();
+      this.tabs.clear();
+      this.initialInputs.clear();
+      this.launchOptions.clear();
+      this.activeTabId = undefined;
+    } else {
+      errors.push(...this.stopSessions());
+    }
     await drainPromises(this.contextWrites);
+    await drainPromises(this.sessionReleases);
     if (errors.length > 0) {
       throw new AggregateError(errors, "One or more plugin sessions failed to stop.");
     }
@@ -571,7 +651,8 @@ export class SessionStore {
     const oldSession = this.sessions.get(tabId);
     this.disposeSessionListeners(tabId);
     this.sessions.delete(tabId);
-    oldSession?.stop?.();
+    if (oldSession?.terminate) await oldSession.terminate();
+    else oldSession?.stop?.();
 
     const window = this.workspace?.findWindowForTab(tabId) ?? this.workspace?.getActiveWindow();
     const runtimeContext = await this.runtimeContextResolver?.runtimeContextFor(current, window);
@@ -770,6 +851,8 @@ export class SessionStore {
   }
 
   private emitTabsChange(): void {
+    if (this.preservingSessions || this.restoring) return;
+    this.persistSessions();
     const update: WorkspaceTabsUpdate = {
       type: "tabs",
       activeTabId: this.activeTabId,
@@ -782,6 +865,17 @@ export class SessionStore {
         this.reportBackgroundError(error, "notify tab listeners", this.activeTabId ?? "workspace");
       }
     }
+  }
+
+  private persistSessions(): void {
+    if (!this.savedSessions || this.restoring || this.preservingSessions) return;
+    const tabs = this.listTabs().filter(tab => !tab.ownerPluginId);
+    const state = {
+      version: 1 as const,
+      activeTabId: tabs.some(tab => tab.id === this.activeTabId) ? this.activeTabId : undefined,
+      sessions: tabs.map(tab => ({ tab, initialInput: this.sessions.get(tab.id)?.restoreInput?.() ?? this.initialInputs.get(tab.id) }))
+    };
+    void this.savedSessions.save(state).catch(error => this.reportBackgroundError(error, "persist open tabs", "workspace"));
   }
 
   private reportBackgroundError(error: unknown, operation: string, tabId: string): void {

@@ -1457,3 +1457,55 @@ async function seedExternalSkill(skillsRoot: string, id: string): Promise<string
   await fs.writeFile(skillPath, `---\nname: ${id}\ndescription: External test skill.\n---\n`, "utf8");
   return skillPath;
 }
+
+describe("Codex terminal update recovery", () => {
+  it("reattaches the exact tab without preparing a conversation or submitting the initial prompt again", async () => {
+    const terminal = new FakeTerminalProcess();
+    const detach = vi.fn();
+    Object.assign(terminal, { detach });
+    const factory = { spawn: vi.fn(), attach: vi.fn(async () => terminal) };
+    const prepareCodexSession = vi.fn();
+    const plugin = new CodexTerminalPlugin(factory);
+    const session = await plugin.restoreSession({
+      tab, cwd: tab.cwd, initialInput: { prompt: "Do not repeat this work" }, prepareCodexSession,
+      controls: { setTabIndicator: vi.fn(), closeTab: vi.fn() }
+    });
+    expect(factory.attach).toHaveBeenCalledWith(tab.id);
+    expect(factory.spawn).not.toHaveBeenCalled();
+    expect(prepareCodexSession).not.toHaveBeenCalled();
+    expect(terminal.written).toBe("");
+    terminal.emitData("Still working");
+    expect(session.snapshot().recentOutput).toBe("Still working");
+    session.detach!();
+    terminal.emitData("After detach");
+    expect(detach).toHaveBeenCalledOnce();
+    expect(terminal.killed).toBe(false);
+    expect(session.snapshot().recentOutput).toBe("Still working");
+  });
+
+  it("keeps broker disconnection visible without closing the tab or reporting terminal exit", () => {
+    const terminal = new FakeTerminalProcess();
+    let disconnect!: (error: Error) => void;
+    Object.assign(terminal, { onDisconnect: (listener: (error: Error) => void) => { disconnect = listener; return () => {}; } });
+    const closeTab = vi.fn();
+    const session = new CodexTerminalSession(tab, terminal, { closeTab, setTabIndicator: vi.fn() }, { closeOnExit: true });
+    disconnect(new Error("Broker connection lost"));
+    expect(session.snapshot()).toMatchObject({ status: "failed", statusMessage: "Broker connection lost" });
+    expect(closeTab).not.toHaveBeenCalled();
+    expect(terminal.killed).toBe(false);
+  });
+
+  it("waits for confirmed termination before completing a terminal stop", async () => {
+    const terminal = new FakeTerminalProcess();
+    let finish!: () => void;
+    vi.spyOn(terminal, "terminate").mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const session = new CodexTerminalSession(tab, terminal);
+    let stopped = false;
+    const stopping = session.terminate().then(() => { stopped = true; });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+    finish();
+    await stopping;
+    expect(session.snapshot().status).toBe("stopped");
+  });
+});

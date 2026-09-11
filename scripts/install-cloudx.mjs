@@ -12,6 +12,8 @@ import {
 } from "./installer-environment.mjs";
 import {
   SERVICE_NAMES,
+  TERMINAL_SERVICE_NAME,
+  UPDATE_SERVICE_NAMES,
   documentationReadinessUrl,
   inspectUpdateTarget,
   updateCheckout,
@@ -544,8 +546,8 @@ export function renderCloudxService({
   return [
     "[Unit]",
     "Description=Cloudx web workbench",
-    "After=network-online.target cloudx-asr.service cloudx-documentation.service",
-    "Wants=cloudx-asr.service cloudx-documentation.service",
+    "After=network-online.target cloudx-asr.service cloudx-documentation.service cloudx-terminal.service",
+    "Wants=cloudx-asr.service cloudx-documentation.service cloudx-terminal.service",
     "",
     "[Service]",
     "Type=simple",
@@ -556,6 +558,26 @@ export function renderCloudxService({
     "Restart=on-failure",
     "RestartSec=5",
     "KillSignal=SIGINT",
+    "",
+    "[Install]",
+    "WantedBy=default.target",
+    "",
+  ].join("\n");
+}
+
+export function renderTerminalService({ repoRoot: root, envPath, nodePath }) {
+  return [
+    "[Unit]",
+    "Description=Cloudx persistent terminal sessions",
+    "",
+    "[Service]",
+    "Type=notify",
+    "NotifyAccess=all",
+    `WorkingDirectory=${root}`,
+    `EnvironmentFile=${envPath}`,
+    `ExecStart=${nodePath} ${path.join(root, "apps/server/dist/terminal/broker.js")}`,
+    "Restart=on-failure",
+    "RestartSec=5",
     "",
     "[Install]",
     "WantedBy=default.target",
@@ -1188,7 +1210,7 @@ export async function runInstaller(options = {}) {
     : undefined;
   explainQuestion(
     "Install systemd services",
-    "Writes user-level services so Cloudx, ASR, and the documentation indexer can run in the background instead of being started manually.",
+    "Writes user-level services for Cloudx, persistent terminals, ASR, and the documentation indexer.",
   );
   const installServices = await prompt.boolean(
     "installServices",
@@ -1198,7 +1220,7 @@ export async function runInstaller(options = {}) {
   if (installServices) {
     explainQuestion(
       "Start services now",
-      "Restarts Cloudx, ASR, and the documentation indexer immediately after writing the unit files, then verifies their readiness endpoints.",
+      "Starts the persistent terminal service, restarts Cloudx, ASR, and the documentation indexer, then verifies their readiness endpoints.",
     );
   }
   const startServices = installServices
@@ -1289,7 +1311,8 @@ export async function runInstaller(options = {}) {
     commands.run("systemctl", ["--user", "daemon-reload"]);
     commands.run("systemctl", ["--user", "enable", ...SERVICE_NAMES]);
     if (startServices) {
-      commands.run("systemctl", ["--user", "restart", ...SERVICE_NAMES]);
+      commands.run("systemctl", ["--user", "start", TERMINAL_SERVICE_NAME]);
+      commands.run("systemctl", ["--user", "restart", ...UPDATE_SERVICE_NAMES]);
       verifyServices(commands, port, defaultDocumentationEnvVars(paths));
     }
   } else {
@@ -1406,6 +1429,7 @@ async function runUninstaller({ paths, commands, runner, prompt }) {
     runner.removePath(
       path.join(paths.systemdDir, "cloudx-documentation.service"),
     );
+    runner.removePath(path.join(paths.systemdDir, TERMINAL_SERVICE_NAME));
     commands.run("systemctl", ["--user", "daemon-reload"], {
       allowFailure: true,
     });
@@ -1596,6 +1620,7 @@ async function runUpdater({
   if (servicesInstalled) {
     installSystemdServices(commands, runner, paths);
     commands.run("systemctl", ["--user", "daemon-reload"]);
+    commands.run("systemctl", ["--user", "enable", TERMINAL_SERVICE_NAME]);
   } else {
     console.log(
       "Cloudx user services were not found, so service unit refresh is skipped.",
@@ -1607,7 +1632,7 @@ async function runUpdater({
     !noStart &&
     (explainQuestion(
       "Restart services",
-      "Restarts Cloudx, ASR, and the documentation indexer after dependencies and service files are updated, then verifies the readiness endpoints.",
+      "Restarts Cloudx, ASR, and the documentation indexer, then verifies readiness. The terminal service stays running so sessions started with persistent terminal ownership can reconnect.",
     ),
     await prompt.boolean(
       "restartServices",
@@ -1617,11 +1642,12 @@ async function runUpdater({
 
   section("10/10 Restart services");
   if (restartServices) {
-    commands.run("systemctl", ["--user", "restart", ...SERVICE_NAMES]);
+    commands.run("systemctl", ["--user", "start", TERMINAL_SERVICE_NAME]);
+    commands.run("systemctl", ["--user", "restart", ...UPDATE_SERVICE_NAMES]);
     verifyServices(commands, port, envConfig);
   } else if (servicesInstalled) {
     console.log(
-      `Services were refreshed but not restarted. Restart later with: systemctl --user restart ${SERVICE_NAMES.join(" ")}`,
+      `Services were refreshed but not restarted. Restart later with: systemctl --user restart ${UPDATE_SERVICE_NAMES.join(" ")}`,
     );
   } else {
     console.log("No installed services to restart.");
@@ -1948,6 +1974,14 @@ function downloadModel(commands, paths) {
 function installSystemdServices(commands, runner, paths) {
   console.log(`Writing user units to ${paths.systemdDir}.`);
   commands.mkdir(paths.systemdDir);
+  runner.writeFile(
+    path.join(paths.systemdDir, TERMINAL_SERVICE_NAME),
+    renderTerminalService({
+      repoRoot: paths.repoRoot,
+      envPath: paths.envPath,
+      nodePath: commands.which("node"),
+    }),
+  );
   runner.writeFile(
     path.join(paths.systemdDir, "cloudx-asr.service"),
     renderAsrService({

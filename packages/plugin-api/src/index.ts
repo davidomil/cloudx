@@ -129,6 +129,9 @@ export interface PluginSession {
   write?(data: string): void;
   resize?(cols: number, rows: number): void;
   stop?(): void;
+  terminate?(): Promise<void>;
+  detach?(): void;
+  restoreInput?(): Record<string, unknown>;
   applyRuntimeContext?(runtimeContext?: WorkspaceRuntimeContext): Promise<Record<string, unknown>> | Record<string, unknown>;
   snapshot(): PluginSessionSnapshot;
   voiceContext(): Promise<PluginVoiceContext> | PluginVoiceContext;
@@ -231,6 +234,7 @@ export interface WorkspacePlugin {
   configFields?: ConfigFieldDescriptor[];
   defaultTitleContext?(input: { cwd: string; initialInput?: Record<string, unknown> }): string | undefined;
   createSession(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;
+  restoreSession?(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;
   descriptor(): PluginDescriptor;
 }
 

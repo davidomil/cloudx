@@ -219,7 +219,7 @@ describe("choosing the service owned by this checkout", () => {
     Object.assign(fixture.properties, overrides);
     expect(() => inspectUpdateTarget(fixture)).toThrow();
   });
-  it.each(["cloudx-asr.service", "cloudx-documentation.service"])(
+  it.each(["cloudx-asr.service", "cloudx-documentation.service", "cloudx-terminal.service"])(
     "rejects an auxiliary %s loaded outside the standard unit directory",
     (name) => {
       const fixture = installation();
@@ -475,6 +475,47 @@ function plannedUpdate({ service = false, modelExists = false } = {}) {
 }
 
 describe("the complete updater plan", () => {
+  it.each([false, true])("preserves terminal processes when their service is already installed=%s", async installed => {
+    const fixture = plannedUpdate();
+    const terminalUnit = path.join(fixture.unitDir, "cloudx-terminal.service");
+    if (installed) fs.writeFileSync(terminalUnit, "existing terminal owner");
+    await runInstaller(fixture.options);
+    const serviceCommands = fixture.runner.commands
+      .filter(command => command.command === "systemctl" && !command.inspect)
+      .map(command => command.args);
+    expect(fixture.runner.writes.find(write => write.path === terminalUnit)?.contents)
+      .toContain("apps/server/dist/terminal/broker.js");
+    expect(serviceCommands).toContainEqual(["--user", "enable", "cloudx-terminal.service"]);
+    const start = serviceCommands.findIndex(args => args[1] === "start");
+    const restart = serviceCommands.findIndex(args => args[1] === "restart");
+    expect(serviceCommands[start]).toEqual(["--user", "start", "cloudx-terminal.service"]);
+    expect(start).toBeLessThan(restart);
+    expect(serviceCommands[restart]).toEqual([
+      "--user", "restart", "cloudx-asr.service", "cloudx-documentation.service", "cloudx.service",
+    ]);
+    expect(serviceCommands.some(args => ["stop", "restart"].includes(args[1]) && args.includes("cloudx-terminal.service")))
+      .toBe(false);
+  });
+  it("refreshes the persistent terminal unit without starting or stopping processes with --no-start", async () => {
+    const fixture = plannedUpdate();
+    await runInstaller({ ...fixture.options, noStart: true });
+    expect(fixture.runner.writes.some(write => write.path === path.join(fixture.unitDir, "cloudx-terminal.service"))).toBe(true);
+    expect(fixture.runner.commands.some(command => command.command === "systemctl" && ["start", "stop", "restart"].includes(command.args[1])))
+      .toBe(false);
+  });
+  it("leaves web services running if the persistent terminal service cannot start", async () => {
+    const fixture = plannedUpdate();
+    const run = fixture.runner.run.bind(fixture.runner);
+    fixture.runner.run = (command, args, options) => {
+      if (command === "systemctl" && args[1] === "start" && args[2] === "cloudx-terminal.service") {
+        throw new Error("Terminal service could not start");
+      }
+      return run(command, args, options);
+    };
+    await expect(runInstaller(fixture.options)).rejects.toThrow("Terminal service could not start");
+    expect(fixture.runner.commands.some(command => command.command === "systemctl" && command.args[1] === "restart"))
+      .toBe(false);
+  });
   it.each([
     [undefined, "https://127.0.0.1:3002"],
     ["::1", "https://[::1]:3002"],

@@ -129,7 +129,8 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       cwd: input.cwd,
       env: launchTemplate.env,
       cols: 100,
-      rows: 30
+      rows: 30,
+      ...(!input.tab.ownerPluginId ? { sessionId: input.tab.id } : {})
     });
     return new CodexTerminalSession(input.tab, terminalProcess, input.controls, {
       closeOnExit: !input.tab.ownerPluginId,
@@ -154,6 +155,31 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
           voiceSummary: nextLaunchTemplate.voiceSummary,
           templateName: nextLaunchTemplate.templateName,
           templateId: nextTemplate?.template.id
+        };
+      }
+    });
+  }
+
+  async restoreSession(input: CreatePluginSessionInput): Promise<PluginSession> {
+    if (!this.factory.attach) throw new Error("Codex terminal reconnection is unavailable.");
+    const terminal = await this.factory.attach(input.tab.id);
+    return new CodexTerminalSession(input.tab, terminal, input.controls, {
+      closeOnExit: true,
+      closeOnExitAfterMs: CODEX_CLOSE_ON_EXIT_GRACE_MS,
+      replayBytes: this.replayBytes,
+      submitDelayMs: CODEX_SUBMIT_DELAY_MS,
+      voiceKind: "codex-terminal",
+      voiceSummary: "Existing interactive Codex CLI session.",
+      applyRuntimeContext: async (runtimeContext) => {
+        const template = templateFromRuntimeContext(runtimeContext);
+        const launch = await materializeCodexTemplate(template, { ...process.env }, {
+          dataDir: this.dataDir, tabId: input.tab.id, cwd: input.cwd, resetOverlay: false, sources: this.sources
+        });
+        return {
+          prompt: buildCodexRuntimeUpdatePrompt(template, launch.overlay),
+          voiceSummary: launch.voiceSummary,
+          templateName: launch.templateName,
+          templateId: template?.template.id
         };
       }
     });
@@ -580,6 +606,7 @@ export class CodexTerminalSession implements PluginSession {
   private readyQuietTimer: ReturnType<typeof setTimeout> | undefined;
   private lastOutputAt = 0;
   private terminalClosed = false;
+  private readonly terminalSubscriptions: Array<() => void> = [];
 
   constructor(
     public readonly tab: WorkspaceTab,
@@ -589,7 +616,7 @@ export class CodexTerminalSession implements PluginSession {
   ) {
     this.status = tab.status;
     this.replayBytes = options.replayBytes ?? DEFAULT_TERMINAL_REPLAY_BYTES;
-    this.terminalProcess.onData((data) => {
+    this.terminalSubscriptions.push(this.terminalProcess.onData((data) => {
       this.lastOutputAt = Date.now();
       this.recentOutput = trimRecentOutput(`${this.recentOutput}${data}`, this.replayBytes);
       let sawCommandFinish = false;
@@ -603,8 +630,8 @@ export class CodexTerminalSession implements PluginSession {
       } else if (this.readiness.state === "starting" || this.readiness.state === "busy") {
         this.scheduleReadyAfterQuietOutput();
       }
-    });
-    this.terminalProcess.onExit((event) => {
+    }));
+    this.terminalSubscriptions.push(this.terminalProcess.onExit((event) => {
       this.terminalClosed = true;
       this.clearPendingSubmitTimers();
       this.clearReadyQuietTimer();
@@ -628,7 +655,14 @@ export class CodexTerminalSession implements PluginSession {
       } else {
         this.setStatus("failed", `Terminal exited with code ${event.exitCode}.`);
       }
+    }));
+    const disconnect = this.terminalProcess.onDisconnect?.((error) => {
+      this.clearPendingSubmitTimers();
+      this.clearReadyQuietTimer();
+      this.setReadiness("closed", error.message);
+      this.setStatus("failed", error.message);
     });
+    if (disconnect) this.terminalSubscriptions.push(disconnect);
   }
 
   onData(listener: (data: string) => void): () => void {
@@ -650,6 +684,24 @@ export class CodexTerminalSession implements PluginSession {
     this.clearPendingSubmitTimers();
     this.clearReadyQuietTimer();
     this.terminalProcess.kill();
+    this.setReadiness("closed", "Terminal was stopped.");
+    this.setStatus("stopped", "Terminal was stopped.");
+  }
+
+  detach(): void {
+    if (!this.terminalProcess.detach) throw new Error("This terminal cannot survive server shutdown.");
+    this.clearPendingSubmitTimers();
+    this.clearReadyQuietTimer();
+    for (const unsubscribe of this.terminalSubscriptions) unsubscribe();
+    this.terminalProcess.detach();
+  }
+
+  async terminate(): Promise<void> {
+    this.stopped = true;
+    this.clearPendingSubmitTimers();
+    this.clearReadyQuietTimer();
+    await this.terminalProcess.terminate();
+    this.terminalClosed = true;
     this.setReadiness("closed", "Terminal was stopped.");
     this.setStatus("stopped", "Terminal was stopped.");
   }

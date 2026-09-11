@@ -127,6 +127,10 @@ class LocalWebSession implements PluginSession {
     };
   }
 
+  restoreInput(): Record<string, unknown> {
+    return { url: this.state.url };
+  }
+
   voiceContext(): PluginVoiceContext {
     const voiceUrl = this.state.url ? redactLocalWebUrlForVoice(this.state.url) : undefined;
     return {

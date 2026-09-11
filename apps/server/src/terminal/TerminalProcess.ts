@@ -5,8 +5,19 @@ export interface TerminalProcess {
   resize(cols: number, rows: number): void;
   kill(): void;
   terminate(): Promise<void>;
+  detach?(): void;
+  onDisconnect?(listener: (error: Error) => void): () => void;
+}
+
+export interface TerminalSpawnOptions {
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  cols: number;
+  rows: number;
+  sessionId?: string;
 }
 
 export interface TerminalProcessFactory {
-  spawn(command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; cols: number; rows: number }): Promise<TerminalProcess>;
+  spawn(command: string, args: string[], options: TerminalSpawnOptions): Promise<TerminalProcess>;
+  attach?(sessionId: string): Promise<TerminalProcess>;
 }

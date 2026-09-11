@@ -41,13 +41,23 @@ export class StandardTerminalPlugin implements WorkspacePlugin {
       cwd: input.cwd,
       env: buildShellIntegrationEnv(env, shell),
       cols: 100,
-      rows: 30
+      rows: 30,
+      ...(!input.tab.ownerPluginId ? { sessionId: input.tab.id } : {})
     });
     return new CodexTerminalSession(input.tab, terminalProcess, input.controls, {
       closeOnExit: false,
       replayBytes: this.replayBytes,
       voiceKind: "standard-terminal",
       voiceSummary: "Interactive shell terminal. Translate natural-language shell requests into concise shell commands before typing."
+    });
+  }
+
+  async restoreSession(input: CreatePluginSessionInput) {
+    if (!this.factory.attach) throw new Error("Terminal reconnection is unavailable.");
+    return new CodexTerminalSession(input.tab, await this.factory.attach(input.tab.id), input.controls, {
+      closeOnExit: false,
+      replayBytes: this.replayBytes,
+      voiceKind: "standard-terminal"
     });
   }
 }

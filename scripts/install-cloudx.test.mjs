@@ -43,6 +43,7 @@ import {
   renderAsrService,
   renderCloudxService,
   renderDocumentationService,
+  renderTerminalService,
   renderEnvFile,
   resolveDeviceConfig,
   runInstaller,
@@ -691,6 +692,27 @@ describe("install-cloudx helpers", () => {
         CLOUDX_ASSISTANT_BIN: "/usr/bin/codex",
       }),
     ).toBe("CLOUDX_PORT=3001\nCLOUDX_ASSISTANT_BIN=/usr/bin/codex\n");
+  });
+
+  it("gives persistent terminals their own service without tying their lifetime to the web service", () => {
+    const service = renderTerminalService({
+      repoRoot: "/repo",
+      envPath: "/home/me/.config/cloudx/cloudx.env",
+      nodePath: "/usr/bin/node",
+    });
+    expect(service).toContain("Type=notify\nNotifyAccess=all");
+    expect(service).toContain("WorkingDirectory=/repo");
+    expect(service).toContain("EnvironmentFile=/home/me/.config/cloudx/cloudx.env");
+    expect(service).toContain("ExecStart=/usr/bin/node /repo/apps/server/dist/terminal/broker.js");
+    expect(service).not.toMatch(/PartOf=|BindsTo=|KillMode=/);
+    const web = renderCloudxService({
+      repoRoot: "/repo",
+      envPath: "/home/me/.config/cloudx/cloudx.env",
+      nodePath: "/usr/bin/node",
+      npmPath: "/usr/bin/npm",
+    });
+    expect(web.split("\n").find(line => line.startsWith("After="))).toContain("cloudx-terminal.service");
+    expect(web.split("\n").find(line => line.startsWith("Wants="))).toContain("cloudx-terminal.service");
   });
 
   it("builds tool path entries from the assistant command and npm global prefix", () => {
@@ -1381,6 +1403,10 @@ describe("runInstaller dry-run", () => {
       "cloudx-asr.service",
       "cloudx-documentation.service",
       "cloudx.service",
+      "cloudx-terminal.service",
+    ]);
+    expect(planned).toContainEqual([
+      "systemctl", "--user", "start", "cloudx-terminal.service",
     ]);
     expect(planned).toContainEqual([
       "systemctl",
@@ -1489,6 +1515,7 @@ describe("runInstaller dry-run", () => {
           "cloudx-asr.service",
           "cloudx-documentation.service",
           "cloudx.service",
+          "cloudx-terminal.service",
         ],
         [
           "systemctl",
@@ -1497,9 +1524,11 @@ describe("runInstaller dry-run", () => {
           "cloudx-asr.service",
           "cloudx-documentation.service",
           "cloudx.service",
+          "cloudx-terminal.service",
         ],
         ["rm", "-rf", "/home/me/.config/systemd/user/cloudx.service"],
         ["rm", "-rf", "/home/me/.config/systemd/user/cloudx-asr.service"],
+        ["rm", "-rf", "/home/me/.config/systemd/user/cloudx-terminal.service"],
         [
           "rm",
           "-rf",
@@ -1611,6 +1640,7 @@ describe("runInstaller dry-run", () => {
           "cloudx-asr.service",
           "cloudx-documentation.service",
           "cloudx.service",
+          "cloudx-terminal.service",
         ]],
         cwd: "/repo",
       },

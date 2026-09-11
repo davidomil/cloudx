@@ -1110,7 +1110,7 @@ export function parseCreateTabResponse(value: unknown): CreateTabResponse {
   };
 }
 
-function isCompleteWorkspaceTab(value: unknown): value is WorkspaceTab {
+export function isCompleteWorkspaceTab(value: unknown): value is WorkspaceTab {
   return (
     isRecord(value) &&
     typeof value.id === "string" &&
