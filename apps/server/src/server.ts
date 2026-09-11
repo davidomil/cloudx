@@ -44,6 +44,8 @@ import { LOCAL_WEB_PROXY_MAX_BODY_BYTES, LocalWebProxy } from "./localWebProxy.j
 import { contentDispositionAttachment, FileTransferService, FileUploadTooLargeError } from "./fileTransfer.js";
 import { CodexTerminalPlugin } from "./plugins/CodexTerminalPlugin.js";
 import { CodexStateSources } from "./plugins/CodexStateSources.js";
+import { CodexSettingsPlugin } from "./plugins/CodexSettingsPlugin.js";
+import { CodexSettingsService } from "./plugins/CodexSettingsService.js";
 import { FileBrowserPlugin } from "./plugins/FileBrowserPlugin.js";
 import { LocalWebPlugin } from "./plugins/LocalWebPlugin.js";
 import { StandardTerminalPlugin } from "./plugins/StandardTerminalPlugin.js";
@@ -1231,6 +1233,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   let sessions: SessionStore | undefined;
   let documentationEnrichment: DocumentationEnrichmentService | undefined;
   plugins.register(new CodexTerminalPlugin(terminalFactory, config.terminalReplayBytes, config.dataDir, codexStateSources));
+  plugins.register(new CodexSettingsPlugin(new CodexSettingsService(codexStateSources)));
   plugins.register(new StandardTerminalPlugin(terminalFactory, config.terminalReplayBytes));
   plugins.register(new FileBrowserPlugin(pathPolicy));
   plugins.register(new LocalWebPlugin());

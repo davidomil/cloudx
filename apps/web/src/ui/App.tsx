@@ -36,6 +36,7 @@ import {
 } from "../api.js";
 import { createBrowserId } from "./browserId.js";
 import { ControlButton } from "./Control.js";
+import { CodexSettingsPanel } from "./CodexSettingsPanel.js";
 import { activeAutomationTriggerIds as triggerIdsFromAutomation, type TriggerEmitter } from "./automationTriggers.js";
 import { disposeFileBrowserPanelStatesExcept } from "./fileBrowserPanelState.js";
 import { disposeFileBrowserTransfersExcept } from "./fileBrowserTransfers.js";
@@ -1228,6 +1229,7 @@ export function App() {
       );
     },
     [PLUGIN_WEBVIEW_RENDERER]: (contribution, context) => <PluginWebviewPanel contribution={contribution} context={context} />,
+    "codex-settings.panel": (_contribution, context) => context.callHook ? <CodexSettingsPanel callHook={context.callHook} /> : <div className="empty-pane">Codex settings hooks are unavailable.</div>,
     "jira.panel": (_contribution, context) => context.callHook ? (
       <Suspense fallback={<div className="empty-pane">Loading Jira...</div>}>
         <JiraPanel callHook={context.callHook} activeTriggerIds={activeAutomationTriggerIds} emitTrigger={handleEmitTrigger} />

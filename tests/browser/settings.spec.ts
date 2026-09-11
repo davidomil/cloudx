@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { parse } from "smol-toml";
 
 const repoRoot = path.resolve(import.meta.dirname, "../..");
 let testRoot: string;
@@ -261,6 +262,103 @@ test("drafts survive tab switches and search, Save persists them, and Cancel dis
   ).toHaveValue("30");
 });
 
+test("Codex Settings saves shared defaults, keeps them after reload, and can restore model defaults", async ({
+  page,
+}, testInfo) => {
+  const configPath = path.join(testRoot, "codex-home", "config.toml");
+  const settings = await openCodexSettings(page);
+  const model = settings.getByRole("textbox", { name: "Default model" });
+  const fastMode = settings.getByRole("combobox", { name: "Fast mode" });
+  const save = settings.getByRole("button", { name: "Save", exact: true });
+  await expect(model).toHaveValue("");
+  await expect(fastMode).toHaveValue("");
+  await expect(save).toBeDisabled();
+
+  await model.fill("browser-fixture-model");
+  await fastMode.selectOption({ label: "On" });
+  await expectCodexSettingsFits(page);
+  await save.click();
+  await expect(settings.getByRole("status")).toHaveText(
+    "Global Codex settings saved.",
+  );
+  expect(parse(await fs.readFile(configPath, "utf8"))).toEqual({
+    model: "browser-fixture-model",
+    service_tier: "priority",
+    features: { fast_mode: true },
+  });
+  await captureSample(page, testInfo, "codex-settings-saved");
+
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(model).toHaveValue("browser-fixture-model");
+  await expect(fastMode).toHaveValue("priority");
+  await expect(save).toBeDisabled();
+  await model.fill("");
+  await fastMode.selectOption({ label: "Model default" });
+  await save.click();
+  await expect(settings.getByRole("status")).toHaveText(
+    "Global Codex settings saved.",
+  );
+  expect(parse(await fs.readFile(configPath, "utf8"))).toEqual({
+    features: { fast_mode: true },
+  });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(model).toHaveValue("");
+  await expect(fastMode).toHaveValue("");
+});
+
+test("Codex Settings preserves a stale draft and external edits until Reload reads the latest settings", async ({
+  page,
+}, testInfo) => {
+  const configPath = path.join(testRoot, "codex-home", "config.toml");
+  const unrelatedSettings =
+    '# Keep this profile unchanged.\n[profiles.review]\nmodel = "profile-model"\n';
+  await fs.writeFile(
+    configPath,
+    `model = "initial-model"\nservice_tier = "default"\n${unrelatedSettings}`,
+  );
+  const settings = await openCodexSettings(page);
+  const model = settings.getByRole("textbox", { name: "Default model" });
+  const fastMode = settings.getByRole("combobox", { name: "Fast mode" });
+  const save = settings.getByRole("button", { name: "Save", exact: true });
+  await expect(model).toHaveValue("initial-model");
+  await expect(fastMode).toHaveValue("default");
+  await model.fill("unsaved-draft-model");
+  await fastMode.selectOption({ label: "On" });
+
+  const externalConfig = `model = "external-model"\nservice_tier = "flex"\n${unrelatedSettings}`;
+  await fs.writeFile(configPath, externalConfig);
+  await save.click();
+  await expect(settings.getByRole("alert")).toHaveText(
+    "Shared Codex settings changed. Reload before saving again.",
+  );
+  await expect(model).toHaveValue("unsaved-draft-model");
+  await expect(fastMode).toHaveValue("priority");
+  await expect(save).toBeEnabled();
+  expect(await fs.readFile(configPath, "utf8")).toBe(externalConfig);
+  await expectCodexSettingsFits(page);
+  await settings.getByRole("alert").scrollIntoViewIfNeeded();
+  await captureSample(page, testInfo, "codex-settings-stale-draft");
+
+  await settings.getByRole("button", { name: "Reload", exact: true }).click();
+  await expect(model).toHaveValue("external-model");
+  await expect(fastMode).toHaveValue("flex");
+  await expect(settings.getByRole("alert")).toHaveCount(0);
+  await expect(save).toBeDisabled();
+  await fastMode.selectOption({ label: "Off" });
+  await save.click();
+  await expect(settings.getByRole("status")).toHaveText(
+    "Global Codex settings saved.",
+  );
+  const savedConfig = await fs.readFile(configPath, "utf8");
+  expect(parse(savedConfig)).toEqual({
+    model: "external-model",
+    service_tier: "default",
+    features: { fast_mode: true },
+    profiles: { review: { model: "profile-model" } },
+  });
+  expect(savedConfig).toContain(unrelatedSettings);
+});
+
 for (const viewport of [
   { width: 667, height: 375 },
   { width: 1024, height: 375 },
@@ -324,6 +422,56 @@ for (const viewport of [
     await expect(scale).toHaveValue("135");
     await scale.click();
   });
+}
+
+async function openCodexSettings(page: Page) {
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await page
+    .locator(".workspace-pane.active")
+    .getByTitle("Add tab to this pane")
+    .click();
+  await page
+    .getByRole("combobox", { name: "Plugin", exact: true })
+    .selectOption({
+      label: "Codex Settings",
+    });
+  await expect(page.getByLabel("New tab directory")).toHaveCount(0);
+  await page.getByRole("button", { name: "Create", exact: true }).click();
+  const settings = page.getByRole("region", {
+    name: "Global Codex settings",
+    exact: true,
+  });
+  await expect(settings).toBeVisible();
+  await expect(settings).toHaveAttribute("aria-busy", "false");
+  return settings;
+}
+
+async function expectCodexSettingsFits(page: Page) {
+  const settings = page.getByRole("region", {
+    name: "Global Codex settings",
+    exact: true,
+  });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth + 1,
+    ),
+  ).toBe(true);
+  expect(
+    await settings.evaluate(
+      (panel) => panel.scrollWidth <= panel.clientWidth + 1,
+    ),
+  ).toBe(true);
+  for (const control of [
+    settings.getByRole("textbox", { name: "Default model" }),
+    settings.getByRole("combobox", { name: "Fast mode" }),
+    settings.getByRole("button", { name: "Save", exact: true }),
+    settings.getByRole("button", { name: "Reload", exact: true }),
+  ]) {
+    await control.scrollIntoViewIfNeeded();
+    await expect(control).toBeInViewport({ ratio: 1 });
+    await control.click({ trial: true });
+    expect((await control.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+  }
 }
 
 async function openSettings(page: Page, isMobile: boolean) {
