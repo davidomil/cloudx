@@ -196,9 +196,13 @@ export class DocumentationEnrichmentService {
   }
 
   private async enrichDocument(document: IngestedDocumentRef, source: DocumentationEnrichmentSource, signal?: AbortSignal, onlyPending = false): Promise<Record<string, unknown>> {
+    const extractionRevision = onlyPending ? document.extractionRevision : undefined;
+    if (onlyPending && (!extractionRevision || extractionRevision.length !== 32 || !/^[0-9a-f]{32}$/.test(extractionRevision))) {
+      throw new Error("Background enrichment requires a valid extraction revision.");
+    }
     const skillIds = configuredSkillIds(this.options.config.getPluginConfig(DOCUMENTATION_PLUGIN_ID)[DOCUMENTATION_AI_ENRICHMENT_SKILLS_KEY]);
     const skills = await this.resolveSkills(skillIds, signal);
-    const fullDocument = await this.enrichmentDocument(document.documentId, signal);
+    const fullDocument = await this.enrichmentDocument(document.documentId, signal, extractionRevision);
     if (onlyPending && (fullDocument.state !== "active" || recordsArray(fullDocument.chunks).some((chunk) => chunk.chunk_origin === "ai"))) {
       return { documentId: document.documentId, status: "unchanged" };
     }
@@ -238,6 +242,7 @@ export class DocumentationEnrichmentService {
       }
       const enrichment = {
         documentId: document.documentId,
+        ...(extractionRevision ? { extractionRevision } : {}),
         spans: output.spans,
         model,
         skillIds,
@@ -264,7 +269,7 @@ export class DocumentationEnrichmentService {
     }
   }
 
-  private async enrichmentDocument(documentId: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+  private async enrichmentDocument(documentId: string, signal?: AbortSignal, extractionRevision?: string): Promise<Record<string, unknown>> {
     let chunkOffset = 0;
     let artifactOffset = 0;
     let needsChunks = true;
@@ -290,6 +295,9 @@ export class DocumentationEnrichmentService {
         ? await this.options.client.getDocument(input, { signal })
         : await this.options.client.getDocument(input);
       const nextDocument = getRecord(response.document, "document");
+      if (extractionRevision && nextDocument.extraction_revision !== extractionRevision) {
+        throw new Error("Document extraction was replaced before enrichment could read its evidence.");
+      }
       document ??= nextDocument;
       if (loadChunks) {
         const nextChunks = recordsArray(nextDocument.chunks);
@@ -571,6 +579,7 @@ export class DocumentationEnrichmentService {
 
 interface IngestedDocumentRef {
   documentId: string;
+  extractionRevision?: string;
 }
 
 interface ArtifactEvidence {
@@ -712,7 +721,10 @@ function uniqueDocuments(response: Record<string, unknown>): IngestedDocumentRef
   const unique = new Map<string, IngestedDocumentRef>();
   for (const document of documents) {
     if (typeof document.documentId === "string" && document.documentId.trim()) {
-      unique.set(document.documentId, { documentId: document.documentId });
+      unique.set(document.documentId, {
+        documentId: document.documentId,
+        extractionRevision: typeof document.extractionRevision === "string" ? document.extractionRevision : undefined,
+      });
     }
   }
   return [...unique.values()];

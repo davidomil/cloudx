@@ -639,7 +639,8 @@ class DocumentationArchive:
             raise ArchiveError("chunkIds cannot be combined with chunkOffset or chunkLimit.")
         artifact_limit = normalized_window_value(artifact_limit, "artifact_limit") if artifact_limit is not None else None
         chunk_text_max_chars = normalized_window_value(chunk_text_max_chars, "chunk_text_max_chars") if chunk_text_max_chars is not None else None
-        with self._connect() as db:
+        with self._write_lock, self._connect() as db:
+            db.execute("BEGIN")
             document = db.execute("SELECT * FROM documents WHERE document_id = ?", (document_id,)).fetchone()
             if not document:
                 raise ArchiveError(f"Unknown document: {document_id}")
@@ -685,13 +686,13 @@ class DocumentationArchive:
                 "SELECT status, error, updated_at AS updatedAt FROM document_enrichment_outcomes WHERE document_id = ?",
                 (document_id,),
             ).fetchone()
+            artifact_window = snapshot_artifact_window(document_id, self.root / document["snapshot_path"], offset=artifact_offset, limit=artifact_limit)
         result = dict(document)
         result["chunks"] = [document_chunk_dict(row, chunk_text_max_chars) for row in chunks]
         result["chunkWindow"] = chunk_window
         result["enrichments"] = [dict(row) for row in enrichments]
         result["events"] = [dict(row) for row in events]
         result["backgroundEnrichment"] = dict(background_enrichment) if background_enrichment else None
-        artifact_window = self.document_artifact_window(document_id, offset=artifact_offset, limit=artifact_limit)
         result["artifacts"] = artifact_window.artifacts
         result["artifactWindow"] = window_metadata(artifact_offset, artifact_limit, artifact_window.total)
         return result
@@ -1222,7 +1223,10 @@ class DocumentationArchive:
         skill_ids: list[str],
         summary: str = "",
         payload: dict[str, Any] | None = None,
+        extraction_revision: str | None = None,
     ) -> dict:
+        if extraction_revision is not None and (not isinstance(extraction_revision, str) or not re.fullmatch(r"[0-9a-f]{32}", extraction_revision)):
+            raise ArchiveError("Enrichment requires a valid extraction revision.")
         chunks = chunk_spans(spans)
         if not chunks:
             raise ArchiveError("Enrichment did not produce extractable text.")
@@ -1232,11 +1236,13 @@ class DocumentationArchive:
         now = timestamp()
 
         def enrich(db: sqlite3.Connection) -> None:
-            document = db.execute("SELECT state FROM documents WHERE document_id = ?", (document_id,)).fetchone()
+            document = db.execute("SELECT state, extraction_revision FROM documents WHERE document_id = ?", (document_id,)).fetchone()
             if not document:
                 raise ArchiveError(f"Unknown document: {document_id}")
             if document["state"] != ACTIVE_STATE:
                 raise ArchiveError("Only active documents can be enriched.")
+            if extraction_revision is not None and document["extraction_revision"] != extraction_revision:
+                raise ArchiveError("Enrichment extraction revision no longer matches the document.")
             db.execute("DELETE FROM document_enrichment_outcomes WHERE document_id = ?", (document_id,))
             db.execute("DELETE FROM chunks WHERE document_id = ? AND chunk_origin = ?", (document_id, "ai"))
             cursor = db.execute(

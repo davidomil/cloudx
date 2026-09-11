@@ -41,7 +41,7 @@ const recordings = [
 describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))(
   "archived media through the real indexer and media tools",
   () => {
-    it.each(["failed", "skipped"] as const)("enriches corrected extraction after an older model attempt is %s", async (outcome) => {
+    it.each(["failed", "skipped", "successful"] as const)("enriches corrected extraction after an older model attempt is %s", async (outcome) => {
       const fixture = await startArchive();
       let worker: DocumentationBackgroundEnrichment | undefined;
       let releaseModel!: () => void;
@@ -54,6 +54,10 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
         enrichment.run.mockImplementationOnce(async () => {
           await modelGate;
           if (outcome === "failed") throw new Error("The older model attempt failed.");
+          if (outcome === "successful") return {
+            summary: "Enrichment from the replaced text extraction.", metadata: [], warnings: [],
+            spans: [{ locator: "ai:metadata", text: "EXCLUDED-SCRIPT" }],
+          };
           return { summary: "No enrichment from the older attempt.", metadata: [], warnings: [], spans: [] };
         });
         const hook = enrichment.plugin.hooks.find((candidate) => candidate.id === "documentation.ingest.path")!;
@@ -70,6 +74,7 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
           .resolves.toMatchObject({ kind: "path", firstDocumentId: documentId, documentCount: 1 });
         const corrected = await fixture.document(documentId);
         expect(corrected.content_sha256).toBe(original.content_sha256);
+        expect(corrected.extraction_revision).not.toBe(original.extraction_revision);
         expect(corrected.source_type).toBe("website");
         expect(corrected.chunks).toMatchObject([{ chunk_origin: "source", locator: "html", text: expect.stringContaining("CORRECTED-GUIDE") }]);
         expect(corrected.chunks[0].text).not.toContain("EXCLUDED-SCRIPT");
@@ -84,6 +89,9 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
         await vi.waitFor(async () => expect((await fixture.document(documentId)).chunks).toEqual(expect.arrayContaining([
           expect.objectContaining({ chunk_origin: "ai", text: "REPLACEMENT-AI-2" }),
         ])), { timeout: 10_000 });
+        const enriched = await fixture.document(documentId);
+        expect(JSON.stringify(enriched.chunks)).not.toContain("EXCLUDED-SCRIPT");
+        expect(enriched.enrichments).toHaveLength(1);
         await expect(fixture.client.nextPendingEnrichment()).resolves.toBeUndefined();
         expect(enrichment.transcribeFile).not.toHaveBeenCalled();
         expect(enrichment.mediaProcessLauncher).not.toHaveBeenCalled();
@@ -615,6 +623,7 @@ interface ArchivedDocument {
   collection: string;
   tags_json: string;
   content_sha256: string;
+  extraction_revision: string;
   chunks: Array<{ locator: string; text: string; chunk_origin: string }>;
   enrichments: Array<{ payload_json: string }>;
 }

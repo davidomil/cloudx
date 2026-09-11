@@ -26,6 +26,7 @@ export interface DocumentationUploadFileInput {
 
 export interface DocumentationEnrichInput {
   documentId: string;
+  extractionRevision?: string;
   spans: Array<{ locator: string; text: string }>;
   model: string;
   skillIds: string[];

@@ -2575,6 +2575,7 @@ describe("buildServer", () => {
     vi.spyOn(services.documentation!, "getDocument").mockResolvedValue({
       document: {
         documentId: "closing-document",
+        extraction_revision: "e".repeat(32),
         state: "active",
         chunks: [],
         artifacts: [],

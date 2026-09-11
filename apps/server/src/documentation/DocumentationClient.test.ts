@@ -453,7 +453,7 @@ describe("DocumentationClient", () => {
     await expect(client.search({ query: "" })).rejects.toThrow("Search query is required.");
   });
 
-  it("posts AI enrichment spans to the document enrich endpoint", async () => {
+  it.each([undefined, "e".repeat(32)])("posts AI enrichment spans with extraction revision %s", async (extractionRevision) => {
     let requestUrl = "";
     let requestBody = "";
     const url = await startServer((request, response) => {
@@ -470,6 +470,7 @@ describe("DocumentationClient", () => {
 
     const result = await client.enrichDocument({
       documentId: "doc-1",
+      extractionRevision,
       spans: [{ locator: "ai:metadata", text: "Metadata summary." }],
       model: "gpt-test",
       skillIds: ["documentation-enrich-metadata"],
@@ -480,6 +481,7 @@ describe("DocumentationClient", () => {
     expect(result).toEqual({ document: { documentId: "doc-1" } });
     expect(requestUrl).toBe("/docs/documents/doc-1/enrich");
     expect(JSON.parse(requestBody)).toEqual({
+      ...(extractionRevision ? { extractionRevision } : {}),
       spans: [{ locator: "ai:metadata", text: "Metadata summary." }],
       model: "gpt-test",
       skillIds: ["documentation-enrich-metadata"],

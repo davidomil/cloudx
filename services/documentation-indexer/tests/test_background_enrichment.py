@@ -4,6 +4,7 @@ import re
 from fastapi.testclient import TestClient
 import pytest
 
+import cloudx_documentation_indexer.archive as archive_module
 from cloudx_documentation_indexer import DocumentationArchive, create_app
 from cloudx_documentation_indexer.archive import ARCHIVE_IMPORT_REPLACE_CONFIRMATION, ArchiveError
 from cloudx_documentation_indexer.extraction import ExtractedSpan
@@ -198,6 +199,127 @@ def test_replaced_extraction_rejects_old_outcomes_and_accepts_its_own(tmp_path: 
     assert accepted.json()["backgroundEnrichment"]["status"] == status
     assert restarted.pending_enrichment() == []
     assert restarted.get_document(document.document_id)["backgroundEnrichment"]["error"] == "Current extraction failed."
+
+
+@pytest.mark.parametrize("replacement", ["correct-source-type", "same-source-type", "reanalyze"])
+def test_replaced_extraction_rejects_old_success_and_accepts_its_own(tmp_path: Path, replacement: str) -> None:
+    app = create_app(tmp_path / "archive")
+    client = TestClient(app)
+    archive = app.state.archive
+    source_path = tmp_path / "retained-source.txt"
+    source_path.write_text("<html><body>Release reset.<script>EXCLUDED-SCRIPT</script></body></html>")
+    document = archive.ingest_path(source_path, source_type="text")[0]
+    old_revision = archive.pending_enrichment()[0]["extractionRevision"]
+    if replacement == "reanalyze":
+        archive.reanalyze_document(document.document_id)
+    else:
+        archive.ingest_path(source_path, source_type="website" if replacement == "correct-source-type" else "text")
+    pending = archive.pending_enrichment()
+    current = archive.get_document(document.document_id)
+    generation = archive._active_index_generation()
+    endpoint = f"/documents/{document.document_id}/enrich"
+    payload = {"model": "test", "spans": [{"locator": "ai", "text": "Obsolete EXCLUDED-SCRIPT evidence."}]}
+
+    stale = client.post(endpoint, json={**payload, "extractionRevision": old_revision})
+
+    assert stale.status_code == 400
+    assert "revision" in stale.json()["detail"]
+    assert archive.get_document(document.document_id) == current
+    assert archive.pending_enrichment() == pending
+    assert archive._active_index_generation() == generation
+    restarted = DocumentationArchive(tmp_path / "archive")
+    assert restarted.get_document(document.document_id) == current
+    assert restarted.pending_enrichment() == pending
+
+    accepted = client.post(endpoint, json={
+        "model": "test", "extractionRevision": pending[0]["extractionRevision"],
+        "spans": [{"locator": "ai", "text": "Corrected release reset evidence."}],
+    })
+
+    assert accepted.status_code == 200
+    assert [chunk["text"] for chunk in accepted.json()["document"]["chunks"] if chunk["chunk_origin"] == "ai"] == ["Corrected release reset evidence."]
+    assert restarted.pending_enrichment() == []
+    assert restarted.search("Corrected release reset evidence")[0]["documentId"] == document.document_id
+
+
+def test_rejected_old_success_preserves_current_enrichment_and_outcome(tmp_path: Path) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+    document = archive.ingest_text(text="Source for explicit processing.")
+    old_revision = archive.pending_enrichment()[0]["extractionRevision"]
+    archive.reanalyze_document(document.document_id)
+    revision = archive.pending_enrichment()[0]["extractionRevision"]
+    archive.record_enrichment_outcome(document.document_id, extraction_revision=revision, status="failed", error="Current extraction failed.")
+    for current_enriched in [False, True]:
+        if current_enriched:
+            archive.enrich_document(document.document_id, model="test", skill_ids=[], spans=[ExtractedSpan("Explicit current evidence.", "ai")])
+        current = archive.get_document(document.document_id)
+        generation = archive._active_index_generation()
+
+        with pytest.raises(ArchiveError, match="revision"):
+            archive.enrich_document(document.document_id, extraction_revision=old_revision, model="test", skill_ids=[], spans=[ExtractedSpan("Obsolete evidence.", "ai")])
+
+        assert archive.get_document(document.document_id) == current
+        assert archive._active_index_generation() == generation
+
+
+@pytest.mark.parametrize("revision", ["", "a" * 31, "a" * 33, "A" * 32, "z" * 32, 7, ["a" * 32]])
+def test_successful_enrichment_validates_a_supplied_extraction_revision(tmp_path: Path, revision) -> None:
+    app = create_app(tmp_path / "archive")
+    client = TestClient(app)
+    archive = app.state.archive
+    document = archive.ingest_text(text="Validation source.")
+    current = archive.get_document(document.document_id)
+
+    response = client.post(f"/documents/{document.document_id}/enrich", json={
+        "model": "test", "extractionRevision": revision, "spans": [{"locator": "ai", "text": "Derived evidence."}],
+    })
+
+    assert response.status_code == 422
+    with pytest.raises(ArchiveError, match="revision"):
+        archive.enrich_document(document.document_id, extraction_revision=revision, model="test", skill_ids=[], spans=[ExtractedSpan("Derived evidence.", "ai")])
+    assert archive.get_document(document.document_id) == current
+
+
+def test_document_evidence_and_artifact_snapshot_match_its_extraction_revision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    archive = DocumentationArchive(tmp_path / "archive")
+    document = archive.ingest_text(text="Original extraction.")
+    original = archive.get_document(document.document_id)
+    connect = archive._connect
+    with connect() as db:
+        db.execute("PRAGMA journal_mode = WAL")
+    replacement = archive._store_snapshot(b"Replacement extraction.", "replacement.txt")
+    changed = False
+    artifact_snapshots = []
+    read_artifacts = archive_module.snapshot_artifact_window
+
+    def replace_between_document_and_chunks(statement: str) -> None:
+        nonlocal changed
+        if changed or not statement.startswith("SELECT COUNT(*) FROM chunks"):
+            return
+        changed = True
+        with connect() as writer:
+            writer.execute("UPDATE documents SET extraction_revision = ?, snapshot_path = ? WHERE document_id = ?", ("b" * 32, replacement.relative_to(archive.root).as_posix(), document.document_id))
+            writer.execute("UPDATE chunks SET text = ? WHERE document_id = ?", ("Replacement extraction.", document.document_id))
+
+    def connect_with_concurrent_replacement():
+        db = connect()
+        db.set_trace_callback(replace_between_document_and_chunks)
+        return db
+
+    def observe_artifact_snapshot(document_id, snapshot_path, **window):
+        artifact_snapshots.append(snapshot_path.relative_to(archive.root).as_posix())
+        return read_artifacts(document_id, snapshot_path, **window)
+
+    monkeypatch.setattr(archive, "_connect", connect_with_concurrent_replacement)
+    monkeypatch.setattr(archive_module, "snapshot_artifact_window", observe_artifact_snapshot)
+
+    evidence = archive.get_document(document.document_id)
+
+    assert changed
+    assert evidence == original
+    assert artifact_snapshots == [original["snapshot_path"]]
+    with connect() as db:
+        assert db.execute("SELECT extraction_revision FROM documents WHERE document_id = ?", (document.document_id,)).fetchone()[0] == "b" * 32
 
 
 @pytest.mark.parametrize("operation", ["ingest", "reanalyze"])

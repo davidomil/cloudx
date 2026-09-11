@@ -88,6 +88,7 @@ class EnrichDocumentRequest(BaseModel):
     skill_ids: list[str] = Field(default_factory=list, alias="skillIds")
     summary: str = ""
     payload: dict = Field(default_factory=dict)
+    extraction_revision: str | None = Field(default=None, alias="extractionRevision", pattern=r"^[0-9a-f]{32}$", min_length=32, max_length=32)
 
 
 class EnrichmentOutcomeRequest(BaseModel):
@@ -283,6 +284,7 @@ def create_app(root: str | Path | None = None) -> FastAPI:
                     skill_ids=request.skill_ids,
                     summary=request.summary,
                     payload=request.payload,
+                    extraction_revision=request.extraction_revision,
                 )
             )
         }
