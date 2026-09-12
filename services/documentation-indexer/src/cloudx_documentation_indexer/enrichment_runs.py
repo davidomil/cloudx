@@ -29,6 +29,10 @@ def fingerprint(value: str) -> str:
     return value
 
 
+def valid_run_id(value) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"run_[0-9a-f]{32}", value) is not None
+
+
 class EnrichmentRuns:
     lease_seconds = 90
 
@@ -49,6 +53,8 @@ class EnrichmentRuns:
             self._document(db, document_id, extraction_revision)
             existing = db.execute("SELECT * FROM enrichment_runs WHERE document_id = ? AND extraction_revision = ? AND processor_fingerprint = ? ORDER BY created_at DESC LIMIT 1",
                                   (document_id, extraction_revision, processor_fingerprint)).fetchone()
+            if existing and not valid_run_id(existing["run_id"]):
+                raise EnrichmentRunError("Invalid enrichment run ID.")
             active = db.execute("SELECT * FROM enrichment_runs WHERE document_id = ? AND status = 'running'", (document_id,)).fetchone()
             if active and active["lease_until"] > time.time():
                 raise EnrichmentRunError("Document already has an active enrichment lease.")
@@ -122,7 +128,6 @@ class EnrichmentRuns:
             if db.execute("SELECT 1 FROM media_completion WHERE run_id = ?", (run_id,)).fetchone():
                 raise EnrichmentRunError("Completed media evidence is immutable.")
             document = self._document(db, document_id, extraction_revision)
-            root = (self.archive.root / document["snapshot_path"]).parent / "extracted"
             result = {"chunks": [], "artifacts": []}
             if transcript:
                 result["artifacts"].append(self._retain_transcript(db, document, run, transcript, transcript_json))
@@ -136,7 +141,7 @@ class EnrichmentRuns:
                 digest = hashlib.sha256(content).hexdigest()
                 identity = "media-" + run_id + "-" + hashlib.sha256((digest + str(frame.get("offsetSeconds"))).encode()).hexdigest()[:24]
                 relative = f"enrichment/{run_id}/{identity}.{format_name}"
-                path = root / relative
+                path = self._media_path(document, run_id, f"{identity}.{format_name}")
                 path.parent.mkdir(parents=True, exist_ok=True)
                 if not path.exists():
                     path.write_bytes(content)
@@ -156,7 +161,7 @@ class EnrichmentRuns:
         payload = {"schemaVersion": 1, "documentId": document["document_id"], "extractionRevision": run["extraction_revision"],
                    "producerRunId": run["run_id"], "sourceSha256": document["content_sha256"], "transcript": transcript}
         content = json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False).encode()
-        path = (self.archive.root / document["snapshot_path"]).parent / "extracted" / relative
+        path = self._media_path(document, run["run_id"], f"{identity}.json")
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():
             path.write_bytes(content)
@@ -167,6 +172,16 @@ class EnrichmentRuns:
         db.execute("INSERT OR IGNORE INTO document_artifacts VALUES(?,?,?,?,?,?,?)",
                    (document["document_id"], run["extraction_revision"], identity, 1000000, transcript["locator"], json.dumps(artifact), run["run_id"]))
         return artifact
+
+    def _media_path(self, document, run_id: str, filename: str) -> Path:
+        if not valid_run_id(run_id):
+            raise EnrichmentRunError("Invalid enrichment run ID.")
+        snapshot = (self.archive.root / document["snapshot_path"]).resolve()
+        root = snapshot.parent / "extracted" / "enrichment" / run_id
+        path = root / filename
+        if not snapshot.is_relative_to(self.archive.snapshots_dir.resolve()) or not path.resolve().is_relative_to(root):
+            raise EnrichmentRunError("Media evidence destination is outside its retained run directory.")
+        return path
 
     def media_window(self, run_id: str, *, lease_token: str, offset: int = 0, limit: int = 100) -> dict:
         if not 0 <= offset or not 1 <= limit <= 100:
@@ -308,6 +323,8 @@ class EnrichmentRuns:
         return document
 
     def _lease(self, db, run_id: str, token: str):
+        if not valid_run_id(run_id):
+            raise EnrichmentRunError("Invalid enrichment run ID.")
         run = db.execute("SELECT * FROM enrichment_runs WHERE run_id = ?", (run_id,)).fetchone()
         if not run or run["status"] != "running" or not secrets.compare_digest(run["lease_token"], token) or run["lease_until"] <= time.time():
             raise EnrichmentRunError("Enrichment lease is absent, expired, or fenced.")

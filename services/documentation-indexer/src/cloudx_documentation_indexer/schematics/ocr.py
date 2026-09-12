@@ -141,17 +141,20 @@ class LocalOcr:
         if not 1 <= max_scale <= 3:
             raise ValueError("OCR scaling must be between 1 and 3")
         settings = self.settings
-        if not settings.executable.is_file() or not os.access(settings.executable, os.X_OK):
-            raise OcrUnavailable("Configured schematic OCR executable is missing or not executable")
-        if not settings.model_path.is_file():
-            raise OcrUnavailable("Configured schematic OCR model does not exist")
-        with settings.model_path.open("rb") as handle:
-            digest = hashlib.file_digest(handle, "sha256").hexdigest()
-        if digest != settings.model_sha256:
-            raise OcrUnavailable("Configured schematic OCR model SHA-256 does not match")
+        try:
+            if not settings.executable.is_file() or not os.access(settings.executable, os.X_OK):
+                raise OcrUnavailable("Configured schematic OCR executable is missing or not executable")
+            if not settings.model_path.is_file():
+                raise OcrUnavailable("Configured schematic OCR model does not exist")
+            with settings.model_path.open("rb") as handle:
+                digest = hashlib.file_digest(handle, "sha256").hexdigest()
+            if digest != settings.model_sha256:
+                raise OcrUnavailable("Configured schematic OCR model SHA-256 does not match")
+            executable_digest = hashlib.sha256(settings.executable.read_bytes()).hexdigest()
+        except OSError as error:
+            raise OcrUnavailable(f"Cannot access configured schematic OCR assets: {error}") from error
         if image.width * image.height > 25_000_000:
             raise OcrUnavailable("Schematic OCR image exceeds the pixel limit")
-        executable_digest = hashlib.sha256(settings.executable.read_bytes()).hexdigest()
         with tempfile.TemporaryDirectory(prefix="cloudx-schematic-ocr-") as directory:
             root = Path(directory)
             version = self.run(root, [str(settings.executable), "--version"], "version", 5)

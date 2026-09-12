@@ -377,12 +377,16 @@ export class DocumentationEnrichmentService {
       const chunks = recordsArray(page.chunks);
       const artifacts = recordsArray(page.artifacts);
       if (chunks.length > ENRICHMENT_DOCUMENT_CHUNK_PAGE_SIZE || artifacts.length > ENRICHMENT_DOCUMENT_ARTIFACT_PAGE_SIZE) throw new Error("Documentation evidence response exceeded its page limit.");
-      needsChunks = windowHasMore(page.chunkWindow);
-      needsArtifacts = windowHasMore(page.artifactWindow);
-      if (needsChunks && !chunks.length) throw new Error("Documentation enrichment chunk window did not advance.");
-      if (needsArtifacts && !artifacts.length) throw new Error("Documentation enrichment artifact window did not advance.");
-      chunkOffset = nextWindowOffset(page.chunkWindow, chunkOffset, chunks.length);
-      artifactOffset = nextWindowOffset(page.artifactWindow, artifactOffset, artifacts.length);
+      if (needsChunks) {
+        needsChunks = windowHasMore(page.chunkWindow);
+        if (needsChunks && !chunks.length) throw new Error("Documentation enrichment chunk window did not advance.");
+        chunkOffset = nextWindowOffset(page.chunkWindow, chunkOffset, chunks.length);
+      }
+      if (needsArtifacts) {
+        needsArtifacts = windowHasMore(page.artifactWindow);
+        if (needsArtifacts && !artifacts.length) throw new Error("Documentation enrichment artifact window did not advance.");
+        artifactOffset = nextWindowOffset(page.artifactWindow, artifactOffset, artifacts.length);
+      }
       yield { ...page, extraction_revision: nextRevision, chunks, artifacts };
     } while (needsChunks || needsArtifacts);
   }

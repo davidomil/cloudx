@@ -53,6 +53,8 @@ class SourceRevisions:
         reference = manifest.get("publicReference") or document["uri"]
         metadata = {**manifest.get("metadata", {}), "sourceKey": document["source_key"]}
         filename = manifest.get("original", {}).get("filename", Path(document["snapshot_path"]).name)
+        if manifest.get("mode") == "generated-code":
+            return self._check_code(document, reference, manifest, refresh=refresh)
         if manifest.get("mode") == "retained-evidence":
             return self._check_video(document, reference, refresh=refresh)
         scheme = urlsplit(reference).scheme
@@ -92,6 +94,64 @@ class SourceRevisions:
                 expected_source=(document_id, document["extraction_revision"], document["source_key"]))
             result.update(documentId=ingested.document_id, status="refreshed")
         return self._record(result)
+
+    def _check_code(self, document: dict, reference: str, manifest: dict, *, refresh: bool) -> dict:
+        from .archive import timestamp
+        from .vendor_code import source_bundle
+
+        sources = self._acquire_code_sources(document, reference)
+        digest = hashlib.sha256(source_bundle(sources)).hexdigest()
+        with self.archive._connect() as db:
+            known = db.execute("SELECT document_id FROM documents WHERE source_key = ? AND content_sha256 = ? ORDER BY created_at DESC LIMIT 1",
+                               (document["source_key"], digest)).fetchone()
+        status = "unchanged" if digest == document["content_sha256"] else "known-revision" if known else "new-revision"
+        result = {"sourceKey": document["source_key"], "status": status, "contentSha256": digest,
+                  "documentId": known[0] if known else None, "checkedAt": timestamp()}
+        if refresh and status == "new-revision":
+            ingested = self.archive._ingest_generated_vendor_code_documentation(
+                title=document["title"], uri=document["uri"], sources=sources,
+                collection=document["collection"], tags=json.loads(document["tags_json"]),
+                retain_raw_code_artifacts=bool(manifest["metadata"].get("exposeRawCodeArtifacts")),
+                source_key=document["source_key"], expected_source=(document["document_id"], document["extraction_revision"], document["source_key"]))
+            result.update(status="refreshed", documentId=ingested.document_id)
+        return self._record(result)
+
+    def _acquire_code_sources(self, document: dict, reference: str):
+        from .archive import ArchiveError, MAX_URL_INGEST_BYTES, directory_code_files, fetch_url_bytes, safe_file_name
+        from .vendor_code import VendorCodeSource, is_unsupported_code_source_name, unsupported_code_source_message
+
+        if urlsplit(reference).scheme in {"http", "https"}:
+            try:
+                response, content = fetch_url_bytes(reference, MAX_URL_INGEST_BYTES)
+            except httpx.HTTPError as error:
+                raise ArchiveError(f"Original code acquisition failed: {error}") from error
+            name = safe_file_name(urlsplit(str(response.url)).path.rsplit("/", 1)[-1] or urlsplit(document["uri"]).path.rsplit("/", 1)[-1] or "downloaded-source")
+            if is_unsupported_code_source_name(name):
+                raise ArchiveError(unsupported_code_source_message([name]))
+            return [VendorCodeSource(name, content, document["uri"])]
+        root = Path(reference)
+        if not root.is_absolute():
+            raise ArchiveError("This source has no fetchable public URL or local original path. Upload a revision with the same source key.")
+        if root.is_dir():
+            paths, unsupported = directory_code_files(root)
+            if unsupported:
+                raise ArchiveError(unsupported_code_source_message([path.relative_to(root).as_posix() for path in unsupported]))
+        else:
+            paths = [root]
+        if not paths:
+            raise ArchiveError("The original directory no longer contains supported code sources.")
+        sources, remaining = [], MAX_URL_INGEST_BYTES
+        for path in paths:
+            try:
+                with path.open("rb") as original:
+                    content = original.read(remaining + 1)
+            except OSError as error:
+                raise ArchiveError(f"Original code acquisition failed: {error}") from error
+            remaining -= len(content)
+            if remaining < 0:
+                raise ArchiveError("Original code sources exceed the ingest size limit.")
+            sources.append(VendorCodeSource(path.relative_to(root).as_posix() if root.is_dir() else path.name, content, str(path)))
+        return sources
 
     def _check_video(self, document: dict, reference: str, *, refresh: bool) -> dict:
         from .archive import timestamp

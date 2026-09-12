@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import io
+from email.message import Message
 import zipfile
+
+from bs4.dammit import EncodingDetector
 
 
 def detected_content_type(content: bytes) -> str | None:
@@ -50,6 +53,24 @@ def decode_source_text(content: bytes) -> str:
         text = content.decode(encoding)
     except UnicodeDecodeError as error:
         raise ValueError("Text sources must contain valid UTF-8 or BOM-marked UTF-16, not binary data.") from error
+    validate_text_controls(text)
+    return text.strip()
+
+
+def decode_html_text(content: bytes, content_type: str | None = None) -> str:
+    validate_source_container(content, spreadsheet=False)
+    markup, bom_encoding = EncodingDetector.strip_byte_order_mark(content)
+    mime = Message()
+    mime["Content-Type"] = content_type or "text/html"
+    encoding = bom_encoding or mime.get_content_charset() or EncodingDetector.find_declared_encoding(markup, is_html=True) or "utf-8"
+    try:
+        text = markup.decode(encoding)
+    except (LookupError, UnicodeDecodeError) as error:
+        raise ValueError(f"HTML source does not contain valid text in its selected encoding {encoding!r}.") from error
+    validate_text_controls(text)
+    return text.strip()
+
+
+def validate_text_controls(text: str) -> None:
     if any(ord(char) < 32 and char not in "\t\r\n\f" for char in text):
         raise ValueError("Binary control characters are not accepted in text sources.")
-    return text.strip()

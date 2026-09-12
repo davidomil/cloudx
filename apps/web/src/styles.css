@@ -4505,7 +4505,7 @@ a:hover svg {
 
 .documentation-source-viewer {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, auto) minmax(min(8rem, 20%), 1fr);
   flex: 1 1 auto;
   min-height: 0;
   border: 1px solid var(--color-border);
@@ -4513,6 +4513,11 @@ a:hover svg {
   background: rgb(14 18 26 / 0.82);
   gap: 10px;
   padding: 10px;
+}
+
+.documentation-revisions {
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .documentation-source-header {

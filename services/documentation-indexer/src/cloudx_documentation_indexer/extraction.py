@@ -30,7 +30,7 @@ from .schematics.pdf_metadata import PdfDeclaredMetadata, extract_pdf_metadata
 from .schematics.native_pdf import is_label_color, native_pdf_geometry
 from .schematics.classification import has_native_circuit_geometry
 from .schematics.scope import DocumentPortAnalysis, resolve_native_document_ports
-from .source_admission import decode_source_text, detected_content_type, validate_source_container
+from .source_admission import decode_html_text, decode_source_text, detected_content_type, validate_source_container
 from .media_source import MEDIA_SUFFIXES, looks_like_media, media_source_metadata
 from .pdf_text import SourcePdfPage, is_painted_text, positioned_words, separated_text_pages
 
@@ -132,7 +132,7 @@ def extract_bytes(
         metadata = media_source_metadata(content, name, artifact_dir)
         return [ExtractedSpan("Retained media source: " + name + "\n" + json.dumps(metadata, sort_keys=True), "media source")]
     if source_type == "website" or suffix in HTML_SUFFIXES or normalized_type.startswith("text/html"):
-        return [ExtractedSpan(extract_html(content), "html")]
+        return [ExtractedSpan(extract_html(content, content_type), "html")]
     if suffix in CODE_SOURCE_SUFFIXES or source_type == "repo_code":
         raise ValueError("Code source extraction requires documentation-first ingest.")
     return [ExtractedSpan(decode_text(content), "text")]
@@ -1123,8 +1123,8 @@ def frame_count(image: Image.Image) -> int:
         return 1
 
 
-def extract_html(content: bytes) -> str:
-    soup = BeautifulSoup(decode_source_text(content), "html.parser")
+def extract_html(content: bytes, content_type: str | None = None) -> str:
+    soup = BeautifulSoup(decode_html_text(content, content_type), "html.parser")
     for element in soup(["script", "style", "template", "noscript"]):
         element.extract()
     return "\n".join(line.strip() for line in soup.get_text("\n").splitlines() if line.strip())

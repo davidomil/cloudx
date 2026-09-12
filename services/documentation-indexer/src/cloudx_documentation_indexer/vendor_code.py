@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import hashlib
 import json
 import re
@@ -131,6 +132,14 @@ class VendorCodeSource:
     relative_path: str
     content: bytes
     source_uri: str
+
+
+def source_bundle(sources: list[VendorCodeSource]) -> bytes:
+    return json.dumps({"schemaVersion": 2, "sources": [
+        {"relativePath": source.relative_path, "sourceUri": source.source_uri,
+         "sha256": hashlib.sha256(source.content).hexdigest(), "contentBase64": base64.b64encode(source.content).decode("ascii")}
+        for source in sorted(sources, key=lambda item: item.relative_path)
+    ]}, sort_keys=True).encode("utf-8")
 
 
 @dataclass(frozen=True)

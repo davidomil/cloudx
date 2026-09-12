@@ -41,6 +41,35 @@ const recordings = [
 describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))(
   "archived media through the real indexer and media tools",
   () => {
+    it.each([
+      { chunks: 101, artifacts: 1 },
+      { chunks: 1, artifacts: 101 },
+      { chunks: 201, artifacts: 101 },
+      { chunks: 101, artifacts: 201 },
+    ])("publishes uneven evidence pages with $chunks chunks and $artifacts artifacts", async (counts) => {
+      const fixture = await startArchive();
+      try {
+        const documentId = await seedPagedEvidence(fixture.archiveRoot, counts);
+        const original = await fixture.document(documentId);
+        const enrichment = createEnrichment(fixture);
+
+        await expect(enrichment.service.enrichIngestResponse({ document: { documentId } }))
+          .resolves.toMatchObject({ enrichment: { results: [{ status: "written" }] } });
+
+        const anchors: Array<{ chunkId?: number; artifactId?: string }> = enrichment.run.mock.calls
+          .flatMap(([prompt]) => JSON.parse(prompt.split("\nEvidence:\n")[1]).supportAnchors);
+        expect(new Set(anchors.flatMap((anchor) => anchor.chunkId ? [anchor.chunkId] : [])))
+          .toEqual(new Set(original.chunks.map((chunk) => chunk.chunk_id)));
+        expect(new Set(anchors.flatMap((anchor) => anchor.artifactId ? [anchor.artifactId] : [])))
+          .toEqual(new Set(Array.from({ length: counts.artifacts }, (_, index) => `table-${index}`)));
+        const published = await fixture.document(documentId);
+        expect(published.enrichments).toHaveLength(1);
+        expect(published.chunks.some((chunk) => chunk.chunk_origin === "ai")).toBe(true);
+      } finally {
+        await fixture.dispose();
+      }
+    }, 30_000);
+
     it.each(["failed", "skipped", "successful"] as const)("enriches corrected extraction after an older model attempt is %s", async (outcome) => {
       const fixture = await startArchive();
       let worker: DocumentationBackgroundEnrichment | undefined;
@@ -705,6 +734,41 @@ async function seedEnrichment(fixture: Awaited<ReturnType<typeof startArchive>>,
     spans: input.spans.map((span) => ({ ...span, kind: "content", supportAnchors: [{ documentId: input.documentId, extractionRevision: document.extraction_revision, locator: source.locator, chunkId: source.chunk_id }] }))
   } });
   await fixture.client.completeEnrichmentRun(run.runId, { leaseToken: run.leaseToken, batchCount: 1, skillIds: input.skillIds, evidence: { chunkCount: 1, artifactCount: 0, keyframeCount: 0, mediaTranscriptChars: 0 } });
+}
+
+async function seedPagedEvidence(archiveRoot: string, counts: { chunks: number; artifacts: number }): Promise<string> {
+  const { stdout } = await runFile(python, ["-c", `
+import sys
+from pathlib import Path
+from cloudx_documentation_indexer.archive import DocumentationArchive
+from cloudx_documentation_indexer.extraction import ExtractedSpan
+
+archive = DocumentationArchive(Path(sys.argv[1]))
+chunk_count, artifact_count = map(int, sys.argv[2:])
+spans = [ExtractedSpan(f"Source fact {i}.", f"page {i}") for i in range(chunk_count)]
+content = "\\n".join(span.text for span in spans).encode()
+snapshot = archive._store_snapshot(content, "source.txt")
+document = archive._write_document(title="Paged source", source_type="text", uri="manual://paged-source",
+    snapshot_path=snapshot, content_bytes=content, spans=spans, collection=None, tags=[])
+artifact_root = snapshot.parent / "extracted"
+artifact_root.mkdir()
+artifacts = []
+for i in range(artifact_count):
+    filename = f"table-{i}.csv"
+    (artifact_root / filename).write_text(f"name,value\\nrow,{i}\\n")
+    artifacts.append({"id": f"table-{i}", "path": filename, "kind": "table", "artifactOrigin": "source",
+                      "locator": f"page {i % chunk_count}"})
+with archive._connect() as db:
+    archive._register_artifacts(db, document.document_id, artifacts)
+print(document.document_id)
+`, archiveRoot, String(counts.chunks), String(counts.artifacts)], {
+    env: {
+      ...process.env,
+      PYTHONPATH: path.join(repositoryRoot, "services/documentation-indexer/src"),
+      CLOUDX_DOCUMENTATION_RETRIEVAL_PROFILE: "diagnostic-hash",
+    },
+  });
+  return stdout.trim();
 }
 
 function createEnrichment(fixture: Awaited<ReturnType<typeof startArchive>>) {

@@ -33,6 +33,7 @@ def extraction_processor() -> dict:
     for path in [root / "source_retention.py", root / "archive.py", root / "extraction.py", root / "vendor_code.py", root / "media_source.py", root / "source_admission.py", root / "pdf_text.py", *sorted((root / "schematics").glob("*.py"))]:
         code.update(path.name.encode())
         code.update(path.read_bytes())
+    ocr_executable_state, ocr_executable_digest = ocr_executable_identity(os.getenv("CLOUDX_SCHEMATIC_OCR_EXECUTABLE"))
     return {"schemaVersion": 2, "codeSha256": code.hexdigest(), "packages": packages,
             "schematicModelSha256": os.getenv("CLOUDX_SINA_MODEL_SHA256"),
             "schematicModelConfigured": bool(os.getenv("CLOUDX_SINA_MODEL_PATH")),
@@ -40,9 +41,23 @@ def extraction_processor() -> dict:
             "schematicImageSize": os.getenv("CLOUDX_SINA_IMAGE_SIZE", "640"),
             "schematicTileSize": os.getenv("CLOUDX_SINA_TILE_SIZE", "0"),
             "ocrModelSha256": os.getenv("CLOUDX_SCHEMATIC_OCR_MODEL_SHA256"),
-            "ocrExecutableSha256": hashlib.sha256(Path(os.environ["CLOUDX_SCHEMATIC_OCR_EXECUTABLE"]).read_bytes()).hexdigest() if os.getenv("CLOUDX_SCHEMATIC_OCR_EXECUTABLE") and Path(os.environ["CLOUDX_SCHEMATIC_OCR_EXECUTABLE"]).is_file() else None,
+            "ocrExecutableSha256": ocr_executable_digest,
+            "ocrExecutableState": ocr_executable_state,
             "ocrTimeoutSeconds": os.getenv("CLOUDX_SCHEMATIC_OCR_TIMEOUT_SECONDS", "45"),
             "ocrMode": os.getenv("CLOUDX_SCHEMATIC_OCR_MODE", "full-page")}
+
+
+def ocr_executable_identity(executable: str | None) -> tuple[str, str | None]:
+    if not executable:
+        return "unconfigured", None
+    try:
+        path = Path(executable)
+        if not path.is_file():
+            return "unavailable", None
+        with path.open("rb") as handle:
+            return "readable", hashlib.file_digest(handle, "sha256").hexdigest()
+    except OSError:
+        return "unavailable", None
 
 
 def processor_fingerprint() -> str:

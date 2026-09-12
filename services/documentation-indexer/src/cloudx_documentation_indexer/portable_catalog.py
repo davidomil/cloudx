@@ -38,7 +38,7 @@ def revision(value):
 
 
 def validate_catalog_records(db):
-    from .enrichment_runs import EnrichmentRuns, EnrichmentRunError
+    from .enrichment_runs import EnrichmentRuns, EnrichmentRunError, valid_run_id
 
     require(db.execute('PRAGMA user_version').fetchone()[0] == 2, 'Portable catalogs require schema version 2; upgrade and rebuild the original archive before export.')
     require(db.execute('PRAGMA foreign_key_check').fetchone() is None, 'Portable catalog contains orphaned foreign-key records.')
@@ -77,6 +77,7 @@ def validate_catalog_records(db):
         if row['processor_fingerprint']:
             require(hashlib.sha256(json.dumps(manifest['processor'], sort_keys=True).encode()).hexdigest() == row['processor_fingerprint'], 'Source processor fingerprint does not match its declared dependencies.')
     for row in db.execute('SELECT * FROM enrichment_runs'):
+        require(valid_run_id(row['run_id']), 'Invalid enrichment run identity; a generated run ID is required.')
         require(row['status'] in run_states and revision(row['extraction_revision']) and digest(row['processor_fingerprint']), 'Invalid enrichment run identity or state.')
         require(isinstance(row['lease_until'], (int, float)) and math.isfinite(row['lease_until']) and row['lease_until'] >= 0, 'Invalid enrichment lease deadline.')
         require(isinstance(row['lease_token'], str) and len(row['lease_token']) == 64 and isinstance(row['owner_id'], str) and bool(row['owner_id'].strip()), 'Invalid enrichment lease identity.')

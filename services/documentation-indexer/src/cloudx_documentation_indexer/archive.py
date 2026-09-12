@@ -68,6 +68,7 @@ from .vendor_code import (
     VendorCodeSource,
     code_review_required_message,
     generate_vendor_code_documentation,
+    source_bundle,
     is_supported_code_source_name,
     is_unsupported_code_source_name,
     unsupported_code_source_message,
@@ -688,7 +689,7 @@ class DocumentationArchive:
                 raise ArchiveError(f"Unknown document: {document_id}")
             chunk_total = int(db.execute("SELECT COUNT(*) FROM chunks WHERE document_id = ?", (document_id,)).fetchone()[0])
             if chunk_ids is None:
-                chunk_where = "document_id = ? AND state != 'pending' AND NOT (chunk_origin = 'media' AND state = 'superseded')"
+                chunk_where = f"document_id = ? AND {published_chunk_sql()}"
                 chunk_params: list[str | int] = [document_id]
                 if chunk_origins is not None:
                     chunk_where += " AND chunk_origin IN (" + ",".join("?" for _ in chunk_origins) + ")"
@@ -1300,6 +1301,8 @@ class DocumentationArchive:
         collection: str | None,
         tags: list[str] | None,
         retain_raw_code_artifacts: bool,
+        source_key: str | None = None,
+        expected_source: tuple[str, str, str] | None = None,
     ) -> IngestedDocument:
         generated = generate_vendor_code_documentation(
             title=title,
@@ -1307,11 +1310,7 @@ class DocumentationArchive:
             sources=sources,
             retain_raw_source=retain_raw_code_artifacts,
         )
-        retained_inputs = json.dumps({"schemaVersion": 2, "sources": [
-            {"relativePath": source.relative_path, "sourceUri": source.source_uri,
-             "sha256": sha256_bytes(source.content), "contentBase64": base64.b64encode(source.content).decode("ascii")}
-            for source in sorted(sources, key=lambda item: item.relative_path)
-        ]}, sort_keys=True).encode("utf-8")
+        retained_inputs = source_bundle(sources)
         with self._write_lock:
             snapshot_path = self._store_snapshot(
                 retained_inputs,
@@ -1321,20 +1320,26 @@ class DocumentationArchive:
                     "generatedCodeDocumentation": True,
                     "rawSourceRetained": True,
                     "exposeRawCodeArtifacts": retain_raw_code_artifacts,
+                    **({"sourceKey": source_key} if source_key is not None else {}),
                 },
             )
-            artifact_root = snapshot_path.parent / "extracted"
-            write_vendor_code_artifacts(artifact_root, generated)
-            return self._write_document(
-                title=title,
-                source_type="repo_code",
-                uri=uri,
-                snapshot_path=snapshot_path,
-                content_bytes=retained_inputs,
-                spans=[ExtractedSpan(text, locator) for locator, text in generated.spans],
-                collection=collection,
-                tags=tags,
-            )
+            try:
+                artifact_root = snapshot_path.parent / "extracted"
+                write_vendor_code_artifacts(artifact_root, generated)
+                return self._write_document(
+                    title=title,
+                    source_type="repo_code",
+                    uri=uri,
+                    snapshot_path=snapshot_path,
+                    content_bytes=retained_inputs,
+                    spans=[ExtractedSpan(text, locator) for locator, text in generated.spans],
+                    collection=collection,
+                    tags=tags,
+                    expected_source=expected_source,
+                )
+            except Exception:
+                self._discard_unreferenced_snapshot(snapshot_path)
+                raise
 
     def search(
         self,
@@ -1416,7 +1421,7 @@ class DocumentationArchive:
                 "UPDATE documents SET state = ?, updated_at = ? WHERE document_id = ?",
                 (state, now, document_id),
             )
-            db.execute("UPDATE chunks SET state = ? WHERE document_id = ?", (state, document_id))
+            db.execute(f"UPDATE chunks SET state = ? WHERE document_id = ? AND {published_chunk_sql()}", (state, document_id))
             db.execute(
                 """
                 INSERT INTO invalidation_events (document_id, previous_state, next_state, reason, created_at)
@@ -1470,7 +1475,7 @@ class DocumentationArchive:
                 if mode == "text":
                     spans = [ExtractedSpan(decode_text(source_bytes), "text")]
                 elif mode == "html":
-                    spans = [ExtractedSpan(extract_html(source_bytes), "html")]
+                    spans = [ExtractedSpan(extract_html(source_bytes, metadata.get("contentType")), "html")]
                 elif mode in {"generated-code", "legacy-generated-documentation"}:
                     if mode == "legacy-generated-documentation":
                         from .legacy_sources import legacy_code_sources
@@ -2006,7 +2011,7 @@ class DocumentationArchive:
         return IngestedDocument(document_id, title.strip() or uri, source_type, ACTIVE_STATE, len(chunks), content_sha256)
 
     def _allowed_chunk_ids(self, *, states: list[str], source_types: list[str] | None, collection: str | None, db: sqlite3.Connection | None = None) -> list[int]:
-        where = ["c.state IN ({})".format(", ".join("?" for _ in states))]
+        where = ["c.state IN ({})".format(", ".join("?" for _ in states)), published_chunk_sql("c")]
         params: list[str] = list(states)
         if source_types:
             where.append("d.source_type IN ({})".format(", ".join("?" for _ in source_types)))
@@ -2045,7 +2050,7 @@ class DocumentationArchive:
         if self.embedding_profile is not None:
             candidate_ids = list(dict.fromkeys([*(int(chunk_id) for chunk_id in ids[0]), *(lexical_candidates or [])]))
             placeholders = ",".join("?" for _ in candidate_ids)
-            rows = db.execute(f"SELECT chunk_id, text FROM chunks WHERE state = 'active' AND chunk_id IN ({placeholders})", candidate_ids).fetchall()
+            rows = db.execute(f"SELECT chunk_id, text FROM chunks WHERE state = 'active' AND {published_chunk_sql()} AND chunk_id IN ({placeholders})", candidate_ids).fetchall()
             candidates = [[row["text"], *retrieval_passages(row["text"])] for row in rows]
             vectors = EmbeddingCache(db, self.embedding_profile_id, self.embedding_dimensions).read([text for passages in candidates for text in passages])
             similarities = vectors @ query_vector[0]
@@ -2072,7 +2077,7 @@ class DocumentationArchive:
         fts_query = fts_query_from_text(query)
         if not fts_query:
             return {}
-        where = ["c.state IN ({})".format(", ".join("?" for _ in states))]
+        where = ["c.state IN ({})".format(", ".join("?" for _ in states)), published_chunk_sql("c")]
         params: list[str | int] = [fts_query, *states]
         if source_types:
             where.append("d.source_type IN ({})".format(", ".join("?" for _ in source_types)))
@@ -2117,7 +2122,7 @@ class DocumentationArchive:
                        d.extraction_revision
                 FROM chunks c
                 JOIN documents d ON d.document_id = c.document_id
-                WHERE c.chunk_id IN ({placeholders})
+                WHERE c.chunk_id IN ({placeholders}) AND {published_chunk_sql("c")}
                 """,
                 chunk_ids,
             ).fetchall()
@@ -3185,10 +3190,17 @@ def normalized_chunk_context(chunk_context: int | None) -> int:
     return value
 
 
+def published_chunk_sql(alias: str = "chunks") -> str:
+    return f"""{alias}.state != 'pending' AND ({alias}.chunk_origin != 'media' OR
+        {alias}.run_id = (SELECT e.run_id FROM document_enrichments e
+                        WHERE e.document_id = {alias}.document_id
+                        ORDER BY e.enrichment_id DESC LIMIT 1))"""
+
+
 def selected_chunk_ids_with_context(db: sqlite3.Connection, document_id: str, chunk_ids: list[int], context: int) -> list[int]:
     if not chunk_ids:
         return []
-    ordered_ids = [int(row["chunk_id"]) for row in db.execute("SELECT chunk_id FROM chunks WHERE document_id = ? AND state != 'pending' AND NOT (chunk_origin = 'media' AND state = 'superseded') ORDER BY chunk_id", (document_id,)).fetchall()]
+    ordered_ids = [int(row["chunk_id"]) for row in db.execute(f"SELECT chunk_id FROM chunks WHERE document_id = ? AND {published_chunk_sql()} ORDER BY chunk_id", (document_id,)).fetchall()]
     target_ids = set(chunk_ids)
     selected_indexes: set[int] = set()
     for index, chunk_id in enumerate(ordered_ids):
