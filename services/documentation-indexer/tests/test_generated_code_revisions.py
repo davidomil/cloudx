@@ -44,7 +44,7 @@ def test_generated_code_revision_uses_the_original_bundle_and_one_acquisition(tm
         before = archive.get_document(old.document_id)
         old_snapshot = archive.root / before['snapshot_path']
         for endpoint in ['check-revision', 'refresh']:
-            checked = client.post(f'/documents/{old.document_id}/{endpoint}')
+            checked = client.post(f'/documents/{old.document_id}/{endpoint}', json={"allowedRoots": [str(tmp_path)]})
             assert checked.status_code == 200, checked.text
             assert checked.json()['status'] == 'unchanged'
             assert checked.json()['documentId'] == old.document_id
@@ -54,7 +54,7 @@ def test_generated_code_revision_uses_the_original_bundle_and_one_acquisition(tm
         if shape == 'directory':
             (source / 'added.h').write_text('#define ADDED_HEADER 1\n')
         calls_before = len(requests)
-        fresh = client.post(f'/documents/{old.document_id}/refresh')
+        fresh = client.post(f'/documents/{old.document_id}/refresh', json={"allowedRoots": [str(tmp_path)]})
         assert fresh.status_code == 200, fresh.text
         assert fresh.json()['status'] == 'refreshed'
         current = archive.get_document(fresh.json()['documentId'])
@@ -68,10 +68,10 @@ def test_generated_code_revision_uses_the_original_bundle_and_one_acquisition(tm
         assert base64.b64decode(json.loads(old_snapshot.read_bytes())['sources'][0]['contentBase64']) == original
         if shape == 'url':
             assert len(requests) == calls_before + 1
-        assert revisions.check(current['document_id'])['status'] == 'unchanged'
+        assert revisions.check(current['document_id'], allowed_roots=[tmp_path])['status'] == 'unchanged'
         if shape == 'directory':
             (source / 'added.h').unlink()
-            removed = revisions.check(current['document_id'], refresh=True)
+            removed = revisions.check(current['document_id'], allowed_roots=[tmp_path], refresh=True)
             assert removed['status'] == 'refreshed'
             latest = archive.get_document(removed['documentId'])
             assert len(json.loads((archive.root / latest['snapshot_path']).read_bytes())['sources']) == 1
@@ -83,7 +83,7 @@ def test_uploaded_code_requires_an_explicit_original_upload_for_refresh(tmp_path
     before = archive.get_document(document.document_id)
     for refresh in [False, True]:
         with pytest.raises(ArchiveError, match='no fetchable|Upload a revision'):
-            SourceRevisions(archive).check(document.document_id, refresh=refresh)
+            SourceRevisions(archive).check(document.document_id, allowed_roots=[tmp_path], refresh=refresh)
     assert archive.get_document(document.document_id) == before
 
 
@@ -111,7 +111,7 @@ def test_generated_code_refresh_preserves_published_source_on_failure(tmp_path, 
     if failure == 'artifact-write':
         monkeypatch.setattr(archive_module, 'write_vendor_code_artifacts', fail_artifacts)
     with pytest.raises((ArchiveError, ValueError, OSError), match='Fixture|revision'):
-        SourceRevisions(archive).check(original.document_id, refresh=True)
+        SourceRevisions(archive).check(original.document_id, allowed_roots=[tmp_path], refresh=True)
     if failure == 'concurrent-revision':
         assert [row['document_id'] for row in archive.list_documents()] == [published[0].document_id]
         assert len(list(archive.snapshots_dir.iterdir())) == 2
@@ -145,6 +145,6 @@ def test_failed_original_code_acquisition_leaves_archive_unchanged(tmp_path, mon
     before = archive.get_document(document.document_id)
     files = set(archive.snapshots_dir.rglob('*'))
     with pytest.raises(ArchiveError):
-        SourceRevisions(archive).check(document.document_id, refresh=True)
+        SourceRevisions(archive).check(document.document_id, allowed_roots=[tmp_path], refresh=True)
     assert archive.get_document(document.document_id) == before
     assert set(archive.snapshots_dir.rglob('*')) == files

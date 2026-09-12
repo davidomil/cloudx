@@ -62,8 +62,8 @@ describe("DocumentationPlugin", () => {
 
   it.each([
     { id: "revisions", method: "listDocumentRevisions", input: { documentId: "doc" }, args: ["doc"], safety: "read" },
-    { id: "checkRevision", method: "checkDocumentRevision", input: { documentId: "doc" }, args: ["doc"], safety: "external" },
-    { id: "refresh", method: "refreshDocument", input: { documentId: "doc" }, args: ["doc"], safety: "external" },
+    { id: "checkRevision", method: "checkDocumentRevision", input: { documentId: "doc" }, args: ["doc", { allowedRoots: ["/tmp"] }], safety: "external" },
+    { id: "refresh", method: "refreshDocument", input: { documentId: "doc" }, args: ["doc", { allowedRoots: ["/tmp"] }], safety: "external" },
     { id: "assignSource", method: "assignDocumentSource", input: { documentId: "doc", sourceKey: "source:guide" }, args: ["doc", "source:guide"], safety: "external" },
     { id: "purge", method: "purgeDocument", input: { documentId: "doc", reason: "obsolete source" }, args: ["doc", "obsolete source"], safety: "external" },
   ])("routes the $id hook to its explicit revision operation", async ({ id, method, input, args, safety }) => {
@@ -76,6 +76,17 @@ describe("DocumentationPlugin", () => {
     expect(hook.automationSafety).toBe(safety);
     if (id === "purge") expect(hook.description).toContain("Irreversibly");
     expect(() => hook.execute({ ...input, documentId: " " }, { caller: { kind: "ui" } })).toThrow("documentId");
+  });
+
+  it.each([
+    { id: "checkRevision", method: "checkDocumentRevision" },
+    { id: "refresh", method: "refreshDocument" },
+  ])("takes $id access roots from server configuration even if input tries to override them", async ({ id, method }) => {
+    const operation = vi.fn(async () => ({}));
+    const plugin = new DocumentationPlugin(Object.assign(fakeClient(), { [method]: operation }), new PathPolicy(["/tmp/allowed"]), new DocumentationIngestQueue());
+    const hook = plugin.hooks.find((candidate) => candidate.id === `documentation.documents.${id}`)!;
+    await hook.execute({ documentId: "doc", allowedRoots: ["/"] }, { caller: { kind: "ui" } });
+    expect(operation).toHaveBeenCalledWith("doc", { allowedRoots: ["/tmp/allowed"] });
   });
 
   it.each([

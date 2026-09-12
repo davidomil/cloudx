@@ -32,7 +32,7 @@ def test_source_network_failure_reports_acquisition_error_and_preserves_archive(
     def unavailable(*_args, **_kwargs):
         raise httpx.ConnectError("fixture original source unavailable")
     monkeypatch.setattr("cloudx_documentation_indexer.archive.fetch_url_bytes", unavailable)
-    response = client.post(f"/documents/{document_id}/refresh")
+    response = client.post(f"/documents/{document_id}/refresh", json={"allowedRoots": []})
     assert response.status_code == 400
     assert "Original source acquisition failed" in response.json()["detail"]
     assert archive.get_document(document_id) == before

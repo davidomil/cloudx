@@ -110,9 +110,9 @@ describe("documentation run HTTP contracts", () => {
 
   it("uses explicit revision, source-family and irreversible purge endpoints", async () => {
     const calls: Array<[string, string, Record<string, unknown>]> = []; const client = await server((method, url, body) => { calls.push([method, url, body]); return { ok: true }; });
-    await client.listDocumentRevisions("doc/1"); await client.checkDocumentRevision("doc/1"); await client.refreshDocument("doc/1"); await client.assignDocumentSource("doc/1", "source:guide"); await client.purgeDocument("doc/1", "Replaced obsolete source");
+    await client.listDocumentRevisions("doc/1"); await client.checkDocumentRevision("doc/1", { allowedRoots: ["/srv/sources"] }); await client.refreshDocument("doc/1", { allowedRoots: ["/srv/sources"] }); await client.assignDocumentSource("doc/1", "source:guide"); await client.purgeDocument("doc/1", "Replaced obsolete source");
     expect(calls).toEqual([
-      ["GET", "/docs/documents/doc%2F1/revisions?token=local", {}], ["POST", "/docs/documents/doc%2F1/check-revision?token=local", {}], ["POST", "/docs/documents/doc%2F1/refresh?token=local", {}], ["PUT", "/docs/documents/doc%2F1/source?token=local", { sourceKey: "source:guide" }], ["POST", "/docs/documents/doc%2F1/purge?token=local", { reason: "Replaced obsolete source" }]
+      ["GET", "/docs/documents/doc%2F1/revisions?token=local", {}], ["POST", "/docs/documents/doc%2F1/check-revision?token=local", { allowedRoots: ["/srv/sources"] }], ["POST", "/docs/documents/doc%2F1/refresh?token=local", { allowedRoots: ["/srv/sources"] }], ["PUT", "/docs/documents/doc%2F1/source?token=local", { sourceKey: "source:guide" }], ["POST", "/docs/documents/doc%2F1/purge?token=local", { reason: "Replaced obsolete source" }]
     ]);
     expect(() => client.purgeDocument("doc", " ")).toThrow("reason");
   });

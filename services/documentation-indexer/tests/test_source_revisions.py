@@ -15,16 +15,16 @@ def test_changed_original_becomes_new_revision_and_old_bytes_are_retained(tmp_pa
     old = archive.ingest_path(source)[0]
     source.write_text("new board revision")
     revisions = SourceRevisions(archive)
-    assert revisions.check(old.document_id)["status"] == "new-revision"
+    assert revisions.check(old.document_id, allowed_roots=[tmp_path])["status"] == "new-revision"
     assert archive.get_document(old.document_id)["state"] == "active"
-    fresh = revisions.check(old.document_id, refresh=True)
+    fresh = revisions.check(old.document_id, allowed_roots=[tmp_path], refresh=True)
     assert fresh["status"] == "refreshed"
     assert archive.get_document(old.document_id)["state"] == "superseded"
     assert len(revisions.list(fresh["documentId"])["revisions"]) == 2
     old_snapshot = archive.root / archive.get_document(old.document_id)["snapshot_path"]
     assert old_snapshot.read_text() == "old board revision"
     source.write_text("old board revision")
-    assert revisions.check(fresh["documentId"], refresh=True)["status"] == "known-revision"
+    assert revisions.check(fresh["documentId"], allowed_roots=[tmp_path], refresh=True)["status"] == "known-revision"
     assert archive.get_document(fresh["documentId"])["state"] == "active"
 
 
@@ -85,9 +85,9 @@ def test_conditional_public_source_check_and_refresh_retain_the_checked_bytes(tm
     monkeypatch.setattr(archive_module, "fetch_url_bytes", fetch)
     old = archive.ingest_url(url)
     revisions = SourceRevisions(archive)
-    assert revisions.check(old.document_id)["status"] == "unchanged"
+    assert revisions.check(old.document_id, allowed_roots=[tmp_path])["status"] == "unchanged"
     assert requests[-1][1] == {"If-None-Match": '"revision-1"'}
-    fresh = revisions.check(old.document_id, refresh=True)
+    fresh = revisions.check(old.document_id, allowed_roots=[tmp_path], refresh=True)
     assert fresh["status"] == "refreshed"
     assert len(requests) == 3
     document = archive.get_document(fresh["documentId"])
@@ -118,13 +118,13 @@ def test_video_revision_compares_selected_frame_bytes_and_retains_single_acquisi
     monkeypatch.setattr(archive_module, "extract_youtube_video_evidence", acquire)
     old = archive.ingest_youtube_video(url)
     revisions = SourceRevisions(archive)
-    assert revisions.check(old.document_id)["status"] == "unchanged"
+    assert revisions.check(old.document_id, allowed_roots=[tmp_path])["status"] == "unchanged"
     color[0] = "black"
-    check = revisions.check(old.document_id)
+    check = revisions.check(old.document_id, allowed_roots=[tmp_path])
     assert check["status"] == "new-revision"
     assert check["comparison"] == "metadata-transcript-selected-frames"
     assert len(archive.list_documents()) == 1
-    latest = revisions.check(old.document_id, refresh=True)
+    latest = revisions.check(old.document_id, allowed_roots=[tmp_path], refresh=True)
     assert len(calls) == 4
     assert latest["status"] == "refreshed"
     old_document = archive.get_document(old.document_id)
@@ -153,7 +153,7 @@ def test_refresh_cannot_supersede_a_revision_published_during_acquisition(tmp_pa
 
     monkeypatch.setattr(extraction, "extract_bytes", concurrent_update)
     with pytest.raises(ArchiveError, match="changed while acquiring"):
-        SourceRevisions(archive).check(old.document_id, refresh=True)
+        SourceRevisions(archive).check(old.document_id, allowed_roots=[tmp_path], refresh=True)
     assert archive.get_document(published[0].document_id)["state"] == "active"
     assert archive.search("intermediate", mode="lexical") == []
     assert len(list(archive.snapshots_dir.iterdir())) == 2

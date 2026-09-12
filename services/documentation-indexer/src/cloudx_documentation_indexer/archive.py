@@ -1912,6 +1912,8 @@ class DocumentationArchive:
         with self._connect() as db:
             require_source_revision(db, expected_source)
             existing_document = db.execute("SELECT * FROM documents WHERE document_id = ?", (document_id,)).fetchone()
+            if existing_document and "sourceKey" not in metadata:
+                source_key = existing_document["source_key"]
             if existing_document and existing_document["state"] == "superseded":
                 self._discard_unreferenced_snapshot(snapshot_path)
                 raise ArchiveError("These bytes are a known superseded revision; importing them cannot reactivate an old revision.")
@@ -1919,6 +1921,7 @@ class DocumentationArchive:
                 previous_manifest = json.loads(existing_document["source_manifest_json"])
                 if (previous_manifest.get("original", {}).get("filename") == manifest["original"]["filename"]
                     and previous_manifest.get("metadata", {}).get("contentType") == metadata.get("contentType")
+                    and previous_manifest.get("metadata", {}).get("exposeRawCodeArtifacts") == metadata.get("exposeRawCodeArtifacts")
                     and existing_document["source_type"] == source_type):
                     count = db.execute("SELECT COUNT(*) FROM chunks WHERE document_id = ? AND chunk_origin = 'source'", (document_id,)).fetchone()[0]
                     self._discard_unreferenced_snapshot(snapshot_path)

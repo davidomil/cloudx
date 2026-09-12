@@ -411,12 +411,12 @@ export class DocumentationClient {
     return this.get(`/documents/${encodeURIComponent(requireString(documentId, "documentId"))}/revisions`);
   }
 
-  checkDocumentRevision(documentId: string, options: DocumentationRequestOptions = {}): Promise<Record<string, unknown>> {
-    return this.post(`/documents/${encodeURIComponent(requireString(documentId, "documentId"))}/check-revision`, {}, options.signal);
+  checkDocumentRevision(documentId: string, sourceAccess: { allowedRoots: string[] }, options: DocumentationRequestOptions = {}): Promise<Record<string, unknown>> {
+    return this.post(`/documents/${encodeURIComponent(requireString(documentId, "documentId"))}/check-revision`, sourceAccess, options.signal);
   }
 
-  refreshDocument(documentId: string, options: DocumentationRequestOptions = {}): Promise<Record<string, unknown>> {
-    return this.post(`/documents/${encodeURIComponent(requireString(documentId, "documentId"))}/refresh`, {}, options.signal);
+  refreshDocument(documentId: string, sourceAccess: { allowedRoots: string[] }, options: DocumentationRequestOptions = {}): Promise<Record<string, unknown>> {
+    return this.post(`/documents/${encodeURIComponent(requireString(documentId, "documentId"))}/refresh`, sourceAccess, options.signal);
   }
 
   purgeDocument(documentId: string, reason: string): Promise<Record<string, unknown>> {

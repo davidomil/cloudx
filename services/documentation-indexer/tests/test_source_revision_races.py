@@ -15,6 +15,6 @@ def test_refresh_does_not_overwrite_a_source_family_assigned_after_publication(t
         revisions.assign_source(result.document_id, "manual://user-selected-family")
         return result
     monkeypatch.setattr(archive, "_ingest_extracted_source", publish_then_assign)
-    result = revisions.check(document.document_id, refresh=True)
+    result = revisions.check(document.document_id, allowed_roots=[tmp_path], refresh=True)
     assert result["status"] == "refreshed"
     assert archive.get_document(result["documentId"])["source_key"] == "manual://user-selected-family"

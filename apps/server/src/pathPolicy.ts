@@ -42,6 +42,10 @@ export class PathPolicy {
     this.roots = this.rootEntries.map((root) => root.resolved);
   }
 
+  configuredRoots(): string[] {
+    return [...this.roots];
+  }
+
   resolve(candidate: string, options: ResolvePathOptions = {}): string {
     const resolved = this.resolveUserPath(candidate, options.relativeBaseDir);
     if (!this.isAllowed(resolved)) {

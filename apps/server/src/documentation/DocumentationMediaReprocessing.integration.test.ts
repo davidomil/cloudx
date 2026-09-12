@@ -12,6 +12,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { AsrClient } from "../asrClient.js";
 import type { ConfigService } from "../configService.js";
+import { HookRegistry } from "../hooks/HookRegistry.js";
 import { PathPolicy } from "../pathPolicy.js";
 import { DocumentationPlugin } from "../plugins/DocumentationPlugin.js";
 import type { RulesSkillsCatalogService } from "../rulesSkills/RulesSkillsCatalogService.js";
@@ -41,6 +42,36 @@ const recordings = [
 describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))(
   "archived media through the real indexer and media tools",
   () => {
+    it.each(["checkRevision", "refresh"])("enforces configured roots when %s follows a copied-text URI", async (operation) => {
+      const fixture = await startArchive();
+      try {
+        const allowed = path.join(fixture.root, "allowed");
+        await fs.mkdir(allowed);
+        const outside = path.join(fixture.root, "outside.txt");
+        await fs.writeFile(outside, "OUTSIDEREVISIONCONTENT must never enter the archive.");
+        const imported = await fixture.client.ingestText({ text: "Retained copied source.", uri: outside });
+        const documentId = (imported.document as { documentId: string }).documentId;
+        const before = await fixture.document(documentId);
+        const snapshots = await fs.readdir(path.join(fixture.archiveRoot, "snapshots"));
+        const plugin = new DocumentationPlugin(fixture.client, new PathPolicy([allowed]), fixture.queue);
+        const hooks = new HookRegistry();
+        plugin.hooks.forEach((hook) => hooks.register(hook));
+
+        await expect(hooks.call(`documentation.documents.${operation}`, { documentId }, { caller: { kind: "http" } }))
+          .rejects.toThrow(/outside configured.*roots/u);
+        await expect(fixture.document(documentId)).resolves.toEqual(before);
+        await expect(fs.readdir(path.join(fixture.archiveRoot, "snapshots"))).resolves.toEqual(snapshots);
+        await expect(fixture.client.search({ query: "OUTSIDEREVISIONCONTENT", mode: "lexical" })).resolves.toMatchObject({ results: [] });
+
+        const permitted = new DocumentationPlugin(fixture.client, new PathPolicy([fixture.root]), fixture.queue);
+        const hook = permitted.hooks.find((candidate) => candidate.id === `documentation.documents.${operation}`)!;
+        await expect(hook.execute({ documentId }, { caller: { kind: "ui" } }))
+          .resolves.toMatchObject({ status: operation === "refresh" ? "refreshed" : "new-revision" });
+      } finally {
+        await fixture.dispose();
+      }
+    }, 30_000);
+
     it.each([
       { chunks: 101, artifacts: 1 },
       { chunks: 1, artifacts: 101 },
